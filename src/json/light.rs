@@ -844,6 +844,65 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
         self.value_at(text_pos)
     }
 
+    /// One past the closing bracket of the container this cursor opens, from the balanced
+    /// parentheses and not the text (#5654): the last node in document order inside it is a
+    /// leaf (a scalar, or an empty container), so the container ends at the last of the closers
+    /// that follow that leaf, one for each parenthesis that closes after it.
+    ///
+    /// Only the closers are looked for: a byte between them that is not one is the container's
+    /// own business, found when it is read, and is skipped here. That keeps a filter that never
+    /// reads a malformed member from being made to validate it (#2103), while a byte after the
+    /// container's last closer is what the caller's gap check sees.
+    ///
+    /// A scan of the text ([`container_end`]) is a pass over the container, so a document that is
+    /// one big array under one key paid a second pass over itself; this reads the leaf and the
+    /// text after it. The kind of an inner closer is not compared with its opener's.
+    ///
+    /// `None` where the end cannot be told (a leaf that has no span, or fewer closers than
+    /// parentheses).
+    pub fn container_end_bp(&self) -> Option<usize>
+    where
+        W: Clone,
+    {
+        let bp = self.index.bp();
+        let close = bp.find_close(self.bp_pos)?;
+        let leaf_open = last_open_before(bp.words(), close)?;
+        if leaf_open < self.bp_pos {
+            return None;
+        }
+        let leaf = JsonCursor::from_bp_position(self.index, self.text, leaf_open);
+        let start = leaf.text_position()?;
+        let (mut i, closers) = match *self.text.get(start)? {
+            // An empty container: its closer is part of the leaf, so it is one of the closers.
+            b'{' | b'[' => (start + 1, close - leaf_open),
+            _ => (
+                scalar_end_pos(start, &leaf.value_at(start))?,
+                close - leaf_open - 1,
+            ),
+        };
+        for _ in 0..closers {
+            while !matches!(self.text.get(i)?, b']' | b'}') {
+                i += 1;
+            }
+            i += 1;
+        }
+        Some(i)
+    }
+
+    /// Where the child at `text_pos` (this cursor's own `text_position()`) ends, for the
+    /// trailing-gap check after a container's last child (#5654): a scalar's own length, or the
+    /// scan [`container_end`] makes for a container. `None` where the end cannot be told.
+    pub fn last_child_text_end(&self, text_pos: usize) -> Option<usize>
+    where
+        W: Clone,
+    {
+        let at = text_pos;
+        match self.text.get(at)? {
+            b'{' | b'[' => self.container_end_bp(),
+            _ => scalar_end_pos(at, &self.value_at(at)),
+        }
+    }
+
     /// Same as [`value`](Self::value), for a caller that has already
     /// resolved this cursor's `text_position()` for some other reason (a
     /// delimiter gap check against a sibling, #1643) and doesn't want to
@@ -3483,6 +3542,27 @@ pub fn following_gap_ok(text: &[u8], key_end: usize) -> bool {
     found == Some(b':') && value_start_ok
 }
 
+/// The position of the last 1 bit (open parenthesis) strictly before `end` in `words`, whose bit
+/// `p` is `words[p / 64] >> (p % 64)`.
+fn last_open_before(words: &[u64], end: usize) -> Option<usize> {
+    let last = end.checked_sub(1)?;
+    let mut word = last / 64;
+    let keep = last % 64 + 1;
+    let mut bits = words.get(word)?
+        & if keep == 64 {
+            u64::MAX
+        } else {
+            (1u64 << keep) - 1
+        };
+    loop {
+        if bits != 0 {
+            return Some(word * 64 + 63 - bits.leading_zeros() as usize);
+        }
+        word = word.checked_sub(1)?;
+        bits = words[word];
+    }
+}
+
 /// Whether nothing but whitespace separates `gap_start` (a container's last
 /// scalar child's own already-known span end) from `close_char` (`]`/`}`) --
 /// #1576/#1676, mirroring `src/bin/succinctly/jq_runner.rs`'s own
@@ -3533,11 +3613,8 @@ fn empty_container_gap_ok<'a, W: AsRef<[u64]> + Clone>(
 
 /// Cheap end position (one past the last byte) of an already-resolved
 /// scalar `value` known to start at `start` -- `None` for a container,
-/// which [`trailing_gap_ok`]'s callers treat as "can't determine, skip"
-/// (matching `src/bin/succinctly/jq_runner.rs`'s own `scalar_end_pos`: a
-/// container's own last child might have arbitrary trailing whitespace
-/// before its closing bracket, so this is deliberately deferred rather than
-/// mistracked).
+/// whose end comes from [`JsonCursor::container_end_bp`] instead (#5654;
+/// see [`JsonCursor::last_child_text_end`], which picks between the two).
 fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
     start: usize,
     value: &StandardJson<'_, W>,
@@ -4252,6 +4329,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     #[inline]
     fn trailing_element_gap_ok(&self, gap_start: usize, close_char: u8) -> bool {
         trailing_gap_ok(self.text, gap_start, close_char)
+    }
+
+    /// #5654: where this container ends, one past its closing bracket, for the trailing-gap
+    /// check after a container that is its parent's last child.
+    #[inline]
+    fn container_text_end(&self) -> Option<usize> {
+        self.container_end_bp()
     }
 
     #[inline]
@@ -5005,11 +5089,10 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
             let next_indent = current_indent + indent_spaces;
             let mut first = true;
             let mut rest = elements;
-            // Tracks the last *scalar* element's own end position, for the
-            // trailing-comma check after the loop (`[1,2,]`) -- `None` once
-            // a container element is seen, matching `scalar_end_pos`'s own
-            // deferral (see its doc comment).
-            let mut last_scalar_end: Option<(&[u8], usize)> = None;
+            // Tracks the last element and its position, for the trailing-comma check after the
+            // loop (`[1,2,]`): its end is resolved for the last one only (#5654, a container's end
+            // is a lookup).
+            let mut last_child: Option<(JsonCursor<'_, W>, usize)> = None;
             // Cursor-yielding `uncons_cursor`, not the plain value
             // `Iterator`/`IntoIterator` impl: #1677's missing/doubled
             // `,` check needs each element's own `text_position()`, which
@@ -5019,7 +5102,7 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                 if !first {
                     out.write_char(',')?;
                 }
-                last_scalar_end = None;
+                last_child = None;
                 // Resolved once and reused below for both the trailing-gap
                 // bookkeeping and the recursive render, instead of a second
                 // `elem_cursor.value()` re-deriving the same value (#1576
@@ -5048,8 +5131,7 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                             elem_cursor.text(),
                         )));
                     }
-                    last_scalar_end =
-                        scalar_end_pos(pos, &elem_value).map(|end| (elem_cursor.text(), end));
+                    last_child = Some((elem_cursor, pos));
                     elem_value
                 } else {
                     elem_cursor.value()
@@ -5071,12 +5153,15 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                     depth + 1,
                 )?;
             }
-            // #1676: a trailing `,` (`[1,2,]`) -- deferred (not checked) when
-            // the last element is itself a container, matching
-            // `scalar_end_pos`'s own precedent.
-            if let Some((text, gap_start)) = last_scalar_end {
-                if !trailing_gap_ok(text, gap_start, b']') {
-                    return Err(StreamFailure::Decode(EvalError::malformed_json_text(text)));
+            // #1676: a trailing `,` (`[1,2,]`), or (#5654) junk after a container that is the
+            // last element.
+            if let Some((cursor, gap_start)) = last_child
+                .and_then(|(cursor, pos)| cursor.last_child_text_end(pos).map(|end| (cursor, end)))
+            {
+                if !trailing_gap_ok(cursor.text(), gap_start, b']') {
+                    return Err(StreamFailure::Decode(EvalError::malformed_json_text(
+                        cursor.text(),
+                    )));
                 }
             }
             if indent_spaces > 0 {
@@ -5920,6 +6005,64 @@ mod tests {
         assert!(trailing_gap_ok(b"[1 \n\t\r]", 2, b']'));
         assert!(!trailing_gap_ok(b"[1\x0c]", 2, b']'));
         assert!(!trailing_gap_ok(b"[1@]", 2, b']'));
+    }
+
+    /// #5654: the end of a container's last child, which the trailing-gap check starts from, for
+    /// each kind of child.
+    #[test]
+    fn test_last_child_text_end_covers_scalars_containers_and_empties_5654() {
+        use crate::json::JsonIndex;
+        let text = br#"[1, "ab", [2, [3]], {"k": []}, {}, []]"#;
+        let index = JsonIndex::build(text);
+        let root = index.root(text);
+        let StandardJson::Array(elements) = root.value() else {
+            panic!("an array");
+        };
+        let ends: Vec<Option<usize>> = elements
+            .cursor_iter()
+            .map(|c| c.text_position().and_then(|s| c.last_child_text_end(s)))
+            .collect();
+        let end_of = |needle: &[u8]| {
+            let at = text
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .expect("present");
+            Some(at + needle.len())
+        };
+        assert_eq!(
+            ends,
+            [
+                Some(2),
+                end_of(b"\"ab\""),
+                end_of(b"[2, [3]]"),
+                end_of(b"{\"k\": []}"),
+                end_of(b"{}"),
+                Some(text.len() - 1),
+            ]
+        );
+    }
+
+    /// #5654: `last_open_before` finds the last 1 bit below `end`, across word boundaries, at a
+    /// full-word mask, and after a run of more than a word of zeros (a run of closers).
+    #[test]
+    fn test_last_open_before_crosses_words_and_masks_5654() {
+        // Bit `p` is `words[p / 64] >> (p % 64)`.
+        let words = [0b1u64, 0, 0, 1u64 << 63, 0b10];
+        assert_eq!(last_open_before(&words, 0), None);
+        assert_eq!(last_open_before(&words, 1), Some(0));
+        // Strictly before `end`: bit 0 is not before 0, but is before 1 and every later end.
+        assert_eq!(last_open_before(&words, 2), Some(0));
+        // A run of 191 zeros (words 1 and 2 and the low part of 0) back to bit 0.
+        assert_eq!(last_open_before(&words, 3 * 64), Some(0));
+        // The top bit of word 3 is position 255; an end at 256 keeps the whole word (`keep == 64`).
+        assert_eq!(last_open_before(&words, 256), Some(255));
+        assert_eq!(last_open_before(&words, 255), Some(0));
+        // Bit 1 of word 4 is position 257.
+        assert_eq!(last_open_before(&words, 258), Some(257));
+        assert_eq!(last_open_before(&words, 257), Some(255));
+        // An end past the stored words finds nothing rather than indexing out of range.
+        assert_eq!(last_open_before(&words, 64 * 6), None);
+        assert_eq!(last_open_before(&[0u64; 3], 130), None);
     }
 
     // ------------------------------------------------------------------

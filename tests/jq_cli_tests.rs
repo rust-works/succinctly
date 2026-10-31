@@ -35758,29 +35758,21 @@ fn test_jq_trailing_leading_comma_now_rejected_1676() -> Result<()> {
     Ok(())
 }
 
-/// #1676's own remaining, deliberately deferred gap: a trailing comma right
-/// before a container's closing bracket is only caught when the last real
-/// child is a scalar or the container is empty -- catching it when the last
-/// child is *itself* a container would need that child's own closing
-/// bracket's text position, the same O(subtree) lookup `preceding_gap_ok`'s
-/// doc comment already explains is too expensive to pay unconditionally.
-/// Pinned here, same discipline as #1643's own now-fixed gap test above, so
-/// a future fix for *this* narrower residual updates this test rather than
-/// silently landing uncovered. Real jq rejects all four (confirmed live
-/// against `/usr/bin/jq` 1.7.1), including the empty-inner-container variant
-/// (`[[],]`, `{"a":{},}`) -- an empty container is still a container for
-/// `scalar_end_pos`'s purposes, so it hits the same skip.
+/// #1676's remaining gap, closed by #5654: a trailing comma right before a container's closing
+/// bracket was only caught when the last real child was a scalar or the container was empty. When
+/// the last child is *itself* a container, its end now comes from the balanced parentheses
+/// (`JsonCursor::container_end_bp`), so the comma after it is the gap the check sees. Real jq
+/// rejects all four (confirmed live against `/usr/bin/jq` 1.7.1), including the empty-inner-container
+/// variant (`[[],]`, `{"a":{},}`).
 #[test]
-fn test_jq_trailing_comma_after_container_last_child_still_a_known_gap_1676() -> Result<()> {
-    for (input, expected) in [
-        (r#"{"a":[1,2],}"#, r#"{"a":[1,2]}"#),
-        ("[[1,2],]", "[[1,2]]"),
-        ("[[],]", "[[]]"),
-        (r#"{"a":{},}"#, r#"{"a":{}}"#),
-    ] {
+fn test_jq_trailing_comma_after_container_last_child_is_rejected_1676() -> Result<()> {
+    for input in [r#"{"a":[1,2],}"#, "[[1,2],]", "[[],]", r#"{"a":{},}"#] {
         let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
-        assert_eq!(code, 0, "{input}: stderr: {stderr:?}");
-        assert_eq!(out.trim(), expected, "{input}");
+        assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
+        assert!(
+            names_fault(&stderr, "Invalid JSON text"),
+            "{input}: stderr: {stderr:?}"
+        );
     }
 
     Ok(())
@@ -35913,24 +35905,19 @@ fn test_jq_lazy_path_trailing_comma_after_scalar_last_child_2243() -> Result<()>
     Ok(())
 }
 
-/// #2243: a trailing comma after a *container-typed* last child (`[1,[2,3],]`)
-/// is a deliberately deferred residual gap, not something this fix closes --
-/// a container's own end position isn't derivable from its start alone (it
-/// may have arbitrary trailing whitespace before its own closing bracket),
-/// matching `scalar_text_end`'s own documented `None`-for-container
-/// contract. Confirmed this is not a regression: the cursor-transparent `.`
-/// path (`print_json`'s own `scalar_end_pos`, #1676) has the identical gap
-/// for the same input, verified live against this exact build.
+/// #2243's residual, closed by #5654: a trailing comma after a *container-typed* last child
+/// (`[1,[2,3],]`) was passed through because a container's end was not derivable from its start.
+/// It now comes from the balanced parentheses (`JsonCursor::container_end_bp`), so the lazy path
+/// rejects it as `.` does.
 #[test]
-fn test_jq_lazy_path_trailing_comma_after_container_last_child_still_a_known_gap_2243() -> Result<()>
-{
-    for (input, expected) in [
-        (r"[1,[2,3],]", "[1,[2,3]]"),
-        (r#"{"a":1,"b":[1,2],}"#, r#"{"a":1,"b":[1,2]}"#),
-    ] {
+fn test_jq_lazy_path_trailing_comma_after_container_last_child_is_rejected_2243() -> Result<()> {
+    for input in [r"[1,[2,3],]", r#"{"a":1,"b":[1,2],}"#] {
         let (out, stderr, code) = run_jq_full(&["-c", "if true then . else . end"], Some(input))?;
-        assert_eq!(code, 0, "{input}: stderr: {stderr:?}");
-        assert_eq!(out.trim(), expected, "{input}");
+        assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
+        assert!(
+            names_fault(&stderr, "Invalid JSON text"),
+            "{input}: stderr: {stderr:?}"
+        );
     }
 
     Ok(())
@@ -36546,21 +36533,13 @@ fn test_jq_length_object_rejects_trailing_comma_2307() -> Result<()> {
     Ok(())
 }
 
-/// #2307's own remaining, deliberately deferred gap -- inherited from
-/// `trailing_element_gap_ok`'s unconditional `is_container()` early return
-/// (the same #2243 residual `array` `length` (`len_checked`), `has(key)`,
-/// `keys`, and every other #2261-family fix in this file already has, not
-/// something new here): a trailing stray comma is only caught when the
-/// object's real last field's *value* is a scalar. When it's a container
-/// (array/object, empty or not), `census`/`checked_len` never resolve a
-/// text position to check against, so the fault slips through. Real jq
-/// rejects all four (confirmed live against `/usr/bin/jq` 1.7.1). Pinned
-/// here, same discipline as #1676's own known-gap test above, so a future
-/// fix for *this* narrower residual updates this test rather than landing
-/// uncovered.
+/// #2307's remaining gap, closed by #5654: a trailing stray comma was only caught by `length` when
+/// the object's real last field's *value* was a scalar; a container (array/object, empty or not)
+/// slipped through because `census`/`checked_len` could not tell where it ended. Its end now comes
+/// from the balanced parentheses. Real jq rejects all four (confirmed live against `/usr/bin/jq`
+/// 1.7.1).
 #[test]
-fn test_jq_length_object_trailing_comma_container_last_value_still_a_known_gap_2307() -> Result<()>
-{
+fn test_jq_length_object_trailing_comma_container_last_value_is_rejected_2307() -> Result<()> {
     for input in [
         r#"{"a":{"x":1},}"#,
         r#"{"a":[1,2],}"#,
@@ -36568,8 +36547,11 @@ fn test_jq_length_object_trailing_comma_container_last_value_still_a_known_gap_2
         r#"{"a":[],}"#,
     ] {
         let (out, stderr, code) = run_jq_full(&["-c", "length"], Some(input))?;
-        assert_eq!(code, 0, "input={input}: stderr: {stderr:?}");
-        assert_eq!(out.trim(), "1", "input={input}");
+        assert_eq!(code, 5, "input={input}: out: {out:?}, stderr: {stderr:?}");
+        assert!(
+            names_fault(&stderr, "Invalid JSON text"),
+            "input={input}: stderr: {stderr:?}"
+        );
     }
 
     Ok(())

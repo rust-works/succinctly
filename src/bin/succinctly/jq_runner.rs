@@ -12011,7 +12011,7 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
     match cursor.value() {
         StandardJson::Array(elements) => {
             let mut saw_any = false;
-            let mut last_gap_end = None;
+            let mut last_child = None;
             for (i, child) in elements.cursor_iter().enumerate() {
                 saw_any = true;
                 let start = child.text_position();
@@ -12025,13 +12025,16 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
                 // #1676: reuses `start` (already resolved above) via
                 // `value_at` rather than `child.value()`, which would
                 // re-derive it -- see `scalar_text_end`'s own doc comment.
-                last_gap_end = start.and_then(|s| child.value_at(s).scalar_text_end(s));
+                // Resolved for the last child only, after the loop (#5654: a container's
+                // end is a scan).
+                last_child = Some((child, start));
             }
+            let last_gap_end = last_child
+                .and_then(|(child, start)| start.and_then(|s| child.last_child_text_end(s)));
             // #1676: trailing `,` (`[1,2,]`) or a stray `,` in an
-            // apparently-empty array (`[,]`) -- `last_gap_end` is `None`
-            // both when there's nothing to check yet and when the last
-            // element is itself a container (`scalar_text_end`'s own doc
-            // comment explains why that case is skipped, not just unknown).
+            // apparently-empty array (`[,]`), and (#5654) junk after a last element that is
+            // itself a container -- `last_gap_end` is `None` when there's nothing to check
+            // yet or the end cannot be told.
             if let Some(open_pos) = cursor.text_position() {
                 let gap_start = if saw_any {
                     last_gap_end
@@ -12048,7 +12051,7 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
         StandardJson::Object(fields) => {
             let mut remaining = fields;
             let mut field_index = 0usize;
-            let mut last_gap_end = None;
+            let mut last_value = None;
             while let Some((field, rest)) = remaining.uncons() {
                 let StandardJson::String(k) = field.key() else {
                     return Err(EvalError::malformed_json_text(cursor.text()));
@@ -12065,8 +12068,7 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
                 }
                 validate_json_delimiters(&value_cursor, depth + 1)?;
                 // #1676: same `value_at`-reuse discipline as the array arm.
-                last_gap_end =
-                    value_start.and_then(|s| value_cursor.value_at(s).scalar_text_end(s));
+                last_value = Some((value_cursor, value_start));
                 remaining = rest;
                 field_index += 1;
             }
@@ -12074,7 +12076,10 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
                 return Err(EvalError::malformed_json_text(cursor.text()));
             }
             // #1676: same trailing/empty-gap check as the array arm above,
-            // applied to the last field's *value*.
+            // applied to the last field's *value*, a container included (#5654).
+            let last_gap_end = last_value.and_then(|(value, start): (JsonCursor<'_, W>, _)| {
+                start.and_then(|s| value.last_child_text_end(s))
+            });
             if let Some(open_pos) = cursor.text_position() {
                 let gap_start = if field_index > 0 {
                     last_gap_end
@@ -12550,7 +12555,7 @@ where
                             last_child = Some((child_cursor, pos));
                         }
                         let last_gap_end = last_child.and_then(|(child_cursor, pos)| {
-                            pos.and_then(|s| child_cursor.value_at(s).scalar_text_end(s))
+                            pos.and_then(|s| child_cursor.last_child_text_end(s))
                         });
                         if let Some(gap_start) = last_gap_end {
                             if !c.trailing_element_gap_ok(gap_start, b']') {
@@ -12760,7 +12765,7 @@ where
                             .into());
                         }
                         let last_gap_end = last_value.and_then(|(value_cursor, value_start)| {
-                            value_start.and_then(|s| value_cursor.value_at(s).scalar_text_end(s))
+                            value_start.and_then(|s| value_cursor.last_child_text_end(s))
                         });
                         if let Some(gap_start) = last_gap_end {
                             if !c.trailing_element_gap_ok(gap_start, b'}') {
