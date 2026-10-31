@@ -9119,13 +9119,14 @@ fn find_literal_end(bytes: &[u8], pos: usize) -> Option<usize> {
 /// carried.
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
     // #5291: jq's parser skips a leading BOM here too, but a BOM-only text is still not JSON.
-    let s = s
-        .strip_prefix('\u{feff}')
-        .filter(|rest| !rest.trim().is_empty())
-        .unwrap_or(s)
-        .trim();
+    let s = match s.strip_prefix('\u{feff}') {
+        Some(rest) if !trim_json_whitespace(rest).is_empty() => rest,
+        _ => s,
+    };
+    let s = trim_json_whitespace(s);
+    // Nothing to parse is not `null`: jq refuses `--argjson x ''` (exit 2), as it does `' '`.
     if s.is_empty() {
-        return Ok(OwnedValue::Null);
+        anyhow::bail!("Invalid JSON: empty text");
     }
 
     validate::validate_jq_lenient(s.as_bytes())
@@ -9135,6 +9136,17 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
     // own rather than an incidental by-product of whatever validated it.
     json_bytes_to_owned_value_checked(s.as_bytes())
         .map_err(|e| anyhow::anyhow!("Invalid JSON: {s}: {e}"))
+}
+
+/// The four bytes jq's lexer skips between tokens. Not `char::is_whitespace`, which also takes a
+/// form feed, a vertical tab and the Unicode spaces that jq refuses (#5654).
+fn is_json_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n')
+}
+
+/// `s` without the JSON whitespace at either end (#5654).
+fn trim_json_whitespace(s: &str) -> &str {
+    s.trim_matches(is_json_whitespace)
 }
 
 /// Parse a JSON stream (multiple JSON values) from a string. Backs both
@@ -9182,8 +9194,11 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
     // leaves it standing, to be refused.
     let s = s.strip_prefix('\u{feff}').unwrap_or(s);
     // Each `--slurpfile` file is an input of its own to jq, its lines counted from 1 (#5497).
-    let (text, lead) = (s.as_bytes(), s.len() - s.trim_start().len());
-    let s = s.trim();
+    let (text, lead) = (
+        s.as_bytes(),
+        s.len() - s.trim_start_matches(is_json_whitespace).len(),
+    );
+    let s = trim_json_whitespace(s);
     if s.is_empty() {
         return Ok(vec![]);
     }
@@ -9227,8 +9242,12 @@ fn parse_json_stream_prefix(
     s: &str,
     origin: Option<StreamOrigin<'_>>,
 ) -> (Vec<OwnedValue>, Option<EvalError>) {
-    let (text, lead) = (s.as_bytes(), s.len() - s.trim_start().len());
-    let s = s.trim();
+    // The same trim as [`parse_json_stream`]'s (#5654), so the two accept the same text.
+    let (text, lead) = (
+        s.as_bytes(),
+        s.len() - s.trim_start_matches(is_json_whitespace).len(),
+    );
+    let s = trim_json_whitespace(s);
     if s.is_empty() {
         return (vec![], None);
     }
@@ -14336,6 +14355,46 @@ mod tests {
             identity_exit_status_value(b"\"false\""),
             OwnedValue::Bool(true)
         );
+    }
+
+    /// #5654: only the four bytes jq's lexer skips are trimmed, and nothing at all is not `null`.
+    #[test]
+    fn parse_json_value_trims_json_whitespace_only_5654() {
+        for ok in [" 1 ", "\t\r\n1\r\n", "\u{feff}1", "\u{feff} 1"] {
+            assert_eq!(parse_json_value(ok).unwrap().to_json(), "1", "{ok:?}");
+        }
+        for refused in [
+            "",
+            " ",
+            "\n",
+            "\u{c}",
+            "1\u{c}",
+            "\u{b}1",
+            "1\u{a0}",
+            "\u{2003}1",
+            "\u{feff}",
+            "\u{feff} ",
+        ] {
+            assert!(parse_json_value(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn parse_json_stream_and_its_prefix_trim_the_same_whitespace_5654() {
+        for text in [
+            " [1] [2]\r\n",
+            "\u{c}1",
+            "1\u{b}",
+            "1\u{a0}",
+            "\u{2003}[1]",
+            "  \n",
+            "",
+        ] {
+            let strict = parse_json_stream(text).ok().map(|values| values.len());
+            let (prefix, error) = parse_json_stream_prefix(text, Some(StreamOrigin::ALONE));
+            let by_prefix = error.is_none().then_some(prefix.len());
+            assert_eq!(strict, by_prefix, "{text:?}");
+        }
     }
 
     #[test]
