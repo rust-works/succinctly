@@ -9549,7 +9549,7 @@ the text after each invalid byte became a three-byte U+FFFD, where jq counts the
 so a value within a few bytes of the boundary can be placed one line off. Invalid bytes are
 substituted before the line model sees the text, and a genuine U+FFFD looks the same.
 A number or literal where an object key belongs (`{1.5e3`, `{true`) is no fault to jq's lexer until the token after it, so the read jq resumes at is the one holding that token, which can be a later line (`{1.5e3\n1"k":false` reads nothing more); succinctly does the same since [#5645](https://github.com/rust-works/succinctly/issues/5645).
-A container in the same place (`{[1]\n2\n3\n`) is still met at its bracket, which is what `--stream`'s parser does and not what the plain reader does: jq reads `3` after the error there and succinctly reads `2` and `3` ([#5655](https://github.com/rust-works/succinctly/issues/5655)).
+A container in the same place (`{[1]\n2\n3\n`) is met at the token after it by the plain reader and at its bracket by `--stream`'s parser, in jq and here since [#5655](https://github.com/rust-works/succinctly/issues/5655).
 
 **The materializing flag routes still validate whatever the filter — down to `-n`/`input`
 now, closed by [#2662](https://github.com/rust-works/succinctly/issues/2662) for
