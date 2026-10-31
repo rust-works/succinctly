@@ -411,6 +411,24 @@ fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
     crate::jq::eval::unary_math_apply::<S>(builtin, n)
 }
 
+/// [`crate::jq::eval::owned_binary_math`] of a document number (#5680): the number is read as an
+/// owned value, which is a scalar and a small allocation, and a number that is not a valid RFC 8259
+/// span (a lenient one, a bridge token) is the evaluator's, as for the unary builtins.
+fn binary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
+    builtin: &Builtin,
+    value: &V,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq || !crate::jq::eval::binary_math_operands_are_simple(builtin) {
+        return None;
+    }
+    let text = value.number_text()?;
+    if !crate::json::validate::is_valid_number(text.as_bytes()) {
+        return None;
+    }
+    let owned = to_owned::<S, V>(value).ok()?;
+    crate::jq::eval::owned_binary_math::<S>(builtin, &owned)
+}
+
 /// Whether `expr` starts with a shape [`crate::jq::eval::eval_owned_fast_path`] can answer: the
 /// arithmetic accumulator, a comparison, `and`/`or`/`not`, a literal, navigation, `type` and
 /// `tostring`, or a pipe that starts with one (#5601). A necessary condition only, so the fast
@@ -5067,6 +5085,10 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     // call; the round trip below would write the number out and index it to make it.
     if let Expr::Builtin(builtin) = strip_parens(expr) {
         if let Some(answer) = crate::jq::eval::owned_unary_math::<S>(builtin, &owned) {
+            return GenericResult::Owned(answer);
+        }
+        // #5680: and `pow`/`atan2` with `.` or a literal for operands.
+        if let Some(answer) = crate::jq::eval::owned_binary_math::<S>(builtin, &owned) {
             return GenericResult::Owned(answer);
         }
     }
@@ -36366,6 +36388,13 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             if let Some(answer) = unary_math_of_document_number::<S, V>(builtin, &value) {
                 return GenericResult::Owned(answer);
             }
+            // #5680: `pow(.; 2)` and the other two-operand math calls whose operands are `.` or a
+            // literal, of a document number.
+            if matches!(builtin, Builtin::Pow(..) | Builtin::Atan2(..)) {
+                if let Some(answer) = binary_math_of_document_number::<S, V>(builtin, &value) {
+                    return GenericResult::Owned(answer);
+                }
+            }
             let root = RootWitness::of(cursor.as_ref());
             let expr = builtin_expr(whole, builtin);
             let rooted = reindexed_root_for::<S, _>(&expr, cursor.as_ref());
@@ -41735,6 +41764,102 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// #5680: `pow` and `atan2` with `.` or a literal for operands are answered from the number
+    /// (a document number and a computed one), with the call the builtins make; a generator
+    /// operand fans out and keeps the evaluator. The pin must be able to fail: it does, with
+    /// `owned_binary_math` returning `None`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn pow_and_atan2_of_a_number_are_not_bridged_5680() {
+        use crate::jq::math;
+        use crate::jq::value::reindex_count;
+
+        let json = b"[0.5,2,10,-1.5,3]";
+        let numbers = [0.5, 2.0, 10.0, -1.5, 3.0];
+        let run = |filter: &str| {
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::get();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            assert_eq!(result.len(), 1, "{filter}");
+            (result[0].to_json(), reindex_count::get() - before)
+        };
+        let join = |values: Vec<f64>| {
+            alloc::format!(
+                "[{}]",
+                values
+                    .into_iter()
+                    .map(|n| OwnedValue::Float(n).to_json())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        for (filter, expected) in [
+            (
+                "map(pow(.; 2))",
+                join(numbers.map(|n| math::pow(n, 2.0)).to_vec()),
+            ),
+            (
+                "map(pow(2; .))",
+                join(numbers.map(|n| math::pow(2.0, n)).to_vec()),
+            ),
+            (
+                "map(pow(.; .))",
+                join(numbers.map(|n| math::pow(n, n)).to_vec()),
+            ),
+            (
+                "map(atan2(.; 1))",
+                join(numbers.map(|n| math::atan2(n, 1.0)).to_vec()),
+            ),
+            (
+                "map(atan2(1; .))",
+                join(numbers.map(|n| math::atan2(1.0, n)).to_vec()),
+            ),
+            (
+                "map(. + 1 | pow(.; 2))",
+                join(numbers.map(|n| math::pow(n + 1.0, 2.0)).to_vec()),
+            ),
+            (
+                "map(. * 2 | atan2(.; .))",
+                join(numbers.map(|n| math::atan2(n * 2.0, n * 2.0)).to_vec()),
+            ),
+        ] {
+            let (answer, reindexes) = run(filter);
+            assert_eq!(answer, expected, "{filter}");
+            assert_eq!(reindexes, 0, "{filter} bridged");
+        }
+        // The evaluator's own route (a computed operand, `1 + 1` for `2`) answers the same on
+        // numbers whose reading is delicate: a signed zero, a 17-digit integer, a double past
+        // 2^53, a spelling with a fraction or exponent and a non-finite value.
+        let delicate =
+            b"[-0,-0.0,869389897822472004,9007199254740993,1e19,1.0,1E2,1e500,-1e500,0.1]";
+        let answers = |filter: &str| {
+            let index = JsonIndex::build(delicate);
+            let expr = crate::jq::parse(filter).unwrap();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(delicate).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            result.iter().map(OwnedValue::to_json).collect::<Vec<_>>()
+        };
+        for (fast, evaluator) in [
+            ("map(pow(.; 2))", "map(pow(.; 1 + 1))"),
+            ("map(pow(2; .))", "map(pow(1 + 1; .))"),
+            ("map(pow(.; .))", "map(pow(.; . + 0))"),
+            ("map(atan2(.; 1))", "map(atan2(.; 1 + 0))"),
+            ("map(atan2(-0; .))", "map(atan2(0 * -1; .))"),
+            ("map(atan2(.; -1))", "map(atan2(.; 0 - 1))"),
+            ("map(. + 0 | pow(.; 2))", "map(. + 0 | pow(.; 1 + 1))"),
+        ] {
+            assert_eq!(answers(fast), answers(evaluator), "{fast}");
+        }
+        // A generator operand, a computed operand and a non-number keep the evaluator.
+        assert!(run("map([pow(.; (1, 2))] | .[0])").1 > 0);
+        assert!(run("map(pow(. + 1; 2))").1 > 0);
+        assert!(run("map(tostring | try pow(.; 2) catch 0)").1 > 0);
     }
 
     /// #5601: a number the filter computed meets the next stage without the reindex bridge, and
