@@ -149,7 +149,7 @@ def gen(rng, depth, env):
     if k in (20, 21, 22):
         tpl = rng.choice(ARITY1)
         n = tpl.count("{}")
-        return Node("{} | " + tpl.replace("{}", "\0", n).replace("\0", "{}"), [sub() for _ in range(n + 1)])
+        return Node("{} | " + tpl, [sub() for _ in range(n + 1)])
     if k == 23:
         return Node('"\\({})-\\({})"', [sub(), sub()])
     if k == 24:
