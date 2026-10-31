@@ -1,4 +1,4 @@
-//! A one-pass reader for the JSON that `fromjson` and `tonumber` are almost always handed (#5675).
+//! A one-pass reader for the JSON that `fromjson` is almost always handed (#5675).
 //!
 //! The general route (`validate_jq_lenient`, a semi-index, then `to_owned`) is three passes and
 //! half a dozen allocations for a 90-byte record, 1.75 us a call against jq's 0.9. This reads text
@@ -10,7 +10,11 @@
 //! What it accepts it builds exactly as `to_owned` does: a number goes through
 //! [`OwnedValue::from_number_literal`] from its own spelling, an object through
 //! [`ObjectBuilder`](super::eval_generic::ObjectBuilder), a string as the decoded text. The
-//! differential tests at the foot of this file hold the two to that over generated documents.
+//! differential tests at the foot of this file hold the two to that over generated documents. The
+//! grammar is written twice (here, and in `json::validate` with `to_owned`), so a change to what
+//! the general route accepts or builds has to be mirrored here or declined here.
+//!
+//! `tonumber` reaches this only through its `is_ok()` probe on the error path.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -19,9 +23,13 @@ use super::eval::JqSemantics;
 use super::eval_generic::ObjectBuilder;
 use super::value::OwnedValue;
 
-/// Deeper than this the general route decides (it enforces the document nesting ceiling and
+/// Deeper than this the general route decides (it enforces the document nesting ceilings and
 /// words the refusal).
 const MAX_DEPTH: usize = 64;
+
+// The reader must never accept what a ceiling of the general route refuses.
+const _: () = assert!(MAX_DEPTH <= crate::json::validate::MAX_NESTING_DEPTH);
+const _: () = assert!(MAX_DEPTH <= super::eval_generic::MAX_NESTING_DEPTH);
 
 /// `text` as an [`OwnedValue`] if it is one plain JSON value, optionally surrounded by JSON
 /// whitespace; `None` when it is anything else, for the caller's general route to decide.
@@ -150,7 +158,28 @@ impl Reader<'_> {
                                 return None;
                             }
                             let unit = u32::from_str_radix(hex, 16).ok()?;
-                            // A surrogate half pairs with another or is refused: not decided here.
+                            if (0xd800..0xdc00).contains(&unit) {
+                                // A high half must be followed by a low half; a lone one is the
+                                // general route's (it words the refusal).
+                                if self.bytes.get(at + 6..at + 8)? != b"\\u" {
+                                    return None;
+                                }
+                                let low_hex = self.text.get(at + 8..at + 12)?;
+                                if !low_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                                    return None;
+                                }
+                                let low = u32::from_str_radix(low_hex, 16).ok()?;
+                                if !(0xdc00..0xe000).contains(&low) {
+                                    return None;
+                                }
+                                let c = char::from_u32(
+                                    0x1_0000 + ((unit - 0xd800) << 10) + (low - 0xdc00),
+                                )?;
+                                out.push(c);
+                                at += 12;
+                                continue;
+                            }
+                            // A lone low half is not a character: char::from_u32 declines it.
                             let c = char::from_u32(unit)?;
                             out.push(c);
                             at += 6;
@@ -272,6 +301,7 @@ mod tests {
             "\"abc\"",
             "\"a\\nb\\t\\\"\\\\\\/\"",
             "\"\\u00e9\\u0041\\u0000\"",
+            "\"\\ud83d\\ude00 x \\ud83d\\ude00\"",
             "\"caf\u{e9} \u{1f600}\"",
             "[]",
             "[ ]",
@@ -315,8 +345,11 @@ mod tests {
             "{\"a\" 1}",
             concat!("{", "a:1}"),
             "{\"a\":1,\"a\":2}",
-            "\"\\ud83d\\ude00\"",
             "\"\\ud800\"",
+            "\"\\ud83d\"",
+            "\"\\ud83dx\"",
+            "\"\\ud83d\\u0041\"",
+            "\"\\ude00\"",
             "\"\\x\"",
             "\"\\u12\"",
             "\"a\nb\"",
