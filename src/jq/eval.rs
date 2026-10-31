@@ -12447,6 +12447,25 @@ fn owned_del_run<S: EvalSemantics>(
     path: &Expr,
     state: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
+    // #5670: a comma of distinct plain field names deletes independent keys, so deleting them one
+    // after another is the delete of all of them at once, and each is the single-path delete
+    // rather than a path set merged into a trie. The first branch to raise is the error the
+    // combined resolution raises, and an object has none.
+    if let Some(fields) = distinct_field_branches(path) {
+        let mut state = state;
+        for field in fields {
+            state = match del_on_owned::<Vec<u64>, S>(field, state, false) {
+                QueryResult::Owned(value) => value,
+                QueryResult::Error(error) => return Err(error),
+                _ => {
+                    return Err(EvalError::new(
+                        "internal error: del yielded other than one value",
+                    )); // patchcov: coverage tolerate-line reason="unreachable: a static jq-mode path resolves to paths or an error, never to no output, a break or a halt (#5549)"
+                }
+            };
+        }
+        return Ok(state);
+    }
     match del_on_owned::<Vec<u64>, S>(path, state, false) {
         QueryResult::Owned(value) => Ok(value),
         QueryResult::Error(error) => Err(error),
@@ -12468,6 +12487,33 @@ pub(crate) fn owned_del_target<S: EvalSemantics>(expr: &Expr) -> Option<&Expr> {
     };
     (owned_del_path_shape(path) && !super::eval_generic::embed_table_active())
         .then_some(path.as_ref())
+}
+
+/// The branches of a `del` path that is a comma of at least two plain field names, all different
+/// (#5670): `.a, .b, .c`, through any parentheses. `None` for anything else, including a name that
+/// repeats and a branch that is a deeper path or an index, which keep the merged delete.
+fn distinct_field_branches(path: &Expr) -> Option<Vec<&Expr>> {
+    fn collect<'p>(expr: &'p Expr, out: &mut Vec<&'p Expr>) -> bool {
+        match expr {
+            Expr::Comma(items) => items.iter().all(|item| collect(item, out)),
+            Expr::Paren(inner) => collect(inner, out),
+            Expr::Field(_) => {
+                out.push(expr);
+                true
+            }
+            _ => false,
+        }
+    }
+    let mut branches = Vec::new();
+    if !matches!(path, Expr::Comma(_) | Expr::Paren(_)) || !collect(path, &mut branches) {
+        return None;
+    }
+    let distinct = branches.iter().enumerate().all(|(i, a)| {
+        branches[..i]
+            .iter()
+            .all(|b| !matches!((a, b), (Expr::Field(x), Expr::Field(y)) if x == y))
+    });
+    (branches.len() >= 2 && distinct).then_some(branches)
 }
 
 /// The path grammar of [`owned_del_target`]: one static path, or a comma of them (#5670). jq
