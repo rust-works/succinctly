@@ -5127,13 +5127,6 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
                     };
                 }
             }
-            // #5606: `[e]`, `{k: e}` and `. as $x | body` over the number, where `e` and the body
-            // are shapes the owned routes answer; see `plain_number_answer`. The embed table gates
-            // it as it gates the fast path below: the answer may then be a bound node's own value.
-            // `plain_shape_may_be_answered` first: substituting an `as` body, or answering the
-            // entries of an object before a later one declines, is paid for again by the bridge
-            // (measured without it: +8.5% instructions on `$x | [$x, .] | length`, +6-11% on
-            // `{a: ., b: (. | tojson | length)}`).
             // `has` and `keys` of a container are a boolean and a fresh array of its keys (#5652).
             Expr::Builtin(Builtin::Has(_) | Builtin::Keys) if container => {
                 if let Some(answer) =
@@ -5142,6 +5135,13 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
                     return GenericResult::Owned(answer);
                 }
             }
+            // #5606: `[e]`, `{k: e}` and `. as $x | body` over the number, where `e` and the body
+            // are shapes the owned routes answer; see `plain_number_answer`. The embed table gates
+            // it as it gates the fast path below: the answer may then be a bound node's own value.
+            // `plain_shape_may_be_answered` first: substituting an `as` body, or answering the
+            // entries of an object before a later one declines, is paid for again by the bridge
+            // (measured without it: +8.5% instructions on `$x | [$x, .] | length`, +6-11% on
+            // `{a: ., b: (. | tojson | length)}`).
             Expr::Array(_) | Expr::Object(_) | Expr::As { .. }
                 if plain
                     && !optional
@@ -41826,6 +41826,15 @@ mod tests {
         assert!(reindexes("[.[] | {a: .} | .[]]") > 0);
         assert!(reindexes("[.[] | {a: .} | .a?]") > 0);
         assert!(reindexes("[.[] | {a: .} | .a + 1]") > 0);
+        // yq mode keeps the bridge: its containers carry node metadata and no storage identity.
+        let json = b"[1,50,3]";
+        let index = JsonIndex::build(json);
+        let yq_expr = crate::jq::parse_with_mode("[.[] | {a: .} | .a]", crate::jq::ParserMode::Yq)
+            .expect("filter parses");
+        let before = reindex_count::get();
+        let _ = eval_using::<crate::jq::YqSemantics, _>(&yq_expr, index.root(json).value())
+            .collect_owned::<crate::jq::YqSemantics>();
+        assert!(reindex_count::get() > before, "yq mode skipped the bridge");
     }
 
     /// #3639: a `label` met at a position with no prefetch hook (the absent-
@@ -42432,6 +42441,21 @@ mod tests {
             match result {
                 GenericResult::Owned(v) => assert_eq!(v.to_json(), expected, "{src}"),
                 other => panic!("{src}: expected the closed stage's value, got: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#4053)"
+            }
+        }
+        // And since #5652 `.` and `type` of that value are answered from the tree, as jq answers
+        // them: the value was accepted when it was built, so handing it on adds no depth to walk.
+        for (src, expected) in [(".", None), ("type", Some("\"array\""))] {
+            let result = eval_on_owned::<JqSemantics, crate::json::light::StandardJson<'_, Vec<u64>>>(
+                &crate::jq::parse(src).unwrap(),
+                deep.clone(),
+                false,
+                Reentry::REBUILT,
+            );
+            match (result, expected) {
+                (GenericResult::Owned(v), Some(text)) => assert_eq!(v.to_json(), text, "{src}"),
+                (GenericResult::Owned(OwnedValue::Array(_)), None) => {}
+                (other, _) => panic!("{src}: expected the tree's own answer, got: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#5652)"
             }
         }
         // A stage that reads `.` and is outside the owned fast path's grammar (`type` is inside
