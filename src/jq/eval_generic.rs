@@ -4131,10 +4131,12 @@ impl<V: DocumentValue> core::fmt::Debug for LazyElem<V> {
 /// variant).
 #[derive(Clone)]
 enum LazySource<V: DocumentValue> {
-    /// Bare `arr | map(f)` (#725).
-    Elements(V::Elements),
-    /// Bare `obj | map(f)` (#725).
-    Values(V::Fields),
+    /// Bare `arr | map(f)` (#725). The second field is the last element pulled so far (`None`
+    /// before the first): the gap before the next one is a `,` only after a first, and the
+    /// closing bracket's own gap is read from it when the walk runs out (#5654).
+    Elements(V::Elements, Option<V::Cursor>),
+    /// Bare `obj | map(f)` (#725). The second field is as for `Elements`.
+    Values(V::Fields, Option<V::Cursor>),
     /// `keys_unsorted | map(f)` (#724).
     ///
     /// Carries the mode's duplicate-key rule into the pull itself (#1514)
@@ -4216,8 +4218,8 @@ enum LazySource<V: DocumentValue> {
 impl<V: DocumentValue> core::fmt::Debug for LazySource<V> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Elements(_) => f.write_str("LazySource::Elements(..)"),
-            Self::Values(_) => f.write_str("LazySource::Values(..)"),
+            Self::Elements(..) => f.write_str("LazySource::Elements(..)"),
+            Self::Values(..) => f.write_str("LazySource::Values(..)"),
             Self::Keys(_) => f.write_str("LazySource::Keys(..)"),
             Self::IndexRange { next, len } => f
                 .debug_struct("LazySource::IndexRange")
@@ -4271,18 +4273,33 @@ impl<V: DocumentValue> LazySource<V> {
     /// while every sibling spelling correctly raised).
     fn advance(&mut self) -> Result<Option<LazyElem<V>>, EvalError> {
         Ok(match self {
-            Self::Elements(elements) => {
+            Self::Elements(elements, last) => {
                 let Some((cursor, rest)) = elements.uncons_cursor() else {
+                    // #5654: the gap before the closing bracket, taken once.
+                    child_tail_gap_ok(last.take().as_ref(), b']')?;
                     return Ok(None);
                 };
+                if !cursor.element_gap_ok(last.is_none()) {
+                    return Err(cursor.malformed_delimiter_error());
+                }
                 *elements = rest;
+                *last = Some(cursor);
                 Some(LazyElem::Cursor(cursor))
             }
-            Self::Values(fields) => {
+            Self::Values(fields, last) => {
                 let Some((field, rest)) = fields.uncons() else {
+                    // #1641: no more fields, or a last field that never got a value.
+                    if fields.ends_unpaired() {
+                        return Err(fields.malformed_member_error());
+                    }
+                    child_tail_gap_ok(last.take().as_ref(), b'}')?;
                     return Ok(None);
                 };
+                if !field.delimiters_ok::<V::Fields>(last.is_none()) {
+                    return Err(fields.malformed_member_error());
+                }
                 *fields = rest;
+                *last = Some(field.value_cursor);
                 Some(LazyElem::Cursor(field.value_cursor))
             }
             Self::Keys(keys) => match keys.next() {
@@ -34648,7 +34665,7 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                     return GenericResult::Error(err);
                 }
                 GenericResult::LazySeq(Box::new(
-                    LazySeq::new(LazySource::Elements(elements)).push_map(f, S::TAG),
+                    LazySeq::new(LazySource::Elements(elements, None)).push_map(f, S::TAG),
                 ))
             } else if let Some(fields) = value.as_object() {
                 // #2594: `LazySource::Values`/`collapsed_fields` likewise
@@ -34671,7 +34688,7 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                             .map(|field| field.value_cursor)
                             .collect(),
                     ),
-                    None => LazySource::Values(fields),
+                    None => LazySource::Values(fields, None),
                 };
                 GenericResult::LazySeq(Box::new(LazySeq::new(source).push_map(f, S::TAG)))
             } else if S::TAG == EvalTag::Yq && cursor_is_null(&value, cursor.as_ref()) {

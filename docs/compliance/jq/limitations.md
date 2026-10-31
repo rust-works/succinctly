@@ -5944,11 +5944,11 @@ than the silent `null` it replaced. Reusing the now-established convention keeps
 diagnostic clean. The truncation it left on stdout was the accepted trade until #3265 buffered
 the record.
 
-**Not fixed: `obj | map(f)` has the identical latent gap.** `{invalid: 1} | map(.)` goes through
-`LazySource::Values` in `eval_generic.rs`, whose `uncons` still cannot tell "no more fields" from
+**Fixed in #5654: `obj | map(f)` had the identical latent gap.** `{invalid: 1} | map(.)` goes through
+`LazySource::Values` in `eval_generic.rs`, whose `uncons` cannot tell "no more fields" from
 "the last field never got a value" apart — the same ambiguity `effective_fields_checked` closes for
 bare `.[]`. Left open by #1641, mirroring the `#1629` precedent above rather than silently
-expanding that PR's scope.
+expanding that PR's scope; `LazySource::Values` now asks `ends_unpaired` when the walk runs out.
 
 `LazySource::Keys` -- `keys_unsorted | map(f)`, the sibling variant of the same `advance()`
 match, sourcing from a `DistinctKeyCursors` walk rather than raw `uncons` -- is *not* this
@@ -6230,7 +6230,10 @@ The last child's end now comes from the balanced parentheses (`JsonCursor::conta
 The last node in document order inside it is a leaf; its end plus one closer for each parenthesis that closes after it is where the container ends.
 Only the closers are looked for, so junk inside the last child is that child's own business, found when it is read, and a filter that never reads a malformed member is still not made to validate it (#2103).
 An inner closer's kind is not compared with its opener's, and junk that itself holds a `]` or `}` between the closers is read as one of them.
-The lazy routes (`map(.)`, `first(.[])`) still skip the gap checks, for a scalar last child too.
+`arr | map(f)` and `obj | map(f)` check the gap before each element or member they pull and the one before the closing bracket when the walk runs out (`[1@,2]`, `[1,,2]`, `[1,2,]`, `[1 2]`, `{"a":1,"b":2,}`, `{"a":1,"b"}` are each refused as jq does, #5654).
+A consumer that stops early (`first(.[])`, `map(.) | first`) never pulls past its answer, so a bad gap after it is not seen: `[1@,2] | first(.[])` prints `1` where jq refuses the document.
+Matching jq there would validate the rest of the document for a filter that exists to stop early, which is the lazy-validation trade-off above (#2103); it stands.
+A body that fails on an earlier element reports its own error first: `[[1],[2]@] | map(.+1)` raises `array ([1]) and number (1) cannot be added`, where jq reports the parse error.
 Measured against the build before it (Apple M-series, interleaved, release): `.` and `length` over a record array, a `{"users":[...]}` document and an array of rows are within noise, and `[.[]|.id]|length` over records whose last field is a container reads +7% to +13% (a lookup now locates the end of that field).
 Pinned by `test_jq_lazy_path_trailing_comma_after_container_last_child_is_rejected_2243` in [tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs) and `tests/jq_cli/i5654_container_last.rs`.
 
