@@ -384,6 +384,20 @@ fn push_yq_string_escape(out: &mut String, c: char) {
     }
 }
 
+/// `text` with the redundant leading zeros of its integer part dropped (`007.50` is `7.50`,
+/// `-00e1` is `-0e1`, `00` is `0`), or `None` when it has none (#5615).
+fn strip_redundant_leading_zeros(text: &str) -> Option<String> {
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text),
+    };
+    let zeros = digits.bytes().take_while(|&b| b == b'0').count();
+    let int_len = digits.bytes().take_while(u8::is_ascii_digit).count();
+    // Keep one digit: all-zero integer part (`00`) leaves its last zero.
+    let drop = zeros.min(int_len.saturating_sub(1));
+    (drop > 0).then(|| format!("{sign}{}", &digits[drop..]))
+}
+
 /// Whether `c` can be part of an unquoted path element in yq's lexer (#4237).
 ///
 /// yq's `PathElement` token is `\.[^ ;\}\{\:\[\],\|\.\[\(\)=\n!]+\??`
@@ -1952,8 +1966,9 @@ impl<'a> Parser<'a> {
         // Check for decimal point
         let mut empty_fraction_dot = None;
         if self.peek() == Some('.') {
-            // Look ahead to ensure it's not `..` (recursive descent)
-            if self.peek_str(2) != ".." {
+            // jq's lexer takes the longest match, `1.`, and reads the rest as a field access
+            // (`1..e1` indexes the number 1, #5615); yq mode keeps stopping before `..`.
+            if self.mode == ParserMode::Jq || self.peek_str(2) != ".." {
                 let dot = self.pos - start;
                 self.next(); // consume the dot
                 let fraction_start = self.pos;
@@ -2005,6 +2020,16 @@ impl<'a> Parser<'a> {
             rewritten.as_str()
         } else {
             spelled
+        };
+        // #5615: jq reads the digits as a decNumber, which drops redundant leading zeros
+        // (`00e1` is `0E+1`, `007.50` is `7.50`); RFC 8259 forbids them, so without this the
+        // spelling fails the validity check below and collapses to the double.
+        let trimmed;
+        let num_str = if self.mode == ParserMode::Jq {
+            trimmed = strip_redundant_leading_zeros(num_str);
+            trimmed.as_deref().unwrap_or(num_str)
+        } else {
+            num_str
         };
         // #2936: the literal's double follows the mode. jq reads a program
         // literal through the same 17-digit decNumber rounding it applies to
@@ -9151,7 +9176,8 @@ impl<'a> Parser<'a> {
     /// B` as `-(1 as $i | B)` and `-2 * "ab"` as `-(2 * "ab")`, so the sign
     /// must not fold into the token. The unary-minus arm then binds the
     /// positive literal and absorbs the chain. A postfix `?` scopes too:
-    /// `-2? * 3` is `-(2? * 3)`. Consumes nothing.
+    /// `-2? * 3` is `-(2? * 3)`; so does a postfix `.name` or `.[...]` (`-1..e1`
+    /// and `-1 .e1` index the number 1, #5615). Consumes nothing.
     fn negation_scopes_over_what_follows(&mut self) -> bool {
         // The byte right after the literal settles nearly every case.
         if matches!(self.peek(), None | Some(',' | ']' | ')' | '}' | ';' | '|')) {
@@ -9163,6 +9189,7 @@ impl<'a> Parser<'a> {
         let scopes = self.matches_keyword("as")
             || self.at_postfix_question()
             || match self.peek() {
+                Some('.') => true,
                 Some('*') => peek2 != "*=",
                 Some('%') => peek2 != "%=",
                 Some('/') => peek2 != "//" && peek2 != "/=",
