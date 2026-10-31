@@ -26392,6 +26392,104 @@ fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
     Ok(keyed)
 }
 
+/// jq's bare `min`/`max` over an array, as a single walk that keeps the winner so far (#5683).
+///
+/// Every element is checked and keyed exactly as `collect_cursors_checked` followed by
+/// `key_elements_generic` does it (the #1677/#2261 delimiter checks, `to_owned_cursor`'s checked
+/// conversion), and the winner is the element itself, a cursor, so a duplicate key it holds is not
+/// collapsed (#1687). The first of equal minima and the last of equal maxima win, which is what
+/// `Iterator::min_by`/`max_by` did to the keyed vector. The one difference is which of two faults
+/// in the same array is reported when it has both: this walk meets them in document order.
+fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
+    elements: V::Elements,
+    want_max: bool,
+    optional: bool,
+) -> GenericResult<V> {
+    /// The winner's key: a plain integer is held bare, anything else as the decoded value.
+    enum Key {
+        Int(i64),
+        Owned(OwnedValue),
+    }
+    // The delimiter fault of this array, suppressed by `optional` as `owned_or_suppress!` does.
+    let gap_fault = || {
+        let error = elements.malformed_element_error();
+        if suppresses(&error, optional) {
+            GenericResult::None
+        } else {
+            GenericResult::Error(error)
+        }
+    };
+    // Nothing the walk does changes the table, so it is asked once: while a binding's embedded
+    // node could be handed back instead of a decoded copy (`to_owned_cursor`'s own first test) the
+    // integer read is not taken.
+    let table_live = embed_table::live();
+    let mut winner: Option<(Key, V::Cursor)> = None;
+    let mut last: Option<V::Cursor> = None;
+    let mut rest = elements;
+    let mut is_first = true;
+    while let Some((cursor, next)) = rest.uncons_cursor() {
+        // The position is resolved once and serves the delimiter check and the integer read.
+        let pos = cursor.text_position();
+        let gap_ok = match pos {
+            Some(pos) => {
+                !V::Cursor::HAS_DELIMITER_CHECKS || cursor.element_gap_ok_at(pos, is_first)
+            }
+            None => true,
+        };
+        if !gap_ok {
+            return gap_fault();
+        }
+        let fast = if table_live {
+            None
+        } else {
+            pos.and_then(|pos| cursor.plain_int_at(pos))
+        };
+        let key = match fast {
+            Some(i) => Key::Int(i),
+            // STYLE-0012: raises regardless of `optional`, as `key_elements_generic`'s bare arm
+            // does (see its comment): `to_owned_cursor` raises only decode failures, which
+            // `suppresses` never suppresses, so routing it would be a guaranteed no-op.
+            None => match to_owned_cursor::<S, _>(&cursor) {
+                Ok(key) => Key::Owned(key),
+                Err(error) => return GenericResult::Error(error),
+            },
+        };
+        let replaces = match winner.as_ref() {
+            None => true,
+            Some((best, _)) => {
+                let order = match (&key, best) {
+                    (Key::Int(a), Key::Int(b)) => a.cmp(b),
+                    (Key::Int(a), Key::Owned(b)) => compare_values::<S>(&OwnedValue::Int(*a), b),
+                    (Key::Owned(a), Key::Int(b)) => compare_values::<S>(a, &OwnedValue::Int(*b)),
+                    (Key::Owned(a), Key::Owned(b)) => compare_values::<S>(a, b),
+                };
+                if want_max {
+                    order != core::cmp::Ordering::Less
+                } else {
+                    order == core::cmp::Ordering::Less
+                }
+            }
+        };
+        if replaces {
+            winner = Some((key, cursor));
+        }
+        last = Some(cursor);
+        rest = next;
+        is_first = false;
+    }
+    // #2261: a trailing stray comma after the real last element (`[1,]`).
+    if let Some(last) = last.as_ref() {
+        if !trailing_element_gap_ok(last, b']') {
+            return gap_fault();
+        }
+    }
+    match winner {
+        Some((_, cursor)) => GenericResult::OneCursor(cursor),
+        // jq answers `null` for an empty array.
+        None => GenericResult::Owned(OwnedValue::Null),
+    }
+}
+
 /// Whether the reordering builtins may keep this input's elements as
 /// cursors, or must hand the whole thing to the DOM path instead.
 ///
@@ -35562,6 +35660,17 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 _ => None,
             };
             let dedup = matches!(builtin, Builtin::Unique | Builtin::UniqueBy(_));
+            // #5683: jq's bare `min`/`max` keep the running winner as they walk, rather than
+            // collecting every element's cursor and then every element's key before comparing
+            // them (two vectors of the array's length, once per call, and a comma of the two
+            // paid it twice). The first minimum and the last maximum win, as below.
+            if !S::MIN_MAX_NEED_AN_ELEMENT && matches!(builtin, Builtin::Min | Builtin::Max) {
+                return extremum_streaming_generic::<S, V>(
+                    elements,
+                    matches!(builtin, Builtin::Max),
+                    optional,
+                );
+            }
             // #2261 (systematic sweep): `collect_cursors_checked`, not the
             // unchecked `collect_cursors` this arm used -- every one of
             // these builtins already resolves each element's cursor to
