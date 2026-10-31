@@ -1,8 +1,10 @@
 //! #5616: yq v4.53.3's lexer skips only space, tab and newline between tokens; CR, form feed,
 //! vertical tab, NBSP, U+0085, U+2028 and U+3000 are `lexer: invalid input text`. `--from-file`
 //! reads the file with every CRLF turned into LF (even inside a string literal) and nothing else
-//! touched, so a lone CR in a file is refused like one in an argument. Every row was captured
-//! from yq v4.53.3.
+//! touched, so a lone CR in a file is refused like one in an argument. Three of yq's token regexes
+//! absorb Go's `\s*` (which adds CR and form feed): `:`, the six comparison operators and
+//! `comments=`; a CR or form feed is accepted next to those and nowhere else. Every row was
+//! captured from yq v4.53.3.
 
 use std::process::Command;
 
@@ -26,6 +28,22 @@ const ROWS: &[(&str, Option<&str>)] = &[
     ("1 # a\rb\n+ 1", Some("2\n")),
     ("1\t+\t1", Some("2\n")),
     ("1 +\n1", Some("2\n")),
+    ("{\"a\":\r1}", Some("a: 1\n")),
+    ("{\"a\" :\x0c1}", Some("a: 1\n")),
+    ("{\"a\":\r1,\"b\":\x0c2}", Some("a: 1\nb: 2\n")),
+    (".a ==\r1", Some("false\n")),
+    (".a \x0c== 1", Some("false\n")),
+    ("1\r== 1", Some("true\n")),
+    ("1 !=\x0c2", Some("true\n")),
+    ("1 <\r2", Some("true\n")),
+    ("1 >=\x0c1", Some("true\n")),
+    ("1 <=\r2", Some("true\n")),
+    ("1\r\x0c> 0", Some("true\n")),
+    ("{\"a\"\r:1}", None),
+    ("{\"a\":1,\r\"b\":2}", None),
+    ("1 ==\x0b1", None),
+    (".a =\r1", None),
+    ("[1]|.[\r0]", None),
 ];
 
 fn run(args: &[&str]) -> Result<(String, i32)> {

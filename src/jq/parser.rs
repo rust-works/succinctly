@@ -727,7 +727,7 @@ fn has_unary_minus(text: &str) -> bool {
                     }
                 }
             }
-            c if c.is_whitespace() => {}
+            c if is_program_whitespace(c) => {}
             '-' => {
                 if previous.map_or(true, |p| "([{,:;|=!<>+-*/%".contains(p)) {
                     return true;
@@ -811,7 +811,7 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
     // and comments, repeatedly, wherever it appears in a `def` header.
     fn skip_ws_and_comments(mut rest: &str) -> &str {
         loop {
-            let trimmed = rest.trim_start();
+            let trimmed = rest.trim_start_matches(is_program_whitespace);
             let Some(after_hash) = trimmed.strip_prefix('#') else {
                 return trimmed;
             };
@@ -1603,6 +1603,27 @@ impl<'a> Parser<'a> {
                 _ => break,
             }
         }
+    }
+
+    /// In yq mode, skip Go's `\s` (space, tab, newline, form feed, CR). Three of yq v4.53.3's token
+    /// regexes absorb it where the whitespace token takes only `[ \t\n]+`: `:\s*`, the six
+    /// comparison operators (`\s*==\s*`, `\s*<\s*`, ...) and `comments\s*=` / `comments\s*|=`.
+    /// A CR or form feed anywhere else is `invalid input text` (#5616). jq mode has no such token.
+    fn skip_yq_space(&mut self) {
+        if self.mode != ParserMode::Yq {
+            return;
+        }
+        while self
+            .peek()
+            .is_some_and(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c'))
+        {
+            self.next();
+        }
+    }
+
+    /// Whether the next characters spell a comparison operator.
+    fn at_comparison_op(&self) -> bool {
+        matches!(self.peek_str(2), "==" | "!=") || matches!(self.peek(), Some('<' | '>'))
     }
 
     /// `skip_ws()` after the `.` of a path, except in yq mode when a name character follows
@@ -3114,6 +3135,7 @@ impl<'a> Parser<'a> {
                                 .or_insert(error);
                         }
                         self.next();
+                        self.skip_yq_space();
                         self.skip_ws();
                         self.parse_object_value()?
                     } else if let Some(key_string) = string_key {
@@ -3350,6 +3372,7 @@ impl<'a> Parser<'a> {
             });
         }
         self.next();
+        self.skip_yq_space();
         self.skip_ws();
         let value = self.parse_object_value()?;
         let key = match first {
@@ -5456,6 +5479,7 @@ impl<'a> Parser<'a> {
 
                         self.skip_ws();
                         self.expect(':')?;
+                        self.skip_yq_space();
                         self.skip_ws();
 
                         // Parse the pattern for this key
@@ -9259,6 +9283,11 @@ impl<'a> Parser<'a> {
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
         let left = self.parse_additive()?;
         self.skip_ws();
+        let before_space = self.pos;
+        self.skip_yq_space();
+        if !self.at_comparison_op() {
+            self.pos = before_space;
+        }
 
         let op = match self.peek_str(2) {
             "==" => CompareOp::Eq,
@@ -9281,6 +9310,7 @@ impl<'a> Parser<'a> {
             }
         }
 
+        self.skip_yq_space();
         self.skip_ws();
         let right = self.parse_additive()?;
 
@@ -9416,6 +9446,9 @@ impl<'a> Parser<'a> {
 
         let saved_pos = self.pos;
         self.consume_keyword(keyword);
+        if keyword == "comments" {
+            self.skip_yq_space();
+        }
         self.skip_ws();
 
         let is_update = if self.peek_str(2) == "|=" {
@@ -9454,6 +9487,9 @@ impl<'a> Parser<'a> {
         };
         let saved_pos = self.pos;
         self.consume_keyword(keyword);
+        if keyword == "comments" {
+            self.skip_yq_space();
+        }
         self.skip_ws();
         let matched =
             self.peek_str(2) == "|=" || (self.peek() == Some('=') && self.peek_str(2) != "==");
@@ -10719,21 +10755,62 @@ mod tests {
                     format!("def f: 1; f{c}"),
                 ] {
                     let spaced = text.replace(c, " ");
+                    let parse = |t: &str| parse_with_mode_and_extensions(t, mode, true);
                     if mode == ParserMode::Jq {
-                        assert!(parse_with_mode(&spaced, mode).is_ok(), "control {spaced:?}");
-                    } else if parse_with_mode(&spaced, mode).is_err() {
+                        assert!(parse(&spaced).is_ok(), "control {spaced:?}");
+                    } else if parse(&spaced).is_err() {
                         continue;
                     }
-                    assert!(
-                        parse_with_mode(&text, mode).is_err(),
-                        "{mode:?} mode accepted {text:?}"
-                    );
+                    assert!(parse(&text).is_err(), "{mode:?} mode accepted {text:?}");
                 }
             }
             for text in ["1 +\t1", "1 +\n1", "1 # c\r\n+ 1", "# c\r\n1"] {
                 assert!(
                     parse_with_mode(text, mode).is_ok(),
                     "{mode:?} mode rejected {text:?}"
+                );
+            }
+        }
+    }
+
+    /// #5616: three of yq v4.53.3's token regexes absorb Go's `\s*` (space, tab, newline, form feed,
+    /// CR): `:`, the six comparison operators and `comments=` / `comments|=`. yq mode accepts a CR
+    /// or form feed next to those and nowhere else; jq mode accepts it nowhere.
+    #[test]
+    fn yq_mode_absorbs_go_space_at_the_colon_comparisons_and_comments_5616() {
+        for c in ['\r', '\x0c'] {
+            for text in [
+                format!("{{\"a\":{c}1}}"),
+                format!("{{\"a\" :{c}1,\"b\":{c}2}}"),
+                format!(".a =={c}1"),
+                format!(".a {c}== 1"),
+                format!("1{c}!= 2"),
+                format!("1 <{c}2"),
+                format!("1 <={c}2"),
+                format!("1{c}{c}> 0"),
+                format!(".a comments{c}= \"x\""),
+                format!(".a comments{c}|= \"x\""),
+            ] {
+                assert!(
+                    parse_with_mode(&text, ParserMode::Yq).is_ok(),
+                    "yq mode rejected {text:?}"
+                );
+                assert!(
+                    parse_with_mode(&text, ParserMode::Jq).is_err(),
+                    "jq mode accepted {text:?}"
+                );
+            }
+            for text in [
+                format!("{{\"a\"{c}:1}}"),
+                format!("{{\"a\":1,{c}\"b\":2}}"),
+                format!(".a ={c}1"),
+                format!("1 +{c}1"),
+                format!(".a head_comment{c}= \"x\""),
+                format!(".a comments ={c}\"x\""),
+            ] {
+                assert!(
+                    parse_with_mode(&text, ParserMode::Yq).is_err(),
+                    "yq mode accepted {text:?}"
                 );
             }
         }
