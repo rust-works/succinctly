@@ -9108,11 +9108,11 @@ fn find_literal_end(bytes: &[u8], pos: usize) -> Option<usize> {
 /// carried.
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
     // #5291: jq's parser skips a leading BOM here too, but a BOM-only text is still not JSON.
-    let s = trim_json_whitespace(
-        s.strip_prefix('\u{feff}')
-            .filter(|rest| !trim_json_whitespace(rest).is_empty())
-            .unwrap_or(s),
-    );
+    let s = match s.strip_prefix('\u{feff}') {
+        Some(rest) if !trim_json_whitespace(rest).is_empty() => rest,
+        _ => s,
+    };
+    let s = trim_json_whitespace(s);
     // Nothing to parse is not `null`: jq refuses `--argjson x ''` (exit 2), as it does `' '`.
     if s.is_empty() {
         anyhow::bail!("Invalid JSON: empty text");
@@ -9231,8 +9231,12 @@ fn parse_json_stream_prefix(
     s: &str,
     origin: Option<StreamOrigin<'_>>,
 ) -> (Vec<OwnedValue>, Option<EvalError>) {
-    let (text, lead) = (s.as_bytes(), s.len() - s.trim_start().len());
-    let s = s.trim();
+    // The same trim as [`parse_json_stream`]'s (#5654), so the two accept the same text.
+    let (text, lead) = (
+        s.as_bytes(),
+        s.len() - s.trim_start_matches(is_json_whitespace).len(),
+    );
+    let s = trim_json_whitespace(s);
     if s.is_empty() {
         return (vec![], None);
     }
@@ -14340,6 +14344,52 @@ mod tests {
             identity_exit_status_value(b"\"false\""),
             OwnedValue::Bool(true)
         );
+    }
+
+    /// #5654: only the four bytes jq's lexer skips are trimmed, and nothing at all is not `null`.
+    #[test]
+    fn parse_json_value_trims_json_whitespace_only_5654() {
+        for ok in [" 1 ", "\t\r\n1\r\n", "\u{feff}1", "\u{feff} 1"] {
+            assert_eq!(parse_json_value(ok).unwrap().to_json(), "1", "{ok:?}");
+        }
+        for refused in [
+            "",
+            " ",
+            "\n",
+            "\u{c}",
+            "1\u{c}",
+            "\u{b}1",
+            "1\u{a0}",
+            "\u{2003}1",
+            "\u{feff}",
+            "\u{feff} ",
+        ] {
+            assert!(parse_json_value(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn parse_json_stream_and_its_prefix_trim_the_same_whitespace_5654() {
+        for text in [
+            " [1] [2]\r\n",
+            "\u{c}1",
+            "1\u{b}",
+            "1\u{a0}",
+            "\u{2003}[1]",
+            "  \n",
+            "",
+        ] {
+            let strict = parse_json_stream(text).map(|values| values.len());
+            let (prefix, error) = parse_json_stream_prefix(text, Some(StreamOrigin::ALONE));
+            assert_eq!(
+                (strict.as_ref().ok().copied(), strict.is_err()),
+                (
+                    Some(prefix.len()).filter(|_| error.is_none()),
+                    error.is_some()
+                ),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
