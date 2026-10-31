@@ -6367,10 +6367,9 @@ fn get_inputs(
     // filter that forces a real read (`force_read_under_null_input`, the
     // only way this function is even reached with `args.null_input` true),
     // real jq treats the condition `seq_no_rs_byte_warning` checks for as
-    // a *fatal* error (exit 5), not a warning -- printing the softer
-    // "ignoring parse error" wording there would misrepresent succinctly's
-    // separate, still-unfixed non-fatal behavior as though it now matched
-    // jq; left silent instead until that's fixed properly.
+    // a *fatal* error (exit 5), not a warning -- `input`/`inputs` raise it,
+    // which the `-n` branch below seeds as a trailing parse error (#5636),
+    // so the softer "ignoring parse error" wording is not printed there.
     //
     // The two arms are exactly disjoint: `seq_no_rs_byte_warning` answers
     // `Some` only for a stream with no RS byte anywhere, which is the one
@@ -6383,11 +6382,14 @@ fn get_inputs(
     let mut seq_slurp_position_lost = false;
     // `jq_seq_reader::SeqStreamWalk::deferred_warning` (#3201).
     let mut seq_deferred_warning: Option<String> = None;
+    // The error `-n`'s `input`/`inputs` raise on a `--seq` stream with no RS byte (#5636).
+    let mut seq_abandoned_text: Option<TrailingParseError> = None;
     // The raw walk's value ranges (`jq_seq_reader::SeqStreamWalk::values`,
     // #3247): the same pass that decides jq's warnings decides its values,
     // over the same raw bytes, already cut at #2998's end-of-stream drop.
-    // Empty when no walk runs, which is only #1525's no-RS-byte stream,
-    // where nothing ever leaves `WAITING_FOR_RS`.
+    // Empty for #1525's no-RS-byte stream, where nothing ever leaves
+    // `WAITING_FOR_RS`: the warning arm runs no walk, and under `-n` the walk
+    // finds nothing (`seq_abandoned_text` is what tells the two streams apart).
     let mut seq_values: Vec<(usize, usize)> = Vec::new();
     // And each value's `(source index, line)` from the same walk (#3250).
     let mut seq_value_locations: Vec<(usize, usize)> = Vec::new();
@@ -6403,32 +6405,30 @@ fn get_inputs(
         // does not imply #1525's template: it costs jq a `parser_reset`
         // that leaves the parser reading rather than waiting for an RS, so
         // the reader owns that case too (#1723).
-        let bom_malformed = crate::jq_seq_reader::bom_prefix(&raw_bytes).malformed;
-        seq_slurp_position_lost =
-            match seq_no_rs_byte_warning(&raw_bytes).filter(|_| !bom_malformed) {
-                Some(warning) => {
-                    eprintln!("{warning}");
-                    // #1525's arm prints its own template instead of the
-                    // reader's, but the location still needs the walk. A
-                    // stream with no RS byte anywhere yields nothing, so
-                    // this is the degenerate input, never the hot path --
-                    // and `seq_values` stays empty, correctly: nothing ever
-                    // leaves `WAITING_FOR_RS`, so no value can exist. Only
-                    // read under `-s` below, so the walk is skipped
-                    // otherwise.
-                    args.slurp && crate::jq_seq_reader::slurp_eof_position_lost(&raw_bytes)
-                }
-                None => {
-                    let walk =
-                        crate::jq_seq_reader::walk_stream(&raw_bytes, args.slurp, &mut |warning| {
-                            eprintln!("{warning}");
-                        });
-                    seq_values = walk.values;
-                    seq_value_locations = walk.locations;
-                    seq_deferred_warning = walk.deferred_warning;
-                    walk.slurp_position_lost
-                }
-            };
+        seq_slurp_position_lost = match seq_no_rs_byte_warning(&raw_bytes) {
+            Some(warning) => {
+                eprintln!("{warning}");
+                // #1525's arm prints its own template instead of the
+                // reader's, but the location still needs the walk. A
+                // stream with no RS byte anywhere yields nothing, so
+                // this is the degenerate input, never the hot path --
+                // and `seq_values` stays empty, correctly: nothing ever
+                // leaves `WAITING_FOR_RS`, so no value can exist. Only
+                // read under `-s` below, so the walk is skipped
+                // otherwise.
+                args.slurp && crate::jq_seq_reader::slurp_eof_position_lost(&raw_bytes)
+            }
+            None => {
+                let walk =
+                    crate::jq_seq_reader::walk_stream(&raw_bytes, args.slurp, &mut |warning| {
+                        eprintln!("{warning}");
+                    });
+                seq_values = walk.values;
+                seq_value_locations = walk.locations;
+                seq_deferred_warning = walk.deferred_warning;
+                walk.slurp_position_lost
+            }
+        };
     } else if seq_stream_shape {
         // The only way this function still runs `build_seq_values` with
         // `seq_warnings_apply` false is `-n` forcing a real read: DSV and
@@ -6441,6 +6441,27 @@ fn get_inputs(
         // `-n -s`'s `input`/`inputs` read the deferred warning too.
         seq_deferred_warning = walk.deferred_warning;
         seq_slurp_position_lost = walk.slurp_position_lost;
+        // A stream with no RS byte is never synced onto, so the first read of it raises
+        // `Unfinished abandoned text at EOF` (#5636) -- an error `input` raises and `inputs`
+        // re-raises, at the position of the end of the last source. The same stream without
+        // `-n` only warns (above). A malformed BOM is the reader's case, as there (#1723).
+        // `-s` is left as it was (#5640): jq raises this in place of the slurped array, and this
+        // path still delivers the array, or `[]`, and raises nothing.
+        if !args.slurp {
+            if let (Some((text_line, column)), Some((last, bytes))) =
+                (seq_no_rs_byte_position(&raw_bytes), raw_bytes.last())
+            {
+                let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
+                seq_abandoned_text = Some(TrailingParseError {
+                    error: EvalError::new(format!(
+                        "Unfinished abandoned text at EOF at line {text_line}, column {column}"
+                    )),
+                    source: u32::try_from(last.unwrap_or(0)).unwrap_or(u32::MAX),
+                    line: u32::try_from(newlines).unwrap_or(u32::MAX),
+                    seq_warning: false,
+                });
+            }
+        }
     }
 
     // Answered here, before the UTF-8 substitution below consumes
@@ -6704,13 +6725,14 @@ fn get_inputs(
     // `resumed_errors`.
     let mut resumed_prefixes: Vec<Vec<StreamPrefix>> = Vec::new();
     let prefix_wanted = args.stream && stream_mode(args, track_eof, true) != StreamMode::Off;
-    let mut trailing_error: Option<TrailingParseError> =
+    let mut trailing_error: Option<TrailingParseError> = seq_abandoned_text.or_else(|| {
         seq_deferred_warning.map(|message| TrailingParseError {
             error: EvalError::new(message),
             source: NO_SOURCE,
             line: UNKNOWN_LINE,
             seq_warning: true,
-        });
+        })
+    });
 
     // `--seq` (RFC 7464, #1571) and raw-input (`-R`, #1809): both can
     // genuinely join content across a file boundary -- real jq's own
@@ -9552,6 +9574,24 @@ fn seq_values_with_indices(combined: &[u8], ranges: &[(usize, usize)]) -> Vec<(O
 /// existing "matching jq's own incremental-reader internals precisely"
 /// scope rather than given a separate issue.
 fn seq_no_rs_byte_warning(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<String> {
+    let (line, column) = seq_no_rs_byte_position(raw_bytes)?;
+    Some(crate::jq_seq_reader::ignored_parse_error(&format!(
+        "Unfinished abandoned text at EOF at line {line}, column {column}"
+    )))
+}
+
+/// The `(line, column)` of the end of a `--seq` stream with no RS byte anywhere, which is where
+/// jq's `Unfinished abandoned text at EOF` is reported (#1525); `None` when an RS byte exists or
+/// there is no source at all. [`seq_no_rs_byte_warning`] words it as the warning a non-`-n` run
+/// prints; `-n` with `input`/`inputs` raises it as an error instead (#5636).
+fn seq_no_rs_byte_position(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<(usize, usize)> {
+    // A *malformed* BOM is the one case where "no RS byte anywhere" does not imply #1525's
+    // template: it costs jq a `parser_reset` that leaves the parser reading rather than waiting
+    // for an RS, so the reader owns that case (#1723). One definition for the warning and the
+    // `-n` error (#5636).
+    if crate::jq_seq_reader::bom_prefix(raw_bytes).malformed {
+        return None;
+    }
     let mut line = 1usize;
     let mut column = 0usize;
     // Shares `stream_bytes` with `jq_seq_reader`, which walks this same
@@ -9572,9 +9612,7 @@ fn seq_no_rs_byte_warning(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<Stri
     if raw_bytes.is_empty() {
         return None;
     }
-    Some(crate::jq_seq_reader::ignored_parse_error(&format!(
-        "Unfinished abandoned text at EOF at line {line}, column {column}"
-    )))
+    Some((line, column))
 }
 
 /// Validate that the DSV delimiter is acceptable.
@@ -13776,6 +13814,33 @@ mod tests {
                 .map(|(i, s)| (Some(i), s.to_vec()))
                 .collect();
             seq_no_rs_byte_warning(&raw_bytes)
+        }
+
+        fn position(sources: &[&[u8]]) -> Option<(usize, usize)> {
+            let raw_bytes: Vec<(Option<usize>, Vec<u8>)> = sources
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (Some(i), s.to_vec()))
+                .collect();
+            seq_no_rs_byte_position(&raw_bytes)
+        }
+
+        /// #5636: the `(line, column)` is the order `-n`'s error words it in, the stream's end
+        /// across every source, and a malformed BOM leaves the stream to the reader.
+        #[test]
+        fn position_is_line_then_column_of_the_stream_end() {
+            assert_eq!(position(&[b"1\n"]), Some((2, 0)));
+            assert_eq!(position(&[b"1"]), Some((1, 1)));
+            assert_eq!(position(&[b"1\n2\n"]), Some((3, 0)));
+            assert_eq!(position(&[b"1\n2\n", b"3"]), Some((3, 1)));
+            assert_eq!(position(&[b"1\n2\n", b""]), Some((3, 0)));
+            assert_eq!(position(&[b""]), Some((1, 0)));
+            assert_eq!(position(&[]), None);
+            assert_eq!(position(&[b"\x1e1\n"]), None);
+            // A BOM prefix that never completes still ends the stream abandoned, at column 0
+            // (jq 1.7.1 agrees); `EF B7` is a malformed BOM, which is the reader's case.
+            assert_eq!(position(&[b"\xEF\xBB"]), Some((1, 0)));
+            assert_eq!(position(&[b"\xEF\xB71\n"]), None);
         }
 
         #[test]

@@ -8852,21 +8852,20 @@ fn test_seq_dsv_combo_does_not_warn_1525() -> Result<()> {
     Ok(())
 }
 
-/// #1525: `-n --seq` combined with a filter that forces a real read
-/// (`inputs`) must not print the "ignoring parse error" warning -- real
-/// jq treats this same no-RS-byte condition as a *fatal* error there
-/// (exit 5), not a warning, and succinctly doesn't implement that fatal
-/// path yet (a separate, larger gap than this issue's own scope).
-/// Printing the warning's exact wording in this mode would misrepresent
-/// succinctly's still-unfixed non-fatal behavior as though it matched jq.
+/// #1525, #5636: `-n --seq` combined with a filter that forces a real read (`inputs`) does not
+/// print the "ignoring parse error" warning: real jq treats this same no-RS-byte condition as a
+/// *fatal* error there (exit 5), raised by `inputs`, and so does `succinctly jq` since #5636.
+/// The wording and the marker are jq's (`jq: error (at <stdin>:0): ...`), not the warning's.
 #[test]
-fn test_seq_null_input_with_inputs_does_not_warn_1525() -> Result<()> {
+fn test_seq_null_input_with_inputs_raises_not_warns_1525() -> Result<()> {
     let (stdout, stderr, code) =
         run_jq_full(&["-n", "--seq", "-c", "[inputs]"], Some("1 2")).unwrap();
-    assert_eq!(code, 0, "stderr: {stderr}");
-    assert_eq!(stderr, "");
-    // `--seq` RS-prefixes output too (RFC 7464), same as real jq.
-    assert_eq!(stdout.trim(), "\u{1e}[]");
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert_eq!(
+        stderr,
+        "jq: error (at <stdin>:0): Unfinished abandoned text at EOF at line 1, column 3\n"
+    );
+    assert_eq!(stdout, "");
     Ok(())
 }
 

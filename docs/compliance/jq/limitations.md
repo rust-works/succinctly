@@ -9068,6 +9068,11 @@ $ printf '1 2' | jq --seq -c '.'                  # jq:          jq: ignoring pa
 $ printf '1 2' | succinctly jq --seq -c '.'       # succinctly:  same (#1525)
 ```
 
+Under `-n`, `input` and `inputs` raise that abandonment as an error instead of warning, as jq does (exit 5, `jq: error (at <file>:N): Unfinished abandoned text at EOF at line L, column C`, `N` being the newlines in the last source).
+`try input catch .` catches it and `first(inputs)` raises it, so a program that never reads is unaffected.
+Pinned by `tests/jq_cli/i5636.rs`, whose rows were captured from jq 1.7.1 ([#5636](https://github.com/rust-works/succinctly/issues/5636)).
+Still different, and tracked as [#5640](https://github.com/rust-works/succinctly/issues/5640): under `-n` the reader's *other* parse errors are not raised by `input`/`inputs` at all (an RS-led record that is cut off, a stream that starts with a BOM, a number at EOF without its RS), where jq raises them and exits 5; and `-n -s` raises no abandonment error at all (it delivers the slurped array, or `[]`, and exits 0) where jq raises it, exit 5, in place of any output.
+
 **The messages are not a property of the record; they are a property of where jq's reader
 gave up.** Four earlier attempts looked for a table mapping "what is wrong with this record"
 onto jq's wording and correctly concluded that no such table exists — the *same* malformed
@@ -9290,25 +9295,18 @@ whole -- see "jq's stream can end silently, mid-buffer, with nothing to explain 
 for the multi-record, non-slurp rule that also bears on stdout's contents (#2998), now
 matched rather than diverging.
 
-A second, narrower gap `succinctly jq --seq` also deliberately stays silent on: `-n`
-combined with a filter that forces a real read (`input`/`inputs`) turns the identical
-no-RS-byte condition into a **fatal** error on real jq (exit 5), not a warning:
+`-n` combined with a filter that forces a real read (`input`/`inputs`) turns the identical no-RS-byte condition into a **fatal** error on real jq (exit 5), not a warning.
+`succinctly jq` raises it too since [#5636](https://github.com/rust-works/succinctly/issues/5636), as the section above describes:
 
 ```
 $ printf '1 2' | jq -n --seq -c '[inputs]'
 jq: error (at <stdin>:0): Unfinished abandoned text at EOF at line 1, column 3
 $ printf '1 2' | succinctly jq -n --seq -c '[inputs]'
-[]
+jq: error (at <stdin>:0): Unfinished abandoned text at EOF at line 1, column 3
 ```
 
-`succinctly jq` has never implemented this fatal-vs-warning distinction (predates #1525, not
-a regression); #1525 specifically avoids printing the warning's exact wording in this one
-mode (`!args.null_input` in `seq_no_rs_byte_warning`'s call site,
-[src/bin/succinctly/jq_runner.rs](../../../src/bin/succinctly/jq_runner.rs)), since doing so
-would make the still-wrong exit code/output look like it now matched jq's message. Fixing the
-underlying exit-code divergence properly needs `get_inputs` to be able to raise a real,
-fatal `EvalError` from this specific condition rather than only ever warning or returning
-values — not attempted here.
+It was a silent `[]` with exit 0 before, which #1525 deliberately did not dress up as the warning's wording.
+`test_seq_null_input_with_inputs_raises_not_warns_1525` pins the exit status and the text.
 
 ## Real-time stdout/stderr interleaving
 

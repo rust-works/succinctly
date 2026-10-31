@@ -245,5 +245,6 @@ mod i5615;
 mod i5624;
 mod i5629;
 mod i5635;
+mod i5636;
 mod i5644;
 mod i5650;
