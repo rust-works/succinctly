@@ -32,6 +32,11 @@ const ROWS: &[(&str, &str, bool, &str, &str, i32)] = &[
     ("\u{feff}1\n", "[inputs]", true, "", "jq: error (at <stdin>:1): Unfinished abandoned text at EOF at line 2, column 0\n", 5),
     ("\x1e1 \x1e", "[inputs]", false, "\x1e[1]\n", "", 0),
     ("\x1e1 \x1e", "[inputs]", true, "\x1e[[1]]\n", "", 0),
+    // The stream with no RS byte is raised once (#5636 and #5640 both reach it).
+    ("1 2", "[limit(4;repeat(try input catch .))]", false, "\x1e[\"Unfinished abandoned text at EOF at line 1, column 3\",\"break\",\"break\",\"break\"]\n", "", 0),
+    ("1\n", "[limit(4;repeat(try input catch .))]", true, "\x1e[\"Unfinished abandoned text at EOF at line 2, column 0\",[],\"break\",\"break\"]\n", "", 0),
+    ("1 2", "[limit(4;repeat(try input catch .))]", true, "\x1e[\"Unfinished abandoned text at EOF at line 1, column 3\",[],\"break\",\"break\"]\n", "", 0),
+    ("1\n", "[inputs]", true, "", "jq: error (at <stdin>:1): Unfinished abandoned text at EOF at line 2, column 0\n", 5),
 ];
 
 #[test]
