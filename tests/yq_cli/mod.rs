@@ -154,6 +154,6 @@ mod i5558;
 mod i5590;
 mod i5600;
 mod i5614;
-mod i5616;
 mod i5615;
+mod i5616;
 mod i865;
