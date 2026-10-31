@@ -9306,8 +9306,8 @@ Each error comes behind the values read before it, the reads after it resume, an
 The EOF report jq defers past the stream's last value names `<unknown>` instead of `file:line`.
 No warning is printed in this mode.
 
-One shape still differs: after an empty record (`\x1e\x1e`), `-n` drops the values behind it, where jq yields them.
-That is the end-of-stream rule of #2998 applied to `input`.
+An empty record (`\x1e\x1e`) does not end the stream for `input`/`inputs` either (#5662): the read that meets it raises `break`, as an exhausted stream does, and the next read scans on.
+`inputs` ends at that `break`, so `[inputs]` is `[]` and a second `inputs` yields the values behind the record, as in jq.
 `test_seq_null_input_with_inputs_raises_not_warns_1525` and `tests/jq_cli/i5640.rs` pin the exit status and the text.
 
 ## Real-time stdout/stderr interleaving

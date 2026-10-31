@@ -778,7 +778,9 @@ struct Reader<'a> {
     final_buffer_start: usize,
     /// Whether real jq's non-slurp end-of-stream rule (#2998) applies:
     /// `-s` keeps its own `has_more` loop going past the event that ends a
-    /// non-slurp stream, so the drop below never fires there.
+    /// non-slurp stream, so the drop below never fires there. When the walk
+    /// collects faults (`-n`'s `input`/`inputs`) the drop is a recorded `break`
+    /// instead of a stop: `input` raises it and the next read scans on (#5662).
     drops_at_first_empty_record: bool,
     /// Whether a value or a warning has already been produced at an offset
     /// `>= final_buffer_start`. jq's own driver (`jq_util_input_next_input`,
@@ -901,17 +903,22 @@ impl<'a> Reader<'a> {
     fn emit_warning(&mut self, body: &str) {
         (self.emit)(&ignored_parse_error(body));
         if self.collect_faults {
-            self.faults.push(RecordedFault {
-                body: body.to_string(),
-                values_before: self.values.len(),
-                position_lost: self.fault_position_lost(),
-                at: if self.at_eof {
-                    YIELDED_AT_EOF
-                } else {
-                    self.offset
-                },
-            });
+            self.record_fault(body);
         }
+    }
+
+    /// Record a diagnostic for [`walk_stream_collecting`], with where the reader stands.
+    fn record_fault(&mut self, body: &str) {
+        self.faults.push(RecordedFault {
+            body: body.to_string(),
+            values_before: self.values.len(),
+            position_lost: self.fault_position_lost(),
+            at: if self.at_eof {
+                YIELDED_AT_EOF
+            } else {
+                self.offset
+            },
+        });
     }
 
     /// jq's `parser_reset`. Note it restores `Normal` -- including over a
@@ -1078,7 +1085,16 @@ impl<'a> Reader<'a> {
                 && self.offset >= self.final_buffer_start
                 && !self.yielded_in_final_buffer
             {
-                self.stopped = true;
+                if self.collect_faults {
+                    // #5662: `input` reads through the same driver, and the message-less
+                    // return is its `break` -- the error an exhausted stream raises -- but the
+                    // stream is not over: the next read scans on, and the call that
+                    // performed the terminal refill is spent.
+                    self.record_fault("break");
+                    self.yielded_in_final_buffer = true;
+                } else {
+                    self.stopped = true;
+                }
             }
             self.reset();
             return Ok(());
