@@ -2,7 +2,9 @@
 
 # jq vs succinctly jq
 
-AMD Ryzen 9 7950X 16-Core Processor · Ubuntu 22.04.5 LTS · 32 cores · `5d69bb32c`
+AMD Ryzen 9 7950X 16-Core Processor · Ubuntu 22.04.5 LTS · 32 cores · `92b6ec733`
+
+> Timed binary: a separate build (`cli,simd,regex,serde`), not the harness (#5570).
 
 ## Summary
 
@@ -10,20 +12,22 @@ AMD Ryzen 9 7950X 16-Core Processor · Ubuntu 22.04.5 LTS · 32 cores · `5d69bb
 |-----------------------------|-------|
 | Reference                   | jq-1.7.1 |
 | Smoke differential pass     | 20/20 |
-| Smoke geomean speedup       | 0.92x (0.79x–0.97x) |
+| Smoke geomean speedup       | 0.91x (0.80x–0.99x) |
 | Builtins defined by succinctly | 100.0% of 207 probed (218 listed, 11 not probed) |
 | Builtins agreeing with the reference | 98.1% (203/207) |
-| CLI probes agreeing | 129/136 |
-| Upstream jq test cases agreeing | 714/714 |
+| Syntax-form probes agreeing | 594/595 |
+| CLI probes agreeing | 201/211 |
+| Upstream jq test cases agreeing | 738/738 |
 | JSONTestSuite `y_` accepted / `n_` rejected (`--validate`) | 95/95 · 188/188 |
 | Robustness probes agreeing | 76/85 |
 | Robustness: crashes / timeouts, succinctly | 0 / 3 |
 | Robustness: crashes / timeouts, jq | 1 / 3 |
-| Geomean speedup vs jq-1.7.1 | 1.93x (0.49x–32.80x, n=52) |
-| Geomean speedup vs the secondary reference | 1.88x (0.44x–26.87x, n=52) |
-| Geomean peak RSS vs jq-1.7.1 | 1.65x (0.61x–12.27x) |
-| Timing rows jq wins / noisy (CV > 5%) | 9 / 11 |
-| Known divergences (ledger) | 27 |
+| Geomean speedup vs jq-1.7.1 | 2.04x (0.64x–33.43x, n=52) |
+| Geomean speedup vs the secondary reference | 2.00x (0.58x–28.12x, n=52) |
+| Geomean peak RSS vs jq-1.7.1 | 1.55x (0.58x–9.42x) |
+| Geomean private memory vs jq-1.7.1 | 0.66x (0.17x–24.46x) |
+| Timing rows jq wins / noisy (CV > 5%) | 8 / 6 |
+| Known divergences (ledger) | 31 |
 | Ledger drift | 0 unlisted, 0 stale |
 
 ## Dimensions
@@ -31,7 +35,7 @@ AMD Ryzen 9 7950X 16-Core Processor · Ubuntu 22.04.5 LTS · 32 cores · `5d69bb
 | Dimension | Status |
 |-----------|--------|
 | Smoke (harness check) | implemented |
-| A. Language & builtin coverage | implemented (builtins; syntax forms and the manual's sections are not yet probed) |
+| A. Language & builtin coverage | implemented (builtins and syntax forms; `import`/`include` beyond the library-path fixtures and the manual's prose are not probed) |
 | G. CLI & I/O compatibility | implemented (flags, I/O, exit codes, numbers; colour and locale partially) |
 | B. Behavioural correctness (differential) | implemented (upstream test files; grammar fuzzing and the sweep scripts are not yet folded in) |
 | C. Input handling & validation | implemented (JSONTestSuite; BOM, NUL, depth and stream shapes are probed under G) |
@@ -68,26 +72,26 @@ AMD Ryzen 9 7950X 16-Core Processor · Ubuntu 22.04.5 LTS · 32 cores · `5d69bb
 
 | Query | jq median (MAD) | succinctly median (MAD) | speedup |
 |-------|-----------------|-------------------------|---------|
-| identity | 1.16 (0.02) | 1.21 (0.02) | 0.96x |
-| field | 1.15 (0.06) | 1.18 (0.04) | 0.97x |
-| iterate | 1.13 (0.02) | 1.18 (0.03) | 0.96x |
-| length | 1.15 (0.03) | 1.20 (0.01) | 0.96x |
-| keys | 1.16 (0.02) | 1.20 (0.02) | 0.97x |
-| map_select | 1.15 (0.03) | 1.24 (0.01) | 0.93x |
-| sort_by | 1.12 (0.01) | 1.25 (0.00) | 0.89x |
-| group_by | 1.15 (0.04) | 1.27 (0.01) | 0.90x |
-| reduce | 1.14 (0.02) | 1.31 (0.03) | 0.87x |
-| to_entries | 1.16 (0.04) | 1.29 (0.01) | 0.90x |
-| csv | 1.13 (0.02) | 1.24 (0.03) | 0.91x |
-| tojson | 1.12 (0.02) | 1.29 (0.03) | 0.87x |
-| update | 1.19 (0.04) | 1.28 (0.00) | 0.93x |
-| paths | 1.19 (0.04) | 1.26 (0.04) | 0.95x |
-| limit | 1.17 (0.01) | 1.29 (0.05) | 0.91x |
-| try_catch | 1.15 (0.03) | 1.22 (0.02) | 0.94x |
-| regex | 1.18 (0.01) | 1.50 (0.07) | 0.79x |
-| raw_output | 1.16 (0.04) | 1.20 (0.05) | 0.97x |
-| sort_keys | 1.15 (0.01) | 1.24 (0.04) | 0.93x |
-| big_int | 1.17 (0.03) | 1.20 (0.01) | 0.97x |
+| identity | 1.16 (0.03) | 1.17 (0.02) | 0.99x |
+| field | 1.12 (0.04) | 1.23 (0.03) | 0.91x |
+| iterate | 1.13 (0.03) | 1.17 (0.01) | 0.97x |
+| length | 1.14 (0.03) | 1.20 (0.03) | 0.95x |
+| keys | 1.14 (0.01) | 1.21 (0.04) | 0.94x |
+| map_select | 1.17 (0.03) | 1.30 (0.01) | 0.91x |
+| sort_by | 1.15 (0.01) | 1.34 (0.08) | 0.86x |
+| group_by | 1.17 (0.00) | 1.31 (0.02) | 0.89x |
+| reduce | 1.16 (0.04) | 1.36 (0.07) | 0.85x |
+| to_entries | 1.22 (0.02) | 1.31 (0.03) | 0.93x |
+| csv | 1.17 (0.02) | 1.27 (0.02) | 0.92x |
+| tojson | 1.15 (0.01) | 1.33 (0.04) | 0.87x |
+| update | 1.19 (0.01) | 1.35 (0.05) | 0.88x |
+| paths | 1.21 (0.02) | 1.29 (0.02) | 0.93x |
+| limit | 1.18 (0.04) | 1.26 (0.02) | 0.93x |
+| try_catch | 1.15 (0.03) | 1.27 (0.02) | 0.91x |
+| regex | 1.17 (0.02) | 1.46 (0.02) | 0.80x |
+| raw_output | 1.13 (0.03) | 1.22 (0.01) | 0.93x |
+| sort_keys | 1.19 (0.04) | 1.27 (0.02) | 0.94x |
+| big_int | 1.17 (0.02) | 1.21 (0.02) | 0.97x |
 
 n = 5 interleaved repetitions per row. Startup dominates at this input size; these rows measure process spawn, not throughput.
 
@@ -117,32 +121,57 @@ jq-1.8.1 builtins: 5 match, 0 differ, 4 not implemented, 0 not probed.
 | `have_literal_numbers/0` | not implemented | newer-than-primary: have_literal_numbers is new in jq 1.8; succinctly follows the 1.7.1 pin (ADR-0018). |
 | `trimstr/1` | not implemented | newer-than-primary: trimstr(s) is new in jq 1.8; succinctly follows the 1.7.1 pin (ADR-0018). |
 
+### A. Syntax forms
+
+Operators, paths and slices, construction, control flow, destructuring (`?//` included), functions, string and format forms, assignment and modules, each run on a fixed document. Stdout and exit status must be identical; error wording is not compared.
+
+| Area | Probes | Agree |
+|------|--------|-------|
+| alternative | 13 | 13 |
+| assignment | 79 | 79 |
+| construction | 36 | 36 |
+| control | 53 | 53 |
+| functions | 51 | 51 |
+| modules | 28 | 28 |
+| operators | 64 | 64 |
+| paths-slices | 48 | 48 |
+| strings-formats | 59 | 58 |
+| syntax | 123 | 123 |
+| variables | 41 | 41 |
+
+| Probe | jq exit | succinctly exit | Ledger |
+|-------|---------|-----------------|--------|
+| `str-format-urid` | 5 | 0 | newer-than-primary: `@urid` is new in jq 1.8, which decodes it; jq 1.7.1 answers `urid is not a valid format` (exit 5). succinctly follows the 1.8 behaviour for this format, documented in CLAUDE.md's format table. |
+
 ## G. CLI & I/O compatibility
 
 Stdout and exit status must be identical; stderr wording is not compared.
 
 | Area | Probes | Agree |
 |------|--------|-------|
-| exit | 17 | 17 |
-| files | 8 | 7 |
+| exit | 38 | 37 |
+| files | 8 | 8 |
 | flags | 20 | 20 |
-| input | 24 | 24 |
-| meta | 11 | 5 |
-| numbers | 12 | 12 |
-| output | 17 | 17 |
+| input | 60 | 57 |
+| meta | 13 | 7 |
+| numbers | 15 | 15 |
+| output | 18 | 18 |
 | pipe | 1 | 1 |
-| program | 10 | 10 |
-| vars | 16 | 16 |
+| program | 14 | 14 |
+| vars | 24 | 24 |
 
 | Probe | jq exit | succinctly exit | Ledger |
 |-------|---------|-----------------|--------|
-| `files-missing-continues` | 2 | 2 | to-triage: jq reads the remaining files after one cannot be opened (and exits 2); succinctly stops at the first missing file. |
 | `version` | 0 | 0 | by-design: `--version` names the tool (`succinctly jq ... 0.8.0`), not jq's version token. |
 | `help-exit` | 0 | 0 | by-design: `-h` prints succinctly's own usage text. |
 | `help-long-exit` | 0 | 0 | by-design: `--help` prints succinctly's own usage text. |
 | `build-configuration` | 0 | 0 | by-design: `--build-configuration` describes succinctly's build, not jq's configure line. |
 | `debug-dump-disasm` | 0 | 2 | by-design: succinctly has no bytecode to disassemble; the flag is rejected (exit 2). |
 | `debug-trace` | 0 | 2 | by-design: succinctly has no bytecode to trace; the flag is rejected (exit 2). |
+| `shtest-seq-inputs-eof` | 5 | 0 | to-triage: `printf '1\n' | jq -cen --seq '[inputs] == []'`: jq raises `Unfinished abandoned text at EOF` (exit 5); succinctly answers `true` (exit 0). |
+| `shtest-2378-object-pair` | 5 | 5 | to-triage: `--stream` over `{"a":1,"b",` prints nothing; jq prints the events it read before the parse error (`[["a"],1]`). Both exit 5. |
+| `shtest-2463-nested-key-after-comma` | 5 | 5 | to-triage: `--stream` over `{"x":"y",{"a":"b"}}` prints nothing; jq prints `[["x"],"y"]` before the parse error. Both exit 5. |
+| `shtest-2463-array-key-after-comma` | 5 | 5 | to-triage: `--stream` over `{"x":"y",["a","b"]}` prints nothing; jq prints `[["x"],"y"]` before the parse error. Both exit 5. |
 
 ### Succinctly-only surface (not counted as coverage)
 
@@ -165,6 +194,8 @@ Each case runs through both tools; stdout and exit status must be identical. The
 | upstream-onig.test | 40 | 40 |
 | upstream-man.test | 224 | 224 |
 | upstream-optional.test | 3 | 3 |
+| upstream-base64.test | 7 | 7 |
+| upstream-manonig.test | 17 | 17 |
 
 | Case | Program | Ledger |
 |------|---------|--------|
@@ -199,25 +230,25 @@ Each probe has a 10 s deadline. Class: `ok`, `error` (non-zero exit), `crash` (s
 
 | Probe | jq | succinctly | Ledger |
 |-------|----|-------------|--------|
-| `deep-tojson-built-1000` | ok 0 (2 ms) | error 5 (5 ms) | by-design: `tojson` of a value built 1000 levels deep: jq answers; succinctly raises `nesting depth exceeds limit of 384` (exit 5) for a value it built itself. The ceiling stays since #5497, which aligned parsing and printing with jq: lifting it is a design of its own (ADR-0025), recorded in the Nesting depth section of docs/compliance/jq/limitations.md. |
+| `deep-tojson-built-1000` | ok 0 (2 ms) | error 5 (3 ms) | by-design: `tojson` of a value built 1000 levels deep: jq answers; succinctly raises `nesting depth exceeds limit of 384` (exit 5) for a value it built itself. The ceiling stays since #5497, which aligned parsing and printing with jq: lifting it is a design of its own (ADR-0025), recorded in the Nesting depth section of docs/compliance/jq/limitations.md. |
 | `deep-tojson-built-10000` | ok 0 (3 ms) | error 5 (3 ms) | by-design: Same as deep-tojson-built-1000, at 10000 levels. The ceiling stays since #5497, which aligned parsing and printing with jq: lifting it is a design of its own (ADR-0025), recorded in the Nesting depth section of docs/compliance/jq/limitations.md. |
-| `deep-tojson-built-20000` | ok 0 (6 ms) | error 5 (5 ms) | by-design: Same as deep-tojson-built-1000, at 20000 levels. The ceiling stays since #5497, which aligned parsing and printing with jq: lifting it is a design of its own (ADR-0025), recorded in the Nesting depth section of docs/compliance/jq/limitations.md. |
+| `deep-tojson-built-20000` | ok 0 (6 ms) | error 5 (3 ms) | by-design: Same as deep-tojson-built-1000, at 20000 levels. The ceiling stays since #5497, which aligned parsing and printing with jq: lifting it is a design of its own (ADR-0025), recorded in the Nesting depth section of docs/compliance/jq/limitations.md. |
 | `deep-built-equal` | ok 0 (2 ms) | error 5 (3 ms) | by-design: `==` on a value built 5000 levels deep: jq answers; succinctly raises the 384-level depth error. The ceiling stays since #5497, which aligned parsing and printing with jq: lifting it is a design of its own (ADR-0025), recorded in the Nesting depth section of docs/compliance/jq/limitations.md. |
 | `deep-built-sort` | ok 0 (2 ms) | error 5 (3 ms) | by-design: `sort` over a value built 3000 levels deep: jq answers; succinctly raises the 384-level depth error. The ceiling stays since #5497, which aligned parsing and printing with jq: lifting it is a design of its own (ADR-0025), recorded in the Nesting depth section of docs/compliance/jq/limitations.md. |
-| `recursion-depth-10000` | ok 0 (4373 ms) | timeout signal (10007 ms) | by-design: A user-defined function recursing 10000 deep: jq answers (about 3 s); succinctly's stack guard refuses with `exceeded maximum recursion depth` (ADR-0025). |
-| `recursion-depth-100000` | timeout signal (10001 ms) | timeout signal (10008 ms) | by-design: Recursion 100000 deep: jq does not finish within 10 s; succinctly's stack guard refuses (ADR-0025). |
-| `regex-gsub-large` | timeout signal (10007 ms) | ok 0 (27 ms) | reference-slow: `gsub("a";"b")` over 100000 characters: jq 1.7.1 does not finish within 10 s; succinctly answers in tens of milliseconds. |
+| `recursion-depth-10000` | ok 0 (4364 ms) | timeout signal (10007 ms) | by-design: A user-defined function recursing 10000 deep: jq answers (about 3 s); succinctly's stack guard refuses with `exceeded maximum recursion depth` (ADR-0025). |
+| `recursion-depth-100000` | timeout signal (10002 ms) | timeout signal (10007 ms) | by-design: Recursion 100000 deep: jq does not finish within 10 s; succinctly's stack guard refuses (ADR-0025). |
+| `regex-gsub-large` | timeout signal (10006 ms) | ok 0 (27 ms) | reference-slow: `gsub("a";"b")` over 100000 characters: jq 1.7.1 does not finish within 10 s; succinctly answers in tens of milliseconds. |
 | `error-deep-message` | ok 0 (2 ms) | error 5 (3 ms) | by-design: `error(<value built 2000 levels deep>)` caught and measured: jq answers; succinctly raises the 384-level depth error. The ceiling stays since #5497, which aligned parsing and printing with jq: lifting it is a design of its own (ADR-0025), recorded in the Nesting depth section of docs/compliance/jq/limitations.md. |
 | `array-set-too-huge-index` | crash signal (6 ms) | error 5 (2 ms) | reference-crash: `[] | .[1e12] = 1`: jq aborts (SIGSEGV); succinctly refuses the index with an error (exit 5, #5500). |
-| `recursion-tail-100000` | timeout signal (10002 ms) | timeout signal (10008 ms) | by-design: Tail-position recursion 100000 deep: jq does not finish within 10 s; succinctly's stack guard refuses (ADR-0025), so it gets no tail-call elimination. |
+| `recursion-tail-100000` | timeout signal (10002 ms) | timeout signal (10007 ms) | by-design: Tail-position recursion 100000 deep: jq does not finish within 10 s; succinctly's stack guard refuses (ADR-0025), so it gets no tail-call elimination. |
 
 ## H. Platform and operational properties
 
 | Tool | Binary size | Dynamic libraries | CPU time ÷ wall time (`.` on 10 MB) |
 |------|-------------|-------------------|--------------------------------------|
-| succinctly jq | 23.9 MiB | 4 | 0.83 |
+| succinctly jq | 22.4 MiB | 4 | 1.00 |
 | jq-1.7.1 | 2.5 MiB | 3 | 0.94 |
-| jq-1.8.1 | 2.6 MiB | 3 | 0.94 |
+| jq-1.8.1 | 2.6 MiB | 3 | 1.00 |
 
 A ratio near 1.00 means one thread. Rust dependencies of the shipped feature set (`cargo tree -e normal`): 53. Build time is not measured.
 
@@ -230,141 +261,143 @@ A ratio near 1.00 means one thread. Rust dependencies of the shipped feature set
 
 ## D. Performance (process spawn, ms; matching outputs only)
 
-Median of 5 interleaved repetitions (fewer at 100 MB), CV in parentheses; the tool order rotates each repetition. A speedup is reference ÷ succinctly, so below 1.00x jq is faster. `1.8.1 ÷ 1.7.1` is the secondary reference's own change in speed.
+Median of interleaved repetitions (5 requested, fewer at 100 MB; a row over 15 ms is topped up to 21 where the time allows), CV in parentheses; the tool order rotates each repetition. A speedup is reference ÷ succinctly, so below 1.00x jq is faster, and is a ratio of medians except where marked †: a row that long is moved by run-to-run noise, so its ratio is of each tool's fastest of the 21 runs, which the noise moves least (the times beside it stay medians). A row marked `CV>5%` is noise-dominated, and its ratio is not a finding on its own. `1.8.1 ÷ 1.7.1` is the secondary reference's own change in speed, always of medians.
 
 ### Where jq is faster
 
-| Query | Input | jq 1.7.1 | succinctly | speedup |
-|-------|-------|----------|------------|---------|
-| startup | none | 1.4 (6%) | 1.4 (3%) | 0.94x |
-| users_assign_update | users-1mb | 9.2 (4%) | 15.3 (2%) | 0.60x |
-| users_del | users-1mb | 9.5 (3%) | 17.9 (2%) | 0.53x |
-| users_tojson_roundtrip | users-1mb | 22.4 (1%) | 35.5 (1%) | 0.63x |
-| users_stream | users-1mb | 27.1 (1%) | 54.9 (0%) | 0.49x |
-| numbers_max | numbers-1mb | 12.8 (2%) | 15.0 (5%) | 0.85x |
-| numbers_map_floor | numbers-1mb | 34.1 (1%) | 39.0 (1%) | 0.87x |
-| strings_split | strings-1mb | 11.7 (2%) | 12.6 (1%) | 0.93x |
-| wide_to_entries | wide-1mb | 62.1 (1%) | 64.7 (1%) | 0.96x |
+| Query | Input | jq 1.7.1 | succinctly | speedup | CV>5% |
+|-------|-------|----------|------------|---------|-------|
+| startup | none | 1.3 (3%) | 1.4 (0%) | 0.90x |  |
+| users_assign_update | users-1mb | 9.3 (0%) | 14.4 (2%) | 0.64x |  |
+| users_del | users-1mb | 9.4 (0%) | 14.5 (2%) | 0.65x |  |
+| users_tojson_roundtrip | users-1mb | 22.6 (1%) | 30.3 (2%) | 0.75x† |  |
+| users_stream | users-1mb | 27.0 (1%) | 42.1 (3%) | 0.65x† |  |
+| numbers_max | numbers-1mb | 12.9 (2%) | 14.2 (0%) | 0.91x |  |
+| strings_split | strings-1mb | 11.9 (2%) | 12.3 (1%) | 0.97x |  |
+| wide_to_entries | wide-1mb | 62.8 (2%) | 65.1 (2%) | 0.96x† |  |
 
 ### All timed rows
 
 | Query | Input | jq 1.7.1 | succinctly | vs 1.7.1 | jq 1.8.1 | vs 1.8.1 | 1.8.1 ÷ 1.7.1 | CV>5% |
 |-------|-------|----------|------------|----------|----------|----------|---------------|-------|
-| startup | none | 1.4 (6%) | 1.4 (3%) | 0.94x | 1.3 (2%) | 0.87x | 0.92x | yes |
-| identity | users-1mb | 17.1 (0%) | 8.3 (0%) | 2.05x | 17.6 (3%) | 2.10x | 1.02x |  |
-| identity | numbers-1mb | 22.6 (1%) | 7.1 (3%) | 3.20x | 22.7 (1%) | 3.22x | 1.01x |  |
-| identity | strings-1mb | 12.1 (1%) | 4.5 (2%) | 2.66x | 12.1 (1%) | 2.67x | 1.00x |  |
-| identity | wide-1mb | 31.6 (2%) | 12.9 (2%) | 2.45x | 32.3 (2%) | 2.51x | 1.02x |  |
-| identity | nested-1mb | 13.6 (1%) | 4.5 (2%) | 3.01x | 13.4 (1%) | 2.98x | 0.99x |  |
-| identity | comprehensive-1mb | 31.5 (1%) | 11.3 (1%) | 2.78x | 32.4 (0%) | 2.86x | 1.03x |  |
-| identity_compact | users-1mb | 15.4 (1%) | 3.4 (4%) | 4.47x | 15.2 (2%) | 4.40x | 0.98x |  |
-| identity_compact | numbers-1mb | 21.0 (0%) | 3.9 (3%) | 5.39x | 20.4 (1%) | 5.24x | 0.97x |  |
-| identity_compact | strings-1mb | 12.1 (1%) | 3.3 (3%) | 3.65x | 12.0 (0%) | 3.61x | 0.99x |  |
-| identity_compact | wide-1mb | 30.8 (2%) | 6.6 (4%) | 4.63x | 30.3 (1%) | 4.55x | 0.98x |  |
-| identity_compact | nested-1mb | 13.4 (0%) | 3.5 (7%) | 3.77x | 13.4 (1%) | 3.79x | 1.01x | yes |
-| identity_compact | comprehensive-1mb | 26.4 (2%) | 10.7 (4%) | 2.47x | 25.4 (6%) | 2.38x | 0.96x | yes |
-| users_field | users-1mb | 9.0 (1%) | 3.1 (2%) | 2.89x | 9.0 (2%) | 2.89x | 1.00x |  |
-| users_length | users-1mb | 9.6 (1%) | 3.3 (2%) | 2.87x | 9.3 (2%) | 2.79x | 0.97x |  |
-| users_names | users-1mb | 10.1 (1%) | 5.3 (4%) | 1.92x | 9.7 (2%) | 1.85x | 0.97x |  |
-| users_map_select | users-1mb | 11.2 (3%) | 6.9 (2%) | 1.62x | 11.0 (1%) | 1.58x | 0.98x |  |
-| users_sort_by | users-1mb | 16.0 (4%) | 11.0 (3%) | 1.45x | 16.2 (3%) | 1.47x | 1.01x |  |
-| users_group_by | users-1mb | 17.0 (2%) | 10.5 (1%) | 1.61x | 16.0 (1%) | 1.52x | 0.94x |  |
-| users_unique_by | users-1mb | 16.9 (3%) | 10.7 (3%) | 1.58x | 16.1 (3%) | 1.50x | 0.95x |  |
-| users_reduce | users-1mb | 10.6 (1%) | 8.7 (2%) | 1.21x | 10.5 (2%) | 1.20x | 0.99x |  |
-| users_to_entries | users-1mb | 9.1 (3%) | 3.3 (2%) | 2.77x | 8.9 (2%) | 2.71x | 0.98x |  |
-| users_csv | users-1mb | 16.4 (3%) | 12.9 (2%) | 1.27x | 16.0 (1%) | 1.24x | 0.98x |  |
-| users_regex | users-1mb | 15.5 (1%) | 8.9 (1%) | 1.74x | 15.6 (2%) | 1.75x | 1.00x |  |
-| users_ascii_downcase | users-1mb | 27.0 (2%) | 7.8 (4%) | 3.46x | 24.7 (0%) | 3.16x | 0.91x |  |
-| users_first_early_exit | users-1mb | 9.1 (1%) | 3.0 (1%) | 3.03x | 9.1 (0%) | 3.01x | 0.99x |  |
-| users_limit_early_exit | users-1mb | 9.2 (1%) | 2.9 (9%) | 3.11x | 9.1 (1%) | 3.09x | 0.99x | yes |
-| users_assign_update | users-1mb | 9.2 (4%) | 15.3 (2%) | 0.60x | 9.0 (3%) | 0.59x | 0.98x |  |
-| users_del | users-1mb | 9.5 (3%) | 17.9 (2%) | 0.53x | 9.3 (6%) | 0.52x | 0.98x | yes |
-| users_paths | users-1mb | 34.2 (2%) | 21.4 (2%) | 1.59x | 32.1 (1%) | 1.50x | 0.94x |  |
-| users_tojson_roundtrip | users-1mb | 22.4 (1%) | 35.5 (1%) | 0.63x | 22.3 (1%) | 0.63x | 0.99x |  |
-| users_walk | users-1mb | 78.0 (1%) | 26.9 (1%) | 2.90x | 71.4 (1%) | 2.65x | 0.92x |  |
-| users_slurp | users-1mb | 8.8 (3%) | 3.7 (9%) | 2.36x | 8.9 (2%) | 2.39x | 1.02x | yes |
-| users_stream | users-1mb | 27.1 (1%) | 54.9 (0%) | 0.49x | 24.2 (1%) | 0.44x | 0.89x |  |
-| numbers_add | numbers-1mb | 27.9 (2%) | 26.3 (1%) | 1.06x | 28.0 (1%) | 1.07x | 1.00x |  |
-| numbers_sort | numbers-1mb | 45.3 (1%) | 30.8 (1%) | 1.47x | 45.1 (3%) | 1.46x | 1.00x |  |
-| numbers_max | numbers-1mb | 12.8 (2%) | 15.0 (5%) | 0.85x | 12.7 (1%) | 0.85x | 0.99x | yes |
-| numbers_map_floor | numbers-1mb | 34.1 (1%) | 39.0 (1%) | 0.87x | 33.1 (0%) | 0.85x | 0.97x |  |
-| strings_length | strings-1mb | 8.2 (2%) | 5.5 (2%) | 1.49x | 7.9 (2%) | 1.44x | 0.97x |  |
-| strings_upcase | strings-1mb | 334.4 (1%) | 10.2 (3%) | 32.80x | 273.9 (0%) | 26.87x | 0.82x |  |
-| strings_split | strings-1mb | 11.7 (2%) | 12.6 (1%) | 0.93x | 11.9 (0%) | 0.95x | 1.02x |  |
-| strings_test | strings-1mb | 12.1 (1%) | 8.8 (2%) | 1.39x | 12.3 (1%) | 1.41x | 1.02x |  |
-| wide_keys | wide-1mb | 30.6 (1%) | 7.7 (3%) | 3.97x | 30.3 (1%) | 3.93x | 0.99x |  |
-| wide_to_entries | wide-1mb | 62.1 (1%) | 64.7 (1%) | 0.96x | 62.1 (2%) | 0.96x | 1.00x |  |
-| wide_map_values | wide-1mb | 128.3 (1%) | 58.7 (1%) | 2.19x | 115.9 (1%) | 1.98x | 0.90x |  |
-| wide_add_values | wide-1mb | 37.0 (1%) | 33.4 (2%) | 1.11x | 37.5 (1%) | 1.12x | 1.01x |  |
-| wide_with_entries | wide-1mb | 306.7 (2%) | 166.8 (1%) | 1.84x | 283.1 (0%) | 1.70x | 0.92x |  |
-| nested_paths | nested-1mb | 6.3 (3%) | 3.7 (6%) | 1.72x | 6.2 (2%) | 1.68x | 0.98x | yes |
-| nested_recurse | nested-1mb | 6.2 (3%) | 4.2 (6%) | 1.47x | 6.3 (2%) | 1.49x | 1.01x | yes |
-| comprehensive_paths | comprehensive-1mb | 79.1 (5%) | 45.7 (4%) | 1.73x | 74.0 (2%) | 1.62x | 0.93x | yes |
-| comprehensive_tostream | comprehensive-1mb | 162.6 (1%) | 82.5 (9%) | 1.97x | 155.4 (0%) | 1.88x | 0.96x | yes |
-| comprehensive_numbers | comprehensive-1mb | 58.3 (1%) | 29.1 (1%) | 2.01x | 56.5 (1%) | 1.94x | 0.97x |  |
+| startup | none | 1.3 (3%) | 1.4 (0%) | 0.90x | 1.2 (2%) | 0.85x | 0.94x |  |
+| identity | users-1mb | 17.1 (2%) | 8.2 (1%) | 2.08x† | 17.5 (1%) | 2.13x† | 1.02x |  |
+| identity | numbers-1mb | 22.6 (1%) | 7.2 (2%) | 3.23x† | 22.7 (2%) | 3.23x† | 1.00x |  |
+| identity | strings-1mb | 12.2 (2%) | 4.3 (3%) | 2.83x | 12.4 (3%) | 2.85x | 1.01x |  |
+| identity | wide-1mb | 31.5 (2%) | 12.9 (1%) | 2.44x† | 32.1 (1%) | 2.50x† | 1.02x |  |
+| identity | nested-1mb | 13.5 (0%) | 4.3 (2%) | 3.16x | 13.5 (1%) | 3.15x | 1.00x |  |
+| identity | comprehensive-1mb | 31.7 (1%) | 11.2 (2%) | 2.86x† | 31.9 (1%) | 2.84x† | 1.01x |  |
+| identity_compact | users-1mb | 15.4 (2%) | 3.3 (4%) | 4.69x† | 15.1 (1%) | 4.66x† | 0.98x |  |
+| identity_compact | numbers-1mb | 20.9 (2%) | 4.0 (4%) | 5.38x† | 20.5 (1%) | 5.29x† | 0.98x |  |
+| identity_compact | strings-1mb | 12.1 (2%) | 3.1 (8%) | 3.84x | 12.0 (1%) | 3.81x | 0.99x | yes |
+| identity_compact | wide-1mb | 30.4 (1%) | 6.2 (2%) | 4.94x† | 30.1 (1%) | 4.91x† | 0.99x |  |
+| identity_compact | nested-1mb | 13.3 (1%) | 3.3 (3%) | 4.08x | 13.5 (1%) | 4.13x | 1.01x |  |
+| identity_compact | comprehensive-1mb | 26.2 (2%) | 10.6 (1%) | 2.42x† | 25.6 (2%) | 2.40x† | 0.98x |  |
+| users_field | users-1mb | 9.0 (2%) | 3.1 (0%) | 2.92x | 9.0 (1%) | 2.90x | 0.99x |  |
+| users_length | users-1mb | 9.6 (0%) | 3.2 (3%) | 3.02x | 9.4 (2%) | 2.96x | 0.98x |  |
+| users_names | users-1mb | 10.0 (1%) | 5.4 (1%) | 1.83x | 10.1 (3%) | 1.86x | 1.01x |  |
+| users_map_select | users-1mb | 11.1 (4%) | 6.9 (2%) | 1.60x | 11.1 (3%) | 1.60x | 1.00x |  |
+| users_sort_by | users-1mb | 16.0 (2%) | 10.6 (2%) | 1.48x† | 15.5 (1%) | 1.46x† | 0.97x |  |
+| users_group_by | users-1mb | 16.7 (3%) | 10.3 (2%) | 1.58x† | 16.2 (5%) | 1.55x† | 0.97x |  |
+| users_unique_by | users-1mb | 17.1 (3%) | 10.5 (2%) | 1.59x† | 16.2 (2%) | 1.55x† | 0.95x |  |
+| users_reduce | users-1mb | 10.5 (1%) | 8.3 (1%) | 1.27x | 10.4 (2%) | 1.25x | 0.99x |  |
+| users_to_entries | users-1mb | 9.1 (1%) | 3.4 (7%) | 2.71x | 9.1 (1%) | 2.70x | 1.00x | yes |
+| users_csv | users-1mb | 16.2 (2%) | 12.5 (1%) | 1.28x† | 15.8 (1%) | 1.25x† | 0.98x |  |
+| users_regex | users-1mb | 15.9 (1%) | 8.8 (2%) | 1.82x† | 15.7 (2%) | 1.80x† | 0.99x |  |
+| users_ascii_downcase | users-1mb | 27.4 (1%) | 7.6 (3%) | 3.65x† | 24.7 (1%) | 3.28x† | 0.90x |  |
+| users_first_early_exit | users-1mb | 9.5 (8%) | 3.0 (5%) | 3.14x | 9.1 (3%) | 3.01x | 0.96x | yes |
+| users_limit_early_exit | users-1mb | 8.9 (2%) | 3.0 (8%) | 2.97x | 9.1 (2%) | 3.03x | 1.02x | yes |
+| users_assign_update | users-1mb | 9.3 (0%) | 14.4 (2%) | 0.64x | 9.0 (2%) | 0.62x | 0.97x |  |
+| users_del | users-1mb | 9.4 (0%) | 14.5 (2%) | 0.65x | 9.3 (3%) | 0.65x | 0.99x |  |
+| users_paths | users-1mb | 33.8 (1%) | 21.2 (2%) | 1.60x† | 32.3 (1%) | 1.55x† | 0.96x |  |
+| users_tojson_roundtrip | users-1mb | 22.6 (1%) | 30.3 (2%) | 0.75x† | 22.3 (2%) | 0.74x† | 0.99x |  |
+| users_walk | users-1mb | 78.1 (1%) | 25.7 (2%) | 3.08x† | 71.8 (1%) | 2.85x† | 0.92x |  |
+| users_slurp | users-1mb | 8.7 (3%) | 3.6 (4%) | 2.40x | 9.0 (2%) | 2.48x | 1.03x |  |
+| users_stream | users-1mb | 27.0 (1%) | 42.1 (3%) | 0.65x† | 24.1 (1%) | 0.58x† | 0.89x |  |
+| numbers_add | numbers-1mb | 28.1 (1%) | 11.0 (1%) | 2.55x† | 27.6 (1%) | 2.54x† | 0.98x |  |
+| numbers_sort | numbers-1mb | 45.4 (1%) | 30.9 (1%) | 1.49x† | 45.4 (2%) | 1.48x† | 1.00x |  |
+| numbers_max | numbers-1mb | 12.9 (2%) | 14.2 (0%) | 0.91x | 12.7 (1%) | 0.89x | 0.99x |  |
+| numbers_map_floor | numbers-1mb | 33.8 (1%) | 24.2 (2%) | 1.40x† | 33.4 (1%) | 1.39x† | 0.99x |  |
+| strings_length | strings-1mb | 7.9 (1%) | 5.2 (3%) | 1.52x | 7.9 (2%) | 1.51x | 1.00x |  |
+| strings_upcase | strings-1mb | 333.1 (1%) | 9.9 (2%) | 33.43x† | 275.0 (1%) | 28.12x† | 0.83x |  |
+| strings_split | strings-1mb | 11.9 (2%) | 12.3 (1%) | 0.97x | 12.0 (1%) | 0.97x | 1.01x |  |
+| strings_test | strings-1mb | 12.1 (1%) | 9.0 (1%) | 1.36x | 12.5 (1%) | 1.39x | 1.03x |  |
+| wide_keys | wide-1mb | 30.8 (1%) | 7.6 (2%) | 4.06x† | 30.3 (1%) | 4.03x† | 0.99x |  |
+| wide_to_entries | wide-1mb | 62.8 (2%) | 65.1 (2%) | 0.96x† | 61.7 (1%) | 0.95x† | 0.98x |  |
+| wide_map_values | wide-1mb | 128.6 (1%) | 58.9 (2%) | 2.16x† | 116.1 (2%) | 1.98x† | 0.90x |  |
+| wide_add_values | wide-1mb | 37.7 (1%) | 33.3 (1%) | 1.15x† | 37.5 (1%) | 1.15x† | 0.99x |  |
+| wide_with_entries | wide-1mb | 308.8 (1%) | 168.0 (1%) | 1.83x† | 285.4 (1%) | 1.72x† | 0.92x |  |
+| nested_paths | nested-1mb | 6.2 (2%) | 3.5 (5%) | 1.76x | 6.2 (3%) | 1.76x | 1.00x | yes |
+| nested_recurse | nested-1mb | 6.1 (1%) | 4.1 (2%) | 1.48x | 6.2 (2%) | 1.50x | 1.01x |  |
+| comprehensive_paths | comprehensive-1mb | 79.5 (2%) | 45.8 (3%) | 1.76x† | 75.4 (1%) | 1.69x† | 0.95x |  |
+| comprehensive_tostream | comprehensive-1mb | 161.8 (2%) | 82.3 (6%) | 1.95x† | 156.5 (1%) | 1.91x† | 0.97x | yes |
+| comprehensive_numbers | comprehensive-1mb | 58.6 (1%) | 28.2 (1%) | 2.08x† | 56.8 (1%) | 2.02x† | 0.97x |  |
 
-## E. Memory (peak RSS, KiB; separate untimed runs, median of 3)
+## E. Memory (peak RSS and private memory, KiB; separate untimed runs, median of 3)
 
-| Query | Input | jq 1.7.1 | succinctly | ratio (succinctly ÷ jq) |
-|-------|-------|----------|------------|-------------------------|
-| startup | none | 3004 | 8880 | 2.96x |
-| identity | users-1mb | 9192 | 10436 | 1.14x |
-| identity | numbers-1mb | 11012 | 11600 | 1.05x |
-| identity | strings-1mb | 3512 | 10576 | 3.01x |
-| identity | wide-1mb | 18728 | 12632 | 0.67x |
-| identity | nested-1mb | 5060 | 11076 | 2.19x |
-| identity | comprehensive-1mb | 17908 | 11712 | 0.65x |
-| identity_compact | users-1mb | 9100 | 9072 | 1.00x |
-| identity_compact | numbers-1mb | 10972 | 9412 | 0.86x |
-| identity_compact | strings-1mb | 3468 | 9360 | 2.70x |
-| identity_compact | wide-1mb | 18724 | 11452 | 0.61x |
-| identity_compact | nested-1mb | 5072 | 9668 | 1.91x |
-| identity_compact | comprehensive-1mb | 17824 | 10840 | 0.61x |
-| users_field | users-1mb | 8308 | 9840 | 1.18x |
-| users_length | users-1mb | 8624 | 10892 | 1.26x |
-| users_names | users-1mb | 8384 | 9928 | 1.18x |
-| users_map_select | users-1mb | 8600 | 12184 | 1.42x |
-| users_sort_by | users-1mb | 9096 | 12992 | 1.43x |
-| users_group_by | users-1mb | 9100 | 12736 | 1.40x |
-| users_unique_by | users-1mb | 9172 | 12688 | 1.38x |
-| users_reduce | users-1mb | 8408 | 11964 | 1.42x |
-| users_to_entries | users-1mb | 8376 | 11976 | 1.43x |
-| users_csv | users-1mb | 8644 | 10704 | 1.24x |
-| users_regex | users-1mb | 8600 | 14552 | 1.69x |
-| users_ascii_downcase | users-1mb | 8884 | 12568 | 1.41x |
-| users_first_early_exit | users-1mb | 8384 | 10440 | 1.25x |
-| users_limit_early_exit | users-1mb | 8388 | 11212 | 1.34x |
-| users_assign_update | users-1mb | 8312 | 19088 | 2.30x |
-| users_del | users-1mb | 8652 | 19904 | 2.30x |
-| users_paths | users-1mb | 13668 | 22928 | 1.68x |
-| users_tojson_roundtrip | users-1mb | 9920 | 22224 | 2.24x |
-| users_walk | users-1mb | 11200 | 26476 | 2.36x |
-| users_slurp | users-1mb | 8408 | 10720 | 1.27x |
-| users_stream | users-1mb | 3048 | 37408 | 12.27x |
-| numbers_add | numbers-1mb | 8180 | 21648 | 2.65x |
-| numbers_sort | numbers-1mb | 12016 | 21556 | 1.79x |
-| numbers_max | numbers-1mb | 8108 | 19088 | 2.35x |
-| numbers_map_floor | numbers-1mb | 10504 | 19900 | 1.89x |
-| strings_length | strings-1mb | 3764 | 12584 | 3.34x |
-| strings_upcase | strings-1mb | 4740 | 13496 | 2.85x |
-| strings_split | strings-1mb | 3764 | 13852 | 3.68x |
-| strings_test | strings-1mb | 3976 | 14328 | 3.60x |
-| wide_keys | wide-1mb | 18732 | 11728 | 0.63x |
-| wide_to_entries | wide-1mb | 50812 | 64728 | 1.27x |
-| wide_map_values | wide-1mb | 22416 | 45816 | 2.04x |
-| wide_add_values | wide-1mb | 18980 | 27288 | 1.44x |
-| wide_with_entries | wide-1mb | 76776 | 108740 | 1.42x |
-| nested_paths | nested-1mb | 5016 | 11600 | 2.31x |
-| nested_recurse | nested-1mb | 5004 | 11408 | 2.28x |
-| comprehensive_paths | comprehensive-1mb | 30500 | 43296 | 1.42x |
-| comprehensive_tostream | comprehensive-1mb | 39756 | 74640 | 1.88x |
-| comprehensive_numbers | comprehensive-1mb | 17264 | 31216 | 1.81x |
+Peak RSS charges a process for the file-backed pages of its mapped executable and libraries, which are shared and reclaimable, so a larger binary reads higher on every row with the same heap (#5578). Private memory leaves them out: on Linux the largest `RssAnon` sampled while the process ran (a lower bound, and coarser for a run of a few milliseconds, so its ratios and the geomean carry the same caveat), on macOS the peak memory footprint. `n/a` where the platform offers neither.
+
+| Query | Input | jq 1.7.1 RSS | succinctly RSS | RSS ratio (succinctly ÷ jq) | jq 1.7.1 private | succinctly private | private ratio |
+|-------|-------|--------------|----------------|-----------------------------|------------------|--------------------|---------------|
+| startup | none | 3192 | 8788 | 2.75x | 812 | 820 | 1.01x |
+| identity | users-1mb | 9280 | 10428 | 1.12x | 6920 | 2616 | 0.38x |
+| identity | numbers-1mb | 11108 | 10928 | 0.98x | 8904 | 3236 | 0.36x |
+| identity | strings-1mb | 3736 | 10324 | 2.76x | 1460 | 2744 | 1.88x |
+| identity | wide-1mb | 18720 | 12272 | 0.66x | 16580 | 4400 | 0.27x |
+| identity | nested-1mb | 5008 | 10440 | 2.08x | 2888 | 2812 | 0.97x |
+| identity | comprehensive-1mb | 17872 | 11720 | 0.66x | 15700 | 3672 | 0.23x |
+| identity_compact | users-1mb | 9432 | 8660 | 0.92x | 6916 | 1508 | 0.22x |
+| identity_compact | numbers-1mb | 11200 | 9364 | 0.84x | 8904 | 1912 | 0.21x |
+| identity_compact | strings-1mb | 3560 | 9044 | 2.54x | 1464 | 1848 | 1.26x |
+| identity_compact | wide-1mb | 18988 | 10936 | 0.58x | 16584 | 3768 | 0.23x |
+| identity_compact | nested-1mb | 5292 | 9156 | 1.73x | 2884 | 1980 | 0.69x |
+| identity_compact | comprehensive-1mb | 17936 | 10612 | 0.59x | 15700 | 2692 | 0.17x |
+| users_field | users-1mb | 8412 | 9160 | 1.09x | 6260 | 1508 | 0.24x |
+| users_length | users-1mb | 8644 | 10836 | 1.25x | 6452 | 1748 | 0.27x |
+| users_names | users-1mb | 8612 | 9620 | 1.12x | 6260 | 1508 | 0.24x |
+| users_map_select | users-1mb | 8688 | 11720 | 1.35x | 6408 | 2336 | 0.36x |
+| users_sort_by | users-1mb | 9344 | 12152 | 1.30x | 7028 | 3480 | 0.50x |
+| users_group_by | users-1mb | 9376 | 12468 | 1.33x | 6988 | 3372 | 0.48x |
+| users_unique_by | users-1mb | 9320 | 12500 | 1.34x | 6996 | 3484 | 0.50x |
+| users_reduce | users-1mb | 8408 | 11204 | 1.33x | 6260 | 1508 | 0.24x |
+| users_to_entries | users-1mb | 8420 | 11456 | 1.36x | 6268 | 1512 | 0.24x |
+| users_csv | users-1mb | 8880 | 10388 | 1.17x | 6480 | 1508 | 0.23x |
+| users_regex | users-1mb | 8724 | 13952 | 1.60x | 6344 | 2336 | 0.37x |
+| users_ascii_downcase | users-1mb | 9108 | 12176 | 1.34x | 6704 | 2360 | 0.35x |
+| users_first_early_exit | users-1mb | 8400 | 10172 | 1.21x | 6268 | 1492 | 0.24x |
+| users_limit_early_exit | users-1mb | 8584 | 10432 | 1.22x | 6272 | 1504 | 0.24x |
+| users_assign_update | users-1mb | 8636 | 18388 | 2.13x | 6268 | 8208 | 1.31x |
+| users_del | users-1mb | 8684 | 18112 | 2.09x | 6468 | 8072 | 1.25x |
+| users_paths | users-1mb | 13864 | 22464 | 1.62x | 11528 | 13392 | 1.16x |
+| users_tojson_roundtrip | users-1mb | 10096 | 21940 | 2.17x | 7620 | 11388 | 1.49x |
+| users_walk | users-1mb | 11192 | 25852 | 2.31x | 9136 | 15408 | 1.69x |
+| users_slurp | users-1mb | 8576 | 10260 | 1.20x | 6260 | 1980 | 0.32x |
+| users_stream | users-1mb | 3204 | 30184 | 9.42x | 844 | 20644 | 24.46x |
+| numbers_add | numbers-1mb | 8204 | 12756 | 1.55x | 5876 | 4172 | 0.71x |
+| numbers_sort | numbers-1mb | 12252 | 21320 | 1.74x | 9888 | 12680 | 1.28x |
+| numbers_max | numbers-1mb | 8328 | 19132 | 2.30x | 5924 | 10452 | 1.76x |
+| numbers_map_floor | numbers-1mb | 10476 | 18768 | 1.79x | 8324 | 9612 | 1.15x |
+| strings_length | strings-1mb | 3996 | 12032 | 3.01x | 1660 | 2584 | 1.56x |
+| strings_upcase | strings-1mb | 4964 | 13444 | 2.71x | 2760 | 3416 | 1.24x |
+| strings_split | strings-1mb | 3932 | 13184 | 3.35x | 1660 | 2668 | 1.61x |
+| strings_test | strings-1mb | 4108 | 13712 | 3.34x | 1688 | 2672 | 1.58x |
+| wide_keys | wide-1mb | 18876 | 11460 | 0.61x | 16576 | 3004 | 0.18x |
+| wide_to_entries | wide-1mb | 50960 | 64304 | 1.26x | 48704 | 55756 | 1.14x |
+| wide_map_values | wide-1mb | 22564 | 45836 | 2.03x | 20176 | 35224 | 1.75x |
+| wide_add_values | wide-1mb | 19008 | 27448 | 1.44x | 16896 | 18520 | 1.10x |
+| wide_with_entries | wide-1mb | 76812 | 108212 | 1.41x | 74716 | 97540 | 1.31x |
+| nested_paths | nested-1mb | 5220 | 10956 | 2.10x | 2840 | 1980 | 0.70x |
+| nested_recurse | nested-1mb | 5056 | 10956 | 2.17x | 2708 | 1980 | 0.73x |
+| comprehensive_paths | comprehensive-1mb | 30540 | 42712 | 1.40x | 28424 | 33756 | 1.19x |
+| comprehensive_tostream | comprehensive-1mb | 39756 | 73840 | 1.86x | 37624 | 64096 | 1.70x |
+| comprehensive_numbers | comprehensive-1mb | 17400 | 30844 | 1.77x | 15048 | 21700 | 1.44x |
 
 ## Reproduce
 
 ```bash
 cargo build --release --features bench-runner
-./target/release/succinctly dev compare jq --quick
+cargo build --release --features cli,simd,regex,serde --target-dir target/subject
+./target/release/succinctly dev compare jq --quick --subject target/subject/release/succinctly --subject-features cli,simd,regex,serde
 ```
 
-manifest sha256 `827510bb914e2d6f6c4fc0a9ab6b91a0b6ef6639bfddef7ab36359cd2b36a4d7` · succinctly sha256 `12d3dc5b9a7444fb3d28e78dda9d86c1256e5efa94b85239faa5a9b81fa90b02` · jq sha256 `467f468e72977663cbeee7f9df4462f7777b3af7eaece6c7f8640fe7f58c3817`
+manifest sha256 `8e04efcb4a9a139c785f6c116549f30f6e91beb71b0769edda55284ad7d6095e` · succinctly sha256 `e080bd776791089799073be3f6e86df7cf7a2fd097ba9fdac8061301be01c8b8` · jq sha256 `cec734cf2ac9a6fdd185336e1b664aaa83b3c59bcc72c8a4b32de401f34b179d`
