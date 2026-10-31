@@ -113,3 +113,18 @@ fn test_a_fault_a_program_resumes_after_comes_after_its_events_5635() -> Result<
         ],
     )
 }
+
+#[test]
+fn test_a_number_or_literal_the_fault_byte_completes_is_never_read_5635() -> Result<()> {
+    check(
+        &["--stream", "-c", "."],
+        &[
+            ("22]", "", 5),
+            ("1.5e3]", "", 5),
+            ("{}-31:", "[[],{}]\n", 5),
+            ("false\"a\"  {}-3}", "[[],false]\n[[],\"a\"]\n[[],{}]\n", 5),
+            ("null,\"x\"", "", 5),
+            ("[1,2] 7}", "[[0],1]\n[[1],2]\n[[1]]\n", 5),
+        ],
+    )
+}

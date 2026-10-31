@@ -6901,7 +6901,7 @@ fn get_inputs(
                 }
                 // Parse as JSON stream: the clean prefix, and the parse error
                 // that ended it if the stream turned malformed (#2961).
-                let (parsed, parse_error) = parse_json_stream_prefix(&raw, origin(&[]));
+                let (mut parsed, parse_error) = parse_json_stream_prefix(&raw, origin(&[]));
                 // `--slurp` stays all-or-nothing: jq prints nothing for a
                 // slurped stream it could not finish parsing. The error goes
                 // out in jq's channel at exit 5, like every other malformed
@@ -6940,21 +6940,33 @@ fn get_inputs(
                             parsed.len()
                         )));
                     }
+                    // The malformed value starts at the first span the parse
+                    // did not produce a value for, or where the splitter
+                    // itself gave up.
+                    let malformed_start = parse_error.is_some().then(|| {
+                        spans
+                            .get(parsed.len())
+                            .map(|&(start, _)| start)
+                            .or(split_error)
+                            .unwrap_or(raw.len())
+                    });
+                    // A number or literal the fault's own byte completes is
+                    // never read (#5635), as on the resuming route.
+                    if let (Some(start), Some(&span)) = (
+                        malformed_start,
+                        parsed.len().checked_sub(1).and_then(|i| spans.get(i)),
+                    ) {
+                        if bare_token_lost_to_fault(raw.as_bytes(), span, start) {
+                            parsed.pop();
+                        }
+                    }
                     let ends: Vec<usize> = spans
                         .iter()
                         .take(parsed.len())
                         .map(|&(_, end)| end)
                         .collect();
                     locations.extend_from_ends(src, &raw, seam, &ends, parsed.len());
-                    if parse_error.is_some() {
-                        // The malformed value starts at the first span the
-                        // parse did not produce a value for, or where the
-                        // splitter itself gave up.
-                        let start = spans
-                            .get(parsed.len())
-                            .map(|&(start, _)| start)
-                            .or(split_error)
-                            .unwrap_or(raw.len());
+                    if let Some(start) = malformed_start {
                         error_line = parse_error_line(raw.as_bytes(), start, seam);
                         fault_start = Some(start);
                     }
@@ -7141,31 +7153,46 @@ fn stream_prefix_events(
 }
 
 /// Put each resumed fault's [`StreamPrefix`] events in front of the fault, in `values` already
-/// expanded to events, and move every fault to the end of its events (#5635).
+/// expanded to events, and move every fault to the end of its events (#5635). One pass over
+/// `values`, since a file can hold many faults.
 fn insert_stream_prefixes(
     values: &mut Vec<OwnedValue>,
     locations: &mut InputLocations,
     resumed_errors: &mut [(usize, TrailingParseError)],
     prefixes: Vec<Vec<StreamPrefix>>,
 ) {
-    if prefixes.iter().all(Vec::is_empty) {
+    if prefixes.iter().all(Vec::is_empty) || prefixes.len() != resumed_errors.len() {
         return;
     }
-    debug_assert_eq!(prefixes.len(), resumed_errors.len());
     let located = locations.per_value.len() == values.len();
-    let mut shift = prefixes.iter().map(Vec::len).sum::<usize>();
-    for (index, prefix) in prefixes.into_iter().enumerate().rev() {
-        let at = resumed_errors[index].0;
-        let events = prefix.len();
+    let added = prefixes.iter().map(Vec::len).sum::<usize>();
+    let mut old_values = std::mem::take(values).into_iter();
+    let mut old_locations = std::mem::take(&mut locations.per_value).into_iter();
+    values.reserve(old_values.len() + added);
+    let mut copied = 0;
+    let mut inserted = 0;
+    for ((at, _), prefix) in resumed_errors.iter_mut().zip(prefixes) {
+        // The faults are in stream order, so each `at` is no less than the one before it.
+        let take = at.saturating_sub(copied);
+        values.extend(old_values.by_ref().take(take));
         if located {
-            let spliced = prefix
-                .iter()
-                .map(|&(_, source, line)| (source as u32, line as u32));
-            locations.per_value.splice(at..at, spliced);
+            locations
+                .per_value
+                .extend(old_locations.by_ref().take(take));
         }
-        values.splice(at..at, prefix.into_iter().map(|(event, _, _)| event));
-        resumed_errors[index].0 = at + shift;
-        shift -= events;
+        copied += take;
+        inserted += prefix.len();
+        for (event, source, line) in prefix {
+            values.push(event);
+            if located {
+                locations.per_value.push((source as u32, line as u32));
+            }
+        }
+        *at += inserted;
+    }
+    values.extend(old_values);
+    if located {
+        locations.per_value.extend(old_locations);
     }
 }
 

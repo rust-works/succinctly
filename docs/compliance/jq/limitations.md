@@ -13548,6 +13548,7 @@ A document that fails to parse part-way has already emitted the events of what i
 Since #5635 `succinctly jq --stream` prints them too, in front of the error, and they carry the line jq had read when it yielded each.
 The document is parsed whole first, so the events are not streamed: once that parse fails, the bytes from the malformed document through the end of the read that holds the fault are read again with the port of jq's streaming parser that `--stream-errors` uses (`jq_stream_errors::events_before_fault`).
 A program using `input`/`inputs` gets them ahead of each fault it resumes after, and one that never reads past them never meets the fault.
+A stream that fails to parse is therefore expanded to events up front, where a stream that parses is walked one document at a time, so a large input with a syntax error near its end holds every earlier document's events in memory first.
 The error text and position are the ones the whole-document parse gives (stderr is not compared).
 
 `-b` is accepted and ignored, as jq does outside Windows; `--binary` is rejected there (`Unknown option --binary`, exit 2) and here.
