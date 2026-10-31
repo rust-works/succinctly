@@ -16254,10 +16254,12 @@ pub(crate) fn apply_compare_op<S: EvalSemantics>(
 /// `==` and `!=` never raise (see [`yq_scalar_text_eq`]), and neither does jq mode, whose
 /// ordering is total.
 ///
+/// An integer written in hex or octal against a float raises yq's `strconv.ParseFloat` error
+/// ([`yq_float_parse_refusal`], #5651).
+///
 /// **Not reproduced:** yq compares a string that parses as a timestamp as a time, so
 /// `"2001-01-01T00:00:00Z" < 1` raises `parsing time "1" as "2006-01-02"` there and answers
-/// `false` here (`OwnedValue` has no timestamp kind); and an integer written in hex or octal
-/// against a float raises a `strconv.ParseFloat` error there. Both are recorded in
+/// `false` here (`OwnedValue` has no timestamp kind). Recorded in
 /// `docs/compliance/yq/limitations.md`.
 pub(crate) fn yq_ordering_refusal<S: EvalSemantics>(
     op: CompareOp,
@@ -16298,12 +16300,49 @@ pub(crate) fn yq_ordering_refusal<S: EvalSemantics>(
     match (left, right) {
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => None,
         (OwnedValue::String(_), OwnedValue::String(_)) => None,
-        (l, r) if is_number(l) && is_number(r) => None,
+        (l, r) if is_number(l) && is_number(r) => yq_float_parse_refusal::<S>(l, r),
         _ => Some(EvalError::new(format!(
             "{} not yet supported for comparison",
             yq_extremum_tag(left)
         ))),
     }
+}
+
+/// yq compares an integer with a float through `strconv.ParseFloat` of each node's text
+/// (#5651), and Go's `ParseFloat` refuses an integer written with a radix prefix: `0x10 < 1.5`
+/// is `strconv.ParseFloat: parsing "0x10": invalid syntax`, as are `0o17` and a signed `-0x10`.
+/// Two integers compare as integers and never reach it, and a decimal spelling (`007`, `+5`,
+/// `1e3`) parses.
+fn yq_float_parse_refusal<S: EvalSemantics>(
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> Option<EvalError> {
+    let is_float = |v: &OwnedValue| {
+        matches!(
+            v,
+            OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(..), _)
+        )
+    };
+    if is_float(left) == is_float(right) {
+        return None;
+    }
+    let integer = if is_float(left) { right } else { left };
+    let OwnedValue::NumberLiteral(NumberRepr::Int(..), _) = integer else {
+        return None;
+    };
+    let text = yq_scalar_text::<S>(integer)?;
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(&text);
+    let prefixed = digits.len() > 2
+        && digits.as_bytes()[0] == b'0'
+        && matches!(
+            digits.as_bytes()[1],
+            b'x' | b'X' | b'o' | b'O' | b'b' | b'B'
+        );
+    prefixed.then(|| {
+        EvalError::new(format!(
+            "strconv.ParseFloat: parsing \"{text}\": invalid syntax"
+        ))
+    })
 }
 
 /// [`apply_compare_op`] for the call sites that can report a failure: in yq mode an ordering

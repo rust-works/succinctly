@@ -3710,12 +3710,14 @@ jq mode keeps its total order (`succinctly jq -n '2 > true'` is `true`).
 
 The refusal is `eval::yq_ordering_refusal`, applied by `eval::try_compare_op` at every call site that can report a failure (the ordinary and generic evaluators, the owned fast path, the `yq` context-pipe route); `direct_cond_verdict` declines to the general route on a refused pair so the error is raised there.
 
+An integer written with a radix prefix (`0x10`, `0o17`) against a float raises `strconv.ParseFloat: parsing "0x10": invalid syntax`, because yq compares an int and a float through `ParseFloat` of each node's text; `succinctly yq` raises the same (#5651).
+Two integers compare as integers, and a decimal spelling (`007`, `+5`, `1e3`) parses, in both tools.
+
 **Not reproduced:**
 
 - A string that parses as a timestamp is compared as a time by yq, so `"2001-01-01T00:00:00Z" < 1` is `parsing time "1" as "2006-01-02": cannot parse "1" as "2006"` there and `false` here.
   `OwnedValue` has no timestamp kind, so the pair is treated as the two kinds it is made of.
-- An integer written in hex (`0x10`) against a float is `strconv.ParseFloat: parsing "0x10": invalid syntax` in yq.
-  Here it compares by value.
+- A signed prefixed integer (`-0x10`), `1_000` and `0b101` read as strings here, so they raise the kind error instead of comparing or raising `ParseFloat`.
 
 ### `|=` with a zero-output update filter -- resolved ([#2484](https://github.com/rust-works/succinctly/issues/2484))
 
