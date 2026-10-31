@@ -240,3 +240,4 @@ mod i5611;
 mod i5613;
 mod i5614;
 mod i5612;
+mod i5613;
