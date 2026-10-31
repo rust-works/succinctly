@@ -4583,6 +4583,9 @@ pub(crate) fn silence_depth_guard_panic_line() {
 
 /// Run the jq command with the given arguments.
 /// Returns the exit code (0 for success, non-zero for various errors).
+///
+/// The caller must end the process on return: the named arguments (`--slurpfile`, `--argjson`)
+/// are not freed (#5673), so a second call in one process would leak them.
 pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     super::sigpipe::restore_default();
     silence_depth_guard_panic_line();
@@ -4621,10 +4624,8 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         }
         Err(BuildContextError::Other(e)) => return Err(e),
     };
-    // The process exits when this function returns (its only callers are `main`'s dispatch arms),
-    // so the named arguments are not freed: a 100 MB `--slurpfile` is millions of small
-    // allocations, and walking them to give the memory back to a process that is about to end was
-    // a quarter of the run (#5673).
+    // Not freed, see the doc comment: giving back a 100 MB `--slurpfile` (millions of small
+    // allocations) to a process about to end was a quarter of the run (#5673).
     let context = std::mem::ManuallyDrop::new(context);
 
     // Get the filter expression. An unreadable `-f`/`--from-file` file is
