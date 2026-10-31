@@ -89,6 +89,20 @@ impl Manifest {
         if primaries != 1 {
             bail!("manifest needs exactly one primary reference, found {primaries}");
         }
+        for suite in &m.suites {
+            if let Some(id) = &suite.reference {
+                if !m
+                    .references
+                    .iter()
+                    .any(|r| &r.id == id && r.role == "secondary")
+                {
+                    bail!(
+                        "suite {} names reference {id}, which is not a secondary reference",
+                        suite.id
+                    );
+                }
+            }
+        }
         Ok((m, sha256_hex(text.as_bytes())))
     }
 
@@ -139,6 +153,18 @@ mod tests {
         let (m, hash) = Manifest::parse(text).unwrap();
         assert_eq!(m.primary().version, "1.7.1");
         assert_eq!(hash.len(), 64);
+    }
+
+    #[test]
+    fn a_suite_naming_an_unknown_reference_is_rejected() {
+        let text = "schema_version = 1\n\
+            [succinctly]\nprofile='release'\nfeatures=''\n[queries]\nsmoke='x'\n\
+            [probes]\ncli='x'\nextensions='x'\nsyntax='x'\nfixtures='x'\ndivergences='x'\nrobust='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n[perf]\nqueries='q'\n\
+            [[reference]]\nid='a'\nversion='1'\nrole='primary'\nsource_url=''\nsource_sha256=''\n\
+            [[suite]]\nid='s'\npath='p'\nsha256='s'\nreference='a'\n";
+        // Naming the primary, or a typo, would run the suite as a primary one.
+        assert!(Manifest::parse(text).is_err());
+        assert!(Manifest::parse(&text.replace("reference='a'\n", "reference='b'\n")).is_err());
     }
 
     #[test]

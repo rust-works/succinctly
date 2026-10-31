@@ -176,6 +176,9 @@ pub struct Results {
     /// counted in `differential`, never checked against the ledger.
     #[serde(default)]
     pub differential_secondary: Vec<suites::SuiteSummary>,
+    /// Secondary-reference suites that could not run, with why (#5622).
+    #[serde(default)]
+    pub secondary_suites_skipped: Vec<String>,
     /// C.
     pub input: Option<jsonconf::InputSummary>,
     /// D and E, one row per query × input.
@@ -530,21 +533,27 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     }
     let mut differential = vec![];
     let mut differential_secondary = vec![];
+    let mut secondary_suites_skipped: Vec<String> = vec![];
     if want(Dimension::Differential) {
         for suite in &manifest.suites {
             if let Some(r) = suite_reference(&manifest, suite) {
                 // The secondary's own files: informational, so not in `run_suites` (the ledger
-                // never learns of them) and not in `observed`.
-                match &secondary {
-                    Ok(sec) => {
-                        let text = Manifest::read_pinned(&root, suite)?;
-                        differential_secondary.push(suites::run(
-                            &suite.id, &text, sec, &subject, None, &fixtures,
-                        )?);
-                    }
-                    Err(why) => {
-                        secondary_note.get_or_insert_with(|| format!("{}: {why}", r.id));
-                    }
+                // never learns of them), not in `observed`, and never fatal: a file that cannot
+                // run is named in the report instead. `--ledger-only` checks the primary alone.
+                if args.ledger_only {
+                    continue;
+                }
+                let ran = match &secondary {
+                    Ok(sec) => Manifest::read_pinned(&root, suite)
+                        .and_then(|text| {
+                            suites::run(&suite.id, &text, sec, &subject, None, &fixtures)
+                        })
+                        .map_err(|e| e.to_string()),
+                    Err(why) => Err(format!("{}: {why}", r.id)),
+                };
+                match ran {
+                    Ok(sum) => differential_secondary.push(sum),
+                    Err(why) => secondary_suites_skipped.push(format!("{}: {why}", suite.id)),
                 }
                 continue;
             }
@@ -752,6 +761,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         extensions: ext_rows,
         differential,
         differential_secondary,
+        secondary_suites_skipped,
         input,
         robust: robust_rows,
         operational: operational_info,

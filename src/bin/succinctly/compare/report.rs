@@ -506,6 +506,12 @@ fn differential_section(s: &mut String, r: &Results) {
 /// disagreement here is expected rather than a bug, so nothing in this table is a ledger entry
 /// and none of it is counted above.
 fn differential_secondary_section(s: &mut String, r: &Results) {
+    if !r.secondary_suites_skipped.is_empty() {
+        let _ = writeln!(s, "\n### B2. jq 1.8.1's own test files: not run\n");
+        for why in &r.secondary_suites_skipped {
+            let _ = writeln!(s, "- {why}");
+        }
+    }
     if r.differential_secondary.is_empty() {
         return;
     }

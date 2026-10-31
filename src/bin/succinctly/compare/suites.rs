@@ -5,7 +5,8 @@
 //! (sha256-pinned in the manifest). Each case runs through both tools; stdout and exit
 //! status must be identical. The files' own expected outputs are not consulted: the
 //! reference *is* the oracle, so a case the reference itself fails on still compares
-//! like for like.
+//! like for like. A suite the manifest pins to the secondary reference (jq 1.8.1's own files,
+//! #5622) runs the same way against that reference and is reported apart.
 
 use super::exec::exec;
 use super::harness::Tool;
