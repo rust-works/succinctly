@@ -1901,7 +1901,8 @@ impl<'a> Parser<'a> {
     ///
     /// jq mode also reads one with no integer part (`.5`, `.00005`, #5299): the caller has
     /// checked a digit follows the `.`. The text is then read as if it began `0`, which is
-    /// the spelling jq's decNumber prints it with (`.50` is `0.50`).
+    /// the spelling jq's decNumber prints it with (`.50` is `0.50`). A `.` with no fraction
+    /// digits is dropped the same way (`1.e1` is read as `1e1`, #5614).
     fn parse_number_literal(&mut self) -> Result<Literal, ParseError> {
         let start = self.pos;
 
@@ -1933,9 +1934,11 @@ impl<'a> Parser<'a> {
         }
 
         // Check for decimal point
+        let mut empty_fraction_dot = None;
         if self.peek() == Some('.') {
             // Look ahead to ensure it's not `..` (recursive descent)
             if self.peek_str(2) != ".." {
+                let dot = self.pos - start;
                 self.next(); // consume the dot
                 let fraction_start = self.pos;
 
@@ -1950,6 +1953,7 @@ impl<'a> Parser<'a> {
                 // yq's lexer has no number token for `5.` (#5452).
                 if self.pos == fraction_start {
                     self.reject_unless_jq_extensions_at("number with a trailing '.'", start)?;
+                    empty_fraction_dot = Some(dot);
                 }
             }
         }
@@ -1974,10 +1978,15 @@ impl<'a> Parser<'a> {
         }
 
         let spelled = &self.input[start..self.pos];
-        let zero_led;
+        let rewritten;
         let num_str = if leading_dot {
-            zero_led = format!("0{spelled}");
-            zero_led.as_str()
+            rewritten = format!("0{spelled}");
+            rewritten.as_str()
+        } else if let Some(dot) = empty_fraction_dot.filter(|_| self.mode == ParserMode::Jq) {
+            // `1.e1` is the decNumber `1e1`: an empty fraction adds no digit, and jq prints it
+            // `1E+1` like the spelling without the dot (#5614).
+            rewritten = format!("{}{}", &spelled[..dot], &spelled[dot + 1..]);
+            rewritten.as_str()
         } else {
             spelled
         };
