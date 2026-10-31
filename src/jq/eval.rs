@@ -7334,9 +7334,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             optional,
             binary_fanout_rules::<S>(EmptyOperandOp::Compare(*op)),
             |left_val, right_val| {
-                Ok(OwnedValue::Bool(apply_compare_op::<S>(
-                    *op, &left_val, &right_val,
-                )))
+                try_compare_op::<S>(*op, &left_val, &right_val).map(OwnedValue::Bool)
             },
             sink,
         ),
@@ -16104,11 +16102,7 @@ fn eval_compare<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         value,
         optional,
         binary_fanout_rules::<S>(EmptyOperandOp::Compare(op)),
-        |left_val, right_val| {
-            Ok(OwnedValue::Bool(apply_compare_op::<S>(
-                op, &left_val, &right_val,
-            )))
-        },
+        |left_val, right_val| try_compare_op::<S>(op, &left_val, &right_val).map(OwnedValue::Bool),
     )
 }
 
@@ -16141,6 +16135,93 @@ pub(crate) fn apply_compare_op<S: EvalSemantics>(
         CompareOp::Le => compare_values::<S>(left, right) != core::cmp::Ordering::Greater,
         CompareOp::Gt => compare_values::<S>(left, right) == core::cmp::Ordering::Greater,
         CompareOp::Ge => compare_values::<S>(left, right) != core::cmp::Ordering::Less,
+    }
+}
+
+/// yq mode only (#5631): the error real yq raises for an ordering comparison (`<`, `<=`, `>`,
+/// `>=`) it cannot make, or `None` when the pair is one it answers.
+///
+/// yq's `compareOperator` (`pkg/yqlib/operator_compare.go`, v4.53.3) is not jq's total order.
+/// In the order it tries them:
+///
+/// 1. a container on the **left** is refused outright: `arrays not yet supported for
+///    comparison` / `maps not yet supported for comparison`, whatever the right operand is
+///    (`null` included, so `[] < null` raises where `null < 1` answers `false`);
+/// 2. a scalar on the left against a container on the right is `<tag> () cannot be subtracted
+///    from <tag>`, the right operand's tag first (a container's text is empty, hence the `()`);
+/// 3. a `null` on either side answers `false` (see [`yq_null_ordering_is_false`]);
+/// 4. two numbers (an integer and a float included) or two strings compare;
+/// 5. anything else -- a bool, or two kinds that do not compare -- is
+///    `<left tag> not yet supported for comparison`: `2 > true` names `!!int`, `"a" < 1` names
+///    `!!str`.
+///
+/// `==` and `!=` never raise (see [`yq_scalar_text_eq`]), and neither does jq mode, whose
+/// ordering is total.
+///
+/// **Not reproduced:** yq compares a string that parses as a timestamp as a time, so
+/// `"2001-01-01T00:00:00Z" < 1` raises `parsing time "1" as "2006-01-02"` there and answers
+/// `false` here (`OwnedValue` has no timestamp kind); and an integer written in hex or octal
+/// against a float raises a `strconv.ParseFloat` error there. Both are recorded in
+/// `docs/compliance/yq/limitations.md`.
+pub(crate) fn yq_ordering_refusal<S: EvalSemantics>(
+    op: CompareOp,
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> Option<EvalError> {
+    if S::TAG != EvalTag::Yq
+        || !matches!(
+            op,
+            CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
+        )
+    {
+        return None;
+    }
+    let is_container = |v: &OwnedValue| matches!(v, OwnedValue::Array(_) | OwnedValue::Object(_));
+    match left {
+        OwnedValue::Array(_) => {
+            return Some(EvalError::new("arrays not yet supported for comparison"))
+        }
+        OwnedValue::Object(_) => {
+            return Some(EvalError::new("maps not yet supported for comparison"))
+        }
+        _ => {}
+    }
+    if is_container(right) {
+        return Some(EvalError::new(format!(
+            "{} () cannot be subtracted from {}",
+            yq_extremum_tag(right),
+            yq_extremum_tag(left),
+        )));
+    }
+    let is_number = |v: &OwnedValue| {
+        matches!(
+            v,
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+        )
+    };
+    match (left, right) {
+        (OwnedValue::Null, _) | (_, OwnedValue::Null) => None,
+        (OwnedValue::String(_), OwnedValue::String(_)) => None,
+        (l, r) if is_number(l) && is_number(r) => None,
+        _ => Some(EvalError::new(format!(
+            "{} not yet supported for comparison",
+            yq_extremum_tag(left)
+        ))),
+    }
+}
+
+/// [`apply_compare_op`] for the call sites that can report a failure: in yq mode an ordering
+/// comparison yq refuses raises [`yq_ordering_refusal`]'s error instead of answering `true` or
+/// `false` (#5631). Every other pairing, and all of jq mode, answers exactly as
+/// [`apply_compare_op`] does.
+pub(crate) fn try_compare_op<S: EvalSemantics>(
+    op: CompareOp,
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> Result<bool, EvalError> {
+    match yq_ordering_refusal::<S>(op, left, right) {
+        Some(error) => Err(error),
+        None => Ok(apply_compare_op::<S>(op, left, right)),
     }
 }
 
@@ -79352,7 +79433,7 @@ fn eval_owned_pure_in<S: EvalSemantics>(
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
-            Some(Ok(OwnedValue::Bool(apply_compare_op::<S>(*op, &l, &r))))
+            Some(try_compare_op::<S>(*op, &l, &r).map(OwnedValue::Bool))
         }
         // `boolean_fanout_core` with a single-output left operand: a left
         // output equal to the short-circuiting value contributes that value

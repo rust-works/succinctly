@@ -80,16 +80,16 @@ use super::eval::{
     slice_owned_value_read_computed, stop_with_downstream, stop_with_error, stop_with_escape,
     streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
     substitute_deferred_var, substitute_vars, suppresses, tonumber_from_str, tostring_owned,
-    tostring_owned_styled, try_handler_root, vec_with_capacity, yq_absent_key_read_is_empty,
-    yq_assign_rhs_document, yq_bool_null_key_into_null, yq_dedup_key, yq_empty_context_reemit,
-    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_first_of_each_key,
-    yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check,
-    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
-    yq_read_only_context, yq_scalar_text, yq_sort_by, BinaryFanoutRules, ComputedSliceBound,
-    Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN,
-    PathTrail, QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RestTail, RootWitness,
-    SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED,
-    MAX_RANGE_TOTAL,
+    tostring_owned_styled, try_compare_op, try_handler_root, vec_with_capacity,
+    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_bool_null_key_into_null, yq_dedup_key,
+    yq_empty_context_reemit, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
+    yq_first_of_each_key, yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text,
+    yq_negative_index_check, yq_negative_index_error, yq_numeric_index_on_object_is_null,
+    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, yq_sort_by, BinaryFanoutRules,
+    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    JqSemantics, LimitN, PathTrail, QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RestTail,
+    RootWitness, SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics,
+    DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -15528,9 +15528,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             optional,
             binary_fanout_rules::<S>(EmptyOperandOp::Compare(*op)),
             |left_val, right_val| {
-                Ok(OwnedValue::Bool(apply_compare_op::<S>(
-                    *op, &left_val, &right_val,
-                )))
+                try_compare_op::<S>(*op, &left_val, &right_val).map(OwnedValue::Bool)
             },
             sink,
         ),
@@ -16524,7 +16522,8 @@ fn direct_cond_verdict_with<S: EvalSemantics, V: DocumentValue>(
             } else {
                 (&literal, operand_value)
             };
-            Some(crate::jq::eval::apply_compare_op::<S>(*op, l, r))
+            // A pairing yq refuses raises on the general route; only it can say so (#5631).
+            crate::jq::eval::try_compare_op::<S>(*op, l, r).ok()
         }
         _ => None, // patchcov: coverage tolerate-line reason="unreachable: direct_cond_verdict checks is_direct_grammar before this runs, and that grammar admits only the shapes the arms above answer (#4095)"
     }
@@ -20667,9 +20666,7 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
             optional,
             binary_fanout_rules::<S>(EmptyOperandOp::Compare(*op)),
             |left_val, right_val| {
-                Ok(OwnedValue::Bool(apply_compare_op::<S>(
-                    *op, &left_val, &right_val,
-                )))
+                try_compare_op::<S>(*op, &left_val, &right_val).map(OwnedValue::Bool)
             },
             &mut collect,
         ),
@@ -21189,11 +21186,10 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
             };
             match combine(left_val, right_val) {
                 Ok(v) => sink.push(GenericItem::Owned(v)),
-                // Reached by the `Expr::Arithmetic` caller only: the two
-                // `Expr::Compare` call sites wrap the infallible
-                // `apply_compare_op` in `Ok(...)` (`CompareOp` has no failure
-                // mode), while `arith_combine` fails on `"a" + 1`, `1 / 0`,
-                // and friends. Same policy as `eval.rs`'s
+                // Reached by `Expr::Arithmetic` (`arith_combine` fails on
+                // `"a" + 1`, `1 / 0`, and friends) and, in yq mode, by
+                // `Expr::Compare` (`try_compare_op` refuses `2 > true`,
+                // #5631); a jq-mode comparison cannot fail. Same policy as `eval.rs`'s
                 // `binary_fanout_each`: a `combine` error aborts the *whole*
                 // fanout rather than skipping just that pairing, whatever was
                 // already pushed stands, and `optional` decides whether the
@@ -21386,11 +21382,7 @@ fn eval_compare_generic<S: EvalSemantics, V: DocumentValue>(
         right,
         optional,
         binary_fanout_rules::<S>(EmptyOperandOp::Compare(op)),
-        |left_val, right_val| {
-            Ok(OwnedValue::Bool(apply_compare_op::<S>(
-                op, &left_val, &right_val,
-            )))
-        },
+        |left_val, right_val| try_compare_op::<S>(op, &left_val, &right_val).map(OwnedValue::Bool),
         &mut |item: GenericItem<V>| {
             // Total, rather than a `GenericItem::Owned` match with an
             // `unreachable!()` fallback: `binary_fanout_each_generic` only
@@ -50073,9 +50065,9 @@ mod tests {
 
     #[test]
     fn generic_arithmetic_fanout_combine_error_escapes_1481() {
-        // `binary_fanout_each_generic`'s `Err(e)` arm -- the one only the
-        // `Expr::Arithmetic` caller can reach, since both `Expr::Compare`
-        // call sites wrap the infallible `apply_compare_op` in `Ok(...)`.
+        // `binary_fanout_each_generic`'s `Err(e)` arm -- reached by the
+        // `Expr::Arithmetic` caller and, in yq mode only, by `Expr::Compare`
+        // (`try_compare_op`, #5631); a jq-mode comparison cannot fail.
         // `first(...)` is what routes a top-level `+` through
         // `eval_each_generic` at all (`Expr::Arithmetic` has no native
         // `eval_single` arm, so a *bare* `("a",1) + 1` bridges out to
