@@ -3401,15 +3401,9 @@ fn sibling_end_ok(before: &[u8]) -> bool {
     if !(last.is_ascii_alphabetic() || last == b'.') {
         return false;
     }
-    let boundary = |b: u8| {
-        matches!(
-            b,
-            b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'[' | b'{' | b',' | b':' | b']' | b'}'
-        )
-    };
     let start = before
         .iter()
-        .rposition(|&b| boundary(b))
+        .rposition(|&b| jq_literal_boundary(b))
         .map_or(0, |p| p + 1);
     let token = &before[start..];
     let unsigned = token
@@ -5855,6 +5849,77 @@ fn stream_json_yaml_double_quoted<Out: core::fmt::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // #5650: the byte a sibling ends on, and JSON whitespace only.
+    // ------------------------------------------------------------------
+
+    /// `preceding_gap_ok(text, at, Some(b','))` for the `2` of `"<head>,2"`.
+    fn comma_gap_ok(head: &[u8]) -> bool {
+        let mut text = head.to_vec();
+        text.extend_from_slice(b",2");
+        preceding_gap_ok(&text, head.len() + 1, Some(b','))
+    }
+
+    #[test]
+    fn test_a_sibling_must_end_on_a_byte_a_value_can_end_on_5650() {
+        for ok in [
+            &b"[1"[..],
+            b"[1.",
+            b"[.5",
+            b"[-0",
+            b"[1e5",
+            b"[1.5E+3",
+            b"[\"a\"",
+            b"[[1]",
+            b"[{}",
+            b"[true",
+            b"[false",
+            b"[null",
+            b"[nan",
+            b"[-nan",
+            b"[Nan4000",
+            b"[Infinity",
+            b"[-Infinity",
+            b"[1 ",
+            b"[1\n\t\r ",
+        ] {
+            assert!(comma_gap_ok(ok), "{:?}", String::from_utf8_lossy(ok));
+        }
+        for bad in [
+            &b"[1@"[..],
+            b"[\"a\"@",
+            b"[true@",
+            b"[[1]@",
+            b"[1\x0c",
+            b"[\"a\"\x0c",
+            b"[1\x00",
+            b"[1null",
+            b"[1true",
+            b"[1false",
+            b"[1e",
+            b"[-1x",
+            b"[.5x",
+            b"[1e+",
+            b"[1-",
+        ] {
+            assert!(!comma_gap_ok(bad), "{:?}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    #[test]
+    fn test_a_digit_ending_glued_token_is_left_to_the_decode_5650() {
+        // The trade `sibling_end_ok` documents: one byte test per number, so `0x1` is not seen here.
+        assert!(comma_gap_ok(b"[0x1"));
+        assert!(comma_gap_ok(b"[1_000"));
+    }
+
+    #[test]
+    fn test_a_form_feed_is_not_whitespace_in_a_trailing_gap_5650() {
+        assert!(trailing_gap_ok(b"[1 \n\t\r]", 2, b']'));
+        assert!(!trailing_gap_ok(b"[1\x0c]", 2, b']'));
+        assert!(!trailing_gap_ok(b"[1@]", 2, b']'));
+    }
 
     // ------------------------------------------------------------------
     // #3340: the string arm walks `SpecialMask` blocks instead of bytes.
