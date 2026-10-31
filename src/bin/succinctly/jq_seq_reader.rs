@@ -778,7 +778,9 @@ struct Reader<'a> {
     final_buffer_start: usize,
     /// Whether real jq's non-slurp end-of-stream rule (#2998) applies:
     /// `-s` keeps its own `has_more` loop going past the event that ends a
-    /// non-slurp stream, so the drop below never fires there.
+    /// non-slurp stream, so the drop below never fires there. When the walk
+    /// collects faults (`-n`'s `input`/`inputs`) the drop is a recorded `break`
+    /// instead of a stop: `input` raises it and the next read scans on (#5662).
     drops_at_first_empty_record: bool,
     /// Whether a value or a warning has already been produced at an offset
     /// `>= final_buffer_start`. jq's own driver (`jq_util_input_next_input`,

@@ -41,6 +41,19 @@ const ROWS: &[(&str, &str, bool, &str, &str, i32)] = &[
     ("\x1e\x1e1\x1e\x1e2\x1e\x1e3\n", "input,input", false, "", "jq: error (at <stdin>:1): Potentially truncated top-level numeric value at line 1, column 4\n", 5),
     ("\x1e\x1e[1]", "[inputs]", true, "\x1e[[[1]]]\n", "", 0),
     ("\x1e1\x1e\x1e2\n", "[limit(4;repeat(try input catch .))]", true, "\x1e[\"Potentially truncated top-level numeric value at line 1, column 3\",[2],\"break\",\"break\"]\n", "", 0),
+    // An empty record repeated, mid-stream, or at the end; and `-n` with a filter that reads nothing.
+    ("\x1e[1]\x1e\x1e[2]", "[limit(6;repeat(try input catch .))]", false, "\x1e[[1],[2],\"break\",\"break\",\"break\",\"break\"]\n", "", 0),
+    ("\x1e[1]\x1e\x1e[2]", "[inputs],[inputs],[inputs]", false, "\x1e[[1],[2]]\n\x1e[]\n\x1e[]\n", "", 0),
+    ("\x1e[1]\x1e\x1e[2]", "null", false, "\x1enull\n", "", 0),
+    ("\x1e\x1e[1]\x1e\x1e[2]", "[limit(6;repeat(try input catch .))]", false, "\x1e[\"break\",[1],[2],\"break\",\"break\",\"break\"]\n", "", 0),
+    ("\x1e\x1e[1]\x1e\x1e[2]", "[inputs],[inputs],[inputs]", false, "\x1e[]\n\x1e[[1],[2]]\n\x1e[]\n", "", 0),
+    ("\x1e\x1e[1]\x1e\x1e[2]", "null", false, "\x1enull\n", "", 0),
+    ("\x1e[1]\x1e\x1e", "[limit(6;repeat(try input catch .))]", false, "\x1e[[1],\"break\",\"break\",\"break\",\"break\",\"break\"]\n", "", 0),
+    ("\x1e[1]\x1e\x1e", "[inputs],[inputs],[inputs]", false, "\x1e[[1]]\n\x1e[]\n\x1e[]\n", "", 0),
+    ("\x1e[1]\x1e\x1e", "null", false, "\x1enull\n", "", 0),
+    ("\x1e\x1e[1]\x1e\x1e", "[limit(6;repeat(try input catch .))]", false, "\x1e[\"break\",[1],\"break\",\"break\",\"break\",\"break\"]\n", "", 0),
+    ("\x1e\x1e[1]\x1e\x1e", "[inputs],[inputs],[inputs]", false, "\x1e[]\n\x1e[[1]]\n\x1e[]\n", "", 0),
+    ("\x1e\x1e[1]\x1e\x1e", "null", false, "\x1enull\n", "", 0),
 ];
 
 #[test]
