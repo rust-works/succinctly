@@ -66,6 +66,7 @@ jobs:
     outputs:
       code: ${{ steps.decide.outputs.code }}
       retest: ${{ steps.dedupe.outputs.retest }}
+      macos: ${{ steps.macos.outputs.macos }}
     steps:
       - uses: actions/checkout@v7
 
@@ -80,6 +81,28 @@ jobs:
               - '!docs/**'
               - '!.claude/skills/**'
               - '!changelog.d/**'    # fragments are .md, but nested, so `!*.md` misses them (#3920)
+            # Where macOS can differ from Linux (#5699): Apple's libm vs glibc's last digit,
+            # the local zone, the files with a `target_os = "macos"` cfg (`git grep -l
+            # 'target_os = "macos"' -- '*.rs'`; add a new one here, or label the PR
+            # `ci:macos`), the build script, dependency / toolchain / cargo config changes,
+            # the deep-recursion test list, and the workflows. `build.rs` and `rust-toolchain*`
+            # do not exist today; they are listed so adding one is covered.
+            macos:
+              - 'src/jq/math.rs'
+              - 'src/jq/local_zone.rs'
+              - 'src/bin/succinctly/address_space.rs'
+              - 'src/bin/succinctly/bench_runner/utils.rs'
+              - 'src/bin/succinctly/compare/*.rs'
+              - 'src/bin/succinctly/dsv_bench.rs'
+              - 'src/bin/succinctly/jq_bench.rs'
+              - 'src/bin/succinctly/yq_bench.rs'
+              - '**/build.rs'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - 'rust-toolchain*'
+              - '.cargo/**'
+              - 'scripts/deep-recursion-tests.sh'
+              - '.github/workflows/**'
 
       - id: decide
         run: |
@@ -88,6 +111,35 @@ jobs:
           else
             echo "code=${{ steps.filter.outputs.code }}" >> "$GITHUB_OUTPUT"
           fi
+
+      # #5699: the macOS matrix runs in merge-group (and un-deduped `main` push) runs, and on a
+      # PR only when it touches code where macOS can differ from Linux (the `macos` filter
+      # above) or carries the `ci:macos` label. Labels are read live, not from the event
+      # payload, so re-running the jobs after adding the label sees it. A failed lookup
+      # fails towards testing.
+      - id: macos
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          PATHS: ${{ steps.filter.outputs.macos }}
+        run: |
+          macos=true
+          if [ "$EVENT" = "pull_request" ]; then
+            macos=false
+            if [ "$PATHS" = "true" ]; then
+              macos=true
+              echo "::notice::PR touches a macOS-sensitive path; running the macOS matrix (#5699)"
+            elif ! labels=$(gh api "repos/$REPO/pulls/$PR" --jq '.labels[].name'); then
+              macos=true
+              echo "::notice::could not read the PR's labels; running the macOS matrix (#5699)"
+            elif grep -qx 'ci:macos' <<<"$labels"; then
+              macos=true
+              echo "::notice::PR carries the ci:macos label; running the macOS matrix (#5699)"
+            fi
+          fi
+          echo "macos=$macos" >> "$GITHUB_OUTPUT"
 
       - id: dedupe
         env:
@@ -539,6 +591,16 @@ jobs:
   # (p50) over Oct 21-28 and 15.6 the day after, and macOS still finished last in 17 of 27
   # merge-group runs. `scripts/ci-load-report.py` produces all of these figures; run it
   # with a window before and after any change to this matrix.
+  #
+  # #5699: the matrix runs in merge-group runs only, not on pull_request runs. macOS is the one
+  # resource that queues, and PR runs (81-91 a day against 33-38 merge-group runs, 2.5 to 1)
+  # held about 57% of the macOS runner-minutes the merge queue waits behind. Over 999 PR runs
+  # and 518 merge-group runs every failing macOS test leg also failed on Linux, bar three runs
+  # that were network fetches. A PR still runs it when it touches a `macos` path (the `gate`
+  # filter: `src/jq/math.rs`, build scripts, manifests, the toolchain, workflows) or carries
+  # the `ci:macos` label. `Test (macOS ARM64)` reports success on a deferred PR, with a notice;
+  # `skipped` is accepted nowhere else. Re-run `scripts/ci-load-report.py` over a window before
+  # and after, and see #5699 for the numbers this was decided on.
   test-macos-arm:
     name: Test (macOS ARM64)
     needs: [gate, test-macos-arm-matrix]
@@ -546,16 +608,34 @@ jobs:
     # than a bare `needs:` (#3084).
     if: always() && needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
+    env:
+      MATRIX: ${{ needs.test-macos-arm-matrix.result }}
+      GATE: ${{ needs.gate.result }}
+      MACOS: ${{ needs.gate.outputs.macos }}
+      EVENT: ${{ github.event_name }}
     steps:
+      # `skipped` passes in exactly one case (#5699): a pull_request whose gate succeeded and
+      # deliberately deferred the matrix to the merge queue. A `skipped` matrix anywhere else
+      # (a merge group, a gate that failed or never set `macos`) is an error, or a broken leg
+      # would again fail to block merge (#3084).
       - run: |
-          test "${{ needs.test-macos-arm-matrix.result }}" = "success" \
-            || { echo "::error::a Test (macOS ARM64) matrix leg did not succeed (${{ needs.test-macos-arm-matrix.result }})"; exit 1; }
+          if [ "$MATRIX" = "success" ]; then
+            exit 0
+          fi
+          if [ "$MATRIX" = "skipped" ] && [ "$GATE" = "success" ] \
+              && [ "$EVENT" = "pull_request" ] && [ "$MACOS" = "false" ]; then
+            echo "::notice::macOS is deferred to the merge queue for this PR; add the ci:macos label (then push or re-run) to run it here (#5699)"
+            exit 0
+          fi
+          echo "::error::a Test (macOS ARM64) matrix leg did not succeed ($MATRIX)"
+          exit 1
 
   test-macos-arm-matrix:
     name: Test (macOS ARM64) (${{ matrix.name }})
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
-    if: needs.gate.outputs.retest != 'false'
+    # #5699: skipped on a pull_request the gate deferred to the merge queue.
+    if: needs.gate.outputs.retest != 'false' && needs.gate.outputs.macos != 'false'
     runs-on: macos-latest
     strategy:
       fail-fast: false
