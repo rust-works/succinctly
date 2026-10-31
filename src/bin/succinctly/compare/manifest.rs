@@ -49,6 +49,10 @@ pub struct Suite {
     pub id: String,
     pub path: String,
     pub sha256: String,
+    /// Id of the reference this suite runs against; absent means the primary. A suite run
+    /// against the secondary stays out of the primary columns and the ledger (#5622).
+    #[serde(default)]
+    pub reference: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,6 +88,20 @@ impl Manifest {
         let primaries = m.references.iter().filter(|r| r.role == "primary").count();
         if primaries != 1 {
             bail!("manifest needs exactly one primary reference, found {primaries}");
+        }
+        for suite in &m.suites {
+            if let Some(id) = &suite.reference {
+                if !m
+                    .references
+                    .iter()
+                    .any(|r| &r.id == id && r.role == "secondary")
+                {
+                    bail!(
+                        "suite {} names reference {id}, which is not a secondary reference",
+                        suite.id
+                    );
+                }
+            }
         }
         Ok((m, sha256_hex(text.as_bytes())))
     }
@@ -138,6 +156,18 @@ mod tests {
     }
 
     #[test]
+    fn a_suite_naming_an_unknown_reference_is_rejected() {
+        let text = "schema_version = 1\n\
+            [succinctly]\nprofile='release'\nfeatures=''\n[queries]\nsmoke='x'\n\
+            [probes]\ncli='x'\nextensions='x'\nsyntax='x'\nfixtures='x'\ndivergences='x'\nrobust='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n[perf]\nqueries='q'\n\
+            [[reference]]\nid='a'\nversion='1'\nrole='primary'\nsource_url=''\nsource_sha256=''\n\
+            [[suite]]\nid='s'\npath='p'\nsha256='s'\nreference='a'\n";
+        // Naming the primary, or a typo, would run the suite as a primary one.
+        assert!(Manifest::parse(text).is_err());
+        assert!(Manifest::parse(&text.replace("reference='a'\n", "reference='b'\n")).is_err());
+    }
+
+    #[test]
     fn two_primaries_are_rejected() {
         let text = "schema_version = 1\n\
             [succinctly]\nprofile='release'\nfeatures=''\n[queries]\nsmoke='x'\n\
@@ -172,7 +202,29 @@ mod pin_tests {
             id: "x".into(),
             path: "comparison/jq/manifest.toml".into(),
             sha256: "0".repeat(64),
+            reference: None,
         };
         assert!(Manifest::read_pinned(root, &s).is_err());
+    }
+
+    /// A suite names the secondary reference it runs against or none (#5622): a typo or the
+    /// primary's id would otherwise drop the suite from both columns without a word.
+    #[test]
+    fn a_suite_reference_names_the_secondary_reference() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (m, _) = Manifest::load(root).unwrap();
+        let secondary: Vec<_> = m.suites.iter().filter(|s| s.reference.is_some()).collect();
+        assert!(secondary.len() >= 7, "{}", secondary.len());
+        for s in &secondary {
+            let id = s.reference.as_deref().unwrap();
+            assert!(
+                m.references
+                    .iter()
+                    .any(|r| r.id == id && r.role == "secondary"),
+                "{} names {id}",
+                s.id
+            );
+        }
+        assert!(m.suites.iter().any(|s| s.reference.is_none()));
     }
 }

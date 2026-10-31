@@ -172,6 +172,13 @@ pub struct Results {
     pub extensions: Vec<cli::CliRow>,
     /// B, one summary per vendored upstream file.
     pub differential: Vec<suites::SuiteSummary>,
+    /// B, the secondary reference's own test files against it (#5622). Informational: never
+    /// counted in `differential`, never checked against the ledger.
+    #[serde(default)]
+    pub differential_secondary: Vec<suites::SuiteSummary>,
+    /// Secondary-reference suites that could not run, with why (#5622).
+    #[serde(default)]
+    pub secondary_suites_skipped: Vec<String>,
     /// C.
     pub input: Option<jsonconf::InputSummary>,
     /// D and E, one row per query × input.
@@ -195,6 +202,19 @@ fn build_reference(root: &std::path::Path, version: &str) -> Result<()> {
         bail!("building jq-{version} failed");
     }
     Ok(())
+}
+
+/// The secondary reference a suite is pinned to, or `None` for a suite that runs against the
+/// primary (#5622).
+fn suite_reference<'a>(
+    manifest: &'a Manifest,
+    suite: &manifest::Suite,
+) -> Option<&'a manifest::Reference> {
+    let id = suite.reference.as_deref()?;
+    manifest
+        .references
+        .iter()
+        .find(|r| r.id == id && r.role == "secondary")
 }
 
 /// The secondary reference's binary, or why it is not available.
@@ -382,6 +402,11 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     } else if want(Dimension::Features)
         || want(Dimension::Performance)
         || want(Dimension::Operational)
+        || (want(Dimension::Differential)
+            && manifest
+                .suites
+                .iter()
+                .any(|s| suite_reference(&manifest, s).is_some()))
     {
         secondary_tool(&root, &manifest, args.build_jq)
     } else {
@@ -507,8 +532,31 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         )?;
     }
     let mut differential = vec![];
+    let mut differential_secondary = vec![];
+    let mut secondary_suites_skipped: Vec<String> = vec![];
     if want(Dimension::Differential) {
         for suite in &manifest.suites {
+            if let Some(r) = suite_reference(&manifest, suite) {
+                // The secondary's own files: informational, so not in `run_suites` (the ledger
+                // never learns of them), not in `observed`, and never fatal: a file that cannot
+                // run is named in the report instead. `--ledger-only` checks the primary alone.
+                if args.ledger_only {
+                    continue;
+                }
+                let ran = match &secondary {
+                    Ok(sec) => Manifest::read_pinned(&root, suite)
+                        .and_then(|text| {
+                            suites::run(&suite.id, &text, sec, &subject, None, &fixtures)
+                        })
+                        .map_err(|e| e.to_string()),
+                    Err(why) => Err(format!("{}: {why}", r.id)),
+                };
+                match ran {
+                    Ok(sum) => differential_secondary.push(sum),
+                    Err(why) => secondary_suites_skipped.push(format!("{}: {why}", suite.id)),
+                }
+                continue;
+            }
             run_suites.push(suite.id.clone());
             let text = Manifest::read_pinned(&root, suite)?;
             let sum = suites::run(
@@ -712,6 +760,8 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         cli: cli_rows,
         extensions: ext_rows,
         differential,
+        differential_secondary,
+        secondary_suites_skipped,
         input,
         robust: robust_rows,
         operational: operational_info,

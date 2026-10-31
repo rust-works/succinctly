@@ -275,6 +275,7 @@ pub fn render(results: &Results) -> String {
     syntax_section(&mut s, &r.syntax, &r.known_divergences);
     cli_sections(&mut s, r);
     differential_section(&mut s, r);
+    differential_secondary_section(&mut s, r);
     input_section(&mut s, r);
     robust_section(&mut s, r);
     operational_section(&mut s, r);
@@ -498,6 +499,42 @@ fn differential_section(s: &mut String, r: &Results) {
             x.program,
             note_for(r, &x.id)
         );
+    }
+}
+
+/// The secondary reference's own test files (#5622). Where `succinctly jq` follows jq 1.7.1, a
+/// disagreement here is expected rather than a bug, so nothing in this table is a ledger entry
+/// and none of it is counted above.
+fn differential_secondary_section(s: &mut String, r: &Results) {
+    if !r.secondary_suites_skipped.is_empty() {
+        let _ = writeln!(s, "\n### B2. jq 1.8.1's own test files: not run\n");
+        for why in &r.secondary_suites_skipped {
+            let _ = writeln!(s, "- {why}");
+        }
+    }
+    if r.differential_secondary.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "\n### B2. jq 1.8.1's own test files (informational)\n");
+    let _ = writeln!(
+        s,
+        "The same comparison against the secondary reference. `succinctly jq` follows jq 1.7.1, so a \
+         disagreement here is a place where 1.8 changed, not necessarily a bug; these rows are not \
+         in the ledger and not in the counts above.\n"
+    );
+    let _ = writeln!(s, "| File | Cases | Agree |");
+    let _ = writeln!(s, "|------|-------|-------|");
+    for x in &r.differential_secondary {
+        let _ = writeln!(s, "| {} | {} | {} |", x.suite, x.total, x.matching);
+    }
+    let _ = writeln!(s, "\n| Case | Program |");
+    let _ = writeln!(s, "|------|---------|");
+    for x in r
+        .differential_secondary
+        .iter()
+        .flat_map(super::suites::SuiteSummary::differing)
+    {
+        let _ = writeln!(s, "| `{}` | `{}` |", x.id, x.program);
     }
 }
 

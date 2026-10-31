@@ -29,6 +29,7 @@ reported as a correctness row and gets no timing; the command exits 1 on it.
 | `probes/extensions.tsv` | succinctly-only surface the reference must reject      |
 | `fixtures/`           | working directory of the CLI probes (`-f`, `-L`, ...)    |
 | `vendor/jq-1.7.1/`    | B: jq's own test files (MIT), sha256-pinned in the manifest |
+| `vendor/jq-1.8.1/`    | B2: jq 1.8.1's own test files, run against 1.8.1 alone and reported apart (informational, never a ledger entry) |
 | `queries/perf.tsv`    | D/E: id, flags, filter, shapes, max tier                 |
 | `probes/robust.tsv`   | F: nesting, recursion, generators, regex, big values, SIGPIPE, `ulimit -v` (`ulimit-v:<KiB>` wrap); `@gen:` builds large stdin |
 | `divergences.toml`    | ledger of known differences; the run fails on drift      |
