@@ -24382,19 +24382,12 @@ fn parse_complete_json(s: &str, yq_mode: bool) -> Result<OwnedValue, String> {
 fn parse_complete_json_after_bom(s: &str, yq_mode: bool) -> Result<OwnedValue, String> {
     let bytes = s.as_bytes();
     if !yq_mode {
-        // #3032: use the same jq accept-set and literal-preserving decoder as
-        // --argjson. Validation must precede semi-indexing: the index alone
-        // does not check JSON grammar or guarantee one complete value.
-        crate::json::validate::validate_jq_lenient(bytes).map_err(|e| e.to_string())?;
-        let index = crate::json::JsonIndex::build(bytes);
-        // STYLE-0012: this parser has no `optional` flag; its caller handles
-        // suppression, and the validator already bounds nesting below the
-        // materializer's own limit.
-        // Each parse makes new NaN instances (#3309), whatever address the
-        // text it indexed happens to have.
-        return super::eval_generic::to_owned::<JqSemantics, _>(&index.root(bytes).value())
-            .map(|value| value.with_fresh_nan_instances(bytes))
-            .map_err(|e| e.to_string());
+        // #5675: plain RFC 8259 text is read in one pass; anything else, and every error, is
+        // decided below.
+        if let Some(value) = super::json_fast::parse_plain(s) {
+            return Ok(value);
+        }
+        return parse_complete_json_indexed(bytes);
     }
 
     // yq retains its existing parser and error behavior (#2018).
@@ -24407,6 +24400,24 @@ fn parse_complete_json_after_bom(s: &str, yq_mode: bool) -> Result<OwnedValue, S
         return Err("trailing content after JSON value".to_string());
     }
     Ok(value)
+}
+
+/// jq mode's general route for [`parse_complete_json_after_bom`]: every text the one-pass reader
+/// declines, and the only route that words an error.
+pub(super) fn parse_complete_json_indexed(bytes: &[u8]) -> Result<OwnedValue, String> {
+    // #3032: use the same jq accept-set and literal-preserving decoder as
+    // --argjson. Validation must precede semi-indexing: the index alone
+    // does not check JSON grammar or guarantee one complete value.
+    crate::json::validate::validate_jq_lenient(bytes).map_err(|e| e.to_string())?;
+    let index = crate::json::JsonIndex::build(bytes);
+    // STYLE-0012: this parser has no `optional` flag; its caller handles
+    // suppression, and the validator already bounds nesting below the
+    // materializer's own limit.
+    // Each parse makes new NaN instances (#3309), whatever address the
+    // text it indexed happens to have.
+    super::eval_generic::to_owned::<JqSemantics, _>(&index.root(bytes).value())
+        .map(|value| value.with_fresh_nan_instances(bytes))
+        .map_err(|e| e.to_string())
 }
 
 /// Parse a JSON value starting at the given position.
