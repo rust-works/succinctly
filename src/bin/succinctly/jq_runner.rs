@@ -5750,6 +5750,27 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             // this function's own stated safety goal.
             if args.null_input && !force_read_under_null_input {
                 jq::seed_remaining_inputs(Vec::new(), locations.exhausted(args.slurp));
+            } else if let Some(lazy) = LAZY_JSON_INPUTS.with(|slot| slot.borrow_mut().take()) {
+                // #5661: a clean single-source stream whose documents are converted as the
+                // program reads them. `inputs` is empty; `locations` holds every document's
+                // line, and no parse error is queued (the route is taken only without one).
+                debug_assert_eq!(lazy.spans.len(), locations.per_value().len());
+                let lines: Vec<(u32, u32)> = locations.per_value().to_vec();
+                let materialize = move |index: usize| {
+                    let (start, end) = lazy.spans[index];
+                    // Serde accepted the span as a whole value and its depth is bounded
+                    // (`lazy_json_spans`), so it is the conversion the eager route made, minus
+                    // a position only a depth error would have read.
+                    stream_document_validated(&lazy.text.as_bytes()[start..end], None, &[], 0)
+                };
+                jq::seed_remaining_inputs_lazily(
+                    lines,
+                    Box::new(materialize),
+                    locations.exhausted(args.slurp),
+                );
+                if locations.eof_tail.is_some() {
+                    jq::count_reads_past_end();
+                }
             } else {
                 // Moves rather than clones: `inputs` isn't read again on
                 // this branch (the null-input arm below uses `OwnedValue::
@@ -6789,6 +6810,8 @@ fn get_inputs(
         // the last, on a route that already decodes every byte of each, and none at all where
         // no message can read it (`--stream`, DSV).
         let last = raw_inputs.len().saturating_sub(1);
+        LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
+        let mut lazy_inputs = false;
         let counts_files = !args.stream && args.input_dsv.is_none();
         let mut next_file = StreamOrigin::ALONE.file;
         for (pos, (file_idx, raw)) in raw_inputs.into_iter().enumerate() {
@@ -6832,6 +6855,23 @@ fn get_inputs(
                 // #4311: a program using `input`/`inputs` sees jq resume after
                 // a parse error, at the read after the one that met the fault.
                 if track_eof && !args.slurp {
+                    // #5661: `-n` over one clean plain-JSON source converts each document when
+                    // the program reads it, so `first(inputs)` neither parses nor holds the rest.
+                    // Anything unusual (an error, a BOM, a deep document) takes the route below.
+                    if args.null_input && !args.stream && pos == 0 && last == 0 {
+                        if let Some(spans) = lazy_json_spans(&raw) {
+                            let ends: Vec<usize> = spans.iter().map(|&(_, end)| end).collect();
+                            locations.extend_from_ends(src, &raw, seam, &ends, spans.len());
+                            LAZY_JSON_INPUTS.with(|slot| {
+                                *slot.borrow_mut() = Some(LazyJsonInputs {
+                                    text: std::rc::Rc::new(raw),
+                                    spans,
+                                });
+                            });
+                            lazy_inputs = true;
+                            continue;
+                        }
+                    }
                     let documents_before = values.len();
                     let mut ends = Vec::new();
                     let mut offset = 0;
@@ -7044,7 +7084,7 @@ fn get_inputs(
             // the real slurp-mode invariant is `InputLocations::single`'s own
             // unconditional single push, asserted independently by `run_jq`'s
             // `debug_assert_eq!(inputs.len(), locations.per_value().len())`.
-            if !args.slurp {
+            if !args.slurp && !lazy_inputs {
                 debug_assert_eq!(locations.len(), values.len(), "one location per value");
             }
         }
@@ -8826,6 +8866,99 @@ fn find_json_values(bytes: &[u8]) -> core::result::Result<Vec<(usize, usize)>, u
         (values, None) => Ok(values),
         (_, Some(offset)) => Err(offset),
     }
+}
+
+/// Documents of a clean single-source JSON stream that `-n` with `input`/`inputs` converts when
+/// they are read, not up front (#5661): the text and each document's byte range in it.
+struct LazyJsonInputs {
+    text: std::rc::Rc<String>,
+    spans: Vec<(usize, usize)>,
+}
+
+thread_local! {
+    /// Set by [`get_inputs`] for the call site that seeds the `input` queue, which takes it.
+    static LAZY_JSON_INPUTS: std::cell::RefCell<Option<LazyJsonInputs>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A document at most this long cannot nest deeper than [`LAZY_JSON_MAX_DEPTH`].
+const LAZY_JSON_SHALLOW_LEN: usize = 64;
+
+/// The nesting a lazily converted document may have. Far under every limit that can make a
+/// conversion fail (jq's input depth limit, the owned tree's), so a document that passes cannot
+/// fail when it is read -- an error there would surface mid-stream, where the eager route reports
+/// it with the stream's position (#5497).
+const LAZY_JSON_MAX_DEPTH: usize = 64;
+
+/// Whether `bytes` (one JSON value) nests no deeper than `limit`, string- and escape-aware.
+fn json_depth_at_most(bytes: &[u8], limit: usize) -> bool {
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for &b in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > limit {
+                    return false;
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    true
+}
+
+/// The byte range of every document of `raw`, when `-n` with `input`/`inputs` can convert them as
+/// they are read (#5661): the whole stream is plain, strict JSON that `serde_json` accepts, the
+/// splitter and `serde_json` agree on where each document ends, and no document nests deeply
+/// enough for its conversion to fail. `None` for anything else -- a parse error, a BOM, a number
+/// jq reads and `serde_json` refuses -- and the eager route then reads the stream, with its error
+/// placement, as it always did.
+fn lazy_json_spans(raw: &str) -> Option<Vec<(usize, usize)>> {
+    if raw.starts_with('\u{feff}') {
+        return None;
+    }
+    let lead = raw.len() - raw.trim_start().len();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut ends = Vec::new();
+    let mut stream =
+        serde_json::Deserializer::from_str(trimmed).into_iter::<serde::de::IgnoredAny>();
+    while let Some(value) = stream.next() {
+        value.ok()?;
+        ends.push(lead + stream.byte_offset());
+    }
+    let (spans, split_error) = split_json_values(raw.as_bytes());
+    if split_error.is_some()
+        || spans.len() != ends.len()
+        || spans
+            .iter()
+            .zip(&ends)
+            .any(|(&(_, end), &serde_end)| end != serde_end)
+    {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    spans
+        .iter()
+        .all(|&(start, end)| {
+            end - start <= LAZY_JSON_SHALLOW_LEN
+                || json_depth_at_most(&bytes[start..end], LAZY_JSON_MAX_DEPTH)
+        })
+        .then_some(spans)
 }
 
 /// [`find_json_values`] without discarding what it found before a failure:
@@ -13124,6 +13257,89 @@ fn format_json_text(value: &OwnedValue, config: &OutputConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5661: which plain-JSON streams `-n` with `input`/`inputs` converts as they are read. The
+    /// route is for a stream with nothing to report: an error, a BOM, a number only jq reads or a
+    /// document deep enough for its conversion to fail all keep the eager route, which places the
+    /// error where jq's reader meets it.
+    #[test]
+    fn lazy_json_spans_takes_only_clean_shallow_streams_5661() {
+        let spans = |text: &str| lazy_json_spans(text);
+        assert_eq!(spans("1\n22\n[3]\n"), Some(vec![(0, 1), (2, 4), (5, 8)]));
+        assert_eq!(spans("  {\"a\":1} \"s\"\n\n"), Some(vec![(2, 9), (10, 13)]));
+        assert_eq!(spans("1 2 3"), Some(vec![(0, 1), (2, 3), (4, 5)]));
+        let deep_enough = format!("{}1{}\n", "[".repeat(64), "]".repeat(64));
+        assert!(spans(&deep_enough).is_some());
+        for refused in [
+            "",
+            " \n\t",
+            "1\n2\n}\n",
+            "{\"a\":\n",
+            "\u{feff}1\n",
+            "nan\n1\n",
+            "007\n",
+            "[1,]\n",
+            "1\n\u{0}2\n",
+        ] {
+            assert_eq!(spans(refused), None, "{refused:?}");
+        }
+        let too_deep = format!("{}1{}\n", "[".repeat(65), "]".repeat(65));
+        assert_eq!(spans(&too_deep), None);
+        // Brackets inside a string do not count towards the depth.
+        let in_string = format!("[\"{}\", 1]\n", "[".repeat(200));
+        assert!(spans(&in_string).is_some());
+    }
+
+    /// #5661: `-n` over one clean plain-JSON file leaves its documents unconverted for the queue,
+    /// and every other shape still reads them up front. The pin must be able to fail: it does,
+    /// with `lazy_json_spans` made to answer `None`.
+    #[test]
+    fn get_inputs_defers_a_clean_stream_under_null_input_5661() {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, text: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let read = |argv: &[&str]| {
+            let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+            let (mut open_failed, mut opened) = (false, Vec::new());
+            let (inputs, locations, trailing, resumed) =
+                get_inputs(&cmd, true, true, &mut open_failed, &mut opened)
+                    .expect("no exit code")
+                    .expect("reads");
+            let lazy = LAZY_JSON_INPUTS.with(|slot| slot.borrow_mut().take());
+            (
+                inputs,
+                locations.per_value().to_vec(),
+                trailing.is_some(),
+                resumed.len(),
+                lazy,
+            )
+        };
+        let clean = write("clean.json", "1\n{\"a\":2}\n[3]\n");
+        let (inputs, lines, trailing, resumed, lazy) = read(&["jq", "-n", "inputs", &clean]);
+        assert!(inputs.is_empty());
+        assert_eq!(lines.len(), 3);
+        assert!(!trailing && resumed == 0);
+        let lazy = lazy.expect("deferred");
+        assert_eq!(lazy.spans, vec![(0, 1), (2, 9), (10, 13)]);
+        // Not under `-n`, with `-s`, with `--stream`, or with a stream that turns malformed.
+        let broken = write("broken.json", "1\n2\n}\n");
+        for argv in [
+            vec!["jq", "inputs", &clean],
+            vec!["jq", "-n", "-s", "inputs", &clean],
+            vec!["jq", "-n", "--stream", "inputs", &clean],
+            vec!["jq", "-n", "inputs", &broken],
+            vec!["jq", "-n", "inputs", &clean, &clean],
+        ] {
+            let (inputs, _, _, _, lazy) = read(&argv);
+            assert!(lazy.is_none(), "{argv:?}");
+            assert!(!inputs.is_empty(), "{argv:?}");
+        }
+    }
 
     /// #3470: which programs `m2_has_stderr_effect` keeps off the M2 fast
     /// path. It must see an effect buried in a computed key, a slice bound or
