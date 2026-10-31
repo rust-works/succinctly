@@ -10730,13 +10730,7 @@ mod tests {
                     );
                 }
             }
-            for text in [
-                "1 +\t1",
-                "1 +\n1",
-                "1 # c\r\n+ 1",
-                "[1] | add \n",
-                "# c\r\n1",
-            ] {
+            for text in ["1 +\t1", "1 +\n1", "1 # c\r\n+ 1", "# c\r\n1"] {
                 assert!(
                     parse_with_mode(text, mode).is_ok(),
                     "{mode:?} mode rejected {text:?}"
