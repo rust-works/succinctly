@@ -3361,11 +3361,21 @@ pub fn preceding_gap_ok(text: &[u8], child_start: usize, expected: Option<u8>) -
                 found = Some(b);
                 i -= 1;
             }
-            b if b.is_ascii_whitespace() => i -= 1,
+            b' ' | b'\t' | b'\n' | b'\r' => i -= 1,
             _ => break, // reached the previous sibling's own content
         }
     }
-    found == expected
+    // #5644: what the scan stopped on has to be what can sit there. A first child follows its
+    // container's `[` or `{`, and a value follows its key's closing `"`; any other byte (`@`,
+    // `#`, a control byte, ...) is junk the index read as whitespace, and jq refuses it
+    // (`[@"a"]`, `{"a"@:1}`, `{@"a":1}`). After a `,` the stop is the previous sibling's own last
+    // byte, which can be anything a value ends in, so only these two are checked.
+    let stopped_on_ok = match expected {
+        None => i == 0 || matches!(text[i - 1], b'[' | b'{'),
+        Some(b':') => i > 0 && text[i - 1] == b'"',
+        Some(_) => true,
+    };
+    found == expected && stopped_on_ok
 }
 
 /// The forward-scan counterpart of [`preceding_gap_ok`]: whether exactly
@@ -3412,11 +3422,21 @@ pub fn following_gap_ok(text: &[u8], key_end: usize) -> bool {
                 found = Some(b);
                 i += 1;
             }
-            b if b.is_ascii_whitespace() => i += 1,
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
             _ => break,
         }
     }
-    found == Some(b':')
+    // #5644: the value after the `:` starts on the byte the scan stopped on. The index reads a
+    // byte that begins no JSON token (`@`, `#`, a control byte, ...) as whitespace and starts the
+    // value after it, so `{"a":@1}` would read as `{"a":1}` where jq refuses it. A letter or
+    // digit is left to the value's own decode, and a closing bracket to the empty-value check.
+    let value_start_ok = i >= text.len()
+        || text[i].is_ascii_alphanumeric()
+        || matches!(
+            text[i],
+            b'"' | b'[' | b'{' | b'-' | b'+' | b'.' | b'}' | b']'
+        );
+    found == Some(b':') && value_start_ok
 }
 
 /// Whether nothing but whitespace separates `gap_start` (a container's last
