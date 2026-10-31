@@ -48226,9 +48226,9 @@ fn test_fromjson_jq_lenient_rejects_invalid_text_3032() -> Result<()> {
         assert!(stdout.is_empty(), "{source:?}: {stdout:?}");
     }
 
-    // Validation runs before the cursor walk and caps nesting below the
-    // materializer's own recursion limit.
-    let deep = format!("{}0{}", "[".repeat(129), "]".repeat(129));
+    // Validation runs before the cursor walk and caps nesting at jq's own parse-depth ceiling
+    // (256 nested arrays, #5688), which is below the materializer's own recursion limit.
+    let deep = format!("{}0{}", "[".repeat(257), "]".repeat(257));
     let (stdout, stderr, code) = run_jq_full(&["-nc", "--arg", "s", &deep, "$s | fromjson"], None)?;
     assert_eq!(code, 5, "{stdout:?} {stderr:?}");
     assert!(stderr.contains("while parsing"), "{stderr}");

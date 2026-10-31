@@ -24435,7 +24435,20 @@ pub(super) fn parse_complete_json_indexed(bytes: &[u8]) -> Result<OwnedValue, St
     // #3032: use the same jq accept-set and literal-preserving decoder as
     // --argjson. Validation must precede semi-indexing: the index alone
     // does not check JSON grammar or guarantee one complete value.
-    crate::json::validate::validate_jq_lenient(bytes).map_err(|e| e.to_string())?;
+    //
+    //
+    // #5688: containers may nest as deep as jq's parse-depth ceiling, not the validator's default
+    // of 128 (the walk's stack at 256 levels is a few tens of KB). jq counts an object as two
+    // entries of that ceiling, so a text past the old default is also put to jq's own count.
+    let mut validator = crate::json::validate::Validator::new(bytes)
+        .jq_lenient()
+        .with_max_depth(super::parse_message::JQ_MAX_PARSING_DEPTH);
+    validator.validate().map_err(|e| e.to_string())?;
+    if validator.deepest() > crate::json::validate::MAX_NESTING_DEPTH
+        && super::parse_message::jq_depth_fault_offset(bytes).is_some()
+    {
+        return Err("Exceeds depth limit for parsing".to_string());
+    }
     let index = crate::json::JsonIndex::build(bytes);
     // STYLE-0012: this parser has no `optional` flag; its caller handles
     // suppression, and the validator already bounds nesting below the

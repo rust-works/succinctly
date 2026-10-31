@@ -176,6 +176,11 @@ pub struct Validator<'a> {
     /// Whether to accept the number and escape spellings real jq accepts
     /// but RFC 8259 does not -- see [`validate_jq_lenient`].
     jq_lenient: bool,
+    /// The deepest container nesting accepted, [`MAX_NESTING_DEPTH`] unless
+    /// [`with_max_depth`](Self::with_max_depth) raised it.
+    max_depth: usize,
+    /// The deepest container nesting entered so far.
+    deepest: usize,
 }
 
 impl<'a> Validator<'a> {
@@ -188,7 +193,24 @@ impl<'a> Validator<'a> {
             column: 1,
             nesting_depth: 0,
             jq_lenient: false,
+            max_depth: MAX_NESTING_DEPTH,
+            deepest: 0,
         }
+    }
+
+    /// The deepest container nesting the walk has entered (0 before it runs).
+    #[must_use]
+    pub fn deepest(&self) -> usize {
+        self.deepest
+    }
+
+    /// This validator, with containers allowed to nest `max_depth` deep instead of
+    /// `MAX_NESTING_DEPTH` (#5688). The caller owns the stack that depth costs: the walk
+    /// recurses once per level.
+    #[must_use]
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth;
+        self
     }
 
     /// This validator, switched to jq's own accept-set for numbers and
@@ -269,12 +291,13 @@ impl<'a> Validator<'a> {
     /// exits so sibling containers do not accumulate depth.
     #[inline]
     fn enter_nested(&mut self) -> Result<(), ValidationError> {
-        if self.nesting_depth >= MAX_NESTING_DEPTH {
+        if self.nesting_depth >= self.max_depth {
             return Err(self.error(ValidationErrorKind::NestingTooDeep {
-                limit: MAX_NESTING_DEPTH,
+                limit: self.max_depth,
             }));
         }
         self.nesting_depth += 1;
+        self.deepest = self.deepest.max(self.nesting_depth);
         Ok(())
     }
 
@@ -2948,6 +2971,29 @@ mod tests {
     fn test_nesting_at_cap_validates() {
         let input = "[".repeat(MAX_NESTING_DEPTH) + &"]".repeat(MAX_NESTING_DEPTH);
         assert!(validate(input.as_bytes()).is_ok());
+    }
+
+    /// #5688: a caller may raise the ceiling, and learn how deep the walk went.
+    #[test]
+    fn test_with_max_depth_raises_the_ceiling_and_reports_the_deepest_level() {
+        let nested = |n: usize| "[".repeat(n) + &"]".repeat(n);
+        let hundred = nested(100);
+        let mut at_default = Validator::new(hundred.as_bytes());
+        assert!(at_default.validate().is_ok());
+        assert_eq!(at_default.deepest(), 100);
+
+        let past_default = nested(MAX_NESTING_DEPTH + 72);
+        assert!(validate(past_default.as_bytes()).is_err());
+        let mut raised = Validator::new(past_default.as_bytes()).with_max_depth(256);
+        assert!(raised.validate().is_ok());
+        assert_eq!(raised.deepest(), 200);
+
+        let over = nested(257);
+        let err = Validator::new(over.as_bytes())
+            .with_max_depth(256)
+            .validate()
+            .unwrap_err();
+        assert_eq!(err.kind, ValidationErrorKind::NestingTooDeep { limit: 256 });
     }
 
     #[test]
