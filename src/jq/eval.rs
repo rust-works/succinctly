@@ -13033,7 +13033,7 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
 
 /// Whether `stage` is one of the argument-free builtins [`closed_unary_builtin`]
 /// answers: each maps its input to at most one value and has no effect.
-fn is_closed_unary_builtin(stage: &Expr) -> bool {
+pub(crate) fn is_closed_unary_builtin(stage: &Expr) -> bool {
     matches!(
         unwrap_paren(stage),
         Expr::Builtin(
