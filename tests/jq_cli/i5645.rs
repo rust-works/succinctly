@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 
-use crate::run_jq_full;
+use crate::{run_jq_full, run_jq_over_files};
 
 const CATCH_INPUTS: &str = "[limit(6; repeat(try input catch \"E\"))]";
 
@@ -26,6 +26,10 @@ const READS: &[(&str, &str)] = &[
     ("{\"a\":1,2 \n\"k\"\n4", r#"["E",4,"E","E","E","E"]"#),
     ("{1 \t \n\n 2 3\n4", r#"["E",4,"E","E","E","E"]"#),
     ("{01\n2\n3", r#"["E",3,"E","E","E","E"]"#),
+    // The next string closes at its first unescaped quote; a form feed is not whitespace to jq,
+    // so it joins the number into one token whose end is met on the line holding it.
+    ("{1\n\"k\\\"x\"\n3", r#"["E",3,"E","E","E","E"]"#),
+    ("{1\x0c\"k\"\n2\n3", r#"["E",2,3,"E","E","E"]"#),
     // No next token: the fault is at the end of input.
     ("{1", r#"["E","E","E","E","E","E"]"#),
     ("{1\n\n", r#"["E","E","E","E","E","E"]"#),
@@ -62,6 +66,28 @@ fn test_the_stream_reader_resumes_at_the_same_read_5645() -> Result<()> {
             (out.trim_end(), err.as_str(), code),
             (expected, "", 0),
             "{stdin:?}"
+        );
+    }
+    Ok(())
+}
+
+/// jq reads its files as one byte stream, so the token after a key-position number can open the
+/// next file, and the fault is met there.
+#[test]
+fn test_the_next_token_may_open_the_next_file_5645() -> Result<()> {
+    for (files, expected) in [
+        (["{1\n", "\"k\":2\n3\n"], r#"["E",3,"E","E","E","E"]"#),
+        (["{1\n", "2\n3\n"], r#"["E",3,"E","E","E","E"]"#),
+        (
+            ["{\"a\":1,2\n", "\n\"k\"\n4\n"],
+            r#"["E",4,"E","E","E","E"]"#,
+        ),
+    ] {
+        let (out, err, code, _) = run_jq_over_files(&["-nc", CATCH_INPUTS], &files)?;
+        assert_eq!(
+            (out.trim_end(), err.as_str(), code),
+            (expected, "", 0),
+            "{files:?}"
         );
     }
     Ok(())
