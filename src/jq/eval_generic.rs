@@ -469,7 +469,7 @@ fn plain_number_answer<S: EvalSemantics>(expr: &Expr, number: &OwnedValue) -> Op
         // Literal keys only (a computed key is a generator), each value one answer: the pairs
         // fold into the map as the evaluator's own construction folds them.
         Expr::Object(entries) => {
-            let mut pairs = Vec::with_capacity(entries.len());
+            let mut pairs = vec_with_capacity(entries.len());
             for entry in entries {
                 let ObjectKey::Literal(key) = &entry.key else {
                     return None;
