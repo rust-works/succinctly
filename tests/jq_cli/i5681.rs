@@ -214,6 +214,37 @@ null"#,
 2",
         0,
     ),
+    // A path target the shipped walkers do not take runs the whole program through the path-mode interpreter.
+    (
+        &["-c", "--stream", "path(.[.[0][0]|select(.)])"],
+        "[7,8]",
+        "[0]\n[1]\n[1]",
+        0,
+    ),
+    (
+        &["-c", "--stream", "(.[]|select(.==1.0)) = 5"],
+        "[1.0]",
+        "[[0],5]\n[[0]]",
+        0,
+    ),
+    (
+        &["-c", "--stream", "(.[0][]|numbers) |= .+1"],
+        "[7,8]",
+        "[[1],7]\n[[2],8]\n[[2]]",
+        0,
+    ),
+    (
+        &["-c", "--stream", "del(.. | nulls)"],
+        "[null,1]",
+        "[[0]]\n[[1],1]\n[[1]]",
+        0,
+    ),
+    (
+        &["-c", "--stream", ".[1] as $d | $d | path($d)"],
+        "[7]",
+        "[]\n[]",
+        0,
+    ),
 ];
 
 #[test]
@@ -226,5 +257,14 @@ fn test_stream_events_read_in_place_by_a_filter_match_jq_5681() -> Result<()> {
             "{args:?} on {stdin:?}: stderr {stderr}"
         );
     }
+    Ok(())
+}
+
+/// A message that names the value is worded from the event the filter read.
+#[test]
+fn test_stream_event_error_names_the_value_it_read_5681() -> Result<()> {
+    let (stdout, stderr, status) = run_jq_full(&["-c", "--stream", ".[1]|keys"], Some("[7]"))?;
+    assert_eq!((stdout.as_str(), status), ("", 5), "stderr {stderr}");
+    assert!(stderr.contains("number (7) has no keys"), "{stderr}");
     Ok(())
 }
