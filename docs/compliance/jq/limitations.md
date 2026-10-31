@@ -8242,6 +8242,12 @@ Wrapping the evaluation in
 so a recursion too deep for it refuses instead; running recursive `def`s at any real depth
 still needs a thread reserved at a comparable size.
 
+Under `ulimit -v` (a cap on address space, which counts a thread's reserved stack) the CLI reserves less.
+The evaluation stack starts at a quarter of the cap, within 16 MiB and its full size, and halves if the thread still cannot be mapped (#5634).
+ADR-0025's floor follows the size it got, so a recursion that reaches it refuses at a proportionally shallower depth instead of overflowing, and a capped run answers where it used to stop with `failed to spawn the evaluation thread`.
+At a cap of 32 MiB the thread cannot be mapped at all.
+A document too large for the cap still aborts on the failed allocation, as jq does.
+
 ## Input files are one byte stream (#4305)
 
 jq 1.7.1 reads all of its input files as one concatenated byte stream, so a token still open where a
