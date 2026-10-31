@@ -30,13 +30,14 @@ reported as a correctness row and gets no timing; the command exits 1 on it.
 | `fixtures/`           | working directory of the CLI probes (`-f`, `-L`, ...)    |
 | `vendor/jq-1.7.1/`    | B: jq's own test files (MIT), sha256-pinned in the manifest |
 | `vendor/jq-1.8.1/`    | B2: jq 1.8.1's own test files, run against 1.8.1 alone and reported apart (informational, never a ledger entry) |
-| `queries/perf.tsv`    | D/E: id, flags, filter, shapes, max tier                 |
+| `queries/perf.tsv`    | D/E: id, flags, filter, shapes, max tier; `@INPUT@` in the flags is the input file's name (`--slurpfile d @INPUT@`), `@files=N` passes it `N` times |
 | `probes/robust.tsv`   | F: nesting, recursion, generators, regex, big values, SIGPIPE, `ulimit -v` (`ulimit-v:<KiB>` wrap); `@gen:` builds large stdin |
 | `divergences.toml`    | ledger of known differences; the run fails on drift      |
 
 Dimension A probes every builtin in the reference's own `builtins` (plus those new in jq 1.8.1, against 1.8.1) and, from `probes/syntax.tsv`, the language's forms: operators, paths and slices, construction, `if`/`reduce`/`foreach`/`label`, destructuring with `?//`, `def`, string and format forms, assignment and `import`/`include`;
 `--write-summary` regenerates `docs/compare/jq-coverage.json` and the figures in `docs/reference/jq-language.md`.
 Dimension B runs the vendored upstream test files through both tools; C runs JSONTestSuite against the reference, `succinctly jq` and `--validate`.
+The performance shapes beyond one large document are `ndjson` (one small record per line), `jsonseq` (the same records behind RS bytes, for `--seq`), several input files (`@files=N`) and `--slurpfile`/`--rawfile` loading (#5622).
 Dimensions D and E time every query on the pinned generated inputs (`[[input]]`, regenerated into `data/compare/inputs/`
 and checked against their sha256) against jq 1.7.1 and 1.8.1, interleaved, gated on output identity; `--control` times jq
 against itself to show the noise floor, and `--full` adds the 10 MB and 100 MB tiers.

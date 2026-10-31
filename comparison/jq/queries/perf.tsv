@@ -41,3 +41,23 @@ nested_recurse	-	[..]|length	nested	10mb
 comprehensive_paths	-	[paths]|length	comprehensive	10mb
 comprehensive_tostream	-	[tostream]|length	comprehensive	10mb
 comprehensive_numbers	-	[..|numbers]|length	comprehensive	10mb
+ndjson_identity	-c	.	ndjson	100mb
+ndjson_field	-r	.name	ndjson	100mb
+ndjson_select	-c	select(.score>500)|.id	ndjson	100mb
+ndjson_tsv	-r	[.id,.name,.score]|@tsv	ndjson	100mb
+ndjson_slurp	-s -c	map(.score)|add	ndjson	10mb
+ndjson_inputs_reduce	-n	reduce inputs as $u (0;.+$u.score)	ndjson	100mb
+ndjson_inputs_first	-n	first(inputs)|.id	ndjson	100mb
+ndjson_raw_lines	-R	length	ndjson	100mb
+ndjson_raw_fromjson	-R	fromjson|.id	ndjson	10mb
+ndjson_raw_slurp	-sR	length	ndjson	100mb
+ndjson_three_files	-c @files=3	.id	ndjson	10mb
+users_three_files	-c @files=3	.users|length	users	10mb
+seq_identity	--seq -c	.	jsonseq	100mb
+seq_field	--seq -r	.name	jsonseq	100mb
+seq_slurp	--seq -s -c	map(.score)|add	jsonseq	10mb
+users_seq_output	--seq -c	.users[]|.id	users	10mb
+users_slurpfile	-n --slurpfile d @INPUT@	$d[0].users|length	users	10mb
+ndjson_slurpfile	-n --slurpfile d @INPUT@	$d|length	ndjson	10mb
+users_rawfile	-n --rawfile s @INPUT@	$s|length	users	100mb
+args_many	-n --arg a 1 --arg b two --arg c 3 --arg d four --arg e 5 --arg f six --arg g 7 --arg h eight --argjson i 9 --argjson j [10,11] --argjson k {"l":12}	[$a,$b,$c,$d,$e,$f,$g,$h,$i,$j,$k]|length	none	1mb

@@ -32,6 +32,8 @@ Options:
           - pretty:            Indented, pretty-printed documents (tests whitespace skipping)
           - wide:              Wide flat object: many distinct top-level keys, no nesting (tests keys_unsorted)
           - wide-escaped-keys: Wide flat object like `wide`, but a fraction of keys (per --escape-density) contain a JSON escape sequence (tests escaped-key decode cost, #2637)
+          - ndjson:            Newline-delimited JSON: one compact user record per line, no enclosing array (tests many small documents; not part of `generate-suite`, and `--pretty` has no single document to indent)
+          - json-seq:          Like `ndjson`, with each record introduced by an RS byte (RFC 7464 JSON text sequences, the input of `jq --seq`)
           
           [default: comprehensive]
 

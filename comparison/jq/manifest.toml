@@ -297,3 +297,57 @@ pattern = "comprehensive"
 size = "100mb"
 seed = 1
 sha256 = "578a1e7bfa47f5e7ca336ca5d61d35028d00ed0eeec5114115b40abfa350f01e"
+
+[[input]]
+id = "ndjson-1mb"
+shape = "ndjson"
+tier = "1mb"
+pattern = "ndjson"
+size = "1mb"
+seed = 1
+sha256 = "f216dc3cb8e4fb0e3830f5823f43f6270fae50738c7a9d4cc2d1123132b57203"
+
+[[input]]
+id = "ndjson-10mb"
+shape = "ndjson"
+tier = "10mb"
+pattern = "ndjson"
+size = "10mb"
+seed = 1
+sha256 = "ab0932e7e5ebc480401f615886fd405120e390c0b7ea22d7a21531a8aa28cc2f"
+
+[[input]]
+id = "ndjson-100mb"
+shape = "ndjson"
+tier = "100mb"
+pattern = "ndjson"
+size = "100mb"
+seed = 1
+sha256 = "f9ca01aa08c48ae93c72e4b5c45b3e776873a2eb37ccd594754d99f9028bd605"
+
+[[input]]
+id = "jsonseq-1mb"
+shape = "jsonseq"
+tier = "1mb"
+pattern = "json-seq"
+size = "1mb"
+seed = 1
+sha256 = "5e80fe18728ae99409a89f03ee2feb8eab23b125c75dd693c018f6aa26e99289"
+
+[[input]]
+id = "jsonseq-10mb"
+shape = "jsonseq"
+tier = "10mb"
+pattern = "json-seq"
+size = "10mb"
+seed = 1
+sha256 = "9d80828da5fe1e811b2e10bfd1bb6fedfa53defafa4b5faa746a4ff1038c8a16"
+
+[[input]]
+id = "jsonseq-100mb"
+shape = "jsonseq"
+tier = "100mb"
+pattern = "json-seq"
+size = "100mb"
+seed = 1
+sha256 = "d2b70721c060f089443907eddc0347b1e20472ac59d304e20d674f6d73c7330b"
