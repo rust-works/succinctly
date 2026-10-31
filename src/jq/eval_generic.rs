@@ -375,11 +375,12 @@ fn document_number_f64_generic<S: EvalSemantics, V: DocumentValue>(value: &V) ->
     }
 }
 
-/// `floor`, `ceil`, `round`, `trunc`, `sqrt` and `fabs` of a document number, and since #5669 the
-/// eighteen libm builtins (`log`, `exp`, `sin`, ...), answered from the number itself (#5593). Without this they fell to [`eval_builtin_in`]'s wildcard, which writes
-/// the number out as JSON text, indexes it and evaluates the builtin over that one-number
-/// document: a round trip and an index build per number to make one libm call (`[.numbers[]|floor]`
-/// was 0.87x of jq, and `floor|.+1` 0.57x).
+/// A unary math builtin of a document number, answered from the number itself (#5593): `floor`,
+/// `ceil`, `round`, `trunc`, `sqrt`, `fabs` and, since #5669, `log`, `exp`, `sin` and the other
+/// fifteen libm builtins ([`crate::jq::eval::is_unary_math_builtin`]). Without this they fell to
+/// [`eval_builtin_in`]'s wildcard, which writes the number out as JSON text, indexes it and
+/// evaluates the builtin over that one-number document: a round trip and an index build per number
+/// to make one libm call (`[.numbers[]|floor]` was 0.87x of jq, and `floor|.+1` 0.57x).
 ///
 /// The double is [`document_number_f64_generic`]'s, which is `eval.rs`'s `json_number_f64` for a
 /// cursor, and the result is the one `builtin_floor` and its siblings build
@@ -41643,6 +41644,43 @@ mod tests {
         assert!(reindexes("map(del(.a, .[]))") > 0);
         assert!(reindexes("map(del(.a, (.b | select(. > 1))))") > 0);
         assert!(reindexes("map(del(.a?, .b))") > 0);
+    }
+
+    /// #5669: a number the filter computed, and a bound one in a fold, meets the libm builtins
+    /// without the reindex bridge too (`owned_unary_math`, and `closed_unary_builtin` for a closed
+    /// pipe such as `$x | log`). `reindex_count` counts every serialize-and-index; the pin must be
+    /// able to fail: it does, with `is_unary_math_builtin` or `is_closed_unary_builtin` dropping a
+    /// name.
+    #[cfg(feature = "std")]
+    #[test]
+    fn libm_builtins_of_an_owned_number_are_not_bridged_5669() {
+        use crate::jq::value::reindex_count;
+
+        let json = b"[0.5,2,10,-1.5]";
+        let reindexes = |filter: &str| {
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::get();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            assert_eq!(result.len(), 1, "{filter}");
+            reindex_count::get() - before
+        };
+        for builtin in [
+            "trunc", "log", "log10", "log2", "exp", "exp10", "exp2", "sin", "cos", "tan", "asin",
+            "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+        ] {
+            for filter in [
+                format!("map(. + 1 | {builtin})"),
+                format!("map(. * 2 | {builtin})"),
+                format!("reduce .[] as $x (0; . + ($x | {builtin}))"),
+            ] {
+                assert_eq!(reindexes(&filter), 0, "{filter} bridged");
+            }
+        }
+        // A value that is not a number keeps the bridge and its message.
+        assert!(reindexes("map(tostring | try log catch 0)") > 0);
     }
 
     /// #5669: the libm builtins of a number answer with the call the builtin itself makes, so the
