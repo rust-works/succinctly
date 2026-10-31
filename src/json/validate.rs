@@ -2977,23 +2977,29 @@ mod tests {
     #[test]
     fn test_with_max_depth_raises_the_ceiling_and_reports_the_deepest_level() {
         let nested = |n: usize| "[".repeat(n) + &"]".repeat(n);
-        let hundred = nested(100);
+        let raised_ceiling = MAX_NESTING_DEPTH * 2;
+        let hundred = nested(MAX_NESTING_DEPTH - 28);
         let mut at_default = Validator::new(hundred.as_bytes());
         assert!(at_default.validate().is_ok());
-        assert_eq!(at_default.deepest(), 100);
+        assert_eq!(at_default.deepest(), MAX_NESTING_DEPTH - 28);
 
         let past_default = nested(MAX_NESTING_DEPTH + 72);
         assert!(validate(past_default.as_bytes()).is_err());
-        let mut raised = Validator::new(past_default.as_bytes()).with_max_depth(256);
+        let mut raised = Validator::new(past_default.as_bytes()).with_max_depth(raised_ceiling);
         assert!(raised.validate().is_ok());
-        assert_eq!(raised.deepest(), 200);
+        assert_eq!(raised.deepest(), MAX_NESTING_DEPTH + 72);
 
-        let over = nested(257);
+        let over = nested(raised_ceiling + 1);
         let err = Validator::new(over.as_bytes())
-            .with_max_depth(256)
+            .with_max_depth(raised_ceiling)
             .validate()
             .unwrap_err();
-        assert_eq!(err.kind, ValidationErrorKind::NestingTooDeep { limit: 256 });
+        assert_eq!(
+            err.kind,
+            ValidationErrorKind::NestingTooDeep {
+                limit: raised_ceiling
+            }
+        );
     }
 
     #[test]

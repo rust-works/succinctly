@@ -24436,10 +24436,11 @@ pub(super) fn parse_complete_json_indexed(bytes: &[u8]) -> Result<OwnedValue, St
     // --argjson. Validation must precede semi-indexing: the index alone
     // does not check JSON grammar or guarantee one complete value.
     //
-    //
     // #5688: containers may nest as deep as jq's parse-depth ceiling, not the validator's default
-    // of 128 (the walk's stack at 256 levels is a few tens of KB). jq counts an object as two
-    // entries of that ceiling, so a text past the old default is also put to jq's own count.
+    // of 128. The walk recurses once per level; `validate::tests::
+    // test_with_max_depth_raises_the_ceiling_and_reports_the_deepest_level` runs it to 256 on a
+    // default 2 MiB test thread in a debug build. jq counts an object as two entries of that
+    // ceiling, so a text past the old default is also put to jq's own count.
     let mut validator = crate::json::validate::Validator::new(bytes)
         .jq_lenient()
         .with_max_depth(super::parse_message::JQ_MAX_PARSING_DEPTH);
@@ -24451,8 +24452,8 @@ pub(super) fn parse_complete_json_indexed(bytes: &[u8]) -> Result<OwnedValue, St
     }
     let index = crate::json::JsonIndex::build(bytes);
     // STYLE-0012: this parser has no `optional` flag; its caller handles
-    // suppression, and the validator already bounds nesting below the
-    // materializer's own limit.
+    // suppression, and the validator's ceiling (256) is the materializer's own, whose innermost
+    // container of a 256-deep text sits at depth 255.
     // Each parse makes new NaN instances (#3309), whatever address the
     // text it indexed happens to have.
     super::eval_generic::to_owned::<JqSemantics, _>(&index.root(bytes).value())
