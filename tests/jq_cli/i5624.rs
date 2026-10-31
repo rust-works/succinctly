@@ -1,0 +1,1097 @@
+//! #5624: the filter `.` over an owned input -- a `--stream` event, a `--seq` record, a DSV row -- hands
+//! the input on without writing it out and indexing the text for a cursor. What is printed must not
+//! move, under every option that reads the value after it is produced (`-S`, `--tab`, `--indent`,
+//! `-a`, `-r`, `-j`, `-e`). Two kinds of check: rows captured from jq 1.7.1 (`/usr/bin/jq`), and a
+//! comparison of `.` against `[.][0]`, which is not the identity filter and so takes the route the
+//! shortcut skips, over more inputs and every option.
+
+use anyhow::Result;
+
+use crate::run_jq_full;
+
+/// `(arguments, stdin, expected stdout, expected exit status)`.
+type Row = (&'static [&'static str], &'static str, &'static str, i32);
+
+const ROWS: &[Row] = &[
+    (&["--stream", "-c", "."], r"1", r"[[],1]", 0),
+    (
+        &["--stream", "."],
+        r"1",
+        r"[
+  [],
+  1
+]",
+        0,
+    ),
+    (&["--stream", "-S", "-c", "."], r"1", r"[[],1]", 0),
+    (
+        &["--stream", "--tab", "."],
+        r"1",
+        r"[
+	[],
+	1
+]",
+        0,
+    ),
+    (
+        &["--stream", "--indent", "1", "."],
+        r"1",
+        r"[
+ [],
+ 1
+]",
+        0,
+    ),
+    (&["--stream", "-a", "-c", "."], r"1", r"[[],1]", 0),
+    (
+        &["--stream", "-r", "."],
+        r"1",
+        r"[
+  [],
+  1
+]",
+        0,
+    ),
+    (
+        &["--stream", "-j", "."],
+        r"1",
+        r"[
+  [],
+  1
+]",
+        0,
+    ),
+    (&["--stream", "-c", "-e", "."], r"1", r"[[],1]", 0),
+    (&["--stream", "-n", "-c", "[inputs]"], r"1", r"[[[],1]]", 0),
+    (&["-s", "-c", "."], r"1", r"[1]", 0),
+    (
+        &["-s", "."],
+        r"1",
+        r"[
+  1
+]",
+        0,
+    ),
+    (&["-n", "-c", "."], r"1", r"null", 0),
+    (&["--stream", "-c", "."], r#""s""#, r#"[[],"s"]"#, 0),
+    (
+        &["--stream", "."],
+        r#""s""#,
+        r#"[
+  [],
+  "s"
+]"#,
+        0,
+    ),
+    (&["--stream", "-S", "-c", "."], r#""s""#, r#"[[],"s"]"#, 0),
+    (
+        &["--stream", "--tab", "."],
+        r#""s""#,
+        r#"[
+	[],
+	"s"
+]"#,
+        0,
+    ),
+    (
+        &["--stream", "--indent", "1", "."],
+        r#""s""#,
+        r#"[
+ [],
+ "s"
+]"#,
+        0,
+    ),
+    (&["--stream", "-a", "-c", "."], r#""s""#, r#"[[],"s"]"#, 0),
+    (
+        &["--stream", "-r", "."],
+        r#""s""#,
+        r#"[
+  [],
+  "s"
+]"#,
+        0,
+    ),
+    (
+        &["--stream", "-j", "."],
+        r#""s""#,
+        r#"[
+  [],
+  "s"
+]"#,
+        0,
+    ),
+    (&["--stream", "-c", "-e", "."], r#""s""#, r#"[[],"s"]"#, 0),
+    (
+        &["--stream", "-n", "-c", "[inputs]"],
+        r#""s""#,
+        r#"[[[],"s"]]"#,
+        0,
+    ),
+    (&["-s", "-c", "."], r#""s""#, r#"["s"]"#, 0),
+    (
+        &["-s", "."],
+        r#""s""#,
+        r#"[
+  "s"
+]"#,
+        0,
+    ),
+    (&["-n", "-c", "."], r#""s""#, r"null", 0),
+    (&["--stream", "-c", "."], r"null", r"[[],null]", 0),
+    (
+        &["--stream", "."],
+        r"null",
+        r"[
+  [],
+  null
+]",
+        0,
+    ),
+    (&["--stream", "-S", "-c", "."], r"null", r"[[],null]", 0),
+    (
+        &["--stream", "--tab", "."],
+        r"null",
+        r"[
+	[],
+	null
+]",
+        0,
+    ),
+    (
+        &["--stream", "--indent", "1", "."],
+        r"null",
+        r"[
+ [],
+ null
+]",
+        0,
+    ),
+    (&["--stream", "-a", "-c", "."], r"null", r"[[],null]", 0),
+    (
+        &["--stream", "-r", "."],
+        r"null",
+        r"[
+  [],
+  null
+]",
+        0,
+    ),
+    (
+        &["--stream", "-j", "."],
+        r"null",
+        r"[
+  [],
+  null
+]",
+        0,
+    ),
+    (&["--stream", "-c", "-e", "."], r"null", r"[[],null]", 0),
+    (
+        &["--stream", "-n", "-c", "[inputs]"],
+        r"null",
+        r"[[[],null]]",
+        0,
+    ),
+    (&["-s", "-c", "."], r"null", r"[null]", 0),
+    (
+        &["-s", "."],
+        r"null",
+        r"[
+  null
+]",
+        0,
+    ),
+    (&["-n", "-c", "."], r"null", r"null", 0),
+    (&["--stream", "-c", "."], r"[]", r"[[],[]]", 0),
+    (
+        &["--stream", "."],
+        r"[]",
+        r"[
+  [],
+  []
+]",
+        0,
+    ),
+    (&["--stream", "-S", "-c", "."], r"[]", r"[[],[]]", 0),
+    (
+        &["--stream", "--tab", "."],
+        r"[]",
+        r"[
+	[],
+	[]
+]",
+        0,
+    ),
+    (
+        &["--stream", "--indent", "1", "."],
+        r"[]",
+        r"[
+ [],
+ []
+]",
+        0,
+    ),
+    (&["--stream", "-a", "-c", "."], r"[]", r"[[],[]]", 0),
+    (
+        &["--stream", "-r", "."],
+        r"[]",
+        r"[
+  [],
+  []
+]",
+        0,
+    ),
+    (
+        &["--stream", "-j", "."],
+        r"[]",
+        r"[
+  [],
+  []
+]",
+        0,
+    ),
+    (&["--stream", "-c", "-e", "."], r"[]", r"[[],[]]", 0),
+    (
+        &["--stream", "-n", "-c", "[inputs]"],
+        r"[]",
+        r"[[[],[]]]",
+        0,
+    ),
+    (&["-s", "-c", "."], r"[]", r"[[]]", 0),
+    (
+        &["-s", "."],
+        r"[]",
+        r"[
+  []
+]",
+        0,
+    ),
+    (&["-n", "-c", "."], r"[]", r"null", 0),
+    (&["--stream", "-c", "."], r"{}", r"[[],{}]", 0),
+    (
+        &["--stream", "."],
+        r"{}",
+        r"[
+  [],
+  {}
+]",
+        0,
+    ),
+    (&["--stream", "-S", "-c", "."], r"{}", r"[[],{}]", 0),
+    (
+        &["--stream", "--tab", "."],
+        r"{}",
+        r"[
+	[],
+	{}
+]",
+        0,
+    ),
+    (
+        &["--stream", "--indent", "1", "."],
+        r"{}",
+        r"[
+ [],
+ {}
+]",
+        0,
+    ),
+    (&["--stream", "-a", "-c", "."], r"{}", r"[[],{}]", 0),
+    (
+        &["--stream", "-r", "."],
+        r"{}",
+        r"[
+  [],
+  {}
+]",
+        0,
+    ),
+    (
+        &["--stream", "-j", "."],
+        r"{}",
+        r"[
+  [],
+  {}
+]",
+        0,
+    ),
+    (&["--stream", "-c", "-e", "."], r"{}", r"[[],{}]", 0),
+    (
+        &["--stream", "-n", "-c", "[inputs]"],
+        r"{}",
+        r"[[[],{}]]",
+        0,
+    ),
+    (&["-s", "-c", "."], r"{}", r"[{}]", 0),
+    (
+        &["-s", "."],
+        r"{}",
+        r"[
+  {}
+]",
+        0,
+    ),
+    (&["-n", "-c", "."], r"{}", r"null", 0),
+    (
+        &["--stream", "-c", "."],
+        r#"{"b":1,"a":[2,{"c":3}]}"#,
+        r#"[["b"],1]
+[["a",0],2]
+[["a",1,"c"],3]
+[["a",1,"c"]]
+[["a",1]]
+[["a"]]"#,
+        0,
+    ),
+    (
+        &["--stream", "."],
+        r#"{"b":1,"a":[2,{"c":3}]}"#,
+        r#"[
+  [
+    "b"
+  ],
+  1
+]
+[
+  [
+    "a",
+    0
+  ],
+  2
+]
+[
+  [
+    "a",
+    1,
+    "c"
+  ],
+  3
+]
+[
+  [
+    "a",
+    1,
+    "c"
+  ]
+]
+[
+  [
+    "a",
+    1
+  ]
+]
+[
+  [
+    "a"
+  ]
+]"#,
+        0,
+    ),
+    (
+        &["--stream", "-S", "-c", "."],
+        r#"{"b":1,"a":[2,{"c":3}]}"#,
+        r#"[["b"],1]
+[["a",0],2]
+[["a",1,"c"],3]
+[["a",1,"c"]]
+[["a",1]]
+[["a"]]"#,
+        0,
+    ),
+    (
+        &["--stream", "--tab", "."],
+        r#"{"b":1,"a":[2,{"c":3}]}"#,
+        r#"[
+	[
+		"b"
+	],
+	1
+]
+[
+	[
+		"a",
+		0
+	],
+	2
+]
+[
+	[
+		"a",
+		1,
+		"c"
+	],
+	3
+]
+[
+	[
+		"a",
+		1,
+		"c"
+	]
+]
+[
+	[
+		"a",
+		1
+	]
+]
+[
+	[
+		"a"
+	]
+]"#,
+        0,
+    ),
+    (
+        &["--stream", "--indent", "1", "."],
+        r#"{"b":1,"a":[2,{"c":3}]}"#,
+        r#"[
+ [
+  "b"
+ ],
+ 1
+]
+[
+ [
+  "a",
+  0
+ ],
+ 2
+]
+[
+ [
+  "a",
+  1,
+  "c"
+ ],
+ 3
+]
+[
+ [
+  "a",
+  1,
+  "c"
+ ]
+]
+[
+ [
+  "a",
+  1
+ ]
+]
+[
+ [
+  "a"
+ ]
+]"#,
+        0,
+    ),
+    (
+        &["--stream", "-a", "-c", "."],
+        r#"{"b":1,"a":[2,{"c":3}]}"#,
+        r#"[["b"],1]
+[["a",0],2]
+[["a",1,"c"],3]
+[["a",1,"c"]]
+[["a",1]]
+[["a"]]"#,
+        0,
+    ),
+    (
+        &["--stream", "-r", "."],
+        r#"{"b":1,"a":[2,{"c":3}]}"#,
+        r#"[
+  [
+    "b"
+  ],
+  1
+]
+[
+  [
+    "a",
+    0
+  ],
+  2
+]
+[
+  [
+    "a",
+    1,
+    "c"
+  ],
+  3
+]
+[
+  [
+    "a",
+    1,
+    "c"
+  ]
+]
+[
+  [
+    "a",
+    1
+  ]
+]
+[
+  [
+    "a"
+  ]
+]"#,
+        0,
+    ),
+    (
+        &["--stream", "-j", "."],
+        r#"{"b":1,"a":[2,{"c":3}]}"#,
+        r#"[
+  [
+    "b"
+  ],
+  1
+][
+  [
+    "a",
+    0
+  ],
+  2
+][
+  [
+    "a",
+    1,
+    "c"
+  ],
+  3
+][
+  [
+    "a",
+    1,
+    "c"
+  ]
+][
+  [
+    "a",
+    1
+  ]
+][
+  [
+    "a"
+  ]
+]"#,
+        0,
+    ),
+    (
+        &["--stream", "-c", "-e", "."],
+        r#"{"b":1,"a":[2,{"c":3}]}"#,
+        r#"[["b"],1]
+[["a",0],2]
+[["a",1,"c"],3]
+[["a",1,"c"]]
+[["a",1]]
+[["a"]]"#,
+        0,
+    ),
+    (
+        &["--stream", "-n", "-c", "[inputs]"],
+        r#"{"b":1,"a":[2,{"c":3}]}"#,
+        r#"[[["b"],1],[["a",0],2],[["a",1,"c"],3],[["a",1,"c"]],[["a",1]],[["a"]]]"#,
+        0,
+    ),
+    (
+        &["-s", "-c", "."],
+        r#"{"b":1,"a":[2,{"c":3}]}"#,
+        r#"[{"b":1,"a":[2,{"c":3}]}]"#,
+        0,
+    ),
+    (
+        &["-s", "."],
+        r#"{"b":1,"a":[2,{"c":3}]}"#,
+        r#"[
+  {
+    "b": 1,
+    "a": [
+      2,
+      {
+        "c": 3
+      }
+    ]
+  }
+]"#,
+        0,
+    ),
+    (&["-n", "-c", "."], r#"{"b":1,"a":[2,{"c":3}]}"#, r"null", 0),
+    (
+        &["--stream", "-c", "."],
+        r"[1E+2,0.0,-0,100000000000000000000,0.1e1,1.5e300]",
+        r"[[0],1E+2]
+[[1],0.0]
+[[2],-0]
+[[3],100000000000000000000]
+[[4],1]
+[[5],1.5E+300]
+[[5]]",
+        0,
+    ),
+    (
+        &["--stream", "."],
+        r"[1E+2,0.0,-0,100000000000000000000,0.1e1,1.5e300]",
+        r"[
+  [
+    0
+  ],
+  1E+2
+]
+[
+  [
+    1
+  ],
+  0.0
+]
+[
+  [
+    2
+  ],
+  -0
+]
+[
+  [
+    3
+  ],
+  100000000000000000000
+]
+[
+  [
+    4
+  ],
+  1
+]
+[
+  [
+    5
+  ],
+  1.5E+300
+]
+[
+  [
+    5
+  ]
+]",
+        0,
+    ),
+    (
+        &["--stream", "-S", "-c", "."],
+        r"[1E+2,0.0,-0,100000000000000000000,0.1e1,1.5e300]",
+        r"[[0],1E+2]
+[[1],0.0]
+[[2],-0]
+[[3],100000000000000000000]
+[[4],1]
+[[5],1.5E+300]
+[[5]]",
+        0,
+    ),
+    (
+        &["--stream", "--tab", "."],
+        r"[1E+2,0.0,-0,100000000000000000000,0.1e1,1.5e300]",
+        r"[
+	[
+		0
+	],
+	1E+2
+]
+[
+	[
+		1
+	],
+	0.0
+]
+[
+	[
+		2
+	],
+	-0
+]
+[
+	[
+		3
+	],
+	100000000000000000000
+]
+[
+	[
+		4
+	],
+	1
+]
+[
+	[
+		5
+	],
+	1.5E+300
+]
+[
+	[
+		5
+	]
+]",
+        0,
+    ),
+    (
+        &["--stream", "--indent", "1", "."],
+        r"[1E+2,0.0,-0,100000000000000000000,0.1e1,1.5e300]",
+        r"[
+ [
+  0
+ ],
+ 1E+2
+]
+[
+ [
+  1
+ ],
+ 0.0
+]
+[
+ [
+  2
+ ],
+ -0
+]
+[
+ [
+  3
+ ],
+ 100000000000000000000
+]
+[
+ [
+  4
+ ],
+ 1
+]
+[
+ [
+  5
+ ],
+ 1.5E+300
+]
+[
+ [
+  5
+ ]
+]",
+        0,
+    ),
+    (
+        &["--stream", "-a", "-c", "."],
+        r"[1E+2,0.0,-0,100000000000000000000,0.1e1,1.5e300]",
+        r"[[0],1E+2]
+[[1],0.0]
+[[2],-0]
+[[3],100000000000000000000]
+[[4],1]
+[[5],1.5E+300]
+[[5]]",
+        0,
+    ),
+    (
+        &["--stream", "-r", "."],
+        r"[1E+2,0.0,-0,100000000000000000000,0.1e1,1.5e300]",
+        r"[
+  [
+    0
+  ],
+  1E+2
+]
+[
+  [
+    1
+  ],
+  0.0
+]
+[
+  [
+    2
+  ],
+  -0
+]
+[
+  [
+    3
+  ],
+  100000000000000000000
+]
+[
+  [
+    4
+  ],
+  1
+]
+[
+  [
+    5
+  ],
+  1.5E+300
+]
+[
+  [
+    5
+  ]
+]",
+        0,
+    ),
+    (
+        &["--stream", "-j", "."],
+        r"[1E+2,0.0,-0,100000000000000000000,0.1e1,1.5e300]",
+        r"[
+  [
+    0
+  ],
+  1E+2
+][
+  [
+    1
+  ],
+  0.0
+][
+  [
+    2
+  ],
+  -0
+][
+  [
+    3
+  ],
+  100000000000000000000
+][
+  [
+    4
+  ],
+  1
+][
+  [
+    5
+  ],
+  1.5E+300
+][
+  [
+    5
+  ]
+]",
+        0,
+    ),
+    (
+        &["--stream", "-c", "-e", "."],
+        r"[1E+2,0.0,-0,100000000000000000000,0.1e1,1.5e300]",
+        r"[[0],1E+2]
+[[1],0.0]
+[[2],-0]
+[[3],100000000000000000000]
+[[4],1]
+[[5],1.5E+300]
+[[5]]",
+        0,
+    ),
+    (
+        &["--stream", "-n", "-c", "[inputs]"],
+        r"[1E+2,0.0,-0,100000000000000000000,0.1e1,1.5e300]",
+        r"[[[0],1E+2],[[1],0.0],[[2],-0],[[3],100000000000000000000],[[4],1],[[5],1.5E+300],[[5]]]",
+        0,
+    ),
+    (
+        &["-s", "-c", "."],
+        r"[1E+2,0.0,-0,100000000000000000000,0.1e1,1.5e300]",
+        r"[[1E+2,0.0,-0,100000000000000000000,1,1.5E+300]]",
+        0,
+    ),
+    (
+        &["-s", "."],
+        r"[1E+2,0.0,-0,100000000000000000000,0.1e1,1.5e300]",
+        r"[
+  [
+    1E+2,
+    0.0,
+    -0,
+    100000000000000000000,
+    1,
+    1.5E+300
+  ]
+]",
+        0,
+    ),
+    (
+        &["-n", "-c", "."],
+        r"[1E+2,0.0,-0,100000000000000000000,0.1e1,1.5e300]",
+        r"null",
+        0,
+    ),
+];
+
+const SEQ_ROWS: &[Row] = &[
+    (&["--seq", "-c", "."], "\x1e[1,2]\n", "\x1e[1,2]\n", 0),
+    (&["--seq", "."], "\x1e[1,2]\n", "\x1e[\n  1,\n  2\n]\n", 0),
+    (
+        &["--seq", "-c", "."],
+        "\x1e{\"a\":1}\n\x1e\"s\"\n",
+        "\x1e{\"a\":1}\n\x1e\"s\"\n",
+        0,
+    ),
+    (
+        &["--seq", "."],
+        "\x1e{\"a\":1}\n\x1e\"s\"\n",
+        "\x1e{\n  \"a\": 1\n}\n\x1e\"s\"\n",
+        0,
+    ),
+    (&["--seq", "-c", "."], "\x1e1.50\n", "\x1e1.50\n", 0),
+    (&["--seq", "."], "\x1e1.50\n", "\x1e1.50\n", 0),
+];
+
+const INPUTS: &[&str] = &[
+    r"1",
+    r#""s""#,
+    r"null",
+    r"[]",
+    r"{}",
+    r"[1,2,3]",
+    r#"{"a":1,"b":2}"#,
+    r#"{"b":1,"a":[2,{"c":3}]}"#,
+    r#"{"users":[{"id":1,"name":"é"},{"id":2,"name":"y"}]}"#,
+    r"[1E+2,0.0,-0,100000000000000000000,0.1e1,1.5e300]",
+    r#"{"a b":"q\n\t\u0001\"","":[true,null]}"#,
+    r#""\ud83d\ude00 é \u00e9""#,
+    r#"[[],[[]],{"a":{}}]"#,
+];
+
+/// Every option that reads the value after the filter has produced it.
+const OPTION_SETS: &[&[&str]] = &[
+    &["-c"],
+    &[],
+    &["-S", "-c"],
+    &["--tab"],
+    &["--indent", "1"],
+    &["-a", "-c"],
+    &["-r"],
+    &["-j"],
+    &["-c", "-e"],
+    &["-C", "-c"],
+    &["--seq", "-c"],
+];
+
+fn check(rows: &[Row]) -> Result<()> {
+    for (args, stdin, expected, code) in rows {
+        let (stdout, stderr, status) = run_jq_full(args, Some(stdin))?;
+        assert_eq!(
+            (stdout.as_str().trim_end_matches('\n'), status),
+            (expected.trim_end_matches('\n'), *code),
+            "{args:?} on {stdin:?}: stderr {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_stream_events_print_like_jq_under_every_output_option_5624() -> Result<()> {
+    check(ROWS)
+}
+
+#[test]
+fn test_seq_records_print_like_jq_5624() -> Result<()> {
+    check(SEQ_ROWS)
+}
+
+/// A DSV row is an owned array of strings; jq has no DSV input, so the rows are the previous
+/// build's output, which the shortcut must not change.
+#[test]
+fn test_dsv_rows_print_as_before_5624() -> Result<()> {
+    let csv = "a,b\n1,\"x y\"\n,\"q\"\"z\"\n\"\u{e9}\",3.50\n";
+    for (args, expected) in [
+        (
+            &["--input-dsv", ",", "-c", "."][..],
+            "[\"a\",\"b\"]\n[\"1\",\"x y\"]\n[\"\",\"q\\\"z\"]\n[\"\u{e9}\",\"3.50\"]\n",
+        ),
+        (
+            &["--input-dsv", ",", "-c", "-s", "."][..],
+            "[[\"a\",\"b\"],[\"1\",\"x y\"],[\"\",\"q\\\"z\"],[\"\u{e9}\",\"3.50\"]]\n",
+        ),
+        (
+            &["--input-dsv", ",", "-a", "-c", "."][..],
+            "[\"a\",\"b\"]\n[\"1\",\"x y\"]\n[\"\",\"q\\\"z\"]\n[\"\\u00e9\",\"3.50\"]\n",
+        ),
+    ] {
+        let (stdout, stderr, status) = run_jq_full(args, Some(csv))?;
+        assert_eq!(
+            (stdout.as_str(), status),
+            (expected, 0),
+            "{args:?}: stderr {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// `.` against `[.][0]` (the same value through the route the shortcut skips) over every input
+/// and option, for `--stream` and for `--slurp`.
+#[test]
+fn test_identity_agrees_with_the_route_it_skips_5624() -> Result<()> {
+    for input in INPUTS {
+        for options in OPTION_SETS {
+            for mode in [&["--stream"][..], &["--slurp"][..], &[][..]] {
+                let run = |filter: &str| -> Result<(String, i32)> {
+                    let mut args: Vec<&str> = mode.to_vec();
+                    args.extend_from_slice(options);
+                    args.push(filter);
+                    let (stdout, _stderr, status) = run_jq_full(&args, Some(input))?;
+                    Ok((stdout, status))
+                };
+                assert_eq!(
+                    run(".")?,
+                    run("[.][0]")?,
+                    "{mode:?} {options:?} on {input:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The nesting ceiling a converted output is held to (256 levels) still applies to the value the
+/// shortcut hands on. `--seq --slurp` wraps a record in one more level, so a record of 255 arrays
+/// prints and one of 256 is refused at exit 5 without a panic; `.` agrees with `[.][0]` there and
+/// under plain `--slurp`, which takes a route of its own.
+#[test]
+fn test_identity_keeps_the_output_nesting_ceiling_5624() -> Result<()> {
+    for depth in [254usize, 255, 256] {
+        let doc = format!("{}{}\n", "[".repeat(depth), "]".repeat(depth));
+        for seq in [false, true] {
+            let mut mode = vec!["--slurp", "-c"];
+            let stdin = if seq {
+                mode.push("--seq");
+                format!("\x1e{doc}")
+            } else {
+                doc.clone()
+            };
+            let run = |filter: &str| -> Result<(String, i32)> {
+                let mut args = mode.clone();
+                args.push(filter);
+                let (stdout, stderr, status) = run_jq_full(&args, Some(&stdin))?;
+                assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+                Ok((stdout, status))
+            };
+            let (stdout, status) = run(".")?;
+            assert_eq!(
+                run("[.][0]")?,
+                (stdout.clone(), status),
+                "seq {seq} {depth}"
+            );
+            if seq {
+                let refused = depth == 256;
+                assert_eq!(
+                    (stdout.is_empty(), status),
+                    (refused, if refused { 5 } else { 0 }),
+                    "{depth} levels under --seq --slurp"
+                );
+            }
+        }
+    }
+    Ok(())
+}
