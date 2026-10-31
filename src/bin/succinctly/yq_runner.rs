@@ -10403,8 +10403,15 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
 
     // Get the filter expression
     let filter_str = if let Some(ref path) = args.from_file {
-        std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read filter file: {}", path.display()))?
+        // yq reads the file with every CRLF turned into LF (even inside a string literal) and
+        // nothing else touched: a lone CR stays and is refused as whitespace (#5616).
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read filter file: {}", path.display()))?;
+        if text.contains('\r') {
+            text.replace("\r\n", "\n")
+        } else {
+            text
+        }
     } else {
         args.filter.clone().unwrap_or_else(|| ".".to_string())
     };
