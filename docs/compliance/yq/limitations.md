@@ -3718,6 +3718,7 @@ Two integers compare as integers, and a decimal spelling (`007`, `+5`, `1e3`) pa
 - A string that parses as a timestamp is compared as a time by yq, so `"2001-01-01T00:00:00Z" < 1` is `parsing time "1" as "2006-01-02": cannot parse "1" as "2006"` there and `false` here.
   `OwnedValue` has no timestamp kind, so the pair is treated as the two kinds it is made of.
 - A signed prefixed integer (`-0x10`), `1_000` and `0b101` read as strings here, so they raise the kind error instead of comparing or raising `ParseFloat`.
+- `sort`, `min` and `max` over an array holding a prefixed integer and a float use their own comparators here: yq's `min`/`max` raise the same `ParseFloat` error, and its `sort` panics with it, where this orders them by value.
 
 ### `|=` with a zero-output update filter -- resolved ([#2484](https://github.com/rust-works/succinctly/issues/2484))
 

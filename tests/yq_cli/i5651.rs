@@ -37,6 +37,24 @@ const ROWS: &[(&str, Result<&str, &str>)] = &[
         ".h < .e",
         Err("strconv.ParseFloat: parsing \"0x10\": invalid syntax"),
     ),
+    // A computed integer keeps the spelling, and a literal operand is read the same way.
+    (
+        "(.h + 0) < .f",
+        Err("strconv.ParseFloat: parsing \"0x10\": invalid syntax"),
+    ),
+    (
+        ".h < 1.5",
+        Err("strconv.ParseFloat: parsing \"0x10\": invalid syntax"),
+    ),
+    (
+        "select(.h < .f)",
+        Err("strconv.ParseFloat: parsing \"0x10\": invalid syntax"),
+    ),
+    // A quoted spelling is a string, which no float compares with.
+    (
+        "\"0x10\" < .f",
+        Err("!!str not yet supported for comparison"),
+    ),
     // Two integers compare as integers, whatever their spelling.
     (".h < .i", Ok("false\n")),
     (".h < .h2", Ok("false\n")),

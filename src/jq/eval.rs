@@ -16310,9 +16310,9 @@ pub(crate) fn yq_ordering_refusal<S: EvalSemantics>(
 
 /// yq compares an integer with a float through `strconv.ParseFloat` of each node's text
 /// (#5651), and Go's `ParseFloat` refuses an integer written with a radix prefix: `0x10 < 1.5`
-/// is `strconv.ParseFloat: parsing "0x10": invalid syntax`, as are `0o17` and a signed `-0x10`.
-/// Two integers compare as integers and never reach it, and a decimal spelling (`007`, `+5`,
-/// `1e3`) parses.
+/// is `strconv.ParseFloat: parsing "0x10": invalid syntax`, as is `0o17`. A computed integer
+/// keeps the spelling (`(.h + 0) < .f` raises too). Two integers compare as integers and never
+/// reach it, and a decimal spelling (`007`, `+5`, `1e3`) parses.
 fn yq_float_parse_refusal<S: EvalSemantics>(
     left: &OwnedValue,
     right: &OwnedValue,
@@ -16331,13 +16331,10 @@ fn yq_float_parse_refusal<S: EvalSemantics>(
         return None;
     };
     let text = yq_scalar_text::<S>(integer)?;
-    let digits = text.strip_prefix(['+', '-']).unwrap_or(&text);
-    let prefixed = digits.len() > 2
-        && digits.as_bytes()[0] == b'0'
-        && matches!(
-            digits.as_bytes()[1],
-            b'x' | b'X' | b'o' | b'O' | b'b' | b'B'
-        );
+    // `0b101` and a signed `-0x10` are read as strings here, so only `0x`/`0o` reach this.
+    let prefixed = text.len() > 2
+        && text.as_bytes()[0] == b'0'
+        && matches!(text.as_bytes()[1], b'x' | b'X' | b'o' | b'O');
     prefixed.then(|| {
         EvalError::new(format!(
             "strconv.ParseFloat: parsing \"{text}\": invalid syntax"
