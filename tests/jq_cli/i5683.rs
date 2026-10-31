@@ -2,7 +2,9 @@
 //! element without decoding it. Each row is `(document, filter, stdout, stderr, exit status)` as
 //! jq 1.7.1 (`/usr/bin/jq`) answers: the first of equal minima and the last of equal maxima win (so
 //! `1`, `1.0` and `1.00` are told apart by their spelling), integers past 18 digits and `-0` keep
-//! the general decode, and a malformed array is refused as before.
+//! the general decode, and a malformed array is refused as before. The last rows put a fault of each
+//! kind in one array (jq reports the first in the text), an 18-digit integer beside a fraction of the
+//! same magnitude, and `min`/`max` under a live `as` binding.
 
 use anyhow::Result;
 
@@ -387,6 +389,193 @@ const ROWS: &[(&str, &str, &str, &str, i32)] = &[
     ("[1\n,\n2\n]", "max", "2\n", "", 0),
     ("[1\n,\n2\n]", "[min,max]", "[1,2]\n", "", 0),
     ("[1\n,\n2\n]", "min?", "1\n", "", 0),
+    (
+        "[1 2,\"\\ud800\"]",
+        "min",
+        "",
+        "jq: parse error: Expected separator between values at line 1, column 5\n",
+        5,
+    ),
+    (
+        "[1 2,\"\\ud800\"]",
+        "max",
+        "",
+        "jq: parse error: Expected separator between values at line 1, column 5\n",
+        5,
+    ),
+    (
+        "[1 2,\"\\ud800\"]",
+        "[min,max]",
+        "",
+        "jq: parse error: Expected separator between values at line 1, column 5\n",
+        5,
+    ),
+    (
+        "[\"\\ud800\",1 2]",
+        "min",
+        "",
+        "jq: parse error: Invalid \\uXXXX\\uXXXX surrogate pair escape at line 1, column 9\n",
+        5,
+    ),
+    (
+        "[\"\\ud800\",1 2]",
+        "max",
+        "",
+        "jq: parse error: Invalid \\uXXXX\\uXXXX surrogate pair escape at line 1, column 9\n",
+        5,
+    ),
+    (
+        "[\"\\ud800\",1 2]",
+        "[min,max]",
+        "",
+        "jq: parse error: Invalid \\uXXXX\\uXXXX surrogate pair escape at line 1, column 9\n",
+        5,
+    ),
+    (
+        "[\"\\ud800\",2,]",
+        "min",
+        "",
+        "jq: parse error: Invalid \\uXXXX\\uXXXX surrogate pair escape at line 1, column 9\n",
+        5,
+    ),
+    (
+        "[\"\\ud800\",2,]",
+        "max",
+        "",
+        "jq: parse error: Invalid \\uXXXX\\uXXXX surrogate pair escape at line 1, column 9\n",
+        5,
+    ),
+    (
+        "[\"\\ud800\",2,]",
+        "[min,max]",
+        "",
+        "jq: parse error: Invalid \\uXXXX\\uXXXX surrogate pair escape at line 1, column 9\n",
+        5,
+    ),
+    (
+        "[3,1,]",
+        "min",
+        "",
+        "jq: parse error: Expected another array element at line 1, column 6\n",
+        5,
+    ),
+    (
+        "[3,1,]",
+        "max",
+        "",
+        "jq: parse error: Expected another array element at line 1, column 6\n",
+        5,
+    ),
+    (
+        "[3,1,]",
+        "[min,max]",
+        "",
+        "jq: parse error: Expected another array element at line 1, column 6\n",
+        5,
+    ),
+    (
+        "[123456789012345678,123456789012345678.5]",
+        "min",
+        "123456789012345678\n",
+        "",
+        0,
+    ),
+    (
+        "[123456789012345678,123456789012345678.5]",
+        "max",
+        "123456789012345678.5\n",
+        "",
+        0,
+    ),
+    (
+        "[123456789012345678,123456789012345678.5]",
+        "[min,max]",
+        "[123456789012345678,123456789012345678.5]\n",
+        "",
+        0,
+    ),
+    (
+        "[123456789012345678.5,123456789012345678]",
+        "min",
+        "123456789012345678\n",
+        "",
+        0,
+    ),
+    (
+        "[123456789012345678.5,123456789012345678]",
+        "max",
+        "123456789012345678.5\n",
+        "",
+        0,
+    ),
+    (
+        "[123456789012345678.5,123456789012345678]",
+        "[min,max]",
+        "[123456789012345678,123456789012345678.5]\n",
+        "",
+        0,
+    ),
+    (
+        "[123456789012345678,1.5e17]",
+        "min",
+        "123456789012345678\n",
+        "",
+        0,
+    ),
+    ("[123456789012345678,1.5e17]", "max", "1.5E+17\n", "", 0),
+    (
+        "[123456789012345678,1.5e17]",
+        "[min,max]",
+        "[123456789012345678,1.5E+17]\n",
+        "",
+        0,
+    ),
+    (
+        "[123456789012345679,123456789012345678.9]",
+        "min",
+        "123456789012345678.9\n",
+        "",
+        0,
+    ),
+    (
+        "[123456789012345679,123456789012345678.9]",
+        "max",
+        "123456789012345679\n",
+        "",
+        0,
+    ),
+    (
+        "[123456789012345679,123456789012345678.9]",
+        "[min,max]",
+        "[123456789012345678.9,123456789012345679]\n",
+        "",
+        0,
+    ),
+    (
+        "[9007199254740993,9007199254740992]",
+        "min",
+        "9007199254740992\n",
+        "",
+        0,
+    ),
+    (
+        "[9007199254740993,9007199254740992]",
+        "max",
+        "9007199254740993\n",
+        "",
+        0,
+    ),
+    (
+        "[9007199254740993,9007199254740992]",
+        "[min,max]",
+        "[9007199254740992,9007199254740993]\n",
+        "",
+        0,
+    ),
+    ("[3,1,2]", ". as $x | $x | min", "1\n", "", 0),
+    ("[3,1,2]", ". as $x | [$x[]|.] | max", "3\n", "", 0),
+    ("[5,2,9]", ".[0] as $x | min", "2\n", "", 0),
+    ("[5,2,9]", "[.[] as $x | $x] | min", "2\n", "", 0),
 ];
 
 #[test]

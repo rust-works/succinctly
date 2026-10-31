@@ -4334,6 +4334,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     /// #5683: see [`DocumentCursor::plain_int_at`].
     #[inline]
     fn plain_int_at(&self, text_pos: usize) -> Option<i64> {
+        debug_assert_eq!(
+            self.text_position(),
+            Some(text_pos),
+            "plain_int_at reads this cursor's own position"
+        );
         let text = self.text;
         let mut i = text_pos;
         let negative = *text.get(i)? == b'-';
@@ -6123,6 +6128,61 @@ mod tests {
             .unwrap();
         let at = last.text_position().unwrap();
         assert_eq!(DocumentCursor::plain_int_at(&last, at), Some(22));
+    }
+
+    /// #5683: wherever `plain_int_at` answers, the general decode of the same token is that
+    /// integer, spelled the same.
+    #[test]
+    fn test_plain_int_at_agrees_with_the_general_decode_5683() {
+        use crate::jq::document::DocumentCursor;
+        use crate::jq::JqSemantics;
+        use crate::jq::OwnedValue;
+        use crate::json::JsonIndex;
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let digits = b"0123456789";
+        let mut answered = 0;
+        for _ in 0..5_000 {
+            let mut token = String::new();
+            if next() % 3 == 0 {
+                token.push('-');
+            }
+            for _ in 0..(next() % 21) {
+                token.push(digits[(next() % 10) as usize] as char);
+            }
+            match next() % 8 {
+                0 => token.push_str(".5"),
+                1 => token.push_str("e2"),
+                2 => token.push('x'),
+                _ => {}
+            }
+            if token.trim_start_matches('-').is_empty() {
+                continue;
+            }
+            let doc = alloc::format!("[{token},0]");
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let Some(first) = root.first_child() else {
+                continue;
+            };
+            let Some(at) = first.text_position() else {
+                continue;
+            };
+            if let Some(value) = DocumentCursor::plain_int_at(&first, at) {
+                answered += 1;
+                let general = OwnedValue::from_number_literal::<JqSemantics>(&token);
+                assert_eq!(general.to_json(), value.to_string(), "{token:?}");
+            }
+        }
+        assert!(
+            answered > 500,
+            "the sweep must reach the reader: {answered}"
+        );
     }
 
     /// #5654: `last_open_before` finds the last 1 bit below `end`, across word boundaries, at a

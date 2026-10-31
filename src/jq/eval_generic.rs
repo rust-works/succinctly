@@ -26410,6 +26410,19 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
         Int(i64),
         Owned(OwnedValue),
     }
+    // The delimiter fault of this array, suppressed by `optional` as `owned_or_suppress!` does.
+    let gap_fault = || {
+        let error = elements.malformed_element_error();
+        if suppresses(&error, optional) {
+            GenericResult::None
+        } else {
+            GenericResult::Error(error)
+        }
+    };
+    // Nothing the walk does changes the table, so it is asked once: while a binding's embedded
+    // node could be handed back instead of a decoded copy (`to_owned_cursor`'s own first test) the
+    // integer read is not taken.
+    let table_live = embed_table::live();
     let mut winner: Option<(Key, V::Cursor)> = None;
     let mut last: Option<V::Cursor> = None;
     let mut rest = elements;
@@ -26424,17 +26437,9 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
             None => true,
         };
         if !gap_ok {
-            let error = elements.malformed_element_error();
-            return if suppresses(&error, optional) {
-                GenericResult::None
-            } else {
-                GenericResult::Error(error)
-            };
+            return gap_fault();
         }
-        // Not while a binding's embedded node could be handed back instead of a decoded copy
-        // (`to_owned_cursor`'s own first test): a plain integer never is one, but the
-        // read below must not be the thing that decides that.
-        let fast = if embed_table::live() {
+        let fast = if table_live {
             None
         } else {
             pos.and_then(|pos| cursor.plain_int_at(pos))
@@ -26475,12 +26480,7 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
     // #2261: a trailing stray comma after the real last element (`[1,]`).
     if let Some(last) = last.as_ref() {
         if !trailing_element_gap_ok(last, b']') {
-            let error = elements.malformed_element_error();
-            return if suppresses(&error, optional) {
-                GenericResult::None
-            } else {
-                GenericResult::Error(error)
-            };
+            return gap_fault();
         }
     }
     match winner {
@@ -35660,6 +35660,17 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 _ => None,
             };
             let dedup = matches!(builtin, Builtin::Unique | Builtin::UniqueBy(_));
+            // #5683: jq's bare `min`/`max` keep the running winner as they walk, rather than
+            // collecting every element's cursor and then every element's key before comparing
+            // them (two vectors of the array's length, once per call, and a comma of the two
+            // paid it twice). The first minimum and the last maximum win, as below.
+            if !S::MIN_MAX_NEED_AN_ELEMENT && matches!(builtin, Builtin::Min | Builtin::Max) {
+                return extremum_streaming_generic::<S, V>(
+                    elements,
+                    matches!(builtin, Builtin::Max),
+                    optional,
+                );
+            }
             // #2261 (systematic sweep): `collect_cursors_checked`, not the
             // unchecked `collect_cursors` this arm used -- every one of
             // these builtins already resolves each element's cursor to
@@ -35811,17 +35822,6 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // ignoring it here was the same asymmetry #2280 fixed for
             // Format/Path/GetPath. Defensive today (see `Reverse`'s sibling
             // comment above for why).
-            // #5683: jq's bare `min`/`max` keep the running winner as they walk, rather than
-            // collecting every element's cursor and then every element's key before comparing
-            // them (two vectors of the array's length, once per call, and a comma of the two
-            // paid it twice). The first minimum and the last maximum win, as below.
-            if !S::MIN_MAX_NEED_AN_ELEMENT && matches!(builtin, Builtin::Min | Builtin::Max) {
-                return extremum_streaming_generic::<S, V>(
-                    elements,
-                    matches!(builtin, Builtin::Max),
-                    optional,
-                );
-            }
             let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
             // jq answers `null` for an empty array, for all four spellings; yq has no element
             // to pick and picks nothing (#4236).
