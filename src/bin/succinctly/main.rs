@@ -1740,10 +1740,12 @@ const MIN_EVAL_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 const _: () = assert!(EVAL_STACK_SIZE >= MIN_EVAL_STACK_SIZE);
 
-/// The stack sizes [`spawn_eval_thread`] tries, largest first: `max`, then each half of the last,
-/// down to `min`.
-fn eval_stack_sizes(max: usize, min: usize) -> impl Iterator<Item = usize> {
-    std::iter::successors(Some(max), |size| Some(size / 2)).take_while(move |size| *size >= min)
+/// The stack sizes [`spawn_eval_thread`] tries, largest first: `start`, then each half of the last
+/// while it stays at or above `min`. `start` itself is always tried.
+fn eval_stack_sizes(start: usize, min: usize) -> impl Iterator<Item = usize> {
+    std::iter::successors(Some(start), move |size| {
+        Some(size / 2).filter(|half| *half >= min)
+    })
 }
 
 /// The stack to try first under a cap of `cap` bytes of address space: a quarter of it, so the
@@ -1778,7 +1780,7 @@ fn spawn_eval_thread() -> Result<std::thread::JoinHandle<Result<()>>> {
             Err(e) => last_error = Some(e),
         }
     }
-    Err(last_error.expect("at least one stack size is tried"))
+    Err(last_error.expect("`start` is always tried"))
         .context("failed to spawn the evaluation thread")
 }
 
@@ -2944,8 +2946,11 @@ mod tests {
             eval_stack_sizes(100 * MIB, 16 * MIB).collect::<Vec<_>>(),
             [100 * MIB, 50 * MIB, 25 * MIB]
         );
-        // The full stack alone when the floor is above it.
-        assert_eq!(eval_stack_sizes(8 * MIB, 16 * MIB).count(), 0);
+        // A start below the floor is still tried, once.
+        assert_eq!(
+            eval_stack_sizes(8 * MIB, 16 * MIB).collect::<Vec<_>>(),
+            [8 * MIB]
+        );
     }
 
     /// #5634: a capped address space starts the stack at a quarter of the cap, never above the

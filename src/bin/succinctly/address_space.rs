@@ -1,14 +1,15 @@
 //! The address space this process may map (#5634).
 //!
 //! `ulimit -v` (`RLIMIT_AS`) counts a thread's reserved stack, so the evaluation thread's size
-//! has to be chosen against it: see `spawn_eval_thread` in `main.rs`.
+//! has to be chosen against it: see `spawn_eval_thread` in `main.rs`. Read where the kernel
+//! enforces the cap; macOS does not enforce `RLIMIT_AS`.
 
 #![allow(unsafe_code)] // one `getrlimit(2)` call, writing only into a local
 
 /// The cap on the process's address space in bytes, or `None` when it is unlimited, unreadable
-/// or (Windows) not a thing the platform has.
+/// or (macOS, Windows) not enforced by the platform.
 pub fn cap() -> Option<usize> {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     {
         let mut limit = libc::rlimit {
             rlim_cur: 0,
@@ -21,7 +22,7 @@ pub fn cap() -> Option<usize> {
         }
         usize::try_from(limit.rlim_cur).ok()
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, not(target_vendor = "apple"))))]
     {
         None
     }
