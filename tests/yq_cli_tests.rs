@@ -5331,25 +5331,27 @@ fn test_yq_length_object_rejects_trailing_comma_2307() -> Result<()> {
     Ok(())
 }
 
-/// #2307's own remaining, deliberately deferred gap (yq-mode twin of
-/// `jq_cli_tests.rs`'s `test_jq_length_object_trailing_comma_container_last_value_still_a_known_gap_2307`):
-/// `checked_len` shares `census`'s inherited #2243 residual --
-/// `trailing_element_gap_ok`'s unconditional `is_container()` early return
-/// -- so a trailing stray comma is only caught when the object's real last
-/// field's value is a scalar, not a container. Pinned here so a future fix
-/// for this narrower residual updates this test rather than landing
-/// uncovered.
+/// #2307's remaining gap, closed by #5654 (yq-mode twin of `jq_cli_tests.rs`'s
+/// `test_jq_length_object_trailing_comma_container_last_value_is_rejected_2307`): `checked_len`
+/// shares `census`'s check, so a trailing stray comma after a container-typed last value is
+/// refused as it is after a scalar one (`test_yq_length_object_rejects_trailing_comma_2307`).
 #[test]
-fn test_yq_length_object_trailing_comma_container_last_value_still_a_known_gap_2307() -> Result<()>
-{
+fn test_yq_length_object_trailing_comma_container_last_value_is_rejected_2307() -> Result<()> {
     for input in [r#"{"a":{"x":1},}"#, r#"{"a":[1,2],}"#] {
-        let (out, code) = run_yq_stdin(
+        let (out, stderr, code) = run_yq_stdin_with_stderr(
             ".[0] | length",
             input,
             &["--input-format", "json", "--slurp"],
         )?;
-        assert_eq!(code, 0, "input={input}");
-        assert_eq!(out.trim(), "1", "input={input}");
+        assert_eq!(code, 1, "input={input}: out: {out:?}, stderr: {stderr:?}");
+        assert!(
+            out.trim().is_empty(),
+            "input={input}: unexpected output {out:?}"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "input={input}: stderr: {stderr:?}"
+        );
     }
 
     Ok(())

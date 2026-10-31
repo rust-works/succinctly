@@ -6195,28 +6195,20 @@ $ echo '{"a":1,}'  | jq  -c 'if true then . else . end'   # parse error, exit 5
 $ echo '{"a":1,}'  | sjq -c 'if true then . else . end'   # exit 5 now (was: {"a":1}, exit 0)
 ```
 
-**Residual gap: a *container-typed* last child still passes through.**
-`scalar_text_end` only knows how to answer a scalar's own end position from
-its start (`start + raw_bytes().len()`, or a fixed literal length for
-`Bool`/`Null`) -- a container's own end position is not derivable from its
-start alone without a further cursor walk, so it answers `None` there by
-design, and `trailing_element_gap_ok` treats that the same as "can't
-determine, skip" (the same convention every other gap check in this family
-already follows):
-
+**Closed (#5654): a *container-typed* last child.**
+`scalar_text_end` answers `None` for a container, so a trailing `,` or a junk byte after a container that was its parent's last child (`[1,[2,3],]`, `{"a":1,"b":[1,2],}`, `[[1]@]`) used to pass through every route.
 ```
 $ echo '[1,[2,3],]'          | jq  -c '.'   # parse error, exit 5
-$ echo '[1,[2,3],]'          | sjq -c '.'   # [1,[2,3]], exit 0 -- still open
-$ echo '{"a":1,"b":[1,2],}'  | jq  -c '.'   # parse error, exit 5
-$ echo '{"a":1,"b":[1,2],}'  | sjq -c '.'   # {"a":1,"b":[1,2]}, exit 0 -- still open
+$ echo '[1,[2,3],]'          | sjq -c '.'   # parse error, exit 5
+$ echo '{"a":1,"b":[1,2],}'  | sjq -c '.'   # parse error, exit 5
 ```
-
-This is not new: the cursor-transparent `.` path (`stream_json_pretty`'s own
-`scalar_end_pos`, #1676) already has the identical gap for the identical
-reason, confirmed live against `main` prior to #2243. Pinned by
-`test_jq_lazy_path_trailing_comma_after_container_last_child_still_a_known_gap_2243`
-in [tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs) rather than left
-untested.
+The last child's end now comes from the balanced parentheses (`JsonCursor::container_end_bp`, `DocumentCursor::container_text_end`), asked of the last child of a container only.
+The last node in document order inside it is a leaf; its end plus one closer for each parenthesis that closes after it is where the container ends.
+Only the closers are looked for, so junk inside the last child is that child's own business, found when it is read, and a filter that never reads a malformed member is still not made to validate it (#2103).
+An inner closer's kind is not compared with its opener's.
+The lazy routes (`map(.)`, `first(.[])`) still skip the gap checks, for a scalar last child too.
+Measured against the build before it (Apple M-series, interleaved, release): `.` and `length` over a record array, a `{"users":[...]}` document and an array of rows are within noise, and `[.[]|.id]|length` over records whose last field is a container reads +7% to +13% (a lookup now locates the end of that field).
+Pinned by `test_jq_lazy_path_trailing_comma_after_container_last_child_is_rejected_2243` in [tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs) and `tests/jq_cli/i5654_container_last.rs`.
 
 **Much narrower reach than #1677/#2211's own checks, tracked as three
 follow-ups rather than folded in here** (same "one materializer at a time"

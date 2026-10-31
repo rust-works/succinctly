@@ -728,6 +728,16 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         true
     }
 
+    /// Where this container ends, one past its closing bracket (#5654): the gap start for the
+    /// trailing check after a container that is its parent's last child, which
+    /// [`DocumentValue::scalar_text_end`] cannot answer.
+    ///
+    /// A scan of the container, so it is asked of a parent's last child only. The default is
+    /// `None`, "can't determine, skip", for the formats that validate while parsing.
+    fn container_text_end(&self) -> Option<usize> {
+        None
+    }
+
     /// Whether the value immediately following this key (at `key_end`, the
     /// key's own already-known span end) is preceded by exactly one `:`
     /// (#1677) -- the forward-scan twin of
@@ -1568,8 +1578,9 @@ pub trait DocumentValue: Sized + Clone {
     /// a real cursor lookup at that depth, not derivable from `start` alone
     /// -- callers checking a trailing gap treat `None` here as "can't
     /// determine, skip" (matching `scalar_end_pos`'s own original doc
-    /// comment). Defaults to `None`; JSON overrides it for every scalar
-    /// variant.
+    /// comment); the last child's check then asks
+    /// [`DocumentCursor::container_text_end`] (#5654). Defaults to `None`;
+    /// JSON overrides it for every scalar variant.
     fn scalar_text_end(&self, start: usize) -> Option<usize> {
         let _ = start;
         None
@@ -2448,24 +2459,35 @@ pub fn value_delimiter_ok<F: DocumentFields>(
 /// reasoning) all share one definition instead of drifting into four
 /// hand-copied ones.
 ///
-/// Takes only the cursor, not an already-resolved value:
-/// [`DocumentValue::scalar_text_end`] unconditionally answers `None` for a
-/// container-typed child (see its own doc comment), so resolving one here
-/// first -- via `is_container()`, cheap and already required by every
-/// [`DocumentCursor`] impl -- skips a `.value()` call this check could
-/// never use anyway, rather than decoding it and immediately discarding the
-/// result.
+/// Takes only the cursor, not an already-resolved value. A container child
+/// ([`DocumentValue::scalar_text_end`] answers `None` for one) is asked
+/// [`DocumentCursor::container_text_end`] instead, a scan of that container that this
+/// check pays for the last child only (#5654); `is_container()` is cheap and already required
+/// by every [`DocumentCursor`] impl, so a container is told apart without decoding its value.
 ///
 /// `None` from either remaining half of the lookup -- no resolvable start
-/// position, or (for a scalar child) no derivable end position -- answers
+/// position, or no derivable end position -- answers
 /// `true` (nothing to flag), the same "can't determine, skip" convention
 /// every sibling gap check in this module already follows.
 pub fn trailing_element_gap_ok<C: DocumentCursor>(last_cursor: &C, close_char: u8) -> bool {
-    if !C::HAS_DELIMITER_CHECKS || last_cursor.is_container() {
+    if !C::HAS_DELIMITER_CHECKS {
         return true;
     }
+    if last_cursor.is_container() {
+        // #5654: junk after a container that is the last child (`[[1]@]`).
+        return match last_cursor.container_text_end() {
+            Some(end) => last_cursor.trailing_element_gap_ok(end, close_char),
+            None => true,
+        };
+    }
     match last_cursor.text_position() {
-        Some(start) => match last_cursor.value().scalar_text_end(start) {
+        // An empty container (`{}`, `[]`) is not `is_container()` above, and no scalar either:
+        // its end is the same scan (#5654, `[{}@]`).
+        Some(start) => match last_cursor
+            .value()
+            .scalar_text_end(start)
+            .or_else(|| last_cursor.container_text_end())
+        {
             Some(end) => last_cursor.trailing_element_gap_ok(end, close_char),
             None => true,
         },
