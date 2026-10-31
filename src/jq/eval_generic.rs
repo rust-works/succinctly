@@ -415,8 +415,10 @@ fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
 /// off the value's text. The bridge this stands in for materializes the string, writes it out as
 /// JSON text, indexes that, and has `builtin_split` read it back -- the writing alone cost as much
 /// as the split on a short line. `None`, leaving the caller on that bridge and its wording, for
-/// yq mode (whose `split` has its own null and separator rules), a separator that is not a plain
-/// string literal (it may fan out, or fail), and a value with no decodable text.
+/// yq mode (kept off this path as a precaution: a string and a string separator split alike in both
+/// modes, and `null` and a number never reach here, so `tests/yq_cli/i5682.rs` pins the yq answers
+/// but cannot fail without the gate), a separator that is not a plain string literal (it may fan
+/// out, or fail), and a value with no decodable text.
 fn split_of_document_string<S: EvalSemantics, V: DocumentValue>(
     builtin: &Builtin,
     value: &V,
