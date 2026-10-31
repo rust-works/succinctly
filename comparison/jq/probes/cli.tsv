@@ -135,3 +135,78 @@ tostring-float	numbers	["-c", "map(tostring)"]	"[1.0, 0.1, 1e100, 1e-5, 3.141592
 seventeen-digits	numbers	["-c", "."]	"[0.1, 0.30000000000000004, 1.7976931348623157e308]"
 negative-zero	numbers	["-c", "."]	"[-0, -0.0, 0]"
 int-division	numbers	["-n", "-c", "[5/2, 1e1000, -1e1000, infinite, -infinite, nan]"]	-
+shtest-nul-slurp-raw	input	["-Rse", ". == \"a\\u0000b\\nc\\u0000d\\ne\""]	"a\u0000b\nc\u0000d\ne"
+shtest-nul-lines-raw	input	["-Rne", "[inputs] == [\"a\\u0000b\", \"c\\u0000d\", \"e\"]"]	"a\u0000b\nc\u0000d\ne"
+shtest-seq-truncated	input	["-ces", "--seq", ". == [2,3,[4,5],true,\"ab\",{},false]"]	"1\u001e2 3\n[0,1\u001e[4,5]true\"ab\"{\"c\":4\u001e{}{\"d\":5,\"e\":6\"\u001efalse\n"
+shtest-seq-truncated-2	input	["-ces", "--seq", ". == [2,3,[4,5],true,\"ab\",{},null]"]	"1\u001e2 3\n[0,1\u001e[4,5]true\"ab\"{\"c\":4\u001e{}{\"d\":5,\"e\":6\"false\n\u001enull"
+shtest-seq-unfinished-string	input	["-c", "--seq", "."]	"\"foo"
+shtest-seq-unfinished-string-exit	exit	["-ce", "--seq", "."]	"\"foo"
+shtest-seq-unfinished-number	input	["-c", "--seq", "."]	"1"
+shtest-seq-inputs-eof	exit	["-cen", "--seq", "[inputs] == []"]	"1\n"
+shtest-exit-status-select-1	exit	["--exit-status", "select(.i==1)"]	"{\"i\": 1}\n{\"i\": 2}\n{\"i\": 3}\n"
+shtest-exit-status-select-2	exit	["--exit-status", "select(.i==2)"]	"{\"i\": 1}\n{\"i\": 2}\n{\"i\": 3}\n"
+shtest-exit-status-select-3	exit	["--exit-status", "select(.i==3)"]	"{\"i\": 1}\n{\"i\": 2}\n{\"i\": 3}\n"
+shtest-exit-status-select-4	exit	["--exit-status", "select(.i==4)"]	"{\"i\": 1}\n{\"i\": 2}\n{\"i\": 3}\n"
+shtest-exit-status-false	exit	["--exit-status", "select(.i==2) | false"]	"{\"i\": 1}\n{\"i\": 2}\n{\"i\": 3}\n"
+shtest-exit-status-true	exit	["--exit-status", "select(.i==2) | true"]	"{\"i\": 1}\n{\"i\": 2}\n{\"i\": 3}\n"
+shtest-951-unterminated-string	exit	["-e", "."]	"\"a\n"
+shtest-2146-invalid-literal	exit	["."]	"foobar\n"
+shtest-2367-huge-exponent	numbers	["."]	"{\"a\": 1E9999999999}\n"
+shtest-2367-huge-exponent-e	exit	["-e", ".a"]	"{\"a\": 1E9999999999}\n"
+shtest-1534-slurp-adjacent	input	["-cs", "add"]	"[1,2][3,4]"
+shtest-1534-slurp-adjacent-nl	input	["-cs", "add"]	"[1,2][3,4]\n"
+shtest-raw-output0	output	["--raw-output0", ".[]"]	"[\"a\", \"b\"]"
+shtest-raw-output0-nul	exit	["--raw-output0", ".[]"]	"[\"a\", \"c\\u0000d\", \"b\"]"
+shtest-stream-errors	input	["--stream-errors", "-c", "."]	"["
+shtest-stream-prefix-1	input	["-cn", "--stream", "fromstream(inputs)"]	"{"
+shtest-parse-prefix-1	input	["-c", "."]	"{"
+shtest-stream-prefix-2	input	["-cn", "--stream", "fromstream(inputs)"]	"{\""
+shtest-parse-prefix-2	input	["-c", "."]	"{\""
+shtest-stream-prefix-5	input	["-cn", "--stream", "fromstream(inputs)"]	"{\"a\":"
+shtest-parse-prefix-5	input	["-c", "."]	"{\"a\":"
+shtest-stream-prefix-8	input	["-cn", "--stream", "fromstream(inputs)"]	"{\"a\":[1,"
+shtest-parse-prefix-8	input	["-c", "."]	"{\"a\":[1,"
+shtest-stream-prefix-12	input	["-cn", "--stream", "fromstream(inputs)"]	"{\"a\":[1,{\"b\""
+shtest-parse-prefix-12	input	["-c", "."]	"{\"a\":[1,{\"b\""
+shtest-stream-prefix-15	input	["-cn", "--stream", "fromstream(inputs)"]	"{\"a\":[1,{\"b\":[2"
+shtest-parse-prefix-15	input	["-c", "."]	"{\"a\":[1,{\"b\":[2"
+shtest-stream-prefix-18	input	["-cn", "--stream", "fromstream(inputs)"]	"{\"a\":[1,{\"b\":[2,3]"
+shtest-parse-prefix-18	input	["-c", "."]	"{\"a\":[1,{\"b\":[2,3]"
+shtest-stream-prefix-22	input	["-cn", "--stream", "fromstream(inputs)"]	"{\"a\":[1,{\"b\":[2,3]}],\""
+shtest-parse-prefix-22	input	["-c", "."]	"{\"a\":[1,{\"b\":[2,3]}],\""
+shtest-stream-prefix-26	input	["-cn", "--stream", "fromstream(inputs)"]	"{\"a\":[1,{\"b\":[2,3]}],\"c\":\""
+shtest-parse-prefix-26	input	["-c", "."]	"{\"a\":[1,{\"b\":[2,3]}],\"c\":\""
+shtest-stream-prefix-30	input	["-cn", "--stream", "fromstream(inputs)"]	"{\"a\":[1,{\"b\":[2,3]}],\"c\":\"dd\","
+shtest-parse-prefix-30	input	["-c", "."]	"{\"a\":[1,{\"b\":[2,3]}],\"c\":\"dd\","
+shtest-stream-prefix-34	input	["-cn", "--stream", "fromstream(inputs)"]	"{\"a\":[1,{\"b\":[2,3]}],\"c\":\"dd\",\"e\":"
+shtest-parse-prefix-34	input	["-c", "."]	"{\"a\":[1,{\"b\":[2,3]}],\"c\":\"dd\",\"e\":"
+shtest-2378-object-pair	input	["--stream"]	"{\"a\":1,\"b\",\n"
+shtest-2463-nested-key	input	["--stream"]	"{{\"a\":\"b\"}}\n"
+shtest-2463-nested-key-after-comma	input	["--stream"]	"{\"x\":\"y\",{\"a\":\"b\"}}\n"
+shtest-2463-array-key	input	["--stream"]	"{[\"a\",\"b\"]}\n"
+shtest-2463-array-key-after-comma	input	["--stream"]	"{\"x\":\"y\",[\"a\",\"b\"]}\n"
+shtest-debug-stderr	meta	["-n", "\"test\", {} | debug, stderr"]	-
+shtest-stderr-raw	meta	["-n", "-c", "-j", "\"hello\\nworld\", null, [false, 0], {\"foo\":[\"bar\"]}, \"\\n\" | stderr"]	-
+shtest-arg-argjson	vars	["-n", "-c", "--arg", "foo", "1", "--argjson", "bar", "2", "{$foo, $bar} | ., . == $ARGS.named"]	-
+shtest-slurpfile-rawfile	vars	["-n", "--slurpfile", "foo", "data.json", "--rawfile", "bar", "data.json", "{$foo, $bar}"]	-
+shtest-args	vars	["-n", "-c", "--args", "$ARGS.positional", "foo", "bar", "baz"]	-
+shtest-jsonargs	vars	["-n", "-c", "--jsonargs", "$ARGS.positional", "null", "true", "[]", "{}"]	-
+shtest-args-then-jsonargs	vars	["-n", "-c", "$ARGS.positional", "--args", "foo", "1", "--jsonargs", "2", "{}", "--args", "3", "4"]	-
+shtest-args-jsonargs-empty	vars	["-n", "-c", "$ARGS.positional", "--args", "--jsonargs"]	-
+shtest-2572-jsonargs-invalid	exit	["-n", "--jsonargs", "null", "invalid"]	-
+shtest-2572-jsonargs-invalid-dashdash	exit	["-n", "--jsonargs", "null", "--", "invalid"]	-
+shtest-2919-script-after-dashdash	vars	["--args", "-rn", "--", "$ARGS.positional[0]", "bar"]	-
+shtest-2919-script-before-dashdash	vars	["--args", "-rn", "1", "--", "$ARGS.positional[0]", "bar"]	-
+shtest-halt	exit	["-n", "halt"]	-
+shtest-halt-error-1	exit	["-n", "halt_error(1)"]	-
+shtest-halt-error-11	exit	["-n", "halt_error(11)"]	-
+shtest-halt-error-newline	exit	["-n", "\"xyz\\n\" | halt_error(1)"]	-
+shtest-halt-error-no-newline	exit	["-n", "\"xy\" | halt_error(1)"]	-
+shtest-halt-error-nul	exit	["-n", "\"x\\u0000y\\u0000z\" | halt_error(1)"]	-
+shtest-halt-error-object	exit	["-n", "{\"a\":\"xyz\"} | halt_error(1)"]	-
+shtest-2785-no-main-program	program	["-n", "-f", "no-main-program.jq"]	-
+shtest-2785-yes-main-program	program	["-n", "-f", "yes-main-program.jq"]	-
+shtest-comment	program	["-n", "123 # comment"]	-
+shtest-comment-cr	program	["-n", "1 # foo\r + 2"]	-
+shtest-cve-2023-50268-nan-payload	numbers	["1 != ."]	"Nan4000\n"
+shtest-cve-2023-50246-tiny-exponent	numbers	["."]	"-10E-1000000001\n"
