@@ -171,6 +171,7 @@ category = "to-triage"
 issue = "#5636"
 reason = "`printf '1\\n' | jq -cen --seq '[inputs] == []'`: jq raises `Unfinished abandoned text at EOF` (exit 5); succinctly answers `true` (exit 0)."
 
+[[divergence]]
 id = "robust:mem-limit-64m-identity"
 platform = "linux"
 category = "reference-crash"
