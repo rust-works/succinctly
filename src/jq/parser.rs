@@ -9311,6 +9311,7 @@ impl<'a> Parser<'a> {
     /// `<=`, `>`, `>=`. In yq mode the space before it may hold a CR or form feed (Go's `\s*`,
     /// see [`Self::skip_yq_space`]); the position is left after the ordinary space when no
     /// operator follows.
+    #[inline(never)]
     fn take_comparison_op(&mut self) -> Option<CompareOp> {
         self.skip_ws();
         let before_space = self.pos;
@@ -9353,18 +9354,40 @@ impl<'a> Parser<'a> {
     /// length costs [`Self::check_expr_nesting`] and not stack.
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
         let left = self.parse_additive()?;
-        let Some(op) = self.take_comparison_op() else {
-            return Ok(left);
-        };
-        let right = self.parse_additive()?;
-        if self.mode != ParserMode::Yq {
-            return Ok(Expr::Compare {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            });
+        match self.take_comparison_op() {
+            None => Ok(left),
+            Some(op) => self.parse_comparison_rest(left, op),
         }
+    }
 
+    /// The part of [`Self::parse_comparison`] after `left op`: the right operand and, in yq mode,
+    /// the rest of the chain. Kept out of line, and out of `parse_comparison`, so that frame --
+    /// which every nested expression recurses through -- is smaller than it was before the chain
+    /// existed: a deep-`def` test sits within 3% of the default 2 MiB test stack in a debug build
+    /// and a larger frame overflowed it on Linux ARM64 in CI (#5629). The chain's own locals live
+    /// in [`Self::fold_yq_comparison_chain`] for the same reason.
+    #[inline(never)]
+    fn parse_comparison_rest(&mut self, left: Expr, op: CompareOp) -> Result<Expr, ParseError> {
+        let right = self.parse_additive()?;
+        if self.mode == ParserMode::Yq {
+            return self.fold_yq_comparison_chain(left, op, right);
+        }
+        Ok(Expr::Compare {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
+
+    /// yq mode: `left op right` is read; gather the operators that follow and fold the chain
+    /// from the right.
+    #[inline(never)]
+    fn fold_yq_comparison_chain(
+        &mut self,
+        left: Expr,
+        op: CompareOp,
+        right: Expr,
+    ) -> Result<Expr, ParseError> {
         let mut operands = vec![left, right];
         let mut ops = vec![op];
         while let Some(op) = self.take_comparison_op() {
