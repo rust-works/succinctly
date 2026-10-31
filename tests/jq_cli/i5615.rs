@@ -15,6 +15,11 @@ fn test_leading_zero_literal_keeps_its_decnumber_spelling_5615() -> Result<()> {
         ("0010e1", "1.0E+2\n"),
         ("0007e-1", "0.7\n"),
         ("000.50e2", "50\n"),
+        // With an empty fraction too (#5614).
+        ("00.e1", "0E+1\n"),
+        ("007.e1", "7E+1\n"),
+        ("000.E2", "0E+2\n"),
+        ("[00.e1]", "[0E+1]\n"),
         ("007.50", "7.50\n"),
         ("00.5", "0.5\n"),
         // Controls: a spelling that was already right.

@@ -592,3 +592,5 @@ num-lit-double-dot-index	operators	["-n", "-c", "1..e1"]	-
 num-lit-double-dot-try	operators	["-n", "-c", "try (1..e1) catch ."]	-
 num-lit-double-dot-neg	operators	["-n", "-c", "-1..e1"]	-
 num-lit-double-dot-neg-space	operators	["-n", "-c", "-1 .e1"]	-
+num-lit-leading-zero-empty-fraction-exp	operators	["-n", "-c", "00.e1"]	-
+num-lit-leading-zero-empty-fraction-int	operators	["-n", "-c", "007.e1"]	-
