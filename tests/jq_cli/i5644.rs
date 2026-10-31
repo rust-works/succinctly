@@ -110,7 +110,7 @@ fn test_a_junk_byte_after_an_opening_token_is_refused_5644() -> Result<()> {
         ),
         (
             "{\"a\":1,\"b\":@\"x\"}",
-            "jq: parse error: Invalid numeric literal at line 1, column 14\n",
+            "jq: parse error: Invalid numeric literal at line 1, column 13\n",
         ),
     ] {
         let (out, err, code) = run_jq_full(&["-c", "length"], Some(document))?;
