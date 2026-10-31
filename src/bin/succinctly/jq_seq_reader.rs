@@ -421,19 +421,17 @@ pub(crate) fn walk_stream_collecting(
         None => None,
     };
     let faults = if collect_faults {
-        let at: Vec<usize> = reader.fault_at.clone();
+        let at: Vec<usize> = reader.faults.iter().map(|fault| fault.at).collect();
         value_locations(raw_bytes, &at)
             .into_iter()
             .zip(std::mem::take(&mut reader.faults))
-            .map(
-                |((source, line), (body, values_before, position_lost))| SeqFault {
-                    body,
-                    values_before,
-                    source,
-                    line,
-                    position_lost,
-                },
-            )
+            .map(|((source, line), fault)| SeqFault {
+                body: fault.body,
+                values_before: fault.values_before,
+                source,
+                line,
+                position_lost: fault.position_lost,
+            })
             .collect()
     } else {
         Vec::new()
@@ -700,6 +698,15 @@ fn classify(c: u8) -> Cls {
     }
 }
 
+/// A diagnostic as the [`Reader`] records it, before [`value_locations`] gives it a place.
+struct RecordedFault {
+    body: String,
+    values_before: usize,
+    position_lost: bool,
+    /// The offset the reader stood at, or [`YIELDED_AT_EOF`] for the EOF branch.
+    at: usize,
+}
+
 struct Reader<'a> {
     line: usize,
     column: usize,
@@ -812,12 +819,9 @@ struct Reader<'a> {
     /// [`walk_stream_collecting`].
     collect_faults: bool,
     /// The recorded diagnostics: the body and the number of values yielded before it.
-    faults: Vec<(String, usize, bool)>,
+    faults: Vec<RecordedFault>,
     /// The stream's whole length in bytes, for [`Reader::fault_position_lost`].
     total: usize,
-    /// Parallel to `faults`: the offset the reader stood at ([`YIELDED_AT_EOF`] for the EOF
-    /// branch), which [`value_locations`] turns into jq's `(source, line)`.
-    fault_at: Vec<usize>,
     emit: &'a mut dyn FnMut(&str),
 }
 
@@ -860,7 +864,6 @@ impl<'a> Reader<'a> {
             collect_faults: false,
             faults: Vec::new(),
             total: 0,
-            fault_at: Vec::new(),
             emit,
         }
     }
@@ -898,13 +901,15 @@ impl<'a> Reader<'a> {
     fn emit_warning(&mut self, body: &str) {
         (self.emit)(&ignored_parse_error(body));
         if self.collect_faults {
-            let lost = self.fault_position_lost();
-            self.faults
-                .push((body.to_string(), self.values.len(), lost));
-            self.fault_at.push(if self.at_eof {
-                YIELDED_AT_EOF
-            } else {
-                self.offset
+            self.faults.push(RecordedFault {
+                body: body.to_string(),
+                values_before: self.values.len(),
+                position_lost: self.fault_position_lost(),
+                at: if self.at_eof {
+                    YIELDED_AT_EOF
+                } else {
+                    self.offset
+                },
             });
         }
     }

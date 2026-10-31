@@ -9280,11 +9280,10 @@ materializes `--seq` input before evaluating, so all warnings precede all values
 but `jq --unbuffered` does not. Without `-s` the same cause shows on stderr too. jq prints each
 warning after evaluating the values read before it, so a runtime error on an earlier value
 comes first, and `halt` suppresses the warnings after it. jq's `input`/`inputs` read each
-warning as an error, and under `-n` that means every one of them, `-n -s` included: there only
-the deferred warning above reaches `input` here, while jq's `input` also raises a warning from
-the reading call (`printf '\x1e1 {' | jq --seq -s -n 'input'` fails with `Unfinished JSON
-term at EOF`, exit 5). succinctly prints all the others up front, before any of that can
-happen -- or, under `-n`, not at all.
+warning as an error instead, and `succinctly jq` raises them the same way since #5640, at the
+position jq names (see the `-n` paragraph below): behind the values before it, with the reads
+after it resuming, and under `-s` before the slurped array. A plain run prints all the
+warnings up front, before any of that can happen.
 
 The differential guard remains deliberately asymmetric: **0 stdout supersets** across the
 randomized corpus. A fabricated value is a correctness failure even where an unrelated jq
@@ -9295,8 +9294,8 @@ whole -- see "jq's stream can end silently, mid-buffer, with nothing to explain 
 for the multi-record, non-slurp rule that also bears on stdout's contents (#2998), now
 matched rather than diverging.
 
-`-n` combined with a filter that forces a real read (`input`/`inputs`) turns the identical no-RS-byte condition into a **fatal** error on real jq (exit 5), not a warning.
-`succinctly jq` raises it too since [#5636](https://github.com/rust-works/succinctly/issues/5636), as the section above describes:
+`-n` combined with a filter that forces a real read (`input`/`inputs`) turns these conditions into **fatal** errors on real jq (exit 5), not warnings, and `succinctly jq` raises them the same way (#5640).
+That covers the stream with no RS byte at all and every error the reader finds in the middle of a stream.
 
 ```
 $ printf '1 2' | jq -n --seq -c '[inputs]'
@@ -9305,8 +9304,13 @@ $ printf '1 2' | succinctly jq -n --seq -c '[inputs]'
 jq: error (at <stdin>:0): Unfinished abandoned text at EOF at line 1, column 3
 ```
 
-It was a silent `[]` with exit 0 before, which #1525 deliberately did not dress up as the warning's wording.
-`test_seq_null_input_with_inputs_raises_not_warns_1525` pins the exit status and the text.
+Each error comes behind the values read before it, the reads after it resume, and under `-s` every one is raised before the slurped array.
+The EOF report jq defers past the stream's last value names `<unknown>` instead of `file:line`.
+No warning is printed in this mode.
+
+One shape still differs: after an empty record (`\x1e\x1e`), `-n` drops the values behind it, where jq yields them.
+That is the end-of-stream rule of #2998 applied to `input`.
+`test_seq_null_input_with_inputs_raises_not_warns_1525` and `tests/jq_cli/i5640.rs` pin the exit status and the text.
 
 ## Real-time stdout/stderr interleaving
 
