@@ -3650,7 +3650,7 @@ empty, so the left operand registered as empty and #2460's rule short-circuited 
 throughout. See "An `and`/`or` operand's evaluation context" above (#2470's section) for
 the fix and its own residual (`=`'s right side, a separate code path #2540 did not reach).
 
-### Ordering comparisons against a real `null` -- resolved for scalars ([#2483](https://github.com/rust-works/succinctly/issues/2483)); containers remain a residual gap
+### Ordering comparisons against a real `null` -- resolved ([#2483](https://github.com/rust-works/succinctly/issues/2483), containers [#5631](https://github.com/rust-works/succinctly/issues/5631))
 
 Real yq v4.53.3's ordering comparators (`<`/`<=`/`>`/`>=`) treat a real `null` operand as
 orderable only against another `null` -- never against any other value -- unlike jq's
@@ -3678,9 +3678,8 @@ cursor evaluator, the generic/CLI evaluator, and -- until spine 2416's exit dele
 the eager path-context evaluator) already routes through, so this is a single call site,
 not three.
 
-**Not reproduced: `null` against an array/object.** Real yq raises a Go-internal error
-there instead of answering at all, and the wording depends on operand *order* -- its
-ordering comparator is implemented as a subtraction internally:
+**`null` against an array/object (resolved by [#5631](https://github.com/rust-works/succinctly/issues/5631)).**
+Real yq raises a Go-internal error there instead of answering at all, and the wording depends on operand *order*, because its ordering comparator is implemented as a subtraction internally:
 
 ```console
 $ yq 'null < []'
@@ -3689,12 +3688,34 @@ $ yq '[] < null'
 Error: arrays not yet supported for comparison
 ```
 
-That is a materially different, deeper quirk than "ordering against null is false", and
-reproducing it bug-for-bug (order-dependent wording, distinct messages per container
-kind) is out of scope here. succinctly instead falls under the same "`false`
-unconditionally" rule as the scalar case above for a `null`-vs-container ordering
-comparison — an improvement over the pre-fix `true` (jq's total order), but still not a
-byte-for-byte match with real yq's error.
+succinctly yq raises the same two errors; see the next section.
+
+### Ordering comparisons of unlike kinds, a bool or a container raise in yq -- resolved ([#5631](https://github.com/rust-works/succinctly/issues/5631))
+
+yq's `<`, `<=`, `>` and `>=` are not jq's total order.
+`compareOperator` (`pkg/yqlib/operator_compare.go`, v4.53.3) tries these rules in order:
+
+| operands                                       | yq 4.53.3                                                                           |
+|------------------------------------------------|-------------------------------------------------------------------------------------|
+| a container on the left (any right operand)    | `arrays not yet supported for comparison` / `maps not yet supported for comparison` |
+| a scalar on the left, a container on the right | `!!seq () cannot be subtracted from !!int` (right tag, then left tag)               |
+| a `null` on either side                        | `false` (`<=`/`>=` of two `null`s is `true`)                                        |
+| two numbers (int or float), or two strings     | compared                                                                            |
+| anything else (a bool, or unlike kinds)        | `<left tag> not yet supported for comparison`                                       |
+
+So `2 > true` is `!!int not yet supported for comparison`, `"a" < 1` is `!!str not yet supported for comparison`, and `true > false` is `!!bool not yet supported for comparison`; succinctly yq used to answer `true`/`false` from jq's order.
+`==` and `!=` never raise, in either tool.
+A 17 x 17 x 4 matrix (null, bools, ints, floats, strings, empty and non-empty containers, `~`) was captured from yq v4.53.3 and agrees with `succinctly yq` on every row that does not involve a timestamp or a hex literal.
+jq mode keeps its total order (`succinctly jq -n '2 > true'` is `true`).
+
+The refusal is `eval::yq_ordering_refusal`, applied by `eval::try_compare_op` at every call site that can report a failure (the ordinary and generic evaluators, the owned fast path, the `yq` context-pipe route); `direct_cond_verdict` declines to the general route on a refused pair so the error is raised there.
+
+**Not reproduced:**
+
+- A string that parses as a timestamp is compared as a time by yq, so `"2001-01-01T00:00:00Z" < 1` is `parsing time "1" as "2006-01-02": cannot parse "1" as "2006"` there and `false` here.
+  `OwnedValue` has no timestamp kind, so the pair is treated as the two kinds it is made of.
+- An integer written in hex (`0x10`) against a float is `strconv.ParseFloat: parsing "0x10": invalid syntax` in yq.
+  Here it compares by value.
 
 ### `|=` with a zero-output update filter -- resolved ([#2484](https://github.com/rust-works/succinctly/issues/2484))
 

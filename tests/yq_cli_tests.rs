@@ -3590,7 +3590,8 @@ fn test_yq_paths_filter_preserves_duplicate_mapping_keys_1342() -> Result<()> {
     for (filter, expected) in [
         ("[paths(scalars)]", r#"[["a"],["a"],["b"]]"#),
         ("[paths(..)]", r#"[["a"],["a"],["b"]]"#),
-        ("[paths(. > 0)]", r#"[["a"],["a"],["b"]]"#),
+        // yq refuses an ordering comparison of a mapping (#5631), so the root is excluded first.
+        ("[paths(scalars | . > 0)]", r#"[["a"],["a"],["b"]]"#),
         // The discriminator: each occurrence is judged on its own value.
         ("[paths(. == 1)]", r#"[["a"]]"#),
         ("[paths(. == 2)]", r#"[["a"]]"#),

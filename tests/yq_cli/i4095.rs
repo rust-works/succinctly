@@ -233,12 +233,12 @@ fn test_recurse_cond_null_and_bool_verdicts_agree_with_the_general_route_4095() 
         ". == true | not",
         // A spelled integer (#2802): yq compares a scalar with a literal by its text, so `0x1F ==
         // 31` is false in yq v4.53.3 and only ordering compares the value. Whatever the general route
-        // answers, the direct verdict has to answer too.
+        // answers, the direct verdict has to answer too. (Ordering is pinned below, over a document
+        // of numbers: yq raises on an ordering comparison of a string or a container, #5631.)
         ". == 31",
         ". != 15",
         ". == 7",
         ". == 5",
-        ". > 6",
         ". == 1000",
         ". == 1e3",
     ] {
@@ -429,6 +429,21 @@ fn test_recurse_cond_over_alias_fanout_completes_4095() -> Result<()> {
         (".root | [limit(3; recurse(.[]?; true))] | length", "1"),
     ] {
         assert_eq!(run(filter, &doc)?, want, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// Ordering compares a spelled integer by value (`0x1F > 6`). yq refuses an ordering comparison of a
+/// container or a string (#5631), so the root mapping is settled by `type` before `>` sees it.
+#[test]
+fn test_recurse_cond_ordering_agrees_with_the_general_route_4095() -> Result<()> {
+    let doc = "a: 0x1F\nb: 007\nc: 2.50\nd: 5\ne: 1e3\nf: 0o17\n";
+    for cond in ["type == \"!!map\" or . > 6", "type == \"!!map\" or . <= 7"] {
+        for tail in ["| tojson", "| path"] {
+            let want = run(&format!("[recurse(.[]?; . | ({cond})) {tail}]"), doc)?;
+            let got = run(&format!("[recurse(.[]?; {cond}) {tail}]"), doc)?;
+            assert_eq!(got, want, "`{cond}` {tail}");
+        }
     }
     Ok(())
 }
