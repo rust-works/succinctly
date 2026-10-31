@@ -6843,19 +6843,19 @@ fn get_inputs(
                         };
                         // #5635: what jq's streaming parser read of the malformed document before it
                         // met the fault, ahead of the error.
-                        let prefix = if prefix_wanted {
+                        let base = if prefix_wanted {
                             faults.line_at_read_of(start);
-                            stream_prefix_events(
-                                raw.as_bytes(),
-                                start,
-                                src,
-                                faults.newlines_before_pos,
-                            )
+                            faults.newlines_before_pos
+                        } else {
+                            0
+                        };
+                        let (_, line, resume) = meet_fault(&mut faults, raw.as_bytes(), start);
+                        resumed_prefixes.push(if prefix_wanted {
+                            let end = resume.clamp(start, raw.len());
+                            stream_prefix_events(&raw.as_bytes()[start..end], src, base)
                         } else {
                             Vec::new()
-                        };
-                        resumed_prefixes.push(prefix);
-                        let (_, line, resume) = meet_fault(&mut faults, raw.as_bytes(), start);
+                        });
                         resumed_errors.push((
                             values.len(),
                             TrailingParseError {
@@ -6967,8 +6967,10 @@ fn get_inputs(
                     // #5635: `--stream` hands the program what jq's streaming parser read of the
                     // malformed document before it met the fault, ahead of the error.
                     if let Some(start) = fault_start.filter(|_| prefix_wanted) {
-                        let base = count_newlines(&raw.as_bytes()[..start]);
-                        stream_prefix = stream_prefix_events(raw.as_bytes(), start, src, base);
+                        let bytes = raw.as_bytes();
+                        let end = fault_read_end(bytes, parse_error_detection(bytes, start));
+                        let base = count_newlines(&bytes[..start]);
+                        stream_prefix = stream_prefix_events(&bytes[start..end], src, base);
                     }
                     trailing_error = Some(TrailingParseError {
                         error,
@@ -7111,16 +7113,28 @@ fn stream_mode(args: &JqCommand, uses_input_builtins: bool, faulted: bool) -> St
 /// and the source and line of the read that yielded it.
 type StreamPrefix = (OwnedValue, usize, usize);
 
-/// The events of the malformed document that starts at `start` in `raw`, which jq's streaming
-/// parser yielded before it met the fault (#5635). `newlines_before` is the number of newlines
-/// before `start`, which the parser's own count of the lines it has read goes on from.
+/// Where the read of jq's that holds the byte it detects a fault at ends: through the next
+/// newline, or the end of the input (#5635). The streaming parser has met the fault by then, so
+/// it need read no further.
+fn fault_read_end(bytes: &[u8], detected: usize) -> usize {
+    let detected = detected.min(bytes.len());
+    bytes[detected..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(bytes.len(), |newline| detected + newline + 1)
+}
+
+/// The events of the malformed document `document` holds, which jq's streaming parser yielded
+/// before it met the fault (#5635): `document` runs from the start of the malformed value to the
+/// end of the read that holds the fault, so a large input is not read on past it.
+/// `newlines_before` is the number of newlines before the document, which the parser's own count
+/// of the lines it has read goes on from.
 fn stream_prefix_events(
-    raw: &[u8],
-    start: usize,
+    document: &[u8],
     source: usize,
     newlines_before: usize,
 ) -> Vec<StreamPrefix> {
-    crate::jq_stream_errors::events_before_fault(&raw[start..])
+    crate::jq_stream_errors::events_before_fault(document)
         .into_iter()
         .map(|(event, lines)| (event, source, newlines_before + lines))
         .collect()
@@ -14477,6 +14491,18 @@ mod tests {
         );
         assert_eq!(stitched(&[b"{\"a\":"]), vec![b"{\"a\":".to_vec()]);
         assert_eq!(stitched(&[]), Vec::<Vec<u8>>::new());
+    }
+
+    /// #5635: the read holding the fault runs through the next newline, or to the end of the input.
+    #[test]
+    fn fault_read_end_runs_through_the_newline_after_the_fault_5635() {
+        let bytes = b"[1,2 x]\n[3]\n";
+        assert_eq!(fault_read_end(bytes, 5), 8);
+        // A fault on a newline is in the read that ends there.
+        assert_eq!(fault_read_end(bytes, 7), 8);
+        assert_eq!(fault_read_end(b"[1,2 x]", 5), 7);
+        assert_eq!(fault_read_end(b"[1,2 x]", 99), 7);
+        assert_eq!(fault_read_end(b"", 0), 0);
     }
 
     /// #4349: a fault in a value that also holds an invalid UTF-8 byte is placed as it is with a
