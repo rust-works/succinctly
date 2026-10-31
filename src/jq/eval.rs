@@ -96387,8 +96387,60 @@ pub(crate) fn unary_math_apply<S: EvalSemantics>(builtin: &Builtin, n: f64) -> O
         Builtin::Trunc => integral_f64_result::<S>(math::trunc(n)),
         Builtin::Sqrt => OwnedValue::Float(math::sqrt(n)),
         Builtin::Fabs => OwnedValue::Float(math::fabs(n)),
+        // The eighteen that are one libm call each (#5669): `builtin_log` and its siblings are
+        // `OwnedValue::Float(math::f(n))`, so these are the same call and the same last digit.
+        Builtin::Log => OwnedValue::Float(math::log(n)),
+        Builtin::Log10 => OwnedValue::Float(math::log10(n)),
+        Builtin::Log2 => OwnedValue::Float(math::log2(n)),
+        Builtin::Exp => OwnedValue::Float(math::exp(n)),
+        Builtin::Exp10 => OwnedValue::Float(math::exp10(n)),
+        Builtin::Exp2 => OwnedValue::Float(math::exp2(n)),
+        Builtin::Sin => OwnedValue::Float(math::sin(n)),
+        Builtin::Cos => OwnedValue::Float(math::cos(n)),
+        Builtin::Tan => OwnedValue::Float(math::tan(n)),
+        Builtin::Asin => OwnedValue::Float(math::asin(n)),
+        Builtin::Acos => OwnedValue::Float(math::acos(n)),
+        Builtin::Atan => OwnedValue::Float(math::atan(n)),
+        Builtin::Sinh => OwnedValue::Float(math::sinh(n)),
+        Builtin::Cosh => OwnedValue::Float(math::cosh(n)),
+        Builtin::Tanh => OwnedValue::Float(math::tanh(n)),
+        Builtin::Asinh => OwnedValue::Float(math::asinh(n)),
+        Builtin::Acosh => OwnedValue::Float(math::acosh(n)),
+        Builtin::Atanh => OwnedValue::Float(math::atanh(n)),
         _ => return None,
     })
+}
+
+/// Whether [`unary_math_apply`] answers `builtin`: the one list the cursor arm
+/// (`unary_math_of_document_number`) and [`owned_unary_math`] both check before reading a number.
+pub(crate) fn is_unary_math_builtin(builtin: &Builtin) -> bool {
+    matches!(
+        builtin,
+        Builtin::Floor
+            | Builtin::Ceil
+            | Builtin::Round
+            | Builtin::Trunc
+            | Builtin::Sqrt
+            | Builtin::Fabs
+            | Builtin::Log
+            | Builtin::Log10
+            | Builtin::Log2
+            | Builtin::Exp
+            | Builtin::Exp10
+            | Builtin::Exp2
+            | Builtin::Sin
+            | Builtin::Cos
+            | Builtin::Tan
+            | Builtin::Asin
+            | Builtin::Acos
+            | Builtin::Atan
+            | Builtin::Sinh
+            | Builtin::Cosh
+            | Builtin::Tanh
+            | Builtin::Asinh
+            | Builtin::Acosh
+            | Builtin::Atanh
+    )
 }
 
 /// [`unary_math_apply`] of an owned number (#5601), so a computed or bound number does not take the
@@ -96400,17 +96452,7 @@ pub(crate) fn owned_unary_math<S: EvalSemantics>(
     builtin: &Builtin,
     input: &OwnedValue,
 ) -> Option<OwnedValue> {
-    if S::TAG != EvalTag::Jq
-        || !matches!(
-            builtin,
-            Builtin::Floor
-                | Builtin::Ceil
-                | Builtin::Round
-                | Builtin::Trunc
-                | Builtin::Sqrt
-                | Builtin::Fabs
-        )
-    {
+    if S::TAG != EvalTag::Jq || !is_unary_math_builtin(builtin) {
         return None;
     }
     let n = match input {

@@ -375,8 +375,8 @@ fn document_number_f64_generic<S: EvalSemantics, V: DocumentValue>(value: &V) ->
     }
 }
 
-/// `floor`, `ceil`, `round`, `trunc`, `sqrt` and `fabs` of a document number, answered from the
-/// number itself (#5593). Without this they fell to [`eval_builtin_in`]'s wildcard, which writes
+/// `floor`, `ceil`, `round`, `trunc`, `sqrt` and `fabs` of a document number, and since #5669 the
+/// eighteen libm builtins (`log`, `exp`, `sin`, ...), answered from the number itself (#5593). Without this they fell to [`eval_builtin_in`]'s wildcard, which writes
 /// the number out as JSON text, indexes it and evaluates the builtin over that one-number
 /// document: a round trip and an index build per number to make one libm call (`[.numbers[]|floor]`
 /// was 0.87x of jq, and `floor|.+1` 0.57x).
@@ -399,15 +399,7 @@ fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
         return None;
     }
     // Checked before reading the number, so a builtin this does not answer costs one match.
-    if !matches!(
-        builtin,
-        Builtin::Floor
-            | Builtin::Ceil
-            | Builtin::Round
-            | Builtin::Trunc
-            | Builtin::Sqrt
-            | Builtin::Fabs
-    ) {
+    if !crate::jq::eval::is_unary_math_builtin(builtin) {
         return None;
     }
     let text = value.number_text()?;
@@ -41553,7 +41545,11 @@ mod tests {
                 .collect_owned::<JqSemantics>();
             reindex_count::get() - before
         };
-        for builtin in ["floor", "ceil", "round", "trunc", "sqrt", "fabs"] {
+        for builtin in [
+            "floor", "ceil", "round", "trunc", "sqrt", "fabs", "log", "log10", "log2", "exp",
+            "exp10", "exp2", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh",
+            "asinh", "acosh", "atanh",
+        ] {
             let filter = format!("map({builtin})");
             let expr = crate::jq::parse(&filter).unwrap();
             let before = reindex_count::get();
@@ -41647,6 +41643,59 @@ mod tests {
         assert!(reindexes("map(del(.a, .[]))") > 0);
         assert!(reindexes("map(del(.a, (.b | select(. > 1))))") > 0);
         assert!(reindexes("map(del(.a?, .b))") > 0);
+    }
+
+    /// #5669: the libm builtins of a number answer with the call the builtin itself makes, so the
+    /// fast arm moves no digit on any platform. Each is compared with `crate::jq::math` over
+    /// numbers whose results include a signed zero, an infinity, a NaN and a double past 2^53.
+    #[test]
+    fn libm_builtins_of_a_number_answer_with_the_builtins_own_call_5669() {
+        use crate::jq::math;
+
+        let json = b"[0,-0.0,0.5,1,2,10,-1,1e-5,100000,1e19,-3.25]";
+        let numbers = [
+            0.0, -0.0, 0.5, 1.0, 2.0, 10.0, -1.0, 1e-5, 100000.0, 1e19, -3.25,
+        ];
+        let answers = |filter: &str| {
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            result.iter().map(OwnedValue::to_json).collect::<Vec<_>>()
+        };
+        let table: [(&str, fn(f64) -> f64); 18] = [
+            ("log", math::log),
+            ("log10", math::log10),
+            ("log2", math::log2),
+            ("exp", math::exp),
+            ("exp10", math::exp10),
+            ("exp2", math::exp2),
+            ("sin", math::sin),
+            ("cos", math::cos),
+            ("tan", math::tan),
+            ("asin", math::asin),
+            ("acos", math::acos),
+            ("atan", math::atan),
+            ("sinh", math::sinh),
+            ("cosh", math::cosh),
+            ("tanh", math::tanh),
+            ("asinh", math::asinh),
+            ("acosh", math::acosh),
+            ("atanh", math::atanh),
+        ];
+        for (name, call) in table {
+            let expected = numbers
+                .iter()
+                .map(|&n| OwnedValue::Float(call(n)).to_json())
+                .collect::<Vec<_>>()
+                .join(",");
+            assert_eq!(
+                answers(&format!("map({name})")),
+                [format!("[{expected}]")],
+                "{name}"
+            );
+        }
     }
 
     /// #5601: a number the filter computed meets the next stage without the reindex bridge, and
