@@ -67,6 +67,16 @@ id = "upstream-optional.test"
 path = "comparison/jq/vendor/jq-1.7.1/optional.test"
 sha256 = "994c3be50823da63c7908a6e1c000a2f63a521bcb639a6423cfb1359e180e465"
 
+[[suite]]
+id = "upstream-base64.test"
+path = "comparison/jq/vendor/jq-1.7.1/base64.test"
+sha256 = "7835b2aa4d0dad61f294eca1656f0707862d3496813d7c21f79deb3bd2aff7e0"
+
+[[suite]]
+id = "upstream-manonig.test"
+path = "comparison/jq/vendor/jq-1.7.1/manonig.test"
+sha256 = "d68810e7a2877e0ff04b7a2f6fde731ccd7d1348e1973582e6004eb06e6fb9b6"
+
 # Dimension C: JSONTestSuite (y_/n_/i_), the file the golden tests use.
 [json_suite]
 id = "json-test-suite"
