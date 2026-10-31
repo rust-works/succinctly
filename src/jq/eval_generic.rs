@@ -46,7 +46,7 @@ use super::deferred_bind::{
     deferred_bind_cursor, deferred_bind_reads, mentions_var, DeferredReads,
 };
 use super::document::{
-    checked_member_key, child_tail_gap_ok, collapsed_fields, collapsed_fields_if,
+    checked_member_key, child_tail_gap_ok, collapsed_fields_checked, collapsed_fields_if,
     container_tail_gap_ok, effective_fields_checked, effective_fields_with_raw_last,
     effective_len_checked, empty_elements_tail_gap_ok, empty_fields_tail_gap_ok, key_delimiter_ok,
     key_display_string, key_display_string_kind, key_hash, key_is_malformed, resolve_display_key,
@@ -4135,8 +4135,9 @@ enum LazySource<V: DocumentValue> {
     /// before the first): the gap before the next one is a `,` only after a first, and the
     /// closing bracket's own gap is read from it when the walk runs out (#5654).
     Elements(V::Elements, Option<V::Cursor>),
-    /// Bare `obj | map(f)` (#725). The second field is as for `Elements`.
-    Values(V::Fields, Option<V::Cursor>),
+    /// Bare `obj | map(f)` (#725). Every member was checked up front, by the same
+    /// `collapsed_fields_checked` probe that finds a repeated key (#5654).
+    Values(V::Fields),
     /// `keys_unsorted | map(f)` (#724).
     ///
     /// Carries the mode's duplicate-key rule into the pull itself (#1514)
@@ -4219,7 +4220,7 @@ impl<V: DocumentValue> core::fmt::Debug for LazySource<V> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Elements(..) => f.write_str("LazySource::Elements(..)"),
-            Self::Values(..) => f.write_str("LazySource::Values(..)"),
+            Self::Values(_) => f.write_str("LazySource::Values(..)"),
             Self::Keys(_) => f.write_str("LazySource::Keys(..)"),
             Self::IndexRange { next, len } => f
                 .debug_struct("LazySource::IndexRange")
@@ -4275,8 +4276,9 @@ impl<V: DocumentValue> LazySource<V> {
         Ok(match self {
             Self::Elements(elements, last) => {
                 let Some((cursor, rest)) = elements.uncons_cursor() else {
-                    // #5654: the gap before the closing bracket, taken once.
-                    child_tail_gap_ok(last.take().as_ref(), b']')?;
+                    // #5654: the gap before the closing bracket. `last` is kept, so a caller that
+                    // pulls again after the error is told again.
+                    child_tail_gap_ok(last.as_ref(), b']')?;
                     return Ok(None);
                 };
                 if !cursor.element_gap_ok(last.is_none()) {
@@ -4286,20 +4288,11 @@ impl<V: DocumentValue> LazySource<V> {
                 *last = Some(cursor);
                 Some(LazyElem::Cursor(cursor))
             }
-            Self::Values(fields, last) => {
+            Self::Values(fields) => {
                 let Some((field, rest)) = fields.uncons() else {
-                    // #1641: no more fields, or a last field that never got a value.
-                    if fields.ends_unpaired() {
-                        return Err(fields.malformed_member_error());
-                    }
-                    child_tail_gap_ok(last.take().as_ref(), b'}')?;
                     return Ok(None);
                 };
-                if !field.delimiters_ok::<V::Fields>(last.is_none()) {
-                    return Err(fields.malformed_member_error());
-                }
                 *fields = rest;
-                *last = Some(field.value_cursor);
                 Some(LazyElem::Cursor(field.value_cursor))
             }
             Self::Keys(keys) => match keys.next() {
@@ -34658,9 +34651,9 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
         // non-goal and stays on the wildcard fallback below.
         Builtin::Map(f) => {
             if let Some(elements) = value.as_array() {
-                // #2594: `LazySource::Elements` pulls through
-                // `uncons_cursor` alone and runs no gap check at all, so
-                // `[,] | map(f)` produced `[]`.
+                // #2594: the zero-child `[,]` has no element to pull, so the
+                // gap checks `LazySource::Elements` makes per element (#5654)
+                // never see it.
                 if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
                     return GenericResult::Error(err);
                 }
@@ -34668,8 +34661,8 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                     LazySeq::new(LazySource::Elements(elements, None)).push_map(f, S::TAG),
                 ))
             } else if let Some(fields) = value.as_object() {
-                // #2594: `LazySource::Values`/`collapsed_fields` likewise
-                // never see the zero-field `{,}`.
+                // #2594: the zero-field `{,}` has no member for the probe
+                // below to check.
                 if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
                     return GenericResult::Error(err);
                 }
@@ -34677,18 +34670,21 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 // last-seen value in both modes (#1398), which needs every
                 // occurrence seen before any value can be emitted --
                 // incompatible with `Values`'s incremental cons-list pull.
-                // `collapsed_fields` gates the materializing fallback
+                // `collapsed_fields_checked` gates the materializing fallback
                 // behind a cheap fingerprint probe (`document::census`),
                 // so the duplicate-free case (by far the common one) keeps
-                // #724/#725's lazy pull unchanged.
-                let source = match collapsed_fields(&fields) {
-                    Some(collapsed) => LazySource::cursors(
+                // #724/#725's lazy pull unchanged. The same probe checks
+                // every member's gaps, a trailing `,` and an unpaired last
+                // field, in both branches (#5654), so `Values` pulls none.
+                let source = match collapsed_fields_checked(&fields, true) {
+                    Err(err) => return GenericResult::Error(err),
+                    Ok(Some(collapsed)) => LazySource::cursors(
                         collapsed
                             .into_iter()
                             .map(|field| field.value_cursor)
                             .collect(),
                     ),
-                    None => LazySource::Values(fields, None),
+                    Ok(None) => LazySource::Values(fields),
                 };
                 GenericResult::LazySeq(Box::new(LazySeq::new(source).push_map(f, S::TAG)))
             } else if S::TAG == EvalTag::Yq && cursor_is_null(&value, cursor.as_ref()) {
