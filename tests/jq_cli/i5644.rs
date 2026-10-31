@@ -102,6 +102,24 @@ fn test_a_junk_byte_after_an_opening_token_is_refused_5644() -> Result<()> {
             );
         }
     }
+    // `length` on an object reads each key and its `:` (the census scan, `following_gap_ok`).
+    for (document, stderr) in [
+        (
+            "{\"a\":@1,\"b\":2}",
+            "jq: parse error: Invalid numeric literal at line 1, column 8\n",
+        ),
+        (
+            "{\"a\":1,\"b\":@\"x\"}",
+            "jq: parse error: Invalid numeric literal at line 1, column 14\n",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", "length"], Some(document))?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            ("", stderr, 5),
+            "length {document:?}"
+        );
+    }
     // `length` reads only the top level, so it sees a fault among the top-level children (a
     // nested one is the semi-index's documented leniency, as for `[[x3]]`).
     for (document, stderr) in &REFUSED[..9] {
@@ -136,7 +154,15 @@ fn test_whitespace_in_every_gap_still_parses_5644() -> Result<()> {
 
 #[test]
 fn test_a_form_feed_in_a_gap_is_refused_5644() -> Result<()> {
-    for document in ["[\x0c1]", "{\"a\":\x0c1}", "{\"a\"\x0c:1}", "{\x0c\"a\":1}"] {
+    for document in [
+        "[\x0c1]",
+        "{\"a\":\x0c1}",
+        "{\"a\"\x0c:1}",
+        "{\x0c\"a\":1}",
+        // The gap after a `,` counts only JSON whitespace too.
+        "[1,\x0c2]",
+        "{\"a\":1,\x0c\"b\":2}",
+    ] {
         let (out, _, code) = run_jq_full(&["-c", "."], Some(document))?;
         assert_eq!((out.as_str(), code), ("", 5), "{document:?}");
     }

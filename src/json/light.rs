@@ -3338,7 +3338,12 @@ fn json_decode_failure(e: JsonError) -> StreamFailure {
 /// zeros (#1149), a leading-dot number (#1171), a malformed nested number
 /// like `1.2.3` (#1194/#966) -- none of which live in a gap.
 ///
-/// Only catches a missing or doubled delimiter between two real children.
+/// Catches a missing or doubled delimiter between two real children, and (#5644) a junk byte
+/// where the scan stops with nothing before it to excuse it: the first child of a container
+/// must follow its `[` or `{`, and a value (`expected` is `:`) must follow its key's closing
+/// `"`. Only space, tab, LF and CR are whitespace, as in JSON. A junk byte between a sibling's
+/// last byte and its `,` is not looked at here.
+///
 /// A trailing delimiter (`{"a":1,}`) or a delimiter in an apparently-empty
 /// container (`{,}`) needs the *closing* bracket's text position, which is
 /// exactly the expensive lookup this function exists to avoid -- tracked
@@ -3402,6 +3407,10 @@ pub fn preceding_gap_ok(text: &[u8], child_start: usize, expected: Option<u8>) -
 /// (`{"a" 1, "b": 2} | length`), and the alternative is silently wrong
 /// output. `scripts/perf-guard.py`'s baseline needs a deliberate
 /// `--update-baseline` run on a pinned bench box to reflect this.
+///
+/// The byte the scan stops on starts the value, so it must be able to start one (#5644): a
+/// letter, digit, quote, bracket, brace or one of `-+.`, or a closing bracket for the
+/// empty-value check. Anything else (`@`, `#`, a control byte) is refused.
 ///
 /// Recognises both delimiter bytes, exactly as [`preceding_gap_ok`] does,
 /// not only `:` -- #2720 review: scanning for `:` alone `break`s on the `,`
