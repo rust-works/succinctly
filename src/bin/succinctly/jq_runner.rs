@@ -5919,7 +5919,9 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 }
             }
         } else {
-            let stream_events_lazily = stream_mode(&args, uses_input_builtins) == StreamMode::Lazy;
+            let faulted = trailing_error.as_ref().is_some_and(|t| !t.seq_warning);
+            let stream_events_lazily =
+                stream_mode(&args, uses_input_builtins, faulted) == StreamMode::Lazy;
             'documents: for (idx, document) in inputs.iter().enumerate() {
                 // `UNKNOWN_LINE`, not just any missing entry, must clear the
                 // source too (#3202): `input_filename` can't otherwise tell
@@ -6695,6 +6697,13 @@ fn get_inputs(
     // filter's own `input`. jq has lost its position by then -- the call
     // that raises it closed the stream -- so it names `<unknown>`.
     let mut resumed_errors: Vec<(usize, TrailingParseError)> = Vec::new();
+    // #5635: the `--stream` events of the document the parse error ended, which jq's streaming
+    // parser yielded before it met the fault -- `(event, source, line)`.
+    let mut stream_prefix: Vec<StreamPrefix> = Vec::new();
+    // ... and of each fault a program using `input`/`inputs` resumes after, parallel to
+    // `resumed_errors`.
+    let mut resumed_prefixes: Vec<Vec<StreamPrefix>> = Vec::new();
+    let prefix_wanted = args.stream && stream_mode(args, track_eof, true) != StreamMode::Off;
     let mut trailing_error: Option<TrailingParseError> =
         seq_deferred_warning.map(|message| TrailingParseError {
             error: EvalError::new(message),
@@ -6832,6 +6841,20 @@ fn get_inputs(
                         let (Some(error), Some(start)) = (parse_error, start) else {
                             break;
                         };
+                        // #5635: what jq's streaming parser read of the malformed document before it
+                        // met the fault, ahead of the error.
+                        let prefix = if prefix_wanted {
+                            faults.line_at_read_of(start);
+                            stream_prefix_events(
+                                raw.as_bytes(),
+                                start,
+                                src,
+                                faults.newlines_before_pos,
+                            )
+                        } else {
+                            Vec::new()
+                        };
+                        resumed_prefixes.push(prefix);
                         let (_, line, resume) = meet_fault(&mut faults, raw.as_bytes(), start);
                         resumed_errors.push((
                             values.len(),
@@ -6850,6 +6873,7 @@ fn get_inputs(
                         // `8`).
                         while next < raw.len() && !raw.is_char_boundary(next) {
                             let line = faults.line_at_read_of(next);
+                            resumed_prefixes.push(Vec::new());
                             resumed_errors.push((
                                 values.len(),
                                 TrailingParseError {
@@ -6898,6 +6922,7 @@ fn get_inputs(
                 // `locations.extend_from_ends`, so slurp mode skips that scan
                 // entirely rather than running it and discarding the result.
                 let mut error_line = 0;
+                let mut fault_start = None;
                 if !args.slurp {
                     // The splitter recognizes every span the parse above
                     // produced a value for (it is the more lenient of the two,
@@ -6931,6 +6956,7 @@ fn get_inputs(
                             .or(split_error)
                             .unwrap_or(raw.len());
                         error_line = parse_error_line(raw.as_bytes(), start, seam);
+                        fault_start = Some(start);
                     }
                 }
                 values.extend(parsed);
@@ -6938,6 +6964,12 @@ fn get_inputs(
                 // after it is read, this file or any later one, and the error
                 // is raised once the documents before it have been (#2961).
                 if let Some(error) = parse_error {
+                    // #5635: `--stream` hands the program what jq's streaming parser read of the
+                    // malformed document before it met the fault, ahead of the error.
+                    if let Some(start) = fault_start.filter(|_| prefix_wanted) {
+                        let base = count_newlines(&raw.as_bytes()[..start]);
+                        stream_prefix = stream_prefix_events(raw.as_bytes(), start, src, base);
+                    }
                     trailing_error = Some(TrailingParseError {
                         error,
                         source: u32::try_from(src).unwrap_or(u32::MAX),
@@ -6965,8 +6997,19 @@ fn get_inputs(
     // location. Only those two need the events kept; a program that reads `.` walks each
     // document's events one at a time in `run_jq`'s loop instead.
     let mut unflushed_close = None;
-    if stream_mode(args, track_eof) == StreamMode::Eager {
+    let faulted = trailing_error.as_ref().is_some_and(|t| !t.seq_warning);
+    if stream_mode(args, track_eof, faulted) == StreamMode::Eager {
         expand_into_stream_events(&mut values, &mut locations, &mut resumed_errors);
+        insert_stream_prefixes(
+            &mut values,
+            &mut locations,
+            &mut resumed_errors,
+            resumed_prefixes,
+        );
+        for (event, source, line) in stream_prefix {
+            values.push(event);
+            locations.push(source, line);
+        }
         // #5548: only the slurped array is wrapped up front; the event jq's parser still holds at
         // EOF is a value of its own after it.
         if args.slurp && last_ends_on_close {
@@ -7046,7 +7089,7 @@ enum StreamMode {
     Lazy,
 }
 
-fn stream_mode(args: &JqCommand, uses_input_builtins: bool) -> StreamMode {
+fn stream_mode(args: &JqCommand, uses_input_builtins: bool, faulted: bool) -> StreamMode {
     let json_documents = args.input_dsv.is_none() && !args.raw_input && !args.seq;
     // `--stream-errors` reads the events itself (#5474), so there is nothing left to expand.
     if !args.stream || args.stream_errors || !json_documents {
@@ -7055,8 +7098,60 @@ fn stream_mode(args: &JqCommand, uses_input_builtins: bool) -> StreamMode {
         StreamMode::Eager
     } else if args.null_input {
         StreamMode::Off
+    } else if faulted {
+        // #5635: the events of the document the parse error ended come with the error, after the
+        // events of the documents before it.
+        StreamMode::Eager
     } else {
         StreamMode::Lazy
+    }
+}
+
+/// One `--stream` event jq's streaming parser yielded before it met a fault (#5635): the event,
+/// and the source and line of the read that yielded it.
+type StreamPrefix = (OwnedValue, usize, usize);
+
+/// The events of the malformed document that starts at `start` in `raw`, which jq's streaming
+/// parser yielded before it met the fault (#5635). `newlines_before` is the number of newlines
+/// before `start`, which the parser's own count of the lines it has read goes on from.
+fn stream_prefix_events(
+    raw: &[u8],
+    start: usize,
+    source: usize,
+    newlines_before: usize,
+) -> Vec<StreamPrefix> {
+    crate::jq_stream_errors::events_before_fault(&raw[start..])
+        .into_iter()
+        .map(|(event, lines)| (event, source, newlines_before + lines))
+        .collect()
+}
+
+/// Put each resumed fault's [`StreamPrefix`] events in front of the fault, in `values` already
+/// expanded to events, and move every fault to the end of its events (#5635).
+fn insert_stream_prefixes(
+    values: &mut Vec<OwnedValue>,
+    locations: &mut InputLocations,
+    resumed_errors: &mut [(usize, TrailingParseError)],
+    prefixes: Vec<Vec<StreamPrefix>>,
+) {
+    if prefixes.iter().all(Vec::is_empty) {
+        return;
+    }
+    debug_assert_eq!(prefixes.len(), resumed_errors.len());
+    let located = locations.per_value.len() == values.len();
+    let mut shift = prefixes.iter().map(Vec::len).sum::<usize>();
+    for (index, prefix) in prefixes.into_iter().enumerate().rev() {
+        let at = resumed_errors[index].0;
+        let events = prefix.len();
+        if located {
+            let spliced = prefix
+                .iter()
+                .map(|&(_, source, line)| (source as u32, line as u32));
+            locations.per_value.splice(at..at, spliced);
+        }
+        values.splice(at..at, prefix.into_iter().map(|(event, _, _)| event));
+        resumed_errors[index].0 = at + shift;
+        shift -= events;
     }
 }
 

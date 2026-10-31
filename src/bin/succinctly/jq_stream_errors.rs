@@ -89,6 +89,8 @@ pub(crate) struct StreamErrorsRead {
     /// is when no value came out of the last refill. `None` when an earlier call already
     /// reached the end and jq has closed the file (`<unknown>`).
     pub(crate) open_at_end: Option<usize>,
+    /// The index in `values` of the first parse error jq turned into an input, if there was one.
+    pub(crate) first_error: Option<usize>,
 }
 
 /// The line count of a value yielded once jq's input is closed.
@@ -211,9 +213,30 @@ pub(crate) fn read(sources: &[(Option<usize>, Vec<u8>)]) -> StreamErrorsRead {
         slurp_at,
         open_at_end: (parser.values.len() == values_before_last_refill)
             .then_some(parser.lines_read),
+        first_error: parser.first_error,
         values: parser.values,
         locations: parser.locations,
     }
+}
+
+/// The events jq's streaming parser yields for `bytes` before the parse error that ends them
+/// (#5635), each with the number of lines of `bytes` jq had read when it yielded it.
+///
+/// `bytes` starts at a value: the document `--stream` could not finish. The events come from the
+/// same port `--stream-errors` reads with, since which events a malformed document produced
+/// before its fault is a property of jq's incremental parser, not of a whole-document parse.
+/// Empty when the parser meets no fault in `bytes`, so a document it reads through is left to the
+/// caller's own error.
+pub(crate) fn events_before_fault(bytes: &[u8]) -> Vec<(OwnedValue, usize)> {
+    let read = read(&[(None, bytes.to_vec())]);
+    let Some(end) = read.first_error else {
+        return Vec::new();
+    };
+    read.values
+        .into_iter()
+        .zip(read.locations.into_iter().map(|(_, lines)| lines))
+        .take(end)
+        .collect()
 }
 
 struct Parser {
@@ -240,6 +263,7 @@ struct Parser {
     closed: bool,
     values: Vec<OwnedValue>,
     locations: Vec<(usize, usize)>,
+    first_error: Option<usize>,
 }
 
 impl Parser {
@@ -259,6 +283,7 @@ impl Parser {
             closed: false,
             values: Vec::new(),
             locations: Vec::new(),
+            first_error: None,
         }
     }
 
@@ -276,6 +301,12 @@ impl Parser {
         self.values.push(value);
         let line = if self.closed { CLOSED } else { self.lines_read };
         self.locations.push((self.source, line));
+    }
+
+    /// [`Parser::yield_value`] for a parse error, remembering where the first one fell.
+    fn yield_error(&mut self, error: OwnedValue) {
+        self.first_error.get_or_insert(self.values.len());
+        self.yield_value(error);
     }
 
     fn path_value(&self) -> OwnedValue {
@@ -318,7 +349,7 @@ impl Parser {
                         self.line, self.column
                     ));
                     self.reset();
-                    self.yield_value(error);
+                    self.yield_error(error);
                     // `p->curr_buf = 0`: the rest of this refill is thrown away.
                     return true;
                 }
@@ -334,20 +365,20 @@ impl Parser {
             let error = self.error_value(format!(
                 "Unfinished string at EOF at line {line}, column {column}"
             ));
-            self.yield_value(error);
+            self.yield_error(error);
             return;
         }
         if let Err(message) = self.check_literal() {
             let error =
                 self.error_value(format!("{message} at EOF at line {line}, column {column}"));
-            self.yield_value(error);
+            self.yield_error(error);
             return;
         }
         if !self.path.is_empty() {
             let error = self.error_value(format!(
                 "Unfinished JSON term at EOF at line {line}, column {column}"
             ));
-            self.yield_value(error);
+            self.yield_error(error);
             return;
         }
         if let Some(value) = self.next.take() {
@@ -720,6 +751,42 @@ mod tests {
 
     fn read_one(input: &[u8]) -> StreamErrorsRead {
         read(&[(None, input.to_vec())])
+    }
+
+    fn before_fault(input: &str) -> Vec<(String, usize)> {
+        events_before_fault(input.as_bytes())
+            .into_iter()
+            .map(|(event, lines)| (event.to_json(), lines))
+            .collect()
+    }
+
+    /// #5635: the events a malformed document yielded before its fault, with the lines read.
+    #[test]
+    fn events_before_fault_stop_at_the_first_error_5635() {
+        let row = |event: &str, lines| (event.to_string(), lines);
+        assert_eq!(
+            before_fault("[1,2,3 x]"),
+            [row("[[0],1]", 0), row("[[1],2]", 0)]
+        );
+        // The count is of newlines read, so it is 0 on the first line and goes up with each line.
+        assert_eq!(
+            before_fault("[1,\n2,\n3 x]\n"),
+            [row("[[0],1]", 1), row("[[1],2]", 2)]
+        );
+        assert_eq!(before_fault("{{\"a\":\"b\"}}"), []);
+        // A fault in a later document leaves the earlier ones' events in.
+        assert_eq!(
+            before_fault("[1]\n[3,x"),
+            [row("[[0],1]", 1), row("[[0]]", 1), row("[[0],3]", 1)]
+        );
+    }
+
+    #[test]
+    fn events_before_fault_are_empty_when_the_parser_meets_none_5635() {
+        assert_eq!(before_fault("[1,2]\n"), []);
+        assert_eq!(before_fault(""), []);
+        // Truncation is a fault at EOF: the events are the ones before it.
+        assert_eq!(before_fault("[1,2"), [("[[0],1]".to_string(), 0)]);
     }
 
     fn run(input: &str) -> Vec<String> {

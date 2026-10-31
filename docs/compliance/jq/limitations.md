@@ -13525,11 +13525,8 @@ leaf or an empty container, `[[path]]` closing a non-empty one), so `.` sees one
 event into one array, and `input`/`inputs` read events (`fromstream(inputs)` and `1|truncate_stream(inputs)` fold
 them back). `-R` ignores the flag, as in jq. Pinned by `test_jq_stream_flag_feeds_tostream_events_4397`.
 
-jq emits events while it parses, so two things differ for the shapes below, both recorded divergences:
+jq emits events while it parses, so one thing differs for the shapes below, a recorded divergence:
 
-- **A document that fails to parse part-way** has already emitted the events of what it finished in jq
-  (`printf '[1,' | jq --stream -c .` prints `[[0],1]` and then the parse error); succinctly parses a document whole,
-  so it prints the events of the documents before it and then the error.
 - **`input_line_number`** is the line the parser is on when jq emits the event, so the events of a document that spans
   lines carry different numbers; every event here carries the line its document completes on.
 - **`--seq`** combines with `--stream` in jq (`echo '[1] 2' | jq --seq --stream -c .` prints each event after an RS
@@ -13547,6 +13544,12 @@ Its events are materialized rather than streamed, like `--stream`'s, so memory g
 Under `-R` and `--input-dsv` the flag is ignored, as `--stream` is.
 It is pinned by `tests/jq_cli/i5474.rs` and was checked against `/usr/bin/jq` on random malformed inputs, with stdout, exit status and the `(at <file>:<line>)` marker compared.
 One shape differs: `--seq` combines with `--stream-errors` in jq (`printf '[1,2' | jq --seq --stream-errors -c .` prints `["Unfinished abandoned text at EOF at line 1, column 4",[]]`), and here `--seq` wins and the flag is ignored, as it is for `--stream`.
+A document that fails to parse part-way has already emitted the events of what it finished in jq (`printf '[1,' | jq --stream -c .` prints `[[0],1]` and then the parse error).
+Since #5635 `succinctly jq --stream` prints them too, in front of the error, and they carry the line jq had read when it yielded each.
+The document is parsed whole first, so the events are not streamed: once that parse fails, the bytes from the malformed document on are read again with the port of jq's streaming parser that `--stream-errors` uses (`jq_stream_errors::events_before_fault`).
+A program using `input`/`inputs` gets them ahead of each fault it resumes after, and one that never reads past them never meets the fault.
+The error text and position are the ones the whole-document parse gives (stderr is not compared).
+
 `-b` is accepted and ignored, as jq does outside Windows; `--binary` is rejected there (`Unknown option --binary`, exit 2) and here.
 
 `--stream` itself still parses the document whole, so it does not give jq's
