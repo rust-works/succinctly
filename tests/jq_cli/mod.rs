@@ -254,6 +254,7 @@ mod i5650;
 mod i5652;
 mod i5654;
 mod i5654_container_last;
+mod i5654_nul;
 mod i5655;
 mod i5661;
 mod i5662;
