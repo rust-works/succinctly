@@ -237,6 +237,7 @@ mod i5601;
 mod i5602;
 mod i5608;
 mod i5611;
+mod i5612;
 mod i5613;
 mod i5614;
 mod i5615;
