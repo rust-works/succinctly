@@ -74,7 +74,15 @@ fn slurpfile(contents: &str) -> Result<(String, i32)> {
 
 #[test]
 fn test_slurpfile_refuses_what_jq_refuses_around_a_value_5654() -> Result<()> {
-    for contents in ["1\u{c}", "\u{b}1 ", "1\u{a0}", "\u{a0}1", "\u{2003}1"] {
+    for contents in [
+        "[1]\u{c}",
+        "\u{c}1",
+        "1\u{c}",
+        "\u{b}1 ",
+        "1\u{a0}",
+        "\u{a0}1",
+        "\u{2003}1",
+    ] {
         assert_eq!(slurpfile(contents)?, (String::new(), 2), "{contents:?}");
     }
     Ok(())
