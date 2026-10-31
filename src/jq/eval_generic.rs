@@ -453,13 +453,16 @@ fn is_computed_plain_number<S: EvalSemantics>(value: &OwnedValue) -> bool {
 }
 
 /// The one answer of `expr` over a computed plain number (#5606), from the number alone, or
-/// `None` where the evaluator must run it: `[e]` is the one-element array of `e`'s answer, `{k: e}`
-/// the object of its entries' answers, an
-/// `. as $x | body` binds `$x` to the number as the evaluator's own bind does (`eval_as`: an
-/// identity source freezes `.`, here a number with no node) and answers the body, and any other
-/// shape is a closed expression ([`crate::jq::eval::eval_owned_closed`]) or one the owned fast
-/// path answers. A shape none of them answers returns `None` whole, so the caller bridges the
-/// original `expr`, never a substituted one.
+/// `None` where the evaluator must run it:
+/// - `[e]` is the one-element array of `e`'s answer;
+/// - `{k: e}` is the object of its entries' answers;
+/// - `. as $x | body` binds `$x` to the number as the evaluator's own bind does (`eval_as`: an
+///   identity source freezes `.`, here a number with no node) and answers the body;
+/// - any other shape is a closed expression ([`crate::jq::eval::eval_owned_closed`]) or one the
+///   owned fast path answers.
+///
+/// A shape none of them answers returns `None` whole, so the caller bridges the original `expr`,
+/// never a substituted one.
 fn plain_number_answer<S: EvalSemantics>(expr: &Expr, number: &OwnedValue) -> Option<OwnedValue> {
     match strip_parens(expr) {
         Expr::Array(inner) => {
@@ -5112,9 +5115,9 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
                     };
                 }
             }
-            // #5606: `[e]`, `{k: e}` and `. as $x | body` over the number, where `e` and the body are shapes
-            // the owned routes answer; see `plain_number_answer`. The embed table gates it as it
-            // gates the fast path below: the answer may then be a bound node's own value.
+            // #5606: `[e]`, `{k: e}` and `. as $x | body` over the number, where `e` and the body
+            // are shapes the owned routes answer; see `plain_number_answer`. The embed table gates
+            // it as it gates the fast path below: the answer may then be a bound node's own value.
             Expr::Array(_) | Expr::Object(_) | Expr::As { .. }
                 if !optional && !embed_table_active() =>
             {
