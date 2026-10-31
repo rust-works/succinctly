@@ -2215,7 +2215,7 @@ fn test_a_long_stream_stopped_early_or_read_whole_5661() -> Result<()> {
         ("[inputs | input_line_number] | last", DOCUMENTS.to_string()),
         (
             "first(inputs), input_line_number",
-            format!("{{\"id\":0,\"s\":\"u0\"}}\n1"),
+            "{\"id\":0,\"s\":\"u0\"}\n1".to_string(),
         ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", program], Some(&stream))?;

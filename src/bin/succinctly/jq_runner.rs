@@ -13321,7 +13321,7 @@ mod tests {
         };
         let clean = write("clean.json", "1\n{\"a\":2}\n[3]\n");
         let (inputs, lines, trailing, resumed, lazy) = read(&["jq", "-n", "inputs", &clean]);
-        assert!(inputs.is_empty());
+        assert_eq!(inputs, Vec::<OwnedValue>::new());
         assert_eq!(lines.len(), 3);
         assert!(!trailing && resumed == 0);
         let lazy = lazy.expect("deferred");
