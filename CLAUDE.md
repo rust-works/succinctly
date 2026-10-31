@@ -36,6 +36,16 @@ scripts/doc_lines.py check` caps prose lines at 1000 characters; `fix` splits ov
 that conflicts in one of these pages because `fix` split a paragraph upstream is resolved by
 `python3 scripts/doc_lines.py resolve <file>` (it splits all three sides, then merges them).
 
+## macOS CI Runs in the Merge Queue Only
+
+The macOS test matrix (`Test (macOS ARM64)`) runs in merge-group runs, not on pull requests: macOS
+runners are the one CI resource that queues, and PR runs used most of them (#5699). A PR runs it
+only if it touches `src/jq/math.rs`, a `build.rs`, a `Cargo.toml`/`Cargo.lock`, `rust-toolchain*`
+or `.github/workflows/**`, or carries the `ci:macos` label (add the label, then push or re-run the
+jobs). On any other PR the required check reports success with a notice, so a macOS-only failure
+surfaces as a merge-queue ejection instead; label a PR `ci:macos` when it touches something
+platform-sensitive that the path list misses.
+
 ## Before You Push
 
 `scripts/pre-push.sh` maps the files your branch changed to the CI gates they can fail and runs
