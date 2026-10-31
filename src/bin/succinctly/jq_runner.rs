@@ -4621,6 +4621,11 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         }
         Err(BuildContextError::Other(e)) => return Err(e),
     };
+    // The process exits when this function returns (its only callers are `main`'s dispatch arms),
+    // so the named arguments are not freed: a 100 MB `--slurpfile` is millions of small
+    // allocations, and walking them to give the memory back to a process that is about to end was
+    // a quarter of the run (#5673).
+    let context = std::mem::ManuallyDrop::new(context);
 
     // Get the filter expression. An unreadable `-f`/`--from-file` file is
     // jq's own usage error (exit 2), so it gets the same two-arm treatment
@@ -4754,11 +4759,12 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // Build the $ARGS special variable
     let args_value = build_args_var(&context);
 
-    // Substitute variables from context into the expression
-    // First substitute regular named variables, then add $ARGS
-    let mut all_vars: Vec<(&str, &OwnedValue)> =
-        context.named.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    all_vars.push(("ARGS", &args_value));
+    // Substitute variables from context into the expression. `$ARGS` goes first: each variable is
+    // substituted in a pass over the whole expression, and a container named argument becomes a
+    // literal tree as large as the value, so a variable substituted after one walks all of it
+    // (#5673). `$ARGS` is substituted for every run, whether or not the program mentions it.
+    let mut all_vars: Vec<(&str, &OwnedValue)> = vec![("ARGS", &args_value)];
+    all_vars.extend(context.named.iter().map(|(k, v)| (k.as_str(), v)));
 
     let mut expr = jq::substitute_vars(&expr, all_vars);
 
