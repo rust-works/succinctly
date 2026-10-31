@@ -12677,6 +12677,19 @@ pub(crate) fn eval_owned_reindex_free<S: EvalSemantics>(
     }
 }
 
+/// `has(K)` and `keys` of an owned array or object, for a literal `K` (#5652): a boolean and a fresh
+/// array, neither of which carries a node of `input`, so they are answered in any position. `None`
+/// for anything else, whose diagnostics and per-type rules stay the evaluator's.
+pub(crate) fn owned_container_key_builtin<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if !matches!(expr, Expr::Builtin(Builtin::Has(_) | Builtin::Keys)) {
+        return None;
+    }
+    eval_owned_door_arm::<S>(expr, input)?.ok()
+}
+
 /// `to_entries` over an owned object or array, each value cloned into its
 /// entry -- a refcount bump for a container, so an entry's `value` is the
 /// very node it came from, as in jq. `None` for anything else, whose
