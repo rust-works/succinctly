@@ -41748,6 +41748,45 @@ mod tests {
         assert!(reindexes("map(floor)", b"[1e1000]") > 0);
     }
 
+    /// #5682: `split` of a document string with a literal separator reads the pieces off the
+    /// string's text instead of bridging: the bridge materializes the string, writes it out as
+    /// JSON and indexes it again (`reindex_count` counts exactly that), once per string. The pin
+    /// must be able to fail: it does, with `split_of_document_string` returning `None`. A
+    /// separator that is not a string literal, a value that is not a string and yq mode keep the
+    /// bridge.
+    #[cfg(feature = "std")]
+    #[test]
+    fn split_of_a_document_string_is_not_bridged_5682() {
+        use crate::jq::value::reindex_count;
+
+        let json = br#"["a,b","","\u00e9,\ud83d\ude00,x",",,"]"#;
+        let run = |filter: &str, json: &[u8]| {
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::get();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            let text = result.iter().map(OwnedValue::to_json).collect::<Vec<_>>();
+            (text, reindex_count::get() - before)
+        };
+        let (answer, reindexes) = run(r#"map(split(","))"#, json);
+        assert_eq!(
+            answer,
+            [r#"[["a","b"],[],["é","😀","x"],["","",""]]"#],
+            "the pieces"
+        );
+        assert_eq!(reindexes, 0, "a literal separator bridged");
+        let (answer, reindexes) = run(r#"map(split(""))"#, br#"["ab"]"#);
+        assert_eq!(answer, [r#"[["a","b"]]"#]);
+        assert_eq!(reindexes, 0);
+        // Not answered here, so bridged as before: a computed separator, a value that is not a
+        // string, and the two-argument (regex) form.
+        assert!(run(r#"map(split("," + ""))"#, json).1 > 0);
+        assert!(run(r#"map(try split(",") catch 0)"#, b"[1]").1 > 0);
+        assert!(run(r#"map(split(",";null))"#, br#"["a,b"]"#).1 > 0);
+    }
+
     /// #5670: a `del` of several static paths is answered on the owned value, as one path is
     /// (#5549): `reindex_count` counts every serialize-and-index. The pin must be able to fail: it
     /// does, with `owned_del_path_shape` refusing a comma.
