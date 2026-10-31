@@ -115022,6 +115022,25 @@ mod tests {
         assert_eq!(copies(".a[0].b", &nested).1, ["7"]);
         assert_eq!(copies(".a[0].b | . + 1", &nested).1, ["8"]);
         assert_eq!(copies(".a[0].b | tostring | length", &nested).1, ["1"]);
+        // A read in the middle of the chain that raises ends the walk, and the rest of the pipe
+        // raises it as the re-entry did.
+        let scalar = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let mut out = Vec::new();
+        let flow = eval_each_owned::<JqSemantics>(
+            &parse(".a.b.c.d").unwrap(),
+            &scalar,
+            false,
+            Reentry::REBUILT,
+            &mut |v| {
+                out.push(v);
+                Demand::Continue
+            },
+        );
+        assert!(out.is_empty());
+        assert!(
+            matches!(&flow, Flow::Escaped(Control::Error(e)) if e.to_string().contains("Cannot index number")),
+            "the rest of the pipe raises"
+        );
     }
 
     /// A parenthesized pipe of `stages` stages that computes a value at each

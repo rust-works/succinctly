@@ -23,6 +23,7 @@ fn test_short_chains_over_a_computed_value_answer_as_jq_does_5663() -> Result<()
         ("{\"a\":{\"a\":1}} | .a.a.a?", "", 0),
         ("{\"a\":[1]} | .a.b", "", 5),
         ("1 | .a.a", "", 5),
+        ("{\"a\":1} | .a.b.c.d", "", 5),
     ] {
         let (stdout, _stderr, code) = run_jq_full(&["-nc", program], None)?;
         assert_eq!((stdout.as_str(), code), (expected, status), "{program}");
