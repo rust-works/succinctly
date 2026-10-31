@@ -6393,6 +6393,9 @@ fn get_inputs(
     let mut seq_values: Vec<(usize, usize)> = Vec::new();
     // And each value's `(source index, line)` from the same walk (#3250).
     let mut seq_value_locations: Vec<(usize, usize)> = Vec::new();
+    // The walk's diagnostics, kept only for `-n` (#5640): `input`/`inputs` raise each one, in
+    // order with the values, where a plain run prints it as a warning.
+    let mut seq_fault_errors: Vec<(usize, TrailingParseError)> = Vec::new();
     // Shared by `seq_warnings_apply` below, the `-n`-forced-read fallback
     // just after it, and the `build_seq_values` gate further down -- one
     // definition rather than three hand-copies of the same shape, so a
@@ -6435,9 +6438,40 @@ fn get_inputs(
         // `-R` are excluded from both gates identically. That combination
         // skips the warnings but still needs the values and `-s`'s
         // location, so it runs the walk here with a no-op sink.
-        let walk = crate::jq_seq_reader::walk_stream(&raw_bytes, args.slurp, &mut |_| {});
+        let walk =
+            crate::jq_seq_reader::walk_stream_collecting(&raw_bytes, args.slurp, true, &mut |_| {});
         seq_values = walk.values;
         seq_value_locations = walk.locations;
+        // `input`/`inputs` raise what a plain run only warns about (#5640).
+        seq_fault_errors = walk
+            .faults
+            .into_iter()
+            .map(|fault| {
+                let source = raw_bytes
+                    .get(fault.source)
+                    .and_then(|(index, _)| *index)
+                    .unwrap_or(0);
+                (
+                    // `-s` reads the whole stream into one array, so every fault the reader
+                    // met is raised by a read before that array is handed over.
+                    if args.slurp { 0 } else { fault.values_before },
+                    TrailingParseError {
+                        error: EvalError::new(fault.body),
+                        source: if fault.position_lost {
+                            NO_SOURCE
+                        } else {
+                            u32::try_from(source).unwrap_or(u32::MAX)
+                        },
+                        line: if fault.position_lost {
+                            UNKNOWN_LINE
+                        } else {
+                            u32::try_from(fault.line).unwrap_or(u32::MAX)
+                        },
+                        seq_warning: false,
+                    },
+                )
+            })
+            .collect();
         // `-n -s`'s `input`/`inputs` read the deferred warning too.
         seq_deferred_warning = walk.deferred_warning;
         seq_slurp_position_lost = walk.slurp_position_lost;
@@ -6717,7 +6751,7 @@ fn get_inputs(
     // (#3201): delivered after the slurped array, to the driver or to the
     // filter's own `input`. jq has lost its position by then -- the call
     // that raises it closed the stream -- so it names `<unknown>`.
-    let mut resumed_errors: Vec<(usize, TrailingParseError)> = Vec::new();
+    let mut resumed_errors: Vec<(usize, TrailingParseError)> = seq_fault_errors;
     // #5635: the `--stream` events of the document the parse error ended, which jq's streaming
     // parser yielded before it met the fault -- `(event, source, line)`.
     let mut stream_prefix: Vec<StreamPrefix> = Vec::new();

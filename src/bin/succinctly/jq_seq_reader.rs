@@ -356,8 +356,22 @@ pub(crate) fn walk_stream(
     slurp: bool,
     emit: &mut dyn FnMut(&str),
 ) -> SeqStreamWalk {
+    walk_stream_collecting(raw_bytes, slurp, false, emit)
+}
+
+/// [`walk_stream`], also recording each diagnostic as a [`SeqFault`] when `collect_faults` is
+/// set (#5640): `-n`'s `input`/`inputs` raise what a plain run only warns about, and need the
+/// message with where the reader stood. Off by default, because a stream can warn once per
+/// byte and the faults would be held in memory (see the note on [`walk_stream`]).
+pub(crate) fn walk_stream_collecting(
+    raw_bytes: &[(Option<usize>, Vec<u8>)],
+    slurp: bool,
+    collect_faults: bool,
+    emit: &mut dyn FnMut(&str),
+) -> SeqStreamWalk {
     let bom = bom_prefix(raw_bytes);
     let mut reader = Reader::new(bom, emit);
+    reader.collect_faults = collect_faults;
     // jq refills its reader one file at a time, so each source after the
     // first begins its own `jv_parser_next` -- whose malformed-BOM reset the
     // walk must reproduce (#3002). The offsets are the sources' absolute
@@ -374,6 +388,7 @@ pub(crate) fn walk_stream(
     let boundaries = refill_boundaries(raw_bytes, bom.malformed);
     let final_buffer_start = final_buffer_start(raw_bytes, total);
     reader.final_buffer_start = final_buffer_start;
+    reader.total = total;
     if bom.malformed {
         // The call for an *empty* final buffer -- after a chunk that ended
         // on a newline, or filled the buffer exactly -- resets as well,
@@ -405,7 +420,26 @@ pub(crate) fn walk_stream(
         }
         None => None,
     };
+    let faults = if collect_faults {
+        let at: Vec<usize> = reader.fault_at.clone();
+        value_locations(raw_bytes, &at)
+            .into_iter()
+            .zip(std::mem::take(&mut reader.faults))
+            .map(
+                |((source, line), (body, values_before, position_lost))| SeqFault {
+                    body,
+                    values_before,
+                    source,
+                    line,
+                    position_lost,
+                },
+            )
+            .collect()
+    } else {
+        Vec::new()
+    };
     SeqStreamWalk {
+        faults,
         slurp_position_lost,
         // Only non-slurp output names a location per value; `-s` would throw
         // this pass away.
@@ -420,11 +454,31 @@ pub(crate) fn walk_stream(
     }
 }
 
+/// One diagnostic of the `--seq` reader: what jq prints as `jq: ignoring parse error: <body>`
+/// and what `input`/`inputs` raise as an error (#5640).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeqFault {
+    /// The parse error's text, without the `jq: ignoring parse error: ` prefix.
+    pub(crate) body: String,
+    /// How many values the reader had yielded before it met the fault.
+    pub(crate) values_before: usize,
+    /// jq's `(source index, line)` for the fault, by the same rule as a value's (#3250).
+    pub(crate) source: usize,
+    pub(crate) line: usize,
+    /// Whether jq has lost its position by the time it raises the fault, so the error names
+    /// `<unknown>` where it would name `file:line`: the EOF report jq defers to the read after
+    /// the one that returned the stream's last value (see [`Reader::fault_position_lost`]).
+    pub(crate) position_lost: bool,
+}
+
 /// What one raw-byte walk over a `--seq` stream ([`walk_stream`])
 /// answers -- the warnings go to its `emit` as it runs; the values and
 /// `-s`'s location come back here -- so a caller that needs several of them
 /// pays for the walk once.
 pub(crate) struct SeqStreamWalk {
+    /// Every diagnostic the walk reported, in order, when [`walk_stream_collecting`] was asked
+    /// to record them (#5640); empty otherwise.
+    pub(crate) faults: Vec<SeqFault>,
     /// Whether `--seq -s`'s runtime-error location is lost entirely -- real
     /// jq answering `(at <unknown>)` where it would otherwise name a file
     /// and line (#1542/#1550/#1568/#2947/#3003). Only meaningful under
@@ -754,6 +808,16 @@ struct Reader<'a> {
     /// entirely, since real jq's `p->eof` is never set on this path -- no
     /// `at EOF` diagnostic for anything left unscanned (#2998).
     stopped: bool,
+    /// Whether [`Reader::emit_warning`] records each diagnostic (#5640); see
+    /// [`walk_stream_collecting`].
+    collect_faults: bool,
+    /// The recorded diagnostics: the body and the number of values yielded before it.
+    faults: Vec<(String, usize, bool)>,
+    /// The stream's whole length in bytes, for [`Reader::fault_position_lost`].
+    total: usize,
+    /// Parallel to `faults`: the offset the reader stood at ([`YIELDED_AT_EOF`] for the EOF
+    /// branch), which [`value_locations`] turns into jq's `(source, line)`.
+    fault_at: Vec<usize>,
     emit: &'a mut dyn FnMut(&str),
 }
 
@@ -793,6 +857,10 @@ impl<'a> Reader<'a> {
             pending_eof_warning: None,
             last_byte_yielded_value: false,
             stopped: false,
+            collect_faults: false,
+            faults: Vec::new(),
+            total: 0,
+            fault_at: Vec::new(),
             emit,
         }
     }
@@ -816,8 +884,29 @@ impl<'a> Reader<'a> {
         self.emit_warning(body);
     }
 
+    /// Whether the diagnostic being reported now is raised with jq's position lost (#5640).
+    ///
+    /// Only the EOF branch's report can be: when the stream's last byte handed a value over, jq
+    /// returns that value from its terminal refill and raises the report in the *next* read,
+    /// after `read_more` has closed the stream (#3201, #3003) -- so `input` names `<unknown>`
+    /// where it would name `file:line` for the same report raised in the reading call. A
+    /// mid-stream fault is raised by the call that met it, position intact.
+    fn fault_position_lost(&self) -> bool {
+        self.at_eof && self.last_byte_yielded_value && self.final_buffer_start < self.total
+    }
+
     fn emit_warning(&mut self, body: &str) {
         (self.emit)(&ignored_parse_error(body));
+        if self.collect_faults {
+            let lost = self.fault_position_lost();
+            self.faults
+                .push((body.to_string(), self.values.len(), lost));
+            self.fault_at.push(if self.at_eof {
+                YIELDED_AT_EOF
+            } else {
+                self.offset
+            });
+        }
     }
 
     /// jq's `parser_reset`. Note it restores `Normal` -- including over a
