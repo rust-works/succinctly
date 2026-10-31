@@ -256,3 +256,4 @@ mod i5654;
 mod i5655;
 mod i5661;
 mod i5663;
+mod i5670;

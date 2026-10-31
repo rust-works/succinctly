@@ -41613,6 +41613,41 @@ mod tests {
         assert!(reindexes("map(floor)", b"[1e1000]") > 0);
     }
 
+    /// #5670: a `del` of several static paths is answered on the owned value, as one path is
+    /// (#5549): `reindex_count` counts every serialize-and-index. The pin must be able to fail: it
+    /// does, with `owned_del_path_shape` refusing a comma.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_del_of_several_static_paths_is_not_bridged_5670() {
+        use crate::jq::value::reindex_count;
+
+        let json = br#"[{"a":1,"b":2,"c":3},{"a":4,"b":5,"c":6}]"#;
+        let reindexes = |filter: &str| {
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::get();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            assert_eq!(result.len(), 1, "{filter}");
+            reindex_count::get() - before
+        };
+        for filter in [
+            "map(del(.a))",
+            "map(del(.a, .b))",
+            "map(del((.a, .b), .c))",
+            "map(del(.a) | del(.b))",
+        ] {
+            assert_eq!(reindexes(filter), 0, "{filter} bridged");
+        }
+        // A computed key, an iteration, a condition and a `?` keep the bridge.
+        assert_eq!(reindexes("map(del(.a, .[\"b\"]))"), 0);
+        assert!(reindexes("map(del(.a, .[(\"B\" | ascii_downcase)]))") > 0);
+        assert!(reindexes("map(del(.a, .[]))") > 0);
+        assert!(reindexes("map(del(.a, (.b | select(. > 1))))") > 0);
+        assert!(reindexes("map(del(.a?, .b))") > 0);
+    }
+
     /// #5601: a number the filter computed meets the next stage without the reindex bridge, and
     /// `floor` and its siblings of an owned number are answered from it. `reindex_count` counts
     /// every serialize-and-index. A NaN, which jq tells two of apart, still bridges. The pin must be
@@ -42518,7 +42553,21 @@ mod tests {
             eval_on_owned::<YqSemantics, V<'_>>(&expr, deep.clone(), false, Reentry::REBUILT);
         assert!(matches!(result, GenericResult::Error(_)), "{result:?}");
         let computed = crate::jq::parse("del(.[7 + 0])").unwrap();
-        let result = eval_on_owned::<JqSemantics, V<'_>>(&computed, deep, false, Reentry::REBUILT);
+        let result =
+            eval_on_owned::<JqSemantics, V<'_>>(&computed, deep.clone(), false, Reentry::REBUILT);
+        assert!(matches!(result, GenericResult::Error(_)), "{result:?}");
+        // #5670: a comma of static paths is the same delete, so it is answered the same way, and
+        // one computed branch sends the whole `del` to the bridge.
+        let several = crate::jq::parse("del(.[7], .[8])").unwrap();
+        let result =
+            eval_on_owned::<JqSemantics, V<'_>>(&several, deep.clone(), false, Reentry::REBUILT);
+        assert!(matches!(result, GenericResult::Owned(_)), "{result:?}");
+        let result =
+            eval_on_owned::<YqSemantics, V<'_>>(&several, deep.clone(), false, Reentry::REBUILT);
+        assert!(matches!(result, GenericResult::Error(_)), "{result:?}");
+        let one_computed = crate::jq::parse("del(.[7], .[8 + 0])").unwrap();
+        let result =
+            eval_on_owned::<JqSemantics, V<'_>>(&one_computed, deep, false, Reentry::REBUILT);
         assert!(matches!(result, GenericResult::Error(_)), "{result:?}");
 
         let raising = crate::jq::parse("del(.a)").unwrap();

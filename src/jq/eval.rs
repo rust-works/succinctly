@@ -12466,8 +12466,20 @@ pub(crate) fn owned_del_target<S: EvalSemantics>(expr: &Expr) -> Option<&Expr> {
     let Expr::Builtin(Builtin::Del(path)) = unwrap_paren(expr) else {
         return None;
     };
-    (owned_assign_path_shape(path, &|_| false) && !super::eval_generic::embed_table_active())
+    (owned_del_path_shape(path) && !super::eval_generic::embed_table_active())
         .then_some(path.as_ref())
+}
+
+/// The path grammar of [`owned_del_target`]: one static path, or a comma of them (#5670). jq
+/// collects every path of `del(f)` from the input before it deletes any, so `del(.a, .b)` does
+/// not depend on the order written, and [`del_on_owned`] -- the builtin's own body -- is what
+/// runs it either way.
+fn owned_del_path_shape(path: &Expr) -> bool {
+    match path {
+        Expr::Comma(items) => items.iter().all(owned_del_path_shape),
+        Expr::Paren(inner) => owned_del_path_shape(inner),
+        other => owned_assign_path_shape(other, &|_| false),
+    }
 }
 
 /// The assignment half of [`try_eval_owned_step`]: [`owned_assign_step`] over
@@ -113975,9 +113987,26 @@ mod tests {
             "del(.users[0].name)",
             "del(.[2][0])",
             "del(.[0].ratio)",
+            "del(.a, .b)",
+            "del(.a, .a.b)",
+            "del(.a.b, .a)",
+            "del(.[0], .[1])",
+            "del(.[0], .[-1])",
+            "del(.[5], .[6])",
+            "del(.users[0], .users[1])",
+            "del(.users[1], .users[0])",
+            "del(.users[0].id, .users[0].name)",
+            "del((.a, .b), .c)",
+            "del((.a, .b))",
+            "del(.id, .name, .score)",
+            "del(.a, .users[0].id)",
+            "del(.[2][0], .[2][1])",
         ];
         let declined = [
-            "del(.a, .b)",
+            "del(.a, .b?)",
+            "del(.a, .[])",
+            "del(.a, .[0:1])",
+            "del(.a, (.b | select(. == 1)))",
             "del(.a?)",
             "del(.[])",
             "del(.[1:])",
