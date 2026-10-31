@@ -42192,11 +42192,11 @@ fn test_jq_stream_flag_feeds_tostream_events_4397() -> Result<()> {
             "{input:?}"
         );
     }
-    // A document that fails to parse is reported after the events of the documents before it. (jq
-    // emits events as it parses, so it also prints `[[0],2]` for the failed `[2,`: recorded in
-    // limitations.md.)
+    // A document that fails to parse is reported after the events of the documents before it, and
+    // after the events jq's parser read of it before the fault: `[[0],2]` for the failed `[2,`
+    // (#5635).
     let (stdout, stderr, code) = run_jq_full(&["--stream", "-c", "."], Some("[1] [2,\n"))?;
-    assert_eq!(stdout, "[[0],1]\n[[0]]\n");
+    assert_eq!(stdout, "[[0],1]\n[[0]]\n[[0],2]\n");
     assert_eq!(code, 5, "{stderr}");
     Ok(())
 }
