@@ -4583,6 +4583,9 @@ pub(crate) fn silence_depth_guard_panic_line() {
 
 /// Run the jq command with the given arguments.
 /// Returns the exit code (0 for success, non-zero for various errors).
+///
+/// The caller must end the process on return: the named arguments (`--slurpfile`, `--argjson`)
+/// are not freed (#5673), so a second call in one process would leak them.
 pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     super::sigpipe::restore_default();
     silence_depth_guard_panic_line();
@@ -4621,6 +4624,9 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         }
         Err(BuildContextError::Other(e)) => return Err(e),
     };
+    // Not freed, see the doc comment: giving back a 100 MB `--slurpfile` (millions of small
+    // allocations) to a process about to end was a quarter of the run (#5673).
+    let context = std::mem::ManuallyDrop::new(context);
 
     // Get the filter expression. An unreadable `-f`/`--from-file` file is
     // jq's own usage error (exit 2), so it gets the same two-arm treatment
@@ -4754,11 +4760,12 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // Build the $ARGS special variable
     let args_value = build_args_var(&context);
 
-    // Substitute variables from context into the expression
-    // First substitute regular named variables, then add $ARGS
-    let mut all_vars: Vec<(&str, &OwnedValue)> =
-        context.named.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    all_vars.push(("ARGS", &args_value));
+    // Substitute variables from context into the expression. `$ARGS` goes first: each variable is
+    // substituted in a pass over the whole expression, and a container named argument becomes a
+    // literal tree as large as the value, so a variable substituted after one walks all of it
+    // (#5673). `$ARGS` is substituted for every run, whether or not the program mentions it.
+    let mut all_vars: Vec<(&str, &OwnedValue)> = vec![("ARGS", &args_value)];
+    all_vars.extend(context.named.iter().map(|(k, v)| (k.as_str(), v)));
 
     let mut expr = jq::substitute_vars(&expr, all_vars);
 
