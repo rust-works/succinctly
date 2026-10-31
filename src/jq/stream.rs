@@ -327,14 +327,11 @@ pub(crate) fn push_real_output_finite_literal(out: &mut String, literal: &str) {
 /// (`100000000000000000000.0`) by its JSON encoder, which is the spelling the
 /// bare `Float` printed before the digits were kept.
 pub(crate) fn yq_json_finite_literal(raw: &[u8]) -> String {
-    match core::str::from_utf8(raw) {
-        Ok(literal) => {
-            let mut out = String::new();
-            push_yq_json_finite_literal(&mut out, literal);
-            out
-        }
-        Err(_) => real_output_finite_literal(raw),
-    }
+    // Lossy, as `real_output_finite_literal` is: a replacement character is no digit, so text
+    // that was not UTF-8 is never respelled and is echoed as that function echoes it.
+    let mut out = String::new();
+    push_yq_json_finite_literal(&mut out, &String::from_utf8_lossy(raw));
+    out
 }
 
 /// [`yq_json_finite_literal`], appended to `out`, and the one definition of its rule (#5594):

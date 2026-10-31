@@ -51058,15 +51058,10 @@ mod tests {
             let owned = to_owned_cursor::<S, _>(&root).unwrap();
             // The sizing changes no member, only the room.
             assert_eq!(owned.to_json(), json);
-            let OwnedValue::Array(items) = &owned else {
-                panic!("expected an array, got {owned:?}");
-            };
+            let items = owned.as_array().expect("an array");
             items
                 .iter()
-                .map(|item| match item {
-                    OwnedValue::Object(map) => map.capacity(),
-                    other => panic!("expected an object, got {other:?}"),
-                })
+                .map(|item| item.as_object().expect("an object").capacity())
                 .collect()
         }
         let wide = format!(
