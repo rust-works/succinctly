@@ -210,3 +210,8 @@ shtest-comment	program	["-n", "123 # comment"]	-
 shtest-comment-cr	program	["-n", "1 # foo\r + 2"]	-
 shtest-cve-2023-50268-nan-payload	numbers	["1 != ."]	"Nan4000\n"
 shtest-cve-2023-50246-tiny-exponent	numbers	["."]	"-10E-1000000001\n"
+seq-n-inputs-no-rs	input	["-cn", "--seq", "[inputs]"]	"1\n"
+seq-n-input-no-rs	input	["-cn", "--seq", "input"]	"1\n"
+seq-n-inputs-no-rs-no-newline	input	["-cn", "--seq", "[inputs]"]	"1"
+seq-n-inputs-no-rs-empty	input	["-cn", "--seq", "[inputs]"]	""
+seq-n-inputs-rs-led	input	["-cn", "--seq", "[inputs]"]	"\u001e1\n"

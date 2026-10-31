@@ -9068,6 +9068,11 @@ $ printf '1 2' | jq --seq -c '.'                  # jq:          jq: ignoring pa
 $ printf '1 2' | succinctly jq --seq -c '.'       # succinctly:  same (#1525)
 ```
 
+Under `-n`, `input` and `inputs` raise that abandonment as an error instead of warning, as jq does (exit 5, `jq: error (at <file>:N): Unfinished abandoned text at EOF at line L, column C`, `N` being the newlines in the last source).
+`try input catch .` catches it and `first(inputs)` raises it, so a program that never reads is unaffected.
+Pinned by `tests/jq_cli/i5636.rs`, whose rows were captured from jq 1.7.1 ([#5636](https://github.com/rust-works/succinctly/issues/5636)).
+Still different, and tracked with the same reader: under `-n` the reader's *other* parse errors are not raised by `input`/`inputs` at all (an RS-led record that is cut off, a stream that starts with a BOM, a number at EOF without its RS), where jq raises them and exits 5; and `-n -s` delivers the slurped array before the abandonment error where jq raises the error in its place.
+
 **The messages are not a property of the record; they are a property of where jq's reader
 gave up.** Four earlier attempts looked for a table mapping "what is wrong with this record"
 onto jq's wording and correctly concluded that no such table exists — the *same* malformed

@@ -148,12 +148,6 @@ category = "newer-than-primary"
 reason = "`@urid` is new in jq 1.8, which decodes it; jq 1.7.1 answers `urid is not a valid format` (exit 5). succinctly follows the 1.8 behaviour for this format, documented in CLAUDE.md's format table."
 
 [[divergence]]
-id = "cli:shtest-seq-inputs-eof"
-category = "to-triage"
-issue = "#5636"
-reason = "`printf '1\\n' | jq -cen --seq '[inputs] == []'`: jq raises `Unfinished abandoned text at EOF` (exit 5); succinctly answers `true` (exit 0)."
-
-[[divergence]]
 id = "robust:mem-limit-64m-identity"
 platform = "linux"
 category = "reference-crash"
