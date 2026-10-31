@@ -192,6 +192,10 @@ fn test_the_stage_after_a_built_container_matches_jq_5652() -> Result<()> {
 
 /// A container holding a NaN is the same storage wherever it is read: `[nan] | . == .` is `true`.
 #[test]
+#[cfg_attr(
+    feature = "unshared-containers",
+    ignore = "holdout has no node identity or sharing (#5254)"
+)]
 fn test_a_built_container_keeps_its_identity_5652() -> Result<()> {
     for (program, expected) in [
         (r"[nan] as $n | {a: $n} | .a == .a", r"true"),

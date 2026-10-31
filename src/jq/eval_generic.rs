@@ -42394,8 +42394,10 @@ mod tests {
         for _ in 0..crate::jq::value::MAX_VALUE_TREE_DEPTH {
             deep = OwnedValue::array_from(vec![deep]);
         }
+        // `[.[]]`, not `.`: since #5652 the owned fast path answers `.`, `type` and the other
+        // reads of a built container itself, so they never reach the bridge's depth check.
         let result = eval_on_owned::<JqSemantics, crate::json::light::StandardJson<'_, Vec<u64>>>(
-            &Expr::Identity,
+            &crate::jq::parse("[.[]]").unwrap(),
             deep,
             false,
             Reentry::REBUILT,
@@ -42432,9 +42434,10 @@ mod tests {
                 other => panic!("{src}: expected the closed stage's value, got: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#4053)"
             }
         }
-        // A stage that reads `.` still goes through the bridge and its error.
+        // A stage that reads `.` and is outside the owned fast path's grammar (`type` is inside
+        // it since #5652) still goes through the bridge and its error.
         let result = eval_on_owned::<JqSemantics, crate::json::light::StandardJson<'_, Vec<u64>>>(
-            &crate::jq::parse("type").unwrap(),
+            &crate::jq::parse("[.[]]").unwrap(),
             deep,
             false,
             Reentry::REBUILT,
