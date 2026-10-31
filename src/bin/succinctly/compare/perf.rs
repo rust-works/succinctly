@@ -102,6 +102,12 @@ pub fn parse_queries(text: &str) -> Result<Vec<PerfQuery>> {
                 n + 1
             );
         }
+        if flags.contains(&INPUT_FLAG) && flags.iter().any(|f| f.starts_with(FILES_FLAG_PREFIX)) {
+            bail!(
+                "perf query line {}: `{INPUT_FLAG}` names the file once, so `{FILES_FLAG_PREFIX}N` has nothing to repeat",
+                n + 1
+            );
+        }
         out.push(PerfQuery {
             id: c[0].into(),
             flags: if c[1] == "-" {
@@ -619,6 +625,7 @@ mod tests {
         assert!(parse_queries("a\t@files=17\t.\tusers\t1mb\n").is_err());
         assert!(parse_queries("a\t@files=x\t.\tusers\t1mb\n").is_err());
         assert!(parse_queries("a\t@files=16\t.\tusers\t1mb\n").is_ok());
+        assert!(parse_queries("a\t-n @INPUT@ @files=2\t.\tusers\t1mb\n").is_err());
     }
 
     #[test]

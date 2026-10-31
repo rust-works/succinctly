@@ -1897,14 +1897,8 @@ fn run_main() -> Result<()> {
         Command::Json(json_cmd) => match json_cmd.command {
             JsonSubcommand::Generate(args) => {
                 let pattern: generators::Pattern = args.pattern.into();
-                let per_line = matches!(
-                    pattern,
-                    generators::Pattern::Ndjson | generators::Pattern::JsonSeq
-                );
-                if per_line && args.pretty {
-                    anyhow::bail!(
-                        "--pretty needs a single document; the ndjson and json-seq patterns have one per line"
-                    );
+                if pattern.is_line_delimited() && args.pretty {
+                    anyhow::bail!("--pretty needs a single document; the ndjson and json-seq patterns have one per line");
                 }
                 let json = generate_json(
                     args.size,
@@ -1915,7 +1909,7 @@ fn run_main() -> Result<()> {
                 );
 
                 let verified_parse = if args.verify {
-                    let parsed = validate_generated_json(&json, args.pretty, per_line)
+                    let parsed = validate_generated_json(&json, args.pretty, pattern)
                         .context("Generated invalid JSON")?;
                     eprintln!("✓ JSON validated successfully");
                     parsed
@@ -2499,16 +2493,23 @@ const SUITE_SIZES: &[(&str, usize)] = &[
 /// re-parse the same string to pretty-print it, so `keep_parsed` lets that one caller
 /// reuse this validation pass's own parse instead of paying for a second one.
 ///
-/// `per_line` is for newline-delimited output (the `ndjson` and `json-seq` patterns): every line is one
-/// document (after an RS byte), and there is no single value to keep.
+/// A line-delimited `pattern` (`ndjson`, `json-seq`) is checked line by line, and there is no
+/// single value to keep: every `json-seq` line must open with the RS byte (0x1e) and no
+/// `ndjson` line may.
 fn validate_generated_json(
     json: &str,
     keep_parsed: bool,
-    per_line: bool,
+    pattern: generators::Pattern,
 ) -> Result<Option<serde_json::Value>> {
-    if per_line {
+    if pattern.is_line_delimited() {
+        let framed = matches!(pattern, generators::Pattern::JsonSeq);
         for (n, line) in json.lines().enumerate() {
-            serde_json::from_str::<serde_json::Value>(line.trim_start_matches('\u{1e}'))
+            let record = match (framed, line.strip_prefix('\u{1e}')) {
+                (true, Some(rest)) => rest,
+                (true, None) => anyhow::bail!("line {}: no RS byte", n + 1),
+                (false, _) => line,
+            };
+            serde_json::from_str::<serde_json::Value>(record)
                 .with_context(|| format!("line {}", n + 1))?;
         }
         return Ok(None);
@@ -2564,7 +2565,7 @@ fn generate_json_suite(args: GenerateSuite) -> Result<()> {
             let json = generate_json(*size, *pattern, Some(seed), 5, 0.1);
 
             if args.verify {
-                validate_generated_json(&json, false, false)
+                validate_generated_json(&json, false, *pattern)
                     .with_context(|| format!("Generated invalid JSON for {}", path.display()))?;
             }
 
@@ -3237,10 +3238,23 @@ mod tests {
 
     #[test]
     fn test_validate_generated_json_per_line_checks_every_record() {
-        let ok = "\u{1e}{\"a\":1}\n{\"a\":2}\n";
-        assert!(validate_generated_json(ok, false, true).unwrap().is_none());
-        assert!(validate_generated_json(ok, false, false).is_err());
-        let err = validate_generated_json("{\"a\":1}\n{\"a\":\n", false, true).unwrap_err();
+        use generators::Pattern;
+        let plain = "{\"a\":1}\n{\"a\":2}\n";
+        let framed = "\u{1e}{\"a\":1}\n\u{1e}{\"a\":2}\n";
+        assert!(validate_generated_json(plain, false, Pattern::Ndjson)
+            .unwrap()
+            .is_none());
+        assert!(validate_generated_json(framed, false, Pattern::JsonSeq)
+            .unwrap()
+            .is_none());
+        // The format is part of the check: RS belongs to json-seq and only to it.
+        assert!(validate_generated_json(framed, false, Pattern::Ndjson).is_err());
+        let err = validate_generated_json(plain, false, Pattern::JsonSeq).unwrap_err();
+        assert!(format!("{err:#}").contains("line 1: no RS byte"), "{err:#}");
+        // A single-document pattern is still parsed whole.
+        assert!(validate_generated_json(plain, false, Pattern::Users).is_err());
+        let err =
+            validate_generated_json("{\"a\":1}\n{\"a\":\n", false, Pattern::Ndjson).unwrap_err();
         assert!(format!("{err:#}").contains("line 2"), "{err:#}");
     }
 

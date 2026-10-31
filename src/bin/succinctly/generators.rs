@@ -22,6 +22,14 @@ pub enum Pattern {
     JsonSeq,
 }
 
+impl Pattern {
+    /// One document per line (`ndjson`, `json-seq`), not a single document: `--verify` checks
+    /// each line, and there is nothing to pretty-print.
+    pub fn is_line_delimited(self) -> bool {
+        matches!(self, Self::Ndjson | Self::JsonSeq)
+    }
+}
+
 /// Generate JSON of approximately target_size bytes
 pub fn generate_json(
     target_size: usize,
@@ -1042,6 +1050,14 @@ mod tests {
         let plain = generate_json(4096, Pattern::Ndjson, Some(42), 5, 0.1);
         assert!(seq.lines().all(|l| l.starts_with('\u{1e}')));
         assert_eq!(seq.replace('\u{1e}', ""), plain);
+    }
+
+    #[test]
+    fn test_only_the_ndjson_patterns_are_line_delimited() {
+        assert!(Pattern::Ndjson.is_line_delimited());
+        assert!(Pattern::JsonSeq.is_line_delimited());
+        assert!(!Pattern::Users.is_line_delimited());
+        assert!(!Pattern::Pretty.is_line_delimited());
     }
 
     #[test]
