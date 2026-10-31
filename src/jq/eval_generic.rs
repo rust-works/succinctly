@@ -5088,7 +5088,14 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     //   A condition outside the pure grammar, or `optional`, bridges as before, which is also where
     //   an error keeps the evaluator's wording.
     let plain = is_computed_plain_number::<S>(&owned);
-    if plain {
+    // #5652: and over an array or object, which the filter built or `fromjson` parsed. The same
+    // stages need nothing from the document there either, and a verdict carries no node. Not with
+    // the embed table active: the container may then be a bound node's own value.
+    let container = !plain
+        && S::TAG == EvalTag::Jq
+        && matches!(owned, OwnedValue::Array(_) | OwnedValue::Object(_))
+        && !embed_table_active();
+    if plain || container {
         match strip_parens(expr) {
             Expr::Builtin(Builtin::ToJson) => {
                 return GenericResult::Owned(tostring_owned::<S>(owned));
@@ -5127,8 +5134,19 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
             // entries of an object before a later one declines, is paid for again by the bridge
             // (measured without it: +8.5% instructions on `$x | [$x, .] | length`, +6-11% on
             // `{a: ., b: (. | tojson | length)}`).
+            // `has` and `keys` of a container are a boolean and a fresh array of its keys (#5652).
+            Expr::Builtin(Builtin::Has(_) | Builtin::Keys) if container => {
+                if let Some(answer) =
+                    crate::jq::eval::owned_container_key_builtin::<S>(strip_parens(expr), &owned)
+                {
+                    return GenericResult::Owned(answer);
+                }
+            }
             Expr::Array(_) | Expr::Object(_) | Expr::As { .. }
-                if !optional && plain_shape_may_be_answered(expr) && !embed_table_active() =>
+                if plain
+                    && !optional
+                    && plain_shape_may_be_answered(expr)
+                    && !embed_table_active() =>
             {
                 if let Some(value) = plain_number_answer::<S>(strip_parens(expr), &owned) {
                     return GenericResult::Owned(value);
@@ -5246,7 +5264,7 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     // walk per value and then bridge anyway, 1-6% slower than not trying (measured).
     if !embed_table_active()
         && ((!S::REINDEX_BRIDGE_KEEPS_IDENTITY && dom_roots::active())
-            || (plain && owned_fast_path_may_answer(expr)))
+            || ((plain || container) && owned_fast_path_may_answer(expr)))
     {
         if let Some(result) = crate::jq::eval::eval_owned_fast_path::<S>(expr, &owned, optional) {
             // No `Err(_) if optional` arm, unlike the route above: the fast
@@ -41766,6 +41784,48 @@ mod tests {
         ] {
             assert!(!answered(filter).1, "{filter} admitted");
         }
+    }
+
+    /// #5652: the stage after an array or object the filter built (or `fromjson` parsed) reads it
+    /// from the owned tree: `reindex_count` counts every serialize-and-index. The pin must be able
+    /// to fail: it does, with the container branch of the fast-path gate removed, with the
+    /// `container` arm of the verdict block removed and with the `has`/`keys` arm removed.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_stage_after_a_built_container_is_not_bridged_5652() {
+        use crate::jq::value::reindex_count;
+
+        let reindexes = |filter: &str| {
+            let json = b"[1,50,3]";
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::get();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            assert_eq!(result.len(), 1, "{filter}");
+            reindex_count::get() - before
+        };
+        for filter in [
+            "[.[] | {a: .} | .a]",
+            "[.[] | {a: ., b: .} | .b]",
+            "[.[] | [., .] | .[0]]",
+            "[.[] | [., .] | .[1] > 2]",
+            "[.[] | {a: .} | select(.a > 1)]",
+            "[.[] | {a: .} | if .a > 1 then .a else empty end]",
+            "[.[] | {a: .} | has(\"a\")]",
+            "[.[] | {a: .} | keys]",
+            "[.[] | [., .] | has(1)]",
+            "[.[] | {a: .} | tojson]",
+        ] {
+            assert_eq!(reindexes(filter), 0, "{filter} bridged");
+        }
+        // A condition outside the pure grammar, a name outside the fast path's grammar and the
+        // document-sourced value keep the bridge.
+        assert!(reindexes("[.[] | {a: .} | select(.a > 1, .a < 0)]") > 0);
+        assert!(reindexes("[.[] | {a: .} | .[]]") > 0);
+        assert!(reindexes("[.[] | {a: .} | .a?]") > 0);
+        assert!(reindexes("[.[] | {a: .} | .a + 1]") > 0);
     }
 
     /// #3639: a `label` met at a position with no prefetch hook (the absent-
