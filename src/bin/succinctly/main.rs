@@ -1731,6 +1731,57 @@ fn require_popcnt() {
     }
 }
 
+/// The least stack the evaluation thread settles for when the address space is capped (#5634).
+///
+/// Half of it is the native-stack floor's reach (ADR-0025): 8 MiB still holds the walks the floor
+/// does not charge for, a built value at `MAX_VALUE_TREE_DEPTH` and a native `recurse`'s own
+/// 512 KiB budget, with room to spare.
+const MIN_EVAL_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+const _: () = assert!(EVAL_STACK_SIZE >= MIN_EVAL_STACK_SIZE);
+
+/// The stack sizes [`spawn_eval_thread`] tries, largest first: `max`, then each half of the last,
+/// down to `min`.
+fn eval_stack_sizes(max: usize, min: usize) -> impl Iterator<Item = usize> {
+    std::iter::successors(Some(max), |size| Some(size / 2)).take_while(move |size| *size >= min)
+}
+
+/// The stack to try first under a cap of `cap` bytes of address space: a quarter of it, so the
+/// document and its index keep the rest, within [`MIN_EVAL_STACK_SIZE`] and `max`. No cap is `max`.
+fn eval_stack_start(max: usize, cap: Option<usize>) -> usize {
+    match cap {
+        Some(cap) => (cap / 4).clamp(MIN_EVAL_STACK_SIZE.min(max), max),
+        None => max,
+    }
+}
+
+/// Spawn the evaluation thread on [`EVAL_STACK_SIZE`], or on a smaller stack when the address
+/// space is capped (#5634).
+///
+/// The stack is address space, not memory, but `ulimit -v` (`RLIMIT_AS`) counts it: under a cap
+/// below the stack size `pthread_create` fails `EAGAIN`, and every run died with `failed to spawn
+/// the evaluation thread` however small its input -- where jq reads the same document in the same
+/// cap. A cap also has to hold the document, so the stack starts at a quarter of it
+/// ([`eval_stack_start`]) and halves from there if the thread still cannot be mapped. Each size
+/// registers its own native-stack floor (ADR-0025), which sits at half of what the thread really
+/// has, so a smaller stack moves where deep recursion is refused, in proportion, and never to an
+/// overflow.
+fn spawn_eval_thread() -> Result<std::thread::JoinHandle<Result<()>>> {
+    let mut last_error = None;
+    let start = eval_stack_start(EVAL_STACK_SIZE, address_space::cap());
+    for size in eval_stack_sizes(start, MIN_EVAL_STACK_SIZE) {
+        let spawned = std::thread::Builder::new()
+            .stack_size(size)
+            .spawn(move || succinctly::jq::with_stack_budget(size, run_main));
+        match spawned {
+            Ok(child) => return Ok(child),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Err(last_error.expect("at least one stack size is tried"))
+        .context("failed to spawn the evaluation thread")
+}
+
 fn main() -> Result<()> {
     #[cfg(all(target_arch = "x86_64", target_feature = "popcnt"))]
     require_popcnt();
@@ -1743,10 +1794,7 @@ fn main() -> Result<()> {
     // recursion of any shape refuses once it has spent half of it instead of
     // overflowing -- registered first thing, where the stack still available
     // and the thread's size agree.
-    let child = std::thread::Builder::new()
-        .stack_size(EVAL_STACK_SIZE)
-        .spawn(|| succinctly::jq::with_stack_budget(EVAL_STACK_SIZE, run_main))
-        .context("failed to spawn the evaluation thread")?;
+    let child = spawn_eval_thread()?;
     match child.join() {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
@@ -2842,6 +2890,7 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
+mod address_space;
 #[cfg(feature = "bench-runner")]
 mod bench_runner;
 #[cfg(feature = "bench-runner")]
@@ -2880,6 +2929,45 @@ use generators::generate_json;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5634: the evaluation thread tries its full stack first, then each half down to the floor,
+    /// and never a size below it.
+    #[test]
+    fn test_eval_stack_sizes_halve_from_the_full_stack_to_the_floor_5634() {
+        const MIB: usize = 1024 * 1024;
+        assert_eq!(
+            eval_stack_sizes(256 * MIB, MIN_EVAL_STACK_SIZE).collect::<Vec<_>>(),
+            [256 * MIB, 128 * MIB, 64 * MIB, 32 * MIB, 16 * MIB]
+        );
+        // Not a power-of-two multiple of the floor: the last size is the last one at or above it.
+        assert_eq!(
+            eval_stack_sizes(100 * MIB, 16 * MIB).collect::<Vec<_>>(),
+            [100 * MIB, 50 * MIB, 25 * MIB]
+        );
+        // The full stack alone when the floor is above it.
+        assert_eq!(eval_stack_sizes(8 * MIB, 16 * MIB).count(), 0);
+    }
+
+    /// #5634: a capped address space starts the stack at a quarter of the cap, never above the
+    /// full stack nor below the floor; an uncapped one starts at the full stack.
+    #[test]
+    fn test_eval_stack_start_follows_the_address_space_cap_5634() {
+        const MIB: usize = 1024 * 1024;
+        let max = 256 * MIB;
+        assert_eq!(eval_stack_start(max, None), max);
+        assert_eq!(eval_stack_start(max, Some(4096 * MIB)), max);
+        assert_eq!(eval_stack_start(max, Some(512 * MIB)), 128 * MIB);
+        assert_eq!(eval_stack_start(max, Some(64 * MIB)), MIN_EVAL_STACK_SIZE);
+        assert_eq!(eval_stack_start(max, Some(MIB)), MIN_EVAL_STACK_SIZE);
+        // A full stack already below the floor is never raised above itself.
+        assert_eq!(eval_stack_start(8 * MIB, Some(MIB)), 8 * MIB);
+    }
+
+    /// The cap the test process itself runs under is read without failing.
+    #[test]
+    fn test_address_space_cap_reads_the_process_limit_5634() {
+        let _ = address_space::cap();
+    }
 
     /// Guardrail for #1150: every `JqCommand`/`YqCommand` flag that can
     /// take more than one value per occurrence (`--arg NAME VALUE`-style

@@ -151,13 +151,13 @@ reason = "`@urid` is new in jq 1.8, which decodes it; jq 1.7.1 answers `urid is 
 id = "robust:mem-limit-64m-identity"
 platform = "linux"
 category = "reference-crash"
-reason = "Under `ulimit -v` 64 MiB, 1M-integer array: the reference jq 1.7.1 aborts; succinctly reports a graceful error (exit 1)."
+reason = "Under `ulimit -v` 64 MiB, 1M-integer array: the reference jq 1.7.1 aborts; succinctly answers, on an evaluation stack sized to the cap (#5634)."
 
 [[divergence]]
 id = "robust:mem-limit-64m-wide"
 platform = "linux"
 category = "reference-crash"
-reason = "Under `ulimit -v` 64 MiB, 300000-key object: the reference jq 1.7.1 aborts; succinctly reports a graceful error (exit 1)."
+reason = "Under `ulimit -v` 64 MiB, 300000-key object: the reference jq 1.7.1 aborts; succinctly answers, on an evaluation stack sized to the cap (#5634)."
 
 [[divergence]]
 id = "robust:mem-limit-string-bomb"
@@ -166,22 +166,15 @@ category = "reference-crash"
 reason = "`\"a\" * 1e9` under `ulimit -v` 512 MiB: jq 1.7.1 aborts; succinctly exits 5 with a graceful error."
 
 [[divergence]]
-id = "robust:mem-limit-256m-identity"
-platform = "linux"
-category = "to-triage"
-issue = "#5634"
-reason = "Under `ulimit -v` 256 MiB a 1M-integer array is read by jq but refused by succinctly with an error (exit 1): it needs more address space. Seen on GitHub-hosted x86_64 Linux in #5623; stderr not yet captured, so the failing allocation is unknown."
-
-[[divergence]]
 id = "robust:mem-limit-64m-string"
 platform = "linux"
-category = "to-triage"
+category = "by-design"
 issue = "#5634"
-reason = "Under `ulimit -v` 64 MiB a 20 MB string is read by jq but refused by succinctly with an error (exit 1). Same run and open question as mem-limit-256m-identity."
+reason = "Under `ulimit -v` 64 MiB a 20 MB string is read by jq but aborts succinctly on a failed allocation: it holds the input, its semi-index and an evaluation stack (16 MiB at the least), which took between 64 and 70 MiB of address space on Linux aarch64. The stack no longer fails the spawn under a cap (#5634); the document is what does not fit."
 
 [[divergence]]
 id = "robust:mem-limit-alloc-bomb"
 platform = "linux"
-category = "to-triage"
+category = "by-design"
 issue = "#5634"
-reason = "`[range(1e8)] | length` under `ulimit -v` 512 MiB: jq 1.7.1 and succinctly both abort (killed by a signal, no exit status), so the output matches but the subject crashes where a graceful out-of-memory error would be expected. Seen on GitHub-hosted x86_64 Linux in #5623; stderr not yet captured."
+reason = "`[range(1e8)] | length` under `ulimit -v` 512 MiB: jq 1.7.1 and succinctly both abort (killed by a signal, no exit status). Rust ends the process on a failed allocation (`memory allocation of N bytes failed`) where jq's `jv_mem_alloc` prints `cannot allocate memory` and aborts, so the output matches; a graceful error would need every container growth to be fallible."
