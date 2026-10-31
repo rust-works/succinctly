@@ -115036,7 +115036,7 @@ mod tests {
                 Demand::Continue
             },
         );
-        assert!(out.is_empty());
+        assert_eq!(out.len(), 0, "nothing is emitted before the error");
         assert!(
             matches!(&flow, Flow::Escaped(Control::Error(e)) if e.to_string().contains("Cannot index number")),
             "the rest of the pipe raises"
