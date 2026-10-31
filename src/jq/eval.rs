@@ -12349,6 +12349,25 @@ fn projection_peel<S: EvalSemantics>(
             child
         }
     };
+    // #5663: the stages after this one that are plain field or index reads are stepped here too,
+    // not by a re-entry each. A re-entry builds the owned pipe of its rest (`RestPipe`) and holds it
+    // while the next re-entry runs, so a chain of `n` reads held `n` rests of `n` stages at its
+    // deepest: `.a.a.a…` of 5,000 steps took 1.4 GB. The last stage is left to the lone-stage route,
+    // and a step that does not answer a value ends the walk with the rest as it stands, which is the
+    // re-entry this replaces: `rest` needs no path context (asked above), so none of the doors a
+    // re-entry offers it first could tell the two apart.
+    let mut child = child;
+    let mut rest = rest;
+    while let [next, tail @ ..] = skip_identity_stages(rest) {
+        if tail.is_empty() || !matches!(next, Expr::Field(_) | Expr::Index { .. }) {
+            break;
+        }
+        let Some(Ok(Some(stepped))) = eval_owned_navigation::<S>(next, &child, optional) else {
+            break;
+        };
+        child = stepped;
+        rest = tail;
+    }
     Some(RestPipe::new(rest).run_owned::<S>(&child, optional, Reentry::REBUILT, sink))
 }
 
@@ -114960,6 +114979,49 @@ mod tests {
             copies: owned_pipe_copies::get() - before,
             kept,
         }
+    }
+
+    /// #5663: a chain of field or index reads over an owned value is stepped without a re-entry
+    /// per stage, so it builds a constant number of owned rests however long it is. Each re-entry
+    /// built the owned pipe of what was left and held it while the next ran: `n` stages held `n`
+    /// pipes of up to `n` stages, quadratic in memory (a 5,000-step `.a.a.a…` took 1.4 GB).
+    #[test]
+    fn test_a_chain_of_reads_over_an_owned_value_builds_no_rest_per_stage_5663() {
+        fn copies(program: &str, input: &OwnedValue) -> (usize, Vec<String>) {
+            let expr = parse(program).unwrap();
+            let mut out = Vec::new();
+            let before = owned_pipe_copies::get();
+            let flow =
+                eval_each_owned::<JqSemantics>(&expr, input, false, Reentry::REBUILT, &mut |v| {
+                    out.push(v.to_json());
+                    Demand::Continue
+                });
+            assert!(matches!(flow, Flow::Exhausted), "{program:.20}");
+            (owned_pipe_copies::get() - before, out)
+        }
+        let object = OwnedValue::object_from([("a".to_string(), OwnedValue::Null)]);
+        let array = OwnedValue::array_from(vec![]);
+        let (short, out) = copies(&".a".repeat(20), &object);
+        assert_eq!(out, ["null"]);
+        let (long, out) = copies(&".a".repeat(200), &object);
+        assert_eq!(out, ["null"]);
+        assert_eq!(short, long, "copies grow with the chain");
+        assert!(long <= 2, "{long} copies");
+        let (long, out) = copies(&".[0]".repeat(200), &array);
+        assert_eq!(out, ["null"]);
+        assert!(long <= 2, "{long} copies over indexes");
+        // A mixed chain, and one that ends in something that is not a read: the walk stops at it
+        // and the rest runs as before.
+        let nested = OwnedValue::object_from([(
+            "a".to_string(),
+            OwnedValue::array_from(vec![OwnedValue::object_from([(
+                "b".to_string(),
+                OwnedValue::Int(7),
+            )])]),
+        )]);
+        assert_eq!(copies(".a[0].b", &nested).1, ["7"]);
+        assert_eq!(copies(".a[0].b | . + 1", &nested).1, ["8"]);
+        assert_eq!(copies(".a[0].b | tostring | length", &nested).1, ["1"]);
     }
 
     /// A parenthesized pipe of `stages` stages that computes a value at each
