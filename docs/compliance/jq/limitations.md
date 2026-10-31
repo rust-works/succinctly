@@ -13546,7 +13546,7 @@ It is pinned by `tests/jq_cli/i5474.rs` and was checked against `/usr/bin/jq` on
 One shape differs: `--seq` combines with `--stream-errors` in jq (`printf '[1,2' | jq --seq --stream-errors -c .` prints `["Unfinished abandoned text at EOF at line 1, column 4",[]]`), and here `--seq` wins and the flag is ignored, as it is for `--stream`.
 A document that fails to parse part-way has already emitted the events of what it finished in jq (`printf '[1,' | jq --stream -c .` prints `[[0],1]` and then the parse error).
 Since #5635 `succinctly jq --stream` prints them too, in front of the error, and they carry the line jq had read when it yielded each.
-The document is parsed whole first, so the events are not streamed: once that parse fails, the bytes from the malformed document on are read again with the port of jq's streaming parser that `--stream-errors` uses (`jq_stream_errors::events_before_fault`).
+The document is parsed whole first, so the events are not streamed: once that parse fails, the bytes from the malformed document through the end of the read that holds the fault are read again with the port of jq's streaming parser that `--stream-errors` uses (`jq_stream_errors::events_before_fault`).
 A program using `input`/`inputs` gets them ahead of each fault it resumes after, and one that never reads past them never meets the fault.
 The error text and position are the ones the whole-document parse gives (stderr is not compared).
 
