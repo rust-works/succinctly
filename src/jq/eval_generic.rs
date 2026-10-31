@@ -11355,6 +11355,44 @@ pub fn eval_each_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
     })
 }
 
+/// [`eval_each_with_cursor`] for an input that is already an owned value (#5681), without writing
+/// it out as text and indexing it first.
+///
+/// A `--stream` event is a `[path, leaf]` array built per leaf, which the cursor route serialised,
+/// indexed and read back to run a filter that looks at two of its fields. This hands the tree to the
+/// owned evaluator's own front doors, and re-indexes only for the stages they decline, which is
+/// what the input-queue bridge above already does with a document it owns.
+///
+/// Not a supported entry point.
+#[doc(hidden)]
+pub fn eval_each_owned_input(
+    expr: &Expr,
+    input: &OwnedValue,
+    on_value: &mut dyn FnMut(OwnedValue) -> bool,
+) -> Option<Control> {
+    with_anchor_scope::<JqSemantics, _>(expr, || {
+        match super::path_mode::route(expr) {
+            Route::Interpreter => {
+                return super::path_mode::run_program(expr, input.clone(), on_value);
+            }
+            Route::Refused(e) => return Some(Control::Error(e)),
+            Route::Shipped => {}
+        }
+        let mut sink = |v: OwnedValue| -> Demand {
+            if on_value(v) {
+                Demand::Continue
+            } else {
+                Demand::Stop
+            }
+        };
+        match eval_each_owned::<JqSemantics>(expr, input, false, Reentry::REBUILT, &mut sink) {
+            Flow::Exhausted => None,
+            Flow::Stopped { pending } => pending,
+            Flow::Escaped(c) => Some(c),
+        }
+    })
+}
+
 /// [`eval_each_with_cursor_using`] inside the anchor scope it opens (#3134).
 fn eval_each_with_cursor_unscoped<S: EvalSemantics, C: DocumentCursor>(
     expr: &Expr,
