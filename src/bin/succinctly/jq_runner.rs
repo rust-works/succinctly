@@ -8421,6 +8421,10 @@ fn parse_error_detection(bytes: &[u8], start: usize) -> usize {
                     jq::jq_depth_fault_offset(&bytes[start..]).map_or(at, |offset| start + offset)
                 }
                 Kind::UnclosedString | Kind::UnexpectedEof { .. } => bytes.len(),
+                Kind::UnexpectedCharacter {
+                    expected: "string key",
+                    ..
+                } => non_string_key_fault(bytes, at),
                 Kind::ControlCharacter { .. }
                 | Kind::InvalidEscape { .. }
                 | Kind::InvalidUnicodeEscape { .. }
@@ -8436,6 +8440,36 @@ fn parse_error_detection(bytes: &[u8], start: usize) -> usize {
         // starts.
         Ok(()) => start,
     }
+}
+
+/// The byte at which jq detects the fault of a number or literal standing where an object key
+/// belongs, `{1.5e3`, `{true` (#5645). jq's lexer takes the value without complaint, so the
+/// fault is met only at the token after it: its closing quote for a string, its delimiter for a
+/// number or literal, itself for a structural byte, the end of input when there is none. The
+/// reads between the value and that token are one run of bytes to jq, which is why the read it
+/// resumes at is the one holding the next token, not the one holding the value. A malformed
+/// token (`{x`, `{1x`) is met at its own end.
+///
+/// A container in the same place (`{[1]`) is met at its bracket by `--stream`'s parser and at
+/// the next token by the other reader, so it keeps the bracket here, which is the `--stream`
+/// answer; the other reader's is a recorded gap (docs/compliance/jq/limitations.md).
+fn non_string_key_fault(bytes: &[u8], at: usize) -> usize {
+    use succinctly::json::validate::validate_jq_lenient;
+    // A bracket, the trailing comma's `}`, a stray `:` or `]`, a string: met at the byte itself.
+    // (`map_or(true, ..)`, not `is_none_or`: the crate's MSRV is 1.73.)
+    if bytes.get(at).map_or(true, |&b| is_jq_token_boundary(b)) {
+        return at;
+    }
+    let end = token_end(bytes, at);
+    if validate_jq_lenient(&bytes[at..end]).is_err() {
+        return end;
+    }
+    let next = end
+        + bytes[end..]
+            .iter()
+            .take_while(|&&b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+            .count();
+    token_end(bytes, next)
 }
 
 /// The first fault in `tail` once the invalid UTF-8 bytes in its strings are substituted, as
@@ -14639,6 +14673,34 @@ mod tests {
             panic!("a fault is expected");
         };
         assert_eq!(error.position.offset, 3);
+    }
+
+    /// #5645: a number or literal in key position is met at the token after it, not at its own end.
+    #[test]
+    fn parse_error_detection_meets_a_non_string_key_at_the_next_token_5645() {
+        // (document, the byte the fault is met at)
+        for (bytes, at) in [
+            // A string: its closing quote.
+            (&b"{1\n\"k\":2}"[..], 5),
+            // A number or literal: the delimiter that ends it, across any whitespace.
+            (b"{1 \t\r\n 2 3", 8),
+            (b"{\"a\":1,true\nnull\n", 16),
+            // A structural byte: itself.
+            (b"{1\n:2}", 3),
+            (b"{1 ,", 3),
+            (b"{1\n}", 3),
+            // Nothing after it: the end of input.
+            (b"{1", 2),
+            (b"{1 \n", 4),
+            // A malformed token is met at its own end, a bracket or a stray byte at itself.
+            (b"{x\n2", 2),
+            (b"{1x\n2", 3),
+            (b"{[1]\n2", 1),
+            (b"{\"a\":1,}", 7),
+            (b"{:1}", 1),
+        ] {
+            assert_eq!(parse_error_detection(bytes, 0), at, "{bytes:?}");
+        }
     }
 
     /// #4335: an invalid UTF-8 byte inside a string is not a refusal, as jq substitutes U+FFFD for
