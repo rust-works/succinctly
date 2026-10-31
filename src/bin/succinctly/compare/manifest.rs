@@ -49,6 +49,10 @@ pub struct Suite {
     pub id: String,
     pub path: String,
     pub sha256: String,
+    /// Id of the reference this suite runs against; absent means the primary. A suite run
+    /// against the secondary stays out of the primary columns and the ledger (#5622).
+    #[serde(default)]
+    pub reference: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -172,7 +176,29 @@ mod pin_tests {
             id: "x".into(),
             path: "comparison/jq/manifest.toml".into(),
             sha256: "0".repeat(64),
+            reference: None,
         };
         assert!(Manifest::read_pinned(root, &s).is_err());
+    }
+
+    /// A suite names the secondary reference it runs against or none (#5622): a typo or the
+    /// primary's id would otherwise drop the suite from both columns without a word.
+    #[test]
+    fn a_suite_reference_names_the_secondary_reference() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (m, _) = Manifest::load(root).unwrap();
+        let secondary: Vec<_> = m.suites.iter().filter(|s| s.reference.is_some()).collect();
+        assert!(secondary.len() >= 7, "{}", secondary.len());
+        for s in &secondary {
+            let id = s.reference.as_deref().unwrap();
+            assert!(
+                m.references
+                    .iter()
+                    .any(|r| r.id == id && r.role == "secondary"),
+                "{} names {id}",
+                s.id
+            );
+        }
+        assert!(m.suites.iter().any(|s| s.reference.is_none()));
     }
 }

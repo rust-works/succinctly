@@ -77,6 +77,53 @@ id = "upstream-manonig.test"
 path = "comparison/jq/vendor/jq-1.7.1/manonig.test"
 sha256 = "d68810e7a2877e0ff04b7a2f6fde731ccd7d1348e1973582e6004eb06e6fb9b6"
 
+# jq 1.8.1's own test files, vendored from its source tarball (sha256-pinned above) and run against
+# the secondary reference alone (#5622). `succinctly jq` follows 1.7.1, so a disagreement here marks
+# a place where 1.8 changed, not necessarily a bug: these are reported apart from the 1.7.1 columns
+# and are never ledger entries.
+
+[[suite]]
+id = "upstream-1.8.1-jq.test"
+path = "comparison/jq/vendor/jq-1.8.1/jq.test"
+sha256 = "f182d4c772688fd7fabceb3b3338ad48427f072c1dae9622d9177cb031c16d41"
+reference = "jq-1.8.1"
+
+[[suite]]
+id = "upstream-1.8.1-onig.test"
+path = "comparison/jq/vendor/jq-1.8.1/onig.test"
+sha256 = "e82dab356709d4a5e4dfd8c71aced12ed1f42eb23208bac0eaf5e3f05bedef05"
+reference = "jq-1.8.1"
+
+[[suite]]
+id = "upstream-1.8.1-man.test"
+path = "comparison/jq/vendor/jq-1.8.1/man.test"
+sha256 = "3c25698e94d5199c75b784cc361cda9c6775389eb61f8f4fb05fde1a757ae3f9"
+reference = "jq-1.8.1"
+
+[[suite]]
+id = "upstream-1.8.1-optional.test"
+path = "comparison/jq/vendor/jq-1.8.1/optional.test"
+sha256 = "06d7249e3d9e09d572995e66276cd65f2da6f907a15e2f9cb012e672598ac5b9"
+reference = "jq-1.8.1"
+
+[[suite]]
+id = "upstream-1.8.1-base64.test"
+path = "comparison/jq/vendor/jq-1.8.1/base64.test"
+sha256 = "c1c8eb62f51f64a9dd0406051d5ba936f471ffdbb6412daed9d44ea5a1e45bac"
+reference = "jq-1.8.1"
+
+[[suite]]
+id = "upstream-1.8.1-manonig.test"
+path = "comparison/jq/vendor/jq-1.8.1/manonig.test"
+sha256 = "62738dd27ce0dbc4f21296e48270f20024274631cae4b9ffe85a0eecaa53af7f"
+reference = "jq-1.8.1"
+
+[[suite]]
+id = "upstream-1.8.1-uri.test"
+path = "comparison/jq/vendor/jq-1.8.1/uri.test"
+sha256 = "50a80984bda47101ffbce532ea8b25b9855638ceb59bd8e130d649e8cc2cedfb"
+reference = "jq-1.8.1"
+
 # Dimension C: JSONTestSuite (y_/n_/i_), the file the golden tests use.
 [json_suite]
 id = "json-test-suite"
