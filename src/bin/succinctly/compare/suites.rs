@@ -1,10 +1,11 @@
 //! Dimension B: the upstream jq test files run as a differential (#5409).
 //!
-//! `jq.test`, `onig.test`, `man.test` and `optional.test` are vendored from the
-//! pinned source tarball (sha256-pinned in the manifest). Each case runs through
-//! both tools; stdout and exit status must be identical. The files' own expected
-//! outputs are not consulted: the reference *is* the oracle, so a case the
-//! reference itself fails on still compares like for like.
+//! `jq.test`, `onig.test`, `man.test`, `optional.test`, `base64.test` and `manonig.test`
+//! (all six files jq 1.7.1 ships) are vendored from the pinned source tarball
+//! (sha256-pinned in the manifest). Each case runs through both tools; stdout and exit
+//! status must be identical. The files' own expected outputs are not consulted: the
+//! reference *is* the oracle, so a case the reference itself fails on still compares
+//! like for like.
 
 use super::exec::exec;
 use super::harness::Tool;
@@ -155,6 +156,18 @@ mod tests {
             .len()
                 > 30
         );
+    }
+
+    /// #5622: the two small files the first four vendored did not cover, 24 cases between them.
+    #[test]
+    fn the_base64_and_manonig_files_are_vendored_whole() {
+        let base64 = parse(include_str!(
+            "../../../../comparison/jq/vendor/jq-1.7.1/base64.test"
+        ));
+        let manonig = parse(include_str!(
+            "../../../../comparison/jq/vendor/jq-1.7.1/manonig.test"
+        ));
+        assert_eq!((base64.len(), manonig.len()), (7, 17));
     }
 
     fn sh(script: &str) -> Tool {
