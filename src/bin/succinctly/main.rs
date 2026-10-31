@@ -577,6 +577,13 @@ enum PatternArg {
     /// --escape-density) contain a JSON escape sequence (tests escaped-key
     /// decode cost, #2637)
     WideEscapedKeys,
+    /// Newline-delimited JSON: one compact user record per line, no enclosing array
+    /// (tests many small documents; not part of `generate-suite`, and `--pretty` has
+    /// no single document to indent)
+    Ndjson,
+    /// Like `ndjson`, with each record introduced by an RS byte (RFC 7464 JSON text
+    /// sequences, the input of `jq --seq`)
+    JsonSeq,
 }
 
 /// Generate a suite of JSON files with various sizes and patterns for benchmarking
@@ -1327,6 +1334,8 @@ impl From<PatternArg> for generators::Pattern {
             PatternArg::Pretty => Self::Pretty,
             PatternArg::Wide => Self::Wide,
             PatternArg::WideEscapedKeys => Self::WideEscapedKeys,
+            PatternArg::Ndjson => Self::Ndjson,
+            PatternArg::JsonSeq => Self::JsonSeq,
         }
     }
 }
@@ -1887,16 +1896,26 @@ fn run_main() -> Result<()> {
         }
         Command::Json(json_cmd) => match json_cmd.command {
             JsonSubcommand::Generate(args) => {
+                let pattern: generators::Pattern = args.pattern.into();
+                let per_line = matches!(
+                    pattern,
+                    generators::Pattern::Ndjson | generators::Pattern::JsonSeq
+                );
+                if per_line && args.pretty {
+                    anyhow::bail!(
+                        "--pretty needs a single document; the ndjson and json-seq patterns have one per line"
+                    );
+                }
                 let json = generate_json(
                     args.size,
-                    args.pattern.into(),
+                    pattern,
                     args.seed,
                     args.depth,
                     args.escape_density,
                 );
 
                 let verified_parse = if args.verify {
-                    let parsed = validate_generated_json(&json, args.pretty)
+                    let parsed = validate_generated_json(&json, args.pretty, per_line)
                         .context("Generated invalid JSON")?;
                     eprintln!("✓ JSON validated successfully");
                     parsed
@@ -2479,7 +2498,21 @@ const SUITE_SIZES: &[(&str, usize)] = &[
 /// materializing a value) -- but `generate --verify --pretty` needs to immediately
 /// re-parse the same string to pretty-print it, so `keep_parsed` lets that one caller
 /// reuse this validation pass's own parse instead of paying for a second one.
-fn validate_generated_json(json: &str, keep_parsed: bool) -> Result<Option<serde_json::Value>> {
+///
+/// `per_line` is for newline-delimited output (the `ndjson` and `json-seq` patterns): every line is one
+/// document (after an RS byte), and there is no single value to keep.
+fn validate_generated_json(
+    json: &str,
+    keep_parsed: bool,
+    per_line: bool,
+) -> Result<Option<serde_json::Value>> {
+    if per_line {
+        for (n, line) in json.lines().enumerate() {
+            serde_json::from_str::<serde_json::Value>(line.trim_start_matches('\u{1e}'))
+                .with_context(|| format!("line {}", n + 1))?;
+        }
+        return Ok(None);
+    }
     let value: serde_json::Value = serde_json::from_str(json)?;
     Ok(keep_parsed.then_some(value))
 }
@@ -2531,7 +2564,7 @@ fn generate_json_suite(args: GenerateSuite) -> Result<()> {
             let json = generate_json(*size, *pattern, Some(seed), 5, 0.1);
 
             if args.verify {
-                validate_generated_json(&json, false)
+                validate_generated_json(&json, false, false)
                     .with_context(|| format!("Generated invalid JSON for {}", path.display()))?;
             }
 
@@ -3188,6 +3221,27 @@ mod tests {
             generators::Pattern::from(PatternArg::Wide),
             generators::Pattern::Wide
         ));
+    }
+
+    #[test]
+    fn test_pattern_arg_line_delimited_patterns_map_to_generator_patterns() {
+        assert!(matches!(
+            generators::Pattern::from(PatternArg::Ndjson),
+            generators::Pattern::Ndjson
+        ));
+        assert!(matches!(
+            generators::Pattern::from(PatternArg::JsonSeq),
+            generators::Pattern::JsonSeq
+        ));
+    }
+
+    #[test]
+    fn test_validate_generated_json_per_line_checks_every_record() {
+        let ok = "\u{1e}{\"a\":1}\n{\"a\":2}\n";
+        assert!(validate_generated_json(ok, false, true).unwrap().is_none());
+        assert!(validate_generated_json(ok, false, false).is_err());
+        let err = validate_generated_json("{\"a\":1}\n{\"a\":\n", false, true).unwrap_err();
+        assert!(format!("{err:#}").contains("line 2"), "{err:#}");
     }
 
     #[test]

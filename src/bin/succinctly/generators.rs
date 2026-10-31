@@ -18,6 +18,8 @@ pub enum Pattern {
     Pretty,
     Wide,
     WideEscapedKeys,
+    Ndjson,
+    JsonSeq,
 }
 
 /// Generate JSON of approximately target_size bytes
@@ -46,6 +48,8 @@ pub fn generate_json(
         Pattern::WideEscapedKeys => {
             generate_wide_escaped_keys_json(target_size, seed, escape_density)
         }
+        Pattern::Ndjson => generate_ndjson_json(target_size, seed, false),
+        Pattern::JsonSeq => generate_ndjson_json(target_size, seed, true),
     }
 }
 
@@ -479,6 +483,33 @@ pub fn generate_users_json(target_size: usize, seed: Option<u64>) -> String {
     }
 
     json.push_str("]}");
+    json
+}
+
+/// Generate newline-delimited JSON: one compact user record per line, the same fields
+/// as [`generate_users_json`], with no enclosing array. Many small documents rather
+/// than one large one, so the per-document paths dominate over parse throughput
+/// (the shape `jq -c .`, `jq -n inputs` and `jq -s` meet on log and event streams).
+/// With `framed` each record also starts with the RS byte (0x1e), which is RFC 7464
+/// JSON text sequences, the input `jq --seq` reads.
+pub fn generate_ndjson_json(target_size: usize, seed: Option<u64>, framed: bool) -> String {
+    let mut rng = seed.map(ChaCha8Rng::seed_from_u64);
+    let mut json = String::with_capacity(target_size);
+
+    let mut i = 0usize;
+    while json.len() < target_size {
+        let age = rng.as_mut().map_or(25, |r| r.random_range(18..80));
+        let score = rng.as_mut().map_or(i * 10, |r| r.random_range(0..1000));
+
+        if framed {
+            json.push('\u{1e}');
+        }
+        json.push_str(&format!(
+            r#"{{"id":{i},"name":"User{i}","email":"user{i}@example.com","age":{age},"active":true,"score":{score}}}"#
+        ));
+        json.push('\n');
+        i += 1;
+    }
     json
 }
 
@@ -987,6 +1018,39 @@ mod tests {
                 ratio
             );
         }
+    }
+
+    #[test]
+    fn test_generate_ndjson_is_one_valid_record_per_line() {
+        for size in [1024, 10 * 1024, 100 * 1024] {
+            let json = generate_json(size, Pattern::Ndjson, Some(42), 5, 0.1);
+            assert!(json.ends_with('\n'), "ndjson/{size}: no final newline");
+            assert!(json.len() >= size && json.len() < size + 200);
+            let mut n = 0;
+            for line in json.lines() {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert_eq!(v["id"], n, "ids count up from 0");
+                n += 1;
+            }
+            assert!(n > 5, "ndjson/{size}: only {n} records");
+        }
+    }
+
+    #[test]
+    fn test_generate_json_seq_frames_each_record_with_rs() {
+        let seq = generate_json(4096, Pattern::JsonSeq, Some(42), 5, 0.1);
+        let plain = generate_json(4096, Pattern::Ndjson, Some(42), 5, 0.1);
+        assert!(seq.lines().all(|l| l.starts_with('\u{1e}')));
+        assert_eq!(seq.replace('\u{1e}', ""), plain);
+    }
+
+    #[test]
+    fn test_generate_ndjson_is_deterministic() {
+        let a = generate_json(4096, Pattern::Ndjson, Some(42), 5, 0.1);
+        let b = generate_json(4096, Pattern::Ndjson, Some(42), 5, 0.1);
+        let c = generate_json(4096, Pattern::Ndjson, Some(43), 5, 0.1);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 
     #[test]
