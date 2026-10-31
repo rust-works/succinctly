@@ -81,14 +81,27 @@ jobs:
               - '!docs/**'
               - '!.claude/skills/**'
               - '!changelog.d/**'    # fragments are .md, but nested, so `!*.md` misses them (#3920)
-            # Where macOS can differ from Linux (#5699): Apple's libm vs glibc's last
-            # digit, the build script, dependency / toolchain changes, the workflow itself.
+            # Where macOS can differ from Linux (#5699): Apple's libm vs glibc's last digit,
+            # the local zone, the files with a `target_os = "macos"` cfg (`git grep -l
+            # 'target_os = "macos"' -- '*.rs'`; add a new one here, or label the PR
+            # `ci:macos`), the build script, dependency / toolchain / cargo config changes,
+            # the deep-recursion test list, and the workflows. `build.rs` and `rust-toolchain*`
+            # do not exist today; they are listed so adding one is covered.
             macos:
               - 'src/jq/math.rs'
+              - 'src/jq/local_zone.rs'
+              - 'src/bin/succinctly/address_space.rs'
+              - 'src/bin/succinctly/bench_runner/utils.rs'
+              - 'src/bin/succinctly/compare/*.rs'
+              - 'src/bin/succinctly/dsv_bench.rs'
+              - 'src/bin/succinctly/jq_bench.rs'
+              - 'src/bin/succinctly/yq_bench.rs'
               - '**/build.rs'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
               - 'rust-toolchain*'
+              - '.cargo/**'
+              - 'scripts/deep-recursion-tests.sh'
               - '.github/workflows/**'
 
       - id: decide
@@ -121,7 +134,7 @@ jobs:
             elif ! labels=$(gh api "repos/$REPO/pulls/$PR" --jq '.labels[].name'); then
               macos=true
               echo "::notice::could not read the PR's labels; running the macOS matrix (#5699)"
-            elif printf '%s\n' "$labels" | grep -qx 'ci:macos'; then
+            elif grep -qx 'ci:macos' <<<"$labels"; then
               macos=true
               echo "::notice::PR carries the ci:macos label; running the macOS matrix (#5699)"
             fi
