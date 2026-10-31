@@ -604,9 +604,13 @@ above.
 - **Integration tests**: `tests/json_indexing_tests.rs`, `tests/simd_level_tests.rs`
 - **New yq/jq CLI tests**: never append to the end of `tests/yq_cli_tests.rs` or
   `tests/jq_cli_tests.rs` (every PR that did conflicted with every other, #4329). A new test for
-  issue `N` goes in `tests/yq_cli/iN.rs` (`tests/jq_cli/iN.rs`) plus one `mod iN;` line in that
-  directory's `mod.rs`, in numeric order; the module reaches the binary's helpers through
-  `crate::` (`use crate::run_yq_stdin;`). It is still the same test binary. See the header of
+  issue `N` goes in `tests/yq_cli/iN.rs` (`tests/jq_cli/iN.rs`) and nowhere else: `mod.rs` declares
+  every file in its directory with `automod::dir!`, so there is no `mod iN;` list to edit and
+  two PRs never conflict on one (GitHub's merge queue ignores `merge=union`, #5697). The module
+  reaches the binary's helpers through `crate::` (`use crate::run_yq_stdin;`). It is still the
+  same test binary. `cargo fmt` cannot follow a macro-generated `mod`, so
+  `scripts/fmt-per-issue.sh` checks those files (`--fix` formats them); an incremental build
+  does not see a *new* file until `tests/yq_cli/mod.rs` is touched. See the header of
   `tests/yq_cli/mod.rs`.
 
 ## `no_std` Support

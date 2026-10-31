@@ -853,6 +853,12 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo fmt --all -- --check
 
+      # `cargo fmt` follows `mod` declarations and cannot follow the `automod::dir!` ones in
+      # `tests/{jq,yq}_cli/mod.rs`, so it never reaches the per-issue test files (#5697).
+      - name: Check formatting of the per-issue test files
+        if: needs.gate.outputs.code == 'true'
+        run: ./scripts/fmt-per-issue.sh
+
   skill-casing:
     name: Skill manifest casing
     needs: gate
