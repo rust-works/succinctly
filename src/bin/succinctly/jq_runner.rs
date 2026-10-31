@@ -12032,10 +12032,9 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
             let last_gap_end = last_child
                 .and_then(|(child, start)| start.and_then(|s| child.last_child_text_end(s)));
             // #1676: trailing `,` (`[1,2,]`) or a stray `,` in an
-            // apparently-empty array (`[,]`) -- `last_gap_end` is `None`
-            // both when there's nothing to check yet and when the last
-            // element is itself a container (`scalar_text_end`'s own doc
-            // comment explains why that case is skipped, not just unknown).
+            // apparently-empty array (`[,]`), and (#5654) junk after a last element that is
+            // itself a container -- `last_gap_end` is `None` when there's nothing to check
+            // yet or the end cannot be told.
             if let Some(open_pos) = cursor.text_position() {
                 let gap_start = if saw_any {
                     last_gap_end
@@ -12077,7 +12076,7 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
                 return Err(EvalError::malformed_json_text(cursor.text()));
             }
             // #1676: same trailing/empty-gap check as the array arm above,
-            // applied to the last field's *value*.
+            // applied to the last field's *value*, a container included (#5654).
             let last_gap_end = last_value.and_then(|(value, start): (JsonCursor<'_, W>, _)| {
                 start.and_then(|s| value.last_child_text_end(s))
             });

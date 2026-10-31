@@ -715,10 +715,12 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// [`container_gap_ok`](Self::container_gap_ok): every format but JSON
     /// validates this while parsing. Provably unreachable for every format
     /// shipped today, not just trivially correct for them: this method's one
-    /// caller only reaches it once `scalar_text_end` has already answered
-    /// `Some`, and JSON is the only format whose `scalar_text_end` ever does
+    /// caller only reaches it once `scalar_text_end` or
+    /// [`container_text_end`](Self::container_text_end) has already answered
+    /// `Some`, and JSON is the only format whose either ever does
     /// -- and JSON overrides this method too, so its own default body never
-    /// runs either. Kept so this default exists to keep a future non-JSON,
+    /// runs either. A format that overrides one of those two must override
+    /// this method too. Kept so this default exists to keep a future non-JSON,
     /// non-parse-validating format honest rather than to be exercised by
     /// anything shipped today (same reasoning as
     /// [`malformed_delimiter_error`](Self::malformed_delimiter_error)'s own

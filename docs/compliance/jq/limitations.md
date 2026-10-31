@@ -6205,7 +6205,7 @@ $ echo '{"a":1,"b":[1,2],}'  | sjq -c '.'   # parse error, exit 5
 The last child's end now comes from the balanced parentheses (`JsonCursor::container_end_bp`, `DocumentCursor::container_text_end`), asked of the last child of a container only.
 The last node in document order inside it is a leaf; its end plus one closer for each parenthesis that closes after it is where the container ends.
 Only the closers are looked for, so junk inside the last child is that child's own business, found when it is read, and a filter that never reads a malformed member is still not made to validate it (#2103).
-An inner closer's kind is not compared with its opener's.
+An inner closer's kind is not compared with its opener's, and junk that itself holds a `]` or `}` between the closers is read as one of them.
 The lazy routes (`map(.)`, `first(.[])`) still skip the gap checks, for a scalar last child too.
 Measured against the build before it (Apple M-series, interleaved, release): `.` and `length` over a record array, a `{"users":[...]}` document and an array of rows are within noise, and `[.[]|.id]|length` over records whose last field is a container reads +7% to +13% (a lookup now locates the end of that field).
 Pinned by `test_jq_lazy_path_trailing_comma_after_container_last_child_is_rejected_2243` in [tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs) and `tests/jq_cli/i5654_container_last.rs`.

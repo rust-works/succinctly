@@ -3613,11 +3613,8 @@ fn empty_container_gap_ok<'a, W: AsRef<[u64]> + Clone>(
 
 /// Cheap end position (one past the last byte) of an already-resolved
 /// scalar `value` known to start at `start` -- `None` for a container,
-/// which [`trailing_gap_ok`]'s callers treat as "can't determine, skip"
-/// (matching `src/bin/succinctly/jq_runner.rs`'s own `scalar_end_pos`: a
-/// container's own last child might have arbitrary trailing whitespace
-/// before its closing bracket, so this is deliberately deferred rather than
-/// mistracked).
+/// whose end comes from [`JsonCursor::container_end_bp`] instead (#5654;
+/// see [`JsonCursor::last_child_text_end`], which picks between the two).
 fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
     start: usize,
     value: &StandardJson<'_, W>,
@@ -3629,35 +3626,6 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
         StandardJson::Bool(false) => Some(start + 5),
         StandardJson::Null => Some(start + 4),
         StandardJson::Array(_) | StandardJson::Object(_) | StandardJson::Error(_) => None,
-    }
-}
-
-/// Where a container's last child stands for the trailing-gap check (#5654): a scalar's end is
-/// known at once, a container's takes [`JsonCursor::container_end_bp`], which only the last
-/// child of a container needs, so the child is kept and resolved after the loop.
-enum TailChild<'a, W> {
-    Unknown,
-    ScalarEnd(&'a [u8], usize),
-    Container(JsonCursor<'a, W>),
-}
-
-impl<'a, W: AsRef<[u64]> + Clone> TailChild<'a, W> {
-    /// The child `cursor` at `pos`, whose value is `value`.
-    fn of(cursor: &JsonCursor<'a, W>, pos: usize, value: &StandardJson<'_, W>) -> Self {
-        match value {
-            StandardJson::Array(_) | StandardJson::Object(_) => Self::Container(*cursor),
-            _ => scalar_end_pos(pos, value)
-                .map_or(Self::Unknown, |end| Self::ScalarEnd(cursor.text(), end)),
-        }
-    }
-
-    /// The text and position the gap before the closing bracket starts at.
-    fn gap_start(&self) -> Option<(&'a [u8], usize)> {
-        match self {
-            Self::Unknown => None,
-            Self::ScalarEnd(text, end) => Some((text, *end)),
-            Self::Container(cursor) => cursor.container_end_bp().map(|end| (cursor.text(), end)),
-        }
     }
 }
 
@@ -5121,10 +5089,10 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
             let next_indent = current_indent + indent_spaces;
             let mut first = true;
             let mut rest = elements;
-            // Tracks the last element, for the trailing-comma check after the loop (`[1,2,]`):
-            // a scalar's end, or a container's start, which only the last one has resolved
-            // (#5654, `TailChild`).
-            let mut last_child: TailChild<'_, W> = TailChild::Unknown;
+            // Tracks the last element and its position, for the trailing-comma check after the
+            // loop (`[1,2,]`): its end is resolved for the last one only (#5654, a container's end
+            // is a lookup).
+            let mut last_child: Option<(JsonCursor<'_, W>, usize)> = None;
             // Cursor-yielding `uncons_cursor`, not the plain value
             // `Iterator`/`IntoIterator` impl: #1677's missing/doubled
             // `,` check needs each element's own `text_position()`, which
@@ -5134,7 +5102,7 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                 if !first {
                     out.write_char(',')?;
                 }
-                last_child = TailChild::Unknown;
+                last_child = None;
                 // Resolved once and reused below for both the trailing-gap
                 // bookkeeping and the recursive render, instead of a second
                 // `elem_cursor.value()` re-deriving the same value (#1576
@@ -5163,7 +5131,7 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                             elem_cursor.text(),
                         )));
                     }
-                    last_child = TailChild::of(&elem_cursor, pos, &elem_value);
+                    last_child = Some((elem_cursor, pos));
                     elem_value
                 } else {
                     elem_cursor.value()
@@ -5187,9 +5155,13 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
             }
             // #1676: a trailing `,` (`[1,2,]`), or (#5654) junk after a container that is the
             // last element.
-            if let Some((text, gap_start)) = last_child.gap_start() {
-                if !trailing_gap_ok(text, gap_start, b']') {
-                    return Err(StreamFailure::Decode(EvalError::malformed_json_text(text)));
+            if let Some((cursor, gap_start)) = last_child
+                .and_then(|(cursor, pos)| cursor.last_child_text_end(pos).map(|end| (cursor, end)))
+            {
+                if !trailing_gap_ok(cursor.text(), gap_start, b']') {
+                    return Err(StreamFailure::Decode(EvalError::malformed_json_text(
+                        cursor.text(),
+                    )));
                 }
             }
             if indent_spaces > 0 {
@@ -6070,26 +6042,27 @@ mod tests {
         );
     }
 
-    /// #5654: the kinds of last child [`TailChild`] resolves lazily, and what each resolves to.
+    /// #5654: `last_open_before` finds the last 1 bit below `end`, across word boundaries, at a
+    /// full-word mask, and after a run of more than a word of zeros (a run of closers).
     #[test]
-    fn test_tail_child_resolves_a_container_only_when_asked_5654() {
-        use crate::json::JsonIndex;
-        let text = br"[[1]@]";
-        let index = JsonIndex::build(text);
-        let root = index.root(text);
-        let StandardJson::Array(elements) = root.value() else {
-            panic!("an array");
-        };
-        let child = elements.cursor_iter().next().expect("one element");
-        let pos = child.text_position().expect("a position");
-        let tail = TailChild::of(&child, pos, &child.value_at(pos));
-        // The container ends after its `]`; what follows is junk, not the parent's `]`.
-        let (gap_text, gap_start) = tail.gap_start().expect("a container resolves");
-        assert_eq!(gap_start, 4);
-        assert!(!trailing_gap_ok(gap_text, gap_start, b']'));
-        assert!(TailChild::<Vec<u64>>::Unknown.gap_start().is_none());
-        let scalar = TailChild::<Vec<u64>>::ScalarEnd(text, 3);
-        assert_eq!(scalar.gap_start().map(|(_, end)| end), Some(3));
+    fn test_last_open_before_crosses_words_and_masks_5654() {
+        // Bit `p` is `words[p / 64] >> (p % 64)`.
+        let words = [0b1u64, 0, 0, 1u64 << 63, 0b10];
+        assert_eq!(last_open_before(&words, 0), None);
+        assert_eq!(last_open_before(&words, 1), Some(0));
+        // Strictly before `end`: bit 0 is not before 0, but is before 1 and every later end.
+        assert_eq!(last_open_before(&words, 2), Some(0));
+        // A run of 191 zeros (words 1 and 2 and the low part of 0) back to bit 0.
+        assert_eq!(last_open_before(&words, 3 * 64), Some(0));
+        // The top bit of word 3 is position 255; an end at 256 keeps the whole word (`keep == 64`).
+        assert_eq!(last_open_before(&words, 256), Some(255));
+        assert_eq!(last_open_before(&words, 255), Some(0));
+        // Bit 1 of word 4 is position 257.
+        assert_eq!(last_open_before(&words, 258), Some(257));
+        assert_eq!(last_open_before(&words, 257), Some(255));
+        // An end past the stored words finds nothing rather than indexing out of range.
+        assert_eq!(last_open_before(&words, 64 * 6), None);
+        assert_eq!(last_open_before(&[0u64; 3], 130), None);
     }
 
     // ------------------------------------------------------------------
