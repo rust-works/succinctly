@@ -55,6 +55,15 @@ pub struct PerfQuery {
     pub max_tier: String,
 }
 
+/// A flag that stands for the input file's name, where an option takes one
+/// (`--slurpfile d @INPUT@`). A query that uses it passes the file only there.
+pub const INPUT_FLAG: &str = "@INPUT@";
+/// A pseudo-flag, `@files=N`, that passes the input file `N` times as positional
+/// arguments, so a run reads several files.
+pub const FILES_FLAG_PREFIX: &str = "@files=";
+/// The most copies `@files=N` may ask for.
+const MAX_FILE_COPIES: usize = 16;
+
 /// `id<TAB>flags<TAB>filter<TAB>shape,shape<TAB>max_tier` (`-` for no flags).
 pub fn parse_queries(text: &str) -> Result<Vec<PerfQuery>> {
     let mut out = vec![];
@@ -71,6 +80,27 @@ pub fn parse_queries(text: &str) -> Result<Vec<PerfQuery>> {
         }
         if !TIERS.contains(&c[4]) {
             bail!("perf query line {}: unknown tier `{}`", n + 1, c[4]);
+        }
+        let flags: Vec<&str> = c[1].split(' ').collect();
+        let shapes: Vec<&str> = c[3].split(',').collect();
+        for f in flags.iter().filter(|f| f.starts_with(FILES_FLAG_PREFIX)) {
+            let copies = f[FILES_FLAG_PREFIX.len()..].parse::<usize>();
+            if !matches!(copies, Ok(n) if (1..=MAX_FILE_COPIES).contains(&n)) {
+                bail!(
+                    "perf query line {}: `{f}` wants a count from 1 to {MAX_FILE_COPIES}",
+                    n + 1
+                );
+            }
+        }
+        if shapes.contains(&"none")
+            && flags
+                .iter()
+                .any(|f| *f == INPUT_FLAG || f.starts_with(FILES_FLAG_PREFIX))
+        {
+            bail!(
+                "perf query line {}: `{INPUT_FLAG}` and `{FILES_FLAG_PREFIX}N` need an input file, and shape `none` has none",
+                n + 1
+            );
         }
         out.push(PerfQuery {
             id: c[0].into(),
@@ -202,10 +232,29 @@ pub struct PerfRow {
     pub noisy: bool,
 }
 
+/// The command line of one run: the flags, the filter, then the input file. `@INPUT@` in
+/// the flags is the file's name at that position, and then it is not appended again;
+/// `@files=N` appends it `N` times.
 fn args_for(q: &PerfQuery, file: Option<&str>) -> Vec<String> {
-    let mut a = q.flags.clone();
+    let mut a = vec![];
+    let mut named = false;
+    let mut copies = 1;
+    for f in &q.flags {
+        if f == INPUT_FLAG {
+            a.extend(file.map(String::from));
+            named = true;
+        } else if let Some(n) = f.strip_prefix(FILES_FLAG_PREFIX) {
+            copies = n.parse().unwrap_or(1);
+        } else {
+            a.push(f.clone());
+        }
+    }
     a.push(q.filter.clone());
-    a.extend(file.map(String::from));
+    if !named {
+        for _ in 0..copies {
+            a.extend(file.map(String::from));
+        }
+    }
     a
 }
 
@@ -531,6 +580,47 @@ mod tests {
         assert!(parse_queries("a\t-\t.\tusers\t5gb\n").is_err());
     }
 
+    fn args(line: &str, file: Option<&str>) -> Vec<String> {
+        args_for(&parse_queries(line).unwrap()[0], file)
+    }
+
+    #[test]
+    fn the_input_file_follows_the_filter_unless_a_flag_names_it() {
+        assert_eq!(
+            args("a\t-c\t.\tusers\t1mb\n", Some("u.json")),
+            ["-c", ".", "u.json"]
+        );
+        assert_eq!(
+            args(
+                "a\t-n --slurpfile d @INPUT@\t$d|length\tusers\t1mb\n",
+                Some("u.json")
+            ),
+            ["-n", "--slurpfile", "d", "u.json", "$d|length"]
+        );
+        assert_eq!(
+            args("a\t-n --arg k v\t$k\tnone\t1mb\n", None),
+            ["-n", "--arg", "k", "v", "$k"]
+        );
+    }
+
+    #[test]
+    fn files_n_passes_the_input_that_many_times_and_is_not_a_flag() {
+        assert_eq!(
+            args("a\t-c @files=3\t.id\tndjson\t1mb\n", Some("n.json")),
+            ["-c", ".id", "n.json", "n.json", "n.json"]
+        );
+    }
+
+    #[test]
+    fn a_placeholder_needs_an_input_and_a_sane_count() {
+        assert!(parse_queries("a\t-n @INPUT@\t.\tnone\t1mb\n").is_err());
+        assert!(parse_queries("a\t@files=2\t.\tnone\t1mb\n").is_err());
+        assert!(parse_queries("a\t@files=0\t.\tusers\t1mb\n").is_err());
+        assert!(parse_queries("a\t@files=17\t.\tusers\t1mb\n").is_err());
+        assert!(parse_queries("a\t@files=x\t.\tusers\t1mb\n").is_err());
+        assert!(parse_queries("a\t@files=16\t.\tusers\t1mb\n").is_ok());
+    }
+
     #[test]
     fn checked_in_queries_parse_and_name_known_shapes() {
         let text = include_str!("../../../../comparison/jq/queries/perf.tsv");
@@ -543,6 +633,8 @@ mod tests {
             "wide",
             "nested",
             "comprehensive",
+            "ndjson",
+            "jsonseq",
             "none",
         ];
         assert!(qs
