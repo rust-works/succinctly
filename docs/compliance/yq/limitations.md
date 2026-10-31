@@ -550,6 +550,15 @@ evaluated and printed (#1817, #2304). `tests/yq_cli_tests.rs` pins this
 (`test_deep_block_yaml_*_1817`). Streamed shapes that never materialize the document
 (`.`, `.[]`, `keys`, `length`, `map(.)`) have no ceiling at all.
 
+### Expression nesting ceiling on a chain of comparisons — rule 4(c)
+
+Real yq parses a chain of comparisons of any length: `1 == 1 == ... == 1` with 100,000 operands answers `false`.
+`succinctly yq` folds the chain from the right, as yq does, into one nested node per link, and a program nested past the 256 expression-nesting limit (`MAX_EXPR_DEPTH`) is refused at parse time.
+`1 == 1 == ... == 1` with about 250 operands still runs; one with 1,000 is `expression nesting exceeds depth limit of 256`, exit 1.
+That is ADR-0018 rule 4(c): matching would take the host process down, because the evaluator and `Drop` walk the tree on the native stack.
+It is the ceiling a long run of `+` already has.
+Pinned by `tests/yq_cli/i5629.rs`.
+
 ### A JSON integer past 2^53 keeps its exact digits — rule 4(b) ([#3605](https://github.com/rust-works/succinctly/issues/3605))
 
 yq's JSON decoder reads every number through a `float64`, so an integer a document spelled past

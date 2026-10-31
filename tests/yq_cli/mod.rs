@@ -157,4 +157,5 @@ mod i5612;
 mod i5614;
 mod i5615;
 mod i5616;
+mod i5629;
 mod i865;
