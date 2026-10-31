@@ -452,6 +452,96 @@ fn is_computed_plain_number<S: EvalSemantics>(value: &OwnedValue) -> bool {
         }
 }
 
+/// The one answer of `expr` over a computed plain number (#5606), from the number alone, or
+/// `None` where the evaluator must run it:
+/// - `[e]` is the one-element array of `e`'s answer;
+/// - `{k: e}` is the object of its entries' answers;
+/// - `. as $x | body` binds `$x` to the number as the evaluator's own bind does (`eval_as`: an
+///   identity source freezes `.`, here a number with no node) and answers the body;
+/// - any other shape is a closed expression ([`crate::jq::eval::eval_owned_closed`]) or one the
+///   owned fast path answers.
+///
+/// A shape none of them answers returns `None` whole, so the caller bridges the original `expr`,
+/// never a substituted one.
+fn plain_number_answer<S: EvalSemantics>(expr: &Expr, number: &OwnedValue) -> Option<OwnedValue> {
+    match strip_parens(expr) {
+        Expr::Array(inner) => {
+            let element = plain_number_answer::<S>(inner, number)?;
+            Some(OwnedValue::array_from(vec![element]))
+        }
+        // Literal keys only (a computed key is a generator), each value one answer: the pairs
+        // fold into the map as the evaluator's own construction folds them.
+        Expr::Object(entries) => {
+            let mut pairs = vec_with_capacity(entries.len());
+            for entry in entries {
+                let ObjectKey::Literal(key) = &entry.key else {
+                    return None;
+                };
+                pairs.push((key.clone(), plain_number_answer::<S>(&entry.value, number)?));
+            }
+            let fields = crate::jq::eval::object_from_pairs::<S>(pairs).ok()?;
+            Some(OwnedValue::Object(fields.into()))
+        }
+        Expr::As {
+            expr: source,
+            var,
+            body,
+        } if matches!(strip_parens(source), Expr::Identity) => {
+            let bound =
+                crate::jq::eval::substitute_bound_var_from::<S>(source, body, var, number, None);
+            plain_number_answer::<S>(&bound, number)
+        }
+        other => {
+            if let Some(value) = crate::jq::eval::eval_owned_closed::<S>(other) {
+                return Some(value);
+            }
+            if !owned_fast_path_may_answer(other) {
+                return None;
+            }
+            match crate::jq::eval::eval_owned_fast_path::<S>(other, number, false) {
+                Some(Ok(Some(value))) => Some(value),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// A necessary condition for [`plain_number_answer`] to answer `expr`, read off it before any
+/// `$x` is substituted: the constructors and operators it answers, over variables, literals and
+/// the shapes the owned fast path answers. It never rejects what the answerer would answer (the
+/// agreement test pins that), and only saves a hopeless shape (a generator, a call, a pipe through
+/// a builtin neither route takes) the failed attempt: the substitution of an `as` body, or the
+/// entries of an object answered before a later one declines.
+fn plain_shape_may_be_answered(body: &Expr) -> bool {
+    match strip_parens(body) {
+        Expr::Var(_) | Expr::Literal(_) => true,
+        Expr::Array(inner) => plain_shape_may_be_answered(inner),
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            matches!(entry.key, ObjectKey::Literal(_)) && plain_shape_may_be_answered(&entry.value)
+        }),
+        Expr::As {
+            expr: source, body, ..
+        } => matches!(strip_parens(source), Expr::Identity) && plain_shape_may_be_answered(body),
+        Expr::Compare { left, right, .. }
+        | Expr::Arithmetic { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Alternative(left, right) => {
+            plain_shape_may_be_answered(left) && plain_shape_may_be_answered(right)
+        }
+        // The head is a closed shape or the fast path's own; each later stage is one the fast
+        // path answers or a builtin `closed_unary_builtin` takes.
+        Expr::Pipe(stages) => {
+            stages.first().is_some_and(plain_shape_may_be_answered)
+                && stages[1..].iter().all(|stage| {
+                    crate::jq::eval::is_closed_unary_builtin(stage)
+                        || owned_fast_path_may_answer(stage)
+                })
+        }
+        other => owned_fast_path_may_answer(other),
+    }
+}
+
 /// Whether `value` is a number scalar of a JSON-sourced document (#3597), whose
 /// `length` is the width of the number yq's JSON decoder produced rather than of
 /// the source spelling `as_str` hands back.
@@ -5028,6 +5118,20 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
                         }
                         Err(error) => GenericResult::Error(error),
                     };
+                }
+            }
+            // #5606: `[e]`, `{k: e}` and `. as $x | body` over the number, where `e` and the body
+            // are shapes the owned routes answer; see `plain_number_answer`. The embed table gates
+            // it as it gates the fast path below: the answer may then be a bound node's own value.
+            // `plain_shape_may_be_answered` first: substituting an `as` body, or answering the
+            // entries of an object before a later one declines, is paid for again by the bridge
+            // (measured without it: +8.5% instructions on `$x | [$x, .] | length`, +6-11% on
+            // `{a: ., b: (. | tojson | length)}`).
+            Expr::Array(_) | Expr::Object(_) | Expr::As { .. }
+                if !optional && plain_shape_may_be_answered(expr) && !embed_table_active() =>
+            {
+                if let Some(value) = plain_number_answer::<S>(strip_parens(expr), &owned) {
+                    return GenericResult::Owned(value);
                 }
             }
             _ => {}
@@ -41556,12 +41660,112 @@ mod tests {
             assert_eq!(reindexes(filter), 0, "{filter} bridged");
         }
         // A condition outside the pure grammar (a generator), a NaN and a stage the arm does not
-        // take (`as`) keep the bridge.
+        // take (an `as` whose body is none of the owned shapes) keep the bridge.
         assert!(reindexes("map(. + 1 | select(. > 1, . < 0))") > 0);
         assert!(reindexes("map(nan | select(. == .))") > 0);
-        assert!(reindexes("map(. + 1 | . as $x | $x)") > 0);
+        assert!(reindexes("map(. + 1 | . as $x | [$x, .] | length)") > 0);
         // `optional` is the verdict path's one gate: `?` suppression stays the bridge's.
         assert!(reindexes("map(. + 1 | select(. > 2)?)") > 0);
+    }
+
+    /// #5606: an array constructor and an `as` binding over a number the filter computed settle
+    /// from the number: `reindex_count` counts every serialize-and-index. The pin must be able to
+    /// fail: it does, with the `[e]`, the `{k: e}` and the `as` branch of `plain_number_answer`
+    /// each disabled.
+    #[cfg(feature = "std")]
+    #[test]
+    fn array_and_as_over_a_computed_number_are_not_bridged_5606() {
+        use crate::jq::value::reindex_count;
+
+        let reindexes = |filter: &str| {
+            let json = b"[1.5,2.5,-0.0,16]";
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::get();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            assert_eq!(result.len(), 1, "{filter}");
+            reindex_count::get() - before
+        };
+        for filter in [
+            "map(. + 1 | [.])",
+            "map(. + 1 | [. + 1])",
+            "map(. * 2 | floor | [.])",
+            "map(. + 1 | [. > 2])",
+            "map(. + 1 | {a: .})",
+            "map(. + 1 | {a: ., b: [. + 1]})",
+            "map(. + 1 | . as $x | {a: $x})",
+            "map(. + 1 | . as $x | $x)",
+            "map(. + 1 | . as $x | $x * 2)",
+            "map(. + 1 | . as $x | [$x])",
+            "map(. + 1 | . as $x | . + $x)",
+            "map(. + 1 | . as $x | . as $y | $x + $y)",
+            "map(. + 1 | (. as $x | $x))",
+        ] {
+            assert_eq!(reindexes(filter), 0, "{filter} bridged");
+        }
+        // A generator element, a body the owned routes do not answer, a NaN, a destructuring bind
+        // and `?` keep the bridge.
+        assert!(reindexes("map(. + 1 | [., .])") > 0);
+        assert!(reindexes("map(. + 1 | {a: (., 1)})") > 0);
+        assert!(reindexes("map(. + 1 | {(\"k\"): .})") > 0);
+        assert!(reindexes("map(. + 1 | . as $x | [$x, .] | length)") > 0);
+        assert!(reindexes("map(nan | [.])") > 0);
+        assert!(reindexes("map(. + 1 | [.]?)") > 0);
+    }
+
+    /// #5606: `plain_shape_may_be_answered` is a necessary condition of `plain_number_answer`: it
+    /// never rejects a shape the answerer answers, and it does reject the shapes whose failed
+    /// attempt costs more than the bridge they then take.
+    #[test]
+    fn plain_shape_predicate_never_rejects_an_answerable_shape_5606() {
+        let number = OwnedValue::Int(3);
+        let answered = |filter: &str| {
+            let expr = crate::jq::parse(filter).unwrap();
+            let answer = plain_number_answer::<JqSemantics>(&expr, &number);
+            if answer.is_some() {
+                assert!(plain_shape_may_be_answered(&expr), "{filter} rejected");
+            }
+            (answer.is_some(), plain_shape_may_be_answered(&expr))
+        };
+        for filter in [
+            "[.]",
+            "[. + 1]",
+            "[. > 2]",
+            "[type]",
+            "[tostring]",
+            "[[.]]",
+            "{a: .}",
+            "{a: ., b: [. + 1]}",
+            ". as $x | $x",
+            ". as $x | $x * 2",
+            ". as $x | [$x]",
+            ". as $x | . + $x",
+            ". as $x | $x | floor",
+            ". as $x | $x | tostring",
+            ". as $x | . as $y | $x + $y",
+            ". as $x | {a: $x, b: [$x]}",
+            ". as $x | $x == . and true",
+            ". as $x | $x > 5 or $x == 3",
+            ". as $x | $x // 1",
+            "([.])",
+            "{a: 1}",
+        ] {
+            assert_eq!(answered(filter), (true, true), "{filter}");
+        }
+        for filter in [
+            "[., .]",
+            "{a: (., 1)}",
+            "{(\"k\"): .}",
+            "{a: ., b: (. | tojson | length)}",
+            "[. | tojson | length]",
+            ". as $x | [$x, .] | length",
+            ". as [$x] | $x",
+            ". as $x | def f: $x; f",
+        ] {
+            assert!(!answered(filter).1, "{filter} admitted");
+        }
     }
 
     /// #3639: a `label` met at a position with no prefetch hook (the absent-
