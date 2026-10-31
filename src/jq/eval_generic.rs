@@ -411,6 +411,31 @@ fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
     crate::jq::eval::unary_math_apply::<S>(builtin, n)
 }
 
+/// `split(SEP)` of a string value, for a literal string `SEP` (#5682): the pieces, read straight
+/// off the value's text. The bridge this stands in for materializes the string, writes it out as
+/// JSON text, indexes that, and has `builtin_split` read it back -- the writing alone cost as much
+/// as the split on a short line. `None`, leaving the caller on that bridge and its wording, for
+/// yq mode (whose `split` has its own null and separator rules), a separator that is not a plain
+/// string literal (it may fan out, or fail), and a value with no decodable text.
+fn split_of_document_string<S: EvalSemantics, V: DocumentValue>(
+    builtin: &Builtin,
+    value: &V,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let Builtin::Split(sep) = builtin else {
+        return None;
+    };
+    let Expr::Literal(Literal::String(sep)) = strip_parens(sep) else {
+        return None;
+    };
+    let text = value.as_str()?;
+    Some(OwnedValue::array_from(crate::jq::eval::split_string(
+        &text, sep,
+    )))
+}
+
 /// Whether `expr` starts with a shape [`crate::jq::eval::eval_owned_fast_path`] can answer: the
 /// arithmetic accumulator, a comparison, `and`/`or`/`not`, a literal, navigation, `type` and
 /// `tostring`, or a pipe that starts with one (#5601). A necessary condition only, so the fast
@@ -36473,6 +36498,10 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // (e.g. `path(...)`/`del(...)` nested inside this builtin's own
             // argument), so it must be checked against this call's own root.
             if let Some(answer) = unary_math_of_document_number::<S, V>(builtin, &value) {
+                return GenericResult::Owned(answer);
+            }
+            // #5682: `-R 'split(",")'` splits every line.
+            if let Some(answer) = split_of_document_string::<S, V>(builtin, &value) {
                 return GenericResult::Owned(answer);
             }
             let root = RootWitness::of(cursor.as_ref());
