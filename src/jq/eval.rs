@@ -92051,11 +92051,23 @@ mod remaining_inputs {
     /// before it, the error, and the `(source, line)` jq's marker names there.
     type QueuedError = (usize, EvalError, (u32, u32));
 
+    /// One queued document: already an owned value, or the index of a document the CLI converts
+    /// when it is read (#5661), so a program that stops early never converts the rest.
+    enum Slot {
+        Ready(OwnedValue),
+        Lazy(usize),
+    }
+
+    /// The CLI's conversion of the document at an index, for [`Slot::Lazy`] slots.
+    pub type Materialize = Box<dyn Fn(usize) -> Result<OwnedValue, EvalError>>;
+
     thread_local! {
         // `(document, source tag, 1-based end line)`. The source tag is opaque
         // here: the CLI assigns it and resolves it back to a file name itself,
         // so no string ever crosses this module's boundary (#1309).
-        static QUEUE: RefCell<VecDeque<(OwnedValue, u32, u32)>> = const { RefCell::new(VecDeque::new()) };
+        static QUEUE: RefCell<VecDeque<(Slot, u32, u32)>> = const { RefCell::new(VecDeque::new()) };
+        // How a `Slot::Lazy` becomes a document (#5661); `None` when nothing is queued lazily.
+        static MATERIALIZE: RefCell<Option<Materialize>> = const { RefCell::new(None) };
         // jq reports the *last successfully read* document's line, not the
         // next one still queued -- starts at 0 (matching real jq's own
         // `input_line_number` before anything has been read yet).
@@ -92123,8 +92135,41 @@ mod remaining_inputs {
     ) {
         debug_assert!(errors.windows(2).all(|w| w[0].0 <= w[1].0));
         debug_assert!(errors.iter().all(|e| e.0 <= documents.len()));
-        QUEUE.with(|q| *q.borrow_mut() = documents.into());
+        QUEUE.with(|q| {
+            *q.borrow_mut() = documents
+                .into_iter()
+                .map(|(doc, src, line)| (Slot::Ready(doc), src, line))
+                .collect();
+        });
+        MATERIALIZE.with(|m| *m.borrow_mut() = None);
         ERRORS.with(|e| *e.borrow_mut() = errors.into());
+        POPPED.with(|p| p.set(0));
+        LAST_LINE.with(|l| l.set(0));
+        SEEDED.with(|s| s.set(true));
+        CURRENT.with(|c| c.set(None));
+        EXHAUSTED.with(|e| e.set(exhausted));
+        PAST_END.with(|p| p.set(false));
+        COUNT_PAST_END.with(|c| c.set(false));
+    }
+
+    /// [`seed`] for a stream the CLI has already checked is clean (#5661): `lines` is each
+    /// document's `(source tag, 1-based end line)` in input order, and `materialize` converts the
+    /// document at an index when it is first read. No parse error is queued: the CLI takes this
+    /// route only for a stream with none.
+    pub fn seed_lazy(
+        lines: impl IntoIterator<Item = (u32, u32)>,
+        materialize: Materialize,
+        exhausted: Option<(u32, u32)>,
+    ) {
+        QUEUE.with(|q| {
+            *q.borrow_mut() = lines
+                .into_iter()
+                .enumerate()
+                .map(|(index, (src, line))| (Slot::Lazy(index), src, line))
+                .collect();
+        });
+        MATERIALIZE.with(|m| *m.borrow_mut() = Some(materialize));
+        ERRORS.with(|e| e.borrow_mut().clear());
         POPPED.with(|p| p.set(0));
         LAST_LINE.with(|l| l.set(0));
         SEEDED.with(|s| s.set(true));
@@ -92195,11 +92240,30 @@ mod remaining_inputs {
             return Pop::ParseError(error);
         }
         let popped = QUEUE.with(|q| q.borrow_mut().pop_front());
-        if let Some((doc, src, line)) = popped {
+        if let Some((slot, src, line)) = popped {
             POPPED.with(|p| p.set(popped_so_far + 1));
             LAST_LINE.with(|l| l.set(line));
             CURRENT.with(|c| c.set(Some((src, line))));
-            return Pop::Document(doc);
+            return match slot {
+                Slot::Ready(doc) => Pop::Document(doc),
+                Slot::Lazy(index) => {
+                    let converted = MATERIALIZE
+                        .with(|m| m.borrow().as_ref().map(|materialize| materialize(index)));
+                    // The converter holds the stream's text: drop it with the last slot.
+                    if QUEUE.with(|q| q.borrow().is_empty()) {
+                        MATERIALIZE.with(|m| *m.borrow_mut() = None);
+                    }
+                    debug_assert!(
+                        converted.is_some(),
+                        "a lazy slot is queued with its converter"
+                    );
+                    match converted {
+                        Some(Ok(doc)) => Pop::Document(doc),
+                        Some(Err(error)) => Pop::ParseError(error),
+                        None => Pop::Exhausted,
+                    }
+                }
+            };
         }
         // Unreachable by the seed's own invariant (every error comes before
         // or at the end of the documents), kept as the end of the stream.
@@ -92525,6 +92589,23 @@ pub fn seed_remaining_inputs_with_errors(
     errors: Vec<(usize, EvalError, (u32, u32))>,
 ) {
     remaining_inputs::seed(documents, exhausted, errors);
+}
+
+/// [`seed_remaining_inputs`] for a stream the CLI has checked is clean, converting each document
+/// when it is read instead of up front (#5661).
+///
+/// `lines` is each document's `(source tag, 1-based end line)` in input order. `materialize` turns
+/// the document at an index into its value; an error it returns reaches the reader as the parse
+/// error `input` raises. The CLI takes this route only where no document can fail to convert and
+/// the stream holds no parse error, so a program that stops early (`first(inputs)`) neither
+/// parses nor holds the documents it never reads.
+#[cfg(feature = "std")]
+pub fn seed_remaining_inputs_lazily(
+    lines: impl IntoIterator<Item = (u32, u32)>,
+    materialize: Box<dyn Fn(usize) -> Result<OwnedValue, EvalError>>,
+    exhausted: Option<(u32, u32)>,
+) {
+    remaining_inputs::seed_lazy(lines, materialize, exhausted);
 }
 
 /// Counts the reads past the end of the input just seeded, as jq does (#4303).
@@ -113097,6 +113178,52 @@ mod tests {
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(1)));
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(2)));
         assert_eq!(pop_remaining_input(), None);
+    }
+
+    /// #5661: a lazily seeded queue converts a document when it is read and not before, moves the
+    /// marker and the line as an eager one does, reaches the end as one does, and hands a failed
+    /// conversion to the reader as the parse error `input` raises. The pin must be able to fail:
+    /// it does, with `seed_lazy` converting every slot as it queues it.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_lazily_seeded_queue_converts_only_what_is_read_5661() {
+        use core::cell::Cell;
+        use std::rc::Rc;
+
+        let converted = Rc::new(Cell::new(0usize));
+        let counter = Rc::clone(&converted);
+        seed_remaining_inputs_lazily(
+            vec![(0, 1), (0, 2), (0, 3), (0, 4)],
+            Box::new(move |index| {
+                counter.set(counter.get() + 1);
+                if index == 2 {
+                    Err(EvalError::new("cannot convert"))
+                } else {
+                    Ok(OwnedValue::Int(index as i64 * 10))
+                }
+            }),
+            Some((0, 4)),
+        );
+        assert_eq!(converted.get(), 0, "seeding converts nothing");
+        assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(0)));
+        assert_eq!(current_input_location(), Some((0, 1)));
+        assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(10)));
+        assert_eq!(converted.get(), 2, "only the documents read are converted");
+        assert!(matches!(
+            pop_input(),
+            InputPop::ParseError(error) if error.message == "cannot convert"
+        ));
+        assert_eq!(current_input_location(), Some((0, 3)));
+        assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(30)));
+        assert_eq!(converted.get(), 4);
+        // The converter owns the stream's text, so it goes with the last slot.
+        assert_eq!(Rc::strong_count(&converted), 1, "the converter is released");
+        assert_eq!(pop_remaining_input(), None);
+        assert_eq!(current_input_location(), Some((0, 4)));
+        // A later eager seed replaces the converter with nothing to convert.
+        seed_remaining_inputs(vec![(OwnedValue::Int(7), 0, 1)], None);
+        assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(7)));
+        assert_eq!(converted.get(), 4);
     }
 
     /// Evaluate `Identity`/`Field`/`Index` against an `OwnedValue` the way
