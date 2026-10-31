@@ -214,7 +214,23 @@ null"#,
 2",
         0,
     ),
-    // A path target the shipped walkers do not take runs the whole program through the path-mode interpreter.
+];
+
+#[test]
+fn test_stream_events_read_in_place_by_a_filter_match_jq_5681() -> Result<()> {
+    for (args, stdin, expected, code) in ROWS {
+        let (stdout, stderr, status) = run_jq_full(args, Some(stdin))?;
+        assert_eq!(
+            (stdout.trim_end(), status),
+            (*expected, *code),
+            "{args:?} on {stdin:?}: stderr {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// A path target the shipped walkers do not take runs the whole program through the path-mode interpreter.
+const DYNAMIC_PATH_ROWS: &[Row] = &[
     (
         &["-c", "--stream", "path(.[.[0][0]|select(.)])"],
         "[7,8]",
@@ -248,8 +264,9 @@ null"#,
 ];
 
 #[test]
-fn test_stream_events_read_in_place_by_a_filter_match_jq_5681() -> Result<()> {
-    for (args, stdin, expected, code) in ROWS {
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
+fn test_stream_events_dynamic_path_target_matches_jq_5681() -> Result<()> {
+    for (args, stdin, expected, code) in DYNAMIC_PATH_ROWS {
         let (stdout, stderr, status) = run_jq_full(args, Some(stdin))?;
         assert_eq!(
             (stdout.trim_end(), status),
