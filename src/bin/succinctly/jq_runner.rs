@@ -6367,10 +6367,9 @@ fn get_inputs(
     // filter that forces a real read (`force_read_under_null_input`, the
     // only way this function is even reached with `args.null_input` true),
     // real jq treats the condition `seq_no_rs_byte_warning` checks for as
-    // a *fatal* error (exit 5), not a warning -- printing the softer
-    // "ignoring parse error" wording there would misrepresent succinctly's
-    // separate, still-unfixed non-fatal behavior as though it now matched
-    // jq; left silent instead until that's fixed properly.
+    // a *fatal* error (exit 5), not a warning -- `input`/`inputs` raise it,
+    // which the `-n` branch below seeds as a trailing parse error (#5636),
+    // so the softer "ignoring parse error" wording is not printed there.
     //
     // The two arms are exactly disjoint: `seq_no_rs_byte_warning` answers
     // `Some` only for a stream with no RS byte anywhere, which is the one
