@@ -3341,8 +3341,8 @@ fn json_decode_failure(e: JsonError) -> StreamFailure {
 /// Catches a missing or doubled delimiter between two real children, and (#5644) a junk byte
 /// where the scan stops with nothing before it to excuse it: the first child of a container
 /// must follow its `[` or `{`, and a value (`expected` is `:`) must follow its key's closing
-/// `"`. Only space, tab, LF and CR are whitespace, as in JSON. A junk byte between a sibling's
-/// last byte and its `,` is not looked at here.
+/// `"`. Only space, tab, LF and CR are whitespace, as in JSON. A sibling must end on a byte a value
+/// can end on (#5650, `sibling_end_ok`).
 ///
 /// A trailing delimiter (`{"a":1,}`) or a delimiter in an apparently-empty
 /// container (`{,}`) needs the *closing* bracket's text position, which is
@@ -3378,9 +3378,50 @@ pub fn preceding_gap_ok(text: &[u8], child_start: usize, expected: Option<u8>) -
     let stopped_on_ok = match expected {
         None => i == 0 || matches!(text[i - 1], b'[' | b'{'),
         Some(b':') => i > 0 && text[i - 1] == b'"',
+        Some(b',') => i > 0 && sibling_end_ok(&text[..i]),
         Some(_) => true,
     };
     found == expected && stopped_on_ok
+}
+
+/// Whether `before`, which ends where a `,` gap begins, ends a value (#5650): the byte a sibling
+/// ends on must be able to end one, so `@`, a form feed or any other junk between a sibling and its
+/// `,` is refused, as jq refuses it (`[1@,2]`, a form feed after `"a"`). A number that has a bare
+/// token glued to it (`1null`, `1e`, `0x1`) is one malformed token to jq's lexer, so a bare token
+/// that starts like a number must be one. A token that starts with a letter (`true`, `nan`,
+/// `-Infinity`) is left to the value's own decode.
+fn sibling_end_ok(before: &[u8]) -> bool {
+    let last = before[before.len() - 1];
+    // The common siblings end here, in one byte test: a number's last digit, a string, a container.
+    // A bare token glued to a number that still ends in a digit (`0x1`, `1_000`) is not looked at:
+    // walking every number back would cost the pretty printer 18% on a number-heavy array.
+    if last.is_ascii_digit() || matches!(last, b'"' | b']' | b'}') {
+        return true;
+    }
+    if !(last.is_ascii_alphabetic() || last == b'.') {
+        return false;
+    }
+    let boundary = |b: u8| {
+        matches!(
+            b,
+            b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'[' | b'{' | b',' | b':' | b']' | b'}'
+        )
+    };
+    let start = before
+        .iter()
+        .rposition(|&b| boundary(b))
+        .map_or(0, |p| p + 1);
+    let token = &before[start..];
+    let unsigned = token
+        .strip_prefix(b"-")
+        .or_else(|| token.strip_prefix(b"+"))
+        .unwrap_or(token);
+    match unsigned.first() {
+        Some(c) if c.is_ascii_digit() || *c == b'.' => {
+            number_literal_end(token, 0) == Some(token.len())
+        }
+        _ => true,
+    }
 }
 
 /// The forward-scan counterpart of [`preceding_gap_ok`]: whether exactly
@@ -3459,7 +3500,7 @@ fn trailing_gap_ok(text: &[u8], gap_start: usize, close_char: u8) -> bool {
     let mut i = gap_start;
     while i < text.len() {
         match text[i] {
-            b if b.is_ascii_whitespace() => i += 1,
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1, // JSON whitespace: no form feed (#5650)
             b if b == close_char => return true,
             _ => return false,
         }
