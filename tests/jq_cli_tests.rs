@@ -8270,19 +8270,26 @@ fn test_seq_warns_under_slurp_1723() -> Result<()> {
 }
 
 /// #1723: the modes #1525 deliberately kept silent stay silent -- `-R`
-/// takes over raw-text handling, DSV content holds no RFC 7464 records,
-/// and `-n` turns this into a fatal error in real jq that succinctly does
-/// not implement (see `test_seq_null_input_with_inputs_does_not_warn_1525`).
+/// takes over raw-text handling and DSV content holds no RFC 7464 records.
+/// `-n` is not one of them: it prints no warning either, but `input`/`inputs`
+/// raise the reader's parse error, as real jq does (#5640, see
+/// `test_seq_null_input_with_inputs_raises_not_warns_1525`).
 #[test]
 fn test_seq_warning_guards_still_suppress_1723() -> Result<()> {
-    for args in [
-        &["-R", "--seq", "-c", "."][..],
-        &["-n", "--seq", "-c", "[inputs]"][..],
-    ] {
-        let (_stdout, stderr, code) = run_jq_full(args, Some("\u{1e}not valid json\n")).unwrap();
-        assert_eq!(code, 0, "args {args:?} stderr: {stderr}");
-        assert_eq!(stderr, "", "args {args:?}");
-    }
+    let (_stdout, stderr, code) =
+        run_jq_full(&["-R", "--seq", "-c", "."], Some("\u{1e}not valid json\n")).unwrap();
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stderr, "");
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "--seq", "-c", "[inputs]"],
+        Some("\u{1e}not valid json\n"),
+    )
+    .unwrap();
+    assert_eq!((stdout.as_str(), code), ("", 5));
+    assert_eq!(
+        stderr,
+        "jq: error (at <stdin>:1): Invalid numeric literal at line 1, column 5 (need RS to resync)\n"
+    );
     Ok(())
 }
 

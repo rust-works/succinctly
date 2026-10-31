@@ -6382,17 +6382,19 @@ fn get_inputs(
     let mut seq_slurp_position_lost = false;
     // `jq_seq_reader::SeqStreamWalk::deferred_warning` (#3201).
     let mut seq_deferred_warning: Option<String> = None;
-    // The error `-n`'s `input`/`inputs` raise on a `--seq` stream with no RS byte (#5636).
-    let mut seq_abandoned_text: Option<TrailingParseError> = None;
     // The raw walk's value ranges (`jq_seq_reader::SeqStreamWalk::values`,
     // #3247): the same pass that decides jq's warnings decides its values,
     // over the same raw bytes, already cut at #2998's end-of-stream drop.
     // Empty for #1525's no-RS-byte stream, where nothing ever leaves
     // `WAITING_FOR_RS`: the warning arm runs no walk, and under `-n` the walk
-    // finds nothing (`seq_abandoned_text` is what tells the two streams apart).
+    // finds no value but records the `Unfinished abandoned text` fault `input` raises
+    // (#5636, #5640).
     let mut seq_values: Vec<(usize, usize)> = Vec::new();
     // And each value's `(source index, line)` from the same walk (#3250).
     let mut seq_value_locations: Vec<(usize, usize)> = Vec::new();
+    // The walk's diagnostics, kept only for `-n` (#5640): `input`/`inputs` raise each one, in
+    // order with the values, where a plain run prints it as a warning.
+    let mut seq_fault_errors: Vec<(usize, TrailingParseError)> = Vec::new();
     // Shared by `seq_warnings_apply` below, the `-n`-forced-read fallback
     // just after it, and the `build_seq_values` gate further down -- one
     // definition rather than three hand-copies of the same shape, so a
@@ -6435,33 +6437,43 @@ fn get_inputs(
         // `-R` are excluded from both gates identically. That combination
         // skips the warnings but still needs the values and `-s`'s
         // location, so it runs the walk here with a no-op sink.
-        let walk = crate::jq_seq_reader::walk_stream(&raw_bytes, args.slurp, &mut |_| {});
+        let walk =
+            crate::jq_seq_reader::walk_stream_collecting(&raw_bytes, args.slurp, true, &mut |_| {});
         seq_values = walk.values;
         seq_value_locations = walk.locations;
+        // `input`/`inputs` raise what a plain run only warns about (#5640).
+        seq_fault_errors = walk
+            .faults
+            .into_iter()
+            .map(|fault| {
+                let source = raw_bytes
+                    .get(fault.source)
+                    .and_then(|(index, _)| *index)
+                    .unwrap_or(0);
+                (
+                    // `-s` reads the whole stream into one array, so every fault the reader
+                    // met is raised by a read before that array is handed over.
+                    if args.slurp { 0 } else { fault.values_before },
+                    TrailingParseError {
+                        error: EvalError::new(fault.body),
+                        source: if fault.position_lost {
+                            NO_SOURCE
+                        } else {
+                            u32::try_from(source).unwrap_or(u32::MAX)
+                        },
+                        line: if fault.position_lost {
+                            UNKNOWN_LINE
+                        } else {
+                            u32::try_from(fault.line).unwrap_or(u32::MAX)
+                        },
+                        seq_warning: false,
+                    },
+                )
+            })
+            .collect();
         // `-n -s`'s `input`/`inputs` read the deferred warning too.
         seq_deferred_warning = walk.deferred_warning;
         seq_slurp_position_lost = walk.slurp_position_lost;
-        // A stream with no RS byte is never synced onto, so the first read of it raises
-        // `Unfinished abandoned text at EOF` (#5636) -- an error `input` raises and `inputs`
-        // re-raises, at the position of the end of the last source. The same stream without
-        // `-n` only warns (above). A malformed BOM is the reader's case, as there (#1723).
-        // `-s` is left as it was (#5640): jq raises this in place of the slurped array, and this
-        // path still delivers the array, or `[]`, and raises nothing.
-        if !args.slurp {
-            if let (Some((text_line, column)), Some((last, bytes))) =
-                (seq_no_rs_byte_position(&raw_bytes), raw_bytes.last())
-            {
-                let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
-                seq_abandoned_text = Some(TrailingParseError {
-                    error: EvalError::new(format!(
-                        "Unfinished abandoned text at EOF at line {text_line}, column {column}"
-                    )),
-                    source: u32::try_from(last.unwrap_or(0)).unwrap_or(u32::MAX),
-                    line: u32::try_from(newlines).unwrap_or(u32::MAX),
-                    seq_warning: false,
-                });
-            }
-        }
     }
 
     // Answered here, before the UTF-8 substitution below consumes
@@ -6717,7 +6729,7 @@ fn get_inputs(
     // (#3201): delivered after the slurped array, to the driver or to the
     // filter's own `input`. jq has lost its position by then -- the call
     // that raises it closed the stream -- so it names `<unknown>`.
-    let mut resumed_errors: Vec<(usize, TrailingParseError)> = Vec::new();
+    let mut resumed_errors: Vec<(usize, TrailingParseError)> = seq_fault_errors;
     // #5635: the `--stream` events of the document the parse error ended, which jq's streaming
     // parser yielded before it met the fault -- `(event, source, line)`.
     let mut stream_prefix: Vec<StreamPrefix> = Vec::new();
@@ -6725,14 +6737,13 @@ fn get_inputs(
     // `resumed_errors`.
     let mut resumed_prefixes: Vec<Vec<StreamPrefix>> = Vec::new();
     let prefix_wanted = args.stream && stream_mode(args, track_eof, true) != StreamMode::Off;
-    let mut trailing_error: Option<TrailingParseError> = seq_abandoned_text.or_else(|| {
+    let mut trailing_error: Option<TrailingParseError> =
         seq_deferred_warning.map(|message| TrailingParseError {
             error: EvalError::new(message),
             source: NO_SOURCE,
             line: UNKNOWN_LINE,
             seq_warning: true,
-        })
-    });
+        });
 
     // `--seq` (RFC 7464, #1571) and raw-input (`-R`, #1809): both can
     // genuinely join content across a file boundary -- real jq's own
