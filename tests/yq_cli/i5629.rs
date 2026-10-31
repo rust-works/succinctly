@@ -41,7 +41,7 @@ fn run(program: &str) -> Result<(String, i32)> {
 #[test]
 fn test_a_chain_of_equality_comparisons_folds_from_the_right_5629() -> Result<()> {
     for (program, expected) in ROWS {
-        assert_eq!(run(program)?, (expected.to_string(), 0), "{program:?}");
+        assert_eq!(run(program)?, ((*expected).to_string(), 0), "{program:?}");
     }
     Ok(())
 }
