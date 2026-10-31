@@ -161,7 +161,7 @@ impl std::error::Error for ValidationError {}
 /// [`ValidationErrorKind::NestingTooDeep`] instead of overflowing the stack.
 /// Matches the YAML parser's cap and keeps depth-100 documents (pinned by
 /// `tests/deep_nesting_valid_tests.rs`) valid.
-const MAX_NESTING_DEPTH: usize = 128;
+pub(crate) const MAX_NESTING_DEPTH: usize = 128;
 
 /// A strict JSON validator with position tracking.
 ///
