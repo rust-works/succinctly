@@ -12359,10 +12359,11 @@ fn projection_peel<S: EvalSemantics>(
     let mut child = child;
     let mut rest = rest;
     while let [next, tail @ ..] = skip_identity_stages(rest) {
-        if tail.is_empty() || !matches!(next, Expr::Field(_) | Expr::Index { .. }) {
-            break;
-        }
-        let Some(Ok(Some(stepped))) = eval_owned_navigation::<S>(next, &child, optional) else {
+        let read = !tail.is_empty() && matches!(next, Expr::Field(_) | Expr::Index { .. });
+        let Some(Ok(Some(stepped))) = read
+            .then(|| eval_owned_navigation::<S>(next, &child, optional))
+            .flatten()
+        else {
             break;
         };
         child = stepped;
@@ -115025,18 +115026,13 @@ mod tests {
         // A read in the middle of the chain that raises ends the walk, and the rest of the pipe
         // raises it as the re-entry did.
         let scalar = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
-        let mut out = Vec::new();
         let flow = eval_each_owned::<JqSemantics>(
             &parse(".a.b.c.d").unwrap(),
             &scalar,
             false,
             Reentry::REBUILT,
-            &mut |v| {
-                out.push(v);
-                Demand::Continue
-            },
+            &mut |_| panic!("nothing is emitted before the error"),
         );
-        assert_eq!(out.len(), 0, "nothing is emitted before the error");
         assert!(
             matches!(&flow, Flow::Escaped(Control::Error(e)) if e.to_string().contains("Cannot index number")),
             "the rest of the pipe raises"
