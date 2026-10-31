@@ -3341,8 +3341,8 @@ fn json_decode_failure(e: JsonError) -> StreamFailure {
 /// Catches a missing or doubled delimiter between two real children, and (#5644) a junk byte
 /// where the scan stops with nothing before it to excuse it: the first child of a container
 /// must follow its `[` or `{`, and a value (`expected` is `:`) must follow its key's closing
-/// `"`. Only space, tab, LF and CR are whitespace, as in JSON. A junk byte between a sibling's
-/// last byte and its `,` is not looked at here.
+/// `"`. Only space, tab, LF and CR are whitespace, as in JSON. A sibling must end on a byte a value
+/// can end on (#5650, `sibling_end_ok`).
 ///
 /// A trailing delimiter (`{"a":1,}`) or a delimiter in an apparently-empty
 /// container (`{,}`) needs the *closing* bracket's text position, which is
@@ -3378,9 +3378,44 @@ pub fn preceding_gap_ok(text: &[u8], child_start: usize, expected: Option<u8>) -
     let stopped_on_ok = match expected {
         None => i == 0 || matches!(text[i - 1], b'[' | b'{'),
         Some(b':') => i > 0 && text[i - 1] == b'"',
+        Some(b',') => i > 0 && sibling_end_ok(&text[..i]),
         Some(_) => true,
     };
     found == expected && stopped_on_ok
+}
+
+/// Whether `before`, which ends where a `,` gap begins, ends a value (#5650): the byte a sibling
+/// ends on must be able to end one, so `@`, a form feed or any other junk between a sibling and its
+/// `,` is refused, as jq refuses it (`[1@,2]`, a form feed after `"a"`). A number that has a bare
+/// token glued to it (`1null`, `1e`, `0x1`) is one malformed token to jq's lexer, so a bare token
+/// that starts like a number must be one. A token that starts with a letter (`true`, `nan`,
+/// `-Infinity`) is left to the value's own decode.
+fn sibling_end_ok(before: &[u8]) -> bool {
+    let last = before[before.len() - 1];
+    // The common siblings end here, in one byte test: a number's last digit, a string, a container.
+    // A bare token glued to a number that still ends in a digit (`0x1`, `1_000`) is not looked at:
+    // walking every number back would cost the pretty printer 18% on a number-heavy array.
+    if last.is_ascii_digit() || matches!(last, b'"' | b']' | b'}') {
+        return true;
+    }
+    if !(last.is_ascii_alphabetic() || last == b'.') {
+        return false;
+    }
+    let start = before
+        .iter()
+        .rposition(|&b| jq_literal_boundary(b))
+        .map_or(0, |p| p + 1);
+    let token = &before[start..];
+    let unsigned = token
+        .strip_prefix(b"-")
+        .or_else(|| token.strip_prefix(b"+"))
+        .unwrap_or(token);
+    match unsigned.first() {
+        Some(c) if c.is_ascii_digit() || *c == b'.' => {
+            number_literal_end(token, 0) == Some(token.len())
+        }
+        _ => true,
+    }
 }
 
 /// The forward-scan counterpart of [`preceding_gap_ok`]: whether exactly
@@ -3459,7 +3494,7 @@ fn trailing_gap_ok(text: &[u8], gap_start: usize, close_char: u8) -> bool {
     let mut i = gap_start;
     while i < text.len() {
         match text[i] {
-            b if b.is_ascii_whitespace() => i += 1,
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1, // JSON whitespace: no form feed (#5650)
             b if b == close_char => return true,
             _ => return false,
         }
@@ -5814,6 +5849,78 @@ fn stream_json_yaml_double_quoted<Out: core::fmt::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // #5650: the byte a sibling ends on, and JSON whitespace only.
+    // ------------------------------------------------------------------
+
+    /// `preceding_gap_ok(text, at, Some(b','))` for the `2` of `"<head>,2"`.
+    fn comma_gap_ok(head: &[u8]) -> bool {
+        // STYLE-0013: a unit test of the shared check itself; there is no field to route through.
+        let mut text = head.to_vec();
+        text.extend_from_slice(b",2");
+        preceding_gap_ok(&text, head.len() + 1, Some(b','))
+    }
+
+    #[test]
+    fn test_a_sibling_must_end_on_a_byte_a_value_can_end_on_5650() {
+        for ok in [
+            &b"[1"[..],
+            b"[1.",
+            b"[.5",
+            b"[-0",
+            b"[1e5",
+            b"[1.5E+3",
+            b"[\"a\"",
+            b"[[1]",
+            b"[{}",
+            b"[true",
+            b"[false",
+            b"[null",
+            b"[nan",
+            b"[-nan",
+            b"[Nan4000",
+            b"[Infinity",
+            b"[-Infinity",
+            b"[1 ",
+            b"[1\n\t\r ",
+        ] {
+            assert!(comma_gap_ok(ok), "{:?}", String::from_utf8_lossy(ok));
+        }
+        for bad in [
+            &b"[1@"[..],
+            b"[\"a\"@",
+            b"[true@",
+            b"[[1]@",
+            b"[1\x0c",
+            b"[\"a\"\x0c",
+            b"[1\x00",
+            b"[1null",
+            b"[1true",
+            b"[1false",
+            b"[1e",
+            b"[-1x",
+            b"[.5x",
+            b"[1e+",
+            b"[1-",
+        ] {
+            assert!(!comma_gap_ok(bad), "{:?}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    #[test]
+    fn test_a_digit_ending_glued_token_is_left_to_the_decode_5650() {
+        // The trade `sibling_end_ok` documents: one byte test per number, so `0x1` is not seen here.
+        assert!(comma_gap_ok(b"[0x1"));
+        assert!(comma_gap_ok(b"[1_000"));
+    }
+
+    #[test]
+    fn test_a_form_feed_is_not_whitespace_in_a_trailing_gap_5650() {
+        assert!(trailing_gap_ok(b"[1 \n\t\r]", 2, b']'));
+        assert!(!trailing_gap_ok(b"[1\x0c]", 2, b']'));
+        assert!(!trailing_gap_ok(b"[1@]", 2, b']'));
+    }
 
     // ------------------------------------------------------------------
     // #3340: the string arm walks `SpecialMask` blocks instead of bytes.

@@ -8741,8 +8741,9 @@ fn split_json_values(bytes: &[u8]) -> (Vec<(usize, usize)>, Option<usize>) {
     let mut pos = 0;
 
     while pos < bytes.len() {
-        // Skip whitespace
-        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+        // Skip whitespace: space, tab, LF and CR only, as jq's lexer does; a form feed starts a
+        // token no value can begin with (#5650).
+        while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
             pos += 1;
         }
         if pos >= bytes.len() {
