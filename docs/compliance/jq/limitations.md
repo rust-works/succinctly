@@ -327,6 +327,30 @@ The offset is the character's first byte within its line: a 3- or 4-byte charact
 One at 4092 or below, or at 4095 or above, is read intact, and `-Rn` with `inputs` agrees with jq on the same line.
 Pinned by `tests/jq_cli/i5476.rs`, which asserts succinctly's side; jq's side was captured from `/usr/bin/jq` 1.7.1.
 
+## A NUL byte truncates jq's input in a chunk with no newline; succinctly reports it (#5654)
+
+jq 1.7.1 reads JSON input through `fgets` into a 4096-byte buffer, and `jq_util_input_read_more` then measures a chunk that holds no newline with `strlen`.
+A NUL byte in such a chunk ends the chunk there, and the rest of it is dropped without a word.
+A chunk that does hold a newline is handed to the parser whole, so the same NUL is an `Invalid numeric literal` error.
+The input's last chunk, the only one of a short file without a trailing newline, is the case that loses data.
+`succinctly jq` reads the text as it is and reports the NUL as a parse error in both cases.
+This is jq discarding the input after the NUL with exit status 0, so the divergence stands under [ADR-0018](../../adrs/adr-0018.md) rather than being matched.
+The `--seq` reader has the same quirk, recorded above.
+
+Rows from `printf '<text>' | jq -c .` (a NUL is `\0`), jq 1.7.1 against `succinctly jq`:
+
+| input        | jq 1.7.1                                                  | succinctly jq                                                |
+|--------------|-----------------------------------------------------------|--------------------------------------------------------------|
+| `\0[1]`      | nothing, exit 0                                           | `Invalid numeric literal at line 1, column 2`, exit 5        |
+| `[1]\0`      | `[1]`, exit 0                                             | `[1]`, then `Invalid numeric literal at EOF`, exit 5         |
+| `[1]\0[2]`   | `[1]`, exit 0                                             | `[1]`, then `Invalid numeric literal`, exit 5                |
+| `[1\0,2]`    | `Unfinished JSON term at EOF at line 1, column 2`, exit 5 | `Invalid JSON text: expected ',' or ']', found '\0'`, exit 5 |
+| `[1,2\0]`    | `Unfinished JSON term at EOF at line 1, column 4`, exit 5 | `Invalid JSON text: expected ',' or ']', found '\0'`, exit 5 |
+| `[1]\0[2]\n` | `Invalid numeric literal at line 1, column 5`, exit 5     | the same                                                     |
+
+The last row is the agreement: with a newline in the chunk jq does not truncate either.
+`tests/jq_cli/i5654_nul.rs` pins both sides.
+
 ## Conversion diagnostics
 
 jq implements `tonumber` and `fromjson` by handing the string to its JSON parser, so a failure surfaces as that parser's diagnostic.
