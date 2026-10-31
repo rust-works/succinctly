@@ -5111,8 +5111,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // #5674: `--seq` input joins them when the stream is clean (see
     // [`seq_plain_json_inputs`]): the records are then a plain JSON stream, and reading them as
     // one skips the per-record index the materializing route builds.
-    let mut seq_plain: Option<PreparedInputs> = None;
-    if args.seq
+    let mut seq_plain: Option<PreparedInputs> = if args.seq
         && !args.raw_input
         && args.input_dsv.is_none()
         && !args.stream
@@ -5121,8 +5120,10 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         && !args.null_input
         && !uses_input_builtins
     {
-        seq_plain = seq_plain_json_inputs(&args)?;
-    }
+        seq_plain_json_inputs(&args)?
+    } else {
+        None
+    };
     let can_use_lazy_path = !args.raw_input
         && args.input_dsv.is_none()
         && (!args.seq || seq_plain.is_some()) // seq input otherwise parses differently
@@ -9024,6 +9025,11 @@ fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Ve
         || !walk.faults.is_empty()
         || walk.values.is_empty()
     {
+        return Err(raw);
+    }
+    // `-s` wraps the values in one array, which is a level more than the deepest value has: a
+    // stream near the nesting ceiling keeps the route that places that error (#2847).
+    if slurp && !json_depth_at_most(&raw, LAZY_JSON_MAX_DEPTH) {
         return Err(raw);
     }
     // Between values (and around them) only JSON whitespace or an RS byte may stand, and every RS
@@ -13415,7 +13421,8 @@ mod tests {
             b"\n\x1e\n\x1e{}\n\n",
         ];
         for raw in clean {
-            let got = seq_stream_as_plain_json(raw.to_vec(), false).expect(&format!("{raw:?}"));
+            let got =
+                seq_stream_as_plain_json(raw.to_vec(), false).unwrap_or_else(|_| panic!("{raw:?}"));
             let blanked: Vec<u8> = raw
                 .iter()
                 .map(|&b| if b == ASCII_RS { b' ' } else { b })
@@ -13434,6 +13441,10 @@ mod tests {
             b"\x1e1\x1e2\n",                 // a number cut off by the next RS
             b"\x1e{\"a\":1} x\n",
         ];
+        // `-s` adds a level to the deepest value, so a deep stream keeps the route that counts it.
+        let deep = format!("\x1e{}{}\n", "[".repeat(100), "]".repeat(100)).into_bytes();
+        assert!(seq_stream_as_plain_json(deep.clone(), false).is_ok());
+        assert_eq!(seq_stream_as_plain_json(deep.clone(), true), Err(deep));
         for raw in unusual {
             assert_eq!(
                 seq_stream_as_plain_json(raw.to_vec(), false),

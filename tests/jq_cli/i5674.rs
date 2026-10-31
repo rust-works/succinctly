@@ -160,7 +160,7 @@ fn seq_streams_answer_as_jq_does_5674() -> Result<()> {
             let got = run_jq_full(&all, Some(stream))?;
             assert_eq!(
                 got,
-                (stdout.to_string(), stderr.to_string(), *status),
+                ((*stdout).to_string(), (*stderr).to_string(), *status),
                 "{name}: {args:?}"
             );
         }
@@ -190,5 +190,26 @@ fn seq_streams_from_a_file_answer_as_from_stdin_5674() -> Result<()> {
             assert_eq!(got.1.replace(&path, "<stdin>"), *stderr, "{name}: {args:?}");
         }
     }
+    Ok(())
+}
+
+/// Two sources are one stream to jq, so they keep the route that joins them: a record can span
+/// the seam, and the output is the one stream's.
+#[test]
+fn seq_stream_across_two_files_5674() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (one, two) = (dir.path().join("one.seq"), dir.path().join("two.seq"));
+    std::fs::write(&one, "\x1e{\"a\":1}\n\x1e{\"a\":")?;
+    std::fs::write(&two, "2}\n\x1e[3]\n")?;
+    let (one, two) = (one.to_string_lossy(), two.to_string_lossy());
+    let got = run_jq_full(&["--seq", "-c", ".", &one, &two], None)?;
+    assert_eq!(
+        got,
+        (
+            "\x1e{\"a\":1}\n\x1e{\"a\":2}\n\x1e[3]\n".to_string(),
+            String::new(),
+            0
+        )
+    );
     Ok(())
 }
