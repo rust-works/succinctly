@@ -5856,6 +5856,7 @@ mod tests {
 
     /// `preceding_gap_ok(text, at, Some(b','))` for the `2` of `"<head>,2"`.
     fn comma_gap_ok(head: &[u8]) -> bool {
+        // STYLE-0013: a unit test of the shared check itself; there is no field to route through.
         let mut text = head.to_vec();
         text.extend_from_slice(b",2");
         preceding_gap_ok(&text, head.len() + 1, Some(b','))
