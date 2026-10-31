@@ -13132,25 +13132,16 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
 pub(crate) fn is_closed_unary_builtin(stage: &Expr) -> bool {
     matches!(
         unwrap_paren(stage),
-        Expr::Builtin(
-            Builtin::Floor
-                | Builtin::Ceil
-                | Builtin::Round
-                | Builtin::Sqrt
-                | Builtin::Fabs
-                | Builtin::Length
-                | Builtin::AsciiDowncase
-                | Builtin::AsciiUpcase
-        )
-    )
+        Expr::Builtin(Builtin::Length | Builtin::AsciiDowncase | Builtin::AsciiUpcase)
+    ) || matches!(unwrap_paren(stage), Expr::Builtin(builtin) if is_unary_math_builtin(builtin))
 }
 
 /// A pipe stage of a closed expression that [`eval_owned_fast_path`] does not
 /// answer (#3944): `$r.score | floor`. The input is the closed head's value,
 /// never the accumulator, so the evaluator runs on a value the size of one
 /// record field. The stage is a whitelisted builtin with no argument, so it
-/// cannot fan out or run an effect. The six math builtins of a number are
-/// [`owned_unary_math`]'s, with no evaluation at all (#5601); every other case,
+/// cannot fan out or run an effect. The math builtins of a number are
+/// [`owned_unary_math`]'s, with no evaluation at all (#5601, #5669); every other case,
 /// or one that raises or yields nothing, is the evaluator's, and `None` leaves the
 /// caller on its own route and text.
 /// jq mode only, like the operators in [`closed_expr_to_owned_at_depth`].
@@ -96375,10 +96366,12 @@ pub(crate) fn integral_f64_result<S: EvalSemantics>(f: f64) -> OwnedValue {
     }
 }
 
-/// The answer of `floor`, `ceil`, `round`, `trunc`, `sqrt` or `fabs` for the finite double `n`, as
-/// `builtin_floor` and its siblings build it (#5593): the one mapping from builtin to libm call, shared
-/// by those, by the cursor arm of the generic evaluator and by [`owned_unary_math`]. `None` for any
-/// other builtin.
+/// The answer of a unary math builtin for the finite double `n`, as `builtin_floor` and its siblings
+/// build it (#5593): `floor`, `ceil`, `round`, `trunc`, `sqrt`, `fabs` and, since #5669, the
+/// eighteen that are one libm call each (`log`, `exp`, `sin`, ...). The mapping from builtin to libm
+/// call the cursor arm of the generic evaluator and [`owned_unary_math`] share, and which
+/// `unary_math_apply_agrees_with_the_evaluators_builtins_5669` holds equal to the `builtin_*`
+/// functions. `None` for any other builtin.
 pub(crate) fn unary_math_apply<S: EvalSemantics>(builtin: &Builtin, n: f64) -> Option<OwnedValue> {
     Some(match builtin {
         Builtin::Floor => integral_f64_result::<S>(math::floor(n)),
@@ -96387,8 +96380,60 @@ pub(crate) fn unary_math_apply<S: EvalSemantics>(builtin: &Builtin, n: f64) -> O
         Builtin::Trunc => integral_f64_result::<S>(math::trunc(n)),
         Builtin::Sqrt => OwnedValue::Float(math::sqrt(n)),
         Builtin::Fabs => OwnedValue::Float(math::fabs(n)),
+        // The eighteen that are one libm call each (#5669): `builtin_log` and its siblings are
+        // `OwnedValue::Float(math::f(n))`, so these are the same call and the same last digit.
+        Builtin::Log => OwnedValue::Float(math::log(n)),
+        Builtin::Log10 => OwnedValue::Float(math::log10(n)),
+        Builtin::Log2 => OwnedValue::Float(math::log2(n)),
+        Builtin::Exp => OwnedValue::Float(math::exp(n)),
+        Builtin::Exp10 => OwnedValue::Float(math::exp10(n)),
+        Builtin::Exp2 => OwnedValue::Float(math::exp2(n)),
+        Builtin::Sin => OwnedValue::Float(math::sin(n)),
+        Builtin::Cos => OwnedValue::Float(math::cos(n)),
+        Builtin::Tan => OwnedValue::Float(math::tan(n)),
+        Builtin::Asin => OwnedValue::Float(math::asin(n)),
+        Builtin::Acos => OwnedValue::Float(math::acos(n)),
+        Builtin::Atan => OwnedValue::Float(math::atan(n)),
+        Builtin::Sinh => OwnedValue::Float(math::sinh(n)),
+        Builtin::Cosh => OwnedValue::Float(math::cosh(n)),
+        Builtin::Tanh => OwnedValue::Float(math::tanh(n)),
+        Builtin::Asinh => OwnedValue::Float(math::asinh(n)),
+        Builtin::Acosh => OwnedValue::Float(math::acosh(n)),
+        Builtin::Atanh => OwnedValue::Float(math::atanh(n)),
         _ => return None,
     })
+}
+
+/// Whether [`unary_math_apply`] answers `builtin`: the one list the cursor arm
+/// (`unary_math_of_document_number`) and [`owned_unary_math`] both check before reading a number.
+pub(crate) fn is_unary_math_builtin(builtin: &Builtin) -> bool {
+    matches!(
+        builtin,
+        Builtin::Floor
+            | Builtin::Ceil
+            | Builtin::Round
+            | Builtin::Trunc
+            | Builtin::Sqrt
+            | Builtin::Fabs
+            | Builtin::Log
+            | Builtin::Log10
+            | Builtin::Log2
+            | Builtin::Exp
+            | Builtin::Exp10
+            | Builtin::Exp2
+            | Builtin::Sin
+            | Builtin::Cos
+            | Builtin::Tan
+            | Builtin::Asin
+            | Builtin::Acos
+            | Builtin::Atan
+            | Builtin::Sinh
+            | Builtin::Cosh
+            | Builtin::Tanh
+            | Builtin::Asinh
+            | Builtin::Acosh
+            | Builtin::Atanh
+    )
 }
 
 /// [`unary_math_apply`] of an owned number (#5601), so a computed or bound number does not take the
@@ -96400,20 +96445,13 @@ pub(crate) fn owned_unary_math<S: EvalSemantics>(
     builtin: &Builtin,
     input: &OwnedValue,
 ) -> Option<OwnedValue> {
-    if S::TAG != EvalTag::Jq
-        || !matches!(
-            builtin,
-            Builtin::Floor
-                | Builtin::Ceil
-                | Builtin::Round
-                | Builtin::Trunc
-                | Builtin::Sqrt
-                | Builtin::Fabs
-        )
-    {
+    if S::TAG != EvalTag::Jq || !is_unary_math_builtin(builtin) {
         return None;
     }
     let n = match input {
+        // An `Int` past 2^53 is not its own double: the bridge writes it out and reads back the
+        // nearest 17-digit double, which `as_f64` would not give, so it keeps the bridge.
+        OwnedValue::Int(i) if i.unsigned_abs() > 1 << 53 => return None,
         OwnedValue::Int(_) | OwnedValue::Float(_) => input.as_f64(),
         // A literal's double is read from its text, as `json_number_f64` reads a document's:
         // `-0` is `Int(0)` in the parsed form and has lost its sign there.
@@ -114024,6 +114062,49 @@ mod tests {
         ] {
             assert_eq!(branches(merged), None, "{merged}");
         }
+    }
+
+    /// #5669: `unary_math_apply` is what the evaluator's own `builtin_*` functions answer. The
+    /// fast arms (cursor and owned) call it instead of them, so a builtin whose body changes, or one
+    /// added to one side only, would answer differently by route; this holds the two equal for
+    /// every builtin `is_unary_math_builtin` names, and holds the name list to the same set.
+    #[test]
+    fn unary_math_apply_agrees_with_the_evaluators_builtins_5669() {
+        let names = [
+            "floor", "ceil", "round", "trunc", "sqrt", "fabs", "log", "log10", "log2", "exp",
+            "exp10", "exp2", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh",
+            "asinh", "acosh", "atanh",
+        ];
+        let numbers = [
+            0.0, -0.0, 0.5, -0.5, 1.0, 2.0, 10.0, -1.0, 1e-5, 100000.0, 1e19, -3.25, 709.5, 0.999,
+        ];
+        let mut named = 0;
+        for name in names {
+            let Expr::Builtin(builtin) = parse(name).unwrap() else {
+                panic!("{name} is not a builtin"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message of the assertion this test exists to make (#5669)"
+            };
+            assert!(is_unary_math_builtin(&builtin), "{name}");
+            named += 1;
+            for n in numbers {
+                let text = alloc::format!("{n:e}");
+                let index = JsonIndex::build(text.as_bytes());
+                let evaluated = eval_builtin::<Vec<u64>, JqSemantics>(
+                    &builtin,
+                    index.root(text.as_bytes()).value(),
+                    false,
+                );
+                let QueryResult::Owned(expected) = evaluated else {
+                    panic!("{name}({n}) was not one owned value"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message of the assertion this test exists to make (#5669)"
+                };
+                let applied = unary_math_apply::<JqSemantics>(&builtin, n)
+                    .unwrap_or_else(|| panic!("{name} has no arm")); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message of the assertion this test exists to make (#5669)"
+                assert_eq!(applied.to_json(), expected.to_json(), "{name}({n})");
+            }
+        }
+        assert_eq!(named, 24);
+        // And the predicate names nothing the list above does not.
+        assert!(!is_unary_math_builtin(&Builtin::Length));
+        assert!(!is_unary_math_builtin(&Builtin::Abs));
     }
 
     /// #5549: `owned_del_step` is the delete the reindex bridge makes of a `del` whose path is
