@@ -74,18 +74,10 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-fn instant(
-    year: i64,
-    month: i64,
-    day: i64,
-    hour: i64,
-    minute: i64,
-    second: i64,
-    nanos: i64,
-    offset_seconds: i64,
-) -> Instant {
-    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second
-        - offset_seconds;
+/// The instant at `second_of_day` seconds and `nanos` nanoseconds into the day `days` days after
+/// the epoch, in a zone `offset_seconds` east of UTC.
+fn instant(days: i64, second_of_day: i64, nanos: i64, offset_seconds: i64) -> Instant {
+    let seconds = days * 86_400 + second_of_day - offset_seconds;
     i128::from(seconds) * 1_000_000_000 + i128::from(nanos)
 }
 
@@ -172,7 +164,10 @@ fn parse_rfc3339(text: &[u8]) -> Option<Instant> {
         return None;
     }
     Some(instant(
-        year, month, day, hour, minute, second, nanos, offset,
+        days_from_civil(year, month, day),
+        hour * 3_600 + minute * 60 + second,
+        nanos,
+        offset,
     ))
 }
 
@@ -184,7 +179,7 @@ fn quote(bytes: &[u8]) -> String {
         if b == b'"' || b == b'\\' {
             out.push('\\');
             out.push(char::from(b));
-        } else if b >= 0x80 || b < b' ' {
+        } else if !(b' '..0x80).contains(&b) {
             out.push_str(&format!("\\x{b:02x}"));
         } else {
             out.push(char::from(b));
@@ -235,7 +230,7 @@ fn parse_date(text: &[u8]) -> Result<Instant, String> {
     if day < 1 || day > days_in(month, year) {
         return Err(format!("parsing time {whole}: day out of range"));
     }
-    Ok(instant(year, month, day, 0, 0, 0, 0, 0))
+    Ok(instant(days_from_civil(year, month, day), 0, 0, 0))
 }
 
 #[cfg(test)]
