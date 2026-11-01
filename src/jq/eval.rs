@@ -86875,12 +86875,13 @@ fn collect_tostream_events_owned(
 ///
 /// `None` means "take the conversion instead": the walk does not decide anything the conversion
 /// decides differently. It declines a repeated key in an object, which the conversion collapses to
-/// the key's first position and last value (and jq's own `--stream` does not); a key with an escape
-/// or one that is not a string, since the repeat check compares raw spellings; a leaf that does not
+/// the key's first position and last value (and jq's own `--stream` does not), comparing keys as
+/// the conversion decodes them; a key that is not a string or does not decode; a leaf that does not
 /// convert, or is a NaN, whose identity the caller refreshes on the converted value; a member with
 /// no value; and a value at [`MAX_NESTING_DEPTH`](super::eval_generic::MAX_NESTING_DEPTH), which the
-/// conversion refuses. It checks no `,` or `:`: it is for a span `serde_json` has accepted whole,
-/// whose delimiters are in place.
+/// conversion refuses. A document it declines late (a repeat in its last object) has its events
+/// built twice, and the first set is dropped before the conversion starts. It checks no `,` or
+/// `:`: the caller has walked them, or `serde_json` has accepted the span whole.
 #[must_use]
 pub fn json_tostream_events<W: Clone + AsRef<[u64]>>(
     cursor: &JsonCursor<'_, W>,
@@ -86910,12 +86911,12 @@ enum StreamWalk {
 }
 
 /// [`json_tostream_events`]'s walk of `value`, whose path is `path`, or `None` to decline. `keys`
-/// holds the raw keys of the objects being walked, for the repeat check.
+/// holds the decoded keys of the objects being walked, for the repeat check.
 fn walk_json_stream<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     depth: usize,
     path: &mut Vec<OwnedValue>,
-    keys: &mut Vec<&'a [u8]>,
+    keys: &mut Vec<Cow<'a, str>>,
     events: &mut Vec<OwnedValue>,
 ) -> Option<StreamWalk> {
     if depth >= super::eval_generic::MAX_NESTING_DEPTH {
@@ -86925,22 +86926,20 @@ fn walk_json_stream<'a, W: Clone + AsRef<[u64]>>(
         StandardJson::Object(fields) if !fields.is_empty() => {
             promote_stream_key(path);
             let base = keys.len();
-            let mut wide: Option<indexmap::IndexSet<&'a [u8]>> = None;
+            let mut wide: Option<indexmap::IndexSet<Cow<'a, str>>> = None;
             let mut rest = *fields;
             while let Some((field, after)) = rest.uncons() {
                 let StandardJson::String(key) = field.key() else {
                     return None;
                 };
-                let (raw, escaped, _) = key.raw_and_escaped();
-                let raw = raw.get(1..raw.len().checked_sub(1)?)?;
-                if escaped || !stream_key_is_new(raw, &keys[base..], &mut wide) {
+                // The conversion's own decode of a JSON key (`decoded_key_str`).
+                let name = key.as_str().ok()?;
+                let component = OwnedValue::String(String::from(&*name).into());
+                if !stream_key_is_new(name, keys, base, &mut wide) {
                     return None;
                 }
-                keys.push(raw);
                 let last = after.is_empty();
-                path.push(OwnedValue::String(
-                    String::from(core::str::from_utf8(raw).ok()?).into(),
-                ));
+                path.push(component);
                 let walked = walk_json_stream(field.value(), depth + 1, path, keys, events)?;
                 let key = path.pop().expect("the key pushed above");
                 match walked {
@@ -86997,24 +86996,27 @@ fn promote_stream_key(path: &mut [OwnedValue]) {
     }
 }
 
-/// Whether `key` is not among `seen`, the raw keys of the object before it; `wide` is the set
-/// [`walk_json_stream`] moves an object's keys into once it has [`STREAM_LINEAR_KEY_CHECK`] of them.
+/// Whether `key` is not among the keys of the object before it, which are `keys[base..]` or, once
+/// there are [`STREAM_LINEAR_KEY_CHECK`] of them, `wide`; `key` joins them.
 fn stream_key_is_new<'a>(
-    key: &'a [u8],
-    seen: &[&'a [u8]],
-    wide: &mut Option<indexmap::IndexSet<&'a [u8]>>,
+    key: Cow<'a, str>,
+    keys: &mut Vec<Cow<'a, str>>,
+    base: usize,
+    wide: &mut Option<indexmap::IndexSet<Cow<'a, str>>>,
 ) -> bool {
     if let Some(set) = wide {
         return set.insert(key);
     }
-    if seen.contains(&key) {
+    if keys[base..].contains(&key) {
         return false;
     }
-    if seen.len() + 1 >= STREAM_LINEAR_KEY_CHECK {
-        let mut set = indexmap::IndexSet::with_capacity(seen.len() * 2);
-        set.extend(seen.iter().copied());
+    if keys.len() - base + 1 >= STREAM_LINEAR_KEY_CHECK {
+        let mut set = indexmap::IndexSet::with_capacity(2 * (keys.len() - base + 1));
+        set.extend(keys.drain(base..));
         set.insert(key);
         *wide = Some(set);
+    } else {
+        keys.push(key);
     }
     true
 }
@@ -136291,8 +136293,9 @@ mod tests {
     }
 
     /// #5618: the events built from a JSON document's index are the events of the document's
-    /// converted value, as printed and as `Debug` (the key sharing included), and every document
-    /// whose events the conversion would build differently is declined.
+    /// converted value, as printed and as `Debug`, with the key sharing; keys are compared as the
+    /// conversion decodes them, and every document whose events the conversion would build
+    /// differently is declined.
     #[test]
     fn json_tostream_events_matches_the_converted_value_5618() {
         let bs = '\\';
@@ -136342,6 +136345,9 @@ mod tests {
             String::from("[{\"a\":1},{\"a\":2}]"),
             String::from("{\"a\":{\"a\":{\"a\":1}}}"),
             String::from("{\"\u{e9}\":1,\"e\u{301}\":2}"),
+            // A key with an escape is decoded, as the conversion decodes it.
+            alloc::format!("{{\"a{bs}n\":{{\"b\":1}},\"{bs}u0062\":[2]}}"),
+            alloc::format!("{{\"{bs}u00e9\":1,\"e\":2}}"),
             nest(super::super::eval_generic::MAX_NESTING_DEPTH - 1),
         ];
         // Either side of the set the repeat check moves into.
@@ -136377,9 +136383,18 @@ mod tests {
             repeated_wide(STREAM_LINEAR_KEY_CHECK + 4, 0),
             repeated_wide(STREAM_LINEAR_KEY_CHECK + 4, STREAM_LINEAR_KEY_CHECK + 3),
             repeated_wide(100, 50),
-            // A key whose decoded spelling is not its raw bytes, repeated or not.
+            // A repeat spelled two ways, which is a repeat once decoded, also past the linear check.
             alloc::format!("{{\"{bs}u0061\":1,\"a\":2}}"),
-            alloc::format!("{{\"a{bs}n\":1}}"),
+            alloc::format!("{{\"a\":1,\"{bs}u0061\":2}}"),
+            alloc::format!(
+                "{{{},\"k{bs}u0031\":0}}",
+                (0..40)
+                    .map(|k| alloc::format!("\"k{k}\":{k}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            // A key that does not decode (a lone surrogate's escape is cut short).
+            alloc::format!("{{\"{bs}ud8\":1}}"),
             // The conversion's nesting ceiling, at a leaf and at a container.
             nest(super::super::eval_generic::MAX_NESTING_DEPTH),
             alloc::format!(

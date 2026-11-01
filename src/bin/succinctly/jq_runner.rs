@@ -7374,11 +7374,16 @@ fn expand_into_stream_events(
     let mut starts = Vec::with_capacity(document_count + 1);
     for (index, document) in documents.into_iter().enumerate() {
         starts.push(values.len());
-        // `into_iter` hands over one document at a time and it is dropped once its events exist, so
-        // the events take its leaves instead of copying them (#5611).
+        // Under `StreamEvents` the parse built each document as its events (#5618). Otherwise
+        // `into_iter` hands over one document at a time and it is dropped once its events exist,
+        // so the events take its leaves instead of copying them (#5611).
         let events = match (form, document) {
             (DocumentForm::StreamEvents, OwnedValue::Array(events)) => events.into_vec(),
-            (_, document) => succinctly::jq::tostream_events_owned(document),
+            (DocumentForm::StreamEvents, document) => {
+                unreachable!("a document built as its events is an array: {document:?}")
+                // patchcov: coverage tolerate-line reason="unreachable: under StreamEvents every value get_inputs parses is built by json_document_to_owned_value as the array of its events, and nothing else is pushed before the expansion (#5618)"
+            }
+            (DocumentForm::Value, document) => succinctly::jq::tostream_events_owned(document),
         };
         if located {
             let target = locations.per_value.len() + events.len();
@@ -12374,9 +12379,9 @@ enum DocumentForm {
     Value,
     /// The array of the `tostream` events `--stream` replaces the document with, for a run that
     /// keeps them ([`StreamMode::Eager`] known before the parse, #5618), which
-    /// [`expand_into_stream_events`] then flattens. A span `serde_json` accepted is walked from its
-    /// index ([`jq::json_tostream_events`]) without building the value; the rest, and a document
-    /// that walk declines, is the value's events.
+    /// [`expand_into_stream_events`] then flattens. The events are walked from the document's
+    /// index ([`jq::json_tostream_events`]) without building the value; a document that walk
+    /// declines is converted, and the value's events are taken.
     StreamEvents,
 }
 
@@ -12411,7 +12416,11 @@ fn json_document_to_owned_value(
         }
     }
     let cursor = index.root(bytes);
-    if let (DocumentForm::StreamEvents, Delimiters::SerdeValidated) = (form, delimiters) {
+    if let Delimiters::Walk = delimiters {
+        validate_json_delimiters(&cursor, 0)?;
+    }
+    // The delimiters are in place either way now, which is all the index walk leaves unchecked.
+    if form == DocumentForm::StreamEvents {
         if let Some(events) = jq::json_tostream_events(&cursor) {
             return Ok(OwnedValue::array_from(events));
         }
@@ -12419,10 +12428,7 @@ fn json_document_to_owned_value(
     // `bytes` is often a temporary (an `--argjson` string, a `--seq` record),
     // so each NaN gets an identity of its own rather than its address (#3309).
     let value = match delimiters {
-        Delimiters::Walk => {
-            validate_json_delimiters(&cursor, 0)?;
-            generic_to_owned::<JqSemantics, _>(&cursor.value())
-        }
+        Delimiters::Walk => generic_to_owned::<JqSemantics, _>(&cursor.value()),
         Delimiters::SerdeValidated => generic_to_owned_checked::<JqSemantics, _>(&cursor.value()),
     }?
     .with_fresh_nan_instances(bytes);
