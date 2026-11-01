@@ -1944,7 +1944,12 @@ impl core::fmt::Debug for ArithSettleMemo {
 /// Derived state, like [`FuncDefData`]'s memo: it takes no part in equality or
 /// `Debug`, a clone starts empty, and `DerefMut` forgets it, because any
 /// rewrite of a stage goes through `&mut Vec<Expr>` and may change the answer
-/// (or, for the tail copies, no longer be a copy of the stages).
+/// (or, for the tail copies, no longer be a copy of the stages). A tail copy
+/// or a kept run starts with the `false`s its owner had settled, never a
+/// `true` (`PipeStages::copy_of`, #5488): sound because a copy holds a
+/// subset of the owner's stages and the stages change only through `DerefMut`,
+/// which forgets the copy's cells as it does the owner's. A pipe built from
+/// a chain block or a split tail (`PipeStages::build_chain`) starts empty.
 #[derive(Default)]
 pub struct PipeStages {
     stages: Vec<Expr>,
@@ -2411,23 +2416,24 @@ impl PipeStages {
     /// variable is a pipe nothing is known about, and each tail of that copy is
     /// copied in turn.
     pub(crate) fn tail_copy(&self, from: usize) -> Self {
-        let mut copy = Self::from(self.stages[from..].to_vec());
-        self.seed_negative_memos(&copy);
+        let mut copy = self.copy_of(&self.stages[from..]);
         if let Some((table, base)) = &self.tails.origin {
             copy.tails.origin = Some((Weak::clone(table), base + from));
         }
         copy
     }
 
-    /// Hand a copy of some of this pipe's stages every `false` this pipe has settled (#5488).
+    /// A pipe of `stages`, some of this pipe's own, that starts with every `false` this pipe has
+    /// settled (#5488). Every copy of stages of a pipe goes through here.
     ///
-    /// Each answer is "some stage holds X" over the stages, so a pipe of a subset of them
-    /// (a tail, a run) holds no X when this one holds none. A `true` is not inherited: the
-    /// stage that holds it may not be among the copy's. Without this a copy starts with empty
-    /// cells and re-walks its stages for each question, which for the tails of one pipe is
-    /// quadratic in its length, as the copies themselves are.
-    fn seed_negative_memos(&self, copy: &Self) {
-        for (owner, copy) in [
+    /// Each answer is "some stage holds X" over the stages, so a pipe of a subset of them (a tail,
+    /// a run) holds no X when this one holds none. A `true` is not inherited: the stage that holds
+    /// it may not be among the copy's. Without this a copy starts with empty cells and re-walks
+    /// its stages for each question, which for the tails of one pipe is quadratic in its length,
+    /// as the copies themselves are.
+    fn copy_of(&self, stages: &[Expr]) -> Self {
+        let copy = Self::from(stages.to_vec());
+        for (settled, inherited) in [
             (&self.needs_path_context, &copy.needs_path_context),
             (&self.effect_before_last, &copy.effect_before_last),
             (&self.holds_tracked_var, &copy.holds_tracked_var),
@@ -2435,10 +2441,11 @@ impl PipeStages {
             (&self.holds_bind, &copy.holds_bind),
             (&self.holds_var, &copy.holds_var),
         ] {
-            if owner.get() == Some(false) {
-                copy.set(Some(false));
+            if settled.get() == Some(false) {
+                inherited.set(Some(false));
             }
         }
+        copy
     }
 
     /// The table this pipe's tails are kept in and the offset of its first
@@ -2611,8 +2618,7 @@ impl PipeStages {
             .get_or_init(|| {
                 let tail = &self.stages[from..from + (end - at)];
                 may_keep(tail).then(|| {
-                    let mut copy = Self::from(tail.to_vec());
-                    self.seed_negative_memos(&copy);
+                    let mut copy = self.copy_of(tail);
                     if matches!(kind, SlotKind::Tail) {
                         copy.tails.origin = Some((Rc::downgrade(table), at));
                     }
@@ -4666,6 +4672,14 @@ mod tests {
         };
         assert!(!kept_stages.holds_bind_or_init(|_| unreachable!("inherited")));
         assert!(!kept_stages.needs_path_context_or_init(|_| unreachable!("inherited")));
+
+        // Mutating a copy forgets what it inherited, as it does for any pipe.
+        let owner = stages();
+        settle(&owner, false);
+        let mut mutated = owner.tail_copy(2);
+        assert!(!mutated.holds_bind_or_init(|_| unreachable!("inherited")));
+        mutated.push(Expr::Identity);
+        assert!(mutated.holds_bind_or_init(|_| true), "a rewrite forgets");
     }
 
     /// #5404: a pipe keeps the owned copy of a tail from its second ask on,
