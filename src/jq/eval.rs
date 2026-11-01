@@ -123222,20 +123222,9 @@ mod tests {
             // exactly. See `partial_prefix_survives_the_stream_forwarding_
             // constructs` for its coverage.
             //
-            // `map_values` keeps only each key's first output, so jq 1.7.1
-            // never reaches the error at all and exits 0.
-            (
-                br#"{"a":1}"#,
-                r#"map_values((.,error("x")))"#,
-                "x",
-                r#"jq 1.7.1 prints {"a":1} and exits 0"#,
-            ),
-            (
-                b"[1,2]",
-                r#"map_values((.,error("x")))"#,
-                "x",
-                "jq 1.7.1 prints [1,2] and exits 0",
-            ),
+            // `map_values` keeps only each key's first output, so it is not here: jq
+            // never reaches the error, and since #5791 neither do we (see
+            // `map_values_reads_only_the_first_output_5791`).
             // `reduce` only ever emits its final accumulator, so there is no
             // prefix to expose either way — this one matches jq 1.7.1.
             (
@@ -123258,8 +123247,6 @@ mod tests {
             // `select`/`if`, string interpolation, target-generator and
             // (since #2326) key-generator index/slice: see the comment in
             // `atomic` above.
-            (br#"{"a":1}"#, "map_values((.,break $out))"),
-            (b"[1,2]", "map_values((.,break $out))"),
             (b"null", "reduce (1,2,break $out) as $v (0;.+$v)"),
         ];
         for (json, filter) in atomic_break {
@@ -123280,6 +123267,30 @@ mod tests {
             outputs(b"null", "label $out | {a:1,b:(2,break $out)}"),
             [r#"{"a":1,"b":2}"#]
         );
+    }
+
+    /// #5791: `map_values(f)` is jq's `.[] |= f`, which reads the first output of `f` and goes no
+    /// further, so a control `f` raises after producing one never surfaces (jq 1.7.1 prints the
+    /// mapped value and exits 0). yq raises it, and keeps doing so (`tests/yq_cli/i5791.rs`).
+    #[test]
+    fn map_values_reads_only_the_first_output_5791() {
+        let rows: &[(&[u8], &str, &str)] = &[
+            (br#"{"a":1}"#, r#"map_values((.,error("x")))"#, r#"{"a":1}"#),
+            (b"[1,2]", r#"map_values((.,error("x")))"#, "[1,2]"),
+            (
+                br#"{"a":1}"#,
+                "label $out | map_values((.,break $out))",
+                r#"{"a":1}"#,
+            ),
+            (
+                b"[1,2]",
+                "label $out | map_values((.+1,break $out))",
+                "[2,3]",
+            ),
+        ];
+        for (json, filter, expected) in rows {
+            assert_eq!(outputs(json, filter), [*expected], "{filter}");
+        }
     }
 
     #[test]
