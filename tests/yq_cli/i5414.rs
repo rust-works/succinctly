@@ -67,3 +67,15 @@ fn nul_in_a_later_branch_prints_the_earlier_one_then_fails() -> Result<()> {
     assert_eq!(code, 1);
     Ok(())
 }
+
+#[test]
+fn colored_nul_terminated_comma_keeps_a_repeated_key_and_aborts_on_nul() -> Result<()> {
+    let (out, code) = run_yq_stdin("., .b", DUP, &["-C", "-0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(strip_ansi(&out), "a: 1\na: 2\nb: 3\x003\x00");
+    let input = "a: 1\nb: \"x\\0y\"\n";
+    let (out, code) = run_yq_stdin(".a, .b", input, &["-C", "-0"])?;
+    assert_eq!(strip_ansi(&out), "1\x00");
+    assert_eq!(code, 1);
+    Ok(())
+}
