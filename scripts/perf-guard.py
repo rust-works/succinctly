@@ -515,9 +515,16 @@ DEFAULT_THRESHOLD = 5.0
 # line, and this row is a `test` over every line of the document (-59.4% ARM64-Linux /
 # -57.7% x86_64 against the PR's own merge-base, outputs byte-identical). Remove it once
 # `main` carries the change and the row reads ~0% against a merge-base that includes it.
+#
+# `users_yq_raw_slice` (#5675) carries an override of the same one-off kind: `write_json_body_jq`
+# copies a string's escape-free text whole instead of writing it a `char` at a time, and this row
+# writes the three lines of every `-R` document it slices (-5.0% x86_64 / -6.0% ARM64-Linux against
+# the PR's own merge-base, outputs byte-identical). Remove it once `main` carries the change and the
+# row reads ~0% against a merge-base that includes it.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
     "users_yq_raw_test": 65.0,
+    "users_yq_raw_slice": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
