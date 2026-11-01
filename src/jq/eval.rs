@@ -82262,9 +82262,6 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                             let witnessed;
                             let (ext_expr, reentry) =
                                 match extract.and_then(|ext| ext.witnessed::<S>(&update_val)) {
-                                    Some(as_written) if extract.is_some_and(|ext| ext.inert) => {
-                                        (as_written, Reentry::REBUILT)
-                                    }
                                     Some(as_written) => {
                                         witnessed = substitute_fold_step(
                                             as_written,
@@ -82922,7 +82919,9 @@ fn reads_a_name_whole(expr: &Expr, names: &[String]) -> bool {
 /// none of `names`, so [`substitute_fold_step`] would return a copy of it. A definition, a call
 /// and a shared argument also decline: each carries per-node memo state that a copy starts empty
 /// and the program's own node keeps across steps (a recursive `def` held its whole call tree, 13 MB
-/// to 114 MB, when #3692 skipped such a copy), so those keep the copy.
+/// to 114 MB, when #3692 skipped such a copy), so those keep the copy. A long pipe also keeps a
+/// memo (its kept tails) on the node; that one is bounded by the pipe, not by the fold, and a
+/// 100-stage `. + 1` body over 100,000 steps peaks at 14.5 MB against 14.2 MB with the copy.
 fn fold_operand_is_inert(expr: &Expr, names: &[String]) -> bool {
     !any_subexpr(expr, &mut |n| match n {
         Expr::Var(v) => names.iter().any(|name| name == v),
