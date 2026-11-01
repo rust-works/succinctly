@@ -6012,10 +6012,17 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // #5675: a `-R` line is already the string the filter reads, so it is handed over
                 // as that tree rather than written out as JSON text, indexed and read back for
                 // every line.
+                //
+                // #5744: so is the array `--stream -s` slurps the events into: it has no source
+                // text either, and writing it out as JSON to index and read it back was 31% of
+                // the instructions of `--stream -s 'length'`.
                 let owned_route = walk.is_some()
                     || (args.raw_input
                         && args.input_dsv.is_none()
-                        && matches!(document, OwnedValue::String(_)));
+                        && matches!(document, OwnedValue::String(_)))
+                    || (args.slurp
+                        && stream_mode(&args, uses_input_builtins, faulted) == StreamMode::Eager
+                        && matches!(document, OwnedValue::Array(_)));
                 let mut whole = Some(document);
                 loop {
                     let input = match walk.as_mut() {
