@@ -2,7 +2,7 @@
 //! and a closer of the wrong kind there (`[[1]},2]`), were read as whitespace: only a last child
 //! that was a scalar had the gap before the closing bracket checked. jq 1.7.1 refuses each as a
 //! parse error, whatever the filter. Documents and messages were captured from jq 1.7.1
-//! (`/usr/bin/jq`). The lazy routes (`map(.)`, `first(.[])`) still skip the check, for scalars too.
+//! (`/usr/bin/jq`). `map(f)` is `i5654_lazy_map.rs`; a consumer that stops early still skips the check.
 
 use anyhow::Result;
 
