@@ -12854,7 +12854,25 @@ fn text_peel_after_refusal<S: EvalSemantics>(
         after.splice(0..0, tail);
         stage = unwrap_paren(first);
     }
-    let rest = match after.as_slice() {
+    // `text_stage` as the binding source of `as`: the variable is the text, so the rest runs on
+    // that text as `. as $x | body`. Sound only when the body never reads the deep input.
+    let (text, head) = match stage {
+        Expr::As {
+            expr: source,
+            var,
+            body,
+        } if !crate::jq::walk::reads_ambient_value(body) => {
+            let text = text_stage_text::<S>(source, input)?;
+            let bind = Expr::As {
+                expr: Box::new(Expr::Identity),
+                var: var.clone(),
+                body: body.clone(),
+            };
+            (text, Some(bind))
+        }
+        _ => (text_stage_text::<S>(stage, input)?, None),
+    };
+    let tail = match after.as_slice() {
         [] => None,
         [only] => Some((*only).clone()),
         _ => Some(Expr::Pipe(
@@ -12865,13 +12883,32 @@ fn text_peel_after_refusal<S: EvalSemantics>(
                 .into(),
         )),
     };
-    let text = match stage {
+    let rest = match (head, tail) {
+        (None, tail) => tail,
+        (Some(bind), None) => Some(bind),
+        (Some(bind), Some(tail)) => Some(Expr::Pipe(vec![bind, tail].into())),
+    };
+    Some((OwnedValue::String(text.into()), rest))
+}
+
+/// The text of `stage` over `input` when `stage` only renders its input as text (#5554):
+/// `tojson`, `tostring`, `@json`, `@text`, `"\(.)"`, a format-prefixed `@json "x\(.)"`, and any of
+/// them under `try` or `?` (a text stage cannot fail, so the guard changes nothing).
+fn text_stage_text<S: EvalSemantics>(stage: &Expr, input: &OwnedValue) -> Option<String> {
+    match unwrap_paren(stage) {
         Expr::Builtin(Builtin::ToJson) | Expr::Format(FormatType::Json) => {
-            owned_value_to_json::<S>(input)
+            Some(owned_value_to_json::<S>(input))
         }
         Expr::Builtin(Builtin::ToString) | Expr::Format(FormatType::Text) => {
-            tostring_text::<S>(input, false)
+            Some(tostring_text::<S>(input, false))
         }
+        Expr::Try { expr, .. } | Expr::Optional(expr) => text_stage_text::<S>(expr, input),
+        Expr::Pipe(stages) => match stages.as_slice() {
+            [first, only] if matches!(unwrap_paren(first), Expr::Identity) => {
+                text_stage_text::<S>(only, input)
+            }
+            _ => None,
+        },
         Expr::StringInterpolation(parts) => {
             let mut text = String::new();
             // Each `\(.)` slot is the same text: walk the value once, not once per slot.
@@ -12884,14 +12921,15 @@ fn text_peel_after_refusal<S: EvalSemantics>(
                             value_text.get_or_insert_with(|| owned_to_string::<S>(input)),
                         );
                     }
-                    StringPart::Expr(_) => return None,
+                    // A slot that is itself a text stage over `.` (`@json "x\(.)"` desugars to
+                    // `. | @json`).
+                    StringPart::Expr(inner) => text.push_str(&text_stage_text::<S>(inner, input)?),
                 }
             }
-            text
+            Some(text)
         }
-        _ => return None,
-    };
-    Some((OwnedValue::String(text.into()), rest))
+        _ => None,
+    }
 }
 
 pub(crate) fn eval_owned_reindex_free<S: EvalSemantics>(
@@ -116300,6 +116338,42 @@ mod tests {
         // Each `\(.)` slot is the same text.
         let slots = peel(r#""a\(.)b\(.)c""#, &refused).unwrap();
         assert_eq!(text(&slots), "\"anullbnullc\"");
+    }
+
+    /// #5554: a text stage is peeled through `try`/`?`, as an `as` source whose body ignores
+    /// `.`, and as a format-prefixed interpolation; a body that reads `.` is not peeled.
+    #[test]
+    fn test_text_peel_looks_through_try_as_and_format_interpolation_5554() {
+        let refused = EvalError::resource_limit("nesting depth exceeds limit of 384");
+        let input = OwnedValue::Null;
+        let peel = |source: &str| {
+            text_peel_after_refusal::<JqSemantics>(
+                &crate::jq::parse(source).unwrap(),
+                &input,
+                &refused,
+            )
+        };
+        let text = |source: &str| peel(source).unwrap().0.to_json();
+        assert_eq!(text("try tojson"), "\"null\"");
+        assert_eq!(text("(tostring)?"), "\"null\"");
+        assert_eq!(text(r#"@json "x\(.)""#), "\"xnull\"");
+        // The binding is the text; the rest runs on it as `. as $x | body`.
+        let (bound, rest) = peel("tojson as $x | $x | length").unwrap();
+        assert_eq!(bound.to_json(), "\"null\"");
+        assert!(matches!(rest, Some(Expr::As { .. })), "{rest:?}");
+        // The stages after a group around the `as` follow it.
+        let (_, rest) = peel("(tojson as $x | $x) | length").unwrap();
+        assert!(
+            matches!(rest, Some(Expr::Pipe(ref stages)) if stages.len() == 2),
+            "{rest:?}"
+        );
+        // A body that reads `.`, a non-text slot and a different format are left alone.
+        assert!(peel("tojson as $x | . | length").is_none());
+        assert!(peel(r#"@base64 "x\(.)""#).is_none());
+        assert!(peel(r#""x\(.a)""#).is_none());
+        assert!(
+            peel("(tojson | length)?").is_none() || peel("(tojson | length)?").unwrap().1.is_none()
+        );
     }
 
     /// #5441: a split tail is built for each call, so the facts its pipe is
