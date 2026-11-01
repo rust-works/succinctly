@@ -9507,7 +9507,10 @@ user who wants jq's rejection has `--validate` and `succinctly json validate`.
 When the update (and the extract) read `$u` only as `$u.field`, each element is converted to an object holding just those members, instead of to a value of its whole subtree.
 It is the deferred bind's rule (`.[] as $x | $x.d`, #3856) for the other binding construct.
 The projection is jq mode only, over JSON, and only for one plain `as $name` pattern whose variable the fold never reads in path position (`$u.a = 3`, `path($u.a)`), where the error text names the whole element.
-A bare `$u`, `$u[..]`, a destructuring pattern or a `?//` alternation convert the element whole, as before.
+A bare `$u`, `$u[..]`, an array pattern, an object pattern with a computed key or a `?//` alternation convert the element whole, as before.
+[#5544](https://github.com/rust-works/succinctly/issues/5544) extended it to one object pattern whose keys are all literals (`as {score: $s}`, `as {$score}`, `as {"score": $s}`, `as {a: {b: $x}}`): the pattern binds names to members and never the element, so the keys it names are the members converted, a key's value is walked whole whatever its sub-pattern binds from it, and no read of the loop variable can see the rest.
+On the document below, `reduce .[] as {b: $b} (0; . + $b)` was `error` (as jq's) and now answers `5`, the same row as `. + $u.b`.
+A plain `.[] as {b: $b} | $b` still raises there, because the deferred bind (#3856) does not destructure.
 How the update spells its read (`. + $u.b`, `. - $u.b`, `($u.b | floor)`, `$u.a == $u.b`) does not matter: all of them project.
 For a fold that reads a member, the object's own frame is still checked as the whole conversion checks it (each key, the delimiters between members, the tail), so a malformed element fails the fold as before; only the value of a member nothing reads is left undecoded.
 A loop variable nothing reads (`reduce .[] as $u (0; . + 1)`) materializes nothing of its element, so it checks nothing, as `.[] as $x | 1` checks nothing: `[{,}]` answers `1` where jq refuses the document.
@@ -9523,9 +9526,9 @@ On `[{"a":"\ud800","b":5}]`:
 
 Validating the rest of the element first (`validate_cursor`, no value built) keeps jq's answer, and was measured on a 7950X against an earlier form of the projection: it saved 4% to 6% of `reduce .users[] as $u (0; .+$u.score)` where that projection saved 44% (the checked walk that shipped saves 32%), and made `.[$u.name] = $u.score` 16% to 18% slower where the projection makes it 19% faster.
 That is the reason the divergence is taken, on the same three grounds as the rest of this section: the agreement being given up was a side effect of materializing the whole element, it made the answer depend on how the update spelled its read (`.[] as $x | $x.b` already answered `5`), and it cost most of a fold's runtime on a body that reads one member.
-A fold naming more than eight fields converts the element whole (past that the projection stops paying: reading all 20 members of a 20-member record was 21% slower on a 7950X).
+A fold naming more than eight fields, or an object pattern with more than eight keys, converts the element whole (past that the projection stops paying: reading all 20 members of a 20-member record was 21% slower on a 7950X).
 `eval.rs`'s own fold drivers (reached only through the hidden `eval_full`) still convert the whole element; `test_fold_loop_element_projection_drifts_from_eval_rs_5519` pins that drift.
-Pinned in `tests/jq_cli/i5519.rs` and `a_fold_element_is_projected_to_the_members_it_reads_5519`.
+Pinned in `tests/jq_cli/i5519.rs`, `tests/jq_cli/i5544.rs` and `a_fold_element_is_projected_to_the_members_it_reads_5519`.
 
 **A raw control character is the one fault in this class that is caught document-wide
 (#2878), and it is not an exception to the rule above.** "A filter validates only what it
