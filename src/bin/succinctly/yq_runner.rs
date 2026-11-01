@@ -4668,7 +4668,22 @@ fn propagate_assign_copied_presentation(
         return;
     }
     // A plain assign chain always collects.
-    for (path_expr, value_expr) in collect_assign_chain(expr).unwrap_or_default() {
+    for (stage, (path_expr, value_expr)) in collect_assign_chain(expr)
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+    {
+        // A negative index (`.a[-1] = .a[0]`) names the node counted from the end of the array
+        // as the write found it, which only the first stage's pristine document says; a later
+        // stage may have changed the length (#5407).
+        let resolved_path = (stage == 0)
+            .then(|| resolve_negative_indices(path_expr, pristine_value))
+            .flatten();
+        let resolved_value = (stage == 0)
+            .then(|| resolve_negative_indices(value_expr, pristine_value))
+            .flatten();
+        let path_expr = resolved_path.as_ref().unwrap_or(path_expr);
+        let value_expr = resolved_value.as_ref().unwrap_or(value_expr);
         let (Some(targets), Some(value_steps)) =
             (static_nav_targets(path_expr), static_nav_steps(value_expr))
         else {
@@ -4724,6 +4739,78 @@ fn propagate_assign_copied_presentation(
                 *target = copy;
             } // patchcov: coverage tolerate-line reason="unreachable: the value at the target exists (checked above), and the tree stops short of it only at a leaf, which the lookup grows (#5249)"
         }
+    }
+}
+
+/// `expr` with each negative array index of its static navigation counted from the end of the
+/// array in `root`, or `None` when it names none or one cannot be resolved (#5407).
+///
+/// Only a chain of fields and indices is read (`.a[-1]`, `.a.b[-2]`, a comma or parenthesis of
+/// them); anything else stops the walk, and a negative index past it stays negative, which
+/// [`static_nav_steps`] then declines.
+fn resolve_negative_indices(expr: &Expr, root: &OwnedValue) -> Option<Expr> {
+    match expr {
+        Expr::Paren(inner) => {
+            resolve_negative_indices(inner, root).map(|e| Expr::Paren(Box::new(e)))
+        }
+        Expr::Comma(items) => {
+            let resolved: Vec<Option<Expr>> = items
+                .iter()
+                .map(|item| resolve_negative_indices(item, root))
+                .collect();
+            resolved.iter().any(Option::is_some).then(|| {
+                Expr::Comma(
+                    items
+                        .iter()
+                        .zip(resolved)
+                        .map(|(item, new)| new.unwrap_or_else(|| item.clone()))
+                        .collect(),
+                )
+            })
+        }
+        Expr::Pipe(stages) => {
+            let mut current = Some(root);
+            let mut changed = false;
+            let mut out = Vec::with_capacity(stages.len());
+            for stage in stages {
+                match stage {
+                    Expr::Field(name) => {
+                        current = match current {
+                            Some(OwnedValue::Object(map)) => map.get(name.as_str()),
+                            _ => None,
+                        };
+                        out.push(stage.clone());
+                    }
+                    Expr::Index { idx, .. } => {
+                        let array = match current {
+                            Some(OwnedValue::Array(items)) => Some(items),
+                            _ => None,
+                        };
+                        if *idx < 0 {
+                            let len = i64::try_from(array?.len()).ok()?;
+                            let resolved = len.checked_add(*idx).filter(|i| *i >= 0)?;
+                            out.push(Expr::Index {
+                                idx: resolved,
+                                key: None,
+                            });
+                            current =
+                                array.and_then(|items| items.get(usize::try_from(resolved).ok()?));
+                            changed = true;
+                        } else {
+                            current =
+                                array.and_then(|items| items.get(usize::try_from(*idx).ok()?));
+                            out.push(stage.clone());
+                        }
+                    }
+                    other => {
+                        current = None;
+                        out.push(other.clone());
+                    }
+                }
+            }
+            changed.then(|| Expr::Pipe(out.into()))
+        }
+        _ => None,
     }
 }
 
