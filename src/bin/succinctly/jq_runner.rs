@@ -2420,7 +2420,7 @@ impl ModuleLoader {
         // too.
         if !data_bindings.is_empty() {
             let data_bindings = dedup_bindings_last_wins(data_bindings);
-            expr = jq::substitute_vars(&expr, as_var_refs(&data_bindings));
+            expr = jq::substitute_named_args(&expr, as_var_refs(&data_bindings));
         }
 
         // Every module some module depends on, outermost first, and every
@@ -4771,7 +4771,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     all_vars.extend(args_value.as_ref().map(|value| ("ARGS", value)));
     all_vars.extend(context.named.iter().map(|(k, v)| (k.as_str(), v)));
 
-    let mut expr = jq::substitute_vars(&expr, all_vars);
+    let mut expr = jq::substitute_named_args(&expr, all_vars);
 
     // #1473: resolve every function call against the `def`s, parameters and
     // builtins in scope at its position, exactly as real jq's compiler does —
