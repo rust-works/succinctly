@@ -19008,7 +19008,7 @@ fn has_pattern_alternatives(f: &Expr) -> bool {
 /// What `map_values(f)` reads of `f`'s result. jq's `.[] |= f` takes the first output and leaves
 /// (#5791), so a control `f` raises after producing one is never reached in jq mode; a result with
 /// no value yet keeps its control. yq raises it (`map_values((1, error("x")))`, v4.53.3).
-fn first_output_only<'a, W, S: EvalSemantics>(result: QueryResult<'a, W>) -> QueryResult<'a, W> {
+fn first_output_only<W, S: EvalSemantics>(result: QueryResult<'_, W>) -> QueryResult<'_, W> {
     match result {
         QueryResult::Partial(vs, _) if S::TAG == EvalTag::Jq && !vs.is_empty() => {
             QueryResult::ManyOwned(vs)
