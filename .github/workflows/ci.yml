@@ -217,11 +217,13 @@ jobs:
           # drift apart; it is computed on its own line so a failure there fails the step
           # rather than quietly running everything. The skip applies to every `--test`
           # binary here, and `--exact` keeps it from matching anything but those names.
+          # #5705: `yq_cli_tests` (~30% of this leg's test time) is not run here either: it runs
+          # in the `deep-recursion` leg below, with no skip list (the names are all jq_cli_tests').
           - name: cli-gated
             buildCli: true
             testCmd: |
               skip=$(scripts/deep-recursion-tests.sh skip-args)
-              cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests -- $skip
+              cargo test --features cli --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests -- $skip
           # `tests/orchestrate_cli_tests.rs` is `#![cfg(feature = "bench-runner")]`
           # and must stay isolated from the cli-gated leg above (#1705): its
           # `cargo run`-spawned CLI subprocesses would otherwise re-link the
@@ -286,6 +288,9 @@ jobs:
             buildCli: false
             testCmd: cargo test --no-default-features --verbose
           # #3698, #5494: the slowest jq_cli_tests (20 of them), split out of `cli-gated` (see its comment).
+          # #5705: `yq_cli_tests` runs here too, whole, as its own `cargo test` after `run`: `run` lists
+          # and runs the one `jq_cli_tests` target and counts its passes. The leg name stays, since the
+          # `Test (...) (deep-recursion)` contexts are required checks.
           # `run` fails if a listed name stopped being a test, or if fewer tests passed than
           # are listed: libtest runs zero tests and exits 0 when `--exact` matches nothing.
           # The script's self-test (a fake `cargo`, ~2 s) runs first, in this leg and not in a
@@ -296,6 +301,7 @@ jobs:
             testCmd: |
               python3 scripts/test_deep_recursion_tests.py
               scripts/deep-recursion-tests.sh run
+              cargo test --features cli --test yq_cli_tests
     env:
       # x86 SIMD CI leg (#193): the SIMD suites self-skip (with a visible
       # `SKIPPED` line) when a CPU feature is missing, so this pins the runner
@@ -396,7 +402,7 @@ jobs:
             buildCli: true
             testCmd: |
               skip=$(scripts/deep-recursion-tests.sh skip-args)
-              cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests -- $skip
+              cargo test --features cli --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests -- $skip
           - name: bench-runner-gated
             buildCli: true
             testCmd: cargo test --features cli,bench-runner --test orchestrate_cli_tests
@@ -472,13 +478,14 @@ jobs:
               source scripts/lib/clippy-variants.sh
               cargo clippy --all-targets --features "$CLIPPY_CORE_FEATURES" -- -D warnings
               cargo clippy --all-targets --features "$CLIPPY_ARM_BROADWORD_FEATURES" -- -D warnings
-          # #3698, #5494: the slowest jq_cli_tests (20 of them), split out of `cli-gated`; same list and
-          # guards as the x86_64 leg's (see the comment on its `cli-gated` entry).
+          # #3698, #5494, #5705: the slowest jq_cli_tests (20 of them) and all of `yq_cli_tests`, split out
+          # of `cli-gated`; same list and guards as the x86_64 leg's (see the comments on its entries).
           - name: deep-recursion
             buildCli: true
             testCmd: |
               python3 scripts/test_deep_recursion_tests.py
               scripts/deep-recursion-tests.sh run
+              cargo test --features cli --test yq_cli_tests
     env:
       # ARM SIMD CI leg (#194, mirroring the x86 pattern from #193): the SVE2
       # suites self-skip (with a visible `SKIPPED` line) when a CPU feature is
@@ -592,6 +599,16 @@ jobs:
   # merge-group runs. `scripts/ci-load-report.py` produces all of these figures; run it
   # with a window before and after any change to this matrix.
   #
+  # #5705: `cli-gated` was still the longest macOS leg (p50 10.4 / 11.8 min over Oct 18-25 /
+  # Oct 25 - Nov 1, against 5.7 / 6.5 `orchestrate-default`, 5.6 / 6.2 `deep-recursion`, 4.2 / 4.9
+  # `simd`), and macOS finished last in 180 of 245 merge-group runs that week. Its test time was
+  # `jq_cli_tests` 209 s, `yq_cli_tests` 104 s and ~30 s for the other binaries; compiling was
+  # ~1.7 min. `yq_cli_tests` therefore runs in `deep-recursion`, which already builds the CLI, so
+  # the move adds a test binary and no runner slot. By those p50s that is about 10 min for
+  # `cli-gated` and 8 for `deep-recursion`: `cli-gated` is still the longest leg, which is why the
+  # next step, if one is needed, is splitting `jq_cli_tests` by `per_issue::` (a fifth macOS leg,
+  # which #3649 measured as too many, so re-measure first).
+  #
   # #5699: the matrix runs in merge-group runs only, not on pull_request runs. macOS is the one
   # resource that queues, and PR runs (81-91 a day against 33-38 merge-group runs, 2.5 to 1)
   # held about 57% of the macOS runner-minutes the merge queue waits behind. Over 999 PR runs
@@ -645,7 +662,7 @@ jobs:
             buildCli: true
             testCmd: |
               skip=$(scripts/deep-recursion-tests.sh skip-args)
-              cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests -- $skip
+              cargo test --features cli --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests -- $skip
           # `tests/orchestrate_cli_tests.rs` is `#![cfg(feature = "bench-runner")]`
           # and must stay isolated from the cli-gated leg above (#1705): its
           # `cargo run`-spawned CLI subprocesses would otherwise re-link the
@@ -667,13 +684,14 @@ jobs:
           - name: simd
             buildCli: false
             testCmd: cargo test --verbose --features simd
-          # #3698, #5494: the slowest jq_cli_tests (20 of them), split out of `cli-gated`; same list and
-          # guards as the x86_64 leg's (see the comment on its `cli-gated` entry).
+          # #3698, #5494, #5705: the slowest jq_cli_tests (20 of them) and all of `yq_cli_tests`, split out
+          # of `cli-gated`; same list and guards as the x86_64 leg's (see the comments on its entries).
           - name: deep-recursion
             buildCli: true
             testCmd: |
               python3 scripts/test_deep_recursion_tests.py
               scripts/deep-recursion-tests.sh run
+              cargo test --features cli --test yq_cli_tests
     env:
       # Apple Silicon has NEON but no SVE/SVE2, so only NEON is pinned; the
       # SVE2 suites are *expected* to print `SKIPPED` lines on this leg. SVE2
