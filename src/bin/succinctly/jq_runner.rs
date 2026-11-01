@@ -9447,7 +9447,7 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 
 /// The four bytes jq's lexer skips between tokens. Not `char::is_whitespace`, which also takes a
 /// form feed, a vertical tab and the Unicode spaces that jq refuses (#5654).
-fn is_json_whitespace(c: char) -> bool {
+pub(crate) fn is_json_whitespace(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\r' | '\n')
 }
 

@@ -1020,15 +1020,18 @@ fn yaml_to_owned_value<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>) -> Re
     to_owned_yaml_cursor::<YqSemantics, _>(&cursor).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// How an input with no bytes at all is read (#4099): yq reads no document from it, except that a
+/// How an input with no document in it is read (#4099): yq reads no document from it, except that a
 /// run which read no document at all evaluates once against one empty document (`printf '' | yq
 /// '.a'` is `null`, `.a = 1` is `a: 1`, and so is `yq '.a' empty.yaml`). `None` is "skip this input".
 ///
-/// The empty document is the one an input holding a line break is (`null\n` for JSON, whose
-/// reader yields none for a lone line break). An input that is not empty is returned as read;
-/// so is an empty one under `--front-matter`, whose own error stands. `at` is the input's place
+/// The empty document is the one an input holding a line break is: YAML's, whatever format the
+/// input was read as (#5478). yq reads an empty or whitespace-only `-p=json` input as the same
+/// document, not as a JSON `null`: it prints as a blank line, `[.]` is `-`, and only a JSON
+/// output spells it `null`. The format that comes back is therefore `Yaml` for a JSON input that
+/// held no document, and `format` otherwise. An input that is not empty is returned as read; so
+/// is an empty one under `--front-matter`, whose own error stands. `at` is the input's place
 /// among `input_files` (0 for stdin with none). An empty input that is not the run's first
-/// counts as the empty document only when every input is a file holding no bytes; `-` cannot
+/// counts as the empty document only when every input is a file holding no document; `-` cannot
 /// be known to be empty before it is read, so a run mixing it with empty files reads nothing from
 /// those.
 fn empty_input_reads_as(
@@ -1037,7 +1040,7 @@ fn empty_input_reads_as(
     input_files: &[String],
     at: usize,
     front_matter: bool,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, InputFormat)> {
     // #5356: yq reads past a UTF-8 byte-order mark at the front of a YAML stream, each file
     // being a stream of its own; it was becoming part of the first key. A JSON document with
     // one is `invalid character 'ï'` in yq, so JSON keeps its mark and is refused as before.
@@ -1046,27 +1049,81 @@ fn empty_input_reads_as(
     if format != InputFormat::Json {
         bytes.drain(..crate::front_matter::leading_bom_len(&bytes));
     }
-    if !bytes.is_empty() || front_matter {
-        return Some(bytes);
+    if !holds_no_document(&bytes, format) || front_matter {
+        return Some((bytes, format));
     }
-    let every_input_is_empty = input_files.len() <= 1
-        || input_files
-            .iter()
-            .all(|file| input_file_holds_no_document_bytes(file));
-    (every_input_is_empty && at == 0).then(|| match format {
-        InputFormat::Json => b"null\n".to_vec(),
-        _ => b"\n".to_vec(),
+    // `at == 0` first: it settles every input but the first without opening a file.
+    (at == 0
+        && (input_files.len() <= 1
+            || input_files
+                .iter()
+                .all(|file| input_file_holds_no_document_bytes(file, format))))
+    .then(|| match format {
+        InputFormat::Json => (b"\n".to_vec(), InputFormat::Yaml),
+        _ => (b"\n".to_vec(), format),
     })
 }
 
-/// Whether `file` is a regular file with nothing in it but, at most, a byte-order mark (#5356):
-/// the mark is not data, so a file of only that is as empty as a zero-byte one.
-fn input_file_holds_no_document_bytes(file: &str) -> bool {
+/// Whether `byte` is whitespace to yq's JSON reader (#5478): a space, tab, line feed or carriage
+/// return. A form feed, vertical tab, no-break space or byte-order mark is not, and is refused.
+/// The same four bytes jq's lexer skips, so the one definition is `jq_runner`'s.
+fn is_json_whitespace(byte: u8) -> bool {
+    crate::jq_runner::is_json_whitespace(char::from(byte))
+}
+
+/// Whether `bytes` hold no document as `format` reads them (#5478): nothing at all, or, for JSON,
+/// nothing but whitespace. yq answers a whitespace-only JSON input exactly as it does an empty
+/// one (`printf '  \n' | yq -p=json .` is the empty document), while a YAML input of only blanks is
+/// a document of its own.
+fn holds_no_document(bytes: &[u8], format: InputFormat) -> bool {
+    bytes.is_empty()
+        || (format == InputFormat::Json && bytes.iter().copied().all(is_json_whitespace))
+}
+
+/// The format `-o auto` resolves against for a gathered source of `source` format (#5478).
+///
+/// A JSON input that held no document is read as YAML's empty document (see
+/// [`empty_input_reads_as`]), but yq still answers `-o auto` from the input it was given: JSON.
+/// Every source of a run is read in the run's own format (#4394), so a `Yaml` source in a JSON
+/// run can only be that document, or one `--front-matter` forced to YAML, which keeps YAML.
+fn output_basis_format(
+    args: &YqCommand,
+    input_files: &[String],
+    source: InputFormat,
+) -> InputFormat {
+    if source == InputFormat::Yaml
+        && args.front_matter.is_none()
+        && resolve_run_input_format(args.input_format, input_files) == InputFormat::Json
+    {
+        InputFormat::Json
+    } else {
+        source
+    }
+}
+
+/// Whether `file` is a regular file with no document in it as `format` reads it (#5478): for JSON
+/// that is nothing but whitespace (scanned until the first byte that is not, so a large file is
+/// not read whole); otherwise nothing in it but, at most, a byte-order mark (#5356), which is not
+/// data, so a file of only that is as empty as a zero-byte one.
+fn input_file_holds_no_document_bytes(file: &str, format: InputFormat) -> bool {
     let Ok(metadata) = std::fs::metadata(file) else {
         return false;
     };
     if !metadata.is_file() {
         return false;
+    }
+    if format == InputFormat::Json {
+        return std::fs::File::open(file).is_ok_and(|mut f| {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match f.read(&mut chunk) {
+                    Ok(0) => return true,
+                    Ok(n) if chunk[..n].iter().copied().all(is_json_whitespace) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    _ => return false,
+                }
+            }
+        });
     }
     metadata.len() == 0
         || (metadata.len() == crate::front_matter::UTF8_BOM.len() as u64
@@ -1114,7 +1171,7 @@ fn is_drained_stdin_file_argument(path: &Path) -> bool {
 /// [`gather_input_sources`], and yq numbers the files that follow it by their position on the
 /// command line (`yq file_index f1 - - f3` is `0`, `1`, `3`), which the M2 loop already does by
 /// walking `input_files`. The routes that walk the gathered sources map back through this.
-fn gathered_file_indices(input_files: &[String]) -> Vec<usize> {
+fn gathered_file_indices(input_files: &[String], format: InputFormat) -> Vec<usize> {
     if input_files.is_empty() {
         return vec![0];
     }
@@ -1128,8 +1185,8 @@ fn gathered_file_indices(input_files: &[String]) -> Vec<usize> {
             seen_stdin = true;
         }
         // An empty file among others reads no document, so it has no source (#4099).
-        if empty_input_reads_as(Vec::new(), InputFormat::Yaml, input_files, index, false).is_none()
-            && input_file_holds_no_document_bytes(file)
+        if empty_input_reads_as(Vec::new(), format, input_files, index, false).is_none()
+            && input_file_holds_no_document_bytes(file, format)
         {
             continue;
         }
@@ -1543,11 +1600,15 @@ fn resolve_run_input_format(format: InputFormat, files: &[String]) -> InputForma
 fn eval_all_documents(
     input_sources: &[GatheredSource],
     input_files: &[String],
+    input_format: InputFormat,
     document: Option<usize>,
 ) -> Result<Vec<(OwnedValue, usize, usize, bool)>> {
     let mut all_docs: Vec<(OwnedValue, usize, usize, bool)> = Vec::new();
     let mut global_doc_index: usize = 0;
-    let source_file_indices = gathered_file_indices(input_files);
+    let source_file_indices = gathered_file_indices(
+        input_files,
+        resolve_run_input_format(input_format, input_files),
+    );
     for (source_idx, (bytes, format, _)) in input_sources.iter().enumerate() {
         let file_idx = source_file_indices
             .get(source_idx)
@@ -1627,14 +1688,14 @@ fn gather_input_sources(
     let mut sources = Vec::new();
     let resolved_format = resolve_run_input_format(input_format, input_files);
     if input_files.is_empty() {
-        let raw_bytes = empty_input_reads_as(
+        let (raw_bytes, resolved_format) = empty_input_reads_as(
             read_stdin()?,
             resolved_format,
             input_files,
             0,
             front_matter.is_some(),
         )
-        .unwrap_or_default();
+        .unwrap_or_else(|| (Vec::new(), resolved_format));
         let (input_bytes, format, body) =
             apply_front_matter(raw_bytes, resolved_format, front_matter, "<stdin>")?;
         let input_bytes = substitute_json_utf8(input_bytes, format, output_format);
@@ -1648,7 +1709,7 @@ fn gather_input_sources(
             if is_drained_stdin_file_argument(path) {
                 continue;
             }
-            let Some(raw_bytes) = empty_input_reads_as(
+            let Some((raw_bytes, resolved_format)) = empty_input_reads_as(
                 read_file(path)?,
                 resolved_format,
                 input_files,
@@ -10676,9 +10737,15 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             args.output_format,
         )?;
         if gathered.1.is_none() {
-            let all_docs = eval_all_documents(&gathered.0, &input_files, args.document)?;
+            let all_docs =
+                eval_all_documents(&gathered.0, &input_files, args.input_format, args.document)?;
             let reported = sink.report_count();
-            let _positions = source_positions::enter(&program.expr, &gathered.0, &input_files);
+            let _positions = source_positions::enter(
+                &program.expr,
+                &gathered.0,
+                &input_files,
+                args.input_format,
+            );
             let query_result: QueryResult<'_, Vec<u64>> =
                 jq::eval_documents_together::<Vec<u64>, YqSemantics>(&program.expr, &all_docs);
             let results = query_result_to_owned_values(query_result, &mut sink);
@@ -11393,14 +11460,14 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
 
         if input_files.is_empty() {
             let fmt = resolve_input_format(args.input_format, None);
-            let yaml_bytes = empty_input_reads_as(
+            let (yaml_bytes, fmt) = empty_input_reads_as(
                 read_stdin()?,
                 fmt,
                 &input_files,
                 0,
                 args.front_matter.is_some(),
             )
-            .unwrap_or_default();
+            .unwrap_or_else(|| (Vec::new(), fmt));
             // #1616: a `-p json` document's invalid UTF-8, for JSON output.
             let yaml_bytes = substitute_json_utf8(yaml_bytes, fmt, args.output_format);
             if let Some(code) = yaml_validate_guard(&yaml_bytes, fmt, args.validate, None) {
@@ -11597,21 +11664,20 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 // `yaml_validate_guard`/`YamlIndex::build` returns just
                 // below) -- `flush_then_err` keeps this error as the
                 // reported one even if the flush also fails.
-                let yaml_bytes = match read_file(path) {
+                let (yaml_bytes, fmt) = match read_file(path) {
                     Ok(bytes) => match empty_input_reads_as(
                         bytes,
+                        // #4394: the first file's extension decides for all of them.
                         run_input_format,
                         &input_files,
                         file_index,
                         args.front_matter.is_some(),
                     ) {
-                        Some(bytes) => bytes,
+                        Some(read) => read,
                         None => continue,
                     },
                     Err(e) => return flush_then_err(&mut writer, e),
                 };
-                // #4394: the first file's extension decides for all of them.
-                let fmt = run_input_format;
                 // #1616: see the stdin block above.
                 let yaml_bytes = substitute_json_utf8(yaml_bytes, fmt, args.output_format);
                 if let Some(code) =
@@ -11843,7 +11909,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         // disagree" treatment `--slurp`'s own fix already established
         // (see that branch's own comment for the real-yq-mismatch
         // rationale on the mixed-format case).
-        let mut source_formats = input_sources.iter().map(|(_, format, _)| *format);
+        let mut source_formats = input_sources
+            .iter()
+            .map(|(_, format, _)| output_basis_format(&args, &input_files, *format));
         let uniform_format = match source_formats.next() {
             Some(first) if source_formats.all(|f| f == first) => first,
             _ => InputFormat::Yaml,
@@ -11863,9 +11931,18 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         let results = match eval_all_results.take() {
             Some(results) => results,
             None => {
-                let all_docs = eval_all_documents(&input_sources, &input_files, args.document)?;
-                let _positions =
-                    source_positions::enter(&program.expr, &input_sources, &input_files);
+                let all_docs = eval_all_documents(
+                    &input_sources,
+                    &input_files,
+                    args.input_format,
+                    args.document,
+                )?;
+                let _positions = source_positions::enter(
+                    &program.expr,
+                    &input_sources,
+                    &input_files,
+                    args.input_format,
+                );
                 let query_result: QueryResult<'_, Vec<u64>> =
                     jq::eval_documents_together::<Vec<u64>, YqSemantics>(&program.expr, &all_docs);
                 query_result_to_owned_values(query_result, &mut sink)
@@ -11980,7 +12057,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             deferred_validate_exit_code = validate_exit_code;
 
             let mut global_doc_index: usize = 0;
-            let source_file_indices = gathered_file_indices(&input_files);
+            let source_file_indices = gathered_file_indices(
+                &input_files,
+                resolve_run_input_format(args.input_format, &input_files),
+            );
             'files: for (source_idx, (bytes, format, _)) in input_sources.iter().enumerate() {
                 // #2839: see the `'m2_files` loop.
                 if json_stream_tail_error_pending() {
@@ -12015,7 +12095,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 // source's own `InputFormat`, not the invocation-wide
                 // default, since `--input-format auto` can mix JSON and
                 // YAML sources in one run.
-                let file_output_config = output_config.for_source(&args, *format);
+                let file_output_config = output_config
+                    .for_source(&args, output_basis_format(&args, &input_files, *format));
                 // Split-exp output files carry real comments when written
                 // as YAML, same as the main output path (#710) -- resolved
                 // per-file now, not the invocation-wide default (#1493).
@@ -12317,7 +12398,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             // in its own source format, a much deeper per-element behavior
             // this fix doesn't attempt to replicate (pinned as a known gap
             // in the test suite).
-            let mut source_formats = input_sources.iter().map(|(_, format, _)| *format);
+            let mut source_formats = input_sources
+                .iter()
+                .map(|(_, format, _)| output_basis_format(&args, &input_files, *format));
             let uniform_format = match source_formats.next() {
                 Some(first) if source_formats.all(|f| f == first) => first,
                 _ => InputFormat::Yaml,
@@ -12398,7 +12481,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             }
             // #4394: the first file's extension decides for all of them.
             let resolved_format = run_input_format;
-            let Some(raw_bytes) = empty_input_reads_as(
+            let Some((raw_bytes, resolved_format)) = empty_input_reads_as(
                 read_file(path)?,
                 resolved_format,
                 &input_files,
@@ -12465,7 +12548,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             // Json`/`== Yaml` exactly, so `Auto` always reaches this slow
             // DOM branch regardless, same pre-existing scope limit as
             // `--slurp`'s fast path.
-            let mut output_config = output_config.for_source(&args, format);
+            let mut output_config =
+                output_config.for_source(&args, output_basis_format(&args, &input_files, format));
             output_config.use_color = false;
 
             // halt/halt_error (#791): tracks whether any *real* evaluated
@@ -12926,7 +13010,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         // gate below.
         let mut all_results: Vec<Vec<Vec<ResultWithComments>>> = Vec::new();
         let mut global_doc_index: usize = 0;
-        let source_file_indices = gathered_file_indices(&input_files);
+        let source_file_indices = gathered_file_indices(
+            &input_files,
+            resolve_run_input_format(args.input_format, &input_files),
+        );
         'collect: for (source_idx, (bytes, format, _)) in input_sources.iter().enumerate() {
             let file_index = source_file_indices
                 .get(source_idx)
@@ -13013,7 +13100,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             let source_format = input_sources
                 .get(file_idx)
                 .map_or(InputFormat::Yaml, |(_, format, _)| *format);
-            let file_output_config = output_config.for_source(&args, source_format);
+            let file_output_config = output_config.for_source(
+                &args,
+                output_basis_format(&args, &input_files, source_format),
+            );
             if front_matter_body.is_some() {
                 writeln!(writer, "---")?;
             }

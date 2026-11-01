@@ -77,7 +77,8 @@ fn test_empty_file_among_several_inputs_4099() -> Result<()> {
     Ok(())
 }
 
-/// JSON has no line-break document: an empty `.json` input is a `null` one.
+/// An empty `.json` input answers `null` wherever the output is JSON (#5478 pins the blank line it
+/// is where the output is YAML).
 #[test]
 fn test_empty_json_input_is_null_4099() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
