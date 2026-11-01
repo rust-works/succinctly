@@ -120,7 +120,7 @@ pub fn parse_entry(suite: &str, file_name: &str, text: &str) -> Result<Entry> {
 }
 
 /// The entries under `dir` (`<dir>/<suite>/<probe>.toml`), sorted by id. `dir/README.md` is the
-/// only other file allowed. Fails on a stray file or directory, on a name no id maps to, and
+/// only other file allowed, and a name starting with `.` (`.DS_Store`) is skipped. Fails on a stray file or directory, on a name no id maps to, and
 /// when the single-file ledger (`<dir>.toml`) exists again, so a branch rebased across the split
 /// cannot bring it back.
 pub fn load(dir: &Path) -> Result<Vec<Entry>> {
@@ -133,9 +133,11 @@ pub fn load(dir: &Path) -> Result<Vec<Entry>> {
         );
     }
     let mut entries = Vec::new();
-    let mut seen = BTreeSet::new();
     for suite_dir in sorted_children(dir)? {
         let suite = file_name(&suite_dir)?;
+        if suite.starts_with('.') {
+            continue;
+        }
         if suite_dir.is_file() {
             if suite == "README.md" {
                 continue;
@@ -144,16 +146,16 @@ pub fn load(dir: &Path) -> Result<Vec<Entry>> {
         }
         for file in sorted_children(&suite_dir)? {
             let name = file_name(&file)?;
+            if name.starts_with('.') {
+                continue;
+            }
             if !file.is_file() {
                 anyhow::bail!("{}: a directory inside a suite", file.display());
             }
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("reading {}", file.display()))?;
-            let e = parse_entry(&suite, &name, &text)?;
-            if !seen.insert(e.id.clone()) {
-                anyhow::bail!("divergence `{}` is listed twice", e.id);
-            }
-            entries.push(e);
+            // The id is the path and a path is unique, so no id can be listed twice.
+            entries.push(parse_entry(&suite, &name, &text)?);
         }
     }
     entries.sort_by(|a, b| a.id.cmp(&b.id));
@@ -377,6 +379,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("divergences");
         write(&dir, "README.md", "fields\n");
+        write(&dir, ".DS_Store", "x");
+        write(&dir, "cli/.DS_Store", "x");
         write(&dir, "features/strftime.1.toml", BODY);
         write(&dir, "cli/b.toml", BODY);
         write(&dir, "cli/a.toml", BODY);

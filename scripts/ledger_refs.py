@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Fail a branch that references a `to-triage` ledger entry's issue but leaves the entry in (#5585).
 
-`comparison/jq/divergences/<suite>/<probe>.toml` lists every known difference from the reference
-jq, one entry per file (#5769). A `to-triage` entry carries the issue that tracks it. The branch that fixes that issue has to delete
+`comparison/jq/divergences/<suite>/<probe>.toml` lists every known difference from the
+reference jq, one entry per file (#5769). A `to-triage` entry carries the issue that tracks it. The branch that fixes that issue has to delete
 the entry in the same change: CI's `Ledger drift` job fails on "listed but no longer diverging"
 otherwise, after a push, a build and a wait (#5583 needed a third commit for exactly this).
 
@@ -113,7 +113,11 @@ def read_dir(root):
 
 def read_tree(ref, root):
     """The same at `ref`, from git without a checkout. Empty when `ref` has no ledger directory."""
-    listing = git("ls-tree", "-r", "--name-only", ref, "--", LEDGER, cwd=root).splitlines()
+    listing = [
+        path
+        for path in git("ls-tree", "-r", "-z", "--name-only", ref, "--", LEDGER, cwd=root).split("\0")
+        if path
+    ]
     if not listing:
         return {}
     request = "".join(f"{ref}:{path}\n" for path in listing)
@@ -206,9 +210,8 @@ def main(argv=None):
         subjects = git("log", "--format=%s", f"{base}..HEAD", cwd=root).splitlines()
         messages = git("log", "--format=%B%x00", f"{base}..HEAD", cwd=root).split("\0")
         at_base = triage_at(base, root)
-        head_files = read_dir(root)
-        if head_files:
-            at_head = to_triage_files(head_files)
+        if os.path.isdir(os.path.join(root, LEDGER)):
+            at_head = to_triage_files(read_dir(root))
         else:
             # A branch cut before #5769 still has the single file.
             with open(os.path.join(root, OLD_LEDGER), encoding="utf-8") as f:

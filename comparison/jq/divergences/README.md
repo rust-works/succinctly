@@ -25,6 +25,9 @@ The file holds the other fields, with no `[[divergence]]` header and no `id`:
 | `platform` | optional `std::env::consts::OS` the entry was observed on; other OSes neither expect nor call it stale |
 | `volatile` | optional `true`: whether the difference shows depends on the host's speed (a probe the reference finishes inside the 10 s deadline on a fast machine only); expected where it shows, not stale where it does not |
 
+Write each field as a basic `"..."` string (or `true`), one per line: `scripts/ledger_refs.py` reads
+`category` and `issue` by pattern, not with a TOML parser.
+
 Adding an entry adds a file and deleting one deletes its file, so two PRs that touch different
 entries never touch the same lines. Two PRs that ledger the same probe produce the same path and
 still conflict, which is the right result.
