@@ -1,0 +1,4 @@
+category = "to-triage"
+volatile = true
+issue = "#5754"
+reason = "`\"Thursday, March 05 2015\" | strptime(\"%A, %B %d %Y\")` under `de_DE.UTF-8`: jq 1.7.1 rejects the English names (exit 5); succinctly parses them. Shows only where the host has that locale installed (a host without it falls back to `C`)."

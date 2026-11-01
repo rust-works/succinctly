@@ -1,0 +1,2 @@
+category = "by-design"
+reason = "succinctly has no bytecode to disassemble; the flag is rejected (exit 2)."

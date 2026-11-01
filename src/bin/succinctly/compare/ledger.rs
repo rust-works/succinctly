@@ -1,14 +1,19 @@
-//! `comparison/jq/divergences.toml`: every known difference from the reference (#5409).
+//! `comparison/jq/divergences/<suite>/<probe>.toml`: every known difference from the reference
+//! (#5409), one entry per file (#5769).
 //!
-//! An id is `<suite>:<probe>` (`features:cbrt/0`, `cli:version`). The run fails
-//! on a difference that is not listed and on a listed one that no longer
-//! differs, so the ledger cannot drift from the behaviour in either direction
-//! (`jq_error_message_tests.rs` does the same for error wording).
+//! An id is `<suite>:<probe>` (`features:cbrt/0`, `cli:version`), and it is the path: the suite is
+//! the directory, the probe is the file name, with the `/` before an arity written as `.`
+//! (`features:strftime/1` is `features/strftime.1.toml`). The file holds the entry's other
+//! fields. Taking the id from the path means it cannot drift from a second copy, and one file
+//! per entry means two PRs that add or delete different entries never touch the same lines,
+//! as `changelog.d/` did for `CHANGELOG.md` (#3920). The run fails on a difference that is not
+//! listed and on a listed one that no longer differs, so the ledger cannot drift from the
+//! behaviour in either direction (`jq_error_message_tests.rs` does the same for error wording).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const CATEGORIES: &[&str] = &[
     "by-design",
@@ -38,10 +43,16 @@ pub struct Entry {
     pub volatile: bool,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct File {
+/// The fields of an entry file: every field of [`Entry`] but the id, which is the path.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Body {
+    category: String,
+    reason: String,
+    issue: Option<String>,
+    platform: Option<String>,
     #[serde(default)]
-    divergence: Vec<Entry>,
+    volatile: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -58,26 +69,112 @@ impl Outcome {
     }
 }
 
-pub fn parse(text: &str) -> Result<Vec<Entry>> {
-    let f: File = toml::from_str(text).context("invalid divergences.toml")?;
-    let mut seen = BTreeSet::new();
-    for e in &f.divergence {
-        if !seen.insert(&e.id) {
-            anyhow::bail!("divergence `{}` is listed twice", e.id);
-        }
-        if !CATEGORIES.contains(&e.category.as_str()) {
-            anyhow::bail!(
-                "divergence `{}` has unknown category `{}`",
-                e.id,
-                e.category
-            );
-        }
-    }
-    Ok(f.divergence)
+/// A name in a suite directory or a probe: the characters an id uses, none that a file system
+/// reads specially.
+fn is_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-pub fn load(path: &Path) -> Result<Vec<Entry>> {
-    parse(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?)
+/// The id of the entry in `<suite>/<file_name>`: `features` and `strftime.1.toml` are
+/// `features:strftime/1`. A name that no id maps to is an error, so a stray or misspelt file
+/// cannot be silently ignored.
+pub fn id_of(suite: &str, file_name: &str) -> Result<String> {
+    let stem = file_name
+        .strip_suffix(".toml")
+        .with_context(|| format!("{suite}/{file_name}: not a `.toml` file"))?;
+    // `name.N`: the arity's `/` is written as `.`.
+    let probe = match stem.rsplit_once('.') {
+        Some((name, arity)) if !arity.is_empty() && arity.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("{name}/{arity}")
+        }
+        _ => stem.to_string(),
+    };
+    let name = probe.split_once('/').map_or(probe.as_str(), |(n, _)| n);
+    if !is_name(suite) || !is_name(name) {
+        anyhow::bail!(
+            "{suite}/{file_name}: no id maps to this path (a suite and a probe use only \
+             letters, digits, `_` and `-`; an arity is written `.N`)"
+        );
+    }
+    Ok(format!("{suite}:{probe}"))
+}
+
+/// One entry from the text of `<suite>/<file_name>`.
+pub fn parse_entry(suite: &str, file_name: &str, text: &str) -> Result<Entry> {
+    let id = id_of(suite, file_name)?;
+    let body: Body =
+        toml::from_str(text).with_context(|| format!("invalid {suite}/{file_name}"))?;
+    if !CATEGORIES.contains(&body.category.as_str()) {
+        anyhow::bail!("divergence `{id}` has unknown category `{}`", body.category);
+    }
+    Ok(Entry {
+        id,
+        category: body.category,
+        reason: body.reason,
+        issue: body.issue,
+        platform: body.platform,
+        volatile: body.volatile,
+    })
+}
+
+/// The entries under `dir` (`<dir>/<suite>/<probe>.toml`), sorted by id. `dir/README.md` is the
+/// only other file allowed. Fails on a stray file or directory, on a name no id maps to, and
+/// when the single-file ledger (`<dir>.toml`) exists again, so a branch rebased across the split
+/// cannot bring it back.
+pub fn load(dir: &Path) -> Result<Vec<Entry>> {
+    let old = dir.with_extension("toml");
+    if old.exists() {
+        anyhow::bail!(
+            "{} exists: the ledger is one file per entry under {} (#5769); move its entries there",
+            old.display(),
+            dir.display()
+        );
+    }
+    let mut entries = Vec::new();
+    let mut seen = BTreeSet::new();
+    for suite_dir in sorted_children(dir)? {
+        let suite = file_name(&suite_dir)?;
+        if suite_dir.is_file() {
+            if suite == "README.md" {
+                continue;
+            }
+            anyhow::bail!("{}: not a suite directory", suite_dir.display());
+        }
+        for file in sorted_children(&suite_dir)? {
+            let name = file_name(&file)?;
+            if !file.is_file() {
+                anyhow::bail!("{}: a directory inside a suite", file.display());
+            }
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            let e = parse_entry(&suite, &name, &text)?;
+            if !seen.insert(e.id.clone()) {
+                anyhow::bail!("divergence `{}` is listed twice", e.id);
+            }
+            entries.push(e);
+        }
+    }
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(entries)
+}
+
+fn sorted_children(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut v = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("reading {}", dir.display()))?;
+    v.sort();
+    Ok(v)
+}
+
+fn file_name(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(String::from)
+        .with_context(|| format!("{}: not a UTF-8 file name", path.display()))
 }
 
 /// An entry observed on another OS is neither expected nor called stale here.
@@ -217,11 +314,98 @@ mod tests {
     }
 
     #[test]
-    fn duplicates_and_unknown_categories_are_rejected() {
-        let one = "[[divergence]]\nid='a:b'\ncategory='to-triage'\nreason='y'\n";
-        assert!(parse(one).is_ok());
-        assert!(parse(&format!("{one}{one}")).is_err());
-        assert!(parse(&one.replace("to-triage", "whatever")).is_err());
+    fn an_id_is_the_path_with_the_arity_dotted() {
+        for (suite, file, id) in [
+            ("cli", "version.toml", "cli:version"),
+            ("cli", "help-exit.toml", "cli:help-exit"),
+            ("features", "strftime.1.toml", "features:strftime/1"),
+            (
+                "features",
+                "get_jq_origin.0.toml",
+                "features:get_jq_origin/0",
+            ),
+            ("since-secondary", "add.1.toml", "since-secondary:add/1"),
+        ] {
+            assert_eq!(id_of(suite, file).unwrap(), id);
+        }
+        for (suite, file) in [
+            ("cli", "version.json"),
+            ("cli", "version"),
+            ("cli", ".toml"),
+            ("cli", "a b.toml"),
+            ("cli", "a:b.toml"),
+            ("cli", "a.b.toml"),
+            ("cli", "a..1.toml"),
+            ("cli", "a.1.2.toml"),
+            ("", "a.toml"),
+            ("c li", "a.toml"),
+        ] {
+            assert!(id_of(suite, file).is_err(), "{suite}/{file}");
+        }
+    }
+
+    #[test]
+    fn an_entry_file_is_the_other_fields_and_nothing_else() {
+        let ok = "category='to-triage'\nreason='y'\nissue='#1'\nplatform='linux'\nvolatile=true\n";
+        let e = parse_entry("robust", "slow.toml", ok).unwrap();
+        assert_eq!(
+            (
+                e.id.as_str(),
+                e.issue.as_deref(),
+                e.platform.as_deref(),
+                e.volatile
+            ),
+            ("robust:slow", Some("#1"), Some("linux"), true)
+        );
+        // The id is the path, so a second copy of it is refused.
+        assert!(parse_entry("cli", "a.toml", &format!("id='cli:a'\n{ok}")).is_err());
+        assert!(parse_entry("cli", "a.toml", "category='to-triage'\n").is_err());
+        assert!(parse_entry("cli", "a.toml", &ok.replace("to-triage", "whatever")).is_err());
+        assert!(parse_entry("cli", "a.toml", &format!("{ok}extra='x'\n")).is_err());
+    }
+
+    fn write(root: &Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    const BODY: &str = "category='to-triage'\nreason='y'\n";
+
+    #[test]
+    fn load_reads_the_directory_sorted_by_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("divergences");
+        write(&dir, "README.md", "fields\n");
+        write(&dir, "features/strftime.1.toml", BODY);
+        write(&dir, "cli/b.toml", BODY);
+        write(&dir, "cli/a.toml", BODY);
+        let ids: Vec<String> = load(&dir).unwrap().into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, ["cli:a", "cli:b", "features:strftime/1"]);
+    }
+
+    #[test]
+    fn load_rejects_stray_files_and_the_old_single_file_ledger() {
+        for (rel, what) in [
+            ("stray.toml", "a file beside the suites"),
+            ("cli/notes.txt", "a non-toml file in a suite"),
+            ("cli/sub/a.toml", "a directory in a suite"),
+            ("cli/bad name.toml", "a name no id maps to"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("divergences");
+            write(&dir, "cli/ok.toml", BODY);
+            write(&dir, rel, BODY);
+            assert!(load(&dir).is_err(), "{what}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("divergences");
+        write(&dir, "cli/ok.toml", BODY);
+        assert!(load(&dir).is_ok());
+        // A rebased branch that brings the old file back is refused.
+        std::fs::write(tmp.path().join("divergences.toml"), "").unwrap();
+        let err = load(&dir).unwrap_err().to_string();
+        assert!(err.contains("one file per entry"), "{err}");
     }
 
     #[test]
@@ -263,7 +447,7 @@ mod tests {
 
     #[test]
     fn the_checked_in_ledger_parses() {
-        let text = include_str!("../../../../comparison/jq/divergences.toml");
-        assert!(parse(text).unwrap().len() >= 10);
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("comparison/jq/divergences");
+        assert!(load(&dir).unwrap().len() >= 10);
     }
 }

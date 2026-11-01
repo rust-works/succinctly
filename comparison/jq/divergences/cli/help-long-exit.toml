@@ -1,0 +1,2 @@
+category = "by-design"
+reason = "`--help` prints succinctly's own usage text."

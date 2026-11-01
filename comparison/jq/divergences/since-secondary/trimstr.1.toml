@@ -1,0 +1,2 @@
+category = "newer-than-primary"
+reason = "trimstr(s) is new in jq 1.8; succinctly follows the 1.7.1 pin (ADR-0018)."

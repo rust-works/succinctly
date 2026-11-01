@@ -1,0 +1,2 @@
+category = "by-design"
+reason = "A user-defined function recursing 10000 deep: jq answers (about 3 s); succinctly's stack guard refuses with `exceeded maximum recursion depth` (ADR-0025)."

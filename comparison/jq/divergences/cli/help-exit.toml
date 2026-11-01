@@ -1,0 +1,2 @@
+category = "by-design"
+reason = "`-h` prints succinctly's own usage text."

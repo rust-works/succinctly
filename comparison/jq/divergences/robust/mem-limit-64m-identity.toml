@@ -1,0 +1,3 @@
+platform = "linux"
+category = "reference-crash"
+reason = "Under `ulimit -v` 64 MiB, 1M-integer array: the reference jq 1.7.1 aborts; succinctly answers, on an evaluation stack sized to the cap (#5634)."

@@ -8,7 +8,7 @@ cargo build --release --features cli,simd,regex,serde,bench-runner
 ./target/release/succinctly dev compare jq --quick    # or --full; --build-jq builds the reference if missing
 ```
 
-`--ledger-only` runs just the probes `divergences.toml` lists for this OS and exits 1 on an entry that no longer
+`--ledger-only` runs just the probes the ledger (`divergences/`) lists for this OS and exits 1 on an entry that no longer
 diverges: the stale half of the `Ledger drift` CI job in about a minute, without the 1.8.1 build (#5585). With no pinned
 1.7.1 build it uses `/usr/bin/jq` when that reports `jq-1.7.1` or `jq-1.7.1-<vendor>` (macOS: `jq-1.7.1-apple`) and says
 so, because a vendor build can disagree with the pinned one on libm-dependent entries. It skips `since-secondary` entries,
@@ -32,7 +32,7 @@ reported as a correctness row and gets no timing; the command exits 1 on it.
 | `vendor/jq-1.8.1/`    | B2: jq 1.8.1's own test files, run against 1.8.1 alone and reported apart (informational, never a ledger entry) |
 | `queries/perf.tsv`    | D/E: id, flags, filter, shapes, max tier; `@INPUT@` in the flags is the input file's name (`--slurpfile d @INPUT@`), `@files=N` passes it `N` times |
 | `probes/robust.tsv`   | F: nesting, recursion, generators, regex, big values, SIGPIPE, `ulimit -v` (`ulimit-v:<KiB>` wrap); `@gen:` builds large stdin |
-| `divergences.toml`    | ledger of known differences; the run fails on drift      |
+| `divergences/`        | ledger of known differences, one file per entry (`<suite>/<probe>.toml`, see its README); the run fails on drift |
 
 The `env` column of `probes/cli.tsv` (and `syntax.tsv`) is a JSON object of variables set for both tools (`{"JQ_COLORS":"1;31"}`, `{"LC_ALL":"","LANG":"de_DE.UTF-8"}`). The base environment is `LC_ALL=C` with `JQ_COLORS`, `NO_COLOR` and every other locale variable removed, so a probe sees only what its row sets (#5552). A locale the host lacks makes both tools fall back to `C`, so the `de_DE`/`tr_TR` rows only mean something on a host that has them (macOS; the Linux runners carry `C.utf8` and `en_US`).
 

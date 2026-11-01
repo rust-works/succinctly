@@ -1,0 +1,2 @@
+category = "reference-crash"
+reason = "Same jq 1.7.1 assertion abort on a non-string format as strftime/1."

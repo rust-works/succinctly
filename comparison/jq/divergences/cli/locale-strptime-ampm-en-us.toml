@@ -1,0 +1,3 @@
+category = "host-dependent"
+issue = "#5753"
+reason = "Same platform-dependent weekday as `locale-strptime-ampm-c`, under `en_US.UTF-8`."

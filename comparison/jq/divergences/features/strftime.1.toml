@@ -1,0 +1,2 @@
+category = "reference-crash"
+reason = "jq 1.7.1 aborts (`Assertion failed: JVP_HAS_KIND(j, JV_KIND_STRING)`, jv.c:1370) on a non-string format; succinctly reports a catchable error."

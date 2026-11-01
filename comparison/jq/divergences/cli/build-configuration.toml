@@ -1,0 +1,2 @@
+category = "by-design"
+reason = "`--build-configuration` describes succinctly's build, not jq's configure line."

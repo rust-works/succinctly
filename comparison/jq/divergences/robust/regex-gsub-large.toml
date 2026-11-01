@@ -1,0 +1,2 @@
+category = "reference-slow"
+reason = "`gsub(\"a\";\"b\")` over 100000 characters: jq 1.7.1 does not finish within 10 s; succinctly answers in tens of milliseconds."
