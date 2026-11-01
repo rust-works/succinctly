@@ -31218,24 +31218,14 @@ fn test_position_arg_and_getpath_without_a_cursor_2168() -> Result<()> {
     Ok(())
 }
 
-/// Known, deliberate gap: slicing an object with a genuine duplicate YAML
-/// key silently collapses it, the same root cause as this repo's other
-/// duplicate-mapping-key gaps (`OwnedValue::Object`'s `IndexMap`
-/// representation cannot hold two entries with the same key at all) --
-/// unlike those other surfaces, there's no cursor-preserving alternative
-/// available here, since slicing inherently needs to reorder/subset the
-/// entries, not just stream them. Real yq keeps both `a` entries (verified
-/// live against yq v4.53.3: `["a",1,"b",2,"a",3]`, 6 children); succinctly
-/// silently drops the first one during the materialization slicing needs.
+/// Slicing an object with a genuine duplicate YAML key keeps both entries,
+/// as real yq does (verified against yq v4.53.3: `["a",1,"b",2,"a",3]`).
+/// Closed by #5426; the name keeps its #1102 origin.
 #[test]
-fn test_object_slice_duplicate_key_known_gap_1102() -> Result<()> {
+fn test_object_slice_duplicate_key_keeps_both_entries_1102() -> Result<()> {
     let (out, code) = run_yq_stdin(".[0:6]", "a: 1\nb: 2\na: 3\n", &["-o", "json", "-I0"])?;
     assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(
-        out.trim(),
-        r#"["a",3,"b",2]"#,
-        "duplicate key collapse is the known gap -- real yq keeps both a entries"
-    );
+    assert_eq!(out.trim(), r#"["a",1,"b",2,"a",3]"#);
     Ok(())
 }
 
