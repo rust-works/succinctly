@@ -18991,7 +18991,6 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Builtin: map_values(f)
 /// Whether `f` holds a `?//` alternative chain (more than one pattern). Only a
 /// chain can retry after the update's first output (#3524); the retry never
 /// surfaces as a second output through `map_values`' own first-output read, so
@@ -19017,6 +19016,7 @@ fn first_output_only<W, S: EvalSemantics>(result: QueryResult<'_, W>) -> QueryRe
     }
 }
 
+/// Builtin: map_values(f)
 fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,

@@ -39772,6 +39772,7 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         MapFamily::Map | MapFamily::MapValues => Rc::new(container.clone()),
     };
     let stages = owned_identity_body_stages(f);
+    let reads_first_output_only = S::TAG == EvalTag::Jq && matches!(family, MapFamily::MapValues);
     let mut array: Vec<OwnedValue> = Vec::new();
     // `map_values` writes each live value and leaves a repeated key's earlier entries alone (yq,
     // ADR-0027): start from the container, not from nothing.
@@ -39794,7 +39795,13 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
             optional,
             OwnedIdentityTail::Pairs(&mut |v, _| {
                 outputs.push(v.into_owned());
-                Flow::Exhausted
+                // #5791: jq's `map_values(f)` is `.[] |= f`, which reads one output of `f` and
+                // leaves, so a control `f` raises after it is never reached. yq runs on.
+                if reads_first_output_only {
+                    Flow::Stopped { pending: None }
+                } else {
+                    Flow::Exhausted
+                }
             }),
         );
         if let Flow::Escaped(control) = flow {
