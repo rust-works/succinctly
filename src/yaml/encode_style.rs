@@ -419,6 +419,15 @@ pub fn go_yaml_dom_scalar(s: &str, flow: bool, json_sourced: bool, is_key: bool)
             return (!s.is_empty()).then(|| String::from(s));
         }
         if matches!(resolve_plain(s), ResolvedScalar::Str) {
+            // Inside `[...]` or `{...}` yq quotes by characters alone, so a plain timestamp or
+            // `12:30:45` is single-quoted there even though it is left bare in block context
+            // (#5469).
+            if flow && !s.is_empty() && flow_plain_needs_single_quotes(s) {
+                let mut out = String::new();
+                if write_go_yaml_single_quoted(&mut out, s).is_ok() {
+                    return Some(out);
+                }
+            }
             return None;
         }
     }
