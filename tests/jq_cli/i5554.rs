@@ -3,8 +3,10 @@
 //! it from the tree instead, with jq's writer's `<skipped: too deep>` marker past 256 levels.
 //! Every expected value was captured from jq 1.7.1 (`/usr/bin/jq`).
 //!
-//! Only a pipe whose first stage renders the value is covered; the same stage inside `try`, a
-//! comma, an `as` source or `map` still reads the refusal (recorded in the limitations page).
+//! A pipe whose first stage renders the value is covered, alone or under `try`/`?`, as an `as`
+//! source whose body ignores `.`, or as a format-prefixed interpolation. The same stage inside a
+//! comma, `map` or an iteration of a too-deep array still reads the refusal (recorded in the
+//! limitations page).
 
 use anyhow::Result;
 
@@ -68,5 +70,41 @@ fn test_a_value_the_bridge_accepts_is_unchanged_5554() -> Result<()> {
     assert_eq!(answer("f(383) | tojson | length")?, "533\n");
     assert_eq!(answer("f(250) | tojson | length")?, "501\n");
     assert_eq!(answer("[1,{\"a\":2.50}] | tojson | length")?, "14\n");
+    Ok(())
+}
+
+#[test]
+fn test_text_stage_under_try_as_and_format_interpolation_5554() -> Result<()> {
+    for (program, want) in [
+        ("f(400) | try tojson | length", "533\n"),
+        ("f(400) | try @text | length", "533\n"),
+        ("f(400) | tojson as $x | $x | length", "533\n"),
+        (r#"f(400) | tojson as $x | "a" + $x | length"#, "534\n"),
+        ("f(400) | (tojson as $x | $x) | length", "533\n"),
+        ("f(400) | tostring as $x | [$x] | length", "1\n"),
+        (r#"f(400) | @json "x\(.)" | length"#, "534\n"),
+        (r#"f(400) | @json "x\(.)y\(.)" | length"#, "1068\n"),
+        (
+            "f(500) | try tostring | .[250:300]",
+            "\"[[[[[[[<skipped: too deep>]]]]]]]]]]]]]]]]]]]]]]]]\"\n",
+        ),
+    ] {
+        assert_eq!(answer(program)?, want, "`{program}`");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_a_binding_body_that_reads_the_deep_input_keeps_the_refusal_5554() -> Result<()> {
+    // `. as $x | .` reads the value, which the bridge cannot index: still refused here.
+    let (_, stderr, code) = run_jq_full(
+        &["-nc", &format!("{DEF} f(400) | tojson as $x | . | length")],
+        None,
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 384"),
+        "{stderr}"
+    );
     Ok(())
 }
