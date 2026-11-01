@@ -11916,7 +11916,7 @@ The shortcut fires only where `==` is handed two handles on one storage, so the 
 
 Still different:
 
-- **Spellings of a fold step that stores its loop variable that still rebuild it** ([#5540](https://github.com/rust-works/succinctly/issues/5540)).
+- **Spellings of a fold step that stores its loop variable that still rebuild it** ([#5761](https://github.com/rust-works/succinctly/issues/5761), #5540 follow-up).
   `reduce $a as $v (null; . += $v) | . == $a` (the compound spelling of jq's own `add`), `(.x, .y) += $v`, `(.x += $v)?`, an `as` rebind (`$v as $w | .x = $w`) and a container-valued field read stored on its own (`.x = $r.items`) are `false` here and `true` in jq.
   A whole-variable read in a sibling stage shares the node (`.y = $r | .x = $r.items`), so the answer follows an unrelated read.
   Two spellings answer `true` where jq says `false`, because a stage returns the handle of its input where jq builds a new container: a slice assigned onto `null` (`reduce $a as $v (null; .[1:] = $v) | . == $a`) and an out-of-range `del` (`$v | del(.[5])`).
