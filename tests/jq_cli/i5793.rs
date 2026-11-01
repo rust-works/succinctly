@@ -34,6 +34,16 @@ const ROWS: &[(&str, &str, i32, usize)] = &[
         5,
         1,
     ),
+    // A bound before the failing one is applied first, and the other control flows pass through.
+    (".b[(0,(.a|map(error(\"x\")))):]", "[1,2,3]\n", 5, 1),
+    (".b[:(0,(.a|map(error(\"x\"))))]", "[]\n", 5, 1),
+    ("label $l | 1, .[(.a|map(break $l))], 2", "1\n", 0, 0),
+    ("first(.[(.a|map(error(\"x\")))])", "", 5, 1),
+    ("limit(1; .[(.a|map(error(\"x\")))])", "", 5, 1),
+    (".[(.a|map(error(\"x\")))] as [$x] ?// $x | $x", "", 5, 1),
+    // The target side already raised.
+    ("(.a|map(error(\"x\")))[0]", "", 5, 1),
+    ("(.a|map(error(\"x\")))[1:]", "", 5, 1),
     // A key that does not fail is unchanged.
     (".b[(.a|map(.))]", "[0]\n", 0, 0),
     (".[(.a|map(\"a\")|.[0])]", "[1]\n", 0, 0),
