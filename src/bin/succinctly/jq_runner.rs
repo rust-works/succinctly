@@ -10975,10 +10975,14 @@ fn evaluate_bytes_streaming<'a>(
     let cursor = index.root(json_bytes);
     let mut write_err: Option<anyhow::Error> = None;
     let control = jq::eval_generic::eval_each_with_cursor(expr, cursor, &mut |result| {
-        // `generic_result_to_jq_values` reports a per-result failure to
-        // `sink` and yields nothing for it, the same "report and keep going"
-        // contract the batched loop relied on (#355).
-        for value in generic_result_to_jq_values(result, cursor, at, sink) {
+        // A failure of the result itself ends the generator once what converted before it is
+        // written: jq abandons the input at its first uncaught error (#5785). The conversion
+        // reports it to `sink`, so the count moving across that call is the signal; what
+        // `on_value` reports afterwards is not.
+        let reports_before = sink.report_count();
+        let values = generic_result_to_jq_values(result, cursor, at, sink);
+        let failed = sink.report_count() != reports_before;
+        for value in values {
             match on_value(sink, value) {
                 Ok(true) => {}
                 Ok(false) => return false,
@@ -10988,7 +10992,7 @@ fn evaluate_bytes_streaming<'a>(
                 }
             }
         }
-        true
+        !failed
     });
     // Reported *before* any write error is surfaced, for the reason
     // `evaluate_input_streaming` gives at its own copy of this match: the
