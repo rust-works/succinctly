@@ -43,6 +43,17 @@ pub struct Perf {
     pub queries: String,
 }
 
+/// Dimension B's grammar fuzzer (#5552): the script, and the seeds and sizes of a run.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Fuzz {
+    pub script: String,
+    /// One run per seed, so the programs a run covers are the same every time.
+    pub seeds: Vec<u64>,
+    /// Programs per seed. The same for `--quick` and a full run: see manifest.toml.
+    pub programs: u32,
+    pub depth: u32,
+}
+
 /// A vendored upstream test file, pinned by content.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Suite {
@@ -67,6 +78,7 @@ pub struct Manifest {
     pub suites: Vec<Suite>,
     pub json_suite: Suite,
     pub perf: Perf,
+    pub fuzz: Fuzz,
     #[serde(rename = "input", default)]
     pub inputs: Vec<super::perf::InputSpec>,
 }
@@ -99,6 +111,9 @@ impl Manifest {
                     i.id
                 );
             }
+        }
+        if m.fuzz.seeds.is_empty() || m.fuzz.programs == 0 {
+            bail!("[fuzz] needs at least one seed and a non-zero program count");
         }
         for suite in &m.suites {
             if let Some(id) = &suite.reference {
@@ -170,7 +185,7 @@ mod tests {
     fn a_suite_naming_an_unknown_reference_is_rejected() {
         let text = "schema_version = 1\n\
             [succinctly]\nprofile='release'\nfeatures=''\n[queries]\nsmoke='x'\n\
-            [probes]\ncli='x'\nextensions='x'\nsyntax='x'\nfixtures='x'\ndivergences='x'\nrobust='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n[perf]\nqueries='q'\n\
+            [probes]\ncli='x'\nextensions='x'\nsyntax='x'\nfixtures='x'\ndivergences='x'\nrobust='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n[perf]\nqueries='q'\n[fuzz]\nscript='s'\nseeds=[1]\nprograms=1\ndepth=1\n\
             [[reference]]\nid='a'\nversion='1'\nrole='primary'\nsource_url=''\nsource_sha256=''\n\
             [[suite]]\nid='s'\npath='p'\nsha256='s'\nreference='a'\n";
         // Naming the primary, or a typo, would run the suite as a primary one.
@@ -182,7 +197,7 @@ mod tests {
     fn an_input_is_generated_or_from_the_corpus_and_never_neither_or_both() {
         let base = "schema_version = 1\n\
             [succinctly]\nprofile='release'\nfeatures=''\n[queries]\nsmoke='x'\n\
-            [probes]\ncli='x'\nextensions='x'\nsyntax='x'\nfixtures='x'\ndivergences='x'\nrobust='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n[perf]\nqueries='q'\n\
+            [probes]\ncli='x'\nextensions='x'\nsyntax='x'\nfixtures='x'\ndivergences='x'\nrobust='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n[perf]\nqueries='q'\n[fuzz]\nscript='s'\nseeds=[1]\nprograms=1\ndepth=1\n\
             [[reference]]\nid='a'\nversion='1'\nrole='primary'\nsource_url=''\nsource_sha256=''\n";
         let input = |fields: &str| {
             format!("{base}[[input]]\nid='i'\nshape='s'\ntier='1mb'\nsha256='h'\n{fields}")
@@ -202,7 +217,7 @@ mod tests {
     fn two_primaries_are_rejected() {
         let text = "schema_version = 1\n\
             [succinctly]\nprofile='release'\nfeatures=''\n[queries]\nsmoke='x'\n\
-            [probes]\ncli='x'\nextensions='x'\nsyntax='x'\nfixtures='x'\ndivergences='x'\nrobust='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n[perf]\nqueries='q'\n\
+            [probes]\ncli='x'\nextensions='x'\nsyntax='x'\nfixtures='x'\ndivergences='x'\nrobust='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n[perf]\nqueries='q'\n[fuzz]\nscript='s'\nseeds=[1]\nprograms=1\ndepth=1\n\
             [[reference]]\nid='a'\nversion='1'\nrole='primary'\nsource_url=''\nsource_sha256=''\n\
             [[reference]]\nid='b'\nversion='2'\nrole='primary'\nsource_url=''\nsource_sha256=''\n";
         assert!(Manifest::parse(text).is_err());

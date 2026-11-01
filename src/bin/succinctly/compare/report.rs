@@ -2,6 +2,7 @@
 
 use super::cli;
 use super::features::{FeatureSummary, Status};
+use super::fuzz;
 use super::harness::{Row, Verdict};
 use super::ledger;
 use super::operational;
@@ -288,6 +289,7 @@ pub fn render(results: &Results) -> String {
     differential_section(&mut s, r);
     differential_secondary_section(&mut s, r);
     input_section(&mut s, r);
+    fuzz_section(&mut s, r.fuzz.as_ref(), &r.known_divergences);
     robust_section(&mut s, r);
     operational_section(&mut s, r);
     perf_sections(&mut s, r);
@@ -818,6 +820,80 @@ fn memory_section(s: &mut String, timed: &[&PerfRow]) {
     }
 }
 
+/// A value in a table cell: the pipes of a jq program must not end the cell.
+fn cell(text: &str) -> String {
+    format!("`{}`", text.replace('|', "\\|").replace('\n', " "))
+}
+
+fn outcome(o: Option<&fuzz::Outcome>) -> String {
+    let Some(o) = o else {
+        return "none".into();
+    };
+    let exit = o.exit.map_or_else(|| "signal".into(), |e| e.to_string());
+    let tail = if o.error.is_empty() {
+        cell(o.stdout.trim_end())
+    } else {
+        cell(&o.error)
+    };
+    format!("exit {exit} {tail}")
+}
+
+/// B, the grammar fuzzer (#5552): what each seed covered, then every minimized finding.
+fn fuzz_section(s: &mut String, f: Option<&fuzz::Summary>, known: &[ledger::Entry]) {
+    let Some(f) = f else {
+        return;
+    };
+    let _ = writeln!(s, "\n## B. Grammar-based differential fuzzing\n");
+    let _ = writeln!(
+        s,
+        "`scripts/jq-grammar-fuzz.py` generates jq programs and documents from a typed grammar under a \
+         fixed seed, so a run covers the same programs every time. Exit status, stdout and the fault's \
+         class (the first stderr line without position or value) must match jq 1.7.1's. A program jq does \
+         not compile, or that times out, is skipped: the generator's mistake, not evidence. \
+         `answered` counts the programs both tools ran to a result; those carry the signal.\n"
+    );
+    let _ = writeln!(
+        s,
+        "| Seed | Programs | Agree | Answered | Skipped | Divergence signatures |"
+    );
+    let _ = writeln!(
+        s,
+        "|------|----------|-------|----------|---------|-----------------------|"
+    );
+    for x in &f.runs {
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {} | {} |",
+            x.seed, x.programs, x.agree, x.answered, x.skipped, x.signatures
+        );
+    }
+    if f.findings.is_empty() {
+        let _ = writeln!(s, "\nNo divergence found.");
+        return;
+    }
+    let _ = writeln!(
+        s,
+        "\n| Id | Kind | Program | Document | jq | succinctly | Ledger |"
+    );
+    let _ = writeln!(
+        s,
+        "|----|------|---------|----------|----|------------|--------|"
+    );
+    for x in &f.findings {
+        let _ = writeln!(
+            s,
+            "| `{}` | {} | {} | {} | {} | {} | {} |",
+            x.id(),
+            x.kind,
+            cell(&x.program),
+            cell(&x.doc),
+            outcome(x.reference.as_ref()),
+            outcome(x.subject.as_ref()),
+            ledger_note(known, &x.id())
+        );
+    }
+}
+
 fn robust_section(s: &mut String, r: &Results) {
     if r.robust.is_empty() {
         return;
@@ -937,6 +1013,80 @@ fn operational_section(s: &mut String, r: &Results) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finding(program: &str) -> fuzz::Finding {
+        let o = |exit, stdout: &str, error: &str| fuzz::Outcome {
+            exit: Some(exit),
+            stdout: stdout.into(),
+            error: error.into(),
+        };
+        fuzz::Finding {
+            seed: 1,
+            kind: "ours-only".into(),
+            members: 3,
+            program: program.into(),
+            doc: "[1]".into(),
+            reference: Some(o(5, "", "jq: error: x")),
+            subject: Some(o(0, "1\n", "")),
+        }
+    }
+
+    fn fuzz_summary(findings: Vec<fuzz::Finding>) -> fuzz::Summary {
+        fuzz::Summary {
+            runs: vec![fuzz::SeedRun {
+                seed: 1,
+                programs: 500,
+                agree: 480,
+                answered: 200,
+                skipped: 12,
+                signatures: findings.len() as u64,
+            }],
+            findings,
+        }
+    }
+
+    #[test]
+    fn a_fuzz_run_without_findings_says_so_and_a_skipped_dimension_prints_nothing() {
+        let mut s = String::new();
+        fuzz_section(&mut s, None, &[]);
+        assert!(s.is_empty());
+        fuzz_section(&mut s, Some(&fuzz_summary(vec![])), &[]);
+        assert!(s.contains("| 1 | 500 | 480 | 200 | 12 | 0 |"), "{s}");
+        assert!(s.contains("No divergence found."), "{s}");
+    }
+
+    /// A pipe in a program must not end its table cell, and an unlisted finding says so.
+    #[test]
+    fn a_fuzz_finding_keeps_its_program_in_one_cell_and_is_unlisted_until_ledgered() {
+        let mut s = String::new();
+        fuzz_section(
+            &mut s,
+            Some(&fuzz_summary(vec![finding(".a | tojson")])),
+            &[],
+        );
+        assert!(s.contains("| `.a \\| tojson` |"), "{s}");
+        assert!(s.contains("exit 5 `jq: error: x`"), "{s}");
+        assert!(s.contains("exit 0 `1`"), "{s}");
+        assert!(s.contains("**unlisted**"), "{s}");
+        let known = vec![ledger::Entry {
+            id: finding(".a | tojson").id(),
+            category: "to-triage".into(),
+            reason: "why".into(),
+            issue: None,
+            platform: None,
+            volatile: false,
+        }];
+        let mut listed = String::new();
+        fuzz_section(
+            &mut listed,
+            Some(&fuzz_summary(vec![finding(".a | tojson")])),
+            &known,
+        );
+        assert!(
+            listed.contains("to-triage: why") && !listed.contains("unlisted"),
+            "{listed}"
+        );
+    }
 
     fn tool(name: &str, rss: Option<u64>, private: Option<u64>) -> ToolResult {
         ToolResult {

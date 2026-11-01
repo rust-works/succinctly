@@ -21,7 +21,8 @@ name: Compare jq ledger
 #
 # The --dimension list in the Compare step names the dimensions whose probes feed the ledger
 # (see `run_suites` in src/bin/succinctly/compare/mod.rs); a new ledger-fed dimension has to
-# be added there too.
+# be added there too. The fuzz dimension runs scripts/jq-grammar-fuzz.py with python3, which the
+# runner image has.
 on:
   pull_request:
     branches: [main]
@@ -31,6 +32,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/compare-jq-build.sh'
+      - 'scripts/jq-grammar-fuzz.py'
       - 'scripts/ledger_refs.py'
       - 'scripts/test_ledger_refs.py'
       - '.github/workflows/compare-jq-ledger.yml'
@@ -42,6 +44,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/compare-jq-build.sh'
+      - 'scripts/jq-grammar-fuzz.py'
       - 'scripts/ledger_refs.py'
       - 'scripts/test_ledger_refs.py'
       - '.github/workflows/compare-jq-ledger.yml'
@@ -130,7 +133,7 @@ jobs:
           mkdir -p data/compare/ledger
           ./target/release/succinctly dev compare jq --quick \
             --dimension smoke --dimension features --dimension cli \
-            --dimension differential --dimension input --dimension robustness \
+            --dimension differential --dimension fuzz --dimension input --dimension robustness \
             --out data/compare/ledger 2>&1 | tee data/compare/ledger/compare.log
 
       - name: Summarize the drift
