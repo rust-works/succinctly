@@ -2023,21 +2023,37 @@ struct TailTable {
     /// variable, which is never split.
     runs: Box<[core::cell::OnceCell<Option<Rc<SharedArg>>>]>,
     /// For a pipe longer than [`MAX_KEPT_TAIL_STAGES`], built on its first
-    /// chained tail: link `i` is the pipe over the blocks from block `i + 1` on
-    /// (see [`PipeStages::chained_tail`], #5679).
-    chain: core::cell::OnceCell<Box<[Rc<SharedArg>]>>,
+    /// chained tail: link `i` is the pipe over block `i` and the blocks after it
+    /// up to the next block holding evaluation state, and `None` for a block
+    /// that holds some (see [`PipeStages::chained_tail`], #5679, #5722).
+    chain: core::cell::OnceCell<Box<[Option<Rc<SharedArg>>]>>,
     /// For the table of a pipe longer than [`MAX_KEPT_TAIL_STAGES`], which has
-    /// only this and `chain`: whether no stage holds evaluation state, so that
-    /// the pipe may be chained.
-    chainable: bool,
+    /// only this and `chain`: for each block, whether a stage in it holds
+    /// evaluation state. A kept link would carry what evaluation did to such a
+    /// stage from one call to the next (#3148), so a block that holds one is
+    /// cloned for each call instead of linked (#5722).
+    block_stateful: Box<[bool]>,
+    /// For each block, the first block at or after it that holds evaluation state
+    /// (the number of blocks if none does): where a link that starts there ends,
+    /// so a tail is built without walking the blocks of a run (#5722).
+    run_ends: Box<[u32]>,
 }
 
 impl TailTable {
     /// The table of a pipe longer than [`MAX_KEPT_TAIL_STAGES`] (#5679): no
     /// tail of it is kept, only the chain it hands its tails on through, so
     /// none of the per-offset arrays a pipe of up to that length keeps.
-    fn for_chain(chainable: bool) -> Rc<Self> {
+    fn for_chain(block_stateful: Box<[bool]>) -> Rc<Self> {
+        let mut run_ends = vec![block_stateful.len() as u32; block_stateful.len() + 1];
+        for block in (0..block_stateful.len()).rev() {
+            run_ends[block] = if block_stateful[block] {
+                block as u32
+            } else {
+                run_ends[block + 1]
+            };
+        }
         Rc::new(Self {
+            run_ends: run_ends.into(),
             volatile_through: 0,
             slots: Box::default(),
             stops: Box::default(),
@@ -2045,8 +2061,15 @@ impl TailTable {
             shares: Box::default(),
             runs: Box::default(),
             chain: core::cell::OnceCell::new(),
-            chainable,
+            block_stateful,
         })
+    }
+
+    /// Whether the pipe has a block after the first that shares: one with no
+    /// stage holding evaluation state. Without it every call would clone the
+    /// whole rest, as it does unchained.
+    fn chainable(&self) -> bool {
+        self.block_stateful.iter().skip(1).any(|stateful| !stateful)
     }
 }
 
@@ -2105,6 +2128,16 @@ pub(crate) const MIN_SPLIT_TAIL_STAGES: usize = 8;
 /// stage.
 fn chain_blocks(len: usize) -> usize {
     (len / CHAIN_BLOCK_STAGES).max(1)
+}
+
+/// The stages of block `block` of a pipe of `len` stages: the last block runs to the end.
+fn chain_block_range(block: usize, len: usize) -> core::ops::Range<usize> {
+    let end = if block + 1 == chain_blocks(len) {
+        len
+    } else {
+        (block + 1) * CHAIN_BLOCK_STAGES
+    };
+    block * CHAIN_BLOCK_STAGES..end
 }
 
 /// The block stage `at` of a pipe of `len` stages is in.
@@ -2256,9 +2289,10 @@ impl PipeStages {
     /// [`TailPlan::Copy`] when it is no longer than two blocks.
     ///
     /// Only jq mode chains a tail, as it only splits one (`splittable`), and
-    /// only a pipe none of whose stages holds evaluation state: the chain is
-    /// kept, so a stage in it would carry what evaluation did to it from one
-    /// call to the next (#3148).
+    /// only a pipe with a block after the first that holds no evaluation state:
+    /// the chain is kept, so a stage in it would carry what evaluation did to it
+    /// from one call to the next (#3148). A block that holds one is cloned for each
+    /// call instead (#5722); a pipe whose every block does is copied whole.
     #[inline(never)]
     fn chain_plan(
         &self,
@@ -2271,13 +2305,18 @@ impl PipeStages {
             return TailPlan::Copy;
         }
         let table = self.tails.table.get_or_init(|| {
+            let blocks = chain_blocks(len);
             TailTable::for_chain(
-                self.stages
-                    .iter()
-                    .all(|stage| class(stage) != StageClass::Stateful),
+                (0..blocks)
+                    .map(|block| {
+                        self.stages[chain_block_range(block, len)]
+                            .iter()
+                            .any(|stage| class(stage) == StageClass::Stateful)
+                    })
+                    .collect(),
             )
         });
-        if table.chainable {
+        if table.chainable() {
             TailPlan::Split
         } else {
             TailPlan::Copy
@@ -2286,12 +2325,15 @@ impl PipeStages {
 
     /// The stages that stand for `stages[from..]` of a pipe longer than
     /// [`MAX_KEPT_TAIL_STAGES`] once [`Self::chain_plan`] has split it (#5679):
-    /// the rest of the block `from` is in, and a link to the pipe over the
-    /// blocks after it.
+    /// the rest of the block `from` is in, then, for the blocks after it, a link
+    /// to each run of blocks that hold no evaluation state and the stages of each
+    /// block that holds some, cloned (#5722).
     ///
-    /// The link is a kept [`SharedArg::run`], so cloning it is a reference-count
+    /// A link is a kept [`SharedArg::run`], so cloning it is a reference-count
     /// bump and what a pipe remembers about its stages is read off its own
-    /// stages, not walked again for each call.
+    /// stages, not walked again for each call. A pipe with no stateful stage hands
+    /// on the rest of its block and one link, however long it is; each stateful
+    /// block adds its stages and one more link to that.
     #[inline(never)]
     fn chained_tail(&self, from: usize) -> Vec<Expr> {
         let len = self.stages.len();
@@ -2300,41 +2342,51 @@ impl PipeStages {
             .table
             .get()
             .expect("a chained tail follows the plan that built its table");
-        let chain = table.chain.get_or_init(|| self.build_chain());
-        // The plan only chains a tail that starts before the last block, so there is a link to
-        // the blocks after this one.
+        let chain = table
+            .chain
+            .get_or_init(|| self.build_chain(&table.block_stateful));
+        // The plan only chains a tail that starts before the last block, so there is a block
+        // after this one.
         let block = chain_block_of(from, len);
         debug_assert!(block + 1 < chain_blocks(len));
-        let mut tail = self.stages[from..(block + 1) * CHAIN_BLOCK_STAGES].to_vec();
-        tail.push(Expr::Shared(Rc::clone(&chain[block])));
+        let mut tail = self.stages[from..chain_block_range(block, len).end].to_vec();
+        let mut next = block + 1;
+        while next < chain.len() {
+            match &chain[next] {
+                Some(link) => {
+                    tail.push(Expr::Shared(Rc::clone(link)));
+                    // The link runs up to the next block that holds state.
+                    next = table.run_ends[next] as usize;
+                }
+                None => {
+                    tail.extend_from_slice(&self.stages[chain_block_range(next, len)]);
+                    next += 1;
+                }
+            }
+        }
         tail
     }
 
-    /// The links of this pipe's chain: link `i` is the pipe over the stages of
-    /// block `i + 1`, ending in a link to the one after it.
+    /// The links of this pipe's chain: link `i` is the pipe over block `i` and
+    /// the blocks after it up to the next block that holds evaluation state
+    /// (`None` for such a block, and for block 0, which no tail starts after).
     #[inline(never)]
-    fn build_chain(&self) -> Box<[Rc<SharedArg>]> {
+    fn build_chain(&self, block_stateful: &[bool]) -> Box<[Option<Rc<SharedArg>>]> {
         let len = self.stages.len();
         let blocks = chain_blocks(len);
-        let mut links = Vec::with_capacity(blocks - 1);
-        let mut next: Option<Rc<SharedArg>> = None;
+        let mut links: Vec<Option<Rc<SharedArg>>> = vec![None; blocks];
         for block in (1..blocks).rev() {
-            let end = if block + 1 == blocks {
-                len
-            } else {
-                (block + 1) * CHAIN_BLOCK_STAGES
-            };
-            let mut stages = self.stages[block * CHAIN_BLOCK_STAGES..end].to_vec();
-            if let Some(link) = next.take() {
-                stages.push(Expr::Shared(link));
+            if block_stateful[block] {
+                continue;
+            }
+            let mut stages = self.stages[chain_block_range(block, len)].to_vec();
+            if let Some(link) = links.get(block + 1).and_then(Option::as_ref) {
+                stages.push(Expr::Shared(Rc::clone(link)));
             }
             let mut arg = SharedArg::new(Expr::Pipe(stages.into()));
             arg.run = true;
-            let link = Rc::new(arg);
-            links.push(Rc::clone(&link));
-            next = Some(link);
+            links[block] = Some(Rc::new(arg));
         }
-        links.reverse();
         links.into()
     }
 
@@ -2437,7 +2489,8 @@ impl PipeStages {
             shares: shares.into(),
             runs,
             chain: core::cell::OnceCell::new(),
-            chainable: false,
+            block_stateful: Box::default(),
+            run_ends: Box::default(),
         })
     }
 
@@ -4925,6 +4978,71 @@ mod tests {
         flat
     }
 
+    /// #5722: a long pipe with a stage holding evaluation state links the runs of blocks around it
+    /// and clones only the block that holds it, so a tail is the stateful blocks' stages plus a link
+    /// per run, not the whole rest; a pipe whose every block holds one is copied whole.
+    #[test]
+    fn test_a_long_pipe_links_around_a_stateful_block_5722() {
+        let total = 1000;
+        let stateful_at = [5 * CHAIN_BLOCK_STAGES + 3, 20 * CHAIN_BLOCK_STAGES];
+        let stages = PipeStages::from(
+            (0..total)
+                .map(|i| Expr::Field(format!("s{i}")))
+                .collect::<Vec<_>>(),
+        );
+        let class = |stage: &Expr| match stage {
+            Expr::Field(name) if stateful_at.iter().any(|at| *name == format!("s{at}")) => {
+                StageClass::Stateful
+            }
+            _ => StageClass::Run,
+        };
+        let plan = |from: usize| stages.tail_plan(from, class, true, |_| true);
+        for from in [1, 15, 16, 40, 79, 80, 95, 96, 200, 319, 320, 500] {
+            assert!(matches!(plan(from), TailPlan::Split), "from {from}");
+            let tail = stages.split_tail(from, |_| unreachable!("a chained tail keeps no run"));
+            assert_eq!(
+                flatten_chained_5679(&tail),
+                stages[from..].to_vec(),
+                "from {from}"
+            );
+            // The rest of the block, a cloned block per stateful block and a link per run.
+            assert!(
+                tail.len() <= 3 * CHAIN_BLOCK_STAGES + 3,
+                "from {from}: {} stages",
+                tail.len()
+            );
+        }
+        // The stateful stage itself is a stage of the tail, not inside a kept link.
+        let tail = stages.split_tail(1, |_| true);
+        assert!(tail
+            .iter()
+            .any(|stage| matches!(stage, Expr::Field(name) if *name == "s83")));
+        for stage in &tail {
+            if let Expr::Shared(link) = stage {
+                for inner in flatten_chained_5679(link.run_stages().unwrap()) {
+                    assert!(
+                        !matches!(&inner, Expr::Field(name) if *name == "s83" || *name == "s320"),
+                        "a kept link holds a stateful stage"
+                    );
+                }
+            }
+        }
+        // Links past the last stateful block are shared between tails.
+        let (one, two) = (
+            stages.split_tail(500, |_| true),
+            stages.split_tail(501, |_| true),
+        );
+        assert!(matches!((one.last(), two.last()),
+            (Some(Expr::Shared(left)), Some(Expr::Shared(right))) if Rc::ptr_eq(left, right)));
+        // Every block stateful: nothing to share, so the tail is copied whole.
+        let all = |_: &Expr| StageClass::Stateful;
+        let fresh = PipeStages::from(stages.to_vec());
+        assert!(matches!(
+            fresh.tail_plan(1, all, true, |_| true),
+            TailPlan::Copy
+        ));
+    }
+
     /// #5679: a pipe longer than [`MAX_KEPT_TAIL_STAGES`] hands on, for the tail of any stage, at
     /// most two blocks and a link to the rest, however long it is. Copied whole the tails were
     /// `n - 1`, `n - 2`, ... stages for the `n` calls nested at the deepest.
@@ -4998,8 +5116,9 @@ mod tests {
         }
     }
 
-    /// #5679: a stage that holds evaluation state is never kept in the chain, which is shared by
-    /// every call, so a pipe with one copies its tails as before.
+    /// #5679, #5722: a stage that holds evaluation state is never kept in the chain, which is
+    /// shared by every call: its block is cloned for each call, and the blocks without one are
+    /// linked. A pipe whose every block holds one copies its tails whole.
     #[test]
     fn test_a_long_pipe_with_a_stateful_stage_is_not_chained_5679() {
         let mut pipe = vec![Expr::Field("a".into()); 400];
@@ -5007,6 +5126,17 @@ mod tests {
         let pipe = PipeStages::from(pipe);
         assert!(matches!(
             pipe.tail_plan(1, class_5421, true, |_| true),
+            TailPlan::Split
+        ));
+        let tail = pipe.split_tail(1, |_| true);
+        assert!(!tail.iter().any(|stage| matches!(stage, Expr::Shared(link)
+            if flatten_chained_5679(link.run_stages().unwrap()).contains(&Expr::Identity))));
+        let mut every = vec![Expr::Field("a".into()); 400];
+        for block in 0..chain_blocks(400) {
+            every[block * CHAIN_BLOCK_STAGES] = Expr::Identity;
+        }
+        assert!(matches!(
+            PipeStages::from(every).tail_plan(1, class_5421, true, |_| true),
             TailPlan::Copy
         ));
     }
