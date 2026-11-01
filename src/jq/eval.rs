@@ -12477,18 +12477,40 @@ pub(crate) fn try_eval_owned_step<S: EvalSemantics>(expr: &Expr, state: OwnedVal
 /// holds no marker and no effect, and every path it can name is one the evaluator's own
 /// resolution finds in the same tree. jq mode only, and not while the
 /// #2889 embed table is live, whose bindings a bridge result would have been detached from.
+///
+/// A `delpaths` of a literal list of paths (#5670, [`owned_delpaths_shape`]) takes the same route,
+/// through the builtin's own batch ([`delpaths_jq_owned`]).
+///
 /// A decline hands the state back untouched; an error is the one `del` raises, with its text,
 /// since the state it consumed cannot be handed back.
 pub(crate) fn owned_del_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
     match owned_del_target::<S>(expr) {
-        Some(path) => OwnedStep::Handled(owned_del_run::<S>(path, state)),
+        Some(target) => OwnedStep::Handled(owned_del_run::<S>(target, state)),
         None => OwnedStep::Declined(state),
     }
 }
 
-/// The delete [`owned_del_step`] makes, for a `path` [`owned_del_target`] has already accepted:
-/// a caller that asked for the target first (to copy a borrowed state only when it will be
-/// used) runs it here and does not ask again.
+/// [`eval_owned_input`]'s `del`/`delpaths` answer (#5549, #5670): the delete of `input` copied
+/// into a state of its own, or `None` for an `expr` [`owned_del_target`] does not take. Out of
+/// line on purpose: [`eval_owned_input`] recurses, and the target (it can hold the list of a
+/// `delpaths`) is a local that must not widen its frame (#1021, #3457 stack-depth guards).
+#[inline(never)]
+fn owned_del_answer<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> Option<QueryResult<'a, W>> {
+    let target = owned_del_target::<S>(expr)?;
+    Some(match owned_del_run::<S>(target, input.clone()) {
+        Ok(value) => QueryResult::Owned(value),
+        Err(_) if optional => QueryResult::None,
+        Err(error) => QueryResult::Error(error),
+    })
+}
+
+/// The delete [`owned_del_step`] makes, for a `target` [`owned_del_target`] has already accepted
+/// (a `del` path, or the list of paths of a `delpaths`): a caller that asked for the target first
+/// (to copy a borrowed state only when it will be used) runs it here and does not ask again.
 ///
 /// A comma of distinct plain field names (#5670) deletes independent keys, so deleting them one
 /// after another is the delete of all of them at once, and each is the single-path delete rather
@@ -12496,9 +12518,13 @@ pub(crate) fn owned_del_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -
 /// resolution raises, and an object raises none. Any other path takes the builtin's own merged
 /// delete.
 fn owned_del_run<S: EvalSemantics>(
-    path: &Expr,
+    target: OwnedDelTarget<'_>,
     state: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
+    let path = match target {
+        OwnedDelTarget::Del(path) => path,
+        OwnedDelTarget::DelPaths(paths) => return delpaths_jq_owned(state, paths),
+    };
     if let Some(fields) = distinct_field_branches(path) {
         let mut state = state;
         for field in fields {
@@ -12520,18 +12546,98 @@ fn del_once<S: EvalSemantics>(path: &Expr, state: OwnedValue) -> Result<OwnedVal
     }
 }
 
-/// The path of the `del(f)` [`owned_del_step`] may answer, and nothing evaluated: `expr` is a
-/// `del` in jq mode, `f` is static, and the #2889 embed table is off. Cheap enough for a caller
-/// holding a borrowed state to ask before it copies one.
-pub(crate) fn owned_del_target<S: EvalSemantics>(expr: &Expr) -> Option<&Expr> {
+/// What [`owned_del_target`] found to delete.
+pub(crate) enum OwnedDelTarget<'e> {
+    /// `del(f)` for the static path set `f`.
+    Del(&'e Expr),
+    /// `delpaths(P)` for a literal list of paths (#5670), already built: the value
+    /// [`delpaths_jq_owned`] takes.
+    DelPaths(OwnedValue),
+}
+
+/// The delete [`owned_del_step`] may answer, and nothing evaluated: `expr` is a `del` of a
+/// static `f`, or a `delpaths` of a literal list of paths, in jq mode, and the #2889 embed
+/// table is off. A caller holding a borrowed state asks before it copies one; the `delpaths`
+/// list is built here, so an expression that does not qualify is refused before anything is
+/// allocated.
+pub(crate) fn owned_del_target<S: EvalSemantics>(expr: &Expr) -> Option<OwnedDelTarget<'_>> {
     if S::TAG != EvalTag::Jq {
         return None;
     }
-    let Expr::Builtin(Builtin::Del(path)) = unwrap_paren(expr) else {
+    let target = match unwrap_paren(expr) {
+        Expr::Builtin(Builtin::Del(path)) if owned_del_path_shape(path) => {
+            OwnedDelTarget::Del(path.as_ref())
+        }
+        Expr::Builtin(Builtin::DelPaths(paths))
+            if owned_delpaths_shape(paths) && !super::eval_generic::embed_table_active() =>
+        {
+            OwnedDelTarget::DelPaths(literal_paths_to_owned(paths)?)
+        }
+        _ => return None,
+    };
+    (!super::eval_generic::embed_table_active()).then_some(target)
+}
+
+/// The elements of an array literal (`[a, b]`, `[a]`; `[]` has none), through parentheses.
+fn array_literal_elements(array: &Expr) -> Option<&[Expr]> {
+    let Expr::Array(inner) = unwrap_paren(array) else {
         return None;
     };
-    (owned_del_path_shape(path) && !super::eval_generic::embed_table_active())
-        .then_some(path.as_ref())
+    Some(match inner.as_ref() {
+        Expr::Comma(items) => items.as_slice(),
+        single => core::slice::from_ref(single),
+    })
+}
+
+/// The literal a `delpaths` path component may be on this route: a string or an integer.
+fn owned_delpaths_component(component: &Expr) -> Option<&Literal> {
+    match component {
+        Expr::Literal(
+            lit @ (Literal::String(_)
+            | Literal::Int(_)
+            | Literal::NumberLiteral(NumberRepr::Int(_), _)),
+        ) => Some(lit),
+        _ => None,
+    }
+}
+
+/// Whether `paths` is an array literal of one or more array literals whose elements are string
+/// or integer literals (`[["a"],["b",0]]`), the `delpaths` argument [`literal_paths_to_owned`]
+/// builds (#5670). Anything else is refused: a computed path, a slice, a number that is not an
+/// integer. A negative index is a literal, so it is taken.
+///
+/// The shape keeps [`delpaths_jq_prepare`] from raising: every entry is an array and no
+/// component can be a NaN, so the one error left is the delete's own, which
+/// [`delpaths_jq_apply`] reports whatever the call's `?` says. `delpaths([])` is not taken: it
+/// has no deletion to make, and [`fixed_path_del`] already answers it. The component set is the
+/// one place that guarantee lives, so a widening of [`owned_delpaths_component`] to a float has
+/// to answer for a NaN first.
+fn owned_delpaths_shape(paths: &Expr) -> bool {
+    array_literal_elements(paths).is_some_and(|entries| {
+        !entries.is_empty()
+            && entries.iter().all(|entry| {
+                array_literal_elements(entry).is_some_and(|components| {
+                    components
+                        .iter()
+                        .all(|component| owned_delpaths_component(component).is_some())
+                })
+            })
+    })
+}
+
+/// The list of paths of an [`owned_delpaths_shape`] argument, as the value `delpaths` takes;
+/// `None` for anything outside the shape, so a component is never dropped from a path.
+fn literal_paths_to_owned(paths: &Expr) -> Option<OwnedValue> {
+    let mut list = vec_with_capacity(array_literal_elements(paths)?.len());
+    for entry in array_literal_elements(paths)? {
+        let components = array_literal_elements(entry)?;
+        let mut path = vec_with_capacity(components.len());
+        for component in components {
+            path.push(literal_to_owned(owned_delpaths_component(component)?));
+        }
+        list.push(OwnedValue::array_from(path));
+    }
+    Some(OwnedValue::array_from(list))
 }
 
 /// The most names [`distinct_field_branches`] takes: each is a pass of its own, so a long list
@@ -79945,14 +80051,10 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             FixedPathDel::Input => input.clone(),
         });
     }
-    // #5549: see `eval_generic::eval_on_owned_over`. The state is copied only for a `del` the
-    // step can answer, and the copy shares `input`'s storage until the delete writes.
-    if let Some(path) = owned_del_target::<S>(expr) {
-        return match owned_del_run::<S>(path, input.clone()) {
-            Ok(value) => QueryResult::Owned(value),
-            Err(_) if optional => QueryResult::None,
-            Err(error) => QueryResult::Error(error),
-        };
+    // #5549: see `eval_generic::eval_on_owned_over`. The state is copied only for a `del` or
+    // `delpaths` the step can answer, and the copy shares `input`'s storage until the delete writes.
+    if let Some(answer) = owned_del_answer::<W, S>(expr, input, optional) {
+        return answer;
     }
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
@@ -114386,6 +114488,30 @@ mod tests {
             "del(.id, .name, .score)",
             "del(.a, .users[0].id)",
             "del(.[2][0], .[2][1])",
+            // #5670: a literal list of paths is the builtin's own delete, order written or not.
+            "delpaths([[\"a\"]])",
+            "(delpaths([[\"a\"], [\"b\"]]))",
+            "delpaths([[\"a\"], [\"a\"]])",
+            "delpaths([[\"a\", \"b\"], [\"a\"]])",
+            "delpaths([[\"a\"], [\"a\", \"b\"]])",
+            "delpaths([[0], [1]])",
+            "delpaths([[1], [0]])",
+            "delpaths([[0], [0]])",
+            "delpaths([[0], [7]])",
+            "delpaths([[\"id\"], [\"name\"], [\"score\"]])",
+            "delpaths([[\"users\", 0], [\"users\", 2]])",
+            "delpaths([[\"users\", 0, \"id\"], [\"users\", 0, \"name\"]])",
+            "delpaths([[0, \"ratio\"], [2, 0]])",
+            "delpaths([[2, 0], [2, 1]])",
+            "delpaths([[\"a\", 1]])",
+            "delpaths([[\"x\", \"y\"]])",
+            "delpaths([[]])",
+            "delpaths([[\"a\"], []])",
+            "delpaths([[-1]])",
+            "delpaths([[0], [-1]])",
+            "delpaths([[2, -1]])",
+            "delpaths([[9007199254740993]])",
+            "delpaths([[0], [9007199254740993]])",
         ];
         let declined = [
             "del(.a, .b?)",
@@ -114400,7 +114526,18 @@ mod tests {
             "del(.a[.b])",
             "del(..)",
             ". as $x | del($x)",
-            "delpaths([[\"a\"]])",
+            "delpaths([])",
+            "delpaths([[\"a\", .b]])",
+            "delpaths([.])",
+            "delpaths([[\"a\"]] + [[\"b\"]])",
+            "delpaths([1])",
+            "delpaths([[1.5]])",
+            "delpaths([[1e1000]])",
+            "delpaths([[null]])",
+            "delpaths([[nan]])",
+            "delpaths(paths)",
+            "delpaths([[\"a\"]])?",
+            "[delpaths([[\"a\"]])]",
             "del(.a) | .b",
             "map(del(.a))",
             ".a = 1",
