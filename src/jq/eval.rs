@@ -12445,6 +12445,24 @@ pub(crate) fn owned_del_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -
     }
 }
 
+/// [`eval_owned_input`]'s `del`/`delpaths` answer (#5549, #5670): the delete of `input` copied
+/// into a state of its own, or `None` for an `expr` [`owned_del_target`] does not take. Out of
+/// line on purpose: [`eval_owned_input`] recurses, and the target (it can hold the list of a
+/// `delpaths`) is a local that must not widen its frame (#1021, #3457 stack-depth guards).
+#[inline(never)]
+fn owned_del_answer<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> Option<QueryResult<'a, W>> {
+    let target = owned_del_target::<S>(expr)?;
+    Some(match owned_del_run::<S>(target, input.clone()) {
+        Ok(value) => QueryResult::Owned(value),
+        Err(_) if optional => QueryResult::None,
+        Err(error) => QueryResult::Error(error),
+    })
+}
+
 /// The delete [`owned_del_step`] makes, for a `target` [`owned_del_target`] has already accepted
 /// (a `del` path, or the list of paths of a `delpaths`): a caller that asked for the target first
 /// (to copy a borrowed state only when it will be used) runs it here and does not ask again.
@@ -79971,12 +79989,8 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
     // #5549: see `eval_generic::eval_on_owned_over`. The state is copied only for a `del` or
     // `delpaths` the step can answer, and the copy shares `input`'s storage until the delete writes.
-    if let Some(target) = owned_del_target::<S>(expr) {
-        return match owned_del_run::<S>(target, input.clone()) {
-            Ok(value) => QueryResult::Owned(value),
-            Err(_) if optional => QueryResult::None,
-            Err(error) => QueryResult::Error(error),
-        };
+    if let Some(answer) = owned_del_answer::<W, S>(expr, input, optional) {
+        return answer;
     }
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
