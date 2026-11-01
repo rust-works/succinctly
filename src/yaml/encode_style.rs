@@ -393,6 +393,19 @@ pub(crate) fn go_yaml_string_scalar(s: &str, flow: bool) -> Option<String> {
     Some(out)
 }
 
+/// `s` single-quoted, when it sits in flow context and holds a flow indicator that go-yaml's
+/// emitter quotes a plain scalar for whatever type it resolves to (#5469, #5467), as a key or as a
+/// value: `Some("'12:30:45'")`. `None` otherwise, for the caller to write as it was.
+fn flow_single_quoted(s: &str, flow: bool) -> Option<String> {
+    if !flow || s.is_empty() || !flow_plain_needs_single_quotes(s) {
+        return None;
+    }
+    let mut out = String::new();
+    // Writing into a `String` cannot fail.
+    write_go_yaml_single_quoted(&mut out, s).ok()?;
+    Some(out)
+}
+
 /// The scalar the yq command line's DOM writer should print for a string that has no
 /// style of its own to preserve, or `None` to leave it to that writer's older rule.
 ///
@@ -405,7 +418,9 @@ pub(crate) fn go_yaml_string_scalar(s: &str, flow: bool) -> Option<String> {
 /// - **A YAML document**: a spelling yq reads as another type is most likely a plain
 ///   scalar of that type, which must be echoed or its type would change on any write.
 ///   A *key* (`200: ok`, `~: v`, `2001-12-14T01:02:03Z: a`) is echoed as it is, except
-///   the empty one, which is left to the caller. A *value* is left to the caller when
+///   the empty one, which is left to the caller, and, inside `[...]` or `{...}`, one with a
+///   flow indicator (`12:30:45`, `2001-12-14T01:02:03Z`), which is single-quoted as a value is
+///   (#5469). A *value* is left to the caller when
 ///   the YAML 1.2 core schema calls it a string and yq does not (a timestamp, `1_000`,
 ///   `0b11`, `<<`); one the core schema also types (`true`, `1`, `null`) can only be a
 ///   string that was quoted or computed, and is quoted.
@@ -419,27 +434,13 @@ pub fn go_yaml_dom_scalar(s: &str, flow: bool, json_sourced: bool, is_key: bool)
             if s.is_empty() {
                 return None;
             }
-            // A key is quoted in flow context by its characters as a value is (#5469): a plain
-            // `2001-12-14T21:59:43Z` or `12:30:45` holds a `:`, so `{'12:30:45': 1}`.
-            if flow && flow_plain_needs_single_quotes(s) {
-                let mut out = String::new();
-                if write_go_yaml_single_quoted(&mut out, s).is_ok() {
-                    return Some(out);
-                }
-            }
-            return Some(String::from(s));
+            return Some(flow_single_quoted(s, flow).unwrap_or_else(|| String::from(s)));
         }
         if matches!(resolve_plain(s), ResolvedScalar::Str) {
             // Inside `[...]` or `{...}` yq quotes by characters alone, so a plain timestamp or
             // `12:30:45` is single-quoted there even though it is left bare in block context
             // (#5469).
-            if flow && !s.is_empty() && flow_plain_needs_single_quotes(s) {
-                let mut out = String::new();
-                if write_go_yaml_single_quoted(&mut out, s).is_ok() {
-                    return Some(out);
-                }
-            }
-            return None;
+            return flow_single_quoted(s, flow);
         }
     }
     go_yaml_string_scalar(s, flow)
