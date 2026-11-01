@@ -13170,6 +13170,11 @@ fn closed_expr_shape(expr: &Expr) -> bool {
                 }
         }),
         Expr::Pipe(stages) => stages.first().is_some_and(closed_expr_shape),
+        // #5733: `"k\($i)"`, every slot closed.
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => closed_expr_shape(inner),
+        }),
         // #3944: the operators [`closed_expr_to_owned_at_depth`] answers for jq.
         Expr::Compare { left, right, .. }
         | Expr::Arithmetic { left, right, .. }
@@ -13270,6 +13275,24 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
                 };
             }
             Some(value)
+        }
+        // #5733: `"k\($i)"` with every slot closed, so one value per slot and one string.
+        // Without this arm an interpolated key sent a fold step through the re-index bridge,
+        // which serialises the whole accumulator to evaluate a key that never reads it. Each slot
+        // is rendered by [`owned_to_string`], as the evaluator's own interpolation does. jq mode
+        // only, like the operators below.
+        Expr::StringInterpolation(parts) if S::TAG == EvalTag::Jq => {
+            let mut text = String::new();
+            for part in parts {
+                match part {
+                    StringPart::Literal(literal) => text.push_str(literal),
+                    StringPart::Expr(inner) => {
+                        let slot = closed_expr_to_owned_at_depth::<S>(inner, depth + 1, escaped)?;
+                        text.push_str(&owned_to_string::<S>(&slot));
+                    }
+                }
+            }
+            Some(OwnedValue::String(text.into()))
         }
         // #3944: the operators of a right side that reads only the loop
         // variable -- `$r == $r`, `$r.a + $r.b`, `$r.n // 0`, `$r.a and $r.b`.
