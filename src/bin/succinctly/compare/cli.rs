@@ -2,7 +2,8 @@
 //!
 //! A probe file is `id<TAB>area<TAB>args-as-JSON-array<TAB>stdin-as-JSON-string`
 //! (`-` for no stdin) and an optional fifth column, a JSON object of environment variables
-//! to set for both tools (`{"JQ_COLORS":"1;31"}`; `-` or absent for none), run in `comparison/jq/fixtures/` so `-f`, `--slurpfile`
+//! to set for both tools (`{"JQ_COLORS":"1;31"}`; `-` or absent for none), run in
+//! `comparison/jq/fixtures/` so `-f`, `--slurpfile`
 //! and `-L` have files to read. Stdout and exit status must be identical;
 //! stderr wording is the error-probe suite's job and is not compared.
 
@@ -278,6 +279,12 @@ mod tests {
             .iter()
             .filter(|p| p.id.starts_with("nocolor-"))
             .all(|p| has(p, "NO_COLOR")));
+        // `LC_ALL` set to the empty string is what hands the choice to the other variables: a
+        // `locale-var-*` row that lost it would run under the base `LC_ALL=C` and match vacuously.
+        assert!(probes
+            .iter()
+            .filter(|p| p.id.starts_with("locale-var-"))
+            .all(|p| has(p, "LC_ALL")));
         let locale: Vec<_> = probes.iter().filter(|p| p.area == "locale").collect();
         assert!(locale.len() >= 100, "{}", locale.len());
         assert!(
