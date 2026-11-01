@@ -3,14 +3,14 @@
 //! Only what can be measured or read from a checked-in source is reported:
 //! binary sizes, dynamic libraries, the Rust dependency count, whether either
 //! tool uses more than one core, and a few facts taken from `Cargo.toml`,
-//! `src/lib.rs`, `ci.yml` and jq's vendored licence. Build time is not measured
-//! (a cold fat-LTO build is minutes and would dominate a `--quick` run).
+//! `src/lib.rs`, `ci.yml` and jq's vendored licence. Build time is measured only with
+//! `--build-time` (a cold fat-LTO build is minutes and would dominate a `--quick` run, #5552).
 
 use super::harness::Tool;
 use super::perf::{ensure_input, InputSpec};
 use anyhow::Result;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Serialize)]
@@ -35,6 +35,19 @@ pub struct Fact {
     pub source: String,
 }
 
+/// One from-source build, timed with a monotonic clock (`--build-time`, #5552).
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildTime {
+    pub what: String,
+    /// What was run, for the report.
+    pub command: String,
+    /// `None` when the build failed or could not be timed.
+    pub seconds: Option<f64>,
+    /// Why it failed (the last lines of its stderr), or a caveat about the figure.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Operational {
     pub binaries: Vec<BinaryInfo>,
@@ -42,6 +55,159 @@ pub struct Operational {
     pub rust_dependencies: Option<usize>,
     pub parallelism: Vec<Parallelism>,
     pub facts: Vec<Fact>,
+    /// Empty unless the run asked for `--build-time`.
+    #[serde(default)]
+    pub build_times: Vec<BuildTime>,
+}
+
+/// Seconds from the file `scripts/compare-jq-build.sh` writes (milliseconds, one integer).
+pub fn parse_timing_ms(text: &str) -> Option<f64> {
+    text.trim().parse::<u64>().ok().map(|ms| ms as f64 / 1000.0)
+}
+
+/// The last few lines of a failed build's stderr, for the report.
+fn stderr_tail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = lines[lines.len().saturating_sub(4)..].join(" / ");
+    if tail.is_empty() {
+        "no output on stderr".into()
+    } else {
+        tail
+    }
+}
+
+/// Run `cmd` with its stdout discarded and return how long it took, or why it failed.
+fn time_command(cmd: &mut Command) -> Result<f64, String> {
+    let start = std::time::Instant::now();
+    let out = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("could not start: {e}"))?;
+    if out.status.success() {
+        Ok(start.elapsed().as_secs_f64())
+    } else {
+        Err(format!("{}: {}", out.status, stderr_tail(&out.stderr)))
+    }
+}
+
+/// Removes the scratch directory when dropped, so an early return or a panic does not leave a
+/// target directory of several GB behind (a Ctrl-C still does; the next run clears it first).
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Time a cold build of each pinned jq (`versions`) and of succinctly, and the rebuild of
+/// succinctly after a source file is touched, one run each in a scratch directory under
+/// `target/compare/build-time/` that is removed afterwards. The jq tarball download and the
+/// crates' download (`cargo fetch`) are outside the clock. The `touch` is undone: the file's
+/// modification time is put back, so the checkout's own `target/` does not see a change.
+pub fn measure_build_times(root: &Path, versions: &[String], features: &str) -> Vec<BuildTime> {
+    let scratch = Scratch(root.join("target/compare/build-time"));
+    let _ = std::fs::remove_dir_all(&scratch.0);
+    let _ = std::fs::create_dir_all(&scratch.0);
+    let mut out = vec![];
+    for v in versions {
+        let timing = scratch.0.join(format!("jq-{v}.ms"));
+        let run = time_command(
+            Command::new(root.join("scripts/compare-jq-build.sh"))
+                .arg(v)
+                .env("COMPARE_JQ_DEST", scratch.0.join(format!("jq-{v}")))
+                .env("COMPARE_JQ_TIMING_FILE", &timing),
+        );
+        let (seconds, note) = match run {
+            Ok(_) => match std::fs::read_to_string(&timing)
+                .ok()
+                .and_then(|t| parse_timing_ms(&t))
+            {
+                Some(s) => (Some(s), None),
+                None => (None, Some("the build script wrote no timing".to_string())),
+            },
+            Err(why) => (None, Some(why)),
+        };
+        out.push(BuildTime {
+            what: format!("jq {v}, cold"),
+            command:
+                "./configure --with-oniguruma=builtin --disable-shared && make -j && make install"
+                    .into(),
+            seconds,
+            note,
+        });
+    }
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let target = scratch.0.join("succinctly-target");
+    // Untimed: the crates must be on disk before the clock starts. If this fails, the download
+    // lands inside the cold build, and the row says so.
+    let fetched = Command::new(&cargo)
+        .args(["fetch", "--locked"])
+        .current_dir(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    let build_args = ["build", "--release", "--locked", "--features", features];
+    let command = format!("cargo build --release --locked --features {features}");
+    let build = || {
+        time_command(
+            Command::new(&cargo)
+                .args(build_args)
+                .arg("--target-dir")
+                .arg(&target)
+                .current_dir(root),
+        )
+    };
+    let cold = build();
+    out.push(BuildTime {
+        what: "succinctly, cold".into(),
+        command: command.clone(),
+        seconds: cold.as_ref().ok().copied(),
+        note: match &cold {
+            Err(why) => Some(why.clone()),
+            Ok(_) if !fetched => Some(
+                "`cargo fetch` failed, so crate downloads may be inside this figure".to_string(),
+            ),
+            Ok(_) => None,
+        },
+    });
+    // The rebuild needs a changed mtime on a tracked file; the original is put back afterwards.
+    let lib = root.join("src/lib.rs");
+    let reference = scratch.0.join("lib.rs.mtime");
+    let kept = Command::new("cp")
+        .arg("-p")
+        .arg(&lib)
+        .arg(&reference)
+        .status()
+        .is_ok_and(|s| s.success());
+    let touched = kept
+        && Command::new("touch")
+            .arg(&lib)
+            .status()
+            .is_ok_and(|s| s.success());
+    let rebuild = if touched {
+        build()
+    } else {
+        Err("could not touch src/lib.rs (read-only checkout?)".to_string())
+    };
+    if touched {
+        let _ = Command::new("touch")
+            .arg("-r")
+            .arg(&reference)
+            .arg(&lib)
+            .status();
+    }
+    out.push(BuildTime {
+        what: "succinctly, rebuild after touching src/lib.rs".into(),
+        command,
+        seconds: rebuild.as_ref().ok().copied(),
+        note: rebuild.err(),
+    });
+    out
 }
 
 /// Library paths from `otool -L` (skipping the binary's own line).
@@ -208,6 +374,7 @@ pub fn collect(
     generator: &Path,
     inputs: &[InputSpec],
     inputs_dir: &Path,
+    build_times: Vec<BuildTime>,
 ) -> Result<Operational> {
     let binaries = tools
         .iter()
@@ -236,6 +403,7 @@ pub fn collect(
         rust_dependencies: rust_dependencies(root, features),
         parallelism,
         facts: facts(root),
+        build_times,
     })
 }
 
@@ -269,6 +437,33 @@ mod tests {
         assert_eq!(parse_time_p("real 1.00\nuser 3.00\nsys 0.00\n"), Some(3.0));
         assert_eq!(parse_time_p("nothing"), None);
         assert_eq!(parse_time_p("real 0.00\nuser 0\nsys 0\n"), None);
+    }
+
+    #[test]
+    fn a_jq_build_timing_file_is_milliseconds() {
+        assert_eq!(parse_timing_ms("61234\n"), Some(61.234));
+        assert_eq!(parse_timing_ms(""), None);
+        assert_eq!(parse_timing_ms("12.5s"), None);
+    }
+
+    /// A build that fails has no time, not the time it took to fail.
+    #[test]
+    fn a_command_is_timed_only_when_it_succeeds() {
+        let took = time_command(Command::new("sh").args(["-c", "sleep 0.05"])).unwrap();
+        assert!((0.05..5.0).contains(&took), "{took}");
+        let why =
+            time_command(Command::new("sh").args(["-c", "echo one >&2; echo two >&2; exit 3"]))
+                .unwrap_err();
+        assert!(why.contains("one / two"), "the stderr tail says why: {why}");
+        assert!(time_command(&mut Command::new("/nonexistent/build"))
+            .unwrap_err()
+            .starts_with("could not start"));
+    }
+
+    #[test]
+    fn a_stderr_tail_is_the_last_four_lines_and_never_empty() {
+        assert_eq!(stderr_tail(b"a\nb\nc\nd\ne\n\n"), "b / c / d / e");
+        assert_eq!(stderr_tail(b""), "no output on stderr");
     }
 
     #[test]

@@ -4,6 +4,7 @@ use super::cli;
 use super::features::{FeatureSummary, Status};
 use super::harness::{Row, Verdict};
 use super::ledger;
+use super::operational;
 use super::perf::{self, Gate, PerfRow, ToolResult};
 use super::robust;
 use super::Results;
@@ -858,8 +859,37 @@ fn robust_section(s: &mut String, r: &Results) {
     }
 }
 
+/// `--build-time`: the from-source builds, one run each, with what makes the figure what it is.
+fn build_time_table(s: &mut String, cores: u32, o: &operational::Operational) {
+    if o.build_times.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        s,
+        "**Build time from source** ({cores} cores; one run each, cold, not repeated: a figure that long \
+         moves with the disk cache and machine load, so it is a magnitude and not a ratio to quote). \
+         The jq tarball and the crates are downloaded before the clock starts; succinctly's \
+         rebuild is what one edit costs under the pinned fat-LTO profile. jq's `make -j` and \
+         cargo both use every core, but the single-codegen-unit fat-LTO link is mostly serial, so \
+         the cores do not explain the gap between them.\n"
+    );
+    let _ = writeln!(s, "| Build | Seconds | Command |");
+    let _ = writeln!(s, "|-------|---------|---------|");
+    for b in &o.build_times {
+        let secs = b
+            .seconds
+            .map_or_else(|| "failed".into(), |v| format!("{v:.1}"));
+        let _ = writeln!(s, "| {} | {secs} | `{}` |", b.what, b.command);
+    }
+    s.push('\n');
+    for b in o.build_times.iter().filter(|b| b.note.is_some()) {
+        let _ = writeln!(s, "- {}: {}", b.what, b.note.as_deref().unwrap_or_default());
+    }
+}
+
 fn operational_section(s: &mut String, r: &Results) {
     let Some(o) = &r.operational else { return };
+    let e = &r.env;
     let _ = writeln!(s, "\n## H. Platform and operational properties\n");
     let _ = writeln!(
         s,
@@ -887,10 +917,16 @@ fn operational_section(s: &mut String, r: &Results) {
     let _ = writeln!(
         s,
         "\nA ratio near 1.00 means one thread. Rust dependencies of the shipped feature set \
-         (`cargo tree -e normal`): {}. Build time is not measured.\n",
+         (`cargo tree -e normal`): {}.{}\n",
         o.rust_dependencies
-            .map_or_else(|| "n/a".into(), |n| n.to_string())
+            .map_or_else(|| "n/a".into(), |n| n.to_string()),
+        if o.build_times.is_empty() {
+            " Build time is not measured (`--build-time` does)."
+        } else {
+            ""
+        }
     );
+    build_time_table(s, e.system.cpu_cores, o);
     let _ = writeln!(s, "| Property | Value | Source |");
     let _ = writeln!(s, "|----------|-------|--------|");
     for f in &o.facts {
@@ -931,6 +967,47 @@ mod tests {
             ir_ratio_primary: None,
             noisy: false,
         }
+    }
+
+    fn operational_with(build_times: Vec<operational::BuildTime>) -> operational::Operational {
+        operational::Operational {
+            binaries: vec![],
+            rust_dependencies: Some(7),
+            parallelism: vec![],
+            facts: vec![],
+            build_times,
+        }
+    }
+
+    #[test]
+    fn build_times_are_a_table_of_one_run_each_and_a_failure_is_not_a_time() {
+        let mut s = String::new();
+        build_time_table(&mut s, 18, &operational_with(vec![]));
+        assert!(s.is_empty(), "no table without --build-time: {s}");
+        let o = operational_with(vec![
+            operational::BuildTime {
+                what: "jq 1.7.1, cold".into(),
+                command: "make".into(),
+                seconds: Some(61.234),
+                note: None,
+            },
+            operational::BuildTime {
+                what: "succinctly, cold".into(),
+                command: "cargo build".into(),
+                seconds: None,
+                note: Some("exit status: 101: error: lock file needs to be updated".into()),
+            },
+        ]);
+        build_time_table(&mut s, 18, &o);
+        assert!(
+            s.contains("18 cores; one run each, cold, not repeated"),
+            "{s}"
+        );
+        assert!(s.contains("| jq 1.7.1, cold | 61.2 | `make` |"), "{s}");
+        assert!(
+            s.contains("| succinctly, cold | failed | `cargo build` |"),
+            "{s}"
+        );
     }
 
     #[test]

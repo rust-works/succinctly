@@ -5,12 +5,17 @@
 #
 # The tarball's sha256 comes from comparison/jq/manifest.toml and is verified
 # before anything is unpacked. Prints the installed binary's path on success.
+#
+# Two optional environment variables serve `dev compare jq --build-time` (#5552):
+#   COMPARE_JQ_DEST         install prefix instead of target/compare/jq-<ver>
+#   COMPARE_JQ_TIMING_FILE  file to write the milliseconds `configure` + `make` + `make install`
+#                           took (the download is not on the clock)
 set -euo pipefail
 
 ver="${1:?usage: $0 <version>}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 manifest="$root/comparison/jq/manifest.toml"
-dest="$root/target/compare/jq-$ver"
+dest="${COMPARE_JQ_DEST:-$root/target/compare/jq-$ver}"
 
 if [ -x "$dest/bin/jq" ] && [ "$("$dest/bin/jq" --version)" = "jq-$ver" ]; then
   echo "$dest/bin/jq"
@@ -38,9 +43,14 @@ got="$(sha256_of "$work/jq.tar.gz")"
 
 tar -xzf "$work/jq.tar.gz" -C "$work"
 cd "$work/jq-$ver"
+# Millisecond clock: python3 where there is one, whole seconds from date(1) otherwise.
+now_ms() { python3 -c 'import time; print(int(time.monotonic() * 1000))' 2>/dev/null || echo "$(( $(date +%s) * 1000 ))"; }
+start_ms=""
+[ -z "${COMPARE_JQ_TIMING_FILE:-}" ] || start_ms="$(now_ms)"
 # Bundled oniguruma, so the regex engine does not depend on the host's.
 ./configure --prefix="$dest" --with-oniguruma=builtin --disable-docs --disable-shared \
   --enable-static --disable-maintainer-mode >"$work/configure.log" 2>&1
 make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)" >"$work/make.log" 2>&1
 make install >>"$work/make.log" 2>&1
+[ -z "$start_ms" ] || echo "$(( $(now_ms) - start_ms ))" >"$COMPARE_JQ_TIMING_FILE"
 echo "$dest/bin/jq"
