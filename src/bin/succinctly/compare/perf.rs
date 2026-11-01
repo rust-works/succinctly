@@ -38,11 +38,19 @@ pub struct InputSpec {
     pub id: String,
     pub shape: String,
     pub tier: String,
-    /// `succinctly json generate -p`.
+    /// `succinctly json generate -p`. Unused by a corpus input.
+    #[serde(default)]
     pub pattern: String,
+    #[serde(default)]
     pub size: String,
+    #[serde(default)]
     pub seed: u64,
     pub sha256: String,
+    /// A real file from the benchmark corpus (`file` in `tests/data/bench-corpus/manifest.json`)
+    /// instead of a generated one (#5552). It is copied to the inputs directory, so a query
+    /// names it like any other input.
+    #[serde(default)]
+    pub corpus: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,12 +158,60 @@ pub fn plan<'a>(
     rows
 }
 
-/// Generate `spec` into `dir` if absent and verify its sha256, so a changed
-/// generator is a failure and not a silently different workload.
-pub fn ensure_input(generator: &Path, dir: &Path, spec: &InputSpec) -> Result<PathBuf> {
+/// Where a corpus file may be: the vendored seed first, then the copy
+/// `scripts/sync-bench-corpus.sh` fetches (a file too large to commit).
+fn corpus_candidates(root: &Path, file: &str) -> [PathBuf; 2] {
+    [
+        root.join("tests/data/bench-corpus/seed").join(file),
+        root.join("data/bench/corpus").join(file),
+    ]
+}
+
+/// The corpus file behind `spec`, or `None` when it is a generated input or the file is not
+/// on this machine (a fetched one before `scripts/sync-bench-corpus.sh` has run).
+pub fn corpus_source(root: &Path, spec: &InputSpec) -> Option<PathBuf> {
+    let file = spec.corpus.as_deref()?;
+    corpus_candidates(root, file)
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+/// Whether `spec` can be produced here: a generated input always can, a corpus input only
+/// when its file is present.
+pub fn available(root: &Path, spec: &InputSpec) -> bool {
+    spec.corpus.is_none() || corpus_source(root, spec).is_some()
+}
+
+/// Generate `spec` into `dir` if absent (or copy its corpus file there) and verify its
+/// sha256, so a changed generator or a changed corpus file is a failure and not a silently
+/// different workload.
+pub fn ensure_input(
+    root: &Path,
+    generator: &Path,
+    dir: &Path,
+    spec: &InputSpec,
+) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.json", spec.id));
-    if !path.exists() {
+    if let Some(file) = &spec.corpus {
+        // A copy left by an earlier run is refreshed when it no longer matches the pin
+        // (the corpus file was re-pinned), and only then judged against it below.
+        let cached_ok = std::fs::read(&path).is_ok_and(|b| sha256_hex(&b) == spec.sha256);
+        if !cached_ok {
+            let Some(from) = corpus_source(root, spec) else {
+                bail!(
+                    "{} names corpus file {file}, which is in neither {} (run \
+                     scripts/sync-bench-corpus.sh to fetch it)",
+                    spec.id,
+                    corpus_candidates(root, file)
+                        .map(|p| p.display().to_string())
+                        .join(" nor ")
+                );
+            };
+            std::fs::copy(&from, &path)
+                .with_context(|| format!("copying {} to {}", from.display(), path.display()))?;
+        }
+    } else if !path.exists() {
         let status = Command::new(generator)
             .args([
                 "json",
@@ -178,10 +234,15 @@ pub fn ensure_input(generator: &Path, dir: &Path, spec: &InputSpec) -> Result<Pa
     let got = sha256_hex(&std::fs::read(&path)?);
     if got != spec.sha256 {
         bail!(
-            "{} has sha256 {got}, the manifest pins {} (the generator or a stale file changed; \
+            "{} has sha256 {got}, the manifest pins {} ({}; \
              delete {} to regenerate, or re-pin on purpose)",
             spec.id,
             spec.sha256,
+            if spec.corpus.is_some() {
+                "the corpus file changed"
+            } else {
+                "the generator or a stale file changed"
+            },
             path.display()
         );
     }
@@ -567,6 +628,7 @@ mod tests {
             size: tier.into(),
             seed: 1,
             sha256: String::new(),
+            corpus: None,
         }
     }
 
@@ -633,21 +695,97 @@ mod tests {
         let text = include_str!("../../../../comparison/jq/queries/perf.tsv");
         let qs = parse_queries(text).unwrap();
         assert!(qs.len() >= 25);
-        let known = [
-            "users",
-            "numbers",
-            "strings",
-            "wide",
-            "nested",
-            "comprehensive",
-            "ndjson",
-            "jsonseq",
-            "none",
-        ];
-        assert!(qs
-            .iter()
-            .flat_map(|q| &q.shapes)
-            .all(|s| known.contains(&s.as_str())));
+        // A shape no input has would run no row and say nothing (#5552): the shapes are the
+        // manifest's own, so a corpus file added there is not also listed here.
+        let (m, _) = super::super::manifest::Manifest::parse(include_str!(
+            "../../../../comparison/jq/manifest.toml"
+        ))
+        .unwrap();
+        for s in qs.iter().flat_map(|q| &q.shapes) {
+            assert!(
+                s == "none" || m.inputs.iter().any(|i| &i.shape == s),
+                "no input has shape {s}"
+            );
+        }
+        // And the other way: an input no query uses is dead weight in the manifest.
+        for i in &m.inputs {
+            assert!(
+                qs.iter().any(|q| q.shapes.contains(&i.shape)),
+                "no query uses {}",
+                i.id
+            );
+        }
+    }
+
+    fn corpus_spec(file: &str, content: &[u8]) -> InputSpec {
+        InputSpec {
+            id: "c".into(),
+            shape: "corpus-c".into(),
+            tier: "1mb".into(),
+            pattern: String::new(),
+            size: String::new(),
+            seed: 0,
+            sha256: sha256_hex(content),
+            corpus: Some(file.into()),
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("compare-perf-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A corpus input is copied from the seed or the fetched tree (the seed first), checked
+    /// against its pin, and refused when the file changed or is missing.
+    #[test]
+    fn a_corpus_input_is_copied_from_the_seed_or_the_fetch_and_checked_against_its_pin() {
+        let root = scratch("corpus");
+        let out = root.join("out");
+        let spec = corpus_spec("json/x/a.json", b"{\"a\":1}\n");
+        let gen = Path::new("/nonexistent/generator");
+        assert!(!available(&root, &spec));
+        let err = ensure_input(&root, gen, &out, &spec)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sync-bench-corpus.sh"), "{err}");
+
+        let fetched = root.join("data/bench/corpus/json/x");
+        std::fs::create_dir_all(&fetched).unwrap();
+        std::fs::write(fetched.join("a.json"), b"{\"a\":1}\n").unwrap();
+        assert!(available(&root, &spec));
+        let path = ensure_input(&root, gen, &out, &spec).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}\n");
+
+        // A stale copy from an earlier run is replaced, not judged.
+        std::fs::write(&path, b"stale").unwrap();
+        ensure_input(&root, gen, &out, &spec).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}\n");
+
+        // The seed wins over the fetch, and a file that differs from the pin is refused.
+        let seed = root.join("tests/data/bench-corpus/seed/json/x");
+        std::fs::create_dir_all(&seed).unwrap();
+        std::fs::write(seed.join("a.json"), b"{\"a\":2}\n").unwrap();
+        assert_eq!(
+            corpus_source(&root, &spec).unwrap(),
+            seed.join("a.json"),
+            "the vendored seed is the first candidate"
+        );
+        std::fs::remove_file(&path).unwrap();
+        let err = ensure_input(&root, gen, &out, &spec)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("manifest pins"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_generated_input_is_always_available() {
+        assert!(available(
+            Path::new("/nonexistent"),
+            &spec("u", "users", "1mb")
+        ));
     }
 
     #[test]

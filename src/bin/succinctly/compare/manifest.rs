@@ -89,6 +89,17 @@ impl Manifest {
         if primaries != 1 {
             bail!("manifest needs exactly one primary reference, found {primaries}");
         }
+        // A generated input needs its generator arguments, and a corpus input has none: the
+        // defaults that let the corpus ones omit them must not hide a missing `size`.
+        for i in &m.inputs {
+            let generated = !i.pattern.is_empty() && !i.size.is_empty();
+            if i.corpus.is_some() == generated || (i.corpus.is_some() && !i.pattern.is_empty()) {
+                bail!(
+                    "input {} needs either `corpus`, or `pattern` and `size` (and not both)",
+                    i.id
+                );
+            }
+        }
         for suite in &m.suites {
             if let Some(id) = &suite.reference {
                 if !m
@@ -168,6 +179,26 @@ mod tests {
     }
 
     #[test]
+    fn an_input_is_generated_or_from_the_corpus_and_never_neither_or_both() {
+        let base = "schema_version = 1\n\
+            [succinctly]\nprofile='release'\nfeatures=''\n[queries]\nsmoke='x'\n\
+            [probes]\ncli='x'\nextensions='x'\nsyntax='x'\nfixtures='x'\ndivergences='x'\nrobust='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n[perf]\nqueries='q'\n\
+            [[reference]]\nid='a'\nversion='1'\nrole='primary'\nsource_url=''\nsource_sha256=''\n";
+        let input = |fields: &str| {
+            format!("{base}[[input]]\nid='i'\nshape='s'\ntier='1mb'\nsha256='h'\n{fields}")
+        };
+        assert!(Manifest::parse(&input("pattern='users'\nsize='1mb'\n")).is_ok());
+        assert!(Manifest::parse(&input("corpus='json/a.json'\n")).is_ok());
+        assert!(Manifest::parse(&input("")).is_err());
+        assert!(Manifest::parse(&input("pattern='users'\n")).is_err());
+        assert!(Manifest::parse(&input("size='1mb'\n")).is_err());
+        assert!(Manifest::parse(&input(
+            "corpus='json/a.json'\npattern='users'\nsize='1mb'\n"
+        ))
+        .is_err());
+    }
+
+    #[test]
     fn two_primaries_are_rejected() {
         let text = "schema_version = 1\n\
             [succinctly]\nprofile='release'\nfeatures=''\n[queries]\nsmoke='x'\n\
@@ -192,6 +223,35 @@ mod pin_tests {
         assert!(m.inputs.len() >= 18 && m.inputs.iter().all(|i| i.sha256.len() == 64));
         for s in m.suites.iter().chain([&m.json_suite]) {
             Manifest::read_pinned(root, s).unwrap();
+        }
+    }
+
+    /// A corpus input names a file the corpus manifest records, with the same hash: the
+    /// comparison pins what it measures, and a corpus file re-pinned on one side only would
+    /// otherwise surface as a failed run on a machine that has fetched it (#5552).
+    #[test]
+    fn a_corpus_input_is_pinned_like_the_corpus_manifest() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (m, _) = Manifest::load(root).unwrap();
+        let corpus: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("tests/data/bench-corpus/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let files = corpus["files"].as_array().unwrap();
+        let named: Vec<_> = m.inputs.iter().filter(|i| i.corpus.is_some()).collect();
+        assert!(named.len() >= 7, "{}", named.len());
+        for i in named {
+            let file = i.corpus.as_deref().unwrap();
+            let entry = files
+                .iter()
+                .find(|f| f["file"] == file)
+                .unwrap_or_else(|| panic!("{} names {file}, not in the corpus manifest", i.id));
+            assert_eq!(entry["sha256"], i.sha256.as_str(), "{}", i.id);
+            assert_eq!(entry["format"], "json", "{} is not a jq input", i.id);
+            assert_eq!(
+                i.shape,
+                format!("corpus-{}", entry["workload"].as_str().unwrap())
+            );
         }
     }
 
