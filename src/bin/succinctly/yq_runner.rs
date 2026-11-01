@@ -1052,11 +1052,13 @@ fn empty_input_reads_as(
     if !holds_no_document(&bytes, format) || front_matter {
         return Some((bytes, format));
     }
-    let every_input_is_empty = input_files.len() <= 1
-        || input_files
-            .iter()
-            .all(|file| input_file_holds_no_document_bytes(file, format));
-    (every_input_is_empty && at == 0).then(|| match format {
+    // `at == 0` first: it settles every input but the first without opening a file.
+    (at == 0
+        && (input_files.len() <= 1
+            || input_files
+                .iter()
+                .all(|file| input_file_holds_no_document_bytes(file, format))))
+    .then(|| match format {
         InputFormat::Json => (b"\n".to_vec(), InputFormat::Yaml),
         _ => (b"\n".to_vec(), format),
     })
@@ -1064,8 +1066,9 @@ fn empty_input_reads_as(
 
 /// Whether `byte` is whitespace to yq's JSON reader (#5478): a space, tab, line feed or carriage
 /// return. A form feed, vertical tab, no-break space or byte-order mark is not, and is refused.
+/// The same four bytes jq's lexer skips, so the one definition is `jq_runner`'s.
 fn is_json_whitespace(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
+    crate::jq_runner::is_json_whitespace(char::from(byte))
 }
 
 /// Whether `bytes` hold no document as `format` reads them (#5478): nothing at all, or, for JSON,
@@ -1116,6 +1119,7 @@ fn input_file_holds_no_document_bytes(file: &str, format: InputFormat) -> bool {
                 match f.read(&mut chunk) {
                     Ok(0) => return true,
                     Ok(n) if chunk[..n].iter().copied().all(is_json_whitespace) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     _ => return false,
                 }
             }

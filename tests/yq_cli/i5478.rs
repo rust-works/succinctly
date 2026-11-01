@@ -108,6 +108,13 @@ fn test_whitespace_only_json_file_among_several_inputs_5478() -> Result<()> {
     let empty = write("e.json", "")?;
     let blank = write("w.json", "  \n")?;
     let one = write("x.json", "{\"a\":1}")?;
+    // More than one 8 KiB read of whitespace, and a document after it: a later file scanned in
+    // chunks must read as the one-shot check of the first does.
+    let long_blank = write("long.json", &" \n".repeat(10_000))?;
+    let long_then_one = write(
+        "long_one.json",
+        &format!("{}{{\"a\":1}}", " ".repeat(20_000)),
+    )?;
     let json = ["-p=json", "-o=json", "-I=0"];
     for (filter, files, expected) in [
         (".", vec![&empty, &blank], "null\n"),
@@ -120,6 +127,11 @@ fn test_whitespace_only_json_file_among_several_inputs_5478() -> Result<()> {
         ("file_index", vec![&blank, &one], "1\n"),
         ("file_index", vec![&one, &blank], "0\n"),
         ("filename", vec![&blank, &one], "\"x.json\"\n"),
+        (".", vec![&long_blank, &blank], "null\n"),
+        (".", vec![&blank, &long_blank, &one], "{\"a\":1}\n"),
+        ("file_index", vec![&blank, &long_blank, &one], "2\n"),
+        (".", vec![&long_blank, &long_then_one], "{\"a\":1}\n"),
+        ("file_index", vec![&long_blank, &long_then_one], "1\n"),
     ] {
         let paths: Vec<&std::path::Path> = files.iter().map(|p| p.as_path()).collect();
         let (stdout, stderr, code) = run_yq_files(filter, &paths, &json)?;
