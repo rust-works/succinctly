@@ -1,0 +1,2 @@
+category = "by-design"
+reason = "Tail-position recursion 100000 deep: jq does not finish within 10 s; succinctly's stack guard refuses (ADR-0025), so it gets no tail-call elimination."

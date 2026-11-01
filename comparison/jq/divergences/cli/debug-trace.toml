@@ -1,0 +1,2 @@
+category = "by-design"
+reason = "succinctly has no bytecode to trace; the flag is rejected (exit 2)."

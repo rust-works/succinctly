@@ -1,6 +1,6 @@
 name: Compare jq ledger
 
-# Fails on a stale or unlisted entry in comparison/jq/divergences.toml (#5565).
+# Fails on a stale or unlisted entry in comparison/jq/divergences/ (#5565, one file per entry since #5769).
 #
 # `succinctly dev compare jq` already exits 1 when a probe differs from the pinned jq and
 # the ledger does not list it, or when a listed entry no longer differs. Nothing ran it on a

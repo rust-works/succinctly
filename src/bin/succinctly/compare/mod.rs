@@ -9,7 +9,7 @@
 //!
 //! Phase 2: dimension A (every builtin the reference lists, plus those new in
 //! the secondary reference), G (CLI flags) and the succinctly-only surface,
-//! checked against the `divergences.toml` ledger.
+//! checked against the `divergences/` ledger.
 
 mod cli;
 mod docs;
@@ -126,7 +126,7 @@ pub struct CompareJqArgs {
     #[arg(long)]
     build_jq: bool,
 
-    /// Run only the probes `divergences.toml` lists for this OS, and report entries that no
+    /// Run only the probes the `divergences/` ledger lists for this OS, and report entries that no
     /// longer diverge (the stale half of the `Ledger drift` CI job, #5585). Needs no jq 1.8.1
     /// build and falls back to `/usr/bin/jq` when the pinned 1.7.1 is not built; skips
     /// `since-secondary` entries, entries for another OS and the perf/operational dimensions.

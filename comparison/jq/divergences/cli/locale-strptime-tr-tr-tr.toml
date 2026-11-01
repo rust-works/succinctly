@@ -1,0 +1,4 @@
+category = "to-triage"
+volatile = true
+issue = "#5754"
+reason = "`\"05 Mart 2015\" | strptime(\"%d %B %Y\")` under `LC_ALL=tr_TR.UTF-8`: where `tr_TR` is installed (macOS) jq 1.7.1 reads `Mart` as the Turkish March and succinctly, which has English month names only (#5754), rejects it. A host without that locale falls back to `C`, where jq rejects `Mart` too and the row matches (since #5752, `%B` takes a month's full name or its three-letter abbreviation and no more)."

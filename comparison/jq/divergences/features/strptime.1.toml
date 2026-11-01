@@ -1,0 +1,2 @@
+category = "host-dependent"
+reason = "On `\"a\" | strptime(.)` the weekday of 1900-00-00 is 6 in jq 1.7.1 on macOS, `[…,8,367]` on glibc, and `[…,0,-1]` in succinctly; the value is platform-libc dependent (#5340)."

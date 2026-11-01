@@ -57,7 +57,7 @@ skip is always printed. The gates are checked against
 `.github/workflows/*.yml` by `python3 scripts/test_pre_push.py`: a new CI gate has to be mirrored in
 `scripts/pre_push.py` or listed there as deliberately not (#5585).
 
-A fix for a `to-triage` entry in `comparison/jq/divergences.toml` deletes that entry in the same
+A fix for a `to-triage` entry in `comparison/jq/divergences/` (one file per entry, #5769) deletes that entry's file in the same
 change, or CI's `Ledger drift` job fails on "listed but no longer diverging" (#5583 needed a third
 commit for it). `python3 scripts/ledger_refs.py check` names the entry in milliseconds; a branch
 that only mentions the issue says `[ledger keeps #N]` on its own line in a commit message.

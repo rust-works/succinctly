@@ -1,0 +1,2 @@
+category = "reference-crash"
+reason = "`[] | .[1e12] = 1`: jq aborts (SIGSEGV); succinctly refuses the index with an error (exit 5, #5500)."

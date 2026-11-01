@@ -1,0 +1,3 @@
+category = "reference-slow"
+reason = "`[match(\"a\";\"g\")]` over 100000 characters: jq 1.7.1 does not finish within 10 s on an M4 Pro (5.7 s on a 7950X); succinctly answers in tens of milliseconds. Whether jq beats the deadline depends on the host (it timed out on an M4 Pro and on a GitHub-hosted x86_64 Linux runner, #5565)."
+volatile = true

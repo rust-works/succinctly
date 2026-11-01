@@ -1,0 +1,4 @@
+category = "to-triage"
+volatile = true
+issue = "#5754"
+reason = "Same as `locale-strftime-names-de-de`, under `tr_TR.UTF-8`. Shows only where the host has that locale installed (a host without it falls back to `C`)."

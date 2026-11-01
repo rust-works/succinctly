@@ -163,8 +163,8 @@ class PlanTests(unittest.TestCase):
         self.assertIsNone(self.plan(["src/jq/eval.rs"])["ledger-refs"])
         self.assertIsNone(self.plan(["docs/x.md"])["ledger-refs"])
 
-    def test_the_ledger_file_alone_runs_the_static_check_and_the_ledger_gate(self):
-        p = self.plan(["comparison/jq/divergences.toml"])
+    def test_a_ledger_entry_file_alone_runs_the_static_check_and_the_ledger_gate(self):
+        p = self.plan(["comparison/jq/divergences/cli/version.toml"])
         self.assertIsNone(p["ledger-refs"])
         self.assertIsNone(p["ledger-only"])
         self.assertIsNotNone(p["fmt"])

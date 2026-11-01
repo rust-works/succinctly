@@ -1,0 +1,2 @@
+category = "host-dependent"
+reason = "Prints the directory of the running binary, so the two tools differ by installation path alone."

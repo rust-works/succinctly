@@ -1,0 +1,4 @@
+category = "to-triage"
+volatile = true
+issue = "#5754"
+reason = "`strftime(\"%A %a %B %b %p\")` under `LC_ALL=de_DE.UTF-8`: jq 1.7.1 calls `setlocale(LC_ALL, \"\")` and prints `Donnerstag Do. März März` (empty `%p`); succinctly prints the English names and `PM`. Shows only where the host has that locale installed (a host without it falls back to `C`)."
