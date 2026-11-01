@@ -82,8 +82,16 @@ fn slurpfile_and_args_reads_answer_as_jq_5690() -> Result<()> {
     for (args, filter, expected) in [
         (vec!["--slurpfile", "s", slurped], "$s|length", "2\n"),
         (vec!["--slurpfile", "s", slurped], "$s[0].v[1]", "2\n"),
-        (vec!["--slurpfile", "s", slurped], "$s|map(type)", "[\"object\",\"array\"]\n"),
-        (vec!["--slurpfile", "s", slurped], "[$s,$s]|.[0]==.[1]", "true\n"),
+        (
+            vec!["--slurpfile", "s", slurped],
+            "$s|map(type)",
+            "[\"object\",\"array\"]\n",
+        ),
+        (
+            vec!["--slurpfile", "s", slurped],
+            "[$s,$s]|.[0]==.[1]",
+            "true\n",
+        ),
         (vec!["--args"], "$ARGS.positional|length", "2\n"),
         (vec!["--args"], "$ARGS|keys", "[\"named\",\"positional\"]\n"),
     ] {
@@ -110,8 +118,16 @@ fn programs_that_write_or_walk_paths_keep_the_literal_5690() -> Result<()> {
         ("[1,null,[null,2]]", "$d | del(.. | nulls)", "[1,[2]]\n"),
         ("[[1,2],[3]]", "$d | getpath([0,1]) = 9", "[[1,9],[3]]\n"),
         ("[1,2]", "[$d | paths]", "[[0],[1]]\n"),
-        ("[1,2]", "reduce range(3) as $i ([]; . + $d) | length", "6\n"),
-        ("[1,2]", "[foreach range(2) as $i (0; .+1; [$d[0], .])]", "[[1,1],[1,2]]\n"),
+        (
+            "[1,2]",
+            "reduce range(3) as $i ([]; . + $d) | length",
+            "6\n",
+        ),
+        (
+            "[1,2]",
+            "[foreach range(2) as $i (0; .+1; [$d[0], .])]",
+            "[[1,1],[1,2]]\n",
+        ),
         ("[1,2]", "def f: $d | length; f", "2\n"),
         ("[3,1,2]", "$d | walk(.) | length", "3\n"),
     ] {
@@ -125,16 +141,25 @@ fn programs_that_write_or_walk_paths_keep_the_literal_5690() -> Result<()> {
 #[test]
 fn a_data_import_binding_answers_as_jq_5690() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    std::fs::write(dir.path().join("data.json"), "{\"a\":[1,2,{\"b\":3}]}\n[4]\n")?;
+    std::fs::write(
+        dir.path().join("data.json"),
+        "{\"a\":[1,2,{\"b\":3}]}\n[4]\n",
+    )?;
     let dir = dir.path().to_str().unwrap();
     for (filter, expected) in [
         ("import \"data\" as $d; $d|length", "2\n"),
         ("import \"data\" as $d; $d[0].a[2].b", "3\n"),
         ("import \"data\" as $d; [$d,$d]|.[0]==.[1]", "true\n"),
-        ("import \"data\" as $d; $d|map(type)", "[\"object\",\"array\"]\n"),
+        (
+            "import \"data\" as $d; $d|map(type)",
+            "[\"object\",\"array\"]\n",
+        ),
         // A write through the value keeps the literal.
         ("import \"data\" as $d; $d | .[1][0] = 9 | .[1]", "[9]\n"),
-        ("import \"data\" as $d; reduce range(2) as $i (0; . + ($d[$i]|length))", "2\n"),
+        (
+            "import \"data\" as $d; reduce range(2) as $i (0; . + ($d[$i]|length))",
+            "2\n",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", "-L", dir, filter], None)?;
         assert_eq!((stdout.as_str(), code), (expected, 0), "{filter}: {stderr}");
