@@ -5256,8 +5256,8 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
             None => owned_vec_to_generic_result(values),
         };
     }
-    // #5549: a `del` of a static path is the delete itself on `owned`, with no text written
-    // and indexed to hand it a cursor.
+    // #5549: a `del` of a static path (or, #5670, a `delpaths` of a literal list of paths) is the
+    // delete itself on `owned`, with no text written and indexed to hand it a cursor.
     let owned = match crate::jq::eval::owned_del_step::<S>(expr, owned) {
         crate::jq::eval::OwnedStep::Handled(Ok(value)) => return GenericResult::Owned(value),
         crate::jq::eval::OwnedStep::Handled(Err(_)) if optional => return GenericResult::None,

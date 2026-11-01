@@ -203,6 +203,8 @@ fn test_delpaths_of_literal_paths_matches_jq_5670() -> Result<()> {
         (r"delpaths([[0],[-1]])", r"[1,2,3,4,5]", r"[2,3,4]"),
         (r"delpaths([[-1],[4]])", r"[1,2,3,4,5]", r"[1,2,3,4]"),
         (r"delpaths([[-1],[-2]])", r"[1,2,3,4,5]", r"[1,2,3]"),
+        // An index past 2^53 keeps its spelling and names no element.
+        (r"delpaths([[9007199254740993],[0]])", r"[1,2,3]", r"[2,3]"),
         (
             r#".users|map(delpaths([["name"],["score"]]))"#,
             users,
