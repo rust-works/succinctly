@@ -86887,7 +86887,7 @@ pub fn json_tostream_events<W: Clone + AsRef<[u64]>>(
 ) -> Option<Vec<OwnedValue>> {
     let mut events = Vec::new();
     let mut path = Vec::new();
-    if let Some(leaf) =
+    if let StreamWalk::Leaf(leaf) =
         walk_json_stream(cursor.value(), 0, &mut path, &mut Vec::new(), &mut events)?
     {
         events.push(OwnedValue::Array(
@@ -86901,17 +86901,23 @@ pub fn json_tostream_events<W: Clone + AsRef<[u64]>>(
 /// ones before it; a wider object is checked through a set, so the check stays linear.
 const STREAM_LINEAR_KEY_CHECK: usize = 16;
 
-/// [`json_tostream_events`]'s walk of `value`, whose path is `path`: `Some(None)` when `value` is a
-/// non-empty container and its events are in `events`, `Some(Some(leaf))` when it is a leaf for the
-/// caller to emit, `None` to decline. `keys` holds the raw keys of the objects being walked, for
-/// the repeat check.
+/// What [`walk_json_stream`] made of a value it did not decline.
+enum StreamWalk {
+    /// A non-empty container, whose events are emitted.
+    Walked,
+    /// A leaf (a scalar or an empty container), for the caller to emit with its key.
+    Leaf(OwnedValue),
+}
+
+/// [`json_tostream_events`]'s walk of `value`, whose path is `path`, or `None` to decline. `keys`
+/// holds the raw keys of the objects being walked, for the repeat check.
 fn walk_json_stream<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     depth: usize,
     path: &mut Vec<OwnedValue>,
     keys: &mut Vec<&'a [u8]>,
     events: &mut Vec<OwnedValue>,
-) -> Option<Option<OwnedValue>> {
+) -> Option<StreamWalk> {
     if depth >= super::eval_generic::MAX_NESTING_DEPTH {
         return None;
     }
@@ -86935,17 +86941,17 @@ fn walk_json_stream<'a, W: Clone + AsRef<[u64]>>(
                 path.push(OwnedValue::String(
                     String::from(core::str::from_utf8(raw).ok()?).into(),
                 ));
-                let leaf = walk_json_stream(field.value(), depth + 1, path, keys, events)?;
+                let walked = walk_json_stream(field.value(), depth + 1, path, keys, events)?;
                 let key = path.pop().expect("the key pushed above");
-                match leaf {
-                    None if last => push_closing_event(events, path, key),
-                    None => {}
-                    Some(leaf) if last => {
+                match walked {
+                    StreamWalk::Walked if last => push_closing_event(events, path, key),
+                    StreamWalk::Walked => {}
+                    StreamWalk::Leaf(leaf) if last => {
                         let closing = key.clone();
                         push_leaf_event(events, path, key, leaf);
                         push_closing_event(events, path, closing);
                     }
-                    Some(leaf) => push_leaf_event(events, path, key, leaf),
+                    StreamWalk::Leaf(leaf) => push_leaf_event(events, path, key, leaf),
                 }
                 rest = after;
             }
@@ -86953,7 +86959,7 @@ fn walk_json_stream<'a, W: Clone + AsRef<[u64]>>(
             if rest.ends_unpaired() {
                 return None;
             }
-            Some(None)
+            Some(StreamWalk::Walked)
         }
         StandardJson::Array(elements) if !elements.is_empty() => {
             promote_stream_key(path);
@@ -86961,16 +86967,16 @@ fn walk_json_stream<'a, W: Clone + AsRef<[u64]>>(
             let mut index = 0i64;
             while let Some((element, after)) = rest.uncons_cursor() {
                 path.push(OwnedValue::Int(index));
-                let leaf = walk_json_stream(element.value(), depth + 1, path, keys, events)?;
+                let walked = walk_json_stream(element.value(), depth + 1, path, keys, events)?;
                 let component = path.pop().expect("the index pushed above");
-                if let Some(leaf) = leaf {
+                if let StreamWalk::Leaf(leaf) = walked {
                     push_leaf_event(events, path, component, leaf);
                 }
                 index += 1;
                 rest = after;
             }
             push_closing_event(events, path, OwnedValue::Int(index - 1));
-            Some(None)
+            Some(StreamWalk::Walked)
         }
         _ => {
             let leaf = super::eval_generic::to_owned_checked::<JqSemantics, _>(&value).ok()?;
@@ -86978,7 +86984,7 @@ fn walk_json_stream<'a, W: Clone + AsRef<[u64]>>(
                 leaf,
                 OwnedValue::NumberLiteral(NumberRepr::Float(f), _) | OwnedValue::Float(f) if f.is_nan()
             );
-            (!nan).then_some(Some(leaf))
+            (!nan).then_some(StreamWalk::Leaf(leaf))
         }
     }
 }
@@ -136383,7 +136389,7 @@ mod tests {
             ),
             // A member with no value, and a key that is not a string.
             String::from("{\"a\"}"),
-            String::from("{1:2}"),
+            String::from("{ 1:2}"),
             // A leaf that does not convert.
             String::from("[1,tru]"),
         ];

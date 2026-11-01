@@ -13564,6 +13564,7 @@ jq emits events while it parses, so one thing differs for the shapes below, a re
 - **A duplicate object key** is emitted once: the events come from the parsed value, which keeps the last
   occurrence (`{"a":1,"a":2}` prints `[["a"],2]` and `[["a"]]`), where jq's `--stream` emits every occurrence
   (`docs/plan/jq-duplicate-key-collapse.md`).
+  Since #5618 a run that keeps the events (`-s`, `input`/`inputs`) builds them from the document's index instead, and a document with a repeated key, or with a key spelled with an escape, is still sent through the parsed value so that the collapse stays.
 
 `--stream-errors` is accepted (#5474).
 It implies `--stream` and reports a parse error as an input of the form `[message, path]`, as jq does, and goes on reading with the next line.

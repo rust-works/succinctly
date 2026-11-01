@@ -15744,6 +15744,7 @@ mod tests {
         let (values, error) = show(parse_json_stream_prefix(
             "1 2 {invalid} 3",
             Some(StreamOrigin::ALONE),
+            DocumentForm::Value,
         ));
         assert_eq!(values, vec!["1", "2"]);
         assert_eq!(
