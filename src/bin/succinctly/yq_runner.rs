@@ -782,11 +782,20 @@ impl OutputConfig {
         let compact = args.indent == 0;
 
         // `args.output_format` itself, not yet resolved against any
-        // source's `InputFormat` -- see `Self::for_source` below (#1493).
-        let indent_str = Self::compute_indent_str(args, args.output_format);
+        // source's `InputFormat` -- see `Self::for_source` below (#1493) -- except that an
+        // explicit `-p=json` makes `-o auto` YAML (#5721, yq v4.53.3: `-p=json -o auto .`
+        // prints YAML, with a backwards-compatibility warning): yq's `auto` reads the output
+        // file's extension, and `-p` given keeps the old YAML default instead.
+        let output_format =
+            if args.output_format == OutputFormat::Auto && args.input_format == InputFormat::Json {
+                OutputFormat::Yaml
+            } else {
+                args.output_format
+            };
+        let indent_str = Self::compute_indent_str(args, output_format);
 
         Self {
-            output_format: args.output_format,
+            output_format,
             compact,
             // Neither `-0` (#1996) nor `-j` (real yq's `--tojson`, #1731) implies `-r`: JSON
             // output keeps its quotes and escapes unless `-r` is explicit.
@@ -1048,6 +1057,10 @@ fn empty_input_reads_as(
     // emptiness test: a file that is only the mark reads as an empty one.
     if format != InputFormat::Json {
         bytes.drain(..crate::front_matter::leading_bom_len(&bytes));
+    } else if let Some(nul) = bytes.iter().position(|&b| b == 0) {
+        // #5721: yq's JSON reader stops at the first NUL (`printf '\0' | yq -p=json .` is the
+        // empty document, `1<NUL>2` is `1`); the rest of the input is never read.
+        bytes.truncate(nul);
     }
     if !holds_no_document(&bytes, format) || front_matter {
         return Some((bytes, format));
@@ -1118,6 +1131,11 @@ fn input_file_holds_no_document_bytes(file: &str, format: InputFormat) -> bool {
             loop {
                 match f.read(&mut chunk) {
                     Ok(0) => return true,
+                    // A NUL ends yq's JSON input (#5721): what follows it is never read.
+                    Ok(n) if chunk[..n].contains(&0) => {
+                        let end = chunk[..n].iter().position(|&b| b == 0).unwrap_or(n);
+                        return chunk[..end].iter().copied().all(is_json_whitespace);
+                    }
                     Ok(n) if chunk[..n].iter().copied().all(is_json_whitespace) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     _ => return false,
