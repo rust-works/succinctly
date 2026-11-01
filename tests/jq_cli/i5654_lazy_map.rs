@@ -124,7 +124,6 @@ fn test_an_object_is_checked_whole_even_for_a_consumer_that_stops_early_5654() -
 #[test]
 fn test_an_array_consumer_that_stops_early_never_pulls_the_bad_gap_5654() -> Result<()> {
     for (document, filter, stdout) in [
-        ("[1@,2]", "map(.) | first", "1\n"),
         ("[1,2@]", "map(.) | first", "1\n"),
         // A gap inside a child that `f` never reads is that child's own business.
         ("[1,[2,3,],4]", "map(.) | length", "3\n"),

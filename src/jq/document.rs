@@ -730,6 +730,15 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         true
     }
 
+    /// #5654: whether the number at `text_pos` has a byte glued to it that is not a jq token
+    /// boundary (`2@`, `0x1`). Its span then runs through the junk, so the value decodes to an
+    /// error with no end to check a trailing gap from; the last child's check asks this instead.
+    /// Only JSON overrides it.
+    fn number_glued_junk(&self, text_pos: usize) -> bool {
+        let _ = text_pos;
+        false
+    }
+
     /// The integer this element is, when its text at `text_pos` (its own `text_position()`) is a
     /// plain one: an optional `-`, then `0` or a digit run of at most 18 digits starting with a
     /// non-zero digit, and the end of the token (#5683). `None` for everything else (a fraction,
@@ -2503,7 +2512,7 @@ pub fn trailing_element_gap_ok<C: DocumentCursor>(last_cursor: &C, close_char: u
             .or_else(|| last_cursor.container_text_end())
         {
             Some(end) => last_cursor.trailing_element_gap_ok(end, close_char),
-            None => true,
+            None => !last_cursor.number_glued_junk(start),
         },
         None => true,
     }

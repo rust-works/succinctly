@@ -2844,8 +2844,8 @@ fn word_special_mask(word: u64) -> u64 {
 /// is a *word* arm, taken only when that greedy loop consumed nothing
 /// after the optional sign and only when the whole word is one of
 /// decNumber's special values ([`special_number_end`]) -- so `nan`,
-/// `-inf` and `+Infinity` are one span each, while `-nope` still yields
-/// exactly the span it always did. `is_valid_number`/
+/// `-inf` and `+Infinity` are one span each, while `-nope` is the whole run
+/// to the next token boundary, like any number with a byte glued on (#5654). `is_valid_number`/
 /// `OwnedValue::from_number_bytes` are what decide, from that whole
 /// span, whether it's safe to treat as a real number (falling back to
 /// `Null` if not) -- matching this crate's own established, tested
@@ -2881,23 +2881,28 @@ fn nested_number_span(text: &[u8], start: usize) -> usize {
     }
     // Nothing numeric after the (optional) sign: a decNumber special word
     // (`nan`, `sNaN12`, `-Infinity`, `+inf`, #2877)? Only then, and only if
-    // the whole word validates -- otherwise this returns exactly the span
-    // it always did (`-` for `-nope`, `+` for `+x`), so the #1643
-    // delimiter-gap check keeps rejecting those the way it does today.
+    // the whole word validates -- otherwise it falls to the glued-run arm
+    // below, which spans `-nope` / `+x` to the next token boundary (#5654).
     if i == body_start {
         if let Some(end) = special_number_end(text, start) {
             return end;
         }
+    }
+    // A byte glued to the number that is not a jq token boundary (`0x1`,
+    // `12x3`, `0.0x1`) makes the whole run one token to jq's scanner, which
+    // then fails to validate it (#5654). The span runs to the end of that
+    // token so every decoder sees the malformed whole, not a valid prefix.
+    if i < text.len() && !jq_literal_boundary(text[i]) {
+        return jq_literal_run_end(text, start);
     }
     i
 }
 
 /// Whether `byte` continues [`nested_number_span`]'s greedy number run --
 /// `[0-9.eE+-]`, the one definition of that class (#3167). The span's own
-/// loop, [`strict_number_end`]'s "ends where the greedy span would" check
-/// and the canonical-echo gate's one-pass number arm
-/// ([`scan_canonical_number`]) all ask this, so a byte added to the class
-/// reaches all three.
+/// loop and `JsonCursor::number_glued_junk` ask this. [`strict_number_end`]
+/// and [`scan_canonical_number`] ask [`jq_literal_boundary`] instead since
+/// #5654: a number ends at a token boundary, not at the first non-number byte.
 #[inline(always)]
 fn is_number_span_byte(byte: u8) -> bool {
     matches!(byte, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
@@ -2911,8 +2916,8 @@ const MALFORMED_NUMBER: &str = "invalid numeric literal";
 
 /// Where the token at `start` ends, if it is
 /// `-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?` and ends exactly where
-/// [`nested_number_span`] would end it -- i.e. the next byte is not in that
-/// span's greedy class. Such a span is a number to every decoder (RFC 8259
+/// [`nested_number_span`] would end it -- i.e. the next byte is a jq token
+/// boundary (or the end), so nothing is glued on (#5654). Such a span is a number to every decoder (RFC 8259
 /// plus jq's redundant leading zeros, #1149), so `JsonCursor::number_at`
 /// accepts it without taking the greedy span; every other shape, valid or
 /// not, answers `None` here and is decided on the whole span.
@@ -2941,7 +2946,12 @@ fn strict_number_end(text: &[u8], start: usize) -> Option<usize> {
         }
         i = digits(text, i)?;
     }
-    (!text.get(i).copied().is_some_and(is_number_span_byte)).then_some(i)
+    // Followed by a jq token boundary (or the end): anything else glued on
+    // (`0x1`, `12x3`) makes the whole run one malformed token (#5654).
+    match text.get(i) {
+        None => Some(i),
+        Some(&b) => jq_literal_boundary(b).then_some(i),
+    }
 }
 
 /// Where the token starting at `start` ends, if it is one of decNumber's
@@ -3453,7 +3463,8 @@ fn sibling_end_ok(before: &[u8]) -> bool {
     let last = before[before.len() - 1];
     // The common siblings end here, in one byte test: a number's last digit, a string, a container.
     // A bare token glued to a number that still ends in a digit (`0x1`, `1_000`) is not looked at:
-    // walking every number back would cost the pretty printer 18% on a number-heavy array.
+    // walking every number back would cost the pretty printer 18% on a number-heavy array. The
+    // number scanners refuse it where it is read instead (#5654).
     if last.is_ascii_digit() || matches!(last, b'"' | b']' | b'}') {
         return true;
     }
@@ -3885,7 +3896,10 @@ fn scan_canonical_literal(bytes: &[u8], pos: usize, literal: &[u8]) -> Option<us
 /// 42% of the whole `-c .` run.
 fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
     let end = pos + jq_canonical_number_prefix(&bytes[pos..])?;
-    (!bytes.get(end).copied().is_some_and(is_number_span_byte)).then_some(end)
+    match bytes.get(end) {
+        None => Some(end),
+        Some(&b) => jq_literal_boundary(b).then_some(end),
+    }
 }
 
 /// The string-token rule: `bytes[pos]` must be `"`, and the scan returns
@@ -4329,6 +4343,24 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     #[inline]
     fn trailing_element_gap_ok(&self, gap_start: usize, close_char: u8) -> bool {
         trailing_gap_ok(self.text, gap_start, close_char)
+    }
+
+    /// #5654: see [`DocumentCursor::number_glued_junk`].
+    fn number_glued_junk(&self, text_pos: usize) -> bool {
+        let text = self.text;
+        let mut i = text_pos;
+        if matches!(text.get(i), Some(b'-' | b'+')) {
+            i += 1;
+        }
+        let body = i;
+        while text.get(i).copied().is_some_and(is_number_span_byte) {
+            i += 1;
+        }
+        i > body
+            && text
+                .get(i)
+                .copied()
+                .is_some_and(|b| !jq_literal_boundary(b))
     }
 
     /// #5683: see [`DocumentCursor::plain_int_at`].
@@ -7635,7 +7667,6 @@ mod tests {
             // Trailing garbage: the token still ends where its own grammar
             // says it does.
             (&b"{\"a\":1}xyz"[..], "{\"a\":1}"),
-            (&b"12xyz"[..], "12"),
         ] {
             assert_eq!(
                 render_compact_jq_through_gate(doc).as_deref(),
@@ -10741,10 +10772,20 @@ mod tests {
                 assert_eq!(child.text_range(), None, "{doc}: text_range");
             }
         }
-        // `-` before a word keeps today's span (`-` alone), so the #1643
-        // gap check still rejects it downstream -- unchanged by #2877.
-        assert_eq!(nested_number_span(b"[-nope]", 1), 2);
-        assert_eq!(nested_number_span(b"[+x]", 1), 2);
+        // `-` before a word is a run jq reads as one token (`-nope`, `+x`),
+        // so the span is the whole run, not the sign alone (#5654); it is
+        // not a number either way, so every decoder refuses it.
+        assert_eq!(nested_number_span(b"[-nope]", 1), 6);
+        assert_eq!(nested_number_span(b"[+x]", 1), 3);
+        // A number with a byte glued on is one token too (#5654).
+        assert_eq!(nested_number_span(b"[0x1,2]", 1), 4);
+        assert_eq!(nested_number_span(b"[12x3]", 1), 5);
+        assert_eq!(nested_number_span(b"[0.0x1]", 1), 6);
+        assert_eq!(strict_number_end(b"0x1,", 0), None);
+        assert_eq!(strict_number_end(b"12,", 0), Some(2));
+        assert_eq!(strict_number_end(b"12", 0), Some(2));
+        assert_eq!(scan_canonical_number(b"12x3", 0), None);
+        assert_eq!(scan_canonical_number(b"12 ", 0), Some(2));
         // ... while a valid signed word is the whole word.
         assert_eq!(nested_number_span(b"[-inf]", 1), 5);
         assert_eq!(nested_number_span(b"[+nan]", 1), 5);

@@ -6676,6 +6676,22 @@ $ echo '{"a":{"k":tru},"b":2}' | sjq -c '[(., .) | .a]'   # (raises)          ex
 The `.a` row shows the rule still holds: a node the array *holds* is validated before anything
 prints.
 
+A number with a byte glued on (`0x1`, `12x3`, `0.0x1`) is one more malformed token (#5654).
+jq reads the run up to the next token boundary as one token and refuses it.
+Every route that reads the element refuses it too, with jq's message and column.
+A route that never reads the element still answers when the glued run ends in a digit and the element is not the last one in its container, as `[1.5.5,2] | length` does.
+A run that ends in a letter or another byte (`2x`, `2@`), or that is the last element, is refused by the gap check whatever the filter (#5650).
+A signed word glued to nothing numeric (`-nope`, `+x`) is not refused by `length` either.
+
+```
+$ echo '[0x1,2]'  | jq  -c 'length'      # (parses nothing) exit 5
+$ echo '[0x1,2]'  | sjq -c 'length'      # 2                exit 0
+$ echo '[0x1,2]'  | sjq -c '.[1]'        # 2                exit 0
+$ echo '[0x1,2]'  | sjq -c 'map(.)'      # (raises)         exit 5
+$ echo '[1,0x1]'  | sjq -c 'length'      # (raises)         exit 5
+$ echo '[2x,1]'   | sjq -c 'length'      # (raises)         exit 5
+```
+
 ### A string with an invalid escape or a lone high surrogate is echoed by a filter that only forwards it (#5308)
 
 jq 1.7.1 rejects the document at parse time, whatever the filter, with exit 2.
