@@ -20752,10 +20752,16 @@ fn owned_contains_at_depth<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue, dep
                 .any(|a_elem| owned_contains_at_depth::<S>(a_elem, b_elem, depth + 1))
         }),
         // Object contains: all keys in b must exist in a with matching values
+        // yq reads a repeated key's *earliest* entry (#5426, captured against v4.53.3:
+        // `a: 1 / a: 2` is `contains({"a":1})` = true and `contains({"a":2})` = false);
+        // jq has no repeated keys, so its collapsed view is the whole object.
         (OwnedValue::Object(a_obj), OwnedValue::Object(b_obj)) => b_obj.iter().all(|(k, b_val)| {
-            a_obj
-                .get(k)
-                .is_some_and(|a_val| owned_contains_at_depth::<S>(a_val, b_val, depth + 1))
+            let a_val = if S::TAG == EvalTag::Yq {
+                a_obj.first_occurrence(k)
+            } else {
+                a_obj.get(k)
+            };
+            a_val.is_some_and(|a_val| owned_contains_at_depth::<S>(a_val, b_val, depth + 1))
         }),
         // yq looks inside an array on its left for a right-hand side that is not an array
         // (#4899, captured against v4.53.3): `[[1]] | contains([1])`, `[[{"a":1}]] |
