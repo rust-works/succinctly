@@ -3734,7 +3734,9 @@ Two integers compare as integers, and a decimal spelling (`007`, `+5`, `1e3`) pa
   The reading is `go_time::parse_yq_datetime`, a port of the part of `time.Parse` those two layouts use, including its looseness (a one-digit hour, a comma before the fraction, a zone offset of 24 hours); `scripts/yq-time-fuzz.py` replays mutated timestamps against a real yq.
   `OwnedValue` has no timestamp kind, so the reading goes by the text, and what yq decides from the `!!timestamp` tag is still different:
   an unquoted document value whose text no layout reads (`2001-01-01 10:00:00`) is a time for yq, which raises on it, and a plain string is `!!str not yet supported for comparison` against a `!!timestamp` on its right, where this answers by string order;
-  the error for a `null` written `~` names `~` in yq and `null` here, and the type tag in a container error reads `!!str` here for a document date (`tag` answers `!!str` for one too).
+  the error for a right operand names its text as written in yq and as the value reads here, so an empty value (`key:`) is `parsing time ""` there and `"null"` here, a `~` is `"~"` and `"null"`, `True` is `"True"` and `"true"`, and a literal `007` in the filter is `"007"` and `"7"`;
+  a number past int64 (`100000000000000000000`) raises `strconv.ParseInt: ... value out of range` in yq and a time error here;
+  and the type tag in a container error reads `!!str` here for a document date (`tag` answers `!!str` for one too).
 - A signed prefixed integer (`-0x10`), `1_000` and `0b101` read as strings here, so they raise the kind error instead of comparing or raising `ParseFloat`.
 - `sort`, `min` and `max` over an array holding a prefixed integer and a float use their own comparators here: yq's `min`/`max` raise the same `ParseFloat` error, and its `sort` panics with it, where this orders them by value.
 

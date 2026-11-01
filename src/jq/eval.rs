@@ -16586,31 +16586,66 @@ pub(crate) fn apply_compare_op<S: EvalSemantics>(
     }
 }
 
-/// yq mode only (#5651): an ordering comparison of two strings that both parse as timestamps
-/// compares the instants, not the text: `"2001-01-01T00:00:00Z" < "2001-01-01T10:00:00+10:00"` is
-/// `false` there (the same moment), where the strings order `true`. Any other pair is `None`: a
-/// right operand that is not a timestamp is [`yq_ordering_refusal`]'s error, which
-/// [`try_compare_op`] raises before this is consulted.
+/// yq mode only (#5651): an ordering comparison whose left operand is a string that parses as a
+/// timestamp is a comparison of times. `None` when it is not one (another mode, an equality, a
+/// left operand that is not such a string, a container on the right, which
+/// [`yq_ordering_refusal`] words first); otherwise the two instants, or the error yq raises for a
+/// right operand its time layouts do not read (a number, a bool and `null` by their text).
+///
+/// The one place that decides it: [`try_compare_op`] and [`apply_compare_op`] answer from it, and
+/// [`yq_ordering_refusal`] names the error from it.
+pub(crate) fn yq_time_comparison<S: EvalSemantics>(
+    op: CompareOp,
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> Option<Result<(super::go_time::Instant, super::go_time::Instant), EvalError>> {
+    if S::TAG != EvalTag::Yq
+        || !matches!(
+            op,
+            CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
+        )
+    {
+        return None;
+    }
+    let OwnedValue::String(left) = left else {
+        return None;
+    };
+    let left = super::go_time::yq_datetime(left)?;
+    let right_text = yq_scalar_text::<S>(right)?;
+    Some(match super::go_time::yq_datetime(&right_text) {
+        Some(right) => Ok((left, right)),
+        None => Err(EvalError::new(
+            super::go_time::yq_datetime_error(&right_text).unwrap_or_default(),
+        )),
+    })
+}
+
+/// The answer of `op` for two instants.
+fn yq_time_verdict(
+    op: CompareOp,
+    left: super::go_time::Instant,
+    right: super::go_time::Instant,
+) -> bool {
+    match op {
+        CompareOp::Lt => left < right,
+        CompareOp::Le => left <= right,
+        CompareOp::Gt => left > right,
+        CompareOp::Ge => left >= right,
+        CompareOp::Eq => left == right,
+        CompareOp::Ne => left != right,
+    }
+}
+
+/// [`yq_time_comparison`]'s answer where it has one and cannot fail: two timestamps.
 pub(crate) fn yq_time_ordering<S: EvalSemantics>(
     op: CompareOp,
     left: &OwnedValue,
     right: &OwnedValue,
 ) -> Option<bool> {
-    if S::TAG != EvalTag::Yq {
-        return None;
+    match yq_time_comparison::<S>(op, left, right)? {
+        Ok((left, right)) => Some(yq_time_verdict(op, left, right)),
+        Err(_) => None,
     }
-    let (OwnedValue::String(left), OwnedValue::String(right)) = (left, right) else {
-        return None;
-    };
-    let left = super::go_time::parse_yq_datetime(left).ok()?;
-    let right = super::go_time::parse_yq_datetime(right).ok()?;
-    Some(match op {
-        CompareOp::Lt => left < right,
-        CompareOp::Le => left <= right,
-        CompareOp::Gt => left > right,
-        CompareOp::Ge => left >= right,
-        CompareOp::Eq | CompareOp::Ne => return None,
-    })
 }
 
 /// yq mode only (#5631): the error real yq raises for an ordering comparison (`<`, `<=`, `>`,
@@ -16671,15 +16706,10 @@ pub(crate) fn yq_ordering_refusal<S: EvalSemantics>(
             yq_extremum_tag(left),
         )));
     }
-    // #5651: a left string that is a timestamp makes this a time comparison, so the right operand
-    // must be one too, whatever kind it is (a number, a bool and `null` by their text).
-    if let OwnedValue::String(text) = left {
-        if super::go_time::parse_yq_datetime(text).is_ok() {
-            let right_text = yq_scalar_text::<S>(right)?;
-            return super::go_time::parse_yq_datetime(&right_text)
-                .err()
-                .map(EvalError::new);
-        }
+    // #5651: a left string that is a timestamp makes this a time comparison, whose right operand
+    // must be one too.
+    if let Some(time) = yq_time_comparison::<S>(op, left, right) {
+        return time.err();
     }
     let is_number = |v: &OwnedValue| {
         matches!(
@@ -16741,6 +16771,11 @@ pub(crate) fn try_compare_op<S: EvalSemantics>(
     left: &OwnedValue,
     right: &OwnedValue,
 ) -> Result<bool, EvalError> {
+    // #5651: parsed once, for the error and for the answer.
+    if let Some(time) = yq_time_comparison::<S>(op, left, right) {
+        // A container on the right is not a time comparison (`None` there), so none reaches here.
+        return time.map(|(left, right)| yq_time_verdict(op, left, right));
+    }
     match yq_ordering_refusal::<S>(op, left, right) {
         Some(error) => Err(error),
         None => Ok(apply_compare_op::<S>(op, left, right)),

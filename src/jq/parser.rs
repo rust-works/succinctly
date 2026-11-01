@@ -34,8 +34,8 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::eval::{
-    apply_compare_op, arith_combine, compare_values, contains_retrying_pattern_bind,
-    yq_scalar_text_eq, EvalError, EvalSemantics, JqSemantics, YqSemantics,
+    apply_compare_op, arith_combine, contains_retrying_pattern_bind, try_compare_op, EvalError,
+    EvalSemantics, JqSemantics, YqSemantics,
 };
 use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import,
@@ -45,7 +45,6 @@ use super::expr::{
 };
 use super::value::{parse_i64_or_f64_in, NumberRepr, OwnedValue};
 use super::walk::{any_subexpr, map_subexprs};
-use core::cmp::Ordering;
 
 /// Parser mode controls syntax differences between jq and yq.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2515,21 +2514,10 @@ impl<'a> Parser<'a> {
                 ) else {
                     return None;
                 };
-                // yq mode's text-comparison rule (`yq_scalar_text_eq`) is the
-                // authority for the two ops it serves; everything else runs
-                // the same total order runtime does.
-                if let Some(equal) = yq_scalar_text_eq::<S>(*op, &l, &r) {
-                    return Some(OwnedValue::Bool(equal));
-                }
-                let ord = compare_values::<S>(&l, &r);
-                Some(OwnedValue::Bool(match op {
-                    CompareOp::Eq => ord == Ordering::Equal,
-                    CompareOp::Ne => ord != Ordering::Equal,
-                    CompareOp::Lt => ord == Ordering::Less,
-                    CompareOp::Le => ord != Ordering::Greater,
-                    CompareOp::Gt => ord == Ordering::Greater,
-                    CompareOp::Ge => ord != Ordering::Less,
-                }))
+                // The runtime's own answer, `try_compare_op`: yq's text equality, its null rule,
+                // its time comparison (#5651) and its refusals (#5631) are not repeated here. A
+                // pair yq refuses is not folded, so the runtime raises it.
+                try_compare_op::<S>(*op, &l, &r).ok().map(OwnedValue::Bool)
             }
             Expr::Array(inner) => match inner.as_ref() {
                 Expr::Comma(items) => {

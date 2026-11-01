@@ -17,6 +17,8 @@ SEEDS = [
     "2000-02-29T23:59:59-23:59Z", "2001-01-01T00:00:00+00:60", "0001-01-01", "9999-12-31T23:59:59Z",
 ]
 ALPHABET = list("0123456789-:TZtz+.,/ _x") + ["é", "\t"]
+# Seeds and a few whole-field replacements reach other years, long fractions and offsets.
+SEEDS += ["1999-12-31T23:59:59.9999999999999Z", "2024-02-29T12:00:00+23:59", "1970-01-01T00:00:00Z"]
 
 
 def mutate(rng, s):
@@ -37,7 +39,7 @@ def mutate(rng, s):
 
 
 def run(cmd, expr):
-    p = subprocess.run(cmd + ["-n", expr], capture_output=True, text=True)
+    p = subprocess.run(cmd + ["-n", expr], capture_output=True, text=True, timeout=30)
     return (p.returncode == 0, (p.stdout + p.stderr).strip().removeprefix("Error: ").strip())
 
 
@@ -54,7 +56,10 @@ def main():
     rng = random.Random(args.seed)
     yq, succ = ["yq"], [args.succinctly, "yq"]
     cases = set(SEEDS)
-    while len(cases) < args.count:
+    # Bounded: the reachable set is finite, so a count beyond it stops at the attempt cap.
+    for _ in range(args.count * 20):
+        if len(cases) >= args.count:
+            break
         cases.add(mutate(rng, rng.choice(SEEDS)))
     bad = 0
     for s in sorted(cases):
@@ -69,6 +74,7 @@ def main():
                 bad += 1
                 print(f"DIFF {expr}\n   yq:   {a}\n   succ: {b}")
     print(f"{len(cases)} strings, {bad} differences")
+    raise SystemExit(1 if bad else 0)
 
 
 if __name__ == "__main__":

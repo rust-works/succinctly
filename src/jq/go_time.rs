@@ -20,12 +20,27 @@ use alloc::string::String;
 /// A parsed instant, as nanoseconds since the Unix epoch.
 pub(crate) type Instant = i128;
 
-/// The instant yq reads `text` as, or the error yq reports when neither layout parses it.
-pub(crate) fn parse_yq_datetime(text: &str) -> Result<Instant, String> {
-    match parse_rfc3339(text.as_bytes()) {
-        Some(instant) => Ok(instant),
-        None => parse_date(text.as_bytes()),
+/// The instant yq reads `text` as under either layout, if it does. Allocates nothing, so the
+/// question can be asked of every string an ordering comparison meets.
+pub(crate) fn yq_datetime(text: &str) -> Option<Instant> {
+    parse_rfc3339(text.as_bytes()).or_else(|| parse_date(text.as_bytes()).ok())
+}
+
+/// The error yq reports for a `text` neither layout parses (the date layout's, the last one it
+/// tries), or `None` when it does parse.
+pub(crate) fn yq_datetime_error(text: &str) -> Option<String> {
+    if parse_rfc3339(text.as_bytes()).is_some() {
+        return None;
     }
+    parse_date(text.as_bytes())
+        .err()
+        .map(|error| error.describe(text.as_bytes()))
+}
+
+/// [`yq_datetime`] and [`yq_datetime_error`] together, for the tests.
+#[cfg(test)]
+pub(crate) fn parse_yq_datetime(text: &str) -> Result<Instant, String> {
+    yq_datetime(text).ok_or_else(|| yq_datetime_error(text).unwrap_or_default())
 }
 
 fn is_digit(s: &[u8], i: usize) -> bool {
@@ -189,46 +204,81 @@ fn quote(bytes: &[u8]) -> String {
     out
 }
 
-/// `time.Parse("2006-01-02", text)`, with Go's `ParseError` text for a failure.
-fn parse_date(text: &[u8]) -> Result<Instant, String> {
-    let whole = quote(text);
-    // `cannot parse "<rest>" as "<element>"`.
-    let element = |rest: &[u8], layout: &str| {
-        format!(
-            "parsing time {whole} as \"2006-01-02\": cannot parse {} as \"{layout}\"",
-            quote(rest)
-        )
-    };
+/// Why `time.Parse("2006-01-02", text)` failed: what Go's `ParseError` is built from, kept apart
+/// from its text so that a probe that only asks whether a string is a date allocates nothing.
+enum DateError<'a> {
+    /// `cannot parse "<rest>" as "<layout element>"`.
+    Element {
+        rest: &'a [u8],
+        layout: &'static str,
+    },
+    MonthOutOfRange,
+    ExtraText(&'a [u8]),
+    DayOutOfRange,
+}
+
+impl DateError<'_> {
+    /// Go's `ParseError.Error()` for a failure on `whole`.
+    fn describe(&self, whole: &[u8]) -> String {
+        let whole = quote(whole);
+        match self {
+            DateError::Element { rest, layout } => format!(
+                "parsing time {whole} as \"2006-01-02\": cannot parse {} as \"{layout}\"",
+                quote(rest)
+            ),
+            DateError::MonthOutOfRange => format!("parsing time {whole}: month out of range"),
+            DateError::ExtraText(rest) => {
+                format!("parsing time {whole}: extra text: {}", quote(rest))
+            }
+            DateError::DayOutOfRange => format!("parsing time {whole}: day out of range"),
+        }
+    }
+}
+
+/// `time.Parse("2006-01-02", text)`.
+fn parse_date(text: &[u8]) -> Result<Instant, DateError<'_>> {
     let mut v = text;
     // 2006
-    let hold = v;
     if v.len() < 4 || !is_digit(v, 0) || !v[..4].iter().all(u8::is_ascii_digit) {
-        return Err(element(hold, "2006"));
+        return Err(DateError::Element {
+            rest: v,
+            layout: "2006",
+        });
     }
     let year = v[..4]
         .iter()
         .fold(0i64, |n, d| n * 10 + i64::from(d - b'0'));
     v = &v[4..];
     // -
-    v = v.strip_prefix(b"-").ok_or_else(|| element(v, "-"))?;
+    v = v.strip_prefix(b"-").ok_or(DateError::Element {
+        rest: v,
+        layout: "-",
+    })?;
     // 01
-    let hold = v;
-    let (month, rest) = getnum(v, true).ok_or_else(|| element(hold, "01"))?;
+    let (month, rest) = getnum(v, true).ok_or(DateError::Element {
+        rest: v,
+        layout: "01",
+    })?;
     v = rest;
     if !(1..=12).contains(&month) {
-        return Err(format!("parsing time {whole}: month out of range"));
+        return Err(DateError::MonthOutOfRange);
     }
     // -
-    v = v.strip_prefix(b"-").ok_or_else(|| element(v, "-"))?;
+    v = v.strip_prefix(b"-").ok_or(DateError::Element {
+        rest: v,
+        layout: "-",
+    })?;
     // 02
-    let hold = v;
-    let (day, rest) = getnum(v, true).ok_or_else(|| element(hold, "02"))?;
+    let (day, rest) = getnum(v, true).ok_or(DateError::Element {
+        rest: v,
+        layout: "02",
+    })?;
     v = rest;
     if !v.is_empty() {
-        return Err(format!("parsing time {whole}: extra text: {}", quote(v)));
+        return Err(DateError::ExtraText(v));
     }
     if day < 1 || day > days_in(month, year) {
-        return Err(format!("parsing time {whole}: day out of range"));
+        return Err(DateError::DayOutOfRange);
     }
     Ok(instant(days_from_civil(year, month, day), 0, 0, 0))
 }
