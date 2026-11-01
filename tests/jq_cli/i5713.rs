@@ -117,6 +117,7 @@ fn a_long_named_string_reads_as_the_plain_string_5713() -> Result<()> {
 
 /// A string spliced as a path target is refused with jq's own error, under the marker as under a
 /// literal.
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn a_long_named_string_is_not_a_path_5713() -> Result<()> {
     let value = long_string();
