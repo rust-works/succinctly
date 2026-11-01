@@ -77269,7 +77269,7 @@ where
 ///
 /// A container (`--argjson`, `--slurpfile`, `$ARGS`, a data `import`) is spliced as one shared
 /// marker instead of a literal tree rebuilt at every `$name`, when the program only reads it
-/// ([`reads_named_arguments_only`]).
+/// (`reads_named_arguments_only`).
 ///
 /// The literal is a tree as large as the value, built once per read of the name and then built
 /// again into a value when the program runs: for 10 MB of `--slurpfile` that was 177 ms of the
