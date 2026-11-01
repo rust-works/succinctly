@@ -20793,6 +20793,10 @@ fn collect_together<S: EvalSemantics, V: DocumentValue>(
     for item in context {
         cur.set(item.tag);
         let mut stray: Option<Control> = None;
+        // #5358: yq's `collectTogether` evaluates the body in a
+        // `SingleReadonlyChildContext`, so under `ea` an absent map key yields
+        // nothing rather than `null`: `[.a]` over a document without `a` is `[]`.
+        let _read_only = yq_read_only_context::enter();
         let flow = run_yq_stages_over_item::<S, V>(
             &mut RestPipe::new(single),
             item,
