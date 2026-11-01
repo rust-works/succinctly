@@ -54,7 +54,7 @@ portable-popcount = []
 serde = ["dep:serde"]
 
 # CLI tool features
-cli = ["std", "clap", "rand", "rand_chacha", "anyhow", "serde_json", "memmap2", "md5", "serde", "regex", "local-zone", "dep:libc"]
+cli = ["std", "clap", "rand", "rand_chacha", "anyhow", "serde_json", "memmap2", "md5", "serde", "regex", "local-zone", "locale-time", "dep:libc"]
 
 # Resolve the system's local time zone for jq's `localtime`/`strflocaltime`
 # (#3054) through jiff: an IANA `TZ` name or the system zone, with the offset
@@ -62,6 +62,12 @@ cli = ["std", "clap", "rand", "rand_chacha", "anyhow", "serde_json", "memmap2", 
 # needs a bundled tz database there; see docs/compliance/jq/limitations.md), the
 # evaluator reads only a POSIX `TZ` offset string.
 local-zone = ["std", "dep:jiff"]
+
+# Localized names and layouts for jq's `strftime`/`strflocaltime` (#5754): `%a %A %b %B %h
+# %p %c %x %X %r` follow `LC_ALL`/`LC_TIME`/`LANG` through the C library's `strftime_l`,
+# as jq's `setlocale(LC_ALL, "")` makes them. Unix with a glibc or Apple libc only; without
+# it, and elsewhere, the C locale's English names.
+locale-time = ["std", "dep:libc"]
 
 # Enable regex support in jq query language. `fancy-regex` compiles only the jq
 # patterns the `regex` crate refuses for lookaround or a backreference (#5502).

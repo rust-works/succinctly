@@ -1,4 +1,0 @@
-category = "to-triage"
-volatile = true
-issue = "#5754"
-reason = "`strftime(\"%x\")` under `LC_ALL=en_US.UTF-8` is `03/05/2015` in jq 1.7.1 (libc) and `03/05/15` in succinctly, which has one fixed `%c`/`%x`/`%X` layout. Shows only where the host has that locale installed (a host without it falls back to `C`)."
