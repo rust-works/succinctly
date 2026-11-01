@@ -33546,7 +33546,7 @@ fn path_context_absent_identity<V: DocumentValue, S: EvalSemantics>(
 /// so it rides a [`Expr::tracked_value`] snapshot as `parent`'s arms do.
 fn path_component_literal(component: &OwnedValue) -> Expr {
     match component {
-        OwnedValue::String(s) => Expr::Literal(Literal::String(s.to_string())),
+        OwnedValue::String(s) => Expr::Literal(Literal::String(s.clone())),
         OwnedValue::Int(i) => Expr::Literal(Literal::Int(*i)),
         other => Expr::tracked_value(other.clone()),
     }
@@ -33674,7 +33674,7 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             Expr::Literal(Literal::Int(file_index_for_path(&path())))
         }
         Expr::Builtin(Builtin::Filename) => {
-            Expr::Literal(Literal::String(filename_for_path(&path())))
+            Expr::Literal(Literal::String(filename_for_path(&path()).into()))
         }
         // #2472: `parent`/`parent(n)` inside a stage the owned identity
         // pipe evaluates as a whole (`[path, parent]`, `select(parent !=
@@ -43511,9 +43511,7 @@ mod tests {
                 expr: Box::new(Expr::Pipe(
                     vec![Expr::Field("a".to_string()), Expr::Builtin(Builtin::Length)].into(),
                 )),
-                catch: Some(Box::new(Expr::Literal(Literal::String(
-                    "caught".to_string(),
-                )))),
+                catch: Some(Box::new(Expr::Literal(Literal::String("caught".into())))),
             },
             value,
         );
@@ -48371,7 +48369,7 @@ mod tests {
                 Expr::Iterate,
                 Expr::IndexExpr {
                     target: Box::new(Expr::Identity),
-                    key: Box::new(Expr::Literal(Literal::String("a".to_string()))),
+                    key: Box::new(Expr::Literal(Literal::String("a".into()))),
                 },
             ]
             .into(),

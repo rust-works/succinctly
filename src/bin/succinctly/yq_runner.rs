@@ -2833,7 +2833,7 @@ fn literal_path_steps(expr: &Expr, out: &mut Vec<PathStep>) -> bool {
     };
     array_literal_items(inner).iter().all(|item| match item {
         Expr::Literal(Literal::String(key)) => {
-            out.push(PathStep::Key(key.clone()));
+            out.push(PathStep::Key(key.to_string()));
             true
         }
         Expr::Literal(Literal::Int(idx)) => {
