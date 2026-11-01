@@ -15536,22 +15536,18 @@ fn test_map_values_object_propagates_bare_halt_from_field() -> Result<()> {
 }
 
 #[test]
-fn test_map_values_object_propagates_partial_halt_from_field() -> Result<()> {
-    // `builtin_map_values`'s object-branch `Partial(_, Control::Halt(code))`
-    // arm: `f` producing an output and then halting on the same field must
-    // still drop the whole result object. Real jq's `map_values` is
-    // defined as `.[] |= f` (`_modify`), which only ever observes the
-    // *first* output of `f` and never reaches a second one -- `jq -n
-    // '{"a":1} | map_values(2, halt_error(5))'` prints `{"a":2}` and exits
-    // 0, never reaching `halt_error` at all -- while succinctly's
-    // `map_values` instead evaluates `f` eagerly via `eval_single` and
-    // walks every `QueryResult` variant it can return, so it does reach the
-    // halt. This test pins succinctly's own contract for this pre-existing
-    // divergence, not jq parity.
+fn test_map_values_object_ignores_a_halt_after_the_first_output_5791() -> Result<()> {
+    // `f` producing an output and then halting on the same field: real jq's `map_values` is
+    // defined as `.[] |= f` (`_modify`), which only ever observes the *first* output of `f`, so
+    // `jq -n '{"a":1} | map_values(2, halt_error(5))'` prints `{"a":2}` and exits 0 without
+    // reaching `halt_error` (#5791; this test used to pin the halt as succinctly's own
+    // contract). The one leftover: the eager evaluation of `f` still fires `halt_error`'s
+    // stderr text (`1`), which jq never prints -- the side-effect rule documented at
+    // `eval.rs`'s "fires even" note, not part of this fix.
     let (stdout, stderr, code) =
         run_jq_full(&["-n", r#"{"a":1} | map_values(2, halt_error(5))"#], None)?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{\n  \"a\": 2\n}\n");
     assert_eq!(stderr, "1\n");
     Ok(())
 }
@@ -15570,17 +15566,13 @@ fn test_map_values_array_propagates_bare_halt_from_element() -> Result<()> {
 }
 
 #[test]
-fn test_map_values_array_propagates_partial_halt_from_element() -> Result<()> {
-    // `builtin_map_values`'s array-branch `Partial(_, Control::Halt(code))`
-    // arm. Same pre-existing multi-output-`f` divergence from real jq as
-    // the object-branch `Partial` test above: real jq's `.[] |= f` only
-    // observes `f`'s first output, so `jq -n '[1] | map_values(2,
-    // halt_error(6))'` prints `[2]` and exits 0 without ever reaching
-    // `halt_error` -- this test pins succinctly's own contract, which does
-    // reach it.
+fn test_map_values_array_ignores_a_halt_after_the_first_output_5791() -> Result<()> {
+    // The array sibling of the object test above: real jq's `.[] |= f` only observes `f`'s first
+    // output, so `jq -n '[1] | map_values(2, halt_error(6))'` prints `[2]` and exits 0. The
+    // stderr text is the same leftover side effect (#5791).
     let (stdout, stderr, code) = run_jq_full(&["-n", "[1] | map_values(2, halt_error(6))"], None)?;
-    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\n  2\n]\n");
     assert_eq!(stderr, "1\n");
     Ok(())
 }
