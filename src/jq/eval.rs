@@ -82996,6 +82996,11 @@ pub(crate) const MAX_PROJECTED_FIELDS: usize = 8;
 /// (`$name.k`, `$name.k?`; [`var_reads`](super::deferred_bind::var_reads)). Any other read -- bare
 /// `$name`, `$name[..]`, a dynamic key -- sees the whole element, so the answer is `None`.
 ///
+/// A single object pattern of literal keys (`as {a: $x, $b}`, #5544) is the other accepted shape:
+/// it binds names to members and never the element, so the fields are its keys
+/// ([`literal_pattern_keys`]) and UPDATE and EXTRACT are not scanned. A computed key, an array
+/// pattern, a `?//` alternation and an object pattern past [`MAX_PROJECTED_FIELDS`] keys decline.
+///
 /// Identity sharing (`retry.shares`, a body that compares or calls) does not decline it: the shared
 /// storage is then the projected object's, whose fields are the element's own values, so the answer
 /// does not depend on how the update spells its read.

@@ -2,15 +2,16 @@
 //! only those keys of each element, as #5519 does for `$u.field`: the pattern binds names to
 //! members, never the element, so nothing else of it is read.
 //!
-//! The first test's expected text and exit status were captured from jq 1.7.1 (`/usr/bin/jq`):
-//! members the pattern does not name, an absent key, a repeated key, a non-object element, a
-//! nested and an array sub-pattern, a computed key and a `?//` alternation, which keep the element
-//! whole. The last two tests pin what is *not* jq's, as #5519's do: a member no key names is not
-//! decoded (the document is one jq refuses at parse time).
+//! The first two tests' expected text, stderr and exit status were captured from jq 1.7.1
+//! (`/usr/bin/jq`): members the pattern does not name, an absent key, a repeated key, a non-object
+//! element, a nested and an array sub-pattern, a nested computed key, a computed key and a `?//`
+//! alternation, which keep the element whole. The malformed-object test pins jq's exit status. The
+//! last test pins what is *not* jq's, as #5519's do: a member no key names is not decoded (the
+//! document is one jq refuses at parse time).
 
 use anyhow::Result;
 
-use crate::run_jq_stdin;
+use crate::{run_jq_full, run_jq_stdin};
 
 fn jq(filter: &str, input: &str) -> Result<(String, i32)> {
     run_jq_stdin(filter, input, &["-c"])
@@ -164,11 +165,56 @@ fn test_a_fold_destructuring_literal_keys_matches_jq_5544() -> Result<()> {
             "true\n",
             0,
         ),
+        // A computed key under a named key keeps that member whole, so it is still projected by `a`.
+        (
+            r#"reduce .[] as {a:{("b"):$x}} (0; . + $x) | [.]"#,
+            r#"[{"a":{"b":2,"q":7},"p":1},{"a":{"k":1}}]"#,
+            "[2]\n",
+            0,
+        ),
+        // A path read of a destructured name, and a field read of it after a pipe.
+        (
+            "reduce .[] as {a:$x} (0; path($x)?)",
+            r#"[{"a":{"b":2},"p":1}]"#,
+            "null\n",
+            0,
+        ),
+        (
+            r"reduce .[] as {a:$x} ({}; .z = ($x | .k))",
+            r#"[{"a":{"k":"m","q":1},"p":1}]"#,
+            "{\"z\":\"m\"}\n",
+            0,
+        ),
     ] {
         assert_eq!(
             jq(filter, input)?,
             (want.to_string(), status),
             "{filter} {input}"
+        );
+    }
+    Ok(())
+}
+
+/// A non-object element fails the fold with jq's own message, not the projected object's.
+#[test]
+fn test_a_non_object_element_names_its_own_type_5544() -> Result<()> {
+    for (filter, input, want) in [
+        (
+            "reduce .[] as {a:$x} (0; . + $x)",
+            r#"[{"a":1},5]"#,
+            "jq: error (at <stdin>:0): Cannot index number with string \"a\"\n",
+        ),
+        (
+            r#"reduce .[] as {a:{("b"):$x}} (0; . + $x)"#,
+            r#"[{"a":1}]"#,
+            "jq: error (at <stdin>:0): Cannot index number with string \"b\"\n",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            ("", want, 5),
+            "{filter}"
         );
     }
     Ok(())
