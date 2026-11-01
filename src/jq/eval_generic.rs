@@ -55453,17 +55453,17 @@ mod tests {
                 reindexes <= bound,
                 "jq: {query} reindexed {reindexes} times"
             );
-            // The `range` body, `reduce` and `def` rows reach the string through
-            // `closed_unary_builtin`, which is jq mode only (yq's bridge stays as it was).
-            if query.contains("as $t") {
-                continue;
-            }
             let (out, reindexes) = outputs_and_reindexes_in::<YqSemantics>(doc, query);
             assert_eq!(out, [yq_want], "yq: {query}");
-            assert!(
-                reindexes <= bound,
-                "yq: {query} reindexed {reindexes} times"
-            );
+            // The `range` body, `reduce` and `def` rows reach the string through
+            // `closed_unary_builtin`, which is jq mode only: yq's answer is the same, but its
+            // bridge stays as it was, so only the answer is pinned there.
+            if !query.contains("as $t") {
+                assert!(
+                    reindexes <= bound,
+                    "yq: {query} reindexed {reindexes} times"
+                );
+            }
         }
         // `if` takes the branch the verdict names.
         let query = "[.s | ascii_downcase | if length > 11 then 1 else 0 end]";

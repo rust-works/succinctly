@@ -10514,6 +10514,11 @@ pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<Owned
 /// the prefix/suffix tests and `contains` are [`eval_owned_door_arm`]'s, which decline a
 /// non-literal or non-string argument and leave every raised error to the bridge.
 ///
+/// #5712: `try`/`?` around an answer (it cannot raise, so no `catch` runs), and a comparison or
+/// boolean over such counts (`length > 5`), which [`eval_owned_pure_in`] settles with the
+/// condition doors on. Only an answer is taken: a comparison that raises (`.a > 1`), fans out or
+/// computes is `None`, and the bridge keeps its error.
+///
 /// Every answer is a fresh integer or boolean, never a subvalue of `input`, so it is admitted
 /// whatever the embed table holds, as [`eval_owned_length`]'s is. Any other builtin or input
 /// shape is `None`.
@@ -114318,8 +114323,10 @@ mod tests {
         }
     }
 
-    /// #5691, #5675: `eval_owned_string_door` answers `length`, `utf8bytelength`, `startswith("lit")`,
-    /// `endswith("lit")` and `contains("lit")` of an owned string the way the reindex bridge does, in both modes, and declines every other input
+    /// #5691, #5675: `eval_owned_string_door` answers `length`, `utf8bytelength`,
+    /// `startswith("lit")`, `endswith("lit")` and `contains("lit")` of an owned string (and, #5712,
+    /// `try`/`?` and comparisons or booleans over those) the way the reindex bridge does, in both
+    /// modes, and declines every other input
     /// and shape (a non-string input, a non-literal or non-string argument, a stage that computes
     /// or fans out), leaving those and their errors to the bridge.
     #[test]
@@ -114382,6 +114389,80 @@ mod tests {
             }
         }
         assert_eq!(answered, strings.len() * shapes.len());
+        // #5712: a comparison or boolean over those counts, and `try`/`?` around them, are
+        // answered too, and agree with the bridge in both modes (the bridge is the oracle for the
+        // order of a number against a string, and for yq's byte count).
+        let mut composed = 0;
+        for text in strings {
+            let value = OwnedValue::String(text.into());
+            for src in [
+                "length > 3",
+                "(length > 3)",
+                "length > \"a\"",
+                "length == 5",
+                "length > 3 and length < 99",
+                "length < 3 or startswith(\"z\")",
+                "length > 100 and .a",
+                "length < 100 or .a",
+                "try length",
+                "length?",
+                "try (length > 3) catch \"c\"",
+                ". == \"abc\"",
+                ". < \"z\"",
+                ". == null",
+                ". == 1e1000",
+            ] {
+                let expr = parse(src).unwrap();
+                let jq_fast = eval_owned_string_door::<JqSemantics>(&expr, &value)
+                    .unwrap_or_else(|| panic!("{src:?} on {text:?} declined"));
+                // yq refuses to order a number against a string, so that row is the bridge's
+                // error there and the door declines.
+                let yq_fast = eval_owned_string_door::<YqSemantics>(&expr, &value);
+                assert_eq!(
+                    yq_fast.is_none(),
+                    src == "length > \"a\"",
+                    "{src:?} on {text:?} in yq mode"
+                );
+                composed += 1;
+                let jq = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, &value, false,
+                ));
+                let yq = debug_normalize(eval_owned_input_bridge::<Vec<u64>, YqSemantics>(
+                    &expr, &value, false,
+                ));
+                assert_eq!(
+                    debug_normalize(QueryResult::<Vec<u64>>::Owned(jq_fast)),
+                    jq,
+                    "jq mode: {src:?} on {text:?}"
+                );
+                if let Some(yq_fast) = yq_fast {
+                    assert_eq!(
+                        debug_normalize(QueryResult::<Vec<u64>>::Owned(yq_fast)),
+                        yq,
+                        "yq mode: {src:?} on {text:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(composed, strings.len() * 15);
+        // A composed shape that raises, fans out or computes is the bridge's: only an answer is
+        // taken, so the door declines and the error keeps the bridge's words.
+        let text = OwnedValue::String("abc".into());
+        for src in [
+            ".a > 1",
+            "length > 1 and .a",
+            "length < 1 or .a",
+            "try (.a > 1) catch \"c\"",
+            "(length > 1, 3)",
+            "length > (1, 3)",
+            "[length]",
+            "length > 1 | not",
+        ] {
+            assert!(
+                eval_owned_string_door::<JqSemantics>(&parse(src).unwrap(), &text).is_none(),
+                "{src}"
+            );
+        }
         // Not a string: the container arms and the bridge keep these.
         for value in [
             OwnedValue::Null,

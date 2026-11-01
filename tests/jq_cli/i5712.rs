@@ -128,6 +128,14 @@ fn the_residual_composed_string_length_shapes_answer_as_jq_does_5712() -> Result
         ("$s|(select(length>4)|length)//0", "5\n"),
         ("{a:($s|select(length>4)|length)}|.a", "5\n"),
         ("[\"x\",$s]|map(select(length>4))|length", "1\n"),
+        // A condition with two outputs forks the branch, as it does for a number.
+        (
+            "[$s|if (true,false) then 1 else 2 end]|tojson",
+            "\"[1,2]\"\n",
+        ),
+        // A right operand that would raise is never read when the left decides.
+        ("$s|(length>100 and .a)", "false\n"),
+        ("$s|(length<100 or .a)", "true\n"),
     ];
     for (filter, expected) in RESIDUAL {
         let (stdout, stderr, code) =
@@ -148,8 +156,10 @@ fn a_comparison_that_raises_still_raises_over_a_string_5712() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-n", "--arg", "s", "abc", "$s|.a>1"], None)?;
     assert_eq!((stdout.as_str(), code), ("", 5), "{stderr}");
     assert!(stderr.contains("Cannot index string"), "{stderr}");
-    let (stdout, stderr, code) =
-        run_jq_full(&["-n", "--arg", "s", "abc", "$s|try (.a>1) catch \"c\""], None)?;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "--arg", "s", "abc", "$s|try (.a>1) catch \"c\""],
+        None,
+    )?;
     assert_eq!((stdout.as_str(), stderr.as_str(), code), ("\"c\"\n", "", 0));
     Ok(())
 }
