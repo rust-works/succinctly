@@ -82126,27 +82126,41 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                     return Demand::Stop;
                 }
                 outcome = None;
+                let update_inert = update.inert;
                 let (update, update_reentry) = update.against::<S>(&state);
-                let substituted_update = substitute_fold_step(
-                    update,
-                    bindings,
-                    all_var_names,
-                    mark_loop_vars,
-                    S::TAG == EvalTag::Jq,
-                );
+                // #5745: an operand that reads no loop variable runs as it stands.
+                let update_rebuilt;
+                let substituted_update: &Expr = if update_inert {
+                    update
+                } else {
+                    update_rebuilt = substitute_fold_step(
+                        update,
+                        bindings,
+                        all_var_names,
+                        mark_loop_vars,
+                        S::TAG == EvalTag::Jq,
+                    );
+                    &update_rebuilt
+                };
                 // EXTRACT runs against each UPDATE output, not against `state`,
                 // so which copy it takes (#3181) is decided per output below,
                 // and the as-written copy is substituted only for an output
                 // the embed table witnesses.
-                let substituted_extract = extract.map(|ext| {
-                    substitute_fold_step(
-                        ext.hoisted,
-                        bindings,
-                        all_var_names,
-                        mark_loop_vars,
-                        false,
-                    )
-                });
+                let extract_rebuilt;
+                let substituted_extract: Option<&Expr> = match extract {
+                    Some(ext) if ext.inert => Some(ext.hoisted),
+                    Some(ext) => {
+                        extract_rebuilt = substitute_fold_step(
+                            ext.hoisted,
+                            bindings,
+                            all_var_names,
+                            mark_loop_vars,
+                            false,
+                        );
+                        Some(&extract_rebuilt)
+                    }
+                    None => None,
+                };
 
                 // #2180 WP3 review: one attempt, one clear -- see
                 // [`each_pattern_alternatives`]'s identical call and
@@ -82201,7 +82215,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                     // written or implicit, so the arms below decide once rather than
                     // twice (#2180 WP3 review: the `else if sink(..) == Demand::Stop`
                     // branch used to carry its own copy of the retry rule).
-                    let ext_flow = match &substituted_extract {
+                    let ext_flow = match substituted_extract {
                         Some(hoisted) => {
                             // Charged separately from the UPDATE bind above: a single
                             // UPDATE can fan out into far more EXTRACT evals than
@@ -82246,6 +82260,9 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                             let witnessed;
                             let (ext_expr, reentry) =
                                 match extract.and_then(|ext| ext.witnessed::<S>(&update_val)) {
+                                    Some(as_written) if extract.is_some_and(|ext| ext.inert) => {
+                                        (as_written, Reentry::REBUILT)
+                                    }
                                     Some(as_written) => {
                                         witnessed = substitute_fold_step(
                                             as_written,
@@ -82337,7 +82354,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
 
                 let step_state = core::mem::replace(&mut state, OwnedValue::Null);
                 let update_flow = fold_step_each::<S>(
-                    &substituted_update,
+                    substituted_update,
                     step_state,
                     optional,
                     update_reentry,
@@ -82345,7 +82362,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 );
 
                 let step_verdict =
-                    step_outcome.take(&update_flow, direct_pattern_retry(&substituted_update));
+                    step_outcome.take(&update_flow, direct_pattern_retry(substituted_update));
                 match step_verdict {
                     Some(FoldUpdateVerdict::Retry(update_val)) => {
                         state = update_val;
@@ -83412,6 +83429,8 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         };
         let all_var_names =
             all_var_names.get_or_insert_with(|| pattern_alternatives_var_names(patterns));
+        let update = update.inert_for(all_var_names);
+        let extract = extract.map(|ext| ext.inert_for(all_var_names));
         let mut state = init_val;
         // Recorded out-of-band for the usual reason: the per-element callback
         // can only answer `Demand`, so "why did the fold stop" has to be kept
@@ -164347,5 +164366,55 @@ mod never_identical_tests_5176 {
                 "{source} keeps the collecting route"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fold_operand_inert_tests_5745 {
+    use super::*;
+    use crate::jq::parse;
+
+    /// #5745: a fold operand runs as written only when binding a step cannot change it, and
+    /// nothing in it carries per-node memo state a copy would reset.
+    #[test]
+    fn test_fold_operand_is_inert_only_when_a_step_leaves_it_alone_5745() {
+        let names = vec!["e".to_string()];
+        for (source, inert) in [
+            (". + 1", true),
+            ("[.] | length", true),
+            (". + $other", true),
+            (". as $x | $x + 1", true),
+            (". + $e", false),
+            ("$e.a", false),
+            ("1 as $e | . + $e", false),
+            ("[.[] | . + $e]", false),
+            ("if $e then 1 else 2 end", false),
+            ("def f: . + 1; f", false),
+            ("def f(g): g; f(.)", false),
+        ] {
+            let expr = parse(source).unwrap();
+            assert_eq!(fold_operand_is_inert(&expr, &names), inert, "{source}");
+        }
+        // No loop variable at all (`reduce`'s `$_`-less spellings) is inert for any body without a definition.
+        assert!(fold_operand_is_inert(&parse(". + $e").unwrap(), &[]));
+    }
+
+    /// #5745: an operand is inert for the fold when both of its copies are.
+    #[test]
+    fn test_fold_operand_inert_for_checks_the_hoisted_and_the_written_copy_5745() {
+        let names = vec!["e".to_string()];
+        let plain = parse(". + 1").unwrap();
+        let reading = parse(". + $e").unwrap();
+        fn operand<'e>(hoisted: &'e Expr, as_written: Option<&'e Expr>) -> FoldOperand<'e> {
+            FoldOperand {
+                hoisted,
+                as_written,
+                inert: false,
+            }
+        }
+        assert!(operand(&plain, None).inert_for(&names).inert);
+        assert!(operand(&plain, Some(&plain)).inert_for(&names).inert);
+        assert!(!operand(&plain, Some(&reading)).inert_for(&names).inert);
+        assert!(!operand(&reading, None).inert_for(&names).inert);
     }
 }
