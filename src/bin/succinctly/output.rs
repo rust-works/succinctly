@@ -1164,7 +1164,10 @@ impl ColorScheme {
 
         // jq reads only the first eight fields, so only their bytes have to be UTF-8: a stray
         // byte in a ninth field is never looked at.
-        let bytes = value.as_encoded_bytes();
+        let Some(bytes) = os_str_bytes(value) else {
+            eprintln!("Failed to set $JQ_COLORS");
+            return Self::default();
+        };
         let read = bytes
             .iter()
             .enumerate()
@@ -1181,6 +1184,19 @@ impl ColorScheme {
                 Self::default()
             })
     }
+}
+
+/// The bytes of an environment value: all of them on unix, where a value is any byte string. On
+/// other platforms a value that is not Unicode has none to read, so it is treated as malformed.
+#[cfg(unix)]
+fn os_str_bytes(value: &std::ffi::OsStr) -> Option<&[u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    Some(value.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn os_str_bytes(value: &std::ffi::OsStr) -> Option<&[u8]> {
+    value.to_str().map(str::as_bytes)
 }
 
 /// Colorize a JSON string using ANSI escape codes.
