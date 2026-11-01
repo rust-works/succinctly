@@ -24,6 +24,12 @@ fn test_dom_write_single_quotes_a_flow_timestamp_5469() -> Result<()> {
             "a: [12:30:45, a?b, x]\n",
             "a: ['12:30:45', 'a?b', x]\nz: 1\n",
         ),
+        // `style = "flow"` turns a block list of them into a flow one: same quoting.
+        (
+            r#".a style="flow""#,
+            "a:\n  - 2001-12-14T21:59:43Z\n  - 12:30:45\n",
+            "a: ['2001-12-14T21:59:43Z', '12:30:45']\n",
+        ),
         // Block context leaves a timestamp bare.
         (
             ".z = 1",
