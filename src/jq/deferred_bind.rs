@@ -226,8 +226,20 @@ pub(crate) struct VarReads {
 
 /// [`VarReads`] of `body` for `$var`.
 pub(crate) fn var_reads(body: &Expr, var: &str) -> VarReads {
-    let (mut reads, mut heads) = (0usize, 0usize);
     let mut fields: Vec<String> = Vec::new();
+    let whole = count_var_reads(body, var, Some(&mut fields));
+    VarReads { fields, whole }
+}
+
+/// [`VarReads::whole`] alone, for a caller that asks on every fold evaluation and must not
+/// allocate the field list (#5540 review: it cost 1,286 instructions a call).
+pub(crate) fn var_read_whole(body: &Expr, var: &str) -> bool {
+    count_var_reads(body, var, None)
+}
+
+/// Whether `$var` is read anywhere but as the head of a field chain; `fields` collects the heads.
+fn count_var_reads(body: &Expr, var: &str, mut fields: Option<&mut Vec<String>>) -> bool {
+    let (mut reads, mut heads) = (0usize, 0usize);
     any_subexpr(body, &mut |e| {
         match e {
             Expr::Var(name) if name == var => reads += 1,
@@ -238,8 +250,10 @@ pub(crate) fn var_reads(body: &Expr, var: &str) -> VarReads {
                     }
                     if let Some(field) = field_read(&pair[1]) {
                         heads += 1;
-                        if !fields.contains(field) {
-                            fields.push(field.clone());
+                        if let Some(fields) = fields.as_deref_mut() {
+                            if !fields.contains(field) {
+                                fields.push(field.clone());
+                            }
                         }
                     }
                 }
@@ -248,10 +262,7 @@ pub(crate) fn var_reads(body: &Expr, var: &str) -> VarReads {
         }
         false
     });
-    VarReads {
-        fields,
-        whole: reads > heads,
-    }
+    reads > heads
 }
 
 /// Whether `body` reads `$var` anywhere but as the head of a field chain

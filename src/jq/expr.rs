@@ -94,11 +94,14 @@ pub struct Tracked {
     /// certify against (see [`Origin::Untracked`]).
     pub node: Option<BindOrigin>,
     /// The value is a fold's loop element handed on as itself, for jq's identity
-    /// short-circuit alone (#5540, `LoopVarSplice::Shared`): its storage is the
-    /// element's own, registered nowhere, so an in-place fold step may store it in the
-    /// accumulator as one `Rc` clone, as jq's `reduce` stores the `jv`. Every other
-    /// marker is an `as` binding's, which the #2889 embed table may track, and an
-    /// in-place step declines it (#3241, #4005).
+    /// short-circuit alone (#5540, `LoopVarSplice::Shared`), so an in-place fold step may
+    /// store it in the accumulator as one `Rc` clone, as jq's `reduce` stores the `jv`.
+    /// The storage can be a node the #2889 embed table registered (an element of a bound
+    /// document); the step is sound anyway because every write to the accumulator goes
+    /// through `Rc::make_mut`, which copies a container with a second strong reference
+    /// first, so neither the element nor the entry is ever written. The markers an `as`
+    /// binding makes, and the path markers, are not this: an in-place step declines them
+    /// (#3241, #4005).
     pub fold_share: bool,
 }
 

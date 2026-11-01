@@ -13268,11 +13268,12 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
         // short-circuit (#3896), read for its value: the clone shares the marker's
         // storage, which is all `apply_compare_op` needs. A marker is always a
         // container, so reading one sets `escaped`, and [`closed_expr_to_owned`]
-        // declines the answer unless an enclosing node reduced it to a scalar.
+        // declines the answer unless an enclosing node reduced it to a scalar --
+        // except a fold's identity-sharing marker (below).
         Expr::TrackedVar(marker) if S::TAG == EvalTag::Jq => {
-            // #5540: a fold's identity-sharing marker is the loop element's own storage,
-            // registered in no embed table, so storing it in the accumulator is one `Rc`
-            // clone, as in jq.
+            // #5540: a fold's identity-sharing marker is the loop element's own storage, so
+            // storing it in the accumulator is one `Rc` clone, as in jq. Every write copies a
+            // container with a second strong reference first (see [`Tracked::fold_share`]).
             if !marker.fold_share {
                 *escaped = true;
             }
@@ -13491,7 +13492,8 @@ enum OwnedAssignRhs<'f> {
 /// [`owned_assign_pipe_step`]'s, on the moved state (#5285).
 ///
 /// It runs while the #2889 embed table is live too (#3241): it reads no
-/// marker and no table entry, and a write to a container the table registered
+/// table entry, takes no `as` binding's marker (only a fold's `fold_share` one,
+/// whose storage it stores as one handle, #5540), and a write to a container the table registered
 /// copies it first (see [`fold_step_each`] for the argument in full). Only the
 /// fold loops take it there; [`eval_owned_reindex_free`]'s other callers stay
 /// off it under the table.
@@ -13530,6 +13532,17 @@ fn owned_assign_step<S: EvalSemantics>(
                 return None;
             }
             let bound = closed_expr_to_owned::<S>(source)?;
+            // #5540: `substitute_var` rebuilds a container as a literal, so a fold's shared
+            // element bound here would stop being one handle (`$v as $n | .x = $n`); the
+            // evaluator keeps it.
+            if matches!(bound, OwnedValue::Array(_) | OwnedValue::Object(_))
+                && any_subexpr(
+                    source,
+                    &mut |n| matches!(n, Expr::TrackedVar(m) if m.fold_share),
+                )
+            {
+                return None;
+            }
             return owned_assign_step::<S>(&substitute_var(body, var, &bound), state);
         }
         Expr::Assign { path, value } => (
@@ -13968,8 +13981,8 @@ fn path_has_state_key(path: &Expr) -> bool {
 /// does -- and a filter that raises, or yields nothing, declines to the
 /// evaluator's own route and text. The operands of the closed shape
 /// ([`closed_expr_shape`]) never read `.`; this is the other half, which does.
-/// A variable is never one of them: a fold's variable is spliced in as a
-/// literal before the step runs.
+/// A variable is never one of them, but for a fold's identity-sharing marker
+/// ([`Tracked::fold_share`], #5540): the loop variable is spliced in before the step runs.
 fn owned_state_expr_shape(expr: &Expr) -> bool {
     owned_state_expr_shape_in(expr, true)
 }
@@ -14008,6 +14021,10 @@ fn owned_state_expr_shape_in(expr: &Expr, calls: bool) -> bool {
             else_branch,
         } => shape(cond) && shape(then_branch) && shape(else_branch),
         Expr::Builtin(Builtin::ToString | Builtin::Type) => true,
+        // #5540: a fold's identity-sharing marker is one value with no effect, as the literal
+        // it replaced was; without it a state-reading filter that stores the loop variable
+        // (`(. // []) + [$r]`) left the owned route and copied the accumulator on every step.
+        Expr::TrackedVar(marker) => marker.fold_share,
         // A call to a `def` with no parameters, whose body is itself one of these. Inside a
         // `def`'s own body a call is not followed, so a definition that reaches itself, or
         // another, is never one of them, whatever a later pass does to the bodies.
@@ -79362,7 +79379,8 @@ fn fold_step_each<S: EvalSemantics>(
 /// under the table because it reads no table entry and no marker's identity (its
 /// right side and keys must be [`closed_expr_to_owned`], which reads an
 /// `Expr::TrackedVar` by value only and declines an answer that is a container
-/// carrying one, #4005 -- so a marker's node never reaches the accumulator, and
+/// carrying an `as` binding's, #4005 -- so that marker's node never reaches the accumulator
+/// (a fold's `fold_share` marker's does, as one `Rc` clone the write copies first, #5540), and
 /// #3181's witnessed UPDATE, which differs from the hoisted copy only in a
 /// marker's origin, answers the same value either way), and it never writes a
 /// container the table
@@ -82807,6 +82825,7 @@ fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
                 .any(|body| loop_var_can_reach_output(body, &wider))
     };
     let visit = |found: bool| if found { Visit::Found } else { Visit::Skip };
+    let reads_whole = |e: &Expr| reads_a_name_whole(e, names);
     search_subexpr(expr, &mut |e| match e {
         Expr::Var(v) if names.iter().any(|name| name == v) => Visit::Found,
         Expr::If {
@@ -82852,14 +82871,12 @@ fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
         // (`. + $a`, `. + [$a]`, `.x = $a`) when they read it whole; a field read
         // (`$r.score`) is a scalar spliced alone, which carries no identity. An
         // assignment's path is read by value, as a key.
-        Expr::Arithmetic { .. } => visit(raises_a_name(e) || reads_a_name_whole(e, names)),
-        Expr::Assign { value, .. }
-        | Expr::CompoundAssign { value, .. }
-        | Expr::AlternativeAssign { value, .. } => {
-            visit(raises_a_name(e) || reads_a_name_whole(value, names))
-        }
-        Expr::Update { filter, .. } => visit(raises_a_name(e) || reads_a_name_whole(filter, names)),
-        _ if is_assignment_expr(e) => visit(raises_a_name(e)),
+        Expr::Arithmetic { .. } => visit(raises_a_name(e) || reads_whole(e)),
+        // MetaAssign exists in yq mode only, where the gate is false.
+        Expr::Assign { value: rhs, .. }
+        | Expr::CompoundAssign { value: rhs, .. }
+        | Expr::AlternativeAssign { value: rhs, .. }
+        | Expr::Update { filter: rhs, .. } => visit(raises_a_name(e) || reads_whole(rhs)),
         _ => Visit::Descend,
     })
 }
@@ -82869,7 +82886,7 @@ fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
 fn reads_a_name_whole(expr: &Expr, names: &[String]) -> bool {
     names
         .iter()
-        .any(|name| super::deferred_bind::var_reads(expr, name).whole)
+        .any(|name| super::deferred_bind::var_read_whole(expr, name))
 }
 
 /// Whether `expr` mentions one of `names` as a variable anywhere.
@@ -82944,14 +82961,12 @@ pub(crate) fn fold_loop_var_projection<S: EvalSemantics>(
 /// one place a marker costs anything is an assignment (below).
 ///
 /// An assignment's path and right-hand side are read by value and mostly keys
-/// and scores. A marker there is read by value (#4005), so one whose answer is a
-/// scalar -- a key, a field, a comparison -- keeps the in-place step, and one
-/// whose answer is a container makes `owned_assign_step` decline
-/// (`closed_expr_to_owned`), copying the accumulator on every step
+/// and scores. A fold's marker there is read by value (#4005) and an answer that is
+/// a container is stored as one handle (#5540), so the in-place step runs either way
 /// (`fold_assign_step_copies_nothing_3138`). Only an explicit `==`/`!=` there
-/// counts, so `.[$r.name] += ($r | f)` keeps its in-place step and a comparison
-/// hidden behind that call keeps the rebuilt operands (NaN-bearing containers
-/// only).
+/// counts here, so `.[$r.name] += ($r | f)` keeps its literal operands and a comparison
+/// hidden behind that call keeps the rebuilt ones (NaN-bearing containers only), while
+/// a whole read on the right-hand side is [`loop_var_can_reach_output`]'s.
 fn loop_var_can_be_compared(expr: &Expr, names: &[String]) -> bool {
     fn is_equality(e: &Expr) -> bool {
         matches!(
@@ -104974,6 +104989,62 @@ mod tests {
         }
     }
 
+    /// #5540: the same positions with a fold's identity-sharing marker (`fold_share`) are
+    /// answered in place, the element's storage stored as one handle, where the `as` binding's
+    /// marker of `owned_assign_step_declines_markers_3241` declines. An `as` rebind of it
+    /// (`$m as $n | .a = $n`) declines again, since `substitute_var` would rebuild the container
+    /// as a literal and the handle would be lost.
+    #[test]
+    #[cfg_attr(
+        feature = "unshared-containers",
+        ignore = "holdout has no node identity or sharing (#5254)"
+    )]
+    fn owned_assign_step_stores_a_fold_share_marker_as_one_handle_5540() {
+        let value = OwnedValue::array_from(vec![OwnedValue::Int(7)]);
+        let marker = |fold_share| {
+            Expr::TrackedVar(Rc::new(Tracked {
+                value: value.clone(),
+                origin: Origin::Untracked,
+                node: None,
+                fold_share,
+            }))
+        };
+        let state = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(0))]);
+        let assign = |m: Expr| Expr::Assign {
+            path: Box::new(Expr::Field("a".to_string())),
+            value: Box::new(m),
+        };
+        // Declined for an `as` binding's marker, handled for the fold's.
+        assert!(matches!(
+            try_owned_assign_step::<JqSemantics>(&assign(marker(false)), state.clone()),
+            OwnedStep::Declined(_)
+        ));
+        let OwnedStep::Handled(Ok(OwnedValue::Object(written))) =
+            try_owned_assign_step::<JqSemantics>(&assign(marker(true)), state.clone())
+        else {
+            panic!("a fold's marker was declined"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step declined a fold_share marker, which closed_expr_to_owned accepts (#5540)"
+        };
+        assert!(
+            written
+                .get("a")
+                .is_some_and(|stored| stored.shares_storage_with(&value)),
+            "the stored element is the marker's own storage, not a rebuilt copy"
+        );
+        // `$m as $n | .a = $n`: rebinding would rebuild the container as a literal.
+        let rebind = Expr::As {
+            expr: Box::new(marker(true)),
+            var: "n".to_string(),
+            body: Box::new(Expr::Assign {
+                path: Box::new(Expr::Field("a".to_string())),
+                value: Box::new(Expr::Var("n".to_string())),
+            }),
+        };
+        assert!(matches!(
+            try_owned_assign_step::<JqSemantics>(&rebind, state),
+            OwnedStep::Declined(_)
+        ));
+    }
+
     /// #4005: a marker read for a scalar -- a key, a field, a comparison of two
     /// of them -- carries none of the binding's identity into the accumulator, so
     /// the owned step answers it. `$m == $m` over a NaN-bearing container is `true`
@@ -105188,9 +105259,10 @@ mod tests {
 
     /// #3896: a fold shares its container loop variables' storage only where its
     /// UPDATE or EXTRACT both reads one and can compare it by value, or (#5516) can
-    /// hand it out of the step, and never in yq mode. An assignment's path and
-    /// right-hand side, and arithmetic, keep the in-place step
-    /// (`fold_assign_step_copies_nothing_3138`) unless they hold a `==`/`!=`.
+    /// hand it out of the step, and never in yq mode. An assignment's path and a
+    /// field read (`$r.score`) share nothing unless they hold a `==`/`!=`; an
+    /// assignment's right-hand side and arithmetic that read the variable whole
+    /// (#5540) do, and run in place (`fold_stores_of_a_container_loop_variable_copy_nothing_5540`).
     #[test]
     fn fold_loop_variable_identity_gate_3896() {
         fn gate<S: EvalSemantics>(src: &str) -> bool {
@@ -105240,8 +105312,9 @@ mod tests {
             // #5540: an assignment or arithmetic that stores the variable hands it on too;
             // the in-place step takes the marker (`Tracked::fold_share`).
             "reduce . as $a ([]; . + [$a])",
-            "reduce . as $a (.; .x = $a)",
             "reduce . as $a ({}; .x = $a)",
+            "reduce . as $a ({}; .x += $a)",
+            "reduce . as $a ({}; .x //= $a)",
             "reduce . as $a ({}; .x |= $a)",
             "reduce . as $a ({}; . + {x: $a})",
             "reduce . as $a (null; . + $a)",
@@ -105274,10 +105347,13 @@ mod tests {
             "reduce . as $a (0; . == 1)",
             "reduce . as $a (0; $b == $b)",
             // An assignment's path and right-hand side run by value: a call or
-            // builtin there must not make `owned_assign_step` decline.
+            // builtin there must not make `owned_assign_step` decline (a field read).
             "reduce .[] as $r ({}; .[$r.name] = $r.score)",
             "reduce .[] as $r ({}; .x[$r.name] += $r.score)",
             "reduce .[] as $r ({}; .[$r.name] += ($r.score | floor))",
+            // #5540: a field read is a scalar spliced alone and shares nothing.
+            "reduce .[] as $r (0; . + $r.score)",
+            "reduce .[] as $r ([]; . + [$r.id])",
             // #5516: an `if` condition, `and` and `or` answer a boolean.
             "reduce . as $a (null; if $a then 1 else 0 end)",
             "reduce . as $a (null; $a and true)",
@@ -160225,6 +160301,34 @@ mod share_audit_2999 {
             &json,
             "reduce .[] as $r ({n: 0, l: []}; .l += [$r.score] | .n += 1)",
             &[(Kind::ArrayMakeMut, 1)],
+        );
+    }
+
+    /// #5540: a step that stores a container loop variable runs in place with the fold's shared
+    /// marker (`Tracked::fold_share`), in a single assignment, in a state-reading filter and as a
+    /// non-first stage of a pipe. Each of the last two left the owned route when only the first
+    /// was taught the marker, and copied the accumulator on every step: 4x per doubling.
+    #[test]
+    fn fold_stores_of_a_container_loop_variable_copy_nothing_5540() {
+        let body: Vec<String> = (0..1000)
+            .map(|i| format!("{{\"name\":\"u{i}\",\"tags\":[{i}]}}"))
+            .collect();
+        let json = format!("[{}]", body.join(",")).into_bytes();
+        for filter in [
+            "reduce .[] as $r ([]; . + [$r])",
+            "reduce .[] as $r ({}; .[$r.name] = $r)",
+            "reduce .[] as $r ({}; . + {($r.name): $r})",
+            "reduce .[] as $r ({}; .[$r.name] |= (. // $r))",
+            "reduce .[] as $r ({}; .n += 1 | .rows += [$r])",
+            "reduce .[] as $r ({}; .n += 1 | .l = .l + [$r])",
+        ] {
+            assert_forced(&json, filter, &[]);
+        }
+        // One small array per key, as `|= [.] + [$r.score]` above: none of the 1,000-key state.
+        assert_forced(
+            &json,
+            "reduce .[] as $r ({}; .[$r.name] |= ((. // []) + [$r]))",
+            &[(Kind::ArrayUnwrap, 1000)],
         );
     }
 

@@ -8195,9 +8195,9 @@ Three differences remain, all in the direction of erroring rather than aborting:
   thread it through.
   `succinctly jq` has the same net for the evaluator's own splice sites
   ([#5526](https://github.com/rust-works/succinctly/issues/5526)).
-  `+=`, `//=` and a fold's `$x` read by an assignment or arithmetic (`reduce f as $x ([]; . + [$x])`) on a value built past 384 levels
+  `+=`, `//=` and a fold's `$x` read where a step cannot hand it on (`reduce f as $x (0; if $x then 1 else 2 end)`) on a value built past 384 levels
   assert the ceiling where they splice it back into the AST, with no `Result` to thread it through.
-  `last(f)` was one of them until [#5516](https://github.com/rust-works/succinctly/issues/5516), which hands the value on instead of splicing it, so `last(f(400)) | length` answers `1` as jq does.
+  `last(f)` was one of them until [#5516](https://github.com/rust-works/succinctly/issues/5516), which hands the value on instead of splicing it, so `last(f(400)) | length` answers `1` as jq does; a step that stores the variable by assignment or arithmetic (`reduce f as $x ([]; . + [$x])`) joined it in [#5540](https://github.com/rust-works/succinctly/issues/5540).
   They exited 101 with a raw panic; the three CLI routes and the library's `jq::eval` now catch exactly that panic.
   The CLI reports `nesting depth exceeds limit of 384` at exit 5, the same refusal `reduce` gives.
   `jq::eval` returns it as a `resource_limit` error.
@@ -10708,7 +10708,8 @@ side and the assignment is answered in place. jq mode only.
 An *explicit* `==`/`!=` on a container loop variable (`.[$r.name] = ($r ==
 $r)`, `($r.a == $r.b)`) is still not answered: #3896 substitutes such a
 variable as a storage-sharing marker so jq's identity short-circuit holds
-(`[nan] == [nan]`), and a marker is never closed (#3241). The ordering
+(`[nan] == [nan]`), and an `as` binding's marker is never closed (#3241); a fold's
+marker is, since #5540, so an equality hidden in an assignment there is answered in place. The ordering
 comparisons and equality on a scalar loop variable are unaffected.
 
 **An `as` bind around the assignment
@@ -10748,9 +10749,9 @@ owns them (#3178). That scope is structural: a later arm added to
 
 It is sound for two reasons, each pinned by a test rather than argued:
 
-- The step reads neither the table nor a marker. Its right side and every key
-  must be `closed_expr_to_owned`, and an `Expr::TrackedVar` is never closed,
-  so the UPDATE #3181's per-step witness hands a step (which always carries a
+- The step reads neither the table nor an `as` binding's marker. Its right side and every key
+  must be `closed_expr_to_owned`, and an `Expr::TrackedVar` is never closed unless it is a
+  fold's identity-sharing marker (`Tracked::fold_share`, #5540), so the UPDATE #3181's per-step witness hands a step (which always carries a
   marker) declines to the evaluator's route, exactly as before
   (`owned_assign_step_declines_markers_3241`).
 - It never writes a container the table registered in place. A registered
@@ -11906,7 +11907,8 @@ The shortcut fires only where `==` is handed two handles on one storage, so the 
   ([#5516](https://github.com/rust-works/succinctly/issues/5516)).
   So `[nan] as $a | last($a) == $a` and `reduce $a as $v (null; [$v]) | .[0] == $a` are `true`, as in jq (`last(f)` is `reduce f as $x (null; $x)`).
   A step that stores the variable by assignment or arithmetic does too ([#5540](https://github.com/rust-works/succinctly/issues/5540)): `reduce $a as $v ({}; .x = $v) | .x == $a`, `reduce $a as $v ([]; . + [$v]) | .[0] == $a` and jq's own spelling of `add`, `reduce $a[] as $v (null; . + $v)`, are `true`.
-  The marker those steps take is the element's own storage, registered in no embed table, so the in-place step stores it as one `Rc` clone (`Tracked::fold_share`); a marker an `as` binding made still makes the step decline (#3241, #4005).
+  The marker those steps take is the element's own storage, so the in-place step stores it as one `Rc` clone (`Tracked::fold_share`); the storage may be a node the embed table registered, which is why every write copies a container with a second strong reference first (#3241). A marker an `as` binding made still makes the step decline (#3241, #4005), and so does an `as` rebind of the fold's (`$v as $n | .x = $n`), which would rebuild the container as a literal.
+  Peak memory of these folds is higher: the accumulator keeps the materialized element where it kept a compact rebuilt copy (+13% to +42% peak RSS on 40,000 records, linear).
 - **An `as` destructuring** ([#5539](https://github.com/rust-works/succinctly/issues/5539)).
   A container a pattern binds from a value that names no node of the document is spliced as the same kind of marker, wherever the body reads the name other than in an assignment's or arithmetic's operands.
   So `[[nan]] as $a | $a as [$x] | $x == $a[0]` is `true`, as in jq, and `$a as [$x] | $x == [nan]`, a fresh container, stays `false`.
@@ -11914,6 +11916,12 @@ The shortcut fires only where `==` is handed two handles on one storage, so the 
 
 Still different:
 
+- **Spellings of a fold step that stores its loop variable that still rebuild it** ([#5761](https://github.com/rust-works/succinctly/issues/5761), #5540 follow-up).
+  `reduce $a as $v (null; . += $v) | . == $a` (the compound spelling of jq's own `add`), `(.x, .y) += $v`, `(.x += $v)?`, an `as` rebind (`$v as $w | .x = $w`) and a container-valued field read stored on its own (`.x = $r.items`) are `false` here and `true` in jq.
+  A whole-variable read in a sibling stage shares the node (`.y = $r | .x = $r.items`), so the answer follows an unrelated read.
+  Two spellings answer `true` where jq says `false`, because a stage returns the handle of its input where jq builds a new container: a slice assigned onto `null` (`reduce $a as $v (null; .[1:] = $v) | . == $a`) and an out-of-range `del` (`$v | del(.[5])`).
+  Both roots predate the fold change (`[nan] as $a | null | .[1:] = $a | . == $a` is already `true`) and are reached in a fold now that the step shares the element.
+  The comparison needs a NaN-bearing container to observe any of this.
 - **Slices.** `.[0:]` and any other full-range slice hand back the array itself, as jq's view
   does. An equal-bounds *partial* slice is a view onto the same storage in jq (pointer, offset
   and size all equal), so `.[0:1] == .[0:1]` is identical there; here each slice is a new
