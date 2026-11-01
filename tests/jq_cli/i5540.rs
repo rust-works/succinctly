@@ -50,9 +50,8 @@ fn test_fold_step_that_stores_its_loop_variable_keeps_the_element_5540() -> Resu
     Ok(())
 }
 
-/// A slice assigned onto `null` and an out-of-range `del` return the handle of their input where jq
-/// builds a new container (#5761), so a store through either keeps the literal operand: `==` stays
-/// `false` as in jq 1.7.1, and as before the fold change.
+/// A slice assigned onto `null` and an out-of-range `del` build a new container, as jq does (#5761),
+/// so a store through either is `false` under `==` in a fold too.
 #[test]
 fn test_store_through_a_slice_or_del_stays_unshared_5761() -> Result<()> {
     for filter in [
