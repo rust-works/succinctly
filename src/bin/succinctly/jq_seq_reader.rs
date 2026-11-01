@@ -315,23 +315,6 @@ pub(crate) fn stream_bytes(
         .skip(bom_prefix(raw_bytes).consumed)
 }
 
-/// [`stream_bytes`], with each byte's offset in the *undecorated* stream --
-/// BOM bytes counted, though (as there) never yielded.
-///
-/// Absolute offsets, so a caller can compare one against a position it
-/// worked out itself over the same sources: a file boundary, a newline.
-/// Numbering the yielded bytes from zero instead would silently shift
-/// every offset by the BOM's width.
-fn indexed_stream_bytes(
-    raw_bytes: &[(Option<usize>, Vec<u8>)],
-) -> impl Iterator<Item = (usize, u8)> + '_ {
-    raw_bytes
-        .iter()
-        .flat_map(|(_, raw)| raw.iter().copied())
-        .enumerate()
-        .skip(bom_prefix(raw_bytes).consumed)
-}
-
 /// jq's own reader over this `--seq` stream's raw bytes: the one walk that
 /// decides every `jq: ignoring parse error: ...` line (handed to `emit`, in
 /// order), the values jq yields ([`SeqStreamWalk::values`]) and `-s`'s EOF
@@ -369,6 +352,27 @@ pub(crate) fn walk_stream_collecting(
     collect_faults: bool,
     emit: &mut dyn FnMut(&str),
 ) -> SeqStreamWalk {
+    walk_stream_placing(raw_bytes, slurp, collect_faults, true, emit)
+}
+
+/// [`walk_stream`] for a caller that wants the values and the verdicts but not where jq's reader
+/// stood at each one (#5674): `locations` comes back empty, which spares the pass over the
+/// stream's `fgets` chunks that [`value_locations`] makes.
+pub(crate) fn walk_stream_values(
+    raw_bytes: &[(Option<usize>, Vec<u8>)],
+    slurp: bool,
+    emit: &mut dyn FnMut(&str),
+) -> SeqStreamWalk {
+    walk_stream_placing(raw_bytes, slurp, false, false, emit)
+}
+
+fn walk_stream_placing(
+    raw_bytes: &[(Option<usize>, Vec<u8>)],
+    slurp: bool,
+    collect_faults: bool,
+    place_values: bool,
+    emit: &mut dyn FnMut(&str),
+) -> SeqStreamWalk {
     let bom = bom_prefix(raw_bytes);
     let mut reader = Reader::new(bom, emit);
     reader.collect_faults = collect_faults;
@@ -376,7 +380,7 @@ pub(crate) fn walk_stream_collecting(
     // first begins its own `jv_parser_next` -- whose malformed-BOM reset the
     // walk must reproduce (#3002). The offsets are the sources' absolute
     // boundaries (the end of each but the last, i.e. the start of each
-    // subsequent one), matching `indexed_stream_bytes`'s undecorated
+    // subsequent one), matching the undecorated
     // numbering. The last of these ends is the stream's whole length,
     // reused below instead of a second `.sum()` over the same sources --
     // both `final_buffer_start` and the EOF answer need it.
@@ -400,7 +404,17 @@ pub(crate) fn walk_stream_collecting(
     }
     reader.drops_at_first_empty_record = !slurp;
     reader.defers_eof_warning = slurp;
-    reader.run(indexed_stream_bytes(raw_bytes), &boundaries);
+    // One buffer, so `run` can look ahead; only a multi-source stream is copied into one.
+    let combined: std::borrow::Cow<'_, [u8]> = match raw_bytes {
+        [(_, only)] => std::borrow::Cow::Borrowed(only.as_slice()),
+        _ => std::borrow::Cow::Owned(
+            raw_bytes
+                .iter()
+                .flat_map(|(_, raw)| raw.iter().copied())
+                .collect(),
+        ),
+    };
+    reader.run(&combined, bom.consumed, &boundaries);
     // The same pass answers `--seq -s`'s EOF-location question; see the
     // field's docs for the rule. `final_buffer_start == total` is how
     // [`final_buffer_start`] spells an *empty* final buffer.
@@ -441,7 +455,7 @@ pub(crate) fn walk_stream_collecting(
         slurp_position_lost,
         // Only non-slurp output names a location per value; `-s` would throw
         // this pass away.
-        locations: if slurp {
+        locations: if slurp || !place_values {
             Vec::new()
         } else {
             debug_assert_eq!(reader.yielded_at.len(), reader.values.len());
@@ -593,7 +607,7 @@ pub(crate) struct SeqStreamWalk {
     pub(crate) slurp_position_lost: bool,
     /// The byte range of every value jq yields, in order, as absolute
     /// offsets into the concatenated raw sources (BOM bytes counted, the
-    /// numbering [`indexed_stream_bytes`] uses). Already cut at real jq's
+    /// numbering [`Reader::run`] uses). Already cut at real jq's
     /// non-slurp end-of-stream drop (#2998), since the walk stops there.
     ///
     /// Raw, like everything else this walk answers (#3247). The values used
@@ -950,10 +964,15 @@ impl<'a> Reader<'a> {
     /// boundary whose source yields no byte at all (an empty trailing file,
     /// or content eaten wholesale by the BOM prefix) still cost jq that
     /// refill, so its reset fires before the EOF branch instead.
-    fn run(&mut self, bytes: impl Iterator<Item = (usize, u8)>, boundaries: &[usize]) {
+    ///
+    /// Walks `data` from `skip` (the bytes jq's BOM handling consumed, which are never scanned
+    /// but are counted in every offset).
+    fn run(&mut self, data: &[u8], skip: usize, boundaries: &[usize]) {
         let mut boundary = 0;
         let mut eof_offset = 0;
-        for (offset, ch) in bytes {
+        let mut offset = skip;
+        while offset < data.len() {
+            let ch = data[offset];
             self.offset = offset;
             eof_offset = offset + 1;
             while boundary < boundaries.len() && boundaries[boundary] <= offset {
@@ -962,6 +981,28 @@ impl<'a> Reader<'a> {
                 }
                 boundary += 1;
             }
+            // #5674: a run of ordinary string bytes is `scan`'s `token_add` and a column each, and
+            // nothing else -- no value completes, no diagnostic is raised, no line starts -- so it
+            // is taken at once. Not under `resets_per_call`, which wipes the parser at the
+            // `fgets` boundaries inside the run.
+            if self.st == St::Str && !self.resets_per_call {
+                let run = data[offset..]
+                    .iter()
+                    .position(|&b| matches!(b, b'"' | b'\\' | b'\n' | ASCII_RS))
+                    .unwrap_or(data.len() - offset);
+                if run > 0 {
+                    self.token_add_all(&data[offset..offset + run]);
+                    self.column += run;
+                    self.last_ch_was_ws = false;
+                    self.offset = offset + run - 1;
+                    eof_offset = offset + run;
+                    self.last_byte_yielded_value = false;
+                    self.produced_value = false;
+                    offset += run;
+                    continue;
+                }
+            }
+            offset += 1;
             if self.st == St::WaitingForRs {
                 if ch == b'\n' {
                     self.line += 1;
@@ -981,7 +1022,7 @@ impl<'a> Reader<'a> {
                 && !ch.is_ascii_whitespace()
                 && ch != ASCII_RS
             {
-                self.value_start = Some(offset);
+                self.value_start = Some(self.offset);
             }
             if let Err(category) = self.scan(ch) {
                 let (line, column) = (self.line, self.column);
@@ -1137,6 +1178,18 @@ impl<'a> Reader<'a> {
             };
         }
         Ok(())
+    }
+
+    /// [`Reader::token_add`] for each byte of `bytes`. The growth differs from byte-at-a-time
+    /// (the buffer only ever holds zeros past `token_len` or bytes an earlier token left, in both),
+    /// and `check_literal` reads nothing past index 1.
+    fn token_add_all(&mut self, bytes: &[u8]) {
+        let end = self.token_len + bytes.len();
+        while end > self.token_buf.len() {
+            self.token_buf.resize(self.token_buf.len() * 2 + 256, 0);
+        }
+        self.token_buf[self.token_len..end].copy_from_slice(bytes);
+        self.token_len = end;
     }
 
     /// jq's `tokenadd`, including its growth policy -- the buffer only
@@ -1537,6 +1590,30 @@ mod tests {
 
     fn assert_warnings(input: &[u8], expected: &[&str]) {
         assert_eq!(warnings(&[input]), expected, "input: {input:?}");
+    }
+
+    /// #5674: the walk takes a run of ordinary string bytes at once. A string long enough to
+    /// grow the token buffer, one cut by every byte the run stops at, and one ending the stream
+    /// all give the values and warnings the byte-at-a-time walk gives.
+    #[test]
+    fn string_runs_are_walked_as_bytes_5674() {
+        let long = "x".repeat(700);
+        let stream = format!("\x1e{{\"a\":\"{long}\",\"b\":\"p\\\"q\\\\r\"}}\n\x1e\"{long}\"\n");
+        let bytes = stream.as_bytes();
+        let first_end = stream.find("}\n").unwrap() + 1;
+        assert_eq!(
+            walk_values(&[bytes], false),
+            vec![(1, first_end), (first_end + 2, bytes.len() - 1)]
+        );
+        assert_warnings(bytes, &[]);
+        // Cut inside a long string by the next RS: the same warning at the same place.
+        let cut = format!("\x1e\"{long}\x1e1\n");
+        assert_warnings(cut.as_bytes(), &["Truncated value at line 1, column 703"]);
+        // A string with a raw newline in it counts the line, and one still open at EOF reports it.
+        assert_warnings(
+            format!("\x1e\"{long}\n{long}").as_bytes(),
+            &["Unfinished string at EOF at line 2, column 700"],
+        );
     }
 
     /// [`SeqStreamWalk::values`] over the given sources.

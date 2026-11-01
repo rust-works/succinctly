@@ -4917,6 +4917,9 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         && !output_config.raw_output0
         && !output_config.unbuffered
         && !output_config.ascii_output
+        // #5674: the streamer writes no RS before a record, which `--seq` input reaching this
+        // route has to see.
+        && !output_config.seq
         && context.named.is_empty();
 
     // Indent width/unit for the fast path's streamer -- built directly from
@@ -5104,21 +5107,39 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // route now indexes one synthesized `[v1,v2,...]` buffer instead
     // (`slurp_documents`). `-n -s` is still excluded by the `!args.null_input`
     // test below, and `-R`/`--seq`/DSV `-s` stay on the materializing path.
-    let can_use_lazy_path = !args.raw_input
+    //
+    // #5674: `--seq` input joins them when the stream is clean (see
+    // [`seq_plain_json_inputs`]): the records are then a plain JSON stream, and reading them as
+    // one skips the per-record index the materializing route builds.
+    // Everything but `--seq` itself that the lazy route requires, named once so the probe below
+    // and the route's own gate cannot drift apart.
+    let lazy_route_open = !args.raw_input
         && args.input_dsv.is_none()
-        && !args.seq // seq input mode parses differently
         && !args.stream // the program reads tostream events, not documents (#4397)
         && !args.stream_errors // ... read by jq's own streaming parser (#5474)
         && !uses_input_builtins;
+    let mut seq_plain: Option<PreparedInputs> =
+        if args.seq && lazy_route_open && !args.validate && !args.null_input {
+            seq_plain_json_inputs(&args)?
+        } else {
+            None
+        };
+    // `--seq` input otherwise parses differently.
+    let can_use_lazy_path = lazy_route_open && (!args.seq || seq_plain.is_some());
 
     if can_use_lazy_path && !args.null_input {
         // Lazy path: read files as raw bytes and process directly
         // This preserves original number formatting like "4e4"
-        let files = get_input_files(&args);
-        let (files, mut raw_inputs, failures) = if files.is_empty() {
-            (files, vec![read_stdin_bytes()?], Vec::new())
-        } else {
-            read_input_files(&files)
+        let (files, mut raw_inputs, failures) = match seq_plain.take() {
+            Some(prepared) => prepared,
+            None => {
+                let files = get_input_files(&args);
+                if files.is_empty() {
+                    (files, vec![read_stdin_bytes()?], Vec::new())
+                } else {
+                    read_input_files(&files)
+                }
+            }
         };
         // A slurp reads every file in the one fetch that meets the first failure, so it
         // reports them all up front and cuts nothing. Otherwise jq reports a file when its
@@ -7869,8 +7890,18 @@ fn utf8_lossy_document(raw: Vec<u8>, seam: Option<&mut Seam>) -> Vec<u8> {
     }
 }
 
+thread_local! {
+    /// Stdin's bytes, read by [`seq_plain_json_inputs`] and handed back when the stream is not
+    /// the clean kind it serves (#5674): stdin can be read once, and the materializing route
+    /// reads it through [`read_stdin_bytes`].
+    static STDIN_PUSHBACK: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
 /// Read stdin to bytes.
 fn read_stdin_bytes() -> Result<Vec<u8>> {
+    if let Some(bytes) = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take()) {
+        return Ok(bytes);
+    }
     let mut buf = Vec::new();
     std::io::stdin()
         .read_to_end(&mut buf)
@@ -8928,6 +8959,104 @@ fn json_depth_at_most(bytes: &[u8], limit: usize) -> bool {
         }
     }
     true
+}
+
+/// The inputs a run reads: the files that opened, their bytes, and the ones that did not.
+type PreparedInputs = (Vec<PathBuf>, Vec<Vec<u8>>, OpenFailures);
+
+/// `--seq` input as the plain JSON stream it is when nothing about it is unusual (#5674).
+///
+/// A `--seq` stream is read by the materializing route: [`jq_seq_reader::walk_stream`] finds
+/// each record, and each is indexed and converted to an owned value on its own, which costs a
+/// query that touches the records 2.2x-2.9x of jq's time. A clean stream needs none of it:
+/// with each RS byte (`0x1e`) turned into a space, the text is a plain JSON stream with every
+/// offset and line where it was, and the lazy route reads that as it reads NDJSON.
+///
+/// "Clean" is decided by the same walk the materializing route runs, not a second reader: no
+/// diagnostic, no deferred or lost position, one source, valid UTF-8, no byte-order mark, and
+/// nothing between the walk's values but JSON whitespace -- so the lazy route finds the values
+/// the walk found, and no others. Anything else gets its bytes back unchanged (stdin through
+/// [`STDIN_PUSHBACK`], a file by being read again) and takes the route it always took.
+fn seq_plain_json_inputs(args: &JqCommand) -> Result<Option<PreparedInputs>> {
+    let named = get_input_files(args);
+    let from_stdin = named.is_empty();
+    let (files, mut raws, failures) = if from_stdin {
+        (named, vec![read_stdin_bytes()?], Vec::new())
+    } else {
+        read_input_files(&named)
+    };
+    // Stdin is one source that always opens, so a file list is all that can fail this.
+    if raws.len() != 1 || !failures.is_empty() {
+        return Ok(None);
+    }
+    let raw = raws.pop().unwrap_or_default();
+    match seq_stream_as_plain_json(raw, args.slurp) {
+        Ok(text) => Ok(Some((files, vec![text], failures))),
+        Err(raw) => {
+            if from_stdin {
+                STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(raw));
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// [`seq_plain_json_inputs`]' decision over one source's bytes: the stream with its RS bytes
+/// blanked when it is clean, the bytes as they were when it is not.
+fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Vec<u8>, Vec<u8>> {
+    // `0xEF` starts a byte-order mark, which jq's reader consumes (even a partial one).
+    if raw.first() == Some(&0xEF) || std::str::from_utf8(&raw).is_err() {
+        return Err(raw);
+    }
+    let mut sources = vec![(None, raw)];
+    let mut warned = false;
+    let walk = crate::jq_seq_reader::walk_stream_values(&sources, slurp, &mut |_| warned = true);
+    let Some((_, mut raw)) = sources.pop() else {
+        return Err(Vec::new()); // patchcov: coverage tolerate-line reason="unreachable: the one source pushed above"
+    };
+    if warned
+        || walk.deferred_warning.is_some()
+        || walk.slurp_position_lost
+        || walk.values.is_empty()
+    {
+        return Err(raw);
+    }
+    // `-s` wraps the values in one array, which is a level more than the deepest value has: a
+    // stream near the nesting ceiling keeps the route that places that error (#2847).
+    if slurp && !json_depth_at_most(&raw, LAZY_JSON_MAX_DEPTH) {
+        return Err(raw);
+    }
+    // Between values (and around them) only JSON whitespace or an RS byte may stand, and every RS
+    // byte of the stream stands there: one inside a value would be a character of it.
+    let separator = |&b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | ASCII_RS);
+    let mut gaps = Vec::with_capacity(walk.values.len() + 1);
+    let mut at = 0;
+    for &(start, end) in &walk.values {
+        if start < at || end > raw.len() || !raw[at..start].iter().all(separator) {
+            return Err(raw);
+        }
+        gaps.push((at, start));
+        at = end;
+    }
+    if !raw[at..].iter().all(separator) {
+        return Err(raw);
+    }
+    gaps.push((at, raw.len()));
+    let in_gaps: usize = gaps
+        .iter()
+        .map(|&(from, to)| raw[from..to].iter().filter(|&&b| b == ASCII_RS).count())
+        .sum();
+    if raw.iter().filter(|&&b| b == ASCII_RS).count() != in_gaps {
+        return Err(raw); // patchcov: coverage tolerate-line reason="defensive: an RS inside a value makes the walk warn (a truncated record), which returns above; kept so a walk that stopped warning cannot leave an RS in a value the lazy route then reads"
+    }
+    for (from, to) in gaps {
+        for b in &mut raw[from..to] {
+            if *b == ASCII_RS {
+                *b = b' ';
+            }
+        }
+    }
+    Ok(raw)
 }
 
 /// The byte range of every document of `raw`, when `-n` with `input`/`inputs` can convert them as
@@ -13303,6 +13432,51 @@ fn format_json_text(value: &OwnedValue, config: &OutputConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5674: a `--seq` stream is read as plain JSON only when nothing about it is unusual, and
+    /// is then the same text with each RS blanked (so every offset and line stays put); every
+    /// other stream comes back byte for byte, because stdin cannot be read twice.
+    #[test]
+    fn seq_stream_reads_as_plain_json_only_when_clean_5674() {
+        let clean: &[&[u8]] = &[
+            b"\x1e{\"a\":1}\n\x1e[2]\n",
+            b"\x1e{\n \"a\": \"x y\"\n}\n\x1e3 \n",
+            b"\x1e1\n\x1e\"a long string, with \\\"escapes\\\" in it\"\n",
+            b"\n\x1e\n\x1e{}\n\n",
+        ];
+        for raw in clean {
+            let got =
+                seq_stream_as_plain_json(raw.to_vec(), false).unwrap_or_else(|_| panic!("{raw:?}"));
+            let blanked: Vec<u8> = raw
+                .iter()
+                .map(|&b| if b == ASCII_RS { b' ' } else { b })
+                .collect();
+            assert_eq!(got, blanked, "{raw:?}");
+        }
+        let unusual: &[&[u8]] = &[
+            b"",
+            b"\x1e\x1e",
+            b"{\"a\":1}\n",                  // no RS at all
+            b"\xef\xbb\xbf\x1e{\"a\":1}\n",  // byte-order mark
+            b"\x1e{\"a\":\"\xff\"}\n",       // not UTF-8
+            b"\x1e{\"a\":1}\n\x1e{\"a\":\n", // truncated record: a warning
+            b"\x1e{\"a\":1}@\n",             // junk after a value
+            b"\x1e{\"a\":\"x\x1ey\"}\n",     // RS inside a string
+            b"\x1e1\x1e2\n",                 // a number cut off by the next RS
+            b"\x1e{\"a\":1} x\n",
+        ];
+        // `-s` adds a level to the deepest value, so a deep stream keeps the route that counts it.
+        let deep = format!("\x1e{}{}\n", "[".repeat(100), "]".repeat(100)).into_bytes();
+        assert!(seq_stream_as_plain_json(deep.clone(), false).is_ok());
+        assert_eq!(seq_stream_as_plain_json(deep.clone(), true), Err(deep));
+        for raw in unusual {
+            assert_eq!(
+                seq_stream_as_plain_json(raw.to_vec(), false),
+                Err(raw.to_vec()),
+                "{raw:?}"
+            );
+        }
+    }
 
     /// #5661: which plain-JSON streams `-n` with `input`/`inputs` converts as they are read. The
     /// route is for a stream with nothing to report: an error, a BOM, a number only jq reads or a
