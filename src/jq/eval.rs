@@ -26092,7 +26092,7 @@ pub(crate) fn getpath_walk_owned_segments<'a, W: Clone + AsRef<[u64]>, S: EvalSe
             // treatment (they still reject a slice descriptor, as yq's do).
             (OwnedValue::Object(map), OwnedValue::Object(desc)) if S::TAG == EvalTag::Yq => {
                 let range = match SliceBounds::from_descriptor(desc) {
-                    Ok(bounds) => bounds.resolve_object_children(map.len()),
+                    Ok(bounds) => bounds.resolve_object_children(map.occurrence_len()),
                     Err(_) if optional => return QueryResult::None,
                     Err(e) => return e.into(),
                 };
@@ -34528,11 +34528,12 @@ pub(crate) fn slice_owned_value_read<S: EvalSemantics>(
 /// file's cursor-backed `Expr::Slice` arm — both need the same rule, one
 /// definition.
 pub(crate) fn slice_object_as_yq_children(
-    map: &IndexMap<String, OwnedValue>,
+    map: &ObjectMap,
     start: Option<i64>,
     end: Option<i64>,
 ) -> OwnedValue {
-    let range = SliceBounds::from_literals(start, end).resolve_object_children(map.len());
+    let range =
+        SliceBounds::from_literals(start, end).resolve_object_children(map.occurrence_len());
     slice_object_children_at(map, range)
 }
 
@@ -34547,22 +34548,30 @@ pub(crate) fn slice_object_as_yq_children(
 /// of hand-copying it — the descriptor there carries bounds as `f64`, not
 /// the `i64` literals [`slice_object_as_yq_children`] itself takes, so it
 /// can't call that function directly.
-fn slice_object_children_at(
-    map: &IndexMap<String, OwnedValue>,
-    range: core::ops::Range<usize>,
-) -> OwnedValue {
-    let children: Vec<OwnedValue> = range
-        .map(|child_idx| {
-            let (k, v) = map
-                .get_index(child_idx / 2)
-                .expect("resolve_object_children never names an out-of-bounds entry");
-            if child_idx % 2 == 0 {
-                OwnedValue::String(k.clone().into())
-            } else {
-                v.clone()
+fn slice_object_children_at(map: &ObjectMap, range: core::ops::Range<usize>) -> OwnedValue {
+    // #5426: yq's child list holds one key/value pair per *entry*, a repeated key's earlier
+    // entries included, so the slice reads `occurrences()`, not the collapsed view.
+    let mut children: Vec<OwnedValue> = vec_with_capacity(range.len());
+    if !range.is_empty() {
+        let first_entry = range.start / 2;
+        let last_entry = (range.end - 1) / 2;
+        for (entry_idx, (k, v)) in map
+            .occurrences()
+            .enumerate()
+            .skip(first_entry)
+            .take(last_entry - first_entry + 1)
+        {
+            for child_idx in [entry_idx * 2, entry_idx * 2 + 1] {
+                if range.contains(&child_idx) {
+                    children.push(if child_idx % 2 == 0 {
+                        OwnedValue::String(k.clone().into())
+                    } else {
+                        v.clone()
+                    });
+                }
             }
-        })
-        .collect();
+        }
+    }
     OwnedValue::array_from(children)
 }
 
@@ -87712,7 +87721,8 @@ fn get_value_at_path(value: &OwnedValue, path: &[OwnedValue]) -> Option<OwnedVal
         }
         (OwnedValue::Object(desc), OwnedValue::Object(map)) => {
             let bounds = SliceBounds::from_descriptor(desc).ok()?;
-            let sliced = slice_object_children_at(map, bounds.resolve_object_children(map.len()));
+            let sliced =
+                slice_object_children_at(map, bounds.resolve_object_children(map.occurrence_len()));
             get_value_at_path(&sliced, &path[1..])
         }
         _ => None,
