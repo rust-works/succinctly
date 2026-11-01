@@ -180,32 +180,7 @@ issue = "#5634"
 reason = "`[range(1e8)] | length` under `ulimit -v` 512 MiB: jq 1.7.1 and succinctly both abort (killed by a signal, no exit status). Rust ends the process on a failed allocation (`memory allocation of N bytes failed`) where jq's `jv_mem_alloc` prints `cannot allocate memory` and aborts, so the output matches; a graceful error would need every container growth to be fallible."
 
 # G: colour and locale probes (#5552). Found with the per-probe `env` column; none is tracked yet, so they are `to-triage`.
-# JQ_COLORS: a field over the colour buffer rejects the whole variable in jq; an empty variable and a trailing empty field keep defaults.
 # strptime/strftime: libc in jq (locale-dependent, `%B` strict, weekday from the unset date fields); a fixed English implementation here.
-
-[[divergence]]
-id = "cli:jqcolors-overlong"
-category = "to-triage"
-issue = "#5750"
-reason = "`JQ_COLORS` with a 30-digit field: jq 1.7.1 prints `Failed to set $JQ_COLORS` and keeps every default colour; succinctly applies the long field to null."
-
-[[divergence]]
-id = "cli:jqcolors-many-semicolons"
-category = "to-triage"
-issue = "#5750"
-reason = "`JQ_COLORS=1;2;3;4;5;6;7;8;9` (one 17-byte field): jq 1.7.1 rejects the whole variable (`Failed to set $JQ_COLORS`) and keeps the defaults; succinctly applies it."
-
-[[divergence]]
-id = "cli:jqcolors-empty"
-category = "to-triage"
-issue = "#5751"
-reason = "`JQ_COLORS=` (set, empty): jq 1.7.1 keeps every default colour; succinctly sets the null colour to the empty string (`ESC[m`)."
-
-[[divergence]]
-id = "cli:jqcolors-empty-fields"
-category = "to-triage"
-issue = "#5751"
-reason = "`JQ_COLORS=:::` (four fields, the last empty): jq 1.7.1 applies the first three and leaves the number colour at its default `0;39`; succinctly also blanks the number colour."
 
 [[divergence]]
 id = "cli:locale-strftime-c-en-us"

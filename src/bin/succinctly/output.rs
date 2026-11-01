@@ -1101,6 +1101,10 @@ impl Default for ColorScheme {
 /// Number of colors `JQ_COLORS` can set. Fields past this are ignored, as in jq.
 const JQ_COLORS_FIELDS: usize = 8;
 
+/// The longest `JQ_COLORS` field jq keeps: its colour buffer is 16 bytes, less `ESC [ m` and the NUL.
+/// A longer one rejects the whole variable (`Failed to set $JQ_COLORS`).
+const JQ_COLORS_FIELD_MAX: usize = 12;
+
 /// Is `sgr` a valid `JQ_COLORS` field?
 ///
 /// jq accepts only digits and `;`, so an SGR parameter is the only thing that can
@@ -1110,22 +1114,21 @@ fn is_valid_sgr(sgr: &str) -> bool {
 }
 
 impl ColorScheme {
-    /// Parse a `JQ_COLORS` spec.
+    /// Parse a `JQ_COLORS` spec, walking jq 1.7.1's `jq_set_colors` loop.
     ///
     /// Format: "null:false:true:numbers:strings:arrays:objects:objectkeys".
     /// Each field is an SGR parameter like "1;30" for bold black.
     ///
-    /// Returns `None` if any of the first [`JQ_COLORS_FIELDS`] fields is invalid.
-    /// jq rejects a malformed spec as a whole rather than keeping the fields that
-    /// did parse, so callers fall back to the complete default scheme.
+    /// The loop takes a field at a time while text remains, so a spec ends when the text left
+    /// after a `:` is empty: `JQ_COLORS=` sets nothing, `1:` sets only the null colour, and
+    /// `:::` sets the first three (each to `\x1b[m`) and leaves the number colour alone. An
+    /// absent trailing field keeps its default; a field past the eighth is never looked at.
     ///
-    /// Absent trailing fields keep their default; an empty field selects `\x1b[m`;
-    /// fields beyond the eighth are ignored without being validated.
+    /// Returns `None` if a field jq looks at is longer than its colour buffer
+    /// ([`JQ_COLORS_FIELD_MAX`] bytes) or is not digits and `;`. jq rejects the spec as a whole
+    /// rather than keeping the fields that did parse, so callers fall back to the complete
+    /// default scheme (#5750, #5751).
     fn from_spec(spec: &str) -> Option<Self> {
-        if !spec.split(':').take(JQ_COLORS_FIELDS).all(is_valid_sgr) {
-            return None;
-        }
-
         let mut scheme = Self::default();
         let fields: [&mut String; JQ_COLORS_FIELDS] = [
             &mut scheme.null,
@@ -1138,10 +1141,17 @@ impl ColorScheme {
             &mut scheme.key,
         ];
 
-        // zip stops at the shorter side, so a short spec leaves the remaining
-        // colors at their defaults and a long one drops the excess.
-        for (field, sgr) in fields.into_iter().zip(spec.split(':')) {
+        let mut rest = spec;
+        for field in fields {
+            if rest.is_empty() {
+                break;
+            }
+            let (sgr, tail) = rest.split_once(':').unwrap_or((rest, ""));
+            if sgr.len() > JQ_COLORS_FIELD_MAX || !is_valid_sgr(sgr) {
+                return None;
+            }
             *field = format!("\x1b[{sgr}m");
+            rest = tail;
         }
 
         Some(scheme)
@@ -1984,7 +1994,41 @@ mod tests {
         let scheme = ColorScheme::from_spec("0;31:::::::").expect("spec is valid");
         assert_eq!(scheme.null, "\x1b[0;31m");
         assert_eq!(scheme.false_, "\x1b[m");
-        assert_eq!(scheme.key, "\x1b[m");
+        assert_eq!(scheme.object, "\x1b[m");
+        assert_eq!(scheme.key, default_colors::KEY);
+    }
+
+    /// #5751: the loop ends when the text after a `:` is empty, so a trailing empty field is
+    /// never read and an empty spec sets nothing. Expected values captured from jq 1.7.1.
+    #[test]
+    fn test_jq_colors_loop_ends_at_empty_remainder_5751() {
+        let none = ColorScheme::from_spec("").unwrap();
+        assert_eq!(none.null, default_colors::NULL);
+        let three = ColorScheme::from_spec(":::").unwrap();
+        assert_eq!(three.null, "\x1b[m");
+        assert_eq!(three.true_, "\x1b[m");
+        assert_eq!(three.number, default_colors::NUMBER);
+        let one = ColorScheme::from_spec("1:").unwrap();
+        assert_eq!(one.null, "\x1b[1m");
+        assert_eq!(one.false_, default_colors::FALSE);
+        let colon = ColorScheme::from_spec(":").unwrap();
+        assert_eq!(colon.null, "\x1b[m");
+        assert_eq!(colon.false_, default_colors::FALSE);
+        // Seven colons is eight fields' worth of text but only seven are read.
+        let seven = ColorScheme::from_spec("1:::::::").unwrap();
+        assert_eq!(seven.key, default_colors::KEY);
+    }
+
+    /// #5750: a field over the colour buffer rejects the whole spec; twelve bytes still fits.
+    #[test]
+    fn test_jq_colors_overlong_field_rejects_whole_spec_5750() {
+        assert!(ColorScheme::from_spec("123456789012").is_some());
+        assert!(ColorScheme::from_spec("1234567890123").is_none());
+        assert!(ColorScheme::from_spec("1;2;3;4;5;6;7;8;9").is_none());
+        // Only the first eight fields are read, so an overlong ninth is ignored.
+        assert!(ColorScheme::from_spec("1:2:3:4:5:6:7:8:1234567890123").is_some());
+        // A later field is checked too, and so is one after a good one.
+        assert!(ColorScheme::from_spec("1:1234567890123").is_none());
     }
 
     #[test]
