@@ -223,7 +223,7 @@ pub fn collect(
     let file = inputs
         .iter()
         .find(|i| i.id == "users-10mb")
-        .and_then(|i| ensure_input(generator, inputs_dir, i).ok());
+        .and_then(|i| ensure_input(root, generator, inputs_dir, i).ok());
     let parallelism = tools
         .iter()
         .map(|t| Parallelism {

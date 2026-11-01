@@ -1,7 +1,7 @@
 # id	flags (space-separated, - for none)	filter	shapes (comma-separated; none = no input file)	max tier (1mb|10mb|100mb)
 startup	-n	1	none	1mb
-identity	-	.	users,numbers,strings,wide,nested,comprehensive	100mb
-identity_compact	-c	.	users,numbers,strings,wide,nested,comprehensive	100mb
+identity	-	.	users,numbers,strings,wide,nested,comprehensive,corpus-charts,corpus-npm,corpus-graph,corpus-openapi,corpus-geojson,corpus-tabular,corpus-pretty	100mb
+identity_compact	-c	.	users,numbers,strings,wide,nested,comprehensive,corpus-charts,corpus-npm,corpus-graph,corpus-openapi,corpus-geojson,corpus-tabular,corpus-pretty	100mb
 users_field	-c	.users[0]	users	100mb
 users_length	-	[.users[]]|length	users	100mb
 users_names	-r	.users[].name	users	100mb
@@ -61,3 +61,22 @@ users_slurpfile	-n --slurpfile d @INPUT@	$d[0].users|length	users	10mb
 ndjson_slurpfile	-n --slurpfile d @INPUT@	$d|length	ndjson	10mb
 users_rawfile	-n --rawfile s @INPUT@	$s|length	users	100mb
 args_many	-n --arg a 1 --arg b two --arg c 3 --arg d four --arg e 5 --arg f six --arg g 7 --arg h eight --argjson i 9 --argjson j [10,11] --argjson k {"l":12}	[$a,$b,$c,$d,$e,$f,$g,$h,$i,$j,$k]|length	none	1mb
+corpus_npm_deps	-c	[.dependencies,.devDependencies|keys[]]|length	corpus-npm	1mb
+corpus_npm_scripts	-r	.scripts|to_entries[]|"\(.key)=\(.value)"	corpus-npm	1mb
+corpus_charts_titles	-c	[.[].title]	corpus-charts	1mb
+corpus_graph_weights	-	[.links[].value]|add	corpus-graph	1mb
+corpus_graph_by_source	-c	[.links|group_by(.source)[]|length]|max	corpus-graph	1mb
+corpus_graph_select	-	[.nodes[]|select(.group==1)|.name]|length	corpus-graph	1mb
+corpus_openapi_definitions	-c	.definitions|keys	corpus-openapi	1mb
+corpus_openapi_strings	-	[..|strings]|length	corpus-openapi	1mb
+corpus_openapi_refs	-	[..|objects|select(has("$ref"))|.["$ref"]]|unique|length	corpus-openapi	1mb
+corpus_openapi_paths	-	[paths]|length	corpus-openapi	1mb
+corpus_geojson_districts	-c	[.features[].properties.district]	corpus-geojson	1mb
+corpus_geojson_types	-c	[.features[].geometry.type]|unique	corpus-geojson	1mb
+corpus_geojson_points	-	[.features[].geometry.coordinates|flatten|length]|add	corpus-geojson	1mb
+corpus_tabular_hours	-	map(.car_hours|tonumber)|add	corpus-tabular	1mb
+corpus_tabular_csv	-r	map([.centroid_lat,.centroid_lon,.peak_hour])[]|@csv	corpus-tabular	1mb
+corpus_tabular_group	-c	group_by(.peak_hour)|map({h:.[0].peak_hour,n:length})	corpus-tabular	1mb
+corpus_pretty_numbers	-	[..|numbers]|length	corpus-pretty	1mb
+corpus_pretty_paths	-	[paths]|length	corpus-pretty	1mb
+corpus_pretty_tostream	-	[tostream]|length	corpus-pretty	1mb

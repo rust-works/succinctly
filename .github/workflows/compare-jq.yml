@@ -38,6 +38,8 @@ jobs:
           scripts/compare-jq-build.sh 1.8.1
       - name: Build succinctly (the manifest's feature set)
         run: cargo build --release --features cli,simd,regex,serde,bench-runner
+      - name: Fetch the benchmark corpus (the real-file perf inputs)
+        run: scripts/sync-bench-corpus.sh
       - name: Compare
         run: ./target/release/succinctly dev compare jq --quick --out data/compare/ci
       - name: Upload the report

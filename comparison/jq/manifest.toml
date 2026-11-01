@@ -351,3 +351,56 @@ pattern = "json-seq"
 size = "100mb"
 seed = 1
 sha256 = "d2b70721c060f089443907eddc0347b1e20472ac59d304e20d674f6d73c7330b"
+
+# Dimensions D/E on real files (#5552): JSON files from the benchmark corpus, copied from the vendored seed or from
+# `scripts/sync-bench-corpus.sh`'s fetch, each pinned by the sha256 the corpus manifest records. A fetched file that is
+# not on the machine drops its rows with a note. They are 0.5 KB to 0.8 MB, so most rows are startup-bound.
+
+[[input]]
+id = "corpus-charts"
+shape = "corpus-charts"
+tier = "1mb"
+corpus = "json/charts/bullet-data.json"
+sha256 = "a1f491be4387e503eb41cbf8c1f5f4c653368b4b1c6f8ac85a2d495d278c53c4"
+
+[[input]]
+id = "corpus-npm"
+shape = "corpus-npm"
+tier = "1mb"
+corpus = "json/npm/express-package.json"
+sha256 = "01f5d42cf38cc1118cd9c1259b0d246f5414ae883f8e1c7c3ee55f984fb31a4f"
+
+[[input]]
+id = "corpus-graph"
+shape = "corpus-graph"
+tier = "1mb"
+corpus = "json/graph/miserables.json"
+sha256 = "6cb4a82266aca5671010104af4532b6add6d2fca7ca2b24e38d57fe322971ee4"
+
+[[input]]
+id = "corpus-openapi"
+shape = "corpus-openapi"
+tier = "1mb"
+corpus = "json/openapi/swagger-v2-schema.json"
+sha256 = "b36871c8016292c5e66dd3b203e69aeff98bfef97e0b3c67c1909036095586a5"
+
+[[input]]
+id = "corpus-geojson"
+shape = "corpus-geojson"
+tier = "1mb"
+corpus = "json/geojson/us-election.geojson"
+sha256 = "d2290e5dcc442ed6cd5e0ab4b306466cad4c673e65323f13828dea8f221cf134"
+
+[[input]]
+id = "corpus-tabular"
+shape = "corpus-tabular"
+tier = "1mb"
+corpus = "json/tabular/carshare-data.json"
+sha256 = "b573a4bdbc3ad293886e4886c44a02b0dceaa2ab1daca6e64a6f7a90b3c0cd3f"
+
+[[input]]
+id = "corpus-pretty"
+shape = "corpus-pretty"
+tier = "1mb"
+corpus = "json/pretty/3d-ribbon.json"
+sha256 = "fd0aeda5c6c567d3149cf4e6fa1ea71a2cf10c884f55df45a1c269f00eb88cdd"

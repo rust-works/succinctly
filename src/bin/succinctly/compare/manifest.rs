@@ -195,6 +195,35 @@ mod pin_tests {
         }
     }
 
+    /// A corpus input names a file the corpus manifest records, with the same hash: the
+    /// comparison pins what it measures, and a corpus file re-pinned on one side only would
+    /// otherwise surface as a failed run on a machine that has fetched it (#5552).
+    #[test]
+    fn a_corpus_input_is_pinned_like_the_corpus_manifest() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (m, _) = Manifest::load(root).unwrap();
+        let corpus: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("tests/data/bench-corpus/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let files = corpus["files"].as_array().unwrap();
+        let named: Vec<_> = m.inputs.iter().filter(|i| i.corpus.is_some()).collect();
+        assert!(named.len() >= 7, "{}", named.len());
+        for i in named {
+            let file = i.corpus.as_deref().unwrap();
+            let entry = files
+                .iter()
+                .find(|f| f["file"] == file)
+                .unwrap_or_else(|| panic!("{} names {file}, not in the corpus manifest", i.id));
+            assert_eq!(entry["sha256"], i.sha256.as_str(), "{}", i.id);
+            assert_eq!(entry["format"], "json", "{} is not a jq input", i.id);
+            assert_eq!(
+                i.shape,
+                format!("corpus-{}", entry["workload"].as_str().unwrap())
+            );
+        }
+    }
+
     #[test]
     fn a_changed_file_is_refused() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));

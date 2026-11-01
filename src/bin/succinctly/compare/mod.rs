@@ -622,7 +622,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         }
         dimensions.push(DimensionStatus {
             name: "F. Robustness",
-            status: "implemented (nesting, recursion, generators, regex, large values, SIGPIPE; the memory-limit probes are not yet included)",
+            status: "implemented (nesting, recursion, generators, regex, large values, SIGPIPE, memory limits under ulimit -v)",
         });
     }
     let (mut perf_rows, mut perf_note) = (vec![], None);
@@ -638,7 +638,20 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                 bail!("no performance query contains `{f}`");
             }
         }
-        let planned = perf::plan(&queries, &manifest.inputs, top);
+        // A fetched corpus file that is not on this machine drops its rows, and says so.
+        let missing: Vec<&str> = manifest
+            .inputs
+            .iter()
+            .filter(|i| !perf::available(&root, i))
+            .map(|i| i.id.as_str())
+            .collect();
+        let present: Vec<perf::InputSpec> = manifest
+            .inputs
+            .iter()
+            .filter(|i| perf::available(&root, i))
+            .cloned()
+            .collect();
+        let planned = perf::plan(&queries, &present, top);
         let generator = std::env::current_exe()?;
         let mut tools = vec![
             if args.control {
@@ -655,11 +668,21 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             Ok(sec) => tools.push(sec.clone()),
             Err(why) => perf_note = Some(format!("no secondary column: {why}")),
         }
+        if !missing.is_empty() {
+            let skipped = format!(
+                "corpus files not on this machine, so their rows are not run (scripts/sync-bench-corpus.sh fetches them): {}",
+                missing.join(", ")
+            );
+            perf_note = Some(match perf_note {
+                Some(n) => format!("{n}; {skipped}"),
+                None => skipped,
+            });
+        }
         // A query with no input (`startup`) runs here too, before any generator has.
         std::fs::create_dir_all(&inputs_dir)?;
         for (query, input) in &planned {
             if let Some(spec) = input {
-                perf::ensure_input(&generator, &inputs_dir, spec)?;
+                perf::ensure_input(&root, &generator, &inputs_dir, spec)?;
             }
             let big = input.is_some_and(|i| i.tier == "100mb");
             let mid = input.is_some_and(|i| i.tier == "10mb");
@@ -677,7 +700,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         }
         dimensions.push(DimensionStatus {
             name: "D. Performance / E. Memory",
-            status: "implemented (spawn timings and peak RSS on generated shapes; real-world corpus files, cachegrind and the memory-limit probes are not yet included)",
+            status: "implemented (spawn timings and peak RSS on generated shapes and the corpus's JSON files; cachegrind counts are not yet included)",
         });
     }
     let mut operational_info = None;
@@ -878,7 +901,7 @@ fn run_verify(
         };
         let spec = ctx.manifest.inputs.iter().find(|i| i.id == input);
         if let Some(spec) = spec {
-            perf::ensure_input(&generator, &inputs_dir, spec)?;
+            perf::ensure_input(ctx.root, &generator, &inputs_dir, spec)?;
         }
         let row = perf::run_row(&tools, q, spec, &inputs_dir, 5)?;
         let now = serde_json::to_value(&row)?;
