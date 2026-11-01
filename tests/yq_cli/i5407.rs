@@ -7,6 +7,10 @@ use anyhow::Result;
 
 use crate::run_yq_stdin;
 
+/// An array whose elements carry anchors, aliases and comments: the alias-mark pass counts a
+/// negative target index the same way.
+const ALIASES: &str = "a:\n  - &x {k: \"v\"} # c1\n  - *x\n  - &y \"s\" # c2\n  - *y\n";
+
 /// (document, filter, output).
 const ROWS: &[(&str, &str, &str)] = &[
     ("a: [\"x\", y]\n", ".a[-1] = .a[0]", "a: [\"x\", \"x\"]\n"),
@@ -28,6 +32,26 @@ const ROWS: &[(&str, &str, &str)] = &[
         "a: [1]\nb: [\"p\", q]\n",
         ".a[-1] = .b[-2]",
         "a: [\"p\"]\nb: [\"p\", q]\n",
+    ),
+    (
+        ALIASES,
+        ".a[-3] = .a[-4]",
+        "a:\n  - &x {k: \"v\"} # c1\n  - {k: \"v\"} # c1\n  - &y \"s\" # c2\n  - *y\n",
+    ),
+    (
+        ALIASES,
+        ".a[-1] = .a[-2]",
+        "a:\n  - &x {k: \"v\"} # c1\n  - *x\n  - &y \"s\" # c2\n  - \"s\" # c2\n",
+    ),
+    (
+        ALIASES,
+        ".a[-1] = .a[1]",
+        "a:\n  - &x {k: \"v\"} # c1\n  - *x\n  - &y \"s\" # c2\n  - *x\n",
+    ),
+    (
+        ALIASES,
+        ".a[-4] = .a[-2]",
+        "a:\n  - &x \"s\" # c2\n  - *x\n  - &y \"s\" # c2\n  - *y\n",
     ),
 ];
 

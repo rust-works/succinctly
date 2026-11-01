@@ -4462,11 +4462,19 @@ fn collect_assign_chain(expr: &Expr) -> Option<Vec<(&Expr, &Expr)>> {
 /// `Declares` left anywhere — `enforce_anchor_soundness` then drops both
 /// (rule 4(a), `a: 1` / `b: 1`, recorded in
 /// `docs/compliance/yq/limitations.md` next to the `del(.a)` example).
-fn propagate_assign_alias_marks(expr: &Expr, tree: &mut CommentTree) {
+fn propagate_assign_alias_marks(expr: &Expr, value: &OwnedValue, tree: &mut CommentTree) {
     let Some(stages) = collect_assign_chain(expr) else {
         return;
     };
+    // A negative index (`.a[-1] = .a[0]`) counts from the end of an array a write to an existing
+    // element leaves as long as it was, so a lone plain assignment resolves it against the
+    // finished value. With more stages a later write may have grown the array (#5407).
+    let resolve = stages.len() == 1 && is_plain_assign_chain(expr);
     for (path_expr, value_expr) in stages {
+        let resolved = resolve
+            .then(|| resolve_negative_indices(path_expr, value))
+            .flatten();
+        let path_expr = resolved.as_ref().unwrap_or(path_expr);
         let Some(targets) = static_nav_targets(path_expr) else {
             continue;
         };
@@ -7639,8 +7647,8 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // whether the mark this pass adds is safe to keep.
     if has_aliases && presentation_sync_ctx.is_some() {
         if let Ok(docs) = &mut docs {
-            for (_value, comments) in docs.iter_mut() {
-                propagate_assign_alias_marks(expr, comments);
+            for (value, comments) in docs.iter_mut() {
+                propagate_assign_alias_marks(expr, value, comments);
             }
         }
     }
