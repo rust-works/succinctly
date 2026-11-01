@@ -5154,6 +5154,11 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
         return GenericResult::Owned(length);
     }
 
+    // #5691: nor does a string's length or prefix/suffix test.
+    if let Some(answer) = crate::jq::eval::eval_owned_string_door::<S>(expr, &owned) {
+        return GenericResult::Owned(answer);
+    }
+
     // #4053: a stage that never reads `.` needs no index over it either.
     if let Some(value) = crate::jq::eval::eval_owned_closed::<S>(expr) {
         return GenericResult::Owned(value);

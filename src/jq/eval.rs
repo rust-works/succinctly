@@ -10495,6 +10495,42 @@ pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<Owned
     }
 }
 
+/// `length`, `startswith("lit")` and `endswith("lit")` of an owned string, answered from the
+/// string itself (#5691).
+///
+/// The bridge writes the string out as JSON text (an escape pass over every byte), indexes that
+/// text and then decodes the string back out of it, validating its UTF-8 a second time, to take
+/// its length or compare its first bytes: about 0.26 s and 190 MB over a 100 MB `--rawfile`,
+/// where the answer needs one pass over the string or only its ends. An owned string is already
+/// valid UTF-8 and cannot raise, so the answer is the bridge's own: `length` counts as
+/// [`builtin_length`] does (`string_length`, per mode), and the two prefix/suffix tests are
+/// [`eval_owned_door_arm`]'s, which decline a non-literal or non-string argument and leave
+/// every raised error to the bridge.
+///
+/// Every answer is a fresh integer or boolean, never a subvalue of `input`, so it is admitted
+/// whatever the embed table holds, as [`eval_owned_length`]'s is. Any other builtin or input
+/// shape is `None`.
+pub(crate) fn eval_owned_string_door<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    let OwnedValue::String(text) = input else {
+        return None;
+    };
+    match unwrap_paren(expr) {
+        // `. | length` is `length`: an identity stage yields its input once.
+        Expr::Pipe(stages) => match skip_identity_stages(stages) {
+            [only] => eval_owned_string_door::<S>(only, input),
+            _ => None,
+        },
+        Expr::Builtin(Builtin::Length) => Some(OwnedValue::Int(string_length::<S>(text))),
+        stage @ Expr::Builtin(Builtin::Startswith(_) | Builtin::Endswith(_)) => {
+            eval_owned_door_arm::<S>(stage, input)?.ok()
+        }
+        _ => None,
+    }
+}
+
 /// A stage that never reads `.`, answered without the owned input (#4053).
 ///
 /// `[$x] | 1` handed the stage `1` an owned array holding the whole of `$x`, and
@@ -11546,6 +11582,14 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
     // #3477: a count needs no index over the container it counts.
     if let Some(length) = eval_owned_length(expr, input) {
         return Some(match sink(length) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        });
+    }
+    // #5691: nor does a string's length or its prefix/suffix test need the string written out
+    // and indexed again.
+    if let Some(answer) = eval_owned_string_door::<S>(expr, input) {
+        return Some(match sink(answer) {
             Demand::Continue => Flow::Exhausted,
             Demand::Stop => Flow::Stopped { pending: None },
         });
@@ -113832,6 +113876,96 @@ mod tests {
             let expr = parse(src).unwrap();
             assert!(
                 eval_owned_length(&expr, &OwnedValue::array_from(vec![])).is_none(),
+                "{src}"
+            );
+        }
+    }
+
+    /// #5691: `eval_owned_string_door` answers `length`, `startswith("lit")` and `endswith("lit")` of an
+    /// owned string the way the reindex bridge does, in both modes, and declines every other input
+    /// and shape (a non-string input, a non-literal or non-string argument, a stage that computes
+    /// or fans out), leaving those and their errors to the bridge.
+    #[test]
+    fn eval_owned_string_door_agrees_with_the_reindex_bridge_5691() {
+        let strings = [
+            "",
+            "a",
+            "h\u{e9}llo",
+            "\u{65e5}\u{672c}\u{8a9e}",
+            "\u{1f600}x\u{1f600}",
+            "a\nb",
+            "q\"b\\s",
+            "\u{7f}del",
+            "zzzabc",
+            "abczzz",
+        ];
+        let mut answered = 0;
+        for text in strings {
+            let value = OwnedValue::String(text.into());
+            for src in [
+                "length",
+                "(length)",
+                ". | length",
+                "startswith(\"z\")",
+                "endswith(\"z\")",
+                "startswith(\"\")",
+                ". | startswith(\"a\")",
+                "endswith(\"\u{672c}\u{8a9e}\")",
+            ] {
+                let expr = parse(src).unwrap();
+                let jq_fast = eval_owned_string_door::<JqSemantics>(&expr, &value)
+                    .unwrap_or_else(|| panic!("{src:?} on {text:?} declined"));
+                let yq_fast = eval_owned_string_door::<YqSemantics>(&expr, &value)
+                    .unwrap_or_else(|| panic!("{src:?} on {text:?} declined in yq mode"));
+                answered += 1;
+                let jq = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, &value, false,
+                ));
+                let yq = debug_normalize(eval_owned_input_bridge::<Vec<u64>, YqSemantics>(
+                    &expr, &value, false,
+                ));
+                assert_eq!(
+                    debug_normalize(QueryResult::<Vec<u64>>::Owned(jq_fast)),
+                    jq,
+                    "jq mode: {src:?} on {text:?}"
+                );
+                assert_eq!(
+                    debug_normalize(QueryResult::<Vec<u64>>::Owned(yq_fast)),
+                    yq,
+                    "yq mode: {src:?} on {text:?}"
+                );
+            }
+        }
+        assert_eq!(answered, strings.len() * 8);
+        // Not a string: the container arms and the bridge keep these.
+        for value in [
+            OwnedValue::Null,
+            OwnedValue::Int(3),
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+        ] {
+            for src in ["length", "startswith(\"a\")", "endswith(\"a\")"] {
+                assert!(
+                    eval_owned_string_door::<JqSemantics>(&parse(src).unwrap(), &value).is_none(),
+                    "{src:?} on {value:?}"
+                );
+            }
+        }
+        // A string, but not this helper's shape: an argument that is not a string literal can
+        // raise or fan out, and a stage that computes is the evaluator's.
+        let text = OwnedValue::String("abc".into());
+        for src in [
+            "startswith(1)",
+            "startswith(null)",
+            "startswith(.)",
+            "endswith(\"a\", \"b\")",
+            "length | . + 1",
+            "length, length",
+            ".[0:1] | length",
+            "keys",
+            "ascii_downcase",
+        ] {
+            assert!(
+                eval_owned_string_door::<JqSemantics>(&parse(src).unwrap(), &text).is_none(),
                 "{src}"
             );
         }
