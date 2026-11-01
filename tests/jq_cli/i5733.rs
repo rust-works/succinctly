@@ -10,7 +10,11 @@ use crate::run_jq_full;
 fn check(cases: &[(&str, &str)]) -> Result<()> {
     for (program, expected) in cases {
         let (stdout, stderr, code) = run_jq_full(&["-nc", program], None)?;
-        assert_eq!((stdout.as_str(), code), (*expected, 0), "{program}: {stderr}");
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*expected, 0),
+            "{program}: {stderr}"
+        );
     }
     Ok(())
 }
