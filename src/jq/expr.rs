@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use std::rc::{Rc, Weak};
 
-use super::value::{NumberRepr, OwnedValue};
+use super::value::{NumberRepr, OwnedValue, SharableString};
 
 /// A `def`'s own parameter, carrying whether it was written with a
 /// leading `$` (`def f($g): ...`) or bare (`def f(g): ...`).
@@ -3985,7 +3985,7 @@ pub enum Literal {
     /// Floating-point number
     Float(f64),
     /// String literal
-    String(String),
+    String(SharableString),
 }
 
 impl Expr {
@@ -4358,7 +4358,7 @@ impl Literal {
 
     /// Create a string literal.
     pub fn string(s: impl Into<String>) -> Self {
-        Self::String(s.into())
+        Self::String(SharableString::from(s.into()))
     }
 
     /// Create a source-text-preserving number literal (#1062), parsing

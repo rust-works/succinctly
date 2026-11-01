@@ -2175,7 +2175,7 @@ impl<'a> Parser<'a> {
 
         // If no interpolations, return a simple string literal
         if parts.is_empty() {
-            return Ok(Expr::Literal(Literal::String(current_literal)));
+            return Ok(Expr::Literal(Literal::String(current_literal.into())));
         }
 
         // Add final literal if any
@@ -2642,7 +2642,7 @@ impl<'a> Parser<'a> {
         match lit {
             Literal::Null => Some(OwnedValue::Null),
             Literal::Bool(b) => Some(OwnedValue::Bool(*b)),
-            Literal::String(s) => Some(OwnedValue::String(s.clone().into())),
+            Literal::String(s) => Some(OwnedValue::String(s.clone())),
             Literal::Int(n) if *n >= 0 => Some(OwnedValue::Int(*n)),
             Literal::Float(f) if !f.is_sign_negative() => Some(OwnedValue::Float(*f)),
             Literal::NumberLiteral(repr, text) if !text.starts_with('-') => {
@@ -2662,7 +2662,7 @@ impl<'a> Parser<'a> {
     fn fold_index_key(key: &Expr) -> Option<Expr> {
         match key {
             Expr::Paren(inner) => Self::fold_index_key(inner),
-            Expr::Literal(Literal::String(s)) => Some(Expr::Field(s.clone())),
+            Expr::Literal(Literal::String(s)) => Some(Expr::Field(s.to_string())),
             Expr::Literal(Literal::Int(i)) => Some(Expr::Index { idx: *i, key: None }),
             // Every number written in filter source arrives as
             // `Literal::NumberLiteral` (#1035), so this one arm covers the
@@ -3100,7 +3100,7 @@ impl<'a> Parser<'a> {
                             // A format over a string with no interpolation never runs (`@base64
                             // "a"` is `"a"`): an ordinary literal key and its `.a` shorthand.
                             Expr::Literal(Literal::String(name)) => {
-                                (ObjectKey::Literal(name), None)
+                                (ObjectKey::Literal(name.into_string()), None)
                             }
                             // #5298: jq's `String` production, with an interpolation. Its
                             // shorthand (`{"a\(1)"}`) is `{"a1": .["a1"]}`.
@@ -3401,7 +3401,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let value = self.parse_object_value()?;
         let key = match first {
-            Expr::Literal(Literal::String(s)) => ObjectKey::Literal(s),
+            Expr::Literal(Literal::String(s)) => ObjectKey::Literal(s.into_string()),
             other => ObjectKey::Expr(Box::new(other)),
         };
         Ok(ObjectEntry { key, value })
@@ -5496,7 +5496,9 @@ impl<'a> Parser<'a> {
                             ObjectKey::Expr(Box::new(key_expr))
                         } else if self.peek() == Some('"') {
                             match self.parse_string_or_interpolation()? {
-                                Expr::Literal(Literal::String(s)) => ObjectKey::Literal(s),
+                                Expr::Literal(Literal::String(s)) => {
+                                    ObjectKey::Literal(s.into_string())
+                                }
                                 interpolated => {
                                     self.count_pattern_computed_key()?;
                                     ObjectKey::Expr(Box::new(interpolated))
@@ -9009,7 +9011,7 @@ impl<'a> Parser<'a> {
     /// expression back when it is neither.
     fn computed_key_of_folded(folded: Expr) -> Result<Expr, Expr> {
         match folded {
-            Expr::Field(name) => Ok(Expr::Literal(Literal::String(name))),
+            Expr::Field(name) => Ok(Expr::Literal(Literal::String(name.into()))),
             Expr::Index { idx, key: None } => Ok(Expr::Literal(Literal::Int(idx))),
             // A spelled whole number keeps its spelling, so folding it back is `fold_index_key`.
             Expr::Index {
@@ -9659,7 +9661,7 @@ impl<'a> Parser<'a> {
     /// it, spelling and range included. `None` for any other key.
     fn path_step_of_kept_key(key: &Expr) -> Option<Expr> {
         match key {
-            Expr::Literal(Literal::String(name)) => Some(Expr::Field(name.clone())),
+            Expr::Literal(Literal::String(name)) => Some(Expr::Field(name.to_string())),
             Expr::Literal(Literal::Int(idx)) => Some(Expr::Index {
                 idx: *idx,
                 key: None,
@@ -15667,7 +15669,7 @@ mod tests {
         let lit = |escapes: &str| {
             let program = format!("\"{escapes}\"");
             match parse_program(&program).map(|p| p.expr) {
-                Ok(Expr::Literal(Literal::String(s))) => Some(s),
+                Ok(Expr::Literal(Literal::String(s))) => Some(s.into_string()),
                 other => panic!("`{program}` parsed to {other:?}"),
             }
         };

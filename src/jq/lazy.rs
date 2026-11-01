@@ -1449,7 +1449,7 @@ mod tests {
         let val: JqValue<'_, Vec<u64>> = JqValue::from_literal(&lit);
         assert_eq!(val.as_i64(), Some(42));
 
-        let lit = Literal::String("hello".to_string());
+        let lit = Literal::String("hello".into());
         let val: JqValue<'_, Vec<u64>> = JqValue::from_literal(&lit);
         assert_eq!(
             val.as_str().map(alloc::borrow::Cow::into_owned),

@@ -78392,7 +78392,7 @@ fn owned_to_expr_at_depth(value: &OwnedValue, depth: usize) -> Expr {
         OwnedValue::NumberLiteral(repr, text) => {
             Expr::Literal(Literal::NumberLiteral(*repr, text.to_string()))
         }
-        OwnedValue::String(s) => Expr::Literal(Literal::String(s.to_string())),
+        OwnedValue::String(s) => Expr::Literal(Literal::String(s.clone())),
         OwnedValue::Array(arr) => {
             // Build array construction expression with all elements
             if arr.is_empty() {
@@ -109661,7 +109661,7 @@ mod tests {
         let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        let b_expr = Expr::Literal(Literal::String(String::new()));
+        let b_expr = Expr::Literal(Literal::String(String::new().into()));
         for optional in [true, false] {
             match builtin_contains::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), optional) {
                 QueryResult::Error(e) => {
@@ -109683,7 +109683,7 @@ mod tests {
         let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        let b_expr = Expr::Literal(Literal::String(String::new()));
+        let b_expr = Expr::Literal(Literal::String(String::new().into()));
         for optional in [true, false] {
             match builtin_inside::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), optional) {
                 QueryResult::Error(e) => {
@@ -109706,7 +109706,7 @@ mod tests {
         let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
         let index = JsonIndex::build(decode_failure_bytes);
         let cursor = index.root(decode_failure_bytes);
-        let b_expr = Expr::Literal(Literal::String(String::new()));
+        let b_expr = Expr::Literal(Literal::String(String::new().into()));
         match builtin_contains::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), true) {
             QueryResult::Error(e) => assert!(e.is_decode_failure()),
             other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
@@ -109719,7 +109719,7 @@ mod tests {
         let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
         let index = JsonIndex::build(decode_failure_bytes);
         let cursor = index.root(decode_failure_bytes);
-        let b_expr = Expr::Literal(Literal::String(String::new()));
+        let b_expr = Expr::Literal(Literal::String(String::new().into()));
         match builtin_inside::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), true) {
             QueryResult::Error(e) => assert!(e.is_decode_failure()),
             other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
@@ -131914,7 +131914,7 @@ mod tests {
         let expr = Expr::Arithmetic {
             op: ArithOp::Add,
             left: Box::new(Expr::Identity),
-            right: Box::new(Expr::Literal(Literal::String("a".to_string()))),
+            right: Box::new(Expr::Literal(Literal::String("a".into()))),
             settle: ArithSettleMemo::default(),
         };
         let mut on_update_calls = 0;
@@ -152336,6 +152336,27 @@ mod tests {
     /// AST as literals, reachable from `.a += rhs_expr`/`.a //= rhs_expr`
     /// and `as`-pattern variable substitution with no adversarial document
     /// involved.
+    /// A shared string spliced as a literal is one refcount, not a copy (#5713): the literal and
+    /// the value read back from it are the same storage as the string it came from.
+    #[cfg(not(feature = "unshared-containers"))]
+    #[test]
+    fn a_shared_string_is_spliced_and_read_back_without_a_copy_5713() {
+        let mut shared = SharableString::from("h\u{e9}".repeat(2100));
+        shared.promote();
+        let value = OwnedValue::String(shared.clone());
+        let Expr::Literal(Literal::String(lit)) = owned_to_expr(&value) else {
+            panic!("a string splices as a string literal");
+        };
+        assert!(
+            lit.ptr_eq(&shared),
+            "the literal shares the string's storage"
+        );
+        let OwnedValue::String(back) = OwnedValue::from(Literal::String(lit)) else {
+            panic!("a string literal reads back as a string");
+        };
+        assert!(back.ptr_eq(&shared), "the read shares it again");
+    }
+
     #[test]
     fn owned_to_expr_panics_past_nesting_depth_limit_1025() {
         use crate::jq::value::MAX_VALUE_TREE_DEPTH;

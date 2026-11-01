@@ -62,3 +62,100 @@ fn programs_that_read_args_and_programs_that_do_not_answer_as_jq_5713() -> Resul
     }
     Ok(())
 }
+
+// The string splice: a named string is shared once, so every `$s` read, a `def` parameter and a
+// `$ARGS` entry take a refcount, not a copy of the whole string. These rows are the shapes a first
+// design (a marker node in place of the literal) made slower or answered differently, each with
+// the answer the pinned jq 1.7.1 gives, at lengths either side of the old 4096-byte threshold.
+
+/// `"hé"` repeated `n` times: `2n` codepoints, `3n` bytes.
+fn he(n: usize) -> String {
+    "h\u{e9}".repeat(n)
+}
+
+const SHARED_ROWS: &[(&str, &str)] = &[
+    ("$s|length", "LEN\n"),
+    // A fold whose update is a pipe of assignments reading `$s` after the first stage.
+    (
+        "reduce range(0;50) as $i ({arr:[]}; .arr += [$i] | .s = $s) | [(.arr|length), (.s|length)]|tojson",
+        "\"[50,LEN]\"\n",
+    ),
+    ("reduce range(0;20) as $i ({}; .s //= $s)|.s|length", "LEN\n"),
+    ("def f($x): ($x|length)+1; [range(3)|f($s)]|add", "ADD\n"),
+    ("def f($x): [$x,$x]|map(length)|add; f($s)", "DOUBLE\n"),
+    ("$s as $x|$x|length", "LEN\n"),
+    ("[$s,$s]|map(startswith(\"h\"))|all", "true\n"),
+    ("$s|startswith($s)", "true\n"),
+    ("$s|endswith($s)", "true\n"),
+    ("{($s):1}|keys|length", "1\n"),
+    ("{a:1}|has(\"a\"), ({a:1}|has($s))", "true\nfalse\n"),
+    ("$s|split($s)|length", "2\n"),
+    ("$ARGS.named.s|length", "LEN\n"),
+    ("[$ARGS.named.s,$s]|unique|length", "1\n"),
+];
+
+#[test]
+fn a_named_string_reads_alike_at_every_length_5713() -> Result<()> {
+    for n in [10usize, 1365, 1366, 2100] {
+        let value = he(n);
+        let len = (2 * n).to_string();
+        let add = (2 * n * 3 + 3).to_string();
+        let double = (4 * n).to_string();
+        for (filter, expected) in SHARED_ROWS {
+            let expected = expected
+                .replace("LEN", &len)
+                .replace("ADD", &add)
+                .replace("DOUBLE", &double);
+            let (stdout, stderr, code) = run_jq_full(&["-n", "--arg", "s", &value, filter], None)?;
+            assert_eq!(
+                (stdout.as_str(), stderr.as_str(), code),
+                (expected.as_str(), "", 0),
+                "{filter} at {n}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A `--argjson` string and a `--rawfile` read the same as an `--arg`.
+#[test]
+fn argjson_and_rawfile_strings_read_alike_5713() -> Result<()> {
+    let value = he(2100);
+    let json = format!("\"{value}\"");
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "--argjson",
+            "s",
+            &json,
+            "[$s|length, ($s|startswith(\"h\"))]|tojson",
+        ],
+        None,
+    )?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("\"[4200,true]\"\n", "", 0)
+    );
+    Ok(())
+}
+
+/// A `--slurpfile` always binds an array, so a string element is read through it.
+#[test]
+fn a_slurpfile_string_element_reads_alike_5713() -> Result<()> {
+    let (_file, path) = crate::temp_json(&format!("\"{}\"", he(2100)))?;
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "--slurpfile",
+            "s",
+            &path,
+            "[$s[0]|length, ([range(3)|$s[0]|startswith(\"h\")]|all)]|tojson",
+        ],
+        None,
+    )?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("\"[4200,true]\"\n", "", 0)
+    );
+    Ok(())
+}

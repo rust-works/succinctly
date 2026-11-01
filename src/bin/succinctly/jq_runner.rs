@@ -4626,7 +4626,14 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     };
     // Not freed, see the doc comment: giving back a 100 MB `--slurpfile` (millions of small
     // allocations) to a process about to end was a quarter of the run (#5673).
-    let context = std::mem::ManuallyDrop::new(context);
+    let mut context = std::mem::ManuallyDrop::new(context);
+    // A named string is shared once here, so every `$s` read, the `$ARGS` object and a `def`
+    // parameter take a refcount instead of a copy of the whole string (#5713).
+    for value in context.named.values_mut() {
+        if let OwnedValue::String(s) = value {
+            s.promote();
+        }
+    }
 
     // Get the filter expression. An unreadable `-f`/`--from-file` file is
     // jq's own usage error (exit 2), so it gets the same two-arm treatment

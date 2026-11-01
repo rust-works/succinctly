@@ -2647,7 +2647,7 @@ impl SharableString {
         feature = "unshared-containers",
         allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)
     )]
-    pub(crate) fn promote(&mut self) {
+    pub fn promote(&mut self) {
         #[cfg(not(feature = "unshared-containers"))]
         if let SharableStringInner::Owned(s) = &mut self.0 {
             self.0 = SharableStringInner::Shared(alloc::rc::Rc::new(core::mem::take(s)));
@@ -6044,7 +6044,7 @@ impl From<Literal> for OwnedValue {
             }
             Literal::Int(n) => Self::Int(n),
             Literal::Float(f) => Self::Float(f),
-            Literal::String(s) => Self::String(s.into()),
+            Literal::String(s) => Self::String(s),
         }
     }
 }
