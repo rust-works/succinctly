@@ -2844,8 +2844,8 @@ fn word_special_mask(word: u64) -> u64 {
 /// is a *word* arm, taken only when that greedy loop consumed nothing
 /// after the optional sign and only when the whole word is one of
 /// decNumber's special values ([`special_number_end`]) -- so `nan`,
-/// `-inf` and `+Infinity` are one span each, while `-nope` still yields
-/// exactly the span it always did. `is_valid_number`/
+/// `-inf` and `+Infinity` are one span each, while `-nope` is the whole run
+/// to the next token boundary, like any number with a byte glued on (#5654). `is_valid_number`/
 /// `OwnedValue::from_number_bytes` are what decide, from that whole
 /// span, whether it's safe to treat as a real number (falling back to
 /// `Null` if not) -- matching this crate's own established, tested
@@ -2881,9 +2881,8 @@ fn nested_number_span(text: &[u8], start: usize) -> usize {
     }
     // Nothing numeric after the (optional) sign: a decNumber special word
     // (`nan`, `sNaN12`, `-Infinity`, `+inf`, #2877)? Only then, and only if
-    // the whole word validates -- otherwise this returns exactly the span
-    // it always did (`-` for `-nope`, `+` for `+x`), so the #1643
-    // delimiter-gap check keeps rejecting those the way it does today.
+    // the whole word validates -- otherwise it falls to the glued-run arm
+    // below, which spans `-nope` / `+x` to the next token boundary (#5654).
     if i == body_start {
         if let Some(end) = special_number_end(text, start) {
             return end;
@@ -2901,10 +2900,9 @@ fn nested_number_span(text: &[u8], start: usize) -> usize {
 
 /// Whether `byte` continues [`nested_number_span`]'s greedy number run --
 /// `[0-9.eE+-]`, the one definition of that class (#3167). The span's own
-/// loop, [`strict_number_end`]'s "ends where the greedy span would" check
-/// and the canonical-echo gate's one-pass number arm
-/// ([`scan_canonical_number`]) all ask this, so a byte added to the class
-/// reaches all three.
+/// loop and `JsonCursor::number_glued_junk` ask this. [`strict_number_end`]
+/// and [`scan_canonical_number`] ask [`jq_literal_boundary`] instead since
+/// #5654: a number ends at a token boundary, not at the first non-number byte.
 #[inline(always)]
 fn is_number_span_byte(byte: u8) -> bool {
     matches!(byte, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
@@ -2918,8 +2916,8 @@ const MALFORMED_NUMBER: &str = "invalid numeric literal";
 
 /// Where the token at `start` ends, if it is
 /// `-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?` and ends exactly where
-/// [`nested_number_span`] would end it -- i.e. the next byte is not in that
-/// span's greedy class. Such a span is a number to every decoder (RFC 8259
+/// [`nested_number_span`] would end it -- i.e. the next byte is a jq token
+/// boundary (or the end), so nothing is glued on (#5654). Such a span is a number to every decoder (RFC 8259
 /// plus jq's redundant leading zeros, #1149), so `JsonCursor::number_at`
 /// accepts it without taking the greedy span; every other shape, valid or
 /// not, answers `None` here and is decided on the whole span.
@@ -3465,7 +3463,8 @@ fn sibling_end_ok(before: &[u8]) -> bool {
     let last = before[before.len() - 1];
     // The common siblings end here, in one byte test: a number's last digit, a string, a container.
     // A bare token glued to a number that still ends in a digit (`0x1`, `1_000`) is not looked at:
-    // walking every number back would cost the pretty printer 18% on a number-heavy array.
+    // walking every number back would cost the pretty printer 18% on a number-heavy array. The
+    // number scanners refuse it where it is read instead (#5654).
     if last.is_ascii_digit() || matches!(last, b'"' | b']' | b'}') {
         return true;
     }

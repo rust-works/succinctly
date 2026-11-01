@@ -95,3 +95,24 @@ fn an_early_stopping_consumer_refuses_a_glued_first_element_5654() -> Result<()>
     );
     Ok(())
 }
+
+/// The gap check refuses a glued run that ends in a letter or is the last element, whatever the
+/// filter, and the sign-prefixed shapes follow the same rule (jq 1.7.1 refuses every row).
+#[test]
+fn a_glued_last_element_or_letter_ending_run_is_refused_by_length_too_5654() -> Result<()> {
+    for doc in [
+        "[2x,1]",
+        "[1,2x,3]",
+        "[1,0x1]",
+        "[1,+1x]",
+        "[1,.5x]",
+        "{\"a\":1,\"b\":2x}",
+        "{\"a\":1,\"b\":0x1}",
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", "length"], Some(doc))?;
+        assert_eq!(code, 5, "{doc}: {out:?} {err:?}");
+        assert_eq!(out, "", "{doc}");
+        assert!(err.contains("Invalid numeric literal"), "{doc}: {err:?}");
+    }
+    Ok(())
+}
