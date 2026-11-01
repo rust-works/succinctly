@@ -10473,6 +10473,9 @@ fn eval_each_owned_fast_path<S: EvalSemantics>(
 /// Everything else -- `null`, a string, a number, a boolean -- declines, and
 /// the bridge keeps its diagnostics and its per-mode rules.
 ///
+/// A string is not answered here: [`eval_owned_string_door`] (#5691) takes `length` of one, at the
+/// same two re-entries.
+///
 /// Deliberately not an arm of [`eval_owned_fast_path`]: that function is also
 /// the stage evaluator behind `closed_expr_to_owned` (an owned-assign right
 /// side) and the resolver's owned evaluation, and a new arm there would widen
@@ -114097,19 +114100,20 @@ mod tests {
             "zzzabc",
             "abczzz",
         ];
+        let shapes = [
+            "length",
+            "(length)",
+            ". | length",
+            "startswith(\"z\")",
+            "endswith(\"z\")",
+            "startswith(\"\")",
+            ". | startswith(\"a\")",
+            "endswith(\"\u{672c}\u{8a9e}\")",
+        ];
         let mut answered = 0;
         for text in strings {
             let value = OwnedValue::String(text.into());
-            for src in [
-                "length",
-                "(length)",
-                ". | length",
-                "startswith(\"z\")",
-                "endswith(\"z\")",
-                "startswith(\"\")",
-                ". | startswith(\"a\")",
-                "endswith(\"\u{672c}\u{8a9e}\")",
-            ] {
+            for src in shapes {
                 let expr = parse(src).unwrap();
                 let jq_fast = eval_owned_string_door::<JqSemantics>(&expr, &value)
                     .unwrap_or_else(|| panic!("{src:?} on {text:?} declined"));
@@ -114134,7 +114138,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(answered, strings.len() * 8);
+        assert_eq!(answered, strings.len() * shapes.len());
         // Not a string: the container arms and the bridge keep these.
         for value in [
             OwnedValue::Null,

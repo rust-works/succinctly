@@ -55307,6 +55307,46 @@ mod tests {
         assert!(reindexes <= 1, "{query} reindexed {reindexes} times");
     }
 
+    /// #5714: the string door of #5691 is reached from both of its call sites, and each is pinned
+    /// on its own. `ascii_downcase` makes the string an owned value and is the one crossing each
+    /// row still pays (the baseline of 1); a site that loses or shadows the door pays a second.
+    ///
+    /// A lone last stage is answered by `eval_each_owned_front_doors`; an array construction is
+    /// entered through `eval_on_owned_over`, which has its own call. Disabling one site moves only
+    /// its own rows, so neither can be lost with the other covering for it. Both are the owned
+    /// route, not the cursor route, so a regression shows here and nowhere else.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_string_door_is_reached_from_both_owned_entries_5714() {
+        let doc = r#"{"s":"H\u00e9llo","a":["Ab"]}"#;
+        // `eval_each_owned_front_doors`: a lone last stage.
+        for (query, want) in [
+            (".s | ascii_downcase | length", "5"),
+            (r#".s | ascii_downcase | startswith("h")"#, "true"),
+            (r#".s | ascii_downcase | endswith("o")"#, "true"),
+            (".s | ascii_downcase | (length)", "5"),
+        ] {
+            let (out, reindexes) = outputs_and_reindexes(doc, query);
+            assert_eq!(out, [want], "{query}");
+            assert_eq!(
+                reindexes, 1,
+                "{query}: the front doors lost the string door"
+            );
+        }
+        // `eval_on_owned_over`: the same stage inside an array construction.
+        for (query, want) in [
+            ("[.s | ascii_downcase | length]", "[5]"),
+            ("[.a[] | ascii_downcase | length]", "[2]"),
+        ] {
+            let (out, reindexes) = outputs_and_reindexes(doc, query);
+            assert_eq!(out, [want], "{query}");
+            assert_eq!(
+                reindexes, 1,
+                "{query}: eval_on_owned_over lost the string door"
+            );
+        }
+    }
+
     /// #3690: `nulls`, `booleans`, `numbers`, `strings`, `arrays` and
     /// `objects` answer from the node's own type. They used to fall through to
     /// the materializing fallback, which decoded each element and re-entered
@@ -55789,7 +55829,8 @@ mod tests {
     fn test_bound_array_length_declines_keep_the_bridge_3477() {
         let doc = r#"{"a":{"b":1},"c":[1,2],"n":null,"s":"héllo","x":-5}"#;
         for (query, want) in [
-            // Non-containers decline to the bridge's own rules.
+            // Non-containers decline to the bridge's own rules; a string is the exception since
+            // #5710, which answers it without the bridge (reindex count 1 -> 0).
             ("[.n] as $a | $a[0] | length", "0"),
             ("[.s] as $a | $a[0] | length", "5"),
             ("[.x] as $a | $a[0] | length", "5"),
