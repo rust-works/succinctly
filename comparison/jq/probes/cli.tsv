@@ -1,4 +1,4 @@
-# id	area	args (JSON array)	stdin (JSON string, - for none)
+# id	area	args (JSON array)	stdin (JSON string, - for none)	env (optional: JSON object of variables set for both tools, e.g. {"JQ_COLORS":"1;31"}; the base is LC_ALL=C, no JQ_COLORS/NO_COLOR)
 compact	output	["-c", "."]	"{\"a\":[1,2]}"
 raw-output	output	["-r", ".a"]	"{\"a\":\"x y\"}"
 join-output	output	["-j", ".[]"]	"[\"a\",\"b\"]"
@@ -13,7 +13,6 @@ tab	output	["--tab", "."]	"{\"a\":[1]}"
 color	output	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true]}"
 color-pretty	output	["-C", "."]	"{\"a\":[1,\"x\",null,true]}"
 monochrome	output	["-M", "."]	"{\"a\":1}"
-jq-colors	output	["-C", "-c", "."]	"[null]"
 unbuffered	output	["--unbuffered", "-c", "."]	"1 2"
 seq-output	output	["--seq", "-c", "."]	"[1]"
 null-input	input	["-n", "1+1"]	-
@@ -215,3 +214,251 @@ shtest-comment	program	["-n", "123 # comment"]	-
 shtest-comment-cr	program	["-n", "1 # foo\r + 2"]	-
 shtest-cve-2023-50268-nan-payload	numbers	["1 != ."]	"Nan4000\n"
 shtest-cve-2023-50246-tiny-exponent	numbers	["."]	"-10E-1000000001\n"
+jqcolors-one	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "1;31"}
+jqcolors-two	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "0;31:0;32"}
+jqcolors-seven	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "0;31:0;32:0;33:0;34:0;35:0;36:0;37"}
+jqcolors-eight	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "0;31:0;32:0;33:0;34:0;35:0;36:0;37:1;31"}
+jqcolors-nine	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "0;31:0;32:0;33:0;34:0;35:0;36:0;37:1;31:0;33"}
+jqcolors-256	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "38;5;208:38;5;21"}
+jqcolors-bold-underline	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "1;4;31:4;32"}
+jqcolors-empty-fields	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": ":::"}
+jqcolors-empty	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": ""}
+jqcolors-leading-colon	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": ":1"}
+jqcolors-trailing-semicolon	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "1;:2;"}
+jqcolors-nondigit	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "x;y"}
+jqcolors-word	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "red"}
+jqcolors-overlong	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "123456789012345678901234567890"}
+jqcolors-negative	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "-1"}
+jqcolors-space	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "1 ;2"}
+jqcolors-escape-char	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "\u001b[1m"}
+jqcolors-null-only	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "4;35"}
+jqcolors-keys-only	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": ":::::::1;35"}
+jqcolors-zero	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "0"}
+jqcolors-many-semicolons	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "1;2;3;4;5;6;7;8;9"}
+jqcolors-pretty	colour	["-C", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "0;31:0;32:0;33:0;34:0;35:0;36:0;37:1;31"}
+jqcolors-without-C	colour	["-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "1;31"}
+jqcolors-with-M	colour	["-M", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "1;31"}
+jqcolors-null-top	colour	["-C", "-c", "."]	"null\n"	{"JQ_COLORS": "1;31"}
+jqcolors-string-top	colour	["-C", "-c", "."]	"\"s\"\n"	{"JQ_COLORS": "0;31:0;32:0;33:0;34:1;35"}
+jqcolors-objkey-pretty	colour	["-C", "."]	"{\"k\":{\"k2\":1}}\n"	{"JQ_COLORS": "0;90:0;39:0;39:0;39:0;32:1;39:1;39:4;31"}
+nocolor-with-C	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"NO_COLOR": "1"}
+nocolor-without-C	colour	["-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"NO_COLOR": "1"}
+nocolor-empty	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"NO_COLOR": ""}
+nocolor-with-jqcolors	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"JQ_COLORS": "1;31", "NO_COLOR": "1"}
+nocolor-with-M	colour	["-M", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"NO_COLOR": "1"}
+nocolor-zero	colour	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	{"NO_COLOR": "0"}
+color-empty-containers	colour	["-C", "-c", "."]	"[[],{}]\n"	-
+color-empty-containers-pretty	colour	["-C", "."]	"[[],{},[[]],{\"a\":{}}]\n"	-
+color-nested-pretty	colour	["-C", "."]	"{\"a\":{\"b\":[1,{\"c\":[true,null]}]},\"d\":[[1,2],[3]]}\n"	-
+color-key-escapes	colour	["-C", "-c", "."]	"{\"k\\\"ey\":1,\"\\u00e9\":\"\\u00e9\\n\",\"\\ud83d\\ude00\":[]}\n"	-
+color-sort-keys	colour	["-C", "-S", "-c", "."]	"{\"b\":1,\"a\":{\"d\":1,\"c\":2}}\n"	-
+color-tab	colour	["-C", "--tab", "."]	"{\"a\":[1,2]}\n"	-
+color-indent-1	colour	["-C", "--indent", "1", "."]	"{\"a\":[1,2]}\n"	-
+color-indent-0	colour	["-C", "--indent", "0", "."]	"{\"a\":[1,2]}\n"	-
+color-raw-string	colour	["-C", "-r", "."]	"\"str\"\n"	-
+color-raw-array	colour	["-C", "-r", "."]	"[\"a\",\"b\"]\n"	-
+color-join-output	colour	["-C", "-j", "."]	"\"a\" [1] {\"b\":2}\n"	-
+color-ascii	colour	["-C", "-a", "-c", "."]	"[\"é\",\"😀\"]\n"	-
+color-seq	colour	["-C", "--seq", "-c", "."]	"[1,{\"a\":2}]\n"	-
+color-stream	colour	["-C", "--stream", "-c", "."]	"{\"a\":[1,{\"b\":2}]}\n"	-
+color-multi-doc	colour	["-C", "-c", "."]	"1 \"a\" [2] {\"b\":3} null true\n"	-
+color-numbers	colour	["-C", "-c", "."]	"[1,-0,1.5,1e1000,100000000000000000000,0.1]\n"	-
+color-nan-inf	colour	["-C", "-n", "-c", "[nan,infinite,-infinite]"]	-	-
+color-string-escapes	colour	["-C", "-c", "."]	"\"\\u0000\\u001f\\u007f\\\\\\/\\t\"\n"	-
+color-tojson-not-coloured	colour	["-C", "-c", "tojson"]	"{\"a\":[1]}\n"	-
+color-at-json-not-coloured	colour	["-C", "-r", "@json"]	"{\"a\":[1]}\n"	-
+color-tostring-not-coloured	colour	["-C", "-c", "map(tostring)"]	"[[1],{\"a\":2}]\n"	-
+color-C-then-M	colour	["-C", "-M", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	-
+color-M-then-C	colour	["-M", "-C", "-c", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	-
+color-color-output-long	colour	["--color-output", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	-
+color-monochrome-long	colour	["--monochrome-output", "."]	"{\"a\":[1,\"x\",null,true,false],\"b\":{},\"c\":[],\"d\":{\"e\":\"s\\n\\\"q\\\"\"}}\n"	-
+color-C-slurp	colour	["-C", "-s", "-c", "."]	"1 [2]\n"	-
+color-C-null-input	colour	["-C", "-n", "{a:[1,{b:null}]}"]	-	-
+color-C-compact-array-of-objects	colour	["-C", "-c", "."]	"[{\"a\":1},{\"b\":[]}]\n"	-
+color-C-deep	colour	["-C", "."]	"[[[[[[[[1]]]]]]]]\n"	-
+color-C-large-string	colour	["-C", "-c", "."]	"\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n"	-
+color-C-unicode-string	colour	["-C", "-c", "."]	"\"\\u00e9\\u4e2d\\ud83d\\ude00\"\n"	-
+color-C-raw-output0	colour	["-C", "--raw-output0", "."]	"\"a\"\n"	-
+color-C-ascii-keys	colour	["-C", "-a", "-c", "."]	"{\"é\":1}\n"	-
+locale-sort-c	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "C.UTF-8"}
+locale-sort-by-c	locale	["-c", "sort_by(.)"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "C.UTF-8"}
+locale-unique-c	locale	["-c", "unique"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "C.UTF-8"}
+locale-minmax-c	locale	["-c", "[min,max]"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "C.UTF-8"}
+locale-sort-keys-c	locale	["-S", "-c", "."]	"{\"é\":1,\"z\":2,\"B\":3,\"a\":4,\"Z\":5,\"ä\":6,\"İ\":7}\n"	{"LC_ALL": "C.UTF-8"}
+locale-keys-c	locale	["-c", "keys"]	"{\"é\":1,\"z\":2,\"B\":3,\"a\":4,\"Z\":5}\n"	{"LC_ALL": "C.UTF-8"}
+locale-ascii-downcase-c	locale	["-c", "ascii_downcase"]	"\"I İ ı i ÀÉ ß Σ ǅ\"\n"	{"LC_ALL": "C.UTF-8"}
+locale-ascii-upcase-c	locale	["-c", "ascii_upcase"]	"\"I İ ı i ÀÉ ß Σ ǅ\"\n"	{"LC_ALL": "C.UTF-8"}
+locale-test-w-c	locale	["-c", "map(test(\"^\\\\w+$\"))"]	"[\"éa\",\"abc\",\"İ\",\"a b\"]\n"	{"LC_ALL": "C.UTF-8"}
+locale-test-icase-c	locale	["-c", "map(test(\"^i$\";\"i\"))"]	"[\"I\",\"İ\",\"ı\",\"i\"]\n"	{"LC_ALL": "C.UTF-8"}
+locale-test-posix-c	locale	["-c", "map([test(\"[[:alpha:]]\"),test(\"[[:upper:]]\")])"]	"[\"é\",\"É\",\"İ\",\"1\"]\n"	{"LC_ALL": "C.UTF-8"}
+locale-length-c	locale	["-c", "map([length,utf8bytelength])"]	"[\"é\",\"😀\",\"İ\",\"ß\"]\n"	{"LC_ALL": "C.UTF-8"}
+locale-tojson-c	locale	["-c", "tojson"]	"[\"é\",\"😀\"]\n"	{"LC_ALL": "C.UTF-8"}
+locale-ascii-out-c	locale	["-a", "-c", "."]	"[\"é\",\"😀\",\"İ\"]\n"	{"LC_ALL": "C.UTF-8"}
+locale-uri-c	locale	["-r", "@uri"]	"\"é ü İ\"\n"	{"LC_ALL": "C.UTF-8"}
+locale-sh-c	locale	["-r", "@sh"]	"\"é İ 'q'\"\n"	{"LC_ALL": "C.UTF-8"}
+locale-base64-c	locale	["-r", "@base64"]	"\"é İ\"\n"	{"LC_ALL": "C.UTF-8"}
+locale-ltrimstr-c	locale	["-c", "[ltrimstr(\"é\"),rtrimstr(\"İ\")]"]	"\"éaİ\"\n"	{"LC_ALL": "C.UTF-8"}
+locale-split-c	locale	["-c", "[split(\"İ\"),ascii_downcase,explode]"]	"\"aİb\"\n"	{"LC_ALL": "C.UTF-8"}
+locale-numbers-c	locale	["-c", "[.[]|tostring]"]	"[1.5,1e100,0.1,1e-7,100000000000000000000,3.0]\n"	{"LC_ALL": "C.UTF-8"}
+locale-tonumber-c	locale	["-c", "map(try tonumber catch \"err\")"]	"[\"1.5\",\"1,5\",\"1e3\",\" 1\",\"0x10\",\"1_0\"]\n"	{"LC_ALL": "C.UTF-8"}
+locale-number-literal-c	locale	["-c", "."]	"[1.5,1e1000,0.10]\n"	{"LC_ALL": "C.UTF-8"}
+locale-text-interp-c	locale	["-r", "\"\\(.)\""]	"1.5\n"	{"LC_ALL": "C.UTF-8"}
+locale-sh-number-c	locale	["-r", "@sh \"x \\(.)\""]	"1.5\n"	{"LC_ALL": "C.UTF-8"}
+locale-csv-c	locale	["-r", "@csv"]	"[1.5,\"é\",null,0.1]\n"	{"LC_ALL": "C.UTF-8"}
+locale-env-c	locale	["-c", "[env.LC_ALL,env.LANG]"]	"null\n"	{"LC_ALL": "C.UTF-8"}
+locale-sort-en-us	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-sort-by-en-us	locale	["-c", "sort_by(.)"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-unique-en-us	locale	["-c", "unique"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-minmax-en-us	locale	["-c", "[min,max]"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-sort-keys-en-us	locale	["-S", "-c", "."]	"{\"é\":1,\"z\":2,\"B\":3,\"a\":4,\"Z\":5,\"ä\":6,\"İ\":7}\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-keys-en-us	locale	["-c", "keys"]	"{\"é\":1,\"z\":2,\"B\":3,\"a\":4,\"Z\":5}\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-ascii-downcase-en-us	locale	["-c", "ascii_downcase"]	"\"I İ ı i ÀÉ ß Σ ǅ\"\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-ascii-upcase-en-us	locale	["-c", "ascii_upcase"]	"\"I İ ı i ÀÉ ß Σ ǅ\"\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-test-w-en-us	locale	["-c", "map(test(\"^\\\\w+$\"))"]	"[\"éa\",\"abc\",\"İ\",\"a b\"]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-test-icase-en-us	locale	["-c", "map(test(\"^i$\";\"i\"))"]	"[\"I\",\"İ\",\"ı\",\"i\"]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-test-posix-en-us	locale	["-c", "map([test(\"[[:alpha:]]\"),test(\"[[:upper:]]\")])"]	"[\"é\",\"É\",\"İ\",\"1\"]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-length-en-us	locale	["-c", "map([length,utf8bytelength])"]	"[\"é\",\"😀\",\"İ\",\"ß\"]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-tojson-en-us	locale	["-c", "tojson"]	"[\"é\",\"😀\"]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-ascii-out-en-us	locale	["-a", "-c", "."]	"[\"é\",\"😀\",\"İ\"]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-uri-en-us	locale	["-r", "@uri"]	"\"é ü İ\"\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-sh-en-us	locale	["-r", "@sh"]	"\"é İ 'q'\"\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-base64-en-us	locale	["-r", "@base64"]	"\"é İ\"\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-ltrimstr-en-us	locale	["-c", "[ltrimstr(\"é\"),rtrimstr(\"İ\")]"]	"\"éaİ\"\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-split-en-us	locale	["-c", "[split(\"İ\"),ascii_downcase,explode]"]	"\"aİb\"\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-numbers-en-us	locale	["-c", "[.[]|tostring]"]	"[1.5,1e100,0.1,1e-7,100000000000000000000,3.0]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-tonumber-en-us	locale	["-c", "map(try tonumber catch \"err\")"]	"[\"1.5\",\"1,5\",\"1e3\",\" 1\",\"0x10\",\"1_0\"]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-number-literal-en-us	locale	["-c", "."]	"[1.5,1e1000,0.10]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-text-interp-en-us	locale	["-r", "\"\\(.)\""]	"1.5\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-sh-number-en-us	locale	["-r", "@sh \"x \\(.)\""]	"1.5\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-csv-en-us	locale	["-r", "@csv"]	"[1.5,\"é\",null,0.1]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-env-en-us	locale	["-c", "[env.LC_ALL,env.LANG]"]	"null\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-sort-de-de	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-sort-by-de-de	locale	["-c", "sort_by(.)"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-unique-de-de	locale	["-c", "unique"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-minmax-de-de	locale	["-c", "[min,max]"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-sort-keys-de-de	locale	["-S", "-c", "."]	"{\"é\":1,\"z\":2,\"B\":3,\"a\":4,\"Z\":5,\"ä\":6,\"İ\":7}\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-keys-de-de	locale	["-c", "keys"]	"{\"é\":1,\"z\":2,\"B\":3,\"a\":4,\"Z\":5}\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-ascii-downcase-de-de	locale	["-c", "ascii_downcase"]	"\"I İ ı i ÀÉ ß Σ ǅ\"\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-ascii-upcase-de-de	locale	["-c", "ascii_upcase"]	"\"I İ ı i ÀÉ ß Σ ǅ\"\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-test-w-de-de	locale	["-c", "map(test(\"^\\\\w+$\"))"]	"[\"éa\",\"abc\",\"İ\",\"a b\"]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-test-icase-de-de	locale	["-c", "map(test(\"^i$\";\"i\"))"]	"[\"I\",\"İ\",\"ı\",\"i\"]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-test-posix-de-de	locale	["-c", "map([test(\"[[:alpha:]]\"),test(\"[[:upper:]]\")])"]	"[\"é\",\"É\",\"İ\",\"1\"]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-length-de-de	locale	["-c", "map([length,utf8bytelength])"]	"[\"é\",\"😀\",\"İ\",\"ß\"]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-tojson-de-de	locale	["-c", "tojson"]	"[\"é\",\"😀\"]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-ascii-out-de-de	locale	["-a", "-c", "."]	"[\"é\",\"😀\",\"İ\"]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-uri-de-de	locale	["-r", "@uri"]	"\"é ü İ\"\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-sh-de-de	locale	["-r", "@sh"]	"\"é İ 'q'\"\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-base64-de-de	locale	["-r", "@base64"]	"\"é İ\"\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-ltrimstr-de-de	locale	["-c", "[ltrimstr(\"é\"),rtrimstr(\"İ\")]"]	"\"éaİ\"\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-split-de-de	locale	["-c", "[split(\"İ\"),ascii_downcase,explode]"]	"\"aİb\"\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-numbers-de-de	locale	["-c", "[.[]|tostring]"]	"[1.5,1e100,0.1,1e-7,100000000000000000000,3.0]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-tonumber-de-de	locale	["-c", "map(try tonumber catch \"err\")"]	"[\"1.5\",\"1,5\",\"1e3\",\" 1\",\"0x10\",\"1_0\"]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-number-literal-de-de	locale	["-c", "."]	"[1.5,1e1000,0.10]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-text-interp-de-de	locale	["-r", "\"\\(.)\""]	"1.5\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-sh-number-de-de	locale	["-r", "@sh \"x \\(.)\""]	"1.5\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-csv-de-de	locale	["-r", "@csv"]	"[1.5,\"é\",null,0.1]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-env-de-de	locale	["-c", "[env.LC_ALL,env.LANG]"]	"null\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-sort-tr-tr	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-sort-by-tr-tr	locale	["-c", "sort_by(.)"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-unique-tr-tr	locale	["-c", "unique"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-minmax-tr-tr	locale	["-c", "[min,max]"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-sort-keys-tr-tr	locale	["-S", "-c", "."]	"{\"é\":1,\"z\":2,\"B\":3,\"a\":4,\"Z\":5,\"ä\":6,\"İ\":7}\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-keys-tr-tr	locale	["-c", "keys"]	"{\"é\":1,\"z\":2,\"B\":3,\"a\":4,\"Z\":5}\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-ascii-downcase-tr-tr	locale	["-c", "ascii_downcase"]	"\"I İ ı i ÀÉ ß Σ ǅ\"\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-ascii-upcase-tr-tr	locale	["-c", "ascii_upcase"]	"\"I İ ı i ÀÉ ß Σ ǅ\"\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-test-w-tr-tr	locale	["-c", "map(test(\"^\\\\w+$\"))"]	"[\"éa\",\"abc\",\"İ\",\"a b\"]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-test-icase-tr-tr	locale	["-c", "map(test(\"^i$\";\"i\"))"]	"[\"I\",\"İ\",\"ı\",\"i\"]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-test-posix-tr-tr	locale	["-c", "map([test(\"[[:alpha:]]\"),test(\"[[:upper:]]\")])"]	"[\"é\",\"É\",\"İ\",\"1\"]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-length-tr-tr	locale	["-c", "map([length,utf8bytelength])"]	"[\"é\",\"😀\",\"İ\",\"ß\"]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-tojson-tr-tr	locale	["-c", "tojson"]	"[\"é\",\"😀\"]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-ascii-out-tr-tr	locale	["-a", "-c", "."]	"[\"é\",\"😀\",\"İ\"]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-uri-tr-tr	locale	["-r", "@uri"]	"\"é ü İ\"\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-sh-tr-tr	locale	["-r", "@sh"]	"\"é İ 'q'\"\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-base64-tr-tr	locale	["-r", "@base64"]	"\"é İ\"\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-ltrimstr-tr-tr	locale	["-c", "[ltrimstr(\"é\"),rtrimstr(\"İ\")]"]	"\"éaİ\"\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-split-tr-tr	locale	["-c", "[split(\"İ\"),ascii_downcase,explode]"]	"\"aİb\"\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-numbers-tr-tr	locale	["-c", "[.[]|tostring]"]	"[1.5,1e100,0.1,1e-7,100000000000000000000,3.0]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-tonumber-tr-tr	locale	["-c", "map(try tonumber catch \"err\")"]	"[\"1.5\",\"1,5\",\"1e3\",\" 1\",\"0x10\",\"1_0\"]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-number-literal-tr-tr	locale	["-c", "."]	"[1.5,1e1000,0.10]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-text-interp-tr-tr	locale	["-r", "\"\\(.)\""]	"1.5\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-sh-number-tr-tr	locale	["-r", "@sh \"x \\(.)\""]	"1.5\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-csv-tr-tr	locale	["-r", "@csv"]	"[1.5,\"é\",null,0.1]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-env-tr-tr	locale	["-c", "[env.LC_ALL,env.LANG]"]	"null\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-strftime-names-en-us	locale	["-r", "strftime(\"%A %a %B %b %p\")"]	"1425599621\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-strftime-c-en-us	locale	["-r", "strftime(\"%c|%x|%X|%D|%r|%R\")"]	"1425599621\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-strftime-num-en-us	locale	["-r", "strftime(\"%d %e %j %U %Y %y %u %w %Z %z\")"]	"1425599621\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-strflocaltime-en-us	locale	["-r", "strflocaltime(\"%A %B %p\")"]	"1425599621\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-todate-en-us	locale	["-r", "todate"]	"1425599621\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-strptime-en-en-us	locale	["-c", "strptime(\"%A, %B %d %Y\")"]	"\"Thursday, March 05 2015\"\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-strptime-abbr-en-us	locale	["-c", "strptime(\"%a %b %d %Y\")"]	"\"Thu Mar 05 2015\"\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-strptime-de-en-us	locale	["-c", "strptime(\"%A, %d. %B %Y\")"]	"\"Donnerstag, 05. März 2015\"\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-strptime-tr-en-us	locale	["-c", "strptime(\"%d %B %Y\")"]	"\"05 Mart 2015\"\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-strptime-ampm-en-us	locale	["-c", "strptime(\"%I:%M %p\")"]	"\"11:30 PM\"\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-gmtime-en-us	locale	["-c", "gmtime"]	"1425599621.678\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-mktime-en-us	locale	["-c", "mktime"]	"[2015,2,5,23,53,41,4,63]\n"	{"LC_ALL": "en_US.UTF-8"}
+locale-strftime-names-de-de	locale	["-r", "strftime(\"%A %a %B %b %p\")"]	"1425599621\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-strftime-c-de-de	locale	["-r", "strftime(\"%c|%x|%X|%D|%r|%R\")"]	"1425599621\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-strftime-num-de-de	locale	["-r", "strftime(\"%d %e %j %U %Y %y %u %w %Z %z\")"]	"1425599621\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-strflocaltime-de-de	locale	["-r", "strflocaltime(\"%A %B %p\")"]	"1425599621\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-todate-de-de	locale	["-r", "todate"]	"1425599621\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-strptime-en-de-de	locale	["-c", "strptime(\"%A, %B %d %Y\")"]	"\"Thursday, March 05 2015\"\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-strptime-abbr-de-de	locale	["-c", "strptime(\"%a %b %d %Y\")"]	"\"Thu Mar 05 2015\"\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-strptime-de-de-de	locale	["-c", "strptime(\"%A, %d. %B %Y\")"]	"\"Donnerstag, 05. März 2015\"\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-strptime-tr-de-de	locale	["-c", "strptime(\"%d %B %Y\")"]	"\"05 Mart 2015\"\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-strptime-ampm-de-de	locale	["-c", "strptime(\"%I:%M %p\")"]	"\"11:30 PM\"\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-gmtime-de-de	locale	["-c", "gmtime"]	"1425599621.678\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-mktime-de-de	locale	["-c", "mktime"]	"[2015,2,5,23,53,41,4,63]\n"	{"LC_ALL": "de_DE.UTF-8"}
+locale-strftime-names-tr-tr	locale	["-r", "strftime(\"%A %a %B %b %p\")"]	"1425599621\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-strftime-c-tr-tr	locale	["-r", "strftime(\"%c|%x|%X|%D|%r|%R\")"]	"1425599621\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-strftime-num-tr-tr	locale	["-r", "strftime(\"%d %e %j %U %Y %y %u %w %Z %z\")"]	"1425599621\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-strflocaltime-tr-tr	locale	["-r", "strflocaltime(\"%A %B %p\")"]	"1425599621\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-todate-tr-tr	locale	["-r", "todate"]	"1425599621\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-strptime-en-tr-tr	locale	["-c", "strptime(\"%A, %B %d %Y\")"]	"\"Thursday, March 05 2015\"\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-strptime-abbr-tr-tr	locale	["-c", "strptime(\"%a %b %d %Y\")"]	"\"Thu Mar 05 2015\"\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-strptime-de-tr-tr	locale	["-c", "strptime(\"%A, %d. %B %Y\")"]	"\"Donnerstag, 05. März 2015\"\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-strptime-tr-tr-tr	locale	["-c", "strptime(\"%d %B %Y\")"]	"\"05 Mart 2015\"\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-strptime-ampm-tr-tr	locale	["-c", "strptime(\"%I:%M %p\")"]	"\"11:30 PM\"\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-gmtime-tr-tr	locale	["-c", "gmtime"]	"1425599621.678\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-mktime-tr-tr	locale	["-c", "mktime"]	"[2015,2,5,23,53,41,4,63]\n"	{"LC_ALL": "tr_TR.UTF-8"}
+locale-strftime-names-c	locale	["-r", "strftime(\"%A %a %B %b %p\")"]	"1425599621\n"	{"LC_ALL": "C.UTF-8"}
+locale-strftime-c-c	locale	["-r", "strftime(\"%c|%x|%X|%D|%r|%R\")"]	"1425599621\n"	{"LC_ALL": "C.UTF-8"}
+locale-strftime-num-c	locale	["-r", "strftime(\"%d %e %j %U %Y %y %u %w %Z %z\")"]	"1425599621\n"	{"LC_ALL": "C.UTF-8"}
+locale-strflocaltime-c	locale	["-r", "strflocaltime(\"%A %B %p\")"]	"1425599621\n"	{"LC_ALL": "C.UTF-8"}
+locale-todate-c	locale	["-r", "todate"]	"1425599621\n"	{"LC_ALL": "C.UTF-8"}
+locale-strptime-en-c	locale	["-c", "strptime(\"%A, %B %d %Y\")"]	"\"Thursday, March 05 2015\"\n"	{"LC_ALL": "C.UTF-8"}
+locale-strptime-abbr-c	locale	["-c", "strptime(\"%a %b %d %Y\")"]	"\"Thu Mar 05 2015\"\n"	{"LC_ALL": "C.UTF-8"}
+locale-strptime-de-c	locale	["-c", "strptime(\"%A, %d. %B %Y\")"]	"\"Donnerstag, 05. März 2015\"\n"	{"LC_ALL": "C.UTF-8"}
+locale-strptime-tr-c	locale	["-c", "strptime(\"%d %B %Y\")"]	"\"05 Mart 2015\"\n"	{"LC_ALL": "C.UTF-8"}
+locale-strptime-ampm-c	locale	["-c", "strptime(\"%I:%M %p\")"]	"\"11:30 PM\"\n"	{"LC_ALL": "C.UTF-8"}
+locale-gmtime-c	locale	["-c", "gmtime"]	"1425599621.678\n"	{"LC_ALL": "C.UTF-8"}
+locale-mktime-c	locale	["-c", "mktime"]	"[2015,2,5,23,53,41,4,63]\n"	{"LC_ALL": "C.UTF-8"}
+locale-var-lang-only-time	locale	["-r", "strftime(\"%A %B\")"]	"1425599621\n"	{"LANG": "de_DE.UTF-8", "LC_ALL": ""}
+locale-var-lang-only-text	locale	["-c", "[ascii_downcase,length,(.|@uri)]"]	"\"İÉé\"\n"	{"LANG": "de_DE.UTF-8", "LC_ALL": ""}
+locale-var-lang-only-sort	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LANG": "de_DE.UTF-8", "LC_ALL": ""}
+locale-var-lc-ctype-only-time	locale	["-r", "strftime(\"%A %B\")"]	"1425599621\n"	{"LC_ALL": "", "LC_CTYPE": "tr_TR.UTF-8"}
+locale-var-lc-ctype-only-text	locale	["-c", "[ascii_downcase,length,(.|@uri)]"]	"\"İÉé\"\n"	{"LC_ALL": "", "LC_CTYPE": "tr_TR.UTF-8"}
+locale-var-lc-ctype-only-sort	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "", "LC_CTYPE": "tr_TR.UTF-8"}
+locale-var-lc-time-only-time	locale	["-r", "strftime(\"%A %B\")"]	"1425599621\n"	{"LC_ALL": "", "LC_TIME": "de_DE.UTF-8"}
+locale-var-lc-time-only-text	locale	["-c", "[ascii_downcase,length,(.|@uri)]"]	"\"İÉé\"\n"	{"LC_ALL": "", "LC_TIME": "de_DE.UTF-8"}
+locale-var-lc-time-only-sort	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "", "LC_TIME": "de_DE.UTF-8"}
+locale-var-lc-collate-only-time	locale	["-r", "strftime(\"%A %B\")"]	"1425599621\n"	{"LC_ALL": "", "LC_COLLATE": "de_DE.UTF-8"}
+locale-var-lc-collate-only-text	locale	["-c", "[ascii_downcase,length,(.|@uri)]"]	"\"İÉé\"\n"	{"LC_ALL": "", "LC_COLLATE": "de_DE.UTF-8"}
+locale-var-lc-collate-only-sort	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "", "LC_COLLATE": "de_DE.UTF-8"}
+locale-var-lc-numeric-only-time	locale	["-r", "strftime(\"%A %B\")"]	"1425599621\n"	{"LC_ALL": "", "LC_NUMERIC": "de_DE.UTF-8"}
+locale-var-lc-numeric-only-text	locale	["-c", "[ascii_downcase,length,(.|@uri)]"]	"\"İÉé\"\n"	{"LC_ALL": "", "LC_NUMERIC": "de_DE.UTF-8"}
+locale-var-lc-numeric-only-sort	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "", "LC_NUMERIC": "de_DE.UTF-8"}
+locale-var-lc-all-beats-lang-time	locale	["-r", "strftime(\"%A %B\")"]	"1425599621\n"	{"LANG": "de_DE.UTF-8", "LC_ALL": "C"}
+locale-var-lc-all-beats-lang-text	locale	["-c", "[ascii_downcase,length,(.|@uri)]"]	"\"İÉé\"\n"	{"LANG": "de_DE.UTF-8", "LC_ALL": "C"}
+locale-var-lc-all-beats-lang-sort	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LANG": "de_DE.UTF-8", "LC_ALL": "C"}
+locale-var-unknown-locale-time	locale	["-r", "strftime(\"%A %B\")"]	"1425599621\n"	{"LC_ALL": "xx_XX.UTF-8"}
+locale-var-unknown-locale-text	locale	["-c", "[ascii_downcase,length,(.|@uri)]"]	"\"İÉé\"\n"	{"LC_ALL": "xx_XX.UTF-8"}
+locale-var-unknown-locale-sort	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "xx_XX.UTF-8"}
+locale-var-posix-time	locale	["-r", "strftime(\"%A %B\")"]	"1425599621\n"	{"LC_ALL": "POSIX"}
+locale-var-posix-text	locale	["-c", "[ascii_downcase,length,(.|@uri)]"]	"\"İÉé\"\n"	{"LC_ALL": "POSIX"}
+locale-var-posix-sort	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "POSIX"}
+locale-var-latin1-time	locale	["-r", "strftime(\"%A %B\")"]	"1425599621\n"	{"LC_ALL": "en_US.ISO8859-1"}
+locale-var-latin1-text	locale	["-c", "[ascii_downcase,length,(.|@uri)]"]	"\"İÉé\"\n"	{"LC_ALL": "en_US.ISO8859-1"}
+locale-var-latin1-sort	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "en_US.ISO8859-1"}
+locale-var-garbage-time	locale	["-r", "strftime(\"%A %B\")"]	"1425599621\n"	{"LC_ALL": "not a locale"}
+locale-var-garbage-text	locale	["-c", "[ascii_downcase,length,(.|@uri)]"]	"\"İÉé\"\n"	{"LC_ALL": "not a locale"}
+locale-var-garbage-sort	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "not a locale"}

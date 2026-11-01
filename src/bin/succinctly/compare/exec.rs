@@ -35,12 +35,35 @@ pub fn exec(tool: &Tool, args: &[String], stdin: impl AsRef<[u8]>, cwd: &Path) -
     exec_within(tool, args, stdin, cwd, DEADLINE)
 }
 
+/// [`exec`] with `env` set on top of the fixed environment, for a probe about a variable
+/// (`JQ_COLORS`, `NO_COLOR`, the locale) the fixed one would otherwise hide (#5552).
+pub fn exec_env(
+    tool: &Tool,
+    args: &[String],
+    stdin: impl AsRef<[u8]>,
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<Exec> {
+    exec_with(tool, args, stdin, cwd, DEADLINE, env)
+}
+
 pub fn exec_within(
     tool: &Tool,
     args: &[String],
     stdin: impl AsRef<[u8]>,
     cwd: &Path,
     deadline: Duration,
+) -> Result<Exec> {
+    exec_with(tool, args, stdin, cwd, deadline, &[])
+}
+
+fn exec_with(
+    tool: &Tool,
+    args: &[String],
+    stdin: impl AsRef<[u8]>,
+    cwd: &Path,
+    deadline: Duration,
+    env: &[(String, String)],
 ) -> Result<Exec> {
     let mut child = Command::new(&tool.program)
         .args(&tool.prefix)
@@ -50,6 +73,7 @@ pub fn exec_within(
         .env("LC_ALL", "C")
         .env_remove("JQ_COLORS")
         .env_remove("NO_COLOR")
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -124,6 +148,19 @@ mod tests {
         assert!(!exec(&sh(other), &[], "", Path::new("."))
             .unwrap()
             .is_undefined());
+    }
+
+    /// A probe's variables are set on top of the fixed environment, and can replace it.
+    #[test]
+    fn a_probe_sets_variables_over_the_fixed_environment() {
+        let env = |k: &str, v: &str| vec![(k.to_string(), v.to_string())];
+        let sh = sh("echo \"$TZ|$LC_ALL|${JQ_COLORS-unset}\"");
+        let plain = exec(&sh, &[], "", Path::new(".")).unwrap();
+        assert_eq!(plain.stdout, b"UTC|C|unset\n");
+        let colours = exec_env(&sh, &[], "", Path::new("."), &env("JQ_COLORS", "1;31")).unwrap();
+        assert_eq!(colours.stdout, b"UTC|C|1;31\n");
+        let locale = exec_env(&sh, &[], "", Path::new("."), &env("LC_ALL", "de_DE.UTF-8")).unwrap();
+        assert_eq!(locale.stdout, b"UTC|de_DE.UTF-8|unset\n");
     }
 
     #[test]

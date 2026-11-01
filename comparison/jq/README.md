@@ -25,7 +25,7 @@ reported as a correctness row and gets no timing; the command exits 1 on it.
 | `manifest.toml`       | pinned references (version, source sha256), build, queries |
 | `queries/smoke.tsv`   | `id`, flags, filter, input — data, not code              |
 | `probes/syntax.tsv`   | A: syntax forms, same columns as `cli.tsv`; run beside the builtins |
-| `probes/cli.tsv`      | G: `id`, area, args (JSON array), stdin (JSON string)    |
+| `probes/cli.tsv`      | G: `id`, area, args (JSON array), stdin (JSON string), optional `env` (JSON object of variables set for both tools: `JQ_COLORS`, `NO_COLOR`, `LC_ALL`/`LANG`/`LC_TIME`) |
 | `probes/extensions.tsv` | succinctly-only surface the reference must reject      |
 | `fixtures/`           | working directory of the CLI probes (`-f`, `-L`, ...)    |
 | `vendor/jq-1.7.1/`    | B: jq's own test files (MIT), sha256-pinned in the manifest |
