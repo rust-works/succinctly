@@ -10510,10 +10510,9 @@ pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<Owned
 /// its length or compare its first bytes: about 0.26 s and 190 MB over a 100 MB `--rawfile`,
 /// where the answer needs one pass over the string or only its ends. An owned string is already
 /// valid UTF-8 and cannot raise, so the answer is the bridge's own: `length` counts as
-/// [`builtin_length`] does (`string_length`, per mode), and the two prefix/suffix tests are
-/// [`eval_owned_door_arm`]'s (as is `contains`'s substring test), which decline a non-literal or
-/// non-string argument and leave
-/// every raised error to the bridge.
+/// [`builtin_length`] does (`string_length`, per mode), `utf8bytelength` is the byte count, and
+/// the prefix/suffix tests and `contains` are [`eval_owned_door_arm`]'s, which decline a
+/// non-literal or non-string argument and leave every raised error to the bridge.
 ///
 /// Every answer is a fresh integer or boolean, never a subvalue of `input`, so it is admitted
 /// whatever the embed table holds, as [`eval_owned_length`]'s is. Any other builtin or input
@@ -10732,11 +10731,12 @@ fn eval_owned_door_arm<S: EvalSemantics>(
             }
             _ => return None,
         },
-        // A string in a string is a substring test in both modes (`owned_contains`); every other
-        // pair, and each container, keeps the bridge's kind check and its per-mode rules (#5675).
+        // A string in a string, asked of the bridge's own `owned_contains` so the two cannot drift;
+        // every other pair, and each container, keeps the bridge's kind check and its per-mode
+        // rules (#5675).
         Builtin::Contains(pattern) => match (input, literal(pattern)?) {
-            (OwnedValue::String(s), OwnedValue::String(pattern)) => {
-                OwnedValue::Bool(s.contains(&*pattern))
+            (OwnedValue::String(_), pattern @ OwnedValue::String(_)) => {
+                OwnedValue::Bool(owned_contains::<S>(input, &pattern))
             }
             _ => return None,
         },
