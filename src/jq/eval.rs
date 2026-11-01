@@ -86868,9 +86868,9 @@ fn collect_tostream_events_owned(
 /// document's index instead of from the value (#5618), or `None` where it could not be built the
 /// same way.
 ///
-/// `tostream_events_owned(to_owned_checked::<JqSemantics, _>(&cursor.value())?)` makes the same
-/// events, but builds the whole document first and then takes it apart. Here each leaf (a scalar or
-/// an empty container) goes through `to_owned_checked` alone and the paths are built from the
+/// `tostream_events_owned` of the document's converted value makes the same events, but builds the
+/// whole document first and then takes it apart. Here each leaf (a scalar or an empty container) is
+/// converted alone, through the conversion's own scalar chain, and the paths are built from the
 /// index, with the same key sharing.
 ///
 /// `None` means "take the conversion instead": the walk does not decide anything the conversion
@@ -86978,7 +86978,10 @@ fn walk_json_stream<'a, W: Clone + AsRef<[u64]>>(
             Some(StreamWalk::Walked)
         }
         _ => {
-            let leaf = super::eval_generic::to_owned_checked::<JqSemantics, _>(&value).ok()?;
+            // STYLE-0012: not a suppression. A leaf that does not convert declines the document,
+            // and the caller converts the whole document instead, which raises the same error
+            // (`to_owned`'s scalar chain is the one the conversion's own walk runs on each leaf).
+            let leaf = super::eval_generic::to_owned::<JqSemantics, _>(&value).ok()?;
             let nan = matches!(
                 leaf,
                 OwnedValue::NumberLiteral(NumberRepr::Float(f), _) | OwnedValue::Float(f) if f.is_nan()
