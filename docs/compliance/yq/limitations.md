@@ -3305,8 +3305,9 @@ It is a property of the bracket spelling directly after the operator, so the par
 A write through the same spelling (`(A + B)["k"] = 1`) is unchanged: an assignment target is folded back to the field it always was.
 A whole-number key (`(A + B)[0]`, `[-1]`, `[1.0]`) is kept as a computed key the same way (#5460), and an object-valued or array-valued key (`(A + B)[.a]`, `[[0]]`) reads nothing on a mapping instead of raising `Cannot index object with object`.
 An array head reads as before (`([1,2] + [3])[9]` is `null`, `[-1]` is `3`).
-A `del()` argument and an assignment target, comma lists of them included, are folded back to the path step they always were, so both stay the no-ops they are in yq.
-Not matched: `del((A + B)[.k])` with a computed key fails with `Invalid path expression` where yq leaves the document alone, and `(A + B)[.k]` over an array head with a mapping-valued key words its error differently.
+A `del()` argument, an assignment target (`=`, `|=`, the compound operators, `style =`, `tag =`, `anchor =`) and a `with()` path, comma lists of them included, are folded back to the path step they always were, so each stays the no-op it is in yq.
+Not matched, all as before: `del((A + B)[.k])` with a computed key, `del((A + B)[0] | select(.))` with the key piped into another stage, and a write through a whole-number key past 2^63 (`(A + B)[9.3e18] = 1`) fail with `Invalid path expression` where yq leaves the document alone.
+`(A + B)[.k]` over an array head with a mapping-valued key words its error differently.
 
 ### `//` maps per left output and keeps a falsy left value when the right side is empty — resolved ([#2817](https://github.com/rust-works/succinctly/issues/2817)); yq's auto-creating key lookup remains
 

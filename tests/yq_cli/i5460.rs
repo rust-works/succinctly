@@ -5,8 +5,9 @@
 //! over the document below, `-o=json -I=0`. An array target, a key the mapping holds, and a write
 //! through such a head (a no-op in yq) read as before.
 //!
-//! Not matched: `del((A + B)[.k])` with a computed key fails with `Invalid path expression`
-//! where yq leaves the document alone, as it did before this change.
+//! Not matched, all as before this change: `del((A + B)[.k])` with a computed key, `del` of such a
+//! key piped into another stage, and a write through a key past 2^63 fail with `Invalid path
+//! expression` where yq leaves the document alone.
 
 use anyhow::Result;
 
@@ -106,6 +107,20 @@ fn test_write_and_delete_through_a_number_key_off_a_sum_are_no_ops_5460() -> Res
         ("del((.l + [3])[-1])", DOC_JSON),
         ("del((.a + {})[1.0])", DOC_JSON),
         ("del((.a + {})[0].x)", DOC_JSON),
+        // The other path-taking forms: metadata assignments, `with`, compound assignments.
+        ("(.l + [3])[0] style = \"single\"", DOC_JSON),
+        ("(.l + [3])[0] tag = \"!!str\"", DOC_JSON),
+        ("(.a + {})[0] anchor = \"x\"", DOC_JSON),
+        ("with((.l + [3])[0]; . = 9)", DOC_JSON),
+        ("with((.a + {})[0]; . = 9)", DOC_JSON),
+        ("(.l + [3])[0] += 1", DOC_JSON),
+        ("(.l + [3])[0] *= 2", DOC_JSON),
+        // Spelled and large whole numbers fold back to the step they were, up to 2^63.
+        ("(.a + {})[2.00] = 1", DOC_JSON),
+        ("del((.a + {})[1e10])", DOC_JSON),
+        ("(.a + {})[9.1e18] = 1", DOC_JSON),
+        ("del((.a + {})[9.1e18])", DOC_JSON),
+        ("(.a + {})[-9.1e18] = 1", DOC_JSON),
         ("del((.a + {})[\"x\"])", DOC_JSON),
         // Other targets of the same `del`, or the same assignment, still act.
         (

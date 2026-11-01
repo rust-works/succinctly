@@ -4997,7 +4997,8 @@ impl<'a> Parser<'a> {
         }
         self.next();
         self.skip_ws();
-        let path = self.parse_expr()?;
+        // #5460: a path argument, so a kept key after a `+`/`*` head reads as the step it was.
+        let path = Self::fold_sum_or_merge_key(self.parse_expr()?);
         self.skip_ws();
         if matches!(path, Expr::Comma(_)) {
             return Err(ParseError::new(
@@ -9010,10 +9011,18 @@ impl<'a> Parser<'a> {
         match folded {
             Expr::Field(name) => Ok(Expr::Literal(Literal::String(name))),
             Expr::Index { idx, key: None } => Ok(Expr::Literal(Literal::Int(idx))),
+            // A spelled whole number keeps its spelling, so folding it back is `fold_index_key`.
             Expr::Index {
-                key: Some(key @ (NumberKey::Float(_) | NumberKey::Literal(..))),
+                key: Some(NumberKey::Literal(f, text)),
                 ..
-            } => Ok(Expr::Literal(Literal::Float(key.value()))),
+            } => Ok(Expr::Literal(Literal::NumberLiteral(
+                NumberRepr::Float(f),
+                text.into(),
+            ))),
+            Expr::Index {
+                key: Some(NumberKey::Float(f)),
+                ..
+            } => Ok(Expr::Literal(Literal::Float(f))),
             other => Err(other),
         }
     }
@@ -9588,7 +9597,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let value = self.parse_alternative()?;
         Ok(Ok(Expr::MetaAssign {
-            target: Box::new(left),
+            target: Box::new(Self::fold_sum_or_merge_key(left)),
             slot,
             value: Box::new(value),
             is_update,
@@ -9645,33 +9654,41 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The path step a key kept by [`Self::keep_string_key_after_sum_or_merge`] was before it was
+    /// kept: a string is the field, and a whole number is what [`Self::fold_index_key`] makes of
+    /// it, spelling and range included. `None` for any other key.
+    fn path_step_of_kept_key(key: &Expr) -> Option<Expr> {
+        match key {
+            Expr::Literal(Literal::String(name)) => Some(Expr::Field(name.clone())),
+            Expr::Literal(Literal::Int(idx)) => Some(Expr::Index {
+                idx: *idx,
+                key: None,
+            }),
+            Expr::Literal(Literal::Float(f))
+                if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f < i64::MAX as f64 =>
+            {
+                Some(Expr::Index {
+                    idx: *f as i64,
+                    key: Some(NumberKey::Float(*f)),
+                })
+            }
+            Expr::Literal(Literal::NumberLiteral(..)) => Self::fold_index_key(key),
+            _ => None,
+        }
+    }
+
     /// [`Self::keep_string_key_after_sum_or_merge`] undone for an assignment's target: a write
     /// through `(A + B)["k"]` is the no-op it always was (#4361), and the kept computed key would
     /// read as a path expression that is not one. The key is the head of the target, bare or as
     /// the first stage of a longer path (`(A + B)["k"].x`, `(A + B)["k"][0]`).
     fn fold_sum_or_merge_key(left: Expr) -> Expr {
         match left {
-            Expr::IndexExpr { target, key } if target.is_sum_or_merge() => match *key {
-                Expr::Literal(Literal::String(name)) => {
-                    Expr::pipe(vec![*target, Expr::Field(name)])
+            Expr::IndexExpr { target, key } if target.is_sum_or_merge() => {
+                match Self::path_step_of_kept_key(&key) {
+                    Some(step) => Expr::pipe(vec![*target, step]),
+                    None => Expr::IndexExpr { target, key },
                 }
-                Expr::Literal(Literal::Int(idx)) => {
-                    Expr::pipe(vec![*target, Expr::Index { idx, key: None }])
-                }
-                Expr::Literal(Literal::Float(f)) if f.fract() == 0.0 && f.abs() < 9.0e18 => {
-                    Expr::pipe(vec![
-                        *target,
-                        Expr::Index {
-                            idx: f as i64,
-                            key: Some(NumberKey::Float(f)),
-                        },
-                    ])
-                }
-                other => Expr::IndexExpr {
-                    target,
-                    key: Box::new(other),
-                },
-            },
+            }
             Expr::Pipe(stages) => {
                 let mut folded = stages.to_vec();
                 let head = folded.remove(0);
