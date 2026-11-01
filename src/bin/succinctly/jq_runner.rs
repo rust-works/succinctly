@@ -2420,7 +2420,7 @@ impl ModuleLoader {
         // too.
         if !data_bindings.is_empty() {
             let data_bindings = dedup_bindings_last_wins(data_bindings);
-            expr = jq::substitute_vars(&expr, as_var_refs(&data_bindings));
+            expr = jq::substitute_named_args(&expr, as_var_refs(&data_bindings));
         }
 
         // Every module some module depends on, outermost first, and every

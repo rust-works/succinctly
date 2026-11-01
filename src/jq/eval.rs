@@ -77262,39 +77262,44 @@ pub fn substitute_vars<'a, I>(expr: &Expr, vars: I) -> Expr
 where
     I: IntoIterator<Item = (&'a str, &'a OwnedValue)>,
 {
-    let mut iter = vars.into_iter();
-    let Some((name, value)) = iter.next() else {
-        return expr.clone();
-    };
-    let mut result = substitute_var(expr, name, value);
-    for (name, value) in iter {
-        result = substitute_var(&result, name, value);
-    }
-    result
+    substitute_vars_shared_or_literal(expr, vars, false)
 }
 
 /// [`substitute_vars`] for a program's named arguments, sharing a container value (#5690).
 ///
-/// A container (`--argjson`, `--slurpfile`, `$ARGS`) is spliced as one shared marker instead of a
-/// literal tree rebuilt at every `$name`, when [`reads_named_arguments_only`] holds.
+/// A container (`--argjson`, `--slurpfile`, `$ARGS`, a data `import`) is spliced as one shared
+/// marker instead of a literal tree rebuilt at every `$name`, when the program only reads it
+/// ([`reads_named_arguments_only`]).
 ///
 /// The literal is a tree as large as the value, built once per read of the name and then built
-/// again into a value when the program runs: 10 MB of `--slurpfile` was about 80 ms of 148. The
-/// marker is the one an `. as $x` binding substitutes (`Origin::Untracked`), which evaluates as the
-/// plain value and shares its storage. It is only sound where nothing asks for the value's path or
-/// writes through it, which is what the gate checks (#5673 pins the rows that made it unsound).
+/// again into a value when the program runs: for 10 MB of `--slurpfile` that was 177 ms of the
+/// run, and 75 ms with the marker (Apple M5 Max). The marker is the one an `. as $x` binding
+/// substitutes (`Origin::Untracked`), which evaluates as the plain value and shares its storage.
+/// It is only sound where nothing asks for the value's path or writes through it, which is what
+/// the gate checks (#5673 pins the rows that made it unsound).
 pub fn substitute_named_args<'a, I>(expr: &Expr, vars: I) -> Expr
 where
     I: IntoIterator<Item = (&'a str, &'a OwnedValue)>,
 {
-    if !reads_named_arguments_only(expr) {
-        return substitute_vars(expr, vars);
-    }
+    // Only a container can be shared, so a program with none (the usual `--arg`) is not walked.
+    let vars: Vec<(&str, &OwnedValue)> = vars.into_iter().collect();
+    let share = vars
+        .iter()
+        .any(|(_, value)| matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)))
+        && reads_named_arguments_only(expr);
+    substitute_vars_shared_or_literal(expr, vars, share)
+}
+
+/// [`substitute_vars`]'s loop, splicing a container as one shared marker when `share` is set.
+fn substitute_vars_shared_or_literal<'a, I>(expr: &Expr, vars: I, share: bool) -> Expr
+where
+    I: IntoIterator<Item = (&'a str, &'a OwnedValue)>,
+{
     let mut result: Option<Expr> = None;
     for (name, value) in vars {
         let current = result.as_ref().unwrap_or(expr);
         result = Some(
-            if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+            if share && matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
                 let marker = LazyMarker::new(value, Origin::Untracked, None);
                 substitute_var_with(current, name, value, Some(&marker), false)
             } else {
@@ -77307,11 +77312,17 @@ where
 
 /// Whether `expr` only reads a named argument's value (#5690).
 ///
-/// That is: no assignment, path expression, fold or definition anywhere in it. A shared marker is refused in path position (`$d | (.[] |
-/// numbers) |= . + 1` is an error with one, `[2,3]` in jq), makes a fold that appends or assigns
-/// the value quadratic (`closed_expr_to_owned` declines a marker), and slows a small container
-/// assigned per record, so each of those keeps the literal.
-pub fn reads_named_arguments_only(expr: &Expr) -> bool {
+/// That is: no assignment, path expression, fold or definition anywhere in it. A shared marker is
+/// refused in path position (`$d | (.[] | numbers) |= . + 1` is an error with one, `[2,3]` in jq),
+/// makes a fold that appends or assigns the value quadratic (`closed_expr_to_owned` declines a
+/// marker), and slows a small container assigned per record, so each of those keeps the literal.
+///
+/// A list of what to exclude, not of what to allow: a construct that asks for a path or writes
+/// has to be added here when it is added to the language (the same rule `walk::any_subexpr`'s own
+/// exhaustive match enforces for a walk, which a `matches!` cannot). A call of anything that is
+/// not a builtin (`FuncCall`, `NamespacedCall`) is excluded too, since its body is not in view;
+/// the jq builtins parse as `Builtin`, so that costs a program with a `def` or a module call.
+fn reads_named_arguments_only(expr: &Expr) -> bool {
     !any_subexpr(expr, &mut |e| {
         is_assignment_expr(e)
             || matches!(
@@ -77339,6 +77350,9 @@ pub fn reads_named_arguments_only(expr: &Expr) -> bool {
                             | Builtin::Omit(_)
                             | Builtin::SortKeys(_)
                             | Builtin::Walk(_)
+                            | Builtin::Parent
+                            | Builtin::ParentN(_)
+                            | Builtin::Key
                     )
             )
     })
@@ -164707,6 +164721,23 @@ mod named_args_shared_tests_5690 {
             ("[foreach range(2) as $i (0; .+1; $d)]", false),
             ("def f: $d; f", false),
             ("$d | walk(.)", false),
+            ("$d | pick(.[0])", false),
+            ("$d | omit(.[0])", false),
+            ("$d | leaf_paths", false),
+            ("$d | [paths(type == \"number\")]", false),
+            ("$d | setpath([0]; 1)", false),
+            ("$d | delpaths([[0]])", false),
+            ("$d | path(..)", false),
+            ("label $out | $d | ., break $out", false),
+            ("$d | .[0] | key", false),
+            ("$d | .[0] | parent", false),
+            ("$d | .[0] | parent(1)", false),
+            ("$d | getpath([0])", true),
+            ("$d | to_entries | length", true),
+            ("$d | with_entries(.)", true),
+            ("[limit(1; $d[])]", true),
+            ("first($d[])", true),
+            ("$d | tostream | length", true),
         ] {
             let substituted =
                 substitute_named_args(&parse(source).unwrap(), [("d", &d), ("n", &n)]);

@@ -120,3 +120,24 @@ fn programs_that_write_or_walk_paths_keep_the_literal_5690() -> Result<()> {
     }
     Ok(())
 }
+
+/// A data `import "data" as $d;` binding is a container argument too, and takes the same gate.
+#[test]
+fn a_data_import_binding_answers_as_jq_5690() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("data.json"), "{\"a\":[1,2,{\"b\":3}]}\n[4]\n")?;
+    let dir = dir.path().to_str().unwrap();
+    for (filter, expected) in [
+        ("import \"data\" as $d; $d|length", "2\n"),
+        ("import \"data\" as $d; $d[0].a[2].b", "3\n"),
+        ("import \"data\" as $d; [$d,$d]|.[0]==.[1]", "true\n"),
+        ("import \"data\" as $d; $d|map(type)", "[\"object\",\"array\"]\n"),
+        // A write through the value keeps the literal.
+        ("import \"data\" as $d; $d | .[1][0] = 9 | .[1]", "[9]\n"),
+        ("import \"data\" as $d; reduce range(2) as $i (0; . + ($d[$i]|length))", "2\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", "-L", dir, filter], None)?;
+        assert_eq!((stdout.as_str(), code), (expected, 0), "{filter}: {stderr}");
+    }
+    Ok(())
+}
