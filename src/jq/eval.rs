@@ -78791,16 +78791,25 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
                     return Demand::Stop;
                 }
                 outcome = None;
+                let inert = update.inert;
                 let (update, reentry) = update.against::<S>(&state);
                 // #5499: jq mode only. An unmarked loop variable is never read in path position
                 // there; yq has no marker, so it cannot say.
-                let substituted = substitute_fold_step(
-                    update,
-                    bindings,
-                    all_var_names,
-                    mark_loop_vars,
-                    S::TAG == EvalTag::Jq,
-                );
+                // #5745: an UPDATE that reads no loop variable runs as it stands, not as a copy
+                // rebuilt per step.
+                let rebuilt;
+                let substituted: &Expr = if inert {
+                    update
+                } else {
+                    rebuilt = substitute_fold_step(
+                        update,
+                        bindings,
+                        all_var_names,
+                        mark_loop_vars,
+                        S::TAG == EvalTag::Jq,
+                    );
+                    &rebuilt
+                };
 
                 if let Some(control) = budget.charge_step("reduce") {
                     outcome_at = pipe_retry_generation();
@@ -78826,7 +78835,7 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
                 let mut last_val: Option<OwnedValue> = None;
                 let step_state = core::mem::replace(&mut state, OwnedValue::Null);
                 let flow =
-                    fold_step_each::<S>(&substituted, step_state, optional, reentry, &mut |v| {
+                    fold_step_each::<S>(substituted, step_state, optional, reentry, &mut |v| {
                         last_val = Some(v);
                         Demand::Continue
                     });
@@ -79193,6 +79202,11 @@ fn owned_arith_chain_shape<S: EvalSemantics>(expr: &Expr) -> Option<Vec<(ArithOp
 struct FoldOperand<'e> {
     hoisted: &'e Expr,
     as_written: Option<&'e Expr>,
+    /// The operand reads none of the fold's loop variables and holds no definition, call or shared
+    /// argument ([`fold_operand_is_inert`], #5745): binding a step then rebuilds the operand as a
+    /// copy of itself, so the step runs the operand as it stands. Settled once per fork by
+    /// [`FoldOperand::inert_for`]; `false` until then.
+    inert: bool,
 }
 
 impl<'e> FoldOperand<'e> {
@@ -79206,6 +79220,16 @@ impl<'e> FoldOperand<'e> {
         Self {
             hoisted,
             as_written: rerootable.then_some(expr),
+            inert: false,
+        }
+    }
+
+    /// This operand with [`FoldOperand::inert`] decided against the fold's loop variable `names`.
+    fn inert_for(self, names: &[String]) -> Self {
+        Self {
+            inert: fold_operand_is_inert(self.hoisted, names)
+                && self.as_written.is_none_or(|e| fold_operand_is_inert(e, names)),
+            ..self
         }
     }
 
@@ -82866,6 +82890,19 @@ fn reads_a_name_whole(expr: &Expr, names: &[String]) -> bool {
         .any(|name| super::deferred_bind::var_reads(expr, name).whole)
 }
 
+/// Whether substituting a fold step's bindings into `expr` is the identity (#5745): it mentions
+/// none of `names`, so [`substitute_fold_step`] would return a copy of it. A definition, a call
+/// and a shared argument also decline: each carries per-node memo state that a copy starts empty
+/// and the program's own node keeps across steps (a recursive `def` held its whole call tree, 13 MB
+/// to 114 MB, when #3692 skipped such a copy), so those keep the copy.
+fn fold_operand_is_inert(expr: &Expr, names: &[String]) -> bool {
+    !any_subexpr(expr, &mut |n| match n {
+        Expr::Var(v) => names.iter().any(|name| name == v),
+        Expr::DefCall { .. } | Expr::FuncDef { .. } | Expr::Shared(_) => true,
+        _ => false,
+    })
+}
+
 /// Whether `expr` mentions one of `names` as a variable anywhere.
 fn mentions_any_name(expr: &Expr, names: &[String]) -> bool {
     any_subexpr(
@@ -83515,6 +83552,7 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
         };
         let all_var_names =
             all_var_names.get_or_insert_with(|| pattern_alternatives_var_names(patterns));
+        let update = update.inert_for(all_var_names);
         let mut acc = init_val;
         // Cleared on entry to every step, not just the first: a `?//` in the
         // source re-enters this callback after a stop was already reported
