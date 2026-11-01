@@ -8984,10 +8984,8 @@ fn seq_plain_json_inputs(args: &JqCommand) -> Result<Option<PreparedInputs>> {
     } else {
         read_input_files(&named)
     };
+    // Stdin is one source that always opens, so a file list is all that can fail this.
     if raws.len() != 1 || !failures.is_empty() {
-        if from_stdin {
-            STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = raws.pop());
-        }
         return Ok(None);
     }
     let raw = raws.pop().unwrap_or_default();
@@ -9048,7 +9046,7 @@ fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Ve
         .map(|&(from, to)| raw[from..to].iter().filter(|&&b| b == ASCII_RS).count())
         .sum();
     if raw.iter().filter(|&&b| b == ASCII_RS).count() != in_gaps {
-        return Err(raw);
+        return Err(raw); // patchcov: coverage tolerate-line reason="defensive: an RS inside a value makes the walk warn (a truncated record), which returns above; kept so a walk that stopped warning cannot leave an RS in a value the lazy route then reads"
     }
     for (from, to) in gaps {
         for b in &mut raw[from..to] {
