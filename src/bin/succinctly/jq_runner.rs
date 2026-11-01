@@ -6023,13 +6023,19 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // #5744: so is the array `--stream -s` slurps the events into: it has no source
                 // text either, and writing it out as JSON to index and read it back was 31% of
                 // the instructions of `--stream -s 'length'`.
-                let owned_route = walk.is_some()
-                    || (args.raw_input
+                //
+                // #5764: the slurped array takes it only for a program the owned evaluator answers
+                // without the reindex bridge; any other reads the array's own index, as before #5744,
+                // which that bridge made 10-15% slower on `[limit(5;.[])]` and `select`.
+                let owned_route = owned_route_for(
+                    walk.is_some(),
+                    args.raw_input
                         && args.input_dsv.is_none()
-                        && matches!(document, OwnedValue::String(_)))
-                    || (args.slurp
+                        && matches!(document, OwnedValue::String(_)),
+                    args.slurp
                         && stream_mode(&args, uses_input_builtins, faulted) == StreamMode::Eager
-                        && matches!(document, OwnedValue::Array(_)));
+                        && matches!(document, OwnedValue::Array(_)),
+                );
                 let mut whole = Some(document);
                 loop {
                     let input = match walk.as_mut() {
@@ -10254,9 +10260,35 @@ fn evaluate_input_streaming(
         at,
         sink,
         output_config,
-        false,
+        OwnedRoute::Off,
         on_value,
     )
+}
+
+/// The route `run_jq` gives an input that is already a tree (#5681, #5764): a lazily walked
+/// `--stream` event or a `-R` line (`lazy_events`, `raw_line`) always reads it where it is; the array
+/// `--stream -s` slurps (`eager_slurped_array`) does so only for a program the owned evaluator
+/// answers without re-indexing; anything else is written out and read through its own index.
+fn owned_route_for(lazy_events: bool, raw_line: bool, eager_slurped_array: bool) -> OwnedRoute {
+    if lazy_events || raw_line {
+        OwnedRoute::Always
+    } else if eager_slurped_array {
+        OwnedRoute::WhereAnswered
+    } else {
+        OwnedRoute::Off
+    }
+}
+
+/// How [`evaluate_input_streaming_via`] reads an input that is already a tree.
+#[derive(Clone, Copy, PartialEq)]
+enum OwnedRoute {
+    /// Written out as JSON, indexed and read through its cursor.
+    Off,
+    /// Evaluated where it is (#5681), re-indexing only the stages the owned evaluator declines.
+    Always,
+    /// [`Self::Always`] for a program the owned evaluator answers without re-indexing, and
+    /// [`Self::Off`] for any other (#5764).
+    WhereAnswered,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10267,7 +10299,7 @@ fn evaluate_input_streaming_via(
     at: &ErrorAt<'_>,
     sink: &mut ErrorSink,
     output_config: &OutputConfig,
-    owned_route: bool,
+    owned_route: OwnedRoute,
     on_value: &mut dyn FnMut(&mut ErrorSink, OwnedValue) -> Result<bool>,
 ) -> Result<()> {
     // #2852: `to_json()` always reformats a `NumberLiteral` to jq's own
@@ -10351,11 +10383,26 @@ fn evaluate_input_streaming_via(
     // `reduce` already gets from `check_tree_depth`; any other panic still
     // unwinds.
     let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if owned_route && !preserve {
+        if !preserve {
             // #5681: the value is already a tree, so the filter reads it where it is.
-            return jq::eval_generic::eval_each_owned_input(expr, input, &mut |v| {
-                deliver(sink, Some(v))
-            });
+            match owned_route {
+                OwnedRoute::Always => {
+                    return jq::eval_generic::eval_each_owned_input(expr, input, &mut |v| {
+                        deliver(sink, Some(v))
+                    });
+                }
+                // #5764: `None` is a program no door answers, with nothing delivered.
+                OwnedRoute::WhereAnswered => {
+                    if let Some(control) =
+                        jq::eval_generic::eval_each_owned_input_if_answered(expr, input, &mut |v| {
+                            deliver(sink, Some(v))
+                        })
+                    {
+                        return control;
+                    }
+                }
+                OwnedRoute::Off => {}
+            }
         }
         let doc = if preserve {
             let text = input.to_json_jq_preserve();
@@ -16944,6 +16991,104 @@ mod tests {
             .expect("spawns")
             .join()
             .expect("passes");
+    }
+
+    /// #5764: the route `run_jq` picks. Every output comparison passes whichever route is picked,
+    /// so a branch edited to the wrong route would show up only as the 10-15% it cost.
+    #[test]
+    fn the_owned_route_is_chosen_per_input_kind_5764() {
+        // (lazy events, raw line, eager slurped array)
+        let rows = [
+            ((true, false, false), OwnedRoute::Always),
+            ((false, true, false), OwnedRoute::Always),
+            ((false, false, true), OwnedRoute::WhereAnswered),
+            ((false, false, false), OwnedRoute::Off),
+            // A lazily walked event is never the slurped array; the first two win regardless.
+            ((true, false, true), OwnedRoute::Always),
+            ((false, true, true), OwnedRoute::Always),
+        ];
+        for ((events, line, slurped), want) in rows {
+            assert!(
+                owned_route_for(events, line, slurped) == want,
+                "events {events}, line {line}, slurped array {slurped}"
+            );
+        }
+    }
+
+    /// #5764: a slurped `--stream` array takes the owned route only for a program the owned
+    /// evaluator answers without re-indexing, and reads its own index for any other, which is what
+    /// it did before #5744. Every route prints what the others do. The count must be able to
+    /// fail: `[limit(2;.[])]` builds no bridge document if `WhereAnswered` is read as `Always`.
+    #[test]
+    fn a_slurped_array_declines_to_its_own_index_when_no_door_answers_5764() {
+        let config = OutputConfig {
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            raw_output0: false,
+            ascii_output: false,
+            color_output: false,
+            color_scheme: ColorScheme::default(),
+            sort_keys: false,
+            indent_string: String::new(),
+            unbuffered: false,
+            seq: false,
+            convention: JsonConvention::JqCompat,
+        };
+        let event = |key: &str, value: i64| {
+            OwnedValue::array_from(vec![
+                OwnedValue::array_from(vec![OwnedValue::String(key.into())]),
+                OwnedValue::Int(value),
+            ])
+        };
+        let input = OwnedValue::array_from(vec![
+            event("a", 1),
+            event("b", 2),
+            OwnedValue::array_from(vec![OwnedValue::array_from(vec![OwnedValue::String(
+                "b".into(),
+            )])]),
+        ]);
+        let run = |filter: &str, route: OwnedRoute| -> (Vec<String>, usize) {
+            let expr = jq::parse(filter).expect("parses");
+            let before = bridge_docs::built();
+            let mut outputs = Vec::new();
+            let mut sink = ErrorSink::default();
+            evaluate_input_streaming_via(
+                &input,
+                &expr,
+                &EvalContext::default(),
+                &ErrorAt::Fixed(InputLocation::unknown()),
+                &mut sink,
+                &config,
+                route,
+                &mut |_, value| {
+                    outputs.push(value.to_json());
+                    Ok(true)
+                },
+            )
+            .expect("evaluates");
+            (outputs, bridge_docs::built() - before)
+        };
+        // (program, bridge documents `WhereAnswered` builds: 0 where a door answers).
+        let rows: [(&str, usize); 6] = [
+            ("length", 0),
+            (".[1]", 0),
+            ("[limit(2;.[])]", 1),
+            ("[.[]|select(length==2)]|length", 1),
+            ("map(.[0][0])|unique", 1),
+            (".[]|select(length==2)", 1),
+        ];
+        for (filter, docs) in rows {
+            let (want, off_docs) = run(filter, OwnedRoute::Off);
+            assert_eq!(off_docs, 1, "{filter}: the old route builds its document");
+            for route in [OwnedRoute::Always, OwnedRoute::WhereAnswered] {
+                let (got, built) = run(filter, route);
+                assert_eq!(got, want, "{filter}: outputs");
+                if route == OwnedRoute::WhereAnswered {
+                    assert_eq!(built, docs, "{filter}: bridge documents built");
+                }
+            }
+        }
     }
 
     /// #5624: the filter `.` over an owned input -- a `--stream` event, a `--seq` record, a DSV
