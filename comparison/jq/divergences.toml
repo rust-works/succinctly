@@ -239,24 +239,6 @@ issue = "#5753"
 reason = "Same weekday difference as `locale-strptime-ampm-c`, under `tr_TR.UTF-8` (a host without that locale falls back to `C`)."
 
 [[divergence]]
-id = "cli:locale-strptime-tr-c"
-category = "to-triage"
-issue = "#5752"
-reason = "`\"05 Mart 2015\" | strptime(\"%d %B %Y\")` under `LC_ALL=C`: jq 1.7.1 rejects it (`does not match format`); succinctly reads it as March, because `%B` accepts a month name followed by extra letters (`Marx`, `Marchx` too; `Ma` is rejected by both)."
-
-[[divergence]]
-id = "cli:locale-strptime-tr-en-us"
-category = "to-triage"
-issue = "#5752"
-reason = "Same `%B` leniency as `locale-strptime-tr-c`, under `en_US.UTF-8`."
-
-[[divergence]]
-id = "cli:locale-strptime-tr-de-de"
-category = "to-triage"
-issue = "#5752"
-reason = "Same `%B` leniency as `locale-strptime-tr-c`, under `de_DE.UTF-8` (a host without that locale falls back to `C`)."
-
-[[divergence]]
 id = "cli:locale-strftime-names-de-de"
 category = "to-triage"
 volatile = true
@@ -352,4 +334,4 @@ id = "cli:locale-strptime-tr-tr-tr"
 category = "to-triage"
 volatile = true
 issue = "#5754"
-reason = "`tr_TR.UTF-8` is not installed on the Linux hosts checked, so jq falls back to `C` and rejects `\"05 Mart 2015\"` as in `locale-strptime-tr-c`; succinctly reads it as March (the `%B` leniency). Where `tr_TR` is installed (macOS) jq accepts `Mart` itself and the row matches."
+reason = "`\"05 Mart 2015\" | strptime(\"%d %B %Y\")` under `LC_ALL=tr_TR.UTF-8`: where `tr_TR` is installed (macOS) jq 1.7.1 reads `Mart` as the Turkish March and succinctly, which has English month names only (#5754), rejects it. A host without that locale falls back to `C`, where jq rejects `Mart` too and the row matches (since #5752, `%B` takes a month's full name or its three-letter abbreviation and no more)."

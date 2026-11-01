@@ -94713,31 +94713,59 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     }
                 }
                 Some('b' | 'B' | 'h') => {
+                    // glibc's `strptime` reads `%b`, `%B` and `%h` alike (#5752): the full month name
+                    // if the input starts with one, else its three-letter abbreviation, either way
+                    // case-insensitively, and nothing more. The letters after the match belong to the
+                    // rest of the format, so `Marx` and `Marc` are `Mar` followed by a letter the
+                    // next format character has to take (it never does), not a longer spelling of
+                    // March. Looked ahead on a copy, so only the matched letters are consumed.
+                    let mut ahead = input_iter.clone();
                     let mut name = String::new();
-                    while let Some(&c) = input_iter.peek() {
+                    while let Some(&c) = ahead.peek() {
                         if c.is_ascii_alphabetic() {
-                            name.push(c);
-                            input_iter.next();
+                            name.push(c.to_ascii_lowercase());
+                            ahead.next();
                         } else {
                             break;
                         }
                     }
                     date_read = true;
-                    let name_lower = name.to_lowercase();
-                    let months = [
-                        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
-                        "nov", "dec",
+                    const MONTHS: [&str; 12] = [
+                        "january",
+                        "february",
+                        "march",
+                        "april",
+                        "may",
+                        "june",
+                        "july",
+                        "august",
+                        "september",
+                        "october",
+                        "november",
+                        "december",
                     ];
                     // #971: a non-matching name (e.g. "xyz") previously left
                     // `month` at its prior/default value instead of erroring,
                     // silently masking malformed input as a valid date -
                     // real jq rejects it ("does not match format").
-                    let matched = months
+                    let matched = MONTHS
                         .iter()
-                        .enumerate()
-                        .find_map(|(i, m)| name_lower.starts_with(m).then_some((i + 1) as i64));
+                        .position(|m| name.starts_with(m))
+                        .map(|i| (i, MONTHS[i].len()))
+                        .or_else(|| {
+                            MONTHS
+                                .iter()
+                                .position(|m| name.starts_with(&m[..3]))
+                                .map(|i| (i, 3))
+                        });
                     match matched {
-                        Some(m) => month = m,
+                        Some((i, len)) => {
+                            month = (i + 1) as i64;
+                            // Letters are ASCII, so one `char` is one byte of the name.
+                            for _ in 0..len {
+                                input_iter.next();
+                            }
+                        }
                         None => return Err(format!("unrecognized month name '{name}'")),
                     }
                 }
