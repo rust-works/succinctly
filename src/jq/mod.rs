@@ -87,6 +87,7 @@ mod glob;
 #[cfg(feature = "regex")]
 mod go_regex;
 mod go_sort;
+mod go_time;
 mod json_fast;
 mod key_index;
 mod lazy;

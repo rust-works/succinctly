@@ -16568,6 +16568,10 @@ pub(crate) fn apply_compare_op<S: EvalSemantics>(
     if let Some(result) = yq_null_ordering_is_false::<S>(op, left, right) {
         return result;
     }
+    // #5651: yq mode only -- see `yq_time_ordering`.
+    if let Some(result) = yq_time_ordering::<S>(op, left, right) {
+        return result;
+    }
     // #2785: yq mode only -- see `yq_scalar_text_eq`.
     if let Some(result) = yq_scalar_text_eq::<S>(op, left, right) {
         return result;
@@ -16580,6 +16584,33 @@ pub(crate) fn apply_compare_op<S: EvalSemantics>(
         CompareOp::Gt => compare_values::<S>(left, right) == core::cmp::Ordering::Greater,
         CompareOp::Ge => compare_values::<S>(left, right) != core::cmp::Ordering::Less,
     }
+}
+
+/// yq mode only (#5651): an ordering comparison of two strings that both parse as timestamps
+/// compares the instants, not the text: `"2001-01-01T00:00:00Z" < "2001-01-01T10:00:00+10:00"` is
+/// `false` there (the same moment), where the strings order `true`. Any other pair is `None`: a
+/// right operand that is not a timestamp is [`yq_ordering_refusal`]'s error, which
+/// [`try_compare_op`] raises before this is consulted.
+pub(crate) fn yq_time_ordering<S: EvalSemantics>(
+    op: CompareOp,
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> Option<bool> {
+    if S::TAG != EvalTag::Yq {
+        return None;
+    }
+    let (OwnedValue::String(left), OwnedValue::String(right)) = (left, right) else {
+        return None;
+    };
+    let left = super::go_time::parse_yq_datetime(left).ok()?;
+    let right = super::go_time::parse_yq_datetime(right).ok()?;
+    Some(match op {
+        CompareOp::Lt => left < right,
+        CompareOp::Le => left <= right,
+        CompareOp::Gt => left > right,
+        CompareOp::Ge => left >= right,
+        CompareOp::Eq | CompareOp::Ne => return None,
+    })
 }
 
 /// yq mode only (#5631): the error real yq raises for an ordering comparison (`<`, `<=`, `>`,
@@ -16605,10 +16636,11 @@ pub(crate) fn apply_compare_op<S: EvalSemantics>(
 /// An integer written in hex or octal against a float raises yq's `strconv.ParseFloat` error
 /// ([`yq_float_parse_refusal`], #5651).
 ///
-/// **Not reproduced:** yq compares a string that parses as a timestamp as a time, so
-/// `"2001-01-01T00:00:00Z" < 1` raises `parsing time "1" as "2006-01-02"` there and answers
-/// `false` here (`OwnedValue` has no timestamp kind). Recorded in
-/// `docs/compliance/yq/limitations.md`.
+/// A string on the left that parses as a timestamp (RFC 3339 or `2006-01-02`, as Go's `time.Parse`
+/// reads them, see [`super::go_time`]) is compared as a time, and the right operand's text is
+/// parsed the same way: `"2001-01-01T00:00:00Z" < 1` raises `parsing time "1" as "2006-01-02":
+/// cannot parse "1" as "2006"`, and so does a `null`, a bool or any string that is not a time
+/// (#5651). Two timestamps compare as instants ([`yq_time_ordering`]).
 pub(crate) fn yq_ordering_refusal<S: EvalSemantics>(
     op: CompareOp,
     left: &OwnedValue,
@@ -16638,6 +16670,16 @@ pub(crate) fn yq_ordering_refusal<S: EvalSemantics>(
             yq_extremum_tag(right),
             yq_extremum_tag(left),
         )));
+    }
+    // #5651: a left string that is a timestamp makes this a time comparison, so the right operand
+    // must be one too, whatever kind it is (a number, a bool and `null` by their text).
+    if let OwnedValue::String(text) = left {
+        if super::go_time::parse_yq_datetime(text).is_ok() {
+            let right_text = yq_scalar_text::<S>(right)?;
+            return super::go_time::parse_yq_datetime(&right_text)
+                .err()
+                .map(EvalError::new);
+        }
     }
     let is_number = |v: &OwnedValue| {
         matches!(
