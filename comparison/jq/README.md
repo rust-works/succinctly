@@ -52,7 +52,7 @@ Dimension F runs the resource-limit probes under a 10 s deadline and classes eac
 Its `memory` probes cap the address space with `ulimit -v` (graceful error versus abort; early-exit `first`/`limit`/`isempty` on a generated array); macOS refuses `ulimit -v`, so there they run uncapped as a no-op and only Linux CI exercises the limit.
 
 Dimension H reports binary size, dynamic libraries, the Rust dependency count, whether either tool uses more than one
-core, and licence / `no_std` / CI-runner facts read from the repository; build time is not measured.
+core, and licence / `no_std` / CI-runner facts read from the repository. `--build-time` also times a cold build of each pinned jq (`configure` + `make` + `make install`, the tarball download not on the clock) and of succinctly (`cargo build --release --locked` into a scratch target directory after an untimed `cargo fetch`), and the rebuild of succinctly after touching `src/lib.rs`: one run each in `target/compare/build-time/`, which is removed afterwards. It takes minutes, and a figure that long moves with the disk cache and load, so the report gives a magnitude, not a ratio.
 
 ```bash
 # Re-run the deterministic dimensions and spot-check 5 timing rows against a recorded run (exit 1 on any difference)

@@ -3,8 +3,8 @@
 //! Only what can be measured or read from a checked-in source is reported:
 //! binary sizes, dynamic libraries, the Rust dependency count, whether either
 //! tool uses more than one core, and a few facts taken from `Cargo.toml`,
-//! `src/lib.rs`, `ci.yml` and jq's vendored licence. Build time is not measured
-//! (a cold fat-LTO build is minutes and would dominate a `--quick` run).
+//! `src/lib.rs`, `ci.yml` and jq's vendored licence. Build time is measured only with
+//! `--build-time` (a cold fat-LTO build is minutes and would dominate a `--quick` run, #5552).
 
 use super::harness::Tool;
 use super::perf::{ensure_input, InputSpec};
@@ -35,6 +35,16 @@ pub struct Fact {
     pub source: String,
 }
 
+/// One from-source build, timed with a monotonic clock (`--build-time`, #5552).
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildTime {
+    pub what: String,
+    /// What was run, for the report.
+    pub command: String,
+    /// `None` when the build failed or could not be timed.
+    pub seconds: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Operational {
     pub binaries: Vec<BinaryInfo>,
@@ -42,6 +52,96 @@ pub struct Operational {
     pub rust_dependencies: Option<usize>,
     pub parallelism: Vec<Parallelism>,
     pub facts: Vec<Fact>,
+    /// Empty unless the run asked for `--build-time`.
+    #[serde(default)]
+    pub build_times: Vec<BuildTime>,
+}
+
+/// Seconds from the file `scripts/compare-jq-build.sh` writes (milliseconds, one integer).
+pub fn parse_timing_ms(text: &str) -> Option<f64> {
+    text.trim().parse::<u64>().ok().map(|ms| ms as f64 / 1000.0)
+}
+
+/// Run `cmd` with its output discarded and return how long it took, or `None` if it failed.
+fn time_command(cmd: &mut Command) -> Option<f64> {
+    let start = std::time::Instant::now();
+    let ok = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?
+        .success();
+    ok.then(|| start.elapsed().as_secs_f64())
+}
+
+/// Time a cold build of each pinned jq (`versions`) and of succinctly, and the rebuild of
+/// succinctly after a source file is touched, one run each in a scratch directory under
+/// `target/compare/build-time/` that is removed afterwards. The jq tarball download and the
+/// crates' download (`cargo fetch`) are outside the clock.
+pub fn measure_build_times(root: &Path, versions: &[String], features: &str) -> Vec<BuildTime> {
+    let scratch = root.join("target/compare/build-time");
+    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::create_dir_all(&scratch);
+    let mut out = vec![];
+    for v in versions {
+        let timing = scratch.join(format!("jq-{v}.ms"));
+        let ok = Command::new(root.join("scripts/compare-jq-build.sh"))
+            .arg(v)
+            .env("COMPARE_JQ_DEST", scratch.join(format!("jq-{v}")))
+            .env("COMPARE_JQ_TIMING_FILE", &timing)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        out.push(BuildTime {
+            what: format!("jq {v}, cold"),
+            command:
+                "./configure --with-oniguruma=builtin --disable-shared && make -j && make install"
+                    .into(),
+            seconds: ok
+                .then(|| std::fs::read_to_string(&timing).ok())
+                .flatten()
+                .and_then(|t| parse_timing_ms(&t)),
+        });
+    }
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let target = scratch.join("succinctly-target");
+    // Untimed: the crates must be on disk before the clock starts.
+    let _ = Command::new(&cargo)
+        .args(["fetch", "--locked"])
+        .current_dir(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let build_args = ["build", "--release", "--locked", "--features", features];
+    let command = format!("cargo build --release --locked --features {features}");
+    let mut build = || {
+        time_command(
+            Command::new(&cargo)
+                .args(build_args)
+                .arg("--target-dir")
+                .arg(&target)
+                .current_dir(root),
+        )
+    };
+    out.push(BuildTime {
+        what: "succinctly, cold".into(),
+        command: command.clone(),
+        seconds: build(),
+    });
+    let touched = Command::new("touch")
+        .arg(root.join("src/lib.rs"))
+        .status()
+        .is_ok_and(|s| s.success());
+    out.push(BuildTime {
+        what: "succinctly, rebuild after touching src/lib.rs".into(),
+        command,
+        seconds: touched.then(&mut build).flatten(),
+    });
+    let _ = std::fs::remove_dir_all(&scratch);
+    out
 }
 
 /// Library paths from `otool -L` (skipping the binary's own line).
@@ -208,6 +308,7 @@ pub fn collect(
     generator: &Path,
     inputs: &[InputSpec],
     inputs_dir: &Path,
+    build_times: Vec<BuildTime>,
 ) -> Result<Operational> {
     let binaries = tools
         .iter()
@@ -236,6 +337,7 @@ pub fn collect(
         rust_dependencies: rust_dependencies(root, features),
         parallelism,
         facts: facts(root),
+        build_times,
     })
 }
 
@@ -269,6 +371,25 @@ mod tests {
         assert_eq!(parse_time_p("real 1.00\nuser 3.00\nsys 0.00\n"), Some(3.0));
         assert_eq!(parse_time_p("nothing"), None);
         assert_eq!(parse_time_p("real 0.00\nuser 0\nsys 0\n"), None);
+    }
+
+    #[test]
+    fn a_jq_build_timing_file_is_milliseconds() {
+        assert_eq!(parse_timing_ms("61234\n"), Some(61.234));
+        assert_eq!(parse_timing_ms(""), None);
+        assert_eq!(parse_timing_ms("12.5s"), None);
+    }
+
+    /// A build that fails has no time, not the time it took to fail.
+    #[test]
+    fn a_command_is_timed_only_when_it_succeeds() {
+        let took = time_command(Command::new("sh").args(["-c", "sleep 0.05"])).unwrap();
+        assert!((0.05..5.0).contains(&took), "{took}");
+        assert_eq!(
+            time_command(Command::new("sh").args(["-c", "exit 3"])),
+            None
+        );
+        assert_eq!(time_command(&mut Command::new("/nonexistent/build")), None);
     }
 
     #[test]

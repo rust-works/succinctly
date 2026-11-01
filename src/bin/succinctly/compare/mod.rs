@@ -94,6 +94,11 @@ pub struct CompareJqArgs {
     #[arg(long)]
     query: Option<String>,
 
+    /// Operational: also time a cold build of each tool from source, one run each (minutes: a
+    /// fat-LTO release build of succinctly, twice, and both pinned jq builds)
+    #[arg(long)]
+    build_time: bool,
+
     /// Performance: also count each tool's instructions under `valgrind --tool=cachegrind`, a
     /// signal load cannot move (Linux with valgrind installed; rows over 1 MB are not counted)
     #[arg(long)]
@@ -294,6 +299,12 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         bail!(
             "--cachegrind counts instructions in the performance dimension, which this run skips"
         );
+    }
+    if args.build_time
+        && (args.ledger_only
+            || (!args.dimension.is_empty() && !args.dimension.contains(&Dimension::Operational)))
+    {
+        bail!("--build-time times builds in the operational dimension, which this run skips");
     }
     let valgrind = args.cachegrind.then(find_valgrind).transpose()?;
     let root = repo_root()?;
@@ -780,10 +791,24 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             &std::env::current_exe()?,
             &manifest.inputs,
             &root.join("data/compare/inputs"),
+            if args.build_time {
+                let versions: Vec<String> = manifest
+                    .references
+                    .iter()
+                    .map(|r| r.version.clone())
+                    .collect();
+                operational::measure_build_times(&root, &versions, &manifest.succinctly.features)
+            } else {
+                vec![]
+            },
         )?);
         dimensions.push(DimensionStatus {
             name: "H. Platform & operational",
-            status: "implemented (sizes, libraries, dependencies, parallelism, licences; build time is not measured)",
+            status: if args.build_time {
+                "implemented (sizes, libraries, dependencies, parallelism, licences, build time)"
+            } else {
+                "implemented (sizes, libraries, dependencies, parallelism, licences; build time only with --build-time)"
+            },
         });
     }
     if args.ledger_only && run_suites.is_empty() {
