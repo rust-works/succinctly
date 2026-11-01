@@ -96695,6 +96695,58 @@ pub(crate) fn owned_unary_math<S: EvalSemantics>(
     unary_math_apply::<S>(builtin, n)
 }
 
+/// `pow(a; b)` and `atan2(y; x)` of owned operands (#5680): each operand is `.` or a literal, one
+/// value that is a finite number, so the call has one answer and no fan-out (`pow((2,3); 2)` is
+/// two, and keeps the evaluator). The operands are read as the builtins read them
+/// ([`math_operand`]) and the result is their libm call, so it is the value `builtin_pow` and
+/// `builtin_atan2` answer. `None` for anything else, which keeps the evaluator and its error text.
+/// Whether both operands of a `pow`/`atan2` are `.` or a literal, from the syntax alone: the cheap
+/// test [`owned_binary_math`] needs before any value is read.
+pub(crate) fn binary_math_operands_are_simple(builtin: &Builtin) -> bool {
+    let simple = |expr: &Expr| matches!(unwrap_paren(expr), Expr::Identity | Expr::Literal(_));
+    matches!(builtin, Builtin::Pow(a, b) | Builtin::Atan2(a, b) if simple(a) && simple(b))
+}
+
+pub(crate) fn owned_binary_math<S: EvalSemantics>(
+    builtin: &Builtin,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let (first, second, is_pow) = match builtin {
+        Builtin::Pow(base, exp) => (base, exp, true),
+        Builtin::Atan2(y, x) => (y, x, false),
+        _ => return None,
+    };
+    // A literal spelling that is not a valid RFC 8259 number (a lenient or bridge-token one) is
+    // the evaluator's, as it is for the unary builtins.
+    if matches!(input, OwnedValue::NumberLiteral(_, text) if !crate::json::validate::is_valid_number(text.as_bytes()))
+    {
+        return None;
+    }
+    let operand = |expr: &Expr| -> Option<f64> {
+        let literal;
+        let value = match unwrap_paren(expr) {
+            Expr::Identity => input,
+            Expr::Literal(lit) => {
+                literal = literal_to_owned(lit);
+                &literal
+            }
+            _ => return None,
+        };
+        math_operand::<S>(value, false)
+            .ok()
+            .filter(|n| n.is_finite())
+    };
+    let (a, b) = (operand(first)?, operand(second)?);
+    Some(OwnedValue::Float(if is_pow {
+        math::pow(a, b)
+    } else {
+        math::atan2(a, b)
+    }))
+}
+
 /// Builtin: floor
 fn builtin_floor<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
