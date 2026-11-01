@@ -172,13 +172,7 @@ fn test_a_fold_destructuring_literal_keys_matches_jq_5544() -> Result<()> {
             "[2]\n",
             0,
         ),
-        // A path read of a destructured name, and a field read of it after a pipe.
-        (
-            "reduce .[] as {a:$x} (0; path($x)?)",
-            r#"[{"a":{"b":2},"p":1}]"#,
-            "null\n",
-            0,
-        ),
+        // A field read of a destructured name after a pipe.
         (
             r"reduce .[] as {a:$x} ({}; .z = ($x | .k))",
             r#"[{"a":{"k":"m","q":1},"p":1}]"#,
@@ -192,6 +186,21 @@ fn test_a_fold_destructuring_literal_keys_matches_jq_5544() -> Result<()> {
             "{filter} {input}"
         );
     }
+    Ok(())
+}
+
+/// A path read of a destructured name. The unshared-containers holdout refuses a path target that
+/// does more than navigate (#5233), so the row is ignored there (#5246).
+#[test]
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
+fn test_a_path_read_of_a_destructured_name_matches_jq_5544() -> Result<()> {
+    assert_eq!(
+        jq(
+            "reduce .[] as {a:$x} (0; path($x)?)",
+            r#"[{"a":{"b":2},"p":1}]"#
+        )?,
+        ("null\n".to_string(), 0)
+    );
     Ok(())
 }
 
