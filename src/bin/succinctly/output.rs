@@ -1149,11 +1149,19 @@ impl ColorScheme {
 
     /// Read the color scheme from the `JQ_COLORS` environment variable.
     pub fn from_env() -> Self {
-        let Ok(spec) = std::env::var("JQ_COLORS") else {
+        Self::from_env_value(std::env::var_os("JQ_COLORS").as_deref())
+    }
+
+    /// The scheme for a `JQ_COLORS` value, or `None` when the variable is unset.
+    ///
+    /// A value that is not UTF-8 is as malformed as one with a bad field: jq reads bytes and
+    /// rejects it, so it warns and keeps the defaults rather than ignoring it silently (#5760).
+    fn from_env_value(value: Option<&std::ffi::OsStr>) -> Self {
+        let Some(value) = value else {
             return Self::default();
         };
 
-        Self::from_spec(&spec).unwrap_or_else(|| {
+        value.to_str().and_then(Self::from_spec).unwrap_or_else(|| {
             // Matches jq: warn on stderr, use defaults, but still exit successfully.
             eprintln!("Failed to set $JQ_COLORS");
             Self::default()
