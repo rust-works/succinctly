@@ -105,18 +105,15 @@ fn test_an_error_in_a_long_pipe_is_raised_and_caught_as_jq_does_5679() -> Result
 
 #[test]
 fn test_a_long_pipe_with_a_stage_holding_a_def_still_answers_5679() -> Result<()> {
-    // A `def` carries evaluation state a kept chain would share between calls, so such a pipe is
-    // copied as before.
+    // A call of a `def` carries evaluation state a kept chain would share between calls, so a pipe
+    // with one is copied as before. (`(def f: . + 1; f)` as a stage holds none: it is inlined.)
     let adds = pipe(". + 1", 150);
     check(&[
+        (format!("def f: . + 1; 0 | {}", pipe("f", 200)), "200\n", 0),
+        (format!("def f: . + 1; 0 | {adds} | f | {adds}"), "301\n", 0),
         (
-            format!("0 | {adds} | (def f: . + 1; f) | {adds}"),
-            "301\n",
-            0,
-        ),
-        (
-            format!("0 | {} | (def f: . + 1; f)", pipe("(def f: . + 1; f)", 150)),
-            "151\n",
+            format!("def f(x): x + 1; 0 | {}", pipe("f(.)", 200)),
+            "200\n",
             0,
         ),
     ])
