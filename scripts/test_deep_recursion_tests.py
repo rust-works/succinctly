@@ -81,6 +81,16 @@ class SkipArgsTests(unittest.TestCase):
         tokens = skip_arg_tokens("skip-args-stack")
         self.assertEqual(tokens, ["--exact"] + [t for n in stack for t in ("--skip", n)])
 
+    def test_heavy_args_is_the_skip_list_less_the_two_stack_tests(self):
+        # The `jq-cli-heavy` coverage shard runs these and `jq-cli` skips all of
+        # `skip-args`, so together they cover `jq_cli_tests` once (#5711). The stack tests
+        # are `#[ignore]`d under coverage, so they are in neither shard's run.
+        tokens = skip_arg_tokens("heavy-args")
+        self.assertEqual(tokens[0], "--exact")
+        heavy = tokens[1:]
+        self.assertEqual(heavy, listed_names()[2:])
+        self.assertEqual(len(heavy), len(set(heavy)))
+
     def test_unknown_or_missing_subcommand_is_a_usage_error(self):
         for args in ([], ["bogus"]):
             with self.subTest(args=args):
