@@ -95,3 +95,51 @@ fn test_noop_delete_and_null_slice_store_keep_their_values_5761() -> Result<()> 
     }
     Ok(())
 }
+
+/// A fold that stores the loop element through a slice or a delete: the answer follows jq's
+/// root, `false` where it builds a new array and `true` where it keeps the input (a full-range
+/// slice, a path through something absent). The fold gate used to keep the literal operand for
+/// all of them.
+#[test]
+#[cfg_attr(
+    feature = "unshared-containers",
+    ignore = "holdout has no node identity or sharing (#5254)"
+)]
+fn test_fold_store_through_a_slice_or_delete_follows_jq_5761() -> Result<()> {
+    for (filter, expected) in [
+        ("{}; .x = ($v | del(.[5].x))", "true"),
+        ("{}; .x = ($v | del(empty))", "true"),
+        ("{}; .x = ($v | .[0:])", "true"),
+        ("{}; .x = ($v | try del(.[5].x.y) catch 1)", "true"),
+        ("{}; .x = ($v | delpaths([[5]]))", "false"),
+        ("{}; .x = ($v | del(.[5]?))", "false"),
+        ("{}; .x = ($v | del(.[5], .[6]))", "false"),
+        ("{}; .x = ($v | .[1:2])", "false"),
+        ("{}; .x = ($v | (.[5] |= empty))", "false"),
+        ("{}; .x = ($v | del(.[0:0]))", "false"),
+    ] {
+        let program = format!("[[nan]] as $a | reduce $a[] as $v ({filter}) | .x == $a[0]");
+        assert_eq!(answer(&program)?, format!("{expected}\n"), "{program}");
+    }
+    for (program, expected) in [
+        (
+            "[[nan]] as $a | reduce $a[] as $v (null; .[1:] |= $v) == $a[0]",
+            "false",
+        ),
+        (
+            "[[nan]] as $a | reduce $a[] as $v ([]; . + [$v | del(.[9])]) | .[0] == $a[0]",
+            "false",
+        ),
+        (
+            "[[nan]] as $a | reduce $a[] as $v ([]; . + ($v | del(.[9]))) == $a[0]",
+            "false",
+        ),
+        (
+            "[[nan]] as $a | reduce $a[] as $v (null; . + ($v | .[0:])) == $a[0]",
+            "true",
+        ),
+    ] {
+        assert_eq!(answer(program)?, format!("{expected}\n"), "{program}");
+    }
+    Ok(())
+}
