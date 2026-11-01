@@ -90,6 +90,10 @@ pub fn write_json_body_jq<W: Write>(out: &mut W, s: &str) -> core::fmt::Result {
         if !is_jq_escaped_byte(b) {
             continue;
         }
+        debug_assert!(
+            b < 0x80,
+            "an escaped byte must be ASCII to sit on a char boundary"
+        );
         if start < i {
             out.write_str(&s[start..i])?;
         }
@@ -115,7 +119,14 @@ pub fn write_json_body_jq<W: Write>(out: &mut W, s: &str) -> core::fmt::Result {
 /// [`is_jq_escaped_control`] names. A byte of a multi-byte character is `>= 0x80`, so never.
 #[inline]
 const fn is_jq_escaped_byte(b: u8) -> bool {
-    b < 0x20 || b == b'"' || b == b'\\' || b == 0x7f
+    b == b'"' || b == b'\\' || is_jq_escaped_control_byte(b)
+}
+
+/// The control bytes jq escapes: C0 and DEL. The one definition [`is_jq_escaped_byte`] and
+/// [`is_jq_escaped_control`] both read, so the `char` writers and the span writer cannot disagree.
+#[inline]
+const fn is_jq_escaped_control_byte(b: u8) -> bool {
+    b < 0x20 || b == 0x7f
 }
 
 /// [`write_json_body_jq`], plus `\uXXXX` for every non-ASCII character — jq's
@@ -281,7 +292,7 @@ pub fn write_json_body_yq_ascii<W: Write>(out: &mut W, s: &str) -> core::fmt::Re
 /// also covers C1 — see [`write_json_body_jq`].
 #[inline]
 const fn is_jq_escaped_control(c: char) -> bool {
-    (c as u32) < 0x20 || c == '\u{7f}'
+    c.is_ascii() && is_jq_escaped_control_byte(c as u8)
 }
 
 /// Run one of this module's body writers into a fresh `String`.
@@ -698,6 +709,21 @@ mod tests {
                     assert_eq!(jq(&s), char_walk(&s), "pad={pad} hit={hit:?} wide={wide:?}");
                 }
             }
+        }
+    }
+
+    /// #5675: the byte predicate the span writer scans with and the `char` predicate the `-a` writer
+    /// matches on name the same controls, over every byte and every code point below U+0100.
+    #[test]
+    fn jq_escape_predicates_agree_5675() {
+        for b in 0..=u8::MAX {
+            let control = is_jq_escaped_control(char::from(b));
+            assert_eq!(control, b < 0x80 && is_jq_escaped_control_byte(b), "{b:#x}");
+            assert_eq!(
+                is_jq_escaped_byte(b),
+                control || b == b'"' || b == b'\\',
+                "{b:#x}"
+            );
         }
     }
 
