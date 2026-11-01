@@ -94,6 +94,11 @@ pub struct CompareJqArgs {
     #[arg(long)]
     query: Option<String>,
 
+    /// Performance: also count each tool's instructions under `valgrind --tool=cachegrind`, a
+    /// signal load cannot move (Linux with valgrind installed; rows over 1 MB are not counted)
+    #[arg(long)]
+    cachegrind: bool,
+
     /// Re-run the deterministic dimensions and spot-check timing rows against a
     /// recorded results.json; exit 1 on any difference
     #[arg(long)]
@@ -255,6 +260,22 @@ fn secondary_tool(
     })
 }
 
+/// `valgrind`, for `--cachegrind`. It exists for Linux only (none for Apple Silicon), so
+/// elsewhere, or without it, the flag is an error and not a silent no-op (#5552).
+fn find_valgrind() -> Result<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        bail!("--cachegrind needs valgrind, which runs on Linux only");
+    }
+    let works = Command::new("valgrind")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !works {
+        bail!("--cachegrind needs a working `valgrind` on PATH (apt-get install valgrind)");
+    }
+    Ok(PathBuf::from("valgrind"))
+}
+
 fn repo_root() -> Result<PathBuf> {
     let out = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -266,6 +287,15 @@ fn repo_root() -> Result<PathBuf> {
 }
 
 pub fn run(args: CompareJqArgs) -> Result<i32> {
+    if args.cachegrind
+        && (args.ledger_only
+            || (!args.dimension.is_empty() && !args.dimension.contains(&Dimension::Performance)))
+    {
+        bail!(
+            "--cachegrind counts instructions in the performance dimension, which this run skips"
+        );
+    }
+    let valgrind = args.cachegrind.then(find_valgrind).transpose()?;
     let root = repo_root()?;
     let (manifest, manifest_sha256) = Manifest::load(&root)?;
     let primary = manifest.primary().clone();
@@ -688,15 +718,53 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                 (true, _, true) => 9,
                 _ => 21,
             };
-            let row = perf::run_row(&tools, query, *input, &inputs_dir, n)?;
+            // Under valgrind a 10 MB row is minutes per tool: only rows up to 1 MB are counted.
+            let counted = valgrind
+                .as_deref()
+                .filter(|_| input.map_or(true, |i| i.tier == "1mb"));
+            let row = perf::run_row_with(&tools, query, *input, &inputs_dir, n, counted)?;
             if row.gate == perf::Gate::Differs {
                 observed.insert(format!("perf:{}@{}", row.query, row.input));
             }
             perf_rows.push(row);
         }
+        if valgrind.is_some() {
+            // A valgrind that could not run the tools must not read as a clean run with no table.
+            let (mut wanted, mut got) = (0, 0);
+            for r in perf_rows
+                .iter()
+                .filter(|r| r.gate == perf::Gate::Match && r.tools.len() > 1)
+                .filter(|r| r.tier == "1mb" || r.tier == "startup")
+            {
+                wanted += 2;
+                got += r
+                    .tools
+                    .iter()
+                    .take(2)
+                    .filter(|t| t.instructions.is_some())
+                    .count();
+            }
+            if wanted > 0 && got == 0 {
+                bail!("--cachegrind: valgrind gave no instruction count for any of the {wanted} tool runs it was asked to count");
+            }
+            if got < wanted {
+                let note = format!(
+                    "{} of {wanted} cachegrind counts are missing (valgrind could not run that tool, or it ran over 300 s)",
+                    wanted - got
+                );
+                perf_note = Some(match perf_note {
+                    Some(n) => format!("{n}; {note}"),
+                    None => note,
+                });
+            }
+        }
         dimensions.push(DimensionStatus {
             name: "D. Performance / E. Memory",
-            status: "implemented (spawn timings and peak RSS on generated shapes and the corpus's JSON files; cachegrind counts are not yet included)",
+            status: if valgrind.is_some() {
+                "implemented (spawn timings and peak RSS on generated shapes and the corpus's JSON files; cachegrind instruction counts for the rows up to 1 MB)"
+            } else {
+                "implemented (spawn timings and peak RSS on generated shapes and the corpus's JSON files; cachegrind instruction counts only with --cachegrind, on Linux)"
+            },
         });
     }
     let mut operational_info = None;

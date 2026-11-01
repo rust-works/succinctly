@@ -268,6 +268,10 @@ pub struct ToolResult {
     /// `RssAnon` seen while the process ran (sampled, so a lower bound for a run too
     /// short to sample twice). macOS: `peak memory footprint`. `None` elsewhere.
     pub private_kb: Option<u64>,
+    /// Instructions executed (`I refs` of one `valgrind --tool=cachegrind` run, #5552): a
+    /// count that machine load cannot move, beside the wall-clock. `None` without
+    /// `--cachegrind`, on a row too large to run under valgrind, or where valgrind failed.
+    pub instructions: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -295,6 +299,8 @@ pub struct PerfRow {
     pub rss_ratio_primary: Option<f64>,
     /// The same ratio over private memory (`ToolResult::private_kb`).
     pub private_ratio_primary: Option<f64>,
+    /// The same ratio over instructions executed (`ToolResult::instructions`).
+    pub ir_ratio_primary: Option<f64>,
     /// Any tool's CV exceeds 5%.
     pub noisy: bool,
 }
@@ -502,6 +508,73 @@ fn median_u64(mut v: Vec<u64>) -> Option<u64> {
     v.get(v.len() / 2).copied()
 }
 
+/// The instruction count in cachegrind's log (`I   refs:      1,234,567`).
+pub fn parse_ir(log: &str) -> Option<u64> {
+    log.lines().find_map(|line| {
+        let v = line.split_once("I   refs:")?.1;
+        v.trim().replace(',', "").parse().ok()
+    })
+}
+
+/// The longest one tool's run under valgrind may take (~50x its native time).
+const IR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Instructions one run of `tool` executes, from `valgrind --tool=cachegrind`. The count is
+/// stable to within a hair (a hash seed or an allocator can move it by a few instructions), so
+/// one run is enough for a signal read at a 5% band. Cache simulation is off (only `Ir` is
+/// read), and the run has the timed runs' working directory and environment. A tool that exits
+/// non-zero still has a valid count (valgrind passes its status through, and the output gate
+/// has already matched it to the reference's), so the count is whatever the log holds: `None`
+/// when valgrind could not run the tool at all, or ran past [`IR_DEADLINE`].
+fn ir_once(valgrind: &Path, tool: &Tool, args: &[String], cwd: &Path) -> Option<u64> {
+    let name: String = tool
+        .name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let dir = std::env::temp_dir().join(format!("compare-cg-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let log = dir.join("cg.log");
+    let mut child = Command::new(valgrind)
+        .args(["--tool=cachegrind", "--cache-sim=no"])
+        .arg(format!("--log-file={}", log.display()))
+        .arg(format!(
+            "--cachegrind-out-file={}",
+            dir.join("cg.out").display()
+        ))
+        .arg(&tool.program)
+        .args(&tool.prefix)
+        .args(args)
+        .current_dir(cwd)
+        .env("TZ", "UTC")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+    let finished = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) if start.elapsed() < IR_DEADLINE => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    let count = std::fs::read_to_string(&log)
+        .ok()
+        .and_then(|t| parse_ir(&t))
+        .filter(|_| finished);
+    let _ = std::fs::remove_dir_all(&dir);
+    count
+}
+
 /// Run one row. `tools[0]` is the subject, `tools[1]` the primary reference,
 /// `tools[2]` (optional) the secondary.
 pub fn run_row(
@@ -510,6 +583,18 @@ pub fn run_row(
     input: Option<&InputSpec>,
     inputs_dir: &Path,
     reps: usize,
+) -> Result<PerfRow> {
+    run_row_with(tools, q, input, inputs_dir, reps, None)
+}
+
+/// [`run_row`], also counting each tool's instructions under the `valgrind` at that path (#5552).
+pub fn run_row_with(
+    tools: &[Tool],
+    q: &PerfQuery,
+    input: Option<&InputSpec>,
+    inputs_dir: &Path,
+    reps: usize,
+    valgrind: Option<&Path>,
 ) -> Result<PerfRow> {
     let file = input.map(|i| format!("{}.json", i.id));
     let args = args_for(q, file.as_deref());
@@ -551,6 +636,7 @@ pub fn run_row(
         secondary_over_primary: None,
         rss_ratio_primary: None,
         private_ratio_primary: None,
+        ir_ratio_primary: None,
         noisy: false,
     };
     if gate == Gate::Differs || reps == 0 {
@@ -584,6 +670,10 @@ pub fn run_row(
             cv_pct: Some(cv_pct(&samples[i])),
             peak_rss_kb: rss,
             private_kb: private,
+            // The secondary reference is not counted: nothing reports it.
+            instructions: valgrind
+                .filter(|_| i < 2)
+                .and_then(|v| ir_once(v, t, &args, inputs_dir)),
         });
     }
     row.noisy = row.tools.iter().any(|t| t.cv_pct.is_some_and(|c| c > 5.0));
@@ -612,6 +702,7 @@ pub fn run_row(
     };
     row.rss_ratio_primary = ratio(row.tools[0].peak_rss_kb, row.tools[1].peak_rss_kb);
     row.private_ratio_primary = ratio(row.tools[0].private_kb, row.tools[1].private_kb);
+    row.ir_ratio_primary = ratio(row.tools[0].instructions, row.tools[1].instructions);
     Ok(row)
 }
 
@@ -778,6 +869,52 @@ mod tests {
             .to_string();
         assert!(err.contains("manifest pins"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_instruction_count_is_read_from_cachegrinds_log() {
+        let log = "==12== Cachegrind, a high-precision tracing profiler\n\
+                   ==12== \n==12== I   refs:      1,234,567\n";
+        assert_eq!(parse_ir(log), Some(1_234_567));
+        assert_eq!(parse_ir("==12== I refs: 5"), None);
+        assert_eq!(parse_ir("no counts here"), None);
+        assert_eq!(parse_ir("==1== I   refs:      x"), None);
+    }
+
+    /// A stand-in `valgrind` that writes the log it is asked for: the run's arguments, working
+    /// directory and failure handling are the harness's, not valgrind's.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_or_silent_valgrind_gives_no_count() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("valgrind");
+        let stub = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let log = r#"for a in "$@"; do case $a in --log-file=*) f=${a#--log-file=};; esac; done"#;
+        let tool = Tool {
+            name: "jq-1.7.1 (control)".into(),
+            program: "true".into(),
+            prefix: vec![],
+        };
+        let ok = stub(
+            "ok",
+            &format!("{log}\necho '==1== I   refs:      42' > \"$f\""),
+        );
+        assert_eq!(ir_once(&ok, &tool, &[], &dir), Some(42));
+        // The traced program's own non-zero exit passes through valgrind; its count is valid.
+        let failing = stub(
+            "failing",
+            &format!("{log}\necho '==1== I   refs:      42' > \"$f\"\nexit 1"),
+        );
+        assert_eq!(ir_once(&failing, &tool, &[], &dir), Some(42));
+        let silent = stub("silent", "exit 0");
+        assert_eq!(ir_once(&silent, &tool, &[], &dir), None);
+        assert_eq!(ir_once(&dir.join("absent"), &tool, &[], &dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

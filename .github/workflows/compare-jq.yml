@@ -33,7 +33,7 @@ jobs:
       - name: Build the pinned references
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential
+          sudo apt-get install -y build-essential valgrind
           scripts/compare-jq-build.sh 1.7.1
           scripts/compare-jq-build.sh 1.8.1
       - name: Build succinctly (the manifest's feature set)
@@ -43,7 +43,7 @@ jobs:
         continue-on-error: true
         run: scripts/sync-bench-corpus.sh
       - name: Compare
-        run: ./target/release/succinctly dev compare jq --quick --out data/compare/ci
+        run: ./target/release/succinctly dev compare jq --quick --cachegrind --out data/compare/ci
       - name: Upload the report
         if: always()
         uses: actions/upload-artifact@v7

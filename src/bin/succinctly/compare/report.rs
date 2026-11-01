@@ -186,6 +186,16 @@ pub fn render(results: &Results) -> String {
                 e.jq_version
             );
         }
+        let ir: Vec<f64> = timed.iter().filter_map(|x| x.ir_ratio_primary).collect();
+        if let Some(g) = geomean(&ir) {
+            let (lo, hi) = range(&ir);
+            let _ = writeln!(
+                s,
+                "| Geomean instructions vs {} (cachegrind, n={}) | {g:.2}x ({lo:.2}x–{hi:.2}x) |",
+                e.jq_version,
+                ir.len()
+            );
+        }
         let _ = writeln!(
             s,
             "| Timing rows jq wins / noisy (CV > 5%) | {} / {} |",
@@ -690,6 +700,74 @@ fn perf_sections(s: &mut String, r: &Results) {
         );
     }
     memory_section(s, &timed);
+    instruction_section(s, &timed);
+}
+
+/// Whether the instruction count and the wall-clock put succinctly on opposite sides of jq
+/// (CLAUDE.md: they can disagree in sign). Both must be more than 5% from a tie, so noise
+/// around 1.0 on either is not a finding.
+fn signs_disagree(ir_ratio: f64, speedup: f64) -> bool {
+    let wall_ratio = 1.0 / speedup;
+    (ir_ratio < 1.0) != (wall_ratio < 1.0)
+        && (ir_ratio - 1.0).abs() > 0.05
+        && (wall_ratio - 1.0).abs() > 0.05
+}
+
+/// Dimension D's secondary signal: instructions executed under cachegrind (`--cachegrind`).
+fn instruction_section(s: &mut String, timed: &[&PerfRow]) {
+    let counted: Vec<&&PerfRow> = timed
+        .iter()
+        .filter(|x| x.tools.iter().any(|t| t.instructions.is_some()))
+        .collect();
+    if counted.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        s,
+        "\n## D. Instruction counts (`valgrind --tool=cachegrind`, `I refs` of one untimed run)\n"
+    );
+    let _ = writeln!(
+        s,
+        "Instructions executed by the whole process, start-up included. Unlike a time they do not move with \
+         machine load, but they are not time: a vectorised loop and a branchy one retire different numbers of \
+         instructions per nanosecond, so the two signals can disagree in sign. A row is marked `differs` when \
+         the instruction ratio and the wall-clock put succinctly on opposite sides of jq and both are more \
+         than 5% from a tie. Only the rows up to 1 MB are counted (cachegrind runs ~50x slower), and only \
+         succinctly and jq 1.7.1; a tool valgrind could not run reads `n/a`. valgrind emulates a CPU \
+         without AVX-512, so on a machine that has it succinctly may take a different code path \
+         here than in the timed runs.\n"
+    );
+    let _ = writeln!(
+        s,
+        "| Query | Input | jq 1.7.1 | succinctly | ratio (succinctly ÷ jq) | wall-clock vs jq 1.7.1 | signs |"
+    );
+    let _ = writeln!(
+        s,
+        "|-------|-------|----------|------------|-------------------------|------------------------|-------|"
+    );
+    for x in counted {
+        let ir = |i: usize| {
+            x.tools
+                .get(i)
+                .and_then(|t| t.instructions)
+                .map_or_else(|| "n/a".into(), |v| v.to_string())
+        };
+        let differs = matches!(
+            (x.ir_ratio_primary, x.speedup_primary),
+            (Some(a), Some(b)) if signs_disagree(a, b)
+        );
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {} | {} | {} |",
+            x.query,
+            x.input,
+            ir(1),
+            ir(0),
+            ratio(x.ir_ratio_primary),
+            row_ratio(x, x.speedup_primary),
+            if differs { "differs" } else { "" }
+        );
+    }
 }
 
 /// Dimension E: peak RSS beside private memory, with the note that says why both are shown.
@@ -831,6 +909,7 @@ mod tests {
             cv_pct: None,
             peak_rss_kb: rss,
             private_kb: private,
+            instructions: None,
         }
     }
 
@@ -849,6 +928,7 @@ mod tests {
             secondary_over_primary: None,
             rss_ratio_primary: rss,
             private_ratio_primary: private,
+            ir_ratio_primary: None,
             noisy: false,
         }
     }
@@ -886,6 +966,55 @@ mod tests {
         let mut s = String::new();
         memory_section(&mut s, &[&r]);
         assert!(s.contains("| 5 | 10 | 2.00x | n/a | n/a |"), "{s}");
+    }
+
+    fn counted(name: &str, ir: Option<u64>) -> ToolResult {
+        ToolResult {
+            instructions: ir,
+            ..tool(name, None, None)
+        }
+    }
+
+    #[test]
+    fn instruction_table_flags_a_row_whose_signs_disagree_with_the_wall_clock() {
+        // Fewer instructions (0.50x) yet jq is faster (speedup 0.80x): the two signals disagree.
+        let mut r = row(
+            vec![counted("succinctly", Some(500)), counted("jq", Some(1000))],
+            None,
+            None,
+        );
+        r.speedup_primary = Some(0.8);
+        r.ir_ratio_primary = Some(0.5);
+        let mut s = String::new();
+        instruction_section(&mut s, &[&r]);
+        assert!(
+            s.contains("| startup | none | 1000 | 500 | 0.50x | 0.80x | differs |"),
+            "{s}"
+        );
+        // The same instruction ratio with succinctly also faster agrees.
+        r.speedup_primary = Some(1.6);
+        let mut s = String::new();
+        instruction_section(&mut s, &[&r]);
+        assert!(s.contains("| 0.50x | 1.60x |  |"), "{s}");
+    }
+
+    #[test]
+    fn a_tie_on_either_signal_is_not_a_disagreement() {
+        assert!(
+            !signs_disagree(0.98, 0.8),
+            "instructions within 5% of a tie"
+        );
+        assert!(!signs_disagree(0.5, 0.98), "wall-clock within 5% of a tie");
+        assert!(signs_disagree(1.5, 1.5), "more instructions, yet faster");
+        assert!(!signs_disagree(1.5, 0.5), "more instructions and slower");
+    }
+
+    #[test]
+    fn no_instruction_section_without_counts() {
+        let r = row(vec![tool("succinctly", None, None)], None, None);
+        let mut s = String::new();
+        instruction_section(&mut s, &[&r]);
+        assert!(s.is_empty(), "{s}");
     }
 }
 
