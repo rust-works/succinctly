@@ -15,8 +15,8 @@
 # was these. Six `recurse` cap and argument-chain tests went from under 2 s to 35-70 s when #5378
 # raised the node cap to 2^20, so each now walks a million-node document through a dozen
 # filters. They are heavy by construction, not slow because of a fault, so the cost is moved
-# here too: this leg (about 270 s of test CPU) and `cli-gated` (about 970 s) now carry
-# similar amounts. A `yq_cli_tests` test cannot be listed: `run` lists and runs one target.
+# here too: this leg (about 270 s of test CPU) and `cli-gated` (about 970 s) then carried
+# similar amounts (#5705 has since moved `yq_cli_tests` here, below). A `yq_cli_tests` test cannot be listed: `run` lists and runs one target.
 #
 # All of `yq_cli_tests` (104 s of macOS test time, #5705) runs in that leg too, but not from
 # here: ci.yml runs `cargo test --features cli --test yq_cli_tests` after `run`, with no skip

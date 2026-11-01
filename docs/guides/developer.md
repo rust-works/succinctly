@@ -169,8 +169,9 @@ slow `jq_cli_tests` test there, add its name to that script's `HEAVY_TESTS` (it 
 test target only). The x86_64 `holdout` leg skips only the two stack tests (`skip-args-stack`),
 since it is the one place the `unshared-containers` build is tested. `scripts/deep-recursion-tests.sh run` runs just those tests locally, and
 `scripts/test_deep_recursion_tests.py` is the script's own self-test, which the leg runs
-first. That leg also runs all of `yq_cli_tests` (#5705), as a separate `cargo test` after the script,
-because it was ~30% of `cli-gated`'s test time. A plain `cargo test --features cli` still runs everything.
+first. That leg also runs all of `yq_cli_tests` (#5705, ~30% of `cli-gated`'s test time), but
+as a separate `cargo test --features cli --test yq_cli_tests` after the script, so `run` alone
+does not reproduce the leg. A plain `cargo test --features cli` still runs everything.
 
 ### Differential sweeps against jq
 

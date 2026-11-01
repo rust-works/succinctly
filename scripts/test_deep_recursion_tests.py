@@ -256,14 +256,17 @@ class CiWiringTests(unittest.TestCase):
         for job in MATRIX_JOBS:
             with self.subTest(job=job):
                 legs = matrix_legs(job)
-                running = [name for name, leg in legs.items() if "yq_cli_tests" in leg]
+                target = re.compile(r"--test yq_cli_tests\b")
+                running = [name for name, leg in legs.items() if target.search(leg)]
                 self.assertEqual(running, ["deep-recursion"])
-                commands = [
-                    line.strip()
-                    for line in legs["deep-recursion"].split("\n")
-                    if "yq_cli_tests" in line
-                ]
+                lines = [line.strip() for line in legs["deep-recursion"].split("\n")]
+                commands = [line for line in lines if target.search(line)]
                 self.assertEqual(commands, ["cargo test --features cli --test yq_cli_tests"])
+                # After the jq half, as ci.yml's comment says: the step's shell stops at the
+                # first failing command, and the jq half is the one that counts its passes.
+                self.assertLess(
+                    lines.index("scripts/deep-recursion-tests.sh run"), lines.index(commands[0])
+                )
 
     def test_no_other_leg_runs_jq_cli_tests_with_the_two_tests_twice(self):
         # A third place running `--test jq_cli_tests` unskipped would run them twice.
