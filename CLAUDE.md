@@ -104,9 +104,11 @@ cargo bench                              # Run benchmarks
 
 ### Coverage
 
-CI runs coverage via the [`action-works/patchcov-action`](https://github.com/action-works/patchcov-action)
-action (x86_64 + ARM64 matrix), which wraps `cargo-llvm-cov` + `patchcov diff` and
-posts PR patch coverage as a sticky comment. To reproduce the CI line-coverage number locally,
+CI runs coverage through `.github/workflows/coverage.yml` (x86_64 + ARM64): four test shards per
+architecture (`scripts/coverage-shards.py` defines which tests each runs; a new test file lands in the
+`rest` shard by itself, #5711), each producing an lcov with `cargo-llvm-cov`, then a report job that
+combines them with [`action-works/patchcov-action`](https://github.com/action-works/patchcov-action)'s
+thin mode (`patchcov diff`) and posts PR patch coverage as a sticky comment. To reproduce the CI line-coverage number locally,
 use the same feature set CI uses:
 
 ```bash

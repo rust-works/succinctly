@@ -779,6 +779,11 @@ jobs:
       - name: ci-load-report.py self-tests
         run: python3 scripts/test_ci_load_report.py -v
 
+      # #5711: pins that the `Coverage` shards (coverage.yml) between them run every test
+      # target once: no build, `cargo metadata` at most.
+      - name: coverage-shards.py self-tests
+        run: python3 scripts/test_coverage_shards.py -v
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -1000,8 +1005,9 @@ jobs:
   # `pull_request` runs it (#3649): a merge-group build has no PR to comment on
   # (#310), and the push-to-main run that publishes the baseline lives in
   # coverage-baseline.yml, where an unrelated job failing or being cancelled
-  # here can no longer make the artifact unreachable. The steps live in
-  # .github/actions/coverage, shared with that workflow.
+  # here can no longer make the artifact unreachable. The jobs live in
+  # .github/workflows/coverage.yml, shared with that workflow: four test shards per
+  # architecture and a report job that combines them (#5711).
   coverage:
     name: Coverage (${{ matrix.name }})
     needs: gate
@@ -1012,28 +1018,16 @@ jobs:
         include:
           - name: x86_64
             runner: ubuntu-latest
-            use-prebuilt: 'true'
           - name: ARM64
             runner: ubuntu-24.04-arm
-            use-prebuilt: 'true'    # prebuilt aarch64-linux patchcov (needs glibc >= 2.35; this image has 2.39); patchcov-action selects by arch (#3873)
-    runs-on: ${{ matrix.runner }}
+    # A called workflow cannot hold more than its caller grants it.
     permissions:
       contents: read
       pull-requests: write          # required to post the sticky coverage comment
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0            # full history for git merge-base (PR fork point)
-
-      - uses: ./.github/actions/coverage
-        with:
-          name: ${{ matrix.name }}
-          use-prebuilt: ${{ matrix.use-prebuilt }}
-          # #3750 B1, stage 1: pooled profile files on pull requests only. A pull
-          # request run publishes no baseline, so an unexpected result here costs one
-          # red job and not phantom deltas on every later PR; coverage-baseline.yml
-          # stays on per-process files until this has been read.
-          pool-profile-files: 'true'
+    uses: ./.github/workflows/coverage.yml
+    with:
+      name: ${{ matrix.name }}
+      runner: ${{ matrix.runner }}
 
   # Drift detector for the yq golden fixtures (tests/data/yq-golden/): the
   # goldens are frozen oracle output, so this is the one job that re-checks

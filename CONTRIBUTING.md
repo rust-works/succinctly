@@ -339,7 +339,7 @@ PR comment** rather than merely tolerated: the CPU-gated regions of
 `src/bits/popcount.rs` (the AVX-512 kernel and its dispatch, and the two
 host-gated tests) are wrapped in `// patchcov: coverage tolerate` ... `coverage end`
 markers in the source, which `patchcov diff` (version pinned in
-`.github/actions/coverage/action.yml`) reads from each revision's own text.
+`.github/workflows/coverage.yml`) reads from each revision's own text.
 `tolerate` keeps the lines in the reported percentage but scores them against
 the baseline, so a flip between a VPOPCNTDQ-capable host and one without cannot
 generate a phantom delta. Since #2467 the file is no longer excluded wholesale

@@ -20,11 +20,12 @@ name: Coverage baseline
 # Runs on every push to `main`, docs-only ones included: a PR can fork from any
 # main commit and needs that commit's baseline.
 #
-# ci.yml's pull-request `Coverage` jobs look the baseline up here (the composite
-# action's `baseline-workflow` input), and ci.yml no longer runs coverage on
-# `push` at all. A PR forked from a commit that predates this workflow, or from
-# one whose run here has not finished yet, falls back to rebuilding the baseline
-# in a worktree.
+# ci.yml's pull-request `Coverage` jobs look the baseline up here (the `baseline-workflow` input
+# of patchcov-action in .github/workflows/coverage.yml), and ci.yml no longer runs coverage on
+# `push` at all. Both call coverage.yml, which runs the tests as shards and publishes the
+# combined report (#5711). A PR forked from a commit that predates this workflow, or from one
+# whose run here has not finished yet, uses the nearest ancestor's baseline; thin mode cannot
+# rebuild one in a worktree any more, so a PR with none reachable gets a comment without deltas.
 on:
   push:
     branches: [main]
@@ -49,21 +50,14 @@ jobs:
         include:
           - name: x86_64
             runner: ubuntu-latest
-            use-prebuilt: 'true'
           - name: ARM64
             runner: ubuntu-24.04-arm
-            use-prebuilt: 'true'    # prebuilt aarch64-linux patchcov (needs glibc >= 2.35; this image has 2.39); patchcov-action selects by arch (#3873)
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - uses: ./.github/actions/coverage
-        with:
-          name: ${{ matrix.name }}
-          use-prebuilt: ${{ matrix.use-prebuilt }}
-          # #3750 B1, stage 2: the pull-request jobs ran pooled first (PR #3764) and
-          # matched the unpooled baseline of the same commit line for line outside
-          # the two CPU-feature-flap files, so the published baseline is pooled too.
-          pool-profile-files: 'true'
+    # The called workflow's report job asks for `pull-requests: write` (its sticky comment, which a
+    # push never posts), and a called workflow cannot hold more than its caller grants it.
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/coverage.yml
+    with:
+      name: ${{ matrix.name }}
+      runner: ${{ matrix.runner }}

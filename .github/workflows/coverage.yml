@@ -1,0 +1,262 @@
+name: Coverage
+
+# The instrumented test run, split across concurrent shard jobs, and the report built from
+# them. Reusable: ci.yml calls it on pull requests (sticky patch-coverage comment) and
+# coverage-baseline.yml on pushes to `main` (publishes the baseline artifact that pull requests
+# diff against), once per architecture. One definition, so the two cannot drift apart on the
+# pinned patchcov version, the tests each shard runs or the coverage gate (#3649, #5711).
+#
+# Why shards (#5711): one job ran 27 of its 30 minutes of x86_64 wall-clock in the test
+# binaries, five binaries held 94% of that, and a dozen single tests took 1-5 minutes each. The
+# shards below run concurrently, each building only its own targets, and `report` combines their
+# lcov files with patchcov-action's thin mode (`run-coverage: false`, `shard-reports`).
+#
+#   jq-cli         `jq_cli_tests` without the tests in scripts/deep-recursion-tests.sh
+#   jq-cli-heavy   exactly those tests
+#   jq-nesting     `jq_library_eval_nesting_depth_tests` (one 224 s test)
+#   rest           the lib, the bins and every other test target
+#
+# scripts/coverage-shards.py defines what each runs; scripts/test_coverage_shards.py fails when
+# this matrix and that file disagree, or when a test target would run in no shard or in two.
+# Doctests run in no shard: stable `cargo llvm-cov` does not instrument them.
+#
+# Costs, accepted on #5711: two jobs per pull request became ten (four shards and a report job
+# per architecture), and thin mode has no merge-base recompute, so a pull request whose
+# ancestors have no published baseline gets a comment without deltas.
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: 'Architecture leg (x86_64 or ARM64): suffixes the artifact names and the comment header'
+        type: string
+        required: true
+      runner:
+        description: 'Runner label for every job; shards and report share it so the checkout root is the same'
+        type: string
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  shard:
+    name: Shard ${{ inputs.name }} (${{ matrix.shard }})
+    runs-on: ${{ inputs.runner }}
+    strategy:
+      fail-fast: false              # a failed shard must still fail the run by name, not cancel its siblings
+      matrix:
+        shard: [jq-cli, jq-cli-heavy, jq-nesting, rest]
+    permissions:
+      contents: read
+    env:
+      # Free the unused hosted toolchains before the run only when `/` has less than this many GiB
+      # free (#3750). The old single job grew used space by ~52 GiB, nearly all of it unpooled
+      # profile files; a shard builds a subset and pools them, so this is a margin, not a need.
+      RECLAIM_BELOW_GIB: '75'
+    steps:
+      - uses: actions/checkout@v7
+
+      # #3585: from ~03:20 UTC on 2026-10-02 `Coverage (x86_64)` died on every PR after 30-31
+      # minutes with `No space left on device` raised by the runner worker's own log file, while
+      # ARM64 (a different image) passed. The multi-GB toolchains this job never uses are
+      # reclaimed, on x86_64 only (ARM64 passes without it), but only when the disk is tight:
+      # #3750 measured the step at 67-108 s of every run that did not need it. The two `df` lines
+      # stay either way, so a log says how much room the run started with.
+      - name: Reclaim disk space (x86_64, only when tight)
+        if: inputs.name == 'x86_64'
+        run: |
+          df -h /
+          # At most six digits: a longer number overflows the shell's 64-bit
+          # arithmetic below and wraps negative, which would silently skip.
+          case "$RECLAIM_BELOW_GIB" in
+            '' | *[!0-9]* | [0-9][0-9][0-9][0-9][0-9][0-9][0-9]*)
+              echo "::error::RECLAIM_BELOW_GIB must be a whole number of GiB with at most six digits, got '$RECLAIM_BELOW_GIB'"
+              exit 1
+              ;;
+          esac
+          avail_kb=$(df --output=avail -k / | tail -1 | tr -d ' ')
+          # 10#: a leading zero would otherwise read as octal.
+          threshold_kb=$((10#$RECLAIM_BELOW_GIB * 1048576))
+          if [ "$avail_kb" -ge "$threshold_kb" ]; then
+            echo "reclaim: skipped, $((avail_kb / 1048576)) GiB free on / is not below the $((10#$RECLAIM_BELOW_GIB)) GiB threshold"
+          else
+            echo "reclaim: running, $((avail_kb / 1048576)) GiB free on / is below the $((10#$RECLAIM_BELOW_GIB)) GiB threshold"
+            sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+              /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift
+          fi
+          df -h /
+
+      # Sample the free space every 20 s so a passing run says how close it came. A failing run
+      # cannot report (the runner dies writing its own log), which is why the headroom above is
+      # printed *before* the tests start.
+      - name: Sample free disk space
+        run: |
+          samples="$RUNNER_TEMP/df-avail-kb"
+          nohup bash -c "while :; do df --output=avail -k / | tail -1 >> '$samples'; sleep 20; done" >/dev/null 2>&1 &
+
+      # #3750 B1: pool the raw profile files. cargo-llvm-cov's `show-env` (which every step below
+      # evals) ignores a preset LLVM_PROFILE_FILE but honours LLVM_PROFILE_FILE_NAME, which
+      # replaces its default `<package>-%p-%Nm.profraw`. Dropping the `%p` is what pools: the
+      # processes of one binary then merge, at exit, into `%Nm` = N files per binary (the slot is
+      # pid % N), with N the runner's CPU count, as in cargo-llvm-cov's own default. Unpooled, a
+      # run left 30,814 files and 47 GiB (2026-10-04). Both callers pool: the pull-request jobs
+      # matched the unpooled baseline line for line outside the two CPU-feature-flap files.
+      # The name goes through $GITHUB_ENV so every later step sees it;
+      # coverage-profraw-stats.sh fails the run if the files are not pooled.
+      - name: Pool raw profile files
+        run: |
+          name="profile-%$(nproc)m.profraw"
+          echo "LLVM_PROFILE_FILE_NAME=$name" >> "$GITHUB_ENV"
+          echo "pooling raw profile files: LLVM_PROFILE_FILE_NAME=$name"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      # The instrumented dependencies are the same for every shard, so they share one cache key:
+      # whichever shard saves first serves the rest on later runs.
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # What patchcov-action's fat mode ran, one shard's worth: the instrumentation env, a clean
+      # profile directory, then `cargo test` (scripts/coverage-shards.py adds the shard's
+      # selectors to `--features cli,simd,regex,serde --workspace`).
+      - name: Run the shard's tests with coverage
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          eval "$(cargo llvm-cov show-env --sh)"
+          cargo llvm-cov clean --workspace
+          python3 scripts/coverage-shards.py run "$SHARD"
+
+      # #3750 A2: how many raw profile files the shard left and how big they are, before the
+      # report merges them; fails the shard if pooling did not take effect. While pooling is on
+      # this is the only check that it did.
+      - name: Profile file stats
+        run: |
+          eval "$(cargo llvm-cov show-env --sh)"
+          bash scripts/coverage-profraw-stats.sh
+
+      - name: Write the shard's lcov report
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          eval "$(cargo llvm-cov show-env --sh)"
+          cargo llvm-cov report --lcov --output-path "shard-$SHARD.lcov"
+
+      # `report` joins every file its pattern matches and names a shard whose file is missing,
+      # empty or without line records, so a failed shard cannot quietly lower coverage.
+      - name: Upload the shard's lcov report
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-shard-${{ inputs.name }}-${{ matrix.shard }}
+          path: shard-${{ matrix.shard }}.lcov
+          if-no-files-found: error
+
+      - name: Report disk headroom
+        if: always()
+        run: |
+          df -h /
+          if [ -s "$RUNNER_TEMP/df-avail-kb" ]; then
+            lowest_kb=$(sort -n "$RUNNER_TEMP/df-avail-kb" | head -1 | tr -d ' ')
+            echo "lowest free space sampled: $(awk -v k="$lowest_kb" 'BEGIN {printf "%.1f GiB", k/1048576}')"
+            # #3750: surface a shrinking margin while a run still survives, not only after
+            # #3585 comes back.
+            if [ "$lowest_kb" -lt "$((25 * 1048576))" ] 2>/dev/null; then
+              echo "::warning::lowest free disk space was under 25 GiB; raise RECLAIM_BELOW_GIB in .github/workflows/coverage.yml before this run's disk use causes ENOSPC (#3750)"
+            fi
+          fi
+
+  report:
+    name: Report ${{ inputs.name }}
+    needs: shard                    # not `if: always()`: a failed shard fails the run
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      pull-requests: write          # required to post the sticky coverage comment
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0            # full history for git merge-base (PR fork point)
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: coverage-shard-${{ inputs.name }}-*
+          merge-multiple: true      # every shard file lands in one directory
+          path: shards
+
+      - uses: action-works/patchcov-action@v2
+        id: patchcov
+        with:
+          # Pin patchcov itself (#3873, #3880, #4324), deliberately and not through the
+          # action's own default, so a patchcov release cannot change measured coverage
+          # under an unrelated PR (0.4.0 is also the action's current default, but the default
+          # moves with the action's tag and this pin does not). 0.4.0 carries the extracted coverage engine:
+          # `.patchcov/config.yaml` discovery and the symmetric ignore list (#302);
+          # patience diff preserves patch attribution on repetitive evaluator
+          # refactors (#1554); source coverage `tolerate` / `tolerate-line` / `end`
+          # markers mask runtime CPU and unreachable-line variance, which is how
+          # popcount.rs's CPU flap is handled now (#2467). It ships prebuilt Linux x86_64 + ARM64 binaries (#3750),
+          # avoiding cargo install on cache misses, and `patchcov merge` for shards. Since 0.4.0 a
+          # nonempty report whose paths match no tracked file fails with exit 7 instead of
+          # diffing nothing; the lcov paths here are the checkout root, so no `strip-prefix`
+          # is set (#4324).
+          # Bump deliberately: re-run the verification in docs/guides/developer.md
+          # "Patchcov migration verification" (lint-markers, then a diff of two real
+          # main lcov artifacts) before moving this pin.
+          version: 0.4.0
+          use-prebuilt-binary: 'true'     # prebuilt patchcov for the runner's arch (glibc >= 2.35; both images have 2.39) (#3873)
+          # Thin mode: the shards ran the tests; this combines their reports (#5711).
+          run-coverage: false
+          shard-reports: shards/shard-*.lcov
+          fail-under-lines: 55   # floor a few pts below local llvm-cov (ARM: 59.58% lines)
+          # fail-under-patch left unset → report-only initially
+          # Where the baseline is looked up: the newest *successful* run of this workflow
+          # for the merge-base commit. ci.yml's push run also holds the test matrices and
+          # perf-guard, so an unrelated failing or cancelled job there (13% of recent main
+          # pushes) leaves a published artifact unreachable -- which is why
+          # coverage-baseline.yml exists (#3649). Thin mode cannot recompute one in a
+          # worktree, so a pull request with no reachable baseline gets no deltas (#5711).
+          baseline-workflow: coverage-baseline.yml
+          baseline-artifact-name: coverage-baseline-${{ inputs.name }}
+          artifact-name: coverage-summary-${{ inputs.name }}
+          # The comment is posted by the steps below, cut to fit GitHub's limit first.
+          comment: 'false'
+
+      # Validate every Rust marker; documentation examples are outside this glob and are not
+      # executable coverage annotations. It was an `extra-test-commands` line of the fat-mode
+      # action, an input thin mode drops, so it runs here, once, after the action installed patchcov.
+      - name: Lint coverage markers
+        if: always() && steps.patchcov.conclusion != 'skipped'
+        run: patchcov lint-markers --include 'src/**/*.rs'
+
+      # GitHub refuses a comment over 65,536 characters, and patchcov lists every
+      # tolerated region and every line of unchanged code whose coverage changed: a
+      # change that moves much unchanged code out of coverage rendered 377,000
+      # characters, and the action's own sticky-comment step failed the job (#5223).
+      # coverage-fit-comment.py keeps the headline figures and the patch section, cuts the
+      # longest lists to their first entries, and the untruncated comment is uploaded
+      # beside the summary. The gates above have already run; this only reports.
+      - name: Fit the coverage comment under GitHub's limit
+        id: fit
+        if: always() && github.event_name == 'pull_request' && steps.patchcov.outputs.comment-path != ''
+        env:
+          COMMENT_PATH: ${{ steps.patchcov.outputs.comment-path }}
+          FULL_ARTIFACT: coverage-comment-${{ inputs.name }}
+        run: python3 scripts/coverage-fit-comment.py "$COMMENT_PATH" coverage-comment.md "$FULL_ARTIFACT"
+
+      - name: Upload the full coverage comment
+        if: always() && steps.fit.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-comment-${{ inputs.name }}
+          path: ${{ steps.patchcov.outputs.comment-path }}
+
+      - name: Comment coverage on PR
+        if: always() && steps.fit.outcome == 'success'
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          header: coverage-${{ inputs.name }}
+          path: coverage-comment.md

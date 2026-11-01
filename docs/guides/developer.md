@@ -231,7 +231,7 @@ comm -13 <(covered rest.info) <(covered two.info)   # lines only the two cover; 
 
 #### Patchcov migration verification
 
-The shared coverage action uses `patchcov-action@v2` with **patchcov 0.4.0**
+The shared coverage workflow (`.github/workflows/coverage.yml`) uses `patchcov-action@v2` with **patchcov 0.4.0**
 (#3873 moved coverage to patchcov, #3880 moved it from the omni-dev-named action, #4324 moved it from
 `patchcov-action@v1`, an interim 0.1.1 snapshot, to `@v2`). The other omni-dev
 commands still use `.omni-dev/`; coverage alone reads `.patchcov/config.yaml`. Install the pinned tool with `cargo install patchcov --version 0.4.0`.
