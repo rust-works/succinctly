@@ -1,7 +1,8 @@
-//! #5713: the `$ARGS` object holds a copy of every named argument, so it is built only for a
-//! program that names `$ARGS`. A program that does not read it answers as before, and one that
-//! does, in any position, still sees the same object. Outputs were captured from jq 1.7.1
-//! (`/usr/bin/jq`).
+//! #5713: the `$ARGS` object holds a copy of every named container argument, so it is built only
+//! for a program that names `$ARGS`; a program that does not read it answers as before, and one
+//! that does, in any position, still sees the same object. A named string is shared once, so a
+//! `$s` read, a `def` parameter and a `$ARGS` entry take a refcount, and every read answers as it
+//! did. Outputs were captured from jq 1.7.1.
 
 use anyhow::Result;
 
@@ -63,10 +64,9 @@ fn programs_that_read_args_and_programs_that_do_not_answer_as_jq_5713() -> Resul
     Ok(())
 }
 
-// The string splice: a named string is shared once, so every `$s` read, a `def` parameter and a
-// `$ARGS` entry take a refcount, not a copy of the whole string. These rows are the shapes a first
-// design (a marker node in place of the literal) made slower or answered differently, each with
-// the answer the pinned jq 1.7.1 gives, at lengths either side of the old 4096-byte threshold.
+// The string sharing: these rows are the shapes a first design (a marker node in place of the
+// literal, #5742) made slower or answered differently, each with the answer the pinned jq 1.7.1
+// gives. A string is read at a short and a long length; nothing depends on the length.
 
 /// `"hé"` repeated `n` times: `2n` codepoints, `3n` bytes.
 fn he(n: usize) -> String {
@@ -96,7 +96,7 @@ const SHARED_ROWS: &[(&str, &str)] = &[
 
 #[test]
 fn a_named_string_reads_alike_at_every_length_5713() -> Result<()> {
-    for n in [10usize, 1365, 1366, 2100] {
+    for n in [10usize, 2100] {
         let value = he(n);
         let len = (2 * n).to_string();
         let add = (2 * n * 3 + 3).to_string();
@@ -117,9 +117,9 @@ fn a_named_string_reads_alike_at_every_length_5713() -> Result<()> {
     Ok(())
 }
 
-/// A `--argjson` string and a `--rawfile` read the same as an `--arg`.
+/// A `--argjson` string reads the same as an `--arg`.
 #[test]
-fn argjson_and_rawfile_strings_read_alike_5713() -> Result<()> {
+fn an_argjson_string_reads_alike_5713() -> Result<()> {
     let value = he(2100);
     let json = format!("\"{value}\"");
     let (stdout, stderr, code) = run_jq_full(
@@ -157,5 +157,81 @@ fn a_slurpfile_string_element_reads_alike_5713() -> Result<()> {
         (stdout.as_str(), stderr.as_str(), code),
         ("\"[4200,true]\"\n", "", 0)
     );
+    Ok(())
+}
+
+/// A long `--rawfile` (the only way to reach a string past the argument-size limit) reads alike.
+#[test]
+fn a_long_rawfile_reads_alike_5713() -> Result<()> {
+    let (_file, path) = crate::temp_json(&he(40_000))?;
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "--rawfile",
+            "s",
+            &path,
+            "[$s|length, ($s|startswith(\"h\")), ([range(5)|$s|length]|add), ($s|test(\"zzzz\"))]|tojson",
+        ],
+        None,
+    )?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("\"[80000,true,400000,false]\"\n", "", 0)
+    );
+    Ok(())
+}
+
+/// A write to a string derived from `$s` never reaches `$s` or another read of it: the literal
+/// and every read share one storage, so a write has to copy first.
+#[test]
+fn a_write_to_a_string_from_a_named_string_leaves_it_alone_5713() -> Result<()> {
+    let value = he(2100);
+    for (filter, expected) in [
+        (
+            "($s + \"x\") as $t | [($s|length), ($t|length)]|tojson",
+            "\"[4200,4201]\"\n",
+        ),
+        (
+            "[$s, ($s|ascii_upcase), $s]|map(length)|tojson",
+            "\"[4200,4200,4200]\"\n",
+        ),
+        (
+            "reduce range(0;3) as $i (\"\"; . + $s) | $s | length",
+            "4200\n",
+        ),
+        (
+            "{a:$s}|.a|=1|[., ($s|length)]|tojson",
+            "\"[{\\\"a\\\":1},4200]\"\n",
+        ),
+        ("$s|(.|=ascii_upcase)|length", "4200\n"),
+        (
+            "[$s|ltrimstr(\"zzz\"), $s]|map(length)|tojson",
+            "\"[4200,4200]\"\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "--arg", "s", &value, filter], None)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (expected, "", 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// A string used as a path target is refused with jq's own error.
+#[test]
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
+fn a_named_string_is_not_a_path_5713() -> Result<()> {
+    let value = he(2100);
+    for filter in ["path($s)", "($s|getpath([]))|=1"] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "--arg", "s", &value, filter], None)?;
+        assert_eq!(stdout, "", "{filter}");
+        assert!(
+            stderr.contains("Invalid path expression with result"),
+            "{filter}: {stderr}"
+        );
+        assert_eq!(code, 5, "{filter}");
+    }
     Ok(())
 }
