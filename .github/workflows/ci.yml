@@ -733,6 +733,9 @@ jobs:
           - name: ARM64-Linux
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      actions: read                 # lists main's push runs and downloads their binary (#5704)
     steps:
       - uses: actions/checkout@v7
         with:
@@ -783,6 +786,98 @@ jobs:
       - name: Install valgrind
         run: sudo apt-get update && sudo apt-get install -y valgrind
 
+      # #5704: the baseline commit (a PR's merge-base, a push's `before`) is a
+      # commit on `main`, and its own `push` run already built this exact binary
+      # in "Build release binary" below -- ~5 of this job's ~15 minutes. That run
+      # uploads it ("Publish release binary"); this step looks it up and, if it
+      # exists for this arch and this `rustc -V`, the two baseline builds below are
+      # skipped. Only the *build* is reused: both binaries are still measured in
+      # this run, which is what #1582's drift cancellation rests on.
+      #
+      # Fails towards building, never towards skipping the comparison: every
+      # `gh api` here is `|| true`, so an unfinished or docs-only push run, an
+      # expired artifact, a different `rustc -V` or a failed lookup all leave
+      # `artifact` empty, and a download or `--version` failure leaves
+      # `PERF_GUARD_BASELINE_BIN` unset. Only a `push` run of this workflow on
+      # `main` is trusted as a source (the runs query is `event=push`, then
+      # `head_branch == main`), so a PR run can never supply the binary other
+      # runs execute.
+      - name: Look up baseline binary from main's push run
+        id: baseline
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          ARCH: ${{ matrix.name }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            BASE_SHA=$(git merge-base HEAD origin/main || true)
+          else
+            BASE_SHA=$BEFORE
+          fi
+          case "$BASE_SHA" in
+            *[!0-9a-f]*|"") echo "::notice::no baseline SHA to look up ('$BASE_SHA'); building the baseline binary"; exit 0 ;;
+          esac
+          if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "::notice::baseline SHA is the all-zeros SHA; building the baseline binary"
+            exit 0
+          fi
+          RUSTC_KEY=$(rustc -V | sha256sum | cut -c1-12)
+          NAME="perf-guard-bin-$ARCH-$BASE_SHA-$RUSTC_KEY"
+          echo "Looking for artifact $NAME ($(rustc -V))"
+          RUN_IDS=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?event=push&head_sha=$BASE_SHA&per_page=10" \
+            --jq '.workflow_runs[] | select(.head_branch == "main") | .id' || true)
+          RUN_ID=""
+          for id in $RUN_IDS; do
+            found=$(gh api "repos/$REPO/actions/runs/$id/artifacts?name=$NAME" \
+              --jq '[.artifacts[] | select(.expired | not)] | length' || true)
+            if [ "${found:-0}" -gt 0 ] 2>/dev/null; then
+              RUN_ID=$id
+              break
+            fi
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "::notice::no usable $NAME artifact from a push run of $BASE_SHA (not finished, skipped, expired, other rustc, or lookup failed); building the baseline binary"
+            exit 0
+          fi
+          {
+            echo "artifact=$NAME"
+            echo "run-id=$RUN_ID"
+            echo "sha=$BASE_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download baseline binary
+        id: baseline-download
+        if: steps.baseline.outputs.artifact != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ steps.baseline.outputs.artifact }}
+          path: /tmp/perf-guard-baseline-bin
+          run-id: ${{ steps.baseline.outputs.run-id }}
+          github-token: ${{ github.token }}
+
+      # Artifacts lose the execute bit. A binary that will not run (truncated,
+      # wrong arch) is not reused: `PERF_GUARD_BASELINE_BIN` stays unset.
+      - name: Verify baseline binary
+        if: steps.baseline-download.outcome == 'success'
+        env:
+          BASE_SHA: ${{ steps.baseline.outputs.sha }}
+          RUN_ID: ${{ steps.baseline.outputs.run-id }}
+          ARTIFACT: ${{ steps.baseline.outputs.artifact }}
+        run: |
+          BIN=/tmp/perf-guard-baseline-bin/succinctly
+          chmod +x "$BIN" 2>/dev/null || true
+          if "$BIN" --version; then
+            echo "PERF_GUARD_BASELINE_BIN=$BIN" >> "$GITHUB_ENV"
+            echo "PERF_GUARD_PREV_BUILT=1" >> "$GITHUB_ENV"
+            echo "::notice::Reusing baseline binary $ARTIFACT from push run $RUN_ID for $BASE_SHA; skipping its build (#5704)"
+          else
+            echo "::warning::downloaded baseline binary does not run; building the baseline binary instead"
+          fi
+
       # Merge-base commit always builds cleanly -- it's an ancestor of `main`
       # that already passed this same required CI when it landed. Built into
       # a separate worktree/target dir so it can't collide with (or poison
@@ -795,7 +890,7 @@ jobs:
       # convention, ...), check whether that step needs the identical change
       # too, so the two baselines stay built consistently.
       - name: Build merge-base binary
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && env.PERF_GUARD_BASELINE_BIN == ''
         run: |
           MERGE_BASE=$(git merge-base HEAD origin/main)
           echo "Building merge-base binary at $MERGE_BASE for PR-relative perf comparison (#1582)"
@@ -825,7 +920,7 @@ jobs:
       # Same `worktree add`/`cd`/`cargo build` sequence as "Build merge-base
       # binary" above (see its own comment) -- keep the two in sync.
       - name: Build previous-commit binary
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && env.PERF_GUARD_BASELINE_BIN == ''
         env:
           # Not attacker-influenced (GitHub computes this itself, always a
           # 40-hex-char SHA or the all-zero SHA) -- routed through `env:`
@@ -847,6 +942,24 @@ jobs:
       - name: Build release binary
         run: cargo build --release --features cli
 
+      # #5704: what the lookup step above finds. Named by arch, SHA and a hash of
+      # `rustc -V` (artifact names cannot hold the string itself), so a toolchain
+      # bump misses and rebuilds. Only `main`'s own push run publishes; 7 days
+      # outlasts any PR's distance from the merge-base it was branched from in
+      # practice, and an expired artifact just falls back to building.
+      - name: Key the release binary artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: echo "RUSTC_KEY=$(rustc -V | sha256sum | cut -c1-12)" >> "$GITHUB_ENV"
+
+      - name: Upload release binary
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-guard-bin-${{ matrix.name }}-${{ github.sha }}-${{ env.RUSTC_KEY }}
+          path: target/release/succinctly
+          retention-days: 7
+          if-no-files-found: error
+
       - name: Save cargo cache
         if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
@@ -861,7 +974,9 @@ jobs:
 
       - name: Run perf guard
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ -n "$PERF_GUARD_BASELINE_BIN" ]; then
+            EXTRA_ARGS="--baseline-binary $PERF_GUARD_BASELINE_BIN"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
             EXTRA_ARGS="--baseline-binary /tmp/perf-guard-merge-base/target/release/succinctly"
           elif [ "${{ github.event_name }}" = "push" ] && [ "$PERF_GUARD_PREV_BUILT" = "1" ]; then
             EXTRA_ARGS="--baseline-binary /tmp/perf-guard-prev-commit/target/release/succinctly"
