@@ -17959,9 +17959,15 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             match owned {
                 OwnedValue::Object(obj) => {
-                    let mut sorted: Vec<(String, OwnedValue)> = obj.into_iter().collect();
+                    // #5426 (ADR-0027 P4): every entry of a repeated key is kept, stable-sorted
+                    // (`a:1, a:2, b:3`); yq copies the last value over the earlier entries.
+                    let mut sorted: Vec<(String, OwnedValue)> = obj.into_occurrences();
                     sorted.sort_by(|a, b| a.0.cmp(&b.0));
-                    QueryResult::Owned(OwnedValue::Object(sorted.into_iter().collect()))
+                    let mut sorted_map = ObjectMap::new();
+                    for (key, value) in sorted {
+                        sorted_map.push_occurrence(key, value);
+                    }
+                    QueryResult::Owned(OwnedValue::Object(sorted_map))
                 }
                 other => QueryResult::Owned(other),
             }
