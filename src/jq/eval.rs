@@ -30945,9 +30945,11 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // drive; here each element is its own call, so the pipe of the program that
     // owns the rest keeps one for it (#5404) -- built per call, a chain of `n`
     // stages over one value copied `n - 1`, `n - 2`, ... of them, and each copy
-    // re-ran the analyses a pipe asks of itself. A pipe's first value and a pipe too
-    // long to keep copies for are copied per call; a rest holding evaluation state
-    // is kept in pieces when it is long enough (#5421), copied per call otherwise.
+    // re-ran the analyses a pipe asks of itself. A pipe's first value is copied per
+    // call; a rest holding evaluation state is kept in pieces when it is long enough
+    // (#5421), copied per call otherwise. A pipe too long to keep copies for hands on
+    // a block of its stages and a link to the rest in jq mode (#5679), and copies per
+    // call when it holds a stage with state, or a marker and a node that reads it.
     //
     // One call to `eval_owned_input` below, not one per branch: it is
     // `#[inline(always)]`, so a second call site would emit its large body twice
@@ -115841,8 +115843,11 @@ mod tests {
             .join()
             .unwrap();
         assert_eq!(output, (2 * stages).to_string());
+        // Each call of the last two blocks still copies, and each earlier one hands on its block
+        // and a link (#5679): a copy per call either way.
+        let fewest = 2 * (stages - 2 - 2 * crate::jq::expr::CHAIN_BLOCK_STAGES);
         assert!(
-            copies >= stages,
+            copies >= fewest,
             "{copies} copies for two values over {stages} stages"
         );
         assert_eq!(kept, 0);

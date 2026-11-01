@@ -1504,8 +1504,12 @@ pub struct SharedArg {
     eager: core::cell::Cell<Option<bool>>,
     needs_path_context: core::cell::Cell<Option<bool>>,
     retrying_bind: core::cell::Cell<Option<bool>>,
-    /// Whether this is a run of a split tail ([`TailPlan::Split`]), not an
+    /// Whether this is a run of a split tail ([`TailPlan::Split`]), or a link of
+    /// the chain of a long pipe ([`PipeStages::chained_tail`], #5679), not an
     /// argument: stages of a pipe, kept as an `Expr::Pipe` of their own (#5441).
+    /// What a reader may rely on is that it is evaluated as the stages it holds;
+    /// a run holds only single-valued, stateless stages, a link any stages that
+    /// hold no evaluation state, so nothing may assume the former of one.
     run: bool,
 }
 
@@ -1960,7 +1964,7 @@ pub(crate) const MAX_KEPT_TAIL_STAGES: usize = 128;
 /// is at most two blocks however long the pipe is. Copied whole it was `n - 1`,
 /// `n - 2`, ... stages for the `n` calls that are nested at the deepest, which
 /// is quadratic in memory: 3,000 stages of `. + 1` took 1.4 GB.
-const CHAIN_BLOCK_STAGES: usize = 16;
+pub(crate) const CHAIN_BLOCK_STAGES: usize = 16;
 
 /// What a pipe has settled about the tails it hands on (#5404).
 ///
@@ -2022,6 +2026,28 @@ struct TailTable {
     /// chained tail: link `i` is the pipe over the blocks from block `i + 1` on
     /// (see [`PipeStages::chained_tail`], #5679).
     chain: core::cell::OnceCell<Box<[Rc<SharedArg>]>>,
+    /// For the table of a pipe longer than [`MAX_KEPT_TAIL_STAGES`], which has
+    /// only this and `chain`: whether no stage holds evaluation state, so that
+    /// the pipe may be chained.
+    chainable: bool,
+}
+
+impl TailTable {
+    /// The table of a pipe longer than [`MAX_KEPT_TAIL_STAGES`] (#5679): no
+    /// tail of it is kept, only the chain it hands its tails on through, so
+    /// none of the per-offset arrays a pipe of up to that length keeps.
+    fn for_chain(chainable: bool) -> Rc<Self> {
+        Rc::new(Self {
+            volatile_through: 0,
+            slots: Box::default(),
+            stops: Box::default(),
+            states: Box::default(),
+            shares: Box::default(),
+            runs: Box::default(),
+            chain: core::cell::OnceCell::new(),
+            chainable,
+        })
+    }
 }
 
 /// Which of a [`TailTable`]'s slots a copy is kept in (#5421).
@@ -2091,7 +2117,8 @@ impl PipeStages {
     /// has gone down this pipe (#5404), or `None` when this pipe keeps no copy
     /// of that tail: it is the pipe's first ask, `may_keep` declined the tail,
     /// the tail is shorter than two stages (a lone stage is handed on as
-    /// itself), or the pipe is longer than [`MAX_KEPT_TAIL_STAGES`]. A tail
+    /// itself), or the pipe is longer than [`MAX_KEPT_TAIL_STAGES`] (which
+    /// chains its tails instead, #5679). A tail
     /// holding evaluation state, or a stage that reads the variable a linked
     /// pipe was rebuilt for, is not kept whole either; see [`Self::tail_plan`].
     #[cfg(test)]
@@ -2129,12 +2156,16 @@ impl PipeStages {
     /// and is asked once per copy: one too large would hold the program's
     /// memory for little.
     ///
-    /// Only a pipe's second ask (and one of at most [`MAX_KEPT_TAIL_STAGES`]
-    /// stages) is answered with anything but [`TailPlan::Copy`]: a pipe that
-    /// goes down once -- a body rebuilt for each value, one level of a
-    /// recursion -- pays nothing for copies it would never reuse. A longer pipe
-    /// is answered [`TailPlan::Split`] from its first ask, chained (#5679), when
-    /// `splittable` and no stage holds evaluation state.
+    /// Only a pipe's second ask is answered with anything but
+    /// [`TailPlan::Copy`], for a pipe of at most [`MAX_KEPT_TAIL_STAGES`]
+    /// stages: a pipe that goes down once -- a body rebuilt for each value, one
+    /// level of a recursion -- pays nothing for copies it would never reuse.
+    /// A longer pipe is the other way round (#5679): every copy of a tail is
+    /// held while the rest runs, and a copy of a copy is a pipe that goes down
+    /// once, so it is answered [`TailPlan::Split`], chained, from its first ask
+    /// when `splittable` and no stage holds evaluation state, and
+    /// [`TailPlan::Copy`] otherwise. A pipe with one stage that holds state
+    /// stays copied whole, however far from the tail that stage is.
     pub(crate) fn tail_plan(
         &self,
         from: usize,
@@ -2239,10 +2270,18 @@ impl PipeStages {
         if !splittable || chain_block_of(from, len) + 1 >= chain_blocks(len) {
             return TailPlan::Copy;
         }
-        if (self.tail_table(class).states[0] as usize) < len {
-            return TailPlan::Copy;
+        let table = self.tails.table.get_or_init(|| {
+            TailTable::for_chain(
+                self.stages
+                    .iter()
+                    .all(|stage| class(stage) != StageClass::Stateful),
+            )
+        });
+        if table.chainable {
+            TailPlan::Split
+        } else {
+            TailPlan::Copy
         }
-        TailPlan::Split
     }
 
     /// The stages that stand for `stages[from..]` of a pipe longer than
@@ -2398,6 +2437,7 @@ impl PipeStages {
             shares: shares.into(),
             runs,
             chain: core::cell::OnceCell::new(),
+            chainable: false,
         })
     }
 
