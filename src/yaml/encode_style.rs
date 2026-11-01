@@ -416,7 +416,18 @@ pub(crate) fn go_yaml_string_scalar(s: &str, flow: bool) -> Option<String> {
 pub fn go_yaml_dom_scalar(s: &str, flow: bool, json_sourced: bool, is_key: bool) -> Option<String> {
     if !json_sourced && resolves_to_non_str(s) {
         if is_key {
-            return (!s.is_empty()).then(|| String::from(s));
+            if s.is_empty() {
+                return None;
+            }
+            // A key is quoted in flow context by its characters as a value is (#5469): a plain
+            // `2001-12-14T21:59:43Z` or `12:30:45` holds a `:`, so `{'12:30:45': 1}`.
+            if flow && flow_plain_needs_single_quotes(s) {
+                let mut out = String::new();
+                if write_go_yaml_single_quoted(&mut out, s).is_ok() {
+                    return Some(out);
+                }
+            }
+            return Some(String::from(s));
         }
         if matches!(resolve_plain(s), ResolvedScalar::Str) {
             // Inside `[...]` or `{...}` yq quotes by characters alone, so a plain timestamp or
@@ -1470,9 +1481,15 @@ mod tests {
                 Some(s),
                 "{s:?}"
             );
+            // A timestamp with a time in it holds a `:`, which flow context quotes (#5469).
+            let want_in_flow = if s.contains(':') {
+                format!("'{s}'")
+            } else {
+                s.to_string()
+            };
             assert_eq!(
                 go_yaml_dom_scalar(s, true, false, true).as_deref(),
-                Some(s),
+                Some(want_in_flow.as_str()),
                 "{s:?} flow"
             );
         }
