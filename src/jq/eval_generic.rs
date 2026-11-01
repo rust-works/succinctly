@@ -5208,14 +5208,10 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
         }
     }
 
-    // #3477: a count needs no index over the container it counts.
-    if let Some(length) = crate::jq::eval::eval_owned_length(expr, &owned) {
-        return GenericResult::Owned(length);
-    }
-
-    // #5691: nor does a string's length or prefix/suffix test.
-    if let Some(answer) = crate::jq::eval::eval_owned_string_door::<S>(expr, &owned) {
-        return GenericResult::Owned(answer);
+    // #3477, #5691: a count needs no index over the container it counts, nor a string's length
+    // or prefix/suffix test the string written out and indexed again.
+    if let Some(count) = crate::jq::eval::eval_owned_count_door::<S>(expr, &owned) {
+        return GenericResult::Owned(count);
     }
 
     // #4053: a stage that never reads `.` needs no index over it either.
@@ -54788,8 +54784,16 @@ mod tests {
     /// The outputs `filter` prints over `json` through the sink evaluator
     /// (jq mode), and how many times the reindex bridge ran to get them.
     fn outputs_and_reindexes(json: &str, filter: &str) -> (Vec<String>, usize) {
+        outputs_and_reindexes_in::<JqSemantics>(json, filter)
+    }
+
+    /// [`outputs_and_reindexes`] in either mode.
+    fn outputs_and_reindexes_in<S: EvalSemantics>(
+        json: &str,
+        filter: &str,
+    ) -> (Vec<String>, usize) {
         let before = crate::jq::value::reindex_count::get();
-        let (out, control) = drive_each_sink::<JqSemantics>(json.as_bytes(), filter);
+        let (out, control) = drive_each_sink::<S>(json.as_bytes(), filter);
         assert!(control.is_none(), "{filter}: {control:?}");
         let after = crate::jq::value::reindex_count::get();
         (
@@ -55096,9 +55100,9 @@ mod tests {
             "yq reindexed per round"
         );
         // What the verdict does not answer keeps its route, and jq's answers: a
-        // number's or a string's `length` (its magnitude / its characters), a
-        // `?`, a forking update, a multi-output condition, and conditions that
-        // raise.
+        // number's `length` (its magnitude), a `?`, a forking update, a multi-output
+        // condition, and conditions that raise. The string row below is answered by the
+        // verdict since #5712 and stays here to pin its output.
         for (query, want) in [
             ("[] | until(length; . + [1])", vec!["[]"]),
             ("0 | until(length >= 3; . + 1)", vec!["3"]),
@@ -55208,43 +55212,98 @@ mod tests {
     }
 
     /// #5712: a string's `length` (and `startswith`/`endswith`) is answered from the owned string
-    /// where it is composed, as an array's is (#3477): a leading stage the rest runs on, a
-    /// `select` condition and an `until`/`while` condition. Each used to write the string out and
-    /// index it again, once per crossing -- once per round for a loop, which made it quadratic.
+    /// where it is composed, as an array's is (#3477): a leading stage the rest runs on (flat or
+    /// in a parenthesised pipe), a `select` condition and an `until`/`while` condition. Each used
+    /// to write the string out and index it again, once per crossing -- once per round for a
+    /// loop, which is where the reindex count grew with the rounds.
+    ///
+    /// Both modes run, on a string whose codepoint count (11) and byte count (13) differ, and the
+    /// thresholds sit between the two: jq counts codepoints and yq bytes (`string_length`), so a
+    /// door that counted the wrong way in either mode changes an answer here.
     ///
     /// `ascii_downcase` makes the string an owned value and is the one crossing each row still
-    /// pays (the baseline of 1); a row that reads the length through the bridge pays a second.
-    /// Without the string door at the two composed sites every row below counts 2.
+    /// pays, so a row is bounded by 1 and not pinned to it: a length read through the bridge
+    /// pays a second and fails the bound, and a later owned `ascii_downcase` does not.
     #[test]
     fn test_owned_string_length_needs_no_second_reindex_5712() {
         let doc = r#"{"s":"H\u00e9llo W\u00f6rld"}"#;
-        for (query, want) in [
-            (".s | ascii_downcase | length | tostring", r#""11""#),
-            (".s | ascii_downcase | length | . + 1", "12"),
-            (".s | ascii_downcase | select(length > 3) | length", "11"),
-            (".s | ascii_downcase | select(length > 30) | length", ""),
-            (r#".s | ascii_downcase | startswith("h") | not"#, "false"),
+        let rows: [(&str, Vec<&str>, Vec<&str>); 10] = [
+            // (query, jq: codepoints, yq: bytes)
+            (
+                ".s | ascii_downcase | length | tostring",
+                vec![r#""11""#],
+                vec![r#""13""#],
+            ),
+            (
+                ".s | ascii_downcase | length | . + 1",
+                vec!["12"],
+                vec!["14"],
+            ),
+            (
+                ".s | ascii_downcase | select(length > 11) | length",
+                vec![],
+                vec!["13"],
+            ),
+            (
+                ".s | ascii_downcase | select(length > 10) | length",
+                vec!["11"],
+                vec!["13"],
+            ),
+            (
+                ".s | ascii_downcase | select(length > 30) | length",
+                vec![],
+                vec![],
+            ),
+            (
+                r#".s | ascii_downcase | startswith("h") | not"#,
+                vec!["false"],
+                vec!["false"],
+            ),
             (
                 r#".s | ascii_downcase | endswith("rld") | tostring"#,
-                r#""true""#,
+                vec![r#""true""#],
+                vec![r#""true""#],
             ),
-        ] {
-            let (out, reindexes) = outputs_and_reindexes(doc, query);
-            let want: Vec<&str> = want.lines().collect();
-            assert_eq!(out, want, "{query}");
-            assert_eq!(reindexes, 1, "{query}");
+            // A parenthesised pipe flattens into the same peel; the pre-filter that lets it
+            // through reads the head (`startswith` here, `length` below).
+            (
+                r#".s | ascii_downcase | (startswith("h") | tostring)"#,
+                vec![r#""true""#],
+                vec![r#""true""#],
+            ),
+            (
+                r#".s | ascii_downcase | (endswith("x") | tostring)"#,
+                vec![r#""false""#],
+                vec![r#""false""#],
+            ),
+            (
+                ".s | ascii_downcase | (. | length) | tostring",
+                vec![r#""11""#],
+                vec![r#""13""#],
+            ),
+        ];
+        for (query, jq_want, yq_want) in rows {
+            let (out, reindexes) = outputs_and_reindexes_in::<JqSemantics>(doc, query);
+            assert_eq!(out, jq_want, "jq: {query}");
+            assert!(reindexes <= 1, "jq: {query} reindexed {reindexes} times");
+            let (out, reindexes) = outputs_and_reindexes_in::<YqSemantics>(doc, query);
+            assert_eq!(out, yq_want, "yq: {query}");
+            assert!(reindexes <= 1, "yq: {query} reindexed {reindexes} times");
         }
-        // A loop condition is read once per round, so a reindex per round grows with the rounds:
-        // the count must not move between 5 rounds and 50.
-        for (rounds, want) in [(5, "5"), (50, "50")] {
-            let query = format!(r#""" | until(length >= {rounds}; . + "x") | length"#);
-            let (out, reindexes) = outputs_and_reindexes(doc, &query);
-            assert_eq!(out, [want], "{query}");
-            assert!(reindexes <= 1, "{query} reindexed {reindexes} times");
+        // A loop condition is read once per round, so a reindex per round grows with the rounds.
+        // `é` is two bytes, so yq reaches 5 sooner than jq does: 3 rounds, 6 bytes.
+        for (rounds, jq_want, yq_want) in [(5, "5", "6"), (50, "50", "50")] {
+            let query = format!(r#""" | until(length >= {rounds}; . + "é") | length"#);
+            let (out, reindexes) = outputs_and_reindexes_in::<JqSemantics>(doc, &query);
+            assert_eq!(out, [jq_want], "jq: {query}");
+            assert!(reindexes <= 1, "jq: {query} reindexed {reindexes} times");
+            let (out, reindexes) = outputs_and_reindexes_in::<YqSemantics>(doc, &query);
+            assert_eq!(out, [yq_want], "yq: {query}");
+            assert!(reindexes <= 1, "yq: {query} reindexed {reindexes} times");
         }
-        let query = r#""" | while(length < 50; . + "x") | length"#;
+        let query = r#""" | [while(length < 50; . + "x")] | length"#;
         let (out, reindexes) = outputs_and_reindexes(doc, query);
-        assert_eq!(out.len(), 50, "{query}");
+        assert_eq!(out, ["50"], "{query}");
         assert!(reindexes <= 1, "{query} reindexed {reindexes} times");
     }
 
@@ -62915,13 +62974,11 @@ mod recurse_cond_owned_route_4095 {
     }
 
     /// A shape the pure verdict declines falls to the evaluator, which answers it (`length` of a
-    /// string) or raises where jq raises (`length` of a boolean).
+    /// number, its magnitude) or raises where jq raises (`length` of a boolean). A string's
+    /// `length` is the verdict's own since #5712, so it no longer reaches the evaluator.
     #[test]
     fn evaluator_answers_what_the_pure_verdict_declines() {
-        assert!(matches!(
-            keeps("length > 0", OwnedValue::String("abc".into())),
-            Ok(true)
-        ));
+        assert!(matches!(keeps("length > 0", OwnedValue::Int(-3)), Ok(true)));
         assert!(matches!(
             keeps("length > 0", OwnedValue::Bool(true)),
             Err(Control::Error(_))
