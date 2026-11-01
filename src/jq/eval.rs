@@ -152125,7 +152125,11 @@ mod tests {
         let OwnedValue::String(held) = &found[0].value else {
             panic!("a string")
         };
+        // The holdout promotes nothing, so its reads copy as they did before.
+        #[cfg(not(feature = "unshared-containers"))]
         assert!(held.is_shared(), "promoted, so a read clones a pointer");
+        #[cfg(feature = "unshared-containers")]
+        let _ = held;
 
         let short = OwnedValue::String("x".repeat(SHARED_STRING_MIN_BYTES - 1).into());
         assert!(
