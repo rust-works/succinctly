@@ -1018,8 +1018,8 @@ Navigation, `.[]`, `map_values` and every write through a path act on the last e
 The 68 oracle rows in `tests/yq_cli/i1344.rs` pin it against yq v4.53.3, on a plain run and under `--eval-all`.
 What is still different, each a place that has not been taught the entries (an earlier entry survives until something copies the map through a raw `IndexMap` borrow, which keeps only the last):
 
-- **`contains`** on a mapping with a repeated key tests only the last entry (`contains({"a":1})` is `false`, yq `true`).
-- **`sort_keys`** collapses a repeated key (yq copies the last value over the earlier entries: `{"a":2,"a":2,"b":3}`).
+- **`sort_keys`** stable-sorts every entry of a repeated key (`a: 1 / a: 2 / b: 3` stays `{"a":1,"a":2,"b":3}`).
+  yq copies the last value over the earlier entries (`{"a":2,"a":2,"b":3}`), which would destroy a document value, so this is a recorded divergence (ADR-0018, ADR-0027 P4, #5426).
 - **A comment, anchor or style on an earlier entry** is not carried on the routes that hold a `CommentTree`, which is keyed by key and describes the last entry: the earlier entry is written plain.
   An alias to an anchor declared on an earlier entry is written as that entry's value, since the anchor is not.
 - The other `IndexMap` builders that have not been converted.
