@@ -24545,12 +24545,14 @@ fn builtin_fromjson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// JSON at all" (`"0x10"`), which jq words differently.
 fn parse_complete_json(s: &str, yq_mode: bool) -> Result<OwnedValue, String> {
     // #5312: jq's parser skips one UTF-8 BOM at the front of the text, as it does for its input
-    // stream (#5291); a second one, or one behind whitespace, is still refused. yq's decoder is
-    // a different one and is left as it was.
+    // stream (#5291); a second one, or one behind whitespace, is still refused.
+    // #5325: yq's `fromjson` skips two: yq's reader drops one and go-yaml's another, and a third
+    // is a character of the text (yq v4.53.3: `"<BOM><BOM>[1]"` is `[1]`, three are the string).
+    let s = s.strip_prefix('\u{feff}').unwrap_or(s);
     let s = if yq_mode {
-        s
-    } else {
         s.strip_prefix('\u{feff}').unwrap_or(s)
+    } else {
+        s
     };
     parse_complete_json_after_bom(s, yq_mode)
 }
