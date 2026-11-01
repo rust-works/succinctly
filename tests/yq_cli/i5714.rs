@@ -1,6 +1,6 @@
 //! #5714: the named-string door of #5691 (`$s|length`, `startswith`, `endswith`) answers in yq
 //! mode as the bridge did (`startswith`/`endswith` are jq builtins, so they need `--jq-extensions`;
-//! the outputs equal the pre-#5710 binary's, which is what this pins): `length` counts bytes there (`h\u{e9}llo` is 6, as in #5712), and the
+//! the outputs were checked equal to the reindex bridge's, i.e. `main` before this change): `length` counts bytes there (`h\u{e9}llo` is 6, as in #5712), and the
 //! prefix and suffix tests compare bytes, bare and inside an array construction.
 
 use anyhow::Result;

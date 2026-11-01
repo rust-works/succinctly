@@ -32,6 +32,13 @@ const ROWS: &[(&str, &str, &str)] = &[
         "[($s|length), ($s|startswith(\"a\"))]|tojson",
         "\"[3,true]\"\n",
     ),
+    // (#5714) The original spelling, kept: a comma inside the pipe, so `length` is not the lone
+    // last stage and the door must decline.
+    (
+        "abc",
+        "[$s|length, ($s|startswith(\"a\"))]|tojson",
+        "\"[3,true]\"\n",
+    ),
     // (#5714) An array construction around the lone stage: the other owned re-entry.
     ("h\u{e9}llo", "[$s|length]|tojson", "\"[5]\"\n"),
     ("zzzabc", "[$s|startswith(\"zzz\")]|tojson", "\"[true]\"\n"),
