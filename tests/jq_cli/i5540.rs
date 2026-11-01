@@ -37,11 +37,31 @@ fn test_fold_step_that_stores_its_loop_variable_keeps_the_element_5540() -> Resu
         "{\"a\":nan} as $a | reduce $a as $v ([]; . + [$v]) | .[0] == $a",
         "[nan] as $a | [foreach $a as $v (null; . + $v; .)] | .[0] == $a",
         "[nan] as $a | reduce $a as $v ({}; .x = $v | .y = $v) | .x == .y",
+        // A state-reading filter and a non-first pipe stage keep the element's handle too.
+        "[nan] as $a | reduce $a as $v ({}; .x |= ((. // []) + [$v])) | .x[0] == $a",
+        "[nan] as $a | reduce $a as $v ({}; .n += 1 | .rows += [$v]) | .rows[0] == $a",
+        "[nan] as $a | reduce $a as $v ({}; .n += 1 | .l = .l + [$v]) | .l[0] == $a",
         // The builtin, and an outer variable, were already `true`.
         "[[nan]] as $a | $a | add == $a[0]",
         "[nan] as $a | reduce 1 as $_ ({}; .x = $a) | .x == $a",
     ] {
         assert_eq!(answer(filter)?, "true\n", "{filter}");
+    }
+    Ok(())
+}
+
+/// A slice assigned onto `null` and an out-of-range `del` return the handle of their input where jq
+/// builds a new container (#5761), so a store through either keeps the literal operand: `==` stays
+/// `false` as in jq 1.7.1, and as before the fold change.
+#[test]
+fn test_store_through_a_slice_or_del_stays_unshared_5761() -> Result<()> {
+    for filter in [
+        "[nan] as $a | reduce $a as $v (null; .[1:] = $v) | . == $a",
+        "[nan] as $a | reduce $a as $v (null; .[1:] |= $v) | . == $a",
+        "[[nan]] as $a | reduce $a[] as $v ({}; .x = ($v | del(.[5]))) | .x == $a[0]",
+        "[[nan]] as $a | reduce $a[] as $v ({}; .x |= ($v | del(.[-5]))) | .x == $a[0]",
+    ] {
+        assert_eq!(answer(filter)?, "false\n", "{filter}");
     }
     Ok(())
 }
@@ -85,6 +105,22 @@ fn test_writes_after_the_stored_element_do_not_reach_the_variable_5540() -> Resu
         (
             "[{\"a\":1},{\"b\":2}] as $a | reduce $a[] as $v ({}; . + $v)",
             "{\"a\":1,\"b\":2}\n",
+        ),
+        (
+            "{\"a\":[1]} as $o | [reduce range(2) as $i ($o; .a += [$i]), $o]",
+            "[{\"a\":[1,0,1]},{\"a\":[1]}]\n",
+        ),
+        (
+            "[{\"a\":{\"b\":1}}] as $a | [reduce $a[] as $v ({}; .x = $v | .x *= {\"a\":{\"c\":2}}), $a]",
+            "[{\"x\":{\"a\":{\"b\":1,\"c\":2}}},[{\"a\":{\"b\":1}}]]\n",
+        ),
+        (
+            "[{\"a\":1,\"b\":2}] as $a | [reduce $a[] as $v ({}; .x = $v | del(.x.a)), $a]",
+            "[{\"x\":{\"b\":2}},[{\"a\":1,\"b\":2}]]\n",
+        ),
+        (
+            "{\"u\":[{\"n\":\"x\",\"t\":[1]}]} | . as $d | [reduce $d.u[] as $r ({}; .a = $r | .b = $r | .a.t += [7]), $d]",
+            "[{\"a\":{\"n\":\"x\",\"t\":[1,7]},\"b\":{\"n\":\"x\",\"t\":[1]}},{\"u\":[{\"n\":\"x\",\"t\":[1]}]}]\n",
         ),
         (
             "[[1],[2]] as $a | [reduce $a[] as $v ([]; . + [$v] | .[0] += [8]), $a]",
