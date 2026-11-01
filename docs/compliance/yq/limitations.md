@@ -6517,7 +6517,6 @@ A NUL byte ends a JSON input: what precedes it is read and what follows is not, 
 An explicit `-p=json` makes `-o auto` YAML, as in yq, where `-o auto` over a `.json` file without `-p` is JSON.
 Not matched: `--eval-all` over such an input prints `null` where yq prints a blank line, and `- null` where yq prints `-` for `[.]`.
 The owned-value route it takes for a JSON input has no spelling for an empty node, as over an empty YAML input with a filter beyond a bare navigation (`ea '[.]'`).
-A NUL byte alone is whitespace to yq (`printf '\0' | yq -p=json .` is a blank line) and is refused here.
 
 ### A write that changes the kind of a document root keeps its comments ([#4997](https://github.com/rust-works/succinctly/issues/4997))
 

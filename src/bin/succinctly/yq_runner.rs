@@ -1096,7 +1096,8 @@ fn holds_no_document(bytes: &[u8], format: InputFormat) -> bool {
 /// The format `-o auto` resolves against for a gathered source of `source` format (#5478).
 ///
 /// A JSON input that held no document is read as YAML's empty document (see
-/// [`empty_input_reads_as`]), but yq still answers `-o auto` from the input it was given: JSON.
+/// [`empty_input_reads_as`]), but yq still answers `-o auto` from the input it was given: JSON
+/// (an explicit `-p=json` is the exception, #5721: `OutputConfig::from_args` already made it YAML).
 /// Every source of a run is read in the run's own format (#4394), so a `Yaml` source in a JSON
 /// run can only be that document, or one `--front-matter` forced to YAML, which keeps YAML.
 fn output_basis_format(
