@@ -10533,6 +10533,23 @@ pub(crate) fn eval_owned_string_door<S: EvalSemantics>(
         // `. | length` is `length`: an identity stage yields its input once.
         Expr::Pipe(stages) => match skip_identity_stages(stages) {
             [only] => eval_owned_string_door::<S>(only, input),
+            // #5675: `split("lit") | length` is the number of pieces, counted without building
+            // them. jq mode only: yq's `split` takes a non-string separator (#4263) and answers
+            // `null` as nothing (#4236), which stay the evaluator's. A separator that is not a
+            // string literal (a generator, a variable, an error) declines.
+            [Expr::Builtin(Builtin::Split(sep)), Expr::Builtin(Builtin::Length)]
+                if S::TAG == EvalTag::Jq =>
+            {
+                match unwrap_paren(sep) {
+                    Expr::Literal(lit) => match literal_to_owned(lit) {
+                        OwnedValue::String(sep) => {
+                            Some(OwnedValue::Int(split_piece_count(text, &sep) as i64))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
             _ => None,
         },
         Expr::Builtin(Builtin::Length) => Some(OwnedValue::Int(string_length::<S>(text))),
@@ -30394,6 +30411,18 @@ pub(crate) fn split_string(s: &str, sep: &str) -> Vec<OwnedValue> {
         split_into_individual_chars(s)
     } else {
         s.split(sep).map(OwnedValue::string).collect()
+    }
+}
+
+/// How many pieces [`split_string`] yields, without building them (#5675): the same three cases,
+/// so `split(sep) | length` over an owned string is answered from the text alone.
+pub(crate) fn split_piece_count(s: &str, sep: &str) -> usize {
+    if s.is_empty() {
+        0
+    } else if sep.is_empty() {
+        s.chars().count()
+    } else {
+        s.split(sep).count()
     }
 }
 
@@ -138893,6 +138922,33 @@ mod tests {
                     assert_eq!(weekday, expected_weekday, "date: {date}");
                 }
             );
+        }
+    }
+
+    /// #5675: `split_piece_count` is `split_string(..).len()` without the pieces.
+    #[test]
+    fn split_piece_count_agrees_with_split_string_5675() {
+        let texts = [
+            "",
+            "a",
+            ",",
+            "a,b",
+            "a,,b,",
+            ",,,",
+            "\u{e9},\u{fc}",
+            "aXXbXXc",
+            "XXX",
+            "\u{1f600}x",
+        ];
+        let seps = ["", ",", "XX", ", ", "\u{fc}", "zz"];
+        for text in texts {
+            for sep in seps {
+                assert_eq!(
+                    split_piece_count(text, sep),
+                    split_string(text, sep).len(),
+                    "{text:?} split by {sep:?}"
+                );
+            }
         }
     }
 
