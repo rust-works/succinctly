@@ -116371,9 +116371,7 @@ mod tests {
         assert!(peel("tojson as $x | . | length").is_none());
         assert!(peel(r#"@base64 "x\(.)""#).is_none());
         assert!(peel(r#""x\(.a)""#).is_none());
-        assert!(
-            peel("(tojson | length)?").is_none() || peel("(tojson | length)?").unwrap().1.is_none()
-        );
+        assert!(peel("(tojson | length)?").is_none());
     }
 
     /// #5441: a split tail is built for each call, so the facts its pipe is
