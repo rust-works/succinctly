@@ -64,9 +64,9 @@ use super::eval::{
     compare_key_arrays, compare_values, debug_assert_materialization_error, def_spine_len,
     demote_for_reentry, descriptor_slice_bounds, each_path_on_owned, each_pattern_binding_set,
     each_range_batches, each_recurse_walk, enter_def_call, enter_def_call_in, entries_to_object,
-    eval_each_owned, eval_full_unrouted as full_eval, finish_fork_flow, finish_fork_from_flow,
-    finish_short_circuit, fold_escaped_generator_prefix, foreach_forks, format_owned,
-    has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
+    eval_each_owned, eval_each_owned_answered, eval_full_unrouted as full_eval, finish_fork_flow,
+    finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
+    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned_read_of as index_owned_by_key, is_assignment_expr, is_eager_arg,
     is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq, limit_raising,
     literal_to_owned, mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
@@ -11466,12 +11466,58 @@ pub fn eval_each_owned_input(
     input: &OwnedValue,
     on_value: &mut dyn FnMut(OwnedValue) -> bool,
 ) -> Option<Control> {
+    // Never declines: `eval_each_owned_input_in` only returns `Declined` when asked to.
+    match eval_each_owned_input_in(expr, input, on_value, false) {
+        OwnedInput::Answered(control) => control,
+        OwnedInput::Declined => None,
+    }
+}
+
+/// [`eval_each_owned_input`] for an input whose program the owned evaluator should only answer
+/// where it can do so without the reindex bridge (#5764): `None` when it cannot, with nothing
+/// evaluated and nothing sent to `on_value`, so the caller evaluates over the input's own index as
+/// it did before.
+///
+/// The bridge is dearer than the old route's: it spells the input as reindex text, registers it
+/// for storage sharing (#3069) and runs `eval.rs`'s evaluator over the index, where a cursor route
+/// reads the same text with `eval_generic`'s lazier one. For the one slurped array a `--stream -s`
+/// run evaluates, that made `[limit(5;.[])]` and `[.[]|select(length==2)]|length` 10-15% slower.
+///
+/// Not a supported entry point.
+#[doc(hidden)]
+pub fn eval_each_owned_input_if_answered(
+    expr: &Expr,
+    input: &OwnedValue,
+    on_value: &mut dyn FnMut(OwnedValue) -> bool,
+) -> Option<Option<Control>> {
+    match eval_each_owned_input_in(expr, input, on_value, true) {
+        OwnedInput::Answered(control) => Some(control),
+        OwnedInput::Declined => None,
+    }
+}
+
+/// What [`eval_each_owned_input_in`] did with the program.
+enum OwnedInput {
+    Answered(Option<Control>),
+    Declined,
+}
+
+fn eval_each_owned_input_in(
+    expr: &Expr,
+    input: &OwnedValue,
+    on_value: &mut dyn FnMut(OwnedValue) -> bool,
+    decline_to_cursor: bool,
+) -> OwnedInput {
     with_anchor_scope::<JqSemantics, _>(expr, || {
         match super::path_mode::route(expr) {
             Route::Interpreter => {
-                return super::path_mode::run_program(expr, input.clone(), on_value);
+                return OwnedInput::Answered(super::path_mode::run_program(
+                    expr,
+                    input.clone(),
+                    on_value,
+                ));
             }
-            Route::Refused(e) => return Some(Control::Error(e)),
+            Route::Refused(e) => return OwnedInput::Answered(Some(Control::Error(e))),
             Route::Shipped => {}
         }
         let mut sink = |v: OwnedValue| -> Demand {
@@ -11481,11 +11527,25 @@ pub fn eval_each_owned_input(
                 Demand::Stop
             }
         };
-        match eval_each_owned::<JqSemantics>(expr, input, false, Reentry::REBUILT, &mut sink) {
+        let flow = if decline_to_cursor {
+            match eval_each_owned_answered::<JqSemantics>(
+                expr,
+                input,
+                false,
+                Reentry::REBUILT,
+                &mut sink,
+            ) {
+                Some(flow) => flow,
+                None => return OwnedInput::Declined,
+            }
+        } else {
+            eval_each_owned::<JqSemantics>(expr, input, false, Reentry::REBUILT, &mut sink)
+        };
+        OwnedInput::Answered(match flow {
             Flow::Exhausted => None,
             Flow::Stopped { pending } => pending,
             Flow::Escaped(c) => Some(c),
-        }
+        })
     })
 }
 

@@ -12059,6 +12059,35 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     eval_each_owned_past_front_doors::<S>(expr, input, optional, reentry, sink)
 }
 
+/// [`eval_each_owned`] for a caller that has a better route than the reindex bridge for a program
+/// the doors do not answer (#5764): `None` when no door does, with nothing evaluated and nothing
+/// sent to `sink`.
+///
+/// Only this call declines. A door that answers may still bridge a stage of its own, through
+/// [`eval_each_owned`], which never declines: by then outputs may have been produced and the
+/// program cannot be started over.
+pub(crate) fn eval_each_owned_answered<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    if let Some(flow) = eval_each_owned_front_doors::<S>(expr, input, optional, sink) {
+        return Some(flow);
+    }
+    let declined = core::cell::Cell::new(false);
+    let flow = eval_each_owned_past_front_doors_in::<S>(
+        expr,
+        input,
+        optional,
+        reentry,
+        sink,
+        Some(&declined),
+    );
+    (!declined.get()).then_some(flow)
+}
+
 /// [`eval_each_owned`] for an `expr` whose front doors
 /// ([`eval_each_owned_front_doors`]) have already declined.
 ///
@@ -12074,6 +12103,20 @@ fn eval_each_owned_past_front_doors<S: EvalSemantics>(
     optional: bool,
     reentry: Reentry,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    eval_each_owned_past_front_doors_in::<S>(expr, input, optional, reentry, sink, None)
+}
+
+/// [`eval_each_owned_past_front_doors`], which hands the program back instead of crossing the
+/// bridge when `declined` is given (#5764): every door above the bridge has declined by then,
+/// nothing has reached `sink`, and the flag is how [`eval_each_owned_answered`] learns it.
+fn eval_each_owned_past_front_doors_in<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+    declined: Option<&core::cell::Cell<bool>>,
 ) -> Flow {
     // #2889: take the front of the pipe natively before re-indexing, so a
     // stage standing *on* an embedded node reaches the bridge as that node
@@ -12143,6 +12186,12 @@ fn eval_each_owned_past_front_doors<S: EvalSemantics>(
     // #3439: a `select` whose condition the tree can answer.
     if let Some(flow) = owned_select_door::<S>(expr, input, optional, reentry, sink) {
         return flow;
+    }
+    // #5764: no door answers this program, and the caller has a route that reads it better than
+    // the bridge below. Before the reroot, which only the bridge needs.
+    if let Some(declined) = declined {
+        declined.set(true);
+        return Flow::Exhausted;
     }
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
