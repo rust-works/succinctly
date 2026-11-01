@@ -2033,6 +2033,10 @@ struct TailTable {
     /// stage from one call to the next (#3148), so a block that holds one is
     /// cloned for each call instead of linked (#5722).
     block_stateful: Box<[bool]>,
+    /// For each block, the first block at or after it that holds evaluation state
+    /// (the number of blocks if none does): where a link that starts there ends,
+    /// so a tail is built without walking the blocks of a run (#5722).
+    run_ends: Box<[u32]>,
 }
 
 impl TailTable {
@@ -2040,7 +2044,16 @@ impl TailTable {
     /// tail of it is kept, only the chain it hands its tails on through, so
     /// none of the per-offset arrays a pipe of up to that length keeps.
     fn for_chain(block_stateful: Box<[bool]>) -> Rc<Self> {
+        let mut run_ends = vec![block_stateful.len() as u32; block_stateful.len() + 1];
+        for block in (0..block_stateful.len()).rev() {
+            run_ends[block] = if block_stateful[block] {
+                block as u32
+            } else {
+                run_ends[block + 1]
+            };
+        }
         Rc::new(Self {
+            run_ends: run_ends.into(),
             volatile_through: 0,
             slots: Box::default(),
             stops: Box::default(),
@@ -2343,10 +2356,7 @@ impl PipeStages {
                 Some(link) => {
                     tail.push(Expr::Shared(Rc::clone(link)));
                     // The link runs up to the next block that holds state.
-                    next += 1;
-                    while next < chain.len() && chain[next].is_some() {
-                        next += 1;
-                    }
+                    next = table.run_ends[next] as usize;
                 }
                 None => {
                     tail.extend_from_slice(&self.stages[chain_block_range(next, len)]);
@@ -2480,6 +2490,7 @@ impl PipeStages {
             runs,
             chain: core::cell::OnceCell::new(),
             block_stateful: Box::default(),
+            run_ends: Box::default(),
         })
     }
 
