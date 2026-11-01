@@ -5998,13 +5998,14 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     ) {
                         break 'documents;
                     }
-                    evaluate_input_streaming(
+                    evaluate_input_streaming_via(
                         &input,
                         &expr,
                         &context,
                         &at,
                         &mut sink,
                         &output_config,
+                        walk.is_some(),
                         &mut |sink, result| {
                             had_output = true;
                             last_output = Some(result.clone());
@@ -10038,6 +10039,29 @@ fn evaluate_input_streaming(
     output_config: &OutputConfig,
     on_value: &mut dyn FnMut(&mut ErrorSink, OwnedValue) -> Result<bool>,
 ) -> Result<()> {
+    evaluate_input_streaming_via(
+        input,
+        expr,
+        _context,
+        at,
+        sink,
+        output_config,
+        false,
+        on_value,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_input_streaming_via(
+    input: &OwnedValue,
+    expr: &jq::Expr,
+    _context: &EvalContext,
+    at: &ErrorAt<'_>,
+    sink: &mut ErrorSink,
+    output_config: &OutputConfig,
+    owned_route: bool,
+    on_value: &mut dyn FnMut(&mut ErrorSink, OwnedValue) -> Result<bool>,
+) -> Result<()> {
     // #2852: `to_json()` always reformats a `NumberLiteral` to jq's own
     // spelling -- before this, every call site here reindexed through it
     // unconditionally, silently reformatting this one input value's own
@@ -10085,16 +10109,33 @@ fn evaluate_input_streaming(
         on_value(sink, input.clone())?;
         return Ok(());
     }
-    let doc = if preserve {
-        let text = input.to_json_jq_preserve();
-        let index = JsonIndex::build(text.as_bytes());
-        InputDoc::Preserve(text, index)
-    } else {
-        InputDoc::Bridge(bridge_doc_of(input))
-    };
-    let cursor = doc.root();
-
     let mut write_err: Option<anyhow::Error> = None;
+    // Hands one answer to the writer: `None` is nothing to write (genuinely no value, or a failure
+    // this call already reported to `sink`, the same "report and keep going" contract the eager
+    // path's own arms followed, #355). The eager route's copy of `to_jq_values`' depth gate (#3009
+    // review): every caller writes through `write_output_owned_value`, whose printer only refuses an
+    // over-deep value after 384 levels of `[` are already on stdout. Checked here, before
+    // `on_value`, so such a value prints nothing, is reported at exit 5 and the generator carries
+    // on -- the lazy route's behaviour, and not the `format_json` panic this route had before the
+    // writers merged.
+    let mut deliver = |sink: &mut ErrorSink, item: Option<OwnedValue>| -> bool {
+        match item {
+            None => true,
+            Some(v) => match v.check_tree_depth() {
+                Err(e) => {
+                    sink.report(DiagStyle::Jq, &e, &at.resolve());
+                    true
+                }
+                Ok(()) => match on_value(sink, v) {
+                    Ok(keep_going) => keep_going,
+                    Err(e) => {
+                        write_err = Some(e);
+                        false
+                    }
+                },
+            },
+        }
+    };
     // The evaluator asserts `MAX_VALUE_TREE_DEPTH` where it splices a built
     // value back into the AST (`last(f)`, `+=`, `//=`) or renders one for
     // `error(...)`, with no `Result` to thread that through (#5526). Caught
@@ -10102,33 +10143,23 @@ fn evaluate_input_streaming(
     // `reduce` already gets from `check_tree_depth`; any other panic still
     // unwinds.
     let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if owned_route && !preserve {
+            // #5681: the value is already a tree, so the filter reads it where it is.
+            return jq::eval_generic::eval_each_owned_input(expr, input, &mut |v| {
+                deliver(sink, Some(v))
+            });
+        }
+        let doc = if preserve {
+            let text = input.to_json_jq_preserve();
+            let index = JsonIndex::build(text.as_bytes());
+            InputDoc::Preserve(text, index)
+        } else {
+            InputDoc::Bridge(bridge_doc_of(input))
+        };
+        let cursor = doc.root();
         jq::eval_generic::eval_each_with_cursor(expr, cursor, &mut |result| {
-            match materialize_stream_item(result, sink, at) {
-                // Nothing to write: either genuinely no value, or a failure this
-                // call already reported to `sink` (same "report and keep going"
-                // contract the eager path's own arms followed, #355).
-                None => true,
-                // The eager route's copy of `to_jq_values`' depth gate (#3009
-                // review): every caller writes through `write_output_owned_value`,
-                // whose printer only refuses an over-deep value after 384 levels
-                // of `[` are already on stdout. Checked here, before `on_value`,
-                // so such a value prints nothing, is reported at exit 5 and the
-                // generator carries on -- the lazy route's behaviour, and not the
-                // `format_json` panic this route had before the writers merged.
-                Some(v) => match v.check_tree_depth() {
-                    Err(e) => {
-                        sink.report(DiagStyle::Jq, &e, &at.resolve());
-                        true
-                    }
-                    Ok(()) => match on_value(sink, v) {
-                        Ok(keep_going) => keep_going,
-                        Err(e) => {
-                            write_err = Some(e);
-                            false
-                        }
-                    },
-                },
-            }
+            let item = materialize_stream_item(result, sink, at);
+            deliver(sink, item)
         })
     }));
     let control = match evaluated {
