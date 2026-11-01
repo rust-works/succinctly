@@ -1722,8 +1722,8 @@ impl EvalError {
 
     /// [`Self::invalid_numeric_literal`] as jq words it for text its parser skipped a leading
     /// BOM of (#5312): the column counts what follows that one BOM, a BOM alone is
-    /// `Expected JSON value`, and the message still quotes the text whole. jq mode only; yq's
-    /// decoder does not skip it the same way.
+    /// `Expected JSON value`, and the message still quotes the text whole. jq mode only; yq skips up
+    /// to two (#5325) and words its errors by its own decoder.
     pub fn invalid_numeric_literal_after_bom(text: &str) -> Self {
         Self::numeric_literal_at(text, text.strip_prefix('\u{feff}').unwrap_or(text))
     }

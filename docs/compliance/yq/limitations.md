@@ -3204,6 +3204,7 @@ Jq mode skips exactly one ([#5312](https://github.com/rust-works/succinctly/issu
 What stays different is the rest of go-yaml's decoding, which this hand-written parser does not do (yq v4.53.3):
 - Trailing content after the first value is ignored (`"[1] 2" | fromjson` is `[1]`); here it is an error.
 - Text that is not JSON is decoded as YAML (`"abc"` is the string `abc`, `"a: 1"` is `{"a":1}`, a mark behind whitespace stays in the string); here it is an error.
+- Three marks before `[1]` leave the third in the text, so yq answers the string; here it is an error.
 - Whitespace alone is `null`; here it is an error.
 - An error is worded by go-yaml (`Error: EOF`, `yaml: while parsing a flow sequence ...`); here it is `Invalid numeric literal` or `Expected JSON value`, with the same exit status.
 
