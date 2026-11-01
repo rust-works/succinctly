@@ -94718,11 +94718,12 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     // case-insensitively, and nothing more. The letters after the match belong to the
                     // rest of the format, so `Marx` and `Marc` are `Mar` followed by a letter the
                     // next format character has to take (it never does), not a longer spelling of
-                    // March. Looked ahead on a copy, so only the matched letters are consumed.
+                    // March. Looked ahead on a copy, so only the matched letters are consumed, and
+                    // no further than the longest name (`september`): a longer run cannot match.
                     let mut ahead = input_iter.clone();
                     let mut name = String::new();
                     while let Some(&c) = ahead.peek() {
-                        if c.is_ascii_alphabetic() {
+                        if c.is_ascii_alphabetic() && name.len() < 9 {
                             name.push(c.to_ascii_lowercase());
                             ahead.next();
                         } else {
@@ -94748,16 +94749,16 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     // `month` at its prior/default value instead of erroring,
                     // silently masking malformed input as a valid date -
                     // real jq rejects it ("does not match format").
-                    let matched = MONTHS
-                        .iter()
-                        .position(|m| name.starts_with(m))
-                        .map(|i| (i, MONTHS[i].len()))
-                        .or_else(|| {
-                            MONTHS
-                                .iter()
-                                .position(|m| name.starts_with(&m[..3]))
-                                .map(|i| (i, 3))
-                        });
+                    // glibc's order: each month's full name, then its abbreviation, before the next
+                    // month's. The English names give the same answer in either order, but a locale's
+                    // may not (#5754).
+                    let matched = MONTHS.iter().enumerate().find_map(|(i, m)| {
+                        if name.starts_with(m) {
+                            Some((i, m.len()))
+                        } else {
+                            name.starts_with(&m[..3]).then_some((i, 3))
+                        }
+                    });
                     match matched {
                         Some((i, len)) => {
                             month = (i + 1) as i64;
