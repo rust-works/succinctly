@@ -11925,8 +11925,8 @@ Still different:
 - **Spellings of a fold step that stores its loop variable that still rebuild it** ([#5761](https://github.com/rust-works/succinctly/issues/5761), #5540 follow-up).
   `reduce $a as $v (null; . += $v) | . == $a` (the compound spelling of jq's own `add`), `(.x, .y) += $v`, `(.x += $v)?`, an `as` rebind (`$v as $w | .x = $w`) and a container-valued field read stored on its own (`.x = $r.items`) are `false` here and `true` in jq.
   A whole-variable read in a sibling stage shares the node (`.y = $r | .x = $r.items`), so the answer follows an unrelated read.
-  A slice assigned onto `null` and an out-of-range `del` return the handle of their input where jq builds a new container (`[nan] as $a | null | .[1:] = $a | . == $a` and `$a | del(.[5]) == $a` are `true` here and `false` in jq).
-  A fold store through either keeps the literal operand, so inside a fold the answer is jq's; the roots outside a fold remain.
+  A slice assigned onto `null`, a `del` whose last index names nothing and `.[5] |= empty` build a new array, as jq does ([#5761](https://github.com/rust-works/succinctly/issues/5761)): `[nan] as $a | null | .[1:] = $a | . == $a` and `$a | del(.[5]) == $a` are `false`.
+  The copy happens only when another handle holds the array, and a path that runs through something absent (`del(.[5].x)`) keeps identity, as in jq.
   The comparison needs a NaN-bearing container to observe any of this.
 - **Slices.** `.[0:]` and any other full-range slice hand back the array itself, as jq's view
   does. An equal-bounds *partial* slice is a view onto the same storage in jq (pointer, offset

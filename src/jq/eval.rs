@@ -38805,6 +38805,7 @@ fn set_path<S: EvalSemantics>(
                 container_noop,
                 terminal_write: true,
                 defer_delete: false,
+                fresh_array: !container_noop,
                 non_integer_bound: slice_has_non_integer_bound(
                     start_key.as_ref(),
                     end_key.as_ref(),
@@ -39087,6 +39088,7 @@ fn set_path_steps<S: EvalSemantics>(
                             // this call's own `edit` is the write (#1321).
                             terminal_write: true,
                             defer_delete: false,
+                            fresh_array: !container_noop,
                             non_integer_bound: slice_has_non_integer_bound(
                                 start_key.as_ref(),
                                 end_key.as_ref(),
@@ -39337,6 +39339,7 @@ fn set_path_steps<S: EvalSemantics>(
                 container_noop,
                 terminal_write: false,
                 defer_delete: false,
+                fresh_array: !container_noop,
                 non_integer_bound: slice_has_non_integer_bound(
                     start_key.as_ref(),
                     end_key.as_ref(),
@@ -39588,6 +39591,9 @@ struct SliceEditFlags {
     terminal_write: bool,
     /// Leave a jq `|= empty` slice untouched until the enclosing `delpaths`.
     defer_delete: bool,
+    /// jq mode: an array stored over a `null` target is a new container, not
+    /// the handle it was written from (#5761).
+    fresh_array: bool,
     /// #2853: this component carries a bound jq never parsed, which can only
     /// happen over a `null` target (see [`SliceBoundKey::Raw`]).
     ///
@@ -39596,6 +39602,18 @@ struct SliceEditFlags {
     /// and *which* refusal depends on whether anything was actually written,
     /// exactly as the `String` arm's own `wrote` split does.
     non_integer_bound: bool,
+}
+
+/// Splits `arr` from any other handle on its storage, as the next write through
+/// it would (#5761).
+///
+/// jq builds a new container where a delete names nothing and where `setpath`
+/// stores over `null`; identity (`==` on a NaN-bearing container) can tell a
+/// shared handle from a new one, so those arms take the copy-on-write the
+/// in-range paths already pay. Free when `arr` is the only handle.
+#[inline]
+fn detach_shared_array(arr: &mut ArrayVec) {
+    let _ = &mut **arr;
 }
 
 /// Adapts a caller with no `|= empty` concept (`set_path`'s three
@@ -39630,6 +39648,7 @@ fn through_slice<E: From<EvalError>>(
         container_noop,
         terminal_write,
         defer_delete,
+        fresh_array,
         non_integer_bound,
     } = flags;
     // #2853: a bound jq never parsed. This arm comes first because it is a
@@ -39976,9 +39995,15 @@ fn through_slice<E: From<EvalError>>(
             if !terminal_write && matches!(sub, OwnedValue::Null) {
                 return Ok(false);
             }
-            let OwnedValue::Array(items) = sub else {
+            let OwnedValue::Array(mut items) = sub else {
                 return Err(EvalError::slice_assign_non_array().into());
             };
+            // jq's `setpath` on `null` builds a new array, so the value
+            // written must not stay the handle it came from (#5761). yq's
+            // equality is structural and its mode keeps the stored handle.
+            if fresh_array {
+                detach_shared_array(&mut items);
+            }
             *root = OwnedValue::Array(items);
             Ok(true)
         }
@@ -40681,6 +40706,11 @@ fn update_path_with_deletes<S: EvalSemantics>(
                             }
                             if wrote {
                                 *write_index(arr, *idx, S::TAG == EvalTag::Yq)? = scratch;
+                            } else if deletes.is_none() {
+                                // jq's `_modify` ends in `delpaths`, which answers
+                                // a new array even for an index that names
+                                // nothing, as `delete_at_path` does (#5761).
+                                detach_shared_array(arr);
                             }
                             wrote
                         }
@@ -40886,6 +40916,7 @@ fn update_path_with_deletes<S: EvalSemantics>(
                     container_noop,
                     terminal_write: true,
                     defer_delete: deletes.is_some(),
+                    fresh_array: !container_noop,
                     non_integer_bound: slice_has_non_integer_bound(
                         start_key.as_ref(),
                         end_key.as_ref(),
@@ -41382,6 +41413,7 @@ fn update_path_steps<S: EvalSemantics>(
                         // no need to allocate the `Pipe` just to check it.
                         terminal_write: rest.iter().all(is_effectively_identity),
                         defer_delete: deletes.is_some(),
+                        fresh_array: !container_noop,
                         non_integer_bound: slice_has_non_integer_bound(
                             start_key.as_ref(),
                             end_key.as_ref(),
@@ -83156,21 +83188,6 @@ fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
     };
     let visit = |found: bool| if found { Visit::Found } else { Visit::Skip };
     let reads_whole = |e: &Expr| reads_a_name_whole(e, names);
-    // #5761: a slice assigned onto `null` installs its right-hand array as the root, and `del`
-    // of a key that names nothing returns its input; jq builds a new container in both, so
-    // sharing the element there would make `==` true where jq says false. These two stages
-    // keep the literal operand until those roots are fixed.
-    let hands_input_back = |e: &Expr| {
-        any_subexpr(e, &mut |n| {
-            matches!(
-                n,
-                Expr::Slice { .. }
-                    | Expr::SliceExpr { .. }
-                    | Expr::Builtin(Builtin::Del(_) | Builtin::DelPaths(_))
-            )
-        })
-    };
-    let stores = |e: &Expr, rhs: &Expr| reads_whole(rhs) && !hands_input_back(e);
     search_subexpr(expr, &mut |e| match e {
         Expr::Var(v) if names.iter().any(|name| name == v) => Visit::Found,
         Expr::If {
@@ -83216,11 +83233,11 @@ fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
         // (`. + $a`, `. + [$a]`, `.x = $a`) when they read it whole; a field read
         // (`$r.score`) is a scalar spliced alone, which carries no identity. An
         // assignment's path is read by value, as a key.
-        Expr::Arithmetic { .. } => visit(raises_a_name(e) || stores(e, e)),
+        Expr::Arithmetic { .. } => visit(raises_a_name(e) || reads_whole(e)),
         Expr::Assign { value: rhs, .. }
         | Expr::CompoundAssign { value: rhs, .. }
         | Expr::AlternativeAssign { value: rhs, .. }
-        | Expr::Update { filter: rhs, .. } => visit(raises_a_name(e) || stores(e, rhs)),
+        | Expr::Update { filter: rhs, .. } => visit(raises_a_name(e) || reads_whole(rhs)),
         // MetaAssign exists in yq mode only, where the gate is false; it stays as it was.
         _ if is_assignment_expr(e) => visit(raises_a_name(e)),
         _ => Visit::Descend,
@@ -92292,8 +92309,16 @@ fn delete_at_path(
                         }
                         // An out-of-range index names nothing to delete — jq's
                         // delpaths silently skips it, `?` or not (#477).
+                        //
+                        // jq still answers a new array (`jv_dels` copies for any
+                        // non-empty key list), so a handle that something else
+                        // holds is split from it here (#5761).
                         DeleteIndexResolution::PositiveOutOfRange(_)
-                        | DeleteIndexResolution::Skip => {}
+                        | DeleteIndexResolution::Skip => {
+                            if !yq_mode {
+                                detach_shared_array(arr);
+                            }
+                        }
                     }
                     Ok(())
                 }
@@ -92980,6 +93005,7 @@ fn delete_path_steps(
                         container_noop: false,
                         terminal_write: yq_mode,
                         defer_delete: false,
+                        fresh_array: !yq_mode,
                         non_integer_bound: slice_has_non_integer_bound(
                             start_key.as_ref(),
                             end_key.as_ref(),
@@ -105721,6 +105747,10 @@ mod tests {
             "reduce . as $a ({}; . + {x: $a})",
             "reduce . as $a (null; . + $a)",
             "reduce .[] as $r ({}; .[$r.name] = my_fn($r))",
+            // #5761: a slice store over `null` and a `del` that names nothing build a new
+            // container, so the stored element is the same handle there too.
+            "reduce . as $a (null; .[1:] = $a)",
+            "reduce . as $a ({}; .x = ($a | del(.[5])))",
             // ... through a binder, whose names then reach the output.
             "reduce . as $a (null; $a as $s | $s)",
             "reduce . as $a (null; $a as [$x] | $x)",
@@ -105753,9 +105783,6 @@ mod tests {
             "reduce .[] as $r ({}; .[$r.name] = $r.score)",
             "reduce .[] as $r ({}; .x[$r.name] += $r.score)",
             "reduce .[] as $r ({}; .[$r.name] += ($r.score | floor))",
-            // #5761: a store through a slice or `del` keeps the literal operand.
-            "reduce . as $a (null; .[1:] = $a)",
-            "reduce . as $a ({}; .x = ($a | del(.[5])))",
             // #5540: a field read is a scalar spliced alone and shares nothing.
             "reduce .[] as $r (0; . + $r.score)",
             "reduce .[] as $r ([]; . + [$r.id])",
