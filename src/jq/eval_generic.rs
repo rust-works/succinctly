@@ -55082,6 +55082,47 @@ mod tests {
         );
     }
 
+    /// #5712: a string's `length` (and `startswith`/`endswith`) is answered from the owned string
+    /// where it is composed, as an array's is (#3477): a leading stage the rest runs on, a
+    /// `select` condition and an `until`/`while` condition. Each used to write the string out and
+    /// index it again, once per crossing -- once per round for a loop, which made it quadratic.
+    ///
+    /// `ascii_downcase` makes the string an owned value and is the one crossing each row still
+    /// pays (the baseline of 1); a row that reads the length through the bridge pays a second.
+    /// Without the string door at the two composed sites every row below counts 2.
+    #[test]
+    fn test_owned_string_length_needs_no_second_reindex_5712() {
+        let doc = r#"{"s":"H\u00e9llo W\u00f6rld"}"#;
+        for (query, want) in [
+            (".s | ascii_downcase | length | tostring", r#""11""#),
+            (".s | ascii_downcase | length | . + 1", "12"),
+            (".s | ascii_downcase | select(length > 3) | length", "11"),
+            (".s | ascii_downcase | select(length > 30) | length", ""),
+            (r#".s | ascii_downcase | startswith("h") | not"#, "false"),
+            (
+                r#".s | ascii_downcase | endswith("rld") | tostring"#,
+                r#""true""#,
+            ),
+        ] {
+            let (out, reindexes) = outputs_and_reindexes(doc, query);
+            let want: Vec<&str> = want.lines().collect();
+            assert_eq!(out, want, "{query}");
+            assert_eq!(reindexes, 1, "{query}");
+        }
+        // A loop condition is read once per round, so a reindex per round grows with the rounds:
+        // the count must not move between 5 rounds and 50.
+        for (rounds, want) in [(5, "5"), (50, "50")] {
+            let query = format!(r#""" | until(length >= {rounds}; . + "x") | length"#);
+            let (out, reindexes) = outputs_and_reindexes(doc, &query);
+            assert_eq!(out, [want], "{query}");
+            assert!(reindexes <= 1, "{query} reindexed {reindexes} times");
+        }
+        let query = r#""" | while(length < 50; . + "x") | length"#;
+        let (out, reindexes) = outputs_and_reindexes(doc, query);
+        assert_eq!(out.len(), 50, "{query}");
+        assert!(reindexes <= 1, "{query} reindexed {reindexes} times");
+    }
+
     /// #3690: `nulls`, `booleans`, `numbers`, `strings`, `arrays` and
     /// `objects` answer from the node's own type. They used to fall through to
     /// the materializing fallback, which decoded each element and re-entered

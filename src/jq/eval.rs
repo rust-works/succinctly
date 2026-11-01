@@ -12349,7 +12349,8 @@ fn projection_peel<S: EvalSemantics>(
         });
     }
     // #3477: a leading `length` steps to the count, then the rest runs on it.
-    let counted = eval_owned_length(first, input);
+    let counted =
+        eval_owned_length(first, input).or_else(|| eval_owned_string_door::<S>(first, input));
     if counted.is_none() && !is_peelable_head::<S>(first) {
         return None;
     }
@@ -79523,10 +79524,13 @@ fn eval_owned_pure_in<S: EvalSemantics>(
     match expr {
         Expr::Paren(inner) => eval_owned_pure_in::<S>(inner, input, position, door),
         // A fresh integer, never a subvalue of `input`, so it is admitted in
-        // either position (see `eval_owned_length`). Everything that is not
-        // an array or an object declines, and the bridge keeps its
-        // diagnostics and its per-mode rules.
-        Expr::Builtin(Builtin::Length) if door => eval_owned_length(expr, input).map(Ok),
+        // either position (see `eval_owned_length`). An array, an object or
+        // (#5712, `eval_owned_string_door`) a string is answered; everything
+        // else declines, and the bridge keeps its diagnostics and its
+        // per-mode rules.
+        Expr::Builtin(Builtin::Length) if door => eval_owned_length(expr, input)
+            .or_else(|| eval_owned_string_door::<S>(expr, input))
+            .map(Ok),
         Expr::Builtin(
             Builtin::Has(_)
             | Builtin::Keys
@@ -136503,7 +136507,8 @@ mod tests {
     }
 
     /// #3439: the door is only for shapes it can answer identically. `length`
-    /// of a scalar keeps the bridge's diagnostics and per-mode rules, and a
+    /// of a number, `null` or a boolean keeps the bridge's diagnostics and per-mode rules (a
+    /// string's is answered since #5712), and a
     /// condition outside the pure grammar is the bridge's outright; a `?`, a
     /// proven re-entry and a value that is not the whole input's root are
     /// gated out.
@@ -136518,12 +136523,19 @@ mod tests {
         };
         // Answered.
         assert!(run("select(length == 2)", &array, false, Reentry::REBUILT).is_some());
-        // `length` of a scalar / string / null / bool is not this door's.
+        // #5712: a string's `length` is answered too, from the string itself.
+        assert!(run(
+            "select(length == 3)",
+            &OwnedValue::string("abc"),
+            false,
+            Reentry::REBUILT
+        )
+        .is_some());
+        // `length` of a number / null / bool is not this door's.
         for scalar in [
             OwnedValue::Int(-3),
             OwnedValue::Null,
             OwnedValue::Bool(true),
-            OwnedValue::string("abc"),
         ] {
             assert!(
                 run("select(length == 3)", &scalar, false, Reentry::REBUILT).is_none(),
@@ -136823,12 +136835,13 @@ mod tests {
         for src in ["length >= 2", "length == 2", "length", "(. | length) > 1"] {
             assert!(run(src, &array, false).is_some(), "{src}");
         }
-        // `length` of a scalar / string / null / bool is not this door's.
+        // #5712: a string's `length` is answered too, from the string itself.
+        assert!(run("length >= 3", &OwnedValue::string("abc"), false).is_some());
+        // `length` of a number / null / bool is not this door's.
         for scalar in [
             OwnedValue::Int(-3),
             OwnedValue::Null,
             OwnedValue::Bool(true),
-            OwnedValue::string("abc"),
         ] {
             assert!(run("length >= 3", &scalar, false).is_none(), "{scalar:?}");
         }
