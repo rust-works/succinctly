@@ -3731,8 +3731,15 @@ Two integers compare as integers, and a decimal spelling (`007`, `+5`, `1e3`) pa
 
 **Not reproduced:**
 
-- A string that parses as a timestamp is compared as a time by yq, so `"2001-01-01T00:00:00Z" < 1` is `parsing time "1" as "2006-01-02": cannot parse "1" as "2006"` there and `false` here.
-  `OwnedValue` has no timestamp kind, so the pair is treated as the two kinds it is made of.
+- A string that parses as a timestamp (RFC 3339 or `2006-01-02`, as Go's `time.Parse` reads them) on the left of `<`, `<=`, `>` or `>=` is compared as a time, and its right operand is parsed the same way ([#5651](https://github.com/rust-works/succinctly/issues/5651)).
+  `"2001-01-01T00:00:00Z" < 1` is `parsing time "1" as "2006-01-02": cannot parse "1" as "2006"` in both tools, and so is a `null`, a bool or a string in another layout (`parsing time "2001-01-01 00:00:00": extra text: " 00:00:00"`).
+  Two timestamps compare as instants, so the same moment in two zones is equal.
+  The reading is `go_time::parse_yq_datetime`, a port of the part of `time.Parse` those two layouts use, including its looseness (a one-digit hour, a comma before the fraction, a zone offset of 24 hours); `scripts/yq-time-fuzz.py` replays mutated timestamps against a real yq.
+  `OwnedValue` has no timestamp kind, so the reading goes by the text, and what yq decides from the `!!timestamp` tag is still different:
+  an unquoted document value whose text no layout reads (`2001-01-01 10:00:00`) is a time for yq, which raises on it, and a plain string is `!!str not yet supported for comparison` against a `!!timestamp` on its right, where this answers by string order;
+  the error for a right operand names its text as written in yq and as the value reads here, so an empty value (`key:`) is `parsing time ""` there and `"null"` here, a `~` is `"~"` and `"null"`, `True` is `"True"` and `"true"`, and a literal `007` in the filter is `"007"` and `"7"`;
+  a number past int64 (`100000000000000000000`) raises `strconv.ParseInt: ... value out of range` in yq and a time error here;
+  and the type tag in a container error reads `!!str` here for a document date (`tag` answers `!!str` for one too).
 - A signed prefixed integer (`-0x10`), `1_000` and `0b101` read as strings here, so they raise the kind error instead of comparing or raising `ParseFloat`.
 - `sort`, `min` and `max` over an array holding a prefixed integer and a float use their own comparators here: yq's `min`/`max` raise the same `ParseFloat` error, and its `sort` panics with it, where this orders them by value.
 
@@ -5420,7 +5427,9 @@ position and then by length, as `sort_by(.a, .b)` is in yq. jq mode is untouched
   text) and as the empty text of any other mapping here: `[.z, {}, .b] | sort` puts the literal
   last in yq. An empty mapping read from a document sorts as empty text in both.
 - **Timestamps.** yq compares two `!!timestamp` nodes as times; `OwnedValue` has no timestamp
-  type, so they compare by text (equal for an ISO date, different for other layouts).
+  type, so `sort` compares them by text (equal for an ISO date, different for other layouts).
+  The ordering operators read a timestamp-shaped string as a time (see the comparison section,
+  [#5651](https://github.com/rust-works/succinctly/issues/5651)); `sort` does not.
 - **An absent key in a `sort_by` key filter** is no output, as in yq ([#4054](https://github.com/rust-works/succinctly/issues/4054),
   [#4387](https://github.com/rust-works/succinctly/issues/4387)). yq evaluates the key through `ReadOnlyClone`,
   so an element lacking the key has a shorter key list (`[]` for `.k`, `[9]` for `.x, .y`) rather than one
