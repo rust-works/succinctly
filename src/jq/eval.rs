@@ -77273,9 +77273,10 @@ where
     result
 }
 
-/// [`substitute_vars`] for a program's named arguments (`--argjson`, `--slurpfile`, `$ARGS`): a
-/// container value is spliced as one shared marker instead of a literal tree rebuilt at every
-/// `$name`, when [`reads_named_arguments_only`] holds (#5690).
+/// [`substitute_vars`] for a program's named arguments, sharing a container value (#5690).
+///
+/// A container (`--argjson`, `--slurpfile`, `$ARGS`) is spliced as one shared marker instead of a
+/// literal tree rebuilt at every `$name`, when [`reads_named_arguments_only`] holds.
 ///
 /// The literal is a tree as large as the value, built once per read of the name and then built
 /// again into a value when the program runs: 10 MB of `--slurpfile` was about 80 ms of 148. The
@@ -77304,8 +77305,9 @@ where
     result.unwrap_or_else(|| expr.clone())
 }
 
-/// Whether `expr` only reads a named argument's value (#5690): no assignment, path expression,
-/// fold or definition anywhere in it. A shared marker is refused in path position (`$d | (.[] |
+/// Whether `expr` only reads a named argument's value (#5690).
+///
+/// That is: no assignment, path expression, fold or definition anywhere in it. A shared marker is refused in path position (`$d | (.[] |
 /// numbers) |= . + 1` is an error with one, `[2,3]` in jq), makes a fold that appends or assigns
 /// the value quadratic (`closed_expr_to_owned` declines a marker), and slows a small container
 /// assigned per record, so each of those keeps the literal.
