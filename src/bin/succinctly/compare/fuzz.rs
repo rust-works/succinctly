@@ -118,6 +118,23 @@ pub fn parse_report(json: &str) -> Result<(SeedRun, Vec<Finding>)> {
     Ok((run, findings))
 }
 
+/// The most distinct divergences one seed may report; more is an error, not a truncation.
+const MAX_SIGNATURES: u64 = 64;
+
+/// A report with fewer minimized findings than signatures dropped some: refuse it.
+fn ensure_all_minimized(run: &SeedRun, findings: &[Finding]) -> Result<()> {
+    if findings.len() as u64 != run.signatures {
+        bail!(
+            "seed {} has {} divergence signatures and only {} were minimized (the cap is \
+             {MAX_SIGNATURES}): fix or ledger some, or raise the cap",
+            run.seed,
+            run.signatures,
+            findings.len()
+        );
+    }
+    Ok(())
+}
+
 /// Whether a `python3` is on `PATH`.
 pub fn python_available() -> bool {
     Command::new("python3")
@@ -134,7 +151,6 @@ fn run_seed(
     reference: &Tool,
     subject: &Tool,
     seed: u64,
-    programs: u32,
 ) -> Result<(SeedRun, Vec<Finding>)> {
     if !reference.prefix.is_empty() || subject.prefix != ["jq"] {
         bail!("the fuzzer runs `<jq> ...` against `<succinctly> jq ...`");
@@ -144,7 +160,10 @@ fn run_seed(
         .arg("-I")
         .arg(root.join(&cfg.script))
         .args(["--bin", &subject.program, "--jq", &reference.program])
-        .args(["-n", &programs.to_string()])
+        .args(["-n", &cfg.programs.to_string()])
+        // Every signature is minimized: a finding the script's default cap left out would
+        // read as "no longer diverging" in the ledger.
+        .args(["--shrink", &MAX_SIGNATURES.to_string()])
         .args(["--seed", &seed.to_string()])
         .args(["--depth", &cfg.depth.to_string()])
         .arg("--json")
@@ -153,7 +172,11 @@ fn run_seed(
         .with_context(|| format!("running {}", cfg.script))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     match out.status.code() {
-        Some(0 | 1) => parse_report(&stdout),
+        Some(0 | 1) => {
+            let (run, findings) = parse_report(&stdout)?;
+            ensure_all_minimized(&run, &findings)?;
+            Ok((run, findings))
+        }
         code => bail!(
             "{} (seed {seed}) exited {code:?}: {}",
             cfg.script,
@@ -168,7 +191,7 @@ pub fn run(root: &Path, cfg: &Fuzz, reference: &Tool, subject: &Tool) -> Result<
     let mut sum = Summary::default();
     let mut seen = BTreeSet::new();
     for &seed in &cfg.seeds {
-        let (run, findings) = run_seed(root, cfg, reference, subject, seed, cfg.programs)?;
+        let (run, findings) = run_seed(root, cfg, reference, subject, seed)?;
         sum.runs.push(run);
         for f in findings {
             if seen.insert(f.id()) {
@@ -215,7 +238,21 @@ mod tests {
         let (run, findings) =
             parse_report(r#"{"seed":1,"programs":5,"signatures":0,"counts":{}}"#).unwrap();
         assert_eq!((run.agree, run.signatures), (0, 0));
-        assert!(findings.is_empty());
+        assert_eq!(findings.len(), 0);
+    }
+
+    #[test]
+    fn a_report_that_dropped_a_signature_is_refused() {
+        let (run, findings) = parse_report(REPORT).unwrap();
+        assert!(ensure_all_minimized(&run, &findings).is_ok());
+        let more = SeedRun {
+            signatures: 2,
+            ..run
+        };
+        let err = ensure_all_minimized(&more, &findings)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 divergence signatures and only 1"), "{err}");
     }
 
     #[test]

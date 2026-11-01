@@ -822,7 +822,15 @@ fn memory_section(s: &mut String, timed: &[&PerfRow]) {
 
 /// A value in a table cell: the pipes of a jq program must not end the cell.
 fn cell(text: &str) -> String {
-    format!("`{}`", text.replace('|', "\\|").replace('\n', " "))
+    let text = text.replace('|', "\\|").replace('\n', " ");
+    if text.is_empty() {
+        "(empty)".into()
+    } else if text.contains('`') {
+        // A longer fence, padded, so a backtick in the text does not close the span.
+        format!("`` {text} ``")
+    } else {
+        format!("`{text}`")
+    }
 }
 
 fn outcome(o: Option<&fuzz::Outcome>) -> String {
@@ -1046,10 +1054,17 @@ mod tests {
     }
 
     #[test]
+    fn a_cell_survives_a_backtick_a_pipe_a_newline_and_nothing() {
+        assert_eq!(cell("a|b\nc"), "`a\\|b c`");
+        assert_eq!(cell("a`b"), "`` a`b ``");
+        assert_eq!(cell(""), "(empty)");
+    }
+
+    #[test]
     fn a_fuzz_run_without_findings_says_so_and_a_skipped_dimension_prints_nothing() {
         let mut s = String::new();
         fuzz_section(&mut s, None, &[]);
-        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
         fuzz_section(&mut s, Some(&fuzz_summary(vec![])), &[]);
         assert!(s.contains("| 1 | 500 | 480 | 200 | 12 | 0 |"), "{s}");
         assert!(s.contains("No divergence found."), "{s}");

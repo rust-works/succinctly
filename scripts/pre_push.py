@@ -36,7 +36,10 @@ from dataclasses import dataclass, field
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_BASE = "origin/main"
 
-# The paths `.github/workflows/compare-jq-ledger.yml` triggers on.
+# The paths `.github/workflows/compare-jq-ledger.yml` triggers on. The workflow also runs the `fuzz`
+# dimension, which `--ledger-only` does not (a ledger id holds the program, not its document), so
+# `scripts/jq-grammar-fuzz.py` triggers the workflow but not this gate: a change to the grammar is
+# checked in CI only.
 LEDGER_PATHS = (
     "comparison/jq/*",
     "src/*",

@@ -15,6 +15,11 @@ A suite and a probe use only letters, digits, `_` and `-`. A file that no id map
 is not `.toml`, and a `divergences.toml` beside this directory fail the loader
 (`src/bin/succinctly/compare/ledger.rs`).
 
+The `fuzz` suite is the exception in what the probe name is: a fuzzer finding is a program, which a
+file name cannot hold, so its probe is `p-` and the first 12 hex digits of the SHA-256 of the
+minimized program (`fuzz:p-cb983ce3375e` is `fuzz/p-cb983ce3375e.toml`). The report prints the id
+of every finding, and the entry's `reason` names the program.
+
 The file holds the other fields, with no `[[divergence]]` header and no `id`:
 
 | Field      | Meaning                                                                                       |
