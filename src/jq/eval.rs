@@ -30536,7 +30536,21 @@ impl<'p> RestTail<'p> {
 /// failing generator ([`eval_pipe`]) reads the first stage of a pipe, and a run
 /// is one.
 fn tail_plan_of<S: EvalSemantics>(owner: &PipeStages, from: usize) -> TailPlan {
-    owner.tail_plan(from, classify_stage, S::TAG == EvalTag::Jq, may_keep_run)
+    owner.tail_plan(
+        from,
+        classify_stage,
+        S::TAG == EvalTag::Jq && chainable(owner),
+        may_keep_run,
+    )
+}
+
+/// Whether a pipe longer than [`MAX_KEPT_TAIL_STAGES`] may hand its tails on through the chain
+/// it keeps (#5679): the links are `Expr::Shared`, which a re-entry's marker rewrite does not
+/// reach, so a pipe holding both a marker it would rewrite and a node that can read the rewrite
+/// is copied. Short pipes never chain, and answer `true` without the walk.
+fn chainable(owner: &PipeStages) -> bool {
+    owner.len() <= crate::jq::expr::MAX_KEPT_TAIL_STAGES
+        || !(pipe_holds_tracked_var(owner) && pipe_holds_resolver_node(owner))
 }
 
 /// The stages that stand for the tail of `owner` from `from` on, once
@@ -30932,9 +30946,11 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // drive; here each element is its own call, so the pipe of the program that
     // owns the rest keeps one for it (#5404) -- built per call, a chain of `n`
     // stages over one value copied `n - 1`, `n - 2`, ... of them, and each copy
-    // re-ran the analyses a pipe asks of itself. A pipe's first value and a pipe too
-    // long to keep copies for are copied per call; a rest holding evaluation state
-    // is kept in pieces when it is long enough (#5421), copied per call otherwise.
+    // re-ran the analyses a pipe asks of itself. A pipe's first value is copied per
+    // call; a rest holding evaluation state is kept in pieces when it is long enough
+    // (#5421), copied per call otherwise. A pipe too long to keep copies for hands on
+    // a block of its stages and a link to the rest in jq mode (#5679), and copies per
+    // call when it holds a stage with state, or a marker and a node that reads it.
     //
     // One call to `eval_owned_input` below, not one per branch: it is
     // `#[inline(always)]`, so a second call site would emit its large body twice
@@ -115811,7 +115827,8 @@ mod tests {
     }
 
     /// #5404: a pipe longer than [`MAX_KEPT_TAIL_STAGES`] keeps no copies (they
-    /// are quadratic in its length) and still answers as it did.
+    /// are quadratic in its length) and still answers as it did. What each call
+    /// copies is a bounded piece of the rest, not the rest (#5679).
     #[test]
     fn test_owned_pipe_longer_than_the_kept_limit_copies_per_value_5404() {
         let stages = crate::jq::expr::MAX_KEPT_TAIL_STAGES + 1;
@@ -115830,8 +115847,11 @@ mod tests {
             .join()
             .unwrap();
         assert_eq!(output, (2 * stages).to_string());
+        // Each call of the last two blocks still copies, and each earlier one hands on its block
+        // and a link (#5679): a copy per call either way.
+        let fewest = 2 * (stages - 2 - 2 * crate::jq::expr::CHAIN_BLOCK_STAGES);
         assert!(
-            copies >= 2 * (stages - 2),
+            copies >= fewest,
             "{copies} copies for two values over {stages} stages"
         );
         assert_eq!(kept, 0);
@@ -115895,6 +115915,92 @@ mod tests {
             matches!(rest.rest().rest().plan::<JqSemantics>(), TailPlan::Copy),
             "a lone stage is handed on as itself, not kept"
         );
+    }
+
+    /// #5679: the stages after one in a pipe of thousands are handed on as a bounded piece (the rest
+    /// of a block and a link), in jq mode, from the first ask; in yq mode they are copied as before.
+    /// A pipe of `n` stages that copied the whole rest held `n` copies of up to `n` stages while the
+    /// rest ran.
+    #[test]
+    fn test_a_long_pipe_hands_each_call_a_bounded_tail_5679() {
+        let source = vec![". + 1"; 3_000].join(" | ");
+        let Expr::Pipe(stages) = parse(&source).unwrap() else {
+            panic!("a pipe");
+        };
+        let mut tail = PipeTail::whole(&stages).rest();
+        for _ in 0..40 {
+            assert!(matches!(tail.plan::<JqSemantics>(), TailPlan::Split));
+            let split = tail.sink().split();
+            assert!(split.len() <= 17, "{} stages", split.len());
+            tail = tail.rest();
+        }
+        assert!(matches!(
+            PipeTail::whole(&stages).rest().plan::<YqSemantics>(),
+            TailPlan::Copy
+        ));
+        // The answer is the same through the chain as through the copy. A pipe this long recurses
+        // past a test thread's default stack.
+        const STACK: usize = 256 * 1024 * 1024;
+        let answers = std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(|| {
+                with_stack_budget(STACK, || {
+                    [128, 129, 160, 300, 1_000].map(|stages| {
+                        let expr = parse(&vec![". + 1"; stages].join(" | ")).unwrap();
+                        let mut out = Vec::new();
+                        let flow = eval_each_owned::<JqSemantics>(
+                            &expr,
+                            &OwnedValue::Int(0),
+                            false,
+                            Reentry::REBUILT,
+                            &mut |v| {
+                                out.push(v.to_json());
+                                Demand::Continue
+                            },
+                        );
+                        assert!(matches!(flow, Flow::Exhausted));
+                        (stages, out)
+                    })
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        for (stages, out) in answers {
+            assert_eq!(out, [stages.to_string()]);
+        }
+    }
+
+    /// #5679: the links of a chain are `Expr::Shared`, which a re-entry's marker rewrite does not
+    /// reach, so a long pipe holding a marker and a node that can read the rewrite is copied; one
+    /// holding either alone is chained.
+    #[test]
+    fn test_a_long_pipe_with_a_marker_and_a_resolver_node_is_not_chained_5679() {
+        let marker = Expr::TrackedVar(Tracked::snapshot(OwnedValue::Int(1)));
+        let long = |extra: &[Expr]| {
+            let Expr::Pipe(mut stages) = parse(&vec![". + 1"; 200].join(" | ")).unwrap() else {
+                panic!("a pipe");
+            };
+            for (at, stage) in extra.iter().enumerate() {
+                stages.insert(10 + at, stage.clone());
+            }
+            stages
+        };
+        let resolver = parse("path(.a)").unwrap();
+        let plan = |pipe: &PipeStages| tail_plan_of::<JqSemantics>(pipe, 1);
+        assert!(matches!(plan(&long(&[])), TailPlan::Split));
+        assert!(matches!(
+            plan(&long(&[Expr::Array(Box::new(marker.clone()))])),
+            TailPlan::Split
+        ));
+        assert!(matches!(
+            plan(&long(core::slice::from_ref(&resolver))),
+            TailPlan::Split
+        ));
+        assert!(matches!(
+            plan(&long(&[Expr::Array(Box::new(marker)), resolver])),
+            TailPlan::Copy
+        ));
     }
 
     /// #5554: the owned bridge answers a text stage over a value too deep to re-index, alone and
