@@ -82647,6 +82647,13 @@ pub(crate) fn pattern_alternatives_var_names(patterns: &[Pattern]) -> Vec<String
     all_var_names
 }
 
+/// How many times this thread rebuilt a fold operand for a step (#5745): what a test reads to tell
+/// an operand that ran as written from one that was copied.
+#[cfg(test)]
+thread_local! {
+    static FOLD_STEP_REBUILDS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 /// Substitute one binding set into a fold's UPDATE or EXTRACT: the bound
 /// names, plus `null` for every name only *another* `?//` alternative binds
 /// (#1365/#1368 -- bound and null-filled names never overlap, since the
@@ -82661,6 +82668,8 @@ pub(crate) fn substitute_fold_step(
     marked: LoopVarSplice,
     splice: bool,
 ) -> Expr {
+    #[cfg(test)]
+    FOLD_STEP_REBUILDS.with(|count| count.set(count.get() + 1));
     let null_value = OwnedValue::Null;
     let vars = as_var_refs(bindings).chain(
         all_var_names
@@ -83399,6 +83408,9 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     // (`foreach empty as $x (...)`, `foreach halt_error as $x (empty; .)`)
     // from paying for a `Vec` build/sort/dedup it will never use.
     let mut all_var_names: Option<Vec<String>> = None;
+    // #5745: whether UPDATE and EXTRACT are inert, decided with `all_var_names` and reused by
+    // every fork.
+    let mut inert_operands: Option<(FoldOperand<'_>, Option<FoldOperand<'_>>)> = None;
     // #5292: charged by every INIT fork but the first.
     let mut shared_budget = REDUCE_FOREACH_MAX_STEPS;
 
@@ -83431,8 +83443,12 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         };
         let all_var_names =
             all_var_names.get_or_insert_with(|| pattern_alternatives_var_names(patterns));
-        let update = update.inert_for(all_var_names);
-        let extract = extract.map(|ext| ext.inert_for(all_var_names));
+        let (update, extract) = *inert_operands.get_or_insert_with(|| {
+            (
+                update.inert_for(all_var_names),
+                extract.map(|ext| ext.inert_for(all_var_names)),
+            )
+        });
         let mut state = init_val;
         // Recorded out-of-band for the usual reason: the per-element callback
         // can only answer `Demand`, so "why did the fold stop" has to be kept
@@ -83548,6 +83564,8 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     // uses, and #2440's short-circuit is structural here rather than an
     // early return this could sit above.
     let mut all_var_names: Option<Vec<String>> = None;
+    // #5745: whether UPDATE is inert, decided with `all_var_names` and reused by every fork.
+    let mut inert_update: Option<FoldOperand<'_>> = None;
     // Shared across every INIT fork but the first (#695, #5292), the same
     // "whole tree, not per-fork" accounting the collecting version used.
     let mut shared_budget = REDUCE_FOREACH_MAX_STEPS;
@@ -83573,7 +83591,7 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
         };
         let all_var_names =
             all_var_names.get_or_insert_with(|| pattern_alternatives_var_names(patterns));
-        let update = update.inert_for(all_var_names);
+        let update = *inert_update.get_or_insert_with(|| update.inert_for(all_var_names));
         let mut acc = init_val;
         // Cleared on entry to every step, not just the first: a `?//` in the
         // source re-enters this callback after a stop was already reported
@@ -164397,8 +164415,61 @@ mod fold_operand_inert_tests_5745 {
             let expr = parse(source).unwrap();
             assert_eq!(fold_operand_is_inert(&expr, &names), inert, "{source}");
         }
-        // No loop variable at all (`reduce`'s `$_`-less spellings) is inert for any body without a definition.
-        assert!(fold_operand_is_inert(&parse(". + $e").unwrap(), &[]));
+    }
+
+    /// Run `program` over `null` on a thread with the CLI's stack, returning its outputs and how
+    /// many fold-step rebuilds that thread made.
+    #[cfg(feature = "std")]
+    fn run_and_count_rebuilds(program: &'static str) -> (String, usize) {
+        const STACK: usize = 256 * 1024 * 1024;
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(move || {
+                with_stack_budget(STACK, || {
+                    let expr = parse(program).unwrap();
+                    let json = b"null";
+                    let index = crate::json::JsonIndex::build(json);
+                    let mut outputs = Vec::new();
+                    let control = crate::jq::eval_generic::eval_each_with_cursor(
+                        &expr,
+                        index.root(json),
+                        &mut |result| {
+                            outputs.push(format!("{result:?}"));
+                            true
+                        },
+                    );
+                    assert!(control.is_none(), "{control:?}");
+                    (
+                        outputs.join(","),
+                        FOLD_STEP_REBUILDS.with(core::cell::Cell::get),
+                    )
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// #5745: the step loops consult the flag. An inert operand is never rebuilt; every other
+    /// operand is rebuilt once per step (a test that cannot fail if the fast path stops firing,
+    /// or fires for an operand that reads the variable, would only compare outputs).
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_fold_steps_rebuild_only_operands_that_read_a_loop_variable_5745() {
+        for (program, rebuilds) in [
+            ("reduce range(5) as $i (0; .+1)", 0),
+            ("reduce range(5) as $i (0; .+$i)", 5),
+            ("reduce range(4) as $i (0; def f: .+1; f)", 4),
+            ("[foreach range(3) as $i (0; .+1)]", 0),
+            ("[foreach range(3) as $i (0; .+1; .*2)]", 0),
+            ("[foreach range(3) as $i (0; .+$i)]", 3),
+            ("[foreach range(3) as $i (0; .+1; .+$i)]", 3),
+            ("[foreach range(3) as $i ((0,10); .+1)]", 0),
+            ("reduce range(3) as $i (0; reduce range(2) as $j (.; .+$i))", 3),
+        ] {
+            let (_, counted) = run_and_count_rebuilds(program);
+            assert_eq!(counted, rebuilds, "{program}");
+        }
     }
 
     /// #5745: an operand is inert for the fold when both of its copies are.
