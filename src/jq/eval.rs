@@ -82644,8 +82644,8 @@ pub(crate) fn pattern_alternatives_var_names(patterns: &[Pattern]) -> Vec<String
     all_var_names
 }
 
-/// How many times this thread rebuilt a fold operand for a step (#5745): what a test reads to tell
-/// an operand that ran as written from one that was copied.
+// How many times this thread rebuilt a fold operand for a step (#5745): what a test reads to tell
+// an operand that ran as written from one that was copied.
 #[cfg(test)]
 thread_local! {
     static FOLD_STEP_REBUILDS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
