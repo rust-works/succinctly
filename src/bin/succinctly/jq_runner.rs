@@ -6020,20 +6020,15 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // #5764: the slurped array takes it only for a program the owned evaluator answers
                 // without the reindex bridge; any other reads the array's own index, as before #5744,
                 // which that bridge made 10-15% slower on `[limit(5;.[])]` and `select`.
-                let owned_route = if walk.is_some()
-                    || (args.raw_input
+                let owned_route = owned_route_for(
+                    walk.is_some(),
+                    args.raw_input
                         && args.input_dsv.is_none()
-                        && matches!(document, OwnedValue::String(_)))
-                {
-                    OwnedRoute::Always
-                } else if args.slurp
-                    && stream_mode(&args, uses_input_builtins, faulted) == StreamMode::Eager
-                    && matches!(document, OwnedValue::Array(_))
-                {
-                    OwnedRoute::WhereAnswered
-                } else {
-                    OwnedRoute::Off
-                };
+                        && matches!(document, OwnedValue::String(_)),
+                    args.slurp
+                        && stream_mode(&args, uses_input_builtins, faulted) == StreamMode::Eager
+                        && matches!(document, OwnedValue::Array(_)),
+                );
                 let mut whole = Some(document);
                 loop {
                     let input = match walk.as_mut() {
@@ -10261,6 +10256,20 @@ fn evaluate_input_streaming(
         OwnedRoute::Off,
         on_value,
     )
+}
+
+/// The route `run_jq` gives an input that is already a tree (#5681, #5764): a lazily walked
+/// `--stream` event or a `-R` line (`lazy_events`, `raw_line`) always reads it where it is; the array
+/// `--stream -s` slurps (`eager_slurped_array`) does so only for a program the owned evaluator
+/// answers without re-indexing; anything else is written out and read through its own index.
+fn owned_route_for(lazy_events: bool, raw_line: bool, eager_slurped_array: bool) -> OwnedRoute {
+    if lazy_events || raw_line {
+        OwnedRoute::Always
+    } else if eager_slurped_array {
+        OwnedRoute::WhereAnswered
+    } else {
+        OwnedRoute::Off
+    }
 }
 
 /// How [`evaluate_input_streaming_via`] reads an input that is already a tree.
@@ -16975,6 +16984,28 @@ mod tests {
             .expect("spawns")
             .join()
             .expect("passes");
+    }
+
+    /// #5764: the route `run_jq` picks. Every output comparison passes whichever route is picked,
+    /// so a branch edited to the wrong route would show up only as the 10-15% it cost.
+    #[test]
+    fn the_owned_route_is_chosen_per_input_kind_5764() {
+        // (lazy events, raw line, eager slurped array)
+        let rows = [
+            ((true, false, false), OwnedRoute::Always),
+            ((false, true, false), OwnedRoute::Always),
+            ((false, false, true), OwnedRoute::WhereAnswered),
+            ((false, false, false), OwnedRoute::Off),
+            // A lazily walked event is never the slurped array; the first two win regardless.
+            ((true, false, true), OwnedRoute::Always),
+            ((false, true, true), OwnedRoute::Always),
+        ];
+        for ((events, line, slurped), want) in rows {
+            assert!(
+                owned_route_for(events, line, slurped) == want,
+                "events {events}, line {line}, slurped array {slurped}"
+            );
+        }
     }
 
     /// #5764: a slurped `--stream` array takes the owned route only for a program the owned

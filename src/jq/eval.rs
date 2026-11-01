@@ -12109,7 +12109,9 @@ fn eval_each_owned_past_front_doors<S: EvalSemantics>(
 
 /// [`eval_each_owned_past_front_doors`], which hands the program back instead of crossing the
 /// bridge when `declined` is given (#5764): every door above the bridge has declined by then,
-/// nothing has reached `sink`, and the flag is how [`eval_each_owned_answered`] learns it.
+/// nothing has reached `sink`, and the flag is how [`eval_each_owned_answered`] learns it. A caller
+/// that passes a flag must read it: the `Flow::Exhausted` returned then is a placeholder, not an
+/// answer that produced nothing.
 fn eval_each_owned_past_front_doors_in<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
