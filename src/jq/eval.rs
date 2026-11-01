@@ -10536,6 +10536,16 @@ pub(crate) fn eval_owned_string_door<S: EvalSemantics>(
         stage @ Expr::Builtin(
             Builtin::Startswith(_) | Builtin::Endswith(_) | Builtin::Contains(_),
         ) => eval_owned_door_arm::<S>(stage, input)?.ok(),
+        // #5712: what the answer cannot raise, `try`/`?` cannot change: a `catch` never runs.
+        Expr::Try { expr: inner, .. } | Expr::Optional(inner) => {
+            eval_owned_string_door::<S>(inner, input)
+        }
+        // #5712: a comparison or boolean over those counts (`length > 5`) is a boolean the pure
+        // grammar settles with the condition doors on. Every raised error is the bridge's: only
+        // an answer is taken.
+        stage @ (Expr::Compare { .. } | Expr::And(..) | Expr::Or(..) | Expr::Not) => {
+            eval_owned_pure_in::<S>(stage, input, ResultPosition::Fresh, true)?.ok()
+        }
         _ => None,
     }
 }
@@ -13345,6 +13355,10 @@ fn closed_unary_builtin<S: EvalSemantics>(stage: &Expr, input: &OwnedValue) -> O
         if let Some(answer) = owned_unary_math::<S>(builtin, input) {
             return Some(answer);
         }
+    }
+    // #5712: a string's `length` is read off the string, not off a copy written out and indexed.
+    if let Some(answer) = eval_owned_string_door::<S>(unwrap_paren(stage), input) {
+        return Some(answer);
     }
     match eval_owned_expr_full::<S>(unwrap_paren(stage), input, false) {
         Ok(Some((value, None))) => Some(value),
