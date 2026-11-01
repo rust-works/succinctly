@@ -13399,6 +13399,23 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
             }
             Some(value)
         }
+        // #5774: `$d[0].users[$i]`, a key that is itself closed (the loop variable): the target and
+        // the key are each one value, and the step is the navigation `.[k]` / `.k` the pipe stages
+        // above answer. A key that is not an integer or a string, or a step that raises, declines
+        // and keeps the evaluator's own route and text. jq mode only, like the operators below.
+        Expr::IndexExpr { target, key } if S::TAG == EvalTag::Jq => {
+            let held = closed_expr_to_owned_at_depth::<S>(target, depth + 1, escaped)?;
+            let key = closed_expr_to_owned_at_depth::<S>(key, depth + 1, escaped)?;
+            let step = match key {
+                OwnedValue::Int(idx) => Expr::Index { idx, key: None },
+                OwnedValue::String(name) => Expr::Field(name.to_string()),
+                _ => return None,
+            };
+            match eval_owned_fast_path::<S>(&step, &held, false) {
+                Some(Ok(Some(next))) => Some(next),
+                _ => None,
+            }
+        }
         // #5733: `"k\($i)"` with every slot closed, so one value per slot and one string.
         // Without this arm an interpolated key sent a fold step through the re-index bridge,
         // which serialises the whole accumulator to evaluate a key that never reads it. Each slot
@@ -13532,6 +13549,11 @@ fn closed_unary_builtin<S: EvalSemantics>(stage: &Expr, input: &OwnedValue) -> O
     }
     // #5712: a string's `length` is read off the string, not off a copy written out and indexed.
     if let Some(answer) = eval_owned_string_door::<S>(unwrap_paren(stage), input) {
+        return Some(answer);
+    }
+    // #5774: a container's `length` is its count, not a copy written out and indexed: `$d | length`
+    // over a named argument is read at every step of a fold.
+    if let Some(answer) = eval_owned_length(unwrap_paren(stage), input) {
         return Some(answer);
     }
     match eval_owned_expr_full::<S>(unwrap_paren(stage), input, false) {
@@ -77511,11 +77533,23 @@ where
 {
     // Only a container can be shared, so a program with none (the usual `--arg`) is not walked.
     let vars: Vec<(&str, &OwnedValue)> = vars.into_iter().collect();
-    let share = vars
+    let any_container = vars
         .iter()
-        .any(|(_, value)| matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)))
-        && reads_named_arguments_only(expr);
-    substitute_vars_shared_or_literal(expr, vars, share)
+        .any(|(_, value)| matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)));
+    if !any_container {
+        return substitute_vars_shared_or_literal(expr, vars, false);
+    }
+    if reads_named_arguments_only(expr) {
+        return substitute_vars_shared_or_literal(expr, vars, true);
+    }
+    // #5774: a fold re-evaluates its body per step, so a literal `$d` there is rebuilt whole per
+    // step. Only a read that navigates into the value (`$d[0].users[$i].age`) is shared; a bare
+    // `$d` (an operand of `+`, an element of `[...]`) keeps the literal, which a fold that
+    // appends it needs (#5690).
+    if reads_named_arguments_besides_folds(expr) {
+        return substitute_vars_navigation_shared(expr, &vars);
+    }
+    substitute_vars_shared_or_literal(expr, vars, false)
 }
 
 /// [`substitute_vars`]'s loop, splicing a container as one shared marker when `share` is set.
@@ -77538,6 +77572,95 @@ where
     result.unwrap_or_else(|| expr.clone())
 }
 
+/// The name a navigation head of `$name` is renamed to before substitution (#5774). It cannot be
+/// written in a program, so it names no variable a program binds.
+fn navigation_head_name(name: &str) -> String {
+    format!("{name}\0navigation")
+}
+
+/// [`substitute_vars`]'s loop for a program with a fold (#5774): a container's navigation heads
+/// are one shared marker, every other `$name` the literal.
+fn substitute_vars_navigation_shared(expr: &Expr, vars: &[(&str, &OwnedValue)]) -> Expr {
+    let mut result: Option<Expr> = None;
+    for &(name, value) in vars {
+        let current = result.as_ref().unwrap_or(expr);
+        let is_container = matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
+        result = Some(if is_container && !program_binds_var(current, name) {
+            let head = navigation_head_name(name);
+            let renamed = rename_navigation_heads(current, name, &head);
+            let marker = LazyMarker::new(value, Origin::Untracked, None);
+            let shared = substitute_var_with(&renamed, &head, value, Some(&marker), false);
+            substitute_var(&shared, name, value)
+        } else {
+            substitute_var(current, name, value)
+        });
+    }
+    result.unwrap_or_else(|| expr.clone())
+}
+
+/// Whether anything in `expr` binds `$name`, so that a `$name` in it may not be the argument.
+fn program_binds_var(expr: &Expr, name: &str) -> bool {
+    any_subexpr(expr, &mut |e| match e {
+        Expr::As { var, .. } => var == name,
+        Expr::AsPattern { patterns, .. }
+        | Expr::Reduce { patterns, .. }
+        | Expr::Foreach { patterns, .. } => patterns.iter().any(|p| pattern_binds_var(p, name)),
+        _ => false,
+    })
+}
+
+/// Whether `expr` is a step that reads into the value before it, or measures it: `.a`, `.[0]`,
+/// `.[1:]`, `.[]`, `length`, `keys`, `has(k)`.
+fn is_navigation_step(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Field(_)
+            | Expr::Index { .. }
+            | Expr::Slice { .. }
+            | Expr::Iterate
+            | Expr::Builtin(
+                Builtin::Length | Builtin::Keys | Builtin::KeysUnsorted | Builtin::Has(_)
+            )
+    )
+}
+
+/// `expr` with every `$name` that heads a navigation chain renamed to `head`.
+///
+/// A head is the `$name` of `$name.a`, `$name[0]`, `$name[1:]`, `$name[]`, `$name[$k]` or
+/// `$name | length`: the value is read through or measured, so nothing of it is handed on whole.
+fn rename_navigation_heads(expr: &Expr, name: &str, head: &str) -> Expr {
+    let is_var = |e: &Expr| matches!(e, Expr::Var(v) if v == name);
+    match expr {
+        Expr::Pipe(stages)
+            if stages.len() >= 2 && is_var(&stages[0]) && is_navigation_step(&stages[1]) =>
+        {
+            Expr::Pipe(
+                core::iter::once(Expr::Var(head.to_string()))
+                    .chain(
+                        stages[1..]
+                            .iter()
+                            .map(|s| rename_navigation_heads(s, name, head)),
+                    )
+                    .collect(),
+            )
+        }
+        Expr::IndexExpr { target, key } if is_var(target) => Expr::IndexExpr {
+            target: Box::new(Expr::Var(head.to_string())),
+            key: Box::new(rename_navigation_heads(key, name, head)),
+        },
+        Expr::SliceExpr { target, start, end } if is_var(target) => Expr::SliceExpr {
+            target: Box::new(Expr::Var(head.to_string())),
+            start: start
+                .as_ref()
+                .map(|s| Box::new(rename_navigation_heads(s, name, head))),
+            end: end
+                .as_ref()
+                .map(|e| Box::new(rename_navigation_heads(e, name, head))),
+        },
+        other => map_subexprs(other, &mut |e| rename_navigation_heads(e, name, head)),
+    }
+}
+
 /// Whether `expr` only reads a named argument's value (#5690).
 ///
 /// That is: no assignment, path expression, fold or definition anywhere in it. A shared marker is
@@ -77551,13 +77674,22 @@ where
 /// not a builtin (`FuncCall`, `NamespacedCall`) is excluded too, since its body is not in view;
 /// the jq builtins parse as `Builtin`, so that costs a program with a `def` or a module call.
 fn reads_named_arguments_only(expr: &Expr) -> bool {
-    !any_subexpr(expr, &mut |e| {
+    !holds_unshareable_construct(expr, false)
+}
+
+/// [`reads_named_arguments_only`], but a fold is allowed (#5774): the program has no assignment,
+/// path expression or definition, so a `$name` read through is not in path position anywhere.
+fn reads_named_arguments_besides_folds(expr: &Expr) -> bool {
+    !holds_unshareable_construct(expr, true)
+}
+
+fn holds_unshareable_construct(expr: &Expr, allow_folds: bool) -> bool {
+    any_subexpr(expr, &mut |e| {
         is_assignment_expr(e)
+            || (!allow_folds && matches!(e, Expr::Reduce { .. } | Expr::Foreach { .. }))
             || matches!(
                 e,
-                Expr::Reduce { .. }
-                    | Expr::Foreach { .. }
-                    | Expr::FuncDef { .. }
+                Expr::FuncDef { .. }
                     | Expr::FuncCall { .. }
                     | Expr::NamespacedCall { .. }
                     | Expr::DefCall { .. }
@@ -165134,6 +165266,40 @@ mod named_args_shared_tests_5690 {
         ] {
             let substituted =
                 substitute_named_args(&parse(source).unwrap(), [("d", &d), ("n", &n)]);
+            assert_eq!(holds_marker(&substituted), shared, "{source}");
+        }
+    }
+
+    /// #5774: in a program with a fold, a container is a marker only where it is read through
+    /// (`$d[0]`, `$d.a`, `$d[$i]`, `$d[1:]`, `$d[]`), and a bare `$d` (an operand of `+`, an
+    /// element of `[...]`, a fold's initial value) keeps the literal a fold that appends it needs.
+    #[test]
+    fn test_a_fold_body_shares_a_container_named_argument_only_where_it_is_read_through_5774() {
+        let d = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        for (source, shared) in [
+            ("reduce range(2) as $i (0; . + $d[$i])", true),
+            ("reduce range(2) as $i (0; . + $d[0])", true),
+            ("reduce range(2) as $i (0; . + ($d | length))", true),
+            ("reduce range(2) as $i ([]; . + ($d | map(.)))", false),
+            ("reduce range(2) as $i ([]; . + [$d[0]])", true),
+            ("[foreach range(2) as $i (0; . + $d[$i])]", true),
+            ("reduce range(2) as $i (0; . + $d[1:][0])", true),
+            ("reduce $d[] as $x (0; . + $x)", true),
+            ("reduce range(2) as $i ([]; . + $d)", false),
+            ("reduce range(2) as $i ([]; . + [$d])", false),
+            ("reduce range(2) as $i ($d; .)", false),
+            // A fold with a write or a path expression keeps the literal everywhere.
+            ("reduce range(2) as $i (.; .[$i] = $d[0])", false),
+            (
+                "reduce range(2) as $i (0; . + (path($d[0]) | length))",
+                false,
+            ),
+            ("reduce range(2) as $i (0; def f: $d[0]; . + f)", false),
+            // A `$d` the program binds itself is not the argument.
+            ("reduce range(2) as $i (0; . + ([5] as $d | $d[0]))", false),
+            ("reduce ([5]) as $d (0; . + $d[0])", false),
+        ] {
+            let substituted = substitute_named_args(&parse(source).unwrap(), [("d", &d)]);
             assert_eq!(holds_marker(&substituted), shared, "{source}");
         }
     }
