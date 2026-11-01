@@ -1057,10 +1057,14 @@ fn empty_input_reads_as(
     // emptiness test: a file that is only the mark reads as an empty one.
     if format != InputFormat::Json {
         bytes.drain(..crate::front_matter::leading_bom_len(&bytes));
-    } else if let Some(nul) = bytes.iter().position(|&b| b == 0) {
+    } else if bytes.contains(&0) {
         // #5721: yq's JSON reader stops at the first NUL (`printf '\0' | yq -p=json .` is the
-        // empty document, `1<NUL>2` is `1`); the rest of the input is never read.
-        bytes.truncate(nul);
+        // empty document, `1<NUL>2` is `1`); the rest of the input is never read. The
+        // `contains` probe is std's word-at-a-time byte search: a byte-by-byte `position` here
+        // cost +8% instructions on `users_yq_keys_unsorted` (a 2 MB JSON file) in the perf guard.
+        if let Some(nul) = bytes.iter().position(|&b| b == 0) {
+            bytes.truncate(nul);
+        }
     }
     if !holds_no_document(&bytes, format) || front_matter {
         return Some((bytes, format));

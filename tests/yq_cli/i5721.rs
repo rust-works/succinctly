@@ -25,7 +25,11 @@ fn a_nul_ends_a_json_input() -> Result<()> {
         (b"1\0\n2", "1\n"),
         (b"{\"a\":1}\0", "{\"a\":1}\n"),
     ] {
-        assert_eq!(json_nul(input, &[])?, (expected.to_string(), 0), "{input:?}");
+        assert_eq!(
+            json_nul(input, &[])?,
+            (expected.to_string(), 0),
+            "{input:?}"
+        );
     }
     Ok(())
 }
