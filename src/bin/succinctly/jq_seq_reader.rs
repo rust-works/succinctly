@@ -964,6 +964,7 @@ impl<'a> Reader<'a> {
     /// boundary whose source yields no byte at all (an empty trailing file,
     /// or content eaten wholesale by the BOM prefix) still cost jq that
     /// refill, so its reset fires before the EOF branch instead.
+    ///
     /// Walks `data` from `skip` (the bytes jq's BOM handling consumed, which are never scanned
     /// but are counted in every offset).
     fn run(&mut self, data: &[u8], skip: usize, boundaries: &[usize]) {

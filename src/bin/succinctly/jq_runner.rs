@@ -5111,25 +5111,21 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // #5674: `--seq` input joins them when the stream is clean (see
     // [`seq_plain_json_inputs`]): the records are then a plain JSON stream, and reading them as
     // one skips the per-record index the materializing route builds.
-    let mut seq_plain: Option<PreparedInputs> = if args.seq
-        && !args.raw_input
+    // Everything but `--seq` itself that the lazy route requires, named once so the probe below
+    // and the route's own gate cannot drift apart.
+    let lazy_route_open = !args.raw_input
         && args.input_dsv.is_none()
-        && !args.stream
-        && !args.stream_errors
-        && !args.validate
-        && !args.null_input
-        && !uses_input_builtins
-    {
-        seq_plain_json_inputs(&args)?
-    } else {
-        None
-    };
-    let can_use_lazy_path = !args.raw_input
-        && args.input_dsv.is_none()
-        && (!args.seq || seq_plain.is_some()) // seq input otherwise parses differently
         && !args.stream // the program reads tostream events, not documents (#4397)
         && !args.stream_errors // ... read by jq's own streaming parser (#5474)
         && !uses_input_builtins;
+    let mut seq_plain: Option<PreparedInputs> =
+        if args.seq && lazy_route_open && !args.validate && !args.null_input {
+            seq_plain_json_inputs(&args)?
+        } else {
+            None
+        };
+    // `--seq` input otherwise parses differently.
+    let can_use_lazy_path = lazy_route_open && (!args.seq || seq_plain.is_some());
 
     if can_use_lazy_path && !args.null_input {
         // Lazy path: read files as raw bytes and process directly
@@ -9022,7 +9018,6 @@ fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Ve
     if warned
         || walk.deferred_warning.is_some()
         || walk.slurp_position_lost
-        || !walk.faults.is_empty()
         || walk.values.is_empty()
     {
         return Err(raw);
