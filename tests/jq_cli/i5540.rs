@@ -1,0 +1,104 @@
+//! #5540: a fold step that stores its container loop variable by assignment or arithmetic hands
+//! on the element itself, as jq's `reduce` does, so a later `==` sees one handle
+//! (`jv_identical`) while `[nan] == [nan]` is `false`. #5516 left these steps out because they
+//! run in place on the owned accumulator. Every row's answer was captured from jq 1.7.1
+//! (`/usr/bin/jq`).
+
+use anyhow::Result;
+
+use crate::run_jq_null;
+
+fn answer(filter: &str) -> Result<String> {
+    let (stdout, code) = run_jq_null(filter, &["-c"])?;
+    assert_eq!(code, 0, "{filter}");
+    Ok(stdout)
+}
+
+/// The issue's four rows, and the other spellings of a step that stores the variable. Each was
+/// `false` here and `true` in jq.
+#[test]
+#[cfg_attr(
+    feature = "unshared-containers",
+    ignore = "holdout has no node identity or sharing (#5254)"
+)]
+fn test_fold_step_that_stores_its_loop_variable_keeps_the_element_5540() -> Result<()> {
+    for filter in [
+        // jq's own `def add: reduce .[] as $x (null; . + $x);`
+        "[[nan]] as $a | reduce $a[] as $v (null; . + $v) == $a[0]",
+        "[[nan]] as $a | reduce $a[] as $v ([]; . + [$v]) | .[0] == $a[0]",
+        "[nan] as $a | reduce $a as $v ({}; .x = $v) | .x == $a",
+        "[nan] as $a | reduce $a as $v ({}; .x |= $v) | .x == $a",
+        "[nan] as $a | reduce $a as $v ({}; .x //= $v) | .x == $a",
+        "[nan] as $a | reduce $a as $v ({}; .x += $v) | .x == $a",
+        "[nan] as $a | reduce $a as $v ({}; .[\"k\"] = $v) | .k == $a",
+        "[nan] as $a | reduce $a as $v ([]; . + [$v, 1]) | .[0] == $a",
+        "{\"a\":nan} as $a | reduce $a as $v ([]; . + [$v]) | .[0] == $a",
+        "[nan] as $a | [foreach $a as $v (null; . + $v; .)] | .[0] == $a",
+        "[nan] as $a | reduce $a as $v ({}; .x = $v | .y = $v) | .x == .y",
+        // The builtin, and an outer variable, were already `true`.
+        "[[nan]] as $a | $a | add == $a[0]",
+        "[nan] as $a | reduce 1 as $_ ({}; .x = $a) | .x == $a",
+    ] {
+        assert_eq!(answer(filter)?, "true\n", "{filter}");
+    }
+    Ok(())
+}
+
+/// A container built around the variable, or equal to it, is a new one: only the element itself
+/// is shared.
+#[test]
+fn test_fold_step_that_builds_a_fresh_container_stays_unequal_5540() -> Result<()> {
+    for filter in [
+        "[nan] as $a | reduce $a as $v ({}; .x = $v) | .x == [nan]",
+        "[[nan]] as $a | reduce $a[] as $v (null; . + $v) == [nan]",
+        "[[nan]] as $a | reduce $a[] as $v ([]; . + [$v]) | .[0] == [nan]",
+        "[[nan],[nan]] as $a | reduce $a[] as $v (null; . + $v) == [nan,nan]",
+    ] {
+        assert_eq!(answer(filter)?, "false\n", "{filter}");
+    }
+    Ok(())
+}
+
+/// Storing the element is one handle, not an alias: a later write to the accumulator copies, and
+/// the bound value is unchanged. The values are those of an unshared fold.
+#[test]
+fn test_writes_after_the_stored_element_do_not_reach_the_variable_5540() -> Result<()> {
+    for (filter, expected) in [
+        (
+            "[nan] as $a | reduce $a as $v ({}; .x = $v | .x[0] = 1) | $a",
+            "[null]\n",
+        ),
+        (
+            "[nan] as $a | reduce $a as $v ([]; . + [$v] | .[0][0] = 1) | $a",
+            "[null]\n",
+        ),
+        (
+            "[[1],[2]] as $a | reduce $a[] as $v (null; . + $v)",
+            "[1,2]\n",
+        ),
+        (
+            "[[1],[2]] as $a | reduce $a[] as $v ({}; .[$v|tostring] = $v)",
+            "{\"[1]\":[1],\"[2]\":[2]}\n",
+        ),
+        (
+            "[{\"a\":1},{\"b\":2}] as $a | reduce $a[] as $v ({}; . + $v)",
+            "{\"a\":1,\"b\":2}\n",
+        ),
+        (
+            "[[1],[2]] as $a | [reduce $a[] as $v ([]; . + [$v] | .[0] += [8]), $a]",
+            "[[[1,8,8],[2]],[[1],[2]]]\n",
+        ),
+        (
+            "{\"a\":[1]} as $o | [reduce range(2) as $i ($o; .a += [$i]), $o]",
+            "[{\"a\":[1,0,1]},{\"a\":[1]}]\n",
+        ),
+        // The embed table is live (`. as $d`), and the element is a node of the document.
+        (
+            "{\"u\":[{\"n\":\"x\",\"t\":[1]},{\"n\":\"y\",\"t\":[2]}]} | . as $d | [reduce $d.u[] as $r ({}; .[$r.n] = $r | .[$r.n].t += [0]), $d]",
+            "[{\"x\":{\"n\":\"x\",\"t\":[1,0]},\"y\":{\"n\":\"y\",\"t\":[2,0]}},{\"u\":[{\"n\":\"x\",\"t\":[1]},{\"n\":\"y\",\"t\":[2]}]}]\n",
+        ),
+    ] {
+        assert_eq!(answer(filter)?, expected, "{filter}");
+    }
+    Ok(())
+}

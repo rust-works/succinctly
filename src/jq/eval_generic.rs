@@ -42444,6 +42444,7 @@ mod tests {
                 node: cursor_a.node_id(),
                 document: cursor_a.document_token(),
             }),
+            fold_share: false,
         });
 
         let result = eval_single::<JqSemantics, _>(

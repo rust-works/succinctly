@@ -13198,7 +13198,12 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
         // container, so reading one sets `escaped`, and [`closed_expr_to_owned`]
         // declines the answer unless an enclosing node reduced it to a scalar.
         Expr::TrackedVar(marker) if S::TAG == EvalTag::Jq => {
-            *escaped = true;
+            // #5540: a fold's identity-sharing marker is the loop element's own storage,
+            // registered in no embed table, so storing it in the accumulator is one `Rc`
+            // clone, as in jq.
+            if !marker.fold_share {
+                *escaped = true;
+            }
             Some(marker.value.clone())
         }
         Expr::Paren(inner) => closed_expr_to_owned_at_depth::<S>(inner, depth + 1, escaped),
@@ -44650,6 +44655,7 @@ fn rewrite_markers<'e>(
                         value: marker.value.clone(),
                         origin,
                         node: marker.node.clone(),
+                        fold_share: false,
                     })
                 });
                 return Expr::TrackedVar(Rc::clone(rewritten));
@@ -77553,6 +77559,8 @@ struct LazyMarker<'a> {
     origin: Origin,
     node: Option<BindOrigin>,
     built: core::cell::OnceCell<Rc<Tracked>>,
+    /// The marker is a fold's identity-sharing splice ([`Tracked::fold_share`], #5540).
+    fold_share: bool,
     /// A deferred binding (#3856): every `$var` becomes this
     /// [`Expr::DeferredVar`] and `value`/`origin` are never read.
     deferred: Option<Rc<BindOrigin>>,
@@ -77565,8 +77573,15 @@ impl<'a> LazyMarker<'a> {
             origin,
             node,
             built: core::cell::OnceCell::new(),
+            fold_share: false,
             deferred: None,
         }
+    }
+
+    /// This marker as a fold's identity-sharing splice ([`Tracked::fold_share`], #5540).
+    fn fold_shared(mut self) -> Self {
+        self.fold_share = true;
+        self
     }
 
     /// What a `$var` becomes: the shared deferred marker, or the lazily built
@@ -77584,6 +77599,7 @@ impl<'a> LazyMarker<'a> {
                 value: self.value.clone(),
                 origin: self.origin.clone(),
                 node: self.node.clone(),
+                fold_share: self.fold_share,
             })
         }))
     }
@@ -78218,6 +78234,7 @@ pub(crate) fn owned_index_key_to_expr<S: EvalSemantics>(key: &OwnedValue) -> Exp
             value: key.clone(),
             origin: Origin::Untracked,
             node: None,
+            fold_share: false,
         })),
         _ => owned_to_expr(key),
     }
@@ -82521,6 +82538,11 @@ pub(crate) fn substitute_fold_step(
         result = Some(
             if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
                 let marker = LazyMarker::new(value, Origin::Untracked, None);
+                let marker = if marked == LoopVarSplice::Shared {
+                    marker.fold_shared()
+                } else {
+                    marker
+                };
                 substitute_var_with(current, name, value, Some(&marker), fields_alone)
             } else {
                 substitute_var(current, name, value)
@@ -82622,14 +82644,14 @@ pub(crate) fn fold_loop_variable_shares_identity<S: EvalSemantics>(
 /// `if` branch. jq hands the element itself on, so `[nan] as $a | reduce $a as $x
 /// (null; $x) == $a` is `true`, and a rebuilt literal is a new container.
 ///
-/// The positions read by value are left out, each for the reason
-/// [`loop_var_can_be_compared`] leaves an assignment out: an assignment and
-/// arithmetic, whose closed right-hand side is `owned_assign_step`'s and
-/// `owned_arith_accumulator_shape`'s in-place step, which a container marker
-/// makes decline (`. + [$a]`, `.x = $a` therefore still rebuild); an `if`'s
-/// condition, where one makes `owned_if_step` decline; and a comparison, `and`
-/// and `or`, whose answer is a boolean. (These are recorded as still different
-/// in `docs/compliance/jq/limitations.md`.)
+/// The positions read by value are left out: an `if`'s condition, where a marker
+/// makes `owned_if_step` decline; a comparison, `and` and `or`, whose answer is a
+/// boolean; and an assignment's path, a key. Arithmetic and an assignment's
+/// right-hand side count when they read the variable whole (`. + $a`, `. + [$a]`,
+/// `.x = $a`, #5540): their closed operand is `owned_assign_step`'s and
+/// `owned_arith_accumulator_shape`'s in-place step, which takes a fold's marker
+/// ([`Tracked::fold_share`]) as one `Rc` clone. A field read (`$r.score`) is a
+/// scalar spliced alone and does not count.
 ///
 /// A binder's source reaches the output only through the names it binds: `$r as
 /// $s | .[$s.name] = $s.score` and `reduce $r.tags[] as $t (.; .[$t] += 1)` hand
@@ -82707,12 +82729,29 @@ fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
             loop_var_can_reach_output(init, names)
                 || through_binder(input, patterns, &[Some(update), extract.as_deref()]),
         ),
-        Expr::Arithmetic { .. } | Expr::Compare { .. } | Expr::And(..) | Expr::Or(..) => {
-            visit(raises_a_name(e))
+        Expr::Compare { .. } | Expr::And(..) | Expr::Or(..) => visit(raises_a_name(e)),
+        // #5540: arithmetic and an assignment's right-hand side store the variable
+        // (`. + $a`, `. + [$a]`, `.x = $a`) when they read it whole; a field read
+        // (`$r.score`) is a scalar spliced alone, which carries no identity. An
+        // assignment's path is read by value, as a key.
+        Expr::Arithmetic { .. } => visit(raises_a_name(e) || reads_a_name_whole(e, names)),
+        Expr::Assign { value, .. }
+        | Expr::CompoundAssign { value, .. }
+        | Expr::AlternativeAssign { value, .. } => {
+            visit(raises_a_name(e) || reads_a_name_whole(value, names))
         }
+        Expr::Update { filter, .. } => visit(raises_a_name(e) || reads_a_name_whole(filter, names)),
         _ if is_assignment_expr(e) => visit(raises_a_name(e)),
         _ => Visit::Descend,
     })
+}
+
+/// Whether `expr` reads one of `names` anywhere but as the head of a field read
+/// (`$r.score`, [`var_reads`](super::deferred_bind::var_reads)).
+fn reads_a_name_whole(expr: &Expr, names: &[String]) -> bool {
+    names
+        .iter()
+        .any(|name| super::deferred_bind::var_reads(expr, name).whole)
 }
 
 /// Whether `expr` mentions one of `names` as a variable anywhere.
@@ -104621,6 +104660,7 @@ mod tests {
             value: value.clone(),
             origin: Origin::Untracked,
             node: None,
+            fold_share: false,
         }));
         let mut exprs = Vec::new();
         for src in [
@@ -104918,6 +104958,15 @@ mod tests {
             "foreach . as $a (0; 0; $a)",
             "foreach . as $a (0; .; $a.b)",
             "foreach . as $a (0; . + 1; [$a, .])",
+            // #5540: an assignment or arithmetic that stores the variable hands it on too;
+            // the in-place step takes the marker (`Tracked::fold_share`).
+            "reduce . as $a ([]; . + [$a])",
+            "reduce . as $a (.; .x = $a)",
+            "reduce . as $a ({}; .x = $a)",
+            "reduce . as $a ({}; .x |= $a)",
+            "reduce . as $a ({}; . + {x: $a})",
+            "reduce . as $a (null; . + $a)",
+            "reduce .[] as $r ({}; .[$r.name] = my_fn($r))",
             // ... through a binder, whose names then reach the output.
             "reduce . as $a (null; $a as $s | $s)",
             "reduce . as $a (null; $a as [$x] | $x)",
@@ -104942,8 +104991,6 @@ mod tests {
         for src in [
             // No comparison, builtin or call: nothing can observe the storage.
             "reduce . as $a (0; . + 1)",
-            "reduce . as $a ([]; . + [$a])",
-            "reduce . as $a (.; .x = $a)",
             // A comparison that never reads a loop variable.
             "reduce . as $a (0; . == 1)",
             "reduce . as $a (0; $b == $b)",
@@ -104951,13 +104998,8 @@ mod tests {
             // builtin there must not make `owned_assign_step` decline.
             "reduce .[] as $r ({}; .[$r.name] = $r.score)",
             "reduce .[] as $r ({}; .x[$r.name] += $r.score)",
-            "reduce .[] as $r ({}; .[$r.name] = my_fn($r))",
             "reduce .[] as $r ({}; .[$r.name] += ($r.score | floor))",
-            // #5516: an assignment and arithmetic keep the in-place step, and an `if`
-            // condition, `and` and `or` answer a boolean.
-            "reduce . as $a ({}; .x = $a)",
-            "reduce . as $a ({}; .x |= $a)",
-            "reduce . as $a ({}; . + {x: $a})",
+            // #5516: an `if` condition, `and` and `or` answer a boolean.
             "reduce . as $a (null; if $a then 1 else 0 end)",
             "reduce . as $a (null; $a and true)",
             "reduce . as $a (null; $a or false)",
@@ -152860,6 +152902,7 @@ mod tests {
             value: OwnedValue::Int(1),
             origin,
             node,
+            fold_share: false,
         };
         let here = BindOrigin::Node {
             node: 3,
@@ -152899,6 +152942,7 @@ mod tests {
             value: OwnedValue::Null,
             origin: at.clone(),
             node: None,
+            fold_share: false,
         };
         assert!(!marker_needs_demotion(&null_at, &elsewhere));
         // The positional origins are never demoted -- they are certified by
@@ -154235,6 +154279,7 @@ mod tests {
                 root: 11,
                 navigated: false,
             }),
+            fold_share: false,
         };
         let root = RootWitness::Node {
             node: 3,
@@ -154265,6 +154310,7 @@ mod tests {
             value: value.clone(),
             origin: Origin::Snapshot,
             node: None,
+            fold_share: false,
         };
         assert!(marker_needs_demotion(&bare, &RootWitness::Owned));
         let untracked = Tracked {
@@ -154290,6 +154336,7 @@ mod tests {
                 value: value.clone(),
                 origin,
                 node,
+                fold_share: false,
             }))
         };
         let origin_of = |e: &Expr| match e {
@@ -154305,6 +154352,7 @@ mod tests {
             value: value.clone(),
             origin: Origin::Untracked,
             node: Some(node(3, 9)),
+            fold_share: false,
         });
         assert!(marker_is_root(&same_marker, &root));
         let same = Expr::TrackedVar(same_marker);
@@ -154397,6 +154445,7 @@ mod tests {
                 root: 1,
                 navigated,
             }),
+            fold_share: false,
         };
         let chain = vec![(Rc::new(inner.clone()), OwnedValue::string("b"))];
         let frame_at = |components: &[&str]| {
@@ -154490,6 +154539,7 @@ mod tests {
             value: value.clone(),
             origin: Origin::Untracked,
             node: None,
+            fold_share: false,
         };
         let frame = Frame::enter(&Expr::Identity);
         assert!(frame.at.is_none(), "no position to certify against");
@@ -154521,6 +154571,7 @@ mod tests {
             value: OwnedValue::Int(1),
             origin: Origin::Untracked,
             node: None,
+            fold_share: false,
         };
         assert!(!marker_identical::<JqSemantics>(
             &one,
@@ -154534,6 +154585,7 @@ mod tests {
             value: OwnedValue::Null,
             origin: Origin::Untracked,
             node: None,
+            fold_share: false,
         };
         assert!(marker_identical::<JqSemantics>(
             &null,
@@ -154544,6 +154596,7 @@ mod tests {
             value: value.clone(),
             origin: Origin::Snapshot,
             node: None,
+            fold_share: false,
         };
         assert!(marker_identical::<JqSemantics>(&snapshot, &rebuilt, &frame));
         assert!(marker_identical::<YqSemantics>(&snapshot, &rebuilt, &frame));
@@ -154625,6 +154678,7 @@ mod tests {
             value: empty.clone(),
             origin: bound_at_root.clone(),
             node: None,
+            fold_share: false,
         };
         assert!(marker_identical::<JqSemantics>(&snapshot, &fresh, &at_root));
         assert!(!marker_identical::<JqSemantics>(
@@ -155242,6 +155296,7 @@ mod tests {
                 value: value.clone(),
                 origin,
                 node,
+                fold_share: false,
             }))
         };
         let origin_of = |e: &Expr| match e {
@@ -155254,6 +155309,7 @@ mod tests {
             value: value.clone(),
             origin: Origin::Untracked,
             node: Some(owned(5)),
+            fold_share: false,
         });
         assert!(marker_is_root(&same_marker, &root));
         let same = Expr::TrackedVar(same_marker);
@@ -155279,6 +155335,7 @@ mod tests {
                 root: 5,
                 navigated: false,
             }),
+            fold_share: false,
         });
         assert!(!marker_is_root(
             &exact_root,
@@ -155349,6 +155406,7 @@ mod tests {
                 value: value.clone(),
                 origin: Origin::Snapshot,
                 node,
+                fold_share: false,
             }))
         };
         let origin_of = |e: &Expr| match e {
@@ -155409,6 +155467,7 @@ mod tests {
                 node: 3,
                 document: 7,
             }),
+            fold_share: false,
         }));
         let own = RootWitness::Node {
             node: 3,
@@ -155468,6 +155527,7 @@ mod tests {
                 node: 3,
                 document: 7,
             }),
+            fold_share: false,
         }));
         let plain = Expr::Pipe(vec![untracked.clone(), Expr::Identity].into());
         assert!(matches!(
@@ -155515,6 +155575,7 @@ mod tests {
                 value: value.clone(),
                 origin: Origin::Snapshot,
                 node,
+                fold_share: false,
             }))
         };
         let node = BindOrigin::Node {
@@ -155569,6 +155630,7 @@ mod tests {
                 value: OwnedValue::Int(1),
                 origin: Origin::Snapshot,
                 node: Some(BindOrigin::Node { node, document: 7 }),
+                fold_share: false,
             }))
         };
         let raise = |node: usize| Expr::Error(Some(Box::new(marker(node))));
@@ -155657,6 +155719,7 @@ mod tests {
                 node: 3,
                 document: 7,
             }),
+            fold_share: false,
         })))));
         let named = RootWitness::Node {
             node: 3,
@@ -156915,6 +156978,7 @@ mod tests {
                 value: OwnedValue::Null,
                 origin,
                 node: None,
+                fold_share: false,
             }))
         };
         let source =
@@ -161207,10 +161271,10 @@ mod touched_edge_cases_2999 {
             .spawn(|| {
                 let json = br"{}";
                 let index = JsonIndex::build(json);
-                // A fold's `$x` read by arithmetic is still spliced back (`last(f)` shares the
-                // value since #5516, and answers as jq does).
-                let program = "def f(n): if n == 0 then 0 else [f(n-1)] end; \
-                               reduce f(400) as $x ([]; . + [$x]) | length";
+                // A fold accumulator re-indexed on every step is still refused (#5554); a loop
+                // variable handed on as itself is not (`last(f)` since #5516, `. + [$x]` since
+                // #5540), and answers as jq does.
+                let program = "reduce range(500) as $i (0; [.]) | length";
                 let expr = parse(program).expect("parse");
                 let result = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
                 let refused = matches!(
@@ -162738,6 +162802,7 @@ mod touched_edge_cases_2999 {
             value: OwnedValue::Null,
             origin: Origin::Untracked,
             node: None,
+            fold_share: false,
         }));
         let Expr::Builtin(Builtin::IsEmpty(operand)) =
             parse("isempty(foreach (1,2) as $i (1; try .a; .))").unwrap()

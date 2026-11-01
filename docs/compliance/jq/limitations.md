@@ -11904,17 +11904,15 @@ The shortcut fires only where `==` is handed two handles on one storage, so the 
   kind of marker when UPDATE or EXTRACT can compare it (#3896) or hand it out of the step
   ([#5516](https://github.com/rust-works/succinctly/issues/5516)).
   So `[nan] as $a | last($a) == $a` and `reduce $a as $v (null; [$v]) | .[0] == $a` are `true`, as in jq (`last(f)` is `reduce f as $x (null; $x)`).
+  A step that stores the variable by assignment or arithmetic does too ([#5540](https://github.com/rust-works/succinctly/issues/5540)): `reduce $a as $v ({}; .x = $v) | .x == $a`, `reduce $a as $v ([]; . + [$v]) | .[0] == $a` and jq's own spelling of `add`, `reduce $a[] as $v (null; . + $v)`, are `true`.
+  The marker those steps take is the element's own storage, registered in no embed table, so the in-place step stores it as one `Rc` clone (`Tracked::fold_share`); a marker an `as` binding made still makes the step decline (#3241, #4005).
 - **An `as` destructuring** ([#5539](https://github.com/rust-works/succinctly/issues/5539)).
   A container a pattern binds from a value that names no node of the document is spliced as the same kind of marker, wherever the body reads the name other than in an assignment's or arithmetic's operands.
   So `[[nan]] as $a | $a as [$x] | $x == $a[0]` is `true`, as in jq, and `$a as [$x] | $x == [nan]`, a fresh container, stays `false`.
-  A name stored or added in place (`.a = $x`, `. + $x`) keeps the literal, for the reason the fold row below gives.
+  A name stored or added in place (`.a = $x`, `. + $x`) keeps the literal: the in-place step declines the marker of an `as` binding (#3241, #4005), where a fold's loop variable is shared (above).
 
 Still different:
 
-- **A fold's loop variable stored by an assignment or by arithmetic.** `reduce $a as $v ({};
-  .x = $v) | .x == $a`, `reduce $a as $v ([]; . + [$v]) | .[0] == $a` and jq's own spelling of
-  `add`, `reduce $a[] as $v (null; . + $v)`, are `false` here and `true` in jq.
-  Those steps run in place on the owned accumulator (#3138, #3944), and a marker there makes them decline and copy the accumulator on every step (#4005), so they keep the rebuilt operand; the `add` builtin itself answers `true`.
 - **Slices.** `.[0:]` and any other full-range slice hand back the array itself, as jq's view
   does. An equal-bounds *partial* slice is a view onto the same storage in jq (pointer, offset
   and size all equal), so `.[0:1] == .[0:1]` is identical there; here each slice is a new
