@@ -4354,8 +4354,8 @@ impl Literal {
     }
 
     /// Create a string literal.
-    pub fn string(s: impl Into<String>) -> Self {
-        Self::String(SharableString::from(s.into()))
+    pub fn string(s: impl Into<SharableString>) -> Self {
+        Self::String(s.into())
     }
 
     /// Create a source-text-preserving number literal (#1062), parsing

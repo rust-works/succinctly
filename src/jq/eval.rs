@@ -29282,10 +29282,10 @@ fn combine_sub_gap<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     gap: &str,
     replacement: OwnedValue,
 ) -> Result<String, QueryResult<'a, W>> {
-    let replacement_text: Cow<'_, str> = match replacement {
-        OwnedValue::String(s) => Cow::Owned(s.into_string()),
-        replacement if S::TAG == EvalTag::Yq => yq_non_string_replacement_text::<S>(&replacement),
-        replacement => {
+    let replacement_text: Cow<'_, str> = match &replacement {
+        OwnedValue::String(s) => Cow::Borrowed(s.as_str()),
+        other if S::TAG == EvalTag::Yq => yq_non_string_replacement_text::<S>(other),
+        _ => {
             return match arith_add::<S>(OwnedValue::String(gap.to_string().into()), replacement) {
                 Ok(OwnedValue::String(combined)) => Ok(combined.into_string()),
                 Ok(other) => unreachable!(
@@ -152173,15 +152173,13 @@ mod tests {
         assert!(!names_nan_index(&Expr::Identity));
     }
 
-    /// #1025: `owned_to_expr` had no depth guard -- splices a
-    /// compound-assignment RHS or pattern-substitution value back into the
-    /// AST as literals, reachable from `.a += rhs_expr`/`.a //= rhs_expr`
-    /// and `as`-pattern variable substitution with no adversarial document
-    /// involved.
     /// A shared string spliced as a literal is one refcount, not a copy (#5713): the literal and
     /// the value read back from it are the same storage as the string it came from.
-    #[cfg(not(feature = "unshared-containers"))]
     #[test]
+    #[cfg_attr(
+        feature = "unshared-containers",
+        ignore = "holdout has no node identity or sharing (#5254)"
+    )]
     fn a_shared_string_is_spliced_and_read_back_without_a_copy_5713() {
         let mut shared = SharableString::from("h\u{e9}".repeat(2100));
         shared.promote();
@@ -152199,6 +152197,11 @@ mod tests {
         assert!(back.ptr_eq(&shared), "the read shares it again");
     }
 
+    /// #1025: `owned_to_expr` had no depth guard -- splices a
+    /// compound-assignment RHS or pattern-substitution value back into the
+    /// AST as literals, reachable from `.a += rhs_expr`/`.a //= rhs_expr`
+    /// and `as`-pattern variable substitution with no adversarial document
+    /// involved.
     #[test]
     fn owned_to_expr_panics_past_nesting_depth_limit_1025() {
         use crate::jq::value::MAX_VALUE_TREE_DEPTH;
