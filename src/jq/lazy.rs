@@ -996,7 +996,7 @@ mod tests {
     use super::*;
 
     /// #3000: `JqValue` is the *output* representation -- `jq_runner`'s
-    /// `to_jq_values` turns every materialized result into one through
+    /// the CLI's output path turned every materialized result into one through
     /// [`JqValue::try_from_owned`], which walks the `OwnedValue` tree
     /// object by object, freeing each source map and immediately allocating
     /// the `JqValue` one. The two maps' `entries` buffers are
@@ -1062,14 +1062,11 @@ mod tests {
         );
     }
 
-    /// #3009: `jq_runner.rs`'s `to_jq_values` no longer rebuilds an owned
-    /// result into a `JqValue` before printing it, so the depth rejection it
-    /// used to inherit from [`JqValue::try_from_owned`] now comes from
-    /// [`OwnedValue::check_tree_depth`] instead. The two must agree exactly
-    /// -- not merely "both reject deep trees" -- because
-    /// `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`
-    /// pins the *observable* result (empty stdout, exit 5, that message) of
-    /// whichever one fires.
+    /// #3009: [`OwnedValue::check_tree_depth`] stands in for the depth rejection
+    /// [`JqValue::try_from_owned`] gives while it rebuilds an owned result. The two must agree
+    /// exactly -- not merely "both reject deep trees" -- because the CLI's identity route still
+    /// reports a document-derived input through the first, with the message the second gives
+    /// (#5554 removed the same check for a value the program built, which jq's writers print).
     ///
     /// Swept either side of the ceiling in both container shapes: an
     /// off-by-one here is invisible until a 383-deep value is wrongly

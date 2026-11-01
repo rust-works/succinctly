@@ -26599,17 +26599,20 @@ fn test_nested_def_inside_recursive_def_matches_jq_1371() -> Result<()> {
 /// #1371 code-review regression: `generic_result_to_jq_values`'s three
 /// `GenericResult::Partial` arms (the already-produced outputs of a
 /// generator that later failed, #400/#494) used to convert via the
-/// panicking `JqValue::from_owned` instead of the checked `to_jq_values`
+/// panicking `JqValue::from_owned` instead of the checked conversion
 /// every other arm in that function uses. A value built by an ordinary
-/// recursive `def` can now exceed `MAX_VALUE_TREE_DEPTH` (384, #1371's
+/// recursive `def` can exceed `MAX_VALUE_TREE_DEPTH` (384, #1371's
 /// whole point), so an already-produced `Partial` output deeper than that
-/// used to panic the process instead of reporting a clean error -- exactly
+/// used to panic the process instead of reporting cleanly -- exactly
 /// the class of bug #1098 closed everywhere else. `deep(500)` builds a
 /// value past the ceiling as the first, successful half of a comma whose
-/// second half then genuinely errors; both must surface as ordinary
-/// diagnostics, never a panic.
+/// second half then genuinely errors.
+///
+/// #5554: the value is no longer refused at the output. jq prints it to its print depth (256 levels
+/// and the `<skipped: too deep>` marker, captured from jq 1.7.1), then reports `boom`; the
+/// regression this pins is that neither half panics.
 #[test]
-fn test_partial_result_over_depth_value_reports_cleanly_not_panic_1371() -> Result<()> {
+fn test_partial_result_over_depth_value_prints_cleanly_not_panic_1371() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
@@ -26618,12 +26621,19 @@ fn test_partial_result_over_depth_value_reports_cleanly_not_panic_1371() -> Resu
         ],
         Some("null"),
     )?;
-    assert_eq!(stdout.trim_end(), "");
+    assert_eq!(
+        stdout,
+        format!(
+            "{}<skipped: too deep>{}\n",
+            "[".repeat(257),
+            "]".repeat(257)
+        )
+    );
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
     assert!(stderr.contains("boom"), "stderr: {stderr:?}");
     assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
+        !stderr.contains("nesting depth exceeds limit"),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -26632,31 +26642,33 @@ fn test_partial_result_over_depth_value_reports_cleanly_not_panic_1371() -> Resu
 /// #3155: the eager `-n`/`--slurp`/DSV route's twin of the test above.
 ///
 /// Merging the owned writers put this route on `print_owned_json`, whose depth
-/// check fires only after 384 levels of `[` are on stdout -- confirmed live
+/// check fired only after 384 levels of `[` were on stdout -- confirmed live
 /// before the fix: `-nc '1, setpath([range(400)|0]; 1), 7'` wrote `1`, then an
 /// unterminated `[[[[...` fragment, then aborted at exit 1 and never printed
 /// `7`. Before the merge the same route panicked inside `format_json` at exit
-/// 101. Neither matches the lazy route, which reports the value, prints none
-/// of it, and carries on at exit 5.
+/// 101.
 ///
-/// `-S` is covered separately because it takes `format_json`, not the
-/// streaming printer, and is where the old panic still lived.
+/// #5554: the route now prints the value as jq does (256 levels, the marker, the closers) and
+/// carries on to `7` at exit 0, which is what this pins; the point that survives is that nothing
+/// panics and no fragment is left unterminated. `-S` is covered separately because it takes
+/// `format_json`, not the streaming printer.
 #[test]
-fn test_eager_over_depth_value_reports_cleanly_3155() -> Result<()> {
+fn test_eager_over_depth_value_prints_cleanly_3155() -> Result<()> {
     let filter = "1, setpath([range(400)|0]; 1), 7";
+    let want = format!(
+        "1\n{}<skipped: too deep>{}\n7\n",
+        "[".repeat(257),
+        "]".repeat(257)
+    );
     for (args, input) in [
         (vec!["-nc", filter], None),
         (vec!["-nc", "-S", filter], None),
         (vec!["-c", "--slurp", filter], Some("null")),
     ] {
         let (stdout, stderr, code) = run_jq_full(&args, input)?;
-        assert_eq!(stdout, "1\n7\n", "{args:?} stderr: {stderr:?}");
-        assert_eq!(code, 5, "{args:?} stderr: {stderr:?}");
+        assert_eq!(stdout, want, "{args:?} stderr: {stderr:?}");
+        assert_eq!(code, 0, "{args:?} stderr: {stderr:?}");
         assert!(!stderr.contains("panicked"), "{args:?} stderr: {stderr:?}");
-        assert!(
-            stderr.contains("jq: error") && stderr.contains("nesting depth exceeds limit of 384"),
-            "{args:?} stderr: {stderr:?}"
-        );
     }
     Ok(())
 }
@@ -26750,7 +26762,7 @@ fn test_complex_output_flags_over_depth_document_report_cleanly_not_panic_2850()
 
 /// #2627: the wildcard/ambient bridge used to reach `eval_generic.rs`'s
 /// `assert_nesting_depth` `panic!` on a too-deep *document* (not a constructed value, unlike
-/// #1371's `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`). It now
+/// #1371's `test_partial_result_over_depth_value_prints_cleanly_not_panic_1371`). It now
 /// reports a clean error instead, and that is what this pins. The probe has moved as the set of
 /// spellings that reach the bridge shrank: `true and true` (closed by #2173), `. and true`
 /// (#2692), `. as $x | $x` (#3856, which echoes now), and `. as $x | $x | tojson`, which reads
@@ -26943,23 +26955,29 @@ fn test_independent_sibling_calls_do_not_share_budget_1016() -> Result<()> {
 /// of counting calls.
 ///
 /// At 60 levels this builds a value 1,200 deep, past `MAX_VALUE_TREE_DEPTH`
-/// (384). Real jq prints it; succinctly refuses it -- but as a catchable
-/// error, which is the part this pins. Before the output path was routed
-/// through `JqValue::try_from_owned` (#1371) the same query took the process
-/// down with a panic, exit 101, which is precisely what #1098 forbids.
+/// (384). Before the output path was routed through `JqValue::try_from_owned`
+/// (#1371) the same query took the process down with a panic, exit 101, which
+/// is precisely what #1098 forbids; #5554 then made it print as jq does
+/// (256 levels and the `<skipped: too deep>` marker, captured from jq 1.7.1),
+/// and what this pins is that it neither panics nor refuses.
 #[test]
-fn test_thickly_wrapped_self_recursive_def_errors_without_aborting_1371() -> Result<()> {
+fn test_thickly_wrapped_self_recursive_def_prints_without_aborting_1371() -> Result<()> {
     let wrap_open = "[".repeat(20);
     let wrap_close = "]".repeat(20);
     let query = format!(
         "def deep(m): if m == 0 then . else {wrap_open}deep(m-1){wrap_close} end; deep(60)"
     );
     let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("null"))?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
-        "stderr: {stderr:?}"
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout,
+        format!(
+            "{}<skipped: too deep>{}\n",
+            "[".repeat(257),
+            "]".repeat(257)
+        )
     );
+    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
 
     // Shallow enough to stay inside the value-depth ceiling: the same shape
     // evaluates, and matches jq 1.7.1 byte for byte (confirmed live).
@@ -27494,7 +27512,7 @@ fn test_recursion_guard_reaches_path_routes_1371() -> Result<()> {
 ///
 /// Kept to a shape whose *value* stays shallow: a recursively built value is
 /// separately capped at `MAX_VALUE_TREE_DEPTH`, which
-/// `test_thickly_wrapped_self_recursive_def_errors_without_aborting_1371`
+/// `test_thickly_wrapped_self_recursive_def_prints_without_aborting_1371`
 /// covers.
 #[test]
 fn test_recursion_reaches_depth_far_past_expansion_era_1371() -> Result<()> {
@@ -37371,12 +37389,13 @@ fn test_deep_flat_assign_chain_exits_cleanly_not_stack_overflow_1429() -> Result
         ],
         None,
     )?;
-    // A refusal, not a crash: the pre-existing value-nesting guard, which the
-    // rebuilt 200,000-deep document trips once the walk itself has completed.
-    assert_ne!(code, 0, "out={out:?} err={err:?}");
+    // Not a crash: the walk completes and the rebuilt 200,000-deep document prints as jq prints a
+    // deep value, to its print depth (#5554; it was refused by the value-nesting guard before).
+    assert_eq!(code, 0, "out={out:?} err={err:?}");
     assert!(
-        err.contains("nesting depth exceeds limit"),
-        "expected the clean depth refusal, got err={err:?} code={code}"
+        out.contains("<skipped: too deep>") && !err.contains("panicked"),
+        "expected the print-depth marker, got out={:?} err={err:?}",
+        &out[out.len().saturating_sub(120)..]
     );
     Ok(())
 }
@@ -37435,10 +37454,12 @@ fn test_deep_flat_update_chain_exits_cleanly_not_stack_overflow_2115() -> Result
         ],
         None,
     )?;
-    assert_ne!(code, 0, "out={out:?} err={err:?}");
+    // #5554: the 1,000,000-deep document is printed to jq's print depth, not refused by the
+    // value-nesting guard; what the test holds is that nothing crashes on the way.
+    assert_eq!(code, 0, "out={out:?} err={err:?}");
     assert!(
-        err.contains("nesting depth exceeds limit of 384"),
-        "expected the clean depth refusal, got err={err:?} code={code}"
+        out.contains("<skipped: too deep>"),
+        "expected the print-depth marker, got err={err:?} code={code}"
     );
     assert!(
         !err.contains("stack overflow") && !err.contains("fatal runtime error"),
