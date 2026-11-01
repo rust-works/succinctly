@@ -19005,6 +19005,18 @@ fn has_pattern_alternatives(f: &Expr) -> bool {
     })
 }
 
+/// What `map_values(f)` reads of `f`'s result. jq's `.[] |= f` takes the first output and leaves
+/// (#5791), so a control `f` raises after producing one is never reached in jq mode; a result with
+/// no value yet keeps its control. yq raises it (`map_values((1, error("x")))`, v4.53.3).
+fn first_output_only<'a, W, S: EvalSemantics>(result: QueryResult<'a, W>) -> QueryResult<'a, W> {
+    match result {
+        QueryResult::Partial(vs, _) if S::TAG == EvalTag::Jq && !vs.is_empty() => {
+            QueryResult::ManyOwned(vs)
+        }
+        other => other,
+    }
+}
+
 fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
@@ -19051,7 +19063,9 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let rewrite =
                 |field_val: StandardJson<'a, W>| -> Result<Option<OwnedValue>, QueryResult<'a, W>> {
                     Ok(
-                        match eval_single::<W, S>(f, field_val, optional).materialize_cursor() {
+                        match first_output_only::<W, S>(
+                            eval_single::<W, S>(f, field_val, optional).materialize_cursor(),
+                        ) {
                             QueryResult::One(v) => match to_owned::<S, _>(&v) {
                                 Ok(owned) => Some(owned),
                                 Err(e) => return Err(suppress_or_raise(e, optional)),
@@ -19190,7 +19204,9 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // already resolved each element's position once internally
                 // to run its delimiter check, then discards it.
                 let elem = cursor.value();
-                match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
+                match first_output_only::<W, S>(
+                    eval_single::<W, S>(f, elem, optional).materialize_cursor(),
+                ) {
                     QueryResult::One(v) => match to_owned::<S, _>(&v) {
                         Ok(owned) => results.push(owned),
                         Err(e) => return suppress_or_raise(e, optional),
