@@ -56010,7 +56010,9 @@ mod tests {
         let (answer, constant) = reindexes(r#"try .[] catch "c""#);
         assert!(answer.contains(r#""\"c\"""#), "{answer}");
         assert_eq!(constant, 0);
-        assert!(reindexes(r#"try .[] catch ("c" | .)"#).1 > 0);
+        // #5675: `("c" | .)` never reads its input and is answered as a closed expression, so it
+        // pays no re-index either. The contrast is the same value behind stages no door answers.
+        assert!(reindexes(r#"try .[] catch ("c" | explode | implode)"#).1 > 0);
     }
 
     /// #3477: what the `length` bypass does not answer keeps the bridge, and
