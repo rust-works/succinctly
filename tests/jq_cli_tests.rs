@@ -26612,7 +26612,7 @@ fn test_nested_def_inside_recursive_def_matches_jq_1371() -> Result<()> {
 /// and the `<skipped: too deep>` marker, captured from jq 1.7.1), then reports `boom`; the
 /// regression this pins is that neither half panics.
 #[test]
-fn test_partial_result_over_depth_value_reports_cleanly_not_panic_1371() -> Result<()> {
+fn test_partial_result_over_depth_value_prints_cleanly_not_panic_1371() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
@@ -26653,7 +26653,7 @@ fn test_partial_result_over_depth_value_reports_cleanly_not_panic_1371() -> Resu
 /// panics and no fragment is left unterminated. `-S` is covered separately because it takes
 /// `format_json`, not the streaming printer.
 #[test]
-fn test_eager_over_depth_value_reports_cleanly_3155() -> Result<()> {
+fn test_eager_over_depth_value_prints_cleanly_3155() -> Result<()> {
     let filter = "1, setpath([range(400)|0]; 1), 7";
     let want = format!(
         "1\n{}<skipped: too deep>{}\n7\n",
@@ -26762,7 +26762,7 @@ fn test_complex_output_flags_over_depth_document_report_cleanly_not_panic_2850()
 
 /// #2627: the wildcard/ambient bridge used to reach `eval_generic.rs`'s
 /// `assert_nesting_depth` `panic!` on a too-deep *document* (not a constructed value, unlike
-/// #1371's `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`). It now
+/// #1371's `test_partial_result_over_depth_value_prints_cleanly_not_panic_1371`). It now
 /// reports a clean error instead, and that is what this pins. The probe has moved as the set of
 /// spellings that reach the bridge shrank: `true and true` (closed by #2173), `. and true`
 /// (#2692), `. as $x | $x` (#3856, which echoes now), and `. as $x | $x | tojson`, which reads
@@ -26961,7 +26961,7 @@ fn test_independent_sibling_calls_do_not_share_budget_1016() -> Result<()> {
 /// (256 levels and the `<skipped: too deep>` marker, captured from jq 1.7.1),
 /// and what this pins is that it neither panics nor refuses.
 #[test]
-fn test_thickly_wrapped_self_recursive_def_errors_without_aborting_1371() -> Result<()> {
+fn test_thickly_wrapped_self_recursive_def_prints_without_aborting_1371() -> Result<()> {
     let wrap_open = "[".repeat(20);
     let wrap_close = "]".repeat(20);
     let query = format!(
@@ -27512,7 +27512,7 @@ fn test_recursion_guard_reaches_path_routes_1371() -> Result<()> {
 ///
 /// Kept to a shape whose *value* stays shallow: a recursively built value is
 /// separately capped at `MAX_VALUE_TREE_DEPTH`, which
-/// `test_thickly_wrapped_self_recursive_def_errors_without_aborting_1371`
+/// `test_thickly_wrapped_self_recursive_def_prints_without_aborting_1371`
 /// covers.
 #[test]
 fn test_recursion_reaches_depth_far_past_expansion_era_1371() -> Result<()> {

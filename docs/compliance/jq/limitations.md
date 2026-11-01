@@ -7246,7 +7246,7 @@ Before #5497 a value 257 to 383 levels deep printed in full.
 **Building.** succinctly still refuses a value more than 384 levels deep (`MAX_VALUE_TREE_DEPTH`), where jq's only limit is its C stack (`[.,.] | sort` segfaults at 100,000 levels, and `length` at 1,000,000).
 Since [#5554](https://github.com/rust-works/succinctly/issues/5554) the output is not where it refuses: a value the program builds past 384 levels and hands to the CLI's output is printed as jq prints it, 256 levels and then the marker, in jq mode.
 `reduce range(1000) as $i ([]; .[0] = .)` and `1, setpath([range(400)|0]; 1), 7` print as in jq on every route and flag (compact, pretty, `--tab`/`--indent`, `-S`, `-C`, `-a`, `-r`, `--seq`, `-e`, `--slurp`).
-What still refuses is the program that builds or consumes such a value through the re-index bridge: a fold step with no owned door, `[., 1]` around it, or a comma after it.
+What still refuses is the program that builds or consumes such a value through the re-index bridge: a fold step with no owned door, `[., 1]` around it, a comma after it, `error`, `halt_error`, `debug`, `stderr` or `first`.
 `reduce`/`foreach` re-index their accumulator on every step and refuse one past 384 levels whatever the program does next.
 `tojson`/`tostring`/interpolation (and `@json`/`@text`) used to materialize a value past 384 levels before writing it, so the marker did not help them there.
 Since [#5554](https://github.com/rust-works/succinctly/issues/5554) a pipe whose first stage only renders its input as text answers a value the re-index bridge refused from the tree, with the marker where jq puts it: `def f(n): if n == 0 then 0 else [f(n-1)] end; f(1000) | tojson | length` is `533`, as in jq.
@@ -8098,7 +8098,7 @@ substitution-opaque node. Recursion now stops at the base case the program itsel
 evaluates. `sum_to(100)`, `sum_to(10000)`, `fib`, and #1381's chained-`def` repro all match
 jq 1.7.1 byte for byte.
 
-Three differences remain, all in the direction of erroring rather than aborting:
+Three differences remain, none of which aborts the process:
 
 - **A non-terminating `def` errors; jq dies.** `def deep: [deep]; deep` and `def f: [f, f];
   f` exceed `MAX_EVAL_FRAMES` and raise a catchable error, exit 5. Real jq aborts on both

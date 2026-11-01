@@ -3918,15 +3918,12 @@ impl OwnedValue {
     /// `check_tree_depth_matches_try_from_owned_3009` in `lazy.rs`, next to
     /// the function it has to agree with.
     ///
-    /// `jq_runner.rs`'s `to_jq_values` used to get this check for free from a
-    /// conversion it no longer performs, and the behaviour that conversion
-    /// was holding up is pinned:
-    /// `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`
-    /// requires an over-deep value built by an ordinary recursive `def` to
-    /// produce *nothing* on stdout (exit 5, clean diagnostic), which a
-    /// depth check inside the writer cannot deliver -- by the time it fires,
-    /// 384 levels of `[` have already been flushed. So the check has to stay
-    /// at this pipeline position even though the conversion did not.
+    /// `jq_runner.rs`'s output path used to run this before any byte was written, so an over-deep
+    /// value built by an ordinary recursive `def` produced *nothing* on stdout (exit 5, clean
+    /// diagnostic): a depth check inside the writer cannot deliver that, since by the time it fires
+    /// 384 levels of `[` have been flushed. #5554 retired that for the jq conventions, whose writers
+    /// stop at jq's print depth and print such a value as jq does; the identity route still calls
+    /// this on a document-derived input.
     ///
     /// Allocation-free, which is what makes it an acceptable stand-in: it
     /// walks the tree it was handed and builds nothing, where the conversion
@@ -3934,7 +3931,7 @@ impl OwnedValue {
     ///
     /// `#[doc(hidden)]`: `pub`, not `pub(crate)`, only because
     /// `src/bin/succinctly/*` compiles as a separate crate from this library
-    /// and needs to reach this from `to_jq_values` (`pub(crate)` cannot
+    /// and needs to reach this from the output path (`pub(crate)` cannot
     /// cross that boundary) -- not intended as public library API, the same
     /// reason [`crate::jq::eval_generic::path_context_pipe_streams_cursors`]
     /// is `#[doc(hidden)]` too.

@@ -127,3 +127,28 @@ fn a_shallow_value_and_a_deep_values_length_are_unchanged_5554() -> Result<()> {
     assert_eq!((stdout.as_str(), code), ("[[[[]]]]\n", 0));
     Ok(())
 }
+
+/// The writers other than compact: `--tab` indents each of the 257 levels, `-a` writes the same
+/// ASCII, and `--seq` prefixes the record separator. Captured from jq 1.7.1.
+#[test]
+fn a_deep_value_prints_under_the_pretty_ascii_and_seq_writers_5554() -> Result<()> {
+    let program = "reduce range(1000) as $i ([]; .[0] = .)";
+    let mut pretty: Vec<String> = (0..257).map(|d| format!("{}[", "\t".repeat(d))).collect();
+    pretty.push(format!("{}<skipped: too deep>", "\t".repeat(257)));
+    pretty.extend((0..257).rev().map(|d| format!("{}]", "\t".repeat(d))));
+    let pretty = format!("{}\n", pretty.join("\n"));
+    let compact = format!("{}\n", deep_array());
+    for (args, want) in [
+        (vec!["-n", "--tab", program], pretty),
+        (vec!["-nc", "-a", program], compact.clone()),
+        (vec!["-nc", "--seq", program], format!("\u{1e}{compact}")),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&args, None)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want.as_str(), 0),
+            "{args:?}: {stderr}"
+        );
+    }
+    Ok(())
+}

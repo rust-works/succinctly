@@ -10351,34 +10351,18 @@ fn evaluate_input_streaming_via(
     let mut write_err: Option<anyhow::Error> = None;
     // Hands one answer to the writer: `None` is nothing to write (genuinely no value, or a failure
     // this call already reported to `sink`, the same "report and keep going" contract the eager
-    // path's own arms followed, #355). Under a convention whose writer prints what lies past its
-    // print depth in full, the depth gate (#3009 review): `write_output_owned_value`'s printer
-    // would only refuse an over-deep value after 384 levels of `[` are already on stdout, so the
-    // value is refused here, before `on_value`, reported at exit 5 with the generator carrying on.
-    // jq's conventions have no such writer and no gate (#5554).
-    // #5554: a jq writer prints what lies below its print depth as `<skipped: too deep>`, so a value
-    // built past the tree ceiling is printed, not refused, as jq prints it. Only a convention whose
-    // writer prints it whole (yq's) still needs the refusal here.
-    let refuses_deep_values = !output_config.convention.skips_past_print_depth();
+    // path's own arms followed, #355). No depth gate: this runner writes under jq's conventions, whose
+    // writers print what lies past jq's print depth as `<skipped: too deep>`, so a value built past
+    // the tree ceiling is printed as jq prints it and never refused here (#5554).
     let mut deliver = |sink: &mut ErrorSink, item: Option<OwnedValue>| -> bool {
         match item {
             None => true,
-            Some(v) => match if refuses_deep_values {
-                v.check_tree_depth()
-            } else {
-                Ok(())
-            } {
+            Some(v) => match on_value(sink, v) {
+                Ok(keep_going) => keep_going,
                 Err(e) => {
-                    sink.report(DiagStyle::Jq, &e, &at.resolve());
-                    true
+                    write_err = Some(e);
+                    false
                 }
-                Ok(()) => match on_value(sink, v) {
-                    Ok(keep_going) => keep_going,
-                    Err(e) => {
-                        write_err = Some(e);
-                        false
-                    }
-                },
             },
         }
     };
@@ -11014,21 +10998,6 @@ fn evaluate_bytes_streaming<'a>(
     Ok(())
 }
 
-/// Convert GenericResult to JqValue, preserving lazy cursor references.
-///
-/// This is similar to query_result_to_jq_values but works with the
-/// cursor-aware GenericResult type from eval_generic.
-/// Admit one already-materialized value for output.
-///
-/// Nothing to check: this runner writes under jq's conventions only, whose writers stop at jq's
-/// print depth and print what lies below it as `<skipped: too deep>` (#5497), so a value built past
-/// `MAX_VALUE_TREE_DEPTH` (384) by an ordinary recursive `def` or `.[0] = .` is printed as jq prints
-/// it and never walked past 257 levels. It used to be refused here, before any byte was written, as
-/// the writer had no depth of its own (#1371, #3009); jq answers where that refused (#5554).
-fn to_jq_values<'a, W: Clone + AsRef<[u64]>>(value: OwnedValue) -> Vec<OutputItem<'a, W>> {
-    vec![OutputItem::Owned(value)]
-}
-
 /// How deep [`validate_cursor`] already counts a `LazySeq` element to be,
 /// restated against the canonical echo scan's ceiling (#3909).
 ///
@@ -11136,9 +11105,9 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         } => match effective_keys(&fields, collapse) {
             Ok(mut keys) => {
                 keys.sort();
-                to_jq_values(OwnedValue::Array(
+                vec![OutputItem::Owned(OwnedValue::Array(
                     keys.into_iter().map(OwnedValue::string).collect(),
-                ))
+                ))]
             }
             Err(e) => {
                 sink.report(DiagStyle::Jq, &e, at.get());
@@ -11271,8 +11240,8 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             sink.report(DiagStyle::Jq, &e, at.get());
             vec![]
         }
-        GenericResult::Owned(v) => to_jq_values(v),
-        GenericResult::ManyOwned(vs) => vs.into_iter().flat_map(|v| to_jq_values(v)).collect(),
+        GenericResult::Owned(v) => vec![OutputItem::Owned(v)],
+        GenericResult::ManyOwned(vs) => vs.into_iter().map(OutputItem::Owned).collect(),
         GenericResult::Break(label) => {
             sink.report_break(DiagStyle::Jq, &label, at.get());
             vec![]
@@ -11285,22 +11254,20 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             vec![]
         }
         // The outputs already produced no longer vanish behind the failure
-        // (#400, #494). Each one still goes through the checked
-        // `to_jq_values`, not `JqValue::from_owned` directly -- these can be
-        // built by an ordinary recursive `def` now (#1371), so an
-        // over-deep one must report cleanly rather than panic, same as
-        // every other arm in this function (see `to_jq_values`'s own doc).
+        // (#400, #494). Each one is admitted as it stands, not rebuilt through
+        // `JqValue::from_owned`, which panics past `MAX_VALUE_TREE_DEPTH`: these can be
+        // built by an ordinary recursive `def` now (#1371), and the writer bounds their depth.
         GenericResult::Partial(vs, jq::Control::Error(e)) => {
             sink.report(DiagStyle::Jq, &e, at.get());
-            vs.into_iter().flat_map(|v| to_jq_values(v)).collect()
+            vs.into_iter().map(OutputItem::Owned).collect()
         }
         GenericResult::Partial(vs, jq::Control::Break(label)) => {
             sink.report_break(DiagStyle::Jq, &label, at.get());
-            vs.into_iter().flat_map(|v| to_jq_values(v)).collect()
+            vs.into_iter().map(OutputItem::Owned).collect()
         }
         GenericResult::Partial(vs, jq::Control::Halt(code)) => {
             sink.request_halt(code);
-            vs.into_iter().flat_map(|v| to_jq_values(v)).collect()
+            vs.into_iter().map(OutputItem::Owned).collect()
         }
     }
 }
@@ -11921,8 +11888,7 @@ fn write_output_owned_value<Out: Write>(
         }
     } else if streams_colored(config) {
         // #5415: streamed through the colorizer, no whole-record `String`.
-        // `print_owned_json` cannot fail past its depth check, which the
-        // caller made before this was handed the value (`to_jq_values`).
+        // `print_owned_json` stops at jq's print depth by itself (#5497).
         let mut colored = output::JsonColorWriter::new(out, &config.color_scheme);
         if config.convention.preserves_source_values() {
             print_owned_json(
@@ -13405,11 +13371,9 @@ where
 /// Past [`succinctly::jq::JQ_MAX_PRINT_DEPTH`] levels it writes jq's
 /// `<skipped: too deep>` marker, as `print_json` does (#5497), so it never
 /// recurses past 257 levels. The depth `ensure!` it used to mirror from
-/// `print_json` went with that; it had been unreachable from the CLI anyway,
-/// since `to_jq_values` rejects an over-deep owned value through
-/// `OwnedValue::check_tree_depth` before any byte is written; #5554 retired that refusal for the
-/// jq conventions, so the marker is now what such a value prints.
-/// `print_owned_json_stops_at_print_depth_3009` pins it.
+/// `print_json` went with that. An over-deep owned value used to be refused before any byte was
+/// written; #5554 retired that refusal, so this marker is the only bound and is what such a value
+/// prints. `print_owned_json_stops_at_print_depth_3009` pins it.
 fn print_owned_json<F, Out>(
     out: &mut Out,
     value: &OwnedValue,
@@ -16884,17 +16848,11 @@ mod tests {
         }
     }
 
-    /// #3009: `print_owned_json`'s depth `ensure!` is unreachable from the
-    /// CLI -- an over-deep owned value is rejected through
-    /// `OwnedValue::check_tree_depth` before any byte is written, by
-    /// `to_jq_values` on the lazy route (which is what keeps
-    /// `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`
-    /// true) and by `evaluate_input_streaming` on the eager
-    /// `-n`/`--slurp`/DSV route (which keeps
-    /// `test_eager_over_depth_value_reports_cleanly_3155` true -- the gate the
-    /// writer merge first shipped without). It stays as a backstop against a future caller that skips that
-    /// gate, so it is covered here directly rather than left as an
-    /// unexercised line.
+    /// #3009, #5554: `print_owned_json` is the only bound on an over-deep owned value's output,
+    /// because the CLI no longer refuses one before writing: it stops at jq's print depth and writes
+    /// the marker, which is covered here directly (`test_partial_result_over_depth_value_reports_
+    /// cleanly_not_panic_1371` and `test_eager_over_depth_value_prints_cleanly_3155` pin the
+    /// CLI's side of it).
     /// `print_json` writes jq's marker past the print depth too, plain or, for a formatter that
     /// marks text about to be colored, as the kind's placeholder (#5497). A lazy value is never
     /// that deep from the CLI: a construction above a document materializes it, so the owned
