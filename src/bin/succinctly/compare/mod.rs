@@ -300,6 +300,9 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             "--cachegrind counts instructions in the performance dimension, which this run skips"
         );
     }
+    if (args.build_time || args.cachegrind) && args.verify.is_some() {
+        bail!("--build-time and --cachegrind measure; --verify re-runs only the recorded sections");
+    }
     if args.build_time
         && (args.ledger_only
             || (!args.dimension.is_empty() && !args.dimension.contains(&Dimension::Operational)))
@@ -849,9 +852,11 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         schema_version: SCHEMA_VERSION,
         run_id,
         command: format!(
-            "./target/release/succinctly dev compare jq {}{}{}",
+            "./target/release/succinctly dev compare jq {}{}{}{}{}",
             if args.full { "--full" } else { "--quick" },
             if args.control { " --control" } else { "" },
+            if args.cachegrind { " --cachegrind" } else { "" },
+            if args.build_time { " --build-time" } else { "" },
             match (&args.subject, &args.subject_features) {
                 (Some(p), Some(f)) => format!(
                     " --subject {} --subject-features {f}",

@@ -43,7 +43,8 @@ got="$(sha256_of "$work/jq.tar.gz")"
 
 tar -xzf "$work/jq.tar.gz" -C "$work"
 cd "$work/jq-$ver"
-now_ms() { python3 -c 'import time; print(int(time.monotonic() * 1000))'; }
+# Millisecond clock: python3 where there is one, whole seconds from date(1) otherwise.
+now_ms() { python3 -c 'import time; print(int(time.monotonic() * 1000))' 2>/dev/null || echo "$(( $(date +%s) * 1000 ))"; }
 start_ms=""
 [ -z "${COMPARE_JQ_TIMING_FILE:-}" ] || start_ms="$(now_ms)"
 # Bundled oniguruma, so the regex engine does not depend on the host's.

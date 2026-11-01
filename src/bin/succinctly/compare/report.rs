@@ -869,7 +869,9 @@ fn build_time_table(s: &mut String, cores: u32, o: &operational::Operational) {
         "**Build time from source** ({} cores; one run each, cold, not repeated: a figure that long \
          moves with the disk cache and machine load, so it is a magnitude and not a ratio to quote). \
          The jq tarball and the crates are downloaded before the clock starts; succinctly's \
-         rebuild is what one edit costs under the pinned fat-LTO profile.\n",
+         rebuild is what one edit costs under the pinned fat-LTO profile. jq's `make -j` and \
+         cargo both use every core, but the single-codegen-unit fat-LTO link is mostly serial, so \
+         the cores do not explain the gap between them.\n",
         cores
     );
     let _ = writeln!(s, "| Build | Seconds | Command |");
@@ -881,6 +883,9 @@ fn build_time_table(s: &mut String, cores: u32, o: &operational::Operational) {
         let _ = writeln!(s, "| {} | {secs} | `{}` |", b.what, b.command);
     }
     s.push('\n');
+    for b in o.build_times.iter().filter(|b| b.note.is_some()) {
+        let _ = writeln!(s, "- {}: {}", b.what, b.note.as_deref().unwrap_or_default());
+    }
 }
 
 fn operational_section(s: &mut String, r: &Results) {
@@ -985,11 +990,13 @@ mod tests {
                 what: "jq 1.7.1, cold".into(),
                 command: "make".into(),
                 seconds: Some(61.234),
+                note: None,
             },
             operational::BuildTime {
                 what: "succinctly, cold".into(),
                 command: "cargo build".into(),
                 seconds: None,
+                note: Some("exit status: 101: error: lock file needs to be updated".into()),
             },
         ]);
         build_time_table(&mut s, 18, &o);
