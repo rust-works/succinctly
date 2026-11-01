@@ -79228,7 +79228,9 @@ impl<'e> FoldOperand<'e> {
     fn inert_for(self, names: &[String]) -> Self {
         Self {
             inert: fold_operand_is_inert(self.hoisted, names)
-                && self.as_written.is_none_or(|e| fold_operand_is_inert(e, names)),
+                && self
+                    .as_written
+                    .map_or(true, |e| fold_operand_is_inert(e, names)),
             ..self
         }
     }
