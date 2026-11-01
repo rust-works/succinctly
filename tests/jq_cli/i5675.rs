@@ -320,3 +320,36 @@ fn test_raw_input_lines_are_read_where_they_are_5675() -> Result<()> {
     }
     Ok(())
 }
+
+/// `utf8bytelength` and `contains("lit")` of a `-R` line are answered from the line itself, not
+/// through the bridge. Every row is what jq 1.7.1 (`/usr/bin/jq`) prints for the same program and
+/// lines: multi-byte text, an empty line, an escape-looking line, a CRLF, a fan-out argument and a
+/// containment check that raises.
+const RAW_DOORS: &[(&[&str], &str, &str, &str, i32)] = &[
+    (&["-Rc", "utf8bytelength"], "héllo\n日本語\n\n😀x😀\na b\nUser12 z\n\"q\\s\n", "6\n9\n0\n9\n3\n8\n4\n", "", 0),
+    (&["-Rc", "[utf8bytelength,length]"], "héllo\n日本語\n\n😀x😀\na b\n", "[6,5]\n[9,3]\n[0,0]\n[9,3]\n[3,3]\n", "", 0),
+    (&["-Rc", "utf8bytelength"], "abc\r\nbb\r\n", "4\n3\n", "", 0),
+    (&["-Rc", "utf8bytelength"], "no newline", "10\n", "", 0),
+    (&["-Rc", "contains(\"User\")"], "héllo\n日本語\n\n😀x😀\na b\nUser12 z\n\"q\\s\n", "false\nfalse\nfalse\nfalse\nfalse\ntrue\nfalse\n", "", 0),
+    (&["-Rc", "contains(\"\")"], "héllo\n\nz\n", "true\ntrue\ntrue\n", "", 0),
+    (&["-Rc", "contains(\"本\")"], "日本語\nx\n", "true\nfalse\n", "", 0),
+    (&["-Rc", "contains(\"c\\r\")"], "abc\r\nbb\r\n", "true\nfalse\n", "", 0),
+    (&["-Rc", "select(contains(\"x\"))"], "héllo\n😀x😀\nxy\n", "\"😀x😀\"\n\"xy\"\n", "", 0),
+    (&["-Rc", "select(utf8bytelength>5)"], "héllo\n日本語\nabc\n", "\"héllo\"\n\"日本語\"\n", "", 0),
+    (&["-Rc", "contains(\"x\",\"y\")"], "x\n", "true\nfalse\n", "", 0),
+    (&["-Rc", "try contains(1) catch \"e\""], "a\nb\n", "\"e\"\n\"e\"\n", "", 0),
+    (&["-Rc", "contains(1)"], "héllo\n日本語\n", "", "jq: error (at <stdin>:1): string (\"héllo\") and number (1) cannot have their containment checked\njq: error (at <stdin>:2): string (\"日本語\") and number (1) cannot have their containment checked\n", 5),
+];
+
+#[test]
+fn test_raw_input_lines_answer_utf8bytelength_and_contains_where_they_are_5675() -> Result<()> {
+    for (args, stdin, stdout, stderr, status) in RAW_DOORS {
+        let (out, err, code) = run_jq_full(args, Some(stdin))?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            (*stdout, *stderr, *status),
+            "{args:?} over {stdin:?}"
+        );
+    }
+    Ok(())
+}

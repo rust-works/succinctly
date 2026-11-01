@@ -10502,8 +10502,8 @@ pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<Owned
     }
 }
 
-/// `length`, `startswith("lit")` and `endswith("lit")` of an owned string, answered from the
-/// string itself (#5691).
+/// `length`, `utf8bytelength`, `startswith("lit")`, `endswith("lit")` and `contains("lit")` of an
+/// owned string, answered from the string itself (#5691, #5675).
 ///
 /// The bridge writes the string out as JSON text (an escape pass over every byte), indexes that
 /// text and then decodes the string back out of it, validating its UTF-8 a second time, to take
@@ -10511,7 +10511,8 @@ pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<Owned
 /// where the answer needs one pass over the string or only its ends. An owned string is already
 /// valid UTF-8 and cannot raise, so the answer is the bridge's own: `length` counts as
 /// [`builtin_length`] does (`string_length`, per mode), and the two prefix/suffix tests are
-/// [`eval_owned_door_arm`]'s, which decline a non-literal or non-string argument and leave
+/// [`eval_owned_door_arm`]'s (as is `contains`'s substring test), which decline a non-literal or
+/// non-string argument and leave
 /// every raised error to the bridge.
 ///
 /// Every answer is a fresh integer or boolean, never a subvalue of `input`, so it is admitted
@@ -10531,9 +10532,11 @@ pub(crate) fn eval_owned_string_door<S: EvalSemantics>(
             _ => None,
         },
         Expr::Builtin(Builtin::Length) => Some(OwnedValue::Int(string_length::<S>(text))),
-        stage @ Expr::Builtin(Builtin::Startswith(_) | Builtin::Endswith(_)) => {
-            eval_owned_door_arm::<S>(stage, input)?.ok()
-        }
+        // The byte count, as `builtin_utf8bytelength` takes it (#5675).
+        Expr::Builtin(Builtin::Utf8ByteLength) => Some(OwnedValue::Int(text.len() as i64)),
+        stage @ Expr::Builtin(
+            Builtin::Startswith(_) | Builtin::Endswith(_) | Builtin::Contains(_),
+        ) => eval_owned_door_arm::<S>(stage, input)?.ok(),
         _ => None,
     }
 }
@@ -10726,6 +10729,14 @@ fn eval_owned_door_arm<S: EvalSemantics>(
         Builtin::Endswith(pattern) => match (input, literal(pattern)?) {
             (OwnedValue::String(s), OwnedValue::String(pattern)) => {
                 OwnedValue::Bool(s.ends_with(&*pattern))
+            }
+            _ => return None,
+        },
+        // A string in a string is a substring test in both modes (`owned_contains`); every other
+        // pair, and each container, keeps the bridge's kind check and its per-mode rules (#5675).
+        Builtin::Contains(pattern) => match (input, literal(pattern)?) {
+            (OwnedValue::String(s), OwnedValue::String(pattern)) => {
+                OwnedValue::Bool(s.contains(&*pattern))
             }
             _ => return None,
         },
@@ -79702,12 +79713,15 @@ fn eval_owned_pure_in<S: EvalSemantics>(
         // (#5712, `eval_owned_string_door`) a string is answered; everything
         // else declines, and the bridge keeps its diagnostics and its
         // per-mode rules.
-        Expr::Builtin(Builtin::Length) if door => eval_owned_count_door::<S>(expr, input).map(Ok),
+        Expr::Builtin(Builtin::Length | Builtin::Utf8ByteLength) if door => {
+            eval_owned_count_door::<S>(expr, input).map(Ok)
+        }
         Expr::Builtin(
             Builtin::Has(_)
             | Builtin::Keys
             | Builtin::Startswith(_)
             | Builtin::Endswith(_)
+            | Builtin::Contains(_)
             | Builtin::ToString,
         ) if door && position == ResultPosition::Operand => eval_owned_door_arm::<S>(expr, input),
         // `[e]` for a single-output pure `e` is the one-element array of
@@ -114290,8 +114304,8 @@ mod tests {
         }
     }
 
-    /// #5691: `eval_owned_string_door` answers `length`, `startswith("lit")` and `endswith("lit")` of an
-    /// owned string the way the reindex bridge does, in both modes, and declines every other input
+    /// #5691, #5675: `eval_owned_string_door` answers `length`, `utf8bytelength`, `startswith("lit")`,
+    /// `endswith("lit")` and `contains("lit")` of an owned string the way the reindex bridge does, in both modes, and declines every other input
     /// and shape (a non-string input, a non-literal or non-string argument, a stage that computes
     /// or fans out), leaving those and their errors to the bridge.
     #[test]
@@ -114317,6 +114331,13 @@ mod tests {
             "startswith(\"\")",
             ". | startswith(\"a\")",
             "endswith(\"\u{672c}\u{8a9e}\")",
+            "utf8bytelength",
+            ". | utf8bytelength",
+            "contains(\"z\")",
+            "contains(\"\")",
+            "contains(\"\u{672c}\")",
+            "contains(\"abc\")",
+            "contains(\"a\\nb\")",
         ];
         let mut answered = 0;
         for text in strings {
@@ -114353,7 +114374,13 @@ mod tests {
             OwnedValue::Int(3),
             OwnedValue::array_from(vec![OwnedValue::Int(1)]),
         ] {
-            for src in ["length", "startswith(\"a\")", "endswith(\"a\")"] {
+            for src in [
+                "length",
+                "utf8bytelength",
+                "startswith(\"a\")",
+                "endswith(\"a\")",
+                "contains(\"a\")",
+            ] {
                 assert!(
                     eval_owned_string_door::<JqSemantics>(&parse(src).unwrap(), &value).is_none(),
                     "{src:?} on {value:?}"
@@ -114368,6 +114395,12 @@ mod tests {
             "startswith(null)",
             "startswith(.)",
             "endswith(\"a\", \"b\")",
+            "contains(1)",
+            "contains(null)",
+            "contains([\"a\"])",
+            "contains(.)",
+            "contains(\"a\", \"b\")",
+            "utf8bytelength | . + 1",
             "length | . + 1",
             "length, length",
             ".[0:1] | length",
