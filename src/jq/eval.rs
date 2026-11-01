@@ -30085,7 +30085,7 @@ fn yq_split_ignores_arguments<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// anything else is the pieces between occurrences of `sep`. Rust's `str::split` differs on both
 /// edge cases -- one empty piece for an empty haystack, an empty piece at each end for an empty
 /// separator -- which is why this is not a bare call to it (#4260).
-fn split_string(s: &str, sep: &str) -> Vec<OwnedValue> {
+pub(crate) fn split_string(s: &str, sep: &str) -> Vec<OwnedValue> {
     if s.is_empty() {
         Vec::new()
     } else if sep.is_empty() {

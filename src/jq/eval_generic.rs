@@ -411,6 +411,33 @@ fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
     crate::jq::eval::unary_math_apply::<S>(builtin, n)
 }
 
+/// `split(SEP)` of a string value, for a literal string `SEP` (#5682): the pieces, read straight
+/// off the value's text. The bridge this stands in for materializes the string, writes it out as
+/// JSON text, indexes that, and has `builtin_split` read it back -- the writing alone cost as much
+/// as the split on a short line. `None`, leaving the caller on that bridge and its wording, for
+/// yq mode (kept off this path as a precaution: a string and a string separator split alike in both
+/// modes, and `null` and a number never reach here, so `tests/yq_cli/i5682.rs` pins the yq answers
+/// but cannot fail without the gate), a separator that is not a plain string literal (it may fan
+/// out, or fail), and a value with no decodable text.
+fn split_of_document_string<S: EvalSemantics, V: DocumentValue>(
+    builtin: &Builtin,
+    value: &V,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let Builtin::Split(sep) = builtin else {
+        return None;
+    };
+    let Expr::Literal(Literal::String(sep)) = strip_parens(sep) else {
+        return None;
+    };
+    let text = value.as_str()?;
+    Some(OwnedValue::array_from(crate::jq::eval::split_string(
+        &text, sep,
+    )))
+}
+
 /// Whether `expr` starts with a shape [`crate::jq::eval::eval_owned_fast_path`] can answer: the
 /// arithmetic accumulator, a comparison, `and`/`or`/`not`, a literal, navigation, `type` and
 /// `tostring`, or a pipe that starts with one (#5601). A necessary condition only, so the fast
@@ -36488,6 +36515,10 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             if let Some(answer) = unary_math_of_document_number::<S, V>(builtin, &value) {
                 return GenericResult::Owned(answer);
             }
+            // #5682: `-R 'split(",")'` splits every line.
+            if let Some(answer) = split_of_document_string::<S, V>(builtin, &value) {
+                return GenericResult::Owned(answer);
+            }
             let root = RootWitness::of(cursor.as_ref());
             let expr = builtin_expr(whole, builtin);
             let rooted = reindexed_root_for::<S, _>(&expr, cursor.as_ref());
@@ -41730,6 +41761,45 @@ mod tests {
         assert_eq!(reindexes("map(. * 1.5 | floor)", b"[1,2]"), 0);
         assert!(reindexes("map(nan | floor)", b"[1,2]") > 0);
         assert!(reindexes("map(floor)", b"[1e1000]") > 0);
+    }
+
+    /// #5682: `split` of a document string with a literal separator reads the pieces off the
+    /// string's text instead of bridging: the bridge materializes the string, writes it out as
+    /// JSON and indexes it again (`reindex_count` counts exactly that), once per string. The pin
+    /// must be able to fail: it does, with `split_of_document_string` returning `None`. A
+    /// separator that is not a string literal, a value that is not a string and yq mode keep the
+    /// bridge.
+    #[cfg(feature = "std")]
+    #[test]
+    fn split_of_a_document_string_is_not_bridged_5682() {
+        use crate::jq::value::reindex_count;
+
+        let json = br#"["a,b","","\u00e9,\ud83d\ude00,x",",,"]"#;
+        let run = |filter: &str, json: &[u8]| {
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::get();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            let text = result.iter().map(OwnedValue::to_json).collect::<Vec<_>>();
+            (text, reindex_count::get() - before)
+        };
+        let (answer, reindexes) = run(r#"map(split(","))"#, json);
+        assert_eq!(
+            answer,
+            [r#"[["a","b"],[],["é","😀","x"],["","",""]]"#],
+            "the pieces"
+        );
+        assert_eq!(reindexes, 0, "a literal separator bridged");
+        let (answer, reindexes) = run(r#"map(split(""))"#, br#"["ab"]"#);
+        assert_eq!(answer, [r#"[["a","b"]]"#]);
+        assert_eq!(reindexes, 0);
+        // Not answered here, so bridged as before: a computed separator, a value that is not a
+        // string, and the two-argument (regex) form.
+        assert!(run(r#"map(split("," + ""))"#, json).1 > 0);
+        assert!(run(r#"map(try split(",") catch 0)"#, b"[1]").1 > 0);
+        assert!(run(r#"map(split(",";null))"#, br#"["a,b"]"#).1 > 0);
     }
 
     /// #5670: a `del` of several static paths is answered on the owned value, as one path is
