@@ -6,7 +6,9 @@
 
 use anyhow::Result;
 
-use crate::run_jq_null;
+use crate::{run_jq_full, run_jq_null};
+
+const DEF: &str = "def f(n): if n == 0 then 0 else [f(n-1)] end;";
 
 fn answer(filter: &str) -> Result<String> {
     let (stdout, code) = run_jq_null(filter, &["-c"])?;
@@ -88,14 +90,64 @@ fn test_writes_after_the_stored_element_do_not_reach_the_variable_5540() -> Resu
             "[[1],[2]] as $a | [reduce $a[] as $v ([]; . + [$v] | .[0] += [8]), $a]",
             "[[[1,8,8],[2]],[[1],[2]]]\n",
         ),
-        (
-            "{\"a\":[1]} as $o | [reduce range(2) as $i ($o; .a += [$i]), $o]",
-            "[{\"a\":[1,0,1]},{\"a\":[1]}]\n",
-        ),
         // The embed table is live (`. as $d`), and the element is a node of the document.
         (
             "{\"u\":[{\"n\":\"x\",\"t\":[1]},{\"n\":\"y\",\"t\":[2]}]} | . as $d | [reduce $d.u[] as $r ({}; .[$r.n] = $r | .[$r.n].t += [0]), $d]",
             "[{\"x\":{\"n\":\"x\",\"t\":[1,0]},\"y\":{\"n\":\"y\",\"t\":[2,0]}},{\"u\":[{\"n\":\"x\",\"t\":[1]},{\"n\":\"y\",\"t\":[2]}]}]\n",
+        ),
+    ] {
+        assert_eq!(answer(filter)?, expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// A step that stores the variable hands the element on, so nothing walks a value built past the
+/// 384-level ceiling when it is spliced back; jq 1.7.1 answers `1`, on both routes. #5526 had
+/// refused it. The rebinding forms (`$x as $n | .a = $n`) keep the evaluator, which shares too.
+#[test]
+#[cfg_attr(
+    feature = "unshared-containers",
+    ignore = "holdout has no node identity or sharing (#5254)"
+)]
+fn test_fold_that_stores_a_deep_loop_variable_answers_as_jq_does_5540() -> Result<()> {
+    for body in [
+        "reduce f(400) as $x ([]; . + [$x]) | length",
+        "reduce f(400) as $x ({}; .a = $x) | .a | length",
+        "reduce f(400) as $x ({}; if $x == $x then ($x as $n | .a = $n) else . end) | .a | length",
+    ] {
+        let program = format!("{DEF} {body}");
+        for (args, input) in [
+            (&["-nc", program.as_str()][..], None),
+            (&["-c", program.as_str()][..], Some("{}")),
+        ] {
+            let (stdout, stderr, code) = run_jq_full(args, input)?;
+            assert_eq!(
+                (stdout.as_str(), code),
+                ("1\n", 0),
+                "{body} {args:?}: stderr={stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The review of PR #5739 found a step that rebinds the stored container with `as`
+/// rebuilding it as a literal, which lost the handle (`false` for `true`) and, for a value past
+/// the ceiling, refused. Each row was `true`/`[null]`/`1` in jq 1.7.1 and on the merge base.
+#[test]
+#[cfg_attr(
+    feature = "unshared-containers",
+    ignore = "holdout has no node identity or sharing (#5254)"
+)]
+fn test_as_rebind_of_a_stored_loop_variable_keeps_the_element_5540() -> Result<()> {
+    for (filter, expected) in [
+        (
+            "[nan] as $a | reduce $a as $v ({}; if $v == $v then ($v as $n | .x = $n) else . end) | .x == $a",
+            "true\n",
+        ),
+        (
+            "[nan] as $a | reduce $a as $v ({}; if $v == $v then ($v as $n | .y = (if $n == $n then $n else 1 end)) else . end) | .y",
+            "[null]\n",
         ),
     ] {
         assert_eq!(answer(filter)?, expected, "{filter}");

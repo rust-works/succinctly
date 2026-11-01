@@ -31,6 +31,8 @@ fn assert_refused(stdout: &str, stderr: &str, code: i32, what: &str) {
 fn test_built_value_past_the_tree_ceiling_is_a_refusal_not_a_panic_5526() -> Result<()> {
     for filter in [
         "reduce range(385) as $i (0; [.]) | length",
+        // A fold's `$x` read where no step hands it on is still spliced back.
+        "reduce f(400) as $x (0; if $x then 1 else 2 end)",
         "{\"a\":1} | .a += f(400) | length",
         "null | .a //= f(400) | length",
         "last(foreach range(385) as $i (0;[.])) | length",
@@ -102,25 +104,6 @@ fn test_last_of_a_deep_value_answers_as_jq_does_5516() -> Result<()> {
     // `last(f)` hands the value on instead of rebuilding it (#5516), so nothing walks it past the
     // ceiling; jq 1.7.1 answers `1`, on both routes.
     let program = format!("{DEF} last(f(400)) | length");
-    for (args, input) in [
-        (&["-nc", program.as_str()][..], None),
-        (&["-c", program.as_str()][..], Some("{}")),
-    ] {
-        let (stdout, stderr, code) = run_jq_full(args, input)?;
-        assert_eq!(
-            (stdout.as_str(), code),
-            ("1\n", 0),
-            "{args:?}: stderr={stderr:?}"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn test_fold_that_stores_a_deep_loop_variable_answers_as_jq_does_5540() -> Result<()> {
-    // A step that stores the variable hands the element on (#5540), so nothing walks it past the
-    // ceiling; jq 1.7.1 answers `1`, on both routes.
-    let program = format!("{DEF} reduce f(400) as $x ([]; . + [$x]) | length");
     for (args, input) in [
         (&["-nc", program.as_str()][..], None),
         (&["-c", program.as_str()][..], Some("{}")),
