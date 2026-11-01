@@ -20,7 +20,7 @@ use succinctly::jq::eval_generic::{SourcePath, SourcePathStep};
 use succinctly::jq::{self, Expr};
 use succinctly::yaml::{YamlCursor, YamlIndex, YamlValue};
 
-use super::{gathered_file_indices, GatheredSource};
+use super::{gathered_file_indices, resolve_run_input_format, GatheredSource};
 use crate::InputFormat;
 
 type Cursor<'a> = YamlCursor<'a, Vec<u64>>;
@@ -31,11 +31,15 @@ pub(super) fn enter(
     expr: &Expr,
     input_sources: &[GatheredSource],
     input_files: &[String],
+    input_format: InputFormat,
 ) -> Option<jq::SourcePositionsScope> {
     if !jq::walk::uses_position_builtins(expr) {
         return None;
     }
-    let file_indices = gathered_file_indices(input_files);
+    let file_indices = gathered_file_indices(
+        input_files,
+        resolve_run_input_format(input_format, input_files),
+    );
     let sources: Vec<Source> = input_sources
         .iter()
         .enumerate()

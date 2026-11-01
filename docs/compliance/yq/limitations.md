@@ -6489,7 +6489,7 @@ anchor: `.m.p |= . + 1` also changes `base.p` there); and `recurse(f; cond)` as 
 An input with no bytes at all reads no document in yq, and a run that read none evaluates once against one
 empty document (`printf '' | yq '.a'` is `null`, `.a = 1` is `a: 1`; `yq '.a' empty.yaml one.yaml` prints
 `1`; `yq '.a' e1.yaml e2.yaml`, both empty, prints `null` once with `file_index` 0). `succinctly yq` reads that
-document as an input of one line break (`null` for JSON), so it answers like yq wherever a line-break document
+document as an input of one line break, so it answers like yq wherever a line-break document
 does, and differs where one does not: `[.]`, `{"a": .}` and `. as $x | [$x]` print `- null` / `a: null` where yq
 prints a bare `-` / `a:`, `line` is `1` where yq has `0`, `@yaml` is `null` where yq's is empty, and `filename`
 is the file's name (`-` for stdin) where yq's is empty. Not covered: `--front-matter` on an empty input keeps its
@@ -6498,6 +6498,15 @@ empty stdin mixed with empty files reads nothing at all; and `-i` over several f
 document came from, where yq writes the result into the first file. A file holding only comments, `---` or a line
 break is a document and is read as one. A write to a comment-only file prints the write without the comment,
 where yq keeps it above (`# c` / `a: 1`).
+
+An empty or whitespace-only JSON input is the same document ([#5478](https://github.com/rust-works/succinctly/issues/5478)), not a JSON `null`.
+Space, tab, line feed and carriage return are whitespace to yq's JSON reader, so `printf '  \n' | yq -p=json .` prints a blank line and `[.]` prints `-`.
+Only a JSON output spells it `null`, and `-o auto` over a `.json` file is one.
+A whitespace-only JSON file among others reads no document, as an empty one does, and takes no `file_index`.
+A form feed, a vertical tab, a no-break space, a byte-order mark or a comment is not whitespace there, and is refused as before.
+Not matched: `--eval-all` over such an input prints `null` where yq prints a blank line, and `- null` where yq prints `-` for `[.]`.
+The owned-value route it takes for a JSON input has no spelling for an empty node, as over an empty YAML input with a filter beyond a bare navigation (`ea '[.]'`).
+A NUL byte alone is whitespace to yq (`printf '\0' | yq -p=json .` is a blank line) and is refused here.
 
 ### A write that changes the kind of a document root keeps its comments ([#4997](https://github.com/rust-works/succinctly/issues/4997))
 
