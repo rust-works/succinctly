@@ -516,9 +516,16 @@ pub fn parse_ir(log: &str) -> Option<u64> {
     })
 }
 
+/// The longest one tool's run under valgrind may take (~50x its native time).
+const IR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Instructions one run of `tool` executes, from `valgrind --tool=cachegrind`. The count is
-/// deterministic, so one run is enough. Cache simulation is off (only `Ir` is read), and the
-/// run has the timed runs' working directory and environment. `None` when valgrind fails.
+/// stable to within a hair (a hash seed or an allocator can move it by a few instructions), so
+/// one run is enough for a signal read at a 5% band. Cache simulation is off (only `Ir` is
+/// read), and the run has the timed runs' working directory and environment. A tool that exits
+/// non-zero still has a valid count (valgrind passes its status through, and the output gate
+/// has already matched it to the reference's), so the count is whatever the log holds: `None`
+/// when valgrind could not run the tool at all, or ran past [`IR_DEADLINE`].
 fn ir_once(valgrind: &Path, tool: &Tool, args: &[String], cwd: &Path) -> Option<u64> {
     let name: String = tool
         .name
@@ -528,7 +535,7 @@ fn ir_once(valgrind: &Path, tool: &Tool, args: &[String], cwd: &Path) -> Option<
     let dir = std::env::temp_dir().join(format!("compare-cg-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
     let log = dir.join("cg.log");
-    let status = Command::new(valgrind)
+    let mut child = Command::new(valgrind)
         .args(["--tool=cachegrind", "--cache-sim=no"])
         .arg(format!("--log-file={}", log.display()))
         .arg(format!(
@@ -544,12 +551,26 @@ fn ir_once(valgrind: &Path, tool: &Tool, args: &[String], cwd: &Path) -> Option<
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .ok()?;
+    let start = Instant::now();
+    let finished = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) if start.elapsed() < IR_DEADLINE => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
     let count = std::fs::read_to_string(&log)
         .ok()
         .and_then(|t| parse_ir(&t))
-        .filter(|_| status.success());
+        .filter(|_| finished);
     let _ = std::fs::remove_dir_all(&dir);
     count
 }
@@ -649,7 +670,10 @@ pub fn run_row_with(
             cv_pct: Some(cv_pct(&samples[i])),
             peak_rss_kb: rss,
             private_kb: private,
-            instructions: valgrind.and_then(|v| ir_once(v, t, &args, inputs_dir)),
+            // The secondary reference is not counted: nothing reports it.
+            instructions: valgrind
+                .filter(|_| i < 2)
+                .and_then(|v| ir_once(v, t, &args, inputs_dir)),
         });
     }
     row.noisy = row.tools.iter().any(|t| t.cv_pct.is_some_and(|c| c > 5.0));
@@ -881,15 +905,12 @@ mod tests {
             &format!("{log}\necho '==1== I   refs:      42' > \"$f\""),
         );
         assert_eq!(ir_once(&ok, &tool, &[], &dir), Some(42));
-        let bad = stub(
-            "bad",
+        // The traced program's own non-zero exit passes through valgrind; its count is valid.
+        let failing = stub(
+            "failing",
             &format!("{log}\necho '==1== I   refs:      42' > \"$f\"\nexit 1"),
         );
-        assert_eq!(
-            ir_once(&bad, &tool, &[], &dir),
-            None,
-            "a failed run's count is not trusted"
-        );
+        assert_eq!(ir_once(&failing, &tool, &[], &dir), Some(42));
         let silent = stub("silent", "exit 0");
         assert_eq!(ir_once(&silent, &tool, &[], &dir), None);
         assert_eq!(ir_once(&dir.join("absent"), &tool, &[], &dir), None);

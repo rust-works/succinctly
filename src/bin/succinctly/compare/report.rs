@@ -732,8 +732,10 @@ fn instruction_section(s: &mut String, timed: &[&PerfRow]) {
          machine load, but they are not time: a vectorised loop and a branchy one retire different numbers of \
          instructions per nanosecond, so the two signals can disagree in sign. A row is marked `differs` when \
          the instruction ratio and the wall-clock put succinctly on opposite sides of jq and both are more \
-         than 5% from a tie. Only the rows up to 1 MB are counted (cachegrind runs ~50x slower); a tool \
-         valgrind could not run reads `n/a`.\n"
+         than 5% from a tie. Only the rows up to 1 MB are counted (cachegrind runs ~50x slower), and only \
+         succinctly and jq 1.7.1; a tool valgrind could not run reads `n/a`. valgrind emulates a CPU \
+         without AVX-512, so on a machine that has it succinctly may take a different code path \
+         here than in the timed runs.\n"
     );
     let _ = writeln!(
         s,

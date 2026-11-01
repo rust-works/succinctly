@@ -260,18 +260,20 @@ fn secondary_tool(
     })
 }
 
-/// `valgrind` on `PATH`, for `--cachegrind`. It exists for Linux only (none for Apple Silicon),
-/// so elsewhere, or without it, the flag is an error and not a silent no-op (#5552).
+/// `valgrind`, for `--cachegrind`. It exists for Linux only (none for Apple Silicon), so
+/// elsewhere, or without it, the flag is an error and not a silent no-op (#5552).
 fn find_valgrind() -> Result<PathBuf> {
     if !cfg!(target_os = "linux") {
         bail!("--cachegrind needs valgrind, which runs on Linux only");
     }
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-        .map(|d| d.join("valgrind"))
-        .find(|p| p.is_file())
-        .context("--cachegrind needs `valgrind` on PATH (apt-get install valgrind)")
+    let works = Command::new("valgrind")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !works {
+        bail!("--cachegrind needs a working `valgrind` on PATH (apt-get install valgrind)");
+    }
+    Ok(PathBuf::from("valgrind"))
 }
 
 fn repo_root() -> Result<PathBuf> {
@@ -285,6 +287,14 @@ fn repo_root() -> Result<PathBuf> {
 }
 
 pub fn run(args: CompareJqArgs) -> Result<i32> {
+    if args.cachegrind
+        && (args.ledger_only
+            || (!args.dimension.is_empty() && !args.dimension.contains(&Dimension::Performance)))
+    {
+        bail!(
+            "--cachegrind counts instructions in the performance dimension, which this run skips"
+        );
+    }
     let valgrind = args.cachegrind.then(find_valgrind).transpose()?;
     let root = repo_root()?;
     let (manifest, manifest_sha256) = Manifest::load(&root)?;
@@ -717,6 +727,36 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                 observed.insert(format!("perf:{}@{}", row.query, row.input));
             }
             perf_rows.push(row);
+        }
+        if valgrind.is_some() {
+            // A valgrind that could not run the tools must not read as a clean run with no table.
+            let (mut wanted, mut got) = (0, 0);
+            for r in perf_rows
+                .iter()
+                .filter(|r| r.gate == perf::Gate::Match && r.tools.len() > 1)
+                .filter(|r| r.tier == "1mb" || r.tier == "startup")
+            {
+                wanted += 2;
+                got += r
+                    .tools
+                    .iter()
+                    .take(2)
+                    .filter(|t| t.instructions.is_some())
+                    .count();
+            }
+            if wanted > 0 && got == 0 {
+                bail!("--cachegrind: valgrind gave no instruction count for any of the {wanted} tool runs it was asked to count");
+            }
+            if got < wanted {
+                let note = format!(
+                    "{} of {wanted} cachegrind counts are missing (valgrind could not run that tool, or it ran over 300 s)",
+                    wanted - got
+                );
+                perf_note = Some(match perf_note {
+                    Some(n) => format!("{n}; {note}"),
+                    None => note,
+                });
+            }
         }
         dimensions.push(DimensionStatus {
             name: "D. Performance / E. Memory",
