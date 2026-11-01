@@ -164465,7 +164465,10 @@ mod fold_operand_inert_tests_5745 {
             ("[foreach range(3) as $i (0; .+$i)]", 3),
             ("[foreach range(3) as $i (0; .+1; .+$i)]", 3),
             ("[foreach range(3) as $i ((0,10); .+1)]", 0),
-            ("reduce range(3) as $i (0; reduce range(2) as $j (.; .+$i))", 3),
+            (
+                "reduce range(3) as $i (0; reduce range(2) as $j (.; .+$i))",
+                3,
+            ),
         ] {
             let (_, counted) = run_and_count_rebuilds(program);
             assert_eq!(counted, rebuilds, "{program}");
