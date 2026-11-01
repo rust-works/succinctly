@@ -4757,14 +4757,18 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         }
     };
 
-    // Build the $ARGS special variable
-    let args_value = build_args_var(&context);
+    // Build the $ARGS special variable, only for a program that names it (#5713): the object
+    // holds a copy of every named argument, and a `--rawfile` of 84 MB was copied into it for a
+    // program that never reads `$ARGS`. A binder of that name (`. as $ARGS`) counts as a mention,
+    // which only builds it when it is not needed.
+    let args_value = names_args_variable(&expr).then(|| build_args_var(&context));
 
     // Substitute variables from context into the expression. `$ARGS` goes first: each variable is
     // substituted in a pass over the whole expression, and a container named argument becomes a
     // literal tree as large as the value, so a variable substituted after one walks all of it
-    // (#5673). `$ARGS` is substituted for every run, whether or not the program mentions it.
-    let mut all_vars: Vec<(&str, &OwnedValue)> = vec![("ARGS", &args_value)];
+    // (#5673).
+    let mut all_vars: Vec<(&str, &OwnedValue)> = Vec::new();
+    all_vars.extend(args_value.as_ref().map(|value| ("ARGS", value)));
     all_vars.extend(context.named.iter().map(|(k, v)| (k.as_str(), v)));
 
     let mut expr = jq::substitute_vars(&expr, all_vars);
@@ -6212,6 +6216,15 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
     }
 
     Ok(context)
+}
+
+/// Whether `expr` has a `$ARGS` anywhere, a binder of that name included (#5713): the one
+/// question that decides whether the `$ARGS` object is built at all.
+fn names_args_variable(expr: &jq::Expr) -> bool {
+    jq::walk::any_subexpr(
+        expr,
+        &mut |e| matches!(e, jq::Expr::Var(name) if name == "ARGS"),
+    )
 }
 
 /// Build the $ARGS special variable containing named and positional args.
@@ -13432,6 +13445,42 @@ fn format_json_text(value: &OwnedValue, config: &OutputConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5713: `$ARGS` is built for a program that names it, wherever it stands, and only then.
+    #[test]
+    fn args_object_is_built_only_for_a_program_that_names_it_5713() {
+        for named in [
+            "$ARGS",
+            "$ARGS.named.a",
+            "[$ARGS.positional[]]",
+            "1 | . + ($ARGS.named.a | length)",
+            "def f: $ARGS; f",
+            "def f($x): $x; f($ARGS)",
+            "reduce range(2) as $i (0; . + ($ARGS.named.a | length))",
+            "\"v=\\($ARGS.positional)\"",
+            "try error($ARGS) catch .",
+            ". as $ARGS | $ARGS",
+        ] {
+            let expr = jq::parse(named).unwrap_or_else(|e| panic!("{named:?}: {e:?}"));
+            assert!(names_args_variable(&expr), "{named:?} names $ARGS");
+        }
+        for unnamed in [
+            ".",
+            "$a",
+            "$a | length",
+            "$ENV.PATH",
+            ".ARGS",
+            "\"$ARGS\"",
+            "{ARGS: 1}",
+            "def f($x): $x; f($a)",
+        ] {
+            let expr = jq::parse(unnamed).unwrap_or_else(|e| panic!("{unnamed:?}: {e:?}"));
+            assert!(
+                !names_args_variable(&expr),
+                "{unnamed:?} does not name $ARGS"
+            );
+        }
+    }
 
     /// #5674: a `--seq` stream is read as plain JSON only when nothing about it is unusual, and
     /// is then the same text with each RS blanked (so every offset and line stays put); every
