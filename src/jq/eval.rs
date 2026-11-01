@@ -31912,6 +31912,8 @@ pub(crate) fn index_one_owned_read_of<S: EvalSemantics>(
         if let OwnedValue::Object(map) = target {
             let absent = match key {
                 OwnedValue::String(s) => map.get(s.as_str()).is_none(),
+                // #5460: a mapping holds no key that is itself a container.
+                OwnedValue::Object(_) | OwnedValue::Array(_) => true,
                 _ => yq_mapping_index_text::<S>(key)
                     .is_some_and(|text| map.get(text.as_str()).is_none()),
             };
