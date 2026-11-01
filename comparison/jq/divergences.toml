@@ -191,27 +191,27 @@ reason = "`strftime(\"%x\")` under `LC_ALL=en_US.UTF-8` is `03/05/2015` in jq 1.
 
 [[divergence]]
 id = "cli:locale-strptime-ampm-c"
-category = "to-triage"
+category = "host-dependent"
 issue = "#5753"
-reason = "`\"11:30 PM\" | strptime(\"%I:%M %p\")`: the weekday (element 6) is 6 in jq 1.7.1 and 0 in succinctly. jq derives it from the unset date fields (`1900-01-00`) with its own formula; `\"12\"|strptime(\"%H\")` and `\"3\"|strptime(\"%d\")` differ the same way."
+reason = "`\"11:30 PM\" | strptime(\"%I:%M %p\")`: the weekday (element 6) is 6 in jq 1.7.1 on macOS and 0 in succinctly. It is the platform libc's weekday and yearday of a format that sets no date (docs/compliance/jq/limitations.md, \"`strptime` weekday and yearday of a format that sets no date\", #5340, #5383): jq's macOS build derives it from the unset date (`1900-01-00`) with its own `set_tm_wday()`, glibc leaves jq's `8`/`367` sentinels, and succinctly answers the date's own weekday. `\"12\"|strptime(\"%H\")` and `\"3\"|strptime(\"%d\")` differ the same way."
 
 [[divergence]]
 id = "cli:locale-strptime-ampm-en-us"
-category = "to-triage"
+category = "host-dependent"
 issue = "#5753"
-reason = "Same weekday difference as `locale-strptime-ampm-c`, under `en_US.UTF-8`."
+reason = "Same platform-dependent weekday as `locale-strptime-ampm-c`, under `en_US.UTF-8`."
 
 [[divergence]]
 id = "cli:locale-strptime-ampm-de-de"
-category = "to-triage"
+category = "host-dependent"
 issue = "#5753"
-reason = "Same weekday difference as `locale-strptime-ampm-c`, under `de_DE.UTF-8` (a host without that locale falls back to `C`)."
+reason = "Same platform-dependent weekday as `locale-strptime-ampm-c`, under `de_DE.UTF-8` (a host without that locale falls back to `C`)."
 
 [[divergence]]
 id = "cli:locale-strptime-ampm-tr-tr"
-category = "to-triage"
+category = "host-dependent"
 issue = "#5753"
-reason = "Same weekday difference as `locale-strptime-ampm-c`, under `tr_TR.UTF-8` (a host without that locale falls back to `C`)."
+reason = "Same platform-dependent weekday as `locale-strptime-ampm-c`, under `tr_TR.UTF-8` (a host without that locale falls back to `C`)."
 
 [[divergence]]
 id = "cli:locale-strptime-tr-c"
