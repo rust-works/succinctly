@@ -155,8 +155,9 @@ mod tests {
     #[test]
     fn an_optional_fifth_column_sets_environment_variables() {
         let p = |line: &str| parse_probes(line).unwrap().remove(0).env;
-        assert!(p("a\tb\t[]\t-\n").is_empty());
-        assert!(p("a\tb\t[]\t-\t-\n").is_empty());
+        let none = Vec::<(String, String)>::new();
+        assert_eq!(p("a\tb\t[]\t-\n"), none);
+        assert_eq!(p("a\tb\t[]\t-\t-\n"), none);
         assert_eq!(
             p("a\tb\t[]\t-\t{\"LC_ALL\":\"de_DE.UTF-8\",\"JQ_COLORS\":\"1\"}\n"),
             [
