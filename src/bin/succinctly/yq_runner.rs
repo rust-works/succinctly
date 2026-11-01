@@ -10799,13 +10799,11 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // already answers one as the nodes its branches name (`eval_comma_generic`, #1361), and the
     // DOM route they used to take rebuilt each as an `IndexMap`, collapsing a duplicate mapping
     // key that yq prints (`., .b` on `a: 1 / a: 2`) and raising on a colliding undecodable key
-    // that `.` echoes (#2645). Stdout only, uncolored and not NUL-terminated: the in-place and slurp gates
-    // keep theirs, and `-C`'s buffered colorizer and `-0`'s lazy separator are tuned to the DOM route.
-    let comma_branches = top_level_comma_branches(&program.expr).filter(|branches| {
-        terminator_from_config(&output_config) != Terminator::Nul
-            && !output_config.use_color
-            && branches.iter().all(|branch| can_use_m2_streaming(branch))
-    });
+    // that `.` echoes (#2645). Stdout only: the in-place and slurp gates keep theirs. `-C` (#808,
+    // `ColorSink::Colored`) and `-0` (`NulCheckedSink`, one result at a time) stream like any other
+    // query, so neither flag sends a comma back to the DOM route (#5414).
+    let comma_branches = top_level_comma_branches(&program.expr)
+        .filter(|branches| branches.iter().all(|branch| can_use_m2_streaming(branch)));
     let is_m2_streamable_comma = comma_branches.is_some();
     // What each `stream_cursor!` evaluates and streams, in order: the branches of a streamed
     // comma, each as a query of its own (a node keeps what its cursor carries), else the query.
