@@ -18,6 +18,11 @@
 # here too: this leg (about 270 s of test CPU) and `cli-gated` (about 970 s) now carry
 # similar amounts. A `yq_cli_tests` test cannot be listed: `run` lists and runs one target.
 #
+# All of `yq_cli_tests` (104 s of macOS test time, #5705) runs in that leg too, but not from
+# here: ci.yml runs `cargo test --features cli --test yq_cli_tests` after `run`, with no skip
+# list, since none of the names below is a yq test. scripts/test_deep_recursion_tests.py pins
+# that it runs there once and nowhere else.
+#
 # The same two stack tests are also `#[ignore]`d under `cfg(coverage)` (the `cargo llvm-cov`
 # runs, CI's `Coverage` job included), by `#[cfg_attr(coverage, ignore = ...)]` on the
 # tests themselves, because they cover no line the rest of the suite does not

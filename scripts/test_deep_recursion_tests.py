@@ -237,6 +237,8 @@ class CiWiringTests(unittest.TestCase):
                 self.assertEqual(len(commands), 1, commands)
                 self.assertIn(" --test jq_cli_tests ", commands[0])
                 self.assertTrue(commands[0].endswith(" -- $skip"), commands[0])
+                # yq_cli_tests moved to the other leg (#5705): left here it would run twice.
+                self.assertNotIn(" --test yq_cli_tests ", commands[0])
 
                 deep = legs["deep-recursion"]
                 self.assertEqual(deep.count("scripts/deep-recursion-tests.sh run"), 1)
@@ -245,6 +247,23 @@ class CiWiringTests(unittest.TestCase):
                     deep.count("python3 scripts/test_deep_recursion_tests.py"), 1
                 )
                 self.assertIn("buildCli: true", deep)
+
+    def test_yq_cli_tests_runs_once_per_platform_in_deep_recursion(self):
+        # #5705: `cli-gated` was the macOS critical path and yq_cli_tests was ~30% of its test
+        # time, so it runs in the `deep-recursion` leg, which already builds the CLI. It takes
+        # no skip list (the listed names are all jq_cli_tests') and no `--exact` filter, so the
+        # whole target runs.
+        for job in MATRIX_JOBS:
+            with self.subTest(job=job):
+                legs = matrix_legs(job)
+                running = [name for name, leg in legs.items() if "yq_cli_tests" in leg]
+                self.assertEqual(running, ["deep-recursion"])
+                commands = [
+                    line.strip()
+                    for line in legs["deep-recursion"].split("\n")
+                    if "yq_cli_tests" in line
+                ]
+                self.assertEqual(commands, ["cargo test --features cli --test yq_cli_tests"])
 
     def test_no_other_leg_runs_jq_cli_tests_with_the_two_tests_twice(self):
         # A third place running `--test jq_cli_tests` unskipped would run them twice.
