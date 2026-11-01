@@ -1970,8 +1970,8 @@ fn test_jq_number_spellings_reject_set_2877() -> Result<()> {
     // `[-nope]` do today and did before #2877 (`-` was never this issue's
     // arm). That is #3035's shape (a scalar's trailing bytes go unread),
     // not a word gate of this issue's, so only the identity half is pinned.
-    // `+0x10` is the same shape: `+X` is `X`, and `[0x10] | map(.)` is `[0]`
-    // today for the same reason.
+    // `+0x10` is the same shape: `+X` is `X`. A number with bytes glued on
+    // is refused wherever it is read since #5654 (`i5654_digit_glued.rs`).
     for input in ["[1nan]", "[-snan.]", "[-nope]", "[+0x10]", "[0x10]"] {
         let (stdout, _, code) = run_jq_full(&["-c", "."], Some(input))?;
         assert_eq!(code, 5, "{input}: {stdout:?}");
