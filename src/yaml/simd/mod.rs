@@ -217,7 +217,7 @@ pub fn count_leading_spaces(input: &[u8], start: usize) -> usize {
 ///
 /// Currently only available on x86_64. Returns None on other platforms.
 ///
-/// `HAS_CR` gates the `\r` mask; see [`x86::classify_yaml_chars`] for why the
+/// `HAS_CR` gates the `\r` mask; see `x86::classify_yaml_chars` for why the
 /// const has to reach this far down (#340).
 #[inline]
 #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]

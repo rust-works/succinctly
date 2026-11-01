@@ -116,7 +116,7 @@ impl YamlCharClass {
     /// compiled on x86_64.) The two disagreed until #185 — this one omitted
     /// `\r` before #324, and the broadword one added `spaces`.
     ///
-    /// `HAS_CR` must be the one [`classify_yaml_chars`] was called with. Passing
+    /// `HAS_CR` must be the one `classify_yaml_chars` was called with. Passing
     /// `false` drops the `\r` arm at compile time, which is sound precisely
     /// because that classifier left `carriage_returns` zero; the const is what
     /// lets the optimizer *know* it, across a `#[target_feature]` call it cannot
