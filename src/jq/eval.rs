@@ -77206,8 +77206,9 @@ where
 /// as a literal, whose fast path the folds' `. + $t` recognisers take first.
 const SHARED_STRING_MIN_BYTES: usize = 4096;
 
-/// [`substitute_vars`] for `jq` mode, where a long string value is spliced as a shared
-/// [`Origin::Untracked`] marker (#5713) -- what an `. as $x` bind of a non-document value
+/// [`substitute_vars`] for `jq` mode, splicing a long string as a shared marker (#5713).
+///
+/// The marker is an `Origin::Untracked` one -- what an `. as $x` bind of a non-document value
 /// already is -- instead of a `Literal::String` copy that is cloned again at each evaluation.
 ///
 /// Strings only. A container spliced this way was found unsafe (#5690: a dynamic path target over
