@@ -4627,13 +4627,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // Not freed, see the doc comment: giving back a 100 MB `--slurpfile` (millions of small
     // allocations) to a process about to end was a quarter of the run (#5673).
     let mut context = std::mem::ManuallyDrop::new(context);
-    // A named string is shared once here, so every `$s` read, the `$ARGS` object and a `def`
-    // parameter take a refcount instead of a copy of the whole string (#5713).
-    for value in context.named.values_mut() {
-        if let OwnedValue::String(s) = value {
-            s.promote();
-        }
-    }
+    share_named_strings(&mut context);
 
     // Get the filter expression. An unreadable `-f`/`--from-file` file is
     // jq's own usage error (exit 2), so it gets the same two-arm treatment
@@ -4765,7 +4759,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     };
 
     // Build the $ARGS special variable, only for a program that uses it (#5713): the object
-    // holds a copy of every named argument, and a `--rawfile` of 84 MB was copied into it for a
+    // holds a handle on every named argument, and a `--rawfile` of 84 MB was copied into it for a
     // program that never reads `$ARGS`.
     let args_value = args_var_if_named(&expr, &context);
 
@@ -6257,6 +6251,21 @@ fn names_args_variable(expr: &jq::Expr) -> bool {
         } => builtin_fallback.is_some(),
         _ => false,
     })
+}
+
+/// Promote each top-level named string (`--arg`, `--rawfile`, a string `--argjson`) to shared
+/// storage once (#5713), so a `$s` read, a `def` parameter and the `$ARGS` object take a
+/// refcount instead of a copy of the whole string.
+///
+/// Called before `args_var_if_named` and `substitute_vars`, which clone from `context.named`.
+/// Only a top-level string is promoted: a string inside a `--slurpfile` or `--argjson`
+/// container, a data module's binding and `succinctly yq`'s named strings keep their copies.
+fn share_named_strings(context: &mut EvalContext) {
+    for value in context.named.values_mut() {
+        if let OwnedValue::String(s) = value {
+            s.promote();
+        }
+    }
 }
 
 /// The `$ARGS` object, built only when [`names_args_variable`] says the program may read it.
@@ -13841,6 +13850,32 @@ mod tests {
 
         fn names(context: &EvalContext) -> Vec<&str> {
             context.named.keys().map(String::as_str).collect()
+        }
+
+        /// Every top-level named string is shared once (#5713), and nothing else is: a clone of
+        /// `context.named` (what `$ARGS` and `substitute_vars` take) then shares storage with it,
+        /// which a program reading an 84 MB `--rawfile` twenty times depends on. Deleting the
+        /// loop, or running it after those clones, fails this.
+        #[test]
+        #[cfg_attr(
+            feature = "unshared-containers",
+            ignore = "holdout has no node identity or sharing (#5254)"
+        )]
+        fn named_strings_are_shared_once_before_anything_clones_them_5713() {
+            let mut context = EvalContext::default();
+            context
+                .named
+                .insert("s".to_string(), OwnedValue::String("x".repeat(5000).into()));
+            context.named.insert("n".to_string(), OwnedValue::Int(1));
+            share_named_strings(&mut context);
+            let (OwnedValue::String(held), Some(OwnedValue::String(cloned))) =
+                (&context.named["s"], context.named.get("s").cloned())
+            else {
+                panic!("`s` stays a string");
+            };
+            assert!(held.is_shared(), "the named string is promoted");
+            assert!(held.ptr_eq(&cloned), "a clone of it is a refcount");
+            assert!(matches!(context.named["n"], OwnedValue::Int(1)));
         }
 
         #[test]

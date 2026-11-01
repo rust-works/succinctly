@@ -2603,6 +2603,12 @@ macro_rules! note_scalar_copy {
 /// string and paid +8% to +50% peak RSS for it (ADR-0024's "Option D
 /// result").
 ///
+/// `jq` mode also promotes every named string argument (`--arg`, `--rawfile`, a string
+/// `--argjson`) once, up front and without that check, so a `$s` read, a `def` parameter and
+/// a `$ARGS` entry take a refcount (#5713). Only a top-level string is promoted; a string
+/// inside a `--slurpfile` or `--argjson` container, a data module's binding, and `succinctly
+/// yq`'s named strings keep their copies.
+///
 /// `Owned(String) | Shared(Rc<String>)` is 24 bytes, the size of the bare
 /// `String` it replaces: the tag lives in `String`'s capacity niche, so
 /// `OwnedValue` stays 32 (pinned below).
@@ -2771,12 +2777,18 @@ impl DerefMut for SharableString {
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn deref_mut(&mut self) -> &mut String {
         if let SharableStringInner::Shared(rc) = &mut self.0 {
-            if alloc::rc::Rc::strong_count(rc) > 1 {
-                note_scalar_copy!(StringCopy);
-            }
-            // `make_mut` copies only when shared; either way the `Rc` is
-            // unique afterwards, so its `String` moves out without a copy.
-            let s = core::mem::take(alloc::rc::Rc::make_mut(rc));
+            // A unique handle gives its `String` back without a copy; a shared one
+            // clones the `String` itself, not through `Rc::make_mut`, which would build
+            // a second `Rc` box only to take the `String` back out of it (#5713: every
+            // named string is shared for the whole run, so an append to one paid that
+            // extra allocation).
+            let s = match alloc::rc::Rc::get_mut(rc) {
+                Some(unique) => core::mem::take(unique),
+                None => {
+                    note_scalar_copy!(StringCopy);
+                    String::clone(rc)
+                }
+            };
             self.0 = SharableStringInner::Owned(s);
         }
         // Inline by construction now: the block above leaves no `Shared`
