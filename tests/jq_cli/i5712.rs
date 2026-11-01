@@ -100,3 +100,66 @@ fn a_string_condition_over_a_deep_value_answers_as_jq_does_5712() -> Result<()> 
     }
     Ok(())
 }
+
+/// The residual shapes: a comparison of the length, `try`/`?`, a `range` body, a `reduce`, a
+/// `def`, and a `select` or `if` over a string inside `[...]`, `//` or an object value. Each
+/// answer is jq 1.7.1's (`length` counts codepoints; the threshold sits between the codepoint
+/// count, 5, and the byte count, 6).
+#[test]
+fn the_residual_composed_string_length_shapes_answer_as_jq_does_5712() -> Result<()> {
+    const RESIDUAL: &[(&str, &str)] = &[
+        ("$s|length>5", "false\n"),
+        ("$s|length>4", "true\n"),
+        ("$s|length>5|not", "true\n"),
+        ("$s|(length>4 and length<6)", "true\n"),
+        ("$s|(length<5 or startswith(\"h\"))", "true\n"),
+        ("$s|try length", "5\n"),
+        ("$s|length?", "5\n"),
+        ("$s|try (length>4) catch \"c\"", "true\n"),
+        ("$s|length>\"a\"", "false\n"),
+        ("[range(3)|($s|length)]|tojson", "\"[5,5,5]\"\n"),
+        ("$s|reduce range(3) as $i (0; . + ($s|length))", "15\n"),
+        ("$s|def f: length; f", "5\n"),
+        ("[$s|select(length>4)]|length", "1\n"),
+        ("[$s|select(length>5)]|length", "0\n"),
+        ("[$s|if length>4 then 1 else 0 end]|tojson", "\"[1]\"\n"),
+        ("[$s|if length>5 then 1 else 0 end]|tojson", "\"[0]\"\n"),
+        ("$s|(select(length>5)|length)//0", "0\n"),
+        ("$s|(select(length>4)|length)//0", "5\n"),
+        ("{a:($s|select(length>4)|length)}|.a", "5\n"),
+        ("[\"x\",$s]|map(select(length>4))|length", "1\n"),
+        // A condition with two outputs forks the branch, as it does for a number.
+        (
+            "[$s|if (true,false) then 1 else 2 end]|tojson",
+            "\"[1,2]\"\n",
+        ),
+        // A right operand that would raise is never read when the left decides.
+        ("$s|(length>100 and .a)", "false\n"),
+        ("$s|(length<100 or .a)", "true\n"),
+    ];
+    for (filter, expected) in RESIDUAL {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-n", "--arg", "s", "h\u{e9}llo", filter], None)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (*expected, "", 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// A comparison the door cannot settle keeps jq's own error: indexing a string raises whether the
+/// comparison sits in `try` or not.
+#[test]
+fn a_comparison_that_raises_still_raises_over_a_string_5712() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "--arg", "s", "abc", "$s|.a>1"], None)?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "{stderr}");
+    assert!(stderr.contains("Cannot index string"), "{stderr}");
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "--arg", "s", "abc", "$s|try (.a>1) catch \"c\""],
+        None,
+    )?;
+    assert_eq!((stdout.as_str(), stderr.as_str(), code), ("\"c\"\n", "", 0));
+    Ok(())
+}

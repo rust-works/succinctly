@@ -5208,6 +5208,42 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
         }
     }
 
+    // #5712: and over a string, which has no node identity to keep once no bound node can be it.
+    // `select` and `if` settle their condition from the string (`select(length > 3)`) and a
+    // verdict is a boolean that carries nothing from it. Only these two: `tojson` of a string is
+    // not its `tostring`, and the bridge keeps every other shape.
+    if matches!(owned, OwnedValue::String(_)) && !optional && !embed_table_active() {
+        match strip_parens(expr) {
+            Expr::Builtin(Builtin::Select(cond)) => {
+                if let Some(verdict) = crate::jq::eval::owned_cond_verdict::<S>(cond, &owned, false)
+                {
+                    return match verdict {
+                        Ok(true) => GenericResult::Owned(owned),
+                        Ok(false) => GenericResult::None,
+                        Err(error) => GenericResult::Error(error),
+                    };
+                }
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                if let Some(verdict) = crate::jq::eval::owned_cond_verdict::<S>(cond, &owned, false)
+                {
+                    return match verdict {
+                        Ok(taken) => {
+                            let branch = if taken { then_branch } else { else_branch };
+                            eval_on_owned_over::<S, V>(branch, owned, optional, reentry, rooted)
+                        }
+                        Err(error) => GenericResult::Error(error),
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
     // #3477, #5691: a count needs no index over the container it counts, nor a string's length
     // or prefix/suffix test the string written out and indexed again.
     if let Some(count) = crate::jq::eval::eval_owned_count_door::<S>(expr, &owned) {
@@ -55350,6 +55386,97 @@ mod tests {
                 "{query}: eval_on_owned_over lost the string door"
             );
         }
+    }
+
+    /// #5712 (residual shapes): a string's `length` is also answered from the owned string when
+    /// it is compared (`length > 11`), under `try`/`?`, in a `range` body, a `reduce`, a `def`,
+    /// and a `select`/`if` over a string inside `[...]`, `//` or an object value. Each of these
+    /// wrote the string out and indexed it again, once per crossing.
+    ///
+    /// Both modes run on a string whose codepoint count (11) and byte count (13) differ, with
+    /// thresholds between them, so a door that counted the wrong way in either mode changes an
+    /// answer. `ascii_downcase` makes the string an owned value and is the one crossing each row
+    /// still pays: a row is bounded by 1 and not pinned to it.
+    #[test]
+    fn test_owned_string_length_residual_shapes_need_no_second_reindex_5712() {
+        let doc = r#"{"s":"H\u00e9llo W\u00f6rld"}"#;
+        let rows: [(&str, &str, &str); 11] = [
+            // (query, jq: codepoints, yq: bytes)
+            (".s | ascii_downcase | length > 11", "false", "true"),
+            (".s | ascii_downcase | try length", "11", "13"),
+            (".s | ascii_downcase | length?", "11", "13"),
+            (
+                ".s | ascii_downcase as $t | [range(9) | ($t | length)] | add",
+                "99",
+                "117",
+            ),
+            (
+                ".s | ascii_downcase as $t | reduce range(3) as $i (0; . + ($t | length))",
+                "33",
+                "39",
+            ),
+            (
+                ".s | ascii_downcase as $t | def f: length; $t | f",
+                "11",
+                "13",
+            ),
+            (
+                "[.s | ascii_downcase | select(length > 10)] | length",
+                "1",
+                "1",
+            ),
+            (
+                "[.s | ascii_downcase | select(length > 11)] | length",
+                "0",
+                "1",
+            ),
+            (
+                "[(.s | ascii_downcase | select(length > 11) | length) // 0] | .[0]",
+                "0",
+                "13",
+            ),
+            (
+                "{a: (.s | ascii_downcase | select(length > 10) | length)} | .a",
+                "11",
+                "13",
+            ),
+            ("[.s | ascii_downcase | length > 10] | .[0]", "true", "true"),
+        ];
+        for (query, jq_want, yq_want) in rows {
+            // Binding the computed string (`as $t`) is a second crossing, paid once however many
+            // rounds the body runs (9 rounds and 2 both read 2); a length read through the
+            // bridge adds one per round and fails the bound.
+            let bound = if query.contains("as $t") && !query.contains("reduce") {
+                2
+            } else {
+                1
+            };
+            let (out, reindexes) = outputs_and_reindexes_in::<JqSemantics>(doc, query);
+            assert_eq!(out, [jq_want], "jq: {query}");
+            assert!(
+                reindexes <= bound,
+                "jq: {query} reindexed {reindexes} times"
+            );
+            let (out, reindexes) = outputs_and_reindexes_in::<YqSemantics>(doc, query);
+            assert_eq!(out, [yq_want], "yq: {query}");
+            // The `range` body, `reduce` and `def` rows reach the string through
+            // `closed_unary_builtin`, which is jq mode only: yq's answer is the same, but its
+            // bridge stays as it was, so only the answer is pinned there.
+            if !query.contains("as $t") {
+                assert!(
+                    reindexes <= bound,
+                    "yq: {query} reindexed {reindexes} times"
+                );
+            }
+        }
+        // `if` takes the branch the verdict names.
+        let query = "[.s | ascii_downcase | if length > 11 then 1 else 0 end]";
+        let (out, reindexes) = outputs_and_reindexes_in::<JqSemantics>(doc, query);
+        assert_eq!(out, ["[0]"], "jq: {query}");
+        assert!(reindexes <= 1, "jq: {query} reindexed {reindexes} times");
+        let (out, reindexes) = outputs_and_reindexes_in::<YqSemantics>(doc, query);
+        assert_eq!(out, ["[1]"], "yq: {query}");
+        assert!(reindexes <= 1, "yq: {query} reindexed {reindexes} times");
     }
 
     /// #3690: `nulls`, `booleans`, `numbers`, `strings`, `arrays` and
