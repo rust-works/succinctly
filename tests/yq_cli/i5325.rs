@@ -47,3 +47,13 @@ fn test_fromjson_of_a_byte_order_mark_with_no_json_after_it_is_an_error_as_in_yq
     }
     Ok(())
 }
+
+#[test]
+fn test_fromjson_skips_no_more_than_two_byte_order_marks_5325() -> Result<()> {
+    // yq reads the third mark as part of the text and answers the string `"<BOM>[1]"`; here it is
+    // an error. What matters is that a third mark is never skipped as the first two are.
+    let filter = format!("\"{}[1]\" | fromjson", BOM.repeat(3));
+    let (stdout, _code) = run_yq_stdin(&filter, "", &["-n", "-o=json", "-I0"])?;
+    assert_ne!(stdout, "[1]\n");
+    Ok(())
+}
