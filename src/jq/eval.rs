@@ -82875,6 +82875,21 @@ fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
     };
     let visit = |found: bool| if found { Visit::Found } else { Visit::Skip };
     let reads_whole = |e: &Expr| reads_a_name_whole(e, names);
+    // #5761: a slice assigned onto `null` installs its right-hand array as the root, and `del`
+    // of a key that names nothing returns its input; jq builds a new container in both, so
+    // sharing the element there would make `==` true where jq says false. These two stages
+    // keep the literal operand until those roots are fixed.
+    let hands_input_back = |e: &Expr| {
+        any_subexpr(e, &mut |n| {
+            matches!(
+                n,
+                Expr::Slice { .. }
+                    | Expr::SliceExpr { .. }
+                    | Expr::Builtin(Builtin::Del(_) | Builtin::DelPaths(_))
+            )
+        })
+    };
+    let stores = |e: &Expr, rhs: &Expr| reads_whole(rhs) && !hands_input_back(e);
     search_subexpr(expr, &mut |e| match e {
         Expr::Var(v) if names.iter().any(|name| name == v) => Visit::Found,
         Expr::If {
@@ -82920,12 +82935,13 @@ fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
         // (`. + $a`, `. + [$a]`, `.x = $a`) when they read it whole; a field read
         // (`$r.score`) is a scalar spliced alone, which carries no identity. An
         // assignment's path is read by value, as a key.
-        Expr::Arithmetic { .. } => visit(raises_a_name(e) || reads_whole(e)),
-        // MetaAssign exists in yq mode only, where the gate is false.
+        Expr::Arithmetic { .. } => visit(raises_a_name(e) || stores(e, e)),
         Expr::Assign { value: rhs, .. }
         | Expr::CompoundAssign { value: rhs, .. }
         | Expr::AlternativeAssign { value: rhs, .. }
-        | Expr::Update { filter: rhs, .. } => visit(raises_a_name(e) || reads_whole(rhs)),
+        | Expr::Update { filter: rhs, .. } => visit(raises_a_name(e) || stores(e, rhs)),
+        // MetaAssign exists in yq mode only, where the gate is false; it stays as it was.
+        _ if is_assignment_expr(e) => visit(raises_a_name(e)),
         _ => Visit::Descend,
     })
 }
@@ -105456,6 +105472,9 @@ mod tests {
             "reduce .[] as $r ({}; .[$r.name] = $r.score)",
             "reduce .[] as $r ({}; .x[$r.name] += $r.score)",
             "reduce .[] as $r ({}; .[$r.name] += ($r.score | floor))",
+            // #5761: a store through a slice or `del` keeps the literal operand.
+            "reduce . as $a (null; .[1:] = $a)",
+            "reduce . as $a ({}; .x = ($a | del(.[5])))",
             // #5540: a field read is a scalar spliced alone and shares nothing.
             "reduce .[] as $r (0; . + $r.score)",
             "reduce .[] as $r ([]; . + [$r.id])",

@@ -8197,7 +8197,8 @@ Three differences remain, all in the direction of erroring rather than aborting:
   ([#5526](https://github.com/rust-works/succinctly/issues/5526)).
   `+=`, `//=` and a fold's `$x` read where a step cannot hand it on (`reduce f as $x (0; if $x then 1 else 2 end)`) on a value built past 384 levels
   assert the ceiling where they splice it back into the AST, with no `Result` to thread it through.
-  `last(f)` was one of them until [#5516](https://github.com/rust-works/succinctly/issues/5516), which hands the value on instead of splicing it, so `last(f(400)) | length` answers `1` as jq does; a step that stores the variable by assignment or arithmetic (`reduce f as $x ([]; . + [$x])`) joined it in [#5540](https://github.com/rust-works/succinctly/issues/5540).
+  `last(f)` was one of them until [#5516](https://github.com/rust-works/succinctly/issues/5516), which hands the value on instead of splicing it, so `last(f(400)) | length` answers `1` as jq does.
+  `reduce f as $x ([]; . + [$x])` and `.x = $x` joined it in [#5540](https://github.com/rust-works/succinctly/issues/5540); the spellings listed under "Still different" in the shared-fold section still splice.
   They exited 101 with a raw panic; the three CLI routes and the library's `jq::eval` now catch exactly that panic.
   The CLI reports `nesting depth exceeds limit of 384` at exit 5, the same refusal `reduce` gives.
   `jq::eval` returns it as a `resource_limit` error.
@@ -10708,8 +10709,9 @@ side and the assignment is answered in place. jq mode only.
 An *explicit* `==`/`!=` on a container loop variable (`.[$r.name] = ($r ==
 $r)`, `($r.a == $r.b)`) is still not answered: #3896 substitutes such a
 variable as a storage-sharing marker so jq's identity short-circuit holds
-(`[nan] == [nan]`), and an `as` binding's marker is never closed (#3241); a fold's
-marker is, since #5540, so an equality hidden in an assignment there is answered in place. The ordering
+(`[nan] == [nan]`), and an `as` binding's marker is never closed (#3241).
+A fold's marker is, since #5540, so an equality hidden in an assignment there is answered in place.
+The ordering
 comparisons and equality on a scalar loop variable are unaffected.
 
 **An `as` bind around the assignment
@@ -11919,8 +11921,8 @@ Still different:
 - **Spellings of a fold step that stores its loop variable that still rebuild it** ([#5761](https://github.com/rust-works/succinctly/issues/5761), #5540 follow-up).
   `reduce $a as $v (null; . += $v) | . == $a` (the compound spelling of jq's own `add`), `(.x, .y) += $v`, `(.x += $v)?`, an `as` rebind (`$v as $w | .x = $w`) and a container-valued field read stored on its own (`.x = $r.items`) are `false` here and `true` in jq.
   A whole-variable read in a sibling stage shares the node (`.y = $r | .x = $r.items`), so the answer follows an unrelated read.
-  Two spellings answer `true` where jq says `false`, because a stage returns the handle of its input where jq builds a new container: a slice assigned onto `null` (`reduce $a as $v (null; .[1:] = $v) | . == $a`) and an out-of-range `del` (`$v | del(.[5])`).
-  Both roots predate the fold change (`[nan] as $a | null | .[1:] = $a | . == $a` is already `true`) and are reached in a fold now that the step shares the element.
+  A slice assigned onto `null` and an out-of-range `del` return the handle of their input where jq builds a new container (`[nan] as $a | null | .[1:] = $a | . == $a` and `$a | del(.[5]) == $a` are `true` here and `false` in jq).
+  A fold store through either keeps the literal operand, so inside a fold the answer is jq's; the roots outside a fold remain.
   The comparison needs a NaN-bearing container to observe any of this.
 - **Slices.** `.[0:]` and any other full-range slice hand back the array itself, as jq's view
   does. An equal-bounds *partial* slice is a view onto the same storage in jq (pointer, offset
