@@ -29,6 +29,15 @@ fn programs_that_read_args_and_programs_that_do_not_answer_as_jq_5713() -> Resul
         ("$r | length", "6\n"),
         ("[$a, $r]", "[\"1\",\"hello\\n\"]\n"),
         ("1", "1\n"),
+        // A call a `def` shadows at another arity keeps its `$ARGS` argument out of the plain walk.
+        (
+            "def limit(f): 1; [limit(1; $ARGS.positional)]",
+            "[[\"p\"]]\n",
+        ),
+        (
+            "def range(f): 1; [range(0; $ARGS.positional | length)]",
+            "[0]\n",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(
             &[

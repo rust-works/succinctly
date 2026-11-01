@@ -4757,11 +4757,10 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         }
     };
 
-    // Build the $ARGS special variable, only for a program that names it (#5713): the object
+    // Build the $ARGS special variable, only for a program that uses it (#5713): the object
     // holds a copy of every named argument, and a `--rawfile` of 84 MB was copied into it for a
-    // program that never reads `$ARGS`. A binder of that name (`. as $ARGS`) counts as a mention,
-    // which only builds it when it is not needed.
-    let args_value = names_args_variable(&expr).then(|| build_args_var(&context));
+    // program that never reads `$ARGS`.
+    let args_value = args_var_if_named(&expr, &context);
 
     // Substitute variables from context into the expression. `$ARGS` goes first: each variable is
     // substituted in a pass over the whole expression, and a container named argument becomes a
@@ -6218,13 +6217,24 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
     Ok(context)
 }
 
-/// Whether `expr` has a `$ARGS` anywhere, a binder of that name included (#5713): the one
-/// question that decides whether the `$ARGS` object is built at all.
+/// Whether `expr` may read `$ARGS` (#5713): a use of it anywhere in the tree, or a call that
+/// still carries a `builtin_fallback`. `any_subexpr` does not descend into a fallback -- it
+/// assumes the compile-time resolution has run, which it has not yet -- and a call whose name a
+/// `def` shadows at another arity keeps its arguments there (`def limit(f): 1; limit(1; $ARGS)`),
+/// so such a call is taken to name it. A binder alone (`. as $ARGS | 1`) does not: nothing reads it.
 fn names_args_variable(expr: &jq::Expr) -> bool {
-    jq::walk::any_subexpr(
-        expr,
-        &mut |e| matches!(e, jq::Expr::Var(name) if name == "ARGS"),
-    )
+    jq::walk::any_subexpr(expr, &mut |e| match e {
+        jq::Expr::Var(name) => name == "ARGS",
+        jq::Expr::FuncCall {
+            builtin_fallback, ..
+        } => builtin_fallback.is_some(),
+        _ => false,
+    })
+}
+
+/// The `$ARGS` object, built only when [`names_args_variable`] says the program may read it.
+fn args_var_if_named(expr: &jq::Expr, context: &EvalContext) -> Option<OwnedValue> {
+    names_args_variable(expr).then(|| build_args_var(context))
 }
 
 /// Build the $ARGS special variable containing named and positional args.
@@ -13460,6 +13470,10 @@ mod tests {
             "\"v=\\($ARGS.positional)\"",
             "try error($ARGS) catch .",
             ". as $ARGS | $ARGS",
+            // A call a `def` shadows at another arity keeps its arguments in a fallback.
+            "def limit(f): 1; [limit(1; $ARGS)]",
+            "def range(f): 1; [range(0; $ARGS.positional | length)]",
+            "def splits(f): 1; [splits(\"a\"; $ARGS.named.a)]",
         ] {
             let expr = jq::parse(named).unwrap_or_else(|e| panic!("{named:?}: {e:?}"));
             assert!(names_args_variable(&expr), "{named:?} names $ARGS");
@@ -13473,6 +13487,8 @@ mod tests {
             "\"$ARGS\"",
             "{ARGS: 1}",
             "def f($x): $x; f($a)",
+            // Only a use counts: a binder nothing reads builds nothing.
+            ". as $ARGS | 1",
         ] {
             let expr = jq::parse(unnamed).unwrap_or_else(|e| panic!("{unnamed:?}: {e:?}"));
             assert!(
@@ -13480,6 +13496,17 @@ mod tests {
                 "{unnamed:?} does not name $ARGS"
             );
         }
+
+        // The object itself is built for the one and not the other.
+        let mut context = EvalContext::default();
+        context
+            .named
+            .insert("a".to_string(), OwnedValue::String("x".into()));
+        let used = jq::parse("$ARGS.named.a").unwrap();
+        let unused = jq::parse("$a").unwrap();
+        let built = args_var_if_named(&used, &context).expect("a program that reads $ARGS");
+        assert!(built.to_json().contains("\"named\":{\"a\":\"x\"}"));
+        assert!(args_var_if_named(&unused, &context).is_none());
     }
 
     /// #5674: a `--seq` stream is read as plain JSON only when nothing about it is unusual, and
