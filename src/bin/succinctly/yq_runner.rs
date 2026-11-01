@@ -782,11 +782,20 @@ impl OutputConfig {
         let compact = args.indent == 0;
 
         // `args.output_format` itself, not yet resolved against any
-        // source's `InputFormat` -- see `Self::for_source` below (#1493).
-        let indent_str = Self::compute_indent_str(args, args.output_format);
+        // source's `InputFormat` -- see `Self::for_source` below (#1493) -- except that an
+        // explicit `-p=json` makes `-o auto` YAML (#5721, yq v4.53.3: `-p=json -o auto .`
+        // prints YAML, with a backwards-compatibility warning): yq's `auto` reads the output
+        // file's extension, and `-p` given keeps the old YAML default instead.
+        let output_format =
+            if args.output_format == OutputFormat::Auto && args.input_format == InputFormat::Json {
+                OutputFormat::Yaml
+            } else {
+                args.output_format
+            };
+        let indent_str = Self::compute_indent_str(args, output_format);
 
         Self {
-            output_format: args.output_format,
+            output_format,
             compact,
             // Neither `-0` (#1996) nor `-j` (real yq's `--tojson`, #1731) implies `-r`: JSON
             // output keeps its quotes and escapes unless `-r` is explicit.
@@ -1048,6 +1057,14 @@ fn empty_input_reads_as(
     // emptiness test: a file that is only the mark reads as an empty one.
     if format != InputFormat::Json {
         bytes.drain(..crate::front_matter::leading_bom_len(&bytes));
+    } else if bytes.contains(&0) {
+        // #5721: yq's JSON reader stops at the first NUL (`printf '\0' | yq -p=json .` is the
+        // empty document, `1<NUL>2` is `1`); the rest of the input is never read. The
+        // `contains` probe is std's word-at-a-time byte search: a byte-by-byte `position` here
+        // cost +8% instructions on `users_yq_keys_unsorted` (a 2 MB JSON file) in the perf guard.
+        if let Some(nul) = bytes.iter().position(|&b| b == 0) {
+            bytes.truncate(nul);
+        }
     }
     if !holds_no_document(&bytes, format) || front_matter {
         return Some((bytes, format));
@@ -1083,7 +1100,8 @@ fn holds_no_document(bytes: &[u8], format: InputFormat) -> bool {
 /// The format `-o auto` resolves against for a gathered source of `source` format (#5478).
 ///
 /// A JSON input that held no document is read as YAML's empty document (see
-/// [`empty_input_reads_as`]), but yq still answers `-o auto` from the input it was given: JSON.
+/// [`empty_input_reads_as`]), but yq still answers `-o auto` from the input it was given: JSON
+/// (an explicit `-p=json` is the exception, #5721: `OutputConfig::from_args` already made it YAML).
 /// Every source of a run is read in the run's own format (#4394), so a `Yaml` source in a JSON
 /// run can only be that document, or one `--front-matter` forced to YAML, which keeps YAML.
 fn output_basis_format(
@@ -1118,6 +1136,11 @@ fn input_file_holds_no_document_bytes(file: &str, format: InputFormat) -> bool {
             loop {
                 match f.read(&mut chunk) {
                     Ok(0) => return true,
+                    // A NUL ends yq's JSON input (#5721): what follows it is never read.
+                    Ok(n) if chunk[..n].contains(&0) => {
+                        let end = chunk[..n].iter().position(|&b| b == 0).unwrap_or(n);
+                        return chunk[..end].iter().copied().all(is_json_whitespace);
+                    }
                     Ok(n) if chunk[..n].iter().copied().all(is_json_whitespace) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     _ => return false,

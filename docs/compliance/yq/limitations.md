@@ -6516,9 +6516,10 @@ Space, tab, line feed and carriage return are whitespace to yq's JSON reader, so
 Only a JSON output spells it `null`, and `-o auto` over a `.json` file is one.
 A whitespace-only JSON file among others reads no document, as an empty one does, and takes no `file_index`.
 A form feed, a vertical tab, a no-break space, a byte-order mark or a comment is not whitespace there, and is refused as before.
+A NUL byte ends a JSON input: what precedes it is read and what follows is not, so a lone NUL is the empty document and `1<NUL>2` is `1` ([#5721](https://github.com/rust-works/succinctly/issues/5721)).
+An explicit `-p=json` makes `-o auto` YAML, as in yq, where `-o auto` over a `.json` file without `-p` is JSON.
 Not matched: `--eval-all` over such an input prints `null` where yq prints a blank line, and `- null` where yq prints `-` for `[.]`.
 The owned-value route it takes for a JSON input has no spelling for an empty node, as over an empty YAML input with a filter beyond a bare navigation (`ea '[.]'`).
-A NUL byte alone is whitespace to yq (`printf '\0' | yq -p=json .` is a blank line) and is refused here.
 
 ### A write that changes the kind of a document root keeps its comments ([#4997](https://github.com/rust-works/succinctly/issues/4997))
 

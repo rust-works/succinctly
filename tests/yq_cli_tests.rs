@@ -40143,15 +40143,14 @@ fn test_yq_auto_output_matches_yaml_input_1493() -> Result<()> {
     Ok(())
 }
 
-/// Same, for JSON input via `-p=json` -- `-o=auto` must still render JSON.
+/// Same, for JSON input via `-p=json`: yq v4.53.3 prints YAML here, not JSON (#5721 -- an
+/// explicit `-p` keeps the old YAML default, with a backwards-compatibility warning; this test
+/// used to expect JSON). JSON input detected from a `.json` extension, with no `-p`, stays JSON.
 #[test]
 fn test_yq_auto_output_matches_json_input_1493() -> Result<()> {
     let (output, code) = run_yq_stdin(".", r#"{"a":1}"#, &["-o=auto", "-p=json"])?;
     assert_eq!(code, 0, "output: {output:?}");
-    assert_eq!(
-        output, "{\n  \"a\": 1\n}\n",
-        "auto should match JSON input's own format"
-    );
+    assert_eq!(output, "a: 1\n");
     Ok(())
 }
 
