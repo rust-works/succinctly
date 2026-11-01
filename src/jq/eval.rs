@@ -10462,6 +10462,10 @@ fn eval_each_owned_fast_path<S: EvalSemantics>(
 /// bound array and then serialized and indexed all of it to count its
 /// elements.
 ///
+/// A string's length is not this function's (its count is per-mode):
+/// [`eval_owned_string_door`] answers it, and callers read both through
+/// [`eval_owned_count_door`] (#5712).
+///
 /// The answer is a fresh integer, never a subvalue of `input`, so none of the
 /// spelling or identity concerns that keep navigation out of
 /// [`eval_owned_pure`]'s `Fresh` position apply. An owned object is already
@@ -10529,6 +10533,20 @@ pub(crate) fn eval_owned_string_door<S: EvalSemantics>(
         }
         _ => None,
     }
+}
+
+/// The count doors in one call: [`eval_owned_length`] (an array's or an object's length, #3477)
+/// and [`eval_owned_string_door`] (a string's length, and its prefix/suffix tests, #5691).
+///
+/// They answer disjoint inputs and every caller wants both, so a caller reads this and not the
+/// pair: #5712 existed because #5710 added the string door beside `eval_owned_length` at two of
+/// its four callers. A new count-like owned shape is added to one of the two and is then
+/// reached everywhere.
+pub(crate) fn eval_owned_count_door<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    eval_owned_length(expr, input).or_else(|| eval_owned_string_door::<S>(expr, input))
 }
 
 /// A stage that never reads `.`, answered without the owned input (#4053).
@@ -10656,6 +10674,10 @@ fn fixed_path_del_shape(expr: &Expr, input: &OwnedValue) -> Option<FixedPathDel>
 /// The results are fresh values (a boolean, a new array, a new string), or for
 /// `tostring` of a string the input's own handle, as the bridge's
 /// [`tostring_owned`] hands it back.
+///
+/// Called from [`eval_owned_pure_in`]'s `door` arms and, for `startswith` and
+/// `endswith` of a string, from [`eval_owned_string_door`] (#5691), which hands
+/// the boolean on as a value.
 fn eval_owned_door_arm<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -11579,17 +11601,10 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
     if let Some(flow) = eval_each_owned_fast_path::<S>(expr, input, optional, sink) {
         return Some(flow);
     }
-    // #3477: a count needs no index over the container it counts.
-    if let Some(length) = eval_owned_length(expr, input) {
-        return Some(match sink(length) {
-            Demand::Continue => Flow::Exhausted,
-            Demand::Stop => Flow::Stopped { pending: None },
-        });
-    }
-    // #5691: nor does a string's length or its prefix/suffix test need the string written out
-    // and indexed again.
-    if let Some(answer) = eval_owned_string_door::<S>(expr, input) {
-        return Some(match sink(answer) {
+    // #3477, #5691: a count needs no index over the container it counts, nor a string's length
+    // or prefix/suffix test the string written out and indexed again.
+    if let Some(count) = eval_owned_count_door::<S>(expr, input) {
+        return Some(match sink(count) {
             Demand::Continue => Flow::Exhausted,
             Demand::Stop => Flow::Stopped { pending: None },
         });
@@ -12152,12 +12167,12 @@ fn eval_each_owned_past_front_doors<S: EvalSemantics>(
 /// with `door` on, shared with `until`/`while` (#3697) -- the
 /// grammar [`eval_owned_pure`] already pins against the bridge (comparisons,
 /// `and`/`or`/`not`, `type`, navigation as an operand) plus `length` over a
-/// container. `select` yields its input unchanged, so a truthy answer emits
+/// container or a string (#5712). `select` yields its input unchanged, so a truthy answer emits
 /// `input` itself -- a refcount bump for a container -- and a falsy one emits
 /// nothing. A condition outside that grammar, or `length` of anything but an
-/// array or object, declines and the bridge answers exactly as before, so the
-/// door can only ever take a shape it can answer identically: its diagnostics
-/// stay the bridge's.
+/// array, an object or (#5712) a string, declines and the bridge answers
+/// exactly as before, so the door can only ever take a shape it can answer
+/// identically: its diagnostics stay the bridge's.
 ///
 /// Taken under the same gate as [`projection_peel`] -- no proof on the
 /// re-entry ([`Reentry::REBUILT`]), no embed table in scope -- because inside
@@ -12251,7 +12266,8 @@ fn is_peelable_head<S: EvalSemantics>(stage: &Expr) -> bool {
     }
 }
 
-/// Take a pipe's leading `.field`/`.[n]`/`.[a:b]` (or `length`; jq mode also
+/// Take a pipe's leading `.field`/`.[n]`/`.[a:b]` (or `length`, and a string's
+/// `startswith`/`endswith`, #5712; jq mode also
 /// `first`/`last`, which yq defines for itself) natively, then
 /// re-enter with the rest on the value it lands on, instead of reindexing the
 /// whole input for the bridge (#3213). A slice is answered by
@@ -12308,7 +12324,13 @@ fn projection_peel<S: EvalSemantics>(
         if !skipped.first().is_some_and(|head| {
             let head = unwrap_paren(head);
             is_peelable_head::<S>(head)
-                || matches!(head, Expr::Pipe(_) | Expr::Builtin(Builtin::Length))
+                || matches!(
+                    head,
+                    Expr::Pipe(_)
+                        | Expr::Builtin(
+                            Builtin::Length | Builtin::Startswith(_) | Builtin::Endswith(_)
+                        )
+                )
                 // #4286: a computed slice, when the stage after it is a read the owned
                 // fusion answers (`eval_generic::fusable_slice_read` is the full gate).
                 || (matches!(head, Expr::SliceExpr { .. })
@@ -12348,9 +12370,9 @@ fn projection_peel<S: EvalSemantics>(
             RestPipe::new(after).run_owned::<S>(&child, optional, Reentry::REBUILT, sink)
         });
     }
-    // #3477: a leading `length` steps to the count, then the rest runs on it.
-    let counted =
-        eval_owned_length(first, input).or_else(|| eval_owned_string_door::<S>(first, input));
+    // #3477, #5712: a leading `length` (or a string's `startswith`/`endswith`) steps to its
+    // count or verdict, then the rest runs on it.
+    let counted = eval_owned_count_door::<S>(first, input);
     if counted.is_none() && !is_peelable_head::<S>(first) {
         return None;
     }
@@ -79470,8 +79492,8 @@ fn produces_fresh_value(expr: &Expr) -> bool {
 /// themselves; the rule is unchanged.
 ///
 /// A handful of operands are opt-in rather than part of the grammar --
-/// `length` over an array or object (#3439), and `has`, `keys`,
-/// `startswith`/`endswith`, `tostring` and `[e]` (#3707) -- behind
+/// `length` over an array or object (#3439) or a string (#5712), and `has`,
+/// `keys`, `startswith`/`endswith`, `tostring` and `[e]` (#3707) -- behind
 /// [`eval_owned_pure_in`]'s `door` flag. This function is the `door: false`
 /// entry point every caller but
 /// [`owned_select_door`] and [`owned_cond_verdict`] uses, so its grammar is
@@ -79498,7 +79520,8 @@ fn eval_owned_pure<S: EvalSemantics>(
 
 /// [`eval_owned_pure`]'s body, with `door` opting in more operands:
 /// `length` over an owned array or object, answered by [`eval_owned_length`]
-/// (#3439), and the arms of [`eval_owned_door_arm`] (#3707) -- `has`, `keys`,
+/// (#3439), or over a string, answered by [`eval_owned_string_door`] (#5712),
+/// and the arms of [`eval_owned_door_arm`] (#3707) -- `has`, `keys`,
 /// `startswith`/`endswith`, `tostring` and `[e]`.
 ///
 /// `door` is a parameter and not an arm of [`eval_owned_pure`] because
@@ -79528,9 +79551,7 @@ fn eval_owned_pure_in<S: EvalSemantics>(
         // (#5712, `eval_owned_string_door`) a string is answered; everything
         // else declines, and the bridge keeps its diagnostics and its
         // per-mode rules.
-        Expr::Builtin(Builtin::Length) if door => eval_owned_length(expr, input)
-            .or_else(|| eval_owned_string_door::<S>(expr, input))
-            .map(Ok),
+        Expr::Builtin(Builtin::Length) if door => eval_owned_count_door::<S>(expr, input).map(Ok),
         Expr::Builtin(
             Builtin::Has(_)
             | Builtin::Keys
@@ -84116,8 +84137,8 @@ impl<'e> LoopOperand<'e> {
 /// result, so the type is what keeps it from doing so.
 ///
 /// `None` when the condition is outside the pure grammar, or `length` of
-/// anything but an array or an object, so the bridge keeps its diagnostics and
-/// its per-mode rules. Because every accepted shape is pure, a walk that ends in
+/// anything but an array, an object or a string (#5712), so the bridge keeps
+/// its diagnostics and its per-mode rules. Because every accepted shape is pure, a walk that ends in
 /// `None` has cost only wasted work.
 pub(crate) fn owned_cond_verdict<S: EvalSemantics>(
     cond: &Expr,
@@ -136821,8 +136842,9 @@ mod tests {
     }
 
     /// #3697: the verdict is only for shapes it can answer identically.
-    /// `length` of a scalar keeps the bridge's diagnostics and per-mode rules
-    /// (a number's `length` is its absolute value), a condition outside the
+    /// `length` of a number, `null` or a boolean keeps the bridge's diagnostics and per-mode
+    /// rules (a number's `length` is its absolute value; a string's is answered since #5712),
+    /// a condition outside the
     /// pure grammar is the bridge's outright, and a `?` is gated out.
     #[test]
     fn owned_cond_verdict_declines_what_it_cannot_answer_identically_3697() {
