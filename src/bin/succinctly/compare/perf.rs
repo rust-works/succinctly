@@ -194,7 +194,10 @@ pub fn ensure_input(
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.json", spec.id));
     if let Some(file) = &spec.corpus {
-        if !path.exists() {
+        // A copy left by an earlier run is refreshed when it no longer matches the pin
+        // (the corpus file was re-pinned), and only then judged against it below.
+        let cached_ok = std::fs::read(&path).is_ok_and(|b| sha256_hex(&b) == spec.sha256);
+        if !cached_ok {
             let Some(from) = corpus_source(root, spec) else {
                 bail!(
                     "{} names corpus file {file}, which is in neither {} (run \
@@ -231,10 +234,15 @@ pub fn ensure_input(
     let got = sha256_hex(&std::fs::read(&path)?);
     if got != spec.sha256 {
         bail!(
-            "{} has sha256 {got}, the manifest pins {} (the generator or a stale file changed; \
+            "{} has sha256 {got}, the manifest pins {} ({}; \
              delete {} to regenerate, or re-pin on purpose)",
             spec.id,
             spec.sha256,
+            if spec.corpus.is_some() {
+                "the corpus file changed"
+            } else {
+                "the generator or a stale file changed"
+            },
             path.display()
         );
     }
@@ -748,6 +756,11 @@ mod tests {
         std::fs::write(fetched.join("a.json"), b"{\"a\":1}\n").unwrap();
         assert!(available(&root, &spec));
         let path = ensure_input(&root, gen, &out, &spec).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}\n");
+
+        // A stale copy from an earlier run is replaced, not judged.
+        std::fs::write(&path, b"stale").unwrap();
+        ensure_input(&root, gen, &out, &spec).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}\n");
 
         // The seed wins over the fetch, and a file that differs from the pin is refused.

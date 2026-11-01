@@ -89,6 +89,17 @@ impl Manifest {
         if primaries != 1 {
             bail!("manifest needs exactly one primary reference, found {primaries}");
         }
+        // A generated input needs its generator arguments, and a corpus input has none: the
+        // defaults that let the corpus ones omit them must not hide a missing `size`.
+        for i in &m.inputs {
+            let generated = !i.pattern.is_empty() && !i.size.is_empty();
+            if i.corpus.is_some() == generated || (i.corpus.is_some() && !i.pattern.is_empty()) {
+                bail!(
+                    "input {} needs either `corpus`, or `pattern` and `size` (and not both)",
+                    i.id
+                );
+            }
+        }
         for suite in &m.suites {
             if let Some(id) = &suite.reference {
                 if !m
@@ -165,6 +176,26 @@ mod tests {
         // Naming the primary, or a typo, would run the suite as a primary one.
         assert!(Manifest::parse(text).is_err());
         assert!(Manifest::parse(&text.replace("reference='a'\n", "reference='b'\n")).is_err());
+    }
+
+    #[test]
+    fn an_input_is_generated_or_from_the_corpus_and_never_neither_or_both() {
+        let base = "schema_version = 1\n\
+            [succinctly]\nprofile='release'\nfeatures=''\n[queries]\nsmoke='x'\n\
+            [probes]\ncli='x'\nextensions='x'\nsyntax='x'\nfixtures='x'\ndivergences='x'\nrobust='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n[perf]\nqueries='q'\n\
+            [[reference]]\nid='a'\nversion='1'\nrole='primary'\nsource_url=''\nsource_sha256=''\n";
+        let input = |fields: &str| {
+            format!("{base}[[input]]\nid='i'\nshape='s'\ntier='1mb'\nsha256='h'\n{fields}")
+        };
+        assert!(Manifest::parse(&input("pattern='users'\nsize='1mb'\n")).is_ok());
+        assert!(Manifest::parse(&input("corpus='json/a.json'\n")).is_ok());
+        assert!(Manifest::parse(&input("")).is_err());
+        assert!(Manifest::parse(&input("pattern='users'\n")).is_err());
+        assert!(Manifest::parse(&input("size='1mb'\n")).is_err());
+        assert!(Manifest::parse(&input(
+            "corpus='json/a.json'\npattern='users'\nsize='1mb'\n"
+        ))
+        .is_err());
     }
 
     #[test]

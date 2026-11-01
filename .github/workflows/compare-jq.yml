@@ -38,7 +38,9 @@ jobs:
           scripts/compare-jq-build.sh 1.8.1
       - name: Build succinctly (the manifest's feature set)
         run: cargo build --release --features cli,simd,regex,serde,bench-runner
+      # A failed download drops the fetched corpus rows with a note in the report; it does not fail the run.
       - name: Fetch the benchmark corpus (the real-file perf inputs)
+        continue-on-error: true
         run: scripts/sync-bench-corpus.sh
       - name: Compare
         run: ./target/release/succinctly dev compare jq --quick --out data/compare/ci

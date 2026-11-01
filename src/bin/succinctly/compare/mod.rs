@@ -622,7 +622,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         }
         dimensions.push(DimensionStatus {
             name: "F. Robustness",
-            status: "implemented (nesting, recursion, generators, regex, large values, SIGPIPE, memory limits under ulimit -v)",
+            status: "implemented (nesting, recursion, generators, regex, large values, SIGPIPE, the memory-limit probes are not yet included)",
         });
     }
     let (mut perf_rows, mut perf_note) = (vec![], None);
@@ -638,20 +638,16 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                 bail!("no performance query contains `{f}`");
             }
         }
-        // A fetched corpus file that is not on this machine drops its rows, and says so.
-        let missing: Vec<&str> = manifest
-            .inputs
+        // A fetched corpus file that is not on this machine drops its rows, and says so (only the
+        // rows this run would have timed).
+        let (planned, dropped): (Vec<_>, Vec<_>) = perf::plan(&queries, &manifest.inputs, top)
+            .into_iter()
+            // `map_or(true, ..)`: the crate's MSRV predates `Option::is_none_or`.
+            .partition(|(_, i)| i.map_or(true, |i| perf::available(&root, i)));
+        let missing: std::collections::BTreeSet<&str> = dropped
             .iter()
-            .filter(|i| !perf::available(&root, i))
-            .map(|i| i.id.as_str())
+            .filter_map(|(_, i)| i.map(|i| i.id.as_str()))
             .collect();
-        let present: Vec<perf::InputSpec> = manifest
-            .inputs
-            .iter()
-            .filter(|i| perf::available(&root, i))
-            .cloned()
-            .collect();
-        let planned = perf::plan(&queries, &present, top);
         let generator = std::env::current_exe()?;
         let mut tools = vec![
             if args.control {
@@ -671,7 +667,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         if !missing.is_empty() {
             let skipped = format!(
                 "corpus files not on this machine, so their rows are not run (scripts/sync-bench-corpus.sh fetches them): {}",
-                missing.join(", ")
+                missing.iter().copied().collect::<Vec<_>>().join(", ")
             );
             perf_note = Some(match perf_note {
                 Some(n) => format!("{n}; {skipped}"),
@@ -901,6 +897,14 @@ fn run_verify(
         };
         let spec = ctx.manifest.inputs.iter().find(|i| i.id == input);
         if let Some(spec) = spec {
+            if !perf::available(ctx.root, spec) {
+                failures.push(format!(
+                    "perf:{query}@{input} needs corpus file {}, which is not on this machine \
+                     (scripts/sync-bench-corpus.sh fetches it)",
+                    spec.corpus.as_deref().unwrap_or_default()
+                ));
+                continue;
+            }
             perf::ensure_input(ctx.root, &generator, &inputs_dir, spec)?;
         }
         let row = perf::run_row(&tools, q, spec, &inputs_dir, 5)?;
