@@ -866,13 +866,12 @@ fn build_time_table(s: &mut String, cores: u32, o: &operational::Operational) {
     }
     let _ = writeln!(
         s,
-        "**Build time from source** ({} cores; one run each, cold, not repeated: a figure that long \
+        "**Build time from source** ({cores} cores; one run each, cold, not repeated: a figure that long \
          moves with the disk cache and machine load, so it is a magnitude and not a ratio to quote). \
          The jq tarball and the crates are downloaded before the clock starts; succinctly's \
          rebuild is what one edit costs under the pinned fat-LTO profile. jq's `make -j` and \
          cargo both use every core, but the single-codegen-unit fat-LTO link is mostly serial, so \
-         the cores do not explain the gap between them.\n",
-        cores
+         the cores do not explain the gap between them.\n"
     );
     let _ = writeln!(s, "| Build | Seconds | Command |");
     let _ = writeln!(s, "|-------|---------|---------|");
