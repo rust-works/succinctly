@@ -69,6 +69,20 @@ const ROWS: &[(&str, &str, &str, i32, usize)] = &[
         5,
         1,
     ),
+    (
+        "[[1],[0],[2]]",
+        ".. | select(type==\"array\") | map(if .==0 then error(\"boom\") else . end)",
+        "[[1],[0],[2]]\n[1]\n",
+        5,
+        1,
+    ),
+    (
+        "[[1],[0],[2]]",
+        ".[] | (., map(if .==0 then error(\"boom\") else . end))",
+        "[1]\n[1]\n[0]\n",
+        5,
+        1,
+    ),
 ];
 
 #[test]
