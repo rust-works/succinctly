@@ -178,3 +178,152 @@ platform = "linux"
 category = "by-design"
 issue = "#5634"
 reason = "`[range(1e8)] | length` under `ulimit -v` 512 MiB: jq 1.7.1 and succinctly both abort (killed by a signal, no exit status). Rust ends the process on a failed allocation (`memory allocation of N bytes failed`) where jq's `jv_mem_alloc` prints `cannot allocate memory` and aborts, so the output matches; a graceful error would need every container growth to be fallible."
+
+# G: colour and locale probes (#5552). Found with the per-probe `env` column; none is tracked yet, so they are `to-triage`.
+# JQ_COLORS: a field over the colour buffer rejects the whole variable in jq; an empty variable and a trailing empty field keep defaults.
+# strptime/strftime: libc in jq (locale-dependent, `%B` strict, weekday from the unset date fields); a fixed English implementation here.
+
+[[divergence]]
+id = "cli:jqcolors-overlong"
+category = "to-triage"
+reason = "`JQ_COLORS` with a 30-digit field: jq 1.7.1 prints `Failed to set $JQ_COLORS` and keeps every default colour; succinctly applies the long field to null."
+
+[[divergence]]
+id = "cli:jqcolors-many-semicolons"
+category = "to-triage"
+reason = "`JQ_COLORS=1;2;3;4;5;6;7;8;9` (one 17-byte field): jq 1.7.1 rejects the whole variable (`Failed to set $JQ_COLORS`) and keeps the defaults; succinctly applies it."
+
+[[divergence]]
+id = "cli:jqcolors-empty"
+category = "to-triage"
+reason = "`JQ_COLORS=` (set, empty): jq 1.7.1 keeps every default colour; succinctly sets the null colour to the empty string (`ESC[m`)."
+
+[[divergence]]
+id = "cli:jqcolors-empty-fields"
+category = "to-triage"
+reason = "`JQ_COLORS=:::` (four fields, the last empty): jq 1.7.1 applies the first three and leaves the number colour at its default `0;39`; succinctly also blanks the number colour."
+
+[[divergence]]
+id = "cli:locale-strftime-c-en-us"
+category = "to-triage"
+volatile = true
+reason = "`strftime(\"%x\")` under `LC_ALL=en_US.UTF-8` is `03/05/2015` in jq 1.7.1 (libc) and `03/05/15` in succinctly, which has one fixed `%c`/`%x`/`%X` layout. Shows only where the host has that locale installed (a host without it falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strptime-ampm-c"
+category = "to-triage"
+reason = "`\"11:30 PM\" | strptime(\"%I:%M %p\")`: the weekday (element 6) is 6 in jq 1.7.1 and 0 in succinctly. jq derives it from the unset date fields (`1900-01-00`) with its own formula; `\"12\"|strptime(\"%H\")` and `\"3\"|strptime(\"%d\")` differ the same way."
+
+[[divergence]]
+id = "cli:locale-strptime-ampm-en-us"
+category = "to-triage"
+reason = "Same weekday difference as `locale-strptime-ampm-c`, under `en_US.UTF-8`."
+
+[[divergence]]
+id = "cli:locale-strptime-ampm-de-de"
+category = "to-triage"
+reason = "Same weekday difference as `locale-strptime-ampm-c`, under `de_DE.UTF-8` (a host without that locale falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strptime-ampm-tr-tr"
+category = "to-triage"
+reason = "Same weekday difference as `locale-strptime-ampm-c`, under `tr_TR.UTF-8` (a host without that locale falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strptime-tr-c"
+category = "to-triage"
+reason = "`\"05 Mart 2015\" | strptime(\"%d %B %Y\")` under `LC_ALL=C`: jq 1.7.1 rejects it (`does not match format`); succinctly reads it as March, because `%B` accepts a month name followed by extra letters (`Marx`, `Marchx` too; `Ma` is rejected by both)."
+
+[[divergence]]
+id = "cli:locale-strptime-tr-en-us"
+category = "to-triage"
+reason = "Same `%B` leniency as `locale-strptime-tr-c`, under `en_US.UTF-8`."
+
+[[divergence]]
+id = "cli:locale-strptime-tr-de-de"
+category = "to-triage"
+reason = "Same `%B` leniency as `locale-strptime-tr-c`, under `de_DE.UTF-8` (a host without that locale falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strftime-names-de-de"
+category = "to-triage"
+volatile = true
+reason = "`strftime(\"%A %a %B %b %p\")` under `LC_ALL=de_DE.UTF-8`: jq 1.7.1 calls `setlocale(LC_ALL, \"\")` and prints `Donnerstag Do. März März` (empty `%p`); succinctly prints the English names and `PM`. Shows only where the host has that locale installed (a host without it falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strftime-names-tr-tr"
+category = "to-triage"
+volatile = true
+reason = "Same as `locale-strftime-names-de-de`, under `tr_TR.UTF-8`. Shows only where the host has that locale installed (a host without it falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strftime-c-de-de"
+category = "to-triage"
+volatile = true
+reason = "`strftime(\"%c|%x|%X|...\")` under `de_DE.UTF-8`: jq 1.7.1 uses the locale's layouts, succinctly the fixed English/C ones. Shows only where the host has that locale installed (a host without it falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strftime-c-tr-tr"
+category = "to-triage"
+volatile = true
+reason = "Same as `locale-strftime-c-de-de`, under `tr_TR.UTF-8`. Shows only where the host has that locale installed (a host without it falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strflocaltime-de-de"
+category = "to-triage"
+volatile = true
+reason = "`strflocaltime(\"%A %B %p\")` under `de_DE.UTF-8`: jq 1.7.1 localizes the names, succinctly prints English. Shows only where the host has that locale installed (a host without it falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strflocaltime-tr-tr"
+category = "to-triage"
+volatile = true
+reason = "Same as `locale-strflocaltime-de-de`, under `tr_TR.UTF-8`. Shows only where the host has that locale installed (a host without it falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strptime-abbr-de-de"
+category = "to-triage"
+volatile = true
+reason = "`\"Thu Mar 05 2015\" | strptime(\"%a %b %d %Y\")` under `de_DE.UTF-8`: jq 1.7.1 reads the locale's names, so the English abbreviations do not match (exit 5); succinctly parses them. Shows only where the host has that locale installed (a host without it falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strptime-abbr-tr-tr"
+category = "to-triage"
+volatile = true
+reason = "Same as `locale-strptime-abbr-de-de`, under `tr_TR.UTF-8`. Shows only where the host has that locale installed (a host without it falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strptime-de-de-de"
+category = "to-triage"
+volatile = true
+reason = "`\"Donnerstag, 05. März 2015\" | strptime(\"%A, %d. %B %Y\")` under `de_DE.UTF-8`: jq 1.7.1 parses it; succinctly rejects German names. Shows only where the host has that locale installed (a host without it falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strptime-en-de-de"
+category = "to-triage"
+volatile = true
+reason = "`\"Thursday, March 05 2015\" | strptime(\"%A, %B %d %Y\")` under `de_DE.UTF-8`: jq 1.7.1 rejects the English names (exit 5); succinctly parses them. Shows only where the host has that locale installed (a host without it falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strptime-en-tr-tr"
+category = "to-triage"
+volatile = true
+reason = "Same as `locale-strptime-en-de-de`, under `tr_TR.UTF-8`. Shows only where the host has that locale installed (a host without it falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-var-lang-only-time"
+category = "to-triage"
+volatile = true
+reason = "`LANG=de_DE.UTF-8` with `LC_ALL` empty is enough for jq 1.7.1 to localize `strftime(\"%A %B\")` (`Donnerstag März`); succinctly ignores the locale variables. Shows only where the host has that locale installed (a host without it falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-var-lc-time-only-time"
+category = "to-triage"
+volatile = true
+reason = "`LC_TIME=de_DE.UTF-8` alone localizes jq 1.7.1's `strftime`; succinctly ignores it. Shows only where the host has that locale installed (a host without it falls back to `C`)."
+
+[[divergence]]
+id = "cli:locale-strptime-tr-tr-tr"
+category = "to-triage"
+volatile = true
+reason = "`tr_TR.UTF-8` is not installed on the Linux hosts checked, so jq falls back to `C` and rejects `\"05 Mart 2015\"` as in `locale-strptime-tr-c`; succinctly reads it as March (the `%B` leniency). Where `tr_TR` is installed (macOS) jq accepts `Mart` itself and the row matches."

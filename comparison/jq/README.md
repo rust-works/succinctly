@@ -25,7 +25,7 @@ reported as a correctness row and gets no timing; the command exits 1 on it.
 | `manifest.toml`       | pinned references (version, source sha256), build, queries |
 | `queries/smoke.tsv`   | `id`, flags, filter, input — data, not code              |
 | `probes/syntax.tsv`   | A: syntax forms, same columns as `cli.tsv`; run beside the builtins |
-| `probes/cli.tsv`      | G: `id`, area, args (JSON array), stdin (JSON string)    |
+| `probes/cli.tsv`      | G: `id`, area, args (JSON array), stdin (JSON string), optional `env` |
 | `probes/extensions.tsv` | succinctly-only surface the reference must reject      |
 | `fixtures/`           | working directory of the CLI probes (`-f`, `-L`, ...)    |
 | `vendor/jq-1.7.1/`    | B: jq's own test files (MIT), sha256-pinned in the manifest |
@@ -33,6 +33,8 @@ reported as a correctness row and gets no timing; the command exits 1 on it.
 | `queries/perf.tsv`    | D/E: id, flags, filter, shapes, max tier; `@INPUT@` in the flags is the input file's name (`--slurpfile d @INPUT@`), `@files=N` passes it `N` times |
 | `probes/robust.tsv`   | F: nesting, recursion, generators, regex, big values, SIGPIPE, `ulimit -v` (`ulimit-v:<KiB>` wrap); `@gen:` builds large stdin |
 | `divergences.toml`    | ledger of known differences; the run fails on drift      |
+
+The `env` column of `probes/cli.tsv` (and `syntax.tsv`) is a JSON object of variables set for both tools (`{"JQ_COLORS":"1;31"}`, `{"LC_ALL":"","LANG":"de_DE.UTF-8"}`). The base environment is `LC_ALL=C` with `JQ_COLORS`, `NO_COLOR` and every other locale variable removed, so a probe sees only what its row sets (#5552). A locale the host lacks makes both tools fall back to `C`, so the `de_DE`/`tr_TR` rows only mean something on a host that has them (macOS; the Linux runners carry `C.utf8` and `en_US`).
 
 Dimension A probes every builtin in the reference's own `builtins` (plus those new in jq 1.8.1, against 1.8.1) and, from `probes/syntax.tsv`, the language's forms: operators, paths and slices, construction, `if`/`reduce`/`foreach`/`label`, destructuring with `?//`, `def`, string and format forms, assignment and `import`/`include`;
 `--write-summary` regenerates `docs/compare/jq-coverage.json` and the figures in `docs/reference/jq-language.md`.

@@ -544,7 +544,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         }
         dimensions.push(DimensionStatus {
             name: "G. CLI & I/O compatibility",
-            status: "implemented (flags, I/O, exit codes, numbers; colour and locale partially)",
+            status: "implemented (flags, I/O, exit codes, numbers; JQ_COLORS, NO_COLOR and the locale variables through per-probe environments)",
         });
     }
     if args.write_summary {

@@ -29,10 +29,23 @@ impl Exec {
     }
 }
 
-/// Run `tool` with `args` and `stdin` in `cwd`. The environment is fixed
-/// (`TZ=UTC`, `LC_ALL=C`) so a locale or zone cannot read as a divergence.
+/// Run `tool` with `args` and `stdin` in `cwd`. The environment is fixed (`TZ=UTC`, `LC_ALL=C`, no
+/// `JQ_COLORS`/`NO_COLOR` and none of the other locale variables the host may export) so a locale or
+/// zone cannot read as a divergence.
 pub fn exec(tool: &Tool, args: &[String], stdin: impl AsRef<[u8]>, cwd: &Path) -> Result<Exec> {
     exec_within(tool, args, stdin, cwd, DEADLINE)
+}
+
+/// [`exec`] with `env` set on top of the fixed environment, for a probe about a variable
+/// (`JQ_COLORS`, `NO_COLOR`, the locale) the fixed one would otherwise hide (#5552).
+pub fn exec_env(
+    tool: &Tool,
+    args: &[String],
+    stdin: impl AsRef<[u8]>,
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<Exec> {
+    exec_with(tool, args, stdin, cwd, DEADLINE, env)
 }
 
 pub fn exec_within(
@@ -42,6 +55,17 @@ pub fn exec_within(
     cwd: &Path,
     deadline: Duration,
 ) -> Result<Exec> {
+    exec_with(tool, args, stdin, cwd, deadline, &[])
+}
+
+fn exec_with(
+    tool: &Tool,
+    args: &[String],
+    stdin: impl AsRef<[u8]>,
+    cwd: &Path,
+    deadline: Duration,
+    env: &[(String, String)],
+) -> Result<Exec> {
     let mut child = Command::new(&tool.program)
         .args(&tool.prefix)
         .args(args)
@@ -50,6 +74,15 @@ pub fn exec_within(
         .env("LC_ALL", "C")
         .env_remove("JQ_COLORS")
         .env_remove("NO_COLOR")
+        .env_remove("LANG")
+        .env_remove("LANGUAGE")
+        .env_remove("LC_CTYPE")
+        .env_remove("LC_COLLATE")
+        .env_remove("LC_TIME")
+        .env_remove("LC_NUMERIC")
+        .env_remove("LC_MESSAGES")
+        .env_remove("LC_MONETARY")
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -124,6 +157,52 @@ mod tests {
         assert!(!exec(&sh(other), &[], "", Path::new("."))
             .unwrap()
             .is_undefined());
+    }
+
+    /// A probe's variables are set on top of the fixed environment, and can replace it.
+    #[test]
+    fn a_probe_sets_variables_over_the_fixed_environment() {
+        let env = |k: &str, v: &str| vec![(k.to_string(), v.to_string())];
+        let sh = sh("echo \"$TZ|$LC_ALL|${JQ_COLORS-unset}|${LANG-unset}|${LC_TIME-unset}\"");
+        let plain = exec(&sh, &[], "", Path::new(".")).unwrap();
+        assert_eq!(plain.stdout, b"UTC|C|unset|unset|unset\n");
+        let colours = exec_env(&sh, &[], "", Path::new("."), &env("JQ_COLORS", "1;31")).unwrap();
+        assert_eq!(colours.stdout, b"UTC|C|1;31|unset|unset\n");
+        let locale = exec_env(&sh, &[], "", Path::new("."), &env("LC_ALL", "de_DE.UTF-8")).unwrap();
+        assert_eq!(locale.stdout, b"UTC|de_DE.UTF-8|unset|unset|unset\n");
+    }
+
+    /// A locale variable the host exports must not reach a probe that sets only `LC_ALL=""` and one
+    /// other variable: it would then read the host's locale.
+    #[test]
+    fn a_hosts_locale_variables_do_not_reach_the_tool() {
+        let sh = sh("echo \"${LANG-unset}|${LC_TIME-unset}|${LC_CTYPE-unset}|${LANGUAGE-unset}\"");
+        // Re-run this test binary with the variables exported, since a test cannot set its own
+        // environment without racing the others.
+        if std::env::var_os("COMPARE_EXEC_LEAK_CHILD").is_none() {
+            let me = std::env::current_exe().unwrap();
+            let out = std::process::Command::new(me)
+                .args([
+                    "--exact",
+                    "compare::exec::tests::a_hosts_locale_variables_do_not_reach_the_tool",
+                ])
+                .args(["--nocapture", "--test-threads=1"])
+                .env("COMPARE_EXEC_LEAK_CHILD", "1")
+                .env("LANG", "de_DE.UTF-8")
+                .env("LC_TIME", "de_DE.UTF-8")
+                .env("LC_CTYPE", "tr_TR.UTF-8")
+                .env("LANGUAGE", "de")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            return;
+        }
+        let e = exec(&sh, &[], "", Path::new(".")).unwrap();
+        assert_eq!(e.stdout, b"unset|unset|unset|unset\n");
     }
 
     #[test]
