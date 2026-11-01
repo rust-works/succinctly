@@ -3198,6 +3198,15 @@ as real jq does. An earlier PR ([#2013](https://github.com/rust-works/succinctly
 already made a lone **high** surrogate an error in both modes, which also stopped two `fromjson`-parsed
 object keys differing only by an unpaired high surrogate from silently collapsing.
 
+Yq-mode `fromjson` skips up to two leading byte-order marks ([#5325](https://github.com/rust-works/succinctly/issues/5325)).
+Real yq drops one in its reader and go-yaml another, so `[1]` behind one or two U+FEFF marks reads as `[1]`, and a third mark is a character of the text.
+Jq mode skips exactly one ([#5312](https://github.com/rust-works/succinctly/issues/5312)).
+What stays different is the rest of go-yaml's decoding, which this hand-written parser does not do (yq v4.53.3):
+- Trailing content after the first value is ignored (`"[1] 2" | fromjson` is `[1]`); here it is an error.
+- Text that is not JSON is decoded as YAML (`"abc"` is the string `abc`, `"a: 1"` is `{"a":1}`, a mark behind whitespace stays in the string); here it is an error.
+- Whitespace alone is `null`; here it is an error.
+- An error is worded by go-yaml (`Error: EOF`, `yaml: while parsing a flow sequence ...`); here it is `Invalid numeric literal` or `Expected JSON value`, with the same exit status.
+
 ### `parent` doesn't auto-vivify the missing node it navigated through
 
 [#2146](https://github.com/rust-works/succinctly/issues/2146) (defect 3, still open --
