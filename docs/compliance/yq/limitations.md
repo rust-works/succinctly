@@ -3298,14 +3298,15 @@ comment for the full call-site list and `tests/yq_cli_tests.rs`'s
 unaffected (it keeps its own separate, unconditional-null rule), and a real container
 target keeps its own structural error.
 
-#### A bracketed key read off a `+` or `*` result (#4361) — string keys resolved; two shapes remain
+#### A bracketed key read off a `+` or `*` result (#4361, #5460) — resolved
 
 The same flag explains `(A + B)["k"]` and `(A * B)["k"]`: the arithmetic operator leaves its result in a context that does not auto-create, so a key the mapping lacks answers nothing where `(A + B).k` and `(A + B) | .["k"]` answer `null`.
 It is a property of the bracket spelling directly after the operator, so the parser keeps a string key there as a computed key instead of folding it into a field (as for a `del()` argument, #2126), and both evaluators read it through `index_one_owned_read_of`.
 A write through the same spelling (`(A + B)["k"] = 1`) is unchanged: an assignment target is folded back to the field it always was.
-Two shapes still answer `null` or an error where yq answers nothing, both on a mapping that lacks the key.
-A number key (`(A + B)[0]`) reaches the evaluator as an array index rather than a computed key, and an object-valued key (`(A + B)[.a]`) raises `Cannot index object with object`.
-Neither was changed: the first shares its parse with array indexing, whose negative-index handling a bracket rewrite would have to reproduce.
+A whole-number key (`(A + B)[0]`, `[-1]`, `[1.0]`) is kept as a computed key the same way (#5460), and an object-valued or array-valued key (`(A + B)[.a]`, `[[0]]`) reads nothing on a mapping instead of raising `Cannot index object with object`.
+An array head reads as before (`([1,2] + [3])[9]` is `null`, `[-1]` is `3`).
+A `del()` argument and an assignment target, comma lists of them included, are folded back to the path step they always were, so both stay the no-ops they are in yq.
+Not matched: `del((A + B)[.k])` with a computed key fails with `Invalid path expression` where yq leaves the document alone, and `(A + B)[.k]` over an array head with a mapping-valued key words its error differently.
 
 ### `//` maps per left output and keeps a falsy left value when the right side is empty — resolved ([#2817](https://github.com/rust-works/succinctly/issues/2817)); yq's auto-creating key lookup remains
 

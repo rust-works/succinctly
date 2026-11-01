@@ -7977,7 +7977,16 @@ impl<'a> Parser<'a> {
             self.keep_bracket_keys = self.mode == ParserMode::Yq;
             let arg = self.parse_required_single_arg(keyword_start);
             self.keep_bracket_keys = outer;
-            return Ok(arg?.map(|path| Builtin::Del(Box::new(path))));
+            // #5460: a `del()` argument is a path, so a key kept as computed after a `+`/`*`
+            // head reads as the path step it was before it was kept.
+            let yq = self.mode == ParserMode::Yq;
+            return Ok(arg?.map(|path| {
+                Builtin::Del(Box::new(if yq {
+                    Self::fold_sum_or_merge_key(path)
+                } else {
+                    path
+                }))
+            }));
         }
 
         // Phase 10: Math Functions
@@ -8969,24 +8978,43 @@ impl<'a> Parser<'a> {
     /// #4361: in yq mode `(A + B)["k"]` and `(A * B)["k"]` read an absent key as nothing, where
     /// `(A + B).k` and `(A + B) | .["k"]` read it as `null`. The folded [`Expr::Field`] cannot
     /// tell the bracket from the dot, so a string key straight after such a head stays the
-    /// computed key it is, as in a `del()` argument (#2126).
+    /// computed key it is, as in a `del()` argument (#2126). A whole-number key does the same
+    /// (#5460): `(A + B)[0]` on a mapping is nothing in yq, where the folded [`Expr::Index`] reads
+    /// `null`. [`Self::fold_sum_or_merge_key`] undoes either for an assignment's target.
     fn keep_string_key_after_sum_or_merge(&self, chain: &[Expr], bracket: Bracket) -> Bracket {
         if self.mode != ParserMode::Yq || chain.len() != 1 || !chain[0].is_sum_or_merge() {
             return bracket;
         }
         match bracket {
-            Bracket::Static(Expr::Field(name)) => Bracket::Dynamic {
-                key: Expr::Literal(Literal::String(name)),
-                optional: false,
-            },
-            Bracket::Static(Expr::Optional(inner)) => match *inner {
-                Expr::Field(name) => Bracket::Dynamic {
-                    key: Expr::Literal(Literal::String(name)),
+            Bracket::Static(Expr::Optional(inner)) => match Self::computed_key_of_folded(*inner) {
+                Ok(key) => Bracket::Dynamic {
+                    key,
                     optional: true,
                 },
-                other => Bracket::Static(Expr::Optional(Box::new(other))),
+                Err(other) => Bracket::Static(Expr::Optional(Box::new(other))),
+            },
+            Bracket::Static(folded) => match Self::computed_key_of_folded(folded) {
+                Ok(key) => Bracket::Dynamic {
+                    key,
+                    optional: false,
+                },
+                Err(other) => Bracket::Static(other),
             },
             other => other,
+        }
+    }
+
+    /// The literal key a folded string or whole-number bracket was written with, or the
+    /// expression back when it is neither.
+    fn computed_key_of_folded(folded: Expr) -> Result<Expr, Expr> {
+        match folded {
+            Expr::Field(name) => Ok(Expr::Literal(Literal::String(name))),
+            Expr::Index { idx, key: None } => Ok(Expr::Literal(Literal::Int(idx))),
+            Expr::Index {
+                key: Some(key @ (NumberKey::Float(_) | NumberKey::Literal(..))),
+                ..
+            } => Ok(Expr::Literal(Literal::Float(key.value()))),
+            other => Err(other),
         }
     }
 
@@ -9627,6 +9655,18 @@ impl<'a> Parser<'a> {
                 Expr::Literal(Literal::String(name)) => {
                     Expr::pipe(vec![*target, Expr::Field(name)])
                 }
+                Expr::Literal(Literal::Int(idx)) => {
+                    Expr::pipe(vec![*target, Expr::Index { idx, key: None }])
+                }
+                Expr::Literal(Literal::Float(f)) if f.fract() == 0.0 && f.abs() < 9.0e18 => {
+                    Expr::pipe(vec![
+                        *target,
+                        Expr::Index {
+                            idx: f as i64,
+                            key: Some(NumberKey::Float(f)),
+                        },
+                    ])
+                }
                 other => Expr::IndexExpr {
                     target,
                     key: Box::new(other),
@@ -9639,6 +9679,9 @@ impl<'a> Parser<'a> {
                 Expr::pipe(folded)
             }
             Expr::Paren(inner) => Expr::Paren(Box::new(Self::fold_sum_or_merge_key(*inner))),
+            Expr::Comma(items) => {
+                Expr::Comma(items.into_iter().map(Self::fold_sum_or_merge_key).collect())
+            }
             other => other,
         }
     }
