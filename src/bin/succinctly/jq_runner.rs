@@ -6000,6 +6000,13 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // #4397: under `--stream` the program reads one `tostream` event at a time,
                 // each walked out of its document as the program asks for it, not kept.
                 let mut walk = stream_events_lazily.then(|| jq::tostream_events_iter(document));
+                // #5675: a `-R` line is already the string the filter reads, so it is handed over
+                // as that tree rather than written out as JSON text, indexed and read back for
+                // every line.
+                let owned_route = walk.is_some()
+                    || (args.raw_input
+                        && args.input_dsv.is_none()
+                        && matches!(document, OwnedValue::String(_)));
                 let mut whole = Some(document);
                 loop {
                     let input = match walk.as_mut() {
@@ -6026,7 +6033,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                         &at,
                         &mut sink,
                         &output_config,
-                        walk.is_some(),
+                        owned_route,
                         &mut |sink, result| {
                             had_output = true;
                             last_output = Some(result.clone());
