@@ -25,10 +25,13 @@ Usage:
     cargo build --release --features cli,simd,regex,serde
     scripts/jq-grammar-fuzz.py [--bin PATH] [--jq PATH] [-n N] [--seed S] [--show K] [--depth D]
     scripts/jq-grammar-fuzz.py --self-test        # the alphabet, so a shrink is visible
+    scripts/jq-grammar-fuzz.py --json             # one JSON object instead of the text report
+`succinctly dev compare jq` runs it as the `fuzz` dimension (#5552) and reads `--json`.
 Exit 1 on any divergence. `--jq` defaults to /usr/bin/jq, which must be jq 1.7.1.
 """
 import argparse
 import json
+import os
 import random
 import re
 import subprocess
@@ -178,9 +181,19 @@ def normalize_err(text):
     return line
 
 
+def tool_env():
+    """The environment both tools run in: the fixed one `dev compare jq` uses elsewhere, so a
+    locale or zone the host exports cannot read as a divergence."""
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("JQ_COLORS", "NO_COLOR", "LANG", "LANGUAGE") and not k.startswith("LC_")}
+    env.update(LC_ALL="C", TZ="UTC")
+    return env
+
+
 def run(cmd, program, doc, timeout):
     try:
-        r = subprocess.run(cmd + ["-c", program], input=doc.encode(), capture_output=True, timeout=timeout)
+        r = subprocess.run(cmd + ["-c", program], input=doc.encode(), capture_output=True,
+                           timeout=timeout, env=tool_env())
     except subprocess.TimeoutExpired:
         return None
     return r.returncode, r.stdout.decode("utf-8", "replace"), normalize_err(r.stderr.decode("utf-8", "replace"))
@@ -244,6 +257,23 @@ def signature(res, ours, theirs):
             (theirs[2] or "")[:30], (ours[2] or "")[:30], bool(ours and theirs and ours[1] == theirs[1]))
 
 
+def report(a, counts, signatures, findings):
+    """The `--json` result: what ran, and each minimized finding with both tools' outcomes."""
+    outcome = lambda o: None if o is None else {"exit": o[0], "stdout": o[1], "error": o[2]}
+    return {
+        "seed": a.seed,
+        "programs": a.n,
+        "depth": a.depth,
+        "counts": counts,
+        "signatures": signatures,
+        "findings": [
+            {"kind": res, "members": count, "program": text, "doc": doc,
+             "reference": outcome(theirs), "subject": outcome(ours)}
+            for count, res, text, doc, ours, theirs in findings
+        ],
+    }
+
+
 def main():
     from concurrent.futures import ThreadPoolExecutor
 
@@ -258,6 +288,7 @@ def main():
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--timeout", type=float, default=2.0)
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--json", action="store_true", help="print one JSON object, not the text report")
     a = ap.parse_args()
     if a.self_test:
         print("arity0:", len(ARITY0), "arity1:", len(ARITY1), "formats:", len(FORMATS), "paths:", len(PATHS))
@@ -302,6 +333,9 @@ def main():
         text = small.render()
         o, t = both(text, doc)
         findings.append((len(members), res, text, doc, o, t))
+    if a.json:
+        print(json.dumps(report(a, counts, len(groups), findings), sort_keys=True))
+        return 1 if groups else 0
     print(f"seed={a.seed} n={a.n} depth={a.depth} {time.time() - t0:.0f}s  " +
           "  ".join(f"{k}={v}" for k, v in sorted(counts.items())) +
           f"  signatures={len(groups)}")

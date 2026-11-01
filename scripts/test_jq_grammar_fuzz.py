@@ -8,6 +8,8 @@ by an equal one made the first version loop forever). Run directly or via
 """
 
 import importlib.util
+import json
+import os
 import pathlib
 import random
 import sys
@@ -72,6 +74,34 @@ class ComparisonTests(unittest.TestCase):
         ours, theirs = (0, "1\n", ""), (5, "", "jq: error: x")
         self.assertEqual(fuzz.signature("ours-only", ours, theirs), fuzz.signature("ours-only", ours, theirs))
         self.assertNotEqual(fuzz.signature("ours-only", ours, theirs), fuzz.signature("mismatch", ours, theirs))
+
+
+class ReportTests(unittest.TestCase):
+    def test_the_tools_run_in_the_fixed_environment(self):
+        saved = dict(os.environ)
+        try:
+            os.environ.update(LANG="de_DE.UTF-8", LC_TIME="de_DE.UTF-8", LC_ALL="tr_TR", TZ="Asia/Tokyo",
+                              JQ_COLORS="1;31", NO_COLOR="1", LANGUAGE="de", KEEP_ME="1")
+            env = fuzz.tool_env()
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+        self.assertEqual((env["LC_ALL"], env["TZ"], env["KEEP_ME"]), ("C", "UTC", "1"))
+        for gone in ("LANG", "LC_TIME", "JQ_COLORS", "NO_COLOR", "LANGUAGE"):
+            self.assertNotIn(gone, env)
+
+    def test_the_json_report_carries_each_finding_with_both_outcomes(self):
+        args = type("A", (), {"seed": 7, "n": 9, "depth": 3})()
+        ours, theirs = (0, "1\n", ""), (5, "", "jq: error: x")
+        rep = fuzz.report(args, {"agree": 8, "ours-only": 1}, 1, [(4, "ours-only", ".a", "{}", ours, theirs)])
+        self.assertEqual((rep["seed"], rep["programs"], rep["signatures"]), (7, 9, 1))
+        self.assertEqual(
+            rep["findings"],
+            [{"kind": "ours-only", "members": 4, "program": ".a", "doc": "{}",
+              "reference": {"exit": 5, "stdout": "", "error": "jq: error: x"},
+              "subject": {"exit": 0, "stdout": "1\n", "error": ""}}],
+        )
+        json.dumps(rep)  # serializable as it stands
 
 
 class ShrinkTests(unittest.TestCase):

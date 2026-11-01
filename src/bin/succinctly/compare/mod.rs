@@ -16,6 +16,7 @@ mod docs;
 mod env;
 mod exec;
 mod features;
+mod fuzz;
 mod harness;
 mod jsonconf;
 mod ledger;
@@ -57,6 +58,8 @@ pub enum Dimension {
     Cli,
     /// B: the upstream jq test files, differentially
     Differential,
+    /// B: grammar-based differential fuzzing (`scripts/jq-grammar-fuzz.py`)
+    Fuzz,
     /// C: JSON input conformance (JSONTestSuite)
     Input,
     /// D and E: wall time and peak memory, interleaved, output-gated
@@ -191,6 +194,9 @@ pub struct Results {
     pub secondary_suites_skipped: Vec<String>,
     /// C.
     pub input: Option<jsonconf::InputSummary>,
+    /// B, the grammar fuzzer's runs and minimized findings (#5552).
+    #[serde(default)]
+    pub fuzz: Option<fuzz::Summary>,
     /// D and E, one row per query × input.
     pub perf: Vec<perf::PerfRow>,
     pub perf_note: Option<String>,
@@ -424,7 +430,10 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         if verifying {
             return !matches!(
                 d,
-                Dimension::Smoke | Dimension::Performance | Dimension::Operational
+                Dimension::Smoke
+                    | Dimension::Performance
+                    | Dimension::Operational
+                    | Dimension::Fuzz
             );
         }
         args.dimension.is_empty() || args.dimension.contains(&d)
@@ -618,8 +627,30 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         }
         dimensions.push(DimensionStatus {
             name: "B. Behavioural correctness (differential)",
-            status: "implemented (upstream test files; grammar fuzzing and the sweep scripts are not yet folded in)",
+            status: "implemented (upstream test files; the sweep scripts are not yet folded in; grammar fuzzing is the fuzz dimension)",
         });
+    }
+    let mut fuzz_summary = None;
+    if want(Dimension::Fuzz) {
+        if fuzz::python_available() {
+            run_suites.push("fuzz".into());
+            let sum = fuzz::run(&root, &manifest.fuzz, &reference, &subject)?;
+            for f in &sum.findings {
+                observed.insert(f.id());
+            }
+            dimensions.push(DimensionStatus {
+                name: "B. Grammar-based differential fuzzing",
+                status: "implemented (fixed seeds; findings are minimized and keyed by program)",
+            });
+            fuzz_summary = Some(sum);
+        } else if args.dimension.contains(&Dimension::Fuzz) {
+            bail!("the fuzz dimension runs scripts/jq-grammar-fuzz.py, and python3 was not found");
+        } else {
+            dimensions.push(DimensionStatus {
+                name: "B. Grammar-based differential fuzzing",
+                status: "not run (python3 was not found)",
+            });
+        }
     }
     let mut input = None;
     if want(Dimension::Input) {
@@ -817,7 +848,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     if args.ledger_only && run_suites.is_empty() {
         bail!(
             "--ledger-only ran no suite: --dimension names only dimensions it skips (smoke, \
-             performance, operational); the ledger is fed by features, cli, differential, input \
+             performance, operational, fuzz); the ledger is fed by features, cli, differential, input \
              and robustness"
         );
     }
@@ -880,6 +911,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         differential_secondary,
         secondary_suites_skipped,
         input,
+        fuzz: fuzz_summary,
         robust: robust_rows,
         operational: operational_info,
         perf: perf_rows,

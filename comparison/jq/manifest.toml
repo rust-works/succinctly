@@ -136,6 +136,17 @@ sha256 = "e938a45b6fe3fa7913207bc4de389f52f5641de1f6f50746b4260dbeb1291050"
 [perf]
 queries = "comparison/jq/queries/perf.tsv"
 
+# Dimension B's grammar fuzzer (scripts/jq-grammar-fuzz.py, #5696). Programs and documents come
+# from a typed grammar under a fixed seed, so a run covers the same programs every time; a changed
+# grammar, seed list or program count moves what is covered, not just whether it passes, and a
+# `--quick` run covers the same programs as a full one: a ledgered finding (`fuzz:p-<hash>`)
+# would otherwise read as stale in the run that did not generate it.
+[fuzz]
+script = "scripts/jq-grammar-fuzz.py"
+seeds = [1, 2, 3]
+programs = 2000
+depth = 3
+
 [[input]]
 id = "users-1mb"
 shape = "users"
