@@ -4757,14 +4757,17 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         }
     };
 
-    // Build the $ARGS special variable
-    let args_value = build_args_var(&context);
+    // Build the $ARGS special variable, only for a program that uses it (#5713): the object
+    // holds a copy of every named argument, and a `--rawfile` of 84 MB was copied into it for a
+    // program that never reads `$ARGS`.
+    let args_value = args_var_if_named(&expr, &context);
 
     // Substitute variables from context into the expression. `$ARGS` goes first: each variable is
     // substituted in a pass over the whole expression, and a container named argument becomes a
     // literal tree as large as the value, so a variable substituted after one walks all of it
-    // (#5673). `$ARGS` is substituted for every run, whether or not the program mentions it.
-    let mut all_vars: Vec<(&str, &OwnedValue)> = vec![("ARGS", &args_value)];
+    // (#5673).
+    let mut all_vars: Vec<(&str, &OwnedValue)> = Vec::new();
+    all_vars.extend(args_value.as_ref().map(|value| ("ARGS", value)));
     all_vars.extend(context.named.iter().map(|(k, v)| (k.as_str(), v)));
 
     let mut expr = jq::substitute_vars(&expr, all_vars);
@@ -6219,6 +6222,26 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
     }
 
     Ok(context)
+}
+
+/// Whether `expr` may read `$ARGS` (#5713): a use of it anywhere in the tree, or a call that
+/// still carries a `builtin_fallback`. `any_subexpr` does not descend into a fallback -- it
+/// assumes the compile-time resolution has run, which it has not yet -- and a call whose name a
+/// `def` shadows at another arity keeps its arguments there (`def limit(f): 1; limit(1; $ARGS)`),
+/// so such a call is taken to name it. A binder alone (`. as $ARGS | 1`) does not: nothing reads it.
+fn names_args_variable(expr: &jq::Expr) -> bool {
+    jq::walk::any_subexpr(expr, &mut |e| match e {
+        jq::Expr::Var(name) => name == "ARGS",
+        jq::Expr::FuncCall {
+            builtin_fallback, ..
+        } => builtin_fallback.is_some(),
+        _ => false,
+    })
+}
+
+/// The `$ARGS` object, built only when [`names_args_variable`] says the program may read it.
+fn args_var_if_named(expr: &jq::Expr, context: &EvalContext) -> Option<OwnedValue> {
+    names_args_variable(expr).then(|| build_args_var(context))
 }
 
 /// Build the $ARGS special variable containing named and positional args.
@@ -13439,6 +13462,59 @@ fn format_json_text(value: &OwnedValue, config: &OutputConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5713: `$ARGS` is built for a program that names it, wherever it stands, and only then.
+    #[test]
+    fn args_object_is_built_only_for_a_program_that_names_it_5713() {
+        for named in [
+            "$ARGS",
+            "$ARGS.named.a",
+            "[$ARGS.positional[]]",
+            "1 | . + ($ARGS.named.a | length)",
+            "def f: $ARGS; f",
+            "def f($x): $x; f($ARGS)",
+            "reduce range(2) as $i (0; . + ($ARGS.named.a | length))",
+            "\"v=\\($ARGS.positional)\"",
+            "try error($ARGS) catch .",
+            ". as $ARGS | $ARGS",
+            // A call a `def` shadows at another arity keeps its arguments in a fallback.
+            "def limit(f): 1; [limit(1; $ARGS)]",
+            "def range(f): 1; [range(0; $ARGS.positional | length)]",
+            "def splits(f): 1; [splits(\"a\"; $ARGS.named.a)]",
+        ] {
+            let expr = jq::parse(named).unwrap_or_else(|e| panic!("{named:?}: {e:?}"));
+            assert!(names_args_variable(&expr), "{named:?} names $ARGS");
+        }
+        for unnamed in [
+            ".",
+            "$a",
+            "$a | length",
+            "$ENV.PATH",
+            ".ARGS",
+            "\"$ARGS\"",
+            "{ARGS: 1}",
+            "def f($x): $x; f($a)",
+            // Only a use counts: a binder nothing reads builds nothing.
+            ". as $ARGS | 1",
+        ] {
+            let expr = jq::parse(unnamed).unwrap_or_else(|e| panic!("{unnamed:?}: {e:?}"));
+            assert!(
+                !names_args_variable(&expr),
+                "{unnamed:?} does not name $ARGS"
+            );
+        }
+
+        // The object itself is built for the one and not the other.
+        let mut context = EvalContext::default();
+        context
+            .named
+            .insert("a".to_string(), OwnedValue::String("x".into()));
+        let used = jq::parse("$ARGS.named.a").unwrap();
+        let unused = jq::parse("$a").unwrap();
+        let built = args_var_if_named(&used, &context).expect("a program that reads $ARGS");
+        assert!(built.to_json().contains("\"named\":{\"a\":\"x\"}"));
+        assert!(args_var_if_named(&unused, &context).is_none());
+    }
 
     /// #5674: a `--seq` stream is read as plain JSON only when nothing about it is unusual, and
     /// is then the same text with each RS blanked (so every offset and line stays put); every
