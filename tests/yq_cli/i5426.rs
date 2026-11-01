@@ -47,3 +47,28 @@ fn contains_reads_the_earliest_entry_at_every_depth() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn object_slice_counts_a_repeated_keys_earlier_entries() -> Result<()> {
+    // yq's child list is `[a,1,a,2,b,3]`: one key/value pair per entry, not per distinct key.
+    for (filter, expected) in [
+        (".[0:2]", "[\"a\",1]\n"),
+        (".[1:]", "[1,\"a\"]\n"),
+        (".[2:5]", "[\"a\",2,\"b\"]\n"),
+        (".[-3:-1]", "[2,\"b\"]\n"),
+        (".[:2]", "[\"a\",1]\n"),
+        (".[5:]", "[]\n"),
+        ("[.] | .[0] | .[1:4]", "[1,\"a\",2]\n"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, DUP, &["-o=json", "-I0"])?;
+        assert_eq!((out.as_str(), code), (expected, 0), "{filter}");
+    }
+    Ok(())
+}
+
+#[test]
+fn object_slice_without_a_repeated_key_is_unchanged() -> Result<()> {
+    let (out, _) = run_yq_stdin(".[1:3]", "a: 1\nb: 2\nc: 3\n", &["-o=json", "-I0"])?;
+    assert_eq!(out, "[1,\"b\"]\n");
+    Ok(())
+}

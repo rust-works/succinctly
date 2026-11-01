@@ -1022,7 +1022,8 @@ What is still different, each a place that has not been taught the entries (an e
 - **`sort_keys`** collapses a repeated key (yq copies the last value over the earlier entries: `{"a":2,"a":2,"b":3}`).
 - **A comment, anchor or style on an earlier entry** is not carried on the routes that hold a `CommentTree`, which is keyed by key and describes the last entry: the earlier entry is written plain.
   An alias to an anchor declared on an earlier entry is written as that entry's value, since the anchor is not.
-- **Object slicing** (#1102) and the other `IndexMap` builders that have not been converted.
+- The other `IndexMap` builders that have not been converted.
+  Object slicing was one, closed by #5426.
 
 The sections below are the history of how each member was closed; where a bullet there says a route "collapses", this paragraph supersedes it.
 
@@ -1114,7 +1115,7 @@ Three narrower gaps #1398's fix deliberately left alone were filed before it lan
 - - [#1344](https://github.com/rust-works/succinctly/issues/1344) — `del`/`with_entries`/`map_values`/`walk` (and `recurse(f)`/`recurse(f; cond)`) fell through `eval_generic.rs`'s wildcard bridge (`eval_on_owned`), which materialized via an `IndexMap`.
   Closed (see the paragraph above): `[..]`, `.., 1` and `.. as $x | $x` print the node intact, as does every other shape in this list except `contains` and `sort_keys`.
 - - [#1102](https://github.com/rust-works/succinctly/issues/1102) — object slicing (`.[S:E]` on an object) must materialize into an `OwnedValue::Object` to build yq's AST-child-list view before slicing it.
-  Still a gap: the view is built from the collapsed map.
+  Closed by #5426: the slice reads the repeated key's every entry.
 
 **[#2186](https://github.com/rust-works/succinctly/issues/2186) records the routes that collapse
 by construction, which is a wider set than the issue's own `LazySeq` arm.**
