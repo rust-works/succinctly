@@ -7438,6 +7438,27 @@ impl<V: DocumentValue> GenericResult<V> {
         })
     }
 
+    /// [`Self::collect_owned`] for a *key* stream (an index key or a slice bound), which keeps the
+    /// escape that ended it instead of swallowing it (#5793).
+    ///
+    /// `collect_owned` answers a failing `map(f)` as an empty list, which is right for the callers
+    /// that only want the values. A key that is such a `map(f)` must raise `f`'s error, as jq's
+    /// `K as $k | .[$k]` does, so the keys that converted before the escape are returned beside it.
+    pub fn collect_owned_with_escape<S: EvalSemantics>(
+        self,
+    ) -> Result<(Vec<OwnedValue>, Option<Control>), EvalError> {
+        if matches!(self, Self::LazyObject(_)) {
+            return self.collect_owned::<S>().map(|keys| (keys, None));
+        }
+        match self.materialize_lazy_checked::<S>()? {
+            Self::Error(e) => Ok((vec![], Some(Control::Error(e)))),
+            Self::Break(label) => Ok((vec![], Some(Control::Break(label)))),
+            Self::Halt(code) => Ok((vec![], Some(Control::Halt(code)))),
+            Self::Partial(keys, control) => Ok((keys, Some(control))),
+            other => other.collect_owned::<S>().map(|keys| (keys, None)),
+        }
+    }
+
     /// Check if this is an error.
     ///
     /// A `Partial` prefix followed by an error still counts.
@@ -19893,10 +19914,11 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
             | GenericItem::LazyIndexRange(_)
             | GenericItem::LazySeq(_)
             | GenericItem::LazyObject(_)) => {
-                let ks = match generic_item_to_result(item).collect_owned::<S>() {
-                    Ok(ks) => ks,
-                    Err(e) => return escape.stop(Control::Error(e)),
-                };
+                let (ks, ended) =
+                    match generic_item_to_result(item).collect_owned_with_escape::<S>() {
+                        Ok(keys) => keys,
+                        Err(e) => return escape.stop(Control::Error(e)),
+                    };
                 for k in &ks {
                     if !process_index_key::<S, V>(
                         target,
@@ -19910,7 +19932,11 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
                         return Demand::Stop;
                     }
                 }
-                Demand::Continue
+                // #5793: the key stream's own escape, after the keys that preceded it.
+                match ended {
+                    Some(control) => escape.stop(control),
+                    None => Demand::Continue,
+                }
             }
         }
     });
@@ -24301,12 +24327,17 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             | GenericItem::LazyIndexRange(_)
             | GenericItem::LazySeq(_)
             | GenericItem::LazyObject(_)) => {
-                let ks = match generic_item_to_result(item).collect_owned::<S>() {
-                    Ok(ks) => ks,
-                    Err(e) => escape_generic!(Control::Error(e)),
-                };
+                let (ks, ended) =
+                    match generic_item_to_result(item).collect_owned_with_escape::<S>() {
+                        Ok(keys) => keys,
+                        Err(e) => escape_generic!(Control::Error(e)),
+                    };
                 for k in &ks {
                     process_one_key!(k);
+                }
+                // #5793: the key stream's own escape, after the keys that preceded it.
+                if let Some(control) = ended {
+                    escape_generic!(control);
                 }
             }
         }
@@ -25065,17 +25096,19 @@ fn pull_slice_bound_generic<S: EvalSemantics, V: DocumentValue>(
     let mut decode_failure: Option<Control> = None;
     let mut item_sink = |item: GenericItem<V>| -> Demand {
         let raw = match item {
-            GenericItem::One(v) => to_owned_key_shape::<_, S>(&v).map(|k| vec![k]),
+            GenericItem::One(v) => to_owned_key_shape::<_, S>(&v).map(|k| (vec![k], None)),
             GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => {
-                to_owned_key_shape_cursor::<_, S>(&c).map(|k| vec![k])
+                to_owned_key_shape_cursor::<_, S>(&c).map(|k| (vec![k], None))
             }
             item @ (GenericItem::Owned(_)
             | GenericItem::LazyKeys { .. }
             | GenericItem::LazyIndexRange(_)
             | GenericItem::LazySeq(_)
-            | GenericItem::LazyObject(_)) => generic_item_to_result(item).collect_owned::<S>(),
+            | GenericItem::LazyObject(_)) => {
+                generic_item_to_result(item).collect_owned_with_escape::<S>()
+            }
         };
-        let raw = match raw {
+        let (raw, ended) = match raw {
             Ok(raw) => raw,
             Err(e) => {
                 return stop_with_escape(&mut decode_failure, Control::Error(e));
@@ -25086,7 +25119,11 @@ fn pull_slice_bound_generic<S: EvalSemantics, V: DocumentValue>(
                 return Demand::Stop;
             }
         }
-        Demand::Continue
+        // #5793: the bound stream's own escape, after the bounds that preceded it.
+        match ended {
+            Some(control) => stop_with_escape(&mut decode_failure, control),
+            None => Demand::Continue,
+        }
     };
     // STYLE-0012: the bound is evaluated with a hardcoded `optional: false`.
     // `.[s:e]?` suppresses only its own slice step, never an error raised
