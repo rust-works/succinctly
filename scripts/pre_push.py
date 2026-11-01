@@ -182,6 +182,7 @@ NOT_MIRRORED = (
     (r"^\./scripts/sync-[\w-]+\.sh", "golden and corpus drift checks need the pinned yq/jq/corpus tooling CI installs"),
     (r"^python3 scripts/perf-guard\.py", "needs valgrind and a release binary on Linux"),
     (r"^python3 scripts/changelog\.py check-pr", "needs the PR's title, body and labels"),
+    (r"^python3 scripts/coverage-(shards|fit-comment)\.py", "the instrumented coverage run and its PR comment (coverage.yml) need cargo-llvm-cov and patchcov; scripts/test_coverage_shards.py is the local check"),
     (r"^\./target/release/succinctly dev compare jq", "the full report (compare-jq.yml); the ledger-fed subset is the ledger-only gate"),
 )
 

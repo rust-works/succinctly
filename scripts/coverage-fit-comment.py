@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fit patchcov's rendered coverage comment under GitHub's comment limit.
 
-    fit-comment.py IN OUT ARTIFACT
+    coverage-fit-comment.py IN OUT ARTIFACT
 
 GitHub refuses an issue comment longer than 65,536 characters, and patchcov lists
 every tolerated region and every line of unchanged code whose coverage changed. A

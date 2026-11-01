@@ -4,8 +4,9 @@
 # exits 0, with one exception: when pooling was requested (see B1 below) and the
 # files are not pooled it exits 1, so that a pooling run which silently did
 # nothing cannot pass for one that worked. Delete this file, and the
-# `extra-test-commands` line in action.yml that runs it, once its figures are no
-# longer wanted AND `pool-profile-files` is no longer used; while pooling is on,
+# `Profile file stats` step of coverage.yml that runs it, once its figures are no
+# longer wanted AND pooling is no longer used (the `Pool raw profile files` step of
+# .github/workflows/coverage.yml; it was the `pool-profile-files` input before #5711); while pooling is on,
 # this is the only thing that checks it took effect.
 #
 # It answers what the issue needs before deciding anything about the merge step:
@@ -32,7 +33,7 @@
 # groups no longer say how many processes a binary spawned; its count is the
 # evidence that pooling worked.
 #
-# B1: `pool-profile-files` exports LLVM_PROFILE_FILE_NAME for the rest of the job. A
+# B1: the `Pool raw profile files` step exports LLVM_PROFILE_FILE_NAME for the rest of the job. A
 # pooled run has about 70 files (one per test binary and doctest, plus the CLI's
 # per-CPU pool: 67 non-CLI files were counted in an unpooled run); an unpooled one
 # left 30,814 on 2026-10-04. More than 500 with the name set means the pool did not
@@ -57,7 +58,7 @@ find "$dir" -maxdepth 2 -name '*.profraw' -exec wc -c {} + 2>/dev/null |
 n=$(wc -l <"$list" | tr -d ' ')
 echo "dir: $dir"
 # What pattern this run's processes were told to write (#3750 B1): the second line
-# is only set when `pool-profile-files` is on.
+# is only set when pooling is on.
 echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE-<unset>}"
 echo "LLVM_PROFILE_FILE_NAME=${LLVM_PROFILE_FILE_NAME-<unset>}"
 pool_failed=0
@@ -116,7 +117,7 @@ df -h / 2>/dev/null || true
 
 echo "::endgroup::"
 if [ "$pool_failed" -eq 1 ]; then
-  echo "::error::pool-profile-files is on (LLVM_PROFILE_FILE_NAME=$LLVM_PROFILE_FILE_NAME) but $n .profraw files exist: pooling did not take effect (#3750)"
+  echo "::error::pooling is on (LLVM_PROFILE_FILE_NAME=$LLVM_PROFILE_FILE_NAME) but $n .profraw files exist: pooling did not take effect (#3750)"
   exit 1
 fi
 exit 0

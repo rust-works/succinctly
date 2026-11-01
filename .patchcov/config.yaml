@@ -1,8 +1,8 @@
 # Coverage config for `patchcov diff` (the sticky PR comment posted by
 # the `Coverage (x86_64)` / `Coverage (ARM64)` jobs in .github/workflows/ci.yml, via
-# the shared steps in .github/actions/coverage/action.yml).
+# the report job of .github/workflows/coverage.yml).
 #
-# Requires the patchcov version pinned in .github/actions/coverage/action.yml.
+# Requires the patchcov version pinned in .github/workflows/coverage.yml.
 # Migrated from omni-dev coverage config (#3873); the diff ignore-list schema
 # and filtering semantics are unchanged.
 diff:
@@ -51,7 +51,7 @@ diff:
   #     ~230-line file, the flapping region is wrapped in a
   #     coverage `tolerate` marker directly in
   #     src/util/simd/x86.rs (needs the patchcov pinned in
-  #     .github/actions/coverage/action.yml; rust-works/omni-dev#1593, succinctly#2467): the file
+  #     .github/workflows/coverage.yml; rust-works/omni-dev#1593, succinctly#2467): the file
   #     keeps contributing its real coverage to the total, and only the
   #     CPU-gated delta is masked.
   #

@@ -28,7 +28,8 @@
 # tests themselves, because they cover no line the rest of the suite does not
 # (#3750, B2). That is not driven by this list: a test moved here is NOT skipped from
 # Coverage unless it carries the attribute too, and it should only get it after the
-# same with/without comparison of the lcov line sets shows nothing unique is lost.
+# same with/without comparison of the lcov line sets shows nothing unique is lost. Coverage
+# runs them anyway, in the `jq-cli-heavy` shard of .github/workflows/coverage.yml (#5711).
 #
 # This file is the single source of truth for the list, for both sides:
 #
@@ -40,6 +41,11 @@
 #                                       `unshared-containers` build is tested, so it
 #                                       keeps running the heavy tests and skips just these
 #   deep-recursion-tests.sh run         the whole `deep-recursion` leg
+#   deep-recursion-tests.sh heavy-args  prints `--exact <name> ...` for HEAVY_TESTS (not the
+#                                       stack tests, which are `#[ignore]`d under coverage):
+#                                       the `jq-cli-heavy` coverage shard runs exactly these
+#                                       and the `jq-cli` shard `skip-args` them, so the two
+#                                       together run every `jq_cli_tests` test once (#5711)
 #
 # Why `run` checks more than `cargo test -- --exact <names>` does: libtest runs
 # zero tests and exits 0 when a filter matches nothing (`running 0 tests`,
@@ -93,7 +99,7 @@ HEAVY_TESTS=(
 DEEP_RECURSION_TESTS=("${STACK_TESTS[@]}" "${HEAVY_TESTS[@]}")
 
 usage() {
-  echo "usage: $0 skip-args|skip-args-stack|run" >&2
+  echo "usage: $0 skip-args|skip-args-stack|heavy-args|run" >&2
 }
 
 # `--exact --skip <name> ...` for the names given.
@@ -141,6 +147,7 @@ run() {
 }
 
 case "${1:-}" in
+  heavy-args) echo "--exact ${HEAVY_TESTS[*]}" ;;
   skip-args) skip_args_of "${DEEP_RECURSION_TESTS[@]}" ;;
   skip-args-stack) skip_args_of "${STACK_TESTS[@]}" ;;
   run) run ;;
