@@ -2412,10 +2412,33 @@ impl PipeStages {
     /// copied in turn.
     pub(crate) fn tail_copy(&self, from: usize) -> Self {
         let mut copy = Self::from(self.stages[from..].to_vec());
+        self.seed_negative_memos(&copy);
         if let Some((table, base)) = &self.tails.origin {
             copy.tails.origin = Some((Weak::clone(table), base + from));
         }
         copy
+    }
+
+    /// Hand a copy of some of this pipe's stages every `false` this pipe has settled (#5488).
+    ///
+    /// Each answer is "some stage holds X" over the stages, so a pipe of a subset of them
+    /// (a tail, a run) holds no X when this one holds none. A `true` is not inherited: the
+    /// stage that holds it may not be among the copy's. Without this a copy starts with empty
+    /// cells and re-walks its stages for each question, which for the tails of one pipe is
+    /// quadratic in its length, as the copies themselves are.
+    fn seed_negative_memos(&self, copy: &Self) {
+        for (owner, copy) in [
+            (&self.needs_path_context, &copy.needs_path_context),
+            (&self.effect_before_last, &copy.effect_before_last),
+            (&self.holds_tracked_var, &copy.holds_tracked_var),
+            (&self.holds_resolver_node, &copy.holds_resolver_node),
+            (&self.holds_bind, &copy.holds_bind),
+            (&self.holds_var, &copy.holds_var),
+        ] {
+            if owner.get() == Some(false) {
+                copy.set(Some(false));
+            }
+        }
     }
 
     /// The table this pipe's tails are kept in and the offset of its first
@@ -2589,6 +2612,7 @@ impl PipeStages {
                 let tail = &self.stages[from..from + (end - at)];
                 may_keep(tail).then(|| {
                     let mut copy = Self::from(tail.to_vec());
+                    self.seed_negative_memos(&copy);
                     if matches!(kind, SlotKind::Tail) {
                         copy.tails.origin = Some((Rc::downgrade(table), at));
                     }
@@ -4580,6 +4604,68 @@ mod tests {
             !iterated.needs_path_context_or_init(|_| false),
             "a rewrite by iteration forgets"
         );
+    }
+
+    /// #5488: a copy of some of a pipe's stages inherits every `false` the pipe has settled, so the
+    /// tails of one pipe do not each re-walk their stages for each question (quadratic in its
+    /// length, as the copies are). A `true` is not inherited: the stage that holds it may not be
+    /// among the copy's.
+    #[test]
+    fn a_tail_copy_inherits_the_negative_memos_5488() {
+        let stages = || PipeStages::from(vec![Expr::Identity; 6]);
+        let settle = |pipe: &PipeStages, answer: bool| {
+            assert_eq!(pipe.needs_path_context_or_init(|_| answer), answer);
+            assert_eq!(pipe.effect_before_last_or_init(|_| answer), answer);
+            assert_eq!(pipe.holds_tracked_var_or_init(|_| answer), answer);
+            assert_eq!(pipe.holds_resolver_node_or_init(|_| answer), answer);
+            assert_eq!(pipe.holds_bind_or_init(|_| answer), answer);
+            assert_eq!(pipe.holds_var_or_init(|_| answer), answer);
+        };
+        let owner = stages();
+        settle(&owner, false);
+        let copy = owner.tail_copy(2);
+        assert_eq!(copy.len(), 4);
+        // Every question is answered from the owner's `false`: a walk here would panic.
+        assert!(!copy.needs_path_context_or_init(|_| unreachable!("inherited")));
+        assert!(!copy.effect_before_last_or_init(|_| unreachable!("inherited")));
+        assert!(!copy.holds_tracked_var_or_init(|_| unreachable!("inherited")));
+        assert!(!copy.holds_resolver_node_or_init(|_| unreachable!("inherited")));
+        assert!(!copy.holds_bind_or_init(|_| unreachable!("inherited")));
+        assert!(!copy.holds_var_or_init(|_| unreachable!("inherited")));
+
+        // A `true` is the owner's alone, and an unanswered question is not guessed.
+        let owner = stages();
+        settle(&owner, true);
+        let copy = owner.tail_copy(2);
+        assert!(
+            !copy.needs_path_context_or_init(|_| false),
+            "the copy asks for itself"
+        );
+        assert!(
+            !copy.holds_var_or_init(|_| false),
+            "the copy asks for itself"
+        );
+        let unanswered = stages().tail_copy(1);
+        assert!(
+            unanswered.holds_bind_or_init(|_| true),
+            "nothing to inherit"
+        );
+
+        // A kept copy (the second ask for a tail) inherits them too.
+        let owner = stages();
+        settle(&owner, false);
+        assert!(
+            owner.kept_tail(1, |_| true).is_none(),
+            "the first ask keeps nothing"
+        );
+        let kept = owner
+            .kept_tail(1, |_| true)
+            .expect("kept on the second ask");
+        let Expr::Pipe(kept_stages) = kept.expr() else {
+            unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: a kept tail is a pipe (#5404)"
+        };
+        assert!(!kept_stages.holds_bind_or_init(|_| unreachable!("inherited")));
+        assert!(!kept_stages.needs_path_context_or_init(|_| unreachable!("inherited")));
     }
 
     /// #5404: a pipe keeps the owned copy of a tail from its second ask on,
