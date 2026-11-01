@@ -83277,6 +83277,11 @@ pub(crate) const MAX_PROJECTED_FIELDS: usize = 8;
 /// (`$name.k`, `$name.k?`; [`var_reads`](super::deferred_bind::var_reads)). Any other read -- bare
 /// `$name`, `$name[..]`, a dynamic key -- sees the whole element, so the answer is `None`.
 ///
+/// A single object pattern of literal keys (`as {a: $x, $b}`, #5544) is the other accepted shape:
+/// it binds names to members and never the element, so the fields are its keys
+/// ([`literal_pattern_keys`]) and UPDATE and EXTRACT are not scanned. A computed key, an array
+/// pattern, a `?//` alternation and an object pattern past [`MAX_PROJECTED_FIELDS`] keys decline.
+///
 /// Identity sharing (`retry.shares`, a body that compares or calls) does not decline it: the shared
 /// storage is then the projected object's, whose fields are the element's own values, so the answer
 /// does not depend on how the update spells its read.
@@ -83293,8 +83298,13 @@ pub(crate) fn fold_loop_var_projection<S: EvalSemantics>(
     if S::TAG != EvalTag::Jq || retry.marks {
         return None;
     }
-    let [Pattern::Var(name)] = patterns else {
-        return None;
+    let name = match patterns {
+        [Pattern::Var(name)] => name,
+        // #5544: an object pattern names no loop variable, so the element is read only through its
+        // keys, and the keys it names are the fields. A computed key, an array pattern or a `?//`
+        // alternation declines: the keys are not known, or the element is bound more than once.
+        [Pattern::Object(entries)] => return literal_pattern_keys(entries),
+        _ => return None,
     };
     let mut fields: Vec<String> = Vec::new();
     for body in core::iter::once(update).chain(extract) {
@@ -83306,6 +83316,26 @@ pub(crate) fn fold_loop_var_projection<S: EvalSemantics>(
             if !fields.contains(&field) {
                 fields.push(field);
             }
+        }
+    }
+    (fields.len() <= MAX_PROJECTED_FIELDS).then_some(fields)
+}
+
+/// The keys of an object destructuring pattern when every one is a literal, in order and without
+/// repeats, as the fields a fold's projection reads (#5544); `None` for a computed key or a count
+/// past [`MAX_PROJECTED_FIELDS`].
+///
+/// Each entry's value (the member under a key, whatever its sub-pattern binds from it) is walked
+/// whole, as the member of a `$u.k` read is. Nothing else of the element is read: the pattern binds
+/// names to members, never the element itself, so UPDATE and EXTRACT have nothing to read it by.
+fn literal_pattern_keys(entries: &[PatternEntry]) -> Option<Vec<String>> {
+    let mut fields: Vec<String> = Vec::new();
+    for entry in entries {
+        let ObjectKey::Literal(key) = &entry.key else {
+            return None;
+        };
+        if !fields.contains(key) {
+            fields.push(key.clone());
         }
     }
     (fields.len() <= MAX_PROJECTED_FIELDS).then_some(fields)
@@ -119322,8 +119352,8 @@ mod tests {
     }
 
     /// #5519: a fold projects its loop element to the fields it reads only when `$u.field` is the
-    /// sole way it reads `$u`; any other read, a destructuring pattern, a marked path read or
-    /// yq mode sees the whole element.
+    /// sole way it reads `$u`; any other read, a marked path read or yq mode sees the whole
+    /// element. #5544: an object pattern of literal keys projects those keys.
     #[test]
     fn test_fold_loop_var_projection_5519() {
         fn projection<S: EvalSemantics>(program: &str) -> Option<Vec<String>> {
@@ -119415,13 +119445,52 @@ mod tests {
             "foreach .[] as $u (0; . + 1; $u)",
             // A path-position read keeps the element whole (the marker's error text names it).
             "reduce .[] as $u (0; try ($u.a = 3) catch .)",
-            // A destructuring pattern and a `?//` alternation bind more than one name.
-            "reduce .[] as {a: $x} (0; . + $x)",
+            // An array pattern and a `?//` alternation bind the element more than once, or by
+            // position.
             "reduce .[] as [$x] (0; . + $x)",
             "reduce .[] as [$x] ?// $x (0; . + $x)",
+            "reduce .[] as {a: $x} ?// [$x] (0; . + $x)",
+            // A computed key is not known until the element is.
+            "reduce .[] as {(\"a\"): $x} (0; . + $x)",
+            "reduce .[] as {a: $x, (\"b\"): $y} (0; . + $x + $y)",
+            "foreach .[] as {(\"a\"): $x} (0; . + $x; .)",
         ] {
             assert_eq!(jq(program), None, "{program}");
         }
+        // #5544: an object pattern names no loop variable, so the keys it names (every one a
+        // literal) are the fields, once each and in order, whatever its sub-patterns bind.
+        assert_eq!(jq("reduce .[] as {a: $x} (0; . + $x)"), names(&["a"]));
+        assert_eq!(jq("reduce .[] as {$a} (0; . + $a)"), names(&["a"]));
+        assert_eq!(
+            jq("reduce .[] as {a: $x, b: $y, a: $z} (0; . + $x + $y + $z)"),
+            names(&["a", "b"])
+        );
+        assert_eq!(jq("reduce .[] as {\"a\": $x} (0; . + $x)"), names(&["a"]));
+        assert_eq!(jq("reduce .[] as {$k: [$x]} (0; . + $x)"), names(&["k"]));
+        assert_eq!(jq("reduce .[] as {a: {b: $x}} (0; . + $x)"), names(&["a"]));
+        assert_eq!(jq("reduce .[] as {a: $x} (0; . + 1)"), names(&["a"]));
+        assert_eq!(
+            jq("foreach .[] as {s: $s} (0; . + $s; [., $s])"),
+            names(&["s"])
+        );
+        // More literal keys than the projection pays for converts the element whole.
+        let keys = |count: usize| {
+            let pattern = (0..count)
+                .map(|i| format!("k{i}: $v{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("reduce .[] as {{{pattern}}} (0; . + 1)")
+        };
+        assert_eq!(
+            jq(&keys(MAX_PROJECTED_FIELDS)).map(|fields| fields.len()),
+            Some(MAX_PROJECTED_FIELDS)
+        );
+        assert_eq!(jq(&keys(MAX_PROJECTED_FIELDS + 1)), None);
+        // yq has no marker to say a name is never read in path position.
+        assert_eq!(
+            projection::<YqSemantics>("reduce .[] as {a: $x} (0; . + $x)"),
+            None
+        );
         // yq has no marker to say a loop variable is never read in path position.
         assert_eq!(
             projection::<YqSemantics>("reduce .[] as $u (0; . + $u.score)"),
