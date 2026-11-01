@@ -11655,6 +11655,45 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
             Demand::Stop => Flow::Stopped { pending: None },
         });
     }
+    // #5675: an expression that never reads `.` (`$n * 2` once `$n` is a literal, `1 + 2`,
+    // `[1, 2]`) is one value whatever the input is, so the input is not written out and indexed to
+    // find it. [`eval_owned_closed`] declines whatever errors, fans out or hands on a bound node.
+    // A bare literal is answered too, so a lone stage and the pipe around it read alike (#3673).
+    // jq mode only: its grammar for yq is narrower still.
+    if S::TAG == EvalTag::Jq {
+        if let Some(value) = eval_owned_closed::<S>(expr) {
+            return Some(match sink(value) {
+                Demand::Continue => Flow::Exhausted,
+                Demand::Stop => Flow::Stopped { pending: None },
+            });
+        }
+    }
+    // #5675: `(.|length) as $n | body` binds a count the count door answers, a fresh integer or
+    // boolean that is no node of `input`. The body then reads a literal, so it is evaluated over
+    // the same input without the bridge having to answer the count first: the source was a
+    // stage of the bridged pipe, written out and indexed for one `length`. jq mode only, like
+    // every other substitution of a bound value into a body.
+    if S::TAG == EvalTag::Jq {
+        if let Expr::As {
+            expr: source,
+            var,
+            body,
+        } = unwrap_paren(expr)
+        {
+            if let Some(count) = eval_owned_count_door::<S>(source, input) {
+                if matches!(count, OwnedValue::Int(_) | OwnedValue::Bool(_)) {
+                    let body = substitute_var(body, var, &count);
+                    return Some(eval_each_owned::<S>(
+                        &body,
+                        input,
+                        optional,
+                        Reentry::REBUILT,
+                        sink,
+                    ));
+                }
+            }
+        }
+    }
     // #4286: a read of a computed slice's range, `.[$i:][0]`, is the same question.
     if let Expr::Pipe(stages) = unwrap_paren(expr) {
         if let Some(read) =
@@ -151294,7 +151333,9 @@ mod tests {
             crate::jq::value::reindex_count::get() - before
         };
         let constant = r#"try .[] catch "c""#;
-        let evaluated = r#"try .[] catch ("c" | .)"#;
+        // #5675: `("c" | .)` never reads its input, so it is answered as a closed expression and
+        // pays no re-index either. The contrast is the same value behind stages no door answers.
+        let evaluated = r#"try .[] catch ("c" | explode | implode)"#;
         assert_eq!(
             reindexes(&|| drop(pulled::<JqSemantics>(b"5", constant))),
             0
@@ -151307,7 +151348,7 @@ mod tests {
         assert!(reindexes(&|| drop(pushed::<JqSemantics>(b"5", evaluated, usize::MAX))) > 0);
         // #4280: the same for a `path(.[])` body.
         let constant = r#"try path(.[]) catch "c""#;
-        let evaluated = r#"try path(.[]) catch ("c" | .)"#;
+        let evaluated = r#"try path(.[]) catch ("c" | explode | implode)"#;
         assert_eq!(
             reindexes(&|| drop(pulled::<JqSemantics>(b"5", constant))),
             0
