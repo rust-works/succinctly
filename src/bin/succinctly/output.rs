@@ -1154,18 +1154,32 @@ impl ColorScheme {
 
     /// The scheme for a `JQ_COLORS` value, or `None` when the variable is unset.
     ///
-    /// A value that is not UTF-8 is as malformed as one with a bad field: jq reads bytes and
-    /// rejects it, so it warns and keeps the defaults rather than ignoring it silently (#5760).
+    /// A value whose first eight fields are not UTF-8 is as malformed as one with a bad field: jq
+    /// reads bytes and rejects it, so it warns and keeps the defaults rather than ignoring it
+    /// silently (#5760).
     fn from_env_value(value: Option<&std::ffi::OsStr>) -> Self {
         let Some(value) = value else {
             return Self::default();
         };
 
-        value.to_str().and_then(Self::from_spec).unwrap_or_else(|| {
-            // Matches jq: warn on stderr, use defaults, but still exit successfully.
-            eprintln!("Failed to set $JQ_COLORS");
-            Self::default()
-        })
+        // jq reads only the first eight fields, so only their bytes have to be UTF-8: a stray
+        // byte in a ninth field is never looked at.
+        let bytes = value.as_encoded_bytes();
+        let read = bytes
+            .iter()
+            .enumerate()
+            .filter(|&(_, &byte)| byte == b':')
+            .nth(JQ_COLORS_FIELDS - 1)
+            .map_or(bytes, |(end, _)| &bytes[..end]);
+
+        std::str::from_utf8(read)
+            .ok()
+            .and_then(Self::from_spec)
+            .unwrap_or_else(|| {
+                // Matches jq: warn on stderr, use defaults, but still exit successfully.
+                eprintln!("Failed to set $JQ_COLORS");
+                Self::default()
+            })
     }
 }
 
