@@ -93,6 +93,13 @@ pub struct Tracked {
     /// a `path()`/`del()`/assignment resolution has a resolver invocation to
     /// certify against (see [`Origin::Untracked`]).
     pub node: Option<BindOrigin>,
+    /// The value is a fold's loop element handed on as itself, for jq's identity
+    /// short-circuit alone (#5540, `LoopVarSplice::Shared`): its storage is the
+    /// element's own, registered nowhere, so an in-place fold step may store it in the
+    /// accumulator as one `Rc` clone, as jq's `reduce` stores the `jv`. Every other
+    /// marker is an `as` binding's, which the #2889 embed table may track, and an
+    /// in-place step declines it (#3241, #4005).
+    pub fold_share: bool,
 }
 
 /// How an [`Expr::TrackedVar`] snapshot may be recognised in path position
@@ -246,6 +253,7 @@ impl Tracked {
             value,
             origin: Origin::Snapshot,
             node: None,
+            fold_share: false,
         })
     }
 }
