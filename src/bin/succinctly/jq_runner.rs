@@ -4770,7 +4770,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     all_vars.extend(args_value.as_ref().map(|value| ("ARGS", value)));
     all_vars.extend(context.named.iter().map(|(k, v)| (k.as_str(), v)));
 
-    let mut expr = jq::substitute_vars(&expr, all_vars);
+    let mut expr = jq::substitute_vars_sharing_strings(&expr, all_vars);
 
     // #1473: resolve every function call against the `def`s, parameters and
     // builtins in scope at its position, exactly as real jq's compiler does —

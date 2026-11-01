@@ -77199,6 +77199,43 @@ where
     result
 }
 
+/// A named-argument string at least this long is spliced as one shared marker rather than a
+/// literal (#5713). A literal is written into the expression once and copied again at each
+/// evaluation (two copies of the whole string per read); a marker holds one reference-counted
+/// string that every read shares. Below it the literal is kept: a short string is cheaper
+/// as a literal, whose fast path the folds' `. + $t` recognisers take first.
+const SHARED_STRING_MIN_BYTES: usize = 4096;
+
+/// [`substitute_vars`] for `jq` mode, where a long string value is spliced as a shared
+/// [`Origin::Untracked`] marker (#5713) -- what an `. as $x` bind of a non-document value
+/// already is -- instead of a `Literal::String` copy that is cloned again at each evaluation.
+///
+/// Strings only. A container spliced this way was found unsafe (#5690: a dynamic path target over
+/// it is refused, and a fold that appends it goes quadratic because `closed_expr_to_owned`
+/// declines a marked container). A marked *string* is a scalar: `closed_expr_to_owned` reads
+/// it by value and resets `escaped`, and a string has no node for a path to descend into.
+/// `jq` mode only, since `closed_expr_to_owned_node` reads a marker only there; the `yq`
+/// callers keep [`substitute_vars`].
+pub fn substitute_vars_sharing_strings<'a, I>(expr: &Expr, vars: I) -> Expr
+where
+    I: IntoIterator<Item = (&'a str, &'a OwnedValue)>,
+{
+    let mut result: Option<Expr> = None;
+    for (name, value) in vars {
+        let current = result.as_ref().unwrap_or(expr);
+        let next = match value {
+            OwnedValue::String(s) if s.len() >= SHARED_STRING_MIN_BYTES => {
+                let mut marker = LazyMarker::new(value, Origin::Untracked, None);
+                marker.share_string = true;
+                substitute_var_impl(current, name, value, Some(&marker))
+            }
+            _ => substitute_var(current, name, value),
+        };
+        result = Some(next);
+    }
+    result.unwrap_or_else(|| expr.clone())
+}
+
 /// Adapt an owned `(name, value)` binding list into the `(&str,
 /// &OwnedValue)` pairs [`substitute_vars`](substitute_vars) needs -- pattern
 /// bindings are stored owned (the matcher, `each_pattern_binding_set`, clones
@@ -77619,6 +77656,9 @@ struct LazyMarker<'a> {
     built: core::cell::OnceCell<Rc<Tracked>>,
     /// The marker is a fold's identity-sharing splice ([`Tracked::fold_share`], #5540).
     fold_share: bool,
+    /// Promote a string value to its shared form when the marker is first built (#5713), so the
+    /// copy is paid only by a program that reads the variable.
+    share_string: bool,
     /// A deferred binding (#3856): every `$var` becomes this
     /// [`Expr::DeferredVar`] and `value`/`origin` are never read.
     deferred: Option<Rc<BindOrigin>>,
@@ -77632,6 +77672,7 @@ impl<'a> LazyMarker<'a> {
             node,
             built: core::cell::OnceCell::new(),
             fold_share: false,
+            share_string: false,
             deferred: None,
         }
     }
@@ -77653,8 +77694,14 @@ impl<'a> LazyMarker<'a> {
 
     fn get(&self) -> Rc<Tracked> {
         Rc::clone(self.built.get_or_init(|| {
+            let mut value = self.value.clone();
+            if self.share_string {
+                if let OwnedValue::String(s) = &mut value {
+                    s.promote();
+                }
+            }
             Rc::new(Tracked {
-                value: self.value.clone(),
+                value,
                 origin: self.origin.clone(),
                 node: self.node.clone(),
                 fold_share: self.fold_share,
@@ -152043,6 +152090,54 @@ mod tests {
         )));
         assert!(!names_nan_index(&Expr::Index { idx: 0, key: None }));
         assert!(!names_nan_index(&Expr::Identity));
+    }
+
+    /// #5713: a string at the threshold is spliced as one marker whose storage every occurrence
+    /// shares, and one byte below it stays a literal; a container is never marked (#5690).
+    #[test]
+    fn a_long_named_string_is_spliced_as_one_shared_marker_5713() {
+        let program = crate::jq::parse("[$s, $s]").unwrap();
+        let splice = |value: &OwnedValue| substitute_vars_sharing_strings(&program, [("s", value)]);
+        let markers = |expr: &Expr| -> Vec<Rc<Tracked>> {
+            let Expr::Array(inner) = expr else {
+                panic!("{expr:?}")
+            };
+            let Expr::Comma(items) = &**inner else {
+                panic!("{inner:?}")
+            };
+            items
+                .iter()
+                .filter_map(|e| match e {
+                    Expr::TrackedVar(t) => Some(Rc::clone(t)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let long = OwnedValue::String("x".repeat(SHARED_STRING_MIN_BYTES).into());
+        let found = markers(&splice(&long));
+        assert_eq!(found.len(), 2);
+        assert!(
+            Rc::ptr_eq(&found[0], &found[1]),
+            "one marker for both reads"
+        );
+        assert_eq!(found[0].origin, Origin::Untracked);
+        let OwnedValue::String(held) = &found[0].value else {
+            panic!("a string")
+        };
+        assert!(held.is_shared(), "promoted, so a read clones a pointer");
+
+        let short = OwnedValue::String("x".repeat(SHARED_STRING_MIN_BYTES - 1).into());
+        assert!(
+            markers(&splice(&short)).is_empty(),
+            "below the threshold: literals"
+        );
+
+        let container = OwnedValue::array_from(vec![long.clone()]);
+        assert!(
+            markers(&splice(&container)).is_empty(),
+            "a container keeps its literal"
+        );
     }
 
     /// #1025: `owned_to_expr` had no depth guard -- splices a
