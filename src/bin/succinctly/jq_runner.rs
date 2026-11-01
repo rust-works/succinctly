@@ -5795,7 +5795,13 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     // Serde accepted the span as a whole value and its depth is bounded
                     // (`lazy_json_spans`), so it is the conversion the eager route made, minus
                     // a position only a depth error would have read.
-                    stream_document_validated(&lazy.text.as_bytes()[start..end], None, &[], 0)
+                    stream_document_validated(
+                        &lazy.text.as_bytes()[start..end],
+                        None,
+                        &[],
+                        0,
+                        DocumentForm::Value,
+                    )
                 };
                 jq::seed_remaining_inputs_lazily(
                     locations.per_value().iter().copied(),
@@ -6826,6 +6832,13 @@ fn get_inputs(
     // `resumed_errors`.
     let mut resumed_prefixes: Vec<Vec<StreamPrefix>> = Vec::new();
     let prefix_wanted = args.stream && stream_mode(args, track_eof, true) != StreamMode::Off;
+    // #5618: a run known to keep the `--stream` events builds each document as its events, so
+    // the documents that parse are never built as values.
+    let form = if stream_mode(args, track_eof, false) == StreamMode::Eager {
+        DocumentForm::StreamEvents
+    } else {
+        DocumentForm::Value
+    };
     let mut trailing_error: Option<TrailingParseError> =
         seq_deferred_warning.map(|message| TrailingParseError {
             error: EvalError::new(message),
@@ -6940,8 +6953,11 @@ fn get_inputs(
                     let mut faults = LineCounter::at_seam(raw.as_bytes(), seam);
                     loop {
                         let segment = &raw[offset..];
-                        let (parsed, parse_error) =
-                            parse_json_stream_prefix(segment, origin(&raw.as_bytes()[..offset]));
+                        let (parsed, parse_error) = parse_json_stream_prefix(
+                            segment,
+                            origin(&raw.as_bytes()[..offset]),
+                            form,
+                        );
                         let (spans, split_error) = split_json_values(segment.as_bytes());
                         if spans.len() < parsed.len() {
                             // patchcov: coverage tolerate reason="unreachable: the splitter is the more lenient of the two and the prefix parse materializes from its spans, so it cannot find fewer values -- the same internal-error guard as the non-resuming branch below (#1064), kept per segment (#4311)"
@@ -7044,7 +7060,7 @@ fn get_inputs(
                 }
                 // Parse as JSON stream: the clean prefix, and the parse error
                 // that ended it if the stream turned malformed (#2961).
-                let (mut parsed, parse_error) = parse_json_stream_prefix(&raw, origin(&[]));
+                let (mut parsed, parse_error) = parse_json_stream_prefix(&raw, origin(&[]), form);
                 // `--slurp` stays all-or-nothing: jq prints nothing for a
                 // slurped stream it could not finish parsing. The error goes
                 // out in jq's channel at exit 5, like every other malformed
@@ -7159,7 +7175,7 @@ fn get_inputs(
     let mut unflushed_close = None;
     let faulted = trailing_error.as_ref().is_some_and(|t| !t.seq_warning);
     if stream_mode(args, track_eof, faulted) == StreamMode::Eager {
-        expand_into_stream_events(&mut values, &mut locations, &mut resumed_errors);
+        expand_into_stream_events(&mut values, &mut locations, &mut resumed_errors, form);
         insert_stream_prefixes(
             &mut values,
             &mut locations,
@@ -7343,11 +7359,13 @@ fn insert_stream_prefixes(
 }
 
 /// Replace each of `values` with its `tostream` events (#4397), repeating its location for every
-/// event and moving each resumed error to the same place in the longer stream.
+/// event and moving each resumed error to the same place in the longer stream. Under
+/// [`DocumentForm::StreamEvents`] each of `values` is already the array of its events (#5618).
 fn expand_into_stream_events(
     values: &mut Vec<OwnedValue>,
     locations: &mut InputLocations,
     resumed_errors: &mut [(usize, TrailingParseError)],
+    form: DocumentForm,
 ) {
     let documents = std::mem::take(values);
     let document_count = documents.len();
@@ -7358,7 +7376,10 @@ fn expand_into_stream_events(
         starts.push(values.len());
         // `into_iter` hands over one document at a time and it is dropped once its events exist, so
         // the events take its leaves instead of copying them (#5611).
-        let events = succinctly::jq::tostream_events_owned(document);
+        let events = match (form, document) {
+            (DocumentForm::StreamEvents, OwnedValue::Array(events)) => events.into_vec(),
+            (_, document) => succinctly::jq::tostream_events_owned(document),
+        };
         if located {
             let target = locations.per_value.len() + events.len();
             locations.per_value.resize(target, old_locations[index]);
@@ -9541,7 +9562,7 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
     }
 
     let origin = Some(StreamOrigin::ALONE);
-    match parse_json_stream_strict(s, origin, text, lead) {
+    match parse_json_stream_strict(s, origin, text, lead, DocumentForm::Value) {
         Ok(values) => Ok(values),
         Err(e) => {
             let bytes = s.as_bytes();
@@ -9549,7 +9570,13 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
                 Ok(spans) => spans
                     .into_iter()
                     .map(|(start, end)| {
-                        stream_document_checked(&bytes[start..end], origin, text, lead + start)
+                        stream_document_checked(
+                            &bytes[start..end],
+                            origin,
+                            text,
+                            lead + start,
+                            DocumentForm::Value,
+                        )
                     })
                     // Wrapped rather than flattened, for the same reason as
                     // the sibling site in `parse_json_stream_strict`: the
@@ -9574,10 +9601,11 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
 /// already reports for the same failure.
 ///
 /// `origin` places `s` in jq's input for the depth limit's message, or is `None` for a stream
-/// jq reads with no depth limit (`--stream`, #5497).
+/// jq reads with no depth limit (`--stream`, #5497). `form` is what each document becomes.
 fn parse_json_stream_prefix(
     s: &str,
     origin: Option<StreamOrigin<'_>>,
+    form: DocumentForm,
 ) -> (Vec<OwnedValue>, Option<EvalError>) {
     // The same trim as [`parse_json_stream`]'s (#5654), so the two accept the same text.
     let (text, lead) = (
@@ -9588,7 +9616,7 @@ fn parse_json_stream_prefix(
     if s.is_empty() {
         return (vec![], None);
     }
-    if let Ok(values) = parse_json_stream_strict(s, origin, text, lead) {
+    if let Ok(values) = parse_json_stream_strict(s, origin, text, lead, form) {
         return (values, None);
     }
     // #5555: jq's parser names the first fault of the text, which can sit inside a value the
@@ -9604,7 +9632,7 @@ fn parse_json_stream_prefix(
     let (spans, split_error) = split_json_values(bytes);
     let mut values = Vec::with_capacity(spans.len());
     for (start, end) in spans {
-        match stream_document_checked(&bytes[start..end], origin, text, lead + start) {
+        match stream_document_checked(&bytes[start..end], origin, text, lead + start, form) {
             Ok(value) => values.push(value),
             Err(error) if error.is_decode_failure() => {
                 return (values, Some(jq_fault().map_or(error, EvalError::new)));
@@ -9623,12 +9651,14 @@ fn parse_json_stream_prefix(
 /// its own doc comment can describe the fallback wrapping it without also
 /// re-explaining this half's mechanics inline.
 ///
-/// `s` starts `lead` bytes into `text`, which `origin` places in jq's input (#5497).
+/// `s` starts `lead` bytes into `text`, which `origin` places in jq's input (#5497). `form` is
+/// what each document becomes.
 fn parse_json_stream_strict(
     s: &str,
     origin: Option<StreamOrigin<'_>>,
     text: &[u8],
     lead: usize,
+    form: DocumentForm,
 ) -> Result<Vec<OwnedValue>> {
     // Validate the whole stream via `serde_json::Deserializer` (for its own error message and its
     // rejection of anything that isn't valid, whitespace-or-self-delineated-separated JSON) --
@@ -9680,7 +9710,7 @@ fn parse_json_stream_strict(
             // this call's guard rather than an incidental by-product of
             // whatever validated the text -- and since #5608 it is the only
             // one: `IgnoredAny` has no recursion limit to lean on.
-            stream_document_validated(&bytes[start..end], origin, text, lead + start)
+            stream_document_validated(&bytes[start..end], origin, text, lead + start, form)
                 .map_err(|e| anyhow::Error::from(MalformedJsonError::new(e)))?,
         );
         prev_end = end;
@@ -12334,7 +12364,20 @@ fn json_document_to_owned_value_checked(
     bytes: &[u8],
     at: Option<&dyn Fn() -> (usize, usize)>,
 ) -> core::result::Result<OwnedValue, EvalError> {
-    json_document_to_owned_value(bytes, at, Delimiters::Walk)
+    json_document_to_owned_value(bytes, at, Delimiters::Walk, DocumentForm::Value)
+}
+
+/// What [`json_document_to_owned_value`] builds of a document.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DocumentForm {
+    /// The document's value.
+    Value,
+    /// The array of the `tostream` events `--stream` replaces the document with, for a run that
+    /// keeps them ([`StreamMode::Eager`] known before the parse, #5618), which
+    /// [`expand_into_stream_events`] then flattens. A span `serde_json` accepted is walked from its
+    /// index ([`jq::json_tostream_events`]) without building the value; the rest, and a document
+    /// that walk declines, is the value's events.
+    StreamEvents,
 }
 
 /// How [`json_document_to_owned_value`] establishes that the delimiters of `bytes` are in place
@@ -12357,6 +12400,7 @@ fn json_document_to_owned_value(
     bytes: &[u8],
     at: Option<&dyn Fn() -> (usize, usize)>,
     delimiters: Delimiters,
+    form: DocumentForm,
 ) -> core::result::Result<OwnedValue, EvalError> {
     let index = JsonIndex::build(bytes);
     if let Some(at) = at {
@@ -12367,16 +12411,27 @@ fn json_document_to_owned_value(
         }
     }
     let cursor = index.root(bytes);
+    if let (DocumentForm::StreamEvents, Delimiters::SerdeValidated) = (form, delimiters) {
+        if let Some(events) = jq::json_tostream_events(&cursor) {
+            return Ok(OwnedValue::array_from(events));
+        }
+    }
     // `bytes` is often a temporary (an `--argjson` string, a `--seq` record),
     // so each NaN gets an identity of its own rather than its address (#3309).
-    match delimiters {
+    let value = match delimiters {
         Delimiters::Walk => {
             validate_json_delimiters(&cursor, 0)?;
             generic_to_owned::<JqSemantics, _>(&cursor.value())
         }
         Delimiters::SerdeValidated => generic_to_owned_checked::<JqSemantics, _>(&cursor.value()),
-    }
-    .map(|value| value.with_fresh_nan_instances(bytes))
+    }?
+    .with_fresh_nan_instances(bytes);
+    Ok(match form {
+        DocumentForm::Value => value,
+        DocumentForm::StreamEvents => {
+            OwnedValue::array_from(succinctly::jq::tostream_events_owned(value))
+        }
+    })
 }
 
 /// [`json_document_to_owned_value_checked`] for the document `bytes` found at `text[offset]`,
@@ -12386,8 +12441,9 @@ fn stream_document_checked(
     origin: Option<StreamOrigin<'_>>,
     text: &[u8],
     offset: usize,
+    form: DocumentForm,
 ) -> core::result::Result<OwnedValue, EvalError> {
-    stream_document(bytes, origin, text, offset, Delimiters::Walk)
+    stream_document(bytes, origin, text, offset, Delimiters::Walk, form)
 }
 
 /// [`stream_document_checked`] for a span `serde_json` has just accepted as a whole value
@@ -12398,8 +12454,16 @@ fn stream_document_validated(
     origin: Option<StreamOrigin<'_>>,
     text: &[u8],
     offset: usize,
+    form: DocumentForm,
 ) -> core::result::Result<OwnedValue, EvalError> {
-    stream_document(bytes, origin, text, offset, Delimiters::SerdeValidated)
+    stream_document(
+        bytes,
+        origin,
+        text,
+        offset,
+        Delimiters::SerdeValidated,
+        form,
+    )
 }
 
 fn stream_document(
@@ -12408,12 +12472,16 @@ fn stream_document(
     text: &[u8],
     offset: usize,
     delimiters: Delimiters,
+    form: DocumentForm,
 ) -> core::result::Result<OwnedValue, EvalError> {
     match origin {
-        Some(origin) => {
-            json_document_to_owned_value(bytes, Some(&|| origin.position(text, offset)), delimiters)
-        }
-        None => json_document_to_owned_value(bytes, None, delimiters),
+        Some(origin) => json_document_to_owned_value(
+            bytes,
+            Some(&|| origin.position(text, offset)),
+            delimiters,
+            form,
+        ),
+        None => json_document_to_owned_value(bytes, None, delimiters, form),
     }
 }
 
@@ -14944,7 +15012,8 @@ mod tests {
             "",
         ] {
             let strict = parse_json_stream(text).ok().map(|values| values.len());
-            let (prefix, error) = parse_json_stream_prefix(text, Some(StreamOrigin::ALONE));
+            let (prefix, error) =
+                parse_json_stream_prefix(text, Some(StreamOrigin::ALONE), DocumentForm::Value);
             let by_prefix = error.is_none().then_some(prefix.len());
             assert_eq!(strict, by_prefix, "{text:?}");
         }
@@ -15639,12 +15708,17 @@ mod tests {
         assert_eq!(
             show(parse_json_stream_prefix(
                 "1 007 \"x\"",
-                Some(StreamOrigin::ALONE)
+                Some(StreamOrigin::ALONE),
+                DocumentForm::Value
             )),
             (vec!["1".into(), "7".into(), "\"x\"".into()], None)
         );
         assert_eq!(
-            show(parse_json_stream_prefix("  ", Some(StreamOrigin::ALONE))),
+            show(parse_json_stream_prefix(
+                "  ",
+                Some(StreamOrigin::ALONE),
+                DocumentForm::Value
+            )),
             (vec![], None)
         );
         // A splitter failure: truncated, unterminated, unmatched.
@@ -15654,12 +15728,16 @@ mod tests {
             ("1 2 \"abc", "Unfinished string at EOF at line 1, column 8"),
             ("1 2 }", "Unmatched '}' at line 1, column 5"),
         ] {
-            let (values, error) = show(parse_json_stream_prefix(text, Some(StreamOrigin::ALONE)));
+            let (values, error) = show(parse_json_stream_prefix(
+                text,
+                Some(StreamOrigin::ALONE),
+                DocumentForm::Value,
+            ));
             assert_eq!(values, vec!["1", "2"], "{text}");
             assert_eq!(error.as_deref(), Some(message), "{text}");
         }
         // Without an origin (`--stream`) the splitter's wording stands.
-        let (_, error) = show(parse_json_stream_prefix("1 2 }", None));
+        let (_, error) = show(parse_json_stream_prefix("1 2 }", None, DocumentForm::Value));
         assert_eq!(error.as_deref(), Some("Invalid JSON text"));
         // A span the splitter accepts but the materializer rejects: the
         // prefix ends there, and nothing after it is kept.
@@ -15682,7 +15760,7 @@ mod tests {
     #[test]
     fn strict_stream_route_agrees_with_the_checked_route_5608() {
         let strict = |text: &str, origin: Option<StreamOrigin<'_>>| {
-            parse_json_stream_strict(text, origin, text.as_bytes(), 0)
+            parse_json_stream_strict(text, origin, text.as_bytes(), 0, DocumentForm::Value)
         };
         let checked = |text: &str, origin: Option<StreamOrigin<'_>>| -> Vec<String> {
             let bytes = text.as_bytes();
@@ -15691,9 +15769,15 @@ mod tests {
             spans
                 .into_iter()
                 .map(|(start, end)| {
-                    stream_document_checked(&bytes[start..end], origin, bytes, start)
-                        .expect("the checked route accepts it")
-                        .to_json()
+                    stream_document_checked(
+                        &bytes[start..end],
+                        origin,
+                        bytes,
+                        start,
+                        DocumentForm::Value,
+                    )
+                    .expect("the checked route accepts it")
+                    .to_json()
                 })
                 .collect()
         };

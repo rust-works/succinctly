@@ -86864,6 +86864,155 @@ fn collect_tostream_events_owned(
     }
 }
 
+/// [`tostream_events_owned`] of the jq-mode value of the JSON document at `cursor`, built from the
+/// document's index instead of from the value (#5618), or `None` where it could not be built the
+/// same way.
+///
+/// `tostream_events_owned(to_owned_checked::<JqSemantics, _>(&cursor.value())?)` makes the same
+/// events, but builds the whole document first and then takes it apart. Here each leaf (a scalar or
+/// an empty container) goes through `to_owned_checked` alone and the paths are built from the
+/// index, with the same key sharing.
+///
+/// `None` means "take the conversion instead": the walk does not decide anything the conversion
+/// decides differently. It declines a repeated key in an object, which the conversion collapses to
+/// the key's first position and last value (and jq's own `--stream` does not); a key with an escape
+/// or one that is not a string, since the repeat check compares raw spellings; a leaf that does not
+/// convert, or is a NaN, whose identity the caller refreshes on the converted value; a member with
+/// no value; and a value at [`MAX_NESTING_DEPTH`](super::eval_generic::MAX_NESTING_DEPTH), which the
+/// conversion refuses. It checks no `,` or `:`: it is for a span `serde_json` has accepted whole,
+/// whose delimiters are in place.
+#[must_use]
+pub fn json_tostream_events<W: Clone + AsRef<[u64]>>(
+    cursor: &JsonCursor<'_, W>,
+) -> Option<Vec<OwnedValue>> {
+    let mut events = Vec::new();
+    let mut path = Vec::new();
+    if let Some(leaf) =
+        walk_json_stream(cursor.value(), 0, &mut path, &mut Vec::new(), &mut events)?
+    {
+        events.push(OwnedValue::Array(
+            vec![OwnedValue::Array(Vec::new().into()), leaf].into(),
+        ));
+    }
+    Some(events)
+}
+
+/// The most keys of one object [`walk_json_stream`] checks for a repeat by comparing each with the
+/// ones before it; a wider object is checked through a set, so the check stays linear.
+const STREAM_LINEAR_KEY_CHECK: usize = 16;
+
+/// [`json_tostream_events`]'s walk of `value`, whose path is `path`: `Some(None)` when `value` is a
+/// non-empty container and its events are in `events`, `Some(Some(leaf))` when it is a leaf for the
+/// caller to emit, `None` to decline. `keys` holds the raw keys of the objects being walked, for
+/// the repeat check.
+fn walk_json_stream<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    depth: usize,
+    path: &mut Vec<OwnedValue>,
+    keys: &mut Vec<&'a [u8]>,
+    events: &mut Vec<OwnedValue>,
+) -> Option<Option<OwnedValue>> {
+    if depth >= super::eval_generic::MAX_NESTING_DEPTH {
+        return None;
+    }
+    match &value {
+        StandardJson::Object(fields) if !fields.is_empty() => {
+            promote_stream_key(path);
+            let base = keys.len();
+            let mut wide: Option<indexmap::IndexSet<&'a [u8]>> = None;
+            let mut rest = *fields;
+            while let Some((field, after)) = rest.uncons() {
+                let StandardJson::String(key) = field.key() else {
+                    return None;
+                };
+                let (raw, escaped, _) = key.raw_and_escaped();
+                let raw = raw.get(1..raw.len().checked_sub(1)?)?;
+                if escaped || !stream_key_is_new(raw, &keys[base..], &mut wide) {
+                    return None;
+                }
+                keys.push(raw);
+                let last = after.is_empty();
+                path.push(OwnedValue::String(
+                    String::from(core::str::from_utf8(raw).ok()?).into(),
+                ));
+                let leaf = walk_json_stream(field.value(), depth + 1, path, keys, events)?;
+                let key = path.pop().expect("the key pushed above");
+                match leaf {
+                    None if last => push_closing_event(events, path, key),
+                    None => {}
+                    Some(leaf) if last => {
+                        let closing = key.clone();
+                        push_leaf_event(events, path, key, leaf);
+                        push_closing_event(events, path, closing);
+                    }
+                    Some(leaf) => push_leaf_event(events, path, key, leaf),
+                }
+                rest = after;
+            }
+            keys.truncate(base);
+            if rest.ends_unpaired() {
+                return None;
+            }
+            Some(None)
+        }
+        StandardJson::Array(elements) if !elements.is_empty() => {
+            promote_stream_key(path);
+            let mut rest = *elements;
+            let mut index = 0i64;
+            while let Some((element, after)) = rest.uncons_cursor() {
+                path.push(OwnedValue::Int(index));
+                let leaf = walk_json_stream(element.value(), depth + 1, path, keys, events)?;
+                let component = path.pop().expect("the index pushed above");
+                if let Some(leaf) = leaf {
+                    push_leaf_event(events, path, component, leaf);
+                }
+                index += 1;
+                rest = after;
+            }
+            push_closing_event(events, path, OwnedValue::Int(index - 1));
+            Some(None)
+        }
+        _ => {
+            let leaf = super::eval_generic::to_owned_checked::<JqSemantics, _>(&value).ok()?;
+            let nan = matches!(
+                leaf,
+                OwnedValue::NumberLiteral(NumberRepr::Float(f), _) | OwnedValue::Float(f) if f.is_nan()
+            );
+            (!nan).then_some(Some(leaf))
+        }
+    }
+}
+
+/// Share the key of the container [`walk_json_stream`] is about to walk into, as
+/// [`shared_stream_key`] does: every event beneath it clones the path.
+fn promote_stream_key(path: &mut [OwnedValue]) {
+    if let Some(OwnedValue::String(key)) = path.last_mut() {
+        key.promote();
+    }
+}
+
+/// Whether `key` is not among `seen`, the raw keys of the object before it; `wide` is the set
+/// [`walk_json_stream`] moves an object's keys into once it has [`STREAM_LINEAR_KEY_CHECK`] of them.
+fn stream_key_is_new<'a>(
+    key: &'a [u8],
+    seen: &[&'a [u8]],
+    wide: &mut Option<indexmap::IndexSet<&'a [u8]>>,
+) -> bool {
+    if let Some(set) = wide {
+        return set.insert(key);
+    }
+    if seen.contains(&key) {
+        return false;
+    }
+    if seen.len() + 1 >= STREAM_LINEAR_KEY_CHECK {
+        let mut set = indexmap::IndexSet::with_capacity(seen.len() * 2);
+        set.extend(seen.iter().copied());
+        set.insert(key);
+        *wide = Some(set);
+    }
+    true
+}
+
 /// [`tostream_events`], one event at a time (#4397).
 ///
 /// The same events in the same order, holding the walk's stack and the current path instead of
@@ -136133,6 +136282,141 @@ mod tests {
             .is_none(),
             "the ceiling must refuse something"
         );
+    }
+
+    /// #5618: the events built from a JSON document's index are the events of the document's
+    /// converted value, as printed and as `Debug` (the key sharing included), and every document
+    /// whose events the conversion would build differently is declined.
+    #[test]
+    fn json_tostream_events_matches_the_converted_value_5618() {
+        let bs = '\\';
+        let via_value = |text: &str| -> Option<Vec<OwnedValue>> {
+            let index = JsonIndex::build(text.as_bytes());
+            let value = super::super::eval_generic::to_owned_checked::<JqSemantics, _>(
+                &index.root(text.as_bytes()).value(),
+            )
+            .ok()?;
+            Some(tostream_events_owned(value))
+        };
+        let via_index = |text: &str| {
+            let index = JsonIndex::build(text.as_bytes());
+            json_tostream_events(&index.root(text.as_bytes()))
+        };
+        let wide = |keys: usize| {
+            let members: Vec<String> = (0..keys).map(|k| alloc::format!("\"k{k}\":{k}")).collect();
+            alloc::format!("{{{}}}", members.join(","))
+        };
+        let nest = |depth: usize| alloc::format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        let mut built = vec![
+            String::from("1"),
+            String::from("-0"),
+            String::from("1.50"),
+            String::from("1e999"),
+            String::from("100000000000000000001"),
+            String::from("1.000000000000000001"),
+            String::from("null"),
+            String::from("true"),
+            String::from("\"\""),
+            alloc::format!("\"a{bs}n{bs}u00e9{bs}\"\""),
+            String::from("[]"),
+            String::from("{}"),
+            String::from("[[]]"),
+            String::from("[{}]"),
+            String::from("{\"a\":{}}"),
+            String::from("{\"a\":1,\"b\":[1]}"),
+            String::from("{\"b\":[1],\"a\":1}"),
+            String::from("{\"a\":1,\"e\":[]}"),
+            String::from("[[[1]]]"),
+            String::from("[1,[2,[]],{\"x\":null}]"),
+            String::from(
+                "{\"users\":[{\"id\":1,\"name\":\"u1\",\"tags\":[\"a\",[],{}]},{\"id\":2}],\"n\":2}",
+            ),
+            // The same key in two objects is not a repeat.
+            String::from("{\"a\":1,\"b\":{\"a\":2}}"),
+            String::from("[{\"a\":1},{\"a\":2}]"),
+            String::from("{\"a\":{\"a\":{\"a\":1}}}"),
+            String::from("{\"\u{e9}\":1,\"e\u{301}\":2}"),
+            nest(super::super::eval_generic::MAX_NESTING_DEPTH - 1),
+        ];
+        // Either side of the set the repeat check moves into.
+        for keys in [
+            STREAM_LINEAR_KEY_CHECK - 1,
+            STREAM_LINEAR_KEY_CHECK,
+            STREAM_LINEAR_KEY_CHECK + 1,
+            100,
+        ] {
+            built.push(wide(keys));
+        }
+        for text in &built {
+            let events = via_index(text).unwrap_or_else(|| panic!("declined {text}"));
+            let expected = via_value(text).expect("the conversion accepts it");
+            assert_eq!(
+                alloc::format!("{events:?}"),
+                alloc::format!("{expected:?}"),
+                "{text}"
+            );
+        }
+
+        let repeated_wide = |keys: usize, repeat: usize| {
+            let mut members: Vec<String> =
+                (0..keys).map(|k| alloc::format!("\"k{k}\":{k}")).collect();
+            members.push(alloc::format!("\"k{repeat}\":0"));
+            alloc::format!("{{{}}}", members.join(","))
+        };
+        let mut declined = vec![
+            // A repeated key, adjacent, apart, nested, and inside a wide object at either end.
+            String::from("{\"a\":1,\"a\":2}"),
+            String::from("{\"a\":1,\"b\":2,\"a\":3}"),
+            String::from("[{\"x\":{\"a\":[1],\"a\":{}}}]"),
+            repeated_wide(STREAM_LINEAR_KEY_CHECK + 4, 0),
+            repeated_wide(STREAM_LINEAR_KEY_CHECK + 4, STREAM_LINEAR_KEY_CHECK + 3),
+            repeated_wide(100, 50),
+            // A key whose decoded spelling is not its raw bytes, repeated or not.
+            alloc::format!("{{\"{bs}u0061\":1,\"a\":2}}"),
+            alloc::format!("{{\"a{bs}n\":1}}"),
+            // The conversion's nesting ceiling, at a leaf and at a container.
+            nest(super::super::eval_generic::MAX_NESTING_DEPTH),
+            alloc::format!(
+                "{}[]{}",
+                "[".repeat(super::super::eval_generic::MAX_NESTING_DEPTH),
+                "]".repeat(super::super::eval_generic::MAX_NESTING_DEPTH)
+            ),
+            // A member with no value, and a key that is not a string.
+            String::from("{\"a\"}"),
+            String::from("{1:2}"),
+            // A leaf that does not convert.
+            String::from("[1,tru]"),
+        ];
+        declined.push(alloc::format!("[{}]", declined[0]));
+        for text in &declined {
+            assert!(via_index(text).is_none(), "accepted {text}");
+        }
+        // A container's key is shared by the events beneath it; a leaf's own key is not.
+        #[cfg(not(feature = "unshared-containers"))]
+        {
+            let events = via_index("{\"a\":{\"x\":1,\"y\":2}}").expect("built");
+            let component = |event: &OwnedValue, at: usize| -> SharableString {
+                let OwnedValue::Array(parts) = event else {
+                    panic!("an event is an array: {event:?}");
+                };
+                let OwnedValue::Array(path) = &parts[0] else {
+                    panic!("a path is an array: {event:?}");
+                };
+                let OwnedValue::String(key) = &path[at] else {
+                    panic!("a key is a string: {event:?}");
+                };
+                key.clone()
+            };
+            assert!(component(&events[0], 0).ptr_eq(&component(&events[1], 0)));
+            assert!(!component(&events[0], 1).ptr_eq(&component(&events[0], 1)));
+        }
+        // The collapse the decline keeps: first position, last value.
+        let shown: Vec<String> = via_value("{\"a\":1,\"b\":2,\"a\":3}")
+            .expect("converts")
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect();
+        assert_eq!(shown, [r#"[["a"],3]"#, r#"[["b"],2]"#, r#"[["b"]]"#]);
     }
 
     #[test]
