@@ -15,7 +15,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// over documents where the pattern passes (a sample of the answering rows of the table), a source that moves the register
 /// or yields nothing, and the INITs that compute. Every row captured from `/usr/bin/jq` 1.7.1 (stdout, exit code, message),
 /// both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5148_reduce_nav_init_bind_of_dot_update_keeps_the_accumulator() -> Result<()> {
@@ -984,7 +983,6 @@ fn test_5148_reduce_nav_init_bind_of_dot_update_keeps_the_accumulator() -> Resul
 
 /// #5148: the same table where the pattern raises on the document (the accumulator becomes `null`, or the raise is jq's own
 /// and stands), a sample of its rows.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5148_reduce_nav_init_bind_of_dot_update_where_the_pattern_raises() -> Result<()> {

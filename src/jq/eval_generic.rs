@@ -9673,8 +9673,7 @@ mod embed_table {
     }
 
     /// How many lazy entries hold a value.
-    // The test that reads it is off in the `unshared-containers` holdout.
-    #[cfg(all(test, not(feature = "unshared-containers")))]
+    #[cfg(test)]
     pub(crate) fn lazy_filled() -> usize {
         LAZY.with(|l| l.borrow().iter().filter(|e| e.value.is_some()).count())
     }
@@ -55299,7 +55298,6 @@ mod tests {
     /// pins that: it was one per round (100 rounds over a 1.4 MB state cost
     /// 286 ms, jq 15 ms) and is now flat in the round count. The outputs are
     /// jq 1.7.1's (captured live).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     #[allow(clippy::literal_string_with_formatting_args)] // STYLE-0004: jq object literals, not format strings
     fn test_until_while_owned_update_needs_no_reindex_per_round_3674() {
@@ -56028,9 +56026,6 @@ mod tests {
 
     /// #3477: a comma sequence that names a container node twice builds it
     /// once when it is materialized, and shares by node, never by value.
-    // Storage identity is what `unshared-containers` removes: a clone there
-    // deep-copies, so the pins below would read `false` for the wrong reason.
-    #[cfg(not(feature = "unshared-containers"))]
     #[test]
     fn test_comma_sequence_materialization_shares_a_repeated_node_3477() {
         let doc = r#"{"a":{"x":1},"b":{"x":1},"c":[1,2]}"#;
@@ -56100,11 +56095,8 @@ mod tests {
         assert_eq!(want, vec![OwnedValue::array_from(expected)]);
         // A node named twice is built once and shared; equal values at two
         // nodes are two builds.
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            assert!(items[0].shares_storage_with(&items[2]));
-            assert!(!items[0].shares_storage_with(&items[6]));
-        }
+        assert!(items[0].shares_storage_with(&items[2]));
+        assert!(!items[0].shares_storage_with(&items[6]));
     }
 
     /// #3856: a failing node is decoded only when something reads it, and then
@@ -56322,9 +56314,6 @@ mod tests {
 
     /// #3815: `[.. | parent?]` emits the root once per child, and the
     /// collection builds it once and shares it, by node and never by value.
-    // Storage identity is what `unshared-containers` removes: a clone there
-    // deep-copies, so the pins below would read `false` for the wrong reason.
-    #[cfg(not(feature = "unshared-containers"))]
     #[test]
     fn test_collected_parent_shares_a_repeated_ancestor_3815() {
         // Seventy inner arrays hold the root at the collection's 64-item
@@ -62432,8 +62421,8 @@ mod tests {
     /// `is_container` is "has BP children", so it is `false` for `{}`/`[]`,
     /// and the old `is_container()` gate never ran the `(node, document)`
     /// lookup for exactly the node a binding registered.
-    // `std` for the thread-local table; the holdout never shares storage.
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    // `std` for the thread-local table.
+    #[cfg(feature = "std")]
     #[test]
     fn embed_gate_finds_an_empty_container_binding_3180() {
         let doc = br#"{"a":{},"b":1}"#;
@@ -62592,7 +62581,7 @@ mod tests {
     /// it. A node below an already-bound ancestor anchors on that ancestor at
     /// once, with every step. A member a later duplicate key shadows gets no
     /// step, and so can never certify.
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     #[test]
     fn embed_anchor_pending_fill_and_steps_3134() {
         let doc = br#"{"a":{"b":1,"c":2},"x":[5,6],"d":1,"d":2}"#;
@@ -62743,7 +62732,7 @@ mod tests {
     /// escaped and undecodable keys, key nodes, empty and nested containers --
     /// and the count gate takes the fast path exactly when no member is
     /// shadowed.
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     #[test]
     fn anchor_step_by_nodes_agrees_with_the_generic_walk_3483() {
         type Cursor<'a> = crate::json::light::JsonCursor<'a, Vec<u64>>;
@@ -62809,7 +62798,7 @@ mod tests {
     /// cannot reach. An array refuses a node that is no child of it; a `held`
     /// that is neither an object nor an array declines; a format that does not
     /// claim one entry per child (YAML) declines and the generic walk answers.
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     #[test]
     fn anchor_step_by_nodes_refuses_and_declines_off_the_happy_path_3483() {
         // A node that is no child of an array: the array's own parent.
@@ -63447,8 +63436,8 @@ mod deferred_bind_tests_3856 {
     /// The lazy entry (#4036): the first materialization of the bound node
     /// builds it, every later one is handed the same `Rc`, and nothing but the
     /// materializer sees the entry.
-    // `std` for the thread-local table; the holdout never shares storage.
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    // `std` for the thread-local table.
+    #[cfg(feature = "std")]
     #[test]
     fn lazy_entry_fills_once_and_shares_the_copy_4036() {
         let doc = br#"{"a":[1,2],"b":{"c":3}}"#;
@@ -63491,7 +63480,7 @@ mod deferred_bind_tests_3856 {
     /// An entry for a body that reads the node once per element counts as a
     /// binding from its fill, not its first reuse; a yq evaluation never reads
     /// one (#4036).
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     #[test]
     fn sharing_entry_is_active_from_its_fill_and_jq_only_4036() {
         let doc = br#"{"a":[1,2]}"#;
@@ -63515,7 +63504,7 @@ mod deferred_bind_tests_3856 {
 
     /// Nested and shadowing entries for one node: the first build fills every
     /// entry waiting on it, and each guard pops its own (#4036).
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     #[test]
     fn lazy_entries_nest_and_pop_in_order_4036() {
         let doc = br#"{"a":[1,2]}"#;
@@ -63551,7 +63540,7 @@ mod deferred_bind_tests_3856 {
 
     /// A binding's entry coming and going does not take the lazy entry's claim
     /// on `active()` with it (#4036).
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     #[test]
     fn lazy_entry_keeps_the_table_active_across_other_bindings_4036() {
         let doc = br#"{"a":{"b":[1]},"c":2}"#;

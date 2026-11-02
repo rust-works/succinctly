@@ -14,7 +14,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// #5120: the issue's rows, on the register `$x` bound at the root and at `.a`, and the rows of a differential grid
 /// (bind site x INIT x source x UPDATE x EXTRACT x context) that `main` answered wrongly. Every row captured from
 /// `/usr/bin/jq` 1.7.1 (stdout, exit code, message), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5120_register_x_bind_in_a_foreach_body_beside_a_computed_init() -> Result<()> {
@@ -244,7 +243,6 @@ fn test_5120_register_x_bind_in_a_foreach_body_beside_a_computed_init() -> Resul
 /// #5120, a silent no-op) until #5111 left the body's `.` hand-on unchecked in a three-argument `foreach` UPDATE. Every
 /// row captured from `/usr/bin/jq` 1.7.1, both routes. The last rows are the uncaught spelling, whose message names the
 /// EXTRACT's value (`with result 1`) where the accumulator (`{}`) was named.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5121_null_bool_emission_after_the_bind_moved_the_register() -> Result<()> {

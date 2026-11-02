@@ -81,7 +81,6 @@ fn a_container_named_argument_answers_as_the_literal_tree_did_5673() -> Result<(
 
 /// A path that ends on, or passes through, a spliced value is refused with jq's own text.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn a_path_through_a_container_named_argument_is_refused_as_jq_does_5673() -> Result<()> {
     let (stdout, stderr, code) =
         run_jq_full(&["-nc", "--argjson", "d", D, "try path($d) catch ."], None)?;
@@ -129,7 +128,6 @@ fn scalar_named_arguments_and_repeated_uses_are_unchanged_5673() -> Result<()> {
 /// a container argument. `path_mode::route` sends the whole program to the interpreter, which has
 /// to be able to take the value in: `(args, filter, stdout)`.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn dynamic_path_targets_over_a_container_named_argument_5673() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let slurped = dir.path().join("s.json");

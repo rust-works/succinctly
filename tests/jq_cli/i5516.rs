@@ -17,10 +17,6 @@ fn answer(filter: &str) -> Result<String> {
 /// The issue's own table. #5515 as merged already answers every row, and rows 1, 2 and 4 were
 /// right before it too; nothing pinned them.
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_computed_slices_and_limit_first_keep_the_variable_5516() -> Result<()> {
     for filter in [
         "[nan] as $a | ($a | .[0:($a|length)] | .) == $a",
@@ -39,10 +35,6 @@ fn test_computed_slices_and_limit_first_keep_the_variable_5516() -> Result<()> {
 /// element itself, so a comparison after the fold sees one handle. `last(f)` is `reduce f as $x
 /// (null; $x)`. Each row was `false`.
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_fold_step_hands_its_loop_variable_on_5516() -> Result<()> {
     for filter in [
         "[nan] as $a | last($a) == $a",

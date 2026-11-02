@@ -805,9 +805,6 @@ benchmark suite. Every rule below cost a wrong conclusion at least once, during 
 detection work in #106; that investigation's write-up in `docs/parsing/yaml.md` (optimisations
 O5 and O6) carries the full numbers.
 
-`scripts/ab-cli.py` implements rules 1, 2, 4 and 6 for CLI-level A/B work:
-
-```bash
 ### The never-triggering holdout build
 
 A layout or representation change moves code around, and on this codebase code
@@ -834,15 +831,20 @@ Three rules make the holdout trustworthy, each learned the hard way (#3000,
    shipped shape for the same reason.
 3. **Retire the switch when its measurement is recorded.** `unboxed-object-map`
    (#3000) was replaced by `unshared-containers` (#2999) once B's numbers were in
-   the ADR; a holdout that outlives its experiment is a permanent second layout
-   for no measurement.
+   the ADR, and `unshared-containers` was deleted once ADR-0024 recorded C's
+   (#5841); a holdout that outlives its experiment is a permanent second layout
+   for no measurement. That one had grown to 1,240 test ignores, about 270 `cfg`
+   sites and its own CI leg, and had stopped being functionally BASE (#5233 made
+   it refuse dynamic path targets). A later change builds its own holdout against
+   the HEAD of its day, as #3182's `unshared-strings` did; git history keeps the
+   old layouts.
 
-Current switch: `unshared-containers` (the #3000 layout for `OwnedValue`'s
-containers). The `share-stats` feature is its companion for the copy audit
-(`SUCCINCTLY_SHARE_STATS=1`). Since #5233 the holdout refuses a jq program whose path
-target does more than navigate (the path-mode interpreter needs the storage identity this
-layout lacks), so an A/B corpus for it keeps such rows out.
+Current switch: none. The `share-stats` feature (the copy-on-write audit,
+`SUCCINCTLY_SHARE_STATS=1`) stays: it is additive and instruments the shipped build.
 
+`scripts/ab-cli.py` implements rules 1, 2, 4 and 6 for CLI-level A/B work:
+
+```bash
 # what the harness reports for a change that does not exist — run this first, once per machine
 scripts/ab-cli.py --before ./succ-base --control --corpus ~/wrk/bench-scratch/mycorpus
 

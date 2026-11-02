@@ -11,7 +11,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// #5205: the issue's row and its `?`, `path`, `del` and `|=` forms, a literal INIT (`0`, `false`, `true`), a one-element
 /// and a three-element source, a boolean marker, a marker bound two levels down, and INIT `.`. Captured from
 /// `/usr/bin/jq` 1.7.1, both routes.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_foreach_update_caught_bind_of_a_null_or_boolean_marker_5205() -> Result<()> {
@@ -129,7 +128,6 @@ fn test_foreach_update_caught_bind_of_a_null_or_boolean_marker_5205() -> Result<
 /// nested `foreach` whose INIT navigates
 /// (`.a?`), where lifting the exclusion turned a raise into a write of `{"a":{"a":{"a":{"a":9}}}}` (8 of 12,000 rows
 /// of the first draft's grid).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_foreach_update_caught_bind_of_a_null_marker_unplaced_shapes_stay_refused_5205() -> Result<()>
@@ -147,7 +145,6 @@ fn test_foreach_update_caught_bind_of_a_null_marker_unplaced_shapes_stay_refused
 /// wherever the row is a `path(...)`, as jq 1.7.1 answers them (stdout, the
 /// first error message, the exit code). The path-mode interpreter carries
 /// jq's register, so they match by construction, on both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_5205() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

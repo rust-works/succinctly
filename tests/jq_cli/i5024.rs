@@ -13,7 +13,6 @@ use crate::{assert_path_rows_both_routes_3749, run_jq_full};
 /// that cannot move the register, a comma of collects) over the sources, UPDATEs, EXTRACTs and documents of a
 /// differential grid, in `path`, `[path(..)?]`, `try .. catch`, `del`, `=` and `|=`. Every row captured from
 /// `/usr/bin/jq` 1.7.1 (stdout, first stderr line up to the container, exit code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5024_collect_init_leaves_the_register_where_the_foreach_entered() -> Result<()> {
@@ -395,7 +394,6 @@ fn test_5024_collect_init_leaves_the_register_where_the_foreach_entered() -> Res
 /// #5024: a collect piped into a generator (`paths`, `tostream`) or a variable stage forks the INIT or reaches a node the
 /// register may be on, so it keeps the reading it had: each row answers as jq does or refuses. Each row is `(input,
 /// filter, jq 1.7.1's stdout, jq's exit code)`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5024_collect_piped_into_a_generator_or_variable_never_answers_where_jq_differs(

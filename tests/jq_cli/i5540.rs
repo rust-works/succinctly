@@ -19,10 +19,6 @@ fn answer(filter: &str) -> Result<String> {
 /// The issue's four rows, and the other spellings of a step that stores the variable. Each was
 /// `false` here and `true` in jq.
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_fold_step_that_stores_its_loop_variable_keeps_the_element_5540() -> Result<()> {
     for filter in [
         // jq's own `def add: reduce .[] as $x (null; . + $x);`
@@ -140,10 +136,6 @@ fn test_writes_after_the_stored_element_do_not_reach_the_variable_5540() -> Resu
 /// 384-level ceiling when it is spliced back; jq 1.7.1 answers `1`, on both routes. #5526 had
 /// refused it. The rebinding forms (`$x as $n | .a = $n`) keep the evaluator, which shares too.
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_fold_that_stores_a_deep_loop_variable_answers_as_jq_does_5540() -> Result<()> {
     for body in [
         "reduce f(400) as $x ([]; . + [$x]) | length",
@@ -170,10 +162,6 @@ fn test_fold_that_stores_a_deep_loop_variable_answers_as_jq_does_5540() -> Resul
 /// rebuilding it as a literal, which lost the handle (`false` for `true`) and, for a value past
 /// the ceiling, refused. Each row was `true`/`[null]`/`1` in jq 1.7.1 and on the merge base.
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_as_rebind_of_a_stored_loop_variable_keeps_the_element_5540() -> Result<()> {
     for (filter, expected) in [
         (

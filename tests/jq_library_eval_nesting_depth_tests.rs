@@ -343,7 +343,6 @@ fn test_public_eval_key_past_a_seeded_deep_position_3020() {
 /// of the root `{k:.}` materializes, so the walk passes at 255 and raises at 256. A duplicate
 /// key the walk descends into but the value drops still fails it. Pinned here since #5497 (see
 /// `test_public_eval_recurse_only_walk_3429_3020`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq's `{a:.}`, not a format argument
 fn test_public_eval_embed_nested_reuse_keeps_the_depth_limit_3179() {

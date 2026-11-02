@@ -10,7 +10,6 @@ use anyhow::Result;
 /// only on a condition that cannot move the register, and jq runs every `if` condition in a subexp. A `.a` source whose
 /// state takes the `else .` branch refused the `$i` emission where jq answers `["a"]`. Rows captured from jq 1.7.1
 /// (stdout, first stderr line, exit code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_if_on_a_pure_condition_around_the_foreach_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -113,7 +112,6 @@ fn test_foreach_update_if_on_a_pure_condition_around_the_foreach_4800() -> Resul
 /// branch it took only for a bare `if .`, so on `if .a`, behind a `try`/`?` and with a stage after the `if` the whole
 /// `if` was judged and the error became an uncatchable guess that escaped the `?`/`try` where jq answers `[]` or `"c"`
 /// (which is why #5010 kept those comma spellings refused). Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_if_else_step_on_the_null_state_stays_catchable_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -293,7 +291,6 @@ fn test_foreach_update_if_else_step_on_the_null_state_stays_catchable_4800() -> 
 /// `try` answered `"c"` where jq emits nothing): `select(true)` was neither a stage #4957 reads after the `if` nor one
 /// #4754 lets follow a truthy-gated `if`, and #5010 kept the other two comma spellings refused. Rows captured from jq
 /// 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_if_comma_branch_with_select_true_after_or_a_pure_condition_4800(
 ) -> Result<()> {
@@ -433,7 +430,6 @@ fn test_foreach_update_if_comma_branch_with_select_true_after_or_a_pure_conditio
 /// a `?` and a `try` where jq answers `[]` / `"C"`: in a `foreach` EXTRACT, behind a head stage (`. |`, `select(.) |`),
 /// a `first`/`limit`/`catch` wrapper and a stage that computes (`| .b`, `| length`). Those keep the answers `main`
 /// gave, which match jq here; a `reduce` UPDATE keeps its refusal too. Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_comma_if_beyond_the_bare_form_outside_a_read_foreach_update_keeps_its_refusal_4800(
 ) -> Result<()> {

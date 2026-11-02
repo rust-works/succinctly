@@ -13,7 +13,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// object, an array and a nested pattern, a plain `$q`, INITs `0`/`{}`/`[]`, a one-shot, a comma, a
 /// navigating and a non-navigating source, and the wrappers around the `try` (`limit`, `first`,
 /// `label`, `if`, a comma). Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4934_reduce_update_try_around_foreign_bind_with_literal_init_raises_on_null() -> Result<()>
 {
@@ -156,7 +155,6 @@ fn test_4934_reduce_update_try_around_foreign_bind_with_literal_init_raises_on_n
 
 /// #4934: the same raise on a document that is no `null`, where the wording used to name the bind's
 /// `null` where jq names the literal accumulator (`with result 0`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4934_reduce_update_try_around_foreign_bind_with_literal_init_raises_off_null() -> Result<()>
 {
@@ -196,7 +194,6 @@ fn test_4934_reduce_update_try_around_foreign_bind_with_literal_init_raises_off_
 /// hands it back and jq answers `[]` (`del` deletes the document, `|= 9` replaces it). The `{"a":1}`
 /// and `{"a":{"b":1}}` rows were a wrong refusal (`with result <document>`): the withheld register
 /// refused the bind step and the `try` made the UPDATE empty.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4934_reduce_update_try_around_foreign_bind_with_dot_init_still_answers() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -282,7 +279,6 @@ fn test_4934_reduce_update_try_around_foreign_bind_with_dot_init_still_answers()
 }
 
 /// #4934: what must keep raising -- a computed or navigating tail after the destructure is no accumulator.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4934_reduce_update_try_around_foreign_bind_still_refuses_a_navigating_or_computed_tail(
 ) -> Result<()> {
@@ -316,7 +312,6 @@ fn test_4934_reduce_update_try_around_foreign_bind_still_refuses_a_navigating_or
 /// `try` catches it, the UPDATE is empty and the state `null`; the register is carried in so each
 /// step is judged against where jq has it. A one-shot (`limit`, `first`) around the `try` keeps that
 /// verdict. Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4934_reduce_update_try_around_foreign_bind_raising_on_later_steps() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

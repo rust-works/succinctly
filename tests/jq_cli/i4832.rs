@@ -14,7 +14,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// reading the message. The `$x` that IS the register (`.a as $x` over `.a`) and a source that cannot
 /// move it (`1`, a comma of literals) are the controls: they answer, or refuse by the old wording, as
 /// before. Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4832_reduce_update_foreign_marker_step_names_the_access() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -378,7 +377,6 @@ fn test_4832_reduce_update_foreign_marker_step_names_the_access() -> Result<()> 
 /// 100,800-row sweep: a comma, a `first`, a `try`, a `?`, `..`, a computed `tostring`, `getpath`, a non-`.` INIT, a
 /// pattern ahead of the `$x`), each a row the binary answered with the final emission's wording before.
 /// Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4832_reduce_update_foreign_marker_step_over_update_shapes() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -734,7 +732,6 @@ fn test_4832_reduce_update_foreign_marker_step_over_update_shapes() -> Result<()
 
 /// #4832: the rows that already matched before the change keep matching: a `$x` that IS the register, an
 /// UPDATE that never navigates it, and the shapes whose refusal still names the final emission.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4832_reduce_update_foreign_marker_controls_keep_matching() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -967,7 +964,6 @@ fn test_4832_reduce_update_foreign_marker_controls_keep_matching() -> Result<()>
 /// certification. A per-step register for these accepted what jq refuses (`path(...)` printed `[]`, `del`
 /// deleted the document, `|= 9` replaced it). The message still names the end of the path where jq names
 /// the step, which is why only the common prefix is pinned. Every row captured from `/usr/bin/jq` 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4832_reduce_update_nested_fold_marker_still_refuses() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

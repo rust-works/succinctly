@@ -1038,8 +1038,7 @@ mod tests {
     /// Same 64-bit gate as the crate's other exact-size pins. #2999 made
     /// both `Object` arms refcounted and `OwnedValue::Array` one pointer too;
     /// neither moves either width (the pointer is still 8 bytes, `Cursor`
-    /// still 32), and the `unshared-containers` holdout keeps both pointers,
-    /// so this holds in every build shape.
+    /// still 32).
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn jq_value_width_tracks_owned_value_3000() {

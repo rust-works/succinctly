@@ -9,7 +9,6 @@ use anyhow::Result;
 /// state is `null`, and the second step takes the `else` and indexes it (`near attempt to access element "a" of
 /// null`, exit 5). The `reduce` was driven by value, emitted, and the state stayed the root (`path` printed `[]`).
 /// Every row captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_if_with_a_navigating_else_empties_with_the_caught_foreach_5044() -> Result<()>
 {
@@ -62,7 +61,6 @@ fn test_reduce_update_if_with_a_navigating_else_empties_with_the_caught_foreach_
 /// #5044: the mirrored form, the `foreach` in the `else` (or in an `elif` chain), in a `reduce` UPDATE: the source is
 /// driven only on a step that took the `else`, so the UPDATE is empty with the `foreach` there too. Refused (`"C"`
 /// under a `try`) or answered `[]` before. Every row captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_mirrored_if_with_the_caught_foreach_in_the_else_5044() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -119,7 +117,6 @@ fn test_reduce_update_mirrored_if_with_the_caught_foreach_in_the_else_5044() -> 
 /// captured from jq 1.7.1, both routes. (#5102: the `INIT null` row that was here matched through the first step's
 /// wrong emission, a nested `foreach` found at the navigated register, and jq's answer is the last step's, which this
 /// reading refuses; it is pinned, ignored, in `i5102.rs` as #5106's.)
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_extract_if_with_a_navigating_else_keeps_the_rows_that_matched_5044() -> Result<()> {
     assert_path_rows_both_routes_3749(&[(
@@ -135,7 +132,6 @@ fn test_foreach_extract_if_with_a_navigating_else_keeps_the_rows_that_matched_50
 /// `reduce` entered with, so jq's `.a` on it raises its own catchable error (`[]` under `?`, `"C"` under a `try`). The
 /// resolver stated no register for a `reduce` whose UPDATE holds a `foreach` and answered `[["a"]]` and `["b"]` from the
 /// by-value drive. Every row captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_if_with_the_caught_foreach_then_a_stage_after_the_reduce_5044() -> Result<()>
 {
@@ -181,7 +177,6 @@ fn test_reduce_update_if_with_the_caught_foreach_then_a_stage_after_the_reduce_5
 /// #5044: a `reduce` whose INIT is not `.` (`null`, `{}`, `1`, `.a`, `$x`) keeps its reading of the same `if`: read as the
 /// others are, a stage after it met a `null` the resolver cannot tell from the register's and raised a guess no `?`
 /// catches (51 of 12,000 grid rows that matched jq). Row captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_with_an_init_other_than_dot_keeps_the_rows_that_matched_5044() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -214,7 +209,6 @@ fn test_reduce_update_with_an_init_other_than_dot_keeps_the_rows_that_matched_50
 /// (`(.a,.b)`, `.[]`, `.[]?`, [`source_hands_register_off`]): `$x` is a node the register is never on, so the destructure
 /// raises each step. `main` read it by value and a `try`/`del`/`|=` around it answered `"C"` or refused where jq
 /// finishes. Every row captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_extract_if_with_a_navigating_else_reads_a_source_that_hands_the_register_off_5044(
 ) -> Result<()> {
@@ -267,7 +261,6 @@ fn test_foreach_extract_if_with_a_navigating_else_reads_a_source_that_hands_the_
 /// #5044: the same for the mirrored `if C then B else FE end` in a `foreach` UPDATE: the `foreach` in the `else` is
 /// read as the one in the `then` is when the source hands the register off. Every row captured from jq 1.7.1, both
 /// routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_mirrored_if_reads_a_source_that_hands_the_register_off_5044() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -319,7 +312,6 @@ fn test_foreach_update_mirrored_if_reads_a_source_that_hands_the_register_off_50
 /// #5044: a source with `.` among its elements (`(.a,.)`) is not read: there `$x` is the register at the last step and
 /// the `foreach` emits, so an EXTRACT read as empty refused 19 of 12,000 grid rows that matched jq. Rows captured from
 /// jq 1.7.1, both routes. (#5102: the `INIT null` row that was here is in `i5102.rs`, ignored, see above.)
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_extract_if_with_a_source_that_hands_the_register_on_keeps_the_rows_that_matched_5044(
 ) -> Result<()> {
@@ -345,7 +337,6 @@ fn test_foreach_extract_if_with_a_source_that_hands_the_register_on_keeps_the_ro
 /// wherever the row is a `path(...)`, as jq 1.7.1 answers them (stdout, the
 /// first error message, the exit code). The path-mode interpreter carries
 /// jq's register, so they match by construction, on both routes.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_5044() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

@@ -11,7 +11,6 @@ use crate::assert_path_rows_both_routes_3749;
 
 /// #5112: the issue's row on `{"a":null}` in `[path(..)?]`; the raising `if` as the first item (nothing emits ahead of
 /// it) and a three-element source (the raise comes on step 2 of 3). On both routes. Captured from `/usr/bin/jq` 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5112_foreach_update_comma_later_step_whose_if_condition_raises() -> Result<()> {

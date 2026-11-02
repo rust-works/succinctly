@@ -13,7 +13,6 @@ use anyhow::Result;
 /// (`first(empty)`, `limit(0; .)`, `select(false // null)`, a parenthesised one) and a parenthesised pipe around it;
 /// a pipe that starts with such a stage (`select(false) | FE`, `(select(false) | 1 | FE) // 5`) keeps the read it
 /// had (the `at > 0` guard is pinned by `test_foreach_extract_after_an_alternative_behind_an_if_is_read_per_branch_4853`). Rows captured from jq 1.7.1 (stdout, first stderr line, exit code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_pipe_with_a_stage_that_emits_nothing_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

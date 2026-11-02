@@ -75,7 +75,6 @@ fn test_state_reading_operands_answer_as_jq_5263() -> Result<()> {
 /// itself instead of re-serializing it for the shipped evaluator. As jq 1.7.1 answers them
 /// (captured live; the holdout refuses every dynamic target).
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_interpreter_defs_length_and_type_answer_as_jq_5263() -> Result<()> {
     let records = r#"[{"name":"a","score":1},{"name":"b","score":2},{"name":"a","score":3},{"name":"c","score":null}]"#;
     for (input, filter, want) in [
@@ -126,7 +125,6 @@ fn test_interpreter_defs_length_and_type_answer_as_jq_5263() -> Result<()> {
 /// answered in place for a string (by codepoints), array, object and `null`, delegated for a number
 /// and a boolean, which raises. As jq 1.7.1 answers them (captured live).
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_interpreter_length_and_type_of_every_kind_answer_as_jq_5263() -> Result<()> {
     for (value, length, kind) in [
         ("null", "0", r#""null""#),

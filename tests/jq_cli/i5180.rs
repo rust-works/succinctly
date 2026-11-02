@@ -12,7 +12,6 @@ use crate::assert_path_rows_both_routes_3749;
 // document where jq writes (and `path` raised where jq answers). The head is now also walked straight off the marker's node.
 
 /// #5180: the issue's rows, `del` and `path`, both routes. Every row captured from `/usr/bin/jq` 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5180_multi_step_navigation_of_a_marker_onto_the_register_node() -> Result<()> {
@@ -70,7 +69,6 @@ fn test_5180_multi_step_navigation_of_a_marker_onto_the_register_node() -> Resul
 }
 
 /// #5180: the `[]` head, which yields several nodes of which only one is the register.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5180_iterating_a_marker_places_the_register_among_its_outputs() -> Result<()> {
@@ -84,7 +82,6 @@ fn test_5180_iterating_a_marker_places_the_register_among_its_outputs() -> Resul
 }
 
 /// #5180: a head that reaches another node than the register's still refuses, or is caught, as before.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5180_a_head_reaching_another_node_is_still_refused() -> Result<()> {
@@ -116,7 +113,6 @@ fn test_5180_a_head_reaching_another_node_is_still_refused() -> Result<()> {
 /// #5180: the stages the walk reads through (`select(true)`, `first(.)`, a postfix `?` on a lookup), a `null` along the
 /// way, an array and an object `[]` whose register is the first element, and sibling values that compare equal where only
 /// one is the register. Every row captured from `/usr/bin/jq` 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5180_stages_the_walk_reads_through_and_the_register_among_equal_siblings() -> Result<()> {

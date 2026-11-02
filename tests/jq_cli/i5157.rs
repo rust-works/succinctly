@@ -12,7 +12,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// #5157: the issue's rows (`// 5`, `// false`, `(..// 5) // 6`, `|= 9`, `del`) and a bind that ends on a literal or an
 /// INIT that is not the register, each over the `null` document. Every row captured from `/usr/bin/jq` 1.7.1, both
 /// routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5157_foreach_update_alternative_over_a_bind_of_a_null_x() -> Result<()> {
@@ -122,7 +121,6 @@ fn test_5157_foreach_update_alternative_over_a_bind_of_a_null_x() -> Result<()> 
 
 /// #5157: the rows that must not move. A register that is not `null` is a pointer jq compares, so a bind of `$x`
 /// refuses on the first step, and an EXTRACT that is the bound `.` after a `5` is a computed value, which jq refuses.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5157_rows_that_still_refuse() -> Result<()> {
@@ -147,7 +145,6 @@ fn test_5157_rows_that_still_refuse() -> Result<()> {
 /// #5157: the shapes the fix leaves as they were. A two-argument `foreach` emits its UPDATE's output, which jq
 /// path-checks (`5` here); a `reduce` is judged on its final accumulator, and a `?//` chain behind the `//` there names
 /// `null` in jq, where reading the `//` through named the stored `5`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5157_two_argument_foreach_and_reduce_keep_their_readings() -> Result<()> {

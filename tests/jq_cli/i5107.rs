@@ -16,7 +16,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// #5107: the issue's rows (`[path(..)?]`, `path`, `|= 9`), `del`, the controls, and rows of a differential grid
 /// (document x bind site x head navigation x nested `foreach` x wrapper x source x INIT x EXTRACT x context) that `main`
 /// refused or answered wrongly. Every row captured from `/usr/bin/jq` 1.7.1 (stdout, exit code, message), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5107_navigation_stage_ahead_of_a_bare_bind_foreach_in_a_foreach_update() -> Result<()> {

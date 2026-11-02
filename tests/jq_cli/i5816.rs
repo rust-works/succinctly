@@ -3290,10 +3290,8 @@ const PATH_ROWS: &[Row] = &[
     ),
 ];
 
-/// The unshared-containers holdout refuses a path expression that does more than navigate, with a
-/// different message (#5246).
+/// A string stage in path position answers as jq 1.7.1 does.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn a_string_stage_in_path_position_answers_as_jq_5816() -> Result<()> {
     check(PATH_ROWS)
 }

@@ -10,7 +10,6 @@ use anyhow::Result;
 /// jq's register by kind (`jv_identical`), and `.a` raised `Invalid path expression near attempt to access element
 /// "a" of null` where jq answers `["a","a"]`. Rows captured from jq 1.7.1 (stdout, first stderr line, exit code),
 /// both routes; the first eight fail on `main`, and resolving the `if` whole again fails the test.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_if_with_the_caught_foreach_in_then_and_a_literal_else_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -100,7 +99,6 @@ fn test_foreach_update_if_with_the_caught_foreach_in_then_and_a_literal_else_480
 /// `[["a","a"]]` for the `.a` EXTRACT rows, and those fail on the base (`[]`; an `elif` chain and a `(.a,.)` source
 /// included). The `$i` EXTRACT rows, the `| .` row and the `{"a":true}` row already matched on the base: they pin that
 /// the arm-only resolve does not move them. Resolving the wrapped `if` whole again fails the test.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_wrapped_if_with_a_literal_else_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -205,7 +203,6 @@ fn test_foreach_update_wrapped_if_with_a_literal_else_4800() -> Result<()> {
 /// (`if_arm_comma_items`). Every row fails on the base: the `.a` EXTRACT rows raised `Invalid path expression near
 /// attempt to access element "a" of null`, the `$i` rows answered `[]`, and `|= 9` raised. Rows captured from jq 1.7.1;
 /// disabling either new path fails the test.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_if_with_a_literal_else_behind_a_handler_or_beside_an_emitting_item_4800(
 ) -> Result<()> {
@@ -350,7 +347,6 @@ fn test_foreach_update_if_with_a_literal_else_behind_a_handler_or_beside_an_emit
 /// `then` that ran (the #5082 reading) or a computed `else` (`[.a]`) behind a handler or beside a comma sibling, an
 /// `if` with no fold (`if .a then .b else 3 end`, which the base already reads whole), and a truthy state that runs
 /// the `foreach`, keep the whole-`if` resolve: narrowing them lost each of these rows in a differential grid.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_if_behind_a_handler_or_comma_keeps_the_whole_resolve_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -419,7 +415,6 @@ fn test_foreach_update_if_behind_a_handler_or_comma_keeps_the_whole_resolve_4800
 /// fold arm on it. Every row fails on the base: the `$i` rows answered `[]` and `path`, `del` and `|= 9` raised
 /// `Invalid path expression with result {"a":null}`, the `.a` EXTRACT row raised `Invalid path expression near attempt
 /// to access element "a" of null`. Rows captured from jq 1.7.1; dropping the `then` reading fails the test.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_if_with_a_literal_then_beside_a_fold_in_the_else_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -525,7 +520,6 @@ fn test_foreach_update_if_with_a_literal_then_beside_a_fold_in_the_else_4800() -
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_if_with_a_literal_then_past_a_falsy_elif_stays_differing_4800() -> Result<()>
 {
@@ -577,7 +571,6 @@ fn test_foreach_update_if_with_a_literal_then_past_a_falsy_elif_stays_differing_
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_wrapped_if_with_a_literal_else_stays_differing_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -645,7 +638,6 @@ fn test_foreach_update_wrapped_if_with_a_literal_else_stays_differing_4800() -> 
 /// read by `alternate_update_shape`, which is the one route that still reaches the `return None` of its `Pipe` arm
 /// (the literal-arm rows above are resolved as the arm and never get there). Where jq answers `[[]]` or `[[],[]]`
 /// these answer `[]`; the answers are pinned as they stand (a fix flips them), and the rows keep the arm covered.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_wrapped_if_with_an_undecidable_condition_stays_differing_4800() -> Result<()>
 {

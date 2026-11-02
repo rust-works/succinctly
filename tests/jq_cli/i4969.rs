@@ -13,7 +13,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// where jq's `$a` is the child the pattern bound (`path` answered `[]`, `del` deleted the document, `|=`
 /// wrote through it). Every row captured from `/usr/bin/jq` 1.7.1, both routes; the rows jq answers are the
 /// controls that must keep answering (a child element, a `try`, a `?`, a computed tail).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4969_reduce_update_alt_chain_bind_of_dot_over_a_source_starting_at_the_accumulator_raises(
 ) -> Result<()> {
@@ -226,7 +225,6 @@ fn test_4969_reduce_update_alt_chain_bind_of_dot_over_a_source_starting_at_the_a
 
 /// #4969: what jq answers must keep answering -- INIT `.` with a navigating source whose elements are
 /// children, a single pattern, and the `.` tail that hands the accumulator back.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4969_reduce_update_alt_chain_bind_of_dot_controls_that_answer() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -427,7 +425,6 @@ fn test_4969_reduce_update_alt_chain_bind_of_dot_controls_that_answer() -> Resul
 /// jq names (`near attempt to access element "a" of ...`); the exemption for a source starting at the
 /// accumulator is read only for a chain holding a bare `$name`. Also the single-pattern forms, whose
 /// wording was never touched.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4969_reduce_update_alt_chain_without_a_bare_alternative_keeps_its_wording() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

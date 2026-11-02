@@ -14,7 +14,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// object, an array and a nested pattern, a plain `$q`, tails `5`/`"s"`/`[1]`/`{}`/`$a`, INITs
 /// `0`/`{}`/`[]`, and `limit`/`first`/`nth(0; ..)`/`if`/`label`/a comma around the `try`. Every row captured from `/usr/bin/jq`
 /// 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4953_reduce_update_try_around_foreign_bind_with_computed_tail_raises_on_null() -> Result<()>
 {
@@ -199,7 +198,6 @@ fn test_4953_reduce_update_try_around_foreign_bind_with_computed_tail_raises_on_
 
 /// #4953: the same tails where the answer already matched or only the wording changed: a document that
 /// is no `null`, whose wording named the bind's `null` where jq names the tail's value, and INIT `.`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4953_reduce_update_try_around_foreign_bind_with_computed_tail_off_null_and_dot_init(
 ) -> Result<()> {

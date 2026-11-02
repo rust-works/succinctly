@@ -8,7 +8,6 @@ use anyhow::Result;
 
 use crate::run_jq_full;
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::type_complexity)] // a table of captured jq answers
 fn test_nan_variable_key_is_a_path_component_and_a_write_refusal_5245() -> Result<()> {

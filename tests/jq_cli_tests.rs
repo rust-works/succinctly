@@ -260,7 +260,6 @@ fn test_pick_pathexps_cli_3026() -> Result<()> {
 }
 
 /// jq emits no partial object when a later path fails.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_pick_pathexps_cli_errors_3026() -> Result<()> {
     for (input, filter, message) in [
@@ -3877,7 +3876,6 @@ fn jq_stderr(filter: &str, input: &str, extra_args: &[&str]) -> Result<String> {
 /// The messages are transcribed from jq 1.7.1. Note the string form inserts the
 /// key raw rather than JSON-escaped — `--arg k 'a"b'` really does produce
 /// `Cannot index array with string "a"b"` in jq.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_cannot_index_error_wording() -> Result<()> {
     let cases: &[(&str, &str, &[&str], &str)] = &[
@@ -3988,7 +3986,6 @@ fn test_cannot_index_wording_is_spelling_independent() -> Result<()> {
 /// and, in an assignment, overwrites — element zero. jq yields null on the read
 /// and errors on the write; both halves are checked here because only the read
 /// half is observable in the golden corpus (`index_nan_key`).
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_nan_key_reads_null_and_rejects_writes() -> Result<()> {
     let (output, _) = run_jq_stdin("[.[nan]]", "[10,20,30]", &["-c"])?;
@@ -9350,7 +9347,6 @@ fn test_halt_not_caught_by_try_catch_or_label() -> Result<()> {
 // bogus boolean, or silently swallowed. Every expectation below was verified
 // live against jq 1.7.1.
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_halt_not_caught_by_try_catch_in_path_expression() -> Result<()> {
     // `resolve_node`'s `Expr::Try` arm (the separate path-expression resolver
@@ -9365,7 +9361,6 @@ fn test_halt_not_caught_by_try_catch_in_path_expression() -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_halt_not_caught_by_bare_optional_in_path_expression() -> Result<()> {
     // `resolve_node`'s `Expr::Optional` blanket arm used to discard the
@@ -9378,7 +9373,6 @@ fn test_halt_not_caught_by_bare_optional_in_path_expression() -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_halt_not_caught_by_try_catch_in_update_assignment() -> Result<()> {
     // Same root cause as the `path()`/`del()` cases above, reached via `|=`:
@@ -10570,7 +10564,6 @@ fn test_break_shadowed_by_def_error_sees_ambient_input_not_jqs_sentinel_2687() -
 /// scope there therefore intercepts a non-matching `break` of an *outer*
 /// label too, not just `error(...)`. Every row verified live against jq
 /// 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_label_error_reraise_is_a_shadowable_error_call_2840() -> Result<()> {
     for (filter, want_stdout) in [
@@ -14059,7 +14052,6 @@ fn test_out_of_bounds_index_and_null_index_report_correct_path_2213() -> Result<
 /// at compile time (exit 3). The jq-expressible path-context shapes are
 /// pinned separately below; all of them already agreed with jq 1.7.1 before
 /// this fix and must continue to.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_optional_index_key_error_escapes_path_context_1410() -> Result<()> {
     // The headline repro: the sibling `key` forces path context, and the
@@ -14163,7 +14155,6 @@ fn test_optional_index_key_error_escapes_path_context_1410() -> Result<()> {
 /// the ambient navigation is genuinely inside the same `path()` scope (not
 /// discarded, an earlier, insufficiently general oracle check's mistake --
 /// see this function's own doc comment for the corrected reasoning).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_getpath_extends_path_context_2253() -> Result<()> {
     let input = r#"{"a":{"x":1}}"#;
@@ -15111,7 +15102,6 @@ fn test_top_level_map_lazy_seq_sort_keys_path_725() -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_halt_after_partial_resolution_converts_via_evalescape_into_control() -> Result<()> {
     // `error.rs`'s `impl From<EvalEscape> for Control` -- specifically its
@@ -16303,7 +16293,6 @@ fn test_slice_descriptor_end_bound_in_open_interval_folds_to_length_3396() -> Re
 /// carries a ceiled end in `(-1, 0)` as past-the-end, so it resolves to the
 /// length on read, write and delete alike, while `path()` still prints the
 /// bound as spelled. Every row verified live against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_slice_computed_bound_and_direct_index_end_in_open_interval_3404() -> Result<()> {
     let cases: &[(&str, &str, &str)] = &[
@@ -17347,7 +17336,6 @@ fn test_eval_assign_rhs_propagates_direct_halt() -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_eval_assign_optional_still_swallows_ordinary_path_error() -> Result<()> {
     // `eval_assign`'s `resolve_dynamic_indexes` match used to be a single
@@ -17385,7 +17373,6 @@ fn test_eval_assign_terminal_halt_keeps_already_built_documents() -> Result<()> 
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_eval_update_optional_still_swallows_ordinary_path_error() -> Result<()> {
     // Same split as `eval_assign`'s `resolve_dynamic_indexes` match (see
@@ -17410,7 +17397,6 @@ fn test_eval_update_optional_still_swallows_ordinary_path_error() -> Result<()> 
 /// `eval_assign`'s own `Err((_, EvalEscape::Error(_))) if optional`
 /// guard, distinct from whatever internal path the `error("x")` shape takes.
 /// Verified against jq 1.7.1: `(.[({})] = 1)?` exits 0 with no output.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_eval_assign_optional_swallows_type_error_from_object_key() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-n", "(.[({})] = 1)?"], None)?;
@@ -17421,7 +17407,6 @@ fn test_eval_assign_optional_swallows_type_error_from_object_key() -> Result<()>
 
 /// `eval_update` sibling of the test above -- see its doc comment. Verified
 /// against jq 1.7.1: `(.[({})] |= .+1)?` exits 0 with no output.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_eval_update_optional_swallows_type_error_from_object_key() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-n", "(.[({})] |= .+1)?"], None)?;
@@ -17430,7 +17415,6 @@ fn test_eval_update_optional_swallows_type_error_from_object_key() -> Result<()>
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_eval_owned_multi_propagates_partial_halt_from_computed_key() -> Result<()> {
     // `eval_owned_multi`'s `QueryResult::Partial(_, Control::Halt(code))`
@@ -17560,7 +17544,6 @@ fn test_update_path_pipe_iterate_arm_reports_type_error_on_non_iterable() -> Res
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_as_binding_propagates_halt_from_partial_bind_stream() -> Result<()> {
     // `resolve_node`'s `Expr::As` arm (`path()`'s own `E as $x | body`
@@ -17584,7 +17567,6 @@ fn test_path_as_binding_propagates_halt_from_partial_bind_stream() -> Result<()>
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_as_binding_propagates_error_from_partial_bind_stream() -> Result<()> {
     // Sibling of the halt test above, `Expr::As`'s `Some(Control::Error(e))`
@@ -17604,7 +17586,6 @@ fn test_path_as_binding_propagates_error_from_partial_bind_stream() -> Result<()
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_as_binding_break_in_bind_stream_reaches_an_outer_label() -> Result<()> {
     // `Expr::As`'s `Some(Control::Break(label))` trailing-control arm,
@@ -17631,7 +17612,6 @@ fn test_path_as_binding_break_in_bind_stream_reaches_an_outer_label() -> Result<
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_break_across_a_path_call_boundary_reaches_an_outer_label_824() -> Result<()> {
     // Issue #824's own first repro: a `break $label` raised inside a
@@ -17653,7 +17633,6 @@ fn test_break_across_a_path_call_boundary_reaches_an_outer_label_824() -> Result
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_break_inside_a_path_call_is_caught_by_a_label_inside_it_824() -> Result<()> {
     // The mirror image of the boundary-crossing case above: a `label`
@@ -17699,7 +17678,6 @@ fn test_break_inside_a_path_call_is_caught_by_a_label_inside_it_824() -> Result<
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_try_catch_inside_a_path_call_catches_a_break_regardless_of_label_824() -> Result<()> {
     // `try`/`catch` (and bare `?`, sugar for a catch-less `try`) intercept a
@@ -17778,7 +17756,6 @@ fn test_try_catch_inside_a_path_call_catches_a_break_regardless_of_label_824() -
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_try_catch_handler_error_keeps_prefix_832() -> Result<()> {
     // #832: `resolve_catch` (the helper `resolve_node`'s `Expr::Try` arm
@@ -17800,7 +17777,6 @@ fn test_path_try_catch_handler_error_keeps_prefix_832() -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_try_catch_handler_halt_keeps_prefix_832() -> Result<()> {
     // #832, halt variant: the catch handler itself calls `halt_error`, which
@@ -17829,7 +17805,6 @@ fn test_path_try_catch_handler_halt_keeps_prefix_832() -> Result<()> {
 /// result 1", with a stale `["a"]` leaking onto stdout besides. Confirmed
 /// against jq 1.7.1: this filter prints nothing and raises the terminal
 /// check's error, never reaching `error("boom")` at all.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_comma_terminal_check_wins_over_a_later_siblings_escape_1560() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -17854,7 +17829,6 @@ fn test_path_comma_terminal_check_wins_over_a_later_siblings_escape_1560() -> Re
 /// later sibling's own error surfaces normally with whatever resolved
 /// before it kept — the existing #986/#1440 behavior the fix above must not
 /// disturb.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_comma_valid_prefix_keeps_a_later_siblings_own_error_1560() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -17867,7 +17841,6 @@ fn test_path_comma_valid_prefix_keeps_a_later_siblings_own_error_1560() -> Resul
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_limit_n_bound_break_inside_a_path_call_reaches_an_outer_label_824() -> Result<()> {
     // `resolve_limit`'s own `n_expr` evaluation (`limit(n; f)`'s count) sits
@@ -17888,7 +17861,6 @@ fn test_limit_n_bound_break_inside_a_path_call_reaches_an_outer_label_824() -> R
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_as_binding_keeps_earlier_binding_prefix_when_a_later_body_errors() -> Result<()> {
     // `Expr::As`'s per-binding loop body, the `Err((body_prefix, escape))`
@@ -17974,7 +17946,6 @@ fn test_resolve_node_try_catch_handles_ordinary_error() -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_limit_path_context_raises_the_subtraction_error_for_a_non_numeric_n() -> Result<()>
 {
@@ -18003,7 +17974,6 @@ fn test_resolve_limit_path_context_raises_the_subtraction_error_for_a_non_numeri
 /// pattern. Output must stay byte-identical for `n` under, at, and over the
 /// array's length -- the bound only changes how much work is done, never
 /// which branches are produced. Oracle-verified against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_limit_bare_iterate_array_bounded_1850() -> Result<()> {
     let input = r"[10,20,30,40,50]";
@@ -18023,7 +17993,6 @@ fn test_path_limit_bare_iterate_array_bounded_1850() -> Result<()> {
 
 /// #1850 companion: the same bounded fast path for an object, matching
 /// jq's own insertion-order `.[]` iteration.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_limit_bare_iterate_object_bounded_1850() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -18039,7 +18008,6 @@ fn test_path_limit_bare_iterate_object_bounded_1850() -> Result<()> {
 /// `cannot_iterate_with` error the unbounded `Expr::Iterate` arm always
 /// did -- the bounded fast path must not silently swallow this into an
 /// empty result.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_limit_bare_iterate_non_container_still_errors_1850() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "path(limit(3; .[]))"], Some("5"))?;
@@ -18052,7 +18020,6 @@ fn test_path_limit_bare_iterate_non_container_still_errors_1850() -> Result<()> 
 /// take the bounded fast path -- `unwrap_paren` peels the wrapper before
 /// the `Expr::Iterate` shape check, matching `resolve_node`'s own
 /// paren-transparency elsewhere.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_limit_bare_iterate_through_parens_bounded_1850() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "path(limit(2; (.[])))"], Some("[1,2,3]"))?;
@@ -18068,7 +18035,6 @@ fn test_path_limit_bare_iterate_through_parens_bounded_1850() -> Result<()> {
 /// `resolve_iterate_sink`, which has no such check of its own. Oracle-verified
 /// against jq 1.7.1: the caught scalar `5` is the value named, not a
 /// `cannot_iterate_with` "Cannot iterate over number" message.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_limit_bare_iterate_untrackable_value_still_near_attempt_error_1850() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -18088,7 +18054,6 @@ fn test_path_limit_bare_iterate_untrackable_value_still_near_attempt_error_1850(
 /// bare `Expr::Iterate` shape the fast path targets, so it still takes the
 /// original eager `resolve_node` route -- confirming
 /// the fast path's narrower scope doesn't regress the general case.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_limit_compound_iterate_still_correct_1850() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -18483,7 +18448,6 @@ fn test_range_from_bound_non_numeric_value_rejected_1556() -> Result<()> {
 /// `Partial` is consumed and its `pending` dropped three closures away from
 /// `resolve_leaf`, matching jq. Live-verified against jq 1.7.1: exit 5,
 /// "Invalid path expression with result 1" -- not exit 9.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_range_bound_path_context_halt_laziness_1556() -> Result<()> {
     let (stdout, stderr, code) =
@@ -18541,7 +18505,6 @@ fn test_recurse_f_keeps_own_partial_fanout_before_error_842() -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_recurse_keeps_f_partial_fanout_before_error_842() -> Result<()> {
     // Issue #842's secondary repro (path position, `resolve_recurse_sink`).
@@ -18575,7 +18538,6 @@ fn test_resolve_recurse_keeps_f_partial_fanout_before_error_842() -> Result<()> 
 /// `{"a":null} | path(recurse(if . == {"a":null} then .a else empty
 /// end))` prints `[]` (root) *and* `["a"]` (the null child, emitted as a
 /// leaf since its own recursion into `f` produces nothing further).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_recurse_emits_null_childs_own_path() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -18602,7 +18564,6 @@ fn test_resolve_recurse_emits_null_childs_own_path() -> Result<()> {
 /// else empty end))` streams `[]`, `["a"]`, `["b"]`, `["b","x"]`,
 /// `["b","y"]` in that order -- the null leaf right after the root, before
 /// `b`'s own subtree, not interleaved with or after it.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_recurse_null_child_does_not_disturb_sibling_order() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -18630,7 +18591,6 @@ fn test_resolve_recurse_null_child_does_not_disturb_sibling_order() -> Result<()
 /// child never appears, since `type=="object"` rejects it before it would
 /// ever be emitted (real jq's `paths(node_filter)` = `path(recurse|select(
 /// node_filter))`, and a `select`-rejected child is never even reached).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_recurse_cond_still_gates_null_child_emission() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -18669,7 +18629,6 @@ const RECURSE_BIG_ROOT_EXTRA: usize = (RECURSE_CAP / 2 + 1) / 64;
 /// deep, so a node costs `1 + depth / 64` of the cap (#5378): the walk delivers
 /// the paths whose cost adds up to `RECURSE_CAP`, then raises. (Printing them
 /// whole would be 6.7e7 keys, so the row prints each path's length.)
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_resolve_recurse_cond_still_bounds_null_current_growth_854() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -18708,7 +18667,6 @@ fn test_resolve_recurse_cond_still_bounds_null_current_growth_854() -> Result<()
 /// loop at all. Verified against jq 1.7.1: `null | path(recurse(.[]))`
 /// raises "Cannot iterate over null (null)" and exits 5, printing `[]`
 /// (the root's own path) first.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_recurse_null_root_still_evaluates_f_and_propagates_its_error() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-n", "null | path(recurse(.[]))"], None)?;
@@ -18728,7 +18686,6 @@ fn test_resolve_recurse_null_root_still_evaluates_f_and_propagates_its_error() -
 /// path(recurse(.[]))` streams `[]` then `["a"]` before raising "Cannot
 /// iterate over null (null)" and exiting 5 -- the error surfaces only
 /// once the traversal actually reaches the null child, not before.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_recurse_null_child_still_evaluates_f_and_propagates_its_error() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "path(recurse(.[]))"], Some(r#"{"a":null}"#))?;
@@ -18754,7 +18711,6 @@ fn test_resolve_recurse_null_child_still_evaluates_f_and_propagates_its_error() 
 /// during traversal" -- so it's fixed here rather than deferred. Verified
 /// against jq 1.7.1: `null | path(recurse(.a; error("boom")))` streams
 /// `[]` (the root's own path) then raises "boom" and exits 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_recurse_null_root_still_evaluates_cond_and_propagates_its_error() -> Result<()> {
     let (stdout, stderr, code) =
@@ -18773,7 +18729,6 @@ fn test_resolve_recurse_null_root_still_evaluates_cond_and_propagates_its_error(
 /// the null child `"a"` is reached, `f`(`.a`) is evaluated on it, and
 /// `cond`'s error on that result aborts the call, all before any further
 /// descent.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_recurse_null_child_still_evaluates_cond_and_propagates_its_error() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -18839,7 +18794,6 @@ fn test_recurse_cond_keeps_already_approved_siblings_before_error_854() -> Resul
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_recurse_cond_keeps_already_approved_siblings_before_error_854() -> Result<()> {
     // Issue #854's secondary repro (path position, `resolve_recurse_sink`).
@@ -18909,7 +18863,6 @@ fn test_resolve_node_select_keeps_cond_partial_fanout_before_error_896() -> Resu
 /// `If` arm's `cond` evaluation. Verified against jq 1.7.1: `echo '1' | jq
 /// -c 'path(if (true, error("x")) then . else empty end)'` prints `[]` to
 /// stdout before erroring, and exits 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_if_keeps_cond_partial_fanout_before_error_896() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -18926,7 +18879,6 @@ fn test_resolve_node_if_keeps_cond_partial_fanout_before_error_896() -> Result<(
 /// (`.[EXPR]` where `EXPR` is a multi-output generator). Verified against
 /// jq 1.7.1: `echo '{"a":1,"b":2}' | jq -c 'path(.[("a", error("x"))])'`
 /// prints `["a"]` to stdout before erroring, and exits 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_index_expr_keeps_key_partial_fanout_before_error_896() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -18943,7 +18895,6 @@ fn test_resolve_index_expr_keeps_key_partial_fanout_before_error_896() -> Result
 /// argument evaluation. Verified against jq 1.7.1: `echo '{"a":1}' | jq -c
 /// 'path(getpath((["a"], error("x"))))'` prints `["a"]` to stdout before
 /// erroring, and exits 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_getpath_keeps_arg_partial_fanout_before_error_896() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -18960,7 +18911,6 @@ fn test_resolve_node_getpath_keeps_arg_partial_fanout_before_error_896() -> Resu
 /// propagate normally at each of the 4 sites above — the partial-keeping
 /// fix must not change this case. Verified against jq 1.7.1: both queries
 /// below print nothing to stdout and exit 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_896_sites_bare_error_still_propagates() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r#"path(select(error("x")))"#], Some("1"))?;
@@ -18988,7 +18938,6 @@ fn test_resolve_node_896_sites_bare_error_still_propagates() -> Result<()> {
 /// is never reached, since jq's `K as $k | E | .[$k]` compilation (this
 /// function's own doc comment) exhausts `E`'s whole generator, escape
 /// included, before ever asking `K` for its next value.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_index_expr_indexes_targets_partial_fanout_before_its_own_error_896() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -19014,7 +18963,6 @@ fn test_resolve_index_expr_indexes_targets_partial_fanout_before_its_own_error_8
 /// entirely inside the *first* key's iteration; the key generator is never
 /// resumed for a second key. Verified against jq 1.7.1: all four queries
 /// below print only the first key/bound's branch before raising.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_index_expr_prefix_matches_jq_when_target_escapes_972() -> Result<()> {
     // Two keys, one target branch.
@@ -19062,7 +19010,6 @@ fn test_resolve_index_expr_prefix_matches_jq_when_target_escapes_972() -> Result
 /// compilation, which re-runs `E` fresh for every key -- the identical bug
 /// #2032 already fixed for the value-mode sibling, `eval_index_expr`.
 /// Verified live against jq 1.7.1 for every assertion below.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_index_expr_reevaluates_target_per_key_2139() -> Result<()> {
     // A target with a real side effect (`stderr`) fires once per key, not
@@ -19103,7 +19050,6 @@ fn test_resolve_index_expr_reevaluates_target_per_key_2139() -> Result<()> {
 /// exempt a later key that lands on an untracked one. Verified live
 /// against jq 1.7.1: the untracked branch on the second key must still
 /// raise "Invalid path expression", not silently write into the document.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_index_expr_checks_trackability_every_key_2139() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -19135,7 +19081,6 @@ fn test_resolve_index_expr_checks_trackability_every_key_2139() -> Result<()> {
 /// untrackable one still contribute to the output prefix. Verified against
 /// jq 1.7.1: `path((.,5)[(0,error("mid"))])` on `null` prints `[0]` (the `.`
 /// branch's own successful index) before raising "Invalid path expression".
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_index_expr_untrackable_branch_keeps_earlier_prefix_2248() -> Result<()> {
     let (stdout, stderr, code) =
@@ -19158,7 +19103,6 @@ fn test_resolve_index_expr_untrackable_branch_keeps_earlier_prefix_2248() -> Res
 /// success — silently deleting both keys instead of raising. Verified
 /// against jq 1.7.1: `limit(2; ...)` still raises with the document
 /// untouched; `limit(1; ...)` correctly deletes only `"x"`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_first_limit_path_truncation_does_not_overreach_index_fanout_972() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -19239,7 +19183,6 @@ fn test_first_path_truncation_keeps_full_multistage_pipe_path_972() -> Result<()
 /// `f` before truncating to `n` outputs, so an error/break/halt after the
 /// nth output still surfaced even though jq's generator would have stopped
 /// pulling from `f` already. All cases verified against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_first_limit_truncate_keep_partial_path_resolvers_972() -> Result<()> {
     let cases: &[(&str, &str, &str)] = &[
@@ -19290,7 +19233,6 @@ fn test_first_limit_truncate_keep_partial_path_resolvers_972() -> Result<()> {
 /// #972 Guard D: the under-satisfied / must-still-raise trap set — cases a
 /// too-aggressive truncation fix could wrongly silence. All verified
 /// against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_first_limit_path_undersatisfied_still_raises_972() -> Result<()> {
     // A bare escape (zero outputs) still propagates.
@@ -19328,7 +19270,6 @@ fn test_first_limit_path_undersatisfied_still_raises_972() -> Result<()> {
 /// eager, so its side effect has already fired by the time the escape is
 /// discarded — that residual leak is #987/#820's territory, not a #972
 /// regression.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_first_limit_path_drops_a_satisfied_halt_972() -> Result<()> {
     let (stdout, _stderr, code) = run_jq_full(
@@ -19420,7 +19361,6 @@ fn test_resolve_seq_static_tail_failure_outranks_earlier_fanout_escape_977() -> 
 /// 2+-dynamic-element pipe shape. Verified against jq 1.7.1: `.c[(0,1)]`
 /// (the second dynamic element) and `.foo` (the tail) both still have to
 /// run for `.a[0]`, the successful alternative, before jq ever raises `t`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_seq_earlier_fanout_escape_threads_through_later_dynamic_stage_1013() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -19451,7 +19391,6 @@ fn test_resolve_seq_earlier_fanout_escape_threads_through_later_dynamic_stage_10
 /// first nor last) still has to thread its `0` alternative through the
 /// remaining dynamic stage (`.c[(0,1)]`) and the tail (`.foo`). Verified
 /// against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_seq_earlier_fanout_escape_threads_through_middle_of_three_dynamic_stages_1013(
 ) -> Result<()> {
@@ -19481,7 +19420,6 @@ fn test_resolve_seq_earlier_fanout_escape_threads_through_middle_of_three_dynami
 /// `.c[...]`'s own escape — before it would ever backtrack to try
 /// `.a[...]`'s second alternative (`error("t1")`), so `t2` is the error jq
 /// actually raises, not `t1`. Verified against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_seq_later_fanout_escape_outranks_earlier_one_1013() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -19510,7 +19448,6 @@ fn test_resolve_seq_later_fanout_escape_outranks_earlier_one_1013() -> Result<()
 /// against jq 1.7.1: `echo '{"a":1,"b":2}' | jq -c 'path(getpath((["a"],
 /// ["b"], error("x"))))'` prints `["a"]` then `["b"]` before raising `x`;
 /// this codebase intentionally only matches the error, not the fan-out.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_getpath_multi_output_surfaces_real_error_not_a_fabricated_one_896(
 ) -> Result<()> {
@@ -19538,7 +19475,6 @@ fn test_resolve_node_getpath_multi_output_surfaces_real_error_not_a_fabricated_o
 /// 'path((select(true, error("t")))[(0+1):2])'` prints
 /// `[{"start":1,"end":2}]` (the already-produced `select` branch, sliced)
 /// before raising `t`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_keeps_target_partial_fanout_before_its_own_error_973() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -19565,7 +19501,6 @@ fn test_resolve_slice_expr_keeps_target_partial_fanout_before_its_own_error_973(
 /// `{"start":0,"end":2}` and `{"start":0,"end":3}` appear; `end`'s own
 /// escape fires during `start`'s very first value, so `start` never tries
 /// a second one and only `{"start":0,"end":2}` appears.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_keeps_bound_partial_fanout_before_its_own_error_1517() -> Result<()> {
     // `start` escapes: `end` (nested inside) is fully iterated for the one
@@ -19702,7 +19637,6 @@ fn test_eval_slice_expr_keeps_bound_partial_fanout_before_its_own_error_1528() -
 /// under-satisfied and must refuse untouched. Same pairing for the
 /// `end`-escape shape (real prefix length 1): `limit(1; ...)` writes,
 /// `limit(2; ...)` refuses. All four verified against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_first_limit_path_truncation_does_not_overreach_slice_bound_fanout_1517() -> Result<()> {
     // `start`-escape axis: real prefix length is 2.
@@ -19749,7 +19683,6 @@ fn test_first_limit_path_truncation_does_not_overreach_slice_bound_fanout_1517()
 /// fixed for a genuine generator escape. Now matches jq 1.7.1 exactly: all
 /// four combinations of the two valid `start` values (0, 1) against both
 /// `end` values (2, 3) print before raising.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_bound_type_error_keeps_valid_prefix_2385() -> Result<()> {
     let (stdout, stderr, code) =
@@ -19768,7 +19701,6 @@ fn test_resolve_slice_bound_type_error_keeps_valid_prefix_2385() -> Result<()> {
 /// `resolve_slice_bound` call site inside `resolve_slice_expr`). Verified
 /// against jq 1.7.1: `path(.[0:(1,2,"x")])` on `[10,20,30]` prints
 /// `[{"start":0,"end":1}]`, `[{"start":0,"end":2}]` before raising.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_bound_end_type_error_keeps_valid_prefix_2385() -> Result<()> {
     let (stdout, stderr, code) =
@@ -19790,7 +19722,6 @@ fn test_resolve_slice_bound_end_type_error_keeps_valid_prefix_2385() -> Result<(
 /// finding for the read-path siblings). Verified against jq 1.7.1: adding
 /// a trailing `halt` to the start-bound generator produces the identical
 /// four pairs and the identical error -- `halt` is never reached.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_bound_type_error_outranks_pending_halt_2385() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -19815,7 +19746,6 @@ fn test_resolve_slice_bound_type_error_outranks_pending_halt_2385() -> Result<()
 /// fixed for the path-mode sibling, `resolve_index_expr`'s `E[K]`, and
 /// #2143 fixed for the value-mode sibling, `eval_slice_expr`. Verified
 /// live against jq 1.7.1 for every assertion below.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_reevaluates_target_per_pair_2249() -> Result<()> {
     // A target with a real side effect (`stderr`) fires once per `(s, t)`
@@ -19852,7 +19782,6 @@ fn test_resolve_slice_expr_reevaluates_target_per_pair_2249() -> Result<()> {
 /// against jq 1.7.1: the untracked branch on the second pair must still
 /// raise "Invalid path expression", not silently write `[99, 99]` into
 /// the document the way this fix's own unfixed baseline does.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_checks_trackability_every_pair_2249() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -19883,7 +19812,6 @@ fn test_resolve_slice_expr_checks_trackability_every_pair_2249() -> Result<()> {
 /// desugaring re-runs `T` fresh for every `$s`, observable whenever `T` has
 /// side effects (`input`) -- verified live against jq 1.7.1 for every
 /// assertion below.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_reevaluates_end_bound_per_start_2245() -> Result<()> {
     // Assignment: a stale `end` silently corrupted data instead of just
@@ -19926,7 +19854,6 @@ fn test_resolve_slice_expr_reevaluates_end_bound_per_start_2245() -> Result<()> 
 /// hard-`Err` path (its `.collect::<Result<Vec<_>, _>>()?` on a resolved
 /// value that isn't a number) inside the per-`s` loop, not just the
 /// `Ok`/escape shapes the other tests here cover.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_end_bound_type_error_2245() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r#"path(.[(0):("x")])"#], Some("[10,20,30]"))?;
@@ -19944,7 +19871,6 @@ fn test_resolve_slice_expr_end_bound_type_error_2245() -> Result<()> {
 /// upfront -- `end`'s own emptiness/escape still has to win over the
 /// trackability error the same way it always did, exactly mirroring the
 /// cross-product loop's own priority below it.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_untrackable_target_end_bound_still_lazy_2245() -> Result<()> {
     // `end` completely empty for every `s` -- the trackability error never
@@ -19983,7 +19909,6 @@ fn test_resolve_slice_expr_untrackable_target_end_bound_still_lazy_2245() -> Res
 /// of upfront -- a first draft of this fix broke the loop on `target`'s
 /// escape without ever folding it into the returned error, silently
 /// exiting 0 with the correct partial output but no error at all.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_target_escape_still_surfaces_in_final_result_2245() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -20004,7 +19929,6 @@ fn test_resolve_slice_expr_target_escape_still_surfaces_in_final_result_2245() -
 /// resolving `target` lazily (triggered only by the first `s` whose own
 /// `T` is genuinely non-empty), so a `target_escape` can only ever be
 /// discovered on an `s` that already has a non-empty `ends` in hand.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_target_escape_does_not_panic_on_empty_later_ends_2245() -> Result<()> {
     let (stdout, _, code) = run_jq_full(
@@ -20195,7 +20119,6 @@ fn test_object_construction_value_is_expd_not_exp_3105() -> Result<()> {
 /// error surfaced instead of the higher-priority `target` error, inverting
 /// the documented `target` > `end` > `start` rule. Fixed by checking
 /// `target_escape` first.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_target_escape_outranks_end_escape_same_iteration_2245() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -20219,7 +20142,6 @@ fn test_resolve_slice_expr_target_escape_outranks_end_escape_same_iteration_2245
 /// fired even when jq's own `S as $s | T as $t | E | .[$s:$t]` nesting
 /// would never reach `E` at all. Fixed by deferring `target`'s resolution
 /// until the first `s` whose own `T` is genuinely non-empty.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_target_not_evaluated_when_end_always_empty_2245() -> Result<()> {
     let (_, stderr, code) = run_jq_full(
@@ -20243,7 +20165,6 @@ fn test_resolve_slice_expr_target_not_evaluated_when_end_always_empty_2245() -> 
 /// outputs* were already correct before this fix and are asserted too, so a
 /// regression that "fixes" the ordering by changing what is produced fails
 /// here rather than passing quietly.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_interleaves_end_bound_with_target_2267() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -20272,7 +20193,6 @@ fn test_resolve_slice_expr_interleaves_end_bound_with_target_2267() -> Result<()
 /// (`start`) was drained in full up front too, one level further out than
 /// the `T` gap. jq reaches `E` for the first `s` before it ever asks the
 /// `S` generator for the second.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_interleaves_start_bound_with_pairs_2267() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -20303,7 +20223,6 @@ fn test_resolve_slice_expr_interleaves_start_bound_with_pairs_2267() -> Result<(
 /// generator, so a later `t`'s side effect does not merely get ignored --
 /// it is never evaluated. Pre-#2267, `t2` fired here because `T` had
 /// already been drained in full before `E` ran at all.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_target_escape_stops_end_generator_2267() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -20329,7 +20248,6 @@ fn test_resolve_slice_expr_target_escape_stops_end_generator_2267() -> Result<()
 /// *after* the already-formed pair's `E`, matching jq. Pre-#2267 the whole
 /// `T` generator ran first, so the halt took the process down before `E`
 /// was ever reached -- `t1, H` instead of jq's `t1, E, H`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_end_halt_lands_after_earlier_pair_2267() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -20353,7 +20271,6 @@ fn test_resolve_slice_expr_end_halt_lands_after_earlier_pair_2267() -> Result<()
 /// `E` runs before the next `k` is asked for. Captured live from jq 1.7.1;
 /// stdout is asserted too, because it was already correct -- the divergence
 /// was only ever in when the target ran.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_index_expr_interleaves_key_with_target_2267() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -20378,7 +20295,6 @@ fn test_resolve_index_expr_interleaves_key_with_target_2267() -> Result<()> {
 /// sink answers with [`Demand`] rather than draining. A key's own `E`
 /// escaping means jq never resumes the key generator, so a later key is not
 /// merely skipped -- it is never evaluated, and its side effect never fires.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_index_expr_target_escape_stops_key_generator_2267() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -20409,7 +20325,6 @@ fn test_resolve_index_expr_target_escape_stops_key_generator_2267() -> Result<()
 /// assigning a non-array to an array slice is a failure `setpath` always
 /// raises, on the very first `(s, t)` pair, so `stderr` fires once out of
 /// the four pairs the cross product would have produced.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_assign_write_failure_stops_slice_pair_generator_2267() -> Result<()> {
     let (stdout, stderr, code) =
@@ -20437,7 +20352,6 @@ fn test_assign_write_failure_stops_slice_pair_generator_2267() -> Result<()> {
 /// isolates the write-time gate from the resolution-time one.
 ///
 /// jq 1.7.1 fires `stderr` once for the two keys; this fired twice.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_assign_write_failure_stops_index_key_generator_2267() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r"(.|stderr)[(-1,-2)] = 1"], Some("null"))?;
@@ -20469,7 +20383,6 @@ fn test_assign_write_failure_stops_index_key_generator_2267() -> Result<()> {
 ///
 /// Every expectation was captured live from `/usr/bin/jq` 1.7.1, not
 /// recalled.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_one_path_assignments_are_unchanged_by_the_eager_route_2976() -> Result<()> {
     // (filter, stdin, expected stdout, side-effect needle, expected firings)
@@ -20539,7 +20452,6 @@ fn test_one_path_assignments_are_unchanged_by_the_eager_route_2976() -> Result<(
 ///
 /// Split out from the table above because it needs a second document on
 /// stdin. jq 1.7.1: `[10,20,30]` then `1` gives `[10,99,30]`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_input_keyed_assignment_is_unchanged_by_the_eager_route_2976() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r".[input] = 99"], Some("[10,20,30]\n1\n"))?;
@@ -20553,7 +20465,6 @@ fn test_input_keyed_assignment_is_unchanged_by_the_eager_route_2976() -> Result<
 /// still fires the target once per path. The short-circuit above is a
 /// property of a failing write, not of streaming -- without this, a fix
 /// that simply stopped after the first path would pass both tests above.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_assign_streams_every_path_when_writes_succeed_2267() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r#"(.|stderr)[("a","b")] = 1"#], Some("{}"))?;
@@ -20576,7 +20487,6 @@ fn test_assign_streams_every_path_when_writes_succeed_2267() -> Result<()> {
 /// Observable, not a formality: resolving the second `.a` against the
 /// *written* document would read back `5` and raise `Cannot index object
 /// with number`. jq 1.7.1 answers `{"a":"b","b":5}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_assign_streaming_resolves_against_the_unwritten_document_2267() -> Result<()> {
     let (stdout, stderr, code) =
@@ -20593,7 +20503,6 @@ fn test_assign_streaming_resolves_against_the_unwritten_document_2267() -> Resul
 /// that fails stops the path generator (the target fires once, not once per
 /// path), and a filter's side effects interleave with the paths'. Every row's
 /// stdout, stderr and exit code is captured whole from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn update_streams_its_path_generator_2974() -> Result<()> {
     for (input, filter, want_out, want_err, want_code) in [
@@ -20655,7 +20564,6 @@ fn update_streams_its_path_generator_2974() -> Result<()> {
 /// path, then the filter's, per path -- rather than every path's reads first,
 /// and a failing update leaves the documents after it unread. Captured from
 /// jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn update_streaming_interleaves_input_reads_2974() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -20689,7 +20597,6 @@ fn update_streaming_interleaves_input_reads_2974() -> Result<()> {
 ///   vivified before any filter runs. It answers what it did before #2974.
 ///   The computed-index rows (`.a[(0,1)] |= key`) are refused since #5233
 ///   (`tests/jq_cli/i5233.rs`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn update_streaming_holdouts_2974() -> Result<()> {
     let (stdout, stderr, code) =
@@ -20718,7 +20625,6 @@ fn update_streaming_holdouts_2974() -> Result<()> {
 /// specified as an array`), so succinctly keeps the earlier write's error --
 /// same exit code, different message, which is why those rows pin stdout and
 /// the exit code rather than stderr.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn update_streaming_retry_after_a_failed_write_2974() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -20753,7 +20659,6 @@ fn update_streaming_retry_after_a_failed_write_2974() -> Result<()> {
 ///
 /// Both rows captured live from jq 1.7.1. Before this, every `s`/`k` was
 /// evaluated regardless of how few paths the consumer asked for.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bounded_consumer_stops_computed_path_generators_2267() -> Result<()> {
     for (filter, input, expected_stdout, absent) in [
@@ -20798,7 +20703,6 @@ fn test_bounded_consumer_stops_computed_path_generators_2267() -> Result<()> {
 /// error, not two values -- so all four terminal shapes reach it. Each row
 /// is captured whole from jq 1.7.1: stdout, the target's firing count and
 /// the exit code.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_streaming_write_carries_the_rhs_terminal_and_optional_2267() -> Result<()> {
     // A failing write under the call's own `?`: empty output, exit 0, and
@@ -20877,7 +20781,6 @@ fn test_streaming_write_carries_the_rhs_terminal_and_optional_2267() -> Result<(
 /// go through `each_assign` at all. Every expectation here is jq 1.7.1's; all
 /// but the multi-output right side also held before the streaming write
 /// existed (#3448 moved that one from two fires to jq's four).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_streaming_write_gate_leaves_neighbouring_shapes_alone_2267() -> Result<()> {
     for (filter, input, expected_stdout, expected_fired) in [
@@ -20927,7 +20830,6 @@ fn test_streaming_write_gate_leaves_neighbouring_shapes_alone_2267() -> Result<(
 /// target per right-hand-side output fired it for outputs `first` never
 /// pulls. Since #3448 the right side is lazy and the target is re-resolved per
 /// *pulled* output, so this still fires once -- as jq does.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_write_paths_resolve_once_per_path_2267() -> Result<()> {
     for (filter, input) in [
@@ -20958,7 +20860,6 @@ fn test_write_paths_resolve_once_per_path_2267() -> Result<()> {
 /// `"x"`.
 ///
 /// Every row captured live from jq 1.7.1 on input `null`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_null_target_non_numeric_slice_bound_resolves_2853() -> Result<()> {
     for (filter, expected) in [
@@ -21000,7 +20901,6 @@ fn test_null_target_non_numeric_slice_bound_resolves_2853() -> Result<()> {
 /// (`del(.["x":], .["y":])`), which is harmless precisely because the
 /// component only ever exists over a `null` target, where every slice
 /// deletes nothing.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_null_target_non_numeric_slice_bound_deletes_as_noop_2853() -> Result<()> {
     for (filter, input, expected) in [
@@ -21027,7 +20927,6 @@ fn test_null_target_non_numeric_slice_bound_deletes_as_noop_2853() -> Result<()>
 /// Refusing before running it would swallow the DEBUG line and replace a real
 /// arithmetic error with the generic sentence -- the regression #1876/#1883
 /// fixed for the string-slice arm.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_null_target_non_numeric_slice_bound_refused_at_write_2853() -> Result<()> {
     const INTEGERS: &str = "Array/string slice indices must be integers";
@@ -21102,7 +21001,6 @@ fn test_null_target_non_numeric_slice_bound_refused_at_write_2853() -> Result<()
 /// without looking at the bound at all -- mirroring
 /// `SliceTargetKind::of_type_name`'s own three-way split. Every row is a
 /// live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_slice_write_refusal_is_kind_aware_when_target_changed_before_write_2927() -> Result<()> {
     const INTEGERS: &str = "Array/string slice indices must be integers";
@@ -21174,7 +21072,6 @@ fn test_slice_write_refusal_is_kind_aware_when_target_changed_before_write_2927(
 /// target had stopped being null -- observable as a doubled side effect
 /// and consuming an extra `input`, not just as the wrong error path. Every
 /// row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_slice_write_refusal_skips_edit_entirely_for_a_non_null_target_2927() -> Result<()> {
     // A chained path after the slice (`["x":][0:1]`, not a bare terminal
@@ -21239,7 +21136,6 @@ fn test_slice_write_refusal_skips_edit_entirely_for_a_non_null_target_2927() -> 
 /// #2853 (must-not-change): the rows that would break if
 /// `slice_has_non_integer_bound` were widened past `SliceBoundKey::Raw`, or
 /// if the null-target arm leaked to a non-null target.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_slice_bound_controls_unmoved_2853() -> Result<()> {
     for (filter, input, expected) in [
@@ -21287,7 +21183,6 @@ fn test_slice_bound_controls_unmoved_2853() -> Result<()> {
 /// write that never happened kept a vivified `{"a":null}` where jq answers
 /// `null`, and -- the severe row -- silently *undid* an already-completed
 /// delete in a two-path fan-out.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_null_target_non_numeric_slice_bound_nested_empty_update_2853() -> Result<()> {
     for (filter, input, expected) in [
@@ -21324,7 +21219,6 @@ fn test_null_target_non_numeric_slice_bound_nested_empty_update_2853() -> Result
 /// Filed as a side-effect count; it is not. Two of these rows are silent
 /// wrong answers -- an element deleted that jq keeps, and a slot written
 /// that jq never reaches. Every expectation captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_optional_group_has_one_abort_scope_2909() -> Result<()> {
     for (filter, input, expected) in [
@@ -21375,7 +21269,6 @@ fn test_optional_group_has_one_abort_scope_2909() -> Result<()> {
 /// than to `?` or to `.[]`. `path((...)?)` with no enclosing pipe reaches
 /// `resolve_optional_sink` directly -- the arm the fix routes the others
 /// into -- so it is the reference behaviour, not just a control.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_optional_group_neighbouring_spellings_unmoved_2909() -> Result<()> {
     for filter in [
@@ -21487,7 +21380,6 @@ fn test_optional_group_no_unbounded_recursion_2909() -> Result<()> {
 /// `path((.,5)[(0,1):(2,error("mid"))])` on `null` prints
 /// `[{"start":0,"end":2}]` (the `.` branch's own successful slice) before
 /// raising "Invalid path expression".
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_untrackable_branch_keeps_earlier_prefix_2248() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -21736,7 +21628,6 @@ fn test_repeat_value_budget_bounds_total_output_independent_of_fan_out() -> Resu
 /// even when `f` was itself perfectly path-trackable (e.g. `.`), raising
 /// "Invalid path expression" where real jq tracks through it correctly.
 /// Every case here confirmed live against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_repeat_tracks_through_trackable_body_1906() -> Result<()> {
     // The issue's own repro.
@@ -21798,7 +21689,6 @@ fn test_path_repeat_tracks_through_trackable_body_1906() -> Result<()> {
 /// when `limit`'s own `n` was already satisfied by branches produced
 /// before it -- something real jq's own lazy `limit` never even reaches.
 /// Confirmed live against jq 1.7.1: exit 0, `[]`, no error at all.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_repeat_error_dropped_once_limit_satisfied_1933() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -21817,7 +21707,6 @@ fn test_path_repeat_error_dropped_once_limit_satisfied_1933() -> Result<()> {
 /// than value-mode allows for the identical query shape. Both modes now
 /// cut at exactly 10000 branches with the same "repeat: maximum
 /// iterations exceeded" message.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_repeat_width_budget_matches_value_mode_1933() -> Result<()> {
     let input = format!(
@@ -21907,7 +21796,6 @@ fn test_repeat_eager_fallback_raises_instead_of_silently_truncating_2014() -> Re
 /// deliberately out-of-scope gap (issue #1935's own suggested disposition --
 /// `nth` has no path-context support at all yet to extend, and the general
 /// combinator-nesting case needs a materially bigger design change).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_first_repeat_tracks_through_trackable_body_1935() -> Result<()> {
     let (stdout, _, code) = run_jq_full(&["-c", "path(first(repeat(.)))"], Some("{\"a\":1}"))?;
@@ -21945,7 +21833,6 @@ fn test_path_first_repeat_tracks_through_trackable_body_1935() -> Result<()> {
 /// live-verified during review. `path(limit(1; .[]))`'s already-established
 /// #1850 behavior is the parity baseline `first(.[])` must match, since the
 /// two are the same bound expressed two ways.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_first_iterate_uses_bounded_fast_path_1935() -> Result<()> {
     let (first_stdout, _, first_code) = run_jq_full(&["-c", "path(first(.[]))"], Some("[1,2,3]"))?;
@@ -22007,7 +21894,6 @@ fn test_path_first_iterate_uses_bounded_fast_path_1935() -> Result<()> {
 /// $ echo '{"a":1}' | jq -c 'path(nth(-1; .a))'
 /// jq: error (at <stdin>:1): nth doesn't support negative indices
 /// ```
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_nth_tracks_like_limit_1952() -> Result<()> {
     // `repeat` reached as `nth`'s direct child -- the shape #1935 pinned as
@@ -22081,7 +21967,6 @@ fn test_path_nth_tracks_like_limit_1952() -> Result<()> {
 /// $ echo '{"a":1,"b":2}' | jq -c 'path(nth(1; if true then (.a,.b) else empty end))'
 /// ["b"]
 /// ```
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_bounded_consumers_thread_through_combinators_1952() -> Result<()> {
     let cases: &[(&str, &str, &str)] = &[
@@ -22133,7 +22018,6 @@ fn test_path_bounded_consumers_thread_through_combinators_1952() -> Result<()> {
 /// divergence from that hang (`docs/compliance/jq/limitations.md`), and
 /// 1000 correct paths is the same answer `path(limit(1500; repeat(.)))`
 /// already gave; the old error was not.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_unbounded_repeat_hits_the_round_cap_1952() -> Result<()> {
     let (stdout, stderr, code) =
@@ -22774,7 +22658,6 @@ fn test_setpath_fanout_emits_its_prefix_then_halts_1279() -> Result<()> {
 /// `del` is a real jq builtin; verified against jq 1.7.1: `jq -n
 /// '[1,2,3]|del(.[error("x")])?'` exits 0 with no output, same as
 /// succinctly here.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_del_computed_index_still_swallows_ordinary_error_under_optional() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r#"del(.[error("x")])?"#], Some("[1,2,3]"))?;
@@ -25218,7 +25101,6 @@ fn test_skip_integer_count_from_document_1879() -> Result<()> {
 /// `eval_limit`'s n-conversion rule but wasn't updated by the initial fix
 /// -- confirmed live against real jq 1.7.1, which gives unlimited
 /// passthrough here too.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_limit_negative_count_is_unlimited_not_error_983() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -25420,7 +25302,6 @@ fn test_limit_float_count_takes_ceil_1825() -> Result<()> {
 /// #845: a falsy, non-path-shaped left operand falls through to the right
 /// side instead of raising #530. Verified against jq 1.7.1: `echo
 /// '{"a":10}' | jq -c 'path(false // .b)'` prints `["b"]`, exit 0.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_falsy_non_path_left_falls_through_845() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r"path(false // .b)"], Some(r#"{"a":10}"#))?;
@@ -25433,7 +25314,6 @@ fn test_resolve_node_alternative_falsy_non_path_left_falls_through_845() -> Resu
 /// #845 companion: `null` (also falsy, also not path-shaped) behaves the
 /// same way. Verified against jq 1.7.1: `path(null // .b)` on `{"a":10}`
 /// prints `["b"]`, exit 0.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_null_left_falls_through_845() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r"path(null // .b)"], Some(r#"{"a":10}"#))?;
@@ -25447,7 +25327,6 @@ fn test_resolve_node_alternative_null_left_falls_through_845() -> Result<()> {
 /// fix must not turn `//`'s left side into a blanket path-shape exemption.
 /// Verified against jq 1.7.1: `path(1 // .b)` on `{"a":10}` raises "Invalid
 /// path expression with result 1", exit 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_truthy_non_path_left_still_raises_845() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r"path(1 // .b)"], Some(r#"{"a":10}"#))?;
@@ -25461,7 +25340,6 @@ fn test_resolve_node_alternative_truthy_non_path_left_still_raises_845() -> Resu
 /// still propagate -- `//` only substitutes for falsy/absent output, never
 /// for a raised error. Verified against jq 1.7.1: `path(error("x") // .b)`
 /// raises `x`, exit 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_left_error_still_propagates_845() -> Result<()> {
     let (stdout, stderr, code) =
@@ -25489,7 +25367,6 @@ fn test_resolve_node_alternative_truthy_path_left_unaffected_845() -> Result<()>
 /// values are always path-exempt" rule. Verified against jq 1.7.1:
 /// `path(false)` on `{"a":10}` raises "Invalid path expression with result
 /// false", exit 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_bare_path_false_still_raises_845() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r"path(false)"], Some(r#"{"a":10}"#))?;
@@ -25505,7 +25382,6 @@ fn test_resolve_node_bare_path_false_still_raises_845() -> Result<()> {
 /// behavior already matches jq exactly on its own. Verified against jq
 /// 1.7.1: `path((.a, 1) // .b)` on `{"a":10}` prints `["a"]` before raising
 /// on `1`, exit 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_keeps_prefix_when_later_sibling_truthy_and_non_path_845(
 ) -> Result<()> {
@@ -25521,7 +25397,6 @@ fn test_resolve_node_alternative_keeps_prefix_when_later_sibling_truthy_and_non_
 /// still succeeds even without a `catch` clause. Verified against jq
 /// 1.7.1: `try (path(false // .b)) catch "caught"` on `{"a":10}` prints
 /// `["b"]`, exit 0 (the `try` never even has anything to catch).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_falsy_left_no_catch_needed_845() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -25547,7 +25422,6 @@ fn test_resolve_node_alternative_falsy_left_no_catch_needed_845() -> Result<()> 
 /// #986) -- #2234 fixed that: `path(stderr // .b)` now matches jq byte for
 /// byte (`{"a":10}[]`, exit 0), so this test's own write-count check is the
 /// only thing left worth pinning.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_does_not_double_evaluate_non_literal_left_845() -> Result<()> {
     let (_stdout, stderr, _code) = run_jq_full(&["-c", "path(stderr // .b)"], Some(r#"{"a":10}"#))?;
@@ -25567,7 +25441,6 @@ fn test_resolve_node_alternative_does_not_double_evaluate_non_literal_left_845()
 /// caller of `resolve_node`'s `Alternative` arm, not just `path()` --
 /// `del()`, `=`, and `|=` all share the same code. Verified against jq
 /// 1.7.1: all three queries below match jq exactly.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_alternative_falsy_left_fix_reaches_del_assign_and_update_845() -> Result<()> {
     let (stdout, _stderr, code) =
@@ -25599,7 +25472,6 @@ fn test_alternative_falsy_left_fix_reaches_del_assign_and_update_845() -> Result
 /// from `false` itself), and `path(try error(false) catch (false // .))`
 /// raises the plain `#530` "with result false" (no navigation attempted at
 /// all).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_falsy_literal_interacts_correctly_with_untracked_catch_845(
 ) -> Result<()> {
@@ -25627,7 +25499,6 @@ fn test_resolve_node_alternative_falsy_literal_interacts_correctly_with_untracke
 /// fell back to the generic `#530` "with result" wording instead of #843's
 /// "near attempt to access element K of V" whenever a trailing `?` was
 /// involved. Verified live against jq 1.7.1 for every assertion below.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_navigation_element_unwraps_optional_component_2272() -> Result<()> {
     // Field access through a computed-key index expression.
@@ -25744,7 +25615,6 @@ fn test_resolve_node_select_keeps_cond_partial_fanout_before_error_1023() -> Res
 /// through both and asserting they produce byte-identical output directly
 /// demonstrates the two arms can no longer silently diverge, since they
 /// now run through the same fork loop underneath.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_select_and_if_cond_fork_agree_with_each_other_1023() -> Result<()> {
     let (select_stdout, select_stderr, select_code) =
@@ -25775,7 +25645,6 @@ fn test_select_and_if_cond_fork_agree_with_each_other_1023() -> Result<()> {
 // ============================================================================
 
 /// #980: earlier falsy sibling, later path-shaped one.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_comma_falsy_then_path_sibling_980() -> Result<()> {
     let (stdout, stderr, code) =
@@ -25787,7 +25656,6 @@ fn test_resolve_node_alternative_comma_falsy_then_path_sibling_980() -> Result<(
 
 /// #980: earlier path-shaped sibling, later falsy one -- order doesn't
 /// matter.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_comma_path_then_falsy_sibling_980() -> Result<()> {
     let (stdout, stderr, code) =
@@ -25799,7 +25667,6 @@ fn test_resolve_node_alternative_comma_path_then_falsy_sibling_980() -> Result<(
 
 /// #980: a `null` sibling (falsy, distinct from `false`) is treated the
 /// same way.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_comma_path_then_null_sibling_980() -> Result<()> {
     let (stdout, stderr, code) =
@@ -25811,7 +25678,6 @@ fn test_resolve_node_alternative_comma_path_then_null_sibling_980() -> Result<()
 
 /// #980: every sibling falsy (mixed `null`/`false`) -- `//` falls through
 /// to the right side entirely.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_comma_all_falsy_siblings_falls_through_980() -> Result<()> {
     let (stdout, stderr, code) =
@@ -25856,7 +25722,6 @@ fn test_resolve_node_alternative_comma_missing_field_sibling_is_falsy_980() -> R
 
 /// #980: three siblings, falsy/path/falsy -- the fix must hold across more
 /// than two outputs, not just a pair.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_comma_three_siblings_mixed_980() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -25876,7 +25741,6 @@ fn test_resolve_node_alternative_comma_three_siblings_mixed_980() -> Result<()> 
 /// Invisible while `drive_fold_source` re-evaluated an erroring source
 /// untracked, and a wrong-fold hazard the moment the resolver's own prefix
 /// is trusted instead. All three captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_escape_prefix_is_truthy_filtered_2235() -> Result<()> {
     for (input, filter, want) in [
@@ -25909,7 +25773,6 @@ fn test_resolve_node_alternative_escape_prefix_is_truthy_filtered_2235() -> Resu
 /// This is #845's own pre-existing behavior, unaffected by #980's fix;
 /// pinned here alongside the other seven shapes so the boundary between
 /// "silently filtered" and "still raises" is guarded in one place.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_node_alternative_comma_truthy_non_path_sibling_still_raises_980() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "path((.a, 1) // .b)"], Some(r#"{"a":10}"#))?;
@@ -25933,7 +25796,6 @@ fn test_resolve_node_alternative_comma_truthy_non_path_sibling_still_raises_980(
 /// computed index after a multi-output path component" message. Verified
 /// against jq 1.7.1: `echo null | jq -c 'path(range(3))'` raises "Invalid
 /// path expression with result 0", exit 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_leaf_multi_output_names_first_value_891() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "path(range(3))"], Some("null"))?;
@@ -25948,7 +25810,6 @@ fn test_resolve_leaf_multi_output_names_first_value_891() -> Result<()> {
 /// output), not a scalar -- confirms the message uses the *rendered* first
 /// value, not just a bare number. Verified against jq 1.7.1: raises
 /// "Invalid path expression with result [0]", exit 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_leaf_multi_output_names_first_container_value_891() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -25975,7 +25836,6 @@ fn test_resolve_leaf_multi_output_names_first_container_value_891() -> Result<()
 /// against jq 1.7.1: both queries below raise "Invalid path expression with
 /// result 0", exit 5 -- `?` does not suppress it, and `catch`'s handler
 /// never runs.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_leaf_multi_output_error_survives_optional_and_try_catch_891() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "path((range(3))?)"], Some("null"))?;
@@ -26001,7 +25861,6 @@ fn test_resolve_leaf_multi_output_error_survives_optional_and_try_catch_891() ->
 /// not just `path(...)`. Verified against jq 1.7.1: `del((range(3))?)` on
 /// `null` raises "Invalid path expression with result 0", exit 5 -- `?`
 /// does not turn this into a silent no-op.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_del_multi_output_error_survives_optional_891() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "del((range(3))?)"], Some("null"))?;
@@ -27325,7 +27184,6 @@ fn test_wide_recursive_string_interpolation_reports_cleanly_not_stack_overflow_2
 /// succinctly stops at its round budget since #5379, so these rows nest it.)
 /// Erroring is the deliberate divergence ADR-0018 permits; what this pins is that
 /// it stays an *error* on all three routes rather than an abort on any of them.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recursion_guard_reaches_lazy_and_path_evaluators_1371() -> Result<()> {
     for filter in [
@@ -27474,7 +27332,6 @@ cover(3)
 /// the rows nest the call. There is no oracle output to match
 /// here -- what is pinned is that the guard is reachable from these routes at all,
 /// rather than the recursion running until the native stack gives out.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recursion_guard_reaches_path_routes_1371() -> Result<()> {
     for filter in [
@@ -31274,7 +31131,6 @@ fn test_module_own_data_import_binds_only_inside_its_own_defs_2956() -> Result<(
 /// repros, the fuzz's own `= 9` hits, both write operators on a refused
 /// chain (the document must come back unwritten, at exit 5), one family-B
 /// row, and three accepting writes that now go through at jq's path.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_alternation_pattern_writes_match_jq_2979() -> Result<()> {
     let rows: &[(&str, &str, &str, &str, i32)] = &[
@@ -32508,7 +32364,6 @@ fn test_duplicate_named_param_three_occurrences_2560() -> Result<()> {
 /// answered `2,3,3,4` for jq's `2,4`; an `empty` argument still ran the body,
 /// an erroring one never raised, and several `$` parameters did not combine
 /// as a cartesian product. Every row below is jq 1.7.1's own output.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_dollar_param_binds_each_value_of_a_generator_argument_3149() -> Result<()> {
     for (filter, expected) in [
@@ -32806,7 +32661,6 @@ fn test_settled_operand_keeps_jq_order_3296() -> Result<()> {
 /// generic evaluator's path-context arms) refuses where it aborted the process,
 /// and answers shallow. The same chain read inside `path()` or `|=` runs through
 /// the path-mode interpreter since #5223 and answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_argument_chain_refuses_on_the_path_routes_3262() -> Result<()> {
     let def = "def f(n): if n == 0 then .a else f(n - 1 | select(true)) end;";
@@ -32843,7 +32697,6 @@ fn test_argument_chain_refuses_on_the_path_routes_3262() -> Result<()> {
 /// took the demand-driven path, whose native stack per link capped these at
 /// ~115-155 levels (refused since #3262) where jq runs 100,000. Read eagerly,
 /// they answer, on the path routes too.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_pure_chain_links_recurse_deep_3287() -> Result<()> {
     for body in [
@@ -33285,7 +33138,6 @@ fn test_func_def_forward_arity_reference_in_own_body_1473() -> Result<()> {
 /// reaches it, so it needs its own coverage. `path(...)` forces evaluation
 /// through the path-context evaluator; both overloads still resolve
 /// correctly there. Oracle-verified against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_func_def_arity_overload_through_path_context_evaluator_1376() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -37735,7 +37587,6 @@ fn test_foreach_alt_extract_break_also_retries_like_error_1458() -> Result<()> {
 /// EXTRACT branch that a later `break` escapes past stays trackable
 /// through `del()`/`=`/`|=`, exactly as `error()` already did. All three
 /// rows captured live against jq 1.7.1 on `{"a":1}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_extract_comma_break_write_side_3099() {
     assert_jq_answers(
@@ -37772,7 +37623,6 @@ fn test_foreach_extract_comma_break_write_side_3099() {
 /// the process exits with the escape's own code (0 for `halt`, 5 for bare
 /// `halt_error`, the given code for `halt_error(n)`). All rows captured
 /// live against jq 1.7.1 on `{"a":1}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_extract_comma_halt_write_side_3099() -> Result<()> {
     for (escape, expect_code) in [("halt", 0), ("halt_error", 5), ("halt_error(3)", 3)] {
@@ -37846,7 +37696,6 @@ fn test_foreach_alt_extract_halt_never_retries_1458() -> Result<()> {
 /// first element, so its row emits that one path. None fall through to
 /// `?// $z`/`$r`'s retry the way an ordinary catchable refusal there would
 /// (#2979's rule 1) -- `halt` bypasses the retry mechanism same as #1458.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_pattern_walk_key_halt_propagates_past_non_last_alternative_3112() -> Result<()> {
     for (filter, input, want_out) in [
@@ -39085,7 +38934,6 @@ fn test_path_context_parent_n_argument_wrong_type_errors_1280() -> Result<()> {
 /// makes the whole call produce zero output. Both `path(...)` mode (this
 /// function) and plain value mode (`eval_limit`, the sibling test below)
 /// had the identical bug via two different collapsing helpers.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_limit_path_mode_zero_output_bound_produces_no_output_1313() -> Result<()> {
     let (out, _err, code) = run_jq_full(
@@ -39112,7 +38960,6 @@ fn test_limit_path_mode_zero_output_bound_produces_no_output_1313() -> Result<()
 /// divergence between the two functions, unrelated to and not introduced by
 /// this issue's own zero-output-bound fix, but caught while both functions
 /// were already being edited for it.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_limit_path_mode_negative_float_bound_is_unlimited_passthrough_1313() -> Result<()> {
     let (out, err, code) = run_jq_full(
@@ -39245,7 +39092,6 @@ fn test_flatten_depth_non_number_argument_errors_1045() -> Result<()> {
 /// All seven were captured live against pinned jq 1.7.1: each writes nothing
 /// to stdout, exits 5, and reports `Invalid path expression with result <v>`
 /// naming the offending value.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_non_pipe_path_expressions_still_raise_986() -> Result<()> {
     // (query, the value jq names in "with result <v>")
@@ -39298,7 +39144,6 @@ fn test_non_pipe_path_expressions_still_raise_986() -> Result<()> {
 /// reach `resolve_index_expr`'s pre-existing #843 checks and pick up jq's
 /// "near attempt to access element K of V" wording. Stage 2 then stopped
 /// `Expr::Comma` from answering the same question a position too early.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_deferred_trackability_matches_jq_986_989() {
     // (query, expected stderr fragment) -- all exit 5, no stdout.
@@ -42441,7 +42286,6 @@ fn test_jq_raw_input_line_number_unterminated_single_file_1809() -> Result<()> {
 /// the negated key is a plain double before indexing happens at all. The
 /// `from-data` case is the control that proves it — a negative float that
 /// never passes through unary minus *does* keep its spelling.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_1088_path_reports_float_index_as_written() {
     let arr = Some("[1,2,3,4,5]");
@@ -42756,7 +42600,6 @@ type SideEffectCase = (
 /// divergence test below, is what a too-eager `Demand::Stop` would break.
 /// Pinning it first follows #1284's precedent (guard rails before the change,
 /// not after).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
     let cases: &[SideEffectCase] = &[
@@ -44306,7 +44149,6 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
 /// spelled in `path(...)`; since #5223 those programs run through the
 /// path-mode interpreter, which raises jq's path error in both spellings, so
 /// both rows now hold jq's answer and the asymmetry is no longer pinned here.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     let cases: &[SideEffectCase] = &[
@@ -45890,7 +45732,6 @@ fn test_nested_short_circuit_consumer_hides_the_stop_2180() -> Result<()> {
 /// `each_paths_filter`, so node `3`'s `stderr` is no longer even evaluated.
 /// Note this is not comma laziness -- jq evaluates both branches of the
 /// `(stderr, true)` comma too, once a node is actually visited.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_paths_filter_does_not_leak_a_never_visited_node_987() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -45915,7 +45756,6 @@ fn test_path_paths_filter_does_not_leak_a_never_visited_node_987() -> Result<()>
 /// unevaluated. Confirmed against jq 1.7.1: node `[0]`'s `stderr` still
 /// fires (it is what makes `[0]` the first, satisfying output), but the
 /// subsequent nodes are never visited at all.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_paths_filter_still_evaluates_the_satisfying_node_987() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -45942,7 +45782,6 @@ fn test_path_paths_filter_still_evaluates_the_satisfying_node_987() -> Result<()
 /// always runs `node_filter` against the root, even though the root's own
 /// path is excluded from the result), then both non-root nodes' `stderr`
 /// fire too — no path output, exit 0.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_paths_filter_visits_every_node_when_none_survive_987() -> Result<()> {
     let (stdout, stderr, code) =
@@ -45959,7 +45798,6 @@ fn test_path_paths_filter_visits_every_node_when_none_survive_987() -> Result<()
 /// not just the `path(...)` spelling the issue's own repro used. Confirmed
 /// against jq 1.7.1: both raise identically to `path(...)`'s own case,
 /// with node `3`'s `stderr` never reached.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_paths_filter_laziness_reaches_del_and_assign_987() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -46001,7 +45839,6 @@ fn test_paths_filter_laziness_reaches_del_and_assign_987() -> Result<()> {
 /// an error aborts the whole computation rather than making jq backtrack
 /// for `range`'s next candidate). Confirmed against jq 1.7.1: `stderr`
 /// fires exactly once (`0`), not three times.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_single_dynamic_stage_static_tail_does_not_over_materialize_2050() -> Result<()> {
     let (stdout, stderr, code) =
@@ -46036,7 +45873,6 @@ fn test_path_single_dynamic_stage_static_tail_does_not_over_materialize_2050() -
 ///
 /// (`succinctly` answered 100000 and 1000 respectively for these two sizes
 /// before this fix -- a `RECURSE_MAX_ITEMS`-style cap, not the full million.)
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_passthrough_between_generator_stages_calls_debug_once_2178() -> Result<()> {
     for n in ["1000", "1000000"] {
@@ -46070,7 +45906,6 @@ fn test_path_passthrough_between_generator_stages_calls_debug_once_2178() -> Res
 /// (The raise is the point: reaching `["a","b"]` at all means `paths` was
 /// asked past its rejected first output. A stage-batch loop truncated to one
 /// value answers `[]`, exit 0.)
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_rejecting_stage_still_reaches_a_later_candidate_2178() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -46096,7 +45931,6 @@ fn test_path_rejecting_stage_still_reaches_a_later_candidate_2178() -> Result<()
 /// ["a",0,"c",0,"foo"]
 /// jq: error (at <stdin>:1): t2
 /// ```
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_multistage_escape_order_matches_jq_2178() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -46913,7 +46747,6 @@ fn test_validate_multi_file_second_invalid_keeps_first_files_output_1558() -> Re
 /// ["b"]
 /// jq: error (at <stdin>:1): Cannot index number with string "x"
 /// ```
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_jq_getpath_fanout_keeps_resolved_prefix_on_later_failure_1532() -> Result<()> {
     // `index_one_owned`'s failure -- indexing a number with a string.
@@ -46931,7 +46764,6 @@ fn test_jq_getpath_fanout_keeps_resolved_prefix_on_later_failure_1532() -> Resul
 /// with `arg_escape` rather than returning), and must keep doing so now
 /// that every arm in the loop leaves the same way. Real jq agrees:
 /// `["a"]` on stdout, then "Path must be specified as an array".
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_jq_getpath_fanout_keeps_prefix_on_non_array_output_1532() -> Result<()> {
     let (out, err, code) = run_jq_full(
@@ -46950,7 +46782,6 @@ fn test_jq_getpath_fanout_keeps_prefix_on_non_array_output_1532() -> Result<()> 
 /// #1532 guard: the all-succeed path is unchanged by the restructure --
 /// every output still produces its own branch, in argument order, and a
 /// write through a fanned-out `getpath` still reaches every branch.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_jq_getpath_fanout_all_outputs_still_resolve_1532() -> Result<()> {
     let (out, _, code) = run_jq_full(
@@ -47424,7 +47255,6 @@ fn test_position_builtin_argument_shapes_2168() -> Result<()> {
 /// `try`/`catch` wrapped in its own outer `?` (the exact shape #2231's
 /// `test_try_catch_handler_still_runs_under_outer_optional_2231` uses to
 /// rule out a leaf silently self-suppressing ahead of an enclosing catch).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_optional_ignored_sites_2280() -> Result<()> {
     let doc = r#"{"a":"\ud800","d":5}"#;
@@ -47500,7 +47330,6 @@ fn test_optional_ignored_sites_2280() -> Result<()> {
 /// to suppress or not by the time `builtin_path` gets a turn. This test
 /// only pins that the reindex-bridge round trip through the fixed line
 /// still produces the correct answer, not a live optional-suppression case.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_eval_rs_only_sites_still_correct_2280() -> Result<()> {
     let long_number = "1".repeat(300);
@@ -49381,7 +49210,6 @@ fn test_raw_input_still_substitutes_under_validate_1247() -> Result<()> {
 /// reconstruction and the whole path was refused where jq accepts and
 /// writes. Confirmed live against jq 1.7.1: `9` on stdout, exit 0, the
 /// document replaced by the write.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_jq_recurse_select_write_through_tracked_var_snapshot_1591() -> Result<()> {
     let filter = "(. as $x | reduce (1) as $i (.; \
@@ -49404,7 +49232,6 @@ fn test_jq_recurse_select_write_through_tracked_var_snapshot_1591() -> Result<()
 /// is the dangerous direction of the two-#1466-call-sites bug class --
 /// confirmed live against jq 1.7.1: exit 5, "Invalid path expression with
 /// result {"a":1}", document untouched.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_jq_reduce_reconstruction_step_no_longer_promotes_next_step_write_1590() -> Result<()> {
     let filter = "(reduce (1,2) as $i (.; if $i==1 then {a: .a} else . end)) |= 9";
@@ -50410,7 +50237,6 @@ fn test_field_index_iterate_delete_on_empty_update_filter_1916() -> Result<()> {
 
 /// #3030: jq collects empty-update paths and deletes them together after all
 /// path filters run. Expectations are from /usr/bin/jq 1.7.1-apple.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_multi_path_empty_update_deletes_simultaneously_3030() -> Result<()> {
     for (input, filter, expected) in [
@@ -52087,7 +51913,6 @@ fn cli_context_builtins_match_jq_3046() -> Result<()> {
 /// implementation. Before #3042, `cbrt`, `hypot(.; .)`, `fma(.; .; .)`,
 /// `frexp`, `significand`, `gamma`, `nearbyint` and `logb` were the sampled
 /// "still unimplemented" names here.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_every_pinned_jq_builtin_is_implemented_1473() -> Result<()> {
     let roster = std::fs::read_to_string(concat!(
@@ -53515,7 +53340,6 @@ fn test_home_jq_errors_follow_module_errors_3313() -> Result<()> {
 /// Non-re-export is pinned with a compile error in
 /// `test_transitive_include_does_not_leak_to_the_includer_2865` and the
 /// `_2962` matrix above; nothing here re-tests it.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_linked_dependency_keeps_jq_scoping_2955() -> Result<()> {
     let rows: &[ModuleRow] = &[
@@ -53667,7 +53491,6 @@ fn test_depth_guard_names_a_linked_def_as_written_2955() -> Result<()> {
 /// `$param`, closure params and recursion through the top-level stub;
 /// `path()`, `|=` and `del()` through it; and an includer whose own def
 /// shadows the dependency's name.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_top_level_module_that_is_also_linked_3153() -> Result<()> {
     const SHARED: (&str, &str) = (
@@ -55956,7 +55779,6 @@ fn test_path_cursor_native_absent_nodes_and_pipes_2061() -> Result<()> {
 ///
 /// Counted by occurrence, not by line: `stderr` writes no trailing newline.
 /// Captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn fold_source_side_effect_fires_once_per_output_1872() -> Result<()> {
     for (input, filter, want, why) in [
@@ -55997,7 +55819,6 @@ fn fold_source_side_effect_fires_once_per_output_1872() -> Result<()> {
 /// terminal check, and that check refuses the first step's emission before
 /// the source is ever pulled again. Before #2235 `Keep::AtMost(usize::MAX)`
 /// pulled the whole source upfront and all three writes fired first.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn fold_source_foreach_diverges_from_reduce_on_this_shape_1872() -> Result<()> {
     for filter in [
@@ -56033,7 +55854,6 @@ fn fold_source_foreach_diverges_from_reduce_on_this_shape_1872() -> Result<()> {
 /// answer). Every row is captured from jq 1.7.1: `(input, filter, stdout,
 /// stderr, exit)`; stderr is compared whole, so a `stderr`/`debug` write
 /// count is pinned exactly.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn fold_source_is_pulled_by_demand_2235() -> Result<()> {
     let e = |msg: &str| format!("jq: error (at <stdin>:0): {msg}\n");
@@ -56473,7 +56293,6 @@ fn reduce_is_demand_forwarding_2899() -> Result<()> {
 /// pinned exactly. `reduce` is here alongside `foreach` because it is the
 /// same loop in the adjacent function and diverged identically, though
 /// #2903 names only `foreach`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn path_mode_fold_resolves_init_by_demand_2903() -> Result<()> {
     for (input, filter, want_out, want_err, want_code) in [
@@ -56654,7 +56473,6 @@ fn path_mode_fold_resolves_init_by_demand_2903() -> Result<()> {
 ///
 /// Every row is captured whole from jq 1.7.1, so the side-effect count is pinned
 /// exactly on stderr as well as stdout.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn path_mode_foreach_update_and_extract_resolve_by_demand_3507() -> Result<()> {
     for (input, filter, want_out, want_err, want_code) in [
@@ -57251,7 +57069,6 @@ fn wide_document_array_reads_agree_with_jq_across_repeated_reads_4035() -> Resul
 /// the reads extend (`src/jq/array_index.rs`). A loop over a 200-element array,
 /// ascending, descending, strided past the end and mixed with negative indexes
 /// (which do read the length), must give jq 1.7.1's paths.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn path_context_index_loops_over_a_wide_array_agree_with_jq_4162() -> Result<()> {
     let body: Vec<String> = (0..200)
@@ -57310,7 +57127,6 @@ fn path_context_index_loops_over_a_wide_array_agree_with_jq_4162() -> Result<()>
 ///
 /// The first five rows are the issue's, whole from jq 1.7.1 -- stdout, stderr and
 /// exit code, so the `?//` body's side-effect count (`axax`) is pinned exactly.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn fold_source_alt_chain_over_a_fresh_value_runs_the_next_alternative_3651() -> Result<()> {
     const D: &str = r#"{"a":{"a":1,"b":{"c":2}},"b":[1,2,3]}"#;
@@ -57447,7 +57263,6 @@ fn fold_source_alt_chain_over_a_fresh_value_runs_the_next_alternative_3651() -> 
 ///
 /// Every row is captured whole from jq 1.7.1 — stdout, stderr and exit code —
 /// so the side-effect count is pinned exactly rather than bounded.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn path_results_stream_to_their_consumer_2908() -> Result<()> {
     let abc = r#"{"a":1,"b":2,"c":3}"#;
@@ -57809,7 +57624,6 @@ fn test_recurse_of_each_optional_has_no_node_cap_3703() -> Result<()> {
 /// truthy output, so those walks are not bounded by the tree and keep the cap.
 ///
 /// Every expectation is captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recurse_of_each_optional_with_a_gating_cond_has_no_node_cap_3737() -> Result<()> {
     // 6,000 one-element arrays: 1 root + 6,000 arrays + 6,000 numbers.
@@ -57994,7 +57808,6 @@ fn test_recurse_gated_cond_runs_in_jq_order_3737() -> Result<()> {
 /// The rows spell `f` as `.[]? | .`, which walks the same tree but is not the
 /// bare `.[]?` whose walk is provably bounded by it: a `cond` that cannot fork
 /// over bare `.[]?` is uncapped since #3737, and no longer reaches the cap.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
     let cap_error = "recurse: maximum nodes exceeded";
@@ -58059,7 +57872,6 @@ fn test_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
 /// one more raises, because the cap fires only when a node remains. Every answer here is jq's
 /// own. (A `cond` that cannot fork over bare `.[]?` is uncapped too, since
 /// #3737, and has its own test.)
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recurse_cap_stopping_consumers_and_boundary_3716() -> Result<()> {
     let cap_error = "recurse: maximum nodes exceeded";
@@ -58117,7 +57929,6 @@ fn test_recurse_cap_stopping_consumers_and_boundary_3716() -> Result<()> {
 
 /// #3716, the less common routes: a `?//` inside `f` does not retry past the
 /// cap, and the shape the cap exists for.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_recurse_cap_retry_and_null_loop_3716() -> Result<()> {
     let cap_error = "recurse: maximum nodes exceeded";
@@ -58188,7 +57999,6 @@ fn test_recurse_cap_retry_and_null_loop_3716() -> Result<()> {
 /// so the side-effect count is pinned exactly rather than bounded. The
 /// delivered values never differed before or after -- the unbounded rows are
 /// here to keep it that way.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn recurse_runs_f_only_on_demand_2693() -> Result<()> {
     let doc = r#"{"a":{"x":1},"b":{"y":2}}"#;
@@ -58492,7 +58302,6 @@ fn recurse_queues_past_its_native_stack_budget_2918() -> Result<()> {
 /// dispatched is never un-emitted by a later one escaping (#896), and a
 /// witness that declines after resolving has to be able to fall back to
 /// by-value evaluation, which a streamed value cannot be taken back from.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn path_mode_streams_cond_and_bind_sources_2694() -> Result<()> {
     let e = |msg: &str| format!("jq: error (at <stdin>:0): {msg}\n");
@@ -58803,7 +58612,6 @@ fn path_mode_streams_cond_and_bind_sources_2694() -> Result<()> {
 /// exhausts the child's memory rather than the test harness's. Both
 /// expectations are captured from jq 1.7.1: `first(...)` contributes exactly
 /// one source element, `limit(3; ...)` exactly three.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn fold_source_bounded_generator_stays_bounded_1872() -> Result<()> {
     for (filter, want_stdout, why) in [
@@ -58836,7 +58644,6 @@ fn fold_source_bounded_generator_stays_bounded_1872() -> Result<()> {
 /// arm, `Expr::Label` on a matching break, a satisfied bound -- so their
 /// values are a fold's values. Each case's value count is captured from jq
 /// 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn fold_source_laundered_short_prefix_value_counts_1872() -> Result<()> {
     for (input, filter, want, why) in [
@@ -58877,7 +58684,6 @@ fn fold_source_laundered_short_prefix_value_counts_1872() -> Result<()> {
 /// per-step register let eleven of four thousand generated folds stream a
 /// prefix jq never streams. No golden can pin it, since a golden compares
 /// stderr byte-for-byte on a failing case and the message diverges.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn fold_source_trackable_branch_falls_back_to_two_pass_1872() -> Result<()> {
     for (input, filter, why) in [
@@ -58959,7 +58765,6 @@ fn test_optional_comma_sibling_prune_holds_across_scalar_shapes_for_assignment_2
 /// Verified against jq 1.7.1: the whole filter is a no-op here because both
 /// branches' writes are themselves no-ops (branch 0 prunes, branch 1's `.a`
 /// already holds `9`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_optional_tail_after_dynamic_fanout_prunes_only_its_own_branch_2124() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", ".[(0,1)].a? = 9"], Some(r#"[1, {"a":9}]"#))?;
@@ -59407,7 +59212,6 @@ fn test_slice_bound_end_cli_dispatch_own_partial_prefix_preserved_2351() -> Resu
 /// Verified against jq 1.7.1: `echo '[1,2,3]' | jq -c
 /// 'path(.[(0,1,error("x")):3])'` prints `[{"start":0,"end":3}]` then
 /// `[{"start":1,"end":3}]` before raising `x`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_bound_cli_dispatch_start_own_partial_prefix_preserved_2351_review(
 ) -> Result<()> {
@@ -60017,7 +59821,6 @@ fn test_slice_expr_eval_rs_dispatch_lazy_bounds_and_optional_2546() -> Result<()
 /// `.a["x":]? = ["z"]` is a no-op on both an array and an object `.a`.
 /// Before the fix every row raised "Array/string slice indices must be
 /// integers" from the pull site.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_bound_ruled_on_per_branch_under_optional_2546() -> Result<()> {
     for (input, filter, expected_stdout, expected_code, expected_stderr) in [
@@ -60066,7 +59869,6 @@ fn test_resolve_slice_expr_bound_ruled_on_per_branch_under_optional_2546() -> Re
 /// {"start":"x","end":null} of 1` (both elide the descriptor to
 /// `{"start":"x...` in the message; that prefix is what is pinned), and `?`
 /// does not change that.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolve_slice_expr_untrackable_target_refused_before_bound_2546() -> Result<()> {
     for filter in ["path((1,2)[\"x\":])", "path((5)[\"x\":]?)"] {
@@ -60092,7 +59894,6 @@ fn test_resolve_slice_expr_untrackable_target_refused_before_bound_2546() -> Res
 /// it was itself trackable, so this printed `[]` instead of raising.
 /// Verified against jq 1.7.1: `jq -c 'path(foreach (.a) as $k (.; .))'` on
 /// `{"a":1}` raises the identical message, exit 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_navigation_clobbers_register_2031() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -60126,7 +59927,6 @@ fn test_foreach_source_navigation_clobbers_register_2031() -> Result<()> {
 /// the register), the second needs the carried half (step 1 of an
 /// object-valued register, which structural equality alone will not accept
 /// as jq's pointer identity).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_reenters_register_every_step_not_just_the_first_2161() -> Result<()> {
     // `.b` is absent, so the accumulator stays `null` -- identical to the
@@ -60215,7 +60015,6 @@ fn test_foreach_reenters_register_every_step_not_just_the_first_2161() -> Result
 /// so these shapes pin the same register-reentry rule through a single
 /// emission (or a single raise) instead of one per step. All values below
 /// are live jq 1.7.1 captures.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_reenters_register_every_step_not_just_the_first_2632() -> Result<()> {
     // `.b` is absent, so the accumulator stays `null` -- identical to the
@@ -60330,7 +60129,6 @@ fn test_reduce_reenters_register_every_step_not_just_the_first_2632() -> Result<
 /// position) then raises on its own step. Verified against jq 1.7.1:
 /// `jq -c 'path(foreach (1, .[]) as $k (.; .))'` on `{"a":1}` prints `[]`
 /// then raises the identical message, exit 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_mixed_source_streams_untracked_prefix_then_raises_on_trackable_element_2031(
 ) -> Result<()> {
@@ -60353,7 +60151,6 @@ fn test_foreach_mixed_source_streams_untracked_prefix_then_raises_on_trackable_e
 /// overwrite the whole document with `9`, a write real jq never performs.
 /// Verified against jq 1.7.1: the identical filter raises the identical
 /// message and leaves the document untouched, exit 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_navigation_clobber_blocks_a_write_2031() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -60380,7 +60177,6 @@ fn test_foreach_source_navigation_clobber_blocks_a_write_2031() -> Result<()> {
 ///
 /// Every row is a live jq 1.7.1 capture: exit 5, nothing on stdout, and the
 /// message below on stderr.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_navigation_then_computation_still_clobbers_register_2159() -> Result<()> {
     const DOC: &str = r#"{"a":1,"b":{"c":2}}"#;
@@ -60458,7 +60254,6 @@ fn test_foreach_source_navigation_then_computation_still_clobbers_register_2159(
 /// re-establishes against the moved register and the answer is rooted at
 /// the source's navigated path -- `["a"]`, not the `[]` this used to print.
 /// Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_navigation_then_computation_relocates_register_2159() -> Result<()> {
     for (input, filter, expected) in [
@@ -60506,7 +60301,6 @@ fn test_foreach_source_navigation_then_computation_relocates_register_2159() -> 
 /// register's, not a re-seeded one -- jq runs that step and prints `["b"]`
 /// before the second element raises; succinctly used to raise up front.
 /// Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_builtin_navigation_source_moves_register_2159() -> Result<()> {
     const DOC: &str = r#"{"a":1,"b":{"c":2},"d":null}"#;
@@ -60566,7 +60360,6 @@ fn test_foreach_builtin_navigation_source_moves_register_2159() -> Result<()> {
 /// keyed on "the source contains navigation" instead of "the source
 /// navigated" would refuse all three. `reduce` restores the register when it
 /// backtracks its source, so it is untouched by any of this. Live jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_that_never_navigates_leaves_register_alone_2159() -> Result<()> {
     const DOC: &str = r#"{"a":1,"b":{"c":2}}"#;
@@ -60605,7 +60398,6 @@ fn test_fold_source_that_never_navigates_leaves_register_alone_2159() -> Result<
 /// register never moved: the read twin answered a path jq refuses, and the
 /// write twins (`=`, `|=`, `del`) went through where jq leaves the document
 /// alone. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_computed_index_source_moves_register_2159() -> Result<()> {
     const ARR: &str = "[1,2,3]";
@@ -60677,7 +60469,6 @@ fn test_foreach_computed_index_source_moves_register_2159() -> Result<()> {
 /// A nested `foreach` that never navigates, and a nested `reduce` (jq restores
 /// the register when it backtracks out of one), are unchanged. Every row is a
 /// live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_nested_navigating_foreach_moves_register_2159() -> Result<()> {
     const DOC: &str = r#"{"a":1,"b":{"c":2}}"#;
@@ -60750,7 +60541,6 @@ fn test_fold_source_nested_navigating_foreach_moves_register_2159() -> Result<()
 /// `path_intact`. Treating the moved/lost register as unknowable stopped the
 /// chain instead, raising where jq (and the build before #2159) answers
 /// nothing at exit 0. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_alt_chain_retries_after_navigation_then_scalar_builtin_2159() -> Result<()> {
     const DOC: &str = r#"{"a":"X","b":"Y"}"#;
@@ -60783,7 +60573,6 @@ fn test_foreach_alt_chain_retries_after_navigation_then_scalar_builtin_2159() ->
 /// and as the write that rides on it; each value kind is one `jv` kind
 /// `jv_identical` compares differently (string/container pointer, number bits,
 /// big-number literal pointer).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_accumulator_identity_carries_across_source_elements_3460() -> Result<()> {
     // (document, filter, stdout, exit code)
@@ -60888,7 +60677,6 @@ fn test_foreach_accumulator_identity_carries_across_source_elements_3460() -> Re
 /// pointers, never structure), and a string or empty-array slice is a fresh
 /// `jv` even at the same path -- widening any of these writes where jq raises.
 /// Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_accumulator_identity_is_positional_3460() -> Result<()> {
     // (document, filter, stdout, exit code)
@@ -60965,7 +60753,6 @@ fn test_foreach_accumulator_identity_is_positional_3460() -> Result<()> {
 /// accumulator leaves the register on it -- `.[0:]|tostring` runs a real `INDEX`
 /// first and only the `tostring` declines to move it further. It was the one row
 /// #2159 moved from matching to refusing. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_full_slice_source_is_the_accumulator_3460() -> Result<()> {
     // (document, filter, stdout, exit code)
@@ -61103,7 +60890,6 @@ fn test_recurse_cond_cursor_walk_keeps_the_owned_walks_order_3867() -> Result<()
 /// return their input as the same `jv`, so `path()` and an update accept them where
 /// every other input builds a fresh value and is refused. Not specific to a fold.
 /// Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_register_survives_input_returning_conversions_3460() -> Result<()> {
     const DOC: &str = r#"{"a":[1,2],"b":"s","n":2,"t":"1"}"#;
@@ -61166,7 +60952,6 @@ fn test_yq_tonumber_of_a_number_writes_3460() -> Result<()> {
 
 /// #4016: `ltrimstr`/`rtrimstr` return their input as the same `jv` unless a string
 /// argument matches the string input's edge. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_register_survives_non_matching_trim_4016() -> Result<()> {
     const DOC: &str = r#"{"b":"s","t":"xs","n":2,"s":"st"}"#;
@@ -61199,7 +60984,6 @@ fn test_path_register_survives_non_matching_trim_4016() -> Result<()> {
 /// names it. A non-empty path set builds a fresh value and keeps raising, which the rows pin
 /// in the other direction (`[1]` under `.[]?`, `{"a":1}` under `.b?`). Every row is a live jq
 /// 1.7.1 capture: (input, filter, stdout, exit code).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_accepts_del_with_an_empty_path_set_4295() -> Result<()> {
     const ROWS: &[(&str, &str, &str, i32)] = &[
@@ -61291,7 +61075,6 @@ fn test_path_accepts_del_with_an_empty_path_set_4295() -> Result<()> {
 /// jq 1.7.1 with `-c`; the message is pinned only where succinctly names the same step (a
 /// constant body is jq's `near attempt to access element` since #4452, before which it was the
 /// value-mode `Cannot index`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_bound_to_a_call_returning_the_register_refuses_4320() -> Result<()> {
     let doc = r#"{"a":false,"b":null}"#;
@@ -61619,7 +61402,6 @@ fn test_foreach_source_bound_to_a_call_returning_the_register_refuses_4320() -> 
 /// value-mode read of the same source, and a body that hands the register on next to a fresh
 /// value (`def f: ., {a:1}`), which stays by value so a `try` over a negated (value-mode)
 /// operand still catches jq's own error, as jq does.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_bound_to_a_call_building_a_fresh_value_refuses_4452() -> Result<()> {
     let doc = r#"{"a":false,"b":null}"#;
@@ -61756,7 +61538,6 @@ fn test_foreach_source_bound_to_a_call_building_a_fresh_value_refuses_4452() -> 
 /// lost their answer. The contrasts are an UPDATE whose earlier stage moved the register
 /// (`. as {a:$q} | foreach ...`), which jq raises at the source's first step, and a call that
 /// navigates. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_foreach_call_source_is_vetted_by_routing_4320() -> Result<()> {
     let doc = r#"{"a":false,"b":null}"#;
@@ -61865,7 +61646,6 @@ fn test_reduce_update_foreach_call_source_is_vetted_by_routing_4320() -> Result<
 /// a source that goes on to navigate, an INIT that is not the register, a pattern that fails, and a
 /// nested `reduce` in the nested `reduce`'s own UPDATE, each of which jq raises. Every row captured from
 /// jq 1.7.1 with `-c`; the message is pinned only where succinctly names the same step.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_nested_reduce_destructuring_source_4320() -> Result<()> {
     let doc = r#"{"a":false,"b":null}"#;
@@ -62206,7 +61986,6 @@ fn test_reduce_update_nested_reduce_destructuring_source_4320() -> Result<()> {
 /// in the shapes the vetter admits), so `label $q | (. as {a:$a} | .)` is the register's own
 /// destructure as the unlabelled body is, and `path`/`del`/`=`/`|=` answer as jq does instead of
 /// refusing. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_label_wrapped_destructure_4567() -> Result<()> {
     let invalid = "Invalid path expression";
@@ -62302,7 +62081,6 @@ fn test_reduce_update_label_wrapped_destructure_4567() -> Result<()> {
 /// navigated and then computed was compared with the outer register by value alone, ignoring
 /// the register statement it carried. A source that moves nothing still answers. Every row is
 /// a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nested_foreach_after_a_navigating_bind_source_raises_4564() -> Result<()> {
     let invalid = "Invalid path expression";
@@ -62374,7 +62152,6 @@ fn test_nested_foreach_after_a_navigating_bind_source_raises_4564() -> Result<()
 /// was driven by value and the emission printed the root, where the same source headed by `.` already
 /// moved it. A `null` marker that equals a `null` accumulator is the register by kind, as `.` is.
 /// Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nested_foreach_source_destructuring_a_null_marker_moves_the_register_4576() -> Result<()> {
     let invalid = "Invalid path expression";
@@ -62454,7 +62231,6 @@ fn test_nested_foreach_source_destructuring_a_null_marker_moves_the_register_457
 /// fresh on every output. `$__loc__` is the object the evaluator builds, so it is fresh too. A
 /// `first`/`limit(1; ..)`/`nth(0; ..)` generates only the operand's first output (#4597): it raises when that is
 /// the fresh item, and answers when it is the register. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_reduce_source_destructuring_a_partly_fresh_comma_or_loc_4582() -> Result<()> {
@@ -62636,7 +62412,6 @@ fn test_reduce_source_destructuring_a_partly_fresh_comma_or_loc_4582() -> Result
 /// jq has, and the whole thing answers inside a `//` or a `del` as jq does. Rows where the handler
 /// moves the register (`catch .a`) or the generator has a second output the stage cannot place keep
 /// the general route and refuse as jq does. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_caught_or_isempty_leaves_the_register_4486() -> Result<()> {
     const DOC: &str = r#"{"a":[true]}"#;
@@ -62722,7 +62497,6 @@ fn test_reduce_update_caught_or_isempty_leaves_the_register_4486() -> Result<()>
 /// the accumulator raises, and `del`/`=`/`|=` write nothing. The by-value drive answered, and
 /// `del` deleted the document. A `reduce` outer backtracks its `UPDATE`, so it still answers.
 /// Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_outer_var_destructured_by_a_fold_source_in_a_fold_body_4505() -> Result<()> {
     const DOC: &str = r#"{"a":false,"b":null}"#;
@@ -62843,7 +62617,6 @@ fn test_outer_var_destructured_by_a_fold_source_in_a_fold_body_4505() -> Result<
 /// the accumulator on, and a `reduce` source's destructure of an outer `$x` was left to the
 /// by-value drive. The rows that end `$y` (the element is the register) and the `reduce` sources
 /// that backtrack still answer. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_moving_the_register_inside_a_fold_body_is_refused_4505() -> Result<()> {
     const DOC: &str = r#"{"a":{"b":1}}"#;
@@ -63049,7 +62822,6 @@ fn test_fold_source_moving_the_register_inside_a_fold_body_is_refused_4505() -> 
 
 /// #4505: on a `null` document the register really is the accumulator's `null` (`jv_identical`
 /// compares it by kind), so the same shapes answer there, as they did before.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_moving_the_register_on_null_still_answers_4505() -> Result<()> {
     const ROWS: &[(&str, &str, i32)] = &[
@@ -63106,7 +62878,6 @@ fn test_fold_source_moving_the_register_on_null_still_answers_4505() -> Result<(
 /// chain answered, a last alternative of several entries that matches is answered, and so is a body
 /// that navigates or is `empty` (it is not the register that the enclosing fold meets). The loud refusal read the chain as the by-value route's (the first alternative
 /// matched), which deleted the document where jq raises. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_chain_of_register_destructures_ends_on_its_last_alternative_4585() -> Result<()> {
     // (document, filter, stdout, exit code)
@@ -63316,7 +63087,6 @@ fn test_caught_chain_of_register_destructures_ends_on_its_last_alternative_4585(
 /// the value, so it answered the first and accepted the second; it now reads the value's type
 /// before refusing. A `?//` chain keeps the by-value route (jq retries the next alternative past
 /// the pattern). Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_destructure_of_the_register_in_a_fold_source_reads_the_type_4575() -> Result<()> {
     // (document, filter, stdout, exit code)
@@ -63623,7 +63393,6 @@ fn test_caught_destructure_of_the_register_in_a_fold_source_reads_the_type_4575(
 /// answered and `del`/`=`/`|=` wrote through the answer. The controls keep answering: a `try`
 /// swallows the path error, a `$x` that is the element of an enclosing `reduce` source is the register,
 /// and the destructure of an element marker is untouched. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructure_of_a_marker_that_is_not_the_register_in_a_fold_body_4588() -> Result<()> {
     // (document, filter, stdout, exit code)
@@ -63841,7 +63610,6 @@ fn test_destructure_of_a_marker_that_is_not_the_register_in_a_fold_body_4588() -
 /// bind whose source emits nothing, `$x` that is the register (`. as $x`), a `try` around it, a bare `$x`,
 /// and the `foreach` form. Every row captured from jq 1.7.1 with `-c`.
 #[allow(clippy::literal_string_with_formatting_args)]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_destructure_of_a_marker_that_is_not_the_register_outside_a_fold_body_4832(
 ) -> Result<()> {
@@ -64087,7 +63855,6 @@ fn test_fold_source_destructure_of_a_marker_that_is_not_the_register_outside_a_f
 /// to the resolver only for a kind the register is known not to be, so a `null` register, a
 /// `null` element of an enclosing `reduce` source and an INIT that navigated onto a `null` keep
 /// answering (the controls). Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_literal_null_bool_destructure_in_a_fold_source_raises_off_the_register_4603() -> Result<()>
 {
@@ -64718,7 +64485,6 @@ fn test_literal_null_bool_destructure_in_a_fold_source_raises_off_the_register_4
 /// accumulator), drove the source by value, and the inner fold emitted a `null` that `path()` refused
 /// uncatchably (exit 5) where jq answers silently. The fold's live register is read instead
 /// (`FoldRegister::register_is_non_null`). Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_literal_destructure_in_a_nested_fold_source_after_an_empty_update_4617() -> Result<()>
 {
@@ -65051,7 +64817,6 @@ fn test_caught_literal_destructure_in_a_nested_fold_source_after_an_empty_update
 /// is the register, so its pattern steps move jq's register (`null | path(foreach (null as {b:$b} | .) as $y
 /// (.; .; .))` is `["b"]`); the by-value drive left it at the root (`[]`), and the fold's source is now routed
 /// to the resolver (`NotRegister::at_null`). Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_literal_destructure_two_folds_deep_and_on_a_null_register_4648() -> Result<()> {
     // (document, filter, stdout, exit code)
@@ -66109,7 +65874,6 @@ fn test_caught_literal_destructure_two_folds_deep_and_on_a_null_register_4648() 
 /// which does not backtrack what the nested fold moved -- the register. The controls keep answering: a
 /// `reduce` source restores the register, and a destructure that never runs or hands nothing on (behind a
 /// `select(false)`, an `empty` body) moves nothing. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructure_in_a_nested_fold_of_a_fold_source_is_path_checked_4708() -> Result<()> {
     // (document, filter, stdout, exit code)
@@ -66566,7 +66330,6 @@ fn test_destructure_in_a_nested_fold_of_a_fold_source_is_path_checked_4708() -> 
 /// pass of an innermost fold whose accumulator is a fresh value, three folds deep, still holds the `null`
 /// register jq restored at its fork point, so the literal is the register there too. Every row is a live
 /// jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_literal_null_destructure_in_a_fold_source_moves_a_null_register_below_the_root_4707(
 ) -> Result<()> {
@@ -66732,7 +66495,6 @@ fn test_literal_null_destructure_in_a_fold_source_moves_a_null_register_below_th
 /// `null` document: jq restores its register at the comma's fork point, so the `1` is no path output.
 /// The shipped resolver raised `Invalid path expression with result 1` on the second pass of the
 /// innermost fold; the path-mode interpreter (#5223) prints jq 1.7.1's paths.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_comma_after_a_null_destructure_in_the_innermost_of_three_folds_answers_as_jq_does_4707(
 ) -> Result<()> {
@@ -66751,7 +66513,6 @@ fn test_comma_after_a_null_destructure_in_the_innermost_of_three_folds_answers_a
 /// catches; the fold refused with the resolver's uncatchable guess, so `(...)? = 9` and
 /// `path((...)?)` raised where jq answers (`{"a":1}` unchanged, no path). Uncaught, it now reads as
 /// jq's own error. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_moved_body_foreach_source_destructure_refusal_is_caught_by_an_enclosing_try_4637(
 ) -> Result<()> {
@@ -67090,7 +66851,6 @@ fn test_moved_body_foreach_source_destructure_refusal_is_caught_by_an_enclosing_
 /// from there, so the inner fold's emission leaves the register on the element and `$i` is it: jq names
 /// the element's path. The fold read the emission as having lost the register and refused `$i`
 /// (`Invalid path expression with result [1]`, exit 5). Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_bind_foreach_source_in_a_navigating_foreach_body_extracting_the_element_4627(
 ) -> Result<()> {
@@ -67362,7 +67122,6 @@ fn test_caught_bind_foreach_source_in_a_navigating_foreach_body_extracting_the_e
 /// (`{"a":{"b":1}}`), so the verdict is per value, not per shape. Where the source moved the
 /// register onto an element the navigation's success by value is not what jq checks, and the
 /// stage keeps refusing (not pinned). Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_caught_navigation_last_in_a_comma_is_judged_per_value_4486() -> Result<()> {
     // (document, filter, stdout, exit code)
@@ -67446,7 +67205,6 @@ fn test_reduce_update_caught_navigation_last_in_a_comma_is_judged_per_value_4486
 /// `ltrimstr`/`rtrimstr`, `delpaths([])`, `setpath([]; .)`) is the register itself, so
 /// `$y` is accepted in path position (#3460, #4016 and #4295 did the same for the bare
 /// stage). Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bound_result_of_input_returning_stage_is_the_register_4017() -> Result<()> {
     const DOC: &str = r#"{"a":[1,2],"b":"s","n":2,"t":"1","c":"s"}"#;
@@ -67552,7 +67310,6 @@ fn test_bound_result_of_input_returning_stage_is_the_register_4017() -> Result<(
 /// the value's kind), so a `//`, `?` or `try` around one binds the same node; `walk(.)`
 /// of an array or object rebuilds it and stays refused. Every row is a live jq 1.7.1
 /// capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bound_result_of_type_filter_is_the_register_4456() -> Result<()> {
     const DOC: &str = r#"{"a":[1,2],"b":"s","n":2,"t":"1","z":null,"o":{"k":1}}"#;
@@ -67617,7 +67374,6 @@ fn test_bound_result_of_type_filter_is_the_register_4456() -> Result<()> {
 /// silently (an exact-looking verdict, not even a refusal). Includes the shapes where a
 /// `?`/`try` around the stage keeps the witness off, which must not go silent either.
 /// Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bound_input_returning_stage_does_not_drop_a_write_under_try_4017() -> Result<()> {
     const DOC: &str = r#"{"a":false,"c":1,"d":{"b":1}}"#;
@@ -67673,7 +67429,6 @@ fn test_bound_input_returning_stage_does_not_drop_a_write_under_try_4017() -> Re
 /// untracked value, so there is no refusal for the construct to swallow. The fresh rows
 /// pin the other direction: the register must not be bound in place of the fresh value.
 /// Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bound_result_under_swallowing_construct_is_judged_per_value_4444() -> Result<()> {
     const DOC: &str = r#"{"b":"s","n":5,"a":[1]}"#;
@@ -67727,7 +67482,6 @@ fn test_bound_result_under_swallowing_construct_is_judged_per_value_4444() -> Re
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_walk_identity_of_a_container_is_not_swallowed_4444() -> Result<()> {
     const DOC: &str = r#"{"o":{"x":1},"a":[1],"s":"s"}"#;
@@ -67758,7 +67512,6 @@ fn test_walk_identity_of_a_container_is_not_swallowed_4444() -> Result<()> {
 /// register), the one that matches builds a fresh value, and jq answers the first before
 /// refusing the second. A comma of literals is placed run by run; the rows that end in a
 /// refusal still print what came before it. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_trim_with_a_literal_generator_argument_is_placed_run_by_run_4444() -> Result<()> {
     const DOC: &str = r#"{"b":"s","n":5}"#;
@@ -67906,7 +67659,6 @@ fn test_yq_foreach_accumulator_identity_stays_refuse_only_3460() -> Result<()> {
 /// navigates, regardless of what UPDATE actually does with it (the
 /// "eleven of four thousand" regression the fold-source doc comment warns
 /// about was exactly an earlier, cruder attempt at this).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_trackable_source_element_binding_still_tracks_through_2031() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -67930,7 +67682,6 @@ fn test_foreach_trackable_source_element_binding_still_tracks_through_2031() -> 
 /// caught by the differential fuzzer (`.ai/scratch/sweep-path-fold-differential.py`)
 /// comparing against jq 1.7.1, where `jq -c 'path(reduce (.[]) as $k (.; .))'`
 /// on `{"a":[1,2]}` is `[]`, exit 0.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_source_navigation_does_not_clobber_persistent_register_2031() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -67951,7 +67702,6 @@ fn test_reduce_source_navigation_does_not_clobber_persistent_register_2031() -> 
 /// (`path(. as $x | 5 | $x.a)` is `["a"]`); this is the fold-specific half.
 /// Verified against jq 1.7.1: `["a","b"]` printed twice (one per `foreach`
 /// element), exit 0.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_reestablishes_outer_bound_register_2046() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -67974,7 +67724,6 @@ fn test_foreach_update_reestablishes_outer_bound_register_2046() -> Result<()> {
 /// against jq 1.7.1: `[]` printed twice, exit 0 (the register never leaves
 /// the document root, since `INIT = 0` is a literal and `$x` itself is the
 /// whole document).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_bare_trackedvar_inside_fold_still_tracks_2046() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -68003,7 +67752,6 @@ fn test_foreach_bare_trackedvar_inside_fold_still_tracks_2046() -> Result<()> {
 /// truncates this particular message shape far sooner than real jq does
 /// (a separate, pre-existing wording-length gap unrelated to this fix,
 /// filed as #2179).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_extract_equal_value_different_node_still_refuses_2046() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -68033,7 +67781,6 @@ fn test_foreach_extract_equal_value_different_node_still_refuses_2046() -> Resul
 /// composes with the existing per-step mechanism instead of overriding it.
 /// Verified against jq 1.7.1: raises "Invalid path expression with result
 /// {\"b\":1}" on the second iteration, exit 5.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_second_iteration_register_moved_by_first_still_refuses_2046() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -68053,7 +67800,6 @@ fn test_reduce_second_iteration_register_moved_by_first_still_refuses_2046() -> 
 /// fold's UPDATE, `=`/`|=`/`del()` all route through the same resolver, so
 /// this exercises the actual document write rather than just `path()`'s
 /// own report. Verified against jq 1.7.1: `{"a":{"b":99},"c":2}`, exit 0.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_reestablished_register_supports_a_write_2046() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -68088,7 +67834,6 @@ fn test_foreach_update_reestablished_register_supports_a_write_2046() -> Result<
 /// `dump_truncated` (`DUMP_KEEP`, `src/jq/error.rs`) truncates this
 /// particular message shape far sooner than real jq does (a separate,
 /// pre-existing wording-length gap unrelated to this fix, filed as #2179).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_advance_does_not_carry_register_past_a_caught_navigation_2046() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -68131,7 +67876,6 @@ fn test_foreach_advance_does_not_carry_register_past_a_caught_navigation_2046() 
 /// "top-level `Pipe`" gate, since neither is syntactically a `Pipe` at the
 /// point `resolve()` sees `expr`, yet both still navigate somewhere
 /// inside and must still refuse.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_extract_navigation_through_missing_key_still_refuses_2860() -> Result<()> {
     for filter in [
@@ -68174,7 +67918,6 @@ fn test_foreach_extract_navigation_through_missing_key_still_refuses_2860() -> R
 /// #2860: the same shape actually reaches a write -- `=`/`|=`/`del()`
 /// through it must refuse rather than silently corrupt the document, the
 /// property the issue's own title is about.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_extract_navigation_through_missing_key_refuses_writes_2860() -> Result<()> {
     for filter in [
@@ -68207,7 +67950,6 @@ fn test_foreach_extract_navigation_through_missing_key_refuses_writes_2860() -> 
 /// reaches `FoldRegister::relocate`'s `identical()` fallback at all -- none
 /// of these three should be touched by gating `identical()` on
 /// `cannot_move_register`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_extract_wellformed_shapes_unaffected_by_2860() -> Result<()> {
     for (input, filter, expected) in [
@@ -68256,7 +67998,6 @@ fn test_foreach_extract_wellformed_shapes_unaffected_by_2860() -> Result<()> {
 /// .))` refused where jq answers `[]` twice. #3914 closed it by another route: the `if` arm of
 /// the resolver now states the register the taken branch starts from, so the `$x` branch is read
 /// as what it is. Captured from jq 1.7.1; the write form is not affected.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_extract_untaken_branch_navigation_answers_as_jq_2860_3914() -> Result<()> {
     let filter = "path(. as $x | foreach (1,2) as $i (0; (if false then .a else $x end); .))";
@@ -68279,7 +68020,6 @@ fn test_foreach_extract_untaken_branch_navigation_answers_as_jq_2860_3914() -> R
 /// untracked-navigation error before jq's own kind check ever ran.
 /// jq-mode only: real yq's lexer rejects `reduce`/`foreach`/`path`
 /// outright.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_null_bool_document_reestablishes_against_register_2732() -> Result<()> {
     for (input, filter, expected) in [
@@ -68323,7 +68063,6 @@ fn test_fold_source_null_bool_document_reestablishes_against_register_2732() -> 
 /// `null`/`true`/`false`, so this fix cannot promote a container. `true`
 /// negative control is a type error from `.b` itself, unrelated to
 /// register tracking at all.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_null_bool_document_wellformed_unaffected_2732() -> Result<()> {
     for (input, filter, want_fragment) in [
@@ -68360,7 +68099,6 @@ fn test_fold_source_null_bool_document_wellformed_unaffected_2732() -> Result<()
 /// register a navigating SOURCE left, as jq's `gen_reduce` does (no `SUBEXP`
 /// around the source), so the error wording now matches jq 1.7.1 exactly, not
 /// just the exit code. See `docs/compliance/jq/limitations.md`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_mid_step_register_position_matches_jq_2732_3780() -> Result<()> {
     for (filter, want) in [
@@ -68392,7 +68130,6 @@ fn test_reduce_mid_step_register_position_matches_jq_2732_3780() -> Result<()> {
 /// row refuses with jq's message. Rows jq answers are pinned too: a
 /// passthrough UPDATE keeps the accumulator on the register (`[]`), a source
 /// that never navigates leaves it at the root, and `foreach` was already right.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_navigating_update_ending_on_the_accumulator_refuses_3780() -> Result<()> {
     let doc = "{\"a\":true,\"k\":2}\n";
@@ -68455,7 +68192,6 @@ fn test_reduce_navigating_update_ending_on_the_accumulator_refuses_3780() -> Res
 }
 
 /// #3811: jq 1.7.1 oracle rows, captured on stdin and -n routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_navigation_in_stream_wrappers_and_defs_3811() -> Result<()> {
     let doc = r#"{"a":true,"k":2}"#;
@@ -68535,7 +68271,6 @@ fn test_reduce_update_navigation_in_stream_wrappers_and_defs_3811() -> Result<()
 /// refuses with exit 5, as jq does; the `?//` rows differ from jq only in the node
 /// the message quotes (jq quotes `null` after the first alternative failed), which
 /// `docs/compliance/jq/limitations.md` records.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_destructuring_navigating_update_refuses_3780() -> Result<()> {
     let doc = "{\"a\":[1],\"k\":2}\n";
@@ -68816,7 +68551,6 @@ fn test_unary_minus_matches_jq_past_2_53_3044() -> Result<()> {
 /// spelling -- `path(.[-869389897822472004])` stayed `[-869389897822472004]`
 /// where jq gives `[-869389897822472000]`. A magnitude within range
 /// (`.[-1]`) must keep folding exactly, unaffected.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_unary_minus_matches_jq_in_index_and_slice_bounds_3044() -> Result<()> {
     for (filter, want) in [
@@ -68990,7 +68724,6 @@ fn test_range_cap_hit_lookahead_overflow_keeps_exact_i64_answer_2131() -> Result
 /// generic "not one of the four primitives" rejection and raised jq's own
 /// `Invalid path expression`, even on a bare `path(. | stderr)` where real
 /// jq answers `[]`. Verified against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_stderr_debug_are_identity_passthroughs_2234() -> Result<()> {
     for (filter, want_stdout, why) in [
@@ -69027,7 +68760,6 @@ fn test_path_stderr_debug_are_identity_passthroughs_2234() -> Result<()> {
 /// reaches its trailing `.`, so `path()` sees no branch at all (an empty
 /// prefix, matching every other bare-escape site in this file). Verified
 /// against jq 1.7.1: both raise the same error, no path output.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_debug_msg_propagates_msg_escape_2234() -> Result<()> {
     let (stdout, stderr, code) =
@@ -69043,7 +68775,6 @@ fn test_path_debug_msg_propagates_msg_escape_2234() -> Result<()> {
 /// `path()` itself -- `stderr` inside an update-assignment target used to
 /// raise the same spurious "Invalid path expression" this issue fixes.
 /// Verified against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_stderr_in_update_assignment_target_2234() -> Result<()> {
     let (stdout, stderr, code) =
@@ -69263,7 +68994,6 @@ fn test_path_answers_past_a_structural_fault_it_never_reads_2168() -> Result<()>
 /// `del(...)` returned the document unchanged at exit 0 where jq exits 5 --
 /// no wrong value was written, but a refused edit looked like a successful
 /// no-op. Every row captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_jq_defined_navigating_builtins_raise_inside_path_2646() -> Result<()> {
     for (filter, element) in [
@@ -69299,7 +69029,6 @@ fn test_jq_defined_navigating_builtins_raise_inside_path_2646() -> Result<()> {
 /// `any(gen; cond)` iterates `gen` instead -- so `any(1;.)` must stay silent
 /// here. If `any(.[];.)` raises, that is the argument navigating, which the
 /// resolver already handled. All captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_only_jq_defined_navigators_raise_inside_path_2646() -> Result<()> {
     for filter in [
@@ -69335,7 +69064,6 @@ fn test_only_jq_defined_navigators_raise_inside_path_2646() -> Result<()> {
 /// assertion anywhere, which is exactly how they shipped wrong -- so this
 /// covers the whole table rather than a sample of it. Captured live from
 /// jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_every_navigating_builtin_table_entry_raises_2646() -> Result<()> {
     for (builtin, element) in [
@@ -69366,7 +69094,6 @@ fn test_every_navigating_builtin_table_entry_raises_2646() -> Result<()> {
 /// a first draft of #2646 did. Bare `flatten` stays in the table: it is
 /// `_flatten(-1)`, whose argument is jq's own literal and cannot raise.
 /// Captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_dollar_param_builtins_keep_their_own_error_2646() -> Result<()> {
     // The argument's error wins, not a path error.
@@ -69415,7 +69142,6 @@ fn test_dollar_param_builtins_keep_their_own_error_2646() -> Result<()> {
 /// real evaluation. `reverse` has no such argument -- only the input's
 /// own `length` -- so it carries none of that risk. Every row captured
 /// live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reverse_raises_inside_path_on_length_minus_one_2744() -> Result<()> {
     for (filter, element) in [
@@ -69453,7 +69179,6 @@ fn test_reverse_raises_inside_path_on_length_minus_one_2744() -> Result<()> {
 
 /// #2744's boundary: `reverse` does not raise at all on a genuinely empty
 /// input (`length` of `0`, #2730's own rule). Captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reverse_stays_silent_on_a_genuinely_empty_input_2744() -> Result<()> {
     for filter in [
@@ -69471,7 +69196,6 @@ fn test_reverse_stays_silent_on_a_genuinely_empty_input_2744() -> Result<()> {
 /// has no length in jq) -- not a path error. Same ordering rule #2646's
 /// `test_dollar_param_builtins_keep_their_own_error_2646` documents for
 /// `join`/`flatten`. Captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reverse_yields_to_its_own_length_failure_2744() -> Result<()> {
     let (stdout, stderr, code) =
@@ -69493,7 +69217,6 @@ fn test_reverse_yields_to_its_own_length_failure_2744() -> Result<()> {
 /// error `reverse` itself already raised -- same #3271-style catchability
 /// check its own test makes for its builtin set. Captured live from jq
 /// 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reverse_raises_unconditionally_2744() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -69523,7 +69246,6 @@ fn test_reverse_raises_unconditionally_2744() -> Result<()> {
 /// (a path, a delete, a write); a payload that is merely equal (`error("x")`,
 /// `error({"a":1})`) is a fresh value, where the navigation prunes. Every row
 /// captured live from jq 1.7.1 over `{"a":{"b":null},"c":2}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_catch_handler_optional_navigation_reaches_the_register_node_3891() -> Result<()> {
     let doc = r#"{"a":{"b":null},"c":2}"#;
@@ -69571,7 +69293,6 @@ fn test_catch_handler_optional_navigation_reaches_the_register_node_3891() -> Re
 /// therefore re-establishes (`[]`), where the resolver read the navigation as moving it
 /// and refused. A body that emits before it raises still moved it. Every row captured
 /// live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_always_raising_try_body_leaves_the_register_where_it_entered_3965() -> Result<()> {
     for (doc, program, want) in [
@@ -69630,7 +69351,6 @@ fn test_always_raising_try_body_leaves_the_register_where_it_entered_3965() -> R
 /// raises its own input, which `.a` navigates on the register's node), a bare postfix
 /// `.a?` (it does not catch the path error), and a body that emitted before it raised are
 /// still refused, as in jq. Every row captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_catch_handler_navigating_under_alternative_on_a_scalar_payload_3987() -> Result<()> {
     let doc = r#"{"a":{"b":null},"c":2}"#;
@@ -69721,7 +69441,6 @@ fn test_catch_handler_navigating_under_alternative_on_a_scalar_payload_3987() ->
 /// handler, so a write through it must refuse (it silently landed in a first cut).
 /// The positive rows cover an array register, a non-root register and a register
 /// reached through a binding. Every row captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_catch_handler_seed_needs_a_payload_jq_keeps_tracked_3891() -> Result<()> {
     for (program, doc, want) in [
@@ -69790,7 +69509,6 @@ fn test_catch_handler_seed_needs_a_payload_jq_keeps_tracked_3891() -> Result<()>
 /// a scalar register (it has no storage to compare), an `if`/`,`/`select` body, a body
 /// that raises twice (`error | error`), at the root and below it, through `path`, `del`,
 /// `=` and `|=`. Every row captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_try_body_raising_its_input_seeds_the_handler_as_the_register_4019() -> Result<()> {
     for (program, doc, want) in [
@@ -69893,7 +69611,6 @@ fn test_try_body_raising_its_input_seeds_the_handler_as_the_register_4019() -> R
 /// error); one whose `//` fell to a by-value `5` did not (`$x` re-establishes `[]`). The
 /// first cut that admitted the `try` accepted the first row too, and jq refuses it.
 /// Every row captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_try_raising_its_input_states_the_handler_register_per_result_4019() -> Result<()> {
     let program = r#"path(. as $x | try (error(.)|error("x")) catch ((.a)? // 5) | $x)"#;
@@ -69917,7 +69634,6 @@ fn test_try_raising_its_input_states_the_handler_register_per_result_4019() -> R
 /// raises something else (a condition that can fail, a fresh message) or emits a
 /// navigation first hands its handler a different value, and the handler's navigation
 /// still raises, as in jq. Every row captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_try_body_raising_something_else_keeps_refusing_the_handler_4019() -> Result<()> {
     for (program, doc, message) in [
@@ -69981,7 +69697,6 @@ fn test_try_body_raising_something_else_keeps_refusing_the_handler_4019() -> Res
 /// node turned jq's path error into a `del` and an assignment that landed. Every row
 /// captured live from jq 1.7.1; the stage after the body and the message position are both
 /// covered, bare and under an `if`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_try_body_raising_an_alternative_is_not_the_register_4019() -> Result<()> {
     for (program, doc, message) in [
@@ -70022,7 +69737,6 @@ fn test_try_body_raising_an_alternative_is_not_the_register_4019() -> Result<()>
 /// with path tracking suspended and its handler runs against the register the `try`'s fork
 /// restored, so `. as $y | .[0] | error($y)` raises the node the `try` stood on. Every row
 /// captured live from jq 1.7.1 (`path`, `del`, `=`, `|=`, and the stage after the `try`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_try_body_raising_a_frozen_marker_seeds_the_handler_as_the_register_4127() -> Result<()> {
     for (program, doc, want) in [
@@ -70134,7 +69848,6 @@ fn test_try_body_raising_a_frozen_marker_seeds_the_handler_as_the_register_4127(
 /// variable rebound or bound off a navigation, a `$x` the body raised after a further
 /// `as`, and a body that can raise a non-message of its own all keep refusing, as in jq.
 /// Every row captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_try_body_raising_a_marker_elsewhere_keeps_refusing_the_handler_4127() -> Result<()> {
     for (program, doc, message) in [
@@ -70218,7 +69931,6 @@ fn test_try_body_raising_a_marker_elsewhere_keeps_refusing_the_handler_4127() ->
 /// navigation answers as jq does (the `true` row emits nothing, the
 /// array row `[0]`). Both refused before the compound stage stated its register
 /// per branch.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_compound_catch_handler_beside_a_navigation_answers_like_jq_3967() -> Result<()> {
     for (program, doc, expected) in [
@@ -70244,7 +69956,6 @@ fn test_compound_catch_handler_beside_a_navigation_answers_like_jq_3967() -> Res
 /// value the resolver is not tracking both raise jq's `Invalid path expression
 /// near attempt to iterate through <input>` inside `path`/`del`/`=`. Every row
 /// captured live from jq 1.7.1 as `[path((INPUT | BUILTIN) | empty)]` over `{}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_index_and_transpose_raise_inside_path_on_an_untracked_value_3888() -> Result<()> {
     for (filter, input) in [
@@ -70293,7 +70004,6 @@ fn test_index_and_transpose_raise_inside_path_on_an_untracked_value_3888() -> Re
 /// #3888: where `transpose` does not reach its access it answers, a failure of its
 /// own `map(length)` comes first, and `?` catches the raise. Captured live from
 /// jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_transpose_stays_silent_or_raises_its_value_error_first_in_path_3888() -> Result<()> {
     for filter in [
@@ -70437,7 +70147,6 @@ fn test_transpose_refuses_an_output_far_larger_than_its_input_3950() -> Result<(
 /// definition makes -- which depends on the *evaluated pattern*, the one thing
 /// #2744's static table could not know. Every row captured live from jq 1.7.1
 /// as `[path((INPUT | BUILTIN(PATTERN)) | empty)]` over `{}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_indices_family_raises_inside_path_on_the_evaluated_pattern_3347() -> Result<()> {
     for (filter, access) in [
@@ -70491,7 +70200,6 @@ fn test_indices_family_raises_inside_path_on_the_evaluated_pattern_3347() -> Res
 /// the root path `[[]]`, which `del` and `=` would then have written through), and
 /// `{"a":1} | indices("a")` answered `null` where jq answers `1`. Every row captured
 /// live from jq 1.7.1; `(input, filter, stdout or error text)`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_indices_family_looks_up_a_null_or_object_input_3890() -> Result<()> {
     for (input, filter, want) in [
@@ -70728,7 +70436,6 @@ fn test_indices_family_looks_up_in_yq_extensions_3890() -> Result<()> {
 /// jq's path register: `path(.a | indices(1))` is `["a",[1]]` and a write through an object or
 /// `null` key lands. Every row captured from `/usr/bin/jq` 1.7.1. A write through an array key
 /// raises in jq (`Cannot update field at array index of array`), as it does here.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_indices_family_steps_a_tracked_input_3890() -> Result<()> {
     for (input, filter, expected) in [
@@ -70917,7 +70624,6 @@ fn test_indices_family_steps_a_tracked_input_3890() -> Result<()> {
 /// #3347: where `indices` does not navigate -- a string searched for a string --
 /// it answers, and a pattern that is empty or raises never reaches the access at
 /// all (jq's `$i` binding runs first). Captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_indices_family_stays_silent_without_a_navigating_pattern_3347() -> Result<()> {
     for filter in [
@@ -70954,7 +70660,6 @@ fn test_indices_family_stays_silent_without_a_navigating_pattern_3347() -> Resul
 /// time whenever it decided not to raise, so an `input` in it consumed two
 /// documents (`debug` printed twice). Captured live from jq 1.7.1; each program
 /// leaves `2` for the trailing `input`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_indices_family_evaluates_its_pattern_once_3347() -> Result<()> {
     for filter in [
@@ -70991,7 +70696,6 @@ fn test_indices_family_evaluates_its_pattern_once_3347() -> Result<()> {
 /// a successful search is the error, the pattern's *first* value is the one that
 /// raises the path error (a later `error` is never reached), and a `break`
 /// ends the search quietly. Captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_indices_family_pattern_control_flow_3347() -> Result<()> {
     for (filter, stdout, stderr, exit) in [
@@ -71043,7 +70747,6 @@ fn test_indices_family_pattern_control_flow_3347() -> Result<()> {
 /// runs on a literal and on a document, which reach the search by different
 /// routes, and the multi-output row checks a later non-empty needle still
 /// searches. Captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_string_search_for_an_empty_needle_finds_nothing_3889() -> Result<()> {
     for (input, filter, expected) in [
@@ -71129,7 +70832,6 @@ fn test_string_indices_of_a_multibyte_needle_do_not_panic_3903() -> Result<()> {
 /// #3347: the raise reaches the write consumers of `path()` too, where the old
 /// by-value answer was an empty path set (`del` echoed the document, `=` wrote
 /// nothing, both exit 0). Captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_indices_family_raises_under_del_and_assignment_3347() -> Result<()> {
     for (filter, access) in [
@@ -71192,7 +70894,6 @@ fn test_indices_family_raises_in_yq_extensions_3347() -> Result<()> {
 /// inside it (a literal array feeding `.[]`, not the live input) raised
 /// nothing where jq raises `Invalid path expression near attempt to
 /// iterate through [1]`. Captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_argument_navigation_raises_on_an_untracked_value_2746() -> Result<()> {
     for filter in [
@@ -71235,7 +70936,6 @@ fn test_argument_navigation_raises_on_an_untracked_value_2746() -> Result<()> {
 /// own live path. A genuinely empty generator raises nothing at all, since
 /// none of the three ever navigate anything in that case. Captured live
 /// from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_argument_navigation_builtins_forward_a_computed_result_2746() -> Result<()> {
     for (filter, result) in [
@@ -71269,7 +70969,6 @@ fn test_argument_navigation_builtins_forward_a_computed_result_2746() -> Result<
 /// `INDEX(gen; f)` is `reduce`-based in jq's own definition and keeps it (`[]`).
 /// The shipped resolver did not carry the live register through `INDEX` and
 /// raised for both; the path-mode interpreter (#5223) answers each as jq does.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_argument_navigation_builtins_drop_the_register_like_reduce_2746() -> Result<()> {
     assert_path_rows_3289(&[
@@ -71297,7 +70996,6 @@ fn test_argument_navigation_builtins_drop_the_register_like_reduce_2746() -> Res
 /// own `match sink(result)` (the `Demand::Stop` side is already reached by
 /// every other test in this group, where the stage is the pipeline's last).
 /// Captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_argument_navigation_builtins_continue_when_nested_in_an_array_2746() -> Result<()> {
     for (filter, expected) in [
@@ -71320,7 +71018,6 @@ fn test_argument_navigation_builtins_continue_when_nested_in_an_array_2746() -> 
 /// answered nothing. The result is a computed boolean, never a path, and
 /// `cond` errors and `gen`'s post-decision errors follow jq's short-circuit.
 /// Captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_any_all_gen_cond_navigation_in_path_context_3349() -> Result<()> {
     for filter in [
@@ -71399,7 +71096,6 @@ fn assert_path_rows_both_routes_3749(rows: &[PathRow3289]) -> Result<()> {
 /// navigates natively from the accepted position (`| .b?` is empty, `| .x` is
 /// jq's own index error), and the write side lands on it. Every row captured
 /// from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_any_all_gen_cond_decisive_result_sits_at_the_register_3749() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -71566,7 +71262,6 @@ fn test_any_all_gen_cond_decisive_result_sits_at_the_register_3749() -> Result<(
 /// computes (`path(false | (any(empty; .) and 1))` answered `[]`, and `del` of
 /// it wrote `null`, where jq refuses); the last three rows pin that conjunct.
 /// Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_any_all_gen_cond_exhausted_register_stays_at_entry_3749() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -71655,7 +71350,6 @@ fn test_any_all_gen_cond_exhausted_register_stays_at_entry_3749() -> Result<()> 
 /// `[{"a":true}]` is `[0,"a"]`, `select(.)`, `first(.)`, `..` and a `def` leave the
 /// register, `del`/`=`/`|=` write there. Every row captured from jq 1.7.1, on the
 /// stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_any_all_navigating_cond_states_the_register_it_left_3757() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -71802,7 +71496,6 @@ fn test_any_all_navigating_cond_states_the_register_it_left_3757() -> Result<()>
 /// an enclosing `try` would swallow it; and an `input_line_number`, `now`,
 /// `env` or `input_filename` generator carries no register state at all, which
 /// used to trip the stage's entry assertion in a debug build.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -72155,7 +71848,6 @@ fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()
 /// jq performs. Both routes of the helper (the live stage and the by-value
 /// `cond`), each on the stdin and `-n` evaluators. Every row captured from jq
 /// 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_any_all_gen_retrying_pattern_supersedes_the_stashed_escape_3757() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -72252,7 +71944,6 @@ fn test_any_all_gen_retrying_pattern_supersedes_the_stashed_escape_3757() -> Res
 /// `nth`), and a result that navigated nothing but whose generator emitted
 /// (`isempty(1)`) states the register as well. Every row captured from jq
 /// 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_pipe_stage_reads_the_backtracked_register_verdict_3758() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -72619,7 +72310,6 @@ fn test_pipe_stage_reads_the_backtracked_register_verdict_3758() -> Result<()> {
 /// $x)` on `{"a":1}` is `[]`). A step that states a loss vouches for nothing, and
 /// an `any` that iterates the computed value still raises. Every row captured from
 /// jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_verdict_stage_on_an_untracked_entry_3826() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -72832,7 +72522,6 @@ fn test_verdict_stage_on_an_untracked_entry_3826() -> Result<()> {
 /// raises when destructured by value (`pattern_walk_fails_by_value`), at any step
 /// (`[[$a]]` over `[1]`), is exact. Every row captured from jq 1.7.1, on the stdin
 /// and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_pattern_that_fails_by_value_retries_3743() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -73047,7 +72736,6 @@ fn test_fold_pattern_that_fails_by_value_retries_3743() -> Result<()> {
 /// #3743: a computed key is not judged by value, because running its generator a
 /// second time would repeat its effects: `stderr` in the key writes once, as in
 /// jq (`a`, then the error), and the pattern keeps the refusal it had.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_pattern_computed_key_is_not_run_twice_3743() -> Result<()> {
     let input = r#"{"a":1}"#;
@@ -73084,7 +72772,6 @@ fn test_fold_pattern_computed_key_is_not_run_twice_3743() -> Result<()> {
 /// (its bare `$a` alternative emits at the entry register).
 /// `test_fold_pattern_against_known_untracked_register_retries_3999` pins the guess that
 /// remains.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_guessed_pattern_refusal_is_not_catchable_3840() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -73167,7 +72854,6 @@ fn test_fold_guessed_pattern_refusal_is_not_catchable_3840() -> Result<()> {
 /// `true` is the register's own boolean), and the retried alternative refused here until
 /// #4048, when the destructuring `reduce` began handing the register back. Every jq side
 /// captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_pattern_step_that_never_succeeds_retries_3998() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -73244,7 +72930,6 @@ fn test_fold_pattern_step_that_never_succeeds_retries_3998() -> Result<()> {
 /// `$var` over a no-op UPDATE (#4506): that cannot raise whichever alternative binds, so it takes
 /// the retry path like jq and fails at the result ("with result 0"). That row's expected message
 /// moved from "element 0" to "with result 0" because it now matches jq, not because it regressed. Every jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_pattern_against_known_untracked_register_retries_3999() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -73340,7 +73025,6 @@ fn test_fold_pattern_against_known_untracked_register_retries_3999() -> Result<(
 /// operand resolved live. Controls, all jq 1.7.1's own refusals: a constructed element, a
 /// navigating INIT, and a source that navigates into an INIT that does. Every row captured
 /// from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructuring_reduce_leaves_the_register_4048() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -73481,7 +73165,6 @@ fn test_destructuring_reduce_leaves_the_register_4048() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_fold_steps_from_known_untracked_register_4049() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -73678,7 +73361,6 @@ fn test_fold_steps_from_known_untracked_register_4049() -> Result<()> {
 /// jq does: a register that is not `null`/boolean (a pointer identity this model cannot
 /// compare), an accumulator that is not the register (`1`, a constructed object), and a
 /// navigation that follows a non-register output. Every jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_navigates_accumulator_on_untracked_null_register_4131() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -73833,7 +73515,6 @@ fn test_reduce_update_navigates_accumulator_on_untracked_null_register_4131() ->
 /// jq answers `["a"]`. The widening is `jv_identical` by kind (a boolean register raises jq's own
 /// error, a register that is not `null`/boolean stays refused), so it holds whatever `UPDATE`
 /// does. Every jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_live_null_register_step_covers_a_nested_fold_update_4445() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -74068,7 +73749,6 @@ fn test_reduce_live_null_register_step_covers_a_nested_fold_update_4445() -> Res
 /// still refuse as jq does: a register that is not `null`/boolean, an accumulator that is
 /// not the register, a boolean register (the step is intact and `jv_get` raises). Every jq
 /// side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_navigates_accumulator_on_untracked_null_register_4480() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -74276,7 +73956,6 @@ fn test_foreach_update_navigates_accumulator_on_untracked_null_register_4480() -
 /// .))` on `null` printed nothing where jq prints `["a","a"]` (#4491), and
 /// `path(reduce .a? as $k (0; -(foreach ...)))` answered `[]` where jq raises `null (null)
 /// cannot be negated`. Every jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nested_fold_in_update_follows_null_accumulator_on_live_register_4492() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -74488,7 +74167,6 @@ fn test_nested_fold_in_update_follows_null_accumulator_on_live_register_4492() -
 /// then vanished: `path(foreach .a? as $k (0; (foreach (1,2) as $i (1; try .a; .), 1); .))` on
 /// `null` printed only the error where jq prints `["a","a"]` first. Every jq side captured from
 /// jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_comma_sibling_and_deep_nested_fold_follow_live_null_register_4499() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -74654,7 +74332,6 @@ fn test_fold_comma_sibling_and_deep_nested_fold_follow_live_null_register_4499()
 /// silently empty: the `try` swallowed a refusal against a register known by value but not by
 /// position). The enclosing fold's step register now reaches the inner one with its position.
 /// Every jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_that_is_a_fold_update_reads_the_outer_frozen_var_4499() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -74745,7 +74422,6 @@ fn test_foreach_that_is_a_fold_update_reads_the_outer_frozen_var_4499() -> Resul
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_that_is_a_fold_update_keeps_init_marker_refused_4499() -> Result<()> {
     assert_path_rows_3289(&[
@@ -74779,7 +74455,6 @@ fn test_foreach_that_is_a_fold_update_keeps_init_marker_refused_4499() -> Result
 /// and an item of a comma (jq forks the comma at its entry) read the same node, so `$w` certifies
 /// against it. Every jq side captured from jq 1.7.1; the controls at the end keep their verdict
 /// (a navigating sibling, an `UPDATE` that moved the register before the `EXTRACT`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_under_try_extract_or_comma_reads_the_outer_frozen_var_4779() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -74892,7 +74567,6 @@ fn test_fold_under_try_extract_or_comma_reads_the_outer_frozen_var_4779() -> Res
 /// by kind. Anything that may have moved it states a loss and keeps refusing, as jq does for
 /// a navigating source or a register moved by an earlier `.a`. Every jq side captured from
 /// jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_emission_states_the_entry_register_on_an_untracked_entry_4130() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -75046,7 +74720,6 @@ fn test_foreach_emission_states_the_entry_register_on_an_untracked_entry_4130() 
 /// ?// $a (0; .; .)) | $x)` on `[true]` is `null`, was exit 5). Controls, jq's own refusals: a
 /// navigating `INIT`, `UPDATE` or `EXTRACT`, and a source that navigates. Every jq side captured
 /// from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_destructuring_pattern_states_the_entry_register_per_step_4129() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -75201,7 +74874,6 @@ fn test_foreach_destructuring_pattern_states_the_entry_register_per_step_4129() 
 /// ahead of the `try`, or a write through it, was refused where jq answers
 /// (`path(. as $x | {a:1} | (try (. as [$a] | $a) catch 7) | $x)` on `[{"a":1}]` is `[]`, was exit
 /// 5). The same bind and fold with no handler already answered. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // The rows' jq filters (`{a:1}`) are literals, not formatting strings; clippy cannot tell the two
 // apart from the brace shape alone.
@@ -75443,7 +75115,6 @@ fn test_try_handler_over_destructuring_bind_or_fold_states_the_entry_register_41
 /// took a step hands its body a seed carrying the register it moved, so an output states that one and
 /// never the entry register; only a bind that took no step reads as the stage's entry. Every jq side
 /// captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_try_handler_over_a_destructure_with_a_producer_body_states_the_entry_register_4490(
 ) -> Result<()> {
@@ -75630,7 +75301,6 @@ fn test_try_handler_over_a_destructure_with_a_producer_body_states_the_entry_reg
 /// handler's register, and a `foreach` UPDATE wrote through the `$x` after it
 /// (`del(. as $x | foreach (1,2) as $i (1; try ((.,1) | . as {(.):$a} | $a) catch 7 | $x; $x))` on
 /// `[[1]]` was `null`, jq raises). Every jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_pattern_key_that_is_an_array_is_a_subarray_search_in_path_position_4527() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -75764,7 +75434,6 @@ fn test_pattern_key_that_is_an_array_is_a_subarray_search_in_path_position_4527(
 /// guess, never retried, and the plain error it returned was swallowed by the `try`: the fold's element
 /// vanished (`path(foreach .a? as $k (0; try (. as {(.):$a} ?// $a | $a); $k))` is `["a"]`, was nothing)
 /// where jq raises at the emission. Every jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_try_over_a_computed_key_alternative_chain_retries_a_step_that_cannot_succeed_4539(
 ) -> Result<()> {
@@ -75871,7 +75540,6 @@ fn test_fold_try_over_a_computed_key_alternative_chain_retries_a_step_that_canno
 /// was lost, so a `try` caught it) but not retried as jq's own, so the `try` swallowed what the `?//`
 /// should have retried and `path(reduce .a? as $k ([]; try (. as [$a] ?// $a | $a)))` answered `[]` where
 /// jq raises at the emission. Every jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_try_over_an_alternative_bind_of_a_container_accumulator_retries_4550() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -76045,7 +75713,6 @@ fn test_fold_try_over_an_alternative_bind_of_a_container_accumulator_retries_455
 /// and raises at the emission. The mark was read in UPDATE only, so the `try` swallowed the refusal and
 /// `path(foreach .a? as $k ([]; .; try (. as [$a] ?// $a | $a)))` on `null` answered nothing at exit 0.
 /// Every jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_extract_try_over_an_alternative_bind_of_a_container_state_retries_4595(
 ) -> Result<()> {
@@ -76178,7 +75845,6 @@ fn test_foreach_extract_try_over_an_alternative_bind_of_a_container_state_retrie
 /// onto the bare alternative. The step compared the state with the *entry* register, which the root is,
 /// so a `try` swallowed the refusal: the UPDATE's output vanished (`$k` EXTRACT answered nothing where jq
 /// answers `[0]`) and the state emission was accepted where jq raises. Every jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_navigating_source_with_init_dot_retries_a_try_over_an_alternative_bind_4610(
 ) -> Result<()> {
@@ -76352,7 +76018,6 @@ fn test_foreach_navigating_source_with_init_dot_retries_a_try_over_an_alternativ
 /// refused `$k` ("Invalid path expression with result 1") where jq answers `[0]`. Controls: an operand that
 /// navigates (or a bare `any`, which iterates its input) still moves the register off the state, and a
 /// computed boolean is no node of it, both as in jq. Every jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_navigating_source_with_a_verdict_builtin_update_keeps_the_register_4611(
 ) -> Result<()> {
@@ -76543,7 +76208,6 @@ fn test_foreach_navigating_source_with_a_verdict_builtin_update_keeps_the_regist
 /// the register is where UPDATE entered and EXTRACT's `$k` names its path). Controls: a sibling or
 /// operand that navigates, which jq refuses on the state, and a computed boolean as EXTRACT. Every jq side
 /// captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_navigating_source_with_a_comma_or_wrapped_verdict_update_keeps_the_register_4623(
 ) -> Result<()> {
@@ -76637,7 +76301,6 @@ fn test_foreach_navigating_source_with_a_comma_or_wrapped_verdict_update_keeps_t
 /// taken for jq's own and swallowed. Controls: an operand that navigates *before* it can emit nothing
 /// (`.a? | empty`), a `select` whose condition raises, and a verdict as EXTRACT. Every jq side captured from
 /// jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_navigating_source_with_a_verdict_over_path_empty_select_and_or_or_def_4641(
 ) -> Result<()> {
@@ -76867,7 +76530,6 @@ fn test_foreach_navigating_source_with_a_verdict_over_path_empty_select_and_or_o
 /// still counted it as siblings, which withheld the register from its UPDATE: a caught `try .a` step on a
 /// `null` accumulator was refused as jq's own and the stream element vanished, so `isempty` answered
 /// `true` where jq's inner fold emitted (`false`). Every jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_isempty_over_a_fold_follows_the_live_null_register_4499() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -76933,7 +76595,6 @@ fn test_foreach_update_isempty_over_a_fold_follows_the_live_null_register_4499()
 /// The `and`/`or`, comma and `not` rows read a verdict over a `reduce` through `verdict_builtin_leaves_register`'s
 /// static view. The last three rows are controls: an EXTRACT that navigates (`.a`) and a `reduce` whose INIT navigates are not
 /// admitted, and keep the answer they had.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_verdict_over_a_reduce_computed_extract_or_non_null_register_follows_jq_4661(
 ) -> Result<()> {
@@ -77178,7 +76839,6 @@ fn test_foreach_update_verdict_over_a_reduce_computed_extract_or_non_null_regist
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_verdict_over_forking_extract_recurse_or_alt_bind_operand_follows_jq_4698(
 ) -> Result<()> {
@@ -77476,7 +77136,6 @@ fn test_foreach_update_verdict_over_forking_extract_recurse_or_alt_bind_operand_
 /// EXTRACT after a caught navigation, which #3984's withhold used to refuse where jq answers: on `null` the loop variable
 /// is a `null` marker, the register by kind (#4756), and on any document the inner `foreach` is the outer fold's whole
 /// UPDATE with no `$k` in its INIT or source (#4499).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_verdict_update_of_a_fold_nested_in_a_fold_follows_jq_4699() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -77683,7 +77342,6 @@ fn test_verdict_update_of_a_fold_nested_in_a_fold_follows_jq_4699() -> Result<()
 /// (`[path(foreach .[]? as $k (0; (isempty(recurse) | not); $k))?]` on `[1]` is `[[0]]`, here `[]`). Every jq
 /// side captured from jq 1.7.1 on `[1]`; the controls that follow are the shapes the admission must not reach
 /// (a verdict decided on a descendant, or after a navigating stage), which keep jq's answer or its refusal.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_composed_isempty_any_recurse_follows_jq_4706() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -78135,7 +77793,6 @@ fn test_foreach_update_composed_isempty_any_recurse_follows_jq_4706() -> Result<
 /// (the pattern's step raises, the `try` catches it, the inner source is empty). The outer `foreach` therefore
 /// emits nothing; the resolver instead emitted its own accumulator once per step. A `reduce` outer is #4709's
 /// (its state is left `null`). Every jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_inner_foreach_over_caught_foreign_destructure_emits_nothing_4723(
 ) -> Result<()> {
@@ -78184,7 +77841,6 @@ fn test_foreach_update_inner_foreach_over_caught_foreign_destructure_emits_nothi
 /// element was dropped. The body is now read once and a call in the scope answers as it does, a call as the
 /// operand of a verdict builtin as the body does (`def f: recurse; isempty(f)`). Every jq side captured from
 /// jq 1.7.1 on `[1]`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_zero_arity_def_around_verdict_follows_jq_4720() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -78242,7 +77898,6 @@ fn test_foreach_update_zero_arity_def_around_verdict_follows_jq_4720() -> Result
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_composed_any_recurse_not_decided_on_the_seed_stays_refused_4706(
 ) -> Result<()> {
@@ -78282,7 +77937,6 @@ fn test_foreach_update_composed_any_recurse_not_decided_on_the_seed_stays_refuse
 /// register UPDATE entered with, as the bare composition does ([`verdict_builtin_leaves_register`] now reads
 /// through the wrapper). Under `?` the refusal was swallowed and the stream element dropped. Every jq side
 /// captured from jq 1.7.1 on `[1]`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_composed_verdict_under_try_follows_jq_4719() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -78363,7 +78017,6 @@ fn test_foreach_update_composed_verdict_under_try_follows_jq_4719() -> Result<()
 /// is read as the left operand of another `//`, behind a `tostring`/`if` tail, with a computed-key
 /// `error({("a"):.})` message, and through a `def` with parameters its body does not name. Each raises in jq
 /// (the destructure of `.` moves the register) and was answered with `[]`; the `{(.a):.}` control is jq's own answer. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_source_always_run_branch_neighbours_follow_jq_4716() -> Result<()> {
@@ -78438,7 +78091,6 @@ fn test_foreach_source_always_run_branch_neighbours_follow_jq_4716() -> Result<(
 /// `| select(.)` tail. It emits nothing for a falsy output, but the head's destructure of `.` has already
 /// moved the register, so it raises on a truthy document (`{"a":true}`) and answers on `null`; a head that
 /// ends in `$b` (not the register) is unaffected. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_source_always_run_branch_behind_select_dot_tail_4739() -> Result<()> {
@@ -78544,7 +78196,6 @@ fn test_foreach_source_always_run_branch_behind_select_dot_tail_4739() -> Result
 /// walk read INIT `.` as still on the register (true only while the source does not navigate, #4354), so
 /// `foreach` answered where jq raises and `reduce` raised where jq answers. Every jq side captured from
 /// jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_alt_bind_of_init_dot_behind_a_navigating_source_retries_4596() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -78643,7 +78294,6 @@ fn test_fold_alt_bind_of_init_dot_behind_a_navigating_source_retries_4596() -> R
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_fold_update_isempty_with_a_pattern_bind_keeps_the_register_4354() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -78721,7 +78371,6 @@ fn test_fold_update_isempty_with_a_pattern_bind_keeps_the_register_4354() -> Res
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_nested_fold_over_frozen_var_with_untracked_register_stays_loud_3984() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -78832,7 +78481,6 @@ fn test_nested_fold_over_frozen_var_with_untracked_register_stays_loud_3984() ->
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_fold_init_that_navigates_then_computes_does_not_keep_the_ambient_register_4013(
 ) -> Result<()> {
@@ -78930,7 +78578,6 @@ fn test_fold_init_that_navigates_then_computes_does_not_keep_the_ambient_registe
 /// backtracks a `reduce` source, so `reduce (. as {a:$a} | .) as $x (.; .)` is `[]`
 /// (the contrast rows). Every row captured from jq 1.7.1, on the stdin and `-n`
 /// routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_destructuring_the_register_moves_it_3744() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -79163,7 +78810,6 @@ fn test_foreach_source_destructuring_the_register_moves_it_3744() -> Result<()> 
 /// walk left (a container as well as a `null`/`true`/`false`), so the refusal is jq's own
 /// "near attempt to access" -- catchable -- rather than an uncatchable guess. The routed
 /// source and the nested `foreach . as PAT` alike; every answer captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_destructuring_register_under_try_is_caught_3938() -> Result<()> {
     for (input, filter, jq_answer) in [
@@ -79204,7 +78850,6 @@ fn test_foreach_source_destructuring_register_under_try_is_caught_3938() -> Resu
 /// The must-not-change rows of the new routing: the same refusals as before for every
 /// non-`try` shape, and `| empty` (which used to refuse) now answers. Every row captured
 /// from jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructure_bind_with_a_no_op_body_defers_its_refusal_3853() -> Result<()> {
     let doc = r#"{"a":[true]}"#;
@@ -79253,7 +78898,6 @@ fn test_destructure_bind_with_a_no_op_body_defers_its_refusal_3853() -> Result<(
 /// result" error, so a `try` (or the `try` an `and`/`or`/`//` operand sits in) never saw
 /// it and `del` failed where jq's catches and leaves the document alone. Every row
 /// captured from jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_routed_foreach_source_under_try_is_caught_3853() -> Result<()> {
     let doc = r#"{"a":[true]}"#;
@@ -79339,7 +78983,6 @@ fn test_routed_foreach_source_under_try_is_caught_3853() -> Result<()> {
 /// really is `null`, so the same walk answers (`["a"]`), and a bare `. as {a:$a} | .`
 /// source and a literal `null` element were already right. Every row captured from jq
 /// 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_destructuring_a_computed_null_is_refused_4007() -> Result<()> {
     let doc = r#"{"a":null,"b":2}"#;
@@ -79456,7 +79099,6 @@ fn test_foreach_source_destructuring_a_computed_null_is_refused_4007() -> Result
 /// stay answered: a bare `$a` loop pattern performs no step, and a `reduce` over `.`
 /// itself restores the register when it backtracks its source. Every row captured from
 /// jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nested_fold_with_a_destructured_register_source_raises_3853() -> Result<()> {
     let near = "Invalid path expression near attempt to access element 0 of [1]";
@@ -79522,7 +79164,6 @@ fn test_nested_fold_with_a_destructured_register_source_raises_3853() -> Result<
 /// are #3744's dangerous direction: the end-of-path refusal sits outside the `try`, so the
 /// operand's result is what jq names. Every row captured from jq 1.7.1, on the stdin and
 /// `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nested_foreach_destructuring_the_register_moves_it_for_the_outer_fold_3853() -> Result<()> {
     let with_result = r#"Invalid path expression with result {"a":1}"#;
@@ -79574,7 +79215,6 @@ fn test_nested_foreach_destructuring_the_register_moves_it_for_the_outer_fold_38
 /// then checked against a register it is no longer at and raises, where the by-value drive
 /// answered `[]` and a write through it landed nowhere. A nested `reduce` backtracks and a
 /// source that destructures nothing leave the root. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nested_foreach_whose_source_destructures_the_register_moves_it_for_the_outer_fold_4031(
 ) -> Result<()> {
@@ -79670,7 +79310,6 @@ fn test_nested_foreach_whose_source_destructures_the_register_moves_it_for_the_o
 /// pattern matches, so on a `null` document `. as [$a] ?// {a:$a}` leaves it on `[0]` and
 /// `. as {a:$a} ?// [$a]` on `["a"]`; a chain read by value answered the root, so a write
 /// through it replaced the document. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nested_foreach_pattern_chain_on_a_null_register_answers_the_member_it_moved_to_3948(
 ) -> Result<()> {
@@ -79726,7 +79365,6 @@ fn test_nested_foreach_pattern_chain_on_a_null_register_answers_the_member_it_mo
 /// instead (a recorded divergence, #2974); the path-mode interpreter (#5223) runs jq's `_modify`
 /// body when the paths can retry and raises jq's message. `=` (which carries on with the retried
 /// alternative) and the two-alternative chain (whose retry raises its own error) answer as jq does.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_three_alternative_chain_under_limit_update_raises_as_jq_does_3963() -> Result<()> {
     let nested = r"foreach (foreach . as [$a] ?// {a:$a} ?// $a (0; .; .)) as $x (.; .; .)";
@@ -79777,7 +79415,6 @@ fn test_three_alternative_chain_under_limit_update_raises_as_jq_does_3963() -> R
 /// moves it the same way. Contrasts: any register that is not `null`/a boolean still refuses
 /// (the outer accumulator is not that node), and a nested `reduce` backtracks. Every row
 /// captured from jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nested_foreach_on_a_null_register_answers_the_member_it_moved_to_3939() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -79953,7 +79590,6 @@ fn test_nested_foreach_on_a_null_register_answers_the_member_it_moved_to_3939() 
 /// a `select(false)` source emits nothing, and a source with no destructure behind the stage is
 /// still the register itself. A `select(f)` whose condition navigates is left to the by-value
 /// drive (its condition can raise). Every row captured from jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_destructure_behind_a_register_forwarding_stage_raises_3956() -> Result<()> {
     let doc = r#"{"a":1,"b":2}"#;
@@ -80053,7 +79689,6 @@ fn test_foreach_source_destructure_behind_a_register_forwarding_stage_raises_395
 /// walk left (#3938), so the right operand's navigation is refused the way jq refuses it, and
 /// the `try`/`?` catches it. The syntactic `(.|.)` form routed by #3940 and the `select(true)`
 /// form of #3956 alike. Captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_routed_foreach_source_as_an_and_operand_under_try_is_caught_3956() -> Result<()> {
     for forwarder in ["(.|.)", "(.|select(true))"] {
@@ -80091,7 +79726,6 @@ fn test_routed_foreach_source_as_an_and_operand_under_try_is_caught_3956() -> Re
 /// bare loop variable performs no step, a nested `reduce` backtracks, and a navigating
 /// leading stage is the navigated source's own business. Every row captured from jq 1.7.1,
 /// on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_destructure_after_a_no_op_leading_stage_raises_3940() -> Result<()> {
     let doc = r#"{"a":1,"b":2}"#;
@@ -80172,7 +79806,6 @@ fn test_foreach_source_destructure_after_a_no_op_leading_stage_raises_3940() -> 
 /// refused. An UPDATE or EXTRACT that can navigate keeps its own answer, and a member that is
 /// not `null`/a boolean still refuses. Every row captured from jq 1.7.1, on the stdin and `-n`
 /// routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nested_navigating_foreach_states_the_register_its_source_left_3883() -> Result<()> {
     let both = r#"{"a":null,"b":null}"#;
@@ -80315,7 +79948,6 @@ fn test_nested_navigating_foreach_states_the_register_its_source_left_3883() -> 
 /// `$var` handed back, an array pattern on an object, a literal INIT that leaves the register
 /// off the accumulator, and a `reduce` whose own source navigated (where `.` is not the
 /// register) keep their refusals. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_handing_back_the_accumulator_after_a_destructure_3953() -> Result<()> {
     let doc = r#"{"a":false,"b":null}"#;
@@ -80483,7 +80115,6 @@ fn test_reduce_update_handing_back_the_accumulator_after_a_destructure_3953() ->
 /// else refused ("Invalid path expression with result"). The element now carries the
 /// root path like a navigated source's does (`.a`, `.[]` already answered); `reduce`
 /// over `.` binds the same element and answers alike. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_over_the_register_binds_it_as_a_path_3790() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -80785,7 +80416,6 @@ fn test_foreach_over_the_register_binds_it_as_a_path_3790() -> Result<()> {
 /// register (`reduce .[] as $i (.; any)`), or on its second pass (`reduce (1,2) ...`), still
 /// raises. A `def` that carries the stage onto an untracked entry keeps jq's answer. Every row
 /// captured from jq 1.7.1 (`/usr/bin/jq`), on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_verdict_stage_behind_a_def_or_reduce_3826() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -81059,7 +80689,6 @@ fn test_verdict_stage_behind_a_def_or_reduce_3826() -> Result<()> {
 /// deleted `.a`, where jq raises. Controls: a source that moves nothing, a generator that
 /// navigates nothing and the bare postfix `?` keep jq's answers. Every row captured from jq
 /// 1.7.1 (`/usr/bin/jq`), on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_isempty_navigates_the_accumulator_4439() -> Result<()> {
     let iterate = r#"Invalid path expression near attempt to iterate through {"a":true}"#;
@@ -81177,7 +80806,6 @@ fn test_reduce_update_isempty_navigates_the_accumulator_4439() -> Result<()> {
 /// counts only behind an INIT that yields (`empty` never runs it), and a source that moved
 /// nothing leaves the answer alone. Every row captured from jq 1.7.1 (`/usr/bin/jq`), on the stdin
 /// and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nested_fold_in_reduce_update_navigates_the_accumulator_4438() -> Result<()> {
     let iterate = "Invalid path expression near attempt to iterate through []";
@@ -81330,7 +80958,6 @@ fn test_nested_fold_in_reduce_update_navigates_the_accumulator_4438() -> Result<
 /// jq raises on the handler's `1` (and `del` of it wrote), and `try .a` raised where jq answers
 /// `["a"]`. Controls: a body that navigates nothing, a source that moves nothing, nested `try`s.
 /// Every row captured from jq 1.7.1 (`/usr/bin/jq`), on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_try_body_navigation_is_caught_4459() -> Result<()> {
     let doc = r#"{"a":true}"#;
@@ -81529,7 +81156,6 @@ fn test_reduce_update_try_body_navigation_is_caught_4459() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -81636,7 +81262,6 @@ fn test_any_all_gen_cond_register_verdict_is_jq_mode_only_3749() -> Result<()> {
 /// which the `and`/`or` rows read, and an emitting `isempty` no longer loses
 /// it for a `$x` frozen before it (`try ($x | .a)` is caught, as in jq). Every
 /// row captured from jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_isempty_and_bare_any_all_state_the_register_3763() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -81750,7 +81375,6 @@ fn test_isempty_and_bare_any_all_state_the_register_3763() -> Result<()> {
 /// captured from jq 1.7.1, on the stdin and `-n` routes; jq words its refusals
 /// `near attempt to iterate through`/`access element` where this says `with
 /// result`, so the message check is the prefix both share.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -81885,7 +81509,6 @@ fn test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763() -> Resu
 /// entered and a `$x` frozen before it re-establishes. The rows above are the
 /// converse: the same navigation on a computed element (`any(1; .a)`) raises in
 /// jq, so it stays refused. Every row captured from jq 1.7.1, on both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_any_all_undecided_register_survives_a_cond_that_never_raised_3763() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -82029,7 +81652,6 @@ fn test_any_all_undecided_register_survives_a_cond_that_never_raised_3763() -> R
 /// the `.[]` the definition starts with, so the move off the by-value leaf
 /// loses none of `builtin_navigation`'s refusals. Every row captured from jq
 /// 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bare_any_all_and_isempty_keep_their_refusals_3763() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -82227,7 +81849,6 @@ fn test_index_stream_idx_expr_error_aborts_construction_2746() -> Result<()> {
 /// "later duplicate keys overwriting earlier ones" fold, here exercised
 /// through the path-tracked resolver's own single-pass construction, which
 /// clones the row for every key but its last). Captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_index_stream_multi_key_row_reaches_every_key_2746() -> Result<()> {
     let (stdout, stderr, code) =
@@ -82247,7 +81868,6 @@ fn test_index_stream_multi_key_row_reaches_every_key_2746() -> Result<()> {
 /// reaches `.[]` and raises, the object arm goes through `map_values`
 /// (deferred, #2743), and a scalar navigates nothing. Captured live from
 /// jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_navigating_builtins_raise_regardless_of_input_type_2646() -> Result<()> {
     for (filter, element) in [
@@ -82669,7 +82289,6 @@ fn test_path_prefix_lets_a_truncating_consumer_succeed_2680() -> Result<()> {
 /// destructuring is not the cause -- it only supplies an untracked ambient
 /// value. The first rows below reproduce with no `as` at all. All captured
 /// live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_refuses_navigation_inside_array_on_untracked_input_2689() -> Result<()> {
     for (filter, doc, element) in [
@@ -82719,7 +82338,6 @@ fn test_path_refuses_navigation_inside_array_on_untracked_input_2689() -> Result
 /// same resolution, so the missing refusal was a **refused edit reported as
 /// a successful no-op** -- the document came back unchanged at exit 0 where
 /// jq exits 5. Captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_write_refuses_navigation_inside_array_on_untracked_input_2689() -> Result<()> {
     for filter in [
@@ -82776,7 +82394,6 @@ fn test_write_refuses_navigation_inside_array_on_untracked_input_2689() -> Resul
 /// where jq refuses only on real navigation; and `(.a)?` is jq's *caught*
 /// `try .a` but the parser stores it as the uncaught `.a?` (#2764). All
 /// captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_array_on_untracked_input_boundary_2689() -> Result<()> {
     for (filter, doc) in [
@@ -82814,7 +82431,6 @@ fn test_array_on_untracked_input_boundary_2689() -> Result<()> {
 /// missing refusal but the *wrong* error (`"boolean (false) cannot be
 /// negated"`, from evaluating the operand by value first, instead of the
 /// operand's own navigation refusal). All captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_refuses_navigation_inside_and_or_negate_on_untracked_input_2760() -> Result<()> {
     for (filter, doc, element) in [
@@ -82869,7 +82485,6 @@ fn test_path_refuses_navigation_inside_and_or_negate_on_untracked_input_2760() -
 /// never be evaluated either -- confirmed live that jq itself raises
 /// nothing for these (the un-taken side's own navigation is simply never
 /// attempted), so a refusal here would be a regression, not the fix.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_and_or_short_circuit_skips_the_untaken_operand_on_untracked_input_2760() -> Result<()> {
     for (filter, doc) in [
@@ -82898,7 +82513,6 @@ fn test_and_or_short_circuit_skips_the_untaken_operand_on_untracked_input_2760()
 /// .k` silently stopped checking `.k`'s own navigation the moment `$v0`
 /// (correctly, per #2759) disqualified itself -- caught live in review,
 /// confirmed against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_and_or_tracked_var_on_one_side_does_not_blind_the_other_2760() -> Result<()> {
     for (filter, doc) in [
@@ -82942,7 +82556,6 @@ fn test_and_or_tracked_var_on_one_side_does_not_blind_the_other_2760() -> Result
 /// same `And`/`Or` arm again for the nested `and` and the dedicated
 /// `TrackedVar` arm for the bare `$v0` -- deciding each node's fate from
 /// inside the resolver, not from an outer predicate over the whole subtree.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_and_or_tracked_var_nested_in_compound_operand_does_not_blind_sibling_navigation_2760(
 ) -> Result<()> {
@@ -83010,7 +82623,6 @@ fn assert_path_rows_via_3749(
 /// 1.7.1; an empty message means no stderr. For the generated matrices whose
 /// programs the shipped resolver refused and the path-mode interpreter answers
 /// as jq does.
-#[cfg(not(feature = "unshared-containers"))]
 fn assert_filters_match_jq_5223(
     input: &str,
     filters: &[String],
@@ -83041,7 +82653,6 @@ fn assert_filters_match_jq_5223(
 /// `DUP`ed input with the register where `L` left it). succinctly accepted
 /// them on a trackable input, or refused with its by-value "with result"
 /// message, or raised past a catching `?`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_and_or_negate_path_refuses_where_the_register_moved_3289() -> Result<()> {
     assert_path_rows_3289(&[
@@ -83072,7 +82683,6 @@ fn test_and_or_negate_path_refuses_where_the_register_moved_3289() -> Result<()>
 /// where a later `$var` re-establishes the register the operator left.
 /// succinctly refused every one; ADR-0018 gives no condition to refuse a
 /// write jq performs, so these must match.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_and_or_negate_path_accepts_where_the_result_is_the_register_3289() -> Result<()> {
     assert_path_rows_3289(&[
@@ -83127,7 +82737,6 @@ fn test_and_or_negate_path_accepts_where_the_result_is_the_register_3289() -> Re
 /// by both now; the `as` source is the one only `register_movement_tracked`
 /// reaches, which is why the claim is the union. Each answers `[]` in jq 1.7.1 and
 /// here; an arm that said `false` would refuse it ("with result").
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_array_claim_over_composite_and_or_operands_carries_the_register_3456() -> Result<()> {
     assert_path_rows_3289(&[
@@ -83191,7 +82800,6 @@ fn test_array_claim_over_composite_and_or_operands_carries_the_register_3456() -
 /// on `[true]` raises near element 0 where `[false,1]` answers `[]`, and a collect
 /// whose operands never navigate off the register (`[first and true]`) backtracks
 /// to the root. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // The `{k:1}` rows are jq filter literals, not formatting strings.
 #[allow(clippy::literal_string_with_formatting_args)]
@@ -83346,7 +82954,6 @@ fn test_collect_and_or_over_register_moving_builtins_3724() -> Result<()> {
 /// (`.a`, `.[0]`, `first`, `//`, a trailing non-navigating stage) and an empty input,
 /// where `f` never runs, still answer. Every row captured from jq 1.7.1, on the
 /// stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // The `{k:1}` rows are jq filter literals, not formatting strings.
 #[allow(clippy::literal_string_with_formatting_args)]
@@ -83467,7 +83074,6 @@ fn test_map_f_in_path_position_raises_where_jq_does_3865() -> Result<()> {
 /// #3289's negative control: a number or string register is never identical
 /// to a fresh boolean, so these stay refused -- the conjunct that keeps the
 /// class-B acceptance from turning into a write jq refuses.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_and_or_negate_path_keeps_refusing_a_non_identical_register_3289() -> Result<()> {
     assert_path_rows_3289(&[
@@ -83512,7 +83118,6 @@ fn test_and_or_negate_path_keeps_refusing_a_non_identical_register_3289() -> Res
 /// #3289 (class E): unary minus on a trackable input resolves its operand
 /// live -- refusing where jq refuses, with jq's message -- and leaves the
 /// register where its operand did, so a later `$y` re-establishes it.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object literal `{b:2}`, not a format arg
 fn test_and_or_negate_path_negate_resolves_live_on_a_trackable_input_3289() -> Result<()> {
@@ -83574,7 +83179,6 @@ fn test_and_or_negate_path_negate_resolves_live_on_a_trackable_input_3289() -> R
 /// non-navigating operand on either side, `try`/`?`/`//` around the
 /// operator, `if`'s and `select`'s subexp condition, value mode, and the
 /// short-circuit (an `error("x")` in the untaken slot never runs).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_and_or_negate_path_unchanged_rows_still_match_3289() -> Result<()> {
     assert_path_rows_3289(&[
@@ -83675,7 +83279,6 @@ fn test_and_or_negate_path_unchanged_rows_still_match_3289() -> Result<()> {
 /// wrapper (`try`, `?`) around an `and` whose moved register must survive
 /// to a later `$y`, a `?//` retry inside an operand, a full array slice
 /// (`.[0:]` is the input itself to jq), and a register the stage carried in.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_and_or_negate_path_review_rows_match_jq_3289() -> Result<()> {
     assert_path_rows_3289(&[
@@ -83817,7 +83420,6 @@ fn test_and_or_negate_path_review_rows_match_jq_3289() -> Result<()> {
 /// nothing; the message can still differ (an operand the resolver cannot
 /// follow keeps the by-value "with result" refusal), which is the safe
 /// direction.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_and_or_negate_path_never_writes_where_jq_refuses_3289() -> Result<()> {
     for (input, filter) in [
@@ -83866,7 +83468,6 @@ fn test_and_or_negate_path_never_writes_where_jq_refuses_3289() -> Result<()> {
 /// `try ... catch` is jq's own error and is handled; the handler's own
 /// output is then not a path, so the write refuses -- it must never fall
 /// through to writing at the root.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_register_catch_handler_output_is_not_a_write_target_3456() -> Result<()> {
     assert_path_rows_3289(&[
@@ -83891,7 +83492,6 @@ fn test_path_register_catch_handler_output_is_not_a_write_target_3456() -> Resul
 /// `downstream` hiding a retried alternative's error). jq's `?//` retries
 /// only on an error in the *pattern destructure*, so a path error in the body
 /// is final; and that error still surfaces when the body is piped onward.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_register_alt_pattern_body_refusal_is_final_3456() -> Result<()> {
     assert_path_rows_3289(&[
@@ -83916,7 +83516,6 @@ fn test_path_register_alt_pattern_body_refusal_is_final_3456() -> Result<()> {
 /// treated as pointer-identical). jq's `.[0:]` hands back the very same
 /// array, but a copy that merely *compares equal* to the register is a
 /// different value to `jv_identical`, and `.[0:0]` is a fresh empty array.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_register_equal_array_copy_is_not_the_register_3456() -> Result<()> {
     assert_path_rows_3289(&[
@@ -83953,7 +83552,6 @@ fn test_path_register_equal_array_copy_is_not_the_register_3456() -> Result<()> 
 /// where that position is the register's; a position-less marker keeps the by-value rule
 /// (the same node jq holds). `=`/`|=`/`del()` over the same shape already raised, with a
 /// different message. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_string_slice_is_not_the_register_3793() -> Result<()> {
     for (input, filter) in [
@@ -84035,7 +83633,6 @@ fn test_string_slice_is_not_the_register_3793() -> Result<()> {
 /// wrote `9`. An INIT of `1` or `null` reproduced it too. Controls: a non-empty array's
 /// slice *is* its node (and `foreach` answers on a string slice, which is a different
 /// shape), and `.` as UPDATE keeps the register. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_string_slice_accumulator_is_not_the_register_3930() -> Result<()> {
     for (input, filter) in [
@@ -84088,7 +83685,6 @@ fn test_reduce_string_slice_accumulator_is_not_the_register_3930() -> Result<()>
 /// slice of `[]` -- and any empty slice -- is a fresh `[]`, so `$x` is not
 /// the register and a `path`/`del`/`|=` through it refuses. Every row
 /// captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_and_or_path_empty_array_slice_is_not_the_register_3494() -> Result<()> {
     assert_path_rows_3289(&[
@@ -84233,7 +83829,6 @@ fn test_and_or_path_empty_array_slice_is_not_the_register_3494() -> Result<()> {
 /// whenever an array register equalled the input by value, which holds for `[]`,
 /// and `?` then swallowed the type error `.b` raises on `[]`. Every row is
 /// captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_and_or_path_empty_slice_then_optional_index_refuses_3647() -> Result<()> {
     assert_path_rows_3289(&[
@@ -84402,7 +83997,6 @@ fn test_and_or_path_empty_slice_then_optional_index_refuses_3647() -> Result<()>
 /// `try` and `first(..)` around an `and` must hand the register on as it
 /// stands, so the later navigation refuses -- or, where jq's own no-write
 /// leaves the document alone, does exactly that.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_register_wrappers_carry_the_register_through_3456() -> Result<()> {
     assert_path_rows_3289(&[
@@ -84433,7 +84027,6 @@ fn test_path_register_wrappers_carry_the_register_through_3456() -> Result<()> {
 /// #3456 (round 2: `FoldRegister` assuming SOURCE never moved the register).
 /// `reduce`/`foreach` whose SOURCE navigates (`getpath`, #2896) leave the
 /// register somewhere the fold's entry state does not describe.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_register_fold_source_that_navigates_moves_the_register_3456() -> Result<()> {
     assert_path_rows_3289(&[
@@ -84460,7 +84053,6 @@ fn test_path_register_fold_source_that_navigates_moves_the_register_3456() -> Re
 /// cubic gate takes minutes at this length, against about 0.07s standalone --
 /// and a milder superlinear slowdown passes. The finer net is the sweep's
 /// chain rows (`scripts/jq-path-register-sweep.py`), which report TIMEOUT.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_register_long_and_chain_is_bounded_3456() -> Result<()> {
     let chain = vec![".a"; 256].join(" and ");
@@ -84495,7 +84087,6 @@ fn test_path_register_long_and_chain_is_bounded_3456() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_path_register_drain_producers_lose_the_register_uncatchably_3456() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":1,"l":[1,2]}"#;
@@ -84534,7 +84125,6 @@ fn test_path_register_drain_producers_lose_the_register_uncatchably_3456() -> Re
 /// catchable, exactly as jq 1.7.1 has it. (`last` states the register
 /// outright since #3643, so its row here is an unchanged-document control.) A checked `[E]` keeps the register
 /// outright (#3263). All exit 0 and byte-identical to jq.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_register_drain_producers_keep_where_they_lost_it_3456() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":1,"l":[1,2]}"#;
@@ -84589,7 +84179,6 @@ fn test_path_register_drain_producers_keep_where_they_lost_it_3456() -> Result<(
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":2}"#;
@@ -84700,7 +84289,6 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
 /// runs on a computed array, #3723; pinned in the library tests). Every row captured
 /// from jq 1.7.1, on the stdin and `-n` routes; where both refuse with different
 /// wording the row asserts the common prefix.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // The `{k:1}` rows are jq filter literals, not formatting strings.
 #[allow(clippy::literal_string_with_formatting_args)]
@@ -84839,7 +84427,6 @@ fn test_collect_map_any_all_navigating_f_keeps_the_register_3724() -> Result<()>
 /// generators the allowlist does not read (`first(f)`, `//`, `limit`) keep
 /// refusing where jq answers. Every row captured from jq 1.7.1, on the stdin
 /// and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_collect_last_f_keeps_the_register_3767() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -85115,7 +84702,6 @@ fn test_collect_last_f_keeps_the_register_3767() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":2}"#;
@@ -85437,7 +85023,6 @@ fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<(
 /// (`null`, exit 0) and `=` overwrote it where jq exits 5. Those four run their body
 /// whatever it yields; the right of a `//` and `limit(n; f)` are not read. Every row
 /// captured from jq 1.7.1 on `{"a":true,"k":2}`, on both evaluators.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_navigating_inside_a_collect_or_alternative_refuses_3797() -> Result<()> {
     let doc = r#"{"a":true,"k":2}"#;
@@ -85612,7 +85197,6 @@ fn test_reduce_update_navigating_inside_a_collect_or_alternative_refuses_3797() 
 /// first), the only entry where the register is carried by the pipe and a stage
 /// outside the allowlist drops it. Entered on the register itself, a `select`
 /// already passed a trackable branch straight through.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":2}"#;
@@ -86007,7 +85591,6 @@ fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
 /// register where the stage entered, so the same pipe outside a fold answers too.
 /// Since part 4 the `first(null)` row answers `["a"]` too (a wrapper over a stage that
 /// navigates nothing); the `(.b // null)` row is answered by #3644.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_extract_ending_on_untracked_null_after_navigation_refuses_3769() -> Result<()> {
     let extract = ".a? | limit(1; last(.a?))";
@@ -86084,7 +85667,6 @@ fn test_foreach_extract_ending_on_untracked_null_after_navigation_refuses_3769()
 /// resolver's uncatchable guess: `path(...)` exited 5 and `del`/`=` refused
 /// where jq answers empty and writes nothing. Every row captured from jq 1.7.1
 /// with `-c`; the rows jq refuses (`$v0 | .b` with no `?`) still refuse.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_keeps_the_register_for_a_frozen_variable_after_it_3761() -> Result<()> {
     let doc = "{\"a\":{\"b\":1}}\n";
@@ -86176,7 +85758,6 @@ fn test_foreach_keeps_the_register_for_a_frozen_variable_after_it_3761() -> Resu
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_true_or_update_extracting_the_variable_never_answers_the_root_3775() -> Result<()> {
     assert_path_rows_3289(&[
@@ -86376,7 +85957,6 @@ fn test_foreach_true_or_update_extracting_the_variable_never_answers_the_root_37
 /// writes, or raises. A chain has no sibling branch to withhold the register
 /// from. Every row captured from jq 1.7.1 with `-c`; #3770 widened this to any body around a generator
 /// (`test_foreach_update_under_try_around_a_generator_keeps_the_register_3770`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_under_try_over_a_generator_keeps_the_register_3738() -> Result<()> {
     let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}]}}"#;
@@ -86633,7 +86213,6 @@ fn test_foreach_update_under_try_over_a_generator_keeps_the_register_3738() -> R
 /// silently skipped (#3738 exempted only a single chain of stages). Every row
 /// captured from jq 1.7.1 with `-c`; what still differs is
 /// `test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_under_try_around_a_generator_keeps_the_register_3770() -> Result<()> {
     let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}]}}"#;
@@ -86767,7 +86346,6 @@ fn test_foreach_update_under_try_around_a_generator_keeps_the_register_3770() ->
 /// without `try`, a bare pipe, already matched. A nested pipe threads the
 /// register through its stages exactly as that top-level one does. Every row
 /// captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3770() -> Result<()>
 {
@@ -86850,7 +86428,6 @@ fn test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3
 /// operand navigated and then `and` computed, so the register is on what it reached and the
 /// EXTRACT runs from there. (`//` around a generator was the other row until #3788, see
 /// `test_foreach_update_bare_var_alternate_keeps_the_register_3788`.) Captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_under_try_with_an_and_body_on_null_keeps_the_register_3770() -> Result<()> {
     assert_path_rows_3289(&[(
@@ -86870,7 +86447,6 @@ fn test_foreach_update_under_try_with_an_and_body_on_null_keeps_the_register_377
 /// write through it was silently skipped. A bare sibling states the register itself
 /// (`carry_frame_register`, as a `//` alternate does since #3788), so one navigating sibling
 /// no longer decides the others. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_under_try_with_a_comma_above_a_pipe_keeps_the_register_3862() -> Result<()> {
     let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}]}}"#;
@@ -86964,7 +86540,6 @@ fn test_foreach_update_under_try_with_a_comma_above_a_pipe_keeps_the_register_38
 /// first group keep their answers: an EXTRACT with no `try` raises on the pipe sibling's output,
 /// as in jq, and an UPDATE whose only output is the pipe never reaches the literal. Every row
 /// captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_comma_with_a_navigating_pipe_and_a_literal_keeps_the_register_3941(
 ) -> Result<()> {
@@ -87060,7 +86635,6 @@ fn test_foreach_update_comma_with_a_navigating_pipe_and_a_literal_keeps_the_regi
 /// register's node; the fold used to refuse (`Invalid path expression with result 5`) because the
 /// comma was opaque to the register read, which #3941's per-sibling read now sees through.
 /// Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_extract_after_a_comma_update_ending_in_a_literal_3933() -> Result<()> {
     assert_path_rows_3289(&[
@@ -87103,7 +86677,6 @@ fn test_foreach_extract_after_a_comma_update_ending_in_a_literal_3933() -> Resul
 /// literal's EXTRACT ran register-less, the `try` swallowed the refusal and the write was
 /// silently skipped. An EXTRACT with no `try` still raises on the pipe sibling's output, as in
 /// jq. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_comma_with_a_non_navigating_pipe_sibling_keeps_the_register_3959(
 ) -> Result<()> {
@@ -87173,7 +86746,6 @@ fn test_foreach_update_comma_with_a_non_navigating_pipe_sibling_keeps_the_regist
 /// is a valid input for it and over `.`, for `del`, `=` and `path`. Every row captured from
 /// jq 1.7.1 with `-c`. A comma written `(A), (B)` holds parenthesised siblings, and `(now)` is
 /// `now`: the last rows spell it that way.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_comma_with_a_bare_builtin_sibling_3960() -> Result<()> {
     let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
@@ -87653,7 +87225,6 @@ fn test_foreach_update_comma_with_a_bare_builtin_sibling_3960() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_comma_bare_builtin_exclusions_characterize_3960() -> Result<()> {
     let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
@@ -87708,7 +87279,6 @@ fn test_foreach_update_comma_bare_builtin_exclusions_characterize_3960() -> Resu
 /// leaving it (#3960), and the `try` swallowed the refusal into a skipped write with exit 0:
 /// `del(...)` echoed the document and `path(...)` printed nothing. Every row captured from jq
 /// 1.7.1 with `-c`, for `del`, `=` and `path`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_register_neutral_shapes_leave_the_register_4028() -> Result<()> {
     let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
@@ -88009,7 +87579,6 @@ fn test_foreach_update_register_neutral_shapes_leave_the_register_4028() -> Resu
 /// sibling that navigated and then computed (`(.a|length)`) has moved the register, a pipe stage
 /// that navigates is a navigation, and jq refuses all of them too. Every row captured from jq
 /// 1.7.1 with `-c`, for `del`, `=` and `path`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_register_neutral_shapes_after_a_navigating_comma_4041() -> Result<()> {
     let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
@@ -88424,7 +87993,6 @@ fn test_foreach_update_register_neutral_shapes_after_a_navigating_comma_4041() -
 /// written through where jq raises `Cannot index number with string "b"`: jq names both paths and
 /// the second `setpath` meets the number the first one wrote. Every row captured from jq 1.7.1
 /// with `-c`, for `=` and `path`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_pipe_into_a_comma_with_a_navigating_sibling_keeps_the_register_4059(
 ) -> Result<()> {
@@ -88902,7 +88470,6 @@ fn test_foreach_update_pipe_into_a_comma_with_a_navigating_sibling_keeps_the_reg
 /// number the first one wrote. The fold used to read the branch as being at its own register by
 /// the equal `null` alone, and then (since #4059) not at all, so a path was dropped and the write
 /// that remained landed where jq raises. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_navigated_then_computed_sibling_moves_the_register_4063() -> Result<()> {
     let null_doc = r#"{"a":null,"z":{"b":1}}"#;
@@ -89063,7 +88630,6 @@ fn test_foreach_update_navigated_then_computed_sibling_moves_the_register_4063()
 /// lost; a trailing `| .` made the pipe read as opaque. A path jq names was dropped and the write
 /// that remained landed where jq raises `Cannot index number with string "b"`. Every row captured
 /// from jq 1.7.1 with `-c`, on both a `null` source and a document.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_null_source_register_shapes_keep_the_register_4063() -> Result<()> {
     let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
@@ -89673,7 +89239,6 @@ fn test_foreach_update_null_source_register_shapes_keep_the_register_4063() -> R
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_navigating_handler_then_stage_answers_4071() -> Result<()> {
     let doc = r#"{"a":{"b":{"b":3}},"z":1}"#;
@@ -89748,7 +89313,6 @@ fn test_foreach_update_navigating_handler_then_stage_answers_4071() -> Result<()
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_unprovable_register_stage_4071() -> Result<()> {
     let doc = r#"{"a":{"b":{"b":3}},"z":1}"#;
@@ -89815,7 +89379,6 @@ fn test_foreach_update_unprovable_register_stage_4071() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_navigated_then_def_keeps_the_register_lost_at_the_node_4252() -> Result<()> {
     let obj = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
@@ -89894,7 +89457,6 @@ fn test_foreach_update_navigated_then_def_keeps_the_register_lost_at_the_node_42
 /// whole document and `del` deleted it, where jq raises. A `reduce` source is backtracked, so it
 /// answers the root in jq too, as does a plain bind with no destructure behind it. Every row
 /// captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_plain_bind_before_a_destructure_refuses_4187() -> Result<()> {
     let doc = r#"{"a":false,"b":null}"#;
@@ -89984,7 +89546,6 @@ fn test_foreach_source_plain_bind_before_a_destructure_refuses_4187() -> Result<
 /// source is backtracked, so it answers the root in jq too, and a chain with a bare `$var`
 /// alternative (`. as {a:$a} ?// $a`) is left to the by-value drive, which matches jq there. Every
 /// row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_destructuring_chain_on_the_register_refuses_4187() -> Result<()> {
     let doc = r#"{"a":[1]}"#;
@@ -90057,7 +89618,6 @@ fn test_foreach_source_destructuring_chain_on_the_register_refuses_4187() -> Res
 /// `=`/`|=` wrote at `[]` (`9` where jq writes `{"a":9}`). Such a source is now placed by the
 /// resolver. A register that is not `null` is untouched: the chain is left to the by-value drive
 /// there, which raises where jq does. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_bare_alternative_chain_on_a_null_register_4417() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -90219,7 +89779,6 @@ fn test_foreach_source_bare_alternative_chain_on_a_null_register_4417() -> Resul
 /// chain that binds the register now holds it on the retry, so the source is placed by the
 /// resolver. Not inside another fold's body, where `.` is the accumulator. Every jq side captured
 /// from jq 1.7.1 (the refusals' wording differs from jq's, as the other source rows do).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_later_bare_alternative_destructure_4320() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -90346,7 +89905,6 @@ fn test_foreach_source_later_bare_alternative_destructure_4320() -> Result<()> {
 /// is, instead of answering the root. A register that is not `null`, a source whose chain follows a
 /// stage that is not the register (`1 |`), and a chain under a `reduce` keep the by-value drive.
 /// Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_bare_alternative_chain_behind_register_stages_4420() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -90539,7 +90097,6 @@ fn test_foreach_source_bare_alternative_chain_behind_register_stages_4420() -> R
 /// by-value drive. A `try` around the wrapper is not routed either (it still prints `[]` twice
 /// where jq prints it once: routing it accepted a `del` jq refuses). Every row captured from jq
 /// 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_bare_alternative_chain_under_first_limit_4483() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -90663,7 +90220,6 @@ fn test_foreach_source_bare_alternative_chain_under_first_limit_4483() -> Result
 /// raises on each (`del` deleted it, `=` replaced it): it is placed by the resolver and refuses, or
 /// answers on `null`. A chain with a bare alternative keeps the by-value drive on a register that
 /// is not `null` (#3279's retry rules). Every jq side captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_pipe_head_of_a_chain_4424() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -90760,7 +90316,6 @@ fn test_foreach_source_pipe_head_of_a_chain_4424() -> Result<()> {
 /// on a document the chain never reaches (`[]`, `null`), behind `first`/`limit`/`try`, in a nested
 /// `reduce`, over a moved foreach INIT, and over a source that yields two elements. Every jq side
 /// captured from jq 1.7.1 with `-c`; the message is pinned only as the common prefix.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_pipe_chain_in_a_reduce_update_4484() -> Result<()> {
     macro_rules! chain {
@@ -90854,7 +90409,6 @@ fn test_foreach_source_pipe_chain_in_a_reduce_update_4484() -> Result<()> {
 /// document answer, as does a `reduce` whose source cannot move the register (`reduce (1)`) over a
 /// document the destructure can index. Every jq side captured from jq 1.7.1 with `-c`; the
 /// message is pinned only as the common prefix.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_later_bare_alternative_in_a_reduce_update_4507() -> Result<()> {
     macro_rules! chain {
@@ -90923,7 +90477,6 @@ fn test_foreach_source_later_bare_alternative_in_a_reduce_update_4507() -> Resul
 /// `.a`, so the path is `["a"]`. Contrasts: a pipe that ends in a navigation, and an `if` with a
 /// branch that is not the register, raise on the other node. Every jq side captured from jq
 /// 1.7.1 with `-c`; the message is pinned only as the common prefix.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_held_var_behind_a_pipe_or_if_4514() -> Result<()> {
     const RAISES: &str = "Invalid path expression";
@@ -91025,7 +90578,6 @@ fn test_foreach_source_held_var_behind_a_pipe_or_if_4514() -> Result<()> {
 /// expression, so the by-value drive answered the root (`path` printed `[]`, `del` returned
 /// `null`). On `null` the first step succeeds and the register moves onto `.a`. Every jq side
 /// captured from jq 1.7.1 with `-c`; the message is pinned only as the common prefix.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_register_behind_first_last_limit_and_as_an_argument_4514() -> Result<()> {
     const RAISES: &str = "Invalid path expression";
@@ -91159,7 +90711,6 @@ fn test_foreach_source_register_behind_first_last_limit_and_as_an_argument_4514(
 /// chain under `try`/`?`, whose refusal the resolver took for a guess a `try` swallows, refuses as
 /// jq does: the pipe of registers is the register for a chain with no bare alternative to retry
 /// onto. Every jq side captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_register_through_def_comma_and_nested_foreach_4424() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -91318,7 +90869,6 @@ fn test_foreach_source_register_through_def_comma_and_nested_foreach_4424() -> R
 /// marker from the source's spine walk, so the by-value drive answered the root (`del` deleted the
 /// document, `=` replaced it). The marker is now read through the wrappers that hand their operand's
 /// value on. Every jq side captured from jq 1.7.1 (the refusals' wording differs from jq's).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_marker_behind_a_value_wrapper_destructures_4320() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -91460,7 +91010,6 @@ fn test_foreach_source_marker_behind_a_value_wrapper_destructures_4320() -> Resu
 /// emit a non-register leaf too (`limit(2; $x, 1)`, `last($x, 1)`: still a raise, from the leaf
 /// `1`), a member `$x`, `nth(1; $x)` (no output at all) and the same on `null`, where the walk
 /// succeeds. Every row captured from jq 1.7.1; succinctly's wording differs for the refusals.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_marker_behind_nested_wrappers_4320() -> Result<()> {
     let wrappers = [
@@ -91617,7 +91166,6 @@ fn test_foreach_source_marker_behind_nested_wrappers_4320() -> Result<()> {
 /// fold destructuring an outer fold's item. Every row captured from jq 1.7.1 with `-c`; where
 /// succinctly's message differs (the mixed chain's other order names the step, not the result)
 /// only the shared prefix is pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_destructure_behind_a_chain_bind_if_or_def_refuses_4278() -> Result<()> {
     let doc = r#"{"a":false,"b":null}"#;
@@ -91912,7 +91460,6 @@ fn test_foreach_source_destructure_behind_a_chain_bind_if_or_def_refuses_4278() 
 /// body refused where jq answers (`destructure-comma-marker-nav` in the bind-origin sweep).
 /// The last two rows keep refusing, as in jq: with a plain bind the first sibling's `$y[0]`
 /// is a path error of its own. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructure_comma_with_a_navigating_pipe_keeps_the_register_3941() -> Result<()> {
     let doc = r#"{"a":[1,2,3],"b":{"c":5}}"#;
@@ -91982,7 +91529,6 @@ fn test_destructure_comma_with_a_navigating_pipe_keeps_the_register_3941() -> Re
 /// for such a comma, so the pipe sibling's `$w` could not re-establish it, `try` swallowed that
 /// refusal and a write through the UPDATE was silently skipped. A plain navigation no longer
 /// withholds it. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_try_comma_with_a_navigating_sibling_keeps_the_register_3932() -> Result<()> {
     let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}],"b":2}}"#;
@@ -92110,7 +91656,6 @@ fn test_foreach_update_try_comma_with_a_navigating_sibling_keeps_the_register_39
 /// dropped the path or write; jq prints `["x","c"]` and then raises `Invalid path expression`
 /// (exit 5) for `path`, raises for `del`, and writes through the rows where the condition itself
 /// raises on the accumulator. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_try_comma_select_sibling_keeps_the_register_3974() -> Result<()> {
     let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}],"b":2,"c":[5,6]}}"#;
@@ -92175,7 +91720,6 @@ fn test_foreach_update_try_comma_select_sibling_keeps_the_register_3974() -> Res
 /// Both rows were refusals in `test_recurse_seed_residuals_stay_loud_3580` until a comma
 /// sibling that navigates stopped withholding the register. Captured from jq 1.7.1 with `-c`
 /// against the #2764 document.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_comma_with_a_recursion_sibling_answers_3932() -> Result<()> {
     assert_rows_2764(&[
@@ -92197,7 +91741,6 @@ fn test_foreach_comma_with_a_recursion_sibling_answers_3932() -> Result<()> {
 /// #3862: a comma sibling states the register on its own, outside a fold's UPDATE too -- a
 /// pipe stage's `first(2, 3)` (a generator of literals) left the register in place for jq and
 /// was refused until each sibling was asked for itself. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_comma_siblings_state_the_register_on_their_own_3862() -> Result<()> {
     let doc = r#"{"a":1}"#;
@@ -92230,7 +91773,6 @@ fn test_comma_siblings_state_the_register_on_their_own_3862() -> Result<()> {
 /// is the alternate's own operand: a left operand that is falsy or empty, navigating or not,
 /// leaves the alternate answered; a *truthy* navigating left still refuses a `$k` that sits
 /// after the navigation. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_bare_var_alternate_keeps_the_register_3788() -> Result<()> {
     let doc = r#"{"a":{"c":1}}"#;
@@ -92378,7 +91920,6 @@ fn test_foreach_update_bare_var_alternate_keeps_the_register_3788() -> Result<()
 /// jq backtracked out of the left operand, so an alternate that leaves the register
 /// alone states the register the stage entered with ([`carry_frame_register`]), and the
 /// stage reads that statement per output. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_alternate_shapes_keep_the_register_3906() -> Result<()> {
     let doc = r#"{"a":{"c":1}}"#;
@@ -92617,7 +92158,6 @@ fn test_foreach_update_alternate_shapes_keep_the_register_3906() -> Result<()> {
 /// register, so both now answer `["a"]`, as in jq.
 /// (`(($k | .b), first($k))`, a comma with a navigating sibling, answers since #3932: see
 /// `test_foreach_update_try_comma_with_a_navigating_sibling_keeps_the_register_3932`.)
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_alternate_first_wrapper_keeps_the_register_4028() -> Result<()> {
     let doc = r#"{"a":{"c":1}}"#;
@@ -92645,7 +92185,6 @@ fn test_foreach_update_alternate_first_wrapper_keeps_the_register_4028() -> Resu
 /// is C-coded: none of them leaves jq's path register anywhere but where the
 /// stage entered it, so a `$x` frozen there re-establishes it after the stage
 /// and a write through it lands. Every row captured from jq 1.7.1 with `-c`.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()> {
     assert_path_rows_3289(&[
@@ -92951,7 +92490,6 @@ fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_path_register_more_by_value_builtins_do_not_move_it_3711() -> Result<()> {
     let objs = r#"[{"a":1},{"a":2}]"#;
@@ -93229,7 +92767,6 @@ fn test_path_register_more_by_value_builtins_do_not_move_it_3711() -> Result<()>
 /// `walk(select(type != "array"))`); the check that already raised for every
 /// value it *produced* never ran for none. An input with no object (`[1]`,
 /// `1`, `[]`, `null`) answers nothing, as in jq.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_from_entries_and_an_empty_walk_raise_in_path_position_3360() -> Result<()> {
     let kv = r#"[{"key":"a","value":1}]"#;
@@ -93320,7 +92857,6 @@ fn test_from_entries_and_an_empty_walk_raise_in_path_position_3360() -> Result<(
 /// never reached the resolver's post-evaluation checks. Every expected value
 /// was captured from jq 1.7.1 with `-c`; the message is only the prefix, since
 /// the container a refusal names is the documented approximation of #3271.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_foreach_source_that_always_raises_raises_in_path_position_3726() -> Result<()> {
     let iterate = "Invalid path expression near attempt to iterate through";
@@ -93581,7 +93117,6 @@ fn test_reduce_foreach_source_that_always_raises_raises_in_path_position_3726() 
 /// the first document and reports it at line 1 of the three, which is what this
 /// pins (the position is jq 1.7.1's own, captured live); the plain
 /// `reduce inputs` source takes no such route and answers the root path.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_source_with_a_refusing_construct_does_not_drain_inputs_3726() -> Result<()> {
     let docs = "[1]\n[2]\n[3]\n";
@@ -93623,7 +93158,6 @@ fn test_reduce_source_with_a_refusing_construct_does_not_drain_inputs_3726() -> 
 /// An array or an object does not take this route: `map(w)` rebuilds the
 /// container, so the trailing `| f` runs on a computed value, and jq refuses
 /// where the by-value route still judges it.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_walk_over_a_scalar_is_f_in_path_position_3713() -> Result<()> {
     // Input, filter, jq 1.7.1's stdout (captured, never recalled).
@@ -93843,7 +93377,6 @@ fn test_walk_over_a_scalar_is_f_in_path_position_3713() -> Result<()> {
 /// every context that drives a leaf (a collect then a `try`, `try walk`, a `reduce`
 /// or `foreach` source, `del`, `|=`); every row is captured from jq 1.7.1
 /// (exit, stdout).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_walk_over_an_array_that_produces_raises_where_jq_raises_3723() -> Result<()> {
     const NAV: &str = r#"if type == "array" then .[0] else . end"#;
@@ -93893,7 +93426,6 @@ fn test_walk_over_an_array_that_produces_raises_where_jq_raises_3723() -> Result
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_walk_over_an_array_that_produces_stays_silent_for_a_body_jq_answers_3723() -> Result<()> {
     for (input, body) in [
@@ -93916,7 +93448,6 @@ fn test_walk_over_an_array_that_produces_stays_silent_for_a_body_jq_answers_3723
 /// The one #3723 shape the shipped resolver answered where jq raises: a collect
 /// that holds a `getpath` was evaluated by value (#2759), so nothing in it was
 /// path-checked. The path-mode interpreter (#5223) raises as jq 1.7.1 does.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_walk_over_an_array_getpath_collect_raises_as_jq_does_3723() -> Result<()> {
     let filter = r#"path(. as $x | [walk(getpath(["a"])?)] | try .[0])"#;
@@ -93943,7 +93474,6 @@ fn test_walk_over_an_array_getpath_collect_raises_as_jq_does_3723() -> Result<()
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_walk_over_an_array_observes_trailing_f_inline_3736() -> Result<()> {
     for (input, filter, code, want_stdout) in [
@@ -93984,7 +93514,6 @@ fn test_walk_over_an_array_observes_trailing_f_inline_3736() -> Result<()> {
 /// delivering any output, so `first(path(walk(debug, debug)))` over
 /// `[null,[null]]` printed 8 `DEBUG` lines. The path-mode interpreter (#5223)
 /// runs `walk` as jq's own definition and prints jq 1.7.1's 7.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_walk_over_an_array_root_f_debugs_as_jq_does_under_first_3736() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -94007,7 +93536,6 @@ fn test_walk_over_an_array_root_f_debugs_as_jq_does_under_first_3736() -> Result
 /// runs `f` on `[null]`'s element and then on the rebuilt `[]`, so `debug` fires
 /// twice (a probe on top of the by-value pass printed four lines). Each row is
 /// captured from jq 1.7.1: same stdout (none), same exit, same stderr bytes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_walk_over_an_array_does_not_rerun_an_f_with_effects_3713() -> Result<()> {
     for (filter, want_stderr) in [
@@ -94110,7 +93638,6 @@ fn test_walk_over_an_array_does_not_rerun_an_f_with_effects_3713() -> Result<()>
 /// object value, a `limit` count, an `if` condition, a `try` or a `?` (where
 /// jq suspends path tracking) is routed too; those rows pin that it still
 /// matches jq. Every row was captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_destructuring_bind_is_path_tracked_3489() -> Result<()> {
     assert_path_rows_3289(&[
@@ -94687,7 +94214,6 @@ fn test_fold_source_destructuring_bind_is_path_tracked_3489() -> Result<()> {
 /// register-preserving sources the by-value drive already answers like jq
 /// (`select(true)`, `first(.)`, `limit(1; .)`, a bare `.`) are pinned unchanged.
 /// Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_destructuring_over_a_builtin_that_builds_a_fresh_value_3745() -> Result<()> {
     assert_path_rows_3289(&[
@@ -94941,7 +94467,6 @@ fn test_fold_source_destructuring_over_a_builtin_that_builds_a_fresh_value_3745(
 /// is reported at line 1 of the three documents, and a later `input` still
 /// sees the second one. Both are jq 1.7.1's output; the base drained the
 /// reader (`break`) or answered `[]`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_destructuring_does_not_drain_inputs_3489() -> Result<()> {
     let docs = "[1]\n[2]\n[3]\n";
@@ -94978,7 +94503,6 @@ fn test_fold_source_destructuring_does_not_drain_inputs_3489() -> Result<()> {
 /// the stage was judged as a whole and each refused. The `(empty, 1)` control
 /// matched jq throughout; the `(.a, 1)` row is the other side of the rule (the
 /// `.a` branch moved the register, so jq refuses and so does this build).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_register_compound_stage_states_its_register_per_branch_3644() -> Result<()> {
     assert_path_rows_3289(&[
@@ -95051,7 +94575,6 @@ fn test_path_register_compound_stage_states_its_register_per_branch_3644() -> Re
 /// document unchanged) was one when this was written; it is pinned in
 /// `test_and_or_path_by_value_operands_track_the_register_3428` and, with the
 /// rest of its family, in `test_try_around_and_or_by_value_operand_answers_as_jq_3645`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_register_by_value_operand_refusals_stay_refused_3456() -> Result<()> {
     let refused = "Invalid path expression";
@@ -95119,7 +94642,6 @@ fn test_path_register_by_value_operand_refusals_stay_refused_3456() -> Result<()
 /// refuses too, at `PATH_END` after the `try` has already returned, so no `try`
 /// may catch them; they pin the `with result` wording both sides share, which the
 /// resolver's by-value guess does not use for an exact refusal.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_try_around_and_or_by_value_operand_answers_as_jq_3645() -> Result<()> {
     let with_true = "Invalid path expression with result true";
@@ -95234,7 +94756,6 @@ fn test_try_around_and_or_by_value_operand_answers_as_jq_3645() -> Result<()> {
 /// navigation against the register `L` moved. Every operand's branch now says
 /// what became of the register, and `R` runs from that. Every row is captured
 /// from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_and_or_path_by_value_operands_track_the_register_3428() -> Result<()> {
     let near_b = r#"Invalid path expression near attempt to access element "b" of [true]"#;
@@ -95462,7 +94983,6 @@ fn test_and_or_path_by_value_operands_track_the_register_3428() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_path_register_range_and_paths_do_not_move_it_3456() -> Result<()> {
     assert_path_rows_3289(&[
@@ -95550,7 +95070,6 @@ fn test_path_register_range_and_paths_do_not_move_it_3456() -> Result<()> {
 /// #3456: `has(k)` is C-coded, and a C builtin's arguments are subexps, so
 /// even a navigating `k` leaves jq's register where it entered. Every row
 /// captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_register_has_does_not_move_it_3456() -> Result<()> {
     assert_path_rows_3289(&[
@@ -95606,7 +95125,6 @@ fn test_path_register_has_does_not_move_it_3456() -> Result<()> {
 /// same resolution, so the missing refusal was a **refused edit reported as
 /// a successful no-op** -- the document came back unchanged at exit 0 where
 /// jq exits 5. Captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_write_refuses_navigation_inside_and_or_negate_on_untracked_input_2760() -> Result<()> {
     let doc = r#"{"a":false}"#;
@@ -95637,7 +95155,6 @@ fn test_write_refuses_navigation_inside_and_or_negate_on_untracked_input_2760() 
 /// navigation at all, and a `TrackedVar` operand, correctly certified (or
 /// declined) by `resolve_node_sink`'s own dedicated `Expr::TrackedVar` arm
 /// rather than by any exclusion here. All captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_and_or_negate_on_untracked_input_boundary_2760() -> Result<()> {
     for (filter, doc) in [
@@ -95666,7 +95183,6 @@ fn test_and_or_negate_on_untracked_input_boundary_2760() -> Result<()> {
 /// and the two error controls were captured from /usr/bin/jq 1.7.1.
 /// `paths(filter)` evaluates this shape through its eager root pre-check
 /// instead of this resolver arm; that remaining divergence is #3366.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_negate_path_arm_retry_does_not_resurrect_a_resolved_error_3299() -> Result<()> {
     let operand = "[1] as $a ?// $b | if $a == null then 1 else $a end";
@@ -95725,7 +95241,6 @@ fn test_negate_path_arm_retry_does_not_resurrect_a_resolved_error_3299() -> Resu
 /// `{"a":false}` raises "near attempt to access element \"a\"" (exit 5);
 /// this arm was accepting it (exit 0) before the fix, the same
 /// accept-where-jq-refuses shape #2760 closed for `and`/`or`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_array_tracked_var_exclusion_does_not_blind_sibling_navigation_3290() -> Result<()> {
     let doc = r#"{"a":false}"#;
@@ -95749,7 +95264,6 @@ fn test_array_tracked_var_exclusion_does_not_blind_sibling_navigation_3290() -> 
 /// #3290 seen from the side that does damage: `del()`/`|=` consume the same
 /// resolution, so the missing refusal was a **refused edit reported as a
 /// successful no-op**. Captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_array_tracked_var_exclusion_write_position_3290() -> Result<()> {
     let doc = r#"{"a":false}"#;
@@ -95777,7 +95291,6 @@ fn test_array_tracked_var_exclusion_write_position_3290() -> Result<()> {
 /// register-carry case (`[$v0]` alone lets a later `$v0.a` navigate through
 /// the carried register, #2759/#3263) stays correct with the exclusion gone.
 /// All captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_array_tracked_var_alone_stays_accepted_3290() -> Result<()> {
     for (filter, doc, expected) in [
@@ -95922,7 +95435,6 @@ fn test_map_path_context_scalar_target_still_raises_in_jq_mode_2375() -> Result<
 /// constructs: `foreach` streams the first fork's outputs *before* raising,
 /// `reduce` emits nothing (its own final-emission check raises on the first
 /// fork already, before the second is ever entered).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_init_fork_source_sees_null_ambient_2388() -> Result<()> {
     const DOC: &str = r#"{"a":1,"c":2}"#;
@@ -96012,7 +95524,6 @@ fn test_foreach_init_fork_source_sees_null_ambient_2388() -> Result<()> {
 /// Pinned separately from the case list above because it is the one row whose
 /// *exit code and stdout were already right* -- only the wording moved, so a
 /// test that checked exit codes alone would not have caught it.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_init_fork_error_operand_is_null_2388() -> Result<()> {
     let (stdout, stderr, code) = run_jq_stdin_streams(
@@ -96041,7 +95552,6 @@ fn test_foreach_init_fork_error_operand_is_null_2388() -> Result<()> {
 /// (the register moved off root, and the ambient is still the document) and
 /// streams nothing at all, which is the row that proves the change is keyed
 /// on the fork index rather than on "INIT navigated somewhere".
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_init_fork_unchanged_rows_2388() -> Result<()> {
     const DOC: &str = r#"{"a":1,"c":2}"#;
@@ -96112,7 +95622,6 @@ fn test_fold_init_fork_unchanged_rows_2388() -> Result<()> {
 /// twice -- the same fabrication class, one level down. The third row is the
 /// near-miss control: a `null` *somewhere in* the document is not the same as
 /// a `null` at the register.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_init_fork_null_register_still_tracks_2388() -> Result<()> {
     // Register is the document root, and the document is `null`.
@@ -96765,7 +96274,6 @@ fn test_jq_mode_null_ordering_keeps_total_order_2483() -> Result<()> {
 /// #3207: #3125's identical-null/bool carve-out is gated to jq mode, and jq
 /// mode must keep it -- `del()` of the identical literal deletes the root, the
 /// same `[]` path `path(null)` answers. Captured against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_jq_mode_del_identical_null_bool_literal_deletes_root_3207() -> Result<()> {
     for (doc, filter, expected) in [
@@ -96824,7 +96332,6 @@ fn assert_rows_3579(rows: &[(&str, &str, &str, &str, i32)]) -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
     assert_rows_3579(&[
@@ -96955,7 +96462,6 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_terminal_null_carve_out_keeps_its_answers_3579() -> Result<()> {
     assert_rows_3579(&[
@@ -97056,7 +96562,6 @@ fn test_terminal_null_carve_out_keeps_its_answers_3579() -> Result<()> {
 /// exactly as jq answers, including under `try` and `?`. The #3579 pins now wrap a
 /// `def` call (`first(def f: 7; f)`), which the allowlist still cannot read. Every row
 /// captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_terminal_null_wrapper_over_a_constant_answers_3767() -> Result<()> {
     assert_rows_3579(&[
@@ -97570,7 +97075,6 @@ fn test_jq_update_filter_position_is_a_succinctly_extension_2522() -> Result<()>
 /// jq answers `key/0 is not defined`), pinned so the route change is readable
 /// as "same answers, different route": every one of them is unchanged from
 /// before #2563, which is the whole claim.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_as_binding_keeps_the_input_identity_2563() -> anyhow::Result<()> {
     let doc = r#"{"a":{"b":1},"c":[10,20],"n":0,"m":1,"s":"hi"}"#;
@@ -98092,7 +97596,6 @@ fn test_walk_residue_constructs_jq_2416() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_computed_bracket_head_is_walkable_2471() -> anyhow::Result<()> {
     let doc = r#"{"a":{"b":1},"c":[10,20],"n":0,"m":1,"s":"hi","k":"b","neg":-1}"#;
@@ -99596,7 +99099,6 @@ fn test_alternative_raises_only_when_it_reads_the_document_2173() -> Result<()> 
 /// register quirk `. as {a:$q} | ...` (jq's destructuring bind moves its
 /// register in a way plain `as $x` does not) has its own matrix in
 /// [`test_destructuring_moves_path_register_2649`] below.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_through_bound_variable_matches_jq_2072() -> Result<()> {
     let input = r#"{"a":[1,2,3]}"#;
@@ -99676,7 +99178,6 @@ fn test_path_through_bound_variable_matches_jq_2072() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_destructuring_moves_path_register_2649() -> Result<()> {
     let d = r#"{"a":[1,2,3],"b":{"c":5}}"#;
@@ -100033,7 +99534,6 @@ fn test_destructuring_moves_path_register_2649() -> Result<()> {
 /// register, destructuring its own element moves the register exactly the
 /// way the path-mode walk (`PathPatternMode`) already models. Every row below was captured live
 /// against `/usr/bin/jq` 1.7.1 on 2026-09-13.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_destructuring_pattern_moves_path_register_2676() -> Result<()> {
     let d = r#"{"a":[1,2,3],"b":{"c":5}}"#;
@@ -100197,7 +99697,6 @@ fn test_fold_destructuring_pattern_moves_path_register_2676() -> Result<()> {
 /// (`{("a","b"):$q}`) fans out one full pattern-match per key output, as
 /// real jq does -- `test_pattern_computed_key_fans_out_in_value_position_2677`
 /// and the #2872 tests below.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_pattern_computed_key_evaluates_2677() -> Result<()> {
     // Control: a plain literal key is completely unaffected.
@@ -100429,7 +99928,6 @@ fn test_pattern_computed_key_fans_out_in_value_position_2677() -> Result<()> {
 
 /// #2873 (PR #2677 review): four bugs found and fixed in code review, each
 /// confirmed live against jq 1.7.1 before the fix and pinned here after.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_pattern_computed_key_review_fixes_2873() -> Result<()> {
     for (input, filter, expected) in [
@@ -100503,7 +100001,6 @@ fn test_pattern_computed_key_review_fixes_2873() -> Result<()> {
 /// other than exactly one output -- through an ordinary *catchable* error,
 /// which `?//` read as "this alternative did not match" and answered
 /// wrongly: the first row was `{"a":"X","c":2}`, a silently dropped write.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_pattern_computed_key_fans_out_in_path_position_2872() -> Result<()> {
     for (input, filter, expected) in [
@@ -100661,7 +100158,6 @@ fn test_pattern_computed_key_fans_out_in_path_position_2872() -> Result<()> {
 /// #2677 shipped got every one of these wrong. Every row confirmed live
 /// against jq 1.7.1; stderr is compared exactly (the `stderr` builtin's
 /// markers are the observable order).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_pattern_computed_key_matcher_is_lazy_2872() -> Result<()> {
     // A key the consumer never asks for must not run: `first` stops after
@@ -100799,7 +100295,6 @@ fn test_pattern_computed_key_matcher_is_lazy_2872() -> Result<()> {
 /// row confirmed live against jq 1.7.1. Until #2872 the fold bound its
 /// pattern through a catchable "not yet supported" refusal, which `?//` and
 /// `try` read as a match failure: the first two rows answered `0` and `1`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_pattern_computed_key_fans_out_in_folds_2872() -> Result<()> {
     for (input, filter, expected) in [
@@ -100920,7 +100415,6 @@ fn test_pattern_computed_key_fans_out_in_folds_2872() -> Result<()> {
 /// runs, a refusal inside either run, more than 16 bindings (the linear
 /// duplicate-name check), and the owned-identity pipe's stop and escape
 /// arms. Every row confirmed live against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_pattern_computed_key_walker_shapes_2872() -> Result<()> {
     for (input, filter, expected) in [
@@ -103211,7 +102705,6 @@ fn test_literal_inside_pipe_operand_does_not_abort_2771() -> Result<()> {
 /// #2771 review: three shapes that must stay exactly as they were, so the
 /// fix above is proven to add coverage rather than widen it. All three
 /// confirmed live against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_literal_inside_pipe_operand_must_not_change_shapes_2771() -> Result<()> {
     let input = r#"{"a":{"b":1}}"#;
@@ -103250,7 +102743,6 @@ fn test_literal_inside_pipe_operand_must_not_change_shapes_2771() -> Result<()> 
 /// but structurally different document. jq's `jv_identical` refuses every
 /// one of these; before this fix succinctly's value-equality-only
 /// certification wrongly admitted them. Captured live against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{a:1}`/`{b:2}` are not formatting strings;
 // clippy cannot tell the two apart from the brace shape alone.
@@ -103309,7 +102801,6 @@ fn test_tracked_var_refuses_a_rebuilt_root_2642() -> Result<()> {
 /// pinned against `..`'s own output instead, which succinctly's own
 /// `Builtin::RecurseDown => builtin_recurse(...)` aliasing makes the correct
 /// comparison.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bare_recurse_family_order_unchanged_by_lazy_sink_2696() -> Result<()> {
     let doc = r#"{"a":[1,{"b":2}],"c":3}"#;
@@ -103327,7 +102818,6 @@ fn test_bare_recurse_family_order_unchanged_by_lazy_sink_2696() -> Result<()> {
 /// `Untracked`, never the reverse), so a regression here would mean the
 /// demotion fired somewhere it structurally cannot be correct. Captured
 /// live against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{a:1}`/`{b:2}` are not formatting strings;
 // clippy cannot tell the two apart from the brace shape alone.
@@ -103402,7 +102892,6 @@ fn test_tracked_var_rebuilt_root_fix_does_not_over_demote_2642() -> Result<()> {
 /// the path is the one navigated inside the `path()` call, so this row was
 /// never even the same *answer* as its siblings. Closed by #3177 -- see
 /// [`test_owned_embed_navigated_inside_path_argument_3177`].
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_tracked_var_owned_embed_residual_closed_3177() -> Result<()> {
     let filter = ". as $x | [.] | path(.[0] | $x)";
@@ -103430,7 +102919,6 @@ fn test_tracked_var_owned_embed_residual_closed_3177() -> Result<()> {
 /// every wider spelling -- `[.,.]`, `{k:.}`, `[[.]]`, `.[]` -- since none
 /// of those is a lazy sequence, so they are pinned here alongside. Every
 /// answer captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{k:.}` are not formatting strings; clippy cannot
 // tell the two apart from the brace shape alone.
@@ -103508,7 +102996,6 @@ fn test_owned_embed_navigated_inside_path_argument_3177() -> Result<()> {
 /// from their input's own children in jq, and a literal `getpath` answers a
 /// node, so an embed of `$x` keeps its identity through them. Every
 /// expected output captured live against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_owned_embed_identity_through_relocating_builtins_3178() -> Result<()> {
@@ -103752,7 +103239,6 @@ fn test_owned_embed_identity_through_relocating_builtins_3178() -> Result<()> {
 /// the root and after a real navigation step. A partial or empty-array
 /// slice still refuses, since neither is `jv_identical` to anything. Every
 /// expected output captured live against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_full_range_slice_keeps_node_identity_3306() -> Result<()> {
@@ -103848,7 +103334,6 @@ fn test_full_range_slice_yq_mode_style_unaffected_3306() -> Result<()> {
 /// root resolves that target over the caller's own tree, as `path(f)` does
 /// since #3177, so `del`, `=`, `|=`, `op=` and `//=` answer where jq does.
 /// Every expected output captured live against jq 1.7.1 on `{"a":1}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_owned_embed_write_target_3188() -> Result<()> {
@@ -103951,7 +103436,6 @@ fn test_owned_embed_write_target_3188() -> Result<()> {
 /// a middle `.[-0.5]` step deletes inside it. `del()`'s grouping also keys by
 /// the exact number, so `.[0.5]` and `.[0]` are two groups that each rewrite
 /// element 0, run in key order. Every row captured live against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_del_fractional_index_matches_jv_dels_3302() -> Result<()> {
     for (input, filter, expected) in [
@@ -104136,7 +103620,6 @@ fn test_del_fractional_index_yq_mode_refused_4749() -> Result<()> {
 /// missing or non-number bound an error only on an array or string, start
 /// floored and end ceiled, and the key appended to a path verbatim. Every
 /// row captured live against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_object_index_key_is_a_slice_descriptor_3300() -> Result<()> {
     for (input, filter, expected) in [
@@ -104698,10 +104181,6 @@ fn test_getpath_array_segment_yq_mode_unchanged_2429() -> Result<()> {
 /// needle is `[]` (`null` for `index`/`rindex`), and a scalar pattern is the
 /// one-element needle. A `null`, object or string input still refuses an array
 /// pattern. Every expectation was captured from `/usr/bin/jq` 1.7.1.
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 #[test]
 fn test_array_pattern_is_a_subarray_search_3453() -> Result<()> {
     for (input, filter, expected) in [
@@ -104824,7 +104303,6 @@ fn test_array_key_yq_mode_unchanged_3453() -> Result<()> {
 /// key earlier in the path is rewritten with `setpath`. The wording depends on
 /// *which* component is the key and what the filter does, so every row below
 /// was captured from `/usr/bin/jq` 1.7.1 rather than derived.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_array_key_in_path_and_write_position_3506() -> Result<()> {
     for (input, filter, expected) in [
@@ -105338,7 +104816,6 @@ const NTH_LITERAL_ROWS_3550: [(&str, &str, &str); 8] = [
 /// generator, so a comma fans out; a `null` input names the position
 /// (`null | path(nth(1))` is `[1]`, not `[]`). Every row was captured from
 /// `/usr/bin/jq` 1.7.1; the error rows compare the message.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bare_nth_is_a_path_step_3550() -> Result<()> {
     for (input, filter, expected) in [
@@ -105684,7 +105161,6 @@ fn test_paths_filter_stop_reaches_a_retry_in_the_filter_3567() -> Result<()> {
 /// (`((if true then . else . end) // {..}) as {p:$x}`, jq `{"a":{"q":2}}`):
 /// `resolves_to_register` certifies it immediately, with no later value
 /// check, and its widening let a `?//` chain delete the whole document.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_try_wrapped_if_bind_source_keeps_register_3279() -> Result<()> {
     for (input, filter, expected) in [
@@ -105774,7 +105250,6 @@ fn test_try_wrapped_if_bind_source_keeps_register_3279() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_alt_destructuring_of_a_passthrough_source_under_try_never_writes_3781() -> Result<()> {
     let doc = r#"{"a":{"b":1}}"#;
@@ -105958,7 +105433,6 @@ fn test_alt_destructuring_of_a_passthrough_source_under_try_never_writes_3781() 
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_try_if_widening_does_not_leak_3279() -> Result<()> {
     for (input, filter, expected, expected_code) in [
@@ -106095,7 +105569,6 @@ fn test_try_wrapped_if_bind_source_yq_unchanged_3279() -> Result<()> {
 /// fresh literal -- still binds by value and refuses as jq does, and so does
 /// a `$v` used after the register moved. Every row captured live against jq
 /// 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_transparent_bind_source_keeps_register_3402() -> Result<()> {
     for (input, filter, expected) in [
@@ -106285,7 +105758,6 @@ fn test_transparent_bind_source_keeps_register_3402() -> Result<()> {
 /// #3402: an effect in a transparent bind source runs once, as in jq. The
 /// witness declines when a `catch` handler navigates its error value, and
 /// re-running the source by value printed `debug`'s line twice.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_transparent_bind_source_effect_runs_once_3402() -> Result<()> {
     let filter =
@@ -106333,7 +105805,6 @@ fn test_transparent_bind_source_matches_identity_bind_3402() -> Result<()> {
 /// funnel-side demotion never ran. jq's `jv_identical` refuses every one
 /// (exit 5, `Invalid path expression`); before this fix every one exited 0
 /// with a written result. Captured live against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{a:1}` are not formatting strings; clippy cannot
 // tell the two apart from the brace shape alone.
@@ -106525,7 +105996,6 @@ fn test_tracked_var_rebuilt_root_in_evaluator_routes_refuse_3036() -> Result<()>
 /// and scalars included (the values `eval.rs` cannot recover a node
 /// identity for, which is why the fix does not rely on one). Captured live
 /// against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{a:1}` are not formatting strings; clippy cannot
 // tell the two apart from the brace shape alone.
@@ -106932,7 +106402,6 @@ fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()>
 /// and a different node that merely looks equal all refuse, as does everything
 /// #3329 already refused (a literal INIT, a later fork). Both routes, every row
 /// captured live from jq 1.7.1 over `{"a":1}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{a:1}` are not formatting strings; clippy cannot
 // tell the two apart from the brace shape alone (as in the #3329 test below).
@@ -107042,7 +106511,6 @@ fn test_fold_loop_variable_rebound_by_as_3898() -> Result<()> {
 /// and source materialize separately, so INIT's own `Rc` is registered for the
 /// source to reuse) and `-n 'input | ...'` through `eval.rs`'s owned fold --
 /// and every expected value is captured from `/usr/bin/jq` 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{k:.}` are not formatting strings; clippy cannot
 // tell the two apart from the brace shape alone.
@@ -107338,7 +106806,6 @@ fn test_fold_loop_variable_in_path_position_3329() -> Result<()> {
 /// Every row runs on both routes: stdin through the generic evaluator, and
 /// `-n 'input | ...'` through `eval.rs`'s own bind sites. All rows are
 /// captured from jq 1.7.1, and every answering row refused on `main`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_update_marker_naming_the_accumulator_3181() -> Result<()> {
     let answering = [
@@ -107498,7 +106965,6 @@ fn test_fold_update_marker_naming_the_accumulator_3181() -> Result<()> {
 /// marker's recorded node the marker is the invocation root, and
 /// `Origin::Snapshot`'s value rule is sound for it. Read, and every write
 /// operator; all captured live from jq 1.7.1, all refused on `main`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{k:.a}` are not formatting strings; clippy
 // cannot tell the two apart from the brace shape alone (as `*_2642`).
@@ -107637,7 +107103,6 @@ fn test_navigated_bind_at_its_own_node_3037() -> Result<()> {
 /// because the assignment family's fallback into `eval_full` was the one
 /// funnel that never demoted a marker; `del` and `path` of the same shape
 /// refused, through the demoting funnels.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{b:1}`/`{k:.a}` are not formatting strings;
 // clippy cannot tell the two apart from the brace shape alone (as `*_2642`).
@@ -107760,7 +107225,6 @@ fn test_navigated_bind_traps_still_refuse_3037() -> Result<()> {
 /// each container back out as the storage that went in
 /// (`bridge_provenance`), so the resolver stands on `$y`'s own `Rc` at
 /// `.a`, and #3177's storage clause is jq's `jv_identical`.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 // jq filter literals like `{b:1}`/`{k:.a}` are not formatting strings;
 // clippy cannot tell the two apart from the brace shape alone (as `*_2642`).
@@ -107821,7 +107285,6 @@ fn test_navigated_bind_positional_and_owned_root_rows_answer_3069() -> Result<()
 /// That travels wherever a container's identity does, so the wrapped,
 /// `def` and `reduce` routes answer too. Every expected output captured
 /// live against jq 1.7.1.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_navigated_bind_anchor_rows_answer_3134() -> Result<()> {
@@ -107957,7 +107420,6 @@ fn test_navigated_bind_anchor_rows_answer_3134() -> Result<()> {
 /// root, the same step under another parent, or a node a write replaced --
 /// and an anchor must never certify one (the write-through direction).
 /// Captured live against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_navigated_bind_anchor_controls_refuse_3134() -> Result<()> {
@@ -108039,7 +107501,6 @@ fn test_navigated_bind_anchor_controls_refuse_3134() -> Result<()> {
 /// keeps the full comparison), nested arrays -- and the one refusal that
 /// must not turn into an answer: an equal value at another position. Every
 /// expected output captured live against jq 1.7.1.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_bound_ancestor_anchor_names_the_step_without_decoding_siblings_3483() -> Result<()> {
@@ -108118,7 +107579,6 @@ fn test_bound_ancestor_anchor_names_the_step_without_decoding_siblings_3483() ->
 /// binds (`BindOrigin::Owned`'s chain); `marker_identical`'s anchor clause
 /// reads that pair where a document bind reads the embed table. Every
 /// expected output captured live against jq 1.7.1.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_navigated_scalar_bind_on_owned_root_answers_3482() -> Result<()> {
@@ -108317,7 +107777,6 @@ fn test_navigated_scalar_bind_on_owned_root_answers_3482() -> Result<()> {
 /// second is a bound value the pipe *computed* (`+`, `ascii_downcase`,
 /// `[...]`) or picked by a rule that disagrees with jq about which element
 /// (`max`), so the identity chain is no proof of the node there.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_navigated_scalar_bind_on_owned_root_controls_refuse_3482() -> Result<()> {
@@ -108458,7 +107917,6 @@ fn test_owned_root_scalar_anchor_is_jq_mode_only_3482() -> Result<()> {
 /// value for a nested container, not only at its depth 0, so `{k:.}`'s copy
 /// of the root holds `$y`'s very value at `.a`, as jq's does. Every expected
 /// output captured live against jq 1.7.1 on `{"a":{"b":1},"c":{"b":1}}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_embed_reused_below_depth_zero_3179() -> Result<()> {
@@ -108528,7 +107986,6 @@ fn test_embed_reused_below_depth_zero_3179() -> Result<()> {
 /// in jq, and 255 are refused before any filter runs. The reuse's depth check is pinned through
 /// the library, which applies no parse limit
 /// (`jq_library_eval_nesting_depth_tests.rs`'s `test_public_eval_embed_nested_reuse_keeps_the_depth_limit_3179`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_embed_nested_reuse_keeps_the_depth_limit_3179() -> Result<()> {
@@ -108559,7 +108016,6 @@ fn test_embed_nested_reuse_keeps_the_depth_limit_3179() -> Result<()> {
 /// `eval.rs`, whose `eval_as` binds a navigated source as a plain literal;
 /// jq 1.7.1 answers on every row here (captured live). The pipe now runs on
 /// the owned identity pipe, whose position tokens name the bind's node.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_navigated_bind_on_owned_root_answers_3135() -> Result<()> {
     let two = r#"{"a":{"b":1}}
@@ -108637,7 +108093,6 @@ fn test_navigated_bind_on_owned_root_answers_3135() -> Result<()> {
 /// and a second element of an iterating source. jq 1.7.1 refuses every one
 /// (captured live), and so does succinctly -- a different `OwnedIdentity`
 /// token, not a value comparison, is what keeps them apart.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_navigated_bind_on_owned_root_traps_refuse_3135() -> Result<()> {
     let two = r#"{"a":{"b":1},"c":{"b":1}}
@@ -108690,7 +108145,6 @@ fn test_navigated_bind_on_owned_root_traps_refuse_3135() -> Result<()> {
 /// `resolve_as_pattern`'s own sibling gap (review): a bare-var pattern
 /// source (`$y as $z | ...`) reaches `resolves_to_register`'s identical
 /// `TrackedVar` arm, which had the same gap independently.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_navigated_bind_null_bool_sibling_answers_3136() -> Result<()> {
     for (input, filter, want) in [
@@ -108775,7 +108229,6 @@ fn test_navigated_bind_on_owned_root_yq_mode_unchanged_3135() -> Result<()> {
 /// position below the root for the one resolver invocation they enter.
 /// Every row captured live from `/usr/bin/jq` 1.7.1; every one exited 5
 /// on `main` before.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_navigated_bind_positional_scalar_and_nested_rows_answer_3134() -> Result<()> {
     for (input, filter, expected) in [
@@ -108930,7 +108383,6 @@ fn test_navigated_bind_positional_scalar_and_nested_rows_answer_3134() -> Result
 /// different `jv` -- an equal-valued sibling, an iterated element, the
 /// same path under a moved root, or a node written since the bind. A
 /// position minted for the bind's own node must never certify any of them.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_navigated_bind_positional_controls_refuse_3134() -> Result<()> {
     for (input, filter) in [
@@ -109009,7 +108461,6 @@ fn test_navigated_bind_yq_mode_unchanged_3037() -> Result<()> {
 /// that allocates a fresh one. succinctly promotes a bound scalar to shared
 /// storage at the bind (`SharableString::promote`, #3191), so both halves
 /// hold here as well. Every row captured live from `/usr/bin/jq` 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_scalar_bind_keeps_node_identity_3191() -> Result<()> {
@@ -109234,7 +108685,6 @@ fn test_scalar_bind_keeps_node_identity_3191() -> Result<()> {
 /// it always named. Both halves are pinned: the `path($x)` read *and* the
 /// write (`=`, `|=`, `del`), since a write is where getting this wrong
 /// costs data rather than an answer.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{k:.}`/`{a:1}` are not formatting strings;
 // clippy cannot tell the two apart from the brace shape alone.
@@ -109380,7 +108830,6 @@ fn test_owned_embed_keeps_node_identity_2889() -> Result<()> {
 /// as jq's eager `map` does, where the lazy `first` arm alone would not
 /// (#725/#2174's documented divergence, kept from spreading to a new
 /// spelling).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{a:1}` are not formatting strings; clippy cannot
 // tell the two apart from the brace shape alone.
@@ -109474,7 +108923,6 @@ fn test_owned_embed_fold_ties_and_identity_stage_2889() -> Result<()> {
 /// promotion): the node named is a *child* of the re-indexed root, which is
 /// what proves the mint is the cursor's own node rather than "the root of
 /// whatever document we just built".
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{k:.}` are not formatting strings; clippy cannot
 // tell the two apart from the brace shape alone.
@@ -109572,7 +109020,6 @@ fn test_owned_embed_keeps_node_identity_on_the_input_bridge_2889() -> Result<()>
 /// - A scalar root, which never enters the embed table on this route.
 #[test]
 // jq filter literals are not formatting strings.
-#[cfg(not(feature = "unshared-containers"))]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
     for (input, filter) in [
@@ -109660,12 +109107,9 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
 /// container's own cursor, tagged, for exactly that case. Every expected
 /// output captured live against jq 1.7.1; the rows jq refuses are in
 /// `test_input_bridge_embed_residuals_refuse_cleanly_2889`.
-#[cfg(all(
-    not(feature = "unshared-containers"),
-    // The empty-container tag lives in a BP position's top bit, which a
-    // narrower target cannot spare: there the route refuses, as before.
-    target_pointer_width = "64"
-))]
+// The empty-container tag lives in a BP position's top bit, which a
+// narrower target cannot spare: there the route refuses, as before.
+#[cfg(target_pointer_width = "64")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_input_route_empty_container_keeps_embed_identity_3180() -> Result<()> {
@@ -109789,8 +109233,8 @@ fn test_input_route_empty_container_read_fresh_when_nothing_can_ask_3491() -> Re
         assert_eq!(stdout.trim_end(), want, "#3491: `{filter}`");
     }
     // A variable in `path()` is a reader: the shared storage is back. Only
-    // where #3180's accept rows are (a 64-bit target, shared containers).
-    #[cfg(all(not(feature = "unshared-containers"), target_pointer_width = "64"))]
+    // where #3180's accept rows are (a 64-bit target).
+    #[cfg(target_pointer_width = "64")]
     {
         let (stdout, stderr, code) = run_jq_full(
             &[
@@ -109817,7 +109261,6 @@ fn test_input_route_empty_container_read_fresh_when_nothing_can_ask_3491() -> Re
 /// binding of *another* empty container (`.a` vs `.b`) is a different node
 /// even though the two values are equal, and turning that into an accept
 /// would be a write to the wrong place.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_default_route_empty_container_embed_keeps_identity_3180() -> Result<()> {
@@ -109959,7 +109402,6 @@ fn test_default_route_empty_container_embed_keeps_identity_3180() -> Result<()> 
 /// fold, so the stage standing on the embed sees the node rather than a
 /// copy. Every expected output captured live against jq 1.7.1 (`-n`, the
 /// document twice on stdin).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_input_route_array_collect_keeps_embed_identity_3180() -> Result<()> {
@@ -110040,7 +109482,6 @@ fn test_input_route_array_collect_keeps_embed_identity_3180() -> Result<()> {
 /// anything writes through the embedded node the copy no longer shares the
 /// entry's storage and the witness declines -- the same event that makes
 /// jq's own refcount exceed one and copy there.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{a:1}` are not formatting strings; clippy
 // cannot tell the two apart from the brace shape alone.
@@ -110180,7 +109621,6 @@ fn test_owned_embed_yq_mode_unchanged_2889() -> Result<()> {
 /// unreachable arm; it exists only because `Builtin` has more than three
 /// variants and Rust's exhaustiveness check cannot see the narrowing the
 /// first `match` already did.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{b:2}` are not formatting strings; clippy
 // cannot tell the two apart from the brace shape alone.
@@ -110290,7 +109730,6 @@ fn test_owned_embed_peel_and_fold_arms_reachable_2889() -> Result<()> {
 /// `rest.is_empty()` guard declines for the identical reason. See
 /// `embed_peel_step_propagates_a_navigation_error_2889` (`src/jq/eval.rs`)
 /// for that arm exercised directly instead.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{b:2}` are not formatting strings; clippy
 // cannot tell the two apart from the brace shape alone.
@@ -110349,13 +109788,7 @@ fn test_owned_embed_peel_and_fold_arms_refuse_cleanly_2889() -> Result<()> {
 /// so what the write left alone is still the binding's own node, as in jq's
 /// `jv_setpath`. Every row is captured from `/usr/bin/jq` 1.7.1 and
 /// byte-identical to it; `main` refused the `//=` one (`alt-keeps-child`).
-///
-/// Rows that rest on storage identity hold only in the shipped, shared-
-/// container build: under `unshared-containers` (the #2999 A/B holdout) a
-/// clone deep-copies, so those answer by refusing instead (the safe
-/// direction), and the known bind-origin failure list there is unchanged.
 #[test]
-#[cfg(not(feature = "unshared-containers"))]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_fold_assign_under_embed_table_matches_jq_3241() -> Result<()> {
     let input = r#"{"a":{"k":1},"b":2}"#;
@@ -110500,7 +109933,6 @@ fn test_fold_assign_under_embed_table_matches_jq_3241() -> Result<()> {
 /// write destroyed (the accumulator being the bound document itself, a child
 /// reached through a node the write replaced, a combine that allocates in jq
 /// too) or swallow an error raised mid-fold.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_fold_assign_under_embed_table_still_refuses_3241() -> Result<()> {
@@ -110585,7 +110017,6 @@ fn test_fold_assign_under_embed_table_still_refuses_3241() -> Result<()> {
 /// same bind below the invocation root. `main` refused every row with
 /// `Invalid path expression near attempt to access element "b" of {"b":2}`;
 /// jq 1.7.1 answers each exactly as pinned here (captured live).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_identity_bind_position_composes_with_getpath_2978() -> Result<()> {
     for (input, filter, want) in [
@@ -110627,7 +110058,6 @@ fn test_identity_bind_position_composes_with_getpath_2978() -> Result<()> {
 /// bind sits at the invocation root would compose `["a","c"]`, answer the
 /// register's path, and then *delete the wrong node*. jq 1.7.1 refuses
 /// both, with this exact message; so does succinctly, before and after.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_identity_bind_below_root_is_not_the_root_2978() -> Result<()> {
     let input = r#"{"a":{"c":{"b":1},"a":{"c":{"b":1}}}}"#;
@@ -110665,7 +110095,6 @@ fn test_identity_bind_below_root_is_not_the_root_2978() -> Result<()> {
 /// document root). #3124 part A is the same defect with a constructed source
 /// and a `?`-suppressed body. Every row: exit 5, nothing on stdout, jq's
 /// exact message.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructure_on_null_stage_refuses_like_jq_3120() -> Result<()> {
     for (input, filter, element) in [
@@ -110715,7 +110144,6 @@ fn test_destructure_on_null_stage_refuses_like_jq_3120() -> Result<()> {
 /// was pinned as "MUST stay a refusal" only because the register was out of
 /// the arm's sight), including the write, and a `?//` whose refused first
 /// alternative is provably not the register retries as jq's fork does.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructure_on_untracked_stage_answers_with_the_register_3120() -> Result<()> {
     for (input, filter, want) in [
@@ -110764,7 +110192,6 @@ fn test_destructure_on_untracked_stage_answers_with_the_register_3120() -> Resul
 /// pin and is covered instead by
 /// `resolve_recursive_descent_sink_stops_after_first_demand_2696` in
 /// `src/jq/eval.rs`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bare_recurse_bounded_consumers_match_jq_2696() -> Result<()> {
     let doc = r#"{"a":[1,{"b":2}],"c":3}"#;
@@ -111479,7 +110906,6 @@ fn test_getpath_path_context_pulls_argument_generator_lazily_2259() -> Result<()
 /// streams, `if`'s condition arm, and `limit`'s count arm. All four
 /// confirmed live against `/usr/bin/jq` 1.7.1 (using succinctly's own `|
 /// key` to force path-context routing, since real jq has no `key/0`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_context_sibling_sites_pull_their_generators_lazily_2916() -> Result<()> {
     // Site 1: `path_context_step_computed_index`'s key stream. The first key
@@ -111624,7 +111050,6 @@ fn test_skip_pulls_count_generator_lazily_3117() -> Result<()> {
 
 /// #2761: jq 1.7.1 rejects the identity seed at the terminal, but names
 /// iteration when a continuation discards that seed and asks for more.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bare_recurse_untracked_navigation_wording_2761() -> Result<()> {
     for stage in ["..", "recurse"] {
@@ -111659,7 +111084,6 @@ fn test_bare_recurse_untracked_navigation_wording_2761() -> Result<()> {
 
 /// The seed itself performs no navigation: a bound can stop before it,
 /// and `try` can catch the iteration error when traversal continues.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bare_recurse_untracked_seed_and_catch_2761() -> Result<()> {
     for stage in ["..", "recurse"] {
@@ -111691,7 +111115,6 @@ fn test_bare_recurse_untracked_seed_and_catch_2761() -> Result<()> {
 /// performs no iterate check at all. Every row confirmed live against jq
 /// 1.7.1 (`docs/compliance/jq/limitations.md` cross-references this issue
 /// for the one row that does *not* match, a documented refuse-only cost).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bare_recurse_marked_var_off_register_refuses_iterate_3048() -> Result<()> {
     let doc = r#"{"a":[1],"c":1}"#;
@@ -111720,7 +111143,6 @@ fn test_bare_recurse_marked_var_off_register_refuses_iterate_3048() -> Result<()
 /// `del`/`|=` in value position reach the same refusal as `path()` — the
 /// document must come back byte-for-byte unchanged, matching jq's own
 /// all-or-nothing write semantics (an error aborts before any mutation).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bare_recurse_marked_var_off_register_del_and_update_untouched_3048() -> Result<()> {
     let doc = r#"{"a":[1],"c":1}"#;
@@ -111748,7 +111170,6 @@ fn test_bare_recurse_marked_var_off_register_del_and_update_untouched_3048() -> 
 /// correctly (it never routed through the buggy `resolve_recursive_descent_sink`
 /// fallback); bare `..`/`recurse` must now agree with it on every marked
 /// shape, closing the drift #3048 flagged between the two spellings.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bare_recurse_agrees_with_explicit_dot_bracket_optional_on_marked_var_3048() -> Result<()> {
     for doc in [
@@ -111772,7 +111193,6 @@ fn test_bare_recurse_agrees_with_explicit_dot_bracket_optional_on_marked_var_304
 /// seed-and-catch test for the unmarked case: a bounded consumer can still
 /// stop on it, and `try` can still catch the later iterate refusal, even
 /// though the value is a marked `$var` off the register.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bare_recurse_marked_var_off_register_seed_and_catch_3048() -> Result<()> {
     let doc = r#"{"a":[1],"c":1}"#;
@@ -111794,7 +111214,6 @@ fn test_bare_recurse_marked_var_off_register_seed_and_catch_3048() -> Result<()>
 /// only widens the untracked-but-marked case, never a trackable one.
 /// Confirmed live against jq 1.7.1: `select(false)` discards every branch,
 /// so `path()` produces no output either way (empty stdout, exit 0).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bare_recurse_var_back_at_register_unaffected_by_3048() -> Result<()> {
     let doc = r#"{"a":[1],"c":1}"#;
@@ -111813,7 +111232,6 @@ fn test_bare_recurse_var_back_at_register_unaffected_by_3048() -> Result<()> {
 /// has cycled back to where `$x` was bound, so jq accepts: empty stdout, exit 0, confirmed live
 /// against jq 1.7.1). Since #4779 the inner `foreach` is the outer one's `EXTRACT`, which reads the
 /// register the step left, and the iterate check sees it: the answer is jq's.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bare_recurse_marked_var_nested_fold_follows_jq_3048_4779() -> Result<()> {
     let doc = r#"{"a":1}"#;
@@ -113561,7 +112979,6 @@ fn test_any_all_cond_isvalid_loops_validate_only_what_they_read_2658() -> Result
 /// through `$x` from the node `$x` was bound from answers as jq does, and
 /// one from a rebuilt copy or a different node refuses. Captured live against
 /// jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // jq filter literals like `{a:1}` are not formatting strings; clippy cannot
 // tell the two apart from the brace shape alone.
@@ -113864,7 +113281,6 @@ fn test_double_iterate_key_skips_empty_inner_collections_3021() -> Result<()> {
 }
 
 /// #3049: jq runs the body of a collected array with path tracking live.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_tracked_array_inner_navigation_refuses_3049() -> Result<()> {
     let doc = r#"{"a":[1],"b":{"k":1},"c":1}"#;
@@ -113890,7 +113306,6 @@ fn test_tracked_array_inner_navigation_refuses_3049() -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_tracked_array_accepting_controls_3049() -> Result<()> {
     let doc = r#"{"a":[1],"b":{"k":1},"c":1}"#;
@@ -113926,7 +113341,6 @@ fn test_tracked_array_accepting_controls_3049() -> Result<()> {
 /// A postfix `.[]?` inside an array is jq's `EACH_OPT`, whose `?` does not
 /// catch the path error an untracked `5` raises. This was accepted here,
 /// unchanged by #3049, until #2764 let the `[E]` arm resolve a `?` live.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_tracked_array_optional_navigation_refuses_as_jq_2764() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "path([5 | .[]?] | empty)"], Some("null"))?;
@@ -113946,7 +113360,6 @@ fn test_tracked_array_optional_navigation_refuses_as_jq_2764() -> Result<()> {
 /// there and refuse, and under `try`/`?` that refusal was caught as though
 /// it were jq's own path error: `del` echoed the document unchanged, exit 0.
 /// Every row is jq 1.7.1's own output.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_write_through_root_snapshot_after_subexp_stage_under_try_3186() -> Result<()> {
     for (input, filter, expected) in [
@@ -114026,7 +113439,6 @@ fn test_write_through_root_snapshot_after_subexp_stage_under_try_3186() -> Resul
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
     assert_path_rows_3289(&[
@@ -115104,7 +114516,6 @@ fn assert_rows_2764(rows: &[(&str, &str, &str, i32)]) -> Result<()> {
 /// -- instead of refusing on sight. `recurse(empty)`, `recurse(.+1; .<3)` and
 /// a caught recursion are accepted, and a non-navigating `f` (and `empty`)
 /// leaves jq's register where it was for a later `$x`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recurse_f_untracked_defers_to_navigation_2764() -> Result<()> {
     assert_rows_2764(&[
@@ -115143,7 +114554,6 @@ fn test_recurse_f_untracked_defers_to_navigation_2764() -> Result<()> {
 /// untracked input raises; postfix `.a?`/`.[]?` is `INDEX_OPT`/`EACH_OPT`,
 /// which does not. The flatten that distributes a group's `?` used to turn
 /// the former into the latter.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_try_scoped_optional_catches_untracked_path_error_2764() -> Result<()> {
     assert_rows_2764(&[
@@ -115185,7 +114595,6 @@ fn test_try_scoped_optional_catches_untracked_path_error_2764() -> Result<()> {
 /// #2764 / #2689: with (b) and (c) fixed, the `[...]` arm resolves `?` and
 /// parameterized recursion live, so `[.a?]`/`[.[]?]` refuse as jq does and
 /// an array of them carries the register to a later `$x`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_array_admits_optional_and_recurse_2764() -> Result<()> {
     assert_rows_2764(&[
@@ -115232,7 +114641,6 @@ fn test_array_admits_optional_and_recurse_2764() -> Result<()> {
 /// own navigation error was reached. Every expectation was captured from
 /// `/usr/bin/jq` 1.7.1, stdout, stderr and exit code, in the read and the write
 /// direction and with `try` inside, around and after the recursion.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recurse_seed_keeps_register_3272() -> Result<()> {
     assert_rows_2764(&[
@@ -115286,7 +114694,6 @@ fn test_recurse_seed_keeps_register_3272() -> Result<()> {
 /// output on an untracked input. A recursion that is not the register's own
 /// seed -- a trackable branch, a literal downstream of `..`, a non-navigating
 /// `f` (#2764) -- reads exactly as it did.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recurse_seed_rule_leaves_other_shapes_unchanged_3272() -> Result<()> {
     assert_rows_2764(&[
@@ -115320,7 +114727,6 @@ fn test_recurse_seed_rule_leaves_other_shapes_unchanged_3272() -> Result<()> {
 /// direction, with `try` inside, around and after the recursion -- and the rows
 /// that follow the issue's own table are its first nine. The stderr half is
 /// succinctly's: it matches jq's wording for every row that raises after the seed.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recurse_seed_behind_call_or_fork_keeps_register_3580() -> Result<()> {
     assert_rows_2764(&[
@@ -115424,7 +114830,6 @@ fn test_recurse_seed_behind_call_or_fork_keeps_register_3580() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recurse_seed_through_nth_bind_and_fold_recurse_f_3892() -> Result<()> {
     assert_rows_2764(&[
@@ -115513,7 +114918,6 @@ fn test_recurse_seed_through_nth_bind_and_fold_recurse_f_3892() -> Result<()> {
 /// bind keeps its own rule.) The rows pin the *current* refusal, and every write
 /// form must exit non-zero -- never 0 with the document unchanged, which is the
 /// silent write loss #3267 closed.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_recurse_seed_residuals_stay_loud_3580() -> Result<()> {
     assert_rows_2764(&[
@@ -115563,7 +114967,6 @@ fn test_recurse_seed_residuals_stay_loud_3580() -> Result<()> {
 /// pipe's own seed is the register the stage entered). Every row captured from `/usr/bin/jq` 1.7.1
 /// on [`DOC_2764`]: the write forms too, a trailing `select(false)` that emits nothing, and a
 /// `select` whose condition navigates (`select(.a?)`), which still raises as jq does.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recurse_seed_through_a_pipe_nested_in_a_forwarder_4123() -> Result<()> {
     assert_rows_2764(&[
@@ -115807,7 +115210,6 @@ fn test_recurse_seed_through_a_pipe_nested_in_a_forwarder_4123() -> Result<()> {
 /// captured from `/usr/bin/jq` 1.7.1 on [`DOC_2764`]: the write forms, a `try` inside, around and
 /// after, the wrappers (`nth`, `first`), a nested `def`, and a trackable entry whose register is
 /// not the one the stage entered with (`.a as $y | .c | ...`), which still refuses.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recurse_seed_through_if_literal_and_def_call_3914() -> Result<()> {
     assert_rows_2764(&[
@@ -115849,7 +115251,6 @@ fn test_recurse_seed_through_if_literal_and_def_call_3914() -> Result<()> {
 /// variable), so `(1, ..)` keeps jq's answer where it was a loud refusal under #3580. The rows
 /// are on [`DOC_2764`], captured from jq 1.7.1: the path form prints both outputs before jq's own
 /// iterate error, and the `try` write forms succeed.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recurse_seed_after_a_comma_sibling_states_the_register_3862() -> Result<()> {
     assert_rows_2764(&[
@@ -115883,7 +115284,6 @@ fn test_recurse_seed_after_a_comma_sibling_states_the_register_3862() -> Result<
 /// `path()` already worked; only the nested-declaration shape was affected.
 /// Confirmed live against jq 1.7.1: every row's expected output here also
 /// matches jq exactly.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_funcdef_declared_inside_path_resolves_not_invalid_path_3297() -> Result<()> {
     for (filter, input, expected) in [
@@ -115924,7 +115324,6 @@ fn test_funcdef_declared_inside_path_resolves_not_invalid_path_3297() -> Result<
 /// #3273: jq permits repeated generic `?` after any expression. The outer
 /// suppression must retain try-style path semantics, and yq mode must keep
 /// rejecting repeated generic `?` as its reference does.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_repeated_postfix_optional_matches_jq_3273() -> Result<()> {
     for (filter, input, expected) in [
@@ -115969,7 +115368,6 @@ fn test_repeated_postfix_optional_matches_jq_3273() -> Result<()> {
 /// `\(E)` piped through `@fmt` first, matching jq's own `gen_format(E, fmt)`.
 /// Every row captured live against jq 1.7.1 (`/usr/bin/jq`) with input
 /// `{"s":"a b&<é","arr":[1,"x y",null,true],"obj":{"k":"v"},"b":"aGk="}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_format_prefixed_string_interpolation_3316() -> Result<()> {
     let input = r#"{"s":"a b&<é","arr":[1,"x y",null,true],"obj":{"k":"v"},"b":"aGk="}"#;
@@ -116123,7 +115521,6 @@ fn test_format_prefixed_string_succinctly_extensions_3316() -> Result<()> {
 /// raises "Invalid path expression" on it (confirmed against `/usr/bin/jq` 1.7.1). The rows
 /// that put `key`/`parent`/`parent(n)` in the slot are refused outright since #5233, a dynamic
 /// path target beside a succinctly extension (`tests/jq_cli/i5233.rs`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_format_prefixed_key_parent_pipe_slot_raises_3369() -> Result<()> {
     let (filter, input) = (r#"path(@base64 "\(length|tostring)")"#, r#"{"foo":1}"#);
@@ -116145,7 +115542,6 @@ fn test_format_prefixed_key_parent_pipe_slot_raises_3369() -> Result<()> {
 /// #3283: the CLI route (not only the library harness) reaches
 /// `array_contents_are_checked`'s newly-admitted shapes. Confirmed live
 /// against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_array_admits_self_checked_builtins_via_cli_3283() -> Result<()> {
     for (filter, input, expected) in [
@@ -116175,7 +115571,6 @@ fn test_array_admits_self_checked_builtins_via_cli_3283() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_map_values_first_path_error_message_residual_3884() -> Result<()> {
     let object = r#"{"a":[1],"b":null}"#;
@@ -116223,7 +115618,6 @@ fn test_map_values_first_path_error_message_residual_3884() -> Result<()> {
 
 /// #3284: a caught #3271 construct inside `[...]` keeps the register
 /// through the CLI route too. Confirmed live against jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_refusal_inside_array_keeps_register_via_cli_3284() -> Result<()> {
     for (filter, input, expected) in [
@@ -116575,7 +115969,6 @@ fn test_parsed_nan_instances_across_inputs_and_args_3309() -> Result<()> {
 /// NaN (`nan`, which never carries #3309's parse identity) equals itself
 /// wherever both operands are still one handle. Every value captured from
 /// `/usr/bin/jq` 1.7.1 with `-nc`.
-#[cfg(not(feature = "unshared-containers"))]
 const CONTAINER_IDENTITY_ROWS_3069: &[(&str, &str)] = &[
     ("[nan] | . == .", "true"),
     ("[nan] | . != .", "false"),
@@ -116600,7 +115993,6 @@ const CONTAINER_IDENTITY_ROWS_3069: &[(&str, &str)] = &[
     ("[nan] | . as $a | ($a + []) == $a", "true"),
 ];
 
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_container_identity_short_circuits_equality_3069() -> Result<()> {
     for (filter, expected) in CONTAINER_IDENTITY_ROWS_3069 {
@@ -116659,7 +116051,6 @@ fn test_container_identity_must_not_change_3069() -> Result<()> {
 /// reads as a cursor rather than an `OwnedValue` (the tables above all run
 /// under `-n`). Stdin is `[1]`; every value captured from `/usr/bin/jq`
 /// 1.7.1. The last two rows build new containers and must stay `false`.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_container_identity_through_document_input_3069() -> Result<()> {
     for (filter, expected) in [
@@ -116688,7 +116079,6 @@ fn test_container_identity_through_document_input_3069() -> Result<()> {
 /// a constructed `as` source is spliced as its own storage rather than
 /// rebuilt at each `$a`. Every value captured from `/usr/bin/jq` 1.7.1 with
 /// `-nc`.
-#[cfg(not(feature = "unshared-containers"))]
 const CONTAINER_IDENTITY_ACROSS_THE_BRIDGE_3069: &[(&str, &str)] = &[
     ("[nan] as $a | $a == $a", "true"),
     ("([nan]|.) as $a | $a == $a", "true"),
@@ -116729,7 +116119,6 @@ const CONTAINER_IDENTITY_ACROSS_THE_BRIDGE_3069: &[(&str, &str)] = &[
     ("{a:[nan]} | .a as $x | .a | path($x)", "[]"),
 ];
 
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_container_identity_survives_the_bridge_and_literal_binds_3069() -> Result<()> {
     for (filter, expected) in CONTAINER_IDENTITY_ACROSS_THE_BRIDGE_3069 {
@@ -116754,7 +116143,6 @@ fn test_container_identity_survives_the_bridge_and_literal_binds_3069() -> Resul
 /// keeps its pattern's storage) already answered `[0]`. The last rows build a
 /// *different* handle (a second parse, a fresh literal) and stay as jq answers
 /// them. Every value captured from `/usr/bin/jq` 1.7.1 with `-nc`.
-#[cfg(not(feature = "unshared-containers"))]
 const SUBARRAY_SEARCH_KEY_IDENTITY_3943: &[(&str, &str)] = &[
     ("[nan] as $a | [$a] | .[[$a]]", "[0]"),
     ("[nan] as $a | [[$a],[$a]] | .[[[$a]]]", "[0,1]"),
@@ -116790,7 +116178,6 @@ const SUBARRAY_SEARCH_KEY_IDENTITY_3943: &[(&str, &str)] = &[
     ),
 ];
 
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_subarray_search_key_keeps_its_identity_3943() -> Result<()> {
     for (filter, expected) in SUBARRAY_SEARCH_KEY_IDENTITY_3943 {
@@ -116812,7 +116199,6 @@ fn test_subarray_search_key_keeps_its_identity_3943() -> Result<()> {
 /// last rows build a *different* handle (a copy, a fresh literal, a scalar, an
 /// element of a second parse) and must stay as jq answers them. Every value
 /// captured from `/usr/bin/jq` 1.7.1 with `-nc`.
-#[cfg(not(feature = "unshared-containers"))]
 const FOLD_LOOP_VARIABLE_IDENTITY_3896: &[(&str, &str)] = &[
     ("reduce ([nan]) as $a (0; $a == $a)", "true"),
     ("reduce ({a:nan}) as $a (0; $a == $a)", "true"),
@@ -116866,7 +116252,6 @@ const FOLD_LOOP_VARIABLE_IDENTITY_3896: &[(&str, &str)] = &[
     ),
 ];
 
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_fold_container_loop_variable_keeps_identity_3896() -> Result<()> {
     for (filter, expected) in FOLD_LOOP_VARIABLE_IDENTITY_3896 {
@@ -116884,7 +116269,6 @@ fn test_fold_container_loop_variable_keeps_identity_3896() -> Result<()> {
 /// rather than an `OwnedValue` literal: the answers do not move, and neither do
 /// the write/refusal answers of #3329 or the in-place assignment folds, when the
 /// UPDATE also compares the variable. Captured from `/usr/bin/jq` 1.7.1.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_fold_container_loop_variable_identity_through_document_input_3896() -> Result<()> {
     for (input, filter, expected, code) in [
@@ -116997,10 +116381,6 @@ fn test_fold_container_loop_variable_identity_through_document_input_3896() -> R
 /// value in the in-place step, and that must not lose jq's instance check (#3896): a
 /// NaN-bearing container is equal to itself because both operands are one shared node, and
 /// unequal to a distinct node with the same contents. Every row captured from jq 1.7.1.
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 #[test]
 fn test_fold_assignment_compares_a_loop_variable_by_identity_4005() -> Result<()> {
     for (filter, expected) in [
@@ -117050,7 +116430,6 @@ fn test_fold_assignment_compares_a_loop_variable_by_identity_4005() -> Result<()
 /// `map_values`, `flatten`, `[.[]]`, `limit`, `first`, `add`), #3383,
 /// #3328 and #3331, plus the #2889/#3036/#3188 residuals that bridged for
 /// the same reason. Every expected output captured live against jq 1.7.1.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_bridge_provenance_keeps_path_identity_3069() -> Result<()> {
@@ -117373,7 +116752,6 @@ fn test_bridge_provenance_keeps_path_identity_3069() -> Result<()> {
 /// sibling, a raised copy. Any of these answering would be the provenance
 /// table handing out storage for a node that is not the one that went in.
 /// Each captured live as refused by jq 1.7.1 on `{"a":1}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_bridge_provenance_never_certifies_a_rebuilt_copy_3069() -> Result<()> {
@@ -117408,7 +116786,6 @@ fn test_bridge_provenance_never_certifies_a_rebuilt_copy_3069() -> Result<()> {
 /// and a write through it refuse exactly as before -- and certify only where
 /// jq's own identity does, the resolver standing on the bound storage itself
 /// (`$a | path($a)`). Captured from `/usr/bin/jq` 1.7.1 with `-nc`.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 // jq filter literals like `{a:1}` are not formatting strings.
 #[allow(clippy::literal_string_with_formatting_args)]
@@ -118918,7 +118295,6 @@ const RETRY_ROWS_PATH_SLICE_BOUND_3293: &[RetryRow3293] = &[
     ),
 ];
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_slice_bound_retry_supersedes_stashed_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_PATH_SLICE_BOUND_3293)
@@ -119288,7 +118664,6 @@ const RETRY_ROWS_PATH_COND_3293: &[RetryRow3293] = &[
     ),
 ];
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_cond_retry_supersedes_stashed_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(Some(r#"{"a":{"a":1}}"#), "", RETRY_ROWS_PATH_COND_3293)
@@ -120205,19 +119580,16 @@ const RETRY_ROWS_RECURSE_3293: &[RetryRow3293] = &[
     ),
 ];
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_bind_source_retry_supersedes_stashed_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_PATH_BIND_SOURCE_3293)
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_fold_retry_supersedes_stashed_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_PATH_FOLD_3293)
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recurse_retry_supersedes_stashed_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_RECURSE_3293)
@@ -120828,7 +120200,6 @@ const RETRY_ROWS_VALUE_ARG_PATH_3487: &[RetryRow3293] = &[
     ),
 ];
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_builtin_argument_retry_in_path_mode_3487() -> Result<()> {
     assert_retry_rows_3293(Some(r#"{"a":{"a":1}}"#), "", RETRY_ROWS_VALUE_ARG_PATH_3487)
@@ -121035,7 +120406,6 @@ const RETRY_ROWS_LIMIT_NON_NUMBER_COUNT_3486: &[RetryRow3293] = &[
     ),
 ];
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_limit_non_number_count_raises_downstream_of_the_count_3486() -> Result<()> {
     assert_retry_rows_3293(
@@ -122270,7 +121640,6 @@ const RETRY_ROWS_PATH_INDEX_3293: &[RetryRow3293] = &[
     (r#"path(.[["a"]]?)"#, "", "", "", 0),
 ];
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_index_retry_supersedes_stashed_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(Some(r#"{"a":{"a":1}}"#), "", RETRY_ROWS_PATH_INDEX_3293)
@@ -122723,7 +122092,6 @@ const RETRY_ROWS_FOLD_3293: &[RetryRow3293] = &[
     ),
 ];
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_and_init_retry_supersedes_stash_3293() -> Result<()> {
     assert_retry_rows_3293(None, "", RETRY_ROWS_FOLD_3293)
@@ -122900,7 +122268,6 @@ fn test_halt_in_a_fold_source_try_writes_once_in_yq_mode_3518() -> Result<()> {
 /// before `error` ran (#791). A message that halts *first* still halts, and a
 /// trailing `break` or error already raised the first value. Every value
 /// captured from jq 1.7.1, on both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_error_of_a_message_that_halts_after_a_value_raises_the_value_3612() -> Result<()> {
     let doc = r#"{"a":1}"#;
@@ -123008,7 +122375,6 @@ fn test_error_of_a_message_that_halts_after_a_value_in_yq_mode_3612() -> Result<
 /// to its first output and stopped, as `first(f)` is (#820). Every value captured
 /// from jq 1.7.1, on both routes; stderr is the observable here, so it is checked
 /// precisely (an empty `expected_start` means stderr must be empty).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_error_message_is_not_evaluated_past_its_first_output_3636() -> Result<()> {
     let doc = r#""abc""#;
@@ -124514,7 +123880,6 @@ fn test_nth_key_and_path_name_the_delivered_element_on_both_routes_3610() -> Res
 /// literal `5`, which stands at no node. Each row runs on both routes, as the
 /// #3610 rows do. jq's path mode delivers one output for a `first`/`nth`
 /// (`path(first(...))` is `[["b",0]]`), which the last rows keep.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_retried_bounded_output_keeps_its_identity_on_both_routes_3621() -> Result<()> {
     let doc = r#"{"a":{"b":[1,2]}}"#;
@@ -124679,7 +124044,6 @@ fn test_nth_laziness_and_error_placement_3610() -> Result<()> {
 /// document untouched, where the pinned jq 1.7.1 raises. Every row runs on both
 /// routes -- `-n` with the document as a prefix builds an owned value, the
 /// document on stdin keeps the cursor.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nth_path_over_a_many_valued_leaf_raises_like_jq_3625() -> Result<()> {
     let doc = r#"{"a":{"b":[1,2]},"c":3}"#;
@@ -124846,7 +124210,6 @@ fn test_nth_index_does_not_change_the_yq_mode_answer_3625() -> Result<()> {
 /// jq 1.7.1 has no `skip`, so every row is jq 1.8.2's (`/opt/homebrew/bin/jq`).
 /// Each row runs on both routes -- `-n` with the document as a prefix builds an
 /// owned value, the document on stdin keeps the cursor.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_skip_is_a_path_expression_on_both_routes_3611() -> Result<()> {
     let doc = r#"{"a":{"b":[10,20,30,40],"c":{"x":1,"y":2,"z":3}},"d":[1,[2,3],4]}"#;
@@ -124954,7 +124317,6 @@ fn test_skip_is_a_path_expression_on_both_routes_3611() -> Result<()> {
 /// a dropped position -- on both routes. A non-number count also raises, with
 /// succinctly's own wording (`classify_skip_n`'s, as in value mode), so only
 /// the exit code is pinned for it.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_skip_path_errors_match_jq_on_both_routes_3611() -> Result<()> {
     let doc = r#"{"a":{"b":[10,20,30,40]}}"#;
@@ -125201,7 +124563,6 @@ fn test_skip_key_names_the_delivered_element_in_yq_mode_3513() -> Result<()> {
 /// evaluator -- the twins of the cursor-route sinks those tables pin. A
 /// `{} | ` prefix changes no row's jq 1.7.1 answer (checked row by row;
 /// the index table's `{"a":5}` becomes the prefix instead of the input).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()> {
     for (prefix, rows) in [
@@ -125482,7 +124843,6 @@ fn test_path_cond_retry_stash_leaves_yq_mode_unchanged_3293() -> Result<()> {
 /// on the wrong output, and `del`/`|=` through a `try` silently discarded
 /// the write at exit 0. Every `Ok` row, and each `Err` row's message, was
 /// captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_comma_bind_source_is_classified_per_branch_3334() -> Result<()> {
     let doc = r#"{"a":[1,2],"b":[3]}"#;
@@ -125581,7 +124941,6 @@ fn test_comma_bind_source_is_classified_per_branch_3334() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()> {
     let doc = r#"{"a":{"b":1}}"#;
@@ -125843,7 +125202,6 @@ fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()>
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_frozen_source_through_a_composite_head_refuses_loudly_3334() -> Result<()> {
     assert_path_rows_3289(&[
@@ -126281,7 +125639,6 @@ fn test_alternative_destructuring_retries_past_a_compound_assignment_write_3417(
 /// own single-leaf, non-forking source post-#3334, so nesting the comma
 /// under `.a |` instead (never split, since only the *top* of the source is
 /// checked) is what still reaches them. Captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_comma_nested_under_pipe_bind_source_streams_prefix_before_error_3334() -> Result<()> {
     let (out, stderr, code) = run_jq_full(
@@ -126305,7 +125662,6 @@ fn test_comma_nested_under_pipe_bind_source_streams_prefix_before_error_3334() -
 /// same root cause as the sibling test above. Nesting the comma under an
 /// `if` (never split, since only the source's own top is checked) is what
 /// still reaches it. Captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_comma_nested_under_if_bind_source_classified_per_leaf_3334() -> Result<()> {
     let (out, code) = run_jq_stdin(
@@ -126951,7 +126307,6 @@ const BARE_FIRST_LAST_PATH_ROWS_3545: &[(&str, &str, &str, i32)] = &[
     (r#"{"a":null}"#, r"path(.a|last)", "[\"a\",-1]\n", 0),
 ];
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bare_first_and_last_are_path_steps_3545() -> Result<()> {
     assert_as_binding_rows_3397(BARE_FIRST_LAST_PATH_ROWS_3545)
@@ -126961,7 +126316,6 @@ fn test_bare_first_and_last_are_path_steps_3545() -> Result<()> {
 /// takes the owned-value route instead of the document cursor one -- the two
 /// resolve a path through different code, and a fix that reaches only one has
 /// bitten this area before.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bare_first_and_last_are_path_steps_on_a_literal_input_3545() -> Result<()> {
     for &(input, filter, stdout, exit) in BARE_FIRST_LAST_PATH_ROWS_3545 {
@@ -127202,7 +126556,6 @@ fn test_def_spine_route_gate_boundary_unchanged_3307() -> Result<()> {
 /// fast path for (`length`, `.[i]`, `last`, slices) and the ones that
 /// materialize it (`tojson`, `as`, nesting). The two `path($x)` rows are
 /// #3069's fix, unpinned until now, which this route must keep.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_comma_array_matches_jq_3317() -> Result<()> {
     let doc = r#"{"a":{"x":1},"b":[2,{"c":3}],"n":"s","m":3}"#;
@@ -127653,7 +127006,6 @@ fn test_scalar_array_defers_an_undecodable_member_3856() -> Result<()> {
 /// and the ones that materialize it (`tojson`, `as`, `reduce`), the items that
 /// are not nodes (`.missing`, a computed stage), and `path($x)`, which refuses
 /// there exactly as jq does.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_comma_head_pipe_array_matches_jq_3476() -> Result<()> {
     let doc = r#"{"a":{"x":1},"b":[2,{"c":3}],"n":"s","m":3}"#;
@@ -127844,7 +127196,6 @@ fn test_comma_head_pipe_array_multi_stage_tail_3476() -> Result<()> {
 /// that reached it (`.b?`, `.[-1]`, `.[1.0]`), and `Frame::names` compared
 /// those spellings, so two routes to one node refused. jq's `jv_identical`
 /// sees the node, not the spelling. Every value is from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolver_frame_position_is_spelling_insensitive_3464() -> Result<()> {
     let doc = r#"{"a":{"b":1},"x":[1,1]}"#;
@@ -128002,7 +127353,6 @@ fn test_resolver_frame_position_is_spelling_insensitive_3464() -> Result<()> {
 /// source's node in lockstep with the owned value (`CursorPatternMode`), for
 /// an object key, an array position, a computed key, a `?//` alternative and
 /// a nested pattern alike.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructuring_bind_keeps_node_identity_3466() -> Result<()> {
     assert_path_rows_3289(&[
@@ -128133,7 +127483,6 @@ fn test_destructuring_bind_keeps_node_identity_3466() -> Result<()> {
 /// #3464: the same rows' other-node twins must keep refusing -- folding
 /// spellings together may only ever name one node, never a neighbour of it
 /// with an equal value.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_resolver_frame_position_spelling_controls_refuse_3464() -> Result<()> {
     let doc = r#"{"a":{"b":1},"x":[1,1]}"#;
@@ -129018,7 +128367,6 @@ fn test_computed_slice_and_index_target_is_lazy_3520() -> Result<()> {
 /// state (#3663); a fan-out carries on from there -- the paths still to come
 /// write into the null state, and the collapsed path's delete applies at the
 /// end. jq 1.7.1, captured live, on the document read and on `-n`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_update_collapse_mid_fan_out_matches_jq_3747() -> Result<()> {
     let q = "(1 as $x ?// $y | select($y == null) | $x)";
@@ -129397,7 +128745,6 @@ fn test_slice_bound_consumer_stop_leaves_uncontested_slices_alone_3471() -> Resu
 /// #3471: path mode is a separate resolver (#3293 slice 6) and does not take the
 /// value-mode retry: `path(first(.[B:]))` retries once and raises, and `del`
 /// over the same slice stays as it was. jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_slice_bound_consumer_stop_leaves_path_mode_alone_3471() -> Result<()> {
     let arr = "[10,20,30]";
@@ -129450,7 +128797,6 @@ fn test_computed_slice_under_consumer_stays_within_the_stack_budget_3471() -> Re
 /// 1.7.1; the `debug` lines are the count of times the target or the right
 /// side ran. `|=` takes only its update's first output, `=`/`op=` run the
 /// target once per right-hand output that is actually pulled.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_assign_rhs_and_target_side_effect_counts_match_jq_3448() -> Result<()> {
     const ROWS: &[(&str, &str, &str, &str, i32)] = &[
@@ -129617,7 +128963,6 @@ fn test_assign_rhs_is_lazy_on_the_generic_route_3448() -> Result<()> {
 /// condition -- and these rows pin that it answers as jq does for an object
 /// pattern, an array pattern, a nested source and a `?//` alternative, in
 /// `path` and `del` alike (every row captured from jq 1.7.1).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructuring_bind_in_a_select_condition_answers_as_jq_3466() -> Result<()> {
     assert_path_rows_3289(&[
@@ -129680,7 +129025,6 @@ fn test_destructuring_bind_in_a_select_condition_answers_as_jq_3466() -> Result<
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructuring_bind_controls_refuse_3466() -> Result<()> {
     assert_path_rows_3289(&[
@@ -129761,7 +129105,6 @@ fn test_destructuring_bind_controls_refuse_3466() -> Result<()> {
 /// behind it, and #3191 declined to carry identity through construction, so the
 /// shipped resolver refused where jq answers `["a","b"]`. The path-mode
 /// interpreter (#5223) keeps the element's identity through the array, as jq does.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_destructuring_bind_constructed_source_answers_as_jq_does_3466() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -129780,7 +129123,6 @@ fn test_destructuring_bind_constructed_source_answers_as_jq_does_3466() -> Resul
 /// on which value the variable holds), and a computed key steps by its
 /// evaluated value -- a literal `0`, a computed `-1`, an out-of-range one --
 /// end to end (rows captured from jq 1.7.1).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructuring_bind_duplicate_and_computed_keys_3466() -> Result<()> {
     assert_path_rows_3289(&[
@@ -129819,7 +129161,6 @@ fn test_destructuring_bind_duplicate_and_computed_keys_3466() -> Result<()> {
 /// value, so its per-step member scan could not go quadratic, and refused the
 /// 65-entry one (`MAX_TRACKED_PATTERN_ENTRIES`). jq answers both widths, and so
 /// does the path-mode interpreter (#5223).
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_destructuring_bind_wide_pattern_answers_as_jq_does_3466() -> Result<()> {
     let pattern = |entries: usize| {
@@ -130080,7 +129421,6 @@ fn test_options_after_args_and_jsonargs_are_options_3447() -> Result<()> {
 /// first output is not pinned: `main` halts where jq raises, which predates this
 /// fix.
 #[allow(clippy::literal_string_with_formatting_args)]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_error_of_an_empty_message_yields_nothing_3488() -> Result<()> {
     assert_rows_2764(&[
@@ -130374,7 +129714,6 @@ fn test_array_collector_over_a_raising_path_context_body_is_atomic_3512() -> Res
 /// through `.[0:]`/`.[null:]` is still the register's own node. A partial
 /// slice, an empty array and a string slice are fresh values and still refuse.
 /// Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_whole_array_slice_is_the_register_3504() -> Result<()> {
     assert_path_rows_3289(&[
@@ -130467,7 +129806,6 @@ fn test_reduce_whole_array_slice_is_the_register_3504() -> Result<()> {
 /// $x.k` is `["k"]`). The reduce's own emission states it, as every by-value
 /// leaf does. A navigating source or INIT, a destructuring pattern, and a UPDATE
 /// that navigates still refuse. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_with_a_computing_update_leaves_the_register_3710() -> Result<()> {
     assert_path_rows_3289(&[
@@ -130578,7 +129916,6 @@ fn test_reduce_with_a_computing_update_leaves_the_register_3710() -> Result<()> 
 /// `path()` answers nothing. `main` already answers these like jq; this pins it
 /// apart from the `reduce` rule below, which is what the issue's remaining shapes
 /// needed. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_marker_after_construction_and_passthrough_is_caught_3732() -> Result<()> {
     assert_path_rows_3289(&[
@@ -130610,7 +129947,6 @@ fn test_marker_after_construction_and_passthrough_is_caught_3732() -> Result<()>
 /// node), a destructuring pattern, a source that destructures a computed value
 /// and a navigating source feeding an UPDATE that navigates keep refusing. Every
 /// row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_with_navigating_source_or_update_leaves_the_register_3732() -> Result<()> {
     assert_path_rows_3289(&[
@@ -130808,7 +130144,6 @@ fn test_reduce_with_navigating_source_or_update_leaves_the_register_3732() -> Re
 /// second step on. Partial slices, an empty array, a string, a navigating
 /// source and a destructuring pattern still refuse. Every row captured from
 /// jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_whole_array_slice_is_the_register_3742() -> Result<()> {
     assert_path_rows_3289(&[
@@ -130930,7 +130265,6 @@ fn test_foreach_whole_array_slice_is_the_register_3742() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_whole_array_slice_under_optional_is_the_register_3734() -> Result<()> {
     assert_path_rows_3289(&[
@@ -131116,7 +130450,6 @@ fn test_reduce_whole_array_slice_under_optional_is_the_register_3734() -> Result
 /// wrapped steps, so the shipped chain walk refused it; jq answers `[]`, as it
 /// does for the unwrapped `(.[0:] | .[0:])`, and so does the path-mode
 /// interpreter (#5223).
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_reduce_whole_array_slice_group_under_optional_answers_as_jq_does_3734() -> Result<()> {
     // jq 1.7.1: `[]`, exit 0.
@@ -131142,7 +130475,6 @@ fn test_reduce_whole_array_slice_group_under_optional_answers_as_jq_does_3734() 
 /// not a navigation node and a bind through it got no marker. Identical
 /// spellings on both sides now certify, as `.x[1]` already did; a different
 /// slot still refuses. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fractional_literal_bind_source_gets_a_marker_3519() -> Result<()> {
     let input = r#"{"a":{"b":1},"x":[1,1]}"#;
@@ -131198,7 +130530,6 @@ fn test_fractional_literal_bind_source_gets_a_marker_3519() -> Result<()> {
 /// swallow the resolver's own refusal and a bind source carrying one stays on
 /// the witness grammar. It used to bind by value, so a later step through
 /// `$y` refused where jq answers. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_postfix_optional_bind_source_gets_a_marker_3519() -> Result<()> {
     let input = r#"{"a":{"b":1},"x":[1,1]}"#;
@@ -131719,7 +131050,6 @@ fn test_path_f_swallowed_scalar_iteration_answers_what_it_did_3722() -> Result<(
 /// Every row is jq 1.7.1's own. The scalar members cover each falsy and truthy
 /// kind, since `//` decides on them, and the document rows pin the trailing
 /// `.[]` deferral (#888) the lazy flatten still has to take.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_f_lone_leaf_resolution_answers_what_it_did_4155() -> Result<()> {
     const MIXED: &str = r#"[1,"a",null,false,[2],{"k":3}]"#;
@@ -131851,7 +131181,6 @@ fn test_path_f_lone_leaf_resolution_answers_what_it_did_4155() -> Result<()> {
 /// container, a `reduce` (which restores the register), and a computed element
 /// all still refuse, so the position is only ever a proof of identity, never a
 /// widening. Every row captured from jq 1.7.1 with `-c`, on both evaluators.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_bound_empty_array_element_answers_its_path_3789() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -131998,7 +131327,6 @@ fn test_foreach_bound_empty_array_element_answers_its_path_3789() -> Result<()> 
 /// with the frame tracking positions for another reason (`. as $_`) it still refuses,
 /// as jq does; those rows pin the behaviour, not the marker a `reduce` binds, which no
 /// query tells apart. Every row captured from jq 1.7.1 with `-c`, on both evaluators.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_bound_empty_array_element_composes_with_the_frame_3789() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -132074,7 +131402,6 @@ fn test_foreach_bound_empty_array_element_composes_with_the_frame_3789() -> Resu
 /// Every row captured from jq 1.7.1 with `-c` on `{"a":{"b":1},"k":2}`, on both
 /// evaluators. A `try ... catch` handler (a register of its own) and a compound
 /// inner stage are still refused where jq answers, tracked by #3767's later parts.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_register_limit_nth_wrappers_and_type_filter_collect_3767() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":2}"#;
@@ -132466,7 +131793,6 @@ fn assert_path_retry_rows_3808(
 
 // #3808: expectations captured from /usr/bin/jq 1.7.1. Each table runs
 // on the document route and again on an owned value built under -n.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_sink_retry_terminal_3808() -> Result<()> {
     let rows: &[RetryRow3293] = &[
@@ -132586,7 +131912,6 @@ fn test_path_sink_retry_terminal_3808() -> Result<()> {
     assert_path_retry_rows_3808(Some("[[0]]"), "", rows)?;
     assert_path_retry_rows_3808(None, "[[0]] | ", rows)
 }
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_sink_retry_index_3808() -> Result<()> {
     let rows: &[RetryRow3293] = &[
@@ -132741,7 +132066,6 @@ fn test_path_sink_retry_key_3808() -> Result<()> {
     assert_path_retry_rows_3808(Some(r#"{"a":1}"#), "", rows)?;
     assert_path_retry_rows_3808(None, r#"{"a":1} | "#, rows)
 }
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_sink_retry_door_3808() -> Result<()> {
     let rows: &[RetryRow3293] = &[
@@ -132777,7 +132101,6 @@ fn test_path_sink_retry_door_3808() -> Result<()> {
     assert_path_retry_rows_3808(Some(r#"{"a":[[1]],"b":2}"#), "", rows)?;
     assert_path_retry_rows_3808(None, r#"{"a":[[1]],"b":2} | "#, rows)
 }
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_path_sink_retry_write_3808() -> Result<()> {
     // Captured from /usr/bin/jq 1.7.1. The shipped evaluator kept the input on
@@ -132902,7 +132225,6 @@ fn test_path_sink_retry_write_3808() -> Result<()> {
     assert_path_retry_rows_3808(None, "[1] | ", rows)
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_sink_retry_controls_3808() -> Result<()> {
     // Non-retried failures, nonretryable halts and consumer stop/break.
@@ -133767,7 +133089,6 @@ const RETRY_ROWS_ANY_ALL_PATH_3827: &[RetryRow3293] = &[
 /// them, `all`, two decisive alternatives, a generator the retry runs on past,
 /// and a retry that raises after the answer, on the owned route and the
 /// document route. Every value is captured from `/usr/bin/jq` 1.7.1 with `-nc`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_any_all_path_condition_retry_names_last_answer_3827() -> Result<()> {
     let input = r#"{"x":{"a":[1],"b":[2]}}"#;
@@ -133814,7 +133135,6 @@ const RETRY_ROWS_ANY_ALL_PATH_RAISE_3827: &[RetryRow3293] = &[
 /// #3827: an answer that is a valid path is printed before the raise of the
 /// `?//` retry that follows it, and an escape after the answers is raised
 /// after them. Every value is captured from `/usr/bin/jq` 1.7.1 with `-nc`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_any_all_path_answer_precedes_retry_raise_3827() -> Result<()> {
     let input = r#"{"x":true}"#;
@@ -133832,7 +133152,6 @@ fn test_any_all_path_answer_precedes_retry_raise_3827() -> Result<()> {
 /// answer reaches the consumer before the retry runs (#3899), so the condition's
 /// later alternative leaves no trace on stderr: `RH` for the by-value route's
 /// `"R"|stderr`, not `RRH`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_any_all_path_answer_halt_is_not_retried_3827() -> Result<()> {
     let input = r#"{"x":true}"#;
@@ -133859,7 +133178,6 @@ fn test_any_all_path_answer_halt_is_not_retried_3827() -> Result<()> {
 /// whatever the consumer did with the answer. Every row captured from jq 1.7.1
 /// with `-c`, stderr interleaved as written; the resolver used to drain the
 /// retry first (`RRH`, `RHjq: error ...`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_any_all_path_answer_precedes_the_retrys_side_effects_3899() -> Result<()> {
     let flat = r#"{"x":true}"#;
@@ -134043,7 +133361,6 @@ const RETRY_ROWS_ISEMPTY_PATH_4114_WRITE: &[RetryRow3293] = &[
 /// #4114: `path(isempty(g))` states the swallowed-break retry `isempty` is defined
 /// with (`first((g | false), true)`), as `any`/`all` have since #3819/#3827, on
 /// the cursor route (a document input) and the owned one (`-n`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_isempty_path_answers_through_a_swallowed_break_retry_4114() -> Result<()> {
     for (input, rows) in [
@@ -134163,7 +133480,6 @@ const RETRY_ROWS_IDENTITY_REGISTER_4341_ARRAY: &[RetryRow3293] = &[
 
 /// #4341: the identity element of `any`/`all`/`isempty` is at the frame's register
 /// on an untracked entry, on the cursor route and the owned one.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_any_all_isempty_identity_answer_states_the_frames_register_4341() -> Result<()> {
     for (input, rows) in [
@@ -134177,7 +133493,6 @@ fn test_any_all_isempty_identity_answer_states_the_frames_register_4341() -> Res
 }
 
 /// #4114: `isempty`'s identity `true` on an untracked entry, under `and`/`or`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_isempty_path_identity_answer_on_an_untracked_entry_4114() -> Result<()> {
     let input = r#"{"a":1}"#;
@@ -134193,7 +133508,6 @@ fn test_isempty_path_identity_answer_on_an_untracked_entry_4114() -> Result<()> 
 /// #4114: the consumer has `isempty`'s `false` before the retry that follows it
 /// runs (#3899's rule for `any`/`all`), and a `halt` downstream of it is not the
 /// break the `?//` swallows, so the retry never runs. Captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_isempty_path_answer_precedes_the_retrys_side_effects_4114() -> Result<()> {
     let input = r#"{"x":false}"#;
@@ -134344,7 +133658,6 @@ const RETRY_ROWS_ANY_ALL_PATH_IDENTITY_3858_3: &[RetryRow3293] = &[(
 /// backtracking through every fork of `gen` restores it. A `false` over a `false`
 /// node (or a `true` over a `true` one) is therefore a valid path, and anything else
 /// is refused as before. Every value is captured from `/usr/bin/jq` 1.7.1 with `-nc`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_any_all_path_identity_answer_is_at_the_entry_register_3858() -> Result<()> {
     for (input, rows) in [
@@ -135690,7 +135003,6 @@ const RETRY_ROWS_PATH_PATTERN_KEY_3843: &[RetryRow3293] = &[
     ),
 ];
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_mode_pattern_key_retry_supersedes_the_abandoned_branch_3843() -> Result<()> {
     let input = r#"{"x":1,"y":2}"#;
@@ -136077,7 +135389,6 @@ const RETRY_ROWS_LAZY_STAGE_3806: &[RetryRow3293] = &[
     ),
 ];
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_retry_before_a_lazy_last_stage_3806() -> Result<()> {
     let input = r#"{"a":[1],"b":[2]}"#;
@@ -136229,7 +135540,6 @@ fn for_both_evaluators_3795(
 /// - a `reduce`/`foreach` over such a source, which the resolver now drives.
 ///
 /// Every expected value captured live against jq 1.7.1. Both evaluators.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_bind_sources_beyond_the_alias_grammar_keep_the_write_3795() -> Result<()> {
     let doc = r#"{"a":{"b":1}}"#;
@@ -136359,7 +135669,6 @@ fn test_bind_sources_beyond_the_alias_grammar_keep_the_write_3795() -> Result<()
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_bind_sources_the_resolver_cannot_place_refuse_loudly_3795() -> Result<()> {
     let doc = r#"{"a":{"b":1}}"#;
@@ -136445,7 +135754,6 @@ fn test_bind_sources_the_resolver_cannot_place_refuse_loudly_3795() -> Result<()
 ///   which keeps jq's catchable refusal (the one row here that fails without the
 ///   demotion; the fold-element rows pin jq's answer and the arms' coverage, but
 ///   no output tried changed when either `MovedRegister` arm was flipped).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_element_binds_and_def_walk_arms_3795() -> Result<()> {
     let doc = r#"{"a":{"b":1}}"#;
@@ -137149,7 +136457,6 @@ const FOLD_SOURCE_ITERATING_BUILTIN_ROWS_3459: &[(&str, &str, &str, i32)] = &[
     (r"[[1],[2]]", r"(foreach (add?) as $k (.; .)) = 9", "9\n", 0),
 ];
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_bare_first_last_nth_moves_the_register_3459() -> Result<()> {
     assert_as_binding_rows_3397(FOLD_SOURCE_BARE_INDEX_BUILTIN_ROWS_3459)?;
@@ -137158,7 +136465,6 @@ fn test_fold_source_bare_first_last_nth_moves_the_register_3459() -> Result<()> 
 
 /// #3459: the same rows with the document written into the program, which takes
 /// the owned-value route instead of the document cursor one.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_bare_first_last_nth_moves_the_register_on_a_literal_input_3459() -> Result<()> {
     for &(input, filter, stdout, exit) in FOLD_SOURCE_BARE_INDEX_BUILTIN_ROWS_3459
@@ -137186,7 +136492,6 @@ fn test_fold_source_bare_first_last_nth_moves_the_register_on_a_literal_input_34
 /// (`{"x":{"a":true}}` is `["x","a"]`), and a body whose value is not the
 /// register's (`1`, or `false` over `true`) still refuses. Every row captured
 /// from jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructuring_alt_bind_with_a_failed_first_alternative_states_its_register_3859(
 ) -> Result<()> {
@@ -137299,7 +136604,6 @@ fn test_destructuring_alt_bind_with_a_failed_first_alternative_states_its_regist
 /// answers `["x"]`, while a branch that lands off the register still refuses
 /// (`false`, `1`), and a branch that navigated keeps its position. Every row
 /// captured from jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructuring_alt_bind_with_a_compound_body_states_its_register_per_branch_3899(
 ) -> Result<()> {
@@ -137392,7 +136696,6 @@ fn test_destructuring_alt_bind_with_a_compound_body_states_its_register_per_bran
 /// `.[0]` is `["x",0]`. A bare postfix `?` does not catch it. Bodies that do not lead with
 /// a navigation step (`$q | .a`, `5 | .a`) and a `try`-scoped `(.[0])?` keep their
 /// behaviour. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructuring_alt_bind_retries_past_a_leading_navigation_refusal_4115() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -137548,7 +136851,6 @@ fn test_destructuring_alt_bind_retries_past_a_leading_navigation_refusal_4115() 
 /// register is not on, so the retry fails the same way and raises. A `reduce` UPDATE and a
 /// source that navigates leave the register off the accumulator, and still raise. Every row
 /// captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructuring_alt_bind_retries_in_a_fold_step_on_the_register_4440() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -137711,7 +137013,6 @@ fn test_destructuring_alt_bind_retries_in_a_fold_step_on_the_register_4440() -> 
 /// answers `[]`, and on a `null` document the chain's first step succeeds and so does the
 /// outer fold. `del` and `=` over it follow. Every row captured from jq 1.7.1; only stdout and
 /// the exit status are pinned, since the message jq names differs from ours on some rows.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nested_foreach_alt_chain_source_in_a_foreach_body_refuses_4564() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
@@ -137857,7 +137158,6 @@ fn test_nested_foreach_alt_chain_source_in_a_foreach_body_refuses_4564() -> Resu
 /// On a `null` document the destructure succeeds and prints the moved path before the terminal
 /// refusal. Every row captured from jq 1.7.1; stdout and the exit status are pinned, since the
 /// message jq names differs from ours on some rows.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_bound_to_a_call_with_a_register_first_output_refuses_4565() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
@@ -138125,7 +137425,6 @@ fn test_foreach_source_bound_to_a_call_with_a_register_first_output_refuses_4565
 /// the register is identical to, and jq answers. A single destructure, a comma of two (each branch
 /// starts from the register) and a destructure of a fresh value after one are unchanged. Every row
 /// captured from jq 1.7.1; stdout and the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_source_destructuring_the_register_twice_raises_4583() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
@@ -138288,7 +137587,6 @@ fn test_reduce_source_destructuring_the_register_twice_raises_4583() -> Result<(
 /// with no handler and a body that raises nothing stay answered, as in jq. A `$x` bound outside, with an
 /// array pattern, is a separate residual (limitations.md). Every row captured from jq 1.7.1; stdout and
 /// the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_caught_empty_body_destructure_in_navigating_fold_raises_4621() -> Result<()>
 {
@@ -138354,7 +137652,6 @@ fn test_foreach_source_caught_empty_body_destructure_in_navigating_fold_raises_4
 /// and `|=` through it wrote. A handler that emits nothing, a `try` with no handler, a `?`, and a `$x`
 /// that is the register (`.[0] as $x` under `.[]?`) are answered, as in jq. Every row captured from jq
 /// 1.7.1; stdout and the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_outer_marker_empty_body_destructure_in_navigating_fold_raises_4626(
 ) -> Result<()> {
@@ -138491,7 +137788,6 @@ fn test_foreach_source_outer_marker_empty_body_destructure_in_navigating_fold_ra
 /// under a `try ... catch H` whose handler emits. A chain with a bare `$var` alternative runs it, which
 /// performs no step, so jq answers. Every row captured from jq 1.7.1; stdout and the exit status are
 /// pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_outer_marker_chain_empty_body_destructure_in_navigating_fold_raises_4621(
 ) -> Result<()> {
@@ -138598,7 +137894,6 @@ fn test_foreach_source_outer_marker_chain_empty_body_destructure_in_navigating_f
 /// route skipped any bind ahead of the destructure, since its source may emit nothing, and the source
 /// was answered. A bind whose source emits nothing (`empty`, `select(false)`) never reaches the
 /// destructure and is answered, as in jq. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_source_outer_marker_destructure_behind_an_always_emitting_bind_raises_4655(
@@ -138743,7 +138038,6 @@ fn test_foreach_source_outer_marker_destructure_behind_an_always_emitting_bind_r
 /// the register on next to a fresh value. Every row captured from jq 1.7.1 on `{"a":5}`; the
 /// controls (an argument that is all the register, a `first(f)` that stops before the fresh item,
 /// a `$`-style parameter) pin what stays answered.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_fold_source_destructuring_a_fresh_item_handed_through_a_call_raises_4665() -> Result<()> {
@@ -138932,7 +138226,6 @@ fn test_fold_source_destructuring_a_fresh_item_handed_through_a_call_raises_4665
 /// now asks too). A bare rebind with no pattern step, and a bind with no destructure, still answer.
 /// A `null` literal bound to a variable, in the body of another fold, is a separate residual
 /// (limitations.md). Every row captured from jq 1.7.1; stdout and the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_destructuring_a_fresh_variable_raises_4616() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
@@ -139002,7 +138295,6 @@ fn test_foreach_source_destructuring_a_fresh_variable_raises_4616() -> Result<()
 /// source was driven by value and answered (`[]`), and `del`, `=` and `|=` wrote through the answer. A
 /// bare rebind and a source that only measures it still answer. Only stdout and the exit status are
 /// pinned: the message names the process's environment. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_destructuring_the_environment_raises_4630() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
@@ -139066,7 +138358,6 @@ fn test_fold_source_destructuring_the_environment_raises_4630() -> Result<()> {
 /// `del`, `=` and `|=` wrote through it. A destructure of the register inside the brackets is answered
 /// by jq and stays so, as does a bare rebind. Every row captured from jq 1.7.1; stdout and the exit
 /// status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_destructuring_a_fresh_value_inside_an_array_raises_4630() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
@@ -139131,7 +138422,6 @@ fn test_fold_source_destructuring_a_fresh_value_inside_an_array_raises_4630() ->
 /// the destructure of the register inside the brackets is answered by jq and stays so. A `$x` marker
 /// destructured inside the brackets is the #4604 family (limitations.md). Every row captured from jq
 /// 1.7.1; stdout and the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_body_source_destructuring_dot_inside_an_array_raises_4632() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
@@ -139222,7 +138512,6 @@ fn test_reduce_body_source_destructuring_dot_inside_an_array_raises_4632() -> Re
 /// through the answer. Controls: a left that can be truthy never runs the right operand, a body
 /// that does not raise never runs the handler, and a handler or branch that destructures nothing
 /// raises nothing. Every row captured from jq 1.7.1; stdout and the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_body_source_destructuring_dot_behind_an_alternative_or_handler_in_an_array_raises_4635(
 ) -> Result<()> {
@@ -139391,7 +138680,6 @@ fn test_reduce_body_source_destructuring_dot_behind_an_alternative_or_handler_in
 /// branch that never runs raise nothing (a bare branch under `if`, `limit`, `first` or `nth` may never run, and
 /// is answered). Every row captured from jq 1.7.1; stdout and the exit
 /// status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_body_source_destructuring_dot_behind_a_bare_alternative_or_handler_raises_4644(
 ) -> Result<()> {
@@ -139608,7 +138896,6 @@ fn test_reduce_body_source_destructuring_dot_behind_a_bare_alternative_or_handle
 /// (`null`); the walk read them as opaque and the source was driven by value. Controls: a tail that emits
 /// nothing (`| empty`, `| select(false)`) or navigates (`| .a`), a branch in the second comma item, a `def`
 /// with a parameter. Every row captured from jq 1.7.1; stdout and the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_source_run_branch_behind_tail_comma_def_and_computed_error_4703() -> Result<()> {
@@ -142493,7 +141780,6 @@ fn test_foreach_source_run_branch_behind_tail_comma_def_and_computed_error_4703(
 /// `try` body inside a moved `reduce` body (the pattern step raises there and the `try` catches it).
 /// The moved-body spellings of the comma left operand, the thrown object and the pipe stage ride the
 /// same gates. Every row captured from jq 1.7.1; stdout and the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_source_destructuring_dot_behind_a_bare_alternative_or_handler_raises_4677(
@@ -142684,7 +141970,6 @@ fn test_foreach_source_destructuring_dot_behind_a_bare_alternative_or_handler_ra
 /// The foreign `$x` spellings stay with #4709; a handler that rethrows (`catch error`) or empties
 /// without being `empty` is still answered. Every row captured from jq
 /// 1.7.1; stdout and the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_leading_destructure_empties_a_foreach_source_in_a_moved_reduce_body_4704(
 ) -> Result<()> {
@@ -142797,7 +142082,6 @@ fn test_caught_leading_destructure_empties_a_foreach_source_in_a_moved_reduce_bo
 /// read the `try` with a handler as opaque and the source was answered. The value decides, so the
 /// source is routed to the resolver rather than refused. Every row captured from jq 1.7.1; stdout and
 /// the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_try_body_destructuring_dot_with_a_handler_raises_4682() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
@@ -142903,7 +142187,6 @@ fn test_foreach_source_try_body_destructuring_dot_with_a_handler_raises_4682() -
 /// truthiness was read only for a marker certified as equal to the accumulator, and a moved body
 /// certifies none, so the source was driven by value and answered (`del`, `=` and `|=` wrote through
 /// it). Every row captured from jq 1.7.1; stdout and the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_body_select_on_a_truthy_marker_then_destructure_raises_4604() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
@@ -142962,7 +142245,6 @@ fn test_reduce_body_select_on_a_truthy_marker_then_destructure_raises_4604() -> 
 /// wrote through it. The top-level-only restriction is lifted. The value-mode operand form (`-(...)`,
 /// `[...]|.[0]` under a `try`), which jq answers, was refused before and still is (limitations.md).
 /// Every row captured from jq 1.7.1; stdout and the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nested_fold_source_destructuring_a_mixed_body_call_raises_4600() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
@@ -143020,7 +142302,6 @@ fn test_nested_fold_source_destructuring_a_mixed_body_call_raises_4600() -> Resu
 /// cannot tell, and left any `if` to the by-value route, which answered the first (`del`, `=` and `|=`
 /// wrote through it). The source is now read with the taken branch. Every row captured from jq 1.7.1;
 /// stdout and the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_if_on_a_marker_reads_the_taken_branch_4604() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
@@ -143089,7 +142370,6 @@ fn test_fold_source_if_on_a_marker_reads_the_taken_branch_4604() -> Result<()> {
 /// navigates, a source that navigates before its bind, a chain with no bare alternative, and the
 /// `reduce` twin (answered since #4613). Every row captured from jq 1.7.1; stdout and
 /// the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_alt_chain_on_untracked_entry_states_the_register_4489() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
@@ -143255,7 +142535,6 @@ fn test_foreach_source_alt_chain_on_untracked_entry_states_the_register_4489() -
 /// jq answers `[]`, and `del` through it wrote nothing. Only a chain that ends in a bare `$var`, in a
 /// fold that is not inside another fold's body, is read. The contrasts stay refused, as in jq. Every
 /// row captured from jq 1.7.1; stdout and the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_source_alt_chain_on_untracked_entry_states_the_register_4613() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
@@ -143361,7 +142640,6 @@ fn test_reduce_source_alt_chain_on_untracked_entry_states_the_register_4613() ->
 /// contrast jq answers keeps answering: a `null` register (`{"a":null}` with INIT `.a`: the first
 /// alternative's destructure of `null` does not raise, so nothing is retried), and so does a `null` document. Every row captured from jq
 /// 1.7.1; stdout and the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_source_destructuring_the_document_after_a_moving_init_raises_4581() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
@@ -143485,7 +142763,6 @@ fn test_reduce_source_destructuring_the_document_after_a_moving_init_raises_4581
 /// `(.x | .. | (. as [$q] ?// $z | $z)) = 9` on `{"x":[null],"k":3}` is
 /// `{"x":[9]}`, with `k` gone -- the nested path `["x",0,0]` fails once `["x",0]`
 /// holds `9`, and `$z` retries at `["x",0]`. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructuring_alt_bind_writes_and_a_retry_resumes_from_null_3859() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -143941,7 +143218,6 @@ fn test_seq_slurp_materializes_lazy_results_and_the_wrap_boundary_2847() -> Resu
 /// `[]` before it raises and this refuses before printing, so stdout differs, as before.)
 /// Every row captured from jq 1.7.1 with `-c` on `{"a":{"b":1},"k":2}`, on the stdin and `-n`
 /// routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_register_catch_handler_compound_of_select_stages_4151() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -144034,7 +143310,6 @@ fn test_register_catch_handler_compound_of_select_stages_4151() -> Result<()> {
 /// handler never runs, and this refuses before printing, so stdout differs, as for #4151.)
 /// Every row captured from jq 1.7.1 with `-c` on `{"a":{"b":1},"k":2}`, on the stdin and `-n`
 /// routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_register_catch_handler_that_never_runs_4309() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -144184,7 +143459,6 @@ fn test_register_catch_handler_that_never_runs_4309() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_register_catch_handler_over_register_keeping_stage_3767() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":2}"#;
@@ -144383,7 +143657,6 @@ fn test_register_catch_handler_over_register_keeping_stage_3767() -> Result<()> 
 /// are the silent write skip the wrapper shapes caused under a `try` (the refusal was
 /// caught as though it were jq's own, so `del` left the document unchanged where jq
 /// deletes). Every row captured from jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_register_wrapper_over_navigates_nothing_stage_3767() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -144567,7 +143840,6 @@ fn test_register_wrapper_over_navigates_nothing_stage_3767() -> Result<()> {
 /// in jq. Rows with a `def` call are left out: `cannot_move_register` never admits a call
 /// and jq answers them, so they stay refused (the safe direction). Every row captured from
 /// jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_register_compound_stage_of_register_keeping_branches_3767() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -144784,7 +144056,6 @@ fn test_register_compound_stage_of_register_keeping_branches_3767() -> Result<()
 /// navigation after the collect or inside it (`[.a]` on a scalar), and a collect whose contents
 /// the resolver does not check (`with_entries`, `|=`). Every row captured from jq 1.7.1, on the
 /// stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_register_collect_as_a_branch_of_a_compound_stage_4152() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -144964,7 +144235,6 @@ fn test_register_collect_as_a_branch_of_a_compound_stage_4152() -> Result<()> {
 /// navigates is path-checked as in a pipe, so `[first(numbers)]` is `[]` and
 /// `[first(1 | .a)]` raises. The output is computed, so a navigation after it inside the
 /// brackets still refuses. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_collect_first_limit_nth_keeps_the_register_3767() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -145285,7 +144555,6 @@ fn test_malformed_element_inside_a_lazy_array_prints_nothing_3909() -> Result<()
 /// and `input_line_number` rows are the ones that fail without the fix, and the `path` rows
 /// pin the register for every spelling. Every row captured from jq 1.7.1, on the stdin and
 /// `-n` routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_register_wrapper_over_by_value_leaf_stage_4108() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -145605,7 +144874,6 @@ fn test_register_wrapper_over_by_value_leaf_stage_4108() -> Result<()> {
 /// accumulator and the path check refuses (jq: `Invalid path expression with result ...`, exit 5).
 /// It was accepted, and `del` wrote `null` over the whole document. A source that navigates
 /// (`.[]?`) leaves jq's register on the element, where the same UPDATE answers `[]`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_try_update_handler_moves_the_register_4126() -> Result<()> {
     for (filter, doc) in [
@@ -145646,7 +144914,6 @@ fn test_reduce_try_update_handler_moves_the_register_4126() -> Result<()> {
 /// entered it, so `f | $x` answers `[]` as `1 | $x` does. The call used to read as a stage that
 /// may have moved the register: a bare `path` refused, and a `try` around it swallowed the refusal
 /// and printed nothing at exit 0. A body that navigates (`.a`) still refuses, as jq's does.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_def_call_with_a_literal_body_keeps_the_register_4124() -> Result<()> {
     let doc = r#"{"a":{"b":{"b":null}},"c":2}"#;
@@ -145689,7 +144956,6 @@ fn test_def_call_with_a_literal_body_keeps_the_register_4124() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_def_call_over_a_register_keeping_body_keeps_the_register_4109() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":2}"#;
@@ -145765,7 +145031,6 @@ fn test_def_call_over_a_register_keeping_body_keeps_the_register_4109() -> Resul
 /// #4124 review: the zero-arity `def` call arm shares one budget across the whole question, so a
 /// chain whose every def calls the one below it several times in a pipe ends at once, as it did
 /// before the arm (a depth cap alone made the analysis fanout^16 long: minutes at a fanout of 5).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_def_call_chain_fanout_is_bounded_4124() -> Result<()> {
     let mut filter = String::from("path(. as $x | def f0: 1; ");
@@ -145794,7 +145059,6 @@ fn test_def_call_chain_fanout_is_bounded_4124() -> Result<()> {
 /// - a body that raises `. // X` or `select(. // 1) | error` may raise the register's
 ///   node, so the handler's `(.a)?` cannot be pruned as a path error: pruning it
 ///   dropped the answer (`del` of the negation wrote nothing, `path` printed nothing).
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_try_catch_operand_of_and_or_negate_refuses_like_jq_4125() -> Result<()> {
     for (program, doc, message) in [
@@ -145831,7 +145095,6 @@ fn test_try_catch_operand_of_and_or_negate_refuses_like_jq_4125() -> Result<()> 
 /// `and` whose `L` is falsy stops before `R` (so `R`'s `try` never runs), a body that
 /// raises a fresh value cannot be the register's node, and a body that raises its input
 /// outright is still seeded as the register.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_try_catch_operand_neighbours_keep_their_answers_4125() -> Result<()> {
     for (program, doc, want) in [
@@ -145875,7 +145138,6 @@ fn test_try_catch_operand_neighbours_keep_their_answers_4125() -> Result<()> {
 /// captured from the binary built from the parent commit and are identical on
 /// this one. An untracked scalar (`1 | .[]?`) is not a trackable one, so the
 /// path error `?` keeps still raises; a handler that is not `empty` still runs.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_swallowed_iteration_in_path_consumers_answers_what_it_did_3728() -> Result<()> {
     const MIXED: &str = r#"[1,"a",null,true,[2],{"k":3}]"#;
@@ -146028,7 +145290,6 @@ fn test_swallowed_iteration_in_path_consumers_answers_what_it_did_3728() -> Resu
 /// a scalar root still answers `[]`. The valid-JSON rows are jq 1.7.1's own; the rows jq
 /// cannot read were captured from the binary built from the parent commit and are identical
 /// on this one.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_swallowed_path_iteration_answers_what_it_did_4157() -> Result<()> {
     const MIXED: &str = r#"[1,"a",null,true,[2],{"k":3}]"#;
@@ -146132,7 +145393,6 @@ fn test_swallowed_path_iteration_answers_what_it_did_4157() -> Result<()> {
 /// the message; in path position the boundary is not shortcut (`path(...)` is not a path
 /// expression there). The valid-JSON rows are jq 1.7.1's own; the undecodable string, which
 /// jq cannot read, escapes as it does for `try .[] catch "c"`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_path_iteration_with_a_literal_answers_what_it_did_4280() -> Result<()> {
     const MIXED: &str = r#"[1,"a",null,true,[2],{"k":3}]"#;
@@ -146227,7 +145487,6 @@ fn test_caught_path_iteration_with_a_literal_answers_what_it_did_4280() -> Resul
 /// have read. By value the payload was `false`/`null`, identical to the register, so
 /// `path(.a? or try error(.c) catch .)` printed `["a"]` where jq exits 5. Every row
 /// captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_error_message_navigation_is_path_checked_4146() -> Result<()> {
     for (program, doc, message) in [
@@ -146311,7 +145570,6 @@ fn test_error_message_navigation_is_path_checked_4146() -> Result<()> {
 /// stays answered, and two rows that raised before this change still raise. Every row captured from jq 1.7.1, on the stdin and `-n` routes. Where the
 /// refusal is the loud guess inside another fold's body it reads `with result ...` rather than
 /// jq's `near attempt to access element "a"`, so those rows pin only the shared prefix.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_destructuring_the_register_raises_where_it_is_not_4128() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -146436,7 +145694,6 @@ fn test_fold_source_destructuring_the_register_raises_where_it_is_not_4128() -> 
 /// first 12 rows are the issue's, captured from jq 1.7.1 on the stdin and `-n` routes; the rest are
 /// must-not-change rows jq answers: a `try` that catches the last alternative's own error, and a
 /// fork whose INIT left the register at the entry.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_destructure_bind_refusal_survives_try_and_fold_init_4150() -> Result<()> {
@@ -146588,7 +145845,6 @@ fn test_destructure_bind_refusal_survives_try_and_fold_init_4150() -> Result<()>
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_path_f_stage_leaves_register_4118() -> Result<()> {
@@ -146681,7 +145937,6 @@ fn test_path_f_stage_leaves_register_4118() -> Result<()> {
 /// same node, key and path as the bracket, including a negative index -- where `nth(-1) | key` used
 /// to answer `-1` and `.[-1] | key` answers the resolved index. Rows 1-3 are jq 1.7.1's own
 /// values; `key` is a succinctly builtin, so those rows pin the equality with `.[n]`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nth_reads_the_same_position_as_the_bracket_4163() -> Result<()> {
     for doc in [
@@ -146771,7 +146026,6 @@ fn test_nth_reads_the_same_position_as_the_bracket_4163() -> Result<()> {
 /// #4197: jq mode keeps its generator model for a slice bound with no output -- the empty
 /// stream is "no slice" on a read and a no-op on a write -- where yq mode raises. Every row
 /// captured live from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_jq_slice_bound_with_no_output_is_no_slice_4197() -> Result<()> {
     for (program, want) in [
@@ -146792,7 +146046,6 @@ fn test_jq_slice_bound_with_no_output_is_no_slice_4197() -> Result<()> {
 /// body that still runs, an index that stands for every child, a `has` that is
 /// `false`), and jq does none of it. Every row was captured from `/usr/bin/jq`
 /// 1.7.1 and must keep its answer.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_jq_empty_operand_keeps_the_generator_model_4139() -> Result<()> {
     for (input, filter, expected) in [
@@ -147567,10 +146820,6 @@ fn test_owned_array_slice_read_keeps_node_identity_answers_4286() -> Result<()> 
 /// milliseconds.
 /// The bound is far above the fused time and far below the unfused one, so it fails on the
 /// regression and not on a loaded machine.
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 #[test]
 fn test_computed_slice_read_loop_does_not_grow_with_the_slice_4286() -> Result<()> {
     let doc = format!(
@@ -147606,7 +146855,6 @@ fn test_computed_slice_read_loop_does_not_grow_with_the_slice_4286() -> Result<(
 /// then the index as written (`-1` stays `-1`, past either end of the slice is `null`), through
 /// `path`, `=`, `|=` and `del`, with the shapes that keep the general route (a non-array target, a
 /// float-spelled index, a generator bound) unchanged. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_of_a_computed_slice_read_names_the_slice_and_the_index_4356() -> Result<()> {
     const DOC: &str =
@@ -147683,7 +146931,6 @@ fn test_path_of_a_computed_slice_read_names_the_slice_and_the_index_4356() -> Re
 /// second (a debug build a few). Both halves are needed: the resolver's slice and the path walk's. The
 /// bound sits far above the fused time and far below the unfused one, so it fails on the
 /// regression and not on a loaded machine.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_of_a_computed_slice_read_loop_does_not_grow_with_the_slice_4356() -> Result<()> {
     let doc = format!(
@@ -148200,7 +147447,6 @@ fn test_path_try_equals_the_question_mark_spelling_4412() -> Result<()> {
 
 /// #4412: the rows from jq 1.7.1, and the boundary: a handler that runs, or a body that is not
 /// navigation, is not `E?` and keeps its route and its answer.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_path_try_values_and_boundary_4412() -> Result<()> {
     let doc = r#"[1, null, "s", {"a": 1}, [2], true]"#;
@@ -149009,7 +148255,6 @@ fn test_negative_index_write_error_keeps_jq_wording_2335() -> Result<()> {
 /// refusal and refused rows jq answers. The last alternative's error, a destructuring that fails
 /// in every alternative and an error jq does not turn into a retry (the terminal `with result`)
 /// still propagate. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_alternative_retries_on_an_uncaught_body_path_error_4487() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -149153,7 +148398,6 @@ fn test_alternative_retries_on_an_uncaught_body_path_error_4487() -> Result<()> 
 /// body does (`try .. catch` already did; the rest were refused on the build before #4487). The controls are a body whose retried alternative raises (jq's own type error,
 /// `first(.a)`), the last alternative's error, and a handler that does not navigate. Every row
 /// captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_alternative_retry_past_a_wrapped_leading_navigation_4441() -> Result<()> {
     const X: &str = r#"{"x":[true]}"#;
@@ -149290,7 +148534,6 @@ fn test_alternative_retry_past_a_wrapped_leading_navigation_4441() -> Result<()>
 /// the by-value drive answered `[]` and `del` deleted the document (exit 0). An argument that is
 /// another node (`f(.a)`), the other parameter and the value-mode source keep their answers.
 /// Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_def_parameter_bound_to_the_register_4485() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -149436,7 +148679,6 @@ fn test_foreach_source_def_parameter_bound_to_the_register_4485() -> Result<()> 
 /// left it (the failed alternatives were backtracked), and a `reduce` UPDATE leaves it there
 /// whichever alternative destructured. EXTRACT's `$k` was refused as a lost register. Every row
 /// captured from jq 1.7.1 with `-c`; the message is pinned only as the common prefix.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_under_an_alt_bind_retries_and_states_the_bare_alternative_4488() -> Result<()> {
     let rows: Vec<PathRow3289> = vec![
@@ -149649,7 +148891,6 @@ fn test_fold_under_an_alt_bind_retries_and_states_the_bare_alternative_4488() ->
 /// (`limit(0.5; ..)` takes `ceil(0.5)`) and a frozen `$x`. On `null` the destructure succeeds and
 /// jq answers. A `reduce` source is the contrast: it backtracks, so jq answers `[]`. Every row
 /// captured from jq 1.7.1 with `-c`; the message is pinned only as the common prefix.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_destructuring_limit_one_comma_first_leaf_4514() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -149819,7 +149060,6 @@ fn test_foreach_source_destructuring_limit_one_comma_first_leaf_4514() -> Result
 /// behind a variable (`as $b`), a frozen `$x`, the wrappers that hand the first output on (`nth(0; ..)`, a pipe with `.`, `try`) and an array pattern; the contrasts are a first output that is not the register (`limit(2; 1, .)`, `nth(1; ..)`, `limit(0; ..)`), where the by-value route is right; on `null` the
 /// destructure succeeds and jq answers. Every row captured from jq 1.7.1 with `-c`; the message is
 /// pinned only as the common prefix.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_destructuring_register_on_first_output_only_4514() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -150141,7 +149381,6 @@ fn test_foreach_source_destructuring_register_on_first_output_only_4514() -> Res
 /// wrapper and these read through the wrappers that hand the chain on unchanged. Every jq side
 /// captured from jq 1.7.1; the `-(...)` row is the #4496 audit's wrong-accept shape (jq raises, the
 /// document must not be echoed).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_wrapped_first_of_a_chain_emits_once_in_path_mode_4497() -> Result<()> {
     let doc: &'static str = r#"{"a":true}"#;
@@ -150218,7 +149457,6 @@ fn test_foreach_wrapped_first_of_a_chain_emits_once_in_path_mode_4497() -> Resul
 /// read: a comma inside `first`, a chain passed as a `def` argument, a nested `foreach` over
 /// `first(CHAIN)` in a `foreach` UPDATE, and `first(CHAIN)` as a `reduce`/`foreach` UPDATE or
 /// EXTRACT. Every jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_first_limit_nth_chain_in_path_mode_stops_nothing_and_emits_per_count_4537() -> Result<()> {
     let doc: &'static str = r#"{"a":true}"#;
@@ -150320,7 +149558,6 @@ fn test_first_limit_nth_chain_in_path_mode_stops_nothing_and_emits_per_count_453
 /// stop forcing the `?//` retry, and a larger count never stops there. A body that is not `.`, an
 /// `nth` past the first alternative's lone output and a zero count stay refused, as in jq. Every
 /// jq side captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_reduce_update_limit_of_a_chain_hands_the_accumulator_on_4662() -> Result<()> {
     let doc: &'static str = r#"{"a":true}"#;
@@ -150419,7 +149656,6 @@ fn test_reduce_update_limit_of_a_chain_hands_the_accumulator_on_4662() -> Result
 /// destructure of the register itself (`def f: .`) is still answered (a `reduce` backtracks its
 /// source), as are the value-mode spelling and a negated `try` operand. Every row captured from
 /// jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // The filters hold `{a:1}`, which clippy reads as a format argument.
 #[allow(clippy::literal_string_with_formatting_args)]
@@ -150520,7 +149756,6 @@ fn test_reduce_source_destructuring_a_fresh_bodied_call_4494() -> Result<()> {
 /// step raises whatever INIT left the register on). The controls jq answers stay answered: a
 /// chain with a bare alternative to retry onto, the register itself behind a variable or a
 /// closure argument, and the value-mode spelling. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // The filters hold `{a:1}`, which clippy reads as a format argument.
 #[allow(clippy::literal_string_with_formatting_args)]
@@ -150706,7 +149941,6 @@ fn test_reduce_source_destructuring_a_fresh_value_residual_shapes_4522() -> Resu
 /// captured from jq 1.7.1 with `-c`. A mixed body *inside* another fold's body under a value-mode
 /// operand is
 /// [`test_reduce_source_certain_fresh_destructure_in_a_fold_body_value_mode_4600`]'s.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // The filters hold `{a:1}`, which clippy reads as a format argument.
 #[allow(clippy::literal_string_with_formatting_args)]
@@ -150919,7 +150153,6 @@ fn test_reduce_source_destructuring_a_fresh_value_mixed_body_and_nested_fold_452
 /// jq raises as it does without the `try`. The read was withheld for any `try`/`?` in the source, so
 /// `del` deleted the document and `=`/`|=` replaced it. A `try`/`?` whose body holds the destructure
 /// catches its raise and the source is answered, as in jq. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_reduce_source_try_around_first_of_register_comma_alone_raises_in_a_moved_body_4676(
@@ -151063,7 +150296,6 @@ fn test_reduce_source_try_around_first_of_register_comma_alone_raises_in_a_moved
 /// so `del` deleted the document and `=`/`|=` replaced it. A `//` under a `try`/`?` that holds a
 /// destructure (the catch answers) and a destructure on the right of a truthy left stay answered.
 /// Every row captured from jq 1.7.1; stdout and the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_reduce_source_destructure_on_the_left_of_an_alternative_in_a_moved_body_raises_4674(
@@ -151243,7 +150475,6 @@ fn test_reduce_source_destructure_on_the_left_of_an_alternative_in_a_moved_body_
 /// generated. It used to be answered (`del` deleted the document). `first({a:1}, .)` raises on the fresh
 /// item instead, and outside a moved body the destructure of the register succeeds. A `try`/`?` around
 /// the destructure catches the raise, so those sources are answered. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_reduce_source_first_of_register_comma_in_a_moved_body_raises_4667() -> Result<()> {
@@ -151337,7 +150568,6 @@ fn test_reduce_source_first_of_register_comma_in_a_moved_body_raises_4667() -> R
 /// destructure catches the raise (answered), a fresh first leaf (`first({a:1}, .)`) raises on the fresh item,
 /// and the register is the accumulator when the outer source did not move it. Every row is a live jq 1.7.1
 /// capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_reduce_source_first_of_register_comma_nested_or_behind_a_try_in_a_moved_body_4674(
@@ -151515,7 +150745,6 @@ fn test_reduce_source_first_of_register_comma_nested_or_behind_a_try_in_a_moved_
 /// trackable, and `del` deleted the document. Controls: a navigating builtin that reads by value
 /// (`getpath`, `keys`, `length`), a `try` around the navigation, a fresh first leaf, and the accumulator as the
 /// register (`reduce 1 as $i`, a top-level fold). Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_reduce_source_navigating_after_first_of_dot_in_a_moved_body_4685() -> Result<()> {
@@ -151696,7 +150925,6 @@ fn test_reduce_source_navigating_after_first_of_dot_in_a_moved_body_4685() -> Re
 /// stages only repeat their input (`(., {a:1}) | ., .`) is still generated and still meets the destructure,
 /// which raises on it. The contrasts stop short of the fresh item (`limit(2; limit(2; ., .), {a:1})`) and
 /// answer. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_reduce_source_fresh_comma_behind_counted_wrappers_and_repeating_stages_4666() -> Result<()>
@@ -151802,7 +151030,6 @@ fn test_reduce_source_fresh_comma_behind_counted_wrappers_and_repeating_stages_4
 /// is not at, so the chain's first step fails `path_intact`, the second alternative's step fails the
 /// same way, and the raise stands. It was answered (`del` deleted the document). The same fold where `.` is
 /// the register (a literal source) answers, as before. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_two_alternative_chain_foreach_in_a_carrying_reduce_in_a_moved_fold_body_4651() -> Result<()>
@@ -151915,7 +151142,6 @@ fn test_two_alternative_chain_foreach_in_a_carrying_reduce_in_a_moved_fold_body_
 /// fails the same way, and the raise stands (a `null`/`true` document included: the built value is not
 /// identical to it). It was answered (`[]`, and `del` wrote). A single-pattern spelling raised already, and
 /// the same fold where `.` is the register answers. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_two_alternative_chain_foreach_in_a_carrying_reduce_behind_an_untracked_stage_4694(
@@ -151985,7 +151211,6 @@ fn test_two_alternative_chain_foreach_in_a_carrying_reduce_behind_an_untracked_s
 /// `try` swallows it, the state becomes `null`, and the second step's `or` result is a computed boolean that
 /// `path()` refuses. It was answered (`[]`). With INIT `.` (the register itself) and without the `or`
 /// the same program answers. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_two_alternative_chain_foreach_in_a_carrying_reduce_under_try_in_a_computed_accumulator_4694(
@@ -152028,7 +151253,6 @@ fn test_two_alternative_chain_foreach_in_a_carrying_reduce_under_try_in_a_comput
 /// itself and a carrying `reduce` around it raise (`del` deleted the document). Where nothing moved the
 /// register (a literal outer source) `.` is the register: the `reduce` UPDATE that holds the carrying
 /// `reduce` answers, and a top-level `foreach` UPDATE is refused at its emission. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_two_alternative_chain_in_a_carrying_foreach_in_a_moved_fold_body_4694() -> Result<()> {
@@ -152095,7 +151319,6 @@ fn test_two_alternative_chain_in_a_carrying_foreach_in_a_moved_fold_body_4694() 
 /// is reached (the last row). The exit code is jq's on every row; the message of the refusal is the
 /// resolver's guess ("with result"), so those rows pin the shared prefix. Every row is a live jq 1.7.1
 /// capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreign_marker_destructure_with_an_empty_body_in_a_fold_body_raises_4604() -> Result<()> {
@@ -152207,7 +151430,6 @@ fn test_foreign_marker_destructure_with_an_empty_body_in_a_fold_body_raises_4604
 /// backtracks a destructure of `.` and a `foreach` one in a `reduce` UPDATE does not move the register
 /// the fold restores, so the same shape destructuring `.` is answered, as jq does (the control rows). Every
 /// row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_select_on_a_foreign_marker_then_destructure_raises_for_a_reduce_source_4604() -> Result<()>
@@ -152311,7 +151533,6 @@ fn test_select_on_a_foreign_marker_then_destructure_raises_for_a_reduce_source_4
 /// last one's error stands, wherever the body is (it was read so only where the accumulator is off the
 /// register, #4621). A bare `$var` alternative runs without a step and does not raise (the last row). Every
 /// row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_alternative_chain_over_a_foreign_marker_in_a_fold_body_raises_4604() -> Result<()> {
@@ -152382,7 +151603,6 @@ fn test_alternative_chain_over_a_foreign_marker_in_a_fold_body_raises_4604() -> 
 /// A condition that fails passes nothing and jq answers (the last two rows). The exit code is jq's on every
 /// row; refusals carry the resolver's guessed message, so those rows pin the shared prefix. Every row is a
 /// live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_select_on_a_pure_marker_condition_decides_by_the_markers_value_4604() -> Result<()> {
@@ -152458,7 +151678,6 @@ fn test_select_on_a_pure_marker_condition_decides_by_the_markers_value_4604() ->
 /// whole UPDATE empty and the state `null`, which the end of the path refuses; it was answered (`[]`, and `del`
 /// wrote). A comma beside the `foreach` is not that (`, 1` emits), and a handler that emits is answered. Every row
 /// is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_caught_foreign_marker_destructure_as_the_head_of_a_pipe_update_of_a_reduce_4724(
@@ -152527,7 +151746,6 @@ fn test_caught_foreign_marker_destructure_as_the_head_of_a_pipe_update_of_a_redu
 /// certain, so it is jq's own end-of-path `Invalid path expression`: a `?` around the `path()` catches it
 /// (`[]`), a `try` inside the `path()` does not. It was raised as the resolver's guess, which nothing
 /// catches. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_caught_foreign_marker_refusal_is_caught_by_an_outer_try_4730() -> Result<()> {
@@ -152575,7 +151793,6 @@ fn test_caught_foreign_marker_refusal_is_caught_by_an_outer_try_4730() -> Result
 /// `jv_identical` to it by kind, so the chain's first alternative walks the register: the path is the
 /// walked one, not the root. The last rows pin a chain whose key raises, which takes the fallback
 /// alternative at the root and is left as it was. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_source_chain_over_rerooted_bound_expression_on_null_4756() -> Result<()> {
@@ -152643,7 +151860,6 @@ fn test_foreach_source_chain_over_rerooted_bound_expression_on_null_4756() -> Re
 /// register as the literal key `{b:$b}` does: it never retries onto the bare alternative, so nothing leaves the
 /// register at the entry. It was read as one that may retry and answered the root (`[]`). The last rows are the
 /// contrasts that still retry or navigate: a key that raises (`error("q")`) and a body that navigates (jq refuses). Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_source_chain_with_a_literal_computed_key_walks_the_null_register_4772() -> Result<()>
@@ -152740,7 +151956,6 @@ fn test_foreach_source_chain_with_a_literal_computed_key_walks_the_null_register
 /// never truthy runs `BRANCH` on the register, so a destructure there is the source's own: jq raises on a
 /// non-null document and walks the register on `null`. It was accepted. A truthy argument, or a body that
 /// names a parameter elsewhere, is unchanged. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_source_def_call_with_falsy_argument_runs_the_alternative_branch_4760() -> Result<()>
@@ -152815,7 +152030,6 @@ fn test_foreach_source_def_call_with_falsy_argument_runs_the_alternative_branch_
 /// `try`, a `reduce` source (which emits its state), the marker that *is* the register, a chain ending on a
 /// bare `$b`, a `null` document and a `reduce` over no elements (UPDATE never runs). Every row is a live jq 1.7.1
 /// capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_caught_foreign_marker_destructure_as_the_whole_update_foreach_of_a_reduce_4709(
@@ -152993,7 +152207,6 @@ fn test_caught_foreign_marker_destructure_as_the_whole_update_foreach_of_a_reduc
 /// `first((., {a:1}), 2)` and `nth(1; {a:1}, .)` answer). An item that cuts the generation short
 /// (`error`, `break`) hides the ones behind it. A `reduce` stage that returns its input hands `.` on,
 /// and `isempty`/`any`/`all` run their generator where they stand. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_reduce_source_fresh_comma_behind_wrappers_stages_and_predicates_4597() -> Result<()> {
@@ -153306,7 +152519,6 @@ fn test_reduce_source_fresh_comma_behind_wrappers_stages_and_predicates_4597() -
 /// register item's UPDATE still runs first, as in jq (an `error` or a `break` there wins). Not pinned: a
 /// source whose raise is not certain (an `error` item before the fresh one, a `try` or an `if` inside it)
 /// and a `foreach` source, which keep the guess. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_reduce_source_certain_fresh_destructure_in_a_fold_body_value_mode_4600() -> Result<()> {
@@ -153890,7 +153102,6 @@ fn test_reduce_source_certain_fresh_destructure_in_a_fold_body_value_mode_4600()
 /// The controls jq answers stay answered: a destructure that is never reached (`empty`,
 /// `select(false)`, the truthy side of `//`), the register behind a call, and a variable bound
 /// before the fresh value. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 // The filters hold `{a:1}`, which clippy reads as a format argument.
 #[allow(clippy::literal_string_with_formatting_args)]
@@ -154198,7 +153409,6 @@ fn test_reduce_source_destructuring_a_fresh_value_pipe_param_alt_residual_4566()
 /// `{"a":1}`. The by-value drive ran alternative one, answered, and `del`/`=` wrote through it. A
 /// `null` register keeps answering (alternative one's `null` destructure succeeds). Every row is a
 /// live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_chain_source_with_later_bare_alternative_destructure_in_a_fold_body_4578() -> Result<()> {
     // (document, filter, stdout, exit code)
@@ -154762,7 +153972,6 @@ fn test_chain_source_with_later_bare_alternative_destructure_in_a_fold_body_4578
 /// through the by-value answer. A truthy `$x` makes it `select(false)` (nothing is destructured, jq
 /// answers), and a `try` swallows the raise; both stay controls. Every row is a live jq 1.7.1 capture
 /// (stdout and exit code; the refusal's message differs from jq's).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_select_not_on_a_falsy_marker_passes_the_register_on_4604() -> Result<()> {
     // (document, filter, stdout, exit code)
@@ -155230,7 +154439,6 @@ fn test_select_not_on_a_falsy_marker_passes_the_register_on_4604() -> Result<()>
 /// it took for the register, so `path()` printed `[]` and `del` returned `null` where jq raises. The walk
 /// reads through the `try`/`?` now, and the resolver models the catch as it does for the destructure
 /// written directly. Every row is a live jq 1.7.1 capture (stdout and exit code).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_try_around_a_fresh_variable_destructure_in_a_fold_source_4640() -> Result<()> {
     // (document, filter, stdout, exit code)
@@ -155586,7 +154794,6 @@ fn test_try_around_a_fresh_variable_destructure_in_a_fold_source_4640() -> Resul
 /// answered the root. The contrasts stay as they were: an EXTRACT that is not a loop variable
 /// (`5`, `.a`) and a non-`null` document. Every row captured from jq 1.7.1 with `-c`; stdout and
 /// the exit status are pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_nested_foreach_loop_variable_hands_the_register_on_4485() -> Result<()> {
     const ROWS: &[(&str, &str, &str, i32)] = &[
@@ -155746,7 +154953,6 @@ fn test_foreach_source_nested_foreach_loop_variable_hands_the_register_on_4485()
 /// `Invalid path expression with result 1` after the first output; it is handed to its
 /// consumer at the marks the fold was entered with, and the walk no longer stops at the second
 /// partial stage. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_two_partial_register_stages_4485() -> Result<()> {
     const ROWS: &[(&str, &str, &str, i32)] = &[
@@ -155846,7 +155052,6 @@ fn test_foreach_source_two_partial_register_stages_4485() -> Result<()> {
 /// and the by-value drive answered `[]` where jq's register had moved onto `.a`
 /// (`def f($x): . as {a:$a} ?// $a | $x; f(2)`). The same body with the literal written inline
 /// was placed. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_def_parameter_bound_to_a_literal_4485() -> Result<()> {
     const ROWS: &[(&str, &str, &str, i32)] = &[
@@ -155925,7 +155130,6 @@ fn test_foreach_source_def_parameter_bound_to_a_literal_4485() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_source_call_args_and_nested_foreach_on_untracked_entry_4615() -> Result<()> {
     const ROWS: &[(&str, &str, &str, i32)] = &[
@@ -156078,7 +155282,6 @@ fn test_foreach_source_call_args_and_nested_foreach_on_untracked_entry_4615() ->
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_source_chain_inside_another_foreach_update_on_untracked_entry_4615() -> Result<()> {
     const ROWS: &[(&str, &str, &str, i32)] = &[
@@ -156349,7 +155552,6 @@ fn test_foreach_source_chain_inside_another_foreach_update_on_untracked_entry_46
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_source_null_or_null_marker_headed_chain_walks_the_null_register_4756() -> Result<()>
 {
@@ -156428,7 +155630,6 @@ fn test_foreach_source_null_or_null_marker_headed_chain_walks_the_null_register_
 /// answered the root (`[]`); `.` after `1 |` is no node of it, so a comma's other output keeps `[]`.
 /// The write side (`= 5`, `|= 5`, `del`) lands on the walked member. On a document that is not `null`
 /// the same heads answer as they did. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_mixed_or_wrapped_null_head_walks_the_null_register_4774() -> Result<()> {
     let chain = "(.|.) as {a:$a} ?// $a | .";
@@ -156542,7 +155743,6 @@ fn test_foreach_source_mixed_or_wrapped_null_head_walks_the_null_register_4774()
 /// no `null` one (`false // false`) or none at all (`null // empty`), and a left operand with both truthy and falsy
 /// outputs (`(null, 1) // null` emits only the `1`); a `false` behind a pipe or `first`/`try` is falsy too. Rows where `main` already refuses
 /// a document that is not `null` stay out. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_alternative_null_head_walks_the_null_register_4784() -> Result<()> {
     let chain = "(.|.) as {a:$a} ?// $a | .";
@@ -156760,7 +155960,6 @@ fn test_foreach_source_alternative_null_head_walks_the_null_register_4784() -> R
 /// (`[]`), at the top level, on an untracked entry and through `del`. #4769 spared a live boolean
 /// register from the frozen-`$var` withhold for this; #4770's `null`-only exemption decides the same
 /// rows, which these pin. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_null_or_marker_headed_chain_on_a_boolean_register_4773() -> Result<()> {
     let chain = "(.|.) as {a:$a} ?// $a | .";
@@ -156961,7 +156160,6 @@ fn test_foreach_source_null_or_marker_headed_chain_on_a_boolean_register_4773() 
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_reduce_with_a_chain_on_untracked_entry_4757() -> Result<()> {
     const REFUSED: &str = "Invalid path expression";
@@ -157037,7 +156235,6 @@ fn test_foreach_update_reduce_with_a_chain_on_untracked_entry_4757() -> Result<(
 /// counts against `n` (jq's `limit` is a `label`/`break` the chain's `?//` retries past), so the
 /// sibling `X` is reached only when `n` is 3 or more: `n` = 1 and 2 print the register once, where
 /// the by-value drive printed it twice. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_limit_of_a_chain_with_a_comma_sibling_counts_the_refused_emission_4663() -> Result<()> {
     let doc: &'static str = r#"{"a":true}"#;
@@ -157067,7 +156264,6 @@ fn test_limit_of_a_chain_with_a_comma_sibling_counts_the_refused_emission_4663()
 /// count its refused first emission, so the multi-output rows (`limit(2,1; ..)`, a comma sibling)
 /// keep jq's element count where the #4609 experiment gave one more. Every row captured from jq
 /// 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_wrapped_alt_chain_on_untracked_entry_states_the_register_4614() -> Result<()>
 {
@@ -157111,7 +156307,6 @@ fn test_foreach_source_wrapped_alt_chain_on_untracked_entry_states_the_register_
 /// boolean at the entry register first and only then runs (or raises in) the navigating one, so
 /// under a `?` the stream keeps `[0]` where the whole-UPDATE gate refused the leading emission too,
 /// and without it the raise names jq's own `"a" of 0`. Every row captured from jq 1.7.1 with `-c`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_verdict_next_to_a_navigating_verdict_keeps_the_leading_register_4660(
 ) -> Result<()> {
@@ -157199,7 +156394,6 @@ fn test_foreach_update_verdict_next_to_a_navigating_verdict_keeps_the_leading_re
 /// the state `null`, which the end of the path refuses) or of a `foreach` (the loop emits nothing for the step).
 /// They were answered (`[]`, and `del`/`|=` wrote). A comma beside the `foreach` is not that. Every row is a live
 /// jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_caught_foreign_marker_destructure_behind_identity_and_label_in_an_update_4732() -> Result<()>
@@ -157272,7 +156466,6 @@ fn test_caught_foreign_marker_destructure_behind_identity_and_label_in_an_update
 /// handler other than `empty` and for `first`/`limit`/`nth`. The same wrappers around a `foreach` that emits, or
 /// under a `foreach` UPDATE, are answered as before; a count that raises (`nth(-1; ..)`) is not read as one that cannot. A `foreach` SOURCE's own `try ... catch H` is not this: its
 /// handler runs on the raise and emits (#4709's controls). Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_caught_foreign_marker_destructure_under_a_handler_first_or_limit_in_a_reduce_update_4763(
@@ -157829,7 +157022,6 @@ fn test_caught_foreign_marker_destructure_under_a_handler_first_or_limit_in_a_re
 /// reaches a `null` element only (`.a` on `{"a":null}`, `(.a, .c)`), a boolean `$x`, and a `$x` bound at
 /// the root keep their answers. Every row is a live jq 1.7.1 capture; `. as $x` rows whose refusal prints
 /// the document instead of `null` are #4791's and stay out.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_caught_foreign_null_marker_in_a_reduce_body_whose_source_moved_the_register_4790(
@@ -160053,7 +159245,6 @@ fn test_caught_foreign_null_marker_in_a_reduce_body_whose_source_moved_the_regis
 /// `$x` answered `[]` (and `del`/`=` wrote) where jq refuses with `result null`. The controls keep their
 /// answers: `first(.c)`, `.. | select(. == null)` and, on `{"a":null,"c":null}`, `nth(1; ..)` and
 /// `last(.a, .c)` reach only a `null` element, which the `null` `$x` is. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_caught_foreign_null_marker_behind_first_limit_or_select_source_4795() -> Result<()> {
@@ -160224,7 +159415,6 @@ fn test_caught_foreign_null_marker_behind_first_limit_or_select_source_4795() ->
 /// not. The source may nest `try`s and end `// empty`. Controls jq answers: a fallback to `.`, a comma beside the
 /// `foreach`, a handler that emits. Under a `foreach` UPDATE the wrapped `foreach` emits nothing. Every row is a live
 /// jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_caught_foreign_marker_destructure_wrapped_in_a_reduce_update_and_catchable_4754(
@@ -160423,7 +159613,6 @@ fn test_caught_foreign_marker_destructure_wrapped_in_a_reduce_update_and_catchab
 /// `$x` that is the register (`. as $x`) or a `null` bound by navigation on a `null` document is not foreign, and a
 /// `1 |` stage ahead of the `foreach` stays refused (it compares `$x` with the literal, not the register, so a skip
 /// would answer a `null` document where jq refuses). Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_caught_foreign_marker_destructure_behind_a_fallback_or_if_in_a_foreach_update_or_extract_4776(
@@ -160600,7 +159789,6 @@ fn test_caught_foreign_marker_destructure_behind_a_fallback_or_if_in_a_foreach_u
 /// a source whose every element is that node (`.a`, `.[]` on one key, `(.a,.a)`), or that yields
 /// nothing (`empty`), is answered. A `foreach` that does not hand its state on is not read. Every row
 /// captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_in_a_reduce_whose_source_moved_the_register_4777(
 ) -> Result<()> {
@@ -160893,7 +160081,6 @@ fn test_caught_foreign_marker_destructure_in_a_reduce_whose_source_moved_the_reg
 /// a fallback is the state once the stages after it have run on it (`(. | FE) // 5 | tostring` is
 /// `"5"`). Falsy and absent states are controls: the `foreach` is not run when the condition fails.
 /// Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_behind_a_pure_condition_or_after_the_fallback_4778(
 ) -> Result<()> {
@@ -161361,7 +160548,6 @@ fn test_caught_foreign_marker_destructure_behind_a_pure_condition_or_after_the_f
 /// frame names, not with `1`. The `null`-document and `null`-marker rows are the ones a version that
 /// compared with the literal answered where jq refuses (`del`/`|=` wrote). Every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes: the `foreach` UPDATE, the `foreach` EXTRACT and the `reduce` UPDATE.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_behind_a_literal_stage_4782() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -162305,7 +161491,6 @@ fn test_caught_foreign_marker_destructure_behind_a_literal_stage_4782() -> Resul
 /// register only on the step whose element is the root, and foreign (the state `null`) on the others.
 /// Every row captured from `/usr/bin/jq` 1.7.1, both routes, with `del` and `|=` and the `null` controls
 /// that must still refuse where jq does.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_of_the_whole_document_4791() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -162442,7 +161627,6 @@ fn test_caught_foreign_marker_destructure_of_the_whole_document_4791() -> Result
 /// empty step left, as jq's do: a `select`/`if` condition on that state, a raising step and a `foreach`
 /// that changes the state on the steps where `$x` is the register decide the final state. Every row
 /// captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_later_steps_run_on_the_state_left_4792() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -162573,7 +161757,6 @@ fn test_caught_foreign_marker_destructure_later_steps_run_on_the_state_left_4792
 /// boolean document the bind is jq's `jv_identical` register on the root step and foreign (the state
 /// `null`) afterwards, so the `foreach` refuses with `null`; a `(.,.a)`/`(.,.[0])` source indexes the
 /// boolean and raises. Captured from `/usr/bin/jq` 1.7.1, both routes, `path` and `del`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_bound_outside_the_resolver_4791() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -162605,7 +161788,6 @@ fn test_caught_foreign_marker_bound_outside_the_resolver_4791() -> Result<()> {
 /// not an emptied update the walk may claim: the stage after the `// 5` fallback or the `select` gate runs
 /// on the value the empty step left, and raises or refuses as jq does. Captured from `/usr/bin/jq` 1.7.1,
 /// both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_emptied_foreach_update_behind_a_reading_stage_stays_unclaimed_4791() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -162652,7 +161834,6 @@ fn test_emptied_foreach_update_behind_a_reading_stage_stays_unclaimed_4791() -> 
 /// refusal names the state the empty step left (`null`), not that value. `if . then (1 | FE) else . end`
 /// reads its condition on the state. Every row captured from `/usr/bin/jq` 1.7.1, both routes, with the
 /// `null` document controls.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_behind_a_computed_stage_4793() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -162791,7 +161972,6 @@ fn test_caught_foreign_marker_destructure_behind_a_computed_stage_4793() -> Resu
 /// value. A zero-output or non-literal key is not a value head and stays on the by-value route. Every
 /// row captured from `/usr/bin/jq` 1.7.1, both routes, with the `null` document controls (where `$x`
 /// is the register and the `foreach` runs).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_caught_foreign_marker_destructure_behind_a_multi_output_head_4797() -> Result<()> {
@@ -162938,7 +162118,6 @@ fn test_caught_foreign_marker_destructure_behind_a_multi_output_head_4797() -> R
 /// `foreach` is, so the refusal names the value jq names (the fallback, or the `null` the empty step
 /// left) and `del`/`|=` refuse as jq does. It was read as a bare `foreach` only, which named the literal
 /// stage's value. Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_caught_foreign_marker_destructure_foreach_update_behind_a_gate_or_fallback_4797(
@@ -163157,7 +162336,6 @@ fn test_caught_foreign_marker_destructure_foreach_update_behind_a_gate_or_fallba
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_extract_after_an_update_that_may_have_moved_the_register_is_refused_4800(
@@ -163279,7 +162457,6 @@ fn test_foreach_extract_after_an_update_that_may_have_moved_the_register_is_refu
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_extract_after_a_register_moving_update_is_refused_behind_stages_4800() -> Result<()>
@@ -163668,7 +162845,6 @@ fn test_foreach_extract_after_a_register_moving_update_is_refused_behind_stages_
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_extract_after_an_alternative_update_is_read_per_branch_4800() -> Result<()> {
@@ -163873,7 +163049,6 @@ fn test_foreach_extract_after_an_alternative_update_is_read_per_branch_4800() ->
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_extract_after_an_alternative_update_behind_a_stage_is_read_per_branch_4837(
@@ -164053,7 +163228,6 @@ fn test_foreach_extract_after_an_alternative_update_behind_a_stage_is_read_per_b
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_extract_after_alternatives_in_a_pipe_is_read_per_branch_4843() -> Result<()> {
@@ -164175,7 +163349,6 @@ fn test_foreach_extract_after_alternatives_in_a_pipe_is_read_per_branch_4843() -
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_extract_after_an_alternative_behind_an_if_is_read_per_branch_4853() -> Result<()> {
     let fe = r"foreach ($x as {a:$a}|.) as $y (.; .; .)";
@@ -164315,7 +163488,6 @@ fn test_foreach_extract_after_an_alternative_behind_an_if_is_read_per_branch_485
 /// which also turned `empty` and a caught `path` into wrong refusals. Controls that must not move: an
 /// EXTRACT of `.` (the state is not where the pattern left the register, `result {"a":1}` in both), a
 /// source that moves the register (`.a?`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_body_dot_hand_on_of_a_single_pattern_bind_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -164428,7 +163600,6 @@ fn test_foreach_update_body_dot_hand_on_of_a_single_pattern_bind_4800() -> Resul
 /// a body that emits twice: jq stores each output as the state and path-checks none, so the answer is the
 /// EXTRACT's (`$i` is `result 1`, `null` is the register's `["a"]`, `empty` is no error). Each of those
 /// used to be refused naming the UPDATE's own state. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_single_pattern_bind_behind_wrappers_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -164814,7 +163985,6 @@ fn test_foreach_update_single_pattern_bind_behind_wrappers_4800() -> Result<()> 
 /// state again. With a source of more than one element the UPDATE was refused naming its own state, the
 /// one-element form having answered. A `break` to a label outside the UPDATE leaves the `foreach` and is
 /// not read (the control row answers as it did). Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_single_pattern_bind_beside_a_label_break_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -164932,7 +164102,6 @@ fn test_foreach_update_single_pattern_bind_beside_a_label_break_4800() -> Result
 /// does, so the answer is the EXTRACT's as it is without the `empty`. Each of those was refused naming the
 /// UPDATE's own state (or, under a `?`, answered `[]`). A sibling that is no bind (`7`, `.a`, `null`) stores
 /// a node of its own and is not read. Every row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_single_pattern_bind_beside_an_empty_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -165097,7 +164266,6 @@ fn test_foreach_update_single_pattern_bind_beside_an_empty_4800() -> Result<()> 
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_single_pattern_bind_beside_a_spelled_out_empty_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -165257,7 +164425,6 @@ fn test_foreach_update_single_pattern_bind_beside_a_spelled_out_empty_4800() -> 
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_single_pattern_bind_beside_a_computed_empty_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -165550,7 +164717,6 @@ fn test_foreach_update_single_pattern_bind_beside_a_computed_empty_4800() -> Res
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_single_pattern_bind_beside_a_constant_division_count_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -165790,7 +164956,6 @@ fn test_foreach_update_single_pattern_bind_beside_a_constant_division_count_4800
 /// names the EXTRACT's value). The inner `foreach` is also read when it emits from a bare computed entry
 /// (`null | foreach ($x as {a:$a} | .) ...`). Every row captured from `/usr/bin/jq` 1.7.1, both routes,
 /// with `del` and `|=` and the `null`-document controls.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_in_a_foreach_update_over_a_moving_source_4800(
 ) -> Result<()> {
@@ -166209,7 +165374,6 @@ fn test_caught_foreign_marker_destructure_in_a_foreach_update_over_a_moving_sour
 /// the state's kind (`["a"]`/`[0]`), a pattern landing on a node of another kind than the state, a nested
 /// or a computed-key pattern and a `foreach` ahead of a comma or a stage keep their reading. Every row
 /// captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_in_a_foreach_update_patterns_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -166336,7 +165500,6 @@ fn test_caught_foreign_marker_destructure_in_a_foreach_update_patterns_4800() ->
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_caught_foreign_marker_destructure_in_a_foreach_update_computed_key_stays_refused_nested_pattern_read_4800(
 ) -> Result<()> {
@@ -166363,7 +165526,6 @@ fn test_caught_foreign_marker_destructure_in_a_foreach_update_computed_key_stays
 /// `foreach` is handed, not the state, is what the pattern's `null`/boolean landing is compared with: `not | FE`
 /// on `{"a":true}` is `["a"]`, `1 | FE` keeps its refusal). Every row captured from `/usr/bin/jq` 1.7.1, both
 /// routes, with `del` and `|=`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_in_a_foreach_update_behind_identity_stages_and_value_heads_4800(
 ) -> Result<()> {
@@ -166795,7 +165957,6 @@ fn test_caught_foreign_marker_destructure_in_a_foreach_update_behind_identity_st
 /// `[null] | FE`, `{"a":null} | FE`, `tostring | FE`, `type | FE`, `not | not | FE`) hands the `foreach` a value
 /// that is `jv_identical` to the landing by kind, as the state is: the step reads like the bare one. Every row
 /// is one `main` answered differently from `/usr/bin/jq` 1.7.1, captured from it, both routes, with `del` and `|=`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_in_a_foreach_update_behind_same_kind_value_heads_4800(
 ) -> Result<()> {
@@ -167103,7 +166264,6 @@ fn test_caught_foreign_marker_destructure_in_a_foreach_update_behind_same_kind_v
 /// answered `["a"]`, `|=` wrote and `del` deleted, where jq raises at the step. A caught `try`, a head that is
 /// not of the landing's kind and the head-less form (which raised) are the controls. Every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_uncaught_foreign_marker_destructure_in_a_foreach_update_behind_same_kind_value_heads_4823(
 ) -> Result<()> {
@@ -167328,7 +166488,6 @@ fn test_uncaught_foreign_marker_destructure_in_a_foreach_update_behind_same_kind
 /// element, so jq raises `with result`. The controls: `$x.c`, equal in value to the register but another node, and the root
 /// `$x` itself raise at the step, and `$x.a` over a document whose `.a` carries no key the pattern names. Every row captured
 /// from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_destructuring_a_navigation_of_the_root_marker_behind_a_value_head_4827(
 ) -> Result<()> {
@@ -167474,7 +166633,6 @@ fn test_foreach_update_destructuring_a_navigation_of_the_root_marker_behind_a_va
 /// storage test of #4827 saw a node that was not the register's; the head without those stages is asked instead.
 /// The controls: `$x.c` (equal in value to the register, another node) still raises, also first in a comma beside the register's
 /// own node (a comma head is not stripped, so nothing changes there), and a `1` value head raises `with result`. Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_destructuring_a_wrapped_navigation_of_the_root_marker_4831() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -167616,7 +166774,6 @@ fn test_foreach_update_destructuring_a_wrapped_navigation_of_the_root_marker_483
 /// element and a container one, for `path`/`del`/`|=`. A `try` around the inner fold is the control: jq's
 /// catch leaves the outer state `null`, which its end-of-path check refuses with the old wording. Every row
 /// captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreign_marker_destructure_refusal_names_the_pattern_step_in_a_fold_update_4826(
 ) -> Result<()> {
@@ -168027,7 +167184,6 @@ fn test_foreign_marker_destructure_refusal_names_the_pattern_step_in_a_fold_upda
 /// elsewhere (#4588), the pattern is a `?//` chain (the last alternative's step names the element), `{$b}`, an array
 /// pattern or a source that indexes the bind's result, and for a `reduce` over a moving source the same chain, `{$a}`,
 /// `[$a]`, `$x | . as P` and a navigated bind. Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreign_marker_destructure_refusal_wording_across_patterns_and_routes_4826() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -168132,7 +167288,6 @@ fn test_foreign_marker_destructure_refusal_wording_across_patterns_and_routes_48
 /// does outside a fold. The raise was final in a fold body, so `foreach`/`reduce` UPDATE and EXTRACT refused
 /// where jq answers, and a `try` around `isempty(...)` swallowed the stale raise, so `del` deleted the document
 /// where jq refuses at the end of the path. Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_alt_bind_body_path_error_retries_in_a_fold_body_off_the_register_4608() -> Result<()> {
@@ -168354,7 +167509,6 @@ fn test_alt_bind_body_path_error_retries_in_a_fold_body_off_the_register_4608() 
 /// bind in a fold body marked off the register raises at the end of the path in jq, and a `try`,
 /// `isempty` or `del` around it must not turn that into an answer. Every row captured from
 /// `/usr/bin/jq` 1.7.1 (all refuse), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_alt_bind_retry_stays_off_for_nested_bodies_in_a_fold_off_the_register_4608() -> Result<()> {
@@ -168519,7 +167673,6 @@ fn test_alt_bind_retry_stays_off_for_nested_bodies_in_a_fold_off_the_register_46
 /// value. The rows after the first block are the controls the rewrite must leave alone: a head that
 /// IS the register (`select(true) |`, `$x |`, `first(., 1) |`), a top-level fold, and a container that
 /// holds the chain's key. Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_source_chain_on_a_fresh_container_emits_once_in_a_fold_update_4775() -> Result<()> {
@@ -168765,7 +167918,6 @@ fn test_foreach_source_chain_on_a_fresh_container_emits_once_in_a_fold_update_47
 /// answers (`["a"]` as a `foreach` EXTRACT), and under `try ((reduce ...) and (.a | .b)?)` the fold's stale
 /// answer let `del` through where jq refuses at the end of the path (`result false`). Every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_nested_fold_alt_bind_update_error_retries_in_a_fold_body_4806() -> Result<()> {
@@ -169035,7 +168187,6 @@ fn test_nested_fold_alt_bind_update_error_retries_in_a_fold_body_4806() -> Resul
 /// rewrite must leave alone: a head that is the register (a body that reads the earlier variable keeps
 /// its by-value answer, recorded in `limitations.md`).
 /// Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_chain_rewrite_covers_unread_variables_bare_chains_and_scalar_inputs_4813() -> Result<()> {
@@ -169276,7 +168427,6 @@ fn test_chain_rewrite_covers_unread_variables_bare_chains_and_scalar_inputs_4813
 /// where jq prints one). The source is routed to the resolver's walk of a bound, as `limit(n; CHAIN)`
 /// is. Every row captured from jq 1.7.1 with `-c`.
 #[allow(clippy::literal_string_with_formatting_args)]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_bounded_alt_chain_behind_stages_counts_every_emission_4669() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -169514,7 +168664,6 @@ fn test_foreach_source_bounded_alt_chain_behind_stages_counts_every_emission_466
 /// from jq 1.7.1 with `-c`. The fold-body positions it used to pin at the by-value count are routed since
 /// #4818 and #4835 (`..._in_a_fold_update_counts_every_emission_4818`, `..._in_other_fold_body_positions_..._4835`).
 #[allow(clippy::literal_string_with_formatting_args)]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_bounded_alt_chain_behind_stages_leaves_value_mode_and_literal_heads_4669(
 ) -> Result<()> {
@@ -169615,7 +168764,6 @@ fn test_foreach_source_bounded_alt_chain_behind_stages_leaves_value_mode_and_lit
 /// (`.a`) moves jq's register before the source runs, so the chain is not on it and the routing stays off
 /// (the `del` is refused, as in jq). Every row captured from jq 1.7.1 with `-c`.
 #[allow(clippy::literal_string_with_formatting_args)]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_bounded_alt_chain_behind_stages_in_a_fold_update_counts_every_emission_4818(
 ) -> Result<()> {
@@ -169785,7 +168933,6 @@ fn test_foreach_source_bounded_alt_chain_behind_stages_in_a_fold_update_counts_e
 /// `select(.)`, a `try ... catch` handler, an `if` whose condition navigates (`.a` moves jq's register
 /// before the branch runs) and an inner INIT that navigates behind a wrapper (the `del` and the
 /// middle-fold-INIT rows match jq). Every other row captured from jq 1.7.1 with `-c`.
-#[cfg(not(feature = "unshared-containers"))]
 #[allow(clippy::literal_string_with_formatting_args)]
 #[test]
 fn test_foreach_source_bounded_alt_chain_behind_stages_in_other_fold_body_positions_counts_every_emission_4835(
@@ -170023,7 +169170,6 @@ fn test_foreach_source_bounded_alt_chain_behind_stages_in_other_fold_body_positi
 /// front of the chain, a `try`/`?` around the `isempty`, or stages after it. Every row captured from
 /// jq 1.7.1 with `-c`.
 #[allow(clippy::literal_string_with_formatting_args)]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_isempty_of_alt_chain_counts_every_emission_4819() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -170121,7 +169267,6 @@ fn test_foreach_source_isempty_of_alt_chain_counts_every_emission_4819() -> Resu
 /// rest). Inside another fold's UPDATE the source is routed since #4818
 /// (`test_foreach_source_bounded_alt_chain_behind_stages_in_a_fold_update_counts_every_emission_4818`).
 /// Every other row captured from jq 1.7.1 with `-c`.
-#[cfg(not(feature = "unshared-containers"))]
 #[allow(clippy::literal_string_with_formatting_args)]
 #[test]
 fn test_foreach_source_isempty_of_alt_chain_leaves_value_mode_and_excluded_operands_4819(
@@ -170166,7 +169311,6 @@ fn test_foreach_source_isempty_of_alt_chain_leaves_value_mode_and_excluded_opera
 /// safe-direction writes #4669's first draft regressed for `first`/`limit`/`nth` and stay answered. Every row
 /// captured from jq 1.7.1 with `-c`, both routes.
 #[allow(clippy::literal_string_with_formatting_args)]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_source_isempty_of_alt_chain_behind_null_folds_and_defs_counts_every_emission_4829(
 ) -> Result<()> {
@@ -170244,7 +169388,6 @@ fn test_foreach_source_isempty_of_alt_chain_behind_null_folds_and_defs_counts_ev
 /// UPDATE (a `foreach` source of the same shape was already routed). Not read: the payload `error(.)`
 /// hands on, which is the register itself, and a handler that does not destructure `.` (`catch .`,
 /// `catch empty`), which answer as jq does. Every row is a live jq 1.7.1 capture.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_reduce_source_caught_error_payload_destructure_4877() -> Result<()> {

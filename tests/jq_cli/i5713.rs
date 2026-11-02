@@ -221,7 +221,6 @@ fn a_write_to_a_string_from_a_named_string_leaves_it_alone_5713() -> Result<()> 
 
 /// A string used as a path target is refused with jq's own error.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn a_named_string_is_not_a_path_5713() -> Result<()> {
     let value = he(2100);
     for filter in ["path($s)", "($s|getpath([]))|=1"] {

@@ -15,7 +15,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// piped into `.`, FE behind a `try` and an `if`, in `|=`, `[path(..)?]`, `path` and `del`; the `[$a]` pattern and the
 /// `?` spelling; and the heads that land on a container, which used to be refused loudly. Every row captured from
 /// `/usr/bin/jq` 1.7.1 (stdout, exit code), on both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5102_navigation_stage_ahead_of_a_caught_foreign_foreach_in_a_foreach_update() -> Result<()>
@@ -224,7 +223,6 @@ fn test_5102_navigation_stage_ahead_of_a_caught_foreign_foreach_in_a_foreach_upd
 /// `foreach` (`first`, `limit`, `//`, `label`, a comma, `select(true)`), the `foreach` in EXTRACT, two navigating
 /// stages, and a `null` `$x` beside a `null` register (identical by kind, so the destructure passes and `FE` emits).
 /// Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5102_the_wrappers_sources_and_bodies_around_the_navigated_foreach() -> Result<()> {

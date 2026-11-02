@@ -13,7 +13,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// wrote through it. `limit(1; ..)` and `nth(0; ..)` are the same single element. Every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes; the rows jq answers are the controls that must keep answering (a source
 /// that goes on, a `.` tail, a source that is not `..`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4986_reduce_update_alt_chain_over_first_of_descent_with_a_navigating_init() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -690,7 +689,6 @@ fn test_4986_reduce_update_alt_chain_over_first_of_descent_with_a_navigating_ini
 /// wherever the stages before the `reduce` and its INIT left it. The last rows are the controls: a source
 /// that goes on (`limit(2; ..)`, `(first(..), .a)`, `(.a, first(..))`) or `last(..)` moves the register and
 /// keeps answering as before. Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4986_reduce_update_alt_chain_over_first_of_descent_after_other_stages_and_controls(
 ) -> Result<()> {

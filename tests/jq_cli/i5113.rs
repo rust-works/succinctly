@@ -14,7 +14,6 @@ use crate::{assert_path_rows_both_routes_3749, run_jq_full};
 /// `range(2) as $n | .`: only the source's bound says the step is the fork's last), and rows of `scripts/jq-foreach-update-if-arm-sweep.py` (with `null`, `true`
 /// and `false` literal arms added) that `main` answered differently and now match. Captured from `/usr/bin/jq` 1.7.1,
 /// both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_literal_then_on_the_last_step_of_an_earlier_init_fork() -> Result<()> {
@@ -83,7 +82,6 @@ fn test_5113_literal_then_on_the_last_step_of_an_earlier_init_fork() -> Result<(
 /// where jq raises), a step that is not its fork's last (the next step runs the fold on the stored literal; read
 /// there, a `?` truncated jq's answer), and an UPDATE whose fold source is a `?//` chain (read on the first of three
 /// forks, the later forks answered nothing where jq emits `["a"]`). Each row must answer as jq does or stay refused, on both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_literal_then_stays_unread_under_a_retry_or_before_the_forks_last_step() -> Result<()> {
@@ -129,7 +127,6 @@ fn test_5113_literal_then_stays_unread_under_a_retry_or_before_the_forks_last_st
 
 /// #5113 rows 2-3: the two single-step reductions from the findings comment, with `path`, `[path()?]` and `del`, on
 /// both routes. Captured from `/usr/bin/jq` 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_handler_try_around_an_if_takes_the_arm_or_the_handler_the_state_ran() -> Result<()> {
@@ -183,7 +180,6 @@ fn test_5113_handler_try_around_an_if_takes_the_arm_or_the_handler_the_state_ran
 /// is not modelled: jq's answers are read there only where they match, and `main`'s refusal is kept otherwise. A row
 /// of the sweep where reading the handler's literal after a raising condition wrote `null` where jq leaves the
 /// document alone.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_handler_try_around_an_if_stays_refused_under_a_retry_chain() -> Result<()> {
@@ -209,7 +205,6 @@ fn test_5113_handler_try_around_an_if_stays_refused_under_a_retry_chain() -> Res
 /// #5113 row 2: `(.a,.)` as the source, so the step that stores the literal `1` is not the last, and the one after it
 /// raises on that `1` and takes the handler. Longer sources and an `elif` chain whose later steps stay on the literal
 /// arms. Captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_literal_then_read_when_every_later_step_stores_a_literal() -> Result<()> {
@@ -249,7 +244,6 @@ fn test_5113_literal_then_read_when_every_later_step_stores_a_literal() -> Resul
 /// (`null`, then `1`, then `1` again), so a step that enters with a state an earlier one entered with repeats the steps
 /// between, which were already read. A source of ten elements keeps the literal arm on its first step, with a handler
 /// (`catch 1`) and beside a literal comma sibling. Captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_literal_then_lookahead_reads_a_source_past_eight_steps_through_its_cycle() -> Result<()>
@@ -289,7 +283,6 @@ fn test_5113_literal_then_lookahead_reads_a_source_past_eight_steps_through_its_
 /// #5113: a source whose bound no static shape says (`.[]`, `range(n)`) may have any number of steps left, so the
 /// literal arm is read when every step that could follow stores a literal too, or raises (the cycle of stored states
 /// is read as the bounded source's is). Captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_literal_then_lookahead_reads_an_unbounded_source() -> Result<()> {
@@ -359,7 +352,6 @@ fn test_5113_literal_then_lookahead_reads_an_unbounded_source() -> Result<()> {
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_lookahead_agrees_with_the_last_step_of_an_earlier_init_fork() -> Result<()> {
@@ -382,7 +374,6 @@ fn test_5113_lookahead_agrees_with_the_last_step_of_an_earlier_init_fork() -> Re
 /// root, the register is on `.a`'s `null`), where `main` answered `["a","a"]` and `|= 9` wrote `{"a":{"a":9}}`. Every
 /// EXTRACT, the three origins a `$x` marker has (`. as`, `.b as`, `(.b|.) as`), the shapes of the caught source (`?`,
 /// `catch empty`, an array pattern) and a state-replacing UPDATE. Captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_caught_bind_foreach_update_is_empty_on_a_step_whose_element_is_not_the_marker(
@@ -510,7 +501,6 @@ fn test_5113_caught_bind_foreach_update_is_empty_on_a_step_whose_element_is_not_
 /// on the steps its first alternative fails, `limit(1; FE) ... |= 9` over `..` wrote nothing where jq writes `9`. Captured
 /// from `/usr/bin/jq` 1.7.1, both routes. A register that holds a `nan` is its own node though `==` says otherwise
 /// (`holds_nan`): the marker equal to it still passes the step.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_caught_bind_foreach_update_keeps_the_steps_where_the_marker_is_the_register(
@@ -593,7 +583,6 @@ fn test_5113_caught_bind_foreach_update_keeps_the_steps_where_the_marker_is_the_
 /// `[["a","a"]]`. Reading the second step as empty let the first step's own placement through, as `["a"]` (a grid of 40,000
 /// rows turned five refusals into wrong answers, `del` among them), until #5205 placed it. It was pinned as a refusal before.
 /// The pipe-spelled `$x | . as P` source, pinned here before #5206, is read now (`tests/jq_cli/i5206.rs`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_caught_bind_foreach_update_leaves_a_null_marker_5205() -> Result<()> {
@@ -615,7 +604,6 @@ fn test_5113_caught_bind_foreach_update_leaves_a_null_marker_5205() -> Result<()
 /// #5113: a literal sibling after the `if` (`null` and `true` `then` literals, an `elif` chain, 2-3 element sources,
 /// the `path`, `|=` and `del` contexts), and a source of ten elements whose second step raises (it ends the `foreach`,
 /// past the eight-step cap). Captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_literal_then_read_beside_a_literal_sibling_after_the_if() -> Result<()> {
@@ -688,7 +676,6 @@ fn test_5113_literal_then_read_beside_a_literal_sibling_after_the_if() -> Result
 
 /// #5113: the literal sibling ahead of the `if`: the `if` is the comma's last item, so the literal it emits is the
 /// stored state, and the lookahead steps through the comma (`7` then the `if` item read as its literal arm).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_literal_then_read_beside_a_literal_sibling_before_the_if() -> Result<()> {
@@ -733,7 +720,6 @@ fn test_5113_literal_then_read_beside_a_literal_sibling_before_the_if() -> Resul
 
 /// #5113: a handler `try` around the `if`, beside a literal sibling: the handler literal is the arm a later step takes
 /// when its condition raises on the stored `7`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_handler_literal_read_beside_a_literal_sibling() -> Result<()> {
@@ -775,7 +761,6 @@ fn test_5113_handler_literal_read_beside_a_literal_sibling() -> Result<()> {
 /// element, which a lookahead started from the `then` literal cannot see (it printed a truncated answer before the
 /// lookahead ran on the unbound UPDATE). jq answers `[["a"]]`, `[["a"],["a"]]`, `[["a"],["a"]]`,
 /// `[["a","a"],["a","a"]]` and `[[],[],["b"],["b"],["a"]]`.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_literal_sibling_reading_stays_unread_where_the_lookahead_cannot_place_the_step(
@@ -823,7 +808,6 @@ fn test_5113_literal_sibling_reading_stays_unread_where_the_lookahead_cannot_pla
 /// wherever the row is a `path(...)`, as jq 1.7.1 answers them (stdout, the
 /// first error message, the exit code). The path-mode interpreter carries
 /// jq's register, so they match by construction, on both routes.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_5113() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

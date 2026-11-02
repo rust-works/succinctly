@@ -58,10 +58,8 @@ fn test_body_rebuilt_per_value_matches_jq_5424() -> Result<()> {
     Ok(())
 }
 
-/// A path expression that does more than navigate (`path(.[] | . as $x | .[0])`) is refused by the
-/// `unshared-containers` holdout build (#5246).
+/// A path expression that does more than navigate: `path(.[] | . as $x | .[0])`.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_path_through_a_body_rebuilt_per_value_matches_jq_5424() -> Result<()> {
     let (stdout, stderr, status) = run_jq_full(
         &["-n", "-c", "[[1,2],[3,4]] | [path(.[] | . as $x | .[0])]"],
@@ -77,12 +75,7 @@ fn test_path_through_a_body_rebuilt_per_value_matches_jq_5424() -> Result<()> {
 
 /// A container that was bound once and compared by identity down a long tail: the tail holds a
 /// variable-reading stage, and must not be wrapped in a way that hides the container's storage.
-/// A NaN-bearing array equals itself only by identity in jq. The `unshared-containers` holdout has no
-/// node identity (#5254).
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
+/// A NaN-bearing array equals itself only by identity in jq.
 #[test]
 fn test_container_identity_survives_a_long_tail_with_a_variable_5424() -> Result<()> {
     let long = ". | [.] | .[0] | [.] | .[0] | . | ";

@@ -9,7 +9,6 @@ use anyhow::Result;
 /// (`["a"]` for a `$i` EXTRACT, nothing for `empty`), and a `?` answered `[]` for jq's `[["a"]]`. Rows captured from jq
 /// 1.7.1 (stdout, first stderr line, exit code), both routes, over `path`, `[path(..)?]`, `del` and `|=` with `$i`, `.`
 /// and `empty` EXTRACTs on `{"a":null}` and `{"a":true}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_if_dot_comma_branch_comma_empty_after_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -188,7 +187,6 @@ fn test_foreach_if_dot_comma_branch_comma_empty_after_4800() -> Result<()> {
 /// (`["a"]` for a `$i` EXTRACT, nothing for `empty`), and a `?` answered `[]` for jq's `[["a"]]`. Rows captured from jq
 /// 1.7.1 (stdout, first stderr line, exit code), both routes, over `path`, `[path(..)?]`, `del` and `|=` with `$i`, `.`
 /// and `empty` EXTRACTs on `{"a":null}` and `{"a":true}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_if_dot_comma_branch_comma_empty_before_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -367,7 +365,6 @@ fn test_foreach_if_dot_comma_branch_comma_empty_before_4800() -> Result<()> {
 /// (`["a"]` for a `$i` EXTRACT, nothing for `empty`), and a `?` answered `[]` for jq's `[["a"]]`. Rows captured from jq
 /// 1.7.1 (stdout, first stderr line, exit code), both routes, over `path`, `[path(..)?]`, `del` and `|=` with `$i`, `.`
 /// and `empty` EXTRACTs on `{"a":null}` and `{"a":true}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_if_dot_comma_branch_comma_select_false_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -546,7 +543,6 @@ fn test_foreach_if_dot_comma_branch_comma_select_false_4800() -> Result<()> {
 /// (`["a"]` for a `$i` EXTRACT, nothing for `empty`), and a `?` answered `[]` for jq's `[["a"]]`. Rows captured from jq
 /// 1.7.1 (stdout, first stderr line, exit code), both routes, over `path`, `[path(..)?]`, `del` and `|=` with `$i`, `.`
 /// and `empty` EXTRACTs on `{"a":null}` and `{"a":true}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_if_dot_comma_branch_comma_parens_first_empty_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -725,7 +721,6 @@ fn test_foreach_if_dot_comma_branch_comma_parens_first_empty_4800() -> Result<()
 /// was refused: read like the bare form, the `.a` EXTRACT's index error on the `null` state of the second step escaped a
 /// `?` and a `try` where jq answers `[]`, until `taken_if_branch` read that step's `else` branch. Rows captured from jq
 /// 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_if_comma_branch_if_on_a_condition_other_than_dot_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -762,7 +757,6 @@ fn test_foreach_if_comma_branch_if_on_a_condition_other_than_dot_4800() -> Resul
 
 /// #4800: A stage after the `if` around a comma branch, for the same reason (the `if` is now found at the head of the
 /// pipe). Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_if_comma_branch_stage_after_the_if_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -827,7 +821,6 @@ fn test_foreach_if_comma_branch_stage_after_the_if_4800() -> Result<()> {
 
 /// #4800: a comma branch behind a nested `if` on a condition other than `.`, and one under a `try`, for the same reason
 /// (the `if` is now found behind the `try`). Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_if_comma_branch_nested_if_and_try_wrapper_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

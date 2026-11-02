@@ -10,7 +10,6 @@ use anyhow::Result;
 /// is now walked as `taken_if_branch` walks it: a falsy condition continues into the `else`, the first truthy one names
 /// its `then`. Rows captured from jq 1.7.1 (stdout, first stderr line, exit code), both routes; every row but the
 /// second (a control that already matched) fails on `main`, and removing the walk fails the test.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_elif_chain_with_the_caught_foreach_in_a_later_arm_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -127,7 +126,6 @@ fn test_foreach_update_elif_chain_with_the_caught_foreach_in_a_later_arm_4800() 
 /// hold -- an `elif` condition that is not `.`, a fold in two arms -- that step would emit, and marking the next one
 /// let `del` echo the document where jq raises the index error on the `null` the empty step left. These stay the
 /// refusals they were (the message differs from jq's: `with result`, not `near attempt to access element`).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_elif_chain_not_read_by_emptied_update_stays_refused_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

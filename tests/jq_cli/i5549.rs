@@ -220,13 +220,8 @@ fn test_tojson_and_static_del_match_jq_5549() -> Result<()> {
 }
 
 /// A NaN is equal to itself only as the very node it is, so these read a value back through a
-/// `del` and compare it with itself: the answer is jq's `jv_identical` short-circuit, which the
-/// unshared-containers holdout has no node to give.
+/// `del` and compare it with itself: the answer is jq's `jv_identical` short-circuit.
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_del_keeps_node_identity_like_jq_5549() -> Result<()> {
     check(IDENTITY_ROWS)
 }

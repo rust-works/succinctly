@@ -556,7 +556,6 @@ jq 1.7.1 rejects each such program at compile time (`key/0 is not defined`), so 
 A dynamic-target program over a document the interpreter cannot materialize whole (a lone surrogate, a scalar at the 257th level) raises the decode error (`invalid unicode escape sequence`, `nesting depth exceeds limit of 256`, exit 5).
 jq rejects the lone surrogate when it parses the document, with its own parse error (`Invalid \uXXXX\uXXXX surrogate pair escape`), so the wording and the reported location differ from jq's while both refuse; a program with no dynamic target still decodes only what it reads (#4412).
 A document past jq's own parse-depth limit never reaches the interpreter: every document route refuses it first, as jq does (see "Nesting depth" below, #5497); the scalar at the 257th level is one jq accepts, the materializer's band recorded there.
-The `unshared-containers` A/B holdout, a measurement build that never ships, refuses a dynamic-target program outright: its by-value `jv_identical` makes the interpreter refuse rows jq answers, and the shipped resolver no longer answers such a target.
 yq mode is unchanged.
 
 So the sections below that describe the path resolver's inferred register (the `Path-mode ...` sections, the register refusals under [Where succinctly errors and jq does not](#where-succinctly-errors-and-jq-does-not), the "artefact guard" and every "refused where jq answers" row) describe the shipped route, which jq mode no longer reaches with a dynamic target.
@@ -587,7 +586,6 @@ The interpreter's own recorded divergences:
   [#5233](https://github.com/rust-works/succinctly/issues/5233) removed the shipped resolver from jq mode's dynamic targets, so the other dynamic targets beside those builtins (a bind in the target with no fold: `at_offset(5) as $x | del(.a | $x)`; a fold outside every path target) are refused the same way instead of answered from the inferred register.
   Since [#5243](https://github.com/rust-works/succinctly/issues/5243) an index key that only computes a value is navigation, so `.a[(0,1)] |= key` has a static target and answers again (`{"a":[0,1,3]}`).
   A document the interpreter cannot materialize (a lone surrogate, nesting past 256 levels) still runs on the shipped route for every program, as above.
-  The `unshared-containers` holdout keeps the shipped routing and refuses nothing.
 
 ## `as` binds the Term before it, in jq mode (#3397)
 

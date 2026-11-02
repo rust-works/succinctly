@@ -33,10 +33,6 @@ fn run(d: &str, filter: &str) -> Result<(String, String, i32)> {
 
 /// `(--argjson d, filter, stdout)`, every one exiting 0.
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn a_path_through_a_named_argument_is_the_arguments_own_5692() -> Result<()> {
     let nested = r#"{"a":{"b":[1,{"c":2}]}}"#;
     for (d, filter, expected) in [
@@ -78,7 +74,6 @@ fn a_path_through_a_named_argument_is_the_arguments_own_5692() -> Result<()> {
 /// A path over a value equal to the argument but not it, or reached another way, is refused with
 /// jq's own text: `(--argjson d, filter, stderr)`, every one exiting 5.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn a_path_over_a_value_that_is_not_the_argument_still_refuses_5692() -> Result<()> {
     for (d, filter, expected) in [
         (
@@ -119,7 +114,6 @@ fn a_path_over_a_value_that_is_not_the_argument_still_refuses_5692() -> Result<(
 /// scalar argument. It fails when one of them starts to agree, so the page is updated with it:
 /// `(--argjson d, filter, stderr)`, every one exiting 5.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn the_recorded_refusals_where_jq_answers_5692() -> Result<()> {
     for (d, filter, expected) in [
         (

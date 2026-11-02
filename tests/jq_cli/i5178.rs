@@ -12,7 +12,6 @@ use crate::assert_path_rows_both_routes_3749;
 
 /// #5178: the issue's rows and their `1 |` and `"q" |` twins, over `path`, `del` and `|=`. Every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5178_value_head_ahead_of_a_nested_foreach_on_a_null_register() -> Result<()> {
@@ -78,7 +77,6 @@ fn test_5178_value_head_ahead_of_a_nested_foreach_on_a_null_register() -> Result
 
 /// #5178: the issue's two-step row. The root element answers `["a"]`, and the `null` element's step raises at its
 /// handler's `$x.a`, a `$x` that is not the register.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5178_two_step_source_raises_on_the_null_element() -> Result<()> {

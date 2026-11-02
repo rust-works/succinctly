@@ -189,10 +189,8 @@ fn test_a_fold_destructuring_literal_keys_matches_jq_5544() -> Result<()> {
     Ok(())
 }
 
-/// A path read of a destructured name. The unshared-containers holdout refuses a path target that
-/// does more than navigate (#5233), so the row is ignored there (#5246).
+/// A path read of a destructured name.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_a_path_read_of_a_destructured_name_matches_jq_5544() -> Result<()> {
     assert_eq!(
         jq(
