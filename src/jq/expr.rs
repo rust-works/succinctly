@@ -1554,6 +1554,15 @@ impl SharedArg {
     /// per call: read off the run's own remembered answer, it is not walked
     /// again. A run is evaluated as the stages it holds, so its answer is
     /// theirs; an argument's is not, and is walked as before.
+    /// A kept run of `stages` (#5441), as a tail plan builds one, for the tests that need a stage
+    /// that is one.
+    #[cfg(test)]
+    pub(crate) fn kept_run(stages: PipeStages) -> Self {
+        let mut arg = Self::new(Expr::Pipe(stages));
+        arg.run = true;
+        arg
+    }
+
     pub(crate) fn run_stages(&self) -> Option<&PipeStages> {
         match &self.expr {
             Expr::Pipe(stages) if self.run => Some(stages),
