@@ -279,6 +279,9 @@ class PushDetectionTests(unittest.TestCase):
             self.assertEqual(self.pushes(command), ["/x/y"], command)
         self.assertEqual(self.pushes('WT=/x; git -C "$WT/sub" push'), ["/x/sub"])
         self.assertEqual(self.pushes('WT=sub; git -C "$WT" push', "/work"), ["/work/sub"])
+        # The shell expands a leading `~` in an assignment.
+        home = os.path.expanduser("~")
+        self.assertEqual(self.pushes('WT=~/wt/a; git -C "$WT" push'), [os.path.join(home, "wt", "a")])
 
     def test_a_directory_that_names_an_unknown_variable_is_unresolved_5850(self):
         for command in (

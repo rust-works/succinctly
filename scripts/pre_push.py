@@ -440,7 +440,7 @@ def pushes(command, cwd, env=None):
                 name, _, assigned = tokens[0].partition("=")
                 if name == "PRE_PUSH_SKIP":
                     skip = assigned
-                expanded = _expand(assigned, env)
+                expanded = _expand(os.path.expanduser(assigned), env)
                 if expanded is None:
                     env.pop(name, None)  # set to something the hook cannot read
                 else:
