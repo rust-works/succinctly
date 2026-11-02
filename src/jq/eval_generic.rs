@@ -2486,11 +2486,30 @@ fn yq_string_input_tag<V: DocumentValue>(
     value: &V,
     cursor: Option<V::Cursor>,
 ) -> Option<String> {
-    // The common case first: an untagged string is `!!str` unless it is a plain `<<` or a plain
-    // date, which start with `<` and a digit.
+    // The common case first. A document's plain scalar reads as text whatever it resolves to, so
+    // an untagged one is accepted here only if its first byte can start none of a null, a bool, a
+    // number, a date or `<<` (`~`, `t`/`f`/`n` in any case, a digit, a sign, `.`, `<`); the rest
+    // take the full reading below.
     if cursor.map_or(true, |c| c.explicit_tag().is_none()) {
         if let Some(text) = value.as_str() {
-            if !matches!(text.as_bytes().first(), Some(b'<' | b'0'..=b'9')) {
+            let can_be_typed = text.as_bytes().first().map_or(true, |b| {
+                matches!(
+                    b,
+                    b'<' | b'0'
+                        ..=b'9'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'~'
+                            | b't'
+                            | b'T'
+                            | b'f'
+                            | b'F'
+                            | b'n'
+                            | b'N'
+                )
+            });
+            if !can_be_typed {
                 return None;
             }
         }
