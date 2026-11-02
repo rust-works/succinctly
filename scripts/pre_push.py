@@ -51,11 +51,16 @@ RUST_PATHS = ("*.rs", "Cargo.toml", "Cargo.lock", "rust-toolchain*", "clippy.tom
 
 RELEASE_FEATURES = "cli,simd,regex,serde,bench-runner"  # comparison/jq/manifest.toml
 
-# What the bin's `bench-runner` unit tests read or are: the `compare` and `bench_runner` modules,
-# the harness's data, and the docs whose generated blocks they hold to the committed runs (#5409).
+# What the bin's `bench-runner` unit tests read or are: the `compare` and `bench_runner` modules
+# and the dispatch that gates them, the harness's data, the docs whose generated blocks they hold
+# to the committed runs (#5409), and the manifest that sets the features. The rest of the bin and
+# the library are left to CI: a change there reaches these tests only through what they call.
 BENCH_RUNNER_BIN_PATHS = (
     "src/bin/succinctly/compare/*",
     "src/bin/succinctly/bench_runner/*",
+    "src/bin/succinctly/main.rs",
+    "Cargo.toml",
+    "Cargo.lock",
     "comparison/jq/*",
     "docs/compare/*",
     "docs/benchmarks/jq.md",
