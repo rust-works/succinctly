@@ -535,22 +535,41 @@ pub fn jq_stream_fault<B: AsRef<[u8]>>(
     line: usize,
     column: usize,
 ) -> Option<String> {
+    jq_stream_fault_end(chunks, line, column).map(|(message, _)| message)
+}
+
+/// [`jq_stream_fault`], and the `(line, column)` jq's parser stands on when it stops (#5923).
+///
+/// jq keeps those counters across a fault: it drops the rest of the read that held the fault, and
+/// the bytes it drops are never scanned, so a second fault is placed from where the first left the
+/// parser, not from where the second sits in the text. The same position is the one the message
+/// names, because the message is built when the parser stops. `None` when the parser reads every
+/// value.
+#[doc(hidden)]
+pub fn jq_stream_fault_end<B: AsRef<[u8]>>(
+    chunks: impl IntoIterator<Item = B>,
+    line: usize,
+    column: usize,
+) -> Option<(String, (usize, usize))> {
     let mut parser = Parser::new(line, column, JQ_MAX_PARSING_DEPTH);
     parser.multi = true;
     for chunk in chunks {
         for &byte in chunk.as_ref() {
             if let Err(Stop::Fault(fault)) = parser.feed(byte) {
-                return Some(format!(
-                    "{fault} at line {}, column {}",
-                    parser.line, parser.column
+                return Some((
+                    format!("{fault} at line {}, column {}", parser.line, parser.column),
+                    (parser.line, parser.column),
                 ));
             }
         }
     }
     match parser.finish() {
-        Err(Stop::Fault(fault)) => Some(format!(
-            "{fault} at EOF at line {}, column {}",
-            parser.line, parser.column
+        Err(Stop::Fault(fault)) => Some((
+            format!(
+                "{fault} at EOF at line {}, column {}",
+                parser.line, parser.column
+            ),
+            (parser.line, parser.column),
         )),
         _ => None,
     }

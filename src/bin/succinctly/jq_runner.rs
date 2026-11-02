@@ -7035,13 +7035,24 @@ fn get_inputs(
                     let mut ends = Vec::new();
                     let mut offset = 0;
                     let mut faults = LineCounter::at_seam(raw.as_bytes(), seam);
+                    // #5923: where jq's parser stands at the start of each segment. The first is
+                    // where the file starts; after a fault it is where the fault left the parser,
+                    // since jq drops the rest of the read and never counts it.
+                    let mut parser_at: Option<(usize, usize)> = None;
                     loop {
                         let segment = &raw[offset..];
-                        let (parsed, parse_error) = parse_json_stream_prefix(
-                            segment,
-                            origin(&raw.as_bytes()[..offset]),
-                            form,
-                        );
+                        let (parsed, parse_error, fault_end) = match parser_at {
+                            None => parse_json_stream_prefix_ending(
+                                segment,
+                                origin(&raw.as_bytes()[..offset]),
+                                form,
+                            ),
+                            Some(file) => parse_json_stream_prefix_ending(
+                                segment,
+                                (!args.stream).then_some(StreamOrigin { file, before: &[] }),
+                                form,
+                            ),
+                        };
                         let (spans, split_error) = split_json_values(segment.as_bytes());
                         if spans.len() < parsed.len() {
                             // patchcov: coverage tolerate reason="unreachable: the splitter is the more lenient of the two and the prefix parse materializes from its spans, so it cannot find fewer values -- the same internal-error guard as the non-resuming branch below (#1064), kept per segment (#4311)"
@@ -7108,6 +7119,16 @@ fn get_inputs(
                                 seq_warning: false,
                             },
                         ));
+                        // The next segment starts where the parser stopped, unless the fault's
+                        // wording was not the parser's own, when the real position stands in.
+                        parser_at = fault_end.or_else(|| {
+                            (!args.stream).then(|| {
+                                advance_position(
+                                    file_start,
+                                    &raw.as_bytes()[..resume.min(raw.len())],
+                                )
+                            })
+                        });
                         let mut next = resume;
                         // A read that starts inside a character starts on a byte
                         // no JSON token begins with: jq raises there too and
@@ -9994,6 +10015,18 @@ fn parse_json_stream_prefix(
     origin: Option<StreamOrigin<'_>>,
     form: DocumentForm,
 ) -> (Vec<OwnedValue>, Option<EvalError>) {
+    let (values, error, _) = parse_json_stream_prefix_ending(s, origin, form);
+    (values, error)
+}
+
+/// [`parse_json_stream_prefix`], and where jq's parser stands when it meets the fault, as
+/// `(line, column)`, when the message is its own (#5923). jq keeps those counters across a fault
+/// and never counts what it drops after it, so the text read on from the fault starts there.
+fn parse_json_stream_prefix_ending(
+    s: &str,
+    origin: Option<StreamOrigin<'_>>,
+    form: DocumentForm,
+) -> (Vec<OwnedValue>, Option<EvalError>, Option<(usize, usize)>) {
     // The same trim as [`parse_json_stream`]'s (#5654), so the two accept the same text.
     let (text, lead) = (
         s.as_bytes(),
@@ -10001,18 +10034,22 @@ fn parse_json_stream_prefix(
     );
     let s = trim_json_whitespace(s);
     if s.is_empty() {
-        return (vec![], None);
+        return (vec![], None, None);
     }
     if let Ok(values) = parse_json_stream_strict(s, origin, text, lead, form) {
-        return (values, None);
+        return (values, None, None);
     }
     // #5555: jq's parser names the first fault of the text, which can sit inside a value the
     // splitter delimits and the delimiter walk rejects, ahead of the one the splitter stopped at.
     // It reads the text as written: the newline after a bare token is part of its fault.
+    let fault_end = std::cell::Cell::new(None);
     let jq_fault = || {
         origin.and_then(|origin| {
             let (line, column) = origin.position(text, 0);
-            jq::jq_stream_fault([text], line, column)
+            jq::jq_stream_fault_end([text], line, column).map(|(message, end)| {
+                fault_end.set(Some(end));
+                message
+            })
         })
     };
     let bytes = s.as_bytes();
@@ -10022,16 +10059,17 @@ fn parse_json_stream_prefix(
         match stream_document_checked(&bytes[start..end], origin, text, lead + start, form) {
             Ok(value) => values.push(value),
             Err(error) if error.is_decode_failure() => {
-                return (values, Some(jq_fault().map_or(error, EvalError::new)));
+                let error = jq_fault().map_or(error, EvalError::new);
+                return (values, Some(error), fault_end.get());
             }
-            Err(error) => return (values, Some(error)),
+            Err(error) => return (values, Some(error), None),
         }
     }
     // #5497: jq meets its depth limit first when the refused bracket comes before the fault
     // the splitter stopped at.
     let error = split_error
         .map(|_| EvalError::new(jq_fault().unwrap_or_else(|| String::from("Invalid JSON text"))));
-    (values, error)
+    (values, error, fault_end.get())
 }
 
 /// The `serde_json`-validated core of [`parse_json_stream`], split out so
