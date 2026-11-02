@@ -215,6 +215,10 @@ const MAX_PATTERN_COMPUTED_KEYS: usize = 4096;
 /// brackets or parentheses stay guarded through the bracket's own depth unit.
 const MAX_EXPR_DEPTH: usize = 256;
 
+/// Nesting levels one step of yq's precedence-40 chain (`==`, `=`, `|=` ...) is charged, since it
+/// recurses ([`Parser::parse_yq_forty_group_operand`]).
+const YQ_FORTY_GROUP_WEIGHT: usize = 16;
+
 /// One link of yq's right-folding arithmetic level ([`Parser::parse_yq_arithmetic`]).
 enum YqArithLink {
     Arith(ArithOp),
@@ -9719,12 +9723,18 @@ impl<'a> Parser<'a> {
     /// group (`= |= += == < ...`, which fold from the right, #5630), so it recurses into
     /// [`Self::parse_assignment_level`]. Charged against the nesting limit like any nested
     /// expression, and kept out of line so the recursive frame stays small.
+    ///
+    /// Each step is charged [`YQ_FORTY_GROUP_WEIGHT`] levels, not one: unlike the arithmetic and
+    /// `and`/`or` chains this one is a real recursion through the large
+    /// [`Self::parse_assignment_level`] frame, and a debug build's 2 MiB test stack overflowed on
+    /// a 5,000-link `==` chain at the plain limit (ARM64 CI, #5630). A chain of more than
+    /// `MAX_EXPR_DEPTH / YQ_FORTY_GROUP_WEIGHT` comparisons or assignments is a parse error.
     #[inline(never)]
     fn parse_yq_forty_group_operand(&mut self) -> Result<Expr, ParseError> {
-        self.check_expr_nesting(1)?;
-        self.expr_depth += 1;
+        self.check_expr_nesting(YQ_FORTY_GROUP_WEIGHT)?;
+        self.expr_depth += YQ_FORTY_GROUP_WEIGHT;
         let result = self.parse_assignment_level();
-        self.expr_depth -= 1;
+        self.expr_depth -= YQ_FORTY_GROUP_WEIGHT;
         result
     }
 
