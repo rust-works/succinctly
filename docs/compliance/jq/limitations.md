@@ -10283,9 +10283,11 @@ What differs from jq 1.7.1:
   Under a locale whose C library has alternative era or digit forms (`ja_JP` on glibc) the plain form is printed.
 - **An empty result is not an error.**
   jq raises `strftime/1: unknown system failure` for `%p` under `de_DE`, where the library prints nothing (macOS and glibc alike); this prints an empty string.
-- **`strptime` reads the locale's names, not its layouts.**
+- **`strptime` reads the locale's names and layouts.**
   `%a %A %b %B %h %p` take the names `strftime` prints in the process locale: a day's or month's full name, else its abbreviation, ASCII-case-insensitively and every other character exactly (`märz` matches `März`, `MÄRZ` does not).
-  `%c %x %X %r` are not read by `strptime` in any locale (jq reads them).
+  `%c %x %X %r` stand for the locale's layouts (`nl_langinfo_l`'s `D_T_FMT`, `D_FMT`, `T_FMT` and `T_FMT_AMPM`), C's `%a %b %e %H:%M:%S %Y`, `%m/%d/%y`, `%H:%M:%S` and `%I:%M:%S %p` without one, and are read as if the format spelled them out.
+  A layout the library holds empty is empty: macOS prints and reads nothing for `%r` under `de_DE`, though `nl_langinfo` reports a layout there, so `"11:53:41 " | strptime("%r")` is an error.
+  A layout with a flag succinctly does not read (`ja_JP`'s `%c` holds `%_m`) is an error, as on macOS.
   An empty am marker matches nothing and reads as am, as on macOS under `de_DE`, where `%p` prints nothing and `PM` is left over.
   `%a`, `%A` and `%p` no longer read any run of letters: `Xyz`, `Thurs`, `Th` and `PMX` are no match, as in jq.
 

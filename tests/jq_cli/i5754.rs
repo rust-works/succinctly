@@ -347,3 +347,87 @@ fn an_uninstalled_locale_reads_english_names() -> Result<()> {
     assert_eq!(strptime("Xyz Mar 05 2015", "%a %b %d %Y", &env)?, None);
     Ok(())
 }
+
+// ---- `strptime` reads `%c`, `%x`, `%X` and `%r` ----
+
+/// In C the four stand for `%a %b %e %H:%M:%S %Y`, `%m/%d/%y`, `%H:%M:%S` and `%I:%M:%S %p`.
+/// Rows from jq 1.7.1 on macOS; succinctly rejected all four.
+#[test]
+fn c_locale_reads_the_layout_specifiers() -> Result<()> {
+    for (text, fmt, want) in [
+        (
+            "Thu Mar  5 23:53:41 2015",
+            "%c",
+            Some("[2015,2,5,23,53,41]"),
+        ),
+        (
+            "Thu Mar 05 23:53:41 2015",
+            "%c",
+            Some("[2015,2,5,23,53,41]"),
+        ),
+        ("Thu Mar 5 23:53:41 2015", "%c", Some("[2015,2,5,23,53,41]")),
+        ("Xyz Mar 5 23:53:41 2015", "%c", None),
+        ("03/05/15", "%x", Some(MARCH_5)),
+        ("03/05/2015", "%x", None),
+        ("23:53:41", "%X", Some("[1900,0,0,23,53,41]")),
+        ("23:53", "%X", None),
+        ("11:53:41 PM", "%r", Some("[1900,0,0,23,53,41]")),
+        ("11:53:41 pm", "%r", Some("[1900,0,0,23,53,41]")),
+        ("12:00:00 AM", "%r", Some("[1900,0,0,0,0,0]")),
+        ("11:53:41", "%r", None),
+        ("03/05/15 23:53:41", "%x %X", Some("[2015,2,5,23,53,41]")),
+        ("%03/05/15", "%%%x", Some(MARCH_5)),
+        ("x 03/05/15", "x %x", Some(MARCH_5)),
+    ] {
+        assert_eq!(strptime(text, fmt, &[])?.as_deref(), want, "{text} | {fmt}");
+    }
+    Ok(())
+}
+
+/// A locale's own layouts: `en_US` reads `%x` as `%m/%d/%Y`, `de_DE` as `%d.%m.%Y`.
+#[test]
+fn locale_layouts_are_read() -> Result<()> {
+    if installed("en_US.UTF-8") {
+        let env = [("LC_ALL", "en_US.UTF-8")];
+        assert_eq!(
+            strptime("03/05/2015", "%x", &env)?.as_deref(),
+            Some(MARCH_5)
+        );
+        assert_eq!(
+            strptime("23:53:41", "%X", &env)?.as_deref(),
+            Some("[1900,0,0,23,53,41]")
+        );
+    }
+    if installed("de_DE.UTF-8") {
+        let env = [("LC_ALL", "de_DE.UTF-8")];
+        assert_eq!(
+            strptime("05.03.2015", "%x", &env)?.as_deref(),
+            Some(MARCH_5)
+        );
+        assert_eq!(
+            strptime("05.03.2015 23:53:41", "%x %X", &env)?.as_deref(),
+            Some("[2015,2,5,23,53,41]")
+        );
+        // C's `%x` is not `de_DE`'s.
+        assert_eq!(strptime("03/05/15", "%x", &env)?, None);
+    }
+    Ok(())
+}
+
+/// A layout that holds a name is read in the locale's names: macOS spells `de_DE`'s `%c` as
+/// `%a %e %b %X %Y`, with the abbreviation `Do.`. And its `%r` is empty, so it reads nothing and
+/// the time is left over (jq 1.7.1 on macOS).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_layout_with_names_and_an_empty_one() -> Result<()> {
+    if !installed("de_DE.UTF-8") {
+        return Ok(());
+    }
+    let env = [("LC_ALL", "de_DE.UTF-8")];
+    assert_eq!(
+        strptime("Do.  5 März 23:53:41 2015", "%c", &env)?.as_deref(),
+        Some("[2015,2,5,23,53,41]")
+    );
+    assert_eq!(strptime("11:53:41 ", "%r", &env)?, None);
+    Ok(())
+}

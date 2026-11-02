@@ -95365,6 +95365,62 @@ fn strptime_name_len(
         .find_map(|name| strptime_prefix_len(input, name))
 }
 
+/// `fmt` with `%c`, `%x`, `%X` and `%r` replaced by the layout each stands for: the process
+/// locale's, else C's (`%a %b %e %H:%M:%S %Y`, `%m/%d/%y`, `%H:%M:%S`, `%I:%M:%S %p`), which is
+/// what the libc reads. A layout can name another (`en_US`'s `%c` holds `%X`), so this repeats a
+/// few times; no locale nests deeper.
+fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
+    let names_a_layout = |text: &str| {
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '%' && matches!(chars.next(), Some('c' | 'x' | 'X' | 'r')) {
+                return true;
+            }
+        }
+        false
+    };
+    if !names_a_layout(fmt) {
+        return alloc::borrow::Cow::Borrowed(fmt);
+    }
+    let layouts = locale_time::layouts();
+    let layout = |spec: char| -> &str {
+        match (spec, layouts) {
+            ('c', Some(l)) => l.date_time.as_str(),
+            ('x', Some(l)) => l.date.as_str(),
+            ('X', Some(l)) => l.time.as_str(),
+            ('r', Some(l)) => l.time_ampm.as_str(),
+            ('c', None) => "%a %b %e %H:%M:%S %Y",
+            ('x', None) => "%m/%d/%y",
+            ('X', None) => "%H:%M:%S",
+            _ => "%I:%M:%S %p",
+        }
+    };
+    let mut text = fmt.to_string();
+    for _ in 0..3 {
+        let mut out = string_with_capacity(text.len());
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some(spec @ ('c' | 'x' | 'X' | 'r')) => out.push_str(layout(spec)),
+                Some(other) => {
+                    out.push('%');
+                    out.push(other);
+                }
+                None => out.push('%'),
+            }
+        }
+        text = out;
+        if !names_a_layout(&text) {
+            break;
+        }
+    }
+    alloc::borrow::Cow::Owned(text)
+}
+
 fn advance_chars(input: &mut core::iter::Peekable<core::str::Chars<'_>>, n: usize) {
     for _ in 0..n {
         input.next();
@@ -95397,6 +95453,10 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     let mut year_read = false;
     let mut date_read = false;
 
+    // `%c`, `%x`, `%X` and `%r` stand for the locale's layouts (C's without one): read as
+    // if the format spelled them out (#5754).
+    let expanded = expand_strptime_layouts(fmt);
+    let fmt: &str = &expanded;
     let mut input_iter = input.chars().peekable();
     let mut fmt_iter = fmt.chars().peekable();
     // The process locale's names (#5754); `None` reads the English ones.
