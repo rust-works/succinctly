@@ -29434,9 +29434,10 @@ fn test_jq_tostring_computed_float_unaffected_1054() -> Result<()> {
 fn test_yq_at_sh_errors_on_number_input_1030() -> Result<()> {
     let (_, stderr, code) = run_yq_stdin_with_stderr(".a | @sh", "a: 1e2\n", &["-r"])?;
     assert_ne!(code, 0);
-    assert!(
-        stderr.contains("can not be escaped for shell"),
-        "stderr: {stderr}"
+    // yq's `@sh` refuses in its `@uri` wording (#5836).
+    assert_eq!(
+        stderr.trim(),
+        "Error: cannot encode !!float as URI, can only operate on strings. Please first pipe through another encoding operator to convert the value to a string"
     );
     Ok(())
 }
@@ -29447,16 +29448,18 @@ fn test_yq_at_sh_errors_on_number_input_1030() -> Result<()> {
 fn test_yq_at_sh_errors_on_non_string_1073() -> Result<()> {
     let (_, stderr, code) = run_yq_stdin_with_stderr(".a | @sh", "a: [1, 2]\n", &["-r"])?;
     assert_ne!(code, 0);
-    assert!(
-        stderr.contains("can not be escaped for shell"),
-        "stderr: {stderr}"
+    // yq's `@sh` refuses in its `@uri` wording (#5836).
+    assert_eq!(
+        stderr.trim(),
+        "Error: cannot encode !!seq as URI, can only operate on strings. Please first pipe through another encoding operator to convert the value to a string"
     );
 
     let (_, stderr, code) = run_yq_stdin_with_stderr(".a | @sh", "a: true\n", &["-r"])?;
     assert_ne!(code, 0);
-    assert!(
-        stderr.contains("can not be escaped for shell"),
-        "stderr: {stderr}"
+    // yq's `@sh` refuses in its `@uri` wording (#5836).
+    assert_eq!(
+        stderr.trim(),
+        "Error: cannot encode !!bool as URI, can only operate on strings. Please first pipe through another encoding operator to convert the value to a string"
     );
 
     // A string is still accepted.
