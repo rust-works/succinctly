@@ -58,7 +58,7 @@ jobs:
   # them: it fails towards testing. A push that bypassed the queue (an admin push) has no such run and gets the full suite.
   gate:
     name: Gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: read           # dorny/paths-filter lists the PR's files
@@ -187,7 +187,7 @@ jobs:
     # reliably blocking merge (#3084). `needs.test-x86-matrix.result` is `success`
     # only when every matrix leg succeeded.
     if: always() && needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - run: |
           test "${{ needs.test-x86-matrix.result }}" = "success" \
@@ -204,7 +204,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -380,7 +380,7 @@ jobs:
     # See test-x86 above for why this is `if: always()` + a result check rather
     # than a bare `needs:` (#3084).
     if: always() && needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - run: |
           test "${{ needs.test-arm-matrix.result }}" = "success" \
@@ -625,7 +625,7 @@ jobs:
     # See test-x86 above for why this is `if: always()` + a result check rather
     # than a bare `needs:` (#3084).
     if: always() && needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       MATRIX: ${{ needs.test-macos-arm-matrix.result }}
       GATE: ${{ needs.gate.result }}
@@ -748,7 +748,7 @@ jobs:
       matrix:
         include:
           - name: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - name: ARM64-Linux
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
@@ -1016,7 +1016,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1059,7 +1059,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1085,7 +1085,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -1103,7 +1103,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1135,7 +1135,7 @@ jobs:
       matrix:
         include:
           - name: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - name: ARM64
             runner: ubuntu-24.04-arm
     # A called workflow cannot hold more than its caller grants it.
@@ -1161,7 +1161,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1189,7 +1189,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1228,7 +1228,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1257,7 +1257,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1283,7 +1283,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1315,7 +1315,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'

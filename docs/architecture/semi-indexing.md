@@ -130,6 +130,34 @@ See [../benchmarks/](../benchmarks/) for detailed numbers across file sizes and 
 1. **Memory**: Index overhead (3-6%)
 2. **Latency**: Index build is upfront cost
 3. **Complexity**: More complex than DOM parsing
+4. **Validation**: Minimal; a malformed value is found when it is read, not when the document is
+   loaded (see [Validation Is Not Done Up Front](#validation-is-not-done-up-front))
+
+### Validation Is Not Done Up Front
+
+jq and yq reject a malformed document before any filter runs. succinctly does not, and that is
+deliberate: checking the whole document first would cost most of what the semi-index saves on a
+query that reads a small part of it. #1247 measured the two candidate checks on an Apple M5 Max,
+on 8.4 MB of generated JSON (min-of-7, the 3.21 ms process-spawn baseline subtracted):
+
+| Check                                               | Net cost   | vs `jq '.users[0].name'` (13.1 ms) | vs `jq '.'` (187 ms) |
+|-----------------------------------------------------|------------|------------------------------------|----------------------|
+| Whole-input UTF-8 validation (`text validate utf8`) | **1.1 ms** | +8%                                | +0.6%                |
+| Full strict JSON validation (`json validate`)       | **8.6 ms** | **+66%**                           | +4.6%                |
+
+These are indicative sizes, not an interleaved A/B per
+[benchmarking.md](../guides/benchmarking.md#ab-benchmarking-method), and the machine was not
+idle; re-measure before relying on the exact figures.
+
+Always-on strict validation costs two thirds of the runtime of a cheap navigation query, so it is
+not done by default; `jq --validate` and `json validate` run it on request. UTF-8 validation is
+cheap (about 7.7 GiB/s on the SIMD path), so it runs once when the runner reads a document, and
+invalid UTF-8 there gets the reference tool's treatment (yq rejects the document; jq substitutes
+U+FFFD). Every other decode failure (an invalid escape, a lone surrogate) is detected
+where the value is read and reported through the evaluator's error channel; re-running a
+whole-document validator when one fires would add a second full pass for no better diagnostic.
+The design and its stages are in
+[plan/decode-failure-routing.md](../plan/decode-failure-routing.md).
 
 ## When to Use
 

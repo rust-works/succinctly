@@ -12615,8 +12615,7 @@ from yq, which has `key`/`parent` and rejects these documents too.
 this whole class of document, through `.d` itself, and has since long before #2168: the
 semi-index accepts input jq's parser rejects, deliberately and at a measured price — always-on
 strict validation costs two thirds of the runtime of a cheap navigation query
-([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md), "Why not
-upfront validation for everyone"), which is the trade `CLAUDE.md`'s own "minimal validation"
+([`docs/architecture/semi-indexing.md`](../../architecture/semi-indexing.md#validation-is-not-done-up-front)), which is the trade `CLAUDE.md`'s own "minimal validation"
 note describes. So the real choice was never "match jq or not" but "diverge uniformly, or
 diverge in a way that depends on the spelling". That is context, **not** a licence: ADR-0018's
 scope note explicitly warns that an evaluator behaviour may not be reframed as a spec-level

@@ -49,7 +49,7 @@ jobs:
       matrix:
         include:
           - name: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - name: ARM64
             runner: ubuntu-24.04-arm
     # The called workflow's report job asks for `pull-requests: write` (its sticky comment, which a

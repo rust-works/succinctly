@@ -193,6 +193,10 @@ repro in all three issues. The YAML validator has **no UTF-8 check at all** — 
 
 ## Why not upfront validation for everyone
 
+The measurement and the conclusion below are now recorded in
+[architecture/semi-indexing.md](../architecture/semi-indexing.md#validation-is-not-done-up-front),
+which ADR-0018 and the limitations pages cite.
+
 The tier review floats "re-run the existing strict validator only when materialization
 hits a degrade point" as a cheaper third option. Costing it surfaced the reason the naive
 version of it — validating every document upfront — is not viable.
