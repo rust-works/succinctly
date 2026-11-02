@@ -86327,12 +86327,17 @@ fn builtin_walk<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///   update and never runs the rest of the stream. `walk(if
 ///   type=="object" then . else empty end)` on `{"a":5}` is `{}`.
 ///
-/// Both containers are atomic on error/break, matching how `[...]`/`{...}`
-/// construction works in jq generally: a child that returns a trailing
-/// `Control` aborts the *whole* container immediately, discarding every
-/// sibling already processed (not just that one child) — verified:
-/// `walk(if .==5 then error("x") else . end)` on `[5,6]` raises with no
-/// output at all, not a partial array.
+/// An **array** is atomic on error/break, matching how `[...]` construction
+/// works in jq generally: a child that returns a trailing `Control` aborts the
+/// *whole* array immediately, discarding every sibling already processed (not
+/// just that one child) — verified: `walk(if .==5 then error("x") else . end)`
+/// on `[5,6]` raises with no output at all, not a partial array.
+///
+/// An **object** member that produced a value keeps its first one and the
+/// `Control` after it is never reached (`.[] |= w` stops there, #5794):
+/// `walk(if type=="number" then (.,error("x")) else . end)` on `{"a":1}` is
+/// `{"a":1}`. Only a member with no value yet raises its `Control`, aborting
+/// the whole object as an array does (`walk_member_raises`).
 fn walk_impl<S: EvalSemantics>(
     f: &Expr,
     value: OwnedValue,
