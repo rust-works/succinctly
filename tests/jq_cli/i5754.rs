@@ -393,6 +393,8 @@ fn locale_layouts_are_read() -> Result<()> {
             strptime("03/05/2015", "%x", &env)?.as_deref(),
             Some(MARCH_5)
         );
+        // macOS's `en_US` `%X` is 24-hour; glibc's is `%r`, which wants an `AM`/`PM`.
+        #[cfg(target_vendor = "apple")]
         assert_eq!(
             strptime("23:53:41", "%X", &env)?.as_deref(),
             Some("[1900,0,0,23,53,41]")
