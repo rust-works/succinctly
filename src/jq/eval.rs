@@ -95225,6 +95225,65 @@ struct BrokenDownTime {
 
 /// Parse a time string according to strptime format specifiers
 #[allow(clippy::type_complexity)] // STYLE-0004: return mirrors strptime's broken-down-time field set
+const WEEKDAY_FULL: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+const WEEKDAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_FULL: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+const MONTH_ABBR: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// How many characters of `input` the name `name` matches at its start, or `None`. The libc
+/// compares with `strncasecmp` in the C locale: an ASCII letter matches either case and every
+/// other character only itself, so `MÄRZ` is not `März` (checked against macOS `jq` under
+/// `de_DE`). An empty name matches nothing, which is a match of length 0.
+fn strptime_prefix_len(
+    input: &core::iter::Peekable<core::str::Chars<'_>>,
+    name: &str,
+) -> Option<usize> {
+    let mut ahead = input.clone();
+    let mut len = 0;
+    for expected in name.chars() {
+        let got = ahead.next()?;
+        let same = if expected.is_ascii() && got.is_ascii() {
+            expected.eq_ignore_ascii_case(&got)
+        } else {
+            expected == got
+        };
+        if !same {
+            return None;
+        }
+        len += 1;
+    }
+    Some(len)
+}
+
+fn advance_chars(input: &mut core::iter::Peekable<core::str::Chars<'_>>, n: usize) {
+    for _ in 0..n {
+        input.next();
+    }
+}
+
 fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), String> {
     // #5340: jq hands the libc a zeroed `struct tm` (`memset(&tm, 0, sizeof(tm))`), so a field the
     // format does not set stays `tm_year = 0` (1900), `tm_mon = 0` and `tm_mday = 0` -- not the
@@ -95251,6 +95310,8 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
 
     let mut input_iter = input.chars().peekable();
     let mut fmt_iter = fmt.chars().peekable();
+    // The process locale's names (#5754); `None` reads the English ones.
+    let names = locale_time::names();
 
     while let Some(fc) = fmt_iter.next() {
         if fc == '%' {
@@ -95341,20 +95402,26 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                         check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=60, "second")?;
                 }
                 Some('p' | 'P') => {
-                    let mut ampm = String::new();
-                    while let Some(&c) = input_iter.peek() {
-                        if c.is_ascii_alphabetic() {
-                            ampm.push(c);
-                            input_iter.next();
-                        } else {
-                            break;
+                    // The locale's am marker, else its pm marker, each ASCII-case-insensitively,
+                    // as the libc reads them: an empty marker (macOS prints none for `%p` under
+                    // `de_DE`) matches nothing and reads as am (#5754). Anything else is no match,
+                    // not a run of letters skipped.
+                    let (am, pm) = match names {
+                        Some(n) => (n.am.as_str(), n.pm.as_str()),
+                        None => ("AM", "PM"),
+                    };
+                    if let Some(len) = strptime_prefix_len(&input_iter, am) {
+                        advance_chars(&mut input_iter, len);
+                        if hour == 12 {
+                            hour = 0;
                         }
-                    }
-                    let ampm_lower = ampm.to_lowercase();
-                    if ampm_lower == "pm" && hour < 12 {
-                        hour += 12;
-                    } else if ampm_lower == "am" && hour == 12 {
-                        hour = 0;
+                    } else if let Some(len) = strptime_prefix_len(&input_iter, pm) {
+                        advance_chars(&mut input_iter, len);
+                        if hour < 12 {
+                            hour += 12;
+                        }
+                    } else {
+                        return Err("unrecognized am/pm marker".to_string());
                     }
                 }
                 Some('j') => {
@@ -95381,13 +95448,19 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     weekday = if w == 7 { 0 } else { w };
                 }
                 Some('a' | 'A') => {
-                    // Skip day name
-                    while let Some(&c) = input_iter.peek() {
-                        if c.is_ascii_alphabetic() {
-                            input_iter.next();
-                        } else {
-                            break;
-                        }
+                    // A day's full name, else its abbreviation, either way for each day in turn
+                    // as the libc tries them, in the locale's names (#5754).
+                    let found = (0..7).find_map(|i| {
+                        let (full, abbr) = match names {
+                            Some(n) => (n.weekday_full[i].as_str(), n.weekday_abbr[i].as_str()),
+                            None => (WEEKDAY_FULL[i], WEEKDAY_ABBR[i]),
+                        };
+                        strptime_prefix_len(&input_iter, full)
+                            .or_else(|| strptime_prefix_len(&input_iter, abbr))
+                    });
+                    match found {
+                        Some(len) => advance_chars(&mut input_iter, len),
+                        None => return Err("unrecognized day name".to_string()),
                     }
                 }
                 Some('b' | 'B' | 'h') => {
@@ -95396,56 +95469,30 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     // case-insensitively, and nothing more. The letters after the match belong to the
                     // rest of the format, so `Marx` and `Marc` are `Mar` followed by a letter the
                     // next format character has to take (it never does), not a longer spelling of
-                    // March. Looked ahead on a copy, so only the matched letters are consumed, and
-                    // no further than the longest name (`september`): a longer run cannot match.
-                    let mut ahead = input_iter.clone();
-                    let mut name = String::new();
-                    while let Some(&c) = ahead.peek() {
-                        if c.is_ascii_alphabetic() && name.len() < 9 {
-                            name.push(c.to_ascii_lowercase());
-                            ahead.next();
-                        } else {
-                            break;
-                        }
-                    }
+                    // March. Only the matched letters are consumed. The names are the locale's when
+                    // one is in effect (#5754): a month's full name, then its abbreviation, before the
+                    // next month's, which is glibc's order and matters where a locale's abbreviation
+                    // is a prefix of another month's name.
                     date_read = true;
-                    const MONTHS: [&str; 12] = [
-                        "january",
-                        "february",
-                        "march",
-                        "april",
-                        "may",
-                        "june",
-                        "july",
-                        "august",
-                        "september",
-                        "october",
-                        "november",
-                        "december",
-                    ];
                     // #971: a non-matching name (e.g. "xyz") previously left
                     // `month` at its prior/default value instead of erroring,
                     // silently masking malformed input as a valid date -
                     // real jq rejects it ("does not match format").
-                    // glibc's order: each month's full name, then its abbreviation, before the next
-                    // month's. The English names give the same answer in either order, but a locale's
-                    // may not (#5754).
-                    let matched = MONTHS.iter().enumerate().find_map(|(i, m)| {
-                        if name.starts_with(m) {
-                            Some((i, m.len()))
-                        } else {
-                            name.starts_with(&m[..3]).then_some((i, 3))
-                        }
+                    let found = (0..12).find_map(|i| {
+                        let (full, abbr) = match names {
+                            Some(n) => (n.month_full[i].as_str(), n.month_abbr[i].as_str()),
+                            None => (MONTH_FULL[i], MONTH_ABBR[i]),
+                        };
+                        strptime_prefix_len(&input_iter, full)
+                            .or_else(|| strptime_prefix_len(&input_iter, abbr))
+                            .map(|len| (i, len))
                     });
-                    match matched {
+                    match found {
                         Some((i, len)) => {
                             month = (i + 1) as i64;
-                            // Letters are ASCII, so one `char` is one byte of the name.
-                            for _ in 0..len {
-                                input_iter.next();
-                            }
+                            advance_chars(&mut input_iter, len);
                         }
-                        None => return Err(format!("unrecognized month name '{name}'")),
+                        None => return Err("unrecognized month name".to_string()),
                     }
                 }
                 Some('C') => {
