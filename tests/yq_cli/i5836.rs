@@ -266,6 +266,7 @@ fn test_arguments_are_read_from_the_real_input_before_the_refusal_5836() -> Resu
         ("test(\"a\",\"b\")", not_matched.as_str()),
         ("test(error(\"p\");\"g\")", "Error: p"),
         ("match(\"x\";\"g\")", not_matched.as_str()),
+        ("capture(\"x\";\"g\")", not_matched.as_str()),
     ] {
         // A document node, which the refusal reads its tag from.
         let (stdout, stderr, code) =

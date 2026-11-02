@@ -2549,7 +2549,12 @@ fn yq_string_op_refusal<S: EvalSemantics, V: DocumentValue>(
             if failed.is_some() {
                 return None;
             }
-            match eval_single::<S, V>(arg, value.clone(), false, cursor).collect_owned::<S>() {
+            // `collect_owned` answers an error as no values, so it is taken here first.
+            let result = match eval_single::<S, V>(arg, value.clone(), false, cursor) {
+                GenericResult::Error(e) => Err(e),
+                other => other.collect_owned::<S>(),
+            };
+            match result {
                 Ok(values) => values.into_iter().next().map(Expr::tracked_value),
                 Err(e) => {
                     failed = Some(e);
