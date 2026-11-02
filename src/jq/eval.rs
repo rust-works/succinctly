@@ -86368,6 +86368,8 @@ fn walk_impl_at_depth<S: EvalSemantics>(
             let mut new_obj = obj.clone();
             for (k, v) in obj {
                 let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
+                // #5794: `map_values` reads one output per member in jq mode, so a control after it is never reached.
+                let control = control.filter(|_| !(S::TAG == EvalTag::Jq && !vs.is_empty()));
                 if let Some(control) = control {
                     return (Vec::new(), Some(control));
                 }
@@ -86386,6 +86388,8 @@ fn walk_impl_at_depth<S: EvalSemantics>(
             let mut new_obj = IndexMap::with_capacity(obj.len());
             for (k, v) in obj {
                 let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
+                // #5794: as above -- the first output stands, a control after it is not reached.
+                let control = control.filter(|_| !(S::TAG == EvalTag::Jq && !vs.is_empty()));
                 if let Some(control) = control {
                     return (Vec::new(), Some(control));
                 }
