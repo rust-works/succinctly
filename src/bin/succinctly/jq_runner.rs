@@ -9170,10 +9170,7 @@ impl LazyBatch {
             "the batch's root is the document the span names"
         );
         let (start, end) = spans[at];
-        Some(
-            generic_to_owned_checked::<JqSemantics, _>(&cursor.value())
-                .map(|value| value.with_fresh_nan_instances(&text[start..end])),
-        )
+        Some(serde_validated_value(&cursor, &text[start..end]))
     }
 }
 
@@ -9221,6 +9218,7 @@ fn lazy_json_producer(lazy: LazyJsonInputs, exhausted: Option<(u32, u32)>) -> jq
         let produced = jq::ProducedInput::converted(converted, lazy.source, line as u32);
         if next == lazy.spans.len() {
             stream = None;
+            batch = None;
         }
         produced
     })
@@ -12663,16 +12661,31 @@ fn json_document_to_owned_value(
     // `bytes` is often a temporary (an `--argjson` string, a `--seq` record),
     // so each NaN gets an identity of its own rather than its address (#3309).
     let value = match delimiters {
-        Delimiters::Walk => generic_to_owned::<JqSemantics, _>(&cursor.value()),
-        Delimiters::SerdeValidated => generic_to_owned_checked::<JqSemantics, _>(&cursor.value()),
-    }?
-    .with_fresh_nan_instances(bytes);
+        Delimiters::Walk => {
+            generic_to_owned::<JqSemantics, _>(&cursor.value())?.with_fresh_nan_instances(bytes)
+        }
+        Delimiters::SerdeValidated => serde_validated_value(&cursor, bytes)?,
+    };
     Ok(match form {
         DocumentForm::Value => value,
         DocumentForm::StreamEvents => {
             OwnedValue::array_from(succinctly::jq::tostream_events_owned(value))
         }
     })
+}
+
+/// The value of the document `cursor` is at, for text `serde_json` has accepted as a whole value
+/// ([`Delimiters::SerdeValidated`]); `bytes` is the document's own text. The one definition of
+/// that conversion, for a document indexed on its own and for one read through a
+/// [`LazyBatch`]'s index (#5854).
+fn serde_validated_value<W: AsRef<[u64]> + Clone>(
+    cursor: &JsonCursor<'_, W>,
+    bytes: &[u8],
+) -> core::result::Result<OwnedValue, EvalError> {
+    Ok(
+        generic_to_owned_checked::<JqSemantics, _>(&cursor.value())?
+            .with_fresh_nan_instances(bytes),
+    )
 }
 
 /// [`json_document_to_owned_value_checked`] for the document `bytes` found at `text[offset]`,
@@ -13926,6 +13939,14 @@ mod tests {
                 .collect(),
         );
         streams.push((0..300).map(|i| format!("{i} ")).collect());
+        // No separator between documents: a container beside a token, adjacent strings.
+        streams.push("[1]2 1[2] \"a\"\"b\" {}{} \"a\"1\"b\" [][]{}\n".to_string());
+        streams.push(
+            (0..200)
+                .map(|i| format!("[{i}]{i}\"s\""))
+                .collect::<String>()
+                + "\n",
+        );
         streams
     }
 
@@ -13944,6 +13965,12 @@ mod tests {
                 while next < spans.len() {
                     let batch = LazyBatch::build(bytes, &spans, next, max_bytes);
                     assert!(batch.end > next, "a batch holds at least one document");
+                    assert_eq!(
+                        batch.indexed.is_some(),
+                        batch.end - next >= 2,
+                        "{stream:?} at {next} in a batch of {max_bytes} bytes: a run of several \
+                         documents has an index of its own"
+                    );
                     for at in next..batch.end {
                         let (start, end) = spans[at];
                         let alone = stream_document_validated(
