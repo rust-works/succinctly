@@ -77572,9 +77572,10 @@ where
 ///
 /// A container (`--argjson`, `--slurpfile`, `$ARGS`, a data `import`) is spliced as one shared
 /// marker instead of a literal tree rebuilt at every `$name`, when the program only reads it
-/// (`reads_named_arguments_only`). A program with a fold but no assignment, path expression or
-/// definition shares only the `$name` that heads a navigation chain (#5774,
-/// `substitute_vars_navigation_shared`); a program that also holds one `$name` that is not read
+/// (`reads_named_arguments_only`). A program with a fold or a store but no path expression or
+/// definition shares only the `$name` that heads a navigation chain (#5774, #5803,
+/// `substitute_vars_navigation_shared`), and with a store only where it is read and not where it
+/// is the input or the target of a store; a program that also holds one `$name` that is not read
 /// through (`$d | map(.a)`, `$d | sort`) keeps the literal for that occurrence only, and a fold
 /// that reaches it still rebuilds the whole value at every step.
 ///
@@ -77640,20 +77641,24 @@ fn navigation_head_name(name: &str) -> String {
 /// are one shared marker, every other `$name` the literal.
 fn substitute_vars_navigation_shared(expr: &Expr, vars: &[(&str, &OwnedValue)]) -> Expr {
     let stores = any_subexpr(expr, &mut |e| is_assignment_expr(e));
+    let folds = any_subexpr(expr, &mut |e| {
+        matches!(e, Expr::Reduce { .. } | Expr::Foreach { .. })
+    });
     let mut result: Option<Expr> = None;
     for &(name, value) in vars {
         let current = result.as_ref().unwrap_or(expr);
         let is_container = matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
         result = Some(if is_container && !program_binds_var(current, name) {
             let head = navigation_head_name(name);
-            let renamed = rename_navigation_heads(current, name, &head, !stores);
+            let renamed = rename_navigation_heads(current, name, &head, true, stores);
             // A fold's identity-sharing marker (#5540): a container read through it is stored in
             // the accumulator as one handle, as jq's `reduce` stores the `jv`, where a plain
             // marker's container sends the step through the reindex bridge, which is quadratic
             // over a growing accumulator. The value is never written (every write copies a
             // container with a second strong reference first), and a named argument has no node
             // in the embed table for the step to confuse it with.
-            let marker = LazyMarker::new(value, Origin::Untracked, None).fold_shared();
+            let marker = LazyMarker::new(value, Origin::Untracked, None);
+            let marker = if folds { marker.fold_shared() } else { marker };
             let shared = substitute_var_with(&renamed, &head, value, Some(&marker), false);
             // A renamed head the substitution did not reach would surface as an undefined
             // variable; the literal is always right.
@@ -77700,41 +77705,84 @@ fn is_navigation_step(expr: &Expr) -> bool {
 /// A head is the `$name` of `$name.a`, `$name[0]`, `$name[1:]`, `$name[]`, `$name[$k]` or
 /// `$name | length`: the value is read through or measured, so nothing of it is handed on whole.
 ///
-/// `reading` says `expr` is read, not written through (#5803): outside the value side of every
-/// store, a program that holds one renames nothing (`false`), since a head there can be the source
-/// of a path (`$d | (.[] | numbers) |= . + 1`, #5673). The target of a store is never renamed.
-fn rename_navigation_heads(expr: &Expr, name: &str, head: &str, reading: bool) -> Expr {
+/// `stores` says the program holds an assignment (#5803). Then a head is renamed only where it is
+/// read, not where its value is the input of a store, which can resolve a path against it
+/// (`$d | (.[] | numbers) |= . + 1`, #5673): a stage of a pipe before one that holds a store, and a
+/// fold's initial value, keep the literal, and so does the target of every store. `reading` is
+/// `false` inside such a position.
+fn rename_navigation_heads(
+    expr: &Expr,
+    name: &str,
+    head: &str,
+    reading: bool,
+    stores: bool,
+) -> Expr {
     let is_var = |e: &Expr| matches!(e, Expr::Var(v) if v == name);
-    let again = |e: &Expr| rename_navigation_heads(e, name, head, reading);
+    let again = |e: &Expr| rename_navigation_heads(e, name, head, reading, stores);
+    let read = |e: &Expr| Box::new(rename_navigation_heads(e, name, head, true, stores));
+    // A fold's initial value is the state its update stores into.
+    let init_reads = reading && !stores;
     match expr {
         Expr::Assign { path, value } => Expr::Assign {
             path: path.clone(),
-            value: Box::new(rename_navigation_heads(value, name, head, true)),
+            value: read(value),
         },
         Expr::Update { path, filter } => Expr::Update {
             path: path.clone(),
-            filter: Box::new(rename_navigation_heads(filter, name, head, true)),
+            filter: read(filter),
         },
         Expr::CompoundAssign { op, path, value } => Expr::CompoundAssign {
             op: *op,
             path: path.clone(),
-            value: Box::new(rename_navigation_heads(value, name, head, true)),
+            value: read(value),
         },
         Expr::AlternativeAssign { path, value } => Expr::AlternativeAssign {
             path: path.clone(),
-            value: Box::new(rename_navigation_heads(value, name, head, true)),
+            value: read(value),
         },
-        Expr::Pipe(stages)
-            if reading
-                && stages.len() >= 2
-                && is_var(&stages[0])
-                && is_navigation_step(&stages[1]) =>
-        {
-            Expr::Pipe(
-                core::iter::once(Expr::Var(head.to_string()))
-                    .chain(stages[1..].iter().map(again))
-                    .collect(),
-            )
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            update,
+        } => Expr::Reduce {
+            input: Box::new(again(input)),
+            patterns: patterns.clone(),
+            init: Box::new(rename_navigation_heads(
+                init, name, head, init_reads, stores,
+            )),
+            update: Box::new(again(update)),
+        },
+        Expr::Foreach {
+            input,
+            patterns,
+            init,
+            update,
+            extract,
+        } => Expr::Foreach {
+            input: Box::new(again(input)),
+            patterns: patterns.clone(),
+            init: Box::new(rename_navigation_heads(
+                init, name, head, init_reads, stores,
+            )),
+            update: Box::new(again(update)),
+            extract: extract.as_ref().map(|e| Box::new(again(e))),
+        },
+        Expr::Pipe(stages) => {
+            // A stage before the last one that holds a store is where a store's input comes from.
+            let last_store = stages
+                .iter()
+                .rposition(|stage| any_subexpr(stage, &mut |e| is_assignment_expr(e)));
+            let reading_at = |at: usize| reading && last_store.map_or(true, |last| at >= last);
+            let lead = reading_at(0) && stages.len() >= 2 && is_var(&stages[0]);
+            let renamed = stages.iter().enumerate().map(|(at, stage)| {
+                if at == 0 && lead && is_navigation_step(&stages[1]) {
+                    Expr::Var(head.to_string())
+                } else {
+                    rename_navigation_heads(stage, name, head, reading_at(at), stores)
+                }
+            });
+            Expr::Pipe(renamed.collect())
         }
         Expr::IndexExpr { target, key } if reading && is_var(target) => Expr::IndexExpr {
             target: Box::new(Expr::Var(head.to_string())),
@@ -77751,8 +77799,8 @@ fn rename_navigation_heads(expr: &Expr, name: &str, head: &str, reading: bool) -
 
 /// Whether `expr` only reads a named argument's value (#5690).
 ///
-/// That is: no assignment, path expression, fold or definition anywhere in it. (A fold alone is
-/// [`reads_named_arguments_besides_folds`]'s, #5774.) A shared marker is
+/// That is: no assignment, path expression, fold or definition anywhere in it. (A fold or a store is
+/// [`reads_named_arguments_besides_folds_and_stores`]'s, #5774, #5803.) A shared marker is
 /// refused in path position (`$d | (.[] | numbers) |= . + 1` is an error with one, `[2,3]` in jq),
 /// makes a fold that appends or assigns the value quadratic (`closed_expr_to_owned` declines a
 /// marker), and slows a small container assigned per record, so each of those keeps the literal.
@@ -165490,6 +165538,11 @@ mod named_args_shared_tests_5690 {
             ("reduce range(2) as $i (.; .[$i] //= $d[0])", true),
             ("reduce range(2) as $i (.; .[$d[0]] = 1)", false),
             ("reduce range(2) as $i (.; .[$i] = $d)", false),
+            // A read that is the input of a later store keeps the literal; one that is not, shares.
+            ("reduce range(2) as $i (0; . + $d[$i]) | .x = 1", false),
+            ("{} | .a = $d[0]", true),
+            ("[$d[0] | .a = 1]", false),
+            ("reduce range(2) as $i (0; . + $d[$i]) | .x = $d[0]", true),
             ("$d | .[0] = 9", false),
             ("$d[0] | .x = 1", false),
             ("reduce range(2) as $i ($d[0]; .x = $d[1])", true),

@@ -32,12 +32,62 @@ const ROWS: &[(&str, &str)] = &[
     ("reduce range(3) as $i ([]; .[$i] = $d) | map(length)", "[3,3,3]\n"),
     ("reduce range(3) as $i ({}; .a = $d[$i] | .b = $d[$i].t) | [.a.id, .b]", "[3,[]]\n"),
     ("reduce range(2) as $i ({}; .a = $d[0] | .a.id = $i) | [.a.id, $d[0].id]", "[1,1]\n"),
+    ("reduce range(2) as $i ($d; .[$i].age = $d[$i].age) | map(.age)", "[30,41,25]\n"),
+    ("reduce range(2) as $i ($d; .[$i].age |= $d[$i + 1].age) | map(.age)", "[41,25,25]\n"),
+    ("reduce range(2) as $i ($d[0]; .age += $d[$i].age) | .age", "101\n"),
+    ("reduce range(2) as $i (0; . + $d[$i].age) | {total: .} | .n = $d[2].age", "{\"total\":71,\"n\":25}\n"),
+    ("$d | map(.age = $d[0].age) | map(.age)", "[30,30,30]\n"),
+    ("[$d[0] | .age = 1] | .[0].age", "1\n"),
 ];
 
 #[test]
 fn a_store_that_reads_a_container_named_argument_answers_as_jq_5803() -> Result<()> {
     for (filter, expected) in ROWS {
         let (stdout, stderr, code) = run_jq_full(&["-nc", "--argjson", "d", D, filter], None)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*expected, 0),
+            "{filter}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// An argument holding NaN: `==` on a node of the argument is identity-short-circuited as in jq
+/// (`[nan] | .[0] == .[0]` is true), whether the read is in a fold, a store or neither.
+const NAN: &str = "[nan,1,{\"a\":nan},[nan]]";
+
+const NAN_ROWS: &[(&str, &str)] = &[
+    ("$d[0] == $d[0]", "true\n"),
+    ("$d == $d", "true\n"),
+    ("[$d[2] == $d[2], $d[3] == $d[3]]", "[true,true]\n"),
+    (
+        "reduce range(1) as $i (0; if $d[0] == $d[0] then 1 else 2 end)",
+        "1\n",
+    ),
+    (
+        "reduce range(2) as $i ([]; . + [$d[0] == $d[0]])",
+        "[true,true]\n",
+    ),
+    (
+        "reduce range(1) as $i ({}; .a = ($d[0] == $d[0]))",
+        "{\"a\":true}\n",
+    ),
+    ("{} | .a = ($d[0] == $d[0])", "{\"a\":true}\n"),
+    (
+        "reduce range(1) as $i ({}; .a = $d[2] | .b = ($d[2] == .a))",
+        "{\"a\":{\"a\":null},\"b\":true}\n",
+    ),
+    (
+        "reduce range(1) as $i ({}; .a = $d[3]) | .a == $d[3]",
+        "true\n",
+    ),
+];
+
+#[test]
+fn a_nan_argument_compares_as_jq_5803() -> Result<()> {
+    for (filter, expected) in NAN_ROWS {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", "--argjson", "d", NAN, filter], None)?;
         assert_eq!(
             (stdout.as_str(), code),
             (*expected, 0),
