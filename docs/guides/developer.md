@@ -465,6 +465,20 @@ cargo clippy --all-targets --features std,simd,serde,cli,regex,bench-runner,larg
 cargo clippy --all-targets --features std,simd,broadword-yaml,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
 ```
 
+Rustdoc has the same blind spot, so CI's `Documentation` job runs it twice and the `rustdoc` and
+`rustdoc-simd-backends` pre-push gates mirror both (#5740). A broken intra-doc link in the x86_64 YAML
+backend is invisible to the `--all-features` run, which compiles that backend out:
+
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests
+```
+
+The second run documents the SIMD backend of the machine it runs on: CI's `Documentation` job is x86_64 Linux, so
+it covers `x86.rs` and the AVX-512 popcount path, and the `rustdoc-simd-backends` gate on an Apple Silicon machine
+covers `neon.rs` instead. To check the x86_64 backend from there, add `--target x86_64-apple-darwin`. Nothing
+documents `broadword.rs` (it needs `broadword-yaml`).
+
 ### Documentation
 
 - All public items must have doc comments
