@@ -10616,7 +10616,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     JSON_STREAM_TAIL_ERROR.with(|e| *e.borrow_mut() = None);
     // `-e` exits 1 for "no match" too, which says nothing about the stream's bad value.
     let exit_status = args.exit_status;
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_yq_inner(args)));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        jq::with_value_depth_on_stack_floor(|| run_yq_inner(args))
+    }));
     match outcome {
         // #2839: the good values of a `-p json` stream are out; now the bad one.
         Ok(Ok(code))
