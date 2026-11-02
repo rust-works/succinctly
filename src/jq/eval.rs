@@ -83509,7 +83509,8 @@ pub(crate) fn fold_loop_variable_shares_identity<S: EvalSemantics>(
     // answered by a single walk.
     let shares = |expr: &Expr| {
         mentions_any_name(expr, &names)
-            && (loop_var_can_be_compared(expr, &names) || loop_var_can_reach_output(expr, &names))
+            && (loop_var_can_be_compared(expr, &names)
+                || loop_var_can_reach_output(expr, &names, &[]))
     };
     !names.is_empty() && (shares(update) || extract.is_some_and(shares))
 }
@@ -83522,11 +83523,11 @@ pub(crate) fn fold_loop_variable_shares_identity<S: EvalSemantics>(
 /// The positions read by value are left out: an `if`'s condition, where a marker
 /// makes `owned_if_step` decline; a comparison, `and` and `or`, whose answer is a
 /// boolean; and an assignment's path, a key. Arithmetic and an assignment's
-/// right-hand side count when they read the variable whole (`. + $a`, `. + [$a]`,
-/// `.x = $a`, #5540): their closed operand is `owned_assign_step`'s and
+/// right-hand side count when they read the variable at all (`. + $a`, `. + [$a]`,
+/// `.x = $a`, #5540; `.x = $r.score`, #5761): their closed operand is `owned_assign_step`'s and
 /// `owned_arith_accumulator_shape`'s in-place step, which takes a fold's marker
-/// ([`Tracked::fold_share`]) as one `Rc` clone. A field read (`$r.score`) is a
-/// scalar spliced alone and does not count.
+/// ([`Tracked::fold_share`]) as one `Rc` clone. A field read hands on the member itself, a
+/// container when the member is one.
 ///
 /// A binder's source reaches the output only through the names it binds: `$r as
 /// $s | .[$s.name] = $s.score` and `reduce $r.tags[] as $t (.; .[$t] += 1)` hand
@@ -83541,40 +83542,40 @@ pub(crate) fn fold_loop_variable_shares_identity<S: EvalSemantics>(
 /// it, so a generator that grows its own value in place copies it once a step
 /// (`last(range([]; {}; [1]))`, as jq's `reduce` does), where the rebuild had
 /// copied it anyway.
-fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
+fn loop_var_can_reach_output(expr: &Expr, names: &[String], bound: &[String]) -> bool {
     let raises_a_name = |e: &Expr| {
-        any_subexpr(e, &mut |n| matches!(n, Expr::Error(_))) && mentions_any_name(e, names)
+        any_subexpr(e, &mut |n| matches!(n, Expr::Error(_)))
+            && (mentions_any_name(e, names) || mentions_any_name(e, bound))
     };
     // `bodies`, searched for `names` plus `bound` when `source` reads one of `names`.
-    let through_binder = |source: &Expr, bound: &[Pattern], bodies: &[Option<&Expr>]| {
-        if !mentions_any_name(source, names) {
+    let through_binder = |source: &Expr, patterns: &[Pattern], bodies: &[Option<&Expr>]| {
+        if !mentions_any_name(source, names) && !mentions_any_name(source, bound) {
             return bodies
                 .iter()
                 .flatten()
-                .any(|body| loop_var_can_reach_output(body, names));
+                .any(|body| loop_var_can_reach_output(body, names, bound));
         }
-        let mut wider = names.to_vec();
-        for pattern in bound {
+        let mut wider = bound.to_vec();
+        for pattern in patterns {
             collect_pattern_var_names(pattern, &mut wider);
         }
         raises_a_name(source)
             || bodies
                 .iter()
                 .flatten()
-                .any(|body| loop_var_can_reach_output(body, &wider))
+                .any(|body| loop_var_can_reach_output(body, names, &wider))
     };
     let visit = |found: bool| if found { Visit::Found } else { Visit::Skip };
-    let reads_whole = |e: &Expr| reads_a_name_whole(e, names);
     search_subexpr(expr, &mut |e| match e {
-        Expr::Var(v) if names.iter().any(|name| name == v) => Visit::Found,
+        Expr::Var(v) if names.iter().chain(bound).any(|name| name == v) => Visit::Found,
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => visit(
             raises_a_name(cond)
-                || loop_var_can_reach_output(then_branch, names)
-                || loop_var_can_reach_output(else_branch, names),
+                || loop_var_can_reach_output(then_branch, names, bound)
+                || loop_var_can_reach_output(else_branch, names, bound),
         ),
         Expr::As { expr, var, body } => visit(through_binder(
             expr,
@@ -83592,7 +83593,7 @@ fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
             init,
             update,
         } => visit(
-            loop_var_can_reach_output(init, names)
+            loop_var_can_reach_output(init, names, bound)
                 || through_binder(input, patterns, &[Some(update)]),
         ),
         Expr::Foreach {
@@ -83602,19 +83603,24 @@ fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
             update,
             extract,
         } => visit(
-            loop_var_can_reach_output(init, names)
+            loop_var_can_reach_output(init, names, bound)
                 || through_binder(input, patterns, &[Some(update), extract.as_deref()]),
         ),
         Expr::Compare { .. } | Expr::And(..) | Expr::Or(..) => visit(raises_a_name(e)),
-        // #5540: arithmetic and an assignment's right-hand side store the variable
-        // (`. + $a`, `. + [$a]`, `.x = $a`) when they read it whole; a field read
-        // (`$r.score`) is a scalar spliced alone, which carries no identity. An
-        // assignment's path is read by value, as a key.
-        Expr::Arithmetic { .. } => visit(raises_a_name(e) || reads_whole(e)),
+        // #5540, #5761: arithmetic and an assignment's right-hand side store what they read
+        // (`. + $a`, `. + [$a]`, `.x = $a`, `.x = $a.items`): a field read hands on the member
+        // itself, which is a container when the member is one. A name a binder took from the
+        // variable (`bound`) counts only when read whole: the binder's body does not take the
+        // in-place step with it marked. An assignment's path is read by value, as a key.
+        Expr::Arithmetic { .. } => {
+            visit(raises_a_name(e) || mentions_any_name(e, names) || reads_a_name_whole(e, bound))
+        }
         Expr::Assign { value: rhs, .. }
         | Expr::CompoundAssign { value: rhs, .. }
         | Expr::AlternativeAssign { value: rhs, .. }
-        | Expr::Update { filter: rhs, .. } => visit(raises_a_name(e) || reads_whole(rhs)),
+        | Expr::Update { filter: rhs, .. } => visit(
+            raises_a_name(e) || mentions_any_name(rhs, names) || reads_a_name_whole(rhs, bound),
+        ),
         // MetaAssign exists in yq mode only, where the gate is false; it stays as it was.
         _ if is_assignment_expr(e) => visit(raises_a_name(e)),
         _ => Visit::Descend,
@@ -106401,7 +106407,15 @@ mod tests {
             "reduce . as $a ({}; . + {x: $a})",
             "reduce . as $a (null; . + $a)",
             "reduce .[] as $r ({}; .[$r.name] = my_fn($r))",
-            // #5761: a slice store over `null` and a `del` that names nothing build a new
+            // #5761: a field read hands on the member itself, a container when the member is
+            // one, so the marker rides it too (the step still runs in place).
+            "reduce .[] as $r ({}; $r.name as $n | .[$n] = $r.score)",
+            "reduce .[] as $r ({}; .[$r.name] = $r.score)",
+            "reduce .[] as $r ({}; .x[$r.name] += $r.score)",
+            "reduce .[] as $r ({}; .[$r.name] += ($r.score | floor))",
+            "reduce .[] as $r (0; . + $r.score)",
+            "reduce .[] as $r ([]; . + [$r.id])",
+            // ... and a slice store over `null` and a `del` that names nothing build a new
             // container, so the stored element is the same handle there too.
             "reduce . as $a (null; .[1:] = $a)",
             "reduce . as $a ({}; .x = ($a | del(.[5])))",
@@ -106432,14 +106446,9 @@ mod tests {
             // A comparison that never reads a loop variable.
             "reduce . as $a (0; . == 1)",
             "reduce . as $a (0; $b == $b)",
-            // An assignment's path and right-hand side run by value: a call or
-            // builtin there must not make `owned_assign_step` decline (a field read).
-            "reduce .[] as $r ({}; .[$r.name] = $r.score)",
-            "reduce .[] as $r ({}; .x[$r.name] += $r.score)",
-            "reduce .[] as $r ({}; .[$r.name] += ($r.score | floor))",
-            // #5540: a field read is a scalar spliced alone and shares nothing.
-            "reduce .[] as $r (0; . + $r.score)",
-            "reduce .[] as $r ([]; . + [$r.id])",
+            // An assignment's path runs by value, as a key.
+            "reduce .[] as $r ({}; .[$r.name] = 1)",
+            "reduce .[] as $r ({}; .x[$r.name] += 1)",
             // #5516: an `if` condition, `and` and `or` answer a boolean.
             "reduce . as $a (null; if $a then 1 else 0 end)",
             "reduce . as $a (null; $a and true)",
@@ -106448,7 +106457,7 @@ mod tests {
             // A binder's source hands nothing on but through its names, here read by
             // value only (`fold_assign_step_copies_nothing_3138`).
             "reduce .[] as $r ({}; $r as $s | .[$s.name] = $s.score)",
-            "reduce .[] as $r ({}; $r.name as $n | .[$n] = $r.score)",
+            "reduce .[] as $r ({}; $r.name as $n | .[$n] = 1)",
             "reduce .[] as $r ({}; $r as {name: $n} | .[$n] = 1)",
             "reduce .[] as $r ({}; reduce $r.tags[] as $t (.; .[$t] += 1))",
             "reduce .[] as $r ({}; foreach $r.tags[] as $t (.; .[$t] = 1; .))",
