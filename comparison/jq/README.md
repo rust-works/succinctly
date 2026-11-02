@@ -77,6 +77,7 @@ cargo build --release --features cli,simd,regex,serde --target-dir target/subjec
 
 `--write-docs` writes `docs/compare/jq-<platform>.{md,json}` and the index `docs/compare/jq.md`, and regenerates the `<!-- compare:jq-<platform> -->` block of `docs/benchmarks/jq.md` from that json.
 A platform's first run needs the two markers added at the top of its section there.
+The section's `**CPU**:` line must name the run's CPU (two machines can share a platform), and `--write-docs` checks that before it measures anything.
 `--render-docs` measures nothing: it re-renders the index and every block from the committed jsons, after a change to how they are rendered.
 The bin's `benchmarks_doc_quotes_the_committed_results` test fails when a block and its json disagree.
 CI is `.github/workflows/compare-jq.yml`, run by hand or on a release, not on pull requests.

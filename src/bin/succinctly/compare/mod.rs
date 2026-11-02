@@ -127,7 +127,13 @@ pub struct CompareJqArgs {
     /// Run nothing: regenerate the index docs/compare/jq.md and the per-platform blocks of
     /// docs/benchmarks/jq.md from the committed docs/compare/jq-<platform>.json files, after a
     /// change to how they are rendered
-    #[arg(long, conflicts_with_all = ["write_docs", "write_summary", "verify", "ledger_only"])]
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "dimension", "quick", "full", "write_docs", "write_summary", "verify", "ledger_only",
+            "control", "query", "build_time", "cachegrind", "build_jq", "jq", "subject",
+        ]
+    )]
     render_docs: bool,
 
     /// Time jq against itself instead of succinctly: the harness's own noise floor
@@ -310,6 +316,10 @@ fn repo_root() -> Result<PathBuf> {
 }
 
 pub fn run(args: CompareJqArgs) -> Result<i32> {
+    if args.render_docs {
+        render_docs(&repo_root()?)?;
+        return Ok(0);
+    }
     if args.cachegrind
         && (args.ledger_only
             || (!args.dimension.is_empty() && !args.dimension.contains(&Dimension::Performance)))
@@ -329,9 +339,13 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     }
     let valgrind = args.cachegrind.then(find_valgrind).transpose()?;
     let root = repo_root()?;
-    if args.render_docs {
-        render_docs(&root)?;
-        return Ok(0);
+    if args.write_docs {
+        // Before measuring anything: a machine with no block of its own would
+        // otherwise find out only when the run is over.
+        let doc = std::fs::read_to_string(root.join(docs::BENCHMARKS_DOC))?;
+        let cpu = crate::bench_runner::metadata::collect_system_info().cpu;
+        docs::check_block_cpu(&doc, &format!("jq-{}", docs::PLATFORM), &cpu)
+            .map_err(|e| anyhow::anyhow!("--write-docs: {}: {e}", docs::BENCHMARKS_DOC))?;
     }
     let (manifest, manifest_sha256) = Manifest::load(&root)?;
     let primary = manifest.primary().clone();
@@ -1128,8 +1142,7 @@ fn write_docs(root: &std::path::Path, results: &Results, args: &CompareJqArgs) -
     std::fs::create_dir_all(&dir)?;
     let p = docs::PLATFORM;
     let json = docs::sanitize(&(serde_json::to_string_pretty(results)? + "\n"), root);
-    let mut runs = docs::committed_runs(&dir)?;
-    runs.retain(|(plat, _)| plat != p);
+    let mut runs = docs::committed_runs(&dir, Some(p))?;
     runs.push((p.to_string(), serde_json::from_str(&json)?));
     runs.sort_by(|a, b| a.0.cmp(&b.0));
     // Patched before anything is written, so a platform with no block in the doc
@@ -1156,7 +1169,7 @@ fn write_docs(root: &std::path::Path, results: &Results, args: &CompareJqArgs) -
 /// `--render-docs`: the committed runs re-rendered, nothing measured.
 fn render_docs(root: &std::path::Path) -> Result<()> {
     let dir = root.join("docs/compare");
-    let runs = docs::committed_runs(&dir)?;
+    let runs = docs::committed_runs(&dir, None)?;
     let bench = root.join(docs::BENCHMARKS_DOC);
     let bench_doc = docs::patch_benchmarks(&std::fs::read_to_string(&bench)?, &runs)?;
     std::fs::write(dir.join("jq.md"), docs::index(&runs))?;

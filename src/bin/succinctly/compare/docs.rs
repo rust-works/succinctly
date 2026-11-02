@@ -19,6 +19,9 @@ pub fn patch_block(doc: &str, id: &str, body: &str) -> Result<String> {
     let (Some(a), Some(b)) = (doc.find(&start), doc.find(&end)) else {
         bail!("doc has no {start} ... {end} block");
     };
+    if doc.matches(&start).count() > 1 || doc.matches(&end).count() > 1 {
+        bail!("doc has more than one `{id}` block, and only the first would be patched");
+    }
     if b < a {
         bail!("doc markers for `{id}` are out of order");
     }
@@ -28,6 +31,28 @@ pub fn patch_block(doc: &str, id: &str, body: &str) -> Result<String> {
         body.trim_end_matches('\n'),
         &doc[b..]
     ))
+}
+
+/// The `**CPU**:` line of the `# ` section holding `id`'s block must name `cpu`: a
+/// platform is an OS and architecture, and the doc has sections for two CPUs of
+/// some, so a run on one must not land in the other's section.
+pub fn check_block_cpu(doc: &str, id: &str, cpu: &str) -> Result<()> {
+    let start = format!("<!-- compare:{id} -->");
+    let Some(at) = doc.find(&start) else {
+        bail!("doc has no {start} block");
+    };
+    let section = doc[..at].rfind("\n# ").map_or(0, |i| i + 1);
+    let named = doc[section..at]
+        .lines()
+        .find_map(|l| l.strip_prefix("**CPU**: "));
+    match named {
+        Some(n) if n.starts_with(cpu) => Ok(()),
+        Some(n) => bail!(
+            "the `{id}` block sits in the section for {n}, and this run is on {cpu}: \
+             give this machine its own section, or move the markers"
+        ),
+        None => bail!("the section holding the `{id}` block has no **CPU**: line"),
+    }
 }
 
 pub const PLATFORM: &str = const_format();
@@ -134,7 +159,7 @@ fn table(header: &[&str], rows: &[Vec<String>], right: usize) -> String {
             .unwrap_or(0)
     };
     let widths: Vec<usize> = (0..header.len()).map(width).collect();
-    let line = |cells: Vec<String>| {
+    let line = |cells: &[String]| {
         let padded: Vec<String> = cells
             .iter()
             .enumerate()
@@ -148,11 +173,12 @@ fn table(header: &[&str], rows: &[Vec<String>], right: usize) -> String {
             .collect();
         format!("| {} |\n", padded.join(" | "))
     };
-    let mut s = line(header.iter().map(|&h| h.to_string()).collect());
+    let header: Vec<String> = header.iter().map(|&h| h.to_string()).collect();
+    let mut s = line(&header);
     let rule: Vec<String> = widths.iter().map(|w| "-".repeat(w + 2)).collect();
     s.push_str(&format!("|{}|\n", rule.join("|")));
     for r in rows {
-        s.push_str(&line(r.clone()));
+        s.push_str(&line(r));
     }
     s
 }
@@ -173,7 +199,7 @@ fn time_ms(row: &Value, i: usize) -> Option<f64> {
 /// from that platform's committed `docs/compare/jq-<platform>.json` alone, so the
 /// hand-written `bench run jq_bench` tables beside it are not its source.
 pub fn perf_block(platform: &str, v: &Value) -> String {
-    let rows = v["perf"].as_array().cloned().unwrap_or_default();
+    let rows: &[Value] = v["perf"].as_array().map_or(&[], Vec::as_slice);
     let name = |i: usize| {
         rows.iter()
             .find_map(|r| r["tools"].get(i)?["tool"].as_str())
@@ -207,6 +233,20 @@ pub fn perf_block(platform: &str, v: &Value) -> String {
         v["env"]["git"]["commit_short"].as_str().unwrap_or("?"),
         v["run_id"].as_str().unwrap_or("?"),
         v["reps"].as_u64().unwrap_or(0),
+    );
+    let features: Vec<&str> = v["env"]["succinctly_features"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let _ = writeln!(
+        s,
+        "**Timed binary**: {}, built with `{}`.\n",
+        if v["env"]["subject_is_harness"].as_bool() == Some(false) {
+            "a separate build passed with `--subject`, not the harness"
+        } else {
+            "the harness itself"
+        },
+        features.join(","),
     );
     let losses = speeds.iter().filter(|&&x| x < 1.0).count();
     let _ = writeln!(
@@ -244,7 +284,8 @@ pub fn perf_block(platform: &str, v: &Value) -> String {
             } else {
                 ""
             };
-            let speedup = if speedup > 1.0 {
+            // Bold follows the printed figure, so a row shown as 1.00x is never bold.
+            let speedup = if (speedup * 100.0).round() > 100.0 {
                 format!("**{speedup:.2}x**{dagger}")
             } else {
                 format!("{speedup:.2}x{dagger}")
@@ -278,8 +319,8 @@ pub fn perf_block(platform: &str, v: &Value) -> String {
 }
 
 /// Every committed platform run in `dir` (`jq-<platform>.json`, not the coverage
-/// summary), sorted by platform.
-pub fn committed_runs(dir: &std::path::Path) -> Result<Vec<(String, Value)>> {
+/// summary) except `skip`'s, which is not read at all, sorted by platform.
+pub fn committed_runs(dir: &std::path::Path, skip: Option<&str>) -> Result<Vec<(String, Value)>> {
     let mut runs = vec![];
     for e in std::fs::read_dir(dir)?.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
@@ -287,7 +328,7 @@ pub fn committed_runs(dir: &std::path::Path) -> Result<Vec<(String, Value)>> {
             .strip_prefix("jq-")
             .and_then(|n| n.strip_suffix(".json"))
         {
-            if plat == "coverage" {
+            if plat == "coverage" || Some(plat) == skip {
                 continue;
             }
             runs.push((
@@ -301,14 +342,19 @@ pub fn committed_runs(dir: &std::path::Path) -> Result<Vec<(String, Value)>> {
 }
 
 /// [`BENCHMARKS_DOC`] with every run's `compare:jq-<platform>` block regenerated.
-/// A run whose platform has no block is an error: its section needs the markers.
+/// A run whose platform has no block, or whose block sits in another CPU's
+/// section, is an error.
 pub fn patch_benchmarks(doc: &str, runs: &[(String, Value)]) -> Result<String> {
     runs.iter().try_fold(doc.to_string(), |d, (p, v)| {
-        patch_block(&d, &format!("jq-{p}"), &perf_block(p, v)).map_err(|e| {
-            anyhow::anyhow!(
-                "{BENCHMARKS_DOC}: {e}; add the two markers at the top of the section for this machine"
-            )
-        })
+        let id = format!("jq-{p}");
+        check_block_cpu(&d, &id, v["env"]["system"]["cpu"].as_str().unwrap_or("?"))
+            .and_then(|()| patch_block(&d, &id, &perf_block(p, v)))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "{BENCHMARKS_DOC}: {e} (a machine's section opens with the two markers, \
+                     see comparison/jq/README.md)"
+                )
+            })
     })
 }
 
@@ -375,6 +421,50 @@ mod tests {
         assert!(patch_block(doc, "z", "new").is_err());
         let reversed = "<!-- /compare:x -->\n<!-- compare:x -->\n";
         assert!(patch_block(reversed, "x", "new").is_err());
+        // A second copy would never be patched and could go stale unseen.
+        let twice = format!("{doc}{doc}");
+        let err = patch_block(&twice, "x", "new").unwrap_err();
+        assert!(err.to_string().contains("more than one"), "{err}");
+    }
+
+    #[test]
+    fn a_block_must_sit_in_the_section_for_the_runs_cpu() {
+        let doc = "# Apple M1 Max\n\n**CPU**: Apple M1 Max\n\n\
+                   # Apple M4 Pro\n\n**CPU**: Apple M4 Pro (12 cores)\n\n\
+                   <!-- compare:jq-macos-aarch64 -->\n<!-- /compare:jq-macos-aarch64 -->\n";
+        assert!(check_block_cpu(doc, "jq-macos-aarch64", "Apple M4 Pro").is_ok());
+        let err = check_block_cpu(doc, "jq-macos-aarch64", "Apple M1 Max").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("section for Apple M4 Pro (12 cores)"),
+            "{err}"
+        );
+        let bare = "# X\n\n<!-- compare:jq-p -->\n<!-- /compare:jq-p -->\n";
+        assert!(check_block_cpu(bare, "jq-p", "X").is_err());
+        assert!(check_block_cpu("no block", "jq-p", "X").is_err());
+    }
+
+    #[test]
+    fn the_perf_block_names_the_timed_binary() {
+        let mut v = perf_run();
+        assert!(perf_block("p", &v)
+            .contains("**Timed binary**: the harness itself, built with `cli,simd`."));
+        v["env"]["subject_is_harness"] = json!(false);
+        assert!(perf_block("p", &v).contains("a separate build passed with `--subject`"));
+    }
+
+    /// Bold marks a printed win: a ratio that prints as 1.00x is not one.
+    #[test]
+    fn bold_follows_the_printed_ratio() {
+        let mut v = perf_run();
+        for (i, x) in [0.996, 1.004, 1.006].into_iter().enumerate() {
+            v["perf"][i]["speedup_primary"] = json!(x);
+        }
+        let s = perf_block("p", &v);
+        let table = &s[s.find("| Query").unwrap()..];
+        assert!(!table.contains("**1.00x**"), "{s}");
+        assert_eq!(table.matches("1.00x").count(), 2, "{s}");
+        assert!(table.contains("| **1.01x** |"), "{s}");
     }
 
     fn tool(name: &str, min: f64, median: f64) -> Value {
@@ -387,7 +477,8 @@ mod tests {
             "command": "succinctly dev compare jq --quick",
             "run_id": "r1",
             "reps": 5,
-            "env": {"system": {"cpu": "Test CPU", "os_version": "Test OS"}, "git": {"commit_short": "abc1234"}},
+            "env": {"system": {"cpu": "Test CPU", "os_version": "Test OS"}, "git": {"commit_short": "abc1234"},
+                    "subject_is_harness": true, "succinctly_features": ["cli", "simd"]},
             "perf": [
                 {"query": "fast", "input": "users-1mb", "tools": tools, "ratio_from_min": false,
                  "speedup_primary": 4.0, "rss_ratio_primary": 0.25},
@@ -447,7 +538,7 @@ mod tests {
     #[test]
     fn benchmarks_doc_quotes_the_committed_results() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let runs = committed_runs(&root.join("docs/compare")).unwrap();
+        let runs = committed_runs(&root.join("docs/compare"), None).unwrap();
         assert_ne!(runs.len(), 0, "no committed run in docs/compare");
         let doc = std::fs::read_to_string(root.join(BENCHMARKS_DOC)).unwrap();
         let patched = patch_benchmarks(&doc, &runs).unwrap();
