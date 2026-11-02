@@ -10334,7 +10334,10 @@ What differs from jq 1.7.1:
   The pin's libc does not skip a leading space before them (`" 9" | strptime("%k")` is an error, as here), where glibc does.
   A specifier the libc does not know (`%Q`, `%P`, `%5`) and a `%` that ends the format are no match, where they were once matched as a literal.
   `%g` and `%G` are no match in the pin's libc and here, and glibc reads them.
-  `%U`, `%W` and `%V` are still no match here, though the pin's libc reads them and derives a date from them when a year is read (`"2015 09" | strptime("%Y %U")` is `[2015,2,1,0,0,0,0,59]`).
+  `%U`, `%W` and `%V` read a week number and, once a year is read, place the date by it as the pin's libc does (`"2015 09" | strptime("%Y %U")` is `[2015,2,1,0,0,0,0,59]`): `%U` counts from the year's first Sunday, `%W` from its first Monday and `%V` from the Monday of ISO week 1, and `%w`, `%u` or `%a` picks the day within the week.
+  A month read beside a week is kept and the day counted from its start, so `"2015 01 09" | strptime("%Y %m %U")` is January 60 (`[2015,0,60,0,0,0,0,59]`), as in jq.
+  A day read beside a week with no month is kept beside the month the week falls in; jq aborts on its own `set_tm_yday` assertion unless the two agree, so there is no answer to match where they do not.
+  `%w` refuses 7 and up and `%u` refuses 0 and 8 up, as the pin's libc does.
   `%Z` takes a run of letters here, where the pin's libc reads only a name of the local zone and fails on the rest.
   An empty am marker matches nothing and reads as am, as on macOS under `de_DE`, where `%p` prints nothing and `PM` is left over.
   `%a`, `%A` and `%p` no longer read any run of letters: `Xyz`, `Thurs`, `Th` and `PMX` are no match, as in jq.
