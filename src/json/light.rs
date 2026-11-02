@@ -108,6 +108,11 @@ pub struct JsonIndex<W = Vec<u64>> {
     /// as NaN (#3034). Provenance, not spelling, is what keeps the two
     /// apart.
     bridge_tokens: bool,
+    /// The closer chain [`JsonCursor::container_end_bp`] last walked, so the next container
+    /// that ends in the same chain reads its end instead of walking the chain again (#5869).
+    /// Left out of `Debug` and empty in a clone, like `seq_hint`: it records what was asked,
+    /// never what the index holds.
+    closer_chain: CloserChainMemo,
 }
 
 impl<W: core::fmt::Debug> core::fmt::Debug for JsonIndex<W> {
@@ -146,6 +151,51 @@ impl SeqHint {
         rank: u32::MAX,
         pos: 0,
     };
+}
+
+/// A container this deep or deeper (in balanced-parentheses positions) memoizes the closer
+/// chain its end sits in; a smaller one walks it, as that is cheaper than the memo.
+const CLOSER_CHAIN_MIN_SPAN: usize = 128;
+
+/// The run of closing brackets that ends a deep container, as [`JsonCursor::container_end_bp`]
+/// walked it (#5869).
+///
+/// A linear nest `[[[...1...]]]` ends every level at the same leaf, one closer further out per
+/// level, and every level is its parent's last child, so the trailing-gap check asks each one
+/// for its end. Walking the chain from the leaf each time made `..` over such a nest quadratic
+/// in its depth. The text position after each closer is the same for every level that ends in
+/// the chain, so the first walk records them and a later level reads its own.
+#[derive(Debug)]
+struct CloserChain {
+    /// The text the positions index into; a request over any other text walks for itself.
+    text: (usize, usize),
+    /// The balanced-parentheses position at which zero closers remain: the leaf's own closer
+    /// for a scalar, the leaf itself for an empty container (whose closer is one of the
+    /// chain's). A container whose close sits `k` positions past it ends after `k` closers.
+    base: usize,
+    /// The leaf's open position. No open parenthesis lies between it and the last close the
+    /// chain covers, so a container closing inside that range has this leaf as its last node.
+    leaf_open: usize,
+    /// `ends[k]` is the text position one past the `k`-th closer, `ends[0]` being the position
+    /// the first closer is looked for from.
+    ends: Vec<usize>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Closers [`JsonCursor::container_end_bp`] walked on this thread, for the tests that pin
+    /// the memo (#5869).
+    static CLOSER_STEPS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// A [`CloserChain`] in a [`JsonIndex`]: interior-mutable like `seq_hint`, and not cloned.
+#[derive(Debug, Default)]
+struct CloserChainMemo(core::cell::RefCell<Option<CloserChain>>);
+
+impl Clone for CloserChainMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 /// Build cumulative popcount index for IB.
@@ -240,6 +290,7 @@ impl JsonIndex<Vec<u64>> {
             lines: OnceCell::new(),
             seq_hint: Cell::new(SeqHint::NONE),
             bridge_tokens: false,
+            closer_chain: CloserChainMemo::default(),
         }
     }
 
@@ -312,6 +363,7 @@ impl JsonIndex<Vec<u64>> {
             lines: OnceCell::new(),
             seq_hint: Cell::new(SeqHint::NONE),
             bridge_tokens: true,
+            closer_chain: CloserChainMemo::default(),
         }
     }
 
@@ -366,6 +418,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
             lines: OnceCell::new(),
             seq_hint: Cell::new(SeqHint::NONE),
             bridge_tokens: false,
+            closer_chain: CloserChainMemo::default(),
         }
     }
 
@@ -866,27 +919,78 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     {
         let bp = self.index.bp();
         let close = bp.find_close(self.bp_pos)?;
+        // #5869: a deep container's end is read from the chain walked for a container nested
+        // in it, or walked here for the ones nested in this.
+        let memoize = close - self.bp_pos >= CLOSER_CHAIN_MIN_SPAN;
+        let mut memo = if memoize {
+            self.index.closer_chain.0.try_borrow_mut().ok()
+        } else {
+            None
+        };
+        if let Some(chain) = memo.as_deref_mut().and_then(Option::as_mut) {
+            if chain.text == (self.text.as_ptr() as usize, self.text.len())
+                && close >= chain.base
+                && close - chain.base < chain.ends.len()
+            {
+                if chain.leaf_open < self.bp_pos {
+                    return None;
+                }
+                return Some(chain.ends[close - chain.base]);
+            }
+        }
         let leaf_open = last_open_before(bp.words(), close)?;
         if leaf_open < self.bp_pos {
             return None;
         }
         let leaf = JsonCursor::from_bp_position(self.index, self.text, leaf_open);
         let start = leaf.text_position()?;
-        let (mut i, closers) = match *self.text.get(start)? {
+        let (mut i, closers, base) = match *self.text.get(start)? {
             // An empty container: its closer is part of the leaf, so it is one of the closers.
-            b'{' | b'[' => (start + 1, close - leaf_open),
+            b'{' | b'[' => (start + 1, close - leaf_open, leaf_open),
             _ => (
                 scalar_end_pos(start, &leaf.value_at(start))?,
                 close - leaf_open - 1,
+                leaf_open + 1,
             ),
         };
-        for _ in 0..closers {
+        let next_closer_end = |mut i: usize| -> Option<usize> {
+            #[cfg(test)]
+            CLOSER_STEPS.with(|steps| steps.set(steps.get() + 1));
             while !matches!(self.text.get(i)?, b']' | b'}') {
                 i += 1;
             }
-            i += 1;
+            Some(i + 1)
+        };
+        let Some(mut memo) = memo else {
+            for _ in 0..closers {
+                i = next_closer_end(i)?;
+            }
+            return Some(i);
+        };
+        // Extend the chain this leaf already has, or start a new one.
+        let text = (self.text.as_ptr() as usize, self.text.len());
+        let mut chain = match memo.take() {
+            Some(chain) if chain.text == text && chain.leaf_open == leaf_open => chain,
+            _ => CloserChain {
+                text,
+                base,
+                leaf_open,
+                ends: alloc::vec![i],
+            },
+        };
+        let mut result = None;
+        while chain.ends.len() <= closers {
+            let at = *chain.ends.last().unwrap_or(&i);
+            let Some(end) = next_closer_end(at) else {
+                break;
+            };
+            chain.ends.push(end);
         }
-        Some(i)
+        if let Some(end) = chain.ends.get(closers) {
+            result = Some(*end);
+        }
+        *memo = Some(chain);
+        result
     }
 
     /// Where the child at `text_pos` (this cursor's own `text_position()`) ends, for the
@@ -11378,5 +11482,93 @@ mod tests {
             rank_ptr,
             "the rank buffer is reused"
         );
+    }
+
+    /// The containers of `text` from its root down the first child of each, outermost first.
+    fn nest_cursors<'a>(
+        index: &'a JsonIndex,
+        text: &'a [u8],
+    ) -> alloc::vec::Vec<JsonCursor<'a, alloc::vec::Vec<u64>>> {
+        let mut out = alloc::vec::Vec::new();
+        let mut cursor = Some(index.root(text));
+        while let Some(c) = cursor {
+            if !c.is_container() {
+                break;
+            }
+            cursor = c.first_child();
+            out.push(c);
+        }
+        out
+    }
+
+    /// #5869: a container's end, read from the closer chain it shares with the containers
+    /// nested in it, is the end the text scan finds. Whitespace between the closers, a second
+    /// deep nest beside the first, and either order of asking all go through the memo.
+    #[test]
+    fn container_end_bp_agrees_with_the_text_scan_along_a_deep_chain_5869() {
+        let nest = |depth: usize| format!("{}1{}", "[ ".repeat(depth), " ] ".repeat(depth));
+        let texts = [
+            nest(400),
+            format!("[{},{}]", nest(300), nest(260)),
+            format!("{}1{}", "[".repeat(500), "]".repeat(500)),
+            format!("{}[]{}", "[".repeat(500), "]".repeat(500)),
+            format!("{}{{}}{}", "[".repeat(500), "]".repeat(500)),
+        ];
+        for text in &texts {
+            let bytes = text.as_bytes();
+            let index = JsonIndex::build(bytes);
+            let cursors = nest_cursors(&index, bytes);
+            assert!(cursors.len() > 2 * CLOSER_CHAIN_MIN_SPAN, "{text:.20}");
+            let expected: alloc::vec::Vec<_> = cursors
+                .iter()
+                .map(|c| container_end(bytes, c.text_position().unwrap()))
+                .collect();
+            let top_down: alloc::vec::Vec<_> =
+                cursors.iter().map(JsonCursor::container_end_bp).collect();
+            assert_eq!(top_down, expected, "top down: {text:.20}");
+            // A fresh index, so the memo starts empty and fills from the innermost level.
+            let index = JsonIndex::build(bytes);
+            let cursors = nest_cursors(&index, bytes);
+            let mut bottom_up: alloc::vec::Vec<_> = cursors
+                .iter()
+                .rev()
+                .map(JsonCursor::container_end_bp)
+                .collect();
+            bottom_up.reverse();
+            assert_eq!(bottom_up, expected, "bottom up: {text:.20}");
+        }
+    }
+
+    /// #5869: asking every level of a linear nest for its end walks each closer once, not once
+    /// per level above it. This counts closers rather than timing them, so it fails the same on
+    /// any machine when the walk goes quadratic again (20,000 levels was 2 x 10^8 steps).
+    #[test]
+    fn container_end_bp_walks_a_closer_chain_once_5869() {
+        let depth = 20_000;
+        let text = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        let bytes = text.as_bytes();
+        for bottom_up in [false, true] {
+            let index = JsonIndex::build(bytes);
+            let cursors = nest_cursors(&index, bytes);
+            assert_eq!(cursors.len(), depth);
+            CLOSER_STEPS.with(|steps| steps.set(0));
+            let ends: alloc::vec::Vec<_> = if bottom_up {
+                cursors
+                    .iter()
+                    .rev()
+                    .map(JsonCursor::container_end_bp)
+                    .collect()
+            } else {
+                cursors.iter().map(JsonCursor::container_end_bp).collect()
+            };
+            let steps = CLOSER_STEPS.with(Cell::get);
+            assert!(
+                steps <= 2 * depth,
+                "bottom_up={bottom_up}: {steps} closers walked for {depth} levels"
+            );
+            // The outermost level ends at the end of the text, each level inside it one before.
+            let outermost = if bottom_up { ends[depth - 1] } else { ends[0] };
+            assert_eq!(outermost, Some(bytes.len()));
+        }
     }
 }
