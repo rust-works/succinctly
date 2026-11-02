@@ -206,6 +206,12 @@ args = ["--check-fields", "{subject}"]
 timeout_s = 300
 
 [[sweep]]
+id = "m2-streaming"
+script = "scripts/jq-m2-streaming-sweep.sh"
+args = ["{subject}"]
+timeout_s = 120
+
+[[sweep]]
 id = "nested-fold-frozen-var"
 script = "scripts/jq-nested-fold-frozen-var-sweep.py"
 args = ["--bin", "{subject}", "--jq", "{jq}"]

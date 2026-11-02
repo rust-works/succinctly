@@ -9781,6 +9781,16 @@ single-element `[...]` forwards its element's own cursor through `.[0]` instead 
 it. `[.] as [$x] \| $x` stays doubled — pattern destructuring binds through a different,
 still-materializing route.
 
+**#5807 re-derived the golden, and the rule held on `{k: .}` too.**
+The sweep had drifted again, by 26 lines.
+Sixteen are `keys_unsorted` rows on malformed documents, which now print nothing before exit 5, as jq does.
+The rest are lone-surrogate and invalid-escape documents.
+`. as $x | $x` and `.[] | . as $x | $x` now echo the document at exit 0, the same "a filter validates only what it reads" echo plain `.` gave (#5308).
+`{k: .}` over `{"a\q":1,"b":2}` now spells the key raw, `{"k":{"a\q":1,"b":2}}`, where the golden had it doubled.
+That is the rule above and not a new spelling: `{k: .}` forwards `.` without decoding it, as `[.] | .[0]` does (#2575).
+Anything that materializes the value still doubles: `{k: .} | tojson`, `{k: .} | .k | keys` and `{k: .} | .k + {}` print `a\\q`.
+The sweep now runs under `succinctly dev compare jq --dimension sweeps` as `m2-streaming`, so a third drift fails a run.
+
 The sweep is a verification tool, not a CI gate, which is how the drift survived long
 enough to be absorbed by an unrelated `--update`;
 `test_undecodable_key_spelling_follows_materialization_2710` (`tests/jq_cli_tests.rs`) now
