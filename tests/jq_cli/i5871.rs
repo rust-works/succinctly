@@ -75,3 +75,56 @@ fn a_long_pipe_ending_in_a_def_call_answers_as_jq_5871() -> Result<()> {
     assert_eq!(run(&program)?, "159922000");
     Ok(())
 }
+
+/// A marker (`$m`, bound to a node of the input) in the stages ahead of the call, with the call
+/// reading paths or assigning: the link a stateless prefix is handed on in is not reached by a
+/// re-entry's marker rewrite, which only a resolver invocation reads.
+#[test]
+fn a_def_call_after_stages_holding_a_bound_node_answers_as_jq_5871() -> Result<()> {
+    let input = r#"{"a":[1,2,3],"b":{"c":4}}"#;
+    for (program, want) in [
+        (
+            "def g: .a[0] = 9; .b as $m | ({a: [$m.c, 2]} | . + {z: $m} | . + {y: 1} | g | .a)",
+            "[9,2]",
+        ),
+        (
+            "def g: .a[0] = 9; .b as $m | (.a[1] = $m.c | .a[2] = 7 | . + {y: 1} | g | .a)",
+            "[9,4,7]",
+        ),
+        (
+            "def g: .a |= map(. + 1); .b as $m | \
+             ([range(0;3)] | map(. + $m.c) | {a: .} | . + {z: $m} | g)",
+            r#"{"a":[5,6,7],"z":{"c":4}}"#,
+        ),
+        (
+            "def g: del(.a[0]); [range(0;3) as $i | .b as $m | \
+             (. + {k: $i} | . + {m: $m.c} | .a[1] = $i | g | [.a, .k, .m])]",
+            "[[[0,3],0,4],[[1,3],1,4],[[2,3],2,4]]",
+        ),
+        (
+            "def g: path(.a[0]); .b as $m | (. + {z: $m} | . + {y: 1} | g)",
+            r#"["a",0]"#,
+        ),
+        (
+            "def g: to_entries; .b as $m | (. + {z: $m} | . + {y: 1} | del(.a) | g | length)",
+            "3",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(input))?;
+        assert_eq!(code, 0, "{program}: {stderr}");
+        assert_eq!(stdout.trim_end(), want, "{program}");
+    }
+    Ok(())
+}
+
+/// Stages after the call stay in the pipe: the call is not last, and the answer is jq's.
+#[test]
+fn stages_after_a_def_call_that_follow_a_prefix_answer_as_jq_5871() -> Result<()> {
+    let pre = [". + $x"; 10].join(" | ");
+    let post = [". + $x"; 40].join(" | ");
+    let program = format!("def f: . + 1; [range(0;300) | . as $x | ({pre} | f | {post})] | add");
+    // Each value `i` is `i * 51 + 1`.
+    let want: u64 = (0..300u64).map(|i| i * 51 + 1).sum();
+    assert_eq!(run(&program)?, want.to_string());
+    Ok(())
+}

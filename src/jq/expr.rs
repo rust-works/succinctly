@@ -2490,6 +2490,10 @@ impl PipeStages {
     /// value down a pipe of `n` stages were `n - 1`, `n - 2`, ... stage clones;
     /// now the first is a copy and every tail of it a reference-count bump.
     ///
+    /// A tail that does hold state is the third shape, when two or more stateless stages lead it
+    /// (`first_state`, [`Self::split_state_tail`], #5871): one `Expr::Shared` link of those
+    /// stages, whose own tails are views, then the stages from the first stateful one on, cloned.
+    ///
     /// `state_end` answers how many stages lead up to and include the last
     /// that holds state (0 when none does). It is asked of a shareable pipe
     /// once and remembered, and every copy and view of a tail starts knowing
@@ -2551,7 +2555,15 @@ impl PipeStages {
     ///
     /// `end` is the number of stages up to and including the last stateful one, counted from the
     /// start of this pipe, and exceeds `from`; `first_state` answers the position, in the tail, of
-    /// its first stateful stage.
+    /// its first stateful stage, which the caller must derive from the same predicate as `end`
+    /// (checked in debug builds): a stateful stage left in the prefix would carry what evaluation
+    /// did to it from one call to the next, as a view of it would (#3148).
+    ///
+    /// A marker a re-entry rewrites is not rewritten inside the link, but the rewrite is read only
+    /// by a resolver invocation, which reads the markers of the expression it starts from: a
+    /// stage's markers are its own, and what flows from one stage to the next is a value. So the
+    /// suffix's call cannot read the prefix's markers, and the caller only has to refuse a prefix
+    /// that holds both a marker and a node that can start one.
     #[inline(never)]
     fn split_state_tail(
         &self,
@@ -2563,6 +2575,12 @@ impl PipeStages {
         if first < MIN_STATELESS_PREFIX || first >= self.len() - from {
             return None;
         }
+        debug_assert!(
+            from + first < end,
+            "the first stateful stage ({}) is not past the last one ({end}): `first_state` and \
+             `state_end` disagree",
+            from + first
+        );
         let prefix = self.copy_of(&self[from..from + first]);
         // None of the prefix's stages holds state, which `first_state` just settled: its tails are
         // views from its first ask.
@@ -2571,12 +2589,20 @@ impl PipeStages {
         arg.run = true;
         let mut stages = Vec::with_capacity(self.len() - from - first + 1);
         stages.push(Expr::Shared(Rc::new(arg)));
+        #[cfg(test)]
+        copied_stages::add(self.len() - from - first);
         stages.extend_from_slice(&self[from + first..]);
-        let split = Self::from(stages);
+        let mut split = Self::from(stages);
         self.inherit_settled(&split);
         split
             .state_end
             .set(Some(Self::stage_index(1 + end - from - first)));
+        // The stages after the link are this pipe's from `from + first` on, so the table that keeps
+        // this pipe's tails keeps the split's too, at the offset where its stage 1 is (a tail
+        // never starts at the link: tail 0 is the pipe itself).
+        if let Some((table, base)) = &self.tails.origin {
+            split.tails.origin = Some((Weak::clone(table), base + from + first - 1));
+        }
         Some(split)
     }
 

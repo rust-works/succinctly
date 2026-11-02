@@ -12002,11 +12002,11 @@ impl RestCopy {
             #[cfg(test)]
             owned_pipe_copies::bump();
             match owner {
-                Some(owner) => owner.tail_copy(
-                    owner.len() - stages.len(),
-                    pipe_state_end,
-                    stateless_prefix_len::<S>,
-                ),
+                Some(owner) => {
+                    owner.tail_copy(owner.len() - stages.len(), pipe_state_end, |tail| {
+                        stateless_prefix_len::<S>(owner, tail)
+                    })
+                }
                 None => stages.to_vec().into(),
             }
         })
@@ -12229,11 +12229,16 @@ fn pipe_state_end(stages: &[Expr]) -> usize {
 /// marker is read only by a resolver invocation ([`reentry_can_observe`]): a prefix holding both a
 /// marker and a node that can start one is copied, as the chain of a long pipe is (#5679). The
 /// stateful suffix stays in the pipe, so its call is rewritten as it was.
-fn stateless_prefix_len<S: EvalSemantics>(tail: &[Expr]) -> usize {
+fn stateless_prefix_len<S: EvalSemantics>(owner: &PipeStages, tail: &[Expr]) -> usize {
     if S::TAG != EvalTag::Jq {
         return 0;
     }
     let prefix = &tail[..pipe_state_start(tail)];
+    // The owner remembers whether it holds a marker at all, which most do not: its answer covers
+    // the prefix, so the prefix is walked only for a pipe that does.
+    if !pipe_holds_tracked_var(owner) {
+        return prefix.len();
+    }
     let (mut marker, mut resolver) = (false, false);
     for stage in prefix {
         any_subexpr(stage, &mut |e| {
@@ -31748,11 +31753,9 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     if exprs.len() == 1 {
                         exprs[0].clone()
                     } else {
-                        Expr::Pipe(tail.owner.tail_copy(
-                            tail.from,
-                            pipe_state_end,
-                            stateless_prefix_len::<S>,
-                        ))
+                        Expr::Pipe(tail.owner.tail_copy(tail.from, pipe_state_end, |rest| {
+                            stateless_prefix_len::<S>(tail.owner, rest)
+                        }))
                     }
                 };
                 &built
@@ -118442,29 +118445,22 @@ mod tests {
                 .collect()
         };
         assert!(holds_evaluation_state(&def_call));
+        // The owner is the tail's own pipe here, so what it remembers is what the tail holds.
+        let prefix_len = |stages: &[Expr]| {
+            let owner: PipeStages = stages.to_vec().into();
+            stateless_prefix_len::<JqSemantics>(&owner, stages)
+        };
         // Nothing to hide: the whole prefix.
-        assert_eq!(
-            stateless_prefix_len::<JqSemantics>(&tail(&[&plain, &plain, &plain])),
-            3
-        );
+        assert_eq!(prefix_len(&tail(&[&plain, &plain, &plain])), 3);
         // A marker alone, and a resolver node alone.
-        assert_eq!(
-            stateless_prefix_len::<JqSemantics>(&tail(&[&plain, &reader, &plain])),
-            3
-        );
-        assert_eq!(
-            stateless_prefix_len::<JqSemantics>(&tail(&[&plain, &resolver, &plain])),
-            3
-        );
+        assert_eq!(prefix_len(&tail(&[&plain, &reader, &plain])), 3);
+        assert_eq!(prefix_len(&tail(&[&plain, &resolver, &plain])), 3);
         // Both, in different stages of the prefix.
-        assert_eq!(
-            stateless_prefix_len::<JqSemantics>(&tail(&[&reader, &plain, &resolver])),
-            0
-        );
+        assert_eq!(prefix_len(&tail(&[&reader, &plain, &resolver])), 0);
         // The prefix ends where the state starts; a marker or a resolver node in the stateful part
-        // is not in the link.
+        // is not in the link, though the owner holds both.
         assert_eq!(
-            stateless_prefix_len::<JqSemantics>(&[
+            prefix_len(&[
                 plain.clone(),
                 plain.clone(),
                 def_call.clone(),
@@ -118473,9 +118469,67 @@ mod tests {
             ]),
             2
         );
-        assert_eq!(
-            stateless_prefix_len::<YqSemantics>(&tail(&[&plain, &plain, &plain])),
-            0
+        let stages = tail(&[&plain, &plain, &plain]);
+        let owner: PipeStages = stages.clone().into();
+        assert_eq!(stateless_prefix_len::<YqSemantics>(&owner, &stages), 0);
+    }
+
+    /// #5871: the two answers `tail_copy` is given about a tail's state come from one predicate:
+    /// the first stateful stage is never past the last, and both skip an `Expr::Shared`.
+    #[test]
+    fn test_pipe_state_start_and_end_agree_on_which_stage_holds_state_5871() {
+        let call = parse("def f: .; f").unwrap();
+        let def_call = match &call {
+            Expr::Pipe(stages) => stages.last().unwrap().clone(),
+            other => other.clone(),
+        };
+        let plain = parse(". + 1").unwrap();
+        let shared = Expr::Shared(Rc::new(SharedArg::new(def_call.clone())));
+        for stages in [
+            vec![],
+            vec![plain.clone(); 3],
+            vec![def_call.clone()],
+            vec![plain.clone(), plain.clone(), def_call.clone()],
+            vec![
+                def_call.clone(),
+                plain.clone(),
+                def_call.clone(),
+                plain.clone(),
+            ],
+            vec![plain.clone(), shared.clone(), plain.clone()],
+        ] {
+            let (start, end) = (pipe_state_start(&stages), pipe_state_end(&stages));
+            let stateful: Vec<usize> = (0..stages.len())
+                .filter(|&i| holds_state_outside_shared(&stages[i]))
+                .collect();
+            assert_eq!(start, stateful.first().copied().unwrap_or(stages.len()));
+            assert_eq!(end, stateful.last().map_or(0, |last| last + 1));
+            if !stateful.is_empty() {
+                assert!(start < end);
+            }
+        }
+    }
+
+    /// #5871: stages after the call are cloned with it, once per value, and the stages ahead of it
+    /// are still one link: ten stages, the call, then forty more is linear in the pipe's length,
+    /// where copying every tail was about 1,300 clones per value.
+    #[test]
+    fn test_rebuilt_body_with_stages_after_a_def_call_clones_linearly_5871() {
+        let (pre, post) = ([". + $x"; 10].join(" | "), [". + $x"; 40].join(" | "));
+        let program = |values: usize| {
+            run_owned_pipe_program::<JqSemantics>(
+                &format!(
+                    "def f: . + 1; [range(0;{values}) | . as $x | ({pre} | f | {post})] | length"
+                ),
+                b"null",
+            )
+        };
+        let (few, many) = (program(4), program(40));
+        assert_eq!(many.output, "40");
+        let more = many.copied_stages - few.copied_stages;
+        assert!(
+            more <= 36 * 4 * 51,
+            "36 more values cloned {more} stages, so each tail past the call was copied again"
         );
     }
 
