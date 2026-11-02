@@ -9095,9 +9095,10 @@ const LAZY_BATCH_FIRST_BYTES: usize = 1 << 14;
 struct LazyBatch {
     first: usize,
     end: usize,
-    /// `None` when the run is a single document, which an index of its own serves as well, or
-    /// when the index does not hold exactly the documents the spans name: the run is then
-    /// converted a document at a time, and the producer does not try this run again.
+    /// `None` when the run is a single document, which an index of its own serves as well, when
+    /// two of its documents touch with nothing between them, or when the index does not hold
+    /// exactly the documents the spans name: the run is then converted a document at a time, and
+    /// the producer does not try this run again.
     indexed: Option<LazyIndexed>,
 }
 
@@ -9119,7 +9120,11 @@ impl LazyBatch {
         while end < spans.len() && spans[end].1 - text_start <= max_bytes {
             end += 1;
         }
-        let indexed = (end - first >= 2)
+        // Only documents with something between them: the index of two touching tokens
+        // (`1"b"`) is not the same on every architecture, and a stream like that is not one
+        // the batching exists for.
+        let separated = spans[first..end].windows(2).all(|w| w[0].1 < w[1].0);
+        let indexed = (end - first >= 2 && separated)
             .then(|| {
                 let text_end = spans[end - 1].1;
                 let covered = &text[text_start..text_end];
@@ -13965,11 +13970,12 @@ mod tests {
                 while next < spans.len() {
                     let batch = LazyBatch::build(bytes, &spans, next, max_bytes);
                     assert!(batch.end > next, "a batch holds at least one document");
+                    let touching = spans[next..batch.end].windows(2).any(|w| w[0].1 == w[1].0);
                     assert_eq!(
                         batch.indexed.is_some(),
-                        batch.end - next >= 2,
+                        batch.end - next >= 2 && !touching,
                         "{stream:?} at {next} in a batch of {max_bytes} bytes: a run of several \
-                         documents has an index of its own"
+                         separated documents has an index of its own"
                     );
                     for at in next..batch.end {
                         let (start, end) = spans[at];
@@ -14001,7 +14007,7 @@ mod tests {
                     }
                     next = batch.end;
                 }
-                if max_bytes >= 4096 {
+                if max_bytes >= 4096 && !spans.windows(2).any(|w| w[0].1 == w[1].0) {
                     assert_eq!(
                         batched,
                         spans.len(),
