@@ -5,7 +5,8 @@ This document analyzes memory usage in the `yq` command and proposes optimizatio
 **Status: Partial (figures dated 2026-01).** M2 shipped as the cursor-streaming navigation path
 ([M2 Streaming Navigation Benchmarks](../benchmarks/yq.md#m2-streaming-navigation-benchmarks));
 M3 shipped with no measurable effect (see "M3 Results"). M1, M4, M5 and M6 are not known to have
-landed: `yq_runner.rs` still collects `all_results` before printing on the DOM route. The memory
+landed: `yq_runner.rs` still collects `all_results` before printing on the DOM route. #5865
+tracks deciding each of them. The memory
 figures and the `OwnedValue` size table predate the `Rc` container layout (#2999/#3000).
 
 ## Problem Statement

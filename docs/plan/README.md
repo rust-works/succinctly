@@ -15,8 +15,7 @@ These still track open work.
 | Plan                                                   | Status      | Module                            | Description                                        |
 |--------------------------------------------------------|-------------|-----------------------------------|----------------------------------------------------|
 | [cspoppy.md](cspoppy.md)                               | Implemented | `src/trees/bp.rs`, `src/bits/`    | Combined sampling, BP select; F1 (#596) still open |
-| [yq-memory-optimization.md](yq-memory-optimization.md) | Partial     | `yq_runner.rs`, `eval_generic.rs` | yq memory plan; M2/M3 done, M1/M4-M6 not landed    |
-| [jq-remaining.md](jq-remaining.md)                     | Open        | `src/jq/`, CLI                    | jq CLI and module-system gaps                      |
+| [yq-memory-optimization.md](yq-memory-optimization.md) | Partial     | `yq_runner.rs`, `eval_generic.rs` | yq memory plan; M2/M3 done, M1/M4-M6 open (#5865)  |
 | [yq-remaining.md](yq-remaining.md)                     | Open        | `src/yaml/`, `yq_runner.rs`       | yq operators, encoders and flags not yet supported |
 
 ## Archived Plans
@@ -47,6 +46,7 @@ the alternatives that were tried, and measurements that may not be recorded anyw
 | [jq-path-register-producer-contract.md](jq-path-register-producer-contract.md) | Superseded  | `src/jq/eval.rs`                   | Inferred path register; superseded by ADR-0026                 |
 | [yaml-index-post-compactrank.md](yaml-index-post-compactrank.md)               | Superseded  | `src/yaml/index.rs`                | Index analysis from the CompactRank era                        |
 | [compact-index-investigation.md](compact-index-investigation.md)               | Rejected    | `src/yaml/index.rs`                | Elias-Fano for position arrays (#58)                           |
+| [jq-remaining.md](jq-remaining.md)                                             | Implemented | `src/jq/`, CLI                     | jq CLI and module-system items, all matching jq 1.7.1 now      |
 
 ## Plan Status Legend
 
