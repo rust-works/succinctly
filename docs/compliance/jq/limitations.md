@@ -11985,6 +11985,14 @@ Ordering is unchanged in both: NaN sorts below NaN, itself included. A mixed-ins
 `sort`/`unique`/`group_by` (`[.a,.b,.a] | unique` over two NaN tokens) depends on the sort's
 comparison order in jq, and may group differently here.
 
+### A partial BOM at the start of the input stream is worded as a numeric-literal fault (#5804)
+
+jq's parser reports a text that opens with part of the UTF-8 BOM (`EF`, or `EF BB`) and then departs from it as `Malformed BOM`.
+`fromjson` and `tonumber` word it that way here (`"\ufffd" | try fromjson catch .` is `"Malformed BOM (while parsing ...)"`).
+The primary input stream does not: `printf '\xef\xbf\xbd1' | jq .` is `jq: parse error: Malformed BOM` in jq and `jq: parse error: Invalid numeric literal at EOF at line 1, column 4` here.
+Both exit 5 with no output, so only the message differs.
+The stream routes word their first fault through `jq_stream_fault`, which does not look for a partial BOM; closing that is a separate change.
+
 ### A malformed nested number raises when read; jq rejects the document (#966, #3034, #3222) — accepted uniform divergence
 
 A number *inside* an array or object is recovered by a greedy span (`[0-9.eE+-]`, plus

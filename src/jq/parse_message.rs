@@ -400,9 +400,31 @@ impl Parser {
 /// The diagnostic `jv_parse` gives for `text`, without its trailing `(while parsing '...')`, or
 /// `None` when jq's parser reads `text` as exactly one JSON value.
 ///
+/// A text that opens with part of the BOM and departs from it is `Malformed BOM` before the
+/// parser runs, as in `jv_parser_set_buf` (#5804); the stream routes ([`jq_stream_fault`]) do not
+/// make that check.
+///
 /// `text` is parsed whole, NULs included: jq's parser takes a length, not a C string.
 pub(crate) fn jq_parse_message(text: &[u8]) -> Option<String> {
+    if malformed_bom(text) {
+        return Some(String::from("Malformed BOM"));
+    }
     jq_parse_fault(text, 1, 0, JQ_MAX_PARSING_DEPTH).map(|fault| fault.message)
+}
+
+/// Whether `text` opens with part of the UTF-8 BOM and then departs from it (#5804).
+///
+/// `jv_parser_set_buf` matches the first bytes against `EF BB BF` one at a time; a byte that
+/// matches advances, and the first mismatch after at least one match is `Malformed BOM`. A whole
+/// BOM is skipped, and a text that does not start with `EF` is not a BOM at all. The mismatching
+/// byte has to be there: a text that ends inside the prefix is left to the parser.
+fn malformed_bom(text: &[u8]) -> bool {
+    let matched = text
+        .iter()
+        .zip(UTF8_BOM)
+        .take_while(|(byte, bom)| byte == bom)
+        .count();
+    0 < matched && matched < UTF8_BOM.len() && matched < text.len()
 }
 
 /// What stopped jq's parser on a text it refuses (#5497).
@@ -612,6 +634,27 @@ pub fn jq_input_depth_fault<W: AsRef<[u64]>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5804: a text that opens with part of the BOM and then departs from it is `Malformed BOM`
+    /// (every U+F000..=U+FFFF character starts `EF`, and U+FEC0 is `EF BB 80`); a whole BOM is
+    /// skipped and any other first byte is not a BOM. Rows captured from `/usr/bin/jq` 1.7.1.
+    #[test]
+    fn a_partial_bom_is_malformed_5804() {
+        for text in ["\u{fffd}", "\u{fffd}e", "\u{f000}", "\u{ffff}1", "\u{fec0}"] {
+            assert_eq!(message(text).as_deref(), Some("Malformed BOM"), "{text:?}");
+        }
+        // Not a BOM prefix: `EE 80 80`, a digit, and a whole BOM (skipped by the caller, so the
+        // second one is an ordinary fault).
+        for text in ["\u{e000}1", "1", "\u{feff}\u{feff}"] {
+            assert_ne!(message(text).as_deref(), Some("Malformed BOM"), "{text:?}");
+        }
+        // A text that ends inside the prefix is the parser's.
+        assert!(!malformed_bom(b"\xEF"));
+        assert!(!malformed_bom(b"\xEF\xBB"));
+        assert!(!malformed_bom(b""));
+        assert!(!malformed_bom(b"\xEF\xBB\xBF1"));
+        assert!(malformed_bom(b"\xEF\xBB1"));
+    }
 
     fn message(text: &str) -> Option<String> {
         jq_parse_message(text.as_bytes())
