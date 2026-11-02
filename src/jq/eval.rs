@@ -105518,8 +105518,9 @@ mod tests {
     }
 
     /// #5761: `. += $v` and `. //= $v` over a `null` (or, for `//=`, `false`) state store the
-    /// fold's element as the state itself, where the sum of two kinds a `+` cannot fail on
-    /// would have declined; a truthy state is left as it is by `//=`.
+    /// fold's element as the state itself. The step used to decline them, because it only combined
+    /// two operands of one kind, and the evaluator then rebuilt the element. A truthy state is
+    /// left as it is by `//=`.
     #[cfg_attr(
         feature = "unshared-containers",
         ignore = "holdout has no node identity or sharing (#5254)"
@@ -105566,10 +105567,12 @@ mod tests {
         };
         assert_eq!(stored, kept);
         // yq's `+` and `//` differ, so its steps stay with the evaluator.
-        assert!(matches!(
-            try_owned_assign_step::<YqSemantics>(&add, OwnedValue::Null),
-            OwnedStep::Declined(_)
-        ));
+        for step in [&add, &default] {
+            assert!(matches!(
+                try_owned_assign_step::<YqSemantics>(step, OwnedValue::Null),
+                OwnedStep::Declined(_)
+            ));
+        }
     }
 
     /// #4005: a marker read for a scalar -- a key, a field, a comparison of two

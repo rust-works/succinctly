@@ -197,6 +197,29 @@ fn test_fold_compound_store_over_a_null_state_keeps_the_element_5761() -> Result
             "[nan] as $a | reduce $a as $v ({\"x\":1}; .x //= $v) | .x",
             "1",
         ),
+        // Scalars, literals and operands that raise or yield several values are unchanged.
+        ("reduce (-0) as $v (null; . += $v)", "-0"),
+        (
+            "reduce (100000000000000000000000000) as $v (null; . //= $v)",
+            "100000000000000000000000000",
+        ),
+        ("reduce (1.000) as $v (null; . += $v)", "1.000"),
+        ("reduce (\"s\") as $v (false; . //= $v)", "\"s\""),
+        ("reduce (false) as $v (null; . //= $v)", "false"),
+        ("reduce range(3) as $i (null; . += [$i])", "[0,1,2]"),
+        ("reduce range(2) as $i (null; . += (1,2))", "4"),
+        ("reduce range(2) as $i (null; . //= (1,2))", "2"),
+        ("reduce range(2) as $i (1; . //= empty)", "null"),
+        ("[foreach range(3) as $i (false; . //= $i; .)]", "[0,0,0]"),
+        // Still `false` here and `true` in jq: a trailing identity stage after the store.
+        (
+            "[nan] as $a | reduce $a as $v (null; . += $v | .) | . == $a",
+            "false",
+        ),
+        (
+            "[nan] as $a | reduce $a as $v (null; . //= $v | .) | . == $a",
+            "false",
+        ),
         // A write after the store copies: the bound value is unchanged.
         (
             "[nan] as $a | reduce $a as $v (null; . += $v) | .[0] = 7 | [., $a]",
@@ -212,6 +235,25 @@ fn test_fold_compound_store_over_a_null_state_keeps_the_element_5761() -> Result
         ),
     ] {
         assert_eq!(answer(filter)?, format!("{expected}\n"), "{filter}");
+    }
+    Ok(())
+}
+
+/// `//=`'s operand is read before the state is tested, so one that raises raises over a truthy
+/// state too, as in jq.
+#[test]
+fn test_fold_alternative_store_evaluates_its_operand_first_5761() -> Result<()> {
+    for filter in [
+        "reduce range(2) as $i (1; . //= error(\"x\"))",
+        "reduce range(2) as $i (null; . //= error(\"x\"))",
+        "reduce range(2) as $i (null; . += error(\"x\"))",
+    ] {
+        let (stdout, stderr, code) = crate::run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(
+            (stdout.as_str(), code, stderr.matches("jq: error").count()),
+            ("", 5, 1),
+            "{filter}: {stderr}"
+        );
     }
     Ok(())
 }
