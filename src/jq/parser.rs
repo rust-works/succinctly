@@ -215,6 +215,16 @@ const MAX_PATTERN_COMPUTED_KEYS: usize = 4096;
 /// brackets or parentheses stay guarded through the bracket's own depth unit.
 const MAX_EXPR_DEPTH: usize = 256;
 
+/// Nesting levels one step of yq's precedence-40 chain (`==`, `=`, `|=` ...) is charged, since it
+/// recurses ([`Parser::parse_yq_forty_group_operand`]).
+const YQ_FORTY_GROUP_WEIGHT: usize = 16;
+
+/// One link of yq's right-folding arithmetic level ([`Parser::parse_yq_arithmetic`]).
+enum YqArithLink {
+    Arith(ArithOp),
+    Alternative,
+}
+
 /// [`Parser::pair_group_budget`]'s starting value (#4185).
 const PAIR_GROUP_BUDGET: usize = 256;
 
@@ -9307,6 +9317,9 @@ impl<'a> Parser<'a> {
 
     /// Parse additive expressions: `expr + expr`, `expr - expr`
     fn parse_additive(&mut self) -> Result<Expr, ParseError> {
+        if self.mode == ParserMode::Yq {
+            return self.parse_yq_arithmetic();
+        }
         let mut left = self.parse_multiplicative()?;
         // Each iteration wraps `left` in another node, so this chain's own
         // length is AST depth even though the loop never recurses (#1156).
@@ -9341,6 +9354,68 @@ impl<'a> Parser<'a> {
         }
 
         Ok(left)
+    }
+
+    /// Consume the next link of yq's arithmetic level, if one follows: `+ - * / % //` (and `*`'s
+    /// merge flags). Not the compound assignments (`+=`, `*=`, `//=` ...), which end the level.
+    #[inline(never)]
+    fn take_yq_arithmetic_op(&mut self) -> Option<YqArithLink> {
+        self.skip_ws();
+        let peek2 = self.peek_str(2);
+        if matches!(peek2, "+=" | "-=" | "*=" | "%=" | "/=") || self.peek_str(3) == "//=" {
+            return None;
+        }
+        let link = match self.peek()? {
+            '+' => YqArithLink::Arith(ArithOp::Add),
+            '-' => YqArithLink::Arith(ArithOp::Sub),
+            '%' => YqArithLink::Arith(ArithOp::Mod),
+            '*' => {
+                self.next();
+                let flags = self.scan_merge_flags();
+                self.skip_ws();
+                return Some(YqArithLink::Arith(ArithOp::Mul(flags)));
+            }
+            '/' if peek2 == "//" => {
+                self.next();
+                self.next();
+                self.skip_ws();
+                return Some(YqArithLink::Alternative);
+            }
+            '/' => YqArithLink::Arith(ArithOp::Div),
+            _ => return None,
+        };
+        self.next();
+        self.skip_ws();
+        Some(link)
+    }
+
+    /// yq mode: `+ - * / % //` are one precedence (42, `operation.go` v4.53.3) and a stack that
+    /// pops only a strictly higher one, so a chain folds from the right: `2 * 3 + 4` is
+    /// `2 * (3 + 4)`, `10 - 3 - 2` is `10 - (3 - 2)` and `1 // 2 == 2` is `(1 // 2) == 2` (#5630).
+    /// The chain is gathered in a loop and folded afterwards, so its length costs
+    /// [`Self::check_expr_nesting`] and not stack.
+    #[inline(never)]
+    fn parse_yq_arithmetic(&mut self) -> Result<Expr, ParseError> {
+        let mut operands = vec![self.parse_operand()?];
+        let mut links = Vec::new();
+        while let Some(link) = self.take_yq_arithmetic_op() {
+            links.push(link);
+            self.check_expr_nesting(links.len())?;
+            operands.push(self.parse_operand()?);
+        }
+        let mut folded = operands.pop().unwrap_or(Expr::Identity);
+        while let (Some(link), Some(left)) = (links.pop(), operands.pop()) {
+            folded = match link {
+                YqArithLink::Arith(op) => Expr::Arithmetic {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(folded),
+                    settle: ArithSettleMemo::default(),
+                },
+                YqArithLink::Alternative => Expr::Alternative(Box::new(left), Box::new(folded)),
+            };
+        }
+        Ok(folded)
     }
 
     /// Consume a comparison operator and the space after it, if one follows: `==`, `!=`, `<`,
@@ -9640,8 +9715,50 @@ impl<'a> Parser<'a> {
         if self.mode == ParserMode::Jq {
             self.parse_or()
         } else {
-            self.parse_alternative()
+            self.parse_yq_forty_group_operand()
         }
+    }
+
+    /// yq mode: the right side of an assignment or comparison is the rest of the precedence-40
+    /// group (`= |= += == < ...`, which fold from the right, #5630), so it recurses into
+    /// [`Self::parse_assignment_level`]. Charged against the nesting limit like any nested
+    /// expression, and kept out of line so the recursive frame stays small.
+    ///
+    /// Each step is charged [`YQ_FORTY_GROUP_WEIGHT`] levels, not one: unlike the arithmetic and
+    /// `and`/`or` chains this one is a real recursion through the large
+    /// [`Self::parse_assignment_level`] frame, and a debug build's 2 MiB test stack overflowed on
+    /// a 5,000-link `==` chain at the plain limit (ARM64 CI, #5630). A chain of more than
+    /// `MAX_EXPR_DEPTH / YQ_FORTY_GROUP_WEIGHT` comparisons or assignments is a parse error.
+    #[inline(never)]
+    fn parse_yq_forty_group_operand(&mut self) -> Result<Expr, ParseError> {
+        self.check_expr_nesting(YQ_FORTY_GROUP_WEIGHT)?;
+        self.expr_depth += YQ_FORTY_GROUP_WEIGHT;
+        let result = self.parse_assignment_level();
+        self.expr_depth -= YQ_FORTY_GROUP_WEIGHT;
+        result
+    }
+
+    /// The left side of an assignment or comparison: everything tighter than the precedence-40
+    /// group. In yq mode that is the arithmetic level (which holds `//`); in jq mode everything
+    /// tighter than `//` ([`Self::parse_assignment`]).
+    fn parse_assignment_target(&mut self) -> Result<Expr, ParseError> {
+        if self.mode == ParserMode::Jq {
+            self.parse_or()
+        } else {
+            self.parse_additive()
+        }
+    }
+
+    /// yq mode: `left op ...` where `op` is a comparison. The comparisons share precedence 40 with
+    /// the assignments and fold from the right, so the right side is the rest of the group.
+    #[inline(never)]
+    fn parse_yq_comparison_tail(&mut self, left: Expr, op: CompareOp) -> Result<Expr, ParseError> {
+        let right = self.parse_yq_forty_group_operand()?;
+        Ok(Expr::Compare {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        })
     }
 
     /// The path step a key kept by [`Self::keep_string_key_after_sum_or_merge`] was before it was
@@ -9696,7 +9813,7 @@ impl<'a> Parser<'a> {
     /// Parse assignment expressions: `path = value`, `path |= filter`, `path += value`, etc.
     /// Assignment has higher precedence than pipe; against `//` see [`Self::parse_assignment`].
     fn parse_assignment_level(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_assignment_operand()?;
+        let mut left = self.parse_assignment_target()?;
         self.skip_ws();
 
         // yq metadata-assignment grammar (#798) -- must be tried before the
@@ -9807,6 +9924,12 @@ impl<'a> Parser<'a> {
                 path: Box::new(Self::fold_sum_or_merge_key(left)),
                 value: Box::new(value),
             });
+        }
+
+        if self.mode == ParserMode::Yq {
+            if let Some(op) = self.take_comparison_op() {
+                return self.parse_yq_comparison_tail(left, op);
+            }
         }
 
         Ok(left)

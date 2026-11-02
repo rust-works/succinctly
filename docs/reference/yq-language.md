@@ -183,6 +183,22 @@ the level reappears inside one and the common `select(.x and .y)` idiom is
 unaffected: `.items[] | select(.name and .value)` filters per element in both
 modes, exactly as in jq.
 
+#### `+ - * / % //` are one precedence and fold to the right (#5630)
+
+The six operators at yq's level 42 tie, and the comparisons and assignments tie at 40. Because the
+shunting yard pops only a *strictly* higher precedence, each tie folds from the right, where jq
+ranks `*` `/` `%` above `+` `-` and folds to the left:
+
+| Filter         | `succinctly yq` / `yq` | `succinctly jq` / `jq` |
+|----------------|------------------------|------------------------|
+| `2 * 3 + 4`    | `14`                   | `10`                   |
+| `10 - 3 - 2`   | `9`                    | `5`                    |
+| `100 / 10 / 5` | `50`                   | `2`                    |
+| `2 == 1 // 2`  | `false`                | `2`                    |
+
+`//` sits in the same level, so `1 // 2 == 2` is `(1 // 2) == 2`; `x == y = z` is
+`x == (y = z)`. Parentheses restore the conventional grouping.
+
 ### Unquoted field names: `*`, `?` and a leading digit (#2800)
 
 Real yq reads an unquoted `.name` as any run of name bytes, so a mapping key is matched
