@@ -80446,13 +80446,119 @@ fn fold_step_each<S: EvalSemantics>(
 pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
     // An `if` UPDATE is a branch choice (#5279); kept out of line, with the chain below, so the
     // function every fold driver inlines stays the size it was.
-    if matches!(expr, Expr::If { .. } | Expr::Paren(_)) {
+    if matches!(
+        expr,
+        Expr::If { .. } | Expr::Paren(_) | Expr::Array(_) | Expr::Object(_)
+    ) {
         return match owned_if_step::<S>(expr, state) {
             Ok(done) => done,
-            Err(state) => owned_update_step_arith::<S>(expr, state),
+            Err(state) => match owned_constructor_step::<S>(expr, state) {
+                Ok(done) => done,
+                Err(state) => owned_update_step_arith::<S>(expr, state),
+            },
         };
     }
     owned_update_step_arith::<S>(expr, state)
+}
+
+/// `[.]`, `[., <closed>…]` and `{<key>: .}` as a fold's UPDATE (#5875): a container built around
+/// the state itself, with every other element or member closed. The new container takes the moved
+/// state as its one `.` member, so a fold of `N` steps costs `O(N)`. Through the bridge each step
+/// wrote the whole accumulator out as JSON and indexed it again to evaluate a constructor that
+/// copies it, which is `O(N^2)` once the accumulator is a nest `N` levels deep.
+///
+/// Exactly one member reads `.` (a second would need a copy, and `[., .]` is not a fold anyone
+/// writes), and every other element, key and value must be [`closed_expr_to_owned`]: one output,
+/// no read of the state, no effect, so settling it before the state is touched is unobservable.
+/// `Err(state)` for anything else, with the state untouched, and the evaluator answers as before.
+/// jq mode only (yq's constructors carry presentation, and its guard past 500 levels is a separate
+/// piece of work, #5554), and not while the #2889 embed table is live, whose registered containers
+/// the accumulator might hold: a container built around one would hide it from the table.
+#[inline(never)]
+fn owned_constructor_step<S: EvalSemantics>(
+    expr: &Expr,
+    state: OwnedValue,
+) -> Result<OwnedStep, OwnedValue> {
+    if S::TAG != EvalTag::Jq || super::eval_generic::embed_table_active() {
+        return Err(state);
+    }
+    match unwrap_paren(expr) {
+        Expr::Array(inner) => {
+            let items = match unwrap_paren(inner) {
+                Expr::Comma(items) => items.as_slice(),
+                single => core::slice::from_ref(single),
+            };
+            // One read of `.`, settled before anything is built: most constructors a fold
+            // declines here (`[.[], $i]`, `[$i]`) cost no more than this count.
+            if items
+                .iter()
+                .filter(|item| matches!(unwrap_paren(item), Expr::Identity))
+                .count()
+                != 1
+            {
+                return Err(state);
+            }
+            let mut built: Vec<Option<OwnedValue>> = vec_with_capacity(items.len());
+            for item in items {
+                if matches!(unwrap_paren(item), Expr::Identity) {
+                    built.push(None);
+                } else if let Some(value) = closed_expr_to_owned::<S>(item) {
+                    built.push(Some(value));
+                } else {
+                    return Err(state);
+                }
+            }
+            let mut state = Some(state);
+            let out: Vec<OwnedValue> = built
+                .into_iter()
+                .map(|slot| slot.or_else(|| state.take()).unwrap_or(OwnedValue::Null))
+                .collect();
+            Ok(OwnedStep::Handled(Ok(OwnedValue::array_from(out))))
+        }
+        Expr::Object(entries) => {
+            if entries
+                .iter()
+                .filter(|entry| matches!(unwrap_paren(&entry.value), Expr::Identity))
+                .count()
+                != 1
+            {
+                return Err(state);
+            }
+            let mut pairs: Vec<(String, Option<OwnedValue>)> = vec_with_capacity(entries.len());
+            for entry in entries {
+                let key = match &entry.key {
+                    ObjectKey::Literal(name) => name.clone(),
+                    ObjectKey::Bare => return Err(state),
+                    ObjectKey::Expr(key) => match closed_expr_to_owned::<S>(key) {
+                        Some(OwnedValue::String(name)) => name.into_string(),
+                        _ => return Err(state),
+                    },
+                };
+                if matches!(unwrap_paren(&entry.value), Expr::Identity) {
+                    pairs.push((key, None));
+                } else if let Some(value) = closed_expr_to_owned::<S>(&entry.value) {
+                    pairs.push((key, Some(value)));
+                } else {
+                    return Err(state);
+                }
+            }
+            let mut state = Some(state);
+            let pairs: Vec<(String, OwnedValue)> = pairs
+                .into_iter()
+                .map(|(key, slot)| {
+                    (
+                        key,
+                        slot.or_else(|| state.take()).unwrap_or(OwnedValue::Null),
+                    )
+                })
+                .collect();
+            // jq mode: a repeated key keeps its first position and takes the last value,
+            // as `object_from_pairs` does there and `eval_object_construction` does.
+            let map: IndexMap<String, OwnedValue> = pairs.into_iter().collect();
+            Ok(OwnedStep::Handled(Ok(OwnedValue::Object(map.into()))))
+        }
+        _ => Err(state),
+    }
 }
 
 /// The rest of [`owned_update_step`], once `expr` is no settleable `if`.
@@ -166898,5 +167004,110 @@ mod named_args_shared_tests_5690 {
         let n = OwnedValue::Int(7);
         let substituted = substitute_named_args(&parse("$n + 1").unwrap(), [("n", &n)]);
         assert!(!holds_marker(&substituted));
+    }
+
+    /// #5875: `[.]`, `[., <closed>…]` and `{<key>: .}` as a fold's UPDATE are built on the moved
+    /// state, not on a re-indexed copy of it, so a fold of `N` steps is `O(N)`. The new container
+    /// holds the very storage the step was handed. Anything else -- a second read of `.`, a member
+    /// that is not closed or yields other than one value, a yq program, a live embed table --
+    /// hands the state back untouched for the evaluator.
+    #[test]
+    #[cfg(feature = "std")]
+    fn owned_update_step_builds_a_constructor_around_the_state_5875() {
+        use crate::jq::eval_generic::embed_table_push;
+
+        let state = || {
+            OwnedValue::object_from([(
+                "q".to_string(),
+                OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+            )])
+        };
+        let arr = OwnedValue::array_from;
+        let obj = |rows: Vec<(&str, OwnedValue)>| {
+            OwnedValue::object_from(rows.into_iter().map(|(k, v)| (k.to_string(), v)))
+        };
+        let step = |src: &str| owned_update_step::<JqSemantics>(&parse(src).unwrap(), state());
+        for (src, want) in [
+            ("[.]", arr(vec![state()])),
+            ("([.])", arr(vec![state()])),
+            (
+                "[., 5, \"x\"]",
+                arr(vec![state(), OwnedValue::Int(5), OwnedValue::string("x")]),
+            ),
+            ("[7, .]", arr(vec![OwnedValue::Int(7), state()])),
+            (
+                "[1, ., null, [2]]",
+                arr(vec![
+                    OwnedValue::Int(1),
+                    state(),
+                    OwnedValue::Null,
+                    arr(vec![OwnedValue::Int(2)]),
+                ]),
+            ),
+            ("{a: .}", obj(vec![("a", state())])),
+            (
+                "{a: 1, b: .}",
+                obj(vec![("a", OwnedValue::Int(1)), ("b", state())]),
+            ),
+            ("{(\"k\" + \"2\"): .}", obj(vec![("k2", state())])),
+            // A repeated key keeps its first position and takes the last value, as jq does.
+            ("{a: 1, a: .}", obj(vec![("a", state())])),
+            ("{a: ., a: 2}", obj(vec![("a", OwnedValue::Int(2))])),
+            (
+                "{b: 1, a: ., b: 3}",
+                obj(vec![("b", OwnedValue::Int(3)), ("a", state())]),
+            ),
+        ] {
+            let OwnedStep::Handled(Ok(got)) = step(src) else {
+                panic!("not handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step declined a constructor UPDATE the test lists as handled (#5875)"
+            };
+            assert_eq!(got, want, "{src}");
+        }
+
+        // The element is the state's own storage, not a copy of it.
+        let held = state();
+        let OwnedStep::Handled(Ok(OwnedValue::Array(items))) =
+            owned_update_step::<JqSemantics>(&parse("[.]").unwrap(), held.clone())
+        else {
+            panic!("`[.]` was not handled"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step declined `[.]`, which the loop above also asserts (#5875)"
+        };
+        assert!(items[0].shares_storage_with(&held), "the state was copied");
+
+        for src in [
+            "[1]",
+            "[., .]",
+            "[., empty]",
+            "[., (1, 2)]",
+            "[., error(\"x\")]",
+            "[.[]]",
+            "[.q]",
+            "{a: .q}",
+            "{a: (., .)}",
+            "{(.): 1}",
+            "{a: 1}",
+            "{a: 1} | .",
+            "[.] | length",
+        ] {
+            let OwnedStep::Declined(back) = step(src) else {
+                panic!("handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step answered a constructor UPDATE the test lists as declined (#5875)"
+            };
+            assert_eq!(back, state(), "{src}: the declined state is untouched");
+        }
+
+        // yq builds its constructors with presentation, which this step does not carry.
+        assert!(matches!(
+            owned_update_step::<YqSemantics>(&parse("[.]").unwrap(), state()),
+            OwnedStep::Declined(_)
+        ));
+
+        // A registered container is the table's to witness; a container built around it would
+        // hide it.
+        let mut bound = state();
+        let origin = BindOrigin::Node {
+            node: 7,
+            document: 42,
+        };
+        let _guard = embed_table_push::<JqSemantics>(Some(&origin), &mut bound);
+        assert!(matches!(step("[.]"), OwnedStep::Declined(_)));
     }
 }
