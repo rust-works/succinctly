@@ -1,40 +1,49 @@
 # Plan: yq Remaining Work
 
-Remaining work for full yq (Mike Farah's) compatibility.
+Remaining work for full yq (Mike Farah's) compatibility. Every row was re-checked against Homebrew
+`yq` v4.53.3 on 2026-11-02 (#5847).
 
-See [yq Language Reference](../reference/yq-language.md) for implemented features.
+See [yq Language Reference](../reference/yq-language.md) for implemented features, and
+[limitations.md](../compliance/yq/limitations.md) for recorded divergences.
 
-## Operators (Low Priority)
+## Operators
 
-| Operator       | Description                              | Notes                    |
-|----------------|------------------------------------------|--------------------------|
-| `eval(expr)`   | Evaluate string as expression            | Security implications    |
-| `with_dtf(fmt)`| Set datetime format context              | Rarely used              |
+| Operator               | yq v4.53.3                          | succinctly                                     |
+|------------------------|-------------------------------------|------------------------------------------------|
+| `eval(expr)`           | Evaluates a string as an expression | `eval/1 is not defined`                        |
+| `with_dtf(fmt; expr)`  | Sets the datetime format for `expr` | `with_dtf/2 is not defined` (#5863)            |
+| `format_datetime(fmt)` | Formats a timestamp                 | `format_datetime/1 is not defined` (#5863)     |
+| `tz(zone)`             | Converts a timestamp to a zone      | Raises `math function requires number` (#5863) |
 
-## Format Encoders (Low Priority)
-
-| Format   | Description              | Notes                          |
-|----------|--------------------------|--------------------------------|
-| `@xml`   | Encode as XML string     | Requires attribute conventions |
-| `to_xml` | Same as @xml             |                                |
-
-## CLI Options (Low Priority)
-
-| Flag                   | Description                              |
-|------------------------|------------------------------------------|
-| `--explode-anchors`    | Expand anchor/alias references inline    |
-| `--preserve-comments`  | Preserve comments in YAML output — partial (#710, #765): always-on for trailing same-line comments (value-scoped and key-scoped) on cursor-preserving paths (identity, navigation, filters, sort-keys); not yet for assignment |
-
-## YAML Features (Low Priority)
-
-| Feature          | Description                              | Notes                    |
-|------------------|------------------------------------------|--------------------------|
-| Merge keys       | `<<: *alias` syntax                      | Complex semantics        |
-| Comment storage  | Store and query trailing same-line comments | Implemented (#710) — `bp_to_line_comment` in the YAML semi-index, `line_comment` builtin. Key-scoped comments on a deferred value's key line also preserved on identity/output (#765), but not exposed via any getter (matches real `yq`). Standalone `head_comment`/`foot_comment` and assignment-path preservation remain open |
-
-## Date Arithmetic (Low Priority)
+## Date Arithmetic (#5863)
 
 ```bash
-.time += "3h10m"   # Add duration
-.time -= "24h"     # Subtract duration
+.time += "3h10m"   # yq adds the duration; succinctly concatenates the strings, exit 0
+.time -= "24h"     # yq subtracts it; succinctly raises "cannot be subtracted"
 ```
+
+`from_unix` renders in UTC where yq uses the local zone, and `now | type` is `!!float` where yq
+says `!!timestamp` (#5863).
+
+## Format Encoders
+
+| Format   | Description          | Notes                                                                            |
+|----------|----------------------|----------------------------------------------------------------------------------|
+| `@xml`   | Encode as XML string | Unknown format here; XML input/output is listed as out of scope in the reference |
+| `to_xml` | Same as `@xml`       | `to_xml/0 is not defined`                                                        |
+
+## CLI Options
+
+| Flag                              | Description                                                             |
+|-----------------------------------|-------------------------------------------------------------------------|
+| `--yaml-fix-merge-anchor-to-spec` | Merge `<<` per the YAML spec instead of yq's default; not accepted here |
+
+## Removed From This List
+
+- **Merge keys** (`<<: *alias`): implemented; reads match yq's default, and the differences in key
+  lists, writes and encoders are in [limitations.md](../compliance/yq/limitations.md) (#3556).
+- **Comment storage and preservation**: implemented (#710, #765, #2795); the remaining gaps are in
+  [limitations.md](../compliance/yq/limitations.md).
+- **`--explode-anchors`** and **`--preserve-comments`**: neither is a yq v4.53.3 flag (yq reports
+  `unknown flag` for both). Anchors are expanded by the `explode(.)` operator, which is implemented,
+  and comments are preserved without a flag.
