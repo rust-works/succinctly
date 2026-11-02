@@ -2606,6 +2606,16 @@ impl PipeStages {
         Some(split)
     }
 
+    /// The shared storage this pipe's stages are in, and where in it they start (#5488, #5488
+    /// slice 2): `None` for a pipe that owns its stages. Every view of one storage answers with
+    /// the same `Rc`, so what is worked out about the storage once is the answer for each of them.
+    pub(crate) fn shared_view(&self) -> Option<(&Rc<Vec<Expr>>, usize)> {
+        match &self.storage {
+            Storage::Shared { stages, start } => Some((stages, *start as usize)),
+            Storage::Own(_) => None,
+        }
+    }
+
     /// A pipe of `stages`, some of this pipe's own, that starts with every `false` this pipe has
     /// settled (#5488). Every copy of stages of a pipe goes through here.
     ///
