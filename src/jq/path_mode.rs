@@ -1210,14 +1210,18 @@ fn with_prelude<R>(f: impl FnOnce(&Prelude) -> R) -> R {
     // Parsed once per thread and freed with it. `with` hands out a shared
     // borrow, so a delegated builtin that re-enters the interpreter on the same
     // thread borrows the same prelude.
-    #[cfg(feature = "std")]
+    //
+    // `test` too: the lib's unit tests link `std` even without the feature
+    // (`cfg_attr(not(test), no_std)`), and reparsing per program made the
+    // #3856 sweeps 10x slower there, the tail of the `no-std` CI legs (#5845).
+    #[cfg(any(feature = "std", test))]
     {
         std::thread_local! {
             static PRELUDE_PARSED: Prelude = Prelude::new();
         }
         PRELUDE_PARSED.with(|prelude| f(prelude))
     }
-    #[cfg(not(feature = "std"))]
+    #[cfg(not(any(feature = "std", test)))]
     {
         f(&Prelude::new())
     }
