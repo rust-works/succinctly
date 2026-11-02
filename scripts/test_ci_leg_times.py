@@ -177,25 +177,58 @@ class IssueTests(unittest.TestCase):
         self.assertIn(c.TITLE, create)
         self.assertIn(c.LABEL, create)
 
-    def test_a_recently_closed_issue_silences_the_report_for_two_weeks(self):
-        closed = [{"closedAt": self.stamp(days=3)}]
+    def closed_issue(self, days_ago, jobs):
+        body = "\n".join(f"| `{job}` | 4.2 min | 11.7 min | 2.8x |" for job in jobs)
+        return {"closedAt": self.stamp(days=days_ago), "body": body}
+
+    def filed(self, calls):
+        return [a for a in calls if a[:2] in (("issue", "create"), ("label", "create"))]
+
+    def test_a_recently_closed_issue_silences_the_jobs_it_named_for_two_weeks(self):
+        closed = [self.closed_issue(3, [NOSTD, "Test (ARM64) (no-std)"])]
         gh, calls = self.fake_gh([], [], closed=closed)
         with mock.patch.object(c, "gh", gh), mock.patch("sys.stdout"):
-            c.file_issue("body", AS_OF)
-        self.assertFalse([a for a in calls if a[:2] in (("issue", "create"), ("label", "create"))])
+            c.file_issue("body", AS_OF, [NOSTD])
+        self.assertFalse(self.filed(calls))
+        # The query: this label, closed ones, enough of them, and the fields the check reads.
+        query = next(a for a in calls if a[:2] == ("issue", "list") and "closed" in a)
+        self.assertIn(c.LABEL, query)
+        self.assertEqual(query[query.index("--limit") + 1], str(c.CLOSED_SEEN))
+        self.assertEqual(query[query.index("--json") + 1], "closedAt,body")
 
-        old = [{"closedAt": self.stamp(days=20)}, {"closedAt": self.stamp(days=40)}]
+        old = [self.closed_issue(20, [NOSTD]), self.closed_issue(40, [NOSTD])]
         gh, calls = self.fake_gh([], [], closed=old)
+        with mock.patch.object(c, "gh", gh):
+            c.file_issue("body", AS_OF, [NOSTD])
+        self.assertTrue([a for a in calls if a[:2] == ("issue", "create")])
+
+    def test_a_job_the_closed_issue_did_not_name_is_still_filed(self):
+        closed = [self.closed_issue(2, ["Test (x86_64) (deep-recursion)"])]
+        gh, calls = self.fake_gh([], [], closed=closed)
+        with mock.patch.object(c, "gh", gh):
+            c.file_issue("body", AS_OF, [NOSTD, "Test (x86_64) (deep-recursion)"])
+        self.assertTrue([a for a in calls if a[:2] == ("issue", "create")])
+
+    def test_the_jobs_of_several_recent_closes_add_up_and_the_newest_is_not_special(self):
+        closed = [self.closed_issue(40, [NOSTD]), self.closed_issue(5, ["A"]), self.closed_issue(2, ["B"])]
+        gh, calls = self.fake_gh([], [], closed=closed)
+        with mock.patch.object(c, "gh", gh), mock.patch("sys.stdout"):
+            c.file_issue("body", AS_OF, ["A", "B"])
+        self.assertFalse(self.filed(calls))
+
+    def test_a_replay_before_a_close_is_not_silenced_by_it(self):
+        # `--as-of` a day before the issue was closed: the close has not happened yet.
+        closed = [{"closedAt": (AS_OF + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ"), "body": f"`{NOSTD}`"}]
+        gh, calls = self.fake_gh([], [], closed=closed)
+        with mock.patch.object(c, "gh", gh):
+            c.file_issue("body", AS_OF, [NOSTD])
+        self.assertTrue([a for a in calls if a[:2] == ("issue", "create")])
+
+    def test_an_issue_without_flagged_jobs_is_never_silenced(self):
+        gh, calls = self.fake_gh([], [], closed=[self.closed_issue(1, [NOSTD])])
         with mock.patch.object(c, "gh", gh):
             c.file_issue("body", AS_OF)
         self.assertTrue([a for a in calls if a[:2] == ("issue", "create")])
-
-    def test_the_newest_of_several_closed_issues_decides(self):
-        closed = [{"closedAt": self.stamp(days=40)}, {"closedAt": self.stamp(days=2)}]
-        gh, calls = self.fake_gh([], [], closed=closed)
-        with mock.patch.object(c, "gh", gh), mock.patch("sys.stdout"):
-            c.file_issue("body", AS_OF)
-        self.assertFalse([a for a in calls if a[:2] == ("issue", "create")])
 
     def test_an_open_issue_is_commented_on_at_most_once_a_day(self):
         gh, calls = self.fake_gh([{"number": 7}], [self.stamp(hours=6)])
@@ -243,8 +276,8 @@ class RetryTests(unittest.TestCase):
     def result(self, code, out="", err=""):
         return mock.Mock(returncode=code, stdout=out, stderr=err)
 
-    def test_an_api_call_is_retried_and_the_later_answer_is_used(self):
-        runs = [self.result(1, err="HTTP 502"), self.result(1, err="HTTP 502"), self.result(0, out="{}")]
+    def test_an_api_read_is_retried_when_the_failure_is_transient(self):
+        runs = [self.result(1, err="gh: Server Error (HTTP 502)"), self.result(1, err="HTTP 503"), self.result(0, out="{}")]
         with mock.patch.object(c.subprocess, "run", side_effect=runs) as run, mock.patch.object(c.time, "sleep") as sleep:
             self.assertEqual(c.gh("api", "x"), "{}")
         self.assertEqual(run.call_count, 3)
@@ -258,13 +291,34 @@ class RetryTests(unittest.TestCase):
                 c.gh("api", "x")
         self.assertEqual(run.call_count, c.ATTEMPTS)
 
+    def test_a_permanent_failure_is_not_retried(self):
+        for err in ("gh: Not Found (HTTP 404)", "HTTP 401: Bad credentials", "HTTP 403: API rate limit exceeded", "HTTP 422"):
+            with mock.patch.object(c.subprocess, "run", return_value=self.result(1, err=err)) as run, mock.patch.object(
+                c.time, "sleep"
+            ) as sleep:
+                with self.assertRaises(RuntimeError):
+                    c.gh("api", "x")
+            self.assertEqual(run.call_count, 1, err)
+            sleep.assert_not_called()
+
     def test_a_write_is_never_retried(self):
-        with mock.patch.object(c.subprocess, "run", return_value=self.result(1, err="boom")) as run, mock.patch.object(
-            c.time, "sleep"
+        for args in (
+            ("issue", "create", "--title", "t"),
+            ("api", "-X", "POST", "repos/x/issues"),
+            ("api", "--method", "PATCH", "repos/x"),
+            ("api", "repos/x", "-f", "a=b"),
+            ("api", "repos/x", "--input", "f.json"),
         ):
-            with self.assertRaises(RuntimeError):
-                c.gh("issue", "create", "--title", "t")
-        self.assertEqual(run.call_count, 1)
+            with mock.patch.object(c.subprocess, "run", return_value=self.result(1, err="HTTP 502")) as run, mock.patch.object(
+                c.time, "sleep"
+            ):
+                with self.assertRaises(RuntimeError):
+                    c.gh(*args)
+            self.assertEqual(run.call_count, 1, args)
+
+    def test_a_paginated_read_is_a_read(self):
+        self.assertTrue(c.is_read(("api", "--paginate", "repos/x/issues/1/comments", "--jq", ".[].created_at")))
+        self.assertFalse(c.is_read(("issue", "list")))
 
 
 class ReportTests(unittest.TestCase):
@@ -300,8 +354,18 @@ class ReportTests(unittest.TestCase):
             c, "fetch_jobs", side_effect=jobs
         ), mock.patch("sys.stdout") as out, mock.patch("sys.stderr") as err:
             self.assertEqual(c.report(AS_OF, issue=False), 0)
-        self.assertIn(NOSTD, "".join(call.args[0] for call in out.write.call_args_list))
+        written = "".join(call.args[0] for call in out.write.call_args_list)
+        self.assertIn(NOSTD, written)
+        # The report counts the runs it read, not the runs it asked for.
+        self.assertIn(f"newest {c.RECENT - 1} successful", written)
         self.assertIn("left out", "".join(call.args[0] for call in err.write.call_args_list))
+
+    def test_too_many_unreadable_runs_is_not_a_report(self):
+        runs_ = [{"id": i, "created_at": "2026-11-02T00:00:00Z"} for i in range(40)]
+        with mock.patch.object(c, "fetch_runs", return_value=runs_), mock.patch.object(
+            c, "fetch_jobs", side_effect=RuntimeError("gh api: HTTP 502")
+        ), mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            self.assertEqual(c.main(["report"]), 2)
 
     def test_nothing_flagged_files_nothing(self):
         runs_ = [{"id": i, "created_at": "2026-11-02T00:00:00Z"} for i in range(40)]
