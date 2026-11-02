@@ -13693,6 +13693,22 @@ Pinned by `test_map_values_object_ignores_a_halt_after_the_first_output_5791`.
 `succinctly yq --jq-extensions` takes jq's rule here, since real yq has no `walk` to follow.
 Pinned by `walk_still_fires_a_later_outputs_side_effect_5794`.
 
+## A path through a named argument: assignments, `$ARGS` and scalars ([#5692](https://github.com/rust-works/succinctly/issues/5692))
+
+jq binds a named argument as `CONST as $name | program`, so a path ending on `$name` is certified by the variable's own `jv`.
+Since #5692 `succinctly jq` answers the path expressions over a container argument as jq does: `--argjson d '{"a":1}' '$d | path($d)'` is `[]`, `'$d | del($d)'` is `null` and `'$d | path($d.a)'` is `["a"]`.
+Three shapes are still refused where jq answers:
+
+- An assignment whose target is the argument: `--argjson d '[1,2]' '$d | $d |= 5'` is `5` in jq, and `'$d | $d.a = 2'` on `{"a":1}` is `{"a":2}`.
+  A program with an assignment keeps the argument as a literal tree, which has an identity per occurrence; the shared value made per-record assignments 26-41% slower and a fold storing it quadratic.
+- `$ARGS.named.d | path($d)`: `$ARGS` and `$d` are two values to the path-mode interpreter, which gives each its own copy.
+- A scalar argument (`--arg`, `--rawfile`, `--argjson d 1`): `$d | path($d)` is `[]` in jq.
+  A scalar is always spliced as a literal (#5690).
+
+Each refusal is jq's own `Invalid path expression` error, so `try` catches it.
+`X as $d | $d | ...` with the same programs answers as jq (`. as $d | $d.a = 2` is `{"a":2}`).
+The refusals above and the answers #5692 fixed are pinned by `tests/jq_cli/i5692.rs`.
+
 ## Depends On
 
 - [ADR-0018](../../adrs/adr-0018.md) - the fidelity rule this page enumerates exceptions to

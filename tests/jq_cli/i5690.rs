@@ -1,9 +1,9 @@
 //! #5690: a container named argument (`--argjson`, `--slurpfile`, `$ARGS`) is spliced into a
 //! program that only reads it as one shared value, not as a literal tree rebuilt at every `$name`
 //! and built again when the program runs (10 MB of `--slurpfile` was 177 ms, now 75 ms). The rows
-//! pin that a read answers as the literal did, and that a program with a fold, an assignment, a
-//! path expression or a definition keeps the literal (#5673's rows pin those targets). Outputs are
-//! captured from jq 1.7.1 (`/usr/bin/jq`).
+//! pin that a read answers as the literal did, and that a program with a fold, an assignment or a
+//! definition keeps the literal (#5673's rows pin those targets; a path expression shares since
+//! #5692). Outputs are captured from jq 1.7.1 (`/usr/bin/jq`).
 
 use anyhow::Result;
 
@@ -107,9 +107,9 @@ fn slurpfile_and_args_reads_answer_as_jq_5690() -> Result<()> {
     Ok(())
 }
 
-/// A fold, an assignment, a path expression and a definition keep the literal: the same
-/// containers answered through each, so a gate that let one through would change an answer or an
-/// exit status here (`(.[] | numbers) |= ...` over a shared value is an error).
+/// A fold, an assignment and a definition keep the literal, and a path expression shares since
+/// #5692: the same containers answered through each, so a gate that let one through would change
+/// an answer or an exit status here (`(.[] | numbers) |= ...` over a shared value was an error).
 #[test]
 #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn programs_that_write_or_walk_paths_keep_the_literal_5690() -> Result<()> {
