@@ -105,7 +105,7 @@ function, `each_range`, built on `fanout_two_args_lazy`'s nesting/escape
 pattern one level deeper. It stays a bespoke function rather than a
 generalized N-argument helper, for the same reason `eval_range` itself is
 bespoke today
-([Stage 6](jq-generator-argument-fanout.md#L23), verbatim): *"the three
+([Stage 6](jq-generator-argument-fanout.md), verbatim): *"the three
 arities differ enough that a generic 3-argument helper would be all glue."*
 
 ### 2. What the new arm owes the dispatch table: the fallback invariant, satisfied by construction

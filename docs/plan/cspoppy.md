@@ -38,7 +38,7 @@ full word. Real Poppy has no per-word level and popcounts up to 7 words inside a
 basic block.
 
 So "implement true CS-Poppy" would mean implementing the true Poppy *rank*
-layout as well — a space/time trade, not a free win. That is now [F2](#f2--true-poppy-rank-layout-as-a-standalone-cspoppy).
+layout as well — a space/time trade, not a free win. That is now [F2](#f2--true-poppy-rank-layout-as-a-standalone-cspoppy--issue-597).
 
 ### 1.2 The select index costs 25% on BP bitmaps, not 1–3%
 
@@ -545,7 +545,7 @@ recompile," closed as expected and unavoidable, was not quite right either.
 The layout shift is not an intrinsic property of recompiling; it is a direct
 consequence of this crate's unpinned `codegen-units=16` default (#1587).
 Pinning `codegen-units=1` on both sides — now documented as [A/B
-Benchmarking Method § 9](../guides/benchmarking.md#a-b-benchmarking-method)
+Benchmarking Method § 9](../guides/benchmarking.md#ab-benchmarking-method)
 — removes #595's x86 regression entirely in a same-session, same-box,
 same-commit re-run (even reversing its sign), and collapses most of #649's
 unexplained ARM `long_*` "improvement" down to noise-adjacent levels in the
