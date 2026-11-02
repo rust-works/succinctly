@@ -287,6 +287,7 @@ fn test_compound_and_alternative_store_keep_the_operand_storage_5761() -> Result
 
 /// What the operand's marker must not change: errors, several right-hand sides, `path()`, a write
 /// after the store, a NaN through `-=`, and an object merge.
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_compound_store_with_a_container_operand_keeps_its_results_5761() -> Result<()> {
     for (filter, expected) in [
