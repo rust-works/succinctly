@@ -2,6 +2,23 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-11-02 — The optimization log leaves CLAUDE.md (issue #5846)
+
+**Sources ingested:**
+- The "Key insights", "Recent YAML optimizations" and "UTF-8 validation optimizations" sections of `CLAUDE.md`,
+  checked against the sections each entry links to in [parsing/yaml.md](parsing/yaml.md) and
+  [benchmarks/utf8-validate.md](benchmarks/utf8-validate.md)
+- The ten performance tables in `CLAUDE.md`, checked against [benchmarks/jq.md](benchmarks/jq.md) and
+  [benchmarks/yq.md](benchmarks/yq.md)
+
+**Pages updated:**
+- [optimizations/lessons.md](optimizations/lessons.md) — new; the three `CLAUDE.md` sections moved verbatim
+- [adrs/adr-0000.md](adrs/adr-0000.md) — an amendment recording the move
+- [STYLE_GUIDE.md](STYLE_GUIDE.md) — the benchmark tables live only under `benchmarks/`; `CLAUDE.md` quotes ranges
+- [optimizations/README.md](optimizations/README.md), [index.md](index.md), [parsing/json.md](parsing/json.md),
+  [parsing/yaml.md](parsing/yaml.md), [plan/cspoppy.md](plan/cspoppy.md) and
+  [plan/decode-failure-routing.md](plan/decode-failure-routing.md) — links to the moved entries
+
 ## 2026-10-25 — Dynamic path targets run on the path-mode interpreter (issue #5223)
 
 **Sources ingested:**
