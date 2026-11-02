@@ -124,7 +124,7 @@ ctrlc = { version = "3.4", optional = true }
 chrono = { version = "0.4", optional = true }
 serde_yaml = { version = "0.9", optional = true }
 toml = { version = "1.1.8", optional = true }
-sha2 = { version = "0.10.9", optional = true }
+sha2 = { version = "0.11.1", optional = true }
 
 # `libc` for the CLI's two `signal` calls: `SIGPIPE` back to its default (#5547), as Rust starts a
 # process with it ignored and jq and yq die of it, so `tool | head -n1` is quiet and exits 141;
