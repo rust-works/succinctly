@@ -8225,6 +8225,7 @@ Three differences remain, none of which aborts the process:
   They exited 101 with a raw panic; the three CLI routes and the library's `jq::eval` now catch exactly that panic.
   The CLI reports `nesting depth exceeds limit of 384` at exit 5, the same refusal `reduce` gives.
   Since [#5554](https://github.com/rust-works/succinctly/issues/5554) `succinctly jq` asserts the native-stack floor there instead of the constant (see "Building" under "Nesting depth" above), so these programs answer as jq does, and past the floor the net reports `nesting depth exceeds limit of the native stack` at exit 5.
+  `+=` and `//=` no longer splice a container operand ([#5761](https://github.com/rust-works/succinctly/issues/5761)), and the depth walk kept in their place has frames small enough that a value two million levels deep fits under the floor, so they answer there too; a fold's `$x` still refuses past it.
   `jq::eval` returns it as a `resource_limit` error.
   As with the yq net, it is a `catch_unwind` net and so ends the evaluation, not an error a `try` could see.
   jq prints all of these values (`1` for each of the four programs in `tests/jq_cli/i5526.rs`).

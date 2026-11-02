@@ -8,6 +8,9 @@
 //! splicing it back, and since #5540 so does `reduce ... as $x ([]; . + [$x])`.
 //! `try error(<deep>)` left the list with #5497: jq's writer stops at its print depth, so the
 //! message renders as jq's does and the program answers `1`.
+//! Since #5761 `+=` and `//=` store the operand instead of rebuilding it, and the walk kept in its
+//! place is cheap enough that a value past the floor fits, so a fold's `$x` is the splice site
+//! the past-floor rows use.
 
 use anyhow::Result;
 
@@ -18,6 +21,9 @@ const DEF: &str = "def f(n): if n == 0 then 0 else [f(n-1)] end;";
 /// A value two million levels deep, built in linear time through `.[0] = .`'s owned door, and
 /// deeper than the floor of both the release and the debug evaluation thread (#5554).
 const PAST_THE_FLOOR: &str = "(reduce range(2000000) as $i ([]; .[0] = .)) as $v |";
+
+/// A fold's `$x` read where no step hands it on: spliced back, so it walks the whole value.
+const FOLD_SPLICE: &str = "reduce $v as $x (0; if $x then 1 else 2 end)";
 
 fn assert_refused(stdout: &str, stderr: &str, code: i32, what: &str) {
     assert_eq!(code, 5, "{what}: stderr={stderr:?}");
@@ -78,26 +84,37 @@ fn test_built_value_past_384_levels_answers_as_jq_at_every_splice_site_5554() ->
 
 #[test]
 fn test_built_value_past_the_native_stack_floor_is_a_refusal_not_a_panic_5526() -> Result<()> {
-    for filter in [
-        "reduce $v as $x (0; if $x then 1 else 2 end)",
-        "{\"a\": []} | .a += $v | length",
-        "null | .a //= $v | length",
+    let program = format!("{PAST_THE_FLOOR} {FOLD_SPLICE}");
+    let (stdout, stderr, code) = run_jq_full(&["-nc", &program], None)?;
+    assert_refused(&stdout, &stderr, code, FOLD_SPLICE);
+    // `+=` and `//=` store the operand (#5761). Its depth walk asks the floor at every level and
+    // fits under it here, so the program answers; either way it never crashes.
+    for (args, input, filter) in [
+        (&["-nc"][..], None, "{\"a\": []} | .a += $v | length"),
+        (&["-nc"][..], None, "null | .a //= $v | length"),
+        (&["-c"][..], Some("{}"), ".a += $v | length"),
+        (&["-c"][..], Some("{}"), ".a //= $v | length"),
     ] {
         let program = format!("{PAST_THE_FLOOR} {filter}");
-        let (stdout, stderr, code) = run_jq_full(&["-nc", &program], None)?;
-        assert_refused(&stdout, &stderr, code, filter);
+        let mut argv = args.to_vec();
+        argv.push(&program);
+        let (stdout, stderr, code) = run_jq_full(&argv, input)?;
+        if code != 0 {
+            assert_refused(&stdout, &stderr, code, filter);
+        } else {
+            assert_eq!((stdout.as_str(), stderr.as_str()), ("1\n", ""), "{filter}");
+        }
     }
     Ok(())
 }
 
 #[test]
 fn test_built_value_past_the_native_stack_floor_on_document_input_5526() -> Result<()> {
-    // The lazy (document) route has its own nets; the same programs over an input.
-    for filter in [".a += $v | length", ".a //= $v | length"] {
-        let program = format!("{PAST_THE_FLOOR} {filter}");
-        let (stdout, stderr, code) = run_jq_full(&["-c", &program], Some("{}"))?;
-        assert_refused(&stdout, &stderr, code, filter);
-    }
+    // The lazy (document) route has its own nets; the same splice over an input.
+    let filter = "reduce $v as $x (.; if $x then 1 else 2 end)";
+    let program = format!("{PAST_THE_FLOOR} {filter}");
+    let (stdout, stderr, code) = run_jq_full(&["-c", &program], Some("{}"))?;
+    assert_refused(&stdout, &stderr, code, filter);
     Ok(())
 }
 
@@ -122,8 +139,7 @@ fn test_refusal_is_per_document_and_try_cannot_swallow_it_5526() -> Result<()> {
     // document (`echo '1 2' | jq 'if . == 1 then error("x") else . end'` exits 0), so a refusal on
     // the first one reports on stderr and the run ends 0; the refusal's own exit 5 is the
     // single-document case above.
-    let program =
-        format!("{PAST_THE_FLOOR} if . == 1 then ({{a: []}} | .a += $v | length) else . end");
+    let program = format!("{PAST_THE_FLOOR} if . == 1 then {FOLD_SPLICE} else . end");
     let (stdout, stderr, code) = run_jq_full(&["-c", &program], Some("1 2"))?;
     assert_eq!(stdout, "2\n", "stderr={stderr:?}");
     assert_eq!(code, 0);
@@ -131,7 +147,7 @@ fn test_refusal_is_per_document_and_try_cannot_swallow_it_5526() -> Result<()> {
     assert!(!stderr.contains("panicked"), "stderr={stderr:?}");
 
     // A resource limit, not a catchable error: `try`/`catch` and `?` do not absorb it.
-    let program = format!("{PAST_THE_FLOOR} try ({{a: []}} | .a += $v | length) catch 0");
+    let program = format!("{PAST_THE_FLOOR} try ({FOLD_SPLICE}) catch 0");
     let (stdout, stderr, code) = run_jq_full(&["-nc", &program], None)?;
     assert_refused(
         &stdout,
