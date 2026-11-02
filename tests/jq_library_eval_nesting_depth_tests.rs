@@ -222,18 +222,22 @@ fn test_public_eval_static_path_chain_ceiling_3429() {
     assert_eq!(message, "nesting depth exceeds limit of 384");
 }
 
-/// #3457: `..`/`recurse` over a document far deeper than any native stack
-/// could hold a recursion of runs on an ordinary small thread and answers,
-/// as it does in the CLI. The walker was a native recursion per level, so the
-/// library entry -- which, unlike the CLI, has no large evaluation thread --
-/// aborted the process with a stack overflow at a few thousand levels.
+/// #3457: `..`/`recurse` over a document deeper than a native recursion could
+/// walk on a small (256 KiB) thread runs on one and answers, as it does in the
+/// CLI. The thread size is what makes the test mean anything: 20,000 levels of
+/// a recursion fit an 8 MiB main thread. The walker was a native recursion per
+/// level, so the library entry -- which, unlike the CLI, has no large
+/// evaluation thread -- aborted the process with a stack overflow at a few
+/// thousand levels.
 #[test]
 fn test_public_eval_recurse_over_very_deep_document_does_not_overflow_the_stack_3457() {
     // A 256 KiB stack holds a few hundred recursive frames of the old walker,
     // and not 20,000 frames of any recursion: x86_64 and AArch64 keep the stack
     // 16-byte aligned at each call, so a frame is at least 16 bytes and 20,000
-    // of them are 320,000. The walk is quadratic in depth (#5869), which made
-    // the 100,000 this used before 200-256 s of every `cargo test` leg (#5844).
+    // of them are 320,000. In a debug build the walker's own frames already
+    // take 128-192 KiB of it, at any depth. The walk is quadratic in depth
+    // (#5869), which made the 100,000 this used before 200-256 s of every
+    // `cargo test` leg (#5844).
     const DEPTH: usize = 20_000;
     let outcome = std::thread::Builder::new()
         .stack_size(256 * 1024)
