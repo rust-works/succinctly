@@ -117449,6 +117449,29 @@ mod tests {
         run::<YqSemantics>();
     }
 
+    /// #5488: folding a literal bracket key after a pipe target (#2126) appends
+    /// the field step to a copy of the pipe and leaves the target alone. The
+    /// parser folds every spelling it reads itself (`.a.b[("c")]`), so only a
+    /// built AST reaches this arm; it is the one that edits a pipe's stages.
+    #[test]
+    fn test_fold_literal_bracket_key_after_a_pipe_target_appends_a_field_5488() {
+        let target = Expr::Pipe(vec![Expr::field("a"), Expr::field("b")].into());
+        let indexed = Expr::IndexExpr {
+            target: Box::new(target.clone()),
+            key: Box::new(Expr::Paren(Box::new(Expr::Literal(Literal::String(
+                "c".into(),
+            ))))),
+        };
+        assert_eq!(
+            fold_literal_bracket_keys(&indexed),
+            Expr::Pipe(vec![Expr::field("a"), Expr::field("b"), Expr::field("c")].into())
+        );
+        let Expr::IndexExpr { target: kept, .. } = &indexed else {
+            unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
+        };
+        assert_eq!(**kept, target, "the source pipe is not edited");
+    }
+
     /// #5488: a body rebuilt for each value copies the rest of its pipe once
     /// per value and hands every tail after that on as a view of the copy, so
     /// a value clones a number of stages linear in the pipe's length: before, a

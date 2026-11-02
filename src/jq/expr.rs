@@ -4867,9 +4867,10 @@ mod tests {
     fn a_tail_of_a_stateless_copy_is_a_view_of_its_stages_5488() {
         let numbered = |n: i64| PipeStages::from((0..n).map(lit_5488).collect::<Vec<_>>());
         let program = numbered(7);
-        let owner = program.tail_copy(1, |_| {
-            unreachable!("an owned `Vec` is copied without asking")
-        });
+        let not_asked = |_: &[Expr]| -> bool {
+            unreachable!("an owned `Vec` is copied without asking") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: the closure fails the test if it is asked"
+        };
+        let owner = program.tail_copy(1, not_asked);
         assert!(!owner.shares_storage_with(&program), "a copy of its own");
         assert_eq!(owner.as_slice(), &program[1..]);
         assert!(!owner.holds_bind_or_init(|_| false));
