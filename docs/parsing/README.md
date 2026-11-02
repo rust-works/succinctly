@@ -93,6 +93,7 @@ Both parsers share optimization techniques:
 - [YAML Analysis](yaml.md) - Ambiguity analysis, oracle model, optimization journey
 - [YAML Conformance](../compliance/yaml/limitations.md) - YAML Test Suite results and known limitations
 - [YAML Succinct Buffer Layout](yaml-succinct.md) - Buffer layout walkthrough for YamlIndex
+- [YAML SIMD Build Matrix](yaml-simd-build-matrix.md) - Which YAML SIMD backend each architecture and feature flag builds
 
 ### Optimisation Techniques
 

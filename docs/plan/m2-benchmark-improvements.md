@@ -1,5 +1,10 @@
 # M2 Benchmark Improvements Plan
 
+**Status: Archived (implemented).** The navigation queries (`.[0]`, `.[]`, `length`) are in
+`src/bin/succinctly/yq_bench.rs`, memory is collected by default, and the results are in
+[M2 Streaming Navigation Benchmarks](../benchmarks/yq.md#m2-streaming-navigation-benchmarks). The
+manual 100 MB figures below are superseded by that page.
+
 This document proposes enhancements to the yq benchmark suite to properly measure the M2 streaming optimization's impact.
 
 ## Problem Statement

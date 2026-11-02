@@ -1,5 +1,7 @@
 # YAML SIMD Build Matrix
 
+[Home](../../) > [Docs](../) > [Parsing](./) > YAML SIMD build matrix
+
 This document describes the build configurations for YAML SIMD optimizations across different target architectures and feature flags.
 
 ## Feature Flags

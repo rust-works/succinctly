@@ -1,5 +1,11 @@
 # DSV Port Plan: High-Performance CSV/DSV Parsing for Succinctly
 
+**Status: Archived (implemented).** This is the original port plan for `src/dsv/`, kept
+as the design record; the phases and file list describe the starting point (the module has since
+gained `simd/sve2.rs` and `index_lightweight.rs`). The current reference is
+[parsing/dsv.md](../parsing/dsv.md) and [parsing/dsv-index.md](../parsing/dsv-index.md). The
+comparison with hw-dsv below is recorded only here.
+
 ## Executive Summary
 
 Port the core algorithms from `hw-dsv` to create a high-performance DSV (delimiter-separated values) parser for succinctly. The approach uses succinct semi-indexing to achieve O(1) field access with minimal memory overhead (~3-4%).

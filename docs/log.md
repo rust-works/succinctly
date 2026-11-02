@@ -2,6 +2,32 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-11-02 — Audit of docs/plan/: archive finished plans in place (issue #5847)
+
+**Sources ingested:**
+- Every file in `docs/plan/`, each checked against the state of the issues it tracks and the
+  code it names (`git grep`), and the inbound links to each from source, tests, scripts and docs
+- `lychee.toml`: the link checker reads only `**/*.md`, so a move would break the ~48 references
+  from `.rs`, test and script files unchecked, including an error message in `src/jq/eval.rs`
+
+**Pages updated:**
+- [plan/README.md](plan/README.md) — every plan indexed (nine had no row), statuses corrected, a
+  Live/Archived split, and the archive-in-place rule
+- Status lines added or corrected in [plan/jq.md](plan/jq.md), [plan/yq.md](plan/yq.md),
+  [plan/dsv.md](plan/dsv.md), [plan/m2-benchmark-improvements.md](plan/m2-benchmark-improvements.md),
+  [plan/compact-index-investigation.md](plan/compact-index-investigation.md),
+  [plan/issue-3025-spike.md](plan/issue-3025-spike.md), [plan/issue-3025-results.md](plan/issue-3025-results.md),
+  [plan/jq-lazy-map-select.md](plan/jq-lazy-map-select.md) and
+  [plan/jq-path-trackability-deferral.md](plan/jq-path-trackability-deferral.md) (both said "design
+  only, not implemented"), [plan/jq-alt-retry-stash-audit.md](plan/jq-alt-retry-stash-audit.md) and
+  [plan/yq-memory-optimization.md](plan/yq-memory-optimization.md) (M2 was still "Pending")
+- [plan/jq-path-mode-interpreter-spike.md](plan/jq-path-mode-interpreter-spike.md) — the `path_spike`
+  file, dev command and script names it cited now point at their `path_mode` successors
+- [parsing/yaml-simd-build-matrix.md](parsing/yaml-simd-build-matrix.md) — moved from
+  `plan/simd-features.md`: a current reference page, not a plan
+- Deleted, with no inbound links and nothing recorded only in them: `plan/documentation-refactor.md`,
+  `plan/optimization-docs-plan.md`, `plan/generic-eval-refactor.md`, `plan/issue-3025-implementation.md`
+
 ## 2026-11-02 — The optimization log leaves CLAUDE.md (issue #5846)
 
 **Sources ingested:**

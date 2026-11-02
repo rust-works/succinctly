@@ -2,6 +2,11 @@
 
 [Home](../../) > [Docs](../) > [Plan](./) > `?//` stash-slot audit
 
+**Status: Archived (dated snapshot).** The verdicts below are as of `main` @ `1fa800b92`. Every
+issue the REACHABLE rows were filed under (#3805-#3810) is now closed, as are #3517 and #3293,
+so the REACHABLE column describes the code before those fixes, not the code today. The
+NOT REACHABLE reasoning and the method still apply.
+
 The closing audit of #3293, the stale-escape-across-a-`?//`-retry audit
 (slices 1-9: #3411, #3421, #3434, #3451, #3472, #3485, #3492, #3495, #3508, #3515). Every
 production slot the issue's triage grep finds gets a verdict, taken at `main` @ `1fa800b92`.

@@ -1,5 +1,12 @@
 # yq Command Implementation Plan
 
+**Status: Archived (implemented).** This is the original plan for `succinctly yq`, kept as
+the design record; the phase prose predates much of the later work. The current reference is
+[yq-language.md](../reference/yq-language.md), and the recorded divergences from yq are in
+[limitations.md](../compliance/yq/limitations.md). The "Lazy `keys_unsorted` output (#685)" and
+"Lazy `map` output (#757)" sections are the only record of those designs and their A/B
+measurements.
+
 This document outlines the plan to add a `yq` subcommand to succinctly for querying YAML files using jq-compatible syntax.
 
 ## Implementation Status

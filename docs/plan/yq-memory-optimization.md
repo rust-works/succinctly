@@ -2,6 +2,13 @@
 
 This document analyzes memory usage in the `yq` command and proposes optimizations to reduce memory consumption.
 
+**Status: Partial (figures dated 2026-01).** M2 shipped as the cursor-streaming navigation path
+([M2 Streaming Navigation Benchmarks](../benchmarks/yq.md#m2-streaming-navigation-benchmarks));
+M3 shipped with no measurable effect (see "M3 Results"). M1, M4, M5 and M6 are not known to have
+landed: `yq_runner.rs` still collects `all_results` before printing on the DOM route. #5865
+tracks deciding each of them. The memory
+figures and the `OwnedValue` size table predate the `Rc` container layout (#2999/#3000).
+
 ## Problem Statement
 
 The `yq` command uses more memory than expected given that succinct data structures are designed for space efficiency. While benchmarks show succinctly uses **7-14x less memory** than system `yq` on large files, the absolute memory usage is still higher than the theoretical minimum.
@@ -709,7 +716,7 @@ struct InternedString {
 | M3    | Low       | Low         | **P1** (quick win)           | ✅ Done     |
 | M4    | Medium    | Low-Medium  | **P1** (quick win)           | Pending     |
 | M1    | High      | Medium      | **P2** (major improvement)   | Pending     |
-| M2    | Very High | High        | **P3** (requires design work)| Pending     |
+| M2    | Very High | High        | **P3** (requires design work)| ✅ Done     |
 | M5    | Medium    | Medium      | **P4** (nice to have)        | Pending     |
 | M6    | Medium    | Medium-High | **P4** (nice to have)        | Pending     |
 

@@ -1,5 +1,11 @@
 # Plan: jq Expression Support
 
+**Status: Archived (implemented).** This is the original plan for `succinctly jq`, kept as
+the design record; its file layout, effort estimate and open questions describe the starting
+point, not the code. The current reference is
+[jq-language.md](../reference/jq-language.md) and [jq-evaluator.md](../reference/jq-evaluator.md),
+and the recorded divergences from jq are in [limitations.md](../compliance/jq/limitations.md).
+
 ## Overview
 
 Implement a subset of jq query expressions on top of the existing JSON semi-indexing infrastructure. The goal is to leverage the fast cursor-based navigation and lazy evaluation already in place.
