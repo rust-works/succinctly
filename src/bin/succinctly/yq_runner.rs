@@ -14574,6 +14574,72 @@ mod tests {
         );
     }
 
+    /// Run `body` on a thread with a real 64 MiB stack, registered as the native-stack floor's
+    /// budget and armed the way `run_yq` arms it (#5876). Returns what `body` returns.
+    fn on_the_floor<R: Send + 'static>(body: impl FnOnce() -> R + Send + 'static) -> R {
+        const STACK: usize = 64 * 1024 * 1024;
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(move || {
+                succinctly::jq::with_stack_budget(STACK, || {
+                    succinctly::jq::with_value_depth_on_stack_floor(body)
+                })
+            })
+            .expect("spawn")
+            .join()
+            .expect("the body catches the walk's own panic")
+    }
+
+    /// The message of the depth-guard panic `walk` raises, or `None` if it returns.
+    fn depth_guard_message_of(walk: impl FnOnce()) -> Option<String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(walk))
+            .err()
+            .map(|payload| {
+                depth_guard_panic_message(&*payload).expect("only a depth guard may panic here")
+            })
+    }
+
+    /// #5876: with the floor armed, the presentation and emission walks pass the 384-level
+    /// constant and refuse only where their own frames have spent half the stack, with the
+    /// floor's message -- the panic `run_yq` reports as a clean error -- not a stack overflow.
+    #[test]
+    fn yq_walks_over_a_built_value_are_bounded_by_the_floor_5876() {
+        let config = OutputConfig {
+            output_format: OutputFormat::Yaml,
+            compact: false,
+            raw_output: false,
+            nul_output: false,
+            ascii_output: false,
+            sort_keys: false,
+            no_doc: false,
+            indent_str: String::new(),
+            use_color: false,
+            json_sourced_floats: false,
+        };
+        let refusal = succinctly::jq::STACK_FLOOR_NESTING_MESSAGE;
+        let (reconcile, emit) = on_the_floor(move || {
+            use succinctly::jq::MAX_VALUE_TREE_DEPTH;
+            // Past the constant, well inside the floor: both walks answer.
+            let past = linear_array_nest(MAX_VALUE_TREE_DEPTH + 600);
+            let answered = depth_guard_message_of(|| {
+                let _ = reconcile_presentation(&past, &CommentTree::empty(), &past, &[]);
+                let _ = emit_yaml_value(&past, &CommentTree::empty(), &config, "", false);
+            });
+            assert_eq!(answered, None, "the walks stop at the constant");
+            // Far past what 32 MiB (half the stack) can hold at any frame size.
+            let far = linear_array_nest(2_000_000);
+            let reconcile = depth_guard_message_of(|| {
+                let _ = reconcile_presentation(&far, &CommentTree::empty(), &far, &[]);
+            });
+            let emit = depth_guard_message_of(|| {
+                let _ = emit_yaml_value(&far, &CommentTree::empty(), &config, "", false);
+            });
+            (reconcile, emit)
+        });
+        assert_eq!(reconcile.as_deref(), Some(refusal));
+        assert_eq!(emit.as_deref(), Some(refusal));
+    }
+
     /// `{"k":{"k":...{}...}}`, `depth` levels of `"k"` nesting, terminating
     /// in `{}` -- mirrors `eval_generic.rs`'s own `linear_nest`.
     fn linear_json_nest(depth: usize) -> String {

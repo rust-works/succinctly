@@ -62,6 +62,8 @@ fn what_follows_a_deep_fold_answers_as_yq_does() -> Result<()> {
                 r#".[] as $i ireduce ({}; {"a": .}) | .a | type"#,
                 "!!map\n".to_string(),
             ),
+            // yq's `==` is `false` for two containers at any depth (`[0] | . == .` too); the row
+            // pins that the walk reaches the answer instead of refusing.
             (".[] as $i ireduce (0; [.]) | . == .", "false\n".to_string()),
         ] {
             assert_eq!(
