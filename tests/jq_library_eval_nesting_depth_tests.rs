@@ -229,9 +229,12 @@ fn test_public_eval_static_path_chain_ceiling_3429() {
 /// aborted the process with a stack overflow at a few thousand levels.
 #[test]
 fn test_public_eval_recurse_over_very_deep_document_does_not_overflow_the_stack_3457() {
-    const DEPTH: usize = 100_000;
     // A 256 KiB stack holds a few hundred recursive frames of the old walker,
-    // not 100,000 of anything.
+    // and not 20,000 frames of any recursion: x86_64 and AArch64 keep the stack
+    // 16-byte aligned at each call, so a frame is at least 16 bytes and 20,000
+    // of them are 320,000. The walk is quadratic in depth (#5869), which made
+    // the 100,000 this used before 200-256 s of every `cargo test` leg (#5844).
+    const DEPTH: usize = 20_000;
     let outcome = std::thread::Builder::new()
         .stack_size(256 * 1024)
         .spawn(|| {
