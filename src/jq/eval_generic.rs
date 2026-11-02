@@ -52458,6 +52458,45 @@ mod tests {
         assert_eq!(CommentTree::empty().key_anchor("key"), None);
     }
 
+    /// #5469: an alias used as a key is recorded in the per-key map by itself, not under an
+    /// alias expansion and not over an earlier same-text key's entry, and clearing it leaves
+    /// every other node alone.
+    #[test]
+    fn test_to_owned_with_comments_records_key_alias_5469() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"b: &a xy\nc:\n  *a : 1\nm: &m\n  *a : 2\nn: *m\nd:\n  &k key: 1\n  *k : 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = mapping_cursor.value();
+        let (_, mut comments) =
+            to_owned_with_comments::<_, YqSemantics>(&value, Some(&mapping_cursor))
+                .expect("conversion succeeds");
+
+        assert_eq!(comments.field("c").key_alias("xy"), Some("a"));
+        assert_eq!(comments.field("m").key_alias("xy"), Some("a"));
+        // The alias-expanded copy carries no mark of its own.
+        assert_eq!(comments.field("n").key_alias("xy"), None);
+        // The repeated key keeps the anchor its first occurrence declared.
+        assert_eq!(comments.field("d").key_anchor("key"), Some("k"));
+        assert_eq!(comments.field("d").key_alias("key"), None);
+        assert_eq!(comments.key_alias("b"), None);
+
+        // Clearing is a no-op on a key with no entry and on a node that is no mapping.
+        comments.clear_key_alias("missing");
+        let mut leaf = CommentTree::empty();
+        leaf.clear_key_alias("xy");
+        assert_eq!(leaf.key_alias("xy"), None);
+        if let CommentTree::Object(_, fields, _) = &mut comments {
+            fields.get_mut("c").unwrap().clear_key_alias("xy");
+        }
+        assert_eq!(comments.field("c").key_alias("xy"), None);
+        assert_eq!(comments.field("m").key_alias("xy"), Some("a"));
+    }
+
     /// #4078: a node's explicit tag is recorded verbatim, on scalars and containers, not
     /// on an alias nor under one, and a head/foot rewrite keeps it.
     #[test]

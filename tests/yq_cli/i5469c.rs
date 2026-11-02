@@ -209,3 +209,17 @@ fn test_a_space_before_a_compact_mapping_colon_parses_5469() -> Result<()> {
     );
     Ok(())
 }
+
+/// An alias key may name a key's own anchor (`&k key: 1` in one mapping, `*k : 2` in another),
+/// whose value is the key's text (yq v4.53.3).
+#[test]
+fn test_an_alias_key_to_an_anchored_key_survives_a_write_5469() -> Result<()> {
+    let doc = "a:\n  &k key: 1\nc:\n  *k : 2\n";
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".zz = 1", doc, &[])?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("a:\n  &k key: 1\nc:\n  *k : 2\nzz: 1\n", 0),
+        "{stderr:?}"
+    );
+    Ok(())
+}
