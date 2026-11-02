@@ -494,6 +494,13 @@ What remains, recorded here:
   rows (a multiply-add recurrence over `j0`/`j1`) were reduced to their `n = 0, ±1`
   cases plus the order rules as equalities, since no AArch64 Linux host was available to
   measure them on.
+  **Ubuntu 26.04's glibc is a fifth libm** (#5878).
+  It moves last digits in both cases, as the failing CI runs of #5878 show: `tgamma` prints `-3.544907701811032` where the golden has `-3.5449077018110318`, and `lgamma` prints `12.801827480081469` where the golden has `12.80182748008147`.
+  Whether a jq 1.7.1 built on that image prints the same new digits has not been measured yet; that is the first step of un-pinning.
+  `asinh`, `acosh` and the sign `lgamma_r` reports at a pole move too.
+  Every x86_64 Linux CI job is pinned to `ubuntu-24.04` for that reason.
+  `scripts/test_ci_runner_pin.py` fails if one is moved to `ubuntu-latest`.
+  Un-pinning means re-sweeping with `scripts/jq-libm-oracle-sweep.sh` against a jq 1.7.1 built on the new image, then dropping the rows the libms disagree on, as was done for AArch64.
 
 ## Behaviour and parser gaps
 
