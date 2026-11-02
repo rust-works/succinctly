@@ -77572,19 +77572,20 @@ where
 ///
 /// A container (`--argjson`, `--slurpfile`, `$ARGS`, a data `import`) is spliced as one shared
 /// marker instead of a literal tree rebuilt at every `$name`, when the program only reads it
-/// (`reads_named_arguments_only`). A program with a fold or a store but no path expression or
-/// definition shares only the `$name` that heads a navigation chain (#5774, #5803,
-/// `substitute_vars_navigation_shared`), and with a store only where it is read and not where it
-/// is the input or the target of a store; a program that also holds one `$name` that is not read
+/// (`reads_named_arguments_only`). A program with a fold or a store but no definition shares only
+/// the `$name` that heads a navigation chain (#5774, #5803, `substitute_vars_navigation_shared`),
+/// and with a store only where it is read and not where it is the input or the target of a store;
+/// a program that also holds one `$name` that is not read
 /// through (`$d | map(.a)`, `$d | sort`) keeps the literal for that occurrence only, and a fold
 /// that reaches it still rebuilds the whole value at every step.
 ///
 /// The literal is a tree as large as the value, built once per read of the name and then built
 /// again into a value when the program runs: for 10 MB of `--slurpfile` that was 177 ms of the
 /// run, and 75 ms with the marker (Apple M5 Max). The marker is the one an `. as $x` binding
-/// substitutes (`Origin::Untracked`), which evaluates as the plain value and shares its storage.
-/// It is only sound where nothing asks for the value's path or writes through it, which is what
-/// the gate checks (#5673 pins the rows that made it unsound).
+/// substitutes (`Origin::Untracked`), which evaluates as the plain value and shares its storage,
+/// so a path ending on it is certified by that storage (#5692). Where the program writes, it is
+/// slower than the literal, which is what the gate checks (#5673 pins the rows a marker first
+/// refused, before the path-mode interpreter gave its scalars storage).
 pub fn substitute_named_args<'a, I>(expr: &Expr, vars: I) -> Expr
 where
     I: IntoIterator<Item = (&'a str, &'a OwnedValue)>,
@@ -77799,13 +77800,13 @@ fn rename_navigation_heads(
 
 /// Whether `expr` only reads a named argument's value (#5690).
 ///
-/// That is: no assignment, path expression, fold or definition anywhere in it. (A fold or a store is
-/// [`reads_named_arguments_besides_folds_and_stores`]'s, #5774, #5803.) A shared marker is
-/// refused in path position (`$d | (.[] | numbers) |= . + 1` is an error with one, `[2,3]` in jq),
-/// makes a fold that appends or assigns the value quadratic (`closed_expr_to_owned` declines a
-/// marker), and slows a small container assigned per record, so each of those keeps the literal.
+/// That is: no assignment, fold or definition anywhere in it. (A fold or a store is
+/// [`reads_named_arguments_besides_folds_and_stores`]'s, #5774, #5803; a path expression shares
+/// since #5692.) A shared marker makes a fold that appends or assigns the value quadratic
+/// (`closed_expr_to_owned` declines a marker), and slows a small container assigned per record,
+/// so each of those keeps the literal.
 ///
-/// A list of what to exclude, not of what to allow: a construct that asks for a path or writes
+/// A list of what to exclude, not of what to allow: a construct that writes
 /// has to be added here when it is added to the language (the same rule `walk::any_subexpr`'s own
 /// exhaustive match enforces for a walk, which a `matches!` cannot). A call of anything that is
 /// not a builtin (`FuncCall`, `NamespacedCall`) is excluded too, since its body is not in view;
@@ -77815,15 +77816,21 @@ fn reads_named_arguments_only(expr: &Expr) -> bool {
 }
 
 /// [`reads_named_arguments_only`], but a fold and a store are allowed (#5774, #5803): the program
-/// has no path expression or definition, so a `$name` read through is not in path position
-/// anywhere but the target of a store, which [`rename_navigation_heads`] never renames.
+/// has no definition, so a `$name` read through is not stored anywhere but the target of a store,
+/// which [`rename_navigation_heads`] never renames.
 fn reads_named_arguments_besides_folds_and_stores(expr: &Expr) -> bool {
     !holds_unshareable_construct(expr, true, true)
 }
 
-/// Whether `expr` holds a construct that keeps the literal for a named argument: an assignment, a
-/// path expression, a definition or call, or (unless `allow_folds`) a `reduce`/`foreach`, or
+/// Whether `expr` holds a construct that keeps the literal for a named argument: an assignment or
+/// `setpath` (both store a value, which a marker slows), a definition or call, `parent`/`key`
+/// (which read where a value came from), or (unless `allow_folds`) a `reduce`/`foreach`, or
 /// (unless `allow_stores`) an assignment. The meta assignment of yq mode is never allowed.
+///
+/// A path expression (`path`, `paths`, `del`, `pick`, `getpath`, `walk`) shares (#5692): the
+/// marker has the value's storage, so a path ending on it is certified as jq certifies the `jv`
+/// (`$d | path($d)` is `[]`), and the path-mode interpreter gives its scalars storage too. The
+/// literal had an identity per occurrence and refused those, where jq answers.
 fn holds_unshareable_construct(expr: &Expr, allow_folds: bool, allow_stores: bool) -> bool {
     any_subexpr(expr, &mut |e| {
         (is_assignment_expr(e) && (!allow_stores || matches!(e, Expr::MetaAssign { .. })))
@@ -77839,21 +77846,7 @@ fn holds_unshareable_construct(expr: &Expr, allow_folds: bool, allow_stores: boo
                     | Expr::DeferredVar(_)
                     | Expr::Label { .. }
                     | Expr::Builtin(
-                        Builtin::Path(_)
-                            | Builtin::PathNoArg
-                            | Builtin::Paths
-                            | Builtin::PathsFilter(_)
-                            | Builtin::LeafPaths
-                            | Builtin::SetPath(..)
-                            | Builtin::DelPaths(_)
-                            | Builtin::Del(_)
-                            | Builtin::Pick(_)
-                            | Builtin::Omit(_)
-                            | Builtin::SortKeys(_)
-                            | Builtin::Walk(_)
-                            | Builtin::Parent
-                            | Builtin::ParentN(_)
-                            | Builtin::Key
+                        Builtin::SetPath(..) | Builtin::Parent | Builtin::ParentN(_) | Builtin::Key
                     )
             )
     })
@@ -165544,7 +165537,7 @@ mod named_args_shared_tests_5690 {
 
     /// #5690: a container named argument is one shared marker in a program that only reads it, and
     /// a literal tree in every other (a test that can fail if the sharing stops, or reaches a
-    /// program that writes or asks for a path).
+    /// program that writes). A path expression shares since #5692.
     #[test]
     fn test_a_container_named_argument_is_shared_only_into_a_reading_program_5690() {
         let d = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
@@ -165557,21 +165550,21 @@ mod named_args_shared_tests_5690 {
             ("$d | (.[] | numbers) |= . + 1", false),
             ("$d | .[0] = 9", false),
             ("$d | .[0] += 9", false),
-            ("$d | del(.[0])", false),
-            ("path($d[0])", false),
-            ("[$d | paths]", false),
+            ("$d | del(.[0])", true),
+            ("path($d[0])", true),
+            ("[$d | paths]", true),
             ("$d | getpath([0]) = 1", false),
             ("reduce range(2) as $i ($d; . + $d)", false),
             ("[foreach range(2) as $i (0; .+1; $d)]", false),
             ("def f: $d; f", false),
-            ("$d | walk(.)", false),
-            ("$d | pick(.[0])", false),
-            ("$d | omit(.[0])", false),
-            ("$d | leaf_paths", false),
-            ("$d | [paths(type == \"number\")]", false),
+            ("$d | walk(.)", true),
+            ("$d | pick(.[0])", true),
+            ("$d | omit(.[0])", true),
+            ("$d | leaf_paths", true),
+            ("$d | [paths(type == \"number\")]", true),
             ("$d | setpath([0]; 1)", false),
-            ("$d | delpaths([[0]])", false),
-            ("$d | path(..)", false),
+            ("$d | delpaths([[0]])", true),
+            ("$d | path(..)", true),
             ("label $out | $d | ., break $out", false),
             ("$d | .[0] | key", false),
             ("$d | .[0] | parent", false),
@@ -165623,10 +165616,10 @@ mod named_args_shared_tests_5690 {
             ("$d | .[0] = 9", false),
             ("$d[0] | .x = 1", false),
             ("reduce range(2) as $i ($d[0]; .x = $d[1])", true),
-            // A write through a path expression or a definition keeps the literal everywhere.
+            // A write through a definition keeps the literal everywhere; a path expression shares (#5692).
             (
                 "reduce range(2) as $i (0; . + (path($d[0]) | length))",
-                false,
+                true,
             ),
             ("reduce range(2) as $i (0; def f: $d[0]; . + f)", false),
             // A `$d` the program binds itself is not the argument.

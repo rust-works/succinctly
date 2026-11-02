@@ -1456,11 +1456,20 @@ impl<'e> Interp<'e> {
             }),
             // A value substituted into the program (`--arg`, a library
             // caller's binding): one `jv` however often it is read.
+            //
+            // Its scalars get storage the way the run's input does
+            // (`promote_identities`), as `jv_parse` gave a named argument's.
+            // `fresh` would stop at the container: a named argument's is
+            // shared with the program (#5690), so its strings and numbers
+            // would have none, and `$d | path($d.a)` would refuse where jq
+            // answers `["a"]` (#5692). The container is copied once per run,
+            // as the literal it replaced was built once per run.
             Expr::TrackedVar(tracked) => {
                 let key = Rc::as_ptr(tracked) as usize;
                 let cached = self.consts.borrow().get(&key).cloned();
                 let value = cached.unwrap_or_else(|| {
-                    let value = fresh(tracked.value.clone(), &[]);
+                    let mut value = tracked.value.clone();
+                    value.promote_identities();
                     self.consts.borrow_mut().insert(key, value.clone());
                     value
                 });
