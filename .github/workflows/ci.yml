@@ -479,6 +479,13 @@ jobs:
               source scripts/lib/clippy-variants.sh
               cargo clippy --all-targets --features "$CLIPPY_CORE_FEATURES" -- -D warnings
               cargo clippy --all-targets --features "$CLIPPY_ARM_BROADWORD_FEATURES" -- -D warnings
+              # #5908: rustdoc has the blind spot clippy has. `--all-features` compiles out the
+              # NEON YAML backend (`scalar-yaml`) and cannot select the broadword one
+              # (`broadword-yaml`), so the `Documentation` job, which is x86_64, never documents
+              # neon.rs or broadword.rs. The same two lists, on the architecture that builds them.
+              export RUSTDOCFLAGS="-D warnings"
+              cargo doc --no-deps --features "$CLIPPY_CORE_FEATURES"
+              cargo doc --no-deps --features "$CLIPPY_ARM_BROADWORD_FEATURES"
           # #3698, #5494, #5705: the slowest jq_cli_tests (20 of them) and all of `yq_cli_tests`, split out
           # of `cli-gated`; same list and guards as the x86_64 leg's (see the comments on its entries).
           - name: deep-recursion
