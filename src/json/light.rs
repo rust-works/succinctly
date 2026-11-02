@@ -45,7 +45,7 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 #[cfg(test)]
 use std::borrow::Cow;
 
-use core::cell::{Cell, OnceCell};
+use core::cell::{Cell, OnceCell, RefCell};
 
 use crate::trees::BalancedParens;
 use crate::util::broadword::select_in_word;
@@ -95,6 +95,12 @@ pub struct JsonIndex<W = Vec<u64>> {
     /// cursors that reached the same node by different routes. YAML's
     /// `AdvancePositions` cache has that exact trap on record.
     seq_hint: Cell<SeqHint>,
+    /// The closer runs [`JsonCursor::container_end_bp`] has read, so the next container on the
+    /// same run is answered by stepping from a known closer rather than by rescanning from the
+    /// run's leaf (#5869). See [`CloseRun`].
+    ///
+    /// Advisory, like `seq_hint`, and left out of `Debug` for the same reason.
+    close_runs: RefCell<Vec<CloseRun>>,
     /// Whether this index was built over the jq reindex bridge's own text
     /// ([`JsonIndex::build_reindex`]), the only text allowed to carry the
     /// bridge's number tokens (`NAN_SENTINEL`, `INFINITY_SENTINEL`,
@@ -146,6 +152,51 @@ impl SeqHint {
         rank: u32::MAX,
         pos: 0,
     };
+}
+
+/// A run of consecutive close parentheses after one leaf, and where one of its closers sits in
+/// the text: the state behind [`JsonIndex::close_run_end`] (#5869).
+///
+/// Every container whose close parenthesis falls in `leaf + 1..=hi` has the open parenthesis at
+/// `leaf` as the last one before it, so [`JsonCursor::container_end_bp`] would count closers from
+/// that same leaf. Those closers are consecutive `]`/`}` bytes in the text with no other closer
+/// between them, so the closer of close `c - 1` is the last closer byte before the closer of `c`,
+/// and the closer of `c + 1` the first one after it. A walk down a spine asks `c`, `c - 1`,
+/// `c - 2`, ... in turn, which costs one gap each from the previous answer instead of a scan of
+/// every closer from the leaf: that scan made `..` over a linear nest quadratic in its depth.
+///
+/// Advisory: a lookup it cannot answer falls back to the scan, which then records the run.
+#[derive(Clone, Copy, Debug)]
+struct CloseRun {
+    /// The open parenthesis of the run's leaf.
+    leaf: usize,
+    /// The lowest close in the run that has a closer byte in the text: `leaf + 1` when the leaf
+    /// is an empty container (its own closer), `leaf + 2` when it is a scalar.
+    first: usize,
+    /// The highest close known to be in the run: every bit in `leaf + 1..=hi` is a close.
+    hi: usize,
+    /// The close the run last answered, in `first..=hi`.
+    at: usize,
+    /// One past the closer of `at`.
+    end: usize,
+}
+
+/// How many runs [`JsonIndex::close_run_end`] keeps. A pre-order walk keeps one per comb level
+/// it is inside (a spine whose earlier siblings have spines of their own); past this the newest
+/// replaces the innermost, which only costs a rescan.
+const CLOSE_RUN_CAPACITY: usize = 32;
+
+#[cfg(test)]
+std::thread_local! {
+    /// How many times [`JsonCursor::container_end_bp`] scanned closers from a leaf instead of
+    /// answering from a recorded run (#5869), for the test that pins the walk linear.
+    static CLOSE_RUN_SCANS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Whether `b` closes a container, as [`JsonCursor::container_end_bp`] counts closers.
+#[inline]
+fn is_closer(b: u8) -> bool {
+    matches!(b, b']' | b'}')
 }
 
 /// Build cumulative popcount index for IB.
@@ -239,6 +290,7 @@ impl JsonIndex<Vec<u64>> {
             bp: BalancedParens::new(semi.bp, bp_bit_count),
             lines: OnceCell::new(),
             seq_hint: Cell::new(SeqHint::NONE),
+            close_runs: RefCell::new(Vec::new()),
             bridge_tokens: false,
         }
     }
@@ -311,6 +363,7 @@ impl JsonIndex<Vec<u64>> {
             bp: BalancedParens::leaf_in(bp_words),
             lines: OnceCell::new(),
             seq_hint: Cell::new(SeqHint::NONE),
+            close_runs: RefCell::new(Vec::new()),
             bridge_tokens: true,
         }
     }
@@ -322,6 +375,7 @@ impl JsonIndex<Vec<u64>> {
     /// last act, and `self` must be dropped afterwards, never read.
     pub(crate) fn take_scalar_parts(&mut self) -> ScalarIndexParts {
         self.ib_len = 0;
+        self.close_runs.get_mut().clear();
         ScalarIndexParts {
             ib: core::mem::take(&mut self.ib),
             ib_rank: core::mem::take(&mut self.ib_rank),
@@ -365,6 +419,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
             bp: BalancedParens::from_words(bp, bp_len),
             lines: OnceCell::new(),
             seq_hint: Cell::new(SeqHint::NONE),
+            close_runs: RefCell::new(Vec::new()),
             bridge_tokens: false,
         }
     }
@@ -385,6 +440,68 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     #[inline]
     pub fn bp(&self) -> &BalancedParens<W> {
         &self.bp
+    }
+
+    /// One past the closer of the close parenthesis `close`, from a run a previous
+    /// [`JsonCursor::container_end_bp`] recorded (#5869), or `None` when no recorded run holds
+    /// it. `text` is the text this index was built from.
+    ///
+    /// Runs entirely before `close` are dropped as they are met: a pre-order walk that has moved
+    /// past a run never asks it again. A run that ends just before `close` is extended when the
+    /// bits between are all closes.
+    fn close_run_end(&self, close: usize, text: &[u8]) -> Option<usize> {
+        let mut runs = self.close_runs.borrow_mut();
+        loop {
+            let run = runs.last_mut()?;
+            if close <= run.leaf {
+                return None;
+            }
+            if close > run.hi {
+                let words = self.bp.words();
+                let all_closes = (run.hi + 1..=close)
+                    .all(|p| words.get(p / 64).is_some_and(|w| (w >> (p % 64)) & 1 == 0));
+                if !all_closes {
+                    runs.pop();
+                    continue;
+                }
+                run.hi = close;
+            }
+            if close < run.first {
+                return None;
+            }
+            let mut end = run.end;
+            for _ in close..run.at {
+                // The closer of the close before: the last closer byte before this one.
+                let mut q = end.checked_sub(1)?;
+                loop {
+                    q = q.checked_sub(1)?;
+                    if is_closer(*text.get(q)?) {
+                        break;
+                    }
+                }
+                end = q + 1;
+            }
+            for _ in run.at..close {
+                // The closer of the close after: the first closer byte after this one.
+                let mut i = end;
+                while !is_closer(*text.get(i)?) {
+                    i += 1;
+                }
+                end = i + 1;
+            }
+            run.at = close;
+            run.end = end;
+            return Some(end);
+        }
+    }
+
+    /// Record a run [`JsonCursor::container_end_bp`] scanned, for [`close_run_end`](Self::close_run_end).
+    fn record_close_run(&self, run: CloseRun) {
+        let mut runs = self.close_runs.borrow_mut();
+        if runs.len() == CLOSE_RUN_CAPACITY {
+            runs.pop();
+        }
+        runs.push(run);
     }
 
     /// Convert byte offset to 1-indexed line and column.
@@ -858,6 +975,11 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     /// one big array under one key paid a second pass over itself; this reads the leaf and the
     /// text after it. The kind of an inner closer is not compared with its opener's.
     ///
+    /// The closers read are recorded on the index (`CloseRun`, #5869): the containers along a
+    /// spine share their leaf, and a walk asks them one after another, so each is answered from
+    /// the one asked before it. Rescanning from the leaf every time made `..` over a linear nest
+    /// quadratic in its depth.
+    ///
     /// `None` where the end cannot be told (a leaf that has no span, or fewer closers than
     /// parentheses).
     pub fn container_end_bp(&self) -> Option<usize>
@@ -866,6 +988,11 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     {
         let bp = self.index.bp();
         let close = bp.find_close(self.bp_pos)?;
+        if let Some(end) = self.index.close_run_end(close, self.text) {
+            return Some(end);
+        }
+        #[cfg(test)]
+        CLOSE_RUN_SCANS.with(|n| n.set(n.get() + 1));
         let leaf_open = last_open_before(bp.words(), close)?;
         if leaf_open < self.bp_pos {
             return None;
@@ -881,10 +1008,19 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
             ),
         };
         for _ in 0..closers {
-            while !matches!(self.text.get(i)?, b']' | b'}') {
+            while !is_closer(*self.text.get(i)?) {
                 i += 1;
             }
             i += 1;
+        }
+        if closers > 0 {
+            self.index.record_close_run(CloseRun {
+                leaf: leaf_open,
+                first: close + 1 - closers,
+                hi: close,
+                at: close,
+                end: i,
+            });
         }
         Some(i)
     }
@@ -6215,6 +6351,138 @@ mod tests {
             answered > 500,
             "the sweep must reach the reader: {answered}"
         );
+    }
+
+    /// Every container's cursor in `text`, in document order.
+    fn container_cursors<'a>(index: &'a JsonIndex, text: &'a [u8]) -> Vec<JsonCursor<'a>> {
+        let mut out = Vec::new();
+        let mut stack = vec![index.root(text)];
+        while let Some(c) = stack.pop() {
+            if text
+                .get(c.text_position().unwrap_or(usize::MAX))
+                .is_some_and(|b| matches!(b, b'[' | b'{'))
+            {
+                out.push(c);
+            }
+            let mut kids = Vec::new();
+            let mut child = c.first_child();
+            while let Some(k) = child {
+                kids.push(k);
+                child = k.next_sibling();
+            }
+            stack.extend(kids.into_iter().rev());
+        }
+        out
+    }
+
+    /// #5869: `container_end_bp` answers the same from the closer-run memo as from a scan, in
+    /// whatever order the containers are asked. A fresh index has no memo, so its answer is the
+    /// scan's; the memoed index is asked in document order, in reverse, and interleaved from both
+    /// ends, over spines, combs, empty and scalar leaves, junk between closers and a `]` inside
+    /// a string.
+    #[test]
+    fn test_container_end_bp_memo_agrees_with_the_scan_in_any_order_5869() {
+        let nest = |n: usize, leaf: &str| format!("{}{leaf}{}", "[".repeat(n), "]".repeat(n));
+        let docs = [
+            nest(40, "1"),
+            nest(40, "[]"),
+            nest(40, "{}"),
+            nest(150, r#""a]b""#),
+            // Closers separated by whitespace and by junk the scan skips.
+            "[ [ [ 1 ] ] , [ [ 2 ] @ ] ]".to_string(),
+            "[[1@]]".to_string(),
+            // A comb: each level has a sibling spine of its own.
+            format!(
+                "[{}]",
+                (0..30)
+                    .map(|i| nest(i % 7 + 1, "true"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            format!(
+                r#"{{"a":{},"b":{},"c":[{},{}]}}"#,
+                nest(70, "1"),
+                nest(3, "[]"),
+                nest(5, "null"),
+                nest(80, "{}")
+            ),
+            // Spines under objects, which end in `}`.
+            format!("{}1{}", r#"{"k":"#.repeat(90), "}".repeat(90)),
+            "[[],[[]],[[],[]]]".to_string(),
+        ];
+        for doc in &docs {
+            let text = doc.as_bytes();
+            let n = container_cursors(&JsonIndex::build(text), text).len();
+            let expected: Vec<Option<usize>> = (0..n)
+                .map(|i| {
+                    let fresh = JsonIndex::build(text);
+                    container_cursors(&fresh, text)[i].container_end_bp()
+                })
+                .collect();
+            let orders: [Vec<usize>; 4] = [
+                (0..n).collect(),
+                (0..n).rev().collect(),
+                (0..n).flat_map(|i| [i, n - 1 - i]).collect(),
+                (0..n).map(|i| (i * 7 + 3) % n).collect(),
+            ];
+            for order in orders {
+                let index = JsonIndex::build(text);
+                let cursors = container_cursors(&index, text);
+                for i in order {
+                    assert_eq!(cursors[i].container_end_bp(), expected[i], "{doc} @ {i}");
+                    // Asked twice in a row: the second is answered from the memo it just wrote.
+                    assert_eq!(
+                        cursors[i].container_end_bp(),
+                        expected[i],
+                        "{doc} @ {i} again"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #5869: a walk down a linear nest scans its closers once, not once per level. The count is
+    /// of scans, not time, so it fails if the per-level rescan returns, at a depth a debug build
+    /// walks in milliseconds.
+    #[test]
+    fn test_container_end_bp_scans_a_spine_once_5869() {
+        const DEPTH: usize = 20_000;
+        for leaf in ["1", "[]", r#""x]""#] {
+            let doc = format!("{}{leaf}{}", "[".repeat(DEPTH), "]".repeat(DEPTH));
+            let text = doc.as_bytes();
+            let index = JsonIndex::build(text);
+            let cursors = container_cursors(&index, text);
+            CLOSE_RUN_SCANS.with(|n| n.set(0));
+            for c in &cursors {
+                assert!(c.container_end_bp().is_some());
+            }
+            let scans = CLOSE_RUN_SCANS.with(Cell::get);
+            assert!(
+                scans <= 2,
+                "{leaf}: {scans} scans for {} containers",
+                cursors.len()
+            );
+        }
+    }
+
+    /// #5869: the memo holds a bounded number of runs, and a lookup past all of them still
+    /// answers by the scan.
+    #[test]
+    fn test_container_end_bp_memo_is_bounded_5869() {
+        let one = |i: usize| format!("{}{i}{}", "[".repeat(3), "]".repeat(3));
+        let doc = format!(
+            "[{}]",
+            (0..(CLOSE_RUN_CAPACITY * 3))
+                .map(one)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let text = doc.as_bytes();
+        let index = JsonIndex::build(text);
+        for c in container_cursors(&index, text) {
+            let _ = c.container_end_bp();
+            assert!(index.close_runs.borrow().len() <= CLOSE_RUN_CAPACITY);
+        }
     }
 
     /// #5654: `last_open_before` finds the last 1 bit below `end`, across word boundaries, at a
