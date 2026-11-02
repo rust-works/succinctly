@@ -5783,28 +5783,40 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 jq::seed_remaining_inputs(Vec::new(), locations.exhausted(args.slurp));
             } else if let Some(lazy) = LAZY_JSON_INPUTS.with(|slot| slot.borrow_mut().take()) {
                 // #5661: a clean single-source stream whose documents are converted as the
-                // program reads them. `inputs` is empty; `locations` holds every document's
-                // line, and no parse error is queued (the route is taken only without one).
-                debug_assert_eq!(lazy.spans.len(), locations.per_value().len());
+                // program reads them. `inputs` is empty, and so is `locations`' line table: each
+                // document's line is counted when it is read, one forward pass over the text in
+                // all. No parse error is queued (the route is taken only without one).
+                debug_assert_eq!(locations.per_value(), &[]);
+                let count = lazy.spans.len();
+                let source = lazy.source;
+                // The counter's place in the text, kept between reads without a borrow of it.
+                let mut lines = LineCounter::at_seam(lazy.text.as_bytes(), lazy.seam).place();
                 let materialize = move |index: usize| {
+                    let bytes = lazy.text.as_bytes();
                     let (start, end) = lazy.spans[index];
+                    let mut counter = LineCounter::resume(bytes, lines);
+                    let line = counter.read_end_line(end);
+                    lines = counter.place();
                     debug_assert!(
-                        json_depth_at_most(&lazy.text.as_bytes()[start..end], LAZY_JSON_MAX_DEPTH),
+                        json_depth_at_most(&bytes[start..end], LAZY_JSON_MAX_DEPTH),
                         "a lazily converted document is within the depth the route admits"
                     );
                     // Serde accepted the span as a whole value and its depth is bounded
                     // (`lazy_json_spans`), so it is the conversion the eager route made, minus
                     // a position only a depth error would have read.
-                    stream_document_validated(
-                        &lazy.text.as_bytes()[start..end],
+                    let converted = stream_document_validated(
+                        &bytes[start..end],
                         None,
                         &[],
                         0,
                         DocumentForm::Value,
-                    )
+                    );
+                    // Narrowed as `InputLocations::push` narrows the eager route's lines.
+                    (line as u32, converted)
                 };
                 jq::seed_remaining_inputs_lazily(
-                    locations.per_value().iter().copied(),
+                    source,
+                    count,
                     Box::new(materialize),
                     locations.exhausted(args.slurp),
                 );
@@ -6683,11 +6695,17 @@ fn get_inputs(
     // file's own bytes. `--slurp` answers `<unknown>` regardless, JSON `--seq`
     // keeps its own record-boundary rules (#2947, #3003), and DSV has no jq
     // oracle.
-    let eof_tail = (track_eof && !args.slurp && !seq_stream_shape && args.input_dsv.is_none())
-        .then(|| {
-            let sources: Vec<&[u8]> = raw_bytes.iter().map(|(_, raw)| raw.as_slice()).collect();
-            EofTail::of(&sources, args.raw_input, &seams, args.stream)
-        });
+    let records_eof = track_eof && !args.slurp && !seq_stream_shape && args.input_dsv.is_none();
+    // #5661: a stream that may take the lazy route defers this until that route has decided. Its
+    // spans answer it without the strict scan (`EofTail::of_clean_source`), and the scan runs
+    // only if the route turns the stream down, or here, over the bytes as read, for a stream
+    // that is not UTF-8.
+    let lazy_candidate =
+        records_eof && json_input_mode && args.null_input && !args.stream && raw_bytes.len() == 1;
+    let mut eof_tail = (records_eof && !lazy_candidate).then(|| {
+        let sources: Vec<&[u8]> = raw_bytes.iter().map(|(_, raw)| raw.as_slice()).collect();
+        EofTail::of(&sources, args.raw_input, &seams, args.stream)
+    });
 
     // All reads happen first, then decoding: a later file's read error still
     // outranks an earlier file's content error, as it did before.
@@ -6716,6 +6734,9 @@ fn get_inputs(
                 if args.validate && json_input_mode {
                     let filename = file_idx.map(|idx| files[idx].to_string_lossy().to_string());
                     validate_json_input(e.as_bytes(), filename.as_deref())?;
+                }
+                if lazy_candidate {
+                    eof_tail = Some(EofTail::of(&[e.as_bytes()], false, &seams, false));
                 }
                 if args.raw_input && !args.slurp {
                     // #1742: real jq's non-slurp `-R` applies this
@@ -6961,18 +6982,32 @@ fn get_inputs(
                     // #5661: `-n` over one clean plain-JSON source converts each document when
                     // the program reads it, so `first(inputs)` neither parses nor holds the rest.
                     // Anything unusual (an error, a BOM, a deep document) takes the route below.
+                    // Each document's line is counted when it is read, and the end of the
+                    // stream comes from its spans (#5661, `EofTail::of_clean_source`).
                     if args.null_input && !args.stream && pos == 0 && last == 0 {
                         if let Some(spans) = lazy_json_spans(&raw) {
-                            let ends: Vec<usize> = spans.iter().map(|&(_, end)| end).collect();
-                            locations.extend_from_ends(src, &raw, seam, &ends, spans.len());
+                            // Set already only for a stream that is not UTF-8, the one case
+                            // whose seam the substitution moves.
+                            if locations.eof_tail.is_none() {
+                                debug_assert_eq!(seam, Seam::NONE, "a lone source is unstitched");
+                                locations.eof_tail =
+                                    Some(EofTail::of_clean_source(raw.as_bytes(), &spans));
+                            }
                             LAZY_JSON_INPUTS.with(|slot| {
                                 *slot.borrow_mut() = Some(LazyJsonInputs {
                                     text: std::rc::Rc::new(raw),
                                     spans,
+                                    source: src as u32,
+                                    seam,
                                 });
                             });
                             lazy_inputs = true;
                             continue;
+                        }
+                        // Turned down: the scan this stream's deferral skipped.
+                        if locations.eof_tail.is_none() {
+                            locations.eof_tail =
+                                Some(EofTail::of(&[raw.as_bytes()], false, &seams, false));
                         }
                     }
                     let documents_before = values.len();
@@ -7195,6 +7230,14 @@ fn get_inputs(
             }
         }
     }
+
+    // #5661: a lazy candidate's tail is set on whichever route took the stream, as every other
+    // stream's is above.
+    debug_assert_eq!(
+        locations.eof_tail.is_some(),
+        records_eof,
+        "the end of stream is recorded where it can be read"
+    );
 
     // #4397: `--stream` feeds the program `tostream`'s events in place of each document, `-s`
     // slurping the events and `input`/`inputs` reading them. Each event keeps its document's
@@ -7626,16 +7669,7 @@ impl EofTail {
         let Some((&last, earlier)) = sources.split_last() else {
             return false;
         };
-        let base = seam.base.min(last.len());
-        // Where the final read starts: reads restart after each newline and
-        // take at most `JQ_READ_CHUNK` bytes, so a last line that fills its
-        // reads exactly leaves an empty final read.
-        let line_start = last[base..]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(base, |at| base + at + 1);
-        let partial = (last.len() - line_start) % JQ_READ_CHUNK;
-        let final_read = last.len() - partial;
+        let final_read = Self::final_read_start(last, seam.base.min(last.len()));
         // The last thing jq completes in this source: a value, or a parse error
         // where its reads meet the fault. Past a fault jq resumes at its next
         // read (#4311), so the stream's last event may follow one.
@@ -7646,11 +7680,7 @@ impl EofTail {
             let (values, malformed) = split_json_values_strict(&last[offset..]);
             if let Some(&(start, end)) = values.last() {
                 // At `last.len()` for a bare token that the end of input completes.
-                last_event = Some(if matches!(last[offset + start], b'"' | b'[' | b'{') {
-                    offset + end - 1
-                } else {
-                    offset + end
-                });
+                last_event = Some(offset + Self::completes_at(&last[offset..], start, end));
             }
             let Some(start) = malformed else {
                 break;
@@ -7669,6 +7699,44 @@ impl EofTail {
             // end when it is empty, and that is the final read only when the
             // whole of this source is.
             None => final_read == 0 && Self::ends_in_bare_token(earlier),
+        }
+    }
+
+    /// Where jq completes the value spanning `start..end` of `bytes`: a string or container on
+    /// its closing byte, a number or literal at the byte after it (or at the end of input).
+    fn completes_at(bytes: &[u8], start: usize, end: usize) -> usize {
+        if matches!(bytes[start], b'"' | b'[' | b'{') {
+            end - 1
+        } else {
+            end
+        }
+    }
+
+    /// Where the read that reaches the end of `last` starts. Reads restart after each newline
+    /// and take at most [`JQ_READ_CHUNK`] bytes, so a last line that fills its reads exactly
+    /// leaves an empty final read. The first `base` bytes are not this source's (#4316).
+    fn final_read_start(last: &[u8], base: usize) -> usize {
+        let line_start = last[base..]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(base, |at| base + at + 1);
+        let partial = (last.len() - line_start) % JQ_READ_CHUNK;
+        last.len() - partial
+    }
+
+    /// [`of`](Self::of) for the one source [`lazy_json_spans`] accepted, from the spans it found
+    /// (#5661). Such a stream has no fault, so its last event is its last document, which
+    /// completes on its closing byte or, for a number or literal, at the byte after it: the
+    /// answer [`json_value_completes_in_final_read`](Self::json_value_completes_in_final_read)
+    /// reaches with a strict scan of the whole source.
+    fn of_clean_source(bytes: &[u8], spans: &[(usize, usize)]) -> Self {
+        let final_read = Self::final_read_start(bytes, 0);
+        let unknown = spans
+            .last()
+            .is_some_and(|&(start, end)| Self::completes_at(bytes, start, end) >= final_read);
+        Self {
+            newlines: count_newlines(bytes) as u32,
+            unknown,
         }
     }
 
@@ -8203,6 +8271,17 @@ struct LineCounter<'a> {
     seam: Seam,
 }
 
+/// A [`LineCounter`]'s position without its text (#5661): only [`LineCounter::resume`] over
+/// the text it was taken from can count from it.
+#[derive(Debug, Clone, Copy)]
+struct LinePlace {
+    pos: usize,
+    newlines_before_pos: usize,
+    line_start: usize,
+    next_newline: Option<usize>,
+    seam: Seam,
+}
+
 impl<'a> LineCounter<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self::at_seam(bytes, Seam::NONE)
@@ -8221,6 +8300,29 @@ impl<'a> LineCounter<'a> {
             line_start: base,
             next_newline: None,
             seam,
+        }
+    }
+
+    /// Where this counter is in its text, kept without a borrow of it between calls (#5661).
+    fn place(&self) -> LinePlace {
+        LinePlace {
+            pos: self.pos,
+            newlines_before_pos: self.newlines_before_pos,
+            line_start: self.line_start,
+            next_newline: self.next_newline,
+            seam: self.seam,
+        }
+    }
+
+    /// The counter [`place`](Self::place) took, over the same `bytes`, to go on counting them.
+    fn resume(bytes: &'a [u8], place: LinePlace) -> Self {
+        Self {
+            bytes,
+            pos: place.pos,
+            newlines_before_pos: place.newlines_before_pos,
+            line_start: place.line_start,
+            next_newline: place.next_newline,
+            seam: place.seam,
         }
     }
 
@@ -8999,6 +9101,10 @@ fn find_json_values(bytes: &[u8]) -> core::result::Result<Vec<(usize, usize)>, u
 struct LazyJsonInputs {
     text: std::rc::Rc<String>,
     spans: Vec<(usize, usize)>,
+    /// The source tag of every document.
+    source: u32,
+    /// The source's [`Seam`], which its line counting starts from.
+    seam: Seam,
 }
 
 thread_local! {
@@ -13675,6 +13781,41 @@ mod tests {
         assert!(spans(&in_string).is_some());
     }
 
+    /// #5661: the lazy route's end of stream, read off its spans, is the one the strict scan of
+    /// [`EofTail::of`] finds, over every shape #4303 turns on: a last line of 4093 to 4096 bytes
+    /// ending in a bare token or a container, trailing blank lines, CRLF, no trailing newline,
+    /// an empty last line and bare tokens only. The pin must be able to fail: it does, with
+    /// `of_clean_source` comparing with `>` or counting a container as complete at its end.
+    #[test]
+    fn of_clean_source_agrees_with_the_strict_scan_5661() {
+        let mut streams: Vec<String> = Vec::new();
+        for last_len in [1usize, 4093, 4094, 4095, 4096, 8190, 8191] {
+            for last in ["1", "[1]", "\"s\"", "true", "{\"a\":1}"] {
+                let pad = " ".repeat(last_len.saturating_sub(last.len()));
+                for lead in ["", "2\n", "[3]\r\n"] {
+                    for tail in ["", "\n", "\n\n", "\r\n", " ", "\n "] {
+                        streams.push(format!("{lead}{pad}{last}{tail}"));
+                        streams.push(format!("{lead}{last}{pad}{tail}"));
+                    }
+                }
+            }
+        }
+        streams.extend(["1 2 3", "1\n2\n3", "null", "\n\n1\n\n"].map(String::from));
+        let mut checked = 0;
+        for text in &streams {
+            let spans = lazy_json_spans(text).expect("a clean stream");
+            let bytes = text.as_bytes();
+            assert_eq!(
+                EofTail::of_clean_source(bytes, &spans),
+                EofTail::of(&[bytes], false, &[], false),
+                "{:?}",
+                text.get(text.len().saturating_sub(12)..).unwrap_or(text)
+            );
+            checked += 1;
+        }
+        assert!(checked > 600);
+    }
+
     /// #5661: `-n` over one clean plain-JSON file leaves its documents unconverted for the queue,
     /// and every other shape still reads them up front. The pin must be able to fail: it does,
     /// with `lazy_json_spans` made to answer `None`.
@@ -13698,19 +13839,41 @@ mod tests {
             let lazy = LAZY_JSON_INPUTS.with(|slot| slot.borrow_mut().take());
             (
                 inputs,
-                locations.per_value().to_vec(),
+                (locations.per_value().to_vec(), locations.eof_tail),
                 trailing.is_some(),
                 resumed.len(),
                 lazy,
             )
         };
         let clean = write("clean.json", "1\n{\"a\":2}\n[3]\n");
-        let (inputs, lines, trailing, resumed, lazy) = read(&["jq", "-n", "inputs", &clean]);
+        let (inputs, (lines, tail), trailing, resumed, lazy) =
+            read(&["jq", "-n", "inputs", &clean]);
         assert_eq!(inputs, Vec::<OwnedValue>::new());
-        assert_eq!(lines.len(), 3);
+        // No line table up front: each document's line is counted when it is read.
+        assert_eq!(lines, Vec::new());
+        assert_eq!(
+            tail,
+            Some(EofTail {
+                newlines: 3,
+                unknown: false
+            })
+        );
         assert!(!trailing && resumed == 0);
         let lazy = lazy.expect("deferred");
         assert_eq!(lazy.spans, vec![(0, 1), (2, 9), (10, 13)]);
+        // A stream the route turns down still gets the end the strict scan finds.
+        let bare_end = write("bare_end.json", "1\n2\n007");
+        let (_, (_, tail), ..) = read(&["jq", "-n", "inputs", &bare_end]);
+        let scanned = EofTail::of(&[b"1\n2\n007".as_slice()], false, &[], false);
+        assert_eq!(tail, Some(scanned));
+        // So does one that is not UTF-8, from its bytes as read.
+        let path = dir.path().join("latin1.json");
+        std::fs::write(&path, b"\"\xe9\"\n1").unwrap();
+        let latin1 = path.to_string_lossy().into_owned();
+        let (inputs, (_, tail), ..) = read(&["jq", "-n", "inputs", &latin1]);
+        assert!(inputs.is_empty(), "the substituted text is still clean");
+        let scanned = EofTail::of(&[b"\"\xe9\"\n1".as_slice()], false, &[], false);
+        assert_eq!(tail, Some(scanned));
         // Not under `-n`, with `-s`, with `--stream`, or with a stream that turns malformed.
         let broken = write("broken.json", "1\n2\n}\n");
         for argv in [
