@@ -53,7 +53,11 @@ those (`--full` adds the lints CI runs: three clippy invocations, rustdoc, `--no
 `list` shows the gates). `.claude/settings.json` runs it as a `PreToolUse` hook, so an agent's
 `git push` is blocked while it fails -- `--no-verify` does not skip it. `PRE_PUSH_SKIP="gate ..."`
 skips named gates (as a prefix of the push, `PRE_PUSH_SKIP=ledger-only git push`, for an agent), and a
-skip is always printed. The gates are checked against
+skip is always printed.
+The hook reads only the command text, so `git -C "$WT" push` is resolved from a `WT=...` assignment earlier in the
+same command (`WT=/path; git -C "$WT" push`), as the shell would: repeat the assignment in every call, since a variable
+set in an earlier call is gone, and a prefix assignment (`WT=/path git -C "$WT" push`) does not count. A directory it
+still cannot resolve, or that is no repository, is refused rather than let through (#5850). The gates are checked against
 `.github/workflows/*.yml` by `python3 scripts/test_pre_push.py`: a new CI gate has to be mirrored in
 `scripts/pre_push.py` or listed there as deliberately not (#5585).
 
