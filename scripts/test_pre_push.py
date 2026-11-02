@@ -270,10 +270,12 @@ class PushDetectionTests(unittest.TestCase):
             'WT=/x/y; cd "$WT" && git push',
             'WT=/x/y; cd "$WT" && git -C "$WT" push',
             'export WT=/x/y && git -C "$WT" push',
-            'WT=/x/y git -C "$WT" push',
-            'env WT=/x/y git -C "$WT" push',
+            'declare -x WT=/x/y; git -C "$WT" push',
+            'WT=/x/y bash -c \'git -C "$WT" push\'',
+            'export WT=/x/y; bash -c \'git -C "$WT" push\'',
             'WT=/x/y; git -C ${WT} push',
             "bash -c 'WT=/x/y; git -C \"$WT\" push'",
+            'true; WT=/x && WT=/x/y && git -C "$WT" push',
             'A=/x; B=$A/y; git -C "$B" push',
         ):
             self.assertEqual(self.pushes(command), ["/x/y"], command)
@@ -292,10 +294,26 @@ class PushDetectionTests(unittest.TestCase):
             'WT=`pwd`; git -C "$WT" push',
             'WT=/x; git -C "$OTHER" push',
             'cd "$WT"; git -C sub push',
+            # The shell expands a prefix assignment's neighbours first, and it ends with its command.
+            'WT=/x/y git -C "$WT" push',
+            'env WT=/x/y git -C "$WT" push',
+            'WT=/x/y git status; git -C "$WT" push',
+            # An assignment that may not have run, or ran in a subshell, leaves the variable unknown.
+            '(WT=/x/y); git -C "$WT" push',
+            'false && WT=/x/y; git -C "$WT" push',
+            'WT=/x/y || WT=/x/z; git -C "$WT" push',
+            'WT=/x/y | cat; git -C "$WT" push',
+            'cargo build && WT=/x/y; git -C "$WT" push',
+            # A child shell sees only what was exported.
+            "WT=/x/y; bash -c 'git -C \"$WT\" push'",
         ):
             found = pre_push.pushes(command, "/work")
             self.assertEqual(len(found), 1, command)
             self.assertIsInstance(found[0][0], pre_push.Unresolved, command)
+        # `$PWD` is the directory the hook was given, then wherever a resolved `cd` went.
+        self.assertEqual(self.pushes('git -C "$PWD" push', "/work"), ["/work"])
+        self.assertEqual(self.pushes('cd sub; git -C "$PWD" push', "/work"), ["/work/sub"])
+        self.assertEqual(self.pushes('cd "$PWD/sub" && git push', "/work"), ["/work/sub"])
         # An absolute path after an unresolved one is a path again.
         self.assertEqual(self.pushes('cd "$WT"; git -C /abs push'), ["/abs"])
         self.assertNotIsInstance(pre_push.pushes('cd "$WT"; git -C /abs push', "/w")[0][0], pre_push.Unresolved)
