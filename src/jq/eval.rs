@@ -13368,6 +13368,32 @@ fn closed_expr_to_owned_at_depth<S: EvalSemantics>(
     Some(value)
 }
 
+/// [`closed_expr_to_owned_node`]'s `IndexExpr` arm (#5774): the target and the key are each one
+/// closed value, and the step is the navigation `.[k]` / `.k` the pipe stages answer. A key that
+/// is not an integer or a string, or a step that raises, declines. Its own function, not inline
+/// in the arm: the walk recurses to `MAX_VALUE_TREE_DEPTH` levels on a thread's stack, and a
+/// local added to the arm's frame is paid at every level (it overflowed a 2 MB test thread on
+/// ARM64 Linux).
+#[inline(never)]
+fn closed_index_expr<S: EvalSemantics>(
+    target: &Expr,
+    key: &Expr,
+    depth: usize,
+    escaped: &mut bool,
+) -> Option<OwnedValue> {
+    let held = closed_expr_to_owned_at_depth::<S>(target, depth + 1, escaped)?;
+    let key = closed_expr_to_owned_at_depth::<S>(key, depth + 1, escaped)?;
+    let step = match key {
+        OwnedValue::Int(idx) => Expr::Index { idx, key: None },
+        OwnedValue::String(name) => Expr::Field(name.to_string()),
+        _ => return None,
+    };
+    match eval_owned_fast_path::<S>(&step, &held, false) {
+        Some(Ok(Some(next))) => Some(next),
+        _ => None,
+    }
+}
+
 fn closed_expr_to_owned_node<S: EvalSemantics>(
     expr: &Expr,
     depth: usize,
@@ -13410,17 +13436,7 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
         // and keeps the evaluator's own route and text -- an integral float key (`$d[$i / 2 | floor]`)
         // too. jq mode only, like the operators below.
         Expr::IndexExpr { target, key } if S::TAG == EvalTag::Jq => {
-            let held = closed_expr_to_owned_at_depth::<S>(target, depth + 1, escaped)?;
-            let key = closed_expr_to_owned_at_depth::<S>(key, depth + 1, escaped)?;
-            let step = match key {
-                OwnedValue::Int(idx) => Expr::Index { idx, key: None },
-                OwnedValue::String(name) => Expr::Field(name.to_string()),
-                _ => return None,
-            };
-            match eval_owned_fast_path::<S>(&step, &held, false) {
-                Some(Ok(Some(next))) => Some(next),
-                _ => None,
-            }
+            closed_index_expr::<S>(target, key, depth, escaped)
         }
         // #5733: `"k\($i)"` with every slot closed, so one value per slot and one string.
         // Without this arm an interpolated key sent a fold step through the re-index bridge,
