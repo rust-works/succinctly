@@ -8,22 +8,9 @@ See [yq Language Reference](../reference/yq-language.md) for implemented feature
 
 ## Operators
 
-| Operator               | yq v4.53.3                          | succinctly                                     |
-|------------------------|-------------------------------------|------------------------------------------------|
-| `eval(expr)`           | Evaluates a string as an expression | `eval/1 is not defined`                        |
-| `with_dtf(fmt; expr)`  | Sets the datetime format for `expr` | `with_dtf/2 is not defined` (#5863)            |
-| `format_datetime(fmt)` | Formats a timestamp                 | `format_datetime/1 is not defined` (#5863)     |
-| `tz(zone)`             | Converts a timestamp to a zone      | Raises `math function requires number` (#5863) |
-
-## Date Arithmetic (#5863)
-
-```bash
-.time += "3h10m"   # yq adds the duration; succinctly concatenates the strings, exit 0
-.time -= "24h"     # yq subtracts it; succinctly raises "cannot be subtracted"
-```
-
-`from_unix` renders in UTC where yq uses the local zone, and `now | type` is `!!float` where yq
-says `!!timestamp` (#5863).
+| Operator     | yq v4.53.3                          | succinctly              |
+|--------------|-------------------------------------|-------------------------|
+| `eval(expr)` | Evaluates a string as an expression | `eval/1 is not defined` |
 
 ## Format Encoders
 
@@ -39,6 +26,11 @@ says `!!timestamp` (#5863).
 | `--yaml-fix-merge-anchor-to-spec` | Merge `<<` per the YAML spec instead of yq's default; not accepted here |
 
 ## Removed From This List
+
+- **Datetime operators** (`with_dtf`, `format_datetime`, `tz`, and `+`/`-` of a duration to a
+  timestamp, `.time += "3h10m"`): implemented, with `now` and `from_unix` in the local zone (#5863).
+  `now | type` is `!!str` here, and the other differences are in
+  [limitations.md](../compliance/yq/limitations.md).
 
 - **Merge keys** (`<<: *alias`): implemented; reads match yq's default, and the differences in key
   lists, writes and encoders are in [limitations.md](../compliance/yq/limitations.md) (#3556).

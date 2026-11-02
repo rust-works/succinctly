@@ -114,6 +114,7 @@ pub mod utf8_document;
 pub mod share_stats;
 mod value;
 pub mod walk;
+mod yq_datetime;
 
 pub use error::{BinOp, Control, ErrorKind, EvalError, EvalErrorPayload};
 pub(crate) use eval::last_as_reduce;

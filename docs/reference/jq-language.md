@@ -273,6 +273,8 @@ below and [ADR-0019](../adrs/adr-0019.md).
 - [x] `from_unix` - Convert Unix epoch to ISO 8601 string (yq extension)
 - [x] `to_unix` - Parse ISO 8601 string to Unix epoch (yq extension)
 - [x] `tz(zone)` - Convert Unix timestamp to datetime in specified timezone (yq extension)
+- [x] `format_datetime(layout)` - Write a timestamp's text with a Go layout (yq extension, #5863; jq has no such builtin)
+- [x] `with_dtf(layout; expr)` - Evaluate `expr` with a Go datetime layout; in jq mode only `format_datetime` reads it (yq extension, #5863)
 
 For broken-down-time arrays, jq converts each numeric field to a signed 32-bit
 integer. `strftime`, `todate`, and `todateiso8601` can display out-of-range

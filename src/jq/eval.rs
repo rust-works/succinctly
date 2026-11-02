@@ -15732,11 +15732,64 @@ pub(crate) fn arith_combine<S: EvalSemantics>(
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
     if S::TAG == EvalTag::Yq {
+        if let Some(result) = yq_timestamp_arith::<S>(op, &left, &right) {
+            return result;
+        }
         if let Some(result) = yq_prefixed_int_arith(op, &left, &right) {
             return result;
         }
     }
     arith_combine_plain::<S>(op, left, right)
+}
+
+/// yq's date arithmetic (#5863): a timestamp on the left of `+` or `-` adds or subtracts the
+/// duration the right operand's text spells (`.t += "3h10m"`, `.t -= "24h"`), and is written
+/// back under the datetime layout; `None` when the left operand is not a timestamp. A string
+/// stands for yq's `!!timestamp` when it reads as one (see `super::yq_datetime`).
+///
+/// Any other string on the left of `-` is yq's `strings cannot be subtracted` against a scalar,
+/// and `!!seq () cannot be subtracted from !!str` (or `!!timestamp`) against a container
+/// (`subtractScalars`, v4.53.3). A container on the right of `+` keeps its own error.
+fn yq_timestamp_arith<S: EvalSemantics>(
+    op: ArithOp,
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> Option<Result<OwnedValue, EvalError>> {
+    let subtract = match op {
+        ArithOp::Add => false,
+        ArithOp::Sub => true,
+        _ => return None,
+    };
+    let OwnedValue::String(left) = left else {
+        return None;
+    };
+    let Some(right_text) = yq_scalar_text::<S>(right) else {
+        if !subtract {
+            return None;
+        }
+        let left_tag = if super::yq_datetime::is_timestamp(left) {
+            "!!timestamp"
+        } else {
+            "!!str"
+        };
+        let right_tag = if matches!(right, OwnedValue::Array(_)) {
+            "!!seq"
+        } else {
+            "!!map"
+        };
+        return Some(Err(EvalError::new(format!(
+            "{right_tag} () cannot be subtracted from {left_tag}"
+        ))));
+    };
+    match super::yq_datetime::add_duration(left, &right_text, subtract) {
+        Some(result) => Some(
+            result
+                .map(|text| OwnedValue::String(text.into()))
+                .map_err(EvalError::new),
+        ),
+        None if subtract => Some(Err(EvalError::new("strings cannot be subtracted"))),
+        None => None,
+    }
 }
 
 /// [`arith_combine`] for operands that carry no hex or octal spelling.
@@ -16961,14 +17014,10 @@ pub(crate) fn yq_time_comparison<S: EvalSemantics>(
     let OwnedValue::String(left) = left else {
         return None;
     };
-    let left = super::go_time::yq_datetime(left)?;
     let right_text = yq_scalar_text::<S>(right)?;
-    Some(match super::go_time::yq_datetime(&right_text) {
-        Some(right) => Ok((left, right)),
-        None => Err(EvalError::new(
-            super::go_time::yq_datetime_error(&right_text).unwrap_or_default(),
-        )),
-    })
+    // Under `with_dtf`, both are read under its layout (#5863).
+    super::yq_datetime::compare_instants(left, &right_text)
+        .map(|result| result.map_err(EvalError::new))
 }
 
 /// The answer of `op` for two instants.
@@ -18487,7 +18536,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
 
         // Phase 12: Additional builtins
-        Builtin::Now => builtin_now::<W>(),
+        Builtin::Now => builtin_now::<W, S>(),
         Builtin::Input => builtin_input::<W, S>(),
         Builtin::Inputs => builtin_inputs::<W, S>(),
         Builtin::InputLineNumber => builtin_input_line_number::<W, S>(),
@@ -18542,6 +18591,8 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::FromUnix => builtin_from_unix::<W, S>(value, optional),
         Builtin::ToUnix => builtin_to_unix::<W, S>(value, optional),
         Builtin::Tz(zone) => builtin_tz::<W, S>(zone, value, optional),
+        Builtin::FormatDatetime(format) => builtin_format_datetime::<W, S>(format, value, optional),
+        Builtin::WithDtf(layout, body) => builtin_with_dtf::<W, S>(layout, body, value, optional),
 
         // Phase 22: File operations (yq)
         Builtin::Load(file_expr) => builtin_load::<W, S>(file_expr, value, optional),
@@ -37964,6 +38015,8 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::Trunc
         | Builtin::TruncateStream(_)
         | Builtin::Tz(_)
+        | Builtin::FormatDatetime(_)
+        | Builtin::WithDtf(_, _)
         | Builtin::Unique
         | Builtin::UniqueBy(_)
         | Builtin::UpperIn(_)
@@ -49225,6 +49278,63 @@ fn resolve_skip_sink<'a, S: EvalSemantics>(
     flow_result(escape)
 }
 
+/// `with_dtf(layout; f)` in path position (#5863): the paths of `f`, resolved with `layout` in
+/// effect. They are delivered once the scope has closed, so whatever the sink evaluates for them
+/// (an update's right side) runs under the layout outside it, as in yq:
+/// `with_dtf("2006"; .t) |= . + "1h"` adds the hour under RFC 3339.
+#[allow(clippy::too_many_arguments)]
+fn resolve_with_dtf_sink<'a, S: EvalSemantics>(
+    layout_expr: &Expr,
+    body: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    let (layouts, escape) = eval_owned_multi_keep_partial::<S>(layout_expr, value);
+    if escape.is_some() {
+        return flow_result(escape);
+    }
+    let Some(layout) = layouts.first() else {
+        return ResolveFlow::Escaped(
+            EvalError::new("could not get date time format: could not find layout for format_time")
+                .into(),
+        );
+    };
+    let layout = yq_scalar_text::<S>(layout)
+        .map(Cow::into_owned)
+        .unwrap_or_default();
+    #[cfg(feature = "std")]
+    {
+        let mut branches = Vec::new();
+        let flow = super::yq_datetime::with_layout(layout, || {
+            resolve_node_sink::<S>(
+                body,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                &mut |branch| {
+                    branches.push(branch);
+                    Demand::Continue
+                },
+            )
+        });
+        if emit_branches(branches, sink) == Demand::Stop {
+            return ResolveFlow::Stopped;
+        }
+        flow
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (layout, body, trackable, snapshot, frame, keep, sink);
+        ResolveFlow::Escaped(EvalError::new("with_dtf requires the std feature").into())
+    }
+}
+
 /// Collecting adapter over [`resolve_node_sink`] — the shape every caller
 /// that still wants a materialized `Vec<PathBranch>` uses.
 ///
@@ -50044,6 +50154,11 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // rejected as "Invalid path expression".
         Expr::Builtin(Builtin::Skip(n, expr)) => {
             resolve_skip_sink::<S>(n, expr, value, trackable, snapshot, frame, keep, sink)
+        }
+        // #5863: `with_dtf(layout; f)` names the paths `f` names, so a write through it lands
+        // (`with_dtf("2006"; .a) = 5` writes `.a` in yq v4.53.3).
+        Expr::Builtin(Builtin::WithDtf(layout, body)) => {
+            resolve_with_dtf_sink::<S>(layout, body, value, trackable, snapshot, frame, keep, sink)
         }
 
         // #2746: `last(f)`, `isempty(f)` and `INDEX(stream; idx_expr)` all
@@ -93706,18 +93821,26 @@ fn delete_path_steps(
 // Phase 12: Additional builtins
 
 /// Builtin: now - current Unix timestamp
-fn builtin_now<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+///
+/// yq's `now` is a `!!timestamp`: RFC 3339 text in the local zone, with no fraction (#5863).
+fn builtin_now<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult<'a, W> {
     #[cfg(feature = "std")]
     {
         use std::time::{SystemTime, UNIX_EPOCH};
         match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) if S::TAG == EvalTag::Yq => QueryResult::Owned(OwnedValue::String(
+                super::yq_datetime::now(duration.as_nanos() as i128).into(),
+            )),
             Ok(duration) => QueryResult::Owned(OwnedValue::Float(duration.as_secs_f64())),
             Err(_) => QueryResult::Error(EvalError::new("failed to get current time")),
         }
     }
     #[cfg(not(feature = "std"))]
     {
-        // no_std environment - return 0.0 as a fallback
+        // no_std environment - the epoch as a fallback
+        if S::TAG == EvalTag::Yq {
+            return QueryResult::Owned(OwnedValue::String(super::yq_datetime::now(0).into()));
+        }
         QueryResult::Owned(OwnedValue::Float(0.0))
     }
 }
@@ -96512,6 +96635,13 @@ fn builtin_from_unix<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(r) => return r,
     };
 
+    // yq's `from_unix` is a `!!timestamp` in the local zone (#5863); the range check above stays.
+    if S::TAG == EvalTag::Yq {
+        return QueryResult::Owned(OwnedValue::String(
+            super::yq_datetime::from_unix(timestamp).into(),
+        ));
+    }
+
     let result = format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         t.year, t.month, t.day, t.hour, t.minute, t.second
@@ -96529,6 +96659,17 @@ fn builtin_to_unix<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
+    // yq reads the text under the datetime layout, as `time.Parse` does (#5863).
+    if S::TAG == EvalTag::Yq {
+        let text = match yq_node_text::<W, S>(&value) {
+            Ok(text) => text,
+            Err(e) => return suppress_or_raise(e, optional),
+        };
+        return match super::yq_datetime::to_unix(&text) {
+            Ok(secs) => QueryResult::Owned(OwnedValue::Int(secs)),
+            Err(e) => suppress_or_raise(EvalError::new(e), optional),
+        };
+    }
     // to_unix parses a lenient ISO 8601 string to a Unix timestamp (not jq's strict `fromdate`, #4967)
     match builtin_fromdate::<W>(value, optional) {
         QueryResult::Owned(OwnedValue::Float(n))
@@ -96820,6 +96961,9 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if S::TAG == EvalTag::Yq {
+        return builtin_yq_tz::<W, S>(zone_expr, value, optional);
+    }
     // Get the timestamp from input (wording kept as it was; see `todate`)
     let timestamp = match get_float_value_with::<W, S>(&value, optional, || {
         EvalError::new("math function requires number")
@@ -96862,6 +97006,146 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::String(result.into()))
         },
     )
+}
+
+/// yq's `getStringParameter` (#5863): the text of the first output of `arg` evaluated on the
+/// input, or yq's `could not find <name> for format_time` when it has none. An argument's own
+/// error, anywhere in its outputs, is the answer.
+fn yq_string_parameter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    arg: &Expr,
+    value: &StandardJson<'a, W>,
+    optional: bool,
+    name: &str,
+) -> Result<String, QueryResult<'a, W>> {
+    let (outputs, trailing) =
+        stream_outputs::<_, S>(eval_single::<W, S>(arg, value.clone(), optional));
+    if let Some(control) = trailing {
+        return Err(partial(Vec::new(), control));
+    }
+    match outputs.first() {
+        Some(first) => Ok(yq_scalar_text::<S>(first)
+            .map(Cow::into_owned)
+            .unwrap_or_default()),
+        None => Err(suppress_or_raise(
+            EvalError::new(format!("could not find {name} for format_time")),
+            optional,
+        )),
+    }
+}
+
+/// The text yq's datetime operators read from a node: a scalar's text (`null` for a missing
+/// one), and nothing for a container (#5863).
+fn yq_node_text<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'_, W>,
+) -> Result<String, EvalError> {
+    let owned = to_owned::<S, _>(value)?;
+    Ok(yq_scalar_text::<S>(&owned)
+        .map(Cow::into_owned)
+        .unwrap_or_default())
+}
+
+/// yq's `parseSnippet` (#5863): `text` read as a YAML document, so `2026` is a number and
+/// `[2026]` a sequence. An empty text is null, a text that does not parse is a string, and so
+/// is one that reads as a string, which keeps the text as written (`"2026"` with its quotes).
+fn yq_parse_snippet<S: EvalSemantics>(text: String) -> OwnedValue {
+    if text.is_empty() {
+        return OwnedValue::Null;
+    }
+    let bytes = text.as_bytes();
+    let parsed = crate::yaml::YamlIndex::build(bytes).ok().and_then(|index| {
+        let root = index.root(bytes);
+        let crate::yaml::YamlValue::Sequence(docs) = root.value() else {
+            return None; // patchcov: coverage tolerate-line reason="unreachable: a YAML index's root is always the document sequence (#4206)"
+        };
+        let (doc, _) = docs.uncons_cursor()?;
+        super::eval_generic::to_owned_yaml_cursor::<S, _>(&doc).ok()
+    });
+    match parsed {
+        Some(OwnedValue::String(_)) | None => OwnedValue::String(text.into()),
+        Some(value) => value,
+    }
+}
+
+/// Builtin: `format_datetime(format)` (yq, #5863): the input read under the datetime layout and
+/// written with Go's layout `format`, then read back as a YAML snippet (`format_datetime("2006")`
+/// is the number `2026`).
+fn builtin_format_datetime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    format_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let format = match yq_string_parameter::<W, S>(format_expr, &value, optional, "format") {
+        Ok(format) => format,
+        Err(result) => return result,
+    };
+    let text = match yq_node_text::<W, S>(&value) {
+        Ok(text) => text,
+        Err(e) => return suppress_or_raise(e, optional),
+    };
+    match super::yq_datetime::format_datetime(&text, &format) {
+        Ok(formatted) => QueryResult::Owned(yq_parse_snippet::<S>(formatted)),
+        Err(e) => suppress_or_raise(EvalError::new(e), optional),
+    }
+}
+
+/// yq's `tz(zone)` (#5863): the input read under the datetime layout, moved to the zone Go's
+/// `time.LoadLocation` loads, and written under the layout.
+fn builtin_yq_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    zone_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let zone = match yq_string_parameter::<W, S>(zone_expr, &value, optional, "timezone") {
+        Ok(zone) => zone,
+        Err(result) => return result,
+    };
+    let text = match yq_node_text::<W, S>(&value) {
+        Ok(text) => text,
+        Err(e) => return suppress_or_raise(e, optional),
+    };
+    match super::yq_datetime::tz(&text, &zone) {
+        Ok(moved) => QueryResult::Owned(OwnedValue::String(moved.into())),
+        Err(e) => suppress_or_raise(EvalError::new(e), optional),
+    }
+}
+
+/// Builtin: `with_dtf(layout; f)` (yq, #5863): `f` with `layout` as the datetime layout for
+/// everything it evaluates. `f` runs to completion inside the scope, so every output is made
+/// under the layout.
+fn builtin_with_dtf<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    layout_expr: &Expr,
+    body: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let layout = match yq_string_parameter::<W, S>(layout_expr, &value, optional, "layout") {
+        Ok(layout) => layout,
+        Err(QueryResult::Error(e)) => {
+            return QueryResult::Error(EvalError::new(format!(
+                "could not get date time format: {e}"
+            )))
+        }
+        Err(result) => return result,
+    };
+    #[cfg(feature = "std")]
+    {
+        super::yq_datetime::with_layout(layout, || {
+            let (outputs, trailing) =
+                stream_outputs::<_, S>(eval_single::<W, S>(body, value, optional));
+            match trailing {
+                Some(control) => partial(outputs, control),
+                None => owned_vec_to_result(outputs),
+            }
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (layout, body, value);
+        suppress_or_raise(
+            EvalError::new("with_dtf requires the std feature"),
+            optional,
+        )
+    }
 }
 
 // Phase 22: File operations (yq)
