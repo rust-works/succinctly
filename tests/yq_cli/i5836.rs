@@ -264,9 +264,23 @@ fn test_arguments_are_read_from_the_real_input_before_the_refusal_5836() -> Resu
         ("sub(\"x\";error(\"r\"))", "Error: r"),
         ("test(\"x\";error(\"f\"))", "Error: f"),
         ("test(\"a\",\"b\")", not_matched.as_str()),
+        ("test(error(\"p\");\"g\")", "Error: p"),
+        ("match(\"x\";\"g\")", not_matched.as_str()),
     ] {
-        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "5\n", &[])?;
+        // A document node, which the refusal reads its tag from.
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(&format!(".b | {filter}"), "b: 5\n", &[])?;
         assert_eq!((stdout.as_str(), stderr.trim(), code), ("", want_err, 1), "{filter}");
     }
+    Ok(())
+}
+
+/// An alias node is left to the builtin, which reads the anchor's value: `FOO` where yq applies it
+/// to the alias's name and prints `X` (recorded in `docs/compliance/yq/limitations.md`).
+#[test]
+fn test_an_alias_node_is_left_to_the_builtin_5836() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".c | upcase", "b: &x foo\nc: *x\n", &[])?;
+    assert_eq!((stdout.as_str(), code), ("FOO\n", 0), "{stderr:?}");
     Ok(())
 }
