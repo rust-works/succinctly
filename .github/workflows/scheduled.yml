@@ -18,9 +18,9 @@ name: Scheduled
 # ARM64 / macOS ARM64, Clippy, Format, Do Not Merge, Documentation and Skill
 # manifest casing), so moving them off the PR path cannot hang a merge.
 #
-# `schedule` runs only on the default branch. `workflow_dispatch` runs either
-# job on demand, e.g. to bisect a bench movement or to check a PR against the
-# upcoming compilers before merging.
+# `schedule` runs only on the default branch. `workflow_dispatch` runs any
+# job on demand, e.g. to bisect a bench movement, to check a PR against the
+# upcoming compilers before merging, or to ask `ci-times` for a report now.
 on:
   schedule:
     - cron: '17 4 * * *'      # daily, 04:17 UTC -- off the hour, outside peak merge hours
@@ -164,16 +164,18 @@ jobs:
   # the thresholds and why they are wide.
   ci-times:
     name: CI job times
+    # Reads this repository's own Actions history; a fork has none, and would query ours.
+    if: github.repository == 'rust-works/succinctly'
     runs-on: ubuntu-24.04
+    # An unreadable API (a 5xx, a rate limit) must not turn the whole Scheduled run red: the beta
+    # toolchain leg above shares it. The report's tests run on pull requests (ci-leg-times.yml).
+    continue-on-error: true
     permissions:
       contents: read
       actions: read
       issues: write
     steps:
       - uses: actions/checkout@v7
-
-      - name: Unit-test the report
-        run: python3 scripts/test_ci_leg_times.py -v
 
       - name: Flag a job that got much slower
         env:

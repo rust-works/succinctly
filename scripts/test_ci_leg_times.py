@@ -113,6 +113,16 @@ class FetchTests(unittest.TestCase):
         with mock.patch.object(c, "api", return_value=body):
             self.assertEqual(c.fetch_jobs(1), {"ok": 300.0})
 
+    def test_jobs_past_the_first_hundred_are_read(self):
+        def many(i):
+            return self.job(f"j{i}", "success", "2026-11-02T10:00:00Z", "2026-11-02T10:01:00Z")
+
+        pages = {1: {"jobs": [many(i) for i in range(100)]}, 2: {"jobs": [many(100), many(101)]}}
+        with mock.patch.object(c, "api", side_effect=lambda path, **p: pages[p["page"]]):
+            seconds = c.fetch_jobs(1)
+        self.assertEqual(len(seconds), 102)
+        self.assertEqual(seconds["j101"], 60.0)
+
     def test_runs_are_pages_of_the_window_newest_first(self):
         def run(i, when):
             return {"id": i, "created_at": when}
@@ -140,7 +150,7 @@ class FetchTests(unittest.TestCase):
 
 
 class IssueTests(unittest.TestCase):
-    def fake_gh(self, issues, comments):
+    def fake_gh(self, issues, comment_times):
         calls = []
 
         def gh(*args):
@@ -148,10 +158,13 @@ class IssueTests(unittest.TestCase):
             if args[:2] == ("issue", "list"):
                 return json.dumps(issues)
             if args[0] == "api":
-                return json.dumps(comments)
+                return "\n".join(comment_times)
             return ""
 
         return gh, calls
+
+    def stamp(self, **ago):
+        return (AS_OF - timedelta(**ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def test_no_open_issue_creates_the_label_and_the_issue(self):
         gh, calls = self.fake_gh([], [])
@@ -164,20 +177,40 @@ class IssueTests(unittest.TestCase):
         self.assertIn(c.TITLE, create)
         self.assertIn(c.LABEL, create)
 
-    def test_an_open_issue_gets_a_comment_once_a_day(self):
-        recent = [{"created_at": (AS_OF - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")}]
-        gh, calls = self.fake_gh([{"number": 7}], recent)
+    def test_an_open_issue_is_commented_on_at_most_once_a_day(self):
+        gh, calls = self.fake_gh([{"number": 7}], [self.stamp(hours=6)])
         with mock.patch.object(c, "gh", gh):
             c.file_issue("body", AS_OF)
         self.assertFalse([a for a in calls if a[:2] in (("issue", "comment"), ("issue", "create"))])
 
-        old = [{"created_at": (AS_OF - timedelta(hours=30)).strftime("%Y-%m-%dT%H:%M:%SZ")}]
-        gh, calls = self.fake_gh([{"number": 7}], old)
+        gh, calls = self.fake_gh([{"number": 7}], [self.stamp(hours=30)])
         with mock.patch.object(c, "gh", gh):
             c.file_issue("body", AS_OF)
         comment = [a for a in calls if a[:2] == ("issue", "comment")]
         self.assertEqual(len(comment), 1)
         self.assertEqual(comment[0][2], "7")
+
+    def test_a_daily_run_that_started_a_few_minutes_early_still_comments(self):
+        # Yesterday's run commented at 04:20 and today's starts at 04:17: 23h57m later.
+        gh, calls = self.fake_gh([{"number": 7}], [self.stamp(hours=23, minutes=57)])
+        with mock.patch.object(c, "gh", gh):
+            c.file_issue("body", AS_OF)
+        self.assertTrue([a for a in calls if a[:2] == ("issue", "comment")])
+
+    def test_the_newest_of_many_comments_decides(self):
+        # More than a page of them: the list is every comment, oldest first, and the last is read.
+        old = [self.stamp(days=200 - i) for i in range(120)]  # the last is 81 days old
+        gh, calls = self.fake_gh([{"number": 7}], old)
+        with mock.patch.object(c, "gh", gh):
+            c.file_issue("body", AS_OF)
+        self.assertIn("--paginate", next(a for a in calls if a[0] == "api"))
+        self.assertTrue([a for a in calls if a[:2] == ("issue", "comment")])
+
+        recent = old[:-1] + [self.stamp(hours=2)]
+        gh, calls = self.fake_gh([{"number": 7}], recent)
+        with mock.patch.object(c, "gh", gh):
+            c.file_issue("body", AS_OF)
+        self.assertFalse([a for a in calls if a[:2] == ("issue", "comment")])
 
     def test_an_open_issue_with_no_comment_yet_gets_one(self):
         gh, calls = self.fake_gh([{"number": 7}], [])
@@ -187,6 +220,13 @@ class IssueTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def setUp(self):
+        # `report` appends to the job summary of the workflow that runs these tests.
+        patched = mock.patch.dict(os.environ)
+        patched.start()
+        self.addCleanup(patched.stop)
+        os.environ.pop("GITHUB_STEP_SUMMARY", None)
+
     def test_report_flags_through_the_whole_pipeline_and_files_only_when_asked(self):
         runs_ = [{"id": i, "created_at": "2026-11-02T00:00:00Z"} for i in range(40)]
         jobs = {i: {NOSTD: 700.0 if i < c.RECENT else 250.0} for i in range(40)}

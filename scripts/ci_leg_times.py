@@ -18,7 +18,7 @@ same `no-std` leg at 4.8 and 6.9 minutes, and a single run would flag that. A jo
 `MIN_BASELINE` baseline samples and `MIN_RECENT` recent ones, and a baseline median of at least
 `MIN_SECONDS`, so a leg that is new, or that only aggregates others, is never flagged.
 
-This is a report, not a required check: it exits 0 whatever it finds. The markdown goes to stdout
+This is a report, not a required check: it exits 0 whatever it finds, and 2 only when the Actions API cannot be read (the workflow job is `continue-on-error`). The markdown goes to stdout
 (and to `$GITHUB_STEP_SUMMARY` in a workflow). With `--issue` a flag also opens one tracking issue
 labelled `ci-slowdown`, or adds a comment to the one that is open, at most one comment a day; the
 baseline follows a slowdown that is left alone, so the report stops by itself within a few days.
@@ -49,6 +49,7 @@ MIN_BASELINE = 8  # baseline samples a job needs
 MIN_RECENT = 3  # recent samples a job needs
 MIN_SECONDS = 60  # a job whose baseline median is shorter is not worth a report
 
+COMMENT_GAP = timedelta(hours=20)  # between comments on the tracking issue
 LABEL = "ci-slowdown"
 TITLE = "ci: a CI job got much slower than its recent level"
 
@@ -96,17 +97,21 @@ def fetch_runs(as_of, days=DAYS):
 
 def fetch_jobs(run_id):
     """`{job name: seconds}` of the jobs of one run that succeeded and took time."""
-    body = api(f"repos/{REPO}/actions/runs/{run_id}/jobs", per_page=100, filter="latest")
-    seconds = {}
-    for job in body.get("jobs", []):
-        if job.get("conclusion") != "success" or not job.get("started_at") or not job.get("completed_at"):
-            continue
-        seconds[job["name"]] = (parse_time(job["completed_at"]) - parse_time(job["started_at"])).total_seconds()
-    return seconds
+    seconds, page = {}, 1
+    while True:
+        body = api(f"repos/{REPO}/actions/runs/{run_id}/jobs", per_page=100, filter="latest", page=page)
+        jobs = body.get("jobs", [])
+        for job in jobs:
+            if job.get("conclusion") != "success" or not job.get("started_at") or not job.get("completed_at"):
+                continue
+            seconds[job["name"]] = (parse_time(job["completed_at"]) - parse_time(job["started_at"])).total_seconds()
+        if len(jobs) < 100:
+            return seconds
+        page += 1
 
 
 def sample_evenly(items, count):
-    """`count` items spread over `items` (all of them when there are fewer), oldest order kept."""
+    """`count` items spread over `items` (all of them when there are fewer), in the order given."""
     if len(items) <= count:
         return list(items)
     step = len(items) / count
@@ -189,8 +194,10 @@ def file_issue(text, as_of):
         gh("issue", "create", "--repo", REPO, "--title", TITLE, "--label", LABEL, "--body", text)
         return
     number = open_issues[0]["number"]
-    last = json.loads(gh("api", f"repos/{REPO}/issues/{number}/comments?per_page=100"))[-1:]
-    if last and as_of - parse_time(last[0]["created_at"]) < timedelta(days=1):
+    created = gh("api", "--paginate", f"repos/{REPO}/issues/{number}/comments?per_page=100", "--jq", ".[].created_at").split()
+    # Less than a day, but the daily run starts a few minutes later each time it is delayed, so a
+    # gap of 23h58m is a new day.
+    if created and as_of - parse_time(created[-1]) < COMMENT_GAP:
         return
     gh("issue", "comment", str(number), "--repo", REPO, "--body", text)
 
