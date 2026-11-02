@@ -5783,13 +5783,19 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // document's line is counted when it is read, one forward pass over the text in
                 // all. No parse error is queued (the route is taken only without one).
                 debug_assert_eq!(locations.per_value(), &[]);
-                let count = lazy.spans.len();
-                let source = lazy.source;
+                let exhausted = locations.exhausted(args.slurp);
                 // The counter's place in the text, kept between reads without a borrow of it.
                 let mut lines = LineCounter::at_seam(lazy.text.as_bytes(), lazy.seam).place();
-                let materialize = move |index: usize| {
+                let mut next = 0;
+                // The stream's text goes with its last document, not with the read past it.
+                let mut stream = (!lazy.spans.is_empty()).then_some(lazy);
+                let producer = move || {
+                    let Some(lazy) = stream.as_ref() else {
+                        return jq::ProducedInput::End(exhausted);
+                    };
                     let bytes = lazy.text.as_bytes();
-                    let (start, end) = lazy.spans[index];
+                    let (start, end) = lazy.spans[next];
+                    next += 1;
                     let mut counter = LineCounter::resume(bytes, lines);
                     let line = counter.read_end_line(end);
                     lines = counter.place();
@@ -5808,14 +5814,14 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                         DocumentForm::Value,
                     );
                     // Narrowed as `InputLocations::push` narrows the eager route's lines.
-                    (line as u32, converted)
+                    let produced =
+                        jq::ProducedInput::converted(converted, lazy.source, line as u32);
+                    if next == lazy.spans.len() {
+                        stream = None;
+                    }
+                    produced
                 };
-                jq::seed_remaining_inputs_lazily(
-                    source,
-                    count,
-                    Box::new(materialize),
-                    locations.exhausted(args.slurp),
-                );
+                jq::seed_remaining_inputs_from(Box::new(producer));
                 if locations.eof_tail.is_some() {
                     jq::count_reads_past_end();
                 }

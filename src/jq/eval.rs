@@ -93626,22 +93626,11 @@ mod remaining_inputs {
     /// before it, the error, and the `(source, line)` jq's marker names there.
     type QueuedError = (usize, EvalError, (u32, u32));
 
-    /// The CLI's conversion of the document at an index of a lazily seeded stream (#5661), and
-    /// that document's 1-based end line. Called once per document, in index order, so it may
-    /// count lines forward as it goes.
-    pub type Materialize = super::LazyInputConverter;
+    /// What the CLI's producer hands the queue at each read (#5498, #5661).
+    pub use super::ProducedInput as Produced;
 
-    /// A stream whose documents the CLI converts when they are read (#5661): a program that
-    /// stops early neither converts the rest nor holds a queue entry for each of them.
-    struct LazyStream {
-        /// The source tag of every document.
-        source: u32,
-        /// The index of the next document to read.
-        next: usize,
-        /// How many documents there are.
-        count: usize,
-        materialize: Materialize,
-    }
+    /// The CLI's source of the documents a seeded stream reads, pulled one item at a time.
+    pub type Producer = super::InputProducer;
 
     thread_local! {
         // `(document, source tag, 1-based end line)`. The source tag is opaque
@@ -93649,9 +93638,9 @@ mod remaining_inputs {
         // so no string ever crosses this module's boundary (#1309).
         static QUEUE: RefCell<VecDeque<(OwnedValue, u32, u32)>> =
             const { RefCell::new(VecDeque::new()) };
-        // The documents read ahead of `QUEUE`, converted as they are read (#5661); `None` when
-        // nothing is seeded lazily or every lazy document has been read.
-        static LAZY: RefCell<Option<LazyStream>> = const { RefCell::new(None) };
+        // Where the documents come from when they are produced as they are read (#5498, #5661);
+        // `None` when nothing is seeded that way or the producer has reported the end.
+        static PRODUCER: RefCell<Option<Producer>> = const { RefCell::new(None) };
         // jq reports the *last successfully read* document's line, not the
         // next one still queued -- starts at 0 (matching real jq's own
         // `input_line_number` before anything has been read yet).
@@ -93722,7 +93711,7 @@ mod remaining_inputs {
         QUEUE.with(|q| {
             *q.borrow_mut() = documents.into();
         });
-        LAZY.with(|l| *l.borrow_mut() = None);
+        PRODUCER.with(|p| *p.borrow_mut() = None);
         ERRORS.with(|e| *e.borrow_mut() = errors.into());
         POPPED.with(|p| p.set(0));
         LAST_LINE.with(|l| l.set(0));
@@ -93733,31 +93722,19 @@ mod remaining_inputs {
         COUNT_PAST_END.with(|c| c.set(false));
     }
 
-    /// [`seed`] for a stream the CLI has already checked is clean (#5661): `count` documents, all
-    /// from the source tagged `source`, each converted by `materialize` when it is read, which
-    /// also reports its line. Nothing is queued per document. No parse error is queued: the CLI
-    /// takes this route only for a stream with none.
-    pub fn seed_lazy(
-        source: u32,
-        count: usize,
-        materialize: Materialize,
-        exhausted: Option<(u32, u32)>,
-    ) {
+    /// [`seed`] for a stream whose items `producer` hands over one at a time, when they are read
+    /// (#5498, #5661): nothing is pulled here and nothing is queued per item. Its parse errors
+    /// come in stream order from the producer, and so does where the marker settles at the end
+    /// ([`Produced::End`]), so `EXHAUSTED` is unset until then.
+    pub fn seed_producer(producer: Producer) {
         QUEUE.with(|q| q.borrow_mut().clear());
-        LAZY.with(|l| {
-            *l.borrow_mut() = (count > 0).then(|| LazyStream {
-                source,
-                next: 0,
-                count,
-                materialize,
-            });
-        });
+        PRODUCER.with(|p| *p.borrow_mut() = Some(producer));
         ERRORS.with(|e| e.borrow_mut().clear());
         POPPED.with(|p| p.set(0));
         LAST_LINE.with(|l| l.set(0));
         SEEDED.with(|s| s.set(true));
         CURRENT.with(|c| c.set(None));
-        EXHAUSTED.with(|e| e.set(exhausted));
+        EXHAUSTED.with(|e| e.set(None));
         PAST_END.with(|p| p.set(false));
         COUNT_PAST_END.with(|c| c.set(false));
     }
@@ -93822,27 +93799,25 @@ mod remaining_inputs {
             CURRENT.with(|c| c.set(Some(at)));
             return Pop::ParseError(error);
         }
-        // Out of its slot while the converter runs, so a converter that reads the queue itself
+        // Out of its slot while the producer runs, so a producer that reads the queue itself
         // finds no borrow held.
-        let lazy = LAZY.with(|l| l.borrow_mut().take()).map(|mut stream| {
-            let index = stream.next;
-            stream.next += 1;
-            let (line, converted) = (stream.materialize)(index);
-            let source = stream.source;
-            // The converter holds the stream's text: it goes with the last document.
-            if stream.next < stream.count {
-                LAZY.with(|l| *l.borrow_mut() = Some(stream));
-            }
-            (converted, source, line)
-        });
-        if let Some((converted, src, line)) = lazy {
+        if let Some(mut producer) = PRODUCER.with(|p| p.borrow_mut().take()) {
+            let (pop, (src, line)) = match producer() {
+                Produced::Document(doc, src, line) => (Pop::Document(doc), (src, line)),
+                // As a document does, a parse error moves the marker and the line to it.
+                Produced::Error(error, at) => (Pop::ParseError(error), at),
+                Produced::End(exhausted) => {
+                    // The producer is dropped here, never asked again. A producer seed queues
+                    // nothing else, so this read is the stream's end.
+                    EXHAUSTED.with(|e| e.set(exhausted));
+                    return pop_past_end();
+                }
+            };
+            PRODUCER.with(|p| *p.borrow_mut() = Some(producer));
             POPPED.with(|p| p.set(popped_so_far + 1));
             LAST_LINE.with(|l| l.set(line));
             CURRENT.with(|c| c.set(Some((src, line))));
-            return match converted {
-                Ok(doc) => Pop::Document(doc),
-                Err(error) => Pop::ParseError(error),
-            };
+            return pop;
         }
         let popped = QUEUE.with(|q| q.borrow_mut().pop_front());
         if let Some((doc, src, line)) = popped {
@@ -93861,6 +93836,12 @@ mod remaining_inputs {
             CURRENT.with(|c| c.set(Some(at)));
             return Pop::ParseError(error);
         }
+        pop_past_end()
+    }
+
+    /// A read that finds nothing left: the marker settles at `EXHAUSTED`, and the reads after
+    /// the first are counted as `pop_input` describes.
+    fn pop_past_end() -> Pop {
         if !COUNT_PAST_END.with(Cell::get) {
             CURRENT.with(|c| c.set(EXHAUSTED.with(Cell::get)));
             return Pop::Exhausted;
@@ -94177,30 +94158,50 @@ pub fn seed_remaining_inputs_with_errors(
     remaining_inputs::seed(documents, exhausted, errors);
 }
 
-/// How [`seed_remaining_inputs_lazily`] converts a document (#5661).
+/// One item an [`InputProducer`] hands the `input` queue when a read asks for it (#5498, #5661).
 ///
-/// Given its index, it answers the document's 1-based end line and its value. It is called once per document, in index order,
-/// when that document is read, so it can count lines forward as it goes. An error it returns
-/// reaches the reader as the parse error `input` raises.
+/// Source tags and lines are what [`seed_remaining_inputs`] documents carry: an opaque source tag
+/// the CLI resolves itself, and a 1-based line.
 #[cfg(feature = "std")]
-pub type LazyInputConverter = Box<dyn FnMut(usize) -> (u32, Result<OwnedValue, EvalError>)>;
+pub enum ProducedInput {
+    /// The next document, with its source tag and the line jq's reader had reached when it
+    /// finished it.
+    Document(OwnedValue, u32, u32),
+    /// A parse error, raised by the read as an ordinary catchable error, with the
+    /// `(source, line)` jq's marker names there. Items may follow it: jq resumes reading after a
+    /// parse error that `input` raises (#4311).
+    Error(EvalError, (u32, u32)),
+    /// Nothing is left. Carries the `(source, line)` [`current_input_location`] settles on once
+    /// the stream is exhausted, or `None` for jq's `<unknown>`. The producer is dropped and not
+    /// asked again.
+    End(Option<(u32, u32)>),
+}
 
-/// [`seed_remaining_inputs`] for a stream the CLI has checked is clean, converting each document
-/// when it is read instead of up front (#5661).
-///
-/// There are `count` documents, all from the source tagged `source`, each converted by
-/// `materialize` ([`LazyInputConverter`]). The CLI takes this route only where no document can
-/// fail to convert and the stream holds no parse error, so a program that stops early
-/// (`first(inputs)`) neither parses nor holds the documents it never reads, and nothing is kept
-/// per document it has not read.
 #[cfg(feature = "std")]
-pub fn seed_remaining_inputs_lazily(
-    source: u32,
-    count: usize,
-    materialize: LazyInputConverter,
-    exhausted: Option<(u32, u32)>,
-) {
-    remaining_inputs::seed_lazy(source, count, materialize, exhausted);
+impl ProducedInput {
+    /// A document, or the parse error converting it met, at `(source, line)`.
+    pub fn converted(converted: Result<OwnedValue, EvalError>, source: u32, line: u32) -> Self {
+        match converted {
+            Ok(document) => Self::Document(document, source, line),
+            Err(error) => Self::Error(error, (source, line)),
+        }
+    }
+}
+
+/// Where a stream seeded by [`seed_remaining_inputs_from`] gets its items: called once per read,
+/// in order, until it answers [`ProducedInput::End`].
+#[cfg(feature = "std")]
+pub type InputProducer = Box<dyn FnMut() -> ProducedInput>;
+
+/// [`seed_remaining_inputs`] for a stream whose items are produced when they are read, instead of
+/// up front (#5498, #5661).
+///
+/// Nothing is pulled here. A program that stops early (`first(inputs)`) never produces the items
+/// it does not read, and nothing is kept for them. The producer runs with no borrow of the queue
+/// held, so it may read the queue itself (it finds nothing there).
+#[cfg(feature = "std")]
+pub fn seed_remaining_inputs_from(producer: InputProducer) {
+    remaining_inputs::seed_producer(producer);
 }
 
 /// Counts the reads past the end of the input just seeded, as jq does (#4303).
@@ -115186,35 +115187,34 @@ mod tests {
         assert_eq!(pop_remaining_input(), None);
     }
 
-    /// #5661: a lazily seeded queue converts a document when it is read and not before, moves the
+    /// #5661: a produced stream converts a document when it is read and not before, moves the
     /// marker and the line as an eager one does, reaches the end as one does, and hands a failed
     /// conversion to the reader as the parse error `input` raises. The pin must be able to fail:
-    /// it does, with `seed_lazy` converting every slot as it queues it.
+    /// it does, with `seed_producer` pulling the first item as it seeds, and with the queue
+    /// keeping the producer after the end.
     #[cfg(feature = "std")]
     #[test]
-    fn a_lazily_seeded_queue_converts_only_what_is_read_5661() {
+    fn a_produced_stream_converts_only_what_is_read_5661() {
         use core::cell::Cell;
         use std::rc::Rc;
 
         let converted = Rc::new(Cell::new(0usize));
         let counter = Rc::clone(&converted);
-        let mut expected = 0;
-        seed_remaining_inputs_lazily(
-            0,
-            4,
-            Box::new(move |index| {
-                assert_eq!(index, expected, "documents are converted in order");
-                expected += 1;
-                counter.set(counter.get() + 1);
-                let line = index as u32 + 1;
-                if index == 2 {
-                    (line, Err(EvalError::new("cannot convert")))
-                } else {
-                    (line, Ok(OwnedValue::Int(index as i64 * 10)))
-                }
-            }),
-            Some((0, 4)),
-        );
+        let mut index = 0;
+        seed_remaining_inputs_from(Box::new(move || {
+            if index == 4 {
+                return ProducedInput::End(Some((0, 4)));
+            }
+            counter.set(counter.get() + 1);
+            let line = index as u32 + 1;
+            let result = if index == 2 {
+                Err(EvalError::new("cannot convert"))
+            } else {
+                Ok(OwnedValue::Int(index as i64 * 10))
+            };
+            index += 1;
+            ProducedInput::converted(result, 0, line)
+        }));
         assert_eq!(converted.get(), 0, "seeding converts nothing");
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(0)));
         assert_eq!(current_input_location(), Some((0, 1)));
@@ -115227,37 +115227,99 @@ mod tests {
         assert_eq!(current_input_location(), Some((0, 3)));
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(30)));
         assert_eq!(converted.get(), 4);
-        // The converter owns the stream's text, so it goes with the last slot.
-        assert_eq!(Rc::strong_count(&converted), 1, "the converter is released");
         assert_eq!(pop_remaining_input(), None);
         assert_eq!(current_input_location(), Some((0, 4)));
-        // A later eager seed replaces the converter with nothing to convert.
+        // The queue drops the producer once it reports the end.
+        assert_eq!(Rc::strong_count(&converted), 1, "the producer is released");
+        // A later eager seed replaces the producer with nothing to convert.
         seed_remaining_inputs(vec![(OwnedValue::Int(7), 0, 1)], None);
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(7)));
         assert_eq!(converted.get(), 4);
     }
 
-    /// #5661: the converter runs with no borrow of the queue held, so one that reads the queue
+    /// #5661: the producer runs with no borrow of the queue held, so one that reads the queue
     /// itself finds it empty rather than panicking on a held borrow.
     #[cfg(feature = "std")]
     #[test]
-    fn a_lazy_converter_may_read_the_queue_5661() {
-        seed_remaining_inputs_lazily(
-            0,
-            2,
-            Box::new(|index| {
-                assert_eq!(
-                    pop_remaining_input(),
-                    None,
-                    "nothing is queued behind the stream"
-                );
-                (1, Ok(OwnedValue::Int(index as i64)))
-            }),
-            None,
-        );
+    fn a_producer_may_read_the_queue_5661() {
+        let mut index = 0;
+        seed_remaining_inputs_from(Box::new(move || {
+            assert_eq!(
+                pop_remaining_input(),
+                None,
+                "nothing is queued behind the stream"
+            );
+            index += 1;
+            match index {
+                1 | 2 => ProducedInput::Document(OwnedValue::Int(index - 1), 0, 1),
+                _ => ProducedInput::End(None),
+            }
+        }));
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(0)));
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(1)));
         assert_eq!(pop_remaining_input(), None);
+    }
+
+    /// #5498: a produced parse error moves the marker and `input_line_number` to where it fell,
+    /// documents can follow it (jq resumes after one, #4311), and the end the producer reports
+    /// last is where the reads past the end start from (#4303). Each item is pulled once, and the
+    /// producer is not asked again after the end.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_produced_error_and_end_move_the_marker_as_queued_ones_do_5498() {
+        use core::cell::Cell;
+        use std::rc::Rc;
+
+        let pulls = Rc::new(Cell::new(0usize));
+        let counted = Rc::clone(&pulls);
+        let mut items = vec![
+            ProducedInput::Document(OwnedValue::Int(1), 0, 1),
+            ProducedInput::Error(EvalError::new("bad"), (0, 2)),
+            ProducedInput::Document(OwnedValue::Int(3), 1, 5),
+            ProducedInput::End(Some((1, 6))),
+        ]
+        .into_iter();
+        seed_remaining_inputs_from(Box::new(move || {
+            counted.set(counted.get() + 1);
+            items
+                .next()
+                .expect("the producer is not asked after the end")
+        }));
+        count_reads_past_end();
+        assert_eq!(pulls.get(), 0);
+        assert_eq!(current_input_location(), None, "nothing read yet");
+        assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(1)));
+        assert_eq!(remaining_inputs::last_line(), Some(1));
+        assert!(matches!(pop_input(), InputPop::ParseError(e) if e.message == "bad"));
+        assert_eq!(current_input_location(), Some((0, 2)));
+        assert_eq!(remaining_inputs::last_line(), Some(2));
+        assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(3)));
+        assert_eq!(current_input_location(), Some((1, 5)));
+        assert_eq!(pulls.get(), 3, "one pull per read");
+        // The first read past the end names where the producer said the stream ended...
+        assert!(matches!(pop_input(), InputPop::Exhausted));
+        assert_eq!(current_input_location(), Some((1, 6)));
+        assert_eq!(remaining_inputs::last_line(), Some(6));
+        // ... and every later one `<unknown>` and line 0, without asking the producer.
+        for _ in 0..2 {
+            assert!(matches!(pop_input(), InputPop::Exhausted));
+            assert_eq!(current_input_location(), None);
+            assert_eq!(remaining_inputs::last_line(), Some(0));
+        }
+        assert_eq!(pulls.get(), 4);
+    }
+
+    /// #5498: a producer that reports `End(None)` leaves jq's `<unknown>` marker, and without
+    /// `count_reads_past_end` every read past the end leaves the marker there.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_produced_end_without_a_position_is_unknown_5498() {
+        seed_remaining_inputs_from(Box::new(|| ProducedInput::End(None)));
+        for _ in 0..2 {
+            assert!(matches!(pop_input(), InputPop::Exhausted));
+            assert_eq!(current_input_location(), None);
+            assert_eq!(remaining_inputs::last_line(), Some(0));
+        }
     }
 
     /// Evaluate `Identity`/`Field`/`Index` against an `OwnedValue` the way
