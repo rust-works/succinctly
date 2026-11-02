@@ -3576,8 +3576,10 @@ struct StorageFacts {
     /// Weak, so that the address this is keyed by cannot be taken by another storage while the
     /// entry lives: the allocation is held until the entry is dropped.
     storage: alloc::rc::Weak<Vec<Expr>>,
-    /// Every `Expr::TrackedVar` in the storage, with the index of the stage it is in.
-    markers: Vec<(usize, Rc<Tracked>)>,
+    /// Every `Expr::TrackedVar` in the storage, with the index of the stage it is in, collected
+    /// when [`reentry_can_observe`] first asks for them: the two positions below answer the memo
+    /// cells, which most pipes never need more than.
+    markers: core::cell::OnceCell<Vec<(usize, Rc<Tracked>)>>,
     /// One past the last stage that holds a marker, 0 when none does.
     tracked_end: usize,
     /// One past the last stage that holds a node that can start a resolver invocation.
@@ -3589,19 +3591,15 @@ impl StorageFacts {
     fn of(storage: &Rc<Vec<Expr>>) -> Self {
         #[cfg(test)]
         STORAGE_FACTS_BUILT.with(|n| n.set(n.get() + 1));
-        let mut markers = Vec::new();
         let (mut tracked_end, mut resolver_end) = (0, 0);
         for (index, stage) in storage.iter().enumerate() {
-            let before = markers.len();
-            let mut resolver = false;
+            let (mut tracked, mut resolver) = (false, false);
             any_subexpr(stage, &mut |e| {
-                if let Expr::TrackedVar(marker) = e {
-                    markers.push((index, Rc::clone(marker)));
-                }
+                tracked |= matches!(e, Expr::TrackedVar(_));
                 resolver |= may_enter_resolver_node(e);
                 false
             });
-            if markers.len() > before {
+            if tracked {
                 tracked_end = index + 1;
             }
             if resolver {
@@ -3610,10 +3608,27 @@ impl StorageFacts {
         }
         Self {
             storage: Rc::downgrade(storage),
-            markers,
+            markers: core::cell::OnceCell::new(),
             tracked_end,
             resolver_end,
         }
+    }
+
+    /// The markers of `storage`, which this was worked out for, from the stage they are in.
+    fn markers(&self, storage: &Rc<Vec<Expr>>) -> &[(usize, Rc<Tracked>)] {
+        self.markers.get_or_init(|| {
+            let mut markers = Vec::new();
+            // Only the stages up to the last that holds one are walked.
+            for (index, stage) in storage.iter().enumerate().take(self.tracked_end) {
+                any_subexpr(stage, &mut |e| {
+                    if let Expr::TrackedVar(marker) = e {
+                        markers.push((index, Rc::clone(marker)));
+                    }
+                    false
+                });
+            }
+            markers
+        })
     }
 }
 
@@ -45738,8 +45753,9 @@ fn reentry_can_observe(expr: &Expr, rewrite: &dyn Fn(&Tracked) -> Option<Origin>
         if stages.len() > FACT_SCAN_STAGES {
             if let Some((storage, start)) = stages.shared_view() {
                 let facts = storage_facts(storage);
-                let from = facts.markers.partition_point(|(index, _)| *index < start);
-                return facts.markers[from..]
+                let markers = facts.markers(storage);
+                let from = markers.partition_point(|(index, _)| *index < start);
+                return markers[from..]
                     .iter()
                     .any(|(_, marker)| rewrite(marker).is_some());
             }
