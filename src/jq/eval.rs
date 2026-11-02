@@ -12061,12 +12061,20 @@ impl RestCopy {
     }
 
     /// The owned pipe over `stages`, built on the first call.
-    fn owned_pipe(&mut self, stages: &[Expr], owner: Option<&PipeStages>) -> &Expr {
+    fn owned_pipe<S: EvalSemantics>(
+        &mut self,
+        stages: &[Expr],
+        owner: Option<&PipeStages>,
+    ) -> &Expr {
         self.pipe_of(|| {
             #[cfg(test)]
             owned_pipe_copies::bump();
             match owner {
-                Some(owner) => owner.tail_copy(owner.len() - stages.len(), pipe_state_end),
+                Some(owner) => {
+                    owner.tail_copy(owner.len() - stages.len(), pipe_state_end, |tail| {
+                        stateless_prefix_len::<S>(owner, tail)
+                    })
+                }
                 None => stages.to_vec().into(),
             }
         })
@@ -12188,7 +12196,7 @@ impl<'a> RestPipe<'a> {
                 let tail = self.tail();
                 self.copy.split_pipe(|| tail.split())
             }
-            Some(TailPlan::Copy) | None => self.copy.owned_pipe(self.stages, self.owner),
+            Some(TailPlan::Copy) | None => self.copy.owned_pipe::<S>(self.stages, self.owner),
         };
         if lone.is_some() {
             eval_each_owned_past_front_doors::<S>(whole, input, optional, reentry, sink)
@@ -12273,17 +12281,64 @@ fn holds_evaluation_state(stage: &Expr) -> bool {
 /// a whole argument tree per copied tail (2.4x on a call whose 8,000-node
 /// argument sat in a copied tail, review of #5830).
 fn pipe_state_end(stages: &[Expr]) -> usize {
-    use crate::jq::walk::{search_subexpr, Visit};
     stages
         .iter()
-        .rposition(|stage| {
-            search_subexpr(stage, &mut |e| match e {
-                Expr::DefCall { .. } | Expr::FuncDef { .. } => Visit::Found,
-                Expr::Shared(_) => Visit::Skip,
-                _ => Visit::Descend,
-            })
-        })
+        .rposition(holds_state_outside_shared)
         .map_or(0, |last| last + 1)
+}
+
+/// How many of `tail` lead up to its first stage that [holds evaluation
+/// state](holds_evaluation_state) outside an [`Expr::Shared`]: the stateless prefix that
+/// [`PipeStages::tail_copy`] hands on as a link of its own (#5871), or 0 when it hands none on.
+///
+/// Only jq mode nests stages, as it only splits a tail (#5421): yq's first-stage rule for a failing
+/// generator ([`eval_pipe`]) reads the first stage of a pipe, and a link is a pipe of its own. And
+/// a link is an `Expr::Shared`, which a re-entry's marker rewrite does not reach, while a rewritten
+/// marker is read only by a resolver invocation ([`reentry_can_observe`]): a prefix holding both a
+/// marker and a node that can start one is copied, as the chain of a long pipe is (#5679). The
+/// stateful suffix stays in the pipe, so its call is rewritten as it was.
+fn stateless_prefix_len<S: EvalSemantics>(owner: &PipeStages, tail: &[Expr]) -> usize {
+    if S::TAG != EvalTag::Jq {
+        return 0;
+    }
+    let prefix = &tail[..pipe_state_start(tail)];
+    // The owner remembers whether it holds a marker at all, which most do not: its answer covers
+    // the prefix, so the prefix is walked only for a pipe that does.
+    if !pipe_holds_tracked_var(owner) {
+        return prefix.len();
+    }
+    let (mut marker, mut resolver) = (false, false);
+    for stage in prefix {
+        any_subexpr(stage, &mut |e| {
+            marker |= matches!(e, Expr::TrackedVar(_));
+            resolver |= may_enter_resolver_node(e);
+            marker && resolver
+        });
+        if marker && resolver {
+            return 0;
+        }
+    }
+    prefix.len()
+}
+
+/// Where in `stages` the first that holds evaluation state outside an [`Expr::Shared`] is, or
+/// `stages.len()` when none does.
+fn pipe_state_start(stages: &[Expr]) -> usize {
+    stages
+        .iter()
+        .position(holds_state_outside_shared)
+        .unwrap_or(stages.len())
+}
+
+/// Whether `stage` holds evaluation state, `Shared` nodes skipped unwalked (see
+/// [`pipe_state_end`]).
+fn holds_state_outside_shared(stage: &Expr) -> bool {
+    use crate::jq::walk::{search_subexpr, Visit};
+    search_subexpr(stage, &mut |e| match e {
+        Expr::DefCall { .. } | Expr::FuncDef { .. } => Visit::Found,
+        Expr::Shared(_) => Visit::Skip,
+        _ => Visit::Descend,
+    })
 }
 
 /// Whether `stage` reads a variable anywhere under it, `Shared` arguments and
@@ -31844,7 +31899,9 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     if exprs.len() == 1 {
                         exprs[0].clone()
                     } else {
-                        Expr::Pipe(tail.owner.tail_copy(tail.from, pipe_state_end))
+                        Expr::Pipe(tail.owner.tail_copy(tail.from, pipe_state_end, |rest| {
+                            stateless_prefix_len::<S>(tail.owner, rest)
+                        }))
                     }
                 };
                 &built
@@ -118738,6 +118795,160 @@ mod tests {
         }
         run::<JqSemantics>();
         run::<YqSemantics>();
+    }
+
+    /// #5871: a body rebuilt for each value whose pipe ends in a call to a `def` clones a number
+    /// of stages linear in the pipe's length for each value. The call holds evaluation state, so a
+    /// tail holding it is a copy (#3148), and each tail of that copy held it too: `n - 1`, `n - 2`,
+    /// ... stage clones per value. The stateless stages ahead of the call are now one link whose
+    /// own tails are views (#5488), and only the call is cloned again.
+    ///
+    /// A call the pipe does not end in, or that leads it, still copies each tail
+    /// (`test_rebuilt_body_hands_its_tails_on_as_views_5488` pins that shape), and so does yq
+    /// mode, whose first-stage rule for a failing generator reads the first stage of a pipe
+    /// (#5421): a link is a pipe of its own.
+    #[test]
+    fn test_rebuilt_body_ending_in_a_def_call_clones_linearly_5871() {
+        fn run() {
+            for stages in [20, 40, 80] {
+                let body = vec![". + $x"; stages - 1].join(" | ");
+                let program = |values: usize| {
+                    run_owned_pipe_program::<JqSemantics>(
+                        &format!(
+                            "def f: . + 1; [range(0;{values}) | . as $x | ({body} | f)] | length"
+                        ),
+                        b"null",
+                    )
+                };
+                let (few, many) = (program(4), program(40));
+                assert_eq!(many.output, "40", "{stages} stages");
+                let more = many.copied_stages - few.copied_stages;
+                // Quadratic is about `stages / 2` clones per stage per value: 800 per value at 40.
+                assert!(
+                    more <= 36 * 4 * stages,
+                    "{stages} stages: 36 more values cloned {more} stages, so each tail \
+                     holding the call was copied again"
+                );
+            }
+        }
+        run();
+    }
+
+    /// #5871: the stages ahead of a tail's first stateful one are handed on as a link only when no
+    /// re-entry could need to rewrite a marker in them: a link is an `Expr::Shared`, which the
+    /// rewrite does not reach, and a rewritten marker is read only by a resolver invocation. A
+    /// marker alone, or a resolver node alone, leaves the link; both in the prefix keep the copy,
+    /// and so does yq mode.
+    #[test]
+    fn test_stateless_prefix_len_keeps_the_copy_where_a_link_hides_a_marker_5871() {
+        let marker = Expr::TrackedVar(Rc::new(Tracked {
+            value: OwnedValue::Int(1),
+            origin: Origin::Untracked,
+            node: None,
+            fold_share: false,
+        }));
+        let call = parse("def f: .; f").unwrap();
+        let def_call = match &call {
+            Expr::Pipe(stages) => stages.last().unwrap().clone(),
+            other => other.clone(),
+        };
+        let plain = parse(". + 1").unwrap();
+        let reader = Expr::Pipe(vec![Expr::Identity, marker].into());
+        let resolver = parse("del(.a)").unwrap();
+        let tail = |stages: &[&Expr]| -> Vec<Expr> {
+            stages
+                .iter()
+                .map(|e| (*e).clone())
+                .chain([def_call.clone()])
+                .collect()
+        };
+        assert!(holds_evaluation_state(&def_call));
+        // The owner is the tail's own pipe here, so what it remembers is what the tail holds.
+        let prefix_len = |stages: &[Expr]| {
+            let owner: PipeStages = stages.to_vec().into();
+            stateless_prefix_len::<JqSemantics>(&owner, stages)
+        };
+        // Nothing to hide: the whole prefix.
+        assert_eq!(prefix_len(&tail(&[&plain, &plain, &plain])), 3);
+        // A marker alone, and a resolver node alone.
+        assert_eq!(prefix_len(&tail(&[&plain, &reader, &plain])), 3);
+        assert_eq!(prefix_len(&tail(&[&plain, &resolver, &plain])), 3);
+        // Both, in different stages of the prefix.
+        assert_eq!(prefix_len(&tail(&[&reader, &plain, &resolver])), 0);
+        // The prefix ends where the state starts; a marker or a resolver node in the stateful part
+        // is not in the link, though the owner holds both.
+        assert_eq!(
+            prefix_len(&[
+                plain.clone(),
+                plain.clone(),
+                def_call.clone(),
+                reader.clone(),
+                resolver.clone(),
+            ]),
+            2
+        );
+        let stages = tail(&[&plain, &plain, &plain]);
+        let owner: PipeStages = stages.clone().into();
+        assert_eq!(stateless_prefix_len::<YqSemantics>(&owner, &stages), 0);
+    }
+
+    /// #5871: the two answers `tail_copy` is given about a tail's state come from one predicate:
+    /// the first stateful stage is never past the last, and both skip an `Expr::Shared`.
+    #[test]
+    fn test_pipe_state_start_and_end_agree_on_which_stage_holds_state_5871() {
+        let call = parse("def f: .; f").unwrap();
+        let def_call = match &call {
+            Expr::Pipe(stages) => stages.last().unwrap().clone(),
+            other => other.clone(),
+        };
+        let plain = parse(". + 1").unwrap();
+        let shared = Expr::Shared(Rc::new(SharedArg::new(def_call.clone())));
+        for stages in [
+            vec![],
+            vec![plain.clone(); 3],
+            vec![def_call.clone()],
+            vec![plain.clone(), plain.clone(), def_call.clone()],
+            vec![
+                def_call.clone(),
+                plain.clone(),
+                def_call.clone(),
+                plain.clone(),
+            ],
+            vec![plain.clone(), shared.clone(), plain.clone()],
+        ] {
+            let (start, end) = (pipe_state_start(&stages), pipe_state_end(&stages));
+            let stateful: Vec<usize> = (0..stages.len())
+                .filter(|&i| holds_state_outside_shared(&stages[i]))
+                .collect();
+            assert_eq!(start, stateful.first().copied().unwrap_or(stages.len()));
+            assert_eq!(end, stateful.last().map_or(0, |last| last + 1));
+            if !stateful.is_empty() {
+                assert!(start < end);
+            }
+        }
+    }
+
+    /// #5871: stages after the call are cloned with it, once per value, and the stages ahead of it
+    /// are still one link: ten stages, the call, then forty more is linear in the pipe's length,
+    /// where copying every tail was about 1,300 clones per value.
+    #[test]
+    fn test_rebuilt_body_with_stages_after_a_def_call_clones_linearly_5871() {
+        let (pre, post) = ([". + $x"; 10].join(" | "), [". + $x"; 40].join(" | "));
+        let program = |values: usize| {
+            run_owned_pipe_program::<JqSemantics>(
+                &format!(
+                    "def f: . + 1; [range(0;{values}) | . as $x | ({pre} | f | {post})] | length"
+                ),
+                b"null",
+            )
+        };
+        let (few, many) = (program(4), program(40));
+        assert_eq!(many.output, "40");
+        let more = many.copied_stages - few.copied_stages;
+        assert!(
+            more <= 36 * 4 * 51,
+            "36 more values cloned {more} stages, so each tail past the call was copied again"
+        );
     }
 
     /// #5404: a tail past [`MAX_KEPT_TAIL_NODES`] is not kept, however few its
