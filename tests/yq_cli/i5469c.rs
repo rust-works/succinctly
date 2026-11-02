@@ -73,15 +73,43 @@ fn test_an_alias_used_as_a_mapping_key_stays_an_alias_5469() -> Result<()> {
     Ok(())
 }
 
-/// A key alias's anchor holding a scalar that is not a string reads back as that scalar's text,
-/// so it survives a write (yq v4.53.3).
+/// A key alias's anchor holding a scalar that is not a string reads back as that scalar, in any
+/// spelling the core schema resolves, so it survives a write (yq v4.53.3). Rewriting the anchor
+/// to another value drops it: `*a` would read back as the new value, not the key.
 #[test]
-fn test_an_alias_key_to_a_number_survives_a_write_5469() -> Result<()> {
+fn test_an_alias_key_to_a_non_string_scalar_survives_a_write_5469() -> Result<()> {
+    for v in [
+        "1",
+        "1.50",
+        "-0",
+        "0x10",
+        "0o17",
+        "1e3",
+        ".inf",
+        ".nan",
+        "+1",
+        "01",
+        "~",
+        "Null",
+        "NULL",
+        "True",
+        "\"true\"",
+        "!!int \"5\"",
+        "2001-12-14",
+    ] {
+        let doc = format!("b: &a {v}\nc:\n  *a : 2\n");
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(".zz = 1", &doc, &[])?;
+        assert_eq!(
+            (stdout, code),
+            (format!("b: &a {v}\nc:\n  *a : 2\nzz: 1\n"), 0),
+            "{v:?}: {stderr:?}"
+        );
+    }
     let (stdout, stderr, code) =
-        run_yq_stdin_with_stderr(".zz = 1", "b: &a 1\nc:\n  *a : 2\n", &[])?;
+        run_yq_stdin_with_stderr(".b = 5", "b: &a 0x10\nc:\n  *a : 2\n", &[])?;
     assert_eq!(
         (stdout.as_str(), code),
-        ("b: &a 1\nc:\n  *a : 2\nzz: 1\n", 0),
+        ("b: &a 5\nc:\n  0x10: 2\n", 0),
         "{stderr:?}"
     );
     Ok(())

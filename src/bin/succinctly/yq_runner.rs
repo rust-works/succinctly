@@ -4125,12 +4125,19 @@ impl Declared<'_> {
 
     /// Whether an alias used as mapping key `key` (`*a : 1`, #5469) would read back as `key`:
     /// the declaration is a scalar whose text is the key's. A container never is, since a
-    /// mapping key here is always text.
+    /// mapping key here is always text. A key holds the anchor's source spelling, so a
+    /// non-string scalar is compared as that spelling resolves (`0x10`, `~`, `True`), not as
+    /// it prints.
     fn reads_as_key(&self, key: &str) -> bool {
         match self {
             Self::Node(OwnedValue::String(s)) => s.as_ref() == key,
             Self::Node(OwnedValue::Array(_) | OwnedValue::Object(_)) => false,
-            Self::Node(scalar) => scalar.to_json() == key,
+            Self::Node(scalar) => {
+                scalar.to_json() == key
+                    || resolve_plain_sourced(key, false)
+                        .to_owned_value(std::borrow::Cow::Borrowed(key))
+                        .identical(scalar)
+            }
             Self::Key(text) => *text == key,
         }
     }
