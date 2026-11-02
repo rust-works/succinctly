@@ -151,7 +151,8 @@ def main():
     args = ap.parse_args()
     for build in (args.bin, args.base):
         if build and not os.access(build, os.X_OK):
-            sys.exit(f"not an executable build: {build}")
+            print(f"not an executable build: {build}", file=sys.stderr)
+            sys.exit(2)
 
     rows = [(doc, prog) for prog in programs() for doc in DOCS]
 

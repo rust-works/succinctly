@@ -46,19 +46,26 @@ SUCC="${1:-$REPO_ROOT/target/release/succinctly}"
 
 if [[ ! -x "$SUCC" ]]; then
   echo "error: succinctly binary not found at $SUCC — run: cargo build --release --features cli" >&2
-  exit 1
+  exit 2
 fi
 
 # Prefer the pinned oracle binary directly (macOS ships jq-1.7.1 at
 # /usr/bin/jq; a PATH jq, e.g. Homebrew's, is often a newer version) — same
 # reasoning as tests/jq_cli_tests.rs's own pinned-oracle comments.
-if [[ -x /usr/bin/jq ]] && /usr/bin/jq --version | grep -q "^$PIN"; then
+# `JQ_ORACLE` (the compare harness's pinned build, #5552) wins when set, and must be the pin too.
+if [[ -n "${JQ_ORACLE:-}" ]]; then
+  if ! "$JQ_ORACLE" --version | grep -q "^$PIN"; then
+    echo "error: JQ_ORACLE=$JQ_ORACLE reports $("$JQ_ORACLE" --version 2>&1), not the pinned $PIN" >&2
+    exit 2
+  fi
+  JQ=$JQ_ORACLE
+elif [[ -x /usr/bin/jq ]] && /usr/bin/jq --version | grep -q "^$PIN"; then
   JQ=/usr/bin/jq
 elif command -v jq >/dev/null 2>&1 && jq --version | grep -q "^$PIN"; then
   JQ="$(command -v jq)"
 else
   echo "error: no jq matching pin $PIN found at /usr/bin/jq or on PATH" >&2
-  exit 1
+  exit 2
 fi
 echo "oracle: $JQ ($("$JQ" --version)), succinctly: $SUCC" >&2
 

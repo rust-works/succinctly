@@ -98,9 +98,11 @@ def main():
         del args[i : i + 2]
     binary = args[0] if args else os.path.join(ROOT, "target/debug/succinctly")
     if not os.access(binary, os.X_OK):
-        sys.exit(f"error: {binary} not found; run: cargo build --features cli")
+        print(f"error: {binary} not found; run: cargo build --features cli", file=sys.stderr)
+        sys.exit(2)
     if not os.access(ORACLE, os.X_OK):
-        sys.exit(f"error: pinned oracle {ORACLE} not found")
+        print(f"error: pinned oracle {ORACLE} not found", file=sys.stderr)
+        sys.exit(2)
 
     programs = [
         cons.replace("{X}", f"{DOC} | {path} {op} {rhs}")

@@ -8,6 +8,7 @@ use super::ledger;
 use super::operational;
 use super::perf::{self, Gate, PerfRow, ToolResult};
 use super::robust;
+use super::sweep;
 use super::Results;
 use std::fmt::Write;
 
@@ -290,6 +291,7 @@ pub fn render(results: &Results) -> String {
     differential_secondary_section(&mut s, r);
     input_section(&mut s, r);
     fuzz_section(&mut s, r.fuzz.as_ref(), &r.known_divergences);
+    sweep_section(&mut s, &r.sweeps, &r.known_divergences);
     robust_section(&mut s, r);
     operational_section(&mut s, r);
     perf_sections(&mut s, r);
@@ -902,6 +904,47 @@ fn fuzz_section(s: &mut String, f: Option<&fuzz::Summary>, known: &[ledger::Entr
     }
 }
 
+/// B, the folded oracle sweeps (#5552): one row per script, then the output of each that diverged.
+fn sweep_section(s: &mut String, runs: &[sweep::Run], known: &[ledger::Entry]) {
+    if runs.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "\n## B. Oracle sweeps\n");
+    let _ = writeln!(
+        s,
+        "Each `scripts/jq-*-sweep.*` script listed in `manifest.toml`'s `[[sweep]]` runs its own grid \
+         through both tools and judges its own rows, including the residuals it expects; the runner \
+         reads only its exit status (1: a divergence the script does not expect). A diverging sweep is \
+         ledgered as `sweep:<id>`, so a second divergence in a listed sweep does not change the outcome.\n"
+    );
+    let _ = writeln!(s, "| Sweep | Script | Result | Seconds | Ledger |");
+    let _ = writeln!(s, "|-------|--------|--------|---------|--------|");
+    for x in runs {
+        let id = x.ledger_id();
+        // An agreeing sweep with no entry has nothing to note; a listed one is stale, and says so.
+        let note = if x.diverges || known.iter().any(|e| e.id == id) {
+            ledger_note(known, &id)
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            s,
+            "| `{}` | `{}` | {} | {:.0} | {note} |",
+            x.id,
+            x.script,
+            if x.diverges { "diverges" } else { "agrees" },
+            x.seconds,
+        );
+    }
+    for x in runs.iter().filter(|x| x.diverges) {
+        let _ = writeln!(s, "\n`{}`, the end of its output:\n\n```text", x.id);
+        for line in &x.tail {
+            let _ = writeln!(s, "{line}");
+        }
+        let _ = writeln!(s, "```");
+    }
+}
+
 fn robust_section(s: &mut String, r: &Results) {
     if r.robust.is_empty() {
         return;
@@ -1099,6 +1142,60 @@ mod tests {
         );
         assert!(
             listed.contains("to-triage: why") && !listed.contains("unlisted"),
+            "{listed}"
+        );
+    }
+
+    fn sweep_run(id: &str, diverges: bool) -> sweep::Run {
+        sweep::Run {
+            id: id.into(),
+            script: format!("scripts/jq-{id}-sweep.py"),
+            diverges,
+            seconds: 12.4,
+            tail: vec!["rows: 40".into(), "failures: 1".into()],
+        }
+    }
+
+    #[test]
+    fn no_sweep_run_prints_nothing_and_an_agreeing_unlisted_sweep_has_no_ledger_note() {
+        let mut s = String::new();
+        sweep_section(&mut s, &[], &[]);
+        assert_eq!(s.len(), 0);
+        sweep_section(&mut s, &[sweep_run("a", false)], &[]);
+        assert!(
+            s.contains("| `a` | `scripts/jq-a-sweep.py` | agrees | 12 |  |"),
+            "{s}"
+        );
+        assert!(!s.contains("unlisted") && !s.contains("failures: 1"), "{s}");
+    }
+
+    /// A diverging sweep is unlisted until ledgered, and its output's tail is shown either way.
+    #[test]
+    fn a_diverging_sweep_shows_its_tail_and_its_ledger_entry() {
+        let mut s = String::new();
+        sweep_section(&mut s, &[sweep_run("b", true)], &[]);
+        assert!(s.contains("| diverges | 12 | **unlisted** |"), "{s}");
+        assert!(s.contains("```text\nrows: 40\nfailures: 1\n```"), "{s}");
+        let known = vec![ledger::Entry {
+            id: "sweep:b".into(),
+            category: "to-triage".into(),
+            reason: "why".into(),
+            issue: None,
+            platform: None,
+            volatile: false,
+        }];
+        let mut listed = String::new();
+        sweep_section(
+            &mut listed,
+            &[sweep_run("b", true), sweep_run("c", false)],
+            &known,
+        );
+        assert!(
+            listed.contains("| diverges | 12 | to-triage: why |"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("| `c` |") && !listed.contains("unlisted"),
             "{listed}"
         );
     }

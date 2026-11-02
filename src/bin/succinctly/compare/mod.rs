@@ -26,6 +26,7 @@ mod perf;
 mod report;
 mod robust;
 mod suites;
+mod sweep;
 mod verify;
 
 use anyhow::{bail, Context, Result};
@@ -60,6 +61,8 @@ pub enum Dimension {
     Differential,
     /// B: grammar-based differential fuzzing (`scripts/jq-grammar-fuzz.py`)
     Fuzz,
+    /// B: the `scripts/jq-*-sweep.*` oracle sweeps listed in the manifest
+    Sweeps,
     /// C: JSON input conformance (JSONTestSuite)
     Input,
     /// D and E: wall time and peak memory, interleaved, output-gated
@@ -197,6 +200,9 @@ pub struct Results {
     /// B, the grammar fuzzer's runs and minimized findings (#5552).
     #[serde(default)]
     pub fuzz: Option<fuzz::Summary>,
+    /// B, the folded oracle sweeps (#5552).
+    #[serde(default)]
+    pub sweeps: Vec<sweep::Run>,
     /// D and E, one row per query × input.
     pub perf: Vec<perf::PerfRow>,
     pub perf_note: Option<String>,
@@ -425,6 +431,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                     | Dimension::Differential
                     | Dimension::Input
                     | Dimension::Robustness
+                    | Dimension::Sweeps
             ) && (args.dimension.is_empty() || args.dimension.contains(&d));
         }
         if verifying {
@@ -434,6 +441,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                     | Dimension::Performance
                     | Dimension::Operational
                     | Dimension::Fuzz
+                    | Dimension::Sweeps
             );
         }
         args.dimension.is_empty() || args.dimension.contains(&d)
@@ -627,7 +635,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         }
         dimensions.push(DimensionStatus {
             name: "B. Behavioural correctness (differential)",
-            status: "implemented (upstream test files; the sweep scripts are not yet folded in; grammar fuzzing is the fuzz dimension)",
+            status: "implemented (upstream test files; the oracle sweeps are the sweeps dimension, grammar fuzzing the fuzz dimension)",
         });
     }
     let mut fuzz_summary = None;
@@ -648,6 +656,34 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         } else {
             dimensions.push(DimensionStatus {
                 name: "B. Grammar-based differential fuzzing",
+                status: "not run (python3 was not found)",
+            });
+        }
+    }
+    let mut sweep_runs = vec![];
+    if want(Dimension::Sweeps) {
+        let needs_python = manifest.sweeps.iter().any(|s| s.script.ends_with(".py"));
+        if !needs_python || fuzz::python_available() {
+            run_suites.push("sweep".into());
+            sweep_runs = sweep::run(
+                &root,
+                &manifest.sweeps,
+                &reference,
+                &subject,
+                only("sweep").as_ref(),
+            )?;
+            for r in sweep_runs.iter().filter(|r| r.diverges) {
+                observed.insert(r.ledger_id());
+            }
+            dimensions.push(DimensionStatus {
+                name: "B. Oracle sweeps",
+                status: "implemented (the sweeps listed in the manifest; the rest of scripts/jq-*-sweep.* are not yet folded in)",
+            });
+        } else if args.dimension.contains(&Dimension::Sweeps) {
+            bail!("the sweeps dimension runs Python sweep scripts, and python3 was not found");
+        } else {
+            dimensions.push(DimensionStatus {
+                name: "B. Oracle sweeps",
                 status: "not run (python3 was not found)",
             });
         }
@@ -697,7 +733,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         }
         dimensions.push(DimensionStatus {
             name: "F. Robustness",
-            status: "implemented (nesting, recursion, generators, regex, large values, SIGPIPE, the memory-limit probes are not yet included)",
+            status: "implemented (nesting, recursion, generators, regex, large values, SIGPIPE, memory limits)",
         });
     }
     let (mut perf_rows, mut perf_note) = (vec![], None);
@@ -848,8 +884,8 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     if args.ledger_only && run_suites.is_empty() {
         bail!(
             "--ledger-only ran no suite: --dimension names only dimensions it skips (smoke, \
-             performance, operational, fuzz); the ledger is fed by features, cli, differential, input \
-             and robustness"
+             performance, operational, fuzz); the ledger is fed by features, cli, differential, input, \
+             robustness and sweeps"
         );
     }
     let ledger_outcome = ledger::check(&known, &observed, &run_suites);
@@ -912,6 +948,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         secondary_suites_skipped,
         input,
         fuzz: fuzz_summary,
+        sweeps: sweep_runs,
         robust: robust_rows,
         operational: operational_info,
         perf: perf_rows,

@@ -88,7 +88,8 @@ def run(cmd, tz, prog, items):
     p = subprocess.run(cmd + ["-c", prog], input="[" + ",".join(items) + "]", capture_output=True,
                        text=True, env=env, timeout=300)
     if p.returncode != 0:
-        sys.exit(f"{cmd[0]} failed for TZ={tz!r} (exit {p.returncode}): {p.stderr.strip()[:200]}")
+        print(f"{cmd[0]} failed for TZ={tz!r} (exit {p.returncode}): {p.stderr.strip()[:200]}", file=sys.stderr)
+        sys.exit(2)
     return [json.loads(line) for line in p.stdout.splitlines()]
 
 

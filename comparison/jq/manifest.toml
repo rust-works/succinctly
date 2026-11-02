@@ -147,6 +147,88 @@ seeds = [1, 2, 3]
 programs = 2000
 depth = 3
 
+# Dimension B's oracle sweeps (`--dimension sweeps`, #5552): the `scripts/jq-*-sweep.*` scripts that
+# judge one build against jq on their own, each with its own list of expected residuals. The runner
+# reads only the exit status (0 agrees, 1 diverges, anything else is an error, and so is exit 1 with
+# a Python traceback), so a sweep's grid and rules stay in the script, which must exit 2, not 1, on
+# a setup error. `{subject}` and `{jq}` name the two binaries; `JQ_ORACLE` and `JQ` are set to the
+# reference for the scripts that read the oracle from the environment. The same arguments run under
+# `--quick`: a sample that missed a ledgered `sweep:<id>` would call it stale. A sweep is listed only
+# if it can fail without `--base` and runs in bounded time and memory; comparison/jq/README.md says
+# why each of the others is not. `timeout_s` is about ten times a run on an M4 Pro.
+
+[[sweep]]
+id = "alt-passthrough"
+script = "scripts/jq-alt-passthrough-sweep.py"
+args = ["--bin", "{subject}", "--jq", "{jq}"]
+timeout_s = 2400
+
+[[sweep]]
+id = "alt-retry"
+script = "scripts/jq-alt-retry-oracle-sweep.sh"
+args = ["{subject}"]
+timeout_s = 300
+
+[[sweep]]
+id = "assign-rhs"
+script = "scripts/jq-assign-rhs-oracle-sweep.py"
+args = ["{subject}"]
+timeout_s = 300
+
+[[sweep]]
+id = "fanout"
+script = "scripts/jq-fanout-oracle-sweep.sh"
+args = ["{subject}"]
+timeout_s = 300
+
+[[sweep]]
+id = "fold-fresh-source"
+script = "scripts/jq-fold-fresh-source-sweep.py"
+args = ["--bin", "{subject}", "--jq", "{jq}"]
+timeout_s = 300
+
+[[sweep]]
+id = "fold-source-alt-chain"
+script = "scripts/jq-fold-source-alt-chain-sweep.py"
+args = ["--bin", "{subject}", "--jq", "{jq}"]
+timeout_s = 300
+
+[[sweep]]
+id = "libm"
+script = "scripts/jq-libm-oracle-sweep.sh"
+args = ["{subject}"]
+timeout_s = 300
+
+[[sweep]]
+id = "localtime"
+script = "scripts/jq-localtime-oracle-sweep.py"
+args = ["--check-fields", "{subject}"]
+timeout_s = 300
+
+[[sweep]]
+id = "nested-fold-frozen-var"
+script = "scripts/jq-nested-fold-frozen-var-sweep.py"
+args = ["--bin", "{subject}", "--jq", "{jq}"]
+timeout_s = 300
+
+[[sweep]]
+id = "nested-fold-outer-var"
+script = "scripts/jq-nested-fold-outer-var-sweep.py"
+args = ["--bin", "{subject}", "--jq", "{jq}"]
+timeout_s = 600
+
+[[sweep]]
+id = "seq"
+script = "scripts/jq-seq-oracle-sweep.py"
+args = ["--oracle", "{jq}", "{subject}"]
+timeout_s = 300
+
+[[sweep]]
+id = "stream-errors"
+script = "scripts/jq-stream-errors-oracle-sweep.py"
+args = ["{subject}", "--oracle", "{jq}"]
+timeout_s = 300
+
 [[input]]
 id = "users-1mb"
 shape = "users"
