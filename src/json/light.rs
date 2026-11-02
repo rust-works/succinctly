@@ -3902,7 +3902,8 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 /// ==>` round-trips; see those two tests' own doc comments for why the
 /// converse isn't asserted -- swept over a hand-picked corpus plus a
 /// differential/fuzz corpus that deliberately includes non-ASCII and
-/// edge-byte content per `CLAUDE.md`'s fuzz-alphabet rule.
+/// edge-byte content per the fuzz-alphabet rule in the testing skill
+/// (`.claude/skills/testing/SKILL.md`).
 ///
 /// This is the form `stream_json`'s echo branch uses, and the reason it can
 /// skip [`JsonCursor::raw_bytes`] entirely (#2608 follow-up). `raw_bytes`
@@ -8184,7 +8185,7 @@ mod tests {
     /// `is_canonical_compact_jq_span(doc) == true ==>` `doc` round-trips
     /// through the re-render unchanged -- swept over multi-byte-UTF-8-and-
     /// edge-byte documents a seeded generator builds, rather than a
-    /// hand-picked list (the fuzz-alphabet rule in `CLAUDE.md`: a fuzzer
+    /// hand-picked list (the fuzz-alphabet rule in the testing skill: a fuzzer
     /// that only ever emits ASCII cannot find a bug in a UTF-8-aware
     /// checker). One direction only, not the full biconditional the
     /// corpus test above checks where it can afford to: the generator
@@ -8315,7 +8316,7 @@ mod tests {
         /// `wide` counts the objects this call tree drew wider than
         /// `PAIRWISE_SPAN_SCAN_LIMIT`, so the sweep below can assert it
         /// actually reached `scan_canonical_object`'s table tier instead
-        /// of taking it on trust (`CLAUDE.md`: a fuzz route's weight is
+        /// of taking it on trust (the testing skill: a fuzz route's weight is
         /// part of the claim).
         fn gen_value(rng: &mut ChaCha8Rng, depth: u32, out: &mut Vec<u8>, wide: &mut usize) {
             if depth == 0 || rng.random_bool(0.35) {
@@ -8413,7 +8414,7 @@ mod tests {
             // the `KeyHashes` seeding nor the table ever runs. Most wide
             // objects therefore draw canonical-only content; the rest are
             // left alone so the decline path is swept at width too. (The
-            // `CLAUDE.md` rule that a fuzz route's weight is part of the
+            // testing skill's rule that a fuzz route's weight is part of the
             // claim: the assertions at the end of this test pin both.)
             let canonical_content = widened && rng.random_bool(0.8);
             // Occasionally force a repeated key, deliberately -- the
