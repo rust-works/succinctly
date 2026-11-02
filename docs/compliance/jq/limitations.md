@@ -11971,7 +11971,8 @@ The shortcut fires only where `==` is handed two handles on one storage, so the 
 Still different:
 
 - **Spellings of a fold step that stores its loop variable that still rebuild it** ([#5761](https://github.com/rust-works/succinctly/issues/5761), #5540 follow-up).
-  `(.x, .y) += $v`, `(.x += $v)?`, a container-valued field read stored on its own (`.x = $r.items`) and a compound store of the whole state followed by an identity stage (`. += $v | .`, `. //= $v | .`) are `false` here and `true` in jq.
+  A container-valued field read stored on its own (`.x = $r.items`) is `false` here and `true` in jq.
+  The right-hand side of any `op=` or `//=` keeps the operand's storage ([#5761](https://github.com/rust-works/succinctly/issues/5761)), in a fold or not: `(.x, .y) += $v`, `(.x += $v)?`, `. += $v | .`, `null | . += $a` and `{x:null} | .x += $a` are `true`, as in jq.
   The whole-state spellings `. += $v` (jq's own `add` is `reduce .[] as $x (null; . + $x)`) and `. //= $v` over a `null` or `false` state keep the element, and so does an `as` rebind (`$v as $w | .x = $w`) ([#5761](https://github.com/rust-works/succinctly/issues/5761)).
   A whole-variable read in a sibling stage shares the node (`.y = $r | .x = $r.items`), so the answer follows an unrelated read.
   A slice assigned onto `null`, a `del` whose last index names nothing and `.[5] |= empty` build a new array, as jq does ([#5761](https://github.com/rust-works/succinctly/issues/5761)): `[nan] as $a | null | .[1:] = $a | . == $a` and `$a | del(.[5]) == $a` are `false`.

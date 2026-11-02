@@ -102,6 +102,10 @@ pub struct Tracked {
     /// first, so neither the element nor the entry is ever written. The markers an `as`
     /// binding makes, and the path markers, are not this: an in-place step declines them
     /// (#3241, #4005).
+    ///
+    /// The same flag marks the right-hand side of an `op=` / `//=` (#5761): a by-value handle
+    /// the write may store, so `null | . += $a` keeps `$a`'s storage. What the two uses share
+    /// is the contract, not the fold.
     pub fold_share: bool,
 }
 

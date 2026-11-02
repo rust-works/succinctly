@@ -211,14 +211,14 @@ fn test_fold_compound_store_over_a_null_state_keeps_the_element_5761() -> Result
         ("reduce range(2) as $i (null; . //= (1,2))", "2"),
         ("reduce range(2) as $i (1; . //= empty)", "null"),
         ("[foreach range(3) as $i (false; . //= $i; .)]", "[0,0,0]"),
-        // Still `false` here and `true` in jq: a trailing identity stage after the store.
+        // A trailing identity stage after the store (`false` until the operand kept its storage).
         (
             "[nan] as $a | reduce $a as $v (null; . += $v | .) | . == $a",
-            "false",
+            "true",
         ),
         (
             "[nan] as $a | reduce $a as $v (null; . //= $v | .) | . == $a",
-            "false",
+            "true",
         ),
         // A write after the store copies: the bound value is unchanged.
         (
@@ -254,6 +254,54 @@ fn test_fold_alternative_store_evaluates_its_operand_first_5761() -> Result<()> 
             ("", 5, 1),
             "{filter}: {stderr}"
         );
+    }
+    Ok(())
+}
+
+/// The right-hand side of `op=` / `//=` is the operand's own storage in jq (`jv_identical`), so a
+/// NaN-bearing container stored through any spelling still equals itself. These were `false`: the
+/// per-path filter rebuilt the operand from literals. Fold or not, one path or several.
+#[test]
+#[cfg_attr(
+    feature = "unshared-containers",
+    ignore = "holdout has no node identity or sharing (#5254)"
+)]
+fn test_compound_and_alternative_store_keep_the_operand_storage_5761() -> Result<()> {
+    for filter in [
+        "[nan] as $a | reduce $a as $v ({\"x\":null,y:null}; (.x,.y) += $v) | .x == $a",
+        "[nan] as $a | reduce $a as $v ({\"x\":null,y:null}; (.x,.y) += $v) | .y == $a",
+        "[nan] as $a | reduce $a as $v ({\"x\":null}; (.x += $v)?) | .x == $a",
+        "[nan] as $a | reduce $a as $v (null; . += $v | .) | . == $a",
+        "[nan] as $a | reduce $a as $v (null; . //= $v | .) | . == $a",
+        "[nan] as $a | reduce $a as $v (null; (. += $v)?) | . == $a",
+        "[nan] as $a | null | . += $a | . == $a",
+        "[nan] as $a | null | . //= $a | . == $a",
+        "[nan] as $a | {\"x\":null} | .x += $a | .x == $a",
+        "[nan] as $a | {\"x\":null} | (.x,.y) += $a | .x == $a",
+        "[nan] as $a | {\"x\":null} | .x //= $a | .x == $a",
+    ] {
+        assert_eq!(answer(filter)?, "true\n", "{filter}");
+    }
+    Ok(())
+}
+
+/// What the operand's marker must not change: errors, several right-hand sides, `path()`, a write
+/// after the store, a NaN through `-=`, and an object merge.
+#[test]
+fn test_compound_store_with_a_container_operand_keeps_its_results_5761() -> Result<()> {
+    for (filter, expected) in [
+        ("{\"a\":1} | try (.a += [1]) catch .", "\"number (1) and array ([1]) cannot be added\""),
+        ("{\"a\":\"s\"} | try (.a -= {}) catch .", "\"string (\\\"s\\\") and object ({}) cannot be subtracted\""),
+        ("{\"a\":[1]} | .a += ([2],[3])", "{\"a\":[1,2]}\n{\"a\":[1,3]}"),
+        ("{\"a\":[1]} | .a += [2] | .a[1] = 7", "{\"a\":[1,7]}"),
+        ("[nan] as $a | {\"x\":[nan]} | .x -= $a | .x", "[null]"),
+        ("{\"a\":{\"x\":{\"p\":1}}} | .a *= {\"x\":{\"q\":2}}", "{\"a\":{\"x\":{\"p\":1,\"q\":2}}}"),
+        ("{\"a\":null} | .a //= [1,{\"b\":2}]", "{\"a\":[1,{\"b\":2}]}"),
+        ("[[1],[2],[3]] | .[] += [0] | length", "3"),
+        ("[[1],[2]] | map(. += [9])", "[[1,9],[2,9]]"),
+        ("{} | .a.b += {\"c\":[1]}", "{\"a\":{\"b\":{\"c\":[1]}}}"),
+    ] {
+        assert_eq!(answer(filter)?, format!("{expected}\n"), "{filter}");
     }
     Ok(())
 }
