@@ -127,8 +127,8 @@ pub use eval::{
     enter_source_positions_scope, eval, eval_documents_together, eval_lenient,
     eval_owned_with_file_index, expr_key, is_alias_sensitive_assign, nonfinite_display_string,
     nonfinite_literal_display, substitute_named_args, substitute_vars, sync_aliased_paths,
-    with_stack_budget, DefScope, EvalSemantics, FileIndexScope, FileNamesScope, JqSemantics,
-    QueryResult, SourcePositionsScope, VisibleDef, YqSemantics,
+    with_stack_budget, with_value_depth_on_stack_floor, DefScope, EvalSemantics, FileIndexScope,
+    FileNamesScope, JqSemantics, QueryResult, SourcePositionsScope, VisibleDef, YqSemantics,
 };
 #[doc(hidden)]
 pub use eval::{eval_full, eval_owned_scalar_fast, eval_reindexed_document, with_stderr_muted};
@@ -183,6 +183,7 @@ pub use value::{
     FlaggedOccurrences, NumberRepr, ObjectMap, ObjectMapEntry, ObjectMapIntoIter, ObjectMapOf,
     OccupiedMapEntry, Occurrences, OwnedValue, ReindexedDoc, SharableLiteral, SharableString,
     VacantMapEntry, JQ_MAX_PRINT_DEPTH, MAX_VALUE_TREE_DEPTH, SKIPPED_TOO_DEEP,
+    STACK_FLOOR_NESTING_MESSAGE,
 };
 // `pub(crate)`, not `pub`: only `yaml::light`'s alias-chain resolvers (#1191
 // code review, #1193/PR #1314) need this from outside `jq::value` --

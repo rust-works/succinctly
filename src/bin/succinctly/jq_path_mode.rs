@@ -73,7 +73,11 @@ pub fn run(args: JqPathModeArgs) -> i32 {
             succinctly::jq::with_stack_budget(crate::EVAL_STACK_SIZE, || {
                 // Compiled again on this thread: the program holds `Rc`s.
                 match path_mode::compile(&filter) {
-                    Ok(program) => run_inputs(&program, bytes.as_deref(), raw, null_input),
+                    // A built value is bounded by that floor past 384 levels, as in
+                    // `succinctly jq` (#5554).
+                    Ok(program) => succinctly::jq::with_value_depth_on_stack_floor(|| {
+                        run_inputs(&program, bytes.as_deref(), raw, null_input)
+                    }),
                     Err(_) => 3, // patchcov: coverage tolerate-line reason="unreachable: the same filter compiled above"
                 }
             })

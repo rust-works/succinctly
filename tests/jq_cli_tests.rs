@@ -33346,46 +33346,43 @@ fn test_path_cursor_native_static_chain_up_to_384_answers_3429() -> Result<()> {
 /// `test_reduce_growth_past_value_tree_depth_reports_cleanly_3261` pins
 /// its exit-5 diagnostic. Only `succinctly yq`'s own YAML-emission pipeline
 /// remains unfixed on this guard, tracked separately as #3278.
+///
+/// Since #5554 the guard is the native-stack floor in jq mode, not 384, so a 500-component chain
+/// answers jq 1.7.1's path; a chain deep enough to reach the floor would not fit on a command line.
+/// `i5554c.rs` pins the refusal past it, and the yq-mode test below still pins 384.
 #[test]
-fn test_path_non_cursor_native_deep_static_chain_reports_clean_error_not_panic_2058_3275(
-) -> Result<()> {
+fn test_path_non_cursor_native_deep_static_chain_answers_as_jq_2058_3275_5554() -> Result<()> {
     let filter = format!("path({}[0:1])", ".a".repeat(500));
     let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("{}"))?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "", "stdout: {stdout:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
-        "stderr: {stderr:?}"
-    );
-    assert!(
-        !stderr.contains("panicked at")
-            && !stderr.contains("RUST_BACKTRACE")
-            && !stderr.contains("stack overflow")
-            && !stderr.contains("fatal runtime error"),
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    let mut expected: Vec<serde_json::Value> = (0..500).map(|_| "a".into()).collect();
+    expected.push(serde_json::json!({"start": 0, "end": 1}));
+    assert_eq!(
+        stdout.trim_end(),
+        serde_json::Value::Array(expected).to_string(),
         "stderr: {stderr:?}"
     );
     Ok(())
 }
 
-/// #3275: the depth error `path()`'s non-cursor-native walk now reports is
-/// [`EvalError::resource_limit`]-tagged and therefore uncatchable (#2132) --
-/// `try`/`catch`, a bare `?`, and a demand-driven consumer like `first(f)`
-/// (the `each_path_on_owned` streaming arm) must all still exit 5 with the
-/// diagnostic rather than silently answering something else.
+/// #3275: `try`/`catch`, a bare `?`, and a demand-driven consumer like `first(f)` (the
+/// `each_path_on_owned` streaming arm) around the same deep walk. It used to be refused there,
+/// uncatchably; since #5554 the walk answers in jq mode, as jq 1.7.1 does (`501` for each, `1`
+/// for the collected form). The refusal's uncatchability past the floor is
+/// `value_depth_defers_to_the_floor_only_when_armed_and_registered_5554`'s.
 #[test]
-fn test_path_non_cursor_native_depth_error_is_uncatchable_3275() -> Result<()> {
+fn test_path_non_cursor_native_deep_walk_under_try_answers_as_jq_3275_5554() -> Result<()> {
     let deep = format!("path({}[0:1])", ".a".repeat(500));
-    for filter in [
-        format!(r#"try {deep} catch "x""#),
-        format!("{deep}?"),
-        format!("[{deep}?]"),
-        format!("first({deep})"),
+    for (filter, want) in [
+        (format!(r#"try {deep} catch "x" | length"#), "501"),
+        (format!("{deep}? | length"), "501"),
+        (format!("[{deep}?] | length"), "1"),
+        (format!("first({deep}) | length"), "501"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("{}"))?;
-        assert_eq!(code, 5, "`{filter}`: stdout={stdout:?} stderr={stderr:?}");
-        assert_eq!(stdout, "", "`{filter}`: stdout={stdout:?}");
-        assert!(
-            stderr.contains("nesting depth exceeds limit of 384"),
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (want, 0),
             "`{filter}`: stderr={stderr:?}"
         );
     }
@@ -33394,7 +33391,8 @@ fn test_path_non_cursor_native_depth_error_is_uncatchable_3275() -> Result<()> {
 
 /// #3275 boundary: 383 static components plus a trailing slice is exactly
 /// at, not past, `MAX_VALUE_TREE_DEPTH` (384) and must still answer the
-/// same path jq does; one more component crosses it.
+/// same path jq does. One more component used to cross it; since #5554 it
+/// answers too in jq mode (jq 1.7.1: 385 components).
 #[test]
 fn test_path_non_cursor_native_depth_boundary_3275() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -33411,29 +33409,23 @@ fn test_path_non_cursor_native_depth_boundary_3275() -> Result<()> {
     );
 
     let (stdout, stderr, code) = run_jq_full(
-        &["-c", &format!("path({}[0:1])", ".a".repeat(384))],
+        &["-c", &format!("path({}[0:1]) | length", ".a".repeat(384))],
         Some("{}"),
     )?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
-        "stderr: {stderr:?}"
-    );
+    assert_eq!((stdout.trim_end(), code), ("385", 0), "stderr: {stderr:?}");
     Ok(())
 }
 
-/// #3275 error ordering (#2680's rule): a position reached *before* the
-/// depth error still gets emitted, since it comes first in `path()`'s own
-/// generator order -- the same "never un-emit an output already produced"
-/// contract `walk_pipe`'s doc comment already documents for other errors.
+/// #3275 generator order (#2680's rule): the shallow position comes first and
+/// the deep one after it. The deep one used to be refused after `["a"]` was
+/// printed; since #5554 both answer in jq mode, as in jq 1.7.1 (`1`, `501`).
 #[test]
-fn test_path_non_cursor_native_depth_error_preserves_earlier_output_3275() -> Result<()> {
-    let filter = format!("path(.a, ({}) [0:1])", ".a".repeat(500));
+fn test_path_non_cursor_native_deep_walk_keeps_generator_order_3275_5554() -> Result<()> {
+    let filter = format!("path(.a, ({}) [0:1]) | length", ".a".repeat(500));
     let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("{}"))?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), r#"["a"]"#, "stdout: {stdout:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("1\n501\n", 0),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -33609,20 +33601,23 @@ fn test_sort_on_non_array_is_unaffected_by_1793_fix() -> Result<()> {
 /// (the non-cursor-native `path()` walk in `eval.rs`) that #3261 did not
 /// touch and that still panics uncaught by design -- that test remains the
 /// living proof `nesting_depth_panic_message`'s narrowing still matters.
+///
+/// #5554 superseded it again: in jq mode the bridge's guard is the native-stack
+/// floor past 384 levels, so this repro answers as jq 1.7.1 does, printing 257
+/// levels and `<skipped: too deep>`. `i5554c.rs` pins the refusal past the floor.
 #[test]
-fn test_reduce_growth_past_value_tree_depth_reports_cleanly_3261() -> Result<()> {
+fn test_reduce_growth_past_value_tree_depth_answers_as_jq_3261_5554() -> Result<()> {
     let (stdout, stderr, code) =
         run_jq_full(&["-c", "reduce range(400) as $i (null; [.])"], Some("null"))
             .unwrap_or_else(|e| panic!("run failed: {e}"));
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "", "stdout: {stdout:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
-        "stderr: {stderr:?}"
+    let want = format!(
+        "{}<skipped: too deep>{}\n",
+        "[".repeat(257),
+        "]".repeat(257)
     );
-    assert!(
-        !stderr.contains("panicked") && !stderr.contains("stack overflow"),
-        "stderr: {stderr:?}"
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        (want.as_str(), "", 0)
     );
     Ok(())
 }
@@ -33638,8 +33633,11 @@ fn test_reduce_growth_past_value_tree_depth_reports_cleanly_3261() -> Result<()>
 /// despite not pinning `builtin_with_entries`'s own arm specifically --
 /// that arm's own tolerate-line annotation (`eval.rs`) explains why no
 /// input can reach it independently.
+///
+/// Since #5554 the field passes the bridge in jq mode (the floor bounds it, not
+/// 384), so the pipeline answers as jq 1.7.1 does.
 #[test]
-fn test_with_entries_entry_value_past_depth_limit_reports_cleanly_3261() -> Result<()> {
+fn test_with_entries_entry_value_past_depth_limit_answers_as_jq_3261_5554() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-nc",
@@ -33648,15 +33646,14 @@ fn test_with_entries_entry_value_past_depth_limit_reports_cleanly_3261() -> Resu
         None,
     )
     .unwrap_or_else(|e| panic!("run failed: {e}"));
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "", "stdout: {stdout:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
-        "stderr: {stderr:?}"
+    let want = format!(
+        "{{\"a\":{}<skipped: too deep>{}}}\n",
+        "[".repeat(256),
+        "]".repeat(256)
     );
-    assert!(
-        !stderr.contains("panicked") && !stderr.contains("stack overflow"),
-        "stderr: {stderr:?}"
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        (want.as_str(), "", 0)
     );
     Ok(())
 }
@@ -101644,17 +101641,10 @@ fn test_resource_limit_caps_are_uncatchable_2132() -> Result<()> {
             "def f: 1, [f]; f",
             "f/0 exceeded maximum recursion depth",
         ),
-        // #3261: MAX_VALUE_TREE_DEPTH, reached via reduce/foreach's own
-        // per-iteration reindex bridge -- newly routed through the
-        // catchable EvalError machinery by that fix, so it must be tagged
-        // `resource_limit` like every other cap in this table or it
-        // silently regresses into exactly the #2089 class this test
-        // guards against.
-        (
-            "MAX_VALUE_TREE_DEPTH",
-            "reduce range(400) as $i (null; [.])",
-            "nesting depth exceeds limit of 384",
-        ),
+        // #3261's MAX_VALUE_TREE_DEPTH row: since #5554 the bound in jq mode is
+        // the native-stack floor, which takes a value two million levels deep to
+        // reach. `i5554c.rs`'s `a_walk_past_the_native_stack_floor_refuses_at_exit_5_5554`
+        // runs these three spellings over it, in the deep-recursion leg.
     ] {
         for spelling in [
             format!("[{expr}?] | length"),

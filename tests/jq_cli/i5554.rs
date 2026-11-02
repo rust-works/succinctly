@@ -4,9 +4,9 @@
 //! Every expected value was captured from jq 1.7.1 (`/usr/bin/jq`).
 //!
 //! A pipe whose first stage renders the value is covered, alone or under `try`/`?`, as an `as`
-//! source whose body ignores `.`, or as a format-prefixed interpolation. The same stage inside a
-//! comma, `map` or an iteration of a too-deep array still reads the refusal (recorded in the
-//! limitations page).
+//! source whose body ignores `.`, or as a format-prefixed interpolation. In jq mode the bridge
+//! itself is bounded by the native-stack floor since Option 3 (`i5554c.rs`), so this text stage is
+//! now the fallback past that floor.
 
 use anyhow::Result;
 
@@ -95,16 +95,9 @@ fn test_text_stage_under_try_as_and_format_interpolation_5554() -> Result<()> {
 }
 
 #[test]
-fn test_a_binding_body_that_reads_the_deep_input_keeps_the_refusal_5554() -> Result<()> {
-    // `. as $x | .` reads the value, which the bridge cannot index: still refused here.
-    let (_, stderr, code) = run_jq_full(
-        &["-nc", &format!("{DEF} f(400) | tojson as $x | . | length")],
-        None,
-    )?;
-    assert_ne!(code, 0);
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
-        "{stderr}"
-    );
+fn test_a_binding_body_that_reads_the_deep_input_answers_as_jq_5554() -> Result<()> {
+    // `. as $x | .` reads the value through the bridge, which the native-stack floor bounds since
+    // Option 3 of #5554 rather than 384; jq 1.7.1 answers `1`.
+    assert_eq!(answer("f(400) | tojson as $x | . | length")?, "1\n");
     Ok(())
 }

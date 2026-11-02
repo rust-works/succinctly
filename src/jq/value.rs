@@ -130,10 +130,45 @@ pub fn nesting_depth_exceeded_message(max: usize) -> String {
 /// See that constant's own doc comment for why this exists as a second,
 /// independently-tuned ceiling alongside
 /// [`eval_generic::assert_nesting_depth`](super::eval_generic::assert_nesting_depth).
+///
+/// Past 384 levels, under [`with_value_depth_on_stack_floor`](super::with_value_depth_on_stack_floor),
+/// the bound is the native-stack floor instead (#5554), and the panic says so.
 #[track_caller]
+#[inline]
 pub fn assert_value_tree_depth(depth: usize) {
-    assert_depth(depth, MAX_VALUE_TREE_DEPTH);
+    if depth >= MAX_VALUE_TREE_DEPTH {
+        assert_value_tree_depth_past_constant();
+    }
 }
+
+/// [`assert_value_tree_depth`] past [`MAX_VALUE_TREE_DEPTH`]: out of line, so the walks below the
+/// constant compare once and branch, as they did before the floor (#5554).
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn assert_value_tree_depth_past_constant() {
+    assert!(
+        super::eval::value_depth_on_stack_floor(),
+        "{}",
+        value_tree_depth_exceeded_message()
+    );
+}
+
+/// What a walk refused past the value-tree bound reports (#5554): the constant's message, or
+/// [`STACK_FLOOR_NESTING_MESSAGE`] where the bound is the native-stack floor.
+pub fn value_tree_depth_exceeded_message() -> String {
+    if super::eval::value_depth_floor_armed() {
+        STACK_FLOOR_NESTING_MESSAGE.to_string()
+    } else {
+        nesting_depth_exceeded_message(MAX_VALUE_TREE_DEPTH)
+    }
+}
+
+/// The refusal of a walk over a built value once the native-stack floor is spent (#5554).
+///
+/// Raised under [`with_value_depth_on_stack_floor`](super::with_value_depth_on_stack_floor). It
+/// quotes no depth: where it fires depends on the stack the thread has and what each level costs.
+pub const STACK_FLOOR_NESTING_MESSAGE: &str = "nesting depth exceeds limit of the native stack";
 
 /// [`assert_value_tree_depth`]'s checked twin (#2850), the same relationship
 /// [`eval_generic::check_nesting_depth`](super::eval_generic::check_nesting_depth)
@@ -148,13 +183,29 @@ pub fn assert_value_tree_depth(depth: usize) {
 /// semantics cannot have meant "accept a truncated value here either" (the
 /// same `[range(100001)?]` reasoning #2089/#2132 already established for
 /// every other internal ceiling).
+///
+/// Past 384 levels it defers to the native-stack floor the way [`assert_value_tree_depth`] does
+/// (#5554).
+#[inline]
 pub fn check_value_tree_depth(depth: usize) -> Result<(), EvalError> {
     if depth < MAX_VALUE_TREE_DEPTH {
         Ok(())
     } else {
-        Err(EvalError::resource_limit(nesting_depth_exceeded_message(
-            MAX_VALUE_TREE_DEPTH,
-        )))
+        check_value_tree_depth_past_constant()
+    }
+}
+
+/// [`check_value_tree_depth`] past [`MAX_VALUE_TREE_DEPTH`], out of line like
+/// [`assert_value_tree_depth_past_constant`].
+#[cold]
+#[inline(never)]
+fn check_value_tree_depth_past_constant() -> Result<(), EvalError> {
+    if super::eval::value_depth_on_stack_floor() {
+        Ok(())
+    } else {
+        Err(EvalError::resource_limit(
+            value_tree_depth_exceeded_message(),
+        ))
     }
 }
 
