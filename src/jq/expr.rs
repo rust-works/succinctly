@@ -5377,6 +5377,54 @@ mod tests {
         assert!(plain.tails.origin.is_none());
     }
 
+    /// #5871: a tail of a linked pipe that holds state is split into a link and the stages from
+    /// the first stateful one, and the stages after the link keep the table: the split's stage `j`
+    /// is the pipe's stage `from + first + j - 1`, so a tail of the split reaches the tail of the
+    /// pipe it is made of. A pipe that is not linked splits into a pipe that is not either, and a
+    /// prefix shorter than [`MIN_STATELESS_PREFIX`] stays a copy.
+    #[test]
+    fn test_split_state_tail_keeps_the_table_at_the_offset_of_its_first_stage_5871() {
+        let reads = |e: &Expr| matches!(e, Expr::Var(_));
+        let mut stages = vec![Expr::Field("a".into()); 10];
+        stages[2] = Expr::Var("x".into());
+        let source = PipeStages::from(stages);
+        let rebuild = || {
+            let mut copy = PipeStages::from(source.to_vec());
+            copy.share_tails_of(&source, |_| StageClass::Run, Some(&reads));
+            copy
+        };
+        let _first = rebuild();
+        let second = rebuild();
+        let kept = second
+            .kept_tail(5, |_| true)
+            .expect("after the reading stage");
+        // The last stateful stage is the 10th; the first of the tail from 1 is its 4th.
+        second.state_end.set(Some(10));
+        let split = second.tail_copy(1, |_| unreachable!("settled"), |_| 3);
+        assert_eq!(
+            split.len(),
+            1 + 6,
+            "one link, then the pipe's stages 4 to 9"
+        );
+        assert!(matches!(&split[0], Expr::Shared(arg) if arg.run_stages().is_some()));
+        assert_eq!(split[1], second[4]);
+        assert_eq!(split.state_end.get(), Some(7));
+        // Stage 3 of the split is the pipe's stage 6; its tail from 2 is the pipe's from 5.
+        assert!(split
+            .kept_tail(2, |_| unreachable!("made for the second"))
+            .is_some_and(|tail| Rc::ptr_eq(&tail, &kept)));
+        // Not linked: split, and linked to nothing.
+        let unlinked = PipeStages::from(vec![Expr::Field("a".into()); 10]);
+        unlinked.state_end.set(Some(10));
+        let plain = unlinked.tail_copy(1, |_| unreachable!("settled"), |_| 3);
+        assert_eq!(plain.len(), 7);
+        assert!(plain.tails.origin.is_none());
+        // A prefix of one stage stays a copy.
+        let short = second.tail_copy(1, |_| unreachable!("settled"), |_| 1);
+        assert_eq!(short.len(), 9);
+        assert!(matches!(&short[0], Expr::Field(_)));
+    }
+
     /// #5441: a pipe rebuilt from one that reads a variable splits a tail that
     /// holds a reading stage around it, wherever it is, once the tail is long
     /// enough: the runs between the reading stages are the ones the source
