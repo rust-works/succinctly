@@ -733,7 +733,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         }
         dimensions.push(DimensionStatus {
             name: "F. Robustness",
-            status: "implemented (nesting, recursion, generators, regex, large values, SIGPIPE, the memory-limit probes are not yet included)",
+            status: "implemented (nesting, recursion, generators, regex, large values, SIGPIPE, memory limits)",
         });
     }
     let (mut perf_rows, mut perf_note) = (vec![], None);
