@@ -2525,8 +2525,30 @@ fn yq_type_tag<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> String
         {
             return tag;
         }
+        if let Some(tag) = plain_merge_tag(&c, value) {
+            return tag.to_string();
+        }
     }
     document_value_type_tag(value).to_string()
+}
+
+/// `!!merge` for a plain `<<` scalar, the tag YAML resolves it to wherever it sits, value or key,
+/// which yq reports (`tag`, `type`) and writes (`a: !!merge <<`, #5833); `None` for anything
+/// else. A quoted `"<<"` and a JSON string are `!!str`. The source text is checked first, so a
+/// node that is not spelled `<<` costs two byte compares and no decode.
+pub(crate) fn plain_merge_tag<C: DocumentCursor, V: DocumentValue>(
+    cursor: &C,
+    value: &V,
+) -> Option<&'static str> {
+    let pos = cursor.text_position()?;
+    let text = cursor.doc_text();
+    let spelled = text.get(pos..pos + 2) == Some(b"<<".as_slice())
+        && text.get(pos + 2).map_or(true, |b| {
+            matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}')
+        });
+    // A block mapping whose first key is `<<` starts at the same byte; only a scalar is the merge
+    // scalar. A cursor whose own value is an alias resolves to its anchor's, which is not this node.
+    (spelled && !cursor.is_alias() && value.as_str().is_some()).then_some("!!merge")
 }
 
 /// Which YAML anchor/alias syntax a node carried in the source document
@@ -3516,9 +3538,12 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             if child_under_alias {
                 None
             } else {
-                cursor
-                    .and_then(DocumentCursor::explicit_tag_of_non_alias)
-                    .map(str::to_string)
+                cursor.and_then(|c| {
+                    c.explicit_tag_of_non_alias()
+                        // Only a plain node can be one; the style is already in hand.
+                        .or_else(|| own_style.is_empty().then(|| plain_merge_tag(c, value))?)
+                        .map(str::to_string)
+                })
             },
             None,
         ),

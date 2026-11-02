@@ -1966,6 +1966,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if let Some(tag) = self.explicit_tag_at(None) {
                     out.write_str(tag)?;
                     out.write_char(' ')?;
+                } else if is_plain_merge_scalar(&s) {
+                    // yq resolves a plain `<<` to `!!merge` wherever it sits and writes the tag
+                    // (`a: !!merge <<`, `[!!merge <<]`, #5833), as the key writer does for a
+                    // merge key.
+                    out.write_str("!!merge ")?;
                 }
                 // A source-level block literal (`|`) or folded (`>`) scalar
                 // has no branch in `stream_yaml_string_value` at all - it
@@ -5983,6 +5988,13 @@ fn upsert_field<'a, W: AsRef<[u64]>>(
             entries.push((key, value));
         }
     }
+}
+
+/// Whether `s` is a plain `<<`, which YAML resolves to the `!!merge` tag in any position (#5833).
+/// A quoted `"<<"` is a string. Compares the raw bytes: a plain scalar spelled `<<` has no
+/// escapes or folding to decode.
+pub(crate) fn is_plain_merge_scalar(s: &YamlString<'_>) -> bool {
+    matches!(s, YamlString::Unquoted { .. }) && s.raw_bytes() == b"<<"
 }
 
 /// Is this key's already-decoded value YAML's merge key?
