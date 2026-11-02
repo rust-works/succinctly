@@ -10587,6 +10587,62 @@ pub(crate) fn eval_owned_string_door<S: EvalSemantics>(
     }
 }
 
+/// A string-to-string stage of an owned string, answered from the string itself (#5816):
+/// `ltrimstr("lit")`, `rtrimstr("lit")`, `tostring` and `. + "lit"`. The answer is a new string, or
+/// the input's own handle where jq hands its input back (`ltrimstr`/`rtrimstr` with nothing to
+/// trim, `tostring` of a string, as [`tostring_owned`] does). jq mode only.
+///
+/// Apart from [`eval_owned_count_door`], whose callers rely on an answer that is no node of
+/// `input` (the `as` count bind substitutes a fresh integer or boolean): a string stage is asked
+/// for only where its answer is the value the rest of the pipe runs on or the output, in front of
+/// [`eval_each_owned`], which path resolution does not use. A non-literal or non-string argument,
+/// and every other stage, decline, and the bridge keeps its errors.
+pub(crate) fn eval_owned_string_stage<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let OwnedValue::String(text) = input else {
+        return None;
+    };
+    let literal_string = |arg: &Expr| match unwrap_paren(arg) {
+        Expr::Literal(lit) => match literal_to_owned(lit) {
+            OwnedValue::String(s) => Some(s),
+            _ => None,
+        },
+        _ => None,
+    };
+    match unwrap_paren(expr) {
+        Expr::Builtin(Builtin::Ltrimstr(pattern)) => {
+            let pattern = literal_string(pattern)?;
+            Some(match text.strip_prefix(&*pattern) {
+                Some(rest) => OwnedValue::String(rest.to_string().into()),
+                None => input.clone(),
+            })
+        }
+        Expr::Builtin(Builtin::Rtrimstr(pattern)) => {
+            let pattern = literal_string(pattern)?;
+            Some(match text.strip_suffix(&*pattern) {
+                Some(rest) => OwnedValue::String(rest.to_string().into()),
+                None => input.clone(),
+            })
+        }
+        Expr::Builtin(Builtin::ToString) => Some(input.clone()),
+        Expr::Arithmetic {
+            op: ArithOp::Add,
+            left,
+            right,
+            ..
+        } if matches!(unwrap_paren(left), Expr::Identity) => {
+            let suffix = literal_string(right)?;
+            arith_combine::<S>(ArithOp::Add, input.clone(), OwnedValue::String(suffix)).ok()
+        }
+        _ => None,
+    }
+}
+
 /// The count doors in one call: [`eval_owned_length`] (an array's or an object's length, #3477)
 /// and [`eval_owned_string_door`] (a string's length, its prefix/suffix tests, #5691, and its
 /// search builtins, #5816).
@@ -11727,6 +11783,13 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
             Demand::Stop => Flow::Stopped { pending: None },
         });
     }
+    // #5816: a string-to-string stage (`ltrimstr("x")`, `tostring`, `. + "x"`) of an owned string.
+    if let Some(answer) = eval_owned_string_stage::<S>(expr, input) {
+        return Some(match sink(answer) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        });
+    }
     // #5675: an expression that never reads `.` (`$n * 2` once `$n` is a literal, `1 + 2`,
     // `[1, 2]`) is one value whatever the input is, so the input is not written out and indexed to
     // find it. [`eval_owned_closed`] declines whatever errors, fans out or hands on a bound node.
@@ -12475,7 +12538,8 @@ fn is_peelable_head<S: EvalSemantics>(stage: &Expr) -> bool {
 }
 
 /// Take a pipe's leading `.field`/`.[n]`/`.[a:b]` (or `length`, and a string's
-/// `startswith`/`endswith`, #5712; jq mode also
+/// `startswith`/`endswith`, #5712, and its `test`/`index`/`rindex`/`inside` of a literal,
+/// `ltrimstr`/`rtrimstr`/`tostring` and `. + "lit"`, #5816; jq mode also
 /// `first`/`last`, which yq defines for itself) natively, then
 /// re-enter with the rest on the value it lands on, instead of reindexing the
 /// whole input for the bridge (#3213). A slice is answered by
@@ -12580,7 +12644,9 @@ fn projection_peel<S: EvalSemantics>(
     }
     // #3477, #5712: a leading `length` (or a string's `startswith`/`endswith`) steps to its
     // count or verdict, then the rest runs on it.
-    let counted = eval_owned_count_door::<S>(first, input);
+    // #5816: or a string-to-string stage, which steps to its string.
+    let counted = eval_owned_count_door::<S>(first, input)
+        .or_else(|| eval_owned_string_stage::<S>(first, input));
     if counted.is_none() && !is_peelable_head::<S>(first) {
         return None;
     }
@@ -115709,6 +115775,111 @@ mod tests {
                 let expr = parse(src).unwrap();
                 assert!(
                     eval_owned_string_door::<JqSemantics>(&expr, &input).is_none(),
+                    "{src:?} on {input:?}"
+                );
+            }
+        }
+    }
+
+    /// #5816: `ltrimstr`, `rtrimstr`, `tostring` and `. + "lit"` of an owned string are answered
+    /// from the string and answer what the reindex bridge does (the oracle), in jq mode; a pattern
+    /// that is not a string literal, the other operators and a non-string input decline, and so does
+    /// every shape in yq mode.
+    #[test]
+    fn eval_owned_string_stage_agrees_with_the_reindex_bridge_5816() {
+        let strings = [
+            "",
+            "a",
+            "h\u{e9}llo",
+            "\u{65e5}\u{672c}\u{8a9e}",
+            "\u{1f600}x\u{1f600}",
+            "a\nb",
+            "q\"b\\s",
+            "zzzabc",
+            "abczzz",
+            "zzz",
+            "a\n",
+        ];
+        let shapes = [
+            "ltrimstr(\"z\")",
+            "ltrimstr(\"zzz\")",
+            "ltrimstr(\"zzzz\")",
+            "ltrimstr(\"\")",
+            "ltrimstr(\"h\u{e9}\")",
+            "ltrimstr(\"\u{65e5}\")",
+            "ltrimstr(\"\u{1f600}\")",
+            "(ltrimstr(\"a\"))",
+            "rtrimstr(\"z\")",
+            "rtrimstr(\"zzz\")",
+            "rtrimstr(\"\")",
+            "rtrimstr(\"\u{8a9e}\")",
+            "rtrimstr(\"a\\n\")",
+            "rtrimstr(\"\\n\")",
+            "tostring",
+            ". + \"x\"",
+            ". + \"\"",
+            ". + \"\u{e9}\"",
+            "(. + \"\\n\")",
+        ];
+        let mut answered = 0;
+        for text in strings {
+            let value = OwnedValue::String(text.into());
+            for src in shapes {
+                let expr = parse(src).unwrap();
+                let fast = eval_owned_string_stage::<JqSemantics>(&expr, &value)
+                    .unwrap_or_else(|| panic!("{src:?} on {text:?} declined"));
+                answered += 1;
+                let bridge = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, &value, false,
+                ));
+                assert_eq!(
+                    debug_normalize(QueryResult::<Vec<u64>>::Owned(fast)),
+                    bridge,
+                    "{src:?} on {text:?}"
+                );
+                assert!(
+                    eval_owned_string_stage::<YqSemantics>(&expr, &value).is_none(),
+                    "{src:?} on {text:?} answered in yq mode"
+                );
+            }
+        }
+        assert_eq!(answered, strings.len() * shapes.len());
+        let value = OwnedValue::String("abc".into());
+        for src in [
+            "ltrimstr(.)",
+            "ltrimstr(1)",
+            "ltrimstr(null)",
+            "ltrimstr(\"a\", \"b\")",
+            "rtrimstr(.)",
+            "rtrimstr(1)",
+            ". + 1",
+            ". + .",
+            "\"x\" + .",
+            ". - \"x\"",
+            ". * \"x\"",
+            "length",
+            "ascii_downcase",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(
+                eval_owned_string_stage::<JqSemantics>(&expr, &value).is_none(),
+                "{src:?} was answered"
+            );
+        }
+        for input in [
+            OwnedValue::Null,
+            OwnedValue::Int(1),
+            OwnedValue::array_from(vec![]),
+        ] {
+            for src in [
+                "ltrimstr(\"a\")",
+                "rtrimstr(\"a\")",
+                "tostring",
+                ". + \"a\"",
+            ] {
+                let expr = parse(src).unwrap();
+                assert!(
+                    eval_owned_string_stage::<JqSemantics>(&expr, &input).is_none(),
                     "{src:?} on {input:?}"
                 );
             }
