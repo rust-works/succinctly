@@ -40,6 +40,11 @@ fn constructor_folds_answer_as_jq_5875() -> Result<()> {
         (r"reduce range(300) as $i (0; [.]) | flatten", None, "[0]\n", 0),
         (r"reduce range(300) as $i (0; {a: .}) | [paths] | length", None, "300\n", 0),
         (r"reduce range(3) as $i (0; [.]) | path(..)", None, "[]\n[0]\n[0,0]\n[0,0,0]\n", 0),
+        (r". as $d | reduce range(3) as $i ($d; [.])", Some(r#"{"q":[1,2]}"#), "[[[{\"q\":[1,2]}]]]\n", 0),
+        (r". as $d | reduce range(3) as $i ($d; {k: .}) | tojson", Some(r#"{"q":[1,2]}"#), "\"{\\\"k\\\":{\\\"k\\\":{\\\"k\\\":{\\\"q\\\":[1,2]}}}}\"\n", 0),
+        (r".[] as $x | reduce range(2) as $i ($x; [., 1])", Some(r#"[{"a":1},[2]]"#), "[[{\"a\":1},1],1]\n[[[2],1],1]\n", 0),
+        (r"reduce range(3) as $i (0; [., .[0]?])", None, "[[[0],0],[0]]\n", 0),
+        (r"reduce range(4) as $i (0; {a: ., a: 2, b: .})", None, "{\"a\":2,\"b\":{\"a\":2,\"b\":{\"a\":2,\"b\":{\"a\":2,\"b\":0}}}}\n", 0),
     ] {
         let args: &[&str] = if input.is_some() {
             &["-c", filter]

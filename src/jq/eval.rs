@@ -80446,16 +80446,20 @@ fn fold_step_each<S: EvalSemantics>(
 pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
     // An `if` UPDATE is a branch choice (#5279); kept out of line, with the chain below, so the
     // function every fold driver inlines stays the size it was.
-    if matches!(
-        expr,
-        Expr::If { .. } | Expr::Paren(_) | Expr::Array(_) | Expr::Object(_)
-    ) {
+    if matches!(expr, Expr::If { .. } | Expr::Paren(_)) {
         return match owned_if_step::<S>(expr, state) {
             Ok(done) => done,
             Err(state) => match owned_constructor_step::<S>(expr, state) {
                 Ok(done) => done,
                 Err(state) => owned_update_step_arith::<S>(expr, state),
             },
+        };
+    }
+    // A constructor around the state (#5875), out of line like the `if` above.
+    if matches!(expr, Expr::Array(_) | Expr::Object(_)) {
+        return match owned_constructor_step::<S>(expr, state) {
+            Ok(done) => done,
+            Err(state) => owned_update_step_arith::<S>(expr, state),
         };
     }
     owned_update_step_arith::<S>(expr, state)
@@ -80467,8 +80471,9 @@ pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue
 /// wrote the whole accumulator out as JSON and indexed it again to evaluate a constructor that
 /// copies it, which is `O(N^2)` once the accumulator is a nest `N` levels deep.
 ///
-/// Exactly one member reads `.` (a second would need a copy, and `[., .]` is not a fold anyone
-/// writes), and every other element, key and value must be [`closed_expr_to_owned`]: one output,
+/// Exactly one member reads `.` (a second would need a copy of a value that is already `N` levels
+/// deep, and a member that reads the state, `[., .[0]]`, is not closed either; those stay on the
+/// bridge, #5893), and every other element, key and value must be [`closed_expr_to_owned`]: one output,
 /// no read of the state, no effect, so settling it before the state is touched is unobservable.
 /// `Err(state)` for anything else, with the state untouched, and the evaluator answers as before.
 /// jq mode only (yq's constructors carry presentation, and its guard past 500 levels is a separate
@@ -80479,52 +80484,62 @@ fn owned_constructor_step<S: EvalSemantics>(
     expr: &Expr,
     state: OwnedValue,
 ) -> Result<OwnedStep, OwnedValue> {
-    if S::TAG != EvalTag::Jq || super::eval_generic::embed_table_active() {
+    if S::TAG != EvalTag::Jq {
         return Err(state);
     }
+    // The live-table check is a thread-local read, so it comes after the shape checks that
+    // decline most constructors for nothing.
     match unwrap_paren(expr) {
         Expr::Array(inner) => {
             let items = match unwrap_paren(inner) {
                 Expr::Comma(items) => items.as_slice(),
                 single => core::slice::from_ref(single),
             };
-            // One read of `.`, settled before anything is built: most constructors a fold
-            // declines here (`[.[], $i]`, `[$i]`) cost no more than this count.
-            if items
+            // One pass: the member that reads `.` is a placeholder until every other member has
+            // been settled, so a decline hands the state back before it is moved. A second read
+            // of `.` declines at once.
+            if !items
                 .iter()
-                .filter(|item| matches!(unwrap_paren(item), Expr::Identity))
-                .count()
-                != 1
+                .any(|item| matches!(unwrap_paren(item), Expr::Identity))
+                || super::eval_generic::embed_table_active()
             {
                 return Err(state);
             }
-            let mut built: Vec<Option<OwnedValue>> = vec_with_capacity(items.len());
-            for item in items {
+            let mut out: Vec<OwnedValue> = vec_with_capacity(items.len());
+            let mut dot = None;
+            for (at, item) in items.iter().enumerate() {
                 if matches!(unwrap_paren(item), Expr::Identity) {
-                    built.push(None);
+                    if dot.replace(at).is_some() {
+                        return Err(state);
+                    }
+                    out.push(OwnedValue::Null);
                 } else if let Some(value) = closed_expr_to_owned::<S>(item) {
-                    built.push(Some(value));
+                    out.push(value);
                 } else {
                     return Err(state);
                 }
             }
-            let mut state = Some(state);
-            let out: Vec<OwnedValue> = built
-                .into_iter()
-                .map(|slot| slot.or_else(|| state.take()).unwrap_or(OwnedValue::Null))
-                .collect();
+            let Some(dot) = dot else {
+                return Err(state);
+            };
+            out[dot] = state;
             Ok(OwnedStep::Handled(Ok(OwnedValue::array_from(out))))
         }
         Expr::Object(entries) => {
-            if entries
+            // The same pass, into the map itself. A repeated key keeps its first position and
+            // takes the last value, as `object_from_pairs` does in jq mode and
+            // `eval_object_construction` does; the member that reads `.` is the key it was
+            // written under until a later member takes that key over.
+            if !entries
                 .iter()
-                .filter(|entry| matches!(unwrap_paren(&entry.value), Expr::Identity))
-                .count()
-                != 1
+                .any(|entry| matches!(unwrap_paren(&entry.value), Expr::Identity))
+                || super::eval_generic::embed_table_active()
             {
                 return Err(state);
             }
-            let mut pairs: Vec<(String, Option<OwnedValue>)> = vec_with_capacity(entries.len());
+            let mut map: IndexMap<String, OwnedValue> = IndexMap::with_capacity(entries.len());
+            let mut dot: Option<String> = None;
+            let mut dot_live = false;
             for entry in entries {
                 let key = match &entry.key {
                     ObjectKey::Literal(name) => name.clone(),
@@ -80535,26 +80550,27 @@ fn owned_constructor_step<S: EvalSemantics>(
                     },
                 };
                 if matches!(unwrap_paren(&entry.value), Expr::Identity) {
-                    pairs.push((key, None));
+                    if dot.is_some() {
+                        return Err(state);
+                    }
+                    dot = Some(key.clone());
+                    dot_live = true;
+                    map.insert(key, OwnedValue::Null);
                 } else if let Some(value) = closed_expr_to_owned::<S>(&entry.value) {
-                    pairs.push((key, Some(value)));
+                    if dot_live && dot.as_deref() == Some(key.as_str()) {
+                        dot_live = false;
+                    }
+                    map.insert(key, value);
                 } else {
                     return Err(state);
                 }
             }
-            let mut state = Some(state);
-            let pairs: Vec<(String, OwnedValue)> = pairs
-                .into_iter()
-                .map(|(key, slot)| {
-                    (
-                        key,
-                        slot.or_else(|| state.take()).unwrap_or(OwnedValue::Null),
-                    )
-                })
-                .collect();
-            // jq mode: a repeated key keeps its first position and takes the last value,
-            // as `object_from_pairs` does there and `eval_object_construction` does.
-            let map: IndexMap<String, OwnedValue> = pairs.into_iter().collect();
+            let Some(dot) = dot else {
+                return Err(state);
+            };
+            if dot_live {
+                map.insert(dot, state);
+            }
             Ok(OwnedStep::Handled(Ok(OwnedValue::Object(map.into()))))
         }
         _ => Err(state),
