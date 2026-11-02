@@ -9768,9 +9768,15 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     match &entry.key {
-        ObjectKey::Literal(name) => {
-            each_object_value::<W, S>(name.clone(), &entry.value, rest, value, optional, acc, sink)
-        }
+        ObjectKey::Literal(name) => each_object_value::<W, S>(
+            Ok(name.clone()),
+            &entry.value,
+            rest,
+            value,
+            optional,
+            acc,
+            sink,
+        ),
         // The `Expr::Object` arm of `eval_each` leaves a construction holding a
         // bare entry to the eager fallback, which collects it.
         ObjectKey::Bare => unreachable!("a bare entry is collected, not streamed"), // patchcov: coverage tolerate-line reason="unreachable: the Expr::Object arm of eval_each sends a construction holding a bare entry down yq_object_route's Union route, so a bare entry never reaches the streaming fan-out (#2783)"
@@ -9787,22 +9793,11 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Ok(v) => v,
                     Err(e) => return escape.stop(Control::Error(e)),
                 };
+                // #5915: a key that is no string (and that yq does not stringify) is kept as it is
+                // and raised by `each_object_value` once the entry's value yields one.
                 let key_str = match &key_owned {
-                    OwnedValue::String(s) => String::clone(s),
-                    _ => match yq_object_key_stringify::<S>(&key_owned) {
-                        Some(s) => s,
-                        None => {
-                            if optional {
-                                // See this function's own doc comment: the
-                                // eager `ObjectEscape::None` rule (discard
-                                // everything) is deliberately not reproduced.
-                                return Demand::Continue; // patchcov: coverage tolerate-line reason="unreachable: `optional` is never `true` here. `eval_each` is entered with a forced `true` at exactly one site (`Expr::Optional` over an `IndexExpr`/`SliceExpr`), and both of those evaluate their target (`eval_index_expr`) and their key (`eval_each(key, .., false)`) with a hardcoded `false`, so only the final index/slice step ever sees it -- nothing carries it down to an `Expr::Object` (#2180)"
-                            }
-                            return escape.stop(Control::Error(
-                                EvalError::cannot_use_as_object_key(&key_owned),
-                            ));
-                        }
-                    },
+                    OwnedValue::String(s) => Ok(String::clone(s)),
+                    _ => yq_object_key_stringify::<S>(&key_owned).ok_or(key_owned),
                 };
                 match each_object_value::<W, S>(
                     key_str,
@@ -9832,7 +9827,7 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                      // threaded straight through the recursion, a struct
                                      // would just rename the same fields.
 fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    key: String,
+    key: Result<String, OwnedValue>,
     value_expr: &Expr,
     rest: &[super::expr::ObjectEntry],
     value: StandardJson<'a, W>,
@@ -9850,7 +9845,19 @@ fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(v) => v,
             Err(e) => return escape.stop(Control::Error(e)),
         };
-        acc.push((key.clone(), val_owned));
+        // #5915: a computed key that is no string is rejected here, once a value exists to pair
+        // it with, as `build_object_entries` and jq do: a value that yields nothing, or raises
+        // first, wins.
+        let key_str = match &key {
+            Ok(name) => name.clone(),
+            Err(bad) => {
+                if optional {
+                    return Demand::Continue; // patchcov: coverage tolerate-line reason="unreachable: `optional` is never `true` here. `eval_each` is entered with a forced `true` at exactly one site (`Expr::Optional` over an `IndexExpr`/`SliceExpr`), and both of those evaluate their target and their key with a hardcoded `false`, so nothing carries it down to an `Expr::Object` (#2180, #5915)"
+                }
+                return escape.stop(Control::Error(EvalError::cannot_use_as_object_key(bad)));
+            }
+        };
+        acc.push((key_str, val_owned));
         let result = each_object_entries::<W, S>(rest, value.clone(), optional, acc, sink);
         acc.pop();
         match result {
