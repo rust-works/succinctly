@@ -52377,25 +52377,43 @@ mod tests {
 
     /// #1017: `owned_from_standard_json` is a third, independent copy of the
     /// cursor-to-`OwnedValue` conversion `to_owned`/`to_owned_cursor` are
-    /// already guarded above (#998) -- same limit, same construction, its
-    /// own guard. Reports the limit as a decode-failure-tagged error rather
-    /// than panicking since #3457, like the other two.
+    /// already guarded above (#998), with its own guard. It converts only a
+    /// value the evaluator built (a fold's accumulator, an embedded `[.]`),
+    /// never an input document, so since #5876 its bound is the value-tree
+    /// one (`MAX_VALUE_TREE_DEPTH`, or the native-stack floor where armed),
+    /// not the document ceiling of 256: a built value that prints at 300
+    /// levels is read back at 300. It reports the limit as a
+    /// resource-limit error rather than panicking, which a `try`/`catch`
+    /// cannot swallow (#2132).
     #[test]
-    fn owned_from_standard_json_errors_past_nesting_depth_limit_1017() {
-        let json = linear_nest(255);
+    fn owned_from_standard_json_errors_past_value_tree_depth_limit_1017() {
+        use crate::jq::MAX_VALUE_TREE_DEPTH;
+        // Past the old document ceiling, below the value-tree one.
+        let json = linear_nest(MAX_NESTING_DEPTH + 44);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
         let owned = owned_from_standard_json::<JqSemantics, _>(&cursor.value()).unwrap();
         assert!(matches!(owned, OwnedValue::Object(_)));
 
-        let json = linear_nest(256);
+        let json = linear_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let index = JsonIndex::build(json.as_bytes());
+        let cursor = index.root(json.as_bytes());
+        let owned = owned_from_standard_json::<JqSemantics, _>(&cursor.value()).unwrap();
+        assert!(matches!(owned, OwnedValue::Object(_)));
+
+        let json = linear_nest(MAX_VALUE_TREE_DEPTH);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
         let err = owned_from_standard_json::<JqSemantics, _>(&cursor.value())
-            .expect_err("owned_from_standard_json should error at depth 256");
+            .expect_err("owned_from_standard_json should error at the value-tree depth");
         assert!(
-            err.is_decode_failure(),
-            "expected decode failure, got: {err:?}"
+            err.is_resource_limit(),
+            "expected a resource-limit error, got: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains(&format!("limit of {MAX_VALUE_TREE_DEPTH}")),
+            "expected the value-tree depth message, got: {err:?}"
         );
     }
 
