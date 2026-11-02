@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -390,6 +391,13 @@ class HookTests(unittest.TestCase):
     """The hook against a real repository whose `scripts/pre_push.py` is a stub."""
 
     def setUp(self):
+        # `hook()` hands the gate a copy of this process's environment, and the push that runs the
+        # suite (`PRE_PUSH_SKIP=fmt git push`, whose `script-tests` gate runs it) sets the variable
+        # this class tests: start from a clean one (#5910).
+        patched = mock.patch.dict(os.environ)
+        patched.start()
+        self.addCleanup(patched.stop)
+        os.environ.pop("PRE_PUSH_SKIP", None)
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.root = os.path.realpath(self.dir.name)
@@ -474,6 +482,12 @@ class HookTests(unittest.TestCase):
         code, message = self.call(f"git -C {nowhere.name} push")
         self.assertEqual(code, 2)
         self.assertIn("cannot find the repository", message)
+
+    def test_an_inherited_skip_variable_does_not_reach_the_stub_gates_5910(self):
+        with open(os.path.join(self.root, "scripts", "pre_push.py"), "w", encoding="utf-8") as f:
+            f.write("import os, sys\nsys.exit(0 if 'fmt' in os.environ.get('PRE_PUSH_SKIP', '').split() else 1)\n")
+        # `setUp` cleared the variable an enclosing push set; the gate sees only what the command says.
+        self.assertEqual(self.call("git push")[0], 2)
 
     def test_unreadable_input_is_allowed(self):
         self.assertEqual(pre_push.hook(io.StringIO("not json")), 0)
