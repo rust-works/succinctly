@@ -28913,25 +28913,33 @@ fn test_isvalid_has_yq_type_mismatch_is_valid_917() -> Result<()> {
 }
 
 /// #3278: a value a filter builds past `MAX_VALUE_TREE_DEPTH` and then hands to
-/// yq's own write/emission pipeline is reported as `nesting depth exceeds limit
-/// of 384` with yq's error status, not an uncaught panic (exit 101 plus a raw
-/// `thread panicked` line).
+/// yq's own write/emission pipeline must not be an uncaught panic (exit 101 plus a
+/// raw `thread panicked` line). It was reported as `nesting depth exceeds limit of
+/// 384` with yq's error status; since #5876 the pipeline's walks check the
+/// native-stack floor instead (as `jq` does since #5554), so a 400-level value is
+/// written and printed. `def` is `--jq-extensions` surface, so there is no yq
+/// oracle: these are the extension's natural answers, byte counts checked against
+/// the same programs in jq mode.
 #[test]
 fn test_yq_deep_filter_built_value_is_a_clean_error_3278() -> Result<()> {
     let deep = "def deep(m): if m == 0 then . else [deep(m - 1)] end;";
-    for filter in [
-        format!("{deep} .a |= deep(400)"),
-        format!("{deep} .a = deep(400)"),
-        format!("{deep} deep(400)"),
+    let dashes = "- ".repeat(400);
+    for (filter, want) in [
+        (
+            format!("{deep} .a |= deep(400)"),
+            format!("a:\n  {dashes}1\n"),
+        ),
+        (
+            format!("{deep} .a = deep(400)"),
+            format!("a:\n  {dashes}a: 1\n"),
+        ),
+        (format!("{deep} deep(400)"), format!("{dashes}a: 1\n")),
     ] {
         let (stdout, stderr, code) =
             run_yq_stdin_with_stderr(&filter, "a: 1\n", &["--jq-extensions"])?;
         assert_eq!(
-            code, 1,
-            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
-        );
-        assert!(
-            stderr.contains("nesting depth exceeds limit of 384"),
+            (stdout.as_str(), code),
+            (want.as_str(), 0),
             "`{filter}` -- stderr: {stderr:?}"
         );
         assert!(
@@ -64187,11 +64195,14 @@ fn test_key_past_a_seeded_deep_position_does_not_panic_3020() -> Result<()> {
 }
 
 /// #3261: `succinctly yq`'s own `evaluate_input` (`yq_runner.rs`) shares the
-/// exact `OwnedValue::reindexed` bridge `succinctly jq` does -- before this
+/// exact `OwnedValue::reindexed` bridge `succinctly jq` does -- before that
 /// fix, a filter-driven value growing past `MAX_VALUE_TREE_DEPTH` (384) via
 /// `reduce`/`foreach` panicked uncaught (exit 101) here too, since nothing
-/// in `evaluate_input` caught it. Now it reports through the ordinary
-/// `sink.report` diagnostic path, matching an everyday evaluator error.
+/// in `evaluate_input` caught it; it then reported `nesting depth exceeds
+/// limit of 384` through the ordinary `sink.report` path. Since #5876 `yq`
+/// arms the native-stack floor as `jq` did in #5554, so the value is read
+/// back and answered (`--jq-extensions` surface: real yq has no `reduce`
+/// over `range`, so the extension follows jq, whose answer is `1`).
 #[test]
 fn test_reduce_growth_past_value_tree_depth_reports_cleanly_yq_3261() -> Result<()> {
     let (stdout, stderr, code) = run_yq_stdin_with_stderr(
@@ -64199,12 +64210,7 @@ fn test_reduce_growth_past_value_tree_depth_reports_cleanly_yq_3261() -> Result<
         "null",
         &["--jq-extensions"],
     )?;
-    assert_ne!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "", "stdout: {stdout:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
-        "stderr: {stderr:?}"
-    );
+    assert_eq!((stdout.as_str(), code), ("1\n", 0), "stderr: {stderr:?}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
     Ok(())
 }

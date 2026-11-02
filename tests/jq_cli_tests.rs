@@ -33435,6 +33435,9 @@ fn test_path_non_cursor_native_deep_walk_keeps_generator_order_3275_5554() -> Re
 /// yq rejects `path(...)` outright as a bad expression, so this is
 /// succinctly extension surface, not a divergence). The same `eval.rs`
 /// walker is reached through `S = YqSemantics`, and used to panic here too.
+/// Since #5876 `succinctly yq` arms the native-stack floor as jq mode did in
+/// #5554, so a path 500 levels deep answers (a 501-component path) instead of
+/// being refused at 384, as the extension follows jq.
 #[test]
 fn test_path_non_cursor_native_depth_error_yq_mode_3275() -> Result<()> {
     let filter = format!("path({}[0:1])", ".a".repeat(500));
@@ -33442,17 +33445,17 @@ fn test_path_non_cursor_native_depth_error_yq_mode_3275() -> Result<()> {
         || {
             let mut cmd = Command::new(succinctly_bin());
             cmd.arg("yq")
-                .args(["--jq-extensions", "-o", "json", &filter]);
+                .args(["--jq-extensions", "-o", "json", "-I0", &filter]);
             cmd
         },
         Some(b"{}\n"),
     )?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    assert_ne!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "", "stdout: {stdout:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
+    let want = format!("[{}{{\"start\":0,\"end\":1}}]\n", "\"a\",".repeat(500));
+    assert_eq!(
+        (stdout.as_str(), code),
+        (want.as_str(), 0),
         "stderr: {stderr:?}"
     );
     assert!(

@@ -6812,3 +6812,19 @@ An absent key and a computed `null` answer `"null"`, as in yq.
 `.[] | select(alias != "")` prints the resolved target of an alias node where yq prints `*x`, the read-route alias echo tracked with the alias-mark family (#2505, #5249).
 Under `--jq-extensions`, `path(...)` and `paths(...)` run with no cursor, so they cannot see an alias node (`paths(alias != "")` lists every scalar), as they cannot see an `anchor`; no yq oracle exists for that surface.
 Pinned by `tests/yq_cli/i5483_alias.rs`, whose rows were captured from yq v4.53.3.
+
+## A value the program builds is bounded by the native-stack floor, not by 384 levels ([#5876](https://github.com/rust-works/succinctly/issues/5876))
+
+yq has no limit on the depth of a value a program builds but Go's own stack.
+`succinctly yq` refused such a value past 384 levels (`MAX_VALUE_TREE_DEPTH`) at its output and in most of the filters after the fold, where yq answers.
+Since #5876 `run_yq` arms the same floor `succinctly jq` has had since [#5554](https://github.com/rust-works/succinctly/issues/5554): a walk over a built value that is past 384 levels checks ADR-0025's native-stack floor once per level instead of refusing.
+`.[] as $i ireduce (0; [.]) | length` over 385 and 2000 items is `1`, as in yq, and the value prints as yq prints it, as YAML (`- - - 0`), as `-o json` and under `-P`, byte for byte (`-C` keeps its own colour difference, [#5416](https://github.com/rust-works/succinctly/issues/5416)).
+The same holds at those two depths for `to_yaml`, `flatten`, `==`, `.[0]`, a field of a deep object (`{"a": .}` folded 2000 times, then `.a | length`) and the rest of the filters that walk the value.
+Where a value built by the program is handed back to the evaluator whole (a field read out of it, `select`, a bind) the document ceiling of 256 levels no longer applies to it either: it was a bound for an input document, and a built value is bounded by the value-tree depth, or by the floor.
+The bridge's converter keeps the 256-level document ceiling for a caller that has not armed the floor (a library embedder), so only the CLI's armed run reads a built value back past it.
+Past the floor the run refuses with `Error: nesting depth exceeds limit of the native stack` at exit 1, where yq's own Go stack is far deeper.
+Where that is depends on the evaluation thread's stack and on what each level costs: the fold that builds the value is the first step to refuse, ahead of every emitter and presentation walk, so the emitters have not been seen to refuse on their own.
+Checked on a 16 MiB evaluation thread (a throwaway build): the build and every consumer above answered at 8,000 levels and refused cleanly at 11,000, with no crash at any size.
+A fold that builds a deep value is quadratic in yq mode, as it is in jq mode before [#5875](https://github.com/rust-works/succinctly/issues/5875): 100,000 levels does not finish inside two minutes.
+The reshape of a result's presentation (its comments and styles) gives up on a navigation construction or a merge deeper than 384 levels and falls back to the plain result, so such a result loses the comments it would otherwise carry; the value itself is unaffected.
+A document whose aliases expand to a deep value is not covered: `-P` and `explode(.)` over a chain of 385 anchors that each wrap the previous one still refuse at 256 levels, where yq answers.

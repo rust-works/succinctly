@@ -5293,7 +5293,17 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     depth: usize,
 ) -> Result<OwnedValue, EvalError> {
     use crate::json::light::StandardJson;
-    guard_nesting_depth(depth)?;
+    // Under the native-stack floor (the CLI arms it for the whole run, #5554, #5876) this converts
+    // a value the evaluator built (a fold's accumulator, an embedded `[.]`), and an input
+    // document is already capped at 256 levels by its parser. The built value is then bounded as
+    // every other walk over one is, by `MAX_VALUE_TREE_DEPTH` or by the floor: the document
+    // ceiling refused a value the output could print. Anywhere else (a library caller that did
+    // not opt in) nothing says the text is a built value, so the document ceiling stays.
+    if depth >= MAX_NESTING_DEPTH && super::eval::value_depth_floor_armed() {
+        super::value::check_value_tree_depth(depth)?;
+    } else {
+        guard_nesting_depth(depth)?;
+    }
     Ok(match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
@@ -52406,6 +52416,38 @@ mod tests {
             err.is_decode_failure(),
             "expected decode failure, got: {err:?}"
         );
+    }
+
+    /// #5876: under the native-stack floor (which the CLI arms for the whole run) this converter
+    /// reads back a value the evaluator built, so it is bounded as every other walk over one is
+    /// -- by `MAX_VALUE_TREE_DEPTH`, or by the floor -- not by the document ceiling of 256. The
+    /// floor is registered on a thread with a real stack of the size it claims.
+    #[cfg(feature = "std")] // the floor is a no-op without `std`
+    #[test]
+    fn owned_from_standard_json_under_the_floor_is_bounded_by_the_value_tree_5876() {
+        use crate::jq::{with_stack_budget, with_value_depth_on_stack_floor, MAX_VALUE_TREE_DEPTH};
+        const STACK: usize = 32 * 1024 * 1024;
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(|| {
+                with_stack_budget(STACK, || {
+                    with_value_depth_on_stack_floor(|| {
+                        // Past the document ceiling, then past the value-tree constant: the floor
+                        // (half of 32 MiB) is nowhere near spent by a few hundred levels.
+                        for depth in [MAX_NESTING_DEPTH, MAX_VALUE_TREE_DEPTH + 100] {
+                            let json = linear_nest(depth);
+                            let index = JsonIndex::build(json.as_bytes());
+                            let cursor = index.root(json.as_bytes());
+                            let owned = owned_from_standard_json::<JqSemantics, _>(&cursor.value())
+                                .unwrap_or_else(|e| panic!("{depth} levels: {e:?}"));
+                            assert!(matches!(owned, OwnedValue::Object(_)), "{depth} levels");
+                        }
+                    });
+                });
+            })
+            .expect("spawn")
+            .join()
+            .expect("the converter answers under the floor");
     }
 
     /// #1192: unlike `to_owned`/`to_owned_cursor` (this file, still silently
