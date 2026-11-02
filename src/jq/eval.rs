@@ -95631,8 +95631,14 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
     let names_a_layout = |text: &str| {
         let mut chars = text.chars();
         while let Some(c) = chars.next() {
-            if c == '%' && matches!(chars.next(), Some('c' | 'x' | 'X' | 'r')) {
-                return true;
+            if c == '%' {
+                let mut next = chars.next();
+                if matches!(next, Some('E' | 'O')) {
+                    next = chars.next();
+                }
+                if matches!(next, Some('c' | 'x' | 'X' | 'r')) {
+                    return true;
+                }
             }
         }
         false
@@ -95664,6 +95670,19 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
             }
             match chars.next() {
                 Some(spec @ ('c' | 'x' | 'X' | 'r')) => out.push_str(layout(spec)),
+                // `%Ec` and `%Ox` stand for the plain layout, as `%EY` is `%Y` (#5754).
+                Some(modifier @ ('E' | 'O')) => match chars.next() {
+                    Some(spec @ ('c' | 'x' | 'X' | 'r')) => out.push_str(layout(spec)),
+                    Some(other) => {
+                        out.push('%');
+                        out.push(modifier);
+                        out.push(other);
+                    }
+                    None => {
+                        out.push('%');
+                        out.push(modifier);
+                    }
+                },
                 Some(other) => {
                     out.push('%');
                     out.push(other);
@@ -95722,7 +95741,26 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
 
     while let Some(fc) = fmt_iter.next() {
         if fc == '%' {
-            match fmt_iter.next() {
+            // `%E` and `%O` modify the specifier after them and read as it does (#5754): jq's libc
+            // takes `%Ey`, `%Od` and `%Ec` for `%y`, `%d` and `%c` in every locale this reads. Only a
+            // specifier can follow: `%E%`, `%EE`, `%E5` and a bare `%E` are no match. The pin's libc
+            // reads the month with `%O` from the alternative names, which C holds as the full ones
+            // alone, so `%OB` takes `March` but not `Mar` and `%Ob` and `%Oh` take neither.
+            let mut spec = fmt_iter.next();
+            let mut alternative_month = false;
+            if let Some(modifier @ ('E' | 'O')) = spec {
+                spec = fmt_iter.next();
+                match spec {
+                    Some('%' | 'E' | 'O') | None => {
+                        return Err(format!("expected a specifier after '%{modifier}'"));
+                    }
+                    Some('b' | 'h') if modifier == 'O' => {
+                        return Err("unrecognized month name".to_string());
+                    }
+                    _ => alternative_month = modifier == 'O',
+                }
+            }
+            match spec {
                 Some('%') => {
                     if input_iter.next() != Some('%') {
                         return Err("expected '%'".to_string());
@@ -95753,10 +95791,12 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     }
                     day = parse_digits(&mut input_iter, 2)?;
                 }
-                Some('H') => {
+                // `%k` and `%l` read as `%H` and `%I`: the libc takes them as the hour in 24- and 12-hour
+                // form, with no padding of their own to read (#5754).
+                Some('H' | 'k') => {
                     hour = check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=23, "hour")?;
                 }
-                Some('I') => {
+                Some('I' | 'l') => {
                     // 0 is valid (confirmed live: real jq accepts `%I`
                     // "00"); will be adjusted by %p if present.
                     hour = check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=12, "hour")?;
@@ -95808,7 +95848,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     second =
                         check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=60, "second")?;
                 }
-                Some('p' | 'P') => {
+                Some('p') => {
                     // The locale's am marker, else its pm marker, each ASCII-case-insensitively,
                     // as the libc reads them: an empty marker (macOS prints none for `%p` under
                     // `de_DE`) matches nothing and reads as am (#5754). Anything else is no match,
@@ -95889,7 +95929,11 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                             Some(n) => (n.month_full[i].as_str(), n.month_abbr[i].as_str()),
                             None => (MONTH_FULL[i], MONTH_ABBR[i]),
                         };
-                        strptime_name_len(&input_iter, full, abbr).map(|len| (i, len))
+                        if alternative_month {
+                            strptime_name_len(&input_iter, full, "").map(|len| (i, len))
+                        } else {
+                            strptime_name_len(&input_iter, full, abbr).map(|len| (i, len))
+                        }
                     });
                     match found {
                         Some((i, len)) => {
@@ -95987,18 +96031,10 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                         }
                     }
                 }
-                Some(other) => {
-                    // Unknown specifier - skip % and match literal
-                    if input_iter.next() != Some(other) {
-                        return Err(format!("expected '{other}'"));
-                    }
-                }
-                None => {
-                    // Trailing % - match literal
-                    if input_iter.next() != Some('%') {
-                        return Err("expected '%'".to_string());
-                    }
-                }
+                // A specifier the libc does not know, and a `%` that ends the format, are no match
+                // (`"x" | strptime("%Q")`) -- not the literal they used to be taken for (#5754).
+                Some(other) => return Err(format!("unknown specifier '%{other}'")),
+                None => return Err("format ends in '%'".to_string()),
             }
         } else if fc.is_whitespace() {
             // Skip any whitespace in input
