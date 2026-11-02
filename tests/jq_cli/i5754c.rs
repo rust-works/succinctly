@@ -124,6 +124,9 @@ fn flags_pad_the_numeric_specifiers_and_nothing_else() -> Result<()> {
         ("strftime", 1420167845, "UTC", "%EE_d|%-E-y|%E--d|%E-_d|%E-Ey", "\"E_d|-y|-d|_d|Ey\""),
         ("strftime", 1420167845, "UTC", "x%Ex", "\"x01/02/15\""),
         ("strftime", 1420167845, "UTC", "%c%c%c%c%Y%Y%Y%Y%Y%a", "\"Fri Jan  2 03:04:05 2015Fri Jan  2 03:04:05 2015Fri Jan  2 03:04:05 2015Fri Jan  2 03:04:05 201520152015201520152015Fri\""),
+        ("strftime", 1420167845, "UTC", "%E-", "\"-\""),
+        ("strftime", 1420167845, "UTC", "%O_", "\"_\""),
+        ("strftime", 1420167845, "UTC", "x%E0", "\"x0\""),
     ] {
         assert_eq!(
             format_time(function, secs, tz, fmt)?.0.as_deref(),
