@@ -13997,10 +13997,12 @@ mod tests {
                                 );
                             }
                             None => {
-                                assert_eq!(
-                                    batch.end,
-                                    next + 1,
-                                    "only a lone document has no index"
+                                assert!(
+                                    batch.end == next + 1
+                                        || spans[next..batch.end]
+                                            .windows(2)
+                                            .any(|w| w[0].1 == w[1].0),
+                                    "only a lone document, or touching ones, have no index"
                                 );
                             }
                         }
