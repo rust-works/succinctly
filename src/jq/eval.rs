@@ -80528,11 +80528,14 @@ pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue
 /// wrote the whole accumulator out as JSON and indexed it again to evaluate a constructor that
 /// copies it, which is `O(N^2)` once the accumulator is a nest `N` levels deep.
 ///
-/// Exactly one member reads `.` (a second would need a copy of a value that is already `N` levels
-/// deep, and a member that reads the state, `[., .[0]]`, is not closed either; those stay on the
-/// bridge, #5893), and every other element, key and value must be [`closed_expr_to_owned`]: one output,
-/// no read of the state, no effect, so settling it before the state is touched is unobservable.
-/// `Err(state)` for anything else, with the state untouched, and the evaluator answers as before.
+/// Exactly one member is `.` itself (a second would need a copy of a value that is already `N`
+/// levels deep). Every other element, key and value is settled by [`owned_assign_operand`] against
+/// the state before it is moved: a closed one (one output, no read of `.`, no effect), or one that
+/// reads a scalar off the state (`length`, `type`, `.n + 1`, #5893). A member that reads a
+/// *container* out of the state (`.a`, `.[0]`) is settled from a rebuilt copy of the state, which is
+/// right and costs `O(state)` a step, so a fold of those is still quadratic once the nest is deep.
+/// `Err(state)` for anything the operand helper declines (one that raises, or yields other than one
+/// value), with the state untouched, and the evaluator answers as before.
 /// jq mode only (yq's constructors carry presentation, and its guard past 500 levels is a separate
 /// piece of work, #5554), and not while the #2889 embed table is live, whose registered containers
 /// the accumulator might hold: a container built around one would hide it from the table.
@@ -80570,7 +80573,7 @@ fn owned_constructor_step<S: EvalSemantics>(
                         return Err(state);
                     }
                     out.push(OwnedValue::Null);
-                } else if let Some(value) = closed_expr_to_owned::<S>(item) {
+                } else if let Some(value) = owned_assign_operand::<S>(item, &state) {
                     out.push(value);
                 } else {
                     return Err(state);
@@ -80601,7 +80604,7 @@ fn owned_constructor_step<S: EvalSemantics>(
                 let key = match &entry.key {
                     ObjectKey::Literal(name) => name.clone(),
                     ObjectKey::Bare => return Err(state),
-                    ObjectKey::Expr(key) => match closed_expr_to_owned::<S>(key) {
+                    ObjectKey::Expr(key) => match owned_assign_operand::<S>(key, &state) {
                         Some(OwnedValue::String(name)) => name.into_string(),
                         _ => return Err(state),
                     },
@@ -80613,7 +80616,7 @@ fn owned_constructor_step<S: EvalSemantics>(
                     dot = Some(key.clone());
                     dot_live = true;
                     map.insert(key, OwnedValue::Null);
-                } else if let Some(value) = closed_expr_to_owned::<S>(&entry.value) {
+                } else if let Some(value) = owned_assign_operand::<S>(&entry.value, &state) {
                     if dot_live && dot.as_deref() == Some(key.as_str()) {
                         dot_live = false;
                     }
@@ -167285,6 +167288,31 @@ mod named_args_shared_tests_5690 {
             (
                 "{b: 1, a: ., b: 3}",
                 obj(vec![("b", OwnedValue::Int(3)), ("a", state())]),
+            ),
+            // A member that reads a scalar off the state is settled before the state moves (#5893).
+            ("[., length]", arr(vec![state(), OwnedValue::Int(1)])),
+            ("[length, .]", arr(vec![OwnedValue::Int(1), state()])),
+            (
+                "[., (.|type), 7]",
+                arr(vec![
+                    state(),
+                    OwnedValue::string("object"),
+                    OwnedValue::Int(7),
+                ]),
+            ),
+            (
+                "{a: ., n: length}",
+                obj(vec![("a", state()), ("n", OwnedValue::Int(1))]),
+            ),
+            ("{(.q|type): .}", obj(vec![("array", state())])),
+            // A container read off the state comes from a rebuilt copy of it: correct, and not
+            // linear, since the rebuild is `O(state)`.
+            (
+                "[., .q]",
+                arr(vec![
+                    state(),
+                    arr(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+                ]),
             ),
         ] {
             let OwnedStep::Handled(Ok(got)) = step(src) else {
