@@ -2,8 +2,7 @@
 //! builtin's own words, and `tag` reads a plain date as `!!timestamp` and a plain `<<` as
 //! `!!merge`. A custom tag reads as its value's own type (`!foo x` is a string, `!foo 5` is
 //! refused as `!foo`). Every row is `printf 'a: DOC\n' | yq '.a | FILTER'` from yq v4.53.3:
-//! stdout, and stderr for a refusal (exit 1). `@sh` on a string is left out: yq writes a string
-//! that needs no quotes bare (`hello`), where this quotes it (#5837).
+//! stdout, and stderr for a refusal (exit 1). `@sh` on a string is pinned by `i5837.rs`.
 
 use anyhow::Result;
 

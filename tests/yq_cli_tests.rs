@@ -29462,10 +29462,11 @@ fn test_yq_at_sh_errors_on_non_string_1073() -> Result<()> {
         "Error: cannot encode !!bool as URI, can only operate on strings. Please first pipe through another encoding operator to convert the value to a string"
     );
 
-    // A string is still accepted.
+    // A string is still accepted, and one that needs no quotes is written bare, as yq writes it
+    // (#5837).
     let (stdout, code) = run_yq_stdin(".a | @sh", "a: hello\n", &["-r"])?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), "'hello'");
+    assert_eq!(stdout.trim_end(), "hello");
     Ok(())
 }
 

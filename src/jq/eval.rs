@@ -24036,6 +24036,34 @@ fn shell_quote_str<S: EvalSemantics>(s: &str) -> String {
     }
 }
 
+/// yq's `@sh` (#5837): a character outside `[A-Za-z0-9_@%+=:,./-]` opens a single-quoted run that
+/// lasts to the end of the string or the next `'`, which is written `\'` outside any quotes; every
+/// other character is written as it is. `hello` stays `hello`, `a b` is `a' b'`, `it's` is `it\'s`
+/// and the empty string is nothing, as yq v4.53.3 writes them. jq quotes the whole string.
+fn yq_shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    let mut quoted = false;
+    for c in s.chars() {
+        if c == '\'' {
+            if quoted {
+                out.push('\'');
+                quoted = false;
+            }
+            out.push_str("\\'");
+        } else if quoted || c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c) {
+            out.push(c);
+        } else {
+            out.push('\'');
+            quoted = true;
+            out.push(c);
+        }
+    }
+    if quoted {
+        out.push('\'');
+    }
+    out
+}
+
 /// Shell-quote a single value for @sh
 fn shell_quote_value<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError> {
     match value {
@@ -24071,8 +24099,16 @@ fn format_sh<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<St
     // per-arm one -- threading `S::TAG != EvalTag::Yq` onto every arm below
     // individually is exactly the shape that let the array-only version of
     // this fix miss the scalar cases in the first place.
-    if S::TAG == EvalTag::Yq && !matches!(value, OwnedValue::String(_)) {
-        return Err(EvalError::cannot_be_shell_escaped(value));
+    if S::TAG == EvalTag::Yq {
+        return match value {
+            OwnedValue::String(s) => Ok(yq_shell_quote(s)),
+            // #5836: yq refuses with its `@uri` wording, as the document route does.
+            _ => Err(EvalError::new(format!(
+                "cannot encode {} as URI, can only operate on strings. Please first pipe through \
+                 another encoding operator to convert the value to a string",
+                owned_yaml_type_tag(value)
+            ))),
+        };
     }
 
     match value {

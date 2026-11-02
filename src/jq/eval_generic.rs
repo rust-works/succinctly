@@ -2514,6 +2514,10 @@ fn yq_string_input_tag<V: DocumentValue>(
             }
         }
     }
+    // A string that does not decode (`"\ud83d"`) is the builtin's to report.
+    if value.string_decode_error().is_some() {
+        return None;
+    }
     let named = yq_type_tag(value, cursor);
     if named.is_empty() {
         return None;
