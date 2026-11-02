@@ -38,6 +38,12 @@ fn a_number_ended_by_a_quote_resumes_at_the_next_read_5925() -> Result<()> {
         ("1e+\"x\n7\n8\n", "[\"Invalid numeric literal\",7,8,\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\"]"),
         // inside an array
         ("[1,2,-\"abc\n[3]\n", "[\"Invalid numeric literal\",[3],\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\"]"),
+        // as an object value
+        ("{\"a\":1e\"x\n\ntrue\n", "[\"Invalid numeric literal\",true,\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\"]"),
+        // inside a nested object value
+        ("{\"a\":[1e\"q\n7\n8\n", "[\"Invalid numeric literal\",7,8,\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\"]"),
+        // as an object key
+        ("{1e\"k\n7\n8\n", "[\"Invalid numeric literal\",7,8,\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\"]"),
         // a bad literal the quote ends (already read as jq does)
         ("1x\"s\ntrue\n2\n", "[\"Invalid numeric literal\",true,2,\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\"]"),
     ] {
@@ -60,6 +66,23 @@ fn the_unclosed_string_may_run_past_the_4095_byte_read_5925() -> Result<()> {
     ] {
         let input = format!("1e\"{}\ntrue\n", "a".repeat(padding));
         assert_eq!(stream(&input)?, want, "{padding} bytes after the quote");
+    }
+    Ok(())
+}
+
+/// The quote can also sit at the edge of a read: the fault is met there, and the read it drops runs
+/// to the next newline or the 4,095-byte limit.
+#[test]
+fn the_quote_may_sit_at_the_edge_of_a_read_5925() -> Result<()> {
+    for (leading, want) in [
+        (4090, "[\"Invalid numeric literal\",7,\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\"]"),
+        (4093, "[\"Invalid numeric literal\",7,\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\"]"),
+        (4094, "[\"Invalid numeric literal\",7,\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\"]"),
+        (4095, "[\"Invalid numeric literal\",7,\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\"]"),
+        (4096, "[\"Invalid numeric literal\",7,\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\"]"),
+    ] {
+        let input = format!("{}1e\"s\n7\n", " ".repeat(leading));
+        assert_eq!(stream(&input)?, want, "{leading} bytes before the quote");
     }
     Ok(())
 }
