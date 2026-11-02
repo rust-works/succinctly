@@ -139,7 +139,6 @@ fn truthy(value: &OwnedValue) -> bool {
 
 /// The address of an array's storage: stable for as long as a handle on it is
 /// alive, which the slice-view tables guarantee by holding one.
-#[cfg(not(feature = "unshared-containers"))]
 fn storage_addr(items: &ArrayVec) -> usize {
     core::ptr::addr_of!(**items) as usize
 }
@@ -841,11 +840,8 @@ pub struct Interp<'e> {
     /// into the root allocation. Keyed by `(root, offset, size)`, so equal
     /// slices of one array are one value; each view maps back to its root
     /// and offset, so a slice of a slice lands on the same key. Both hold
-    /// the root, so a compared address is never reused. Unused under the
-    /// `unshared-containers` holdout, which has no storage to view.
-    #[cfg_attr(feature = "unshared-containers", allow(dead_code))]
+    /// the root, so a compared address is never reused.
     slices: RefCell<BTreeMap<(usize, usize, usize), ArrayVec>>,
-    #[cfg_attr(feature = "unshared-containers", allow(dead_code))]
     slice_roots: RefCell<BTreeMap<usize, (ArrayVec, usize)>>,
 }
 
@@ -957,35 +953,16 @@ pub(crate) fn route(program: &Expr) -> Route {
     if !dynamic || shipped_only {
         return Route::Shipped;
     }
-    // The interpreter reads storage identity, which the `unshared-containers`
-    // A/B holdout (#2999) does not have: its by-value `jv_identical` refuses
-    // rows jq answers. Nor does the shipped resolver answer a dynamic target any
-    // more (#5233), so that measurement build refuses one outright rather than
-    // answer it wrongly.
-    HOLDOUT_REFUSAL
-        .map(str::to_string)
-        .or_else(|| {
-            extension.map(|name| {
-                format!(
-                    "{name} is not supported in a program whose path expression does more than navigate"
-                )
-            })
+    extension
+        .map(|name| {
+            format!(
+                "{name} is not supported in a program whose path expression does more than navigate"
+            )
         })
         .map_or(Route::Interpreter, |message| {
             Route::Refused(EvalError::new(message))
         })
 }
-
-/// What the `unshared-containers` holdout refuses a dynamic path target with
-/// (#5233): a constant, not a branch, so the shipped build holds no line only
-/// the holdout runs.
-#[cfg(feature = "unshared-containers")]
-const HOLDOUT_REFUSAL: Option<&str> = Some(
-    "a path expression that does more than navigate is not supported in the \
-     unshared-containers build",
-);
-#[cfg(not(feature = "unshared-containers"))]
-const HOLDOUT_REFUSAL: Option<&str> = None;
 
 /// Why `succinctly jq` refuses `program`, if it does (#5233).
 ///
@@ -1731,21 +1708,14 @@ impl<'e> Interp<'e> {
     /// `jvp_array_slice`: an empty slice is a fresh `[]`; the whole root is the
     /// root itself; any other range is the one view of that range, unless it
     /// starts 65,536 or more elements into the root, where jq copies it.
-    #[cfg_attr(feature = "unshared-containers", allow(clippy::unused_self))]
     fn array_slice(&self, items: &ArrayVec, start: usize, end: usize) -> OwnedValue {
         if start == end {
             return OwnedValue::Array(ArrayVec::new());
         }
-        // The holdout stores an array's elements inline, so there is no
-        // storage address to key a view by, and no identity to keep anyway.
-        #[cfg(feature = "unshared-containers")]
-        return OwnedValue::Array(items[start..end].to_vec().into());
-        #[cfg(not(feature = "unshared-containers"))]
         self.array_view(items, start, end)
     }
 
     /// [`Self::array_slice`]'s non-empty range, as a view of its root.
-    #[cfg(not(feature = "unshared-containers"))]
     fn array_view(&self, items: &ArrayVec, start: usize, end: usize) -> OwnedValue {
         let (root, offset) = self
             .slice_roots
@@ -4519,11 +4489,8 @@ fn variant_name(expr: &Expr) -> String {
         .to_string()
 }
 
-// The interpreter reads storage identity, which the `unshared-containers`
-// holdout does not have (every clone copies), so its tests pin the shipped
-// shape only.
-#[cfg(all(test, not(feature = "unshared-containers")))]
+#[cfg(test)]
 mod reference;
 
-#[cfg(all(test, not(feature = "unshared-containers")))]
+#[cfg(test)]
 mod tests;

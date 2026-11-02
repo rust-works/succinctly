@@ -14,7 +14,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// differential grid (document x bind site x pattern x body x source x INIT x wrapper x context) that `main` refused or
 /// answered wrongly, with nested folds, `first`/`label`/`limit`/`if`/`//` around the `try`, and the `catch` handler form as a
 /// control. Every row captured from `/usr/bin/jq` 1.7.1 (stdout, exit code, message), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5136_reduce_update_try_bind_of_dot_keeps_the_accumulator() -> Result<()> {

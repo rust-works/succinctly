@@ -111,7 +111,6 @@ fn slurpfile_and_args_reads_answer_as_jq_5690() -> Result<()> {
 /// #5692: the same containers answered through each, so a gate that let one through would change
 /// an answer or an exit status here (`(.[] | numbers) |= ...` over a shared value was an error).
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn programs_that_write_or_walk_paths_keep_the_literal_5690() -> Result<()> {
     for (d, filter, expected) in [
         ("[1,2]", "$d | (.[] | numbers) |= . + 1", "[2,3]\n"),

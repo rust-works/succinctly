@@ -75,7 +75,6 @@ fn test_value_only_index_key_answers_as_jq_5243() -> Result<()> {
 /// A key that calls a function keeps the target dynamic, so it runs on the path-mode interpreter,
 /// with jq's answer (the holdout refuses every dynamic target).
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_function_call_in_an_index_key_runs_on_the_interpreter_5243() -> Result<()> {
     let filter = "def f: 9; .[(.a = f) | .a | tostring] = 2";
     let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
@@ -91,7 +90,6 @@ fn test_function_call_in_an_index_key_runs_on_the_interpreter_5243() -> Result<(
 /// at compile time, as before #5243: the walker evaluates a key off the cursor and would read
 /// the wrong node (`.a[line | tostring]` wrote key `"0"` on line 3).
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_extension_in_an_index_key_is_still_refused_5243() -> Result<()> {
     for (filter, name) in [(".a[line | tostring] = 9", "line"), (".[key] = 1", "key")] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("\n\n{\"a\":{\"3\":1}}"))?;

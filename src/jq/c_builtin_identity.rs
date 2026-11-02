@@ -172,7 +172,6 @@ pub(crate) fn array_index(len: usize, key: &OwnedValue) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(feature = "unshared-containers"))]
     use crate::jq::path_mode::run;
 
     fn doc(text: &str) -> OwnedValue {
@@ -188,7 +187,6 @@ mod tests {
     /// answer was captured from `/usr/bin/jq` 1.7.1: `Ok` is the path printed,
     /// `Err` the `Invalid path expression` message.
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
     fn each_keep_input_row_matches_jq_5223() {
         let rows: &'static [(&str, &str, Result<&str, &str>)] = &[
             (r#"{"a":"x"}"#, "path(.a | tostring)", Ok(r#"["a"]"#)),
@@ -291,7 +289,6 @@ mod tests {
             .unwrap_or_else(|e| std::panic::resume_unwind(e));
     }
 
-    #[cfg(not(feature = "unshared-containers"))]
     fn check_rows(rows: &[(&str, &str, Result<&str, &str>)]) {
         for (input, filter, want) in rows {
             let run = run(filter, doc(input)).expect(filter);

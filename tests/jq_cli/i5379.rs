@@ -420,7 +420,6 @@ fn test_a_tail_loop_that_never_ends_hits_the_round_budget_5379() -> Result<()> {
 
 /// A program with a dynamic path target runs on the path-mode interpreter, which keeps jq's path
 /// register; the loop carries it from stage to stage. Answers captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_a_program_that_reads_a_path_loops_too_5379() -> Result<()> {
     for (label, doc, body, want) in [

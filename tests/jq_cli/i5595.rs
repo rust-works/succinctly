@@ -156,9 +156,8 @@ fn test_add_over_an_array_matches_jq_5595() -> Result<()> {
 }
 
 /// `path($x)` after an `add` over a bound document is a path expression that does more than
-/// navigate, which the unshared-containers holdout refuses by design.
+/// navigate.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_add_keeps_a_bound_node_out_of_the_path_like_jq_5595() -> Result<()> {
     check(PATH_ROWS)
 }

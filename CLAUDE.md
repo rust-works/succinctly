@@ -511,34 +511,33 @@ for the full list.
 
 ## Feature Flags
 
-| Feature               | Description                                                                                                               |
-|-----------------------|---------------------------------------------------------------------------------------------------------------------------|
-| `std`                 | Standard library (default, CPU detection)                                                                                 |
-| `simd`                | Explicit SIMD intrinsics                                                                                                  |
-| `portable-popcount`   | Non-additive: replaces intrinsic popcount with the portable bitwise one                                                   |
-| `serde`               | Serde serialize/deserialize support                                                                                       |
-| `regex`               | Regex builtins in jq (included in `cli`)                                                                                  |
-| `cli`                 | CLI tool (jq, yq, locate, generators)                                                                                     |
-| `local-zone`          | System local zone for jq `localtime`/`strflocaltime` via jiff (in `cli`; not Windows)                                     |
-| `locale-time`         | Localized `strftime`/`strflocaltime` names via libc `strftime_l` (in `cli`; Apple and Linux libc only; #5754)             |
-| `bench-runner`        | Unified benchmark runner (bench list/run)                                                                                 |
-| `large-tests`         | 1GB bitvector tests                                                                                                       |
-| `huge-tests`          | 5GB bitvector tests                                                                                                       |
-| `mmap-tests`          | Memory-mapped bitvector tests                                                                                             |
-| `broadword-yaml`      | Non-additive: replaces NEON YAML scanning with broadword (SWAR) on ARM64                                                  |
-| `scalar-yaml`         | Non-additive: disables all SIMD/broadword YAML parsing                                                                    |
-| `select-stats`        | Adds a counter to five hot `select` scan loops (#40 measurement; never for timing runs)                                   |
-| `unshared-containers` | Non-additive: the #3000 layout (boxed map, inline array `Vec`) instead of `Rc` containers (#2999 A/B holdout; never ship) |
-| `share-stats`         | Record every copy-on-write that copied, with its call site (#2999 clone audit)                                            |
+| Feature             | Description                                                                                                   |
+|---------------------|---------------------------------------------------------------------------------------------------------------|
+| `std`               | Standard library (default, CPU detection)                                                                     |
+| `simd`              | Explicit SIMD intrinsics                                                                                      |
+| `portable-popcount` | Non-additive: replaces intrinsic popcount with the portable bitwise one                                       |
+| `serde`             | Serde serialize/deserialize support                                                                           |
+| `regex`             | Regex builtins in jq (included in `cli`)                                                                      |
+| `cli`               | CLI tool (jq, yq, locate, generators)                                                                         |
+| `local-zone`        | System local zone for jq `localtime`/`strflocaltime` via jiff (in `cli`; not Windows)                         |
+| `locale-time`       | Localized `strftime`/`strflocaltime` names via libc `strftime_l` (in `cli`; Apple and Linux libc only; #5754) |
+| `bench-runner`      | Unified benchmark runner (bench list/run)                                                                     |
+| `large-tests`       | 1GB bitvector tests                                                                                           |
+| `huge-tests`        | 5GB bitvector tests                                                                                           |
+| `mmap-tests`        | Memory-mapped bitvector tests                                                                                 |
+| `broadword-yaml`    | Non-additive: replaces NEON YAML scanning with broadword (SWAR) on ARM64                                      |
+| `scalar-yaml`       | Non-additive: disables all SIMD/broadword YAML parsing                                                        |
+| `select-stats`      | Adds a counter to five hot `select` scan loops (#40 measurement; never for timing runs)                       |
+| `share-stats`       | Record every copy-on-write that copied, with its call site (#2999 clone audit)                                |
 
 ### `--all-features` is not a superset build (#3006)
 
-Four features above are marked **non-additive**: enabling one *replaces* the
+Three features above are marked **non-additive**: enabling one *replaces* the
 default with a slower or measurement-only build rather than adding behavior
 on top of it (`select-stats`/`share-stats` are additive — instrumentation
 only, no default behavior replaced — and not part of this set, even though
 both must also never be on for a timing/shipped build for their own,
-different reason). `cargo build --all-features` turns on all four at once,
+different reason). `cargo build --all-features` turns on all three at once,
 so an `--all-features` binary is a strictly slower, non-shipping build with
 no diagnostic that it's non-default. This has already bitten twice, in ways
 CI works around but this repo's own docs don't all say consistently:
@@ -572,28 +571,10 @@ CI works around but this repo's own docs don't all say consistently:
   absent in exactly the build most likely to be run to "check everything" —
   including [docs/guides/release.md](docs/guides/release.md)'s own release
   checklist, which now also runs the shipped feature set for this reason.
-  `unshared-containers` specifically is the #2999/#3000 A/B holdout pattern
-  [docs/guides/benchmarking.md](docs/guides/benchmarking.md#ab-benchmarking-method)
-  documents its own rules for; this is the general case that pattern is one
-  instance of.
-- **`unshared-containers` refuses a dynamic path target** (#5233): a jq program
-  whose `path`/`del`/`=`/`|=` target does more than navigate gets `a path
-  expression that does more than navigate is not supported in the
-  unshared-containers build`, so a test that runs one fails under
-  `--all-features`. Mark it
-  `#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]`
-  above its `#[test]` — an ignore, not a `cfg`, so it still compiles and
-  the helpers it calls do not turn into dead code. A test that pins node
-  identity or sharing (`ptr_eq`, a NaN compared by identity, a loop that must
-  not go quadratic) fails there for the holdout's own reason, not the refusal,
-  and takes `ignore = "holdout has no node identity or sharing (#5254)"`.
-  The x86_64 `holdout` leg of `.github/workflows/ci.yml` runs
-  `cargo test --all-features --test jq_cli_tests --lib`, so a failure there is
-  a real one. `git grep 'ignore = "holdout'` lists the ignored ones; one
-  that stops hitting its reason (a program the holdout can answer, the refusal
-  lifted, identity added) can drop its attribute. Check that the refusal is the reason
-  before adding one: a program the holdout refuses wrongly is a bug in the
-  holdout, not a test to skip.
+  An A/B holdout feature is one instance of this pattern
+  ([docs/guides/benchmarking.md](docs/guides/benchmarking.md#ab-benchmarking-method)
+  has its own rules, including retiring the switch once its measurement is
+  recorded: `unshared-containers` went that way, #5841).
 
 If you're deciding what `cargo test`/`cargo clippy` invocation "covers
 everything": it's the CI legs matching the **default** feature set

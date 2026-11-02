@@ -62,10 +62,8 @@ fn test_dot_digit_after_a_term_stays_a_syntax_error_5299() -> Result<()> {
 }
 
 /// A literal is not a path: `path(.5)` raises `Invalid path expression with result 0.5` (exit 5) in
-/// jq. The unshared-containers holdout refuses a path target that does more than navigate before
-/// it gets there (exit 3), which is its own refusal rather than this literal's.
+/// jq.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_leading_dot_literal_is_not_a_path_5299() -> Result<()> {
     let (out, code) = run_jq_stdin("path(.5)", "null", &["-c"])?;
     assert_eq!((out.as_str(), code), ("", 5));

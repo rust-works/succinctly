@@ -17,7 +17,6 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use std::borrow::Cow;
 
-#[cfg(not(feature = "unshared-containers"))]
 use alloc::rc::Rc;
 use core::ops::{Deref, DerefMut};
 
@@ -2146,21 +2145,11 @@ fn format_positive_shifted_plain(
 // only `OwnedValue` and measured 15% less live heap at peak with 23% more RSS
 // on `wide_10mb | to_entries` -- ~290 bytes of allocator hole per entry
 // object. Both enums use `ObjectMapOf`, so a change here moves both at once.
-//
-// The `unshared-containers` cargo feature restores the #3000 layout from
-// this source shape -- the object map behind a plain `Box`, the array's
-// `Vec` inline -- so a clone deep-copies again and every container costs
-// exactly the allocations it did before #2999 (an inline `Vec` is 24 bytes,
-// so the value stays 32). That is the never-triggering holdout an A/B of the
-// sharing subtracts as code-layout bias (see `docs/guides/benchmarking.md`).
-// Measurement only; never enable it in a shipped build.
 
 /// Report a forced copy-on-write to [`share_stats`](super::share_stats),
 /// attributed to the wrapper method's caller. One spelling for every
 /// instrumented path, so the `cfg` gate cannot drift between them; expands
-/// to nothing in the shipped build, and is not defined at all under the
-/// `unshared-containers` holdout, where nothing is ever shared.
-#[cfg(not(feature = "unshared-containers"))]
+/// to nothing in the shipped build.
 macro_rules! note_forced_copy {
     ($kind:ident) => {
         #[cfg(any(test, feature = "share-stats"))]
@@ -2177,16 +2166,10 @@ macro_rules! note_forced_copy {
 /// copy-on-write point, `Rc::make_mut`) and `From<target>`. Everything whose
 /// shape depends on the container -- iteration, `Extend`, `FromIterator` --
 /// stays written out per wrapper below.
-///
-/// `unshared_from`/`unshared_into` say how the `unshared-containers` holdout
-/// wraps and unwraps its inner type (a `Box` for the map, nothing for the
-/// `Vec`, both exactly the #3000 layout).
 macro_rules! shared_container {
     (
         $wrapper:ident, $inner:ident, target = $target:ty,
         into = $into:ident, on_write = $on_write:ident, on_unwrap = $on_unwrap:ident,
-        unshared_from = |$from_arg:ident| $unshared_from:expr,
-        unshared_into = |$into_arg:ident| $unshared_into:expr,
     ) => {
         impl<V> $wrapper<V> {
             /// An empty container.
@@ -2211,40 +2194,16 @@ macro_rules! shared_container {
             /// either handle copies first ([`DerefMut`], `Rc::make_mut`):
             /// while the answer is `true`, neither handle has been written
             /// through since they were split.
-            ///
-            /// Always `false` under `unshared-containers`, where a clone
-            /// already deep-copied and no two handles can share anything --
-            /// the measurement holdout therefore refuses every identity the
-            /// table would have granted, which costs acceptance, never
-            /// correctness.
             #[inline]
             pub fn ptr_eq(&self, other: &Self) -> bool {
-                #[cfg(not(feature = "unshared-containers"))]
-                {
-                    Rc::ptr_eq(&self.0, &other.0)
-                }
-                #[cfg(feature = "unshared-containers")]
-                {
-                    let _ = other;
-                    false
-                }
+                Rc::ptr_eq(&self.0, &other.0)
             }
 
             /// Whether another handle currently shares this storage, i.e.
             /// whether the next write through this handle will copy it.
-            ///
-            /// Always `false` under `unshared-containers`, where every clone
-            /// already copied eagerly.
             #[inline]
             pub fn is_shared(&self) -> bool {
-                #[cfg(not(feature = "unshared-containers"))]
-                {
-                    Rc::strong_count(&self.0) > 1
-                }
-                #[cfg(feature = "unshared-containers")]
-                {
-                    false
-                }
+                Rc::strong_count(&self.0) > 1
             }
         }
 
@@ -2254,20 +2213,12 @@ macro_rules! shared_container {
             #[inline]
             #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
             pub fn $into(self) -> $target {
-                #[cfg(not(feature = "unshared-containers"))]
-                {
-                    match Rc::try_unwrap(self.0) {
-                        Ok(inner) => inner,
-                        Err(shared) => {
-                            note_forced_copy!($on_unwrap);
-                            (*shared).clone()
-                        }
+                match Rc::try_unwrap(self.0) {
+                    Ok(inner) => inner,
+                    Err(shared) => {
+                        note_forced_copy!($on_unwrap);
+                        (*shared).clone()
                     }
-                }
-                #[cfg(feature = "unshared-containers")]
-                {
-                    let $into_arg = self.0;
-                    $unshared_into
                 }
             }
         }
@@ -2284,9 +2235,8 @@ macro_rules! shared_container {
             }
         }
 
-        /// A refcount bump in the shipped shape (the copy is deferred to the
-        /// first write through either handle); a deep copy under
-        /// `unshared-containers`.
+        /// A refcount bump: the copy is deferred to the first write through
+        /// either handle.
         impl<V: Clone> Clone for $wrapper<V> {
             #[inline]
             fn clone(&self) -> Self {
@@ -2297,8 +2247,6 @@ macro_rules! shared_container {
         impl<V: PartialEq> PartialEq for $wrapper<V> {
             #[inline]
             fn eq(&self, other: &Self) -> bool {
-                // Through `Deref`, not the field: the field is an `Rc` in the
-                // shipped shape and something else under `unshared-containers`.
                 **self == **other
             }
         }
@@ -2332,31 +2280,17 @@ macro_rules! shared_container {
             #[inline]
             #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
             fn deref_mut(&mut self) -> &mut Self::Target {
-                #[cfg(not(feature = "unshared-containers"))]
-                {
-                    if Rc::strong_count(&self.0) > 1 {
-                        note_forced_copy!($on_write);
-                    }
-                    Rc::make_mut(&mut self.0)
+                if Rc::strong_count(&self.0) > 1 {
+                    note_forced_copy!($on_write);
                 }
-                #[cfg(feature = "unshared-containers")]
-                {
-                    &mut self.0
-                }
+                Rc::make_mut(&mut self.0)
             }
         }
 
         impl<V> From<$target> for $wrapper<V> {
-            #[cfg(not(feature = "unshared-containers"))]
             #[inline]
             fn from(inner: $target) -> Self {
                 Self(Rc::new(inner))
-            }
-
-            #[cfg(feature = "unshared-containers")]
-            #[inline]
-            fn from($from_arg: $target) -> Self {
-                Self($unshared_from)
             }
         }
 
@@ -2401,22 +2335,12 @@ pub struct ArrayOf<V>(ArrayInnerOf<V>);
 /// (Unrelated to the `arrayvec` crate.)
 pub type ArrayVec = ArrayOf<OwnedValue>;
 
-/// [`ArrayOf`]'s inner representation: refcounted in the shipped build.
-#[cfg(not(feature = "unshared-containers"))]
+/// [`ArrayOf`]'s inner representation: refcounted.
 type ArrayInnerOf<V> = Rc<Vec<V>>;
-
-/// See [`ArrayInnerOf`]'s shared twin -- the `unshared-containers`
-/// measurement holdout: the `Vec` inline, exactly as `OwnedValue::Array`
-/// held it before #2999 (24 bytes, so the value stays 32 and no array costs
-/// an allocation it did not cost then).
-#[cfg(feature = "unshared-containers")]
-type ArrayInnerOf<V> = Vec<V>;
 
 shared_container! {
     ArrayOf, ArrayInnerOf, target = Vec<V>,
     into = into_vec, on_write = ArrayMakeMut, on_unwrap = ArrayUnwrap,
-    unshared_from = |vec| vec,
-    unshared_into = |inner| inner,
 }
 
 /// An array compares equal to the bare `Vec` it wraps, in both directions,
@@ -2458,7 +2382,6 @@ pub enum ArrayIntoIter<V> {
     Owned(alloc::vec::IntoIter<V>),
     /// Another handle still shares the array; the elements in `next..end`
     /// are cloned out, from either end.
-    #[cfg(not(feature = "unshared-containers"))]
     Shared {
         /// The array every remaining element is cloned from.
         vec: Rc<Vec<V>>,
@@ -2476,7 +2399,6 @@ impl<V: Clone> Iterator for ArrayIntoIter<V> {
     fn next(&mut self) -> Option<V> {
         match self {
             Self::Owned(iter) => iter.next(),
-            #[cfg(not(feature = "unshared-containers"))]
             Self::Shared { vec, next, end } => {
                 if next >= end {
                     return None;
@@ -2492,7 +2414,6 @@ impl<V: Clone> Iterator for ArrayIntoIter<V> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
             Self::Owned(iter) => iter.size_hint(),
-            #[cfg(not(feature = "unshared-containers"))]
             Self::Shared { next, end, .. } => {
                 let n = end - next;
                 (n, Some(n))
@@ -2506,7 +2427,6 @@ impl<V: Clone> DoubleEndedIterator for ArrayIntoIter<V> {
     fn next_back(&mut self) -> Option<V> {
         match self {
             Self::Owned(iter) => iter.next_back(),
-            #[cfg(not(feature = "unshared-containers"))]
             Self::Shared { vec, next, end } => {
                 if next >= end {
                     return None;
@@ -2527,24 +2447,17 @@ impl<V: Clone> IntoIterator for ArrayOf<V> {
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn into_iter(self) -> Self::IntoIter {
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            match Rc::try_unwrap(self.0) {
-                Ok(vec) => ArrayIntoIter::Owned(vec.into_iter()),
-                Err(shared) => {
-                    note_forced_copy!(ArrayUnwrap);
-                    let end = shared.len();
-                    ArrayIntoIter::Shared {
-                        vec: shared,
-                        next: 0,
-                        end,
-                    }
+        match Rc::try_unwrap(self.0) {
+            Ok(vec) => ArrayIntoIter::Owned(vec.into_iter()),
+            Err(shared) => {
+                note_forced_copy!(ArrayUnwrap);
+                let end = shared.len();
+                ArrayIntoIter::Shared {
+                    vec: shared,
+                    next: 0,
+                    end,
                 }
             }
-        }
-        #[cfg(feature = "unshared-containers")]
-        {
-            ArrayIntoIter::Owned(self.0.into_iter())
         }
     }
 }
@@ -2572,9 +2485,7 @@ impl<'a, V: Clone> IntoIterator for &'a mut ArrayOf<V> {
 
 /// Report a copy that a promoted scalar (#3191) forced, attributed to the
 /// wrapper method's caller -- [`note_forced_copy`]'s twin for the scalar
-/// wrappers, defined in every build because the scalar wrappers exist in
-/// the `unshared-containers` holdout too (where nothing is ever promoted,
-/// so it never fires).
+/// wrappers.
 macro_rules! note_scalar_copy {
     ($kind:ident) => {
         #[cfg(any(test, feature = "share-stats"))]
@@ -2632,8 +2543,6 @@ pub struct SharableString(SharableStringInner);
 #[derive(Clone)]
 enum SharableStringInner {
     Owned(String),
-    // Never built under the holdout, which promotes nothing.
-    #[cfg_attr(feature = "unshared-containers", allow(dead_code))]
     Shared(alloc::rc::Rc<String>),
 }
 
@@ -2646,15 +2555,9 @@ impl SharableString {
 
     /// Move the string behind a refcount, so every later clone shares it
     /// and [`ptr_eq`](Self::ptr_eq) can report the identity (#3191). A
-    /// no-op when it is already shared, and under the `unshared-containers`
-    /// holdout, where nothing is ever shared.
+    /// no-op when it is already shared.
     #[inline]
-    #[cfg_attr(
-        feature = "unshared-containers",
-        allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)
-    )]
     pub fn promote(&mut self) {
-        #[cfg(not(feature = "unshared-containers"))]
         if let SharableStringInner::Owned(s) = &mut self.0 {
             self.0 = SharableStringInner::Shared(alloc::rc::Rc::new(core::mem::take(s)));
         }
@@ -2928,20 +2831,13 @@ pub struct SharableLiteral(SharableLiteralInner);
 #[derive(Clone)]
 enum SharableLiteralInner {
     Owned(Box<str>),
-    // Never built under the holdout, which promotes nothing.
-    #[cfg_attr(feature = "unshared-containers", allow(dead_code))]
     Shared(alloc::rc::Rc<Box<str>>),
 }
 
 impl SharableLiteral {
     /// See `SharableString::promote`.
     #[inline]
-    #[cfg_attr(
-        feature = "unshared-containers",
-        allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)
-    )]
     pub(crate) fn promote(&mut self) {
-        #[cfg(not(feature = "unshared-containers"))]
         if let SharableLiteralInner::Owned(s) = &mut self.0 {
             self.0 = SharableLiteralInner::Shared(alloc::rc::Rc::new(core::mem::take(s)));
         }
@@ -3736,8 +3632,6 @@ impl OwnedValue {
     /// storage it was built with. Computed numbers (`Int`/`Float`) have no
     /// storage in jq either and are left as they are; a JSON document's
     /// numbers all materialize as `NumberLiteral`s, which this promotes.
-    ///
-    /// A no-op under the `unshared-containers` holdout, whose `promote` is one.
     pub(crate) fn promote_identities(&mut self) {
         match self {
             Self::String(s) => s.promote(),
@@ -5566,8 +5460,7 @@ pub(crate) fn jq_identical<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue) -> 
 /// instances, this is the whole rule. Its precondition is promotion: an
 /// unpromoted string or literal is identical to nothing, so a caller that
 /// asks it of document scalars materializes them promoted first
-/// (`promote_identities`). Under the `unshared-containers` holdout nothing is
-/// ever shared, so only the unallocated kinds can be identical there.
+/// (`promote_identities`).
 pub(crate) fn jv_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
     match (a, b) {
         (OwnedValue::Null, OwnedValue::Null) => true,
@@ -6169,7 +6062,6 @@ mod tests {
     /// while it is: a clone is a copy, and `ptr_eq` is `false` even against
     /// itself. Promotion makes every later clone the same storage.
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
     fn sharable_string_shares_only_once_promoted_3191() {
         let mut s = SharableString::from("abc");
         assert!(!s.is_shared());
@@ -6197,7 +6089,6 @@ mod tests {
     /// -- while the other handle keeps the original. A write through the
     /// *last* handle copies nothing.
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
     fn sharable_string_write_unshares_3191() {
         use crate::jq::share_stats::{self, Kind};
 
@@ -6222,7 +6113,6 @@ mod tests {
     /// `into_string` moves when it can and copies (recorded) when another
     /// handle still holds the storage.
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
     fn sharable_string_into_string_moves_unless_shared_3191() {
         use crate::jq::share_stats::{self, Kind};
 
@@ -6299,7 +6189,6 @@ mod tests {
     /// The number-spelling twin: inline until promoted, one storage for
     /// every clone after, and `into_boxed` copies only while shared.
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
     fn sharable_literal_shares_only_once_promoted_3191() {
         use crate::jq::share_stats::{self, Kind};
 
@@ -6324,7 +6213,6 @@ mod tests {
     /// number spelling (#3191), and never answers `true` for storage a bind
     /// did not promote, nor across kinds.
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
     fn shares_storage_with_reads_promoted_scalars_3191() {
         let inline = OwnedValue::string("s");
         assert!(!inline.shares_storage_with(&inline.clone()));
@@ -6352,7 +6240,6 @@ mod tests {
     /// bits, a literal never against a computed number, promoted scalars and
     /// containers by storage, and `null`/booleans by kind and value.
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
     fn jv_identical_on_every_kind_5223() {
         let two = OwnedValue::Int(2);
         assert!(jv_identical(&two, &OwnedValue::Float(2.0)));
@@ -6400,7 +6287,6 @@ mod tests {
     /// places are not, the containers keep their storage, and the document
     /// prints exactly as before.
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
     fn promote_identities_gives_each_document_node_one_identity_5223() {
         let json = br#"{"a":"s","b":"s","c":1,"d":1,"e":[1.0,"s"]}"#;
         let index = crate::json::JsonIndex::build(json);
@@ -6429,29 +6315,6 @@ mod tests {
         assert!(!jv_identical(&map["e"], &e_storage));
     }
 
-    /// Under the holdout nothing shares storage, so only the kinds jq compares
-    /// by value can be identical (#5223).
-    #[test]
-    #[cfg(feature = "unshared-containers")]
-    fn jv_identical_under_the_holdout_compares_only_by_value_5223() {
-        let array = OwnedValue::Array(vec![OwnedValue::Null].into());
-        assert!(!jv_identical(&array, &array.clone()));
-        assert!(jv_identical(&OwnedValue::Int(2), &OwnedValue::Float(2.0)));
-    }
-
-    /// The holdout never promotes: its A/B twin must not share a scalar
-    /// either, or it measures a sharing binary against a sharing binary.
-    #[test]
-    #[cfg(feature = "unshared-containers")]
-    fn unshared_containers_holdout_never_promotes_a_scalar_3191() {
-        let mut s = SharableString::from("abc");
-        s.promote();
-        assert!(!s.is_shared());
-        let mut l = SharableLiteral::from("5");
-        l.promote();
-        assert!(!l.is_shared());
-    }
-
     /// #3000: the whole point of [`ObjectMap`] is that `OwnedValue` stops
     /// paying `IndexMap`'s 72 inline bytes on *every* value. Pinned so a
     /// future variant that reintroduces a wide payload can't silently undo
@@ -6465,11 +6328,7 @@ mod tests {
     /// bytes (16 since #1344 added the side list for a repeated key's earlier
     /// entries, still under `NumberLiteral`'s 32). #2999 put `Array` behind a pointer as well (24 -> 8), which
     /// changes nothing here -- `NumberLiteral` was already the widest arm --
-    /// and is asserted so the shape stays documented. 32 holds in every build
-    /// -- under the `unshared-containers` holdout the array's `Vec` is inline
-    /// again (24 bytes, still under `NumberLiteral`'s 32) -- so this pin has
-    /// no feature exemption; only the one-pointer assertion on `ArrayVec` is
-    /// the shipped shape's.
+    /// and is asserted so the shape stays documented.
     /// Same 64-bit gate as the crate's other exact-size pins (`EvalError`,
     /// `Expr`): 32-bit targets shrink the pointer-sized fields.
     #[test]
@@ -6490,7 +6349,6 @@ mod tests {
             "ObjectMap must stay two pointers wide -- narrow enough that Object is not \
              OwnedValue's widest arm again, and with the map as the only heap block"
         );
-        #[cfg(not(feature = "unshared-containers"))]
         assert_eq!(
             core::mem::size_of::<ArrayVec>(),
             core::mem::size_of::<usize>(),
@@ -6656,7 +6514,6 @@ mod tests {
     /// the write copies exactly once and leaves the other handle untouched,
     /// and `share_stats` names the line that copied.
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
     fn clone_shares_storage_until_the_first_write_2999() {
         use crate::jq::share_stats::{self, Kind};
 
@@ -6709,7 +6566,6 @@ mod tests {
     /// copies when it is shared -- the by-value-destructure class the audit
     /// exists to list.
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
     fn by_value_consumption_moves_when_unique_and_copies_when_shared_2999() {
         use crate::jq::share_stats::{self, Kind};
 
@@ -6789,7 +6645,6 @@ mod tests {
     /// element handles, not the elements) and that one object. Every other
     /// object stays one allocation shared by both documents.
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
     fn a_write_copies_only_the_spine_it_goes_through_2999() {
         use crate::jq::share_stats::{self, Kind};
 
@@ -6827,47 +6682,6 @@ mod tests {
             assert!(a.is_shared() && b.is_shared());
             assert_eq!(a, b);
         }
-    }
-
-    /// The holdout's own pin: `unshared-containers` must copy eagerly and
-    /// hold the array's `Vec` inline (24 bytes, as before #2999 -- an extra
-    /// allocation per array would make it a third layout, not #3000's), or
-    /// the A/B it exists for is measuring two sharing binaries against each
-    /// other and reporting the difference as code-layout bias.
-    #[test]
-    #[cfg(feature = "unshared-containers")]
-    fn unshared_containers_holdout_copies_eagerly_2999() {
-        use crate::jq::share_stats;
-
-        assert_eq!(
-            core::mem::size_of::<ArrayVec>(),
-            core::mem::size_of::<Vec<OwnedValue>>()
-        );
-        assert_eq!(core::mem::size_of::<OwnedValue>(), 32);
-
-        let original = OwnedValue::array_from(vec![OwnedValue::object_from([(
-            "a".to_string(),
-            OwnedValue::Int(1),
-        )])]);
-        let (mut copy, recorded) = share_stats::measure(|| original.clone());
-        assert!(recorded.is_empty(), "{recorded:?}");
-        let items = as_array_vec(&copy);
-        assert!(!items.is_shared());
-        let ((), recorded) = share_stats::measure(|| {
-            copy.as_array_mut().unwrap()[0]
-                .as_object_mut()
-                .unwrap()
-                .insert("b".to_string(), OwnedValue::Int(2));
-        });
-        assert!(
-            recorded.is_empty(),
-            "nothing is ever shared, so nothing is ever forced: {recorded:?}"
-        );
-        assert_eq!(
-            original.as_array().unwrap()[0].as_object().unwrap().len(),
-            1
-        );
-        assert_eq!(copy.as_array().unwrap()[0].as_object().unwrap().len(), 2);
     }
 
     /// #1171: a leading-dot number literal (with or without a `-` sign)
@@ -8180,7 +7994,6 @@ mod tests {
     /// inside it (#3069): two handles on one array or object holding a
     /// computed NaN are equal in jq mode, at any depth. A structurally equal
     /// copy is not, yq stays structural, and ordering never short-circuits.
-    #[cfg(not(feature = "unshared-containers"))]
     #[test]
     fn test_container_identity_short_circuits_jq_equality_3069() {
         let nan = OwnedValue::Float(f64::NAN);

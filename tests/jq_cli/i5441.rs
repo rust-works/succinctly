@@ -60,11 +60,7 @@ fn test_body_that_reads_its_variable_late_matches_jq_5441() -> Result<()> {
 }
 
 /// A container passed down a run and compared by identity after it: a NaN-bearing array equals itself
-/// only by identity in jq. The `unshared-containers` holdout has no node identity (#5254).
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
+/// only by identity in jq.
 #[test]
 fn test_container_identity_survives_a_run_split_around_a_reader_5441() -> Result<()> {
     // Ten stages that hand a container on unchanged, as jq's `+ null` does: a run.

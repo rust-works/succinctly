@@ -9,7 +9,6 @@ use anyhow::Result;
 /// a `try` and a `del(..)?` catch it. It raised the same text uncatchably (a guessed refusal of a register lost
 /// anywhere in the root, which holds a `null`). Rows captured from jq 1.7.1 (stdout, first stderr line, exit code),
 /// both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_foreach_landing_on_an_object_navigating_extract_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -144,7 +143,6 @@ fn test_caught_foreign_foreach_landing_on_an_object_navigating_extract_4800() ->
 
 /// #4800: the same with the pattern landing on an array (`{"a":[1]}`). The uncaught message is jq's own, as it was;
 /// what is pinned is that it is still that message once the register is placed on the array.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_foreach_landing_on_an_array_navigating_extract_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -279,7 +277,6 @@ fn test_caught_foreign_foreach_landing_on_an_array_navigating_extract_4800() -> 
 
 /// #4800: with a `.`, `$i` or `empty` EXTRACT the same fold answers as before: the terminal refusal names the
 /// emitted `null` or `$i`, and an EXTRACT that emits nothing has no output to check.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_foreach_landing_on_a_container_other_extracts_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -352,7 +349,6 @@ fn test_caught_foreign_foreach_landing_on_a_container_other_extracts_4800() -> R
 /// #4800: the same `foreach` behind the shapes that already read it for a `null` landing: a `null` or `not` head
 /// (the `foreach` is handed a `null` or boolean, never the container), a `.` stage, a `label`, `first`, `try` and an
 /// emits-nothing comma sibling, with a `.a` EXTRACT on `{"a":{"a":null}}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_foreach_landing_on_a_container_behind_wrappers_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -509,7 +505,6 @@ fn test_caught_foreign_foreach_landing_on_a_container_behind_wrappers_4800() -> 
 /// #4800: a `null` landing, as before (`["a","a"]`, and a two-entry pattern whose absent `b` lands on `null` too); an
 /// empty object landing (`{"a":{}}`), read as any container; and a `$i.a` EXTRACT, whose error names the element
 /// (`$i` is the root there), caught under `?` now that the register is placed.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_foreach_landing_null_empty_and_element_extract_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -617,7 +612,6 @@ fn test_caught_foreign_foreach_landing_null_empty_and_element_extract_4800() -> 
 /// #4800: a `not` head hands the `foreach` a boolean (`true`, from the `null` the emptied step left), which is never the
 /// container the pattern lands on either: with a `$i.a` EXTRACT, which raises on the element, `[path(..)?]` catches it
 /// as jq does. Read for a `null` state only, it raised uncatchably.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_foreach_landing_on_a_container_behind_a_boolean_head_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -668,7 +662,6 @@ fn test_caught_foreign_foreach_landing_on_a_container_behind_a_boolean_head_4800
 
 /// #4800: a `try` around the `foreach` whose handler emits nothing (`catch empty`) has no output to misplace, so the
 /// container landing is read through it as through a bare `try`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_foreach_landing_on_a_container_behind_a_catch_empty_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -707,7 +700,6 @@ fn test_caught_foreign_foreach_landing_on_a_container_behind_a_catch_empty_4800(
 /// carries the register the `try` entered with: the root here, so jq's `$i` is `[]` and `[path(..)?]` is `[[]]`.
 /// #4800 kept this shape refused (`has_emitting_handler`), since the container reading did not state that register;
 /// #5004 seeds the handler with it (`foreach_update_try_entry`), so the rows match jq.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_foreach_landing_behind_an_emitting_handler_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

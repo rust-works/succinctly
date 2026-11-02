@@ -12,7 +12,6 @@ use crate::assert_path_rows_both_routes_3749;
 // pattern walked off the root, the nested `foreach` emitted, and a `$i` EXTRACT named `["a","a"]`, which `|=` wrote.
 
 /// #5176: the issue's rows (`path`, `|=`, `del` on `null`, `true` and `1` elements, and the `(FE, 7)`/`(7, FE)` commas), every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5176_caught_foreign_foreach_over_a_non_root_source_emits_nothing() -> Result<()> {
@@ -77,7 +76,6 @@ fn test_5176_caught_foreign_foreach_over_a_non_root_source_emits_nothing() -> Re
 }
 
 /// #5176: other sources (`.b`, `(.a, 1)`, `.[]?`, `.a | .`), INITs (`null`, `0`) and EXTRACTs (`$i | .`, `.`, `$x`) of the same shape.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5176_caught_foreign_foreach_over_other_sources_and_inits() -> Result<()> {
@@ -135,7 +133,6 @@ fn test_5176_caught_foreign_foreach_over_other_sources_and_inits() -> Result<()>
 }
 
 /// #5176: an array pattern and a `?` around the destructure are read as the object pattern under `try` is.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5176_caught_foreign_foreach_array_pattern_and_optional_source() -> Result<()> {
@@ -158,7 +155,6 @@ fn test_5176_caught_foreign_foreach_array_pattern_and_optional_source() -> Resul
 }
 
 /// #5176: the sources on which the root `$x` is the register on a step (`.`, `(.a, .)`, `(., .a)`), and a `$x` that is the element itself (a container, a string, a number, a container holding a `NaN`), are not read as foreign: they match jq as they did.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5176_caught_foreign_foreach_where_the_marker_is_the_register_is_unchanged() -> Result<()> {
@@ -224,7 +220,6 @@ fn test_5176_caught_foreign_foreach_where_the_marker_is_the_register_is_unchange
 
 /// #5183: a `?` over a step the nested `foreach` refused (the `$y` EXTRACT on a literal element, where jq's register is the root
 /// and `$x` is it) was answered by step 1's wrong emission, which #5176 removed. The step is read now, and jq's `[["a"]]` stands.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5176_step_two_a_question_mark_hid_is_read_5183() -> Result<()> {

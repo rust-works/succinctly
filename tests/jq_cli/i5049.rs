@@ -13,7 +13,6 @@ use crate::{assert_path_rows_both_routes_3749, run_jq_full};
 
 /// #5049: the issue's rows on both documents (`path`, `[path(..)?]`, `del`, `|=`), the stage-less form's `with result
 /// 7`, and the `try (FI) catch 7` UPDATE. Every row captured from `/usr/bin/jq` 1.7.1 (stdout, exit code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5049_caught_foreign_foreach_update_with_an_inner_handler_and_the_stage_after_it(
@@ -124,7 +123,6 @@ fn test_5049_caught_foreign_foreach_update_with_an_inner_handler_and_the_stage_a
 /// `foreach`'s source left it, so the stage after it finds `$x` foreign as jq does. Here the inner `foreach`'s EXTRACT is
 /// `$y`, emitted at the register its source walked to. A `try` around the whole path used to catch an exact refusal
 /// the stage made of the root (jq: no output).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5049_extract_that_cannot_move_the_register_states_the_walked_step_register() -> Result<()> {
@@ -162,7 +160,6 @@ fn test_5049_extract_that_cannot_move_the_register_states_the_walked_step_regist
 
 /// #5049: a two-argument `foreach` emits its UPDATE's output with the register that UPDATE left (here `.a | select(true)
 /// | 2` leaves it on `.a`), so a later `$x.a` or `.b?` meets jq's own path check rather than a by-value guess.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_5049_two_argument_foreach_emission_keeps_the_register_update_left() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -200,7 +197,6 @@ fn test_5049_two_argument_foreach_emission_keeps_the_register_update_left() -> R
 /// #5049: where the source did not move the inner `foreach`'s step register (`MovedRegister::At`), its EXTRACT's
 /// emission states no register: read as the walked step register, differential grids turned the first row's refusal
 /// into an accept (jq refuses) and the second's into a write one level short of jq's. Each row must answer as jq does or stay refused (exit 5, nothing on stdout), on both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5049_extract_states_no_register_the_source_did_not_move_alone() -> Result<()> {
@@ -238,7 +234,6 @@ fn test_5049_extract_states_no_register_the_source_did_not_move_alone() -> Resul
 /// #5049: the same reading on an outer step that is not the `foreach`'s last, or that binds `[$i] ?// $i`, where no
 /// `try` around the nested `foreach` is placed (#5004 seeds only a bare `$name` on the last step): the `null` INIT is the
 /// state the first step hands it, `$x` is the register there, and `.a` on that `null` is jq's own catchable raise.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5049_inner_handler_reading_on_a_step_that_is_not_the_last_or_not_a_bare_name() -> Result<()>

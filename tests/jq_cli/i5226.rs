@@ -1,8 +1,4 @@
 //! #5226: a `//` right operand whose bind source is the loop variable (`$i`, `$i.a`) in a fold UPDATE is refused as jq refuses it.
-//!
-//! The interpreter reads storage identity, which the `unshared-containers` holdout does not have, so these pin the
-//! shipped shape only.
-#![cfg(not(feature = "unshared-containers"))]
 
 use anyhow::Result;
 

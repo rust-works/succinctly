@@ -5522,14 +5522,10 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                                     // only ever ask `matches!(last, Null |
                                     // Bool(false))`, which is why the M2 path
                                     // already synthesizes a `Bool` here rather than
-                                    // materializing (`record_exit_status`). Cloning
-                                    // the value instead would be a refcount bump in
-                                    // the shipped build but a deep copy under the
-                                    // `unshared-containers` holdout, i.e. a cost
-                                    // that shows up only in the configuration used
-                                    // to measure this change. There is no `Err`
-                                    // counterpart: an owned value cannot fail to
-                                    // materialize, and its writer bounds its own depth.
+                                    // materializing (`record_exit_status`). There is
+                                    // no `Err` counterpart: an owned value cannot fail
+                                    // to materialize, and its writer bounds its own
+                                    // depth.
                                     OutputItem::Owned(v) => {
                                         last_output = Some(OwnedValue::Bool(!matches!(
                                             v,
@@ -14005,10 +14001,6 @@ mod tests {
         /// which a program reading an 84 MB `--rawfile` twenty times depends on. Deleting the
         /// loop, or running it after those clones, fails this.
         #[test]
-        #[cfg_attr(
-            feature = "unshared-containers",
-            ignore = "holdout has no node identity or sharing (#5254)"
-        )]
         fn named_strings_are_shared_once_before_anything_clones_them_5713() {
             let mut context = EvalContext::default();
             context

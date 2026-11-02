@@ -279,17 +279,6 @@ jobs:
           - name: scalar-yaml
             buildCli: false
             testCmd: cargo test --verbose --features simd,scalar-yaml
-          # #5254: `--all-features` builds the `unshared-containers` A/B holdout (#2999), which
-          # refuses a dynamic jq path target (#5233) and has no node identity, so the tests that
-          # need either carry `ignore = "holdout ..."` (#5246) and what is left must pass. Nothing
-          # else here builds that feature, so without this leg its tests drift unseen. Only the
-          # two stack-filling tests run in their own leg below (`skip-args-stack`); the slow
-          # tests that moved there with them (#5494) still run here, under the holdout build.
-          - name: holdout
-            buildCli: false
-            testCmd: |
-              skip=$(scripts/deep-recursion-tests.sh skip-args-stack)
-              cargo test --all-features --test jq_cli_tests --lib -- $skip
           # #2114: `cargo check` doesn't build test targets at all, so it never
           # caught #2083 (a std-only symbol reachable from test code with no
           # matching cfg gate) -- `cargo test` both builds and runs them.

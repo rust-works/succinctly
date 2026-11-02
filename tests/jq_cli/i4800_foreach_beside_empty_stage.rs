@@ -9,7 +9,6 @@ use anyhow::Result;
 /// {"a":null}`) where jq answers `["a"]`/nothing, and with a `$i` EXTRACT named the `null` instead of the state.
 /// `| select(true)` and a bare `FE | .` already matched and are kept as controls, as are the stages that compute. Every row
 /// captured from jq 1.7.1 (stdout, first stderr line, exit code), both routes, over `path`, `[path(..)?]`, `del` and `|=`, with a `reduce` UPDATE at the end.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_foreach_beside_an_empty_comma_item_then_a_stage_4800(
 ) -> Result<()> {

@@ -1,8 +1,4 @@
 //! #5228: the explicit pipe spelling of a `//` alternate, and a `?` or `try` around the path of the plain one, answer as jq does.
-//!
-//! The interpreter reads storage identity, which the `unshared-containers` holdout does not have, so these pin the
-//! shipped shape only.
-#![cfg(not(feature = "unshared-containers"))]
 
 use anyhow::Result;
 

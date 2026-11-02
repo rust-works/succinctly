@@ -52,10 +52,6 @@ fn test_noop_delete_and_null_slice_store_build_a_new_array_5761() -> Result<()> 
 /// What must not change: a path that runs through something absent keeps identity in jq, and the
 /// new container is a shallow copy, so the elements inside it are still the same handles.
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_paths_that_name_nothing_keep_identity_5761() -> Result<()> {
     for filter in [
         "[nan] as $a | $a | del(.[5].x) == $a",
@@ -101,10 +97,6 @@ fn test_noop_delete_and_null_slice_store_keep_their_values_5761() -> Result<()> 
 /// slice, a path through something absent). The fold gate used to keep the literal operand for
 /// all of them.
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_fold_store_through_a_slice_or_delete_follows_jq_5761() -> Result<()> {
     for (filter, expected) in [
         ("{}; .x = ($v | del(.[5].x))", "true"),
@@ -148,10 +140,6 @@ fn test_fold_store_through_a_slice_or_delete_follows_jq_5761() -> Result<()> {
 /// keeps the element itself, as jq's `reduce` does: `add` is `reduce .[] as $x (null; . + $x)`.
 /// These were `false` here for the compound spellings and `true` in jq 1.7.1.
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_fold_compound_store_over_a_null_state_keeps_the_element_5761() -> Result<()> {
     for (filter, expected) in [
         (
@@ -262,10 +250,6 @@ fn test_fold_alternative_store_evaluates_its_operand_first_5761() -> Result<()> 
 /// NaN-bearing container stored through any spelling still equals itself. These were `false`: the
 /// per-path filter rebuilt the operand from literals. Fold or not, one path or several.
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_compound_and_alternative_store_keep_the_operand_storage_5761() -> Result<()> {
     for filter in [
         "[nan] as $a | reduce $a as $v ({\"x\":null,y:null}; (.x,.y) += $v) | .x == $a",
@@ -287,7 +271,6 @@ fn test_compound_and_alternative_store_keep_the_operand_storage_5761() -> Result
 
 /// What the operand's marker must not change: errors, several right-hand sides, `path()`, a write
 /// after the store, a NaN through `-=`, and an object merge.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_compound_store_with_a_container_operand_keeps_its_results_5761() -> Result<()> {
     for (filter, expected) in [

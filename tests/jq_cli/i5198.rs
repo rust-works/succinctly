@@ -10,7 +10,6 @@ use crate::assert_path_rows_both_routes_3749;
 
 /// #5198: a bare generator, a source that yields twice, a bind ahead of it, the write form, and generators whose last
 /// output is the register (`null`). Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5198_reduce_update_generator_yields_its_last_output() -> Result<()> {

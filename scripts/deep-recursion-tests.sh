@@ -35,11 +35,6 @@
 #
 #   deep-recursion-tests.sh skip-args   prints `--exact --skip <name> ...`, which
 #                                       ci.yml appends after `--` on `cli-gated`
-#   deep-recursion-tests.sh skip-args-stack
-#                                       the same for the two stack tests only: the
-#                                       x86_64 `holdout` leg is the one place the
-#                                       `unshared-containers` build is tested, so it
-#                                       keeps running the heavy tests and skips just these
 #   deep-recursion-tests.sh run         the whole `deep-recursion` leg
 #   deep-recursion-tests.sh heavy-args  prints `--exact <name> ...` for HEAVY_TESTS (not the
 #                                       stack tests, which are `#[ignore]`d under coverage):
@@ -67,7 +62,7 @@ set -euo pipefail
 
 TEST_TARGET=jq_cli_tests
 
-# The two whose cost is the native stack (#3698). The `holdout` leg skips only these.
+# The two whose cost is the native stack (#3698).
 STACK_TESTS=(
   test_recursion_refuses_before_the_native_stack_runs_out_3262
   test_composed_recursion_across_two_defs_errors_not_aborts_1371
@@ -95,11 +90,11 @@ HEAVY_TESTS=(
   test_type_selectors_equal_their_definition_3690 # 11
 )
 
-# What the `deep-recursion` leg runs, and every other leg but `holdout` skips.
+# What the `deep-recursion` leg runs, and every other leg skips.
 DEEP_RECURSION_TESTS=("${STACK_TESTS[@]}" "${HEAVY_TESTS[@]}")
 
 usage() {
-  echo "usage: $0 skip-args|skip-args-stack|heavy-args|run" >&2
+  echo "usage: $0 skip-args|heavy-args|run" >&2
 }
 
 # `--exact --skip <name> ...` for the names given.
@@ -149,7 +144,6 @@ run() {
 case "${1:-}" in
   heavy-args) echo "--exact ${HEAVY_TESTS[*]}" ;;
   skip-args) skip_args_of "${DEEP_RECURSION_TESTS[@]}" ;;
-  skip-args-stack) skip_args_of "${STACK_TESTS[@]}" ;;
   run) run ;;
   *) usage; exit 2 ;;
 esac

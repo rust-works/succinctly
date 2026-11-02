@@ -10,7 +10,6 @@ use crate::assert_path_rows_both_routes_3749;
 
 /// #5193: the issue's rows, the bare generator, a bounded `limit`, and the write forms. Every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5193_foreach_update_generator_delivers_every_output() -> Result<()> {

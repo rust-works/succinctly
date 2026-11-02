@@ -11,7 +11,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// #5179: The issue's first row, and the same shape with more steps, a six-step run, a nested pattern, an array
 /// pattern and a `.z |` wrapper. The state an earlier step's `catch $i` left is the node `$x`'s pattern lands on, so
 /// the pattern's `.` emits it on the register. Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_try_handler_landing_equal_to_the_state_is_that_node_5179() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -189,7 +188,6 @@ fn test_foreach_update_try_handler_landing_equal_to_the_state_is_that_node_5179(
 /// #5179: the row #5012 pinned as refused: the root `catch $i` left on the first step is the node the second step's
 /// pattern lands on. jq emits `["a"]` and then raises its catchable `with result` error; `main` raised the same error
 /// uncatchably. Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_try_handler_landing_equal_to_the_state_with_a_container_state_5179(
 ) -> Result<()> {
@@ -227,7 +225,6 @@ fn test_foreach_update_try_handler_landing_equal_to_the_state_with_a_container_s
 
 /// #5179: A landing equal to the state by value at another position is a different node: the pattern's `.` emits the
 /// state off the register, as for a landing that differs. Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_try_handler_landing_equal_to_the_state_by_value_at_another_position_5179(
 ) -> Result<()> {
@@ -294,7 +291,6 @@ fn test_foreach_update_try_handler_landing_equal_to_the_state_by_value_at_anothe
 /// #5179: The issue's second row, and a nested pattern whose innermost key is absent. The one-entry nested pattern
 /// lands on a value the state is not, so the pattern's `.` emits the state off the register. Rows captured from jq
 /// 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_try_handler_nested_pattern_that_does_not_raise_5179() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -359,7 +355,6 @@ fn test_foreach_update_try_handler_nested_pattern_that_does_not_raise_5179() -> 
 
 /// #5179: Not read, and as before: a head before the nested `foreach` hands it a value that is not the state, so
 /// identity by position says nothing. Pinned so a change is seen. Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_try_handler_landing_test_not_read_behind_a_head_5179() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -399,7 +394,6 @@ fn test_foreach_update_try_handler_landing_test_not_read_behind_a_head_5179() ->
 /// an absent key lands on a `null`, and a pattern of two entries or two elements is answered by an earlier reading, so
 /// the answer is jq's. Covers a landing at the state's position (`.a[0]` after `catch $i` left it) and at another
 /// position (`.c`, an equal value). Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_try_handler_array_and_multi_entry_patterns_5179() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -666,7 +660,6 @@ fn test_foreach_update_try_handler_array_and_multi_entry_patterns_5179() -> Resu
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_try_handler_landing_shapes_the_test_does_not_read_stay_refused_5179(
 ) -> Result<()> {

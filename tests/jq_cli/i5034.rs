@@ -10,7 +10,6 @@ use anyhow::Result;
 /// (`near attempt to access element "a" of null`, exit 5). `succinctly` read the `if` as one whose `else` is not `.`
 /// and so not an UPDATE that is empty with `FE`: `FE` was driven by value, emitted, and the state stayed the root
 /// (`path` printed nothing, `del` and `|= 9` echoed the document). Every row captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_if_with_a_navigating_else_empties_with_the_caught_foreach_5034() -> Result<()>
 {
@@ -135,7 +134,6 @@ fn test_foreach_update_if_with_a_navigating_else_empties_with_the_caught_foreach
 /// the second element) the bind passes there and `FE` emits, so `if true then FE else .a end` is `FE` (the `else`
 /// never runs) and answers as the bare `FE` does, where reading the `else` left that step refused. Every row captured
 /// from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_if_with_a_navigating_else_keeps_the_rows_that_matched_5034() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -236,7 +234,6 @@ fn test_foreach_update_if_with_a_navigating_else_keeps_the_rows_that_matched_503
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_if_with_a_navigating_else_keeps_the_extract_and_mirrored_foreach_reading_5034(
 ) -> Result<()> {

@@ -17,10 +17,6 @@ fn answer(filter: &str) -> Result<String> {
 /// The issue's own table, plus the nested, `?//` and multi-name shapes of the same bind. Each
 /// row was `false`.
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_destructured_container_keeps_its_storage_5539() -> Result<()> {
     for filter in [
         "[[nan]] as $a | $a as [$x] | $x == $a[0]",
@@ -55,10 +51,6 @@ fn test_destructured_container_is_not_a_fresh_one_5539() -> Result<()> {
 /// The generic evaluator's route, with a document to walk instead of `-n`: both evaluators end
 /// in the same substitution, and neither may rebuild the container.
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_destructured_container_keeps_its_storage_on_a_document_5539() -> Result<()> {
     for filter in [
         "[[nan]] as $a | $a as [$x] | $x == $a[0]",
@@ -94,10 +86,6 @@ fn test_destructured_container_stored_by_value_5539() -> Result<()> {
 
 /// The control: a plain `as` bind of the same node already answered `true`.
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_plain_bind_control_5539() -> Result<()> {
     assert_eq!(
         answer("[[nan]] as $a | $a[0] as $x | $x == $a[0]")?,

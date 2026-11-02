@@ -34,10 +34,10 @@ git pull origin main
 ./scripts/build.sh
 
 # Run the complete test suite against the shipped feature set --
-# NOT --all-features, which builds several non-shipping measurement/holdout
-# configurations instead (portable-popcount, broadword-yaml, scalar-yaml,
-# unshared-containers) and would let a shipped-shape-only regression pass
-# silently. See CLAUDE.md's Feature Flags section for why.
+# NOT --all-features, which builds several non-shipping measurement
+# configurations instead (portable-popcount, broadword-yaml, scalar-yaml)
+# and would let a shipped-shape-only regression pass silently. See
+# CLAUDE.md's Feature Flags section for why.
 cargo test --features cli,simd,regex,serde
 
 # Run benchmarks (see docs/guides/benchmarking.md for details)

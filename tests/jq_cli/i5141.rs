@@ -18,7 +18,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// `|=` and `del`, with the controls that answer (a source that moves nothing, a `try`, a bind of `null`, a `?//` chain, a
 /// `foreach` UPDATE, a nested `reduce`). Every row captured from `/usr/bin/jq` 1.7.1 (stdout, exit code, message), both
 /// routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5141_reduce_moved_source_comma_update_bind_of_dot_raises() -> Result<()> {

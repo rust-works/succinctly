@@ -79,7 +79,6 @@ fn features() -> Vec<String> {
     for (on, name) in [
         (cfg!(feature = "scalar-yaml"), "scalar-yaml"),
         (cfg!(feature = "portable-popcount"), "portable-popcount"),
-        (cfg!(feature = "unshared-containers"), "unshared-containers"),
         (cfg!(feature = "select-stats"), "select-stats"),
         (cfg!(feature = "share-stats"), "share-stats"),
     ] {
@@ -122,7 +121,6 @@ impl Env {
         for bad in [
             "scalar-yaml",
             "portable-popcount",
-            "unshared-containers",
             "select-stats",
             "share-stats",
         ] {

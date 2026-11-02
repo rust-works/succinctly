@@ -15,7 +15,6 @@ use anyhow::Result;
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_single_pattern_bind_beside_limit_of_dot_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -387,7 +386,6 @@ fn test_foreach_update_single_pattern_bind_beside_limit_of_dot_4800() -> Result<
 /// emission that is never made, where jq answers nothing. The controls keep their refusal: an EXTRACT that
 /// does emit (`$i`, `.`) is the shape the earlier #4800 rows decide. (An uncaught destructure was a control too, until #4957
 /// read it as jq does.) Every other row captured from jq 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_with_an_emitting_nothing_extract_ignores_an_inert_update_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -614,7 +612,6 @@ fn test_foreach_with_an_emitting_nothing_extract_ignores_an_inert_update_4800() 
 /// wherever the row is a `path(...)`, as jq 1.7.1 answers them (stdout, the
 /// first error message, the exit code). The path-mode interpreter carries
 /// jq's register, so they match by construction, on both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

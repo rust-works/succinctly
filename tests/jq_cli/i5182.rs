@@ -10,7 +10,6 @@ use crate::assert_path_rows_both_routes_3749;
 // register, the pattern walked off the root and a `$i` EXTRACT named `["b","a"]`, which `del` and `|=` wrote.
 
 /// #5182: the issue's rows (`path`, `?`, `del`, `|=` and the comma UPDATEs) on `null`, `true`, string and container elements, every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5182_uncaught_foreign_foreach_over_a_non_root_source_raises() -> Result<()> {
@@ -89,7 +88,6 @@ fn test_5182_uncaught_foreign_foreach_over_a_non_root_source_raises() -> Result<
 }
 
 /// #5182: the step the error names for an array pattern, two entries, a nested pattern, a `$a` body and `[$a]` under `?`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5182_uncaught_foreign_foreach_patterns_name_the_step_jq_names() -> Result<()> {
@@ -133,7 +131,6 @@ fn test_5182_uncaught_foreign_foreach_patterns_name_the_step_jq_names() -> Resul
 }
 
 /// #5182: the sources on which the root `$x` is the register on a step (`.`, `(.a, .)`), a `$x` that is the element itself, and the caught form are not read as foreign.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5182_uncaught_foreign_foreach_where_the_marker_is_the_register_is_unchanged() -> Result<()>
@@ -176,7 +173,6 @@ fn test_5182_uncaught_foreign_foreach_where_the_marker_is_the_register_is_unchan
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5182_step_two_refusal_a_question_mark_drops_until_a_non_dot_bind_body_is_read() -> Result<()>

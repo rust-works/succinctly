@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 
-#[cfg(not(feature = "unshared-containers"))]
 use crate::assert_path_rows_3289;
 use crate::assert_path_rows_both_routes_3749;
 
@@ -17,7 +16,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// #5110: the issue's rows, the controls that keep the reading they had (a marker that is not the register), and rows of a differential grid (document x bind site x literal stage x nested `foreach` x wrapper x source x
 /// INIT x EXTRACT x context) that `main` refused or answered wrongly. Every row captured from `/usr/bin/jq` 1.7.1
 /// (stdout, exit code, message), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5110_literal_stage_ahead_of_a_bare_bind_foreach_in_a_foreach_update() -> Result<()> {
@@ -392,7 +390,6 @@ fn test_5110_literal_stage_ahead_of_a_bare_bind_foreach_in_a_foreach_update() ->
 /// #5110: the issue's third row, written as `path`, `del` and `|=`; the heads, alternates, documents, bind sites,
 /// wrappers, sources, INITs and EXTRACTs around it. Every row captured from `/usr/bin/jq` 1.7.1 (stdout, exit code,
 /// message), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5110_literal_stage_ahead_of_a_bare_bind_foreach_behind_an_alternative_update() -> Result<()>
@@ -786,7 +783,6 @@ fn test_5110_literal_stage_ahead_of_a_bare_bind_foreach_behind_an_alternative_up
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5110_alternative_update_shapes_not_read_keep_their_refusal() -> Result<()> {

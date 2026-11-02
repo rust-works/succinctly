@@ -1,9 +1,6 @@
 //! #5248: `..` followed by a bracket suffix (`..[0]?`, `..[]?`, `..["a"]?`, `..[1:]?`) is a postfix on the
 //! `..` term in jq mode, as it is in jq 1.7.1; it was a parse error here. yq's lexer rejects the same
 //! spellings (`Error: bad expression`), so yq mode keeps rejecting them.
-//!
-//! The path rows need the path-mode interpreter, which reads storage identity the `unshared-containers`
-//! holdout does not have, so only those are gated off it; the read rows run in every build.
 
 use anyhow::Result;
 
@@ -278,7 +275,6 @@ fn test_recursive_descent_bracket_suffix_reads_match_jq_5248() -> Result<()> {
 }
 
 /// `path`, `del`, `|=` and `=` over the same suffixes, captured from jq 1.7.1, on both routes.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_recursive_descent_bracket_suffix_paths_match_jq_5248() -> Result<()> {

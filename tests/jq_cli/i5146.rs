@@ -13,7 +13,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// #5146: a variable bind of `.` around each body shape and wrapper, under `path`, `[path(..)?]` and `|=`, over documents
 /// where the pattern passes and where it raises (the state becomes `null`, as in jq), the bodies that return `$z`, and a
 /// source that moves the register. Every row captured from `/usr/bin/jq` 1.7.1 (stdout, exit code, message), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5146_reduce_update_as_var_bind_of_dot_keeps_the_accumulator() -> Result<()> {

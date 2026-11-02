@@ -9,7 +9,6 @@ use crate::assert_path_rows_both_routes_3749;
 // item, so the three-argument `foreach` EXTRACT ran once where jq runs it once per item.
 
 /// #5185: the issue's four rows and the comma shapes beside them. Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5185_comma_of_dots_in_a_bind_body_delivers_each_output() -> Result<()> {

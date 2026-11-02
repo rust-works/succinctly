@@ -115,9 +115,7 @@ fn test_forks_stay_bounded() -> Result<()> {
 }
 
 /// ...and through the path interpreter, where a round that answers once and then raises is a fork.
-/// A dynamic path target is refused by the `unshared-containers` holdout (#5246).
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_forks_stay_bounded_through_the_path_interpreter() -> Result<()> {
     assert_capped(&[
         "[path(until((false, error(\"x\")); .))] | length",

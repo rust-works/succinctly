@@ -13,7 +13,6 @@ use crate::{assert_path_rows_both_routes_3749, run_jq_full};
 
 /// #5103: the issue's rows and their `first(.a,.b)`/`(.a,.b)` binds, on a non-empty array (`$x` is the register) and an
 /// empty one (`$x` is not), under `try`, `?` and bare. Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_5103_register_through_a_whole_slice_with_x_at_its_container() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -149,7 +148,6 @@ fn test_5103_register_through_a_whole_slice_with_x_at_its_container() -> Result<
 /// #5103: the slice-spelled register answers in jq's own spelling (`["a",{"start":0,"end":null}]`), a `del` through it
 /// deletes the slice, an assignment raises jq's slice error, and an equal-valued sibling bound as `$x` (`(.a,.b)`) is
 /// provably another node, so its refusal is caught.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_5103_whole_slice_names_the_node_it_slices() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -228,7 +226,6 @@ fn test_5103_whole_slice_names_the_node_it_slices() -> Result<()> {
 
 /// #5103: a slice that does not span the whole array (`[1:]`, `[0:0]`), the slice of an empty array and a string slice
 /// are not the node they slice, so jq refuses (or `?` empties) and so does this.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_5103_partial_empty_and_string_slices_stay_other_nodes() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -282,7 +279,6 @@ fn test_5103_partial_empty_and_string_slices_stay_other_nodes() -> Result<()> {
 /// elements where jq raises, and `main` deleted through `.a[65536:] as $x | .a[65536:]`. One evaluation bound as `. as
 /// $x` is still the copy the register stands on. Captured from `/usr/bin/jq` 1.7.1 on a 70,003-element array, on the
 /// `-n` route (the document built in the filter) and on stdin.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_5103_copied_slice_past_offset_65535_is_a_new_array_per_evaluation() -> Result<()> {
     // (filter, stdout, first stderr line, exit code)
@@ -356,7 +352,6 @@ fn test_5103_copied_slice_past_offset_65535_is_a_new_array_per_evaluation() -> R
 /// copy the register stands on: jq answers) or two (`.a[70000:] as $x | .a[70000:]`: jq's catchable raise), which
 /// positions cannot tell apart, so these stay refused: never a caught refusal that drops jq's answer, nor an answer
 /// where jq raises. Both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_5103_copied_slice_spelled_alike_stays_refused() -> Result<()> {
     // (filter, jq's stdout)

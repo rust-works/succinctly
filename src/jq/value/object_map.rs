@@ -75,14 +75,11 @@
 //! table itself (probing, growth and its allocations), which no hasher changes. Revisit this
 //! with new numbers, not on the strength of a profile that attributes `insert_full` to hashing.
 
-#[cfg(all(not(test), feature = "unshared-containers"))]
-use alloc::boxed::Box;
 #[cfg(not(test))]
 use alloc::string::String;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
-#[cfg(not(feature = "unshared-containers"))]
 use alloc::rc::Rc;
 use core::hash::Hash;
 use core::ops::{Deref, DerefMut};
@@ -90,9 +87,7 @@ use core::ops::{Deref, DerefMut};
 use indexmap::{Equivalent, IndexMap};
 
 /// Records a forced copy for [`share_stats`](crate::jq::share_stats), in the
-/// builds that read it. Only the shared (refcounted) shape ever copies
-/// forcibly, so the holdout has no use for it.
-#[cfg(not(feature = "unshared-containers"))]
+/// builds that read it.
 macro_rules! note_forced_copy {
     ($kind:ident) => {
         #[cfg(any(test, feature = "share-stats"))]
@@ -141,22 +136,11 @@ pub struct ObjectMapOf<V> {
     shadows: Option<ShadowsInnerOf<V>>,
 }
 
-/// [`ObjectMapOf`]'s map: refcounted in the shipped build.
-#[cfg(not(feature = "unshared-containers"))]
+/// [`ObjectMapOf`]'s map: refcounted.
 type ObjectMapInnerOf<V> = Rc<IndexMap<String, V>>;
 
-/// See [`ObjectMapInnerOf`]'s shared twin -- the `unshared-containers`
-/// measurement holdout, the #3000 layout: boxed, not shared.
-#[cfg(feature = "unshared-containers")]
-type ObjectMapInnerOf<V> = Box<IndexMap<String, V>>;
-
-/// [`ObjectMapOf`]'s side list: refcounted in the shipped build.
-#[cfg(not(feature = "unshared-containers"))]
+/// [`ObjectMapOf`]'s side list: refcounted.
 type ShadowsInnerOf<V> = Rc<Shadows<V>>;
-
-/// See [`ShadowsInnerOf`]'s shared twin.
-#[cfg(feature = "unshared-containers")]
-type ShadowsInnerOf<V> = Box<Shadows<V>>;
 
 /// The document-order list of entries for a map in which some key repeats.
 ///
@@ -240,30 +224,16 @@ impl<V> Shadows<V> {
 #[inline]
 #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
 fn map_mut<V: Clone>(map: &mut ObjectMapInnerOf<V>) -> &mut IndexMap<String, V> {
-    #[cfg(not(feature = "unshared-containers"))]
-    {
-        if Rc::strong_count(map) > 1 {
-            note_forced_copy!(ObjectMakeMut);
-        }
-        Rc::make_mut(map)
+    if Rc::strong_count(map) > 1 {
+        note_forced_copy!(ObjectMakeMut);
     }
-    #[cfg(feature = "unshared-containers")]
-    {
-        map
-    }
+    Rc::make_mut(map)
 }
 
 /// The side list, copied first if another handle shares it.
 #[inline]
 fn shadows_mut<V: Clone>(shadows: &mut ShadowsInnerOf<V>) -> &mut Shadows<V> {
-    #[cfg(not(feature = "unshared-containers"))]
-    {
-        Rc::make_mut(shadows)
-    }
-    #[cfg(feature = "unshared-containers")]
-    {
-        shadows
-    }
+    Rc::make_mut(shadows)
 }
 
 /// `shadows` as a mutable reference to its list, if there is one.
@@ -297,28 +267,14 @@ impl<V> ObjectMapOf<V> {
     /// through since they were split. Every method that changes the side
     /// list also changes the map, so equal map pointers with different side
     /// lists cannot happen.
-    ///
-    /// Always `false` under `unshared-containers`, where a clone
-    /// already deep-copied and no two handles can share anything --
-    /// the measurement holdout therefore refuses every identity the
-    /// table would have granted, which costs acceptance, never
-    /// correctness.
     #[inline]
     pub fn ptr_eq(&self, other: &Self) -> bool {
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            Rc::ptr_eq(&self.map, &other.map)
-                && match (&self.shadows, &other.shadows) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => Rc::ptr_eq(a, b),
-                    _ => false,
-                }
-        }
-        #[cfg(feature = "unshared-containers")]
-        {
-            let _ = other;
-            false
-        }
+        Rc::ptr_eq(&self.map, &other.map)
+            && match (&self.shadows, &other.shadows) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                _ => false,
+            }
     }
 
     /// Whether another handle currently shares this storage, i.e.
@@ -327,19 +283,9 @@ impl<V> ObjectMapOf<V> {
     /// The side list of a repeated key is a separate allocation, copied only
     /// by a write that changes it (a new key, a removal, a new repeat), so a
     /// shared side list does not show here.
-    ///
-    /// Always `false` under `unshared-containers`, where every clone
-    /// already copied eagerly.
     #[inline]
     pub fn is_shared(&self) -> bool {
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            Rc::strong_count(&self.map) > 1
-        }
-        #[cfg(feature = "unshared-containers")]
-        {
-            false
-        }
+        Rc::strong_count(&self.map) > 1
     }
 
     /// Whether some key of this object has more than one entry, i.e. whether
@@ -427,19 +373,12 @@ impl<V: Clone> ObjectMapOf<V> {
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn into_index_map(self) -> IndexMap<String, V> {
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            match Rc::try_unwrap(self.map) {
-                Ok(map) => map,
-                Err(shared) => {
-                    note_forced_copy!(ObjectUnwrap);
-                    (*shared).clone()
-                }
+        match Rc::try_unwrap(self.map) {
+            Ok(map) => map,
+            Err(shared) => {
+                note_forced_copy!(ObjectUnwrap);
+                (*shared).clone()
             }
-        }
-        #[cfg(feature = "unshared-containers")]
-        {
-            *self.map
         }
     }
 
@@ -448,7 +387,6 @@ impl<V: Clone> ObjectMapOf<V> {
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn into_occurrences(self) -> Vec<(String, V)> {
         let Self { map, shadows } = self;
-        #[cfg(not(feature = "unshared-containers"))]
         let (map, shadows) = {
             let shared = Rc::strong_count(&map) > 1;
             if shared {
@@ -459,8 +397,6 @@ impl<V: Clone> ObjectMapOf<V> {
                 shadows.map(|s| Rc::try_unwrap(s).unwrap_or_else(|shared| (*shared).clone())),
             )
         };
-        #[cfg(feature = "unshared-containers")]
-        let (map, shadows) = (*map, shadows.map(|s| *s));
         let Some(shadows) = shadows else {
             return map.into_iter().collect();
         };
@@ -1012,9 +948,8 @@ impl<V> Default for ObjectMapOf<V> {
     }
 }
 
-/// A refcount bump per pointer in the shipped shape (the copy is deferred to
-/// the first write through either handle); a deep copy under
-/// `unshared-containers`.
+/// A refcount bump per pointer: the copy is deferred to the first write
+/// through either handle.
 impl<V: Clone> Clone for ObjectMapOf<V> {
     #[inline]
     fn clone(&self) -> Self {
@@ -1030,8 +965,6 @@ impl<V: Clone> Clone for ObjectMapOf<V> {
 impl<V: PartialEq> PartialEq for ObjectMapOf<V> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        // Through `Deref`, not the field: the field is an `Rc` in the
-        // shipped shape and something else under `unshared-containers`.
         **self == **other
     }
 }
@@ -1072,19 +1005,9 @@ impl<V: Clone> DerefMut for ObjectMapOf<V> {
 impl<V> From<IndexMap<String, V>> for ObjectMapOf<V> {
     #[inline]
     fn from(map: IndexMap<String, V>) -> Self {
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            Self {
-                map: Rc::new(map),
-                shadows: None,
-            }
-        }
-        #[cfg(feature = "unshared-containers")]
-        {
-            Self {
-                map: Box::new(map),
-                shadows: None,
-            }
+        Self {
+            map: Rc::new(map),
+            shadows: None,
         }
     }
 }
@@ -1123,7 +1046,6 @@ pub enum ObjectMapIntoIter<V> {
     /// Another handle still shares the map; the entries in `next..end` are
     /// cloned out, from either end (`DoubleEndedIterator`, like the owned
     /// form).
-    #[cfg(not(feature = "unshared-containers"))]
     Shared {
         /// The map every remaining entry is cloned from.
         map: Rc<IndexMap<String, V>>,
@@ -1141,7 +1063,6 @@ impl<V: Clone> Iterator for ObjectMapIntoIter<V> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Owned(iter) => iter.next(),
-            #[cfg(not(feature = "unshared-containers"))]
             Self::Shared { map, next, end } => {
                 if next >= end {
                     return None;
@@ -1157,7 +1078,6 @@ impl<V: Clone> Iterator for ObjectMapIntoIter<V> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
             Self::Owned(iter) => iter.size_hint(),
-            #[cfg(not(feature = "unshared-containers"))]
             Self::Shared { next, end, .. } => {
                 let n = end - next;
                 (n, Some(n))
@@ -1171,7 +1091,6 @@ impl<V: Clone> DoubleEndedIterator for ObjectMapIntoIter<V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         match self {
             Self::Owned(iter) => iter.next_back(),
-            #[cfg(not(feature = "unshared-containers"))]
             Self::Shared { map, next, end } => {
                 if next >= end {
                     return None;
@@ -1193,24 +1112,17 @@ impl<V: Clone> IntoIterator for ObjectMapOf<V> {
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn into_iter(self) -> Self::IntoIter {
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            match Rc::try_unwrap(self.map) {
-                Ok(map) => ObjectMapIntoIter::Owned(map.into_iter()),
-                Err(shared) => {
-                    note_forced_copy!(ObjectUnwrap);
-                    let end = shared.len();
-                    ObjectMapIntoIter::Shared {
-                        map: shared,
-                        next: 0,
-                        end,
-                    }
+        match Rc::try_unwrap(self.map) {
+            Ok(map) => ObjectMapIntoIter::Owned(map.into_iter()),
+            Err(shared) => {
+                note_forced_copy!(ObjectUnwrap);
+                let end = shared.len();
+                ObjectMapIntoIter::Shared {
+                    map: shared,
+                    next: 0,
+                    end,
                 }
             }
-        }
-        #[cfg(feature = "unshared-containers")]
-        {
-            ObjectMapIntoIter::Owned((*self.map).into_iter())
         }
     }
 }
@@ -1461,7 +1373,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
     fn identity_follows_both_pointers_so_a_shadow_only_difference_is_not_the_same_node() {
         let map = with_repeats(&[("a", 1), ("a", 2)]);
         let mut copy = map.clone();
@@ -1492,7 +1403,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
     fn replacing_a_live_value_does_not_copy_a_shared_side_list() {
         let map = with_repeats(&[("a", 1), ("a", 2)]);
         let mut copy = map.clone();

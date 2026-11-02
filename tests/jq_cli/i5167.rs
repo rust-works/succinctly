@@ -16,7 +16,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// #5167: the issue's rows (an outer `$x`, a navigation and the loop's `$i` over `(.a,.)` as the right operand, under
 /// `try` and `?`) and the operands the grid showed move nothing that matched. Every row captured from `/usr/bin/jq` 1.7.1,
 /// both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5167_two_argument_foreach_alternative_with_a_non_constant_operand() -> Result<()> {
@@ -68,7 +67,6 @@ fn test_5167_two_argument_foreach_alternative_with_a_non_constant_operand() -> R
 
 /// #5167: a `?//` chain behind the `//` in a two-argument `foreach`, where jq retries the failed alternative on the state it
 /// left.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5167_two_argument_foreach_alternative_over_a_destructuring_alternation() -> Result<()> {
@@ -92,7 +90,6 @@ fn test_5167_two_argument_foreach_alternative_over_a_destructuring_alternation()
 
 /// #5167: a `reduce` reads the `$x` operand, and keeps its `?//` chain as it was: jq names the `null` its failed
 /// alternative left, and reading the chain named the stored `5`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5167_reduce_alternative_with_a_marker_operand_and_an_alternation() -> Result<()> {
@@ -123,7 +120,6 @@ fn test_5167_reduce_alternative_with_a_marker_operand_and_an_alternation() -> Re
 
 /// #5167: the same operands behind a three-argument `foreach`'s `//` (#5157), which refused the loop's `$i` and a
 /// comma of a navigation and a constant after the first step.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5167_three_argument_foreach_alternative_with_a_non_constant_operand() -> Result<()> {

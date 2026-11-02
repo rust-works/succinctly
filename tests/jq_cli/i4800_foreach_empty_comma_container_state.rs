@@ -10,7 +10,6 @@ use anyhow::Result;
 /// comma, and an `empty` EXTRACT's inert-UPDATE shortcut did not read `empty`. Rows captured from jq 1.7.1 (stdout,
 /// first stderr line, exit code), both routes, over `path`, `[path(..)?]` and `|=` with `.`, `$i`, `empty`, `.a` and
 /// `(.a)?` EXTRACTs, sources `.` and `(.,.a)`, on `{"a":null}` and `{"a":{"a":null}}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_empty_comma_item_over_a_container_state_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -1279,7 +1278,6 @@ fn test_foreach_update_empty_comma_item_over_a_container_state_4800() -> Result<
 
 /// #4800: the same comma behind `if . then (empty, FE) else . end`, a `try` and a stage (`((FE, empty)) | .`), where the
 /// state is a container (source `.`). Rows captured from jq 1.7.1, both routes, over `path`, `[path(..)?]` and `del`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_empty_comma_item_behind_an_if_try_or_stage_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -1921,7 +1919,6 @@ fn test_foreach_update_empty_comma_item_behind_an_if_try_or_stage_4800() -> Resu
 /// not inert, and the nested `foreach` was refused for an emission that is never made. Rows captured from jq 1.7.1,
 /// both routes, over `path`, `[path(..)?]` and `|=` with `empty`, `select(false)` and `first(empty)` EXTRACTs, sources `.` and `(.a,.)`,
 /// on `{"a":null}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_with_an_emitting_nothing_extract_reads_empty_as_inert_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -2560,7 +2557,6 @@ fn test_foreach_with_an_emitting_nothing_extract_reads_empty_as_inert_4800() -> 
 
 /// #4800: the same comma under `try path(..) catch "c"`: jq's own, catchable error is caught (`"c"`), where the refusal
 /// the comma was read as before was uncatchable. Rows captured from jq 1.7.1, both routes, on `{"a":null}`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_empty_comma_item_under_try_catch_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -2696,7 +2692,6 @@ fn test_foreach_update_empty_comma_item_under_try_catch_4800() -> Result<()> {
 /// #4800: a comma that holds a *value* beside the `foreach` (`(FE, 7)`: the `7` is stored as a state of its own,
 /// with the register where jq leaves it) was not read, so a `?` around the path kept the refusal, uncatchably, where
 /// jq answers `[]`. Since #5018 a literal sibling is read item by item and the answer is jq's own.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_comma_with_a_value_sibling_answers_like_jq_4800() -> Result<()> {
     let filter = r"[path(. as $x | foreach . as $i (.; (foreach (try ($x as {a:$a} | .)) as $y (.; .; .), 7); $i))?]";

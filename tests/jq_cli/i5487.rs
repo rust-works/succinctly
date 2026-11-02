@@ -14,10 +14,6 @@ fn answer(filter: &str) -> Result<String> {
 }
 
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_variable_headed_pipe_is_identical_to_the_variable_5487() -> Result<()> {
     for filter in [
         // `==` on either side, an array and an object.
@@ -40,10 +36,6 @@ fn test_variable_headed_pipe_is_identical_to_the_variable_5487() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_variable_headed_pipe_inside_a_generator_5487() -> Result<()> {
     assert_eq!(
         answer("[nan] as $a | [range(0;3) | ($a | . | .)] | map(. == $a)")?,
@@ -53,10 +45,6 @@ fn test_variable_headed_pipe_inside_a_generator_5487() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 fn test_shapes_that_already_kept_the_handle_still_do_5487() -> Result<()> {
     for filter in [
         "[nan] as $a | ($a | .) == $a",

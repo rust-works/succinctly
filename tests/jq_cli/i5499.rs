@@ -96,7 +96,6 @@ fn test_as_binding_reads_a_field_5499() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_a_field_read_in_path_position_still_names_the_object_5499() -> Result<()> {
     // The splice must not change the object the error names.
     assert_eq!(
@@ -111,7 +110,6 @@ fn test_a_field_read_in_path_position_still_names_the_object_5499() -> Result<()
 }
 
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_a_fold_reading_its_variable_in_path_position_still_names_the_object_5499() -> Result<()> {
     // The splice is for a fold whose variable is read as a value. A path read keeps the object.
     let want =

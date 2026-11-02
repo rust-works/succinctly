@@ -12,7 +12,6 @@ use crate::assert_path_rows_both_routes_3749;
 
 /// #5150: the issue's rows, the trailing-identity spellings, and the non-empty updates that are unchanged. Every row
 /// captured from `/usr/bin/jq` 1.7.1 (stdout, exit code, message), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5150_update_empty_through_a_trailing_identity_deletes_the_slot() -> Result<()> {

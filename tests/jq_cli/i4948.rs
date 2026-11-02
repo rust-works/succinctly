@@ -16,7 +16,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// #4948: `else .` is the branch taken on the `null` the emptied step left behind. Every row captured from
 /// `/usr/bin/jq` 1.7.1 (stdout, first stderr line up to the container, exit code), both routes: the rows that print
 /// `[]`, `"C"` or a written document were exits 5 before.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4948_else_dot_after_an_emptied_caught_foreign_foreach_step() -> Result<()> {
@@ -138,7 +137,6 @@ fn test_4948_else_dot_after_an_emptied_caught_foreign_foreach_step() -> Result<(
 
 /// #4948: the same step behind the other spellings of the `if` (no `else`, a `$y` EXTRACT, an array pattern) and
 /// an `else` that computes a literal on a `null` document.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4948_other_if_shapes_around_the_caught_foreign_foreach() -> Result<()> {
@@ -225,7 +223,6 @@ fn test_4948_other_if_shapes_around_the_caught_foreign_foreach() -> Result<()> {
 
 /// #4948: controls that matched jq before the change and must still: a state that is truthy runs `FE`, so the
 /// `then` branch is read as it was; an `if` that is not around a `foreach`; the bare `foreach`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4948_controls_keep_their_answers() -> Result<()> {

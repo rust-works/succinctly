@@ -13,7 +13,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// second with `near attempt to access element "b" of <$x>`. Covers an object, an array and a nested
 /// pattern, a bind in front, a moving and a non-moving source, and `path`/`del`/`|=`. Every row captured
 /// from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4901_reduce_update_foreign_marker_destructure_returns_the_accumulator() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -101,7 +100,6 @@ fn test_4901_reduce_update_foreign_marker_destructure_returns_the_accumulator() 
 /// path. At step 1 `$x` is the register (the source's `.a?`), so `$x | . as {a:$a} | .` passes; at
 /// step 2 the source's `.` has moved the register back to the root and the pattern step on `$x`
 /// raises. The binary refused at step 1 with `with result {"b":1}`, which `try ... catch .` showed.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4901_reduce_update_foreign_marker_pipe_names_the_later_step() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -115,7 +113,6 @@ fn test_4901_reduce_update_foreign_marker_pipe_names_the_later_step() -> Result<
 /// not the register (a source that moved it, or a `$x` bound at another node), and the same behind
 /// `del`. A relaxation that stopped checking the destructure's steps, or the register the later steps
 /// meet, would turn one of these into an answer.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4901_reduce_update_foreign_marker_destructure_still_refuses() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

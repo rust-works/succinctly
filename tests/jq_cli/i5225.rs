@@ -1,8 +1,4 @@
 //! #5225: a nested `foreach` whose source destructures the register `$x`, caught or alt-wrapped, answers as jq does.
-//!
-//! The interpreter reads storage identity, which the `unshared-containers` holdout does not have, so these pin the
-//! shipped shape only.
-#![cfg(not(feature = "unshared-containers"))]
 
 use anyhow::Result;
 

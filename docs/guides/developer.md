@@ -166,8 +166,7 @@ documents since #5378, and the fused-slice equivalence tests build large arrays)
 all of them in their own `deep-recursion` leg rather than in `cli-gated`;
 `scripts/deep-recursion-tests.sh` holds the list for both sides (#3698), so to move another
 slow `jq_cli_tests` test there, add its name to that script's `HEAVY_TESTS` (it handles that one
-test target only). The x86_64 `holdout` leg skips only the two stack tests (`skip-args-stack`),
-since it is the one place the `unshared-containers` build is tested. `scripts/deep-recursion-tests.sh run` runs just those tests locally, and
+test target only). `scripts/deep-recursion-tests.sh run` runs just those tests locally, and
 `scripts/test_deep_recursion_tests.py` is the script's own self-test, which the leg runs
 first. That leg also runs all of `yq_cli_tests` (#5705, ~30% of `cli-gated`'s test time), but
 as a separate `cargo test --features cli --test yq_cli_tests` after the script, so `run` alone

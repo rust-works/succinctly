@@ -16,7 +16,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// `|=` and `=`; INIT `false`; the `[$a]` pattern, which does not pass on an object; and the rows that must stay as they
 /// are: an `if` that is false, INIT `{}`/`.a`, and a `$x` that is not the register (`.a as $x`, `.nope as $x`, the
 /// source `.a` or `(.a,.b)`). Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5106_extract_caught_bind_foreach_restates_at_the_bound_child() -> Result<()> {
@@ -279,7 +278,6 @@ fn test_5106_extract_caught_bind_foreach_restates_at_the_bound_child() -> Result
 /// #5106 / #5126: the residual rows, once ignored as known gaps and answered as jq answers since the path-mode interpreter
 /// (#5223) carries jq's register: INIT `.`, an UPDATE that stores `$x`, and a source `$i` over a `false` element. Captured
 /// from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5106_former_known_gaps_match_jq() -> Result<()> {

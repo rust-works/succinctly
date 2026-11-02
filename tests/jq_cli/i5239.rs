@@ -5,10 +5,6 @@
 //!
 //! #5233 widened the refusal to every dynamic target beside such a builtin (the shipped resolver no longer answers a dynamic target
 //! at all), so these rows now read the #5233 message.
-//!
-//! The interpreter reads storage identity, which the `unshared-containers` holdout does not have, so these pin the shipped shape
-//! only.
-#![cfg(not(feature = "unshared-containers"))]
 
 use anyhow::Result;
 

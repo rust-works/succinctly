@@ -283,7 +283,7 @@ fn test_alternative_binds_looser_than_assignment_in_jq_mode_5293() -> Result<()>
 }
 
 /// The same rows whose target does more than navigate (`.a // 1 %= 2` is `.a // (1 %= 2)`, whose
-/// left side is a path expression that reads): the unshared-containers holdout refuses them.
+/// left side is a path expression that reads).
 /// (input name, input, filter, expected `-c` output, exit code).
 const DYNAMIC_ROWS: &[(&str, &str, &str, &str, i32)] = &[
     (
@@ -303,7 +303,6 @@ const DYNAMIC_ROWS: &[(&str, &str, &str, &str, i32)] = &[
 ];
 
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_alternative_in_a_binding_body_after_assignment_5293() -> Result<()> {
     for (name, input, filter, want, want_code) in DYNAMIC_ROWS {
         let (stdout, stderr, code) =

@@ -264,7 +264,6 @@ const DYNAMIC_PATH_ROWS: &[Row] = &[
 ];
 
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_stream_events_dynamic_path_target_matches_jq_5681() -> Result<()> {
     for (args, stdin, expected, code) in DYNAMIC_PATH_ROWS {
         let (stdout, stderr, status) = run_jq_full(args, Some(stdin))?;

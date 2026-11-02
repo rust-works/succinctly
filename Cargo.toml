@@ -82,22 +82,6 @@ mmap-tests = ["memmap2", "tempfile"]  # Memory-mapped tests
 # Useful for testing broadword performance vs NEON intrinsics.
 broadword-yaml = []
 
-# Measurement-only holdout for #2999: restore the #3000 layout (object map
-# behind a plain `Box`, array `Vec` inline; 32-byte values, no structural
-# sharing, no extra allocation per array) from the current source shape, so an
-# A/B of the sharing can subtract code-layout bias. NEVER enable this in a
-# shipped build -- it turns every `OwnedValue::clone()` back into a deep copy.
-# It superseded #3000's `unboxed-object-map` (pre-#3000 layout) once that
-# experiment's numbers were recorded.
-#
-# Non-additive, like `portable-popcount`/`broadword-yaml`/`scalar-yaml`/
-# `select-stats` above and below: `--all-features` turns it on, so a
-# `--all-features` build is the *unshared* layout. That is this repo's
-# existing shape for a measurement flag, and the existing mitigation applies
-# unchanged -- CI lints the shipped shape on its own second `clippy` leg, not
-# only under `--all-features`.
-unshared-containers = []
-
 # Record every copy-on-write that actually copied (#2999): a shared array or
 # object written through, or consumed by value, with the file:line that forced
 # it. Zero cost when off; the shipped build carries only the refcount check

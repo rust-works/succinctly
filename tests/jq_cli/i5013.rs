@@ -8,7 +8,6 @@ use anyhow::Result;
 /// at the pattern's step. The by-value drive answered `["a"]`, so `del` deleted `.a` and `|= 9`/`= 9` wrote `.a`
 /// where jq leaves the document and errors. Rows captured from jq 1.7.1 (stdout, first stderr line, exit code), both
 /// routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_foreign_destructure_after_a_navigating_init_raises_5013() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -67,7 +66,6 @@ fn test_fold_source_foreign_destructure_after_a_navigating_init_raises_5013() ->
 /// #5013: a `try`/`?` around that destructure catches the raise and leaves the source empty, so a `foreach` emits
 /// nothing and a `reduce` answers its INIT (`del` deleted `.a` where jq leaves the document); a handler that emits
 /// supplies the element instead. Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_caught_foreign_destructure_after_a_navigating_init_empties_the_source_5013(
 ) -> Result<()> {
@@ -112,7 +110,6 @@ fn test_fold_source_caught_foreign_destructure_after_a_navigating_init_empties_t
 
 /// #5013: unchanged: an INIT that does not move the register (`.`, `0`), a SOURCE that navigates rather than
 /// destructures (it already raised), and a `$x` bound at INIT's own node. Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_destructure_controls_5013() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -150,7 +147,6 @@ fn test_fold_source_destructure_controls_5013() -> Result<()> {
 /// #5013: an INIT on a later fork (`(., .a)`, `(.a,.b)`), and an INIT that lands on a `null` below the root, move
 /// the register too, and a caught destructure of a foreign `$x` empties the source there as well. Each was read by
 /// value and wrote (`del` of the whole document, `|= 9` of `.b`/`.c`). Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_foreign_destructure_after_a_later_or_null_init_raises_5013() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -195,7 +191,6 @@ fn test_fold_source_foreign_destructure_after_a_later_or_null_init_raises_5013()
 /// #5013: a `?//` chain of destructures of a foreign `$x` after a navigating INIT raises too, so no write goes
 /// through (it was read by value, and `del` deleted `.a`). jq names the last alternative's step (`element 0`), the
 /// resolver the first's: the exit code and the empty output agree, the wording does not.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_alternative_chain_after_a_navigating_init_refuses_5013() -> Result<()> {
     for (input, filter) in [
@@ -240,7 +235,6 @@ fn test_fold_source_alternative_chain_after_a_navigating_init_refuses_5013() -> 
 
 /// #5013: inside another fold's body an INIT that lands on a `null` below the root keeps the live `null` on the fold's
 /// own frame, as before: the register's frame is not used there. Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_null_init_inside_a_fold_body_unchanged_5013() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -279,7 +273,6 @@ fn test_fold_source_null_init_inside_a_fold_body_unchanged_5013() -> Result<()> 
 /// wherever the row is a `path(...)`, as jq 1.7.1 answers them (stdout, the
 /// first error message, the exit code). The path-mode interpreter carries
 /// jq's register, so they match by construction, on both routes.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_5013() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
