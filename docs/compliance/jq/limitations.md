@@ -10310,7 +10310,7 @@ What differs from jq 1.7.1:
   `%k` and `%l` are read as `%H` and `%I`.
   A specifier the libc does not know (`%Q`, `%P`, `%5`) and a `%` that ends the format are no match, where they were once matched as a literal.
   `%U`, `%W` and `%V` are still no match here, though the pin's libc reads them and derives a date from them when a year is read (`"2015 09" | strptime("%Y %U")` is `[2015,2,1,0,0,0,0,59]`).
-  `%Z` takes a run of capital letters here, where the pin's libc reads only a name of the local zone and fails on the rest.
+  `%Z` takes a run of letters here, where the pin's libc reads only a name of the local zone and fails on the rest.
   An empty am marker matches nothing and reads as am, as on macOS under `de_DE`, where `%p` prints nothing and `PM` is left over.
   `%a`, `%A` and `%p` no longer read any run of letters: `Xyz`, `Thurs`, `Th` and `PMX` are no match, as in jq.
 
