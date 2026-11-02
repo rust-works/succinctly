@@ -1363,6 +1363,66 @@ const ROWS: &[Row] = &[
         "ZZZ",
         [("false\n", 0), ("false\n", 0), ("false\n", 0)],
     ),
+    (
+        "test(\"a$\")",
+        "a\n",
+        [("true\n", 0), ("true\nfalse\n", 0), ("true\n", 0)],
+    ),
+    (
+        "test(\"a$\")",
+        "a\nb\n",
+        [("false\n", 0), ("true\nfalse\nfalse\n", 0), ("false\n", 0)],
+    ),
+    (
+        "test(\"a$\")",
+        "\n",
+        [("false\n", 0), ("false\nfalse\n", 0), ("false\n", 0)],
+    ),
+    (
+        "test(\"b$\")",
+        "a\n",
+        [("false\n", 0), ("false\nfalse\n", 0), ("false\n", 0)],
+    ),
+    (
+        "test(\"b$\")",
+        "a\nb\n",
+        [("true\n", 0), ("false\ntrue\nfalse\n", 0), ("true\n", 0)],
+    ),
+    (
+        "test(\"b$\")",
+        "\n",
+        [("false\n", 0), ("false\nfalse\n", 0), ("false\n", 0)],
+    ),
+    (
+        "test(\"^b\")",
+        "a\n",
+        [("false\n", 0), ("false\nfalse\n", 0), ("false\n", 0)],
+    ),
+    (
+        "test(\"^b\")",
+        "a\nb\n",
+        [("false\n", 0), ("false\ntrue\nfalse\n", 0), ("false\n", 0)],
+    ),
+    (
+        "test(\"^b\")",
+        "\n",
+        [("false\n", 0), ("false\nfalse\n", 0), ("false\n", 0)],
+    ),
+    (
+        "test(\"a$\";\"x\")",
+        "a\n",
+        [("true\n", 0), ("true\nfalse\n", 0), ("true\n", 0)],
+    ),
+    (
+        "test(\"a$\";\"x\")",
+        "a\nb\n",
+        [("false\n", 0), ("true\nfalse\nfalse\n", 0), ("false\n", 0)],
+    ),
+    (
+        "test(\"a$\";\"x\")",
+        "\n",
+        [("false\n", 0), ("false\nfalse\n", 0), ("false\n", 0)],
+    ),
 ];
 
 #[test]

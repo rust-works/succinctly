@@ -10509,7 +10509,8 @@ pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<Owned
 }
 
 /// `length`, `utf8bytelength`, `startswith("lit")`, `endswith("lit")` and `contains("lit")` of an
-/// owned string, answered from the string itself (#5691, #5675).
+/// owned string, answered from the string itself (#5691, #5675), and (#5816) `test("lit")`,
+/// `test("lit"; "lit")`, `index("lit")`, `rindex("lit")` and `inside("lit")`.
 ///
 /// The bridge writes the string out as JSON text (an escape pass over every byte), indexes that
 /// text and then decodes the string back out of it, validating its UTF-8 a second time, to take
@@ -10517,17 +10518,18 @@ pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<Owned
 /// where the answer needs one pass over the string or only its ends. An owned string is already
 /// valid UTF-8 and cannot raise, so the answer is the bridge's own: `length` counts as
 /// [`builtin_length`] does (`string_length`, per mode), `utf8bytelength` is the byte count, and
-/// the prefix/suffix tests and `contains` are [`eval_owned_door_arm`]'s, which decline a
-/// non-literal or non-string argument and leave every raised error to the bridge.
+/// the prefix/suffix tests, `contains` and the #5816 search builtins are [`eval_owned_door_arm`]'s,
+/// which decline a non-literal or non-string argument (and a regex that does not compile) and
+/// leave every raised error to the bridge.
 ///
 /// #5712: `try`/`?` around an answer (it cannot raise, so no `catch` runs), and a comparison or
 /// boolean over such counts (`length > 5`), which [`eval_owned_pure_in`] settles with the
 /// condition doors on. Only an answer is taken: a comparison that raises (`.a > 1`), fans out or
 /// computes is `None`, and the bridge keeps its error.
 ///
-/// Every answer is a fresh integer or boolean, never a subvalue of `input`, so it is admitted
-/// whatever the embed table holds, as [`eval_owned_length`]'s is. Any other builtin or input
-/// shape is `None`.
+/// Every answer is a fresh integer, boolean or `null` (`index`/`rindex` of a needle that is not
+/// there), never a subvalue of `input`, so it is admitted whatever the embed table holds, as
+/// [`eval_owned_length`]'s is. Any other builtin or input shape is `None`.
 pub(crate) fn eval_owned_string_door<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -10586,7 +10588,8 @@ pub(crate) fn eval_owned_string_door<S: EvalSemantics>(
 }
 
 /// The count doors in one call: [`eval_owned_length`] (an array's or an object's length, #3477)
-/// and [`eval_owned_string_door`] (a string's length, and its prefix/suffix tests, #5691).
+/// and [`eval_owned_string_door`] (a string's length, its prefix/suffix tests, #5691, and its
+/// search builtins, #5816).
 ///
 /// They answer disjoint inputs and every caller wants both, so a caller reads this and not the
 /// pair: #5712 existed because #5710 added the string door beside `eval_owned_length` at two of
@@ -10711,7 +10714,8 @@ fn fixed_path_del_shape(expr: &Expr, input: &OwnedValue) -> Option<FixedPathDel>
 
 /// The [`eval_owned_pure_in`] `door` arms that answer one builtin over the
 /// owned input (#3707): `has(<literal>)`, `keys`, `startswith(<literal>)`,
-/// `endswith(<literal>)` and `tostring`.
+/// `endswith(<literal>)` and `tostring`, and (#5816, jq mode) `test`, `index`, `rindex` and
+/// `inside` of a string by a string literal.
 ///
 /// Each answers only the shape whose result the reindex bridge hands back
 /// identically, and returns `None` for everything else, so a type mismatch, a
@@ -10721,13 +10725,13 @@ fn fixed_path_del_shape(expr: &Expr, input: &OwnedValue) -> Option<FixedPathDel>
 /// argument is a literal so there is no generator to fan out and nothing to
 /// evaluate: a literal cannot raise, emit twice or touch the input.
 ///
-/// The results are fresh values (a boolean, a new array, a new string), or for
+/// The results are fresh values (a boolean, an integer, `null`, a new array, a new string), or for
 /// `tostring` of a string the input's own handle, as the bridge's
 /// [`tostring_owned`] hands it back.
 ///
 /// Called from [`eval_owned_pure_in`]'s `door` arms and, for `startswith` and
-/// `endswith` of a string, from [`eval_owned_string_door`] (#5691), which hands
-/// the boolean on as a value.
+/// `endswith` of a string, and the #5816 search builtins, from [`eval_owned_string_door`]
+/// (#5691), which hands the answer on as a value.
 fn eval_owned_door_arm<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -80472,7 +80476,7 @@ fn eval_owned_pure<S: EvalSemantics>(
 /// `length` over an owned array or object, answered by [`eval_owned_length`]
 /// (#3439), or over a string, answered by [`eval_owned_string_door`] (#5712),
 /// and the arms of [`eval_owned_door_arm`] (#3707) -- `has`, `keys`,
-/// `startswith`/`endswith`, `tostring` and `[e]`.
+/// `startswith`/`endswith`, `tostring`, (#5816) `test`/`index`/`rindex`/`inside` and `[e]`.
 ///
 /// `door` is a parameter and not an arm of [`eval_owned_pure`] because
 /// that function also decides what [`closed_expr_to_owned`] and the
@@ -115446,12 +115450,6 @@ mod tests {
         }
     }
 
-    /// #5691, #5675: `eval_owned_string_door` answers `length`, `utf8bytelength`,
-    /// `startswith("lit")`, `endswith("lit")` and `contains("lit")` of an owned string (and, #5712,
-    /// `try`/`?` and comparisons or booleans over those) the way the reindex bridge does, in both
-    /// modes, and declines every other input
-    /// and shape (a non-string input, a non-literal or non-string argument, a stage that computes
-    /// or fans out), leaving those and their errors to the bridge.
     /// #5816: `test`, `index`, `rindex` and `inside` of a string by a string literal are answered
     /// from the string, and answer what the reindex bridge does (the oracle), in jq mode. Anything
     /// the door must not take declines: a pattern or flags that is not a string literal, a pattern
@@ -115471,8 +115469,14 @@ mod tests {
             "abczzz",
             "ZZZ",
             "aaaa",
+            "a\n",
+            "a\nb\n",
         ];
         let shapes = [
+            "test(\"a$\")",
+            "test(\"b$\")",
+            "test(\"^b\")",
+            "test(\"a\\n$\")",
             "test(\"z\")",
             "test(\"Z\"; \"i\")",
             "test(\"^a\")",
@@ -115571,6 +115575,12 @@ mod tests {
         }
     }
 
+    /// #5691, #5675: `eval_owned_string_door` answers `length`, `utf8bytelength`,
+    /// `startswith("lit")`, `endswith("lit")` and `contains("lit")` of an owned string (and, #5712,
+    /// `try`/`?` and comparisons or booleans over those) the way the reindex bridge does, in both
+    /// modes, and declines every other input
+    /// and shape (a non-string input, a non-literal or non-string argument, a stage that computes
+    /// or fans out), leaving those and their errors to the bridge.
     #[test]
     fn eval_owned_string_door_agrees_with_the_reindex_bridge_5691() {
         let strings = [
