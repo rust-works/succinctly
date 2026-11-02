@@ -8939,7 +8939,7 @@ impl<'a> Parser<'a> {
         map_subexprs(&s, &mut |e: &Expr| {
             if let Expr::Pipe(stages) = e {
                 let mut stages = stages.clone();
-                stages.push(format.clone());
+                stages.make_mut().push(format.clone());
                 Expr::Pipe(stages)
             } else {
                 Expr::Pipe(vec![e.clone(), format.clone()].into())
