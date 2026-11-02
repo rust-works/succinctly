@@ -59,7 +59,8 @@ class ShardTests(unittest.TestCase):
         self.assertIn("--lib", args)
         self.assertIn("--bins", args)
         self.assertNotIn(shards.JQ_CLI, selected_tests(args))
-        self.assertNotIn(shards.NESTING, selected_tests(args))
+        # #5844: no longer a shard of its own once its one slow test took seconds.
+        self.assertIn("jq_library_eval_nesting_depth_tests", selected_tests(args))
 
     def test_the_jq_cli_shards_split_the_target_by_name_without_overlap(self):
         skip = shards.shard_args("jq-cli")
@@ -108,7 +109,7 @@ class ShardTests(unittest.TestCase):
             )
 
         self.assertEqual(run("shards").stdout.split(), list(shards.SHARDS))
-        self.assertEqual(run("args", "jq-nesting").stdout.split(), shards.shard_args("jq-nesting"))
+        self.assertEqual(run("args", "jq-cli-heavy").stdout.split(), shards.shard_args("jq-cli-heavy"))
         self.assertNotEqual(run("args", "bogus").returncode, 0)
         self.assertEqual(run().returncode, 2)
 

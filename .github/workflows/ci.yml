@@ -1124,7 +1124,7 @@ jobs:
   # (#310), and the push-to-main run that publishes the baseline lives in
   # coverage-baseline.yml, where an unrelated job failing or being cancelled
   # here can no longer make the artifact unreachable. The jobs live in
-  # .github/workflows/coverage.yml, shared with that workflow: four test shards per
+  # .github/workflows/coverage.yml, shared with that workflow: three test shards per
   # architecture and a report job that combines them (#5711).
   coverage:
     name: Coverage (${{ matrix.name }})

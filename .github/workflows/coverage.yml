@@ -13,7 +13,6 @@ name: Coverage
 #
 #   jq-cli         `jq_cli_tests` without the tests in scripts/deep-recursion-tests.sh
 #   jq-cli-heavy   exactly those tests
-#   jq-nesting     `jq_library_eval_nesting_depth_tests` (one 224 s test)
 #   rest           the lib, the bins and every other test target
 #
 # scripts/coverage-shards.py defines what each runs; scripts/test_coverage_shards.py fails when
@@ -21,7 +20,7 @@ name: Coverage
 # Doctests run in no shard: stable `cargo llvm-cov` does not instrument them.
 #
 # Costs, accepted on #5711: two jobs per pull request became ten (four shards and a report job
-# per architecture), and thin mode has no merge-base recompute, so a pull request whose
+# per architecture; eight since #5844 folded `jq-nesting` into `rest`), and thin mode has no merge-base recompute, so a pull request whose
 # ancestors have no published baseline gets a comment without deltas.
 on:
   workflow_call:
@@ -46,7 +45,7 @@ jobs:
     strategy:
       fail-fast: false              # a failed shard must still fail the run by name, not cancel its siblings
       matrix:
-        shard: [jq-cli, jq-cli-heavy, jq-nesting, rest]
+        shard: [jq-cli, jq-cli-heavy, rest]
     permissions:
       contents: read
     env:
