@@ -95747,7 +95747,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
             // reads the month with `%O` from the alternative names, which C holds as the full ones
             // alone, so `%OB` takes `March` but not `Mar` and `%Ob` and `%Oh` take neither.
             let mut spec = fmt_iter.next();
-            let mut alternative_month = false;
+            let mut alternative_names = false;
             if let Some(modifier @ ('E' | 'O')) = spec {
                 spec = fmt_iter.next();
                 match spec {
@@ -95757,7 +95757,8 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     Some('b' | 'h') if modifier == 'O' => {
                         return Err("unrecognized month name".to_string());
                     }
-                    _ => alternative_month = modifier == 'O',
+                    Some('B') => alternative_names = modifier == 'O',
+                    _ => {}
                 }
             }
             match spec {
@@ -95929,7 +95930,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                             Some(n) => (n.month_full[i].as_str(), n.month_abbr[i].as_str()),
                             None => (MONTH_FULL[i], MONTH_ABBR[i]),
                         };
-                        if alternative_month {
+                        if alternative_names {
                             strptime_name_len(&input_iter, full, "").map(|len| (i, len))
                         } else {
                             strptime_name_len(&input_iter, full, abbr).map(|len| (i, len))
