@@ -13964,7 +13964,11 @@ mod tests {
                                 );
                             }
                             None => {
-                                assert_eq!(batch.end, next + 1, "only a lone document has no index")
+                                assert_eq!(
+                                    batch.end,
+                                    next + 1,
+                                    "only a lone document has no index"
+                                );
                             }
                         }
                     }
