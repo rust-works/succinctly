@@ -385,6 +385,7 @@ below its alias, expands the alias to the key's text (`c: key`) where yq prints 
 unresolvable `*k`.
 An alias used *as* a key (`*a : 2` in block context, `{*a: 1}` in flow, [#5469](https://github.com/rust-works/succinctly/issues/5469)) is kept on every route, and on a write it is held to the same three rules with the key's text as its value.
 One that fails them prints that text: `del(.b)` on `b: &a xy` / `c: {*a : 1}` prints `c: {xy: 1}` where yq prints an unresolvable `*a`, and so does a write whose output leaves the anchor out (`.c | .zz = 1`).
+That text keeps the anchor's quoting, so a key whose anchor is `"true"`, `'1'` or `!!str 12` prints as `"true": 1`, `'1': 1` or `"12": 1` and reads back as a string, not as the bool or integer key a bare `true: 1` is ([#5813](https://github.com/rust-works/succinctly/issues/5813)).
 A navigation that streams the node without its anchor (`.c`, `.[]`) prints `*a` as yq does, as it already does for a value alias, and that output names no anchor.
 `.b = "q"` prints the key as `xy` as well: yq keeps `*a`, which reads back as the key `q`, but succinctly's key is the text it read and a write to the anchor does not reach it.
 An alias to a sequence or mapping used as a key is printed as the key's text too, which is `''` here.

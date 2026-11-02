@@ -980,6 +980,15 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         ""
     }
 
+    /// [`Self::style`] of the node this alias (`*name`) refers to, or `""` when this node is no
+    /// alias or its target cannot be found (#5813).
+    ///
+    /// An alias has no quoting of its own (its text is `*name`), so a key written as one reads
+    /// its quoting from the anchor's node: that is where `"true"` says the key is a string.
+    fn alias_target_style(&self) -> &'static str {
+        ""
+    }
+
     /// Whether this cursor's document is JSON-sourced and should canonicalize
     /// number literals rather than preserve their source spelling (#978,
     /// #1398).
