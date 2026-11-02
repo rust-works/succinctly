@@ -537,39 +537,45 @@ echo '"aaa"' | succinctly yq 'sub("a"; "X"; "g")'
 
 ### Date/Time Extensions
 
-Beyond jq's standard date functions (`now` stays ungated; `gmtime`, `localtime`,
-`mktime`, `strftime`, `strptime`, `todate`, `fromdate`, `todateiso8601`, and
-`fromdateiso8601` all need `--jq-extensions` -- see
-[Gated jq Builtins](#gated-jq-builtins---jq-extensions) for the full list), yq
-adds:
+Beyond jq's standard date functions (`gmtime`, `localtime`, `mktime`, `strftime`,
+`strptime`, `todate`, `fromdate`, `todateiso8601`, and `fromdateiso8601` all need
+`--jq-extensions` -- see [Gated jq Builtins](#gated-jq-builtins---jq-extensions) for
+the full list), yq has its own datetime operators (#5863). They work on a timestamp's
+text, read with Go's `time.Parse` under the current layout -- RFC 3339
+(`2006-01-02T15:04:05Z07:00`), with `2006-01-02` tried when that fails -- and written
+back with Go's `time.Format`:
 
-| Function        | Description                   | Example                             |
-|-----------------|-------------------------------|-------------------------------------|
-| `from_unix`     | Unix epoch to ISO 8601 string | `1705766400 \| from_unix`           |
-| `to_unix`       | ISO 8601 string to Unix epoch | `"2024-01-20T16:00:00Z" \| to_unix` |
-| `tz(zone)`      | Convert timestamp to timezone | `now \| tz("America/New_York")`     |
+| Operator                 | Description                                                          | Example                                   |
+|--------------------------|----------------------------------------------------------------------|-------------------------------------------|
+| `+` / `-` a duration     | Add or subtract a Go duration (`3h10m`, `1.5h`, `-24h`)              | `.time += "3h10m"`                        |
+| `format_datetime(f)`     | Write with Go layout `f`, read back as YAML (`"2006"` is a number)   | `.time \| format_datetime("Jan 2, 2006")` |
+| `tz(zone)`               | Move to a zone: `UTC`, `Local`, or an IANA name                      | `.time \| tz("America/New_York")`         |
+| `with_dtf(layout; expr)` | Use Go layout `layout` for every datetime operator inside `expr`     | `with_dtf("2006-01-02"; .d + "24h")`      |
+| `now`                    | The current time, RFC 3339 in the local zone                         | `.updated = now`                          |
+| `from_unix`              | Unix epoch to RFC 3339 in the local zone                             | `1705766400 \| from_unix`                 |
+| `to_unix`                | A timestamp read under the layout, to whole Unix seconds             | `.time \| to_unix`                        |
 
 ```bash
-# Convert Unix timestamp to datetime
-echo '1705766400' | succinctly yq 'from_unix'
-# Output: "2024-01-20T16:00:00Z"
+printf 'time: 2026-01-01T00:00:00Z\n' | succinctly yq '.time += "3h10m"'
+# time: 2026-01-01T03:10:00Z
 
-# Convert datetime to Unix timestamp
-echo '"2024-01-20T16:00:00Z"' | succinctly yq 'to_unix'
-# Output: 1705766400
+printf 'time: 2026-01-01T00:00:00Z\n' | succinctly yq '.time | format_datetime("Monday, 02-Jan-06 at 3:04PM MST")'
+# Thursday, 01-Jan-26 at 12:00AM UTC
 
-# Convert to specific timezone
-echo '1705314600' | succinctly yq 'tz("America/New_York")'
-# Output: "2024-01-15T05:30:00-05:00"
+printf 'time: 2026-01-01T00:00:00Z\n' | succinctly yq '.time | tz("Australia/Sydney")'
+# 2026-01-01T11:00:00+11:00
 
-echo '1705314600' | succinctly yq 'tz("Asia/Tokyo")'
-# Output: "2024-01-15T19:30:00+09:00"
+printf 'd: 2026-01-01\n' | succinctly yq 'with_dtf("2006-01-02"; .d += "48h")'
+# d: 2026-01-03
+
+TZ=UTC succinctly yq -n '0 | from_unix'
+# 1970-01-01T00:00:00Z
 ```
 
-**Supported timezone formats:**
-- IANA names: `America/New_York`, `Europe/London`, `Asia/Tokyo`
-- Abbreviations: `EST`, `PST`, `JST`, `CET`, `UTC`, `GMT`
-- Numeric offsets: `+05:30`, `-0800`, `+09`
+The local zone is `TZ` or the system zone. A string counts as a timestamp when it reads as
+RFC 3339 or `2006-01-02`, quoted or not, where yq goes by the `!!timestamp` tag; see
+[docs/compliance/yq/limitations.md](../compliance/yq/limitations.md) for that and the
+other differences.
 
 ### Format Encoders
 
