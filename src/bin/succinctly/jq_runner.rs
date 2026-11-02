@@ -4845,6 +4845,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // #5498: a plain `--stream` walk (no `-n`, no `-s`) reads its events through the same queue, from
     // the stream reader, so it holds neither the document nor its event list; the driver loop pops
     // them as `input` does. `-n` has no input of its own, so it reads only if the program does.
+    // So this is "reads through the queue", not "calls `input`": `stream_mode` and the reader's
+    // seeding in `get_inputs` check `stream_walk_by_reader` themselves, so a caller of either cannot
+    // send a plain walk down the eager expansion by mistake (`stream_walk_by_reader_agrees_with_get_inputs_5498`).
     let uses_input_builtins = jq::walk::uses_input_builtins(&expr) || stream_walk_by_reader(&args);
 
     // Configure output
@@ -5933,7 +5936,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         // reads the input with: the message is the parser's own, with no
                         // location. A fault the program's own `input` reads is an error of the
                         // program, with its marker, and never reaches this loop.
-                        jq::InputPop::ParseError(error) if args.stream => {
+                        jq::InputPop::ParseError(error) if stream_walk_by_reader(&args) => {
                             sink.report_parse_error(&error.message);
                             break;
                         }
@@ -6658,8 +6661,8 @@ fn get_inputs(
         );
         // #5498: the program reads its inputs through `input`/`inputs` (under `-n`) or the driver
         // loop pops them (a plain walk), and the reader hands them out as they are asked for, so a
-        // stream of events is never held.
-        if track_eof && !args.slurp {
+        // stream of events is never held. `--stream-errors` without `-n` keeps its eager read.
+        if track_eof && !args.slurp && (args.null_input || stream_walk_by_reader(args)) {
             LAZY_STREAM_INPUTS.with(|slot| {
                 *slot.borrow_mut() = Some(LazyStreamInputs {
                     files: raw_bytes.iter().map(|(file, _)| *file).collect(),
@@ -7370,7 +7373,9 @@ fn stream_walk_by_reader(args: &JqCommand) -> bool {
 fn stream_mode(args: &JqCommand, uses_input_builtins: bool, faulted: bool) -> StreamMode {
     let json_documents = args.input_dsv.is_none() && !args.raw_input && !args.seq;
     // `--stream-errors` reads the events itself (#5474), so there is nothing left to expand.
-    if !args.stream || args.stream_errors || !json_documents {
+    // A plain walk (#5498) is read by the stream reader through the input queue, whichever way
+    // `uses_input_builtins` was set for it: nothing is left to expand.
+    if !args.stream || args.stream_errors || !json_documents || stream_walk_by_reader(args) {
         StreamMode::Off
     } else if args.slurp || uses_input_builtins {
         StreamMode::Eager
@@ -14344,17 +14349,44 @@ mod tests {
             assert!(lazy.is_none(), "{argv:?}");
             assert!(!inputs.is_empty(), "{argv:?}");
         }
+        // A plain `--stream` walk without `-n` is read by the stream reader too (#5498): the driver
+        // loop pops its events, so nothing is queued up front, and the reader takes exactly the
+        // runs `stream_walk_by_reader` names.
+        for (argv, by_reader) in [
+            (vec!["jq", "--stream", "inputs", &clean], true),
+            (vec!["jq", "--stream", "-c", "inputs", &clean], true),
+            (vec!["jq", "--stream", "-s", "inputs", &clean], false),
+            (vec!["jq", "--stream", "--seq", "inputs", &clean], false),
+            (vec!["jq", "--stream", "-R", "inputs", &clean], false),
+            (
+                vec!["jq", "--stream", "--input-dsv", ",", "inputs", &clean],
+                false,
+            ),
+            (vec!["jq", "--stream-errors", "inputs", &clean], false),
+            (vec!["jq", "inputs", &clean], false),
+        ] {
+            let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+            assert_eq!(stream_walk_by_reader(&cmd), by_reader, "{argv:?}");
+            let (inputs, _, _, _, lazy) = read(&argv);
+            let stream = LAZY_STREAM_INPUTS.with(|slot| slot.borrow_mut().take());
+            assert_eq!(
+                stream.is_some(),
+                by_reader,
+                "{argv:?}: the reader serves a plain walk, and only that"
+            );
+            if by_reader {
+                assert!(inputs.is_empty() && lazy.is_none(), "{argv:?}");
+                // The mode every caller of `stream_mode` sees, wherever it got the flag from.
+                assert!(
+                    [false, true]
+                        .into_iter()
+                        .all(|reads| stream_mode(&cmd, reads, false) == StreamMode::Off),
+                    "{argv:?}"
+                );
+            }
+        }
         // `--stream` and `--stream-errors` are read as the program asks too, by jq's streaming
         // parser rather than from spans (#5498): nothing is queued up front.
-        // A plain `--stream` walk without `-n` is read by the reader too (#5498): the driver loop
-        // pops its events.
-        {
-            let argv = ["jq", "--stream", "inputs", &clean];
-            let (inputs, _, _, _, lazy) = read(&argv);
-            assert!(inputs.is_empty() && lazy.is_none(), "{argv:?}");
-            let stream = LAZY_STREAM_INPUTS.with(|slot| slot.borrow_mut().take());
-            assert!(stream.is_some(), "{argv:?} is read by the stream reader");
-        }
         for flag in ["--stream", "--stream-errors"] {
             let argv = ["jq", "-n", flag, "inputs", &clean];
             let (inputs, _, _, _, lazy) = read(&argv);

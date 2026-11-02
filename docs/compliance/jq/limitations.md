@@ -13688,9 +13688,11 @@ Since #5498, `--stream` without `-s` and `--seq` does not have the three diverge
 It reads with the same port of jq's streaming parser that `--stream-errors` uses, and hands each event to the program when it asks for it, so memory holds the input's bytes and the parser's state, not the events.
 Each event carries the line jq had read when it yielded it, a repeated key is emitted every time, a document of any depth is read, and a parse error is raised by the read that reaches it, with jq's own text and position (`Expected separator between values at line 2, column 7`), as `input` raises it.
 A plain walk prints a fault as jq's main loop does, `jq: parse error: <message>` with no `(at …)` marker, after the events before it, at exit 5.
-`tests/jq_cli/i5498.rs`, `tests/jq_cli/i5498_plain_walk.rs` and the `--stream` rows of `tests/jq_cli/i5618.rs` pin it, and 6,040 stream-by-program runs over malformed and well-formed streams, one or two files, matched `/usr/bin/jq` 1.7.1 on stdout, stderr and exit status, as did 1,980 rows of a plain walk (22 streams, 15 programs, 3 flag sets, a file and stdin).
+`tests/jq_cli/i5498.rs`, `tests/jq_cli/i5498_plain_walk.rs` and the `--stream` rows of `tests/jq_cli/i5618.rs` pin it, and 6,040 stream-by-program runs over malformed and well-formed streams, one or two files, matched `/usr/bin/jq` 1.7.1 on stdout, stderr and exit status, as did a 1,980-row differential run of a plain walk (22 streams, 15 programs, 3 flag sets, a file and stdin), of which 1,264 rows are pinned by `tests/jq_cli/i5498_plain_walk.rs`.
 A 70 MB document walked with `select(length==2)|empty` peaks at 72 MB (the old walk: 664 MB; jq: 2 MB, which reads 4 KB at a time where the reader here takes the file whole).
 The one other `--stream` route, `-s`, still builds the events from the parsed document and keeps every difference described here.
+One difference is not about the route: a file that does not open and is named before one that does makes jq's `--stream` stop after the first event of the later file (`jq -c --stream . missing.json a.json` prints `[[0],1]` and the open error, exit 2), where succinctly prints every event.
+Both `-n` with `inputs` and a non-stream run agree with jq there, so the quirk is in jq's streaming parser's state after the failed open, not in what the program reads.
 
 `--stream-errors` is accepted (#5474).
 It implies `--stream` and reports a parse error as an input of the form `[message, path]`, as jq does, and goes on reading with the next line.

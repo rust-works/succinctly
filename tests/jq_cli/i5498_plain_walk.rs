@@ -64,7 +64,7 @@ fn a_plain_stream_walk_over_stdin_answers_as_jq_5498() -> Result<()> {
         assert_eq!(got_code, code.parse::<i32>()?, "status of {context}");
         count += 1;
     }
-    assert!(count > 600, "the table was read: {count} rows");
+    assert_eq!(count, 634, "every row of the table was replayed");
     Ok(())
 }
 
@@ -96,7 +96,7 @@ fn a_plain_stream_walk_over_a_file_answers_as_jq_5498() -> Result<()> {
         assert_eq!(got_code, code.parse::<i32>()?, "status of {context}");
         count += 1;
     }
-    assert!(count > 600, "the table was read: {count} rows");
+    assert_eq!(count, 630, "every row of the table was replayed");
     Ok(())
 }
 
