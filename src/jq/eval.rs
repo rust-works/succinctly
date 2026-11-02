@@ -24041,7 +24041,7 @@ fn shell_quote_str<S: EvalSemantics>(s: &str) -> String {
 /// other character is written as it is. `hello` stays `hello`, `a b` is `a' b'`, `it's` is `it\'s`
 /// and the empty string is nothing, as yq v4.53.3 writes them. jq quotes the whole string.
 fn yq_shell_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+    let mut out = string_with_capacity(s.len());
     let mut quoted = false;
     for c in s.chars() {
         if c == '\'' {
@@ -128679,47 +128679,33 @@ mod tests {
     /// applied under both modes.
     #[test]
     fn test_format_sh_yq_mode_only_accepts_strings() {
-        yq_query!(br"[1, 2, 3]", "@sh",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "array ([1,2,3]) can not be escaped for shell");
-            }
-        );
+        // yq refuses every non-string, naming its tag in the `@uri` wording (#5836), and does not
+        // inspect a container's elements.
+        for (input, tag) in [
+            (&br"[1, 2, 3]"[..], "!!seq"),
+            (&br#"[[1, 2], "x", null]"#[..], "!!seq"),
+            (&br"5"[..], "!!int"),
+            (&br"1.5"[..], "!!float"),
+            (&br"true"[..], "!!bool"),
+            (&br"null"[..], "!!null"),
+        ] {
+            yq_query!(input, "@sh",
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, format!("cannot encode {tag} as URI, can only operate on strings. Please first pipe through another encoding operator to convert the value to a string"));
+                }
+            );
+        }
 
-        // Nested/mixed-content arrays error the same way -- yq's own rule
-        // doesn't inspect elements, unlike jq's per-element quoting.
-        yq_query!(br#"[[1, 2], "x", null]"#, "@sh",
-            QueryResult::Error(e) => {
-                assert!(e.message.starts_with("array ("), "{}", e.message);
-                assert!(e.message.ends_with("can not be escaped for shell"), "{}", e.message);
-            }
-        );
-
-        // Every scalar type errors too -- not just containers.
-        yq_query!(br"5", "@sh",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "number (5) can not be escaped for shell");
-            }
-        );
-        yq_query!(br"1.5", "@sh",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "number (1.5) can not be escaped for shell");
-            }
-        );
-        yq_query!(br"true", "@sh",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "boolean (true) can not be escaped for shell");
-            }
-        );
-        yq_query!(br"null", "@sh",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "null (null) can not be escaped for shell");
-            }
-        );
-
-        // A string is still the one accepted type.
+        // A string is the one accepted type, quoted from the first character that needs it
+        // (#5837).
         yq_query!(br#""hello""#, "@sh",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "'hello'");
+                assert_eq!(s, "hello");
+            }
+        );
+        yq_query!(br#""it's a b""#, "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "it\\'s' a b'");
             }
         );
     }
