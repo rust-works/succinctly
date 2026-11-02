@@ -10,8 +10,11 @@ name: Scheduled
 #   * `bench` -- `cargo bench --bench rank_select`. It uploads artifacts nobody
 #     compares against a baseline; the deterministic regression signal is
 #     ci.yml's `perf-guard` job.
+#   * `ci-times` -- flags a CI job whose time has jumped well past its recent level
+#     (#5867): the `no-std` legs ran at 2.5-3x for nine days (#5845) with every check
+#     green.
 #
-# Neither is a required status check (the ruleset requires only Test x86_64 /
+# None is a required status check (the ruleset requires only Test x86_64 /
 # ARM64 / macOS ARM64, Clippy, Format, Do Not Merge, Documentation and Skill
 # manifest casing), so moving them off the PR path cannot hang a merge.
 #
@@ -153,3 +156,26 @@ jobs:
         with:
           name: benchmark-results-${{ matrix.platform.arch }}-${{ matrix.variant.name }}
           path: bench-${{ matrix.variant.name }}.txt
+
+  # #5867: a CI job can get several times slower and stay green. Compares the median time of each job in
+  # the newest `merge_group` runs of ci.yml with its median over the two weeks before and, if one is
+  # both 1.5x and two minutes slower, opens (or adds a comment to) the one open `ci-slowdown` issue.
+  # Reads the Actions API only; never required, never blocks the queue. scripts/ci_leg_times.py has
+  # the thresholds and why they are wide.
+  ci-times:
+    name: CI job times
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Unit-test the report
+        run: python3 scripts/test_ci_leg_times.py -v
+
+      - name: Flag a job that got much slower
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_leg_times.py report --issue
