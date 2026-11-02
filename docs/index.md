@@ -24,7 +24,7 @@ graph TD
 | JSON structural index      | [JsonIndex](parsing/json-index.md)                    | [src/json/](../src/json/)             | [parsing/json.md](parsing/json.md)                                 |
 | YAML structural index      | [YamlIndex](parsing/yaml-index.md)                    | [src/yaml/](../src/yaml/)             | [parsing/yaml.md](parsing/yaml.md)                                 |
 | DSV/CSV structural index   | [DsvIndex](parsing/dsv-index.md)                      | [src/dsv/](../src/dsv/)               | [parsing/dsv.md](parsing/dsv.md)                                   |
-| Query language             | [jq Evaluator](reference/jq-evaluator.md)             | [src/jq/](../src/jq/)                 | [CLAUDE.md](../CLAUDE.md#jq-format-functions)                      |
+| Query language             | [jq Evaluator](reference/jq-evaluator.md)             | [src/jq/](../src/jq/)                 | [jq Language Reference](reference/jq-language.md#format-strings)                      |
 | SIMD acceleration          | [SIMD Strategy](optimizations/simd-strategy.md)       | per-module `simd/` dirs               | [optimizations/simd.md](optimizations/simd.md)                     |
 | Line/column lookup         | [Line Index](optimizations/line-index.md)             | [src/text/lines.rs](../src/text/lines.rs) | [adrs/adr-0012.md](adrs/adr-0012.md)                           |
 

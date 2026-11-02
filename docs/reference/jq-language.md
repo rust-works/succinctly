@@ -145,6 +145,47 @@ below and [ADR-0019](../adrs/adr-0019.md).
       slot is run through the format first, jq's own `gen_format` rule; a
       literal with no interpolation is returned unchanged (#3316)
 
+| Format       | Syntax              | Description                                       | Example Output      |
+|--------------|---------------------|---------------------------------------------------|---------------------|
+| **@csv**     | `@csv`              | Comma-separated values (fixed delimiter)          | `"a","b","c"`       |
+| **@tsv**     | `@tsv`              | Tab-separated values (fixed delimiter)            | `a\tb\tc`           |
+| **@dsv**     | `@dsv(delimiter)`   | Generic DSV with custom delimiter                 | `"a"\|"b"\|"c"`     |
+| **@json**    | `@json`             | JSON format                                       | `{"a":1}`           |
+| **@text**    | `@text`             | Convert to string (same as tostring)              | `42`                |
+| **@uri**     | `@uri`              | URI percent encoding                              | `hello%20world`     |
+| **@urid**    | `@urid`             | URI percent decoding                              | `hello world`       |
+| **@base64**  | `@base64`           | Base64 encoding                                   | `aGVsbG8=`          |
+| **@base64d** | `@base64d`          | Base64 decoding                                   | `hello`             |
+| **@html**    | `@html`             | HTML entity escaping                              | `&lt;script&gt;`    |
+| **@sh**      | `@sh`               | Shell quoting                                     | `'hello world'`     |
+| **@yaml**    | `@yaml`             | YAML block-style encoding (yq)                    | `a: 1\nb: 2\n`      |
+| **@props**   | `@props`            | Java properties format (yq)                       | `key = value`       |
+
+**@uri/@base64/@html on arrays/objects (jq mode only):** a container is JSON-encoded
+first, then formatted, matching real jq (`[1,2] | @uri` => `"%5B1%2C2%5D"`) — `succinctly
+yq` still rejects a container outright for all three, matching real yq's own
+`cannot encode !!seq as URI/base64...` error (#1096); `@html` itself needs `--jq-extensions` there, since yq's
+lexer has no such format (#5444).
+
+**Format-prefixed string interpolation (jq mode only):** `@fmt "lit\(E)lit"` runs each
+`\(E)` slot through the format before splicing it in — jq's own `gen_format` desugar,
+`@base64 "v=\(1)"` => `"v=MQ=="` — while the literal text passes through unchanged. A
+literal with no interpolation never runs the format at all (`@base64 "abc"` => `"abc"`).
+yq's lexer rejects a format followed by a string outright, and `succinctly yq` matches
+that unchanged (#3316).
+
+**@dsv(delimiter) specifics:**
+- Custom delimiters: Any single or multi-character string
+- Always-quoted strings: every string field is double-quoted (matching jq's `@csv`), regardless of content; non-strings are bare and null is empty
+- CSV-compatible: `@dsv(",")` produces identical output to `@csv`
+- Escape handling: Inner `"` is doubled (`""`)
+
+```bash
+echo '["a","b","c"]' | jq -r '@dsv("|")'        # Output: "a"|"b"|"c"
+echo '["a","b|c","d"]' | jq -r '@dsv("|")'      # Output: "a"|"b|c"|"d"
+echo '["a","b","c"]' | jq -r '@dsv(";")'        # Output: "a";"b";"c"
+```
+
 ### Variables & Control Flow
 - [x] `as $var | expr` - Variable binding
 - [x] Object/array destructuring patterns
@@ -229,6 +270,22 @@ below and [ADR-0019](../adrs/adr-0019.md).
   suffixes (`*+`, `*?`, `*n`, `*d`, `*c`, e.g. `*=+d`) after `*`/`*=` that
   control merge semantics — see [yq-language.md](yq-language.md#yq-specific-operators)
   for the full flag table.
+
+```bash
+echo '{"a": 1}' | succinctly jq '.a = 42'           # {"a": 42}
+echo '{"x": 5}' | succinctly jq '.x |= . * 2'       # {"x": 10}
+echo '{"n": 10}' | succinctly jq '.n += 5'          # {"n": 15}
+echo '{"a": null}' | succinctly jq '.a //= "default"'  # {"a": "default"}
+echo '{"a": 1, "b": 2}' | succinctly jq 'del(.a)'   # {"b": 2}
+echo '[1, 2, 3]' | succinctly jq '.[] |= . * 2'     # [2, 4, 6]
+```
+
+`*`/`*=` on two objects recursively merges them (matching values are merged if both are objects, otherwise the right side wins) — this works in both `jq` and `yq` mode, since real jq does the same. On two arrays, plain `*`/`*=` replaces the left side wholesale with the right (yq mode only; `succinctly jq` still errors on array `*`, matching real jq, which has no array-merge concept):
+
+```bash
+echo '{"a": {"x": 1}, "b": {"x": 2, "y": 3}}' | succinctly jq '.a *= .b'  # {"a":{"x":2,"y":3},...}
+printf 'a: [1, 2]\nb: [3, 4]\n' | succinctly yq '.a *= .b'               # a: [3, 4]
+```
 
 ### User Functions
 - [x] `def name: body;`
@@ -362,6 +419,78 @@ These are succinctly-specific extensions not available in standard jq or yq:
 - [x] `at_position(line; col)` - Jump to node at line/column (1-indexed)
 
 These enable IDE integration and programmatic navigation to specific document positions.
+
+**Use cases:** IDE integration (jump to the node under the cursor), error investigation (navigate to a byte offset from an error message), and tools that work with document positions.
+
+```bash
+# Jump to node at byte offset 10 (inside "Alice" string)
+echo '{"name": "Alice", "age": 30}' | succinctly jq 'at_offset(10)'
+# Output: "Alice"
+
+# Jump to node at line 1, column 1 (the root object)
+echo '{"name": "Alice"}' | succinctly jq 'at_position(1; 1)'
+# Output: {"name": "Alice"}
+
+# Navigate from offset position - get array at offset 10, then access element
+echo '{"users": [{"name": "Alice"}, {"name": "Bob"}]}' | succinctly jq 'at_offset(10) | .[1].name'
+# Output: "Bob"
+
+# Works with multiline JSON - line 2, column 3 is the "name" key
+echo '{
+  "name": "Alice",
+  "age": 30
+}' | succinctly jq 'at_position(2; 3)'
+# Output: "name"
+
+# Works with YAML via yq
+succinctly yq 'at_offset(6)' config.yaml
+
+# Combine with other jq operations
+echo '{"data": {"nested": {"value": 42}}}' | succinctly jq 'at_offset(9) | .nested.value'
+# Output: 42
+```
+
+- `at_offset(n)` uses a 0-indexed byte offset (same as `jq-locate --offset`).
+- `at_position(line; col)` uses a 1-indexed line and column (same as `jq-locate --line --column`).
+- Both return an error if the offset or position is out of bounds or does not correspond to a valid node.
+- Use `at_offset(n)?` or `at_position(l; c)?` for the optional form (empty on an invalid position).
+
+#### `leaf_paths`
+
+`leaf_paths` is **not a real jq builtin** — it errors with `leaf_paths/0 is
+not defined` in real jq (confirmed against jq 1.7.1 and 1.8.2). It's a
+succinctly extension modeled on the community recipe
+`def leaf_paths: paths(scalars);`, but intentionally broader: it returns
+paths to every **leaf** (childless) node in the tree, not just paths whose
+`type` is scalar.
+
+```bash
+echo '{"a": {"b": 1, "c": null}, "d": [], "e": [2, 3]}' | succinctly jq -c 'leaf_paths'
+# ["a","b"]
+# ["a","c"]
+# ["d"]
+# ["e",0]
+# ["e",1]
+```
+
+**Diverges from `paths(scalars)` on two cases:**
+- `null` counts as a leaf here; `paths(scalars)` excludes it (an accidental
+  side effect of `select()` treating a `null` yield as falsy, not a
+  deliberate design choice in jq).
+- Empty `{}`/`[]` count as leaves here; `paths(scalars)` excludes them too,
+  since their `type` is `"object"`/`"array"`, not scalar — even though they
+  have no children to recurse into either.
+
+This divergence is intentional: `leaf_paths` uses a tree-structural
+definition of "leaf" (no children), which the community recipe's
+type-based `scalars` filter doesn't fully capture. See
+`collect_leaf_paths` in `src/jq/eval.rs` and issue #771 for the full rationale.
+
+**In `succinctly yq`**, `leaf_paths` (along with `paths`, `getpath`, `limit`,
+`gsub`/`scan`/`splits`, and the rest of the jq-only surface real yq's lexer
+rejects) is gated behind `--jq-extensions` and off by default since #1512 —
+`succinctly jq` above is unaffected either way. See
+[yq-language.md](yq-language.md#gated-jq-builtins---jq-extensions) for the full list.
 
 ---
 
