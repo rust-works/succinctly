@@ -169,6 +169,14 @@ class PlanTests(unittest.TestCase):
         self.assertIsNone(p["ledger-only"])
         self.assertIsNotNone(p["fmt"])
 
+    def test_a_generated_doc_block_runs_the_bench_runner_bin_tests(self):
+        # A hand edit to a block the compare tests hold to docs/compare/ fails before the push.
+        self.assertIsNone(self.plan(["docs/benchmarks/jq.md"])["bench-runner-bin"])
+        self.assertIsNone(self.plan(["docs/compare/jq-linux-x86_64.json"])["bench-runner-bin"])
+        self.assertIsNone(self.plan(["src/bin/succinctly/compare/docs.rs"])["bench-runner-bin"])
+        self.assertIsNotNone(self.plan(["docs/benchmarks/yq.md"])["bench-runner-bin"])
+        self.assertIsNotNone(self.plan(["src/jq/eval.rs"])["bench-runner-bin"])
+
     def test_full_adds_the_lints_and_arm_only_where_it_applies(self):
         self.assertIsNone(self.plan(["src/lib.rs"], "full")["clippy"])
         self.assertIsNotNone(self.plan(["src/lib.rs"], "full", "x86_64")["clippy-arm-broadword"])
