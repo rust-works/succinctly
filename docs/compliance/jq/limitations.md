@@ -10308,8 +10308,16 @@ What differs from jq 1.7.1:
   A locale layout that prints the zone itself (glibc's `en_GB` `%c` ends in `%Z`) takes the same zone labels.
 - **`%E*` and `%O*` follow the plain specifier.**
   Under a locale whose C library has alternative era or digit forms (`ja_JP` on glibc) the plain form is printed.
-- **An empty result is not an error.**
-  jq raises `strftime/1: unknown system failure` for `%p` under `de_DE`, where the library prints nothing (macOS and glibc alike); this prints an empty string.
+- **An empty result, or one past jq's buffer, is an error.**
+  jq hands the library a buffer of `strlen(fmt) + 100` bytes and raises `strftime/1: unknown system failure` (`strflocaltime/1:` for the local-zone one) when `strftime` returns 0.
+  So does this: an empty format, `%p` under `de_DE` (the library prints nothing there, macOS and glibc alike) and a result of `strlen(fmt) + 100` bytes or more (five `%c`) are that error, and `strftime("...")?` is empty.
+- **`_`, `-` and `0` are padding flags on the numeric specifiers.**
+  They apply to `%d %e %H %I %j %k %l %m %M %S %U %V %W` and to `%z`, which the library prints as a signed `hhmm` number (`+0530` is `+ 530` with `_` and `+530` with `-`).
+  Every other specifier ignores them, including `%y %Y %C %g %G`, where a glibc `jq` pads and strips as well.
+  `%E` and `%O` modifiers pass through for every specifier, and a flag may stand before or after one (`%-Ed` and `%E_d`); a second modifier or flag is a character that names nothing, and a flag or modifier that ends the format is printed as itself.
+  `%+` is `%a %b %e %H:%M:%S %Z %Y` and `%v` is `%e-%b-%Y`, as the pinned libc has them.
+  A NUL in the format ends it, as it ends a C string (`"a\u0000b"` formats as `a`), and the buffer limit is measured on the part before it.
+  A character after `%` that names nothing is printed bare, with the flag before it dropped: `%Q` is `Q`, `%5Y` is `5Y` and `%^a` is `^a`, where a glibc `jq` honours `^`, `#` and a width and prints `%Q` as written.
 - **`strptime` reads the locale's names and layouts.**
   `%a %A %b %B %h %p` take the names `strftime` prints in the process locale: a day's or month's full name, else its abbreviation, ASCII-case-insensitively and every other character exactly (`märz` matches `März`, `MÄRZ` does not).
   `%c %x %X %r` stand for the locale's layouts (`nl_langinfo_l`'s `D_T_FMT`, `D_FMT`, `T_FMT` and `T_FMT_AMPM`), C's `%a %b %e %H:%M:%S %Y`, `%m/%d/%y`, `%H:%M:%S` and `%I:%M:%S %p` without one, and are read as if the format spelled them out.

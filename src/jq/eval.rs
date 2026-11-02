@@ -95529,6 +95529,10 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             };
 
+            // jq hands the libc a C string, so a NUL ends the format (`"a\u0000b"` formats as
+            // `a`) and `strlen(fmt)` below stops there too (#5754).
+            let fmt = fmt.split('\0').next().unwrap_or_default().to_string();
+
             // Only these specifiers read the zone's labels; `E`/`O` modifiers
             // precede one of them, so the letters alone decide. A locale's own
             // `%c`/`%x`/`%X`/`%r` layout may also print the zone (#5754).
@@ -95561,6 +95565,15 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Err(_) if optional => return QueryResult::None,
                 Err(e) => return QueryResult::Error(e), // patchcov: coverage tolerate-line reason="unreachable for strftime's C-int-clamped fields and bounded zone offset; shared checked date helpers retain overflow guards for other callers (#3083)"
             };
+            // jq hands the libc a buffer of `strlen(fmt) + 100` bytes and fails when `strftime`
+            // returns 0: an empty result, or one that does not fit with its terminator (#5754).
+            if result.is_empty() || result.len() >= fmt.len() + 100 {
+                return if optional {
+                    QueryResult::None // patchcov: coverage tolerate-line reason="`optional` is never true through either caller of this function, same as the arms above (#3068); a trailing ? is caught by the enclosing try"
+                } else {
+                    QueryResult::Error(EvalError::strftime_system_failure(name))
+                };
+            }
             QueryResult::Owned(OwnedValue::String(result.into()))
         },
     )
@@ -95675,7 +95688,54 @@ fn format_strftime(
 
     while let Some(c) = chars.next() {
         if c == '%' {
-            let spec = chars.next();
+            let mut spec = chars.next();
+            // The prefix of a conversion is `[flag] [E|O] [flag]` (#5754, #3055), at most one flag
+            // in all, and the libc's reading of it is:
+            // - A `_`, `-` or `0` is a padding flag for the specifier after it: `_` pads with
+            //   blanks, `-` does not pad, `0` pads with zeros.
+            // - `E` and `O` are the POSIX "alternative representation" modifiers. The pinned C
+            //   library has no alternatives, so a modified specifier is its plain form (`%EY`,
+            //   `%Oy`, `%Ea`, `%En` are `%Y`, `%y`, `%a`, `%n`), whatever the letter.
+            // - A flag or modifier that ends the format is printed as itself (`%E` is `E`, `%-`
+            //   is `-`, `%-E` is `E`), and so is a character that names nothing, without the `%`
+            //   and without the flag before it. A second modifier, or a second flag, is one such
+            //   character (`%EE_d` is `E_d`, `%-E-y` is `-y`).
+            let flag_char = |c: Option<char>| match c {
+                Some(f @ ('_' | '-' | '0')) => Some(f),
+                _ => None,
+            };
+            let mut flag = None;
+            if let Some(f) = flag_char(spec) {
+                match chars.next() {
+                    Some(next) => {
+                        flag = Some(f);
+                        spec = Some(next);
+                    }
+                    None => {
+                        result.push(f);
+                        continue;
+                    }
+                }
+            }
+            if let Some(modifier @ ('E' | 'O')) = spec {
+                spec = chars.next();
+                if spec.is_none() {
+                    result.push(modifier);
+                    continue;
+                }
+                if let (None, Some(f)) = (flag, flag_char(spec)) {
+                    match chars.next() {
+                        Some(next) => {
+                            flag = Some(f);
+                            spec = Some(next);
+                        }
+                        None => {
+                            result.push(f);
+                            continue;
+                        }
+                    }
+                }
+            }
             if let (
                 true,
                 Some(letter @ ('a' | 'A' | 'b' | 'B' | 'h' | 'p' | 'c' | 'x' | 'X' | 'r')),
@@ -95691,18 +95751,18 @@ fn format_strftime(
                 Some('%') => result.push('%'),
                 Some('Y') => result.push_str(&format!("{year:04}")),
                 Some('y') => result.push_str(&format!("{:02}", year % 100)),
-                Some('m') => result.push_str(&format!("{month:02}")),
-                Some('d') => result.push_str(&format!("{day:02}")),
-                Some('e') => result.push_str(&format!("{day:2}")),
-                Some('H') => result.push_str(&format!("{hour:02}")),
-                Some('I') => result.push_str(&format!("{hour12:02}")),
+                Some('m') => result.push_str(&padded(month, 2, '0', flag)),
+                Some('d') => result.push_str(&padded(day, 2, '0', flag)),
+                Some('e') => result.push_str(&padded(day, 2, ' ', flag)),
+                Some('H') => result.push_str(&padded(hour, 2, '0', flag)),
+                Some('I') => result.push_str(&padded(hour12, 2, '0', flag)),
                 // Blank- (not zero-) padded hours. Confirmed live against
                 // the pinned oracle (#3055): `strftime("%k")`/`("%l")` on a
                 // single-digit hour are `" 1"`/`" 1"`, not `"01"`/`"01"`.
-                Some('k') => result.push_str(&format!("{hour:2}")),
-                Some('l') => result.push_str(&format!("{hour12:2}")),
-                Some('M') => result.push_str(&format!("{minute:02}")),
-                Some('S') => result.push_str(&format!("{second:02}")),
+                Some('k') => result.push_str(&padded(hour, 2, ' ', flag)),
+                Some('l') => result.push_str(&padded(hour12, 2, ' ', flag)),
+                Some('M') => result.push_str(&padded(minute, 2, '0', flag)),
+                Some('S') => result.push_str(&padded(second, 2, '0', flag)),
                 Some('p') => result.push_str(if hour < 12 { "AM" } else { "PM" }),
                 // Confirmed live against the pinned oracle (macOS libc's
                 // `strftime`, #3055): `%P` prints the bare letter `P`
@@ -95710,47 +95770,6 @@ fn format_strftime(
                 // rule) -- macOS doesn't implement `%P` and falls back to
                 // printing the specifier letter unprefixed.
                 Some('P') => result.push('P'),
-                // POSIX's `%E`/`%O` "alternative representation" modifiers:
-                // the pinned oracle's C library has no locale-specific
-                // alternatives and treats every modified specifier as a
-                // pure pass-through to its plain form (confirmed live for
-                // every letter below, e.g. `%EY`/`%Oy`/`%Ez` all match
-                // `%Y`/`%y`/`%z` exactly, #3055). Two different fallbacks
-                // when nothing recognized follows, both confirmed live: at
-                // true end-of-format it's the bare modifier letter (the
-                // case this issue's own repro pins); followed by anything
-                // else unrecognized (a literal character, `%` starting a
-                // new specifier) it produces nothing at all, and that
-                // following character/specifier is processed normally on
-                // the *next* loop iteration -- `%E-`/`%O-` are the empty
-                // string, not `E-`/`O-`. The allow-list below is a second,
-                // hand-maintained copy of "every letter this match
-                // recognizes" (review, #3055) -- a future specifier added
-                // above needs a matching decision made here too, or its
-                // own `%E<x>`/`%O<x>` silently falls to the unrecognized
-                // fallback instead of whatever pass-through the oracle
-                // might actually implement.
-                Some(letter @ ('E' | 'O')) => match chars.peek().copied() {
-                    Some(next) if "YymdeHIMSuUVWwcCxXz".contains(next) => {
-                        chars.next();
-                        let plain = format_strftime(
-                            &format!("%{next}"),
-                            year,
-                            month,
-                            day,
-                            hour,
-                            minute,
-                            second,
-                            weekday,
-                            yearday,
-                            zone_offset,
-                            zone_name,
-                        )?; // patchcov: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: the call's own argument lines (immediately above) show 3 hits under the #3055 test's three E/O pass-through rows, but this closing-token line is never itself credited -- verified via the raw lcov DA: records"
-                        result.push_str(&plain);
-                    }
-                    Some(_) => {}
-                    None => result.push(letter),
-                },
                 // `%c`/`%r` are fixed compositions of the fields above
                 // (C's `"%a %b %e %H:%M:%S %Y"` / `"%I:%M:%S %p"`); `%x`/`%X`
                 // are merged into `%D`/`%T` below, which the oracle confirms
@@ -95765,9 +95784,19 @@ fn format_strftime(
                     "{hour12:02}:{minute:02}:{second:02} {}",
                     if hour < 12 { "AM" } else { "PM" }
                 )),
-                Some('j') => result.push_str(&format!(
-                    "{:03}",
-                    (yearday as i32).wrapping_add(1) // C `tm_yday + 1`
+                // The pinned libc's `%+` is `date`'s layout, `%a %b %e %H:%M:%S %Z %Y`, and
+                // `%v` is `%e-%b-%Y` (#5754).
+                Some('+') => result.push_str(&format!(
+                    "{} {} {day:2} {hour:02}:{minute:02}:{second:02} {zone_name} {year:04}",
+                    weekday_abbr(weekday),
+                    month_abbr(month),
+                )),
+                Some('v') => result.push_str(&format!("{day:2}-{}-{year:04}", month_abbr(month))),
+                Some('j') => result.push_str(&padded(
+                    i64::from((yearday as i32).wrapping_add(1)), // C `tm_yday + 1`
+                    3,
+                    '0',
+                    flag,
                 )),
                 Some('w') => result.push_str(&format!("{weekday}")),
                 Some('u') => {
@@ -95798,7 +95827,11 @@ fn format_strftime(
                 Some('z') => {
                     let sign = if zone_offset < 0 { '-' } else { '+' };
                     let minutes = zone_offset.unsigned_abs() / 60;
-                    result.push_str(&format!("{sign}{:02}{:02}", minutes / 60, minutes % 60));
+                    // The libc prints the offset as a signed number, `hhmm`, so a flag pads or
+                    // strips the digits after the sign (`+0530` is `+ 530` and `+530`).
+                    let hhmm = (minutes / 60 * 100 + minutes % 60) as i64;
+                    result.push(sign);
+                    result.push_str(&padded(hhmm, 4, '0', flag));
                 }
                 Some('Z') => result.push_str(zone_name),
                 // The fields are in `zone`, so the epoch is theirs minus its
@@ -95818,7 +95851,7 @@ fn format_strftime(
                         .wrapping_add(7)
                         .wrapping_sub(weekday as i32)
                         / 7;
-                    result.push_str(&format!("{week:02}"));
+                    result.push_str(&padded(i64::from(week), 2, '0', flag));
                 }
                 Some('W') => {
                     let weekday_mon = if weekday == 0 {
@@ -95827,11 +95860,11 @@ fn format_strftime(
                         (weekday as i32).wrapping_sub(1)
                     };
                     let week = (yearday as i32).wrapping_add(7).wrapping_sub(weekday_mon) / 7;
-                    result.push_str(&format!("{week:02}"));
+                    result.push_str(&padded(i64::from(week), 2, '0', flag));
                 }
                 Some('V') => {
                     let (_, week) = iso_week_date(year, yearday, weekday)?;
-                    result.push_str(&format!("{week:02}"));
+                    result.push_str(&padded(week, 2, '0', flag));
                 }
                 Some('G') => {
                     let (iso_year, _) = iso_week_date(year, yearday, weekday)?;
@@ -95841,10 +95874,10 @@ fn format_strftime(
                     let (iso_year, _) = iso_week_date(year, yearday, weekday)?;
                     result.push_str(&format!("{:02}", (iso_year % 100).abs()));
                 }
-                Some(other) => {
-                    result.push('%');
-                    result.push(other);
-                }
+                // A character that follows `%` and names nothing is printed bare, without the
+                // `%` and without any flag before it (`%Q` is `Q`, `%5Y` is `5Y`, `%^a` is `^a`),
+                // as the pinned libc prints it (#5754).
+                Some(other) => result.push(other),
                 None => result.push('%'),
             }
         } else {
@@ -95853,6 +95886,17 @@ fn format_strftime(
     }
 
     Ok(result)
+}
+
+/// `n` in at least `width` columns, as the libc pads a numeric field: with `default` unless the
+/// field's `flag` says otherwise (`_` blanks, `0` zeros, `-` no padding).
+fn padded(n: i64, width: usize, default: char, flag: Option<char>) -> String {
+    debug_assert!(matches!(default, '0' | ' '));
+    match flag.unwrap_or(if default == '0' { '0' } else { '_' }) {
+        '-' => n.to_string(),
+        '_' => format!("{n:width$}"),
+        _ => format!("{n:0width$}"),
+    }
 }
 
 /// ISO week calculation used by the pinned macOS `strftime` implementation.
