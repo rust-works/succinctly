@@ -391,7 +391,11 @@ An alias to a sequence or mapping used as a key is printed as the key's text too
 `keys` writes each key as its node ([#5469](https://github.com/rust-works/succinctly/issues/5469)): `- &k !!str key`, `- !!merge <<`, `- *a`, on the streaming route and on the DOM routes `-P`, `--arg` and `--sort-keys` take.
 So does a `keys` result built into a construction of reads (`[.c | keys]`, `{x: (.c | keys)}`, `[keys]`, `.c | keys + [.b]`).
 A mapping with a `~` key, which `keys` lists as `"~"` where yq lists `null` ([#2802](https://github.com/rust-works/succinctly/issues/2802)), leaves the whole construction bare, and so does a `keys` result taken through `-` (`[(.c | keys) - ["q"]]`).
-One that a later stage takes further (`[.c | keys] | .[0]`) or that is written back (`. |= keys`) still prints each key bare, and `keys | map(.)` writes a `<<` key without its `!!merge` ([#5833](https://github.com/rust-works/succinctly/issues/5833), yq's `!!merge` on every plain `<<`).
+One that a later stage takes further (`[.c | keys] | .[0]`) or that is written back (`. |= keys`) still prints each key bare.
+A plain `<<` anywhere, value as well as key, is the `!!merge` tag yq writes (`a: !!merge <<`) and reports (`tag`, `type`), and a computed `"<<"` is quoted ([#5833](https://github.com/rust-works/succinctly/issues/5833)).
+Writing the equal string over a plain `<<` (`.a = "<<"` on `a: <<`) keeps `!!merge <<` where yq writes `"<<"`, since a write of an equal value keeps the node's tag, as it does an explicit one (`!foo x`) in both tools; the value read back is the same.
+Clearing the tag of a `<<` (`.a tag = ""`) writes `!!merge <<` where yq writes a bare `<<`, since an untagged `<<` here is a computed string and is quoted; both read back as the merge scalar.
+An explicit `!!merge <<` is not told apart from a plain `<<`, so `.a tag = "!!str"` on it writes `"<<"` where yq writes `!!str <<`; both read back as the string `<<`.
 On the streaming route and under `--sort-keys` a tagged key that decodes to a line break (`? !!str a` / `` / `  b`) is double-quoted (`- !!str "a\nb"`) where yq writes a literal block (`- !!str |-`), and under `-P` an anchored empty key is `- &k ""` where yq writes `- &k`; both read back as the same key.
 A `<<` merge
 expands the merged mapping's keys where yq keeps `<<: *m`. The expansion does not re-declare the

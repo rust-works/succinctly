@@ -6437,7 +6437,22 @@ fn apply_tag(tag: &str, value: &mut OwnedValue, node: &mut CommentTree) {
     // A tag written in the source keeps go-yaml's tagged style when the tag is replaced, so the
     // new one is written even where it is the scalar's own (`a: !!str 1` with `!!int` is
     // `a: !!int 1`); an empty text clears it, and the scalar reads as what its text says again.
-    let source_tagged = current.tag().is_some();
+    // A plain `<<` carries the `!!merge` tag YAML resolves it to (#5833), which yq replaces as it
+    // would no tag at all (`a: <<` with `!!str` is `a: "<<"`).
+    let implicit_merge = current.tag() == Some("!!merge")
+        && current.style.is_empty()
+        && matches!(&*value, OwnedValue::String(s) if s.as_ref() == "<<");
+    let source_tagged = current.tag().is_some() && !implicit_merge;
+    // Cleared, or set to the `!!merge` it resolves to, a plain `<<` is the merge scalar again, which
+    // is written behind its tag: yq writes `!!merge <<` and `<<`, which read back alike, and an
+    // untagged `<<` here is a computed string, written quoted.
+    if (tag.is_empty() || tag == "!!merge")
+        && matches!(current.style, "" | "tagged")
+        && matches!(&*value, OwnedValue::String(s) if s.as_ref() == "<<")
+    {
+        *node.meta_mut() = current.with_tag(Some("!!merge".to_string()));
+        return;
+    }
     let explicit_text = |tag: &str| {
         if tag.starts_with('!') {
             tag.to_string()

@@ -2525,8 +2525,30 @@ fn yq_type_tag<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> String
         {
             return tag;
         }
+        if let Some(tag) = plain_merge_tag(&c, value) {
+            return tag.to_string();
+        }
     }
     document_value_type_tag(value).to_string()
+}
+
+/// `!!merge` for a plain `<<` scalar, the tag YAML resolves it to wherever it sits, value or key,
+/// which yq reports (`tag`, `type`) and writes (`a: !!merge <<`, #5833); `None` for anything
+/// else. A quoted `"<<"` and a JSON string are `!!str`, and so is a plain scalar that only starts
+/// with `<<` (`run: << EOF`). The source text is checked first, so a node not spelled `<<` costs
+/// two byte compares and no decode.
+pub(crate) fn plain_merge_tag<C: DocumentCursor, V: DocumentValue>(
+    cursor: &C,
+    value: &V,
+) -> Option<&'static str> {
+    let pos = cursor.text_position()?;
+    if cursor.doc_text().get(pos..pos + 2) != Some(b"<<".as_slice()) {
+        return None;
+    }
+    // Text that starts with `<<` and decodes to exactly `<<` is the plain scalar `<<`: a quoted one
+    // starts with its quote, and a block mapping whose first key is `<<` starts at the same byte
+    // but is no string. An alias resolves to its anchor's node, which is not this one.
+    (!cursor.is_alias() && value.as_str().as_deref() == Some("<<")).then_some("!!merge")
 }
 
 /// Which YAML anchor/alias syntax a node carried in the source document
@@ -3516,9 +3538,12 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             if child_under_alias {
                 None
             } else {
-                cursor
-                    .and_then(DocumentCursor::explicit_tag_of_non_alias)
-                    .map(str::to_string)
+                cursor.and_then(|c| {
+                    c.explicit_tag_of_non_alias()
+                        // Only a plain node can be one; the style is already in hand.
+                        .or_else(|| own_style.is_empty().then(|| plain_merge_tag(c, value))?)
+                        .map(str::to_string)
+                })
             },
             None,
         ),
