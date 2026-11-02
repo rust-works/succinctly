@@ -294,6 +294,34 @@ _GLOBAL_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--ex
 _NO_PUBLISH = ("--delete", "-d", "--dry-run", "-n")
 _HEREDOC = re.compile(r"<<-?\s*(?:'([^']*)'|\"([^\"]*)\"|(\\?[A-Za-z_][A-Za-z0-9_]*))")
 
+_VARIABLE = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})")
+_ASSIGNING = ("export", "declare", "typeset", "readonly", "local")
+
+
+class Unresolved(str):
+    """A directory the hook could not work out: it names a shell variable it was not told.
+
+    The text is the word as written. `hook()` refuses the push rather than guess (#5850): a guess
+    runs the gates in the wrong repository and lets the push through ungated.
+    """
+
+
+def _expand(word, env):
+    """`word` with `$NAME` and `${NAME}` replaced from `env` (and `$HOME`); `None` if one is left.
+
+    A command substitution (`$(...)`), a name `env` does not hold and a variable the shell
+    would set itself all leave a `$` behind, and the caller treats that as unresolved.
+    """
+
+    def value(match):
+        name = match.group(1) or match.group(2)
+        found = env.get(name, os.environ.get("HOME") if name == "HOME" else None)
+        return match.group(0) if found is None else found
+
+    expanded = _VARIABLE.sub(value, word)
+    return None if "$" in expanded or "`" in expanded else expanded
+
+
 
 def _split(command):
     """The simple commands of a shell line, each a list of words; `None` if a quote is left open.
@@ -375,38 +403,63 @@ def _split(command):
     return commands
 
 
-def pushes(command, cwd):
+def pushes(command, cwd, env=None):
     """`[(directory, skip)]` for each `git push` in `command` that publishes refs.
 
     `skip` is the `PRE_PUSH_SKIP` value the push was prefixed with (`PRE_PUSH_SKIP=ledger-only git
     push`), the only way an agent can pass one to the hook. A push that only deletes, or only
     simulates, publishes nothing and is not returned. `bash -c '...'` is looked into; other
     substitutions are not.
+
+    `directory` follows `cd` and `git -C`, with `$NAME` read from the assignments earlier in the
+    same command (`WT=/x; git -C "$WT" push`, `export WT=/x`, `env WT=/x git -C "$WT" push`). A
+    directory that still names a variable is returned as [`Unresolved`] (#5850): the hook sees
+    only the command text, never the shell's variables.
     """
+    env = {} if env is None else env
     commands = _split(command)
     if commands is None:  # an open quote: read it the cautious way, as if the quotes were not there
         commands = [c.split() for c in re.split(r"&&|\|\||[;|&\n()]", command) if c.strip()]
     found = []
+
+    def resolve(base, word):
+        """`word` joined onto `base`: [`Unresolved`] if either names a variable, unless `word` is absolute."""
+        expanded = _expand(os.path.expanduser(word), env)
+        if expanded is not None and os.path.isabs(expanded):
+            return os.path.normpath(expanded)
+        if expanded is None or isinstance(base, Unresolved):
+            return Unresolved(word if expanded is None else base)
+        return os.path.normpath(os.path.join(base, expanded))
+
     for tokens in commands:
         skip = ""
-        while tokens and (_ENV_ASSIGN.match(tokens[0]) or tokens[0] in _WRAPPERS):
-            if tokens[0].startswith("PRE_PUSH_SKIP="):
-                skip = tokens[0].split("=", 1)[1]
+        while tokens and (
+            _ENV_ASSIGN.match(tokens[0]) or tokens[0] in _WRAPPERS or tokens[0] in _ASSIGNING
+        ):
+            if _ENV_ASSIGN.match(tokens[0]):
+                name, _, assigned = tokens[0].partition("=")
+                if name == "PRE_PUSH_SKIP":
+                    skip = assigned
+                expanded = _expand(assigned, env)
+                if expanded is None:
+                    env.pop(name, None)  # set to something the hook cannot read
+                else:
+                    env[name] = expanded
             tokens = tokens[1:]
         if tokens[:1] and os.path.basename(tokens[0]) in _SHELLS and "-c" in tokens[1:]:
             at = tokens.index("-c")
             if at + 1 < len(tokens):
-                found.extend(pushes(tokens[at + 1], cwd))
+                found.extend(pushes(tokens[at + 1], cwd, dict(env)))
             continue
         if tokens[:1] == ["cd"] and len(tokens) > 1:
-            cwd = os.path.normpath(os.path.join(cwd, os.path.expanduser(tokens[1])))
+            cwd = resolve(cwd, tokens[1])
             continue
         if tokens[:1] != ["git"]:
             continue
         directory, i = cwd, 1
         while i < len(tokens) and tokens[i].startswith("-"):
             if tokens[i] == "-C" and i + 1 < len(tokens):
-                directory = os.path.normpath(os.path.join(directory, os.path.expanduser(tokens[i + 1])))
+                directory = resolve(directory, tokens[i + 1])
             i += 2 if tokens[i] in _GLOBAL_WITH_ARG else 1
         if i >= len(tokens) or tokens[i] != "push":
             continue
@@ -430,10 +483,22 @@ def hook(stdin):
     command = (call.get("tool_input") or {}).get("command") or ""
     cwd = call.get("cwd") or os.getcwd()
     for directory, skip in dict.fromkeys(pushes(command, cwd)):
+        if isinstance(directory, Unresolved):
+            sys.stderr.write(
+                f"git push blocked: the hook cannot tell which repository this push is in, because its "
+                f"directory ({directory!s}) names a shell variable it was not given. The gates cannot run "
+                "on a guess. Write the path out, or assign the variable earlier in the same command "
+                '(`WT=/path/to/worktree; git -C "$WT" push`); a variable set in an earlier call is gone.\n'
+            )
+            return 2
         try:
             root = git("rev-parse", "--show-toplevel", cwd=directory).strip()
-        except (RuntimeError, OSError):
-            continue
+        except (RuntimeError, OSError) as e:
+            sys.stderr.write(
+                f"git push blocked: the hook cannot find the repository this push is in ({directory}): {e}. "
+                "The gates cannot run, so the push is not let through unchecked.\n"
+            )
+            return 2
         script = os.path.join(root, "scripts", "pre_push.py")
         if not os.path.exists(script):
             continue
