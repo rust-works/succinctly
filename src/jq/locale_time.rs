@@ -31,7 +31,7 @@ mod imp {
     use alloc::vec::Vec;
     use std::sync::OnceLock;
 
-    use super::{TimeNames, TmFields};
+    use super::{Layouts, TimeNames, TmFields};
 
     /// A `locale_t` that is never freed, so it can be shared by every thread.
     struct Handle(libc::locale_t);
@@ -88,19 +88,9 @@ mod imp {
         LOCALE.get_or_init(resolve).is_some()
     }
 
-    static NAMES: OnceLock<Option<TimeNames>> = OnceLock::new();
-
-    /// The locale's day, month and am/pm names, rendered by `strftime_l` -- the same source
-    /// `strftime` prints from, so a name `strftime` writes is one `strptime` reads. `None`
-    /// under C.
-    pub(super) fn names() -> Option<&'static TimeNames> {
-        NAMES.get_or_init(build_names).as_ref()
-    }
-
-    fn build_names() -> Option<TimeNames> {
-        LOCALE.get_or_init(resolve).as_ref()?;
-        // Only the field a specifier reads matters; the rest is a fixed ordinary date.
-        let at = |month: i64, weekday: i64, hour: i64| TmFields {
+    /// Only the field a specifier reads matters; the rest is a fixed ordinary date.
+    fn ordinary_time(month: i64, weekday: i64, hour: i64) -> TmFields<'static> {
+        TmFields {
             year: 2015,
             month,
             day: 1,
@@ -111,7 +101,65 @@ mod imp {
             yearday: 0,
             zone_offset: 0,
             zone_name: "UTC",
+        }
+    }
+
+    static NAMES: OnceLock<Option<TimeNames>> = OnceLock::new();
+    static LAYOUTS: OnceLock<Option<Layouts>> = OnceLock::new();
+
+    // Apple's `libc` crate declares `nl_langinfo` (the global locale) but not the `_l` form.
+    #[cfg(target_vendor = "apple")]
+    extern "C" {
+        fn nl_langinfo_l(item: libc::nl_item, locale: libc::locale_t) -> *mut libc::c_char;
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    use libc::nl_langinfo_l;
+
+    /// The layouts `%c`, `%x`, `%X` and `%r` stand for in the locale, as `strptime` reads them.
+    /// `None` under C.
+    pub(super) fn layouts() -> Option<&'static Layouts> {
+        LAYOUTS.get_or_init(build_layouts).as_ref()
+    }
+
+    fn build_layouts() -> Option<Layouts> {
+        let handle = LOCALE.get_or_init(resolve).as_ref()?;
+        let item = |which: libc::nl_item| -> Option<String> {
+            // SAFETY: `handle.0` is a live `locale_t` and `which` a valid `nl_item`; the
+            // result is a NUL-terminated string owned by the locale, copied before returning.
+            let text = unsafe { nl_langinfo_l(which, handle.0) };
+            if text.is_null() {
+                return None;
+            }
+            // SAFETY: non-null and NUL-terminated, per above.
+            let text = unsafe { core::ffi::CStr::from_ptr(text) };
+            Some(text.to_string_lossy().into_owned())
         };
+        // On macOS `nl_langinfo` falls back to the C layout for a locale whose own is empty
+        // (`de_DE`'s `T_FMT_AMPM`), while `strftime` prints the empty one and `strptime`
+        // reads it: a `%r` that renders nothing is an empty layout.
+        let t_ampm = if render("%r", &ordinary_time(1, 0, 0))?.is_empty() {
+            String::new()
+        } else {
+            item(libc::T_FMT_AMPM)?
+        };
+        Some(Layouts {
+            date_time: item(libc::D_T_FMT)?,
+            date: item(libc::D_FMT)?,
+            time: item(libc::T_FMT)?,
+            time_ampm: t_ampm,
+        })
+    }
+
+    /// The locale's day, month and am/pm names, rendered by `strftime_l` -- the same source
+    /// `strftime` prints from, so a name `strftime` writes is one `strptime` reads. `None`
+    /// under C.
+    pub(super) fn names() -> Option<&'static TimeNames> {
+        NAMES.get_or_init(build_names).as_ref()
+    }
+
+    fn build_names() -> Option<TimeNames> {
+        LOCALE.get_or_init(resolve).as_ref()?;
+        let at = ordinary_time;
         let weekdays = |spec: &str| -> Option<[String; 7]> {
             let mut out: [String; 7] = Default::default();
             for (i, slot) in out.iter_mut().enumerate() {
@@ -192,7 +240,7 @@ mod imp {
 mod imp {
     use alloc::string::String;
 
-    use super::{TimeNames, TmFields};
+    use super::{Layouts, TimeNames, TmFields};
 
     pub(super) fn is_active() -> bool {
         false
@@ -203,6 +251,10 @@ mod imp {
     }
 
     pub(super) fn names() -> Option<&'static TimeNames> {
+        None
+    }
+
+    pub(super) fn layouts() -> Option<&'static Layouts> {
         None
     }
 }
@@ -250,6 +302,32 @@ pub(crate) struct TimeNames {
     /// `%p` under `de_DE`, and its `strptime` then reads the empty string as the am marker.
     pub(crate) am: alloc::string::String,
     pub(crate) pm: alloc::string::String,
+}
+
+/// The layouts `strptime`'s `%c`, `%x`, `%X` and `%r` stand for, in the process locale (#5754).
+// The C-locale stub never builds one; only the `strftime_l` backend does.
+#[cfg_attr(
+    not(all(
+        feature = "locale-time",
+        any(target_vendor = "apple", target_os = "linux")
+    )),
+    allow(dead_code)
+)]
+pub(crate) struct Layouts {
+    pub(crate) date_time: alloc::string::String,
+    pub(crate) date: alloc::string::String,
+    pub(crate) time: alloc::string::String,
+    /// Empty where the locale's own is (macOS `de_DE`): `%r` then reads nothing.
+    pub(crate) time_ampm: alloc::string::String,
+}
+
+/// The locale's `%c`/`%x`/`%X`/`%r` layouts, or `None` when `strptime` should use C's.
+pub(crate) fn layouts() -> Option<&'static Layouts> {
+    if cfg!(test) {
+        None
+    } else {
+        imp::layouts()
+    }
 }
 
 /// The locale's day, month and am/pm names, or `None` when `strptime` should read the
