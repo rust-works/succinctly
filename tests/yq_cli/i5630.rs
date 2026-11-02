@@ -48,7 +48,11 @@ fn run(args: &[&str]) -> Result<(String, i32)> {
 #[test]
 fn test_arithmetic_and_alternative_fold_from_the_right_5630() -> Result<()> {
     for (program, expected) in ROWS {
-        assert_eq!(run(&["yq", "-n", program])?, ((*expected).to_string(), 0), "{program:?}");
+        assert_eq!(
+            run(&["yq", "-n", program])?,
+            ((*expected).to_string(), 0),
+            "{program:?}"
+        );
     }
     Ok(())
 }
@@ -56,8 +60,16 @@ fn test_arithmetic_and_alternative_fold_from_the_right_5630() -> Result<()> {
 /// jq mode keeps jq's grammar: `*` over `+`, left-associative `-`.
 #[test]
 fn test_jq_mode_keeps_conventional_arithmetic_5630() -> Result<()> {
-    for (program, expected) in [("2 * 3 + 4", "10\n"), ("10 - 3 - 2", "5\n"), ("100 / 10 / 5", "2\n")] {
-        assert_eq!(run(&["jq", "-n", program])?, (expected.to_string(), 0), "{program:?}");
+    for (program, expected) in [
+        ("2 * 3 + 4", "10\n"),
+        ("10 - 3 - 2", "5\n"),
+        ("100 / 10 / 5", "2\n"),
+    ] {
+        assert_eq!(
+            run(&["jq", "-n", program])?,
+            (expected.to_string(), 0),
+            "{program:?}"
+        );
     }
     Ok(())
 }
