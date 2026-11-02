@@ -11,6 +11,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -191,6 +192,69 @@ class PlanTests(unittest.TestCase):
     def test_gates_are_ordered_cheapest_first(self):
         order = [g.cost for g, _ in pre_push.plan([], "full", "x86_64", set())]
         self.assertEqual(order, sorted(order))
+
+
+class GateEnvironmentTests(unittest.TestCase):
+    """A harness `PATH` without rustup's directory must not fail every cargo gate (#5901)."""
+
+    def cargo_home(self, with_cargo=True):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        bin_dir = os.path.join(home.name, "bin")
+        os.makedirs(bin_dir)
+        if with_cargo:
+            stub = os.path.join(bin_dir, "cargo")
+            with open(stub, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(stub, 0o755)
+        return home.name
+
+    def empty_path(self):
+        empty = tempfile.TemporaryDirectory()
+        self.addCleanup(empty.cleanup)
+        return empty.name
+
+    def test_cargo_home_is_put_on_a_path_that_lacks_cargo(self):
+        home = self.cargo_home()
+        env = pre_push.gate_environment({}, {"PATH": self.empty_path(), "CARGO_HOME": home})
+        self.assertEqual(env["PATH"].split(os.pathsep)[0], os.path.join(home, "bin"))
+        self.assertIsNotNone(shutil.which("cargo", path=env["PATH"]))
+
+    def test_dot_cargo_in_home_is_the_fallback_without_cargo_home(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        os.makedirs(os.path.join(home.name, ".cargo", "bin"))
+        stub = os.path.join(home.name, ".cargo", "bin", "cargo")
+        open(stub, "w").close()
+        os.chmod(stub, 0o755)
+        env = pre_push.gate_environment({}, {"PATH": self.empty_path(), "HOME": home.name})
+        self.assertEqual(env["PATH"].split(os.pathsep)[0], os.path.join(home.name, ".cargo", "bin"))
+
+    def test_a_path_that_already_has_cargo_is_left_alone(self):
+        on_path = self.cargo_home()
+        elsewhere = self.cargo_home()
+        path = os.path.join(on_path, "bin")
+        env = pre_push.gate_environment({}, {"PATH": path, "CARGO_HOME": elsewhere})
+        self.assertEqual(env["PATH"], path)
+
+    def test_a_machine_with_no_cargo_stays_without_it_so_the_gate_fails_loudly(self):
+        home = self.cargo_home(with_cargo=False)
+        path = self.empty_path()
+        env = pre_push.gate_environment({}, {"PATH": path, "CARGO_HOME": home})
+        self.assertEqual(env["PATH"], path)
+        self.assertIsNone(shutil.which("cargo", path=env["PATH"]))
+
+    def test_the_gates_own_variables_are_kept(self):
+        env = pre_push.gate_environment({"RUSTDOCFLAGS": "-D warnings"}, {"PATH": self.empty_path()})
+        self.assertEqual(env["RUSTDOCFLAGS"], "-D warnings")
+
+    def test_the_hook_run_reaches_a_gate_that_needs_cargo(self):
+        """End to end: a gate step `cargo ...` runs under a PATH without cargo and finds it."""
+        home = self.cargo_home()
+        env = pre_push.gate_environment({}, {"PATH": "/usr/bin:/bin", "CARGO_HOME": home})
+        if shutil.which("cargo", path="/usr/bin:/bin"):
+            self.skipTest("a system cargo is on the minimal PATH")
+        self.assertEqual(subprocess.run(["bash", "-c", "cargo --version"], env=env).returncode, 0)
 
 
 class PushDetectionTests(unittest.TestCase):
