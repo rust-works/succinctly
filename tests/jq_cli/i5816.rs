@@ -1452,8 +1452,8 @@ fn a_string_builtin_over_a_string_input_answers_as_jq_5816() -> Result<()> {
 }
 
 /// #5816: the string-to-string stages (`ltrimstr`, `rtrimstr`, `tostring`, `. + "lit"`) of a string
-/// input, alone and as the head of a pipe, over the same three input modes, with path position
-/// (`path(...)`) and a non-string argument included.
+/// input, alone and as the head of a pipe, over the same three input modes, with a non-string
+/// argument included.
 const STAGE_ROWS: &[Row] = &[
     (
         "ltrimstr(\"x\")|length",
@@ -2587,167 +2587,6 @@ const STAGE_ROWS: &[Row] = &[
         ],
     ),
     (
-        "[path(ltrimstr(\"h\"))]",
-        "",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(ltrimstr(\"h\"))]",
-        "a",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(ltrimstr(\"h\"))]",
-        "hello zzz world",
-        [("", 5), ("", 5), ("", 5)],
-    ),
-    (
-        "[path(ltrimstr(\"h\"))]",
-        "héllo",
-        [("", 5), ("", 5), ("", 5)],
-    ),
-    (
-        "[path(ltrimstr(\"h\"))]",
-        "日本語",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(ltrimstr(\"h\"))]",
-        "a\nb",
-        [("[[]]\n", 0), ("[[]]\n[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(ltrimstr(\"h\"))]",
-        "q\"b\\s",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(ltrimstr(\"h\"))]",
-        "zzzabc",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(ltrimstr(\"h\"))]",
-        "abczzz",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(ltrimstr(\"h\"))]",
-        "zzz",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    ("[path(ltrimstr(\"h\"))]", "hé", [("", 5), ("", 5), ("", 5)]),
-    (
-        "[path(tostring)]",
-        "",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(tostring)]",
-        "a",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(tostring)]",
-        "hello zzz world",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(tostring)]",
-        "héllo",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(tostring)]",
-        "日本語",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(tostring)]",
-        "a\nb",
-        [("[[]]\n", 0), ("[[]]\n[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(tostring)]",
-        "q\"b\\s",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(tostring)]",
-        "zzzabc",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(tostring)]",
-        "abczzz",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(tostring)]",
-        "zzz",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "[path(tostring)]",
-        "hé",
-        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
-    ),
-    (
-        "try path(. + \"x\") catch \"c\"",
-        "",
-        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
-    ),
-    (
-        "try path(. + \"x\") catch \"c\"",
-        "a",
-        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
-    ),
-    (
-        "try path(. + \"x\") catch \"c\"",
-        "hello zzz world",
-        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
-    ),
-    (
-        "try path(. + \"x\") catch \"c\"",
-        "héllo",
-        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
-    ),
-    (
-        "try path(. + \"x\") catch \"c\"",
-        "日本語",
-        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
-    ),
-    (
-        "try path(. + \"x\") catch \"c\"",
-        "a\nb",
-        [("\"c\"\n", 0), ("\"c\"\n\"c\"\n", 0), ("\"c\"\n", 0)],
-    ),
-    (
-        "try path(. + \"x\") catch \"c\"",
-        "q\"b\\s",
-        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
-    ),
-    (
-        "try path(. + \"x\") catch \"c\"",
-        "zzzabc",
-        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
-    ),
-    (
-        "try path(. + \"x\") catch \"c\"",
-        "abczzz",
-        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
-    ),
-    (
-        "try path(. + \"x\") catch \"c\"",
-        "zzz",
-        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
-    ),
-    (
-        "try path(. + \"x\") catch \"c\"",
-        "hé",
-        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
-    ),
-    (
         "ltrimstr(\"h\")|ltrimstr(\"é\")|length",
         "",
         [("0\n", 0), ("0\n", 0), ("0\n", 0)],
@@ -3283,4 +3122,178 @@ const STAGE_ROWS: &[Row] = &[
 #[test]
 fn a_string_stage_over_a_string_input_answers_as_jq_5816() -> Result<()> {
     check(STAGE_ROWS)
+}
+
+/// #5816: a string stage in path position keeps the evaluator's route and its answer (jq refuses
+/// `path(ltrimstr("h"))`, answers `path(tostring)` with `[]`).
+const PATH_ROWS: &[Row] = &[
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "a",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "hello zzz world",
+        [("", 5), ("", 5), ("", 5)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "héllo",
+        [("", 5), ("", 5), ("", 5)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "日本語",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "a\nb",
+        [("[[]]\n", 0), ("[[]]\n[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "q\"b\\s",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "zzzabc",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "abczzz",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "zzz",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    ("[path(ltrimstr(\"h\"))]", "hé", [("", 5), ("", 5), ("", 5)]),
+    (
+        "[path(tostring)]",
+        "",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "a",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "hello zzz world",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "héllo",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "日本語",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "a\nb",
+        [("[[]]\n", 0), ("[[]]\n[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "q\"b\\s",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "zzzabc",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "abczzz",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "zzz",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "hé",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "a",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "hello zzz world",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "héllo",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "日本語",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "a\nb",
+        [("\"c\"\n", 0), ("\"c\"\n\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "q\"b\\s",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "zzzabc",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "abczzz",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "zzz",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "hé",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+];
+
+/// The unshared-containers holdout refuses a path expression that does more than navigate, with a
+/// different message (#5246).
+#[test]
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
+fn a_string_stage_in_path_position_answers_as_jq_5816() -> Result<()> {
+    check(PATH_ROWS)
 }
