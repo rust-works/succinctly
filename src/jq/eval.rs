@@ -119305,10 +119305,6 @@ mod tests {
         let resolver = parse("keys").unwrap();
         let plain = parse(". + 1").unwrap();
         assert!(may_enter_resolver_node(&resolver));
-        let rewrites: [(&str, &dyn Fn(&Tracked) -> Option<Origin>); 2] = [
-            ("rewritten", &|_| Some(Origin::Untracked)),
-            ("kept", &|_| None),
-        ];
         let mut checked = 0;
         for len in [FACT_SCAN_STAGES + 1, FACT_SCAN_STAGES + 4, 24] {
             for tracked_at in [None, Some(0), Some(len / 2), Some(len - 1)] {
@@ -119345,10 +119341,11 @@ mod tests {
                                 .any(|st| any_subexpr(st, &mut may_enter_resolver_node)),
                             "resolver: {context}"
                         );
-                        for (name, rewrite) in rewrites {
+                        for (name, changes) in [("rewritten", true), ("kept", false)] {
+                            let rewrite = |_: &Tracked| changes.then_some(Origin::Untracked);
                             assert_eq!(
-                                reentry_can_observe(&expr, rewrite),
-                                reentry_can_observe_by_walking(&expr, rewrite),
+                                reentry_can_observe(&expr, &rewrite),
+                                reentry_can_observe_by_walking(&expr, &rewrite),
                                 "{name}: {context}"
                             );
                             checked += 1;
