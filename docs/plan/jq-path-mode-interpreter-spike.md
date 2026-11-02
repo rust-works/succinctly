@@ -10,7 +10,7 @@ routing rule) are on the issue and in the ADR.
 
 ## What was built
 
-`src/jq/path_spike.rs` is an interpreter over the parsed `Expr`. It **carries** jq 1.7.1's
+`src/jq/path_spike.rs` (now `src/jq/path_mode/reference.rs`) is an interpreter over the parsed `Expr`. It **carries** jq 1.7.1's
 register (`path`, `value_at_path`, `subexp_nest`) with every output and applies `jv_identical`
 at jq's three check sites: `INDEX`/`EACH`, `getpath`'s `_jq_path_append`, and `PATH_END`. It
 infers nothing.
@@ -66,11 +66,11 @@ Errors are jq's three path messages, raised where jq raises them and catchable a
 construct the spike does not implement raises `Unsupported`, which nothing catches. Such a row
 is counted apart and is never read as a verdict.
 
-The dev entry is a hidden `succinctly dev jq-path-spike`. `succinctly jq` does not change.
+The dev entry is a hidden `succinctly dev jq-path-spike` (now `dev jq-path-mode`). `succinctly jq` does not change.
 
 ## How it was measured
 
-`scripts/jq-path-spike-3way.py` replays rows through `/usr/bin/jq` 1.7.1 (the oracle), a release
+`scripts/jq-path-mode-3way.py` replays rows through `/usr/bin/jq` 1.7.1 (the oracle), a release
 build of `main` (see the results for the commit), and a release build of the spike at the commit this PR lands. It
 compares stdout and exit code per row, as the sweeps do. The classes:
 
@@ -86,12 +86,12 @@ compares stdout and exit code per row, as the sweeps do. The classes:
 
 The rows come from two sources:
 
-1. **`scripts/jq-path-spike-rows/repros.jsonl`**: every live probe in #5223 and every repro in
+1. **`scripts/jq-path-mode-rows/repros.jsonl`**: every live probe in #5223 and every repro in
    the issues it supersedes (#4800, #5013, #5030, #5042, #5044, #5101, #5113, #5156, #5175,
    #5181, #5194, #5203, #5205, #5207 and #5213), 73 rows. Every row of every superseded issue
    matches jq. The one `LOSS-stub` is the issue's own `ltrimstr("z")` probe.
 2. **Every sweep the issue lists**, captured unchanged. Each sweep ran once with its `--bin`
-   pointed at `scripts/jq-path-spike-record.py`, a shim that logs each `(argv, stdin)` and
+   pointed at `scripts/jq-path-mode-record.py`, a shim that logs each `(argv, stdin)` and
    answers with `main`. Two grids are too large for a gate, so only part of each was taken:
    - `jq-path-register-sweep.py`'s full grid is about 10M rows; it ran with
      `--stage-only --sample 30000 --seed 5223`;
@@ -188,7 +188,7 @@ The gate in #5223:
   builtins on stderr. One oracle probe per builtin closes them.
 - **The prelude** already runs 74 definitions: `builtin.jq`'s, plus the six `_sp_upd_*`
   helpers for the update-assignment operators. The jq-defined builtins still
-  stubbed are listed in `stub_risk` (`src/jq/path_spike.rs`).
+  stubbed are listed in `stub_risk` (`src/jq/path_mode/reference.rs`).
 - **Identity on `OwnedValue` (D5)**: the spike's `SVal` is the reference Phase 1's promotion
   has to reproduce. It covers constants per site, literal versus computed numbers, and slices
   as views.

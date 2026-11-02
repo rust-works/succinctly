@@ -1,5 +1,8 @@
 # Issue #3025: lossless reindex spike
 
+**Status: Archived (implemented).** #3025 is closed; the lossless reindex bridge landed, and
+[issue-3025-results.md](issue-3025-results.md) records what was built and measured.
+
 Date: 2026-09-23. Baseline: `717833c17724a2db6281518af8cb9a3a175cbeb3`.
 
 ## Decision

@@ -1,12 +1,16 @@
 # A general lazy `map`/`select` primitive for `eval_generic.rs` (#700)
 
-**Status: design only, not implemented.** This document is the deliverable for issue
+**Status: Archived (implemented).** Every slice landed and every follow-up issue is closed
+(#724, #725, #757, #758, #789, #1576, #2206, #3856): `LazySeq` and `drain_atomic` live in
+`src/jq/eval_generic.rs`, and no ADR supersedes this note, so it stays the design record. The
+opening sections were written before any of that code existed; "Follow-up issues" at the bottom
+says what each slice became.
+
+This document is the deliverable for issue
 [#700](https://github.com/rust-works/succinctly/issues/700) — a follow-up from
 [#686](https://github.com/rust-works/succinctly/issues/686) (measurement spike) and
 [#140](https://github.com/rust-works/succinctly/issues/140)/[#678](https://github.com/rust-works/succinctly/pull/678)
-(M3.1, which shipped `GenericResult::LazyKeys`/`LazyIndexRange`). No code in this repo has
-been changed to implement it; see "Follow-up issues" at the bottom for where implementation
-is tracked.
+(M3.1, which shipped `GenericResult::LazyKeys`/`LazyIndexRange`).
 
 ## Problem
 
