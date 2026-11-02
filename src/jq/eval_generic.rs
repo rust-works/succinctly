@@ -2534,21 +2534,21 @@ fn yq_type_tag<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> String
 
 /// `!!merge` for a plain `<<` scalar, the tag YAML resolves it to wherever it sits, value or key,
 /// which yq reports (`tag`, `type`) and writes (`a: !!merge <<`, #5833); `None` for anything
-/// else. A quoted `"<<"` and a JSON string are `!!str`. The source text is checked first, so a
-/// node that is not spelled `<<` costs two byte compares and no decode.
+/// else. A quoted `"<<"` and a JSON string are `!!str`, and so is a plain scalar that only starts
+/// with `<<` (`run: << EOF`). The source text is checked first, so a node not spelled `<<` costs
+/// two byte compares and no decode.
 pub(crate) fn plain_merge_tag<C: DocumentCursor, V: DocumentValue>(
     cursor: &C,
     value: &V,
 ) -> Option<&'static str> {
     let pos = cursor.text_position()?;
-    let text = cursor.doc_text();
-    let spelled = text.get(pos..pos + 2) == Some(b"<<".as_slice())
-        && text.get(pos + 2).map_or(true, |b| {
-            matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}')
-        });
-    // A block mapping whose first key is `<<` starts at the same byte; only a scalar is the merge
-    // scalar. A cursor whose own value is an alias resolves to its anchor's, which is not this node.
-    (spelled && !cursor.is_alias() && value.as_str().is_some()).then_some("!!merge")
+    if cursor.doc_text().get(pos..pos + 2) != Some(b"<<".as_slice()) {
+        return None;
+    }
+    // Text that starts with `<<` and decodes to exactly `<<` is the plain scalar `<<`: a quoted one
+    // starts with its quote, and a block mapping whose first key is `<<` starts at the same byte
+    // but is no string. An alias resolves to its anchor's node, which is not this one.
+    (!cursor.is_alias() && value.as_str().as_deref() == Some("<<")).then_some("!!merge")
 }
 
 /// Which YAML anchor/alias syntax a node carried in the source document

@@ -110,3 +110,47 @@ fn test_a_json_merge_spelled_string_stays_a_string_5833() -> Result<()> {
     }
     Ok(())
 }
+
+/// A plain scalar that only starts with `<<` is an ordinary string, on every route (`-i` among
+/// them, which must not tag a heredoc-style value in the user's file).
+#[test]
+fn test_a_plain_scalar_starting_with_merge_spelling_is_a_string_5833() -> Result<()> {
+    let doc = "run: << EOF\nb: [<< x, y]\nc: <<\n  foo\nd: <<\n";
+    let written = "run: << EOF\nb: [<< x, y]\nc: << foo\nd: !!merge <<\nx: 1\n";
+    for (filter, args, want) in [
+        (".run | tag", &[][..], "!!str\n"),
+        (".c | tag", &[][..], "!!str\n"),
+        (".b[0] | tag", &[][..], "!!str\n"),
+        (".x = 1", &[][..], written),
+        (
+            ".x = 1",
+            &["-P"][..],
+            "run: << EOF\nb:\n  - << x\n  - y\nc: << foo\nd: !!merge <<\nx: 1\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, args)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want, 0),
+            "{filter} {args:?}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// `tag =` on a plain `<<`: `!!str` makes it a string, quoted, and `!!merge` is the tag it
+/// already resolves to, written. Clearing the tag gives `!!merge <<` where yq writes `<<`, which
+/// reads back the same (recorded in `docs/compliance/yq/limitations.md`).
+#[test]
+fn test_tag_assignment_on_a_plain_merge_scalar_5833() -> Result<()> {
+    for (filter, want) in [
+        (".a tag = \"!!str\"", "a: \"<<\"\n"),
+        (".a tag = \"!!merge\"", "a: !!merge <<\n"),
+        (".a tag = \"!x\"", "a: !x <<\n"),
+        (".a tag = \"\"", "a: !!merge <<\n"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "a: <<\n", &[])?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{filter}: {stderr:?}");
+    }
+    Ok(())
+}

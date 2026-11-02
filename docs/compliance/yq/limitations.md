@@ -394,6 +394,8 @@ A mapping with a `~` key, which `keys` lists as `"~"` where yq lists `null` ([#2
 One that a later stage takes further (`[.c | keys] | .[0]`) or that is written back (`. |= keys`) still prints each key bare.
 A plain `<<` anywhere, value as well as key, is the `!!merge` tag yq writes (`a: !!merge <<`) and reports (`tag`, `type`), and a computed `"<<"` is quoted ([#5833](https://github.com/rust-works/succinctly/issues/5833)).
 Writing the equal string over a plain `<<` (`.a = "<<"` on `a: <<`) keeps `!!merge <<` where yq writes `"<<"`, since a write of an equal value keeps the node's tag, as it does an explicit one (`!foo x`) in both tools; the value read back is the same.
+Clearing the tag of a `<<` (`.a tag = ""`) writes `!!merge <<` where yq writes a bare `<<`, since an untagged `<<` here is a computed string and is quoted; both read back as the merge scalar.
+An explicit `!!merge <<` is not told apart from a plain `<<`, so `.a tag = "!!str"` on it writes `"<<"` where yq writes `!!str <<`; both read back as the string `<<`.
 On the streaming route and under `--sort-keys` a tagged key that decodes to a line break (`? !!str a` / `` / `  b`) is double-quoted (`- !!str "a\nb"`) where yq writes a literal block (`- !!str |-`), and under `-P` an anchored empty key is `- &k ""` where yq writes `- &k`; both read back as the same key.
 A `<<` merge
 expands the merged mapping's keys where yq keeps `<<: *m`. The expansion does not re-declare the
