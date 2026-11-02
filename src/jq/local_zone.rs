@@ -236,14 +236,15 @@ mod backend_jiff {
         let mut guard = TZNAME
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let names = guard.get_or_insert_with(|| {
+        let result = f(guard.get_or_insert_with(|| {
             if std::env::var_os("TZ").is_some_and(|tz| tz.is_empty()) {
                 [None, None]
             } else {
                 tzname_in(system())
             }
-        });
-        f(names)
+        }));
+        drop(guard);
+        result
     }
 
     fn note_conversion(is_dst: bool, abbreviation: &str) {
