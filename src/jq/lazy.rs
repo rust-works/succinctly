@@ -815,19 +815,10 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                         }
                         // Defensive fallback; JSON string-token keys are
                         // always given a text range by the semi-index, so
-                        // this is not expected to be reached. The key is
-                        // already confirmed to be `StandardJson::String`
-                        // above, so this always writes a real key rather
-                        // than the `null` placeholder it used to.
-                        None => {
-                            out.write_char('"')?;
-                            if let StandardJson::String(k) = key {
-                                if let Ok(s) = k.as_str() {
-                                    write_json_body_jq(out, &s)?;
-                                }
-                            }
-                            out.write_char('"')?;
-                        }
+                        // this is not expected to be reached (#5864: it used
+                        // to write `""` for a key that would not decode;
+                        // every other site in the #1247 routing raises).
+                        None => write_key_decoded(out, &key)?,
                     }
                 }
                 // #1956: matches `eval_generic.rs`'s own
@@ -986,6 +977,22 @@ impl<W> From<&str> for JqValue<'_, W> {
     fn from(s: &str) -> Self {
         JqValue::String(s.to_string())
     }
+}
+
+/// Write `key` as a quoted JSON string by decoding it, for a key whose cursor has no text range
+/// to copy verbatim. A key that will not decode raises (`core::fmt::Error`, the only error
+/// `write_json` has) instead of rendering as `""` (#5864).
+fn write_key_decoded<W: core::fmt::Write, V>(
+    out: &mut W,
+    key: &StandardJson<'_, V>,
+) -> core::fmt::Result {
+    let StandardJson::String(k) = key else {
+        return Err(core::fmt::Error);
+    };
+    let s = k.as_str().map_err(|_| core::fmt::Error)?;
+    out.write_char('"')?;
+    write_json_body_jq(out, &s)?;
+    out.write_char('"')
 }
 
 #[cfg(test)]
@@ -1178,6 +1185,25 @@ mod tests {
                 assert_eq!(&*spelling, literal);
             }
         }
+    }
+
+    /// #5864: the no-text-range fallback of a `LazyKeysArray` key raises on a key that will not
+    /// decode (a bad escape, invalid UTF-8) rather than writing `""`, and writes a key that
+    /// decodes as the quoted, escaped JSON string. The branch itself is unreachable through a
+    /// semi-index (every string-token key has a text range), so the helper is exercised directly.
+    #[test]
+    fn key_without_text_range_raises_when_it_will_not_decode_5864() {
+        use crate::json::JsonIndex;
+        let decode = |json: &[u8]| {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let mut out = String::new();
+            write_key_decoded(&mut out, &cursor.value()).map(|()| out)
+        };
+        assert_eq!(decode(br#""a\u00e9\n""#), Ok("\"a\u{e9}\\n\"".to_string()));
+        assert_eq!(decode(br#""bad\q""#), Err(core::fmt::Error));
+        assert_eq!(decode(b"\"\xff\""), Err(core::fmt::Error));
+        assert_eq!(decode(b"123"), Err(core::fmt::Error));
     }
 
     /// #2868: compare complete results, including nested containers,
