@@ -297,10 +297,6 @@ fn test_compound_store_with_a_container_operand_keeps_its_results_5761() -> Resu
 /// A container read off the loop variable (`$r.items`) and stored is the element's own member, so
 /// `==` (which short-circuits on `jv_identical`, while `[nan] == [nan]` is `false`) sees one array
 /// in jq. Each was `false` here. Every answer was captured from jq 1.7.1.
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 #[test]
 fn test_fold_store_of_a_field_read_keeps_the_members_identity_5761() -> Result<()> {
     for filter in [
