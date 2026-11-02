@@ -71,7 +71,11 @@ fn a_stream_fault_is_raised_by_the_read_that_reaches_it_5498() -> Result<()> {
         let (out, err, code) = run_jq_full(&["--stream", "-nc", filter], Some(fault))?;
         assert_eq!(
             (out.as_str(), err.as_str(), code),
-            ("", format!("jq: error (at <stdin>:2): {message}\n").as_str(), 5),
+            (
+                "",
+                format!("jq: error (at <stdin>:2): {message}\n").as_str(),
+                5
+            ),
             "{filter}"
         );
     }
