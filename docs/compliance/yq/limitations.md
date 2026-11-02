@@ -3784,7 +3784,7 @@ Its datetime operators read that text with Go's `time.Parse` under the current l
 - The ordering comparisons read both sides under the `with_dtf` layout.
 
 The local zone is `TZ` or the system zone, as Go's `time.Local` is.
-Every row of the issue, and 80 more, are pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, under `TZ=UTC` and `TZ=Australia/Sydney`.
+Every row of the issue is pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, among 95 rows captured under `TZ=UTC` and `TZ=Australia/Sydney`; the 10 that differ are the ones listed below.
 
 **Not reproduced:**
 
