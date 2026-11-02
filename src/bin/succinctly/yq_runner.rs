@@ -14640,6 +14640,43 @@ mod tests {
         assert_eq!(emit.as_deref(), Some(refusal));
     }
 
+    /// #3278, #5876: `run_yq` arms the native-stack floor, but a thread that registered no floor
+    /// (every library embedder, and this unit test) keeps the 384-level bound exactly. A value
+    /// built past it and then written reaches the emission pipeline's depth assert, a panic with
+    /// no `Result` to thread it through, and `run_yq` reports exactly that panic as yq's own error
+    /// status instead of an uncaught exit 101. The CLI's registered floor moves where this fires
+    /// (see `yq_walks_over_a_built_value_are_bounded_by_the_floor_5876`), not whether it is caught.
+    #[test]
+    fn run_yq_reports_a_deep_built_value_without_a_floor_as_a_clean_error_3278() {
+        // A large stack with no floor registered on it: a debug build's evaluator frames for a
+        // recursive `def` run to hundreds of KiB a level, so 400 levels overflow the default
+        // 2 MiB test thread (and 64 MiB) long before the depth assert is reached. The CLI gives a
+        // debug build 2 GiB for the same reason; this is address space until a page is touched.
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024 * 1024)
+            .spawn(|| {
+                use clap::Parser;
+                let dir = tempfile::tempdir().expect("tempdir");
+                let input = dir.path().join("in.yaml");
+                std::fs::write(&input, "a: 1\n").expect("write input");
+                let deep = "def deep(m): if m == 0 then . else [deep(m - 1)] end; deep(400)";
+                let command = crate::YqCommand::parse_from([
+                    "yq",
+                    "--jq-extensions",
+                    "-o",
+                    "json",
+                    "-I0",
+                    deep,
+                    input.to_str().expect("utf-8 path"),
+                ]);
+                let code = run_yq(command).expect("a clean exit status, not an error or a panic");
+                assert_eq!(code, exit_codes::YQ_FAILURE);
+            })
+            .expect("spawn")
+            .join()
+            .expect("run_yq returns instead of unwinding");
+    }
+
     /// `{"k":{"k":...{}...}}`, `depth` levels of `"k"` nesting, terminating
     /// in `{}` -- mirrors `eval_generic.rs`'s own `linear_nest`.
     fn linear_json_nest(depth: usize) -> String {
