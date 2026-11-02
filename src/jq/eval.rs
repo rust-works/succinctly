@@ -93430,23 +93430,32 @@ mod remaining_inputs {
     /// before it, the error, and the `(source, line)` jq's marker names there.
     type QueuedError = (usize, EvalError, (u32, u32));
 
-    /// One queued document: already an owned value, or the index of a document the CLI converts
-    /// when it is read (#5661), so a program that stops early never converts the rest.
-    enum Slot {
-        Ready(OwnedValue),
-        Lazy(usize),
-    }
+    /// The CLI's conversion of the document at an index of a lazily seeded stream (#5661), and
+    /// that document's 1-based end line. Called once per document, in index order, so it may
+    /// count lines forward as it goes.
+    pub type Materialize = Box<dyn FnMut(usize) -> (u32, Result<OwnedValue, EvalError>)>;
 
-    /// The CLI's conversion of the document at an index, for [`Slot::Lazy`] slots.
-    pub type Materialize = Box<dyn Fn(usize) -> Result<OwnedValue, EvalError>>;
+    /// A stream whose documents the CLI converts when they are read (#5661): a program that
+    /// stops early neither converts the rest nor holds a queue entry for each of them.
+    struct LazyStream {
+        /// The source tag of every document.
+        source: u32,
+        /// The index of the next document to read.
+        next: usize,
+        /// How many documents there are.
+        count: usize,
+        materialize: Materialize,
+    }
 
     thread_local! {
         // `(document, source tag, 1-based end line)`. The source tag is opaque
         // here: the CLI assigns it and resolves it back to a file name itself,
         // so no string ever crosses this module's boundary (#1309).
-        static QUEUE: RefCell<VecDeque<(Slot, u32, u32)>> = const { RefCell::new(VecDeque::new()) };
-        // How a `Slot::Lazy` becomes a document (#5661); `None` when nothing is queued lazily.
-        static MATERIALIZE: RefCell<Option<Materialize>> = const { RefCell::new(None) };
+        static QUEUE: RefCell<VecDeque<(OwnedValue, u32, u32)>> =
+            const { RefCell::new(VecDeque::new()) };
+        // The documents read ahead of `QUEUE`, converted as they are read (#5661); `None` when
+        // nothing is seeded lazily or every lazy document has been read.
+        static LAZY: RefCell<Option<LazyStream>> = const { RefCell::new(None) };
         // jq reports the *last successfully read* document's line, not the
         // next one still queued -- starts at 0 (matching real jq's own
         // `input_line_number` before anything has been read yet).
@@ -93515,12 +93524,9 @@ mod remaining_inputs {
         debug_assert!(errors.windows(2).all(|w| w[0].0 <= w[1].0));
         debug_assert!(errors.iter().all(|e| e.0 <= documents.len()));
         QUEUE.with(|q| {
-            *q.borrow_mut() = documents
-                .into_iter()
-                .map(|(doc, src, line)| (Slot::Ready(doc), src, line))
-                .collect();
+            *q.borrow_mut() = documents.into();
         });
-        MATERIALIZE.with(|m| *m.borrow_mut() = None);
+        LAZY.with(|l| *l.borrow_mut() = None);
         ERRORS.with(|e| *e.borrow_mut() = errors.into());
         POPPED.with(|p| p.set(0));
         LAST_LINE.with(|l| l.set(0));
@@ -93531,23 +93537,25 @@ mod remaining_inputs {
         COUNT_PAST_END.with(|c| c.set(false));
     }
 
-    /// [`seed`] for a stream the CLI has already checked is clean (#5661): `lines` is each
-    /// document's `(source tag, 1-based end line)` in input order, and `materialize` converts the
-    /// document at an index when it is first read. No parse error is queued: the CLI takes this
-    /// route only for a stream with none.
+    /// [`seed`] for a stream the CLI has already checked is clean (#5661): `count` documents, all
+    /// from the source tagged `source`, each converted by `materialize` when it is read, which
+    /// also reports its line. Nothing is queued per document. No parse error is queued: the CLI
+    /// takes this route only for a stream with none.
     pub fn seed_lazy(
-        lines: impl IntoIterator<Item = (u32, u32)>,
+        source: u32,
+        count: usize,
         materialize: Materialize,
         exhausted: Option<(u32, u32)>,
     ) {
-        QUEUE.with(|q| {
-            *q.borrow_mut() = lines
-                .into_iter()
-                .enumerate()
-                .map(|(index, (src, line))| (Slot::Lazy(index), src, line))
-                .collect();
+        QUEUE.with(|q| q.borrow_mut().clear());
+        LAZY.with(|l| {
+            *l.borrow_mut() = (count > 0).then(|| LazyStream {
+                source,
+                next: 0,
+                count,
+                materialize,
+            });
         });
-        MATERIALIZE.with(|m| *m.borrow_mut() = Some(materialize));
         ERRORS.with(|e| e.borrow_mut().clear());
         POPPED.with(|p| p.set(0));
         LAST_LINE.with(|l| l.set(0));
@@ -93618,31 +93626,34 @@ mod remaining_inputs {
             CURRENT.with(|c| c.set(Some(at)));
             return Pop::ParseError(error);
         }
-        let popped = QUEUE.with(|q| q.borrow_mut().pop_front());
-        if let Some((slot, src, line)) = popped {
+        let lazy = LAZY.with(|l| {
+            let mut slot = l.borrow_mut();
+            let stream = slot.as_mut()?;
+            let index = stream.next;
+            stream.next += 1;
+            let (line, converted) = (stream.materialize)(index);
+            let source = stream.source;
+            // The converter holds the stream's text: drop it with the last document.
+            if stream.next == stream.count {
+                *slot = None;
+            }
+            Some((converted, source, line))
+        });
+        if let Some((converted, src, line)) = lazy {
             POPPED.with(|p| p.set(popped_so_far + 1));
             LAST_LINE.with(|l| l.set(line));
             CURRENT.with(|c| c.set(Some((src, line))));
-            return match slot {
-                Slot::Ready(doc) => Pop::Document(doc),
-                Slot::Lazy(index) => {
-                    let converted = MATERIALIZE
-                        .with(|m| m.borrow().as_ref().map(|materialize| materialize(index)));
-                    // The converter holds the stream's text: drop it with the last slot.
-                    if QUEUE.with(|q| q.borrow().is_empty()) {
-                        MATERIALIZE.with(|m| *m.borrow_mut() = None);
-                    }
-                    debug_assert!(
-                        converted.is_some(),
-                        "a lazy slot is queued with its converter"
-                    );
-                    match converted {
-                        Some(Ok(doc)) => Pop::Document(doc),
-                        Some(Err(error)) => Pop::ParseError(error),
-                        None => Pop::Exhausted,
-                    }
-                }
+            return match converted {
+                Ok(doc) => Pop::Document(doc),
+                Err(error) => Pop::ParseError(error),
             };
+        }
+        let popped = QUEUE.with(|q| q.borrow_mut().pop_front());
+        if let Some((doc, src, line)) = popped {
+            POPPED.with(|p| p.set(popped_so_far + 1));
+            LAST_LINE.with(|l| l.set(line));
+            CURRENT.with(|c| c.set(Some((src, line))));
+            return Pop::Document(doc);
         }
         // Unreachable by the seed's own invariant (every error comes before
         // or at the end of the documents), kept as the end of the stream.
@@ -93973,18 +93984,21 @@ pub fn seed_remaining_inputs_with_errors(
 /// [`seed_remaining_inputs`] for a stream the CLI has checked is clean, converting each document
 /// when it is read instead of up front (#5661).
 ///
-/// `lines` is each document's `(source tag, 1-based end line)` in input order. `materialize` turns
-/// the document at an index into its value; an error it returns reaches the reader as the parse
-/// error `input` raises. The CLI takes this route only where no document can fail to convert and
-/// the stream holds no parse error, so a program that stops early (`first(inputs)`) neither
-/// parses nor holds the documents it never reads.
+/// There are `count` documents, all from the source tagged `source`. `materialize` turns the
+/// document at an index into its 1-based end line and its value; it is called once per document,
+/// in index order, when that document is read, so it can count lines forward as it goes. An error
+/// it returns reaches the reader as the parse error `input` raises. The CLI takes this route only
+/// where no document can fail to convert and the stream holds no parse error, so a program that
+/// stops early (`first(inputs)`) neither parses nor holds the documents it never reads, and
+/// nothing is kept per document it has not read.
 #[cfg(feature = "std")]
 pub fn seed_remaining_inputs_lazily(
-    lines: impl IntoIterator<Item = (u32, u32)>,
-    materialize: Box<dyn Fn(usize) -> Result<OwnedValue, EvalError>>,
+    source: u32,
+    count: usize,
+    materialize: Box<dyn FnMut(usize) -> (u32, Result<OwnedValue, EvalError>)>,
     exhausted: Option<(u32, u32)>,
 ) {
-    remaining_inputs::seed_lazy(lines, materialize, exhausted);
+    remaining_inputs::seed_lazy(source, count, materialize, exhausted);
 }
 
 /// Counts the reads past the end of the input just seeded, as jq does (#4303).
@@ -114918,14 +114932,19 @@ mod tests {
 
         let converted = Rc::new(Cell::new(0usize));
         let counter = Rc::clone(&converted);
+        let mut expected = 0;
         seed_remaining_inputs_lazily(
-            vec![(0, 1), (0, 2), (0, 3), (0, 4)],
+            0,
+            4,
             Box::new(move |index| {
+                assert_eq!(index, expected, "documents are converted in order");
+                expected += 1;
                 counter.set(counter.get() + 1);
+                let line = index as u32 + 1;
                 if index == 2 {
-                    Err(EvalError::new("cannot convert"))
+                    (line, Err(EvalError::new("cannot convert")))
                 } else {
-                    Ok(OwnedValue::Int(index as i64 * 10))
+                    (line, Ok(OwnedValue::Int(index as i64 * 10)))
                 }
             }),
             Some((0, 4)),
