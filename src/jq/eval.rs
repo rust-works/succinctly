@@ -19383,6 +19383,12 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #5918: yq's `map(f)` over an empty mapping is that mapping, where it is an empty
+    // sequence over an empty sequence, a null or, in jq, any empty container.
+    if S::TAG == EvalTag::Yq && matches!(&value, StandardJson::Object(fields) if fields.is_empty())
+    {
+        return QueryResult::One(value);
+    }
     // map(f) is [.[] | f], and .[] over an object iterates its values, so jq
     // accepts an object here as readily as an array (#422).
     match value {

@@ -35218,6 +35218,11 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
                     return GenericResult::Error(err);
                 }
+                // #5918: yq's `map(f)` over an empty mapping is that mapping, not an empty
+                // sequence (`f` never runs, and `map(.) | tag` is `!!map`).
+                if S::TAG == EvalTag::Yq && fields.is_empty() {
+                    return GenericResult::One(value);
+                }
                 // `.[]` collapses a repeated key to its first position but
                 // last-seen value in both modes (#1398), which needs every
                 // occurrence seen before any value can be emitted --
@@ -40195,6 +40200,14 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         }
     }
     let result = match family {
+        // #5918: yq's `map(f)` over an empty mapping is that mapping, as the unpositioned sites
+        // answer (`eval.rs`'s `builtin_map` and `eval_builtin_in`'s `Builtin::Map` arm).
+        MapFamily::Map
+            if S::TAG == EvalTag::Yq
+                && matches!(container, OwnedValue::Object(fields) if fields.is_empty()) =>
+        {
+            container.clone()
+        }
         MapFamily::Map => OwnedValue::array_from(array),
         MapFamily::MapValues => match container {
             OwnedValue::Array(_) => OwnedValue::array_from(array),
