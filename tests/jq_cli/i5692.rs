@@ -78,6 +78,7 @@ fn a_path_through_a_named_argument_is_the_arguments_own_5692() -> Result<()> {
 /// A path over a value equal to the argument but not it, or reached another way, is refused with
 /// jq's own text: `(--argjson d, filter, stderr)`, every one exiting 5.
 #[test]
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn a_path_over_a_value_that_is_not_the_argument_still_refuses_5692() -> Result<()> {
     for (d, filter, expected) in [
         (
@@ -104,6 +105,42 @@ fn a_path_over_a_value_that_is_not_the_argument_still_refuses_5692() -> Result<(
             r#"{"a":1}"#,
             "$d | reduce range(2) as $i (.; del($d.a))",
             r#"jq: error (at <unknown>): Invalid path expression near attempt to access element "a" of {"a":1}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run(d, filter)?;
+        assert_eq!((stdout.as_str(), code), ("", 5), "{filter}: {stderr}");
+        assert_eq!(stderr.trim_end(), expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// The shapes `limitations.md` records as still refused where jq 1.7.1 answers (`{"a":2}`, `5`,
+/// `[]` and `[]`): an assignment whose target is the argument, `$ARGS.named.d | path($d)`, and a
+/// scalar argument. It fails when one of them starts to agree, so the page is updated with it:
+/// `(--argjson d, filter, stderr)`, every one exiting 5.
+#[test]
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
+fn the_recorded_refusals_where_jq_answers_5692() -> Result<()> {
+    for (d, filter, expected) in [
+        (
+            r#"{"a":1}"#,
+            "$d | $d.a = 2",
+            r#"jq: error (at <unknown>): Invalid path expression near attempt to access element "a" of {"a":1}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            "$d | $d |= 5",
+            r#"jq: error (at <unknown>): Invalid path expression with result {"a":1}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            "$ARGS.named.d | path($d)",
+            r#"jq: error (at <unknown>): Invalid path expression with result {"a":1}"#,
+        ),
+        (
+            "1",
+            "$d | path($d)",
+            "jq: error (at <unknown>): Invalid path expression with result 1",
         ),
     ] {
         let (stdout, stderr, code) = run(d, filter)?;

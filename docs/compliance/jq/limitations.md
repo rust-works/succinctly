@@ -13706,8 +13706,8 @@ Three shapes are still refused where jq answers:
   A scalar is always spliced as a literal (#5690).
 
 Each refusal is jq's own `Invalid path expression` error, so `try` catches it.
-`X as $d | $d | ...` with the same program answers as jq in every case.
-Pinned by `tests/jq_cli/i5692.rs`.
+`X as $d | $d | ...` with the same programs answers as jq (`. as $d | $d.a = 2` is `{"a":2}`).
+The refusals above and the answers #5692 fixed are pinned by `tests/jq_cli/i5692.rs`.
 
 ## Depends On
 
