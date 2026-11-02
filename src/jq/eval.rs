@@ -3545,7 +3545,7 @@ pub(crate) fn pipe_holds_tracked_var(stages: &PipeStages) -> bool {
         }
         #[cfg(feature = "std")]
         if let Some((storage, start)) = stages.shared_view() {
-            return storage_facts(storage).tracked_end > start;
+            return storage_facts(storage).tracked_end(storage) > start;
         }
         tail[scanned..].iter().any(stage_holds_tracked_var)
     })
@@ -3566,24 +3566,26 @@ fn stage_holds_tracked_var(stage: &Expr) -> bool {
 /// takes the facts.
 const FACT_SCAN_STAGES: usize = 8;
 
-/// What is true of the stages of one shared storage ([`PipeStages::shared_view`]), worked out in
-/// one pass over it and answered for every view of it (#5488, slice 2). A body that reads its
-/// variable late, with stages in front that are not arithmetic, is a pipe of `n` stages that
-/// each of its `n` tails is a view of; each tail asked the walk below for the marker at its end,
-/// which was `n` walks of up to `n` stages per value.
+/// What is true of the stages of one shared storage ([`PipeStages::shared_view`]), each fact worked
+/// out the first time it is asked and answered for every view of it (#5488, slice 2). A body that
+/// reads its variable late, with stages in front that are not arithmetic, is a pipe of `n` stages
+/// that each of its `n` tails is a view of; each tail asked the walk below for the marker at its
+/// end, which was `n` walks of up to `n` stages per value.
+///
+/// Each fact is the last stage that holds something, so it is looked for from the end of the
+/// storage: a body that holds the node in its last stage answers at once, and one that never does
+/// is walked once, as the scan of its first view was.
 #[cfg(feature = "std")]
 struct StorageFacts {
     /// Weak, so that the address this is keyed by cannot be taken by another storage while the
     /// entry lives: the allocation is held until the entry is dropped.
     storage: alloc::rc::Weak<Vec<Expr>>,
-    /// Every `Expr::TrackedVar` in the storage, with the index of the stage it is in, collected
-    /// when [`reentry_can_observe`] first asks for them: the two positions below answer the memo
-    /// cells, which most pipes never need more than.
-    markers: core::cell::OnceCell<Vec<(usize, Rc<Tracked>)>>,
     /// One past the last stage that holds a marker, 0 when none does.
-    tracked_end: usize,
+    tracked_end: core::cell::OnceCell<usize>,
     /// One past the last stage that holds a node that can start a resolver invocation.
-    resolver_end: usize,
+    resolver_end: core::cell::OnceCell<usize>,
+    /// Every `Expr::TrackedVar` in the storage, with the index of the stage it is in.
+    markers: core::cell::OnceCell<Vec<(usize, Rc<Tracked>)>>,
 }
 
 #[cfg(feature = "std")]
@@ -3591,35 +3593,40 @@ impl StorageFacts {
     fn of(storage: &Rc<Vec<Expr>>) -> Self {
         #[cfg(test)]
         STORAGE_FACTS_BUILT.with(|n| n.set(n.get() + 1));
-        let (mut tracked_end, mut resolver_end) = (0, 0);
-        for (index, stage) in storage.iter().enumerate() {
-            let (mut tracked, mut resolver) = (false, false);
-            any_subexpr(stage, &mut |e| {
-                tracked |= matches!(e, Expr::TrackedVar(_));
-                resolver |= may_enter_resolver_node(e);
-                false
-            });
-            if tracked {
-                tracked_end = index + 1;
-            }
-            if resolver {
-                resolver_end = index + 1;
-            }
-        }
         Self {
             storage: Rc::downgrade(storage),
+            tracked_end: core::cell::OnceCell::new(),
+            resolver_end: core::cell::OnceCell::new(),
             markers: core::cell::OnceCell::new(),
-            tracked_end,
-            resolver_end,
         }
     }
 
-    /// The markers of `storage`, which this was worked out for, from the stage they are in.
+    /// One past the last stage of `storage`, which this was made for, that holds a marker.
+    fn tracked_end(&self, storage: &Rc<Vec<Expr>>) -> usize {
+        *self.tracked_end.get_or_init(|| {
+            storage
+                .iter()
+                .rposition(|stage| any_subexpr(stage, &mut |e| matches!(e, Expr::TrackedVar(_))))
+                .map_or(0, |last| last + 1)
+        })
+    }
+
+    /// One past the last stage of `storage` that holds a node that can start a resolver invocation.
+    fn resolver_end(&self, storage: &Rc<Vec<Expr>>) -> usize {
+        *self.resolver_end.get_or_init(|| {
+            storage
+                .iter()
+                .rposition(|stage| any_subexpr(stage, &mut may_enter_resolver_node))
+                .map_or(0, |last| last + 1)
+        })
+    }
+
+    /// The markers of `storage`, from the stage they are in.
     fn markers(&self, storage: &Rc<Vec<Expr>>) -> &[(usize, Rc<Tracked>)] {
         self.markers.get_or_init(|| {
             let mut markers = Vec::new();
             // Only the stages up to the last that holds one are walked.
-            for (index, stage) in storage.iter().enumerate().take(self.tracked_end) {
+            for (index, stage) in storage.iter().enumerate().take(self.tracked_end(storage)) {
                 any_subexpr(stage, &mut |e| {
                     if let Expr::TrackedVar(marker) = e {
                         markers.push((index, Rc::clone(marker)));
@@ -3712,7 +3719,7 @@ pub(crate) fn pipe_holds_resolver_node(stages: &PipeStages) -> bool {
         }
         #[cfg(feature = "std")]
         if let Some((storage, start)) = stages.shared_view() {
-            return storage_facts(storage).resolver_end > start;
+            return storage_facts(storage).resolver_end(storage) > start;
         }
         tail[scanned..].iter().any(stage_holds_resolver_node)
     })
