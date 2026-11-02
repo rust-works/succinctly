@@ -2013,9 +2013,65 @@ enum Storage {
     Own(Vec<Expr>),
     /// The stages are `stages[start..]`.
     Shared {
-        stages: Rc<Vec<Expr>>,
+        stages: Rc<SharedStages>,
         start: u32,
     },
+}
+
+/// The stages a copied pipe tail and its views share (#5488), and what is
+/// remembered about all of them.
+///
+/// Immutable once shared: an edit goes through [`PipeStages::make_mut`], which
+/// gives the pipe a `Vec` of its own, so what [`StageMarks`] says of the stages
+/// holds for as long as the storage exists.
+struct SharedStages {
+    stages: Vec<Expr>,
+    marks: core::cell::OnceCell<StageMarks>,
+}
+
+impl SharedStages {
+    fn new(stages: Vec<Expr>) -> Self {
+        Self {
+            stages,
+            marks: core::cell::OnceCell::new(),
+        }
+    }
+}
+
+/// Which stages of a [`SharedStages`] hold the nodes `reentry_can_observe`
+/// asks for (#5488): found in one pass over the stages, then read by every view
+/// of them, so a view at `start` need not walk its own stages to learn that
+/// none of them holds one.
+struct StageMarks {
+    /// The stages that hold an `Expr::TrackedVar`, in order.
+    tracked: Box<[u32]>,
+    /// The last stage that holds a node that can start a resolver invocation.
+    resolver_last: Option<u32>,
+}
+
+/// What `reentry_can_observe` needs of the stages of one view (#5488).
+pub(crate) struct TailMarks<'a> {
+    stages: &'a [Expr],
+    tracked: &'a [u32],
+    resolver: bool,
+}
+
+impl<'a> TailMarks<'a> {
+    /// Whether some stage of the view holds an `Expr::TrackedVar`.
+    pub(crate) fn holds_tracked_var(&self) -> bool {
+        !self.tracked.is_empty()
+    }
+
+    /// Whether some stage of the view holds a node that can start a resolver
+    /// invocation.
+    pub(crate) fn holds_resolver_node(&self) -> bool {
+        self.resolver
+    }
+
+    /// The stages of the view that hold an `Expr::TrackedVar`, and no other.
+    pub(crate) fn tracked_stages(&self) -> impl Iterator<Item = &'a Expr> + '_ {
+        self.tracked.iter().map(|&at| &self.stages[at as usize])
+    }
 }
 
 impl Default for Storage {
@@ -2624,8 +2680,11 @@ impl PipeStages {
 
     /// A pipe over `stages[start..]`, this pipe's shared storage (#5488),
     /// starting with every `false` this pipe has settled, as [`Self::copy_of`].
-    fn view_from(&self, stages: &Rc<Vec<Expr>>, start: usize) -> Self {
-        assert!(start <= stages.len(), "a view starts within its storage");
+    fn view_from(&self, stages: &Rc<SharedStages>, start: usize) -> Self {
+        assert!(
+            start <= stages.stages.len(),
+            "a view starts within its storage"
+        );
         let view = Self {
             storage: Storage::Shared {
                 stages: Rc::clone(stages),
@@ -2641,7 +2700,7 @@ impl PipeStages {
     fn into_shared(mut self) -> Self {
         if let Storage::Own(stages) = &mut self.storage {
             self.storage = Storage::Shared {
-                stages: Rc::new(core::mem::take(stages)),
+                stages: Rc::new(SharedStages::new(core::mem::take(stages))),
                 start: 0,
             };
         }
@@ -2931,6 +2990,41 @@ impl PipeStages {
         }
     }
 
+    /// Where the stages of this pipe that hold the nodes `reentry_can_observe`
+    /// looks for are (#5488), when it shares its storage: found once for all the
+    /// stages, by `tracked` and `resolver`, which must be the walks the caller
+    /// would otherwise make over each stage. `None` for a pipe that owns a
+    /// `Vec`, which is walked as it always was.
+    pub(crate) fn tail_marks(
+        &self,
+        tracked: impl Fn(&Expr) -> bool,
+        resolver: impl Fn(&Expr) -> bool,
+    ) -> Option<TailMarks<'_>> {
+        let Storage::Shared { stages, start } = &self.storage else {
+            return None;
+        };
+        let marks = stages.marks.get_or_init(|| StageMarks {
+            tracked: stages
+                .stages
+                .iter()
+                .enumerate()
+                .filter(|(_, stage)| tracked(stage))
+                .map(|(at, _)| Self::stage_index(at))
+                .collect(),
+            resolver_last: stages
+                .stages
+                .iter()
+                .rposition(resolver)
+                .map(Self::stage_index),
+        });
+        let first = marks.tracked.partition_point(|&at| at < *start);
+        Some(TailMarks {
+            stages: &stages.stages,
+            tracked: &marks.tracked[first..],
+            resolver: marks.resolver_last.is_some_and(|at| at >= *start),
+        })
+    }
+
     /// The stages as a `Vec` to edit, after which nothing this pipe settled
     /// holds: the remembered answers and the tails are forgotten. A pipe that
     /// shares its storage (a view, or the owner of one) is given a `Vec` of its
@@ -3003,11 +3097,11 @@ impl Storage {
         match self {
             Self::Own(stages) => stages,
             Self::Shared { stages, start } => match Rc::try_unwrap(stages) {
-                Ok(mut stages) => {
-                    stages.drain(..start as usize);
-                    stages
+                Ok(mut shared) => {
+                    shared.stages.drain(..start as usize);
+                    shared.stages
                 }
-                Err(shared) => shared[start as usize..].to_vec(),
+                Err(shared) => shared.stages[start as usize..].to_vec(),
             },
         }
     }
@@ -3023,7 +3117,9 @@ impl core::ops::Deref for PipeStages {
     fn deref(&self) -> &[Expr] {
         match &self.storage {
             Storage::Own(stages) => stages,
-            Storage::Shared { stages, start } => stages.get(*start as usize..).unwrap_or_default(),
+            Storage::Shared { stages, start } => {
+                stages.stages.get(*start as usize..).unwrap_or_default()
+            }
         }
     }
 }
@@ -4987,6 +5083,57 @@ mod tests {
     /// An integer literal stage, for the #5488 view tests.
     fn lit_5488(n: i64) -> Expr {
         Expr::Literal(Literal::Int(n))
+    }
+
+    /// #5488: the stages a view holds that are marked are the ones a walk over the view finds,
+    /// from every start, for the view of an owner and a view of a view alike, and a pipe that owns
+    /// its `Vec` has no marks, so it is walked as it was.
+    #[test]
+    fn a_views_marks_are_those_of_a_walk_over_its_stages_5488() {
+        let tracked = |e: &Expr| matches!(e, Expr::TrackedVar(_));
+        let resolver = |e: &Expr| matches!(e, Expr::Literal(Literal::Int(99)));
+        for shape in [
+            vec![1, 2, 3, 4, 5, 6],
+            vec![1, 7, 3, 4, 7, 6],
+            vec![7, 2, 3, 4, 5, 6],
+            vec![1, 2, 3, 4, 5, 7],
+            vec![99, 2, 3, 4, 5, 7],
+            vec![1, 99, 3, 99, 5, 6],
+            vec![7, 99, 7, 99, 7, 99],
+        ] {
+            let stages: Vec<Expr> = shape
+                .iter()
+                .map(|&n| match n {
+                    7 => Expr::tracked_value(OwnedValue::Null),
+                    n => lit_5488(n),
+                })
+                .collect();
+            let program = PipeStages::from(stages);
+            assert!(
+                program.tail_marks(tracked, resolver).is_none(),
+                "an owned `Vec` is not marked"
+            );
+            let owner = program.tail_copy(0, |_| 0, |_| 0);
+            for from in 0..shape.len() {
+                let view = owner.tail_copy(from, |_| 0, |_| 0);
+                let marks = view
+                    .tail_marks(tracked, resolver)
+                    .expect("a copy shares its storage");
+                let walked: Vec<&Expr> = view.iter().filter(|e| tracked(e)).collect();
+                let marked: Vec<&Expr> = marks.tracked_stages().collect();
+                assert_eq!(marked.len(), walked.len(), "{shape:?} from {from}");
+                assert!(marked
+                    .iter()
+                    .zip(&walked)
+                    .all(|(a, b)| core::ptr::eq(*a, *b)));
+                assert_eq!(marks.holds_tracked_var(), !walked.is_empty());
+                assert_eq!(
+                    marks.holds_resolver_node(),
+                    view.iter().any(resolver),
+                    "{shape:?} from {from}"
+                );
+            }
+        }
     }
 
     /// #5488: a tail of a pipe that owns its `Vec` (a pipe of the program, one

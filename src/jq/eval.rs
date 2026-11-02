@@ -3535,12 +3535,22 @@ pub(crate) fn pipe_needs_path_context(stages: &PipeStages) -> bool {
 /// replaces, stopped at the first hit as that walk was, so a pipe that holds
 /// the node pays no more than it did and one that does not pays once.
 pub(crate) fn pipe_holds_tracked_var(stages: &PipeStages) -> bool {
-    stages.holds_tracked_var_or_init(|stages| {
-        stages.iter().any(|stage| match kept_run_of(stage) {
-            Some(run) => kept_run_answers(run, pipe_holds_tracked_var),
-            None => any_subexpr(stage, &mut |e| matches!(e, Expr::TrackedVar(_))),
-        })
-    })
+    // A pipe that shares its storage reads the answer off the stages that hold one (#5488): a tail
+    // that holds one is never told so by the pipe it was copied from (a `true` is not inherited),
+    // and finding the stage walked the tail up to it, once for each of its `n` calls.
+    if let Some(marks) = stages.tail_marks(stage_holds_tracked_var, stage_holds_resolver_node) {
+        return marks.holds_tracked_var();
+    }
+    stages.holds_tracked_var_or_init(|stages| stages.iter().any(stage_holds_tracked_var))
+}
+
+/// Whether `stage` holds an `Expr::TrackedVar`, a kept run by what it holds
+/// ([`pipe_holds_tracked_var`]).
+fn stage_holds_tracked_var(stage: &Expr) -> bool {
+    match kept_run_of(stage) {
+        Some(run) => kept_run_answers(run, pipe_holds_tracked_var),
+        None => any_subexpr(stage, &mut |e| matches!(e, Expr::TrackedVar(_))),
+    }
 }
 
 /// The stages a stage of a split tail stands for when it is one of the runs
@@ -3571,12 +3581,20 @@ fn kept_run_answers(run: &PipeStages, fact: fn(&PipeStages) -> bool) -> bool {
 /// A kept run is asked for its stages, not counted as the `Shared` around them
 /// (#5441): it is evaluated as those stages.
 pub(crate) fn pipe_holds_resolver_node(stages: &PipeStages) -> bool {
-    stages.holds_resolver_node_or_init(|stages| {
-        stages.iter().any(|stage| match kept_run_of(stage) {
-            Some(run) => kept_run_answers(run, pipe_holds_resolver_node),
-            None => any_subexpr(stage, &mut may_enter_resolver_node),
-        })
-    })
+    // As [`pipe_holds_tracked_var`]: from the shared storage's marks, when it has them (#5488).
+    if let Some(marks) = stages.tail_marks(stage_holds_tracked_var, stage_holds_resolver_node) {
+        return marks.holds_resolver_node();
+    }
+    stages.holds_resolver_node_or_init(|stages| stages.iter().any(stage_holds_resolver_node))
+}
+
+/// Whether `stage` holds a node that can start a resolver invocation, a kept
+/// run by what it holds ([`pipe_holds_resolver_node`]).
+fn stage_holds_resolver_node(stage: &Expr) -> bool {
+    match kept_run_of(stage) {
+        Some(run) => kept_run_answers(run, pipe_holds_resolver_node),
+        None => any_subexpr(stage, &mut may_enter_resolver_node),
+    }
 }
 
 /// Whether the stages of a pipe hold an `Expr::As`, remembered on the pipe
@@ -45603,6 +45621,20 @@ fn reentry_can_observe(expr: &Expr, rewrite: &dyn Fn(&Tracked) -> Option<Origin>
     if let Expr::Pipe(stages) = expr {
         if !pipe_holds_tracked_var(stages) || !pipe_holds_resolver_node(stages) {
             return false;
+        }
+        // A pipe that shares its storage knows which of its stages hold a marker
+        // and whether one holds a resolver node (#5488), so a tail of `n` stages
+        // whose only marker is in the last is not walked stage by stage on each
+        // of its `n` calls: the answer is the same, from the stages that can
+        // change it.
+        if let Some(marks) = stages.tail_marks(stage_holds_tracked_var, stage_holds_resolver_node) {
+            return marks.holds_resolver_node()
+                && marks.tracked_stages().any(|stage| {
+                    any_subexpr(
+                        stage,
+                        &mut |e| matches!(e, Expr::TrackedVar(marker) if rewrite(marker).is_some()),
+                    )
+                });
         }
     }
     // One walk for both questions: this runs once per re-entry, which on a
