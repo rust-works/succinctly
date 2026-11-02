@@ -771,6 +771,21 @@ regression signal is `perf-guard` in `ci.yml`.
 
 **Artifacts**: Uploaded as `benchmark-results-{arch}` with 3 text files per platform.
 
+### Slow CI jobs
+
+A `Test` leg can get several times slower and stay green (#5845: the `no-std` legs ran at 2.5-3x for nine
+days; #5494: the macOS `cli-gated` leg grew by half in a week). The `ci-times` job in the same scheduled
+workflow reads the job times of the newest successful `merge_group` runs of `ci.yml` through the Actions
+API and compares each job's median with its median over the two weeks before (`scripts/ci_leg_times.py`).
+A job that is both 1.5x and two minutes slower goes in the job summary and in one open issue labelled
+`ci-slowdown` (a comment at most once a day). It is a report, not a check, and the thresholds are wide
+because runner noise is: the same leg has measured 4.8 and 6.9 minutes in adjacent runs.
+
+Run it by hand with `python3 scripts/ci_leg_times.py report` (needs `gh` and a token), or replay a past
+window with `--as-of 2026-10-26T00:00:00Z`: that date flags the `no-std` legs a day after #5232 merged,
+and `--as-of 2026-10-24T12:00:00Z` flags nothing. A flagged job is a prompt to read its log: the `finished
+in` lines name the test binary that grew.
+
 ### What CI Does NOT Run
 
 CI intentionally skips:
