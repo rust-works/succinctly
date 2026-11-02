@@ -4122,6 +4122,18 @@ impl Declared<'_> {
             },
         }
     }
+
+    /// Whether an alias used as mapping key `key` (`*a : 1`, #5469) would read back as `key`:
+    /// the declaration is a scalar whose text is the key's. A container never is, since a
+    /// mapping key here is always text.
+    fn reads_as_key(&self, key: &str) -> bool {
+        match self {
+            Self::Node(OwnedValue::String(s)) => s.as_ref() == key,
+            Self::Node(OwnedValue::Array(_) | OwnedValue::Object(_)) => false,
+            Self::Node(scalar) => scalar.to_json() == key,
+            Self::Key(text) => *text == key,
+        }
+    }
 }
 
 /// Drop every `*alias` mark this document cannot actually resolve, so the
@@ -4153,14 +4165,17 @@ impl Declared<'_> {
 ///
 /// Anchor *declarations* are never dropped: an unreferenced `&x` is valid
 /// YAML and real `yq` keeps it (`yq 'del(.b)'` still prints `a: &x 1`).
+///
+/// An alias used as a mapping key (`*a : 1`, #5469) is held to the same three rules, its value
+/// being the key's text; one that fails them is written as that text.
 fn enforce_anchor_soundness(value: &OwnedValue, comments: &mut CommentTree, sort_keys: bool) {
     // Scoped so the scan's immutable borrow of `*comments` (and the anchor
     // names `declared` keys on, which live in it) has certainly ended
     // before the second pass takes a mutable one. The flagged paths borrow
     // only from `value`, which the second pass never touches.
-    let unresolvable: Vec<Vec<TreeStep<'_>>> = {
+    let (unresolvable, unresolvable_keys) = {
         let mut declared: IndexMap<&str, Declared<'_>> = IndexMap::new();
-        let mut unresolvable = Vec::new();
+        let mut unresolvable = Unresolvable::default();
         let mut path = Vec::new();
         scan_anchor_soundness(
             value,
@@ -4171,13 +4186,27 @@ fn enforce_anchor_soundness(value: &OwnedValue, comments: &mut CommentTree, sort
             &mut path,
             0,
         );
-        unresolvable
+        (unresolvable.nodes, unresolvable.keys)
     };
     for steps in &unresolvable {
         if let Some(node) = comment_tree_at_path_mut(comments, steps) {
             node.meta_mut().anchor = None;
         }
     }
+    for (steps, key) in &unresolvable_keys {
+        if let Some(node) = comment_tree_at_path_mut(comments, steps) {
+            node.clear_key_alias(key);
+        }
+    }
+}
+
+/// The aliases [`scan_anchor_soundness`] found unresolvable: the path of each node whose own
+/// `*name` mark fails, and (#5469) the path of each mapping holding a key that is such an alias,
+/// with that key.
+#[derive(Default)]
+struct Unresolvable<'v> {
+    nodes: Vec<Vec<TreeStep<'v>>>,
+    keys: Vec<(Vec<TreeStep<'v>>, &'v str)>,
 }
 
 /// Pre-order half of [`enforce_anchor_soundness`]: record each declaration
@@ -4192,7 +4221,7 @@ fn scan_anchor_soundness<'v, 'c>(
     comments: &'c CommentTree,
     sort_keys: bool,
     declared: &mut IndexMap<&'c str, Declared<'v>>,
-    unresolvable: &mut Vec<Vec<TreeStep<'v>>>,
+    unresolvable: &mut Unresolvable<'v>,
     path: &mut Vec<TreeStep<'v>>,
     depth: usize,
 ) {
@@ -4215,7 +4244,7 @@ fn scan_anchor_soundness<'v, 'c>(
         // "would these render the same", not "are these jq-equal".
         Some(AnchorMark::Aliases(name)) if !matches!(declared.get(name.as_str()), Some(d) if d.identical(value)) =>
         {
-            unresolvable.push(path.clone());
+            unresolvable.nodes.push(path.clone());
         }
         Some(AnchorMark::Aliases(_)) => {}
         None => {}
@@ -4235,6 +4264,13 @@ fn scan_anchor_soundness<'v, 'c>(
             }
             for k in keys {
                 let Some(v) = fields.get(k) else { continue };
+                // #5469: a key that is an alias is written before its value, so it must
+                // resolve against what came before it.
+                if let Some(name) = comments.key_alias(k) {
+                    if !matches!(declared.get(name), Some(d) if d.reads_as_key(k)) {
+                        unresolvable.keys.push((path.clone(), k.as_str()));
+                    }
+                }
                 // #2598: a key's `&name` is declared before its value is
                 // reached, and stands for the key's own text.
                 if let Some(name) = comments.key_anchor(k) {
@@ -8584,8 +8620,18 @@ fn defers_to_own_block(value: &OwnedValue, comments: &CommentTree) -> bool {
 /// `key`'s own `&name ` anchor declaration and explicit tag, if it has them
 /// (#2598, #4088). The key-side twin of [`anchor_decl_prefix`], matching
 /// `write_yaml_field_key` in `light.rs`: `&k !Foo key: &v 1`. Allocates only for
-/// an anchored or tagged key.
-fn with_key_anchor(comments: &CommentTree, key: &str, quoted_key: String) -> String {
+/// an anchored, tagged or alias key.
+///
+/// A key that is an alias is `*name` instead (#5469), with the space yq writes before a block
+/// mapping's `:` (`*a : 1`) and none in a flow mapping (`{*a: 1}`).
+fn with_key_anchor(comments: &CommentTree, key: &str, quoted_key: String, flow: bool) -> String {
+    if let Some(name) = comments.key_alias(key) {
+        return if flow {
+            format!("*{name}")
+        } else {
+            format!("*{name} ")
+        };
+    }
     match (comments.key_anchor(key), comments.key_tag(key)) {
         (Some(name), Some(tag)) => format!("&{name} {tag} {quoted_key}"),
         (Some(name), None) => format!("&{name} {quoted_key}"),
@@ -9114,6 +9160,7 @@ fn emit_yaml_value_at_depth(
                             kc,
                             k,
                             yaml_quote_key(k, kc.key_style(k), true, config.json_sourced_floats),
+                            true,
                         );
                         let field_comments = field_comments_of(comments, k, live);
                         let val = emit_yaml_value_at_depth(
@@ -9151,7 +9198,9 @@ fn emit_yaml_value_at_depth(
                         let plain_key = kc.key_style(k).is_empty()
                             && kc.key_anchor(k).is_none()
                             && kc.key_tag(k).is_none();
-                        let explicit_key = if go_yaml_key_is_simple(k) {
+                        // An alias key is `*name` however long its target is (#5469).
+                        let explicit_key = if go_yaml_key_is_simple(k) || kc.key_alias(k).is_some()
+                        {
                             None
                         } else if plain_key
                             && (config.json_sourced_floats
@@ -9171,6 +9220,7 @@ fn emit_yaml_value_at_depth(
                                     false,
                                     config.json_sourced_floats,
                                 ),
+                                false,
                             ))
                         }
                         .map(|scalar| format!("? {scalar}\n{indent}"));
@@ -9185,6 +9235,7 @@ fn emit_yaml_value_at_depth(
                                     false,
                                     config.json_sourced_floats,
                                 ),
+                                false,
                             )
                         });
                         let field_comments = field_comments_of(comments, k, *live);

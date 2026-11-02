@@ -516,12 +516,17 @@ fn trace_at_depth(
                             return None;
                         };
                         // The key node is reused as the entry's `key` string, so
-                        // its `&anchor` rides along (`key: &k key`, #2598).
+                        // its `&anchor` rides along (`key: &k key`, #2598), and so
+                        // does an alias used as the key (`key: *a`, #5469).
                         let mut key_meta =
                             NodeMeta::from_comment_and_style(None, tree.key_style(key));
                         key_meta.anchor = tree
                             .key_anchor(key)
-                            .map(|name| AnchorMark::Declares(name.to_string()));
+                            .map(|name| AnchorMark::Declares(name.to_string()))
+                            .or_else(|| {
+                                tree.key_alias(key)
+                                    .map(|name| AnchorMark::Aliases(name.to_string()))
+                            });
                         (CommentTree::Leaf(key_meta), tree.field(key).clone())
                     }
                     OwnedValue::Array(_) => (CommentTree::empty(), tree.at_index(i).clone()),
@@ -566,11 +571,13 @@ fn trace_at_depth(
                 // leave the earlier occurrence's style behind on collision.
                 keys.shift_remove(key.as_ref());
                 let key_tree = entry_tree.field(key_field);
-                if let Some(meta) = KeyMeta::with_anchor(
+                if let Some(meta) = KeyMeta::with_alias(
                     None,
                     false,
                     key_tree.style(),
                     key_tree.declared_anchor().map(str::to_string),
+                    None,
+                    key_tree.alias_name().map(str::to_string),
                 ) {
                     keys.insert(key.to_string(), meta);
                 }
@@ -592,12 +599,13 @@ fn trace_at_depth(
             let mut keys = IndexMap::new();
             for key in sorted.keys() {
                 fields.insert(key.clone(), tree.field(key).clone());
-                if let Some(meta) = KeyMeta::with_properties(
+                if let Some(meta) = KeyMeta::with_alias(
                     None,
                     false,
                     tree.key_style(key),
                     tree.key_anchor(key).map(str::to_string),
                     tree.key_tag(key).map(str::to_string),
+                    tree.key_alias(key).map(str::to_string),
                 ) {
                     keys.insert(key.clone(), meta);
                 }
@@ -834,12 +842,13 @@ fn merge_tree(
             };
             fields.insert(key.clone(), child);
             let key_tree = if lvalue.is_some() { lt } else { rt };
-            if let Some(meta) = KeyMeta::with_properties(
+            if let Some(meta) = KeyMeta::with_alias(
                 None,
                 false,
                 key_tree.key_style(key),
                 key_tree.key_anchor(key).map(str::to_string),
                 key_tree.key_tag(key).map(str::to_string),
+                key_tree.key_alias(key).map(str::to_string),
             ) {
                 keys.insert(key.clone(), meta);
             }
