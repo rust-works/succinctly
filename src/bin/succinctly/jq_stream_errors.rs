@@ -1280,4 +1280,35 @@ mod tests {
         assert_eq!(end.first_error, batch.first_error);
         assert!(reader.next().is_none(), "a finished reader stays finished");
     }
+
+    /// #5498: a reader that has handed out one input has fed the parser the refills that
+    /// completed it and no more, and holds none of the values after it.
+    #[test]
+    fn a_reader_feeds_the_parser_only_as_far_as_the_input_asked_for() {
+        let lines: String = (0..5000).map(|i| format!("[{i}]\n")).collect();
+        let sources = vec![(Some(0), lines.into_bytes())];
+        let total = sources[0].1.len();
+        let mut reader = Reader::new(&sources);
+        let (first, _) = reader.next().expect("a first input");
+        assert_eq!(first.to_json(), "[[0],0]");
+        assert!(
+            reader.cursor.pos < 64,
+            "{} of {total} bytes fed",
+            reader.cursor.pos
+        );
+        // `[0]` completed two events (the leaf and the close); the second waits in the queue.
+        assert_eq!(reader.parser.pending.len(), 1);
+        assert_eq!(reader.next().expect("the close").0.to_json(), "[[0]]");
+        assert!(reader.cursor.pos < 64);
+        // Reading on to the end hands out every event and then nothing.
+        let mut count = 2;
+        while reader.next().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 10_000);
+        assert_eq!(
+            reader.cursor.pos, 0,
+            "the cursor has moved past the last source"
+        );
+    }
 }
