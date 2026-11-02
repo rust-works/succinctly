@@ -126,8 +126,10 @@ fn a_walk_past_the_native_stack_floor_refuses_at_exit_5_5554() -> Result<()> {
         format!("{PAST_THE_FLOOR} | flatten"),
         // A splice site's panicking guard, caught by #5526's net.
         format!("{PAST_THE_FLOOR} as $v | {{\"a\": []}} | .a += $v | length"),
-        // A resource limit: `try` does not absorb it.
+        // A resource limit (#2132's table, #3261's row): no spelling of `try` absorbs it.
         format!("try ({PAST_THE_FLOOR} | flatten) catch 0"),
+        format!("[{PAST_THE_FLOOR} | [., 1]?] | length"),
+        format!("[try ({PAST_THE_FLOOR} | [., 1])] | length"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
         assert_eq!(code, 5, "{filter}: {stderr}");

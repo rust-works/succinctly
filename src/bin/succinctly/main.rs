@@ -1744,7 +1744,9 @@ fn require_popcnt() {
 ///
 /// Half of it is the native-stack floor's reach (ADR-0025): 8 MiB still holds the walks the floor
 /// does not charge for, a built value at `MAX_VALUE_TREE_DEPTH` and a native `recurse`'s own
-/// 512 KiB budget, with room to spare.
+/// 512 KiB budget, with room to spare. In `succinctly jq` a walk over a built value past 384
+/// levels is charged to the floor itself (#5554), so a smaller stack refuses it shallower; the
+/// recursive `Drop` of what it built is the walk left uncharged (#5782).
 const MIN_EVAL_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 const _: () = assert!(EVAL_STACK_SIZE >= MIN_EVAL_STACK_SIZE);

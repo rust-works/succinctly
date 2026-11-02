@@ -8189,7 +8189,8 @@ Three differences remain, none of which aborts the process:
   1,200 levels; jq prints it, and so does succinctly since #5554 (the output check that
   reported `nesting depth exceeds limit of 384` and exited 5 is gone in jq mode; see Printing
   above).
-  Since #5554 `succinctly jq` also bounds every other walk over such a value by the native-stack floor rather than by 384 (see Building above); the history below is of the 384 guard, which `succinctly yq` and an unregistered library thread still have. Before #1371 this shape could not recurse far enough to reach the ceiling at
+  Since #5554 `succinctly jq` also bounds every other walk over such a value by the native-stack floor rather than by 384 (see Building above); the history below is of the 384 guard, which `succinctly yq` and an unregistered library thread still have.
+  Before #1371 this shape could not recurse far enough to reach the ceiling at
   all. Between f2789080a (2026-08-29) and #3261, the guard's most commonly reached call
   site -- `reduce`/`foreach`'s own per-iteration reindex bridge
   (`OwnedValue::to_json_for_reindex`), which every ordinary evaluation of this shape

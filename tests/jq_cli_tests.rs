@@ -101641,18 +101641,10 @@ fn test_resource_limit_caps_are_uncatchable_2132() -> Result<()> {
             "def f: 1, [f]; f",
             "f/0 exceeded maximum recursion depth",
         ),
-        // #3261: MAX_VALUE_TREE_DEPTH, reached via the reindex bridge --
-        // newly routed through the catchable EvalError machinery by that
-        // fix, so it must be tagged `resource_limit` like every other cap in
-        // this table or it silently regresses into exactly the #2089 class
-        // this test guards against. Since #5554 the bound in jq mode is the
-        // native-stack floor, so the value is built two million levels deep
-        // through `.[0] = .`'s owned door, past both profiles' floors.
-        (
-            "MAX_VALUE_TREE_DEPTH/native-stack floor",
-            "reduce range(2000000) as $i ([]; .[0] = .) | [., 1]",
-            "nesting depth exceeds limit of the native stack",
-        ),
+        // #3261's MAX_VALUE_TREE_DEPTH row: since #5554 the bound in jq mode is
+        // the native-stack floor, which takes a value two million levels deep to
+        // reach. `i5554c.rs`'s `a_walk_past_the_native_stack_floor_refuses_at_exit_5_5554`
+        // runs these three spellings over it, in the deep-recursion leg.
     ] {
         for spelling in [
             format!("[{expr}?] | length"),

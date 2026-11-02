@@ -285,13 +285,9 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     }
 
     fn try_from_owned_at_depth(owned: OwnedValue, depth: usize) -> Result<Self, EvalError> {
-        // Past the constant, the native-stack floor decides where one is armed (#5554).
-        if depth >= super::value::MAX_VALUE_TREE_DEPTH && !super::eval::value_depth_on_stack_floor()
-        {
-            return Err(EvalError::new(
-                super::value::value_tree_depth_exceeded_message(),
-            ));
-        }
+        // The value-tree guard itself, so past 384 levels the native-stack floor decides where
+        // one is armed and the refusal is the same uncatchable `resource_limit` (#5554).
+        super::value::check_value_tree_depth(depth)?;
         Ok(match owned {
             OwnedValue::Array(arr) => JqValue::Array(
                 arr.into_iter()
