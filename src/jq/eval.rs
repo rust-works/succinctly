@@ -12538,7 +12538,8 @@ fn is_peelable_head<S: EvalSemantics>(stage: &Expr) -> bool {
 }
 
 /// Take a pipe's leading `.field`/`.[n]`/`.[a:b]` (or `length`, and a string's
-/// `startswith`/`endswith`, #5712; jq mode also
+/// `startswith`/`endswith`, #5712, and its `test`/`index`/`rindex`/`inside` of a literal,
+/// `ltrimstr`/`rtrimstr`/`tostring` and `. + "lit"`, #5816; jq mode also
 /// `first`/`last`, which yq defines for itself) natively, then
 /// re-enter with the rest on the value it lands on, instead of reindexing the
 /// whole input for the bridge (#3213). A slice is answered by
