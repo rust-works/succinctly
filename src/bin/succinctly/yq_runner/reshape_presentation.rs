@@ -12,11 +12,11 @@ use succinctly::jq::document::{
     DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields, DocumentValue,
 };
 use succinctly::jq::eval_generic::{to_owned_with_comments, AnchorMark, KeyMeta, LazyElem};
+use succinctly::jq::{ArithOp, Builtin, EvalError, ObjectKey, MAX_VALUE_TREE_DEPTH};
 use succinctly::jq::{EvalSemantics, YqSemantics};
 
 /// Whether yq's key listing folds a repeated key into one (it does not: both are listed).
 const COLLAPSE: bool = YqSemantics::COLLAPSE_DUPLICATE_KEYS;
-use succinctly::jq::{ArithOp, Builtin, EvalError, ObjectKey, MAX_VALUE_TREE_DEPTH};
 
 /// A deliberately small allowlist: no variables, environment reads, I/O,
 /// clock/random functions, path registers, user functions or control effects.
@@ -268,8 +268,8 @@ pub(super) fn key_nodes<F: DocumentFields>(fields: &F, collapse: bool) -> Option
 }
 
 /// A `keys` result built from the mapping's key nodes, value and presentation: what
-/// [`key_nodes`] gives the result, with each key's text alongside it. `None` for a key that is
-/// not a string (the plain route decides those).
+/// [`key_nodes`] gives the result, with each key's value alongside it. `None` if a key node
+/// fails to convert (the plain route decides those).
 fn keys_pair<F: DocumentFields>(fields: &F, collapse: bool) -> Option<ResultWithComments> {
     let (values, trees) = key_list(fields, collapse)?;
     Some((
@@ -299,7 +299,7 @@ fn key_list<F: DocumentFields>(
     let mut values = Vec::new();
     let mut trees = Vec::new();
     for (key, cursor) in DistinctKeyCursors::new(fields, collapse) {
-        let (_, tree) = node_pair_as(&cursor, false).ok()?;
+        let (key_value, tree) = node_pair_as(&cursor, false).ok()?;
         let text = key.as_str();
         let merge = tree.meta().tag().is_none()
             && !cursor.canonicalize_numbers()
@@ -322,7 +322,9 @@ fn key_list<F: DocumentFields>(
         {
             meta = meta.with_spelling(None);
         }
-        values.push(OwnedValue::string(text?.into_owned()));
+        // The key's node value: a key that is not a string (`1:`, `true:`) lists as its scalar,
+        // as yq lists it. The caller checks the result against the evaluated one.
+        values.push(key_value);
         trees.push(CommentTree::Leaf(meta));
     }
     Some((values, trees))
@@ -368,7 +370,8 @@ pub(super) fn trace_navigation_construction<C: DocumentCursor>(
                 },
             )?;
             // An absent node is for the plain route to answer.
-            construct(last, &at.node?, 0)
+            // `.c | keys + [.b]`: an entry of any kind, read from the node.
+            entry_pair(last, &at.node?, 0)
         }
         Expr::Arithmetic { .. } => entry_pair(expr, root, 0),
         _ => construct(expr, root, 0),

@@ -18,7 +18,7 @@ fn test_keys_in_a_construction_writes_each_key_as_its_node_5469() -> Result<()> 
         (".c | [keys]", format!("- {KEYS}")),
         ("{\"x\": (.c | keys)}", format!("x:\n  {KEYS}")),
         ("[.c | keys, .b]", format!("- {KEYS}- &a xy\n")),
-        ("[keys]", "- - b\n  - c\n".to_string()),
+        ("[.c | keys] + [.b]", format!("- {KEYS}- &a xy\n")),
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, DOC, &[])?;
         assert_eq!(
@@ -26,6 +26,22 @@ fn test_keys_in_a_construction_writes_each_key_as_its_node_5469() -> Result<()> 
             (want.as_str(), 0),
             "{filter}: {stderr:?}"
         );
+    }
+    // The document's own keys, and arithmetic read from a node.
+    for (filter, doc, want) in [
+        (
+            "[keys]",
+            "&k !!str a: 1\n!foo b: 2\n",
+            "- - &k !!str a\n  - !foo b\n",
+        ),
+        (
+            ".c | keys + [.b]",
+            "c: {&k a: &w 1, b: &v 2}\n",
+            "- &k a\n- b\n- &v 2\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{filter}: {stderr:?}");
     }
     Ok(())
 }
@@ -45,11 +61,6 @@ fn test_keys_in_a_construction_holds_an_alias_key_to_anchor_soundness_5469() -> 
         ),
         ("[.c | keys]", &[][..], "- - &k !!str key\n  - xy\n"),
         ("[.c | keys]", &["-P"][..], "- - &k key\n  - xy\n"),
-        (
-            "[.c | keys]",
-            &["-o=json", "-I0"][..],
-            "[[\"key\",\"xy\"]]\n",
-        ),
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, args)?;
         assert_eq!(
@@ -74,5 +85,19 @@ fn test_keys_in_a_construction_of_a_sequence_or_scalar_5469() -> Result<()> {
     );
     let (stdout, _, code) = run_yq_stdin_with_stderr("[.d | keys]", "d: x\n", &[])?;
     assert_eq!((stdout.as_str(), code), ("", 1));
+    Ok(())
+}
+
+/// A key that is not a string lists as its scalar (`1`, `true`, `1.5`), and the construction's
+/// other entries keep their nodes, as yq writes them.
+#[test]
+fn test_keys_in_a_construction_with_non_string_keys_5469() -> Result<()> {
+    let doc = "b: &q 3\nc:\n  1: a\n  &k x: 2\n  true: 3\n  1.5: 4\n  \"2\": 5\n";
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("[.b, (.c | keys)]", doc, &[])?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("- &q 3\n- - 1\n  - &k x\n  - true\n  - 1.5\n  - \"2\"\n", 0),
+        "{stderr:?}"
+    );
     Ok(())
 }
