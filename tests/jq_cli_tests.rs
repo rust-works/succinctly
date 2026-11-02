@@ -23359,7 +23359,7 @@ fn test_as_pattern_no_alt_unaffected_720() -> Result<()> {
 // name) over the raw, undeduped binding list in pattern order, so only the
 // first bind ever found anything left to replace. Real jq's actual rule is
 // asymmetric between the two container kinds, confirmed live against jq
-// 1.7.1 (not inferred, per CLAUDE.md's #1120 lesson that a fix matching
+// 1.7.1 (not inferred, per the testing skill's #1120 rule that a fix matching
 // only one repro shape can encode the wrong general rule): an **array**
 // pattern keeps the *last* position's value; an **object** pattern keeps
 // the *first* field's value, tracking the pattern's own field order rather

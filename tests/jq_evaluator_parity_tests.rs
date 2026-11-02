@@ -908,7 +908,7 @@ fn test_parity_number_literal_preservation_387() {
     // A computed number (post-arithmetic) is a fresh value, not a passthrough,
     // so it drops the literal and both evaluators still agree with each other
     // -- this only pins parity, not a specific jq-matching spelling (that gap
-    // is pre-existing and unrelated to #387; see CLAUDE.md's own notes).
+    // is pre-existing and unrelated to #387).
     assert_parity(b"1e100", "(. + 0) | tostring");
 
     // The streaming identity path was already correct before #387 and must

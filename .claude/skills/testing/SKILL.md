@@ -132,6 +132,26 @@ input text, assert it never disagrees with the balanced-parens structure the par
 oracle held across the whole real-workload corpus and all 279 valid YAML-suite cases when #106
 added it, and it catches classes of bug that example-based tests cannot reach.
 
+## Fuzz and Oracle Sweeps: Three Rules Code Comments Cite
+
+These are cited by name from test comments (`src/json/light.rs`, `tests/jq_cli_tests.rs`,
+`docs/plan/jq-generator-argument-fanout.md`).
+
+1. **The fuzz alphabet must reach the bytes the code under test handles.** A fuzzer that only ever
+   emits ASCII cannot find a bug in a UTF-8-aware checker. Include multi-byte UTF-8, escapes and the
+   edge bytes (raw control bytes, bytes at or above `0x80`) among a generator's ingredients, and say so in
+   the test's doc comment.
+2. **A fuzz route's weight is part of the claim.** A sweep proves something about a code path only if
+   it reaches it often enough: a generator whose 17th key survives about once in 30,000 draws never
+   runs the wide-object table at all. Count the draws that reached the path (`wide`, a hit counter)
+   and assert the count is non-zero, rather than trusting the sampling probabilities.
+3. **A fix that matches one repro shape can encode the wrong general rule (#1120).** Capture the
+   reference tool's behaviour over the whole matrix of shapes the rule covers (array and object
+   patterns, every nesting order of two generator arguments) before generalising from the
+   failing case, and from a generator that does not share the fix's own assumptions. A count of
+   outputs that matches proves nothing about their order. A hand-picked matrix has the picker's
+   blind spots, so fuzz it as well.
+
 ## Fakes Can't Verify Build-Time/Runtime Feature Agreement
 
 When a test double stands in for "produce an artifact, then invoke it" (cross-compile a binary
