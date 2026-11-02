@@ -75,7 +75,10 @@ cargo build --release --features cli,simd,regex,serde --target-dir target/subjec
 ./target/release/succinctly dev compare jq --quick --subject target/subject/release/succinctly --subject-features cli,simd,regex,serde
 ```
 
-`--write-docs` writes `docs/compare/jq-<platform>.{md,json}` and the index `docs/compare/jq.md`. CI is
-`.github/workflows/compare-jq.yml`, run by hand or on a release, not on pull requests.
+`--write-docs` writes `docs/compare/jq-<platform>.{md,json}` and the index `docs/compare/jq.md`, and regenerates the `<!-- compare:jq-<platform> -->` block of `docs/benchmarks/jq.md` from that json.
+A platform's first run needs the two markers added at the top of its section there.
+`--render-docs` measures nothing: it re-renders the index and every block from the committed jsons, after a change to how they are rendered.
+The bin's `benchmarks_doc_quotes_the_committed_results` test fails when a block and its json disagree.
+CI is `.github/workflows/compare-jq.yml`, run by hand or on a release, not on pull requests.
 `.github/workflows/compare-jq-ledger.yml` runs the correctness dimensions (no timing rows) on pull requests that touch
 `comparison/jq/`, `src/jq/` or the harness, and weekly, and fails on an unlisted or stale ledger entry (#5565).

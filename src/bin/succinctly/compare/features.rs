@@ -78,8 +78,8 @@ pub struct Coverage {
     pub matching_pct: f64,
 }
 
-pub const DOC_START: &str = "<!-- compare:builtins -->";
-pub const DOC_END: &str = "<!-- /compare:builtins -->";
+/// The `<!-- compare:builtins -->` block of `docs/reference/jq-language.md`.
+pub const DOC_ID: &str = "builtins";
 
 impl From<&FeatureSummary> for Coverage {
     fn from(f: &FeatureSummary) -> Self {
@@ -107,18 +107,7 @@ impl Coverage {
 
 /// Replace the text between the doc's markers with `cov`'s sentence.
 pub fn patch_doc(doc: &str, cov: &Coverage) -> Result<String> {
-    let (Some(a), Some(b)) = (doc.find(DOC_START), doc.find(DOC_END)) else {
-        bail!("doc has no {DOC_START} ... {DOC_END} block");
-    };
-    if b < a {
-        bail!("doc markers are out of order");
-    }
-    Ok(format!(
-        "{}{DOC_START}\n{}\n{}",
-        &doc[..a],
-        cov.sentence(),
-        &doc[b..]
-    ))
+    super::docs::patch_block(doc, DOC_ID, &cov.sentence())
 }
 
 /// `name/arity` of every builtin the reference lists, sorted.
@@ -296,9 +285,13 @@ mod tests {
 
     #[test]
     fn patching_replaces_only_the_marked_block() {
-        let doc = format!("a\n{DOC_START}\nold\n{DOC_END}\nb\n");
+        let (start, end) = (
+            format!("<!-- compare:{DOC_ID} -->"),
+            format!("<!-- /compare:{DOC_ID} -->"),
+        );
+        let doc = format!("a\n{start}\nold\n{end}\nb\n");
         let out = patch_doc(&doc, &cov()).unwrap();
-        assert!(out.starts_with("a\n") && out.ends_with(&format!("{DOC_END}\nb\n")));
+        assert!(out.starts_with("a\n") && out.ends_with(&format!("{end}\nb\n")));
         assert!(out.contains(&cov().sentence()) && !out.contains("old"));
         assert_eq!(patch_doc(&out, &cov()).unwrap(), out);
         assert!(patch_doc("no markers", &cov()).is_err());

@@ -124,6 +124,12 @@ pub struct CompareJqArgs {
     #[arg(long)]
     write_docs: bool,
 
+    /// Run nothing: regenerate the index docs/compare/jq.md and the per-platform blocks of
+    /// docs/benchmarks/jq.md from the committed docs/compare/jq-<platform>.json files, after a
+    /// change to how they are rendered
+    #[arg(long, conflicts_with_all = ["write_docs", "write_summary", "verify", "ledger_only"])]
+    render_docs: bool,
+
     /// Time jq against itself instead of succinctly: the harness's own noise floor
     #[arg(long)]
     control: bool,
@@ -323,6 +329,10 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     }
     let valgrind = args.cachegrind.then(find_valgrind).transpose()?;
     let root = repo_root()?;
+    if args.render_docs {
+        render_docs(&root)?;
+        return Ok(0);
+    }
     let (manifest, manifest_sha256) = Manifest::load(&root)?;
     let primary = manifest.primary().clone();
 
@@ -1117,6 +1127,15 @@ fn write_docs(root: &std::path::Path, results: &Results, args: &CompareJqArgs) -
     let dir = root.join("docs/compare");
     std::fs::create_dir_all(&dir)?;
     let p = docs::PLATFORM;
+    let json = docs::sanitize(&(serde_json::to_string_pretty(results)? + "\n"), root);
+    let mut runs = docs::committed_runs(&dir)?;
+    runs.retain(|(plat, _)| plat != p);
+    runs.push((p.to_string(), serde_json::from_str(&json)?));
+    runs.sort_by(|a, b| a.0.cmp(&b.0));
+    // Patched before anything is written, so a platform with no block in the doc
+    // leaves every committed file as it was.
+    let bench = root.join(docs::BENCHMARKS_DOC);
+    let bench_doc = docs::patch_benchmarks(&std::fs::read_to_string(&bench)?, &runs)?;
     std::fs::write(
         dir.join(format!("jq-{p}.md")),
         docs::sanitize(
@@ -1124,29 +1143,29 @@ fn write_docs(root: &std::path::Path, results: &Results, args: &CompareJqArgs) -
             root,
         ),
     )?;
-    std::fs::write(
-        dir.join(format!("jq-{p}.json")),
-        docs::sanitize(&(serde_json::to_string_pretty(results)? + "\n"), root),
-    )?;
-    let mut rows = vec![];
-    for e in std::fs::read_dir(&dir)?.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if let Some(plat) = name
-            .strip_prefix("jq-")
-            .and_then(|n| n.strip_suffix(".json"))
-        {
-            if plat == "coverage" {
-                continue;
-            }
-            rows.push((
-                plat.to_string(),
-                serde_json::from_str(&std::fs::read_to_string(e.path())?)?,
-            ));
-        }
-    }
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    std::fs::write(dir.join("jq.md"), docs::index(&rows))?;
-    println!("wrote docs/compare/jq-{p}.md, jq-{p}.json and jq.md");
+    std::fs::write(dir.join(format!("jq-{p}.json")), json)?;
+    std::fs::write(dir.join("jq.md"), docs::index(&runs))?;
+    std::fs::write(&bench, bench_doc)?;
+    println!(
+        "wrote docs/compare/jq-{p}.md, jq-{p}.json, jq.md and {}",
+        docs::BENCHMARKS_DOC
+    );
+    Ok(())
+}
+
+/// `--render-docs`: the committed runs re-rendered, nothing measured.
+fn render_docs(root: &std::path::Path) -> Result<()> {
+    let dir = root.join("docs/compare");
+    let runs = docs::committed_runs(&dir)?;
+    let bench = root.join(docs::BENCHMARKS_DOC);
+    let bench_doc = docs::patch_benchmarks(&std::fs::read_to_string(&bench)?, &runs)?;
+    std::fs::write(dir.join("jq.md"), docs::index(&runs))?;
+    std::fs::write(&bench, bench_doc)?;
+    println!(
+        "rendered docs/compare/jq.md and {} from {} committed run(s)",
+        docs::BENCHMARKS_DOC,
+        runs.len()
+    );
     Ok(())
 }
 
