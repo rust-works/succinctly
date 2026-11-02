@@ -357,7 +357,8 @@ const ROWS: &[Row] = &[
         r"[[[[]]],[[{}]]]",
         r"2",
         0,
-    ),    // A repeated key: `-n` with `inputs` reads jq's own streaming parser (#5498), which emits
+    ),
+    // A repeated key: `-n` with `inputs` reads jq's own streaming parser (#5498), which emits
     // every occurrence as it meets it.
     (
         &["--stream", "-n", "-c", "[inputs]"],

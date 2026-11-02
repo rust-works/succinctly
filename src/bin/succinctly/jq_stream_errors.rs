@@ -188,21 +188,9 @@ pub(crate) struct Yielded {
     pub(crate) value: OwnedValue,
     /// The source index and the lines jq had read of it ([`CLOSED`] after jq closed its input).
     pub(crate) location: (usize, usize),
-    /// Whether the input is a parse error: `[message, path]` under `--stream-errors`, and the
-    /// error jq raises, whose text is the message, without it.
-    pub(crate) error: bool,
-}
-
-impl Yielded {
-    /// The text of a parse error input: the first element of its `[message, path]`.
-    pub(crate) fn message(&self) -> String {
-        self.value
-            .as_array()
-            .and_then(|items| items.first())
-            .and_then(OwnedValue::as_str)
-            .map(str::to_owned)
-            .unwrap_or_default()
-    }
+    /// The message, when the input is a parse error: `[message, path]` is the input under
+    /// `--stream-errors`, and the message is the error jq raises without it.
+    pub(crate) error: Option<String>,
 }
 
 /// How jq's reader ended, known once [`Reader::next`] has returned `None`.
@@ -369,6 +357,12 @@ pub(crate) fn events_before_fault(bytes: &[u8]) -> Vec<(OwnedValue, usize)> {
         .collect()
 }
 
+/// A parse error as `--stream-errors` hands it over (`[message, path]`) and the message alone.
+struct ParseFault {
+    value: OwnedValue,
+    message: String,
+}
+
 struct Parser {
     line: usize,
     column: usize,
@@ -431,10 +425,10 @@ impl Parser {
     }
 
     fn yield_value(&mut self, value: OwnedValue) {
-        self.push(value, false);
+        self.push(value, None);
     }
 
-    fn push(&mut self, value: OwnedValue, error: bool) {
+    fn push(&mut self, value: OwnedValue, error: Option<String>) {
         let line = if self.closed { CLOSED } else { self.lines_read };
         self.pending.push_back(Yielded {
             value,
@@ -445,9 +439,9 @@ impl Parser {
     }
 
     /// [`Parser::yield_value`] for a parse error, remembering where the first one fell.
-    fn yield_error(&mut self, error: OwnedValue) {
+    fn yield_error(&mut self, fault: ParseFault) {
         self.first_error.get_or_insert(self.yielded);
-        self.push(error, true);
+        self.push(fault.value, Some(fault.message));
     }
 
     fn path_value(&self) -> OwnedValue {
@@ -455,8 +449,14 @@ impl Parser {
     }
 
     /// jq's `make_error` with `JV_PARSE_STREAM_ERRORS`: the message and the path as it stands.
-    fn error_value(&self, message: String) -> OwnedValue {
-        OwnedValue::array_from(vec![OwnedValue::String(message.into()), self.path_value()])
+    fn error_value(&self, message: String) -> ParseFault {
+        ParseFault {
+            value: OwnedValue::array_from(vec![
+                OwnedValue::String(message.clone().into()),
+                self.path_value(),
+            ]),
+            message,
+        }
     }
 
     /// One refill's bytes, which are one call to `jv_parser_next` or more: the values it completes
@@ -1341,8 +1341,8 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 10_000);
-        assert_eq!(
-            reader.cursor.pos, 0,
+        assert!(
+            reader.cursor.source == sources.len() && reader.cursor.closed,
             "the cursor has moved past the last source"
         );
     }

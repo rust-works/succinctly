@@ -5785,10 +5785,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             if args.null_input && !force_read_under_null_input {
                 jq::seed_remaining_inputs(Vec::new(), locations.exhausted(args.slurp));
             } else if let Some(lazy) = LAZY_STREAM_INPUTS.with(|slot| slot.borrow_mut().take()) {
-                // #5498: `--stream-errors` read as the program asks. The end of the stream is
-                // settled when the reader reaches it.
+                // #5498: `--stream` and `--stream-errors` read as the program asks. The end of the
+                // stream is settled when the reader reaches it.
                 debug_assert_eq!(locations.per_value(), &[]);
-                jq::seed_remaining_inputs_from(stream_errors_producer(lazy));
+                jq::seed_remaining_inputs_from(stream_reader_producer(lazy));
                 jq::count_reads_past_end();
             } else if let Some(lazy) = LAZY_JSON_INPUTS.with(|slot| slot.borrow_mut().take()) {
                 // #5661: a clean single-source stream whose documents are converted as the
@@ -6935,6 +6935,7 @@ fn get_inputs(
         // no message can read it (`--stream`, DSV).
         let last = raw_inputs.len().saturating_sub(1);
         LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
+        LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
         let mut lazy_inputs = false;
         let counts_files = !args.stream && args.input_dsv.is_none();
         let mut next_file = StreamOrigin::ALONE.file;
@@ -9255,7 +9256,7 @@ fn lazy_json_producer(lazy: LazyJsonInputs, exhausted: Option<(u32, u32)>) -> jq
     })
 }
 
-/// `--stream-errors` inputs read as the program asks for them (#5498): jq's streaming parser over
+/// `--stream` and `--stream-errors` inputs read as the program asks for them (#5498): jq's streaming parser over
 /// the sources' bytes, and what its source indices mean.
 struct LazyStreamInputs {
     reader: crate::jq_stream_errors::Reader<Vec<(Option<usize>, Vec<u8>)>>,
@@ -9271,7 +9272,7 @@ struct LazyStreamInputs {
 /// The producer the `input` queue pulls a [`LazyStreamInputs`] stream's inputs from: each read
 /// feeds the parser the refills it takes to complete one more input, and the read after the
 /// last settles the end of the stream where jq's reader stood (#5498).
-fn stream_errors_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
+fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
     let LazyStreamInputs {
         mut reader,
         files,
@@ -9291,10 +9292,11 @@ fn stream_errors_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
                     u32::try_from(line).unwrap_or(u32::MAX),
                 )
             };
-            if raise_errors && input.error {
-                jq::ProducedInput::Error(EvalError::new(input.message()), (tag, line))
-            } else {
-                jq::ProducedInput::Document(input.value, tag, line)
+            match input.error {
+                Some(message) if raise_errors => {
+                    jq::ProducedInput::Error(EvalError::new(message), (tag, line))
+                }
+                _ => jq::ProducedInput::Document(input.value, tag, line),
             }
         }
         None => jq::ProducedInput::End(
