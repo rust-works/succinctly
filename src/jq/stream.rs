@@ -1270,6 +1270,46 @@ fn stream_yaml_key_value<W: core::fmt::Write>(
     }
 }
 
+/// [`stream_yaml_key_value`] for a key read straight from its node, which a `keys` result
+/// writes as that node (#5469): an alias key is `*name`, and any other key takes its own
+/// `&anchor` and explicit tag first (`&k !!str key`), with yq's `!!merge` on a plain `<<`. A
+/// tagged plain key keeps its plain text (`!!str 1`), which the tag already types. A JSON
+/// cursor has none of these (its `"<<"` is an ordinary string), so it reaches the plain writer.
+fn stream_yaml_key_node<W: core::fmt::Write, C: DocumentCursor>(
+    out: &mut W,
+    key: &OwnedValue,
+    cursor: &C,
+) -> core::fmt::Result {
+    if let Some(name) = cursor.alias() {
+        out.write_char('*')?;
+        return out.write_str(name);
+    }
+    if let Some(anchor) = cursor.anchor() {
+        out.write_char('&')?;
+        out.write_str(anchor)?;
+        out.write_char(' ')?;
+    }
+    let style = cursor.style();
+    let plain_string = match key {
+        OwnedValue::String(s) if style.is_empty() => Some(s),
+        _ => None,
+    };
+    match cursor.explicit_tag_of_non_alias() {
+        Some(tag) => {
+            out.write_str(tag)?;
+            out.write_char(' ')?;
+            if let Some(s) = plain_string {
+                return out.write_str(s);
+            }
+        }
+        None if !cursor.canonicalize_numbers() && plain_string.is_some_and(|s| &**s == "<<") => {
+            return out.write_str("!!merge <<");
+        }
+        None => {}
+    }
+    stream_yaml_key_value(out, key, style)
+}
+
 /// Stream a `DocumentFields`' keys (`keys_unsorted`) as YAML without an
 /// intermediate `Vec<String>`/`OwnedValue::Array` (#685).
 ///
@@ -1317,7 +1357,7 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
             if i > 0 {
                 out.write_str(", ")?;
             }
-            stream_yaml_key_value(out, &key, cursor.style())?;
+            stream_yaml_key_node(out, &key, &cursor)?;
         }
         // #1956: `ended_unpaired()` alone missed a malformed `,`/`:` delimiter
         // -- `is_malformed()` checks both #1194 faults this walk can find.
@@ -1343,7 +1383,7 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
                 out.write_char('\n')?;
             }
             out.write_str("- ")?;
-            stream_yaml_key_value(out, &key, cursor.style())?;
+            stream_yaml_key_node(out, &key, &cursor)?;
         }
         // #1956: `ended_unpaired()` alone missed a malformed `,`/`:` delimiter
         // -- `is_malformed()` checks both #1194 faults this walk can find.
@@ -1358,6 +1398,35 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
 mod tests {
     use super::*;
     use indexmap::IndexMap;
+
+    #[test]
+    fn stream_lazy_keys_yaml_writes_each_key_as_its_node_5469() {
+        use crate::jq::document::DocumentValue;
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"b: &a xy\n&k !!str key: 1\n!foo bar: 2\n!!str 1: 4\n*a : 5\nplain: 6\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let value = index.root(yaml).first_child().unwrap().value();
+        let fields = value.as_object().unwrap();
+        // Captured from yq v4.53.3: `keys | . style="flow"`, and `keys`. A `<<` key is pinned
+        // through the CLI (`tests/yq_cli/i5469d.rs`): this crate-level read expands a merge.
+        for (indent, expected) in [
+            (
+                IndentSpec::COMPACT,
+                "[b, &k !!str key, !foo bar, !!str 1, *a, plain]",
+            ),
+            (
+                IndentSpec::spaces(2),
+                "- b\n- &k !!str key\n- !foo bar\n- !!str 1\n- *a\n- plain",
+            ),
+        ] {
+            let mut out = String::new();
+            let mut error = None;
+            stream_lazy_keys_yaml(&fields, false, &mut out, indent, &mut error).unwrap();
+            assert!(error.is_none(), "{error:?}");
+            assert_eq!(out, expected);
+        }
+    }
 
     #[test]
     fn stream_lazy_keys_yaml_preserves_quotes_in_flow_and_block_3615() {

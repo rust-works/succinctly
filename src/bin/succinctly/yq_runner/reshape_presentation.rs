@@ -8,7 +8,9 @@ use super::{
     collect_write_targets, is_closed_literal, reconcile_presentation, CommentTree, Expr, IndexMap,
     NodeMeta, NumberRepr, OwnedValue, ResultWithComments,
 };
-use succinctly::jq::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
+use succinctly::jq::document::{
+    DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields, DocumentValue,
+};
 use succinctly::jq::eval_generic::{to_owned_with_comments, AnchorMark, KeyMeta, LazyElem};
 use succinctly::jq::YqSemantics;
 use succinctly::jq::{ArithOp, Builtin, EvalError, ObjectKey, MAX_VALUE_TREE_DEPTH};
@@ -247,6 +249,28 @@ fn node_pair_as<C: DocumentCursor>(
         }
     }
     Ok((value, tree))
+}
+
+/// The presentation of a `keys` result (#5469): one leaf per key, each the key node's own, so
+/// `&k key`, `!!str t`, a quoted `"1"` and an alias key `*a` print as yq prints them. A plain
+/// `<<` takes the `!!merge` tag yq gives a merge key. `None` if a key fails to convert; the
+/// caller then prints the keys bare, as it did before.
+pub(super) fn key_nodes<F: DocumentFields>(fields: &F, collapse: bool) -> Option<CommentTree> {
+    let mut trees = Vec::new();
+    for (key, cursor) in DistinctKeyCursors::new(fields, collapse) {
+        let (_, tree) = node_pair_as(&cursor, false).ok()?;
+        let merge = tree.meta().tag().is_none()
+            && !cursor.canonicalize_numbers()
+            && cursor.style().is_empty()
+            && cursor.alias().is_none()
+            && key.as_str().is_some_and(|k| k == "<<");
+        trees.push(if merge {
+            CommentTree::Leaf(tree.meta().with_tag(Some("!!merge".to_string())))
+        } else {
+            tree
+        });
+    }
+    Some(CommentTree::Array(NodeMeta::empty(), trees))
 }
 
 /// The sequence a `LazySeq` stands for, each element with the presentation of the node it still
