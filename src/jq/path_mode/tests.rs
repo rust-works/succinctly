@@ -493,14 +493,84 @@ fn the_prelude_parses_one_definition_at_a_time_5223() {
             chain = rest;
         }
         assert_eq!(chain, Expr::Identity);
-        assert_eq!(prelude.defs, defs);
+        let parsed: Vec<&Expr> = prelude.defs.iter().map(PreludeDef::expr).collect();
+        assert_eq!(parsed.len(), defs.len());
+        for (parsed, expected) in parsed.into_iter().zip(&defs) {
+            assert_eq!(parsed, expected);
+        }
     });
     std::thread::Builder::new()
         .stack_size(2 << 20)
-        .spawn(|| drop(Prelude::new()))
+        .spawn(|| {
+            let prelude = Prelude::new();
+            for def in &prelude.defs {
+                def.expr();
+            }
+        })
         .expect("spawn")
         .join()
         .expect("the prelude parses on a 2 MiB thread");
+}
+
+/// A definition's name and arity are read off its source text, so a call finds
+/// it without parsing it (#5858): they are the parsed `FuncDef`'s, and no
+/// (name, arity) is defined twice, which is what lets a body see the whole
+/// prelude where it used to see only the definitions before it.
+#[test]
+fn a_prelude_definitions_header_is_its_funcdefs_and_is_unique_5858() {
+    on_big_stack(|| {
+        let prelude = Prelude::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for def in &prelude.defs {
+            let Expr::FuncDef { name, params, .. } = def.expr() else {
+                panic!("{}: not a FuncDef", def.source);
+            };
+            assert_eq!((def.name, def.arity), (name.as_str(), params.len()));
+            assert!(seen.insert((def.name, def.arity)), "{} twice", def.name);
+            // Only a `_sp_` name can bind to a prelude definition, and one that
+            // an earlier body calls must be defined before it, as the nested
+            // `Frame::Def` chain it replaced required.
+            assert!(def.name.starts_with("_sp_"), "{}", def.name);
+        }
+        for (at, def) in prelude.defs.iter().enumerate() {
+            any_subexpr(def.expr(), &mut |e| {
+                if let Expr::FuncCall { name, args, .. } = e {
+                    if let Some(&callee) = prelude.index.get(&(name.as_str(), args.len())) {
+                        assert!(callee <= at, "{} calls {name}, defined after it", def.name);
+                    }
+                }
+                false
+            });
+        }
+        assert!(prelude.defs.len() > 100, "{}", prelude.defs.len());
+    });
+}
+
+/// A new prelude parses no definition, and a program parses only the ones it
+/// reaches (#5858): the cost a library caller without `std` paid per `eval`.
+#[test]
+fn a_prelude_definition_is_parsed_on_its_first_call_5858() {
+    on_big_stack(|| {
+        let parsed = |prelude: &Prelude| {
+            prelude
+                .defs
+                .iter()
+                .filter(|def| def.parsed.get().is_some())
+                .count()
+        };
+        let prelude = Prelude::new();
+        assert_eq!(parsed(&prelude), 0);
+        let program = parse("path(limit(2; .[]))").expect("parses");
+        let run = Interp::new(&prelude).run(&program, parse_doc("[1,2,3]"));
+        assert!(matches!(run.outcome, Outcome::Done));
+        assert_eq!(run.outputs.len(), 2);
+        let after = parsed(&prelude);
+        assert!(
+            (1..prelude.defs.len()).contains(&after),
+            "{after} of {}",
+            prelude.defs.len()
+        );
+    });
 }
 
 /// Every jq-defined builtin [`prelude_call`] maps resolves to a definition of
