@@ -2310,7 +2310,7 @@ The AVX-512 JSON parser implementation has been **removed** from the codebase
 because it was consistently **7-17% slower** than AVX2 across all workloads.
 ```
 
-Key quote from `CLAUDE.md`:
+Key quote from [optimizations/lessons.md](../optimizations/lessons.md#key-insights):
 > "Wider SIMD != automatically faster (AVX-512 JSON was 10% slower than AVX2)"
 
 **2. Memory-Bound Workload**

@@ -713,4 +713,4 @@ not deliver. §4 exists so this one is judged the same way.
 - [docs/architecture/bitvec.md](../architecture/bitvec.md) — current rank/select
 - [docs/architecture/balanced-parens.md](../architecture/balanced-parens.md)
 - [docs/adrs/adr-0011.md](../adrs/adr-0011.md) — why rank/select is built in-crate
-- P11 in CLAUDE.md — the BP select1 work this builds on (#26)
+- P11 in [docs/optimizations/lessons.md](../optimizations/lessons.md#yaml-optimization-log) — the BP select1 work this builds on (#26)

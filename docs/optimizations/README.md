@@ -239,5 +239,6 @@ When adding new optimization documentation:
 ## See Also
 
 - [history.md](history.md) - Complete record of all optimizations attempted (successes and failures with exact measurements)
+- [lessons.md](lessons.md) - Key insights, the YAML optimization log (P2.5 to O8) and the UTF-8 validation experiments (#134)
 - [end-positions.md](end-positions.md) - Detailed case study of three EndPositions designs (Vec, 3-bitmap, 2-bitmap)
 - [../../.claude/skills/](../../.claude/skills/) - Claude Code skill files for specific topics

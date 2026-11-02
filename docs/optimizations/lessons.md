@@ -1,0 +1,268 @@
+# Optimization Lessons and Log
+
+[Home](../../) > [Docs](../) > [Optimizations](./) > Lessons and Log
+
+The lessons and the accepted/rejected optimization log that used to live in the root `CLAUDE.md`,
+moved here verbatim by #5846 so that every agent session stops paying for them. Each log entry links
+to its full write-up. [history.md](history.md) is the older record of the bit-level and JSON work;
+[ADRs](../adrs/README.md) are the canonical record of the decisions behind them.
+
+## Key insights
+
+See [README.md](README.md) for the technique pages these come from.
+
+- Wider SIMD != automatically faster (AVX-512 JSON was 10% slower than AVX2)
+- Algorithmic improvements beat micro-optimizations (cumulative index: 627x speedup; YAML streaming: 2.3x speedup)
+- Simpler data structures often outperform complex ones due to cache behaviour
+- Caching hot values eliminates repeated lookups (type checking: 1-17% improvement)
+- Hardware prefetchers beat software prefetch for sequential access (prefetch: +30% regression!)
+- SIMD newline scanning + indentation checking enables fast block boundary detection (block scalars: 19-25% improvement!)
+- Micro-benchmark wins ≠ real-world improvements (threshold tuning: +8-15% regression despite micro-bench suggesting improvement)
+- Eliminating phases beats optimizing them (YAML streaming: removed DOM conversion entirely for 2.3x gain)
+- Derive, don't store, what the text already encodes (seq_items bitvector elimination: −12.5% build peak memory)
+- Duplicated predicates diverge silently — one definition, plus a test that the call sites agree (#106: three copies of one predicate, one of them quadratic)
+- Check where data physically lives before proposing to tag it (#106: the proposal assumed a `Vec<u32>`; no real file has one)
+- Re-derive a break-even before trusting it (#106: the issue's stated 12.5% dropped a bits-to-bytes conversion; the real gate was 3.125%)
+- A hash table is not automatically cheaper than a sort — above L3 a sort streams and a table does not, and which wins is architecture-dependent (#1514: the same table beat the sort on an M4 Pro and lost 24% to it on a 7950X at 7.1M keys)
+- To attribute a cost, build the binary again with the feature *disabled* and measure that — timings alone cannot separate what a check costs from what the code around it costs (#1514: it proved #1385's cost was 100% its probe, and caught a larger regression introduced by the fix)
+- Instruction counts and wall-clock can disagree in sign, and differently per architecture: #2878's SIMD string scan read +2.2% Ir on x86_64 and -8.2% on ARM64 in the perf guard, and timed -6.5% on a 7950X and +10.7% on an M4 Pro. A guard row moving is a prompt to time it, in either direction; a per-item NEON path is decided by its load-to-branch latency (movemask emulation, vector-to-GPR transfer), which a short scalar loop beats below ~8 bytes (#2963)
+- A build profile is part of the measurement *and* of the shipped binary: at cargo's default 16 codegen units the same commit pair read -14% on x86_64 for a diff that could not reach the queries, and thin LTO left that class in place; `[profile.release]` pins one codegen unit plus fat LTO for it (#2603, closing the class #595/#1587/#2655 kept filing). Release builds compile ~3x slower; the debug loop is untouched. The one row that profile made slower (x86 identity, 4-6%) was a re-pricing of work the identity writer should never have done — a 144-byte record per object field, 22.9 MB for a 2 MB input, half of the print's instructions — and removing that work beat the old profile outright: `wide` identity −29% on a 7950X, `users` −15% (#2720)
+- A comment-only edit is not a layout holdout: rustc emits a byte-identical binary, so it measures the noise floor twice. The layout band a real change moves unrelated rows by needs a code change the timed queries cannot reach; on a 7950X that band reached −17% on 5 ms rows whose `Ir` was identical to within 500 instructions (#2720)
+- The pinned profile fixes partitioning, not placement: moving the JSON index builder's per-byte jump-table loop by 16-48 bytes swings the 7950X's `users keys_unsorted` by up to 15% (min) with `Ir` identical per function (#3100). The test that settles it is inert padding in the *base*: if padding alone reproduces an `Ir`-flat x86 delta, the delta is layout. No LLVM alignment flag closed the band cheaply (`docs/guides/benchmarking.md` § 9)
+- A single figure can't describe two rows whose reachable code differs 3.4x in instructions executed: #2608's canonical-compact echo was closed on an A/B reading "+7% on both the canonical document and the late-fail twin" (586M vs 1,985M Ir) — a delta that reads the same whether the fast path fires or bails is measuring something other than the path (layout, a binary not taking the path, a corpus that isn't the shape). Re-measured with a `black_box(false)` holdout and a control copy, gate-on vs gate-off in the same build of PR #2919 as reviewed: −69%/+9% wall on an M4 Pro, −72%/+3% wall and −66.6%/+13% Ir on a 7950X (the shipped gate vs `main`, after the gate itself was made cheaper, is the table in `docs/parsing/json.md`: −68%/+7.7% on the 7950X, −72%/+8.8% on the M4 Pro)
+- The echo is free and the decision is the cost (#2608): ~33 Ir/byte to decide whether a compact jq render can skip re-rendering, 0.02 to copy the span once it may — and a −4.8% Ir SIMD win on that decision (a jq-table escape scanner plus #2963's word probe) lost 3-9% wall-clock on both boxes, on strings 4-12 bytes wide, below the width where a NEON/AVX compare→movemask→GPR round trip beats a short scalar loop (#2963's per-item lesson again). #3168 re-measured it with a holdout and a string-length sweep: the scanner's cost is paid per string and per escape segment, so it wins on long strings (-17% to -24% at 64 bytes, both boxes) and loses on escape-dense text and short keys (M4 Pro +17%/+12%, 7950X about +5%/+3% net of the holdout); no scalar prefix removed that on both boxes, so it did not ship as a per-string scan. #3340 then took the entry out by classifying 64-byte blocks of specials once (`util/simd/specials.rs`), lazily so a numbers-only document and a small sub-value are not charged: −13% to −31% wall on 0-3-byte, 16/64-byte, `strings` and `unicode` rows and −2% to −11% on records, none worse than its never-calling holdout on either box except a flat object of 2-8-byte keys at about +1% on the M4 Pro (`docs/parsing/json.md`)
+
+## YAML optimization log
+
+The P-series and O-series YAML parser and query optimizations, newest last.
+
+- ✅ P2.5 (Cached Type Checking): 1-17% improvement depending on nesting depth
+  - See [docs/parsing/yaml.md#p25-cached-type-checking---implemented-](../parsing/yaml.md#p25-cached-type-checking---implemented-) for details
+  - Best for deeply nested YAML (Kubernetes configs, CI/CD files)
+- ❌ P2.6 (Software Prefetching): **REJECTED** - 30% regression on large files
+  - Modern CPU hardware prefetchers are superior for sequential parsing
+  - Software prefetch causes cache pollution and interferes with hardware
+  - See [docs/parsing/yaml.md#p26-software-prefetching-for-large-files---rejected-](../parsing/yaml.md#p26-software-prefetching-for-large-files---rejected-) for analysis
+- ✅ P2.7 (Block Scalar SIMD): **19-25% improvement** on block scalar parsing - **largest Phase 2 optimization!**
+  - AVX2 scans 32-byte chunks for newlines, checks indentation using SIMD
+  - 100x100 lines: 247 µs → 195 µs (-21%, 1.27x faster)
+  - Throughput: 1.39 GiB/s → 1.76 GiB/s (+27%)
+  - See [docs/parsing/yaml.md#p27-block-scalar-simd---accepted-](../parsing/yaml.md#p27-block-scalar-simd---accepted-) for full analysis
+- ❌ P2.8 (SIMD Threshold Tuning): **REJECTED** - 8-15% regression on quoted strings
+  - Micro-benchmarks suggested SIMD threshold tuning would help (showed 2-4% gain)
+  - End-to-end tests showed severe regressions instead
+  - Modern CPUs (branch prediction, inlining) make threshold tuning counterproductive
+  - See [docs/parsing/yaml.md#p28-simd-threshold-tuning---rejected-](../parsing/yaml.md#p28-simd-threshold-tuning---rejected-) for full analysis
+- ❌ P3 (Branchless Character Classification): **REJECTED** - 25-44% regression on simple parsing
+  - Replaced `matches!` macros with lookup tables to eliminate branches
+  - Micro-benchmarks showed 3-29% improvement for character classification
+  - End-to-end tests showed catastrophic 25-44% regressions
+  - Modern branch predictors (93-95% accuracy) beat lookup tables
+  - `.map_or()` overhead and cache pollution from 256-byte tables dominated any benefit
+  - Third consecutive optimization where micro-benchmarks mislead (P2.6, P2.8, P3 all failed)
+  - See [docs/parsing/yaml.md#p3-branchless-character-classification---rejected-](../parsing/yaml.md#p3-branchless-character-classification---rejected-) for full analysis
+- ✅ P4 (Anchor/Alias SIMD): **6-17% improvement** on anchor-heavy workloads
+  - AVX2 SIMD scans for anchor name terminators in 32-byte chunks
+  - anchors/100: 13.60µs → 11.65µs (-14.6%, 1.17x faster)
+  - anchors/1000: 155.5µs → 139.2µs (-10.1%, 1.11x faster)
+  - k8s_100: 33.92µs → 31.40µs (-7.4%, 1.08x faster)
+  - Micro-benchmarks confirmed: 9-12x faster for 32-64 byte anchor names
+  - **First successful optimization since P2.7** - proves SIMD string searching wins when targeting real bottlenecks
+  - Best for: Kubernetes manifests, CI/CD configs with many anchors/aliases
+  - See [docs/parsing/yaml.md#p4-anchoralias-simd---accepted-](../parsing/yaml.md#p4-anchoralias-simd---accepted-) for full analysis
+- ❌ P5 (Flow Collection Fast Path): **REJECTED** - aborted at analysis stage before implementation
+  - Micro-benchmarks showed 8-14x SIMD wins for 64-128 byte flow collections
+  - Real YAML flow collections are typically 10-30 bytes (too small for SIMD to win)
+  - SIMD only wins at 32+ bytes, but 90% of real flow collections are < 30 bytes
+  - **Lessons from P2.6/P2.8/P3 applied** - rejected during analysis to avoid predicted regression
+  - Key insight: Micro-benchmark wins only translate when optimizing inputs that exist in real workloads
+  - See [docs/parsing/yaml.md#p5-flow-collection-fast-path---rejected-](../parsing/yaml.md#p5-flow-collection-fast-path---rejected-) for full analysis
+- ❌ P6 (BMI2 Operations): **REJECTED** - YAML's grammar prevents DSV-style quote indexing
+  - **Primary reason**: YAML cannot use BMI2 like DSV does (grammar incompatibility)
+    - DSV: Quotes are context-free (`""` escape), can build global quote index in one pass using BMI2 `toggle64`
+    - YAML: Backslash escaping (`\"`) requires escape preprocessing BEFORE quote detection
+    - Circular dependency: Need escape mask to build quote mask, but escape handling is what we're optimizing
+    - Multi-pass approach (escape → quote → parse) slower than current early-exit SIMD
+  - **Wrong approach tested**: Micro-benchmarks tested per-string parsing (not index building)
+    - DSV BMI2 builds global document index (scans everything once)
+    - Tested YAML per-string parsing (early-exit SIMD wins on short strings)
+    - Apples-to-oranges comparison revealed fundamental grammar difference
+  - **Key insight**: BMI2 quote indexing only works when escaping is context-free (CSV's `""`, not YAML's `\"`)
+  - **Additional context-sensitivity**: YAML has two quote types (`"` vs `'`), block scalars (`|` `>`), and context-dependent quote meaning
+  - See [docs/parsing/yaml.md#p6-bmi2-operations-pdeppext---rejected-](../parsing/yaml.md#p6-bmi2-operations-pdeppext---rejected-) for full analysis
+- ❌ P7 (Newline Index): **REJECTED** - use case mismatch (CLI feature, not parsing optimization)
+  - ⚠️ **Premise corrected by #228**: JSON had *two* newline structures and P7 found only one.
+    `JsonIndex::newlines` **was** built eagerly in every `JsonIndex::build` — an O(n) scan and ~15.9%
+    of the input on every jq query. P7's conclusion held; JSON was violating it. Both are now
+    `text::LineIndex`, built lazily (ADR-0012).
+  - **Discovery** (as believed at the time): JSON's `NewlineIndex` is NOT built during parsing
+    - Only used in `jq-locate` CLI tool for `--line X --column Y` → byte offset conversion
+    - Never built during JSON parsing, jq queries, or benchmarks
+    - Zero performance impact on actual JSON processing
+  - **YAML's current approach**: Lazy O(n) `current_line()` only on error paths
+    - 4 call sites, all in error reporting (TabIndentation, UnexpectedToken, etc.)
+    - Comment: "Only called on error paths, so we pay the cost only when needed"
+    - Benchmarks use valid YAML (no errors, so `current_line()` never called)
+  - **Two possible interpretations**:
+    - Option A (CLI feature): Add `yq-locate` tool with on-demand NewlineIndex (no benchmark impact)
+    - Option B (misguided): Build index during parsing (O(n) overhead with zero benefit for valid YAML)
+  - **Why Option B would fail**: Adds build cost to hot path (parsing) to optimize cold path (errors/CLI)
+  - **Pattern recognition**: Not all JSON features are optimizations - NewlineIndex is CLI UX, not performance
+  - See [docs/parsing/yaml.md#p7-newline-index---rejected-](../parsing/yaml.md#p7-newline-index---rejected-) for full analysis
+- ❌ P8 (AVX-512 Variants): **REJECTED** - benchmark design flaw + JSON precedent (7% slower at realistic sizes)
+  - **Primary reason**: Memory-bound workload doesn't benefit from wider SIMD
+    - JSON AVX-512 was **7-17% slower** than AVX2 and removed from codebase
+    - YAML is similarly memory-bound (sequential text parsing)
+    - Memory bandwidth bottleneck prevents wider vectors from helping
+  - **Micro-benchmark design flaw**:
+    - Measured loop iterations instead of work performed
+    - AVX2: 8 iterations for 256B (32B chunks)
+    - AVX-512: 4 iterations for 256B (64B chunks)
+    - "2x speedup" was artificial - half the iterations, not twice the efficiency
+  - **Realistic size results** (AMD Ryzen 9 7950X):
+    - 64B: **7% slower** (18.59ns vs 17.34ns) - memory bandwidth bottleneck
+    - 128B: **Neutral** (18.94ns vs 18.95ns) - break-even point
+    - 256B+: "Wins" misleading (fewer iterations, not faster per-byte)
+  - **Zen 4 limitation**: Splits 512-bit ops into two 256-bit paths (overhead without benefit)
+  - **Pattern recognition**: P5/P6/P7/P8 all rejected for mismatch (size/grammar/use case/benchmark)
+  - **Key lesson**: Wider SIMD ≠ faster for memory-bound workloads (AVX2 already saturates RAM bandwidth)
+  - See [docs/parsing/yaml.md#p8-avx-512-variants---rejected-](../parsing/yaml.md#p8-avx-512-variants---rejected-) for full analysis
+- ✅ P9 (Direct YAML-to-JSON Streaming): **2.3x improvement** on `yq` identity queries - **largest Phase 2 optimization!**
+  - Eliminated intermediate OwnedValue DOM by streaming directly from YAML cursor to JSON
+  - 10KB: 257µs → 108µs (38.1 → 90.5 MiB/s, **+137%**)
+  - 100KB: 1.93ms → 828µs (47.7 → 111.1 MiB/s, **+133%**)
+  - Single-pass YAML→JSON escape transcoding without intermediate string allocation
+  - **Bottleneck shift**: Parsing now 40% of time (was 15%), DOM conversion eliminated
+  - Best for: `yq '.'` identity queries, format conversion, streaming output
+  - See [docs/parsing/yaml.md#p9-direct-yaml-to-json-streaming---accepted-](../parsing/yaml.md#p9-direct-yaml-to-json-streaming---accepted-) for full analysis
+- ✅ P10 (Type Preservation): **Full yq compatibility** (correctness fix)
+  - Fixed quoted string type preservation: `"1.0"` stays as string, not converted to number `1`
+  - Added early-exit for quoted strings, skipping expensive `parse::<i64>()` and `parse::<f64>()` calls
+  - Current performance: 10KB: 1.63ms, 100KB: 2.78ms, 1MB: 13.2ms (with correct output)
+  - Byte-for-byte output verified against pinned-`yq` golden fixtures (`tests/yq_golden_tests.rs`, captured from mikefarah/yq via `scripts/sync-yq-golden.sh`) that run hermetically on every CI leg, plus a `yq-drift` CI job that re-checks the goldens against the pinned `yq` — see #227
+  - **Key achievement**: `succinctly yq` is now a drop-in replacement for `yq` for supported arguments
+  - See [docs/parsing/yaml.md#p10-type-preservation-for-yq-compatibility---accepted-](../parsing/yaml.md#p10-type-preservation-for-yq-compatibility---accepted-) for full analysis
+- ✅ P11 (BP Select1 for yq-locate): **2.5-5.9x faster** select1 queries, fixes issue #26
+  - Added zero-cost generic `SelectSupport` trait to `BalancedParens<W, S>` (NoSelect for JSON, WithSelect for YAML)
+  - `find_bp_at_text_pos()` now uses O(1) sampled select1 instead of O(log n) binary search on rank1
+  - **Micro-benchmark speedups** (10K queries):
+    - 1K opens: 326µs vs 820µs (**2.5x** faster)
+    - 10K opens: 318µs vs 1.31ms (**4.1x** faster)
+    - 100K opens: 308µs vs 1.68ms (**5.4x** faster)
+    - 1M opens: 356µs vs 2.10ms (**5.9x** faster)
+  - **End-to-end yq benchmarks**: 1MB identity query 3.1% faster (14.45ms → 14.00ms)
+  - **Trade-off**: 2-4% regression in yaml_bench (SelectIndex build cost) but benefits `yq-locate` use case
+  - **Zero-cost for JSON**: Uses `NoSelect` (ZST) - no memory or runtime overhead
+  - **Fixes GitHub issue #26**: YAML `at_offset` and `yq-locate` now return correct nodes
+  - See [docs/parsing/yaml.md#p11-bp-select1-for-yq-locate---accepted-](../parsing/yaml.md#p11-bp-select1-for-yq-locate---accepted-) for full analysis
+- ✅ P12 (Advance Index for bp_to_text): **20-25% faster** yq identity queries on 1MB files, fixes issue #62
+  - Replaced `Vec<u32>` with memory-efficient `BpToTextPositions` enum (IB + Advance bitmaps)
+  - **~1.5× memory compression** for bp_to_text structure (measured with 33% duplicates)
+  - **Automatic fallback** to `Vec<u32>` for non-monotonic positions (explicit keys)
+  - **End-to-end yq benchmarks**:
+    - users/1mb: **-24.6%** time (+32.7% throughput)
+    - sequences/1mb: **-24.8%** time (+33.0% throughput)
+    - nested/1mb: **-21.5%** time (+27.4% throughput)
+  - **yaml_bench improvements**: sequences/1000 -5.0%, large/1mb -3.2%, block_scalars -3.5%
+  - **Minor regression**: ~1.5-2% on tiny (10-element) quoted string benchmarks
+  - Better cache locality from compact bitmap representation
+  - See [docs/parsing/yaml.md#p12-advance-index-for-memory-efficient-bp_to_text---accepted-](../parsing/yaml.md#p12-advance-index-for-memory-efficient-bp_to_text---accepted-) for full analysis
+- ✅ P12-A (Build Regression Mitigation): **11-85% faster** `yaml_bench` build times, fixes issue #72
+  - A1: Inline zero-filling in `EndPositions::build()` — eliminates temp `Vec<u32>` allocation
+  - A2: Combined monotonicity check — merged into `try_build()`, eliminates separate O(N) scan
+  - A4: Lazy newline index via `OnceCell` — removes O(N) text scan from `build()`
+  - Largest gains on newline-heavy content (long strings: -44% to -85%, block scalars: -42% to -57%)
+  - Broad improvements across all categories (simple_kv: -11% to -22%, nested: -15% to -24%)
+  - A3 from issue #72 remains as future opportunity
+  - See [docs/parsing/yaml.md#p12-a-build-regression-mitigation-a1--a2--a4---accepted-](../parsing/yaml.md#p12-a-build-regression-mitigation-a1--a2--a4---accepted-) for full analysis
+- ✅ O1 (Sequential Cursor for AdvancePositions): **3-13% faster** yq queries on small-medium files, issue #74
+  - Applied `Cell<SequentialCursor>` pattern from `CompactEndPositions` to `AdvancePositions`
+  - Three-path dispatch: sequential (amortized O(1)), forward-gap (linear advance), random (full recomputation)
+  - Duplicate-detection cache: `last_ib_arg`/`last_ib_result` for O(1) return on shared positions (~33% of nodes)
+  - **End-to-end yq benchmarks** (users/ workload):
+    - 1KB: **-9 to -13%** time (strongest improvement)
+    - 10KB: **-8%** time
+    - 100KB: **-3%** time
+    - 1MB: neutral (get() is smaller fraction of total streaming time)
+  - **Neutral on strings/ and nested/** — unique positions reduce duplicate-cache hit rate
+  - Best for: small-medium YAML with container-heavy structure (Kubernetes manifests, CI/CD configs)
+  - See [docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions--accepted-](../parsing/yaml.md#o1-sequential-cursor-for-advancepositions--accepted-) for full analysis
+- ✅ O2 (Gap-Skipping via advance_rank1): **2-6% faster** yq queries on nested/users at small-medium sizes, issue #74
+  - Replaced O(G) linear loop in `advance_cursor_to()` with O(1) `advance_rank1(target)` call
+  - Applied to both `CompactEndPositions` and `AdvancePositions` cursor forward-gap paths
+  - Reuses existing cumulative rank array — zero additional memory overhead
+  - **End-to-end yq benchmarks** (against O1 baseline):
+    - nested/1kb: **-6.1%**, users/10kb: **-6.0%**, strings/100kb: **-5.5%**
+    - Most workloads show noisy but directionally positive results
+  - **yaml_bench**: No regression (query-path only optimization)
+  - Results are noisy because the forward-gap path is infrequently hit during typical streaming
+  - See [docs/parsing/yaml.md#o2-gap-skipping-via-advance_rank1--accepted-](../parsing/yaml.md#o2-gap-skipping-via-advance_rank1--accepted-) for full analysis
+- ✅ O3 (SIMD Escape Scanning): **4-12x faster** micro-benchmark escape scanning on ARM64 NEON, issue #87
+  - Added `find_json_escape_neon()` using NEON SIMD to scan for JSON escape characters (`"`, `\`, `< 0x20`)
+  - Processes 16 bytes per iteration vs 1 byte scalar
+  - **Micro-benchmark speedups** (Apple M1 Max, no-escape strings):
+    - 16B: **4.1x** faster, 64B: **6.3x** faster, 256B: **11.8x** faster, 1024B: **12x** faster
+  - **Realistic patterns** (escape every ~20 chars): 1.3-2.5x speedup
+  - **End-to-end transcode**: 180-420 MiB/s throughput maintained
+  - **16-byte threshold + `#[inline(always)]`**: Both required to prevent regression (threshold alone still caused 3-5% regression)
+  - Best for: YAML with long string values (logs, templates, embedded content)
+  - See [docs/parsing/yaml.md#o3-simd-escape-scanning-for-json-output--accepted-](../parsing/yaml.md#o3-simd-escape-scanning-for-json-output--accepted-) for full analysis
+- ✅ O4 (seq_items Bitvector Elimination): **−12.5% build peak memory, 2-6% faster builds**, issues #75/#104/#106
+  - Removed the stored `seq_items` bitvector; seq-item wrappers are derived from text (`-` + whitespace/EOI)
+  - Branchless `matches!` derivation at both detection sites recovers the 7-15% query regression #106 found in the naive form
+  - **Measured** (Apple M5 Max, c090e7f6 vs 2a41c2f5): build peak 2.00× → 1.75× of input (−L/4 transient scratch), retained index −3-5% (19-41 KB/MB), all 44 yaml_bench benchmarks improved or neutral, yq query side neutral-or-better (worst +1.8% noise, best −10.7%)
+  - Outputs byte-identical pre↔post on all 80 yq A/B configurations
+  - Key insight: derive, don't store, what the text already encodes; transient build allocations can dwarf the retained structure (2-bit-per-byte scratch was 6-13× the stored bitvector)
+  - See [docs/parsing/yaml.md#o4-seq_items-bitvector-elimination--accepted-](../parsing/yaml.md#o4-seq_items-bitvector-elimination--accepted-) for full analysis
+- ✅ O5 (Lazy-Keys Cursor+Value Reuse): **-5.3% to -8.4%** on yq/jq queries that walk every key, issues #1599/#1606/#1609
+  - `each_lazy_keys_iterate_sink`'s streaming `keys_unsorted` arm (#1599) discarded each key's already-decoded value and let downstream re-derive it via a second `V::Cursor::value()` resolve — for YAML a full scalar decode, not a cheap re-read
+  - New `GenericItem::OneCursorValue(V::Cursor, V)` variant carries the value through instead; 3 edits in `src/jq/eval_generic.rs`, no changes to `document.rs`/`yaml/light.rs`/`json/light.rs`
+  - **Measured** (Apple M4 Pro, interleaved A/B, 100K/1M-key flat mappings): walks-all shape -5.3% to -8.4% (both yq and jq), early-exit shape unchanged (within noise) — #1599's -34% early-exit win fully preserved, batching-window idea #1609 floated was not needed
+  - `size_of::<GenericItem<V>>()` measured unchanged (176/192 bytes) — the new variant fit inside the enum's existing footprint, no boxing needed
+  - Key insight: a doc comment naming a redundancy (#1514) can be verified by reading the call graph, not just profiled; format-dependent magnitude (YAML full decode vs JSON single-byte dispatch) doesn't mean the underlying inefficiency isn't present in the cheaper format too
+  - See [docs/parsing/yaml.md#o5-lazy-keys-cursorvalue-reuse--accepted-](../parsing/yaml.md#o5-lazy-keys-cursorvalue-reuse--accepted-) for full analysis
+- ✅ O6 (`HAS_CR` Const-Generic Specialization): **recovers most of the #324 CRLF-correctness cost**, issue #340
+  - `build_semi_index` SIMD-scans once for `\r`, then parses with `Parser::<false>` (LF-only) or `Parser::<true>` (#324 parser verbatim)
+  - Interleaved `yaml_bench` vs `c5dab403`, excl. block scalars: **M4 Pro +4.0% → +0.7%**, **7950X +11.0% → +4.7%**; x86 block scalars 31-34% *faster* than pre-#324
+  - End-to-end `dev bench yq` (32 configs) recovers fully: **7950X +5.0% → +0.8%**, **M4 Pro +2.3% → −0.2%** median; CRLF documents +1.1%/+0.5% (unchanged); binary +52 KB (+0.9%)
+  - **The gate is one-directional**: `true` is always correct, and the whole-input precheck proves no `\r` arm is reachable under `false`. An un-gated site is a missed optimization, never a bug — so gating can be applied incrementally and measured
+  - **Cost the estimate missed**: long quoted scalars regress +7-12%. The parser bulk-skips them at ~15 GB/s, so a second pass over the input is large next to the parse. Reusing the position-finding `define_escape_scanner!` first made it **+42%**; an existence-only scan (OR the chunk compares, reduce once) was needed
+  - Key insight: a precheck that enables a fast path is charged to *every* input, including the ones it cannot help — measure it against the workload where the parser is already fastest, not the one it is slowest
+  - See [docs/parsing/yaml.md#buying-it-back-the-has_cr-specialization](../parsing/yaml.md#buying-it-back-the-has_cr-specialization) for full analysis
+- ✅ O7 (CS-Poppy Combined Sampling for BP Select): **4× smaller YAML select index**, mixed select1 speed by platform, issue #64
+  - Replaced `WithSelect`'s sampled `(word, cumulative)` pairs with `WithCsPoppy`: `u32` entry points into BP's own rank directory (`rank_l1`/`rank_l2`) instead of a parallel structure
+  - Step A (narrow `SelectIndex<u32>` for BP, `len <= u32::MAX` bits) + Step B (`WithCsPoppy`) together take the BP select index from 25% to 6.25% of the bitmap — a 4x reduction, measured via real `select_heap_size()`, not derived
+  - **select1 speed is platform-dependent**: neutral-to-faster on Zen 4 (7950X), 5-15% slower on Apple M4 Pro — both measured via full (non-`--quick`) `bp_select_micro` runs on pinned hardware. Accepted despite the ARM regression because `BalancedParens::select1` on YAML's BP is reached only once per `at_offset`/`at_position`/`yq-locate` call, never the `.foo.bar` navigation hot path
+  - `yaml_bench` build-side clean (< 2% on 38/39 groups, both platforms) except one x86-only `block_scalars` anomaly (12-28%, reproduced twice), investigated and attributed to binary code-layout rather than the new logic: the BP structure for that workload is a fixed 7 words regardless of document size, too small to mechanistically explain the delta, and the same workload is neutral on ARM — filed as #595
+  - Also surfaced a pre-existing, unrelated `yaml_bench` bug: the `anchors` group panics with `UnknownAnchor` on unmodified `main` too — filed as #594
+  - See [docs/plan/cspoppy.md](../plan/cspoppy.md#5a-results-2026-08-03) for full analysis
+- ✅ O8 (Skip Delimiter Checks YAML Cannot Fail): **-17% to -20% wall-clock on scalar-sequence queries, -9.5% to -10.6% on record `sort_by`** (M4 Pro and 7950X), issue #2640
+  - The issue asked whether fusing the walk's double position-resolve was worth it. **JSON: no** — the repeat is a cache hit worth at most ~2.9% of instructions on the worst shape, 0.1-0.5% on `sort`. **YAML: the checks are dead code that still cost** — `element_gap_ok`, `value_delimiter_ok` and the free `trailing_element_gap_ok` resolved a position or decoded a value before consulting a delimiter check YAML can never fail
+  - `DocumentCursor::HAS_DELIMITER_CHECKS` (default `true`, `false` for `YamlCursor`) lets the three helpers return early; for JSON the branch folds away at compile time
+  - **Measured** (interleaved A/B, 0 output differences; cachegrind on a 7950X): `[.sequences[]] | length` -29% instructions / -17% to -18% wall, `.sequences | length` -32% / -18% to -20%, `.users | sort_by(...)` -13.6% / -9.5% to -10.6%; every JSON row +0.000% instructions
+  - **A test of "no work was done" must be able to fail**: the first draft of the cache-state test ended its sequence on the element the cache was parked on, so removing the guard still passed; found by mutating the guard, fixed by ending on a different element
+  - Key insight: a doc comment saying a default "costs them nothing" is a claim about the *default*, not about the code that decides whether to call it — the wrapper resolved a position before reaching the free default. Check what runs *before* the cheap branch
+  - See [docs/parsing/yaml.md#o8-skip-the-delimiter-checks-yaml-cannot-fail--accepted-](../parsing/yaml.md#o8-skip-the-delimiter-checks-yaml-cannot-fail--accepted-) for full analysis
+
+## UTF-8 validation log
+
+- ⚠️ Broadword (SWAR) UTF-8 accept scan: opt-in only, **not the default** — issue #134
+  - Clears ASCII in 32- and 8-byte strides with plain 64-bit arithmetic, then validates each multi-byte sequence with independent range comparisons
+  - **Corrected finding**: the original "2.01x/2.14x geomean vs scalar" claim was measured before #133 (which gave `validate_utf8_scalar` its own 8-byte ASCII skip) merged into `main`. This branch was rebased onto that merge with no conflict, so it went unnoticed — the doc numbers kept citing the pre-#133 scalar baseline. Against the *current* scalar validator, broadword's geomean is a **net loss**: ~0.89x on a 7950X, ~0.93x on an M4 Pro (interleaved, 9 runs, 11 realistic `generate-suite` patterns, 10MB, current `main` tip)
+  - Wins clearly only on long/pure ASCII (~1.67x on 7950X, ~2.0x on M4 Pro); every other realistic pattern — source code, logs, JSON, accented text, CJK, emoji — is a wash-to-loss, some over 30% (e.g. source_code: 0.68-0.70x)
+  - `validate_utf8()` therefore dispatches to AVX2 where available and to `validate_utf8_scalar` everywhere else (reverted from broadword); `validate_utf8_broadword` remains available for callers who know their input is ASCII-dominant
+  - `validate_utf8_scalar` (from #133, not this issue) already beats `core::str::from_utf8` in geomean (~1.18-1.25x); broadword only adds a small further edge over std (~1.05-1.16x), far short of the originally claimed 2.01x/2.14x
+  - Key insight: a wide ASCII-skip probe only pays for itself when runs are genuinely long; on realistic mixed content, attempting it is frequent, mostly-wasted overhead
+  - See [docs/benchmarks/utf8-validate.md#engine-comparison-134](../benchmarks/utf8-validate.md#engine-comparison-134) for full analysis
+- ❌ Höhrmann DFA for the multi-byte step: **REJECTED** — lost to whole-sequence validation on 9 of 11 realistic patterns, issue #134
+  - Implemented as specified in #134 (9 states × 12 byte classes, packed-nibble transition table verified against Höhrmann's published `utf8d`), benchmarked head-to-head, and removed
+  - Worst at emoji and mixed. The specific "x scalar" multipliers from that run predate #133's scalar ASCII skip and are not repeated here — but the relative finding (whole-sequence beats DFA) is unaffected, since both sides of that comparison shared the same denominator in the same run
+  - **Cause is dependency structure, not table size**: a DFA carries `state -> step -> state` around its loop, retiring one byte per 2-3 cycle chain however compact the table; whole-sequence validation issues its range comparisons independently and retires 3-4 bytes per iteration
+  - Same effect already visible in the baseline: the scalar validator was *faster* on emoji than on ASCII (pre-#133) precisely because it consumed a whole sequence per iteration
+  - **Also**: #134's proposed 10-class byte table cannot work — lumping all of `0x80-0xBF` into one class makes a `(state, class)` table unable to distinguish `E0 80` (overlong) from `E0 A0` (valid), silently accepting overlong encodings and surrogates. 12 classes (split at `0x90`/`0xA0`) are the minimum.
+  - Key lesson: for a validator, prefer the formulation with the shortest loop-carried dependency, not the smallest table
+  - **Second lesson (from the broadword reversal above)**: a benchmark claim is only as fresh as its baseline — a clean, conflict-free rebase can silently improve the "control" side and flip a documented win into a loss with nothing to flag it
+- ❌ Redundant-load removal in `broadword.rs`'s ASCII skip: **REJECTED** — 3.6x regression, issue #134
+  - Hypothesis: the 32-byte block probe reloads its first 8 bytes a second time on failure (`load_word` re-reads what `load_block`'s first chunk already read), so probing narrow-first and widening only after the first word proves clean should save loads on short/isolated ASCII runs
+  - Measured instead: ASCII throughput on an M-series Mac dropped from ~65 GiB/s to ~18 GiB/s — reproducible, not noise. Splitting one 4-word OR-reduction into "one word, then conditionally three more" likely defeated whatever auto-vectorization/unrolling LLVM was doing with the original single loop; load-count intuition does not predict codegen
+  - Reverted immediately; needs real profiling (`perf`/disassembly), not another guess
