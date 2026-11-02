@@ -1,2 +1,0 @@
-category = "to-triage"
-reason = "Program `(10 | @base64d) | rindex((. | tonumber))`, found by the grammar fuzzer (seed 3). A string that starts with U+FFFD (bytes EF BF BD) given to `tonumber` or `fromjson`: jq 1.7.1 reports `Malformed BOM (while parsing '�')`, succinctly `Invalid numeric literal at EOF at line 1, column 3`. Both exit 5 with no output, so only the catchable message differs (`\"�\" | try tonumber catch .`)."
