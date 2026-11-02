@@ -11518,9 +11518,9 @@ mod tests {
     }
 
     /// The containers from `start` down the first child of each, outermost first.
-    fn nest_cursors_from<'a>(
-        start: JsonCursor<'a, alloc::vec::Vec<u64>>,
-    ) -> alloc::vec::Vec<JsonCursor<'a, alloc::vec::Vec<u64>>> {
+    fn nest_cursors_from(
+        start: JsonCursor<'_, alloc::vec::Vec<u64>>,
+    ) -> alloc::vec::Vec<JsonCursor<'_, alloc::vec::Vec<u64>>> {
         let mut out = alloc::vec::Vec::new();
         let mut cursor = Some(start);
         while let Some(c) = cursor {
