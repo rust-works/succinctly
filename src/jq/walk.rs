@@ -207,7 +207,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::FromUnix
         | Builtin::ToUnix => BuiltinKids::None,
 
-        // --- One sub-expression (59) ---------------------------------------
+        // --- One sub-expression (60) ---------------------------------------
         Builtin::Has(e)
         | Builtin::In(e)
         | Builtin::UpperIn(e)
@@ -267,6 +267,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::Splits(e)
         | Builtin::CombinationsN(e)
         | Builtin::Tz(e)
+        | Builtin::FormatDatetime(e)
         | Builtin::Load(e)
         | Builtin::AtOffset(e) => BuiltinKids::One(e),
         // `Option<Box<Expr>>`, not `Box<Expr>` -- #2855's `None` case (a
@@ -277,7 +278,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
             None => BuiltinKids::None,
         },
 
-        // --- Two sub-expressions (20) --------------------------------------
+        // --- Two sub-expressions (21) --------------------------------------
         Builtin::UpperInSrc(a, b)
         | Builtin::AnyCond(a, b)
         | Builtin::AllCond(a, b)
@@ -297,6 +298,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::SplitRegex(a, b)
         | Builtin::SplitsFlags(a, b)
         | Builtin::Skip(a, b)
+        | Builtin::WithDtf(a, b)
         | Builtin::AtPosition(a, b)
         | Builtin::Libm2(_, a, b) => BuiltinKids::Two(a, b),
 
@@ -523,7 +525,7 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         | Builtin::FromUnix
         | Builtin::ToUnix => builtin.clone(),
 
-        // --- One sub-expression (59) ---------------------------------------
+        // --- One sub-expression (60) ---------------------------------------
         Builtin::Has(e) => Builtin::Has(Box::new(f(e))),
         Builtin::In(e) => Builtin::In(Box::new(f(e))),
         Builtin::UpperIn(e) => Builtin::UpperIn(Box::new(f(e))),
@@ -590,10 +592,11 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         Builtin::Splits(e) => Builtin::Splits(Box::new(f(e))),
         Builtin::CombinationsN(e) => Builtin::CombinationsN(Box::new(f(e))),
         Builtin::Tz(e) => Builtin::Tz(Box::new(f(e))),
+        Builtin::FormatDatetime(e) => Builtin::FormatDatetime(Box::new(f(e))),
         Builtin::Load(e) => Builtin::Load(Box::new(f(e))),
         Builtin::AtOffset(e) => Builtin::AtOffset(Box::new(f(e))),
 
-        // --- Two sub-expressions (20) --------------------------------------
+        // --- Two sub-expressions (21) --------------------------------------
         Builtin::UpperInSrc(a, b) => Builtin::UpperInSrc(Box::new(f(a)), Box::new(f(b))),
         Builtin::AnyCond(a, b) => Builtin::AnyCond(Box::new(f(a)), Box::new(f(b))),
         Builtin::AllCond(a, b) => Builtin::AllCond(Box::new(f(a)), Box::new(f(b))),
@@ -619,6 +622,7 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         Builtin::SplitRegex(a, b) => Builtin::SplitRegex(Box::new(f(a)), Box::new(f(b))),
         Builtin::SplitsFlags(a, b) => Builtin::SplitsFlags(Box::new(f(a)), Box::new(f(b))),
         Builtin::Skip(a, b) => Builtin::Skip(Box::new(f(a)), Box::new(f(b))),
+        Builtin::WithDtf(a, b) => Builtin::WithDtf(Box::new(f(a)), Box::new(f(b))),
         Builtin::AtPosition(a, b) => Builtin::AtPosition(Box::new(f(a)), Box::new(f(b))),
 
         // --- Three sub-expressions (2) -------------------------------------
@@ -1905,6 +1909,8 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
             | Builtin::FromUnix
             | Builtin::ToUnix
             | Builtin::Tz(_)
+            | Builtin::FormatDatetime(_)
+            | Builtin::WithDtf(_, _)
             | Builtin::Load(_) => false,
         },
         // Each node's own input is rebound. Child expressions are inspected
@@ -2279,6 +2285,8 @@ fn node_reads_ambient(node: &Expr) -> bool {
             | Builtin::FromUnix
             | Builtin::ToUnix
             | Builtin::Tz(_)
+            | Builtin::FormatDatetime(_)
+            | Builtin::WithDtf(_, _)
             | Builtin::Load(_)
             | Builtin::AtOffset(_)
             | Builtin::AtPosition(_, _) => true,

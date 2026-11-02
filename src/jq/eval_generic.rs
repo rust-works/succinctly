@@ -37770,6 +37770,10 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::Trunc
             | Builtin::TruncateStream(_)
             | Builtin::Tz(_)
+            // #5863: a timestamp computed from the node, and a scope whose outputs are
+            // materialized inside it.
+            | Builtin::FormatDatetime(_)
+            | Builtin::WithDtf(..)
             | Builtin::UpperIn(_)
             | Builtin::UpperInSrc(..)
             | Builtin::UpperIndex(_)

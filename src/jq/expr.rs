@@ -3930,6 +3930,13 @@ pub enum Builtin {
     /// Input: now | tz("America/New_York") -> "2024-01-20T11:00:00-05:00"
     /// Supported zones: "UTC", "local", or IANA timezone names
     Tz(Box<Expr>),
+    /// `format_datetime(format)` (yq, #5863) - a timestamp read under the datetime layout and
+    /// written with Go's layout `format`, then read back as a YAML snippet
+    FormatDatetime(Box<Expr>),
+    /// `with_dtf(layout; expr)` (yq, #5863) - `expr` evaluated with `layout` as the datetime
+    /// layout `+`, `-`, the ordering comparisons, `format_datetime`, `tz` and `to_unix` read and
+    /// write timestamps with
+    WithDtf(Box<Expr>, Box<Expr>),
 
     // Phase 22: File operations (yq)
     /// `load(file)` - load external YAML/JSON file and return its parsed content

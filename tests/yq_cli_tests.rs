@@ -42999,9 +42999,10 @@ fn test_jq_only_date_builtins_gated_behind_jq_extensions_1907() -> Result<()> {
     // Real yq's own date/time extensions stay ungated (unaffected by this
     // fix, sanity-checked here so a future accidental over-broad gate
     // regresses loudly).
-    let (out, code) = run_yq_stdin("from_unix", "0\n", &[])?;
+    // `from_unix` writes the local zone (#5863), so the round trip is what is zone-independent.
+    let (out, code) = run_yq_stdin("from_unix | to_unix", "0\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "1970-01-01T00:00:00Z");
+    assert_eq!(out.trim(), "0");
 
     Ok(())
 }
@@ -63833,18 +63834,20 @@ fn jq_only_builtins_3046_are_gated_in_yq_mode() -> Result<()> {
     Ok(())
 }
 
-/// `tz` (a yq-mode extension) on a non-number keeps its pre-#3042 wording;
-/// real yq answers a Go layout-parse error (`could not parse datetime of
-/// [a] ...`) there, so neither is oracle-backed -- pinned only so #3042's
-/// move of the libm family onto jq's `number required` provably did not
-/// reach it (see #3068 for the jq-side sibling).
+/// `tz` on text that is not a timestamp answers yq's Go layout-parse error
+/// (#5863): yq v4.53.3 prints `could not parse datetime of [a] using layout
+/// [...]: parsing time "x" as "2006-01-02": cannot parse "x" as "2006"`, with
+/// the node's path in the brackets, which a value here does not carry. It was
+/// pinned so #3042's move of the libm family onto jq's `number required` did
+/// not reach `tz` (see #3068 for the jq-side sibling); it still does not.
 #[test]
 fn test_tz_non_number_wording_unchanged_by_3042() -> Result<()> {
     let (_out, stderr, code) = run_yq_stdin_with_stderr(r#".a | tz("UTC")"#, "a: x\n", &[])?;
     assert_ne!(code, 0);
-    assert!(
-        stderr.contains("math function requires number"),
-        "stderr: {stderr:?}"
+    assert_eq!(
+        stderr.trim_end(),
+        "Error: could not parse datetime of [] using layout [2006-01-02T15:04:05Z07:00]: \
+         parsing time \"x\" as \"2006-01-02\": cannot parse \"x\" as \"2006\""
     );
     Ok(())
 }

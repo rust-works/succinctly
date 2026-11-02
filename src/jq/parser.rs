@@ -8783,6 +8783,38 @@ impl<'a> Parser<'a> {
                 .parse_required_single_arg(keyword_start)?
                 .map(|zone| Builtin::Tz(Box::new(zone))));
         }
+        // #5863: yq's datetime layout operators.
+        if self.matches_keyword("format_datetime") {
+            let keyword_start = self.pos;
+            self.consume_keyword("format_datetime");
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|format| Builtin::FormatDatetime(Box::new(format))));
+        }
+        if self.matches_keyword("with_dtf") {
+            let keyword_start = self.pos;
+            self.consume_keyword("with_dtf");
+            self.skip_ws();
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
+            self.skip_ws();
+            let layout = self.parse_expr()?;
+            self.skip_ws();
+            if self.peek() != Some(';') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![layout]);
+            }
+            self.next();
+            self.skip_ws();
+            let body = self.parse_expr()?;
+            self.skip_ws();
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![layout, body]);
+            }
+            self.next();
+            return Ok(Some(Builtin::WithDtf(Box::new(layout), Box::new(body))));
+        }
 
         // Phase 17: Combinations
         if self.matches_keyword("combinations") {
@@ -15533,6 +15565,7 @@ mod tests {
             "first",
             "flatten",
             "foot_comment",
+            "format_datetime",
             "from_entries",
             "from_json",
             "from_unix",
@@ -15598,6 +15631,7 @@ mod tests {
             "unique_by",
             "upcase",
             "with",
+            "with_dtf",
             "with_entries",
         ];
         /// yq's lexer rejects the name and `succinctly yq` accepts or refuses it on purpose: position navigation is a documented succinctly extension, and the `input` family has its own unconditional refusal (#1507).
