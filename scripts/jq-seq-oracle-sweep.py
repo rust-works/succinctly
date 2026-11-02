@@ -63,7 +63,7 @@ than on a newline) is unreachable here.
 
 Usage:
   cargo build --release --features cli
-  ./scripts/jq-seq-oracle-sweep.py [--seed N] [--cases N] [--slurp-location] [path-to-binary]
+  ./scripts/jq-seq-oracle-sweep.py [--seed N] [--cases N] [--slurp-location] [--oracle JQ] [path-to-binary]
 """
 
 import argparse
@@ -117,11 +117,18 @@ HAND = [
 ]
 
 
-def resolve_oracle():
+def resolve_oracle(given=None):
     pin = (REPO_ROOT / "tests/data/jq-golden/JQ_VERSION").read_text().strip()
     # Prefer the pinned oracle directly (macOS ships jq-1.7.1 at /usr/bin/jq;
     # a PATH jq, e.g. Homebrew's, is often newer) -- same reasoning as
-    # tests/jq_cli_tests.rs's own pinned-oracle comments.
+    # tests/jq_cli_tests.rs's own pinned-oracle comments. `--oracle` (the
+    # compare harness's pinned build, #5552) is the only one tried when given.
+    if given:
+        version = subprocess.run([given, "--version"], capture_output=True, text=True).stdout.strip()
+        if not version.startswith(pin):
+            print(f"error: --oracle {given} reports {version!r}, not the pinned {pin}", file=sys.stderr)
+            sys.exit(2)
+        return given, version
     for candidate in ("/usr/bin/jq", None):
         path = candidate or shutil_which_jq()
         if path and os.access(path, os.X_OK):
@@ -130,7 +137,8 @@ def resolve_oracle():
             ).stdout.strip()
             if version.startswith(pin):
                 return path, version
-    sys.exit(f"error: no jq matching pin {pin} found at /usr/bin/jq or on PATH")
+    print(f"error: no jq matching pin {pin} found at /usr/bin/jq or on PATH", file=sys.stderr)
+    sys.exit(2)
 
 
 def shutil_which_jq():
@@ -210,6 +218,7 @@ def main():
     parser.add_argument("binary", nargs="?", default=str(REPO_ROOT / "target/release/succinctly"))
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--cases", type=int, default=4000)
+    parser.add_argument("--oracle", help="the jq to compare against (default: the pinned one at /usr/bin/jq or on PATH)")
     parser.add_argument(
         "--expect-artifacts",
         action="store_true",
@@ -229,7 +238,7 @@ def main():
             f"error: succinctly binary not found at {args.binary} — "
             "run: cargo build --release --features cli"
         )
-    jq, version = resolve_oracle()
+    jq, version = resolve_oracle(args.oracle)
     print(f"oracle: {jq} ({version}), succinctly: {args.binary}", file=sys.stderr)
 
     cases = HAND + random_cases(args.cases, args.seed, args.expect_artifacts)

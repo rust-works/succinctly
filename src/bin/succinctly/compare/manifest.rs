@@ -54,6 +54,22 @@ pub struct Fuzz {
     pub depth: u32,
 }
 
+/// One of the `scripts/jq-*-sweep.*` oracle sweeps, folded under dimension B (#5552).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Sweep {
+    /// The ledger key's probe: `sweep:<id>`.
+    pub id: String,
+    pub script: String,
+    /// Its arguments; `{subject}` and `{jq}` name the two binaries. The same under `--quick`:
+    /// a smaller sample would call a listed divergence stale in the run that missed it.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Variables set for it on top of the fixed environment, with the same placeholders.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    pub timeout_s: u64,
+}
+
 /// A vendored upstream test file, pinned by content.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Suite {
@@ -79,6 +95,8 @@ pub struct Manifest {
     pub json_suite: Suite,
     pub perf: Perf,
     pub fuzz: Fuzz,
+    #[serde(rename = "sweep", default)]
+    pub sweeps: Vec<Sweep>,
     #[serde(rename = "input", default)]
     pub inputs: Vec<super::perf::InputSpec>,
 }
@@ -114,6 +132,20 @@ impl Manifest {
         }
         if m.fuzz.seeds.is_empty() || m.fuzz.programs == 0 {
             bail!("[fuzz] needs at least one seed and a non-zero program count");
+        }
+        let mut sweep_ids = std::collections::BTreeSet::new();
+        for s in &m.sweeps {
+            let named = !s.id.is_empty()
+                && s.id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if !named || !sweep_ids.insert(&s.id) || s.timeout_s == 0 {
+                bail!(
+                    "sweep `{}` needs a unique id of letters, digits, `-` and `_` (it is a ledger \
+                     file name) and a non-zero timeout_s",
+                    s.id
+                );
+            }
         }
         for suite in &m.suites {
             if let Some(id) = &suite.reference {
@@ -213,6 +245,25 @@ mod tests {
         .is_err());
     }
 
+    /// A sweep id is a ledger file name, and two sweeps sharing one would share an entry.
+    #[test]
+    fn a_sweep_id_is_unique_and_a_file_name() {
+        let base = "schema_version = 1\n\
+            [succinctly]\nprofile='release'\nfeatures=''\n[queries]\nsmoke='x'\n\
+            [probes]\ncli='x'\nextensions='x'\nsyntax='x'\nfixtures='x'\ndivergences='x'\nrobust='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n[perf]\nqueries='q'\n[fuzz]\nscript='s'\nseeds=[1]\nprograms=1\ndepth=1\n\
+            [[reference]]\nid='a'\nversion='1'\nrole='primary'\nsource_url=''\nsource_sha256=''\n";
+        let sweep = |id: &str, timeout: u32| {
+            format!("[[sweep]]\nid='{id}'\nscript='s.py'\ntimeout_s={timeout}\n")
+        };
+        let one = format!("{base}{}", sweep("fold-a_1", 60));
+        let (m, _) = Manifest::parse(&one).unwrap();
+        assert_eq!((m.sweeps[0].args.len(), m.sweeps[0].env.len()), (0, 0));
+        assert!(Manifest::parse(&format!("{one}{}", sweep("fold-a_1", 60))).is_err());
+        assert!(Manifest::parse(&format!("{base}{}", sweep("a/b", 60))).is_err());
+        assert!(Manifest::parse(&format!("{base}{}", sweep("", 60))).is_err());
+        assert!(Manifest::parse(&format!("{base}{}", sweep("a", 0))).is_err());
+    }
+
     #[test]
     fn two_primaries_are_rejected() {
         let text = "schema_version = 1\n\
@@ -266,6 +317,28 @@ mod pin_tests {
             assert_eq!(
                 i.shape,
                 format!("corpus-{}", entry["workload"].as_str().unwrap())
+            );
+        }
+    }
+
+    /// A folded sweep names a script in `scripts/` that exists: a renamed one would otherwise
+    /// fail only when the dimension runs.
+    #[test]
+    fn every_folded_sweep_names_a_sweep_script() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (m, _) = Manifest::load(root).unwrap();
+        assert!(m.sweeps.len() >= 12, "{}", m.sweeps.len());
+        for s in &m.sweeps {
+            assert!(
+                s.script.starts_with("scripts/jq-") && s.script.contains("sweep"),
+                "{}",
+                s.script
+            );
+            assert!(
+                root.join(&s.script).is_file(),
+                "{} names {}",
+                s.id,
+                s.script
             );
         }
     }

@@ -58,7 +58,8 @@ pub fn exec_within(
     exec_with(tool, args, stdin, cwd, deadline, &[])
 }
 
-fn exec_with(
+/// [`exec_env`] with its own deadline: a folded sweep script runs for minutes (#5552).
+pub fn exec_with(
     tool: &Tool,
     args: &[String],
     stdin: impl AsRef<[u8]>,
