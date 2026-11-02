@@ -181,7 +181,7 @@ fn test_string_builtins_refuse_a_non_string_tag_as_yq_5836() -> Result<()> {
     for (doc, filter, want_out, want_err) in ROWS {
         let (stdout, stderr, code) =
             run_yq_stdin_with_stderr(&format!(".a | {filter}"), &format!("a: {doc}\n"), &[])?;
-        let want_code = if want_err.is_empty() { 0 } else { 1 };
+        let want_code = i32::from(!want_err.is_empty());
         assert_eq!(
             (stdout.as_str(), stderr.trim(), code),
             (*want_out, *want_err, want_code),
