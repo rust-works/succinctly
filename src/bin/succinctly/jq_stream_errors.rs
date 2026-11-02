@@ -723,19 +723,22 @@ impl Parser {
         }
         // The validation above passed. A string with no escape and valid UTF-8 is its own bytes, so
         // it needs neither the checked document parser nor a quoted copy to hand it (#5498).
-        if !buf.contains(&b'\\') {
-            if let Ok(text) = core::str::from_utf8(buf) {
-                let value = OwnedValue::string(text);
-                self.value(value)?;
-                self.token_len = 0;
-                return Ok(());
+        let plain = if buf.contains(&b'\\') {
+            None
+        } else {
+            core::str::from_utf8(buf).ok()
+        };
+        let value = match plain {
+            Some(text) => OwnedValue::string(text),
+            None => {
+                let mut quoted = Vec::with_capacity(self.token_len + 2);
+                quoted.push(b'"');
+                quoted.extend_from_slice(&self.token_buf[..self.token_len]);
+                quoted.push(b'"');
+                materialize(&quoted)
             }
-        }
-        let mut quoted = Vec::with_capacity(self.token_len + 2);
-        quoted.push(b'"');
-        quoted.extend_from_slice(&self.token_buf[..self.token_len]);
-        quoted.push(b'"');
-        self.value(materialize(&quoted))?;
+        };
+        self.value(value)?;
         self.token_len = 0;
         Ok(())
     }
@@ -743,10 +746,13 @@ impl Parser {
 
 /// The number a token spells, read as the document path reads it but without that path's index
 /// build and re-parse (#5498): the literal keeps its spelling, so `1.0`, `1e2` and `-0` print as
-/// they were written. Only a token whose text is a number to the document parser takes this; any
-/// other goes to [`materialize`], which decides what it is.
+/// they were written. A token `from_number_bytes` cannot read (it answers `null`, which no number
+/// is) goes to [`materialize`], which decides what it is.
 fn fast_number(token: &[u8]) -> OwnedValue {
-    OwnedValue::from_number_bytes::<succinctly::jq::JqSemantics>(token)
+    match OwnedValue::from_number_bytes::<succinctly::jq::JqSemantics>(token) {
+        OwnedValue::Null => materialize(token),
+        number => number,
+    }
 }
 
 /// The value a token spells, built by the checked document parser so that it reads exactly as the
@@ -778,7 +784,6 @@ mod tests {
             .collect()
     }
 
-    /// #5635: the events a malformed document yielded before its fault, with the lines read.
     /// The fast paths (#5498) must build what the checked document parser builds, to the literal:
     /// a number keeps its spelling, a string its decoded text.
     #[test]
@@ -817,10 +822,12 @@ mod tests {
             "1e-5",
             "12345678901234567890.5",
         ];
+        let mut compared = 0;
         for text in numbers {
             if !number_is_valid(text.as_bytes()) {
                 continue;
             }
+            compared += 1;
             let (fast, slow) = (fast_number(text.as_bytes()), materialize(text.as_bytes()));
             assert_eq!(fast.to_json(), slow.to_json(), "{text}");
             assert_eq!(
@@ -829,6 +836,22 @@ mod tests {
                 "{text}"
             );
             assert_eq!(fast.number_str(), slow.number_str(), "{text}");
+        }
+        // The spellings the document parser tolerates must be among those compared.
+        for text in ["007", ".5", "-.5", "1.", "1e400"] {
+            assert!(
+                number_is_valid(text.as_bytes()),
+                "{text} is no longer a valid token"
+            );
+        }
+        assert!(compared >= 25, "only {compared} spellings were compared");
+        // Bytes that are not UTF-8 take the substituting path, not the fast one.
+        for bytes in [&b"\"a\xffb\""[..], b"\"\x80\"", b"\"\xe3\x81\""] {
+            let events = read_one(&[b"[", bytes, b"]"].concat()).values;
+            assert_eq!(
+                events[0].to_json(),
+                format!("[[0],{}]", materialize(bytes).to_json())
+            );
         }
         for input in [
             "\"\"",
@@ -847,6 +870,7 @@ mod tests {
         }
     }
 
+    /// #5635: the events a malformed document yielded before its fault, with the lines read.
     #[test]
     fn events_before_fault_stop_at_the_first_error_5635() {
         let row = |event: &str, lines| (event.to_string(), lines);
