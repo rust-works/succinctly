@@ -14256,18 +14256,26 @@ mod tests {
         assert!(inputs.is_empty(), "the substituted text is still clean");
         let scanned = EofTail::of(&[b"\"\xe9\"\n1".as_slice()], false, &[], false);
         assert_eq!(tail, Some(scanned));
-        // Not under `-n`, with `-s`, with `--stream`, or with a stream that turns malformed.
+        // Not under `-n`, with `-s`, or with a stream that turns malformed.
         let broken = write("broken.json", "1\n2\n}\n");
         for argv in [
             vec!["jq", "inputs", &clean],
             vec!["jq", "-n", "-s", "inputs", &clean],
-            vec!["jq", "-n", "--stream", "inputs", &clean],
             vec!["jq", "-n", "inputs", &broken],
             vec!["jq", "-n", "inputs", &clean, &clean],
         ] {
             let (inputs, _, _, _, lazy) = read(&argv);
             assert!(lazy.is_none(), "{argv:?}");
             assert!(!inputs.is_empty(), "{argv:?}");
+        }
+        // `--stream` and `--stream-errors` are read as the program asks too, by jq's streaming
+        // parser rather than from spans (#5498): nothing is queued up front.
+        for flag in ["--stream", "--stream-errors"] {
+            let argv = ["jq", "-n", flag, "inputs", &clean];
+            let (inputs, _, _, _, lazy) = read(&argv);
+            assert!(inputs.is_empty() && lazy.is_none(), "{argv:?}");
+            let stream = LAZY_STREAM_INPUTS.with(|slot| slot.borrow_mut().take());
+            assert!(stream.is_some(), "{argv:?} is read by the stream reader");
         }
     }
 
