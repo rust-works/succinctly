@@ -96986,7 +96986,7 @@ fn builtin_with_dtf<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let layout = match yq_string_parameter::<W, S>(layout_expr, &value, optional, "layout") {
         Ok(layout) => layout,
-        Err(QueryResult::Error(e)) if e.to_string().starts_with("could not find layout") => {
+        Err(QueryResult::Error(e)) => {
             return QueryResult::Error(EvalError::new(format!(
                 "could not get date time format: {e}"
             )))

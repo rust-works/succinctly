@@ -6,7 +6,7 @@
 //! `with_dtf` set another, and `2006-01-02` when RFC 3339 fails), works on the `time.Time`, and
 //! writes the result back with `Format(layout)`. So which strings parse, what the error says and
 //! what a formatted time spells all come from Go, and are ported here from `time/format.go`
-//! (Go 1.24), including its looser-than-RFC 3339 reading (a one-digit hour, a comma before the
+//! (Go 1.26, the toolchain yq v4.53.3 is built with), including its looser-than-RFC 3339 reading (a one-digit hour, a comma before the
 //! fraction, a zone offset of 24 hours).
 //!
 //! yq's ordering comparison (`compareOperator`, `pkg/yqlib/operator_compare.go`, v4.53.3) reads a
@@ -580,13 +580,13 @@ fn parse_nanoseconds(value: &[u8], nbytes: usize) -> Result<i64, Option<&'static
     Ok(ns)
 }
 
-/// Go's `parseSignedOffset`: the length of a `+h`/`-hh` offset of at most 12 hours, or 0.
+/// Go's `parseSignedOffset`: the length of a `+h`/`-hh` offset of at most 23 hours, or 0.
 fn parse_signed_offset(value: &[u8]) -> usize {
     if !matches!(value.first(), Some(b'+' | b'-')) {
         return 0;
     }
     match leading_int(&value[1..]) {
-        Some((x, rest)) if rest.len() != value.len() - 1 && x <= 12 => value.len() - rest.len(),
+        Some((x, rest)) if rest.len() != value.len() - 1 && x <= 23 => value.len() - rest.len(),
         _ => 0,
     }
 }
@@ -962,7 +962,8 @@ fn parse_fields<'a>(layout: &'a [u8], value: &'a [u8]) -> Result<Fields<'a>, Par
                             range_error = error;
                             match offset {
                                 Some(offset) => {
-                                    zone_offset = Some(offset);
+                                    // Go's "no offset" marker is `-1`, so an offset of exactly -1s is none.
+                                    zone_offset = (offset != -1).then_some(offset);
                                     true
                                 }
                                 None => false,
@@ -1277,7 +1278,10 @@ pub(crate) fn format(time: &GoTime, layout: &str, local: &dyn Location) -> Strin
                 }
                 let zone = offset / 60;
                 out.push(if zone < 0 { '-' } else { '+' });
-                let (zone, abs_offset) = (zone.abs(), offset.abs());
+                // Go negates the offset only when the minute part is negative, so a negative
+                // offset under a minute keeps its sign in the seconds field (`+00:00:-30`).
+                let abs_offset = if zone < 0 { -offset } else { offset };
+                let zone = zone.abs();
                 push_int(&mut out, zone / 60, 2);
                 if matches!(
                     std,
@@ -1446,7 +1450,8 @@ pub(crate) fn parse_duration(text: &str) -> Result<i64, String> {
                 return Err(invalid());
             }
         }
-        d += v;
+        // Go's `uint64` wraps here, so two terms of exactly 1<<63 sum to 0 and parse.
+        d = d.wrapping_add(v);
         if d > 1 << 63 {
             return Err(invalid());
         }
@@ -1777,6 +1782,8 @@ mod tests {
             (".5s", 500_000_000),
             ("1h1h", 2 * h),
             ("2562047h", 2_562_047 * h),
+            // Go's uint64 wraps: two terms of exactly 1<<63 ns sum to 0.
+            ("9223372036854775808ns9223372036854775808ns", 0),
         ] {
             assert_eq!(parse_duration(text), Ok(want), "{text}");
         }

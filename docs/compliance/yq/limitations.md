@@ -3773,7 +3773,7 @@ Two integers compare as integers, and a decimal spelling (`007`, `+5`, `1e3`) pa
 
 yq keeps a timestamp as text tagged `!!timestamp`.
 Its datetime operators read that text with Go's `time.Parse` under the current layout and write a result back with `Format`: RFC 3339 by default, with `2006-01-02` tried when RFC 3339 fails, or the layout `with_dtf(layout; f)` sets for everything `f` evaluates.
-`succinctly yq` does the same through `go_time`, a port of `time.Parse`, `time.Format` and `time.ParseDuration` (Go 1.24), and `yq_datetime`, which applies them as yq's operators do:
+`succinctly yq` does the same through `go_time`, a port of `time.Parse`, `time.Format` and `time.ParseDuration` (Go 1.26, the toolchain yq v4.53.3 is built with), and `yq_datetime`, which applies them as yq's operators do:
 
 - `+` and `-` add a duration to a timestamp (`.t += "3h10m"`, `.t -= "24h"`), keeping its zone, and raise Go's error for a duration that does not parse (`unable to parse duration [bogus]: time: invalid duration "bogus"`, with `-bogus` for `-`).
   Before #5863, `.t += "3h10m"` concatenated the text and exited 0.
@@ -3784,7 +3784,7 @@ Its datetime operators read that text with Go's `time.Parse` under the current l
 - The ordering comparisons read both sides under the `with_dtf` layout.
 
 The local zone is `TZ` or the system zone, as Go's `time.Local` is.
-Every row of the issue is pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, among 95 rows captured under `TZ=UTC` and `TZ=Australia/Sydney`; the 10 that differ are the ones listed below.
+Every row of the issue is pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, among 104 rows captured under `TZ=UTC` and `TZ=Australia/Sydney`; the 10 that differ are the ones listed below.
 
 **Not reproduced:**
 
@@ -3805,6 +3805,14 @@ Every row of the issue is pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, 
   A write through it (`with_dtf(f; .a) = 5`, `|=`, `del`) lands where yq's does.
 - `tz` with an IANA name needs the `local-zone` feature (on in `cli`, not on Windows); without it only `UTC`, the empty name and `Local` load, and every other name is `unknown time zone`.
 - A `no_std` build has no thread-local layout, so `with_dtf` raises `with_dtf requires the std feature` there.
+- `with_dtf(layout, f)` with a comma between its two arguments (yq's `withDateTimeFormat` accepts a union as well as a block) is a parse error here; only the `;` form is read.
+- A `with_dtf`, `format_datetime` or `tz` argument is evaluated once per input node here, and once for the whole context in yq, which uses the first result for every node.
+  So `.[] | format_datetime(.)` over several timestamps formats each with its own text here and every one with the first node's text in yq.
+- `with_dtf` in path position (`with_dtf(error("boom"); .a) |= 1`) reports a layout argument's error without yq's `could not get date time format: ` prefix.
+- A `format_datetime` result that YAML reads back as empty (`""`, `" "`, `"#x"`, `".999"` on a time with no nanoseconds) prints `null` here where yq prints an empty scalar, and `format_datetime("[2006]")` prints block style here where yq keeps flow style.
+- `.t + "1h" | tag` is `!!str` here and `!!timestamp` in yq, the same split as the tags above.
+- `"x" | from_unix` says `math function requires number` here where yq says `from_unix only works on numbers, found !!str instead`.
+- `tz("Europe")` and `tz("zone.tab")` (a directory and a file that is not a zone) raise a different message here (`is a directory`, `malformed time zone information`) from yq's.
 - Go matches a zone abbreviation read by a layout's `MST` against every zone the local zone has ever used; here only the zones in effect at the date and half a year either side are asked, which covers standard and daylight time.
 - `with_dtf("2006")` and `format_datetime` with no argument are parse errors in succinctly's wording, not yq's (`must provide a date time format string and an expression, ...`, `'format_datetime' expects 1 arg but received none`).
 - `from_unix` keeps succinctly's out-of-range error for a number past the calendar it converts (`1e20`), where yq prints the year Go's arithmetic wraps to.

@@ -63841,7 +63841,7 @@ fn jq_only_builtins_3046_are_gated_in_yq_mode() -> Result<()> {
 /// pinned so #3042's move of the libm family onto jq's `number required` did
 /// not reach `tz` (see #3068 for the jq-side sibling); it still does not.
 #[test]
-fn test_tz_non_number_wording_unchanged_by_3042() -> Result<()> {
+fn test_tz_non_timestamp_answers_the_layout_parse_error_5863() -> Result<()> {
     let (_out, stderr, code) = run_yq_stdin_with_stderr(r#".a | tz("UTC")"#, "a: x\n", &[])?;
     assert_ne!(code, 0);
     assert_eq!(

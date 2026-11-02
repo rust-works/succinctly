@@ -15,6 +15,20 @@ const DOC: &str = "a: 1\nt: 2026-01-01T00:00:00Z\ne: \".a\"\nd: 2026-01-01\nq: \
 
 /// (TZ, filter, stdout, stderr, exit code), each the same as yq v4.53.3's.
 const ROWS: &[(&str, &str, &str, &str, i32)] = &[
+    // Two terms of exactly 1<<63 ns wrap Go's uint64 to 0 (a debug build once panicked here).
+    ("UTC", ".t + \"9223372036854775808ns9223372036854775808ns\"", "\"2026-01-01T00:00:00Z\"\n", "", 0),
+    // A signed zone abbreviation reaches 23 hours, and 24 is not one.
+    ("UTC", "with_dtf(\"2006 MST\"; \"2026 +13\" | to_unix)", "1767225600\n", "", 0),
+    ("UTC", "with_dtf(\"2006 MST\"; \"2026 +23\" | to_unix)", "1767225600\n", "", 0),
+    ("UTC", "with_dtf(\"2006 MST\"; \"2026 +24\" | to_unix)", "", "Error: could not parse datetime of [] using layout [2006 MST]: parsing time \"2026 +24\" as \"2006 MST\": cannot parse \"+24\" as \"MST\"", 1),
+    // Go's "no offset" marker is -1, so an offset of -1s is read as none (UTC) and -2s is a zone.
+    ("UTC", "with_dtf(\"15:04:05 -07:00:00\"; \"10:00:00 -00:00:01\" | to_unix)", "-62167183200\n", "", 0),
+    ("UTC", "with_dtf(\"15:04:05 -07:00:00\"; \"10:00:00 -00:00:02\" | to_unix)", "-62167183198\n", "", 0),
+    // A negative offset under a minute keeps its sign in the seconds field.
+    ("UTC", "with_dtf(\"2006-01-02 15:04:05 -07:00:00\"; \"2026-01-01 10:00:00 -00:00:30\" | format_datetime(\"-07:00:00\"))", "\"+00:00:-30\"\n", "", 0),
+    ("UTC", "with_dtf(\"2006-01-02 15:04:05 -07:00:00\"; \"2026-01-01 10:00:00 -00:00:30\" | format_datetime(\"-0700\"))", "0\n", "", 0),
+    // Every error from the layout argument is prefixed, not only a missing layout.
+    ("UTC", "with_dtf(error(\"boom\"); .t)", "", "Error: could not get date time format: boom", 1),
     ("UTC", ".t += \"3h10m\" | .t", "\"2026-01-01T03:10:00Z\"\n", "", 0),
     ("UTC", ".t -= \"24h\" | .t", "\"2025-12-31T00:00:00Z\"\n", "", 0),
     ("UTC", ".t | format_datetime(\"2006\")", "2026\n", "", 0),
