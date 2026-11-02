@@ -8222,12 +8222,14 @@ Three differences remain, none of which aborts the process:
   `succinctly yq`'s own YAML-emission pipeline (`yq_runner.rs`'s `emit_yaml_value_at_depth`
   and four sibling `assert_value_tree_depth` call sites, reached by a write (`=`/`|=`/`+=`)
   whose right-hand side constructs a deep value directly rather than through the reindex
-  bridge) still asserts, but `run_yq` now catches exactly that panic (#3278) and reports the
-  same `nesting depth exceeds limit of 384` diagnostic with yq's own error status (exit 1,
-  where `succinctly jq` exits 5), not an uncaught exit 101. Unlike the checked guards above
-  this is a `catch_unwind` net rather than an `EvalError`, so the failure ends the run
-  instead of being an error a `try` could see; the emission recursion has no `Result` to
-  thread it through.
+  bridge) still asserts, and `run_yq` catches exactly that panic (#3278) and reports it with
+  yq's own error status (exit 1, where `succinctly jq` exits 5), not an uncaught exit 101.
+  Since #5876 the assertion is the native-stack floor's, as in jq mode: `.a |= deep(400)`
+  prints the value at exit 0, and the diagnostic is `nesting depth exceeds limit of the
+  native stack`, past where the walk has spent half the evaluation stack. Unlike the checked
+  guards above this is a `catch_unwind` net rather than an `EvalError`, so the failure ends
+  the run instead of being an error a `try` could see; the emission recursion has no
+  `Result` to thread it through.
   `succinctly jq` has the same net for the evaluator's own splice sites
   ([#5526](https://github.com/rust-works/succinctly/issues/5526)).
   `+=`, `//=` and a fold's `$x` read where a step cannot hand it on (`reduce f as $x (0; if $x then 1 else 2 end)`) on a value built past 384 levels

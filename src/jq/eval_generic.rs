@@ -5293,11 +5293,17 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     depth: usize,
 ) -> Result<OwnedValue, EvalError> {
     use crate::json::light::StandardJson;
-    // A value the evaluator built (a fold's accumulator, an embedded `[.]`), never an input
-    // document, so it is bounded as every other walk over a built value is: by
-    // `MAX_VALUE_TREE_DEPTH`, or by the native-stack floor where that is armed (#5554, #5876).
-    // The document ceiling (`MAX_NESTING_DEPTH`, 256) refused a value the output could print.
-    super::value::check_value_tree_depth(depth)?;
+    // Under the native-stack floor (the CLI arms it for the whole run, #5554, #5876) this converts
+    // a value the evaluator built (a fold's accumulator, an embedded `[.]`), and an input
+    // document is already capped at 256 levels by its parser. The built value is then bounded as
+    // every other walk over one is, by `MAX_VALUE_TREE_DEPTH` or by the floor: the document
+    // ceiling refused a value the output could print. Anywhere else (a library caller that did
+    // not opt in) nothing says the text is a built value, so the document ceiling stays.
+    if depth >= MAX_NESTING_DEPTH && super::eval::value_depth_floor_armed() {
+        super::value::check_value_tree_depth(depth)?;
+    } else {
+        guard_nesting_depth(depth)?;
+    }
     Ok(match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
@@ -52377,44 +52383,57 @@ mod tests {
 
     /// #1017: `owned_from_standard_json` is a third, independent copy of the
     /// cursor-to-`OwnedValue` conversion `to_owned`/`to_owned_cursor` are
-    /// already guarded above (#998), with its own guard. It converts only a
-    /// value the evaluator built (a fold's accumulator, an embedded `[.]`),
-    /// never an input document, so since #5876 its bound is the value-tree
-    /// one (`MAX_VALUE_TREE_DEPTH`, or the native-stack floor where armed),
-    /// not the document ceiling of 256: a built value that prints at 300
-    /// levels is read back at 300. It reports the limit as a
-    /// resource-limit error rather than panicking, which a `try`/`catch`
-    /// cannot swallow (#2132).
+    /// already guarded above (#998) -- same limit, same construction, its
+    /// own guard. Reports the limit as a decode-failure-tagged error rather
+    /// than panicking since #3457, like the other two.
     #[test]
-    fn owned_from_standard_json_errors_past_value_tree_depth_limit_1017() {
-        use crate::jq::MAX_VALUE_TREE_DEPTH;
-        // Past the old document ceiling, below the value-tree one.
-        let json = linear_nest(MAX_NESTING_DEPTH + 44);
+    fn owned_from_standard_json_errors_past_nesting_depth_limit_1017() {
+        let json = linear_nest(255);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
         let owned = owned_from_standard_json::<JqSemantics, _>(&cursor.value()).unwrap();
         assert!(matches!(owned, OwnedValue::Object(_)));
 
-        let json = linear_nest(MAX_VALUE_TREE_DEPTH - 1);
-        let index = JsonIndex::build(json.as_bytes());
-        let cursor = index.root(json.as_bytes());
-        let owned = owned_from_standard_json::<JqSemantics, _>(&cursor.value()).unwrap();
-        assert!(matches!(owned, OwnedValue::Object(_)));
-
-        let json = linear_nest(MAX_VALUE_TREE_DEPTH);
+        let json = linear_nest(256);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
         let err = owned_from_standard_json::<JqSemantics, _>(&cursor.value())
-            .expect_err("owned_from_standard_json should error at the value-tree depth");
+            .expect_err("owned_from_standard_json should error at depth 256");
         assert!(
-            err.is_resource_limit(),
-            "expected a resource-limit error, got: {err:?}"
+            err.is_decode_failure(),
+            "expected decode failure, got: {err:?}"
         );
-        assert!(
-            err.to_string()
-                .contains(&format!("limit of {MAX_VALUE_TREE_DEPTH}")),
-            "expected the value-tree depth message, got: {err:?}"
-        );
+    }
+
+    /// #5876: under the native-stack floor (which the CLI arms for the whole run) this converter
+    /// reads back a value the evaluator built, so it is bounded as every other walk over one is
+    /// -- by `MAX_VALUE_TREE_DEPTH`, or by the floor -- not by the document ceiling of 256. The
+    /// floor is registered on a thread with a real stack of the size it claims.
+    #[test]
+    fn owned_from_standard_json_under_the_floor_is_bounded_by_the_value_tree_5876() {
+        use crate::jq::{with_stack_budget, with_value_depth_on_stack_floor, MAX_VALUE_TREE_DEPTH};
+        const STACK: usize = 32 * 1024 * 1024;
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(|| {
+                with_stack_budget(STACK, || {
+                    with_value_depth_on_stack_floor(|| {
+                        // Past the document ceiling, then past the value-tree constant: the floor
+                        // (half of 32 MiB) is nowhere near spent by a few hundred levels.
+                        for depth in [MAX_NESTING_DEPTH, MAX_VALUE_TREE_DEPTH + 100] {
+                            let json = linear_nest(depth);
+                            let index = JsonIndex::build(json.as_bytes());
+                            let cursor = index.root(json.as_bytes());
+                            let owned = owned_from_standard_json::<JqSemantics, _>(&cursor.value())
+                                .unwrap_or_else(|e| panic!("{depth} levels: {e:?}"));
+                            assert!(matches!(owned, OwnedValue::Object(_)), "{depth} levels");
+                        }
+                    });
+                });
+            })
+            .expect("spawn")
+            .join()
+            .expect("the converter answers under the floor");
     }
 
     /// #1192: unlike `to_owned`/`to_owned_cursor` (this file, still silently

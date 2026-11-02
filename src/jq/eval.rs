@@ -22800,7 +22800,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // rather than being silently substituted with JSON's `"null"` (#561).
         let entry_doc = match entry.reindexed::<S>() {
             Ok(doc) => doc,
-            Err(e) => return QueryResult::Error(e), // patchcov: coverage tolerate-line reason="unreachable: entry is one of to_entries's already-materialized {key,value} pairs, so its depth here is provably no deeper than whatever earlier check let it exist -- a document-decoded entry is already <256 deep (MAX_NESTING_DEPTH, stricter than this 384 guard), and a filter-constructed one already survived becoming a cursor via its own whole-object reindex, which is strictly deeper than any single field extracted from it could be (unwrapping only reduces depth); confirmed live, {a: (reduce range(400) as $i (0; [.]))} | with_entries(.) fails one step earlier at the whole-object bridge, never here (#3261)"
+            Err(e) => return QueryResult::Error(e), // patchcov: coverage tolerate-line reason="unreachable: entry is one of to_entries's already-materialized {key,value} pairs, so its depth here is provably no deeper than whatever earlier check let it exist -- a document-decoded entry is already <256 deep (MAX_NESTING_DEPTH, stricter than this 384 guard), and a filter-constructed one already survived becoming a cursor via its own whole-object reindex, which is strictly deeper than any single field extracted from it could be (unwrapping only reduces depth); the whole-object bridge applies the same bound one step earlier, so it never fails here (#3261, #5554)"
         };
         let cursor = entry_doc.root();
 
@@ -102934,8 +102934,9 @@ mod value_depth_floor {
 /// value checks its depth once per level, so past 384 levels such a check can ask the floor instead:
 /// a walk then refuses where its stack is spent rather than at a fixed depth calibrated for the
 /// smallest stack a thread might have. Without a registered floor, or outside `f`, the bound stays
-/// 384. `succinctly jq` arms it for its whole run; `succinctly yq` does not, since its emitters were
-/// tuned against 384 on their own.
+/// 384. `succinctly jq` arms it for its whole run, and `succinctly yq` does too since #5876: its
+/// emitters and presentation walks assert through the same guards, so they refuse where their own
+/// frames have spent half the stack, not at 384.
 ///
 /// No-op under `no_std`.
 pub fn with_value_depth_on_stack_floor<R>(f: impl FnOnce() -> R) -> R {
