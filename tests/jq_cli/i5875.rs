@@ -12,198 +12,34 @@ use crate::run_jq_full;
 #[test]
 fn constructor_folds_answer_as_jq_5875() -> Result<()> {
     for (filter, input, want, want_code) in [
-        (
-            r"reduce range(5) as $i (0; [.])",
-            None,
-            r#"[[[[[0]]]]]
-"#,
-            0,
-        ),
-        (
-            r"reduce range(5) as $i (0; [., $i])",
-            None,
-            r#"[[[[[0,0],1],2],3],4]
-"#,
-            0,
-        ),
-        (
-            r"reduce range(4) as $i (0; [$i, .])",
-            None,
-            r#"[3,[2,[1,[0,0]]]]
-"#,
-            0,
-        ),
-        (
-            r#"reduce range(4) as $i (0; [$i, ., "x", null, true, {"a":[1]}])"#,
-            None,
-            r#"[3,[2,[1,[0,0,"x",null,true,{"a":[1]}],"x",null,true,{"a":[1]}],"x",null,true,{"a":[1]}],"x",null,true,{"a":[1]}]
-"#,
-            0,
-        ),
-        (
-            r"reduce range(4) as $i (0; {a: .})",
-            None,
-            r#"{"a":{"a":{"a":{"a":0}}}}
-"#,
-            0,
-        ),
-        (
-            r"reduce range(4) as $i (0; {a: ., b: $i})",
-            None,
-            r#"{"a":{"a":{"a":{"a":0,"b":0},"b":1},"b":2},"b":3}
-"#,
-            0,
-        ),
-        (
-            r"reduce range(4) as $i (0; {($i|tostring): .})",
-            None,
-            r#"{"3":{"2":{"1":{"0":0}}}}
-"#,
-            0,
-        ),
-        (
-            r"reduce range(4) as $i (0; {b: 1, a: ., b: 3})",
-            None,
-            r#"{"b":3,"a":{"b":3,"a":{"b":3,"a":{"b":3,"a":0}}}}
-"#,
-            0,
-        ),
-        (
-            r"reduce range(4) as $i (0; {a: ., a: 2})",
-            None,
-            r#"{"a":2}
-"#,
-            0,
-        ),
-        (
-            r"[foreach range(4) as $i (0; [., $i]; length)]",
-            None,
-            r#"[2,2,2,2]
-"#,
-            0,
-        ),
-        (
-            r"[foreach range(3) as $i (0; {a: .}; .)]",
-            None,
-            r#"[{"a":0},{"a":{"a":0}},{"a":{"a":{"a":0}}}]
-"#,
-            0,
-        ),
-        (
-            r"0 | until(tojson|length > 12; [.])",
-            None,
-            r#"[[[[[[0]]]]]]
-"#,
-            0,
-        ),
-        (
-            r"reduce range(2) as $i (nan; [.])",
-            None,
-            r#"[[null]]
-"#,
-            0,
-        ),
-        (
-            r"reduce range(2) as $i (100000000000000000000000; [.])",
-            None,
-            r#"[[100000000000000000000000]]
-"#,
-            0,
-        ),
-        (
-            r"reduce range(2) as $i (-0; [.])",
-            None,
-            r#"[[-0]]
-"#,
-            0,
-        ),
-        (
-            r"reduce range(1) as $i (1.10; {a: .})",
-            None,
-            r#"{"a":1.10}
-"#,
-            0,
-        ),
-        (
-            r#"reduce range(3) as $i (0; [., error("x")])"#,
-            None,
-            r"",
-            5,
-        ),
-        (
-            r"reduce range(3) as $i (0; [., empty])",
-            None,
-            r#"[[[0]]]
-"#,
-            0,
-        ),
-        (
-            r"reduce range(3) as $i (0; [., .])",
-            None,
-            r#"[[[0,0],[0,0]],[[0,0],[0,0]]]
-"#,
-            0,
-        ),
-        (
-            r"reduce range(3) as $i (0; {a: (., .)})",
-            None,
-            r#"{"a":{"a":{"a":0}}}
-"#,
-            0,
-        ),
-        (r"reduce range(3) as $i (0; {(1): .})", None, r"", 3),
-        (
-            r"reduce .[] as $x (0; [., $x])",
-            Some(r#"[{"a":1},[2],3]"#),
-            r#"[[[0,{"a":1}],[2]],3]
-"#,
-            0,
-        ),
-        (
-            r"reduce .[] as $x (null; {k: ., v: $x})",
-            Some(r#"[{"a":1},[2],3]"#),
-            r#"{"k":{"k":{"k":null,"v":{"a":1}},"v":[2]},"v":3}
-"#,
-            0,
-        ),
-        (
-            r"reduce .[] as $x ({}; {p: ., v: $x}) | [paths]",
-            Some(r#"[{"a":1},[2]]"#),
-            r#"[["p"],["p","p"],["p","v"],["p","v","a"],["v"],["v",0]]
-"#,
-            0,
-        ),
-        (
-            r". as $d | reduce range(3) as $i (0; {a: ., b: $d})",
-            Some(r#"{"q":[1,2]}"#),
-            r#"{"a":{"a":{"a":0,"b":{"q":[1,2]}},"b":{"q":[1,2]}},"b":{"q":[1,2]}}
-"#,
-            0,
-        ),
-        (
-            r"reduce range(300) as $i (0; [.]) | flatten",
-            None,
-            r#"[0]
-"#,
-            0,
-        ),
-        (
-            r"reduce range(300) as $i (0; {a: .}) | [paths] | length",
-            None,
-            r#"300
-"#,
-            0,
-        ),
-        (
-            r"reduce range(3) as $i (0; [.]) | path(..)",
-            None,
-            r#"[]
-[0]
-[0,0]
-[0,0,0]
-"#,
-            0,
-        ),
+        (r"reduce range(5) as $i (0; [.])", None, "[[[[[0]]]]]\n", 0),
+        (r"reduce range(5) as $i (0; [., $i])", None, "[[[[[0,0],1],2],3],4]\n", 0),
+        (r"reduce range(4) as $i (0; [$i, .])", None, "[3,[2,[1,[0,0]]]]\n", 0),
+        (r#"reduce range(4) as $i (0; [$i, ., "x", null, true, {"a":[1]}])"#, None, "[3,[2,[1,[0,0,\"x\",null,true,{\"a\":[1]}],\"x\",null,true,{\"a\":[1]}],\"x\",null,true,{\"a\":[1]}],\"x\",null,true,{\"a\":[1]}]\n", 0),
+        (r"reduce range(4) as $i (0; {a: .})", None, "{\"a\":{\"a\":{\"a\":{\"a\":0}}}}\n", 0),
+        (r"reduce range(4) as $i (0; {a: ., b: $i})", None, "{\"a\":{\"a\":{\"a\":{\"a\":0,\"b\":0},\"b\":1},\"b\":2},\"b\":3}\n", 0),
+        (r"reduce range(4) as $i (0; {($i|tostring): .})", None, "{\"3\":{\"2\":{\"1\":{\"0\":0}}}}\n", 0),
+        (r"reduce range(4) as $i (0; {b: 1, a: ., b: 3})", None, "{\"b\":3,\"a\":{\"b\":3,\"a\":{\"b\":3,\"a\":{\"b\":3,\"a\":0}}}}\n", 0),
+        (r"reduce range(4) as $i (0; {a: ., a: 2})", None, "{\"a\":2}\n", 0),
+        (r"[foreach range(4) as $i (0; [., $i]; length)]", None, "[2,2,2,2]\n", 0),
+        (r"[foreach range(3) as $i (0; {a: .}; .)]", None, "[{\"a\":0},{\"a\":{\"a\":0}},{\"a\":{\"a\":{\"a\":0}}}]\n", 0),
+        (r"0 | until(tojson|length > 12; [.])", None, "[[[[[[0]]]]]]\n", 0),
+        (r"reduce range(2) as $i (nan; [.])", None, "[[null]]\n", 0),
+        (r"reduce range(2) as $i (100000000000000000000000; [.])", None, "[[100000000000000000000000]]\n", 0),
+        (r"reduce range(2) as $i (-0; [.])", None, "[[-0]]\n", 0),
+        (r"reduce range(1) as $i (1.10; {a: .})", None, "{\"a\":1.10}\n", 0),
+        (r#"reduce range(3) as $i (0; [., error("x")])"#, None, "", 5),
+        (r"reduce range(3) as $i (0; [., empty])", None, "[[[0]]]\n", 0),
+        (r"reduce range(3) as $i (0; [., .])", None, "[[[0,0],[0,0]],[[0,0],[0,0]]]\n", 0),
+        (r"reduce range(3) as $i (0; {a: (., .)})", None, "{\"a\":{\"a\":{\"a\":0}}}\n", 0),
+        (r"reduce range(3) as $i (0; {(1): .})", None, "", 3),
+        (r"reduce .[] as $x (0; [., $x])", Some(r#"[{"a":1},[2],3]"#), "[[[0,{\"a\":1}],[2]],3]\n", 0),
+        (r"reduce .[] as $x (null; {k: ., v: $x})", Some(r#"[{"a":1},[2],3]"#), "{\"k\":{\"k\":{\"k\":null,\"v\":{\"a\":1}},\"v\":[2]},\"v\":3}\n", 0),
+        (r"reduce .[] as $x ({}; {p: ., v: $x}) | [paths]", Some(r#"[{"a":1},[2]]"#), "[[\"p\"],[\"p\",\"p\"],[\"p\",\"v\"],[\"p\",\"v\",\"a\"],[\"v\"],[\"v\",0]]\n", 0),
+        (r". as $d | reduce range(3) as $i (0; {a: ., b: $d})", Some(r#"{"q":[1,2]}"#), "{\"a\":{\"a\":{\"a\":0,\"b\":{\"q\":[1,2]}},\"b\":{\"q\":[1,2]}},\"b\":{\"q\":[1,2]}}\n", 0),
+        (r"reduce range(300) as $i (0; [.]) | flatten", None, "[0]\n", 0),
+        (r"reduce range(300) as $i (0; {a: .}) | [paths] | length", None, "300\n", 0),
+        (r"reduce range(3) as $i (0; [.]) | path(..)", None, "[]\n[0]\n[0,0]\n[0,0,0]\n", 0),
     ] {
         let args: &[&str] = if input.is_some() {
             &["-c", filter]
