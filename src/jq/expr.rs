@@ -466,8 +466,9 @@ pub enum Expr {
     /// Chained expressions: `.foo.bar[0]`
     /// Each element is applied in sequence to the result of the previous.
     ///
-    /// The stages are a [`PipeStages`], which reads as a `Vec<Expr>` and also
-    /// remembers whether any stage needs path context (#3886).
+    /// The stages are a [`PipeStages`], which reads as the `[Expr]` slice of
+    /// its stages (its `Vec` to edit is [`PipeStages::make_mut`], #5488) and
+    /// also remembers whether any stage needs path context (#3886).
     Pipe(PipeStages),
 
     /// Comma operator: `.foo, .bar` - outputs from both expressions
@@ -1947,14 +1948,16 @@ impl core::fmt::Debug for ArithSettleMemo {
 ///
 /// Derived state, like [`FuncDefData`]'s memo: it takes no part in equality or
 /// `Debug`, a clone starts empty (and is a deep copy of the stages, never a
-/// view: a stage holding evaluation state must start empty, #3148), and
+/// view: a view shares the stage nodes themselves, #3148), and
 /// `DerefMut` forgets it, because any rewrite of a stage goes through
 /// [`Self::make_mut`] and may change the answer
 /// (or, for the tail copies, no longer be a copy of the stages). A tail copy
 /// or a kept run starts with the `false`s its owner had settled, never a
 /// `true` (`PipeStages::copy_of`, #5488): sound because a copy holds a
-/// subset of the owner's stages and the stages change only through `DerefMut`,
-/// which forgets the copy's cells as it does the owner's. A pipe built from
+/// subset of the owner's stages and the stages change only through `DerefMut`
+/// and `make_mut`, which forget the copy's cells as they do the owner's. A
+/// tail copy or view also starts knowing where its last stateful stage is,
+/// which is exact for a tail (`tail_copy`). A pipe built from
 /// a chain block or a split tail (`PipeStages::build_chain`) starts empty.
 #[derive(Default)]
 pub struct PipeStages {
@@ -1965,9 +1968,12 @@ pub struct PipeStages {
     holds_resolver_node: core::cell::Cell<Option<bool>>,
     holds_bind: core::cell::Cell<Option<bool>>,
     holds_var: core::cell::Cell<Option<bool>>,
-    /// Whether a stage holds evaluation state (#3148, #5488): a tail of a pipe
-    /// that holds none is handed on as a view of its stages.
-    holds_state: core::cell::Cell<Option<bool>>,
+    /// How many stages lead up to and include the last that holds evaluation
+    /// state (#3148, #5488), 0 when none does: a tail starting at or past it
+    /// holds none and is handed on as a view of its stages. A position rather
+    /// than a yes or no, so that a tail of a pipe whose `def` comes late knows
+    /// its answer without walking its stages again (review of #5830).
+    state_end: core::cell::Cell<Option<u32>>,
     tails: TailState,
 }
 
@@ -2469,21 +2475,44 @@ impl PipeStages {
     /// copied in turn.
     ///
     /// A copy is made shareable, and a tail of a pipe that is shareable is a
-    /// view of its storage (#5488), unless `holds_state` says a stage of the
-    /// pipe holds evaluation state: a view shares the stage itself, which would
-    /// carry what evaluation did to it from one call to the next (#3148).
-    /// Copied, the tails of one value down a pipe of `n` stages were `n - 1`,
-    /// `n - 2`, ... stage clones; now the first is a copy and every tail of it a
-    /// reference-count bump. `holds_state` is asked of a shareable pipe once and
-    /// remembered, and a view inherits the `false`; a pipe that owns a `Vec` is
-    /// copied without asking, so a pipe that goes down once pays no walk.
-    pub(crate) fn tail_copy(&self, from: usize, holds_state: impl FnOnce(&[Expr]) -> bool) -> Self {
-        let mut copy = match &self.storage {
-            Storage::Shared { stages, start } if !self.holds_state_or_init(holds_state) => {
+    /// view of its storage (#5488), unless a stage of the tail holds evaluation
+    /// state: a view shares the stage itself, which would carry what evaluation
+    /// did to it from one call to the next (#3148). Copied, the tails of one
+    /// value down a pipe of `n` stages were `n - 1`, `n - 2`, ... stage clones;
+    /// now the first is a copy and every tail of it a reference-count bump.
+    ///
+    /// `state_end` answers how many stages lead up to and include the last
+    /// that holds state (0 when none does). It is asked of a shareable pipe
+    /// once and remembered, and every copy and view of a tail starts knowing
+    /// its own answer, so no tail of the pipe walks its stages again. A pipe
+    /// that owns a `Vec` is copied without asking, so a pipe that goes down
+    /// once pays no walk. A copy no view could come of stays a `Vec`: one
+    /// whose tails past its last stateful stage are shorter than two stages
+    /// (a lone stage is handed on bare, never as a tail copy), which covers
+    /// every copy of fewer than three stages.
+    pub(crate) fn tail_copy(&self, from: usize, state_end: impl FnOnce(&[Expr]) -> usize) -> Self {
+        let end = match &self.storage {
+            Storage::Shared { .. } => Some(self.state_end_or_init(state_end)),
+            Storage::Own(_) => self.state_end.get().map(|end| end as usize),
+        };
+        let mut copy = match (&self.storage, end) {
+            (Storage::Shared { stages, start }, Some(end)) if end <= from => {
                 self.view_from(stages, *start as usize + from)
             }
-            _ => self.copy_of(&self[from..]).into_shared(),
+            _ => {
+                let copy = self.copy_of(&self[from..]);
+                let end = end.map_or(0, |end| end.saturating_sub(from));
+                if copy.len() >= end.max(1) + 2 {
+                    copy.into_shared()
+                } else {
+                    copy
+                }
+            }
         };
+        if let Some(end) = end {
+            copy.state_end
+                .set(Some(Self::stage_index(end.saturating_sub(from))));
+        }
         if let Some((table, base)) = &self.tails.origin {
             copy.tails.origin = Some((Weak::clone(table), base + from));
         }
@@ -2509,11 +2538,11 @@ impl PipeStages {
     /// A pipe over `stages[start..]`, this pipe's shared storage (#5488),
     /// starting with every `false` this pipe has settled, as [`Self::copy_of`].
     fn view_from(&self, stages: &Rc<Vec<Expr>>, start: usize) -> Self {
-        debug_assert!(start <= stages.len());
+        assert!(start <= stages.len(), "a view starts within its storage");
         let view = Self {
             storage: Storage::Shared {
                 stages: Rc::clone(stages),
-                start: u32::try_from(start).expect("a pipe has fewer than 2^32 stages"),
+                start: Self::stage_index(start),
             },
             ..Self::default()
         };
@@ -2542,11 +2571,13 @@ impl PipeStages {
             (&self.holds_resolver_node, &copy.holds_resolver_node),
             (&self.holds_bind, &copy.holds_bind),
             (&self.holds_var, &copy.holds_var),
-            (&self.holds_state, &copy.holds_state),
         ] {
             if settled.get() == Some(false) {
                 inherited.set(Some(false));
             }
+        }
+        if self.state_end.get() == Some(0) {
+            copy.state_end.set(Some(0));
         }
     }
 
@@ -2782,10 +2813,23 @@ impl PipeStages {
         memo(&self.holds_var, || classify(self))
     }
 
-    /// Whether a stage holds evaluation state, computing it with `classify` on
-    /// the first call (#5488): whether [`Self::tail_copy`] must copy.
-    pub(crate) fn holds_state_or_init(&self, classify: impl FnOnce(&[Expr]) -> bool) -> bool {
-        memo(&self.holds_state, || classify(self))
+    /// How many stages lead up to and include the last that holds evaluation
+    /// state, 0 when none does, computing it with `classify` on the first call
+    /// (#5488): from where on [`Self::tail_copy`] may view rather than copy.
+    pub(crate) fn state_end_or_init(&self, classify: impl FnOnce(&[Expr]) -> usize) -> usize {
+        match self.state_end.get() {
+            Some(end) => end as usize,
+            None => {
+                let end = classify(self);
+                self.state_end.set(Some(Self::stage_index(end)));
+                end
+            }
+        }
+    }
+
+    /// `at`, a position among a pipe's stages, as it is stored.
+    fn stage_index(at: usize) -> u32 {
+        u32::try_from(at).expect("a pipe has fewer than 2^32 stages")
     }
 
     /// Whether this pipe's stages are a view of the storage `other` holds
@@ -2806,18 +2850,13 @@ impl PipeStages {
     /// own first; one that holds it alone is edited in place, dropping the
     /// stages before its start.
     pub fn make_mut(&mut self) -> &mut Vec<Expr> {
-        self.needs_path_context.set(None);
-        self.effect_before_last.set(None);
-        self.holds_tracked_var.set(None);
-        self.holds_resolver_node.set(None);
-        self.holds_bind.set(None);
-        self.holds_var.set(None);
-        self.holds_state.set(None);
-        self.tails = TailState::default();
-        if let Storage::Shared { .. } = self.storage {
-            let shared = core::mem::take(&mut self.storage);
-            self.storage = Storage::Own(shared.into_vec());
-        }
+        // Rebuilt from `Default`, so a memo added later is forgotten without
+        // a line here to forget it.
+        let stages = core::mem::take(&mut self.storage).into_vec();
+        *self = Self {
+            storage: Storage::Own(stages),
+            ..Self::default()
+        };
         match &mut self.storage {
             Storage::Own(stages) => stages,
             Storage::Shared { .. } => unreachable!("the storage was just made a `Vec`"), // patchcov: coverage tolerate-line reason="unreachable: the `if` above replaces shared storage with a `Vec`"
@@ -2859,7 +2898,7 @@ impl From<Vec<Expr>> for PipeStages {
             holds_resolver_node: core::cell::Cell::new(None),
             holds_bind: core::cell::Cell::new(None),
             holds_var: core::cell::Cell::new(None),
-            holds_state: core::cell::Cell::new(None),
+            state_end: core::cell::Cell::new(None),
             tails: TailState::default(),
         }
     }
@@ -4798,7 +4837,7 @@ mod tests {
         };
         let owner = stages();
         settle(&owner, false);
-        let copy = owner.tail_copy(2, |_| true);
+        let copy = owner.tail_copy(2, <[Expr]>::len);
         assert_eq!(copy.len(), 4);
         // Every question is answered from the owner's `false`: a walk here would panic.
         assert!(!copy.needs_path_context_or_init(|_| unreachable!("inherited")));
@@ -4811,7 +4850,7 @@ mod tests {
         // A `true` is the owner's alone, and an unanswered question is not guessed.
         let owner = stages();
         settle(&owner, true);
-        let copy = owner.tail_copy(2, |_| true);
+        let copy = owner.tail_copy(2, <[Expr]>::len);
         assert!(
             !copy.needs_path_context_or_init(|_| false),
             "the copy asks for itself"
@@ -4820,7 +4859,7 @@ mod tests {
             !copy.holds_var_or_init(|_| false),
             "the copy asks for itself"
         );
-        let unanswered = stages().tail_copy(1, |_| true);
+        let unanswered = stages().tail_copy(1, <[Expr]>::len);
         assert!(
             unanswered.holds_bind_or_init(|_| true),
             "nothing to inherit"
@@ -4845,7 +4884,7 @@ mod tests {
         // Mutating a copy forgets what it inherited, as it does for any pipe.
         let owner = stages();
         settle(&owner, false);
-        let mut mutated = owner.tail_copy(2, |_| true);
+        let mut mutated = owner.tail_copy(2, <[Expr]>::len);
         assert!(!mutated.holds_bind_or_init(|_| unreachable!("inherited")));
         mutated.make_mut().push(Expr::Identity);
         assert!(mutated.holds_bind_or_init(|_| true), "a rewrite forgets");
@@ -4867,22 +4906,22 @@ mod tests {
     fn a_tail_of_a_stateless_copy_is_a_view_of_its_stages_5488() {
         let numbered = |n: i64| PipeStages::from((0..n).map(lit_5488).collect::<Vec<_>>());
         let program = numbered(7);
-        let not_asked = |_: &[Expr]| -> bool {
+        let not_asked = |_: &[Expr]| -> usize {
             unreachable!("an owned `Vec` is copied without asking") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: the closure fails the test if it is asked"
         };
         let owner = program.tail_copy(1, not_asked);
-        assert!(!owner.shares_storage_with(&program), "a copy of its own");
+        assert!(!core::ptr::eq(&owner[0], &program[1]), "a copy of its own");
         assert_eq!(owner.as_slice(), &program[1..]);
         assert!(!owner.holds_bind_or_init(|_| false));
 
-        let view = owner.tail_copy(2, |_| false);
+        let view = owner.tail_copy(2, |_| 0);
         assert!(view.shares_storage_with(&owner), "a view, not a copy");
         assert_eq!(view.as_slice(), &owner[2..]);
         assert!(core::ptr::eq(&view[0], &owner[2]), "the owner's own stages");
-        assert!(!view.holds_state_or_init(|_| unreachable!("inherited")));
+        assert_eq!(view.state_end_or_init(|_| unreachable!("inherited")), 0);
         assert!(!view.holds_bind_or_init(|_| unreachable!("inherited")));
         assert!(
-            !owner.holds_state_or_init(|_| unreachable!("asked once")),
+            owner.state_end_or_init(|_| unreachable!("asked once")) == 0,
             "the owner remembers its answer"
         );
 
@@ -4895,11 +4934,40 @@ mod tests {
 
         // A pipe that holds state is copied, and copied again on every ask.
         let stateful = numbered(7).tail_copy(1, |_| unreachable!("not asked"));
-        let copy = stateful.tail_copy(2, |_| true);
+        let copy = stateful.tail_copy(2, <[Expr]>::len);
         assert!(!copy.shares_storage_with(&stateful), "a copy of its own");
         assert_eq!(copy.as_slice(), &stateful[2..]);
         let again = stateful.tail_copy(1, |_| unreachable!("asked once"));
         assert!(!again.shares_storage_with(&stateful));
+
+        // A tail starting past the last stateful stage is a view. One starting
+        // before it is a copy that knows its own answer, and whose tails past
+        // that stage are views in turn.
+        let early = numbered(8).tail_copy(1, |_| unreachable!("not asked"));
+        let past = early.tail_copy(2, |_| 2);
+        assert!(past.shares_storage_with(&early), "past the state: a view");
+        assert_eq!(past.state_end_or_init(|_| unreachable!("inherited")), 0);
+        let before = early.tail_copy(1, |_| unreachable!("asked once"));
+        assert!(!before.shares_storage_with(&early), "before it: a copy");
+        assert_eq!(before.state_end_or_init(|_| unreachable!("inherited")), 1);
+        let after = before.tail_copy(1, |_| unreachable!("inherited"));
+        assert!(after.shares_storage_with(&before), "and past it: a view");
+
+        // A copy whose state ends too late for any view stays a `Vec`, and a
+        // tail of it is copied knowing its answer: no stage is walked again.
+        let late = numbered(8).tail_copy(1, |_| unreachable!("not asked"));
+        let copy = late.tail_copy(1, <[Expr]>::len);
+        assert_eq!(copy.state_end_or_init(|_| unreachable!("inherited")), 6);
+        let again = copy.tail_copy(1, |_| unreachable!("inherited"));
+        assert!(!again.shares_storage_with(&copy));
+        assert_eq!(again.state_end_or_init(|_| unreachable!("inherited")), 5);
+        let not_shared = again.tail_copy(4, |_| unreachable!("a `Vec`, not asked"));
+        assert_eq!(not_shared.as_slice(), &again[4..]);
+
+        // So does a copy of fewer than three stages: its one tail is a lone stage.
+        let short = numbered(3).tail_copy(1, not_asked);
+        let lone = short.tail_copy(1, |_| unreachable!("a `Vec`, not asked"));
+        assert_eq!(lone.as_slice(), &short[1..]);
 
         // A clone of a view is a deep copy, never another view (#3148).
         let cloned = view.clone();
@@ -4916,7 +4984,7 @@ mod tests {
         let numbered = |n: i64| PipeStages::from((0..n).map(lit_5488).collect::<Vec<_>>());
         let shareable = |n: i64| numbered(n + 1).tail_copy(1, |_| unreachable!("not asked"));
         let owner = shareable(5);
-        let mut view = owner.tail_copy(2, |_| false);
+        let mut view = owner.tail_copy(2, |_| 0);
         view.make_mut().push(Expr::Identity);
         assert!(!view.shares_storage_with(&owner));
         assert_eq!(view.len(), 4);
@@ -4924,12 +4992,12 @@ mod tests {
         assert_eq!(owner.as_slice(), shareable(5).as_slice());
 
         // The owner outlived by its view: the view holds the storage alone.
-        let mut alone = shareable(5).tail_copy(3, |_| false);
+        let mut alone = shareable(5).tail_copy(3, |_| 0);
         assert_eq!(alone.make_mut().as_slice(), &shareable(5)[3..]);
 
         // `DerefMut` goes through the same edit.
         let owner = shareable(4);
-        let mut written = owner.tail_copy(1, |_| false);
+        let mut written = owner.tail_copy(1, |_| 0);
         written[0] = Expr::Identity;
         assert_eq!(owner[1], lit_5488(2), "the owner is untouched");
         assert_eq!(
@@ -4939,11 +5007,8 @@ mod tests {
 
         // `into_vec` and by-value iteration yield the view's stages, shared or not.
         let owner = shareable(4);
-        assert_eq!(
-            owner.tail_copy(2, |_| false).into_vec(),
-            owner[2..].to_vec()
-        );
-        let last: Vec<Expr> = shareable(4).tail_copy(3, |_| false).into_iter().collect();
+        assert_eq!(owner.tail_copy(2, |_| 0).into_vec(), owner[2..].to_vec());
+        let last: Vec<Expr> = shareable(4).tail_copy(3, |_| 0).into_iter().collect();
         assert_eq!(last, vec![lit_5488(4)]);
         assert_eq!(shareable(2).into_vec(), vec![lit_5488(1), lit_5488(2)]);
     }
@@ -5193,7 +5258,7 @@ mod tests {
             .expect("after the reading stage");
         // The tail from 1 is copied, and the copy is linked.
         assert!(second.kept_tail(1, |_| true).is_none());
-        let copy = second.tail_copy(1, |_| true);
+        let copy = second.tail_copy(1, <[Expr]>::len);
         assert_eq!(copy.len(), 9);
         assert!(
             copy.kept_tail(1, |_| true).is_none(),
@@ -5203,16 +5268,18 @@ mod tests {
             .kept_tail(4, |_| unreachable!("made for the second"))
             .expect("offset 5 of the pipe");
         assert!(Rc::ptr_eq(&again, &kept));
-        // A copy of a copy keeps it too.
-        let inner = copy.tail_copy(2, |_| true);
+        // A tail of the copy keeps it too: a view of the copy's stages
+        // (#5488), whose origin is the copy's, at the offset it starts from.
+        let inner = copy.tail_copy(2, |_| 0);
+        assert!(inner.shares_storage_with(&copy), "a view of the copy");
         assert!(inner
             .kept_tail(2, |_| unreachable!("made for the second"))
             .is_some_and(|tail| Rc::ptr_eq(&tail, &kept)));
         // Not linked: a plain copy, which keeps nothing on its first ask.
-        let alone = third.tail_copy(0, |_| true);
+        let alone = third.tail_copy(0, <[Expr]>::len);
         assert_eq!(alone.len(), 10);
         let unlinked = PipeStages::from(vec![Expr::Field("a".into()); 6]);
-        let plain = unlinked.tail_copy(2, |_| true);
+        let plain = unlinked.tail_copy(2, <[Expr]>::len);
         assert_eq!(plain.len(), 4);
         assert!(plain.tails.origin.is_none());
     }

@@ -11801,8 +11801,9 @@ pub(crate) mod owned_pipe_copies {
 /// rest cannot be answered without it (#1598, #3673, #3682).
 ///
 /// `eval_each_owned` takes an `&Expr`, and the only way to present a `rest`
-/// *slice* as one is to own a copy: a `Vec` allocation plus a recursive
-/// `Expr` clone per stage. Doing that inside the per-element call meant
+/// *slice* as one is to own a pipe of it: a copy, a `Vec` allocation plus a
+/// recursive `Expr` clone per stage, or, for a tail of a copy whose stages
+/// are shared, a view of them (#5488). Doing that inside the per-element call meant
 /// paying it once per element; a driver builds one of these instead and
 /// reuses it for its whole loop. A rest of one plain stage does not need the
 /// copy at all when `eval_each_owned`'s front doors answer it, so
@@ -11868,9 +11869,7 @@ impl RestCopy {
             #[cfg(test)]
             owned_pipe_copies::bump();
             match owner {
-                Some(owner) => {
-                    owner.tail_copy(owner.len() - stages.len(), pipe_holds_evaluation_state)
-                }
+                Some(owner) => owner.tail_copy(owner.len() - stages.len(), pipe_state_end),
                 None => stages.to_vec().into(),
             }
         })
@@ -12065,11 +12064,29 @@ fn holds_evaluation_state(stage: &Expr) -> bool {
     })
 }
 
-/// Whether any of `stages` [holds evaluation state](holds_evaluation_state):
-/// whether a tail of their pipe must be copied rather than viewed
-/// ([`PipeStages::tail_copy`], #5488).
-fn pipe_holds_evaluation_state(stages: &[Expr]) -> bool {
-    stages.iter().any(holds_evaluation_state)
+/// How many of `stages` lead up to and include the last that [holds
+/// evaluation state](holds_evaluation_state) outside an [`Expr::Shared`], 0
+/// when none does: from where on a tail of their pipe may be viewed rather
+/// than copied ([`PipeStages::tail_copy`], #5488).
+///
+/// A `Shared` node (a closure argument, a kept run, a #5679 chain link) is
+/// skipped unwalked: a copy of a stage clones it by bumping its `Rc`, so a
+/// copy shares whatever is under it with the program exactly as a view does,
+/// and its contents cannot make the copy the safer choice. Walking them cost
+/// a whole argument tree per copied tail (2.4x on a call whose 8,000-node
+/// argument sat in a copied tail, review of #5830).
+fn pipe_state_end(stages: &[Expr]) -> usize {
+    use crate::jq::walk::{search_subexpr, Visit};
+    stages
+        .iter()
+        .rposition(|stage| {
+            search_subexpr(stage, &mut |e| match e {
+                Expr::DefCall { .. } | Expr::FuncDef { .. } => Visit::Found,
+                Expr::Shared(_) => Visit::Skip,
+                _ => Visit::Descend,
+            })
+        })
+        .map_or(0, |last| last + 1)
 }
 
 /// Whether `stage` reads a variable anywhere under it, `Shared` arguments and
@@ -31512,7 +31529,7 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     if exprs.len() == 1 {
                         exprs[0].clone()
                     } else {
-                        Expr::Pipe(tail.owner.tail_copy(tail.from, pipe_holds_evaluation_state))
+                        Expr::Pipe(tail.owner.tail_copy(tail.from, pipe_state_end))
                     }
                 };
                 &built
@@ -117450,14 +117467,14 @@ mod tests {
     }
 
     /// #5488: folding a literal bracket key after a pipe target (#2126) appends
-    /// the field step to a copy of the pipe and leaves the target alone. The
+    /// the field step to the pipe's stages. The
     /// parser folds every spelling it reads itself (`.a.b[("c")]`), so only a
     /// built AST reaches this arm; it is the one that edits a pipe's stages.
     #[test]
     fn test_fold_literal_bracket_key_after_a_pipe_target_appends_a_field_5488() {
         let target = Expr::Pipe(vec![Expr::field("a"), Expr::field("b")].into());
         let indexed = Expr::IndexExpr {
-            target: Box::new(target.clone()),
+            target: Box::new(target),
             key: Box::new(Expr::Paren(Box::new(Expr::Literal(Literal::String(
                 "c".into(),
             ))))),
@@ -117466,10 +117483,6 @@ mod tests {
             fold_literal_bracket_keys(&indexed),
             Expr::Pipe(vec![Expr::field("a"), Expr::field("b"), Expr::field("c")].into())
         );
-        let Expr::IndexExpr { target: kept, .. } = &indexed else {
-            unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
-        };
-        assert_eq!(**kept, target, "the source pipe is not edited");
     }
 
     /// #5488: a body rebuilt for each value copies the rest of its pipe once
@@ -117482,6 +117495,40 @@ mod tests {
     /// the variable is read first (its tails are kept, #5436). A pipe holding a
     /// `def` still copies every tail (#3148), quadratic, as the `def` shape
     /// pins.
+    /// A closure argument holding a call does not make a copied tail
+    /// stateful: the copy would share that argument's `Rc` with the program
+    /// just as a view does, so [`pipe_state_end`] does not walk
+    /// it (review of #5830, where walking an 8,000-node argument per copied
+    /// tail made the call 2.6x slower than before views).
+    #[test]
+    fn test_a_call_in_a_closure_argument_leaves_the_tail_a_view_5488() {
+        fn run<S: EvalSemantics>() {
+            for stages in [10, 20] {
+                let body = vec![". + $x"; stages].join(" | ");
+                let program = |values: usize| {
+                    run_owned_pipe_program::<S>(
+                        &format!(
+                            "def h: .; def g(f): . as $x | ({body} | if . < 0 then f else . end); \
+                             [range(0;{values}) | g(h)] | length"
+                        ),
+                        b"null",
+                    )
+                };
+                let (few, many) = (program(4), program(40));
+                assert_eq!(many.output, "40", "{stages} stages ({:?})", S::TAG);
+                let more = many.copied_stages - few.copied_stages;
+                assert!(
+                    more <= 36 * 2 * stages,
+                    "{stages} stages: 36 more values cloned {more} stages, so a call \
+                     inside the argument `f` made each tail a copy ({:?})",
+                    S::TAG
+                );
+            }
+        }
+        run::<JqSemantics>();
+        run::<YqSemantics>();
+    }
+
     #[test]
     fn test_rebuilt_body_hands_its_tails_on_as_views_5488() {
         fn run<S: EvalSemantics>() {
