@@ -4,7 +4,8 @@
 //! when the result is empty or does not fit the `strlen(fmt) + 100` byte buffer jq gives the libc.
 //! Every expectation is what jq 1.7.1 (`/usr/bin/jq`) prints on macOS: `^`, `#` and a width are
 //! not flags there, and `y`, `Y`, `C`, `g` and `G` ignore the flags (a glibc `jq` pads and strips
-//! those, reads `^` and `#`, and prints an unknown `%Q` as written).
+//! those, reads `^` and `#`, and prints an unknown `%Q` as written). `%E` and `%O` are modifiers
+//! the libc passes through for every specifier, and a flag may stand on either side of one.
 
 use std::process::Command;
 
@@ -108,6 +109,21 @@ fn flags_pad_the_numeric_specifiers_and_nothing_else() -> Result<()> {
         ("strflocaltime", 1420167845, "UTC", "%0z", "\"+0000\""),
         ("strftime", 1420167845, "UTC", "%p", "\"AM\""),
         ("strftime", 1420167845, "UTC", "%c%c%c%c", "\"Fri Jan  2 03:04:05 2015Fri Jan  2 03:04:05 2015Fri Jan  2 03:04:05 2015Fri Jan  2 03:04:05 2015\""),
+        ("strftime", 1420167845, "UTC", "%+", "\"Fri Jan  2 03:04:05 UTC 2015\""),
+        ("strftime", 1420167845, "UTC", "%v", "\" 2-Jan-2015\""),
+        ("strftime", 1420167845, "UTC", "%_+", "\"Fri Jan  2 03:04:05 UTC 2015\""),
+        ("strftime", 1420167845, "UTC", "%-v", "\" 2-Jan-2015\""),
+        ("strftime", 1420167845, "UTC", "%E+", "\"Fri Jan  2 03:04:05 UTC 2015\""),
+        ("strftime", 1420167845, "UTC", "%Ev", "\" 2-Jan-2015\""),
+        ("strftime", 1420167845, "UTC", "[%-Ed|%E_d|%O-d|%0Oe|%_Ek|%-Ey|%E-y|%_Ec|%-Ox|%E_Y|%-EH|%_OM]", "\"[2| 2|2|02| 3|15|15|Fri Jan  2 03:04:05 2015|01/02/15|2015|3| 4]\""),
+        ("strftime", 1420167845, "UTC", "%Ea|%Ob|%En|%Ep|%Eg|%Oh", "\"Fri|Jan|\\n|AM|15|Jan\""),
+        ("strftime", 1420167845, "UTC", "%E|%O", "\"|O\""),
+        ("strftime", 1420167845, "UTC", "%E-|%E_|%E0|%O-", "\"|||-\""),
+        ("strftime", 1420167845, "UTC", "%-E|%_O", "\"|O\""),
+        ("strftime", 1420167845, "UTC", "%E%|%EE|%OE|%EO|%E5", "\"%|E|E|O|5\""),
+        ("strftime", 1420167845, "UTC", "%EE_d|%-E-y|%E--d|%E-_d|%E-Ey", "\"E_d|-y|-d|_d|Ey\""),
+        ("strftime", 1420167845, "UTC", "x%Ex", "\"x01/02/15\""),
+        ("strftime", 1420167845, "UTC", "%c%c%c%c%Y%Y%Y%Y%Y%a", "\"Fri Jan  2 03:04:05 2015Fri Jan  2 03:04:05 2015Fri Jan  2 03:04:05 2015Fri Jan  2 03:04:05 201520152015201520152015Fri\""),
     ] {
         assert_eq!(
             format_time(function, secs, tz, fmt)?.0.as_deref(),
@@ -124,6 +140,7 @@ fn an_empty_or_oversized_result_is_a_system_failure() -> Result<()> {
         ("strftime", 1420167845, "UTC", ""),
         ("strftime", 1420167845, "UTC", "%c%c%c%c%c"),
         ("strflocaltime", 1420167845, "UTC", ""),
+        ("strftime", 1420167845, "UTC", "%c%c%c%c%Y%Y%Y%Y%Y%a%a"),
     ] {
         let (out, stderr) = format_time(function, secs, tz, fmt)?;
         assert_eq!(out, None, "{function}({fmt:?})");
@@ -132,5 +149,34 @@ fn an_empty_or_oversized_result_is_a_system_failure() -> Result<()> {
             "{function}({fmt:?}): {stderr}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn the_optional_form_of_a_failing_format_is_empty() -> Result<()> {
+    for filter in [
+        r#"1420167845|strftime("")?"#,
+        r#"1420167845|strflocaltime("%c%c%c%c%c")?"#,
+        r#"1420167845|[strftime("")?]|length"#,
+    ] {
+        let (out, _stderr, code) = crate::run_jq_full(&["-n", filter], None)?;
+        assert_eq!(code, 0, "{filter}");
+        assert!(out.is_empty() || out == "0\n", "{filter}: {out:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_nul_ends_the_format() -> Result<()> {
+    let (out, _stderr, code) =
+        crate::run_jq_full(&["-n", "-c", r#"1420167845|strftime("a\u0000b%Y")"#], None)?;
+    assert_eq!((out.as_str(), code), ("\"a\"\n", 0));
+    let (_out, stderr, code) =
+        crate::run_jq_full(&["-n", r#"1420167845|strftime("\u0000")"#], None)?;
+    assert_eq!(code, 5);
+    assert!(
+        stderr.contains("strftime/1: unknown system failure"),
+        "{stderr}"
+    );
     Ok(())
 }

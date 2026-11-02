@@ -95225,6 +95225,10 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             };
 
+            // jq hands the libc a C string, so a NUL ends the format (`"a\u0000b"` formats as
+            // `a`) and `strlen(fmt)` below stops there too (#5754).
+            let fmt = fmt.split('\0').next().unwrap_or_default().to_string();
+
             // Only these specifiers read the zone's labels; `E`/`O` modifiers
             // precede one of them, so the letters alone decide. A locale's own
             // `%c`/`%x`/`%X`/`%r` layout may also print the zone (#5754).
@@ -95381,11 +95385,23 @@ fn format_strftime(
     while let Some(c) = chars.next() {
         if c == '%' {
             let mut spec = chars.next();
-            // A `_`, `-` or `0` right after the `%` is a padding flag for the specifier after it
-            // (#5754): `_` pads with blanks, `-` does not pad, `0` pads with zeros. A flag that
-            // ends the format is the bare character, as the pinned libc prints it.
+            // The prefix of a conversion is `[flag] [E|O] [flag]` (#5754, #3055), at most one flag
+            // in all, and the libc's reading of it is:
+            // - A `_`, `-` or `0` is a padding flag for the specifier after it: `_` pads with
+            //   blanks, `-` does not pad, `0` pads with zeros.
+            // - `E` and `O` are the POSIX "alternative representation" modifiers. The pinned C
+            //   library has no alternatives, so a modified specifier is its plain form (`%EY`,
+            //   `%Oy`, `%Ea`, `%En` are `%Y`, `%y`, `%a`, `%n`), whatever the letter.
+            // - A flag or modifier that ends the format is printed as itself (`%E` is `E`, `%-`
+            //   is `-`, `%-E` is `E`), and so is a character that names nothing, without the `%`
+            //   and without the flag before it. A second modifier, or a second flag, is one such
+            //   character (`%EE_d` is `E_d`, `%-E-y` is `-y`).
+            let flag_char = |c: Option<char>| match c {
+                Some(f @ ('_' | '-' | '0')) => Some(f),
+                _ => None,
+            };
             let mut flag = None;
-            if let Some(f @ ('_' | '-' | '0')) = spec {
+            if let Some(f) = flag_char(spec) {
                 match chars.next() {
                     Some(next) => {
                         flag = Some(f);
@@ -95394,6 +95410,25 @@ fn format_strftime(
                     None => {
                         result.push(f);
                         continue;
+                    }
+                }
+            }
+            if let Some(modifier @ ('E' | 'O')) = spec {
+                spec = chars.next();
+                if spec.is_none() {
+                    result.push(modifier);
+                    continue;
+                }
+                if let (None, Some(f)) = (flag, flag_char(spec)) {
+                    match chars.next() {
+                        Some(next) => {
+                            flag = Some(f);
+                            spec = Some(next);
+                        }
+                        None => {
+                            result.push(f);
+                            continue;
+                        }
                     }
                 }
             }
@@ -95431,47 +95466,6 @@ fn format_strftime(
                 // rule) -- macOS doesn't implement `%P` and falls back to
                 // printing the specifier letter unprefixed.
                 Some('P') => result.push('P'),
-                // POSIX's `%E`/`%O` "alternative representation" modifiers:
-                // the pinned oracle's C library has no locale-specific
-                // alternatives and treats every modified specifier as a
-                // pure pass-through to its plain form (confirmed live for
-                // every letter below, e.g. `%EY`/`%Oy`/`%Ez` all match
-                // `%Y`/`%y`/`%z` exactly, #3055). Two different fallbacks
-                // when nothing recognized follows, both confirmed live: at
-                // true end-of-format it's the bare modifier letter (the
-                // case this issue's own repro pins); followed by anything
-                // else unrecognized (a literal character, `%` starting a
-                // new specifier) it produces nothing at all, and that
-                // following character/specifier is processed normally on
-                // the *next* loop iteration -- `%E-`/`%O-` are the empty
-                // string, not `E-`/`O-`. The allow-list below is a second,
-                // hand-maintained copy of "every letter this match
-                // recognizes" (review, #3055) -- a future specifier added
-                // above needs a matching decision made here too, or its
-                // own `%E<x>`/`%O<x>` silently falls to the unrecognized
-                // fallback instead of whatever pass-through the oracle
-                // might actually implement.
-                Some(letter @ ('E' | 'O')) => match chars.peek().copied() {
-                    Some(next) if "YymdeHIMSuUVWwcCxXz".contains(next) => {
-                        chars.next();
-                        let plain = format_strftime(
-                            &format!("%{next}"),
-                            year,
-                            month,
-                            day,
-                            hour,
-                            minute,
-                            second,
-                            weekday,
-                            yearday,
-                            zone_offset,
-                            zone_name,
-                        )?; // patchcov: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: the call's own argument lines (immediately above) show 3 hits under the #3055 test's three E/O pass-through rows, but this closing-token line is never itself credited -- verified via the raw lcov DA: records"
-                        result.push_str(&plain);
-                    }
-                    Some(_) => {}
-                    None => result.push(letter),
-                },
                 // `%c`/`%r` are fixed compositions of the fields above
                 // (C's `"%a %b %e %H:%M:%S %Y"` / `"%I:%M:%S %p"`); `%x`/`%X`
                 // are merged into `%D`/`%T` below, which the oracle confirms
@@ -95486,6 +95480,14 @@ fn format_strftime(
                     "{hour12:02}:{minute:02}:{second:02} {}",
                     if hour < 12 { "AM" } else { "PM" }
                 )),
+                // The pinned libc's `%+` is `date`'s layout, `%a %b %e %H:%M:%S %Z %Y`, and
+                // `%v` is `%e-%b-%Y` (#5754).
+                Some('+') => result.push_str(&format!(
+                    "{} {} {day:2} {hour:02}:{minute:02}:{second:02} {zone_name} {year:04}",
+                    weekday_abbr(weekday),
+                    month_abbr(month),
+                )),
+                Some('v') => result.push_str(&format!("{day:2}-{}-{year:04}", month_abbr(month))),
                 Some('j') => result.push_str(&padded(
                     i64::from((yearday as i32).wrapping_add(1)), // C `tm_yday + 1`
                     3,
@@ -95585,10 +95587,8 @@ fn format_strftime(
 /// `n` in at least `width` columns, as the libc pads a numeric field: with `default` unless the
 /// field's `flag` says otherwise (`_` blanks, `0` zeros, `-` no padding).
 fn padded(n: i64, width: usize, default: char, flag: Option<char>) -> String {
-    match flag.unwrap_or(match default {
-        '0' => '0',
-        _ => '_',
-    }) {
+    debug_assert!(matches!(default, '0' | ' '));
+    match flag.unwrap_or(if default == '0' { '0' } else { '_' }) {
         '-' => n.to_string(),
         '_' => format!("{n:width$}"),
         _ => format!("{n:0width$}"),
