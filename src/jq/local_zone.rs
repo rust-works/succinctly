@@ -89,6 +89,15 @@ pub(crate) fn named_at(name: &str, utc_secs: i64) -> Option<LocalZone> {
     backend::named_at(name, utc_secs)
 }
 
+/// The local zone's standard and daylight-time names as C's `tzset` leaves them in `tzname`,
+/// the names `strptime`'s `%Z` accepts besides `GMT` (#5754): the abbreviation of the latest
+/// standard and of the latest daylight-time period the zone has had, `None` for a kind it never
+/// had. `Pacific/Honolulu` is `HST` and `HPT` (its 1945 daylight time), not `HDT`;
+/// `Australia/Brisbane` keeps `AEDT` from before 1992.
+pub(crate) fn tzname() -> [Option<String>; 2] {
+    backend::tzname()
+}
+
 /// Go's `time.Local` for [`super::go_time`]: this module's zone, whatever its backend.
 pub(crate) struct GoLocal;
 
@@ -146,6 +155,10 @@ mod backend_utc {
     ) -> LocalZone {
         LocalZone::utc()
     }
+
+    pub(super) fn tzname() -> [Option<alloc::string::String>; 2] {
+        [Some(LocalZone::utc().name), None]
+    }
 }
 
 /// The system's local zone through `jiff`: `TZ` as an IANA name, a `:name`, a
@@ -194,6 +207,43 @@ mod backend_jiff {
     pub(super) fn named_at(name: &str, utc_secs: i64) -> Option<LocalZone> {
         let tz = jiff::tz::db().get(name).ok()?;
         Some(zone_in(&tz, utc_secs))
+    }
+
+    /// An empty `TZ` is UTC, but the pin's libc loads it without setting `tzname`, so `%Z`
+    /// takes no name there but `GMT` (`UTC` is no match, though `strflocaltime` prints it).
+    pub(super) fn tzname() -> [Option<alloc::string::String>; 2] {
+        static NAMES: OnceLock<[Option<alloc::string::String>; 2]> = OnceLock::new();
+        NAMES
+            .get_or_init(|| {
+                if std::env::var_os("TZ").is_some_and(|tz| tz.is_empty()) {
+                    [None, None]
+                } else {
+                    tzname_in(system())
+                }
+            })
+            .clone()
+    }
+
+    /// `tzset` names each kind after the last period of it in the zone's tz file, so the
+    /// transitions are walked back from 2100, past the end of any table, to the first standard
+    /// and the first daylight-time one. A zone with no transitions has its one name, standard.
+    fn tzname_in(tz: &TimeZone) -> [Option<alloc::string::String>; 2] {
+        const YEAR_2100: i64 = 4_102_444_800;
+        let start = Timestamp::from_second(YEAR_2100).unwrap_or(Timestamp::MAX);
+        let mut names: [Option<alloc::string::String>; 2] = [None, None];
+        for transition in tz.preceding(start) {
+            let slot = &mut names[usize::from(transition.dst().is_dst())];
+            if slot.is_none() {
+                *slot = Some(transition.abbreviation().to_string());
+            }
+            if names.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        if names[0].is_none() {
+            names[0] = Some(tz.to_offset_info(start).abbreviation().to_string());
+        }
+        names
     }
 
     pub(super) fn for_wall_clock(
@@ -325,13 +375,24 @@ mod backend_jiff {
     #[cfg(test)]
     mod tests {
         use super::{
-            is_rule_less_posix, offset_in, wall_clock_in, with_default_rule, zone_in, TimeZone,
+            is_rule_less_posix, offset_in, tzname_in, wall_clock_in, with_default_rule, zone_in,
+            TimeZone,
         };
 
         /// New York's rule as a POSIX string: needs no tz database on the
         /// machine running the test.
         fn new_york() -> TimeZone {
             TimeZone::posix("EST5EDT,M3.2.0,M11.1.0").unwrap()
+        }
+
+        /// #5754: `tzname` holds a zone's latest standard and daylight-time names, and a zone
+        /// with no daylight time has none of the second kind.
+        #[test]
+        fn tzname_is_the_latest_standard_and_daylight_name() {
+            let names = |tz: &TimeZone| tzname_in(tz).map(|name| name.unwrap_or_default());
+            assert_eq!(names(&new_york()), ["EST", "EDT"]);
+            assert_eq!(names(&TimeZone::posix("XYZ3").unwrap()), ["XYZ", ""]);
+            assert_eq!(names(&TimeZone::UTC), ["UTC", ""]);
         }
 
         #[test]
@@ -503,6 +564,11 @@ mod backend_posix {
         _second: i64,
     ) -> LocalZone {
         current()
+    }
+
+    /// A fixed offset has one name, its standard one.
+    pub(super) fn tzname() -> [Option<String>; 2] {
+        [Some(current().name), None]
     }
 
     fn current() -> LocalZone {
