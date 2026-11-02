@@ -1,0 +1,630 @@
+{"a":1,"b":[2,3]}\n	.	-c --stream	[["a"],1]\n[["b",0],2]\n[["b",1],3]\n[["b",1]]\n[["b"]]\n		0
+{"a":1,"b":[2,3]}\n	.	--stream -r	[\n  [\n    "a"\n  ],\n  1\n]\n[\n  [\n    "b",\n    0\n  ],\n  2\n]\n[\n  [\n    "b",\n    1\n  ],\n  3\n]\n[\n  [\n    "b",\n    1\n  ]\n]\n[\n  [\n    "b"\n  ]\n]\n		0
+{"a":1,"b":[2,3]}\n	select(length==2)	-c --stream	[["a"],1]\n[["b",0],2]\n[["b",1],3]\n		0
+{"a":1,"b":[2,3]}\n	select(length==2)	--stream -r	[\n  [\n    "a"\n  ],\n  1\n]\n[\n  [\n    "b",\n    0\n  ],\n  2\n]\n[\n  [\n    "b",\n    1\n  ],\n  3\n]\n		0
+{"a":1,"b":[2,3]}\n	[., input_line_number]	-c --stream	[[["a"],1],1]\n[[["b",0],2],1]\n[[["b",1],3],1]\n[[["b",1]],1]\n[[["b"]],1]\n		0
+{"a":1,"b":[2,3]}\n	[., input_line_number]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  1\n]\n[\n  [\n    [\n      "b",\n      0\n    ],\n    2\n  ],\n  1\n]\n[\n  [\n    [\n      "b",\n      1\n    ],\n    3\n  ],\n  1\n]\n[\n  [\n    [\n      "b",\n      1\n    ]\n  ],\n  1\n]\n[\n  [\n    [\n      "b"\n    ]\n  ],\n  1\n]\n		0
+{"a":1,"b":[2,3]}\n	input_line_number	-c --stream	1\n1\n1\n1\n1\n		0
+{"a":1,"b":[2,3]}\n	input_line_number	--stream -r	1\n1\n1\n1\n1\n		0
+{"a":1,"b":[2,3]}\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n		0
+{"a":1,"b":[2,3]}\n	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n{FILE}\n{FILE}\n		0
+{"a":1,"b":[2,3]}\n	[., input]	-c --stream	[[["a"],1],[["b",0],2]]\n[[["b",1],3],[["b",1]]]\n	jq: error (at {FILE}:1): break\n	5
+{"a":1,"b":[2,3]}\n	[., input]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  [\n    [\n      "b",\n      0\n    ],\n    2\n  ]\n]\n[\n  [\n    [\n      "b",\n      1\n    ],\n    3\n  ],\n  [\n    [\n      "b",\n      1\n    ]\n  ]\n]\n	jq: error (at {FILE}:1): break\n	5
+{"a":1,"b":[2,3]}\n	[., inputs]	-c --stream	[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]]\n		0
+{"a":1,"b":[2,3]}\n	[., inputs]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  [\n    [\n      "b",\n      0\n    ],\n    2\n  ],\n  [\n    [\n      "b",\n      1\n    ],\n    3\n  ],\n  [\n    [\n      "b",\n      1\n    ]\n  ],\n  [\n    [\n      "b"\n    ]\n  ]\n]\n		0
+{"a":1,"b":[2,3]}\n	first(inputs)	-c --stream	[["b",0],2]\n[["b",1]]\n		0
+{"a":1,"b":[2,3]}\n	first(inputs)	--stream -r	[\n  [\n    "b",\n    0\n  ],\n  2\n]\n[\n  [\n    "b",\n    1\n  ]\n]\n		0
+{"a":1,"b":[2,3]}\n	if length == 2 then .[0] else empty end	-c --stream	["a"]\n["b",0]\n["b",1]\n		0
+{"a":1,"b":[2,3]}\n	if length == 2 then .[0] else empty end	--stream -r	[\n  "a"\n]\n[\n  "b",\n  0\n]\n[\n  "b",\n  1\n]\n		0
+{"a":1,"b":[2,3]}\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+{"a":1,"b":[2,3]}\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n		0
+{"a":1,"b":[2,3]}\n	halt	-c --stream			0
+{"a":1,"b":[2,3]}\n	halt	--stream -r			0
+{"a":1,"b":[2,3]}\n	error	-c --stream		jq: error (at {FILE}:1) (not a string): [["a"],1]\njq: error (at {FILE}:1) (not a string): [["b",0],2]\njq: error (at {FILE}:1) (not a string): [["b",1],3]\njq: error (at {FILE}:1) (not a string): [["b",1]]\njq: error (at {FILE}:1) (not a string): [["b"]]\n	5
+{"a":1,"b":[2,3]}\n	error	--stream -r		jq: error (at {FILE}:1) (not a string): [["a"],1]\njq: error (at {FILE}:1) (not a string): [["b",0],2]\njq: error (at {FILE}:1) (not a string): [["b",1],3]\njq: error (at {FILE}:1) (not a string): [["b",1]]\njq: error (at {FILE}:1) (not a string): [["b"]]\n	5
+{"a":1,"b":[2,3]}\n	empty	-c --stream			0
+{"a":1,"b":[2,3]}\n	empty	--stream -r			0
+{"a":1,"b":[2,3]}\n	select(length==2) | .[1]	-c --stream	1\n2\n3\n		0
+{"a":1,"b":[2,3]}\n	select(length==2) | .[1]	--stream -r	1\n2\n3\n		0
+{"a":1,"b":[2,3]}\n	length	-c --stream	2\n2\n2\n1\n1\n		0
+{"a":1,"b":[2,3]}\n	length	--stream -r	2\n2\n2\n1\n1\n		0
+[1,2]\n{"a":3}\n"x"\n	.	-c --stream	[[0],1]\n[[1],2]\n[[1]]\n[["a"],3]\n[["a"]]\n[[],"x"]\n		0
+[1,2]\n{"a":3}\n"x"\n	.	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n[\n  [\n    1\n  ],\n  2\n]\n[\n  [\n    1\n  ]\n]\n[\n  [\n    "a"\n  ],\n  3\n]\n[\n  [\n    "a"\n  ]\n]\n[\n  [],\n  "x"\n]\n		0
+[1,2]\n{"a":3}\n"x"\n	select(length==2)	-c --stream	[[0],1]\n[[1],2]\n[["a"],3]\n[[],"x"]\n		0
+[1,2]\n{"a":3}\n"x"\n	select(length==2)	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n[\n  [\n    1\n  ],\n  2\n]\n[\n  [\n    "a"\n  ],\n  3\n]\n[\n  [],\n  "x"\n]\n		0
+[1,2]\n{"a":3}\n"x"\n	[., input_line_number]	-c --stream	[[[0],1],1]\n[[[1],2],1]\n[[[1]],1]\n[[["a"],3],2]\n[[["a"]],2]\n[[[],"x"],3]\n		0
+[1,2]\n{"a":3}\n"x"\n	[., input_line_number]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  1\n]\n[\n  [\n    [\n      1\n    ],\n    2\n  ],\n  1\n]\n[\n  [\n    [\n      1\n    ]\n  ],\n  1\n]\n[\n  [\n    [\n      "a"\n    ],\n    3\n  ],\n  2\n]\n[\n  [\n    [\n      "a"\n    ]\n  ],\n  2\n]\n[\n  [\n    [],\n    "x"\n  ],\n  3\n]\n		0
+[1,2]\n{"a":3}\n"x"\n	input_line_number	-c --stream	1\n1\n1\n2\n2\n3\n		0
+[1,2]\n{"a":3}\n"x"\n	input_line_number	--stream -r	1\n1\n1\n2\n2\n3\n		0
+[1,2]\n{"a":3}\n"x"\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n		0
+[1,2]\n{"a":3}\n"x"\n	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n{FILE}\n{FILE}\n{FILE}\n		0
+[1,2]\n{"a":3}\n"x"\n	[., input]	-c --stream	[[[0],1],[[1],2]]\n[[[1]],[["a"],3]]\n[[["a"]],[[],"x"]]\n		0
+[1,2]\n{"a":3}\n"x"\n	[., input]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  [\n    [\n      1\n    ],\n    2\n  ]\n]\n[\n  [\n    [\n      1\n    ]\n  ],\n  [\n    [\n      "a"\n    ],\n    3\n  ]\n]\n[\n  [\n    [\n      "a"\n    ]\n  ],\n  [\n    [],\n    "x"\n  ]\n]\n		0
+[1,2]\n{"a":3}\n"x"\n	[., inputs]	-c --stream	[[[0],1],[[1],2],[[1]],[["a"],3],[["a"]],[[],"x"]]\n		0
+[1,2]\n{"a":3}\n"x"\n	[., inputs]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  [\n    [\n      1\n    ],\n    2\n  ],\n  [\n    [\n      1\n    ]\n  ],\n  [\n    [\n      "a"\n    ],\n    3\n  ],\n  [\n    [\n      "a"\n    ]\n  ],\n  [\n    [],\n    "x"\n  ]\n]\n		0
+[1,2]\n{"a":3}\n"x"\n	first(inputs)	-c --stream	[[1],2]\n[["a"],3]\n[[],"x"]\n		0
+[1,2]\n{"a":3}\n"x"\n	first(inputs)	--stream -r	[\n  [\n    1\n  ],\n  2\n]\n[\n  [\n    "a"\n  ],\n  3\n]\n[\n  [],\n  "x"\n]\n		0
+[1,2]\n{"a":3}\n"x"\n	if length == 2 then .[0] else empty end	-c --stream	[0]\n[1]\n["a"]\n[]\n		0
+[1,2]\n{"a":3}\n"x"\n	if length == 2 then .[0] else empty end	--stream -r	[\n  0\n]\n[\n  1\n]\n[\n  "a"\n]\n[]\n		0
+[1,2]\n{"a":3}\n"x"\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+[1,2]\n{"a":3}\n"x"\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n		0
+[1,2]\n{"a":3}\n"x"\n	halt	-c --stream			0
+[1,2]\n{"a":3}\n"x"\n	halt	--stream -r			0
+[1,2]\n{"a":3}\n"x"\n	error	-c --stream		jq: error (at {FILE}:1) (not a string): [[0],1]\njq: error (at {FILE}:1) (not a string): [[1],2]\njq: error (at {FILE}:1) (not a string): [[1]]\njq: error (at {FILE}:2) (not a string): [["a"],3]\njq: error (at {FILE}:2) (not a string): [["a"]]\njq: error (at {FILE}:3) (not a string): [[],"x"]\n	5
+[1,2]\n{"a":3}\n"x"\n	error	--stream -r		jq: error (at {FILE}:1) (not a string): [[0],1]\njq: error (at {FILE}:1) (not a string): [[1],2]\njq: error (at {FILE}:1) (not a string): [[1]]\njq: error (at {FILE}:2) (not a string): [["a"],3]\njq: error (at {FILE}:2) (not a string): [["a"]]\njq: error (at {FILE}:3) (not a string): [[],"x"]\n	5
+[1,2]\n{"a":3}\n"x"\n	empty	-c --stream			0
+[1,2]\n{"a":3}\n"x"\n	empty	--stream -r			0
+[1,2]\n{"a":3}\n"x"\n	select(length==2) | .[1]	-c --stream	1\n2\n3\n"x"\n		0
+[1,2]\n{"a":3}\n"x"\n	select(length==2) | .[1]	--stream -r	1\n2\n3\nx\n		0
+[1,2]\n{"a":3}\n"x"\n	length	-c --stream	2\n2\n1\n2\n1\n2\n		0
+[1,2]\n{"a":3}\n"x"\n	length	--stream -r	2\n2\n1\n2\n1\n2\n		0
+1 2 3\n	.	-c --stream	[[],1]\n[[],2]\n[[],3]\n		0
+1 2 3\n	.	--stream -r	[\n  [],\n  1\n]\n[\n  [],\n  2\n]\n[\n  [],\n  3\n]\n		0
+1 2 3\n	select(length==2)	-c --stream	[[],1]\n[[],2]\n[[],3]\n		0
+1 2 3\n	select(length==2)	--stream -r	[\n  [],\n  1\n]\n[\n  [],\n  2\n]\n[\n  [],\n  3\n]\n		0
+1 2 3\n	[., input_line_number]	-c --stream	[[[],1],1]\n[[[],2],1]\n[[[],3],1]\n		0
+1 2 3\n	[., input_line_number]	--stream -r	[\n  [\n    [],\n    1\n  ],\n  1\n]\n[\n  [\n    [],\n    2\n  ],\n  1\n]\n[\n  [\n    [],\n    3\n  ],\n  1\n]\n		0
+1 2 3\n	input_line_number	-c --stream	1\n1\n1\n		0
+1 2 3\n	input_line_number	--stream -r	1\n1\n1\n		0
+1 2 3\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n		0
+1 2 3\n	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n		0
+1 2 3\n	[., input]	-c --stream	[[[],1],[[],2]]\n	jq: error (at {FILE}:1): break\n	5
+1 2 3\n	[., input]	--stream -r	[\n  [\n    [],\n    1\n  ],\n  [\n    [],\n    2\n  ]\n]\n	jq: error (at {FILE}:1): break\n	5
+1 2 3\n	[., inputs]	-c --stream	[[[],1],[[],2],[[],3]]\n		0
+1 2 3\n	[., inputs]	--stream -r	[\n  [\n    [],\n    1\n  ],\n  [\n    [],\n    2\n  ],\n  [\n    [],\n    3\n  ]\n]\n		0
+1 2 3\n	first(inputs)	-c --stream	[[],2]\n		0
+1 2 3\n	first(inputs)	--stream -r	[\n  [],\n  2\n]\n		0
+1 2 3\n	if length == 2 then .[0] else empty end	-c --stream	[]\n[]\n[]\n		0
+1 2 3\n	if length == 2 then .[0] else empty end	--stream -r	[]\n[]\n[]\n		0
+1 2 3\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+1 2 3\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n		0
+1 2 3\n	halt	-c --stream			0
+1 2 3\n	halt	--stream -r			0
+1 2 3\n	error	-c --stream		jq: error (at {FILE}:1) (not a string): [[],1]\njq: error (at {FILE}:1) (not a string): [[],2]\njq: error (at {FILE}:1) (not a string): [[],3]\n	5
+1 2 3\n	error	--stream -r		jq: error (at {FILE}:1) (not a string): [[],1]\njq: error (at {FILE}:1) (not a string): [[],2]\njq: error (at {FILE}:1) (not a string): [[],3]\n	5
+1 2 3\n	empty	-c --stream			0
+1 2 3\n	empty	--stream -r			0
+1 2 3\n	select(length==2) | .[1]	-c --stream	1\n2\n3\n		0
+1 2 3\n	select(length==2) | .[1]	--stream -r	1\n2\n3\n		0
+1 2 3\n	length	-c --stream	2\n2\n2\n		0
+1 2 3\n	length	--stream -r	2\n2\n2\n		0
+	.	-c --stream			0
+	.	--stream -r			0
+	select(length==2)	-c --stream			0
+	select(length==2)	--stream -r			0
+	[., input_line_number]	-c --stream			0
+	[., input_line_number]	--stream -r			0
+	input_line_number	-c --stream			0
+	input_line_number	--stream -r			0
+	input_filename	-c --stream			0
+	input_filename	--stream -r			0
+	[., input]	-c --stream			0
+	[., input]	--stream -r			0
+	[., inputs]	-c --stream			0
+	[., inputs]	--stream -r			0
+	first(inputs)	-c --stream			0
+	first(inputs)	--stream -r			0
+	if length == 2 then .[0] else empty end	-c --stream			0
+	if length == 2 then .[0] else empty end	--stream -r			0
+	$__loc__	-c --stream			0
+	$__loc__	--stream -r			0
+	halt	-c --stream			0
+	halt	--stream -r			0
+	error	-c --stream			0
+	error	--stream -r			0
+	empty	-c --stream			0
+	empty	--stream -r			0
+	select(length==2) | .[1]	-c --stream			0
+	select(length==2) | .[1]	--stream -r			0
+	length	-c --stream			0
+	length	--stream -r			0
+{"a":\n1,\n"b":[2,\n3]}\n	.	-c --stream	[["a"],1]\n[["b",0],2]\n[["b",1],3]\n[["b",1]]\n[["b"]]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	.	--stream -r	[\n  [\n    "a"\n  ],\n  1\n]\n[\n  [\n    "b",\n    0\n  ],\n  2\n]\n[\n  [\n    "b",\n    1\n  ],\n  3\n]\n[\n  [\n    "b",\n    1\n  ]\n]\n[\n  [\n    "b"\n  ]\n]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	select(length==2)	-c --stream	[["a"],1]\n[["b",0],2]\n[["b",1],3]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	select(length==2)	--stream -r	[\n  [\n    "a"\n  ],\n  1\n]\n[\n  [\n    "b",\n    0\n  ],\n  2\n]\n[\n  [\n    "b",\n    1\n  ],\n  3\n]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	[., input_line_number]	-c --stream	[[["a"],1],2]\n[[["b",0],2],3]\n[[["b",1],3],4]\n[[["b",1]],4]\n[[["b"]],4]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	[., input_line_number]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  2\n]\n[\n  [\n    [\n      "b",\n      0\n    ],\n    2\n  ],\n  3\n]\n[\n  [\n    [\n      "b",\n      1\n    ],\n    3\n  ],\n  4\n]\n[\n  [\n    [\n      "b",\n      1\n    ]\n  ],\n  4\n]\n[\n  [\n    [\n      "b"\n    ]\n  ],\n  4\n]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	input_line_number	-c --stream	2\n3\n4\n4\n4\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	input_line_number	--stream -r	2\n3\n4\n4\n4\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n{FILE}\n{FILE}\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	[., input]	-c --stream	[[["a"],1],[["b",0],2]]\n[[["b",1],3],[["b",1]]]\n	jq: error (at {FILE}:4): break\n	5
+{"a":\n1,\n"b":[2,\n3]}\n	[., input]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  [\n    [\n      "b",\n      0\n    ],\n    2\n  ]\n]\n[\n  [\n    [\n      "b",\n      1\n    ],\n    3\n  ],\n  [\n    [\n      "b",\n      1\n    ]\n  ]\n]\n	jq: error (at {FILE}:4): break\n	5
+{"a":\n1,\n"b":[2,\n3]}\n	[., inputs]	-c --stream	[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	[., inputs]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  [\n    [\n      "b",\n      0\n    ],\n    2\n  ],\n  [\n    [\n      "b",\n      1\n    ],\n    3\n  ],\n  [\n    [\n      "b",\n      1\n    ]\n  ],\n  [\n    [\n      "b"\n    ]\n  ]\n]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	first(inputs)	-c --stream	[["b",0],2]\n[["b",1]]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	first(inputs)	--stream -r	[\n  [\n    "b",\n    0\n  ],\n  2\n]\n[\n  [\n    "b",\n    1\n  ]\n]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	if length == 2 then .[0] else empty end	-c --stream	["a"]\n["b",0]\n["b",1]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	if length == 2 then .[0] else empty end	--stream -r	[\n  "a"\n]\n[\n  "b",\n  0\n]\n[\n  "b",\n  1\n]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	halt	-c --stream			0
+{"a":\n1,\n"b":[2,\n3]}\n	halt	--stream -r			0
+{"a":\n1,\n"b":[2,\n3]}\n	error	-c --stream		jq: error (at {FILE}:2) (not a string): [["a"],1]\njq: error (at {FILE}:3) (not a string): [["b",0],2]\njq: error (at {FILE}:4) (not a string): [["b",1],3]\njq: error (at {FILE}:4) (not a string): [["b",1]]\njq: error (at {FILE}:4) (not a string): [["b"]]\n	5
+{"a":\n1,\n"b":[2,\n3]}\n	error	--stream -r		jq: error (at {FILE}:2) (not a string): [["a"],1]\njq: error (at {FILE}:3) (not a string): [["b",0],2]\njq: error (at {FILE}:4) (not a string): [["b",1],3]\njq: error (at {FILE}:4) (not a string): [["b",1]]\njq: error (at {FILE}:4) (not a string): [["b"]]\n	5
+{"a":\n1,\n"b":[2,\n3]}\n	empty	-c --stream			0
+{"a":\n1,\n"b":[2,\n3]}\n	empty	--stream -r			0
+{"a":\n1,\n"b":[2,\n3]}\n	select(length==2) | .[1]	-c --stream	1\n2\n3\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	select(length==2) | .[1]	--stream -r	1\n2\n3\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	length	-c --stream	2\n2\n2\n1\n1\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	length	--stream -r	2\n2\n2\n1\n1\n		0
+{"a":1,"a":2}\n	.	-c --stream	[["a"],1]\n[["a"],2]\n[["a"]]\n		0
+{"a":1,"a":2}\n	.	--stream -r	[\n  [\n    "a"\n  ],\n  1\n]\n[\n  [\n    "a"\n  ],\n  2\n]\n[\n  [\n    "a"\n  ]\n]\n		0
+{"a":1,"a":2}\n	select(length==2)	-c --stream	[["a"],1]\n[["a"],2]\n		0
+{"a":1,"a":2}\n	select(length==2)	--stream -r	[\n  [\n    "a"\n  ],\n  1\n]\n[\n  [\n    "a"\n  ],\n  2\n]\n		0
+{"a":1,"a":2}\n	[., input_line_number]	-c --stream	[[["a"],1],1]\n[[["a"],2],1]\n[[["a"]],1]\n		0
+{"a":1,"a":2}\n	[., input_line_number]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  1\n]\n[\n  [\n    [\n      "a"\n    ],\n    2\n  ],\n  1\n]\n[\n  [\n    [\n      "a"\n    ]\n  ],\n  1\n]\n		0
+{"a":1,"a":2}\n	input_line_number	-c --stream	1\n1\n1\n		0
+{"a":1,"a":2}\n	input_line_number	--stream -r	1\n1\n1\n		0
+{"a":1,"a":2}\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n		0
+{"a":1,"a":2}\n	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n		0
+{"a":1,"a":2}\n	[., input]	-c --stream	[[["a"],1],[["a"],2]]\n	jq: error (at {FILE}:1): break\n	5
+{"a":1,"a":2}\n	[., input]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  [\n    [\n      "a"\n    ],\n    2\n  ]\n]\n	jq: error (at {FILE}:1): break\n	5
+{"a":1,"a":2}\n	[., inputs]	-c --stream	[[["a"],1],[["a"],2],[["a"]]]\n		0
+{"a":1,"a":2}\n	[., inputs]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  [\n    [\n      "a"\n    ],\n    2\n  ],\n  [\n    [\n      "a"\n    ]\n  ]\n]\n		0
+{"a":1,"a":2}\n	first(inputs)	-c --stream	[["a"],2]\n		0
+{"a":1,"a":2}\n	first(inputs)	--stream -r	[\n  [\n    "a"\n  ],\n  2\n]\n		0
+{"a":1,"a":2}\n	if length == 2 then .[0] else empty end	-c --stream	["a"]\n["a"]\n		0
+{"a":1,"a":2}\n	if length == 2 then .[0] else empty end	--stream -r	[\n  "a"\n]\n[\n  "a"\n]\n		0
+{"a":1,"a":2}\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+{"a":1,"a":2}\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n		0
+{"a":1,"a":2}\n	halt	-c --stream			0
+{"a":1,"a":2}\n	halt	--stream -r			0
+{"a":1,"a":2}\n	error	-c --stream		jq: error (at {FILE}:1) (not a string): [["a"],1]\njq: error (at {FILE}:1) (not a string): [["a"],2]\njq: error (at {FILE}:1) (not a string): [["a"]]\n	5
+{"a":1,"a":2}\n	error	--stream -r		jq: error (at {FILE}:1) (not a string): [["a"],1]\njq: error (at {FILE}:1) (not a string): [["a"],2]\njq: error (at {FILE}:1) (not a string): [["a"]]\n	5
+{"a":1,"a":2}\n	empty	-c --stream			0
+{"a":1,"a":2}\n	empty	--stream -r			0
+{"a":1,"a":2}\n	select(length==2) | .[1]	-c --stream	1\n2\n		0
+{"a":1,"a":2}\n	select(length==2) | .[1]	--stream -r	1\n2\n		0
+{"a":1,"a":2}\n	length	-c --stream	2\n2\n1\n		0
+{"a":1,"a":2}\n	length	--stream -r	2\n2\n1\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	.	-c --stream	[["a","b","c",0],1]\n[["a","b","c",1,"d"],2]\n[["a","b","c",1,"d"]]\n[["a","b","c",1]]\n[["a","b","c"]]\n[["a","b"]]\n[["a"]]\n[[0,0],[]]\n[[0,0]]\n[[0]]\n[[],{}]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	.	--stream -r	[\n  [\n    "a",\n    "b",\n    "c",\n    0\n  ],\n  1\n]\n[\n  [\n    "a",\n    "b",\n    "c",\n    1,\n    "d"\n  ],\n  2\n]\n[\n  [\n    "a",\n    "b",\n    "c",\n    1,\n    "d"\n  ]\n]\n[\n  [\n    "a",\n    "b",\n    "c",\n    1\n  ]\n]\n[\n  [\n    "a",\n    "b",\n    "c"\n  ]\n]\n[\n  [\n    "a",\n    "b"\n  ]\n]\n[\n  [\n    "a"\n  ]\n]\n[\n  [\n    0,\n    0\n  ],\n  []\n]\n[\n  [\n    0,\n    0\n  ]\n]\n[\n  [\n    0\n  ]\n]\n[\n  [],\n  {}\n]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	select(length==2)	-c --stream	[["a","b","c",0],1]\n[["a","b","c",1,"d"],2]\n[[0,0],[]]\n[[],{}]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	select(length==2)	--stream -r	[\n  [\n    "a",\n    "b",\n    "c",\n    0\n  ],\n  1\n]\n[\n  [\n    "a",\n    "b",\n    "c",\n    1,\n    "d"\n  ],\n  2\n]\n[\n  [\n    0,\n    0\n  ],\n  []\n]\n[\n  [],\n  {}\n]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[., input_line_number]	-c --stream	[[["a","b","c",0],1],1]\n[[["a","b","c",1,"d"],2],1]\n[[["a","b","c",1,"d"]],1]\n[[["a","b","c",1]],1]\n[[["a","b","c"]],1]\n[[["a","b"]],1]\n[[["a"]],1]\n[[[0,0],[]],2]\n[[[0,0]],2]\n[[[0]],2]\n[[[],{}],3]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[., input_line_number]	--stream -r	[\n  [\n    [\n      "a",\n      "b",\n      "c",\n      0\n    ],\n    1\n  ],\n  1\n]\n[\n  [\n    [\n      "a",\n      "b",\n      "c",\n      1,\n      "d"\n    ],\n    2\n  ],\n  1\n]\n[\n  [\n    [\n      "a",\n      "b",\n      "c",\n      1,\n      "d"\n    ]\n  ],\n  1\n]\n[\n  [\n    [\n      "a",\n      "b",\n      "c",\n      1\n    ]\n  ],\n  1\n]\n[\n  [\n    [\n      "a",\n      "b",\n      "c"\n    ]\n  ],\n  1\n]\n[\n  [\n    [\n      "a",\n      "b"\n    ]\n  ],\n  1\n]\n[\n  [\n    [\n      "a"\n    ]\n  ],\n  1\n]\n[\n  [\n    [\n      0,\n      0\n    ],\n    []\n  ],\n  2\n]\n[\n  [\n    [\n      0,\n      0\n    ]\n  ],\n  2\n]\n[\n  [\n    [\n      0\n    ]\n  ],\n  2\n]\n[\n  [\n    [],\n    {}\n  ],\n  3\n]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	input_line_number	-c --stream	1\n1\n1\n1\n1\n1\n1\n2\n2\n2\n3\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	input_line_number	--stream -r	1\n1\n1\n1\n1\n1\n1\n2\n2\n2\n3\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n{FILE}\n{FILE}\n{FILE}\n{FILE}\n{FILE}\n{FILE}\n{FILE}\n{FILE}\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[., input]	-c --stream	[[["a","b","c",0],1],[["a","b","c",1,"d"],2]]\n[[["a","b","c",1,"d"]],[["a","b","c",1]]]\n[[["a","b","c"]],[["a","b"]]]\n[[["a"]],[[0,0],[]]]\n[[[0,0]],[[0]]]\n	jq: error (at {FILE}:3): break\n	5
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[., input]	--stream -r	[\n  [\n    [\n      "a",\n      "b",\n      "c",\n      0\n    ],\n    1\n  ],\n  [\n    [\n      "a",\n      "b",\n      "c",\n      1,\n      "d"\n    ],\n    2\n  ]\n]\n[\n  [\n    [\n      "a",\n      "b",\n      "c",\n      1,\n      "d"\n    ]\n  ],\n  [\n    [\n      "a",\n      "b",\n      "c",\n      1\n    ]\n  ]\n]\n[\n  [\n    [\n      "a",\n      "b",\n      "c"\n    ]\n  ],\n  [\n    [\n      "a",\n      "b"\n    ]\n  ]\n]\n[\n  [\n    [\n      "a"\n    ]\n  ],\n  [\n    [\n      0,\n      0\n    ],\n    []\n  ]\n]\n[\n  [\n    [\n      0,\n      0\n    ]\n  ],\n  [\n    [\n      0\n    ]\n  ]\n]\n	jq: error (at {FILE}:3): break\n	5
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[., inputs]	-c --stream	[[["a","b","c",0],1],[["a","b","c",1,"d"],2],[["a","b","c",1,"d"]],[["a","b","c",1]],[["a","b","c"]],[["a","b"]],[["a"]],[[0,0],[]],[[0,0]],[[0]],[[],{}]]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[., inputs]	--stream -r	[\n  [\n    [\n      "a",\n      "b",\n      "c",\n      0\n    ],\n    1\n  ],\n  [\n    [\n      "a",\n      "b",\n      "c",\n      1,\n      "d"\n    ],\n    2\n  ],\n  [\n    [\n      "a",\n      "b",\n      "c",\n      1,\n      "d"\n    ]\n  ],\n  [\n    [\n      "a",\n      "b",\n      "c",\n      1\n    ]\n  ],\n  [\n    [\n      "a",\n      "b",\n      "c"\n    ]\n  ],\n  [\n    [\n      "a",\n      "b"\n    ]\n  ],\n  [\n    [\n      "a"\n    ]\n  ],\n  [\n    [\n      0,\n      0\n    ],\n    []\n  ],\n  [\n    [\n      0,\n      0\n    ]\n  ],\n  [\n    [\n      0\n    ]\n  ],\n  [\n    [],\n    {}\n  ]\n]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	first(inputs)	-c --stream	[["a","b","c",1,"d"],2]\n[["a","b","c",1]]\n[["a","b"]]\n[[0,0],[]]\n[[0]]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	first(inputs)	--stream -r	[\n  [\n    "a",\n    "b",\n    "c",\n    1,\n    "d"\n  ],\n  2\n]\n[\n  [\n    "a",\n    "b",\n    "c",\n    1\n  ]\n]\n[\n  [\n    "a",\n    "b"\n  ]\n]\n[\n  [\n    0,\n    0\n  ],\n  []\n]\n[\n  [\n    0\n  ]\n]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	if length == 2 then .[0] else empty end	-c --stream	["a","b","c",0]\n["a","b","c",1,"d"]\n[0,0]\n[]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	if length == 2 then .[0] else empty end	--stream -r	[\n  "a",\n  "b",\n  "c",\n  0\n]\n[\n  "a",\n  "b",\n  "c",\n  1,\n  "d"\n]\n[\n  0,\n  0\n]\n[]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	halt	-c --stream			0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	halt	--stream -r			0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	error	-c --stream		jq: error (at {FILE}:1) (not a string): [["a","b","c",0],1]\njq: error (at {FILE}:1) (not a string): [["a","b","c",1,"d"],2]\njq: error (at {FILE}:1) (not a string): [["a","b","c",1,"d"]]\njq: error (at {FILE}:1) (not a string): [["a","b","c",1]]\njq: error (at {FILE}:1) (not a string): [["a","b","c"]]\njq: error (at {FILE}:1) (not a string): [["a","b"]]\njq: error (at {FILE}:1) (not a string): [["a"]]\njq: error (at {FILE}:2) (not a string): [[0,0],[]]\njq: error (at {FILE}:2) (not a string): [[0,0]]\njq: error (at {FILE}:2) (not a string): [[0]]\njq: error (at {FILE}:3) (not a string): [[],{}]\n	5
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	error	--stream -r		jq: error (at {FILE}:1) (not a string): [["a","b","c",0],1]\njq: error (at {FILE}:1) (not a string): [["a","b","c",1,"d"],2]\njq: error (at {FILE}:1) (not a string): [["a","b","c",1,"d"]]\njq: error (at {FILE}:1) (not a string): [["a","b","c",1]]\njq: error (at {FILE}:1) (not a string): [["a","b","c"]]\njq: error (at {FILE}:1) (not a string): [["a","b"]]\njq: error (at {FILE}:1) (not a string): [["a"]]\njq: error (at {FILE}:2) (not a string): [[0,0],[]]\njq: error (at {FILE}:2) (not a string): [[0,0]]\njq: error (at {FILE}:2) (not a string): [[0]]\njq: error (at {FILE}:3) (not a string): [[],{}]\n	5
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	empty	-c --stream			0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	empty	--stream -r			0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	select(length==2) | .[1]	-c --stream	1\n2\n[]\n{}\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	select(length==2) | .[1]	--stream -r	1\n2\n[]\n{}\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	length	-c --stream	2\n2\n1\n1\n1\n1\n1\n2\n1\n1\n2\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	length	--stream -r	2\n2\n1\n1\n1\n1\n1\n2\n1\n1\n2\n		0
+{"a":1}	.	-c --stream	[["a"],1]\n[["a"]]\n		0
+{"a":1}	.	--stream -r	[\n  [\n    "a"\n  ],\n  1\n]\n[\n  [\n    "a"\n  ]\n]\n		0
+{"a":1}	select(length==2)	-c --stream	[["a"],1]\n		0
+{"a":1}	select(length==2)	--stream -r	[\n  [\n    "a"\n  ],\n  1\n]\n		0
+{"a":1}	[., input_line_number]	-c --stream	[[["a"],1],0]\n[[["a"]],0]\n		0
+{"a":1}	[., input_line_number]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  0\n]\n[\n  [\n    [\n      "a"\n    ]\n  ],\n  0\n]\n		0
+{"a":1}	input_line_number	-c --stream	0\n0\n		0
+{"a":1}	input_line_number	--stream -r	0\n0\n		0
+{"a":1}	input_filename	-c --stream	"{FILE}"\nnull\n		0
+{"a":1}	input_filename	--stream -r	{FILE}\nnull\n		0
+{"a":1}	[., input]	-c --stream	[[["a"],1],[["a"]]]\n		0
+{"a":1}	[., input]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  [\n    [\n      "a"\n    ]\n  ]\n]\n		0
+{"a":1}	[., inputs]	-c --stream	[[["a"],1],[["a"]]]\n		0
+{"a":1}	[., inputs]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  [\n    [\n      "a"\n    ]\n  ]\n]\n		0
+{"a":1}	first(inputs)	-c --stream	[["a"]]\n		0
+{"a":1}	first(inputs)	--stream -r	[\n  [\n    "a"\n  ]\n]\n		0
+{"a":1}	if length == 2 then .[0] else empty end	-c --stream	["a"]\n		0
+{"a":1}	if length == 2 then .[0] else empty end	--stream -r	[\n  "a"\n]\n		0
+{"a":1}	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+{"a":1}	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n		0
+{"a":1}	halt	-c --stream			0
+{"a":1}	halt	--stream -r			0
+{"a":1}	error	-c --stream		jq: error (at {FILE}:0) (not a string): [["a"],1]\njq: error (at <unknown>) (not a string): [["a"]]\n	5
+{"a":1}	error	--stream -r		jq: error (at {FILE}:0) (not a string): [["a"],1]\njq: error (at <unknown>) (not a string): [["a"]]\n	5
+{"a":1}	empty	-c --stream			0
+{"a":1}	empty	--stream -r			0
+{"a":1}	select(length==2) | .[1]	-c --stream	1\n		0
+{"a":1}	select(length==2) | .[1]	--stream -r	1\n		0
+{"a":1}	length	-c --stream	2\n1\n		0
+{"a":1}	length	--stream -r	2\n1\n		0
+\n\n[1]\n\n{"a":[]}\n	.	-c --stream	[[0],1]\n[[0]]\n[["a"],[]]\n[["a"]]\n		0
+\n\n[1]\n\n{"a":[]}\n	.	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n[\n  [\n    0\n  ]\n]\n[\n  [\n    "a"\n  ],\n  []\n]\n[\n  [\n    "a"\n  ]\n]\n		0
+\n\n[1]\n\n{"a":[]}\n	select(length==2)	-c --stream	[[0],1]\n[["a"],[]]\n		0
+\n\n[1]\n\n{"a":[]}\n	select(length==2)	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n[\n  [\n    "a"\n  ],\n  []\n]\n		0
+\n\n[1]\n\n{"a":[]}\n	[., input_line_number]	-c --stream	[[[0],1],3]\n[[[0]],3]\n[[["a"],[]],5]\n[[["a"]],5]\n		0
+\n\n[1]\n\n{"a":[]}\n	[., input_line_number]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  3\n]\n[\n  [\n    [\n      0\n    ]\n  ],\n  3\n]\n[\n  [\n    [\n      "a"\n    ],\n    []\n  ],\n  5\n]\n[\n  [\n    [\n      "a"\n    ]\n  ],\n  5\n]\n		0
+\n\n[1]\n\n{"a":[]}\n	input_line_number	-c --stream	3\n3\n5\n5\n		0
+\n\n[1]\n\n{"a":[]}\n	input_line_number	--stream -r	3\n3\n5\n5\n		0
+\n\n[1]\n\n{"a":[]}\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n		0
+\n\n[1]\n\n{"a":[]}\n	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n{FILE}\n		0
+\n\n[1]\n\n{"a":[]}\n	[., input]	-c --stream	[[[0],1],[[0]]]\n[[["a"],[]],[["a"]]]\n		0
+\n\n[1]\n\n{"a":[]}\n	[., input]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  [\n    [\n      0\n    ]\n  ]\n]\n[\n  [\n    [\n      "a"\n    ],\n    []\n  ],\n  [\n    [\n      "a"\n    ]\n  ]\n]\n		0
+\n\n[1]\n\n{"a":[]}\n	[., inputs]	-c --stream	[[[0],1],[[0]],[["a"],[]],[["a"]]]\n		0
+\n\n[1]\n\n{"a":[]}\n	[., inputs]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  [\n    [\n      0\n    ]\n  ],\n  [\n    [\n      "a"\n    ],\n    []\n  ],\n  [\n    [\n      "a"\n    ]\n  ]\n]\n		0
+\n\n[1]\n\n{"a":[]}\n	first(inputs)	-c --stream	[[0]]\n[["a"]]\n		0
+\n\n[1]\n\n{"a":[]}\n	first(inputs)	--stream -r	[\n  [\n    0\n  ]\n]\n[\n  [\n    "a"\n  ]\n]\n		0
+\n\n[1]\n\n{"a":[]}\n	if length == 2 then .[0] else empty end	-c --stream	[0]\n["a"]\n		0
+\n\n[1]\n\n{"a":[]}\n	if length == 2 then .[0] else empty end	--stream -r	[\n  0\n]\n[\n  "a"\n]\n		0
+\n\n[1]\n\n{"a":[]}\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+\n\n[1]\n\n{"a":[]}\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n		0
+\n\n[1]\n\n{"a":[]}\n	halt	-c --stream			0
+\n\n[1]\n\n{"a":[]}\n	halt	--stream -r			0
+\n\n[1]\n\n{"a":[]}\n	error	-c --stream		jq: error (at {FILE}:3) (not a string): [[0],1]\njq: error (at {FILE}:3) (not a string): [[0]]\njq: error (at {FILE}:5) (not a string): [["a"],[]]\njq: error (at {FILE}:5) (not a string): [["a"]]\n	5
+\n\n[1]\n\n{"a":[]}\n	error	--stream -r		jq: error (at {FILE}:3) (not a string): [[0],1]\njq: error (at {FILE}:3) (not a string): [[0]]\njq: error (at {FILE}:5) (not a string): [["a"],[]]\njq: error (at {FILE}:5) (not a string): [["a"]]\n	5
+\n\n[1]\n\n{"a":[]}\n	empty	-c --stream			0
+\n\n[1]\n\n{"a":[]}\n	empty	--stream -r			0
+\n\n[1]\n\n{"a":[]}\n	select(length==2) | .[1]	-c --stream	1\n[]\n		0
+\n\n[1]\n\n{"a":[]}\n	select(length==2) | .[1]	--stream -r	1\n[]\n		0
+\n\n[1]\n\n{"a":[]}\n	length	-c --stream	2\n1\n2\n1\n		0
+\n\n[1]\n\n{"a":[]}\n	length	--stream -r	2\n1\n2\n1\n		0
+[]\n{}\n[[],{}]\n	.	-c --stream	[[],[]]\n[[],{}]\n[[0],[]]\n[[1],{}]\n[[1]]\n		0
+[]\n{}\n[[],{}]\n	.	--stream -r	[\n  [],\n  []\n]\n[\n  [],\n  {}\n]\n[\n  [\n    0\n  ],\n  []\n]\n[\n  [\n    1\n  ],\n  {}\n]\n[\n  [\n    1\n  ]\n]\n		0
+[]\n{}\n[[],{}]\n	select(length==2)	-c --stream	[[],[]]\n[[],{}]\n[[0],[]]\n[[1],{}]\n		0
+[]\n{}\n[[],{}]\n	select(length==2)	--stream -r	[\n  [],\n  []\n]\n[\n  [],\n  {}\n]\n[\n  [\n    0\n  ],\n  []\n]\n[\n  [\n    1\n  ],\n  {}\n]\n		0
+[]\n{}\n[[],{}]\n	[., input_line_number]	-c --stream	[[[],[]],1]\n[[[],{}],2]\n[[[0],[]],3]\n[[[1],{}],3]\n[[[1]],3]\n		0
+[]\n{}\n[[],{}]\n	[., input_line_number]	--stream -r	[\n  [\n    [],\n    []\n  ],\n  1\n]\n[\n  [\n    [],\n    {}\n  ],\n  2\n]\n[\n  [\n    [\n      0\n    ],\n    []\n  ],\n  3\n]\n[\n  [\n    [\n      1\n    ],\n    {}\n  ],\n  3\n]\n[\n  [\n    [\n      1\n    ]\n  ],\n  3\n]\n		0
+[]\n{}\n[[],{}]\n	input_line_number	-c --stream	1\n2\n3\n3\n3\n		0
+[]\n{}\n[[],{}]\n	input_line_number	--stream -r	1\n2\n3\n3\n3\n		0
+[]\n{}\n[[],{}]\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n		0
+[]\n{}\n[[],{}]\n	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n{FILE}\n{FILE}\n		0
+[]\n{}\n[[],{}]\n	[., input]	-c --stream	[[[],[]],[[],{}]]\n[[[0],[]],[[1],{}]]\n	jq: error (at {FILE}:3): break\n	5
+[]\n{}\n[[],{}]\n	[., input]	--stream -r	[\n  [\n    [],\n    []\n  ],\n  [\n    [],\n    {}\n  ]\n]\n[\n  [\n    [\n      0\n    ],\n    []\n  ],\n  [\n    [\n      1\n    ],\n    {}\n  ]\n]\n	jq: error (at {FILE}:3): break\n	5
+[]\n{}\n[[],{}]\n	[., inputs]	-c --stream	[[[],[]],[[],{}],[[0],[]],[[1],{}],[[1]]]\n		0
+[]\n{}\n[[],{}]\n	[., inputs]	--stream -r	[\n  [\n    [],\n    []\n  ],\n  [\n    [],\n    {}\n  ],\n  [\n    [\n      0\n    ],\n    []\n  ],\n  [\n    [\n      1\n    ],\n    {}\n  ],\n  [\n    [\n      1\n    ]\n  ]\n]\n		0
+[]\n{}\n[[],{}]\n	first(inputs)	-c --stream	[[],{}]\n[[1],{}]\n		0
+[]\n{}\n[[],{}]\n	first(inputs)	--stream -r	[\n  [],\n  {}\n]\n[\n  [\n    1\n  ],\n  {}\n]\n		0
+[]\n{}\n[[],{}]\n	if length == 2 then .[0] else empty end	-c --stream	[]\n[]\n[0]\n[1]\n		0
+[]\n{}\n[[],{}]\n	if length == 2 then .[0] else empty end	--stream -r	[]\n[]\n[\n  0\n]\n[\n  1\n]\n		0
+[]\n{}\n[[],{}]\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+[]\n{}\n[[],{}]\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n		0
+[]\n{}\n[[],{}]\n	halt	-c --stream			0
+[]\n{}\n[[],{}]\n	halt	--stream -r			0
+[]\n{}\n[[],{}]\n	error	-c --stream		jq: error (at {FILE}:1) (not a string): [[],[]]\njq: error (at {FILE}:2) (not a string): [[],{}]\njq: error (at {FILE}:3) (not a string): [[0],[]]\njq: error (at {FILE}:3) (not a string): [[1],{}]\njq: error (at {FILE}:3) (not a string): [[1]]\n	5
+[]\n{}\n[[],{}]\n	error	--stream -r		jq: error (at {FILE}:1) (not a string): [[],[]]\njq: error (at {FILE}:2) (not a string): [[],{}]\njq: error (at {FILE}:3) (not a string): [[0],[]]\njq: error (at {FILE}:3) (not a string): [[1],{}]\njq: error (at {FILE}:3) (not a string): [[1]]\n	5
+[]\n{}\n[[],{}]\n	empty	-c --stream			0
+[]\n{}\n[[],{}]\n	empty	--stream -r			0
+[]\n{}\n[[],{}]\n	select(length==2) | .[1]	-c --stream	[]\n{}\n[]\n{}\n		0
+[]\n{}\n[[],{}]\n	select(length==2) | .[1]	--stream -r	[]\n{}\n[]\n{}\n		0
+[]\n{}\n[[],{}]\n	length	-c --stream	2\n2\n2\n2\n1\n		0
+[]\n{}\n[[],{}]\n	length	--stream -r	2\n2\n2\n2\n1\n		0
+{"a":1}\r\n[2]\r\n	.	-c --stream	[["a"],1]\n[["a"]]\n[[0],2]\n[[0]]\n		0
+{"a":1}\r\n[2]\r\n	.	--stream -r	[\n  [\n    "a"\n  ],\n  1\n]\n[\n  [\n    "a"\n  ]\n]\n[\n  [\n    0\n  ],\n  2\n]\n[\n  [\n    0\n  ]\n]\n		0
+{"a":1}\r\n[2]\r\n	select(length==2)	-c --stream	[["a"],1]\n[[0],2]\n		0
+{"a":1}\r\n[2]\r\n	select(length==2)	--stream -r	[\n  [\n    "a"\n  ],\n  1\n]\n[\n  [\n    0\n  ],\n  2\n]\n		0
+{"a":1}\r\n[2]\r\n	[., input_line_number]	-c --stream	[[["a"],1],1]\n[[["a"]],1]\n[[[0],2],2]\n[[[0]],2]\n		0
+{"a":1}\r\n[2]\r\n	[., input_line_number]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  1\n]\n[\n  [\n    [\n      "a"\n    ]\n  ],\n  1\n]\n[\n  [\n    [\n      0\n    ],\n    2\n  ],\n  2\n]\n[\n  [\n    [\n      0\n    ]\n  ],\n  2\n]\n		0
+{"a":1}\r\n[2]\r\n	input_line_number	-c --stream	1\n1\n2\n2\n		0
+{"a":1}\r\n[2]\r\n	input_line_number	--stream -r	1\n1\n2\n2\n		0
+{"a":1}\r\n[2]\r\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n		0
+{"a":1}\r\n[2]\r\n	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n{FILE}\n		0
+{"a":1}\r\n[2]\r\n	[., input]	-c --stream	[[["a"],1],[["a"]]]\n[[[0],2],[[0]]]\n		0
+{"a":1}\r\n[2]\r\n	[., input]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  [\n    [\n      "a"\n    ]\n  ]\n]\n[\n  [\n    [\n      0\n    ],\n    2\n  ],\n  [\n    [\n      0\n    ]\n  ]\n]\n		0
+{"a":1}\r\n[2]\r\n	[., inputs]	-c --stream	[[["a"],1],[["a"]],[[0],2],[[0]]]\n		0
+{"a":1}\r\n[2]\r\n	[., inputs]	--stream -r	[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  [\n    [\n      "a"\n    ]\n  ],\n  [\n    [\n      0\n    ],\n    2\n  ],\n  [\n    [\n      0\n    ]\n  ]\n]\n		0
+{"a":1}\r\n[2]\r\n	first(inputs)	-c --stream	[["a"]]\n[[0]]\n		0
+{"a":1}\r\n[2]\r\n	first(inputs)	--stream -r	[\n  [\n    "a"\n  ]\n]\n[\n  [\n    0\n  ]\n]\n		0
+{"a":1}\r\n[2]\r\n	if length == 2 then .[0] else empty end	-c --stream	["a"]\n[0]\n		0
+{"a":1}\r\n[2]\r\n	if length == 2 then .[0] else empty end	--stream -r	[\n  "a"\n]\n[\n  0\n]\n		0
+{"a":1}\r\n[2]\r\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+{"a":1}\r\n[2]\r\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n		0
+{"a":1}\r\n[2]\r\n	halt	-c --stream			0
+{"a":1}\r\n[2]\r\n	halt	--stream -r			0
+{"a":1}\r\n[2]\r\n	error	-c --stream		jq: error (at {FILE}:1) (not a string): [["a"],1]\njq: error (at {FILE}:1) (not a string): [["a"]]\njq: error (at {FILE}:2) (not a string): [[0],2]\njq: error (at {FILE}:2) (not a string): [[0]]\n	5
+{"a":1}\r\n[2]\r\n	error	--stream -r		jq: error (at {FILE}:1) (not a string): [["a"],1]\njq: error (at {FILE}:1) (not a string): [["a"]]\njq: error (at {FILE}:2) (not a string): [[0],2]\njq: error (at {FILE}:2) (not a string): [[0]]\n	5
+{"a":1}\r\n[2]\r\n	empty	-c --stream			0
+{"a":1}\r\n[2]\r\n	empty	--stream -r			0
+{"a":1}\r\n[2]\r\n	select(length==2) | .[1]	-c --stream	1\n2\n		0
+{"a":1}\r\n[2]\r\n	select(length==2) | .[1]	--stream -r	1\n2\n		0
+{"a":1}\r\n[2]\r\n	length	-c --stream	2\n1\n2\n1\n		0
+{"a":1}\r\n[2]\r\n	length	--stream -r	2\n1\n2\n1\n		0
+[1,2]\n{"a":1}\n}	.	-c --stream	[[0],1]\n[[1],2]\n[[1]]\n[["a"],1]\n[["a"]]\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	.	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n[\n  [\n    1\n  ],\n  2\n]\n[\n  [\n    1\n  ]\n]\n[\n  [\n    "a"\n  ],\n  1\n]\n[\n  [\n    "a"\n  ]\n]\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	select(length==2)	-c --stream	[[0],1]\n[[1],2]\n[["a"],1]\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	select(length==2)	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n[\n  [\n    1\n  ],\n  2\n]\n[\n  [\n    "a"\n  ],\n  1\n]\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[., input_line_number]	-c --stream	[[[0],1],1]\n[[[1],2],1]\n[[[1]],1]\n[[["a"],1],2]\n[[["a"]],2]\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[., input_line_number]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  1\n]\n[\n  [\n    [\n      1\n    ],\n    2\n  ],\n  1\n]\n[\n  [\n    [\n      1\n    ]\n  ],\n  1\n]\n[\n  [\n    [\n      "a"\n    ],\n    1\n  ],\n  2\n]\n[\n  [\n    [\n      "a"\n    ]\n  ],\n  2\n]\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	input_line_number	-c --stream	1\n1\n1\n2\n2\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	input_line_number	--stream -r	1\n1\n1\n2\n2\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n{FILE}\n{FILE}\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[., input]	-c --stream	[[[0],1],[[1],2]]\n[[[1]],[["a"],1]]\n	jq: error (at {FILE}:2): Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[., input]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  [\n    [\n      1\n    ],\n    2\n  ]\n]\n[\n  [\n    [\n      1\n    ]\n  ],\n  [\n    [\n      "a"\n    ],\n    1\n  ]\n]\n	jq: error (at {FILE}:2): Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[., inputs]	-c --stream		jq: error (at {FILE}:2): Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[., inputs]	--stream -r		jq: error (at {FILE}:2): Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	first(inputs)	-c --stream	[[1],2]\n[["a"],1]\n	jq: error (at {FILE}:2): Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	first(inputs)	--stream -r	[\n  [\n    1\n  ],\n  2\n]\n[\n  [\n    "a"\n  ],\n  1\n]\n	jq: error (at {FILE}:2): Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	if length == 2 then .[0] else empty end	-c --stream	[0]\n[1]\n["a"]\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	if length == 2 then .[0] else empty end	--stream -r	[\n  0\n]\n[\n  1\n]\n[\n  "a"\n]\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	halt	-c --stream			0
+[1,2]\n{"a":1}\n}	halt	--stream -r			0
+[1,2]\n{"a":1}\n}	error	-c --stream		jq: error (at {FILE}:1) (not a string): [[0],1]\njq: error (at {FILE}:1) (not a string): [[1],2]\njq: error (at {FILE}:1) (not a string): [[1]]\njq: error (at {FILE}:2) (not a string): [["a"],1]\njq: error (at {FILE}:2) (not a string): [["a"]]\njq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	error	--stream -r		jq: error (at {FILE}:1) (not a string): [[0],1]\njq: error (at {FILE}:1) (not a string): [[1],2]\njq: error (at {FILE}:1) (not a string): [[1]]\njq: error (at {FILE}:2) (not a string): [["a"],1]\njq: error (at {FILE}:2) (not a string): [["a"]]\njq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	empty	-c --stream		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	empty	--stream -r		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	select(length==2) | .[1]	-c --stream	1\n2\n1\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	select(length==2) | .[1]	--stream -r	1\n2\n1\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	length	-c --stream	2\n2\n1\n2\n1\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	length	--stream -r	2\n2\n1\n2\n1\n	jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1]\n{"a" 2}\n[3]\n	.	-c --stream	[[0],1]\n[[0]]\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	.	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n[\n  [\n    0\n  ]\n]\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	select(length==2)	-c --stream	[[0],1]\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	select(length==2)	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	[., input_line_number]	-c --stream	[[[0],1],1]\n[[[0]],1]\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	[., input_line_number]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  1\n]\n[\n  [\n    [\n      0\n    ]\n  ],\n  1\n]\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	input_line_number	-c --stream	1\n1\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	input_line_number	--stream -r	1\n1\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	input_filename	--stream -r	{FILE}\n{FILE}\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	[., input]	-c --stream	[[[0],1],[[0]]]\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	[., input]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  [\n    [\n      0\n    ]\n  ]\n]\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	[., inputs]	-c --stream	[[[0],3],[[0]]]\n	jq: error (at {FILE}:2): Expected separator between values at line 2, column 7\n	0
+[1]\n{"a" 2}\n[3]\n	[., inputs]	--stream -r	[\n  [\n    [\n      0\n    ],\n    3\n  ],\n  [\n    [\n      0\n    ]\n  ]\n]\n	jq: error (at {FILE}:2): Expected separator between values at line 2, column 7\n	0
+[1]\n{"a" 2}\n[3]\n	first(inputs)	-c --stream	[[0]]\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	first(inputs)	--stream -r	[\n  [\n    0\n  ]\n]\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	if length == 2 then .[0] else empty end	-c --stream	[0]\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	if length == 2 then .[0] else empty end	--stream -r	[\n  0\n]\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	halt	-c --stream			0
+[1]\n{"a" 2}\n[3]\n	halt	--stream -r			0
+[1]\n{"a" 2}\n[3]\n	error	-c --stream		jq: error (at {FILE}:1) (not a string): [[0],1]\njq: error (at {FILE}:1) (not a string): [[0]]\njq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	error	--stream -r		jq: error (at {FILE}:1) (not a string): [[0],1]\njq: error (at {FILE}:1) (not a string): [[0]]\njq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	empty	-c --stream		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	empty	--stream -r		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	select(length==2) | .[1]	-c --stream	1\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	select(length==2) | .[1]	--stream -r	1\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	length	-c --stream	2\n1\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	length	--stream -r	2\n1\n	jq: parse error: Expected separator between values at line 2, column 7\n	5
+{"a":[1,2	.	-c --stream	[["a",0],1]\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	.	--stream -r	[\n  [\n    "a",\n    0\n  ],\n  1\n]\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	select(length==2)	-c --stream	[["a",0],1]\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	select(length==2)	--stream -r	[\n  [\n    "a",\n    0\n  ],\n  1\n]\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[., input_line_number]	-c --stream	[[["a",0],1],0]\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[., input_line_number]	--stream -r	[\n  [\n    [\n      "a",\n      0\n    ],\n    1\n  ],\n  0\n]\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	input_line_number	-c --stream	0\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	input_line_number	--stream -r	0\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	input_filename	-c --stream	"{FILE}"\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	input_filename	--stream -r	{FILE}\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[., input]	-c --stream		jq: error (at {FILE}:0): Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[., input]	--stream -r		jq: error (at {FILE}:0): Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[., inputs]	-c --stream		jq: error (at {FILE}:0): Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[., inputs]	--stream -r		jq: error (at {FILE}:0): Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	first(inputs)	-c --stream		jq: error (at {FILE}:0): Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	first(inputs)	--stream -r		jq: error (at {FILE}:0): Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	if length == 2 then .[0] else empty end	-c --stream	["a",0]\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	if length == 2 then .[0] else empty end	--stream -r	[\n  "a",\n  0\n]\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	halt	-c --stream			0
+{"a":[1,2	halt	--stream -r			0
+{"a":[1,2	error	-c --stream		jq: error (at {FILE}:0) (not a string): [["a",0],1]\njq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	error	--stream -r		jq: error (at {FILE}:0) (not a string): [["a",0],1]\njq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	empty	-c --stream		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	empty	--stream -r		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	select(length==2) | .[1]	-c --stream	1\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	select(length==2) | .[1]	--stream -r	1\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	length	-c --stream	2\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	length	--stream -r	2\n	jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+"abc\\q"	.	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	.	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	select(length==2)	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	select(length==2)	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	[., input_line_number]	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	[., input_line_number]	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	input_line_number	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	input_line_number	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	input_filename	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	input_filename	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	[., input]	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	[., input]	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	[., inputs]	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	[., inputs]	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	first(inputs)	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	first(inputs)	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	if length == 2 then .[0] else empty end	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	if length == 2 then .[0] else empty end	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	$__loc__	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	$__loc__	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	halt	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	halt	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	error	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	error	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	empty	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	empty	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	select(length==2) | .[1]	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	select(length==2) | .[1]	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	length	-c --stream		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	length	--stream -r		jq: parse error: Invalid escape at line 1, column 7\n	5
+[1,2]]	.	-c --stream	[[0],1]\n[[1],2]\n[[1]]\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	.	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n[\n  [\n    1\n  ],\n  2\n]\n[\n  [\n    1\n  ]\n]\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	select(length==2)	-c --stream	[[0],1]\n[[1],2]\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	select(length==2)	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n[\n  [\n    1\n  ],\n  2\n]\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[., input_line_number]	-c --stream	[[[0],1],0]\n[[[1],2],0]\n[[[1]],0]\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[., input_line_number]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  0\n]\n[\n  [\n    [\n      1\n    ],\n    2\n  ],\n  0\n]\n[\n  [\n    [\n      1\n    ]\n  ],\n  0\n]\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	input_line_number	-c --stream	0\n0\n0\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	input_line_number	--stream -r	0\n0\n0\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[., input]	-c --stream	[[[0],1],[[1],2]]\n	jq: error (at {FILE}:0): Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[., input]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  [\n    [\n      1\n    ],\n    2\n  ]\n]\n	jq: error (at {FILE}:0): Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[., inputs]	-c --stream		jq: error (at {FILE}:0): Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[., inputs]	--stream -r		jq: error (at {FILE}:0): Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	first(inputs)	-c --stream	[[1],2]\n	jq: error (at {FILE}:0): Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	first(inputs)	--stream -r	[\n  [\n    1\n  ],\n  2\n]\n	jq: error (at {FILE}:0): Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	if length == 2 then .[0] else empty end	-c --stream	[0]\n[1]\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	if length == 2 then .[0] else empty end	--stream -r	[\n  0\n]\n[\n  1\n]\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	halt	-c --stream			0
+[1,2]]	halt	--stream -r			0
+[1,2]]	error	-c --stream		jq: error (at {FILE}:0) (not a string): [[0],1]\njq: error (at {FILE}:0) (not a string): [[1],2]\njq: error (at {FILE}:0) (not a string): [[1]]\njq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	error	--stream -r		jq: error (at {FILE}:0) (not a string): [[0],1]\njq: error (at {FILE}:0) (not a string): [[1],2]\njq: error (at {FILE}:0) (not a string): [[1]]\njq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	empty	-c --stream		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	empty	--stream -r		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	select(length==2) | .[1]	-c --stream	1\n2\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	select(length==2) | .[1]	--stream -r	1\n2\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	length	-c --stream	2\n2\n1\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	length	--stream -r	2\n2\n1\n	jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1]\n{"x":1,}\n	.	-c --stream	[[0],1]\n[[0]]\n[["x"],1]\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	.	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n[\n  [\n    0\n  ]\n]\n[\n  [\n    "x"\n  ],\n  1\n]\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	select(length==2)	-c --stream	[[0],1]\n[["x"],1]\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	select(length==2)	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n[\n  [\n    "x"\n  ],\n  1\n]\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[., input_line_number]	-c --stream	[[[0],1],1]\n[[[0]],1]\n[[["x"],1],2]\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[., input_line_number]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  1\n]\n[\n  [\n    [\n      0\n    ]\n  ],\n  1\n]\n[\n  [\n    [\n      "x"\n    ],\n    1\n  ],\n  2\n]\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	input_line_number	-c --stream	1\n1\n2\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	input_line_number	--stream -r	1\n1\n2\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[., input]	-c --stream	[[[0],1],[[0]]]\n	jq: error (at {FILE}:2): Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[., input]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  [\n    [\n      0\n    ]\n  ]\n]\n	jq: error (at {FILE}:2): Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[., inputs]	-c --stream		jq: error (at {FILE}:2): Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[., inputs]	--stream -r		jq: error (at {FILE}:2): Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	first(inputs)	-c --stream	[[0]]\n	jq: error (at {FILE}:2): Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	first(inputs)	--stream -r	[\n  [\n    0\n  ]\n]\n	jq: error (at {FILE}:2): Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	if length == 2 then .[0] else empty end	-c --stream	[0]\n["x"]\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	if length == 2 then .[0] else empty end	--stream -r	[\n  0\n]\n[\n  "x"\n]\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	halt	-c --stream			0
+[1]\n{"x":1,}\n	halt	--stream -r			0
+[1]\n{"x":1,}\n	error	-c --stream		jq: error (at {FILE}:1) (not a string): [[0],1]\njq: error (at {FILE}:1) (not a string): [[0]]\njq: error (at {FILE}:2) (not a string): [["x"],1]\njq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	error	--stream -r		jq: error (at {FILE}:1) (not a string): [[0],1]\njq: error (at {FILE}:1) (not a string): [[0]]\njq: error (at {FILE}:2) (not a string): [["x"],1]\njq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	empty	-c --stream		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	empty	--stream -r		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	select(length==2) | .[1]	-c --stream	1\n1\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	select(length==2) | .[1]	--stream -r	1\n1\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	length	-c --stream	2\n1\n2\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	length	--stream -r	2\n1\n2\n	jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+\u{feff}[1]\n	.	-c --stream	[[0],1]\n[[0]]\n		0
+\u{feff}[1]\n	.	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n[\n  [\n    0\n  ]\n]\n		0
+\u{feff}[1]\n	select(length==2)	-c --stream	[[0],1]\n		0
+\u{feff}[1]\n	select(length==2)	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n		0
+\u{feff}[1]\n	[., input_line_number]	-c --stream	[[[0],1],1]\n[[[0]],1]\n		0
+\u{feff}[1]\n	[., input_line_number]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  1\n]\n[\n  [\n    [\n      0\n    ]\n  ],\n  1\n]\n		0
+\u{feff}[1]\n	input_line_number	-c --stream	1\n1\n		0
+\u{feff}[1]\n	input_line_number	--stream -r	1\n1\n		0
+\u{feff}[1]\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n		0
+\u{feff}[1]\n	input_filename	--stream -r	{FILE}\n{FILE}\n		0
+\u{feff}[1]\n	[., input]	-c --stream	[[[0],1],[[0]]]\n		0
+\u{feff}[1]\n	[., input]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  [\n    [\n      0\n    ]\n  ]\n]\n		0
+\u{feff}[1]\n	[., inputs]	-c --stream	[[[0],1],[[0]]]\n		0
+\u{feff}[1]\n	[., inputs]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  [\n    [\n      0\n    ]\n  ]\n]\n		0
+\u{feff}[1]\n	first(inputs)	-c --stream	[[0]]\n		0
+\u{feff}[1]\n	first(inputs)	--stream -r	[\n  [\n    0\n  ]\n]\n		0
+\u{feff}[1]\n	if length == 2 then .[0] else empty end	-c --stream	[0]\n		0
+\u{feff}[1]\n	if length == 2 then .[0] else empty end	--stream -r	[\n  0\n]\n		0
+\u{feff}[1]\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+\u{feff}[1]\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n		0
+\u{feff}[1]\n	halt	-c --stream			0
+\u{feff}[1]\n	halt	--stream -r			0
+\u{feff}[1]\n	error	-c --stream		jq: error (at {FILE}:1) (not a string): [[0],1]\njq: error (at {FILE}:1) (not a string): [[0]]\n	5
+\u{feff}[1]\n	error	--stream -r		jq: error (at {FILE}:1) (not a string): [[0],1]\njq: error (at {FILE}:1) (not a string): [[0]]\n	5
+\u{feff}[1]\n	empty	-c --stream			0
+\u{feff}[1]\n	empty	--stream -r			0
+\u{feff}[1]\n	select(length==2) | .[1]	-c --stream	1\n		0
+\u{feff}[1]\n	select(length==2) | .[1]	--stream -r	1\n		0
+\u{feff}[1]\n	length	-c --stream	2\n1\n		0
+\u{feff}[1]\n	length	--stream -r	2\n1\n		0
+[1,nan]\n	.	-c --stream	[[0],1]\n[[1],null]\n[[1]]\n		0
+[1,nan]\n	.	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n[\n  [\n    1\n  ],\n  null\n]\n[\n  [\n    1\n  ]\n]\n		0
+[1,nan]\n	select(length==2)	-c --stream	[[0],1]\n[[1],null]\n		0
+[1,nan]\n	select(length==2)	--stream -r	[\n  [\n    0\n  ],\n  1\n]\n[\n  [\n    1\n  ],\n  null\n]\n		0
+[1,nan]\n	[., input_line_number]	-c --stream	[[[0],1],1]\n[[[1],null],1]\n[[[1]],1]\n		0
+[1,nan]\n	[., input_line_number]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  1\n]\n[\n  [\n    [\n      1\n    ],\n    null\n  ],\n  1\n]\n[\n  [\n    [\n      1\n    ]\n  ],\n  1\n]\n		0
+[1,nan]\n	input_line_number	-c --stream	1\n1\n1\n		0
+[1,nan]\n	input_line_number	--stream -r	1\n1\n1\n		0
+[1,nan]\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n		0
+[1,nan]\n	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n		0
+[1,nan]\n	[., input]	-c --stream	[[[0],1],[[1],null]]\n	jq: error (at {FILE}:1): break\n	5
+[1,nan]\n	[., input]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  [\n    [\n      1\n    ],\n    null\n  ]\n]\n	jq: error (at {FILE}:1): break\n	5
+[1,nan]\n	[., inputs]	-c --stream	[[[0],1],[[1],null],[[1]]]\n		0
+[1,nan]\n	[., inputs]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1\n  ],\n  [\n    [\n      1\n    ],\n    null\n  ],\n  [\n    [\n      1\n    ]\n  ]\n]\n		0
+[1,nan]\n	first(inputs)	-c --stream	[[1],null]\n		0
+[1,nan]\n	first(inputs)	--stream -r	[\n  [\n    1\n  ],\n  null\n]\n		0
+[1,nan]\n	if length == 2 then .[0] else empty end	-c --stream	[0]\n[1]\n		0
+[1,nan]\n	if length == 2 then .[0] else empty end	--stream -r	[\n  0\n]\n[\n  1\n]\n		0
+[1,nan]\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+[1,nan]\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n		0
+[1,nan]\n	halt	-c --stream			0
+[1,nan]\n	halt	--stream -r			0
+[1,nan]\n	error	-c --stream		jq: error (at {FILE}:1) (not a string): [[0],1]\njq: error (at {FILE}:1) (not a string): [[1],null]\njq: error (at {FILE}:1) (not a string): [[1]]\n	5
+[1,nan]\n	error	--stream -r		jq: error (at {FILE}:1) (not a string): [[0],1]\njq: error (at {FILE}:1) (not a string): [[1],null]\njq: error (at {FILE}:1) (not a string): [[1]]\n	5
+[1,nan]\n	empty	-c --stream			0
+[1,nan]\n	empty	--stream -r			0
+[1,nan]\n	select(length==2) | .[1]	-c --stream	1\nnull\n		0
+[1,nan]\n	select(length==2) | .[1]	--stream -r	1\nnull\n		0
+[1,nan]\n	length	-c --stream	2\n2\n1\n		0
+[1,nan]\n	length	--stream -r	2\n2\n1\n		0
+[1e1000, 100000000000000000000000000]\n	.	-c --stream	[[0],1E+1000]\n[[1],100000000000000000000000000]\n[[1]]\n		0
+[1e1000, 100000000000000000000000000]\n	.	--stream -r	[\n  [\n    0\n  ],\n  1E+1000\n]\n[\n  [\n    1\n  ],\n  100000000000000000000000000\n]\n[\n  [\n    1\n  ]\n]\n		0
+[1e1000, 100000000000000000000000000]\n	select(length==2)	-c --stream	[[0],1E+1000]\n[[1],100000000000000000000000000]\n		0
+[1e1000, 100000000000000000000000000]\n	select(length==2)	--stream -r	[\n  [\n    0\n  ],\n  1E+1000\n]\n[\n  [\n    1\n  ],\n  100000000000000000000000000\n]\n		0
+[1e1000, 100000000000000000000000000]\n	[., input_line_number]	-c --stream	[[[0],1E+1000],1]\n[[[1],100000000000000000000000000],1]\n[[[1]],1]\n		0
+[1e1000, 100000000000000000000000000]\n	[., input_line_number]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1E+1000\n  ],\n  1\n]\n[\n  [\n    [\n      1\n    ],\n    100000000000000000000000000\n  ],\n  1\n]\n[\n  [\n    [\n      1\n    ]\n  ],\n  1\n]\n		0
+[1e1000, 100000000000000000000000000]\n	input_line_number	-c --stream	1\n1\n1\n		0
+[1e1000, 100000000000000000000000000]\n	input_line_number	--stream -r	1\n1\n1\n		0
+[1e1000, 100000000000000000000000000]\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n		0
+[1e1000, 100000000000000000000000000]\n	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n		0
+[1e1000, 100000000000000000000000000]\n	[., input]	-c --stream	[[[0],1E+1000],[[1],100000000000000000000000000]]\n	jq: error (at {FILE}:1): break\n	5
+[1e1000, 100000000000000000000000000]\n	[., input]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1E+1000\n  ],\n  [\n    [\n      1\n    ],\n    100000000000000000000000000\n  ]\n]\n	jq: error (at {FILE}:1): break\n	5
+[1e1000, 100000000000000000000000000]\n	[., inputs]	-c --stream	[[[0],1E+1000],[[1],100000000000000000000000000],[[1]]]\n		0
+[1e1000, 100000000000000000000000000]\n	[., inputs]	--stream -r	[\n  [\n    [\n      0\n    ],\n    1E+1000\n  ],\n  [\n    [\n      1\n    ],\n    100000000000000000000000000\n  ],\n  [\n    [\n      1\n    ]\n  ]\n]\n		0
+[1e1000, 100000000000000000000000000]\n	first(inputs)	-c --stream	[[1],100000000000000000000000000]\n		0
+[1e1000, 100000000000000000000000000]\n	first(inputs)	--stream -r	[\n  [\n    1\n  ],\n  100000000000000000000000000\n]\n		0
+[1e1000, 100000000000000000000000000]\n	if length == 2 then .[0] else empty end	-c --stream	[0]\n[1]\n		0
+[1e1000, 100000000000000000000000000]\n	if length == 2 then .[0] else empty end	--stream -r	[\n  0\n]\n[\n  1\n]\n		0
+[1e1000, 100000000000000000000000000]\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+[1e1000, 100000000000000000000000000]\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n		0
+[1e1000, 100000000000000000000000000]\n	halt	-c --stream			0
+[1e1000, 100000000000000000000000000]\n	halt	--stream -r			0
+[1e1000, 100000000000000000000000000]\n	error	-c --stream		jq: error (at {FILE}:1) (not a string): [[0],1E+1000]\njq: error (at {FILE}:1) (not a string): [[1],100000000000000000000000000]\njq: error (at {FILE}:1) (not a string): [[1]]\n	5
+[1e1000, 100000000000000000000000000]\n	error	--stream -r		jq: error (at {FILE}:1) (not a string): [[0],1E+1000]\njq: error (at {FILE}:1) (not a string): [[1],100000000000000000000000000]\njq: error (at {FILE}:1) (not a string): [[1]]\n	5
+[1e1000, 100000000000000000000000000]\n	empty	-c --stream			0
+[1e1000, 100000000000000000000000000]\n	empty	--stream -r			0
+[1e1000, 100000000000000000000000000]\n	select(length==2) | .[1]	-c --stream	1E+1000\n100000000000000000000000000\n		0
+[1e1000, 100000000000000000000000000]\n	select(length==2) | .[1]	--stream -r	1E+1000\n100000000000000000000000000\n		0
+[1e1000, 100000000000000000000000000]\n	length	-c --stream	2\n2\n1\n		0
+[1e1000, 100000000000000000000000000]\n	length	--stream -r	2\n2\n1\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	.	-c --stream	[[0],"\u{e9}"]\n[[1],"\u{e9}"]\n[[2],"\u{1f600}"]\n[[2]]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	.	--stream -r	[\n  [\n    0\n  ],\n  "\u{e9}"\n]\n[\n  [\n    1\n  ],\n  "\u{e9}"\n]\n[\n  [\n    2\n  ],\n  "\u{1f600}"\n]\n[\n  [\n    2\n  ]\n]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	select(length==2)	-c --stream	[[0],"\u{e9}"]\n[[1],"\u{e9}"]\n[[2],"\u{1f600}"]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	select(length==2)	--stream -r	[\n  [\n    0\n  ],\n  "\u{e9}"\n]\n[\n  [\n    1\n  ],\n  "\u{e9}"\n]\n[\n  [\n    2\n  ],\n  "\u{1f600}"\n]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[., input_line_number]	-c --stream	[[[0],"\u{e9}"],1]\n[[[1],"\u{e9}"],1]\n[[[2],"\u{1f600}"],1]\n[[[2]],1]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[., input_line_number]	--stream -r	[\n  [\n    [\n      0\n    ],\n    "\u{e9}"\n  ],\n  1\n]\n[\n  [\n    [\n      1\n    ],\n    "\u{e9}"\n  ],\n  1\n]\n[\n  [\n    [\n      2\n    ],\n    "\u{1f600}"\n  ],\n  1\n]\n[\n  [\n    [\n      2\n    ]\n  ],\n  1\n]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	input_line_number	-c --stream	1\n1\n1\n1\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	input_line_number	--stream -r	1\n1\n1\n1\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	input_filename	-c --stream	"{FILE}"\n"{FILE}"\n"{FILE}"\n"{FILE}"\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	input_filename	--stream -r	{FILE}\n{FILE}\n{FILE}\n{FILE}\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[., input]	-c --stream	[[[0],"\u{e9}"],[[1],"\u{e9}"]]\n[[[2],"\u{1f600}"],[[2]]]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[., input]	--stream -r	[\n  [\n    [\n      0\n    ],\n    "\u{e9}"\n  ],\n  [\n    [\n      1\n    ],\n    "\u{e9}"\n  ]\n]\n[\n  [\n    [\n      2\n    ],\n    "\u{1f600}"\n  ],\n  [\n    [\n      2\n    ]\n  ]\n]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[., inputs]	-c --stream	[[[0],"\u{e9}"],[[1],"\u{e9}"],[[2],"\u{1f600}"],[[2]]]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[., inputs]	--stream -r	[\n  [\n    [\n      0\n    ],\n    "\u{e9}"\n  ],\n  [\n    [\n      1\n    ],\n    "\u{e9}"\n  ],\n  [\n    [\n      2\n    ],\n    "\u{1f600}"\n  ],\n  [\n    [\n      2\n    ]\n  ]\n]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	first(inputs)	-c --stream	[[1],"\u{e9}"]\n[[2]]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	first(inputs)	--stream -r	[\n  [\n    1\n  ],\n  "\u{e9}"\n]\n[\n  [\n    2\n  ]\n]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	if length == 2 then .[0] else empty end	-c --stream	[0]\n[1]\n[2]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	if length == 2 then .[0] else empty end	--stream -r	[\n  0\n]\n[\n  1\n]\n[\n  2\n]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	$__loc__	-c --stream	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	$__loc__	--stream -r	{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n{\n  "file": "<top-level>",\n  "line": 1\n}\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	halt	-c --stream			0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	halt	--stream -r			0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	error	-c --stream		jq: error (at {FILE}:1) (not a string): [[0],"\u{e9}"]\njq: error (at {FILE}:1) (not a string): [[1],"\u{e9}"]\njq: error (at {FILE}:1) (not a string): [[2],"\u{1f600}"]\njq: error (at {FILE}:1) (not a string): [[2]]\n	5
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	error	--stream -r		jq: error (at {FILE}:1) (not a string): [[0],"\u{e9}"]\njq: error (at {FILE}:1) (not a string): [[1],"\u{e9}"]\njq: error (at {FILE}:1) (not a string): [[2],"\u{1f600}"]\njq: error (at {FILE}:1) (not a string): [[2]]\n	5
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	empty	-c --stream			0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	empty	--stream -r			0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	select(length==2) | .[1]	-c --stream	"\u{e9}"\n"\u{e9}"\n"\u{1f600}"\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	select(length==2) | .[1]	--stream -r	\u{e9}\n\u{e9}\n\u{1f600}\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	length	-c --stream	2\n2\n2\n1\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	length	--stream -r	2\n2\n2\n1\n		0
