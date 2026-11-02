@@ -9356,6 +9356,17 @@ fn write_yaml_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
     field: YamlField<'_, W>,
     flow: bool,
 ) -> StreamResult {
+    // #5469: an alias used as a key stays an alias, as a value does (#712). yq writes a space
+    // before the `:` in block context (`*a : 1`), where a `:` straight after the name would read
+    // as part of it, and none in flow context (`{*a: 1}`).
+    if let Some(name) = field.key_cursor().alias() {
+        out.write_char('*')?;
+        out.write_str(name)?;
+        if !flow {
+            out.write_char(' ')?;
+        }
+        return Ok(());
+    }
     if let Some(anchor) = field.key_cursor().anchor() {
         out.write_char('&')?;
         out.write_str(anchor)?;
@@ -9452,7 +9463,8 @@ fn write_yaml_block_field_key_checked<W: AsRef<[u64]>, Out: core::fmt::Write>(
     indent_spaces: usize,
     unit: char,
 ) -> Result<bool, StreamFailure> {
-    if !field.key_cursor().index.canonicalize_numbers() {
+    // An alias key is written as `*name` however long its target is (#5469).
+    if !field.key_cursor().index.canonicalize_numbers() && !field.key_cursor().is_alias() {
         if let YamlValue::String(s) = field.key() {
             // A break is spelled as an escape in a one-line key, so it takes a backslash.
             let long = match s {
