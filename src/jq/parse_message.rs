@@ -400,6 +400,10 @@ impl Parser {
 /// The diagnostic `jv_parse` gives for `text`, without its trailing `(while parsing '...')`, or
 /// `None` when jq's parser reads `text` as exactly one JSON value.
 ///
+/// A text that opens with part of the BOM and departs from it is `Malformed BOM` before the
+/// parser runs, as in `jv_parser_set_buf` (#5804); the stream routes ([`jq_stream_fault`]) do not
+/// make that check.
+///
 /// `text` is parsed whole, NULs included: jq's parser takes a length, not a C string.
 pub(crate) fn jq_parse_message(text: &[u8]) -> Option<String> {
     if malformed_bom(text) {

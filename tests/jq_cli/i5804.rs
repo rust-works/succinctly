@@ -40,6 +40,15 @@ fn test_a_partial_bom_is_malformed_in_fromjson_and_tonumber_5804() -> Result<()>
             r#""\ufec0" | try fromjson catch ."#,
             "\"Malformed BOM (while parsing '\u{fec0}')\"",
         ),
+        // The quotation ends at a NUL, as for any other fault; `tonumber` takes trailing text.
+        (
+            r#""\ufffd\u0000x" | try fromjson catch ."#,
+            "\"Malformed BOM (while parsing '\u{fffd}')\"",
+        ),
+        (
+            r#""\ufffd 1" | try tonumber catch ."#,
+            "\"Malformed BOM (while parsing '\u{fffd} 1')\"",
+        ),
         // The fuzzer's finding: `@base64d` of `null` is two U+FFFD and a letter.
         (
             r#"(null | @base64d) | try fromjson catch . | startswith("Malformed BOM")"#,
