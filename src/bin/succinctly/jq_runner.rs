@@ -5784,6 +5784,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // this function's own stated safety goal.
             if args.null_input && !force_read_under_null_input {
                 jq::seed_remaining_inputs(Vec::new(), locations.exhausted(args.slurp));
+            } else if let Some(lazy) = LAZY_STREAM_INPUTS.with(|slot| slot.borrow_mut().take()) {
+                // #5498: `--stream` and `--stream-errors` read as the program asks. The end of the
+                // stream is settled when the reader reaches it.
+                debug_assert_eq!(locations.per_value(), &[]);
+                jq::seed_remaining_inputs_from(stream_reader_producer(lazy));
+                jq::count_reads_past_end();
             } else if let Some(lazy) = LAZY_JSON_INPUTS.with(|slot| slot.borrow_mut().take()) {
                 // #5661: a clean single-source stream whose documents are converted as the
                 // program reads them. `inputs` is empty, and so is `locations`' line table: each
@@ -6452,7 +6458,13 @@ fn get_inputs(
     // a file continues in the next one.
     // `--validate` is strict per file (an empty file is rejected too), so it reads the files as
     // written.
-    let mut seams = if json_input_mode && !args.validate && !args.stream_errors {
+    // #5498: plain `--stream`, under `-n`, reads the way `--stream-errors` does (jq's streaming
+    // parser, which carries a token over a file boundary itself) and raises each fault as the
+    // error jq raises; the rest of `--stream` keeps its own route for now.
+    let stream_by_reader =
+        args.stream && !args.stream_errors && args.null_input && track_eof && !args.slurp;
+    let mut seams = if json_input_mode && !args.validate && !args.stream_errors && !stream_by_reader
+    {
         stitch_json_file_seams(
             raw_bytes.iter_mut().map(|(_, raw)| raw),
             track_eof,
@@ -6616,20 +6628,34 @@ fn get_inputs(
     // #5474: `--stream-errors` reads the bytes with jq's own streaming parser, which turns a fault
     // into an input of its own, so neither the document parse nor the `--stream` expansion below
     // can produce what the program reads.
-    if args.stream_errors && json_input_mode {
+    if (args.stream_errors || stream_by_reader) && json_input_mode {
         if args.validate {
             for (file_idx, raw) in &raw_bytes {
                 let filename = file_idx.map(|idx| files[idx].to_string_lossy().to_string());
                 validate_json_input(raw, filename.as_deref())?;
             }
         }
-        let read = crate::jq_stream_errors::read(&raw_bytes);
         let mut locations = InputLocations::new(
             files
                 .iter()
                 .map(|p| Some(p.to_string_lossy().to_string()))
                 .collect(),
         );
+        // #5498: under `-n` the program reads its inputs through `input`/`inputs`, and the
+        // reader hands them out as the program asks, so a stream of events is never held.
+        if track_eof && args.null_input && !args.slurp {
+            LAZY_STREAM_INPUTS.with(|slot| {
+                *slot.borrow_mut() = Some(LazyStreamInputs {
+                    files: raw_bytes.iter().map(|(file, _)| *file).collect(),
+                    last_source: u32::try_from(locations.files().len().saturating_sub(1))
+                        .unwrap_or(u32::MAX),
+                    reader: crate::jq_stream_errors::Reader::new(raw_bytes),
+                    raise_errors: stream_by_reader,
+                });
+            });
+            return Ok(Ok((Vec::new(), locations, None, Vec::new())));
+        }
+        let read = crate::jq_stream_errors::read(&raw_bytes);
         let mut values = read.values;
         let mut value_locations = read.locations;
         // `--slurp` closes its array at the call that empties jq's buffer, so what that call left
@@ -6909,6 +6935,7 @@ fn get_inputs(
         // no message can read it (`--stream`, DSV).
         let last = raw_inputs.len().saturating_sub(1);
         LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
+        LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
         let mut lazy_inputs = false;
         let counts_files = !args.stream && args.input_dsv.is_none();
         let mut next_file = StreamOrigin::ALONE.file;
@@ -9229,7 +9256,62 @@ fn lazy_json_producer(lazy: LazyJsonInputs, exhausted: Option<(u32, u32)>) -> jq
     })
 }
 
+/// `--stream` and `--stream-errors` inputs read as the program asks for them (#5498): jq's streaming parser over
+/// the sources' bytes, and what its source indices mean.
+struct LazyStreamInputs {
+    reader: crate::jq_stream_errors::Reader<Vec<(Option<usize>, Vec<u8>)>>,
+    /// The file each source was read from, as `get_inputs` tags its values.
+    files: Vec<Option<usize>>,
+    /// The tag of the last source, which the end of the stream names.
+    last_source: u32,
+    /// Whether a parse error is raised by the read that reaches it, as under `--stream`, and not
+    /// handed over as an input of its own, as under `--stream-errors`.
+    raise_errors: bool,
+}
+
+/// The producer the `input` queue pulls a [`LazyStreamInputs`] stream's inputs from: each read
+/// feeds the parser the refills it takes to complete one more input, and the read after the
+/// last settles the end of the stream where jq's reader stood (#5498).
+fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
+    let LazyStreamInputs {
+        mut reader,
+        files,
+        last_source,
+        raise_errors,
+    } = lazy;
+    Box::new(move || match reader.next_yielded() {
+        Some(input) => {
+            let (source, line) = input.location;
+            // The same tags the whole read gave: a value yielded after jq closed its input has
+            // no line, and the first source is tag 0 when it is stdin.
+            let (tag, line) = if line == crate::jq_stream_errors::CLOSED {
+                (0, UNKNOWN_LINE)
+            } else {
+                (
+                    u32::try_from(files[source].unwrap_or(0)).unwrap_or(u32::MAX),
+                    u32::try_from(line).unwrap_or(u32::MAX),
+                )
+            };
+            match input.error {
+                Some(message) if raise_errors => {
+                    jq::ProducedInput::Error(EvalError::new(message), (tag, line))
+                }
+                _ => jq::ProducedInput::Document(input.value, tag, line),
+            }
+        }
+        None => jq::ProducedInput::End(
+            reader
+                .end()
+                .open_at_end
+                .map(|lines| (last_source, u32::try_from(lines).unwrap_or(u32::MAX))),
+        ),
+    })
+}
+
 thread_local! {
+    /// Set by [`get_inputs`] for the call site that seeds the `input` queue, which takes it.
+    static LAZY_STREAM_INPUTS: std::cell::RefCell<Option<LazyStreamInputs>> =
+        const { std::cell::RefCell::new(None) };
     /// Set by [`get_inputs`] for the call site that seeds the `input` queue, which takes it.
     static LAZY_JSON_INPUTS: std::cell::RefCell<Option<LazyJsonInputs>> =
         const { std::cell::RefCell::new(None) };
@@ -14176,18 +14258,26 @@ mod tests {
         assert!(inputs.is_empty(), "the substituted text is still clean");
         let scanned = EofTail::of(&[b"\"\xe9\"\n1".as_slice()], false, &[], false);
         assert_eq!(tail, Some(scanned));
-        // Not under `-n`, with `-s`, with `--stream`, or with a stream that turns malformed.
+        // Not under `-n`, with `-s`, or with a stream that turns malformed.
         let broken = write("broken.json", "1\n2\n}\n");
         for argv in [
             vec!["jq", "inputs", &clean],
             vec!["jq", "-n", "-s", "inputs", &clean],
-            vec!["jq", "-n", "--stream", "inputs", &clean],
             vec!["jq", "-n", "inputs", &broken],
             vec!["jq", "-n", "inputs", &clean, &clean],
         ] {
             let (inputs, _, _, _, lazy) = read(&argv);
             assert!(lazy.is_none(), "{argv:?}");
             assert!(!inputs.is_empty(), "{argv:?}");
+        }
+        // `--stream` and `--stream-errors` are read as the program asks too, by jq's streaming
+        // parser rather than from spans (#5498): nothing is queued up front.
+        for flag in ["--stream", "--stream-errors"] {
+            let argv = ["jq", "-n", flag, "inputs", &clean];
+            let (inputs, _, _, _, lazy) = read(&argv);
+            assert!(inputs.is_empty() && lazy.is_none(), "{argv:?}");
+            let stream = LAZY_STREAM_INPUTS.with(|slot| slot.borrow_mut().take());
+            assert!(stream.is_some(), "{argv:?} is read by the stream reader");
         }
     }
 

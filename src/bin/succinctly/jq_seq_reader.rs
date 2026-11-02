@@ -97,15 +97,22 @@ pub(crate) fn ignored_parse_error(body: &str) -> String {
 pub(crate) fn fgets_chunk_lens(raw: &[u8]) -> impl Iterator<Item = usize> + '_ {
     let mut pos = 0usize;
     std::iter::from_fn(move || {
-        let rest = raw.get(pos..).filter(|rest| !rest.is_empty())?;
-        let len = rest
-            .iter()
-            .take(JQ_FGETS_CHUNK)
-            .position(|&byte| byte == b'\n')
-            .map_or_else(|| rest.len().min(JQ_FGETS_CHUNK), |index| index + 1);
+        let len = fgets_chunk_len_at(raw, pos)?;
         pos += len;
         Some(len)
     })
+}
+
+/// The length of the `fgets` chunk that starts at `pos` in `raw`, or `None` at its end: one step
+/// of [`fgets_chunk_lens`], for a reader that finds the chunks as it goes (#5498).
+pub(crate) fn fgets_chunk_len_at(raw: &[u8], pos: usize) -> Option<usize> {
+    let rest = raw.get(pos..).filter(|rest| !rest.is_empty())?;
+    Some(
+        rest.iter()
+            .take(JQ_FGETS_CHUNK)
+            .position(|&byte| byte == b'\n')
+            .map_or_else(|| rest.len().min(JQ_FGETS_CHUNK), |index| index + 1),
+    )
 }
 
 /// The absolute offsets, ascending, at which jq starts a `jv_parser_next`

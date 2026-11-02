@@ -32,7 +32,7 @@
 //! bytes, so a number keeps its spelling and a string its decoding exactly as a document's would;
 //! this module decides only where each one begins and ends and which error fires.
 
-use crate::jq_seq_reader::{fgets_chunk_lens, number_is_valid, unhex4, JQ_FGETS_CHUNK};
+use crate::jq_seq_reader::{fgets_chunk_len_at, number_is_valid, unhex4, JQ_FGETS_CHUNK};
 use succinctly::jq::OwnedValue;
 
 /// What jq's `p->last_seen` can hold.
@@ -106,30 +106,52 @@ struct Refill<'a> {
     is_last: bool,
 }
 
-/// The refills jq makes over `sources`, in order.
+/// Where the refills jq makes over a list of sources have got to, so that the next one can be
+/// found without the whole list being built (the list is as long as the input has lines).
 ///
 /// A file is read a line at a time (`fgets` into 4096 bytes), and the refill is the last one when
 /// `fgets` hit the end of the last file: a chunk that ends in a newline, or fills the buffer, has
 /// not hit it yet and is followed by a refill that returns nothing. The parser sees a chunk with no
 /// newline up to its first NUL (`strlen`).
-fn refills(sources: &[(Option<usize>, Vec<u8>)]) -> Vec<Refill<'_>> {
-    let mut refills: Vec<Refill<'_>> = Vec::new();
-    for (index, (_, raw)) in sources.iter().enumerate() {
-        let last_source = index + 1 == sources.len();
-        let lens: Vec<usize> = fgets_chunk_lens(raw).collect();
-        if lens.is_empty() {
-            refills.push(Refill {
-                source: index,
-                bytes: &[],
-                newline: false,
-                is_last: last_source,
-            });
-            continue;
-        }
-        let mut start = 0;
-        for (k, &len) in lens.iter().enumerate() {
-            let chunk = &raw[start..start + len];
-            start += len;
+#[derive(Default)]
+struct RefillCursor {
+    source: usize,
+    /// Where the next chunk starts in `source`.
+    pos: usize,
+    /// The source and `is_last` of the refill handed out last, which decides whether the
+    /// empty closing refill follows.
+    last: Option<(usize, bool)>,
+    closed: bool,
+}
+
+impl RefillCursor {
+    fn next<'a>(&mut self, sources: &'a [(Option<usize>, Vec<u8>)]) -> Option<Refill<'a>> {
+        while let Some((_, raw)) = sources.get(self.source) {
+            let last_source = self.source + 1 == sources.len();
+            let source = self.source;
+            if raw.is_empty() {
+                self.source += 1;
+                let is_last = last_source;
+                self.last = Some((source, is_last));
+                return Some(Refill {
+                    source,
+                    bytes: &[],
+                    newline: false,
+                    is_last,
+                });
+            }
+            let Some(len) = fgets_chunk_len_at(raw, self.pos) else {
+                self.source += 1;
+                self.pos = 0;
+                continue;
+            };
+            let chunk = &raw[self.pos..self.pos + len];
+            self.pos += len;
+            let at_end = self.pos == raw.len();
+            if at_end {
+                self.source += 1;
+                self.pos = 0;
+            }
             let newline = chunk.ends_with(b"\n");
             let hit_eof = !newline && len < JQ_FGETS_CHUNK;
             let bytes = if newline {
@@ -137,40 +159,121 @@ fn refills(sources: &[(Option<usize>, Vec<u8>)]) -> Vec<Refill<'_>> {
             } else {
                 &chunk[..chunk.iter().position(|&b| b == 0).unwrap_or(len)]
             };
-            refills.push(Refill {
-                source: index,
+            let is_last = last_source && at_end && hit_eof;
+            self.last = Some((source, is_last));
+            return Some(Refill {
+                source,
                 bytes,
                 newline,
-                is_last: last_source && k + 1 == lens.len() && hit_eof,
+                is_last,
             });
         }
-    }
-    if let Some(last) = refills.last() {
-        if !last.is_last {
-            refills.push(Refill {
-                source: last.source,
-                bytes: &[],
-                newline: false,
-                is_last: true,
-            });
+        if !self.closed {
+            self.closed = true;
+            if let Some((source, false)) = self.last {
+                return Some(Refill {
+                    source,
+                    bytes: &[],
+                    newline: false,
+                    is_last: true,
+                });
+            }
         }
+        None
     }
-    refills
 }
 
-/// Read `sources` (each source's bytes as read, a leading BOM already removed) the way
-/// `jq --stream-errors` does.
-pub(crate) fn read(sources: &[(Option<usize>, Vec<u8>)]) -> StreamErrorsRead {
-    let mut parser = Parser::new();
-    // What the last byte of a refill left for the next call to hand out.
-    let mut deferred: Vec<OwnedValue> = Vec::new();
-    let mut inside = None;
-    let mut slurp_at = (0, 0);
-    let mut finished = false;
-    let mut values_before_last_refill = 0;
-    for refill in refills(sources) {
+/// One input jq's parser yielded.
+pub(crate) struct Yielded {
+    pub(crate) value: OwnedValue,
+    /// The source index and the lines jq had read of it ([`CLOSED`] after jq closed its input).
+    pub(crate) location: (usize, usize),
+    /// The message, when the input is a parse error: `[message, path]` is the input under
+    /// `--stream-errors`, and the message is the error jq raises without it.
+    pub(crate) error: Option<String>,
+}
+
+/// How jq's reader ended, known once [`Reader::next`] has returned `None`.
+pub(crate) struct ReadEnd {
+    /// How many of the values jq's `--slurp` loop puts in its array: see
+    /// [`StreamErrorsRead::inside`].
+    pub(crate) inside: usize,
+    /// Where jq stood when it closed the array: see [`StreamErrorsRead::slurp_at`].
+    pub(crate) slurp_at: (usize, usize),
+    /// See [`StreamErrorsRead::open_at_end`].
+    pub(crate) open_at_end: Option<usize>,
+    /// The index among the values of the first parse error jq turned into an input, if any.
+    pub(crate) first_error: Option<usize>,
+}
+
+/// jq's reader over `S`, the sources' bytes as read, handing out the inputs one at a time as the
+/// refills that complete them are fed to the parser: the parser's state and the refill being
+/// read are all it holds, not the values it has yielded.
+pub(crate) struct Reader<S: AsRef<[(Option<usize>, Vec<u8>)]>> {
+    sources: S,
+    cursor: RefillCursor,
+    parser: Parser,
+    /// What the last byte of a refill left for the next call to hand out.
+    deferred: Vec<OwnedValue>,
+    inside: Option<usize>,
+    slurp_at: (usize, usize),
+    finished: bool,
+    values_before_last_refill: usize,
+    done: bool,
+}
+
+impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> Reader<S> {
+    pub(crate) fn new(sources: S) -> Self {
+        Self {
+            sources,
+            cursor: RefillCursor::default(),
+            parser: Parser::new(),
+            deferred: Vec::new(),
+            inside: None,
+            slurp_at: (0, 0),
+            finished: false,
+            values_before_last_refill: 0,
+            done: false,
+        }
+    }
+
+    /// The next input and the `(source index, lines read)` jq's reader stood at when it yielded
+    /// it ([`CLOSED`] for the lines of one yielded after jq closed its input), or `None` once
+    /// jq's reader has nothing left.
+    pub(crate) fn next(&mut self) -> Option<(OwnedValue, (usize, usize))> {
+        self.next_yielded().map(|y| (y.value, y.location))
+    }
+
+    /// [`next`](Self::next), with whether the input is a parse error.
+    pub(crate) fn next_yielded(&mut self) -> Option<Yielded> {
+        loop {
+            if let Some(item) = self.parser.pending.pop_front() {
+                return Some(item);
+            }
+            if self.done {
+                return None;
+            }
+            self.step();
+        }
+    }
+
+    /// One refill of jq's input buffer, or what follows the last one.
+    fn step(&mut self) {
+        let Some(refill) = self.cursor.next(self.sources.as_ref()) else {
+            // Whatever is left comes from calls made after jq has closed its input.
+            self.parser.closed = true;
+            for value in std::mem::take(&mut self.deferred) {
+                self.parser.yield_value(value);
+            }
+            if !self.finished {
+                self.parser.finish();
+            }
+            self.done = true;
+            return;
+        };
+        let parser = &mut self.parser;
         if refill.is_last {
-            values_before_last_refill = parser.values.len();
+            self.values_before_last_refill = parser.yielded;
         }
         if parser.source != refill.source {
             parser.source = refill.source;
@@ -180,11 +283,11 @@ pub(crate) fn read(sources: &[(Option<usize>, Vec<u8>)]) -> StreamErrorsRead {
             parser.lines_read += 1;
         }
         // The call that follows a refill starts with `stream_check_done`.
-        let drained = !deferred.is_empty();
-        for value in std::mem::take(&mut deferred) {
+        let drained = !self.deferred.is_empty();
+        for value in std::mem::take(&mut self.deferred) {
             parser.yield_value(value);
         }
-        let ended_with_value = parser.feed(refill.bytes, &mut deferred);
+        let ended_with_value = parser.feed(refill.bytes, &mut self.deferred);
         if refill.is_last {
             // The slurp loop ends with the first call that leaves nothing in the buffer.
             let first_call_empties = if refill.bytes.is_empty() {
@@ -194,28 +297,43 @@ pub(crate) fn read(sources: &[(Option<usize>, Vec<u8>)]) -> StreamErrorsRead {
             };
             if !first_call_empties {
                 parser.finish();
-                finished = true;
+                self.finished = true;
             }
-            inside = Some(parser.values.len());
-            slurp_at = (parser.source, parser.lines_read);
+            self.inside = Some(parser.yielded);
+            self.slurp_at = (parser.source, parser.lines_read);
         }
     }
-    // Whatever is left comes from calls made after jq has closed its input.
-    parser.closed = true;
-    for value in std::mem::take(&mut deferred) {
-        parser.yield_value(value);
+
+    /// How the read ended. Meaningful once [`next`](Self::next) has returned `None`.
+    pub(crate) fn end(&self) -> ReadEnd {
+        ReadEnd {
+            inside: self.inside.unwrap_or(self.parser.yielded),
+            slurp_at: self.slurp_at,
+            open_at_end: (self.parser.yielded == self.values_before_last_refill)
+                .then_some(self.parser.lines_read),
+            first_error: self.parser.first_error,
+        }
     }
-    if !finished {
-        parser.finish();
+}
+
+/// Read `sources` (each source's bytes as read, a leading BOM already removed) the way
+/// `jq --stream-errors` does.
+pub(crate) fn read(sources: &[(Option<usize>, Vec<u8>)]) -> StreamErrorsRead {
+    let mut reader = Reader::new(sources);
+    let mut values = Vec::new();
+    let mut locations = Vec::new();
+    while let Some((value, location)) = reader.next() {
+        values.push(value);
+        locations.push(location);
     }
+    let end = reader.end();
     StreamErrorsRead {
-        inside: inside.unwrap_or(parser.values.len()),
-        slurp_at,
-        open_at_end: (parser.values.len() == values_before_last_refill)
-            .then_some(parser.lines_read),
-        first_error: parser.first_error,
-        values: parser.values,
-        locations: parser.locations,
+        inside: end.inside,
+        slurp_at: end.slurp_at,
+        open_at_end: end.open_at_end,
+        first_error: end.first_error,
+        values,
+        locations,
     }
 }
 
@@ -237,6 +355,12 @@ pub(crate) fn events_before_fault(bytes: &[u8]) -> Vec<(OwnedValue, usize)> {
         .zip(read.locations.into_iter().map(|(_, lines)| lines))
         .take(end)
         .collect()
+}
+
+/// A parse error as `--stream-errors` hands it over (`[message, path]`) and the message alone.
+struct ParseFault {
+    value: OwnedValue,
+    message: String,
 }
 
 struct Parser {
@@ -261,8 +385,11 @@ struct Parser {
     lines_read: usize,
     /// Set once jq has closed its input, for the calls made after the last refill.
     closed: bool,
-    values: Vec<OwnedValue>,
-    locations: Vec<(usize, usize)>,
+    /// What has been yielded and not yet handed to the caller, with the `(source, lines read)`
+    /// jq stood at.
+    pending: std::collections::VecDeque<Yielded>,
+    /// How many values the parser has yielded in all, handed out or not.
+    yielded: usize,
     first_error: Option<usize>,
 }
 
@@ -281,8 +408,8 @@ impl Parser {
             source: 0,
             lines_read: 0,
             closed: false,
-            values: Vec::new(),
-            locations: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            yielded: 0,
             first_error: None,
         }
     }
@@ -298,15 +425,23 @@ impl Parser {
     }
 
     fn yield_value(&mut self, value: OwnedValue) {
-        self.values.push(value);
+        self.push(value, None);
+    }
+
+    fn push(&mut self, value: OwnedValue, error: Option<String>) {
         let line = if self.closed { CLOSED } else { self.lines_read };
-        self.locations.push((self.source, line));
+        self.pending.push_back(Yielded {
+            value,
+            location: (self.source, line),
+            error,
+        });
+        self.yielded += 1;
     }
 
     /// [`Parser::yield_value`] for a parse error, remembering where the first one fell.
-    fn yield_error(&mut self, error: OwnedValue) {
-        self.first_error.get_or_insert(self.values.len());
-        self.yield_value(error);
+    fn yield_error(&mut self, fault: ParseFault) {
+        self.first_error.get_or_insert(self.yielded);
+        self.push(fault.value, Some(fault.message));
     }
 
     fn path_value(&self) -> OwnedValue {
@@ -314,8 +449,14 @@ impl Parser {
     }
 
     /// jq's `make_error` with `JV_PARSE_STREAM_ERRORS`: the message and the path as it stands.
-    fn error_value(&self, message: String) -> OwnedValue {
-        OwnedValue::array_from(vec![OwnedValue::String(message.into()), self.path_value()])
+    fn error_value(&self, message: String) -> ParseFault {
+        ParseFault {
+            value: OwnedValue::array_from(vec![
+                OwnedValue::String(message.clone().into()),
+                self.path_value(),
+            ]),
+            message,
+        }
     }
 
     /// One refill's bytes, which are one call to `jv_parser_next` or more: the values it completes
@@ -1049,5 +1190,160 @@ mod tests {
         assert_eq!(read.inside, 2);
         // An empty input has no value, and nothing to slurp.
         assert_eq!(read_one(b"").values.len(), 0);
+    }
+
+    /// The refills as the reader first found them: the whole list up front, one `Vec` entry per
+    /// line of the input. The cursor must hand out the same refills one at a time (#5498).
+    fn reference_refills(
+        sources: &[(Option<usize>, Vec<u8>)],
+    ) -> Vec<(usize, Vec<u8>, bool, bool)> {
+        let mut refills: Vec<(usize, Vec<u8>, bool, bool)> = Vec::new();
+        for (index, (_, raw)) in sources.iter().enumerate() {
+            let last_source = index + 1 == sources.len();
+            let lens: Vec<usize> = crate::jq_seq_reader::fgets_chunk_lens(raw).collect();
+            if lens.is_empty() {
+                refills.push((index, Vec::new(), false, last_source));
+                continue;
+            }
+            let mut start = 0;
+            for (k, &len) in lens.iter().enumerate() {
+                let chunk = &raw[start..start + len];
+                start += len;
+                let newline = chunk.ends_with(b"\n");
+                let hit_eof = !newline && len < JQ_FGETS_CHUNK;
+                let bytes = if newline {
+                    chunk
+                } else {
+                    &chunk[..chunk.iter().position(|&b| b == 0).unwrap_or(len)]
+                };
+                refills.push((
+                    index,
+                    bytes.to_vec(),
+                    newline,
+                    last_source && k + 1 == lens.len() && hit_eof,
+                ));
+            }
+        }
+        if let Some(last) = refills.last() {
+            if !last.3 {
+                refills.push((last.0, Vec::new(), false, true));
+            }
+        }
+        refills
+    }
+
+    /// #5498: the cursor finds the refills the up-front list held, over sources that end on a
+    /// newline, in the middle of a line, exactly on a full buffer, past one, with NULs, or empty.
+    #[test]
+    fn the_refill_cursor_hands_out_the_refills_the_list_held() {
+        let long = |n: usize, tail: &[u8]| {
+            let mut v = vec![b'a'; n];
+            v.extend_from_slice(tail);
+            v
+        };
+        let pieces: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"1".to_vec(),
+            b"1\n".to_vec(),
+            b"[1,2]\n[3]\n".to_vec(),
+            b"[1,2]\n[3]".to_vec(),
+            b"\n".to_vec(),
+            b"\n\n\n".to_vec(),
+            b"a\0b\n".to_vec(),
+            b"a\0b".to_vec(),
+            long(JQ_FGETS_CHUNK - 1, b"\n"),
+            long(JQ_FGETS_CHUNK, b""),
+            long(JQ_FGETS_CHUNK, b"\n"),
+            long(JQ_FGETS_CHUNK + 1, b""),
+            long(2 * JQ_FGETS_CHUNK, b"\nx"),
+            long(JQ_FGETS_CHUNK - 1, b"x\ny"),
+        ];
+        let mut cases: Vec<Vec<(Option<usize>, Vec<u8>)>> = vec![Vec::new()];
+        for a in &pieces {
+            cases.push(vec![(Some(0), a.clone())]);
+            for b in &pieces {
+                cases.push(vec![(Some(0), a.clone()), (Some(1), b.clone())]);
+            }
+        }
+        cases.push(vec![
+            (None, pieces[3].clone()),
+            (None, Vec::new()),
+            (None, pieces[10].clone()),
+        ]);
+        for sources in cases {
+            let want = reference_refills(&sources);
+            let mut cursor = RefillCursor::default();
+            let mut got = Vec::new();
+            while let Some(r) = cursor.next(&sources) {
+                got.push((r.source, r.bytes.to_vec(), r.newline, r.is_last));
+            }
+            assert_eq!(
+                got,
+                want,
+                "{:?}",
+                sources.iter().map(|s| s.1.len()).collect::<Vec<_>>()
+            );
+            assert!(
+                cursor.next(&sources).is_none(),
+                "the cursor stays at the end"
+            );
+        }
+    }
+
+    /// #5498: handing the inputs out one at a time ends in the state the batch read reported.
+    #[test]
+    fn a_reader_pulled_one_input_at_a_time_ends_as_the_batch_read_does() {
+        let sources = vec![
+            (Some(0), b"[1,2]\n{\"a\" 2}\n[3".to_vec()),
+            (Some(1), b"]\n4 5\n".to_vec()),
+        ];
+        let batch = read(&sources);
+        let mut reader = Reader::new(&sources);
+        let mut pulled = Vec::new();
+        while let Some(item) = reader.next() {
+            pulled.push(item);
+        }
+        let end = reader.end();
+        assert_eq!(pulled.len(), batch.values.len());
+        for (i, (value, location)) in pulled.iter().enumerate() {
+            assert_eq!(value.to_json(), batch.values[i].to_json());
+            assert_eq!(*location, batch.locations[i]);
+        }
+        assert_eq!(end.inside, batch.inside);
+        assert_eq!(end.slurp_at, batch.slurp_at);
+        assert_eq!(end.open_at_end, batch.open_at_end);
+        assert_eq!(end.first_error, batch.first_error);
+        assert!(reader.next().is_none(), "a finished reader stays finished");
+    }
+
+    /// #5498: a reader that has handed out one input has fed the parser the refills that
+    /// completed it and no more, and holds none of the values after it.
+    #[test]
+    fn a_reader_feeds_the_parser_only_as_far_as_the_input_asked_for() {
+        let lines: String = (0..5000).map(|i| format!("[{i}]\n")).collect();
+        let sources = vec![(Some(0), lines.into_bytes())];
+        let total = sources[0].1.len();
+        let mut reader = Reader::new(&sources);
+        let (first, _) = reader.next().expect("a first input");
+        assert_eq!(first.to_json(), "[[0],0]");
+        assert!(
+            reader.cursor.pos < 64,
+            "{} of {total} bytes fed",
+            reader.cursor.pos
+        );
+        // `[0]` completed two events (the leaf and the close); the second waits in the queue.
+        assert_eq!(reader.parser.pending.len(), 1);
+        assert_eq!(reader.next().expect("the close").0.to_json(), "[[0]]");
+        assert!(reader.cursor.pos < 64);
+        // Reading on to the end hands out every event and then nothing.
+        let mut count = 2;
+        while reader.next().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 10_000);
+        assert!(
+            reader.cursor.source == sources.len() && reader.cursor.closed,
+            "the cursor has moved past the last source"
+        );
     }
 }
