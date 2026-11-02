@@ -8145,6 +8145,22 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         YamlCursor::style(self)
     }
 
+    fn alias_target_style(&self) -> &'static str {
+        if !self.is_alias() {
+            return "";
+        }
+        let Some(target) = self.resolve_alias_target_cursor() else {
+            return "";
+        };
+        let style = YamlCursor::style(&target);
+        // `&a !!str 12` is a string whatever its spelling says: the string style keeps it quoted
+        // once the key is written as its text.
+        if style.is_empty() && target.explicit_tag() == Some("!!str") {
+            return crate::jq::eval_generic::KEY_STYLE_STRING;
+        }
+        style
+    }
+
     #[inline]
     fn canonicalize_numbers(&self) -> bool {
         self.index.canonicalize_numbers()

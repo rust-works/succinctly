@@ -3897,10 +3897,17 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             } else {
                 DocumentCursor::alias(&field.key_cursor).map(str::to_string)
             };
+            // #5813: an alias key has no quoting of its own; the anchor's node holds it, and
+            // `*a : 1` printed as its text (`"true": 1`) must still read back as a string.
+            let key_style = if key_alias.is_some() {
+                field.key_cursor.alias_target_style()
+            } else {
+                field.key_cursor.style()
+            };
             if let Some(meta) = KeyMeta::with_alias(
                 key_comment,
                 value_absent,
-                field.key_cursor.style(),
+                key_style,
                 key_anchor,
                 key_tag,
                 key_alias,
