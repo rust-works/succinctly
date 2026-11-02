@@ -17,7 +17,7 @@ permissions:
 jobs:
   audit:
     name: Security Audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -42,7 +42,7 @@ jobs:
 
   deny:
     name: Dependency Policy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -66,7 +66,7 @@ jobs:
 
   secrets:
     name: Secret Scanning
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:

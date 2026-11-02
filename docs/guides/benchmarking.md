@@ -153,7 +153,7 @@ Run targeted benchmarks when:
 ### CI/CD: Automated
 
 GitHub Actions runs `rank_select` benchmarks on every PR/push for smoke testing:
-- x86_64 (ubuntu-latest)
+- x86_64 (ubuntu-24.04)
 - ARM64-Linux (ubuntu-24.04-arm)
 - ARM64-macOS (macos-latest)
 
@@ -710,7 +710,7 @@ the measurement that justified [select-scan.md](../optimizations/select-scan.md)
 ### CI/CD Platforms
 
 GitHub Actions runs benchmarks on:
-- **ubuntu-latest** (x86_64)
+- **ubuntu-24.04** (x86_64)
 - **ubuntu-24.04-arm** (ARM64)
 - **macos-latest** (Apple Silicon M-series)
 
@@ -758,7 +758,7 @@ nobody compares against a baseline and used about 40% of CI's macOS-minutes. The
 regression signal is `perf-guard` in `ci.yml`.
 
 **Test Matrix**:
-- x86_64 (ubuntu-latest)
+- x86_64 (ubuntu-24.04)
 - ARM64-Linux (ubuntu-24.04-arm)
 - ARM64-macOS (macos-latest)
 

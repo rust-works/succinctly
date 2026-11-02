@@ -50,7 +50,7 @@ jobs:
   # mutually independent, so they are matrix legs rather than chained steps.
   upstream:
     name: Test (x86_64) (${{ matrix.rust }}, ${{ matrix.variant.name }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false                                   # beta breakage must not cancel nightly
       matrix:
@@ -106,7 +106,7 @@ jobs:
       matrix:
         platform:
           - name: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             arch: x86_64
           - name: ARM64-Linux
             runner: ubuntu-24.04-arm

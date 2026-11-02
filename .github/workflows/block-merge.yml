@@ -19,7 +19,7 @@ jobs:
   do-not-merge:
     # "Do Not Merge" is the check-context name marked required in the main ruleset.
     name: Do Not Merge
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       # The `if` guards the STEP, not the job: the job always runs and reports a
       # status (green when the label is absent), so a PR can never sit forever

@@ -281,7 +281,7 @@ What each CI runner exercises for real:
 
 | Runner                        | CPU           | Backends asserted in CI                |
 |-------------------------------|---------------|----------------------------------------|
-| `ubuntu-latest` (Test x86_64) | AMD EPYC 7763 | POPCNT, SSE4.1/4.2, **BMI2**, **AVX2** |
+| `ubuntu-24.04` (Test x86_64)  | AMD EPYC 7763 | POPCNT, SSE4.1/4.2, **BMI2**, **AVX2** |
 | `ubuntu-24.04-arm` (Test ARM) | Neoverse-N2   | NEON, **SVE2**, **SVE2-BITPERM**       |
 | `macos-latest` (Test macOS)   | Apple Silicon | NEON                                   |
 
@@ -328,7 +328,7 @@ Because the AVX-512 gate is a runtime CPU check, not a `#[cfg]`, the ~30
 executable lines behind the VPOPCNTDQ dispatch in `src/bits/popcount.rs` are
 still *compiled* under `--features cli,simd,regex,serde` and counted in the
 coverage denominator — but only *executed* on a runner whose CPU has
-`avx512vpopcntdq`. The coverage job is also `ubuntu-latest` with no guaranteed
+`avx512vpopcntdq`. The coverage job is also `ubuntu-24.04` with no guaranteed
 VPOPCNTDQ (`SUCCINCTLY_EXPECT_SIMD` intentionally omits it — see the note in
 [docs/reference/environment-variables.md](docs/reference/environment-variables.md#succinctly_expect_simd)),
 so **`src/bits/popcount.rs` reports a non-deterministic x86 coverage number**:
