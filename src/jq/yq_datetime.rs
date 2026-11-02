@@ -77,10 +77,11 @@ fn layout() -> Cow<'static, str> {
 /// `with_dtf(layout; f)`: `f` evaluated with `layout` as the datetime layout, and the previous
 /// one restored afterwards, however `f` ends. `f` must finish its work inside: nothing it returns
 /// may evaluate later. The RFC 3339 layout spelled out is the default one, which is the only
-/// layout yq also reads `2006-01-02` under.
+/// layout yq also reads `2006-01-02` under, and so is an empty one (yq's `GetDateTimeLayout`
+/// answers RFC 3339 for it, as for a container's empty text).
 #[cfg(feature = "std")]
 pub(crate) fn with_layout<T>(layout: String, f: impl FnOnce() -> T) -> T {
-    let custom = (layout != RFC3339).then_some(layout);
+    let custom = (!layout.is_empty() && layout != RFC3339).then_some(layout);
     let _scope = context::enter(custom);
     f()
 }
@@ -99,21 +100,43 @@ pub(crate) fn is_timestamp(text: &str) -> bool {
     go_time::yq_datetime(text).is_some() || custom_datetime(text).is_some()
 }
 
+/// Whether `text` can begin a Go duration: after an optional sign, a digit or a `.`, which is
+/// where `time.ParseDuration` starts reading a number.
+fn starts_like_a_duration(text: &str) -> bool {
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    unsigned
+        .as_bytes()
+        .first()
+        .is_some_and(|&b| b.is_ascii_digit() || b == b'.')
+}
+
 /// yq's `+` (or `-`, when `subtract`) of a duration to `left`, or `None` when `left` is not a
 /// timestamp and the operator is not a date operation. `right` is the right operand's text.
 ///
-/// The duration is read first, then the time: `.t + "bogus"` is the duration's error whatever
+/// The duration is read first, then the time: `.t + "bogus1h"` is the duration's error whatever
 /// `.t` holds. `-` negates the text before reading it, so its error names `"-bogus"`; the
 /// bracketed text is the operand as written.
+///
+/// The text stands in for yq's `!!timestamp` tag, which a quoted or JSON string does not have:
+/// there `"2026-01-01" + "T00:00:00Z"` concatenates. So `+` of text that cannot begin a duration
+/// (`T00:00:00Z`, `bogus`, an empty string) to a string that is a timestamp only by its shape
+/// concatenates too, as for a string; text that starts like one (`3hrs`, `1`) is read and
+/// refused. A string that reads under a custom layout is a timestamp to yq whatever its tag, so
+/// that rule has no exception.
 pub(crate) fn add_duration(
     left: &str,
     right: &str,
     subtract: bool,
 ) -> Option<Result<String, String>> {
-    let layout = if go_time::yq_datetime(left).is_some() {
-        layout()
-    } else {
-        Cow::Owned(custom_datetime(left)?)
+    let layout = match custom_datetime(left) {
+        Some(custom) => Cow::Owned(custom),
+        None if go_time::yq_datetime(left).is_some() => {
+            if !subtract && !starts_like_a_duration(right) {
+                return None;
+            }
+            layout()
+        }
+        None => return None,
     };
     let duration_text: Cow<'_, str> = match (subtract, right.strip_prefix('-')) {
         (false, _) => Cow::Borrowed(right),

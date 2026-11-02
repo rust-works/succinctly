@@ -6373,6 +6373,35 @@ impl<'a> Parser<'a> {
         Ok(Some(arg))
     }
 
+    /// [`Self::parse_required_single_arg`]'s two-argument sibling, `(a; b)`, for `skip` and
+    /// `with_dtf`. No `(` at all is a wrong-arity call before any argument exists (#2807), and
+    /// each argument is a full expression, comma generators included (#2863).
+    fn parse_required_two_args(
+        &mut self,
+        start_pos: usize,
+    ) -> Result<Option<(Expr, Expr)>, ParseError> {
+        self.skip_ws();
+        if let Err(early) = self.expect_or_none('(', start_pos) {
+            return early;
+        }
+        self.next();
+        self.skip_ws();
+        let first = self.parse_expr()?;
+        self.skip_ws();
+        if self.peek() != Some(';') {
+            return self.builtin_wrong_arity_or_expect(start_pos, ';', vec![first]);
+        }
+        self.next();
+        self.skip_ws();
+        let second = self.parse_expr()?;
+        self.skip_ws();
+        if self.peek() != Some(')') {
+            return self.builtin_wrong_arity_or_expect(start_pos, ')', vec![first, second]);
+        }
+        self.next();
+        Ok(Some((first, second)))
+    }
+
     /// #2036 Direction 3: entry point for every *fixed*-arity special form
     /// (`limit`, `until`, `while`, `repeat`, `range`, `first`, `last`,
     /// `error`). `parse_original` is the keyword's own dedicated parser
@@ -8596,33 +8625,15 @@ impl<'a> Parser<'a> {
             self.reject_unless_jq_extensions("skip")?;
             let keyword_start = self.pos;
             self.consume_keyword("skip");
-            self.skip_ws();
             // #2807: no `(` at all is a wrong-arity call before any
             // argument exists -- rewind and let the generic fallback
             // resolve it (`skip` alone is `skip/0 is not defined` in jq
             // 1.7.1, not a syntax error). The reparse is arity-0, so the
             // #2686 exponent this function's other checkpoints avoid does
             // not arise here.
-            if let Err(early) = self.expect_or_none('(', keyword_start) {
-                return early;
-            }
-            self.next();
-            self.skip_ws();
-            // #2863: consume the full argument, including comma generators.
-            let n = self.parse_expr()?;
-            self.skip_ws();
-            if self.peek() != Some(';') {
-                return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![n]);
-            }
-            self.next();
-            self.skip_ws();
-            let expr = self.parse_expr()?;
-            self.skip_ws();
-            if self.peek() != Some(')') {
-                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![n, expr]);
-            }
-            self.next();
-            return Ok(Some(Builtin::Skip(Box::new(n), Box::new(expr))));
+            return Ok(self
+                .parse_required_two_args(keyword_start)?
+                .map(|(n, expr)| Builtin::Skip(Box::new(n), Box::new(expr))));
         }
 
         // nth(n; expr) or nth(n) - output only the nth value (0-indexed)
@@ -8794,26 +8805,9 @@ impl<'a> Parser<'a> {
         if self.matches_keyword("with_dtf") {
             let keyword_start = self.pos;
             self.consume_keyword("with_dtf");
-            self.skip_ws();
-            if let Err(early) = self.expect_or_none('(', keyword_start) {
-                return early;
-            }
-            self.next();
-            self.skip_ws();
-            let layout = self.parse_expr()?;
-            self.skip_ws();
-            if self.peek() != Some(';') {
-                return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![layout]);
-            }
-            self.next();
-            self.skip_ws();
-            let body = self.parse_expr()?;
-            self.skip_ws();
-            if self.peek() != Some(')') {
-                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![layout, body]);
-            }
-            self.next();
-            return Ok(Some(Builtin::WithDtf(Box::new(layout), Box::new(body))));
+            return Ok(self
+                .parse_required_two_args(keyword_start)?
+                .map(|(layout, body)| Builtin::WithDtf(Box::new(layout), Box::new(body))));
         }
 
         // Phase 17: Combinations

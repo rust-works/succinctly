@@ -30,13 +30,12 @@ const ROWS: &[(&str, &str, &str, &str, i32)] = &[
     ("UTC", ".t + \"1.5h\"", "\"2026-01-01T01:30:00Z\"\n", "", 0),
     ("UTC", ".t + \"1h\" + \"1h\"", "\"2026-01-01T02:00:00Z\"\n", "", 0),
     ("UTC", ".t |= . + \"1h\" | .t", "\"2026-01-01T01:00:00Z\"\n", "", 0),
-    ("UTC", ".t + \"bogus\"", "", "Error: unable to parse duration [bogus]: time: invalid duration \"bogus\"", 1),
     ("UTC", ".t - \"bogus\"", "", "Error: unable to parse duration [bogus]: time: invalid duration \"-bogus\"", 1),
     ("UTC", ".t + 1", "", "Error: unable to parse duration [1]: time: missing unit in duration \"1\"", 1),
     ("UTC", ".t - 1", "", "Error: unable to parse duration [1]: time: missing unit in duration \"-1\"", 1),
-    ("UTC", ".t + null", "", "Error: unable to parse duration [null]: time: invalid duration \"null\"", 1),
-    ("UTC", ".t + true", "", "Error: unable to parse duration [true]: time: invalid duration \"true\"", 1),
-    ("UTC", ".t + \"\"", "", "Error: unable to parse duration []: time: invalid duration \"\"", 1),
+    ("UTC", "\"2026-01-01\" + \"T00:00:00Z\"", "\"2026-01-01T00:00:00Z\"\n", "", 0),
+    ("UTC", ".t + \"3hrs\"", "", "Error: unable to parse duration [3hrs]: time: unknown unit \"hrs\" in duration \"3hrs\"", 1),
+    ("UTC", "with_dtf(\"\"; .t + \"1h\")", "\"2026-01-01T01:00:00Z\"\n", "", 0),
     ("UTC", ".t + \"9999999h\"", "", "Error: unable to parse duration [9999999h]: time: invalid duration \"9999999h\"", 1),
     ("UTC", ".t - .t", "", "Error: unable to parse duration [2026-01-01T00:00:00Z]: time: unknown unit \"-\" in duration \"-2026-01-01T00:00:00Z\"", 1),
     ("UTC", ".e + \"x\"", "\".ax\"\n", "", 0),
@@ -104,9 +103,18 @@ const ROWS: &[(&str, &str, &str, &str, i32)] = &[
 ];
 
 /// (TZ, filter, stdout, stderr, exit code) where succinctly differs from yq, with yq's answer in
-/// the comment: the node's path in an error message (a value here carries none), and a quoted
-/// string spelled like a timestamp, which is one here (`OwnedValue` has no timestamp tag).
+/// the comment: the node's path in an error message (a value here carries none), a quoted string
+/// spelled like a timestamp, which is one here, and a plain one, which concatenates text that
+/// cannot begin a duration as a quoted one does (`OwnedValue` has no timestamp tag).
 const DIVERGENT: &[(&str, &str, &str, &str, i32)] = &[
+    // yq: Error: unable to parse duration [bogus]: time: invalid duration "bogus" (text that cannot begin a duration concatenates, as for a quoted date)
+    ("UTC", ".t + \"bogus\"", "\"2026-01-01T00:00:00Zbogus\"\n", "", 0),
+    // yq: Error: unable to parse duration [null]: time: invalid duration "null" (text that cannot begin a duration concatenates, as for a quoted date)
+    ("UTC", ".t + null", "\"2026-01-01T00:00:00Z\"\n", "", 0),
+    // yq: Error: unable to parse duration [true]: time: invalid duration "true" (text that cannot begin a duration concatenates, as for a quoted date)
+    ("UTC", ".t + true", "\"2026-01-01T00:00:00Ztrue\"\n", "", 0),
+    // yq: Error: unable to parse duration []: time: invalid duration "" (text that cannot begin a duration concatenates, as for a quoted date)
+    ("UTC", ".t + \"\"", "\"2026-01-01T00:00:00Z\"\n", "", 0),
     // yq: "!!timestamp" (the tag; `now` is text here, and a string's tag is `!!str`)
     ("UTC", "now | type", "\"!!str\"\n", "", 0),
     // yq: "2026-01-01T00:00:00Z3h" (a quoted string is `!!str` in yq, and concatenates)

@@ -46,8 +46,10 @@ pub(crate) trait Location {
 }
 
 /// A local zone that is UTC, which is what Go's `time.Local` is with no zone configured.
+#[cfg(test)]
 pub(crate) struct UtcLocation;
 
+#[cfg(test)]
 impl Location for UtcLocation {
     fn lookup(&self, _unix: i64) -> (String, i64) {
         (String::from("UTC"), 0)
@@ -126,8 +128,7 @@ pub(crate) fn yq_datetime(text: &str) -> Option<Instant> {
     parse_fields(RFC3339.as_bytes(), text)
         .or_else(|_| parse_fields(DATE.as_bytes(), text))
         .ok()
-        // Neither layout names a zone, so the instant does not depend on the local zone.
-        .map(|fields| fields.resolve(&UtcLocation).nanos)
+        .map(|fields| fields.instant_without_names())
 }
 
 /// The error yq reports for a `text` neither default layout parses (the date layout's, the last
@@ -678,6 +679,15 @@ struct Fields<'a> {
 }
 
 impl Fields<'_> {
+    /// The instant, for a layout that reads no zone abbreviation, whose instant does not depend
+    /// on the local zone. Asks no [`Location`], so it allocates nothing.
+    fn instant_without_names(&self) -> Instant {
+        match self.zone_offset {
+            Some(offset) if !self.utc => self.wall - i128::from(offset) * NANOS_PER_SECOND,
+            _ => self.wall,
+        }
+    }
+
     /// The end of Go's `parse`: which `Location` the time gets.
     fn resolve(&self, local: &dyn Location) -> GoTime {
         if self.utc {
@@ -1148,9 +1158,13 @@ fn parse_numeric_zone(
             (value[0], &value[1..3], &value[3..5], b"00", &value[5..])
         }
     };
-    let hr = getnum(hours, true)?.0;
-    let mm = getnum(minutes, true)?.0;
-    let ss = getnum(seconds, true)?.0;
+    // Go reads the fields in turn, stops at the first that is not two digits (leaving it and the
+    // rest 0), and checks the ranges before reporting that: `+25:x0` is an hour out of range.
+    let hr = getnum(hours, true).map(|n| n.0);
+    let mm = hr.and_then(|_| getnum(minutes, true)).map(|n| n.0);
+    let ss = mm.and_then(|_| getnum(seconds, true)).map(|n| n.0);
+    let parsed = ss.is_some();
+    let (hr, mm, ss) = (hr.unwrap_or(0), mm.unwrap_or(0), ss.unwrap_or(0));
     // `>` rather than `>=`: some people write offsets of 24 hours or 60 minutes or seconds.
     // Go assigns the three in turn, so the last one out of range is the one reported.
     let range_error = if ss > 60 {
@@ -1164,6 +1178,7 @@ fn parse_numeric_zone(
     };
     let offset = (hr * 60 + mm) * 60 + ss;
     let offset = match sign {
+        _ if !parsed => None,
         b'+' => Some(offset),
         b'-' => Some(-offset),
         _ => None,
@@ -1702,6 +1717,15 @@ mod tests {
         assert_eq!(
             e("15:04", "25:00"),
             r#"parsing time "25:00": hour out of range"#
+        );
+        // The range is checked before a later field's parse failure is reported.
+        assert_eq!(
+            e("15:04 -07:00", "10:00 +25:x0"),
+            r#"parsing time "10:00 +25:x0": time zone offset hour out of range"#
+        );
+        assert_eq!(
+            e("15:04 -07:00", "10:00 +05:x0"),
+            r#"parsing time "10:00 +05:x0" as "15:04 -07:00": cannot parse "+05:x0" as "-07:00""#
         );
         assert_eq!(
             e("2006 002", "2001 366"),
