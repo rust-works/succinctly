@@ -157,6 +157,11 @@ impl SeqHint {
 /// chain its end sits in; a smaller one walks it, as that is cheaper than the memo.
 const CLOSER_CHAIN_MIN_SPAN: usize = 128;
 
+/// A chain of fewer closers than this is walked again rather than kept: a wide document of
+/// large records ends each record in one or two closers, and keeping those would allocate for
+/// every one.
+const CLOSER_CHAIN_MIN_CLOSERS: usize = 32;
+
 /// The run of closing brackets that ends a deep container, as [`JsonCursor::container_end_bp`]
 /// walked it (#5869).
 ///
@@ -919,23 +924,32 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     {
         let bp = self.index.bp();
         let close = bp.find_close(self.bp_pos)?;
-        // #5869: a deep container's end is read from the chain walked for a container nested
-        // in it, or walked here for the ones nested in this.
-        let memoize = close - self.bp_pos >= CLOSER_CHAIN_MIN_SPAN;
-        let mut memo = if memoize {
+        // #5869: the end of a deep container is read from the chain of closers walked for one
+        // nested in it, or for the one nested in this, instead of walked from the leaf again.
+        let text_key = (self.text.as_ptr() as usize, self.text.len());
+        let mut slot = if close - self.bp_pos >= CLOSER_CHAIN_MIN_SPAN {
             self.index.closer_chain.0.try_borrow_mut().ok()
         } else {
             None
         };
-        if let Some(chain) = memo.as_deref_mut().and_then(Option::as_mut) {
-            if chain.text == (self.text.as_ptr() as usize, self.text.len())
+        if let Some(chain) = slot.as_deref_mut().and_then(Option::as_mut) {
+            // Every parenthesis from the chain's base on, as far as it has been walked, is a
+            // close; so is each up to this container's if no open lies between them, and then
+            // the container's last node is the chain's leaf.
+            let walked_to = chain.base + chain.ends.len();
+            if chain.text == text_key
                 && close >= chain.base
-                && close - chain.base < chain.ends.len()
+                && (close < walked_to || !has_open_in(bp.words(), walked_to, close + 1))
             {
                 if chain.leaf_open < self.bp_pos {
                     return None;
                 }
-                return Some(chain.ends[close - chain.base]);
+                let k = close - chain.base;
+                while chain.ends.len() <= k {
+                    let end = closer_end(self.text, *chain.ends.last()?)?;
+                    chain.ends.push(end);
+                }
+                return Some(chain.ends[k]);
             }
         }
         let leaf_open = last_open_before(bp.words(), close)?;
@@ -944,7 +958,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
         }
         let leaf = JsonCursor::from_bp_position(self.index, self.text, leaf_open);
         let start = leaf.text_position()?;
-        let (mut i, closers, base) = match *self.text.get(start)? {
+        let (first, closers, base) = match *self.text.get(start)? {
             // An empty container: its closer is part of the leaf, so it is one of the closers.
             b'{' | b'[' => (start + 1, close - leaf_open, leaf_open),
             _ => (
@@ -953,44 +967,30 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
                 leaf_open + 1,
             ),
         };
-        let next_closer_end = |mut i: usize| -> Option<usize> {
-            #[cfg(test)]
-            CLOSER_STEPS.with(|steps| steps.set(steps.get() + 1));
-            while !matches!(self.text.get(i)?, b']' | b'}') {
-                i += 1;
-            }
-            Some(i + 1)
-        };
-        let Some(mut memo) = memo else {
+        let Some(mut slot) = slot.filter(|_| closers >= CLOSER_CHAIN_MIN_CLOSERS) else {
+            let mut i = first;
             for _ in 0..closers {
-                i = next_closer_end(i)?;
+                i = closer_end(self.text, i)?;
             }
             return Some(i);
         };
-        // Extend the chain this leaf already has, or start a new one.
-        let text = (self.text.as_ptr() as usize, self.text.len());
-        let mut chain = match memo.take() {
-            Some(chain) if chain.text == text && chain.leaf_open == leaf_open => chain,
-            _ => CloserChain {
-                text,
-                base,
-                leaf_open,
-                ends: alloc::vec![i],
-            },
-        };
-        let mut result = None;
-        while chain.ends.len() <= closers {
-            let at = *chain.ends.last().unwrap_or(&i);
-            let Some(end) = next_closer_end(at) else {
+        // A chain long enough to be asked about again: keep every position on the way.
+        let mut ends = Vec::with_capacity(closers + 1);
+        ends.push(first);
+        while ends.len() <= closers {
+            let Some(end) = closer_end(self.text, ends[ends.len() - 1]) else {
                 break;
             };
-            chain.ends.push(end);
+            ends.push(end);
         }
-        if let Some(end) = chain.ends.get(closers) {
-            result = Some(*end);
-        }
-        *memo = Some(chain);
-        result
+        let end = ends.get(closers).copied();
+        *slot = Some(CloserChain {
+            text: text_key,
+            base,
+            leaf_open,
+            ends,
+        });
+        end
     }
 
     /// Where the child at `text_pos` (this cursor's own `text_position()`) ends, for the
@@ -3655,6 +3655,39 @@ pub fn following_gap_ok(text: &[u8], key_end: usize) -> bool {
             b'"' | b'[' | b'{' | b'-' | b'+' | b'.' | b'}' | b']'
         );
     found == Some(b':') && value_start_ok
+}
+
+/// One past the first closing bracket (`]` or `}`) at or after `i` in `text`: where the next
+/// closer of a chain ends, whatever lies between it and `i` (#5654, #5869).
+fn closer_end(text: &[u8], mut i: usize) -> Option<usize> {
+    #[cfg(test)]
+    CLOSER_STEPS.with(|steps| steps.set(steps.get() + 1));
+    while !matches!(text.get(i)?, b']' | b'}') {
+        i += 1;
+    }
+    Some(i + 1)
+}
+
+/// Whether any bit of `words` in the range `[lo, hi)` is set (an open parenthesis lies there).
+fn has_open_in(words: &[u64], lo: usize, hi: usize) -> bool {
+    let mut pos = lo;
+    while pos < hi {
+        let (word, bit) = (pos / 64, pos % 64);
+        let Some(&w) = words.get(word) else {
+            return false;
+        };
+        let take = (hi - pos).min(64 - bit);
+        let mask = if take == 64 {
+            u64::MAX
+        } else {
+            ((1u64 << take) - 1) << bit
+        };
+        if w & mask != 0 {
+            return true;
+        }
+        pos += take;
+    }
+    false
 }
 
 /// The position of the last 1 bit (open parenthesis) strictly before `end` in `words`, whose bit
@@ -11484,13 +11517,12 @@ mod tests {
         );
     }
 
-    /// The containers of `text` from its root down the first child of each, outermost first.
-    fn nest_cursors<'a>(
-        index: &'a JsonIndex,
-        text: &'a [u8],
+    /// The containers from `start` down the first child of each, outermost first.
+    fn nest_cursors_from<'a>(
+        start: JsonCursor<'a, alloc::vec::Vec<u64>>,
     ) -> alloc::vec::Vec<JsonCursor<'a, alloc::vec::Vec<u64>>> {
         let mut out = alloc::vec::Vec::new();
-        let mut cursor = Some(index.root(text));
+        let mut cursor = Some(start);
         while let Some(c) = cursor {
             if !c.is_container() {
                 break;
@@ -11501,9 +11533,34 @@ mod tests {
         out
     }
 
+    /// The containers of `text` from its root down the first child of each, outermost first.
+    fn nest_cursors<'a>(
+        index: &'a JsonIndex,
+        text: &'a [u8],
+    ) -> alloc::vec::Vec<JsonCursor<'a, alloc::vec::Vec<u64>>> {
+        nest_cursors_from(index.root(text))
+    }
+
+    /// Every level of the first nest of `bytes`, then of the second when the text holds two side
+    /// by side (`[<nest>,<nest>]`).
+    fn all_levels<'a>(
+        index: &'a JsonIndex,
+        bytes: &'a [u8],
+    ) -> alloc::vec::Vec<JsonCursor<'a, alloc::vec::Vec<u64>>> {
+        let mut levels = nest_cursors(index, bytes);
+        // A root with a second member that is a container: the second nest.
+        if let Some(second) = levels.first().and_then(JsonCursor::first_child) {
+            if let Some(second) = second.next_sibling().filter(JsonCursor::is_container) {
+                levels.extend(nest_cursors_from(second));
+            }
+        }
+        levels
+    }
+
     /// #5869: a container's end, read from the closer chain it shares with the containers
     /// nested in it, is the end the text scan finds. Whitespace between the closers, a second
-    /// deep nest beside the first, and either order of asking all go through the memo.
+    /// deep nest beside the first (whose own levels are asked too, after the first's chain was
+    /// replaced), and every order of asking go through the memo.
     #[test]
     fn container_end_bp_agrees_with_the_text_scan_along_a_deep_chain_5869() {
         let nest = |depth: usize| format!("{}1{}", "[ ".repeat(depth), " ] ".repeat(depth));
@@ -11517,25 +11574,49 @@ mod tests {
         for text in &texts {
             let bytes = text.as_bytes();
             let index = JsonIndex::build(bytes);
-            let cursors = nest_cursors(&index, bytes);
-            assert!(cursors.len() > 2 * CLOSER_CHAIN_MIN_SPAN, "{text:.20}");
-            let expected: alloc::vec::Vec<_> = cursors
+            let levels = all_levels(&index, bytes);
+            assert!(levels.len() > 2 * CLOSER_CHAIN_MIN_SPAN, "{text:.20}");
+            if text.starts_with("[[ ") {
+                // The root, the 300 levels of the first nest and the 260 of the second.
+                assert_eq!(levels.len(), 1 + 300 + 260);
+            }
+            let expected: alloc::vec::Vec<_> = levels
                 .iter()
                 .map(|c| container_end(bytes, c.text_position().unwrap()))
                 .collect();
-            let top_down: alloc::vec::Vec<_> =
-                cursors.iter().map(JsonCursor::container_end_bp).collect();
-            assert_eq!(top_down, expected, "top down: {text:.20}");
-            // A fresh index, so the memo starts empty and fills from the innermost level.
-            let index = JsonIndex::build(bytes);
-            let cursors = nest_cursors(&index, bytes);
-            let mut bottom_up: alloc::vec::Vec<_> = cursors
-                .iter()
-                .rev()
-                .map(JsonCursor::container_end_bp)
-                .collect();
-            bottom_up.reverse();
-            assert_eq!(bottom_up, expected, "bottom up: {text:.20}");
+            let n = levels.len();
+            // Outermost first, innermost first, and a stride through the levels (7919 is prime,
+            // so it reaches each once): each order starts from an empty memo.
+            let orders: [alloc::vec::Vec<usize>; 3] = [
+                (0..n).collect(),
+                (0..n).rev().collect(),
+                (0..n).map(|k| k * 7919 % n).collect(),
+            ];
+            for order in &orders {
+                let index = JsonIndex::build(bytes);
+                let levels = all_levels(&index, bytes);
+                let mut got = alloc::vec![None; n];
+                for &k in order {
+                    got[k] = levels[k].container_end_bp();
+                }
+                assert_eq!(got, expected, "{:?}...: {text:.20}", &order[..3]);
+            }
+        }
+    }
+
+    /// `has_open_in` over the edges of a word: the range's ends, a range inside one word, one
+    /// spanning several, and one past the words.
+    #[test]
+    fn has_open_in_reads_exactly_the_range_5869() {
+        let mut words = [0u64; 4];
+        for bit in [0usize, 63, 64, 130] {
+            words[bit / 64] |= 1 << (bit % 64);
+        }
+        for lo in 0..260 {
+            for hi in lo..260 {
+                let expected = [0usize, 63, 64, 130].iter().any(|b| (lo..hi).contains(b));
+                assert_eq!(has_open_in(&words, lo, hi), expected, "[{lo}, {hi})");
+            }
         }
     }
 
