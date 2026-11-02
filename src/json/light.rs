@@ -164,6 +164,8 @@ impl SeqHint {
 /// and the closer of `c + 1` the first one after it. A walk down a spine asks `c`, `c - 1`,
 /// `c - 2`, ... in turn, which costs one gap each from the previous answer instead of a scan of
 /// every closer from the leaf: that scan made `..` over a linear nest quadratic in its depth.
+/// A walk from the innermost container outwards extends the run the same way. Only the newest
+/// run is consulted, so two deep spines asked alternately still rescan.
 ///
 /// Advisory: a lookup it cannot answer falls back to the scan, which then records the run.
 #[derive(Clone, Copy, Debug)]
@@ -457,9 +459,11 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
                 return None;
             }
             if close > run.hi {
-                let words = self.bp.words();
-                let all_closes = (run.hi + 1..=close)
-                    .all(|p| words.get(p / 64).is_some_and(|w| (w >> (p % 64)) & 1 == 0));
+                // Every bit in `hi + 1..=close` is a close iff no open parenthesis lies there.
+                let all_closes = match last_open_before(self.bp.words(), close + 1) {
+                    Some(open) => open <= run.hi,
+                    None => true,
+                };
                 if !all_closes {
                     runs.pop();
                     continue;
@@ -6465,24 +6469,23 @@ mod tests {
         }
     }
 
-    /// #5869: the memo holds a bounded number of runs, and a lookup past all of them still
-    /// answers by the scan.
+    /// #5869: the memo holds a bounded number of runs, keeping the newest.
     #[test]
-    fn test_container_end_bp_memo_is_bounded_5869() {
-        let one = |i: usize| format!("{}{i}{}", "[".repeat(3), "]".repeat(3));
-        let doc = format!(
-            "[{}]",
-            (0..(CLOSE_RUN_CAPACITY * 3))
-                .map(one)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let text = doc.as_bytes();
-        let index = JsonIndex::build(text);
-        for c in container_cursors(&index, text) {
-            let _ = c.container_end_bp();
-            assert!(index.close_runs.borrow().len() <= CLOSE_RUN_CAPACITY);
+    fn test_close_runs_are_bounded_and_keep_the_newest_5869() {
+        let index = JsonIndex::build(b"[]");
+        for leaf in 0..CLOSE_RUN_CAPACITY * 3 {
+            index.record_close_run(CloseRun {
+                leaf,
+                first: leaf + 1,
+                hi: leaf + 1,
+                at: leaf + 1,
+                end: 0,
+            });
+            let runs = index.close_runs.borrow();
+            assert!(runs.len() <= CLOSE_RUN_CAPACITY);
+            assert_eq!(runs.last().map(|r| r.leaf), Some(leaf));
         }
+        assert_eq!(index.close_runs.borrow().len(), CLOSE_RUN_CAPACITY);
     }
 
     /// #5654: `last_open_before` finds the last 1 bit below `end`, across word boundaries, at a
