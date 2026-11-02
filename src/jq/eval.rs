@@ -96172,18 +96172,17 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     let mut hour: i64 = 0;
     let mut minute: i64 = 0;
     let mut second: i64 = 0;
-    // weekday and yearday are parsed from format specifiers like %w, %j, %u,
-    // but then recalculated at the end for consistency with the parsed date.
-    // This matches jq's behavior where weekday/yearday in output are always
-    // computed from the date, not taken from the parsed input.
-    #[allow(unused_variables, unused_assignments)]
-    // STYLE-0004: weekday parsed from %w/%u then recomputed from the date (jq parity)
-    let mut weekday: i64 = 0;
+    // The weekday printed is computed from the date at the end, as jq's macOS build does. The one
+    // read (`%w`, `%u`, `%a`, `%A`; 0 = Sunday) only places a day within a week number (#5754).
+    let mut weekday_read: Option<i64> = None;
     // #5383: `%j` (1-366), and whether a year was read and whether anything set the month or day,
     // which decide at the end whether the libc derives the month and day from it.
     let mut day_of_year: Option<i64> = None;
     let mut year_read = false;
-    let mut date_read = false;
+    let mut month_read = false;
+    let mut mday_read = false;
+    // #5754: the last `%U`, `%W` or `%V` read, as its number and specifier.
+    let mut week: Option<(i64, char)> = None;
 
     // `%c`, `%x`, `%X` and `%r` stand for the locale's layouts (C's without one): read as
     // if the format spelled them out (#5754).
@@ -96233,14 +96232,14 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                 }
                 Some('m') => {
                     month = parse_digits(&mut input_iter, 2)?;
-                    date_read = true;
+                    month_read = true;
                 }
                 Some('d') => {
                     day = parse_digits(&mut input_iter, 2)?;
-                    date_read = true;
+                    mday_read = true;
                 }
                 Some('e') => {
-                    date_read = true;
+                    mday_read = true;
                     // Skip leading space if present
                     if input_iter.peek() == Some(&' ') {
                         input_iter.next();
@@ -96293,7 +96292,8 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     year = t.year;
                     month = t.month;
                     day = t.day;
-                    date_read = true;
+                    month_read = true;
+                    mday_read = true;
                     hour = t.hour;
                     minute = t.minute;
                     second = t.second;
@@ -96337,18 +96337,31 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     }
                     day_of_year = Some(yd);
                 }
-                #[allow(unused_assignments)]
-                // STYLE-0004: assignment superseded once the date is recomputed (jq parity)
                 Some('w') => {
-                    // Parse weekday, but we recalculate it from the date for consistency
-                    weekday = parse_digits(&mut input_iter, 1)?;
-                }
-                #[allow(unused_assignments)]
-                // STYLE-0004: assignment superseded once the date is recomputed (jq parity)
-                Some('u') => {
-                    // Parse ISO weekday (1=Monday, 7=Sunday), convert to 0=Sunday
+                    // 0 (Sunday) to 6; the libc refuses 7 and up (#5754).
                     let w = parse_digits(&mut input_iter, 1)?;
-                    weekday = if w == 7 { 0 } else { w };
+                    if w > 6 {
+                        return Err(format!("weekday {w} out of range"));
+                    }
+                    weekday_read = Some(w);
+                }
+                Some('u') => {
+                    // 1 (Monday) to 7 (Sunday); the libc refuses 0 and 8 up (#5754).
+                    let w = parse_digits(&mut input_iter, 1)?;
+                    if !(1..=7).contains(&w) {
+                        return Err(format!("ISO weekday {w} out of range"));
+                    }
+                    weekday_read = Some(w % 7);
+                }
+                Some(spec @ ('U' | 'W' | 'V')) => {
+                    // #5754: a week number of up to two digits, 0-53 (`%V` 1-53), which places the
+                    // date at the end once a year is read.
+                    let number = parse_digits(&mut input_iter, 2)?;
+                    let first = if spec == 'V' { 1 } else { 0 };
+                    if !(first..=53).contains(&number) {
+                        return Err(format!("week {number} out of range"));
+                    }
+                    week = Some((number, spec));
                 }
                 Some('a' | 'A') => {
                     // A day's full name, else its abbreviation, either way for each day in turn
@@ -96358,10 +96371,13 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                             Some(n) => (n.weekday_full[i].as_str(), n.weekday_abbr[i].as_str()),
                             None => (WEEKDAY_FULL[i], WEEKDAY_ABBR[i]),
                         };
-                        strptime_name_len(&input_iter, full, abbr)
+                        strptime_name_len(&input_iter, full, abbr).map(|len| (i, len))
                     });
                     match found {
-                        Some(len) => advance_chars(&mut input_iter, len),
+                        Some((i, len)) => {
+                            weekday_read = Some(i as i64);
+                            advance_chars(&mut input_iter, len);
+                        }
                         None => return Err("unrecognized day name".to_string()),
                     }
                 }
@@ -96375,7 +96391,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     // one is in effect (#5754): a month's full name, then its abbreviation, before the
                     // next month's, which is glibc's order and matters where a locale's abbreviation
                     // is a prefix of another month's name.
-                    date_read = true;
+                    month_read = true;
                     // #971: a non-matching name (e.g. "xyz") previously left
                     // `month` at its prior/default value instead of erroring,
                     // silently masking malformed input as a valid date -
@@ -96406,7 +96422,8 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                 }
                 Some('D') => {
                     // mm/dd/yy
-                    date_read = true;
+                    month_read = true;
+                    mday_read = true;
                     month = parse_digits(&mut input_iter, 2)?;
                     if input_iter.next() != Some('/') {
                         return Err("expected '/'".to_string());
@@ -96420,7 +96437,8 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                 }
                 Some('F') => {
                     // yyyy-mm-dd
-                    date_read = true;
+                    month_read = true;
+                    mday_read = true;
                     year = parse_digits(&mut input_iter, 4)?;
                     if input_iter.next() != Some('-') {
                         return Err("expected '-'".to_string());
@@ -96527,6 +96545,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // (`"2015 060" | strptime("%Y %j")` is `[2015,2,1,0,0,0,0,59]`), a day past the end of the
     // year rolling into the next (`"2015 366"` is 2016-01-01). A month or day read next to `%j`
     // is order- and platform-dependent in the libc (some rows abort jq) and stays as read.
+    let date_read = month_read || mday_read;
     if let (Some(mut yd), true, false) = (day_of_year, year_read, date_read) {
         let days_in_year = if yearday_for_civil(year, 12, 31) == 365 {
             366
@@ -96551,6 +96570,53 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
         day = yd - month_start[idx];
     }
 
+    // #5754: with a year read, no `%j` and not both a month and a day, the libc places the date by
+    // the last week number read. `%U` counts weeks from the year's first Sunday, `%W` from its first
+    // Monday (both 1-based, week 0 being the days before it) and `%V` from the Monday of ISO week 1,
+    // which can fall in December. The weekday read (`%w`, `%u`, `%a`) picks the day within the
+    // week, the week's first day without one. A day before the year is no match, and one past its
+    // end rolls into the next year. A month read is kept and the day counted from its start, so it
+    // can pass 31 or go below 1 (`"2015 01 09" | strptime("%Y %m %U")` is January 60, March 1); a
+    // day read with no month is kept beside the month the week falls in, which jq's own check
+    // aborts on unless the two agree.
+    let mut mday_from_week = false;
+    if let (Some((number, spec)), true, None, false, true) = (
+        week,
+        year_read,
+        day_of_year,
+        month_read && mday_read,
+        (1..=12).contains(&month),
+    ) {
+        let jan1 =
+            (checked_days_from_civil(year, 1, 1).map_err(|e| e.to_string())? % 7 + 4 + 7) % 7;
+        let week_start = i64::from(spec != 'U');
+        let first_week_start = if spec == 'V' {
+            3 - (jan1 + 2) % 7
+        } else {
+            (7 - jan1 + week_start) % 7
+        };
+        let day_in_week = (weekday_read.unwrap_or(week_start) - week_start + 7) % 7;
+        let mut yd = first_week_start + (number - 1) * 7 + day_in_week;
+        if yd < 0 {
+            return Err(format!("week {number} begins before the year"));
+        }
+        if !month_read {
+            let days_in_year = yearday_for_civil(year, 12, 31) + 1;
+            if yd >= days_in_year {
+                yd -= days_in_year;
+                year += 1;
+            }
+            month = (1..=12)
+                .rev()
+                .find(|&m| yearday_for_civil(year, m, 1) <= yd)
+                .unwrap_or(1);
+        }
+        if !mday_read {
+            day = yd - yearday_for_civil(year, month, 1) + 1;
+            mday_from_week = true;
+        }
+    }
+
     // `%m`/`%d`/`%e`/`%D`/`%F` parse up to 2 digits with no range check of
     // their own (`parse_digits` just accepts `00`-`99`), so an out-of-range
     // month reaching `yearday_for_civil`'s `month_days[(month - 1) as
@@ -96564,8 +96630,9 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // `day`'s lower bound is never checked: it's only ever assigned from
     // `parse_digits`, which builds its output from `is_ascii_digit()`
     // characters alone, so it can never be negative (`day == 0` is real,
-    // jq-valid input - `2024-01-00` succeeds) (#968).
-    if !(1..=12).contains(&month) || day > 31 {
+    // jq-valid input - `2024-01-00` succeeds) (#968). A day counted from a week number is
+    // exempt: the libc sets it past 31 or below 1 itself (#5754).
+    if !(1..=12).contains(&month) || (day > 31 && !mday_from_week) {
         return Err(format!("month {month} or day {day} out of range"));
     }
 
@@ -96578,7 +96645,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // hand-duplicated copy's `u32` type couldn't represent without its
     // subtraction underflowing.
     let days = checked_days_from_civil(year, month, day).map_err(|e| e.to_string())?;
-    weekday = (days % 7 + 4 + 7) % 7;
+    let weekday = (days % 7 + 4 + 7) % 7;
 
     // Calculate day of year, via the same leap-year table
     // broken_down_time_from_unix_secs uses (#912).
