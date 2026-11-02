@@ -119,3 +119,19 @@ fn test_keys_quotes_a_tagged_key_holding_a_line_break_5469() -> Result<()> {
     }
     Ok(())
 }
+
+/// A non-specific `!` key and an anchored merge key, on each route: yq v4.53.3 drops the `!` and
+/// writes the anchor before the merge tag.
+#[test]
+fn test_keys_drops_a_non_specific_tag_and_anchors_a_merge_key_5469() -> Result<()> {
+    for args in [&[][..], &["-P"][..], &["--sort-keys"][..]] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr("keys", "! z: 1\n&m <<: {p: 1}\n", args)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("- z\n- &m !!merge <<\n", 0),
+            "{args:?}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
