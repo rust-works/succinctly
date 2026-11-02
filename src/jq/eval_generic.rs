@@ -52409,6 +52409,7 @@ mod tests {
     /// reads back a value the evaluator built, so it is bounded as every other walk over one is
     /// -- by `MAX_VALUE_TREE_DEPTH`, or by the floor -- not by the document ceiling of 256. The
     /// floor is registered on a thread with a real stack of the size it claims.
+    #[cfg(feature = "std")] // the floor is a no-op without `std`
     #[test]
     fn owned_from_standard_json_under_the_floor_is_bounded_by_the_value_tree_5876() {
         use crate::jq::{with_stack_budget, with_value_depth_on_stack_floor, MAX_VALUE_TREE_DEPTH};
