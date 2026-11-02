@@ -95367,8 +95367,8 @@ fn strptime_name_len(
 
 /// `fmt` with `%c`, `%x`, `%X` and `%r` replaced by the layout each stands for: the process
 /// locale's, else C's (`%a %b %e %H:%M:%S %Y`, `%m/%d/%y`, `%H:%M:%S`, `%I:%M:%S %p`), which is
-/// what the libc reads. A layout can name another (`en_US`'s `%c` holds `%X`), so this repeats a
-/// few times; no locale nests deeper.
+/// what the libc reads. A layout can name another (`en_US`'s `%c` holds `%X`), so this repeats
+/// until none is left, to a bound that no locale's layouts reach.
 fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
     let names_a_layout = |text: &str| {
         let mut chars = text.chars();
@@ -95396,7 +95396,7 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
         }
     };
     let mut text = fmt.to_string();
-    for _ in 0..3 {
+    for _ in 0..8 {
         let mut out = string_with_capacity(text.len());
         let mut chars = text.chars();
         while let Some(c) = chars.next() {

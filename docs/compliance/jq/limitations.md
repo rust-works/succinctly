@@ -10287,7 +10287,9 @@ What differs from jq 1.7.1:
   `%a %A %b %B %h %p` take the names `strftime` prints in the process locale: a day's or month's full name, else its abbreviation, ASCII-case-insensitively and every other character exactly (`märz` matches `März`, `MÄRZ` does not).
   `%c %x %X %r` stand for the locale's layouts (`nl_langinfo_l`'s `D_T_FMT`, `D_FMT`, `T_FMT` and `T_FMT_AMPM`), C's `%a %b %e %H:%M:%S %Y`, `%m/%d/%y`, `%H:%M:%S` and `%I:%M:%S %p` without one, and are read as if the format spelled them out.
   A layout the library holds empty is empty: macOS prints and reads nothing for `%r` under `de_DE`, though `nl_langinfo` reports a layout there, so `"11:53:41 " | strptime("%r")` is an error.
-  A layout with a flag succinctly does not read (`ja_JP`'s `%c` holds `%_m`) is an error, as on macOS.
+  A layout holding a specifier `strptime` does not read here (a `_` or `-` flag, `%k`, `%l`) fails on text that has it.
+  macOS fails the same way for `ja_JP`'s `%c`, which holds `%_m`; glibc may read such a layout, so a glibc `jq` can accept text this rejects.
+  `%E*` and `%O*` modifiers (`%Ex`, `%Ec`, `%Oy`) are not read by `strptime` in any locale, where jq reads them as the plain specifier (`"03/05/15" | strptime("%Ex")`).
   An empty am marker matches nothing and reads as am, as on macOS under `de_DE`, where `%p` prints nothing and `PM` is left over.
   `%a`, `%A` and `%p` no longer read any run of letters: `Xyz`, `Thurs`, `Th` and `PMX` are no match, as in jq.
 
