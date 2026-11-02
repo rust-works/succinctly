@@ -104,7 +104,7 @@ cargo bench                              # Run benchmarks
 
 ### Coverage
 
-CI runs coverage through `.github/workflows/coverage.yml` (x86_64 + ARM64): four test shards per
+CI runs coverage through `.github/workflows/coverage.yml` (x86_64 + ARM64): three test shards per
 architecture (`scripts/coverage-shards.py` defines which tests each runs; a new test file lands in the
 `rest` shard by itself, #5711), each producing an lcov with `cargo-llvm-cov`, then a report job that
 combines them with [`action-works/patchcov-action`](https://github.com/action-works/patchcov-action)'s
