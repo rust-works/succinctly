@@ -397,12 +397,15 @@ impl<V: Teardown> ObjectMapOf<V> {
     }
 
     /// [`Teardown::detach`] every value the map holds and every repeated
-    /// key's earlier entry, wherever this handle owns the storage alone.
+    /// key's earlier entry, wherever this handle owns the storage alone, then
+    /// drop what is left of that storage (scalars and empty containers, none
+    /// of which recurses), so the object's own `Drop` finds nothing to do.
     pub(super) fn detach_into(&mut self, work: &mut Vec<V>) {
         if let Some(map) = self.unique_map() {
             for child in map.values_mut() {
                 child.detach(work);
             }
+            map.clear();
         }
         if let Some(shadows) = self.unique_shadows() {
             for entry in &mut shadows.order {
@@ -410,6 +413,7 @@ impl<V: Teardown> ObjectMapOf<V> {
                     child.detach(work);
                 }
             }
+            self.shadows = None;
         }
     }
 

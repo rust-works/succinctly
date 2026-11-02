@@ -2253,7 +2253,8 @@ pub trait Teardown: Sized {
 
     /// [`detach`](Self::detach) every child of `self`, in order: a handle
     /// released here may leave a later sibling on the same child as its last
-    /// holder.
+    /// holder. What is left of storage `self` owns alone is then dropped
+    /// (nothing in it recurses), so dropping `self` afterwards does no work.
     #[inline]
     fn detach_children(&mut self, work: &mut Vec<Self>) {
         let _ = work;
@@ -2453,12 +2454,15 @@ impl<V: Teardown> ArrayOf<V> {
         Rc::get_mut(&mut self.0)
     }
 
-    /// [`Teardown::detach`] every element, if this handle owns them alone.
+    /// [`Teardown::detach`] every element, if this handle owns them alone,
+    /// then drop what is left (scalars and empty containers, none of which
+    /// recurses), so the array's own `Drop` finds it empty.
     fn detach_into(&mut self, work: &mut Vec<V>) {
         if let Some(vec) = self.unique_vec() {
             for child in vec.iter_mut() {
                 child.detach(work);
             }
+            vec.clear();
         }
     }
 }
@@ -11502,6 +11506,32 @@ mod tests {
         }
         drop(array);
         drop(object);
+    }
+
+    /// Detaching a unique container's children leaves it empty, side list
+    /// included, so its own drop on the worklist returns at once instead of
+    /// scanning the scalars it had left a second time.
+    #[test]
+    fn detaching_children_leaves_a_unique_container_empty_5782() {
+        let mut work = Vec::new();
+        let mut array = OwnedValue::array_from(vec![
+            OwnedValue::Int(1),
+            linear_array_nest(2),
+            OwnedValue::array(),
+        ]);
+        array.detach_children(&mut work);
+        assert_eq!(work.len(), 1, "only the non-empty container is queued");
+        assert_eq!(array, OwnedValue::array());
+
+        let mut map = ObjectMap::new();
+        map.insert("k".to_string(), nest_object_5782(2));
+        map.push_occurrence("k".to_string(), OwnedValue::Int(2));
+        let mut object = OwnedValue::Object(map);
+        work.clear();
+        object.detach_children(&mut work);
+        assert_eq!(work.len(), 1);
+        let map = object.as_object_mut().expect("an object");
+        assert!(!map.has_entries(), "map and side list both dropped");
     }
 
     /// The drop-depth count is given back however a drop ends: within the

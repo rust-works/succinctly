@@ -57225,9 +57225,11 @@ fn slice_is_same_array(value: &OwnedValue) -> bool {
 /// behind the container. It is sound for the reason ADR-0024's #2889
 /// amendment gives for the embed table's entry: `marker.value` is a strong
 /// reference held for the marker's whole lifetime, so a write through any
-/// other handle copies first (`Rc::make_mut`; the by-value unwrap is
-/// `Rc::try_unwrap`, and the one `unsafe` in the containers reads each field once), and a target that still
-/// shares the storage is that node, unmodified. It reads no origin on
+/// other handle copies first (`Rc::make_mut`; the by-value unwrap moves
+/// out only through a unique `Rc` -- `Rc::get_mut` for an array,
+/// `Rc::try_unwrap` for an object -- and the one `unsafe` in the containers
+/// reads each field once), and a target that still shares the storage is
+/// that node, unmodified. It reads no origin on
 /// purpose: an [`Origin::Untracked`] marker -- a navigated bind, or a
 /// `Snapshot` demoted against a rebuilt root -- refuses by node identity
 /// because it has no invocation to certify a position in, and the pointer
