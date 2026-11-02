@@ -3789,12 +3789,18 @@ Every row of the issue, and 80 more, are pinned against yq v4.53.3 in `tests/yq_
 **Not reproduced:**
 
 - `OwnedValue` has no timestamp kind, so the text stands in for the tag: a string is a timestamp when it reads as RFC 3339 or `2006-01-02`, the rule the ordering comparison already follows (#5651).
-  A quoted string spelled like one is therefore a timestamp here and a `!!str` in yq, which concatenates it: `"2026-01-01T00:00:00Z" + "3h"` is `"2026-01-01T03:00:00Z"` here and `"2026-01-01T00:00:00Z3h"` in yq, and `"2026-01-01" + "x"` raises the duration error here where yq concatenates.
+  A quoted (or JSON) string spelled like one is a `!!str` in yq, which concatenates it, so the two can only both be served by what the right operand is.
+  `+` of text that can begin a duration (after a sign, a digit or `.`: `3h`, `1`, `3hrs`) to such a string adds or refuses it as for a timestamp, and any other text concatenates as for a string.
+  So `"2026-01-01" + "T00:00:00Z"` is `"2026-01-01T00:00:00Z"` in both tools, and `.t += "3hrs"` raises yq's `unknown unit "hrs"` rather than appending.
+  What remains: a quoted date plus a duration (`"2026-01-01T00:00:00Z" + "3h"`) is `"2026-01-01T03:00:00Z"` here and `"2026-01-01T00:00:00Z3h"` in yq, and a plain date plus text that cannot begin one (`.t + "bogus"`, `.t + ""`, `.t + null`, `.t + true`) concatenates here (`null` adds nothing) where yq raises `unable to parse duration [bogus]`.
+  `-` has no such split, since yq cannot subtract from a string at all: a quoted date minus a duration subtracts it here, and minus anything else raises the duration error, where yq raises `strings cannot be subtracted` for both.
   Under a custom layout the same text is still a timestamp here, so `with_dtf("2006-01-02"; .q + "1h")` on a quoted RFC 3339 `.q` raises the layout's parse error where yq concatenates.
-  Following yq on the quoted string instead would make a plain date concatenate silently on the write routes (`|=`, `+=`), which see the value without its node, and a silently wrong date is the failure this replaced.
+  Following yq on the quoted string in every case would make a plain date plus a duration concatenate silently on the write routes (`|=`, `+=`), which see the value without its node, and a silently wrong date is the failure this replaced.
   For the same reason `now | type`, `from_unix | tag` and `tz(z) | tag` are `!!str` here and `!!timestamp` in yq, and a string builtin (`test`, `split`) accepts them here where yq refuses them (#5836).
 - yq names the node's path in the `format_datetime`, `tz` and `to_unix` errors (`could not parse datetime of [a.b]`).
   A value here carries no path, so the brackets are always empty, as yq writes them for a computed value.
+- A missing key as the layout, format or zone argument (`with_dtf(.nope; f)`, `format_datetime(.nope)`) reads as `null` here, so it is the layout `null`; yq navigates it read-only, finds no node and raises `could not find layout for format_time`.
+  An empty layout, or a container's, is RFC 3339 in both tools.
 - A stage after `with_dtf` that reads path context (`with_dtf(f; .a) | path`) reads the position of `with_dtf`'s input (`[]` where yq has `["a"]`).
   A write through it (`with_dtf(f; .a) = 5`, `|=`, `del`) lands where yq's does.
 - `tz` with an IANA name needs the `local-zone` feature (on in `cli`, not on Windows); without it only `UTC`, the empty name and `Local` load, and every other name is `unknown time zone`.
