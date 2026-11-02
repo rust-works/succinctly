@@ -29,6 +29,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -254,6 +255,24 @@ def plan(paths, tier, arch, skip):
     return out
 
 
+def gate_environment(extra, environ=None):
+    """The environment a gate's commands run in: `environ` plus the gate's own variables (#5901).
+
+    An agent harness often starts with a `PATH` that lacks rustup's directory, so `cargo` is not
+    found although it is installed, and a gate would fail for a reason that is not the code. When
+    `cargo` is not on `PATH`, `$CARGO_HOME/bin` and `~/.cargo/bin` are put on it if one of them holds
+    one. A machine with no cargo at all is left as it is, so the gate still fails with
+    `cargo: command not found`.
+    """
+    env = dict(os.environ if environ is None else environ, **extra)
+    if shutil.which("cargo", path=env.get("PATH", os.defpath)) is None:
+        home = env.get("CARGO_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".cargo")
+        bin_dir = os.path.join(home, "bin")
+        if os.path.isfile(os.path.join(bin_dir, "cargo")):
+            env["PATH"] = os.pathsep.join(p for p in (bin_dir, env.get("PATH")) if p)
+    return env
+
+
 def run_gates(root, base, tier):
     arch = platform.machine().lower()
     skip = set(os.environ.get("PRE_PUSH_SKIP", "").split())
@@ -269,7 +288,7 @@ def run_gates(root, base, tier):
             print(f"  - {gate.name}: not run (a cheaper gate failed: {', '.join(f.name for f in failed)})")
             continue
         print(f"  * {gate.name}", flush=True)
-        env = dict(os.environ, **gate.env)
+        env = gate_environment(gate.env)
         for step in gate.steps:
             cmd = step.format(base=base, target=target_dir(root))
             print(f"    $ {cmd}", flush=True)
