@@ -1937,7 +1937,7 @@ impl core::fmt::Debug for ArithSettleMemo {
 ///
 /// Reads as the slice of stages it holds (`Deref`), so a pipe's stages are
 /// matched and indexed as before; [`Self::make_mut`] is the `Vec` to push to.
-/// A copy of a tail ([`Self::tail_copy`]) holds its stages in storage it can
+/// A copy of a tail (`tail_copy`) holds its stages in storage it can
 /// share (#5488), and a tail of such a pipe is a view of that storage rather
 /// than a copy of its stages, unless a stage holds evaluation state. The
 /// remembered answer is `eval::needs_path_context`
@@ -2892,7 +2892,7 @@ impl core::ops::Deref for PipeStages {
 
     /// Read on every dispatch of a pipe: inlined, and with no panic path to
     /// keep it small (a view's `start` is at most its storage's length, as
-    /// [`PipeStages::view_from`] checks).
+    /// `PipeStages::view_from` checks).
     #[inline(always)]
     fn deref(&self) -> &[Expr] {
         match &self.storage {
