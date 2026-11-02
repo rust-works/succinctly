@@ -143,3 +143,75 @@ fn test_fold_store_through_a_slice_or_delete_follows_jq_5761() -> Result<()> {
     }
     Ok(())
 }
+
+/// A fold that adds or defaults its loop element onto a `null` (or, for `//=`, `false`) start
+/// keeps the element itself, as jq's `reduce` does: `add` is `reduce .[] as $x (null; . + $x)`.
+/// These were `false` here for the compound spellings and `true` in jq 1.7.1.
+#[test]
+#[cfg_attr(
+    feature = "unshared-containers",
+    ignore = "holdout has no node identity or sharing (#5254)"
+)]
+fn test_fold_compound_store_over_a_null_state_keeps_the_element_5761() -> Result<()> {
+    for (filter, expected) in [
+        (
+            "[nan] as $a | reduce $a as $v (null; . += $v) | . == $a",
+            "true",
+        ),
+        (
+            "[nan] as $a | reduce $a as $v (null; . //= $v) | . == $a",
+            "true",
+        ),
+        (
+            "[nan] as $a | reduce $a as $v (false; . //= $v) | . == $a",
+            "true",
+        ),
+        (
+            "[nan] as $a | [foreach $a as $v (null; . += $v; .)] | .[0] == $a",
+            "true",
+        ),
+        (
+            "[nan] as $a | [foreach $a as $v (null; . //= $v)] | .[0] == $a",
+            "true",
+        ),
+        (
+            "[[nan]] as $a | reduce $a[] as $v (null; . += $v) == $a[0]",
+            "true",
+        ),
+        (
+            "{\"a\":[nan]} as $a | reduce $a as $v (null; . //= $v) == $a",
+            "true",
+        ),
+        // A second element adds to the first, a new container.
+        (
+            "[[nan],[nan]] as $a | reduce $a[] as $v (null; . += $v) == [nan,nan]",
+            "false",
+        ),
+        // A truthy state is `//=`'s answer and is never replaced.
+        (
+            "[nan] as $a | reduce $a as $v ([]; . //= $v) | . == $a",
+            "false",
+        ),
+        ("[nan] as $a | reduce $a as $v (1; . //= $v)", "1"),
+        (
+            "[nan] as $a | reduce $a as $v ({\"x\":1}; .x //= $v) | .x",
+            "1",
+        ),
+        // A write after the store copies: the bound value is unchanged.
+        (
+            "[nan] as $a | reduce $a as $v (null; . += $v) | .[0] = 7 | [., $a]",
+            "[[7],[null]]",
+        ),
+        (
+            "[nan] as $a | reduce $a as $v (null; . //= $v) | .[0] = 7 | [., $a]",
+            "[[7],[null]]",
+        ),
+        (
+            "[[1]] as $a | reduce $a[] as $v (null; . += $v | .[0] = 9) | [., $a]",
+            "[[9],[[1]]]",
+        ),
+    ] {
+        assert_eq!(answer(filter)?, format!("{expected}\n"), "{filter}");
+    }
+    Ok(())
+}

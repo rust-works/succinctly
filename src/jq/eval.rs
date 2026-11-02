@@ -13725,6 +13725,20 @@ fn owned_assign_step<S: EvalSemantics>(
                 let old = core::mem::replace(state, OwnedValue::Null);
                 Some(arith_combine::<S>(ArithOp::Add, old, right).map(|sum| *state = sum))
             }
+            // #5761: `null + x` is `x` itself, and `. //= x` over a `null` or `false` state is
+            // `x` too, so the state takes the operand's own handle. A fold that adds or defaults
+            // its loop element onto a `null` start thereby keeps the element (`add` is
+            // `reduce .[] as $x (null; . + $x)`), where the evaluator route rebuilds it.
+            OwnedAssignRhs::Combine(ArithOp::Add, right) if matches!(state, OwnedValue::Null) => {
+                *state = right;
+                Some(Ok(()))
+            }
+            OwnedAssignRhs::Alternative(right) => {
+                if !state.is_truthy() {
+                    *state = right;
+                }
+                Some(Ok(()))
+            }
             _ => None,
         };
     }
@@ -105499,6 +105513,61 @@ mod tests {
         };
         assert!(matches!(
             try_owned_assign_step::<JqSemantics>(&rebind, state),
+            OwnedStep::Declined(_)
+        ));
+    }
+
+    /// #5761: `. += $v` and `. //= $v` over a `null` (or, for `//=`, `false`) state store the
+    /// fold's element as the state itself, where the sum of two kinds a `+` cannot fail on
+    /// would have declined; a truthy state is left as it is by `//=`.
+    #[cfg_attr(
+        feature = "unshared-containers",
+        ignore = "holdout has no node identity or sharing (#5254)"
+    )]
+    #[test]
+    fn owned_assign_step_stores_a_fold_share_marker_over_a_null_state_5761() {
+        let value = OwnedValue::array_from(vec![OwnedValue::Int(7)]);
+        let marker = Expr::TrackedVar(Rc::new(Tracked {
+            value: value.clone(),
+            origin: Origin::Untracked,
+            node: None,
+            fold_share: true,
+        }));
+        let add = Expr::CompoundAssign {
+            op: AssignOp::Add,
+            path: Box::new(Expr::Identity),
+            value: Box::new(marker.clone()),
+        };
+        let default = Expr::AlternativeAssign {
+            path: Box::new(Expr::Identity),
+            value: Box::new(marker),
+        };
+        for (step, state) in [
+            (&add, OwnedValue::Null),
+            (&default, OwnedValue::Null),
+            (&default, OwnedValue::Bool(false)),
+        ] {
+            let OwnedStep::Handled(Ok(stored)) =
+                try_owned_assign_step::<JqSemantics>(step, state.clone())
+            else {
+                panic!("{step:?} over {state:?} was declined"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if the identity-path step declined a null or false state (#5761)"
+            };
+            assert!(
+                stored.shares_storage_with(&value),
+                "{step:?} over {state:?} rebuilt the element"
+            );
+        }
+        // A truthy state is `//=`'s answer, untouched.
+        let kept = OwnedValue::Int(1);
+        let OwnedStep::Handled(Ok(stored)) =
+            try_owned_assign_step::<JqSemantics>(&default, kept.clone())
+        else {
+            panic!("a truthy state was declined"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if the identity-path step declined a truthy state (#5761)"
+        };
+        assert_eq!(stored, kept);
+        // yq's `+` and `//` differ, so its steps stay with the evaluator.
+        assert!(matches!(
+            try_owned_assign_step::<YqSemantics>(&add, OwnedValue::Null),
             OwnedStep::Declined(_)
         ));
     }

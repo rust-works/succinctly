@@ -11942,7 +11942,8 @@ The shortcut fires only where `==` is handed two handles on one storage, so the 
 Still different:
 
 - **Spellings of a fold step that stores its loop variable that still rebuild it** ([#5761](https://github.com/rust-works/succinctly/issues/5761), #5540 follow-up).
-  `reduce $a as $v (null; . += $v) | . == $a` (the compound spelling of jq's own `add`), `(.x, .y) += $v`, `(.x += $v)?`, an `as` rebind (`$v as $w | .x = $w`) and a container-valued field read stored on its own (`.x = $r.items`) are `false` here and `true` in jq.
+  `(.x, .y) += $v`, `(.x += $v)?`, a container-valued field read stored on its own (`.x = $r.items`) and a compound store of the whole state followed by an identity stage (`. += $v | .`, `. //= $v | .`) are `false` here and `true` in jq.
+  The whole-state spellings `. += $v` (jq's own `add` is `reduce .[] as $x (null; . + $x)`) and `. //= $v` over a `null` or `false` state keep the element, and so does an `as` rebind (`$v as $w | .x = $w`) ([#5761](https://github.com/rust-works/succinctly/issues/5761)).
   A whole-variable read in a sibling stage shares the node (`.y = $r | .x = $r.items`), so the answer follows an unrelated read.
   A slice assigned onto `null`, a `del` whose last index names nothing and `.[5] |= empty` build a new array, as jq does ([#5761](https://github.com/rust-works/succinctly/issues/5761)): `[nan] as $a | null | .[1:] = $a | . == $a` and `$a | del(.[5]) == $a` are `false`.
   The copy happens only when another handle holds the array, and a path that runs through something absent (`del(.[5].x)`) keeps identity, as in jq.
