@@ -1943,6 +1943,8 @@ A number, a bool, a null, a container, a plain date (`!!timestamp`), a plain `<<
 A bad pattern or flag is still reported first, as yq checks those before the input, and `split` passes a null through.
 `tag` and `type` report a verbatim tag as what it spells, a core one in its `!!` form (`!<tag:yaml.org,2002:binary>` is `!!binary`, `!<!foo>` is `!foo`), as yq does.
 An alias node keeps its target's value, where yq applies the builtin to the alias's name (`b: *x` with `upcase` is `X`).
+The refusal is made where the builtin reads a document node; a value reached through an update (`.b |= upcase`), `to_entries`/`with_entries`, or a literal under `-n` (`5 | @base64`) still gets jq's wording or, for `@base64` and `@uri`, an answer.
+Under `--jq-extensions`, `ascii_downcase` and `ascii_upcase` are `downcase` and `upcase` and refuse the same inputs, a plain date among them.
 
 ### Regex patterns are read as Go's `regexp` reads them (#5374, #5388)
 

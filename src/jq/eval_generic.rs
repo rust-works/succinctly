@@ -2486,6 +2486,15 @@ fn yq_string_input_tag<V: DocumentValue>(
     value: &V,
     cursor: Option<V::Cursor>,
 ) -> Option<String> {
+    // The common case first: an untagged string is `!!str` unless it is a plain `<<` or a plain
+    // date, which start with `<` and a digit.
+    if cursor.map_or(true, |c| c.explicit_tag().is_none()) {
+        if let Some(text) = value.as_str() {
+            if !matches!(text.as_bytes().first(), Some(b'<' | b'0'..=b'9')) {
+                return None;
+            }
+        }
+    }
     let named = yq_type_tag(value, cursor);
     if named.is_empty() {
         return None;
@@ -2502,9 +2511,12 @@ fn yq_string_input_tag<V: DocumentValue>(
     (read_as != "!!str").then_some(named)
 }
 
-/// yq's refusal of a string builtin on a non-string input (#5836), or `None` to evaluate it. A bad
-/// pattern or flag is reported first, as yq checks those before the input: the builtin is run once
-/// on the empty string, and its error, if it has one, is the answer.
+/// yq's refusal of a string builtin on a non-string input (#5836), or `None` to evaluate it.
+///
+/// yq evaluates the arguments it reads and checks the pattern and flags before the input, so an
+/// argument's error (`test(error(.))`), a bad flag or a pattern that does not compile is the
+/// answer when there is one. Each argument is evaluated on the real input, then the builtin runs
+/// once on the empty string with those values in place; only its own input is swapped.
 fn yq_string_op_refusal<S: EvalSemantics, V: DocumentValue>(
     op: YqStringOp,
     expr: &Expr,
@@ -2512,15 +2524,59 @@ fn yq_string_op_refusal<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
 ) -> Option<GenericResult<V>> {
     let tag = yq_string_input_tag(op, value, cursor)?;
-    if let GenericResult::Error(e) = eval_on_owned::<S, V>(
-        expr,
-        OwnedValue::String(String::new().into()),
-        false,
-        Reentry::REBUILT,
-    ) {
-        return Some(GenericResult::Error(e));
+    if let Expr::Builtin(builtin) = expr {
+        let mut failed = None;
+        let probe = yq_string_op_probe(builtin, |arg| {
+            if failed.is_some() {
+                return None;
+            }
+            match eval_single::<S, V>(arg, value.clone(), false, cursor).collect_owned::<S>() {
+                Ok(values) => values.into_iter().next().map(Expr::tracked_value),
+                Err(e) => {
+                    failed = Some(e);
+                    None
+                }
+            }
+        });
+        if let Some(e) = failed {
+            return Some(GenericResult::Error(e));
+        }
+        // An argument with no value leaves nothing to check; the builtin answers it.
+        let probe = probe?;
+        if let GenericResult::Error(e) = eval_on_owned::<S, V>(
+            &Expr::Builtin(probe),
+            OwnedValue::String(String::new().into()),
+            false,
+            Reentry::REBUILT,
+        ) {
+            return Some(GenericResult::Error(e));
+        }
     }
     Some(GenericResult::Error(EvalError::new(op.refusal(&tag))))
+}
+
+/// `builtin` with each argument yq evaluates replaced by `arg`'s answer for it, or `None` if one
+/// has none. yq's `split(a; b)` reads neither argument and its `sub(re; r; flags)` only the pattern
+/// (both reproduced here), so those stand as `null`.
+fn yq_string_op_probe(
+    builtin: &Builtin,
+    mut arg: impl FnMut(&Expr) -> Option<Expr>,
+) -> Option<Builtin> {
+    let mut read = |e: &Expr| arg(e).map(Box::new);
+    let unread = || Box::new(Expr::tracked_value(OwnedValue::Null));
+    Some(match builtin {
+        Builtin::Split(sep) => Builtin::Split(read(sep)?),
+        Builtin::SplitRegex(..) => Builtin::SplitRegex(unread(), unread()),
+        Builtin::Sub(re, replacement) => Builtin::Sub(read(re)?, read(replacement)?),
+        Builtin::SubFlags(re, ..) => Builtin::SubFlags(read(re)?, unread(), unread()),
+        Builtin::Test(re) => Builtin::Test(read(re)?),
+        Builtin::TestFlags(re, flags) => Builtin::TestFlags(read(re)?, read(flags)?),
+        Builtin::Match(re) => Builtin::Match(read(re)?),
+        Builtin::MatchFlags(re, flags) => Builtin::MatchFlags(read(re)?, read(flags)?),
+        Builtin::Capture(re) => Builtin::Capture(read(re)?),
+        Builtin::CaptureFlags(re, flags) => Builtin::CaptureFlags(read(re)?, read(flags)?),
+        other => other.clone(),
+    })
 }
 
 fn document_value_type_tag<V: DocumentValue>(value: &V) -> &'static str {

@@ -236,3 +236,37 @@ fn test_tag_of_a_verbatim_tag_is_what_it_spells_5836() -> Result<()> {
     }
     Ok(())
 }
+
+/// The arguments yq reads are evaluated on the real input before the type check, so an
+/// argument's error or value decides the answer first; `split(a; b)` reads neither argument and
+/// `sub(re; r; flags)` only its pattern.
+#[test]
+fn test_arguments_are_read_from_the_real_input_before_the_refusal_5836() -> Result<()> {
+    const HINT: &str = "Hint: Most often you'll want to use '|=' over '=' for this operation";
+    let not_matched = format!("Error: cannot match with !!int, can only match strings. {HINT}");
+    let not_substituted =
+        format!("Error: cannot substitute with !!int, can only substitute strings. {HINT}");
+    for (filter, want_err) in [
+        (
+            "test(\"x\";.)",
+            "Error: unrecognised match params '5', please see docs at https://mikefarah.gitbook.io/yq/operators/string-operators",
+        ),
+        (
+            "test(\"x\";tag)",
+            "Error: 'i' is not a valid option for match. To ignore case, use an expression like match(\"(?i)cat\")",
+        ),
+        ("test(error(.))", "Error: 5"),
+        ("test(error(tag))", "Error: !!int"),
+        ("split(error(\"s\"))", "Error: s"),
+        ("split(\"x\";error(\"s\"))", "Error: cannot split !!int, can only split strings"),
+        ("sub(\"x\";\"y\";error(\"f\"))", not_substituted.as_str()),
+        ("sub(error(\"p\");\"y\";\"g\")", "Error: p"),
+        ("sub(\"x\";error(\"r\"))", "Error: r"),
+        ("test(\"x\";error(\"f\"))", "Error: f"),
+        ("test(\"a\",\"b\")", not_matched.as_str()),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "5\n", &[])?;
+        assert_eq!((stdout.as_str(), stderr.trim(), code), ("", want_err, 1), "{filter}");
+    }
+    Ok(())
+}
