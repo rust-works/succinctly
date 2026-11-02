@@ -60,6 +60,46 @@ fn a_program_reading_inputs_without_null_input_answers_as_jq_5855() -> Result<()
     Ok(())
 }
 
+/// The same programs over a file named on the command line, where the lazy route's source tag
+/// names the file for `input_filename`, `$__loc__` and the marker of an error. The rows are
+/// `tests/data/jq-lazy-input-without-n-file-oracle-5855.tsv`, with the file's path as `{FILE}`.
+#[test]
+fn a_program_reading_inputs_from_a_file_without_null_input_answers_as_jq_5855() -> Result<()> {
+    let table = include_str!("../data/jq-lazy-input-without-n-file-oracle-5855.tsv");
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("stream.json");
+    let file = path.to_string_lossy().into_owned();
+    let mut rows = 0;
+    for line in table.lines() {
+        let [stream, program, flags, stdout, stderr, code] =
+            line.split('\t').collect::<Vec<_>>()[..]
+        else {
+            panic!("malformed row {line:?}");
+        };
+        let (stream, program) = (unescape(stream), unescape(program));
+        std::fs::write(&path, &stream)?;
+        let mut args: Vec<&str> = flags.split(' ').collect();
+        args.push(&program);
+        args.push(&file);
+        let (got_out, got_err, got_code) = run_jq_full(&args, None)?;
+        let context = format!("{args:?} over {stream:?}");
+        assert_eq!(
+            got_out,
+            unescape(stdout).replace("{FILE}", &file),
+            "stdout of {context}"
+        );
+        assert_eq!(
+            got_err,
+            unescape(stderr).replace("{FILE}", &file),
+            "stderr of {context}"
+        );
+        assert_eq!(got_code, code.parse::<i32>()?, "status of {context}");
+        rows += 1;
+    }
+    assert!(rows > 900, "the table was read: {rows} rows");
+    Ok(())
+}
+
 /// `halt` after the first document: the rest of the stream is never converted. The answer is
 /// the same as when every document is read first (an empty stdout, status 0).
 #[test]

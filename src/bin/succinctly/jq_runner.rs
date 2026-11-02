@@ -6700,8 +6700,7 @@ fn get_inputs(
     // spans answer it without the strict scan (`EofTail::of_clean_source`), and the scan runs
     // only if the route turns the stream down, or here, over the bytes as read, for a stream
     // that is not UTF-8.
-    let lazy_candidate =
-        records_eof && json_input_mode && args.null_input && !args.stream && raw_bytes.len() == 1;
+    let lazy_candidate = records_eof && json_input_mode && !args.stream && raw_bytes.len() == 1;
     let mut eof_tail = (records_eof && !lazy_candidate).then(|| {
         let sources: Vec<&[u8]> = raw_bytes.iter().map(|(_, raw)| raw.as_slice()).collect();
         EofTail::of(&sources, args.raw_input, &seams, args.stream)
@@ -7620,6 +7619,13 @@ struct EofTail {
 /// longer than this is read in pieces of this size (#4303).
 const JQ_READ_CHUNK: usize = 4095;
 
+#[cfg(test)]
+std::thread_local! {
+    /// How many times [`EofTail::of`] scanned a whole stream on this thread, for the tests that
+    /// pin the lazy route (#5855): a clean stream the route takes needs none.
+    static STRICT_EOF_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl EofTail {
     /// The tail of `sources`, in command-line order, read as JSON text or, with
     /// `raw`, as `-R` lines.
@@ -7628,6 +7634,8 @@ impl EofTail {
     /// source's own lines and reads start after the bytes moved onto it, which belong to an
     /// earlier file's reads. Nothing is moved off the last source.
     fn of(sources: &[&[u8]], raw: bool, seams: &[Seam], stream: bool) -> Self {
+        #[cfg(test)]
+        STRICT_EOF_SCANS.with(|n| n.set(n.get() + 1));
         let base = sources.len().checked_sub(1).map_or(0, |last| {
             seams
                 .get(last)
@@ -9099,7 +9107,7 @@ fn find_json_values(bytes: &[u8]) -> core::result::Result<Vec<(usize, usize)>, u
     }
 }
 
-/// Documents of a clean single-source JSON stream that `-n` with `input`/`inputs` converts when
+/// Documents of a clean single-source JSON stream that a program reading `input`/`inputs` converts when
 /// they are read, not up front (#5661): the text and each document's byte range in it.
 struct LazyJsonInputs {
     text: std::rc::Rc<String>,
@@ -9455,7 +9463,7 @@ fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Ve
     Ok(raw)
 }
 
-/// The byte range of every document of `raw`, when `-n` with `input`/`inputs` can convert them as
+/// The byte range of every document of `raw`, when a program reading `input`/`inputs` can convert them as
 /// they are read (#5661): the whole stream is plain, strict JSON that `serde_json` accepts, the
 /// splitter and `serde_json` agree on where each document ends, and no document nests deeply
 /// enough for its conversion to fail. `None` for anything else -- a parse error, a BOM, a number
@@ -13970,7 +13978,7 @@ mod tests {
         }
     }
 
-    /// #5661: which plain-JSON streams `-n` with `input`/`inputs` converts as they are read. The
+    /// #5661: which plain-JSON streams a program reading `input`/`inputs` converts as they are read. The
     /// route is for a stream with nothing to report: an error, a BOM, a number only jq reads or a
     /// document deep enough for its conversion to fail all keep the eager route, which places the
     /// error where jq's reader meets it.
@@ -14263,12 +14271,36 @@ mod tests {
         assert_eq!(tail, Some(scanned));
         // Without `-n` the driver loop pops from the same queue, so a clean stream is deferred
         // there too (#5855).
-        let (inputs, _, _, _, lazy) = read(&["jq", "inputs", &clean]);
+        STRICT_EOF_SCANS.with(|n| n.set(0));
+        let (inputs, (lines, tail), _, _, lazy) = read(&["jq", "inputs", &clean]);
+        assert_eq!(
+            STRICT_EOF_SCANS.with(std::cell::Cell::get),
+            0,
+            "a clean stream the route takes is never scanned whole"
+        );
         assert!(inputs.is_empty(), "the driver pops them from the queue");
+        assert_eq!(lines, Vec::new());
+        // The end of the stream comes from its spans, with no strict scan before the route.
+        assert_eq!(
+            tail,
+            Some(EofTail {
+                newlines: 3,
+                unknown: false
+            })
+        );
         assert_eq!(
             lazy.expect("deferred").spans,
             vec![(0, 1), (2, 9), (10, 13)]
         );
+        // A stream the route turns down, or that is not UTF-8, still gets the strict scan.
+        let (_, (_, tail), ..) = read(&["jq", "inputs", &bare_end]);
+        assert_eq!(
+            tail,
+            Some(EofTail::of(&[b"1\n2\n007".as_slice()], false, &[], false))
+        );
+        let (inputs, (_, tail), ..) = read(&["jq", "inputs", &latin1]);
+        assert!(inputs.is_empty(), "the substituted text is still clean");
+        assert_eq!(tail, Some(scanned));
         // Not with `-s`, with `--stream`, with a stream that turns malformed, or with several
         // files.
         let broken = write("broken.json", "1\n2\n}\n");
