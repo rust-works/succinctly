@@ -2920,11 +2920,14 @@ pub struct KeyMeta {
     /// key is still known to be a string, or `""` for a plain key.
     style: &'static str,
     /// The anchor the key declares (`&k key: 1`, #2598), without the `&`.
-    /// A key can only declare one: an alias used as a key is a separate gap.
     anchor: Option<String>,
     /// The explicit tag the key was written with (`!Foo key: 1`, `!!str 1: x`),
     /// verbatim (#4088).
     tag: Option<String>,
+    /// The anchor an alias used as the key refers to (`*a : 1`, #5469), without the `*`. The
+    /// key itself is the anchor's text; a key that is an alias declares no anchor and carries
+    /// no tag of its own (#1374).
+    alias: Option<String>,
 }
 
 /// The key style (see [`CommentTree::key_style`]) for a key whose quoting `-P` stripped.
@@ -2969,11 +2972,29 @@ impl KeyMeta {
         anchor: Option<String>,
         tag: Option<String>,
     ) -> Option<Self> {
+        Self::with_alias(comment, value_absent, style, anchor, tag, None)
+    }
+
+    /// [`Self::with_properties`] for a key that may also be an alias (`*a : 1`, #5469), which
+    /// earns the key an entry on its own.
+    pub fn with_alias(
+        comment: Option<String>,
+        value_absent: bool,
+        style: &'static str,
+        anchor: Option<String>,
+        tag: Option<String>,
+        alias: Option<String>,
+    ) -> Option<Self> {
         let style = match style {
             "single" | "double" | KEY_STYLE_STRING => style,
             _ => "",
         };
-        if comment.is_none() && style.is_empty() && anchor.is_none() && tag.is_none() {
+        if comment.is_none()
+            && style.is_empty()
+            && anchor.is_none()
+            && tag.is_none()
+            && alias.is_none()
+        {
             return None;
         }
         Some(Self {
@@ -2982,6 +3003,7 @@ impl KeyMeta {
             style,
             anchor,
             tag,
+            alias,
         })
     }
 
@@ -2990,12 +3012,13 @@ impl KeyMeta {
     /// `None` once nothing is left to say.
     #[must_use]
     pub fn carried_over(&self, value_absent: bool, keep_style: bool) -> Option<Self> {
-        Self::with_properties(
+        Self::with_alias(
             self.comment.clone(),
             value_absent,
             if keep_style { self.style } else { "" },
             self.anchor.clone(),
             self.tag.clone(),
+            self.alias.clone(),
         )
     }
 
@@ -3190,6 +3213,23 @@ impl CommentTree {
     /// key carries none. Distinct from `field(key).meta().tag()`, the *value's* tag.
     pub fn key_tag(&self, key: &str) -> Option<&str> {
         self.key_meta(key).and_then(|k| k.tag.as_deref())
+    }
+
+    /// The anchor object field `key`'s *key* is an alias to (`*a : 1`, #5469), without the `*`,
+    /// or `None` if this isn't an `Object`, has no such key, or the key is no alias. Distinct
+    /// from `field(key).alias_name()`, which is the *value*'s alias.
+    pub fn key_alias(&self, key: &str) -> Option<&str> {
+        self.key_meta(key).and_then(|k| k.alias.as_deref())
+    }
+
+    /// Forget that object field `key`'s key is an alias, so it is written as its own text: the
+    /// soundness pass's answer to a key alias with no matching anchor before it (#5469).
+    pub fn clear_key_alias(&mut self, key: &str) {
+        if let Self::Object(_, _, keys) = self {
+            if let Some(meta) = keys.get_mut(key) {
+                meta.alias = None;
+            }
+        }
     }
 
     /// The same key-scoped comment as [`Self::key_comment`], but only when
@@ -3601,12 +3641,21 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             } else {
                 DocumentCursor::explicit_tag_of_non_alias(&field.key_cursor).map(str::to_string)
             };
-            if let Some(meta) = KeyMeta::with_properties(
+            // #5469: an alias used as the key, on the same terms as its anchor. The entries are
+            // keyed by text, so an alias that repeats an earlier key of this mapping (`&k key: 1`
+            // then `*k : 2`) would replace that key's entry, anchor and all; it is left plain.
+            let key_alias = if field_under_alias || key_comment_map.contains_key(&key) {
+                None
+            } else {
+                DocumentCursor::alias(&field.key_cursor).map(str::to_string)
+            };
+            if let Some(meta) = KeyMeta::with_alias(
                 key_comment,
                 value_absent,
                 field.key_cursor.style(),
                 key_anchor,
                 key_tag,
+                key_alias,
             ) {
                 key_comment_map.insert(key, meta);
             }
