@@ -5293,7 +5293,11 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     depth: usize,
 ) -> Result<OwnedValue, EvalError> {
     use crate::json::light::StandardJson;
-    guard_nesting_depth(depth)?;
+    // A value the evaluator built (a fold's accumulator, an embedded `[.]`), never an input
+    // document, so it is bounded as every other walk over a built value is: by
+    // `MAX_VALUE_TREE_DEPTH`, or by the native-stack floor where that is armed (#5554, #5876).
+    // The document ceiling (`MAX_NESTING_DEPTH`, 256) refused a value the output could print.
+    super::value::check_value_tree_depth(depth)?;
     Ok(match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
