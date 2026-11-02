@@ -150,13 +150,13 @@ class FetchTests(unittest.TestCase):
 
 
 class IssueTests(unittest.TestCase):
-    def fake_gh(self, issues, comment_times):
+    def fake_gh(self, issues, comment_times, closed=()):
         calls = []
 
         def gh(*args):
             calls.append(args)
             if args[:2] == ("issue", "list"):
-                return json.dumps(issues)
+                return json.dumps(list(closed) if "closed" in args else issues)
             if args[0] == "api":
                 return "\n".join(comment_times)
             return ""
@@ -176,6 +176,26 @@ class IssueTests(unittest.TestCase):
         create = next(a for a in calls if a[:2] == ("issue", "create"))
         self.assertIn(c.TITLE, create)
         self.assertIn(c.LABEL, create)
+
+    def test_a_recently_closed_issue_silences_the_report_for_two_weeks(self):
+        closed = [{"closedAt": self.stamp(days=3)}]
+        gh, calls = self.fake_gh([], [], closed=closed)
+        with mock.patch.object(c, "gh", gh), mock.patch("sys.stdout"):
+            c.file_issue("body", AS_OF)
+        self.assertFalse([a for a in calls if a[:2] in (("issue", "create"), ("label", "create"))])
+
+        old = [{"closedAt": self.stamp(days=20)}, {"closedAt": self.stamp(days=40)}]
+        gh, calls = self.fake_gh([], [], closed=old)
+        with mock.patch.object(c, "gh", gh):
+            c.file_issue("body", AS_OF)
+        self.assertTrue([a for a in calls if a[:2] == ("issue", "create")])
+
+    def test_the_newest_of_several_closed_issues_decides(self):
+        closed = [{"closedAt": self.stamp(days=40)}, {"closedAt": self.stamp(days=2)}]
+        gh, calls = self.fake_gh([], [], closed=closed)
+        with mock.patch.object(c, "gh", gh), mock.patch("sys.stdout"):
+            c.file_issue("body", AS_OF)
+        self.assertFalse([a for a in calls if a[:2] == ("issue", "create")])
 
     def test_an_open_issue_is_commented_on_at_most_once_a_day(self):
         gh, calls = self.fake_gh([{"number": 7}], [self.stamp(hours=6)])
@@ -219,6 +239,34 @@ class IssueTests(unittest.TestCase):
         self.assertTrue([a for a in calls if a[:2] == ("issue", "comment")])
 
 
+class RetryTests(unittest.TestCase):
+    def result(self, code, out="", err=""):
+        return mock.Mock(returncode=code, stdout=out, stderr=err)
+
+    def test_an_api_call_is_retried_and_the_later_answer_is_used(self):
+        runs = [self.result(1, err="HTTP 502"), self.result(1, err="HTTP 502"), self.result(0, out="{}")]
+        with mock.patch.object(c.subprocess, "run", side_effect=runs) as run, mock.patch.object(c.time, "sleep") as sleep:
+            self.assertEqual(c.gh("api", "x"), "{}")
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_it_gives_up_after_the_attempts_and_says_what_failed(self):
+        with mock.patch.object(c.subprocess, "run", return_value=self.result(1, err="HTTP 502")) as run, mock.patch.object(
+            c.time, "sleep"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 502"):
+                c.gh("api", "x")
+        self.assertEqual(run.call_count, c.ATTEMPTS)
+
+    def test_a_write_is_never_retried(self):
+        with mock.patch.object(c.subprocess, "run", return_value=self.result(1, err="boom")) as run, mock.patch.object(
+            c.time, "sleep"
+        ):
+            with self.assertRaises(RuntimeError):
+                c.gh("issue", "create", "--title", "t")
+        self.assertEqual(run.call_count, 1)
+
+
 class ReportTests(unittest.TestCase):
     def setUp(self):
         # `report` appends to the job summary of the workflow that runs these tests.
@@ -239,6 +287,21 @@ class ReportTests(unittest.TestCase):
             file_issue.assert_called_once()
         written = "".join(call.args[0] for call in out.write.call_args_list)
         self.assertIn(NOSTD, written)
+
+    def test_a_run_whose_jobs_cannot_be_read_is_left_out_not_fatal(self):
+        runs_ = [{"id": i, "created_at": "2026-11-02T00:00:00Z"} for i in range(40)]
+
+        def jobs(rid):
+            if rid == 1:
+                raise RuntimeError("gh api: HTTP 502")
+            return {NOSTD: 700.0 if rid < c.RECENT else 250.0}
+
+        with mock.patch.object(c, "fetch_runs", return_value=runs_), mock.patch.object(
+            c, "fetch_jobs", side_effect=jobs
+        ), mock.patch("sys.stdout") as out, mock.patch("sys.stderr") as err:
+            self.assertEqual(c.report(AS_OF, issue=False), 0)
+        self.assertIn(NOSTD, "".join(call.args[0] for call in out.write.call_args_list))
+        self.assertIn("left out", "".join(call.args[0] for call in err.write.call_args_list))
 
     def test_nothing_flagged_files_nothing(self):
         runs_ = [{"id": i, "created_at": "2026-11-02T00:00:00Z"} for i in range(40)]

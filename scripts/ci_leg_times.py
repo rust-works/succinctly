@@ -20,8 +20,9 @@ same `no-std` leg at 4.8 and 6.9 minutes, and a single run would flag that. A jo
 
 This is a report, not a required check: it exits 0 whatever it finds, and 2 only when the Actions API cannot be read (the workflow job is `continue-on-error`). The markdown goes to stdout
 (and to `$GITHUB_STEP_SUMMARY` in a workflow). With `--issue` a flag also opens one tracking issue
-labelled `ci-slowdown`, or adds a comment to the one that is open, at most one comment a day; the
-baseline follows a slowdown that is left alone, so the report stops by itself within a few days.
+labelled `ci-slowdown`, or adds a comment to the one that is open, at most one comment a day. Closing
+that issue is an acknowledgement: nothing new is filed for 14 days. The baseline follows a slowdown that is
+left alone, so the report stops by itself within a few days.
 
 `--as-of` ends the window at a past time, which replays a regression: the one this was written for
 is flagged within a day or two of 2026-10-25 (the replay is in #5867's PR).
@@ -33,6 +34,7 @@ import os
 import statistics
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -50,6 +52,8 @@ MIN_RECENT = 3  # recent samples a job needs
 MIN_SECONDS = 60  # a job whose baseline median is shorter is not worth a report
 
 COMMENT_GAP = timedelta(hours=20)  # between comments on the tracking issue
+SILENCE = timedelta(days=14)  # a tracking issue closed this recently is an acknowledgement
+ATTEMPTS = 3  # tries for one `gh api` call (a GitHub 5xx is not a finding)
 LABEL = "ci-slowdown"
 TITLE = "ci: a CI job got much slower than its recent level"
 
@@ -59,10 +63,15 @@ def parse_time(text):
 
 
 def gh(*args):
-    out = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
-    if out.returncode != 0:
-        raise RuntimeError(f"gh {' '.join(args)}: {out.stderr.strip()}")
-    return out.stdout
+    """`gh <args>`'s stdout. A read through the API is retried on failure: GitHub answers a 502 now and then."""
+    attempts = ATTEMPTS if args[:1] == ("api",) else 1
+    for attempt in range(attempts):
+        out = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+        if out.returncode == 0:
+            return out.stdout
+        if attempt + 1 < attempts:
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"gh {' '.join(args)}: {out.stderr.strip()}")
 
 
 def api(path, **params):
@@ -169,8 +178,15 @@ def report(as_of, issue):
     runs = fetch_runs(as_of)
     recent_runs, rest = runs[:RECENT], runs[RECENT:]
     baseline_runs = sample_evenly(rest, BASELINE_RUNS)
+    def jobs_of(run):
+        try:
+            return fetch_jobs(run["id"])
+        except RuntimeError as e:  # after the retries: leave this run out rather than lose the report
+            print(f"ci_leg_times: run {run['id']} left out: {e}", file=sys.stderr)
+            return {}
+
     with ThreadPoolExecutor(max_workers=8) as pool:  # each is a `gh api` round trip of a few seconds
-        jobs = list(pool.map(lambda r: fetch_jobs(r["id"]), recent_runs + baseline_runs))
+        jobs = list(pool.map(jobs_of, recent_runs + baseline_runs))
     recent, baseline = jobs[: len(recent_runs)], jobs[len(recent_runs) :]
     flags = analyse(recent, baseline)
     text = render(flags, len(recent_runs), len(baseline_runs), as_of)
@@ -190,6 +206,11 @@ def file_issue(text, as_of):
         gh("issue", "list", "--repo", REPO, "--label", LABEL, "--state", "open", "--json", "number,comments,title")
     )
     if not open_issues:
+        closed = gh("issue", "list", "--repo", REPO, "--label", LABEL, "--state", "closed", "--limit", "5", "--json", "closedAt").strip()
+        closed_at = [parse_time(i["closedAt"]) for i in json.loads(closed or "[]") if i.get("closedAt")]
+        if closed_at and as_of - max(closed_at) < SILENCE:
+            print(f"A `{LABEL}` issue was closed within {SILENCE.days} days: not filing another.")
+            return
         gh("label", "create", LABEL, "--repo", REPO, "--description", "a CI job got much slower", "--force")
         gh("issue", "create", "--repo", REPO, "--title", TITLE, "--label", LABEL, "--body", text)
         return
