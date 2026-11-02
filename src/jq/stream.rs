@@ -1284,30 +1284,54 @@ fn stream_yaml_key_node<W: core::fmt::Write, C: DocumentCursor>(
         out.write_char('*')?;
         return out.write_str(name);
     }
+    let style = cursor.style();
+    let plain_string = match key {
+        OwnedValue::String(s) if style.is_empty() => Some(s.as_str()),
+        _ => None,
+    };
+    // Whether a property has been written, so the next part needs a space before it. An empty
+    // plain key after a property is nothing at all (`- !!str`, `- &k`), as yq writes it.
+    let mut after_property = false;
     if let Some(anchor) = cursor.anchor() {
         out.write_char('&')?;
         out.write_str(anchor)?;
-        out.write_char(' ')?;
+        after_property = true;
     }
-    let style = cursor.style();
-    let plain_string = match key {
-        OwnedValue::String(s) if style.is_empty() => Some(s),
-        _ => None,
-    };
-    match cursor.explicit_tag_of_non_alias() {
+    // yq drops the non-specific `!` (`! z` is `- z`).
+    match cursor.explicit_tag_of_non_alias().filter(|tag| *tag != "!") {
         Some(tag) => {
+            if after_property {
+                out.write_char(' ')?;
+            }
             out.write_str(tag)?;
-            out.write_char(' ')?;
-            if let Some(s) = plain_string {
+            after_property = true;
+            // A plain key reads the same plain behind its tag. One that decodes to a line break
+            // (`? !!str a` / `` / `  b`) would not, so it takes the quoting below.
+            if let Some(s) = plain_string.filter(|s| !s.is_empty() && !has_line_break(s)) {
+                out.write_char(' ')?;
                 return out.write_str(s);
             }
         }
-        None if !cursor.canonicalize_numbers() && plain_string.is_some_and(|s| &**s == "<<") => {
+        None if !cursor.canonicalize_numbers() && plain_string == Some("<<") => {
+            if after_property {
+                out.write_char(' ')?;
+            }
             return out.write_str("!!merge <<");
         }
         None => {}
     }
+    if after_property {
+        if plain_string == Some("") {
+            return Ok(());
+        }
+        out.write_char(' ')?;
+    }
     stream_yaml_key_value(out, key, style)
+}
+
+/// Whether `s` holds a character a YAML plain scalar cannot carry as itself.
+fn has_line_break(s: &str) -> bool {
+    s.contains(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}'])
 }
 
 /// Stream a `DocumentFields`' keys (`keys_unsorted`) as YAML without an

@@ -259,16 +259,29 @@ pub(super) fn key_nodes<F: DocumentFields>(fields: &F, collapse: bool) -> Option
     let mut trees = Vec::new();
     for (key, cursor) in DistinctKeyCursors::new(fields, collapse) {
         let (_, tree) = node_pair_as(&cursor, false).ok()?;
+        let text = key.as_str();
         let merge = tree.meta().tag().is_none()
             && !cursor.canonicalize_numbers()
             && cursor.style().is_empty()
             && cursor.alias().is_none()
-            && key.as_str().is_some_and(|k| k == "<<");
-        trees.push(if merge {
-            CommentTree::Leaf(tree.meta().with_tag(Some("!!merge".to_string())))
-        } else {
-            tree
-        });
+            && text.as_deref() == Some("<<");
+        let mut meta = tree.meta().clone();
+        if merge {
+            meta = meta.with_tag(Some("!!merge".to_string()));
+        }
+        // yq drops the non-specific `!` (`! z` is `- z`).
+        if meta.tag() == Some("!") {
+            meta = meta.with_tag(None);
+        }
+        // A plain key that decodes to a line break (`? !!str a` / `` / `  b`) cannot be written
+        // as it was spelled, so the writer quotes it instead.
+        if text
+            .as_deref()
+            .is_some_and(|t| t.contains(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}']))
+        {
+            meta = meta.with_spelling(None);
+        }
+        trees.push(CommentTree::Leaf(meta));
     }
     Some(CommentTree::Array(NodeMeta::empty(), trees))
 }
@@ -542,8 +555,11 @@ fn trace_at_depth(
                         // The key node is reused as the entry's `key` string, so
                         // its `&anchor` rides along (`key: &k key`, #2598), and so
                         // does an alias used as the key (`key: *a`, #5469).
+                        // And its explicit tag (`!foo q`, #5469), as the `keys` writers give it.
                         let mut key_meta =
-                            NodeMeta::from_comment_and_style(None, tree.key_style(key));
+                            NodeMeta::from_comment_and_style(None, tree.key_style(key)).with_tag(
+                                tree.key_tag(key).filter(|t| *t != "!").map(str::to_string),
+                            );
                         key_meta.anchor = tree
                             .key_anchor(key)
                             .map(|name| AnchorMark::Declares(name.to_string()))

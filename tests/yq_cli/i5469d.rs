@@ -62,3 +62,60 @@ fn test_keys_of_a_json_document_gives_a_merge_spelled_key_no_tag_5469() -> Resul
     }
     Ok(())
 }
+
+/// The DOM routes a flag takes (`--arg`, `--sort-keys`, `-P`) give each key its tag too, for a
+/// document with no merge key or alias, which used to reach a route that dropped it (yq v4.53.3).
+#[test]
+fn test_keys_on_the_dom_routes_keeps_a_key_tag_5469() -> Result<()> {
+    for (args, want) in [
+        (&["--arg", "x", "y"][..], "- !foo q\n- &k !!str r\n"),
+        (&["--sort-keys"][..], "- !foo q\n- &k !!str r\n"),
+        (&["-P"][..], "- !foo q\n- &k r\n"),
+    ] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr("keys", "!foo q: 1\n&k !!str r: 2\n", args)?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{args:?}: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// The edges of a key's properties, each as yq v4.53.3 writes it on the streaming route: an empty
+/// tagged or anchored key is its properties alone, and the non-specific `!` is dropped.
+#[test]
+fn test_keys_writes_an_empty_or_non_specific_tagged_key_as_yq_5469() -> Result<()> {
+    for (doc, want) in [
+        ("!!str : 1\n", "- !!str\n"),
+        ("!foo : 1\n", "- !foo\n"),
+        ("&k : 1\n", "- &k\n"),
+        ("&k !!str : 1\n", "- &k !!str\n"),
+        ("{!!str : 1}\n", "- !!str\n"),
+        ("! z: 1\n", "- z\n"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr("keys", doc, &[])?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{doc:?}: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// A tagged plain key that decodes to a line break cannot be written as it was spelled. yq writes
+/// a literal block, as the `--arg` route here does; the streaming route and `--sort-keys`
+/// double-quote it (recorded in `limitations.md`). Both read back as the key `"a\nb"`, where writing the text raw did not.
+#[test]
+fn test_keys_quotes_a_tagged_key_holding_a_line_break_5469() -> Result<()> {
+    let doc = "? !!str a\n\n  b\n: 1\n";
+    for (args, want) in [
+        (&[][..], "- !!str \"a\\nb\"\n"),
+        (&["--arg", "x", "y"][..], "- !!str |-\n  a\n  b\n"),
+        (&["--sort-keys"][..], "- !!str \"a\\nb\"\n"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr("keys", doc, args)?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{args:?}: {stderr:?}");
+        let (reread, stderr, code) = run_yq_stdin_with_stderr(".", &stdout, &["-o=json", "-I0"])?;
+        assert_eq!(
+            (reread.as_str(), code),
+            ("[\"a\\nb\"]\n", 0),
+            "{args:?}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
