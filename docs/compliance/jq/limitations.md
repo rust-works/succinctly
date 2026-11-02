@@ -10260,6 +10260,32 @@ and the `jq-linux-arm64` release binaries):
   `timegm` rule, modelled on the macOS jq; jq on Linux converts such dates. This is unrelated to
   the zone source and is the same with any `TZ`.
 
+### `strftime`/`strflocaltime` localize through the C library where there is one (#5754)
+
+jq calls `setlocale(LC_ALL, "")`, so `strftime` and `strflocaltime` follow `LC_ALL`, `LC_TIME` and `LANG`.
+`succinctly jq` does the same for `%a %A %b %B %h %p %c %x %X %r`: the `locale-time` feature (on in `cli`) renders them through the C library's `strftime_l` in the locale `newlocale(LC_ALL_MASK, "")` resolves.
+The locale is resolved once per process, on the first conversion.
+jq's all-or-nothing rule holds: a locale that is not installed, or any one invalid category, leaves the whole process in C (`LANG=de_DE.UTF-8 LC_MESSAGES=xx_XX` prints `Thursday`).
+An unset, `C`, `POSIX` or `C.*` environment never leaves the evaluator's own English tables.
+A name that is not valid UTF-8 comes out as U+FFFD, as jq's output does.
+
+What differs from jq 1.7.1:
+
+- **No localization without the C library.**
+  Windows, a bare `std` build and `no_std` print the C locale's English names whatever the environment says.
+- **A localized result is only as localized as the host's libc.**
+  Another host's `de_DE` can spell a name differently (`Do` on glibc, `Do.` on macOS).
+  A jq built without `setlocale` support prints English where `succinctly jq` does not.
+- **The numeric specifiers, `%z`, `%Z` and `%s` are not localized.**
+  They stay in the evaluator, so the zone-label rules above are unchanged under any locale.
+  A locale layout that prints the zone itself (glibc's `en_GB` `%c` ends in `%Z`) takes the same zone labels.
+- **`%E*` and `%O*` follow the plain specifier.**
+  Under a locale whose C library has alternative era or digit forms (`ja_JP` on glibc) the plain form is printed.
+- **An empty result is not an error.**
+  jq raises `strftime/1: unknown system failure` for `%p` under `de_DE`, where the library prints nothing (macOS and glibc alike); this prints an empty string.
+- **`strptime` still reads English names.**
+  The locale's names and layouts for `strptime` are not read yet (#5754).
+
 ### A structurally malformed value doesn't abort the rest of a multi-value stream — no carve-out; this one is out of policy
 
 Real jq DOM-parses the whole input before evaluating anything, so a parse error on one

@@ -520,6 +520,7 @@ for the full list.
 | `regex`               | Regex builtins in jq (included in `cli`)                                                                                  |
 | `cli`                 | CLI tool (jq, yq, locate, generators)                                                                                     |
 | `local-zone`          | System local zone for jq `localtime`/`strflocaltime` via jiff (in `cli`; not Windows)                                     |
+| `locale-time`         | Localized `strftime`/`strflocaltime` names via libc `strftime_l` (in `cli`; Apple and Linux libc only; #5754)             |
 | `bench-runner`        | Unified benchmark runner (bench list/run)                                                                                 |
 | `large-tests`         | 1GB bitvector tests                                                                                                       |
 | `huge-tests`          | 5GB bitvector tests                                                                                                       |

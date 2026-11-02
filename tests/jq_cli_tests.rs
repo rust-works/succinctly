@@ -653,7 +653,9 @@ fn spawn_jq(args: &[&str], stdin_input: Option<&[u8]>) -> Result<(std::process::
     spawn_with_signal_retry(
         || {
             let mut command = Command::new(succinctly_bin());
-            command.arg("jq").args(args);
+            // jq follows `LC_ALL`/`LC_TIME`/`LANG` for `strftime`'s names (#5754); the
+            // expectations in this file are the C locale's, whatever the host's is.
+            command.arg("jq").args(args).env("LC_ALL", "C");
             command
         },
         stdin_input,
@@ -745,6 +747,7 @@ fn spawn_jq_with_env(
             command
                 .arg("jq")
                 .args(args)
+                .env("LC_ALL", "C") // the C locale's names (#5754); `env_key` may override it
                 .env(env_key, env_value.as_ref());
             command
         },

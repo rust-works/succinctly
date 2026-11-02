@@ -46,6 +46,7 @@ use super::document::{
 };
 use super::glob::yq_match_key;
 use super::local_zone::{self, LocalZone};
+use super::locale_time;
 use super::math;
 use super::slice::{self, SliceBounds};
 use super::tail_call::{
@@ -94581,8 +94582,10 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             // Only these specifiers read the zone's labels; `E`/`O` modifiers
-            // precede one of them, so the letters alone decide.
-            let labelled = fmt.bytes().any(|b| matches!(b, b'z' | b'Z' | b's'));
+            // precede one of them, so the letters alone decide. A locale's own
+            // `%c`/`%x`/`%X`/`%r` layout may also print the zone (#5754).
+            let labelled = fmt.bytes().any(|b| matches!(b, b'z' | b'Z' | b's'))
+                || locale_time::layouts_may_name_the_zone(&fmt);
             let (t, zone) =
                 match broken_down_time_fields::<W, S>(&value, optional, local, labelled, name) {
                     Ok(tz) => tz,
@@ -94704,9 +94707,39 @@ fn format_strftime(
         }
     };
 
+    // The process locale (#5754): when one is in effect, the specifiers that name a day,
+    // a month or an am/pm half, or lay out a whole date or time, are the C library's own
+    // for it (`locale_time`). Under C -- every default run -- `localized` is false and the
+    // tables above answer.
+    let localized = locale_time::is_active();
+    let tm = locale_time::TmFields {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        weekday,
+        yearday,
+        zone_offset,
+        zone_name,
+    };
+
     while let Some(c) = chars.next() {
         if c == '%' {
-            match chars.next() {
+            let spec = chars.next();
+            if let (
+                true,
+                Some(letter @ ('a' | 'A' | 'b' | 'B' | 'h' | 'p' | 'c' | 'x' | 'X' | 'r')),
+            ) = (localized, spec)
+            {
+                // A time the C library cannot hold (a year past `int`) gets the C rendering.
+                if let Some(text) = locale_time::render(&format!("%{letter}"), &tm) {
+                    result.push_str(&text);
+                    continue;
+                }
+            }
+            match spec {
                 Some('%') => result.push('%'),
                 Some('Y') => result.push_str(&format!("{year:04}")),
                 Some('y') => result.push_str(&format!("{:02}", year % 100)),

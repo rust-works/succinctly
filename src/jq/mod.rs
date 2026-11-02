@@ -92,6 +92,7 @@ mod json_fast;
 mod key_index;
 mod lazy;
 mod local_zone;
+mod locale_time;
 mod math;
 mod parse_message;
 mod parser;

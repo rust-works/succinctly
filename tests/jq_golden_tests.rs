@@ -172,7 +172,13 @@ fn run_case(case: &Case) -> Result<(), String> {
     let (output, _code) = spawn_with_signal_retry(
         || {
             let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-            command.arg("jq").args(&case.args).arg(&case.filter);
+            // The fixtures are jq's C-locale answers; `strftime`'s names follow the host's
+            // locale otherwise (#5754).
+            command
+                .arg("jq")
+                .args(&case.args)
+                .arg(&case.filter)
+                .env("LC_ALL", "C");
             command
         },
         Some(case.input.as_bytes()),
