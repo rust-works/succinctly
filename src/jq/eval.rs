@@ -118486,6 +118486,32 @@ mod tests {
         ));
     }
 
+    /// #5554: `eval_each_owned`'s bridge peels a lone text stage the same way, and hands the sink's
+    /// demand back. The CLI no longer reaches it below the native-stack floor, so this thread,
+    /// which has not armed the floor, is where it refuses at 385 levels.
+    #[test]
+    fn test_streaming_owned_bridge_renders_a_lone_text_stage_past_the_reindex_limit_5554() {
+        let mut deep = OwnedValue::Int(0);
+        for _ in 0..crate::jq::MAX_VALUE_TREE_DEPTH + 16 {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        let expr = parse("tojson").unwrap();
+        for demand in [Demand::Continue, Demand::Stop] {
+            let mut out = Vec::new();
+            let flow =
+                eval_each_owned::<JqSemantics>(&expr, &deep, false, Reentry::REBUILT, &mut |v| {
+                    out.push(v);
+                    demand
+                });
+            let lengths: Vec<_> = out.iter().map(|v| v.to_json().len()).collect();
+            assert_eq!(lengths, [533 + 2], "{demand:?}");
+            match demand {
+                Demand::Continue => assert!(matches!(flow, Flow::Exhausted)),
+                Demand::Stop => assert!(matches!(flow, Flow::Stopped { pending: None })),
+            }
+        }
+    }
+
     /// #5554: the text peel asks only after a depth refusal, in jq mode, and only for a first
     /// stage that renders its input, reading a leading `(a | b)` as `a | b`.
     #[test]
