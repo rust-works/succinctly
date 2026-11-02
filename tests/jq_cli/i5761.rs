@@ -294,6 +294,10 @@ fn test_compound_store_with_a_container_operand_keeps_its_results_5761() -> Resu
         ("{\"a\":\"s\"} | try (.a -= {}) catch .", "\"string (\\\"s\\\") and object ({}) cannot be subtracted\""),
         ("{\"a\":[1]} | .a += ([2],[3])", "{\"a\":[1,2]}\n{\"a\":[1,3]}"),
         ("{\"a\":[1]} | .a += [2] | .a[1] = 7", "{\"a\":[1,7]}"),
+        // A truthy left side keeps itself; the operand is still evaluated, and may hold falsy members.
+        ("{\"a\":[1]} | .a //= [9,{\"b\":null}]", "{\"a\":[1]}"),
+        ("{\"a\":[null,false]} | .a += [null,false]", "{\"a\":[null,false,null,false]}"),
+        ("{\"a\":[1]} | try ([path(.a += [2])]) catch .", "\"Invalid path expression near attempt to access element 0 of [{\\\"a\\\":[1,2]},[]]\""),
         ("[nan] as $a | {\"x\":[nan]} | .x -= $a | .x", "[null]"),
         ("{\"a\":{\"x\":{\"p\":1}}} | .a *= {\"x\":{\"q\":2}}", "{\"a\":{\"x\":{\"p\":1,\"q\":2}}}"),
         ("{\"a\":null} | .a //= [1,{\"b\":2}]", "{\"a\":[1,{\"b\":2}]}"),
