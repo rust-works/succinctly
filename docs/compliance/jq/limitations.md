@@ -7274,13 +7274,14 @@ A value handed to the CLI's output prints as jq prints it, 256 levels and then t
 Past the floor the walk refuses with `nesting depth exceeds limit of the native stack` at exit 5, uncatchable, where jq has long since segfaulted.
 On the 256 MiB release thread the re-index bridge refuses between about 697,000 and 699,500 levels (Apple Silicon); a walk with heavier frames (`walk(.)`, `flatten`) refuses sooner, and a debug build or x86_64 at depths of their own.
 The text stage of #5598/#5743 stays as the fallback there: a pipe whose first stage only renders its input as text (`tojson`, `tostring`, `"\(.)"`) answers from the tree even past the floor.
-Two costs remain.
-A fold whose step has no owned door (`reduce range(N) as $i (0; [.])`, `{a: .}`) re-indexes the whole accumulator on every step, so it is quadratic where jq is linear; it used to refuse at 385 levels instead.
-`.[0] = .` has an owned door and stays linear.
+One cost remains.
+A fold whose step is a constructor around the accumulator (`[.]`, `[., <closed>…]`, `{k: .}`, with every other member closed) builds it on the moved state, so it is linear in the number of steps, as jq's is ([#5875](https://github.com/rust-works/succinctly/issues/5875)).
+Before that it re-indexed the whole accumulator on every step and was quadratic past 384 levels (17 s at N = 40,000, against 0.03 s in jq); a step of any other shape that constructs from `.` still is.
+`.[0] = .` has an owned door too and is linear.
 `paths`, `tostream` and `[path(..)]` over a value hundreds of thousands of levels deep build output quadratic in its depth, as jq's would, and need the memory for it.
 `succinctly yq` still refuses a value past 384 levels: its emitters were tuned against that bound and are not covered by the floor yet.
 
-**Dropping.** A fold whose step has an owned door (`.[0] = .`) shares the accumulator instead of copying it, so the value it builds can be millions of levels deep (`reduce range(10000000) as $i ([]; .[0] = .) | length`).
+**Dropping.** A fold whose step has an owned door (`.[0] = .`, `[.]`, `{k: .}`) shares the accumulator instead of copying it, so the value it builds can be millions of levels deep (`reduce range(10000000) as $i ([]; .[0] = .) | length`).
 jq 1.7.1 segfaults on that program from a few hundred thousand levels (between 150,000 and 200,000 on macOS with an 8 MB stack); succinctly prints `1` ([#5782](https://github.com/rust-works/succinctly/issues/5782)).
 The divergence is deliberate (ADR-0018: a reference that takes the process down is not matched): past 256 nested container drops, dropping such a value is iterative, on a heap worklist, so the native stack it needs is bounded.
 
