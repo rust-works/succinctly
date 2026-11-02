@@ -55578,6 +55578,36 @@ mod tests {
         }
     }
 
+    /// #5816: `ltrimstr`, `rtrimstr`, `tostring` and `. + "lit"` of an owned string step to their
+    /// string without writing it out and indexing it again, as a lone stage and as the head of a
+    /// pipe whose rest then runs on the string. `ascii_downcase` makes the string an owned value
+    /// and is the one crossing each row still pays, so a row is pinned to 1: a lost door shows as 2.
+    #[test]
+    fn test_string_stage_doors_need_no_second_reindex_5816() {
+        let doc = r#"{"s":"H\u00e9llo"}"#;
+        for (query, want) in [
+            // The lone stage: `eval_each_owned_front_doors`.
+            (r#".s | ascii_downcase | rtrimstr("o")"#, "\"h\u{e9}ll\""),
+            (r#".s | ascii_downcase | ltrimstr("h")"#, "\"\u{e9}llo\""),
+            (r#".s | ascii_downcase | . + "x""#, "\"h\u{e9}llox\""),
+            (".s | ascii_downcase | tostring", "\"h\u{e9}llo\""),
+            // The head of a pipe: the peel.
+            (r#".s | ascii_downcase | ltrimstr("h") | length"#, "4"),
+            (r#".s | ascii_downcase | rtrimstr("o") | length"#, "4"),
+            (".s | ascii_downcase | tostring | length", "5"),
+            (r#".s | ascii_downcase | . + "x" | length"#, "6"),
+            (
+                r#".s | ascii_downcase | ltrimstr("h") | startswith("\u00e9")"#,
+                "true",
+            ),
+            (r#".s | ascii_downcase | ltrimstr("h") | index("l")"#, "2"),
+        ] {
+            let (out, reindexes) = outputs_and_reindexes(doc, query);
+            assert_eq!(out, [want], "{query}");
+            assert_eq!(reindexes, 1, "{query}: the string stage door was lost");
+        }
+    }
+
     /// #5816: `test`, `index`, `rindex` and `inside` of a string literal read the owned string, from
     /// both owned entries and from an operand, so none of them writes it out and indexes it again.
     /// `ascii_downcase` makes the string an owned value and is the one crossing each row still
