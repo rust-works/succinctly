@@ -1453,7 +1453,7 @@ test bench_name ... bench:  1,234 ns/iter (+/- 56)
 - **Platform**: CPU model and OS version
 - **Tool versions**: For comparison benchmarks (jq-1.6, yq v4.48.1)
 - **Build flags**: Any special RUSTFLAGS or features, and — for an A/B comparing two binaries —
-  which release profile built each side (see [A/B Benchmarking Method § 9](#a-b-benchmarking-method),
+  which release profile built each side (see [A/B Benchmarking Method § 9](#ab-benchmarking-method),
   #1587). Since #2603 a plain `cargo build --release` is `codegen-units=1`, `lto="fat"`; a binary
   built from a tree older than that is default `codegen-units=16`, which can add its own
   ±10-27% independent of the change being measured, so say which.

@@ -1040,7 +1040,7 @@ End-to-end benchmarks on ARM (M1 Max) showed **no measurable improvement** and s
 
 **Root Cause Analysis:** SIMD overhead dominates for typical YAML values (10-40 bytes).
 
-See [Tuning Opportunities](#unquoted-structural-scanning-tuning) below for proposed fixes.
+See [Tuning Opportunities](#proposed-tuning-opportunities) below for proposed fixes.
 
 #### AMD Ryzen 9 7950X (x86_64 AVX2/AVX-512) - Baseline (2026-01-17)
 
