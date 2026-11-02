@@ -31,7 +31,7 @@ mod imp {
     use alloc::vec::Vec;
     use std::sync::OnceLock;
 
-    use super::TmFields;
+    use super::{TimeNames, TmFields};
 
     /// A `locale_t` that is never freed, so it can be shared by every thread.
     struct Handle(libc::locale_t);
@@ -86,6 +86,54 @@ mod imp {
 
     pub(super) fn is_active() -> bool {
         LOCALE.get_or_init(resolve).is_some()
+    }
+
+    static NAMES: OnceLock<Option<TimeNames>> = OnceLock::new();
+
+    /// The locale's day, month and am/pm names, rendered by `strftime_l` -- the same source
+    /// `strftime` prints from, so a name `strftime` writes is one `strptime` reads. `None`
+    /// under C.
+    pub(super) fn names() -> Option<&'static TimeNames> {
+        NAMES.get_or_init(build_names).as_ref()
+    }
+
+    fn build_names() -> Option<TimeNames> {
+        LOCALE.get_or_init(resolve).as_ref()?;
+        // Only the field a specifier reads matters; the rest is a fixed ordinary date.
+        let at = |month: i64, weekday: i64, hour: i64| TmFields {
+            year: 2015,
+            month,
+            day: 1,
+            hour,
+            minute: 0,
+            second: 0,
+            weekday,
+            yearday: 0,
+            zone_offset: 0,
+            zone_name: "UTC",
+        };
+        let weekdays = |spec: &str| -> Option<[String; 7]> {
+            let mut out: [String; 7] = Default::default();
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = render(spec, &at(1, i as i64, 0))?;
+            }
+            Some(out)
+        };
+        let months = |spec: &str| -> Option<[String; 12]> {
+            let mut out: [String; 12] = Default::default();
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = render(spec, &at(i as i64 + 1, 0, 0))?;
+            }
+            Some(out)
+        };
+        Some(TimeNames {
+            weekday_full: weekdays("%A")?,
+            weekday_abbr: weekdays("%a")?,
+            month_full: months("%B")?,
+            month_abbr: months("%b")?,
+            am: render("%p", &at(1, 0, 0))?,
+            pm: render("%p", &at(1, 0, 12))?,
+        })
     }
 
     /// Render `spec` (for example `%A` or `%Ec`) with `strftime_l`. `None` when no
@@ -144,13 +192,17 @@ mod imp {
 mod imp {
     use alloc::string::String;
 
-    use super::TmFields;
+    use super::{TimeNames, TmFields};
 
     pub(super) fn is_active() -> bool {
         false
     }
 
     pub(super) fn render(_spec: &str, _tm: &TmFields<'_>) -> Option<String> {
+        None
+    }
+
+    pub(super) fn names() -> Option<&'static TimeNames> {
         None
     }
 }
@@ -176,6 +228,38 @@ pub(crate) struct TmFields<'a> {
     pub(crate) yearday: i64,
     pub(crate) zone_offset: i64,
     pub(crate) zone_name: &'a str,
+}
+
+/// The names `strptime` reads, in the process locale (#5754).
+// The C-locale stub never builds one; only the `strftime_l` backend does.
+#[cfg_attr(
+    not(all(
+        feature = "locale-time",
+        any(target_vendor = "apple", target_os = "linux")
+    )),
+    allow(dead_code)
+)]
+pub(crate) struct TimeNames {
+    /// Sunday first, as `tm_wday` counts.
+    pub(crate) weekday_full: [alloc::string::String; 7],
+    pub(crate) weekday_abbr: [alloc::string::String; 7],
+    /// January first.
+    pub(crate) month_full: [alloc::string::String; 12],
+    pub(crate) month_abbr: [alloc::string::String; 12],
+    /// What `%p` prints before and after noon. Either can be empty: macOS prints nothing for
+    /// `%p` under `de_DE`, and its `strptime` then reads the empty string as the am marker.
+    pub(crate) am: alloc::string::String,
+    pub(crate) pm: alloc::string::String,
+}
+
+/// The locale's day, month and am/pm names, or `None` when `strptime` should read the
+/// evaluator's own English ones (a C locale, no `locale-time`, and this crate's unit tests).
+pub(crate) fn names() -> Option<&'static TimeNames> {
+    if cfg!(test) {
+        None
+    } else {
+        imp::names()
+    }
 }
 
 /// Whether the locale's `%c`/`%x`/`%X`/`%r` layouts can print the zone (`%Z`, `%z`): glibc's
