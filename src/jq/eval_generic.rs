@@ -2417,6 +2417,112 @@ fn cursor_is_null<V: DocumentValue>(value: &V, cursor: Option<&V::Cursor>) -> bo
 /// checking defensively costs nothing and avoids relying on that
 /// invariant). `as_array`/`as_object` are last since every scalar arm above
 /// already excludes them.
+/// A builtin yq applies to strings only, by the wording of its refusal (#5836).
+#[derive(Clone, Copy)]
+enum YqStringOp {
+    Split,
+    Substitute,
+    Match,
+    ChangeCase,
+    Trim,
+    Base64,
+    Uri,
+}
+
+impl YqStringOp {
+    fn of_builtin(builtin: &Builtin) -> Option<Self> {
+        Some(match builtin {
+            Builtin::Split(_) | Builtin::SplitRegex(..) => Self::Split,
+            Builtin::Sub(..) | Builtin::SubFlags(..) => Self::Substitute,
+            Builtin::Test(_)
+            | Builtin::TestFlags(..)
+            | Builtin::Match(_)
+            | Builtin::MatchFlags(..)
+            | Builtin::Capture(_)
+            | Builtin::CaptureFlags(..) => Self::Match,
+            Builtin::AsciiUpcase | Builtin::AsciiDowncase => Self::ChangeCase,
+            Builtin::Trim => Self::Trim,
+            _ => return None,
+        })
+    }
+
+    fn of_format(format: &FormatType) -> Option<Self> {
+        match format {
+            FormatType::Base64 => Some(Self::Base64),
+            // yq's `@sh` refuses with its `@uri` wording.
+            FormatType::Uri | FormatType::Sh => Some(Self::Uri),
+            _ => None,
+        }
+    }
+
+    /// yq v4.53.3's error for an input tagged `tag`.
+    fn refusal(self, tag: &str) -> String {
+        const HINT: &str = "Hint: Most often you'll want to use '|=' over '=' for this operation";
+        match self {
+            Self::Split => format!("cannot split {tag}, can only split strings"),
+            Self::Substitute => {
+                format!("cannot substitute with {tag}, can only substitute strings. {HINT}")
+            }
+            Self::Match => format!("cannot match with {tag}, can only match strings. {HINT}"),
+            Self::ChangeCase => {
+                format!("cannot change case with {tag}, can only operate on strings. ")
+            }
+            Self::Trim => format!("cannot trim {tag}, can only operate on strings. "),
+            Self::Base64 => format!("cannot encode {tag} as base64, can only operate on strings"),
+            Self::Uri => format!(
+                "cannot encode {tag} as URI, can only operate on strings. Please first pipe \
+                 through another encoding operator to convert the value to a string"
+            ),
+        }
+    }
+}
+
+/// The tag yq names when a string builtin refuses this input, or `None` when it accepts it: the
+/// node's tag (`!!merge`, `!!binary`, `!!int`, a custom `!foo`) unless the type yq reads from it is
+/// a string. A custom tag reads as the value's own type, so `!foo x` is a string and `!foo 5` is
+/// refused as `!foo`. An alias node is left to the builtin.
+fn yq_string_input_tag<V: DocumentValue>(
+    op: YqStringOp,
+    value: &V,
+    cursor: Option<V::Cursor>,
+) -> Option<String> {
+    let named = yq_type_tag(value, cursor);
+    if named.is_empty() {
+        return None;
+    }
+    // yq's `split` passes a null through (`null | split(",")` is nothing).
+    if matches!(op, YqStringOp::Split) && named == "!!null" {
+        return None;
+    }
+    let read_as = if named.starts_with("!!") {
+        named.as_str()
+    } else {
+        document_value_type_tag(value)
+    };
+    (read_as != "!!str").then_some(named)
+}
+
+/// yq's refusal of a string builtin on a non-string input (#5836), or `None` to evaluate it. A bad
+/// pattern or flag is reported first, as yq checks those before the input: the builtin is run once
+/// on the empty string, and its error, if it has one, is the answer.
+fn yq_string_op_refusal<S: EvalSemantics, V: DocumentValue>(
+    op: YqStringOp,
+    expr: &Expr,
+    value: &V,
+    cursor: Option<V::Cursor>,
+) -> Option<GenericResult<V>> {
+    let tag = yq_string_input_tag(op, value, cursor)?;
+    if let GenericResult::Error(e) = eval_on_owned::<S, V>(
+        expr,
+        OwnedValue::String(String::new().into()),
+        false,
+        Reentry::REBUILT,
+    ) {
+        return Some(GenericResult::Error(e));
+    }
+    Some(GenericResult::Error(EvalError::new(op.refusal(&tag))))
+}
+
 fn document_value_type_tag<V: DocumentValue>(value: &V) -> &'static str {
     if value.is_null() {
         "!!null"
@@ -2518,18 +2624,43 @@ fn yq_type_tag<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> String
         // `!!null`, `! [a]` is `!!seq`. Reporting it as `!` was already wrong
         // for plain navigation (`.[0] | tag`); a selector that hands the node
         // on (#3690) made it visible one step further.
-        if let Some(tag) = c
-            .explicit_tag()
-            .filter(|tag| *tag != "!")
-            .map(str::to_string)
-        {
-            return tag;
+        if let Some(tag) = c.explicit_tag().filter(|tag| *tag != "!") {
+            // A verbatim tag is reported as what it spells, a core one in its `!!` form
+            // (`!<tag:yaml.org,2002:binary>` is `!!binary`, `!<!foo>` is `!foo`), as yq reports it
+            // (#5836).
+            return match tag
+                .strip_prefix("!<")
+                .and_then(|rest| rest.strip_suffix('>'))
+            {
+                Some(spelled) => match spelled.strip_prefix("tag:yaml.org,2002:") {
+                    Some(core) => format!("!!{core}"),
+                    None => spelled.to_string(),
+                },
+                None => tag.to_string(),
+            };
         }
         if let Some(tag) = plain_merge_tag(&c, value) {
             return tag.to_string();
         }
+        if plain_timestamp(&c, value) {
+            return "!!timestamp".to_string();
+        }
     }
     document_value_type_tag(value).to_string()
+}
+
+/// Whether `cursor` is a plain scalar go-yaml resolves to `!!timestamp` (`2001-12-14`,
+/// `2001-12-14T21:59:43.10-05:00`), which yq reports as its tag and its string builtins refuse
+/// (#5836). A quoted date and a JSON string are strings. The first byte is checked before the
+/// node's style, so a string that cannot be a date costs one compare.
+fn plain_timestamp<C: DocumentCursor, V: DocumentValue>(cursor: &C, value: &V) -> bool {
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    text.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        && !cursor.canonicalize_numbers()
+        && cursor.style().is_empty()
+        && crate::yaml::go_yaml_resolved_tag(&text) == "!!timestamp"
 }
 
 /// `!!merge` for a plain `<<` scalar, the tag YAML resolves it to wherever it sits, value or key,
@@ -14645,6 +14776,20 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // `eval_format`) -- found by code review to have been missed by
         // this issue's first pass, which fixed `eval_format` without
         // noticing it isn't on the path ordinary CLI usage takes.
+        // #5836: yq's `@base64`, `@uri` and `@sh` refuse an input whose tag is not `!!str`.
+        Expr::Format(format_type)
+            if S::TAG == EvalTag::Yq && YqStringOp::of_format(format_type).is_some() =>
+        {
+            let op = YqStringOp::of_format(format_type).unwrap_or(YqStringOp::Uri);
+            match yq_string_op_refusal::<S, V>(op, expr, &value, cursor) {
+                Some(refusal) => refusal,
+                None => format_result::<S, _>(
+                    format_type,
+                    &owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional),
+                    optional,
+                ),
+            }
+        }
         Expr::Format(format_type) => format_result::<S, _>(
             format_type,
             &owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional),
@@ -34682,6 +34827,16 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    // #5836: yq's string builtins refuse an input whose tag is not `!!str`.
+    if S::TAG == EvalTag::Yq {
+        if let Some(op) = YqStringOp::of_builtin(builtin) {
+            let whole =
+                whole.map_or_else(|| Cow::Owned(Expr::Builtin(builtin.clone())), Cow::Borrowed);
+            if let Some(refusal) = yq_string_op_refusal::<S, V>(op, &whole, &value, cursor) {
+                return refusal;
+            }
+        }
+    }
     // #2471 (gate reason 1 of spine 2416): a map-family body that reads path
     // context is evaluated once per member, at the member's own position.
     // Gated on `needs_path_context` so an ordinary `map_values(.+1)` never

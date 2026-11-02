@@ -1933,9 +1933,16 @@ than performing an actual regex split; arity 3+ is accepted and discarded (parse
 matching `sub`'s own arity 4+ handling above. The 1-arg `split(s)` form is unaffected — its
 own argument really is evaluated and used (`split(error("boom"))` still raises, confirmed
 live) — and `succinctly jq`'s `split/2` keeps its real jq-modeled regex-split behavior
-unchanged in jq mode. Non-string-input error wording (`array (...) cannot be matched, as it
-is not a string` vs. real yq's `cannot split !!seq, can only split strings`) is a separate,
-pre-existing gap unrelated to arity, not addressed here.
+unchanged in jq mode. A non-string input is refused in yq's words, `cannot split !!seq, can only
+split strings` (#5836, see below).
+
+### String builtins refuse an input whose tag is not `!!str` (#5836)
+
+yq's `split`, `sub`, `test`, `match`, `capture`, `upcase`, `downcase`, `trim`, `@base64`, `@uri` and `@sh` refuse an input whose tag is not `!!str`, naming the tag, and `succinctly yq` does the same with yq's wording (`cannot change case with !!int, can only operate on strings. `, `cannot encode !!seq as URI, ...`, which `@sh` uses too).
+A number, a bool, a null, a container, a plain date (`!!timestamp`), a plain `<<` (`!!merge`) and an explicit core tag on a string (`!!binary aGk=`, `!!float "x"`) are refused; a custom tag reads as its value's own type, so `!foo x` is a string and `!foo 5` is refused as `!foo`.
+A bad pattern or flag is still reported first, as yq checks those before the input, and `split` passes a null through.
+`tag` and `type` report a verbatim tag as what it spells, a core one in its `!!` form (`!<tag:yaml.org,2002:binary>` is `!!binary`, `!<!foo>` is `!foo`), as yq does.
+An alias node keeps its target's value, where yq applies the builtin to the alias's name (`b: *x` with `upcase` is `X`).
 
 ### Regex patterns are read as Go's `regexp` reads them (#5374, #5388)
 
@@ -3755,7 +3762,7 @@ Two integers compare as integers, and a decimal spelling (`007`, `+5`, `1e3`) pa
   an unquoted document value whose text no layout reads (`2001-01-01 10:00:00`) is a time for yq, which raises on it, and a plain string is `!!str not yet supported for comparison` against a `!!timestamp` on its right, where this answers by string order;
   the error for a right operand names its text as written in yq and as the value reads here, so an empty value (`key:`) is `parsing time ""` there and `"null"` here, a `~` is `"~"` and `"null"`, `True` is `"True"` and `"true"`, and a literal `007` in the filter is `"007"` and `"7"`;
   a number past int64 (`100000000000000000000`) raises `strconv.ParseInt: ... value out of range` in yq and a time error here;
-  and the type tag in a container error reads `!!str` here for a document date (`tag` answers `!!str` for one too).
+  and the type tag in a container error reads `!!str` here for a document date, which `tag` reports as `!!timestamp` (#5836).
 - A signed prefixed integer (`-0x10`), `1_000` and `0b101` read as strings here, so they raise the kind error instead of comparing or raising `ParseFloat`.
 - `sort`, `min` and `max` over an array holding a prefixed integer and a float use their own comparators here: yq's `min`/`max` raise the same `ParseFloat` error, and its `sort` panics with it, where this orders them by value.
 
