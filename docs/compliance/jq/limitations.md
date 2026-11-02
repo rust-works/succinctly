@@ -10283,8 +10283,11 @@ What differs from jq 1.7.1:
   Under a locale whose C library has alternative era or digit forms (`ja_JP` on glibc) the plain form is printed.
 - **An empty result is not an error.**
   jq raises `strftime/1: unknown system failure` for `%p` under `de_DE`, where the library prints nothing (macOS and glibc alike); this prints an empty string.
-- **`strptime` still reads English names.**
-  The locale's names and layouts for `strptime` are not read yet (#5754).
+- **`strptime` reads the locale's names, not its layouts.**
+  `%a %A %b %B %h %p` take the names `strftime` prints in the process locale: a day's or month's full name, else its abbreviation, ASCII-case-insensitively and every other character exactly (`märz` matches `März`, `MÄRZ` does not).
+  `%c %x %X %r` are not read by `strptime` in any locale (jq reads them).
+  An empty am marker matches nothing and reads as am, as on macOS under `de_DE`, where `%p` prints nothing and `PM` is left over.
+  `%a`, `%A` and `%p` no longer read any run of letters: `Xyz`, `Thurs`, `Th` and `PMX` are no match, as in jq.
 
 ### A structurally malformed value doesn't abort the rest of a multi-value stream — no carve-out; this one is out of policy
 
