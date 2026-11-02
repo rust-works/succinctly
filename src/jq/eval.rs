@@ -38379,12 +38379,12 @@ fn assign_one<S: EvalSemantics>(
         AssignKind::Compound(op) => Some(Expr::Arithmetic {
             op,
             left: Box::new(Expr::Identity),
-            right: Box::new(owned_to_expr(&value)),
+            right: Box::new(owned_operand_to_expr::<S>(&value)),
             settle: ArithSettleMemo::default(),
         }),
         AssignKind::Alt => Some(Expr::Alternative(
             Box::new(Expr::Identity),
-            Box::new(owned_to_expr(&value)),
+            Box::new(owned_operand_to_expr::<S>(&value)),
         )),
     };
     if streaming {
@@ -79015,6 +79015,45 @@ pub(crate) fn owned_index_key_to_expr<S: EvalSemantics>(key: &OwnedValue) -> Exp
             fold_share: false,
         })),
         _ => owned_to_expr(key),
+    }
+}
+
+/// [`owned_to_expr`] for the right-hand side of `op=` / `//=` (#5761). In jq mode a
+/// container operand rides a by-value marker ([`Tracked::fold_share`]: one handle the in-place
+/// step may store) instead of being rebuilt from literals, so `null | . += $a | . == $a` stores
+/// `$a`'s own storage as jq does, and a NaN inside it keeps its identity. It is by-value on
+/// purpose: a plain [`Origin::Untracked`] marker sets `escaped` in [`closed_expr_to_owned`],
+/// which takes `. + <marker>` off the owned fast path (`.[] += [0]` measured +64%). A scalar
+/// has no storage to share and stays a literal; yq mode keeps the rebuilt form.
+fn owned_operand_to_expr<S: EvalSemantics>(value: &OwnedValue) -> Expr {
+    match value {
+        OwnedValue::Array(_) | OwnedValue::Object(_) if S::TAG != EvalTag::Yq => {
+            // The rebuild below refused an operand nested past the ceiling (#5526) by panicking
+            // into the refusal net; the marker has no such walk, so keep the refusal.
+            assert_operand_tree_depth(value, 0);
+            Expr::TrackedVar(Rc::new(Tracked {
+                value: value.clone(),
+                origin: Origin::Untracked,
+                node: None,
+                fold_share: true,
+            }))
+        }
+        _ => owned_to_expr(value),
+    }
+}
+
+/// [`assert_value_tree_depth`] over every level of `value`: the refusal [`owned_to_expr`]'s
+/// rebuild raised on the way, for an operand that is spliced as a marker instead (#5761).
+fn assert_operand_tree_depth(value: &OwnedValue, depth: usize) {
+    assert_value_tree_depth(depth);
+    match value {
+        OwnedValue::Array(arr) => arr
+            .iter()
+            .for_each(|v| assert_operand_tree_depth(v, depth + 1)),
+        OwnedValue::Object(obj) => obj
+            .iter()
+            .for_each(|(_, v)| assert_operand_tree_depth(v, depth + 1)),
+        _ => {}
     }
 }
 
