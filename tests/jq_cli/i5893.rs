@@ -1,7 +1,7 @@
 //! #5893: a constructor fold step that reads a scalar off the accumulator (`[., length]`,
 //! `{a: ., n: length}`, `{(.s): .}`) is built on the moved accumulator like `[.]` is (#5875), so a
-//! deep fold of it is linear. A member that reads a container out of the accumulator (`[., .a]`) is
-//! answered from a rebuilt copy of it: right, and still quadratic. Every expected string was captured from jq 1.7.1
+//! deep fold of it is linear. A member that reads a container out of the accumulator (`[., .a]`), a
+//! float or `tojson` is answered from a rebuilt copy of it: right, and still quadratic. Every expected string was captured from jq 1.7.1
 //! (`/usr/bin/jq`).
 
 use anyhow::Result;
@@ -48,6 +48,14 @@ fn a_state_reading_constructor_fold_past_the_old_quadratic_wall_answers_5893() -
         (
             "reduce range(300000) as $i (0; {a: ., n: length}) | .n",
             "2\n",
+        ),
+        (
+            r#"reduce range(300000) as $i ({"n":1}; {p: ., n: (.n + 1)}) | .n"#,
+            "300001\n",
+        ),
+        (
+            r#"reduce range(300000) as $i ({"s":"k"}; {(.s): ., s: .s}) | .s"#,
+            "\"k\"\n",
         ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;

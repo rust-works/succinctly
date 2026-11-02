@@ -80531,11 +80531,13 @@ pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue
 /// Exactly one member is `.` itself (a second would need a copy of a value that is already `N`
 /// levels deep). Every other element, key and value is settled by [`owned_assign_operand`] against
 /// the state before it is moved: a closed one (one output, no read of `.`, no effect), or one that
-/// reads a scalar off the state (`length`, `type`, `.n + 1`, #5893). A member that reads a
-/// *container* out of the state (`.a`, `.[0]`) is settled from a rebuilt copy of the state, which is
-/// right and costs `O(state)` a step, so a fold of those is still quadratic once the nest is deep.
-/// `Err(state)` for anything the operand helper declines (one that raises, or yields other than one
-/// value), with the state untouched, and the evaluator answers as before.
+/// reads scalars off the state (`length`, `type`, a field, integer `+`, `-`, `*` such as `.n + 1`,
+/// #5893). A member that reads a container (`.a`, `.[0]`) is answered from a rebuilt copy of the
+/// state, which is right and costs `O(state)` a step; a float (`.n / 2`) or `tojson` is the same,
+/// so a fold of those is quadratic past 384 levels as before. A member the helper evaluates and
+/// then declines (it raises, or yields other than one value) costs that evaluation again on the
+/// bridge the step falls back to, with the state untouched. A member that is not
+/// [`owned_state_expr_shape`] is never evaluated here, so no effect runs twice.
 /// jq mode only (yq's constructors carry presentation, and its guard past 500 levels is a separate
 /// piece of work, #5554), and not while the #2889 embed table is live, whose registered containers
 /// the accumulator might hold: a container built around one would hide it from the table.

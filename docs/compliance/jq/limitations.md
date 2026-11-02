@@ -7275,10 +7275,9 @@ Past the floor the walk refuses with `nesting depth exceeds limit of the native 
 On the 256 MiB release thread the re-index bridge refuses between about 697,000 and 699,500 levels (Apple Silicon); a walk with heavier frames (`walk(.)`, `flatten`) refuses sooner, and a debug build or x86_64 at depths of their own.
 The text stage of #5598/#5743 stays as the fallback there: a pipe whose first stage only renders its input as text (`tojson`, `tostring`, `"\(.)"`) answers from the tree even past the floor.
 One cost remains.
-A fold whose step is a constructor around the accumulator (`[.]`, `[., <closed>…]`, `{k: .}`, with every other member closed or reading a scalar off the accumulator, such as `length`, `type` or `.n + 1`) builds it on the moved state, so it is linear in the number of steps, as jq's is ([#5875](https://github.com/rust-works/succinctly/issues/5875), [#5893](https://github.com/rust-works/succinctly/issues/5893)).
+A fold whose step is a constructor around the accumulator (`[.]`, `[., <closed>…]`, `{k: .}`, with every other member closed or reading scalars off the accumulator: `length`, `type`, a field, integer `+`, `-` and `*` such as `.n + 1`) builds it on the moved state, so it is linear in the number of steps, as jq's is ([#5875](https://github.com/rust-works/succinctly/issues/5875), [#5893](https://github.com/rust-works/succinctly/issues/5893)).
 Before that it re-indexed the whole accumulator on every step and was quadratic past 384 levels (17 s at N = 40,000, against 0.03 s in jq).
-A member that reads a container out of the accumulator (`[., .a]`) is answered from a rebuilt copy of it and still is quadratic, as is a step of any other shape that constructs from `.`.
-`.[0] = .` has an owned door too and is linear.
+A member that reads a container out of the accumulator (`[., .a]`), a float (`.n / 2`) or `tojson` costs `O(accumulator)` a step and is quadratic, as is a step of any other shape that constructs from `.`.
 `paths`, `tostream` and `[path(..)]` over a value hundreds of thousands of levels deep build output quadratic in its depth, as jq's would, and need the memory for it.
 `succinctly yq` still refuses a value past 384 levels: its emitters were tuned against that bound and are not covered by the floor yet.
 
