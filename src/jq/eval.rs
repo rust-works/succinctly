@@ -95223,8 +95223,6 @@ struct BrokenDownTime {
     yearday: i64, // 0-indexed (0-365)
 }
 
-/// Parse a time string according to strptime format specifiers
-#[allow(clippy::type_complexity)] // STYLE-0004: return mirrors strptime's broken-down-time field set
 const WEEKDAY_FULL: [&str; 7] = [
     "Sunday",
     "Monday",
@@ -95278,12 +95276,28 @@ fn strptime_prefix_len(
     Some(len)
 }
 
+/// How many characters a day or month name matches: the full name, else the abbreviation. An empty
+/// name (a locale the library renders nothing for) is never a match, unlike an am/pm marker: it
+/// would match any text without consuming it.
+fn strptime_name_len(
+    input: &core::iter::Peekable<core::str::Chars<'_>>,
+    full: &str,
+    abbr: &str,
+) -> Option<usize> {
+    [full, abbr]
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .find_map(|name| strptime_prefix_len(input, name))
+}
+
 fn advance_chars(input: &mut core::iter::Peekable<core::str::Chars<'_>>, n: usize) {
     for _ in 0..n {
         input.next();
     }
 }
 
+/// Parse a time string according to strptime format specifiers
+#[allow(clippy::type_complexity)] // STYLE-0004: return mirrors strptime's broken-down-time field set
 fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), String> {
     // #5340: jq hands the libc a zeroed `struct tm` (`memset(&tm, 0, sizeof(tm))`), so a field the
     // format does not set stays `tm_year = 0` (1900), `tm_mon = 0` and `tm_mday = 0` -- not the
@@ -95455,8 +95469,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                             Some(n) => (n.weekday_full[i].as_str(), n.weekday_abbr[i].as_str()),
                             None => (WEEKDAY_FULL[i], WEEKDAY_ABBR[i]),
                         };
-                        strptime_prefix_len(&input_iter, full)
-                            .or_else(|| strptime_prefix_len(&input_iter, abbr))
+                        strptime_name_len(&input_iter, full, abbr)
                     });
                     match found {
                         Some(len) => advance_chars(&mut input_iter, len),
@@ -95483,9 +95496,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                             Some(n) => (n.month_full[i].as_str(), n.month_abbr[i].as_str()),
                             None => (MONTH_FULL[i], MONTH_ABBR[i]),
                         };
-                        strptime_prefix_len(&input_iter, full)
-                            .or_else(|| strptime_prefix_len(&input_iter, abbr))
-                            .map(|len| (i, len))
+                        strptime_name_len(&input_iter, full, abbr).map(|len| (i, len))
                     });
                     match found {
                         Some((i, len)) => {
