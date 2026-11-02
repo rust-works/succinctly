@@ -55490,6 +55490,34 @@ mod tests {
         }
     }
 
+    /// #5816: `test`, `index`, `rindex` and `inside` of a string literal read the owned string, from
+    /// both owned entries and from an operand, so none of them writes it out and indexes it again.
+    /// `ascii_downcase` makes the string an owned value and is the one crossing each row still
+    /// pays, so a row is pinned to 1 and not 0: a lost door shows as 2.
+    #[cfg(all(feature = "std", feature = "regex"))]
+    #[test]
+    fn test_string_search_builtins_need_no_second_reindex_5816() {
+        let doc = r#"{"s":"H\u00e9llo"}"#;
+        for (query, want) in [
+            // `eval_each_owned_front_doors`: a lone last stage.
+            (r#".s | ascii_downcase | test("h")"#, "true"),
+            (r#".s | ascii_downcase | test("L"; "i")"#, "true"),
+            (r#".s | ascii_downcase | index("l")"#, "3"),
+            (r#".s | ascii_downcase | rindex("l")"#, "4"),
+            (r#".s | ascii_downcase | inside("xh\u00e9llo")"#, "true"),
+            // `eval_on_owned_over`: the same stage inside an array construction.
+            (r#"[.s | ascii_downcase | test("h")]"#, "[true]"),
+            (r#"[.s | ascii_downcase | index("l")]"#, "[3]"),
+            // An operand: a boolean over the answer.
+            (r#".s | ascii_downcase | test("h") and test("o")"#, "true"),
+            (r#".s | ascii_downcase | select(test("h")) | length"#, "5"),
+        ] {
+            let (out, reindexes) = outputs_and_reindexes(doc, query);
+            assert_eq!(out, [want], "{query}");
+            assert_eq!(reindexes, 1, "{query}: the string door was lost");
+        }
+    }
+
     /// #5712 (residual shapes): a string's `length` is also answered from the owned string when
     /// it is compared (`length > 11`), under `try`/`?`, in a `range` body, a `reduce`, a `def`,
     /// and a `select`/`if` over a string inside `[...]`, `//` or an object value. Each of these
