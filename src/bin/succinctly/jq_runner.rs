@@ -5790,13 +5790,13 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 let count = lazy.spans.len();
                 let source = lazy.source;
                 // The counter's place in the text, kept between reads without a borrow of it.
-                let mut lines = LineCounter::at_seam(lazy.text.as_bytes(), lazy.seam).rebind(&[]);
+                let mut lines = LineCounter::at_seam(lazy.text.as_bytes(), lazy.seam).place();
                 let materialize = move |index: usize| {
                     let bytes = lazy.text.as_bytes();
                     let (start, end) = lazy.spans[index];
-                    let mut counter = lines.rebind(bytes);
+                    let mut counter = LineCounter::resume(bytes, lines);
                     let line = counter.read_end_line(end);
-                    lines = counter.rebind(&[]);
+                    lines = counter.place();
                     debug_assert!(
                         json_depth_at_most(&bytes[start..end], LAZY_JSON_MAX_DEPTH),
                         "a lazily converted document is within the depth the route admits"
@@ -5811,7 +5811,8 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                         0,
                         DocumentForm::Value,
                     );
-                    (u32::try_from(line).unwrap_or(u32::MAX), converted)
+                    // Narrowed as `InputLocations::push` narrows the eager route's lines.
+                    (line as u32, converted)
                 };
                 jq::seed_remaining_inputs_lazily(
                     source,
@@ -6985,13 +6986,12 @@ fn get_inputs(
                     // stream comes from its spans (#5661, `EofTail::of_clean_source`).
                     if args.null_input && !args.stream && pos == 0 && last == 0 {
                         if let Some(spans) = lazy_json_spans(&raw) {
+                            // Set already only for a stream that is not UTF-8, the one case
+                            // whose seam the substitution moves.
                             if locations.eof_tail.is_none() {
-                                locations.eof_tail = Some(if seam == Seam::NONE {
-                                    EofTail::of_clean_source(raw.as_bytes(), &spans)
-                                } else {
-                                    // patchcov: coverage tolerate-line reason="defensive: a lone source has no file to stitch with, so its seam is the default; kept as the scan every other stream gets"
-                                    EofTail::of(&[raw.as_bytes()], false, &seams, false)
-                                });
+                                debug_assert_eq!(seam, Seam::NONE, "a lone source is unstitched");
+                                locations.eof_tail =
+                                    Some(EofTail::of_clean_source(raw.as_bytes(), &spans));
                             }
                             LAZY_JSON_INPUTS.with(|slot| {
                                 *slot.borrow_mut() = Some(LazyJsonInputs {
@@ -7230,6 +7230,14 @@ fn get_inputs(
             }
         }
     }
+
+    // #5661: a lazy candidate's tail is set on whichever route took the stream, as every other
+    // stream's is above.
+    debug_assert_eq!(
+        locations.eof_tail.is_some(),
+        records_eof,
+        "the end of stream is recorded where it can be read"
+    );
 
     // #4397: `--stream` feeds the program `tostream`'s events in place of each document, `-s`
     // slurping the events and `input`/`inputs` reading them. Each event keeps its document's
@@ -7672,11 +7680,7 @@ impl EofTail {
             let (values, malformed) = split_json_values_strict(&last[offset..]);
             if let Some(&(start, end)) = values.last() {
                 // At `last.len()` for a bare token that the end of input completes.
-                last_event = Some(if matches!(last[offset + start], b'"' | b'[' | b'{') {
-                    offset + end - 1
-                } else {
-                    offset + end
-                });
+                last_event = Some(offset + Self::completes_at(&last[offset..], start, end));
             }
             let Some(start) = malformed else {
                 break;
@@ -7695,6 +7699,16 @@ impl EofTail {
             // end when it is empty, and that is the final read only when the
             // whole of this source is.
             None => final_read == 0 && Self::ends_in_bare_token(earlier),
+        }
+    }
+
+    /// Where jq completes the value spanning `start..end` of `bytes`: a string or container on
+    /// its closing byte, a number or literal at the byte after it (or at the end of input).
+    fn completes_at(bytes: &[u8], start: usize, end: usize) -> usize {
+        if matches!(bytes[start], b'"' | b'[' | b'{') {
+            end - 1
+        } else {
+            end
         }
     }
 
@@ -7717,14 +7731,9 @@ impl EofTail {
     /// reaches with a strict scan of the whole source.
     fn of_clean_source(bytes: &[u8], spans: &[(usize, usize)]) -> Self {
         let final_read = Self::final_read_start(bytes, 0);
-        let unknown = spans.last().is_some_and(|&(start, end)| {
-            let completes_at = if matches!(bytes[start], b'"' | b'[' | b'{') {
-                end - 1
-            } else {
-                end
-            };
-            completes_at >= final_read
-        });
+        let unknown = spans
+            .last()
+            .is_some_and(|&(start, end)| Self::completes_at(bytes, start, end) >= final_read);
         Self {
             newlines: count_newlines(bytes) as u32,
             unknown,
@@ -8262,6 +8271,17 @@ struct LineCounter<'a> {
     seam: Seam,
 }
 
+/// A [`LineCounter`]'s position without its text (#5661): only [`LineCounter::resume`] over
+/// the text it was taken from can count from it.
+#[derive(Debug, Clone, Copy)]
+struct LinePlace {
+    pos: usize,
+    newlines_before_pos: usize,
+    line_start: usize,
+    next_newline: Option<usize>,
+    seam: Seam,
+}
+
 impl<'a> LineCounter<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self::at_seam(bytes, Seam::NONE)
@@ -8283,16 +8303,26 @@ impl<'a> LineCounter<'a> {
         }
     }
 
-    /// This counter's place, over `bytes` instead: the same text to go on counting it, or none,
-    /// to keep the place without a borrow of the text between calls (#5661).
-    fn rebind<'b>(&self, bytes: &'b [u8]) -> LineCounter<'b> {
-        LineCounter {
-            bytes,
+    /// Where this counter is in its text, kept without a borrow of it between calls (#5661).
+    fn place(&self) -> LinePlace {
+        LinePlace {
             pos: self.pos,
             newlines_before_pos: self.newlines_before_pos,
             line_start: self.line_start,
             next_newline: self.next_newline,
             seam: self.seam,
+        }
+    }
+
+    /// The counter [`place`](Self::place) took, over the same `bytes`, to go on counting them.
+    fn resume(bytes: &'a [u8], place: LinePlace) -> Self {
+        Self {
+            bytes,
+            pos: place.pos,
+            newlines_before_pos: place.newlines_before_pos,
+            line_start: place.line_start,
+            next_newline: place.next_newline,
+            seam: place.seam,
         }
     }
 

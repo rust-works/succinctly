@@ -93433,7 +93433,7 @@ mod remaining_inputs {
     /// The CLI's conversion of the document at an index of a lazily seeded stream (#5661), and
     /// that document's 1-based end line. Called once per document, in index order, so it may
     /// count lines forward as it goes.
-    pub type Materialize = Box<dyn FnMut(usize) -> (u32, Result<OwnedValue, EvalError>)>;
+    pub type Materialize = super::LazyInputConverter;
 
     /// A stream whose documents the CLI converts when they are read (#5661): a program that
     /// stops early neither converts the rest nor holds a queue entry for each of them.
@@ -93626,18 +93626,18 @@ mod remaining_inputs {
             CURRENT.with(|c| c.set(Some(at)));
             return Pop::ParseError(error);
         }
-        let lazy = LAZY.with(|l| {
-            let mut slot = l.borrow_mut();
-            let stream = slot.as_mut()?;
+        // Out of its slot while the converter runs, so a converter that reads the queue itself
+        // finds no borrow held.
+        let lazy = LAZY.with(|l| l.borrow_mut().take()).map(|mut stream| {
             let index = stream.next;
             stream.next += 1;
             let (line, converted) = (stream.materialize)(index);
             let source = stream.source;
-            // The converter holds the stream's text: drop it with the last document.
-            if stream.next == stream.count {
-                *slot = None;
+            // The converter holds the stream's text: it goes with the last document.
+            if stream.next < stream.count {
+                LAZY.with(|l| *l.borrow_mut() = Some(stream));
             }
-            Some((converted, source, line))
+            (converted, source, line)
         });
         if let Some((converted, src, line)) = lazy {
             POPPED.with(|p| p.set(popped_so_far + 1));
@@ -93981,21 +93981,27 @@ pub fn seed_remaining_inputs_with_errors(
     remaining_inputs::seed(documents, exhausted, errors);
 }
 
+/// How [`seed_remaining_inputs_lazily`] converts a document (#5661).
+///
+/// Given its index, it answers the document's 1-based end line and its value. It is called once per document, in index order,
+/// when that document is read, so it can count lines forward as it goes. An error it returns
+/// reaches the reader as the parse error `input` raises.
+#[cfg(feature = "std")]
+pub type LazyInputConverter = Box<dyn FnMut(usize) -> (u32, Result<OwnedValue, EvalError>)>;
+
 /// [`seed_remaining_inputs`] for a stream the CLI has checked is clean, converting each document
 /// when it is read instead of up front (#5661).
 ///
-/// There are `count` documents, all from the source tagged `source`. `materialize` turns the
-/// document at an index into its 1-based end line and its value; it is called once per document,
-/// in index order, when that document is read, so it can count lines forward as it goes. An error
-/// it returns reaches the reader as the parse error `input` raises. The CLI takes this route only
-/// where no document can fail to convert and the stream holds no parse error, so a program that
-/// stops early (`first(inputs)`) neither parses nor holds the documents it never reads, and
-/// nothing is kept per document it has not read.
+/// There are `count` documents, all from the source tagged `source`, each converted by
+/// `materialize` ([`LazyInputConverter`]). The CLI takes this route only where no document can
+/// fail to convert and the stream holds no parse error, so a program that stops early
+/// (`first(inputs)`) neither parses nor holds the documents it never reads, and nothing is kept
+/// per document it has not read.
 #[cfg(feature = "std")]
 pub fn seed_remaining_inputs_lazily(
     source: u32,
     count: usize,
-    materialize: remaining_inputs::Materialize,
+    materialize: LazyInputConverter,
     exhausted: Option<(u32, u32)>,
 ) {
     remaining_inputs::seed_lazy(source, count, materialize, exhausted);
@@ -114969,6 +114975,29 @@ mod tests {
         seed_remaining_inputs(vec![(OwnedValue::Int(7), 0, 1)], None);
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(7)));
         assert_eq!(converted.get(), 4);
+    }
+
+    /// #5661: the converter runs with no borrow of the queue held, so one that reads the queue
+    /// itself finds it empty rather than panicking on a held borrow.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_lazy_converter_may_read_the_queue_5661() {
+        seed_remaining_inputs_lazily(
+            0,
+            2,
+            Box::new(|index| {
+                assert_eq!(
+                    pop_remaining_input(),
+                    None,
+                    "nothing is queued behind the stream"
+                );
+                (1, Ok(OwnedValue::Int(index as i64)))
+            }),
+            None,
+        );
+        assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(0)));
+        assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(1)));
+        assert_eq!(pop_remaining_input(), None);
     }
 
     /// Evaluate `Identity`/`Field`/`Index` against an `OwnedValue` the way
