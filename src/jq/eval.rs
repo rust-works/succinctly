@@ -96357,7 +96357,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     // #5754: a week number of up to two digits, 0-53 (`%V` 1-53), which places the
                     // date at the end once a year is read.
                     let number = parse_digits(&mut input_iter, 2)?;
-                    let first = if spec == 'V' { 1 } else { 0 };
+                    let first = i64::from(spec == 'V');
                     if !(first..=53).contains(&number) {
                         return Err(format!("week {number} out of range"));
                     }
@@ -96627,11 +96627,13 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // (#912) doesn't validate this itself - it only guards against actual
     // `i64` overflow, which an out-of-semantic-range month/day doesn't
     // trigger - so this check is still required even after that refactor.
-    // `day`'s lower bound is never checked: it's only ever assigned from
+    // `day`'s lower bound is never checked. A day read comes from
     // `parse_digits`, which builds its output from `is_ascii_digit()`
-    // characters alone, so it can never be negative (`day == 0` is real,
-    // jq-valid input - `2024-01-00` succeeds) (#968). A day counted from a week number is
-    // exempt: the libc sets it past 31 or below 1 itself (#5754).
+    // characters alone, so it is never negative (`day == 0` is real,
+    // jq-valid input - `2024-01-00` succeeds) (#968). A day counted from a
+    // week number next to a month read is exempt from the upper bound too:
+    // the libc sets it past 31 or below 1 itself, and jq prints it
+    // (`"2015 March 05" | strptime("%Y %B %U")` is March -27, #5754).
     if !(1..=12).contains(&month) || (day > 31 && !mday_from_week) {
         return Err(format!("month {month} or day {day} out of range"));
     }
