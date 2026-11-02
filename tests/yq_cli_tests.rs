@@ -18941,9 +18941,11 @@ fn test_keys_unsorted_yaml_merge_key_lazy_685() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"["<<","c"]"#);
 
+    // The merge key is written as its node, `!!merge <<`, as yq's `.item | keys` prints it
+    // (#5469; this was `- "<<"` before).
     let (output, code) = run_yq_stdin(".item | keys_unsorted", input, &["--jq-extensions"])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), "- \"<<\"\n- c");
+    assert_eq!(output.trim(), "- !!merge <<\n- c");
 
     Ok(())
 }
