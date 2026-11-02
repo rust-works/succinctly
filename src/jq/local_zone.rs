@@ -81,6 +81,40 @@ pub(crate) fn for_wall_clock(
     backend::for_wall_clock(year, month, day, hour, minute, second)
 }
 
+/// The zone named `name` (an IANA name such as `Australia/Sydney`) in effect at `utc_secs`, as
+/// yq's `tz` loads it through Go's `time.LoadLocation`; `None` for a name the zone database does
+/// not have. Only the `local-zone` backend has a database: without it every name is unknown
+/// (`UTC`, the empty name and `Local` never reach here).
+pub(crate) fn named_at(name: &str, utc_secs: i64) -> Option<LocalZone> {
+    backend::named_at(name, utc_secs)
+}
+
+/// Go's `time.Local` for [`super::go_time`]: this module's zone, whatever its backend.
+pub(crate) struct GoLocal;
+
+impl super::go_time::Location for GoLocal {
+    fn lookup(&self, unix: i64) -> (String, i64) {
+        let zone = at_instant(unix);
+        (zone.name, zone.offset_secs)
+    }
+
+    /// Go scans every zone the location has ever used. A backend answers only for an instant, so
+    /// the zones in effect around `unix` are asked instead: half a year either side holds both
+    /// standard and daylight time. As in Go, a zone in effect at the wall clock read with its own
+    /// offset wins; otherwise any zone of that name does.
+    fn lookup_name(&self, name: &str, unix: i64) -> Option<i64> {
+        const HALF_YEAR: i64 = 182 * 86_400;
+        let candidates = [unix, unix - HALF_YEAR, unix + HALF_YEAR].map(at_instant);
+        let named = || candidates.iter().filter(|zone| zone.name == name);
+        named()
+            .find_map(|zone| {
+                let in_effect = at_instant(unix - zone.offset_secs);
+                (in_effect.name == name).then_some(in_effect.offset_secs)
+            })
+            .or_else(|| named().next().map(|zone| zone.offset_secs))
+    }
+}
+
 #[cfg(all(feature = "std", feature = "local-zone", not(windows)))]
 use backend_jiff as backend;
 
@@ -96,6 +130,10 @@ mod backend_utc {
 
     pub(super) fn at_instant(_utc_secs: i64) -> LocalZone {
         LocalZone::utc()
+    }
+
+    pub(super) fn named_at(_name: &str, _utc_secs: i64) -> Option<LocalZone> {
+        None
     }
 
     pub(super) fn for_wall_clock(
@@ -151,6 +189,11 @@ mod backend_jiff {
 
     pub(super) fn at_instant(utc_secs: i64) -> LocalZone {
         zone_in(system(), utc_secs)
+    }
+
+    pub(super) fn named_at(name: &str, utc_secs: i64) -> Option<LocalZone> {
+        let tz = jiff::tz::db().get(name).ok()?;
+        Some(zone_in(&tz, utc_secs))
     }
 
     pub(super) fn for_wall_clock(
@@ -445,6 +488,10 @@ mod backend_posix {
 
     pub(super) fn at_instant(_utc_secs: i64) -> LocalZone {
         current()
+    }
+
+    pub(super) fn named_at(_name: &str, _utc_secs: i64) -> Option<LocalZone> {
+        None
     }
 
     pub(super) fn for_wall_clock(
