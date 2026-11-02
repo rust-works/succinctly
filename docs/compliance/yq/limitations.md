@@ -2679,6 +2679,8 @@ JSON and YAML input alike; a string that is no integer keeps the ordinary error.
 - **The wording of the refusal.** yq's is `cannot index array with ' 1' (strconv.ParseInt: parsing
   " 1": invalid syntax)`; this build keeps its own `Cannot index array with string " 1"`, and
   `Cannot index array with number` for a fractional key.
+  The constructors are shared with jq mode, so a key of 30 bytes or more loses its text here too
+  (`Cannot index array with string`, #5817), as it does in jq; neither wording is yq's.
 - **A mapping indexed by a number**, `{"0":"z"} | del(.[0])` (and `a: {"1": x}` | `del(.a[1])`), which yq
   deletes when the key is a string and this build leaves: a `1:` key is an `!!int`, which yq's delete leaves
   alone (#2353), and the value tree does not keep which spelling a key had.

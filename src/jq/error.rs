@@ -635,7 +635,8 @@ impl EvalError {
     /// key, `Cannot index <container> with <key type>`.
     ///
     /// jq embeds the key's text only when it is a string, and does not
-    /// truncate it, but leaves it out of a key of 30 bytes or more (#5817). A slice reports its key as `object`, because jq models
+    /// truncate it, but leaves it out of a key of [`LONG_INDEX_KEY`] bytes or more
+    /// (#5817). A slice reports its key as `object`, because jq models
     /// `.[a:b]` as indexing with `{"start":a,"end":b}`.
     pub fn cannot_index(container_type: &str, key: &OwnedValue) -> Self {
         if let Some(err) = Self::unreadable_container(container_type) {
