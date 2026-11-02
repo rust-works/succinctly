@@ -12,7 +12,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// left is never truthy or in the handler of a `try` that only raises, as the first item of a comma, under
 /// `first`/`limit`/`nth(0; ..)`, or after a bind of a constant. Rows are a sample (two per source shape) of
 /// the fold-body grid's `rd-nav`/`rd-nava` outers; every one captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4933_nested_fold_destructure_in_a_reduce_update_names_the_step() -> Result<()> {
@@ -512,7 +511,6 @@ fn test_4933_nested_fold_destructure_in_a_reduce_update_names_the_step() -> Resu
 
 /// #4933: the rows that already named the step keep doing so (a sample of the grid's matches on both `main`
 /// and the change).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4933_nested_fold_destructure_naming_keeps_matching() -> Result<()> {

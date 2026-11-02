@@ -8,10 +8,15 @@ use super::{
     collect_write_targets, is_closed_literal, reconcile_presentation, CommentTree, Expr, IndexMap,
     NodeMeta, NumberRepr, OwnedValue, ResultWithComments,
 };
-use succinctly::jq::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
+use succinctly::jq::document::{
+    DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields, DocumentValue,
+};
 use succinctly::jq::eval_generic::{to_owned_with_comments, AnchorMark, KeyMeta, LazyElem};
-use succinctly::jq::YqSemantics;
 use succinctly::jq::{ArithOp, Builtin, EvalError, ObjectKey, MAX_VALUE_TREE_DEPTH};
+use succinctly::jq::{EvalSemantics, YqSemantics};
+
+/// Whether yq's key listing folds a repeated key into one (it does not: both are listed).
+const COLLAPSE: bool = YqSemantics::COLLAPSE_DUPLICATE_KEYS;
 
 /// A deliberately small allowlist: no variables, environment reads, I/O,
 /// clock/random functions, path registers, user functions or control effects.
@@ -120,9 +125,13 @@ pub(super) fn navigation_construction(expr: &Expr) -> bool {
             Expr::Paren(inner) => entry(inner),
             Expr::Arithmetic { left, right, .. } => entry(left) && entry(right),
             Expr::Pipe(parts) => match parts.split_last() {
-                Some((Expr::Builtin(Builtin::Length), path)) => path.iter().all(static_path),
+                Some((Expr::Builtin(Builtin::Length | Builtin::KeysUnsorted), path)) => {
+                    path.iter().all(static_path)
+                }
                 _ => static_path(expr),
             },
+            // `[keys]`: the keys of the node the construction reads (#5469).
+            Expr::Builtin(Builtin::KeysUnsorted) => true,
             _ => is_closed_literal(expr) || static_path(expr) || navigation_construction(expr),
         }
     }
@@ -249,6 +258,78 @@ fn node_pair_as<C: DocumentCursor>(
     Ok((value, tree))
 }
 
+/// The presentation of a `keys` result (#5469): one leaf per key, each the key node's own, so
+/// `&k key`, `!!str t`, a quoted `"1"` and an alias key `*a` print as yq prints them. A plain
+/// `<<` takes the `!!merge` tag yq gives a merge key. `None` if a key fails to convert; the
+/// caller then prints the keys bare, as it did before.
+pub(super) fn key_nodes<F: DocumentFields>(fields: &F, collapse: bool) -> Option<CommentTree> {
+    let (_, trees) = key_list(fields, collapse)?;
+    Some(CommentTree::Array(NodeMeta::empty(), trees))
+}
+
+/// A `keys` result built from the mapping's key nodes, value and presentation: what
+/// [`key_nodes`] gives the result, with each key's value alongside it. `None` if a key node
+/// fails to convert (the plain route decides those).
+fn keys_pair<F: DocumentFields>(fields: &F, collapse: bool) -> Option<ResultWithComments> {
+    let (values, trees) = key_list(fields, collapse)?;
+    Some((
+        OwnedValue::Array(values.into_iter().collect()),
+        CommentTree::Array(NodeMeta::empty(), trees),
+    ))
+}
+
+/// `keys` of a document node: a mapping's key nodes ([`keys_pair`]), or a sequence's indices,
+/// which carry no presentation.
+fn node_keys_pair<C: DocumentCursor>(node: &C) -> Option<ResultWithComments> {
+    let value = node.value();
+    if let Some(fields) = value.as_object_listed() {
+        return keys_pair(&fields, COLLAPSE);
+    }
+    let len = value.as_array()?.len();
+    Some((
+        OwnedValue::Array((0..len).map(|i| OwnedValue::Int(i as i64)).collect()),
+        CommentTree::Array(NodeMeta::empty(), vec![CommentTree::empty(); len]),
+    ))
+}
+
+fn key_list<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> Option<(Vec<OwnedValue>, Vec<CommentTree>)> {
+    let mut values = Vec::new();
+    let mut trees = Vec::new();
+    for (key, cursor) in DistinctKeyCursors::new(fields, collapse) {
+        let (key_value, tree) = node_pair_as(&cursor, false).ok()?;
+        let text = key.as_str();
+        let merge = tree.meta().tag().is_none()
+            && !cursor.canonicalize_numbers()
+            && cursor.style().is_empty()
+            && cursor.alias().is_none()
+            && text.as_deref() == Some("<<");
+        let mut meta = tree.meta().clone();
+        if merge {
+            meta = meta.with_tag(Some("!!merge".to_string()));
+        }
+        // yq drops the non-specific `!` (`! z` is `- z`).
+        if meta.tag() == Some("!") {
+            meta = meta.with_tag(None);
+        }
+        // A plain key that decodes to a line break (`? !!str a` / `` / `  b`) cannot be written
+        // as it was spelled, so the writer quotes it instead.
+        if text
+            .as_deref()
+            .is_some_and(|t| t.contains(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}']))
+        {
+            meta = meta.with_spelling(None);
+        }
+        // The key's node value: a key that is not a string (`1:`, `true:`) lists as its scalar,
+        // as yq lists it. The caller checks the result against the evaluated one.
+        values.push(key_value);
+        trees.push(CommentTree::Leaf(meta));
+    }
+    Some((values, trees))
+}
+
 /// The sequence a `LazySeq` stands for, each element with the presentation of the node it still
 /// is (#5429); a value an earlier stage computed has none.
 pub(super) fn sequence_of_nodes<C: DocumentCursor>(
@@ -289,7 +370,8 @@ pub(super) fn trace_navigation_construction<C: DocumentCursor>(
                 },
             )?;
             // An absent node is for the plain route to answer.
-            construct(last, &at.node?, 0)
+            // `.c | keys + [.b]`: an entry of any kind, read from the node.
+            entry_pair(last, &at.node?, 0)
         }
         Expr::Arithmetic { .. } => entry_pair(expr, root, 0),
         _ => construct(expr, root, 0),
@@ -340,6 +422,13 @@ fn entry_pair<C: DocumentCursor>(e: &Expr, root: &C, depth: usize) -> Option<Res
             };
             Some((OwnedValue::Int(length), CommentTree::empty()))
         }
+        // `[.c | keys]`, `{x: (.c | keys)}`: each key is its node, as a bare `.c | keys` prints
+        // it (#5469). An absent node and a scalar are the plain route's.
+        Expr::Pipe(parts) if matches!(parts.last(), Some(Expr::Builtin(Builtin::KeysUnsorted))) => {
+            let path = Expr::Pipe(parts[..parts.len() - 1].to_vec().into());
+            node_keys_pair(&land(&path, start())?.node?)
+        }
+        Expr::Builtin(Builtin::KeysUnsorted) => node_keys_pair(root),
         _ if is_closed_literal(e) => Some((evaluated(e, &OwnedValue::Null)?, CommentTree::empty())),
         _ if static_path(e) => landed_pair(&land(e, start())?),
         _ => construct(e, root, depth + 1),
@@ -518,8 +607,11 @@ fn trace_at_depth(
                         // The key node is reused as the entry's `key` string, so
                         // its `&anchor` rides along (`key: &k key`, #2598), and so
                         // does an alias used as the key (`key: *a`, #5469).
+                        // And its explicit tag (`!foo q`, #5469), as the `keys` writers give it.
                         let mut key_meta =
-                            NodeMeta::from_comment_and_style(None, tree.key_style(key));
+                            NodeMeta::from_comment_and_style(None, tree.key_style(key)).with_tag(
+                                tree.key_tag(key).filter(|t| *t != "!").map(str::to_string),
+                            );
                         key_meta.anchor = tree
                             .key_anchor(key)
                             .map(|name| AnchorMark::Declares(name.to_string()))

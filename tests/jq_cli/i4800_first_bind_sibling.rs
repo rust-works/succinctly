@@ -11,7 +11,6 @@ use anyhow::Result;
 /// own state (`result {"a":null}`), `empty` raised where jq prints nothing, and `[path(..)?]` answered `[]`
 /// where jq answers `[["a"]]`. Covers `first`, `limit(1; ..)`, `limit(0.5; ..)` (takes `ceil(0.5)`), `nth(0; ..)`,
 /// a nested comma, and the wrappers around them. Every row captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_single_pattern_bind_led_first_over_a_non_bind_sibling_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -355,7 +354,6 @@ fn test_foreach_update_single_pattern_bind_led_first_over_a_non_bind_sibling_480
 /// whose pattern computes a key (`{(empty): $q}`) emits nothing, so the sibling supplies the first output and
 /// stores a node of its own. Only the
 /// refusal's kind is pinned here, as the sibling tests do.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_first_over_a_non_bind_sibling_controls_stay_refused_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

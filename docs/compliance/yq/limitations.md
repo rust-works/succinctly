@@ -385,10 +385,20 @@ below its alias, expands the alias to the key's text (`c: key`) where yq prints 
 unresolvable `*k`.
 An alias used *as* a key (`*a : 2` in block context, `{*a: 1}` in flow, [#5469](https://github.com/rust-works/succinctly/issues/5469)) is kept on every route, and on a write it is held to the same three rules with the key's text as its value.
 One that fails them prints that text: `del(.b)` on `b: &a xy` / `c: {*a : 1}` prints `c: {xy: 1}` where yq prints an unresolvable `*a`, and so does a write whose output leaves the anchor out (`.c | .zz = 1`).
+That text keeps the anchor's quoting, so a key whose anchor is `"true"`, `'1'` or `!!str 12` prints as `"true": 1`, `'1': 1` or `"12": 1` and reads back as a string, not as the bool or integer key a bare `true: 1` is ([#5813](https://github.com/rust-works/succinctly/issues/5813)).
 A navigation that streams the node without its anchor (`.c`, `.[]`) prints `*a` as yq does, as it already does for a value alias, and that output names no anchor.
 `.b = "q"` prints the key as `xy` as well: yq keeps `*a`, which reads back as the key `q`, but succinctly's key is the text it read and a write to the anchor does not reach it.
 An alias to a sequence or mapping used as a key is printed as the key's text too, which is `''` here.
-Two routes still print a key bare: `keys` (`- &k key` in yq) and `pick`, and a `<<` merge
+`keys` writes each key as its node ([#5469](https://github.com/rust-works/succinctly/issues/5469)): `- &k !!str key`, `- !!merge <<`, `- *a`, on the streaming route and on the DOM routes `-P`, `--arg` and `--sort-keys` take.
+So does a `keys` result built into a construction of reads (`[.c | keys]`, `{x: (.c | keys)}`, `[keys]`, `.c | keys + [.b]`).
+A mapping with a `~` key, which `keys` lists as `"~"` where yq lists `null` ([#2802](https://github.com/rust-works/succinctly/issues/2802)), leaves the whole construction bare, and so does a `keys` result taken through `-` (`[(.c | keys) - ["q"]]`).
+One that a later stage takes further (`[.c | keys] | .[0]`) or that is written back (`. |= keys`) still prints each key bare.
+A plain `<<` anywhere, value as well as key, is the `!!merge` tag yq writes (`a: !!merge <<`) and reports (`tag`, `type`), and a computed `"<<"` is quoted ([#5833](https://github.com/rust-works/succinctly/issues/5833)).
+Writing the equal string over a plain `<<` (`.a = "<<"` on `a: <<`) keeps `!!merge <<` where yq writes `"<<"`, since a write of an equal value keeps the node's tag, as it does an explicit one (`!foo x`) in both tools; the value read back is the same.
+Clearing the tag of a `<<` (`.a tag = ""`) writes `!!merge <<` where yq writes a bare `<<`, since an untagged `<<` here is a computed string and is quoted; both read back as the merge scalar.
+An explicit `!!merge <<` is not told apart from a plain `<<`, so `.a tag = "!!str"` on it writes `"<<"` where yq writes `!!str <<`; both read back as the string `<<`.
+On the streaming route and under `--sort-keys` a tagged key that decodes to a line break (`? !!str a` / `` / `  b`) is double-quoted (`- !!str "a\nb"`) where yq writes a literal block (`- !!str |-`), and under `-P` an anchored empty key is `- &k ""` where yq writes `- &k`; both read back as the same key.
+A `<<` merge
 expands the merged mapping's keys where yq keeps `<<: *m`. The expansion does not re-declare the
 source's anchors ([#2513](https://github.com/rust-works/succinctly/issues/2513)): `default: &d` /
 `  a: &y 1` / `item: {<<: *d, b: 2}` written with `.item.b = 3` prints `a: 1` under `item`, not a
@@ -1924,9 +1934,18 @@ than performing an actual regex split; arity 3+ is accepted and discarded (parse
 matching `sub`'s own arity 4+ handling above. The 1-arg `split(s)` form is unaffected — its
 own argument really is evaluated and used (`split(error("boom"))` still raises, confirmed
 live) — and `succinctly jq`'s `split/2` keeps its real jq-modeled regex-split behavior
-unchanged in jq mode. Non-string-input error wording (`array (...) cannot be matched, as it
-is not a string` vs. real yq's `cannot split !!seq, can only split strings`) is a separate,
-pre-existing gap unrelated to arity, not addressed here.
+unchanged in jq mode. A non-string input is refused in yq's words, `cannot split !!seq, can only
+split strings` (#5836, see below).
+
+### String builtins refuse an input whose tag is not `!!str` (#5836)
+
+yq's `split`, `sub`, `test`, `match`, `capture`, `upcase`, `downcase`, `trim`, `@base64`, `@uri` and `@sh` refuse an input whose tag is not `!!str`, naming the tag, and `succinctly yq` does the same with yq's wording (`cannot change case with !!int, can only operate on strings. `, `cannot encode !!seq as URI, ...`, which `@sh` uses too).
+A number, a bool, a null, a container, a plain date (`!!timestamp`), a plain `<<` (`!!merge`) and an explicit core tag on a string (`!!binary aGk=`, `!!float "x"`) are refused; a custom tag reads as its value's own type, so `!foo x` is a string and `!foo 5` is refused as `!foo`.
+A bad pattern or flag is still reported first, as yq checks those before the input, and `split` passes a null through.
+`tag` and `type` report a verbatim tag as what it spells, a core one in its `!!` form (`!<tag:yaml.org,2002:binary>` is `!!binary`, `!<!foo>` is `!foo`), as yq does.
+An alias node keeps its target's value, where yq applies the builtin to the alias's name (`b: *x` with `upcase` is `X`).
+The refusal is made where the builtin reads a document node; a value reached through an update (`.b |= upcase`), `to_entries`/`with_entries`, or a literal under `-n` (`5 | @base64`) still gets jq's wording or, for `@base64` and `@uri`, an answer.
+Under `--jq-extensions`, `ascii_downcase` and `ascii_upcase` are `downcase` and `upcase` and refuse the same inputs, a plain date among them.
 
 ### Regex patterns are read as Go's `regexp` reads them (#5374, #5388)
 
@@ -3741,14 +3760,63 @@ Two integers compare as integers, and a decimal spelling (`007`, `+5`, `1e3`) pa
 - A string that parses as a timestamp (RFC 3339 or `2006-01-02`, as Go's `time.Parse` reads them) on the left of `<`, `<=`, `>` or `>=` is compared as a time, and its right operand is parsed the same way ([#5651](https://github.com/rust-works/succinctly/issues/5651)).
   `"2001-01-01T00:00:00Z" < 1` is `parsing time "1" as "2006-01-02": cannot parse "1" as "2006"` in both tools, and so is a `null`, a bool or a string in another layout (`parsing time "2001-01-01 00:00:00": extra text: " 00:00:00"`).
   Two timestamps compare as instants, so the same moment in two zones is equal.
-  The reading is `go_time::parse_yq_datetime`, a port of the part of `time.Parse` those two layouts use, including its looseness (a one-digit hour, a comma before the fraction, a zone offset of 24 hours); `scripts/yq-time-fuzz.py` replays mutated timestamps against a real yq.
+  The reading is `go_time::yq_datetime`, a port of `time.Parse`, including its looseness (a one-digit hour, a comma before the fraction, a zone offset of 24 hours); `scripts/yq-time-fuzz.py` replays mutated timestamps against a real yq.
+  Under `with_dtf(layout; f)` both sides are read under `layout`, and a string that reads under it is a time too, as in yq (#5863, see the datetime operators section).
   `OwnedValue` has no timestamp kind, so the reading goes by the text, and what yq decides from the `!!timestamp` tag is still different:
   an unquoted document value whose text no layout reads (`2001-01-01 10:00:00`) is a time for yq, which raises on it, and a plain string is `!!str not yet supported for comparison` against a `!!timestamp` on its right, where this answers by string order;
   the error for a right operand names its text as written in yq and as the value reads here, so an empty value (`key:`) is `parsing time ""` there and `"null"` here, a `~` is `"~"` and `"null"`, `True` is `"True"` and `"true"`, and a literal `007` in the filter is `"007"` and `"7"`;
   a number past int64 (`100000000000000000000`) raises `strconv.ParseInt: ... value out of range` in yq and a time error here;
-  and the type tag in a container error reads `!!str` here for a document date (`tag` answers `!!str` for one too).
+  and the type tag in a container error reads `!!str` here for a document date, which `tag` reports as `!!timestamp` (#5836).
 - A signed prefixed integer (`-0x10`), `1_000` and `0b101` read as strings here, so they raise the kind error instead of comparing or raising `ParseFloat`.
 - `sort`, `min` and `max` over an array holding a prefixed integer and a float use their own comparators here: yq's `min`/`max` raise the same `ParseFloat` error, and its `sort` panics with it, where this orders them by value.
+
+### Datetime operators: date arithmetic, `format_datetime`, `tz` and `with_dtf` -- resolved ([#5863](https://github.com/rust-works/succinctly/issues/5863)); a quoted date and the timestamp tag remain
+
+yq keeps a timestamp as text tagged `!!timestamp`.
+Its datetime operators read that text with Go's `time.Parse` under the current layout and write a result back with `Format`: RFC 3339 by default, with `2006-01-02` tried when RFC 3339 fails, or the layout `with_dtf(layout; f)` sets for everything `f` evaluates.
+`succinctly yq` does the same through `go_time`, a port of `time.Parse`, `time.Format` and `time.ParseDuration` (Go 1.26, the toolchain yq v4.53.3 is built with), and `yq_datetime`, which applies them as yq's operators do:
+
+- `+` and `-` add a duration to a timestamp (`.t += "3h10m"`, `.t -= "24h"`), keeping its zone, and raise Go's error for a duration that does not parse (`unable to parse duration [bogus]: time: invalid duration "bogus"`, with `-bogus` for `-`).
+  Before #5863, `.t += "3h10m"` concatenated the text and exited 0.
+  Any other string on the left of `-` is `strings cannot be subtracted`, or `!!seq () cannot be subtracted from !!str` against a container, in yq's words.
+- `format_datetime(f)` writes the time with Go's layout `f` and reads the result back as a YAML snippet, as yq does: `format_datetime("2006")` is the number `2026`, and `format_datetime("[2006]")` a sequence.
+- `tz(zone)` moves a timestamp to the zone `time.LoadLocation` loads: `UTC` or the empty name, `Local`, or an IANA name.
+- `now` and `from_unix` are RFC 3339 text in the local zone, with no fraction, and `to_unix` reads under the layout.
+- The ordering comparisons read both sides under the `with_dtf` layout.
+
+The local zone is `TZ` or the system zone, as Go's `time.Local` is.
+Every row of the issue is pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, among 104 rows captured under `TZ=UTC` and `TZ=Australia/Sydney`; the 10 that differ are the ones listed below.
+
+**Not reproduced:**
+
+- `OwnedValue` has no timestamp kind, so the text stands in for the tag: a string is a timestamp when it reads as RFC 3339 or `2006-01-02`, the rule the ordering comparison already follows (#5651).
+  A quoted (or JSON) string spelled like one is a `!!str` in yq, which concatenates it, so the two can only both be served by what the right operand is.
+  `+` of text that can begin a duration (after a sign, a digit or `.`: `3h`, `1`, `3hrs`) to such a string adds or refuses it as for a timestamp, and any other text concatenates as for a string.
+  So `"2026-01-01" + "T00:00:00Z"` is `"2026-01-01T00:00:00Z"` in both tools, and `.t += "3hrs"` raises yq's `unknown unit "hrs"` rather than appending.
+  What remains: a quoted date plus a duration (`"2026-01-01T00:00:00Z" + "3h"`) is `"2026-01-01T03:00:00Z"` here and `"2026-01-01T00:00:00Z3h"` in yq, and a plain date plus text that cannot begin one (`.t + "bogus"`, `.t + ""`, `.t + null`, `.t + true`) concatenates here (`null` adds nothing) where yq raises `unable to parse duration [bogus]`.
+  `-` has no such split, since yq cannot subtract from a string at all: a quoted date minus a duration subtracts it here, and minus anything else raises the duration error, where yq raises `strings cannot be subtracted` for both.
+  Under a custom layout the same text is still a timestamp here, so `with_dtf("2006-01-02"; .q + "1h")` on a quoted RFC 3339 `.q` raises the layout's parse error where yq concatenates.
+  Following yq on the quoted string in every case would make a plain date plus a duration concatenate silently on the write routes (`|=`, `+=`), which see the value without its node, and a silently wrong date is the failure this replaced.
+  For the same reason `now | type`, `from_unix | tag` and `tz(z) | tag` are `!!str` here and `!!timestamp` in yq, and a string builtin (`test`, `split`) accepts them here where yq refuses them (#5836).
+- yq names the node's path in the `format_datetime`, `tz` and `to_unix` errors (`could not parse datetime of [a.b]`).
+  A value here carries no path, so the brackets are always empty, as yq writes them for a computed value.
+- A missing key as the layout, format or zone argument (`with_dtf(.nope; f)`, `format_datetime(.nope)`) reads as `null` here, so it is the layout `null`; yq navigates it read-only, finds no node and raises `could not find layout for format_time`.
+  An empty layout, or a container's, is RFC 3339 in both tools.
+- A stage after `with_dtf` that reads path context (`with_dtf(f; .a) | path`) reads the position of `with_dtf`'s input (`[]` where yq has `["a"]`).
+  A write through it (`with_dtf(f; .a) = 5`, `|=`, `del`) lands where yq's does.
+- `tz` with an IANA name needs the `local-zone` feature (on in `cli`, not on Windows); without it only `UTC`, the empty name and `Local` load, and every other name is `unknown time zone`.
+- A `no_std` build has no thread-local layout, so `with_dtf` raises `with_dtf requires the std feature` there.
+- `with_dtf(layout, f)` with a comma between its two arguments (yq's `withDateTimeFormat` accepts a union as well as a block) is a parse error here; only the `;` form is read.
+- A `with_dtf`, `format_datetime` or `tz` argument is evaluated once per input node here, and once for the whole context in yq, which uses the first result for every node.
+  So `.[] | format_datetime(.)` over several timestamps formats each with its own text here and every one with the first node's text in yq.
+- `with_dtf` in path position (`with_dtf(error("boom"); .a) |= 1`) reports a layout argument's error without yq's `could not get date time format: ` prefix.
+- A `format_datetime` result that YAML reads back as empty (`""`, `" "`, `"#x"`, `".999"` on a time with no nanoseconds) prints `null` here where yq prints an empty scalar, and `format_datetime("[2006]")` prints block style here where yq keeps flow style.
+- `.t + "1h" | tag` is `!!str` here and `!!timestamp` in yq, the same split as the tags above.
+- `"x" | from_unix` says `math function requires number` here where yq says `from_unix only works on numbers, found !!str instead`.
+- `tz("Europe")` and `tz("zone.tab")` (a directory and a file that is not a zone) raise a different message here (`is a directory`, `malformed time zone information`) from yq's.
+- Go matches a zone abbreviation read by a layout's `MST` against every zone the local zone has ever used; here only the zones in effect at the date and half a year either side are asked, which covers standard and daylight time.
+- `with_dtf("2006")` and `format_datetime` with no argument are parse errors in succinctly's wording, not yq's (`must provide a date time format string and an expression, ...`, `'format_datetime' expects 1 arg but received none`).
+- `from_unix` keeps succinctly's out-of-range error for a number past the calendar it converts (`1e20`), where yq prints the year Go's arithmetic wraps to.
 
 ### `|=` with a zero-output update filter -- resolved ([#2484](https://github.com/rust-works/succinctly/issues/2484))
 
@@ -6744,3 +6812,19 @@ An absent key and a computed `null` answer `"null"`, as in yq.
 `.[] | select(alias != "")` prints the resolved target of an alias node where yq prints `*x`, the read-route alias echo tracked with the alias-mark family (#2505, #5249).
 Under `--jq-extensions`, `path(...)` and `paths(...)` run with no cursor, so they cannot see an alias node (`paths(alias != "")` lists every scalar), as they cannot see an `anchor`; no yq oracle exists for that surface.
 Pinned by `tests/yq_cli/i5483_alias.rs`, whose rows were captured from yq v4.53.3.
+
+## A value the program builds is bounded by the native-stack floor, not by 384 levels ([#5876](https://github.com/rust-works/succinctly/issues/5876))
+
+yq has no limit on the depth of a value a program builds but Go's own stack.
+`succinctly yq` refused such a value past 384 levels (`MAX_VALUE_TREE_DEPTH`) at its output and in most of the filters after the fold, where yq answers.
+Since #5876 `run_yq` arms the same floor `succinctly jq` has had since [#5554](https://github.com/rust-works/succinctly/issues/5554): a walk over a built value that is past 384 levels checks ADR-0025's native-stack floor once per level instead of refusing.
+`.[] as $i ireduce (0; [.]) | length` over 385 and 2000 items is `1`, as in yq, and the value prints as yq prints it, as YAML (`- - - 0`), as `-o json` and under `-P`, byte for byte (`-C` keeps its own colour difference, [#5416](https://github.com/rust-works/succinctly/issues/5416)).
+The same holds at those two depths for `to_yaml`, `flatten`, `==`, `.[0]`, a field of a deep object (`{"a": .}` folded 2000 times, then `.a | length`) and the rest of the filters that walk the value.
+Where a value built by the program is handed back to the evaluator whole (a field read out of it, `select`, a bind) the document ceiling of 256 levels no longer applies to it either: it was a bound for an input document, and a built value is bounded by the value-tree depth, or by the floor.
+The bridge's converter keeps the 256-level document ceiling for a caller that has not armed the floor (a library embedder), so only the CLI's armed run reads a built value back past it.
+Past the floor the run refuses with `Error: nesting depth exceeds limit of the native stack` at exit 1, where yq's own Go stack is far deeper.
+Where that is depends on the evaluation thread's stack and on what each level costs: the fold that builds the value is the first step to refuse, ahead of every emitter and presentation walk, so the emitters have not been seen to refuse on their own.
+Checked on a 16 MiB evaluation thread (a throwaway build): the build and every consumer above answered at 8,000 levels and refused cleanly at 11,000, with no crash at any size.
+A fold that builds a deep value is quadratic in yq mode, as it is in jq mode before [#5875](https://github.com/rust-works/succinctly/issues/5875): 100,000 levels does not finish inside two minutes.
+The reshape of a result's presentation (its comments and styles) gives up on a navigation construction or a merge deeper than 384 levels and falls back to the plain result, so such a result loses the comments it would otherwise carry; the value itself is unaffected.
+A document whose aliases expand to a deep value is not covered: `-P` and `explode(.)` over a chain of 385 anchors that each wrap the previous one still refuse at 256 levels, where yq answers.

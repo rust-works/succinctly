@@ -372,11 +372,13 @@ mod tests {
         // output, not just the trailing partial bytes (#1696 review). Only
         // a raw-bytes capture, decoded lossily after the exit-code check,
         // survives this: the invalid tail becomes a replacement character
-        // instead of erasing the whole buffer.
+        // instead of erasing the whole buffer. The bytes are octal escapes:
+        // POSIX `printf` has no `\x`, so Linux's dash `sh` printed the four
+        // characters `\xe2` literally and the test passed only on macOS.
         let err = SystemSsh
             .exec(
                 &node("localhost"),
-                "printf '\\xe2\\x82' >&2; kill -9 $$",
+                "printf '\\342\\202' >&2; kill -9 $$",
                 Duration::from_secs(5),
             )
             .unwrap_err();

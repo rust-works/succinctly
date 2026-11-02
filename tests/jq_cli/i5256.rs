@@ -11,7 +11,6 @@ use crate::run_jq_full;
 /// jq 1.7.1 answers them (captured live): several paths, a path twice, a value generator, an
 /// empty update, nested paths in either order, and a fold of them.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_dynamic_target_writes_answer_as_jq_5256() -> Result<()> {
     for (input, filter, want) in [
         (
@@ -92,7 +91,6 @@ fn test_dynamic_target_writes_answer_as_jq_5256() -> Result<()> {
 /// raises the write's error ahead of the generator's); a write that succeeds leaves the
 /// generator's error to be raised.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_write_error_comes_before_a_later_path_error_5256() -> Result<()> {
     for (input, filter, want_stderr) in [
         (
@@ -136,7 +134,6 @@ fn test_write_error_comes_before_a_later_path_error_5256() -> Result<()> {
 /// answer and the first error are still jq's (captured live): the paths on either side of it, a
 /// write that fails inside the flush or after it, and a path error after the flush.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_write_lookahead_bound_answers_as_jq_5256() -> Result<()> {
     for (n, want) in [
         (4095, "8386560"),

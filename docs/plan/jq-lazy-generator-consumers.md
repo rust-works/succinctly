@@ -1306,7 +1306,7 @@ the reasoning behind each placement:
    scope (`first(.[] | stderr)`) never covered them and they needed their own issue. Closed
    by extending the existing `first`/`last` bridge-to-`eval.rs` pattern to the top-level
    entry points rather than by #1461's full mirror — see "#1504 — the other 'two more
-   owners'..." above. #1461 itself remains open.
+   owners'..." above. #1461 itself was closed later by #1581.
 9. **#1596** (duplicate: #1604) — the next increment of option (c): mirror Stage 5's widened
    `eval.rs` arm set (`If`/`Try`/`Optional`/`Label`/`As`/`AsPattern`/`FuncDef`/`Limit`) into
    `eval_generic.rs`, closing the asymmetry Stage 5's own finding (ii) named — `first(...)`/

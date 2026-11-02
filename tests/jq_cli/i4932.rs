@@ -10,7 +10,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// `.`, `select(true)`, `(.)?` or `try . catch .`. The binary refused each with `with result <accumulator>`.
 /// Rows are a sample (four per UPDATE shape) of a 5,760-row hash sample of a 23,040-row sweep over three outer binds, eight sources,
 /// three INITs, `path`/`del` and four documents; every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4932_reduce_update_foreign_marker_wrapped_binds_hand_the_accumulator_on() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -327,7 +326,6 @@ fn test_4932_reduce_update_foreign_marker_wrapped_binds_hand_the_accumulator_on(
 
 /// #4932: the rows jq refuses (the accumulator is not the register, or a bind's step is not on it), which the
 /// widening must keep refusing -- a sample of the sweep's matches on both `main` and the change.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_4932_reduce_update_foreign_marker_wrapped_binds_keep_their_refusals() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

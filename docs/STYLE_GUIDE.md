@@ -365,9 +365,10 @@ Adding, updating, or documenting benchmark results.
   overlapping runs produce meaningless numbers.
 - **Label every result table with the CPU/platform** it was measured on (the existing tables use
   headings like "Apple M1 Max", "ARM Neoverse-V2"). Numbers without a platform are not comparable.
-- **Keep the summaries in sync** — the performance tables in [CLAUDE.md](../CLAUDE.md) and the
-  detailed pages under [docs/benchmarks/](benchmarks/) must not diverge; update both when a number
-  changes, and note the regeneration command beneath the table.
+- **Keep one copy of each table** — the per-platform tables live only in the pages under
+  [docs/benchmarks/](benchmarks/), with the regeneration command beneath each. The
+  [CLAUDE.md](../CLAUDE.md) performance summary quotes ranges from them; when a refresh moves a
+  range it states, update that line too.
 
 The [`benchmark-docs` skill](../.claude/skills/benchmark-docs/SKILL.md) codifies the per-platform
 update procedure.
@@ -376,8 +377,9 @@ update procedure.
 
 Benchmark numbers are only trustworthy if they are reproducible and attributed to hardware.
 Sequential execution avoids the biggest source of noise; per-platform labelling stops readers
-comparing an M4 result against a Neoverse one; keeping CLAUDE.md and `docs/benchmarks/` in lock-step
-prevents the headline summary from drifting away from the detail.
+comparing an M4 result against a Neoverse one. Two full copies of a table drift: by #5846 the M4 Pro
+yq figure at 100 MB read 10.6x in CLAUDE.md and 8.5x in `docs/benchmarks/yq.md`, both from the same
+commit, so CLAUDE.md now carries ranges and a link instead of the tables.
 
 ---
 

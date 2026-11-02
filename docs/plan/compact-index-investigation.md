@@ -1,5 +1,12 @@
 # Compact Index Investigation Plan
 
+**Status: Archived (rejected).** #58 was closed as superseded: the `Vec<u32>` `bp_to_text`
+baseline this plan targets was replaced by the Advance-Index encoding (P12, #62), and the
+Elias-Fano implementation in `src/bits/elias_fano.rs` measured 34-40x slower for the
+cursor-iteration and random-access patterns `bp_to_text` needs. The Elias-Fano measurements are
+also in [hierarchical-structures.md](../optimizations/hierarchical-structures.md);
+`elias_fano.rs` now serves `text::LineIndex` ([ADR-0012](../adrs/adr-0012.md)).
+
 This document outlines the investigation plan for reducing `YamlIndex` memory overhead through compact position encoding.
 
 ## Problem Statement

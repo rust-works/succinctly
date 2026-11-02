@@ -6,7 +6,6 @@ use anyhow::Result;
 
 use crate::run_jq_stdin;
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nan_slice_bounds_match_jq_5231() -> Result<()> {
     let rows: &[(&str, &str, &str)] = &[

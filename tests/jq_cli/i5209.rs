@@ -10,7 +10,6 @@ use crate::assert_path_rows_both_routes_3749;
 
 /// #5209: The issue's rows, the writes over them, a deeper and an array pattern, and the same landing on a `false`/`true`
 /// child or state. Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_try_handler_nested_pattern_landing_on_a_null_child_5209() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

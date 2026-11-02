@@ -10,7 +10,6 @@ use anyhow::Result;
 /// (`del` deleted `.a`, the comma answered `["a"]` twice); a `$x` bound at `.a` is the register, so its destructure
 /// walks from it and jq's refusal at the end of the path stands (it answered `["a"]`), and `$x | .c` is
 /// `["a","c"]` (it raised). Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_after_a_navigating_init_runs_on_the_moved_register_5017() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -92,7 +91,6 @@ fn test_fold_source_after_a_navigating_init_runs_on_the_moved_register_5017() ->
 /// `$x | (. | .) as P`). Inside another fold's body the shared caught-destructure reading meets the same spellings:
 /// a `reduce` UPDATE whose state is the register raises jq's `with result null`, and a `foreach` UPDATE over
 /// `.a?` emits nothing, as jq does (both answered otherwise). Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_moved_register_on_later_forks_and_dot_spelled_catches_5017() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -146,7 +144,6 @@ fn test_fold_source_moved_register_on_later_forks_and_dot_spelled_catches_5017()
 /// or a fold behind a computed stage (`1 |`, `.a | tostring |`), now raises at a foreign `$x`'s destructure as jq does
 /// (`del` deleted `.a`); a `$x` bound at the register's node, a caught destructure and an unmoved INIT answer as before.
 /// Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_entered_on_a_register_frame_reads_a_foreign_destructure_5017() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -221,7 +218,6 @@ fn test_fold_entered_on_a_register_frame_reads_a_foreign_destructure_5017() -> R
 /// classed a `$x` at `.a` as foreign and changed jq's answer). A later INIT fork that cannot move the register is read
 /// as the first one is: `(1,2)`/`(0,0)` forks raise, or empty a caught destructure, as jq does. Rows captured from jq
 /// 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_entered_on_a_register_frame_boundary_and_later_forks_5017() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

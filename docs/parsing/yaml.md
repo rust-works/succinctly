@@ -1040,7 +1040,7 @@ End-to-end benchmarks on ARM (M1 Max) showed **no measurable improvement** and s
 
 **Root Cause Analysis:** SIMD overhead dominates for typical YAML values (10-40 bytes).
 
-See [Tuning Opportunities](#unquoted-structural-scanning-tuning) below for proposed fixes.
+See [Tuning Opportunities](#proposed-tuning-opportunities) below for proposed fixes.
 
 #### AMD Ryzen 9 7950X (x86_64 AVX2/AVX-512) - Baseline (2026-01-17)
 
@@ -2310,7 +2310,7 @@ The AVX-512 JSON parser implementation has been **removed** from the codebase
 because it was consistently **7-17% slower** than AVX2 across all workloads.
 ```
 
-Key quote from `CLAUDE.md`:
+Key quote from [optimizations/lessons.md](../optimizations/lessons.md#key-insights):
 > "Wider SIMD != automatically faster (AVX-512 JSON was 10% slower than AVX2)"
 
 **2. Memory-Bound Workload**
@@ -5287,6 +5287,53 @@ directly against a before/after binary pair, not just plausible-looking output).
 - `src/jq/eval_generic.rs` — `GenericItem::OneCursorValue` variant, construction site,
   `continue_pipe_element_generic` arm, `generic_item_to_result` arm
 - `tests/yq_cli_tests.rs` — three new `_1609` regression tests
+
+---
+
+## O7: CS-Poppy Combined Sampling for BP Select — Accepted ✅
+
+**Issue**: #64. **Design and full measurements**:
+[plan/cspoppy.md](../plan/cspoppy.md) (§5a-5d); this entry is the result.
+
+### What changed
+
+`BalancedParens`'s select support for YAML went from `WithSelect`'s sampled
+`(word, cumulative)` pairs to `WithCsPoppy`, which stores `u32` entry points into BP's own rank
+directory (`rank_l1`/`rank_l2`) instead of a parallel structure. Step A narrowed the BP sample
+entry to `u32` (BP bitmaps are under `u32::MAX` bits); Step B added the combined sampling.
+
+### Results (2026-08-03; Apple M4 Pro and AMD Ryzen 9 7950X, full `bp_select_micro`)
+
+- **Memory, 4×**: the BP select index went from 25.00% of the bitmap to 12.50% (Step A) to
+  6.25% (Step B), measured by `select_heap_size()` in
+  `test_cspoppy_index_is_half_of_with_select` and `test_select_index_costs_one_eighth_of_bitmap`.
+- **`select1` speed is platform-dependent**: +4.9% to +15.0% slower on the M4 Pro at 1K-1M opens,
+  with non-overlapping confidence intervals across two full runs; neutral to 1.7% faster on the
+  7950X at 10K-1M opens (its 1K row is an outlier against its own neighbours).
+- **Build side**: 38 of 39 `yaml_bench` ids within 2% on both boxes (`yaml/anchors/*` excluded: it
+  panicked on `main` too, #594). `yaml/block_scalars/*` read 12-28% slower on the 7950X only.
+
+### Why it shipped despite the ARM regression
+
+YAML's `BalancedParens::select1` is reached only through `find_bp_at_text_pos`, at most once per
+`yq-locate`/`at_offset`/`at_position` call, never on the `.foo.bar` navigation path
+([select-scan.md](../optimizations/select-scan.md) found no other caller). A 5-15% change on a
+~150-190 µs call made once per invocation is below what an end-to-end benchmark resolves; the 4×
+memory saving applies to every `YamlIndex`.
+
+### The `block_scalars` anomaly was code layout
+
+The BP structure for that workload is 7 words regardless of document size, too small to cost
+40 µs. cachegrind on the 7950X (#595) found instructions retired flat on every shape and L1
+instruction-cache misses up 11.8-27.7%, tracking the wall-clock range, and #649 found a matching 7-10% *improvement* on the M4 Pro's `long_*`
+shapes. #1587 then traced both to the default `codegen-units = 16`: with `codegen-units = 1` on
+both sides, the x86 regression disappears (its sign reverses) and most of the ARM improvement
+collapses into noise. `[profile.release]` now pins one codegen unit (#2603).
+
+### Still open
+
+F1, dropping BP's `rank_l2` (#596), is the largest remaining select/rank memory saving; its
+cost analysis is in [plan/cspoppy.md](../plan/cspoppy.md).
 
 ---
 

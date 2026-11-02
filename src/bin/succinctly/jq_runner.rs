@@ -4586,7 +4586,14 @@ pub(crate) fn silence_depth_guard_panic_line() {
 ///
 /// The caller must end the process on return: the named arguments (`--slurpfile`, `--argjson`)
 /// are not freed (#5673), so a second call in one process would leak them.
-pub fn run_jq(mut args: JqCommand) -> Result<i32> {
+///
+/// A value the program builds is bounded by the native-stack floor `main` registered, not by
+/// `MAX_VALUE_TREE_DEPTH`, as jq bounds it by its C stack alone (#5554).
+pub fn run_jq(args: JqCommand) -> Result<i32> {
+    jq::with_value_depth_on_stack_floor(|| run_jq_on_stack_floor(args))
+}
+
+fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     super::sigpipe::restore_default();
     silence_depth_guard_panic_line();
     args.resolve_positional_args();
@@ -4834,7 +4841,14 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // Exact in both directions now, where the substring scan over-reported as
     // well as under-reported: `.input`, `.inputs` and an `"input"` string
     // literal no longer force the non-lazy read path.
-    let uses_input_builtins = jq::walk::uses_input_builtins(&expr);
+    //
+    // #5498: a plain `--stream` walk (no `-n`, no `-s`) reads its events through the same queue, from
+    // the stream reader, so it holds neither the document nor its event list; the driver loop pops
+    // them as `input` does. `-n` has no input of its own, so it reads only if the program does.
+    // So this is "reads through the queue", not "calls `input`": `stream_mode` and the reader's
+    // seeding in `get_inputs` check `stream_walk_by_reader` themselves, so a caller of either cannot
+    // send a plain walk down the eager expansion by mistake (`stream_walk_by_reader_agrees_with_get_inputs_5498`).
+    let uses_input_builtins = jq::walk::uses_input_builtins(&expr) || stream_walk_by_reader(&args);
 
     // Configure output
     let output_config = OutputConfig::from_args(&args);
@@ -5522,14 +5536,10 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                                     // only ever ask `matches!(last, Null |
                                     // Bool(false))`, which is why the M2 path
                                     // already synthesizes a `Bool` here rather than
-                                    // materializing (`record_exit_status`). Cloning
-                                    // the value instead would be a refcount bump in
-                                    // the shipped build but a deep copy under the
-                                    // `unshared-containers` holdout, i.e. a cost
-                                    // that shows up only in the configuration used
-                                    // to measure this change. There is no `Err`
-                                    // counterpart: an owned value cannot fail to
-                                    // materialize, and its writer bounds its own depth.
+                                    // materializing (`record_exit_status`). There is
+                                    // no `Err` counterpart: an owned value cannot fail
+                                    // to materialize, and its writer bounds its own
+                                    // depth.
                                     OutputItem::Owned(v) => {
                                         last_output = Some(OwnedValue::Bool(!matches!(
                                             v,
@@ -5781,45 +5791,22 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             // this function's own stated safety goal.
             if args.null_input && !force_read_under_null_input {
                 jq::seed_remaining_inputs(Vec::new(), locations.exhausted(args.slurp));
+            } else if let Some(lazy) = LAZY_STREAM_INPUTS.with(|slot| slot.borrow_mut().take()) {
+                // #5498: `--stream` and `--stream-errors` read as the program asks. The end of the
+                // stream is settled when the reader reaches it.
+                debug_assert_eq!(locations.per_value(), &[]);
+                jq::seed_remaining_inputs_from(stream_reader_producer(lazy));
+                jq::count_reads_past_end();
             } else if let Some(lazy) = LAZY_JSON_INPUTS.with(|slot| slot.borrow_mut().take()) {
                 // #5661: a clean single-source stream whose documents are converted as the
                 // program reads them. `inputs` is empty, and so is `locations`' line table: each
                 // document's line is counted when it is read, one forward pass over the text in
                 // all. No parse error is queued (the route is taken only without one).
                 debug_assert_eq!(locations.per_value(), &[]);
-                let count = lazy.spans.len();
-                let source = lazy.source;
-                // The counter's place in the text, kept between reads without a borrow of it.
-                let mut lines = LineCounter::at_seam(lazy.text.as_bytes(), lazy.seam).place();
-                let materialize = move |index: usize| {
-                    let bytes = lazy.text.as_bytes();
-                    let (start, end) = lazy.spans[index];
-                    let mut counter = LineCounter::resume(bytes, lines);
-                    let line = counter.read_end_line(end);
-                    lines = counter.place();
-                    debug_assert!(
-                        json_depth_at_most(&bytes[start..end], LAZY_JSON_MAX_DEPTH),
-                        "a lazily converted document is within the depth the route admits"
-                    );
-                    // Serde accepted the span as a whole value and its depth is bounded
-                    // (`lazy_json_spans`), so it is the conversion the eager route made, minus
-                    // a position only a depth error would have read.
-                    let converted = stream_document_validated(
-                        &bytes[start..end],
-                        None,
-                        &[],
-                        0,
-                        DocumentForm::Value,
-                    );
-                    // Narrowed as `InputLocations::push` narrows the eager route's lines.
-                    (line as u32, converted)
-                };
-                jq::seed_remaining_inputs_lazily(
-                    source,
-                    count,
-                    Box::new(materialize),
+                jq::seed_remaining_inputs_from(lazy_json_producer(
+                    lazy,
                     locations.exhausted(args.slurp),
-                );
+                ));
                 if locations.eof_tail.is_some() {
                     jq::count_reads_past_end();
                 }
@@ -5945,6 +5932,14 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                             sink.report_parse_error(&error.message);
                             break;
                         }
+                        // ... and so does its streaming parser's fault (#5498), which `--stream`
+                        // reads the input with: the message is the parser's own, with no
+                        // location. A fault the program's own `input` reads is an error of the
+                        // program, with its marker, and never reaches this loop.
+                        jq::InputPop::ParseError(error) if stream_walk_by_reader(&args) => {
+                            sink.report_parse_error(&error.message);
+                            break;
+                        }
                         jq::InputPop::ParseError(error) => {
                             sink.report(
                                 DiagStyle::Jq,
@@ -5968,13 +5963,17 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     }
                     // Streaming, not collect-then-write (#1653) -- see
                     // `evaluate_input_streaming`.
-                    evaluate_input_streaming(
+                    //
+                    // #5498: a `--stream` event is a tree with no source text, read where it is
+                    // as the lazy walk's events were (#5681).
+                    evaluate_input_streaming_via(
                         &input,
                         &expr,
                         &context,
                         &ErrorAt::Live(&locations),
                         &mut sink,
                         &output_config,
+                        owned_route_for(args.stream, false, false),
                         &mut |sink, result| {
                             had_output = true;
                             last_output = Some(result.clone());
@@ -6478,7 +6477,12 @@ fn get_inputs(
     // a file continues in the next one.
     // `--validate` is strict per file (an empty file is rejected too), so it reads the files as
     // written.
-    let mut seams = if json_input_mode && !args.validate && !args.stream_errors {
+    // #5498: plain `--stream`, under `-n`, reads the way `--stream-errors` does (jq's streaming
+    // parser, which carries a token over a file boundary itself) and raises each fault as the
+    // error jq raises; the rest of `--stream` keeps its own route for now.
+    let stream_by_reader = args.stream && !args.stream_errors && track_eof && !args.slurp;
+    let mut seams = if json_input_mode && !args.validate && !args.stream_errors && !stream_by_reader
+    {
         stitch_json_file_seams(
             raw_bytes.iter_mut().map(|(_, raw)| raw),
             track_eof,
@@ -6642,20 +6646,35 @@ fn get_inputs(
     // #5474: `--stream-errors` reads the bytes with jq's own streaming parser, which turns a fault
     // into an input of its own, so neither the document parse nor the `--stream` expansion below
     // can produce what the program reads.
-    if args.stream_errors && json_input_mode {
+    if (args.stream_errors || stream_by_reader) && json_input_mode {
         if args.validate {
             for (file_idx, raw) in &raw_bytes {
                 let filename = file_idx.map(|idx| files[idx].to_string_lossy().to_string());
                 validate_json_input(raw, filename.as_deref())?;
             }
         }
-        let read = crate::jq_stream_errors::read(&raw_bytes);
         let mut locations = InputLocations::new(
             files
                 .iter()
                 .map(|p| Some(p.to_string_lossy().to_string()))
                 .collect(),
         );
+        // #5498: the program reads its inputs through `input`/`inputs` (under `-n`) or the driver
+        // loop pops them (a plain walk), and the reader hands them out as they are asked for, so a
+        // stream of events is never held. `--stream-errors` without `-n` keeps its eager read.
+        if track_eof && !args.slurp && (args.null_input || stream_walk_by_reader(args)) {
+            LAZY_STREAM_INPUTS.with(|slot| {
+                *slot.borrow_mut() = Some(LazyStreamInputs {
+                    files: raw_bytes.iter().map(|(file, _)| *file).collect(),
+                    last_source: u32::try_from(locations.files().len().saturating_sub(1))
+                        .unwrap_or(u32::MAX),
+                    reader: crate::jq_stream_errors::Reader::new(raw_bytes),
+                    raise_errors: stream_by_reader,
+                });
+            });
+            return Ok(Ok((Vec::new(), locations, None, Vec::new())));
+        }
+        let read = crate::jq_stream_errors::read(&raw_bytes);
         let mut values = read.values;
         let mut value_locations = read.locations;
         // `--slurp` closes its array at the call that empties jq's buffer, so what that call left
@@ -6700,8 +6719,7 @@ fn get_inputs(
     // spans answer it without the strict scan (`EofTail::of_clean_source`), and the scan runs
     // only if the route turns the stream down, or here, over the bytes as read, for a stream
     // that is not UTF-8.
-    let lazy_candidate =
-        records_eof && json_input_mode && args.null_input && !args.stream && raw_bytes.len() == 1;
+    let lazy_candidate = records_eof && json_input_mode && !args.stream && raw_bytes.len() == 1;
     let mut eof_tail = (records_eof && !lazy_candidate).then(|| {
         let sources: Vec<&[u8]> = raw_bytes.iter().map(|(_, raw)| raw.as_slice()).collect();
         EofTail::of(&sources, args.raw_input, &seams, args.stream)
@@ -6935,6 +6953,7 @@ fn get_inputs(
         // no message can read it (`--stream`, DSV).
         let last = raw_inputs.len().saturating_sub(1);
         LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
+        LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
         let mut lazy_inputs = false;
         let counts_files = !args.stream && args.input_dsv.is_none();
         let mut next_file = StreamOrigin::ALONE.file;
@@ -6979,12 +6998,14 @@ fn get_inputs(
                 // #4311: a program using `input`/`inputs` sees jq resume after
                 // a parse error, at the read after the one that met the fault.
                 if track_eof && !args.slurp {
-                    // #5661: `-n` over one clean plain-JSON source converts each document when
-                    // the program reads it, so `first(inputs)` neither parses nor holds the rest.
+                    // #5661: one clean plain-JSON source converts each document when the
+                    // program reads it, so `first(inputs)` neither parses nor holds the rest.
                     // Anything unusual (an error, a BOM, a deep document) takes the route below.
                     // Each document's line is counted when it is read, and the end of the
-                    // stream comes from its spans (#5661, `EofTail::of_clean_source`).
-                    if args.null_input && !args.stream && pos == 0 && last == 0 {
+                    // stream comes from its spans (#5661, `EofTail::of_clean_source`). Without
+                    // `-n` the driver loop pops its inputs from the same queue the program's
+                    // `input` does, so it takes the route too (#5855).
+                    if !args.stream && pos == 0 && last == 0 {
                         if let Some(spans) = lazy_json_spans(&raw) {
                             // Set already only for a stream that is not UTF-8, the one case
                             // whose seam the substitution moves.
@@ -7336,10 +7357,25 @@ enum StreamMode {
     Lazy,
 }
 
+/// Whether a plain `--stream` walk (#5498) is read by the stream reader through the input queue:
+/// a program with no `-n` and no `-s`, over JSON documents. Under `-n` the program asks for its
+/// inputs itself, and `-s` holds the whole array.
+fn stream_walk_by_reader(args: &JqCommand) -> bool {
+    args.stream
+        && !args.stream_errors
+        && !args.null_input
+        && !args.slurp
+        && args.input_dsv.is_none()
+        && !args.raw_input
+        && !args.seq
+}
+
 fn stream_mode(args: &JqCommand, uses_input_builtins: bool, faulted: bool) -> StreamMode {
     let json_documents = args.input_dsv.is_none() && !args.raw_input && !args.seq;
     // `--stream-errors` reads the events itself (#5474), so there is nothing left to expand.
-    if !args.stream || args.stream_errors || !json_documents {
+    // A plain walk (#5498) is read by the stream reader through the input queue, whichever way
+    // `uses_input_builtins` was set for it: nothing is left to expand.
+    if !args.stream || args.stream_errors || !json_documents || stream_walk_by_reader(args) {
         StreamMode::Off
     } else if args.slurp || uses_input_builtins {
         StreamMode::Eager
@@ -7617,6 +7653,13 @@ struct EofTail {
 /// longer than this is read in pieces of this size (#4303).
 const JQ_READ_CHUNK: usize = 4095;
 
+#[cfg(test)]
+std::thread_local! {
+    /// How many times [`EofTail::of`] scanned a whole stream on this thread, for the tests that
+    /// pin the lazy route (#5855): a clean stream the route takes needs none.
+    static STRICT_EOF_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl EofTail {
     /// The tail of `sources`, in command-line order, read as JSON text or, with
     /// `raw`, as `-R` lines.
@@ -7625,6 +7668,8 @@ impl EofTail {
     /// source's own lines and reads start after the bytes moved onto it, which belong to an
     /// earlier file's reads. Nothing is moved off the last source.
     fn of(sources: &[&[u8]], raw: bool, seams: &[Seam], stream: bool) -> Self {
+        #[cfg(test)]
+        STRICT_EOF_SCANS.with(|n| n.set(n.get() + 1));
         let base = sources.len().checked_sub(1).map_or(0, |last| {
             seams
                 .get(last)
@@ -9096,7 +9141,7 @@ fn find_json_values(bytes: &[u8]) -> core::result::Result<Vec<(usize, usize)>, u
     }
 }
 
-/// Documents of a clean single-source JSON stream that `-n` with `input`/`inputs` converts when
+/// Documents of a clean single-source JSON stream that a program reading `input`/`inputs` converts when
 /// they are read, not up front (#5661): the text and each document's byte range in it.
 struct LazyJsonInputs {
     text: std::rc::Rc<String>,
@@ -9107,7 +9152,210 @@ struct LazyJsonInputs {
     seam: Seam,
 }
 
+/// The text a batch's index covers is at most this long, past its first document (#5854).
+const LAZY_BATCH_MAX_BYTES: usize = 1 << 20;
+
+/// The first batch of a stream covers about this much text, and each batch after it twice the
+/// one before up to [`LAZY_BATCH_MAX_BYTES`], so a program that stops after a few documents
+/// (`first(inputs)`) indexes little more than they hold.
+const LAZY_BATCH_FIRST_BYTES: usize = 1 << 14;
+
+/// A run of consecutive documents of a [`LazyJsonInputs`] stream, `spans[first..end]`, read
+/// through one index in place of an index per document (#5854): building and dropping an index
+/// of its own is most of what converting a small document costs.
+struct LazyBatch {
+    first: usize,
+    end: usize,
+    /// `None` when the run is a single document, which an index of its own serves as well, when
+    /// two of its documents touch with nothing between them, or when the index does not hold
+    /// exactly the documents the spans name: the run is then converted a document at a time, and
+    /// the producer does not try this run again.
+    indexed: Option<LazyIndexed>,
+}
+
+struct LazyIndexed {
+    index: JsonIndex,
+    /// Where the batch's text starts in the stream's text (the index's offset 0), and ends.
+    text_start: usize,
+    text_end: usize,
+    /// The BP position of each document's root, in document order.
+    roots: Vec<usize>,
+}
+
+impl LazyBatch {
+    /// The batch that starts at `spans[first]` and takes documents while their text stays within
+    /// `max_bytes` of the first's start (the first always goes in).
+    fn build(text: &[u8], spans: &[(usize, usize)], first: usize, max_bytes: usize) -> Self {
+        let text_start = spans[first].0;
+        let mut end = first + 1;
+        while end < spans.len() && spans[end].1 - text_start <= max_bytes {
+            end += 1;
+        }
+        // Only documents with something between them: the index of two touching tokens
+        // (`1"b"`) is not the same on every architecture, and a stream like that is not one
+        // the batching exists for.
+        let separated = spans[first..end].windows(2).all(|w| w[0].1 < w[1].0);
+        let indexed = (end - first >= 2 && separated)
+            .then(|| {
+                let text_end = spans[end - 1].1;
+                let covered = &text[text_start..text_end];
+                let index = JsonIndex::build(covered);
+                let mut roots = Vec::with_capacity(end - first);
+                let mut at = Some(index.root(covered));
+                while let Some(cursor) = at {
+                    roots.push(cursor.bp_position());
+                    at = cursor.next_sibling();
+                }
+                // Serde and the splitter agreed on every span, so a clean stream has one root
+                // per span.
+                (roots.len() == end - first).then_some(LazyIndexed {
+                    index,
+                    text_start,
+                    text_end,
+                    roots,
+                })
+            })
+            .flatten();
+        Self {
+            first,
+            end,
+            indexed,
+        }
+    }
+
+    /// The document `spans[at]`, which this batch covers, converted as
+    /// [`Delimiters::SerdeValidated`] converts a document indexed on its own; `None` when the
+    /// batch has no index of its own.
+    fn document(
+        &self,
+        text: &[u8],
+        spans: &[(usize, usize)],
+        at: usize,
+    ) -> Option<core::result::Result<OwnedValue, EvalError>> {
+        let indexed = self.indexed.as_ref()?;
+        let cursor = JsonCursor::from_bp_position(
+            &indexed.index,
+            &text[indexed.text_start..indexed.text_end],
+            indexed.roots[at - self.first],
+        );
+        debug_assert_eq!(
+            cursor
+                .text_range()
+                .map(|(from, to)| (from + indexed.text_start, to + indexed.text_start)),
+            Some(spans[at]),
+            "the batch's root is the document the span names"
+        );
+        let (start, end) = spans[at];
+        Some(serde_validated_value(&cursor, &text[start..end]))
+    }
+}
+
+/// The producer the `input` queue pulls a [`LazyJsonInputs`] stream's documents from (#5661):
+/// each read converts the next document and counts its line, one forward pass over the text in
+/// all, and the read after the last answers the end of the stream at `exhausted`.
+fn lazy_json_producer(lazy: LazyJsonInputs, exhausted: Option<(u32, u32)>) -> jq::InputProducer {
+    // The counter's place in the text, kept between reads without a borrow of it.
+    let mut lines = LineCounter::at_seam(lazy.text.as_bytes(), lazy.seam).place();
+    let mut next = 0;
+    // The index over the documents being read, and how much text the next one covers (#5854).
+    let mut batch: Option<LazyBatch> = None;
+    let mut batch_bytes = LAZY_BATCH_FIRST_BYTES;
+    // The stream's text goes with its last document, not with the read past it.
+    let mut stream = (!lazy.spans.is_empty()).then_some(lazy);
+    Box::new(move || {
+        let Some(lazy) = stream.as_ref() else {
+            return jq::ProducedInput::End(exhausted);
+        };
+        let bytes = lazy.text.as_bytes();
+        let (start, end) = lazy.spans[next];
+        if batch.as_ref().map_or(true, |b| next >= b.end) {
+            batch = Some(LazyBatch::build(bytes, &lazy.spans, next, batch_bytes));
+            batch_bytes = (batch_bytes * 2).min(LAZY_BATCH_MAX_BYTES);
+        }
+        let at = next;
+        next += 1;
+        let mut counter = LineCounter::resume(bytes, lines);
+        let line = counter.read_end_line(end);
+        lines = counter.place();
+        debug_assert!(
+            json_depth_at_most(&bytes[start..end], LAZY_JSON_MAX_DEPTH),
+            "a lazily converted document is within the depth the route admits"
+        );
+        // Serde accepted the span as a whole value and its depth is bounded
+        // (`lazy_json_spans`), so it is the conversion the eager route made, minus
+        // a position only a depth error would have read.
+        let converted = batch
+            .as_ref()
+            .and_then(|batch| batch.document(bytes, &lazy.spans, at))
+            .unwrap_or_else(|| {
+                stream_document_validated(&bytes[start..end], None, &[], 0, DocumentForm::Value)
+            });
+        // Narrowed as `InputLocations::push` narrows the eager route's lines.
+        let produced = jq::ProducedInput::converted(converted, lazy.source, line as u32);
+        if next == lazy.spans.len() {
+            stream = None;
+            batch = None;
+        }
+        produced
+    })
+}
+
+/// `--stream` and `--stream-errors` inputs read as the program asks for them (#5498): jq's streaming parser over
+/// the sources' bytes, and what its source indices mean.
+struct LazyStreamInputs {
+    reader: crate::jq_stream_errors::Reader<Vec<(Option<usize>, Vec<u8>)>>,
+    /// The file each source was read from, as `get_inputs` tags its values.
+    files: Vec<Option<usize>>,
+    /// The tag of the last source, which the end of the stream names.
+    last_source: u32,
+    /// Whether a parse error is raised by the read that reaches it, as under `--stream`, and not
+    /// handed over as an input of its own, as under `--stream-errors`.
+    raise_errors: bool,
+}
+
+/// The producer the `input` queue pulls a [`LazyStreamInputs`] stream's inputs from: each read
+/// feeds the parser the refills it takes to complete one more input, and the read after the
+/// last settles the end of the stream where jq's reader stood (#5498).
+fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
+    let LazyStreamInputs {
+        mut reader,
+        files,
+        last_source,
+        raise_errors,
+    } = lazy;
+    Box::new(move || match reader.next_yielded() {
+        Some(input) => {
+            let (source, line) = input.location;
+            // The same tags the whole read gave: a value yielded after jq closed its input has
+            // no line, and the first source is tag 0 when it is stdin.
+            let (tag, line) = if line == crate::jq_stream_errors::CLOSED {
+                (0, UNKNOWN_LINE)
+            } else {
+                (
+                    u32::try_from(files[source].unwrap_or(0)).unwrap_or(u32::MAX),
+                    u32::try_from(line).unwrap_or(u32::MAX),
+                )
+            };
+            match input.error {
+                Some(message) if raise_errors => {
+                    jq::ProducedInput::Error(EvalError::new(message), (tag, line))
+                }
+                _ => jq::ProducedInput::Document(input.value, tag, line),
+            }
+        }
+        None => jq::ProducedInput::End(
+            reader
+                .end()
+                .open_at_end
+                .map(|lines| (last_source, u32::try_from(lines).unwrap_or(u32::MAX))),
+        ),
+    })
+}
+
 thread_local! {
+    /// Set by [`get_inputs`] for the call site that seeds the `input` queue, which takes it.
+    static LAZY_STREAM_INPUTS: std::cell::RefCell<Option<LazyStreamInputs>> =
+        const { std::cell::RefCell::new(None) };
     /// Set by [`get_inputs`] for the call site that seeds the `input` queue, which takes it.
     static LAZY_JSON_INPUTS: std::cell::RefCell<Option<LazyJsonInputs>> =
         const { std::cell::RefCell::new(None) };
@@ -9249,7 +9497,7 @@ fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Ve
     Ok(raw)
 }
 
-/// The byte range of every document of `raw`, when `-n` with `input`/`inputs` can convert them as
+/// The byte range of every document of `raw`, when a program reading `input`/`inputs` can convert them as
 /// they are read (#5661): the whole stream is plain, strict JSON that `serde_json` accepts, the
 /// splitter and `serde_json` agree on where each document ends, and no document nests deeply
 /// enough for its conversion to fail. `None` for anything else -- a parse error, a BOM, a number
@@ -12544,16 +12792,31 @@ fn json_document_to_owned_value(
     // `bytes` is often a temporary (an `--argjson` string, a `--seq` record),
     // so each NaN gets an identity of its own rather than its address (#3309).
     let value = match delimiters {
-        Delimiters::Walk => generic_to_owned::<JqSemantics, _>(&cursor.value()),
-        Delimiters::SerdeValidated => generic_to_owned_checked::<JqSemantics, _>(&cursor.value()),
-    }?
-    .with_fresh_nan_instances(bytes);
+        Delimiters::Walk => {
+            generic_to_owned::<JqSemantics, _>(&cursor.value())?.with_fresh_nan_instances(bytes)
+        }
+        Delimiters::SerdeValidated => serde_validated_value(&cursor, bytes)?,
+    };
     Ok(match form {
         DocumentForm::Value => value,
         DocumentForm::StreamEvents => {
             OwnedValue::array_from(succinctly::jq::tostream_events_owned(value))
         }
     })
+}
+
+/// The value of the document `cursor` is at, for text `serde_json` has accepted as a whole value
+/// ([`Delimiters::SerdeValidated`]); `bytes` is the document's own text. The one definition of
+/// that conversion, for a document indexed on its own and for one read through a
+/// [`LazyBatch`]'s index (#5854).
+fn serde_validated_value<W: AsRef<[u64]> + Clone>(
+    cursor: &JsonCursor<'_, W>,
+    bytes: &[u8],
+) -> core::result::Result<OwnedValue, EvalError> {
+    Ok(
+        generic_to_owned_checked::<JqSemantics, _>(&cursor.value())?
+            .with_fresh_nan_instances(bytes),
+    )
 }
 
 /// [`json_document_to_owned_value_checked`] for the document `bytes` found at `text[offset]`,
@@ -13749,7 +14012,7 @@ mod tests {
         }
     }
 
-    /// #5661: which plain-JSON streams `-n` with `input`/`inputs` converts as they are read. The
+    /// #5661: which plain-JSON streams a program reading `input`/`inputs` converts as they are read. The
     /// route is for a stream with nothing to report: an error, a BOM, a number only jq reads or a
     /// document deep enough for its conversion to fail all keep the eager route, which places the
     /// error where jq's reader meets it.
@@ -13779,6 +14042,171 @@ mod tests {
         // Brackets inside a string do not count towards the depth.
         let in_string = format!("[\"{}\", 1]\n", "[".repeat(200));
         assert!(spans(&in_string).is_some());
+    }
+
+    /// The streams the batching pins below read: every shape a document converts differently by.
+    fn batched_streams_5854() -> Vec<String> {
+        let mut streams = vec![
+            // Number literals jq keeps as written (#2936), and the extremes around them.
+            "1.000 1E2 -0 -0.0 1e1000 100000000000000000000 0.1 1 2 3\n".to_string(),
+            // Duplicate keys, an empty container, and a key that needs unescaping.
+            "{\"a\":1,\"a\":2,\"b\":{}} [] {\"\\u0041\":[1,[2,[3]]]}\n".to_string(),
+            // A lone surrogate and an escaped pair, a long string and a multi-byte character.
+            "\"\\ud800\" \"\\ud83d\\ude00\" \"é𝄞\" \"x\"\n".to_string(),
+            // Bare tokens and strings around containers: the roots of the batch's index.
+            "null true false \"s\" 0 [null] {\"k\":null} \"t\"\n".to_string(),
+            // Blank lines, CRLF and indentation between documents.
+            "  {\"a\": 1}\r\n\r\n\n\t[1, 2,\n 3]\r\n".to_string(),
+        ];
+        // Many small records, so the batches have boundaries inside the stream.
+        streams.push(
+            (0..400)
+                .map(|i| {
+                    format!(
+                        "{{\"id\":{i},\"s\":\"v{i}\",\"n\":{}.5,\"a\":[{i},null]}}\n",
+                        i * 7
+                    )
+                })
+                .collect(),
+        );
+        streams.push((0..300).map(|i| format!("{i} ")).collect());
+        // No separator between documents: a container beside a token, adjacent strings.
+        streams.push("[1]2 1[2] \"a\"\"b\" {}{} \"a\"1\"b\" [][]{}\n".to_string());
+        streams.push(
+            (0..200)
+                .map(|i| format!("[{i}]{i}\"s\""))
+                .collect::<String>()
+                + "\n",
+        );
+        streams
+    }
+
+    /// #5854: a document read through its batch's index is the value an index of its own gives
+    /// it, whichever documents the batch holds and wherever its boundaries fall.
+    #[test]
+    fn a_batched_document_equals_the_one_converted_alone_5854() {
+        for stream in batched_streams_5854() {
+            let spans = lazy_json_spans(&stream).expect("a clean stream the lazy route admits");
+            let bytes = stream.as_bytes();
+            // 1 is a batch of one document (no index of its own); the others cut the stream
+            // at different places, down to one big batch.
+            for max_bytes in [1, 8, 17, 64, 255, 4096, LAZY_BATCH_MAX_BYTES] {
+                let mut next = 0;
+                let mut batched = 0;
+                while next < spans.len() {
+                    let batch = LazyBatch::build(bytes, &spans, next, max_bytes);
+                    assert!(batch.end > next, "a batch holds at least one document");
+                    let touching = spans[next..batch.end].windows(2).any(|w| w[0].1 == w[1].0);
+                    assert_eq!(
+                        batch.indexed.is_some(),
+                        batch.end - next >= 2 && !touching,
+                        "{stream:?} at {next} in a batch of {max_bytes} bytes: a run of several \
+                         separated documents has an index of its own"
+                    );
+                    for at in next..batch.end {
+                        let (start, end) = spans[at];
+                        let alone = stream_document_validated(
+                            &bytes[start..end],
+                            None,
+                            &[],
+                            0,
+                            DocumentForm::Value,
+                        );
+                        match batch.document(bytes, &spans, at) {
+                            Some(together) => {
+                                batched += 1;
+                                // The result, an error included: a lone surrogate fails alike.
+                                assert_eq!(
+                                    format!("{together:?}"),
+                                    format!("{alone:?}"),
+                                    "document {at} of {stream:?} in a batch of {max_bytes} bytes"
+                                );
+                            }
+                            None => {
+                                assert!(
+                                    batch.end == next + 1
+                                        || spans[next..batch.end]
+                                            .windows(2)
+                                            .any(|w| w[0].1 == w[1].0),
+                                    "only a lone document, or touching ones, have no index"
+                                );
+                            }
+                        }
+                    }
+                    next = batch.end;
+                }
+                if max_bytes >= 4096 && !spans.windows(2).any(|w| w[0].1 == w[1].0) {
+                    assert_eq!(
+                        batched,
+                        spans.len(),
+                        "{stream:?} is read through its batches"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #5854: a batch covers no more text than its limit past the first document, and a stream
+    /// is covered by consecutive batches with no gap and no overlap.
+    #[test]
+    fn batches_cover_a_stream_in_order_within_their_limit_5854() {
+        let stream: String = (0..100).map(|i| format!("{{\"id\":{i}}}\n")).collect();
+        let spans = lazy_json_spans(&stream).expect("clean");
+        let limit = 200;
+        let mut next = 0;
+        let mut ends = Vec::new();
+        while next < spans.len() {
+            let batch = LazyBatch::build(stream.as_bytes(), &spans, next, limit);
+            assert_eq!(batch.first, next);
+            assert!(spans[batch.end - 1].1 - spans[next].0 <= limit || batch.end == next + 1);
+            ends.push(batch.end);
+            next = batch.end;
+        }
+        assert_eq!(*ends.last().unwrap(), spans.len());
+        assert!(ends.len() > 1 && ends.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// #5854: the producer's documents, lines and end are the same with batches as without,
+    /// across the batch sizes its growth passes through (the test's stream is far past the
+    /// first batch's).
+    #[test]
+    fn the_producer_reads_a_batched_stream_as_it_read_one_document_at_a_time_5854() {
+        let stream: String = (0..3000)
+            .map(|i| format!("{{\"id\":{i},\"s\":\"{}\"}}\n", "x".repeat(i % 50)))
+            .collect();
+        let spans = lazy_json_spans(&stream).expect("clean");
+        assert!(
+            spans.last().unwrap().1 > 2 * LAZY_BATCH_FIRST_BYTES,
+            "the stream outgrows the first batch"
+        );
+        let text = std::rc::Rc::new(stream.clone());
+        let mut producer = lazy_json_producer(
+            LazyJsonInputs {
+                text,
+                spans: spans.clone(),
+                source: 0,
+                seam: Seam::NONE,
+            },
+            None,
+        );
+        for (i, &(start, end)) in spans.iter().enumerate() {
+            let alone = stream_document_validated(
+                &stream.as_bytes()[start..end],
+                None,
+                &[],
+                0,
+                DocumentForm::Value,
+            )
+            .expect("converts");
+            match producer() {
+                jq::ProducedInput::Document(value, _, line) => {
+                    assert_eq!(value, alone, "document {i}");
+                    assert_eq!(line as usize, i + 1, "document {i}'s line");
+                }
+                _ => panic!("document {i} is a converted value"),
+            }
+        }
+        assert!(matches!(producer(), jq::ProducedInput::End(None)));
     }
 
     /// #5661: the lazy route's end of stream, read off its spans, is the one the strict scan of
@@ -13817,7 +14245,8 @@ mod tests {
     }
 
     /// #5661: `-n` over one clean plain-JSON file leaves its documents unconverted for the queue,
-    /// and every other shape still reads them up front. The pin must be able to fail: it does,
+    /// as does a program without `-n` that reads inputs (#5855), and every other shape still
+    /// reads them up front. The pin must be able to fail: it does,
     /// with `lazy_json_spans` made to answer `None`.
     #[test]
     fn get_inputs_defers_a_clean_stream_under_null_input_5661() {
@@ -13874,12 +14303,45 @@ mod tests {
         assert!(inputs.is_empty(), "the substituted text is still clean");
         let scanned = EofTail::of(&[b"\"\xe9\"\n1".as_slice()], false, &[], false);
         assert_eq!(tail, Some(scanned));
-        // Not under `-n`, with `-s`, with `--stream`, or with a stream that turns malformed.
+        // Without `-n` the driver loop pops from the same queue, so a clean stream is deferred
+        // there too (#5855).
+        STRICT_EOF_SCANS.with(|n| n.set(0));
+        let (inputs, (lines, tail), _, _, lazy) = read(&["jq", "inputs", &clean]);
+        assert_eq!(
+            STRICT_EOF_SCANS.with(std::cell::Cell::get),
+            0,
+            "a clean stream the route takes is never scanned whole"
+        );
+        assert!(inputs.is_empty(), "the driver pops them from the queue");
+        assert_eq!(lines, Vec::new());
+        // The end of the stream comes from its spans, with no strict scan before the route.
+        assert_eq!(
+            tail,
+            Some(EofTail {
+                newlines: 3,
+                unknown: false
+            })
+        );
+        assert_eq!(
+            lazy.expect("deferred").spans,
+            vec![(0, 1), (2, 9), (10, 13)]
+        );
+        // A stream the route turns down, or that is not UTF-8, still gets the strict scan.
+        let (_, (_, tail), ..) = read(&["jq", "inputs", &bare_end]);
+        assert_eq!(
+            tail,
+            Some(EofTail::of(&[b"1\n2\n007".as_slice()], false, &[], false))
+        );
+        let (inputs, (_, tail), ..) = read(&["jq", "inputs", &latin1]);
+        assert!(inputs.is_empty(), "the substituted text is still clean");
+        assert_eq!(tail, Some(scanned));
+        // Not with `-s`, with a stream that turns malformed, or with several files.
         let broken = write("broken.json", "1\n2\n}\n");
         for argv in [
-            vec!["jq", "inputs", &clean],
+            vec!["jq", "-s", "inputs", &clean],
+            vec!["jq", "inputs", &broken],
+            vec!["jq", "inputs", &clean, &clean],
             vec!["jq", "-n", "-s", "inputs", &clean],
-            vec!["jq", "-n", "--stream", "inputs", &clean],
             vec!["jq", "-n", "inputs", &broken],
             vec!["jq", "-n", "inputs", &clean, &clean],
         ] {
@@ -13887,6 +14349,96 @@ mod tests {
             assert!(lazy.is_none(), "{argv:?}");
             assert!(!inputs.is_empty(), "{argv:?}");
         }
+        // A plain `--stream` walk without `-n` is read by the stream reader too (#5498): the driver
+        // loop pops its events, so nothing is queued up front, and the reader takes exactly the
+        // runs `stream_walk_by_reader` names.
+        for (argv, by_reader) in [
+            (vec!["jq", "--stream", "inputs", &clean], true),
+            (vec!["jq", "--stream", "-c", "inputs", &clean], true),
+            (vec!["jq", "--stream", "-s", "inputs", &clean], false),
+            (vec!["jq", "--stream", "--seq", "inputs", &clean], false),
+            (vec!["jq", "--stream", "-R", "inputs", &clean], false),
+            (
+                vec!["jq", "--stream", "--input-dsv", ",", "inputs", &clean],
+                false,
+            ),
+            (vec!["jq", "--stream-errors", "inputs", &clean], false),
+            (vec!["jq", "inputs", &clean], false),
+        ] {
+            let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+            assert_eq!(stream_walk_by_reader(&cmd), by_reader, "{argv:?}");
+            let (inputs, _, _, _, lazy) = read(&argv);
+            let stream = LAZY_STREAM_INPUTS.with(|slot| slot.borrow_mut().take());
+            assert_eq!(
+                stream.is_some(),
+                by_reader,
+                "{argv:?}: the reader serves a plain walk, and only that"
+            );
+            if by_reader {
+                assert!(inputs.is_empty() && lazy.is_none(), "{argv:?}");
+                // The mode every caller of `stream_mode` sees, wherever it got the flag from.
+                assert!(
+                    [false, true]
+                        .into_iter()
+                        .all(|reads| stream_mode(&cmd, reads, false) == StreamMode::Off),
+                    "{argv:?}"
+                );
+            }
+        }
+        // `--stream` and `--stream-errors` are read as the program asks too, by jq's streaming
+        // parser rather than from spans (#5498): nothing is queued up front.
+        for flag in ["--stream", "--stream-errors"] {
+            let argv = ["jq", "-n", flag, "inputs", &clean];
+            let (inputs, _, _, _, lazy) = read(&argv);
+            assert!(inputs.is_empty() && lazy.is_none(), "{argv:?}");
+            let stream = LAZY_STREAM_INPUTS.with(|slot| slot.borrow_mut().take());
+            assert!(stream.is_some(), "{argv:?} is read by the stream reader");
+        }
+    }
+
+    /// #5498: the #5661 producer answers each document with jq's line for it, then the end it was
+    /// given, and drops the stream's text with its last document rather than at the read past it,
+    /// so a program that reads exactly every document does not keep the text for the rest of the
+    /// run. The pin must be able to fail: it does, without the `stream = None` that drops it.
+    #[test]
+    fn the_lazy_json_producer_drops_the_text_with_its_last_document_5498() {
+        let text = std::rc::Rc::new(String::from("1\n{\"a\":2}\n\n[3]\n"));
+        let mut producer = lazy_json_producer(
+            LazyJsonInputs {
+                text: std::rc::Rc::clone(&text),
+                spans: vec![(0, 1), (2, 9), (11, 14)],
+                source: 3,
+                seam: Seam::NONE,
+            },
+            Some((3, 4)),
+        );
+        // `jq -nc '[inputs|input_line_number]'` on the same text is `[1,2,4]`.
+        for (want, line) in [("1", 1), (r#"{"a":2}"#, 2), ("[3]", 4)] {
+            match producer() {
+                jq::ProducedInput::Document(value, 3, got) => {
+                    assert_eq!((value.to_json(), got), (want.to_string(), line));
+                }
+                other => panic!("expected {want} at line {line}, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            std::rc::Rc::strong_count(&text),
+            1,
+            "the text goes with the last document"
+        );
+        assert!(matches!(producer(), jq::ProducedInput::End(Some((3, 4)))));
+        assert!(matches!(
+            lazy_json_producer(
+                LazyJsonInputs {
+                    text,
+                    spans: Vec::new(),
+                    source: 0,
+                    seam: Seam::NONE,
+                },
+                None,
+            )(),
+            jq::ProducedInput::End(None)
+        ));
     }
 
     /// #3470: which programs `m2_has_stderr_effect` keeps off the M2 fast
@@ -14005,10 +14557,6 @@ mod tests {
         /// which a program reading an 84 MB `--rawfile` twenty times depends on. Deleting the
         /// loop, or running it after those clones, fails this.
         #[test]
-        #[cfg_attr(
-            feature = "unshared-containers",
-            ignore = "holdout has no node identity or sharing (#5254)"
-        )]
         fn named_strings_are_shared_once_before_anything_clones_them_5713() {
             let mut context = EvalContext::default();
             context

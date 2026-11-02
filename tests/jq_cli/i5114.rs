@@ -13,7 +13,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// #5114: the issue's rows and rows of a differential grid (document x source x caught-bind shape x `//` wrapper x
 /// EXTRACT x `path`/`|=`/`del`) that were refused or answered wrongly before the fix. Every row captured from
 /// `/usr/bin/jq` 1.7.1 (stdout, exit code, message), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5114_foreach_update_alternative_of_a_caught_foreign_foreach() -> Result<()> {

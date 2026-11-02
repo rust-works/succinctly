@@ -16,7 +16,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// #5143: the rows jq raises on (the step is refused, as `.b` is), the rows it answers (an empty or unsuitable accumulator, a
 /// branch not taken, a `try`), under `path` and `|=`. Every row captured from `/usr/bin/jq` 1.7.1 (stdout, exit code,
 /// message), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5143_reduce_moved_source_data_dependent_indexing_in_a_discarded_output() -> Result<()> {

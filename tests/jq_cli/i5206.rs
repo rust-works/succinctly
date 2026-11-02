@@ -10,7 +10,6 @@ use crate::assert_path_rows_both_routes_3749;
 
 /// #5206: the pipe spelling, under `path`, `?`, `|=` and `del`, on `null`, `true` and container elements, with an array pattern, a `.` stage inside the pipe and a `null` EXTRACT; the root source, where `$x` is the register, answers as before.
 /// Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5206_piped_caught_destructure_of_a_foreign_marker_leaves_the_source_empty() -> Result<()> {

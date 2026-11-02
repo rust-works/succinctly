@@ -13,7 +13,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// #5156: the issue's rows (`path`, `|= 9`, `del` over `// .`) and rows of a differential grid (document x source x caught-bind
 /// shape x `//` alternate x wrapper x EXTRACT x `path`/`?`/`|=`/`del`) that were refused or answered wrongly before the fix.
 /// Every row captured from `/usr/bin/jq` 1.7.1 (stdout, exit code, message), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5156_foreach_update_alternative_with_a_value_alternate_of_a_caught_foreign_foreach(
@@ -194,7 +193,6 @@ fn test_5156_foreach_update_alternative_with_a_value_alternate_of_a_caught_forei
 /// wherever the row is a `path(...)`, as jq 1.7.1 answers them (stdout, the
 /// first error message, the exit code). The path-mode interpreter carries
 /// jq's register, so they match by construction, on both routes.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_5156() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

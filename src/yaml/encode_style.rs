@@ -422,7 +422,7 @@ fn flow_single_quoted(s: &str, flow: bool) -> Option<String> {
 ///   flow indicator (`12:30:45`, `2001-12-14T01:02:03Z`), which is single-quoted as a value is
 ///   (#5469). A *value* is left to the caller when
 ///   the YAML 1.2 core schema calls it a string and yq does not (a timestamp, `1_000`,
-///   `0b11`, `<<`); one the core schema also types (`true`, `1`, `null`) can only be a
+///   `0b11`); `<<` is quoted (#5833); one the core schema also types (`true`, `1`, `null`) can only be a
 ///   string that was quoted or computed, and is quoted.
 ///
 /// `flow` is whether the scalar sits inside `[...]` or `{...}`. A string with a line
@@ -435,6 +435,12 @@ pub fn go_yaml_dom_scalar(s: &str, flow: bool, json_sourced: bool, is_key: bool)
                 return None;
             }
             return Some(flow_single_quoted(s, flow).unwrap_or_else(|| String::from(s)));
+        }
+        // A plain `<<` from the document carries its `!!merge` tag and is written behind it
+        // (#5833), so an untagged one is a string that was quoted or computed, and is quoted, as
+        // yq writes `.z = "<<"` (`z: "<<"`).
+        if s == "<<" {
+            return Some(String::from("\"<<\""));
         }
         if matches!(resolve_plain(s), ResolvedScalar::Str) {
             // Inside `[...]` or `{...}` yq quotes by characters alone, so a plain timestamp or
@@ -1526,11 +1532,13 @@ mod tests {
             "1_000",
             "0b11",
             "0X1F",
-            "<<",
         ] {
             assert_eq!(go_yaml_dom_scalar(s, false, false, false), None, "{s:?}");
         }
         for (s, expected) in [
+            // A plain `<<` value carries its `!!merge` tag and is written behind it, so one that
+            // reaches here untagged is a string, quoted in either context (#5833).
+            ("<<", "\"<<\""),
             ("true", "\"true\""),
             ("1", "\"1\""),
             ("null", "\"null\""),
@@ -1550,6 +1558,10 @@ mod tests {
             );
         }
         assert_eq!(go_yaml_dom_scalar("a\nb", false, false, false), None);
+        assert_eq!(
+            go_yaml_dom_scalar("<<", true, false, false).as_deref(),
+            Some("\"<<\"")
+        );
     }
 
     /// #3587: every row is yq v4.53.3's output for the string as a mapping value

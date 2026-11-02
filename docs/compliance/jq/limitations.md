@@ -494,6 +494,13 @@ What remains, recorded here:
   rows (a multiply-add recurrence over `j0`/`j1`) were reduced to their `n = 0, ±1`
   cases plus the order rules as equalities, since no AArch64 Linux host was available to
   measure them on.
+  **Ubuntu 26.04's glibc is a fifth libm** (#5878).
+  It moves last digits in both cases, as the failing CI runs of #5878 show: `tgamma` prints `-3.544907701811032` where the golden has `-3.5449077018110318`, and `lgamma` prints `12.801827480081469` where the golden has `12.80182748008147`.
+  Whether a jq 1.7.1 built on that image prints the same new digits has not been measured yet; that is the first step of un-pinning.
+  `asinh`, `acosh` and the sign `lgamma_r` reports at a pole move too.
+  Every x86_64 Linux CI job is pinned to `ubuntu-24.04` for that reason.
+  `scripts/test_ci_runner_pin.py` fails if one is moved to `ubuntu-latest`.
+  Un-pinning means re-sweeping with `scripts/jq-libm-oracle-sweep.sh` against a jq 1.7.1 built on the new image, then dropping the rows the libms disagree on, as was done for AArch64.
 
 ## Behaviour and parser gaps
 
@@ -556,7 +563,6 @@ jq 1.7.1 rejects each such program at compile time (`key/0 is not defined`), so 
 A dynamic-target program over a document the interpreter cannot materialize whole (a lone surrogate, a scalar at the 257th level) raises the decode error (`invalid unicode escape sequence`, `nesting depth exceeds limit of 256`, exit 5).
 jq rejects the lone surrogate when it parses the document, with its own parse error (`Invalid \uXXXX\uXXXX surrogate pair escape`), so the wording and the reported location differ from jq's while both refuse; a program with no dynamic target still decodes only what it reads (#4412).
 A document past jq's own parse-depth limit never reaches the interpreter: every document route refuses it first, as jq does (see "Nesting depth" below, #5497); the scalar at the 257th level is one jq accepts, the materializer's band recorded there.
-The `unshared-containers` A/B holdout, a measurement build that never ships, refuses a dynamic-target program outright: its by-value `jv_identical` makes the interpreter refuse rows jq answers, and the shipped resolver no longer answers such a target.
 yq mode is unchanged.
 
 So the sections below that describe the path resolver's inferred register (the `Path-mode ...` sections, the register refusals under [Where succinctly errors and jq does not](#where-succinctly-errors-and-jq-does-not), the "artefact guard" and every "refused where jq answers" row) describe the shipped route, which jq mode no longer reaches with a dynamic target.
@@ -587,7 +593,6 @@ The interpreter's own recorded divergences:
   [#5233](https://github.com/rust-works/succinctly/issues/5233) removed the shipped resolver from jq mode's dynamic targets, so the other dynamic targets beside those builtins (a bind in the target with no fold: `at_offset(5) as $x | del(.a | $x)`; a fold outside every path target) are refused the same way instead of answered from the inferred register.
   Since [#5243](https://github.com/rust-works/succinctly/issues/5243) an index key that only computes a value is navigation, so `.a[(0,1)] |= key` has a static target and answers again (`{"a":[0,1,3]}`).
   A document the interpreter cannot materialize (a lone surrogate, nesting past 256 levels) still runs on the shipped route for every program, as above.
-  The `unshared-containers` holdout keeps the shipped routing and refuses nothing.
 
 ## `as` binds the Term before it, in jq mode (#3397)
 
@@ -7247,7 +7252,7 @@ What still differs:
 
 - Under `--slurp` the message has no `at line L, column C`: the files are joined into one array before it is indexed, so the position is gone by then.
 - jq's `--stream` uses its streaming parser, which has no depth limit, and succinctly's `--stream` does not apply jq's parse limit either.
-  It still materializes each document before it streams the events, though, so it stops at the materializer's ceiling below (a document of 257 nested arrays), where jq streams on.
+  Except without `-s` (#5498), it still materializes each document before it streams the events, though, so it stops at the materializer's ceiling below (a document of 257 nested arrays), where jq streams on.
 - The routes that materialize a document (`input`/`inputs`, `--slurpfile`, and the filters that build an owned copy, such as `tojson`, `del` and `sort`) check every node, leaves included, against `MAX_NESTING_DEPTH` (256).
   A document jq accepts with a scalar at its 257th level, which only 256 nested containers can hold (`[[…[1]…]]` with 256 arrays, or 255 arrays around `{"a":1}`), is refused there with `nesting depth exceeds limit of 256`.
   The guard is shared with `succinctly yq` across the evaluator, and a one-level band is not worth moving it for.
@@ -7259,18 +7264,26 @@ A document cannot be that deep any more, so only a value the program builds reac
 Under `-C` the marker takes the color of the value it replaces, followed by a reset, as in jq.
 Before #5497 a value 257 to 383 levels deep printed in full.
 
-**Building.** succinctly still refuses a value more than 384 levels deep (`MAX_VALUE_TREE_DEPTH`), where jq's only limit is its C stack (`[.,.] | sort` segfaults at 100,000 levels, and `length` at 1,000,000).
-Since [#5554](https://github.com/rust-works/succinctly/issues/5554) the output is not where it refuses: a value the program builds past 384 levels and hands to the CLI's output is printed as jq prints it, 256 levels and then the marker, in jq mode.
-`reduce range(1000) as $i ([]; .[0] = .)` and `1, setpath([range(400)|0]; 1), 7` print as in jq on every route and flag (compact, pretty, `--tab`/`--indent`, `-S`, `-C`, `-a`, `-r`, `--seq`, `-e`, `--slurp`).
-What still refuses is the program that builds or consumes such a value through the re-index bridge: a fold step with no owned door, `[., 1]` around it, a comma after it, `error`, `halt_error`, `debug`, `stderr` or `first`.
-`reduce`/`foreach` re-index their accumulator on every step and refuse one past 384 levels whatever the program does next.
-`tojson`/`tostring`/interpolation (and `@json`/`@text`) used to materialize a value past 384 levels before writing it, so the marker did not help them there.
-Since [#5554](https://github.com/rust-works/succinctly/issues/5554) a pipe whose first stage only renders its input as text answers a value the re-index bridge refused from the tree, with the marker where jq puts it: `def f(n): if n == 0 then 0 else [f(n-1)] end; f(1000) | tojson | length` is `533`, as in jq.
-Only a refusal asks for that, so a value under the limit reads as before, and it is jq mode only.
-A leading `( … | … )` group is read as its stages, and a consumer that stops early (`first`, `limit`, `isempty`) stops the rest too.
-The stage also answers under `try`/`?` (a text stage cannot fail), as the source of an `as` whose body never reads `.` (`f(400) | tojson as $x | $x | length`), and as a format-prefixed interpolation (`@json "x\(.)"`).
-The same stage inside a comma, `map`, a `?` that guards a longer pipe, or an iteration of an array that is itself too deep still reads the refusal, and so does an uncaught `error` of a deep value, which jq prints through the same writer.
-ADR-0025's stack floor relies on that bound for the walks over a built value between its checks, so lifting it is a design of its own; see "Recursive `def`s" below for the shapes that reach it.
+**Building.** jq's only limit on a value the program builds is its C stack (`[.,.] | sort` segfaults at 100,000 levels, and `length` at 1,000,000).
+succinctly refused such a value past 384 levels (`MAX_VALUE_TREE_DEPTH`) wherever it was re-indexed or walked, which in practice meant nearly every consumer.
+Since [#5554](https://github.com/rust-works/succinctly/issues/5554) a walk over a built value that is past 384 levels checks ADR-0025's native-stack floor once per level instead of refusing, in jq mode.
+A value is then refused only where the walk has spent half the evaluation thread's stack.
+Every row of #5554's table answers as jq 1.7.1 does, byte for byte: `reduce range(500) as $i (0; [.]) | length` is `1`, `reduce range(400) as $i (0; [.]) | flatten` is `[0]`, and `def f(n): if n == 0 then 0 else [f(n-1)] end; f(400) | tojson | length` is `533`.
+So do the consumers that used to refuse inside the evaluator: `[., 1]`, a comma after the value, `first`, `map(tojson)`, `.[] | tojson` over an array of them, `@json "\(tojson)"`, `error`, `halt_error`, `debug`, `stderr`, `sort`, `==`, `walk`, `paths`, `tostream`, `getpath`, `del` and `|=`.
+A value handed to the CLI's output prints as jq prints it, 256 levels and then the marker, in jq mode (#5780); `tojson`, `tostring`, interpolation and `@json`/`@text` stop at the same depth.
+Past the floor the walk refuses with `nesting depth exceeds limit of the native stack` at exit 5, uncatchable, where jq has long since segfaulted.
+On the 256 MiB release thread the re-index bridge refuses between about 697,000 and 699,500 levels (Apple Silicon); a walk with heavier frames (`walk(.)`, `flatten`) refuses sooner, and a debug build or x86_64 at depths of their own.
+The text stage of #5598/#5743 stays as the fallback there: a pipe whose first stage only renders its input as text (`tojson`, `tostring`, `"\(.)"`) answers from the tree even past the floor.
+One cost remains.
+A fold whose step is a constructor around the accumulator (`[.]`, `[., <closed>…]`, `{k: .}`, with every other member closed or reading scalars off the accumulator: `length`, `type`, a field, integer `+`, `-` and `*` such as `.n + 1`) builds it on the moved state, so it is linear in the number of steps, as jq's is ([#5875](https://github.com/rust-works/succinctly/issues/5875), [#5893](https://github.com/rust-works/succinctly/issues/5893)).
+Before that it re-indexed the whole accumulator on every step and was quadratic past 384 levels (17 s at N = 40,000, against 0.03 s in jq).
+A member that reads a container out of the accumulator (`[., .a]`), a float (`.n / 2`) or `tojson` costs `O(accumulator)` a step and is quadratic, as is a step of any other shape that constructs from `.`.
+`paths`, `tostream` and `[path(..)]` over a value hundreds of thousands of levels deep build output quadratic in its depth, as jq's would, and need the memory for it.
+`succinctly yq` takes the same floor since [#5876](https://github.com/rust-works/succinctly/issues/5876); see the yq limitations page.
+
+**Dropping.** A fold whose step has an owned door (`.[0] = .`, `[.]`, `{k: .}`) shares the accumulator instead of copying it, so the value it builds can be millions of levels deep (`reduce range(10000000) as $i ([]; .[0] = .) | length`).
+jq 1.7.1 segfaults on that program from a few hundred thousand levels (between 150,000 and 200,000 on macOS with an 8 MB stack); succinctly prints `1` ([#5782](https://github.com/rust-works/succinctly/issues/5782)).
+The divergence is deliberate (ADR-0018: a reference that takes the process down is not matched): past 256 nested container drops, dropping such a value is iterative, on a heap worklist, so the native stack it needs is bounded.
 
 ### Before #5497
 
@@ -8187,7 +8200,9 @@ Three differences remain, none of which aborts the process:
   limit.** `def deep(m): if m == 0 then . else [[…]]deep(m-1)[[…]] end; deep(60)` builds
   1,200 levels; jq prints it, and so does succinctly since #5554 (the output check that
   reported `nesting depth exceeds limit of 384` and exited 5 is gone in jq mode; see Printing
-  above). Before #1371 this shape could not recurse far enough to reach the ceiling at
+  above).
+  Since #5554 `succinctly jq` also bounds every other walk over such a value by the native-stack floor rather than by 384 (see Building above); the history below is of the 384 guard, which `succinctly yq` and an unregistered library thread still have.
+  Before #1371 this shape could not recurse far enough to reach the ceiling at
   all. Between f2789080a (2026-08-29) and #3261, the guard's most commonly reached call
   site -- `reduce`/`foreach`'s own per-iteration reindex bridge
   (`OwnedValue::to_json_for_reindex`), which every ordinary evaluation of this shape
@@ -8207,12 +8222,14 @@ Three differences remain, none of which aborts the process:
   `succinctly yq`'s own YAML-emission pipeline (`yq_runner.rs`'s `emit_yaml_value_at_depth`
   and four sibling `assert_value_tree_depth` call sites, reached by a write (`=`/`|=`/`+=`)
   whose right-hand side constructs a deep value directly rather than through the reindex
-  bridge) still asserts, but `run_yq` now catches exactly that panic (#3278) and reports the
-  same `nesting depth exceeds limit of 384` diagnostic with yq's own error status (exit 1,
-  where `succinctly jq` exits 5), not an uncaught exit 101. Unlike the checked guards above
-  this is a `catch_unwind` net rather than an `EvalError`, so the failure ends the run
-  instead of being an error a `try` could see; the emission recursion has no `Result` to
-  thread it through.
+  bridge) still asserts, and `run_yq` catches exactly that panic (#3278) and reports it with
+  yq's own error status (exit 1, where `succinctly jq` exits 5), not an uncaught exit 101.
+  Since #5876 the assertion is the native-stack floor's, as in jq mode: `.a |= deep(400)`
+  prints the value at exit 0, and the diagnostic is `nesting depth exceeds limit of the
+  native stack`, past where the walk has spent half the evaluation stack. Unlike the checked
+  guards above this is a `catch_unwind` net rather than an `EvalError`, so the failure ends
+  the run instead of being an error a `try` could see; the emission recursion has no
+  `Result` to thread it through.
   `succinctly jq` has the same net for the evaluator's own splice sites
   ([#5526](https://github.com/rust-works/succinctly/issues/5526)).
   `+=`, `//=` and a fold's `$x` read where a step cannot hand it on (`reduce f as $x (0; if $x then 1 else 2 end)`) on a value built past 384 levels
@@ -8221,6 +8238,8 @@ Three differences remain, none of which aborts the process:
   `reduce f as $x ([]; . + [$x])` and `.x = $x` joined it in [#5540](https://github.com/rust-works/succinctly/issues/5540); the spellings listed under "Still different" in the shared-fold section still splice.
   They exited 101 with a raw panic; the three CLI routes and the library's `jq::eval` now catch exactly that panic.
   The CLI reports `nesting depth exceeds limit of 384` at exit 5, the same refusal `reduce` gives.
+  Since [#5554](https://github.com/rust-works/succinctly/issues/5554) `succinctly jq` asserts the native-stack floor there instead of the constant (see "Building" under "Nesting depth" above), so these programs answer as jq does, and past the floor the net reports `nesting depth exceeds limit of the native stack` at exit 5.
+  `+=` and `//=` no longer splice a container operand ([#5761](https://github.com/rust-works/succinctly/issues/5761)), and the depth walk kept in their place has frames small enough that a value two million levels deep fits under the floor, so they answer there too; a fold's `$x` still refuses past it.
   `jq::eval` returns it as a `resource_limit` error.
   As with the yq net, it is a `catch_unwind` net and so ends the evaluation, not an error a `try` could see.
   jq prints all of these values (`1` for each of the four programs in `tests/jq_cli/i5526.rs`).
@@ -9577,7 +9596,7 @@ which keeps the splitter's clean prefix instead of discarding it, and queues the
 behind it for `input`/`inputs` (catchable there, delivered once, `break` after).
 The error is jq's parser's own text and position since [#5555](https://github.com/rust-works/succinctly/issues/5555) (`jq: parse error: Unfinished JSON term at EOF at line 2, column 5`, with no `(at …)` marker from the driver loop; under `input`/`inputs` it is `jq: error (at <file>:<line>): …`).
 It is the first fault in jq's input, counting lines across files, whether the splitter stopped there or on a later one.
-`--stream` reads with jq's streaming parser, and a splitter failure there still reads `Invalid JSON text`.
+`--stream` reads with jq's streaming parser, and a splitter failure there reads that parser's own text (`Unmatched '}' at the top-level at line 1, column 5`) since #5498, except under `-s`, which still reads `Invalid JSON text`.
 A malformed *member* the semi-index accepts is a separate case below: it is found when the filter reads it, and is worded as jq's parser words it since [#5576](https://github.com/rust-works/succinctly/issues/5576).
 A parse error stops the whole input stream on both routes, as it
 does in jq: the files after the malformed one are not read ([#4313](https://github.com/rust-works/succinctly/issues/4313);
@@ -9780,6 +9799,16 @@ generic-evaluator arm no longer materializes a cursor-shaped inner result, so a
 single-element `[...]` forwards its element's own cursor through `.[0]` instead of decoding
 it. `[.] as [$x] \| $x` stays doubled — pattern destructuring binds through a different,
 still-materializing route.
+
+**#5807 re-derived the golden, and the rule held on `{k: .}` too.**
+The sweep had drifted again, by 26 lines.
+Sixteen are `keys_unsorted` rows on malformed documents, which now print nothing before exit 5, as jq does.
+The rest are lone-surrogate and invalid-escape documents.
+`. as $x | $x` and `.[] | . as $x | $x` now echo the document at exit 0, the same "a filter validates only what it reads" echo plain `.` gave (#5308).
+`{k: .}` over `{"a\q":1,"b":2}` now spells the key raw, `{"k":{"a\q":1,"b":2}}`, where the golden had it doubled.
+That is the rule above and not a new spelling: `{k: .}` forwards `.` without decoding it, as `[.] | .[0]` does (#2575).
+Anything that materializes the value still doubles: `{k: .} | tojson`, `{k: .} | .k | keys` and `{k: .} | .k + {}` print `a\\q`.
+The sweep now runs under `succinctly dev compare jq --dimension sweeps` as `m2-streaming`, so a third drift fails a run.
 
 The sweep is a verification tool, not a CI gate, which is how the drift survived long
 enough to be absorbed by an unrelated `--update`;
@@ -10281,15 +10310,32 @@ What differs from jq 1.7.1:
   A locale layout that prints the zone itself (glibc's `en_GB` `%c` ends in `%Z`) takes the same zone labels.
 - **`%E*` and `%O*` follow the plain specifier.**
   Under a locale whose C library has alternative era or digit forms (`ja_JP` on glibc) the plain form is printed.
-- **An empty result is not an error.**
-  jq raises `strftime/1: unknown system failure` for `%p` under `de_DE`, where the library prints nothing (macOS and glibc alike); this prints an empty string.
+- **An empty result, or one past jq's buffer, is an error.**
+  jq hands the library a buffer of `strlen(fmt) + 100` bytes and raises `strftime/1: unknown system failure` (`strflocaltime/1:` for the local-zone one) when `strftime` returns 0.
+  So does this: an empty format, `%p` under `de_DE` (the library prints nothing there, macOS and glibc alike) and a result of `strlen(fmt) + 100` bytes or more (five `%c`) are that error, and `strftime("...")?` is empty.
+- **`_`, `-` and `0` are padding flags on the numeric specifiers.**
+  They apply to `%d %e %H %I %j %k %l %m %M %S %U %V %W` and to `%z`, which the library prints as a signed `hhmm` number (`+0530` is `+ 530` with `_` and `+530` with `-`).
+  Every other specifier ignores them, including `%y %Y %C %g %G`, where a glibc `jq` pads and strips as well.
+  `%E` and `%O` modifiers pass through for every specifier, and a flag may stand before or after one (`%-Ed` and `%E_d`); a second modifier or flag is a character that names nothing, and a flag or modifier that ends the format is printed as itself.
+  `%+` is `%a %b %e %H:%M:%S %Z %Y` and `%v` is `%e-%b-%Y`, as the pinned libc has them.
+  A NUL in the format ends it, as it ends a C string (`"a\u0000b"` formats as `a`), and the buffer limit is measured on the part before it.
+  A character after `%` that names nothing is printed bare, with the flag before it dropped: `%Q` is `Q`, `%5Y` is `5Y` and `%^a` is `^a`, where a glibc `jq` honours `^`, `#` and a width and prints `%Q` as written.
 - **`strptime` reads the locale's names and layouts.**
   `%a %A %b %B %h %p` take the names `strftime` prints in the process locale: a day's or month's full name, else its abbreviation, ASCII-case-insensitively and every other character exactly (`märz` matches `März`, `MÄRZ` does not).
   `%c %x %X %r` stand for the locale's layouts (`nl_langinfo_l`'s `D_T_FMT`, `D_FMT`, `T_FMT` and `T_FMT_AMPM`), C's `%a %b %e %H:%M:%S %Y`, `%m/%d/%y`, `%H:%M:%S` and `%I:%M:%S %p` without one, and are read as if the format spelled them out.
   A layout the library holds empty is empty: macOS prints and reads nothing for `%r` under `de_DE`, though `nl_langinfo` reports a layout there, so `"11:53:41 " | strptime("%r")` is an error.
   A layout holding a specifier `strptime` does not read here (a `_` or `-` flag, `%k`, `%l`) fails on text that has it.
   macOS fails the same way for `ja_JP`'s `%c`, which holds `%_m`; glibc may read such a layout, so a glibc `jq` can accept text this rejects.
-  `%E*` and `%O*` modifiers (`%Ex`, `%Ec`, `%Oy`) are not read by `strptime` in any locale, where jq reads them as the plain specifier (`"03/05/15" | strptime("%Ex")`).
+  `%E*` and `%O*` modifiers (`%Ex`, `%Ec`, `%Oy`) are read by `strptime` as the plain specifier, as jq reads them (`"03/05/15" | strptime("%Ex")`).
+  Only a specifier can follow a modifier: `%E%`, `%EE` and a bare `%E` are no match.
+  The pin's libc reads `%OB` from the alternative month names, which C holds as the full names alone, so `%OB` takes `March` but not `Mar`, and `%Ob` and `%Oh` take neither; a glibc `jq` reads the abbreviation with `%O` as it does without.
+  The pin's libc puts no limit on which specifier a modifier precedes; glibc reads `%E` only before `c C x X y Y` and `%O` only before `d e H I m M S U V W w y`, so a glibc `jq` rejects `"03" | strptime("%Em")`.
+  `%k` and `%l` are read as `%H` and `%I`.
+  The pin's libc does not skip a leading space before them (`" 9" | strptime("%k")` is an error, as here), where glibc does.
+  A specifier the libc does not know (`%Q`, `%P`, `%5`) and a `%` that ends the format are no match, where they were once matched as a literal.
+  `%g` and `%G` are no match in the pin's libc and here, and glibc reads them.
+  `%U`, `%W` and `%V` are still no match here, though the pin's libc reads them and derives a date from them when a year is read (`"2015 09" | strptime("%Y %U")` is `[2015,2,1,0,0,0,0,59]`).
+  `%Z` takes a run of letters here, where the pin's libc reads only a name of the local zone and fails on the rest.
   An empty am marker matches nothing and reads as am, as on macOS under `de_DE`, where `%p` prints nothing and `PM` is left over.
   `%a`, `%A` and `%p` no longer read any run of letters: `Xyz`, `Thurs`, `Th` and `PMX` are no match, as in jq.
 
@@ -12597,8 +12643,7 @@ from yq, which has `key`/`parent` and rejects these documents too.
 this whole class of document, through `.d` itself, and has since long before #2168: the
 semi-index accepts input jq's parser rejects, deliberately and at a measured price — always-on
 strict validation costs two thirds of the runtime of a cheap navigation query
-([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md), "Why not
-upfront validation for everyone"), which is the trade `CLAUDE.md`'s own "minimal validation"
+([`docs/architecture/semi-indexing.md`](../../architecture/semi-indexing.md#validation-is-not-done-up-front)), which is the trade `CLAUDE.md`'s own "minimal validation"
 note describes. So the real choice was never "match jq or not" but "diverge uniformly, or
 diverge in a way that depends on the spelling". That is context, **not** a licence: ADR-0018's
 scope note explicitly warns that an evaluator behaviour may not be reframed as a spec-level
@@ -13638,17 +13683,28 @@ jq emits events while it parses, so one thing differs for the shapes below, a re
   (`docs/plan/jq-duplicate-key-collapse.md`).
   Since #5618 a run that keeps the events (`-s`, `input`/`inputs`) builds them from the document's index instead, and a document with a repeated key (compared after decoding, so `"\u0061"` repeats `"a"`) is still sent through the parsed value so that the collapse stays.
 
+Since #5498, `--stream` without `-s` and `--seq` does not have the three divergences above, and does not materialize its events: under `-n` with `input`/`inputs`, and, since the plain walk was routed too, as a program that reads `.`.
+It reads with the same port of jq's streaming parser that `--stream-errors` uses, and hands each event to the program when it asks for it, so memory holds the input's bytes and the parser's state, not the events.
+Each event carries the line jq had read when it yielded it, a repeated key is emitted every time, a document of any depth is read, and a parse error is raised by the read that reaches it, with jq's own text and position (`Expected separator between values at line 2, column 7`), as `input` raises it.
+A plain walk prints a fault as jq's main loop does, `jq: parse error: <message>` with no `(at …)` marker, after the events before it, at exit 5.
+`tests/jq_cli/i5498.rs`, `tests/jq_cli/i5498_plain_walk.rs` and the `--stream` rows of `tests/jq_cli/i5618.rs` pin it, and 6,040 stream-by-program runs over malformed and well-formed streams, one or two files, matched `/usr/bin/jq` 1.7.1 on stdout, stderr and exit status, as did a 1,980-row differential run of a plain walk (22 streams, 15 programs, 3 flag sets, a file and stdin), of which 1,264 rows are pinned by `tests/jq_cli/i5498_plain_walk.rs`.
+A 70 MB document walked with `select(length==2)|empty` peaks at 72 MB (the old walk: 664 MB; jq: 2 MB, which reads 4 KB at a time where the reader here takes the file whole).
+The one other `--stream` route, `-s`, still builds the events from the parsed document and keeps every difference described here.
+One difference is not about the route: a file that does not open and is named before one that does makes jq's `--stream` stop after the first event of the later file (`jq -c --stream . missing.json a.json` prints `[[0],1]` and the open error, exit 2), where succinctly prints every event.
+Both `-n` with `inputs` and a non-stream run agree with jq there, so the quirk is in jq's streaming parser's state after the failed open, not in what the program reads.
+
 `--stream-errors` is accepted (#5474).
 It implies `--stream` and reports a parse error as an input of the form `[message, path]`, as jq does, and goes on reading with the next line.
 Unlike `--stream`, it does not build its events from a whole-document parse: the events a malformed document produced before the fault, and the path at the fault, are properties of jq's own incremental parser, so `jq_stream_errors.rs` is a port of the streaming half of jq 1.7.1's `jv_parse.c`.
 It follows jq in four details: it reads one `fgets` line at a time (the rest of a line is dropped after an error), a value completed by the byte that then fails is lost, there is no depth limit, and `--slurp` closes its array at the call that empties jq's buffer.
-Its events are materialized rather than streamed, like `--stream`'s, so memory grows with the input.
+Its events are materialized rather than streamed, so memory grows with the input, except under `-n` with `input`/`inputs` (no `-s`), where they are handed out as the program asks (#5498).
 `--validate` still runs first and rejects a malformed input outright, since strict validation is what it asks for.
 Under `-R` and `--input-dsv` the flag is ignored, as `--stream` is.
 It is pinned by `tests/jq_cli/i5474.rs` and was checked against `/usr/bin/jq` on random malformed inputs, with stdout, exit status and the `(at <file>:<line>)` marker compared.
 One shape differs: `--seq` combines with `--stream-errors` in jq (`printf '[1,2' | jq --seq --stream-errors -c .` prints `["Unfinished abandoned text at EOF at line 1, column 4",[]]`), and here `--seq` wins and the flag is ignored, as it is for `--stream`.
 A document that fails to parse part-way has already emitted the events of what it finished in jq (`printf '[1,' | jq --stream -c .` prints `[[0],1]` and then the parse error).
 Since #5635 `succinctly jq --stream` prints them too, in front of the error, and they carry the line jq had read when it yielded each.
+Without `-s` the reader above yields them as it goes (#5498), and the rest of this paragraph describes `-s` and `--stream-errors` without `-n`.
 The document is parsed whole first, so the events are not streamed: once that parse fails, the bytes from the malformed document through the end of the read that holds the fault are read again with the port of jq's streaming parser that `--stream-errors` uses (`jq_stream_errors::events_before_fault`).
 A program using `input`/`inputs` gets them ahead of each fault it resumes after, and one that never reads past them never meets the fault.
 A stream that fails to parse is therefore expanded to events up front, where a stream that parses is walked one document at a time, so a large input with a syntax error near its end holds every earlier document's events in memory first.
@@ -13656,11 +13712,8 @@ The error text and position are the ones the whole-document parse gives (stderr 
 
 `-b` is accepted and ignored, as jq does outside Windows; `--binary` is rejected there (`Unknown option --binary`, exit 2) and here.
 
-`--stream` itself still parses the document whole, so it does not give jq's
-constant-memory streaming of a large document: a program that reads `.` walks each document's events one at a time
-(`tostream_events_iter`, memory proportional to the depth on top of the document), and one that uses `-s` or
-`input`/`inputs` keeps every event (a 10.8 MB array of 120,000 records peaked at 622 MB with the events kept and
-310 MB walked one at a time, against jq's 2.4 MB).
+`--stream -s` still parses the document whole, so it does not give jq's constant-memory streaming of a large document: it keeps every event, as jq does, but builds them from the parsed document, so a 10.8 MB array of 120,000 records peaked at 622 MB with the events kept, against jq's 2.4 MB for a walk.
+A plain walk, which used to read `tostream_events_iter` over that document at 310 MB, is read by the reader above since #5498.
 
 ## ANSI color bytes: `-C` writes jq 1.7.1's bytes, redundant repeats included ([#5473](https://github.com/rust-works/succinctly/issues/5473))
 

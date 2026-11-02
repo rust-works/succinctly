@@ -58,7 +58,7 @@ jobs:
   # them: it fails towards testing. A push that bypassed the queue (an admin push) has no such run and gets the full suite.
   gate:
     name: Gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: read           # dorny/paths-filter lists the PR's files
@@ -187,7 +187,7 @@ jobs:
     # reliably blocking merge (#3084). `needs.test-x86-matrix.result` is `success`
     # only when every matrix leg succeeded.
     if: always() && needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - run: |
           test "${{ needs.test-x86-matrix.result }}" = "success" \
@@ -204,7 +204,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -249,10 +249,19 @@ jobs:
           # of sailing through on AVX2 dispatch. The in-lib contract test
           # (test_succinctly_simd_env_contract) fails this leg if the clamp
           # ever stops applying or the value here is typo'd.
+          #
+          # #5409: the bin's unit tests under `bench-runner`. `compare` and
+          # `bench_runner` are `#[cfg(feature = "bench-runner")]`, and no other
+          # leg builds the bin with that feature (coverage's `--bins` does not
+          # enable it), so their tests -- among them the guards that hold
+          # docs/benchmarks/jq.md and docs/reference/jq-language.md to the
+          # committed docs/compare/ runs -- ran nowhere. A unit test does not
+          # relink `target/debug/succinctly`, so #1705 does not apply.
           - name: bench-runner-and-sse2-dispatch
             buildCli: true
             testCmd: |
               cargo test --features cli,bench-runner --test orchestrate_cli_tests
+              cargo test --features cli,bench-runner --bin succinctly
               SUCCINCTLY_SIMD=sse2 cargo test --verbose
           - name: default
             buildCli: false
@@ -270,17 +279,6 @@ jobs:
           - name: scalar-yaml
             buildCli: false
             testCmd: cargo test --verbose --features simd,scalar-yaml
-          # #5254: `--all-features` builds the `unshared-containers` A/B holdout (#2999), which
-          # refuses a dynamic jq path target (#5233) and has no node identity, so the tests that
-          # need either carry `ignore = "holdout ..."` (#5246) and what is left must pass. Nothing
-          # else here builds that feature, so without this leg its tests drift unseen. Only the
-          # two stack-filling tests run in their own leg below (`skip-args-stack`); the slow
-          # tests that moved there with them (#5494) still run here, under the holdout build.
-          - name: holdout
-            buildCli: false
-            testCmd: |
-              skip=$(scripts/deep-recursion-tests.sh skip-args-stack)
-              cargo test --all-features --test jq_cli_tests --lib -- $skip
           # #2114: `cargo check` doesn't build test targets at all, so it never
           # caught #2083 (a std-only symbol reachable from test code with no
           # matching cfg gate) -- `cargo test` both builds and runs them.
@@ -382,7 +380,7 @@ jobs:
     # See test-x86 above for why this is `if: always()` + a result check rather
     # than a bare `needs:` (#3084).
     if: always() && needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - run: |
           test "${{ needs.test-arm-matrix.result }}" = "success" \
@@ -403,9 +401,12 @@ jobs:
             testCmd: |
               skip=$(scripts/deep-recursion-tests.sh skip-args)
               cargo test --features cli --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests -- $skip
+          # The bin's `bench-runner` unit tests run here too (#5409; see the x86_64 leg).
           - name: bench-runner-gated
             buildCli: true
-            testCmd: cargo test --features cli,bench-runner --test orchestrate_cli_tests
+            testCmd: |
+              cargo test --features cli,bench-runner --test orchestrate_cli_tests
+              cargo test --features cli,bench-runner --bin succinctly
           - name: default
             buildCli: false
             testCmd: cargo test --verbose
@@ -478,6 +479,13 @@ jobs:
               source scripts/lib/clippy-variants.sh
               cargo clippy --all-targets --features "$CLIPPY_CORE_FEATURES" -- -D warnings
               cargo clippy --all-targets --features "$CLIPPY_ARM_BROADWORD_FEATURES" -- -D warnings
+              # #5908: rustdoc has the blind spot clippy has. `--all-features` compiles out the
+              # NEON YAML backend (`scalar-yaml`) and cannot select the broadword one
+              # (`broadword-yaml`), so the `Documentation` job, which is x86_64, never documents
+              # neon.rs or broadword.rs. The same two lists, on the architecture that builds them.
+              export RUSTDOCFLAGS="-D warnings"
+              cargo doc --no-deps --features "$CLIPPY_CORE_FEATURES"
+              cargo doc --no-deps --features "$CLIPPY_ARM_BROADWORD_FEATURES"
           # #3698, #5494, #5705: the slowest jq_cli_tests (20 of them) and all of `yq_cli_tests`, split out
           # of `cli-gated`; same list and guards as the x86_64 leg's (see the comments on its entries).
           - name: deep-recursion
@@ -624,7 +632,7 @@ jobs:
     # See test-x86 above for why this is `if: always()` + a result check rather
     # than a bare `needs:` (#3084).
     if: always() && needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       MATRIX: ${{ needs.test-macos-arm-matrix.result }}
       GATE: ${{ needs.gate.result }}
@@ -747,7 +755,7 @@ jobs:
       matrix:
         include:
           - name: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - name: ARM64-Linux
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
@@ -786,6 +794,11 @@ jobs:
       # target once: no build, `cargo metadata` at most.
       - name: coverage-shards.py self-tests
         run: python3 scripts/test_coverage_shards.py -v
+
+      # #5878: pins every x86_64 Linux runner to ubuntu-24.04, the glibc the jq libm goldens were
+      # verified on; a runner-image move then has to edit that test, not happen silently.
+      - name: ci-runner-pin self-tests
+        run: python3 scripts/test_ci_runner_pin.py -v
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -880,7 +893,7 @@ jobs:
         id: baseline-download
         if: steps.baseline.outputs.artifact != ''
         continue-on-error: true
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: ${{ steps.baseline.outputs.artifact }}
           path: /tmp/perf-guard-baseline-bin
@@ -1015,7 +1028,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1058,7 +1071,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1084,7 +1097,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -1102,7 +1115,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1117,13 +1130,26 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+      # #5740: `--all-features` turns on `scalar-yaml` and `portable-popcount`, which compile out
+      # the x86_64 YAML SIMD backend and the AVX-512 popcount path, so the run above never sees
+      # their docs (two broken intra-doc links sat in that backend). The feature list is the
+      # clippy one (scripts/lib/clippy-variants.sh), which excludes both, so this x86_64 runner
+      # documents what a default build compiles.
+      - name: Build docs with the SIMD backends compiled in
+        if: needs.gate.outputs.code == 'true'
+        run: |
+          source scripts/lib/clippy-variants.sh
+          cargo doc --no-deps --features "$CLIPPY_CORE_FEATURES"
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   # Pull-request coverage: the sticky patch-coverage comment, diffed against the
   # baseline that coverage-baseline.yml published for the PR's merge-base. Only
   # `pull_request` runs it (#3649): a merge-group build has no PR to comment on
   # (#310), and the push-to-main run that publishes the baseline lives in
   # coverage-baseline.yml, where an unrelated job failing or being cancelled
   # here can no longer make the artifact unreachable. The jobs live in
-  # .github/workflows/coverage.yml, shared with that workflow: four test shards per
+  # .github/workflows/coverage.yml, shared with that workflow: three test shards per
   # architecture and a report job that combines them (#5711).
   coverage:
     name: Coverage (${{ matrix.name }})
@@ -1134,7 +1160,7 @@ jobs:
       matrix:
         include:
           - name: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - name: ARM64
             runner: ubuntu-24.04-arm
     # A called workflow cannot hold more than its caller grants it.
@@ -1160,7 +1186,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1188,7 +1214,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1227,7 +1253,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1256,7 +1282,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1282,7 +1308,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
@@ -1314,7 +1340,7 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'

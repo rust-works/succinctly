@@ -1,3 +1,4 @@
 category = "host-dependent"
 issue = "#5753"
-reason = "Same platform-dependent weekday as `locale-strptime-ampm-c`, under `tr_TR.UTF-8` (a host without that locale falls back to `C`)."
+reason = "Same platform-dependent weekday as `locale-strptime-ampm-c`, under `tr_TR.UTF-8`, on a host without that locale (it falls back to `C`). A host that has the locale matches: neither tool parses `PM` there, and both exit 5."
+volatile = true

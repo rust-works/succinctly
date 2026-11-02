@@ -1425,9 +1425,8 @@ const ROWS: &[Row] = &[
     ),
 ];
 
-#[test]
-fn a_string_builtin_over_a_string_input_answers_as_jq_5816() -> Result<()> {
-    for (filter, text, expected) in ROWS {
+fn check(rows: &[Row]) -> Result<()> {
+    for (filter, text, expected) in rows {
         let arg_filter = format!("$s | {filter}");
         let line = format!("{text}\n");
         let runs: [(Vec<&str>, Option<&str>); 3] = [
@@ -1445,4 +1444,1854 @@ fn a_string_builtin_over_a_string_input_answers_as_jq_5816() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[test]
+fn a_string_builtin_over_a_string_input_answers_as_jq_5816() -> Result<()> {
+    check(ROWS)
+}
+
+/// #5816: the string-to-string stages (`ltrimstr`, `rtrimstr`, `tostring`, `. + "lit"`) of a string
+/// input, alone and as the head of a pipe, over the same three input modes, with a non-string
+/// argument included.
+const STAGE_ROWS: &[Row] = &[
+    (
+        "ltrimstr(\"x\")|length",
+        "",
+        [("0\n", 0), ("0\n", 0), ("0\n", 0)],
+    ),
+    (
+        "ltrimstr(\"x\")|length",
+        "a",
+        [("1\n", 0), ("1\n", 0), ("1\n", 0)],
+    ),
+    (
+        "ltrimstr(\"x\")|length",
+        "hello zzz world",
+        [("15\n", 0), ("15\n", 0), ("15\n", 0)],
+    ),
+    (
+        "ltrimstr(\"x\")|length",
+        "héllo",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "ltrimstr(\"x\")|length",
+        "日本語",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(\"x\")|length",
+        "a\nb",
+        [("3\n", 0), ("1\n1\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(\"x\")|length",
+        "q\"b\\s",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "ltrimstr(\"x\")|length",
+        "zzzabc",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "ltrimstr(\"x\")|length",
+        "abczzz",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "ltrimstr(\"x\")|length",
+        "zzz",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(\"x\")|length",
+        "hé",
+        [("2\n", 0), ("2\n", 0), ("2\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|length",
+        "",
+        [("0\n", 0), ("0\n", 0), ("0\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|length",
+        "a",
+        [("1\n", 0), ("1\n", 0), ("1\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|length",
+        "hello zzz world",
+        [("14\n", 0), ("14\n", 0), ("14\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|length",
+        "héllo",
+        [("4\n", 0), ("4\n", 0), ("4\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|length",
+        "日本語",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|length",
+        "a\nb",
+        [("3\n", 0), ("1\n1\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|length",
+        "q\"b\\s",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|length",
+        "zzzabc",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|length",
+        "abczzz",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|length",
+        "zzz",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|length",
+        "hé",
+        [("1\n", 0), ("1\n", 0), ("1\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")",
+        "",
+        [("\"\"\n", 0), ("\"\"\n", 0), ("\"\"\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")",
+        "a",
+        [("\"a\"\n", 0), ("\"a\"\n", 0), ("\"a\"\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")",
+        "hello zzz world",
+        [
+            ("\"ello zzz world\"\n", 0),
+            ("\"ello zzz world\"\n", 0),
+            ("\"ello zzz world\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(\"h\")",
+        "héllo",
+        [("\"éllo\"\n", 0), ("\"éllo\"\n", 0), ("\"éllo\"\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")",
+        "日本語",
+        [
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(\"h\")",
+        "a\nb",
+        [
+            ("\"a\\nb\"\n", 0),
+            ("\"a\"\n\"b\"\n", 0),
+            ("\"a\\nb\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(\"h\")",
+        "q\"b\\s",
+        [
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(\"h\")",
+        "zzzabc",
+        [
+            ("\"zzzabc\"\n", 0),
+            ("\"zzzabc\"\n", 0),
+            ("\"zzzabc\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(\"h\")",
+        "abczzz",
+        [
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(\"h\")",
+        "zzz",
+        [("\"zzz\"\n", 0), ("\"zzz\"\n", 0), ("\"zzz\"\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")",
+        "hé",
+        [("\"é\"\n", 0), ("\"é\"\n", 0), ("\"é\"\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")",
+        "",
+        [("\"\"\n", 0), ("\"\"\n", 0), ("\"\"\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")",
+        "a",
+        [("\"a\"\n", 0), ("\"a\"\n", 0), ("\"a\"\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")",
+        "hello zzz world",
+        [
+            ("\"hello zzz world\"\n", 0),
+            ("\"hello zzz world\"\n", 0),
+            ("\"hello zzz world\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(\"o\")",
+        "héllo",
+        [("\"héll\"\n", 0), ("\"héll\"\n", 0), ("\"héll\"\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")",
+        "日本語",
+        [
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(\"o\")",
+        "a\nb",
+        [
+            ("\"a\\nb\"\n", 0),
+            ("\"a\"\n\"b\"\n", 0),
+            ("\"a\\nb\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(\"o\")",
+        "q\"b\\s",
+        [
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(\"o\")",
+        "zzzabc",
+        [
+            ("\"zzzabc\"\n", 0),
+            ("\"zzzabc\"\n", 0),
+            ("\"zzzabc\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(\"o\")",
+        "abczzz",
+        [
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(\"o\")",
+        "zzz",
+        [("\"zzz\"\n", 0), ("\"zzz\"\n", 0), ("\"zzz\"\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")",
+        "hé",
+        [("\"hé\"\n", 0), ("\"hé\"\n", 0), ("\"hé\"\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")|length",
+        "",
+        [("0\n", 0), ("0\n", 0), ("0\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")|length",
+        "a",
+        [("1\n", 0), ("1\n", 0), ("1\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")|length",
+        "hello zzz world",
+        [("15\n", 0), ("15\n", 0), ("15\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")|length",
+        "héllo",
+        [("4\n", 0), ("4\n", 0), ("4\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")|length",
+        "日本語",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")|length",
+        "a\nb",
+        [("3\n", 0), ("1\n1\n", 0), ("3\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")|length",
+        "q\"b\\s",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")|length",
+        "zzzabc",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")|length",
+        "abczzz",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")|length",
+        "zzz",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "rtrimstr(\"o\")|length",
+        "hé",
+        [("2\n", 0), ("2\n", 0), ("2\n", 0)],
+    ),
+    (
+        "rtrimstr(\"\")",
+        "",
+        [("\"\"\n", 0), ("\"\"\n", 0), ("\"\"\n", 0)],
+    ),
+    (
+        "rtrimstr(\"\")",
+        "a",
+        [("\"a\"\n", 0), ("\"a\"\n", 0), ("\"a\"\n", 0)],
+    ),
+    (
+        "rtrimstr(\"\")",
+        "hello zzz world",
+        [
+            ("\"hello zzz world\"\n", 0),
+            ("\"hello zzz world\"\n", 0),
+            ("\"hello zzz world\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(\"\")",
+        "héllo",
+        [("\"héllo\"\n", 0), ("\"héllo\"\n", 0), ("\"héllo\"\n", 0)],
+    ),
+    (
+        "rtrimstr(\"\")",
+        "日本語",
+        [
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(\"\")",
+        "a\nb",
+        [
+            ("\"a\\nb\"\n", 0),
+            ("\"a\"\n\"b\"\n", 0),
+            ("\"a\\nb\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(\"\")",
+        "q\"b\\s",
+        [
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(\"\")",
+        "zzzabc",
+        [
+            ("\"zzzabc\"\n", 0),
+            ("\"zzzabc\"\n", 0),
+            ("\"zzzabc\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(\"\")",
+        "abczzz",
+        [
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(\"\")",
+        "zzz",
+        [("\"zzz\"\n", 0), ("\"zzz\"\n", 0), ("\"zzz\"\n", 0)],
+    ),
+    (
+        "rtrimstr(\"\")",
+        "hé",
+        [("\"hé\"\n", 0), ("\"hé\"\n", 0), ("\"hé\"\n", 0)],
+    ),
+    (
+        "ltrimstr(\"\")|length",
+        "",
+        [("0\n", 0), ("0\n", 0), ("0\n", 0)],
+    ),
+    (
+        "ltrimstr(\"\")|length",
+        "a",
+        [("1\n", 0), ("1\n", 0), ("1\n", 0)],
+    ),
+    (
+        "ltrimstr(\"\")|length",
+        "hello zzz world",
+        [("15\n", 0), ("15\n", 0), ("15\n", 0)],
+    ),
+    (
+        "ltrimstr(\"\")|length",
+        "héllo",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "ltrimstr(\"\")|length",
+        "日本語",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(\"\")|length",
+        "a\nb",
+        [("3\n", 0), ("1\n1\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(\"\")|length",
+        "q\"b\\s",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "ltrimstr(\"\")|length",
+        "zzzabc",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "ltrimstr(\"\")|length",
+        "abczzz",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "ltrimstr(\"\")|length",
+        "zzz",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(\"\")|length",
+        "hé",
+        [("2\n", 0), ("2\n", 0), ("2\n", 0)],
+    ),
+    (
+        "tostring",
+        "",
+        [("\"\"\n", 0), ("\"\"\n", 0), ("\"\"\n", 0)],
+    ),
+    (
+        "tostring",
+        "a",
+        [("\"a\"\n", 0), ("\"a\"\n", 0), ("\"a\"\n", 0)],
+    ),
+    (
+        "tostring",
+        "hello zzz world",
+        [
+            ("\"hello zzz world\"\n", 0),
+            ("\"hello zzz world\"\n", 0),
+            ("\"hello zzz world\"\n", 0),
+        ],
+    ),
+    (
+        "tostring",
+        "héllo",
+        [("\"héllo\"\n", 0), ("\"héllo\"\n", 0), ("\"héllo\"\n", 0)],
+    ),
+    (
+        "tostring",
+        "日本語",
+        [
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+        ],
+    ),
+    (
+        "tostring",
+        "a\nb",
+        [
+            ("\"a\\nb\"\n", 0),
+            ("\"a\"\n\"b\"\n", 0),
+            ("\"a\\nb\"\n", 0),
+        ],
+    ),
+    (
+        "tostring",
+        "q\"b\\s",
+        [
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+        ],
+    ),
+    (
+        "tostring",
+        "zzzabc",
+        [
+            ("\"zzzabc\"\n", 0),
+            ("\"zzzabc\"\n", 0),
+            ("\"zzzabc\"\n", 0),
+        ],
+    ),
+    (
+        "tostring",
+        "abczzz",
+        [
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+        ],
+    ),
+    (
+        "tostring",
+        "zzz",
+        [("\"zzz\"\n", 0), ("\"zzz\"\n", 0), ("\"zzz\"\n", 0)],
+    ),
+    (
+        "tostring",
+        "hé",
+        [("\"hé\"\n", 0), ("\"hé\"\n", 0), ("\"hé\"\n", 0)],
+    ),
+    ("tostring|length", "", [("0\n", 0), ("0\n", 0), ("0\n", 0)]),
+    ("tostring|length", "a", [("1\n", 0), ("1\n", 0), ("1\n", 0)]),
+    (
+        "tostring|length",
+        "hello zzz world",
+        [("15\n", 0), ("15\n", 0), ("15\n", 0)],
+    ),
+    (
+        "tostring|length",
+        "héllo",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "tostring|length",
+        "日本語",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "tostring|length",
+        "a\nb",
+        [("3\n", 0), ("1\n1\n", 0), ("3\n", 0)],
+    ),
+    (
+        "tostring|length",
+        "q\"b\\s",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "tostring|length",
+        "zzzabc",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "tostring|length",
+        "abczzz",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "tostring|length",
+        "zzz",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "tostring|length",
+        "hé",
+        [("2\n", 0), ("2\n", 0), ("2\n", 0)],
+    ),
+    (
+        ". + \"x\"",
+        "",
+        [("\"x\"\n", 0), ("\"x\"\n", 0), ("\"x\"\n", 0)],
+    ),
+    (
+        ". + \"x\"",
+        "a",
+        [("\"ax\"\n", 0), ("\"ax\"\n", 0), ("\"ax\"\n", 0)],
+    ),
+    (
+        ". + \"x\"",
+        "hello zzz world",
+        [
+            ("\"hello zzz worldx\"\n", 0),
+            ("\"hello zzz worldx\"\n", 0),
+            ("\"hello zzz worldx\"\n", 0),
+        ],
+    ),
+    (
+        ". + \"x\"",
+        "héllo",
+        [
+            ("\"héllox\"\n", 0),
+            ("\"héllox\"\n", 0),
+            ("\"héllox\"\n", 0),
+        ],
+    ),
+    (
+        ". + \"x\"",
+        "日本語",
+        [
+            ("\"日本語x\"\n", 0),
+            ("\"日本語x\"\n", 0),
+            ("\"日本語x\"\n", 0),
+        ],
+    ),
+    (
+        ". + \"x\"",
+        "a\nb",
+        [
+            ("\"a\\nbx\"\n", 0),
+            ("\"ax\"\n\"bx\"\n", 0),
+            ("\"a\\nbx\"\n", 0),
+        ],
+    ),
+    (
+        ". + \"x\"",
+        "q\"b\\s",
+        [
+            ("\"q\\\"b\\\\sx\"\n", 0),
+            ("\"q\\\"b\\\\sx\"\n", 0),
+            ("\"q\\\"b\\\\sx\"\n", 0),
+        ],
+    ),
+    (
+        ". + \"x\"",
+        "zzzabc",
+        [
+            ("\"zzzabcx\"\n", 0),
+            ("\"zzzabcx\"\n", 0),
+            ("\"zzzabcx\"\n", 0),
+        ],
+    ),
+    (
+        ". + \"x\"",
+        "abczzz",
+        [
+            ("\"abczzzx\"\n", 0),
+            ("\"abczzzx\"\n", 0),
+            ("\"abczzzx\"\n", 0),
+        ],
+    ),
+    (
+        ". + \"x\"",
+        "zzz",
+        [("\"zzzx\"\n", 0), ("\"zzzx\"\n", 0), ("\"zzzx\"\n", 0)],
+    ),
+    (
+        ". + \"x\"",
+        "hé",
+        [("\"héx\"\n", 0), ("\"héx\"\n", 0), ("\"héx\"\n", 0)],
+    ),
+    (". + \"x\"|length", "", [("1\n", 0), ("1\n", 0), ("1\n", 0)]),
+    (
+        ". + \"x\"|length",
+        "a",
+        [("2\n", 0), ("2\n", 0), ("2\n", 0)],
+    ),
+    (
+        ". + \"x\"|length",
+        "hello zzz world",
+        [("16\n", 0), ("16\n", 0), ("16\n", 0)],
+    ),
+    (
+        ". + \"x\"|length",
+        "héllo",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        ". + \"x\"|length",
+        "日本語",
+        [("4\n", 0), ("4\n", 0), ("4\n", 0)],
+    ),
+    (
+        ". + \"x\"|length",
+        "a\nb",
+        [("4\n", 0), ("2\n2\n", 0), ("4\n", 0)],
+    ),
+    (
+        ". + \"x\"|length",
+        "q\"b\\s",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        ". + \"x\"|length",
+        "zzzabc",
+        [("7\n", 0), ("7\n", 0), ("7\n", 0)],
+    ),
+    (
+        ". + \"x\"|length",
+        "abczzz",
+        [("7\n", 0), ("7\n", 0), ("7\n", 0)],
+    ),
+    (
+        ". + \"x\"|length",
+        "zzz",
+        [("4\n", 0), ("4\n", 0), ("4\n", 0)],
+    ),
+    (
+        ". + \"x\"|length",
+        "hé",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (". + \"\"|length", "", [("0\n", 0), ("0\n", 0), ("0\n", 0)]),
+    (". + \"\"|length", "a", [("1\n", 0), ("1\n", 0), ("1\n", 0)]),
+    (
+        ". + \"\"|length",
+        "hello zzz world",
+        [("15\n", 0), ("15\n", 0), ("15\n", 0)],
+    ),
+    (
+        ". + \"\"|length",
+        "héllo",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        ". + \"\"|length",
+        "日本語",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        ". + \"\"|length",
+        "a\nb",
+        [("3\n", 0), ("1\n1\n", 0), ("3\n", 0)],
+    ),
+    (
+        ". + \"\"|length",
+        "q\"b\\s",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        ". + \"\"|length",
+        "zzzabc",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        ". + \"\"|length",
+        "abczzz",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        ". + \"\"|length",
+        "zzz",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        ". + \"\"|length",
+        "hé",
+        [("2\n", 0), ("2\n", 0), ("2\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|startswith(\"é\")",
+        "",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|startswith(\"é\")",
+        "a",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|startswith(\"é\")",
+        "hello zzz world",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|startswith(\"é\")",
+        "héllo",
+        [("true\n", 0), ("true\n", 0), ("true\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|startswith(\"é\")",
+        "日本語",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|startswith(\"é\")",
+        "a\nb",
+        [("false\n", 0), ("false\nfalse\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|startswith(\"é\")",
+        "q\"b\\s",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|startswith(\"é\")",
+        "zzzabc",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|startswith(\"é\")",
+        "abczzz",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|startswith(\"é\")",
+        "zzz",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|startswith(\"é\")",
+        "hé",
+        [("true\n", 0), ("true\n", 0), ("true\n", 0)],
+    ),
+    (
+        "ltrimstr(1)",
+        "",
+        [("\"\"\n", 0), ("\"\"\n", 0), ("\"\"\n", 0)],
+    ),
+    (
+        "ltrimstr(1)",
+        "a",
+        [("\"a\"\n", 0), ("\"a\"\n", 0), ("\"a\"\n", 0)],
+    ),
+    (
+        "ltrimstr(1)",
+        "hello zzz world",
+        [
+            ("\"hello zzz world\"\n", 0),
+            ("\"hello zzz world\"\n", 0),
+            ("\"hello zzz world\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(1)",
+        "héllo",
+        [("\"héllo\"\n", 0), ("\"héllo\"\n", 0), ("\"héllo\"\n", 0)],
+    ),
+    (
+        "ltrimstr(1)",
+        "日本語",
+        [
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(1)",
+        "a\nb",
+        [
+            ("\"a\\nb\"\n", 0),
+            ("\"a\"\n\"b\"\n", 0),
+            ("\"a\\nb\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(1)",
+        "q\"b\\s",
+        [
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(1)",
+        "zzzabc",
+        [
+            ("\"zzzabc\"\n", 0),
+            ("\"zzzabc\"\n", 0),
+            ("\"zzzabc\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(1)",
+        "abczzz",
+        [
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(1)",
+        "zzz",
+        [("\"zzz\"\n", 0), ("\"zzz\"\n", 0), ("\"zzz\"\n", 0)],
+    ),
+    (
+        "ltrimstr(1)",
+        "hé",
+        [("\"hé\"\n", 0), ("\"hé\"\n", 0), ("\"hé\"\n", 0)],
+    ),
+    (
+        "ltrimstr(1)|length",
+        "",
+        [("0\n", 0), ("0\n", 0), ("0\n", 0)],
+    ),
+    (
+        "ltrimstr(1)|length",
+        "a",
+        [("1\n", 0), ("1\n", 0), ("1\n", 0)],
+    ),
+    (
+        "ltrimstr(1)|length",
+        "hello zzz world",
+        [("15\n", 0), ("15\n", 0), ("15\n", 0)],
+    ),
+    (
+        "ltrimstr(1)|length",
+        "héllo",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "ltrimstr(1)|length",
+        "日本語",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(1)|length",
+        "a\nb",
+        [("3\n", 0), ("1\n1\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(1)|length",
+        "q\"b\\s",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "ltrimstr(1)|length",
+        "zzzabc",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "ltrimstr(1)|length",
+        "abczzz",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "ltrimstr(1)|length",
+        "zzz",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(1)|length",
+        "hé",
+        [("2\n", 0), ("2\n", 0), ("2\n", 0)],
+    ),
+    (
+        "rtrimstr(null)",
+        "",
+        [("\"\"\n", 0), ("\"\"\n", 0), ("\"\"\n", 0)],
+    ),
+    (
+        "rtrimstr(null)",
+        "a",
+        [("\"a\"\n", 0), ("\"a\"\n", 0), ("\"a\"\n", 0)],
+    ),
+    (
+        "rtrimstr(null)",
+        "hello zzz world",
+        [
+            ("\"hello zzz world\"\n", 0),
+            ("\"hello zzz world\"\n", 0),
+            ("\"hello zzz world\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(null)",
+        "héllo",
+        [("\"héllo\"\n", 0), ("\"héllo\"\n", 0), ("\"héllo\"\n", 0)],
+    ),
+    (
+        "rtrimstr(null)",
+        "日本語",
+        [
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(null)",
+        "a\nb",
+        [
+            ("\"a\\nb\"\n", 0),
+            ("\"a\"\n\"b\"\n", 0),
+            ("\"a\\nb\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(null)",
+        "q\"b\\s",
+        [
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(null)",
+        "zzzabc",
+        [
+            ("\"zzzabc\"\n", 0),
+            ("\"zzzabc\"\n", 0),
+            ("\"zzzabc\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(null)",
+        "abczzz",
+        [
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+        ],
+    ),
+    (
+        "rtrimstr(null)",
+        "zzz",
+        [("\"zzz\"\n", 0), ("\"zzz\"\n", 0), ("\"zzz\"\n", 0)],
+    ),
+    (
+        "rtrimstr(null)",
+        "hé",
+        [("\"hé\"\n", 0), ("\"hé\"\n", 0), ("\"hé\"\n", 0)],
+    ),
+    (
+        "[ltrimstr(\"h\"), rtrimstr(\"o\")]",
+        "",
+        [
+            ("[\"\",\"\"]\n", 0),
+            ("[\"\",\"\"]\n", 0),
+            ("[\"\",\"\"]\n", 0),
+        ],
+    ),
+    (
+        "[ltrimstr(\"h\"), rtrimstr(\"o\")]",
+        "a",
+        [
+            ("[\"a\",\"a\"]\n", 0),
+            ("[\"a\",\"a\"]\n", 0),
+            ("[\"a\",\"a\"]\n", 0),
+        ],
+    ),
+    (
+        "[ltrimstr(\"h\"), rtrimstr(\"o\")]",
+        "hello zzz world",
+        [
+            ("[\"ello zzz world\",\"hello zzz world\"]\n", 0),
+            ("[\"ello zzz world\",\"hello zzz world\"]\n", 0),
+            ("[\"ello zzz world\",\"hello zzz world\"]\n", 0),
+        ],
+    ),
+    (
+        "[ltrimstr(\"h\"), rtrimstr(\"o\")]",
+        "héllo",
+        [
+            ("[\"éllo\",\"héll\"]\n", 0),
+            ("[\"éllo\",\"héll\"]\n", 0),
+            ("[\"éllo\",\"héll\"]\n", 0),
+        ],
+    ),
+    (
+        "[ltrimstr(\"h\"), rtrimstr(\"o\")]",
+        "日本語",
+        [
+            ("[\"日本語\",\"日本語\"]\n", 0),
+            ("[\"日本語\",\"日本語\"]\n", 0),
+            ("[\"日本語\",\"日本語\"]\n", 0),
+        ],
+    ),
+    (
+        "[ltrimstr(\"h\"), rtrimstr(\"o\")]",
+        "a\nb",
+        [
+            ("[\"a\\nb\",\"a\\nb\"]\n", 0),
+            ("[\"a\",\"a\"]\n[\"b\",\"b\"]\n", 0),
+            ("[\"a\\nb\",\"a\\nb\"]\n", 0),
+        ],
+    ),
+    (
+        "[ltrimstr(\"h\"), rtrimstr(\"o\")]",
+        "q\"b\\s",
+        [
+            ("[\"q\\\"b\\\\s\",\"q\\\"b\\\\s\"]\n", 0),
+            ("[\"q\\\"b\\\\s\",\"q\\\"b\\\\s\"]\n", 0),
+            ("[\"q\\\"b\\\\s\",\"q\\\"b\\\\s\"]\n", 0),
+        ],
+    ),
+    (
+        "[ltrimstr(\"h\"), rtrimstr(\"o\")]",
+        "zzzabc",
+        [
+            ("[\"zzzabc\",\"zzzabc\"]\n", 0),
+            ("[\"zzzabc\",\"zzzabc\"]\n", 0),
+            ("[\"zzzabc\",\"zzzabc\"]\n", 0),
+        ],
+    ),
+    (
+        "[ltrimstr(\"h\"), rtrimstr(\"o\")]",
+        "abczzz",
+        [
+            ("[\"abczzz\",\"abczzz\"]\n", 0),
+            ("[\"abczzz\",\"abczzz\"]\n", 0),
+            ("[\"abczzz\",\"abczzz\"]\n", 0),
+        ],
+    ),
+    (
+        "[ltrimstr(\"h\"), rtrimstr(\"o\")]",
+        "zzz",
+        [
+            ("[\"zzz\",\"zzz\"]\n", 0),
+            ("[\"zzz\",\"zzz\"]\n", 0),
+            ("[\"zzz\",\"zzz\"]\n", 0),
+        ],
+    ),
+    (
+        "[ltrimstr(\"h\"), rtrimstr(\"o\")]",
+        "hé",
+        [
+            ("[\"é\",\"hé\"]\n", 0),
+            ("[\"é\",\"hé\"]\n", 0),
+            ("[\"é\",\"hé\"]\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(\"h\")|ltrimstr(\"é\")|length",
+        "",
+        [("0\n", 0), ("0\n", 0), ("0\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|ltrimstr(\"é\")|length",
+        "a",
+        [("1\n", 0), ("1\n", 0), ("1\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|ltrimstr(\"é\")|length",
+        "hello zzz world",
+        [("14\n", 0), ("14\n", 0), ("14\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|ltrimstr(\"é\")|length",
+        "héllo",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|ltrimstr(\"é\")|length",
+        "日本語",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|ltrimstr(\"é\")|length",
+        "a\nb",
+        [("3\n", 0), ("1\n1\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|ltrimstr(\"é\")|length",
+        "q\"b\\s",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|ltrimstr(\"é\")|length",
+        "zzzabc",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|ltrimstr(\"é\")|length",
+        "abczzz",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|ltrimstr(\"é\")|length",
+        "zzz",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(\"h\")|ltrimstr(\"é\")|length",
+        "hé",
+        [("0\n", 0), ("0\n", 0), ("0\n", 0)],
+    ),
+    (
+        "tostring|tostring|length",
+        "",
+        [("0\n", 0), ("0\n", 0), ("0\n", 0)],
+    ),
+    (
+        "tostring|tostring|length",
+        "a",
+        [("1\n", 0), ("1\n", 0), ("1\n", 0)],
+    ),
+    (
+        "tostring|tostring|length",
+        "hello zzz world",
+        [("15\n", 0), ("15\n", 0), ("15\n", 0)],
+    ),
+    (
+        "tostring|tostring|length",
+        "héllo",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "tostring|tostring|length",
+        "日本語",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "tostring|tostring|length",
+        "a\nb",
+        [("3\n", 0), ("1\n1\n", 0), ("3\n", 0)],
+    ),
+    (
+        "tostring|tostring|length",
+        "q\"b\\s",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "tostring|tostring|length",
+        "zzzabc",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "tostring|tostring|length",
+        "abczzz",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "tostring|tostring|length",
+        "zzz",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "tostring|tostring|length",
+        "hé",
+        [("2\n", 0), ("2\n", 0), ("2\n", 0)],
+    ),
+    (
+        ". + \"a\" + \"b\"|length",
+        "",
+        [("2\n", 0), ("2\n", 0), ("2\n", 0)],
+    ),
+    (
+        ". + \"a\" + \"b\"|length",
+        "a",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        ". + \"a\" + \"b\"|length",
+        "hello zzz world",
+        [("17\n", 0), ("17\n", 0), ("17\n", 0)],
+    ),
+    (
+        ". + \"a\" + \"b\"|length",
+        "héllo",
+        [("7\n", 0), ("7\n", 0), ("7\n", 0)],
+    ),
+    (
+        ". + \"a\" + \"b\"|length",
+        "日本語",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        ". + \"a\" + \"b\"|length",
+        "a\nb",
+        [("5\n", 0), ("3\n3\n", 0), ("5\n", 0)],
+    ),
+    (
+        ". + \"a\" + \"b\"|length",
+        "q\"b\\s",
+        [("7\n", 0), ("7\n", 0), ("7\n", 0)],
+    ),
+    (
+        ". + \"a\" + \"b\"|length",
+        "zzzabc",
+        [("8\n", 0), ("8\n", 0), ("8\n", 0)],
+    ),
+    (
+        ". + \"a\" + \"b\"|length",
+        "abczzz",
+        [("8\n", 0), ("8\n", 0), ("8\n", 0)],
+    ),
+    (
+        ". + \"a\" + \"b\"|length",
+        "zzz",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        ". + \"a\" + \"b\"|length",
+        "hé",
+        [("4\n", 0), ("4\n", 0), ("4\n", 0)],
+    ),
+    (
+        "select(ltrimstr(\"h\")|length>2)",
+        "",
+        [("", 0), ("", 0), ("", 0)],
+    ),
+    (
+        "select(ltrimstr(\"h\")|length>2)",
+        "a",
+        [("", 0), ("", 0), ("", 0)],
+    ),
+    (
+        "select(ltrimstr(\"h\")|length>2)",
+        "hello zzz world",
+        [
+            ("\"hello zzz world\"\n", 0),
+            ("\"hello zzz world\"\n", 0),
+            ("\"hello zzz world\"\n", 0),
+        ],
+    ),
+    (
+        "select(ltrimstr(\"h\")|length>2)",
+        "héllo",
+        [("\"héllo\"\n", 0), ("\"héllo\"\n", 0), ("\"héllo\"\n", 0)],
+    ),
+    (
+        "select(ltrimstr(\"h\")|length>2)",
+        "日本語",
+        [
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+        ],
+    ),
+    (
+        "select(ltrimstr(\"h\")|length>2)",
+        "a\nb",
+        [("\"a\\nb\"\n", 0), ("", 0), ("\"a\\nb\"\n", 0)],
+    ),
+    (
+        "select(ltrimstr(\"h\")|length>2)",
+        "q\"b\\s",
+        [
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+        ],
+    ),
+    (
+        "select(ltrimstr(\"h\")|length>2)",
+        "zzzabc",
+        [
+            ("\"zzzabc\"\n", 0),
+            ("\"zzzabc\"\n", 0),
+            ("\"zzzabc\"\n", 0),
+        ],
+    ),
+    (
+        "select(ltrimstr(\"h\")|length>2)",
+        "abczzz",
+        [
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+        ],
+    ),
+    (
+        "select(ltrimstr(\"h\")|length>2)",
+        "zzz",
+        [("\"zzz\"\n", 0), ("\"zzz\"\n", 0), ("\"zzz\"\n", 0)],
+    ),
+    (
+        "select(ltrimstr(\"h\")|length>2)",
+        "hé",
+        [("", 0), ("", 0), ("", 0)],
+    ),
+    (
+        "ltrimstr(\"z\")|index(\"z\")",
+        "",
+        [("null\n", 0), ("null\n", 0), ("null\n", 0)],
+    ),
+    (
+        "ltrimstr(\"z\")|index(\"z\")",
+        "a",
+        [("null\n", 0), ("null\n", 0), ("null\n", 0)],
+    ),
+    (
+        "ltrimstr(\"z\")|index(\"z\")",
+        "hello zzz world",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "ltrimstr(\"z\")|index(\"z\")",
+        "héllo",
+        [("null\n", 0), ("null\n", 0), ("null\n", 0)],
+    ),
+    (
+        "ltrimstr(\"z\")|index(\"z\")",
+        "日本語",
+        [("null\n", 0), ("null\n", 0), ("null\n", 0)],
+    ),
+    (
+        "ltrimstr(\"z\")|index(\"z\")",
+        "a\nb",
+        [("null\n", 0), ("null\nnull\n", 0), ("null\n", 0)],
+    ),
+    (
+        "ltrimstr(\"z\")|index(\"z\")",
+        "q\"b\\s",
+        [("null\n", 0), ("null\n", 0), ("null\n", 0)],
+    ),
+    (
+        "ltrimstr(\"z\")|index(\"z\")",
+        "zzzabc",
+        [("0\n", 0), ("0\n", 0), ("0\n", 0)],
+    ),
+    (
+        "ltrimstr(\"z\")|index(\"z\")",
+        "abczzz",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "ltrimstr(\"z\")|index(\"z\")",
+        "zzz",
+        [("0\n", 0), ("0\n", 0), ("0\n", 0)],
+    ),
+    (
+        "ltrimstr(\"z\")|index(\"z\")",
+        "hé",
+        [("null\n", 0), ("null\n", 0), ("null\n", 0)],
+    ),
+    (
+        "ltrimstr(\"a\")|test(\"b\")",
+        "",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"a\")|test(\"b\")",
+        "a",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"a\")|test(\"b\")",
+        "hello zzz world",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"a\")|test(\"b\")",
+        "héllo",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"a\")|test(\"b\")",
+        "日本語",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"a\")|test(\"b\")",
+        "a\nb",
+        [("true\n", 0), ("false\ntrue\n", 0), ("true\n", 0)],
+    ),
+    (
+        "ltrimstr(\"a\")|test(\"b\")",
+        "q\"b\\s",
+        [("true\n", 0), ("true\n", 0), ("true\n", 0)],
+    ),
+    (
+        "ltrimstr(\"a\")|test(\"b\")",
+        "zzzabc",
+        [("true\n", 0), ("true\n", 0), ("true\n", 0)],
+    ),
+    (
+        "ltrimstr(\"a\")|test(\"b\")",
+        "abczzz",
+        [("true\n", 0), ("true\n", 0), ("true\n", 0)],
+    ),
+    (
+        "ltrimstr(\"a\")|test(\"b\")",
+        "zzz",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (
+        "ltrimstr(\"a\")|test(\"b\")",
+        "hé",
+        [("false\n", 0), ("false\n", 0), ("false\n", 0)],
+    ),
+    (". + \"é\"|length", "", [("1\n", 0), ("1\n", 0), ("1\n", 0)]),
+    (
+        ". + \"é\"|length",
+        "a",
+        [("2\n", 0), ("2\n", 0), ("2\n", 0)],
+    ),
+    (
+        ". + \"é\"|length",
+        "hello zzz world",
+        [("16\n", 0), ("16\n", 0), ("16\n", 0)],
+    ),
+    (
+        ". + \"é\"|length",
+        "héllo",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        ". + \"é\"|length",
+        "日本語",
+        [("4\n", 0), ("4\n", 0), ("4\n", 0)],
+    ),
+    (
+        ". + \"é\"|length",
+        "a\nb",
+        [("4\n", 0), ("2\n2\n", 0), ("4\n", 0)],
+    ),
+    (
+        ". + \"é\"|length",
+        "q\"b\\s",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        ". + \"é\"|length",
+        "zzzabc",
+        [("7\n", 0), ("7\n", 0), ("7\n", 0)],
+    ),
+    (
+        ". + \"é\"|length",
+        "abczzz",
+        [("7\n", 0), ("7\n", 0), ("7\n", 0)],
+    ),
+    (
+        ". + \"é\"|length",
+        "zzz",
+        [("4\n", 0), ("4\n", 0), ("4\n", 0)],
+    ),
+    (
+        ". + \"é\"|length",
+        "hé",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "rtrimstr(\"zzz\")|length",
+        "",
+        [("0\n", 0), ("0\n", 0), ("0\n", 0)],
+    ),
+    (
+        "rtrimstr(\"zzz\")|length",
+        "a",
+        [("1\n", 0), ("1\n", 0), ("1\n", 0)],
+    ),
+    (
+        "rtrimstr(\"zzz\")|length",
+        "hello zzz world",
+        [("15\n", 0), ("15\n", 0), ("15\n", 0)],
+    ),
+    (
+        "rtrimstr(\"zzz\")|length",
+        "héllo",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "rtrimstr(\"zzz\")|length",
+        "日本語",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "rtrimstr(\"zzz\")|length",
+        "a\nb",
+        [("3\n", 0), ("1\n1\n", 0), ("3\n", 0)],
+    ),
+    (
+        "rtrimstr(\"zzz\")|length",
+        "q\"b\\s",
+        [("5\n", 0), ("5\n", 0), ("5\n", 0)],
+    ),
+    (
+        "rtrimstr(\"zzz\")|length",
+        "zzzabc",
+        [("6\n", 0), ("6\n", 0), ("6\n", 0)],
+    ),
+    (
+        "rtrimstr(\"zzz\")|length",
+        "abczzz",
+        [("3\n", 0), ("3\n", 0), ("3\n", 0)],
+    ),
+    (
+        "rtrimstr(\"zzz\")|length",
+        "zzz",
+        [("0\n", 0), ("0\n", 0), ("0\n", 0)],
+    ),
+    (
+        "rtrimstr(\"zzz\")|length",
+        "hé",
+        [("2\n", 0), ("2\n", 0), ("2\n", 0)],
+    ),
+    (
+        "ltrimstr(\"zzz\")|rtrimstr(\"abc\")",
+        "",
+        [("\"\"\n", 0), ("\"\"\n", 0), ("\"\"\n", 0)],
+    ),
+    (
+        "ltrimstr(\"zzz\")|rtrimstr(\"abc\")",
+        "a",
+        [("\"a\"\n", 0), ("\"a\"\n", 0), ("\"a\"\n", 0)],
+    ),
+    (
+        "ltrimstr(\"zzz\")|rtrimstr(\"abc\")",
+        "hello zzz world",
+        [
+            ("\"hello zzz world\"\n", 0),
+            ("\"hello zzz world\"\n", 0),
+            ("\"hello zzz world\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(\"zzz\")|rtrimstr(\"abc\")",
+        "héllo",
+        [("\"héllo\"\n", 0), ("\"héllo\"\n", 0), ("\"héllo\"\n", 0)],
+    ),
+    (
+        "ltrimstr(\"zzz\")|rtrimstr(\"abc\")",
+        "日本語",
+        [
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+            ("\"日本語\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(\"zzz\")|rtrimstr(\"abc\")",
+        "a\nb",
+        [
+            ("\"a\\nb\"\n", 0),
+            ("\"a\"\n\"b\"\n", 0),
+            ("\"a\\nb\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(\"zzz\")|rtrimstr(\"abc\")",
+        "q\"b\\s",
+        [
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+            ("\"q\\\"b\\\\s\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(\"zzz\")|rtrimstr(\"abc\")",
+        "zzzabc",
+        [("\"\"\n", 0), ("\"\"\n", 0), ("\"\"\n", 0)],
+    ),
+    (
+        "ltrimstr(\"zzz\")|rtrimstr(\"abc\")",
+        "abczzz",
+        [
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+            ("\"abczzz\"\n", 0),
+        ],
+    ),
+    (
+        "ltrimstr(\"zzz\")|rtrimstr(\"abc\")",
+        "zzz",
+        [("\"\"\n", 0), ("\"\"\n", 0), ("\"\"\n", 0)],
+    ),
+    (
+        "ltrimstr(\"zzz\")|rtrimstr(\"abc\")",
+        "hé",
+        [("\"hé\"\n", 0), ("\"hé\"\n", 0), ("\"hé\"\n", 0)],
+    ),
+];
+
+#[test]
+fn a_string_stage_over_a_string_input_answers_as_jq_5816() -> Result<()> {
+    check(STAGE_ROWS)
+}
+
+/// #5816: a string stage in path position keeps the evaluator's route and its answer (jq refuses
+/// `path(ltrimstr("h"))`, answers `path(tostring)` with `[]`).
+const PATH_ROWS: &[Row] = &[
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "a",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "hello zzz world",
+        [("", 5), ("", 5), ("", 5)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "héllo",
+        [("", 5), ("", 5), ("", 5)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "日本語",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "a\nb",
+        [("[[]]\n", 0), ("[[]]\n[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "q\"b\\s",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "zzzabc",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "abczzz",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(ltrimstr(\"h\"))]",
+        "zzz",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    ("[path(ltrimstr(\"h\"))]", "hé", [("", 5), ("", 5), ("", 5)]),
+    (
+        "[path(tostring)]",
+        "",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "a",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "hello zzz world",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "héllo",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "日本語",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "a\nb",
+        [("[[]]\n", 0), ("[[]]\n[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "q\"b\\s",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "zzzabc",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "abczzz",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "zzz",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "[path(tostring)]",
+        "hé",
+        [("[[]]\n", 0), ("[[]]\n", 0), ("[[]]\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "a",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "hello zzz world",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "héllo",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "日本語",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "a\nb",
+        [("\"c\"\n", 0), ("\"c\"\n\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "q\"b\\s",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "zzzabc",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "abczzz",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "zzz",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+    (
+        "try path(. + \"x\") catch \"c\"",
+        "hé",
+        [("\"c\"\n", 0), ("\"c\"\n", 0), ("\"c\"\n", 0)],
+    ),
+];
+
+/// A string stage in path position answers as jq 1.7.1 does.
+#[test]
+fn a_string_stage_in_path_position_answers_as_jq_5816() -> Result<()> {
+    check(PATH_ROWS)
 }

@@ -9,6 +9,10 @@
 # `--verbose` was one -v, which lychee 0.24 calls "warn": the excluded and
 # failing links, not every successful one ("info" prints all of them).
 verbose = "warn"
+# A link's `#fragment` has to name a heading that exists. Without this a heading renamed after it
+# was linked passed CI, and ten such links had piled up (#5873). It reads the headings of a local
+# `.md` and the anchors of a fetched page (`anchor-only`: lychee 0.24 also takes `full` for `#:~:text=`).
+include_fragments = "anchor-only"
 no_progress = true
 cache = true
 max_cache_age = "1d"
@@ -60,6 +64,11 @@ exclude = [
   # HTML pages with 503/504s for hours at a time (#3594), and a `commit/` page
   # has no raw form to check instead.
   '^https://github\.com/[^/]+/[^/]+/commit/[0-9a-f]{7,40}([/?#.]|$)',
+  # Two links in a released CHANGELOG.md entry to headings that were renamed afterwards. A release
+  # note is history and CHANGELOG.md is not edited in a PR (changelog.d/README.md), so the dead
+  # anchors are listed here and the files still resolve (#5873).
+  'limitations\.md#jqs-own-utf-8-replacement-character-substitution-fixed-at-function-granularity-open-at-document-granularity$',
+  'limitations\.md#a-bad-escape-in-a-streamed-scalar-still-degrades-silently-instead-of-raising$',
 ]
 
 # A pinned `blob/` link is checked at raw.githubusercontent.com instead (still a

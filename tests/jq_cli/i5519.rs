@@ -283,7 +283,6 @@ fn test_an_undecodable_member_nothing_reads_is_not_decoded_5519() -> Result<()> 
 /// A fold that reads its variable in path position keeps the element whole, so the error names
 /// every member of it. A dynamic path target is refused outright by the holdout build.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_a_path_position_read_still_names_the_whole_element_5519() -> Result<()> {
     let want = "\"Invalid path expression near attempt to access element \\\"a\\\" of {\\\"a\\\":1,\\\"b\\\":2}\"\n";
     for filter in [

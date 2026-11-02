@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 
-#[cfg(not(feature = "unshared-containers"))]
 use crate::assert_path_rows_3289;
 use crate::assert_path_rows_both_routes_3749;
 
@@ -18,7 +17,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// `del` and `|=`, with the controls where the pattern raises (the state becomes `null`, as in jq), a `foreach` UPDATE, and
 /// the wrappers that keep their refusal or their answer (a count of zero, a comma item that is not the accumulator).
 /// Every row captured from `/usr/bin/jq` 1.7.1 (stdout, exit code, message), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5140_reduce_update_bind_of_dot_behind_first_limit_nth_comma_if() -> Result<()> {
@@ -594,7 +592,6 @@ fn test_5140_reduce_update_bind_of_dot_behind_first_limit_nth_comma_if() -> Resu
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5140_wrappers_not_read_keep_their_refusal() -> Result<()> {

@@ -24,7 +24,6 @@ fn test_recurse_cond_reads_no_input_past_the_first_node_4095() -> Result<()> {
 
 /// The same walk named through `path(...)`, which jq 1.7.1 answers identically (captured live).
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_path_of_recurse_cond_reads_no_input_past_the_first_node_4095() -> Result<()> {
     let (stdout, _, code) = run_jq_full(
         &[

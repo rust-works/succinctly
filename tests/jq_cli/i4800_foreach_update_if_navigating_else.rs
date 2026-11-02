@@ -12,7 +12,6 @@ use anyhow::Result;
 /// `else`. A step whose condition is falsy still runs the `else` branch and is read as before
 /// ([`taken_if_branch`]). Rows captured from jq 1.7.1 (stdout, first stderr line, exit code), both routes; each fails
 /// with the per-step read removed.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_if_then_caught_foreach_with_a_navigating_else_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

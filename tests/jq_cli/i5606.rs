@@ -192,10 +192,8 @@ fn test_array_and_as_after_a_computed_number_match_jq_5606() -> Result<()> {
     Ok(())
 }
 
-/// `path($x)` is a path expression that does more than navigate, which the unshared-containers
-/// holdout refuses.
+/// `path($x)` is a path expression that does more than navigate.
 #[test]
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 fn test_as_after_a_computed_number_keeps_its_path_5606() -> Result<()> {
     for (program, expected) in [
         (

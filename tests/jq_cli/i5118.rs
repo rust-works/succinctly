@@ -14,7 +14,6 @@ use crate::run_jq_full;
 ///
 /// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
 /// refused here now hold jq 1.7.1's answers.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_5118_a_slice_past_65535_of_a_view_is_refused_as_jq_refuses() -> Result<()> {
     for filter in [
@@ -36,7 +35,6 @@ fn test_5118_a_slice_past_65535_of_a_view_is_refused_as_jq_refuses() -> Result<(
 /// keeps its offset of 60,000 and the second slice reaches 66,000 and is copied: jq refuses. The path-mode interpreter's
 /// write builds a new array at offset 0, so the second slice is a view and the path answers. Recorded in
 /// `docs/compliance/jq/limitations.md`.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_5118_a_written_view_answers_where_jq_refuses_5223() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -52,7 +50,6 @@ fn test_5118_a_written_view_answers_where_jq_refuses_5223() -> Result<()> {
 
 /// #5118: small arrays are untouched by the gate, so the rows that match jq keep matching (`[1,2,3]`, and a slice of a
 /// 70,003-element array that stays below the 65,536 offset answers as jq does or refuses).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_5118_small_arrays_still_answer_as_jq_does() -> Result<()> {
     let (stdout, stderr, code) =

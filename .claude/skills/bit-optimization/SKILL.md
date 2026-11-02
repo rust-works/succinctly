@@ -238,18 +238,21 @@ impl CacheAlignedBuilder {
 
 In this codebase:
 - **Succinct operations**: rank/select are O(1) with o(n) auxiliary space
-- **Non-succinct storage**: `bp_to_text: Vec<u32>` uses 4 bytes per node (not compressed)
+- **Position storage is a separate choice**: a node's text positions are not part of the BP
+  structure, and how they are stored decides most of the index's size
 
-**Memory breakdown for YamlIndex (~5x input)**:
+`YamlIndex` used to keep `bp_to_text` and `bp_to_text_end` as `Vec<u32>` (4 bytes per node each,
+~80 MB on a 100 MB input), its biggest component. They are now bitmaps: `OpenPositions` /
+`AdvancePositions` (`src/yaml/advance_positions.rs`, P12, #62) and `EndPositions` /
+`CompactEndPositions` (`src/yaml/end_positions.rs`). See
+[docs/parsing/yaml-succinct.md](../../../docs/parsing/yaml-succinct.md) for the current layout and
+why it is bitmaps rather than position vectors.
 
-| Component                       | Size (100MB input) | Notes                                        |
-|---------------------------------|--------------------|----------------------------------------------|
-| `bp_to_text` + `bp_to_text_end` | ~80 MB             | 4 bytes × 2 × 10M nodes - **biggest target** |
-| BP bitvector + rank/select      | ~20 MB             | Actually succinct                            |
-| Input text                      | 100 MB             | Retained for value extraction                |
-| Other metadata                  | ~30 MB             | Type info, containers bitvec                 |
-
-**Optimization opportunity**: Position arrays are monotonic for scalars. Elias-Fano encoding could reduce 80 MB → ~6.6 MB (12× reduction). See [compact-index-investigation.md](../../../docs/plan/compact-index-investigation.md).
+**Elias-Fano was tried for these arrays and rejected** (#58): `src/bits/elias_fano.rs` measured
+34-40x slower than the vectors for the cursor-iteration and random-access patterns the positions
+need. It now serves `text::LineIndex` (ADR-0012), where access is rare. See
+[compact-index-investigation.md](../../../docs/plan/compact-index-investigation.md) for the
+investigation.
 
 ## See Also
 
@@ -258,4 +261,4 @@ In this codebase:
 - [docs/optimizations/hierarchical-structures.md](../../../docs/optimizations/hierarchical-structures.md) - Rank/select structures
 - [docs/optimizations/access-patterns.md](../../../docs/optimizations/access-patterns.md) - Sequential vs random access
 - [docs/optimizations/history.md](../../../docs/optimizations/history.md) - Historical optimization record
-- [docs/plan/compact-index-investigation.md](../../../docs/plan/compact-index-investigation.md) - Elias-Fano for position arrays
+- [docs/plan/compact-index-investigation.md](../../../docs/plan/compact-index-investigation.md) - Elias-Fano for position arrays (rejected, #58)

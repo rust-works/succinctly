@@ -139,7 +139,6 @@ fn truthy(value: &OwnedValue) -> bool {
 
 /// The address of an array's storage: stable for as long as a handle on it is
 /// alive, which the slice-view tables guarantee by holding one.
-#[cfg(not(feature = "unshared-containers"))]
 fn storage_addr(items: &ArrayVec) -> usize {
     core::ptr::addr_of!(**items) as usize
 }
@@ -364,6 +363,13 @@ enum Frame<'e> {
         id: u64,
         parent: Env<'e>,
     },
+    /// The prelude's definitions, as one frame: a call finds a definition by
+    /// name and arity here and parses it on its first call (#5858). Each
+    /// definition's body runs in this frame, so it sees every definition.
+    Prelude {
+        prelude: &'e Prelude,
+        parent: Env<'e>,
+    },
 }
 
 /// A resolved function.
@@ -392,7 +398,8 @@ impl<'e> Env<'e> {
             Frame::Var { parent, .. }
             | Frame::Def { parent, .. }
             | Frame::Arg { parent, .. }
-            | Frame::Label { parent, .. } => parent,
+            | Frame::Label { parent, .. }
+            | Frame::Prelude { parent, .. } => parent,
         }
     }
 
@@ -463,6 +470,27 @@ impl<'e> Env<'e> {
                         env: env.clone(),
                         frame: at.clone(),
                     });
+                }
+                Frame::Prelude { prelude, .. } => {
+                    if let Some(def) = prelude.find(name, arity) {
+                        let Expr::FuncDef {
+                            name: n,
+                            params,
+                            body,
+                            ..
+                        } = def.expr()
+                        else {
+                            // patchcov: coverage tolerate reason="unreachable: every PRELUDE definition starts with `def`, which a unit test pins"
+                            unreachable!("a prelude definition parses to a FuncDef");
+                            // patchcov: coverage end
+                        };
+                        return Some(Callee::Def {
+                            name: n,
+                            params,
+                            body,
+                            env: at.clone(),
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -770,14 +798,22 @@ def _sp_recurse_down: recurse;
 .
 "#;
 
-/// The parsed [`PRELUDE`], plus the few one-off expressions the interpreter
-/// needs a stable `&Expr` for.
+/// The [`PRELUDE`], one definition per entry, parsed on its first call (#5858),
+/// plus the few one-off expressions the interpreter needs a stable `&Expr` for.
+///
+/// Parsing all of it takes about 1 ms (Apple M5 Max, release build), a few
+/// hundred times a small document's evaluation. Without `std` there is no cache
+/// to spread that over, so every `eval` that reaches the interpreter paid it;
+/// a program calls a handful of the ~110 definitions, so each parses only the
+/// ones it reaches.
 pub struct Prelude {
-    /// One `FuncDef` per definition, in [`PRELUDE`]'s order, each parsed on
-    /// its own: parsed as one chain the definitions nest about 150 deep, and
-    /// the recursive-descent parser then needs more native stack than a 2 MiB
-    /// debug thread has (a library caller's or a `cargo test` thread's).
-    defs: Vec<Expr>,
+    /// In [`PRELUDE`]'s order. Each is parsed on its own: parsed as one chain
+    /// the definitions nest about 150 deep, and the recursive-descent parser
+    /// then needs more native stack than a 2 MiB debug thread has (a library
+    /// caller's or a `cargo test` thread's).
+    defs: Vec<PreludeDef>,
+    /// Each definition's index in `defs`, by name and arity.
+    index: BTreeMap<(&'static str, usize), usize>,
     /// `$__sp_t`: a compound assignment's right-hand value, re-read as the
     /// `$sp_t` argument of `_sp_upd_*`.
     t_var: Expr,
@@ -785,32 +821,95 @@ pub struct Prelude {
     iterate: Expr,
 }
 
+/// One [`PRELUDE`] definition: its header read without parsing, its `FuncDef`
+/// parsed on first use.
+struct PreludeDef {
+    /// `name(a; $b): body;` or `name: body;`: the definition less its `def `, as
+    /// [`prelude_definitions`] cuts it.
+    source: &'static str,
+    name: &'static str,
+    arity: usize,
+    parsed: core::cell::OnceCell<Expr>,
+    /// What [`Interp::loops_in_place`] remembers on a `Frame::Def`, for a
+    /// definition with no parameters.
+    tail: Cell<Option<bool>>,
+}
+
+impl PreludeDef {
+    fn new(source: &'static str) -> Self {
+        let header = source;
+        let end = header
+            .find(['(', ':'])
+            .expect("a prelude definition has a body");
+        let arity = match header[end..].strip_prefix('(') {
+            Some(params) => {
+                let params = &params[..params.find(')').expect("a parameter list closes")];
+                params.matches(';').count() + 1
+            }
+            None => 0,
+        };
+        Self {
+            source,
+            name: &header[..end],
+            arity,
+            parsed: core::cell::OnceCell::new(),
+            tail: Cell::new(None),
+        }
+    }
+
+    /// The definition's `FuncDef`, its chain `rest` an identity.
+    ///
+    /// The first call of a definition parses it wherever the evaluation is, no
+    /// longer at the top. One definition's parse is shallow (the unit tests parse
+    /// every one on a 2 MiB debug thread), and the native-stack floor
+    /// ([`native_stack_exhausted`]) leaves half of
+    /// the registered stack unspent, so the parse has room at the floor.
+    fn expr(&self) -> &Expr {
+        self.parsed.get_or_init(|| {
+            let src = format!("def {} .", self.source);
+            let def = parse(&src).unwrap_or_else(|e| panic!("prelude: {e:?}"));
+            mark_loadvn(&def)
+        })
+    }
+}
+
 impl Prelude {
-    /// Parse the prelude. Panics only if [`PRELUDE`] itself fails to parse,
-    /// which a unit test pins.
+    /// Read the prelude's definitions and parse its one-off expressions. Panics
+    /// only if [`PRELUDE`] itself fails to parse, which a unit test pins.
     pub fn new() -> Self {
         let parse_ok = |src: &str| parse(src).unwrap_or_else(|e| panic!("prelude: {e:?}"));
+        let defs: Vec<PreludeDef> = prelude_definitions().map(PreludeDef::new).collect();
+        let index = defs
+            .iter()
+            .enumerate()
+            .map(|(at, def)| ((def.name, def.arity), at))
+            .collect();
         Self {
-            defs: prelude_definitions()
-                .map(|def| mark_loadvn(&parse_ok(&format!("{def} ."))))
-                .collect(),
+            defs,
+            index,
             t_var: parse_ok("$__sp_t"),
             iterate: parse_ok(".[]"),
         }
     }
+
+    /// The definition named `name` taking `arity` parameters. A name is
+    /// defined once (a unit test pins it), so the index holds them all.
+    fn find(&self, name: &str, arity: usize) -> Option<&PreludeDef> {
+        self.index.get(&(name, arity)).map(|&at| &self.defs[at])
+    }
 }
 
-/// [`PRELUDE`]'s definitions, one source text each (`def name: body;`):
-/// every one starts a line with `def `, and the text ends with the chain's `.`.
-fn prelude_definitions() -> impl Iterator<Item = String> {
+/// [`PRELUDE`]'s definitions, one source text each (`name: body;`): every one
+/// starts a line with `def `, which is cut, and the text ends before the chain's `.`.
+fn prelude_definitions() -> impl Iterator<Item = &'static str> {
     let text = PRELUDE
         .trim()
         .strip_suffix('.')
         .expect("the prelude ends with `.`");
     text.split("\ndef ").map(|def| {
         let def = def.trim();
-        let def = def.strip_prefix("def ").unwrap_or(def);
-        format!("def {def}")
+        // Only the first definition keeps its `def `; the rest lost it to the split.
+        def.strip_prefix("def ").unwrap_or(def)
     })
 }
 
@@ -841,11 +940,8 @@ pub struct Interp<'e> {
     /// into the root allocation. Keyed by `(root, offset, size)`, so equal
     /// slices of one array are one value; each view maps back to its root
     /// and offset, so a slice of a slice lands on the same key. Both hold
-    /// the root, so a compared address is never reused. Unused under the
-    /// `unshared-containers` holdout, which has no storage to view.
-    #[cfg_attr(feature = "unshared-containers", allow(dead_code))]
+    /// the root, so a compared address is never reused.
     slices: RefCell<BTreeMap<(usize, usize, usize), ArrayVec>>,
-    #[cfg_attr(feature = "unshared-containers", allow(dead_code))]
     slice_roots: RefCell<BTreeMap<usize, (ArrayVec, usize)>>,
 }
 
@@ -957,35 +1053,16 @@ pub(crate) fn route(program: &Expr) -> Route {
     if !dynamic || shipped_only {
         return Route::Shipped;
     }
-    // The interpreter reads storage identity, which the `unshared-containers`
-    // A/B holdout (#2999) does not have: its by-value `jv_identical` refuses
-    // rows jq answers. Nor does the shipped resolver answer a dynamic target any
-    // more (#5233), so that measurement build refuses one outright rather than
-    // answer it wrongly.
-    HOLDOUT_REFUSAL
-        .map(str::to_string)
-        .or_else(|| {
-            extension.map(|name| {
-                format!(
-                    "{name} is not supported in a program whose path expression does more than navigate"
-                )
-            })
+    extension
+        .map(|name| {
+            format!(
+                "{name} is not supported in a program whose path expression does more than navigate"
+            )
         })
         .map_or(Route::Interpreter, |message| {
             Route::Refused(EvalError::new(message))
         })
 }
-
-/// What the `unshared-containers` holdout refuses a dynamic path target with
-/// (#5233): a constant, not a branch, so the shipped build holds no line only
-/// the holdout runs.
-#[cfg(feature = "unshared-containers")]
-const HOLDOUT_REFUSAL: Option<&str> = Some(
-    "a path expression that does more than navigate is not supported in the \
-     unshared-containers build",
-);
-#[cfg(not(feature = "unshared-containers"))]
-const HOLDOUT_REFUSAL: Option<&str> = None;
 
 /// Why `succinctly jq` refuses `program`, if it does (#5233).
 ///
@@ -1233,14 +1310,18 @@ fn with_prelude<R>(f: impl FnOnce(&Prelude) -> R) -> R {
     // Parsed once per thread and freed with it. `with` hands out a shared
     // borrow, so a delegated builtin that re-enters the interpreter on the same
     // thread borrows the same prelude.
-    #[cfg(feature = "std")]
+    //
+    // `test` too: the lib's unit tests link `std` even without the feature
+    // (`cfg_attr(not(test), no_std)`), and reparsing per program made the
+    // #3856 sweeps 10x slower there, the tail of the `no-std` CI legs (#5845).
+    #[cfg(any(feature = "std", test))]
     {
         std::thread_local! {
             static PRELUDE_PARSED: Prelude = Prelude::new();
         }
         PRELUDE_PARSED.with(|prelude| f(prelude))
     }
-    #[cfg(not(feature = "std"))]
+    #[cfg(not(any(feature = "std", test)))]
     {
         f(&Prelude::new())
     }
@@ -1249,21 +1330,10 @@ fn with_prelude<R>(f: impl FnOnce(&Prelude) -> R) -> R {
 impl<'e> Interp<'e> {
     /// An interpreter over `prelude`'s definitions.
     pub fn new(prelude: &'e Prelude) -> Self {
-        let mut env = Env::default();
-        for def in &prelude.defs {
-            if let Expr::FuncDef {
-                name, params, body, ..
-            } = def
-            {
-                env = Env::push(Frame::Def {
-                    name,
-                    params,
-                    body,
-                    parent: env.clone(),
-                    tail: Cell::new(None),
-                });
-            }
-        }
+        let env = Env::push(Frame::Prelude {
+            prelude,
+            parent: Env::default(),
+        });
         Self {
             prelude,
             prelude_env: env,
@@ -1731,21 +1801,14 @@ impl<'e> Interp<'e> {
     /// `jvp_array_slice`: an empty slice is a fresh `[]`; the whole root is the
     /// root itself; any other range is the one view of that range, unless it
     /// starts 65,536 or more elements into the root, where jq copies it.
-    #[cfg_attr(feature = "unshared-containers", allow(clippy::unused_self))]
     fn array_slice(&self, items: &ArrayVec, start: usize, end: usize) -> OwnedValue {
         if start == end {
             return OwnedValue::Array(ArrayVec::new());
         }
-        // The holdout stores an array's elements inline, so there is no
-        // storage address to key a view by, and no identity to keep anyway.
-        #[cfg(feature = "unshared-containers")]
-        return OwnedValue::Array(items[start..end].to_vec().into());
-        #[cfg(not(feature = "unshared-containers"))]
         self.array_view(items, start, end)
     }
 
     /// [`Self::array_slice`]'s non-empty range, as a view of its root.
-    #[cfg(not(feature = "unshared-containers"))]
     fn array_view(&self, items: &ArrayVec, start: usize, end: usize) -> OwnedValue {
         let (root, offset) = self
             .slice_roots
@@ -3325,8 +3388,14 @@ impl<'e> Interp<'e> {
     /// frame is the innermost of `env`, runs as a loop (#5379): its spine ends in a call to
     /// the def itself or to one declared in it. Asked on every call, so remembered on the frame.
     fn loops_in_place(env: &Env<'e>, name: &str, body: &'e Expr) -> bool {
-        let Some(Frame::Def { tail, .. }) = env.0.as_deref() else {
-            return declared_tail_call(body, name); // patchcov: coverage tolerate-line reason="unreachable: a Callee::Def's env is its own Def frame"
+        let tail = match env.0.as_deref() {
+            Some(Frame::Def { tail, .. }) => tail,
+            // A prelude definition's env is the prelude's frame: its memo is on the definition.
+            Some(Frame::Prelude { prelude, .. }) => match prelude.find(name, 0) {
+                Some(def) => &def.tail,
+                None => return declared_tail_call(body, name), // patchcov: coverage tolerate-line reason="unreachable: a Callee::Def of the prelude's frame was found there by name"
+            },
+            _ => return declared_tail_call(body, name), // patchcov: coverage tolerate-line reason="unreachable: a Callee::Def's env is its own Def frame or the prelude's"
         };
         if let Some(known) = tail.get() {
             return known;
@@ -4519,11 +4588,8 @@ fn variant_name(expr: &Expr) -> String {
         .to_string()
 }
 
-// The interpreter reads storage identity, which the `unshared-containers`
-// holdout does not have (every clone copies), so its tests pin the shipped
-// shape only.
-#[cfg(all(test, not(feature = "unshared-containers")))]
+#[cfg(test)]
 mod reference;
 
-#[cfg(all(test, not(feature = "unshared-containers")))]
+#[cfg(test)]
 mod tests;

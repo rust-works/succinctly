@@ -10,7 +10,6 @@ use crate::assert_path_rows_both_routes_3749;
 
 /// The issue's rows and their controls: a bare `if`, the `then` a literal, `.`, `null` or `$i`, an EXTRACT of `$i`,
 /// `.` or `.a`, a falsy or constant condition, a source of two items.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_5082_truthy_condition_runs_a_then_that_moves_no_register() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -368,7 +367,6 @@ fn test_5082_truthy_condition_runs_a_then_that_moves_no_register() -> Result<()>
 }
 
 /// The same `if` on other documents, where the condition is falsy or the document has no object to navigate.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_5082_other_documents() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -489,7 +487,6 @@ fn test_5082_other_documents() -> Result<()> {
 
 /// The `if` behind a wrapper that adds no movement of its own: parentheses, a handler-less `try`/`?`, a `| .` or
 /// `| select(true)` stage.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_5082_wrapped_if_is_read_as_its_taken_branch() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

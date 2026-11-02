@@ -3,7 +3,7 @@
 [Home](../../) > [Docs](../) > [Optimizations](./) > Path-resolution per-step cloning
 
 Investigation of [#2058](https://github.com/rust-works/succinctly/issues/2058), which
-[del-path-trie.md](del-path-trie.md#2058) flagged as the term still binding
+[del-path-trie.md](del-path-trie.md#a-third-depth-driven-cost-in-path-resolution-itself-2058) flagged as the term still binding
 `jq_write_path_del_shared_prefix_depth`'s exponent to ~1.6 even after #1690 removed a
 genuine per-*branch* O(d²) from the same code region: holding the branch count fixed at
 two and scaling only depth `D` still read an exponent of ~1.8-1.95 for `path()`, `=` and

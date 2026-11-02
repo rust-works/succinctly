@@ -4095,7 +4095,7 @@ fn test_arithmetic_validates_only_what_it_reads_2626() -> Result<()> {
     Ok(())
 }
 
-/// #868: `leaf_paths` (also a succinctly extension, see CLAUDE.md) shares
+/// #868: `leaf_paths` (also a succinctly extension, see docs/reference/jq-language.md) shares
 /// `paths`'s same duplicate-key bug via its own `to_owned`-based walk --
 /// same fix, same internal-consistency criterion.
 #[test]
@@ -18941,9 +18941,11 @@ fn test_keys_unsorted_yaml_merge_key_lazy_685() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"["<<","c"]"#);
 
+    // The merge key is written as its node, `!!merge <<`, as yq's `.item | keys` prints it
+    // (#5469; this was `- "<<"` before).
     let (output, code) = run_yq_stdin(".item | keys_unsorted", input, &["--jq-extensions"])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), "- \"<<\"\n- c");
+    assert_eq!(output.trim(), "- !!merge <<\n- c");
 
     Ok(())
 }
@@ -28911,25 +28913,33 @@ fn test_isvalid_has_yq_type_mismatch_is_valid_917() -> Result<()> {
 }
 
 /// #3278: a value a filter builds past `MAX_VALUE_TREE_DEPTH` and then hands to
-/// yq's own write/emission pipeline is reported as `nesting depth exceeds limit
-/// of 384` with yq's error status, not an uncaught panic (exit 101 plus a raw
-/// `thread panicked` line).
+/// yq's own write/emission pipeline must not be an uncaught panic (exit 101 plus a
+/// raw `thread panicked` line). It was reported as `nesting depth exceeds limit of
+/// 384` with yq's error status; since #5876 the pipeline's walks check the
+/// native-stack floor instead (as `jq` does since #5554), so a 400-level value is
+/// written and printed. `def` is `--jq-extensions` surface, so there is no yq
+/// oracle: these are the extension's natural answers, byte counts checked against
+/// the same programs in jq mode.
 #[test]
 fn test_yq_deep_filter_built_value_is_a_clean_error_3278() -> Result<()> {
     let deep = "def deep(m): if m == 0 then . else [deep(m - 1)] end;";
-    for filter in [
-        format!("{deep} .a |= deep(400)"),
-        format!("{deep} .a = deep(400)"),
-        format!("{deep} deep(400)"),
+    let dashes = "- ".repeat(400);
+    for (filter, want) in [
+        (
+            format!("{deep} .a |= deep(400)"),
+            format!("a:\n  {dashes}1\n"),
+        ),
+        (
+            format!("{deep} .a = deep(400)"),
+            format!("a:\n  {dashes}a: 1\n"),
+        ),
+        (format!("{deep} deep(400)"), format!("{dashes}a: 1\n")),
     ] {
         let (stdout, stderr, code) =
             run_yq_stdin_with_stderr(&filter, "a: 1\n", &["--jq-extensions"])?;
         assert_eq!(
-            code, 1,
-            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
-        );
-        assert!(
-            stderr.contains("nesting depth exceeds limit of 384"),
+            (stdout.as_str(), code),
+            (want.as_str(), 0),
             "`{filter}` -- stderr: {stderr:?}"
         );
         assert!(
@@ -29432,9 +29442,10 @@ fn test_jq_tostring_computed_float_unaffected_1054() -> Result<()> {
 fn test_yq_at_sh_errors_on_number_input_1030() -> Result<()> {
     let (_, stderr, code) = run_yq_stdin_with_stderr(".a | @sh", "a: 1e2\n", &["-r"])?;
     assert_ne!(code, 0);
-    assert!(
-        stderr.contains("can not be escaped for shell"),
-        "stderr: {stderr}"
+    // yq's `@sh` refuses in its `@uri` wording (#5836).
+    assert_eq!(
+        stderr.trim(),
+        "Error: cannot encode !!float as URI, can only operate on strings. Please first pipe through another encoding operator to convert the value to a string"
     );
     Ok(())
 }
@@ -29445,22 +29456,25 @@ fn test_yq_at_sh_errors_on_number_input_1030() -> Result<()> {
 fn test_yq_at_sh_errors_on_non_string_1073() -> Result<()> {
     let (_, stderr, code) = run_yq_stdin_with_stderr(".a | @sh", "a: [1, 2]\n", &["-r"])?;
     assert_ne!(code, 0);
-    assert!(
-        stderr.contains("can not be escaped for shell"),
-        "stderr: {stderr}"
+    // yq's `@sh` refuses in its `@uri` wording (#5836).
+    assert_eq!(
+        stderr.trim(),
+        "Error: cannot encode !!seq as URI, can only operate on strings. Please first pipe through another encoding operator to convert the value to a string"
     );
 
     let (_, stderr, code) = run_yq_stdin_with_stderr(".a | @sh", "a: true\n", &["-r"])?;
     assert_ne!(code, 0);
-    assert!(
-        stderr.contains("can not be escaped for shell"),
-        "stderr: {stderr}"
+    // yq's `@sh` refuses in its `@uri` wording (#5836).
+    assert_eq!(
+        stderr.trim(),
+        "Error: cannot encode !!bool as URI, can only operate on strings. Please first pipe through another encoding operator to convert the value to a string"
     );
 
-    // A string is still accepted.
+    // A string is still accepted, and one that needs no quotes is written bare, as yq writes it
+    // (#5837).
     let (stdout, code) = run_yq_stdin(".a | @sh", "a: hello\n", &["-r"])?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), "'hello'");
+    assert_eq!(stdout.trim_end(), "hello");
     Ok(())
 }
 
@@ -42993,9 +43007,10 @@ fn test_jq_only_date_builtins_gated_behind_jq_extensions_1907() -> Result<()> {
     // Real yq's own date/time extensions stay ungated (unaffected by this
     // fix, sanity-checked here so a future accidental over-broad gate
     // regresses loudly).
-    let (out, code) = run_yq_stdin("from_unix", "0\n", &[])?;
+    // `from_unix` writes the local zone (#5863), so the round trip is what is zone-independent.
+    let (out, code) = run_yq_stdin("from_unix | to_unix", "0\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "1970-01-01T00:00:00Z");
+    assert_eq!(out.trim(), "0");
 
     Ok(())
 }
@@ -63827,18 +63842,20 @@ fn jq_only_builtins_3046_are_gated_in_yq_mode() -> Result<()> {
     Ok(())
 }
 
-/// `tz` (a yq-mode extension) on a non-number keeps its pre-#3042 wording;
-/// real yq answers a Go layout-parse error (`could not parse datetime of
-/// [a] ...`) there, so neither is oracle-backed -- pinned only so #3042's
-/// move of the libm family onto jq's `number required` provably did not
-/// reach it (see #3068 for the jq-side sibling).
+/// `tz` on text that is not a timestamp answers yq's Go layout-parse error
+/// (#5863): yq v4.53.3 prints `could not parse datetime of [a] using layout
+/// [...]: parsing time "x" as "2006-01-02": cannot parse "x" as "2006"`, with
+/// the node's path in the brackets, which a value here does not carry. It was
+/// pinned so #3042's move of the libm family onto jq's `number required` did
+/// not reach `tz` (see #3068 for the jq-side sibling); it still does not.
 #[test]
-fn test_tz_non_number_wording_unchanged_by_3042() -> Result<()> {
+fn test_tz_non_timestamp_answers_the_layout_parse_error_5863() -> Result<()> {
     let (_out, stderr, code) = run_yq_stdin_with_stderr(r#".a | tz("UTC")"#, "a: x\n", &[])?;
     assert_ne!(code, 0);
-    assert!(
-        stderr.contains("math function requires number"),
-        "stderr: {stderr:?}"
+    assert_eq!(
+        stderr.trim_end(),
+        "Error: could not parse datetime of [] using layout [2006-01-02T15:04:05Z07:00]: \
+         parsing time \"x\" as \"2006-01-02\": cannot parse \"x\" as \"2006\""
     );
     Ok(())
 }
@@ -64178,11 +64195,14 @@ fn test_key_past_a_seeded_deep_position_does_not_panic_3020() -> Result<()> {
 }
 
 /// #3261: `succinctly yq`'s own `evaluate_input` (`yq_runner.rs`) shares the
-/// exact `OwnedValue::reindexed` bridge `succinctly jq` does -- before this
+/// exact `OwnedValue::reindexed` bridge `succinctly jq` does -- before that
 /// fix, a filter-driven value growing past `MAX_VALUE_TREE_DEPTH` (384) via
 /// `reduce`/`foreach` panicked uncaught (exit 101) here too, since nothing
-/// in `evaluate_input` caught it. Now it reports through the ordinary
-/// `sink.report` diagnostic path, matching an everyday evaluator error.
+/// in `evaluate_input` caught it; it then reported `nesting depth exceeds
+/// limit of 384` through the ordinary `sink.report` path. Since #5876 `yq`
+/// arms the native-stack floor as `jq` did in #5554, so the value is read
+/// back and answered (`--jq-extensions` surface: real yq has no `reduce`
+/// over `range`, so the extension follows jq, whose answer is `1`).
 #[test]
 fn test_reduce_growth_past_value_tree_depth_reports_cleanly_yq_3261() -> Result<()> {
     let (stdout, stderr, code) = run_yq_stdin_with_stderr(
@@ -64190,12 +64210,7 @@ fn test_reduce_growth_past_value_tree_depth_reports_cleanly_yq_3261() -> Result<
         "null",
         &["--jq-extensions"],
     )?;
-    assert_ne!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "", "stdout: {stdout:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
-        "stderr: {stderr:?}"
-    );
+    assert_eq!((stdout.as_str(), code), ("1\n", 0), "stderr: {stderr:?}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
     Ok(())
 }

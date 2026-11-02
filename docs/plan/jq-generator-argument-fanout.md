@@ -139,8 +139,8 @@ construction). **Copy those; do not re-derive them.**
 
 For a builtin with two generator arguments, the order is decided by *how jq defines that
 builtin*, not by its signature. Inferring it from the signature produces the right number
-of outputs in the wrong sequence — which no count-based test catches. This is CLAUDE.md's
-#1120 lesson exactly.
+of outputs in the wrong sequence — which no count-based test catches. This is the testing
+skill's #1120 rule (`.claude/skills/testing/SKILL.md`) exactly.
 
 | jq mechanism | order | witness |
 |---|---|---|

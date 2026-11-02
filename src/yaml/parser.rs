@@ -2995,8 +2995,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
             }
             // After quoted key, check for `: `
-            // Skip optional whitespace
-            while i < self.input.len() && self.input[i] == b' ' {
+            // Skip optional whitespace: spaces and tabs, as `parse_mapping_entry` does
+            // (`s-separate-in-line`, #5814).
+            while i < self.input.len() && Self::is_inline_whitespace(self.input[i]) {
                 i += 1;
             }
             if i < self.input.len() && self.input[i] == b':' {

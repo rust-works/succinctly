@@ -17,6 +17,7 @@
 # filters. They are heavy by construction, not slow because of a fault, so the cost is moved
 # here too: this leg (about 270 s of test CPU) and `cli-gated` (about 970 s) then carried
 # similar amounts (#5705 has since moved `yq_cli_tests` here, below). A `yq_cli_tests` test cannot be listed: `run` lists and runs one target.
+# #5782's ten-million-level drop test joined later, timed on its own rather than in that run.
 #
 # All of `yq_cli_tests` (104 s of macOS test time, #5705) runs in that leg too, but not from
 # here: ci.yml runs `cargo test --features cli --test yq_cli_tests` after `run`, with no skip
@@ -35,11 +36,6 @@
 #
 #   deep-recursion-tests.sh skip-args   prints `--exact --skip <name> ...`, which
 #                                       ci.yml appends after `--` on `cli-gated`
-#   deep-recursion-tests.sh skip-args-stack
-#                                       the same for the two stack tests only: the
-#                                       x86_64 `holdout` leg is the one place the
-#                                       `unshared-containers` build is tested, so it
-#                                       keeps running the heavy tests and skips just these
 #   deep-recursion-tests.sh run         the whole `deep-recursion` leg
 #   deep-recursion-tests.sh heavy-args  prints `--exact <name> ...` for HEAVY_TESTS (not the
 #                                       stack tests, which are `#[ignore]`d under coverage):
@@ -67,7 +63,7 @@ set -euo pipefail
 
 TEST_TARGET=jq_cli_tests
 
-# The two whose cost is the native stack (#3698). The `holdout` leg skips only these.
+# The two whose cost is the native stack (#3698).
 STACK_TESTS=(
   test_recursion_refuses_before_the_native_stack_runs_out_3262
   test_composed_recursion_across_two_defs_errors_not_aborts_1371
@@ -81,6 +77,7 @@ HEAVY_TESTS=(
   test_argument_chain_refuses_on_the_path_routes_3262 # 61
   test_recurse_cap_stopping_consumers_and_boundary_3716 # 44
   test_fused_slice_key_equals_the_unfused_spelling_4286 # 43
+  per_issue::i5782::a_ten_million_level_array_is_dropped_without_overflowing_the_stack_5782 # 28 (#5782, measured alone; peaks near 790 MB RSS)
   test_owned_array_slice_read_equals_the_unfused_spelling_4286 # 25
   test_fused_navigated_literal_slice_read_equals_the_unfused_spelling_4406 # 25
   test_recurse_cap_retry_and_null_loop_3716 # 23
@@ -93,13 +90,19 @@ HEAVY_TESTS=(
   test_tree_recursion_stack_follows_depth_not_calls_3296 # 12
   test_path_try_equals_the_question_mark_spelling_4412 # 11
   test_type_selectors_equal_their_definition_3690 # 11
+  # #5554: each builds a value two million levels deep, past the debug thread's native-stack floor
+  # (seconds, M5 Max, one at a time).
+  per_issue::i5526::test_refusal_is_per_document_and_try_cannot_swallow_it_5526 # 33
+  per_issue::i5526::test_built_value_past_the_native_stack_floor_is_a_refusal_not_a_panic_5526 # 25
+  per_issue::i5554c::a_walk_past_the_native_stack_floor_refuses_at_exit_5_5554 # 17
+  per_issue::i5526::test_built_value_past_the_native_stack_floor_on_document_input_5526 # 17
 )
 
-# What the `deep-recursion` leg runs, and every other leg but `holdout` skips.
+# What the `deep-recursion` leg runs, and every other leg skips.
 DEEP_RECURSION_TESTS=("${STACK_TESTS[@]}" "${HEAVY_TESTS[@]}")
 
 usage() {
-  echo "usage: $0 skip-args|skip-args-stack|heavy-args|run" >&2
+  echo "usage: $0 skip-args|heavy-args|run" >&2
 }
 
 # `--exact --skip <name> ...` for the names given.
@@ -149,7 +152,6 @@ run() {
 case "${1:-}" in
   heavy-args) echo "--exact ${HEAVY_TESTS[*]}" ;;
   skip-args) skip_args_of "${DEEP_RECURSION_TESTS[@]}" ;;
-  skip-args-stack) skip_args_of "${STACK_TESTS[@]}" ;;
   run) run ;;
   *) usage; exit 2 ;;
 esac

@@ -10,7 +10,6 @@ use crate::assert_path_rows_both_routes_3749;
 
 /// #5126 row 1: the issue's row and its siblings (`false`, `null` and parenthesised conditions, a live arm that is `empty`, the fold in the `else`, `path`, `[path()?]`, `del`),
 /// captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5126_constant_condition_names_the_live_extract_arm() -> Result<()> {

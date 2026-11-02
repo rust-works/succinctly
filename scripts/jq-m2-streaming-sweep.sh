@@ -48,6 +48,9 @@
 # scripts/jq-fanout-oracle-sweep.sh. The pinned rows in tests/jq_cli_tests.rs
 # are what CI enforces.
 #
+# Exit status: 0 the table matches, 1 a line changed, 2 a setup error (the contract
+# `comparison/jq/manifest.toml`'s `[[sweep]]` runner reads, #5807).
+#
 # Usage:
 #   cargo build --release --features cli
 #   ./scripts/jq-m2-streaming-sweep.sh [--update] [path-to-succinctly-binary]
@@ -74,19 +77,21 @@ SUCC="${ARGS[0]:-$REPO_ROOT/target/release/succinctly}"
 
 if [[ ! -x "$SUCC" ]]; then
   echo "error: succinctly binary not found at $SUCC — run: cargo build --release --features cli" >&2
-  exit 1
+  exit 2
 fi
 
 # Prefer the pinned oracle binary directly (macOS ships jq-1.7.1 at
 # /usr/bin/jq; a PATH jq, e.g. Homebrew's, is often newer) — same reasoning
 # as tests/jq_cli_tests.rs's own pinned-oracle comments.
-if [[ -x /usr/bin/jq ]] && /usr/bin/jq --version | grep -q "^$PIN"; then
+if [[ -n "${JQ_ORACLE:-}" ]] && "$JQ_ORACLE" --version 2>/dev/null | grep -q "^$PIN"; then
+  JQ="$JQ_ORACLE"
+elif [[ -x /usr/bin/jq ]] && /usr/bin/jq --version | grep -q "^$PIN"; then
   JQ=/usr/bin/jq
 elif command -v jq >/dev/null 2>&1 && jq --version | grep -q "^$PIN"; then
   JQ="$(command -v jq)"
 else
   echo "error: no jq matching pin $PIN found at /usr/bin/jq or on PATH" >&2
-  exit 1
+  exit 2
 fi
 echo "oracle: $JQ ($("$JQ" --version)), succinctly: $SUCC" >&2
 
@@ -246,7 +251,7 @@ fi
 
 if [[ ! -f "$GOLDEN" ]]; then
   echo "error: golden table $GOLDEN not found — run with --update to create it" >&2
-  exit 1
+  exit 2
 fi
 
 if diff -u "$GOLDEN" "$ACTUAL" > "$WORK/diff.txt"; then

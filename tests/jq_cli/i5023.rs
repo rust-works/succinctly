@@ -15,7 +15,6 @@ use crate::{assert_path_rows_both_routes_3749, run_jq_full};
 /// under a `$x` or `$i` EXTRACT; `[path(..)?]`, `try path(..) catch`, `try del(..) catch`. The last block holds the
 /// terminal's own refusals, which stay, and the no-op pipes outside a UPDATE. Every row captured from `/usr/bin/jq` 1.7.1 (stdout, first stderr line up to the container, exit
 /// code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5023_foreach_update_pipe_of_no_ops_over_an_untracked_state() -> Result<()> {
@@ -4121,7 +4120,6 @@ fn test_5023_foreach_update_pipe_of_no_ops_over_an_untracked_state() -> Result<(
 /// #5023: shapes jq refuses never get an answer: a no-op pipe outside a `foreach` UPDATE keeps the refusal it had
 /// (the fix is the UPDATE's, not the shared resolver's: handing the seed on there answered
 /// the first row, `del` writing `null`, and the second, a pipe off the root). Every row captured from `/usr/bin/jq` 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5023_shapes_jq_refuses_are_not_answered() -> Result<()> {

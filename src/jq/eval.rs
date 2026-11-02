@@ -9768,9 +9768,15 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     match &entry.key {
-        ObjectKey::Literal(name) => {
-            each_object_value::<W, S>(name.clone(), &entry.value, rest, value, optional, acc, sink)
-        }
+        ObjectKey::Literal(name) => each_object_value::<W, S>(
+            Ok(name.clone()),
+            &entry.value,
+            rest,
+            value,
+            optional,
+            acc,
+            sink,
+        ),
         // The `Expr::Object` arm of `eval_each` leaves a construction holding a
         // bare entry to the eager fallback, which collects it.
         ObjectKey::Bare => unreachable!("a bare entry is collected, not streamed"), // patchcov: coverage tolerate-line reason="unreachable: the Expr::Object arm of eval_each sends a construction holding a bare entry down yq_object_route's Union route, so a bare entry never reaches the streaming fan-out (#2783)"
@@ -9787,22 +9793,11 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Ok(v) => v,
                     Err(e) => return escape.stop(Control::Error(e)),
                 };
+                // #5915: a key that is no string (and that yq does not stringify) is kept as it is
+                // and raised by `each_object_value` once the entry's value yields one.
                 let key_str = match &key_owned {
-                    OwnedValue::String(s) => String::clone(s),
-                    _ => match yq_object_key_stringify::<S>(&key_owned) {
-                        Some(s) => s,
-                        None => {
-                            if optional {
-                                // See this function's own doc comment: the
-                                // eager `ObjectEscape::None` rule (discard
-                                // everything) is deliberately not reproduced.
-                                return Demand::Continue; // patchcov: coverage tolerate-line reason="unreachable: `optional` is never `true` here. `eval_each` is entered with a forced `true` at exactly one site (`Expr::Optional` over an `IndexExpr`/`SliceExpr`), and both of those evaluate their target (`eval_index_expr`) and their key (`eval_each(key, .., false)`) with a hardcoded `false`, so only the final index/slice step ever sees it -- nothing carries it down to an `Expr::Object` (#2180)"
-                            }
-                            return escape.stop(Control::Error(
-                                EvalError::cannot_use_as_object_key(&key_owned),
-                            ));
-                        }
-                    },
+                    OwnedValue::String(s) => Ok(String::clone(s)),
+                    _ => yq_object_key_stringify::<S>(&key_owned).ok_or(key_owned),
                 };
                 match each_object_value::<W, S>(
                     key_str,
@@ -9832,7 +9827,7 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                      // threaded straight through the recursion, a struct
                                      // would just rename the same fields.
 fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    key: String,
+    key: Result<String, OwnedValue>,
     value_expr: &Expr,
     rest: &[super::expr::ObjectEntry],
     value: StandardJson<'a, W>,
@@ -9850,7 +9845,19 @@ fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(v) => v,
             Err(e) => return escape.stop(Control::Error(e)),
         };
-        acc.push((key.clone(), val_owned));
+        // #5915: a computed key that is no string is rejected here, once a value exists to pair
+        // it with, as `build_object_entries` and jq do: a value that yields nothing, or raises
+        // first, wins.
+        let key_str = match &key {
+            Ok(name) => name.clone(),
+            Err(bad) => {
+                if optional {
+                    return Demand::Continue; // patchcov: coverage tolerate-line reason="unreachable: `optional` is never `true` here. `eval_each` is entered with a forced `true` at exactly one site (`Expr::Optional` over an `IndexExpr`/`SliceExpr`), and both of those evaluate their target and their key with a hardcoded `false`, so nothing carries it down to an `Expr::Object` (#2180, #5915)"
+                }
+                return escape.stop(Control::Error(EvalError::cannot_use_as_object_key(bad)));
+            }
+        };
+        acc.push((key_str, val_owned));
         let result = each_object_entries::<W, S>(rest, value.clone(), optional, acc, sink);
         acc.pop();
         match result {
@@ -10582,6 +10589,62 @@ pub(crate) fn eval_owned_string_door<S: EvalSemantics>(
         // an answer is taken.
         stage @ (Expr::Compare { .. } | Expr::And(..) | Expr::Or(..) | Expr::Not) => {
             eval_owned_pure_in::<S>(stage, input, ResultPosition::Fresh, true)?.ok()
+        }
+        _ => None,
+    }
+}
+
+/// A string-to-string stage of an owned string, answered from the string itself (#5816):
+/// `ltrimstr("lit")`, `rtrimstr("lit")`, `tostring` and `. + "lit"`. The answer is a new string, or
+/// the input's own handle where jq hands its input back (`ltrimstr`/`rtrimstr` with nothing to
+/// trim, `tostring` of a string, as [`tostring_owned`] does). jq mode only.
+///
+/// Apart from [`eval_owned_count_door`], whose callers rely on an answer that is no node of
+/// `input` (the `as` count bind substitutes a fresh integer or boolean): a string stage is asked
+/// for only where its answer is the value the rest of the pipe runs on or the output, in front of
+/// [`eval_each_owned`], which path resolution does not use. A non-literal or non-string argument,
+/// and every other stage, decline, and the bridge keeps its errors.
+pub(crate) fn eval_owned_string_stage<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let OwnedValue::String(text) = input else {
+        return None;
+    };
+    let literal_string = |arg: &Expr| match unwrap_paren(arg) {
+        Expr::Literal(lit) => match literal_to_owned(lit) {
+            OwnedValue::String(s) => Some(s),
+            _ => None,
+        },
+        _ => None,
+    };
+    match unwrap_paren(expr) {
+        Expr::Builtin(Builtin::Ltrimstr(pattern)) => {
+            let pattern = literal_string(pattern)?;
+            Some(match text.strip_prefix(&*pattern) {
+                Some(rest) => OwnedValue::String(rest.to_string().into()),
+                None => input.clone(),
+            })
+        }
+        Expr::Builtin(Builtin::Rtrimstr(pattern)) => {
+            let pattern = literal_string(pattern)?;
+            Some(match text.strip_suffix(&*pattern) {
+                Some(rest) => OwnedValue::String(rest.to_string().into()),
+                None => input.clone(),
+            })
+        }
+        Expr::Builtin(Builtin::ToString) => Some(input.clone()),
+        Expr::Arithmetic {
+            op: ArithOp::Add,
+            left,
+            right,
+            ..
+        } if matches!(unwrap_paren(left), Expr::Identity) => {
+            let suffix = literal_string(right)?;
+            arith_combine::<S>(ArithOp::Add, input.clone(), OwnedValue::String(suffix)).ok()
         }
         _ => None,
     }
@@ -11610,7 +11673,7 @@ fn embed_peel_step<S: EvalSemantics>(
                 return None;
             }
             let mut flat = inner.clone();
-            flat.extend_from_slice(rest);
+            flat.make_mut().extend_from_slice(rest);
             return embed_peel_step::<S>(&Expr::Pipe(flat), input, optional, reentry);
         }
         Expr::Identity => {
@@ -11727,6 +11790,13 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
             Demand::Stop => Flow::Stopped { pending: None },
         });
     }
+    // #5816: a string-to-string stage (`ltrimstr("x")`, `tostring`, `. + "x"`) of an owned string.
+    if let Some(answer) = eval_owned_string_stage::<S>(expr, input) {
+        return Some(match sink(answer) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        });
+    }
     // #5675: an expression that never reads `.` (`$n * 2` once `$n` is a literal, `1 + 2`,
     // `[1, 2]`) is one value whatever the input is, so the input is not written out and indexed to
     // find it. [`eval_owned_closed`] declines whatever errors, fans out or hands on a bound node.
@@ -11795,7 +11865,75 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
     if owned_swallowing_boundary::<S>(expr, input) {
         return Some(Flow::Exhausted);
     }
+    // #5840: a program that answers nothing for any input needs no input read at all.
+    if S::TAG == EvalTag::Jq && owned_answers_nothing(expr) {
+        return Some(Flow::Exhausted);
+    }
+    // #5840: `.k // empty` is `select(.k)` that emits the value it read.
+    // Not under an embed table, as [`owned_select_door`]: a read that stands on an embedded node is
+    // [`embed_peel_step`]'s to answer.
+    if S::TAG == EvalTag::Jq && !super::eval_generic::embed_table_active() {
+        if let Some(flow) = owned_alternative_to_empty::<S>(expr, input, sink) {
+            return Some(flow);
+        }
+    }
     None
+}
+
+/// Whether `expr` produces no output whatever its input is: `empty`, `error(lit)?` and a pipe
+/// that starts with either (#5840).
+///
+/// The first such stage ends the pipe before a later stage is run, so nothing behind it is
+/// evaluated: not for its output, not for an error, as in jq (`empty | error("x")` is empty). A
+/// stage that merely contains one (`1, empty`) is not this function's. `error` is taken only
+/// with no argument or a literal one, since an argument is itself evaluated first and may
+/// raise, or read `input`, before the `?` suppresses it.
+fn owned_answers_nothing(expr: &Expr) -> bool {
+    match unwrap_paren(expr) {
+        Expr::Builtin(Builtin::Empty) => true,
+        Expr::Try { expr, catch: None } | Expr::Optional(expr) => match unwrap_paren(expr) {
+            Expr::Error(None) => true,
+            Expr::Error(Some(arg)) => matches!(unwrap_paren(arg), Expr::Literal(_)),
+            _ => false,
+        },
+        Expr::Pipe(stages) => match skip_identity_stages(stages) {
+            [first, ..] => owned_answers_nothing(first),
+            [] => false,
+        },
+        _ => false,
+    }
+}
+
+/// `.k // empty` and `.[n] // empty` over an owned container (#5840): the value read when it is
+/// truthy, nothing when it is `null` or `false`. `None` when the shape is another, or when the read
+/// does not answer a value, so the bridge keeps its diagnostics.
+///
+/// `//` keeps the truthy outputs of its left side and falls through to the right only when there is
+/// none, and the right is `empty`: one read, one truthiness test. A read that raises is not taken
+/// (`//` suppresses the error, a case the bridge settles).
+fn owned_alternative_to_empty<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    let Expr::Alternative(left, right) = unwrap_paren(expr) else {
+        return None;
+    };
+    if !matches!(unwrap_paren(right), Expr::Builtin(Builtin::Empty)) {
+        return None;
+    }
+    let left = unwrap_paren(left);
+    if !matches!(left, Expr::Field(_) | Expr::Index { .. }) {
+        return None;
+    }
+    match eval_owned_navigation::<S>(left, input, false)? {
+        Ok(Some(value)) if value.is_truthy() => Some(match sink(value) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        }),
+        Ok(Some(_)) => Some(Flow::Exhausted),
+        _ => None,
+    }
 }
 
 /// The one stage `rest` is made of, if it is a plain one: the stage the front
@@ -11867,8 +12005,9 @@ pub(crate) mod owned_pipe_copies {
 /// rest cannot be answered without it (#1598, #3673, #3682).
 ///
 /// `eval_each_owned` takes an `&Expr`, and the only way to present a `rest`
-/// *slice* as one is to own a copy: a `Vec` allocation plus a recursive
-/// `Expr` clone per stage. Doing that inside the per-element call meant
+/// *slice* as one is to own a pipe of it: a copy, a `Vec` allocation plus a
+/// recursive `Expr` clone per stage, or, for a tail of a copy whose stages
+/// are shared, a view of them (#5488). Doing that inside the per-element call meant
 /// paying it once per element; a driver builds one of these instead and
 /// reuses it for its whole loop. A rest of one plain stage does not need the
 /// copy at all when `eval_each_owned`'s front doors answer it, so
@@ -11929,12 +12068,20 @@ impl RestCopy {
     }
 
     /// The owned pipe over `stages`, built on the first call.
-    fn owned_pipe(&mut self, stages: &[Expr], owner: Option<&PipeStages>) -> &Expr {
+    fn owned_pipe<S: EvalSemantics>(
+        &mut self,
+        stages: &[Expr],
+        owner: Option<&PipeStages>,
+    ) -> &Expr {
         self.pipe_of(|| {
             #[cfg(test)]
             owned_pipe_copies::bump();
             match owner {
-                Some(owner) => owner.tail_copy(owner.len() - stages.len()),
+                Some(owner) => {
+                    owner.tail_copy(owner.len() - stages.len(), pipe_state_end, |tail| {
+                        stateless_prefix_len::<S>(owner, tail)
+                    })
+                }
                 None => stages.to_vec().into(),
             }
         })
@@ -12056,7 +12203,7 @@ impl<'a> RestPipe<'a> {
                 let tail = self.tail();
                 self.copy.split_pipe(|| tail.split())
             }
-            Some(TailPlan::Copy) | None => self.copy.owned_pipe(self.stages, self.owner),
+            Some(TailPlan::Copy) | None => self.copy.owned_pipe::<S>(self.stages, self.owner),
         };
         if lone.is_some() {
             eval_each_owned_past_front_doors::<S>(whole, input, optional, reentry, sink)
@@ -12126,6 +12273,78 @@ fn holds_evaluation_state(stage: &Expr) -> bool {
         } else {
             Visit::Descend
         }
+    })
+}
+
+/// How many of `stages` lead up to and include the last that [holds
+/// evaluation state](holds_evaluation_state) outside an [`Expr::Shared`], 0
+/// when none does: from where on a tail of their pipe may be viewed rather
+/// than copied ([`PipeStages::tail_copy`], #5488).
+///
+/// A `Shared` node (a closure argument, a kept run, a #5679 chain link) is
+/// skipped unwalked: a copy of a stage clones it by bumping its `Rc`, so a
+/// copy shares whatever is under it with the program exactly as a view does,
+/// and its contents cannot make the copy the safer choice. Walking them cost
+/// a whole argument tree per copied tail (2.4x on a call whose 8,000-node
+/// argument sat in a copied tail, review of #5830).
+fn pipe_state_end(stages: &[Expr]) -> usize {
+    stages
+        .iter()
+        .rposition(holds_state_outside_shared)
+        .map_or(0, |last| last + 1)
+}
+
+/// How many of `tail` lead up to its first stage that [holds evaluation
+/// state](holds_evaluation_state) outside an [`Expr::Shared`]: the stateless prefix that
+/// [`PipeStages::tail_copy`] hands on as a link of its own (#5871), or 0 when it hands none on.
+///
+/// Only jq mode nests stages, as it only splits a tail (#5421): yq's first-stage rule for a failing
+/// generator ([`eval_pipe`]) reads the first stage of a pipe, and a link is a pipe of its own. And
+/// a link is an `Expr::Shared`, which a re-entry's marker rewrite does not reach, while a rewritten
+/// marker is read only by a resolver invocation ([`reentry_can_observe`]): a prefix holding both a
+/// marker and a node that can start one is copied, as the chain of a long pipe is (#5679). The
+/// stateful suffix stays in the pipe, so its call is rewritten as it was.
+fn stateless_prefix_len<S: EvalSemantics>(owner: &PipeStages, tail: &[Expr]) -> usize {
+    if S::TAG != EvalTag::Jq {
+        return 0;
+    }
+    let prefix = &tail[..pipe_state_start(tail)];
+    // The owner remembers whether it holds a marker at all, which most do not: its answer covers
+    // the prefix, so the prefix is walked only for a pipe that does.
+    if !pipe_holds_tracked_var(owner) {
+        return prefix.len();
+    }
+    let (mut marker, mut resolver) = (false, false);
+    for stage in prefix {
+        any_subexpr(stage, &mut |e| {
+            marker |= matches!(e, Expr::TrackedVar(_));
+            resolver |= may_enter_resolver_node(e);
+            marker && resolver
+        });
+        if marker && resolver {
+            return 0;
+        }
+    }
+    prefix.len()
+}
+
+/// Where in `stages` the first that holds evaluation state outside an [`Expr::Shared`] is, or
+/// `stages.len()` when none does.
+fn pipe_state_start(stages: &[Expr]) -> usize {
+    stages
+        .iter()
+        .position(holds_state_outside_shared)
+        .unwrap_or(stages.len())
+}
+
+/// Whether `stage` holds evaluation state, `Shared` nodes skipped unwalked (see
+/// [`pipe_state_end`]).
+fn holds_state_outside_shared(stage: &Expr) -> bool {
+    use crate::jq::walk::{search_subexpr, Visit};
+    search_subexpr(stage, &mut |e| match e {
+        Expr::DefCall { .. } | Expr::FuncDef { .. } => Visit::Found,
+        Expr::Shared(_) => Visit::Skip,
+        _ => Visit::Descend,
     })
 }
 
@@ -12426,7 +12645,7 @@ fn owned_select_door<S: EvalSemantics>(
     // the settled ones are truthy, so `input` reaches it unchanged.
     let mut peeled = false;
     while let [first, tail @ ..] = stages {
-        let Expr::Builtin(Builtin::Select(cond)) = unwrap_paren(first) else {
+        let Some((cond, inverted)) = select_like::<S>(first) else {
             break;
         };
         // `optional` is gated at the top, so the verdict is the shared one
@@ -12434,7 +12653,7 @@ fn owned_select_door<S: EvalSemantics>(
         let Some(verdict) = owned_cond_verdict::<S>(cond, input, false) else {
             break;
         };
-        match verdict {
+        match verdict.map(|truthy| truthy != inverted) {
             Ok(true) => {}
             Ok(false) => return Some(Flow::Exhausted),
             Err(error) => return Some(Flow::Escaped(Control::Error(error))),
@@ -12463,6 +12682,33 @@ fn owned_select_door<S: EvalSemantics>(
     Some(RestPipe::new(stages).run_owned::<S>(input, optional, Reentry::REBUILT, sink))
 }
 
+/// The condition of a stage [`owned_select_door`] settles, and whether it keeps the input when the
+/// condition is falsy rather than truthy: `select(c)`, and in jq mode its definition spelled out
+/// (#5840), `if c then . else empty end` and `if c then empty else . end`.
+///
+/// jq defines `select(f)` as exactly that conditional, so the spellings are one stage, a condition
+/// with several outputs included (the verdict declines those). Under `--stream` and `-R` a program
+/// written the long way took the bridge for every input, where `select` did not.
+fn select_like<S: EvalSemantics>(stage: &Expr) -> Option<(&Expr, bool)> {
+    match unwrap_paren(stage) {
+        Expr::Builtin(Builtin::Select(cond)) => Some((cond, false)),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } if S::TAG == EvalTag::Jq => {
+            let then_branch = unwrap_paren(then_branch);
+            let else_branch = unwrap_paren(else_branch);
+            match (then_branch, else_branch) {
+                (Expr::Identity, Expr::Builtin(Builtin::Empty)) => Some((cond, false)),
+                (Expr::Builtin(Builtin::Empty), Expr::Identity) => Some((cond, true)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// A first stage [`projection_peel`] navigates natively without asking the
 /// input: the one list both its nested-pipe pre-filter and its guard read.
 fn is_peelable_head<S: EvalSemantics>(stage: &Expr) -> bool {
@@ -12475,7 +12721,8 @@ fn is_peelable_head<S: EvalSemantics>(stage: &Expr) -> bool {
 }
 
 /// Take a pipe's leading `.field`/`.[n]`/`.[a:b]` (or `length`, and a string's
-/// `startswith`/`endswith`, #5712; jq mode also
+/// `startswith`/`endswith`, #5712, and its `test`/`index`/`rindex`/`inside` of a literal,
+/// `ltrimstr`/`rtrimstr`/`tostring` and `. + "lit"`, #5816; jq mode also
 /// `first`/`last`, which yq defines for itself) natively, then
 /// re-enter with the rest on the value it lands on, instead of reindexing the
 /// whole input for the bridge (#3213). A slice is answered by
@@ -12553,7 +12800,7 @@ fn projection_peel<S: EvalSemantics>(
             return None;
         }
         let mut flat = inner.clone();
-        flat.extend_from_slice(rest);
+        flat.make_mut().extend_from_slice(rest);
         return projection_peel::<S>(&Expr::Pipe(flat), input, optional, reentry, sink);
     }
     if rest.is_empty() {
@@ -12580,7 +12827,9 @@ fn projection_peel<S: EvalSemantics>(
     }
     // #3477, #5712: a leading `length` (or a string's `startswith`/`endswith`) steps to its
     // count or verdict, then the rest runs on it.
-    let counted = eval_owned_count_door::<S>(first, input);
+    // #5816: or a string-to-string stage, which steps to its string.
+    let counted = eval_owned_count_door::<S>(first, input)
+        .or_else(|| eval_owned_string_stage::<S>(first, input));
     if counted.is_none() && !is_peelable_head::<S>(first) {
         return None;
     }
@@ -15545,11 +15794,64 @@ pub(crate) fn arith_combine<S: EvalSemantics>(
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
     if S::TAG == EvalTag::Yq {
+        if let Some(result) = yq_timestamp_arith::<S>(op, &left, &right) {
+            return result;
+        }
         if let Some(result) = yq_prefixed_int_arith(op, &left, &right) {
             return result;
         }
     }
     arith_combine_plain::<S>(op, left, right)
+}
+
+/// yq's date arithmetic (#5863): a timestamp on the left of `+` or `-` adds or subtracts the
+/// duration the right operand's text spells (`.t += "3h10m"`, `.t -= "24h"`), and is written
+/// back under the datetime layout; `None` when the left operand is not a timestamp. A string
+/// stands for yq's `!!timestamp` when it reads as one (see `super::yq_datetime`).
+///
+/// Any other string on the left of `-` is yq's `strings cannot be subtracted` against a scalar,
+/// and `!!seq () cannot be subtracted from !!str` (or `!!timestamp`) against a container
+/// (`subtractScalars`, v4.53.3). A container on the right of `+` keeps its own error.
+fn yq_timestamp_arith<S: EvalSemantics>(
+    op: ArithOp,
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> Option<Result<OwnedValue, EvalError>> {
+    let subtract = match op {
+        ArithOp::Add => false,
+        ArithOp::Sub => true,
+        _ => return None,
+    };
+    let OwnedValue::String(left) = left else {
+        return None;
+    };
+    let Some(right_text) = yq_scalar_text::<S>(right) else {
+        if !subtract {
+            return None;
+        }
+        let left_tag = if super::yq_datetime::is_timestamp(left) {
+            "!!timestamp"
+        } else {
+            "!!str"
+        };
+        let right_tag = if matches!(right, OwnedValue::Array(_)) {
+            "!!seq"
+        } else {
+            "!!map"
+        };
+        return Some(Err(EvalError::new(format!(
+            "{right_tag} () cannot be subtracted from {left_tag}"
+        ))));
+    };
+    match super::yq_datetime::add_duration(left, &right_text, subtract) {
+        Some(result) => Some(
+            result
+                .map(|text| OwnedValue::String(text.into()))
+                .map_err(EvalError::new),
+        ),
+        None if subtract => Some(Err(EvalError::new("strings cannot be subtracted"))),
+        None => None,
+    }
 }
 
 /// [`arith_combine`] for operands that carry no hex or octal spelling.
@@ -16774,14 +17076,10 @@ pub(crate) fn yq_time_comparison<S: EvalSemantics>(
     let OwnedValue::String(left) = left else {
         return None;
     };
-    let left = super::go_time::yq_datetime(left)?;
     let right_text = yq_scalar_text::<S>(right)?;
-    Some(match super::go_time::yq_datetime(&right_text) {
-        Some(right) => Ok((left, right)),
-        None => Err(EvalError::new(
-            super::go_time::yq_datetime_error(&right_text).unwrap_or_default(),
-        )),
-    })
+    // Under `with_dtf`, both are read under its layout (#5863).
+    super::yq_datetime::compare_instants(left, &right_text)
+        .map(|result| result.map_err(EvalError::new))
 }
 
 /// The answer of `op` for two instants.
@@ -18300,7 +18598,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
 
         // Phase 12: Additional builtins
-        Builtin::Now => builtin_now::<W>(),
+        Builtin::Now => builtin_now::<W, S>(),
         Builtin::Input => builtin_input::<W, S>(),
         Builtin::Inputs => builtin_inputs::<W, S>(),
         Builtin::InputLineNumber => builtin_input_line_number::<W, S>(),
@@ -18355,6 +18653,8 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::FromUnix => builtin_from_unix::<W, S>(value, optional),
         Builtin::ToUnix => builtin_to_unix::<W, S>(value, optional),
         Builtin::Tz(zone) => builtin_tz::<W, S>(zone, value, optional),
+        Builtin::FormatDatetime(format) => builtin_format_datetime::<W, S>(format, value, optional),
+        Builtin::WithDtf(layout, body) => builtin_with_dtf::<W, S>(layout, body, value, optional),
 
         // Phase 22: File operations (yq)
         Builtin::Load(file_expr) => builtin_load::<W, S>(file_expr, value, optional),
@@ -19083,6 +19383,12 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #5918: yq's `map(f)` over an empty mapping is that mapping, where it is an empty
+    // sequence over an empty sequence, a null or, in jq, any empty container.
+    if S::TAG == EvalTag::Yq && matches!(&value, StandardJson::Object(fields) if fields.is_empty())
+    {
+        return QueryResult::One(value);
+    }
     // map(f) is [.[] | f], and .[] over an object iterates its values, so jq
     // accepts an object here as readily as an array (#422).
     match value {
@@ -22507,7 +22813,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // rather than being silently substituted with JSON's `"null"` (#561).
         let entry_doc = match entry.reindexed::<S>() {
             Ok(doc) => doc,
-            Err(e) => return QueryResult::Error(e), // patchcov: coverage tolerate-line reason="unreachable: entry is one of to_entries's already-materialized {key,value} pairs, so its depth here is provably no deeper than whatever earlier check let it exist -- a document-decoded entry is already <256 deep (MAX_NESTING_DEPTH, stricter than this 384 guard), and a filter-constructed one already survived becoming a cursor via its own whole-object reindex, which is strictly deeper than any single field extracted from it could be (unwrapping only reduces depth); confirmed live, {a: (reduce range(400) as $i (0; [.]))} | with_entries(.) fails one step earlier at the whole-object bridge, never here (#3261)"
+            Err(e) => return QueryResult::Error(e), // patchcov: coverage tolerate-line reason="unreachable: entry is one of to_entries's already-materialized {key,value} pairs, so its depth here is provably no deeper than whatever earlier check let it exist -- a document-decoded entry is already <256 deep (MAX_NESTING_DEPTH, stricter than this 384 guard), and a filter-constructed one already survived becoming a cursor via its own whole-object reindex, which is strictly deeper than any single field extracted from it could be (unwrapping only reduces depth); the whole-object bridge applies the same bound one step earlier, so it never fails here (#3261, #5554)"
         };
         let cursor = entry_doc.root();
 
@@ -23944,6 +24250,34 @@ fn shell_quote_str<S: EvalSemantics>(s: &str) -> String {
     }
 }
 
+/// yq's `@sh` (#5837): a character outside `[A-Za-z0-9_@%+=:,./-]` opens a single-quoted run that
+/// lasts to the end of the string or the next `'`, which is written `\'` outside any quotes; every
+/// other character is written as it is. `hello` stays `hello`, `a b` is `a' b'`, `it's` is `it\'s`
+/// and the empty string is nothing, as yq v4.53.3 writes them. jq quotes the whole string.
+fn yq_shell_quote(s: &str) -> String {
+    let mut out = string_with_capacity(s.len());
+    let mut quoted = false;
+    for c in s.chars() {
+        if c == '\'' {
+            if quoted {
+                out.push('\'');
+                quoted = false;
+            }
+            out.push_str("\\'");
+        } else if quoted || c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c) {
+            out.push(c);
+        } else {
+            out.push('\'');
+            quoted = true;
+            out.push(c);
+        }
+    }
+    if quoted {
+        out.push('\'');
+    }
+    out
+}
+
 /// Shell-quote a single value for @sh
 fn shell_quote_value<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError> {
     match value {
@@ -23979,8 +24313,16 @@ fn format_sh<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<St
     // per-arm one -- threading `S::TAG != EvalTag::Yq` onto every arm below
     // individually is exactly the shape that let the array-only version of
     // this fix miss the scalar cases in the first place.
-    if S::TAG == EvalTag::Yq && !matches!(value, OwnedValue::String(_)) {
-        return Err(EvalError::cannot_be_shell_escaped(value));
+    if S::TAG == EvalTag::Yq {
+        return match value {
+            OwnedValue::String(s) => Ok(yq_shell_quote(s)),
+            // #5836: yq refuses with its `@uri` wording, as the document route does.
+            _ => Err(EvalError::new(format!(
+                "cannot encode {} as URI, can only operate on strings. Please first pipe through \
+                 another encoding operator to convert the value to a string",
+                owned_yaml_type_tag(value)
+            ))),
+        };
     }
 
     match value {
@@ -24135,7 +24477,7 @@ fn props_value_to_string(value: &OwnedValue, escape: bool) -> String {
             nonfinite_literal_display(*f, literal).to_string()
         }
         // Echo verbatim (#1008): `@props` is documented as a yq-flavored
-        // format function (CLAUDE.md's format table marks it `(yq)`) --
+        // format function (docs/reference/jq-language.md's format table marks it `(yq)`) --
         // reachable from `succinctly jq` too, but real yq's preservation
         // convention is the correct one regardless of which binary calls
         // it, not jq's `format_number_jq_compat` reformatting.
@@ -31570,7 +31912,9 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     if exprs.len() == 1 {
                         exprs[0].clone()
                     } else {
-                        Expr::Pipe(tail.owner.tail_copy(tail.from))
+                        Expr::Pipe(tail.owner.tail_copy(tail.from, pipe_state_end, |rest| {
+                            stateless_prefix_len::<S>(tail.owner, rest)
+                        }))
                     }
                 };
                 &built
@@ -37741,6 +38085,8 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::Trunc
         | Builtin::TruncateStream(_)
         | Builtin::Tz(_)
+        | Builtin::FormatDatetime(_)
+        | Builtin::WithDtf(_, _)
         | Builtin::Unique
         | Builtin::UniqueBy(_)
         | Builtin::UpperIn(_)
@@ -49002,6 +49348,63 @@ fn resolve_skip_sink<'a, S: EvalSemantics>(
     flow_result(escape)
 }
 
+/// `with_dtf(layout; f)` in path position (#5863): the paths of `f`, resolved with `layout` in
+/// effect. They are delivered once the scope has closed, so whatever the sink evaluates for them
+/// (an update's right side) runs under the layout outside it, as in yq:
+/// `with_dtf("2006"; .t) |= . + "1h"` adds the hour under RFC 3339.
+#[allow(clippy::too_many_arguments)]
+fn resolve_with_dtf_sink<'a, S: EvalSemantics>(
+    layout_expr: &Expr,
+    body: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    let (layouts, escape) = eval_owned_multi_keep_partial::<S>(layout_expr, value);
+    if escape.is_some() {
+        return flow_result(escape);
+    }
+    let Some(layout) = layouts.first() else {
+        return ResolveFlow::Escaped(
+            EvalError::new("could not get date time format: could not find layout for format_time")
+                .into(),
+        );
+    };
+    let layout = yq_scalar_text::<S>(layout)
+        .map(Cow::into_owned)
+        .unwrap_or_default();
+    #[cfg(feature = "std")]
+    {
+        let mut branches = Vec::new();
+        let flow = super::yq_datetime::with_layout(layout, || {
+            resolve_node_sink::<S>(
+                body,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                &mut |branch| {
+                    branches.push(branch);
+                    Demand::Continue
+                },
+            )
+        });
+        if emit_branches(branches, sink) == Demand::Stop {
+            return ResolveFlow::Stopped;
+        }
+        flow
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (layout, body, trackable, snapshot, frame, keep, sink);
+        ResolveFlow::Escaped(EvalError::new("with_dtf requires the std feature").into())
+    }
+}
+
 /// Collecting adapter over [`resolve_node_sink`] — the shape every caller
 /// that still wants a materialized `Vec<PathBranch>` uses.
 ///
@@ -49821,6 +50224,11 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // rejected as "Invalid path expression".
         Expr::Builtin(Builtin::Skip(n, expr)) => {
             resolve_skip_sink::<S>(n, expr, value, trackable, snapshot, frame, keep, sink)
+        }
+        // #5863: `with_dtf(layout; f)` names the paths `f` names, so a write through it lands
+        // (`with_dtf("2006"; .a) = 5` writes `.a` in yq v4.53.3).
+        Expr::Builtin(Builtin::WithDtf(layout, body)) => {
+            resolve_with_dtf_sink::<S>(layout, body, value, trackable, snapshot, frame, keep, sink)
         }
 
         // #2746: `last(f)`, `isempty(f)` and `INDEX(stream; idx_expr)` all
@@ -57097,9 +57505,11 @@ fn slice_is_same_array(value: &OwnedValue) -> bool {
 /// behind the container. It is sound for the reason ADR-0024's #2889
 /// amendment gives for the embed table's entry: `marker.value` is a strong
 /// reference held for the marker's whole lifetime, so a write through any
-/// other handle copies first (`Rc::make_mut`; the by-value unwrap is
-/// `Rc::try_unwrap`, and `src/jq` has no `unsafe`), and a target that still
-/// shares the storage is that node, unmodified. It reads no origin on
+/// other handle copies first (`Rc::make_mut`; the by-value unwrap moves
+/// out only through a unique `Rc` -- `Rc::get_mut` for an array,
+/// `Rc::try_unwrap` for an object -- and the one `unsafe` in the containers
+/// reads each field once), and a target that still shares the storage is
+/// that node, unmodified. It reads no origin on
 /// purpose: an [`Origin::Untracked`] marker -- a navigated bind, or a
 /// `Snapshot` demoted against a rebuilt root -- refuses by node identity
 /// because it has no invocation to certify a position in, and the pointer
@@ -80109,10 +80519,137 @@ pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue
     if matches!(expr, Expr::If { .. } | Expr::Paren(_)) {
         return match owned_if_step::<S>(expr, state) {
             Ok(done) => done,
+            Err(state) => match owned_constructor_step::<S>(expr, state) {
+                Ok(done) => done,
+                Err(state) => owned_update_step_arith::<S>(expr, state),
+            },
+        };
+    }
+    // A constructor around the state (#5875), out of line like the `if` above.
+    if matches!(expr, Expr::Array(_) | Expr::Object(_)) {
+        return match owned_constructor_step::<S>(expr, state) {
+            Ok(done) => done,
             Err(state) => owned_update_step_arith::<S>(expr, state),
         };
     }
     owned_update_step_arith::<S>(expr, state)
+}
+
+/// `[.]`, `[., <closed>…]` and `{<key>: .}` as a fold's UPDATE (#5875): a container built around
+/// the state itself, with every other element or member closed. The new container takes the moved
+/// state as its one `.` member, so a fold of `N` steps costs `O(N)`. Through the bridge each step
+/// wrote the whole accumulator out as JSON and indexed it again to evaluate a constructor that
+/// copies it, which is `O(N^2)` once the accumulator is a nest `N` levels deep.
+///
+/// Exactly one member is `.` itself (a second would need a copy of a value that is already `N`
+/// levels deep). Every other element, key and value is settled by [`owned_assign_operand`] against
+/// the state before it is moved: a closed one (one output, no read of `.`, no effect), or one that
+/// reads scalars off the state (`length`, `type`, a field, integer `+`, `-`, `*` such as `.n + 1`,
+/// #5893). A member that reads a container (`.a`, `.[0]`) is answered from a rebuilt copy of the
+/// state, which is right and costs `O(state)` a step; a float (`.n / 2`) or `tojson` is the same,
+/// so a fold of those is quadratic past 384 levels as before. A member the helper evaluates and
+/// then declines (it raises, or yields other than one value) costs that evaluation again on the
+/// bridge the step falls back to, with the state untouched. A member that is not
+/// [`owned_state_expr_shape`] is never evaluated here, so no effect runs twice.
+/// jq mode only (yq's constructors carry presentation, and its guard past 500 levels is a separate
+/// piece of work, #5554), and not while the #2889 embed table is live, whose registered containers
+/// the accumulator might hold: a container built around one would hide it from the table.
+#[inline(never)]
+fn owned_constructor_step<S: EvalSemantics>(
+    expr: &Expr,
+    state: OwnedValue,
+) -> Result<OwnedStep, OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return Err(state);
+    }
+    // The live-table check is a thread-local read, so it comes after the shape checks that
+    // decline most constructors for nothing.
+    match unwrap_paren(expr) {
+        Expr::Array(inner) => {
+            let items = match unwrap_paren(inner) {
+                Expr::Comma(items) => items.as_slice(),
+                single => core::slice::from_ref(single),
+            };
+            // One pass: the member that reads `.` is a placeholder until every other member has
+            // been settled, so a decline hands the state back before it is moved. A second read
+            // of `.` declines at once.
+            if !items
+                .iter()
+                .any(|item| matches!(unwrap_paren(item), Expr::Identity))
+                || super::eval_generic::embed_table_active()
+            {
+                return Err(state);
+            }
+            let mut out: Vec<OwnedValue> = vec_with_capacity(items.len());
+            let mut dot = None;
+            for (at, item) in items.iter().enumerate() {
+                if matches!(unwrap_paren(item), Expr::Identity) {
+                    if dot.replace(at).is_some() {
+                        return Err(state);
+                    }
+                    out.push(OwnedValue::Null);
+                } else if let Some(value) = owned_assign_operand::<S>(item, &state) {
+                    out.push(value);
+                } else {
+                    return Err(state);
+                }
+            }
+            let Some(dot) = dot else {
+                return Err(state);
+            };
+            out[dot] = state;
+            Ok(OwnedStep::Handled(Ok(OwnedValue::array_from(out))))
+        }
+        Expr::Object(entries) => {
+            // The same pass, into the map itself. A repeated key keeps its first position and
+            // takes the last value, as `object_from_pairs` does in jq mode and
+            // `eval_object_construction` does; the member that reads `.` is the key it was
+            // written under until a later member takes that key over.
+            if !entries
+                .iter()
+                .any(|entry| matches!(unwrap_paren(&entry.value), Expr::Identity))
+                || super::eval_generic::embed_table_active()
+            {
+                return Err(state);
+            }
+            let mut map: IndexMap<String, OwnedValue> = IndexMap::with_capacity(entries.len());
+            let mut dot: Option<String> = None;
+            let mut dot_live = false;
+            for entry in entries {
+                let key = match &entry.key {
+                    ObjectKey::Literal(name) => name.clone(),
+                    ObjectKey::Bare => return Err(state),
+                    ObjectKey::Expr(key) => match owned_assign_operand::<S>(key, &state) {
+                        Some(OwnedValue::String(name)) => name.into_string(),
+                        _ => return Err(state),
+                    },
+                };
+                if matches!(unwrap_paren(&entry.value), Expr::Identity) {
+                    if dot.is_some() {
+                        return Err(state);
+                    }
+                    dot = Some(key.clone());
+                    dot_live = true;
+                    map.insert(key, OwnedValue::Null);
+                } else if let Some(value) = owned_assign_operand::<S>(&entry.value, &state) {
+                    if dot_live && dot.as_deref() == Some(key.as_str()) {
+                        dot_live = false;
+                    }
+                    map.insert(key, value);
+                } else {
+                    return Err(state);
+                }
+            }
+            let Some(dot) = dot else {
+                return Err(state);
+            };
+            if dot_live {
+                map.insert(dot, state);
+            }
+            Ok(OwnedStep::Handled(Ok(OwnedValue::Object(map.into()))))
+        }
+        _ => Err(state),
+    }
 }
 
 /// The rest of [`owned_update_step`], once `expr` is no settleable `if`.
@@ -92148,7 +92685,7 @@ fn fold_literal_bracket_keys(expr: &Expr) -> Expr {
         Expr::Identity => field,
         Expr::Pipe(stages) => {
             let mut stages = stages.clone();
-            stages.push(field);
+            stages.make_mut().push(field);
             Expr::Pipe(stages)
         }
         other => Expr::Pipe(vec![other.clone(), field].into()),
@@ -93487,18 +94024,26 @@ fn delete_path_steps(
 // Phase 12: Additional builtins
 
 /// Builtin: now - current Unix timestamp
-fn builtin_now<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+///
+/// yq's `now` is a `!!timestamp`: RFC 3339 text in the local zone, with no fraction (#5863).
+fn builtin_now<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult<'a, W> {
     #[cfg(feature = "std")]
     {
         use std::time::{SystemTime, UNIX_EPOCH};
         match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) if S::TAG == EvalTag::Yq => QueryResult::Owned(OwnedValue::String(
+                super::yq_datetime::now(duration.as_nanos() as i128).into(),
+            )),
             Ok(duration) => QueryResult::Owned(OwnedValue::Float(duration.as_secs_f64())),
             Err(_) => QueryResult::Error(EvalError::new("failed to get current time")),
         }
     }
     #[cfg(not(feature = "std"))]
     {
-        // no_std environment - return 0.0 as a fallback
+        // no_std environment - the epoch as a fallback
+        if S::TAG == EvalTag::Yq {
+            return QueryResult::Owned(OwnedValue::String(super::yq_datetime::now(0).into()));
+        }
         QueryResult::Owned(OwnedValue::Float(0.0))
     }
 }
@@ -93540,22 +94085,11 @@ mod remaining_inputs {
     /// before it, the error, and the `(source, line)` jq's marker names there.
     type QueuedError = (usize, EvalError, (u32, u32));
 
-    /// The CLI's conversion of the document at an index of a lazily seeded stream (#5661), and
-    /// that document's 1-based end line. Called once per document, in index order, so it may
-    /// count lines forward as it goes.
-    pub type Materialize = super::LazyInputConverter;
+    /// What the CLI's producer hands the queue at each read (#5498, #5661).
+    pub use super::ProducedInput as Produced;
 
-    /// A stream whose documents the CLI converts when they are read (#5661): a program that
-    /// stops early neither converts the rest nor holds a queue entry for each of them.
-    struct LazyStream {
-        /// The source tag of every document.
-        source: u32,
-        /// The index of the next document to read.
-        next: usize,
-        /// How many documents there are.
-        count: usize,
-        materialize: Materialize,
-    }
+    /// The CLI's source of the documents a seeded stream reads, pulled one item at a time.
+    pub type Producer = super::InputProducer;
 
     thread_local! {
         // `(document, source tag, 1-based end line)`. The source tag is opaque
@@ -93563,9 +94097,9 @@ mod remaining_inputs {
         // so no string ever crosses this module's boundary (#1309).
         static QUEUE: RefCell<VecDeque<(OwnedValue, u32, u32)>> =
             const { RefCell::new(VecDeque::new()) };
-        // The documents read ahead of `QUEUE`, converted as they are read (#5661); `None` when
-        // nothing is seeded lazily or every lazy document has been read.
-        static LAZY: RefCell<Option<LazyStream>> = const { RefCell::new(None) };
+        // Where the documents come from when they are produced as they are read (#5498, #5661);
+        // `None` when nothing is seeded that way or the producer has reported the end.
+        static PRODUCER: RefCell<Option<Producer>> = const { RefCell::new(None) };
         // jq reports the *last successfully read* document's line, not the
         // next one still queued -- starts at 0 (matching real jq's own
         // `input_line_number` before anything has been read yet).
@@ -93608,8 +94142,9 @@ mod remaining_inputs {
     pub enum Pop {
         /// The next document.
         Document(OwnedValue),
-        /// The stream ended in a parse error after the documents before it.
-        /// Delivered once; every later read is [`Pop::Exhausted`].
+        /// A parse error after the documents before it, delivered once. Documents may follow
+        /// it, since jq resumes reading after a parse error that `input` raises (#4311); once
+        /// nothing does, every later read is [`Pop::Exhausted`].
         ParseError(EvalError),
         /// Nothing left to read.
         Exhausted,
@@ -93636,7 +94171,7 @@ mod remaining_inputs {
         QUEUE.with(|q| {
             *q.borrow_mut() = documents.into();
         });
-        LAZY.with(|l| *l.borrow_mut() = None);
+        PRODUCER.with(|p| *p.borrow_mut() = None);
         ERRORS.with(|e| *e.borrow_mut() = errors.into());
         POPPED.with(|p| p.set(0));
         LAST_LINE.with(|l| l.set(0));
@@ -93647,31 +94182,19 @@ mod remaining_inputs {
         COUNT_PAST_END.with(|c| c.set(false));
     }
 
-    /// [`seed`] for a stream the CLI has already checked is clean (#5661): `count` documents, all
-    /// from the source tagged `source`, each converted by `materialize` when it is read, which
-    /// also reports its line. Nothing is queued per document. No parse error is queued: the CLI
-    /// takes this route only for a stream with none.
-    pub fn seed_lazy(
-        source: u32,
-        count: usize,
-        materialize: Materialize,
-        exhausted: Option<(u32, u32)>,
-    ) {
+    /// [`seed`] for a stream whose items `producer` hands over one at a time, when they are read
+    /// (#5498, #5661): nothing is pulled here and nothing is queued per item. Its parse errors
+    /// come in stream order from the producer, and so does where the marker settles at the end
+    /// ([`Produced::End`]), so `EXHAUSTED` is unset until then.
+    pub fn seed_producer(producer: Producer) {
         QUEUE.with(|q| q.borrow_mut().clear());
-        LAZY.with(|l| {
-            *l.borrow_mut() = (count > 0).then(|| LazyStream {
-                source,
-                next: 0,
-                count,
-                materialize,
-            });
-        });
+        PRODUCER.with(|p| *p.borrow_mut() = Some(producer));
         ERRORS.with(|e| e.borrow_mut().clear());
         POPPED.with(|p| p.set(0));
         LAST_LINE.with(|l| l.set(0));
         SEEDED.with(|s| s.set(true));
         CURRENT.with(|c| c.set(None));
-        EXHAUSTED.with(|e| e.set(exhausted));
+        EXHAUSTED.with(|e| e.set(None));
         PAST_END.with(|p| p.set(false));
         COUNT_PAST_END.with(|c| c.set(false));
     }
@@ -93736,27 +94259,25 @@ mod remaining_inputs {
             CURRENT.with(|c| c.set(Some(at)));
             return Pop::ParseError(error);
         }
-        // Out of its slot while the converter runs, so a converter that reads the queue itself
+        // Out of its slot while the producer runs, so a producer that reads the queue itself
         // finds no borrow held.
-        let lazy = LAZY.with(|l| l.borrow_mut().take()).map(|mut stream| {
-            let index = stream.next;
-            stream.next += 1;
-            let (line, converted) = (stream.materialize)(index);
-            let source = stream.source;
-            // The converter holds the stream's text: it goes with the last document.
-            if stream.next < stream.count {
-                LAZY.with(|l| *l.borrow_mut() = Some(stream));
-            }
-            (converted, source, line)
-        });
-        if let Some((converted, src, line)) = lazy {
-            POPPED.with(|p| p.set(popped_so_far + 1));
+        if let Some(mut producer) = PRODUCER.with(|p| p.borrow_mut().take()) {
+            let (pop, (src, line)) = match producer() {
+                Produced::Document(doc, src, line) => (Pop::Document(doc), (src, line)),
+                // As a document does, a parse error moves the marker and the line to it.
+                Produced::Error(error, at) => (Pop::ParseError(error), at),
+                Produced::End(exhausted) => {
+                    // The producer is dropped here, never asked again. A producer seed queues
+                    // nothing else, so this read is the stream's end.
+                    EXHAUSTED.with(|e| e.set(exhausted));
+                    return pop_past_end();
+                }
+            };
+            // No `POPPED`: a producer seed queues no `ERRORS` for it to time.
+            PRODUCER.with(|p| *p.borrow_mut() = Some(producer));
             LAST_LINE.with(|l| l.set(line));
             CURRENT.with(|c| c.set(Some((src, line))));
-            return match converted {
-                Ok(doc) => Pop::Document(doc),
-                Err(error) => Pop::ParseError(error),
-            };
+            return pop;
         }
         let popped = QUEUE.with(|q| q.borrow_mut().pop_front());
         if let Some((doc, src, line)) = popped {
@@ -93775,6 +94296,12 @@ mod remaining_inputs {
             CURRENT.with(|c| c.set(Some(at)));
             return Pop::ParseError(error);
         }
+        pop_past_end()
+    }
+
+    /// A read that finds nothing left: the marker settles at `EXHAUSTED`, and the reads after
+    /// the first are counted as `pop_input` describes.
+    fn pop_past_end() -> Pop {
         if !COUNT_PAST_END.with(Cell::get) {
             CURRENT.with(|c| c.set(EXHAUSTED.with(Cell::get)));
             return Pop::Exhausted;
@@ -94091,30 +94618,53 @@ pub fn seed_remaining_inputs_with_errors(
     remaining_inputs::seed(documents, exhausted, errors);
 }
 
-/// How [`seed_remaining_inputs_lazily`] converts a document (#5661).
+/// One item an [`InputProducer`] hands the `input` queue when a read asks for it (#5498, #5661).
 ///
-/// Given its index, it answers the document's 1-based end line and its value. It is called once per document, in index order,
-/// when that document is read, so it can count lines forward as it goes. An error it returns
-/// reaches the reader as the parse error `input` raises.
+/// Source tags and lines are what [`seed_remaining_inputs`] documents carry: an opaque source tag
+/// the CLI resolves itself, and a 1-based line.
 #[cfg(feature = "std")]
-pub type LazyInputConverter = Box<dyn FnMut(usize) -> (u32, Result<OwnedValue, EvalError>)>;
+#[derive(Debug)]
+pub enum ProducedInput {
+    /// The next document, with its source tag and the line jq's reader had reached when it
+    /// finished it.
+    Document(OwnedValue, u32, u32),
+    /// A parse error, raised by the read as an ordinary catchable error, with the
+    /// `(source, line)` jq's marker names there. Items may follow it: jq resumes reading after a
+    /// parse error that `input` raises (#4311).
+    Error(EvalError, (u32, u32)),
+    /// Nothing is left. Carries the `(source, line)` [`current_input_location`] settles on once
+    /// the stream is exhausted, or `None` for jq's `<unknown>`. The producer is dropped and not
+    /// asked again.
+    End(Option<(u32, u32)>),
+}
 
-/// [`seed_remaining_inputs`] for a stream the CLI has checked is clean, converting each document
-/// when it is read instead of up front (#5661).
-///
-/// There are `count` documents, all from the source tagged `source`, each converted by
-/// `materialize` ([`LazyInputConverter`]). The CLI takes this route only where no document can
-/// fail to convert and the stream holds no parse error, so a program that stops early
-/// (`first(inputs)`) neither parses nor holds the documents it never reads, and nothing is kept
-/// per document it has not read.
 #[cfg(feature = "std")]
-pub fn seed_remaining_inputs_lazily(
-    source: u32,
-    count: usize,
-    materialize: LazyInputConverter,
-    exhausted: Option<(u32, u32)>,
-) {
-    remaining_inputs::seed_lazy(source, count, materialize, exhausted);
+impl ProducedInput {
+    /// A document, or the parse error converting it met, at `(source, line)`.
+    pub fn converted(converted: Result<OwnedValue, EvalError>, source: u32, line: u32) -> Self {
+        match converted {
+            Ok(document) => Self::Document(document, source, line),
+            Err(error) => Self::Error(error, (source, line)),
+        }
+    }
+}
+
+/// Where a stream seeded by [`seed_remaining_inputs_from`] gets its items: called once per read,
+/// in order, until it answers [`ProducedInput::End`].
+#[cfg(feature = "std")]
+pub type InputProducer = Box<dyn FnMut() -> ProducedInput>;
+
+/// [`seed_remaining_inputs`] for a stream whose items are produced when they are read, instead of
+/// up front (#5498, #5661).
+///
+/// Nothing is pulled here. A program that stops early (`first(inputs)`) never produces the items
+/// it does not read, and nothing is kept for them. The producer runs with no borrow of the queue
+/// held, so a read of the queue from inside it does not panic. That read finds nothing and is
+/// counted as a read past the end, moving the marker (#4303), so a producer has no reason to make
+/// one.
+#[cfg(feature = "std")]
+pub fn seed_remaining_inputs_from(producer: InputProducer) {
+    remaining_inputs::seed_producer(producer);
 }
 
 /// Counts the reads past the end of the input just seeded, as jq does (#4303).
@@ -94130,8 +94680,9 @@ pub fn count_reads_past_end() {
     remaining_inputs::count_reads_past_end();
 }
 
-/// One read from the `input`/`inputs` queue: a document, the parse error the
-/// input stream ended in (delivered once, #2961), or nothing left.
+/// One read from the `input`/`inputs` queue: a document, a parse error in the
+/// input stream (delivered once, #2961; documents may follow it, #4311), or
+/// nothing left.
 #[cfg(feature = "std")]
 pub use remaining_inputs::Pop as InputPop;
 
@@ -95002,6 +95553,10 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             };
 
+            // jq hands the libc a C string, so a NUL ends the format (`"a\u0000b"` formats as
+            // `a`) and `strlen(fmt)` below stops there too (#5754).
+            let fmt = fmt.split('\0').next().unwrap_or_default().to_string();
+
             // Only these specifiers read the zone's labels; `E`/`O` modifiers
             // precede one of them, so the letters alone decide. A locale's own
             // `%c`/`%x`/`%X`/`%r` layout may also print the zone (#5754).
@@ -95034,6 +95589,15 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Err(_) if optional => return QueryResult::None,
                 Err(e) => return QueryResult::Error(e), // patchcov: coverage tolerate-line reason="unreachable for strftime's C-int-clamped fields and bounded zone offset; shared checked date helpers retain overflow guards for other callers (#3083)"
             };
+            // jq hands the libc a buffer of `strlen(fmt) + 100` bytes and fails when `strftime`
+            // returns 0: an empty result, or one that does not fit with its terminator (#5754).
+            if result.is_empty() || result.len() >= fmt.len() + 100 {
+                return if optional {
+                    QueryResult::None // patchcov: coverage tolerate-line reason="`optional` is never true through either caller of this function, same as the arms above (#3068); a trailing ? is caught by the enclosing try"
+                } else {
+                    QueryResult::Error(EvalError::strftime_system_failure(name))
+                };
+            }
             QueryResult::Owned(OwnedValue::String(result.into()))
         },
     )
@@ -95148,7 +95712,54 @@ fn format_strftime(
 
     while let Some(c) = chars.next() {
         if c == '%' {
-            let spec = chars.next();
+            let mut spec = chars.next();
+            // The prefix of a conversion is `[flag] [E|O] [flag]` (#5754, #3055), at most one flag
+            // in all, and the libc's reading of it is:
+            // - A `_`, `-` or `0` is a padding flag for the specifier after it: `_` pads with
+            //   blanks, `-` does not pad, `0` pads with zeros.
+            // - `E` and `O` are the POSIX "alternative representation" modifiers. The pinned C
+            //   library has no alternatives, so a modified specifier is its plain form (`%EY`,
+            //   `%Oy`, `%Ea`, `%En` are `%Y`, `%y`, `%a`, `%n`), whatever the letter.
+            // - A flag or modifier that ends the format is printed as itself (`%E` is `E`, `%-`
+            //   is `-`, `%-E` is `E`), and so is a character that names nothing, without the `%`
+            //   and without the flag before it. A second modifier, or a second flag, is one such
+            //   character (`%EE_d` is `E_d`, `%-E-y` is `-y`).
+            let flag_char = |c: Option<char>| match c {
+                Some(f @ ('_' | '-' | '0')) => Some(f),
+                _ => None,
+            };
+            let mut flag = None;
+            if let Some(f) = flag_char(spec) {
+                match chars.next() {
+                    Some(next) => {
+                        flag = Some(f);
+                        spec = Some(next);
+                    }
+                    None => {
+                        result.push(f);
+                        continue;
+                    }
+                }
+            }
+            if let Some(modifier @ ('E' | 'O')) = spec {
+                spec = chars.next();
+                if spec.is_none() {
+                    result.push(modifier);
+                    continue;
+                }
+                if let (None, Some(f)) = (flag, flag_char(spec)) {
+                    match chars.next() {
+                        Some(next) => {
+                            flag = Some(f);
+                            spec = Some(next);
+                        }
+                        None => {
+                            result.push(f);
+                            continue;
+                        }
+                    }
+                }
+            }
             if let (
                 true,
                 Some(letter @ ('a' | 'A' | 'b' | 'B' | 'h' | 'p' | 'c' | 'x' | 'X' | 'r')),
@@ -95164,18 +95775,18 @@ fn format_strftime(
                 Some('%') => result.push('%'),
                 Some('Y') => result.push_str(&format!("{year:04}")),
                 Some('y') => result.push_str(&format!("{:02}", year % 100)),
-                Some('m') => result.push_str(&format!("{month:02}")),
-                Some('d') => result.push_str(&format!("{day:02}")),
-                Some('e') => result.push_str(&format!("{day:2}")),
-                Some('H') => result.push_str(&format!("{hour:02}")),
-                Some('I') => result.push_str(&format!("{hour12:02}")),
+                Some('m') => result.push_str(&padded(month, 2, '0', flag)),
+                Some('d') => result.push_str(&padded(day, 2, '0', flag)),
+                Some('e') => result.push_str(&padded(day, 2, ' ', flag)),
+                Some('H') => result.push_str(&padded(hour, 2, '0', flag)),
+                Some('I') => result.push_str(&padded(hour12, 2, '0', flag)),
                 // Blank- (not zero-) padded hours. Confirmed live against
                 // the pinned oracle (#3055): `strftime("%k")`/`("%l")` on a
                 // single-digit hour are `" 1"`/`" 1"`, not `"01"`/`"01"`.
-                Some('k') => result.push_str(&format!("{hour:2}")),
-                Some('l') => result.push_str(&format!("{hour12:2}")),
-                Some('M') => result.push_str(&format!("{minute:02}")),
-                Some('S') => result.push_str(&format!("{second:02}")),
+                Some('k') => result.push_str(&padded(hour, 2, ' ', flag)),
+                Some('l') => result.push_str(&padded(hour12, 2, ' ', flag)),
+                Some('M') => result.push_str(&padded(minute, 2, '0', flag)),
+                Some('S') => result.push_str(&padded(second, 2, '0', flag)),
                 Some('p') => result.push_str(if hour < 12 { "AM" } else { "PM" }),
                 // Confirmed live against the pinned oracle (macOS libc's
                 // `strftime`, #3055): `%P` prints the bare letter `P`
@@ -95183,47 +95794,6 @@ fn format_strftime(
                 // rule) -- macOS doesn't implement `%P` and falls back to
                 // printing the specifier letter unprefixed.
                 Some('P') => result.push('P'),
-                // POSIX's `%E`/`%O` "alternative representation" modifiers:
-                // the pinned oracle's C library has no locale-specific
-                // alternatives and treats every modified specifier as a
-                // pure pass-through to its plain form (confirmed live for
-                // every letter below, e.g. `%EY`/`%Oy`/`%Ez` all match
-                // `%Y`/`%y`/`%z` exactly, #3055). Two different fallbacks
-                // when nothing recognized follows, both confirmed live: at
-                // true end-of-format it's the bare modifier letter (the
-                // case this issue's own repro pins); followed by anything
-                // else unrecognized (a literal character, `%` starting a
-                // new specifier) it produces nothing at all, and that
-                // following character/specifier is processed normally on
-                // the *next* loop iteration -- `%E-`/`%O-` are the empty
-                // string, not `E-`/`O-`. The allow-list below is a second,
-                // hand-maintained copy of "every letter this match
-                // recognizes" (review, #3055) -- a future specifier added
-                // above needs a matching decision made here too, or its
-                // own `%E<x>`/`%O<x>` silently falls to the unrecognized
-                // fallback instead of whatever pass-through the oracle
-                // might actually implement.
-                Some(letter @ ('E' | 'O')) => match chars.peek().copied() {
-                    Some(next) if "YymdeHIMSuUVWwcCxXz".contains(next) => {
-                        chars.next();
-                        let plain = format_strftime(
-                            &format!("%{next}"),
-                            year,
-                            month,
-                            day,
-                            hour,
-                            minute,
-                            second,
-                            weekday,
-                            yearday,
-                            zone_offset,
-                            zone_name,
-                        )?; // patchcov: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: the call's own argument lines (immediately above) show 3 hits under the #3055 test's three E/O pass-through rows, but this closing-token line is never itself credited -- verified via the raw lcov DA: records"
-                        result.push_str(&plain);
-                    }
-                    Some(_) => {}
-                    None => result.push(letter),
-                },
                 // `%c`/`%r` are fixed compositions of the fields above
                 // (C's `"%a %b %e %H:%M:%S %Y"` / `"%I:%M:%S %p"`); `%x`/`%X`
                 // are merged into `%D`/`%T` below, which the oracle confirms
@@ -95238,9 +95808,19 @@ fn format_strftime(
                     "{hour12:02}:{minute:02}:{second:02} {}",
                     if hour < 12 { "AM" } else { "PM" }
                 )),
-                Some('j') => result.push_str(&format!(
-                    "{:03}",
-                    (yearday as i32).wrapping_add(1) // C `tm_yday + 1`
+                // The pinned libc's `%+` is `date`'s layout, `%a %b %e %H:%M:%S %Z %Y`, and
+                // `%v` is `%e-%b-%Y` (#5754).
+                Some('+') => result.push_str(&format!(
+                    "{} {} {day:2} {hour:02}:{minute:02}:{second:02} {zone_name} {year:04}",
+                    weekday_abbr(weekday),
+                    month_abbr(month),
+                )),
+                Some('v') => result.push_str(&format!("{day:2}-{}-{year:04}", month_abbr(month))),
+                Some('j') => result.push_str(&padded(
+                    i64::from((yearday as i32).wrapping_add(1)), // C `tm_yday + 1`
+                    3,
+                    '0',
+                    flag,
                 )),
                 Some('w') => result.push_str(&format!("{weekday}")),
                 Some('u') => {
@@ -95271,7 +95851,11 @@ fn format_strftime(
                 Some('z') => {
                     let sign = if zone_offset < 0 { '-' } else { '+' };
                     let minutes = zone_offset.unsigned_abs() / 60;
-                    result.push_str(&format!("{sign}{:02}{:02}", minutes / 60, minutes % 60));
+                    // The libc prints the offset as a signed number, `hhmm`, so a flag pads or
+                    // strips the digits after the sign (`+0530` is `+ 530` and `+530`).
+                    let hhmm = (minutes / 60 * 100 + minutes % 60) as i64;
+                    result.push(sign);
+                    result.push_str(&padded(hhmm, 4, '0', flag));
                 }
                 Some('Z') => result.push_str(zone_name),
                 // The fields are in `zone`, so the epoch is theirs minus its
@@ -95291,7 +95875,7 @@ fn format_strftime(
                         .wrapping_add(7)
                         .wrapping_sub(weekday as i32)
                         / 7;
-                    result.push_str(&format!("{week:02}"));
+                    result.push_str(&padded(i64::from(week), 2, '0', flag));
                 }
                 Some('W') => {
                     let weekday_mon = if weekday == 0 {
@@ -95300,11 +95884,11 @@ fn format_strftime(
                         (weekday as i32).wrapping_sub(1)
                     };
                     let week = (yearday as i32).wrapping_add(7).wrapping_sub(weekday_mon) / 7;
-                    result.push_str(&format!("{week:02}"));
+                    result.push_str(&padded(i64::from(week), 2, '0', flag));
                 }
                 Some('V') => {
                     let (_, week) = iso_week_date(year, yearday, weekday)?;
-                    result.push_str(&format!("{week:02}"));
+                    result.push_str(&padded(week, 2, '0', flag));
                 }
                 Some('G') => {
                     let (iso_year, _) = iso_week_date(year, yearday, weekday)?;
@@ -95314,10 +95898,10 @@ fn format_strftime(
                     let (iso_year, _) = iso_week_date(year, yearday, weekday)?;
                     result.push_str(&format!("{:02}", (iso_year % 100).abs()));
                 }
-                Some(other) => {
-                    result.push('%');
-                    result.push(other);
-                }
+                // A character that follows `%` and names nothing is printed bare, without the
+                // `%` and without any flag before it (`%Q` is `Q`, `%5Y` is `5Y`, `%^a` is `^a`),
+                // as the pinned libc prints it (#5754).
+                Some(other) => result.push(other),
                 None => result.push('%'),
             }
         } else {
@@ -95326,6 +95910,17 @@ fn format_strftime(
     }
 
     Ok(result)
+}
+
+/// `n` in at least `width` columns, as the libc pads a numeric field: with `default` unless the
+/// field's `flag` says otherwise (`_` blanks, `0` zeros, `-` no padding).
+fn padded(n: i64, width: usize, default: char, flag: Option<char>) -> String {
+    debug_assert!(matches!(default, '0' | ' '));
+    match flag.unwrap_or(if default == '0' { '0' } else { '_' }) {
+        '-' => n.to_string(),
+        '_' => format!("{n:width$}"),
+        _ => format!("{n:0width$}"),
+    }
 }
 
 /// ISO week calculation used by the pinned macOS `strftime` implementation.
@@ -95503,8 +96098,14 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
     let names_a_layout = |text: &str| {
         let mut chars = text.chars();
         while let Some(c) = chars.next() {
-            if c == '%' && matches!(chars.next(), Some('c' | 'x' | 'X' | 'r')) {
-                return true;
+            if c == '%' {
+                let mut next = chars.next();
+                if matches!(next, Some('E' | 'O')) {
+                    next = chars.next();
+                }
+                if matches!(next, Some('c' | 'x' | 'X' | 'r')) {
+                    return true;
+                }
             }
         }
         false
@@ -95536,6 +96137,19 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
             }
             match chars.next() {
                 Some(spec @ ('c' | 'x' | 'X' | 'r')) => out.push_str(layout(spec)),
+                // `%Ec` and `%Ox` stand for the plain layout, as `%EY` is `%Y` (#5754).
+                Some(modifier @ ('E' | 'O')) => match chars.next() {
+                    Some(spec @ ('c' | 'x' | 'X' | 'r')) => out.push_str(layout(spec)),
+                    Some(other) => {
+                        out.push('%');
+                        out.push(modifier);
+                        out.push(other);
+                    }
+                    None => {
+                        out.push('%');
+                        out.push(modifier);
+                    }
+                },
                 Some(other) => {
                     out.push('%');
                     out.push(other);
@@ -95594,7 +96208,27 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
 
     while let Some(fc) = fmt_iter.next() {
         if fc == '%' {
-            match fmt_iter.next() {
+            // `%E` and `%O` modify the specifier after them and read as it does (#5754): jq's libc
+            // takes `%Ey`, `%Od` and `%Ec` for `%y`, `%d` and `%c` in every locale this reads. Only a
+            // specifier can follow: `%E%`, `%EE`, `%E5` and a bare `%E` are no match. The pin's libc
+            // reads the month with `%O` from the alternative names, which C holds as the full ones
+            // alone, so `%OB` takes `March` but not `Mar` and `%Ob` and `%Oh` take neither.
+            let mut spec = fmt_iter.next();
+            let mut alternative_names = false;
+            if let Some(modifier @ ('E' | 'O')) = spec {
+                spec = fmt_iter.next();
+                match spec {
+                    Some('%' | 'E' | 'O') | None => {
+                        return Err(format!("expected a specifier after '%{modifier}'"));
+                    }
+                    Some('b' | 'h') if modifier == 'O' => {
+                        return Err("unrecognized month name".to_string());
+                    }
+                    Some('B') => alternative_names = modifier == 'O',
+                    _ => {}
+                }
+            }
+            match spec {
                 Some('%') => {
                     if input_iter.next() != Some('%') {
                         return Err("expected '%'".to_string());
@@ -95625,10 +96259,12 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     }
                     day = parse_digits(&mut input_iter, 2)?;
                 }
-                Some('H') => {
+                // `%k` and `%l` read as `%H` and `%I`: the libc takes them as the hour in 24- and 12-hour
+                // form, with no padding of their own to read (#5754).
+                Some('H' | 'k') => {
                     hour = check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=23, "hour")?;
                 }
-                Some('I') => {
+                Some('I' | 'l') => {
                     // 0 is valid (confirmed live: real jq accepts `%I`
                     // "00"); will be adjusted by %p if present.
                     hour = check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=12, "hour")?;
@@ -95680,7 +96316,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     second =
                         check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=60, "second")?;
                 }
-                Some('p' | 'P') => {
+                Some('p') => {
                     // The locale's am marker, else its pm marker, each ASCII-case-insensitively,
                     // as the libc reads them: an empty marker (macOS prints none for `%p` under
                     // `de_DE`) matches nothing and reads as am (#5754). Anything else is no match,
@@ -95761,7 +96397,11 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                             Some(n) => (n.month_full[i].as_str(), n.month_abbr[i].as_str()),
                             None => (MONTH_FULL[i], MONTH_ABBR[i]),
                         };
-                        strptime_name_len(&input_iter, full, abbr).map(|len| (i, len))
+                        if alternative_names {
+                            strptime_name_len(&input_iter, full, "").map(|len| (i, len))
+                        } else {
+                            strptime_name_len(&input_iter, full, abbr).map(|len| (i, len))
+                        }
                     });
                     match found {
                         Some((i, len)) => {
@@ -95859,18 +96499,10 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                         }
                     }
                 }
-                Some(other) => {
-                    // Unknown specifier - skip % and match literal
-                    if input_iter.next() != Some(other) {
-                        return Err(format!("expected '{other}'"));
-                    }
-                }
-                None => {
-                    // Trailing % - match literal
-                    if input_iter.next() != Some('%') {
-                        return Err("expected '%'".to_string());
-                    }
-                }
+                // A specifier the libc does not know, and a `%` that ends the format, are no match
+                // (`"x" | strptime("%Q")`) -- not the literal they used to be taken for (#5754).
+                Some(other) => return Err(format!("unknown specifier '%{other}'")),
+                None => return Err("format ends in '%'".to_string()),
             }
         } else if fc.is_whitespace() {
             // Skip any whitespace in input
@@ -96250,6 +96882,13 @@ fn builtin_from_unix<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(r) => return r,
     };
 
+    // yq's `from_unix` is a `!!timestamp` in the local zone (#5863); the range check above stays.
+    if S::TAG == EvalTag::Yq {
+        return QueryResult::Owned(OwnedValue::String(
+            super::yq_datetime::from_unix(timestamp).into(),
+        ));
+    }
+
     let result = format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         t.year, t.month, t.day, t.hour, t.minute, t.second
@@ -96267,6 +96906,17 @@ fn builtin_to_unix<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
+    // yq reads the text under the datetime layout, as `time.Parse` does (#5863).
+    if S::TAG == EvalTag::Yq {
+        let text = match yq_node_text::<W, S>(&value) {
+            Ok(text) => text,
+            Err(e) => return suppress_or_raise(e, optional),
+        };
+        return match super::yq_datetime::to_unix(&text) {
+            Ok(secs) => QueryResult::Owned(OwnedValue::Int(secs)),
+            Err(e) => suppress_or_raise(EvalError::new(e), optional),
+        };
+    }
     // to_unix parses a lenient ISO 8601 string to a Unix timestamp (not jq's strict `fromdate`, #4967)
     match builtin_fromdate::<W>(value, optional) {
         QueryResult::Owned(OwnedValue::Float(n))
@@ -96558,6 +97208,9 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if S::TAG == EvalTag::Yq {
+        return builtin_yq_tz::<W, S>(zone_expr, value, optional);
+    }
     // Get the timestamp from input (wording kept as it was; see `todate`)
     let timestamp = match get_float_value_with::<W, S>(&value, optional, || {
         EvalError::new("math function requires number")
@@ -96600,6 +97253,146 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::String(result.into()))
         },
     )
+}
+
+/// yq's `getStringParameter` (#5863): the text of the first output of `arg` evaluated on the
+/// input, or yq's `could not find <name> for format_time` when it has none. An argument's own
+/// error, anywhere in its outputs, is the answer.
+fn yq_string_parameter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    arg: &Expr,
+    value: &StandardJson<'a, W>,
+    optional: bool,
+    name: &str,
+) -> Result<String, QueryResult<'a, W>> {
+    let (outputs, trailing) =
+        stream_outputs::<_, S>(eval_single::<W, S>(arg, value.clone(), optional));
+    if let Some(control) = trailing {
+        return Err(partial(Vec::new(), control));
+    }
+    match outputs.first() {
+        Some(first) => Ok(yq_scalar_text::<S>(first)
+            .map(Cow::into_owned)
+            .unwrap_or_default()),
+        None => Err(suppress_or_raise(
+            EvalError::new(format!("could not find {name} for format_time")),
+            optional,
+        )),
+    }
+}
+
+/// The text yq's datetime operators read from a node: a scalar's text (`null` for a missing
+/// one), and nothing for a container (#5863).
+fn yq_node_text<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'_, W>,
+) -> Result<String, EvalError> {
+    let owned = to_owned::<S, _>(value)?;
+    Ok(yq_scalar_text::<S>(&owned)
+        .map(Cow::into_owned)
+        .unwrap_or_default())
+}
+
+/// yq's `parseSnippet` (#5863): `text` read as a YAML document, so `2026` is a number and
+/// `[2026]` a sequence. An empty text is null, a text that does not parse is a string, and so
+/// is one that reads as a string, which keeps the text as written (`"2026"` with its quotes).
+fn yq_parse_snippet<S: EvalSemantics>(text: String) -> OwnedValue {
+    if text.is_empty() {
+        return OwnedValue::Null;
+    }
+    let bytes = text.as_bytes();
+    let parsed = crate::yaml::YamlIndex::build(bytes).ok().and_then(|index| {
+        let root = index.root(bytes);
+        let crate::yaml::YamlValue::Sequence(docs) = root.value() else {
+            return None; // patchcov: coverage tolerate-line reason="unreachable: a YAML index's root is always the document sequence (#4206)"
+        };
+        let (doc, _) = docs.uncons_cursor()?;
+        super::eval_generic::to_owned_yaml_cursor::<S, _>(&doc).ok()
+    });
+    match parsed {
+        Some(OwnedValue::String(_)) | None => OwnedValue::String(text.into()),
+        Some(value) => value,
+    }
+}
+
+/// Builtin: `format_datetime(format)` (yq, #5863): the input read under the datetime layout and
+/// written with Go's layout `format`, then read back as a YAML snippet (`format_datetime("2006")`
+/// is the number `2026`).
+fn builtin_format_datetime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    format_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let format = match yq_string_parameter::<W, S>(format_expr, &value, optional, "format") {
+        Ok(format) => format,
+        Err(result) => return result,
+    };
+    let text = match yq_node_text::<W, S>(&value) {
+        Ok(text) => text,
+        Err(e) => return suppress_or_raise(e, optional),
+    };
+    match super::yq_datetime::format_datetime(&text, &format) {
+        Ok(formatted) => QueryResult::Owned(yq_parse_snippet::<S>(formatted)),
+        Err(e) => suppress_or_raise(EvalError::new(e), optional),
+    }
+}
+
+/// yq's `tz(zone)` (#5863): the input read under the datetime layout, moved to the zone Go's
+/// `time.LoadLocation` loads, and written under the layout.
+fn builtin_yq_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    zone_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let zone = match yq_string_parameter::<W, S>(zone_expr, &value, optional, "timezone") {
+        Ok(zone) => zone,
+        Err(result) => return result,
+    };
+    let text = match yq_node_text::<W, S>(&value) {
+        Ok(text) => text,
+        Err(e) => return suppress_or_raise(e, optional),
+    };
+    match super::yq_datetime::tz(&text, &zone) {
+        Ok(moved) => QueryResult::Owned(OwnedValue::String(moved.into())),
+        Err(e) => suppress_or_raise(EvalError::new(e), optional),
+    }
+}
+
+/// Builtin: `with_dtf(layout; f)` (yq, #5863): `f` with `layout` as the datetime layout for
+/// everything it evaluates. `f` runs to completion inside the scope, so every output is made
+/// under the layout.
+fn builtin_with_dtf<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    layout_expr: &Expr,
+    body: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let layout = match yq_string_parameter::<W, S>(layout_expr, &value, optional, "layout") {
+        Ok(layout) => layout,
+        Err(QueryResult::Error(e)) => {
+            return QueryResult::Error(EvalError::new(format!(
+                "could not get date time format: {e}"
+            )))
+        }
+        Err(result) => return result,
+    };
+    #[cfg(feature = "std")]
+    {
+        super::yq_datetime::with_layout(layout, || {
+            let (outputs, trailing) =
+                stream_outputs::<_, S>(eval_single::<W, S>(body, value, optional));
+            match trailing {
+                Some(control) => partial(outputs, control),
+                None => owned_vec_to_result(outputs),
+            }
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (layout, body, value);
+        suppress_or_raise(
+            EvalError::new("with_dtf requires the std feature"),
+            optional,
+        )
+    }
 }
 
 // Phase 22: File operations (yq)
@@ -102110,6 +102903,83 @@ pub(crate) fn native_stack_exhausted() -> bool {
     origin != 0 && origin.abs_diff(stack_address()) > reach
 }
 
+/// Whether values on this thread are bounded by the native-stack floor instead of
+/// [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) -- see
+/// [`with_value_depth_on_stack_floor`] (#5554).
+#[cfg(feature = "std")]
+mod value_depth_floor {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ON: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn on() -> bool {
+        ON.with(Cell::get)
+    }
+
+    /// Restores the previous setting on drop.
+    #[must_use]
+    pub(crate) struct Guard(bool);
+
+    pub(crate) fn enter() -> Guard {
+        Guard(ON.with(|on| on.replace(true)))
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ON.with(|on| on.set(self.0));
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod value_depth_floor {
+    pub(crate) fn on() -> bool {
+        false
+    }
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn enter() -> Guard {
+        Guard
+    }
+}
+
+/// Run `f` with a value's nesting bounded by the native-stack floor [`with_stack_budget`] registered,
+/// instead of by [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) (#5554).
+///
+/// jq has no limit on the depth of a value a program builds, only its C stack. Every walk over a built
+/// value checks its depth once per level, so past 384 levels such a check can ask the floor instead:
+/// a walk then refuses where its stack is spent rather than at a fixed depth calibrated for the
+/// smallest stack a thread might have. Without a registered floor, or outside `f`, the bound stays
+/// 384. `succinctly jq` arms it for its whole run, and `succinctly yq` does too since #5876: its
+/// emitters and presentation walks assert through the same guards, so they refuse where their own
+/// frames have spent half the stack, not at 384.
+///
+/// No-op under `no_std`.
+pub fn with_value_depth_on_stack_floor<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = value_depth_floor::enter();
+    f()
+}
+
+/// Whether a walk already past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) levels of
+/// a value may go one level deeper: only under [`with_value_depth_on_stack_floor`], on a thread with a
+/// registered floor that is not spent yet.
+pub(crate) fn value_depth_on_stack_floor() -> bool {
+    if !value_depth_floor::on() {
+        return false;
+    }
+    let (origin, reach) = native_stack::budget();
+    origin != 0 && origin.abs_diff(stack_address()) <= reach
+}
+
+/// Whether [`with_value_depth_on_stack_floor`] is armed and a floor registered, so a refusal past
+/// 384 levels is the floor's rather than the constant's.
+pub(crate) fn value_depth_floor_armed() -> bool {
+    value_depth_floor::on() && native_stack::budget().0 != 0
+}
+
 /// The refusal of a call to `def` that recursed too deep: by
 /// [`MAX_EVAL_FRAMES`], or by the native-stack floor (ADR-0025).
 pub(crate) fn def_call_depth_refusal(def: &FuncDefData) -> EvalError {
@@ -104927,7 +105797,6 @@ mod tests {
     /// under an `as` binding (the #2889 embed table, where #3241 lets the
     /// assignment step run; its own tests are the `_3241` ones) -- end to end.
     /// Every expected output is captured from jq 1.7.1.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn owned_assign_step_fold_rows_match_jq_3138() {
         let records =
@@ -105195,7 +106064,6 @@ mod tests {
     /// (256) is what bounds them. A chain at that limit still answers, and one
     /// past it is refused at parse time rather than panicking in the value-tree
     /// depth assert (384).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     #[cfg(feature = "std")]
     fn owned_assign_closed_rhs_chain_3944() {
@@ -105223,7 +106091,6 @@ mod tests {
 
     /// #3944: the fold loops end to end over the new right-hand sides, every
     /// expected output captured from jq 1.7.1.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn owned_assign_closed_rhs_fold_rows_match_jq_3944() {
         let records =
@@ -105363,7 +106230,6 @@ mod tests {
 
     /// #3978: the fold loops end to end over an `as`-bound key, every
     /// expected output captured from jq 1.7.1.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn owned_assign_as_bind_fold_rows_match_jq_3978() {
         let records =
@@ -105509,7 +106375,7 @@ mod tests {
     /// reads the state declines, a closed one still chooses, and a chain is the evaluator's. A
     /// branch that is no step hands the state back untouched, whole `if` and all.
     #[test]
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     fn if_and_chain_steps_under_the_embed_table_and_when_the_branch_is_no_step_5279() {
         use crate::jq::eval_generic::embed_table_push;
 
@@ -105583,7 +106449,7 @@ mod tests {
     /// side beside them is still taken under the table, so the guard is the operand
     /// and not the step.
     #[test]
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     fn state_reading_operands_decline_under_the_embed_table_and_in_yq_5263() {
         use crate::jq::eval_generic::embed_table_push;
 
@@ -105680,13 +106546,9 @@ mod tests {
     /// move), and the table is asserted live first so this cannot pass by
     /// running the route it replaced.
     ///
-    /// `unshared-containers` is the measurement holdout where a clone
-    /// deep-copies, which the table's entry (a clone of the bound value)
-    /// relies on; the shipped sharing is what this is about, so it does not
-    /// run there. Nor without `std`, where the table is a stub that is never
-    /// live.
+    /// Not without `std`, where the table is a stub that is never live.
     #[test]
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     fn fold_step_each_takes_owned_assign_under_embed_table_3241() {
         use crate::jq::eval_generic::{embed_table_active, embed_table_push};
 
@@ -105768,7 +106630,7 @@ mod tests {
     /// original, while the copy keeps sharing the children it did not touch --
     /// as jq's `jv_setpath` does.
     #[test]
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     fn owned_assign_step_copies_a_registered_container_3241() {
         use crate::jq::eval_generic::embed_table_push;
 
@@ -105844,7 +106706,7 @@ mod tests {
     /// (`+= {"x": 1}`, `= 7`) leave the registered container untouched and
     /// build a new one.
     #[test]
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     fn owned_assign_step_copies_when_the_table_is_the_only_other_holder_3241() {
         use crate::jq::eval_generic::embed_table_push;
 
@@ -106025,10 +106887,6 @@ mod tests {
     /// (`$m as $n | .a = $n`) declines again, since `substitute_var` would rebuild the container
     /// as a literal and the handle would be lost.
     #[test]
-    #[cfg_attr(
-        feature = "unshared-containers",
-        ignore = "holdout has no node identity or sharing (#5254)"
-    )]
     fn owned_assign_step_stores_a_fold_share_marker_as_one_handle_5540() {
         let value = OwnedValue::array_from(vec![OwnedValue::Int(7)]);
         let marker = |fold_share| {
@@ -106079,10 +106937,6 @@ mod tests {
     /// fold's element as the state itself. The step used to decline them, because it only combined
     /// two operands of one kind, and the evaluator then rebuilt the element. A truthy state is
     /// left as it is by `//=`.
-    #[cfg_attr(
-        feature = "unshared-containers",
-        ignore = "holdout has no node identity or sharing (#5254)"
-    )]
     #[test]
     fn owned_assign_step_stores_a_fold_share_marker_over_a_null_state_5761() {
         let value = OwnedValue::array_from(vec![OwnedValue::Int(7)]);
@@ -106138,10 +106992,6 @@ mod tests {
     /// the owned step answers it. `$m == $m` over a NaN-bearing container is `true`
     /// because the two operands are one shared node (jq's instance check, #3896),
     /// which only holds if the step reads the marker rather than a rebuilt copy.
-    #[cfg_attr(
-        feature = "unshared-containers",
-        ignore = "holdout has no node identity or sharing (#5254)"
-    )]
     #[test]
     fn owned_assign_step_reads_markers_by_value_for_scalars_4005() {
         let nan_row = OwnedValue::array_from(vec![
@@ -106474,7 +107324,7 @@ mod tests {
     /// differential of `owned_assign_step_agrees_with_forced_bridge_3138`,
     /// re-run through `fold_step_each` with an entry registered.
     #[test]
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     fn fold_step_each_embed_active_matches_forced_bridge_3241() {
         use crate::jq::eval_generic::{embed_table_active, embed_table_push};
 
@@ -107565,6 +108415,35 @@ mod tests {
         }
     }
 
+    /// #5488: a tail of two or more stages of a pipe of the program is copied
+    /// for each call, never handed on as a view of the program's own stages:
+    /// a view shares the `def` node, which remembers what evaluation did to it
+    /// (#3148), so the recursive `fib` in the tail after `. - 1` would turn hot
+    /// on its second reach and keep its whole call tree. Only a copy is
+    /// shareable ([`PipeStages::tail_copy`]); handing out views of a pipe that
+    /// owns its stages, with the state check answering "no", fails this test.
+    /// The output is the same either way. The lone-stage twins are
+    /// `test_declined_lone_def_call_keeps_its_copy_and_the_3148_retention_3692` and
+    /// `test_eval_owned_pipe_keeps_a_lone_def_its_copy_and_the_3148_retention_3715`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_owned_tail_holding_a_def_keeps_its_copy_and_the_3148_retention_5488() {
+        for program in [
+            "def fib: if . < 2 then . else (. - 1 | fib | . + 0) + (. - 2 | fib | . + 0) end; \
+             [range(3) | 8 | fib] | add",
+            "def fib: if . < 2 then . else (. - 1 | . + 0 | fib) + (. - 2 | . * 1 | fib) end; \
+             [range(3) | 8 | fib] | add",
+        ] {
+            let (out, retained) = run_and_count_retained(program);
+            assert_eq!(out, "Owned(Int(63))", "{program}");
+            assert_eq!(
+                retained, 1,
+                "{program}: only the top-level call site keeps its body; the tail \
+                 holding `fib` after `. - 1` must be a copy, not a view"
+            );
+        }
+    }
+
     /// #3148: a call tree evaluated once retains the root call's body only,
     /// not one body per call. Before the fix, every node's first-use body was
     /// kept for the program's lifetime, so `fib(12)`'s 465 calls left 465
@@ -107678,6 +108557,74 @@ mod tests {
         assert_eq!(native_stack::budget().0, 0, "restored on exit");
     }
 
+    /// #5554: past 384 levels a value-tree guard defers to the floor only with both the opt-in and
+    /// a registration, refuses once that floor is spent, and says which bound refused.
+    #[cfg(feature = "std")]
+    #[test]
+    fn value_depth_defers_to_the_floor_only_when_armed_and_registered_5554() {
+        use crate::jq::value::{
+            check_value_tree_depth, nesting_depth_exceeded_message, MAX_VALUE_TREE_DEPTH,
+            STACK_FLOOR_NESTING_MESSAGE,
+        };
+        let past = MAX_VALUE_TREE_DEPTH;
+        let message = |r: Result<(), EvalError>| r.err().map(|e| e.message);
+        let constant = Some(nesting_depth_exceeded_message(MAX_VALUE_TREE_DEPTH));
+
+        assert_eq!(message(check_value_tree_depth(past)), constant, "neither");
+        assert_eq!(
+            with_stack_budget(1 << 20, || message(check_value_tree_depth(past))),
+            constant,
+            "a registration alone keeps 384"
+        );
+        assert_eq!(
+            with_value_depth_on_stack_floor(|| message(check_value_tree_depth(past))),
+            constant,
+            "the opt-in alone keeps 384: there is no floor to ask"
+        );
+        let armed = |budget: usize| {
+            with_stack_budget(budget, || {
+                with_value_depth_on_stack_floor(|| {
+                    (
+                        check_value_tree_depth(MAX_VALUE_TREE_DEPTH - 1).is_ok(),
+                        check_value_tree_depth(past),
+                    )
+                })
+            })
+        };
+        let (under, roomy) = armed(1 << 20);
+        assert!(under && roomy.is_ok(), "both armed, room left: {roomy:?}");
+        let (under, spent) = armed(0);
+        assert!(under, "below 384 the floor is never asked");
+        let spent = spent.expect_err("a spent floor refuses");
+        assert_eq!(spent.message, STACK_FLOOR_NESTING_MESSAGE);
+        assert!(
+            spent.is_resource_limit(),
+            "uncatchable, like the 384 refusal"
+        );
+        assert!(!value_depth_floor::on(), "restored on exit");
+    }
+
+    /// #5554: the panicking guard follows the same rule, and its floor message is one the CLI's
+    /// `catch_unwind` nets recognise.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_panicking_value_guard_defers_to_the_floor_too_5554() {
+        use crate::jq::value::{assert_value_tree_depth, MAX_VALUE_TREE_DEPTH};
+        with_stack_budget(1 << 20, || {
+            with_value_depth_on_stack_floor(|| assert_value_tree_depth(MAX_VALUE_TREE_DEPTH));
+        });
+        let payload = std::panic::catch_unwind(|| {
+            with_stack_budget(0, || {
+                with_value_depth_on_stack_floor(|| assert_value_tree_depth(MAX_VALUE_TREE_DEPTH));
+            });
+        })
+        .expect_err("a spent floor panics");
+        assert_eq!(
+            crate::jq::eval_generic::depth_guard_panic_message(&*payload).as_deref(),
+            Some(crate::jq::value::STACK_FLOOR_NESTING_MESSAGE)
+        );
+    }
+
     /// ADR-0025 (#3262): with no stack left, a `def` call refuses naming the
     /// definition, and an argument read refuses unnamed -- the uncatchable
     /// resource limit `MAX_EVAL_FRAMES` also raises.
@@ -107723,7 +108670,6 @@ mod tests {
     /// recursion only reaches with an enclosing one already holding the stack.
     /// With no stack left, the first check on each route refuses.
     #[cfg(feature = "std")]
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn every_route_checks_the_native_stack_floor_3262() {
         let json = br#"{"a":{"b":1}}"#;
@@ -107865,7 +108811,6 @@ mod tests {
     /// above drives `eval_full` (this file's evaluator) only, so it no longer
     /// reaches those arms once `eval()` stopped being an alias of it.
     #[cfg(feature = "std")]
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn the_library_entry_checks_the_native_stack_floor_3457() {
         let json = br#"{"a":{"b":1}}"#;
@@ -111303,7 +112248,6 @@ mod tests {
     /// may bind the *node* `rest` reaches or has to fall back to binding by
     /// value. Both verdicts matter: `.b` is on the closed navigation
     /// grammar, `.b | length` is not. Outputs captured live from jq 1.7.1.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_marker_headed_bind_source_navigation_verdicts_2180() {
         // Accepted: every node of `rest` is on the grammar.
@@ -112184,7 +113128,6 @@ mod tests {
     /// (`scalar_decode_failure`'s doc comment) -- exercised here since the
     /// two tests above only reach these three functions' array/object
     /// arms, never their scalar fallback.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_direct_misc_family_scalar_fallback_1755() {
         for expr in [
@@ -112404,7 +113347,6 @@ mod tests {
     /// `keys?`/`to_entries?`/`map_values(...)?`'s own #2286 revision --
     /// real jq's equivalent is a parse error no filter (`?` included) ever
     /// reaches.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_builtin_pick_omit_optional_suppresses_malformed_key_errors_1829() {
         for (doc, expr) in [
@@ -115099,35 +116041,34 @@ mod tests {
         assert_eq!(pop_remaining_input(), None);
     }
 
-    /// #5661: a lazily seeded queue converts a document when it is read and not before, moves the
+    /// #5661: a produced stream converts a document when it is read and not before, moves the
     /// marker and the line as an eager one does, reaches the end as one does, and hands a failed
     /// conversion to the reader as the parse error `input` raises. The pin must be able to fail:
-    /// it does, with `seed_lazy` converting every slot as it queues it.
+    /// it does, with `seed_producer` pulling the first item as it seeds, and with the queue
+    /// keeping the producer after the end.
     #[cfg(feature = "std")]
     #[test]
-    fn a_lazily_seeded_queue_converts_only_what_is_read_5661() {
+    fn a_produced_stream_converts_only_what_is_read_5661() {
         use core::cell::Cell;
         use std::rc::Rc;
 
         let converted = Rc::new(Cell::new(0usize));
         let counter = Rc::clone(&converted);
-        let mut expected = 0;
-        seed_remaining_inputs_lazily(
-            0,
-            4,
-            Box::new(move |index| {
-                assert_eq!(index, expected, "documents are converted in order");
-                expected += 1;
-                counter.set(counter.get() + 1);
-                let line = index as u32 + 1;
-                if index == 2 {
-                    (line, Err(EvalError::new("cannot convert")))
-                } else {
-                    (line, Ok(OwnedValue::Int(index as i64 * 10)))
-                }
-            }),
-            Some((0, 4)),
-        );
+        let mut index = 0;
+        seed_remaining_inputs_from(Box::new(move || {
+            if index == 4 {
+                return ProducedInput::End(Some((0, 4)));
+            }
+            counter.set(counter.get() + 1);
+            let line = index as u32 + 1;
+            let result = if index == 2 {
+                Err(EvalError::new("cannot convert"))
+            } else {
+                Ok(OwnedValue::Int(index as i64 * 10))
+            };
+            index += 1;
+            ProducedInput::converted(result, 0, line)
+        }));
         assert_eq!(converted.get(), 0, "seeding converts nothing");
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(0)));
         assert_eq!(current_input_location(), Some((0, 1)));
@@ -115140,37 +116081,99 @@ mod tests {
         assert_eq!(current_input_location(), Some((0, 3)));
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(30)));
         assert_eq!(converted.get(), 4);
-        // The converter owns the stream's text, so it goes with the last slot.
-        assert_eq!(Rc::strong_count(&converted), 1, "the converter is released");
         assert_eq!(pop_remaining_input(), None);
         assert_eq!(current_input_location(), Some((0, 4)));
-        // A later eager seed replaces the converter with nothing to convert.
+        // The queue drops the producer once it reports the end.
+        assert_eq!(Rc::strong_count(&converted), 1, "the producer is released");
+        // A later eager seed replaces the producer with nothing to convert.
         seed_remaining_inputs(vec![(OwnedValue::Int(7), 0, 1)], None);
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(7)));
         assert_eq!(converted.get(), 4);
     }
 
-    /// #5661: the converter runs with no borrow of the queue held, so one that reads the queue
+    /// #5661: the producer runs with no borrow of the queue held, so one that reads the queue
     /// itself finds it empty rather than panicking on a held borrow.
     #[cfg(feature = "std")]
     #[test]
-    fn a_lazy_converter_may_read_the_queue_5661() {
-        seed_remaining_inputs_lazily(
-            0,
-            2,
-            Box::new(|index| {
-                assert_eq!(
-                    pop_remaining_input(),
-                    None,
-                    "nothing is queued behind the stream"
-                );
-                (1, Ok(OwnedValue::Int(index as i64)))
-            }),
-            None,
-        );
+    fn a_producer_may_read_the_queue_5661() {
+        let mut index = 0;
+        seed_remaining_inputs_from(Box::new(move || {
+            assert_eq!(
+                pop_remaining_input(),
+                None,
+                "nothing is queued behind the stream"
+            );
+            index += 1;
+            match index {
+                1 | 2 => ProducedInput::Document(OwnedValue::Int(index - 1), 0, 1),
+                _ => ProducedInput::End(None),
+            }
+        }));
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(0)));
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(1)));
         assert_eq!(pop_remaining_input(), None);
+    }
+
+    /// #5498: a produced parse error moves the marker and `input_line_number` to where it fell,
+    /// documents can follow it (jq resumes after one, #4311), and the end the producer reports
+    /// last is where the reads past the end start from (#4303). Each item is pulled once, and the
+    /// producer is not asked again after the end.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_produced_error_and_end_move_the_marker_as_queued_ones_do_5498() {
+        use core::cell::Cell;
+        use std::rc::Rc;
+
+        let pulls = Rc::new(Cell::new(0usize));
+        let counted = Rc::clone(&pulls);
+        let mut items = vec![
+            ProducedInput::Document(OwnedValue::Int(1), 0, 1),
+            ProducedInput::Error(EvalError::new("bad"), (0, 2)),
+            ProducedInput::Document(OwnedValue::Int(3), 1, 5),
+            ProducedInput::End(Some((1, 6))),
+        ]
+        .into_iter();
+        seed_remaining_inputs_from(Box::new(move || {
+            counted.set(counted.get() + 1);
+            items
+                .next()
+                .expect("the producer is not asked after the end")
+        }));
+        count_reads_past_end();
+        assert_eq!(pulls.get(), 0);
+        assert_eq!(current_input_location(), None, "nothing read yet");
+        assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(1)));
+        assert_eq!(remaining_inputs::last_line(), Some(1));
+        assert!(matches!(pop_input(), InputPop::ParseError(e) if e.message == "bad"));
+        assert_eq!(current_input_location(), Some((0, 2)));
+        assert_eq!(remaining_inputs::last_line(), Some(2));
+        assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(3)));
+        assert_eq!(current_input_location(), Some((1, 5)));
+        assert_eq!(pulls.get(), 3, "one pull per read");
+        // The first read past the end names where the producer said the stream ended...
+        assert!(matches!(pop_input(), InputPop::Exhausted));
+        assert_eq!(current_input_location(), Some((1, 6)));
+        assert_eq!(remaining_inputs::last_line(), Some(6));
+        // ... and every later one `<unknown>` and line 0, without asking the producer.
+        for _ in 0..2 {
+            assert!(matches!(pop_input(), InputPop::Exhausted));
+            assert_eq!(current_input_location(), None);
+            assert_eq!(remaining_inputs::last_line(), Some(0));
+        }
+        assert_eq!(pulls.get(), 4);
+    }
+
+    /// #5498: a producer that reports `End(None)` leaves jq's `<unknown>` marker, and without
+    /// `count_reads_past_end` every read past the end leaves the marker there.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_produced_end_without_a_position_is_unknown_5498() {
+        seed_remaining_inputs_from(Box::new(|| ProducedInput::End(None)));
+        for _ in 0..2 {
+            assert!(matches!(pop_input(), InputPop::Exhausted));
+            assert_eq!(current_input_location(), None);
+            assert_eq!(remaining_inputs::last_line(), Some(0));
+        }
     }
 
     /// Evaluate `Identity`/`Field`/`Index` against an `OwnedValue` the way
@@ -115718,6 +116721,111 @@ mod tests {
                 let expr = parse(src).unwrap();
                 assert!(
                     eval_owned_string_door::<JqSemantics>(&expr, &input).is_none(),
+                    "{src:?} on {input:?}"
+                );
+            }
+        }
+    }
+
+    /// #5816: `ltrimstr`, `rtrimstr`, `tostring` and `. + "lit"` of an owned string are answered
+    /// from the string and answer what the reindex bridge does (the oracle), in jq mode; a pattern
+    /// that is not a string literal, the other operators and a non-string input decline, and so does
+    /// every shape in yq mode.
+    #[test]
+    fn eval_owned_string_stage_agrees_with_the_reindex_bridge_5816() {
+        let strings = [
+            "",
+            "a",
+            "h\u{e9}llo",
+            "\u{65e5}\u{672c}\u{8a9e}",
+            "\u{1f600}x\u{1f600}",
+            "a\nb",
+            "q\"b\\s",
+            "zzzabc",
+            "abczzz",
+            "zzz",
+            "a\n",
+        ];
+        let shapes = [
+            "ltrimstr(\"z\")",
+            "ltrimstr(\"zzz\")",
+            "ltrimstr(\"zzzz\")",
+            "ltrimstr(\"\")",
+            "ltrimstr(\"h\u{e9}\")",
+            "ltrimstr(\"\u{65e5}\")",
+            "ltrimstr(\"\u{1f600}\")",
+            "(ltrimstr(\"a\"))",
+            "rtrimstr(\"z\")",
+            "rtrimstr(\"zzz\")",
+            "rtrimstr(\"\")",
+            "rtrimstr(\"\u{8a9e}\")",
+            "rtrimstr(\"a\\n\")",
+            "rtrimstr(\"\\n\")",
+            "tostring",
+            ". + \"x\"",
+            ". + \"\"",
+            ". + \"\u{e9}\"",
+            "(. + \"\\n\")",
+        ];
+        let mut answered = 0;
+        for text in strings {
+            let value = OwnedValue::String(text.into());
+            for src in shapes {
+                let expr = parse(src).unwrap();
+                let fast = eval_owned_string_stage::<JqSemantics>(&expr, &value)
+                    .unwrap_or_else(|| panic!("{src:?} on {text:?} declined"));
+                answered += 1;
+                let bridge = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, &value, false,
+                ));
+                assert_eq!(
+                    debug_normalize(QueryResult::<Vec<u64>>::Owned(fast)),
+                    bridge,
+                    "{src:?} on {text:?}"
+                );
+                assert!(
+                    eval_owned_string_stage::<YqSemantics>(&expr, &value).is_none(),
+                    "{src:?} on {text:?} answered in yq mode"
+                );
+            }
+        }
+        assert_eq!(answered, strings.len() * shapes.len());
+        let value = OwnedValue::String("abc".into());
+        for src in [
+            "ltrimstr(.)",
+            "ltrimstr(1)",
+            "ltrimstr(null)",
+            "ltrimstr(\"a\", \"b\")",
+            "rtrimstr(.)",
+            "rtrimstr(1)",
+            ". + 1",
+            ". + .",
+            "\"x\" + .",
+            ". - \"x\"",
+            ". * \"x\"",
+            "length",
+            "ascii_downcase",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(
+                eval_owned_string_stage::<JqSemantics>(&expr, &value).is_none(),
+                "{src:?} was answered"
+            );
+        }
+        for input in [
+            OwnedValue::Null,
+            OwnedValue::Int(1),
+            OwnedValue::array_from(vec![]),
+        ] {
+            for src in [
+                "ltrimstr(\"a\")",
+                "rtrimstr(\"a\")",
+                "tostring",
+                ". + \"a\"",
+            ] {
+                let expr = parse(src).unwrap();
+                assert!(
+                    eval_owned_string_stage::<JqSemantics>(&expr, &input).is_none(),
                     "{src:?} on {input:?}"
                 );
             }
@@ -116814,7 +117922,7 @@ mod tests {
 
         // The relocating-fold door answers only while a binding is in scope
         // and an element of the input shares that binding's storage.
-        #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+        #[cfg(feature = "std")]
         {
             use crate::jq::eval_generic::embed_table_push;
             let bound = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
@@ -117127,7 +118235,7 @@ mod tests {
         // lone stage only when it stands on an embedded node (`.[]`, `.[0]`,
         // `.a`) or relocates one (`max`, `sort`, ...); `eval_owned_reindex_free`
         // stands down.
-        #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+        #[cfg(feature = "std")]
         {
             use crate::jq::eval_generic::embed_table_push;
             let bound = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
@@ -117318,6 +118426,8 @@ mod tests {
         /// Copies of the rest of a pipe made on this thread: one per call, and
         /// one per tail a pipe kept.
         copies: usize,
+        /// Stages cloned into copies of a pipe's stages on this thread (#5488).
+        copied_stages: usize,
         /// The most tails any pipe of the program holds.
         kept: usize,
     }
@@ -117331,6 +118441,7 @@ mod tests {
         let expr = parse(program).unwrap();
         let index = crate::json::JsonIndex::build(input);
         let before = owned_pipe_copies::get();
+        let stages_before = crate::jq::expr::copied_stages::get();
         let out: Vec<String> = eval_full::<Vec<u64>, S>(&expr, index.root(input))
             .collect_owned::<S>()
             .iter()
@@ -117346,6 +118457,7 @@ mod tests {
         OwnedPipeRun {
             output: out.join(","),
             copies: owned_pipe_copies::get() - before,
+            copied_stages: crate::jq::expr::copied_stages::get() - stages_before,
             kept,
         }
     }
@@ -117753,6 +118865,286 @@ mod tests {
         run::<YqSemantics>();
     }
 
+    /// #5488: folding a literal bracket key after a pipe target (#2126) appends
+    /// the field step to the pipe's stages. The
+    /// parser folds every spelling it reads itself (`.a.b[("c")]`), so only a
+    /// built AST reaches this arm; it is the one that edits a pipe's stages.
+    #[test]
+    fn test_fold_literal_bracket_key_after_a_pipe_target_appends_a_field_5488() {
+        let target = Expr::Pipe(vec![Expr::field("a"), Expr::field("b")].into());
+        let indexed = Expr::IndexExpr {
+            target: Box::new(target),
+            key: Box::new(Expr::Paren(Box::new(Expr::Literal(Literal::String(
+                "c".into(),
+            ))))),
+        };
+        assert_eq!(
+            fold_literal_bracket_keys(&indexed),
+            Expr::Pipe(vec![Expr::field("a"), Expr::field("b"), Expr::field("c")].into())
+        );
+    }
+
+    /// #5488: a body rebuilt for each value copies the rest of its pipe once
+    /// per value and hands every tail after that on as a view of the copy, so
+    /// a value clones a number of stages linear in the pipe's length: before, a
+    /// body that reads its variable in every stage, or late after stages that
+    /// are not runs (`[.][0]`, `floor`), copied `n - 1`, `n - 2`, ... stages per
+    /// value, quadratic in `n`. Measured: `n - 1` per value, `2n - 3` for
+    /// `floor`, whose rest is copied a second time on its way down; none when
+    /// the variable is read first (its tails are kept, #5436). A pipe holding a
+    /// `def` still copies every tail (#3148), quadratic, as the `def` shape
+    /// pins.
+    /// A closure argument holding a call does not make a copied tail
+    /// stateful: the copy would share that argument's `Rc` with the program
+    /// just as a view does, so [`pipe_state_end`] does not walk
+    /// it (review of #5830, where walking an 8,000-node argument per copied
+    /// tail made the call 2.6x slower than before views).
+    #[test]
+    fn test_a_call_in_a_closure_argument_leaves_the_tail_a_view_5488() {
+        fn run<S: EvalSemantics>() {
+            for stages in [10, 20] {
+                let body = vec![". + $x"; stages].join(" | ");
+                let program = |values: usize| {
+                    run_owned_pipe_program::<S>(
+                        &format!(
+                            "def h: .; def g(f): . as $x | ({body} | if . < 0 then f else . end); \
+                             [range(0;{values}) | g(h)] | length"
+                        ),
+                        b"null",
+                    )
+                };
+                let (few, many) = (program(4), program(40));
+                assert_eq!(many.output, "40", "{stages} stages ({:?})", S::TAG);
+                let more = many.copied_stages - few.copied_stages;
+                assert!(
+                    more <= 36 * 2 * stages,
+                    "{stages} stages: 36 more values cloned {more} stages, so a call \
+                     inside the argument `f` made each tail a copy ({:?})",
+                    S::TAG
+                );
+            }
+        }
+        run::<JqSemantics>();
+        run::<YqSemantics>();
+    }
+
+    #[test]
+    fn test_rebuilt_body_hands_its_tails_on_as_views_5488() {
+        fn run<S: EvalSemantics>() {
+            for stages in [10, 20, 40] {
+                let repeat = |stage: &str, n: usize| vec![stage; n].join(" | ");
+                let shapes = [
+                    ("every stage", repeat(". + $x", stages), false),
+                    (
+                        "[.][0], read last",
+                        format!("{} | . + $x", repeat("[.][0]", stages - 1)),
+                        false,
+                    ),
+                    (
+                        "floor, read last",
+                        format!("{} | . + $x", repeat("floor", stages - 1)),
+                        false,
+                    ),
+                    (
+                        "read first, [.][0]",
+                        format!(". + $x | {}", repeat("[.][0]", stages - 1)),
+                        false,
+                    ),
+                    (
+                        "a def, read every stage",
+                        format!("def f: .; {}", repeat("f | . + $x", stages / 2)),
+                        true,
+                    ),
+                ];
+                for (name, body, stateful) in shapes {
+                    let program = |values: usize| {
+                        let body = match body.split_once("; ") {
+                            Some((def, body)) => {
+                                format!("{def}; [range(0;{values}) | . as $x | ({body})] | length")
+                            }
+                            None => format!("[range(0;{values}) | . as $x | ({body})] | length"),
+                        };
+                        run_owned_pipe_program::<S>(&body, b"null")
+                    };
+                    let (few, many) = (program(4), program(40));
+                    assert_eq!(many.output, "40", "{name}, {stages} stages ({:?})", S::TAG);
+                    let more = many.copied_stages - few.copied_stages;
+                    if stateful {
+                        assert!(
+                            more >= 36 * 2 * stages,
+                            "{name}, {stages} stages: a pipe holding a `def` copies each \
+                             tail, but 36 more values cloned only {more} stages ({:?})",
+                            S::TAG
+                        );
+                    } else {
+                        assert!(
+                            more <= 36 * 2 * (stages - 1),
+                            "{name}, {stages} stages: 36 more values cloned {more} stages, \
+                             more than two copies of the rest each ({:?})",
+                            S::TAG
+                        );
+                    }
+                }
+            }
+        }
+        run::<JqSemantics>();
+        run::<YqSemantics>();
+    }
+
+    /// #5871: a body rebuilt for each value whose pipe ends in a call to a `def` clones a number
+    /// of stages linear in the pipe's length for each value. The call holds evaluation state, so a
+    /// tail holding it is a copy (#3148), and each tail of that copy held it too: `n - 1`, `n - 2`,
+    /// ... stage clones per value. The stateless stages ahead of the call are now one link whose
+    /// own tails are views (#5488), and only the call is cloned again.
+    ///
+    /// A call the pipe does not end in, or that leads it, still copies each tail
+    /// (`test_rebuilt_body_hands_its_tails_on_as_views_5488` pins that shape), and so does yq
+    /// mode, whose first-stage rule for a failing generator reads the first stage of a pipe
+    /// (#5421): a link is a pipe of its own.
+    #[test]
+    fn test_rebuilt_body_ending_in_a_def_call_clones_linearly_5871() {
+        fn run() {
+            for stages in [20, 40, 80] {
+                let body = vec![". + $x"; stages - 1].join(" | ");
+                let program = |values: usize| {
+                    run_owned_pipe_program::<JqSemantics>(
+                        &format!(
+                            "def f: . + 1; [range(0;{values}) | . as $x | ({body} | f)] | length"
+                        ),
+                        b"null",
+                    )
+                };
+                let (few, many) = (program(4), program(40));
+                assert_eq!(many.output, "40", "{stages} stages");
+                let more = many.copied_stages - few.copied_stages;
+                // Quadratic is about `stages / 2` clones per stage per value: 800 per value at 40.
+                assert!(
+                    more <= 36 * 4 * stages,
+                    "{stages} stages: 36 more values cloned {more} stages, so each tail \
+                     holding the call was copied again"
+                );
+            }
+        }
+        run();
+    }
+
+    /// #5871: the stages ahead of a tail's first stateful one are handed on as a link only when no
+    /// re-entry could need to rewrite a marker in them: a link is an `Expr::Shared`, which the
+    /// rewrite does not reach, and a rewritten marker is read only by a resolver invocation. A
+    /// marker alone, or a resolver node alone, leaves the link; both in the prefix keep the copy,
+    /// and so does yq mode.
+    #[test]
+    fn test_stateless_prefix_len_keeps_the_copy_where_a_link_hides_a_marker_5871() {
+        let marker = Expr::TrackedVar(Rc::new(Tracked {
+            value: OwnedValue::Int(1),
+            origin: Origin::Untracked,
+            node: None,
+            fold_share: false,
+        }));
+        let call = parse("def f: .; f").unwrap();
+        let def_call = match &call {
+            Expr::Pipe(stages) => stages.last().unwrap().clone(),
+            other => other.clone(),
+        };
+        let plain = parse(". + 1").unwrap();
+        let reader = Expr::Pipe(vec![Expr::Identity, marker].into());
+        let resolver = parse("del(.a)").unwrap();
+        let tail = |stages: &[&Expr]| -> Vec<Expr> {
+            stages
+                .iter()
+                .map(|e| (*e).clone())
+                .chain([def_call.clone()])
+                .collect()
+        };
+        assert!(holds_evaluation_state(&def_call));
+        // The owner is the tail's own pipe here, so what it remembers is what the tail holds.
+        let prefix_len = |stages: &[Expr]| {
+            let owner: PipeStages = stages.to_vec().into();
+            stateless_prefix_len::<JqSemantics>(&owner, stages)
+        };
+        // Nothing to hide: the whole prefix.
+        assert_eq!(prefix_len(&tail(&[&plain, &plain, &plain])), 3);
+        // A marker alone, and a resolver node alone.
+        assert_eq!(prefix_len(&tail(&[&plain, &reader, &plain])), 3);
+        assert_eq!(prefix_len(&tail(&[&plain, &resolver, &plain])), 3);
+        // Both, in different stages of the prefix.
+        assert_eq!(prefix_len(&tail(&[&reader, &plain, &resolver])), 0);
+        // The prefix ends where the state starts; a marker or a resolver node in the stateful part
+        // is not in the link, though the owner holds both.
+        assert_eq!(
+            prefix_len(&[
+                plain.clone(),
+                plain.clone(),
+                def_call.clone(),
+                reader.clone(),
+                resolver.clone(),
+            ]),
+            2
+        );
+        let stages = tail(&[&plain, &plain, &plain]);
+        let owner: PipeStages = stages.clone().into();
+        assert_eq!(stateless_prefix_len::<YqSemantics>(&owner, &stages), 0);
+    }
+
+    /// #5871: the two answers `tail_copy` is given about a tail's state come from one predicate:
+    /// the first stateful stage is never past the last, and both skip an `Expr::Shared`.
+    #[test]
+    fn test_pipe_state_start_and_end_agree_on_which_stage_holds_state_5871() {
+        let call = parse("def f: .; f").unwrap();
+        let def_call = match &call {
+            Expr::Pipe(stages) => stages.last().unwrap().clone(),
+            other => other.clone(),
+        };
+        let plain = parse(". + 1").unwrap();
+        let shared = Expr::Shared(Rc::new(SharedArg::new(def_call.clone())));
+        for stages in [
+            vec![],
+            vec![plain.clone(); 3],
+            vec![def_call.clone()],
+            vec![plain.clone(), plain.clone(), def_call.clone()],
+            vec![
+                def_call.clone(),
+                plain.clone(),
+                def_call.clone(),
+                plain.clone(),
+            ],
+            vec![plain.clone(), shared.clone(), plain.clone()],
+        ] {
+            let (start, end) = (pipe_state_start(&stages), pipe_state_end(&stages));
+            let stateful: Vec<usize> = (0..stages.len())
+                .filter(|&i| holds_state_outside_shared(&stages[i]))
+                .collect();
+            assert_eq!(start, stateful.first().copied().unwrap_or(stages.len()));
+            assert_eq!(end, stateful.last().map_or(0, |last| last + 1));
+            if !stateful.is_empty() {
+                assert!(start < end);
+            }
+        }
+    }
+
+    /// #5871: stages after the call are cloned with it, once per value, and the stages ahead of it
+    /// are still one link: ten stages, the call, then forty more is linear in the pipe's length,
+    /// where copying every tail was about 1,300 clones per value.
+    #[test]
+    fn test_rebuilt_body_with_stages_after_a_def_call_clones_linearly_5871() {
+        let (pre, post) = ([". + $x"; 10].join(" | "), [". + $x"; 40].join(" | "));
+        let program = |values: usize| {
+            run_owned_pipe_program::<JqSemantics>(
+                &format!(
+                    "def f: . + 1; [range(0;{values}) | . as $x | ({pre} | f | {post})] | length"
+                ),
+                b"null",
+            )
+        };
+        let (few, many) = (program(4), program(40));
+        assert_eq!(many.output, "40");
+        let more = many.copied_stages - few.copied_stages;
+        assert!(
+            more <= 36 * 4 * 51,
+            "36 more values cloned {more} stages, so each tail past the call was copied again"
+        );
+    }
+
     /// #5404: a tail past [`MAX_KEPT_TAIL_NODES`] is not kept, however few its
     /// stages: what a pipe holds is bounded by nodes, not stages. The tails
     /// near the end of the pipe are small enough and are kept; the longer ones
@@ -117936,7 +119328,7 @@ mod tests {
                 panic!("a pipe");
             };
             for (at, stage) in extra.iter().enumerate() {
-                stages.insert(10 + at, stage.clone());
+                stages.make_mut().insert(10 + at, stage.clone());
             }
             stages
         };
@@ -117982,6 +119374,32 @@ mod tests {
             eval_owned_input_bridge::<Vec<u64>, JqSemantics>(&expr, &deep, false),
             QueryResult::Error(_)
         ));
+    }
+
+    /// #5554: `eval_each_owned`'s bridge peels a lone text stage the same way, and hands the sink's
+    /// demand back. The CLI no longer reaches it below the native-stack floor, so this thread,
+    /// which has not armed the floor, is where it refuses at 385 levels.
+    #[test]
+    fn test_streaming_owned_bridge_renders_a_lone_text_stage_past_the_reindex_limit_5554() {
+        let mut deep = OwnedValue::Int(0);
+        for _ in 0..crate::jq::MAX_VALUE_TREE_DEPTH + 16 {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        let expr = parse("tojson").unwrap();
+        for demand in [Demand::Continue, Demand::Stop] {
+            let mut out = Vec::new();
+            let flow =
+                eval_each_owned::<JqSemantics>(&expr, &deep, false, Reentry::REBUILT, &mut |v| {
+                    out.push(v);
+                    demand
+                });
+            let lengths: Vec<_> = out.iter().map(|v| v.to_json().len()).collect();
+            assert_eq!(lengths, [533 + 2], "{demand:?}");
+            match demand {
+                Demand::Continue => assert!(matches!(flow, Flow::Exhausted)),
+                Demand::Stop => assert!(matches!(flow, Flow::Stopped { pending: None })),
+            }
+        }
     }
 
     /// #5554: the text peel asks only after a depth refusal, in jq mode, and only for a first
@@ -118155,7 +119573,7 @@ mod tests {
         .collect();
         let mut with_marker = parse(". + 1 | . + 2").unwrap();
         if let Expr::Pipe(stages) = &mut with_marker {
-            stages.insert(1, Expr::Array(Box::new(marker)));
+            stages.make_mut().insert(1, Expr::Array(Box::new(marker)));
             pipes.push(core::mem::take(stages));
         }
         for pipe in &pipes {
@@ -118528,7 +119946,6 @@ mod tests {
     /// went in (`bridge_provenance`). yq compares structurally, and its
     /// bridge rebuilds; so does jq's without `std`, which has no thread-local
     /// to register the bridge's input in.
-    #[cfg(not(feature = "unshared-containers"))]
     #[test]
     fn eval_owned_pure_and_the_bridge_keep_container_identity_3069() {
         let value = OwnedValue::object_from([(
@@ -122094,7 +123511,6 @@ mod tests {
     /// against jq 1.7.1: `path(.[(0,1,error("x")):3])` on `[1,2,3]` prints
     /// `[{"start":0,"end":3}]` then `[{"start":1,"end":3}]` before raising
     /// `x` -- jq mode is unaffected by the new gate.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_drive_slice_bound_start_own_partial_prefix_preserved_in_jq_mode_2351_review() {
         query!(b"[1,2,3]", r#"path(.[(0,1,error("x")):3])"#,
@@ -122108,7 +123524,6 @@ mod tests {
     /// #2351 review sibling: the end bound (`K2`). Verified against jq
     /// 1.7.1: `path(.[0:(1,2,error("x"))])` on `[1,2,3]` prints
     /// `[{"start":0,"end":1}]` then `[{"start":0,"end":2}]` before raising.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_drive_slice_bound_end_own_partial_prefix_preserved_in_jq_mode_2351_review() {
         query!(b"[1,2,3]", r#"path(.[0:(1,2,error("x"))])"#,
@@ -122198,7 +123613,6 @@ mod tests {
     /// expected prefix is unverifiable against a real oracle -- `key` has
     /// none -- but is identical to `path()`'s single pair by construction,
     /// per the existing sibling test above).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn slice_bound_conversion_sites_agree_on_double_fault_2410() {
         // Site: `eval_slice_bound` (plain read).
@@ -124782,7 +126196,6 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_if_no_else_path_mode() {
         // path(if false then .a end) is [] in jq 1.7.1: the identity
@@ -128326,47 +129739,33 @@ mod tests {
     /// applied under both modes.
     #[test]
     fn test_format_sh_yq_mode_only_accepts_strings() {
-        yq_query!(br"[1, 2, 3]", "@sh",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "array ([1,2,3]) can not be escaped for shell");
-            }
-        );
+        // yq refuses every non-string, naming its tag in the `@uri` wording (#5836), and does not
+        // inspect a container's elements.
+        for (input, tag) in [
+            (&br"[1, 2, 3]"[..], "!!seq"),
+            (&br#"[[1, 2], "x", null]"#[..], "!!seq"),
+            (&br"5"[..], "!!int"),
+            (&br"1.5"[..], "!!float"),
+            (&br"true"[..], "!!bool"),
+            (&br"null"[..], "!!null"),
+        ] {
+            yq_query!(input, "@sh",
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, format!("cannot encode {tag} as URI, can only operate on strings. Please first pipe through another encoding operator to convert the value to a string"));
+                }
+            );
+        }
 
-        // Nested/mixed-content arrays error the same way -- yq's own rule
-        // doesn't inspect elements, unlike jq's per-element quoting.
-        yq_query!(br#"[[1, 2], "x", null]"#, "@sh",
-            QueryResult::Error(e) => {
-                assert!(e.message.starts_with("array ("), "{}", e.message);
-                assert!(e.message.ends_with("can not be escaped for shell"), "{}", e.message);
-            }
-        );
-
-        // Every scalar type errors too -- not just containers.
-        yq_query!(br"5", "@sh",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "number (5) can not be escaped for shell");
-            }
-        );
-        yq_query!(br"1.5", "@sh",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "number (1.5) can not be escaped for shell");
-            }
-        );
-        yq_query!(br"true", "@sh",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "boolean (true) can not be escaped for shell");
-            }
-        );
-        yq_query!(br"null", "@sh",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "null (null) can not be escaped for shell");
-            }
-        );
-
-        // A string is still the one accepted type.
+        // A string is the one accepted type, quoted from the first character that needs it
+        // (#5837).
         yq_query!(br#""hello""#, "@sh",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "'hello'");
+                assert_eq!(s, "hello");
+            }
+        );
+        yq_query!(br#""it's a b""#, "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "it\\'s' a b'");
             }
         );
     }
@@ -135078,7 +136477,6 @@ mod tests {
     /// #4087: yq reads a boolean or `null` index into `null` as `null` and a write builds a
     /// mapping keyed by its text, on the eager evaluator too -- `index_one`, `index_one_owned` and
     /// `key_to_path_component`. jq mode keeps raising.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_yq_boolean_null_index_into_null_on_the_eager_route_4087() {
         for (doc, filter, expected) in [
@@ -136582,7 +137980,6 @@ mod tests {
     /// that always resolves. Rendering emptiness as it aimed a caller's
     /// `getpath`/`setpath`/`delpaths` at the document root, which is why this
     /// pins the variant (`None`) and not just the rendered output.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_of_nothing_is_no_output_not_the_root_path() {
         query!(br#"{"a": 1}"#, "path(empty)", QueryResult::None => {});
@@ -136699,7 +138096,6 @@ mod tests {
     /// `try`, `label`, `as`, static `getpath`). Every expectation here is
     /// captured from real jq 1.7.1 and mirrored as a golden fixture under
     /// `tests/data/jq-golden/cases/path_*`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_resolves_recursive_descent_recurse_select_and_typeof() {
         let doc = br#"{"a":{"b":1},"c":2}"#;
@@ -136729,7 +138125,6 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_resolves_transparent_control_flow_combinators() {
         let doc = br#"{"a":{"b":1},"c":[1,2]}"#;
@@ -136749,7 +138144,6 @@ mod tests {
     /// #530: a filter that is not a path expression at all — as opposed to
     /// one jq recognises but this resolver does not (#483) — raises jq's own
     /// sentence by name instead of answering `[]`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     // `"path({a:1})"` is a jq filter literal, not a formatting string; clippy
     // cannot tell the two apart from the brace shape alone.
@@ -136789,7 +138183,6 @@ mod tests {
     /// found invalid -- confirmed live against jq 1.7.1: every filter below
     /// produces zero stdout lines, only the terminal-check error, regardless
     /// of which side of the comma the later escape sits on.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_comma_terminal_check_wins_over_a_later_siblings_escape_1560() {
         for filter in [
@@ -136813,7 +138206,6 @@ mod tests {
     /// an output already produced before a later one errors"). This is the
     /// existing #986/#1440 behavior `reject_untracked_prefix_too` must not
     /// disturb.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_comma_valid_prefix_keeps_a_later_siblings_own_error_1560() {
         query!(br#"{"a":1,"b":2}"#, r#"path(.a, error("z"), .b)"#,
@@ -136838,7 +138230,6 @@ mod tests {
     /// `["a"]` then `["a","b"]`; `select(length == 2)` rejects the first
     /// and accepts only the second). Confirmed live against jq 1.7.1
     /// (`/usr/bin/jq`): the filter below raises, it does not produce `[]`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_select_after_generator_does_not_swallow_surviving_branch_2050() {
         query!(br#"{"a":{"b":1}}"#,
@@ -136881,7 +138272,6 @@ mod tests {
     /// string key "a" (its own first path component). This must surface as
     /// a raised error, not a silent success: a no-op here would mean
     /// `del()` claimed to delete something it never touched.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_del_select_after_generator_does_not_silently_noop_2050() {
         query!(br#"{"a":{"b":1}}"#,
@@ -136895,7 +138285,6 @@ mod tests {
     /// The two rows from #2050's own divergence table that were already
     /// correct before this fix -- pinned here so a future change to
     /// `resolve_seq_sink`'s fan-out loop can't quietly regress them back.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_select_after_generator_previously_correct_rows_2050() {
         // A *non-rejecting* `select` (`select(true)`) never exercises the
@@ -136938,7 +138327,6 @@ mod tests {
     /// argument via `eval_owned_multi`, which discards the already-produced
     /// first output the moment the second candidate's break escapes, per
     /// #842's precedent for the same all-or-nothing pitfall elsewhere).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_paths_filter_raises_before_reaching_a_later_break_861() {
         query!(
@@ -136969,7 +138357,6 @@ mod tests {
     /// still-uncatchable case — `EvalEscape::Halt`'s own doc: "Must reach
     /// the CLI unconditionally; never catchable, never suppressible" — and
     /// is covered by [`test_path_paths_filter_halts_when_the_first_candidate_halts_987`].
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_paths_filter_never_swallows_a_later_halt() {
         query!(
@@ -136998,7 +138385,6 @@ mod tests {
     /// (.|halt_error) else true end))` on `[1,2,"trigger"]` halts with exit
     /// 5 (`halt_error`'s own default code) and `1` on stderr, both with and
     /// without a wrapping `try`/`catch`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_paths_filter_halts_when_the_first_candidate_halts_987() {
         query!(
@@ -137020,7 +138406,6 @@ mod tests {
     /// even once evaluation is lazy. See `jq_cli_tests.rs` for the
     /// side-effecting, CLI-level over-stop traps this can't observe. All
     /// three confirmed against jq 1.7.1.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_paths_filter_output_count_shapes_987() {
         // Zero surviving candidates: silent prune, no output, no error.
@@ -137051,7 +138436,6 @@ mod tests {
     /// semantics never "un-emit" an output. Verified against jq 1.7.1:
     /// `path(.a, 1)` prints `["a"]` then raises; `(.a, .b[0])?` prints
     /// `["a"]` and silently stops.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_keeps_the_prefix_before_a_later_sibling_errors() {
         query!(br#"{"a":1}"#, "path(.a, 1)",
@@ -137086,7 +138470,6 @@ mod tests {
     /// then raises an ordinary error. Verified against jq 1.7.1: `label $out
     /// | path(try (.a, break $out) catch error("y"))` on `{"a":1}` prints
     /// `["a"]` then raises "y", exit 5.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_try_catch_handler_break_keeps_prefix_832() {
         query!(
@@ -137110,7 +138493,6 @@ mod tests {
     /// `{"a":10}` prints `["a"]` then raises
     /// `Invalid path expression near attempt to access element "b" of
     /// {"b":1,"c":2}`, never reaching `"z"`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_field_access_raises_near_attempt_843() {
         query!(br#"{"a":10}"#, r#"path(try (.a, error({"b":1,"c":2})) catch (.b, "z"))"#,
@@ -137130,7 +138512,6 @@ mod tests {
     /// index and slice reuse "near attempt to access element ... of ...",
     /// but `.[]` gets its own "near attempt to iterate through ..." (no
     /// "element" at all). Confirmed against jq 1.7.1.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_index_slice_iterate_raise_near_attempt_843() {
         query!(br#"{"a":10}"#, r"path(try (.a, error([1,2,3])) catch .[0])",
@@ -137171,7 +138552,6 @@ mod tests {
     /// key rather than deferring to `#530`'s generic "with result" — the
     /// `Expr::IndexExpr` arm's own no-op-target special case
     /// (`is_passthrough_target`). Confirmed against jq 1.7.1.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_computed_index_raises_near_attempt_843() {
         query!(br#"{"a":10}"#, r#"path(try (.a, error({"b":1})) catch .[.k // "b"])"#,
@@ -137223,7 +138603,6 @@ mod tests {
     /// {c:1}})) catch .a.b)` on `{"x":1}` reports "near attempt to access
     /// element \"a\" of {\"a\":{\"c\":1}}" — the *first* component, using
     /// the untracked root, never even computing what `.a` would resolve to.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_chained_field_access_raises_near_attempt_843() {
         query!(br#"{"x":1}"#, r"path(try (.x, error({a:{c:1}})) catch .a.b)",
@@ -137243,7 +138622,6 @@ mod tests {
     /// `resolve_slice_expr`'s own no-op-target special case, the sibling of
     /// `resolve_index_expr`'s `.[.k]` handling tested above. Confirmed
     /// against jq 1.7.1.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_dynamic_slice_raises_near_attempt_843() {
         query!(br#"{"a":10}"#, r"path(try (.a, error([1,2,3])) catch .[(0+1):2])",
@@ -137268,7 +138646,6 @@ mod tests {
     /// constructor and silently reported the resolved integer instead of a
     /// float bound's own spelling -- caught only once review re-tested
     /// with a float bound specifically. Confirmed against jq 1.7.1.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_dynamic_float_slice_keeps_bound_spelling_1326() {
         query!(br#"{"a":10}"#, r"path(try (.a, error([1,2,3])) catch .[(0.5+1):2.5])",
@@ -137304,7 +138681,6 @@ mod tests {
     /// #843 — confirmed live against jq 1.7.1 outside of any `catch` at
     /// all: `path(false // .b)` is `["b"]` in real jq, but already raises
     /// `#530` in succinctly today; filed as #845, not fixed here.)
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_alternative_fallback_raises_near_attempt_843() {
         query!(br#"{"a":10}"#, r#"path(try (.a, error({"b":1})) catch (empty // .b))"#,
@@ -137327,7 +138703,6 @@ mod tests {
     /// in the pre-existing suite happened to exercise this exact fallback line.
     /// Confirmed against jq 1.7.1: `path(getpath("not-array"))` raises this
     /// message.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_getpath_non_array_argument_falls_through_to_resolve_leaf() {
         query!(br#"{"a":10}"#, r#"path(getpath("not-array"))"#,
@@ -137372,7 +138747,6 @@ mod tests {
     /// parenthesized `(.a)?` and bare `try .a` (no catch) both suppress the
     /// very same error and print only `["a"]`. Before this fix, succinctly
     /// suppressed all eight forms identically.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_bare_optional_does_not_suppress_near_attempt_843() {
         for (filter, expected_message) in [
@@ -137407,7 +138781,6 @@ mod tests {
     /// forms above still suppress the error exactly as before — this fix
     /// is specific to the bare-postfix `?` position, not `?`/`try` in
     /// general. Confirmed live against jq 1.7.1.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_parenthesized_optional_still_suppresses_843() {
         for filter in [
@@ -137431,7 +138804,6 @@ mod tests {
     /// covered, since the original report was that assignment silently
     /// wrote attacker-controlled data into the real document instead of
     /// raising and writing nothing.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_getpath_result_stays_untracked_843() {
         // `path()` form, both pipe and dot-chain spellings of "navigate
@@ -137480,7 +138852,6 @@ mod tests {
     /// confirmed live against jq 1.7.1: both still raise "near attempt",
     /// naming `getpath`'s own landed value as the container, and perform
     /// no write.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_getpath_as_true_index_slice_expr_target_843() {
         query!(
@@ -137515,7 +138886,6 @@ mod tests {
     /// 1.7.1: both `path(try (.a, error({y:99})) catch
     /// (select(false)[.k]))` and the slice sibling print only `["a"]`, no
     /// error, no extra output.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_index_slice_expr_target_produces_no_branches_843() {
         for filter in [
@@ -137540,7 +138910,6 @@ mod tests {
     /// and never touches `"z"`. Before this fix, `select(true)` silently
     /// succeeded (contributing a spurious extra `[]` output) and the raised
     /// message came from `"z"` instead.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_comma_checks_each_sibling_eagerly_843() {
         query!(
@@ -137562,7 +138931,6 @@ mod tests {
     /// pipe/target continuation — see #1297), not here, where `.y` is still
     /// to come. Confirmed live against jq 1.7.1 for both the piped and
     /// dot-chain spellings.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_select_as_intermediate_step_still_works_843() {
         for filter in [
@@ -137603,7 +138971,6 @@ mod tests {
     /// The issue's own repro: `.[]` after a `Pipe` boundary must still raise
     /// jq's "near attempt to iterate" wording, not the generic "with
     /// result" message `resolve_catch`'s old eager check produced.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_pipe_boundary_iterate_raises_near_attempt_1297() {
         query!(b"null", r"path((try error([1,2,3]) catch .) | .[])",
@@ -137617,7 +138984,6 @@ mod tests {
     }
 
     /// Same shape, a `Field` step after the boundary instead of `Iterate`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_pipe_boundary_field_raises_near_attempt_1297() {
         query!(b"null", r"path((try error(5) catch .) | .a)",
@@ -137634,7 +139000,6 @@ mod tests {
     /// `Pipe` boundary — `resolve_index_expr`'s own post-target check has
     /// the identical gap for a computed index built directly on a
     /// `try`/`catch`, no `Pipe` node in the AST at all.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_index_expr_target_boundary_raises_near_attempt_1297() {
         query!(b"null", r"path((try error([1,2,3]) catch .)[0])",
@@ -137648,7 +139013,6 @@ mod tests {
     }
 
     /// Same boundary gap, `resolve_slice_expr`'s sibling check.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_catch_handler_slice_expr_target_boundary_raises_near_attempt_1297() {
         query!(b"null", r"path((try error([1,2,3]) catch .)[0:2])",
@@ -137666,7 +139030,6 @@ mod tests {
     /// *target* (`=` binds tighter than `|`, so `A | B = C` would otherwise
     /// parse as `A | (B = C)`, a different shape entirely that never
     /// touches this machinery).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_assign_pipe_boundary_iterate_raises_near_attempt_1297() {
         query!(b"null", r"(((try error([1,2,3]) catch .) | .[]) = 1)",
@@ -137680,7 +139043,6 @@ mod tests {
     }
 
     /// Write-side (`|=`), same boundary shape.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_update_assign_pipe_boundary_field_raises_near_attempt_1297() {
         query!(b"null", r"(((try error(5) catch .) | .a) |= 5)",
@@ -137695,7 +139057,6 @@ mod tests {
 
     /// `del()`, same boundary shape — the fourth of the four callers
     /// `resolve_dynamic_indexes` serves (`path()`/`=`/`|=`/`del()`).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_del_pipe_boundary_field_raises_near_attempt_1297() {
         query!(b"null", r"del((try error([1,2,3]) catch .) | .a)",
@@ -137712,7 +139073,6 @@ mod tests {
     /// now-deleted eager check must still raise, not silently corrupt the
     /// document — just caught one level up, by `resolve_dynamic_indexes`'s
     /// own terminal check, instead of inside `resolve_catch` itself.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_assign_bare_terminal_select_still_raises_not_corrupts_1297() {
         query!(br#"{"a":10}"#, r#"try (.a, error({"y":99})) catch select(true) = "X""#,
@@ -138081,24 +139441,21 @@ mod tests {
             assert!(via_index(text).is_none(), "accepted {text}");
         }
         // A container's key is shared by the events beneath it; a leaf's own key is not.
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            let events = via_index("{\"a\":{\"x\":1,\"y\":2}}").expect("built");
-            let component = |event: &OwnedValue, at: usize| -> SharableString {
-                let OwnedValue::Array(parts) = event else {
-                    panic!("an event is an array: {event:?}");
-                };
-                let OwnedValue::Array(path) = &parts[0] else {
-                    panic!("a path is an array: {event:?}");
-                };
-                let OwnedValue::String(key) = &path[at] else {
-                    panic!("a key is a string: {event:?}");
-                };
-                key.clone()
+        let events = via_index("{\"a\":{\"x\":1,\"y\":2}}").expect("built");
+        let component = |event: &OwnedValue, at: usize| -> SharableString {
+            let OwnedValue::Array(parts) = event else {
+                panic!("an event is an array: {event:?}");
             };
-            assert!(component(&events[0], 0).ptr_eq(&component(&events[1], 0)));
-            assert!(!component(&events[0], 1).ptr_eq(&component(&events[0], 1)));
-        }
+            let OwnedValue::Array(path) = &parts[0] else {
+                panic!("a path is an array: {event:?}");
+            };
+            let OwnedValue::String(key) = &path[at] else {
+                panic!("a key is a string: {event:?}");
+            };
+            key.clone()
+        };
+        assert!(component(&events[0], 0).ptr_eq(&component(&events[1], 0)));
+        assert!(!component(&events[0], 1).ptr_eq(&component(&events[0], 1)));
         // The collapse the decline keeps: first position, last value.
         let shown: Vec<String> = via_value("{\"a\":1,\"b\":2,\"a\":3}")
             .expect("converts")
@@ -138897,10 +140254,6 @@ mod tests {
     /// the reindex bridge at all (#3261 -- it raises the depth-limit error),
     /// so a `select` that answers over one is a `select` that did not take
     /// the bridge.
-    #[cfg_attr(
-        feature = "unshared-containers",
-        ignore = "holdout has no node identity or sharing (#5254)"
-    )]
     #[test]
     fn owned_select_door_is_reached_and_skips_the_bridge_3439() {
         let mut deep = OwnedValue::Null;
@@ -138923,6 +140276,77 @@ mod tests {
         assert!(
             matches!((&out[0], &deep), (OwnedValue::Array(a), OwnedValue::Array(b)) if a.ptr_eq(b))
         );
+    }
+
+    /// #5840: a program that answers nothing (`empty`, `error("x")?`, a pipe that starts with
+    /// one), `select`'s definition spelled out as an `if`, and `.k // empty` never reach the bridge.
+    /// An input past `MAX_VALUE_TREE_DEPTH` is the probe the test above uses: the bridge refuses it,
+    /// so [`eval_each_owned_answered`] answering (rather than declining to the caller) and the right
+    /// outputs say the program was answered from the tree. The pin must be able to fail: it does,
+    /// with the `owned_answers_nothing` door and `select_like`'s `If` arms removed.
+    #[test]
+    fn empty_and_select_spelled_as_if_skip_the_bridge_5840() {
+        let mut deep = OwnedValue::Null;
+        for _ in 0..crate::jq::value::MAX_VALUE_TREE_DEPTH {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        let run = |src: &str, input: &OwnedValue| -> Option<Vec<OwnedValue>> {
+            let expr = parse(src).unwrap();
+            let mut out = Vec::new();
+            let flow = eval_each_owned_answered::<JqSemantics>(
+                &expr,
+                input,
+                false,
+                Reentry::REBUILT,
+                &mut |v| {
+                    out.push(v);
+                    Demand::Continue
+                },
+            )?;
+            assert!(matches!(flow, Flow::Exhausted), "{src}");
+            Some(out)
+        };
+        for (src, outputs) in [
+            ("empty", 0),
+            ("(empty)", 0),
+            (". | empty", 0),
+            ("empty | error(\"x\")", 0),
+            ("empty | 1, 2", 0),
+            ("error(\"x\")?", 0),
+            ("error?", 0),
+            ("try error(null)", 0),
+            ("if length == 2 then . else empty end", 0),
+            ("if length == 1 then . else empty end", 1),
+            ("if length == 1 then empty else . end", 0),
+            ("if length == 2 then empty else . end", 1),
+            ("select(length == 1) | select(length == 1)", 1),
+            ("if length == 1 then . else empty end | length", 1),
+            (".[0] // empty", 1),
+            (".[1] // empty", 0),
+        ] {
+            let got = run(src, &deep).unwrap_or_else(|| panic!("{src} took the bridge"));
+            assert_eq!(got.len(), outputs, "{src}");
+        }
+        // A condition or a read the tree cannot answer, a fan-out, a handler or an argument that
+        // is computed still go to the bridge, which answers them as before.
+        for src in [
+            "if (length, 2) == 1 then . else empty end",
+            "if length == 1 then . else 2 end",
+            "if length == 1 then 1 else empty end",
+            "error(.)?",
+            "try error(\"x\") catch empty",
+            "1, empty",
+            ".[0] // 3",
+            "(.[0], .[1]) // empty",
+        ] {
+            assert!(run(src, &deep).is_none(), "{src} should decline");
+        }
+        // `//` falls through on null and false, and keeps a truthy read.
+        let falsy = OwnedValue::array_from(vec![OwnedValue::Bool(false), OwnedValue::Int(3)]);
+        let got = run(".[0] // empty", &falsy).unwrap();
+        assert_eq!(got.len(), 0);
+        let got = run(".[1] // empty", &falsy).unwrap();
+        assert_eq!(got, vec![OwnedValue::Int(3)]);
     }
 
     /// `eval_owned_pure` is shared with `closed_expr_to_owned` and the
@@ -141714,7 +143138,6 @@ mod tests {
         ]);
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_optional_assign_through_autovivified_null_no_longer_leaves_a_remnant() {
         // Before #486/#498, `?` swallowed the write failure but not before
@@ -141809,7 +143232,6 @@ mod tests {
         )]);
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_optional_write_does_not_swallow_a_sibling_clobber_in_a_fan_out() {
         // #498's multi-branch case: `?` prunes path *production*, never
@@ -141856,7 +143278,6 @@ mod tests {
     /// #499: slice bounds accept any expression, evaluated with the same
     /// discipline as a computed index key (`resolve_index_expr`). Every case
     /// here was checked against jq 1.7.1 directly.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_computed_slice_bounds() {
         assert_outcomes(&[
@@ -142365,7 +143786,6 @@ mod tests {
     /// resolves to a number or fails to *evaluate* at all, so the
     /// empty-bound-stream short-circuit and the "resolved bounds don't apply
     /// to this target" refusal never ran. Checked against jq 1.7.1 directly.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_computed_slice_bounds_path_mode_edge_cases() {
         assert_outcomes(&[
@@ -147721,7 +149141,6 @@ mod tests {
     /// #1326: `path()` keeps a float slice bound's own spelling, the same
     /// way #1088 already does for a float array *index* -- every case here
     /// is oracle-verified against real jq 1.7.1.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_reports_a_float_slice_bound_verbatim_1326() {
         // The issue's own primary repro: a non-whole float bound, which
@@ -147814,7 +149233,6 @@ mod tests {
     /// `def`/`as`-bound body through them for these shapes, so the
     /// dedicated direct-call tests just below are what actually pin the
     /// arms themselves; these stay as end-to-end sanity checks.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_slice_number_survives_def_and_as_binding_1326() {
         query!(br"[1,2,3,4,5]", r"path((1) as $x | .[1.5:3.5])",
@@ -148086,7 +149504,6 @@ mod tests {
     // fixed call sites, and a guard that `|=` itself was deliberately left
     // unfixed (see `eval_owned_multi_first`).
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_dynamic_index_assignment_propagates_partial_error_694() {
         // Issue #694's primary repro. Confirmed against real jq 1.7.1:
@@ -148386,7 +149803,6 @@ mod tests {
     /// branch failure the sink stopped on when it answers, produces nothing,
     /// or raises; a halt is never superseded. Captured from jq 1.7.1 with
     /// `-c` over `{"a":{"a":1}}`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_cond_retry_supersedes_stashed_verdict_3293() {
         for (filter, values, end) in [
@@ -148508,7 +149924,6 @@ mod tests {
     /// they drive. A `?//` retry that answers, produces nothing, or raises
     /// supersedes the failure the abandoned alternative stopped on; a halt is
     /// never superseded. Captured from jq 1.7.1 with `-c` over `[10,20,30]`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_bind_source_and_fold_retry_supersedes_stashed_verdict_3293() {
         for (filter, values, end) in [
@@ -148718,7 +150133,6 @@ mod tests {
     /// `f` that *is* a `?//` bind is recognised
     /// ([`direct_pattern_retry`]); the wrapped form needs the retry
     /// generation. Captured from jq 1.7.1 with `-c` over `[10,20,30]`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_recurse_retry_supersedes_stashed_abort_3293() {
         let direct = r#"([1] as $q ?// $b | if length==3 then (if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end)"#;
@@ -148789,7 +150203,6 @@ mod tests {
     /// abandoned alternative stopped on; a halt is never superseded; an
     /// untracked target still refuses the retry's own key. Captured from jq
     /// 1.7.1 with `-c` over `{"a":{"a":1}}`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_index_retry_supersedes_stashed_verdict_3293() {
         let answers = r#"([["a"]] as [$q] ?// [[$q]] | $q)"#;
@@ -149530,7 +150943,6 @@ mod tests {
         });
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_resolve_recurse_sink_keeps_f_partial_fanout_before_error_842() {
         // Issue #842's path-position repro (`resolve_recurse_sink`, no `cond`).
@@ -149548,7 +150960,6 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_resolve_recurse_cond_keeps_f_partial_fanout_before_error_842() {
         // Same as the previous test, but with `cond` present (always `true`,
@@ -149619,7 +151030,6 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_resolve_recurse_sink_max_items_cap_replaces_a_pending_error_842() {
         // Pins the cap's behaviour on a 10,000-node walk, not the 2^20-node one (#5378).
@@ -149659,7 +151069,6 @@ mod tests {
     /// is an error in both positions (the cap's, not the deferred one), and
     /// the two are compared against each other: the same count of nodes
     /// delivered before it, and the same error.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_recurse_family_max_items_gate_agrees_across_value_and_path_position_1023() {
         // Pins the cap's behaviour on a 10,000-node walk, not the 2^20-node one (#5378).
@@ -149732,7 +151141,6 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_resolve_recurse_cond_keeps_already_approved_siblings_before_error_854() {
         // Path-position sibling of the previous test (`resolve_recurse_sink`'s
@@ -149787,7 +151195,6 @@ mod tests {
         }
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_resolve_recurse_cond_keeps_already_approved_siblings_subtree_before_error_854() {
         // Path-position sibling of the previous test. Confirmed against
@@ -149851,7 +151258,6 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_resolve_recurse_cond_own_multi_output_fanout_kept_before_error_854() {
         // Path-position sibling of the previous test. Confirmed against
@@ -149887,7 +151293,6 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_resolve_recurse_cond_keeps_already_approved_siblings_before_break_854() {
         // Path-position counterpart of the previous test (`resolve_recurse_sink`'s
@@ -149948,7 +151353,6 @@ mod tests {
     /// node before `-1` is delivered and `cond`'s own `boom` ends the walk, as in
     /// jq 1.7.1 (`[recurse(.items?[]?; if . == -1 then error("boom") else true end)]`
     /// raises `boom`, and `limit(3; ...)` answers).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn recurse_cond_error_past_the_old_cap_is_the_conds_own_3867() {
         let large_doc = format!(
@@ -149984,7 +151388,6 @@ mod tests {
     /// value walker, the path walker and a write through it; the same chain with
     /// 9,000 elements (9,301 nodes) is under it. Both are run fully native and
     /// fully queued.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn recurse_cap_in_the_queued_walk_5378() {
         let _cap = recurse_cap_override::scoped(10_000);
@@ -150018,7 +151421,6 @@ mod tests {
     /// grows by one unit a round (`. + "x"`, `. + [1]`) is bounded by the units
     /// it holds, not by how many nodes there are: with a cap of 1,000 the walk
     /// delivers the nodes whose costs add up to it, then raises.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn recurse_node_cost_charges_a_growing_value_5378() {
         let _cap = recurse_cap_override::scoped(1000);
@@ -150047,7 +151449,6 @@ mod tests {
     /// the cap, so a path that grows with the walk (`null | recurse(.a)`) cannot
     /// hold more than about 2^26 keys however large the cap is, and a path under
     /// 64 keys is counted node for node.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn recurse_node_cost_charges_a_long_path_5378() {
         assert_eq!(recurse_node_cost(0), 1);
@@ -150087,7 +151488,6 @@ mod tests {
     /// walk off scalars, `.children[]`, `.children[]?`, `.a.b[]?`). Every answer
     /// is jq 1.7.1's, captured on the same documents, in value and path
     /// position, native and queued.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn recurse_answers_a_bounded_walk_past_the_cap_3867() {
         // 1 + 6000 + 6000 = 12001 nodes.
@@ -150191,7 +151591,6 @@ mod tests {
     /// longer bounded by the tree -- before the cap (the fork is at the first
     /// leaf) and after it (the fork is at the last, 12,002 nodes in, where jq
     /// answers 12004). Value and path position, native and queued.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn recurse_cap_lifts_until_a_cond_forks_3867() {
         // Pins the cap's behaviour on a 10,000-node walk, not the 2^20-node one (#5378).
@@ -150256,7 +151655,6 @@ mod tests {
         }
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_resolve_recurse_cond_max_items_cap_replaces_a_pending_error_854() {
         // Pins the cap's behaviour on a 10,000-node walk, not the 2^20-node one (#5378).
@@ -150279,7 +151677,6 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_resolve_recurse_cond_and_builtin_recurse_cond_agree_897() {
         // #897: `resolve_recurse_sink`'s `Some(cond)` arm and `builtin_recurse_cond`
@@ -150350,7 +151747,6 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_del_computed_key_propagates_partial_error_694() {
         // Confirmed against real jq 1.7.1: errors with "boom".
@@ -150363,7 +151759,6 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_slice_assignment_dynamic_bound_propagates_partial_error_694() {
         // `drive_slice_bound`, one of the call sites fixed for free by the
@@ -152803,7 +154198,6 @@ mod tests {
     /// `tonumber`'s own decode-failure raise (`QueryResult::None`); after,
     /// it correctly propagates uncaught, matching the sibling `Expr::Try`
     /// arm's already-existing behavior for the identical shape.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn eval_rs_resolve_node_optional_does_not_suppress_decode_failure_1746() {
         let json: &[u8] = br#"{"a":"\ud800"}"#;
@@ -153585,10 +154979,6 @@ mod tests {
     /// A shared string spliced as a literal is one refcount, not a copy (#5713): the literal and
     /// the value read back from it are the same storage as the string it came from.
     #[test]
-    #[cfg_attr(
-        feature = "unshared-containers",
-        ignore = "holdout has no node identity or sharing (#5254)"
-    )]
     fn a_shared_string_is_spliced_and_read_back_without_a_copy_5713() {
         let mut shared = SharableString::from("h\u{e9}".repeat(2100));
         shared.promote();
@@ -153722,7 +155112,6 @@ mod tests {
     /// value-position `as` evaluator, entirely separate from `resolve_node`)
     /// discarded `$orig`'s provenance before `path(...)` ever started
     /// resolving.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_tracks_variable_bound_from_identity_outside_path_844() {
         assert_eq!(
@@ -153735,7 +155124,6 @@ mod tests {
     /// not `.` itself) must keep raising -- real jq does not track it
     /// either, and uses the same "near attempt" wording this fix must not
     /// accidentally start suppressing. Confirmed against jq 1.7.1.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_does_not_track_variable_bound_from_navigation_844() {
         query!(br#"{"a":{"c":5}}"#, r".a as $x | path($x | .c)",
@@ -153755,7 +155143,6 @@ mod tests {
     /// poisoned `.other.o` here too. Per-branch trackability (already
     /// established by #986/#989) means `Expr::TrackedVar`'s own use-time
     /// check only ever affects its own branch.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_comma_sibling_independent_of_untracked_variable_844() {
         assert_eq!(
@@ -153782,7 +155169,6 @@ mod tests {
     /// own argument -- `resolve_node`'s own `Expr::As` arm, a second,
     /// independent call site of the same lossy `substitute_var` machinery
     /// `eval_as` uses.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_tracks_variable_bound_from_identity_inside_path_844() {
         assert_eq!(
@@ -153795,7 +155181,6 @@ mod tests {
     /// treats an already-substituted `Expr::TrackedVar` as a passthrough
     /// too, so `$y` stays trackable even though its own bind source is
     /// `$x`, not `.` directly.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_tracks_chained_passthrough_bindings_844() {
         assert_eq!(
@@ -153807,7 +155192,6 @@ mod tests {
     /// The fix isn't `path()`-only: `resolve_dynamic_indexes`/`resolve_node`
     /// back all four path-consuming entry points, so plain assignment and
     /// `del()` through a passthrough-bound variable are fixed for free.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_assign_and_del_track_variable_bound_from_identity_844() {
         assert_eq!(outputs(br#"{"a":1}"#, r". as $x | $x = 5"), ["5"]);
@@ -153822,7 +155206,6 @@ mod tests {
     /// `if C then A else B end` tracks when **both** branches are
     /// passthrough, regardless of which one `C` actually picks -- this
     /// predicate never evaluates `C`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_tracks_if_with_both_branches_passthrough_844() {
         assert_eq!(
@@ -153837,7 +155220,6 @@ mod tests {
     /// Negative control: an `if` where only *one* branch is passthrough
     /// stays untracked even when the taken branch happens to be the
     /// passthrough one -- the gate is purely syntactic, not evaluated.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_does_not_track_if_with_one_non_passthrough_branch_844() {
         query!(br#"{"a":{"c":5}}"#,
@@ -153855,7 +155237,6 @@ mod tests {
     /// to be passthrough, since every expression this predicate recognizes
     /// is built from primitives that cannot themselves raise, so a
     /// recognized `A` provably never reaches `B`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_tracks_try_catch_ignoring_catch_shape_844() {
         assert_eq!(
@@ -153873,7 +155254,6 @@ mod tests {
     /// `A`, even though `$x`'s branch is provably never taken either,
     /// stays untracked -- this predicate does not know `5` is truthy any
     /// more than it evaluates `if`'s `C`).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_tracks_alternative_left_ignoring_right_shape_844() {
         assert_eq!(
@@ -153907,7 +155287,6 @@ mod tests {
     /// per-iteration deep-cloning would be slow to run under `cargo test`.
     /// Doesn't re-measure wall-clock time (too flaky for a unit test) --
     /// just pins that this shape still resolves correctly.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_tracks_variable_referenced_in_a_loop_844() {
         let mut json = String::from(r#"{"root_marker":["hit"],"records":["#);
@@ -153943,7 +155322,6 @@ mod tests {
     /// anywhere for the register to *survive* the literal, so the marker
     /// reached its use site with the ambient value `5` to compare against
     /// and could only refuse.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_register_survives_intervening_literal_1573() {
         assert_eq!(
@@ -153955,7 +155333,6 @@ mod tests {
     /// The register is a *position*, not just a permission: navigation may
     /// continue off the re-established variable, and the emitted path is the
     /// register's own, not the empty one the ambient literal would give.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_register_navigates_off_reestablished_var_1573() {
         assert_eq!(
@@ -153972,7 +155349,6 @@ mod tests {
     /// the second one is already untracked when it runs, so it cannot
     /// re-derive the register from its own ambient input the way the first
     /// one does, and has to inherit the branch's carried copy.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_register_survives_consecutive_literals_1573() {
         assert_eq!(
@@ -153985,7 +155361,6 @@ mod tests {
     /// leaves the register where it was. `length` and a `Comma` fan-out are
     /// both confirmed live (`(1,2)` yields the path twice, once per branch,
     /// exactly as jq does).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_register_survives_non_literal_computed_stages_1573() {
         assert_eq!(
@@ -154005,7 +155380,6 @@ mod tests {
     /// loop too, not only the `Ok` side.
     ///
     /// Confirmed live against jq 1.7.1: prints `[]`, then raises `boom`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_register_reestablished_in_escaping_partial_prefix_1573() {
         query!(br#"{"a":1}"#, r#"path(. as $x | 5 | ($x, error("boom")))"#,
@@ -154020,7 +155394,6 @@ mod tests {
     /// navigates nothing keeps carrying the register, so these still
     /// answer. Pins the allowlist's positive half — narrowing it further
     /// has to break a test rather than quietly cost these.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_register_survives_navigation_free_stages_1573() {
         for filter in [
@@ -154052,7 +155425,6 @@ mod tests {
     /// when what they contain navigates, including onto a computed value
     /// (`{k:1} | {j: .zz.yy}`) or through a jq-defined builtin (`first`).
     /// Each is `[]` in jq 1.7.1; each refused here before #3186.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_register_survives_subexp_stages_that_navigate_3186() {
         for filter in [
@@ -154099,7 +155471,6 @@ mod tests {
     /// the register keeps it alive, so a later `$var` frozen from the
     /// register's own position re-establishes across it. jq answers `["a"]`
     /// for both; succinctly dropped the register and refused.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_register_survives_getpath_off_register_2896() {
         assert_eq!(
@@ -154122,7 +155493,6 @@ mod tests {
     /// *second* `getpath` composes from it and the pipe lands back on the
     /// register. Two stages deep, which is what proves the mark is read as
     /// an input position and not merely produced.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_register_getpath_result_carries_its_position_2896() {
         assert_eq!(
@@ -154139,7 +155509,6 @@ mod tests {
     /// root (`INIT = .`), so `getpath(["a"])` inside UPDATE lands the
     /// accumulator back on the register's own node and EXTRACT's `.b`
     /// continues from it.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_foreach_register_getpath_resumes_at_register_node_2896() {
         assert_eq!(
@@ -154182,7 +155551,6 @@ mod tests {
     /// re-entry boundary. The last is #2860's own repro: a
     /// `Marked(Origin::At)` branch must *not* be admitted by `relocate`'s
     /// widened eligibility -- only a positional `Snapshot::At` is.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_foreach_register_getpath_negative_controls_2896() {
         for (doc, filter, expected) in [
@@ -154245,7 +155613,6 @@ mod tests {
     /// The third filter is the negative control for the same shape: `$y`
     /// names the node the register is *not* on, so it must not re-establish
     /// — it refuses on jq, on `main`, and here.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_register_getpath_equal_value_different_node_2896() {
         let doc = br#"{"a":{"b":2},"c":{"b":2}}"#;
@@ -154306,7 +155673,6 @@ mod tests {
     /// untracked stage whose value merely *happened* to equal the register
     /// refused where the identical `.` stage does not: all three of these
     /// are `["a"]` in jq 1.7.1, but the first refused.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_register_getpath_empty_preserves_unconditionally_2896() {
         for filter in [
@@ -154532,7 +155898,6 @@ mod tests {
     /// second element re-enters UPDATE with the *first* element's result as
     /// its accumulator, which is no longer the register's node. jq raises
     /// after emitting nothing; the one-element spelling above answers.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_foreach_register_getpath_resets_between_elements_2896() {
         query!(br#"{"a":{"b":2}}"#, r#"path(foreach (1,2) as $k (.; getpath(["a"]); .b))"#,
@@ -154565,7 +155930,6 @@ mod tests {
     /// every spelling `is_identity_passthrough` recognises, a bare-variable
     /// `?//` alternative, two `getpath`s deep, and the fold shapes -- read,
     /// then written through. `main` refused every row.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_identity_bind_carries_its_position_2978() {
         for (doc, filter, expected) in [
@@ -154677,7 +156041,6 @@ mod tests {
     /// catch-less-`try` spelling of the same escape (`error(...)?`) on the
     /// `Alternative` arm directly rather than routed through an actual
     /// `try`/`catch`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_raising_try_body_is_not_an_identity_passthrough_2978() {
         let doc = br#"{"a":{"k":{"b":1}}}"#;
@@ -154812,7 +156175,6 @@ mod tests {
     /// `error`'s message and `halt_error`'s code) evaluated but not part
     /// of the output, so it only moves the register when `msg` itself
     /// navigates. Confirmed live against jq 1.7.1 for every row below.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_stderr_debug_passthrough_keeps_path_register_3126() {
         let doc = br#"{"a":{"b":1}}"#;
@@ -154952,7 +156314,6 @@ mod tests {
     /// produces, still come first and still win, exactly as they did before
     /// #3271 touched this code at all. Every row confirmed live against jq
     /// 1.7.1.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_native_builtins_yield_to_jqs_own_earlier_failure_3271() {
         // A type error the construct's own input fails, before any of
@@ -155483,7 +156844,6 @@ mod tests {
     /// #5103: a whole-range slice of a non-empty array is the array (`jvp_array_slice` shares the buffer), so jq's
     /// `.a[0:3]` of a 3-array is `.a`; refuse-only in [`test_path_bind_origin_matrix_refuse_only_2042`] until then.
     /// Read through the invocation's root, which only a `std` build records, so it is pinned outside the matrix.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     #[cfg(feature = "std")]
     fn test_path_bind_origin_full_slice_is_the_array_5103() {
@@ -155497,7 +156857,6 @@ mod tests {
         }
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_bind_origin_matrix_accepts_2042() {
         // (input, filter, jq 1.7.1's `-c '[FILTER]'`)
@@ -155843,7 +157202,6 @@ mod tests {
     /// the same jv (same offset and length). The path-mode interpreter, which
     /// runs this program since #5223 (and through this helper's `eval_full`
     /// since #5233), sees it with or without `std`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_bind_origin_slice_spelling_accepts_3464() {
         assert_eq!(
@@ -155863,7 +157221,6 @@ mod tests {
     /// stepping, `?//` alternative fallback (both a pattern-step retry and
     /// a body that never even needs one), a `null` register carried
     /// through a second entry, and a write (`del`).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_destructure_matrix_accepts_2649() {
         // (input, filter, jq 1.7.1's `-c '[FILTER]'`)
@@ -155973,7 +157330,6 @@ mod tests {
     /// bind whose *source* is itself a variable frozen from the live
     /// register re-establishes exactly as a plain `$q` reference does
     /// elsewhere. Confirmed live: jq 1.7.1 answers `["a"]`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_as_pattern_source_tracked_var_reestablishes_2649() {
         assert_eq!(
@@ -155987,7 +157343,6 @@ mod tests {
     /// [`cannot_move_register`] treats it exactly like a plain `As` body --
     /// safe to carry the register across as a stage. Confirmed live: jq
     /// 1.7.1 answers `[]`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_as_pattern_var_only_alternatives_preserve_register_2649() {
         assert_eq!(
@@ -156010,7 +157365,6 @@ mod tests {
     /// is checked against the real one: `["a"]` on the `null` document (the
     /// register *is* `null`), jq's refusal on `{"a":1}`, both read and
     /// written.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_as_pattern_in_catch_handler_checks_the_entry_register_3133() {
         assert_eq!(
@@ -156043,7 +157397,6 @@ mod tests {
     /// truthy and breaks; pattern 2 (`$z`) never does, so its own body
     /// wins. Confirmed live: jq 1.7.1 answers `[]` (no error, no swallowed
     /// break).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_as_pattern_break_retries_non_last_alternative_2649() {
         assert_eq!(
@@ -156095,7 +157448,6 @@ mod tests {
     /// prefix" rule [`test_path_register_reestablished_in_escaping_partial_prefix_1573`]
     /// pins for a plain `As`. Confirmed live: jq 1.7.1 prints `[]`, then
     /// raises `boom`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_as_pattern_source_escape_reaches_sink_2649() {
         query!(br"null", r#"path((null, error("boom")) as $q ?// $z | $q)"#,
@@ -156113,7 +157465,6 @@ mod tests {
     /// dropped output, or a write to the wrong key on the first cut; jq
     /// 1.7.1 answers are the expected values, and `$y` sits in value
     /// position only, so agreeing means the *binding* is right.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_bind_source_outside_pure_navigation_binds_by_value_2042() {
         let rows: &[(&[u8], &str, &str)] = &[
@@ -156167,7 +157518,6 @@ mod tests {
     /// pipe heads too ([`marker_headed`]) -- `$y.b | .c` parses as
     /// `Pipe([Pipe([$y, .b]), .c])`, which the first cut did not unwrap --
     /// and a `recurse` body certifies a marker at the node it visits.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_marker_rerooting_and_recurse_frames_2042() {
         for (input, filter, want) in [
@@ -156414,7 +157764,7 @@ mod tests {
     /// it was not (`max`, `+`, `[...]` place a computed value at a position
     /// without that value being the node there).
     #[test]
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))] // `invocation_roots` records nothing without `std`, so every anchor refuses
+    #[cfg(feature = "std")] // `invocation_roots` records nothing without `std`, so every anchor refuses
     fn anchored_identical_reads_an_owned_chain_3482() {
         let inner = OwnedValue::object_from([("b".to_string(), OwnedValue::string("x"))]);
         let root = OwnedValue::object_from([("a".to_string(), inner.clone())]);
@@ -156511,10 +157861,8 @@ mod tests {
     /// clause compares the marker's own `Rc` with the node under the
     /// register, which is why the resolver can answer for an embed at a
     /// nested position (`[.] | path(.[0] | $x)`) that no root witness can
-    /// name. `unshared-containers` deep-copies on clone, so there is no
-    /// storage to share and the test does not run there.
+    /// name.
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
     fn marker_identical_reads_storage_identity_3177() {
         let value = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
         // A navigated bind outside any invocation: the origin that never
@@ -156847,7 +158195,7 @@ mod tests {
     /// which would put a second dataful variant on the niche and cost 8 bytes
     /// (measured 120 against 112).
     #[test]
-    #[cfg(all(target_pointer_width = "64", not(feature = "unshared-containers")))]
+    #[cfg(target_pointer_width = "64")]
     fn path_branch_size_is_pinned_3456() {
         assert_eq!(
             core::mem::size_of::<PathBranch<'static>>(),
@@ -157049,15 +158397,12 @@ mod tests {
     /// jq's own refcount exceed one and copy there). Plus the jq-mode gate,
     /// and the guard's own scope.
     ///
-    /// `unshared-containers` is the measurement holdout where a clone
-    /// deep-copies, so there is no storage to share and every row would be
-    /// `Owned`; the sharing is what this test is about, so it does not run
-    /// there. Nor without `std`: the table needs a `thread_local!`, so the
+    /// Not without `std`: the table needs a `thread_local!`, so the
     /// `no_std` build compiles `embed_table`'s stub, where every lookup
     /// answers `None` by construction (the refuse-only behaviour that
     /// configuration is meant to have).
     #[test]
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     fn of_owned_witnesses_only_the_binding_s_own_storage_2889() {
         use crate::jq::eval_generic::embed_table_push;
 
@@ -157792,7 +159137,6 @@ mod tests {
     /// The issue's own two repros: a trackable variable passed straight
     /// through `reduce`/`foreach`'s UPDATE, never touched by it, still
     /// resolves to the root path it was actually bound from.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_path_tracks_variable_through_reduce_foreach_update_1440() {
         assert_eq!(
@@ -157810,7 +159154,6 @@ mod tests {
     /// inherited from a transient UPDATE result) at every iteration
     /// boundary and at final emission — see `FoldRegister`'s own doc
     /// comment for the full model.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_reduce_register_restore_semantics_1440() {
         // INIT's path survives an empty fold (no source elements at all).
@@ -157868,7 +159211,6 @@ mod tests {
     /// Multi-element input: only the *last* UPDATE output per step
     /// survives the fold, same rule as `eval_reduce`'s own value-position
     /// fold.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_reduce_last_update_output_wins_1440() {
         query!(
@@ -157888,7 +159230,6 @@ mod tests {
     /// and an intermediate iteration's own trackability never leaks into a
     /// later one (the register is fixed per INIT fork, re-checked fresh
     /// every step).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_reduce_mixed_per_iteration_trackability_1440() {
         assert_eq!(
@@ -157910,7 +159251,6 @@ mod tests {
     /// A fold whose UPDATE never derives from the trackable variable at
     /// all behaves exactly like the pre-#844 baseline: an ordinary,
     /// untracked computed result.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_reduce_foreach_never_derived_from_tracked_var_1440() {
         query!(
@@ -157933,7 +159273,6 @@ mod tests {
     /// result carries *directly* into EXTRACT (no reset), but a computed
     /// (untracked) UPDATE result leaves the register wherever it already
     /// was rather than clearing it — see `FoldRegister::advance`.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_foreach_register_advance_within_one_step_1440() {
         assert_eq!(
@@ -157972,7 +159311,6 @@ mod tests {
     /// The register resets between *source elements* for `foreach` too,
     /// exactly like `reduce`'s own per-iteration reset — the within-one-step
     /// UPDATE→EXTRACT chain above is the only place it carries forward.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_foreach_register_resets_between_source_elements_1440() {
         query!(
@@ -157993,7 +159331,6 @@ mod tests {
     /// this becomes the terminal (untracked) value; for `foreach` it
     /// simply never emits since there is no UPDATE output for EXTRACT (or
     /// the implicit identity extract) to run on.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_reduce_foreach_empty_update_1440() {
         query!(br#"{"a":1}"#, "path(reduce (1,2) as $i (.; empty))",
@@ -158007,7 +159344,6 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_2079_path_reduce_ordinary_linear_fold_over_10001_elements_succeeds() {
         // #2079: `resolve_reduce` (path-mode) has its own separate
@@ -158022,7 +159358,6 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_2079_path_foreach_ordinary_linear_fold_over_10001_elements_succeeds() {
         // #2079: same fix, `resolve_foreach`'s own path-mode loop. Each
@@ -158040,7 +159375,6 @@ mod tests {
     /// vs. `foreach` (streams it), a mid-fold error aborts cleanly, and a
     /// `break` reaches an outer `label` rather than being swallowed
     /// (#824's contract, mirrored from `Expr::As`'s own arm).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_reduce_foreach_escapes_and_partial_prefix_1440() {
         // INIT partial: the fork already produced from `.a` survives, then
@@ -158122,7 +159456,6 @@ mod tests {
     /// unwinding; `main` reported "Invalid path expression with result 1"
     /// at exit 5 instead of emitting anything. All rows captured live
     /// against jq 1.7.1.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_foreach_extract_comma_break_reestablishes_register_3099() {
         // The issue's own repro, EXTRACT stage, label outside `path()`.
@@ -158217,7 +159550,6 @@ mod tests {
     /// golden compares whole streams while these assert the *prefix
     /// length*, which is what a `Keep::First` regression in
     /// `drive_fold_source` would silently shorten.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_fold_source_streams_prefix_before_fatal_escape_1872() {
         // The issue's own repro: elements `1` and `2` fold and emit, then
@@ -158292,7 +159624,6 @@ mod tests {
     /// stop-after-first leaf. These are the shapes that would change if it
     /// ever leaked out of a fold source into `resolve_dynamic_indexes`'s
     /// own entry.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_fold_source_keep_all_does_not_leak_to_path_consumers_1872() {
         query!(
@@ -158315,7 +159646,6 @@ mod tests {
     /// `reduce`'s own INIT-fork behavior: each INIT output forks the whole
     /// construct into an independent path, exactly mirroring
     /// `eval_reduce`'s own value-position fork semantics.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_reduce_init_forks_1440() {
         assert_eq!(
@@ -158331,7 +159661,6 @@ mod tests {
     /// nested folds — the register mechanism is purely local to each
     /// `resolve_reduce`/`resolve_foreach` call, so nesting composes for
     /// free with no special-casing.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_reduce_foreach_composition_1440() {
         assert_eq!(
@@ -158375,7 +159704,6 @@ mod tests {
     /// target too, not just for `path()` itself — `resolve_reduce`/
     /// `resolve_foreach` are reached from the same `resolve_dynamic_indexes`
     /// entry point `=`/`del()`/`|=` all share.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_reduce_foreach_write_side_1440() {
         assert_eq!(
@@ -158396,7 +159724,6 @@ mod tests {
     /// must shadow it inside UPDATE, not accidentally resolve the outer
     /// binding — `substitute_pattern`'s own untracked substitution for the
     /// loop variable already handles this; this pins the negative case.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_reduce_pattern_shadowing_outer_var_1440() {
         query!(
@@ -158419,7 +159746,6 @@ mod tests {
     /// regression pin on correctness at scale rather than a wall-clock
     /// benchmark (too flaky for a unit test, same rationale as `_844`'s
     /// own doc comment).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_reduce_foreach_tracks_a_large_loop_1440() {
         let json = br#"{"a":1}"#;
@@ -158466,7 +159792,6 @@ mod tests {
     /// names the matching alternative doesn't bind. Those rows assert jq's
     /// answers rather than a refusal; the fallback they used to take is yq
     /// mode's alone now.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_reduce_foreach_path_dispatch_falls_back_1440() {
         let refuses = |src: &str| {
@@ -158539,7 +159864,6 @@ mod tests {
     /// `(., 1)`, the asymmetric source, is pinned by #3334's own tests: that
     /// fix splits a comma source per leaf, so each output is judged by the
     /// leaf that produced it.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_comma_fanned_source_recognizes_every_identity_branch_3127() {
         for (doc, filter, want) in [
@@ -159004,7 +160328,6 @@ mod tests {
     /// echoed; row 1 on `main`, rows 2-4 once #3120 let the walk answer).
     /// The stage's frame now carries the register into the nested pipe, so
     /// every row writes exactly what jq writes.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_nested_try_body_keeps_the_register_3133() {
         for (doc, filter, want) in [
@@ -159062,7 +160385,6 @@ mod tests {
     /// fold's SOURCE resolves through the path register. Every row here is
     /// confirmed live against jq 1.7.1 (the issue's own repro, plus the
     /// follow-up probes that pinned the `None`-register seeding rule).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_fold_pattern_destructuring_tracks_register_2676() {
         let doc: &[u8] = br#"{"a":[1,2,3],"b":{"c":5}}"#;
@@ -159309,7 +160631,6 @@ mod tests {
     /// format specifier — the same accommodation
     /// `test_reduce_foreach_path_dispatch_falls_back_1440` already makes. The
     /// golden fixtures keep the issue's own unspaced spelling verbatim.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_fold_register_rejects_reconstruction_1466() {
         for filter in [
@@ -159345,7 +160666,6 @@ mod tests {
     /// pointer and refuses. A reconstructed number refuses too — `1` is not
     /// identical to a `1` that came from the document, even though they are
     /// equal.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_fold_register_identity_by_value_kind_1466() {
         // Accepted: the register's value is `null`/`true`/`false` and the
@@ -159421,7 +160741,6 @@ mod tests {
     /// having an equal value elsewhere changes nothing either way — the
     /// check is about how the value was reached, never about how many
     /// places hold one like it.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_fold_register_accepts_navigation_1466() {
         let json = br#"{"a":{"b":1},"c":{"b":1}}"#;
@@ -159442,7 +160761,6 @@ mod tests {
     /// own arm cannot certify, since it compares against the ambient input
     /// rather than the register. This is what a value-blind provenance model
     /// would have lost; these are all `[]` in jq.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_fold_register_accepts_variable_snapshot_1466() {
         let json = br#"{"a":1}"#;
@@ -159522,7 +160840,6 @@ mod tests {
     /// "general rule, not a narrow patch" reasoning required, each
     /// independently confirmed against jq 1.7.1 and each a case pristine
     /// `main` (pre-#1591) refuses that jq accepts.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_fold_register_accepts_variable_snapshot_through_combinators_1591() {
         // The issue's own repro, read side.
@@ -159612,7 +160929,6 @@ mod tests {
     /// should ever demote), and confirms the ordinary accept/refuse cases
     /// this change must not regress — each independently confirmed against
     /// jq 1.7.1, and each a case pristine `main` (pre-#1590) gets wrong.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_fold_register_resolve_per_step_provenance_1590() {
         // The issue's own repro, read side.
@@ -159699,7 +161015,6 @@ mod tests {
     /// (`.a` on `$x`'s value, `1`, is not itself a further path-shaped
     /// value) instead of `#843`'s "near attempt" message. Confirmed live
     /// against jq 1.7.1: byte-identical message and exit code.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_resolve_recurse_sink_field_navigation_into_snapshot_wording_gap_1591() {
         query!(br#"{"a":1}"#,
@@ -159734,7 +161049,6 @@ mod tests {
     /// An empty fold emits INIT's own accumulator without ever running a
     /// step, so final emission's provenance has to come from INIT's own
     /// branch rather than from a last-step result that never existed.
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_fold_register_empty_fold_final_emission_1466() {
         assert_eq!(
@@ -161473,7 +162787,6 @@ mod tests {
 /// build that has nothing to share, so the module is gated like the pins in
 /// `value.rs`.
 #[cfg(test)]
-#[cfg(not(feature = "unshared-containers"))]
 mod share_audit_2999 {
     use alloc::collections::BTreeMap;
 
@@ -163285,8 +164598,10 @@ mod touched_edge_cases_2999 {
                 let index = JsonIndex::build(json);
                 // A fold accumulator re-indexed on every step is still refused (#5554); a loop
                 // variable handed on as itself is not (`last(f)` since #5516, `. + [$x]` since
-                // #5540), and answers as jq does.
-                let program = "reduce range(500) as $i (0; [.]) | length";
+                // #5540), and answers as jq does. `[.]` is built on the moved accumulator now
+                // (#5875), so the step is one the owned route declines: `empty` is not a closed
+                // member, and `[., empty]` is `[.]` to jq.
+                let program = "reduce range(500) as $i (0; [., empty]) | length";
                 let expr = parse(program).expect("parse");
                 let result = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
                 let refused = matches!(
@@ -165990,5 +167305,135 @@ mod named_args_shared_tests_5690 {
         let n = OwnedValue::Int(7);
         let substituted = substitute_named_args(&parse("$n + 1").unwrap(), [("n", &n)]);
         assert!(!holds_marker(&substituted));
+    }
+
+    /// #5875: `[.]`, `[., <closed>…]` and `{<key>: .}` as a fold's UPDATE are built on the moved
+    /// state, not on a re-indexed copy of it, so a fold of `N` steps is `O(N)`. The new container
+    /// holds the very storage the step was handed. Anything else -- a second read of `.`, a member
+    /// that is not closed or yields other than one value, a yq program, a live embed table --
+    /// hands the state back untouched for the evaluator.
+    #[test]
+    #[cfg(feature = "std")]
+    fn owned_update_step_builds_a_constructor_around_the_state_5875() {
+        use crate::jq::eval_generic::embed_table_push;
+
+        let state = || {
+            OwnedValue::object_from([(
+                "q".to_string(),
+                OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+            )])
+        };
+        let arr = OwnedValue::array_from;
+        let obj = |rows: Vec<(&str, OwnedValue)>| {
+            OwnedValue::object_from(rows.into_iter().map(|(k, v)| (k.to_string(), v)))
+        };
+        let step = |src: &str| owned_update_step::<JqSemantics>(&parse(src).unwrap(), state());
+        for (src, want) in [
+            ("[.]", arr(vec![state()])),
+            ("([.])", arr(vec![state()])),
+            (
+                "[., 5, \"x\"]",
+                arr(vec![state(), OwnedValue::Int(5), OwnedValue::string("x")]),
+            ),
+            ("[7, .]", arr(vec![OwnedValue::Int(7), state()])),
+            (
+                "[1, ., null, [2]]",
+                arr(vec![
+                    OwnedValue::Int(1),
+                    state(),
+                    OwnedValue::Null,
+                    arr(vec![OwnedValue::Int(2)]),
+                ]),
+            ),
+            ("{a: .}", obj(vec![("a", state())])),
+            (
+                "{a: 1, b: .}",
+                obj(vec![("a", OwnedValue::Int(1)), ("b", state())]),
+            ),
+            ("{(\"k\" + \"2\"): .}", obj(vec![("k2", state())])),
+            // A repeated key keeps its first position and takes the last value, as jq does.
+            ("{a: 1, a: .}", obj(vec![("a", state())])),
+            ("{a: ., a: 2}", obj(vec![("a", OwnedValue::Int(2))])),
+            (
+                "{b: 1, a: ., b: 3}",
+                obj(vec![("b", OwnedValue::Int(3)), ("a", state())]),
+            ),
+            // A member that reads a scalar off the state is settled before the state moves (#5893).
+            ("[., length]", arr(vec![state(), OwnedValue::Int(1)])),
+            ("[length, .]", arr(vec![OwnedValue::Int(1), state()])),
+            (
+                "[., (.|type), 7]",
+                arr(vec![
+                    state(),
+                    OwnedValue::string("object"),
+                    OwnedValue::Int(7),
+                ]),
+            ),
+            (
+                "{a: ., n: length}",
+                obj(vec![("a", state()), ("n", OwnedValue::Int(1))]),
+            ),
+            ("{(.q|type): .}", obj(vec![("array", state())])),
+            // A container read off the state comes from a rebuilt copy of it: correct, and not
+            // linear, since the rebuild is `O(state)`.
+            (
+                "[., .q]",
+                arr(vec![
+                    state(),
+                    arr(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+                ]),
+            ),
+        ] {
+            let OwnedStep::Handled(Ok(got)) = step(src) else {
+                panic!("not handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step declined a constructor UPDATE the test lists as handled (#5875)"
+            };
+            assert_eq!(got, want, "{src}");
+        }
+
+        // The element is the state's own storage, not a copy of it.
+        let held = state();
+        let OwnedStep::Handled(Ok(OwnedValue::Array(items))) =
+            owned_update_step::<JqSemantics>(&parse("[.]").unwrap(), held.clone())
+        else {
+            panic!("`[.]` was not handled"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step declined `[.]`, which the loop above also asserts (#5875)"
+        };
+        assert!(items[0].shares_storage_with(&held), "the state was copied");
+
+        for src in [
+            "[1]",
+            "[., .]",
+            "[., empty]",
+            "[., (1, 2)]",
+            "[., error(\"x\")]",
+            "[.[]]",
+            "[.q]",
+            "{a: .q}",
+            "{a: (., .)}",
+            "{(.): 1}",
+            "{a: 1}",
+            "{a: 1} | .",
+            "[.] | length",
+        ] {
+            let OwnedStep::Declined(back) = step(src) else {
+                panic!("handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step answered a constructor UPDATE the test lists as declined (#5875)"
+            };
+            assert_eq!(back, state(), "{src}: the declined state is untouched");
+        }
+
+        // yq builds its constructors with presentation, which this step does not carry.
+        assert!(matches!(
+            owned_update_step::<YqSemantics>(&parse("[.]").unwrap(), state()),
+            OwnedStep::Declined(_)
+        ));
+
+        // A registered container is the table's to witness; a container built around it would
+        // hide it.
+        let mut bound = state();
+        let origin = BindOrigin::Node {
+            node: 7,
+            document: 42,
+        };
+        let _guard = embed_table_push::<JqSemantics>(Some(&origin), &mut bound);
+        assert!(matches!(step("[.]"), OwnedStep::Declined(_)));
     }
 }

@@ -8,7 +8,6 @@ use anyhow::Result;
 /// naming the state on `{"a":null}` and `{"a":true}` where jq answers `[]`, and on `{"a":null}` a `.a` EXTRACT under a `?` let
 /// the index error escape where jq answers `[]`. Rows captured from jq 1.7.1 (stdout, first stderr line, exit code), both
 /// routes, over `path`, `[path(..)?]`, `del` and `|=` with `.`, `$i`, `empty` and `.a` EXTRACTs.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_foreach_if_dot_label_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -243,7 +242,6 @@ fn test_caught_foreign_marker_destructure_foreach_if_dot_label_4800() -> Result<
 /// naming the state on `{"a":null}` and `{"a":true}` where jq answers `[]`, and on `{"a":null}` a `.a` EXTRACT under a `?` let
 /// the index error escape where jq answers `[]`. Rows captured from jq 1.7.1 (stdout, first stderr line, exit code), both
 /// routes, over `path`, `[path(..)?]`, `del` and `|=` with `.`, `$i`, `empty` and `.a` EXTRACTs.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_foreach_if_dot_label_comma_select_false_4800(
 ) -> Result<()> {
@@ -479,7 +477,6 @@ fn test_caught_foreign_marker_destructure_foreach_if_dot_label_comma_select_fals
 /// naming the state on `{"a":null}` and `{"a":true}` where jq answers `[]`, and on `{"a":null}` a `.a` EXTRACT under a `?` let
 /// the index error escape where jq answers `[]`. Rows captured from jq 1.7.1 (stdout, first stderr line, exit code), both
 /// routes, over `path`, `[path(..)?]`, `del` and `|=` with `.`, `$i`, `empty` and `.a` EXTRACTs.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_foreach_if_dot_comma_empty_after_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -714,7 +711,6 @@ fn test_caught_foreign_marker_destructure_foreach_if_dot_comma_empty_after_4800(
 /// naming the state on `{"a":null}` and `{"a":true}` where jq answers `[]`, and on `{"a":null}` a `.a` EXTRACT under a `?` let
 /// the index error escape where jq answers `[]`. Rows captured from jq 1.7.1 (stdout, first stderr line, exit code), both
 /// routes, over `path`, `[path(..)?]`, `del` and `|=` with `.`, `$i`, `empty` and `.a` EXTRACTs.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_foreach_if_dot_comma_empty_before_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

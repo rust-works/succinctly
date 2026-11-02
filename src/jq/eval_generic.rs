@@ -104,7 +104,9 @@ use super::tail_call::{
     bind_next, body_is_reusable, pipe_settles_before_last, stage_settles, tail_def, tail_reachable,
     Tail, TailRounds,
 };
-use super::value::{owned_value_eq, subarray_indices, NumberRepr, ObjectMapOf, OwnedValue};
+use super::value::{
+    owned_value_eq, subarray_indices, NumberRepr, ObjectMapOf, OwnedValue, Teardown,
+};
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
 /// [`to_owned_with_comments`] (#998).
@@ -279,16 +281,20 @@ pub fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Opt
 /// [`MAX_NESTING_DEPTH`] (document nesting) *or*
 /// [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) (a value a
 /// filter built past the tree ceiling, which `yq_runner.rs`'s emission and
-/// presentation walks assert on after evaluation has already succeeded).
+/// presentation walks assert on after evaluation has already succeeded) --
+/// or the native-stack floor that replaces the tree ceiling under
+/// [`with_value_depth_on_stack_floor`](super::with_value_depth_on_stack_floor)
+/// ([`STACK_FLOOR_NESTING_MESSAGE`](super::value::STACK_FLOOR_NESTING_MESSAGE), #5554).
 /// `None` for any other panic, which a caller must still `resume_unwind`.
 pub fn depth_guard_panic_message(payload: &(dyn core::any::Any + Send)) -> Option<String> {
     let text = payload
         .downcast_ref::<String>()
         .map(String::as_str)
         .or_else(|| payload.downcast_ref::<&str>().copied())?;
-    [MAX_NESTING_DEPTH, super::value::MAX_VALUE_TREE_DEPTH]
+    ([MAX_NESTING_DEPTH, super::value::MAX_VALUE_TREE_DEPTH]
         .into_iter()
         .any(|max| text == super::value::nesting_depth_exceeded_message(max))
+        || text == super::value::STACK_FLOOR_NESTING_MESSAGE)
         .then(|| text.to_string())
 }
 
@@ -1451,18 +1457,18 @@ pub fn validate_cursor<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Resul
 /// the shadow. One definition every materializer shares, so the walks cannot disagree about which
 /// mode keeps what (#1344).
 #[doc(hidden)]
-pub struct ObjectBuilder<V> {
+pub struct ObjectBuilder<V: Teardown> {
     plain: IndexMap<String, V>,
     shadowed: Option<ObjectMapOf<V>>,
 }
 
-impl<V: Clone> Default for ObjectBuilder<V> {
+impl<V: Clone + Teardown> Default for ObjectBuilder<V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<V: Clone> ObjectBuilder<V> {
+impl<V: Clone + Teardown> ObjectBuilder<V> {
     #[inline]
     pub fn new() -> Self {
         Self::with_capacity(0)
@@ -1568,7 +1574,7 @@ impl SiblingShape {
 /// the value itself ([`BuildOwned`]) or nothing ([`CheckOnly`], #3156). The
 /// walk -- every check, in the same order -- is the same for both.
 trait CursorWalkOutput {
-    type Out: Clone;
+    type Out: Clone + Teardown;
     /// Whether the walk keeps the members it reads. `false` lets the object
     /// arm skip the per-key `String` and the per-object collision map, which
     /// are all a walk that builds nothing would spend them on (#3478).
@@ -1630,6 +1636,8 @@ impl CursorWalkOutput for BuildOwned {
 
 /// [`validate_cursor`]'s output: nothing, dropped as it goes.
 struct CheckOnly;
+
+impl Teardown for () {}
 
 impl CursorWalkOutput for CheckOnly {
     type Out = ();
@@ -2417,6 +2425,196 @@ fn cursor_is_null<V: DocumentValue>(value: &V, cursor: Option<&V::Cursor>) -> bo
 /// checking defensively costs nothing and avoids relying on that
 /// invariant). `as_array`/`as_object` are last since every scalar arm above
 /// already excludes them.
+/// A builtin yq applies to strings only, by the wording of its refusal (#5836).
+#[derive(Clone, Copy)]
+enum YqStringOp {
+    Split,
+    Substitute,
+    Match,
+    ChangeCase,
+    Trim,
+    Base64,
+    Uri,
+}
+
+impl YqStringOp {
+    fn of_builtin(builtin: &Builtin) -> Option<Self> {
+        Some(match builtin {
+            Builtin::Split(_) | Builtin::SplitRegex(..) => Self::Split,
+            Builtin::Sub(..) | Builtin::SubFlags(..) => Self::Substitute,
+            Builtin::Test(_)
+            | Builtin::TestFlags(..)
+            | Builtin::Match(_)
+            | Builtin::MatchFlags(..)
+            | Builtin::Capture(_)
+            | Builtin::CaptureFlags(..) => Self::Match,
+            Builtin::AsciiUpcase | Builtin::AsciiDowncase => Self::ChangeCase,
+            Builtin::Trim => Self::Trim,
+            _ => return None,
+        })
+    }
+
+    fn of_format(format: &FormatType) -> Option<Self> {
+        match format {
+            FormatType::Base64 => Some(Self::Base64),
+            // yq's `@sh` refuses with its `@uri` wording.
+            FormatType::Uri | FormatType::Sh => Some(Self::Uri),
+            _ => None,
+        }
+    }
+
+    /// yq v4.53.3's error for an input tagged `tag`.
+    fn refusal(self, tag: &str) -> String {
+        const HINT: &str = "Hint: Most often you'll want to use '|=' over '=' for this operation";
+        match self {
+            Self::Split => format!("cannot split {tag}, can only split strings"),
+            Self::Substitute => {
+                format!("cannot substitute with {tag}, can only substitute strings. {HINT}")
+            }
+            Self::Match => format!("cannot match with {tag}, can only match strings. {HINT}"),
+            Self::ChangeCase => {
+                format!("cannot change case with {tag}, can only operate on strings. ")
+            }
+            Self::Trim => format!("cannot trim {tag}, can only operate on strings. "),
+            Self::Base64 => format!("cannot encode {tag} as base64, can only operate on strings"),
+            Self::Uri => format!(
+                "cannot encode {tag} as URI, can only operate on strings. Please first pipe \
+                 through another encoding operator to convert the value to a string"
+            ),
+        }
+    }
+}
+
+/// The tag yq names when a string builtin refuses this input, or `None` when it accepts it: the
+/// node's tag (`!!merge`, `!!binary`, `!!int`, a custom `!foo`) unless the type yq reads from it is
+/// a string. A custom tag reads as the value's own type, so `!foo x` is a string and `!foo 5` is
+/// refused as `!foo`. An alias node is left to the builtin.
+fn yq_string_input_tag<V: DocumentValue>(
+    op: YqStringOp,
+    value: &V,
+    cursor: Option<V::Cursor>,
+) -> Option<String> {
+    // The common case first. A document's plain scalar reads as text whatever it resolves to, so
+    // an untagged one is accepted here only if its first byte can start none of a null, a bool, a
+    // number, a date or `<<` (`~`, `t`/`f`/`n` in any case, a digit, a sign, `.`, `<`); the rest
+    // take the full reading below.
+    if cursor.map_or(true, |c| c.explicit_tag().is_none()) {
+        if let Some(text) = value.as_str() {
+            let can_be_typed = text.as_bytes().first().map_or(true, |b| {
+                matches!(
+                    b,
+                    b'<' | b'0'
+                        ..=b'9'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'~'
+                            | b't'
+                            | b'T'
+                            | b'f'
+                            | b'F'
+                            | b'n'
+                            | b'N'
+                )
+            });
+            if !can_be_typed {
+                return None;
+            }
+        }
+    }
+    // A string that does not decode (`"\ud83d"`) is the builtin's to report.
+    if value.string_decode_error().is_some() {
+        return None;
+    }
+    let named = yq_type_tag(value, cursor);
+    if named.is_empty() {
+        return None;
+    }
+    // yq's `split` passes a null through (`null | split(",")` is nothing).
+    if matches!(op, YqStringOp::Split) && named == "!!null" {
+        return None;
+    }
+    let read_as = if named.starts_with("!!") {
+        named.as_str()
+    } else {
+        document_value_type_tag(value)
+    };
+    (read_as != "!!str").then_some(named)
+}
+
+/// yq's refusal of a string builtin on a non-string input (#5836), or `None` to evaluate it.
+///
+/// yq evaluates the arguments it reads and checks the pattern and flags before the input, so an
+/// argument's error (`test(error(.))`), a bad flag or a pattern that does not compile is the
+/// answer when there is one. Each argument is evaluated on the real input, then the builtin runs
+/// once on the empty string with those values in place; only its own input is swapped.
+fn yq_string_op_refusal<S: EvalSemantics, V: DocumentValue>(
+    op: YqStringOp,
+    expr: &Expr,
+    value: &V,
+    cursor: Option<V::Cursor>,
+) -> Option<GenericResult<V>> {
+    let tag = yq_string_input_tag(op, value, cursor)?;
+    if let Expr::Builtin(builtin) = expr {
+        let mut failed = None;
+        let probe = yq_string_op_probe(builtin, |arg| {
+            if failed.is_some() {
+                return None;
+            }
+            // `collect_owned` answers an error as no values, so it is taken here first.
+            let result = match eval_single::<S, V>(arg, value.clone(), false, cursor) {
+                GenericResult::Error(e) => Err(e),
+                other => other.collect_owned::<S>(),
+            };
+            match result {
+                Ok(values) => values.into_iter().next().map(Expr::tracked_value),
+                Err(e) => {
+                    failed = Some(e);
+                    None
+                }
+            }
+        });
+        if let Some(e) = failed {
+            return Some(GenericResult::Error(e));
+        }
+        // An argument with no value leaves nothing to check; the builtin answers it.
+        let probe = probe?;
+        if let GenericResult::Error(e) = eval_on_owned::<S, V>(
+            &Expr::Builtin(probe),
+            OwnedValue::String(String::new().into()),
+            false,
+            Reentry::REBUILT,
+        ) {
+            return Some(GenericResult::Error(e));
+        }
+    }
+    Some(GenericResult::Error(EvalError::new(op.refusal(&tag))))
+}
+
+/// `builtin` with each argument yq evaluates replaced by `arg`'s answer for it, or `None` if one
+/// has none. yq's `split(a; b)` reads neither argument and its `sub(re; r; flags)` only the pattern
+/// (both reproduced here), so those stand as `null`.
+fn yq_string_op_probe(
+    builtin: &Builtin,
+    mut arg: impl FnMut(&Expr) -> Option<Expr>,
+) -> Option<Builtin> {
+    let mut read = |e: &Expr| arg(e).map(Box::new);
+    let unread = || Box::new(Expr::tracked_value(OwnedValue::Null));
+    Some(match builtin {
+        Builtin::Split(sep) => Builtin::Split(read(sep)?),
+        Builtin::SplitRegex(..) => Builtin::SplitRegex(unread(), unread()),
+        Builtin::Sub(re, replacement) => Builtin::Sub(read(re)?, read(replacement)?),
+        Builtin::SubFlags(re, ..) => Builtin::SubFlags(read(re)?, unread(), unread()),
+        Builtin::Test(re) => Builtin::Test(read(re)?),
+        Builtin::TestFlags(re, flags) => Builtin::TestFlags(read(re)?, read(flags)?),
+        Builtin::Match(re) => Builtin::Match(read(re)?),
+        Builtin::MatchFlags(re, flags) => Builtin::MatchFlags(read(re)?, read(flags)?),
+        Builtin::Capture(re) => Builtin::Capture(read(re)?),
+        Builtin::CaptureFlags(re, flags) => Builtin::CaptureFlags(read(re)?, read(flags)?),
+        other => other.clone(),
+    })
+}
+
 fn document_value_type_tag<V: DocumentValue>(value: &V) -> &'static str {
     if value.is_null() {
         "!!null"
@@ -2518,15 +2716,62 @@ fn yq_type_tag<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> String
         // `!!null`, `! [a]` is `!!seq`. Reporting it as `!` was already wrong
         // for plain navigation (`.[0] | tag`); a selector that hands the node
         // on (#3690) made it visible one step further.
-        if let Some(tag) = c
-            .explicit_tag()
-            .filter(|tag| *tag != "!")
-            .map(str::to_string)
-        {
-            return tag;
+        if let Some(tag) = c.explicit_tag().filter(|tag| *tag != "!") {
+            // A verbatim tag is reported as what it spells, a core one in its `!!` form
+            // (`!<tag:yaml.org,2002:binary>` is `!!binary`, `!<!foo>` is `!foo`), as yq reports it
+            // (#5836).
+            return match tag
+                .strip_prefix("!<")
+                .and_then(|rest| rest.strip_suffix('>'))
+            {
+                Some(spelled) => match spelled.strip_prefix("tag:yaml.org,2002:") {
+                    Some(core) => format!("!!{core}"),
+                    None => spelled.to_string(),
+                },
+                None => tag.to_string(),
+            };
+        }
+        if let Some(tag) = plain_merge_tag(&c, value) {
+            return tag.to_string();
+        }
+        if plain_timestamp(&c, value) {
+            return "!!timestamp".to_string();
         }
     }
     document_value_type_tag(value).to_string()
+}
+
+/// Whether `cursor` is a plain scalar go-yaml resolves to `!!timestamp` (`2001-12-14`,
+/// `2001-12-14T21:59:43.10-05:00`), which yq reports as its tag and its string builtins refuse
+/// (#5836). A quoted date and a JSON string are strings. The first byte is checked before the
+/// node's style, so a string that cannot be a date costs one compare.
+fn plain_timestamp<C: DocumentCursor, V: DocumentValue>(cursor: &C, value: &V) -> bool {
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    text.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        && !cursor.canonicalize_numbers()
+        && cursor.style().is_empty()
+        && crate::yaml::go_yaml_resolved_tag(&text) == "!!timestamp"
+}
+
+/// `!!merge` for a plain `<<` scalar, the tag YAML resolves it to wherever it sits, value or key,
+/// which yq reports (`tag`, `type`) and writes (`a: !!merge <<`, #5833); `None` for anything
+/// else. A quoted `"<<"` and a JSON string are `!!str`, and so is a plain scalar that only starts
+/// with `<<` (`run: << EOF`). The source text is checked first, so a node not spelled `<<` costs
+/// two byte compares and no decode.
+pub(crate) fn plain_merge_tag<C: DocumentCursor, V: DocumentValue>(
+    cursor: &C,
+    value: &V,
+) -> Option<&'static str> {
+    let pos = cursor.text_position()?;
+    if cursor.doc_text().get(pos..pos + 2) != Some(b"<<".as_slice()) {
+        return None;
+    }
+    // Text that starts with `<<` and decodes to exactly `<<` is the plain scalar `<<`: a quoted one
+    // starts with its quote, and a block mapping whose first key is `<<` starts at the same byte
+    // but is no string. An alias resolves to its anchor's node, which is not this one.
+    (!cursor.is_alias() && value.as_str().as_deref() == Some("<<")).then_some("!!merge")
 }
 
 /// Which YAML anchor/alias syntax a node carried in the source document
@@ -3516,9 +3761,12 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             if child_under_alias {
                 None
             } else {
-                cursor
-                    .and_then(DocumentCursor::explicit_tag_of_non_alias)
-                    .map(str::to_string)
+                cursor.and_then(|c| {
+                    c.explicit_tag_of_non_alias()
+                        // Only a plain node can be one; the style is already in hand.
+                        .or_else(|| own_style.is_empty().then(|| plain_merge_tag(c, value))?)
+                        .map(str::to_string)
+                })
             },
             None,
         ),
@@ -3649,10 +3897,17 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             } else {
                 DocumentCursor::alias(&field.key_cursor).map(str::to_string)
             };
+            // #5813: an alias key has no quoting of its own; the anchor's node holds it, and
+            // `*a : 1` printed as its text (`"true": 1`) must still read back as a string.
+            let key_style = if key_alias.is_some() {
+                field.key_cursor.alias_target_style()
+            } else {
+                field.key_cursor.style()
+            };
             if let Some(meta) = KeyMeta::with_alias(
                 key_comment,
                 value_absent,
-                field.key_cursor.style(),
+                key_style,
                 key_anchor,
                 key_tag,
                 key_alias,
@@ -5038,7 +5293,17 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     depth: usize,
 ) -> Result<OwnedValue, EvalError> {
     use crate::json::light::StandardJson;
-    guard_nesting_depth(depth)?;
+    // Under the native-stack floor (the CLI arms it for the whole run, #5554, #5876) this converts
+    // a value the evaluator built (a fold's accumulator, an embedded `[.]`), and an input
+    // document is already capped at 256 levels by its parser. The built value is then bounded as
+    // every other walk over one is, by `MAX_VALUE_TREE_DEPTH` or by the floor: the document
+    // ceiling refused a value the output could print. Anywhere else (a library caller that did
+    // not opt in) nothing says the text is a built value, so the document ceiling stays.
+    if depth >= MAX_NESTING_DEPTH && super::eval::value_depth_floor_armed() {
+        super::value::check_value_tree_depth(depth)?;
+    } else {
+        guard_nesting_depth(depth)?;
+    }
     Ok(match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
@@ -9437,8 +9702,7 @@ mod embed_table {
     }
 
     /// How many lazy entries hold a value.
-    // The test that reads it is off in the `unshared-containers` holdout.
-    #[cfg(all(test, not(feature = "unshared-containers")))]
+    #[cfg(test)]
     pub(crate) fn lazy_filled() -> usize {
         LAZY.with(|l| l.borrow().iter().filter(|e| e.value.is_some()).count())
     }
@@ -14620,6 +14884,20 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // `eval_format`) -- found by code review to have been missed by
         // this issue's first pass, which fixed `eval_format` without
         // noticing it isn't on the path ordinary CLI usage takes.
+        // #5836: yq's `@base64`, `@uri` and `@sh` refuse an input whose tag is not `!!str`.
+        Expr::Format(format_type)
+            if S::TAG == EvalTag::Yq && YqStringOp::of_format(format_type).is_some() =>
+        {
+            let op = YqStringOp::of_format(format_type).unwrap_or(YqStringOp::Uri);
+            match yq_string_op_refusal::<S, V>(op, expr, &value, cursor) {
+                Some(refusal) => refusal,
+                None => format_result::<S, _>(
+                    format_type,
+                    &owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional),
+                    optional,
+                ),
+            }
+        }
         Expr::Format(format_type) => format_result::<S, _>(
             format_type,
             &owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional),
@@ -34657,6 +34935,16 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    // #5836: yq's string builtins refuse an input whose tag is not `!!str`.
+    if S::TAG == EvalTag::Yq {
+        if let Some(op) = YqStringOp::of_builtin(builtin) {
+            let whole =
+                whole.map_or_else(|| Cow::Owned(Expr::Builtin(builtin.clone())), Cow::Borrowed);
+            if let Some(refusal) = yq_string_op_refusal::<S, V>(op, &whole, &value, cursor) {
+                return refusal;
+            }
+        }
+    }
     // #2471 (gate reason 1 of spine 2416): a map-family body that reads path
     // context is evaluated once per member, at the member's own position.
     // Gated on `needs_path_context` so an ordinary `map_values(.+1)` never
@@ -34939,6 +35227,11 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 // below to check.
                 if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
                     return GenericResult::Error(err);
+                }
+                // #5918: yq's `map(f)` over an empty mapping is that mapping, not an empty
+                // sequence (`f` never runs, and `map(.) | tag` is `!!map`).
+                if S::TAG == EvalTag::Yq && fields.is_empty() {
+                    return GenericResult::One(value);
                 }
                 // `.[]` collapses a repeated key to its first position but
                 // last-seen value in both modes (#1398), which needs every
@@ -37503,6 +37796,10 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::Trunc
             | Builtin::TruncateStream(_)
             | Builtin::Tz(_)
+            // #5863: a timestamp computed from the node, and a scope whose outputs are
+            // materialized inside it.
+            | Builtin::FormatDatetime(_)
+            | Builtin::WithDtf(..)
             | Builtin::UpperIn(_)
             | Builtin::UpperInSrc(..)
             | Builtin::UpperIndex(_)
@@ -39913,6 +40210,14 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         }
     }
     let result = match family {
+        // #5918: yq's `map(f)` over an empty mapping is that mapping, as the unpositioned sites
+        // answer (`eval.rs`'s `builtin_map` and `eval_builtin_in`'s `Builtin::Map` arm).
+        MapFamily::Map
+            if S::TAG == EvalTag::Yq
+                && matches!(container, OwnedValue::Object(fields) if fields.is_empty()) =>
+        {
+            container.clone()
+        }
         MapFamily::Map => OwnedValue::array_from(array),
         MapFamily::MapValues => match container {
             OwnedValue::Array(_) => OwnedValue::array_from(array),
@@ -52113,6 +52418,38 @@ mod tests {
         );
     }
 
+    /// #5876: under the native-stack floor (which the CLI arms for the whole run) this converter
+    /// reads back a value the evaluator built, so it is bounded as every other walk over one is
+    /// -- by `MAX_VALUE_TREE_DEPTH`, or by the floor -- not by the document ceiling of 256. The
+    /// floor is registered on a thread with a real stack of the size it claims.
+    #[cfg(feature = "std")] // the floor is a no-op without `std`
+    #[test]
+    fn owned_from_standard_json_under_the_floor_is_bounded_by_the_value_tree_5876() {
+        use crate::jq::{with_stack_budget, with_value_depth_on_stack_floor, MAX_VALUE_TREE_DEPTH};
+        const STACK: usize = 32 * 1024 * 1024;
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(|| {
+                with_stack_budget(STACK, || {
+                    with_value_depth_on_stack_floor(|| {
+                        // Past the document ceiling, then past the value-tree constant: the floor
+                        // (half of 32 MiB) is nowhere near spent by a few hundred levels.
+                        for depth in [MAX_NESTING_DEPTH, MAX_VALUE_TREE_DEPTH + 100] {
+                            let json = linear_nest(depth);
+                            let index = JsonIndex::build(json.as_bytes());
+                            let cursor = index.root(json.as_bytes());
+                            let owned = owned_from_standard_json::<JqSemantics, _>(&cursor.value())
+                                .unwrap_or_else(|e| panic!("{depth} levels: {e:?}"));
+                            assert!(matches!(owned, OwnedValue::Object(_)), "{depth} levels");
+                        }
+                    });
+                });
+            })
+            .expect("spawn")
+            .join()
+            .expect("the converter answers under the floor");
+    }
+
     /// #1192: unlike `to_owned`/`to_owned_cursor` (this file, still silently
     /// degrading to `OwnedValue::Null` -- see
     /// `test_to_owned_degrades_to_null_on_string_decode_failure_1098` above)
@@ -55039,7 +55376,6 @@ mod tests {
     /// pins that: it was one per round (100 rounds over a 1.4 MB state cost
     /// 286 ms, jq 15 ms) and is now flat in the round count. The outputs are
     /// jq 1.7.1's (captured live).
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     #[allow(clippy::literal_string_with_formatting_args)] // STYLE-0004: jq object literals, not format strings
     fn test_until_while_owned_update_needs_no_reindex_per_round_3674() {
@@ -55578,6 +55914,36 @@ mod tests {
         }
     }
 
+    /// #5816: `ltrimstr`, `rtrimstr`, `tostring` and `. + "lit"` of an owned string step to their
+    /// string without writing it out and indexing it again, as a lone stage and as the head of a
+    /// pipe whose rest then runs on the string. `ascii_downcase` makes the string an owned value
+    /// and is the one crossing each row still pays, so a row is pinned to 1: a lost door shows as 2.
+    #[test]
+    fn test_string_stage_doors_need_no_second_reindex_5816() {
+        let doc = r#"{"s":"H\u00e9llo"}"#;
+        for (query, want) in [
+            // The lone stage: `eval_each_owned_front_doors`.
+            (r#".s | ascii_downcase | rtrimstr("o")"#, "\"h\u{e9}ll\""),
+            (r#".s | ascii_downcase | ltrimstr("h")"#, "\"\u{e9}llo\""),
+            (r#".s | ascii_downcase | . + "x""#, "\"h\u{e9}llox\""),
+            (".s | ascii_downcase | tostring", "\"h\u{e9}llo\""),
+            // The head of a pipe: the peel.
+            (r#".s | ascii_downcase | ltrimstr("h") | length"#, "4"),
+            (r#".s | ascii_downcase | rtrimstr("o") | length"#, "4"),
+            (".s | ascii_downcase | tostring | length", "5"),
+            (r#".s | ascii_downcase | . + "x" | length"#, "6"),
+            (
+                r#".s | ascii_downcase | ltrimstr("h") | startswith("\u00e9")"#,
+                "true",
+            ),
+            (r#".s | ascii_downcase | ltrimstr("h") | index("l")"#, "2"),
+        ] {
+            let (out, reindexes) = outputs_and_reindexes(doc, query);
+            assert_eq!(out, [want], "{query}");
+            assert_eq!(reindexes, 1, "{query}: the string stage door was lost");
+        }
+    }
+
     /// #5816: `test`, `index`, `rindex` and `inside` of a string literal read the owned string, from
     /// both owned entries and from an operand, so none of them writes it out and indexes it again.
     /// `ascii_downcase` makes the string an owned value and is the one crossing each row still
@@ -55738,9 +56104,6 @@ mod tests {
 
     /// #3477: a comma sequence that names a container node twice builds it
     /// once when it is materialized, and shares by node, never by value.
-    // Storage identity is what `unshared-containers` removes: a clone there
-    // deep-copies, so the pins below would read `false` for the wrong reason.
-    #[cfg(not(feature = "unshared-containers"))]
     #[test]
     fn test_comma_sequence_materialization_shares_a_repeated_node_3477() {
         let doc = r#"{"a":{"x":1},"b":{"x":1},"c":[1,2]}"#;
@@ -55810,11 +56173,8 @@ mod tests {
         assert_eq!(want, vec![OwnedValue::array_from(expected)]);
         // A node named twice is built once and shared; equal values at two
         // nodes are two builds.
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            assert!(items[0].shares_storage_with(&items[2]));
-            assert!(!items[0].shares_storage_with(&items[6]));
-        }
+        assert!(items[0].shares_storage_with(&items[2]));
+        assert!(!items[0].shares_storage_with(&items[6]));
     }
 
     /// #3856: a failing node is decoded only when something reads it, and then
@@ -56032,9 +56392,6 @@ mod tests {
 
     /// #3815: `[.. | parent?]` emits the root once per child, and the
     /// collection builds it once and shares it, by node and never by value.
-    // Storage identity is what `unshared-containers` removes: a clone there
-    // deep-copies, so the pins below would read `false` for the wrong reason.
-    #[cfg(not(feature = "unshared-containers"))]
     #[test]
     fn test_collected_parent_shares_a_repeated_ancestor_3815() {
         // Seventy inner arrays hold the root at the collection's 64-item
@@ -62142,8 +62499,8 @@ mod tests {
     /// `is_container` is "has BP children", so it is `false` for `{}`/`[]`,
     /// and the old `is_container()` gate never ran the `(node, document)`
     /// lookup for exactly the node a binding registered.
-    // `std` for the thread-local table; the holdout never shares storage.
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    // `std` for the thread-local table.
+    #[cfg(feature = "std")]
     #[test]
     fn embed_gate_finds_an_empty_container_binding_3180() {
         let doc = br#"{"a":{},"b":1}"#;
@@ -62302,7 +62659,7 @@ mod tests {
     /// it. A node below an already-bound ancestor anchors on that ancestor at
     /// once, with every step. A member a later duplicate key shadows gets no
     /// step, and so can never certify.
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     #[test]
     fn embed_anchor_pending_fill_and_steps_3134() {
         let doc = br#"{"a":{"b":1,"c":2},"x":[5,6],"d":1,"d":2}"#;
@@ -62453,7 +62810,7 @@ mod tests {
     /// escaped and undecodable keys, key nodes, empty and nested containers --
     /// and the count gate takes the fast path exactly when no member is
     /// shadowed.
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     #[test]
     fn anchor_step_by_nodes_agrees_with_the_generic_walk_3483() {
         type Cursor<'a> = crate::json::light::JsonCursor<'a, Vec<u64>>;
@@ -62519,7 +62876,7 @@ mod tests {
     /// cannot reach. An array refuses a node that is no child of it; a `held`
     /// that is neither an object nor an array declines; a format that does not
     /// claim one entry per child (YAML) declines and the generic walk answers.
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     #[test]
     fn anchor_step_by_nodes_refuses_and_declines_off_the_happy_path_3483() {
         // A node that is no child of an array: the array's own parent.
@@ -63157,8 +63514,8 @@ mod deferred_bind_tests_3856 {
     /// The lazy entry (#4036): the first materialization of the bound node
     /// builds it, every later one is handed the same `Rc`, and nothing but the
     /// materializer sees the entry.
-    // `std` for the thread-local table; the holdout never shares storage.
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    // `std` for the thread-local table.
+    #[cfg(feature = "std")]
     #[test]
     fn lazy_entry_fills_once_and_shares_the_copy_4036() {
         let doc = br#"{"a":[1,2],"b":{"c":3}}"#;
@@ -63201,7 +63558,7 @@ mod deferred_bind_tests_3856 {
     /// An entry for a body that reads the node once per element counts as a
     /// binding from its fill, not its first reuse; a yq evaluation never reads
     /// one (#4036).
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     #[test]
     fn sharing_entry_is_active_from_its_fill_and_jq_only_4036() {
         let doc = br#"{"a":[1,2]}"#;
@@ -63225,7 +63582,7 @@ mod deferred_bind_tests_3856 {
 
     /// Nested and shadowing entries for one node: the first build fills every
     /// entry waiting on it, and each guard pops its own (#4036).
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     #[test]
     fn lazy_entries_nest_and_pop_in_order_4036() {
         let doc = br#"{"a":[1,2]}"#;
@@ -63261,7 +63618,7 @@ mod deferred_bind_tests_3856 {
 
     /// A binding's entry coming and going does not take the lazy entry's claim
     /// on `active()` with it (#4036).
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[cfg(feature = "std")]
     #[test]
     fn lazy_entry_keeps_the_table_active_across_other_bindings_4036() {
         let doc = br#"{"a":{"b":[1]},"c":2}"#;

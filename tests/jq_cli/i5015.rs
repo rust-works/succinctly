@@ -15,7 +15,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// spellings, the `$x`, `.` and array-pattern binds, sources that leave the register on the root or move it, in
 /// `path`, `[path(..)?]`, `try .. catch`, `del`, `=` and `|=`. Every row captured from `/usr/bin/jq` 1.7.1 (stdout,
 /// first stderr line up to the container, exit code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5015_navigating_extract_after_a_bare_caught_bind_foreach_update() -> Result<()> {
@@ -256,7 +255,6 @@ fn test_5015_navigating_extract_after_a_bare_caught_bind_foreach_update() -> Res
 /// bind `foreach` UPDATE (object and array patterns, `try`/`?`/bare), over an `INIT` of `null` or a number, sources that
 /// leave the register on the root or move it, in `[path(..)?]` and `try path(..) catch`. Only rows `main` answered
 /// differently from jq, every one captured from `/usr/bin/jq` 1.7.1 (stdout, exit code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5015_plain_extract_after_a_bare_caught_bind_foreach_update_over_a_null_init() -> Result<()>
@@ -1459,7 +1457,6 @@ fn test_5015_plain_extract_after_a_bare_caught_bind_foreach_update_over_a_null_i
 /// restatement above leaves it alone: over an `INIT .` it names the root's path where jq's does (`["a"]` for the
 /// first row). Rows a review found `main` answering as jq does and the unrestricted restatement breaking. Every row
 /// captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5015_getpath_extract_after_a_bare_caught_bind_foreach_update_keeps_its_answer() -> Result<()>

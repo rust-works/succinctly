@@ -537,39 +537,45 @@ echo '"aaa"' | succinctly yq 'sub("a"; "X"; "g")'
 
 ### Date/Time Extensions
 
-Beyond jq's standard date functions (`now` stays ungated; `gmtime`, `localtime`,
-`mktime`, `strftime`, `strptime`, `todate`, `fromdate`, `todateiso8601`, and
-`fromdateiso8601` all need `--jq-extensions` -- see
-[Gated jq Builtins](#gated-jq-builtins---jq-extensions) for the full list), yq
-adds:
+Beyond jq's standard date functions (`gmtime`, `localtime`, `mktime`, `strftime`,
+`strptime`, `todate`, `fromdate`, `todateiso8601`, and `fromdateiso8601` all need
+`--jq-extensions` -- see [Gated jq Builtins](#gated-jq-builtins---jq-extensions) for
+the full list), yq has its own datetime operators (#5863). They work on a timestamp's
+text, read with Go's `time.Parse` under the current layout -- RFC 3339
+(`2006-01-02T15:04:05Z07:00`), with `2006-01-02` tried when that fails -- and written
+back with Go's `time.Format`:
 
-| Function        | Description                   | Example                             |
-|-----------------|-------------------------------|-------------------------------------|
-| `from_unix`     | Unix epoch to ISO 8601 string | `1705766400 \| from_unix`           |
-| `to_unix`       | ISO 8601 string to Unix epoch | `"2024-01-20T16:00:00Z" \| to_unix` |
-| `tz(zone)`      | Convert timestamp to timezone | `now \| tz("America/New_York")`     |
+| Operator                 | Description                                                          | Example                                   |
+|--------------------------|----------------------------------------------------------------------|-------------------------------------------|
+| `+` / `-` a duration     | Add or subtract a Go duration (`3h10m`, `1.5h`, `-24h`)              | `.time += "3h10m"`                        |
+| `format_datetime(f)`     | Write with Go layout `f`, read back as YAML (`"2006"` is a number)   | `.time \| format_datetime("Jan 2, 2006")` |
+| `tz(zone)`               | Move to a zone: `UTC`, `Local`, or an IANA name                      | `.time \| tz("America/New_York")`         |
+| `with_dtf(layout; expr)` | Use Go layout `layout` for every datetime operator inside `expr`     | `with_dtf("2006-01-02"; .d + "24h")`      |
+| `now`                    | The current time, RFC 3339 in the local zone                         | `.updated = now`                          |
+| `from_unix`              | Unix epoch to RFC 3339 in the local zone                             | `1705766400 \| from_unix`                 |
+| `to_unix`                | A timestamp read under the layout, to whole Unix seconds             | `.time \| to_unix`                        |
 
 ```bash
-# Convert Unix timestamp to datetime
-echo '1705766400' | succinctly yq 'from_unix'
-# Output: "2024-01-20T16:00:00Z"
+printf 'time: 2026-01-01T00:00:00Z\n' | succinctly yq '.time += "3h10m"'
+# time: 2026-01-01T03:10:00Z
 
-# Convert datetime to Unix timestamp
-echo '"2024-01-20T16:00:00Z"' | succinctly yq 'to_unix'
-# Output: 1705766400
+printf 'time: 2026-01-01T00:00:00Z\n' | succinctly yq '.time | format_datetime("Monday, 02-Jan-06 at 3:04PM MST")'
+# Thursday, 01-Jan-26 at 12:00AM UTC
 
-# Convert to specific timezone
-echo '1705314600' | succinctly yq 'tz("America/New_York")'
-# Output: "2024-01-15T05:30:00-05:00"
+printf 'time: 2026-01-01T00:00:00Z\n' | succinctly yq '.time | tz("Australia/Sydney")'
+# 2026-01-01T11:00:00+11:00
 
-echo '1705314600' | succinctly yq 'tz("Asia/Tokyo")'
-# Output: "2024-01-15T19:30:00+09:00"
+printf 'd: 2026-01-01\n' | succinctly yq 'with_dtf("2006-01-02"; .d += "48h")'
+# d: 2026-01-03
+
+TZ=UTC succinctly yq -n '0 | from_unix'
+# 1970-01-01T00:00:00Z
 ```
 
-**Supported timezone formats:**
-- IANA names: `America/New_York`, `Europe/London`, `Asia/Tokyo`
-- Abbreviations: `EST`, `PST`, `JST`, `CET`, `UTC`, `GMT`
-- Numeric offsets: `+05:30`, `-0800`, `+09`
+The local zone is `TZ` or the system zone. A string counts as a timestamp when it reads as
+RFC 3339 or `2006-01-02`, quoted or not, where yq goes by the `!!timestamp` tag; see
+[docs/compliance/yq/limitations.md](../compliance/yq/limitations.md) for that and the
+other differences.
 
 ### Format Encoders
 
@@ -866,14 +872,13 @@ cursor.column()   // usize - 1-based column number
 
 ## Known Limitations
 
-See [yq Remaining Work](../plan/yq-remaining.md) for incomplete features.
+See [yq Remaining Work](../plan/yq-remaining.md) for the yq operators, encoders and flags not yet supported.
 
 ### Intentionally Not Implemented
 
 1. **XML/TOML input/output** - Out of scope (separate tools)
 2. **Comment preservation** - trailing (`# c`) comments, anchors, style and standalone head/foot comment lines all survive every YAML route now (the streaming route, `-P`, and a write like `.a = 5`/`del(.b)` -- #2795 PR A/B); `--header-preprocess=false` is not implemented (the default header slurping is), and the DOM route's verbatim header reproduction has known gaps -- see [limitations.md](../compliance/yq/limitations.md)
-3. **Merge keys** (`<<: *alias`) - Rarely used, complex semantics
-4. **Schema validation** - Separate tool concern
+3. **Schema validation** - Separate tool concern
 
 ### Partial Implementation Notes
 
@@ -885,6 +890,7 @@ See [yq Remaining Work](../plan/yq-remaining.md) for incomplete features.
 6. **`--tab` output does not round-trip** - succinctly's own YAML reader (like the wider YAML 1.1/1.2 spec) forbids tab characters in indentation, so any nested `--tab` YAML output cannot be read back by `succinctly yq` itself, or by other spec-strict YAML parsers. Real yq v4.53.3 has no `--tab` flag at all (confirmed live: `unknown flag: --tab`), so this is a succinctly-only extension with no round-trip oracle to satisfy — it is write-only by design (#1684)
 7. **`type`/`tag` on an alias occurrence through a constructed array/object lose the alias distinction** (#2516) - real yq's `type`/`tag` answer `""` for an alias node (`*name`) rather than dereferencing to its target's tag, and succinctly matches that for a direct cursor-forwarded read (`.y | type`, `(.x, .y) | type`). Once the read goes through array/object *construction* (`[.x, .y] | map(type)`), succinctly's own construction step resets cursor/position context for its elements (the same reset `key`/`path` already get inside `{...}`/`[...]`, see note 3 above) before `type` ever runs, so the alias distinction is lost there and `type` answers the (dereferenced) tag instead of `""`. Real yq's own answer for that exact constructed shape happens to already be `""` for the alias element, so this specific combination is a residual divergence — captured in `tests/yq_cli_tests.rs`'s `test_yaml_explicit_tag_resolves_through_alias_903`
 8. **A variable bound from an absent key, and an alias binding's flow style** (#2072) - an `as`-bound variable stands at the node it was bound from since #2072, so `key`/`path`/`parent`/`parent(n)`/`file_index`/`document_index`/`line`/`column` and YAML anchor and style marks all answer through `$x` as they do without the binding. Two residues remain. Real yq's `as` binds a candidate *list*, and a key lookup that finds nothing contributes no candidate, so the body is skipped entirely (`.c | (.a as $x | $x)` prints nothing on `a: {b: 1}` / `c: {b: 1}`); succinctly's value model has no absent-versus-null distinction to bind, so it prints `null` and `| path` answers `["c","a"]` — the same path the unbound `.c | .a | path` answers in both tools. And a binding whose source is an *alias* resolves to the alias node, whose own style mark is not the anchor node's, so `.c as $x | $x` on `c: *anc` re-emits the value in block style where `.c` alone keeps the anchor's flow style. Both are recorded in [docs/compliance/yq/limitations.md](../compliance/yq/limitations.md) and captured in `tests/yq_cli_tests.rs`'s `test_bound_variable_carries_node_identity_2072`
+9. **Merge keys** (`<<: *alias`) - Read the way yq v4.53.3 reads them by default: a value read splices the merged mapping in, and `explode(.)` expands it. yq's `--yaml-fix-merge-anchor-to-spec` flag is not accepted. Where key lists (`keys`, `length`, `has`, #3556), writes and the encoders differ from yq is recorded in [limitations.md](../compliance/yq/limitations.md)
 
 ---
 

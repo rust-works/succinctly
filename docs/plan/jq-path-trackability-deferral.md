@@ -1,13 +1,18 @@
 # Deferred trackability checks for `resolve_node`'s path resolver (#986, #989)
 
-**Status: design only, not implemented.** This document is the deliverable for issues
+**Status: Archived (implemented).** #986 and #989 are both closed. The deferred check
+landed in `resolve_leaf`'s catch-all and `resolve_seq` (their doc comments in `src/jq/eval.rs`
+cite #986), and #989 needed no separate change: once `resolve_seq` threads each branch's own
+trackability, the existing `resolve_index_expr` checks produce jq's "near attempt" wording (see
+#989's closing comment). The text below predates that and is kept as the design record,
+including "Where the terminal check belongs", which the code comments point to.
+
+This document is the deliverable for issues
 [#986](https://github.com/rust-works/succinctly/issues/986) and
 [#989](https://github.com/rust-works/succinctly/issues/989), which a prior investigation
 (see #986's own comment thread) diagnosed as sharing one root cause and recommended for
 Tier 3 design treatment rather than a same-session implementation, after an earlier attempt
-(PR #985, on #972) was reverted for underestimating this exact code region's invariants. No
-code in this repo has been changed to implement this; see "Follow-up issues" at the bottom
-for where implementation should be tracked once this is reviewed.
+(PR #985, on #972) was reverted for underestimating this exact code region's invariants.
 
 **Revision note.** An earlier draft of this document placed the deferred check inside
 `resolve_seq`. That was wrong, and would have shipped a silent `del()` data-corruption
@@ -484,9 +489,7 @@ rigorous *oracle differential* gate:
 
 ## Follow-up issues
 
-Not yet filed. Once this document is reviewed, file one implementation issue per stage above
-(mirroring #700 → #724/#725's own slice-per-issue pattern), linking back to this document and
-to #986/#989 for the original repros.
+None were filed: the stages landed against #986 and #989 directly, and both are closed.
 
 [#2042](https://github.com/rust-works/succinctly/issues/2042) shipped a related but distinct
 widening in the same neighbourhood — a `$var` bound from a *navigated* position can now be

@@ -193,6 +193,10 @@ repro in all three issues. The YAML validator has **no UTF-8 check at all** — 
 
 ## Why not upfront validation for everyone
 
+The measurement and the conclusion below are now recorded in
+[architecture/semi-indexing.md](../architecture/semi-indexing.md#validation-is-not-done-up-front),
+which ADR-0018 and the limitations pages cite.
+
 The tier review floats "re-run the existing strict validator only when materialization
 hits a degrade point" as a cheaper third option. Costing it surfaced the reason the naive
 version of it — validating every document upfront — is not viable.
@@ -358,7 +362,7 @@ Verified by reading and by live repro at `cedee4cbb`. ✱ = not recorded in any 
 | 13 | `lazy.rs:707` `cursor_to_owned_at_depth` string arm | `String::new()` | 3 |
 | 14 | `lazy.rs:721` `cursor_to_owned_at_depth` key guard | field dropped | 3 |
 | 15 | `lazy.rs:658` `lazy_keys_array_to_owned` ✱ | key dropped from `keys` | 3 |
-| 16 | `lazy.rs:606` raw-bytes key fallback ✱ | documented-defensive; align for consistency | 3 |
+| 16 | `lazy.rs` raw-bytes key fallback ✱ | documented-defensive; aligned in #5864 | 3 |
 | 17 | `eval_generic.rs:1040` `StandardJson::Error` | `Null` | 4 |
 | 18 | `lazy.rs:733` `StandardJson::Error` | `Null` | 4 |
 | 19 | `eval.rs:427` `StandardJson::Error` | `Null` | 4 |
@@ -395,16 +399,14 @@ fixing it first means Stage 3's new error paths have a clean sink to fail into.
 **Stage 3 — make the `to_owned` family fallible (sites 11–15). ✅ landed.** The main
 change. *Why third:* everything it can raise now has somewhere correct to go.
 
-**Site 16 (`lazy.rs:606`) is not actually landed, despite an earlier version of this doc
-claiming it under this stage's "✅ landed."** `write_json_at_depth`'s raw-bytes key
-fallback (`LazyKeysArray`'s defensive branch for a key with no text range) still reads
-`if let Ok(s) = k.as_str() { write_json_body_jq(out, &s)?; }` with no `else` — on a decode
-failure it writes nothing, silently rendering the key as `""` rather than raising, same as
-before this stage. Confirmed by re-reading the site directly, not inferred. Low practical
-severity — the comment there is right that a JSON object key is always a text-range token,
-so this branch is close to unreachable — but "align for consistency" was never actually
-done, and the site inventory's own "Today" column already said so; only the stage-level
-"landed" summary overclaimed it.
+**Site 16 (`write_key_decoded` in `lazy.rs`) landed in #5864.** An earlier version of this
+doc claimed it under this stage's "✅ landed" while the site still read
+`if let Ok(s) = k.as_str() { write_json_body_jq(out, &s)?; }` with no `else`, so a key that
+would not decode rendered as `""` instead of raising. `LazyKeysArray`'s raw-bytes key
+fallback (the branch for a key with no text range) now calls `write_key_decoded`, which maps
+a decode failure to `core::fmt::Error` as every other site here does. The branch stays
+close to unreachable -- a JSON object key is always a text-range token -- so a unit test
+drives the helper directly (`key_without_text_range_raises_when_it_will_not_decode_5864`).
 
 Implementation notes, all discovered while doing it:
 
@@ -777,7 +779,7 @@ discarded, matching #1641/#1679 and the "buffering the whole record" non-goal be
    documents. Making it reject them is the point of Stage 5, but it is a user-visible
    behaviour change to call out in the changelog, not just a bug fix.
 5. **Stage 5's pass is charged to every input, including the ones it cannot help.** This
-   is the exact trap the O6 `HAS_CR` work documented (see CLAUDE.md): measure against the
+   is the exact trap the O6 `HAS_CR` work documented (see [optimizations/lessons.md](../optimizations/lessons.md)): measure against the
    workload where succinctly is *already fastest*, not the one where it is slowest. The
    +8%-on-the-cheapest-query figure above is the ceiling to defend; anything worse means
    the pass is in the wrong place.

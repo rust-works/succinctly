@@ -114,6 +114,7 @@ pub mod utf8_document;
 pub mod share_stats;
 mod value;
 pub mod walk;
+mod yq_datetime;
 
 pub use error::{BinOp, Control, ErrorKind, EvalError, EvalErrorPayload};
 pub(crate) use eval::last_as_reduce;
@@ -127,8 +128,8 @@ pub use eval::{
     enter_source_positions_scope, eval, eval_documents_together, eval_lenient,
     eval_owned_with_file_index, expr_key, is_alias_sensitive_assign, nonfinite_display_string,
     nonfinite_literal_display, substitute_named_args, substitute_vars, sync_aliased_paths,
-    with_stack_budget, DefScope, EvalSemantics, FileIndexScope, FileNamesScope, JqSemantics,
-    QueryResult, SourcePositionsScope, VisibleDef, YqSemantics,
+    with_stack_budget, with_value_depth_on_stack_floor, DefScope, EvalSemantics, FileIndexScope,
+    FileNamesScope, JqSemantics, QueryResult, SourcePositionsScope, VisibleDef, YqSemantics,
 };
 #[doc(hidden)]
 pub use eval::{eval_full, eval_owned_scalar_fast, eval_reindexed_document, with_stderr_muted};
@@ -143,8 +144,8 @@ pub use eval::{
 #[cfg(feature = "std")]
 pub use eval::{
     count_reads_past_end, current_input_location, pop_input, pop_remaining_input,
-    seed_remaining_inputs, seed_remaining_inputs_lazily, seed_remaining_inputs_with_error,
-    seed_remaining_inputs_with_errors, InputPop, LazyInputConverter, UNKNOWN_INPUT_LINE,
+    seed_remaining_inputs, seed_remaining_inputs_from, seed_remaining_inputs_with_error,
+    seed_remaining_inputs_with_errors, InputPop, InputProducer, ProducedInput, UNKNOWN_INPUT_LINE,
 };
 // `input_queue_is_active` exists under both gates (a `const fn` returning
 // `false` without `std`), so `eval_generic` can consult it unconditionally.
@@ -182,7 +183,8 @@ pub use value::{
     jq_float_is_scientific, nesting_depth_exceeded_message, ArrayIntoIter, ArrayOf, ArrayVec,
     FlaggedOccurrences, NumberRepr, ObjectMap, ObjectMapEntry, ObjectMapIntoIter, ObjectMapOf,
     OccupiedMapEntry, Occurrences, OwnedValue, ReindexedDoc, SharableLiteral, SharableString,
-    VacantMapEntry, JQ_MAX_PRINT_DEPTH, MAX_VALUE_TREE_DEPTH, SKIPPED_TOO_DEEP,
+    Teardown, VacantMapEntry, JQ_MAX_PRINT_DEPTH, MAX_VALUE_TREE_DEPTH, SKIPPED_TOO_DEEP,
+    STACK_FLOOR_NESTING_MESSAGE,
 };
 // `pub(crate)`, not `pub`: only `yaml::light`'s alias-chain resolvers (#1191
 // code review, #1193/PR #1314) need this from outside `jq::value` --

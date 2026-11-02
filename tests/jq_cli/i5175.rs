@@ -14,7 +14,6 @@ use crate::{assert_path_rows_both_routes_3749, run_jq_stdin};
 
 /// #5175: the issue's row 2 (a navigation-source bind in the right operand), for both folds, and the `|=` write that ran
 /// where jq raises. Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5175_alternative_with_a_navigation_source_bind_in_the_right_operand() -> Result<()> {
@@ -65,7 +64,6 @@ fn test_5175_alternative_with_a_navigation_source_bind_in_the_right_operand() ->
 }
 
 /// #5175: a right operand that destructures the outer `$x` again, which jq runs from the register the `//` was entered with.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5175_alternative_with_a_destructuring_bind_in_the_right_operand() -> Result<()> {
@@ -104,7 +102,6 @@ fn test_5175_alternative_with_a_destructuring_bind_in_the_right_operand() -> Res
 
 /// #5175: the three-argument `foreach`, whose EXTRACT is the emission, reads the same right operand. Rows captured from
 /// `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5175_three_argument_foreach_with_a_bind_in_the_right_operand() -> Result<()> {
@@ -154,7 +151,6 @@ fn test_5175_left_operand_that_fans_out_is_not_read_with_a_bind_in_the_right_ope
 /// #5175: a comma around the binds of the right operand, whose items each run from the register the `//` was entered with. Before, the operand kept the resolver's refusal, a `try` around the `//` swallowed it, and
 /// `path`/`del`/`|=` answered where jq raises at the emission of the left operand's truthy output. Every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes, for a `reduce`, a two-argument and a three-argument `foreach`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5175_right_operand_with_a_comma() -> Result<()> {
@@ -207,7 +203,6 @@ fn test_5175_right_operand_with_a_comma() -> Result<()> {
 /// #5175: an `if` around the binds of the right operand (its condition cannot move the register). Before, the operand kept the resolver's refusal, a `try` around the `//` swallowed it, and
 /// `path`/`del`/`|=` answered where jq raises at the emission of the left operand's truthy output. Every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes, for a `reduce`, a two-argument and a three-argument `foreach`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5175_right_operand_with_an_if() -> Result<()> {
@@ -260,7 +255,6 @@ fn test_5175_right_operand_with_an_if() -> Result<()> {
 /// #5175: a bind in the right operand whose source is a comma of sources or `.[]`, so its body runs once per source output. Before, the operand kept the resolver's refusal, a `try` around the `//` swallowed it, and
 /// `path`/`del`/`|=` answered where jq raises at the emission of the left operand's truthy output. Every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes, for a `reduce`, a two-argument and a three-argument `foreach`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5175_right_operand_with_a_generator_source() -> Result<()> {
@@ -315,7 +309,6 @@ fn test_5175_right_operand_with_a_generator_source() -> Result<()> {
 /// a truncated sequence. Every row raises in jq (the left operand's truthy `5`) and still raises here. Over the sweep grid
 /// the guard is observable only in the wording of the step (`of 0` where unguarded, `of null` guarded, jq's `of 1`), so
 /// this pins the refusal, not the wording.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5175_right_operand_that_fans_out_through_a_body_or_nested_sources_stays_unread(
@@ -341,7 +334,6 @@ fn test_5175_right_operand_that_fans_out_through_a_body_or_nested_sources_stays_
 /// emission of the left operand's truthy `5`. Every row captured from `/usr/bin/jq` 1.7.1, both routes, for a `reduce`, a
 /// two-argument and a three-argument `foreach`; the last row is a falsy left operand, where the right operand runs and jq
 /// answers.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5175_right_operand_with_a_bind_source_that_navigates_an_outer_marker() -> Result<()> {
@@ -395,7 +387,6 @@ fn test_5175_right_operand_with_a_bind_source_that_navigates_an_outer_marker() -
 /// wherever the row is a `path(...)`, as jq 1.7.1 answers them (stdout, the
 /// first error message, the exit code). The path-mode interpreter carries
 /// jq's register, so they match by construction, on both routes.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_5175() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

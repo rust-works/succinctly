@@ -27,6 +27,7 @@ This directory documents optimization techniques used in the succinctly library,
 | **`del()` root short-circuit** | [del-root-shortcircuit.md](del-root-shortcircuit.md) | #1651 double-flatten O(d²) fix, k≈1.96→1.14                    |
 | **`del()` path trie** | [del-path-trie.md](del-path-trie.md) | #1690 hash-consed path merge, 6.4x lower per-branch cost               |
 | **Path-resolution cloning** | [path-resolution-clone.md](path-resolution-clone.md) | #2058 per-step value/path clone fix, k≈1.9→1.0                  |
+| **Path-context walk** | [path-context-walk.md](path-context-walk.md) | #2572 shared trail, #3022 streamed positions for `key`/`parent` |
 | **Targets**          | [targets.md](targets.md)                                 | CPU target configurations, architecture flags                         |
 | **SIMD Strategy**    | [simd-strategy.md](simd-strategy.md)                     | Per-module SIMD usage, platform support, lessons                      |
 
@@ -239,5 +240,6 @@ When adding new optimization documentation:
 ## See Also
 
 - [history.md](history.md) - Complete record of all optimizations attempted (successes and failures with exact measurements)
+- [lessons.md](lessons.md) - Key insights, the YAML optimization log (P2.5 to O8) and the UTF-8 validation experiments (#134)
 - [end-positions.md](end-positions.md) - Detailed case study of three EndPositions designs (Vec, 3-bitmap, 2-bitmap)
 - [../../.claude/skills/](../../.claude/skills/) - Claude Code skill files for specific topics

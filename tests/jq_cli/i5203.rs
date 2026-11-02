@@ -1,8 +1,4 @@
 //! #5203: rows the path-mode interpreter (#5223) answers as jq 1.7.1 does.
-//!
-//! The interpreter reads storage identity, which the `unshared-containers` holdout does not have, so these pin the
-//! shipped shape only.
-#![cfg(not(feature = "unshared-containers"))]
 
 use anyhow::Result;
 

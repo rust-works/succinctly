@@ -6,7 +6,6 @@ use anyhow::Result;
 /// #4800: `label $l | FE` stores exactly the outputs the bare `foreach` does. It was refused naming the state where jq
 /// answers `["a"]` (`[path(..)?]` is `[["a"]]`, here `[]`). Rows captured from jq 1.7.1 (stdout, first stderr line, exit
 /// code), both routes, over `path`, `[path(..)?]`, `del` and `|=` with `.`, `$i`, `empty` and `.a` EXTRACTs.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_foreach_under_a_label_bare_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -128,7 +127,6 @@ fn test_caught_foreign_marker_destructure_foreach_under_a_label_bare_4800() -> R
 /// #4800: `label $l | (FE, empty)` stores exactly the outputs the bare `foreach` does. It was refused naming the state where jq
 /// answers `["a"]` (`[path(..)?]` is `[["a"]]`, here `[]`). Rows captured from jq 1.7.1 (stdout, first stderr line, exit
 /// code), both routes, over `path`, `[path(..)?]`, `del` and `|=` with `.`, `$i`, `empty` and `.a` EXTRACTs.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_foreach_under_a_label_comma_empty_after_4800(
 ) -> Result<()> {
@@ -251,7 +249,6 @@ fn test_caught_foreign_marker_destructure_foreach_under_a_label_comma_empty_afte
 /// #4800: `label $l | (empty, FE)` stores exactly the outputs the bare `foreach` does. It was refused naming the state where jq
 /// answers `["a"]` (`[path(..)?]` is `[["a"]]`, here `[]`). Rows captured from jq 1.7.1 (stdout, first stderr line, exit
 /// code), both routes, over `path`, `[path(..)?]`, `del` and `|=` with `.`, `$i`, `empty` and `.a` EXTRACTs.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_foreach_under_a_label_comma_empty_before_4800(
 ) -> Result<()> {
@@ -374,7 +371,6 @@ fn test_caught_foreign_marker_destructure_foreach_under_a_label_comma_empty_befo
 /// #4800: `label $l | (FE, select(false))` stores exactly the outputs the bare `foreach` does. It was refused naming the state where jq
 /// answers `["a"]` (`[path(..)?]` is `[["a"]]`, here `[]`). Rows captured from jq 1.7.1 (stdout, first stderr line, exit
 /// code), both routes, over `path`, `[path(..)?]`, `del` and `|=` with `.`, `$i`, `empty` and `.a` EXTRACTs.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_foreach_under_a_label_comma_select_false_4800(
 ) -> Result<()> {
@@ -497,7 +493,6 @@ fn test_caught_foreign_marker_destructure_foreach_under_a_label_comma_select_fal
 /// #4800: `label $l | (first(empty), FE)` stores exactly the outputs the bare `foreach` does. It was refused naming the state where jq
 /// answers `["a"]` (`[path(..)?]` is `[["a"]]`, here `[]`). Rows captured from jq 1.7.1 (stdout, first stderr line, exit
 /// code), both routes, over `path`, `[path(..)?]`, `del` and `|=` with `.`, `$i`, `empty` and `.a` EXTRACTs.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_foreach_under_a_label_comma_first_empty_4800(
 ) -> Result<()> {
@@ -620,7 +615,6 @@ fn test_caught_foreign_marker_destructure_foreach_under_a_label_comma_first_empt
 /// #4800: `label $l | (FE, break $l)` stores exactly the outputs the bare `foreach` does. It was refused naming the state where jq
 /// answers `["a"]` (`[path(..)?]` is `[["a"]]`, here `[]`). Rows captured from jq 1.7.1 (stdout, first stderr line, exit
 /// code), both routes, over `path`, `[path(..)?]`, `del` and `|=` with `.`, `$i`, `empty` and `.a` EXTRACTs.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_foreach_under_a_label_comma_break_after_4800(
 ) -> Result<()> {
@@ -743,7 +737,6 @@ fn test_caught_foreign_marker_destructure_foreach_under_a_label_comma_break_afte
 /// #4800: `label $l | ((FE), empty) | .` stores exactly the outputs the bare `foreach` does. It was refused naming the state where jq
 /// answers `["a"]` (`[path(..)?]` is `[["a"]]`, here `[]`). Rows captured from jq 1.7.1 (stdout, first stderr line, exit
 /// code), both routes, over `path`, `[path(..)?]`, `del` and `|=` with `.`, `$i`, `empty` and `.a` EXTRACTs.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_foreach_under_a_label_pipe_dot_after_comma_4800(
 ) -> Result<()> {
@@ -866,7 +859,6 @@ fn test_caught_foreign_marker_destructure_foreach_under_a_label_pipe_dot_after_c
 /// #4800: `label $l | (break $l, FE)` stores exactly the outputs the bare `foreach` does. It was refused naming the state where jq
 /// answers `["a"]` (`[path(..)?]` is `[["a"]]`, here `[]`). Rows captured from jq 1.7.1 (stdout, first stderr line, exit
 /// code), both routes, over `path`, `[path(..)?]`, `del` and `|=` with `.`, `$i`, `empty` and `.a` EXTRACTs.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_foreign_marker_destructure_foreach_under_a_label_break_ahead_control_4800(
 ) -> Result<()> {

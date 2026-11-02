@@ -13,8 +13,10 @@ The shards, and why they are cut where they are (times are the #5711 measurement
 
     jq-cli        `jq_cli_tests` without the tests in scripts/deep-recursion-tests.sh
     jq-cli-heavy  exactly those tests (the 328 s `recurse` cap test is the floor)
-    jq-nesting    `jq_library_eval_nesting_depth_tests`: one test, 224 s, alone in its binary
     rest          the lib, the bins and every other test target
+
+`jq_library_eval_nesting_depth_tests` had a shard of its own while one of its tests took 224 s;
+#5844 brought that test to a few seconds and it moved back into `rest`.
 
 `jq-cli` and `jq-cli-heavy` both come from deep-recursion-tests.sh, so a test cannot be in both or
 in neither, and a heavy name that goes stale falls out of the skip list and runs in `jq-cli`: no
@@ -38,9 +40,8 @@ DEEP_RECURSION = SCRIPTS / "deep-recursion-tests.sh"
 COMMON = ["--features", "cli,simd,regex,serde", "--workspace"]
 
 JQ_CLI = "jq_cli_tests"
-NESTING = "jq_library_eval_nesting_depth_tests"
 
-SHARDS = ("jq-cli", "jq-cli-heavy", "jq-nesting", "rest")
+SHARDS = ("jq-cli", "jq-cli-heavy", "rest")
 
 
 def test_targets():
@@ -67,10 +68,8 @@ def shard_args(shard):
         return COMMON + ["--test", JQ_CLI, "--"] + deep_recursion_args("skip-args")
     if shard == "jq-cli-heavy":
         return COMMON + ["--test", JQ_CLI, "--"] + deep_recursion_args("heavy-args")
-    if shard == "jq-nesting":
-        return COMMON + ["--test", NESTING]
     if shard == "rest":
-        others = [t for t in test_targets() if t not in (JQ_CLI, NESTING)]
+        others = [t for t in test_targets() if t != JQ_CLI]
         return COMMON + ["--lib", "--bins"] + [a for t in others for a in ("--test", t)]
     raise SystemExit(f"unknown shard '{shard}'; expected one of: {', '.join(SHARDS)}")
 

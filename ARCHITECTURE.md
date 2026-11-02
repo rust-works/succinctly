@@ -68,5 +68,5 @@ duplicate their detail:
 | [docs/optimizations/](docs/optimizations/) | Optimization techniques and the accept/reject history (incl. why AVX-512 was dropped) |
 | [docs/benchmarks/](docs/benchmarks/) | Per-platform benchmark results |
 | [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md) | Tagged, stable-ID coding & docs conventions |
-| [CLAUDE.md](CLAUDE.md) | Full module map, commands, feature flags, performance summary |
+| [CLAUDE.md](CLAUDE.md) | Full module map, commands, feature flags, agent conventions |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to build, test, and submit changes |

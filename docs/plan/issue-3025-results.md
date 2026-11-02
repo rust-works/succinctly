@@ -1,5 +1,8 @@
 # #3025 implementation evidence
 
+**Status: Archived (implemented).** #3025 is closed. The behaviour is recorded in
+[limitations.md](../compliance/jq/limitations.md); the measurements below are recorded only here.
+
 The reindex bridge now preserves every non-NaN number literal verbatim,
 including source tokens beyond the former 256-character limit. A bounded
 owned-state path handles entries conversion and literal numeric updates to an

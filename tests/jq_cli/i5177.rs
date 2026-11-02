@@ -11,7 +11,6 @@ use crate::assert_path_rows_both_routes_3749;
 
 /// #5177: the issue's rows (INIT `.`, so the state is the root, the element and `$x`) over `path`, `del`, `|=` and `[path(..)?]`,
 /// and the `try del(..)` row that #5173 turned loud. Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5177_nested_foreach_destructure_on_a_state_that_is_the_register() -> Result<()> {

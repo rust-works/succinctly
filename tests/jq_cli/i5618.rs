@@ -358,9 +358,24 @@ const ROWS: &[Row] = &[
         r"2",
         0,
     ),
+    // A repeated key: `-n` with `inputs` reads jq's own streaming parser (#5498), which emits
+    // every occurrence as it meets it.
+    (
+        &["--stream", "-n", "-c", "[inputs]"],
+        "[1] {\"x\":{\"a\":[1],\"a\":{}}}\n",
+        r#"[[[0],1],[[0]],[["x","a",0],1],[["x","a",0]],[["x","a"],{}],[["x","a"]],[["x"]]]"#,
+        0,
+    ),
+    (
+        &["--stream", "-n", "-c", "[inputs]"],
+        r#"{"a":1,"a":2}"#,
+        r#"[[["a"],1],[["a"],2],[["a"]]]"#,
+        0,
+    ),
 ];
 
-/// A repeated key, compared after decoding: first position, last value, one event.
+/// A repeated key on the routes that still decode the document first (`-s`, no `-n`): compared
+/// after decoding, first position, last value, one event.
 const COLLAPSED: &[Row] = &[
     (
         &["--stream", "-c", "-s", "."],
@@ -372,18 +387,6 @@ const COLLAPSED: &[Row] = &[
         &["--stream", "-c", "-s", "."],
         r#"{"a":1,"b":2,"a":3}"#,
         "[[[\"a\"],3],[[\"b\"],2]]\n[[\"b\"]]",
-        0,
-    ),
-    (
-        &["--stream", "-n", "-c", "[inputs]"],
-        "[1] {\"x\":{\"a\":[1],\"a\":{}}}\n",
-        r#"[[[0],1],[[0]],[["x","a"],{}],[["x","a"]],[["x"]]]"#,
-        0,
-    ),
-    (
-        &["--stream", "-n", "-c", "[inputs]"],
-        r#"{"a":1,"a":2}"#,
-        r#"[[["a"],2],[["a"]]]"#,
         0,
     ),
 ];

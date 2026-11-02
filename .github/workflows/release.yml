@@ -14,7 +14,7 @@ env:
 jobs:
   create-release:
     name: Create Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       upload_url: ${{ steps.create_release.outputs.upload_url }}
       release_version: ${{ env.RELEASE_VERSION }}
@@ -45,7 +45,7 @@ jobs:
         build: [linux-x64, linux-arm64, macos-arm64, windows]
         include:
         - build: linux-x64
-          os: ubuntu-latest
+          os: ubuntu-24.04
           rust: stable
           target: x86_64-unknown-linux-gnu
           archive-name: succinctly-linux-x64.tar.gz
@@ -117,7 +117,7 @@ jobs:
 
   publish-crates:
     name: Publish to crates.io
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [create-release, build-release]
     steps:
     - uses: actions/checkout@v7

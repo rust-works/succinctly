@@ -5,10 +5,6 @@
 //! interpreter cannot materialize whole raises the decode error. jq 1.7.1 rejects every one
 //! of these programs at compile time (`key/0 is not defined`, ...), and both documents when
 //! it parses them.
-//!
-//! The `unshared-containers` holdout refuses every such program with its own message, so these
-//! pin the shipped shape only.
-#![cfg(not(feature = "unshared-containers"))]
 
 use anyhow::Result;
 

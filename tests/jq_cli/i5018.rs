@@ -13,7 +13,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// #5018: `FE | null`, `FE | true`, `FE | not`, `try (FE | false)`, `(FE | null)?` and `FE | . == null` under a `null`,
 /// `.`, `true` or `not` EXTRACT, over a root register's child that is `null`, `false` and a container; `[path(..)?]`
 /// and `try path(..) catch`. Every row captured from `/usr/bin/jq` 1.7.1 (stdout, exit code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5018_pipe_stage_emitting_null_or_boolean_after_a_bare_caught_bind_foreach_update(
@@ -1040,7 +1039,6 @@ fn test_5018_pipe_stage_emitting_null_or_boolean_after_a_bare_caught_bind_foreac
 /// siblings (`7`, `null`, `true`, `false`, `"s"`, `0`), in either order and with two siblings, over the sources, INITs
 /// and EXTRACTs of the grid, in `path`, `del` and `paths`. Every row captured from `/usr/bin/jq` 1.7.1 (stdout, exit
 /// code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5018_comma_sibling_beside_a_bare_caught_bind_foreach_update() -> Result<()> {
@@ -1352,7 +1350,6 @@ fn test_5018_comma_sibling_beside_a_bare_caught_bind_foreach_update() -> Result<
 /// #5018: the comma is split the way the gate split it, so an `empty` item around it or beside a literal does not
 /// shift which item is the `foreach`, and a `null` literal sibling answers as jq does (two paths, then its raise).
 /// Every row captured from `/usr/bin/jq` 1.7.1 (stdout, exit code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5018_null_sibling_beside_a_bare_caught_bind_foreach_update() -> Result<()> {

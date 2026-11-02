@@ -11,7 +11,6 @@ use crate::assert_path_rows_both_routes_3749;
 
 /// #5161: the issue's rows (`try`, `?`, the bare `//`), each over a two-argument `foreach` whose state is not the
 /// register. Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5161_two_argument_foreach_update_alternative_over_a_bind() -> Result<()> {
@@ -94,7 +93,6 @@ fn test_5161_two_argument_foreach_update_alternative_over_a_bind() -> Result<()>
 
 /// #5161: the same `//` as a `reduce` UPDATE, whose final accumulator jq path-checks, and the `?//` chain behind it that
 /// stays as it was (jq names `null`, the stored `5` is not what its retry leaves).
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5161_reduce_update_alternative_over_a_bind() -> Result<()> {

@@ -14,7 +14,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// #4941: `wrapped-sel-true` -- a sample of the grid rows over the `rd-nav`, `rd-nava`, `rd-rec` and `rd-lit` outers (the
 /// destructure behind this stage raises in jq, and the binary used to answer it); every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4941_select_true_ahead_of_a_bracketed_destructure_raises() -> Result<()> {
@@ -95,7 +94,6 @@ fn test_4941_select_true_ahead_of_a_bracketed_destructure_raises() -> Result<()>
 /// #4941: `wrapped-sel-1` -- a sample of the grid rows over the `rd-nav`, `rd-nava`, `rd-rec` and `rd-lit` outers (the
 /// destructure behind this stage raises in jq, and the binary used to answer it); every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4941_select_one_ahead_of_a_bracketed_destructure_raises() -> Result<()> {
@@ -176,7 +174,6 @@ fn test_4941_select_one_ahead_of_a_bracketed_destructure_raises() -> Result<()> 
 /// #4941: `wrapped-first-dot` -- a sample of the grid rows over the `rd-nav`, `rd-nava`, `rd-rec` and `rd-lit` outers (the
 /// destructure behind this stage raises in jq, and the binary used to answer it); every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4941_first_dot_ahead_of_a_bracketed_destructure_raises() -> Result<()> {
@@ -257,7 +254,6 @@ fn test_4941_first_dot_ahead_of_a_bracketed_destructure_raises() -> Result<()> {
 /// #4941: `wrapped-limit-dot` -- a sample of the grid rows over the `rd-nav`, `rd-nava`, `rd-rec` and `rd-lit` outers (the
 /// destructure behind this stage raises in jq, and the binary used to answer it); every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4941_limit_dot_ahead_of_a_bracketed_destructure_raises() -> Result<()> {
@@ -338,7 +334,6 @@ fn test_4941_limit_dot_ahead_of_a_bracketed_destructure_raises() -> Result<()> {
 /// #4941: `wrapped-opt-dot` -- a sample of the grid rows over the `rd-nav`, `rd-nava`, `rd-rec` and `rd-lit` outers (the
 /// destructure behind this stage raises in jq, and the binary used to answer it); every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4941_optional_dot_ahead_of_a_bracketed_destructure_raises() -> Result<()> {
@@ -419,7 +414,6 @@ fn test_4941_optional_dot_ahead_of_a_bracketed_destructure_raises() -> Result<()
 /// #4941: `wrapped-sel-true-alt` -- a sample of the grid rows over the `rd-nav`, `rd-nava`, `rd-rec` and `rd-lit` outers (the
 /// destructure behind this stage raises in jq, and the binary used to answer it); every row captured from
 /// `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4941_select_true_behind_alt_ahead_of_a_bracketed_destructure_raises() -> Result<()> {
@@ -499,7 +493,6 @@ fn test_4941_select_true_behind_alt_ahead_of_a_bracketed_destructure_raises() ->
 
 /// #4941: the controls -- a stage that can empty its input (`select(false)`, `limit(0; ..)`, `first(empty)`) never
 /// reaches the destructure behind it, so jq answers and the binary must too. Every row captured from `/usr/bin/jq` 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4941_input_emptying_stage_keeps_the_destructure_unreached() -> Result<()> {
@@ -637,7 +630,6 @@ fn test_4941_input_emptying_stage_keeps_the_destructure_unreached() -> Result<()
 /// `try ... catch`, the right of a `//` whose left is never truthy, the handler of a `try` that only raises, a
 /// parenthesised pipe. Stdout and exit code are jq's; the wording is the step or the end of the path (jq's
 /// `result 7` for a handler that returns a literal), so only the common prefix is pinned.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4941_input_handing_stage_behind_run_branches() -> Result<()> {

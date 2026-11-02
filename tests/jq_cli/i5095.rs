@@ -10,7 +10,6 @@ use anyhow::Result;
 /// jq's is caught. Uncaught, the refusal and its message are as before; an INIT that navigated and then computed
 /// (`$r | .b | length`, no position kept) answers as before, and a `$x` bound at INIT's own node refuses at the end of
 /// the path as before. Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_fold_source_destructure_of_an_equal_sibling_is_caught_5095() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -91,7 +90,6 @@ fn test_fold_source_destructure_of_an_equal_sibling_is_caught_5095() -> Result<(
 /// at another position is another node, so `?`/`try` catch the refusal of its step as jq's do. Positions that name
 /// one node (`.[1]` and `.[-1]` of a two-element array) and a `null` register (identical to a `null` `$x` by kind)
 /// still read `$x` as the register and answer. Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_pipe_destructure_of_an_equal_sibling_is_caught_5095() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -145,7 +143,6 @@ fn test_pipe_destructure_of_an_equal_sibling_is_caught_5095() -> Result<()> {
 /// that escaped the `?`. The frame carried the register's value (`.a`'s node), and jq's register only moves down
 /// from there, so the root is not it and the refusal is caught as jq's is. Uncaught, the refusal is as before.
 /// Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_nested_reduce_refusal_of_a_root_accumulator_is_caught_5095() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -191,7 +188,6 @@ fn test_nested_reduce_refusal_of_a_root_accumulator_is_caught_5095() -> Result<(
 /// *is* `.a` in jq) or at another depth (`.a[0:][0]` is `.a[0]`) is read as that node, so its destructure passes and jq's
 /// answer follows (`[["a",0,"b"]]`, and `del` writes `{"a":[{},{"b":2}]}`), where #5095 kept the refusal loud and `main`
 /// before it answered `[]` on the trackable stage. Never a caught refusal, the silent wrong answer. Both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_destructure_of_the_register_spelled_through_a_slice_answers_as_jq_5095() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

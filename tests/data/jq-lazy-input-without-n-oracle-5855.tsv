@@ -1,0 +1,652 @@
+1\n2\n3\n	.	-c	1\n2\n3\n		0
+1\n2\n3\n	.	-c -e	1\n2\n3\n		0
+1\n2\n3\n	[., input]	-c	[1,2]\n	jq: error (at <stdin>:3): break\n	5
+1\n2\n3\n	[., input]	-c -e	[1,2]\n	jq: error (at <stdin>:3): break\n	5
+1\n2\n3\n	[., inputs]	-c	[1,2,3]\n		0
+1\n2\n3\n	[., inputs]	-c -e	[1,2,3]\n		0
+1\n2\n3\n	input	-c	2\n	jq: error (at <stdin>:3): break\n	5
+1\n2\n3\n	input	-c -e	2\n	jq: error (at <stdin>:3): break\n	5
+1\n2\n3\n	[., input_line_number]	-c	[1,1]\n[2,2]\n[3,3]\n		0
+1\n2\n3\n	[., input_line_number]	-c -e	[1,1]\n[2,2]\n[3,3]\n		0
+1\n2\n3\n	[input_line_number, input_filename]	-c	[1,"<stdin>"]\n[2,"<stdin>"]\n[3,"<stdin>"]\n		0
+1\n2\n3\n	[input_line_number, input_filename]	-c -e	[1,"<stdin>"]\n[2,"<stdin>"]\n[3,"<stdin>"]\n		0
+1\n2\n3\n	first(inputs)	-c	2\n		0
+1\n2\n3\n	first(inputs)	-c -e	2\n		0
+1\n2\n3\n	[., (try input catch "E")]	-c	[1,2]\n[3,"E"]\n		0
+1\n2\n3\n	[., (try input catch "E")]	-c -e	[1,2]\n[3,"E"]\n		0
+1\n2\n3\n	. as $a | try input catch "E" | [$a, .]	-c	[1,2]\n[3,"E"]\n		0
+1\n2\n3\n	. as $a | try input catch "E" | [$a, .]	-c -e	[1,2]\n[3,"E"]\n		0
+1\n2\n3\n	if . == 2 then halt else . end	-c	1\n		0
+1\n2\n3\n	if . == 2 then halt else . end	-c -e	1\n		0
+1\n2\n3\n	if . == 2 then "bye" | halt_error else . end	-c	1\n	bye	5
+1\n2\n3\n	if . == 2 then "bye" | halt_error else . end	-c -e	1\n	bye	5
+1\n2\n3\n	$__loc__	-c	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+1\n2\n3\n	$__loc__	-c -e	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+1\n2\n3\n	[., input, input_line_number]	-c	[1,2,2]\n	jq: error (at <stdin>:3): break\n	5
+1\n2\n3\n	[., input, input_line_number]	-c -e	[1,2,2]\n	jq: error (at <stdin>:3): break\n	5
+1\n2\n3\n	reduce inputs as $x (.; . + $x)	-c	6\n		0
+1\n2\n3\n	reduce inputs as $x (.; . + $x)	-c -e	6\n		0
+1\n2\n3\n	[limit(2; inputs)]	-c	[2,3]\n		0
+1\n2\n3\n	[limit(2; inputs)]	-c -e	[2,3]\n		0
+1\n2\n3\n	input_line_number	-c	1\n2\n3\n		0
+1\n2\n3\n	input_line_number	-c -e	1\n2\n3\n		0
+1\n2\n3\n	[., (input | input_line_number)]	-c	[1,2]\n	jq: error (at <stdin>:3): break\n	5
+1\n2\n3\n	[., (input | input_line_number)]	-c -e	[1,2]\n	jq: error (at <stdin>:3): break\n	5
+1\n2\n3\n	error	-c		jq: error (at <stdin>:1) (not a string): 1\njq: error (at <stdin>:2) (not a string): 2\njq: error (at <stdin>:3) (not a string): 3\n	5
+1\n2\n3\n	error	-c -e		jq: error (at <stdin>:1) (not a string): 1\njq: error (at <stdin>:2) (not a string): 2\njq: error (at <stdin>:3) (not a string): 3\n	5
+1\n2\n3\n	if . == 2 then error("x") else . end	-c	1\n3\n	jq: error (at <stdin>:2): x\n	0
+1\n2\n3\n	if . == 2 then error("x") else . end	-c -e	1\n3\n	jq: error (at <stdin>:2): x\n	0
+1\n2\n3\n	select(. != 2)	-c	1\n3\n		0
+1\n2\n3\n	select(. != 2)	-c -e	1\n3\n		0
+1\n2\n3\n	empty	-c			0
+1\n2\n3\n	empty	-c -e			4
+1\n2\n3\n	[., ([inputs] | length)]	-c	[1,2]\n		0
+1\n2\n3\n	[., ([inputs] | length)]	-c -e	[1,2]\n		0
+1\n2\n3	.	-c	1\n2\n3\n		0
+1\n2\n3	.	-c -e	1\n2\n3\n		0
+1\n2\n3	[., input]	-c	[1,2]\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	[., input]	-c -e	[1,2]\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	[., inputs]	-c	[1,2,3]\n		0
+1\n2\n3	[., inputs]	-c -e	[1,2,3]\n		0
+1\n2\n3	input	-c	2\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	input	-c -e	2\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	[., input_line_number]	-c	[1,1]\n[2,2]\n[3,2]\n		0
+1\n2\n3	[., input_line_number]	-c -e	[1,1]\n[2,2]\n[3,2]\n		0
+1\n2\n3	[input_line_number, input_filename]	-c	[1,"<stdin>"]\n[2,"<stdin>"]\n[2,"<stdin>"]\n		0
+1\n2\n3	[input_line_number, input_filename]	-c -e	[1,"<stdin>"]\n[2,"<stdin>"]\n[2,"<stdin>"]\n		0
+1\n2\n3	first(inputs)	-c	2\n		0
+1\n2\n3	first(inputs)	-c -e	2\n		0
+1\n2\n3	[., (try input catch "E")]	-c	[1,2]\n[3,"E"]\n		0
+1\n2\n3	[., (try input catch "E")]	-c -e	[1,2]\n[3,"E"]\n		0
+1\n2\n3	. as $a | try input catch "E" | [$a, .]	-c	[1,2]\n[3,"E"]\n		0
+1\n2\n3	. as $a | try input catch "E" | [$a, .]	-c -e	[1,2]\n[3,"E"]\n		0
+1\n2\n3	if . == 2 then halt else . end	-c	1\n		0
+1\n2\n3	if . == 2 then halt else . end	-c -e	1\n		0
+1\n2\n3	if . == 2 then "bye" | halt_error else . end	-c	1\n	bye	5
+1\n2\n3	if . == 2 then "bye" | halt_error else . end	-c -e	1\n	bye	5
+1\n2\n3	$__loc__	-c	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+1\n2\n3	$__loc__	-c -e	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+1\n2\n3	[., input, input_line_number]	-c	[1,2,2]\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	[., input, input_line_number]	-c -e	[1,2,2]\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	reduce inputs as $x (.; . + $x)	-c	6\n		0
+1\n2\n3	reduce inputs as $x (.; . + $x)	-c -e	6\n		0
+1\n2\n3	[limit(2; inputs)]	-c	[2,3]\n		0
+1\n2\n3	[limit(2; inputs)]	-c -e	[2,3]\n		0
+1\n2\n3	input_line_number	-c	1\n2\n2\n		0
+1\n2\n3	input_line_number	-c -e	1\n2\n2\n		0
+1\n2\n3	[., (input | input_line_number)]	-c	[1,2]\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	[., (input | input_line_number)]	-c -e	[1,2]\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	error	-c		jq: error (at <stdin>:1) (not a string): 1\njq: error (at <stdin>:2) (not a string): 2\njq: error (at <stdin>:2) (not a string): 3\n	5
+1\n2\n3	error	-c -e		jq: error (at <stdin>:1) (not a string): 1\njq: error (at <stdin>:2) (not a string): 2\njq: error (at <stdin>:2) (not a string): 3\n	5
+1\n2\n3	if . == 2 then error("x") else . end	-c	1\n3\n	jq: error (at <stdin>:2): x\n	0
+1\n2\n3	if . == 2 then error("x") else . end	-c -e	1\n3\n	jq: error (at <stdin>:2): x\n	0
+1\n2\n3	select(. != 2)	-c	1\n3\n		0
+1\n2\n3	select(. != 2)	-c -e	1\n3\n		0
+1\n2\n3	empty	-c			0
+1\n2\n3	empty	-c -e			4
+1\n2\n3	[., ([inputs] | length)]	-c	[1,2]\n		0
+1\n2\n3	[., ([inputs] | length)]	-c -e	[1,2]\n		0
+1 2 3	.	-c	1\n2\n3\n		0
+1 2 3	.	-c -e	1\n2\n3\n		0
+1 2 3	[., input]	-c	[1,2]\n	jq: error (at <unknown>): break\n	5
+1 2 3	[., input]	-c -e	[1,2]\n	jq: error (at <unknown>): break\n	5
+1 2 3	[., inputs]	-c	[1,2,3]\n		0
+1 2 3	[., inputs]	-c -e	[1,2,3]\n		0
+1 2 3	input	-c	2\n	jq: error (at <unknown>): break\n	5
+1 2 3	input	-c -e	2\n	jq: error (at <unknown>): break\n	5
+1 2 3	[., input_line_number]	-c	[1,0]\n[2,0]\n[3,0]\n		0
+1 2 3	[., input_line_number]	-c -e	[1,0]\n[2,0]\n[3,0]\n		0
+1 2 3	[input_line_number, input_filename]	-c	[0,"<stdin>"]\n[0,"<stdin>"]\n[0,"<stdin>"]\n		0
+1 2 3	[input_line_number, input_filename]	-c -e	[0,"<stdin>"]\n[0,"<stdin>"]\n[0,"<stdin>"]\n		0
+1 2 3	first(inputs)	-c	2\n		0
+1 2 3	first(inputs)	-c -e	2\n		0
+1 2 3	[., (try input catch "E")]	-c	[1,2]\n[3,"E"]\n		0
+1 2 3	[., (try input catch "E")]	-c -e	[1,2]\n[3,"E"]\n		0
+1 2 3	. as $a | try input catch "E" | [$a, .]	-c	[1,2]\n[3,"E"]\n		0
+1 2 3	. as $a | try input catch "E" | [$a, .]	-c -e	[1,2]\n[3,"E"]\n		0
+1 2 3	if . == 2 then halt else . end	-c	1\n		0
+1 2 3	if . == 2 then halt else . end	-c -e	1\n		0
+1 2 3	if . == 2 then "bye" | halt_error else . end	-c	1\n	bye	5
+1 2 3	if . == 2 then "bye" | halt_error else . end	-c -e	1\n	bye	5
+1 2 3	$__loc__	-c	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+1 2 3	$__loc__	-c -e	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+1 2 3	[., input, input_line_number]	-c	[1,2,0]\n	jq: error (at <unknown>): break\n	5
+1 2 3	[., input, input_line_number]	-c -e	[1,2,0]\n	jq: error (at <unknown>): break\n	5
+1 2 3	reduce inputs as $x (.; . + $x)	-c	6\n		0
+1 2 3	reduce inputs as $x (.; . + $x)	-c -e	6\n		0
+1 2 3	[limit(2; inputs)]	-c	[2,3]\n		0
+1 2 3	[limit(2; inputs)]	-c -e	[2,3]\n		0
+1 2 3	input_line_number	-c	0\n0\n0\n		0
+1 2 3	input_line_number	-c -e	0\n0\n0\n		0
+1 2 3	[., (input | input_line_number)]	-c	[1,0]\n	jq: error (at <unknown>): break\n	5
+1 2 3	[., (input | input_line_number)]	-c -e	[1,0]\n	jq: error (at <unknown>): break\n	5
+1 2 3	error	-c		jq: error (at <stdin>:0) (not a string): 1\njq: error (at <stdin>:0) (not a string): 2\njq: error (at <stdin>:0) (not a string): 3\n	5
+1 2 3	error	-c -e		jq: error (at <stdin>:0) (not a string): 1\njq: error (at <stdin>:0) (not a string): 2\njq: error (at <stdin>:0) (not a string): 3\n	5
+1 2 3	if . == 2 then error("x") else . end	-c	1\n3\n	jq: error (at <stdin>:0): x\n	0
+1 2 3	if . == 2 then error("x") else . end	-c -e	1\n3\n	jq: error (at <stdin>:0): x\n	0
+1 2 3	select(. != 2)	-c	1\n3\n		0
+1 2 3	select(. != 2)	-c -e	1\n3\n		0
+1 2 3	empty	-c			0
+1 2 3	empty	-c -e			4
+1 2 3	[., ([inputs] | length)]	-c	[1,2]\n		0
+1 2 3	[., ([inputs] | length)]	-c -e	[1,2]\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	.	-c	{"a":1}\n{"a":2}\n{"a":3}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	.	-c -e	{"a":1}\n{"a":2}\n{"a":3}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	[., input]	-c	[{"a":1},{"a":2}]\n	jq: error (at <stdin>:3): break\n	5
+{"a":1}\n{"a":2}\n{"a":3}\n	[., input]	-c -e	[{"a":1},{"a":2}]\n	jq: error (at <stdin>:3): break\n	5
+{"a":1}\n{"a":2}\n{"a":3}\n	[., inputs]	-c	[{"a":1},{"a":2},{"a":3}]\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	[., inputs]	-c -e	[{"a":1},{"a":2},{"a":3}]\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	input	-c	{"a":2}\n	jq: error (at <stdin>:3): break\n	5
+{"a":1}\n{"a":2}\n{"a":3}\n	input	-c -e	{"a":2}\n	jq: error (at <stdin>:3): break\n	5
+{"a":1}\n{"a":2}\n{"a":3}\n	[., input_line_number]	-c	[{"a":1},1]\n[{"a":2},2]\n[{"a":3},3]\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	[., input_line_number]	-c -e	[{"a":1},1]\n[{"a":2},2]\n[{"a":3},3]\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	[input_line_number, input_filename]	-c	[1,"<stdin>"]\n[2,"<stdin>"]\n[3,"<stdin>"]\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	[input_line_number, input_filename]	-c -e	[1,"<stdin>"]\n[2,"<stdin>"]\n[3,"<stdin>"]\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	first(inputs)	-c	{"a":2}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	first(inputs)	-c -e	{"a":2}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	[., (try input catch "E")]	-c	[{"a":1},{"a":2}]\n[{"a":3},"E"]\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	[., (try input catch "E")]	-c -e	[{"a":1},{"a":2}]\n[{"a":3},"E"]\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	. as $a | try input catch "E" | [$a, .]	-c	[{"a":1},{"a":2}]\n[{"a":3},"E"]\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	. as $a | try input catch "E" | [$a, .]	-c -e	[{"a":1},{"a":2}]\n[{"a":3},"E"]\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	if . == 2 then halt else . end	-c	{"a":1}\n{"a":2}\n{"a":3}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	if . == 2 then halt else . end	-c -e	{"a":1}\n{"a":2}\n{"a":3}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	if . == 2 then "bye" | halt_error else . end	-c	{"a":1}\n{"a":2}\n{"a":3}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	if . == 2 then "bye" | halt_error else . end	-c -e	{"a":1}\n{"a":2}\n{"a":3}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	$__loc__	-c	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	$__loc__	-c -e	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	[., input, input_line_number]	-c	[{"a":1},{"a":2},2]\n	jq: error (at <stdin>:3): break\n	5
+{"a":1}\n{"a":2}\n{"a":3}\n	[., input, input_line_number]	-c -e	[{"a":1},{"a":2},2]\n	jq: error (at <stdin>:3): break\n	5
+{"a":1}\n{"a":2}\n{"a":3}\n	reduce inputs as $x (.; . + $x)	-c	{"a":3}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	reduce inputs as $x (.; . + $x)	-c -e	{"a":3}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	[limit(2; inputs)]	-c	[{"a":2},{"a":3}]\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	[limit(2; inputs)]	-c -e	[{"a":2},{"a":3}]\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	input_line_number	-c	1\n2\n3\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	input_line_number	-c -e	1\n2\n3\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	[., (input | input_line_number)]	-c	[{"a":1},2]\n	jq: error (at <stdin>:3): break\n	5
+{"a":1}\n{"a":2}\n{"a":3}\n	[., (input | input_line_number)]	-c -e	[{"a":1},2]\n	jq: error (at <stdin>:3): break\n	5
+{"a":1}\n{"a":2}\n{"a":3}\n	error	-c		jq: error (at <stdin>:1) (not a string): {"a":1}\njq: error (at <stdin>:2) (not a string): {"a":2}\njq: error (at <stdin>:3) (not a string): {"a":3}\n	5
+{"a":1}\n{"a":2}\n{"a":3}\n	error	-c -e		jq: error (at <stdin>:1) (not a string): {"a":1}\njq: error (at <stdin>:2) (not a string): {"a":2}\njq: error (at <stdin>:3) (not a string): {"a":3}\n	5
+{"a":1}\n{"a":2}\n{"a":3}\n	if . == 2 then error("x") else . end	-c	{"a":1}\n{"a":2}\n{"a":3}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	if . == 2 then error("x") else . end	-c -e	{"a":1}\n{"a":2}\n{"a":3}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	select(. != 2)	-c	{"a":1}\n{"a":2}\n{"a":3}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	select(. != 2)	-c -e	{"a":1}\n{"a":2}\n{"a":3}\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	empty	-c			0
+{"a":1}\n{"a":2}\n{"a":3}\n	empty	-c -e			4
+{"a":1}\n{"a":2}\n{"a":3}\n	[., ([inputs] | length)]	-c	[{"a":1},2]\n		0
+{"a":1}\n{"a":2}\n{"a":3}\n	[., ([inputs] | length)]	-c -e	[{"a":1},2]\n		0
+\n\n1\n\n2\n\n	.	-c	1\n2\n		0
+\n\n1\n\n2\n\n	.	-c -e	1\n2\n		0
+\n\n1\n\n2\n\n	[., input]	-c	[1,2]\n		0
+\n\n1\n\n2\n\n	[., input]	-c -e	[1,2]\n		0
+\n\n1\n\n2\n\n	[., inputs]	-c	[1,2]\n		0
+\n\n1\n\n2\n\n	[., inputs]	-c -e	[1,2]\n		0
+\n\n1\n\n2\n\n	input	-c	2\n		0
+\n\n1\n\n2\n\n	input	-c -e	2\n		0
+\n\n1\n\n2\n\n	[., input_line_number]	-c	[1,3]\n[2,5]\n		0
+\n\n1\n\n2\n\n	[., input_line_number]	-c -e	[1,3]\n[2,5]\n		0
+\n\n1\n\n2\n\n	[input_line_number, input_filename]	-c	[3,"<stdin>"]\n[5,"<stdin>"]\n		0
+\n\n1\n\n2\n\n	[input_line_number, input_filename]	-c -e	[3,"<stdin>"]\n[5,"<stdin>"]\n		0
+\n\n1\n\n2\n\n	first(inputs)	-c	2\n		0
+\n\n1\n\n2\n\n	first(inputs)	-c -e	2\n		0
+\n\n1\n\n2\n\n	[., (try input catch "E")]	-c	[1,2]\n		0
+\n\n1\n\n2\n\n	[., (try input catch "E")]	-c -e	[1,2]\n		0
+\n\n1\n\n2\n\n	. as $a | try input catch "E" | [$a, .]	-c	[1,2]\n		0
+\n\n1\n\n2\n\n	. as $a | try input catch "E" | [$a, .]	-c -e	[1,2]\n		0
+\n\n1\n\n2\n\n	if . == 2 then halt else . end	-c	1\n		0
+\n\n1\n\n2\n\n	if . == 2 then halt else . end	-c -e	1\n		0
+\n\n1\n\n2\n\n	if . == 2 then "bye" | halt_error else . end	-c	1\n	bye	5
+\n\n1\n\n2\n\n	if . == 2 then "bye" | halt_error else . end	-c -e	1\n	bye	5
+\n\n1\n\n2\n\n	$__loc__	-c	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+\n\n1\n\n2\n\n	$__loc__	-c -e	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+\n\n1\n\n2\n\n	[., input, input_line_number]	-c	[1,2,5]\n		0
+\n\n1\n\n2\n\n	[., input, input_line_number]	-c -e	[1,2,5]\n		0
+\n\n1\n\n2\n\n	reduce inputs as $x (.; . + $x)	-c	3\n		0
+\n\n1\n\n2\n\n	reduce inputs as $x (.; . + $x)	-c -e	3\n		0
+\n\n1\n\n2\n\n	[limit(2; inputs)]	-c	[2]\n		0
+\n\n1\n\n2\n\n	[limit(2; inputs)]	-c -e	[2]\n		0
+\n\n1\n\n2\n\n	input_line_number	-c	3\n5\n		0
+\n\n1\n\n2\n\n	input_line_number	-c -e	3\n5\n		0
+\n\n1\n\n2\n\n	[., (input | input_line_number)]	-c	[1,5]\n		0
+\n\n1\n\n2\n\n	[., (input | input_line_number)]	-c -e	[1,5]\n		0
+\n\n1\n\n2\n\n	error	-c		jq: error (at <stdin>:3) (not a string): 1\njq: error (at <stdin>:5) (not a string): 2\n	5
+\n\n1\n\n2\n\n	error	-c -e		jq: error (at <stdin>:3) (not a string): 1\njq: error (at <stdin>:5) (not a string): 2\n	5
+\n\n1\n\n2\n\n	if . == 2 then error("x") else . end	-c	1\n	jq: error (at <stdin>:5): x\n	5
+\n\n1\n\n2\n\n	if . == 2 then error("x") else . end	-c -e	1\n	jq: error (at <stdin>:5): x\n	5
+\n\n1\n\n2\n\n	select(. != 2)	-c	1\n		0
+\n\n1\n\n2\n\n	select(. != 2)	-c -e	1\n		0
+\n\n1\n\n2\n\n	empty	-c			0
+\n\n1\n\n2\n\n	empty	-c -e			4
+\n\n1\n\n2\n\n	[., ([inputs] | length)]	-c	[1,1]\n		0
+\n\n1\n\n2\n\n	[., ([inputs] | length)]	-c -e	[1,1]\n		0
+42\n	.	-c	42\n		0
+42\n	.	-c -e	42\n		0
+42\n	[., input]	-c		jq: error (at <stdin>:1): break\n	5
+42\n	[., input]	-c -e		jq: error (at <stdin>:1): break\n	5
+42\n	[., inputs]	-c	[42]\n		0
+42\n	[., inputs]	-c -e	[42]\n		0
+42\n	input	-c		jq: error (at <stdin>:1): break\n	5
+42\n	input	-c -e		jq: error (at <stdin>:1): break\n	5
+42\n	[., input_line_number]	-c	[42,1]\n		0
+42\n	[., input_line_number]	-c -e	[42,1]\n		0
+42\n	[input_line_number, input_filename]	-c	[1,"<stdin>"]\n		0
+42\n	[input_line_number, input_filename]	-c -e	[1,"<stdin>"]\n		0
+42\n	first(inputs)	-c			0
+42\n	first(inputs)	-c -e			4
+42\n	[., (try input catch "E")]	-c	[42,"E"]\n		0
+42\n	[., (try input catch "E")]	-c -e	[42,"E"]\n		0
+42\n	. as $a | try input catch "E" | [$a, .]	-c	[42,"E"]\n		0
+42\n	. as $a | try input catch "E" | [$a, .]	-c -e	[42,"E"]\n		0
+42\n	if . == 2 then halt else . end	-c	42\n		0
+42\n	if . == 2 then halt else . end	-c -e	42\n		0
+42\n	if . == 2 then "bye" | halt_error else . end	-c	42\n		0
+42\n	if . == 2 then "bye" | halt_error else . end	-c -e	42\n		0
+42\n	$__loc__	-c	{"file":"<top-level>","line":1}\n		0
+42\n	$__loc__	-c -e	{"file":"<top-level>","line":1}\n		0
+42\n	[., input, input_line_number]	-c		jq: error (at <stdin>:1): break\n	5
+42\n	[., input, input_line_number]	-c -e		jq: error (at <stdin>:1): break\n	5
+42\n	reduce inputs as $x (.; . + $x)	-c	42\n		0
+42\n	reduce inputs as $x (.; . + $x)	-c -e	42\n		0
+42\n	[limit(2; inputs)]	-c	[]\n		0
+42\n	[limit(2; inputs)]	-c -e	[]\n		0
+42\n	input_line_number	-c	1\n		0
+42\n	input_line_number	-c -e	1\n		0
+42\n	[., (input | input_line_number)]	-c		jq: error (at <stdin>:1): break\n	5
+42\n	[., (input | input_line_number)]	-c -e		jq: error (at <stdin>:1): break\n	5
+42\n	error	-c		jq: error (at <stdin>:1) (not a string): 42\n	5
+42\n	error	-c -e		jq: error (at <stdin>:1) (not a string): 42\n	5
+42\n	if . == 2 then error("x") else . end	-c	42\n		0
+42\n	if . == 2 then error("x") else . end	-c -e	42\n		0
+42\n	select(. != 2)	-c	42\n		0
+42\n	select(. != 2)	-c -e	42\n		0
+42\n	empty	-c			0
+42\n	empty	-c -e			4
+42\n	[., ([inputs] | length)]	-c	[42,0]\n		0
+42\n	[., ([inputs] | length)]	-c -e	[42,0]\n		0
+	.	-c			0
+	.	-c -e			4
+	[., input]	-c			0
+	[., input]	-c -e			4
+	[., inputs]	-c			0
+	[., inputs]	-c -e			4
+	input	-c			0
+	input	-c -e			4
+	[., input_line_number]	-c			0
+	[., input_line_number]	-c -e			4
+	[input_line_number, input_filename]	-c			0
+	[input_line_number, input_filename]	-c -e			4
+	first(inputs)	-c			0
+	first(inputs)	-c -e			4
+	[., (try input catch "E")]	-c			0
+	[., (try input catch "E")]	-c -e			4
+	. as $a | try input catch "E" | [$a, .]	-c			0
+	. as $a | try input catch "E" | [$a, .]	-c -e			4
+	if . == 2 then halt else . end	-c			0
+	if . == 2 then halt else . end	-c -e			4
+	if . == 2 then "bye" | halt_error else . end	-c			0
+	if . == 2 then "bye" | halt_error else . end	-c -e			4
+	$__loc__	-c			0
+	$__loc__	-c -e			4
+	[., input, input_line_number]	-c			0
+	[., input, input_line_number]	-c -e			4
+	reduce inputs as $x (.; . + $x)	-c			0
+	reduce inputs as $x (.; . + $x)	-c -e			4
+	[limit(2; inputs)]	-c			0
+	[limit(2; inputs)]	-c -e			4
+	input_line_number	-c			0
+	input_line_number	-c -e			4
+	[., (input | input_line_number)]	-c			0
+	[., (input | input_line_number)]	-c -e			4
+	error	-c			0
+	error	-c -e			4
+	if . == 2 then error("x") else . end	-c			0
+	if . == 2 then error("x") else . end	-c -e			4
+	select(. != 2)	-c			0
+	select(. != 2)	-c -e			4
+	empty	-c			0
+	empty	-c -e			4
+	[., ([inputs] | length)]	-c			0
+	[., ([inputs] | length)]	-c -e			4
+  \n \n	.	-c			0
+  \n \n	.	-c -e			4
+  \n \n	[., input]	-c			0
+  \n \n	[., input]	-c -e			4
+  \n \n	[., inputs]	-c			0
+  \n \n	[., inputs]	-c -e			4
+  \n \n	input	-c			0
+  \n \n	input	-c -e			4
+  \n \n	[., input_line_number]	-c			0
+  \n \n	[., input_line_number]	-c -e			4
+  \n \n	[input_line_number, input_filename]	-c			0
+  \n \n	[input_line_number, input_filename]	-c -e			4
+  \n \n	first(inputs)	-c			0
+  \n \n	first(inputs)	-c -e			4
+  \n \n	[., (try input catch "E")]	-c			0
+  \n \n	[., (try input catch "E")]	-c -e			4
+  \n \n	. as $a | try input catch "E" | [$a, .]	-c			0
+  \n \n	. as $a | try input catch "E" | [$a, .]	-c -e			4
+  \n \n	if . == 2 then halt else . end	-c			0
+  \n \n	if . == 2 then halt else . end	-c -e			4
+  \n \n	if . == 2 then "bye" | halt_error else . end	-c			0
+  \n \n	if . == 2 then "bye" | halt_error else . end	-c -e			4
+  \n \n	$__loc__	-c			0
+  \n \n	$__loc__	-c -e			4
+  \n \n	[., input, input_line_number]	-c			0
+  \n \n	[., input, input_line_number]	-c -e			4
+  \n \n	reduce inputs as $x (.; . + $x)	-c			0
+  \n \n	reduce inputs as $x (.; . + $x)	-c -e			4
+  \n \n	[limit(2; inputs)]	-c			0
+  \n \n	[limit(2; inputs)]	-c -e			4
+  \n \n	input_line_number	-c			0
+  \n \n	input_line_number	-c -e			4
+  \n \n	[., (input | input_line_number)]	-c			0
+  \n \n	[., (input | input_line_number)]	-c -e			4
+  \n \n	error	-c			0
+  \n \n	error	-c -e			4
+  \n \n	if . == 2 then error("x") else . end	-c			0
+  \n \n	if . == 2 then error("x") else . end	-c -e			4
+  \n \n	select(. != 2)	-c			0
+  \n \n	select(. != 2)	-c -e			4
+  \n \n	empty	-c			0
+  \n \n	empty	-c -e			4
+  \n \n	[., ([inputs] | length)]	-c			0
+  \n \n	[., ([inputs] | length)]	-c -e			4
+1\n2\n3	.	-c	1\n2\n3\n		0
+1\n2\n3	.	-c -e	1\n2\n3\n		0
+1\n2\n3	[., input]	-c	[1,2]\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	[., input]	-c -e	[1,2]\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	[., inputs]	-c	[1,2,3]\n		0
+1\n2\n3	[., inputs]	-c -e	[1,2,3]\n		0
+1\n2\n3	input	-c	2\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	input	-c -e	2\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	[., input_line_number]	-c	[1,1]\n[2,2]\n[3,2]\n		0
+1\n2\n3	[., input_line_number]	-c -e	[1,1]\n[2,2]\n[3,2]\n		0
+1\n2\n3	[input_line_number, input_filename]	-c	[1,"<stdin>"]\n[2,"<stdin>"]\n[2,"<stdin>"]\n		0
+1\n2\n3	[input_line_number, input_filename]	-c -e	[1,"<stdin>"]\n[2,"<stdin>"]\n[2,"<stdin>"]\n		0
+1\n2\n3	first(inputs)	-c	2\n		0
+1\n2\n3	first(inputs)	-c -e	2\n		0
+1\n2\n3	[., (try input catch "E")]	-c	[1,2]\n[3,"E"]\n		0
+1\n2\n3	[., (try input catch "E")]	-c -e	[1,2]\n[3,"E"]\n		0
+1\n2\n3	. as $a | try input catch "E" | [$a, .]	-c	[1,2]\n[3,"E"]\n		0
+1\n2\n3	. as $a | try input catch "E" | [$a, .]	-c -e	[1,2]\n[3,"E"]\n		0
+1\n2\n3	if . == 2 then halt else . end	-c	1\n		0
+1\n2\n3	if . == 2 then halt else . end	-c -e	1\n		0
+1\n2\n3	if . == 2 then "bye" | halt_error else . end	-c	1\n	bye	5
+1\n2\n3	if . == 2 then "bye" | halt_error else . end	-c -e	1\n	bye	5
+1\n2\n3	$__loc__	-c	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+1\n2\n3	$__loc__	-c -e	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+1\n2\n3	[., input, input_line_number]	-c	[1,2,2]\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	[., input, input_line_number]	-c -e	[1,2,2]\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	reduce inputs as $x (.; . + $x)	-c	6\n		0
+1\n2\n3	reduce inputs as $x (.; . + $x)	-c -e	6\n		0
+1\n2\n3	[limit(2; inputs)]	-c	[2,3]\n		0
+1\n2\n3	[limit(2; inputs)]	-c -e	[2,3]\n		0
+1\n2\n3	input_line_number	-c	1\n2\n2\n		0
+1\n2\n3	input_line_number	-c -e	1\n2\n2\n		0
+1\n2\n3	[., (input | input_line_number)]	-c	[1,2]\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	[., (input | input_line_number)]	-c -e	[1,2]\n	jq: error (at <unknown>): break\n	5
+1\n2\n3	error	-c		jq: error (at <stdin>:1) (not a string): 1\njq: error (at <stdin>:2) (not a string): 2\njq: error (at <stdin>:2) (not a string): 3\n	5
+1\n2\n3	error	-c -e		jq: error (at <stdin>:1) (not a string): 1\njq: error (at <stdin>:2) (not a string): 2\njq: error (at <stdin>:2) (not a string): 3\n	5
+1\n2\n3	if . == 2 then error("x") else . end	-c	1\n3\n	jq: error (at <stdin>:2): x\n	0
+1\n2\n3	if . == 2 then error("x") else . end	-c -e	1\n3\n	jq: error (at <stdin>:2): x\n	0
+1\n2\n3	select(. != 2)	-c	1\n3\n		0
+1\n2\n3	select(. != 2)	-c -e	1\n3\n		0
+1\n2\n3	empty	-c			0
+1\n2\n3	empty	-c -e			4
+1\n2\n3	[., ([inputs] | length)]	-c	[1,2]\n		0
+1\n2\n3	[., ([inputs] | length)]	-c -e	[1,2]\n		0
+1\r\n2\r\n3\r\n	.	-c	1\n2\n3\n		0
+1\r\n2\r\n3\r\n	.	-c -e	1\n2\n3\n		0
+1\r\n2\r\n3\r\n	[., input]	-c	[1,2]\n	jq: error (at <stdin>:3): break\n	5
+1\r\n2\r\n3\r\n	[., input]	-c -e	[1,2]\n	jq: error (at <stdin>:3): break\n	5
+1\r\n2\r\n3\r\n	[., inputs]	-c	[1,2,3]\n		0
+1\r\n2\r\n3\r\n	[., inputs]	-c -e	[1,2,3]\n		0
+1\r\n2\r\n3\r\n	input	-c	2\n	jq: error (at <stdin>:3): break\n	5
+1\r\n2\r\n3\r\n	input	-c -e	2\n	jq: error (at <stdin>:3): break\n	5
+1\r\n2\r\n3\r\n	[., input_line_number]	-c	[1,1]\n[2,2]\n[3,3]\n		0
+1\r\n2\r\n3\r\n	[., input_line_number]	-c -e	[1,1]\n[2,2]\n[3,3]\n		0
+1\r\n2\r\n3\r\n	[input_line_number, input_filename]	-c	[1,"<stdin>"]\n[2,"<stdin>"]\n[3,"<stdin>"]\n		0
+1\r\n2\r\n3\r\n	[input_line_number, input_filename]	-c -e	[1,"<stdin>"]\n[2,"<stdin>"]\n[3,"<stdin>"]\n		0
+1\r\n2\r\n3\r\n	first(inputs)	-c	2\n		0
+1\r\n2\r\n3\r\n	first(inputs)	-c -e	2\n		0
+1\r\n2\r\n3\r\n	[., (try input catch "E")]	-c	[1,2]\n[3,"E"]\n		0
+1\r\n2\r\n3\r\n	[., (try input catch "E")]	-c -e	[1,2]\n[3,"E"]\n		0
+1\r\n2\r\n3\r\n	. as $a | try input catch "E" | [$a, .]	-c	[1,2]\n[3,"E"]\n		0
+1\r\n2\r\n3\r\n	. as $a | try input catch "E" | [$a, .]	-c -e	[1,2]\n[3,"E"]\n		0
+1\r\n2\r\n3\r\n	if . == 2 then halt else . end	-c	1\n		0
+1\r\n2\r\n3\r\n	if . == 2 then halt else . end	-c -e	1\n		0
+1\r\n2\r\n3\r\n	if . == 2 then "bye" | halt_error else . end	-c	1\n	bye	5
+1\r\n2\r\n3\r\n	if . == 2 then "bye" | halt_error else . end	-c -e	1\n	bye	5
+1\r\n2\r\n3\r\n	$__loc__	-c	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+1\r\n2\r\n3\r\n	$__loc__	-c -e	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+1\r\n2\r\n3\r\n	[., input, input_line_number]	-c	[1,2,2]\n	jq: error (at <stdin>:3): break\n	5
+1\r\n2\r\n3\r\n	[., input, input_line_number]	-c -e	[1,2,2]\n	jq: error (at <stdin>:3): break\n	5
+1\r\n2\r\n3\r\n	reduce inputs as $x (.; . + $x)	-c	6\n		0
+1\r\n2\r\n3\r\n	reduce inputs as $x (.; . + $x)	-c -e	6\n		0
+1\r\n2\r\n3\r\n	[limit(2; inputs)]	-c	[2,3]\n		0
+1\r\n2\r\n3\r\n	[limit(2; inputs)]	-c -e	[2,3]\n		0
+1\r\n2\r\n3\r\n	input_line_number	-c	1\n2\n3\n		0
+1\r\n2\r\n3\r\n	input_line_number	-c -e	1\n2\n3\n		0
+1\r\n2\r\n3\r\n	[., (input | input_line_number)]	-c	[1,2]\n	jq: error (at <stdin>:3): break\n	5
+1\r\n2\r\n3\r\n	[., (input | input_line_number)]	-c -e	[1,2]\n	jq: error (at <stdin>:3): break\n	5
+1\r\n2\r\n3\r\n	error	-c		jq: error (at <stdin>:1) (not a string): 1\njq: error (at <stdin>:2) (not a string): 2\njq: error (at <stdin>:3) (not a string): 3\n	5
+1\r\n2\r\n3\r\n	error	-c -e		jq: error (at <stdin>:1) (not a string): 1\njq: error (at <stdin>:2) (not a string): 2\njq: error (at <stdin>:3) (not a string): 3\n	5
+1\r\n2\r\n3\r\n	if . == 2 then error("x") else . end	-c	1\n3\n	jq: error (at <stdin>:2): x\n	0
+1\r\n2\r\n3\r\n	if . == 2 then error("x") else . end	-c -e	1\n3\n	jq: error (at <stdin>:2): x\n	0
+1\r\n2\r\n3\r\n	select(. != 2)	-c	1\n3\n		0
+1\r\n2\r\n3\r\n	select(. != 2)	-c -e	1\n3\n		0
+1\r\n2\r\n3\r\n	empty	-c			0
+1\r\n2\r\n3\r\n	empty	-c -e			4
+1\r\n2\r\n3\r\n	[., ([inputs] | length)]	-c	[1,2]\n		0
+1\r\n2\r\n3\r\n	[., ([inputs] | length)]	-c -e	[1,2]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	.	-c	{"a":1}\n[2]\n3\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	.	-c -e	{"a":1}\n[2]\n3\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	[., input]	-c	[{"a":1},[2]]\n	jq: error (at <stdin>:7): break\n	5
+{\n"a":1\n}\n[\n2\n]\n3\n	[., input]	-c -e	[{"a":1},[2]]\n	jq: error (at <stdin>:7): break\n	5
+{\n"a":1\n}\n[\n2\n]\n3\n	[., inputs]	-c	[{"a":1},[2],3]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	[., inputs]	-c -e	[{"a":1},[2],3]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	input	-c	[2]\n	jq: error (at <stdin>:7): break\n	5
+{\n"a":1\n}\n[\n2\n]\n3\n	input	-c -e	[2]\n	jq: error (at <stdin>:7): break\n	5
+{\n"a":1\n}\n[\n2\n]\n3\n	[., input_line_number]	-c	[{"a":1},3]\n[[2],6]\n[3,7]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	[., input_line_number]	-c -e	[{"a":1},3]\n[[2],6]\n[3,7]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	[input_line_number, input_filename]	-c	[3,"<stdin>"]\n[6,"<stdin>"]\n[7,"<stdin>"]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	[input_line_number, input_filename]	-c -e	[3,"<stdin>"]\n[6,"<stdin>"]\n[7,"<stdin>"]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	first(inputs)	-c	[2]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	first(inputs)	-c -e	[2]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	[., (try input catch "E")]	-c	[{"a":1},[2]]\n[3,"E"]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	[., (try input catch "E")]	-c -e	[{"a":1},[2]]\n[3,"E"]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	. as $a | try input catch "E" | [$a, .]	-c	[{"a":1},[2]]\n[3,"E"]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	. as $a | try input catch "E" | [$a, .]	-c -e	[{"a":1},[2]]\n[3,"E"]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	if . == 2 then halt else . end	-c	{"a":1}\n[2]\n3\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	if . == 2 then halt else . end	-c -e	{"a":1}\n[2]\n3\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	if . == 2 then "bye" | halt_error else . end	-c	{"a":1}\n[2]\n3\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	if . == 2 then "bye" | halt_error else . end	-c -e	{"a":1}\n[2]\n3\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	$__loc__	-c	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	$__loc__	-c -e	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	[., input, input_line_number]	-c	[{"a":1},[2],6]\n	jq: error (at <stdin>:7): break\n	5
+{\n"a":1\n}\n[\n2\n]\n3\n	[., input, input_line_number]	-c -e	[{"a":1},[2],6]\n	jq: error (at <stdin>:7): break\n	5
+{\n"a":1\n}\n[\n2\n]\n3\n	reduce inputs as $x (.; . + $x)	-c	3\n	jq: error (at <stdin>:6): object ({"a":1}) and array ([2]) cannot be added\n	0
+{\n"a":1\n}\n[\n2\n]\n3\n	reduce inputs as $x (.; . + $x)	-c -e	3\n	jq: error (at <stdin>:6): object ({"a":1}) and array ([2]) cannot be added\n	0
+{\n"a":1\n}\n[\n2\n]\n3\n	[limit(2; inputs)]	-c	[[2],3]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	[limit(2; inputs)]	-c -e	[[2],3]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	input_line_number	-c	3\n6\n7\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	input_line_number	-c -e	3\n6\n7\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	[., (input | input_line_number)]	-c	[{"a":1},6]\n	jq: error (at <stdin>:7): break\n	5
+{\n"a":1\n}\n[\n2\n]\n3\n	[., (input | input_line_number)]	-c -e	[{"a":1},6]\n	jq: error (at <stdin>:7): break\n	5
+{\n"a":1\n}\n[\n2\n]\n3\n	error	-c		jq: error (at <stdin>:3) (not a string): {"a":1}\njq: error (at <stdin>:6) (not a string): [2]\njq: error (at <stdin>:7) (not a string): 3\n	5
+{\n"a":1\n}\n[\n2\n]\n3\n	error	-c -e		jq: error (at <stdin>:3) (not a string): {"a":1}\njq: error (at <stdin>:6) (not a string): [2]\njq: error (at <stdin>:7) (not a string): 3\n	5
+{\n"a":1\n}\n[\n2\n]\n3\n	if . == 2 then error("x") else . end	-c	{"a":1}\n[2]\n3\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	if . == 2 then error("x") else . end	-c -e	{"a":1}\n[2]\n3\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	select(. != 2)	-c	{"a":1}\n[2]\n3\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	select(. != 2)	-c -e	{"a":1}\n[2]\n3\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	empty	-c			0
+{\n"a":1\n}\n[\n2\n]\n3\n	empty	-c -e			4
+{\n"a":1\n}\n[\n2\n]\n3\n	[., ([inputs] | length)]	-c	[{"a":1},2]\n		0
+{\n"a":1\n}\n[\n2\n]\n3\n	[., ([inputs] | length)]	-c -e	[{"a":1},2]\n		0
+1\n2\n3\n}	.	-c	1\n2\n3\n	jq: parse error: Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	.	-c -e	1\n2\n3\n	jq: parse error: Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	[., input]	-c	[1,2]\n	jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	[., input]	-c -e	[1,2]\n	jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	[., inputs]	-c		jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	[., inputs]	-c -e		jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	input	-c	2\n	jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	input	-c -e	2\n	jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	first(inputs)	-c	2\n	jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	first(inputs)	-c -e	2\n	jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	[., (try input catch "E")]	-c	[1,2]\n[3,"E"]\n		0
+1\n2\n3\n}	[., (try input catch "E")]	-c -e	[1,2]\n[3,"E"]\n		0
+1\n2\n3\n}	. as $a | try input catch "E" | [$a, .]	-c	[1,2]\n[3,"E"]\n		0
+1\n2\n3\n}	. as $a | try input catch "E" | [$a, .]	-c -e	[1,2]\n[3,"E"]\n		0
+1\n2\n3\n}	if . == 2 then halt else . end	-c	1\n		0
+1\n2\n3\n}	if . == 2 then halt else . end	-c -e	1\n		0
+1\n2\n3\n}	if . == 2 then "bye" | halt_error else . end	-c	1\n	bye	5
+1\n2\n3\n}	if . == 2 then "bye" | halt_error else . end	-c -e	1\n	bye	5
+1\n2\n3\n}	$__loc__	-c	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n	jq: parse error: Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	$__loc__	-c -e	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n	jq: parse error: Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	[., input, input_line_number]	-c	[1,2,2]\n	jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	[., input, input_line_number]	-c -e	[1,2,2]\n	jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	reduce inputs as $x (.; . + $x)	-c		jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	reduce inputs as $x (.; . + $x)	-c -e		jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	[., (input | input_line_number)]	-c	[1,2]\n	jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	[., (input | input_line_number)]	-c -e	[1,2]\n	jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	error	-c		jq: error (at <stdin>:1) (not a string): 1\njq: error (at <stdin>:2) (not a string): 2\njq: error (at <stdin>:3) (not a string): 3\njq: parse error: Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	error	-c -e		jq: error (at <stdin>:1) (not a string): 1\njq: error (at <stdin>:2) (not a string): 2\njq: error (at <stdin>:3) (not a string): 3\njq: parse error: Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	if . == 2 then error("x") else . end	-c	1\n3\n	jq: error (at <stdin>:2): x\njq: parse error: Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	if . == 2 then error("x") else . end	-c -e	1\n3\n	jq: error (at <stdin>:2): x\njq: parse error: Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	select(. != 2)	-c	1\n3\n	jq: parse error: Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	select(. != 2)	-c -e	1\n3\n	jq: parse error: Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	empty	-c		jq: parse error: Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	empty	-c -e		jq: parse error: Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	[., ([inputs] | length)]	-c		jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+1\n2\n3\n}	[., ([inputs] | length)]	-c -e		jq: error (at <stdin>:3): Unmatched '}' at line 4, column 1\n	5
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	.	-c	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	.	-c -e	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[., input]	-c	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[., input]	-c -e	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[., inputs]	-c	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[., inputs]	-c -e	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	input	-c	2\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	input	-c -e	2\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[., input_line_number]	-c	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],1]\n[2,2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[., input_line_number]	-c -e	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],1]\n[2,2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[input_line_number, input_filename]	-c	[1,"<stdin>"]\n[2,"<stdin>"]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[input_line_number, input_filename]	-c -e	[1,"<stdin>"]\n[2,"<stdin>"]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	first(inputs)	-c	2\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	first(inputs)	-c -e	2\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[., (try input catch "E")]	-c	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[., (try input catch "E")]	-c -e	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	. as $a | try input catch "E" | [$a, .]	-c	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	. as $a | try input catch "E" | [$a, .]	-c -e	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	if . == 2 then halt else . end	-c	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	if . == 2 then halt else . end	-c -e	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	if . == 2 then "bye" | halt_error else . end	-c	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	bye	5
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	if . == 2 then "bye" | halt_error else . end	-c -e	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	bye	5
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	$__loc__	-c	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	$__loc__	-c -e	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[., input, input_line_number]	-c	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],2,2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[., input, input_line_number]	-c -e	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],2,2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	reduce inputs as $x (.; . + $x)	-c		jq: error (at <stdin>:2): array ([[[[[[[[[[[...) and number (2) cannot be added\n	5
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	reduce inputs as $x (.; . + $x)	-c -e		jq: error (at <stdin>:2): array ([[[[[[[[[[[...) and number (2) cannot be added\n	5
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[limit(2; inputs)]	-c	[2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[limit(2; inputs)]	-c -e	[2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	input_line_number	-c	1\n2\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	input_line_number	-c -e	1\n2\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[., (input | input_line_number)]	-c	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[., (input | input_line_number)]	-c -e	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],2]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	error	-c		jq: error (at <stdin>:1) (not a string): [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\njq: error (at <stdin>:2) (not a string): 2\n	5
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	error	-c -e		jq: error (at <stdin>:1) (not a string): [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\njq: error (at <stdin>:2) (not a string): 2\n	5
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	if . == 2 then error("x") else . end	-c	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	jq: error (at <stdin>:2): x\n	5
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	if . == 2 then error("x") else . end	-c -e	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	jq: error (at <stdin>:2): x\n	5
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	select(. != 2)	-c	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	select(. != 2)	-c -e	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	empty	-c			0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	empty	-c -e			4
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[., ([inputs] | length)]	-c	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],1]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n2\n	[., ([inputs] | length)]	-c -e	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],1]\n		0
+{"a":1,"a":2}\n3\n	.	-c	{"a":2}\n3\n		0
+{"a":1,"a":2}\n3\n	.	-c -e	{"a":2}\n3\n		0
+{"a":1,"a":2}\n3\n	[., input]	-c	[{"a":2},3]\n		0
+{"a":1,"a":2}\n3\n	[., input]	-c -e	[{"a":2},3]\n		0
+{"a":1,"a":2}\n3\n	[., inputs]	-c	[{"a":2},3]\n		0
+{"a":1,"a":2}\n3\n	[., inputs]	-c -e	[{"a":2},3]\n		0
+{"a":1,"a":2}\n3\n	input	-c	3\n		0
+{"a":1,"a":2}\n3\n	input	-c -e	3\n		0
+{"a":1,"a":2}\n3\n	[., input_line_number]	-c	[{"a":2},1]\n[3,2]\n		0
+{"a":1,"a":2}\n3\n	[., input_line_number]	-c -e	[{"a":2},1]\n[3,2]\n		0
+{"a":1,"a":2}\n3\n	[input_line_number, input_filename]	-c	[1,"<stdin>"]\n[2,"<stdin>"]\n		0
+{"a":1,"a":2}\n3\n	[input_line_number, input_filename]	-c -e	[1,"<stdin>"]\n[2,"<stdin>"]\n		0
+{"a":1,"a":2}\n3\n	first(inputs)	-c	3\n		0
+{"a":1,"a":2}\n3\n	first(inputs)	-c -e	3\n		0
+{"a":1,"a":2}\n3\n	[., (try input catch "E")]	-c	[{"a":2},3]\n		0
+{"a":1,"a":2}\n3\n	[., (try input catch "E")]	-c -e	[{"a":2},3]\n		0
+{"a":1,"a":2}\n3\n	. as $a | try input catch "E" | [$a, .]	-c	[{"a":2},3]\n		0
+{"a":1,"a":2}\n3\n	. as $a | try input catch "E" | [$a, .]	-c -e	[{"a":2},3]\n		0
+{"a":1,"a":2}\n3\n	if . == 2 then halt else . end	-c	{"a":2}\n3\n		0
+{"a":1,"a":2}\n3\n	if . == 2 then halt else . end	-c -e	{"a":2}\n3\n		0
+{"a":1,"a":2}\n3\n	if . == 2 then "bye" | halt_error else . end	-c	{"a":2}\n3\n		0
+{"a":1,"a":2}\n3\n	if . == 2 then "bye" | halt_error else . end	-c -e	{"a":2}\n3\n		0
+{"a":1,"a":2}\n3\n	$__loc__	-c	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+{"a":1,"a":2}\n3\n	$__loc__	-c -e	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+{"a":1,"a":2}\n3\n	[., input, input_line_number]	-c	[{"a":2},3,2]\n		0
+{"a":1,"a":2}\n3\n	[., input, input_line_number]	-c -e	[{"a":2},3,2]\n		0
+{"a":1,"a":2}\n3\n	reduce inputs as $x (.; . + $x)	-c		jq: error (at <stdin>:2): object ({"a":2}) and number (3) cannot be added\n	5
+{"a":1,"a":2}\n3\n	reduce inputs as $x (.; . + $x)	-c -e		jq: error (at <stdin>:2): object ({"a":2}) and number (3) cannot be added\n	5
+{"a":1,"a":2}\n3\n	[limit(2; inputs)]	-c	[3]\n		0
+{"a":1,"a":2}\n3\n	[limit(2; inputs)]	-c -e	[3]\n		0
+{"a":1,"a":2}\n3\n	input_line_number	-c	1\n2\n		0
+{"a":1,"a":2}\n3\n	input_line_number	-c -e	1\n2\n		0
+{"a":1,"a":2}\n3\n	[., (input | input_line_number)]	-c	[{"a":2},2]\n		0
+{"a":1,"a":2}\n3\n	[., (input | input_line_number)]	-c -e	[{"a":2},2]\n		0
+{"a":1,"a":2}\n3\n	error	-c		jq: error (at <stdin>:1) (not a string): {"a":2}\njq: error (at <stdin>:2) (not a string): 3\n	5
+{"a":1,"a":2}\n3\n	error	-c -e		jq: error (at <stdin>:1) (not a string): {"a":2}\njq: error (at <stdin>:2) (not a string): 3\n	5
+{"a":1,"a":2}\n3\n	if . == 2 then error("x") else . end	-c	{"a":2}\n3\n		0
+{"a":1,"a":2}\n3\n	if . == 2 then error("x") else . end	-c -e	{"a":2}\n3\n		0
+{"a":1,"a":2}\n3\n	select(. != 2)	-c	{"a":2}\n3\n		0
+{"a":1,"a":2}\n3\n	select(. != 2)	-c -e	{"a":2}\n3\n		0
+{"a":1,"a":2}\n3\n	empty	-c			0
+{"a":1,"a":2}\n3\n	empty	-c -e			4
+{"a":1,"a":2}\n3\n	[., ([inputs] | length)]	-c	[{"a":2},1]\n		0
+{"a":1,"a":2}\n3\n	[., ([inputs] | length)]	-c -e	[{"a":2},1]\n		0
+"a"\n"b"\n"c"\n	.	-c	"a"\n"b"\n"c"\n		0
+"a"\n"b"\n"c"\n	.	-c -e	"a"\n"b"\n"c"\n		0
+"a"\n"b"\n"c"\n	[., input]	-c	["a","b"]\n	jq: error (at <stdin>:3): break\n	5
+"a"\n"b"\n"c"\n	[., input]	-c -e	["a","b"]\n	jq: error (at <stdin>:3): break\n	5
+"a"\n"b"\n"c"\n	[., inputs]	-c	["a","b","c"]\n		0
+"a"\n"b"\n"c"\n	[., inputs]	-c -e	["a","b","c"]\n		0
+"a"\n"b"\n"c"\n	input	-c	"b"\n	jq: error (at <stdin>:3): break\n	5
+"a"\n"b"\n"c"\n	input	-c -e	"b"\n	jq: error (at <stdin>:3): break\n	5
+"a"\n"b"\n"c"\n	[., input_line_number]	-c	["a",1]\n["b",2]\n["c",3]\n		0
+"a"\n"b"\n"c"\n	[., input_line_number]	-c -e	["a",1]\n["b",2]\n["c",3]\n		0
+"a"\n"b"\n"c"\n	[input_line_number, input_filename]	-c	[1,"<stdin>"]\n[2,"<stdin>"]\n[3,"<stdin>"]\n		0
+"a"\n"b"\n"c"\n	[input_line_number, input_filename]	-c -e	[1,"<stdin>"]\n[2,"<stdin>"]\n[3,"<stdin>"]\n		0
+"a"\n"b"\n"c"\n	first(inputs)	-c	"b"\n		0
+"a"\n"b"\n"c"\n	first(inputs)	-c -e	"b"\n		0
+"a"\n"b"\n"c"\n	[., (try input catch "E")]	-c	["a","b"]\n["c","E"]\n		0
+"a"\n"b"\n"c"\n	[., (try input catch "E")]	-c -e	["a","b"]\n["c","E"]\n		0
+"a"\n"b"\n"c"\n	. as $a | try input catch "E" | [$a, .]	-c	["a","b"]\n["c","E"]\n		0
+"a"\n"b"\n"c"\n	. as $a | try input catch "E" | [$a, .]	-c -e	["a","b"]\n["c","E"]\n		0
+"a"\n"b"\n"c"\n	if . == 2 then halt else . end	-c	"a"\n"b"\n"c"\n		0
+"a"\n"b"\n"c"\n	if . == 2 then halt else . end	-c -e	"a"\n"b"\n"c"\n		0
+"a"\n"b"\n"c"\n	if . == 2 then "bye" | halt_error else . end	-c	"a"\n"b"\n"c"\n		0
+"a"\n"b"\n"c"\n	if . == 2 then "bye" | halt_error else . end	-c -e	"a"\n"b"\n"c"\n		0
+"a"\n"b"\n"c"\n	$__loc__	-c	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+"a"\n"b"\n"c"\n	$__loc__	-c -e	{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n{"file":"<top-level>","line":1}\n		0
+"a"\n"b"\n"c"\n	[., input, input_line_number]	-c	["a","b",2]\n	jq: error (at <stdin>:3): break\n	5
+"a"\n"b"\n"c"\n	[., input, input_line_number]	-c -e	["a","b",2]\n	jq: error (at <stdin>:3): break\n	5
+"a"\n"b"\n"c"\n	reduce inputs as $x (.; . + $x)	-c	"abc"\n		0
+"a"\n"b"\n"c"\n	reduce inputs as $x (.; . + $x)	-c -e	"abc"\n		0
+"a"\n"b"\n"c"\n	[limit(2; inputs)]	-c	["b","c"]\n		0
+"a"\n"b"\n"c"\n	[limit(2; inputs)]	-c -e	["b","c"]\n		0
+"a"\n"b"\n"c"\n	input_line_number	-c	1\n2\n3\n		0
+"a"\n"b"\n"c"\n	input_line_number	-c -e	1\n2\n3\n		0
+"a"\n"b"\n"c"\n	[., (input | input_line_number)]	-c	["a",2]\n	jq: error (at <stdin>:3): break\n	5
+"a"\n"b"\n"c"\n	[., (input | input_line_number)]	-c -e	["a",2]\n	jq: error (at <stdin>:3): break\n	5
+"a"\n"b"\n"c"\n	error	-c		jq: error (at <stdin>:1): a\njq: error (at <stdin>:2): b\njq: error (at <stdin>:3): c\n	5
+"a"\n"b"\n"c"\n	error	-c -e		jq: error (at <stdin>:1): a\njq: error (at <stdin>:2): b\njq: error (at <stdin>:3): c\n	5
+"a"\n"b"\n"c"\n	if . == 2 then error("x") else . end	-c	"a"\n"b"\n"c"\n		0
+"a"\n"b"\n"c"\n	if . == 2 then error("x") else . end	-c -e	"a"\n"b"\n"c"\n		0
+"a"\n"b"\n"c"\n	select(. != 2)	-c	"a"\n"b"\n"c"\n		0
+"a"\n"b"\n"c"\n	select(. != 2)	-c -e	"a"\n"b"\n"c"\n		0
+"a"\n"b"\n"c"\n	empty	-c			0
+"a"\n"b"\n"c"\n	empty	-c -e			4
+"a"\n"b"\n"c"\n	[., ([inputs] | length)]	-c	["a",2]\n		0
+"a"\n"b"\n"c"\n	[., ([inputs] | length)]	-c -e	["a",2]\n		0

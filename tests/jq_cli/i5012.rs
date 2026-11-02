@@ -14,7 +14,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// root object, a container, which the #4800 reading needed to be a `null`/boolean: the handler was run with no register
 /// and `$i` refused as exact, so `[path(..)?]` dropped jq's path. Then a step before the run's last, and a source with no
 /// bound (`.[]?`). Rows captured from jq 1.7.1 (stdout, first stderr line, exit code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_try_handler_on_a_container_state_sits_at_the_try_entry_5012() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -74,7 +73,6 @@ fn test_foreach_update_try_handler_on_a_container_state_sits_at_the_try_entry_50
 /// object raises `Cannot index object with number`, `{a:$a,b:$b}` raises at `.b`, checked against `.a`, and
 /// `{a:{b:$b}}` raises at `.b` of the array `.a` its first step moved the register onto, so the nested `foreach` raises
 /// whatever state the earlier step's handler left. Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_try_handler_where_the_pattern_raises_on_the_register_5012() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -141,7 +139,6 @@ fn test_foreach_update_try_handler_where_the_pattern_raises_on_the_register_5012
 /// earlier step's handler left (`"c"`, or the root) is not equal to that landing, so it is never `jv_identical` to it
 /// and the pattern's `.` body emits it off the register, as #4800 reads a `null`/boolean state. Rows captured from jq
 /// 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_try_handler_where_the_landing_is_not_the_state_5012() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -166,7 +163,6 @@ fn test_foreach_update_try_handler_where_the_landing_is_not_the_state_5012() -> 
 /// the child the first moved the register onto and raises, the source's own `try` empties it, and the `foreach` emits
 /// nothing, so `path` is empty and `del`/`|=` leave the document. Read now that a pattern that raises on the register
 /// is read whatever the state (#4800 pinned these refused). Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_caught_two_entry_destructure_on_the_register_empties_the_step_5012() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -231,7 +227,6 @@ fn test_caught_two_entry_destructure_on_the_register_empties_the_step_5012() -> 
 
 /// #5012: every step of `..`: the root (whose state is `null`, #4800's reading), then `.a` and `.a.a`, whose state is
 /// the root the previous handler emitted. Rows captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_try_handler_on_every_step_of_an_unbounded_source_5012() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -258,7 +253,6 @@ fn test_foreach_update_try_handler_on_every_step_of_an_unbounded_source_5012() -
 /// reading now covers: a two-entry pattern (`{a:$a,b:$b}`), whose second step raises against the moved register and
 /// is caught by the source's own `try`, so the `foreach` emits nothing, as in jq. Rows captured from jq 1.7.1, both
 /// routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_try_handler_before_the_run_last_step_is_placed_5012() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -472,7 +466,6 @@ fn test_foreach_update_try_handler_before_the_run_last_step_is_placed_5012() -> 
 /// the source in jq and moves the register first; a `try .. catch 1` around the source's destructure emits from the
 /// raise. (A step whose element `$x` is, with a one-entry pattern landing on the state, is read by position since
 /// #5179, `tests/jq_cli/i5179.rs`.) Both routes.
-#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_try_handler_where_the_reading_does_not_hold_stays_refused_5012() -> Result<()>
 {

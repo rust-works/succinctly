@@ -166,8 +166,7 @@ documents since #5378, and the fused-slice equivalence tests build large arrays)
 all of them in their own `deep-recursion` leg rather than in `cli-gated`;
 `scripts/deep-recursion-tests.sh` holds the list for both sides (#3698), so to move another
 slow `jq_cli_tests` test there, add its name to that script's `HEAVY_TESTS` (it handles that one
-test target only). The x86_64 `holdout` leg skips only the two stack tests (`skip-args-stack`),
-since it is the one place the `unshared-containers` build is tested. `scripts/deep-recursion-tests.sh run` runs just those tests locally, and
+test target only). `scripts/deep-recursion-tests.sh run` runs just those tests locally, and
 `scripts/test_deep_recursion_tests.py` is the script's own self-test, which the leg runs
 first. That leg also runs all of `yq_cli_tests` (#5705, ~30% of `cli-gated`'s test time), but
 as a separate `cargo test --features cli --test yq_cli_tests` after the script, so `run` alone
@@ -464,6 +463,25 @@ cargo clippy --all-targets --features std,simd,serde,cli,regex,bench-runner,larg
 
 # ARM64 only, additionally (lints neon.rs/broadword.rs, which don't compile on x86_64 at all)
 cargo clippy --all-targets --features std,simd,broadword-yaml,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
+```
+
+Rustdoc has the same blind spot, so CI's `Documentation` job runs it twice and the `rustdoc` and
+`rustdoc-simd-backends` pre-push gates mirror both (#5740). A broken intra-doc link in the x86_64 YAML
+backend is invisible to the `--all-features` run, which compiles that backend out:
+
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests
+```
+
+The second run documents the SIMD backend of the machine it runs on: CI's `Documentation` job is x86_64 Linux, so
+it covers `x86.rs` and the AVX-512 popcount path, and the `rustdoc-simd-backends` gate on an Apple Silicon machine
+covers `neon.rs` instead. To check the x86_64 backend from there, add `--target x86_64-apple-darwin`.
+`neon.rs` and `broadword.rs` are documented on ARM64 (#5908): the `clippy-all-variants` leg of CI's ARM64 matrix runs
+the second command above and a third with `broadword-yaml`, which the `rustdoc-arm-broadword` gate mirrors on an ARM64 machine:
+
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features std,simd,broadword-yaml,serde,cli,regex,bench-runner,large-tests,mmap-tests
 ```
 
 ### Documentation

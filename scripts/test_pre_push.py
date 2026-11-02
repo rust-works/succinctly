@@ -11,10 +11,12 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -169,6 +171,14 @@ class PlanTests(unittest.TestCase):
         self.assertIsNone(p["ledger-only"])
         self.assertIsNotNone(p["fmt"])
 
+    def test_a_generated_doc_block_runs_the_bench_runner_bin_tests(self):
+        # A hand edit to a block the compare tests hold to docs/compare/ fails before the push.
+        self.assertIsNone(self.plan(["docs/benchmarks/jq.md"])["bench-runner-bin"])
+        self.assertIsNone(self.plan(["docs/compare/jq-linux-x86_64.json"])["bench-runner-bin"])
+        self.assertIsNone(self.plan(["src/bin/succinctly/compare/docs.rs"])["bench-runner-bin"])
+        self.assertIsNotNone(self.plan(["docs/benchmarks/yq.md"])["bench-runner-bin"])
+        self.assertIsNotNone(self.plan(["src/jq/eval.rs"])["bench-runner-bin"])
+
     def test_full_adds_the_lints_and_arm_only_where_it_applies(self):
         self.assertIsNone(self.plan(["src/lib.rs"], "full")["clippy"])
         self.assertIsNotNone(self.plan(["src/lib.rs"], "full", "x86_64")["clippy-arm-broadword"])
@@ -183,6 +193,69 @@ class PlanTests(unittest.TestCase):
     def test_gates_are_ordered_cheapest_first(self):
         order = [g.cost for g, _ in pre_push.plan([], "full", "x86_64", set())]
         self.assertEqual(order, sorted(order))
+
+
+class GateEnvironmentTests(unittest.TestCase):
+    """A harness `PATH` without rustup's directory must not fail every cargo gate (#5901)."""
+
+    def cargo_home(self, with_cargo=True):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        bin_dir = os.path.join(home.name, "bin")
+        os.makedirs(bin_dir)
+        if with_cargo:
+            stub = os.path.join(bin_dir, "cargo")
+            with open(stub, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(stub, 0o755)
+        return home.name
+
+    def empty_path(self):
+        empty = tempfile.TemporaryDirectory()
+        self.addCleanup(empty.cleanup)
+        return empty.name
+
+    def test_cargo_home_is_put_on_a_path_that_lacks_cargo(self):
+        home = self.cargo_home()
+        env = pre_push.gate_environment({}, {"PATH": self.empty_path(), "CARGO_HOME": home})
+        self.assertEqual(env["PATH"].split(os.pathsep)[0], os.path.join(home, "bin"))
+        self.assertIsNotNone(shutil.which("cargo", path=env["PATH"]))
+
+    def test_dot_cargo_in_home_is_the_fallback_without_cargo_home(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        os.makedirs(os.path.join(home.name, ".cargo", "bin"))
+        stub = os.path.join(home.name, ".cargo", "bin", "cargo")
+        open(stub, "w").close()
+        os.chmod(stub, 0o755)
+        env = pre_push.gate_environment({}, {"PATH": self.empty_path(), "HOME": home.name})
+        self.assertEqual(env["PATH"].split(os.pathsep)[0], os.path.join(home.name, ".cargo", "bin"))
+
+    def test_a_path_that_already_has_cargo_is_left_alone(self):
+        on_path = self.cargo_home()
+        elsewhere = self.cargo_home()
+        path = os.path.join(on_path, "bin")
+        env = pre_push.gate_environment({}, {"PATH": path, "CARGO_HOME": elsewhere})
+        self.assertEqual(env["PATH"], path)
+
+    def test_a_machine_with_no_cargo_stays_without_it_so_the_gate_fails_loudly(self):
+        home = self.cargo_home(with_cargo=False)
+        path = self.empty_path()
+        env = pre_push.gate_environment({}, {"PATH": path, "CARGO_HOME": home})
+        self.assertEqual(env["PATH"], path)
+        self.assertIsNone(shutil.which("cargo", path=env["PATH"]))
+
+    def test_the_gates_own_variables_are_kept(self):
+        env = pre_push.gate_environment({"RUSTDOCFLAGS": "-D warnings"}, {"PATH": self.empty_path()})
+        self.assertEqual(env["RUSTDOCFLAGS"], "-D warnings")
+
+    def test_the_hook_run_reaches_a_gate_that_needs_cargo(self):
+        """End to end: a gate step `cargo ...` runs under a PATH without cargo and finds it."""
+        home = self.cargo_home()
+        env = pre_push.gate_environment({}, {"PATH": "/usr/bin:/bin", "CARGO_HOME": home})
+        if shutil.which("cargo", path="/usr/bin:/bin"):
+            self.skipTest("a system cargo is on the minimal PATH")
+        self.assertEqual(subprocess.run(["bash", "-c", "cargo --version"], env=env).returncode, 0)
 
 
 class PushDetectionTests(unittest.TestCase):
@@ -256,11 +329,75 @@ class PushDetectionTests(unittest.TestCase):
     def test_an_unbalanced_quote_still_finds_the_push(self):
         self.assertEqual(self.pushes("echo 'unterminated; git push"), ["/work"])
 
+    def test_a_directory_named_by_an_assignment_in_the_same_command_is_resolved_5850(self):
+        for command in (
+            'WT=/x/y; git -C "$WT" push -u origin b',
+            'WT=/x/y; cd "$WT" && git push',
+            'WT=/x/y; cd "$WT" && git -C "$WT" push',
+            'export WT=/x/y && git -C "$WT" push',
+            'declare -x WT=/x/y; git -C "$WT" push',
+            'WT=/x/y bash -c \'git -C "$WT" push\'',
+            'export WT=/x/y; bash -c \'git -C "$WT" push\'',
+            'WT=/x/y; git -C ${WT} push',
+            "bash -c 'WT=/x/y; git -C \"$WT\" push'",
+            'true; WT=/x && WT=/x/y && git -C "$WT" push',
+            'A=/x; B=$A/y; git -C "$B" push',
+        ):
+            self.assertEqual(self.pushes(command), ["/x/y"], command)
+        self.assertEqual(self.pushes('WT=/x; git -C "$WT/sub" push'), ["/x/sub"])
+        self.assertEqual(self.pushes('WT=sub; git -C "$WT" push', "/work"), ["/work/sub"])
+        # The shell expands a leading `~` in an assignment.
+        home = os.path.expanduser("~")
+        self.assertEqual(self.pushes('WT=~/wt/a; git -C "$WT" push'), [os.path.join(home, "wt", "a")])
+
+    def test_a_directory_that_names_an_unknown_variable_is_unresolved_5850(self):
+        for command in (
+            'git -C "$WT" push',
+            'cd "$WT" && git push',
+            "git -C '$WT' push",
+            'WT=$(git rev-parse --show-toplevel); git -C "$WT" push',
+            'WT=`pwd`; git -C "$WT" push',
+            'WT=/x; git -C "$OTHER" push',
+            'cd "$WT"; git -C sub push',
+            # The shell expands a prefix assignment's neighbours first, and it ends with its command.
+            'WT=/x/y git -C "$WT" push',
+            'env WT=/x/y git -C "$WT" push',
+            'WT=/x/y git status; git -C "$WT" push',
+            # An assignment that may not have run, or ran in a subshell, leaves the variable unknown.
+            '(WT=/x/y); git -C "$WT" push',
+            'false && WT=/x/y; git -C "$WT" push',
+            'WT=/x/y || WT=/x/z; git -C "$WT" push',
+            'WT=/x/y | cat; git -C "$WT" push',
+            'cargo build && WT=/x/y; git -C "$WT" push',
+            # A child shell sees only what was exported.
+            "WT=/x/y; bash -c 'git -C \"$WT\" push'",
+        ):
+            found = pre_push.pushes(command, "/work")
+            self.assertEqual(len(found), 1, command)
+            self.assertIsInstance(found[0][0], pre_push.Unresolved, command)
+        # `$PWD` is the directory the hook was given, then wherever a resolved `cd` went.
+        self.assertEqual(self.pushes('git -C "$PWD" push', "/work"), ["/work"])
+        self.assertEqual(self.pushes('cd sub; git -C "$PWD" push', "/work"), ["/work/sub"])
+        self.assertEqual(self.pushes('cd "$PWD/sub" && git push', "/work"), ["/work/sub"])
+        # An absolute path after an unresolved one is a path again.
+        self.assertEqual(self.pushes('cd "$WT"; git -C /abs push'), ["/abs"])
+        self.assertNotIsInstance(pre_push.pushes('cd "$WT"; git -C /abs push', "/w")[0][0], pre_push.Unresolved)
+        # A variable set to something unreadable stops being known.
+        found = pre_push.pushes('WT=/x; WT=$(pwd); git -C "$WT" push', "/work")
+        self.assertIsInstance(found[0][0], pre_push.Unresolved)
+
 
 class HookTests(unittest.TestCase):
     """The hook against a real repository whose `scripts/pre_push.py` is a stub."""
 
     def setUp(self):
+        # `hook()` hands the gate a copy of this process's environment, and the push that runs the
+        # suite (`PRE_PUSH_SKIP=fmt git push`, whose `script-tests` gate runs it) sets the variable
+        # this class tests: start from a clean one (#5910).
+        patched = mock.patch.dict(os.environ)
+        patched.start()
+        self.addCleanup(patched.stop)
+        os.environ.pop("PRE_PUSH_SKIP", None)
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.root = os.path.realpath(self.dir.name)
@@ -315,6 +452,42 @@ class HookTests(unittest.TestCase):
             f.write("import os, sys\nsys.exit(0 if 'fmt' in os.environ.get('PRE_PUSH_SKIP', '').split() else 1)\n")
         self.assertEqual(self.call("git push")[0], 2)
         self.assertEqual(self.call("PRE_PUSH_SKIP=fmt git push")[0], 0)
+
+    def test_a_push_through_a_shell_variable_runs_the_gate_5850(self):
+        self.stub(1)
+        # The spelling the global worktree instructions require, from the main checkout's cwd.
+        for command in (
+            f'WT={self.root}; git -C "$WT" push -u origin b',
+            f'WT={self.root}; cd "$WT" && git -C "$WT" rev-parse --abbrev-ref HEAD && git -C "$WT" push -u origin b',
+            f'export WT={self.root}; git -C "$WT" push 2>&1',
+        ):
+            code, message = self.call(command, cwd="/")
+            self.assertEqual(code, 2, command)
+            self.assertIn("stub gate output", message, command)
+        self.stub(0)
+        self.assertEqual(self.call(f'WT={self.root}; git -C "$WT" push', cwd="/")[0], 0)
+
+    def test_a_push_in_a_directory_the_hook_cannot_resolve_is_refused_5850(self):
+        self.stub(0)  # a passing gate: the refusal is about not knowing where to run it
+        for command in ('git -C "$WT" push', 'cd "$WT" && git push', 'WT=$(pwd); git -C "$WT" push'):
+            code, message = self.call(command)
+            self.assertEqual(code, 2, command)
+            self.assertIn("names a shell variable", message, command)
+            self.assertIn("$WT", message, command)
+
+    def test_a_push_in_a_directory_that_is_no_repository_is_refused_not_waved_through_5850(self):
+        self.stub(0)
+        nowhere = tempfile.TemporaryDirectory()
+        self.addCleanup(nowhere.cleanup)
+        code, message = self.call(f"git -C {nowhere.name} push")
+        self.assertEqual(code, 2)
+        self.assertIn("cannot find the repository", message)
+
+    def test_an_inherited_skip_variable_does_not_reach_the_stub_gates_5910(self):
+        with open(os.path.join(self.root, "scripts", "pre_push.py"), "w", encoding="utf-8") as f:
+            f.write("import os, sys\nsys.exit(0 if 'fmt' in os.environ.get('PRE_PUSH_SKIP', '').split() else 1)\n")
+        # `setUp` cleared the variable an enclosing push set; the gate sees only what the command says.
+        self.assertEqual(self.call("git push")[0], 2)
 
     def test_unreadable_input_is_allowed(self):
         self.assertEqual(pre_push.hook(io.StringIO("not json")), 0)

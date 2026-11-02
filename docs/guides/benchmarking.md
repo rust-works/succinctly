@@ -153,7 +153,7 @@ Run targeted benchmarks when:
 ### CI/CD: Automated
 
 GitHub Actions runs `rank_select` benchmarks on every PR/push for smoke testing:
-- x86_64 (ubuntu-latest)
+- x86_64 (ubuntu-24.04)
 - ARM64-Linux (ubuntu-24.04-arm)
 - ARM64-macOS (macos-latest)
 
@@ -710,7 +710,7 @@ the measurement that justified [select-scan.md](../optimizations/select-scan.md)
 ### CI/CD Platforms
 
 GitHub Actions runs benchmarks on:
-- **ubuntu-latest** (x86_64)
+- **ubuntu-24.04** (x86_64)
 - **ubuntu-24.04-arm** (ARM64)
 - **macos-latest** (Apple Silicon M-series)
 
@@ -758,7 +758,7 @@ nobody compares against a baseline and used about 40% of CI's macOS-minutes. The
 regression signal is `perf-guard` in `ci.yml`.
 
 **Test Matrix**:
-- x86_64 (ubuntu-latest)
+- x86_64 (ubuntu-24.04)
 - ARM64-Linux (ubuntu-24.04-arm)
 - ARM64-macOS (macos-latest)
 
@@ -770,6 +770,21 @@ regression signal is `perf-guard` in `ci.yml`.
 ```
 
 **Artifacts**: Uploaded as `benchmark-results-{arch}` with 3 text files per platform.
+
+### Slow CI jobs
+
+A `Test` leg can get several times slower and stay green (#5845: the `no-std` legs ran at 2.5-3x for nine
+days; #5494: the macOS `cli-gated` leg grew by half in a week). The `ci-times` job in the same scheduled
+workflow reads the job times of the newest successful `merge_group` runs of `ci.yml` through the Actions
+API and compares each job's median with its median over the two weeks before (`scripts/ci_leg_times.py`).
+A job that is both 1.5x and two minutes slower goes in the job summary and in one open issue labelled
+`ci-slowdown` (a comment at most once a day). It is a report, not a check, and the thresholds are wide
+because runner noise is: the same leg has measured 4.8 and 6.9 minutes in adjacent runs.
+
+Run it by hand with `python3 scripts/ci_leg_times.py report` (needs `gh` and a token), or replay a past
+window with `--as-of 2026-10-26T00:00:00Z`: that date flags the `no-std` legs a day after #5232 merged,
+and `--as-of 2026-10-24T12:00:00Z` flags nothing. A flagged job is a prompt to read its log: the `finished
+in` lines name the test binary that grew.
 
 ### What CI Does NOT Run
 
@@ -805,9 +820,6 @@ benchmark suite. Every rule below cost a wrong conclusion at least once, during 
 detection work in #106; that investigation's write-up in `docs/parsing/yaml.md` (optimisations
 O5 and O6) carries the full numbers.
 
-`scripts/ab-cli.py` implements rules 1, 2, 4 and 6 for CLI-level A/B work:
-
-```bash
 ### The never-triggering holdout build
 
 A layout or representation change moves code around, and on this codebase code
@@ -834,15 +846,20 @@ Three rules make the holdout trustworthy, each learned the hard way (#3000,
    shipped shape for the same reason.
 3. **Retire the switch when its measurement is recorded.** `unboxed-object-map`
    (#3000) was replaced by `unshared-containers` (#2999) once B's numbers were in
-   the ADR; a holdout that outlives its experiment is a permanent second layout
-   for no measurement.
+   the ADR, and `unshared-containers` was deleted once ADR-0024 recorded C's
+   (#5841); a holdout that outlives its experiment is a permanent second layout
+   for no measurement. That one had grown to 1,240 test ignores, about 270 `cfg`
+   sites and its own CI leg, and had stopped being functionally BASE (#5233 made
+   it refuse dynamic path targets). A later change builds its own holdout against
+   the HEAD of its day, as #3182's `unshared-strings` did; git history keeps the
+   old layouts.
 
-Current switch: `unshared-containers` (the #3000 layout for `OwnedValue`'s
-containers). The `share-stats` feature is its companion for the copy audit
-(`SUCCINCTLY_SHARE_STATS=1`). Since #5233 the holdout refuses a jq program whose path
-target does more than navigate (the path-mode interpreter needs the storage identity this
-layout lacks), so an A/B corpus for it keeps such rows out.
+Current switch: none. The `share-stats` feature (the copy-on-write audit,
+`SUCCINCTLY_SHARE_STATS=1`) stays: it is additive and instruments the shipped build.
 
+`scripts/ab-cli.py` implements rules 1, 2, 4 and 6 for CLI-level A/B work:
+
+```bash
 # what the harness reports for a change that does not exist — run this first, once per machine
 scripts/ab-cli.py --before ./succ-base --control --corpus ~/wrk/bench-scratch/mycorpus
 
@@ -1451,7 +1468,7 @@ test bench_name ... bench:  1,234 ns/iter (+/- 56)
 - **Platform**: CPU model and OS version
 - **Tool versions**: For comparison benchmarks (jq-1.6, yq v4.48.1)
 - **Build flags**: Any special RUSTFLAGS or features, and — for an A/B comparing two binaries —
-  which release profile built each side (see [A/B Benchmarking Method § 9](#a-b-benchmarking-method),
+  which release profile built each side (see [A/B Benchmarking Method § 9](#ab-benchmarking-method),
   #1587). Since #2603 a plain `cargo build --release` is `codegen-units=1`, `lto="fat"`; a binary
   built from a tree older than that is default `codegen-units=16`, which can add its own
   ±10-27% independent of the change being measured, so say which.

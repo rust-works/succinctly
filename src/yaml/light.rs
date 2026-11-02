@@ -1966,6 +1966,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if let Some(tag) = self.explicit_tag_at(None) {
                     out.write_str(tag)?;
                     out.write_char(' ')?;
+                } else if is_plain_merge_scalar(&s) {
+                    // yq resolves a plain `<<` to `!!merge` wherever it sits and writes the tag
+                    // (`a: !!merge <<`, `[!!merge <<]`, #5833), as the key writer does for a
+                    // merge key.
+                    out.write_str("!!merge ")?;
                 }
                 // A source-level block literal (`|`) or folded (`>`) scalar
                 // has no branch in `stream_yaml_string_value` at all - it
@@ -5985,6 +5990,13 @@ fn upsert_field<'a, W: AsRef<[u64]>>(
     }
 }
 
+/// Whether `s` is a plain `<<`, which YAML resolves to the `!!merge` tag in any position (#5833).
+/// A quoted `"<<"` is a string. Compares the raw bytes: a plain scalar spelled `<<` has no
+/// escapes or folding to decode.
+pub(crate) fn is_plain_merge_scalar(s: &YamlString<'_>) -> bool {
+    matches!(s, YamlString::Unquoted { .. }) && s.raw_bytes() == b"<<"
+}
+
 /// Is this key's already-decoded value YAML's merge key?
 ///
 /// Empirically, mikefarah/yq treats a key whose *decoded* content is `<<` as
@@ -8131,6 +8143,22 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     #[inline]
     fn style(&self) -> &'static str {
         YamlCursor::style(self)
+    }
+
+    fn alias_target_style(&self) -> &'static str {
+        if !self.is_alias() {
+            return "";
+        }
+        let Some(target) = self.resolve_alias_target_cursor() else {
+            return "";
+        };
+        let style = YamlCursor::style(&target);
+        // `&a !!str 12` is a string whatever its spelling says: the string style keeps it quoted
+        // once the key is written as its text.
+        if style.is_empty() && target.explicit_tag() == Some("!!str") {
+            return crate::jq::eval_generic::KEY_STYLE_STRING;
+        }
+        style
     }
 
     #[inline]

@@ -13,7 +13,6 @@ use crate::{assert_path_rows_both_routes_3749, run_jq_full};
 /// #4957: `true`, `1` and `"s"` as the condition, with and without an `else .`, and nested in a taken `then`; a falsy
 /// literal and a literal `else` keep the reading they had. Every row captured from `/usr/bin/jq` 1.7.1 (stdout, first stderr line up to the
 /// container, exit code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4957_literal_truthy_if_around_a_caught_foreign_foreach() -> Result<()> {
@@ -177,7 +176,6 @@ fn test_4957_literal_truthy_if_around_a_caught_foreign_foreach() -> Result<()> {
 /// #4957: the root-leaving sources against the `if . then FE else . end`, bare, comma, pipe and `try` spellings of the
 /// UPDATE, in `path`, `del`, `|=` and `=` position, with the `$i` and `.` EXTRACTs. Every row captured from
 /// `/usr/bin/jq` 1.7.1 (stdout, first stderr line up to the container, exit code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4957_bare_caught_bind_foreach_update_on_a_root_register() -> Result<()> {
@@ -370,7 +368,6 @@ fn test_4957_bare_caught_bind_foreach_update_on_a_root_register() -> Result<()> 
 /// #4957: the spellings of the `foreach` that is read (a `$name` or `.` bound, an object or array pattern, a
 /// `catch .` handler, a `?` around the bind) and of the UPDATE around it (`try`, a comma, a pipe, an `if`), each on a
 /// row the rest of the file's rows do not reach. Every row captured from `/usr/bin/jq` 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4957_bare_caught_bind_foreach_update_spellings() -> Result<()> {
@@ -476,7 +473,6 @@ fn test_4957_bare_caught_bind_foreach_update_spellings() -> Result<()> {
 /// that computes. Reading them as the bare one-variable bind flipped rows like these to a caught raise that printed
 /// `[]`/`"C"` where jq prints a path, or to an answer where jq refuses (random grids of 30,000 to 50,000 rows found
 /// 2 to 11 of each). Each row is `(input, filter, jq 1.7.1's stdout, jq's exit code)`.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4957_shapes_outside_the_read_never_answer_where_jq_differs() -> Result<()> {
@@ -733,7 +729,6 @@ fn test_4957_shapes_outside_the_read_never_answer_where_jq_differs() -> Result<(
 /// and a container; the bare, `try`, `?`, `$x`/`.`/`$i` and array-pattern spellings; sources that leave the register
 /// on the root or move it; `path`, `[path(..)?]`, `try .. catch`, `del`, `=` and `|=`. Every row captured from
 /// `/usr/bin/jq` 1.7.1 (stdout, first stderr line up to the container, exit code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4957_null_boolean_extract_after_a_bare_caught_bind_foreach_update() -> Result<()> {
@@ -1189,7 +1184,6 @@ fn test_4957_null_boolean_extract_after_a_bare_caught_bind_foreach_update() -> R
 /// #4957: `FE | .`, `try (FE | .)`, `(FE | .)?`, `FE | length` and `FE | has("a")`/`$x`/`tostring` under a `null`, `true` or `not` EXTRACT, over a root
 /// register's child that is `null`, `false` and a container; `[path(..)?]` and `try path(..) catch`. Every row captured
 /// from `/usr/bin/jq` 1.7.1 (stdout, exit code), both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4957_null_boolean_extract_after_a_pipe_wrapped_bare_caught_bind_foreach_update(
@@ -1788,7 +1782,6 @@ fn test_4957_null_boolean_extract_after_a_pipe_wrapped_bare_caught_bind_foreach_
 
 /// #4957: the pipe stages, `if`s and comma siblings the read does not cover keep a refusal or jq's answer, never a
 /// different one. Every row captured from `/usr/bin/jq` 1.7.1.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_4957_wrapped_shapes_outside_the_pipe_read_never_answer_where_jq_differs() -> Result<()> {

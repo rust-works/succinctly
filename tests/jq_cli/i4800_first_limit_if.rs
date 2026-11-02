@@ -12,7 +12,6 @@ use anyhow::Result;
 /// Before, each wrapper made the UPDATE "not a bind-only shape" and it was refused naming its own state
 /// (`result {"a":null}`), `empty` EXTRACT raised where jq prints nothing and `[path(..; .a)?]` answered `[]`.
 /// Every row captured from jq 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_single_pattern_bind_under_first_limit_if_and_truthy_select_4800(
 ) -> Result<()> {
@@ -446,7 +445,6 @@ fn test_foreach_update_single_pattern_bind_under_first_limit_if_and_truthy_selec
 /// (the second output, a different one), a state-dependent count, `select(.)` and a `//` (a falsy register
 /// would run the alternate). jq answers `result 1` for each (the EXTRACT's `$i`), so only the refusal's kind
 /// is pinned here, as the sibling tests do.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_foreach_update_single_pattern_bind_under_wrappers_that_stay_refused_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[

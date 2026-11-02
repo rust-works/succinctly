@@ -14,7 +14,6 @@ use crate::assert_path_rows_both_routes_3749;
 /// EXTRACT judging the stored `5`, a non-`null` register), a doubled `| .`, the other constant right operands, and the
 /// left operands the rewrite leaves piped (a comma tail, a `def`: the bare spelling answers them wrongly, #5170). Every row captured from `/usr/bin/jq`
 /// 1.7.1, both routes.
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5162_foreach_update_alternative_over_a_bind_piped_into_identity() -> Result<()> {

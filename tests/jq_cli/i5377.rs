@@ -90,7 +90,6 @@ fn test_last_of_a_generator_answers_as_jq_5377() -> Result<()> {
     assert_rows(ROWS)
 }
 
-#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_last_of_a_generator_in_path_position_answers_as_jq_5377() -> Result<()> {
     assert_rows(PATH_ROWS)

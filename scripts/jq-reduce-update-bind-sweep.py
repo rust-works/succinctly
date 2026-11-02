@@ -18,9 +18,12 @@ a refuse-only fallback leaked under `try` before, #3186/#3267) or a row that was
 the base is one on `--bin`. A wrong accept both builds share is the documented residual and does not
 fail. Without `--base` the run only reports (a timeout of `--bin` still fails it): the residual has no
 reference to be told apart from. A timeout is its own class and never a match, whichever side hung.
+`--jq-gate` fails the run on any ACCEPT_WRONG or DIFF of `--bin` as well, with or without `--base`: no
+residual is documented today (both grids are all MATCH), and it is how `succinctly dev compare jq
+--dimension sweeps` runs this script (#5552). A residual that becomes accepted has to be listed here first.
 
 Usage: scripts/jq-reduce-update-bind-sweep.py --bin BIN [--base BIN] [--jq JQ] [--jobs N] [--show N]
-                                              [--sample K] [--alt] [--dump FILE]
+                                              [--sample K] [--alt] [--dump FILE] [--jq-gate]
 """
 import argparse
 import collections
@@ -137,6 +140,11 @@ def main():
     ap.add_argument("--alt", action="store_true", help="the grid over `?//` chains (#4964)")
     ap.add_argument("--sample", type=int, default=1, help="run every Kth row (a quick, deterministic subset)")
     ap.add_argument("--dump", help="write every row of a transition worth reading, as JSON")
+    ap.add_argument(
+        "--jq-gate",
+        action="store_true",
+        help="also fail on any ACCEPT_WRONG or DIFF row of --bin against jq (the gate without --base, #5552)",
+    )
     a = ap.parse_args()
 
     rows = list(grid(ALT_BINDS if a.alt else None))[:: max(a.sample, 1)]
@@ -165,6 +173,9 @@ def main():
                 (kb == "MATCH" and kc != "MATCH") or (kb != "ACCEPT_WRONG" and kc == "ACCEPT_WRONG")
             ):
                 failed = True
+            # No residual is documented, so against jq alone a wrong answer is never expected.
+            if a.jq_gate and kc in ("ACCEPT_WRONG", "DIFF"):
+                failed = True
     print(("base -> candidate" if a.base else "candidate") + " (vs jq):")
     for (kb, kc), n in sorted(counts.items(), key=lambda kv: -kv[1]):
         print(f"  {kb:13} -> {kc:13} {n}" if a.base else f"  {kc:13} {n}")
@@ -179,7 +190,7 @@ def main():
                 out,
             )
     if failed:
-        print("\nFAIL: a lost match or a new wrong accept (see above)", file=sys.stderr)
+        print("\nFAIL: a timeout, a lost match, a new wrong accept or (--jq-gate) a wrong answer (see above)", file=sys.stderr)
     return 1 if failed else 0
 
 
