@@ -10509,7 +10509,8 @@ pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<Owned
 }
 
 /// `length`, `utf8bytelength`, `startswith("lit")`, `endswith("lit")` and `contains("lit")` of an
-/// owned string, answered from the string itself (#5691, #5675).
+/// owned string, answered from the string itself (#5691, #5675), and (#5816) `test("lit")`,
+/// `test("lit"; "lit")`, `index("lit")`, `rindex("lit")` and `inside("lit")`.
 ///
 /// The bridge writes the string out as JSON text (an escape pass over every byte), indexes that
 /// text and then decodes the string back out of it, validating its UTF-8 a second time, to take
@@ -10517,17 +10518,18 @@ pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<Owned
 /// where the answer needs one pass over the string or only its ends. An owned string is already
 /// valid UTF-8 and cannot raise, so the answer is the bridge's own: `length` counts as
 /// [`builtin_length`] does (`string_length`, per mode), `utf8bytelength` is the byte count, and
-/// the prefix/suffix tests and `contains` are [`eval_owned_door_arm`]'s, which decline a
-/// non-literal or non-string argument and leave every raised error to the bridge.
+/// the prefix/suffix tests, `contains` and the #5816 search builtins are [`eval_owned_door_arm`]'s,
+/// which decline a non-literal or non-string argument (and a regex that does not compile) and
+/// leave every raised error to the bridge.
 ///
 /// #5712: `try`/`?` around an answer (it cannot raise, so no `catch` runs), and a comparison or
 /// boolean over such counts (`length > 5`), which [`eval_owned_pure_in`] settles with the
 /// condition doors on. Only an answer is taken: a comparison that raises (`.a > 1`), fans out or
 /// computes is `None`, and the bridge keeps its error.
 ///
-/// Every answer is a fresh integer or boolean, never a subvalue of `input`, so it is admitted
-/// whatever the embed table holds, as [`eval_owned_length`]'s is. Any other builtin or input
-/// shape is `None`.
+/// Every answer is a fresh integer, boolean or `null` (`index`/`rindex` of a needle that is not
+/// there), never a subvalue of `input`, so it is admitted whatever the embed table holds, as
+/// [`eval_owned_length`]'s is. Any other builtin or input shape is `None`.
 pub(crate) fn eval_owned_string_door<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -10562,7 +10564,14 @@ pub(crate) fn eval_owned_string_door<S: EvalSemantics>(
         // The byte count, as `builtin_utf8bytelength` takes it (#5675).
         Expr::Builtin(Builtin::Utf8ByteLength) => Some(OwnedValue::Int(text.len() as i64)),
         stage @ Expr::Builtin(
-            Builtin::Startswith(_) | Builtin::Endswith(_) | Builtin::Contains(_),
+            Builtin::Startswith(_)
+            | Builtin::Endswith(_)
+            | Builtin::Contains(_)
+            | Builtin::Test(_)
+            | Builtin::TestFlags(..)
+            | Builtin::Index(_)
+            | Builtin::Rindex(_)
+            | Builtin::Inside(_),
         ) => eval_owned_door_arm::<S>(stage, input)?.ok(),
         // #5712: what the answer cannot raise, `try`/`?` cannot change: a `catch` never runs.
         Expr::Try { expr: inner, .. } | Expr::Optional(inner) => {
@@ -10579,7 +10588,8 @@ pub(crate) fn eval_owned_string_door<S: EvalSemantics>(
 }
 
 /// The count doors in one call: [`eval_owned_length`] (an array's or an object's length, #3477)
-/// and [`eval_owned_string_door`] (a string's length, and its prefix/suffix tests, #5691).
+/// and [`eval_owned_string_door`] (a string's length, its prefix/suffix tests, #5691, and its
+/// search builtins, #5816).
 ///
 /// They answer disjoint inputs and every caller wants both, so a caller reads this and not the
 /// pair: #5712 existed because #5710 added the string door beside `eval_owned_length` at two of
@@ -10704,7 +10714,8 @@ fn fixed_path_del_shape(expr: &Expr, input: &OwnedValue) -> Option<FixedPathDel>
 
 /// The [`eval_owned_pure_in`] `door` arms that answer one builtin over the
 /// owned input (#3707): `has(<literal>)`, `keys`, `startswith(<literal>)`,
-/// `endswith(<literal>)` and `tostring`.
+/// `endswith(<literal>)` and `tostring`, and (#5816, jq mode) `test`, `index`, `rindex` and
+/// `inside` of a string by a string literal.
 ///
 /// Each answers only the shape whose result the reindex bridge hands back
 /// identically, and returns `None` for everything else, so a type mismatch, a
@@ -10714,13 +10725,13 @@ fn fixed_path_del_shape(expr: &Expr, input: &OwnedValue) -> Option<FixedPathDel>
 /// argument is a literal so there is no generator to fan out and nothing to
 /// evaluate: a literal cannot raise, emit twice or touch the input.
 ///
-/// The results are fresh values (a boolean, a new array, a new string), or for
+/// The results are fresh values (a boolean, an integer, `null`, a new array, a new string), or for
 /// `tostring` of a string the input's own handle, as the bridge's
 /// [`tostring_owned`] hands it back.
 ///
 /// Called from [`eval_owned_pure_in`]'s `door` arms and, for `startswith` and
-/// `endswith` of a string, from [`eval_owned_string_door`] (#5691), which hands
-/// the boolean on as a value.
+/// `endswith` of a string, and the #5816 search builtins, from [`eval_owned_string_door`]
+/// (#5691), which hands the answer on as a value.
 fn eval_owned_door_arm<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -10782,9 +10793,64 @@ fn eval_owned_door_arm<S: EvalSemantics>(
             OwnedValue::String(_) => input.clone(),
             _ => OwnedValue::String(tostring_text::<S>(input, false).into()),
         },
+        // #5816: a literal needle in a string, through the cursor builtin's own search. jq mode
+        // only: yq has none of these (its lexer rejects them) and they stay the evaluator's there.
+        Builtin::Index(needle) | Builtin::Rindex(needle) if S::TAG == EvalTag::Jq => {
+            match (input, literal(needle)?) {
+                (OwnedValue::String(text), OwnedValue::String(needle)) => string_search(
+                    text,
+                    &needle,
+                    if matches!(builtin, Builtin::Index(_)) {
+                        SearchOccurrence::First
+                    } else {
+                        SearchOccurrence::Last
+                    },
+                ),
+                _ => return None,
+            }
+        }
+        // `inside(b)` is `b | contains(.)` (`builtin_inside`): both strings, so no kind mismatch.
+        Builtin::Inside(whole) if S::TAG == EvalTag::Jq => match (input, literal(whole)?) {
+            (OwnedValue::String(_), whole @ OwnedValue::String(_)) => {
+                OwnedValue::Bool(owned_contains::<S>(&whole, input))
+            }
+            _ => return None,
+        },
+        // #5816: `test("lit")` and `test("lit"; "lit")` of a string, with the cursor builtin's own
+        // compiled-regex cache. A pattern or flags that is not a string literal, a pattern that
+        // does not compile and a match that fails (a backtracking limit) all decline, so every
+        // diagnostic, and its `?`/`try` handling, stays the evaluator's.
+        #[cfg(feature = "regex")]
+        Builtin::Test(pattern) if S::TAG == EvalTag::Jq => {
+            owned_regex_test::<S>(input, literal(pattern)?, None)?
+        }
+        #[cfg(feature = "regex")]
+        Builtin::TestFlags(pattern, flags) if S::TAG == EvalTag::Jq => {
+            owned_regex_test::<S>(input, literal(pattern)?, Some(literal(flags)?))?
+        }
         _ => return None,
     };
     Some(Ok(answer))
+}
+
+/// `test` of an owned string by a string-literal pattern and flags, or `None` when anything is
+/// not that or raises (#5816). The regex is the cursor builtin's own (`build_regex`).
+#[cfg(feature = "regex")]
+fn owned_regex_test<S: EvalSemantics>(
+    input: &OwnedValue,
+    pattern: OwnedValue,
+    flags: Option<OwnedValue>,
+) -> Option<OwnedValue> {
+    let (OwnedValue::String(text), OwnedValue::String(pattern)) = (input, pattern) else {
+        return None;
+    };
+    let flags = match &flags {
+        None => None,
+        Some(OwnedValue::String(flags)) => Some(flags.as_str()),
+        Some(_) => return None,
+    };
+    let re = build_regex::<S>(&pattern, flags).ok()?;
+    Some(OwnedValue::Bool(re.is_match(text).ok()?))
 }
 
 /// `add`/`min`/`max` over an owned container, computed here instead of
@@ -25764,6 +25830,47 @@ enum SearchOccurrence {
     Last,
 }
 
+/// `indices`/`index`/`rindex` of a string needle in a string, as [`search_pattern`] answers them
+/// (#5816): the one body the cursor builtins and the owned string door
+/// ([`eval_owned_door_arm`]) share, so the two cannot drift.
+fn string_search(text: &str, needle: &str, occurrence: SearchOccurrence) -> OwnedValue {
+    // jq 1.7.1's `_strindices` has no window to try for an empty needle, so `indices` answers
+    // `[]` and `index`/`rindex` (its `.[0]` / `.[-1:][0]`) answer `null`, for an empty input too
+    // (#3889). `str::find` matches an empty needle at every position, which is not what jq
+    // reports. The array arm of `search_pattern` already answers an empty needle this way.
+    if needle.is_empty() {
+        return match occurrence {
+            SearchOccurrence::All => OwnedValue::array_from(Vec::new()),
+            SearchOccurrence::First | SearchOccurrence::Last => OwnedValue::Null,
+        };
+    }
+    match occurrence {
+        SearchOccurrence::All => {
+            let mut indices = Vec::new();
+            let mut start = 0;
+            // Resume after the *first character* of the match, not its first byte: a match that
+            // begins with a multi-byte character would leave `start` inside it and the next
+            // slice would panic (#3903). A valid UTF-8 needle can only match on a character
+            // boundary, so this finds exactly the overlapping matches jq's byte-wise scan does.
+            let step = needle.chars().next().map_or(1, char::len_utf8);
+            while let Some(pos) = text[start..].find(needle) {
+                indices.push(OwnedValue::Int((start + pos) as i64));
+                start += pos + step;
+                if start >= text.len() {
+                    break;
+                }
+            }
+            OwnedValue::array_from(indices)
+        }
+        SearchOccurrence::First => text
+            .find(needle)
+            .map_or(OwnedValue::Null, |pos| OwnedValue::Int(pos as i64)),
+        SearchOccurrence::Last => text
+            .rfind(needle)
+            .map_or(OwnedValue::Null, |pos| OwnedValue::Int(pos as i64)),
+    }
+}
+
 /// Shared search body of [`builtin_indices`]/[`builtin_index`]/[`builtin_rindex`]
 /// (#1538) -- the three differ only in [`SearchOccurrence`], both for a
 /// string input's substring search and an array input's element scan.
@@ -25846,47 +25953,7 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 _ => return QueryResult::Error(non_string_pattern(value, pattern)),
             };
             match s.as_str() {
-                // jq 1.7.1's `_strindices` has no window to try for an empty
-                // needle, so `indices` answers `[]` and `index`/`rindex` (its
-                // `.[0]` / `.[-1:][0]`) answer `null`, for an empty input too
-                // (#3889). `str::find` matches an empty needle at every
-                // position, which is not what jq reports. The array arm above
-                // already answers an empty needle this way.
-                Ok(_) if pattern_str.is_empty() => match occurrence {
-                    SearchOccurrence::All => QueryResult::Owned(OwnedValue::array_from(Vec::new())),
-                    SearchOccurrence::First | SearchOccurrence::Last => {
-                        QueryResult::Owned(OwnedValue::Null)
-                    }
-                },
-                Ok(cow) => match occurrence {
-                    SearchOccurrence::All => {
-                        let mut indices = Vec::new();
-                        let mut start = 0;
-                        // Resume after the *first character* of the match, not
-                        // its first byte: a match that begins with a multi-byte
-                        // character would leave `start` inside it and the next
-                        // slice would panic (#3903). A valid UTF-8 needle can
-                        // only match on a character boundary, so this finds
-                        // exactly the overlapping matches jq's byte-wise scan does.
-                        let step = pattern_str.chars().next().map_or(1, char::len_utf8);
-                        while let Some(pos) = cow[start..].find(pattern_str.as_str()) {
-                            indices.push(OwnedValue::Int((start + pos) as i64));
-                            start += pos + step;
-                            if start >= cow.len() {
-                                break;
-                            }
-                        }
-                        QueryResult::Owned(OwnedValue::array_from(indices))
-                    }
-                    SearchOccurrence::First => match cow.find(pattern_str.as_str()) {
-                        Some(pos) => QueryResult::Owned(OwnedValue::Int(pos as i64)),
-                        None => QueryResult::Owned(OwnedValue::Null),
-                    },
-                    SearchOccurrence::Last => match cow.rfind(pattern_str.as_str()) {
-                        Some(pos) => QueryResult::Owned(OwnedValue::Int(pos as i64)),
-                        None => QueryResult::Owned(OwnedValue::Null),
-                    },
-                },
+                Ok(cow) => QueryResult::Owned(string_search(&cow, pattern_str, occurrence)),
                 Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
             }
         }
@@ -80409,7 +80476,7 @@ fn eval_owned_pure<S: EvalSemantics>(
 /// `length` over an owned array or object, answered by [`eval_owned_length`]
 /// (#3439), or over a string, answered by [`eval_owned_string_door`] (#5712),
 /// and the arms of [`eval_owned_door_arm`] (#3707) -- `has`, `keys`,
-/// `startswith`/`endswith`, `tostring` and `[e]`.
+/// `startswith`/`endswith`, `tostring`, (#5816) `test`/`index`/`rindex`/`inside` and `[e]`.
 ///
 /// `door` is a parameter and not an arm of [`eval_owned_pure`] because
 /// that function also decides what [`closed_expr_to_owned`] and the
@@ -80447,6 +80514,11 @@ fn eval_owned_pure_in<S: EvalSemantics>(
             | Builtin::Startswith(_)
             | Builtin::Endswith(_)
             | Builtin::Contains(_)
+            | Builtin::Test(_)
+            | Builtin::TestFlags(..)
+            | Builtin::Index(_)
+            | Builtin::Rindex(_)
+            | Builtin::Inside(_)
             | Builtin::ToString,
         ) if door && position == ResultPosition::Operand => eval_owned_door_arm::<S>(expr, input),
         // `[e]` for a single-output pure `e` is the one-element array of
@@ -115375,6 +115447,131 @@ mod tests {
                 eval_owned_length(&expr, &OwnedValue::array_from(vec![])).is_none(),
                 "{src}"
             );
+        }
+    }
+
+    /// #5816: `test`, `index`, `rindex` and `inside` of a string by a string literal are answered
+    /// from the string, and answer what the reindex bridge does (the oracle), in jq mode. Anything
+    /// the door must not take declines: a pattern or flags that is not a string literal, a pattern
+    /// that does not compile, an unknown flag, a non-string needle, a non-string input, and every
+    /// shape in yq mode, where the evaluator keeps its own rules.
+    #[test]
+    fn eval_owned_string_door_answers_search_builtins_as_the_bridge_does_5816() {
+        let strings = [
+            "",
+            "a",
+            "h\u{e9}llo",
+            "\u{65e5}\u{672c}\u{8a9e}",
+            "\u{1f600}x\u{1f600}",
+            "a\nb",
+            "q\"b\\s",
+            "zzzabc",
+            "abczzz",
+            "ZZZ",
+            "aaaa",
+            "a\n",
+            "a\nb\n",
+        ];
+        let shapes = [
+            "test(\"a$\")",
+            "test(\"b$\")",
+            "test(\"^b\")",
+            "test(\"a\\n$\")",
+            "test(\"z\")",
+            "test(\"Z\"; \"i\")",
+            "test(\"^a\")",
+            "test(\"a$\")",
+            "test(\"\u{e9}\")",
+            "test(\"\"; \"\")",
+            "test(\"a.b\"; \"s\")",
+            "test(\"A\"; \"gi\")",
+            "(test(\"z\"))",
+            "index(\"z\")",
+            "rindex(\"z\")",
+            "index(\"\")",
+            "rindex(\"\")",
+            "index(\"aa\")",
+            "rindex(\"aa\")",
+            "index(\"\u{e9}\")",
+            "index(\"\u{672c}\")",
+            "rindex(\"\u{1f600}\")",
+            "inside(\"hzzzello world\")",
+            "inside(\"\")",
+            "inside(\"aaaaa\")",
+            "inside(\"\u{e9}\")",
+        ];
+        // `test` is the `regex` feature's; without it the door has no arm for it.
+        let shapes: Vec<&str> = shapes
+            .into_iter()
+            .filter(|src| cfg!(feature = "regex") || !src.contains("test("))
+            .collect();
+        let mut answered = 0;
+        for text in strings {
+            let value = OwnedValue::String(text.into());
+            for src in &shapes {
+                let src = *src;
+                let expr = parse(src).unwrap();
+                let fast = eval_owned_string_door::<JqSemantics>(&expr, &value)
+                    .unwrap_or_else(|| panic!("{src:?} on {text:?} declined"));
+                answered += 1;
+                let bridge = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, &value, false,
+                ));
+                assert_eq!(
+                    debug_normalize(QueryResult::<Vec<u64>>::Owned(fast)),
+                    bridge,
+                    "{src:?} on {text:?}"
+                );
+                assert!(
+                    eval_owned_string_door::<YqSemantics>(&expr, &value).is_none(),
+                    "{src:?} on {text:?} answered in yq mode"
+                );
+            }
+        }
+        assert_eq!(answered, strings.len() * shapes.len());
+        let value = OwnedValue::String("abc".into());
+        for src in [
+            "test(.)",
+            "test(\"a\"; .)",
+            "test(\"[\")",
+            "test(\"a\"; \"q\")",
+            "test([\"a\", \"i\"])",
+            "test(\"a\"; null)",
+            "test(1)",
+            "test(\"a\", \"b\")",
+            "index(1)",
+            "index(.)",
+            "index(\"a\", \"b\")",
+            "index({\"start\": 0})",
+            "rindex(null)",
+            "inside(1)",
+            "inside(.)",
+            "inside([\"abc\"])",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(
+                eval_owned_string_door::<JqSemantics>(&expr, &value).is_none(),
+                "{src:?} was answered"
+            );
+        }
+        // A value that is not a string is the bridge's own (`Cannot be matched`, `Cannot determine`).
+        for input in [
+            OwnedValue::Null,
+            OwnedValue::Int(1),
+            OwnedValue::array_from(vec![]),
+        ] {
+            for src in [
+                "test(\"a\")",
+                "index(\"a\")",
+                "rindex(\"a\")",
+                "inside(\"a\")",
+            ] {
+                let expr = parse(src).unwrap();
+                assert!(
+                    eval_owned_string_door::<JqSemantics>(&expr, &input).is_none(),
+                    "{src:?} on {input:?}"
+                );
+            }
         }
     }
 
