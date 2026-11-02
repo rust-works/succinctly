@@ -61,7 +61,9 @@ jobs:
             testCmd: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests
           - name: bench-runner-gated
             buildCli: true
-            testCmd: cargo test --features cli,bench-runner --test orchestrate_cli_tests
+            testCmd: |
+              cargo test --features cli,bench-runner --test orchestrate_cli_tests
+              cargo test --features cli,bench-runner --bin succinctly
           - name: default
             buildCli: false
             testCmd: cargo test --verbose

@@ -51,6 +51,17 @@ RUST_PATHS = ("*.rs", "Cargo.toml", "Cargo.lock", "rust-toolchain*", "clippy.tom
 
 RELEASE_FEATURES = "cli,simd,regex,serde,bench-runner"  # comparison/jq/manifest.toml
 
+# What the bin's `bench-runner` unit tests read or are: the `compare` and `bench_runner` modules,
+# the harness's data, and the docs whose generated blocks they hold to the committed runs (#5409).
+BENCH_RUNNER_BIN_PATHS = (
+    "src/bin/succinctly/compare/*",
+    "src/bin/succinctly/bench_runner/*",
+    "comparison/jq/*",
+    "docs/compare/*",
+    "docs/benchmarks/jq.md",
+    "docs/reference/jq-language.md",
+)
+
 
 @dataclass(frozen=True)
 class Gate:
@@ -113,6 +124,14 @@ GATES = (
         (r"^\./scripts/fmt-per-issue\.sh$",),
         paths=("tests/*", "Cargo.toml", "scripts/fmt-per-issue.sh"),
         cost=1,
+    ),
+    Gate(
+        "bench-runner-bin",
+        "fast",
+        ("cargo test --features cli,bench-runner --bin succinctly",),
+        (r"^cargo test --features cli,bench-runner --bin succinctly$",),
+        paths=BENCH_RUNNER_BIN_PATHS,
+        cost=2,
     ),
     Gate(
         "ledger-only",

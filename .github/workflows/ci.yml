@@ -249,10 +249,19 @@ jobs:
           # of sailing through on AVX2 dispatch. The in-lib contract test
           # (test_succinctly_simd_env_contract) fails this leg if the clamp
           # ever stops applying or the value here is typo'd.
+          #
+          # #5409: the bin's unit tests under `bench-runner`. `compare` and
+          # `bench_runner` are `#[cfg(feature = "bench-runner")]`, and no other
+          # leg builds the bin with that feature (coverage's `--bins` does not
+          # enable it), so their tests -- among them the guards that hold
+          # docs/benchmarks/jq.md and docs/reference/jq-language.md to the
+          # committed docs/compare/ runs -- ran nowhere. A unit test does not
+          # relink `target/debug/succinctly`, so #1705 does not apply.
           - name: bench-runner-and-sse2-dispatch
             buildCli: true
             testCmd: |
               cargo test --features cli,bench-runner --test orchestrate_cli_tests
+              cargo test --features cli,bench-runner --bin succinctly
               SUCCINCTLY_SIMD=sse2 cargo test --verbose
           - name: default
             buildCli: false
@@ -403,9 +412,12 @@ jobs:
             testCmd: |
               skip=$(scripts/deep-recursion-tests.sh skip-args)
               cargo test --features cli --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests -- $skip
+          # The bin's `bench-runner` unit tests run here too (#5409; see the x86_64 leg).
           - name: bench-runner-gated
             buildCli: true
-            testCmd: cargo test --features cli,bench-runner --test orchestrate_cli_tests
+            testCmd: |
+              cargo test --features cli,bench-runner --test orchestrate_cli_tests
+              cargo test --features cli,bench-runner --bin succinctly
           - name: default
             buildCli: false
             testCmd: cargo test --verbose
