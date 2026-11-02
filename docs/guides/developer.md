@@ -474,6 +474,11 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests
 ```
 
+The second run documents the SIMD backend of the machine it runs on: CI's `Documentation` job is x86_64 Linux, so
+it covers `x86.rs` and the AVX-512 popcount path, and the `rustdoc-simd-backends` gate on an Apple Silicon machine
+covers `neon.rs` instead. To check the x86_64 backend from there, add `--target x86_64-apple-darwin`. Nothing
+documents `broadword.rs` (it needs `broadword-yaml`).
+
 ### Documentation
 
 - All public items must have doc comments
