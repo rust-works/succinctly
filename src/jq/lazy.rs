@@ -285,9 +285,11 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     }
 
     fn try_from_owned_at_depth(owned: OwnedValue, depth: usize) -> Result<Self, EvalError> {
-        if depth >= super::value::MAX_VALUE_TREE_DEPTH {
+        // Past the constant, the native-stack floor decides where one is armed (#5554).
+        if depth >= super::value::MAX_VALUE_TREE_DEPTH && !super::eval::value_depth_on_stack_floor()
+        {
             return Err(EvalError::new(
-                super::value::nesting_depth_exceeded_message(super::value::MAX_VALUE_TREE_DEPTH),
+                super::value::value_tree_depth_exceeded_message(),
             ));
         }
         Ok(match owned {

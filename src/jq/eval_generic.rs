@@ -279,16 +279,20 @@ pub fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Opt
 /// [`MAX_NESTING_DEPTH`] (document nesting) *or*
 /// [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) (a value a
 /// filter built past the tree ceiling, which `yq_runner.rs`'s emission and
-/// presentation walks assert on after evaluation has already succeeded).
+/// presentation walks assert on after evaluation has already succeeded) --
+/// or the native-stack floor that replaces the tree ceiling under
+/// [`with_value_depth_on_stack_floor`](super::with_value_depth_on_stack_floor)
+/// ([`STACK_FLOOR_NESTING_MESSAGE`](super::value::STACK_FLOOR_NESTING_MESSAGE), #5554).
 /// `None` for any other panic, which a caller must still `resume_unwind`.
 pub fn depth_guard_panic_message(payload: &(dyn core::any::Any + Send)) -> Option<String> {
     let text = payload
         .downcast_ref::<String>()
         .map(String::as_str)
         .or_else(|| payload.downcast_ref::<&str>().copied())?;
-    [MAX_NESTING_DEPTH, super::value::MAX_VALUE_TREE_DEPTH]
+    ([MAX_NESTING_DEPTH, super::value::MAX_VALUE_TREE_DEPTH]
         .into_iter()
         .any(|max| text == super::value::nesting_depth_exceeded_message(max))
+        || text == super::value::STACK_FLOOR_NESTING_MESSAGE)
         .then(|| text.to_string())
 }
 

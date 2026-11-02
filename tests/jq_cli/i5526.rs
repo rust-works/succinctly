@@ -1,10 +1,11 @@
 //! #5526: a value the program built more than 384 levels deep crashed `succinctly jq` with a raw
 //! Rust panic (exit 101) at the sites that splice it back into the AST (`last(f)`, `+=`, `//=`,
-//! a fold's `$x`) or render it for `error(...)`. It is now the same refusal `reduce range(385)
-//! as $i (0; [.])` already gave: `nesting depth exceeds limit of 384` on stderr, exit 5, and no
-//! panic line. jq itself answers every program below (`1`); whether 384 stays is #5497's call.
-//! `last(f)` no longer reaches the ceiling: since #5516 it shares the value instead of splicing
-//! it back, and answers as jq does, and since #5540 so does `reduce ... as $x ([]; . + [$x])`.
+//! a fold's `$x`) or render it for `error(...)`. They became the refusal the re-index bridge gave,
+//! `nesting depth exceeds limit of 384` at exit 5 with no panic line. Since #5554 the guard there
+//! is the native-stack floor in jq mode, so below it every program answers as jq 1.7.1 does; past
+//! it the same net reports `nesting depth exceeds limit of the native stack`, still exit 5.
+//! `last(f)` no longer reaches a splice at all: since #5516 it shares the value instead of
+//! splicing it back, and since #5540 so does `reduce ... as $x ([]; . + [$x])`.
 //! `try error(<deep>)` left the list with #5497: jq's writer stops at its print depth, so the
 //! message renders as jq's does and the program answers `1`.
 
@@ -14,11 +15,16 @@ use crate::run_jq_full;
 
 const DEF: &str = "def f(n): if n == 0 then 0 else [f(n-1)] end;";
 
+/// A value two million levels deep, built in linear time through `.[0] = .`'s owned door, and
+/// deeper than the floor of both the release and the debug evaluation thread (#5554).
+const PAST_THE_FLOOR: &str = "(reduce range(2000000) as $i ([]; .[0] = .)) as $v |";
+
 fn assert_refused(stdout: &str, stderr: &str, code: i32, what: &str) {
     assert_eq!(code, 5, "{what}: stderr={stderr:?}");
     assert_eq!(stdout, "", "{what}");
     assert!(
-        stderr.contains("jq: error") && stderr.contains("nesting depth exceeds limit of 384"),
+        stderr.contains("jq: error")
+            && stderr.contains("nesting depth exceeds limit of the native stack"),
         "{what}: stderr={stderr:?}"
     );
     assert!(
@@ -27,17 +33,57 @@ fn assert_refused(stdout: &str, stderr: &str, code: i32, what: &str) {
     );
 }
 
+/// Under the floor the splice sites answer as jq 1.7.1 does (#5554).
 #[test]
-fn test_built_value_past_the_tree_ceiling_is_a_refusal_not_a_panic_5526() -> Result<()> {
-    for filter in [
-        "reduce range(385) as $i (0; [.]) | length",
+fn test_built_value_past_384_levels_answers_as_jq_at_every_splice_site_5554() -> Result<()> {
+    for (args, input, filter) in [
+        (
+            &["-nc"][..],
+            None,
+            "reduce range(385) as $i (0; [.]) | length",
+        ),
         // A fold's `$x` read where no step hands it on is still spliced back.
-        "reduce f(400) as $x (0; if $x then 1 else 2 end)",
-        "{\"a\":1} | .a += f(400) | length",
-        "null | .a //= f(400) | length",
-        "last(foreach range(385) as $i (0;[.])) | length",
+        (
+            &["-nc"][..],
+            None,
+            "reduce f(400) as $x (0; if $x then 1 else 2 end)",
+        ),
+        (&["-nc"][..], None, "null | .a //= f(400) | length"),
+        (
+            &["-nc"][..],
+            None,
+            "last(foreach range(385) as $i (0;[.])) | length",
+        ),
+        // The lazy (document) route has its own nets.
+        (
+            &["-c"][..],
+            Some("{}"),
+            "reduce range(385) as $i (0; [.]) | length",
+        ),
+        (&["-c"][..], Some("{}"), ".a += f(400) | length"),
+        (&["-c"][..], Some("{}"), ".a //= f(400) | length"),
     ] {
         let program = format!("{DEF} {filter}");
+        let mut argv = args.to_vec();
+        argv.push(&program);
+        let (stdout, stderr, code) = run_jq_full(&argv, input)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("1\n", "", 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_built_value_past_the_native_stack_floor_is_a_refusal_not_a_panic_5526() -> Result<()> {
+    for filter in [
+        "reduce $v as $x (0; if $x then 1 else 2 end)",
+        "{\"a\": []} | .a += $v | length",
+        "null | .a //= $v | length",
+    ] {
+        let program = format!("{PAST_THE_FLOOR} {filter}");
         let (stdout, stderr, code) = run_jq_full(&["-nc", &program], None)?;
         assert_refused(&stdout, &stderr, code, filter);
     }
@@ -45,14 +91,10 @@ fn test_built_value_past_the_tree_ceiling_is_a_refusal_not_a_panic_5526() -> Res
 }
 
 #[test]
-fn test_built_value_past_the_tree_ceiling_on_document_input_5526() -> Result<()> {
+fn test_built_value_past_the_native_stack_floor_on_document_input_5526() -> Result<()> {
     // The lazy (document) route has its own nets; the same programs over an input.
-    for filter in [
-        "reduce range(385) as $i (0; [.]) | length",
-        ".a += f(400) | length",
-        ".a //= f(400) | length",
-    ] {
-        let program = format!("{DEF} {filter}");
+    for filter in [".a += $v | length", ".a //= $v | length"] {
+        let program = format!("{PAST_THE_FLOOR} {filter}");
         let (stdout, stderr, code) = run_jq_full(&["-c", &program], Some("{}"))?;
         assert_refused(&stdout, &stderr, code, filter);
     }
@@ -80,15 +122,16 @@ fn test_refusal_is_per_document_and_try_cannot_swallow_it_5526() -> Result<()> {
     // document (`echo '1 2' | jq 'if . == 1 then error("x") else . end'` exits 0), so a refusal on
     // the first one reports on stderr and the run ends 0; the refusal's own exit 5 is the
     // single-document case above.
-    let program = format!("{DEF} if . == 1 then ({{a:1}} | .a += f(400) | length) else . end");
+    let program =
+        format!("{PAST_THE_FLOOR} if . == 1 then ({{a: []}} | .a += $v | length) else . end");
     let (stdout, stderr, code) = run_jq_full(&["-c", &program], Some("1 2"))?;
     assert_eq!(stdout, "2\n", "stderr={stderr:?}");
     assert_eq!(code, 0);
-    assert!(stderr.contains("nesting depth exceeds limit of 384"));
+    assert!(stderr.contains("nesting depth exceeds limit of the native stack"));
     assert!(!stderr.contains("panicked"), "stderr={stderr:?}");
 
     // A resource limit, not a catchable error: `try`/`catch` and `?` do not absorb it.
-    let program = format!("{DEF} try ({{a:1}} | .a += f(400) | length) catch 0");
+    let program = format!("{PAST_THE_FLOOR} try ({{a: []}} | .a += $v | length) catch 0");
     let (stdout, stderr, code) = run_jq_full(&["-nc", &program], None)?;
     assert_refused(
         &stdout,

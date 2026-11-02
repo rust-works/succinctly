@@ -102232,6 +102232,82 @@ pub(crate) fn native_stack_exhausted() -> bool {
     origin != 0 && origin.abs_diff(stack_address()) > reach
 }
 
+/// Whether values on this thread are bounded by the native-stack floor instead of
+/// [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) -- see
+/// [`with_value_depth_on_stack_floor`] (#5554).
+#[cfg(feature = "std")]
+mod value_depth_floor {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ON: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn on() -> bool {
+        ON.with(Cell::get)
+    }
+
+    /// Restores the previous setting on drop.
+    #[must_use]
+    pub(crate) struct Guard(bool);
+
+    pub(crate) fn enter() -> Guard {
+        Guard(ON.with(|on| on.replace(true)))
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ON.with(|on| on.set(self.0));
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod value_depth_floor {
+    pub(crate) fn on() -> bool {
+        false
+    }
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn enter() -> Guard {
+        Guard
+    }
+}
+
+/// Run `f` with a value's nesting bounded by the native-stack floor [`with_stack_budget`] registered,
+/// instead of by [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) (#5554).
+///
+/// jq has no limit on the depth of a value a program builds, only its C stack. Every walk over a built
+/// value checks its depth once per level, so past 384 levels such a check can ask the floor instead:
+/// a walk then refuses where its stack is spent rather than at a fixed depth calibrated for the
+/// smallest stack a thread might have. Without a registered floor, or outside `f`, the bound stays
+/// 384. `succinctly jq` arms it for its whole run; `succinctly yq` does not, since its emitters were
+/// tuned against 384 on their own.
+///
+/// No-op under `no_std`.
+pub fn with_value_depth_on_stack_floor<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = value_depth_floor::enter();
+    f()
+}
+
+/// Whether a walk already past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) levels of
+/// a value may go one level deeper: only under [`with_value_depth_on_stack_floor`], on a thread with a
+/// registered floor that is not spent yet.
+pub(crate) fn value_depth_on_stack_floor() -> bool {
+    if !value_depth_floor::on() {
+        return false;
+    }
+    let (origin, reach) = native_stack::budget();
+    origin != 0 && origin.abs_diff(stack_address()) <= reach
+}
+
+/// Whether [`with_value_depth_on_stack_floor`] is armed and a floor registered, so a refusal past
+/// 384 levels is the floor's rather than the constant's.
+pub(crate) fn value_depth_floor_armed() -> bool {
+    value_depth_floor::on() && native_stack::budget().0 != 0
+}
+
 /// The refusal of a call to `def` that recursed too deep: by
 /// [`MAX_EVAL_FRAMES`], or by the native-stack floor (ADR-0025).
 pub(crate) fn def_call_depth_refusal(def: &FuncDefData) -> EvalError {
@@ -107804,6 +107880,74 @@ mod tests {
              smaller for being measured deeper: {nested_big:?} vs {outer:?}"
         );
         assert_eq!(native_stack::budget().0, 0, "restored on exit");
+    }
+
+    /// #5554: past 384 levels a value-tree guard defers to the floor only with both the opt-in and
+    /// a registration, refuses once that floor is spent, and says which bound refused.
+    #[cfg(feature = "std")]
+    #[test]
+    fn value_depth_defers_to_the_floor_only_when_armed_and_registered_5554() {
+        use crate::jq::value::{
+            check_value_tree_depth, nesting_depth_exceeded_message, MAX_VALUE_TREE_DEPTH,
+            STACK_FLOOR_NESTING_MESSAGE,
+        };
+        let past = MAX_VALUE_TREE_DEPTH;
+        let message = |r: Result<(), EvalError>| r.err().map(|e| e.message);
+        let constant = Some(nesting_depth_exceeded_message(MAX_VALUE_TREE_DEPTH));
+
+        assert_eq!(message(check_value_tree_depth(past)), constant, "neither");
+        assert_eq!(
+            with_stack_budget(1 << 20, || message(check_value_tree_depth(past))),
+            constant,
+            "a registration alone keeps 384"
+        );
+        assert_eq!(
+            with_value_depth_on_stack_floor(|| message(check_value_tree_depth(past))),
+            constant,
+            "the opt-in alone keeps 384: there is no floor to ask"
+        );
+        let armed = |budget: usize| {
+            with_stack_budget(budget, || {
+                with_value_depth_on_stack_floor(|| {
+                    (
+                        check_value_tree_depth(MAX_VALUE_TREE_DEPTH - 1).is_ok(),
+                        check_value_tree_depth(past),
+                    )
+                })
+            })
+        };
+        let (under, roomy) = armed(1 << 20);
+        assert!(under && roomy.is_ok(), "both armed, room left: {roomy:?}");
+        let (under, spent) = armed(0);
+        assert!(under, "below 384 the floor is never asked");
+        let spent = spent.expect_err("a spent floor refuses");
+        assert_eq!(spent.message, STACK_FLOOR_NESTING_MESSAGE);
+        assert!(
+            spent.is_resource_limit(),
+            "uncatchable, like the 384 refusal"
+        );
+        assert!(!value_depth_floor::on(), "restored on exit");
+    }
+
+    /// #5554: the panicking guard follows the same rule, and its floor message is one the CLI's
+    /// `catch_unwind` nets recognise.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_panicking_value_guard_defers_to_the_floor_too_5554() {
+        use crate::jq::value::{assert_value_tree_depth, MAX_VALUE_TREE_DEPTH};
+        with_stack_budget(1 << 20, || {
+            with_value_depth_on_stack_floor(|| assert_value_tree_depth(MAX_VALUE_TREE_DEPTH));
+        });
+        let payload = std::panic::catch_unwind(|| {
+            with_stack_budget(0, || {
+                with_value_depth_on_stack_floor(|| assert_value_tree_depth(MAX_VALUE_TREE_DEPTH));
+            });
+        })
+        .expect_err("a spent floor panics");
+        assert_eq!(
+            crate::jq::eval_generic::depth_guard_panic_message(&*payload).as_deref(),
+            Some(crate::jq::value::STACK_FLOOR_NESTING_MESSAGE)
+        );
     }
 
     /// ADR-0025 (#3262): with no stack left, a `def` call refuses naming the

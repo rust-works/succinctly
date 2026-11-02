@@ -88,6 +88,13 @@ HEAVY_TESTS=(
   test_tree_recursion_stack_follows_depth_not_calls_3296 # 12
   test_path_try_equals_the_question_mark_spelling_4412 # 11
   test_type_selectors_equal_their_definition_3690 # 11
+  # #5554: each builds a value two million levels deep, past the debug thread's native-stack floor
+  # (seconds, M5 Max, one at a time).
+  per_issue::i5526::test_refusal_is_per_document_and_try_cannot_swallow_it_5526 # 33
+  per_issue::i5526::test_built_value_past_the_native_stack_floor_is_a_refusal_not_a_panic_5526 # 25
+  per_issue::i5554c::a_walk_past_the_native_stack_floor_refuses_at_exit_5_5554 # 17
+  per_issue::i5526::test_built_value_past_the_native_stack_floor_on_document_input_5526 # 17
+  test_resource_limit_caps_are_uncatchable_2132 # 10
 )
 
 # What the `deep-recursion` leg runs, and every other leg skips.

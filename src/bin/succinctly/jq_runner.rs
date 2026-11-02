@@ -4586,7 +4586,14 @@ pub(crate) fn silence_depth_guard_panic_line() {
 ///
 /// The caller must end the process on return: the named arguments (`--slurpfile`, `--argjson`)
 /// are not freed (#5673), so a second call in one process would leak them.
-pub fn run_jq(mut args: JqCommand) -> Result<i32> {
+///
+/// A value the program builds is bounded by the native-stack floor `main` registered, not by
+/// `MAX_VALUE_TREE_DEPTH`, as jq bounds it by its C stack alone (#5554).
+pub fn run_jq(args: JqCommand) -> Result<i32> {
+    jq::with_value_depth_on_stack_floor(|| run_jq_on_stack_floor(args))
+}
+
+fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     super::sigpipe::restore_default();
     silence_depth_guard_panic_line();
     args.resolve_positional_args();
