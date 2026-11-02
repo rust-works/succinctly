@@ -130,12 +130,10 @@ pub(crate) fn add_duration(
 ) -> Option<Result<String, String>> {
     let layout = match custom_datetime(left) {
         Some(custom) => Cow::Owned(custom),
-        None if go_time::yq_datetime(left).is_some() => {
-            if !subtract && !starts_like_a_duration(right) {
-                return None;
-            }
-            layout()
-        }
+        // Asked before `left` is parsed: a string `+` text that cannot begin a duration is the
+        // common case, a concatenation, and must not pay for a `time.Parse` of every left side.
+        None if !subtract && !starts_like_a_duration(right) => return None,
+        None if go_time::yq_datetime(left).is_some() => layout(),
         None => return None,
     };
     let duration_text: Cow<'_, str> = match (subtract, right.strip_prefix('-')) {
