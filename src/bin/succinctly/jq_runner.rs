@@ -9081,6 +9081,102 @@ struct LazyJsonInputs {
     seam: Seam,
 }
 
+/// The text a batch's index covers is at most this long, past its first document (#5854).
+const LAZY_BATCH_MAX_BYTES: usize = 1 << 20;
+
+/// The first batch of a stream covers about this much text, and each batch after it twice the
+/// one before up to [`LAZY_BATCH_MAX_BYTES`], so a program that stops after a few documents
+/// (`first(inputs)`) indexes little more than they hold.
+const LAZY_BATCH_FIRST_BYTES: usize = 1 << 14;
+
+/// A run of consecutive documents of a [`LazyJsonInputs`] stream, `spans[first..end]`, read
+/// through one index in place of an index per document (#5854): building and dropping an index
+/// of its own is most of what converting a small document costs.
+struct LazyBatch {
+    first: usize,
+    end: usize,
+    /// `None` when the run is a single document, which an index of its own serves as well, or
+    /// when the index does not hold exactly the documents the spans name: the run is then
+    /// converted a document at a time, and the producer does not try this run again.
+    indexed: Option<LazyIndexed>,
+}
+
+struct LazyIndexed {
+    index: JsonIndex,
+    /// Where the batch's text starts in the stream's text (the index's offset 0), and ends.
+    text_start: usize,
+    text_end: usize,
+    /// The BP position of each document's root, in document order.
+    roots: Vec<usize>,
+}
+
+impl LazyBatch {
+    /// The batch that starts at `spans[first]` and takes documents while their text stays within
+    /// `max_bytes` of the first's start (the first always goes in).
+    fn build(text: &[u8], spans: &[(usize, usize)], first: usize, max_bytes: usize) -> Self {
+        let text_start = spans[first].0;
+        let mut end = first + 1;
+        while end < spans.len() && spans[end].1 - text_start <= max_bytes {
+            end += 1;
+        }
+        let indexed = (end - first >= 2)
+            .then(|| {
+                let text_end = spans[end - 1].1;
+                let covered = &text[text_start..text_end];
+                let index = JsonIndex::build(covered);
+                let mut roots = Vec::with_capacity(end - first);
+                let mut at = Some(index.root(covered));
+                while let Some(cursor) = at {
+                    roots.push(cursor.bp_position());
+                    at = cursor.next_sibling();
+                }
+                // Serde and the splitter agreed on every span, so a clean stream has one root
+                // per span.
+                (roots.len() == end - first).then_some(LazyIndexed {
+                    index,
+                    text_start,
+                    text_end,
+                    roots,
+                })
+            })
+            .flatten();
+        Self {
+            first,
+            end,
+            indexed,
+        }
+    }
+
+    /// The document `spans[at]`, which this batch covers, converted as
+    /// [`Delimiters::SerdeValidated`] converts a document indexed on its own; `None` when the
+    /// batch has no index of its own.
+    fn document(
+        &self,
+        text: &[u8],
+        spans: &[(usize, usize)],
+        at: usize,
+    ) -> Option<core::result::Result<OwnedValue, EvalError>> {
+        let indexed = self.indexed.as_ref()?;
+        let cursor = JsonCursor::from_bp_position(
+            &indexed.index,
+            &text[indexed.text_start..indexed.text_end],
+            indexed.roots[at - self.first],
+        );
+        debug_assert_eq!(
+            cursor
+                .text_range()
+                .map(|(from, to)| (from + indexed.text_start, to + indexed.text_start)),
+            Some(spans[at]),
+            "the batch's root is the document the span names"
+        );
+        let (start, end) = spans[at];
+        Some(
+            generic_to_owned_checked::<JqSemantics, _>(&cursor.value())
+                .map(|value| value.with_fresh_nan_instances(&text[start..end])),
+        )
+    }
+}
+
 /// The producer the `input` queue pulls a [`LazyJsonInputs`] stream's documents from (#5661):
 /// each read converts the next document and counts its line, one forward pass over the text in
 /// all, and the read after the last answers the end of the stream at `exhausted`.
@@ -9088,6 +9184,9 @@ fn lazy_json_producer(lazy: LazyJsonInputs, exhausted: Option<(u32, u32)>) -> jq
     // The counter's place in the text, kept between reads without a borrow of it.
     let mut lines = LineCounter::at_seam(lazy.text.as_bytes(), lazy.seam).place();
     let mut next = 0;
+    // The index over the documents being read, and how much text the next one covers (#5854).
+    let mut batch: Option<LazyBatch> = None;
+    let mut batch_bytes = LAZY_BATCH_FIRST_BYTES;
     // The stream's text goes with its last document, not with the read past it.
     let mut stream = (!lazy.spans.is_empty()).then_some(lazy);
     Box::new(move || {
@@ -9096,6 +9195,11 @@ fn lazy_json_producer(lazy: LazyJsonInputs, exhausted: Option<(u32, u32)>) -> jq
         };
         let bytes = lazy.text.as_bytes();
         let (start, end) = lazy.spans[next];
+        if batch.as_ref().map_or(true, |b| next >= b.end) {
+            batch = Some(LazyBatch::build(bytes, &lazy.spans, next, batch_bytes));
+            batch_bytes = (batch_bytes * 2).min(LAZY_BATCH_MAX_BYTES);
+        }
+        let at = next;
         next += 1;
         let mut counter = LineCounter::resume(bytes, lines);
         let line = counter.read_end_line(end);
@@ -9107,8 +9211,12 @@ fn lazy_json_producer(lazy: LazyJsonInputs, exhausted: Option<(u32, u32)>) -> jq
         // Serde accepted the span as a whole value and its depth is bounded
         // (`lazy_json_spans`), so it is the conversion the eager route made, minus
         // a position only a depth error would have read.
-        let converted =
-            stream_document_validated(&bytes[start..end], None, &[], 0, DocumentForm::Value);
+        let converted = batch
+            .as_ref()
+            .and_then(|batch| batch.document(bytes, &lazy.spans, at))
+            .unwrap_or_else(|| {
+                stream_document_validated(&bytes[start..end], None, &[], 0, DocumentForm::Value)
+            });
         // Narrowed as `InputLocations::push` narrows the eager route's lines.
         let produced = jq::ProducedInput::converted(converted, lazy.source, line as u32);
         if next == lazy.spans.len() {
@@ -13790,6 +13898,150 @@ mod tests {
         // Brackets inside a string do not count towards the depth.
         let in_string = format!("[\"{}\", 1]\n", "[".repeat(200));
         assert!(spans(&in_string).is_some());
+    }
+
+    /// The streams the batching pins below read: every shape a document converts differently by.
+    fn batched_streams_5854() -> Vec<String> {
+        let mut streams = vec![
+            // Number literals jq keeps as written (#2936), and the extremes around them.
+            "1.000 1E2 -0 -0.0 1e1000 100000000000000000000 0.1 1 2 3\n".to_string(),
+            // Duplicate keys, an empty container, and a key that needs unescaping.
+            "{\"a\":1,\"a\":2,\"b\":{}} [] {\"\\u0041\":[1,[2,[3]]]}\n".to_string(),
+            // A lone surrogate and an escaped pair, a long string and a multi-byte character.
+            "\"\\ud800\" \"\\ud83d\\ude00\" \"é𝄞\" \"x\"\n".to_string(),
+            // Bare tokens and strings around containers: the roots of the batch's index.
+            "null true false \"s\" 0 [null] {\"k\":null} \"t\"\n".to_string(),
+            // Blank lines, CRLF and indentation between documents.
+            "  {\"a\": 1}\r\n\r\n\n\t[1, 2,\n 3]\r\n".to_string(),
+        ];
+        // Many small records, so the batches have boundaries inside the stream.
+        streams.push(
+            (0..400)
+                .map(|i| {
+                    format!(
+                        "{{\"id\":{i},\"s\":\"v{i}\",\"n\":{}.5,\"a\":[{i},null]}}\n",
+                        i * 7
+                    )
+                })
+                .collect(),
+        );
+        streams.push((0..300).map(|i| format!("{i} ")).collect());
+        streams
+    }
+
+    /// #5854: a document read through its batch's index is the value an index of its own gives
+    /// it, whichever documents the batch holds and wherever its boundaries fall.
+    #[test]
+    fn a_batched_document_equals_the_one_converted_alone_5854() {
+        for stream in batched_streams_5854() {
+            let spans = lazy_json_spans(&stream).expect("a clean stream the lazy route admits");
+            let bytes = stream.as_bytes();
+            // 1 is a batch of one document (no index of its own); the others cut the stream
+            // at different places, down to one big batch.
+            for max_bytes in [1, 8, 17, 64, 255, 4096, LAZY_BATCH_MAX_BYTES] {
+                let mut next = 0;
+                let mut batched = 0;
+                while next < spans.len() {
+                    let batch = LazyBatch::build(bytes, &spans, next, max_bytes);
+                    assert!(batch.end > next, "a batch holds at least one document");
+                    for at in next..batch.end {
+                        let (start, end) = spans[at];
+                        let alone = stream_document_validated(
+                            &bytes[start..end],
+                            None,
+                            &[],
+                            0,
+                            DocumentForm::Value,
+                        );
+                        match batch.document(bytes, &spans, at) {
+                            Some(together) => {
+                                batched += 1;
+                                // The result, an error included: a lone surrogate fails alike.
+                                assert_eq!(
+                                    format!("{together:?}"),
+                                    format!("{alone:?}"),
+                                    "document {at} of {stream:?} in a batch of {max_bytes} bytes"
+                                );
+                            }
+                            None => {
+                                assert_eq!(batch.end, next + 1, "only a lone document has no index")
+                            }
+                        }
+                    }
+                    next = batch.end;
+                }
+                if max_bytes >= 4096 {
+                    assert_eq!(
+                        batched,
+                        spans.len(),
+                        "{stream:?} is read through its batches"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #5854: a batch covers no more text than its limit past the first document, and a stream
+    /// is covered by consecutive batches with no gap and no overlap.
+    #[test]
+    fn batches_cover_a_stream_in_order_within_their_limit_5854() {
+        let stream: String = (0..100).map(|i| format!("{{\"id\":{i}}}\n")).collect();
+        let spans = lazy_json_spans(&stream).expect("clean");
+        let limit = 200;
+        let mut next = 0;
+        let mut ends = Vec::new();
+        while next < spans.len() {
+            let batch = LazyBatch::build(stream.as_bytes(), &spans, next, limit);
+            assert_eq!(batch.first, next);
+            assert!(spans[batch.end - 1].1 - spans[next].0 <= limit || batch.end == next + 1);
+            ends.push(batch.end);
+            next = batch.end;
+        }
+        assert_eq!(*ends.last().unwrap(), spans.len());
+        assert!(ends.len() > 1 && ends.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// #5854: the producer's documents, lines and end are the same with batches as without,
+    /// across the batch sizes its growth passes through (the test's stream is far past the
+    /// first batch's).
+    #[test]
+    fn the_producer_reads_a_batched_stream_as_it_read_one_document_at_a_time_5854() {
+        let stream: String = (0..3000)
+            .map(|i| format!("{{\"id\":{i},\"s\":\"{}\"}}\n", "x".repeat(i % 50)))
+            .collect();
+        let spans = lazy_json_spans(&stream).expect("clean");
+        assert!(
+            spans.last().unwrap().1 > 2 * LAZY_BATCH_FIRST_BYTES,
+            "the stream outgrows the first batch"
+        );
+        let text = std::rc::Rc::new(stream.clone());
+        let mut producer = lazy_json_producer(
+            LazyJsonInputs {
+                text,
+                spans: spans.clone(),
+                source: 0,
+                seam: Seam::NONE,
+            },
+            None,
+        );
+        for (i, &(start, end)) in spans.iter().enumerate() {
+            let alone = stream_document_validated(
+                &stream.as_bytes()[start..end],
+                None,
+                &[],
+                0,
+                DocumentForm::Value,
+            )
+            .expect("converts");
+            match producer() {
+                jq::ProducedInput::Document(value, _, line) => {
+                    assert_eq!(value, alone, "document {i}");
+                    assert_eq!(line as usize, i + 1, "document {i}'s line");
+                }
+                _ => panic!("document {i} is a converted value"),
+            }
+        }
+        assert!(matches!(producer(), jq::ProducedInput::End(None)));
     }
 
     /// #5661: the lazy route's end of stream, read off its spans, is the one the strict scan of
