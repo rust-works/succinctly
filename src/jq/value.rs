@@ -2180,9 +2180,10 @@ fn format_positive_shifted_plain(
 //    the `Iterate` fan-out in `set_path`) used to deep-copy the whole tree
 //    for that separation; now they copy exactly the spine they write.
 //
-// Copy-on-write is invisible to callers in every way but cost: the crate has
-// no `unsafe` in `src/jq`, so a `&mut` into one handle can never alias
-// another, and no `Send`/`Sync` bound exists anywhere the values travel
+// Copy-on-write is invisible to callers in every way but cost: the only
+// `unsafe` in the containers is the by-value move out of `ObjectMapOf`
+// (#5782), which reads each field once and aliases nothing, so a `&mut` into
+// one handle can never alias another, and no `Send`/`Sync` bound exists anywhere the values travel
 // (`main` runs evaluation on one spawned thread), which is why this is `Rc`
 // and not `Arc`. The one behavioural surface is *when* a copy happens, and
 // [`share_stats`](super::share_stats) records every forced one with its call
@@ -2208,6 +2209,58 @@ macro_rules! note_forced_copy {
     };
 }
 
+/// How a container's `Drop` takes a deeply nested value apart without
+/// recursing once per level (#5782).
+///
+/// [`ArrayOf`] and [`ObjectMapOf`] drop through this trait: a value built
+/// millions of levels deep (`reduce range(10000000) as $i ([]; .[0] = .)`)
+/// would otherwise overflow the native stack in drop glue, which `Drop`
+/// cannot refuse. Only [`OwnedValue`] sets [`ITERATIVE`](Self::ITERATIVE),
+/// so every other instantiation compiles the teardown away.
+///
+/// Not part of the supported API: `#[doc(hidden)]`, and
+/// [`detach_children`](Self::detach_children) empties the value it is called
+/// on, which is only correct for a value that is about to be dropped.
+#[doc(hidden)]
+pub trait Teardown: Sized {
+    /// Whether dropping a container of `Self` runs the iterative teardown.
+    const ITERATIVE: bool = false;
+
+    /// Whether `self` is a container this handle is the last holder of the
+    /// storage of (the map, or a repeated key's side list), so that taking
+    /// it apart moves children out of storage nothing else reads.
+    #[inline]
+    fn is_unique_container(&self) -> bool {
+        false
+    }
+
+    /// Whether `self` is a non-empty container: the only kind of child that
+    /// can lead to a deep value, so a container with none needs no teardown.
+    #[inline]
+    fn is_nonempty_container(&self) -> bool {
+        false
+    }
+
+    /// If `self` is a non-empty container, take it out of its parent, leaving
+    /// a scalar behind: a container this handle is the last holder of goes
+    /// onto `work`, any other is dropped on the spot (which only releases one
+    /// handle), so the parent then drops without recursing into either. A
+    /// scalar is left alone for the parent's ordinary drop glue.
+    #[inline]
+    fn detach(&mut self, work: &mut Vec<Self>) {
+        let _ = work;
+    }
+
+    /// [`detach`](Self::detach) every child of `self`, in order: a handle
+    /// released here may leave a later sibling on the same child as its last
+    /// holder. What is left of storage `self` owns alone is then dropped
+    /// (nothing in it recurses), so dropping `self` afterwards does no work.
+    #[inline]
+    fn detach_children(&mut self, work: &mut Vec<Self>) {
+        let _ = work;
+    }
+}
+
 /// The copy-on-write bookkeeping [`ObjectMapOf`] and [`ArrayOf`] share,
 /// generated once so the two wrappers cannot drift apart in the part that
 /// matters: `new`/`with_capacity`, `is_shared`, the by-value unwrap (move
@@ -2222,7 +2275,7 @@ macro_rules! shared_container {
         $wrapper:ident, $inner:ident, target = $target:ty,
         into = $into:ident, on_write = $on_write:ident, on_unwrap = $on_unwrap:ident,
     ) => {
-        impl<V> $wrapper<V> {
+        impl<V: Teardown> $wrapper<V> {
             /// An empty container.
             #[inline]
             pub fn new() -> Self {
@@ -2258,17 +2311,17 @@ macro_rules! shared_container {
             }
         }
 
-        impl<V: Clone> $wrapper<V> {
+        impl<V: Teardown + Clone> $wrapper<V> {
             /// Consume the wrapper, yielding the container it wraps -- by move
             /// when this handle was the last one, by copy otherwise.
             #[inline]
             #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
-            pub fn $into(self) -> $target {
-                match Rc::try_unwrap(self.0) {
-                    Ok(inner) => inner,
-                    Err(shared) => {
+            pub fn $into(mut self) -> $target {
+                match Rc::get_mut(&mut self.0) {
+                    Some(inner) => core::mem::take(inner),
+                    None => {
                         note_forced_copy!($on_unwrap);
-                        (*shared).clone()
+                        (*self.0).clone()
                     }
                 }
             }
@@ -2279,7 +2332,7 @@ macro_rules! shared_container {
         // needs nothing of its value type beyond what the clone itself needs.
         // `OwnedValue` has no `Default` at all, so `#[derive(Default)]` would
         // not even compile here.
-        impl<V> Default for $wrapper<V> {
+        impl<V: Teardown> Default for $wrapper<V> {
             #[inline]
             fn default() -> Self {
                 Self::new()
@@ -2288,14 +2341,14 @@ macro_rules! shared_container {
 
         /// A refcount bump: the copy is deferred to the first write through
         /// either handle.
-        impl<V: Clone> Clone for $wrapper<V> {
+        impl<V: Teardown + Clone> Clone for $wrapper<V> {
             #[inline]
             fn clone(&self) -> Self {
                 Self(self.0.clone())
             }
         }
 
-        impl<V: PartialEq> PartialEq for $wrapper<V> {
+        impl<V: Teardown + PartialEq> PartialEq for $wrapper<V> {
             #[inline]
             fn eq(&self, other: &Self) -> bool {
                 **self == **other
@@ -2307,14 +2360,14 @@ macro_rules! shared_container {
         /// `Debug` would print the wrapper's name -- a cosmetic but real
         /// change to what a downstream `println!("{:?}", value)` shows, for a
         /// type whose whole purpose is to be invisible.
-        impl<V: core::fmt::Debug> core::fmt::Debug for $wrapper<V> {
+        impl<V: Teardown + core::fmt::Debug> core::fmt::Debug for $wrapper<V> {
             #[inline]
             fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 core::fmt::Debug::fmt(&**self, f)
             }
         }
 
-        impl<V> Deref for $wrapper<V> {
+        impl<V: Teardown> Deref for $wrapper<V> {
             type Target = $target;
 
             #[inline]
@@ -2327,7 +2380,7 @@ macro_rules! shared_container {
         /// before the caller's write reaches it. `V: Clone` is what
         /// `Rc::make_mut` needs and is the only bound the sharing adds
         /// anywhere.
-        impl<V: Clone> DerefMut for $wrapper<V> {
+        impl<V: Teardown + Clone> DerefMut for $wrapper<V> {
             #[inline]
             #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
             fn deref_mut(&mut self) -> &mut Self::Target {
@@ -2338,14 +2391,14 @@ macro_rules! shared_container {
             }
         }
 
-        impl<V> From<$target> for $wrapper<V> {
+        impl<V: Teardown> From<$target> for $wrapper<V> {
             #[inline]
             fn from(inner: $target) -> Self {
                 Self(Rc::new(inner))
             }
         }
 
-        impl<V: Clone> From<$wrapper<V>> for $target {
+        impl<V: Teardown + Clone> From<$wrapper<V>> for $target {
             #[inline]
             #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
             fn from(wrapper: $wrapper<V>) -> Self {
@@ -2380,7 +2433,7 @@ pub type ObjectMap = ObjectMapOf<OwnedValue>;
 /// forms, [`From`]/[`FromIterator`]/[`Extend`], and a `Debug` that prints the
 /// bare `Vec`. Only *construction* from a bare `Vec` needs `.into()` (or
 /// [`OwnedValue::array_from`]).
-pub struct ArrayOf<V>(ArrayInnerOf<V>);
+pub struct ArrayOf<V: Teardown>(ArrayInnerOf<V>);
 
 /// [`OwnedValue::Array`]'s backing store: [`ArrayOf`] over `OwnedValue`.
 /// (Unrelated to the `arrayvec` crate.)
@@ -2394,32 +2447,170 @@ shared_container! {
     into = into_vec, on_write = ArrayMakeMut, on_unwrap = ArrayUnwrap,
 }
 
+impl<V: Teardown> ArrayOf<V> {
+    /// The elements, if this handle owns them alone.
+    #[inline]
+    fn unique_vec(&mut self) -> Option<&mut Vec<V>> {
+        Rc::get_mut(&mut self.0)
+    }
+
+    /// [`Teardown::detach`] every element, if this handle owns them alone,
+    /// then drop what is left (scalars and empty containers, none of which
+    /// recurses), so the array's own `Drop` finds it empty.
+    fn detach_into(&mut self, work: &mut Vec<V>) {
+        if let Some(vec) = self.unique_vec() {
+            for child in vec.iter_mut() {
+                child.detach(work);
+            }
+            vec.clear();
+        }
+    }
+}
+
+/// Dropping a unique array more than `drop_depth`'s limit of container
+/// drops deep tears the rest of the subtree down on a heap worklist (#5782),
+/// so a value millions of levels deep drops in bounded native stack; a
+/// shallower one drops its elements through the ordinary drop glue, inside
+/// one level of the count. On the worklist each element that is a container
+/// is swapped for a scalar in place and in order: a handle that was one of
+/// several on the same child is released first, which leaves the next as
+/// the last holder, so a diamond-shaped value (`[S, S]` per level) is torn
+/// down as well.
+impl<V: Teardown> Drop for ArrayOf<V> {
+    #[inline]
+    fn drop(&mut self) {
+        if !V::ITERATIVE {
+            return;
+        }
+        let Some(vec) = self.unique_vec() else {
+            return;
+        };
+        if vec.is_empty() {
+            return;
+        }
+        #[cfg(feature = "std")]
+        {
+            if let Some(_level) = drop_depth::enter() {
+                vec.clear();
+                return;
+            }
+            self.tear_down_cold();
+        }
+        #[cfg(not(feature = "std"))]
+        if vec.iter().any(V::is_nonempty_container) {
+            self.tear_down_cold();
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+pub(crate) mod drop_depth {
+    //! How many container drops are running on this thread's stack, so that
+    //! a drop recurses through the ordinary drop glue while the value is
+    //! shallow and takes the rest of a deep one apart on a worklist (#5782).
+    //!
+    //! A container drop that is still within [`LIMIT`] levels drops its
+    //! children itself, inside a level of this count, and pays nothing per
+    //! child; only a drop past it reaches [`tear_down`](super::tear_down).
+    //! Scanning every unique container's children for a container instead
+    //! (and tearing down on a worklist whenever one turned up) cost +2% to
+    //! +11% wall-clock on a 7950X; this costs two thread-local accesses per
+    //! unique container. `no_std` has no `thread_local!`, so there every
+    //! unique container still scans.
+    //!
+    //! The limit keeps a drop's native stack small: about 64 bytes per array
+    //! level and 160 per object level in a release build, so at most about
+    //! 43 KB.
+
+    use std::cell::Cell;
+
+    /// Container drops one thread may nest before the rest is iterative.
+    pub(crate) const LIMIT: u32 = 256;
+
+    std::thread_local! {
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// One level of the count, given back when it drops.
+    pub(crate) struct Level(u32);
+
+    impl Drop for Level {
+        #[inline]
+        fn drop(&mut self) {
+            DEPTH.with(|depth| depth.set(self.0));
+        }
+    }
+
+    /// One more level, or `None` once [`LIMIT`] are already running.
+    #[inline]
+    pub(crate) fn enter() -> Option<Level> {
+        DEPTH.with(|depth| {
+            let current = depth.get();
+            (current < LIMIT).then(|| {
+                depth.set(current + 1);
+                Level(current)
+            })
+        })
+    }
+
+    /// The levels running now.
+    #[cfg(test)]
+    pub(crate) fn current() -> u32 {
+        DEPTH.with(Cell::get)
+    }
+}
+
+impl<V: Teardown> ArrayOf<V> {
+    /// The teardown of a unique array past the depth limit (or, without
+    /// `std`, one that has a container element), out of line so a shallow
+    /// drop does not carry it.
+    #[cold]
+    #[inline(never)]
+    fn tear_down_cold(&mut self) {
+        let mut work = Vec::new();
+        self.detach_into(&mut work);
+        tear_down(work);
+    }
+}
+
+/// Take apart every container on `work`, and every unique container found
+/// below them, on the worklist itself. Out of line: only a drop past the
+/// depth limit reaches it (without `std`, a value that holds a unique
+/// container), so a shallow drop stays small.
+#[cold]
+#[inline(never)]
+pub(crate) fn tear_down<V: Teardown>(mut work: Vec<V>) {
+    while let Some(mut value) = work.pop() {
+        value.detach_children(&mut work);
+    }
+}
+
 /// An array compares equal to the bare `Vec` it wraps, in both directions,
 /// so `assert_eq!(items, vec![..])` keeps reading as it did when
 /// `OwnedValue::Array` held a `Vec` -- the same transparency the `Deref`
 /// gives reads.
-impl<V: PartialEq> PartialEq<Vec<V>> for ArrayOf<V> {
+impl<V: Teardown + PartialEq> PartialEq<Vec<V>> for ArrayOf<V> {
     #[inline]
     fn eq(&self, other: &Vec<V>) -> bool {
         **self == *other
     }
 }
 
-impl<V: PartialEq> PartialEq<ArrayOf<V>> for Vec<V> {
+impl<V: Teardown + PartialEq> PartialEq<ArrayOf<V>> for Vec<V> {
     #[inline]
     fn eq(&self, other: &ArrayOf<V>) -> bool {
         *self == **other
     }
 }
 
-impl<V> FromIterator<V> for ArrayOf<V> {
+impl<V: Teardown> FromIterator<V> for ArrayOf<V> {
     #[inline]
     fn from_iter<I: IntoIterator<Item = V>>(iter: I) -> Self {
         Self::from(Vec::from_iter(iter))
     }
 }
 
-impl<V: Clone> Extend<V> for ArrayOf<V> {
+impl<V: Teardown + Clone> Extend<V> for ArrayOf<V> {
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn extend<I: IntoIterator<Item = V>>(&mut self, iter: I) {
@@ -2491,17 +2682,19 @@ impl<V: Clone> DoubleEndedIterator for ArrayIntoIter<V> {
 
 impl<V: Clone> ExactSizeIterator for ArrayIntoIter<V> {}
 
-impl<V: Clone> IntoIterator for ArrayOf<V> {
+impl<V: Teardown + Clone> IntoIterator for ArrayOf<V> {
     type Item = V;
     type IntoIter = ArrayIntoIter<V>;
 
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn into_iter(self) -> Self::IntoIter {
-        match Rc::try_unwrap(self.0) {
-            Ok(vec) => ArrayIntoIter::Owned(vec.into_iter()),
-            Err(shared) => {
+        let mut this = self;
+        match Rc::get_mut(&mut this.0) {
+            Some(vec) => ArrayIntoIter::Owned(core::mem::take(vec).into_iter()),
+            None => {
                 note_forced_copy!(ArrayUnwrap);
+                let shared = Rc::clone(&this.0);
                 let end = shared.len();
                 ArrayIntoIter::Shared {
                     vec: shared,
@@ -2513,7 +2706,7 @@ impl<V: Clone> IntoIterator for ArrayOf<V> {
     }
 }
 
-impl<'a, V> IntoIterator for &'a ArrayOf<V> {
+impl<'a, V: Teardown> IntoIterator for &'a ArrayOf<V> {
     type Item = &'a V;
     type IntoIter = core::slice::Iter<'a, V>;
 
@@ -2523,7 +2716,7 @@ impl<'a, V> IntoIterator for &'a ArrayOf<V> {
     }
 }
 
-impl<'a, V: Clone> IntoIterator for &'a mut ArrayOf<V> {
+impl<'a, V: Teardown + Clone> IntoIterator for &'a mut ArrayOf<V> {
     type Item = &'a mut V;
     type IntoIter = core::slice::IterMut<'a, V>;
 
@@ -3049,6 +3242,46 @@ pub enum OwnedValue {
     /// JSON object (insertion order preserved like jq; the map is held
     /// behind one refcounted pointer -- see [`ObjectMap`] for why)
     Object(ObjectMap),
+}
+
+impl Teardown for OwnedValue {
+    const ITERATIVE: bool = true;
+
+    #[inline]
+    fn is_unique_container(&self) -> bool {
+        match self {
+            Self::Array(items) => !items.is_shared() && !items.is_empty(),
+            Self::Object(map) => map.is_detachable(),
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn is_nonempty_container(&self) -> bool {
+        match self {
+            Self::Array(items) => !items.is_empty(),
+            Self::Object(map) => map.has_entries(),
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn detach(&mut self, work: &mut Vec<Self>) {
+        if self.is_nonempty_container() {
+            let taken = core::mem::replace(self, Self::Null);
+            if taken.is_unique_container() {
+                work.push(taken);
+            }
+        }
+    }
+
+    fn detach_children(&mut self, work: &mut Vec<Self>) {
+        match self {
+            Self::Array(items) => items.detach_into(work),
+            Self::Object(map) => map.detach_into(work),
+            _ => {}
+        }
+    }
 }
 
 impl OwnedValue {
@@ -11148,5 +11381,203 @@ mod tests {
         ] {
             assert!(v.identical(&v), "not reflexive: {v:?}");
         }
+    }
+
+    /// Levels deep enough that one native frame of drop glue per level
+    /// overflows the 2 MiB stack a test thread gets, in a debug build.
+    const DEEP_5782: usize = 400_000;
+
+    fn nest_object_5782(depth: usize) -> OwnedValue {
+        let mut value = OwnedValue::Object(ObjectMap::new());
+        for _ in 0..depth {
+            value = OwnedValue::object_from([("a".to_string(), value)]);
+        }
+        value
+    }
+
+    /// Dropping a unique array, object, or alternating chain of them is
+    /// iterative: a recursive drop glue overflows this thread's stack
+    /// (#5782).
+    #[test]
+    fn dropping_a_deep_unique_value_does_not_overflow_the_stack_5782() {
+        drop(linear_array_nest(DEEP_5782));
+        drop(nest_object_5782(DEEP_5782));
+        let mut value = OwnedValue::Null;
+        for level in 0..DEEP_5782 {
+            value = if level % 2 == 0 {
+                OwnedValue::array_from(vec![OwnedValue::Int(1), value, OwnedValue::Null])
+            } else {
+                OwnedValue::object_from([
+                    ("x".to_string(), OwnedValue::Bool(true)),
+                    ("a".to_string(), value),
+                ])
+            };
+        }
+        drop(value);
+    }
+
+    /// A repeated key's earlier entries (the shadows, yq mode) hold values
+    /// too, and the teardown reaches them: here every level of the chain is
+    /// held *only* by the shadow of its parent's repeated key.
+    #[test]
+    fn dropping_a_deep_chain_held_by_shadows_does_not_overflow_5782() {
+        let mut value = OwnedValue::Null;
+        for _ in 0..DEEP_5782 {
+            let mut map = ObjectMap::new();
+            map.insert("k".to_string(), value);
+            map.push_occurrence("k".to_string(), OwnedValue::Null);
+            value = OwnedValue::Object(map);
+        }
+        assert_eq!(
+            value.as_object_mut().expect("an object").occurrence_len(),
+            2
+        );
+        drop(value);
+    }
+
+    /// A handle that shares its storage only decrements: the last handle
+    /// still sees every level, and tears the chain down when it goes.
+    #[test]
+    fn dropping_one_of_two_handles_leaves_the_deep_value_intact_5782() {
+        let first = linear_array_nest(DEEP_5782);
+        let second = first.clone();
+        drop(first);
+        let mut depth = 0usize;
+        let mut cursor = &second;
+        while let OwnedValue::Array(items) = cursor {
+            let Some(next) = items.first() else { break };
+            depth += 1;
+            cursor = next;
+        }
+        assert_eq!(depth, DEEP_5782);
+        drop(second);
+    }
+
+    /// An element type that opts out of the iterative teardown, as `JqValue`
+    /// does: the container's `Drop` is a no-op for it and every provided
+    /// `Teardown` method answers "nothing to do".
+    struct Plain;
+
+    impl Teardown for Plain {}
+
+    #[test]
+    fn an_element_type_without_the_teardown_leaves_the_default_methods_inert_5782() {
+        let mut plain = Plain;
+        let mut work = Vec::new();
+        assert!(!plain.is_unique_container());
+        assert!(!plain.is_nonempty_container());
+        plain.detach(&mut work);
+        plain.detach_children(&mut work);
+        assert_eq!(work.len(), 0);
+        drop(ArrayOf::from(vec![Plain, Plain]));
+    }
+
+    /// The teardown's own entry points decline what they do not own: a
+    /// scalar has no children, and a shared array's elements are left to the
+    /// handle that still holds them.
+    #[test]
+    fn detaching_a_scalar_or_a_shared_array_changes_nothing_5782() {
+        let mut work = Vec::new();
+        let mut scalar = OwnedValue::Int(1);
+        assert!(!scalar.is_unique_container());
+        scalar.detach_children(&mut work);
+        assert_eq!(scalar, OwnedValue::Int(1));
+
+        let mut first = ArrayVec::from(vec![linear_array_nest(2)]);
+        let second = first.clone();
+        first.detach_into(&mut work);
+        assert_eq!(work.len(), 0);
+        assert_eq!(first, second);
+    }
+
+    /// Two handles on the same child at every level (`[S, S]`): whichever
+    /// is released first only decrements, and the last one must still be
+    /// torn down iteratively rather than by the glue.
+    #[test]
+    fn dropping_a_diamond_of_shared_children_does_not_overflow_5782() {
+        let mut array = OwnedValue::Null;
+        let mut object = OwnedValue::Null;
+        for _ in 0..DEEP_5782 {
+            array = OwnedValue::array_from(vec![array.clone(), array]);
+            object = OwnedValue::object_from([
+                ("a".to_string(), object.clone()),
+                ("b".to_string(), object),
+            ]);
+        }
+        drop(array);
+        drop(object);
+    }
+
+    /// Detaching a unique container's children leaves it empty, side list
+    /// included, so its own drop on the worklist returns at once instead of
+    /// scanning the scalars it had left a second time.
+    #[test]
+    fn detaching_children_leaves_a_unique_container_empty_5782() {
+        let mut work = Vec::new();
+        let mut array = OwnedValue::array_from(vec![
+            OwnedValue::Int(1),
+            linear_array_nest(2),
+            OwnedValue::array(),
+        ]);
+        array.detach_children(&mut work);
+        assert_eq!(work.len(), 1, "only the non-empty container is queued");
+        assert_eq!(array, OwnedValue::array());
+
+        let mut map = ObjectMap::new();
+        map.insert("k".to_string(), nest_object_5782(2));
+        map.push_occurrence("k".to_string(), OwnedValue::Int(2));
+        let mut object = OwnedValue::Object(map);
+        work.clear();
+        object.detach_children(&mut work);
+        assert_eq!(work.len(), 1);
+        let map = object.as_object_mut().expect("an object");
+        assert!(!map.has_entries(), "map and side list both dropped");
+    }
+
+    /// The drop-depth count is given back however a drop ends: within the
+    /// limit, past it on the worklist, or started with every level already
+    /// taken, when the whole value goes onto the worklist from its root.
+    #[test]
+    #[cfg(feature = "std")]
+    fn the_drop_depth_count_is_restored_after_every_drop_5782() {
+        assert_eq!(drop_depth::current(), 0);
+        drop(linear_array_nest(drop_depth::LIMIT as usize - 1));
+        drop(linear_array_nest(DEEP_5782));
+        drop(nest_object_5782(DEEP_5782));
+        assert_eq!(drop_depth::current(), 0);
+
+        let mut held: Vec<_> = core::iter::from_fn(drop_depth::enter).collect();
+        assert_eq!(held.len(), drop_depth::LIMIT as usize);
+        drop(linear_array_nest(DEEP_5782));
+        drop(nest_object_5782(DEEP_5782));
+        assert_eq!(drop_depth::current(), drop_depth::LIMIT);
+        while let Some(level) = held.pop() {
+            drop(level);
+        }
+        assert_eq!(drop_depth::current(), 0);
+    }
+
+    /// An array of many deep chains is torn down without a per-level frame
+    /// and without losing track of any of them.
+    #[test]
+    fn dropping_a_wide_array_of_deep_values_does_not_overflow_5782() {
+        let chains: Vec<OwnedValue> = (0..64).map(|_| linear_array_nest(DEEP_5782 / 16)).collect();
+        drop(OwnedValue::array_from(chains));
+    }
+
+    /// The by-value conversions still hand back every element after the
+    /// wrapper gained a `Drop`.
+    #[test]
+    fn by_value_conversions_still_move_the_contents_out_5782() {
+        let items = ArrayVec::from(vec![OwnedValue::Int(1), linear_array_nest(3)]);
+        let vec = items.into_vec();
+        assert_eq!(vec.len(), 2);
+
+        let map = ObjectMap::from(indexmap::IndexMap::from([(
+            "a".to_string(),
+            nest_object_5782(3),
+        )]));
+        let entries: Vec<_> = map.into_iter().collect();
+        assert_eq!(entries.len(), 1);
     }
 }

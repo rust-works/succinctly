@@ -17,6 +17,7 @@
 # filters. They are heavy by construction, not slow because of a fault, so the cost is moved
 # here too: this leg (about 270 s of test CPU) and `cli-gated` (about 970 s) then carried
 # similar amounts (#5705 has since moved `yq_cli_tests` here, below). A `yq_cli_tests` test cannot be listed: `run` lists and runs one target.
+# #5782's ten-million-level drop test joined later, timed on its own rather than in that run.
 #
 # All of `yq_cli_tests` (104 s of macOS test time, #5705) runs in that leg too, but not from
 # here: ci.yml runs `cargo test --features cli --test yq_cli_tests` after `run`, with no skip
@@ -76,6 +77,7 @@ HEAVY_TESTS=(
   test_argument_chain_refuses_on_the_path_routes_3262 # 61
   test_recurse_cap_stopping_consumers_and_boundary_3716 # 44
   test_fused_slice_key_equals_the_unfused_spelling_4286 # 43
+  per_issue::i5782::a_ten_million_level_array_is_dropped_without_overflowing_the_stack_5782 # 28 (#5782, measured alone; peaks near 790 MB RSS)
   test_owned_array_slice_read_equals_the_unfused_spelling_4286 # 25
   test_fused_navigated_literal_slice_read_equals_the_unfused_spelling_4406 # 25
   test_recurse_cap_retry_and_null_loop_3716 # 23

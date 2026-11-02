@@ -7280,6 +7280,10 @@ A fold whose step has no owned door (`reduce range(N) as $i (0; [.])`, `{a: .}`)
 `paths`, `tostream` and `[path(..)]` over a value hundreds of thousands of levels deep build output quadratic in its depth, as jq's would, and need the memory for it.
 `succinctly yq` still refuses a value past 384 levels: its emitters were tuned against that bound and are not covered by the floor yet.
 
+**Dropping.** A fold whose step has an owned door (`.[0] = .`) shares the accumulator instead of copying it, so the value it builds can be millions of levels deep (`reduce range(10000000) as $i ([]; .[0] = .) | length`).
+jq 1.7.1 segfaults on that program from a few hundred thousand levels (between 150,000 and 200,000 on macOS with an 8 MB stack); succinctly prints `1` ([#5782](https://github.com/rust-works/succinctly/issues/5782)).
+The divergence is deliberate (ADR-0018: a reference that takes the process down is not matched): past 256 nested container drops, dropping such a value is iterative, on a heap worklist, so the native stack it needs is bounded.
+
 ### Before #5497
 
 The rest of this section is the history of the guards that a too-deep document reached before the parse limit above refused it; they still guard the routes listed above.

@@ -104,7 +104,9 @@ use super::tail_call::{
     bind_next, body_is_reusable, pipe_settles_before_last, stage_settles, tail_def, tail_reachable,
     Tail, TailRounds,
 };
-use super::value::{owned_value_eq, subarray_indices, NumberRepr, ObjectMapOf, OwnedValue};
+use super::value::{
+    owned_value_eq, subarray_indices, NumberRepr, ObjectMapOf, OwnedValue, Teardown,
+};
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
 /// [`to_owned_with_comments`] (#998).
@@ -1455,18 +1457,18 @@ pub fn validate_cursor<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Resul
 /// the shadow. One definition every materializer shares, so the walks cannot disagree about which
 /// mode keeps what (#1344).
 #[doc(hidden)]
-pub struct ObjectBuilder<V> {
+pub struct ObjectBuilder<V: Teardown> {
     plain: IndexMap<String, V>,
     shadowed: Option<ObjectMapOf<V>>,
 }
 
-impl<V: Clone> Default for ObjectBuilder<V> {
+impl<V: Clone + Teardown> Default for ObjectBuilder<V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<V: Clone> ObjectBuilder<V> {
+impl<V: Clone + Teardown> ObjectBuilder<V> {
     #[inline]
     pub fn new() -> Self {
         Self::with_capacity(0)
@@ -1572,7 +1574,7 @@ impl SiblingShape {
 /// the value itself ([`BuildOwned`]) or nothing ([`CheckOnly`], #3156). The
 /// walk -- every check, in the same order -- is the same for both.
 trait CursorWalkOutput {
-    type Out: Clone;
+    type Out: Clone + Teardown;
     /// Whether the walk keeps the members it reads. `false` lets the object
     /// arm skip the per-key `String` and the per-object collision map, which
     /// are all a walk that builds nothing would spend them on (#3478).
@@ -1634,6 +1636,8 @@ impl CursorWalkOutput for BuildOwned {
 
 /// [`validate_cursor`]'s output: nothing, dropped as it goes.
 struct CheckOnly;
+
+impl Teardown for () {}
 
 impl CursorWalkOutput for CheckOnly {
     type Out = ();
