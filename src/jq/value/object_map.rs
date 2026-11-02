@@ -432,30 +432,50 @@ impl<V: Teardown> ObjectMapOf<V> {
     }
 }
 
-/// Dropping a unique object tears the whole subtree down on a heap worklist
-/// (#5782); see [`ArrayOf`](super::ArrayOf)'s `Drop`. The values are scanned
-/// in order and only containers are swapped out, so siblings that share a
-/// child are released before the last one is judged, and the worklist `Vec`
-/// allocates only when a unique container is found.
+/// Dropping a unique object past the depth limit tears the rest of the
+/// subtree down on a heap worklist (#5782); see [`ArrayOf`](super::ArrayOf)'s
+/// `Drop` and `drop_depth`. On the worklist the values are visited in order
+/// and only containers are swapped out, so siblings that share a child are
+/// released before the last one is judged.
 impl<V: Teardown> Drop for ObjectMapOf<V> {
     #[inline]
     fn drop(&mut self) {
         if !V::ITERATIVE {
             return;
         }
-        let holds_container = self.shadows.is_some()
-            || self
-                .unique_map()
-                .is_some_and(|map| map.values().any(V::is_nonempty_container));
-        if holds_container {
+        #[cfg(feature = "std")]
+        {
+            if !self.is_detachable() {
+                return;
+            }
+            // `clear`, not `take`: an empty `IndexMap` would build a fresh
+            // `RandomState`.
+            if let Some(_level) = super::drop_depth::enter() {
+                if let Some(map) = self.unique_map() {
+                    map.clear();
+                }
+                drop(self.shadows.take());
+                return;
+            }
             self.tear_down_cold();
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let holds_container = self.shadows.is_some()
+                || self
+                    .unique_map()
+                    .is_some_and(|map| map.values().any(V::is_nonempty_container));
+            if holds_container {
+                self.tear_down_cold();
+            }
         }
     }
 }
 
 impl<V: Teardown> ObjectMapOf<V> {
-    /// The teardown of a unique object that has a container value, out of
-    /// line so the drop of a flat object is just the check in `drop`.
+    /// The teardown of a unique object past the depth limit (or, without
+    /// `std`, one that has a container value), out of line so a shallow drop
+    /// does not carry it.
     #[cold]
     #[inline(never)]
     fn tear_down_cold(&mut self) {

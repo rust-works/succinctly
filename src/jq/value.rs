@@ -2463,14 +2463,15 @@ impl<V: Teardown> ArrayOf<V> {
     }
 }
 
-/// Dropping a unique array tears the whole subtree down on a heap worklist
-/// (#5782), so a value millions of levels deep drops in constant native
-/// stack. Each element that is a container is swapped for a scalar in place
-/// and in order: a handle that was one of several on the same child is
-/// released first, which leaves the next as the last holder, so a
-/// diamond-shaped value (`[S, S]` per level) is torn down as well. Scalars
-/// are not touched, so the ordinary drop glue frees them in its one pass, and
-/// the worklist allocates only when a unique container turns up.
+/// Dropping a unique array more than `drop_depth`'s limit of container
+/// drops deep tears the rest of the subtree down on a heap worklist (#5782),
+/// so a value millions of levels deep drops in bounded native stack; a
+/// shallower one drops its elements through the ordinary drop glue, inside
+/// one level of the count. On the worklist each element that is a container
+/// is swapped for a scalar in place and in order: a handle that was one of
+/// several on the same child is released first, which leaves the next as
+/// the last holder, so a diamond-shaped value (`[S, S]` per level) is torn
+/// down as well.
 impl<V: Teardown> Drop for ArrayOf<V> {
     #[inline]
     fn drop(&mut self) {
@@ -2480,15 +2481,85 @@ impl<V: Teardown> Drop for ArrayOf<V> {
         let Some(vec) = self.unique_vec() else {
             return;
         };
+        if vec.is_empty() {
+            return;
+        }
+        #[cfg(feature = "std")]
+        {
+            if let Some(_level) = drop_depth::enter() {
+                vec.clear();
+                return;
+            }
+            self.tear_down_cold();
+        }
+        #[cfg(not(feature = "std"))]
         if vec.iter().any(V::is_nonempty_container) {
             self.tear_down_cold();
         }
     }
 }
 
+#[cfg(feature = "std")]
+pub(crate) mod drop_depth {
+    //! How many container drops are running on this thread's stack, so that
+    //! a drop recurses through the ordinary drop glue while the value is
+    //! shallow and takes the rest of a deep one apart on a worklist (#5782).
+    //!
+    //! A container drop that is still within [`LIMIT`] levels drops its
+    //! children itself, inside a level of this count, and pays nothing per
+    //! child; only a drop past it reaches [`tear_down`](super::tear_down).
+    //! Scanning every unique container's children for a container instead
+    //! (and tearing down on a worklist whenever one turned up) cost +2% to
+    //! +11% wall-clock on a 7950X; this costs two thread-local accesses per
+    //! unique container. `no_std` has no `thread_local!`, so there every
+    //! unique container still scans.
+    //!
+    //! The limit keeps a drop's native stack small: about 64 bytes per array
+    //! level and 160 per object level in a release build, so at most about
+    //! 43 KB.
+
+    use std::cell::Cell;
+
+    /// Container drops one thread may nest before the rest is iterative.
+    pub(crate) const LIMIT: u32 = 256;
+
+    std::thread_local! {
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// One level of the count, given back when it drops.
+    pub(crate) struct Level(u32);
+
+    impl Drop for Level {
+        #[inline]
+        fn drop(&mut self) {
+            DEPTH.with(|depth| depth.set(self.0));
+        }
+    }
+
+    /// One more level, or `None` once [`LIMIT`] are already running.
+    #[inline]
+    pub(crate) fn enter() -> Option<Level> {
+        DEPTH.with(|depth| {
+            let current = depth.get();
+            (current < LIMIT).then(|| {
+                depth.set(current + 1);
+                Level(current)
+            })
+        })
+    }
+
+    /// The levels running now.
+    #[cfg(test)]
+    pub(crate) fn current() -> u32 {
+        DEPTH.with(Cell::get)
+    }
+}
+
 impl<V: Teardown> ArrayOf<V> {
-    /// The teardown of a unique array that has a container element, out of
-    /// line so the drop of a flat array is just the check above.
+    /// The teardown of a unique array past the depth limit (or, without
+    /// `std`, one that has a container element), out of line so a shallow
+    /// drop does not carry it.
     #[cold]
     #[inline(never)]
     fn tear_down_cold(&mut self) {
@@ -2499,9 +2570,9 @@ impl<V: Teardown> ArrayOf<V> {
 }
 
 /// Take apart every container on `work`, and every unique container found
-/// below them, on the worklist itself. Out of line: only a value that holds a
-/// unique container reaches it, so the drop of a flat or shallow container
-/// stays as small as the scan.
+/// below them, on the worklist itself. Out of line: only a drop past the
+/// depth limit reaches it (without `std`, a value that holds a unique
+/// container), so a shallow drop stays small.
 #[cold]
 #[inline(never)]
 pub(crate) fn tear_down<V: Teardown>(mut work: Vec<V>) {
@@ -11431,6 +11502,29 @@ mod tests {
         }
         drop(array);
         drop(object);
+    }
+
+    /// The drop-depth count is given back however a drop ends: within the
+    /// limit, past it on the worklist, or started with every level already
+    /// taken, when the whole value goes onto the worklist from its root.
+    #[test]
+    #[cfg(feature = "std")]
+    fn the_drop_depth_count_is_restored_after_every_drop_5782() {
+        assert_eq!(drop_depth::current(), 0);
+        drop(linear_array_nest(drop_depth::LIMIT as usize - 1));
+        drop(linear_array_nest(DEEP_5782));
+        drop(nest_object_5782(DEEP_5782));
+        assert_eq!(drop_depth::current(), 0);
+
+        let mut held: Vec<_> = core::iter::from_fn(drop_depth::enter).collect();
+        assert_eq!(held.len(), drop_depth::LIMIT as usize);
+        drop(linear_array_nest(DEEP_5782));
+        drop(nest_object_5782(DEEP_5782));
+        assert_eq!(drop_depth::current(), drop_depth::LIMIT);
+        while let Some(level) = held.pop() {
+            drop(level);
+        }
+        assert_eq!(drop_depth::current(), 0);
     }
 
     /// An array of many deep chains is torn down without a per-level frame

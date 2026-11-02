@@ -7275,7 +7275,7 @@ A fold whose step has no owned door (`reduce range(N) as $i (0; [.])`, `{a: .}`)
 
 **Dropping.** A fold whose step has an owned door (`.[0] = .`) shares the accumulator instead of copying it, so the value it builds can be millions of levels deep (`reduce range(10000000) as $i ([]; .[0] = .) | length`).
 jq 1.7.1 segfaults on that program from about 300,000 levels and jq 1.6 does too; succinctly prints `1` ([#5782](https://github.com/rust-works/succinctly/issues/5782)).
-The divergence is deliberate (ADR-0018: a reference that takes the process down is not matched): dropping such a value is iterative, on a heap worklist, so it needs no native stack per level.
+The divergence is deliberate (ADR-0018: a reference that takes the process down is not matched): past 256 nested container drops, dropping such a value is iterative, on a heap worklist, so the native stack it needs is bounded.
 
 ### Before #5497
 
