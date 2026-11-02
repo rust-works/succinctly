@@ -86341,6 +86341,56 @@ fn walk_impl<S: EvalSemantics>(
     walk_impl_at_depth::<S>(f, value, optional, 0)
 }
 
+/// The control `walk` surfaces for an object member (#5794): in jq mode one that follows the member's
+/// first output is not reached. Out of line so the recursive `walk_impl_at_depth` frame stays small (#1021).
+#[inline(never)]
+fn after_first_output<S: EvalSemantics>(
+    control: Option<Control>,
+    no_output: bool,
+) -> Option<Control> {
+    if S::TAG == EvalTag::Jq && !no_output {
+        None
+    } else {
+        control
+    }
+}
+
+/// `walk`'s object arm: each member takes the first output of its own walk (#5794). Out of line so
+/// the recursive `walk_impl_at_depth` frame stays small (#1021); `Err` carries the early return.
+#[inline(never)]
+fn walk_object_members<S: EvalSemantics>(
+    f: &Expr,
+    obj: ObjectMap,
+    optional: bool,
+    depth: usize,
+) -> Result<OwnedValue, (Vec<OwnedValue>, Option<Control>)> {
+    // `map_values(w)` rewrites each key's live entry and leaves a repeated key's earlier entries
+    // as read (yq, ADR-0027), so an object that has any starts from itself.
+    let shadowed = obj.has_shadows();
+    let mut new_obj = if shadowed {
+        obj.clone()
+    } else {
+        IndexMap::with_capacity(obj.len()).into()
+    };
+    for (k, v) in obj {
+        let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
+        // jq mode reads one output per member, so a control after it is never reached.
+        if let Some(control) = after_first_output::<S>(control, vs.is_empty()) {
+            return Err((Vec::new(), Some(control)));
+        }
+        match vs.into_iter().next() {
+            Some(new_v) => {
+                new_obj.insert(k, new_v);
+            }
+            None if shadowed => {
+                new_obj.shift_remove(k.as_str());
+            }
+            None => {}
+        }
+    }
+    Ok(OwnedValue::Object(new_obj))
+}
+
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH)
 /// levels of nesting (#1021, following #1005's precedent).
 fn walk_impl_at_depth<S: EvalSemantics>(
@@ -86362,43 +86412,11 @@ fn walk_impl_at_depth<S: EvalSemantics>(
             }
             OwnedValue::array_from(new_arr)
         }
-        // `map_values(w)` rewrites each key's live entry and leaves a repeated key's earlier entries
-        // as read (yq, ADR-0027), so an object that has any starts from itself.
-        OwnedValue::Object(obj) if obj.has_shadows() => {
-            let mut new_obj = obj.clone();
-            for (k, v) in obj {
-                let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
-                // #5794: `map_values` reads one output per member in jq mode, so a control after it is never reached.
-                let control = control.filter(|_| !(S::TAG == EvalTag::Jq && !vs.is_empty()));
-                if let Some(control) = control {
-                    return (Vec::new(), Some(control));
-                }
-                match vs.into_iter().next() {
-                    Some(new_v) => {
-                        new_obj.insert(k, new_v);
-                    }
-                    None => {
-                        new_obj.shift_remove(k.as_str());
-                    }
-                }
-            }
-            OwnedValue::Object(new_obj)
-        }
-        OwnedValue::Object(obj) => {
-            let mut new_obj = IndexMap::with_capacity(obj.len());
-            for (k, v) in obj {
-                let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
-                // #5794: as above -- the first output stands, a control after it is not reached.
-                let control = control.filter(|_| !(S::TAG == EvalTag::Jq && !vs.is_empty()));
-                if let Some(control) = control {
-                    return (Vec::new(), Some(control));
-                }
-                if let Some(new_v) = vs.into_iter().next() {
-                    new_obj.insert(k, new_v);
-                }
-            }
-            OwnedValue::Object(new_obj.into())
-        }
+        // Out of line: the object arms' locals would otherwise widen this recursive frame (#1021).
+        OwnedValue::Object(obj) => match walk_object_members::<S>(f, obj, optional, depth) {
+            Ok(rebuilt) => rebuilt,
+            Err(done) => return done,
+        },
         other => other,
     };
 
