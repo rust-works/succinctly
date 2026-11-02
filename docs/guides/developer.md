@@ -476,8 +476,13 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features std,simd,serde,cli,reg
 
 The second run documents the SIMD backend of the machine it runs on: CI's `Documentation` job is x86_64 Linux, so
 it covers `x86.rs` and the AVX-512 popcount path, and the `rustdoc-simd-backends` gate on an Apple Silicon machine
-covers `neon.rs` instead. To check the x86_64 backend from there, add `--target x86_64-apple-darwin`. Nothing
-documents `broadword.rs` (it needs `broadword-yaml`).
+covers `neon.rs` instead. To check the x86_64 backend from there, add `--target x86_64-apple-darwin`.
+`neon.rs` and `broadword.rs` are documented on ARM64 (#5908): the `clippy-all-variants` leg of CI's ARM64 matrix runs
+the second command above and a third with `broadword-yaml`, which the `rustdoc-arm-broadword` gate mirrors on an ARM64 machine:
+
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features std,simd,broadword-yaml,serde,cli,regex,bench-runner,large-tests,mmap-tests
+```
 
 ### Documentation
 

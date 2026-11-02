@@ -183,6 +183,18 @@ GATES = (
         arch=("aarch64", "arm64"),
     ),
     Gate(
+        "rustdoc-arm-broadword",
+        "full",
+        (
+            'source scripts/lib/clippy-variants.sh && cargo doc --no-deps --features "$CLIPPY_ARM_BROADWORD_FEATURES"',
+        ),
+        (r'^cargo doc --no-deps --features "\$CLIPPY_ARM_BROADWORD_FEATURES"$',),
+        paths=RUST_PATHS,
+        cost=4,
+        env={"RUSTDOCFLAGS": "-D warnings"},
+        arch=("aarch64", "arm64"),
+    ),
+    Gate(
         "rustdoc",
         "full",
         ("cargo doc --no-deps --all-features",),
