@@ -958,6 +958,10 @@ fn cursor_number_to_owned<W: Clone + AsRef<[u64]>>(
 // From implementations
 // ============================================================================
 
+/// A `JqValue` is not torn down iteratively: its own arrays are plain `Vec`s, and
+/// only the owned tree (#5782) can be built millions of levels deep.
+impl<W> crate::jq::Teardown for JqValue<'_, W> {}
+
 impl<W> From<bool> for JqValue<'_, W> {
     fn from(b: bool) -> Self {
         JqValue::Bool(b)

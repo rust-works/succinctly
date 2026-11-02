@@ -70,6 +70,7 @@ STACK_TESTS=(
 
 # 10 s or more each, in the order of the #5494 measurement (seconds, M5 Max, in parallel).
 HEAVY_TESTS=(
+  per_issue::i5782::a_ten_million_level_array_is_dropped_without_overflowing_the_stack_5782 # 28
   test_fused_slice_read_equals_the_unfused_spelling_4195 # 72
   test_recurse_cap_raises_instead_of_ending_silently_3716 # 68
   test_fused_literal_slice_read_equals_the_unfused_spelling_4323 # 61

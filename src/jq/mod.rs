@@ -182,7 +182,7 @@ pub use value::{
     jq_float_is_scientific, nesting_depth_exceeded_message, ArrayIntoIter, ArrayOf, ArrayVec,
     FlaggedOccurrences, NumberRepr, ObjectMap, ObjectMapEntry, ObjectMapIntoIter, ObjectMapOf,
     OccupiedMapEntry, Occurrences, OwnedValue, ReindexedDoc, SharableLiteral, SharableString,
-    VacantMapEntry, JQ_MAX_PRINT_DEPTH, MAX_VALUE_TREE_DEPTH, SKIPPED_TOO_DEEP,
+    Teardown, VacantMapEntry, JQ_MAX_PRINT_DEPTH, MAX_VALUE_TREE_DEPTH, SKIPPED_TOO_DEEP,
     STACK_FLOOR_NESTING_MESSAGE,
 };
 // `pub(crate)`, not `pub`: only `yaml::light`'s alias-chain resolvers (#1191

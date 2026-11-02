@@ -57226,7 +57226,7 @@ fn slice_is_same_array(value: &OwnedValue) -> bool {
 /// amendment gives for the embed table's entry: `marker.value` is a strong
 /// reference held for the marker's whole lifetime, so a write through any
 /// other handle copies first (`Rc::make_mut`; the by-value unwrap is
-/// `Rc::try_unwrap`, and `src/jq` has no `unsafe`), and a target that still
+/// `Rc::try_unwrap`, and the one `unsafe` in the containers reads each field once), and a target that still
 /// shares the storage is that node, unmodified. It reads no origin on
 /// purpose: an [`Origin::Untracked`] marker -- a navigated bind, or a
 /// `Snapshot` demoted against a rebuilt root -- refuses by node identity
