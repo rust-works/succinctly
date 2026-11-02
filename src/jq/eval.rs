@@ -95265,7 +95265,7 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // returns 0: an empty result, or one that does not fit with its terminator (#5754).
             if result.is_empty() || result.len() >= fmt.len() + 100 {
                 return if optional {
-                    QueryResult::None // patchcov: coverage tolerate-line reason="`optional` is never true through either caller of this function, as for the arms above (#3068); `strftime(\"\")?` is caught by the enclosing try"
+                    QueryResult::None // patchcov: coverage tolerate-line reason="`optional` is never true through either caller of this function, same as the arms above (#3068); a trailing ? is caught by the enclosing try"
                 } else {
                     QueryResult::Error(EvalError::strftime_system_failure(name))
                 };
