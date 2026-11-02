@@ -28,10 +28,21 @@ use super::local_zone::{self, GoLocal};
 mod context {
     use alloc::string::String;
     use core::cell::RefCell;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     std::thread_local! {
         /// `None` is RFC 3339.
         static LAYOUT: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// Whether any thread has ever entered a custom layout. It only goes from `false` to `true`,
+    /// and does so before the layout is visible to its own thread, so `false` means this thread's
+    /// layout is RFC 3339 and a string `+` can skip the thread-local read (`users_yq_raw_concat`,
+    /// every row of which asks).
+    static EVER_CUSTOM: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn ever_custom() -> bool {
+        EVER_CUSTOM.load(Ordering::Relaxed)
     }
 
     pub(super) fn custom() -> Option<String> {
@@ -42,6 +53,9 @@ mod context {
     pub(super) struct Scope(Option<String>);
 
     pub(super) fn enter(layout: Option<String>) -> Scope {
+        if layout.is_some() {
+            EVER_CUSTOM.store(true, Ordering::Relaxed);
+        }
         Scope(LAYOUT.with(|current| current.replace(layout)))
     }
 
@@ -61,6 +75,10 @@ mod context {
 
     pub(super) fn custom() -> Option<String> {
         None
+    }
+
+    pub(super) fn ever_custom() -> bool {
+        false
     }
 }
 
@@ -128,10 +146,14 @@ pub(crate) fn add_duration(
     right: &str,
     subtract: bool,
 ) -> Option<Result<String, String>> {
+    // The common case, a string `+` text that cannot begin a duration, is a concatenation unless
+    // a custom layout reads `left`; with none ever set it needs neither a layout lookup nor a
+    // `time.Parse` of every left side.
+    if !subtract && !context::ever_custom() && !starts_like_a_duration(right) {
+        return None;
+    }
     let layout = match custom_datetime(left) {
         Some(custom) => Cow::Owned(custom),
-        // Asked before `left` is parsed: a string `+` text that cannot begin a duration is the
-        // common case, a concatenation, and must not pay for a `time.Parse` of every left side.
         None if !subtract && !starts_like_a_duration(right) => return None,
         None if go_time::yq_datetime(left).is_some() => layout(),
         None => return None,
