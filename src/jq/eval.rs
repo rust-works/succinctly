@@ -10486,6 +10486,11 @@ fn eval_each_owned_fast_path<S: EvalSemantics>(
 /// condition, #3697) switch on: both read the count as a truth value, so its
 /// answer changes nothing about what a closed expression or the resolver
 /// accepts. A change to what this returns changes those conditions too.
+///
+/// #5774: [`closed_unary_builtin`] calls it too, for the `length` stage of a closed pipe
+/// (`$d | length`, `$r.items | length`). That stage already accepted exactly a container's count
+/// (through the bridge, which this answers as, per the test below), so admission is unchanged;
+/// only the route is. A change to what this returns changes every closed fold-step pipe too.
 pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
     match unwrap_paren(expr) {
         // `. | length` is `length`: an identity stage yields its input once.
@@ -13402,7 +13407,8 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
         // #5774: `$d[0].users[$i]`, a key that is itself closed (the loop variable): the target and
         // the key are each one value, and the step is the navigation `.[k]` / `.k` the pipe stages
         // above answer. A key that is not an integer or a string, or a step that raises, declines
-        // and keeps the evaluator's own route and text. jq mode only, like the operators below.
+        // and keeps the evaluator's own route and text -- an integral float key (`$d[$i / 2 | floor]`)
+        // too. jq mode only, like the operators below.
         Expr::IndexExpr { target, key } if S::TAG == EvalTag::Jq => {
             let held = closed_expr_to_owned_at_depth::<S>(target, depth + 1, escaped)?;
             let key = closed_expr_to_owned_at_depth::<S>(key, depth + 1, escaped)?;
@@ -77519,7 +77525,11 @@ where
 ///
 /// A container (`--argjson`, `--slurpfile`, `$ARGS`, a data `import`) is spliced as one shared
 /// marker instead of a literal tree rebuilt at every `$name`, when the program only reads it
-/// (`reads_named_arguments_only`).
+/// (`reads_named_arguments_only`). A program with a fold but no assignment, path expression or
+/// definition shares only the `$name` that heads a navigation chain (#5774,
+/// `substitute_vars_navigation_shared`); a program that also holds one `$name` that is not read
+/// through (`$d | map(.a)`, `$d | sort`) keeps the literal for that occurrence only, and a fold
+/// that reaches it still rebuilds the whole value at every step.
 ///
 /// The literal is a tree as large as the value, built once per read of the name and then built
 /// again into a value when the program runs: for 10 MB of `--slurpfile` that was 177 ms of the
@@ -77590,7 +77600,13 @@ fn substitute_vars_navigation_shared(expr: &Expr, vars: &[(&str, &OwnedValue)]) 
             let renamed = rename_navigation_heads(current, name, &head);
             let marker = LazyMarker::new(value, Origin::Untracked, None);
             let shared = substitute_var_with(&renamed, &head, value, Some(&marker), false);
-            substitute_var(&shared, name, value)
+            // A renamed head the substitution did not reach would surface as an undefined
+            // variable; the literal is always right.
+            if any_subexpr(&shared, &mut |e| matches!(e, Expr::Var(v) if *v == head)) {
+                substitute_var(current, name, value)
+            } else {
+                substitute_var(&shared, name, value)
+            }
         } else {
             substitute_var(current, name, value)
         });
@@ -77663,7 +77679,8 @@ fn rename_navigation_heads(expr: &Expr, name: &str, head: &str) -> Expr {
 
 /// Whether `expr` only reads a named argument's value (#5690).
 ///
-/// That is: no assignment, path expression, fold or definition anywhere in it. A shared marker is
+/// That is: no assignment, path expression, fold or definition anywhere in it. (A fold alone is
+/// [`reads_named_arguments_besides_folds`]'s, #5774.) A shared marker is
 /// refused in path position (`$d | (.[] | numbers) |= . + 1` is an error with one, `[2,3]` in jq),
 /// makes a fold that appends or assigns the value quadratic (`closed_expr_to_owned` declines a
 /// marker), and slows a small container assigned per record, so each of those keeps the literal.
@@ -77683,6 +77700,8 @@ fn reads_named_arguments_besides_folds(expr: &Expr) -> bool {
     !holds_unshareable_construct(expr, true)
 }
 
+/// Whether `expr` holds a construct that keeps the literal for a named argument: an assignment, a
+/// path expression, a definition or call, or (unless `allow_folds`) a `reduce`/`foreach`.
 fn holds_unshareable_construct(expr: &Expr, allow_folds: bool) -> bool {
     any_subexpr(expr, &mut |e| {
         is_assignment_expr(e)

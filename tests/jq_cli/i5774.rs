@@ -64,6 +64,37 @@ const ROWS: &[(&str, &str)] = &[
         "reduce range(3) as $i (0; . + ([$d[$i].t[]?] | length))",
         "3\n",
     ),
+    (
+        "reduce range(3) as $i ($d[0].t; . + [$i]) | [., $d[0].t]",
+        "[[1,2,0,1,2],[1,2]]\n",
+    ),
+    (
+        "[foreach range(2) as $i ($d[0]; .t += [$i]; .t)] | [., $d[0].t]",
+        "[[[1,2,0],[1,2,0,1]],[1,2]]\n",
+    ),
+    (
+        "reduce range(2) as $i ($d; .[$i].age += 1) | [.[0].age, $d[0].age]",
+        "[31,30]\n",
+    ),
+    (
+        "reduce range(3) as $i (0; . + ($d[$i / 2 | floor].age))",
+        "101\n",
+    ),
+    ("reduce range(3) as $i (0; . + ($d[$i * 1.0].age))", "96\n"),
+    ("reduce range(3) as $i ([]; . + [$d[1.5].id])", "[2,2,2]\n"),
+    ("reduce range(3) as $i ([]; . + [$d[-1].id])", "[3,3,3]\n"),
+    (
+        "reduce range(3) as $i ([]; . + [$d[$i - 5]])",
+        "[null,null,{\"id\":1,\"age\":30,\"t\":[1,2]}]\n",
+    ),
+    (
+        "reduce range(5) as $i ([]; . + [$d[$i].id])",
+        "[1,2,3,null,null]\n",
+    ),
+    (
+        "reduce range(3) as $i (0; . + $d[$i].age + ($d | map(.age) | add))",
+        "384\n",
+    ),
 ];
 
 #[test]
