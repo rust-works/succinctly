@@ -15565,12 +15565,13 @@ fn test_err_unexpected_char_invalid_byte_does_not_embed_nul_1187() -> Result<()>
 #[test]
 fn test_err_unexpected_char_remaining_call_sites_1187() -> Result<()> {
     // `parse_compact_mapping_entry`: an alias-as-key inside a sequence item
-    // (`- *a : v`) doesn't skip the space before the colon the way a
-    // quoted/unquoted key does, so `looks_like_mapping_entry`'s more
-    // tolerant lookahead (which greenlit this as an entry) and the actual
-    // colon check disagree.
+    // followed by a comma (`- *a,b: v`) -- the alias-name scanner stops at
+    // the flow indicator, while `looks_like_mapping_entry`'s more tolerant
+    // lookahead greenlit this as an entry. (This used to be `- *a : v`, a
+    // space before the colon, which yq reads as a mapping and writes for an
+    // alias key; #5469 made it parse.) yq rejects this one too.
     let (_, stderr, code) =
-        run_yq_stdin_with_stderr(".", "- &a 1\n- *a : 2\n", &["-o", "json", "-I0"])?;
+        run_yq_stdin_with_stderr(".", "- &a 1\n- *a,b: 2\n", &["-o", "json", "-I0"])?;
     assert_ne!(code, 0);
     assert!(
         stderr.contains("expected ':' after key in compact mapping"),

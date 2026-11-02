@@ -4825,6 +4825,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Close key node
         self.write_bp_close();
 
+        // Skip optional whitespace between key and colon, as the block mapping's site does: a
+        // quoted or alias key ends at its closing quote or name, so `- "k" : 1` and `- *a : 1`
+        // (which yq writes for an alias key, #5469) reach here with the space still ahead. A
+        // plain key already took its trailing space.
+        self.skip_inline_whitespace();
+
         // Expect colon
         if self.peek() != Some(b':') {
             return Err(

@@ -129,3 +129,55 @@ fn test_an_alias_key_that_would_not_read_back_prints_its_text_5469() -> Result<(
     );
     Ok(())
 }
+
+/// A space between a sequence item's alias or quoted key and its `:` (`- *a : 1`, `- "k" : 1`),
+/// which yq writes for an alias key and reads back, used to be a parse error in a compact
+/// mapping: its key parser left the space ahead of the colon check, which the block mapping's
+/// own parser skips. Captured from yq v4.53.3.
+#[test]
+fn test_a_space_before_a_compact_mapping_colon_parses_5469() -> Result<()> {
+    for (doc, args, want) in [
+        (
+            "b: &a xy\nc:\n- *a : 1\n",
+            &["-o=json", "-I0"][..],
+            "{\"b\":\"xy\",\"c\":[{\"xy\":1}]}\n",
+        ),
+        (
+            "b: &a xy\nc:\n- *a : 1\n",
+            &[][..],
+            "b: &a xy\nc:\n  - *a : 1\n",
+        ),
+        (
+            "c:\n- \"k\" : 1\n- 'j'  : 2\n",
+            &["-o=json", "-I0"][..],
+            "{\"c\":[{\"k\":1},{\"j\":2}]}\n",
+        ),
+        (
+            "c:\n- \"k\" : 1\n- 'j'  : 2\n",
+            &[][..],
+            "c:\n  - \"k\": 1\n  - 'j': 2\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, args)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want, 0),
+            "{doc:?} {args:?}: {stderr:?}"
+        );
+    }
+    // `-P` writes a flow mapping's alias key in a sequence item as `- *a : 1`, which reads back.
+    let (written, stderr, code) =
+        run_yq_stdin_with_stderr(".", "b: &a xy\nc:\n- {*a : 1}\n", &["-P"])?;
+    assert_eq!(
+        (written.as_str(), code),
+        ("b: &a xy\nc:\n  - *a : 1\n", 0),
+        "{stderr:?}"
+    );
+    let (reread, stderr, code) = run_yq_stdin_with_stderr(".", &written, &["-o=json", "-I0"])?;
+    assert_eq!(
+        (reread.as_str(), code),
+        ("{\"b\":\"xy\",\"c\":[{\"xy\":1}]}\n", 0),
+        "{stderr:?}"
+    );
+    Ok(())
+}
