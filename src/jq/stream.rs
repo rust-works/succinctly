@@ -1291,12 +1291,13 @@ fn stream_yaml_key_node<W: core::fmt::Write, C: DocumentCursor>(
     };
     // Whether a property has been written, so the next part needs a space before it. An empty
     // plain key after a property is nothing at all (`- !!str`, `- &k`), as yq writes it.
-    let mut after_property = false;
-    if let Some(anchor) = cursor.anchor() {
+    let mut after_property = if let Some(anchor) = cursor.anchor() {
         out.write_char('&')?;
         out.write_str(anchor)?;
-        after_property = true;
-    }
+        true
+    } else {
+        false
+    };
     // yq drops the non-specific `!` (`! z` is `- z`).
     match cursor.explicit_tag_of_non_alias().filter(|tag| *tag != "!") {
         Some(tag) => {
