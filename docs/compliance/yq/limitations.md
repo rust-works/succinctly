@@ -388,7 +388,10 @@ One that fails them prints that text: `del(.b)` on `b: &a xy` / `c: {*a : 1}` pr
 A navigation that streams the node without its anchor (`.c`, `.[]`) prints `*a` as yq does, as it already does for a value alias, and that output names no anchor.
 `.b = "q"` prints the key as `xy` as well: yq keeps `*a`, which reads back as the key `q`, but succinctly's key is the text it read and a write to the anchor does not reach it.
 An alias to a sequence or mapping used as a key is printed as the key's text too, which is `''` here.
-Two routes still print a key bare: `keys` (`- &k key` in yq) and `pick`, and a `<<` merge
+`keys` writes each key as its node ([#5469](https://github.com/rust-works/succinctly/issues/5469)): `- &k !!str key`, `- !!merge <<`, `- *a`, on the streaming route and on the DOM routes `-P`, `--arg` and `--sort-keys` take.
+A `keys` result that is built into something else (`[keys]`) or written back (`. |= keys`) still prints each key bare, and so does `keys | map(.)` for a `<<` key, which loses its `!!merge`.
+On the streaming route and under `--sort-keys` a tagged key that decodes to a line break (`? !!str a` / `` / `  b`) is double-quoted (`- !!str "a\nb"`) where yq writes a literal block (`- !!str |-`), and under `-P` an anchored empty key is `- &k ""` where yq writes `- &k`; both read back as the same key.
+A `<<` merge
 expands the merged mapping's keys where yq keeps `<<: *m`. The expansion does not re-declare the
 source's anchors ([#2513](https://github.com/rust-works/succinctly/issues/2513)): `default: &d` /
 `  a: &y 1` / `item: {<<: *d, b: 2}` written with `.item.b = 3` prints `a: 1` under `item`, not a

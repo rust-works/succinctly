@@ -1270,6 +1270,71 @@ fn stream_yaml_key_value<W: core::fmt::Write>(
     }
 }
 
+/// [`stream_yaml_key_value`] for a key read straight from its node, which a `keys` result
+/// writes as that node (#5469): an alias key is `*name`, and any other key takes its own
+/// `&anchor` and explicit tag first (`&k !!str key`), with yq's `!!merge` on a plain `<<`. A
+/// tagged plain key keeps its plain text (`!!str 1`), which the tag already types. A JSON
+/// cursor has none of these (its `"<<"` is an ordinary string), so it reaches the plain writer.
+fn stream_yaml_key_node<W: core::fmt::Write, C: DocumentCursor>(
+    out: &mut W,
+    key: &OwnedValue,
+    cursor: &C,
+) -> core::fmt::Result {
+    if let Some(name) = cursor.alias() {
+        out.write_char('*')?;
+        return out.write_str(name);
+    }
+    let style = cursor.style();
+    let plain_string = match key {
+        OwnedValue::String(s) if style.is_empty() => Some(s.as_str()),
+        _ => None,
+    };
+    // Whether a property has been written, so the next part needs a space before it. An empty
+    // plain key after a property is nothing at all (`- !!str`, `- &k`), as yq writes it.
+    let mut after_property = if let Some(anchor) = cursor.anchor() {
+        out.write_char('&')?;
+        out.write_str(anchor)?;
+        true
+    } else {
+        false
+    };
+    // yq drops the non-specific `!` (`! z` is `- z`).
+    match cursor.explicit_tag_of_non_alias().filter(|tag| *tag != "!") {
+        Some(tag) => {
+            if after_property {
+                out.write_char(' ')?;
+            }
+            out.write_str(tag)?;
+            after_property = true;
+            // A plain key reads the same plain behind its tag. One that decodes to a line break
+            // (`? !!str a` / `` / `  b`) would not, so it takes the quoting below.
+            if let Some(s) = plain_string.filter(|s| !s.is_empty() && !has_line_break(s)) {
+                out.write_char(' ')?;
+                return out.write_str(s);
+            }
+        }
+        None if !cursor.canonicalize_numbers() && plain_string == Some("<<") => {
+            if after_property {
+                out.write_char(' ')?;
+            }
+            return out.write_str("!!merge <<");
+        }
+        None => {}
+    }
+    if after_property {
+        if plain_string == Some("") {
+            return Ok(());
+        }
+        out.write_char(' ')?;
+    }
+    stream_yaml_key_value(out, key, style)
+}
+
+/// Whether `s` holds a character a YAML plain scalar cannot carry as itself.
+fn has_line_break(s: &str) -> bool {
+    s.contains(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}'])
+}
+
 /// Stream a `DocumentFields`' keys (`keys_unsorted`) as YAML without an
 /// intermediate `Vec<String>`/`OwnedValue::Array` (#685).
 ///
@@ -1317,7 +1382,7 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
             if i > 0 {
                 out.write_str(", ")?;
             }
-            stream_yaml_key_value(out, &key, cursor.style())?;
+            stream_yaml_key_node(out, &key, &cursor)?;
         }
         // #1956: `ended_unpaired()` alone missed a malformed `,`/`:` delimiter
         // -- `is_malformed()` checks both #1194 faults this walk can find.
@@ -1343,7 +1408,7 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
                 out.write_char('\n')?;
             }
             out.write_str("- ")?;
-            stream_yaml_key_value(out, &key, cursor.style())?;
+            stream_yaml_key_node(out, &key, &cursor)?;
         }
         // #1956: `ended_unpaired()` alone missed a malformed `,`/`:` delimiter
         // -- `is_malformed()` checks both #1194 faults this walk can find.
@@ -1358,6 +1423,35 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
 mod tests {
     use super::*;
     use indexmap::IndexMap;
+
+    #[test]
+    fn stream_lazy_keys_yaml_writes_each_key_as_its_node_5469() {
+        use crate::jq::document::DocumentValue;
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"b: &a xy\n&k !!str key: 1\n!foo bar: 2\n!!str 1: 4\n*a : 5\nplain: 6\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let value = index.root(yaml).first_child().unwrap().value();
+        let fields = value.as_object().unwrap();
+        // Captured from yq v4.53.3: `keys | . style="flow"`, and `keys`. A `<<` key is pinned
+        // through the CLI (`tests/yq_cli/i5469d.rs`): this crate-level read expands a merge.
+        for (indent, expected) in [
+            (
+                IndentSpec::COMPACT,
+                "[b, &k !!str key, !foo bar, !!str 1, *a, plain]",
+            ),
+            (
+                IndentSpec::spaces(2),
+                "- b\n- &k !!str key\n- !foo bar\n- !!str 1\n- *a\n- plain",
+            ),
+        ] {
+            let mut out = String::new();
+            let mut error = None;
+            stream_lazy_keys_yaml(&fields, false, &mut out, indent, &mut error).unwrap();
+            assert!(error.is_none(), "{error:?}");
+            assert_eq!(out, expected);
+        }
+    }
 
     #[test]
     fn stream_lazy_keys_yaml_preserves_quotes_in_flow_and_block_3615() {

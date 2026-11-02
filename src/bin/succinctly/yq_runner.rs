@@ -7502,9 +7502,16 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
                 if sorted {
                     keys.sort();
                 }
-                Ok(vec![no_comments(OwnedValue::Array(
-                    keys.into_iter().map(OwnedValue::string).collect(),
-                ))])
+                let value = OwnedValue::Array(keys.into_iter().map(OwnedValue::string).collect());
+                // #5469: each key is its node, so it keeps that node's anchor, tag, quoting or
+                // alias, as the streaming route writes it. A sorted result is in another order.
+                let tree = (need_comments && !sorted)
+                    .then(|| reshape_presentation::key_nodes(&fields, collapse))
+                    .flatten();
+                Ok(vec![match tree {
+                    Some(tree) => (value, tree),
+                    None => no_comments(value),
+                }])
             }
             // Same reasoning as `LazyKeys` above, for array `keys`/
             // `keys_unsorted` (#684).
