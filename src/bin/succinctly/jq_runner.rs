@@ -6458,7 +6458,13 @@ fn get_inputs(
     // a file continues in the next one.
     // `--validate` is strict per file (an empty file is rejected too), so it reads the files as
     // written.
-    let mut seams = if json_input_mode && !args.validate && !args.stream_errors {
+    // #5498: plain `--stream`, under `-n`, reads the way `--stream-errors` does (jq's streaming
+    // parser, which carries a token over a file boundary itself) and raises each fault as the
+    // error jq raises; the rest of `--stream` keeps its own route for now.
+    let stream_by_reader =
+        args.stream && !args.stream_errors && args.null_input && track_eof && !args.slurp;
+    let mut seams = if json_input_mode && !args.validate && !args.stream_errors && !stream_by_reader
+    {
         stitch_json_file_seams(
             raw_bytes.iter_mut().map(|(_, raw)| raw),
             track_eof,
@@ -6622,7 +6628,7 @@ fn get_inputs(
     // #5474: `--stream-errors` reads the bytes with jq's own streaming parser, which turns a fault
     // into an input of its own, so neither the document parse nor the `--stream` expansion below
     // can produce what the program reads.
-    if args.stream_errors && json_input_mode {
+    if (args.stream_errors || stream_by_reader) && json_input_mode {
         if args.validate {
             for (file_idx, raw) in &raw_bytes {
                 let filename = file_idx.map(|idx| files[idx].to_string_lossy().to_string());
@@ -6644,6 +6650,7 @@ fn get_inputs(
                     last_source: u32::try_from(locations.files().len().saturating_sub(1))
                         .unwrap_or(u32::MAX),
                     reader: crate::jq_stream_errors::Reader::new(raw_bytes),
+                    raise_errors: stream_by_reader,
                 });
             });
             return Ok(Ok((Vec::new(), locations, None, Vec::new())));
@@ -9256,6 +9263,9 @@ struct LazyStreamInputs {
     files: Vec<Option<usize>>,
     /// The tag of the last source, which the end of the stream names.
     last_source: u32,
+    /// Whether a parse error is raised by the read that reaches it, as under `--stream`, and not
+    /// handed over as an input of its own, as under `--stream-errors`.
+    raise_errors: bool,
 }
 
 /// The producer the `input` queue pulls a [`LazyStreamInputs`] stream's inputs from: each read
@@ -9266,9 +9276,11 @@ fn stream_errors_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
         mut reader,
         files,
         last_source,
+        raise_errors,
     } = lazy;
-    Box::new(move || match reader.next() {
-        Some((value, (source, line))) => {
+    Box::new(move || match reader.next_yielded() {
+        Some(input) => {
+            let (source, line) = input.location;
             // The same tags the whole read gave: a value yielded after jq closed its input has
             // no line, and the first source is tag 0 when it is stdin.
             let (tag, line) = if line == crate::jq_stream_errors::CLOSED {
@@ -9279,7 +9291,11 @@ fn stream_errors_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
                     u32::try_from(line).unwrap_or(u32::MAX),
                 )
             };
-            jq::ProducedInput::Document(value, tag, line)
+            if raise_errors && input.error {
+                jq::ProducedInput::Error(EvalError::new(input.message()), (tag, line))
+            } else {
+                jq::ProducedInput::Document(input.value, tag, line)
+            }
         }
         None => jq::ProducedInput::End(
             reader

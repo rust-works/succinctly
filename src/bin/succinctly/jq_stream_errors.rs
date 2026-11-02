@@ -183,6 +183,28 @@ impl RefillCursor {
     }
 }
 
+/// One input jq's parser yielded.
+pub(crate) struct Yielded {
+    pub(crate) value: OwnedValue,
+    /// The source index and the lines jq had read of it ([`CLOSED`] after jq closed its input).
+    pub(crate) location: (usize, usize),
+    /// Whether the input is a parse error: `[message, path]` under `--stream-errors`, and the
+    /// error jq raises, whose text is the message, without it.
+    pub(crate) error: bool,
+}
+
+impl Yielded {
+    /// The text of a parse error input: the first element of its `[message, path]`.
+    pub(crate) fn message(&self) -> String {
+        self.value
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(OwnedValue::as_str)
+            .map(str::to_owned)
+            .unwrap_or_default()
+    }
+}
+
 /// How jq's reader ended, known once [`Reader::next`] has returned `None`.
 pub(crate) struct ReadEnd {
     /// How many of the values jq's `--slurp` loop puts in its array: see
@@ -231,6 +253,11 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> Reader<S> {
     /// it ([`CLOSED`] for the lines of one yielded after jq closed its input), or `None` once
     /// jq's reader has nothing left.
     pub(crate) fn next(&mut self) -> Option<(OwnedValue, (usize, usize))> {
+        self.next_yielded().map(|y| (y.value, y.location))
+    }
+
+    /// [`next`](Self::next), with whether the input is a parse error.
+    pub(crate) fn next_yielded(&mut self) -> Option<Yielded> {
         loop {
             if let Some(item) = self.parser.pending.pop_front() {
                 return Some(item);
@@ -366,7 +393,7 @@ struct Parser {
     closed: bool,
     /// What has been yielded and not yet handed to the caller, with the `(source, lines read)`
     /// jq stood at.
-    pending: std::collections::VecDeque<(OwnedValue, (usize, usize))>,
+    pending: std::collections::VecDeque<Yielded>,
     /// How many values the parser has yielded in all, handed out or not.
     yielded: usize,
     first_error: Option<usize>,
@@ -404,15 +431,23 @@ impl Parser {
     }
 
     fn yield_value(&mut self, value: OwnedValue) {
+        self.push(value, false);
+    }
+
+    fn push(&mut self, value: OwnedValue, error: bool) {
         let line = if self.closed { CLOSED } else { self.lines_read };
-        self.pending.push_back((value, (self.source, line)));
+        self.pending.push_back(Yielded {
+            value,
+            location: (self.source, line),
+            error,
+        });
         self.yielded += 1;
     }
 
     /// [`Parser::yield_value`] for a parse error, remembering where the first one fell.
     fn yield_error(&mut self, error: OwnedValue) {
         self.first_error.get_or_insert(self.yielded);
-        self.yield_value(error);
+        self.push(error, true);
     }
 
     fn path_value(&self) -> OwnedValue {
