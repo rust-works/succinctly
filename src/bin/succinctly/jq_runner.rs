@@ -6980,12 +6980,14 @@ fn get_inputs(
                 // #4311: a program using `input`/`inputs` sees jq resume after
                 // a parse error, at the read after the one that met the fault.
                 if track_eof && !args.slurp {
-                    // #5661: `-n` over one clean plain-JSON source converts each document when
-                    // the program reads it, so `first(inputs)` neither parses nor holds the rest.
+                    // #5661: one clean plain-JSON source converts each document when the
+                    // program reads it, so `first(inputs)` neither parses nor holds the rest.
                     // Anything unusual (an error, a BOM, a deep document) takes the route below.
                     // Each document's line is counted when it is read, and the end of the
-                    // stream comes from its spans (#5661, `EofTail::of_clean_source`).
-                    if args.null_input && !args.stream && pos == 0 && last == 0 {
+                    // stream comes from its spans (#5661, `EofTail::of_clean_source`). Without
+                    // `-n` the driver loop pops its inputs from the same queue the program's
+                    // `input` does, so it takes the route too (#5855).
+                    if !args.stream && pos == 0 && last == 0 {
                         if let Some(spans) = lazy_json_spans(&raw) {
                             // Set already only for a stream that is not UTF-8, the one case
                             // whose seam the substitution moves.
@@ -14201,7 +14203,8 @@ mod tests {
     }
 
     /// #5661: `-n` over one clean plain-JSON file leaves its documents unconverted for the queue,
-    /// and every other shape still reads them up front. The pin must be able to fail: it does,
+    /// as does a program without `-n` that reads inputs (#5855), and every other shape still
+    /// reads them up front. The pin must be able to fail: it does,
     /// with `lazy_json_spans` made to answer `None`.
     #[test]
     fn get_inputs_defers_a_clean_stream_under_null_input_5661() {
@@ -14258,10 +14261,22 @@ mod tests {
         assert!(inputs.is_empty(), "the substituted text is still clean");
         let scanned = EofTail::of(&[b"\"\xe9\"\n1".as_slice()], false, &[], false);
         assert_eq!(tail, Some(scanned));
-        // Not under `-n`, with `-s`, or with a stream that turns malformed.
+        // Without `-n` the driver loop pops from the same queue, so a clean stream is deferred
+        // there too (#5855).
+        let (inputs, _, _, _, lazy) = read(&["jq", "inputs", &clean]);
+        assert!(inputs.is_empty(), "the driver pops them from the queue");
+        assert_eq!(
+            lazy.expect("deferred").spans,
+            vec![(0, 1), (2, 9), (10, 13)]
+        );
+        // Not with `-s`, with `--stream`, with a stream that turns malformed, or with several
+        // files.
         let broken = write("broken.json", "1\n2\n}\n");
         for argv in [
-            vec!["jq", "inputs", &clean],
+            vec!["jq", "-s", "inputs", &clean],
+            vec!["jq", "--stream", "inputs", &clean],
+            vec!["jq", "inputs", &broken],
+            vec!["jq", "inputs", &clean, &clean],
             vec!["jq", "-n", "-s", "inputs", &clean],
             vec!["jq", "-n", "inputs", &broken],
             vec!["jq", "-n", "inputs", &clean, &clean],
