@@ -24471,7 +24471,7 @@ fn props_value_to_string(value: &OwnedValue, escape: bool) -> String {
             nonfinite_literal_display(*f, literal).to_string()
         }
         // Echo verbatim (#1008): `@props` is documented as a yq-flavored
-        // format function (CLAUDE.md's format table marks it `(yq)`) --
+        // format function (docs/reference/jq-language.md's format table marks it `(yq)`) --
         // reachable from `succinctly jq` too, but real yq's preservation
         // convention is the correct one regardless of which binary calls
         // it, not jq's `format_number_jq_compat` reformatting.

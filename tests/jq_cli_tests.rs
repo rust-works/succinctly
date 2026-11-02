@@ -36070,7 +36070,7 @@ fn test_jq_genuinely_empty_containers_unaffected_2594() -> Result<()> {
         ("[]", "keys", "[]"),
         ("[]", "keys_unsorted", "[]"),
         // Succinctly's `leaf_paths` extension counts an empty container as
-        // a leaf (see CLAUDE.md); `paths` does not. Both stay as they were.
+        // a leaf (see docs/reference/jq-language.md); `paths` does not. Both stay as they were.
         ("[]", "leaf_paths", "[]"),
         ("{}", "leaf_paths", "[]"),
         ("[]", "[.[]]", "[]"),

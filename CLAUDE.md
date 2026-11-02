@@ -237,84 +237,17 @@ use succinctly::jq::{parse, eval};
 | **YamlIndex**     | YAML semi-indexing with oracle parser  | ~250-400 MiB/s             |
 | **DsvIndex**      | DSV semi-indexing with lightweight rank| 85-1676 MiB/s (API)        |
 
-### jq Format Functions
+### jq Format Functions and Assignment Operators
 
-The jq implementation supports format functions for converting values to strings:
+The format table (`@csv`, `@tsv`, `@dsv(delim)`, `@json`, `@text`, `@uri`, `@urid`, `@base64`, `@base64d`, `@html`, `@sh`, `@yaml`, `@props`) and the assignment operators (`=`, `|=`, `+=`, `-=`, `*=`, `/=`, `%=`, `//=`, `del()`) are in
+[docs/reference/jq-language.md](docs/reference/jq-language.md#format-strings) and its
+[assignment section](docs/reference/jq-language.md#assignment-operators), with examples. The rules that are easy to get wrong:
 
-| Format       | Syntax              | Description                                       | Example Output      |
-|--------------|---------------------|---------------------------------------------------|---------------------|
-| **@csv**     | `@csv`              | Comma-separated values (fixed delimiter)          | `"a","b","c"`       |
-| **@tsv**     | `@tsv`              | Tab-separated values (fixed delimiter)            | `a\tb\tc`           |
-| **@dsv**     | `@dsv(delimiter)`   | Generic DSV with custom delimiter                 | `"a"\|"b"\|"c"`     |
-| **@json**    | `@json`             | JSON format                                       | `{"a":1}`           |
-| **@text**    | `@text`             | Convert to string (same as tostring)              | `42`                |
-| **@uri**     | `@uri`              | URI percent encoding                              | `hello%20world`     |
-| **@urid**    | `@urid`             | URI percent decoding                              | `hello world`       |
-| **@base64**  | `@base64`           | Base64 encoding                                   | `aGVsbG8=`          |
-| **@base64d** | `@base64d`          | Base64 decoding                                   | `hello`             |
-| **@html**    | `@html`             | HTML entity escaping                              | `&lt;script&gt;`    |
-| **@sh**      | `@sh`               | Shell quoting                                     | `'hello world'`     |
-| **@yaml**    | `@yaml`             | YAML block-style encoding (yq)                    | `a: 1\nb: 2\n`      |
-| **@props**   | `@props`            | Java properties format (yq)                       | `key = value`       |
-
-**@uri/@base64/@html on arrays/objects (jq mode only):** a container is JSON-encoded
-first, then formatted, matching real jq (`[1,2] | @uri` => `"%5B1%2C2%5D"`) — `succinctly
-yq` still rejects a container outright for all three, matching real yq's own
-`cannot encode !!seq as URI/base64...` error (#1096); `@html` itself needs `--jq-extensions` there, since yq's
-lexer has no such format (#5444).
-
-**Format-prefixed string interpolation (jq mode only):** `@fmt "lit\(E)lit"` runs each
-`\(E)` slot through the format before splicing it in — jq's own `gen_format` desugar,
-`@base64 "v=\(1)"` => `"v=MQ=="` — while the literal text passes through unchanged. A
-literal with no interpolation never runs the format at all (`@base64 "abc"` => `"abc"`).
-yq's lexer rejects a format followed by a string outright, and `succinctly yq` matches
-that unchanged (#3316).
-
-**@dsv(delimiter) specifics:**
-- Custom delimiters: Any single or multi-character string
-- Always-quoted strings: every string field is double-quoted (matching jq's `@csv`), regardless of content; non-strings are bare and null is empty
-- CSV-compatible: `@dsv(",")` produces identical output to `@csv`
-- Escape handling: Inner `"` is doubled (`""`)
-
-```bash
-# Examples
-echo '["a","b","c"]' | jq -r '@dsv("|")'        # Output: "a"|"b"|"c"
-echo '["a","b|c","d"]' | jq -r '@dsv("|")'      # Output: "a"|"b|c"|"d"
-echo '["a","b","c"]' | jq -r '@dsv(";")'        # Output: "a";"b";"c"
-```
-
-### jq Assignment Operators
-
-The jq implementation supports assignment operators for modifying JSON in-place:
-
-| Operator  | Syntax             | Description                                                    | Example                   |
-|-----------|--------------------|----------------------------------------------------------------|---------------------------|
-| **=**     | `.path = value`    | Simple assignment                                              | `.a = 42`                 |
-| **\|=**   | `.path \|= filter` | Update assignment (applies filter to current value)            | `.a \|= . + 1`            |
-| **+=**    | `.path += value`   | Compound add (equivalent to `.path \|= . + value`)             | `.count += 10`            |
-| **-=**    | `.path -= value`   | Compound subtract                                              | `.health -= 25`           |
-| ***=**    | `.path *= value`   | Compound multiply, or recursive object/array merge (see below) | `.scale *= 2`             |
-| **/=**    | `.path /= value`   | Compound divide                                                | `.total /= 4`             |
-| **%=**    | `.path %= value`   | Compound modulo                                                | `.index %= 10`            |
-| **//=**   | `.path //= value`  | Alternative assignment (sets only if null/false)               | `.default //= "fallback"` |
-| **del()** | `del(.path)`       | Delete field or array element                                  | `del(.temporary)`         |
-
-```bash
-# Examples
-echo '{"a": 1}' | succinctly jq '.a = 42'           # {"a": 42}
-echo '{"x": 5}' | succinctly jq '.x |= . * 2'       # {"x": 10}
-echo '{"n": 10}' | succinctly jq '.n += 5'          # {"n": 15}
-echo '{"a": null}' | succinctly jq '.a //= "default"'  # {"a": "default"}
-echo '{"a": 1, "b": 2}' | succinctly jq 'del(.a)'   # {"b": 2}
-echo '[1, 2, 3]' | succinctly jq '.[] |= . * 2'     # [2, 4, 6]
-```
-
-`*`/`*=` on two objects recursively merges them (matching values are merged if both are objects, otherwise the right side wins) — this works in both `jq` and `yq` mode, since real jq does the same. On two arrays, plain `*`/`*=` replaces the left side wholesale with the right (yq mode only; `succinctly jq` still errors on array `*`, matching real jq, which has no array-merge concept):
-
-```bash
-echo '{"a": {"x": 1}, "b": {"x": 2, "y": 3}}' | succinctly jq '.a *= .b'  # {"a":{"x":2,"y":3},...}
-printf 'a: [1, 2]\nb: [3, 4]\n' | succinctly yq '.a *= .b'               # a: [3, 4]
-```
+- **`@uri`/`@base64`/`@html` on an array or object (jq mode only):** the container is JSON-encoded first, as real jq does (`[1,2] | @uri` => `"%5B1%2C2%5D"`). `succinctly yq` rejects a container for all three, as real yq does (#1096), and `@html` needs `--jq-extensions` there (#5444).
+- **Format-prefixed interpolation (jq mode only):** `@fmt "lit\(E)lit"` formats each `\(E)` slot and leaves the literal text alone; a literal with no interpolation never runs the format. yq's lexer rejects a format followed by a string, and `succinctly yq` matches (#3316).
+- **`@text` and `@urid`:** `@text` is `tostring`. `@urid` (URI percent decoding) is new in jq 1.8; `succinctly jq` follows 1.8, where jq 1.7.1 answers `urid is not a valid format` (the `str-format-urid` ledger entry).
+- **`@dsv(delim)`:** every string field is double-quoted whatever its content (as `@csv` does), non-strings are bare, null is empty, an inner `"` is doubled, and `@dsv(",")` is identical to `@csv`.
+- **`*`/`*=`:** two objects merge recursively in both modes (real jq does too). Two arrays are replaced wholesale in yq mode only; `succinctly jq` errors on array `*`, as real jq does.
 
 ### The rule the divergence sections below are exceptions to
 
@@ -427,91 +360,14 @@ with the anchor deleted earlier in the pipe there is nothing to redirect to, so 
 stays positional. The equal-value rule above is then the backstop: wherever the redirect
 declines, the values differ and the mark is dropped rather than discarding the write.
 
-### jq Position-Based Navigation (succinctly extension)
+### jq Extensions: Position Navigation and `leaf_paths`
 
-Succinctly extends jq with position-based navigation builtins that allow jumping directly to a node at a specific byte offset or line/column position. This is unique to succinctly and not available in standard jq or yq.
+Both are succinctly's own, not in jq 1.7.1 or yq; examples are in
+[docs/reference/jq-language.md](docs/reference/jq-language.md#succinctly-extensions).
 
-| Builtin                    | Description                                                  | Example             |
-|----------------------------|--------------------------------------------------------------|---------------------|
-| **at_offset(n)**           | Jump to node at byte offset `n` (0-indexed)                  | `at_offset(10)`     |
-| **at_position(line; col)** | Jump to node at line/column (1-indexed, semicolon-separated) | `at_position(2; 3)` |
-
-**Use cases:**
-- IDE integration: Jump to node under cursor position
-- Error investigation: Navigate to specific byte offset from error message
-- Programmatic navigation: Build tools that work with document positions
-
-```bash
-# Jump to node at byte offset 10 (inside "Alice" string)
-echo '{"name": "Alice", "age": 30}' | succinctly jq 'at_offset(10)'
-# Output: "Alice"
-
-# Jump to node at line 1, column 1 (the root object)
-echo '{"name": "Alice"}' | succinctly jq 'at_position(1; 1)'
-# Output: {"name": "Alice"}
-
-# Navigate from offset position - get array at offset 10, then access element
-echo '{"users": [{"name": "Alice"}, {"name": "Bob"}]}' | succinctly jq 'at_offset(10) | .[1].name'
-# Output: "Bob"
-
-# Works with multiline JSON - line 2, column 3 is the "name" key
-echo '{
-  "name": "Alice",
-  "age": 30
-}' | succinctly jq 'at_position(2; 3)'
-# Output: "name"
-
-# Works with YAML via yq
-succinctly yq 'at_offset(6)' config.yaml
-
-# Combine with other jq operations
-echo '{"data": {"nested": {"value": 42}}}' | succinctly jq 'at_offset(9) | .nested.value'
-# Output: 42
-```
-
-**Notes:**
-- `at_offset(n)` uses 0-indexed byte offset (same as `jq-locate --offset`)
-- `at_position(line; col)` uses 1-indexed line and column (same as `jq-locate --line --column`)
-- Returns error if offset/position is out of bounds or doesn't correspond to a valid node
-- Use `at_offset(n)?` or `at_position(l; c)?` for optional (returns empty on invalid position)
-
-### jq `leaf_paths` (succinctly extension)
-
-`leaf_paths` is **not a real jq builtin** — it errors with `leaf_paths/0 is
-not defined` in real jq (confirmed against jq 1.7.1 and 1.8.2). It's a
-succinctly extension modeled on the community recipe
-`def leaf_paths: paths(scalars);`, but intentionally broader: it returns
-paths to every **leaf** (childless) node in the tree, not just paths whose
-`type` is scalar.
-
-```bash
-echo '{"a": {"b": 1, "c": null}, "d": [], "e": [2, 3]}' | succinctly jq -c 'leaf_paths'
-# ["a","b"]
-# ["a","c"]
-# ["d"]
-# ["e",0]
-# ["e",1]
-```
-
-**Diverges from `paths(scalars)` on two cases:**
-- `null` counts as a leaf here; `paths(scalars)` excludes it (an accidental
-  side effect of `select()` treating a `null` yield as falsy, not a
-  deliberate design choice in jq).
-- Empty `{}`/`[]` count as leaves here; `paths(scalars)` excludes them too,
-  since their `type` is `"object"`/`"array"`, not scalar — even though they
-  have no children to recurse into either.
-
-This divergence is intentional: `leaf_paths` uses a tree-structural
-definition of "leaf" (no children), which the community recipe's
-type-based `scalars` filter doesn't fully capture. See
-[collect_leaf_paths](src/jq/eval.rs) and issue #771 for the full rationale.
-
-**In `succinctly yq`**, `leaf_paths` (along with `paths`, `getpath`, `limit`,
-`gsub`/`scan`/`splits`, and the rest of the jq-only surface real yq's lexer
-rejects) is gated behind `--jq-extensions` and off by default since #1512 —
-`succinctly jq` above is unaffected either way. See
-[docs/reference/yq-language.md](docs/reference/yq-language.md#gated-jq-builtins---jq-extensions)
-for the full list.
+- **`at_offset(n)`, `at_position(line; col)`:** jump to the node at a 0-indexed byte offset, or a 1-indexed line and column (the arguments of `jq-locate --offset` / `--line --column`). An offset or position outside the document, or on no node, is an error; `at_offset(n)?` is empty instead.
+- **`leaf_paths`:** not a real jq builtin (`leaf_paths/0 is not defined` in jq 1.7.1 and 1.8.2). It returns the path to every childless node, so it differs from the recipe `paths(scalars)` in two cases: `null` counts as a leaf, and so does an empty `{}`/`[]` (see `collect_leaf_paths` in `src/jq/eval.rs`, #771).
+- **In `succinctly yq`** `leaf_paths` is gated behind `--jq-extensions`, like `paths`, `getpath`, `limit`, `gsub`/`scan`/`splits` and the rest of the jq-only surface yq's lexer rejects (#1512; the list is in [docs/reference/yq-language.md](docs/reference/yq-language.md#gated-jq-builtins---jq-extensions)). `succinctly jq` is unaffected.
 
 ## Feature Flags
 
@@ -536,66 +392,14 @@ for the full list.
 
 ### `--all-features` is not a superset build (#3006)
 
-Three features above are marked **non-additive**: enabling one *replaces* the
-default with a slower or measurement-only build rather than adding behavior
-on top of it (`select-stats`/`share-stats` are additive — instrumentation
-only, no default behavior replaced — and not part of this set, even though
-both must also never be on for a timing/shipped build for their own,
-different reason). `cargo build --all-features` turns on all three at once,
-so an `--all-features` binary is a strictly slower, non-shipping build with
-no diagnostic that it's non-default. This has already bitten twice, in ways
-CI works around but this repo's own docs don't all say consistently:
+`portable-popcount`, `broadword-yaml` and `scalar-yaml` are **non-additive**: each *replaces* the default with a slower or measurement-only build instead of adding to it. `cargo build --all-features` turns on all three, so that binary is a non-shipping build with no diagnostic saying so. (`select-stats` and `share-stats` are additive instrumentation, not part of this set, but must also never be on for a timing or shipped build.)
 
-- **Clippy's blind spot, twice over**: `--all-features` enables `scalar-yaml`,
-  which compiles out the YAML SIMD backend for whichever architecture is
-  building (`src/yaml/simd/x86.rs` on x86_64; `neon.rs` and `broadword.rs`
-  on ARM64 — `broadword.rs` itself never even compiles on x86_64, feature
-  or not) entirely, *and* `portable-popcount`, which together with `simd`
-  also gates *out* the AVX-512 popcount path (`src/bits/popcount.rs`) the
-  same way — so `cargo clippy --all-targets --all-features` never lints
-  either (#185, #388). CI's x86_64 `Clippy` job therefore runs *twice* —
-  once with `--all-features`, once with `--features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests`
-  (excludes both `scalar-yaml` and `portable-popcount`, so both real paths
-  compile in) — and the ARM64 leg runs a *third* time on top of that with
-  `broadword-yaml` added (the YAML backend selectors are cfg-exclusive, so
-  no single build reaches neon/broadword/scalar at once; see
-  `.github/workflows/ci.yml`'s own comment above the `clippy-all-variants`
-  matrix entry for the exact commands). Both feature lists have exactly one
-  source of truth, `scripts/lib/clippy-variants.sh` (#3354) — `ci.yml`,
-  `scripts/build.sh`, and `scripts/test.sh` all source it rather than each
-  holding their own copy; update that file, not the prose here, if the list
-  ever changes. When validating clippy locally for
-  any change touching `src/yaml/simd/*.rs` or `src/bits/popcount.rs`, run
-  every invocation ci.yml runs for your architecture, not just
-  `--all-features` — and see [docs/guides/developer.md](docs/guides/developer.md)'s
-  own Linting section, which now lists them too. Rustdoc runs for the same
-  reason with the same lists: twice on x86_64, and on ARM64 with the core and the
-  `broadword-yaml` list (#5740, #5908).
-- **Pins gated out of the most-run build**: an exact-size or exact-behaviour
-  pin describing the *shipped* shape has to be `#[cfg(not(feature = "…"))]`-gated
-  so `cargo test --all-features` stays green, which makes the pin silently
-  absent in exactly the build most likely to be run to "check everything" —
-  including [docs/guides/release.md](docs/guides/release.md)'s own release
-  checklist, which now also runs the shipped feature set for this reason.
-  An A/B holdout feature is one instance of this pattern
-  ([docs/guides/benchmarking.md](docs/guides/benchmarking.md#ab-benchmarking-method)
-  has its own rules, including retiring the switch once its measurement is
-  recorded: `unshared-containers` went that way, #5841).
+- **Clippy cannot see everything in one invocation.** `scalar-yaml` compiles out the YAML SIMD backend of the building architecture (`src/yaml/simd/x86.rs` on x86_64; `neon.rs` and `broadword.rs` on ARM64; `broadword.rs` never compiles on x86_64 at all), and `portable-popcount` together with `simd` compiles out the AVX-512 popcount path (`src/bits/popcount.rs`), so `cargo clippy --all-targets --all-features` lints none of them (#185, #388). CI's x86_64 `Clippy` job therefore runs twice, once with `--all-features` and once with `--features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests`, which excludes both; the ARM64 leg runs a third time with `broadword-yaml` added, because the YAML backend selectors are cfg-exclusive (the commands are commented above the `clippy-all-variants` matrix entry in `.github/workflows/ci.yml`).
+- **One source of truth for the lists:** `scripts/lib/clippy-variants.sh` (#3354), sourced by `ci.yml`, `scripts/build.sh` and `scripts/test.sh`. Change that file, not prose. For a change touching `src/yaml/simd/*.rs` or `src/bits/popcount.rs`, run every invocation `ci.yml` runs for your architecture; [docs/guides/developer.md](docs/guides/developer.md)'s Linting section lists them. Rustdoc runs for the same reason with the same lists: twice on x86_64, and on ARM64 with the core and the `broadword-yaml` list (#5740, #5908).
+- **Pins gated out of the most-run build.** An exact-size or exact-behaviour pin of the *shipped* shape has to be `#[cfg(not(feature = "…"))]`-gated so `cargo test --all-features` stays green, which leaves the pin absent in the build most likely to be run to "check everything". [docs/guides/release.md](docs/guides/release.md)'s checklist runs the shipped feature set for this reason. An A/B holdout feature is one instance: [docs/guides/benchmarking.md](docs/guides/benchmarking.md#ab-benchmarking-method) says to retire the switch once its measurement is recorded (`unshared-containers`, #5841).
+- **What "covers everything" means:** the CI legs on the **default** feature set (`cli,simd,regex,serde` for tests) plus the non-`--all-features` clippy invocations above, not `--all-features`. The bare `--all-features` clippy line under CI/CD below is only part of that.
 
-If you're deciding what `cargo test`/`cargo clippy` invocation "covers
-everything": it's the CI legs matching the **default** feature set
-(`cli,simd,regex,serde` for tests) plus the non-`--all-features` clippy
-invocation(s) above, not `--all-features` — including the bare
-`--all-features` clippy line under the CI/CD section below, which only
-covers part of the picture.
-
-This documents the footgun; it doesn't remove it (that needs the `--cfg`
-conversion this issue's own Option 1 describes, deliberately not attempted
-here since a `RUSTFLAGS` change invalidates every developer's and every CI
-run's build cache and needs its own measurement first). Don't treat this
-section's existence as the issue being closed for good — a new non-additive
-feature added later needs the same write-up, not just a line in the table
-above.
+The footgun is documented, not removed: that needs a `--cfg` conversion, which changes `RUSTFLAGS` and so invalidates every build cache, and needs its own measurement. A new non-additive feature needs the same write-up here as well as a line in the table above.
 
 ## Testing Strategy
 

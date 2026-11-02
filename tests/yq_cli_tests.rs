@@ -4095,7 +4095,7 @@ fn test_arithmetic_validates_only_what_it_reads_2626() -> Result<()> {
     Ok(())
 }
 
-/// #868: `leaf_paths` (also a succinctly extension, see CLAUDE.md) shares
+/// #868: `leaf_paths` (also a succinctly extension, see docs/reference/jq-language.md) shares
 /// `paths`'s same duplicate-key bug via its own `to_owned`-based walk --
 /// same fix, same internal-consistency criterion.
 #[test]
