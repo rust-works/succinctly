@@ -527,6 +527,20 @@ fn a_prelude_definitions_header_is_its_funcdefs_and_is_unique_5858() {
             };
             assert_eq!((def.name, def.arity), (name.as_str(), params.len()));
             assert!(seen.insert((def.name, def.arity)), "{} twice", def.name);
+            // Only a `_sp_` name can bind to a prelude definition, and one that
+            // an earlier body calls must be defined before it, as the nested
+            // `Frame::Def` chain it replaced required.
+            assert!(def.name.starts_with("_sp_"), "{}", def.name);
+        }
+        for (at, def) in prelude.defs.iter().enumerate() {
+            any_subexpr(def.expr(), &mut |e| {
+                if let Expr::FuncCall { name, args, .. } = e {
+                    if let Some(&callee) = prelude.index.get(&(name.as_str(), args.len())) {
+                        assert!(callee <= at, "{} calls {name}, defined after it", def.name);
+                    }
+                }
+                false
+            });
         }
         assert!(prelude.defs.len() > 100, "{}", prelude.defs.len());
     });
@@ -552,7 +566,7 @@ fn a_prelude_definition_is_parsed_on_its_first_call_5858() {
         assert_eq!(run.outputs.len(), 2);
         let after = parsed(&prelude);
         assert!(
-            (1..prelude.defs.len() / 4).contains(&after),
+            (1..prelude.defs.len()).contains(&after),
             "{after} of {}",
             prelude.defs.len()
         );

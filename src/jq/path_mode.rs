@@ -858,6 +858,12 @@ impl PreludeDef {
     }
 
     /// The definition's `FuncDef`, its chain `rest` an identity.
+    ///
+    /// The first call of a definition parses it wherever the evaluation is, no
+    /// longer at the top. One definition's parse is shallow (the unit tests parse
+    /// every one on a 2 MiB debug thread), and the native-stack floor
+    /// ([`native_stack_exhausted`]) leaves half of
+    /// the registered stack unspent, so the parse has room at the floor.
     fn expr(&self) -> &Expr {
         self.parsed.get_or_init(|| {
             let src = format!("def {} .", self.source);
