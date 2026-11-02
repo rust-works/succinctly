@@ -164,3 +164,18 @@ fn one_invalid_category_makes_the_whole_process_c() -> Result<()> {
     );
     Ok(())
 }
+
+/// glibc's `en_US` `%c` ends in the zone (`... PM GMT`); the zone it names must be the local
+/// one, not the placeholder a format without `%Z` gets. macOS's `%c` has no zone at all.
+#[test]
+fn a_locale_layout_that_prints_the_zone_names_the_local_one() -> Result<()> {
+    if !installed("en_US.UTF-8") {
+        return Ok(());
+    }
+    let out = run(
+        r#"strflocaltime("%c")"#,
+        &[("LC_ALL", "en_US.UTF-8"), ("TZ", "Asia/Tokyo")],
+    )?;
+    assert!(!out.contains("UTC"), "{out:?}");
+    Ok(())
+}

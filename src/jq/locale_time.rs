@@ -47,9 +47,12 @@ mod imp {
     /// The locale name jq's `setlocale(LC_ALL, "")` would settle on for `LC_TIME`:
     /// `LC_ALL`, else `LC_TIME`, else `LANG`, the first one that is set and non-empty.
     fn time_locale_name() -> Option<String> {
-        ["LC_ALL", "LC_TIME", "LANG"]
-            .iter()
-            .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
+        ["LC_ALL", "LC_TIME", "LANG"].iter().find_map(|var| {
+            // `var_os`: a value that is not UTF-8 still names the locale libc would pick.
+            std::env::var_os(var)
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string_lossy().into_owned())
+        })
     }
 
     fn is_c_name(name: &str) -> bool {
@@ -67,8 +70,13 @@ mod imp {
         }
         // SAFETY: an empty name and a null base are the documented arguments; the
         // result is either null (failure) or a handle we keep.
-        let handle =
-            unsafe { libc::newlocale(libc::LC_ALL_MASK, c"".as_ptr(), core::ptr::null_mut()) };
+        let handle = unsafe {
+            libc::newlocale(
+                libc::LC_ALL_MASK,
+                b"\0".as_ptr().cast(),
+                core::ptr::null_mut(),
+            )
+        };
         if handle.is_null() {
             None
         } else {
@@ -168,6 +176,12 @@ pub(crate) struct TmFields<'a> {
     pub(crate) yearday: i64,
     pub(crate) zone_offset: i64,
     pub(crate) zone_name: &'a str,
+}
+
+/// Whether the locale's `%c`/`%x`/`%X`/`%r` layouts can print the zone (`%Z`, `%z`): glibc's
+/// `en_GB` `%c` ends in `%Z`. A format using any of them has to resolve the zone labels.
+pub(crate) fn layouts_may_name_the_zone(fmt: &str) -> bool {
+    is_active() && fmt.bytes().any(|b| matches!(b, b'c' | b'x' | b'X' | b'r'))
 }
 
 /// Whether a non-C locale is in effect for the time conversions.

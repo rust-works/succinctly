@@ -94582,8 +94582,10 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             // Only these specifiers read the zone's labels; `E`/`O` modifiers
-            // precede one of them, so the letters alone decide.
-            let labelled = fmt.bytes().any(|b| matches!(b, b'z' | b'Z' | b's'));
+            // precede one of them, so the letters alone decide. A locale's own
+            // `%c`/`%x`/`%X`/`%r` layout may also print the zone (#5754).
+            let labelled = fmt.bytes().any(|b| matches!(b, b'z' | b'Z' | b's'))
+                || locale_time::layouts_may_name_the_zone(&fmt);
             let (t, zone) =
                 match broken_down_time_fields::<W, S>(&value, optional, local, labelled, name) {
                     Ok(tz) => tz,
