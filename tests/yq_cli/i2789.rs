@@ -54,14 +54,15 @@ fn test_key_tostring_and_formats_over_string_keys_2789() -> Result<()> {
             ],
         ),
         (
+            // yq quotes from the first character that needs it (#5837).
             ".[] | key | @sh",
             &[
-                "'plain'",
-                "'dq'",
-                "'Yes'",
-                "'name with space'",
+                "plain",
+                "dq",
+                "Yes",
+                "name' with space'",
                 "'\u{e9}\u{20ac}'",
-                "''",
+                "",
             ],
         ),
     ];
