@@ -216,7 +216,7 @@
 #
 # Usage:
 #   cargo build --release --features cli
-#   ./scripts/jq-bind-origin-oracle-sweep.sh                 # TSV + summary; exit 1 on fabricate/mismatch/new refuse-only
+#   ./scripts/jq-bind-origin-oracle-sweep.sh [SUBJECT]       # TSV + summary; exit 1 on fabricate/mismatch/new refuse-only
 #   ./scripts/jq-bind-origin-oracle-sweep.sh --list-cases    # rows only, no binaries needed
 #
 # Env: SUCCINCTLY (default target/release/succinctly), JQ (default /usr/bin/jq;
@@ -224,19 +224,22 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# The compare harness (`--dimension sweeps`, #5552) passes the subject as the one argument and sets
+# `JQ` (and `JQ_ORACLE`) to the pinned reference; a setup error exits 2, since 1 means "diverges".
+if [[ -n "${1:-}" && "$1" != "--list-cases" ]]; then SUCCINCTLY=$1; fi
 SUCCINCTLY="${SUCCINCTLY:-target/release/succinctly}"
 PIN="$(cat tests/data/jq-golden/JQ_VERSION)"
 if [[ "${1:-}" != "--list-cases" ]]; then
   if [[ ! -x "$SUCCINCTLY" ]]; then
     echo "error: succinctly binary not found at $SUCCINCTLY -- run: cargo build --release --features cli" >&2
-    exit 1
+    exit 2
   fi
   # The pinned oracle, never whichever jq is first on PATH (Homebrew's is a
   # newer version) -- the same rule the sibling sweeps apply.
   JQ="${JQ:-/usr/bin/jq}"
   if ! "$JQ" --version 2>/dev/null | grep -q "^$PIN"; then
     echo "error: $JQ is not the pinned oracle ($PIN): $("$JQ" --version 2>&1)" >&2
-    exit 1
+    exit 2
   fi
 fi
 
@@ -1295,40 +1298,6 @@ CASES_EOF
 # other side: a `(` before a `#` in a reason made bash read the `#` as a
 # comment inside the `$( )`, so the closing `)` vanished).
 read -r -d '' REFUSE_ONLY <<'REFUSE_EOF' || true
-source-rebuilt-container:the source navigates inside a construction, which jq's suspended tracking allows but the resolver refuses; falls back to a plain value
-optional-source-over-construction:#3519 -- a ? after a construction (`([$q] | .[0]?) as $y`) is refused by the resolver where jq's suspended tracking allows it; the postfix ? lets that refusal through to the by-value fallback, which binds a plain value
-optional-source-computed-key:#3519 -- a computed key under ? is not on the witness grammar's literal-key gate (is_constant_key_navigation), so the source binds by value
-optional-source-computed-slice:#3519 -- same gate, for a computed slice bound
-full-slice-is-the-array:jq's full slice is the array itself; the bind path ends in a slice component, .a does not
-marker-not-at-head:a marker is re-rooted only at the head of a source; elsewhere it is certified against the ambient position
-destructure-bind-after-pattern:#2649 residue 1 -- a plain bind on the ambient input after a pattern moved the register: resolve_bind_source needs a trackable stage, and the pattern's body stage is not
-owned-embed-fold-update-rebuilt-by-nonwrite:#3181 review -- a witnessed step runs its UPDATE through the owned re-index bridge, so even an UPDATE returning `.` hands the next step a rebuilt copy (the owned-embed-fold-if-identity mechanism)
-owned-embed-fold-if-identity:#2889 -- an `if` UPDATE returning `.` is not one of eval_owned_navigation's recognized shapes, so embed_peel_step declines and the accumulator goes through the owned re-index bridge
-identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition
-untracked-later-step-refusal-no-retry:#3120 review -- refusal_is_exact is decided per source, and a marker that is the register is value-equal to it, so a later-step refusal after a certified first step is treated as a guess and does not retry; jq retries onto $w. The trackable twin retries and agrees
-computed-identity-bind-mixed-if:#3133 -- an if source with one arm a computed `.` and the other a marker binds Untracked on an untracked stage (the condition is not evaluated); jq evaluates it and binds the marker
-scalar-string-keeps-tostring-twice:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
-scalar-string-keeps-ltrimstr-nomatch:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
-scalar-string-keeps-ltrimstr-nonstring-arg:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
-scalar-string-keeps-rtrimstr-nomatch:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
-scalar-string-keeps-sub-nomatch:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
-scalar-string-keeps-gsub-nomatch:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
-scalar-string-keeps-flatten-one:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
-scalar-string-keeps-walk:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
-scalar-string-keeps-reduce-rebind:#3191 -- a fold rebinding the value as its own accumulator (`reduce . as $y (null; $y)`) runs its UPDATE through the owned re-index bridge (the #2889 owned-embed-fold-if-identity mechanism), which hands path() a fresh copy
-destructure-bind-node-constructed-source-refuse-only:#3466 -- an element of a freshly constructed source has no document node behind it, and #3191 declined to carry identity through construction (an Rc per element), so `[.a.b] as [$z] | path(.a.b | $z)` refuses where jq answers; a destructuring of a document node answers
-scalar-number-keeps-abs:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
-scalar-number-keeps-max-by-one:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
-scalar-number-keeps-ltrimstr-passthrough:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
-scalar-constant-pool-number-def:#3191 -- jq's constant pool loads one `jv` for a def's literal across calls; here each evaluation of a literal is a fresh value and only a bind promotes one, so the two calls are two storages (the two-literal twin refuses in both)
-scalar-constant-pool-string-def:same as scalar-constant-pool-number-def, for a string literal
-bound-comma-nested-node-refuse-only:#3477 -- a comma sequence shares a node only when it names that node twice; `.a` inside a `.` element is a descendant of another element, and the materialized copy of `.` has already built its own `.a`, so jq's shared jv is not shared here (the exact-node memo is deliberate: descendant sharing is the embed table's job and needs a bind to register)
-fold-loop-var-scalar-refuses:#3329 -- a fold's loop variable is marked for containers only; a scalar has no storage identity until a bind promotes it (#3191), so `reduce (.) as $x (.; path($x))` on a string or number refuses where jq answers
-fold-loop-var-rebound-alt-chain:#3898 -- the fold's loop variable is aliased only by a plain `$x as $y` (or a passthrough pipe of it); a `?//` chain of binds is not read as a rebinding, so the variable is not marked and jq's answer ({"a":9}) is refused
-nested-fold-frozen-init-foreach-after-length:#3984 -- the fold's register is untracked, so a refusal of a frozen value the step could have navigated is the resolver's guess and stays loud (#3267); jq finds the step intact and answers
-nested-fold-frozen-foreach-in-foreach-extract-del:#3984 -- the fold's register is untracked, so a refusal of a frozen value the step could have navigated is the resolver's guess and stays loud (#3267); jq finds the step intact and answers
-nested-fold-frozen-foreach-in-foreach-extract-assign:#3984 -- the fold's register is untracked, so a refusal of a frozen value the step could have navigated is the resolver's guess and stays loud (#3267); jq finds the step intact and answers
-nested-fold-frozen-foreach-in-foreach-extract-path:#3984 -- the fold's register is untracked, so a refusal of a frozen value the step could have navigated is the resolver's guess and stays loud (#3267); jq finds the step intact and answers
 REFUSE_EOF
 
 if [[ "${1:-}" == "--list-cases" ]]; then
