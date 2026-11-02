@@ -788,6 +788,11 @@ jobs:
       - name: coverage-shards.py self-tests
         run: python3 scripts/test_coverage_shards.py -v
 
+      # #5878: pins every x86_64 Linux runner to ubuntu-24.04, the glibc the jq libm goldens were
+      # verified on; a runner-image move then has to edit that test, not happen silently.
+      - name: ci-runner-pin self-tests
+        run: python3 scripts/test_ci_runner_pin.py -v
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
