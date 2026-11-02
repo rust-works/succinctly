@@ -5783,39 +5783,10 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // document's line is counted when it is read, one forward pass over the text in
                 // all. No parse error is queued (the route is taken only without one).
                 debug_assert_eq!(locations.per_value(), &[]);
-                let count = lazy.spans.len();
-                let source = lazy.source;
-                // The counter's place in the text, kept between reads without a borrow of it.
-                let mut lines = LineCounter::at_seam(lazy.text.as_bytes(), lazy.seam).place();
-                let materialize = move |index: usize| {
-                    let bytes = lazy.text.as_bytes();
-                    let (start, end) = lazy.spans[index];
-                    let mut counter = LineCounter::resume(bytes, lines);
-                    let line = counter.read_end_line(end);
-                    lines = counter.place();
-                    debug_assert!(
-                        json_depth_at_most(&bytes[start..end], LAZY_JSON_MAX_DEPTH),
-                        "a lazily converted document is within the depth the route admits"
-                    );
-                    // Serde accepted the span as a whole value and its depth is bounded
-                    // (`lazy_json_spans`), so it is the conversion the eager route made, minus
-                    // a position only a depth error would have read.
-                    let converted = stream_document_validated(
-                        &bytes[start..end],
-                        None,
-                        &[],
-                        0,
-                        DocumentForm::Value,
-                    );
-                    // Narrowed as `InputLocations::push` narrows the eager route's lines.
-                    (line as u32, converted)
-                };
-                jq::seed_remaining_inputs_lazily(
-                    source,
-                    count,
-                    Box::new(materialize),
+                jq::seed_remaining_inputs_from(lazy_json_producer(
+                    lazy,
                     locations.exhausted(args.slurp),
-                );
+                ));
                 if locations.eof_tail.is_some() {
                     jq::count_reads_past_end();
                 }
@@ -9101,6 +9072,43 @@ struct LazyJsonInputs {
     source: u32,
     /// The source's [`Seam`], which its line counting starts from.
     seam: Seam,
+}
+
+/// The producer the `input` queue pulls a [`LazyJsonInputs`] stream's documents from (#5661):
+/// each read converts the next document and counts its line, one forward pass over the text in
+/// all, and the read after the last answers the end of the stream at `exhausted`.
+fn lazy_json_producer(lazy: LazyJsonInputs, exhausted: Option<(u32, u32)>) -> jq::InputProducer {
+    // The counter's place in the text, kept between reads without a borrow of it.
+    let mut lines = LineCounter::at_seam(lazy.text.as_bytes(), lazy.seam).place();
+    let mut next = 0;
+    // The stream's text goes with its last document, not with the read past it.
+    let mut stream = (!lazy.spans.is_empty()).then_some(lazy);
+    Box::new(move || {
+        let Some(lazy) = stream.as_ref() else {
+            return jq::ProducedInput::End(exhausted);
+        };
+        let bytes = lazy.text.as_bytes();
+        let (start, end) = lazy.spans[next];
+        next += 1;
+        let mut counter = LineCounter::resume(bytes, lines);
+        let line = counter.read_end_line(end);
+        lines = counter.place();
+        debug_assert!(
+            json_depth_at_most(&bytes[start..end], LAZY_JSON_MAX_DEPTH),
+            "a lazily converted document is within the depth the route admits"
+        );
+        // Serde accepted the span as a whole value and its depth is bounded
+        // (`lazy_json_spans`), so it is the conversion the eager route made, minus
+        // a position only a depth error would have read.
+        let converted =
+            stream_document_validated(&bytes[start..end], None, &[], 0, DocumentForm::Value);
+        // Narrowed as `InputLocations::push` narrows the eager route's lines.
+        let produced = jq::ProducedInput::converted(converted, lazy.source, line as u32);
+        if next == lazy.spans.len() {
+            stream = None;
+        }
+        produced
+    })
 }
 
 thread_local! {
@@ -13883,6 +13891,51 @@ mod tests {
             assert!(lazy.is_none(), "{argv:?}");
             assert!(!inputs.is_empty(), "{argv:?}");
         }
+    }
+
+    /// #5498: the #5661 producer answers each document with jq's line for it, then the end it was
+    /// given, and drops the stream's text with its last document rather than at the read past it,
+    /// so a program that reads exactly every document does not keep the text for the rest of the
+    /// run. The pin must be able to fail: it does, without the `stream = None` that drops it.
+    #[test]
+    fn the_lazy_json_producer_drops_the_text_with_its_last_document_5498() {
+        let text = std::rc::Rc::new(String::from("1\n{\"a\":2}\n\n[3]\n"));
+        let mut producer = lazy_json_producer(
+            LazyJsonInputs {
+                text: std::rc::Rc::clone(&text),
+                spans: vec![(0, 1), (2, 9), (11, 14)],
+                source: 3,
+                seam: Seam::NONE,
+            },
+            Some((3, 4)),
+        );
+        // `jq -nc '[inputs|input_line_number]'` on the same text is `[1,2,4]`.
+        for (want, line) in [("1", 1), (r#"{"a":2}"#, 2), ("[3]", 4)] {
+            match producer() {
+                jq::ProducedInput::Document(value, 3, got) => {
+                    assert_eq!((value.to_json(), got), (want.to_string(), line));
+                }
+                other => panic!("expected {want} at line {line}, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            std::rc::Rc::strong_count(&text),
+            1,
+            "the text goes with the last document"
+        );
+        assert!(matches!(producer(), jq::ProducedInput::End(Some((3, 4)))));
+        assert!(matches!(
+            lazy_json_producer(
+                LazyJsonInputs {
+                    text,
+                    spans: Vec::new(),
+                    source: 0,
+                    seam: Seam::NONE,
+                },
+                None,
+            )(),
+            jq::ProducedInput::End(None)
+        ));
     }
 
     /// #3470: which programs `m2_has_stderr_effect` keeps off the M2 fast
