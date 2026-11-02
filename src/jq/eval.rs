@@ -93683,8 +93683,9 @@ mod remaining_inputs {
     pub enum Pop {
         /// The next document.
         Document(OwnedValue),
-        /// The stream ended in a parse error after the documents before it.
-        /// Delivered once; every later read is [`Pop::Exhausted`].
+        /// A parse error after the documents before it, delivered once. Documents may follow
+        /// it, since jq resumes reading after a parse error that `input` raises (#4311); once
+        /// nothing does, every later read is [`Pop::Exhausted`].
         ParseError(EvalError),
         /// Nothing left to read.
         Exhausted,
@@ -93813,8 +93814,8 @@ mod remaining_inputs {
                     return pop_past_end();
                 }
             };
+            // No `POPPED`: a producer seed queues no `ERRORS` for it to time.
             PRODUCER.with(|p| *p.borrow_mut() = Some(producer));
-            POPPED.with(|p| p.set(popped_so_far + 1));
             LAST_LINE.with(|l| l.set(line));
             CURRENT.with(|c| c.set(Some((src, line))));
             return pop;
@@ -94163,6 +94164,7 @@ pub fn seed_remaining_inputs_with_errors(
 /// Source tags and lines are what [`seed_remaining_inputs`] documents carry: an opaque source tag
 /// the CLI resolves itself, and a 1-based line.
 #[cfg(feature = "std")]
+#[derive(Debug)]
 pub enum ProducedInput {
     /// The next document, with its source tag and the line jq's reader had reached when it
     /// finished it.
@@ -94198,7 +94200,9 @@ pub type InputProducer = Box<dyn FnMut() -> ProducedInput>;
 ///
 /// Nothing is pulled here. A program that stops early (`first(inputs)`) never produces the items
 /// it does not read, and nothing is kept for them. The producer runs with no borrow of the queue
-/// held, so it may read the queue itself (it finds nothing there).
+/// held, so a read of the queue from inside it does not panic. That read finds nothing and is
+/// counted as a read past the end, moving the marker (#4303), so a producer has no reason to make
+/// one.
 #[cfg(feature = "std")]
 pub fn seed_remaining_inputs_from(producer: InputProducer) {
     remaining_inputs::seed_producer(producer);
@@ -94217,8 +94221,9 @@ pub fn count_reads_past_end() {
     remaining_inputs::count_reads_past_end();
 }
 
-/// One read from the `input`/`inputs` queue: a document, the parse error the
-/// input stream ended in (delivered once, #2961), or nothing left.
+/// One read from the `input`/`inputs` queue: a document, a parse error in the
+/// input stream (delivered once, #2961; documents may follow it, #4311), or
+/// nothing left.
 #[cfg(feature = "std")]
 pub use remaining_inputs::Pop as InputPop;
 
