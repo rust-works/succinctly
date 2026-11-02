@@ -130,12 +130,17 @@ fn test_inputs_raise_the_fault_at_the_position_the_parser_stood_on_5555() -> Res
 }
 
 #[test]
-fn test_a_stream_the_splitter_cannot_delimit_keeps_the_splitters_wording_with_stream_5555(
+fn test_a_stream_the_splitter_cannot_delimit_reads_with_jqs_streaming_parser_with_stream_5555(
 ) -> Result<()> {
-    // `--stream` reads with a parser that has no depth limit, and has no origin to place the
-    // fault by here, so it keeps the splitter's wording.
-    let (_, stderr, code) = run_jq_full(&["-c", "--stream", "."], Some("1 2 }"))?;
+    // `--stream` reads with jq's own streaming parser, which has no depth limit and says what jq
+    // says of a fault (#5498): the events before it, then its message with no location, at exit
+    // 5. Real jq 1.7.1 prints exactly this.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "--stream", "."], Some("1 2 }"))?;
     assert_eq!(code, 5);
-    assert!(stderr.contains("Invalid JSON text"), "{stderr:?}");
+    assert_eq!(stdout, "[[],1]\n[[],2]\n");
+    assert_eq!(
+        stderr,
+        "jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n"
+    );
     Ok(())
 }
