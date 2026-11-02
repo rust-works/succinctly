@@ -327,7 +327,7 @@ mod pin_tests {
     fn every_folded_sweep_names_a_sweep_script() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let (m, _) = Manifest::load(root).unwrap();
-        assert!(m.sweeps.len() >= 12, "{}", m.sweeps.len());
+        assert!(m.sweeps.len() >= 16, "{}", m.sweeps.len());
         for s in &m.sweeps {
             assert!(
                 s.script.starts_with("scripts/jq-") && s.script.contains("sweep"),

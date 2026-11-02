@@ -21,7 +21,10 @@ jq on the base and no longer does (a lost match: a refuse-only fallback has leak
 #3186/#3267), the candidate is ACCEPT_WRONG where the base was not, or a row the base refused (REFUSE_WRONG) now
 answers wrongly (DIFF: under a `?` a refusal can become a truncated answer, #5113, #5132) or prints a different partial
 output before it refuses, or on a candidate timeout. A wrong answer that became another wrong answer is listed, not
-failed (it may be a partial fix).
+failed (it may be a partial fix). Without `--base` only a timeout fails, unless `--jq-gate` is given: it fails the
+run on any ACCEPT_WRONG or DIFF against jq as well, with or without `--base`. No residual is documented today, and it
+is how `succinctly dev compare jq --dimension sweeps` runs this script (#5552); a residual that becomes accepted has
+to be listed here first.
 `--fixed` rows (wrong on the base, MATCH on the candidate) are counted and listed, so a change can
 show what it moved. Run it against a build from before the change as `--base`.
 
@@ -30,7 +33,7 @@ not touch: with `--base` it exits 1 on any row whose output differs between the 
 
 Usage: scripts/jq-foreach-update-if-arm-sweep.py --bin BIN [--base BIN] [--jq JQ] [--n N] [--seed S]
                                                   [--show N] [--only SUBSTR[,SUBSTR...]] [--jobs N]
-                                                  [--control] [--dump FILE]
+                                                  [--control] [--dump FILE] [--jq-gate]
 """
 import argparse
 import collections
@@ -192,6 +195,11 @@ def main():
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--control", action="store_true", help="fold in the `then` arm only; any output change against --base fails")
     ap.add_argument("--dump", help="write every row's classes as JSON lines to this file")
+    ap.add_argument(
+        "--jq-gate",
+        action="store_true",
+        help="also fail on any ACCEPT_WRONG or DIFF row of --bin against jq (the gate without --base, #5552)",
+    )
     args = ap.parse_args()
     if args.control and not args.base:
         ap.error("--control compares against --base: pass a reference build")
@@ -279,9 +287,15 @@ def main():
             ("WRONG ANSWER CHANGED", rewritten),
         ]
         failed = failed or bool(lost or newly or silenced)
-    else:
+    elif not args.jq_gate:
         print(f"ACCEPT_WRONG: {sum(r['cls'] == 'ACCEPT_WRONG' for r in out)} (pass --base to judge a change)")
         sections.append(("ACCEPT_WRONG", [r for r in out if r["cls"] == "ACCEPT_WRONG"]))
+    if args.jq_gate:
+        # No residual is documented, so against jq alone a wrong answer is never expected.
+        wrong = [r for r in out if r["cls"] in ("ACCEPT_WRONG", "DIFF")]
+        print(f"ACCEPT_WRONG or DIFF against jq (--jq-gate): {len(wrong)}")
+        sections.append(("WRONG", wrong))
+        failed = failed or bool(wrong)
     for title, section in sections:
         for r in section[: args.show]:
             print(f"{title} {r['name']} [{r['cls']}]\n   {r['prog']}\n   in={r['doc']} jq={r['oracle']} build={r['cand']} base={r['base']}")

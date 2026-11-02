@@ -199,6 +199,14 @@ script = "scripts/jq-fold-source-alt-chain-sweep.py"
 args = ["--bin", "{subject}", "--jq", "{jq}"]
 timeout_s = 300
 
+# `--jq-gate`: without `--base` this sweep fails only on a timeout; the flag fails it on any wrong
+# answer against jq too. The default 40,000-row sample of the 7.9M-row product, under a fixed seed.
+[[sweep]]
+id = "foreach-update-if-arm"
+script = "scripts/jq-foreach-update-if-arm-sweep.py"
+args = ["--bin", "{subject}", "--jq", "{jq}", "--jq-gate"]
+timeout_s = 1200
+
 [[sweep]]
 id = "libm"
 script = "scripts/jq-libm-oracle-sweep.sh"
@@ -222,6 +230,21 @@ id = "nested-fold-outer-var"
 script = "scripts/jq-nested-fold-outer-var-sweep.py"
 args = ["--bin", "{subject}", "--jq", "{jq}"]
 timeout_s = 600
+
+# `--jq-gate`, as for foreach-update-if-arm. Every 4th row of the 108,864-row grid: the whole grid is
+# all MATCH and takes about 7.5 minutes on an M4 Pro, the sample about 1.5.
+[[sweep]]
+id = "reduce-update-bind"
+script = "scripts/jq-reduce-update-bind-sweep.py"
+args = ["--bin", "{subject}", "--jq", "{jq}", "--jq-gate", "--sample", "4"]
+timeout_s = 1200
+
+# The same script's grid over `?//` chains (#4964): 145,152 rows, all MATCH, about 12 minutes whole.
+[[sweep]]
+id = "reduce-update-bind-alt"
+script = "scripts/jq-reduce-update-bind-sweep.py"
+args = ["--bin", "{subject}", "--jq", "{jq}", "--jq-gate", "--alt", "--sample", "8"]
+timeout_s = 1200
 
 [[sweep]]
 id = "seq"
