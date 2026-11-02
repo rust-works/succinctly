@@ -115496,10 +115496,16 @@ mod tests {
             "inside(\"aaaaa\")",
             "inside(\"\u{e9}\")",
         ];
+        // `test` is the `regex` feature's; without it the door has no arm for it.
+        let shapes: Vec<&str> = shapes
+            .into_iter()
+            .filter(|src| cfg!(feature = "regex") || !src.contains("test("))
+            .collect();
         let mut answered = 0;
         for text in strings {
             let value = OwnedValue::String(text.into());
-            for src in shapes {
+            for src in &shapes {
+                let src = *src;
                 let expr = parse(src).unwrap();
                 let fast = eval_owned_string_door::<JqSemantics>(&expr, &value)
                     .unwrap_or_else(|| panic!("{src:?} on {text:?} declined"));
