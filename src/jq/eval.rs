@@ -86341,6 +86341,16 @@ fn walk_impl<S: EvalSemantics>(
     walk_impl_at_depth::<S>(f, value, optional, 0)
 }
 
+/// Whether a control that `walk`'s object arm met on a member aborts the whole object.
+/// The arm is `map_values(w)`, which reads one output per member, so a control `w` raises
+/// after producing a value is never reached and the member keeps that value (#5794, the rule
+/// `first_output_only` states for `map_values` itself); a member with no value yet raises it.
+/// Both modes: real yq has no `walk` (its lexer rejects it), so under `--jq-extensions` it
+/// means what jq defines.
+fn walk_member_raises(member_values: &[OwnedValue]) -> bool {
+    member_values.is_empty()
+}
+
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH)
 /// levels of nesting (#1021, following #1005's precedent).
 fn walk_impl_at_depth<S: EvalSemantics>(
@@ -86369,7 +86379,9 @@ fn walk_impl_at_depth<S: EvalSemantics>(
             for (k, v) in obj {
                 let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
                 if let Some(control) = control {
-                    return (Vec::new(), Some(control));
+                    if walk_member_raises(&vs) {
+                        return (Vec::new(), Some(control));
+                    }
                 }
                 match vs.into_iter().next() {
                     Some(new_v) => {
@@ -86387,7 +86399,9 @@ fn walk_impl_at_depth<S: EvalSemantics>(
             for (k, v) in obj {
                 let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
                 if let Some(control) = control {
-                    return (Vec::new(), Some(control));
+                    if walk_member_raises(&vs) {
+                        return (Vec::new(), Some(control));
+                    }
                 }
                 if let Some(new_v) = vs.into_iter().next() {
                     new_obj.insert(k, new_v);

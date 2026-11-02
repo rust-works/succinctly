@@ -13676,6 +13676,9 @@ It still evaluates `f` to its end before taking that value, so a side effect of 
 `debug` and `stderr` after the first output are the same, as is `input` (it consumes a document jq leaves).
 `succinctly yq` raises the later error, as real yq does.
 Pinned by `test_map_values_object_ignores_a_halt_after_the_first_output_5791`.
+`walk(f)` on an object is `map_values(w)` in jq, so since [#5794](https://github.com/rust-works/succinctly/issues/5794) a member keeps the first output of its own subtree the same way, and has the same residual.
+`{"a":1} | walk((., halt_error))` prints `{"a":1}` and exits 5 in jq with `{"a":1}` on stderr; `succinctly jq` prints the same on stdout and writes `1` to stderr first, for the member's later output.
+`succinctly yq --jq-extensions` takes jq's rule here, since real yq has no `walk` to follow.
 
 ## Depends On
 
