@@ -7257,18 +7257,21 @@ A document cannot be that deep any more, so only a value the program builds reac
 Under `-C` the marker takes the color of the value it replaces, followed by a reset, as in jq.
 Before #5497 a value 257 to 383 levels deep printed in full.
 
-**Building.** succinctly still refuses a value more than 384 levels deep (`MAX_VALUE_TREE_DEPTH`), where jq's only limit is its C stack (`[.,.] | sort` segfaults at 100,000 levels, and `length` at 1,000,000).
-Since [#5554](https://github.com/rust-works/succinctly/issues/5554) the output is not where it refuses: a value the program builds past 384 levels and hands to the CLI's output is printed as jq prints it, 256 levels and then the marker, in jq mode.
-`reduce range(1000) as $i ([]; .[0] = .)` and `1, setpath([range(400)|0]; 1), 7` print as in jq on every route and flag (compact, pretty, `--tab`/`--indent`, `-S`, `-C`, `-a`, `-r`, `--seq`, `-e`, `--slurp`).
-What still refuses is the program that builds or consumes such a value through the re-index bridge: a fold step with no owned door, `[., 1]` around it, a comma after it, `error`, `halt_error`, `debug`, `stderr` or `first`.
-`reduce`/`foreach` re-index their accumulator on every step and refuse one past 384 levels whatever the program does next.
-`tojson`/`tostring`/interpolation (and `@json`/`@text`) used to materialize a value past 384 levels before writing it, so the marker did not help them there.
-Since [#5554](https://github.com/rust-works/succinctly/issues/5554) a pipe whose first stage only renders its input as text answers a value the re-index bridge refused from the tree, with the marker where jq puts it: `def f(n): if n == 0 then 0 else [f(n-1)] end; f(1000) | tojson | length` is `533`, as in jq.
-Only a refusal asks for that, so a value under the limit reads as before, and it is jq mode only.
-A leading `( … | … )` group is read as its stages, and a consumer that stops early (`first`, `limit`, `isempty`) stops the rest too.
-The stage also answers under `try`/`?` (a text stage cannot fail), as the source of an `as` whose body never reads `.` (`f(400) | tojson as $x | $x | length`), and as a format-prefixed interpolation (`@json "x\(.)"`).
-The same stage inside a comma, `map`, a `?` that guards a longer pipe, or an iteration of an array that is itself too deep still reads the refusal, and so does an uncaught `error` of a deep value, which jq prints through the same writer.
-ADR-0025's stack floor relies on that bound for the walks over a built value between its checks, so lifting it is a design of its own; see "Recursive `def`s" below for the shapes that reach it.
+**Building.** jq's only limit on a value the program builds is its C stack (`[.,.] | sort` segfaults at 100,000 levels, and `length` at 1,000,000).
+succinctly refused such a value past 384 levels (`MAX_VALUE_TREE_DEPTH`) wherever it was re-indexed or walked, which in practice meant nearly every consumer.
+Since [#5554](https://github.com/rust-works/succinctly/issues/5554) a walk over a built value that is past 384 levels checks ADR-0025's native-stack floor once per level instead of refusing, in jq mode.
+A value is then refused only where the walk has spent half the evaluation thread's stack.
+Every row of #5554's table answers as jq 1.7.1 does, byte for byte: `reduce range(500) as $i (0; [.]) | length` is `1`, `reduce range(400) as $i (0; [.]) | flatten` is `[0]`, and `def f(n): if n == 0 then 0 else [f(n-1)] end; f(400) | tojson | length` is `533`.
+So do the consumers that used to refuse inside the evaluator: `[., 1]`, a comma after the value, `first`, `map(tojson)`, `.[] | tojson` over an array of them, `@json "\(tojson)"`, `error`, `halt_error`, `debug`, `stderr`, `sort`, `==`, `walk`, `paths`, `tostream`, `getpath`, `del` and `|=`.
+A value handed to the CLI's output prints as jq prints it, 256 levels and then the marker, in jq mode (#5780); `tojson`, `tostring`, interpolation and `@json`/`@text` stop at the same depth.
+Past the floor the walk refuses with `nesting depth exceeds limit of the native stack` at exit 5, uncatchable, where jq has long since segfaulted.
+On the 256 MiB release thread the re-index bridge refuses between about 697,000 and 699,500 levels (Apple Silicon); a walk with heavier frames (`walk(.)`, `flatten`) refuses sooner, and a debug build or x86_64 at depths of their own.
+The text stage of #5598/#5743 stays as the fallback there: a pipe whose first stage only renders its input as text (`tojson`, `tostring`, `"\(.)"`) answers from the tree even past the floor.
+Two costs remain.
+A fold whose step has no owned door (`reduce range(N) as $i (0; [.])`, `{a: .}`) re-indexes the whole accumulator on every step, so it is quadratic where jq is linear; it used to refuse at 385 levels instead.
+`.[0] = .` has an owned door and stays linear.
+`paths`, `tostream` and `[path(..)]` over a value hundreds of thousands of levels deep build output quadratic in its depth, as jq's would, and need the memory for it.
+`succinctly yq` still refuses a value past 384 levels: its emitters were tuned against that bound and are not covered by the floor yet.
 
 ### Before #5497
 
@@ -8185,7 +8188,8 @@ Three differences remain, none of which aborts the process:
   limit.** `def deep(m): if m == 0 then . else [[…]]deep(m-1)[[…]] end; deep(60)` builds
   1,200 levels; jq prints it, and so does succinctly since #5554 (the output check that
   reported `nesting depth exceeds limit of 384` and exited 5 is gone in jq mode; see Printing
-  above). Before #1371 this shape could not recurse far enough to reach the ceiling at
+  above).
+  Since #5554 `succinctly jq` also bounds every other walk over such a value by the native-stack floor rather than by 384 (see Building above); the history below is of the 384 guard, which `succinctly yq` and an unregistered library thread still have. Before #1371 this shape could not recurse far enough to reach the ceiling at
   all. Between f2789080a (2026-08-29) and #3261, the guard's most commonly reached call
   site -- `reduce`/`foreach`'s own per-iteration reindex bridge
   (`OwnedValue::to_json_for_reindex`), which every ordinary evaluation of this shape
@@ -8219,6 +8223,7 @@ Three differences remain, none of which aborts the process:
   `reduce f as $x ([]; . + [$x])` and `.x = $x` joined it in [#5540](https://github.com/rust-works/succinctly/issues/5540); the spellings listed under "Still different" in the shared-fold section still splice.
   They exited 101 with a raw panic; the three CLI routes and the library's `jq::eval` now catch exactly that panic.
   The CLI reports `nesting depth exceeds limit of 384` at exit 5, the same refusal `reduce` gives.
+  Since [#5554](https://github.com/rust-works/succinctly/issues/5554) `succinctly jq` asserts the native-stack floor there instead of the constant (see "Building" under "Nesting depth" above), so these programs answer as jq does, and past the floor the net reports `nesting depth exceeds limit of the native stack` at exit 5.
   `jq::eval` returns it as a `resource_limit` error.
   As with the yq net, it is a `catch_unwind` net and so ends the evaluation, not an error a `try` could see.
   jq prints all of these values (`1` for each of the four programs in `tests/jq_cli/i5526.rs`).
