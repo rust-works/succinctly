@@ -65,7 +65,8 @@ fn a_program_reading_inputs_without_null_input_answers_as_jq_5855() -> Result<()
 #[test]
 fn a_program_that_halts_on_the_first_document_leaves_the_rest_unread_5855() -> Result<()> {
     let stream = "1\n2\n3\n";
-    let (stdout, stderr, code) = run_jq_full(&["-c", "[., input_line_number] | halt"], Some(stream))?;
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[., input_line_number] | halt"], Some(stream))?;
     assert_eq!((stdout.as_str(), stderr.as_str(), code), ("", "", 0));
     let (stdout, _, code) = run_jq_full(&["-c", ". , halt"], Some(stream))?;
     assert_eq!((stdout.as_str(), code), ("1\n", 0));
