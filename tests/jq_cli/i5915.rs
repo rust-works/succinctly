@@ -34,6 +34,25 @@ fn a_bad_computed_key_waits_for_a_value_as_in_jq_5915() -> Result<()> {
             "\"null\"\n",
             0,
         ),
+        (
+            r#"{"n":1} | try {(.n): .[0]} catch ."#,
+            "\"Cannot index object with number\"\n",
+            0,
+        ),
+        (
+            r#"{"n":1} | try {(.n): 2} catch ."#,
+            "\"Cannot use number (1) as object key\"\n",
+            0,
+        ),
+        (r#"{"n":1} | try {(.n): .[0]?} catch ."#, "", 0),
+        (r#"{"n":1} | {(.n): (1,2)}"#, "", 5),
+        (r#"{"n":1} | [limit(3; {(.n): (1,2)})]"#, "", 5),
+        (
+            r#"{"n":1} | try {(.n, "a"): error("v")} catch ."#,
+            "\"v\"\n",
+            0,
+        ),
+        (r#"{"n":1} | try {(.n): error("v")} catch ."#, "\"v\"\n", 0),
     ] {
         let (stdout, _, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!((stdout.as_str(), code), (want, want_code), "{filter}");
