@@ -318,3 +318,62 @@ fn test_5754_strptime_epoch_seconds_reach_local_time_after_the_fields() -> Resul
         ),
     ])
 }
+
+/// `$program` with `-n` under `TZ=zone`: compact stdout and the exit code.
+fn run_in_zone(zone: &str, program: &str) -> Result<(String, i32)> {
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.env("TZ", zone).args(["jq", "-nc", program]);
+            command
+        },
+        None,
+    )?;
+    Ok((String::from_utf8(output.stdout)?, code))
+}
+
+/// #5754: `tzname` is process state in jq's libc: every `localtime_r` renames the slot of the
+/// converted instant's kind (standard or daylight) after its abbreviation, so `%Z` takes the names
+/// of the instants converted last. `localtime`, `strflocaltime` of a number and `strptime`'s own
+/// `GMT` and `%s` conversion are such conversions; `strflocaltime` of an array is not. Honolulu's
+/// fresh daylight name is `HPT` (1945); after converting an instant of its 1942-45 war time it is
+/// `HWT`. Every row is a tz history no tz database release changes.
+#[test]
+fn test_5754_strptime_zone_names_follow_the_last_local_conversion() -> Result<()> {
+    for (zone, program, want) in [
+        (
+            "Pacific/Honolulu",
+            r#"("1943-03-05 10:00 HPT","1943-03-05 10:00 HWT") | try strptime("%F %R %Z") catch "no match""#,
+            "[1943,2,5,10,0,0,5,63]\n\"no match\"\n",
+        ),
+        (
+            "Pacific/Honolulu",
+            r#"("1943-03-05 10:00 GMT","1943-03-05 10:00 HPT","1943-03-05 10:00 HWT") | try strptime("%F %R %Z") catch "no match""#,
+            "[1943,2,5,0,30,0,5,63]\n\"no match\"\n[1943,2,5,10,0,0,5,63]\n",
+        ),
+        (
+            "Pacific/Honolulu",
+            r#"(-800000000 | localtime | empty), ("1 HWT" | try strptime("%s %Z") catch "no match")"#,
+            "[1969,11,31,14,0,1,3,364]\n",
+        ),
+        (
+            "Pacific/Honolulu",
+            r#"(-800000000 | strflocaltime("%H") | empty), ("1 HWT" | try strptime("%s %Z") catch "no match")"#,
+            "[1969,11,31,14,0,1,3,364]\n",
+        ),
+        (
+            "Pacific/Honolulu",
+            r#"([1943,2,5,0,0,0,0,0] | strflocaltime("%H") | empty), ("1 HWT" | try strptime("%s %Z") catch "no match")"#,
+            "\"no match\"\n",
+        ),
+        (
+            "",
+            r#"(0 | localtime | empty), ("2015-03-05 UTC" | try strptime("%F %Z") catch "no match")"#,
+            "[2015,2,5,0,0,0,4,63]\n",
+        ),
+    ] {
+        let (got, code) = run_in_zone(zone, program)?;
+        assert_eq!((got.as_str(), code), (want, 0), "TZ={zone:?} {program}");
+    }
+    Ok(())
+}

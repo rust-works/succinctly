@@ -89,10 +89,12 @@ pub(crate) fn named_at(name: &str, utc_secs: i64) -> Option<LocalZone> {
     backend::named_at(name, utc_secs)
 }
 
-/// The local zone's standard and daylight-time names as C's `tzset` leaves them in `tzname`,
-/// the names `strptime`'s `%Z` accepts besides `GMT` (#5754): the abbreviation of the latest
-/// standard and of the latest daylight-time period the zone has had, `None` for a kind it never
-/// had. `Pacific/Honolulu` is `HST` and `HPT` (its 1945 daylight time), not `HDT`;
+/// The local zone's standard and daylight-time names as the pin's libc holds them in `tzname`,
+/// the names `strptime`'s `%Z` accepts besides `GMT` (#5754). `tzset` starts them at the
+/// abbreviation of the latest standard and of the latest daylight-time period the zone has had
+/// (`None` for a kind it never had), and each conversion to local time ([`offset_at`],
+/// [`at_instant`]) renames the slot of its instant's kind after that instant's abbreviation, as
+/// `localtime_r` does. `Pacific/Honolulu` is `HST` and `HPT` (its 1945 daylight time), not `HDT`;
 /// `Australia/Brisbane` keeps `AEDT` from before 1992.
 pub(crate) fn tzname() -> [Option<String>; 2] {
     backend::tzname()
@@ -197,11 +199,18 @@ mod backend_jiff {
     }
 
     pub(super) fn offset_at(utc_secs: i64) -> i64 {
-        offset_in(system(), utc_secs)
+        let info = system().to_offset_info(timestamp(utc_secs));
+        note_conversion(info.dst().is_dst(), info.abbreviation());
+        i64::from(info.offset().seconds())
     }
 
     pub(super) fn at_instant(utc_secs: i64) -> LocalZone {
-        zone_in(system(), utc_secs)
+        let info = system().to_offset_info(timestamp(utc_secs));
+        note_conversion(info.dst().is_dst(), info.abbreviation());
+        LocalZone {
+            offset_secs: i64::from(info.offset().seconds()),
+            name: info.abbreviation().to_string(),
+        }
     }
 
     pub(super) fn named_at(name: &str, utc_secs: i64) -> Option<LocalZone> {
@@ -212,16 +221,38 @@ mod backend_jiff {
     /// An empty `TZ` is UTC, but the pin's libc loads it without setting `tzname`, so `%Z`
     /// takes no name there but `GMT` (`UTC` is no match, though `strflocaltime` prints it).
     pub(super) fn tzname() -> [Option<alloc::string::String>; 2] {
-        static NAMES: OnceLock<[Option<alloc::string::String>; 2]> = OnceLock::new();
-        NAMES
-            .get_or_init(|| {
-                if std::env::var_os("TZ").is_some_and(|tz| tz.is_empty()) {
-                    [None, None]
-                } else {
-                    tzname_in(system())
-                }
-            })
-            .clone()
+        with_tzname(|names| names.clone())
+    }
+
+    /// `tzname` is process state in the pin's libc: `tzset` fills it, and every `localtime_r`
+    /// renames the slot of the converted instant's kind after its abbreviation, so a `%Z` read
+    /// after `localtime`, after `strflocaltime` of a number or after a `GMT` or `%s` conversion
+    /// takes the names of the instants converted last (#5754). [`offset_at`] and [`at_instant`]
+    /// are those conversions here.
+    static TZNAME: std::sync::Mutex<Option<[Option<alloc::string::String>; 2]>> =
+        std::sync::Mutex::new(None);
+
+    fn with_tzname<R>(f: impl FnOnce(&mut [Option<alloc::string::String>; 2]) -> R) -> R {
+        let mut guard = TZNAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let names = guard.get_or_insert_with(|| {
+            if std::env::var_os("TZ").is_some_and(|tz| tz.is_empty()) {
+                [None, None]
+            } else {
+                tzname_in(system())
+            }
+        });
+        f(names)
+    }
+
+    fn note_conversion(is_dst: bool, abbreviation: &str) {
+        with_tzname(|names| {
+            let slot = &mut names[usize::from(is_dst)];
+            if slot.as_deref() != Some(abbreviation) {
+                *slot = Some(abbreviation.to_string());
+            }
+        });
     }
 
     /// `tzset` names each kind after the last period of it in the zone's tz file, so the
@@ -280,6 +311,7 @@ mod backend_jiff {
         Timestamp::from_second(utc_secs - cycles * CYCLE_SECS).unwrap_or(Timestamp::MAX)
     }
 
+    #[cfg(test)]
     fn offset_in(tz: &TimeZone, utc_secs: i64) -> i64 {
         i64::from(tz.to_offset(timestamp(utc_secs)).seconds())
     }
