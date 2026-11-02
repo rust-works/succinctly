@@ -11858,7 +11858,75 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
     if owned_swallowing_boundary::<S>(expr, input) {
         return Some(Flow::Exhausted);
     }
+    // #5840: a program that answers nothing for any input needs no input read at all.
+    if S::TAG == EvalTag::Jq && owned_answers_nothing(expr) {
+        return Some(Flow::Exhausted);
+    }
+    // #5840: `.k // empty` is `select(.k)` that emits the value it read.
+    // Not under an embed table, as [`owned_select_door`]: a read that stands on an embedded node is
+    // [`embed_peel_step`]'s to answer.
+    if S::TAG == EvalTag::Jq && !super::eval_generic::embed_table_active() {
+        if let Some(flow) = owned_alternative_to_empty::<S>(expr, input, sink) {
+            return Some(flow);
+        }
+    }
     None
+}
+
+/// Whether `expr` produces no output whatever its input is: `empty`, `error(lit)?` and a pipe
+/// that starts with either (#5840).
+///
+/// The first such stage ends the pipe before a later stage is run, so nothing behind it is
+/// evaluated: not for its output, not for an error, as in jq (`empty | error("x")` is empty). A
+/// stage that merely contains one (`1, empty`) is not this function's. `error` is taken only
+/// with no argument or a literal one, since an argument is itself evaluated first and may
+/// raise, or read `input`, before the `?` suppresses it.
+fn owned_answers_nothing(expr: &Expr) -> bool {
+    match unwrap_paren(expr) {
+        Expr::Builtin(Builtin::Empty) => true,
+        Expr::Try { expr, catch: None } | Expr::Optional(expr) => match unwrap_paren(expr) {
+            Expr::Error(None) => true,
+            Expr::Error(Some(arg)) => matches!(unwrap_paren(arg), Expr::Literal(_)),
+            _ => false,
+        },
+        Expr::Pipe(stages) => match skip_identity_stages(stages) {
+            [first, ..] => owned_answers_nothing(first),
+            [] => false,
+        },
+        _ => false,
+    }
+}
+
+/// `.k // empty` and `.[n] // empty` over an owned container (#5840): the value read when it is
+/// truthy, nothing when it is `null` or `false`. `None` when the shape is another, or when the read
+/// does not answer a value, so the bridge keeps its diagnostics.
+///
+/// `//` keeps the truthy outputs of its left side and falls through to the right only when there is
+/// none, and the right is `empty`: one read, one truthiness test. A read that raises is not taken
+/// (`//` suppresses the error, a case the bridge settles).
+fn owned_alternative_to_empty<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    let Expr::Alternative(left, right) = unwrap_paren(expr) else {
+        return None;
+    };
+    if !matches!(unwrap_paren(right), Expr::Builtin(Builtin::Empty)) {
+        return None;
+    }
+    let left = unwrap_paren(left);
+    if !matches!(left, Expr::Field(_) | Expr::Index { .. }) {
+        return None;
+    }
+    match eval_owned_navigation::<S>(left, input, false)? {
+        Ok(Some(value)) if value.is_truthy() => Some(match sink(value) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        }),
+        Ok(Some(_)) => Some(Flow::Exhausted),
+        _ => None,
+    }
 }
 
 /// The one stage `rest` is made of, if it is a plain one: the stage the front
@@ -12515,7 +12583,7 @@ fn owned_select_door<S: EvalSemantics>(
     // the settled ones are truthy, so `input` reaches it unchanged.
     let mut peeled = false;
     while let [first, tail @ ..] = stages {
-        let Expr::Builtin(Builtin::Select(cond)) = unwrap_paren(first) else {
+        let Some((cond, inverted)) = select_like::<S>(first) else {
             break;
         };
         // `optional` is gated at the top, so the verdict is the shared one
@@ -12523,7 +12591,7 @@ fn owned_select_door<S: EvalSemantics>(
         let Some(verdict) = owned_cond_verdict::<S>(cond, input, false) else {
             break;
         };
-        match verdict {
+        match verdict.map(|truthy| truthy != inverted) {
             Ok(true) => {}
             Ok(false) => return Some(Flow::Exhausted),
             Err(error) => return Some(Flow::Escaped(Control::Error(error))),
@@ -12550,6 +12618,33 @@ fn owned_select_door<S: EvalSemantics>(
         });
     }
     Some(RestPipe::new(stages).run_owned::<S>(input, optional, Reentry::REBUILT, sink))
+}
+
+/// The condition of a stage [`owned_select_door`] settles, and whether it keeps the input when the
+/// condition is falsy rather than truthy: `select(c)`, and in jq mode its definition spelled out
+/// (#5840), `if c then . else empty end` and `if c then empty else . end`.
+///
+/// jq defines `select(f)` as exactly that conditional, so the spellings are one stage, a condition
+/// with several outputs included (the verdict declines those). Under `--stream` and `-R` a program
+/// written the long way took the bridge for every input, where `select` did not.
+fn select_like<S: EvalSemantics>(stage: &Expr) -> Option<(&Expr, bool)> {
+    match unwrap_paren(stage) {
+        Expr::Builtin(Builtin::Select(cond)) => Some((cond, false)),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } if S::TAG == EvalTag::Jq => {
+            let then_branch = unwrap_paren(then_branch);
+            let else_branch = unwrap_paren(else_branch);
+            match (then_branch, else_branch) {
+                (Expr::Identity, Expr::Builtin(Builtin::Empty)) => Some((cond, false)),
+                (Expr::Builtin(Builtin::Empty), Expr::Identity) => Some((cond, true)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// A first stage [`projection_peel`] navigates natively without asking the
@@ -139453,6 +139548,77 @@ mod tests {
         assert!(
             matches!((&out[0], &deep), (OwnedValue::Array(a), OwnedValue::Array(b)) if a.ptr_eq(b))
         );
+    }
+
+    /// #5840: a program that answers nothing (`empty`, `error("x")?`, a pipe that starts with
+    /// one), `select`'s definition spelled out as an `if`, and `.k // empty` never reach the bridge.
+    /// An input past `MAX_VALUE_TREE_DEPTH` is the probe the test above uses: the bridge refuses it,
+    /// so [`eval_each_owned_answered`] answering (rather than declining to the caller) and the right
+    /// outputs say the program was answered from the tree. The pin must be able to fail: it does,
+    /// with the `owned_answers_nothing` door and `select_like`'s `If` arms removed.
+    #[test]
+    fn empty_and_select_spelled_as_if_skip_the_bridge_5840() {
+        let mut deep = OwnedValue::Null;
+        for _ in 0..crate::jq::value::MAX_VALUE_TREE_DEPTH {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        let run = |src: &str, input: &OwnedValue| -> Option<Vec<OwnedValue>> {
+            let expr = parse(src).unwrap();
+            let mut out = Vec::new();
+            let flow = eval_each_owned_answered::<JqSemantics>(
+                &expr,
+                input,
+                false,
+                Reentry::REBUILT,
+                &mut |v| {
+                    out.push(v);
+                    Demand::Continue
+                },
+            )?;
+            assert!(matches!(flow, Flow::Exhausted), "{src}");
+            Some(out)
+        };
+        for (src, outputs) in [
+            ("empty", 0),
+            ("(empty)", 0),
+            (". | empty", 0),
+            ("empty | error(\"x\")", 0),
+            ("empty | 1, 2", 0),
+            ("error(\"x\")?", 0),
+            ("error?", 0),
+            ("try error(null)", 0),
+            ("if length == 2 then . else empty end", 0),
+            ("if length == 1 then . else empty end", 1),
+            ("if length == 1 then empty else . end", 0),
+            ("if length == 2 then empty else . end", 1),
+            ("select(length == 1) | select(length == 1)", 1),
+            ("if length == 1 then . else empty end | length", 1),
+            (".[0] // empty", 1),
+            (".[1] // empty", 0),
+        ] {
+            let got = run(src, &deep).unwrap_or_else(|| panic!("{src} took the bridge"));
+            assert_eq!(got.len(), outputs, "{src}");
+        }
+        // A condition or a read the tree cannot answer, a fan-out, a handler or an argument that
+        // is computed still go to the bridge, which answers them as before.
+        for src in [
+            "if (length, 2) == 1 then . else empty end",
+            "if length == 1 then . else 2 end",
+            "if length == 1 then 1 else empty end",
+            "error(.)?",
+            "try error(\"x\") catch empty",
+            "1, empty",
+            ".[0] // 3",
+            "(.[0], .[1]) // empty",
+        ] {
+            assert!(run(src, &deep).is_none(), "{src} should decline");
+        }
+        // `//` falls through on null and false, and keeps a truthy read.
+        let falsy = OwnedValue::array_from(vec![OwnedValue::Bool(false), OwnedValue::Int(3)]);
+        let got = run(".[0] // empty", &falsy).unwrap();
+        assert_eq!(got.len(), 0);
+        let got = run(".[1] // empty", &falsy).unwrap();
+        assert_eq!(got, vec![OwnedValue::Int(3)]);
     }
 
     /// `eval_owned_pure` is shared with `closed_expr_to_owned` and the
