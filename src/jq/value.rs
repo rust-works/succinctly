@@ -2220,7 +2220,7 @@ macro_rules! note_forced_copy {
 ///
 /// Not part of the supported API: `#[doc(hidden)]`, and
 /// [`detach_children`](Self::detach_children) empties the value it is called
-/// on, which is only sound for a value that is about to be dropped.
+/// on, which is only correct for a value that is about to be dropped.
 #[doc(hidden)]
 pub trait Teardown: Sized {
     /// Whether dropping a container of `Self` runs the iterative teardown.
