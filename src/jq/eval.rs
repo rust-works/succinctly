@@ -164299,8 +164299,10 @@ mod touched_edge_cases_2999 {
                 let index = JsonIndex::build(json);
                 // A fold accumulator re-indexed on every step is still refused (#5554); a loop
                 // variable handed on as itself is not (`last(f)` since #5516, `. + [$x]` since
-                // #5540), and answers as jq does.
-                let program = "reduce range(500) as $i (0; [.]) | length";
+                // #5540), and answers as jq does. `[.]` is built on the moved accumulator now
+                // (#5875), so the step is one the owned route declines: `empty` is not a closed
+                // member, and `[., empty]` is `[.]` to jq.
+                let program = "reduce range(500) as $i (0; [., empty]) | length";
                 let expr = parse(program).expect("parse");
                 let result = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
                 let refused = matches!(
