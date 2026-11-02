@@ -35,10 +35,11 @@ pub struct Entry {
     /// `std::env::consts::OS` this entry was observed on (`macos`, `linux`); an
     /// entry for another OS is neither expected nor called stale here.
     pub platform: Option<String>,
-    /// Whether the difference shows depends on the host's speed (a reference that
-    /// finishes a probe inside the deadline on a fast machine and not on a slow one):
-    /// the entry is expected wherever the difference shows, but is not called stale
-    /// where it does not.
+    /// Whether the difference shows depends on the host: its speed (a reference that
+    /// finishes a probe inside the deadline on a fast machine and not on a slow one), or
+    /// the locales it has installed (a probe under `de_DE` falls back to `C` on a host
+    /// without it): the entry is expected wherever the difference shows, but is not
+    /// called stale where it does not.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub volatile: bool,
 }
