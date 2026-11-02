@@ -326,6 +326,9 @@ fn test_fold_store_of_a_field_read_keeps_the_members_identity_5761() -> Result<(
         "[{\"items\":[nan]}] as $in | reduce $in[] as $r (null; . + $r.items) | . == $in[0].items",
         "[{\"n\":\"k\",\"items\":[nan]}] as $in | reduce $in[] as $r ({}; .[$r.n] = $r.items) | .k == $in[0].items",
         "[{\"items\":[nan]}] as $in | foreach $in[] as $r ({}; .a = $r.items; .a == $in[0].items)",
+        "[{\"items\":[nan]}] as $in | reduce $in[] as $r ({}; .a //= $r.items) | .a == $in[0].items",
+        "[{\"items\":[nan]}] as $in | reduce $in[] as $r ({}; .a |= $r.items) | .a == $in[0].items",
+        "[{\"items\":[nan]}] as $in | reduce $in[] as $r ({}; $r.items as $i | .a = $i) | .a == $in[0].items",
     ] {
         assert_eq!(answer(filter)?, "true\n", "{filter}");
     }

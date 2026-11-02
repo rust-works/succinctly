@@ -11974,6 +11974,11 @@ The shortcut fires only where `==` is handed two handles on one storage, so the 
 
 Still different:
 
+- **A field read through an `as` rebind of a fold's loop variable** ([#5761](https://github.com/rust-works/succinctly/issues/5761)).
+  `[{"items":[nan]}] as $in | reduce $in[] as $r ({}; $r as $s | .a = $s.items) | .a == $in[0].items` is `true` in jq and `false` here.
+  The stored member is rebuilt, because a binder's body does not take the fold's in-place step with the rebound name marked (the marker made `fold_assign_step_copies_nothing_3138` copy the accumulator on every step).
+  Reading the member before the rebind (`$r.items as $i | .a = $i`) and storing the whole variable (`$r as $s | .x = $s`) both match jq.
+  The comparison needs a NaN-bearing container to observe this.
 - **Slices.** `.[0:]` and any other full-range slice hand back the array itself, as jq's view
   does. An equal-bounds *partial* slice is a view onto the same storage in jq (pointer, offset
   and size all equal), so `.[0:1] == .[0:1]` is identical there; here each slice is a new
