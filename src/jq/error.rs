@@ -219,6 +219,10 @@ impl From<EvalEscape> for Control {
     }
 }
 
+/// The length in bytes from which jq leaves the key out of `Cannot index <type> with string`
+/// (#5817): a 29-byte key is quoted whole, a 30-byte one is not (jq 1.7.1, `[1] | .[$k]`).
+const LONG_INDEX_KEY: usize = 30;
+
 /// jq truncates values embedded in error messages to a fixed-width buffer
 /// (`jv_dump_string_trunc` with `char errbuf[15]`): a JSON dump of at most
 /// `DUMP_BUDGET` bytes is used verbatim, anything longer keeps its first
@@ -631,16 +635,14 @@ impl EvalError {
     /// key, `Cannot index <container> with <key type>`.
     ///
     /// jq embeds the key's text only when it is a string, and does not
-    /// truncate it. A slice reports its key as `object`, because jq models
+    /// truncate it, but leaves it out of a key of 30 bytes or more (#5817). A slice reports its key as `object`, because jq models
     /// `.[a:b]` as indexing with `{"start":a,"end":b}`.
     pub fn cannot_index(container_type: &str, key: &OwnedValue) -> Self {
         if let Some(err) = Self::unreadable_container(container_type) {
             return err;
         }
         match key {
-            OwnedValue::String(k) => {
-                Self::new(format!("Cannot index {container_type} with string \"{k}\""))
-            }
+            OwnedValue::String(k) => Self::cannot_index_with_field(container_type, k),
             other => Self::cannot_index_with_type(container_type, other.type_name()),
         }
     }
@@ -659,6 +661,10 @@ impl EvalError {
     pub fn cannot_index_with_field(container_type: &str, key: &str) -> Self {
         if let Some(err) = Self::unreadable_container(container_type) {
             return err;
+        }
+        // jq words a key of `LONG_INDEX_KEY` bytes or more without its text (#5817).
+        if key.len() >= LONG_INDEX_KEY {
+            return Self::new(format!("Cannot index {container_type} with string"));
         }
         Self::new(format!(
             "Cannot index {container_type} with string \"{key}\""
@@ -2181,6 +2187,29 @@ mod tests {
             EvalError::cannot_index("number", &s(key)).message,
             format!("Cannot index number with string \"{key}\"")
         );
+    }
+
+    /// #5817: a key of 30 bytes or more is left out of the message, counted in bytes (jq 1.7.1:
+    /// 29 `k` or 14 `\u{e9}` keep it, 30 `k` or 15 `\u{e9}` drop it).
+    #[test]
+    fn a_long_index_key_is_left_out_of_the_message_5817() {
+        for (key, kept) in [
+            ("k".repeat(29), true),
+            ("k".repeat(30), false),
+            ("\u{e9}".repeat(14), true),
+            ("\u{e9}".repeat(15), false),
+        ] {
+            let expected = if kept {
+                format!("Cannot index array with string \"{key}\"")
+            } else {
+                String::from("Cannot index array with string")
+            };
+            assert_eq!(EvalError::cannot_index("array", &s(&key)).message, expected);
+            assert_eq!(
+                EvalError::cannot_index_with_field("array", &key).message,
+                expected
+            );
+        }
     }
 
     /// The object-key refusal names the kind and previews the value, and the
