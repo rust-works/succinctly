@@ -93995,7 +93995,7 @@ pub fn seed_remaining_inputs_with_errors(
 pub fn seed_remaining_inputs_lazily(
     source: u32,
     count: usize,
-    materialize: Box<dyn FnMut(usize) -> (u32, Result<OwnedValue, EvalError>)>,
+    materialize: remaining_inputs::Materialize,
     exhausted: Option<(u32, u32)>,
 ) {
     remaining_inputs::seed_lazy(source, count, materialize, exhausted);

@@ -5786,7 +5786,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // program reads them. `inputs` is empty, and so is `locations`' line table: each
                 // document's line is counted when it is read, one forward pass over the text in
                 // all. No parse error is queued (the route is taken only without one).
-                debug_assert!(locations.per_value().is_empty());
+                debug_assert_eq!(locations.per_value(), &[]);
                 let count = lazy.spans.len();
                 let source = lazy.source;
                 // The counter's place in the text, kept between reads without a borrow of it.
@@ -6699,11 +6699,8 @@ fn get_inputs(
     // spans answer it without the strict scan (`EofTail::of_clean_source`), and the scan runs
     // only if the route turns the stream down, or here, over the bytes as read, for a stream
     // that is not UTF-8.
-    let lazy_candidate = records_eof
-        && json_input_mode
-        && args.null_input
-        && !args.stream
-        && raw_bytes.len() == 1;
+    let lazy_candidate =
+        records_eof && json_input_mode && args.null_input && !args.stream && raw_bytes.len() == 1;
     let mut eof_tail = (records_eof && !lazy_candidate).then(|| {
         let sources: Vec<&[u8]> = raw_bytes.iter().map(|(_, raw)| raw.as_slice()).collect();
         EofTail::of(&sources, args.raw_input, &seams, args.stream)
