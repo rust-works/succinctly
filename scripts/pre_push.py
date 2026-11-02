@@ -191,6 +191,17 @@ GATES = (
         env={"RUSTDOCFLAGS": "-D warnings"},
     ),
     Gate(
+        "rustdoc-simd-backends",
+        "full",
+        (
+            'source scripts/lib/clippy-variants.sh && cargo doc --no-deps --features "$CLIPPY_CORE_FEATURES"',
+        ),
+        (r'^cargo doc --no-deps --features "\$CLIPPY_CORE_FEATURES"$',),
+        paths=RUST_PATHS,
+        cost=4,
+        env={"RUSTDOCFLAGS": "-D warnings"},
+    ),
+    Gate(
         "no-default-features",
         "full",
         ("cargo test --no-default-features",),

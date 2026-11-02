@@ -1123,6 +1123,19 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+      # #5740: `--all-features` turns on `scalar-yaml` and `portable-popcount`, which compile out
+      # the x86_64 YAML SIMD backend and the AVX-512 popcount path, so the run above never sees
+      # their docs (two broken intra-doc links sat in that backend). The feature list is the
+      # clippy one (scripts/lib/clippy-variants.sh), which excludes both, so this x86_64 runner
+      # documents what a default build compiles.
+      - name: Build docs with the SIMD backends compiled in
+        if: needs.gate.outputs.code == 'true'
+        run: |
+          source scripts/lib/clippy-variants.sh
+          cargo doc --no-deps --features "$CLIPPY_CORE_FEATURES"
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   # Pull-request coverage: the sticky patch-coverage comment, diffed against the
   # baseline that coverage-baseline.yml published for the PR's merge-base. Only
   # `pull_request` runs it (#3649): a merge-group build has no PR to comment on

@@ -465,6 +465,15 @@ cargo clippy --all-targets --features std,simd,serde,cli,regex,bench-runner,larg
 cargo clippy --all-targets --features std,simd,broadword-yaml,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
 ```
 
+Rustdoc has the same blind spot, so CI's `Documentation` job runs it twice and the `rustdoc` and
+`rustdoc-simd-backends` pre-push gates mirror both (#5740). A broken intra-doc link in the x86_64 YAML
+backend is invisible to the `--all-features` run, which compiles that backend out:
+
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests
+```
+
 ### Documentation
 
 - All public items must have doc comments

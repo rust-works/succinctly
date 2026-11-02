@@ -568,7 +568,8 @@ CI works around but this repo's own docs don't all say consistently:
   any change touching `src/yaml/simd/*.rs` or `src/bits/popcount.rs`, run
   every invocation ci.yml runs for your architecture, not just
   `--all-features` — and see [docs/guides/developer.md](docs/guides/developer.md)'s
-  own Linting section, which now lists them too.
+  own Linting section, which now lists them too. Rustdoc runs twice for the same
+  reason (#5740).
 - **Pins gated out of the most-run build**: an exact-size or exact-behaviour
   pin describing the *shipped* shape has to be `#[cfg(not(feature = "…"))]`-gated
   so `cargo test --all-features` stays green, which makes the pin silently
