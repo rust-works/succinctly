@@ -666,7 +666,7 @@ impl Parser {
                 if !number_is_valid(token) {
                     return Err("Invalid numeric literal");
                 }
-                materialize(token)
+                fast_number(token)
             }
         };
         self.value(value)?;
@@ -721,6 +721,16 @@ impl Parser {
                 _ => return Err("Invalid escape"),
             }
         }
+        // The validation above passed. A string with no escape and valid UTF-8 is its own bytes, so
+        // it needs neither the checked document parser nor a quoted copy to hand it (#5498).
+        if !buf.contains(&b'\\') {
+            if let Ok(text) = core::str::from_utf8(buf) {
+                let value = OwnedValue::string(text);
+                self.value(value)?;
+                self.token_len = 0;
+                return Ok(());
+            }
+        }
         let mut quoted = Vec::with_capacity(self.token_len + 2);
         quoted.push(b'"');
         quoted.extend_from_slice(&self.token_buf[..self.token_len]);
@@ -729,6 +739,14 @@ impl Parser {
         self.token_len = 0;
         Ok(())
     }
+}
+
+/// The number a token spells, read as the document path reads it but without that path's index
+/// build and re-parse (#5498): the literal keeps its spelling, so `1.0`, `1e2` and `-0` print as
+/// they were written. Only a token whose text is a number to the document parser takes this; any
+/// other goes to [`materialize`], which decides what it is.
+fn fast_number(token: &[u8]) -> OwnedValue {
+    OwnedValue::from_number_bytes::<succinctly::jq::JqSemantics>(token)
 }
 
 /// The value a token spells, built by the checked document parser so that it reads exactly as the
@@ -761,6 +779,74 @@ mod tests {
     }
 
     /// #5635: the events a malformed document yielded before its fault, with the lines read.
+    /// The fast paths (#5498) must build what the checked document parser builds, to the literal:
+    /// a number keeps its spelling, a string its decoded text.
+    #[test]
+    fn the_scalar_fast_paths_agree_with_the_document_parser_5498() {
+        let numbers = [
+            "0",
+            "-0",
+            "1",
+            "-1",
+            "9",
+            "10",
+            "007",
+            "-007",
+            "00",
+            "1.0",
+            "1e2",
+            "-1E+2",
+            "0.5",
+            ".5",
+            "-.5",
+            "1.",
+            "1.50",
+            "0e0",
+            "1e400",
+            "-1e400",
+            "1E-400",
+            "123456789012345678",
+            "-123456789012345678",
+            "1234567890123456789",
+            "9223372036854775807",
+            "9223372036854775808",
+            "-9223372036854775808",
+            "100000000000000000000",
+            "0.1e1",
+            "1e5",
+            "1e-5",
+            "12345678901234567890.5",
+        ];
+        for text in numbers {
+            if !number_is_valid(text.as_bytes()) {
+                continue;
+            }
+            let (fast, slow) = (fast_number(text.as_bytes()), materialize(text.as_bytes()));
+            assert_eq!(fast.to_json(), slow.to_json(), "{text}");
+            assert_eq!(
+                core::mem::discriminant(&fast),
+                core::mem::discriminant(&slow),
+                "{text}"
+            );
+            assert_eq!(fast.number_str(), slow.number_str(), "{text}");
+        }
+        for input in [
+            "\"\"",
+            "\"abc\"",
+            "\"h\u{e9}llo \u{1F600}\"",
+            "\"a b\"",
+            "\"\\n\"",
+            "\"\\u00e9\"",
+            "\"\\ud83d\\ude00\"",
+            "\"\\\"\"",
+        ] {
+            let inner = &input[1..input.len() - 1];
+            let events = run(&format!("[{input}]"));
+            let expected = materialize(input.as_bytes()).to_json();
+            assert_eq!(events[0], format!("[[0],{expected}]"), "{inner}");
+        }
+    }
+
     #[test]
     fn events_before_fault_stop_at_the_first_error_5635() {
         let row = |event: &str, lines| (event.to_string(), lines);
