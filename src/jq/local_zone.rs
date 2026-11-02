@@ -389,7 +389,7 @@ mod backend_jiff {
         /// with no daylight time has none of the second kind.
         #[test]
         fn tzname_is_the_latest_standard_and_daylight_name() {
-            let names = |tz: &TimeZone| tzname_in(tz).map(|name| name.unwrap_or_default());
+            let names = |tz: &TimeZone| tzname_in(tz).map(Option::unwrap_or_default);
             assert_eq!(names(&new_york()), ["EST", "EDT"]);
             assert_eq!(names(&TimeZone::posix("XYZ3").unwrap()), ["XYZ", ""]);
             assert_eq!(names(&TimeZone::UTC), ["UTC", ""]);
