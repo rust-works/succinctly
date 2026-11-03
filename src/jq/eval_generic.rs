@@ -32904,7 +32904,10 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
         // values (`[recurse(.[]?) | (path, key)]` against `[.. | (path, key)]`).
         Expr::RecursiveDescent
         | Expr::Builtin(
-            Builtin::Recurse | Builtin::RecurseDown | Builtin::RecurseF(_) | Builtin::RecurseCond(..),
+            Builtin::Recurse
+            | Builtin::RecurseDown
+            | Builtin::RecurseF(_)
+            | Builtin::RecurseCond(..),
         ) => incoming,
         Expr::Break(_)
         | Expr::Error(_)

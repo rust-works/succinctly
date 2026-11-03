@@ -22,7 +22,11 @@ fn a_union_after_the_walk_is_branch_major_as_in_yq() -> Result<()> {
     // yq: `[.. | (path, key)]`
     let want = r#"[[],["a"],["a","b"],"a","b"]"#;
     for walk in ["..", "recurse(.[]?; true)", "recurse(.[]?)", "recurse"] {
-        assert_eq!(json(&format!("[{walk} | (path, key)]"), NESTED)?, want, "{walk}");
+        assert_eq!(
+            json(&format!("[{walk} | (path, key)]"), NESTED)?,
+            want,
+            "{walk}"
+        );
     }
     Ok(())
 }
@@ -32,7 +36,11 @@ fn a_navigation_stage_before_a_position_reader_sees_the_real_nodes() -> Result<(
     // yq: `[.. | select(type == "!!map") | .x | select(. != null) | path]` reaches the anchor only.
     let tail = r#"select(type == "!!map") | .x | select(. != null) | path"#;
     for walk in ["..", "recurse(.[]?; true)", "recurse(.[]?)"] {
-        assert_eq!(json(&format!("[{walk} | {tail}]"), SHARED)?, r#"[["a","x"]]"#, "{walk}");
+        assert_eq!(
+            json(&format!("[{walk} | {tail}]"), SHARED)?,
+            r#"[["a","x"]]"#,
+            "{walk}"
+        );
     }
     Ok(())
 }
@@ -79,11 +87,17 @@ fn path_of_a_gated_walk_reads_the_nodes_tag_as_the_value_walk_does() -> Result<(
     let doc = "ak: !!binary aGVsbG8=\nb: 1\n";
     let want = r#"["","ak"]"#;
     assert_eq!(
-        json(r#"[path(recurse(.[]?; type == "!!binary")) | join(".")]"#, doc)?,
+        json(
+            r#"[path(recurse(.[]?; type == "!!binary")) | join(".")]"#,
+            doc
+        )?,
         want
     );
     assert_eq!(
-        json(r#"[recurse(.[]?; type == "!!binary") | path | join(".")]"#, doc)?,
+        json(
+            r#"[recurse(.[]?; type == "!!binary") | path | join(".")]"#,
+            doc
+        )?,
         want
     );
     Ok(())
@@ -94,7 +108,10 @@ fn a_consumers_stop_ends_the_gated_walk_before_a_later_siblings_cond() -> Result
     // `limit(1; ...)` is satisfied by the root, so no child's `cond` is asked: a `cond` that raises
     // never runs.
     assert_eq!(
-        json("[limit(1; path(recurse(.[]?; error(\"asked\"))))]", "a: 1\nb: 2\n")?,
+        json(
+            "[limit(1; path(recurse(.[]?; error(\"asked\"))))]",
+            "a: 1\nb: 2\n"
+        )?,
         "[[]]"
     );
     Ok(())
