@@ -10338,7 +10338,11 @@ What differs from jq 1.7.1:
   A month read beside a week is kept and the day counted from its start, so `"2015 01 09" | strptime("%Y %m %U")` is January 60 (`[2015,0,60,0,0,0,0,59]`), as in jq.
   A day read beside a week with no month is kept beside the month the week falls in; jq aborts on its own `set_tm_yday` assertion unless the two agree, so there is no answer to match where they do not.
   `%w` refuses 7 and up and `%u` refuses 0 and 8 up, as the pin's libc does.
-  `%Z` takes a run of letters here, where the pin's libc reads only a name of the local zone and fails on the rest.
+  `%Z` reads a run of capital letters naming `GMT` or one of the local zone's `tzname` names, its latest standard and daylight-time names (`AEST` and `AEDT` in Sydney, `HST` and `HPT` in Honolulu), and anything else is no match, as in the pin's libc; `UTC` reads only where the zone is UTC, and under an empty `TZ` only `GMT` reads.
+  As in the pin's libc, `tzname` is process state: `localtime`, `strflocaltime` of a number and a `GMT` or `%s` conversion each rename the slot of the converted instant's kind, so in Honolulu `HWT` reads after a 1944 instant is converted and `HPT` no longer does.
+  The pin's libc ends the run of capitals with `isupper` on bytes, which in a UTF-8 locale is true of some lead bytes (`0xC3`), so `"GMTÉ" | strptime("%ZÉ")` is no match there; here the run is ASCII capitals, so it reads.
+  `GMT` and `%s` make the fields a UTC instant, normalised as `timegm` does, that becomes local time once the format is read, so a field read after `%s` is a UTC one (`"1425599621 05" | strptime("%s %H")` is 16:53:41 in Sydney).
+  As in the pin's libc, an instant before 1900-01-01 00:00 UTC there is -1, 1969-12-31 23:59:59 UTC (`"GMT" | strptime("%Z")`, and `%s` of an earlier time).
   An empty am marker matches nothing and reads as am, as on macOS under `de_DE`, where `%p` prints nothing and `PM` is left over.
   `%a`, `%A` and `%p` no longer read any run of letters: `Xyz`, `Thurs`, `Th` and `PMX` are no match, as in jq.
 

@@ -96379,6 +96379,9 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     let mut mday_read = false;
     // #5754: the last `%U`, `%W` or `%V` read, as its number and specifier.
     let mut week: Option<(i64, char)> = None;
+    // #5754: whether `%s` or `%Z` naming `GMT` was read, so the fields are UTC and go to the
+    // local zone at the end.
+    let mut gmt = false;
 
     // `%c`, `%x`, `%X` and `%r` stand for the locale's layouts (C's without one): read as
     // if the format spelled them out (#5754).
@@ -96459,9 +96462,11 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                 Some('s') => {
                     // #5303: seconds since the epoch -- leading white space, an optional
                     // sign, then digits (all three confirmed on the pinned jq: `"  12"`,
-                    // `"+5"` and `"-1"` read, `"- 5"`, `"+-5"` and a bare sign do not) --
-                    // expanded through the local zone, as `localtime_r` does, which is the
-                    // zone `localtime` uses. It replaces the date and time read so far
+                    // `"+5"` and `"-1"` read, `"- 5"`, `"+-5"` and a bare sign do not).
+                    // The libc sets the fields to the instant in UTC and turns the GMT flag on,
+                    // so they reach the local zone at the end, through whatever the format sets
+                    // after it (`"1425599621 05" | strptime("%s %H")` is 05:53:41 UTC in local
+                    // time, #5754). It replaces the date and time read so far
                     // (`"2015 1425599621" | strptime("%Y %s")` is the instant's year);
                     // weekday and yearday are recomputed below.
                     while input_iter.peek().is_some_and(|c| c.is_whitespace()) {
@@ -96480,11 +96485,8 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     };
                     let magnitude = parse_digits(&mut input_iter, 19)?;
                     let secs = if negative { -magnitude } else { magnitude };
-                    let zone = local_zone::at_instant(secs);
-                    let shifted = secs
-                        .checked_add(zone.offset_secs)
-                        .ok_or_else(|| EvalError::datetime_out_of_range().to_string())?;
-                    let t = broken_down_time_from_unix_secs(shifted).map_err(|e| e.to_string())?;
+                    let t = broken_down_time_from_unix_secs(secs).map_err(|e| e.to_string())?;
+                    gmt = true;
                     year = t.year;
                     month = t.month;
                     day = t.day;
@@ -96692,14 +96694,26 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     }
                 }
                 Some('Z') => {
-                    // Skip timezone name
-                    while let Some(&c) = input_iter.peek() {
-                        if c.is_ascii_alphabetic() {
-                            input_iter.next();
-                        } else {
-                            break;
-                        }
+                    // #5754: a run of capital letters naming `GMT`, which turns the GMT flag on,
+                    // or one of the local zone's `tzname` names (`AEST` or `AEDT` in Sydney),
+                    // which changes nothing printed. Anything else, an empty run included, is
+                    // no match: the pin's libc knows no other name, not even `UTC` outside UTC.
+                    let len = input_iter
+                        .clone()
+                        .take_while(char::is_ascii_uppercase)
+                        .count();
+                    let name: String = input_iter.clone().take(len).collect();
+                    if name == "GMT" {
+                        gmt = true;
+                    } else if name.is_empty()
+                        || !local_zone::tzname()
+                            .iter()
+                            .flatten()
+                            .any(|zone| *zone == name)
+                    {
+                        return Err(format!("unknown zone name '{name}'"));
                     }
+                    advance_chars(&mut input_iter, len);
                 }
                 // A specifier the libc does not know, and a `%` that ends the format, are no match
                 // (`"x" | strptime("%Q")`) -- not the literal they used to be taken for (#5754).
@@ -96842,6 +96856,34 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // momentarily negative for March specifically, which the pre-#912
     // hand-duplicated copy's `u32` type couldn't represent without its
     // subtraction underflowing.
+    // #5754: with the GMT flag on, the libc's `strptime` ends with `timegm` and `localtime_r`:
+    // the fields, normalised, are a UTC instant and become that instant's local time. `timegm`
+    // fails before 1900-01-01 00:00 UTC and returns -1, which is 1969-12-31 23:59:59 UTC
+    // (`"10 GMT" | strptime("%H %Z")` is in 1969, from the zeroed 1900-01-00).
+    if gmt {
+        const START_OF_1900: i64 = -2_208_988_800;
+        let to_secs = |days: i64| -> Option<i64> {
+            days.checked_mul(86_400)?
+                .checked_add(hour * 3_600 + minute * 60 + second)
+        };
+        let days = checked_days_from_civil(year, month, day).map_err(|e| e.to_string())?;
+        let mut secs =
+            to_secs(days).ok_or_else(|| EvalError::datetime_out_of_range().to_string())?;
+        if secs < START_OF_1900 {
+            secs = -1;
+        }
+        let local = secs
+            .checked_add(local_zone::at_instant(secs).offset_secs)
+            .ok_or_else(|| EvalError::datetime_out_of_range().to_string())?;
+        let t = broken_down_time_from_unix_secs(local).map_err(|e| e.to_string())?;
+        year = t.year;
+        month = t.month;
+        day = t.day;
+        hour = t.hour;
+        minute = t.minute;
+        second = t.second;
+    }
+
     let days = checked_days_from_civil(year, month, day).map_err(|e| e.to_string())?;
     let weekday = (days % 7 + 4 + 7) % 7;
 
