@@ -847,6 +847,48 @@ struct GenerateYamlSuite {
 /// requirement, unlike this three-way mutual group.
 const JQ_OUTPUT_FORMAT_FLAGS: &[&str] = &["compact_output", "tab", "indent"];
 
+/// `--indent`'s value as jq 1.7.1 reads it (#6017): C's `atoi`, which is `(int)strtol(text, 0, 10)`.
+/// Leading white space and one sign are skipped, the digits that follow are read and anything after
+/// them is ignored, so `" 2"` and `"3x"` are 2 and 3 and text that starts with anything else (`""`,
+/// `"abc"`, `"0x2"`) is 0. A value past a `long` clamps to it and then wraps to an `int`, as the C
+/// cast does (`99999999999999999999` is `-1`): that is a 64-bit `long`'s, as on macOS and Linux
+/// (a 32-bit-`long` libc clamps at an `int` instead). jq refuses what is outside -1 to 7; `-1` is a tab.
+fn parse_jq_indent(text: &str) -> Result<i8, String> {
+    let mut bytes = text.bytes().peekable();
+    while bytes
+        .next_if(|b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+        .is_some()
+    {}
+    let negative = match bytes.peek() {
+        Some(b'-') => {
+            bytes.next();
+            true
+        }
+        Some(b'+') => {
+            bytes.next();
+            false
+        }
+        _ => false,
+    };
+    let mut magnitude: u64 = 0;
+    while let Some(digit) = bytes.next_if(u8::is_ascii_digit) {
+        magnitude = magnitude
+            .saturating_mul(10)
+            .saturating_add(u64::from(digit - b'0'));
+    }
+    // `strtol` clamps to `LONG_MAX` / `LONG_MIN`; `atoi` then keeps the low 32 bits.
+    let long = if negative {
+        i64::try_from(magnitude).map_or(i64::MIN, |m| -m)
+    } else {
+        i64::try_from(magnitude).unwrap_or(i64::MAX)
+    };
+    let int = long as i32;
+    i8::try_from(int)
+        .ok()
+        .filter(|n| (-1..=7).contains(n))
+        .ok_or_else(|| "--indent takes a number between -1 and 7".to_string())
+}
+
 /// Command-line JSON processor (jq-compatible CLI)
 #[derive(Debug, Parser)]
 #[command(name = "jq")]
@@ -967,8 +1009,11 @@ struct JqCommand {
     ///
     /// See `compact_output`'s own doc comment for the shared
     /// last-flag-wins rationale (#2009).
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=7), overrides_with_all = JQ_OUTPUT_FORMAT_FLAGS)]
-    indent: Option<u8>,
+    ///
+    /// The value is read as jq reads it (C's `atoi`, #6017): `-1` is a tab, white space and a
+    /// sign are allowed, and text that does not start with a digit is 0.
+    #[arg(long, value_name = "N", value_parser = parse_jq_indent, allow_hyphen_values = true, overrides_with_all = JQ_OUTPUT_FORMAT_FLAGS)]
+    indent: Option<i8>,
 
     // === Program Input ===
     /// Read filter from file instead of command line
@@ -1031,7 +1076,9 @@ struct JqCommand {
 
     // === Modules ===
     /// Prepend directory to module search path
-    #[arg(short = 'L', value_name = "DIR", action = clap::ArgAction::Append, allow_hyphen_values = true)]
+    ///
+    /// An empty directory is a search-path element like any other (jq accepts `-L ""`, #6017).
+    #[arg(short = 'L', value_name = "DIR", action = clap::ArgAction::Append, allow_hyphen_values = true, value_parser = clap::builder::TypedValueParser::map(clap::builder::OsStringValueParser::new(), PathBuf::from))]
     library_path: Vec<PathBuf>,
 
     // === Formats ===
@@ -3341,6 +3388,47 @@ mod tests {
             msg.contains("jq not found") || msg.contains("binary not found"),
             "unexpected error: {msg}"
         );
+    }
+
+    /// #6017: `--indent` reads its value as C's `atoi` does, so everything jq 1.7.1 takes is taken
+    /// here (rows captured from `/usr/bin/jq`; `tests/jq_cli/i6017.rs` runs them end to end).
+    #[test]
+    fn the_indent_value_is_read_as_atoi_reads_it() {
+        let ok = |text: &str| parse_jq_indent(text).unwrap();
+        for (text, want) in [
+            ("0", 0),
+            ("7", 7),
+            ("-1", -1),
+            ("+2", 2),
+            (" 2", 2),
+            ("\t\n\x0b\x0c\r3", 3),
+            ("3x", 3),
+            ("2.5", 2),
+            ("007", 7),
+            ("", 0),
+            ("abc", 0),
+            ("0x2", 0),
+            ("+-3", 0),
+            ("-0", 0),
+            // past a `long`, `strtol` clamps and the `int` cast keeps the low 32 bits
+            ("99999999999999999999", -1),
+            ("-99999999999999999999", 0),
+            ("4294967295", -1),
+            ("4294967296", 0),
+            ("4294967297", 1),
+            ("4294967303", 7),
+            ("-4294967295", 1),
+        ] {
+            assert_eq!(ok(text), want, "{text:?}");
+        }
+        for text in ["8", "-2", "99999999999", "-99999999999"] {
+            assert!(
+                parse_jq_indent(text)
+                    .unwrap_err()
+                    .contains("between -1 and 7"),
+                "{text:?}"
+            );
+        }
     }
 }
 

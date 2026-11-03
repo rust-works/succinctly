@@ -462,3 +462,14 @@ locale-var-latin1-sort	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"
 locale-var-garbage-time	locale	["-r", "strftime(\"%A %B\")"]	"1425599621\n"	{"LC_ALL": "not a locale"}
 locale-var-garbage-text	locale	["-c", "[ascii_downcase,length,(.|@uri)]"]	"\"İÉé\"\n"	{"LC_ALL": "not a locale"}
 locale-var-garbage-sort	locale	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\",\"é\",\"e\",\"ä\",\"z\",\"Z\",\" \",\"-\",\"İ\",\"ı\",\"i\",\"I\",\"ß\",\"ss\",\"Å\",\"aa\"]\n"	{"LC_ALL": "not a locale"}
+indent-minus-one-tab	output	["--indent", "-1", "."]	"{\"a\":[1]}"
+indent-empty-is-zero	output	["--indent", "", "."]	"{\"a\":[1]}"
+indent-trailing-garbage	output	["--indent", "3x", "."]	"{\"a\":[1]}"
+indent-leading-space	output	["--indent", " 2", "."]	"{\"a\":[1]}"
+indent-not-a-number-is-zero	output	["--indent", "abc", "."]	"{\"a\":[1]}"
+indent-wraps-to-minus-one	output	["--indent", "99999999999999999999", "."]	"{\"a\":[1]}"
+indent-minus-two-error	output	["--indent", "-2", "."]	"{\"a\":[1]}"
+library-path-empty	program	["-L", "", "-n", "1"]	-
+library-path-empty-import	program	["-L", "", "-n", "import \"a\" as a; 1"]	-
+library-path-empty-then-real-dir	program	["-L", "", "-L", "mod", "-n", "import \"lib\" as l; 1"]	-
+indent-swallows-next-option	output	["--indent", "-c", "."]	"{\"a\":[1]}"

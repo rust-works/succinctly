@@ -90,6 +90,12 @@ pub(crate) fn named_flag_order(argv: &[String]) -> Vec<NamedFlag> {
 }
 
 impl JqCommand {
+    /// Whether the output is indented with tabs: `--tab`, or `--indent -1`, which jq 1.7.1 treats
+    /// as the same thing (#6017). The one definition for both indent derivations.
+    fn uses_tab_indent(&self) -> bool {
+        self.tab || self.indent == Some(-1)
+    }
+
     /// Turn clap's greedy `--args`/`--jsonargs` captures into the filter and
     /// the ordered positional words jq's own `main.c` produces (#3412).
     ///
@@ -3171,7 +3177,7 @@ struct OutputConfig {
 
 impl OutputConfig {
     fn from_args(args: &JqCommand) -> Self {
-        let indent_string = if args.tab {
+        let indent_string = if args.uses_tab_indent() {
             "\t".to_string()
         } else if let Some(n) = args.indent {
             " ".repeat(n as usize)
@@ -4935,7 +4941,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // streamer needs the semantic width/unit pair, not rendered text.
     // Priority matches `OutputConfig::from_args`'s `indent_string`
     // construction exactly (tab > explicit `--indent N` > `-c` > default 2).
-    let json_indent = if args.tab {
+    let json_indent = if args.uses_tab_indent() {
         IndentSpec {
             width: 1,
             unit: '\t',
