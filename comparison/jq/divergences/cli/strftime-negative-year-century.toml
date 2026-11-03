@@ -1,0 +1,4 @@
+category = "host-dependent"
+issue = "#6030"
+reason = "`[-101,0,1,0,0,0,0,0] | strftime(\"%y|%C\")` is `01|-1` in jq 1.7.1 on macOS and succinctly follows it; a glibc jq prints `99|-2` (the floored remainder and quotient). Same cause as `strftime-negative-year-y`."
+platform = "linux"

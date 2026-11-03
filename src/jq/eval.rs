@@ -95541,6 +95541,23 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     )
 }
 
+/// `%y` as the pinned libc prints it (`_yconv`, #6030): the year's remainder by 100 under C's
+/// truncating `%`, as its absolute value in two digits, so year -5 is `05` and year -2015 is `15`.
+fn year_in_century(year: i64) -> String {
+    format!("{:02}", (year % 100).abs())
+}
+
+/// `%C` as the pinned libc prints it (#6030): the year's quotient by 100 under C's truncating `/`
+/// in two digits, except that a negative year below 100 in size has a century of 0 and a negative
+/// remainder, which prints `-0` (year -5 is `-0`, year -101 is `-1`).
+fn century_of_year(year: i64) -> String {
+    if year / 100 == 0 && year % 100 < 0 {
+        "-0".to_string()
+    } else {
+        format!("{:02}", year / 100)
+    }
+}
+
 /// Format a time according to strftime format specifiers
 #[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors strftime's broken-down-time field set
 fn format_strftime(
@@ -95712,7 +95729,7 @@ fn format_strftime(
             match spec {
                 Some('%') => result.push('%'),
                 Some('Y') => result.push_str(&format!("{year:04}")),
-                Some('y') => result.push_str(&format!("{:02}", year % 100)),
+                Some('y') => result.push_str(&year_in_century(year)),
                 Some('m') => result.push_str(&padded(month, 2, '0', flag)),
                 Some('d') => result.push_str(&padded(day, 2, '0', flag)),
                 Some('e') => result.push_str(&padded(day, 2, ' ', flag)),
@@ -95776,9 +95793,9 @@ fn format_strftime(
                 Some('B') => {
                     result.push_str(month_full(month));
                 }
-                Some('C') => result.push_str(&format!("{:02}", year / 100)),
+                Some('C') => result.push_str(&century_of_year(year)),
                 Some('D' | 'x') => {
-                    result.push_str(&format!("{month:02}/{day:02}/{:02}", year % 100));
+                    result.push_str(&format!("{month:02}/{day:02}/{}", year_in_century(year)));
                 }
                 Some('F') => result.push_str(&format!("{year:04}-{month:02}-{day:02}")),
                 Some('R') => result.push_str(&format!("{hour:02}:{minute:02}")),
