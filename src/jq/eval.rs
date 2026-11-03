@@ -14169,15 +14169,23 @@ fn owned_assign_step<S: EvalSemantics>(
             }
             let bound = closed_expr_to_owned::<S>(source)?;
             // #5540: `substitute_var` rebuilds a container as a literal, so a fold's shared
-            // element bound here would stop being one handle (`$v as $n | .x = $n`); the
-            // evaluator keeps it.
+            // element bound here would stop being one handle (`$v as $n | .x = $n`).
             if matches!(bound, OwnedValue::Array(_) | OwnedValue::Object(_))
                 && any_subexpr(
                     source,
                     &mut |n| matches!(n, Expr::TrackedVar(m) if m.fold_share),
                 )
             {
-                return None;
+                // #5938: a source that is the marker itself (`$r as $s`) binds the name to that
+                // same storage, so the name takes the same marker and a field read off it hands
+                // on the member (`.a = $s.items`), as the loop variable's own does. Any other
+                // source (`$r.items as $i`) is the evaluator's.
+                if !matches!(unwrap_paren(source), Expr::TrackedVar(m) if m.fold_share) {
+                    return None;
+                }
+                let marker = LazyMarker::new(&bound, Origin::Untracked, None).fold_shared();
+                let body = substitute_var_impl(body, var, &bound, Some(&marker));
+                return owned_assign_step::<S>(&body, state);
             }
             return owned_assign_step::<S>(&substitute_var(body, var, &bound), state);
         }
@@ -84252,11 +84260,16 @@ pub(crate) fn fold_loop_variable_shares_identity<S: EvalSemantics>(
 /// ([`Tracked::fold_share`]) as one `Rc` clone. A field read hands on the member itself, a
 /// container when the member is one.
 ///
-/// A binder's source reaches the output only through the names it binds: `$r as
-/// $s | .[$s.name] = $s.score` and `reduce $r.tags[] as $t (.; .[$t] += 1)` hand
+/// A binder's source reaches the output only through the names it binds:
+/// `reduce $r.tags[] as $t (.; .[$t] += 1)` and `$r as {name: $n} | .[$n] = 1` hand
 /// nothing on, so the names join the search of the body (and of a fold's UPDATE
 /// and EXTRACT) instead, and the in-place step they feed keeps its unmarked
-/// operands. A position left out, or a binder's source, still counts when it can
+/// operands. A plain rebind of the variable under an assignment (`$r as $s | .a =
+/// $s.items`, #5938) is the exception: [`owned_assign_step`] gives the new name the
+/// variable's own marker, so the name joins `names` and a field read of it counts
+/// like one of the variable's. The two must agree (a rebind this accepts that the
+/// step declines would rebuild the member), which `tests/jq_cli/i5938.rs`
+/// pins. A position left out, or a binder's source, still counts when it can
 /// raise while reading a name, since `try ... catch .` hands the error value on
 /// (`try (error($a) and true) catch .`).
 ///
@@ -84300,6 +84313,17 @@ fn loop_var_can_reach_output(expr: &Expr, names: &[String], bound: &[String]) ->
                 || loop_var_can_reach_output(then_branch, names, bound)
                 || loop_var_can_reach_output(else_branch, names, bound),
         ),
+        // #5938: `$r as $s | .a = $s.items` binds `$s` to the loop variable's own storage, and
+        // `owned_assign_step` gives the name the same marker, so `$s` is the loop variable
+        // under another name: a read of it counts as one of the variable's.
+        Expr::As { expr, var, body }
+            if matches!(unwrap_paren(expr), Expr::Var(v) if names.contains(v))
+                && is_owned_assign(unwrap_paren(body)) =>
+        {
+            let mut alias = names.to_vec();
+            alias.push(var.clone());
+            visit(loop_var_can_reach_output(body, &alias, bound))
+        }
         Expr::As { expr, var, body } => visit(through_binder(
             expr,
             &[Pattern::Var(var.clone())],
@@ -106997,17 +107021,31 @@ mod tests {
                 .is_some_and(|stored| stored.shares_storage_with(&value)),
             "the stored element is the marker's own storage, not a rebuilt copy"
         );
-        // `$m as $n | .a = $n`: rebinding would rebuild the container as a literal.
-        let rebind = Expr::As {
-            expr: Box::new(marker(true)),
+        // #5938: `$m as $n | .a = $n` binds the name to the marker's own storage, so the name
+        // takes the same marker and the write stores that storage, not a rebuilt literal.
+        let rebind = |source: Expr| Expr::As {
+            expr: Box::new(source),
             var: "n".to_string(),
             body: Box::new(Expr::Assign {
                 path: Box::new(Expr::Field("a".to_string())),
                 value: Box::new(Expr::Var("n".to_string())),
             }),
         };
+        let OwnedStep::Handled(Ok(OwnedValue::Object(written))) =
+            try_owned_assign_step::<JqSemantics>(&rebind(marker(true)), state.clone())
+        else {
+            panic!("a rebind of a fold's marker was declined"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step declined a rebind of a fold_share marker (#5938)"
+        };
+        assert!(
+            written
+                .get("a")
+                .is_some_and(|stored| stored.shares_storage_with(&value)),
+            "the rebound name stores the marker's own storage"
+        );
+        // A source that only wraps the marker (`[$m] as $n`) is a new container: the evaluator's.
+        let wrapped = Expr::Array(Box::new(marker(true)));
         assert!(matches!(
-            try_owned_assign_step::<JqSemantics>(&rebind, state),
+            try_owned_assign_step::<JqSemantics>(&rebind(wrapped), state),
             OwnedStep::Declined(_)
         ));
     }
@@ -107339,6 +107377,9 @@ mod tests {
             // #5761: a field read hands on the member itself, a container when the member is
             // one, so the marker rides it too (the step still runs in place).
             "reduce .[] as $r ({}; $r.name as $n | .[$n] = $r.score)",
+            // #5938: a plain rebind of the variable is the variable under another name.
+            "reduce .[] as $r ({}; $r as $s | .[$s.name] = $s.score)",
+            "reduce .[] as $r ({}; ($r) as $s | $s as $t | .a = $t.items)",
             "reduce .[] as $r ({}; .[$r.name] = $r.score)",
             "reduce .[] as $r ({}; .x[$r.name] += $r.score)",
             "reduce .[] as $r ({}; .[$r.name] += ($r.score | floor))",
@@ -107385,8 +107426,8 @@ mod tests {
             "reduce . as $a (null; $b)",
             // A binder's source hands nothing on but through its names, here read by
             // value only (`fold_assign_step_copies_nothing_3138`).
-            "reduce .[] as $r ({}; $r as $s | .[$s.name] = $s.score)",
             "reduce .[] as $r ({}; $r.name as $n | .[$n] = 1)",
+            "reduce .[] as $r ({}; $r as $s | .[$s.name] = 1)",
             "reduce .[] as $r ({}; $r as {name: $n} | .[$n] = 1)",
             "reduce .[] as $r ({}; reduce $r.tags[] as $t (.; .[$t] += 1))",
             "reduce .[] as $r ({}; foreach $r.tags[] as $t (.; .[$t] = 1; .))",
