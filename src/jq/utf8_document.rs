@@ -144,7 +144,11 @@ pub fn substitute_invalid_utf8_jq_document(raw: &[u8]) -> String {
 fn push_segment(out: &mut String, bytes: &[u8]) {
     match core::str::from_utf8(bytes) {
         Ok(s) => out.push_str(s),
-        Err(_) => out.push_str(&substitute_invalid_utf8_jq_style(bytes)),
+        // Byte by byte, never with the string-scoped short-tail rule: jq substitutes nothing
+        // outside a string (a bad byte is part of a literal token), so a lead byte must not take
+        // the white space after it, or the newline that ends the token (`\xe1\n"a" 1` lost its
+        // newline, and the read that resumed after the fault lost `"a"` and `1`, #5994).
+        Err(_) => out.push_str(&String::from_utf8_lossy(bytes)),
     }
 }
 
@@ -267,6 +271,20 @@ mod tests {
         assert_eq!(
             substitute_invalid_utf8_jq_document(b"\"\xe1A\" 1"),
             "\"\u{fffd}\" 1"
+        );
+    }
+
+    /// #5994: outside a string the substitution is byte by byte, so a lead byte keeps the white
+    /// space after it; jq's parser counts that newline and ends the literal token at it.
+    #[test]
+    fn a_lead_byte_outside_a_string_keeps_the_white_space_after_it_5994() {
+        assert_eq!(
+            substitute_invalid_utf8_jq_document(b"\xe1\n\"a\" 1"),
+            "\u{fffd}\n\"a\" 1"
+        );
+        assert_eq!(
+            substitute_invalid_utf8_jq_document(b"1 \xf0\x90\n\"a\""),
+            "1 \u{fffd}\n\"a\""
         );
     }
 
