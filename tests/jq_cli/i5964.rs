@@ -10,6 +10,14 @@ use crate::run_jq_over_byte_files;
 
 const FILTER: &str = "[limit(8; repeat(try input catch .))]";
 
+/// `(files, flags, stdout, stderr)`: a row that exits 5.
+type Row = (
+    &'static [&'static [u8]],
+    &'static [&'static str],
+    &'static str,
+    &'static str,
+);
+
 /// `try input catch .`, over the files in order: the column of each fault the program reads.
 #[test]
 fn a_fault_after_an_invalid_byte_is_counted_over_the_bytes_read_5964() -> Result<()> {
@@ -44,7 +52,7 @@ fn a_fault_after_an_invalid_byte_is_counted_over_the_bytes_read_5964() -> Result
 #[test]
 fn the_other_routes_count_the_bytes_read_too_5964() -> Result<()> {
     // `(files, flags, stdout, stderr)`; every one exits 5.
-    let rows: &[(&[&[u8]], &[&str], &str, &str)] = &[
+    let rows: &[Row] = &[
         (
             &[b"\xff }"],
             &["-c", "."],

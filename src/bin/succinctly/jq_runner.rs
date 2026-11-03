@@ -8220,7 +8220,7 @@ fn advance_source(
 ) -> (usize, usize) {
     let bytes = lossy
         .and_then(|lossy| lossy.bytes(range.clone()))
-        .unwrap_or(&text[range]);
+        .unwrap_or_else(|| &text[range]);
     advance_position(at, bytes)
 }
 
