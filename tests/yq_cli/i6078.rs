@@ -471,3 +471,20 @@ fn jq_mode_keeps_the_alias_spellings_undefined_6078() -> Result<()> {
     }
     Ok(())
 }
+
+/// A function the program defines under one of these names (possible with `--jq-extensions`) is
+/// the one called, as it is for every other name.
+#[test]
+fn a_defined_function_keeps_the_name_6078() -> Result<()> {
+    for (filter, expected) in [
+        ("def root: 5; root", "5\n"),
+        ("def parents: 6; parents", "6\n"),
+        ("def toEntries: 7; toEntries", "7\n"),
+        ("def groupby(f): 8; groupby(.a)", "8\n"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, "a: {b: 1}\n", &["--jq-extensions"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(output, expected, "{filter}");
+    }
+    Ok(())
+}

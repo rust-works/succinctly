@@ -1901,8 +1901,8 @@ impl<'a> Parser<'a> {
     fn consume_keyword(&mut self, keyword: &str) {
         // The spelling the input has: `keyword` itself, or in yq mode one of its other spellings.
         if self.mode == ParserMode::Yq && !self.input[self.pos..].starts_with(keyword) {
-            if let Some(spelling) = yq_spellings_of(keyword)
-                .find(|spelling| self.input[self.pos..].starts_with(spelling))
+            if let Some(spelling) =
+                yq_spellings_of(keyword).find(|spelling| self.matches_spelling(spelling))
             {
                 self.pos += spelling.len();
                 return;
@@ -4369,16 +4369,24 @@ impl<'a> Parser<'a> {
                 {
                     // #4206: yq's `to_json` / `to_yaml`, each with an optional literal indent.
                     self.parse_yq_to_text_operator()
-                } else if self.mode == ParserMode::Yq && self.matches_keyword("root") {
+                } else if self.mode == ParserMode::Yq
+                    && self.matches_keyword("root")
+                    && !self.shadowable_defs.contains("root")
+                {
                     // #6078: yq's `root`, the document's root node: `parent(-1)`.
                     self.consume_keyword("root");
                     let desugared =
                         parse_with_mode_and_extensions("parent(-1)", ParserMode::Yq, true)?;
                     self.zero_arity_or_wrong_arity_call(keyword_start, Some("root"), desugared)
-                } else if self.mode == ParserMode::Yq && self.matches_keyword("parents") {
+                } else if self.mode == ParserMode::Yq
+                    && self.matches_keyword("parents")
+                    && !self.shadowable_defs.contains("parents")
+                {
                     // #6078: yq's `parents`, the node's ancestors as a sequence, the nearest first
                     // and the document root last (`[]` at the root). `parent(n)` is empty past the
-                    // root, which is where the walk stops.
+                    // root, which is where the walk stops; a document nests far less than 1000
+                    // deep (`MAX_VALUE_TREE_DEPTH`), and an ancestor is a collection, never `null`
+                    // or `false`, which `//` would also take for empty.
                     self.consume_keyword("parents");
                     let desugared = parse_with_mode_and_extensions(
                         "[label $out | range(1; 1000) as $n | (parent($n) // break $out)]",
@@ -15716,12 +15724,12 @@ mod tests {
             "pick",
             "pivot",
             "reverse",
+            "root",
             "select",
             "setpath",
             "shuffle",
             "sort",
             "sortKeys",
-            "root",
             "sort_by",
             "sort_keys",
             "split",
