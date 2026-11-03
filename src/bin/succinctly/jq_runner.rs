@@ -6032,6 +6032,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         "{}",
                         crate::jq_seq_reader::ignored_parse_error(&t.error.message)
                     );
+                } else if t.as_parse_error {
+                    sink.report_parse_error(&t.error.message);
                 } else {
                     sink.report(
                         DiagStyle::Jq,
@@ -6329,6 +6331,9 @@ struct TrailingParseError {
     /// error, not an uncaught one, and it never costs exit 5. `input`/
     /// `inputs` still receive it as an error.
     seq_warning: bool,
+    /// Reported as jq's main loop words a parse error, `jq: parse error: ...`, not as an error at an
+    /// input (#6061).
+    as_parse_error: bool,
 }
 
 /// What [`get_inputs`] read: every document, their locations, and -- when a
@@ -6588,6 +6593,7 @@ fn get_inputs(
                             u32::try_from(fault.line).unwrap_or(u32::MAX)
                         },
                         seq_warning: false,
+                        as_parse_error: false,
                     },
                 )
             })
@@ -6667,6 +6673,7 @@ fn get_inputs(
                     source: u32::try_from(source).unwrap_or(u32::MAX),
                     line: u32::try_from(line).unwrap_or(u32::MAX),
                     seq_warning: false,
+                    as_parse_error: false,
                 }
             };
             let mut resumed: Vec<(usize, TrailingParseError)> = Vec::new();
@@ -6700,6 +6707,41 @@ fn get_inputs(
         // there.
         if let (true, Some((message, (source, line)))) = (stream_by_reader, read.first_fault.take())
         {
+            // #6061: jq closes the slurp array at the call that consumes the last byte, so a fault
+            // met by a later call (a bare token or a `,` last in the input completes its event in
+            // the call before) comes after the array, which holds the events read. A fault met
+            // before the array closes is the whole result.
+            if args.slurp {
+                let deferred = crate::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
+                if deferred.before.is_empty() {
+                    let place = |at| stream_location(&raw_bytes, at);
+                    let (array_source, array_line) = place(deferred.slurp_at);
+                    locations.push(array_source, array_line);
+                    let mut values = vec![OwnedValue::array_from(deferred.array)];
+                    let mut trailing_error = None;
+                    for item in deferred.after {
+                        match item {
+                            crate::jq_stream_errors::Afterwards::Value(value, at) => {
+                                let (source, line) = place(at);
+                                locations.push(source, line);
+                                values.push(value);
+                            }
+                            crate::jq_stream_errors::Afterwards::Fault(message, at) => {
+                                let (source, line) = place(at);
+                                trailing_error = Some(TrailingParseError {
+                                    error: EvalError::new(message),
+                                    source: u32::try_from(source).unwrap_or(u32::MAX),
+                                    line: u32::try_from(line).unwrap_or(u32::MAX),
+                                    seq_warning: false,
+                                    as_parse_error: true,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    return Ok(Ok((values, locations, trailing_error, Vec::new())));
+                }
+            }
             return Ok(Err(MalformedJsonError::new(EvalError::new(message))
                 .at_stream_fault(source, line)
                 .into()));
@@ -6945,6 +6987,7 @@ fn get_inputs(
             source: NO_SOURCE,
             line: UNKNOWN_LINE,
             seq_warning: true,
+            as_parse_error: false,
         });
 
     // `--seq` (RFC 7464, #1571) and raw-input (`-R`, #1809): both can
@@ -7332,6 +7375,7 @@ fn get_inputs(
                             u32::try_from(error_line).unwrap_or(u32::MAX)
                         },
                         seq_warning: false,
+                        as_parse_error: false,
                     });
                     break;
                 }
@@ -9634,6 +9678,7 @@ fn read_json_tail(
                 source: u32::try_from(fault_source).unwrap_or(u32::MAX),
                 line: u32::try_from(line).unwrap_or(u32::MAX),
                 seq_warning: false,
+                as_parse_error: false,
             },
         ));
         // The next segment starts where the parser stopped, unless the fault's
@@ -9684,6 +9729,7 @@ fn read_json_tail(
                     source: u32::try_from(fault_source).unwrap_or(u32::MAX),
                     line: u32::try_from(line).unwrap_or(u32::MAX),
                     seq_warning: false,
+                    as_parse_error: false,
                 },
             ));
             let read_end = faults.read_end(next);
@@ -15879,6 +15925,7 @@ mod tests {
             source: 0,
             line: 7,
             seq_warning: false,
+            as_parse_error: false,
         };
         for documents in 0..=3usize {
             for resumed_at in [
