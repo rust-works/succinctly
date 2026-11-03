@@ -7506,7 +7506,11 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   The `fancy-regex` route reports only the span `\K` keeps, so a pattern with `\K` under `l` is searched one start at a time with the pattern anchored there (`\G(?:...)`), and a match is measured from that start ([#6085](https://github.com/rust-works/succinctly/issues/6085)).
   `"a1" | match("a\\K1";"l")` is `[[1,1]]` as in jq, where it was empty.
   Where the ways to match at one start keep different spans, `fancy-regex` picks the one with the longest kept span: `"baa" | match("b?\\K[ab]a*";"l")` is `[[1,2]]` in jq and `[[0,3]]` here.
-  With the extended mode (the `x` flag or an inline `(?x)`) the anchored copy is not built, because a trailing `#` comment would swallow its closing parenthesis, and the search keeps the span `\K` keeps.
+  So does `"ab" | match("a|ab\\K";"l")`, `[[2,0]]` in jq (the second alternative reaches the furthest end) and `[[0,1]]` here.
+  The search is one anchored attempt per character position, and each search reads the rest of the text as Oniguruma's does, so a `g` loop over a long text is quadratic in the matches (a pattern with a `\G` of its own is quadratic in the same way): 12.8 KB holding 6,400 matches takes 6.3 s with `l` and 0.01 s without `\K` (M4 Pro, release build).
+  Without `\K` the one-pass index of [#5563](https://github.com/rust-works/succinctly/issues/5563) is kept.
+  The `x` flag works: the anchored copy closes its group on a new line, so that a `#` comment cannot swallow the parenthesis.
+  An inline `(?x)` or a flag switched off inside the pattern (`(?-x)`) keeps the search that measures the span `\K` keeps.
 - **`l` stays a no-op on a pattern with a lazy quantifier.**
   `fancy-regex`'s longest mode returns the lazy match where Oniguruma returns the longest of all the ways to match: `"aa" | match("a*?";"l")` is `"aa"` in jq and `""` here.
   Such a pattern keeps its old route whole, `n` included, because the two flags are not independent (`ln` is the longest non-empty match anywhere).
