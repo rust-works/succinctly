@@ -114,5 +114,22 @@ fn a_consumers_stop_ends_the_gated_walk_before_a_later_siblings_cond() -> Result
         )?,
         "[[]]"
     );
+    // After the first child, a later sibling's `cond` is still not asked: it raises on `2`, which
+    // `limit(2; ...)` never reaches, as in the value walk.
+    let raises_on_two = r#"if . == 2 then error("asked") else true end"#;
+    assert_eq!(
+        json(
+            &format!("[limit(2; path(recurse(.[]?; {raises_on_two})))]"),
+            "[1, 2, 3]\n"
+        )?,
+        "[[],[0]]"
+    );
+    assert_eq!(
+        json(
+            &format!("[limit(2; recurse(.[]?; {raises_on_two}) | path)]"),
+            "[1, 2, 3]\n"
+        )?,
+        "[[],[0]]"
+    );
     Ok(())
 }

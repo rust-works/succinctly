@@ -28620,32 +28620,31 @@ fn path_descent_each<S: EvalSemantics, V: DocumentValue>(
     cond: Option<&Expr>,
     emit: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Result<Demand, Control> {
-    let mut pending = vec![(PathTrail::root(), PathNode::At(root))];
-    while let Some((at, here)) = pending.pop() {
+    // The flag marks a child whose `cond` has not been asked yet (#5504). `recurse(f; cond)` asks
+    // `cond` of a child just before it emits and descends into it, and never of the root, as the
+    // position walk does ([`path_context_step_recurse_each`]): a consumer's stop, or an earlier
+    // sibling's subtree, ends the walk before a later sibling's `cond` runs, which matters for a
+    // `cond` that raises or has an effect.
+    let mut pending = vec![(PathTrail::root(), PathNode::At(root), false)];
+    while let Some((at, here, unasked)) = pending.pop() {
+        if let (true, Some(cond), PathNode::At(cursor)) = (unasked, cond, &here) {
+            // A child of a live node is a live node: `path_descent_children` iterates a cursor, so
+            // an owned or absent child never reaches this walk with a `cond` to ask.
+            if !recurse_cond_keeps_cursor::<S, V>(cond, *cursor)? {
+                continue;
+            }
+        }
         guard_path_walk_depth(at.depth())?;
         if matches!(emit(OwnedValue::Array(at.to_vec().into())), Demand::Stop) {
             return Ok(Demand::Stop);
         }
-        let mut children = path_descent_children::<S, V>(&here, &at)?;
-        if let Some(cond) = cond {
-            // #5504: `recurse(f; cond)` asks `cond` of each child before descending into it, and
-            // never of the root, as the position walk does ([`path_context_step_recurse_each`]).
-            // Asked here, as the walk reaches the parent, a stop from `emit` has already ended the
-            // walk before a later sibling's `cond` runs.
-            let mut kept = Vec::new();
-            for (trail, node) in children {
-                let keeps = match &node {
-                    PathNode::At(cursor) => recurse_cond_keeps_cursor::<S, V>(cond, *cursor)?,
-                    // A child of a live node is a live node: `path_descent_children` iterates a cursor.
-                    PathNode::Absent | PathNode::Owned(_) => true,
-                };
-                if keeps {
-                    kept.push((trail, node));
-                }
-            }
-            children = kept;
-        }
-        pending.extend(children.into_iter().rev());
+        let gated = cond.is_some();
+        pending.extend(
+            path_descent_children::<S, V>(&here, &at)?
+                .into_iter()
+                .rev()
+                .map(|(trail, node)| (trail, node, gated)),
+        );
     }
     Ok(Demand::Continue)
 }
@@ -32919,13 +32918,15 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
         // pipe down the owned route and "answers identically"; it does not. That route is
         // element-major for a union after a position stage, and it navigates alias-dereferenced
         // values (`[recurse(.[]?) | (path, key)]` against `[.. | (path, key)]`).
-        Expr::RecursiveDescent
-        | Expr::Builtin(
-            Builtin::Recurse
-            | Builtin::RecurseDown
-            | Builtin::RecurseF(_)
-            | Builtin::RecurseCond(..),
-        ) => incoming,
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => incoming,
+        // A `recurse(f)` whose `f` is not a structural descent computes its outputs (`recurse(. + 1; . < 5)`,
+        // `recurse(.a // empty)`), so only the walkable spellings step like `..`.
+        Expr::Builtin(Builtin::RecurseF(f)) if crate::jq::eval::is_structural_descent(f, None) => {
+            incoming
+        }
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) if recurse_cond_is_walkable(f, cond) => {
+            incoming
+        }
         Expr::Break(_)
         | Expr::Error(_)
         | Expr::Builtin(
