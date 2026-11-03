@@ -14,10 +14,6 @@ fn answer(filter: &str) -> Result<String> {
 }
 
 /// Each spelling was `false` here and is `true` in jq: the stored member is the element's own array.
-#[cfg_attr(
-    feature = "unshared-containers",
-    ignore = "holdout has no node identity or sharing (#5254)"
-)]
 #[test]
 fn test_rebound_loop_variable_field_read_keeps_the_members_identity_5938() -> Result<()> {
     for filter in [
