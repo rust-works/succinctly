@@ -8802,6 +8802,11 @@ fn parse_error_detection(bytes: &[u8], start: usize, stream: bool) -> usize {
                 | Kind::InvalidEscape { .. }
                 | Kind::InvalidUnicodeEscape { .. }
                 | Kind::UnpairedSurrogate { .. } => string_close_from(bytes, at),
+                // A number a quote ends (`1e"`, `-"`, `1."`) is checked as the quote arrives, so
+                // jq meets the fault at the quote itself. The string it opens is part of what the
+                // read drops, not a token to complete: taken for one, a string that never closes
+                // put the fault at the end of the input (#5925).
+                Kind::InvalidNumber { .. } if bytes.get(at) == Some(&b'"') => at,
                 // jq's lexer takes a whole token before its parser sees it: a
                 // string where a separator belongs is refused at its closing
                 // quote, and a bad literal or number (`truex`, `1x`) at the
