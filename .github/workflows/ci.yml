@@ -785,6 +785,12 @@ jobs:
       - name: jq-path-register-sweep.py self-tests
         run: python3 scripts/test_jq_path_register_sweep.py -v
 
+      # #5955: the same shape for the jq grammar fuzzer the `Compare jq ledger` workflow runs:
+      # no build, no jq. It pins that the minimizer terminates (#5695 looped forever on a subtree
+      # replaced by an equal one), which a ledger run would only show as a hung job.
+      - name: jq-grammar-fuzz.py self-tests
+        run: python3 scripts/test_jq_grammar_fuzz.py -v
+
       # #3649: the same shape for the CI load report: jobs built in the test, no network.
       # It pins the load-adjusted queue-wait count the macOS matrix decisions rest on.
       - name: ci-load-report.py self-tests
