@@ -16949,6 +16949,19 @@ mod tests {
         let lossy = LossySource::new(original, &text);
         assert!(lossy.runs.is_none());
         assert_eq!(lossy.bytes(0..1), None);
+        // Nor does text that is not the original at all: a replacement that is not U+FFFD, a text
+        // that stops short, a text that goes on.
+        assert!(LossySource::new(b"a\xffb".to_vec(), b"axxxb")
+            .runs
+            .is_none());
+        assert!(LossySource::new(b"a\xffb".to_vec(), "a\u{fffd}".as_bytes())
+            .runs
+            .is_none());
+        assert!(
+            LossySource::new(b"a\xffb".to_vec(), "a\u{fffd}bc".as_bytes())
+                .runs
+                .is_none()
+        );
     }
 
     /// #4349: the substituted copy is mapped back to the original only when it differs from it by
