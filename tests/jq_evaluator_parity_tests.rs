@@ -3395,18 +3395,19 @@ fn test_parity_def_spines_3307() {
 /// #5519: the generic evaluator (the CLI's) projects a fold's loop element to the members its
 /// update reads, so a member nothing reads is not decoded; `eval.rs`'s own fold drivers convert
 /// the whole element. The two answer differently on a document whose unread member cannot be
-/// decoded. Pinned with `assert_ne!` so the fix (porting the projection, or deciding the rule
-/// the other way) has to update it; `eval_full` is `#[doc(hidden)]` and no CLI route reaches
-/// `eval.rs` with raw input.
+/// decoded, and that is intended (#5544): `eval_full` is `#[doc(hidden)]` and no CLI route reaches
+/// `eval.rs` with raw input, so the projection stays in the one evaluator that sees an index.
+/// A change that makes them agree (porting the projection, or dropping it) removes this test and
+/// asserts parity instead.
 #[test]
-fn test_fold_loop_element_projection_drifts_from_eval_rs_5519() {
+fn test_fold_loop_element_projection_is_generic_evaluator_only_5519() {
     let json = br#"[{"a":"\ud800","b":5}]"#;
     let filter = "reduce .[] as $u (0; . + $u.b)";
     let full = full_outputs(json, filter);
     let generic = generic_outputs(json, filter);
     assert_ne!(
         full, generic,
-        "the evaluators agree now: drop this pin and assert_parity"
+        "the evaluators agree now: drop this test and assert_parity"
     );
     assert_eq!(generic, ["5"], "generic evaluator projects");
     assert!(

@@ -9571,7 +9571,8 @@ On `[{"a":"\ud800","b":5}]`:
 Validating the rest of the element first (`validate_cursor`, no value built) keeps jq's answer, and was measured on a 7950X against an earlier form of the projection: it saved 4% to 6% of `reduce .users[] as $u (0; .+$u.score)` where that projection saved 44% (the checked walk that shipped saves 32%), and made `.[$u.name] = $u.score` 16% to 18% slower where the projection makes it 19% faster.
 That is the reason the divergence is taken, on the same three grounds as the rest of this section: the agreement being given up was a side effect of materializing the whole element, it made the answer depend on how the update spelled its read (`.[] as $x | $x.b` already answered `5`), and it cost most of a fold's runtime on a body that reads one member.
 A fold naming more than eight fields, or an object pattern with more than eight keys, converts the element whole (past that the projection stops paying: reading all 20 members of a 20-member record was 21% slower on a 7950X).
-`eval.rs`'s own fold drivers (reached only through the hidden `eval_full`) still convert the whole element; `test_fold_loop_element_projection_drifts_from_eval_rs_5519` pins that drift.
+`eval.rs`'s own fold drivers (reached only through the hidden `eval_full`, which no CLI route feeds raw input) convert the whole element, and stay that way (#5544).
+`test_fold_loop_element_projection_is_generic_evaluator_only_5519` pins the difference as intended.
 Pinned in `tests/jq_cli/i5519.rs`, `tests/jq_cli/i5544.rs` and `a_fold_element_is_projected_to_the_members_it_reads_5519`.
 
 **A raw control character is the one fault in this class that is caught document-wide
