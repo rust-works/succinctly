@@ -28613,9 +28613,13 @@ fn interval_quantifier_at(chars: &[char], at: usize) -> Option<(usize, bool)> {
 /// The exception is a quantifier that ends the pattern, or ends it but for closing parentheses
 /// (`(?:a++)`): nothing after it can fail, so the plain quantifier matches the same text
 /// (`sub("a*+";"X")`) and the `+` is dropped.
-/// A lazy quantifier followed by `+` (`a*?+`) and `{n}+` are a repeat of a repeat in jq as well
-/// and are left alone, as is a `+` that whitespace separates from its quantifier under the `x`
-/// flag (`a* +`).
+/// A fixed `{n}` followed by `+` is just `{n}` in jq (`"aaaa" | match("a{2}+")` is `aa`; the
+/// `+` repeats nothing, since a fixed count has nothing to give back), where the `regex` crate
+/// reads `(?:a{2})+`, so the `+` is dropped (#6079). Whatever follows it is a new quantifier on
+/// that: `{n}++` repeats `{n}`, and `{n}+?` makes it optional (greedily; the crate would read a
+/// bare `?` there as lazy, so it is written `{0,1}`). A lazy quantifier followed by `+` (`a*?+`)
+/// and `{n}?+` are a repeat of a repeat in jq as well and are left alone, as is a `+` that
+/// whitespace separates from its quantifier under the `x` flag (`a* +`).
 /// Escapes, character classes, `\Q..\E`, `(?#..)` and, under `x`, `#` comments are stepped over;
 /// an inline `(?x)` is not modelled, so a `#` comment under it is read as pattern.
 #[cfg(feature = "regex")]
@@ -28644,6 +28648,11 @@ fn refuse_possessive_quantifier(
         Fixed,
     }
     let mut last = Last::Other;
+    // The `+` of a possessive quantifier whose plain form matches the same text, and of a fixed
+    // `{n}+`, which jq reads as `{n}`: dropped from the pattern the crate sees.
+    let mut drops: Vec<usize> = Vec::new();
+    // A `?` after such a `{n}+`, written `{0,1}` so that it stays the greedy optional.
+    let mut optional: Vec<usize> = Vec::new();
     let mut i = 0;
     while i < chars.len() {
         let before = std::mem::replace(&mut last, Last::Other);
@@ -28655,6 +28664,16 @@ fn refuse_possessive_quantifier(
                     i += 1;
                 }
                 i += 2;
+            }
+            // A braced escape (`\x{41}`, `\p{Lu}`, `\k{n}`) is one atom: its digits in braces are not
+            // an interval, and a `+` after it is a plain greedy quantifier (#6079).
+            '\\' if matches!(chars.get(i + 1), Some('x' | 'p' | 'P' | 'k' | 'g' | 'N'))
+                && chars.get(i + 2) == Some(&'{') =>
+            {
+                i = chars[i + 3..]
+                    .iter()
+                    .position(|&c| c == '}')
+                    .map_or(i + 3, |close| i + 3 + close + 1);
             }
             '\\' => i += 2,
             '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') => {
@@ -28696,11 +28715,22 @@ fn refuse_possessive_quantifier(
                 // Nothing after it can fail, so it never has to give anything back: the plain
                 // quantifier matches the same text.
                 if chars[i + 1..].iter().all(|&c| c == ')') {
-                    let mut plain: String = chars[..i].iter().collect();
-                    plain.extend(&chars[i + 1..]);
-                    return Ok(std::borrow::Cow::Owned(plain));
+                    drops.push(i);
+                    // Only `)` follows, so there is nothing left to scan.
+                    break;
                 }
                 return Err(refusal());
+            }
+            // #6079: a fixed count has nothing to give back, so jq's `{n}+` is `{n}`; a quantifier
+            // after it applies to that.
+            '+' if before == Last::Fixed => {
+                drops.push(i);
+                i += 1;
+                if chars.get(i) == Some(&'?') {
+                    optional.push(i);
+                    last = Last::Greedy;
+                    i += 1;
+                }
             }
             // The lazy marker of the quantifier before it; what follows is a new quantifier.
             '?' if before != Last::Other => i += 1,
@@ -28718,7 +28748,24 @@ fn refuse_possessive_quantifier(
             _ => i += 1,
         }
     }
-    Ok(std::borrow::Cow::Borrowed(pattern))
+    if drops.is_empty() {
+        return Ok(std::borrow::Cow::Borrowed(pattern));
+    }
+    // Both lists are in ascending order, so each is walked once.
+    let mut dropped = drops.iter().copied().peekable();
+    let mut swapped = optional.iter().copied().peekable();
+    let mut rewritten = String::new();
+    for (at, &c) in chars.iter().enumerate() {
+        if dropped.next_if_eq(&at).is_some() {
+            continue;
+        }
+        if swapped.next_if_eq(&at).is_some() {
+            rewritten.push_str("{0,1}");
+        } else {
+            rewritten.push(c);
+        }
+    }
+    Ok(std::borrow::Cow::Owned(rewritten))
 }
 
 /// How many compiled patterns [`build_regex`] keeps (#5531).
@@ -141696,6 +141743,51 @@ mod tests {
         ] {
             let got = translate_posix_brackets(pattern, false).unwrap();
             assert_eq!(got, want, "{pattern}");
+        }
+    }
+
+    /// #6079: a fixed `{n}` followed by `+` is `{n}` in jq. The scan drops the `+`; a quantifier
+    /// after it applies to the `{n}`, and a `?` is written `{0,1}` so it stays the greedy optional.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_fixed_count_plus_drops_the_plus_6079() {
+        use std::borrow::Cow;
+        for (pattern, want) in [
+            ("a{2}+", "a{2}"),
+            (".{1}+", ".{1}"),
+            ("(ab){1}+c", "(ab){1}c"),
+            ("a{2}+$", "a{2}$"),
+            ("a{2}+|b{3}+", "a{2}|b{3}"),
+            ("a{2}++", "a{2}+"),
+            ("a{2}+*", "a{2}*"),
+            ("a{2}+{2}", "a{2}{2}"),
+            ("a{2}+?", "a{2}{0,1}"),
+            ("a{2}+?a", "a{2}{0,1}a"),
+            ("a{2}+??", "a{2}{0,1}?"),
+        ] {
+            let got = refuse_possessive_quantifier(pattern, false).unwrap();
+            assert_eq!(got, want, "{pattern}");
+        }
+        // Left as written: a repeat of a repeat in jq too, a class, an escaped brace, and a `+`
+        // that the extended mode separates from its quantifier.
+        for pattern in [
+            "a{2}?+",
+            "[a{2}+]",
+            r"\{2}+",
+            "a{2}",
+            "a{2,3}",
+            // A braced escape is one atom: its `{41}` is not a count, and its `+` repeats.
+            r"\x{41}+",
+            r"\p{Lu}+",
+            r"\x{41}{2}",
+        ] {
+            assert!(
+                matches!(
+                    refuse_possessive_quantifier(pattern, false),
+                    Ok(Cow::Borrowed(_))
+                ),
+                "{pattern}"
+            );
         }
     }
 
