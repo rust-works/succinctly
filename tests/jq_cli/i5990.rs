@@ -9,6 +9,15 @@ use crate::run_jq_over_byte_files;
 
 const FILTER: &str = "[limit(8; repeat(try input catch .))]";
 
+/// `(files, flags, stdout, stderr, exit code)`.
+type RouteRow = (
+    &'static [&'static [u8]],
+    &'static [&'static str],
+    &'static str,
+    &'static str,
+    i32,
+);
+
 /// `try input catch .` over one file: the fault each string with a raw control character raises.
 #[test]
 fn a_control_character_in_a_string_is_refused_before_the_substitution_5990() -> Result<()> {
@@ -31,8 +40,7 @@ fn a_control_character_in_a_string_is_refused_before_the_substitution_5990() -> 
 /// The same refusal on the main loop's route, `--stream` and `-s`.
 #[test]
 fn the_other_routes_refuse_it_too_5990() -> Result<()> {
-    // `(files, flags, stdout, stderr, exit code)`.
-    let rows: &[(&[&[u8]], &[&str], &str, &str, i32)] = &[
+    let rows: &[RouteRow] = &[
         (&[b"\"\xe1\n\" 1 }"], &["-c", "."], "", "jq: parse error: Invalid string: control characters from U+0000 through U+001F must be escaped at line 2, column 1\n", 5),
         (&[b"[1,\"a\xe1\x01b\",2]"], &["-c", "--stream", "."], "[[0],1]\n", "jq: parse error: Invalid string: control characters from U+0000 through U+001F must be escaped at line 1, column 9\n", 5),
         (&[b"\"\xe1\n\" 1"], &["-cs", "."], "", "jq: parse error: Invalid string: control characters from U+0000 through U+001F must be escaped at line 2, column 1\n", 5),
