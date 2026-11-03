@@ -9456,7 +9456,7 @@ impl LazyBatch {
 /// after them, in order) is handed out, and then the end of the stream.
 fn lazy_json_producer_then(
     lazy: LazyJsonInputs,
-    mut tail: std::collections::VecDeque<jq::ProducedInput>,
+    mut tail: Box<dyn Iterator<Item = jq::ProducedInput>>,
     mut exhausted: Option<(u32, u32)>,
 ) -> jq::InputProducer {
     // The counter's place in the text, kept between reads without a borrow of it.
@@ -9469,9 +9469,7 @@ fn lazy_json_producer_then(
     let mut stream = (!lazy.spans.is_empty() || lazy.more.is_some()).then_some(lazy);
     Box::new(move || {
         let Some(lazy) = stream.as_mut() else {
-            return tail
-                .pop_front()
-                .unwrap_or(jq::ProducedInput::End(exhausted));
+            return tail.next().unwrap_or(jq::ProducedInput::End(exhausted));
         };
         // Every document scanned so far is read: scan the next chunk (#5856).
         if next == lazy.spans.len() {
@@ -9482,9 +9480,7 @@ fn lazy_json_producer_then(
             if lazy.spans.is_empty() {
                 stream = None;
                 batch = None;
-                return tail
-                    .pop_front()
-                    .unwrap_or(jq::ProducedInput::End(exhausted));
+                return tail.next().unwrap_or(jq::ProducedInput::End(exhausted));
             }
         }
         let bytes = lazy.text.as_bytes();
@@ -9527,7 +9523,7 @@ fn lazy_json_producer_then(
 /// in `tail`, exactly as [`get_inputs`] queues them for a fault it finds up front.
 fn lazy_scan_on(
     lazy: &mut LazyJsonInputs,
-    tail: &mut std::collections::VecDeque<jq::ProducedInput>,
+    tail: &mut Box<dyn Iterator<Item = jq::ProducedInput>>,
     exhausted: &mut Option<(u32, u32)>,
 ) {
     let Some(mut more) = lazy.more.take() else {
@@ -9597,13 +9593,15 @@ fn lazy_scan_on(
                         &ends,
                         values.len(),
                     );
-                    tail.extend(lazy_tail_items(values, &locations, None, errors));
+                    *tail = Box::new(lazy_tail_items(values, &locations, None, errors));
                 }
                 // patchcov: coverage tolerate reason="unreachable: the splitter is the more lenient of the two parsers and the prefix parse materializes from its spans, so it cannot find fewer values (the guard `read_json_tail` keeps per segment, #4311)"
-                Err(error) => tail.push_back(jq::ProducedInput::Error(
-                    EvalError::new(error.to_string()),
-                    (lazy.source, UNKNOWN_LINE),
-                )),
+                Err(error) => {
+                    *tail = Box::new(std::iter::once(jq::ProducedInput::Error(
+                        EvalError::new(error.to_string()),
+                        (lazy.source, UNKNOWN_LINE),
+                    )))
+                }
                 // patchcov: coverage end
             }
             *exhausted = settled(
@@ -9653,7 +9651,7 @@ fn seed_input_queue(
         let tail = lazy_tail_items(inputs, locations, trailing_error, resumed_errors);
         jq::seed_remaining_inputs_from(lazy_json_producer_then(
             lazy,
-            tail,
+            Box::new(tail),
             locations.exhausted(slurp),
         ));
         if locations.eof_tail.is_some() {
@@ -9710,35 +9708,59 @@ fn lazy_tail_items(
     locations: &InputLocations,
     trailing_error: Option<TrailingParseError>,
     resumed_errors: Vec<(usize, TrailingParseError)>,
-) -> std::collections::VecDeque<jq::ProducedInput> {
+) -> LazyTail {
     debug_assert_eq!(
         inputs.len(),
         locations.per_value().len(),
         "one location per queued document"
     );
     let documents = inputs.len();
-    // As a plain error: jq's `try input catch .` catches a parse error like any other, where the
-    // materializer's own error is tagged as an uncatchable decode failure.
-    let error_of = |t: TrailingParseError| {
-        jq::ProducedInput::Error(EvalError::new(t.error.message), (t.source, t.line))
-    };
-    let mut errors = resumed_errors
-        .into_iter()
-        .chain(trailing_error.map(|t| (documents, t)))
-        .peekable();
-    let mut out = std::collections::VecDeque::with_capacity(documents);
-    for (index, (value, &(source, line))) in
-        inputs.into_iter().zip(locations.per_value()).enumerate()
-    {
-        while errors.peek().is_some_and(|&(before, _)| before <= index) {
-            if let Some((_, t)) = errors.next() {
-                out.push_back(error_of(t));
-            }
-        }
-        out.push_back(jq::ProducedInput::Document(value, source, line));
+    LazyTail {
+        values: inputs.into_iter(),
+        places: locations.per_value().to_vec(),
+        index: 0,
+        errors: resumed_errors
+            .into_iter()
+            .chain(trailing_error.map(|t| (documents, t)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .peekable(),
     }
-    out.extend(errors.map(|(_, t)| error_of(t)));
-    out
+}
+
+/// The items [`lazy_tail_items`] hands out, one at a time: building them all up front would hold a
+/// second copy of every value's slot beside the vector they come from (#5856).
+struct LazyTail {
+    values: std::vec::IntoIter<OwnedValue>,
+    /// `(source, line)` of every value, in order.
+    places: Vec<(u32, u32)>,
+    /// How many values were handed out.
+    index: usize,
+    errors: std::iter::Peekable<std::vec::IntoIter<(usize, TrailingParseError)>>,
+}
+
+impl Iterator for LazyTail {
+    type Item = jq::ProducedInput;
+
+    fn next(&mut self) -> Option<jq::ProducedInput> {
+        // Each error comes ahead of the document its count names, and the ones left after the last
+        // document come last.
+        let error_next = self
+            .errors
+            .peek()
+            .is_some_and(|&(before, _)| before <= self.index || self.values.len() == 0);
+        if error_next {
+            // As a plain error: jq's `try input catch .` catches a parse error like any other,
+            // where the materializer's own error is tagged as an uncatchable decode failure.
+            return self.errors.next().map(|(_, t)| {
+                jq::ProducedInput::Error(EvalError::new(t.error.message), (t.source, t.line))
+            });
+        }
+        let value = self.values.next()?;
+        let (source, line) = self.places[self.index];
+        self.index += 1;
+        Some(jq::ProducedInput::Document(value, source, line))
+    }
 }
 
 /// `--stream` and `--stream-errors` inputs read as the program asks for them (#5498): jq's streaming parser over
@@ -14703,7 +14725,6 @@ mod tests {
         // The queue hands them out in that order.
         let tail = lazy_tail_items(inputs, &locations, trailing, resumed);
         let kinds: Vec<&str> = tail
-            .iter()
             .map(|item| match item {
                 jq::ProducedInput::Document(..) => "document",
                 jq::ProducedInput::Error(..) => "error",
@@ -14967,7 +14988,7 @@ mod tests {
         lazy: LazyJsonInputs,
         exhausted: Option<(u32, u32)>,
     ) -> jq::InputProducer {
-        lazy_json_producer_then(lazy, std::collections::VecDeque::new(), exhausted)
+        lazy_json_producer_then(lazy, Box::new(std::iter::empty()), exhausted)
     }
 
     /// #5853: the tail a malformed stream hands out after its lazy start is in the order the queue
@@ -15043,7 +15064,7 @@ mod tests {
                             seam: Seam::NONE,
                             more: None,
                         },
-                        tail,
+                        Box::new(tail),
                         None,
                     ));
                     assert_eq!(
