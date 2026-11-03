@@ -30,10 +30,7 @@ fn a_negative_zero_literal_prints_zero_in_json() -> Result<()> {
 
 #[test]
 fn a_negative_zero_variable_index_has_an_integer_path() -> Result<()> {
-    let got = json(
-        ". as $d | -0 | . as $i | $d | .[$i] | path",
-        "[1, 2, 3]\n",
-    )?;
+    let got = json(". as $d | -0 | . as $i | $d | .[$i] | path", "[1, 2, 3]\n")?;
     assert_eq!(got, "[0]\n");
     Ok(())
 }
