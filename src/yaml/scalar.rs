@@ -646,13 +646,18 @@ fn has_non_json_float_marker(raw: &str) -> bool {
 /// The number yq's JSON encoder writes for a literal whose text is not what it writes.
 ///
 /// An integer past `i64` ([`overflowed_int_json_text`]), a spelled one
-/// ([`spelled_int_json_text`]) or a spelled float ([`spelled_float_json_text`]). `None` for
-/// every literal that is echoed.
+/// ([`spelled_int_json_text`]), a spelled float ([`spelled_float_json_text`]) or `-0`. `None`
+/// for every literal that is echoed.
+///
+/// `-0` is the integer zero of an expression literal (`-0`, `.a |= -0`, a JSON-sourced `-0`):
+/// yq keeps its text for `tostring` and YAML output, and its JSON encoder prints `0` (#6051). A
+/// YAML document's `-0` is a float, which never reaches this function as that text.
 #[must_use]
 pub fn yq_json_number_text(raw: &str) -> Option<String> {
     overflowed_int_json_text(raw)
         .or_else(|| spelled_int_json_text(raw))
         .or_else(|| spelled_float_json_text(raw))
+        .or_else(|| (raw == "-0").then(|| "0".into()))
 }
 
 /// A normalized, JSON-safe equivalent spelling for `s`, for a `Float`
