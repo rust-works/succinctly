@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Randomised differential for jq's multi-file input stream (#4305, #4316, #4335, #4349, #4352,
-#4358, #4376): the byte stream jq builds from several files, with a token open where a file ends,
+#4358, #4376, #5936): the byte stream jq builds from several files, with a token open where a file ends,
 a parse error caught by `try input catch`, and the lines `input_line_number` names.
 
 jq reads its input files as ONE concatenated byte stream, with a line count and 4095-byte reads
@@ -25,9 +25,8 @@ With `--base BINARY` (a build of `main`), every differing run is attributed:
     both        neither matches
 
 so a change is judged by what it moved, not by the residual it leaves. A deliberately nasty pool
-(`--pool nasty`) still differs from jq in about one run in forty on two files and more on three
-(a fault met in bytes that came from more than one file is not modelled, `Seam::chained`); read
-the totals against the same pool on `main`, never against zero.
+(`--pool nasty`) still differs from jq in some runs; read the totals against the same pool on
+`main`, never against zero.
 
 Usage (debug builds are fine; run it under `memcap.py` like any other succinctly run):
 
@@ -71,6 +70,8 @@ PROGRAMS = [
         '[limit(8; repeat(try (input | [., input_line_number]) '
         'catch ["E", input_line_number]))]',
     ],
+    # The parser's own message names the line and column it stands on (#5923, #5936).
+    ["-nc", "[limit(8; repeat(try input catch .))]"],
 ]
 
 
@@ -104,7 +105,7 @@ def main():
     ap.add_argument("--pool", choices=["clean", "nasty"], default="clean")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--streams", type=int, default=250)
-    ap.add_argument("--files", type=int, choices=[2, 3], default=0, help="0: either, at random")
+    ap.add_argument("--files", type=int, choices=[2, 3, 4], default=0, help="0: either, at random")
     ap.add_argument("--max-tokens", type=int, default=6)
     ap.add_argument("--timeout", type=float, default=20.0)
     ap.add_argument("--show", type=int, default=5, help="runs to print per class")
