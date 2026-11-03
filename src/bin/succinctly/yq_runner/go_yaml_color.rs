@@ -334,6 +334,13 @@ impl Src {
         }
     }
 
+    /// Whether a line break has been pushed at or after relative position `from`.
+    fn has_newline_from(&self, from: usize) -> bool {
+        self.last_newline
+            .and_then(|abs| abs.checked_sub(self.origin))
+            .is_some_and(|rel| rel >= from)
+    }
+
     /// The relative position of the second-to-last line break, if it is at or after `from`.
     fn prev_newline_from(&self, from: usize) -> Option<usize> {
         self.prev_newline
@@ -620,7 +627,19 @@ struct Scanner {
     /// How far the search for the closing quote of the scalar waiting at `.0` has read, so that
     /// each piece of text that arrives is read once, not the scalar again from its opening.
     quote_probe: Option<(usize, usize)>,
+    /// How much text with no line break in it a scan waits for before it starts on the line, and
+    /// how much of its end it then leaves unscanned for the look-ahead the scanner makes.
+    /// A line shorter than the first is read whole, as the Go scanner reads it; a longer one is
+    /// read as it arrives, so that one very long line does not have to be held entire.
+    long_line: usize,
+    tail: usize,
 }
+
+/// The defaults of [`Scanner::long_line`] and [`Scanner::tail`].
+const LONG_LINE: usize = 64 * 1024;
+const LINE_TAIL: usize = 4 * 1024;
+/// The tokens a scan hands to the printer at a time.
+const TOKEN_BATCH: usize = 512;
 
 impl Scanner {
     fn new() -> Self {
@@ -641,6 +660,8 @@ impl Scanner {
             saved_pos: None,
             eof: false,
             quote_probe: None,
+            long_line: LONG_LINE,
+            tail: LINE_TAIL,
         }
     }
 
@@ -1770,16 +1791,49 @@ impl Scanner {
         if self.eof {
             return ctx.size();
         }
-        ctx.src
-            .prev_newline_from(ctx.idx)
-            .map_or(ctx.idx, |newline| newline + 1)
+        if let Some(newline) = ctx.src.prev_newline_from(ctx.idx) {
+            return newline + 1;
+        }
+        // No complete line follows the one being scanned, but this one has already outgrown
+        // the rest of the pieces in the text: scan it up to the tail it still needs.
+        let size = ctx.size();
+        if size.saturating_sub(ctx.idx) > self.long_line {
+            return size.saturating_sub(self.tail).max(ctx.idx);
+        }
+        ctx.idx
+    }
+
+    /// Whether the scanner may look ahead from `ctx.idx` for the end of the line: either the end
+    /// of the line has arrived, or the text is over.
+    fn line_end_is_known(&self, ctx: &Ctx) -> bool {
+        self.eof || ctx.src.has_newline_from(ctx.idx)
+    }
+
+    /// Whether the character at `ctx.idx` would make the scanner read on to the end of its line,
+    /// and that line has not been fully received (only a line long enough to be scanned before its
+    /// end arrives can be in that state).
+    fn must_wait_for_line_end(&self, ctx: &Ctx, c: char) -> bool {
+        if self.line_end_is_known(ctx) {
+            return false;
+        }
+        match c {
+            '#' => !ctx.exists_buffer() || matches!(ctx.previous_char(), ' ' | '\t' | '\n' | '\r'),
+            '|' | '>' => !ctx.exists_buffer(),
+            '!' => !ctx.exists_buffer() && !self.is_directive,
+            '<' => ctx.repeat_num('<') == 2,
+            _ => false,
+        }
     }
 
     /// Scans the text so far, as far as `stop` allows. Returns an error token to print and
-    /// carry on after, like `lexer.Tokenize` does.
-    fn scan(&mut self, ctx: &mut Ctx) -> Res<()> {
+    /// carry on after, like `lexer.Tokenize` does, and whether it paused to have its tokens
+    /// taken, to be called again.
+    fn scan(&mut self, ctx: &mut Ctx) -> Res<bool> {
         let stop = self.stop(ctx);
         while ctx.idx < stop {
+            if ctx.tokens.len() >= TOKEN_BATCH {
+                return Ok(true);
+            }
             let c = ctx.current_char();
             if !self.eof
                 && (c == '"' || c == '\'')
@@ -1787,7 +1841,10 @@ impl Scanner {
                 && !ctx.exists_buffer()
                 && !self.quote_is_closed(ctx, c)
             {
-                return Ok(());
+                return Ok(false);
+            }
+            if !ctx.is_multi_line() && self.must_wait_for_line_end(ctx, c) {
+                return Ok(false);
             }
             self.update_indent(c);
             if self.indent_state == IndentState::Down {
@@ -1870,7 +1927,7 @@ impl Scanner {
         if self.eof {
             self.add_buffered_token_if_exists(ctx);
         }
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -1970,7 +2027,8 @@ impl YamlColorizer {
                 self.printer.push(tk, out);
             }
             match result {
-                Ok(()) => break,
+                Ok(true) => self.ctx.src.compact(self.ctx.idx),
+                Ok(false) => break,
                 Err(invalid_token) => {
                     self.printer.push(invalid_token, out);
                     // Tokenize starts a new Scan() after the invalid token: a context of its own
@@ -1990,6 +2048,16 @@ impl YamlColorizer {
             }
         }
         self.ctx.src.compact(self.ctx.idx);
+    }
+
+    /// A colorizer that scans a line before it has arrived in full once it passes `long_line`
+    /// characters, leaving `tail` of them unscanned: the defaults are far longer than a test's text.
+    #[cfg(test)]
+    fn with_line_limits(long_line: usize, tail: usize) -> Self {
+        let mut colorizer = Self::default();
+        colorizer.scanner.long_line = long_line;
+        colorizer.scanner.tail = tail;
+        colorizer
     }
 
     /// Colors `text`, a piece of the current result's text.
@@ -2109,6 +2177,36 @@ mod tests {
         let whole = color(text);
         for size in [1, 2, 3, 5, 8, 13, 100] {
             assert_eq!(color_in_pieces(text, size), whole, "pieces of {size}");
+        }
+    }
+
+    /// A line scanned before it has arrived in full colors as it does when it is read whole.
+    #[test]
+    fn a_long_line_scanned_as_it_arrives_colors_as_when_read_whole_5416() {
+        let texts = [
+            "a: &x 1 # c\nb: *x\nc: |\n  lit\n  eral\nd: 'q''s'\ne: \"a\\nb\"\nf: [1, \"b\", c]\n",
+            "- x # c\n- !!str 1\n- !custom 5\n- {a: [1, 2], b: 'x'}\n- ? k\n  : v\n",
+            "list: [aaa, bbb # not a comment\n  , ccc]\nurl: http://x/#y\nm:\n  <<: *x\n  n: ~\n",
+            "---\na: 1\n---\nb: |-\n  text\n  more\n...\n",
+            "k: this is a fairly long plain scalar # with a comment after it\nj: \"and a long double quoted one\"\n",
+        ];
+        for text in texts {
+            let whole = color(text);
+            for (long_line, tail) in [(1, 8), (6, 8), (20, 16)] {
+                for size in [1, 2, 5, 13, 64] {
+                    let mut colorizer = YamlColorizer::with_line_limits(long_line, tail);
+                    let mut out = String::new();
+                    let chars: Vec<char> = text.chars().collect();
+                    for piece in chars.chunks(size) {
+                        colorizer.push_str(&piece.iter().collect::<String>(), &mut out);
+                    }
+                    colorizer.finish(&mut out);
+                    assert_eq!(
+                        out, whole,
+                        "{text:?} limits {long_line}/{tail} pieces of {size}"
+                    );
+                }
+            }
         }
     }
 
