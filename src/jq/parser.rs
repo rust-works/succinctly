@@ -111,6 +111,14 @@ enum Bracket {
     },
 }
 
+/// What a quoted dotted step, `."key"`, names: see [`Parser::parse_path_step`].
+enum PathStep {
+    /// A string with no interpolation: a field of the target.
+    Field(String),
+    /// A string with `\(...)` interpolation: the key is computed against the chain's input.
+    Computed(Expr),
+}
+
 /// Attach a parsed bracket to the postfix chain built so far.
 ///
 /// A dynamic key captures the chain as its `target`, because the key is
@@ -2195,6 +2203,20 @@ impl<'a> Parser<'a> {
         Ok(Expr::StringInterpolation(parts))
     }
 
+    /// The quoted step of a dotted path, `."key"`, as jq's grammar reads it: `Term '.' String`, an
+    /// index by that string. A string with no interpolation names a field; one with `\(...)` indexes
+    /// by the computed string, as `.["a\(1)"]` does (#6053). yq reads the text raw, so only jq mode
+    /// can compute one.
+    fn parse_path_step(&mut self) -> Result<PathStep, ParseError> {
+        if self.mode == ParserMode::Jq {
+            return Ok(match self.parse_string_or_interpolation()? {
+                Expr::Literal(Literal::String(name)) => PathStep::Field(name.to_string()),
+                computed => PathStep::Computed(computed),
+            });
+        }
+        self.parse_path_step_name().map(PathStep::Field)
+    }
+
     /// The quoted name of a dotted path step, `."key"` (#4916). In jq mode that is an ordinary string
     /// literal. yq reads the text between the quotes **raw**, escapes included, up to the next `"`:
     /// `.x."a\tb"` selects the key `a\tb` (a backslash and a `t`), where `.x["a\tb"]` selects the one
@@ -4080,8 +4102,10 @@ impl<'a> Parser<'a> {
 
                 // Check for quoted field access `."key"`
                 let mut expr = if self.peek() == Some('"') {
-                    let name = self.parse_path_step_name()?;
-                    self.field_or_wildcard(name)
+                    match self.parse_path_step()? {
+                        PathStep::Field(name) => self.field_or_wildcard(name),
+                        PathStep::Computed(key) => Expr::index_by(Expr::Identity, key),
+                    }
                 } else {
                     // Field access `.foo`
                     let name = self.parse_field_ident()?;
@@ -9109,7 +9133,20 @@ impl<'a> Parser<'a> {
                         push_bracket(&mut chain, bracket);
                     } else {
                         let name = if self.peek() == Some('"') {
-                            self.parse_path_step_name()?
+                            match self.parse_path_step()? {
+                                PathStep::Field(name) => name,
+                                PathStep::Computed(key) => {
+                                    // `.a."b\(0)"` is `.a | .["b\(0)"]` with the key read from the
+                                    // chain's input, as a bracket's is (#6053).
+                                    self.skip_ws();
+                                    let optional = self.at_postfix_question();
+                                    if optional {
+                                        self.next();
+                                    }
+                                    push_bracket(&mut chain, Bracket::Dynamic { key, optional });
+                                    continue;
+                                }
+                            }
                         } else {
                             self.parse_field_ident()?
                         };
