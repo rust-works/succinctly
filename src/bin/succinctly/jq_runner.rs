@@ -3144,6 +3144,7 @@ fn extract_func_defs(expr: &Expr) -> FuncDefList {
 }
 
 /// Output formatting configuration
+#[derive(Clone)]
 struct OutputConfig {
     compact: bool,
     raw_output: bool,
@@ -3176,6 +3177,15 @@ struct OutputConfig {
 }
 
 impl OutputConfig {
+    /// This config with `-C` off, for the one record [`drops_color_for_ascii_raw`] says jq writes uncolored (#6047).
+    /// Cloned only when `-C`, `-a` and a raw string coincide, so no other record pays for it.
+    fn without_color(&self) -> Self {
+        Self {
+            color_output: false,
+            ..self.clone()
+        }
+    }
+
     fn from_args(args: &JqCommand) -> Self {
         let indent_string = if args.uses_tab_indent() {
             "\t".to_string()
@@ -13036,6 +13046,15 @@ fn write_output_jq_value_colored<Out: Write, Wrd: Clone + AsRef<[u64]>>(
         None
     };
 
+    // #6047: `-C` is dropped for a string `-a` keeps quoted under a raw mode.
+    let uncolored;
+    let (config, stream_color) = if drops_color_for_ascii_raw(&as_str, config) {
+        uncolored = config.without_color();
+        (&uncolored, false)
+    } else {
+        (config, stream_color)
+    };
+
     // #3909: a cursor whose source text is already the compact record needs no
     // render and so no buffer -- the scan that certified it is the validation
     // the buffer exists to wait for (#3265), and nothing after it can fail.
@@ -13341,6 +13360,14 @@ fn is_raw_record(as_str: &Option<Cow<'_, str>>, config: &OutputConfig) -> bool {
     as_str.is_some() && !config.ascii_output
 }
 
+/// Whether `-a` makes this raw-shaped record print uncolored (#6047). jq writes a top-level string
+/// under `-a` with `-r`, `-j` or `--raw-output0` through its own `jv_dumpf(.., JV_PRINT_ASCII)` branch,
+/// which has no color flag: the quotes stay (#2662) and `-C` is dropped, for any string, not only
+/// a non-ASCII one. A string inside a container, and a non-string, are colored as before.
+fn drops_color_for_ascii_raw(as_str: &Option<Cow<'_, str>>, config: &OutputConfig) -> bool {
+    as_str.is_some() && config.ascii_output && config.color_output
+}
+
 /// The `-r`/`-j`/`--raw-output0` string of an owned value, or `None` when
 /// this record is not raw-shaped. `OwnedValue`'s counterpart to
 /// `JqValue::as_str()`, which the lazy writer uses for the same purpose --
@@ -13382,7 +13409,16 @@ fn write_output_owned_value<Out: Write>(
     value: &OwnedValue,
     config: &OutputConfig,
 ) -> Result<()> {
-    if write_output_raw_prologue(out, owned_raw_str(value, config), config)? {
+    let raw = owned_raw_str(value, config);
+    // #6047: `-C` is dropped for a string `-a` keeps quoted under a raw mode.
+    let uncolored;
+    let config = if drops_color_for_ascii_raw(&raw, config) {
+        uncolored = config.without_color();
+        &uncolored
+    } else {
+        config
+    };
+    if write_output_raw_prologue(out, raw, config)? {
         return Ok(());
     }
 
@@ -19569,7 +19605,16 @@ mod tests {
             value: &OwnedValue,
             config: &OutputConfig,
         ) -> Result<()> {
-            if write_output_raw_prologue(out, owned_raw_str(value, config), config)? {
+            let raw = owned_raw_str(value, config);
+            // #6047: the one rule this route has gained since; `-C` is dropped for a string `-a` keeps quoted.
+            let uncolored;
+            let config = if drops_color_for_ascii_raw(&raw, config) {
+                uncolored = config.without_color();
+                &uncolored
+            } else {
+                config
+            };
+            if write_output_raw_prologue(out, raw, config)? {
                 return Ok(());
             }
             out.write_all(format_json(value, config).as_bytes())?;
