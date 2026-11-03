@@ -50,3 +50,11 @@ fn a_negative_zero_in_a_document_is_still_a_float() -> Result<()> {
     assert_eq!(json(".a", "a: -0\n")?, "-0.0\n");
     Ok(())
 }
+
+#[test]
+fn a_negative_zero_read_from_json_prints_zero() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(".", "[-0, 1]\n", &["-p=json", "-o=json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[0,1]\n");
+    Ok(())
+}

@@ -4598,6 +4598,8 @@ Two differences remain, none of them about the digits of an integer past `i64`:
   An underscored decimal or a hex float (`"1_0.5"`, `"0x1p3"`) still normalizes to its value (`10.5`, `8`).
   An explicit `!!float 9223372036854775807` prints the rounded double.
   `"-0" | tonumber` is a float here (`-0` in JSON, `!!float`) and an `!!int` in yq, which prints `0` there.
+  A `-0` expression literal is the integer zero in both tools: `tostring` and YAML output echo `-0`, and JSON output prints `0` ([#6051](https://github.com/rust-works/succinctly/issues/6051)).
+  A `-0` index bound to a variable and used on a literal array (`-0 | . as $i | [10, 20] | .[$i] | path`) still echoes `-0` in the path when it is written as YAML (`- -0`, where yq prints `- 0`); JSON output prints `[0]`.
   A signed or underscored integer past `i64` (`"+9223372036854775808"`, `"1_000_000_000_000_000_000_0"`) normalizes to its double.
   An underscored or upper-case-prefixed spelling (`1_000`, `0X10`) written to a file and read back by `succinctly yq` is a string, the recorded input-spec divergence; yq reads it as an integer.
 - **A tag is not printed on a nested value.** yq keeps an explicit tag on the node, so a `!!float`
