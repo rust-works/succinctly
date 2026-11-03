@@ -169,8 +169,9 @@ script = "scripts/jq-alt-retry-oracle-sweep.sh"
 args = ["{subject}"]
 timeout_s = 300
 
-# The jq-mode half only, with `--gate`: the yq half is a recording (904 of its 10,248 cases differ
-# from yq v4.53.3 at #5552), and the harness's reference is jq. All 10,248 jq cases agree, 3.3 minutes.
+# The jq-mode half only, with `--gate`: the harness's reference is jq and it runs no yq. The yq half
+# agrees with yq v4.53.3 on all 10,248 cases too (#5998; the 904 differences #5552 saw came from a host
+# whose yq was v4.52.2), and `--gate` without `--jq-only` checks it by hand. All 10,248 jq cases agree, 3.3 minutes.
 # `--gate` re-runs a diverging case once before it counts: on macOS about one case in 20,000 has recorded
 # exit 0 for a run that printed its error, then agreed on every re-run (#5952).
 [[sweep]]
