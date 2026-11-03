@@ -9537,7 +9537,13 @@ fn lazy_scan_on(
             faults + usize::from(chunk.end == ChunkEnd::Fault),
         ));
     });
-    lazy.spans.extend(chunk.spans);
+    // At a fault the chunk's own documents are the eager reader's too, from the end of the last
+    // document read: the text is then done with as soon as it has read them (a stream with a fault
+    // early in it held 4% to 12% more memory than the eager route while its last chunk's documents
+    // were read lazily), and a number or literal directly before the fault is its to decide.
+    if chunk.end != ChunkEnd::Fault {
+        lazy.spans.extend(chunk.spans);
+    }
     let end_of_last = lazy.spans.last().map_or(more.scanned_to, |&(_, end)| end);
     let settled = |tail: EofTail| (!tail.unknown).then_some((more.last_source, tail.newlines));
     match chunk.end {
