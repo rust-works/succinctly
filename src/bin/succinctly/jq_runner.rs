@@ -5210,8 +5210,15 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // loop derives from a file (its name, its source tag, the line a
         // diagnostic names) is carried here instead, since the one document
         // no longer belongs to any single file.
-        let (raw_inputs, slurped) = if args.slurp {
-            match slurp_documents(raw_inputs, &originals, &files, args.validate, &seams) {
+        let (raw_inputs, mut slurped) = if args.slurp {
+            match slurp_documents(
+                raw_inputs,
+                &originals,
+                &files,
+                args.validate,
+                &seams,
+                failures.iter().any(|&(at, _)| at >= files.len()),
+            ) {
                 Ok(mut slurped) => (vec![std::mem::take(&mut slurped.combined)], Some(slurped)),
                 // `--validate` already printed its own report.
                 Err(SlurpFailure::Validation(exit_code)) => return Ok(exit_code),
@@ -5240,6 +5247,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         } else {
             (raw_inputs, None)
         };
+        // #6004: the error jq raises once the slurped array is out.
+        let slurp_deferred_fault = slurped.as_mut().and_then(|s| s.fault.take());
         // #5576: a malformed member this route meets when the filter reads it is worded as jq's
         // parser words it, from the stream's first fault. The buffers are shared with the loop
         // below, not copied; a slurped stream's are gone, so it is read again from its files.
@@ -5687,6 +5696,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // reader meets when it asks for more and finds none -- unless the run had stopped.
         if !run_stopped {
             report_open_failures(&failures[next_failure..], &mut open_failed);
+        }
+        // #6004: the fault a slurped stream ended in, after the array it holds.
+        if let (false, Some(message)) = (run_stopped, slurp_deferred_fault) {
+            out.flush()?;
+            sink.report_parse_error(&message);
+            return Ok(DiagStyle::Jq.error_exit_code());
         }
     } else {
         // The materializing path: reads every document up front into a
@@ -6406,6 +6421,9 @@ fn get_inputs(
     // it, and the `InputLocations` built from it, so a file that did not open takes no index.
     // A main input `read_file_bytes` couldn't open is jq's own exit-2 usage error (#3098),
     // reported here and left out; `opened` hands the caller the names that remain.
+    // #6004: a file that would not open after the last one that did is read after it, so the
+    // stream does not end where the last opened file does.
+    let mut unopened_tail = false;
     let (files, mut raw_bytes): OpenedInputs = if files.is_empty() {
         match read_stdin_bytes() {
             Ok(b) => (files, vec![(None, b)]),
@@ -6413,6 +6431,7 @@ fn get_inputs(
         }
     } else {
         let (files, raws, failures) = read_input_files(&files);
+        unopened_tail = failures.iter().any(|&(at, _)| at >= files.len());
         if let Some(&(at, _)) = failures.first() {
             note_open_failure_at(at);
         }
@@ -7177,6 +7196,7 @@ fn get_inputs(
                         src,
                         seam: &seam,
                         lossy,
+                        ends_stream: pos == last && !unopened_tail,
                     };
                     let file_end = match read_json_tail(
                         &raw,
@@ -7208,17 +7228,42 @@ fn get_inputs(
                 // slurped stream it could not finish parsing. The error goes
                 // out in jq's channel at exit 5, like every other malformed
                 // document, rather than through `anyhow` at exit 1.
+                // ... except for one shape (#6004): a bare number or literal straight before the
+                // stream's last byte, an opener, is a value by the time jq meets the fault, so
+                // the array holds it and the error follows the array.
+                let mut slurp_keeps_prefix = false;
                 if args.slurp {
-                    if let Some(error) = parse_error {
-                        let malformed = MalformedJsonError::new(error);
-                        // #5555: the read that met the fault, as the resuming route places it.
-                        return Ok(Err(
-                            match slurp_fault_at(&raw, seam, parsed.len(), args.stream) {
+                    if let Some(error) = &parse_error {
+                        // Only where the stream ends in this file's last byte.
+                        if pos == last && !unopened_tail && !args.stream && !args.seq {
+                            let (spans, split_error) = split_json_values(raw.as_bytes());
+                            let malformed_start = spans
+                                .get(parsed.len())
+                                .map(|&(start, _)| start)
+                                .or(split_error);
+                            slurp_keeps_prefix = parsed
+                                .len()
+                                .checked_sub(1)
+                                .and_then(|i| spans.get(i).copied())
+                                .zip(malformed_start)
+                                .is_some_and(|(span, malformed)| {
+                                    bare_token_before_final_opener(raw.as_bytes(), span, malformed)
+                                });
+                        }
+                        if !slurp_keeps_prefix {
+                            let malformed = MalformedJsonError::new(error.clone());
+                            // #5555: the read that met the fault, as the resuming route places it.
+                            return Ok(Err(match slurp_fault_at(
+                                &raw,
+                                seam,
+                                parsed.len(),
+                                args.stream,
+                            ) {
                                 Some(line) => malformed.at_stream_fault(src, line),
                                 None => malformed, // patchcov: coverage tolerate-line reason="unreachable: the prefix parse stopped at value `parsed`, which the splitter either delimits or stopped at, so a read is found; kept so a disagreement falls back to line 0 (#5555)"
                             }
-                            .into(),
-                        ));
+                            .into()));
+                        }
                     }
                 }
                 // Skipped under `--slurp` (#1541) -- see the DSV branch above.
@@ -7281,7 +7326,11 @@ fn get_inputs(
                     trailing_error = Some(TrailingParseError {
                         error,
                         source: u32::try_from(src).unwrap_or(u32::MAX),
-                        line: u32::try_from(error_line).unwrap_or(u32::MAX),
+                        line: if slurp_keeps_prefix {
+                            UNKNOWN_LINE
+                        } else {
+                            u32::try_from(error_line).unwrap_or(u32::MAX)
+                        },
                         seq_warning: false,
                     });
                     break;
@@ -7339,7 +7388,9 @@ fn get_inputs(
             // (above); only `--seq`'s deferred warning follows the array
             // (#3201).
             {
-                debug_assert!(trailing_error.as_ref().map_or(true, |t| t.seq_warning));
+                debug_assert!(trailing_error
+                    .as_ref()
+                    .map_or(true, |t| t.seq_warning || t.line == UNKNOWN_LINE));
                 trailing_error
             },
             resumed_errors,
@@ -9008,6 +9059,23 @@ fn bare_token_lost_to_fault(
         && parse_error_detection(bytes, malformed, stream) == end
 }
 
+/// Whether the malformed value at `malformed` is the stream's last byte, a `[` or `{`, straight after
+/// the bare number or literal at `span`: the one shape where jq's parser has completed that token
+/// when it meets the end of input (#6004). A number or literal completes on the byte after it, and
+/// here that byte is the opener the end of input leaves unfinished, so the token is a value before
+/// the fault is raised. The read that completed it is the read that reached the end, so the fault
+/// is named `<unknown>`, and a slurp holds the token (`printf '1[' | jq -cs .` prints `[1]` and
+/// then fails). With white space between (`1 [`), or after a string or container (`"a"[`, `[1][`),
+/// the value was complete in an earlier read and the fault is named after the file as usual.
+/// Oracle-verified against jq 1.7.1.
+fn bare_token_before_final_opener(bytes: &[u8], span: (usize, usize), malformed: usize) -> bool {
+    let (start, end) = span;
+    end == malformed
+        && malformed + 1 == bytes.len()
+        && matches!(bytes[malformed], b'[' | b'{')
+        && !matches!(bytes.get(start), Some(b'"' | b'[' | b'{'))
+}
+
 /// The byte at which jq detects the fault in the malformed value starting at
 /// `start`: see [`parse_error_line`].
 fn parse_error_detection(bytes: &[u8], start: usize, stream: bool) -> usize {
@@ -9452,6 +9520,9 @@ struct TailContext<'a> {
     seam: &'a Seam,
     /// The bytes jq read, where the text is a substitution of them (#5964).
     lossy: Option<&'a LossySource>,
+    /// The stream ends in this source's last byte: it is the last file and no file after it
+    /// failed to open (#6004).
+    ends_stream: bool,
 }
 
 /// The eager reader of a JSON text from byte `offset` on (#4311): the documents it holds, each ending
@@ -9538,7 +9609,21 @@ fn read_json_tail(
             }
             break;
         };
-        let (detected, line, resume) = meet_fault(&mut faults, raw.as_bytes(), start, cx.stream);
+        let (detected, mut line, resume) =
+            meet_fault(&mut faults, raw.as_bytes(), start, cx.stream);
+        // #6004: a bare token straight before the last byte, an opener, completes in the read that
+        // reaches the end, so jq names the fault `<unknown>`.
+        if cx.ends_stream
+            && !cx.stream
+            && read
+                .checked_sub(1)
+                .and_then(|i| spans.get(i))
+                .is_some_and(|&(s, e)| {
+                    bare_token_before_final_opener(raw.as_bytes(), (offset + s, offset + e), start)
+                })
+        {
+            line = UNKNOWN_LINE as usize;
+        }
         // A fault met in bytes moved onto this file is in the read of the file they came from,
         // which is the file jq names for it (#6004).
         let fault_source = faults.moved_source(detected).unwrap_or(cx.src);
@@ -9922,6 +10007,8 @@ fn lazy_scan_on(
                 src: lazy.source as usize,
                 seam: &lazy.seam,
                 lossy: more.lossy.as_ref(),
+                // Not known here whether a file after this one failed to open (#6004).
+                ends_stream: false,
             };
             let (mut values, mut ends, mut errors) = (Vec::new(), Vec::new(), Vec::new());
             match read_json_tail(text, end_of_last, &cx, &mut values, &mut ends, &mut errors) {
@@ -10800,6 +10887,9 @@ struct SlurpedInput {
     /// The last source's own newline count at EOF, the line jq's `(at ...)`
     /// marker names for a value slurped out of the whole stream (#1520).
     eof_line: usize,
+    /// The parse error jq raises after the slurped array when the stream ends in a bare token
+    /// straight before one last opener (#6004): the array holds the token, the error follows it.
+    fault: Option<String>,
 }
 
 /// jq's parse error for a `--slurp` stream the splitter gave up on in `raw`, file `idx` of `files`
@@ -10894,12 +10984,14 @@ fn slurp_documents(
     files: &[PathBuf],
     validate: bool,
     seams: &[Seam],
+    unopened_tail: bool,
 ) -> core::result::Result<SlurpedInput, SlurpFailure> {
     let last = raw_inputs.len().saturating_sub(1);
     let mut combined = Vec::with_capacity(raw_inputs.iter().map(Vec::len).sum::<usize>() + 2);
     let mut eof_line = 0;
     combined.push(b'[');
     let mut wrote_value = false;
+    let mut fault = None;
     // Where the current file starts in jq's input, which counts lines across files (#5555).
     let mut origin = StreamOrigin::ALONE.file;
     for (idx, raw) in raw_inputs.into_iter().enumerate() {
@@ -10917,9 +11009,19 @@ fn slurp_documents(
                 .get(idx)
                 .and_then(Option::as_deref)
                 .unwrap_or(&raw);
-            return Err(SlurpFailure::Unsplittable(slurp_fault(
-                files, idx, read, origin,
-            )));
+            let message = slurp_fault(files, idx, read, origin);
+            // #6004: a bare token straight before the stream's last byte, an opener, is a value
+            // by the time jq meets the fault: the array keeps it and the error follows.
+            let keeps_prefix = idx == last
+                && !unopened_tail
+                && message.is_some()
+                && spans
+                    .last()
+                    .is_some_and(|&span| bare_token_before_final_opener(&raw, span, offset));
+            if !keeps_prefix {
+                return Err(SlurpFailure::Unsplittable(message));
+            }
+            fault = message;
         }
         if idx != last {
             // The next file starts where jq's line and column counts leave off here.
@@ -10950,6 +11052,7 @@ fn slurp_documents(
         combined,
         last_source: last,
         eof_line,
+        fault,
     })
 }
 
@@ -18466,7 +18569,7 @@ mod tests {
     fn slurp_documents_joins_every_value_in_file_order_2847() {
         let join_with = |files: &[&str], validate: bool| {
             let raw = files.iter().map(|f| f.as_bytes().to_vec()).collect();
-            match slurp_documents(raw, &[], &[], validate, &[]) {
+            match slurp_documents(raw, &[], &[], validate, &[], false) {
                 Ok(s) => Ok((
                     String::from_utf8(s.combined).unwrap(),
                     s.last_source,
