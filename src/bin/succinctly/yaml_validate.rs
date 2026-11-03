@@ -271,27 +271,8 @@ fn get_error_snippet(input: &[u8], line: usize, column: usize) -> Option<ErrorSn
         .map_or(text.len(), |i| line_start + i);
     let line_content = &text[line_start..line_end];
 
-    let max_width = 80;
-    let (display_content, caret_offset) = if line_content.len() > max_width {
-        let error_col = column.saturating_sub(1);
-        if error_col < max_width / 2 {
-            let truncated = &line_content[..max_width.min(line_content.len())];
-            (format!("{truncated}..."), error_col)
-        } else if error_col >= line_content.len().saturating_sub(max_width / 2) {
-            let start = line_content.len().saturating_sub(max_width);
-            let truncated = &line_content[start..];
-            let pos_in_truncated = error_col.saturating_sub(start);
-            (format!("...{truncated}"), pos_in_truncated + 3)
-        } else {
-            let start = error_col.saturating_sub(max_width / 2);
-            let end = (start + max_width).min(line_content.len());
-            let truncated = &line_content[start..end];
-            let pos_in_truncated = error_col.saturating_sub(start);
-            (format!("...{truncated}..."), pos_in_truncated + 3)
-        }
-    } else {
-        (line_content.to_string(), column.saturating_sub(1))
-    };
+    // Truncate long lines (on character boundaries, #5988)
+    let (display_content, caret_offset) = crate::error_snippet::truncate_line(line_content, column);
 
     Some(ErrorSnippet {
         line_content: display_content,
