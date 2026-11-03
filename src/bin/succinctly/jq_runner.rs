@@ -8383,6 +8383,9 @@ struct Seam {
     /// one file (an empty or all-tail file handed them on) these are the last file's, and
     /// `earlier` holds the others (#5936).
     prev_lines: usize,
+    /// Which file the last share came from: its position among the files stitched, which is the
+    /// source tag of the file's values (#6004).
+    prev_source: usize,
     /// The files the `base` bytes came from before the last, front to back (#5936). `None`
     /// when they came from one file, which is nearly always.
     earlier: Option<std::rc::Rc<[SeamPart]>>,
@@ -8402,6 +8405,9 @@ struct SeamPart {
     /// The newlines in that file ahead of the share: jq has counted them when it meets a fault
     /// in it.
     lines: usize,
+    /// The file the share came from, by its position among the files stitched: the file jq's read
+    /// of these bytes was in, so the file it names for a fault met in them (#6004).
+    source: usize,
 }
 
 impl Seam {
@@ -8410,6 +8416,7 @@ impl Seam {
         moved_len: 0,
         moved_newline: None,
         prev_lines: 0,
+        prev_source: 0,
         earlier: None,
         raw_ends: None,
     };
@@ -8430,6 +8437,7 @@ impl Seam {
         let last = SeamPart {
             end: self.base,
             lines: self.prev_lines,
+            source: self.prev_source,
         };
         let mut start = 0;
         self.earlier
@@ -8486,7 +8494,7 @@ impl Seam {
                     .iter()
                     .map(|part| SeamPart {
                         end: text_end(part.end),
-                        lines: part.lines,
+                        ..part.clone()
                     })
                     .collect()
             }),
@@ -8664,6 +8672,12 @@ impl<'a> LineCounter<'a> {
             part.lines + count_newlines(&self.bytes[start..read_end]),
             read_end,
         ))
+    }
+
+    /// The file the moved byte at `at` came from, by its position among the files stitched, or
+    /// `None` for a byte of this file's own (#6004).
+    fn moved_source(&self, at: usize) -> Option<usize> {
+        (at < self.seam.base.min(self.bytes.len())).then(|| self.seam.part_at(at).1.source)
     }
 
     /// Where the read holding `at` ends, given that the last call was
@@ -9200,7 +9214,9 @@ fn stitch_json_file_seams<'a>(
         if !carry.is_empty() {
             seams[index].base = carry.len();
             let mut parts = std::mem::take(&mut carry_parts);
-            seams[index].prev_lines = parts.pop().map_or(0, |last| last.lines);
+            let last = parts.pop().unwrap_or_default();
+            seams[index].prev_lines = last.lines;
+            seams[index].prev_source = last.source;
             seams[index].earlier = (!parts.is_empty()).then(|| parts.into());
             // Exact, not amortized: a doubled capacity on a multi-gigabyte file is the cost.
             raw.reserve_exact(carry.len());
@@ -9222,12 +9238,14 @@ fn stitch_json_file_seams<'a>(
                         .map(|(from, part)| SeamPart {
                             end: part.end - start,
                             lines: part.lines + newlines(&raw[from.min(start)..start]),
+                            source: part.source,
                         })
                         .collect();
                     if carry.len() > base - start {
                         parts.push(SeamPart {
                             end: carry.len(),
                             lines: 0,
+                            source: index,
                         });
                     }
                     parts
@@ -9235,6 +9253,7 @@ fn stitch_json_file_seams<'a>(
                     vec![SeamPart {
                         end: carry.len(),
                         lines: newlines(seams[index].own(raw)),
+                        source: index,
                     }]
                 };
                 debug_assert!(
@@ -9510,11 +9529,14 @@ fn read_json_tail(
             break;
         };
         let (detected, line, resume) = meet_fault(&mut faults, raw.as_bytes(), start, cx.stream);
+        // A fault met in bytes moved onto this file is in the read of the file they came from,
+        // which is the file jq names for it (#6004).
+        let fault_source = faults.moved_source(detected).unwrap_or(cx.src);
         resumed_errors.push((
             values.len(),
             TrailingParseError {
                 error,
-                source: u32::try_from(cx.src).unwrap_or(u32::MAX),
+                source: u32::try_from(fault_source).unwrap_or(u32::MAX),
                 line: u32::try_from(line).unwrap_or(u32::MAX),
                 seq_warning: false,
             },
@@ -9542,6 +9564,7 @@ fn read_json_tail(
         // `8`).
         while next < raw.len() && (inside_edit.is_some() || !raw.is_char_boundary(next)) {
             let line = faults.line_at_read_of(next);
+            let fault_source = faults.moved_source(next).unwrap_or(cx.src);
             let raw_start = inside_edit.take();
             // #5975: the fault is the parser's own, read from the byte the read
             // starts on, from where the parser stood at the last fault.
@@ -9563,7 +9586,7 @@ fn read_json_tail(
                 values.len(),
                 TrailingParseError {
                     error,
-                    source: u32::try_from(cx.src).unwrap_or(u32::MAX),
+                    source: u32::try_from(fault_source).unwrap_or(u32::MAX),
                     line: u32::try_from(line).unwrap_or(u32::MAX),
                     seq_warning: false,
                 },
@@ -18048,7 +18071,16 @@ mod tests {
                 // ... which makes the bytes it hands on more than one file's (#4376): the first
                 // file's three, then the second's one (#5936).
                 Seam {
-                    earlier: Some([SeamPart { end: 3, lines: 0 }].into()),
+                    earlier: Some(
+                        [SeamPart {
+                            end: 3,
+                            lines: 0,
+                            source: 0
+                        }]
+                        .into()
+                    ),
+                    // ... the second file's share is the last (#6004).
+                    prev_source: 1,
                     ..moved(4, 0, None)
                 }
             ]
@@ -18091,7 +18123,14 @@ mod tests {
         let two_files = Seam {
             base: 8,
             prev_lines: 0,
-            earlier: Some([SeamPart { end: 5, lines: 2 }].into()),
+            earlier: Some(
+                [SeamPart {
+                    end: 5,
+                    lines: 2,
+                    source: 0,
+                }]
+                .into(),
+            ),
             ..Seam::NONE
         };
         let mut counter = LineCounter::at_seam(stitched, two_files);
@@ -18102,7 +18141,14 @@ mod tests {
         let early_seam = Seam {
             base: 8,
             prev_lines: 0,
-            earlier: Some([SeamPart { end: 6, lines: 3 }].into()),
+            earlier: Some(
+                [SeamPart {
+                    end: 6,
+                    lines: 3,
+                    source: 0,
+                }]
+                .into(),
+            ),
             ..Seam::NONE
         };
         let counter = LineCounter::at_seam(early, early_seam);
@@ -18136,16 +18182,36 @@ mod tests {
         let chain = seams(&[b"1\n[1,", b"2,", b"3]\n"]);
         assert_eq!((chain[1].base, chain[1].earlier.is_some()), (3, false));
         assert_eq!((chain[2].base, chain[2].prev_lines), (5, 0));
+        // Each share knows the file it came from (#6004): the first file's `[1,`, then the
+        // second's `2,`.
+        assert_eq!(chain[2].prev_source, 1);
+        assert_eq!(
+            chain[2].earlier.as_deref().map(|parts| parts[0].source),
+            Some(0)
+        );
+        assert_eq!(chain[1].prev_source, 0);
         assert_eq!(
             chain[2].earlier.as_deref(),
-            Some(&[SeamPart { end: 3, lines: 1 }][..])
+            Some(
+                &[SeamPart {
+                    end: 3,
+                    lines: 1,
+                    source: 0
+                }][..]
+            )
         );
         // The newlines ahead of the first file's share stay with it, and the second file's
         // share, all of its own bytes, has none ahead.
         let lines = seams(&[b"\n\n[1,\n", b"2,\n3,", b"4]\n"]);
         assert_eq!(
             lines[2].earlier.as_deref(),
-            Some(&[SeamPart { end: 4, lines: 2 }][..])
+            Some(
+                &[SeamPart {
+                    end: 4,
+                    lines: 2,
+                    source: 0
+                }][..]
+            )
         );
         assert_eq!((lines[2].base, lines[2].prev_lines), (9, 0));
         // `\` is part of the run up to a boundary, and so is every byte after it.
@@ -18172,14 +18238,27 @@ mod tests {
         let seam = Seam {
             base: 6,
             prev_lines: 1,
-            earlier: Some([SeamPart { end: 3, lines: 0 }].into()),
+            earlier: Some(
+                [SeamPart {
+                    end: 3,
+                    lines: 0,
+                    source: 0,
+                }]
+                .into(),
+            ),
             ..Seam::NONE
         };
         let (after, _) = substituted(seam, b"[\xff,\n\xffx");
         assert_eq!((after.base, after.prev_lines), (10, 1));
         assert_eq!(
             after.earlier.as_deref(),
-            Some(&[SeamPart { end: 5, lines: 0 }][..])
+            Some(
+                &[SeamPart {
+                    end: 5,
+                    lines: 0,
+                    source: 0
+                }][..]
+            )
         );
         // One file's moved bytes have nothing earlier to move.
         let (one, _) = substituted(Seam::base(2), b"\xff1");
@@ -18213,7 +18292,11 @@ mod tests {
         let raw = b"[\xe2\x82]\xac\" 1";
         let seam = Seam {
             base: 3,
-            earlier: Some([SeamPart { end: 2, lines: 0 }].into()),
+            earlier: Some([SeamPart {
+                end: 2,
+                lines: 0,
+                source: 0,
+            }].into()),
             ..Seam::NONE
         };
         let (after, edits) = substituted(seam, raw);
@@ -18223,6 +18306,48 @@ mod tests {
         assert_eq!(
             after.raw_start_inside_edit(after.base, after.base, &spread),
             None
+        );
+    }
+
+    /// #6004: a byte moved onto a file is named after the file it came from, whichever of several
+    /// the bytes were handed on through, and one of the file's own bytes after none.
+    #[test]
+    fn moved_source_names_the_file_a_byte_came_from_6004() {
+        let seam = Seam {
+            base: 6,
+            prev_source: 2,
+            earlier: Some(
+                [
+                    SeamPart {
+                        end: 1,
+                        lines: 0,
+                        source: 0,
+                    },
+                    SeamPart {
+                        end: 3,
+                        lines: 0,
+                        source: 1,
+                    },
+                ]
+                .into(),
+            ),
+            ..Seam::NONE
+        };
+        let counter = LineCounter::at_seam(b"[\xe1\n1,2,x]", seam);
+        assert_eq!(
+            (0..8)
+                .map(|at| counter.moved_source(at))
+                .collect::<Vec<_>>(),
+            [
+                Some(0),
+                Some(1),
+                Some(1),
+                Some(2),
+                Some(2),
+                Some(2),
+                None,
+                None
+            ]
         );
     }
 

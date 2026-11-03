@@ -72,7 +72,11 @@ PROGRAMS = [
     ],
     # The parser's own message names the line and column it stands on (#5923, #5936).
     ["-nc", "[limit(8; repeat(try input catch .))]"],
+    # An uncaught fault names the file and line its read met it in, on stderr (#6004).
+    ["-nc", "[inputs]"],
 ]
+# Programs whose first stderr line is part of the answer: the others catch every error.
+COMPARES_STDERR = {"[inputs]"}
 
 
 def run(binary, program, names, timeout):
@@ -82,6 +86,8 @@ def run(binary, program, names, timeout):
         r = subprocess.run(argv + program + names, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return ("timeout", b"")
+    if program[1] in COMPARES_STDERR:
+        return (r.returncode, r.stdout, r.stderr.split(b"\n")[0])
     return (r.returncode, r.stdout)
 
 
