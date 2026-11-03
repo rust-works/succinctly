@@ -10389,6 +10389,15 @@ What differs from jq 1.7.1:
   The pin's libc does not skip a leading space before them (`" 9" | strptime("%k")` is an error, as here), where glibc does.
   A specifier the libc does not know (`%Q`, `%P`, `%5`) and a `%` that ends the format are no match, where they were once matched as a literal.
   `%g` and `%G` are no match in the pin's libc and here, and glibc reads them.
+  What a glibc `jq` does under a locale, measured (#5754) on a Ryzen 9 7950X (Ubuntu 22.04, glibc 2.35) with a source-built jq 1.7.1, `de_DE`, `tr_TR`, `fr_FR` and `ja_JP` generated with `localedef` into a user `LOCPATH`, and `C` and `en_US` as installed.
+  `strftime` agrees in all six locales for every specifier but `%P`: 1,584 rows (six instants, 44 formats, six locales), 36 differ, all `%P`.
+  glibc prints `%P` as the lowercase marker (`am`, `pm`; `ÖÖ` and `午前` under `tr_TR` and `ja_JP`; an error under `de_DE` and `fr_FR`, whose markers are empty), where the pin's libc and this implementation print a bare `P`.
+  `strptime` has three differences beyond the ones above.
+  The names of the `C` locale are read as well as the locale's own: `"Thursday, 05 March 2015" | strptime("%A, %d %B %Y")` is read under `de_DE`, `tr_TR` and `fr_FR`, and so is `"March" | strptime("%B")`, where the pin's libc and this implementation read only the locale's names (the `locale-strptime-en-de-de` and `locale-strptime-en-tr-tr` ledger entries; the Linux runners have no such locale and show nothing).
+  `%p` is remembered and applied when the hour is read, in either order: `"PM 11" | strptime("%p %I")` is hour 23 and `"AM 12"` is hour 0, and a `%p` with no hour read leaves the hour 0, where the pin reads `%p` as it arrives and `"PM" | strptime("%p")` is hour 12.
+  The same remembered marker lets glibc read an hour past 12 with it (`"13 PM" | strptime("%H %p")` is hour 13), where the pin refuses (#5960); it also shows in `ja_JP`'s `%r`, whose layout holds `%p`.
+  Under `tr_TR` the English `AM` and `PM` are read as well as `ÖÖ` and `ÖS`; under `de_DE` neither is read, as its markers are empty (so are `fr_FR`'s).
+  The `%O` forms (`%Ob`, `%Oh`) and the `%k` leading space are the differences recorded above; every other row measured (93 `strptime` rows per locale, each rendered by the glibc jq's own `strftime` and read back, plus the names above) agrees.
   `%U`, `%W` and `%V` read a week number and, once a year is read, place the date by it as the pin's libc does (`"2015 09" | strptime("%Y %U")` is `[2015,2,1,0,0,0,0,59]`): `%U` counts from the year's first Sunday, `%W` from its first Monday and `%V` from the Monday of ISO week 1, and `%w`, `%u` or `%a` picks the day within the week.
   A month read beside a week is kept and the day counted from its start, so `"2015 01 09" | strptime("%Y %m %U")` is January 60 (`[2015,0,60,0,0,0,0,59]`), as in jq.
   A day read beside a week with no month is kept beside the month the week falls in; jq aborts on its own `set_tm_yday` assertion unless the two agree, so there is no answer to match where they do not.
