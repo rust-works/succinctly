@@ -258,5 +258,6 @@ fn a_zone_name_with_a_width_is_exactly_that_long() -> Result<()> {
         ("%+3Z", "GMT", Some("[1969,11,31,23,59,59]")),
         ("%E3Z", "GMT", Some("[1969,11,31,23,59,59]")),
         ("%Z", "GMTA", None),
+        ("%99999999Z", "GMT", None),
     ])
 }

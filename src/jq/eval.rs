@@ -95882,13 +95882,17 @@ struct StrptimeSpecPrefix {
     width: usize,
     /// The specifier that ends the prefix; `None` at the end of the format.
     spec: Option<char>,
-    /// Every character read after the `%`, the specifier included.
+    /// Every character read after the `%`, the specifier included; empty unless the caller asked
+    /// to keep it (only the layout expansion needs it, to copy a prefix it does not replace).
     consumed: String,
     /// Why the prefix is no match, where it is not (the characters after it are left unread).
     error: Option<String>,
 }
 
-fn read_strptime_spec_prefix(chars: &mut impl Iterator<Item = char>) -> StrptimeSpecPrefix {
+fn read_strptime_spec_prefix(
+    chars: &mut impl Iterator<Item = char>,
+    keep_consumed: bool,
+) -> StrptimeSpecPrefix {
     let mut prefix = StrptimeSpecPrefix {
         modifier: None,
         width: 0,
@@ -95900,7 +95904,7 @@ fn read_strptime_spec_prefix(chars: &mut impl Iterator<Item = char>) -> Strptime
     let mut run: Option<usize> = None;
     loop {
         let next = chars.next();
-        if let Some(c) = next {
+        if let (Some(c), true) = (next, keep_consumed) {
             prefix.consumed.push(c);
         }
         match next {
@@ -95948,7 +95952,7 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
         let mut chars = text.chars();
         while let Some(c) = chars.next() {
             if c == '%' {
-                let prefix = read_strptime_spec_prefix(&mut chars);
+                let prefix = read_strptime_spec_prefix(&mut chars, false);
                 if prefix.error.is_none() && matches!(prefix.spec, Some('c' | 'x' | 'X' | 'r')) {
                     return true;
                 }
@@ -95983,7 +95987,7 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
             }
             // `%c`, `%Ex`, `%5X` and `%+r` all stand for the plain layout: the width and the
             // modifier change nothing (#5754, #5989).
-            let prefix = read_strptime_spec_prefix(&mut chars);
+            let prefix = read_strptime_spec_prefix(&mut chars, true);
             match prefix.spec {
                 Some(spec @ ('c' | 'x' | 'X' | 'r')) if prefix.error.is_none() => {
                     out.push_str(layout(spec));
@@ -96091,7 +96095,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                 spec,
                 error,
                 ..
-            } = read_strptime_spec_prefix(&mut fmt_iter);
+            } = read_strptime_spec_prefix(&mut fmt_iter, false);
             if let Some(error) = error {
                 return Err(error);
             }
@@ -96479,13 +96483,18 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     } else {
                         width
                     };
-                    let name: String = input_iter.clone().take(len).collect();
+                    // A width past the rest of the input is refused before anything is copied.
                     if width != 0
-                        && (name.chars().count() != width
-                            || !name.chars().all(|c| c.is_ascii_uppercase()))
+                        && input_iter
+                            .clone()
+                            .take(width)
+                            .filter(char::is_ascii_uppercase)
+                            .count()
+                            != width
                     {
-                        return Err(format!("no zone name of {width} capitals at '{name}'"));
+                        return Err(format!("no zone name of {width} capitals"));
                     }
+                    let name: String = input_iter.clone().take(len).collect();
                     if name == "GMT" {
                         gmt = true;
                         // As `%s` does, `GMT` drops an offset an earlier `%z` read (#5960).
