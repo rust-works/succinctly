@@ -63,12 +63,13 @@ use crate::text::utf8::substitute_invalid_utf8_jq_style;
 /// [`substitute_invalid_utf8_jq_style`] to each JSON string rather than to
 /// the whole buffer (#1743).
 ///
-/// Bytes outside any string are substituted too, per contiguous segment:
-/// the result has to be valid UTF-8 for the rest of the pipeline to treat
-/// it as text at all. Real jq rejects a document with a bad byte outside a
-/// string (`printf '{"a":\xe1\x41 1}' | jq .` is a parse error), and so
-/// does succinctly, so the exact replacement chosen there is only ever
-/// visible in an error message.
+/// Bytes outside any string are substituted too, one invalid byte at a time
+/// (`String::from_utf8_lossy`): the result has to be valid UTF-8 for the rest
+/// of the pipeline to treat it as text at all. Real jq substitutes nothing
+/// there: a bad byte is part of a literal token, which is a parse error
+/// (`printf '{"a":\xe1\x41 1}' | jq .`), and so it is in succinctly. The
+/// white space after it must survive, since jq counts its newlines and a
+/// read that resumes after the fault starts from them (#5994).
 ///
 /// Only for JSON-shaped input. `--raw-input` is line-scoped (#1742, handled
 /// by its own caller), `--raw-input --slurp` is genuinely whole-buffer in
@@ -134,8 +135,8 @@ pub fn substitute_invalid_utf8_jq_document(raw: &[u8]) -> String {
 /// it is not already valid UTF-8.
 ///
 /// The check is not an optimisation on top of a different answer -- it *is*
-/// the same answer: [`substitute_invalid_utf8_jq_style`] returns valid input
-/// byte-for-byte unchanged, pinned by #1247's own guard test. Skipping it
+/// the same answer: `String::from_utf8_lossy` returns valid input
+/// byte-for-byte unchanged. Skipping it
 /// skips an allocation and a second scan, and that is worth having because
 /// segment count scales with the document, not with the corruption in it: a
 /// file with one bad byte still has one segment per JSON string, so building
