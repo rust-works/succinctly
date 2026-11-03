@@ -109,10 +109,10 @@ const ORACLE_ROWS: &[(&str, &str, &str, &str)] = &[
 fn upcase_and_downcase_map_unicode_as_yq_does_6091() -> Result<()> {
     for &(name, document, filter, expected) in ORACLE_ROWS {
         let (output, code) = run_yq_stdin(filter, document, &[])?;
-        // A refusal (a number cannot change case) is yq's, and exits as yq's does.
-        if code == 0 {
-            assert_eq!(output, expected, "{name}: `{filter}` over {document:?}");
-        }
+        // A number or a null cannot change case: yq refuses and prints nothing, and so do we.
+        let refused = name.starts_with("upcase_a_number") || name.starts_with("downcase_null");
+        assert_eq!(code != 0, refused, "{name}");
+        assert_eq!(output, expected, "{name}: `{filter}` over {document:?}");
     }
     Ok(())
 }

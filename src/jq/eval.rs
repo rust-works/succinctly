@@ -21033,6 +21033,14 @@ fn builtin_unicode_case<W: Clone + AsRef<[u64]>>(
 /// full one; and Go's tables are Unicode 15, so a pair Unicode 16 added (`ɤ`/`Ɤ`, `ƛ`/`Ƛ`, the
 /// Garay letters) maps neither way.
 fn simple_case(c: char, upper: bool) -> char {
+    // ASCII has no exception, and is nearly every character of a real document.
+    if c.is_ascii() {
+        return if upper {
+            c.to_ascii_uppercase()
+        } else {
+            c.to_ascii_lowercase()
+        };
+    }
     let cp = c as u32;
     if matches!(
         cp,
