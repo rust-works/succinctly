@@ -27544,6 +27544,11 @@ struct JqRegex {
     /// `l` on the `fancy-regex` engine: a search returns the longest match anywhere at or after
     /// its start, not the leftmost one (see [`fancy_longest_captures`]).
     longest: Option<LongestSearch>,
+    /// For an `l` pattern with `\K`: the pattern anchored at where a search begins (`\G(?:...)`),
+    /// so that each start can be tried alone and a match measured from there, as Oniguruma's
+    /// `ONIG_OPTION_FIND_LONGEST` does, not from where `\K` moved the start (#6085). `fancy-regex`
+    /// reports only the span `\K` keeps.
+    keep_anchored: Option<fancy_regex::Regex>,
 }
 
 /// How an `l` search ends early.
@@ -27725,6 +27730,10 @@ impl JqRegex {
                     };
                 }
                 let max_len = self.longest.and_then(|search| search.max_len);
+                if let Some(anchored) = &self.keep_anchored {
+                    return fancy_longest_keep_captures(anchored, input, start, max_len)
+                        .map(|caps| caps.map(RegexCaptures::Fancy));
+                }
                 fancy_longest_captures(re, input, start, max_len)
                     .map(|caps| caps.map(RegexCaptures::Fancy))
             }
@@ -27836,6 +27845,81 @@ fn fancy_longest_captures<'h>(
             .map_err(fancy_match_error),
         None => Ok(None),
     }
+}
+
+/// Whether `pattern` holds the escape `\` + `letter` outside a class: `\K` the keep operator, not
+/// `\\K` (an escaped backslash and a `K`) nor `[\K]`. A bracket is read loosely (the first `]` ends
+/// a class), which can only turn a keep into a miss for a malformed class; a false yes costs the
+/// slower search (#6085).
+#[cfg(feature = "regex")]
+fn holds_escape(pattern: &str, letter: char) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut in_class = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                if !in_class && chars.get(i + 1) == Some(&letter) {
+                    return true;
+                }
+                i += 2;
+                continue;
+            }
+            '[' => in_class = true,
+            ']' => in_class = false,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether an inline flag group of `pattern` switches a flag off (`(?-x)`, `(?i-x:...)`), which
+/// the anchored copy of an extended-mode pattern does not follow (#6085).
+#[cfg(feature = "regex")]
+fn flag_switched_off(pattern: &str) -> bool {
+    pattern.match_indices("(?").any(|(at, _)| {
+        pattern[at + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
+            .any(|c| c == '-')
+    })
+}
+
+/// [`fancy_longest_captures`] for a pattern with `\K` (#6085): `anchored` is the pattern anchored at
+/// where a search begins, so each start is tried alone and the match found there is measured from
+/// that start. Oniguruma's `ONIG_OPTION_FIND_LONGEST` compares `end - start of the attempt`, not
+/// the span `\K` keeps, which is all `fancy-regex` reports: `"a1" | match("a\\K1";"l")` is
+/// `[[1,1]]`, a match of length 2 from the attempt at 0. The earliest of equal lengths wins, and
+/// the search stops at `max_len`, as the unanchored one does. One call per character position.
+#[cfg(feature = "regex")]
+fn fancy_longest_keep_captures<'h>(
+    anchored: &fancy_regex::Regex,
+    input: &'h str,
+    start: usize,
+    max_len: Option<usize>,
+) -> Result<Option<fancy_regex::Captures<'h, str>>, EvalError> {
+    let mut best: Option<(usize, fancy_regex::Captures<'h, str>)> = None;
+    let mut at = start;
+    loop {
+        if let Some(caps) = anchored
+            .captures_from_pos(input, at)
+            .map_err(fancy_match_error)?
+        {
+            let len = caps.get(0).map_or(0, |m| m.end().saturating_sub(at));
+            if best.as_ref().map_or(true, |(best_len, _)| len > *best_len) {
+                best = Some((len, caps));
+            }
+            if max_len.is_some_and(|max| len >= max) {
+                break;
+            }
+        }
+        match input.get(at..).and_then(|rest| rest.chars().next()) {
+            Some(c) => at += c.len_utf8(),
+            None => break,
+        }
+    }
+    Ok(best.map(|(_, caps)| caps))
 }
 
 /// A `fancy-regex` search that gave up. Oniguruma gives up too, on its own retry limit, with
@@ -29224,6 +29308,21 @@ fn build_regex_uncached<S: EvalSemantics>(
         // anywhere), so fixing `n` alone would change which wrong answer it gives.
         if modes.longest || modes.not_empty {
             if let Some(re) = build_fancy_regex_with::<S>(&pattern, modes) {
+                // #6085: an `l` search with `\K` measures a match from where its attempt began.
+                // Under the `x` flag the closing parenthesis follows a newline, so that a `#`
+                // comment at the end of the pattern cannot swallow it; an inline `(?x)`, a switch
+                // that turns a flag off, and a `\G` of the pattern's own keep the old search.
+                let extended_flag = flags.is_some_and(|f| f.contains('x'));
+                let keep_anchored = (modes.longest
+                    && holds_escape(&pattern, 'K')
+                    && !holds_escape(&pattern, 'G')
+                    && !flag_switched_off(&pattern)
+                    && (extended_flag || !inline_extended(&pattern)))
+                .then(|| {
+                    let close = if extended_flag { "\n" } else { "" };
+                    build_fancy_regex_at::<S>(&pattern, modes, Some(close))
+                })
+                .flatten();
                 return Ok(JqRegex {
                     engine: RegexEngine::Fancy(re),
                     needs_trailing_nl_check: false,
@@ -29232,8 +29331,9 @@ fn build_regex_uncached<S: EvalSemantics>(
                     engine_not_empty: modes.not_empty,
                     longest: modes.longest.then_some(LongestSearch {
                         max_len,
-                        start_independent: !pattern.contains("\\G"),
+                        start_independent: !pattern.contains("\\G") && keep_anchored.is_none(),
                     }),
+                    keep_anchored,
                 });
             }
         }
@@ -29252,6 +29352,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 suppress_empty,
                 engine_not_empty: false,
                 longest: None,
+                keep_anchored: None,
             });
         }
     }
@@ -29264,6 +29365,7 @@ fn build_regex_uncached<S: EvalSemantics>(
             suppress_empty,
             engine_not_empty: false,
             longest: None,
+            keep_anchored: None,
         }),
         // #5502: lookaround, backreferences, atomic groups and the like are Oniguruma syntax the
         // `regex` crate refuses. A pattern `fancy-regex` cannot take either keeps the crate's
@@ -29277,6 +29379,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 suppress_empty,
                 engine_not_empty: false,
                 longest: None,
+                keep_anchored: None,
             }),
             None => Err(EvalError::new(format!("invalid regex: {e}"))),
         },
@@ -29363,6 +29466,21 @@ fn build_fancy_regex_with<S: EvalSemantics>(
     pattern: &str,
     modes: FancyModes,
 ) -> Option<fancy_regex::Regex> {
+    build_fancy_regex_at::<S>(pattern, modes, None)
+}
+
+/// [`build_fancy_regex_with`], optionally anchored at where a search begins (#6085): with
+/// `anchored` = `Some(close)` the program is `\G(?:...` + `close` + `)`, `close` being a newline
+/// under the extended mode so that a `#` comment cannot swallow the parenthesis. The `\G` is
+/// outside the dead branch that variable-length `l` patterns get, since a `\G` inside an
+/// alternation loses `fancy-regex`'s early exit (it fails at once when not at the search start),
+/// and every failing attempt would then scan the rest of the text.
+#[cfg(feature = "regex")]
+fn build_fancy_regex_at<S: EvalSemantics>(
+    pattern: &str,
+    modes: FancyModes,
+    anchored: Option<&str>,
+) -> Option<fancy_regex::Regex> {
     if S::TAG == EvalTag::Yq {
         return None;
     }
@@ -29381,6 +29499,10 @@ fn build_fancy_regex_with<S: EvalSemantics>(
         format!("{FANCY_UNBOUNDED_DEAD_BRANCH}|{pattern}")
     } else {
         pattern
+    };
+    let pattern = match anchored {
+        Some(close) => format!("\\G(?:{pattern}{close})"),
+        None => pattern,
     };
     fancy_regex::RegexBuilder::new(&pattern)
         .oniguruma_mode(true)

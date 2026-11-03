@@ -7501,11 +7501,16 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   Like Oniguruma's, one search reads the rest of the text, unless the pattern has a bounded length (`a|ab`), where the search stops at the first match of that length.
   With `g`, one pass over the starts serves every search of the text, so the loop is linear in the matches ([#5563](https://github.com/rust-works/succinctly/issues/5563)); a pattern with `\G` keeps one search per match, and is quadratic in them.
   An unbounded pattern (`a+`) over a long text reads the rest of it per search in both tools, and a pattern with `\G` over many matches is slow in both, and slower here.
-- **`l` with `\K` misses the match or picks another.**
-  `"a1" | match("a\\K1";"l")` is `[[1,1]]` in jq and empty here, and `"a1b" | match("1\\K|b";"l")` is `[[2,0]]` in jq and `[[2,1]]` here.
-  Oniguruma's longest-match rule measures from where the attempt began, and the search here measures the span `\K` keeps.
-  `n` with `\K` agrees with jq ([#6083](https://github.com/rust-works/succinctly/issues/6083)).
-  Tracked as [#6085](https://github.com/rust-works/succinctly/issues/6085).
+- **`l` with `\K` measures from the attempt, but chooses among ways to match by the span `\K` keeps.**
+  Oniguruma's `ONIG_OPTION_FIND_LONGEST` compares `end - the start of the attempt`, and keeps the first way to match at one start that reaches the best end.
+  The `fancy-regex` route reports only the span `\K` keeps, so a pattern with `\K` under `l` is searched one start at a time with the pattern anchored there (`\G(?:...)`), and a match is measured from that start ([#6085](https://github.com/rust-works/succinctly/issues/6085)).
+  `"a1" | match("a\\K1";"l")` is `[[1,1]]` as in jq, where it was empty.
+  Where the ways to match at one start keep different spans, `fancy-regex` picks the one with the longest kept span: `"baa" | match("b?\\K[ab]a*";"l")` is `[[1,2]]` in jq and `[[0,3]]` here.
+  So does `"ab" | match("a|ab\\K";"l")`, `[[2,0]]` in jq (the second alternative reaches the furthest end) and `[[0,1]]` here.
+  The search is one anchored attempt per character position, and each search reads the rest of the text as Oniguruma's does, so a `g` loop over a long text is quadratic in the matches (a pattern with a `\G` of its own is quadratic in the same way): 12.8 KB holding 6,400 matches takes 6.3 s with `l` and 0.01 s without `\K` (M4 Pro, release build).
+  Without `\K` the one-pass index of [#5563](https://github.com/rust-works/succinctly/issues/5563) is kept.
+  The `x` flag works: the anchored copy closes its group on a new line, so that a `#` comment cannot swallow the parenthesis.
+  An inline `(?x)` or a flag switched off inside the pattern (`(?-x)`) keeps the search that measures the span `\K` keeps.
 - **`l` stays a no-op on a pattern with a lazy quantifier.**
   `fancy-regex`'s longest mode returns the lazy match where Oniguruma returns the longest of all the ways to match: `"aa" | match("a*?";"l")` is `"aa"` in jq and `""` here.
   Such a pattern keeps its old route whole, `n` included, because the two flags are not independent (`ln` is the longest non-empty match anywhere).
