@@ -108,6 +108,23 @@ Located in `bench-compare/benches/`:
 |-------------------------|--------------------------------------------|------------------|
 | `neon_movemask`         | NEON movemask implementations              | Generated inline |
 
+### 7. Micro-benchmarks and probes outside the suites
+
+These targets are not part of `bench run`, a report or CI. Each stays because it is the only way to
+measure what it was written for (#5953); a target whose subject gains a guard elsewhere (a perf-guard
+row, a counted-allocation test) can go.
+
+| Target                                 | Measures                                                                                                  | Why it stays                                                                                                                                                          | Run                                                                       |
+|----------------------------------------|-----------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------|
+| `benches/bp_rank_micro.rs`             | `BalancedParens::rank1` at three tree shapes and four sizes                                               | The baseline #596 (drop BP's `rank_l2`) needs; #596 is open. Delete it if #596 is closed or abandoned.                                                                | `cargo bench --bench bp_rank_micro`                                       |
+| `benches/json_escape_micro.rs`         | `find_json_escape` (SIMD) against a scalar loop, per escape position and string length (#87)              | `find_json_escape` still ships (jq's string escaping in `src/jq/escape.rs`, JSON text output), and no other bench times it alone.                                     | `cargo bench --bench json_escape_micro`                                   |
+| `benches/jq_leaf_paths_clone_bench.rs` | Depth scaling of `collect_leaf_paths` on `{"k":{"k":...}}` (#1657)                                        | The guard that the prefix rebuild stays linear in depth: no test or perf-guard row measures it.                                                                       | `cargo bench --bench jq_leaf_paths_clone_bench`                           |
+| `examples/alloc_probe_3692.rs`         | Allocator calls of one *streaming* evaluation (`eval_each_with_cursor`), the route the CLI drives (#3692) | `alloc_probe_3022` counts the collecting route, which the owned pipe drivers are not reached through, and no counted-allocation test in `tests/` is for #3692's rows. | `cargo run --release --example alloc_probe_3692 -- <file.json> '<query>'` |
+
+The older probes `alloc_probe_3022`, `alloc_sites_3728` (see [section 11](#11-attribute-an-allocation-count-to-call-sites--and-keep-the-sampler-honest)),
+`keyhashes_rss`, `yaml_profile` and `jq_format_shape` ([ADR-0016](../adrs/adr-0016.md)) are
+documented where they are used and follow the same rule.
+
 ---
 
 ## When to Run Benchmarks
