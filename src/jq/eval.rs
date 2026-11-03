@@ -89718,6 +89718,27 @@ fn delete_paths_sorted<S: EvalSemantics>(
         paths.iter().all(|p| p.len() > start),
         "every path in a run is longer than the depth it is grouped at"
     );
+    // #6012: jq reads each key it has more path under with `jv_get`, and a `null` has nothing a
+    // `null`, boolean or array key can name: `null | delpaths([[[1],0]])` is `Cannot index null
+    // with array`. A `null` child never gets that far, because jq skips it before it descends
+    // (`delete_paths_under` returns it as it is), so only a `null` root is asked, here at depth 0;
+    // the first such key in the sorted order jq walks them names the error. yq indexes nothing by
+    // any of them.
+    if start == 0 && !yq_mode && matches!(value, OwnedValue::Null) {
+        if let Some(key) = paths
+            .iter()
+            .filter(|path| path.len() > 1)
+            .map(|path| &path[0])
+            .find(|key| {
+                matches!(
+                    key,
+                    OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::Array(_)
+                )
+            })
+        {
+            return Err(EvalError::cannot_index("null", key));
+        }
+    }
     let mut del_keys: Vec<&OwnedValue> = Vec::new();
     let mut i = 0;
     while i < paths.len() {
@@ -89840,7 +89861,7 @@ fn delete_paths_under<S: EvalSemantics>(
         },
         // jq reads the child with `jv_get`: a `null` is skipped, and any other
         // scalar is `Cannot index <type> with <key>`.
-        // (A `null` *root* meeting a `null`, boolean or array key is `delpaths_jq_apply`'s: jq
+        // (A `null` *root* meeting a `null`, boolean or array key is `delete_paths_sorted`'s: jq
         // skips a `null` child before it descends, so only the root can be indexed here, #6012.)
         OwnedValue::Null => Ok(OwnedValue::Null),
         // #6012: `jv_get` on a string takes an object key as a slice descriptor, before the rest
@@ -89850,7 +89871,7 @@ fn delete_paths_under<S: EvalSemantics>(
         // fails to delete from (`Cannot delete fields from string`) or to index.
         OwnedValue::String(text) if !yq_mode && matches!(key, OwnedValue::Object(_)) => {
             let OwnedValue::Object(desc) = key else {
-                unreachable!("matched an object key above")
+                return Err(EvalError::cannot_index("string", key));
             };
             let chars: Vec<char> = text.chars().collect();
             let range = SliceBounds::from_descriptor(desc)?.resolve_walk(chars.len());
@@ -98864,29 +98885,7 @@ pub(crate) fn delpaths_jq_apply(
     match paths.first() {
         None => Ok(value),
         Some([]) => Ok(OwnedValue::Null),
-        Some(_) => {
-            // #6012: jq reads each key it has more path under with `jv_get`, and a `null` has
-            // nothing a `null`, boolean or array key can name: `null | delpaths([[[1],0]])` is
-            // `Cannot index null with array`. A `null` child never gets that far, because jq
-            // skips it before descending, so only a `null` root is asked (in the sorted order
-            // jq walks the keys, the first such key naming the error).
-            if matches!(value, OwnedValue::Null) {
-                if let Some(key) = paths
-                    .iter()
-                    .filter(|path| path.len() > 1)
-                    .map(|path| &path[0])
-                    .find(|key| {
-                        matches!(
-                            key,
-                            OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::Array(_)
-                        )
-                    })
-                {
-                    return Err(EvalError::cannot_index("null", key));
-                }
-            }
-            delete_paths_sorted::<JqSemantics>(value, &paths, 0)
-        }
+        Some(_) => delete_paths_sorted::<JqSemantics>(value, &paths, 0),
     }
 }
 

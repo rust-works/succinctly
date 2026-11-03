@@ -51,6 +51,16 @@ fn delpaths_reads_the_first_key_of_a_longer_path_as_jv_get_does() -> Result<()> 
         ("{\"a\":null} | try delpaths([[\"a\",[1],0]]) catch .", "{\"a\":null}\n"),
         ("[1,2,3] | try delpaths([[{\"a\":1},0]]) catch .", "\"Array/string slice indices must be integers\"\n"),
         ("1 | try delpaths([[{\"a\":1},0]]) catch .", "\"Cannot index number with object\"\n"),
+        ("{\"a\":\"abc\"} | try delpaths([[\"a\",{\"a\":1},0]]) catch .", "\"Array/string slice indices must be integers\"\n"),
+        ("{\"a\":\"abc\"} | try delpaths([[\"a\",{\"start\":1,\"end\":2},0]]) catch .", "\"Cannot delete fields from string\"\n"),
+        ("[[\"abc\"]] | try delpaths([[0,0,{\"a\":1},0]]) catch .", "\"Array/string slice indices must be integers\"\n"),
+        ("\"abc\" | try del(.[{\"a\":1}][0]) catch .", "\"Array/string slice indices must be integers\"\n"),
+        ("\"abc\" | try del(.[1:2][0]) catch .", "\"Cannot index string with number\"\n"),
+        ("null | try del(.[null].a) catch .", "\"Cannot index null with null\"\n"),
+        ("null | try del(.[true][0]) catch .", "\"Cannot index null with boolean\"\n"),
+        ("null | try del(.[[1]][0]) catch .", "\"Cannot index null with array\"\n"),
+        ("{\"a\":null} | try delpaths([[\"a\",null,0]]) catch .", "{\"a\":null}\n"),
+        ("[null] | try delpaths([[0,null,0]]) catch .", "[null]\n"),
     ] {
         let (out, code) = run_jq_null(filter, &["-c"])?;
         assert_eq!((out.as_str(), code), (want, 0), "{filter}");
