@@ -9624,8 +9624,9 @@ the text after each invalid byte became a three-byte U+FFFD, where jq counts the
 so a value within a few bytes of the boundary can be placed one line off. Invalid bytes are
 substituted before the line model sees the text, and a genuine U+FFFD looks the same.
 The column a parse error names is counted over the bytes jq read, an invalid byte one column, since [#5964](https://github.com/rust-works/succinctly/issues/5964) (`\xff }` is column 2).
-The fault `input` raises after a run jq collapses or drops inside a string (`"\xe1A" }`, where the `A` goes with the lead byte) is still counted over the substituted text, and so reads a column too high for each such run.
-So is a fault after a multi-byte character cut by the end of a file, because the substitution moves the bytes it carried onto the next file.
+The fault a program's `input`/`inputs` raises after a run jq collapses or drops inside a string (`"\xe1A" }`, where the `A` goes with the lead byte) is still counted over the substituted text, and so reads a column too high for each such run.
+The fault the main loop meets, and `-s` and `--stream`, count it over the bytes read.
+A fault after a multi-byte character cut by the end of a file is also off, because the substitution moves the bytes it carried onto the next file ([#5975](https://github.com/rust-works/succinctly/issues/5975)).
 A number or literal where an object key belongs (`{1.5e3`, `{true`) is no fault to jq's lexer until the token after it, so the read jq resumes at is the one holding that token, which can be a later line (`{1.5e3\n1"k":false` reads nothing more); succinctly does the same since [#5645](https://github.com/rust-works/succinctly/issues/5645).
 A container in the same place (`{[1]\n2\n3\n`) is met at the token after it by the plain reader and at its bracket by `--stream`'s parser, in jq and here since [#5655](https://github.com/rust-works/succinctly/issues/5655).
 

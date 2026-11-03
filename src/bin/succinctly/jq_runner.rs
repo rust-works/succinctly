@@ -8160,13 +8160,15 @@ struct LossyRun {
 impl LossySource {
     /// `original` read as `substituted`.
     fn new(original: Vec<u8>, substituted: &[u8]) -> Self {
-        let runs = (substituted == String::from_utf8_lossy(&original).as_bytes())
-            .then(|| Self::runs_of(&original));
+        let runs = Self::runs_of(&original, substituted);
         Self { original, runs }
     }
 
-    /// The runs of invalid bytes in `original`, as the lossy conversion replaces them.
-    fn runs_of(original: &[u8]) -> Vec<LossyRun> {
+    /// The runs of invalid bytes in `original`, as the lossy conversion replaces them, or `None`
+    /// when `substituted` is anything but that conversion. Checked as the runs are found, so
+    /// no second copy of the document is made to compare with.
+    fn runs_of(original: &[u8], substituted: &[u8]) -> Option<Vec<LossyRun>> {
+        const REPLACEMENT: &[u8] = "\u{fffd}".as_bytes();
         let (mut runs, mut text, mut shrink) = (Vec::new(), 0, 0);
         let mut rest = original;
         while !rest.is_empty() {
@@ -8179,15 +8181,21 @@ impl LossySource {
                         .unwrap_or_else(|| rest.len() - e.valid_up_to()),
                 ),
             };
+            if substituted.get(text..text + valid) != Some(&rest[..valid]) {
+                return None;
+            }
             text += valid;
             if invalid > 0 {
+                if substituted.get(text..text + 3) != Some(REPLACEMENT) {
+                    return None;
+                }
                 shrink += 3 - invalid;
                 runs.push(LossyRun { at: text, shrink });
                 text += 3;
             }
             rest = &rest[valid + invalid..];
         }
-        runs
+        (text == substituted.len()).then_some(runs)
     }
 
     /// The offset in the original of `at` in the text; inside a U+FFFD, where its run starts.
@@ -10223,7 +10231,14 @@ fn slurp_documents(
         }
         if idx != last {
             // The next file starts where jq's line and column counts leave off here.
-            origin = advance_position(origin, &raw);
+            // (counted over the bytes as read, #5964)
+            origin = advance_position(
+                origin,
+                originals
+                    .get(idx)
+                    .and_then(Option::as_deref)
+                    .unwrap_or(&raw),
+            );
         }
         for (start, end) in spans {
             if wrote_value {
@@ -16892,8 +16907,6 @@ mod tests {
         }
     }
 
-    /// #4349: the substituted copy is mapped back to the original only when it differs from it by
-    /// one U+FFFD per invalid run; a fault past the byte is found at the matching original byte.
     #[test]
     fn lossy_source_counts_the_bytes_jq_read_5964() {
         let substitute = |original: &[u8]| {
@@ -16938,6 +16951,8 @@ mod tests {
         assert_eq!(lossy.bytes(0..1), None);
     }
 
+    /// #4349: the substituted copy is mapped back to the original only when it differs from it by
+    /// one U+FFFD per invalid run; a fault past the byte is found at the matching original byte.
     #[test]
     fn fault_past_invalid_utf8_maps_back_one_for_one_4349() {
         // Nothing left to fault on once the byte is substituted.
