@@ -209,6 +209,15 @@ fn repair_string_body(out: &mut String, body: &[u8], has_escape: bool) {
         return;
     }
 
+    // jq's lexer refuses a raw control character in a string before it substitutes anything, so a
+    // body holding one is a parse error at that character. The drop quirk must not take it with a
+    // lead byte (`"\xe1\n"` would read as a lone U+FFFD): substitute byte by byte instead, which
+    // keeps every ASCII byte where the parser will find it (#5990).
+    if body.iter().any(|&b| b < 0x20) {
+        out.push_str(&String::from_utf8_lossy(body));
+        return;
+    }
+
     if has_escape {
         let mut decoded = Vec::with_capacity(body.len());
         if decode_escapes_into::<false>(body, &mut decoded).is_ok() {
@@ -239,6 +248,25 @@ mod tests {
         assert_eq!(
             substitute_invalid_utf8_jq_document(b"{\"a\":\"\xe1\x41\",\"b\":[1,2,3],\"c\":\"x\"}"),
             "{\"a\":\"\u{fffd}\",\"b\":[1,2,3],\"c\":\"x\"}"
+        );
+    }
+
+    /// #5990: a raw control character keeps its place, so the parser refuses the string as jq's
+    /// lexer does; the drop quirk would have folded it into the lead byte's U+FFFD.
+    #[test]
+    fn a_control_character_is_never_dropped_with_a_lead_byte_5990() {
+        assert_eq!(
+            substitute_invalid_utf8_jq_document(b"\"\xe1\n\" 1"),
+            "\"\u{fffd}\n\" 1"
+        );
+        assert_eq!(
+            substitute_invalid_utf8_jq_document(b"{\"k\xe1\t\":1}"),
+            "{\"k\u{fffd}\t\":1}"
+        );
+        // Without one, the quirk is unchanged.
+        assert_eq!(
+            substitute_invalid_utf8_jq_document(b"\"\xe1A\" 1"),
+            "\"\u{fffd}\" 1"
         );
     }
 
