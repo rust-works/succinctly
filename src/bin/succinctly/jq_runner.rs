@@ -9601,8 +9601,7 @@ fn lazy_scan_on(
                         EvalError::new(error.to_string()),
                         (lazy.source, UNKNOWN_LINE),
                     )))
-                }
-                // patchcov: coverage end
+                } // patchcov: coverage end
             }
             *exhausted = settled(
                 more.recorded_tail
