@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Pins every x86_64 Linux runner to ubuntu-24.04 until the jq libm goldens are re-captured (#5878).
+"""Pins every x86_64 Linux runner to ubuntu-24.04 until the other jobs are verified on 26.04 (#5878, #5926).
 
 `ubuntu-latest` moved to ubuntu-26.04 on 2026-11-02 and its glibc prints different last digits for
 `tgamma`, `lgamma` and friends, so `math_libm_family` and `math_platform_libm_bits` failed on every
-x86_64 leg and the merge queue stopped. A silent image move is exactly what that was; this makes the
-next one a deliberate edit of this file. Run directly (`python3 scripts/test_ci_runner_pin.py`).
+x86_64 leg and the merge queue stopped. Those two goldens no longer pin the digits 26.04 prints
+differently (#5926), and the whole test suite passes on a 26.04 runner. The pin stays because the
+perf guard (valgrind), coverage and release jobs have not been run there; a silent image move is
+exactly what stopped the queue, so moving the image is a deliberate edit of this file. Run directly
+(`python3 scripts/test_ci_runner_pin.py`).
 """
 
 import pathlib
@@ -25,7 +28,7 @@ class RunnerPinTests(unittest.TestCase):
                     for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
                     if "ubuntu-latest" in line and not line.lstrip().startswith("#")
                 ]
-                self.assertEqual(lines, [], "pin to ubuntu-24.04, or re-capture the libm goldens first (#5878)")
+                self.assertEqual(lines, [], "pin to ubuntu-24.04, or verify the perf guard, coverage and release jobs on the new image first (#5926)")
 
     def test_the_x86_64_test_matrix_is_pinned(self):
         text = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")

@@ -39,10 +39,9 @@
 //!
 //! The two libm cases, `math_libm_family` and `math_platform_libm_bits`, pin last-bit digits, which
 //! are a property of the platform's libm (succinctly calls it, as jq does). They hold only where
-//! Apple's libm, glibc 2.35 and glibc 2.39 agree; Ubuntu 26.04's glibc does not (#5878: `tgamma`
-//! prints `-3.544907701811032` where the golden has `-3.5449077018110318`). The x86_64 Linux CI jobs are
-//! therefore pinned to `ubuntu-24.04` (`scripts/test_ci_runner_pin.py` holds the pin) until those
-//! two cases are re-captured; see `docs/compliance/jq/limitations.md`.
+//! every libm agrees on the inputs they use: Apple's, glibc 2.35, 2.39 and Ubuntu 26.04's 2.43. The
+//! inputs one of them printed differently were dropped (#5878, #5926; `tgamma(-0.5)`, `lgamma(10)`,
+//! `erf(0.25)`, ...), as AArch64's were (#3067). See `docs/compliance/jq/limitations.md`.
 //!
 //! Succinctly-only extensions (`at_offset`, `at_position`, `@dsv`, `@urid`,
 //! `@props`, `@yaml`) have no jq oracle and are deliberately absent here — they
