@@ -5874,25 +5874,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                             );
                             break;
                         }
-                        // jq's `main` prints its parser's depth refusal of the next input as a
-                        // parse error, with no input location (#5497).
-                        jq::InputPop::ParseError(error)
-                            if jq::is_jq_depth_fault(&error.message) =>
-                        {
-                            sink.report_parse_error(&error.message);
-                            break;
-                        }
-                        // ... and so does its streaming parser's fault (#5498), which `--stream`
-                        // reads the input with: the message is the parser's own, with no
-                        // location. A fault the program's own `input` reads is an error of the
-                        // program, with its marker, and never reaches this loop.
-                        jq::InputPop::ParseError(error) if stream_walk_by_reader(&args) => {
-                            sink.report_parse_error(&error.message);
-                            break;
-                        }
-                        // A parse error the main loop meets is jq's `parse error`, with no
-                        // input location, as when the program reads no input (#5965). Only the
-                        // program's own `input` raises it as an error with a marker.
+                        // jq's `main` prints any fault of its parser as a parse error, with no
+                        // input location: its depth refusal of the next input (#5497), its
+                        // streaming parser's fault under `--stream` (#5498), and a malformed
+                        // document (#5965). A fault the program's own `input` reads is an error
+                        // of the program, with its marker, and never reaches this loop.
                         jq::InputPop::ParseError(error) => {
                             sink.report_parse_error(&error.message);
                             break;

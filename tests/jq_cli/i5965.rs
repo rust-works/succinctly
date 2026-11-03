@@ -8,7 +8,14 @@ use anyhow::Result;
 use crate::run_jq_full;
 
 /// `(stream, program, extra flags, stdout, stderr, exit code)`: a row over standard input.
-type Row = (&'static str, &'static str, &'static [&'static str], &'static str, &'static str, i32);
+type Row = (
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static str,
+    &'static str,
+    i32,
+);
 
 #[test]
 fn test_5965_main_loop_parse_error_is_not_a_program_error() -> Result<()> {
@@ -48,7 +55,14 @@ fn test_5965_main_loop_parse_error_is_not_a_program_error() -> Result<()> {
             5,
         ),
         // The program reads the fault itself: caught, so nothing is reported.
-        ("1\n}", "[.,(try input catch \"E\")]", &["-c"], "[1,\"E\"]\n", "", 0),
+        (
+            "1\n}",
+            "[.,(try input catch \"E\")]",
+            &["-c"],
+            "[1,\"E\"]\n",
+            "",
+            0,
+        ),
         // `--stream` words it as its own parser does.
         (
             "1\n}",
@@ -78,5 +92,19 @@ fn test_5965_main_loop_parse_error_is_not_a_program_error() -> Result<()> {
             "{stream:?} | jq {flags:?} {program}"
         );
     }
+    // The same from a file, where the old message named it.
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("s.json");
+    std::fs::write(&path, "1\n}")?;
+    let path = path.to_string_lossy().into_owned();
+    let (out, err, code) = run_jq_full(&["-c", "input_line_number", &path], None)?;
+    assert_eq!(
+        (out.as_str(), err.as_str(), code),
+        (
+            "1\n",
+            "jq: parse error: Unmatched '}' at line 2, column 1\n",
+            5
+        )
+    );
     Ok(())
 }
