@@ -33,6 +33,18 @@
   "nan_through": [(copysign(nan; -1) | isnan), (fdim(nan; 1) | isnan), (ldexp(nan; 1) | isnan), (fma(nan; 1; 1) | isnan), (fmax(nan; nan) | isnan), (hypot(nan; 1) | isnan), (nextafter(nan; 1) | isnan), (nextafter(1; nan) | isnan), (jn(2; nan) | isnan), (remainder(nan; 1) | isnan)],
   "arg_order": [[ldexp((1,2); (3,4))], [fmax((1,2); (3,4))], [fma((1,2); (3,4); (5,6))]],
   "dot_ignored": (5 | [fmax(.; 3), ldexp(.; 1)]),
+  "ranges_of_dropped_points": [
+    (-0.5 | tgamma | . < -3.54490770181 and . > -3.5449077019),
+    (10 | lgamma | . > 12.8018274800 and . < 12.8018274801),
+    (100 | lgamma | . > 359.134205369 and . < 359.134205370),
+    (-1 | lgamma_r | (.[0] > 1e300) and (.[1] | fabs) == 1),
+    (10 | lgamma_r | .[0] > 12.8018274800 and .[0] < 12.8018274801 and .[1] == 1),
+    (0.25 | erf | . > 0.27632639016 and . < 0.27632639017),
+    (3 | erfc | . > 2.2090496998e-05 and . < 2.2090496999e-05),
+    (46 | . * 0.137 - 20 | asinh | . > -3.3117267350 and . < -3.3117267349),
+    (128 | . * 0.137 - 20 | asinh | . > -1.6337774587 and . < -1.6337774586),
+    (15 | . * 0.137 + 1 | acosh | . > 1.7819949411 and . < 1.7819949412)
+  ],
   "array_shape": [(2 | frexp | .[1] | type), (2 | modf | length), (2 | lgamma_r | length)],
   "overflow_in": (1e308 * 10 | [frexp, modf, logb, significand, rint])
 }

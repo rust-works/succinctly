@@ -498,7 +498,9 @@ What remains, recorded here:
   It moves last digits in both cases, as the failing CI runs of #5878 show: `tgamma` printed `-3.544907701811032` where the golden had `-3.5449077018110318`, and `lgamma` printed `12.801827480081469` where the golden had `12.80182748008147`.
   A jq 1.7.1 built on that image prints exactly what succinctly prints there, for both cases in full (the jq needs `-std=gnu17` and the system Oniguruma to build under GCC 15), so the difference is the libm's and not succinctly's.
   The inputs 26.04 prints differently left the goldens, as AArch64's did: `tgamma(-0.5)`, `lgamma` at 10 and 100, `lgamma_r` at -1 (the sign it reports at the pole), 10 and 100, `erf(0.25)`, `erfc(3)`, two of `asinh`'s four points and one of `acosh`'s.
+  A `ranges_of_dropped_points` row in `math_libm_family` keeps every dropped input covered by a tight bracket (and the pole's magnitude and sign magnitude), which every libm satisfies.
   Both goldens hold on Apple, glibc 2.35, 2.39 and 2.43 now, and the whole test suite passes on a 26.04 runner.
+  Measured with throwaway probe workflows on PR #5948: jq against succinctly on `ubuntu-26.04` (job 125655644982) and the full `cargo test --no-fail-fast` run there (job 125658757334).
   The x86_64 Linux CI jobs are still pinned to `ubuntu-24.04`, no longer for the goldens: the perf guard (valgrind), coverage and release jobs have not been run on 26.04.
   `scripts/test_ci_runner_pin.py` fails if one is moved to `ubuntu-latest`.
 
