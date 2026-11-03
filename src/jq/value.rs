@@ -273,8 +273,8 @@ pub(crate) fn parse_i64_or_f64_in<S: EvalSemantics>(s: &str) -> Option<NumberRep
 /// [`OwnedValue::from_number_bytes`]'s mode-aware parse never runs for them.
 /// This is their one accessor: in jq mode, whatever `bytes` spell that
 /// [`jq_literal_text_to_f64`] reads as a decimal -- RFC 8259, the lenient
-/// spellings the funnels preserve, and the ones they do not (a bare
-/// trailing dot, rule 4c's `14455058590201385605.`, which jq still rounds
+/// spellings the funnels preserve, and the ones they do not (a yq-mode
+/// bare trailing dot, `14455058590201385605.`, which jq still rounds
 /// like any other literal) -- is rounded to 17 significant digits like
 /// every other entry point; anything else -- a bridge token, a decNumber
 /// word, a malformed span -- falls through to `fallback`, the caller's own
@@ -3694,6 +3694,15 @@ impl OwnedValue {
     /// `S` is the number model the literal's double is read under (#2936);
     /// see `from_number_literal` and `parse_i64_or_f64_in` (both private).
     pub fn from_number_bytes<S: EvalSemantics>(bytes: &[u8]) -> Self {
+        // jq reads a bare trailing dot as the integer and prints it as one (`99999999999999999.`
+        // is `99999999999999999`, #6052), so keep the digits as the literal. Left to the lossy
+        // fallback at the bottom it came back as `100000000000000000`. yq reads the token as a
+        // float, and that fallback is its answer.
+        if S::TAG != EvalTag::Yq {
+            if let Some(digits) = crate::json::validate::strip_bare_trailing_dot(bytes) {
+                return Self::from_number_bytes::<S>(digits);
+            }
+        }
         if crate::json::validate::is_valid_number(bytes) {
             return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal::<S>);
         }
@@ -3767,10 +3776,8 @@ impl OwnedValue {
         // *original* text as the literal spelling -- `Self::from_number_literal`
         // (via `parse_i64_or_f64`) parses a trailing-dot float natively, so
         // no separate reparse of the original text is needed here. A bare
-        // trailing `.` with no exponent (`1.`) is deliberately left alone:
-        // real jq doesn't preserve that spelling either (`[1.]` -> `[1]`
-        // on both sides), so the existing lossy fallback below already
-        // matches jq there.
+        // trailing `.` with no exponent (`1.`) never reaches here in jq mode:
+        // the top of this function drops the dot (#6052).
         //
         // Checked against the leading-zero-stripped form (when one
         // exists), not always `bytes` itself, so the two escapes compose:

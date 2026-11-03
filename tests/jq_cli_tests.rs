@@ -1496,13 +1496,12 @@ fn test_argjson_reject_set_2052() -> Result<()> {
         assert_eq!(stdout, "", "--argjson {value}");
     }
 
-    // 2. The recorded rule-4c divergence (#2240): jq answers `5`/`7`/`0`, and
-    //    this validator refuses on purpose -- admitting a bare trailing dot
-    //    would route `99999999999999999.` through `from_number_bytes`'s
-    //    large-integer gap. See `docs/compliance/jq/limitations.md`.
-    for value in ["5.", "-5.", "[5.]", "{\"a\":5.}", "1.", "0.", "007."] {
+    // 2. The old rule-4c group (a bare trailing dot: `5.`, `007.`, `[5.]`) is
+    //    accepted since #6052, as jq does; it is pinned in `tests/jq_cli/i6052.rs`.
+    //    What stays refused is a dot with no integer part or a second dot.
+    for value in [".", "-.", "1.5.", "1..", "+."] {
         let (stdout, _stderr, code) = run_jq_full(&["-nc", "--argjson", "x", value, "$x"], None)?;
-        assert_ne!(code, 0, "rule-4c row must stay rejected: {value}");
+        assert_ne!(code, 0, "--argjson must reject: {value}");
         assert_eq!(stdout, "", "{value}");
     }
 
@@ -1511,8 +1510,7 @@ fn test_argjson_reject_set_2052() -> Result<()> {
     //    What stays rejected is every way its two gates can fail to fire --
     //    a word that is not decNumber's, a NaN with anything but digits
     //    after it, a `+` before anything but a digit, `.` or such a word --
-    //    each captured as `Invalid numeric literal` from jq 1.7.1, plus the
-    //    rule-4c refusal with a `+` in front.
+    //    each captured as `Invalid numeric literal` from jq 1.7.1.
     for value in [
         "nanx",
         "nana",
@@ -1541,8 +1539,6 @@ fn test_argjson_reject_set_2052() -> Result<()> {
         "[+]",
         "{nan:1}",
         "[nan1.5,2]",
-        "+5.",
-        "+007.",
         "+9e999e999",
         "+1e0e0",
     ] {
@@ -2316,19 +2312,15 @@ fn test_argjson_tolerates_trailing_dot_before_exponent_2240() -> Result<()> {
     Ok(())
 }
 
-/// Regression guard (found by review before merge, round 2): a bare
-/// trailing `.` with no exponent at all is deliberately *not* accepted by
-/// this fix, unlike an earlier draft that treated it the same as the
-/// exponent-adjacent form -- see `normalize_dot_leniency`'s own doc
-/// comment for the precision-loss reasoning. Real jq itself *does* accept
-/// `1.` (giving `1`), so this is a known, deliberate, narrower-than-jq
-/// divergence, not a match -- pinned here as the accepted trade-off
-/// rather than left as an unstated side effect of the narrowing.
+/// A bare trailing `.` with no exponent at all was refused here (rule 4c), because the dot went
+/// to a lossy `f64` fallback and `99999999999999999.` came back as `100000000000000000`. It is
+/// accepted since #6052 and reads as jq reads it: the integer, digits kept.
 #[test]
-fn test_argjson_bare_trailing_dot_still_rejected_2240() -> Result<()> {
-    for value in ["1.", "99999999999999999."] {
-        let (_, _, code) = run_jq_full(&["-n", "--argjson", "n", value, "$n"], None)?;
-        assert_ne!(code, 0, "value {value:?}");
+fn test_argjson_bare_trailing_dot_reads_as_the_integer_6052() -> Result<()> {
+    for (value, expected) in [("1.", "1"), ("99999999999999999.", "99999999999999999")] {
+        let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", value, "$n"], None)?;
+        assert_eq!(code, 0, "value {value:?}");
+        assert_eq!(stdout.trim_end(), expected, "value {value:?}");
     }
     Ok(())
 }
@@ -48056,7 +48048,7 @@ fn test_fromjson_jq_lenient_numbers_and_literal_spelling_3032() -> Result<()> {
 /// `tonumber` probe for valid JSON that is not a number.
 #[test]
 fn test_fromjson_jq_lenient_rejects_invalid_text_3032() -> Result<()> {
-    for source in ["1.", "01x", "[1,]", r#""\ud800""#, "\"a\tb\""] {
+    for source in ["1.5.", "01x", "[1,]", r#""\ud800""#, "\"a\tb\""] {
         let (stdout, stderr, code) =
             run_jq_full(&["-nc", "--arg", "s", source, "$s | fromjson"], None)?;
         assert_eq!(code, 5, "{source:?}: {stdout:?} {stderr:?}");

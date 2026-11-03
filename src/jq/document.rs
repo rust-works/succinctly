@@ -1318,8 +1318,8 @@ pub trait DocumentValue: Sized + Clone {
     /// The raw source text of this value if it is a number token, whatever
     /// its spelling -- [`number_literal`](Self::number_literal) minus the
     /// "preservable" gate (#2936). A lenient span this crate does not keep
-    /// as a literal (a bare trailing dot, `14455058590201385605.`, is the
-    /// rule-4c case) is still a decimal jq reads through its 17-digit
+    /// as a literal (a bare trailing dot, `14455058590201385605.`, until
+    /// #6052 in jq mode) is still a decimal jq reads through its 17-digit
     /// rounding, so the mode-aware number readers
     /// (`eval_generic::document_number_f64_generic`) need the text, not the
     /// double `as_f64` already rounded once. Not a display contract: nothing

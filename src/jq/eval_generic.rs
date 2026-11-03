@@ -704,6 +704,8 @@ fn to_owned_checked_at_depth<S: EvalSemantics, V: DocumentValue>(
         // `from_document_float` below, which would re-bake it past yq's
         // threshold; see `DocumentValue::bridge_computed_float`.
         Ok(OwnedValue::Float(f))
+    } else if let Some(owned) = jq_bare_trailing_dot_number::<S, V>(value) {
+        Ok(owned)
     } else if let Some(literal) = value.number_literal() {
         Ok(OwnedValue::from_number_literal::<S>(&literal))
     } else if let Some(i) = value.as_i64() {
@@ -957,6 +959,23 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
 /// [`validate_cursor`]'s walk would do with it before dropping it (#3478).
 /// One chain, so the two can never disagree about which scalars raise.
 #[inline(always)]
+/// A document number written with a bare trailing dot (`5.`, `99999999999999999.`), read the way
+/// jq reads it: as the integer, its digits kept as the literal (#6052). `number_literal()` declines
+/// such a span, and the `as_f64` fallback after it turned a large one into the wrong integer.
+///
+/// jq mode only. yq reads the token as a float (`!!float`), and `number_literal()` is the same
+/// trait method in both modes, so the mode has to be decided here, where `S` is known.
+fn jq_bare_trailing_dot_number<S: EvalSemantics, V: DocumentValue>(
+    value: &V,
+) -> Option<OwnedValue> {
+    if S::TAG == EvalTag::Yq {
+        return None;
+    }
+    let text = value.number_text()?;
+    crate::json::validate::strip_bare_trailing_dot(text.as_bytes())?;
+    Some(OwnedValue::from_number_bytes::<S>(text.as_bytes()))
+}
+
 fn scalar_to_owned<S: EvalSemantics, V: DocumentValue>(
     value: &V,
     keep: bool,
@@ -973,6 +992,8 @@ fn scalar_to_owned<S: EvalSemantics, V: DocumentValue>(
         // `from_document_float` below, which would re-bake it past yq's
         // threshold; see `DocumentValue::bridge_computed_float`.
         Ok(OwnedValue::Float(f))
+    } else if let Some(owned) = jq_bare_trailing_dot_number::<S, V>(value) {
+        Ok(if keep { owned } else { OwnedValue::Null })
     } else if let Some(literal) = value.number_literal() {
         Ok(if keep {
             OwnedValue::from_number_literal::<S>(&literal)
