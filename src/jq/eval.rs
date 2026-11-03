@@ -96508,8 +96508,10 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     // The libc takes at least one white-space character (the run of them, not
                     // just one): `"2015" | strptime("%Y%n")` is no match, `"2015 "` reads (#5934).
                     let mut skipped = false;
+                    // ASCII white space only, as the libc's `isspace` in the C locale: a no-break
+                    // space does not count.
                     while let Some(&c) = input_iter.peek() {
-                        if c.is_whitespace() {
+                        if matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r') {
                             input_iter.next();
                             skipped = true;
                         } else {
