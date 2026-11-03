@@ -20,6 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: What pgrep prints
+        continue-on-error: true
         run: |
           head -3 /etc/os-release; pgrep -V; python3 --version; dpkg -l procps | tail -1
           mkdir -p /tmp/p/.cargo/bin
