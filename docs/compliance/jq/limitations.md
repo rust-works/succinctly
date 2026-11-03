@@ -10196,7 +10196,7 @@ glibc's `%j` was not captured, so the rows above are the macOS pin's and glibc m
 ### `strptime`'s weekday in January and February of a century year that is not a leap year is the calendar's, where jq's macOS build is a day early (#970, #5946)
 
 jq's macOS build fills `tm_wday` itself (`set_tm_wday()` in `builtin.c`, a Gauss-style routine whose own comment admits it "produces the wrong day-of-the-week number" for 1900-01-01..1900-02-28 and 2100-01-01..2100-02-28).
-glibc leaves the weekday to its `strptime` and answers the calendar's.
+glibc leaves the weekday to its `strptime` and answers the calendar's (jq 1.6 on Linux, the only glibc build captured: `"2100" | strptime("%Y")` is weekday `4` and `"1900-01-01" | strptime("%Y-%m-%d")` is `1`).
 succinctly answers the calendar's on both, so it matches glibc and differs from the macOS pin.
 This is the "matching would corrupt data" condition of ADR-0018: the pin's answer is a weekday that is not the date's, and the owner decided in #970 to keep the correct one.
 `"2100" | strptime("%Y")` is `[2100,0,0,0,0,0,3,-1]` in jq on macOS and `[2100,0,0,0,0,0,4,-1]` here; `"1900-01-01" | strptime("%Y-%m-%d")` is weekday `0` there and `1` here.
