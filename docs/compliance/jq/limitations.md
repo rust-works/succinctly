@@ -7450,10 +7450,33 @@ Three differences remain.
   Pinned by `test_lookbehind_oniguruma_refuses_is_answered_5502`.
 - **Oniguruma syntax outside the checked list stays refused.**
   The second engine takes only constructs and escapes whose meaning there was compared with jq's.
-  `\h` and `\H` (a hex digit there, the letters `h` and `H` in jq), `\g<name>`/`\g1`, the absence operator `(?~…)`, `\X`, `\Q…\E` and `\y` keep the `invalid regex` error.
+  `\g<name>`/`\g1`, the absence operator `(?~…)`, `\X` and `\y` keep the `invalid regex` error.
   So do two that jq reads differently from `fancy-regex`: a reversed interval (`a{3,2}`), an error in jq, and a `+` after an interval (`a{2,3}+`), possessive in jq for `{n,m}+` and `{n,}+` but not for `{n}+`.
   A `(?P…)` group is refused before either engine, with jq's `undefined group option` (above).
   Pinned by `test_constructs_read_differently_stay_refused_5502`.
+
+### Oniguruma escapes and group syntax read before either engine (#6070)
+
+The jq pre-pass that reads a pattern before the `regex` crate sees it (`translate_posix_brackets`) rewrites the escapes below to what Oniguruma's Perl syntax gives them and refuses what it refuses.
+Every row was captured from jq 1.7.1.
+
+- **A backslash and a letter that means nothing there is the letter.** `\g`, `\h`, `\i`, `\j`, `\l`, `\m`, `\q`, `\u`, `\C`, `\E`, `\F`, `\H`, `\I`, `\J`, `\L`, `\M`, `\T`, `\U`, `\V`, and `\k`, `\o`, `\p`, `\P` when no `<`, `'` or `{` follows, so `"u0041" | test("\\u0041")` is `true` and `"A" | test("\\u0041")` is `false`.
+  The same holds inside a class (`[\h]`, `[\N]`, `[\y]`, `[\X]`, `[\8]`).
+- **`\N` is any character but a newline, `\O` any character, and `\Q…\E` quotes** what it holds (to the end of the pattern when `\E` is missing).
+- **`\0` and a number that is no backreference are octal** (`\101` is `A`, `\012` a newline).
+  `\1`..`\9` are always backreferences, a larger number only up to the groups opened so far, as in Oniguruma's tokenizer.
+  A backreference to a group the pattern does not have is jq's `invalid backref number/name`.
+- **`\cX` is control-X** (`\c?` is DEL), and `\c` at the end of the pattern is `end pattern at control`.
+- **`\xHH` at 0x80 or above is a byte of a UTF-8 sequence:** `\xc3\xa9` is `é`.
+  A sequence that stops short is `too short multibyte code string`, a continuation byte first or a bad one inside is `invalid code point value`, and one that is no character (`\xed\xa0\x80`, `\xf8`) compiles and matches nothing.
+  `\xH` is the character H, `\x` before anything but a hex digit is NUL (and an `x` at the very end of the pattern is itself).
+- **`(*FAIL)` never matches.**
+- **jq's refusals:** an interval with nothing to repeat (`{1}`, `a|{2}`, `(?:{2})`: `target of repeat operator is not specified`), a conditional on a group the pattern lacks (`(?(2)a|b)`: `invalid backref number/name`, and `undefined name <n> reference` for a name), and a group name that is empty or starts with a digit.
+  `"a" | test("(?(2)a|b)")` panicked inside `fancy-regex` before this.
+
+Still refused with the crate's `invalid regex` error, where jq answers: `\X` (one grapheme cluster), `\y` and `\Y` (text-segment boundaries), `\g<name>` and `\g1` (calls), `\o{…}`, an octal escape of 0x80 or more (`\377`), `\cé`, and `\x{110000}`.
+Whether one of them matches needs Unicode text segmentation or Oniguruma's byte-level reading of a multibyte pattern.
+Pinned by `tests/jq_cli/i6070.rs`.
 
 The `l` and `n` flags use the second engine too, and are described in the next section.
 
