@@ -94,7 +94,7 @@ fn test_5947_strptime_an_empty_field_reads_nothing() -> Result<()> {
     ])
 }
 
-/// #5947: `%s` reads as `strtol` does: with no digits it reads 0 and consumes nothing, so what follows must still match.
+/// #5947: `%s` reads as `strtol` does: with no digits it reads 0 and consumes nothing, so what follows must still match; a month or day out of range before it is refused as it is read.
 #[test]
 fn test_5947_strptime_epoch_seconds_with_no_digits_read_zero() -> Result<()> {
     assert_rows(&[
@@ -108,6 +108,13 @@ fn test_5947_strptime_epoch_seconds_with_no_digits_read_zero() -> Result<()> {
         ("UTC", "2015 ", "%Y %s", "[1970,0,1,0,0,0,0]\n", 0),
         ("UTC", "2015 x", "%Y%sx", "", 5),
         ("UTC", "  12", "%s", "[1970,0,1,0,0,12,0]\n", 0),
+        ("UTC", "69", "%d %s", "", 5),
+        ("UTC", "13", "%m%s", "", 5),
+        ("UTC", "13 ", "%m %s", "", 5),
+        ("UTC", "00", "%d%s", "[1970,0,1,0,0,0,0]\n", 0),
+        ("UTC", "32", "%e%s", "", 5),
+        ("UTC", "13/05/15", "%D%s", "", 5),
+        ("UTC", "2015-03-32", "%F%s", "", 5),
     ])
 }
 
@@ -146,5 +153,8 @@ fn test_5947_strptime_year_fields_take_a_sign() -> Result<()> {
         ("UTC", "-100 01", "%Y %W", "[-100,0,7,0,0,0,6]\n", 0),
         ("UTC", "-5 00 4", "%Y %U %w", "[-5,0,4,0,0,0,3]\n", 0),
         ("UTC", "-999 366", "%Y %j", "[-998,0,1,0,0,0,0]\n", 0),
+        ("UTC", "-991 01", "%Y %V", "[-991,0,1,0,0,0,0]\n", 0),
+        ("UTC", "-991 53", "%Y %V", "[-991,11,31,0,0,0,364]\n", 0),
+        ("UTC", "-985 09", "%Y %V", "[-985,1,26,0,0,0,56]\n", 0),
     ])
 }
