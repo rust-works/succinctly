@@ -37955,6 +37955,29 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         },
     );
     let pre = alias_identity::active().then(|| result.clone());
+    // #6087: yq updates the *nodes* a descent selects, so an outer node's update cannot move an inner
+    // one out of reach: `(.. | select(tag == "!!map")) |= with_entries(.key |= "K_" + .)` renames every
+    // level. These writes address nodes by path, and an outer rename invalidates the path an inner
+    // update was recorded under (it then wrote `b: null` at the old name), so the deepest are written
+    // first, which leaves a parent's paths intact. Equal depths keep their order, and a path set that
+    // is not from a descent keeps the order it was named in (`(.a, .a.b) |= f`).
+    if S::TAG == EvalTag::Yq
+        && paths.len() > 1
+        && any_subexpr(path_expr, &mut |e| {
+            matches!(
+                e,
+                Expr::RecursiveDescent
+                    | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown | Builtin::RecurseF(_))
+            )
+        })
+    {
+        let depth = |path: &Expr| {
+            let mut steps = Vec::new();
+            push_path_components(&mut steps, path);
+            steps.len()
+        };
+        paths.sort_by_key(|path| core::cmp::Reverse(depth(path)));
+    }
 
     // yq's slice-assignment no-op (#1101, generalized to any chain depth by
     // #1116) — `update_path` itself now no-ops the *write* whenever it
