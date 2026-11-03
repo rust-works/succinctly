@@ -27944,13 +27944,12 @@ fn translate_posix_brackets(
                     at_start = false;
                     i += 3;
                     continue;
-                } else {
-                    out.push(kind);
-                    changed = true;
-                    at_start = false;
-                    i += 2;
-                    continue;
                 }
+                out.push(kind);
+                changed = true;
+                at_start = false;
+                i += 2;
+                continue;
             }
             // The braces of `\x{..}`, `\k{..}` and the like belong to the escape: they are not an
             // interval, and the brace scan below must not see them.
