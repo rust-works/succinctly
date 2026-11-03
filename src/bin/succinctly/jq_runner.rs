@@ -14606,15 +14606,7 @@ mod tests {
             let (eager, eager_lazy) = observe_inputs(dir.path(), files, true);
             assert_eq!(eager_lazy, 0, "the reference route is eager");
             let (lazy, lazy_documents) = observe_inputs(dir.path(), files, false);
-            assert_eq!(
-                lazy,
-                eager,
-                "{:?} (lazy documents {lazy_documents})",
-                files
-                    .iter()
-                    .map(|f| String::from_utf8_lossy(f))
-                    .collect::<Vec<_>>()
-            );
+            assert_eq!(lazy, eager, "{files:?} (lazy documents {lazy_documents})");
             checked += 1;
             lazy_streams += usize::from(lazy_documents > 0);
         };
@@ -14644,6 +14636,49 @@ mod tests {
             lazy_streams * 2 > checked,
             "{lazy_streams} of {checked} streams took the lazy route"
         );
+    }
+
+    /// #5857: [`lazy_json_sources`] takes a stream of several files whose last holds no document, with
+    /// the end of the stream its newlines, and turns down one that holds no document at all, one with
+    /// a file that is not clean, and one that begins with a BOM.
+    #[test]
+    fn lazy_json_sources_ends_a_stream_on_a_last_file_with_no_document_5857() {
+        let files = |texts: &[&str]| -> Vec<(Option<usize>, String)> {
+            texts
+                .iter()
+                .enumerate()
+                .map(|(index, text)| (Some(index), (*text).to_string()))
+                .collect()
+        };
+        let sources = |texts: &[&str]| lazy_json_sources(&files(texts), &[]);
+        let (tail, found) = sources(&["1\n2\n", "  \n\n"]).expect("the first file has documents");
+        assert_eq!(
+            tail,
+            EofTail {
+                newlines: 2,
+                unknown: false
+            }
+        );
+        assert_eq!(
+            found
+                .iter()
+                .map(|(spans, _)| spans.len())
+                .collect::<Vec<_>>(),
+            [2, 0]
+        );
+        // A last file with a document ends on it, as a single file does.
+        let (tail, _) = sources(&["\n", "1\n2"]).expect("clean");
+        assert_eq!(
+            tail,
+            EofTail {
+                newlines: 1,
+                unknown: true
+            }
+        );
+        // No document anywhere, a file that is not clean, a BOM.
+        assert!(sources(&["", "  ", "\n"]).is_none());
+        assert!(sources(&["1\n", "}\n"]).is_none());
+        assert!(sources(&["1\n", "\u{feff}2\n"]).is_none());
     }
 
     /// [`lazy_json_scan`]'s spans for a stream it reads whole.
