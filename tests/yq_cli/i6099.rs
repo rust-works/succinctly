@@ -130,3 +130,30 @@ fn the_presentation_of_each_entry_follows_it() -> Result<()> {
     }
     Ok(())
 }
+
+/// A comma binds the `key` stages it can and leaves the ones below another step.
+#[test]
+fn a_comma_binds_the_keys_it_can() -> Result<()> {
+    check(&[
+        (
+            "z: 1\nY: 2\nx: 3\nww: 4\n",
+            "sort_by(key, (.a | key))",
+            "{\"Y\":2,\"ww\":4,\"x\":3,\"z\":1}\n",
+        ),
+        (
+            "z: 1\nY: 2\nx: 3\nww: 4\n",
+            "sort_by((.a | key), key)",
+            "{\"Y\":2,\"ww\":4,\"x\":3,\"z\":1}\n",
+        ),
+        (
+            "z: 1\nY: 2\nx: 3\nww: 4\n",
+            "sort_by(.b, key)",
+            "{\"Y\":2,\"ww\":4,\"x\":3,\"z\":1}\n",
+        ),
+        (
+            "z: 1\nY: 2\nx: 3\nww: 4\n",
+            "sort_by(key, length)",
+            "{\"Y\":2,\"ww\":4,\"x\":3,\"z\":1}\n",
+        ),
+    ])
+}

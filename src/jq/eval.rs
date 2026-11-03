@@ -22604,11 +22604,13 @@ fn bind_entry_key(f: &Expr, key_expr: &Expr) -> Option<Expr> {
             let mut changed = false;
             let mut out = vec_with_capacity(items.len());
             for item in items {
-                if reads_key(item) {
-                    out.push(bind_entry_key(item, key_expr)?);
-                    changed = true;
-                } else {
-                    out.push(item.clone());
+                // An item whose `key` is below another step stays as it is; its siblings bind.
+                match bind_entry_key(item, key_expr) {
+                    Some(bound) => {
+                        out.push(bound);
+                        changed = true;
+                    }
+                    None => out.push(item.clone()),
                 }
             }
             changed.then(|| Expr::Comma(out))
