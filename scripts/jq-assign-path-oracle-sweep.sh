@@ -32,9 +32,17 @@
 # identical between two recordings anyway, so a diff is unaffected either way
 # — but only recordings made with the *same* flag are comparable.
 #
+# `--jq-only` records the jq-mode half only (no yq is needed), and `--gate` exits 1
+# on any succinctly-vs-oracle divergence: together they are how `succinctly dev
+# compare jq --dimension sweeps` runs this script (#5552), where the jq half's 10,248
+# cases all agree with jq 1.7.1. The yq half has 904 divergences on `main` at #5552,
+# so `--gate` without `--jq-only` fails; it is a recording, not a gate, there. The
+# harness sets `JQ_ORACLE` to its pinned reference, taken first when it matches the
+# pin, and a setup error exits 2, since 1 means "diverges".
+#
 # Usage:
 #   cargo build --release --features cli,simd,regex,serde
-#   ./scripts/jq-assign-path-oracle-sweep.sh [--summary] [--no-oracle] [binary]
+#   ./scripts/jq-assign-path-oracle-sweep.sh [--summary] [--no-oracle] [--jq-only] [--gate] [binary]
 
 set -euo pipefail
 
@@ -43,11 +51,15 @@ PIN="$(cat "$REPO_ROOT/tests/data/jq-golden/JQ_VERSION")"
 
 SUMMARY=0
 USE_ORACLE=1
+GATE=0
+MODES=(jq yq)
 SUCC=""
 for arg in "$@"; do
   case "$arg" in
     --summary) SUMMARY=1 ;;
     --no-oracle) USE_ORACLE=0 ;;
+    --jq-only) MODES=(jq) ;;
+    --gate) GATE=1 ;;
     *) SUCC="$arg" ;;
   esac
 done
@@ -55,7 +67,11 @@ SUCC="${SUCC:-$REPO_ROOT/target/release/succinctly}"
 
 if [[ ! -x "$SUCC" ]]; then
   echo "error: succinctly binary not found at $SUCC — run: cargo build --release --features cli,simd,regex,serde" >&2
-  exit 1
+  exit 2
+fi
+if ((GATE && !USE_ORACLE)); then
+  echo "error: --gate judges against the oracle: drop --no-oracle" >&2
+  exit 2
 fi
 
 # Prefer the pinned oracle binary directly (macOS ships jq-1.7.1 at
@@ -65,21 +81,25 @@ fi
 JQ=""
 YQ=""
 if ((USE_ORACLE)); then
-  if [[ -x /usr/bin/jq ]] && /usr/bin/jq --version | grep -q "^$PIN"; then
+  if [[ -n "${JQ_ORACLE:-}" ]] && "$JQ_ORACLE" --version 2>/dev/null | grep -q "^$PIN"; then
+    JQ="$JQ_ORACLE"
+  elif [[ -x /usr/bin/jq ]] && /usr/bin/jq --version | grep -q "^$PIN"; then
     JQ=/usr/bin/jq
   elif command -v jq >/dev/null 2>&1 && jq --version | grep -q "^$PIN"; then
     JQ="$(command -v jq)"
   else
-    echo "error: no jq matching pin $PIN found at /usr/bin/jq or on PATH" >&2
-    exit 1
+    echo "error: no jq matching pin $PIN found at \$JQ_ORACLE, /usr/bin/jq or on PATH" >&2
+    exit 2
   fi
-  if command -v yq >/dev/null 2>&1 && yq --version | grep -q 'v4\.'; then
-    YQ="$(command -v yq)"
-  else
-    echo "error: no yq v4 found on PATH" >&2
-    exit 1
+  if [[ " ${MODES[*]} " == *" yq "* ]]; then
+    if command -v yq >/dev/null 2>&1 && yq --version | grep -q 'v4\.'; then
+      YQ="$(command -v yq)"
+    else
+      echo "error: no yq v4 found on PATH" >&2
+      exit 2
+    fi
   fi
-  echo "oracles: $JQ ($("$JQ" --version)), $YQ ($("$YQ" --version 2>&1 | tail -1))" >&2
+  echo "oracles: $JQ ($("$JQ" --version)), ${YQ:-<no yq: --jq-only>}${YQ:+ ($("$YQ" --version 2>&1 | tail -1))}" >&2
 fi
 echo "succinctly: $SUCC" >&2
 
@@ -165,12 +185,11 @@ total=0
 diverged=0
 declare -a div_keys=()
 
-run_case() {
-  local mode="$1" op="$2" path="$3" doc="$4" filter="$5"
-  total=$((total + 1))
-  printf '%s' "$doc" > "$DOC_FILE"
+flaky=0
 
-  local s_out s_code o_out o_code s_err o_err
+# Runs one case through succinctly and the oracle into the caller's `s_*`/`o_*` locals.
+exec_case() {
+  local mode="$1" filter="$2"
   if [[ "$mode" == jq ]]; then
     s_out="$("$SUCC" jq -c "$filter" "$DOC_FILE" 2>"$S_ERR")" && s_code=0 || s_code=$?
   else
@@ -186,10 +205,33 @@ run_case() {
       o_out="$("$YQ" -o=json -I=0 "$filter" "$DOC_FILE" 2>"$O_ERR")" && o_code=0 || o_code=$?
     fi
     o_err="$(cat "$O_ERR")"
-    if [[ "$s_out" != "$o_out" || "$s_code" != "$o_code" ]]; then
-      diverged=$((diverged + 1))
-      div_keys+=("$mode/$op")
+  fi
+}
+
+case_diverges() { ((USE_ORACLE)) && [[ "$s_out" != "$o_out" || "$s_code" != "$o_code" ]]; }
+
+run_case() {
+  local mode="$1" op="$2" path="$3" doc="$4" filter="$5"
+  total=$((total + 1))
+  printf '%s' "$doc" > "$DOC_FILE"
+
+  local s_out s_code o_out o_code s_err o_err
+  exec_case "$mode" "$filter"
+  # Under `--gate`, a divergence is run once more before it counts (#5952): on macOS about one
+  # case in 20,000 has recorded an exit status of 0 for a run that printed its error, on either
+  # tool and on a different case each time, and the case then agrees on every re-run. A
+  # divergence that the re-run repeats is counted as before; one it does not is reported.
+  if ((GATE)) && case_diverges; then
+    local first="succinctly=$s_code oracle=$o_code"
+    exec_case "$mode" "$filter"
+    if ! case_diverges; then
+      flaky=$((flaky + 1))
+      echo "flaky: $mode $filter on $(esc "$doc") diverged once ($first) and agrees on a re-run" >&2
     fi
+  fi
+  if case_diverges; then
+    diverged=$((diverged + 1))
+    div_keys+=("$mode/$op")
   fi
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -198,7 +240,7 @@ run_case() {
     "$o_code" "$(esc "$o_out")" "$(esc "$o_err")"
 }
 
-for mode in jq yq; do
+for mode in "${MODES[@]}"; do
   for op in "${OPS[@]}"; do
     for path in "${PATHS[@]}"; do
       filter="${op//__P__/$path}"
@@ -256,7 +298,7 @@ while ((${#GEN_PATHS[@]} < 100)); do
   GEN_PATHS+=("$path")
 done
 
-for mode in jq yq; do
+for mode in "${MODES[@]}"; do
   for op in "${GEN_OPS[@]}"; do
     for path in "${GEN_PATHS[@]}"; do
       filter="${op//__P__/$path}"
@@ -276,4 +318,10 @@ if ((SUMMARY)); then
   } >&2
 else
   echo "== $total cases recorded ($diverged vs-oracle divergences) ==" >&2
+fi
+((flaky == 0)) || echo "($flaky case(s) diverged once and agreed on a re-run; see the flaky: lines)" >&2
+
+if ((GATE && diverged > 0)); then
+  echo "FAIL: $diverged succinctly-vs-oracle divergence(s) (--gate)" >&2
+  exit 1
 fi

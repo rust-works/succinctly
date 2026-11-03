@@ -174,20 +174,53 @@ does not reproduce the leg. A plain `cargo test --features cli` still runs every
 
 ### Differential sweeps against jq
 
-A change to the jq evaluator's path register is judged against `/usr/bin/jq` (1.7.1) over a generated grid,
-not only against the golden fixtures. These three sweeps in `scripts/` each run two builds (the base,
-normally `main`, and the candidate) over the same rows and exit non-zero on a row that matched jq on the base
-and no longer does; the older `jq-nested-fold-frozen-var-sweep.py` and `jq-nested-fold-outer-var-sweep.py` take
-`--bin`/`--base` too but gate differently (read each header). A debug build (`cargo build --features cli`) is enough; give the base its own checkout so
-it is not rebuilt.
+A change to the jq evaluator, the path register above all, is judged against `/usr/bin/jq` (1.7.1) over a
+generated grid, not only against the golden fixtures. `scripts/` holds 27 such sweeps, each written as the gate
+for one fix and kept as the regression net for its class. 26 of them run under
+`succinctly dev compare jq --dimension sweeps` (`comparison/jq/manifest.toml`'s `[[sweep]]`, #5552), with the
+arguments listed there, against one build and jq alone. To judge a change, run the ones that reach it by hand
+as well, with `--base` set to a `main` build where the script takes one: that is what finds a lost match, and
+the full grid finds what a folded sample does not. A debug build (`cargo build --features cli`) is enough;
+give the base its own checkout so it is not rebuilt. Read each script's header for its rules.
 
-- `jq-fold-body-register-grid-sweep.py --bin BIN --base BIN`: outer fold x inner fold x source shape x write
-  context x document, about 92,000 rows x 3 processes, hours on a loaded machine. Judges stdout and exit code.
-- `jq-fold-body-message-sweep.py --bin BIN --base BIN --only SUBSTR`: the same rows (`--shard I/N` splits
-  them), judging the first line of stderr as well.
-- `jq-nested-fold-source-sweep.py BASE NEW [N [SEED]]`: a fold's source destructuring a frozen `$x` inside
-  another fold (#5030), 6,000 rows by default, minutes. Judges stdout, exit code and stderr, and sorts the
-  rows into fixed / REGRESS / changed-wrong, and also fails on a new silent accept or a candidate timeout.
+| Script (`scripts/jq-…`)                  | Gates                                                                       | Folded as                    |
+|------------------------------------------|-----------------------------------------------------------------------------|------------------------------|
+| `alt-passthrough-sweep.py`               | `?//` destructuring binds over a pass-through head (#3781)                  | whole grid                   |
+| `alt-retry-oracle-sweep.sh`              | a `?//` bind under a short-circuiting consumer (#2180)                      | whole grid                   |
+| `assign-path-oracle-sweep.sh`            | the `=`/`\|=`/`del` path walkers, jq and yq mode (#1429)                    | `--jq-only --gate`           |
+| `assign-rhs-oracle-sweep.py`             | assignment's right-hand side and target order (#3448)                       | whole grid                   |
+| `bind-origin-oracle-sweep.sh`            | a `$var`'s node identity in path position (#2042, #1573)                    | whole grid                   |
+| `fanout-oracle-sweep.sh`                 | binary fan-out interleaving (#1481)                                         | whole grid                   |
+| `fold-body-message-sweep.py`             | the fold-body grid's rows, error message included (#4933)                   | not folded (see below)       |
+| `fold-body-register-grid-sweep.py`       | a fold source moving the register inside another fold (#4505), 1.2M rows    | `--jq-gate --sample 40`      |
+| `fold-fresh-source-sweep.py`             | `yields_only_fresh_values` (#3489, #3745)                                   | whole grid                   |
+| `fold-source-alt-chain-sweep.py`         | a `?//` chain over a fresh value in a fold source (#3651)                   | whole grid                   |
+| `fold-source-register-sweep.py`          | a fold source that navigates, then computes (#2159)                         | whole grid                   |
+| `fold-update-alt-bind-sweep.py`          | a `//` over a bind of an outer `$x` as a fold's UPDATE (#5157), 6.9M rows   | `--jq-gate --sample 200`     |
+| `foreach-update-alt-alternate-sweep.py`  | a non-literal alternate of a `//` over a nested `foreach` UPDATE (#5156)    | `--jq-gate`                  |
+| `foreach-update-if-arm-sweep.py`         | an `if` in a `foreach` UPDATE with a caught fold in one arm (#5115)         | `--jq-gate`                  |
+| `foreach-update-null-marker-sweep.py`    | a `null`/boolean `$x` destructured in a nested `foreach` UPDATE (#5205)     | `--jq-gate`                  |
+| `foreach-update-state-register-sweep.py` | a handler that hands the state on around a nested `foreach` (#5208)         | `--jq-gate`, subject as base |
+| `libm-oracle-sweep.sh`                   | the libm-backed math builtins (#3045)                                       | whole grid                   |
+| `localtime-oracle-sweep.py`              | the local-zone date builtins (#3054)                                        | `--check-fields`             |
+| `m2-streaming-sweep.sh`                  | the M2 streaming route against its golden table (#1653, #2103)              | whole grid                   |
+| `nested-fold-frozen-var-sweep.py`        | a nested fold over a frozen `$var` in a `try` (#3984)                       | whole grid                   |
+| `nested-fold-outer-var-sweep.py`         | a `foreach` that is a fold's whole UPDATE, reading the outer `$var` (#4499) | whole grid                   |
+| `nested-fold-source-sweep.py`            | a fold source destructuring a frozen `$x` inside another fold (#5030)       | `--jq-gate`, subject as base |
+| `path-context-oracle-sweep.sh`           | the path-context evaluators, jq and yq mode (#2416)                         | `--jq-only`                  |
+| `path-register-sweep.py`                 | jq's path register (#3456, #3289, #3428), 63.6M rows                        | `--jq-gate --sample 2000`    |
+| `reduce-update-bind-sweep.py`            | a `reduce` UPDATE destructuring an outer `$x` (#4934), and its `?//` grid   | `--jq-gate`, sampled, twice  |
+| `seq-oracle-sweep.py`                    | `--seq`'s parse-error diagnostics (#1723)                                   | whole grid                   |
+| `stream-errors-oracle-sweep.py`          | `--stream-errors` (#5474)                                                   | whole grid                   |
+
+`--jq-gate` (and `assign-path`'s `--gate`) fails a run on a wrong answer against jq alone; without it a script
+that judges a change against `--base` gates nothing when it has no base (#5552). None of the folded scripts
+documents a residual for it, so a residual that becomes accepted is listed in the script first. The two
+dual-mode shell sweeps fold only their jq half: `assign-path`'s yq half differs from yq v4.53.3 on 904 of 10,248
+cases and is a recording, not a gate. `fold-body-message` stays a manual A/B tool: its verdict is a message
+that changed against `--base`, and against jq alone 273 of a 43,407-row slice differ only in wording while
+`fold-body-register-grid` already gates the same rows' output and exit code. `jq-grammar-fuzz.py` is not a
+sweep: it is the `fuzz` dimension. `jq-path-register-sweep.py`'s own self-tests run in `ci.yml`.
 
 The first line of stderr has to be part of the verdict: a grid that judged stdout and exit code alone passed a
 change whose message regression a pinned test then caught (#5197). The register-grid and nested-fold sweeps print a

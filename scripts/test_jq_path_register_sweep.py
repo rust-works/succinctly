@@ -143,5 +143,37 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(sweep.classify(("[]\n", 0), capped), "TIMEOUT")
 
 
+class SampleTests(unittest.TestCase):
+    """`--sample` draws from the generated grid without listing it: the whole grid is
+    63.6M rows and ~15 GB as a list (#5552)."""
+
+    def test_the_generated_grid_is_the_listed_grid_in_order(self):
+        one = [sweep.OPERANDS[0]]
+        grid, chains = sweep.build_rows(operands=one)
+        self.assertEqual(list(sweep.iter_grid(operands=one)), grid)
+        self.assertEqual(sweep.chain_rows(), chains)
+
+    def test_a_sample_holds_k_distinct_items_and_one_seed_is_one_draw(self):
+        draw = sweep.reservoir_sample(range(10_000), 50, sweep.random.Random(7))
+        self.assertEqual(len(draw), 50)
+        self.assertEqual(len(set(draw)), 50)
+        self.assertEqual(draw, sweep.reservoir_sample(range(10_000), 50, sweep.random.Random(7)))
+        self.assertNotEqual(draw, sweep.reservoir_sample(range(10_000), 50, sweep.random.Random(8)))
+
+    def test_fewer_items_than_k_are_all_kept(self):
+        self.assertEqual(sweep.reservoir_sample(iter(range(3)), 5, sweep.random.Random(1)), [0, 1, 2])
+        self.assertEqual(sweep.reservoir_sample(range(3), 0, sweep.random.Random(1)), [])
+
+    def test_every_item_is_equally_likely(self):
+        # 40,000 draws of 5 of 50: each item is expected 4,000 times. A skip computed
+        # off by one, or a first-k bias, moves the count far outside a 5% band.
+        counts = [0] * 50
+        for seed in range(40_000):
+            for x in sweep.reservoir_sample(range(50), 5, sweep.random.Random(seed)):
+                counts[x] += 1
+        for item, n in enumerate(counts):
+            self.assertLess(abs(n - 4000), 200, f"item {item} drawn {n} times")
+
+
 if __name__ == "__main__":
     unittest.main()

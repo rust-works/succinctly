@@ -8,7 +8,7 @@ fold's later emission of the accumulator raises in jq; when an enclosing `reduce
 moved the register onto an element, neither `.` nor `$x` is the register and the step raises for a
 `reduce` source too. `jq-path-register-sweep.py` has no outer-`$x`-destructured-in-a-body operand,
 so it cannot gate this: the grid here is outer fold x inner fold x source shape x write context x
-document, six x three x fifty-six x seven x thirteen.
+document, 28 x 3 x 159 x 7 x 13 = 1,215,396 rows (6 x 3 x 56 x 7 x 13 when it was written).
 
 Rows are classified against jq (`/usr/bin/jq`) per build, as `jq-path-register-sweep.py` does:
 MATCH, ACCEPT_WRONG (jq refused, the build answered: the dangerous one, `del`/`=`/`|=` write
@@ -16,10 +16,15 @@ through it), REFUSE_WRONG (the safe direction) and DIFF. Exit status 1 when the 
 ACCEPT_WRONG outside the documented residual (`KNOWN_ACCEPT_WRONG`), a row that matched jq on
 `--base` and no longer does (a lost match: a refuse-only fallback has leaked under `try` before,
 #3186/#3267), or a candidate timeout. Run it against a `main` build as `--base` to see what a change moved.
+`--jq-gate` also fails the run on any DIFF of the candidate against jq (a wrong answer where both answered,
+which the ACCEPT_WRONG rule does not see). No DIFF is documented today, and it is how `succinctly dev compare jq
+--dimension sweeps` runs this script (#5552), over `--sample K`: about one row in K of the 1.2M-row grid, chosen
+by a hash of the row's index and `--seed` while the grid is generated.
 
 Usage: scripts/jq-fold-body-register-grid-sweep.py --bin BIN [--base BIN] [--jq JQ] [--show N]
                                                    [--only SUBSTR[,SUBSTR...]] [--only-source SUBSTR[,SUBSTR...]]
                                                    [--jobs N] [--wrapped | --deep] [--dump FILE]
+                                                   [--sample K] [--seed S] [--jq-gate]
 """
 import argparse
 import collections
@@ -360,6 +365,19 @@ def classify(oracle, got):
 PROGRESS_EVERY = 2000
 
 
+def _mix64(x):
+    """splitmix64's finalizer: a fixed, well-spread 64-bit hash, the same on every machine and Python."""
+    x = (x + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    return x ^ (x >> 31)
+
+
+def keep(index, k, seed):
+    """Whether `--sample K` keeps the row at `index` of the generated grid: about one in `k`."""
+    return k <= 1 or _mix64((seed << 40) ^ index) % k == 0
+
+
 def progress_line(done, total, elapsed):
     """`  done/total (elapsed s, rate rows/s, ETA)`: the rate is the run's average so far."""
     rate = done / elapsed if elapsed > 0 else 0.0
@@ -390,6 +408,13 @@ def main():
     )
     ap.add_argument("--dump", help="write every row's classes as JSON lines to this file (name, doc, candidate, base)")
     ap.add_argument("--breakdown", action="store_true", help="count the #4588 residual rows per outer fold and source")
+    ap.add_argument("--sample", type=int, default=1, help="keep about one row in K, by a seeded hash of its index")
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument(
+        "--jq-gate",
+        action="store_true",
+        help="also fail on any DIFF row of --bin against jq (#5552)",
+    )
     args = ap.parse_args()
     if args.wrapped and args.deep:
         ap.error("--wrapped and --deep are alternatives: run them separately")
@@ -398,7 +423,10 @@ def main():
 
     rows = []
     contexts = WRAPPED_CONTEXTS if args.wrapped else CONTEXTS
-    for (on, o), (inn, i), (sn, s), (cn, c), doc in itertools.product(DEEP_OUTER if args.deep else OUTER, INNER, SOURCES, contexts, DOCS):
+    product = itertools.product(DEEP_OUTER if args.deep else OUTER, INNER, SOURCES, contexts, DOCS)
+    for index, ((on, o), (inn, i), (sn, s), (cn, c), doc) in enumerate(product):
+        if not keep(index, args.sample, args.seed):
+            continue
         name = f"{on}/{inn}/{sn}/{cn}"
         if args.only and not any(part in name for part in args.only.split(",")):
             continue
@@ -465,6 +493,7 @@ def main():
     residual = [r for r in results if r[5] == "ACCEPT_WRONG" and known(r)]
     lost = [r for r in results if args.base and r[7] == "MATCH" and r[5] != "MATCH"]
     hung = [r for r in results if r[5] == "TIMEOUT"]
+    diff = [r for r in results if r[5] == "DIFF"] if args.jq_gate else []
     print(
         f"ACCEPT_WRONG outside the documented residual: {len(fresh)}; documented residual: "
         f"{len(residual)} (known sources included); of a non-register `$x` (#4588): {len(residual_nav)}"
@@ -476,7 +505,9 @@ def main():
         for (outer, source), n in sorted(by.items()):
             print(f"  residual {outer} {source}: {n}")
     print(f"lost matches against --base: {len(lost)}; candidate timeouts: {len(hung)}")
-    for title, section in (("ACCEPT_WRONG", fresh), ("LOST MATCH", lost), ("TIMEOUT", hung)):
+    if args.jq_gate:
+        print(f"DIFF against jq (--jq-gate): {len(diff)}")
+    for title, section in (("ACCEPT_WRONG", fresh), ("LOST MATCH", lost), ("TIMEOUT", hung), ("DIFF", diff)):
         for name, _sn, prog, doc, oracle, klass, cand, _b in section[: args.show]:
             print(f"{title} {name} [{klass}]\n   {prog}\n   in={doc} jq={oracle} build={cand}")
     if args.wrapped or args.deep:
@@ -485,8 +516,8 @@ def main():
         print(f"newly ACCEPT_WRONG against --base: {len(worse)}")
         for name, _sn, prog, doc, oracle, klass, cand, _b in worse[: args.show]:
             print(f"NEW ACCEPT_WRONG {name}\n   {prog}\n   in={doc} jq={oracle} build={cand}")
-        return 1 if worse or lost or hung else 0
-    return 1 if fresh or lost or hung or len(residual_nav) > RESIDUAL_NAV_MAX else 0
+        return 1 if worse or lost or hung or diff else 0
+    return 1 if fresh or lost or hung or diff or len(residual_nav) > RESIDUAL_NAV_MAX else 0
 
 
 sys.exit(main())

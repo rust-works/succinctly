@@ -15,19 +15,25 @@ answered: the dangerous one, `del`/`=`/`|=` write through it), REFUSE_WRONG (the
 With `--base`, exit status 1 when a row that matched jq on the base no longer does (a lost match: a
 refuse-only fallback leaked under `try` before, #3186/#3267), a row that was not an ACCEPT_WRONG on the
 base is one on `--bin`, or a row the base refused now answers wrongly (DIFF). A wrong answer both builds
-share is listed, not failed. A timeout of `--bin` that `--base` did not have fails. The full product is large, so `--sample K`
-runs every Kth row of a fixed shuffle (`--seed`) and `--only` narrows to rows containing a substring.
+share is listed, not failed. A timeout of `--bin` that `--base` did not have fails. Without `--base` only that
+timeout fails, unless `--jq-gate` is given: it fails the run on any ACCEPT_WRONG or DIFF of `--bin` against jq as
+well, with or without `--base` (MSGDIFF and REFUSE_WRONG stay listed only). No residual is documented today, and it
+is how `succinctly dev compare jq --dimension sweeps` runs this script (#5552); a residual that becomes accepted has
+to be listed here first.
+
+The `foreach` product is 6.9M rows, so `--sample K` keeps about one row in K, chosen by a hash of the row's index
+and `--seed` while the grid is generated (a list of the whole grid passed a 4 GB cap before #5552), and `--only`
+narrows to rows containing a substring.
 
 Usage: scripts/jq-fold-update-alt-bind-sweep.py --bin BIN [--base BIN] [--jq JQ] [--fold foreach|foreach2|reduce]
                                                 [--sample K] [--seed S] [--only SUBSTR[,SUBSTR...]]
-                                                [--jobs N] [--show N] [--dump FILE]
+                                                [--jobs N] [--show N] [--dump FILE] [--jq-gate]
 """
 import argparse
 import collections
 import concurrent.futures as cf
 import itertools
 import json
-import random
 import re
 import subprocess
 import sys
@@ -147,6 +153,24 @@ def grid(fold):
                 yield doc, expr
 
 
+def _mix64(x):
+    """splitmix64's finalizer: a fixed, well-spread 64-bit hash, the same on every machine and Python."""
+    x = (x + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    return x ^ (x >> 31)
+
+
+def sampled(rows, k, seed):
+    """About one row in `k` of `rows`, chosen by a hash of its index and `seed`, without listing `rows`."""
+    if k <= 1:
+        yield from rows
+        return
+    for i, row in enumerate(rows):
+        if _mix64((seed << 40) ^ i) % k == 0:
+            yield row
+
+
 def run(cmd, doc, expr):
     try:
         p = subprocess.run(cmd + ["-c", expr], input=doc.encode(), capture_output=True, timeout=20)
@@ -179,18 +203,22 @@ def main():
     ap.add_argument("--fold", choices=["foreach", "foreach2", "reduce"], default="foreach")
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--show", type=int, default=10, help="rows printed per transition")
-    ap.add_argument("--sample", type=int, default=1, help="run every Kth row of the shuffled grid")
+    ap.add_argument("--sample", type=int, default=1, help="keep about one row in K, by a seeded hash of its index")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--only", help="keep rows whose program contains one of these substrings")
     ap.add_argument("--dump", help="write every row of a transition worth reading, as JSON")
+    ap.add_argument(
+        "--jq-gate",
+        action="store_true",
+        help="also fail on any ACCEPT_WRONG or DIFF row of --bin against jq (the gate without --base, #5552)",
+    )
     a = ap.parse_args()
 
-    rows = list(grid(a.fold))
+    rows = grid(a.fold)
     if a.only:
         needles = a.only.split(",")
-        rows = [r for r in rows if any(n in r[1] for n in needles)]
-    random.Random(a.seed).shuffle(rows)
-    rows = rows[:: max(a.sample, 1)]
+        rows = (r for r in rows if any(n in r[1] for n in needles))
+    rows = list(sampled(rows, a.sample, a.seed))
     print(f"{len(rows)} rows", file=sys.stderr)
 
     def work(row):
@@ -218,6 +246,9 @@ def main():
                 or (kb == "REFUSE_WRONG" and kc == "DIFF")
             ):
                 failed = True
+            # No residual is documented, so against jq alone a wrong answer is never expected.
+            if a.jq_gate and kc in ("ACCEPT_WRONG", "DIFF"):
+                failed = True
     print(("base -> candidate" if a.base else "candidate") + " (vs jq):")
     for (kb, kc), n in sorted(counts.items(), key=lambda kv: -kv[1]):
         print(f"  {kb:13} -> {kc:13} {n}" if a.base else f"  {kc:13} {n}")
@@ -232,7 +263,8 @@ def main():
                 out,
             )
     if failed:
-        print("\nFAIL: a lost match or a new wrong accept (see above)", file=sys.stderr)
+        why = "a lost match, a new wrong accept" + (" or a wrong answer against jq" if a.jq_gate else "")
+        print(f"\nFAIL: {why} (see above)", file=sys.stderr)
     return 1 if failed else 0
 
 
