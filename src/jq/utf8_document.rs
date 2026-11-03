@@ -63,8 +63,8 @@ use crate::text::utf8::substitute_invalid_utf8_jq_style;
 /// [`substitute_invalid_utf8_jq_style`] to each JSON string rather than to
 /// the whole buffer (#1743).
 ///
-/// Bytes outside any string are substituted too, one invalid byte at a time
-/// (`String::from_utf8_lossy`): the result has to be valid UTF-8 for the rest
+/// Bytes outside any string are substituted too, one U+FFFD for each maximal
+/// ill-formed run (`String::from_utf8_lossy`): the result has to be valid UTF-8 for the rest
 /// of the pipeline to treat it as text at all. Real jq substitutes nothing
 /// there: a bad byte is part of a literal token, which is a parse error
 /// (`printf '{"a":\xe1\x41 1}' | jq .`), and so it is in succinctly. The
@@ -145,7 +145,7 @@ pub fn substitute_invalid_utf8_jq_document(raw: &[u8]) -> String {
 fn push_segment(out: &mut String, bytes: &[u8]) {
     match core::str::from_utf8(bytes) {
         Ok(s) => out.push_str(s),
-        // Byte by byte, never with the string-scoped short-tail rule: jq substitutes nothing
+        // One U+FFFD per maximal ill-formed run, never the string-scoped short-tail rule: jq substitutes nothing
         // outside a string (a bad byte is part of a literal token), so a lead byte must not take
         // the white space after it, or the newline that ends the token (`\xe1\n"a" 1` lost its
         // newline, and the read that resumed after the fault lost `"a"` and `1`, #5994).
@@ -216,7 +216,7 @@ fn repair_string_body(out: &mut String, body: &[u8], has_escape: bool) {
 
     // jq's lexer refuses a raw control character in a string before it substitutes anything, so a
     // body holding one is a parse error at that character. The drop quirk must not take it with a
-    // lead byte (`"\xe1\n"` would read as a lone U+FFFD): substitute byte by byte instead, which
+    // lead byte (`"\xe1\n"` would read as a lone U+FFFD): substitute each ill-formed run on its own instead, which
     // keeps every ASCII byte where the parser will find it (#5990).
     if body.iter().any(|&b| b < 0x20) {
         out.push_str(&String::from_utf8_lossy(body));
@@ -275,7 +275,7 @@ mod tests {
         );
     }
 
-    /// #5994: outside a string the substitution is byte by byte, so a lead byte keeps the white
+    /// #5994: outside a string each ill-formed run is one U+FFFD on its own, so a lead byte keeps the white
     /// space after it; jq's parser counts that newline and ends the literal token at it.
     #[test]
     fn a_lead_byte_outside_a_string_keeps_the_white_space_after_it_5994() {
