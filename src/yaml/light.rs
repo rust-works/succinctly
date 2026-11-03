@@ -6696,8 +6696,9 @@ fn zero_bytes(w: u64) -> u64 {
 /// This is the gate of every reader of a scalar, run for every scalar of a document, so it is one
 /// pass eight bytes at a time that also notes whether any byte is non-ASCII; only a body that
 /// has one pays for [`holds_unicode_scalar_break`]. The gate used to be three `contains` passes
-/// (`special`, `\n`, `\r`), and four or five once the lead bytes of the three characters were
-/// added, which timed +5% on every row of `dev bench`-shaped YAML on both a 7950X and an M4 Pro.
+/// (`special`, `\n`, `\r`), and five once the lead bytes of the three characters were added,
+/// which timed +5% (up to +11%) on all 12 rows of an interleaved A/B on both a 7950X and an M4 Pro
+/// (#4913); this one pass is faster than the original three on both.
 #[inline]
 fn body_is_verbatim(bytes: &[u8], special: u8, unicode: bool) -> bool {
     let special_word = SWAR_LOW * u64::from(special);
