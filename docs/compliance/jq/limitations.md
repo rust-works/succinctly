@@ -7410,6 +7410,7 @@ An escaped letter Oniguruma does not define is the letter, as `\u` and `\U` are 
 The set was captured from jq 1.7.1 over every ASCII character.
 The `regex` crate refused most of them, and read `\v` as a vertical tab (`"v" | test("\\v")` is `true` in jq).
 `\g` and `\k` are the letter only where no `<` or `'` follows: `\g<n>` calls a group and `\k<n>` is a back-reference.
+`\o` is the letter only where no `{` follows: `\o{101}` is an octal escape, and stays refused.
 `\x` is not in the set: jq reads hex digits after it, and a lone `\x` at the end of a pattern is the letter while `\xZ` matches nothing, which this does not reproduce (it stays the crate's error).
 Pinned in `tests/jq_cli/i6080.rs`.
 A Python-style group (`(?P<n>a)`, `(?P=n)`, `(?P>n)`) is an error in jq (`undefined group option`), and the `regex` crate would accept the first.
@@ -7487,7 +7488,7 @@ Every row was captured from jq 1.7.1.
 - **jq's refusals:** an interval with nothing to repeat (`{1}`, `a|{2}`, `(?:{2})`: `target of repeat operator is not specified`), a conditional on a group the pattern lacks (`(?(2)a|b)`: `invalid backref number/name`, and `undefined name <n> reference` for a name), and a group name that is empty or starts with a digit.
   `"a" | test("(?(2)a|b)")` panicked inside `fancy-regex` before this.
 
-Still refused with the crate's `invalid regex` error, where jq answers: `\X` (one grapheme cluster), `\y` and `\Y` (text-segment boundaries), `\g<name>` and `\g1` (calls), `\o{…}`, an octal escape of 0x80 or more (`\377`), `\cé`, and `\x{110000}`.
+Still refused with the crate's `invalid regex` error, where jq answers: `\X` (one grapheme cluster), `\y` and `\Y` (text-segment boundaries), `\g<name>` (a call), `\o{…}`, an octal escape of 0x80 or more (`\377`), `\cé`, and `\x{110000}`.
 Whether one of them matches needs Unicode text segmentation or Oniguruma's byte-level reading of a multibyte pattern.
 Pinned by `tests/jq_cli/i6070.rs`.
 

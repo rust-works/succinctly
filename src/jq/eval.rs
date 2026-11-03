@@ -28300,14 +28300,15 @@ fn translate_posix_brackets(
 ///
 /// The set is captured from jq-1.7.1 over every ASCII character, in and out of a class and under
 /// the `x` flag: `g h i j k l m o q u v C E F H I J L M T U V`. `\g` and `\k` are the letter only
-/// where no `<` or `'` follows (`\g<n>` calls a group, `\k<n>` is a back-reference). `\x` is not
-/// here: it reads hex digits, and what follows it decides the meaning. `\p` and `\P` have their
-/// own rule below.
+/// where no `<` or `'` follows (`\g<n>` calls a group, `\k<n>` is a back-reference), and `\o` where
+/// no `{` does (`\o{101}` is an octal escape, which stays refused). `\x` is not here: it reads hex
+/// digits, and what follows it decides the meaning. `\p` and `\P` have their own rule below.
 #[cfg(feature = "regex")]
 fn is_plain_letter_escape(letter: char, after: Option<char>) -> bool {
     match letter {
         'g' | 'k' => !matches!(after, Some('<' | '\'')),
-        'h' | 'i' | 'j' | 'l' | 'm' | 'o' | 'q' | 'u' | 'v' | 'C' | 'E' | 'F' | 'H' | 'I' | 'J'
+        'o' => after != Some('{'),
+        'h' | 'i' | 'j' | 'l' | 'm' | 'q' | 'u' | 'v' | 'C' | 'E' | 'F' | 'H' | 'I' | 'J'
         | 'L' | 'M' | 'T' | 'U' | 'V' => true,
         _ => false,
     }

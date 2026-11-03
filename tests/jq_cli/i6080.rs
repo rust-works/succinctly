@@ -143,3 +143,14 @@ fn an_escaped_letter_jq_does_not_define_is_the_letter() -> Result<()> {
         (r#""ab" | test("a\\bb")"#, "false"),
     ])
 }
+
+/// `\o{101}` is an octal escape in jq, not `o` and a repeat: it stays refused (as before #6080), where
+/// reading `\o` as the letter answered `"oo" | test("\\o{2}")` as `true` and jq `false`.
+#[test]
+fn an_octal_brace_escape_is_not_the_letter_o() -> Result<()> {
+    for program in [r#""A" | test("\\o{101}")"#, r#""oo" | test("\\o{2}")"#] {
+        let (_, code) = run_jq_stdin(program, "null", &["-c"])?;
+        assert_ne!(code, 0, "`{program}` must stay refused");
+    }
+    Ok(())
+}
