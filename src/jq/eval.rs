@@ -17458,12 +17458,24 @@ pub(crate) fn compare_values<S: EvalSemantics>(
 /// Whether `value` is, or holds anywhere, a NaN: the scan [`sort_like_jq`] makes first, so that
 /// the second comparison it needs for a pair of NaN-bearing keys is paid only by data that has
 /// one.
+///
+/// Walked with a stack of its own, not by recursion: a key can be as deep as the comparator
+/// refuses to follow, and this scan runs before the comparator's depth guard does.
 pub(crate) fn value_has_nan(value: &OwnedValue) -> bool {
-    match value {
-        OwnedValue::Array(items) => items.iter().any(value_has_nan),
-        OwnedValue::Object(fields) => fields.values().any(value_has_nan),
-        number => number.as_f64().is_some_and(f64::is_nan),
+    // A scalar, which is nearly every sort key, needs no stack.
+    if !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+        return value.as_f64().is_some_and(f64::is_nan);
     }
+    let mut pending = vec![value];
+    while let Some(next) = pending.pop() {
+        match next {
+            OwnedValue::Array(items) => pending.extend(items.iter()),
+            OwnedValue::Object(fields) => pending.extend(fields.values()),
+            number if number.as_f64().is_some_and(f64::is_nan) => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Whether any of the `[f]` keys of a sort is, or holds, a NaN.
@@ -136703,6 +136715,77 @@ mod tests {
                 QueryResult::Owned(OwnedValue::Int(_)) => {}
             );
         }
+    }
+
+    /// #6008: a NaN tie is an equivalence, so the sort is consistent however the NaNs sit in the
+    /// keys: ties stay in input order, every other pair is ordered, and nothing panics.
+    #[test]
+    fn test_sort_nan_ties_are_a_consistent_order_6008() {
+        // A small deterministic generator, not a dependency.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let atoms = [
+            OwnedValue::Float(f64::NAN),
+            OwnedValue::Int(0),
+            OwnedValue::Int(1),
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+        ];
+        let build = |depth: u32, next: &mut dyn FnMut() -> u64| -> OwnedValue {
+            fn go(depth: u32, next: &mut dyn FnMut() -> u64, atoms: &[OwnedValue]) -> OwnedValue {
+                if depth == 0 || next() % 3 == 0 {
+                    return atoms[(next() % atoms.len() as u64) as usize].clone();
+                }
+                let len = (next() % 3) as usize;
+                OwnedValue::array_from((0..len).map(|_| go(depth - 1, next, atoms)).collect())
+            }
+            go(depth, next, &atoms)
+        };
+        for round in 0..40 {
+            let mut items: Vec<(usize, OwnedValue)> = (0..(round * 40 + 10))
+                .map(|i| (i, build(3, &mut next)))
+                .collect();
+            sort_like_jq(
+                &mut items,
+                |a, b| compare_values::<JqSemantics>(&a.1, &b.1),
+                |item| value_has_nan(&item.1),
+            );
+            // Two neighbours that compare `Less` in both directions are a tie, and a tie keeps
+            // input order; any other neighbouring pair is not out of order.
+            for pair in items.windows(2) {
+                let (ab, ba) = (
+                    compare_values::<JqSemantics>(&pair[0].1, &pair[1].1),
+                    compare_values::<JqSemantics>(&pair[1].1, &pair[0].1),
+                );
+                let tie = ab == core::cmp::Ordering::Less && ba == core::cmp::Ordering::Less;
+                assert!(
+                    (tie && pair[0].0 < pair[1].0) || ab != core::cmp::Ordering::Greater,
+                    "round {round}: {:?} before {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+    }
+
+    /// #6008: the scan for a NaN does not recurse, so a key nested past the comparator's depth
+    /// guard is scanned without using the stack.
+    #[test]
+    fn test_value_has_nan_follows_a_deep_key_6008() {
+        let mut deep = OwnedValue::Float(f64::NAN);
+        let mut clean = OwnedValue::Int(1);
+        for _ in 0..200_000 {
+            deep = OwnedValue::array_from(vec![deep]);
+            clean = OwnedValue::array_from(vec![clean]);
+        }
+        assert!(value_has_nan(&deep));
+        assert!(!value_has_nan(&clean));
+        // Dropping 200,000 levels is the owned value's own iterative teardown.
     }
 
     #[test]

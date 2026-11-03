@@ -2,8 +2,9 @@
 //! ways), and its sort and `min_by`/`max_by` loops settle those ties by input position: the sort
 //! keeps NaN-keyed items in input order, `min`/`min_by` take the last of a run of NaNs and
 //! `max`/`max_by` the first. The rows are `tests/data/jq-nan-ties-oracle-6008.tsv`: a program, its
-//! stdout, stderr and exit status, captured from `/usr/bin/jq` 1.7.1 over 13 arrays (NaN first,
-//! middle, last, alone, in nested arrays and in object fields) and 16 builtins. The stderr is
+//! stdout, stderr and exit status, captured from `/usr/bin/jq` 1.7.1 over 13 arrays of at most three
+//! items (NaN first, middle, last, alone, in nested arrays and in object fields, a length at which
+//! glibc and Apple's `qsort` agree) and 16 builtins. The stderr is
 //! compared on its first line, as jq words it `(at <unknown>)` and so do we.
 
 use anyhow::Result;
@@ -69,13 +70,11 @@ fn nan_ties_keep_input_order_in_a_long_document_6008() -> Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     let input = format!("[{documents}]");
-    let (stdout, stderr, code) = run_jq_full(
-        &[
-            "-c",
-            "sort_by(.k) | map(select(.k == null) | .n) | . == sort",
-        ],
-        Some(&input),
-    )?;
+    // The 667 NaN-keyed records come first, in input order (jq on glibc; Apple's `qsort` permutes
+    // a run this long, see the limitations page), and the rest follow in key order.
+    let program = "sort_by(.k) as $s | ($s[:667] | map(.n)) == [range(0; 2000; 3)] \
+                   and ($s[667:] | map(.k)) == [range(2000) | select(. % 3 != 0)]";
+    let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(&input))?;
     assert_eq!((stdout.as_str(), stderr.as_str(), code), ("true\n", "", 0));
     let (stdout, _, _) = run_jq_full(&["-c", "min_by(.k).n, max_by(.k).n"], Some(&input))?;
     // The last NaN-keyed record is the minimum, the first the maximum of the NaNs; 1999 is the

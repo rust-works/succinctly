@@ -36434,10 +36434,10 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             };
             // `min_by`/`max_by` on ties: jq's own definitions keep the
             // *first* minimum and the *last* maximum (`min_by` uses `<`,
-            // `max_by` uses `<=` internally), which is exactly what
-            // `Iterator::min_by`/`max_by` do. Reusing them rather than
-            // hand-rolling the comparison keeps that asymmetry from being
-            // re-derived and getting it backwards.
+            // `max_by` uses `<=` internally), which is what `jq_min_by`/`jq_max_by` do: a
+            // new item replaces the held one when it compares `Less` (`min`) or unless it does
+            // (`max`). For two NaNs, which each compare `Less` than the other, that is the last
+            // for `min_by` and the first for `max_by` (#6008).
             // #4055: yq's own comparator and tie rule for the bare spellings, whose keys are the
             // elements themselves.
             if S::MIN_MAX_NEED_AN_ELEMENT && matches!(builtin, Builtin::Min | Builtin::Max) {
