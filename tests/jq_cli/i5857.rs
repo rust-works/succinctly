@@ -4,7 +4,7 @@
 //! captured from `/usr/bin/jq`): each document, the line and file `input_line_number` and
 //! `input_filename` name after it, a token that runs on from one file into the next, an empty
 //! or white-space-only file, and the `(at ...)` marker an error names once the stream is read
-//! to its end.
+//! to its end. `-R` lines of several files take the same route.
 
 use anyhow::Result;
 
@@ -67,6 +67,51 @@ fn a_stream_of_several_files_read_under_null_input_matches_jq_5857() -> Result<(
             let (path, renamed) = name(path, index);
             stderr = stderr.replace(&path, &renamed);
             let base = path.rsplit('/').next().unwrap_or(&path);
+            stdout = stdout.replace(base, &renamed);
+        }
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (*want_out, *want_err, *want_code),
+            "{files:?} {program}"
+        );
+    }
+    Ok(())
+}
+
+const RAW_ALL: &str = "[inputs|[., input_line_number, (input_filename|split(\"/\")|last)]]";
+const RAW_MARK: &str = "[inputs]|error(\"x\")";
+const RAW_FIRST: &str = "first(inputs), input_line_number, (input_filename|split(\"/\")|last)";
+
+/// `-R`'s lines (#5857): a line that a file leaves open goes on into the next, and a final line
+/// without a newline is the last file's.
+const RAW_ROWS: &[Row] = &[
+        (&[b"a\nb\n", b"c\nd\n"], RAW_ALL, "[[\"a\",1,\"f0.json\"],[\"b\",2,\"f0.json\"],[\"c\",1,\"f1.json\"],[\"d\",2,\"f1.json\"]]\n", "", 0),
+        (&[b"a\nb\n", b"c\nd\n"], RAW_MARK, "", "jq: error (at f1.json:2): x\n", 5),
+        (&[b"a\nb", b"c\nd\n"], RAW_ALL, "[[\"a\",1,\"f0.json\"],[\"bc\",1,\"f1.json\"],[\"d\",2,\"f1.json\"]]\n", "", 0),
+        (&[b"a\nb", b"c\nd"], RAW_ALL, "[[\"a\",1,\"f0.json\"],[\"bc\",1,\"f1.json\"],[\"d\",1,\"f1.json\"]]\n", "", 0),
+        (&[b"a\nb", b"c\nd"], RAW_MARK, "", "jq: error (at <unknown>): x\n", 5),
+        (&[b"ab", b"cd", b"ef\n"], RAW_ALL, "[[\"abcdef\",1,\"f2.json\"]]\n", "", 0),
+        (&[b"a\n", b"", b"b\n"], RAW_ALL, "[[\"a\",1,\"f0.json\"],[\"b\",1,\"f2.json\"]]\n", "", 0),
+        (&[b"a\n", b"\n", b"b"], RAW_ALL, "[[\"a\",1,\"f0.json\"],[\"\",1,\"f1.json\"],[\"b\",0,\"f2.json\"]]\n", "", 0),
+        (&[b"a", b"", b""], RAW_ALL, "[[\"a\",0,\"f2.json\"]]\n", "", 0),
+        (&[b"a", b"", b""], RAW_MARK, "", "jq: error (at <unknown>): x\n", 5),
+        (&[b"", b"a\n", b"\n\n"], RAW_ALL, "[[\"a\",1,\"f1.json\"],[\"\",1,\"f2.json\"],[\"\",2,\"f2.json\"]]\n", "", 0),
+        (&[b"a\n", b"b\n", b"c\n"], RAW_FIRST, "\"a\"\n1\n\"f0.json\"\n", "", 0),
+        (&[b"\xc3\xa9\n", b"x\xff\ny\n"], RAW_ALL, "[[\"é\",1,\"f0.json\"],[\"x�\",1,\"f1.json\"],[\"y\",2,\"f1.json\"]]\n", "", 0),
+        (&[b"a\r\nb\r\n", b"c\r\n"], RAW_ALL, "[[\"a\\r\",1,\"f0.json\"],[\"b\\r\",2,\"f0.json\"],[\"c\\r\",1,\"f1.json\"]]\n", "", 0),
+        (&[b"one\n"], RAW_MARK, "", "jq: error (at f0.json:1): x\n", 5),
+        (&[b"one"], RAW_MARK, "", "jq: error (at <unknown>): x\n", 5),
+];
+
+#[test]
+fn the_lines_of_several_files_read_under_null_input_match_jq_5857() -> Result<()> {
+    for (files, program, want_out, want_err, want_code) in RAW_ROWS {
+        let (stdout, stderr, code, paths) = run_jq_over_byte_files(&["-nRc", program], files)?;
+        let (mut stdout, mut stderr) = (stdout, stderr);
+        for (index, path) in paths.iter().enumerate() {
+            let renamed = format!("f{index}.json");
+            stderr = stderr.replace(path, &renamed);
+            let base = path.rsplit('/').next().unwrap_or(path);
             stdout = stdout.replace(base, &renamed);
         }
         assert_eq!(
