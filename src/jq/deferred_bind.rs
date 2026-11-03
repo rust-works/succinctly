@@ -84,6 +84,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::document::DocumentCursor;
+use super::eval::unwrap_paren;
 use super::expr::{BindOrigin, Builtin, Expr, ObjectKey};
 use super::walk::any_subexpr;
 
@@ -246,7 +247,7 @@ fn count_var_reads(body: &Expr, var: &str, mut fields: Option<&mut Vec<String>>)
             Expr::Pipe(stages) => {
                 for pair in stages.windows(2) {
                     // `($x).k` reads the member as `$x.k` does: a parenthesis only groups (#5544).
-                    if !matches!(without_parens(&pair[0]), Expr::Var(name) if name == var) {
+                    if !matches!(unwrap_paren(&pair[0]), Expr::Var(name) if name == var) {
                         continue;
                     }
                     if let Some(field) = field_read(&pair[1]) {
@@ -313,14 +314,6 @@ fn may_yield_many(expr: &Expr) -> bool {
         Expr::As { expr, body, .. } => may_yield_many(expr) || may_yield_many(body),
         _ => true,
     }
-}
-
-/// `expr` with the parentheses around it taken off: `(($x))` is `$x`.
-fn without_parens(mut expr: &Expr) -> &Expr {
-    while let Expr::Paren(inner) = expr {
-        expr = inner;
-    }
-    expr
 }
 
 /// The field a stage reads from an object: `.k`, `.k?`.
@@ -612,6 +605,47 @@ mod tests {
         assert_eq!(field_heads("($u) | length"), (heads(&[]), true));
         assert_eq!(field_heads("($u | length)"), (heads(&[]), true));
         assert_eq!(field_heads("($u).a[0]"), (heads(&["a"]), false));
+    }
+
+    /// #5544: a parenthesised field head is classified as the bare one is, for a read at the bind's
+    /// own input and for one that reads the whole node.
+    #[test]
+    fn a_parenthesized_head_is_classified_as_the_bare_one_5544() {
+        for (bare, paren) in [
+            (". as $x | $x.a", ". as $x | ($x).a"),
+            (". as $x | $x.a.b", ". as $x | ($x).a.b"),
+            (". as $x | $x.a + $x.b", ". as $x | ($x).a + ($x).b"),
+            (". as $x | $x.a == .b", ". as $x | ($x).a == .b"),
+            (". as $x | $x", ". as $x | ($x)"),
+            (". as $x | [$x, $x.a]", ". as $x | [($x), ($x).a]"),
+        ] {
+            assert_eq!(reads(paren), reads(bare), "{paren}");
+        }
+        assert_eq!(reads(". as $x | ($x).a"), Some(DeferredReads::Members));
+        assert_eq!(reads(". as $x | (($x)).a"), Some(DeferredReads::Members));
+        assert_eq!(reads(". as $x | ($x)"), Some(DeferredReads::Whole));
+        assert_eq!(reads(". as $x | ($x).a + [$x]"), Some(DeferredReads::Whole));
+    }
+
+    /// The bare spelling is admitted under a repeated ambient and the parenthesised one is not, because
+    /// `walk_pipe` tests the head of a field chain itself and does not see through a parenthesis
+    /// (#5957). Pinned so that fixing it must change these rows.
+    #[test]
+    fn a_parenthesized_head_under_a_repeated_ambient_is_refused_until_5957() {
+        for (bare, paren) in [
+            (
+                ". as $x | .users[] | $x.limit",
+                ". as $x | .users[] | ($x).limit",
+            ),
+            (
+                ". as $x | .users[] | select(.n > $x.limit)",
+                ". as $x | .users[] | select(.n > ($x).limit)",
+            ),
+            (". as $x | [.[] | $x.a]", ". as $x | [.[] | ($x).a]"),
+        ] {
+            assert_eq!(reads(bare), Some(DeferredReads::Members), "{bare}");
+            assert_eq!(reads(paren), None, "{paren}");
+        }
     }
 
     #[test]

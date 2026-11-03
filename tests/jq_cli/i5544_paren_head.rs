@@ -44,20 +44,16 @@ fn a_fold_reading_a_parenthesized_field_head_matches_jq_5544() -> Result<()> {
 fn a_parenthesized_head_leaves_the_members_nothing_names_undecoded_5544() -> Result<()> {
     // `"a"` holds a lone surrogate: jq refuses the document, and here only a read of it raises.
     let doc = r#"[{"a":"\ud800","b":5}]"#;
-    for spelling in [
-        "$u.b",
-        "($u).b",
-        "(($u)).b",
-        r#"($u)["b"]"#,
-        "($u | .b)",
-        "($u).b + ($u).b",
+    for (spelling, want) in [
+        ("$u.b", "5\n"),
+        ("($u).b", "5\n"),
+        ("(($u)).b", "5\n"),
+        (r#"($u)["b"]"#, "5\n"),
+        ("($u | .b)", "5\n"),
+        ("($u).b + ($u).b", "10\n"),
+        ("$u.b + ($u).b", "10\n"),
     ] {
-        let filter = format!("reduce .[] as $u (0; . + {spelling})");
-        let want = if spelling.contains("+ ($u).b") {
-            "10\n"
-        } else {
-            "5\n"
-        };
+        let filter = format!("reduce .[] as $u (0; . + ({spelling}))");
         assert_eq!(jq(&filter, doc)?, (want.to_string(), 0), "{filter}");
     }
     // A read of the member, or of the whole element, still decodes it.
@@ -65,6 +61,7 @@ fn a_parenthesized_head_leaves_the_members_nothing_names_undecoded_5544() -> Res
         "($u).a | length",
         "($u).b + ([$u] | length)",
         "($u | length)",
+        "($u)",
     ] {
         let filter = format!("reduce .[] as $u (0; . + ({spelling}))");
         let (_, status) = jq(&filter, doc)?;
