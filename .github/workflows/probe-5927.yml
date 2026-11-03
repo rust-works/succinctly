@@ -1,0 +1,39 @@
+name: probe 5927
+
+# Throwaway: shows what pgrep prints on each runner image (#5927). Not to be merged.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/probe-5927.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu-24.04, ubuntu-26.04]
+    steps:
+      - uses: actions/checkout@v7
+      - name: What pgrep prints
+        run: |
+          head -3 /etc/os-release; pgrep -V; python3 --version; dpkg -l procps | tail -1
+          mkdir -p /tmp/p/.cargo/bin
+          ln -s "$(command -v sleep)" /tmp/p/.cargo/bin/fake-tool
+          /tmp/p/.cargo/bin/fake-tool 40 &
+          pid=$!
+          sleep 1
+          echo "--- ps"; ps -o pid,comm,args -p "$pid"
+          echo "--- pgrep -fl"; pgrep -fl "cargo|rustc|criterion" || echo "(no output, rc=$?)"
+          echo "--- pgrep -fa"; pgrep -fa "cargo|rustc|criterion" || echo "(no output, rc=$?)"
+          echo "--- pgrep -f (pids)"; pgrep -f "cargo|rustc|criterion" || echo "(no output, rc=$?)"
+          echo "--- pgrep -l fake-tool"; pgrep -l fake-tool || echo "(no output, rc=$?)"
+          echo "--- pgrep -xl sleep"; pgrep -xl sleep || echo "(no output, rc=$?)"
+          echo "--- pgrep -xl fake-tool"; pgrep -xl fake-tool || echo "(no output, rc=$?)"
+          kill "$pid"
+      - name: The script test
+        run: python3 scripts/test_ab_cli.py -v 2>&1 | tail -40
