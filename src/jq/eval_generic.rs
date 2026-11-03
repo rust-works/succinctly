@@ -16699,7 +16699,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         Expr::Builtin(Builtin::Path(path_expr))
             if cursor.is_some() && path_expr_descent(path_expr).is_some() =>
         {
-            let cond = path_expr_descent(path_expr).expect("guarded");
+            let cond = path_expr_descent(path_expr).and_then(|descent| descent.cond());
             each_path_descent_generic::<S, V>(cursor.expect("guarded"), cond, sink)
         }
 
@@ -27445,21 +27445,38 @@ fn path_expr_is_bare_descent(expr: &Expr) -> bool {
     }
 }
 
-/// The descent [`path_descent_each`] walks for `path(expr)`: `Some(None)` for a bare `..` (see
-/// [`path_expr_is_bare_descent`]), `Some(Some(cond))` for a `recurse(f; cond)` whose `cond` the position
+/// The descent [`path_descent_each`] walks for `path(expr)`: [`PathDescent::Bare`] for a bare `..` (see
+/// [`path_expr_is_bare_descent`]), [`PathDescent::Gated`] for a `recurse(f; cond)` whose `cond` the position
 /// walk takes ([`recurse_cond_is_walkable`], #5504), `None` for anything else. A gated descent was
 /// the one spelling of `path(recurse(...))` still materializing the document, which expands every
 /// alias where `..` stops at one (#4214).
-fn path_expr_descent(expr: &Expr) -> Option<Option<&Expr>> {
+fn path_expr_descent(expr: &Expr) -> Option<PathDescent<'_>> {
     if path_expr_is_bare_descent(expr) {
-        return Some(None);
+        return Some(PathDescent::Bare);
     }
     match expr {
         Expr::Paren(inner) => path_expr_descent(inner),
         Expr::Builtin(Builtin::RecurseCond(f, cond)) if recurse_cond_is_walkable(f, cond) => {
-            Some(Some(cond))
+            Some(PathDescent::Gated(cond))
         }
         _ => None,
+    }
+}
+
+/// A descent [`path_descent_each`] walks ([`path_expr_descent`]).
+enum PathDescent<'e> {
+    /// `..`, `recurse` or `recurse(.[]?)`: every descendant.
+    Bare,
+    /// `recurse(f; cond)`: the children `cond` keeps.
+    Gated(&'e Expr),
+}
+
+impl<'e> PathDescent<'e> {
+    fn cond(&self) -> Option<&'e Expr> {
+        match self {
+            Self::Bare => None,
+            Self::Gated(cond) => Some(cond),
+        }
     }
 }
 
@@ -28615,7 +28632,7 @@ fn path_descent_each<S: EvalSemantics, V: DocumentValue>(
             // never of the root, as the position walk does ([`path_context_step_recurse_each`]).
             // Asked here, as the walk reaches the parent, a stop from `emit` has already ended the
             // walk before a later sibling's `cond` runs.
-            let mut kept = Vec::with_capacity(children.len());
+            let mut kept = Vec::new();
             for (trail, node) in children {
                 let keeps = match &node {
                     PathNode::At(cursor) => recurse_cond_keeps_cursor::<S, V>(cond, *cursor)?,
@@ -36599,9 +36616,9 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // #3850: a bare `..`/`recurse` over a live node is walked by `path_descent_each`, so it
             // takes the path walkers' 384 ceiling; over a computed value (no cursor) it still
             // materializes below and keeps 256.
-            if let (Some(root), Some(cond)) = (cursor, path_expr_descent(path_expr)) {
+            if let (Some(root), Some(descent)) = (cursor, path_expr_descent(path_expr)) {
                 let mut out = Vec::new();
-                return match path_descent_each::<S, V>(root, cond, &mut |path| {
+                return match path_descent_each::<S, V>(root, descent.cond(), &mut |path| {
                     out.push(path);
                     Demand::Continue
                 }) {
@@ -56980,7 +56997,7 @@ mod tests {
         ] {
             let expr = stage(gated);
             let got = path_expr_descent(&expr).unwrap_or_else(|| panic!("{gated}"));
-            assert_eq!(got.is_some(), has_cond, "{gated}");
+            assert_eq!(got.cond().is_some(), has_cond, "{gated}");
         }
         for other in [
             "recurse(.a; true)",
