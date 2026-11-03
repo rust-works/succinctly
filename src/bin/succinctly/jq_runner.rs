@@ -7000,11 +7000,13 @@ fn get_inputs(
         // #6019: under `-n -s` jq reads on the first `input`, so a stream with a fault is read the
         // way the resuming route reads it (the faults are inputs, the documents after them are
         // read), and the faults then come out ahead of the array. A clean stream, or a program
-        // that does not read inputs, keeps the single parse.
+        // that does not read inputs, keeps the single parse. (`track_eof` is set only for a program
+        // that reads inputs, so the probe parse is paid by `-n -s` with `input`/`inputs` alone.)
         let resume_slurp = args.slurp
             && args.null_input
             && track_eof
             && !args.stream
+            && !args.seq
             && args.input_dsv.is_none()
             && raw_inputs
                 .iter()
