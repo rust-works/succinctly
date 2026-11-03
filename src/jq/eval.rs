@@ -89818,6 +89818,27 @@ fn delete_paths_sorted<S: EvalSemantics>(
         paths.iter().all(|p| p.len() > start),
         "every path in a run is longer than the depth it is grouped at"
     );
+    // #6012: jq reads each key it has more path under with `jv_get`, and a `null` has nothing a
+    // `null`, boolean or array key can name: `null | delpaths([[[1],0]])` is `Cannot index null
+    // with array`. A `null` child never gets that far, because jq skips it before it descends
+    // (`delete_paths_under` returns it as it is), so only a `null` root is asked, here at depth 0;
+    // the first such key in the sorted order jq walks them names the error. yq indexes nothing by
+    // any of them.
+    if start == 0 && !yq_mode && matches!(value, OwnedValue::Null) {
+        if let Some(key) = paths
+            .iter()
+            .filter(|path| path.len() > 1)
+            .map(|path| &path[0])
+            .find(|key| {
+                matches!(
+                    key,
+                    OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::Array(_)
+                )
+            })
+        {
+            return Err(EvalError::cannot_index("null", key));
+        }
+    }
     let mut del_keys: Vec<&OwnedValue> = Vec::new();
     let mut i = 0;
     while i < paths.len() {
@@ -89940,7 +89961,24 @@ fn delete_paths_under<S: EvalSemantics>(
         },
         // jq reads the child with `jv_get`: a `null` is skipped, and any other
         // scalar is `Cannot index <type> with <key>`.
+        // (A `null` *root* meeting a `null`, boolean or array key is `delete_paths_sorted`'s: jq
+        // skips a `null` child before it descends, so only the root can be indexed here, #6012.)
         OwnedValue::Null => Ok(OwnedValue::Null),
+        // #6012: `jv_get` on a string takes an object key as a slice descriptor, before the rest
+        // of the path is reached: one that is not a descriptor (a bound that is not a number or
+        // `null`, or a key that is not `start`/`end` at all) is `Array/string slice indices must
+        // be integers`, and one that is names a substring, which the rest of the path then
+        // fails to delete from (`Cannot delete fields from string`) or to index.
+        OwnedValue::String(text) if !yq_mode && matches!(key, OwnedValue::Object(_)) => {
+            let OwnedValue::Object(desc) = key else {
+                return Err(EvalError::cannot_index("string", key));
+            };
+            let chars: Vec<char> = text.chars().collect();
+            let range = SliceBounds::from_descriptor(desc)?.resolve_walk(chars.len());
+            let part: String = chars[range].iter().collect();
+            delete_paths_sorted::<S>(OwnedValue::String(part.into()), paths, start)?;
+            Err(EvalError::cannot_delete_fields_from("string"))
+        }
         // #2106 (delpaths half): real yq no-ops a delpaths() path component
         // against a genuine scalar root, the same way `del()` does -- an
         // array root still errors below, matching `is_yq_field_index_noop_scalar`'s
