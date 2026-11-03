@@ -96,42 +96,42 @@ fn test_l_measures_from_the_attempt_not_from_k_6085() -> Result<()> {
         (r#""ab" | [match("b\\K";"l")|[.offset,.length]]"#, "[[2,0]]"),
         (
             r#""\u00e9\u00e91" | [match("\u00e9\\K1";"l")|[.offset,.length]]"#,
-            r#"[[2,1]]"#,
+            "[[2,1]]",
         ),
         (
             r#""\u00e9\u00e91\u00e91" | [match("\u00e9\\K1";"lg")|[.offset,.length]]"#,
-            r#"[[2,1],[4,1]]"#,
+            "[[2,1],[4,1]]",
         ),
         (
             r#""a\u00e91a1" | [match("a\\K1|\u00e9\\K1";"lg")|[.offset,.length]]"#,
-            r#"[[2,1],[4,1]]"#,
+            "[[2,1],[4,1]]",
         ),
         (
             r#""a1a1a1" | [match("a\\K1";"lg")|[.offset,.length]]"#,
-            r#"[[1,1],[3,1],[5,1]]"#,
+            "[[1,1],[3,1],[5,1]]",
         ),
         (
             r#""xaby" | [match("a\\Kb|a";"l")|[.offset,.length]]"#,
-            r#"[[2,1]]"#,
+            "[[2,1]]",
         ),
         (
             r#""a1" | [match("a \\K 1";"lx")|[.offset,.length]]"#,
-            r#"[[1,1]]"#,
+            "[[1,1]]",
         ),
         (
             r#""a1" | [match("a\\K1 # c";"lx")|[.offset,.length]]"#,
-            r#"[[1,1]]"#,
+            "[[1,1]]",
         ),
         (
             r#""a1a1" | [match("a \\K 1";"lgx")|[.offset,.length]]"#,
-            r#"[[1,1],[3,1]]"#,
+            "[[1,1],[3,1]]",
         ),
         (
             r#""a\\K1b" | [match("a\\\\K1";"l")|[.offset,.length]]"#,
-            r#"[[0,4]]"#,
+            "[[0,4]]",
         ),
-        (r#""a1" | [match("[\\K]1";"l")|[.offset,.length]]"#, r#"[]"#),
-        (r#""a1a1" | test("a\\K1";"l")"#, r#"true"#),
+        (r#""a1" | [match("[\\K]1";"l")|[.offset,.length]]"#, "[]"),
+        (r#""a1a1" | test("a\\K1";"l")"#, "true"),
         (r#""a1b" | [scan("1\\K|b";"l")]"#, r#"[""]"#),
         (r#""a1a1" | sub("a\\K1";"X";"l")"#, r#""aXa1""#),
         (r#""a1a1" | gsub("a\\K1";"X";"lg")"#, r#""aXaX""#),
