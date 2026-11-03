@@ -1,0 +1,5 @@
+category = "host-dependent"
+issue = "#5754"
+reason = "`\"Thursday, March 05 2015\" | strptime(\"%A, %B %d %Y\")` under `de_DE.UTF-8`: glibc's `strptime` reads the `C` locale's English names as well as the locale's own, so a glibc jq 1.7.1 answers where the macOS pin's libc and succinctly exit 5 (docs/compliance/jq/limitations.md, \"glibc `jq` under a locale, measured\"). Only a Linux host that has `de_DE` shows it: without the locale both tools fall back to `C` and agree."
+platform = "linux"
+volatile = true

@@ -1,0 +1,5 @@
+category = "host-dependent"
+issue = "#5754"
+reason = "`\"Thursday, March 05 2015\" | strptime(\"%A, %B %d %Y\")` under `tr_TR.UTF-8`: the same glibc behaviour as `locale-strptime-en-de-de`, reading the `C` locale's English names beside the locale's own. Only a Linux host that has `tr_TR` shows it."
+platform = "linux"
+volatile = true
