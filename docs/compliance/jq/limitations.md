@@ -12041,7 +12041,8 @@ The shortcut fires only where `==` is handed two handles on one storage, so the 
   ([#5516](https://github.com/rust-works/succinctly/issues/5516)).
   So `[nan] as $a | last($a) == $a` and `reduce $a as $v (null; [$v]) | .[0] == $a` are `true`, as in jq (`last(f)` is `reduce f as $x (null; $x)`).
   A step that stores the variable by assignment or arithmetic does too ([#5540](https://github.com/rust-works/succinctly/issues/5540)): `reduce $a as $v ({}; .x = $v) | .x == $a`, `reduce $a as $v ([]; . + [$v]) | .[0] == $a` and jq's own spelling of `add`, `reduce $a[] as $v (null; . + $v)`, are `true`.
-  The marker those steps take is the element's own storage, so the in-place step stores it as one `Rc` clone (`Tracked::fold_share`); the storage may be a node the embed table registered, which is why every write copies a container with a second strong reference first (#3241). A marker an `as` binding made still makes the step decline (#3241, #4005), and so does an `as` rebind of the fold's (`$v as $n | .x = $n`), which would rebuild the container as a literal.
+  The marker those steps take is the element's own storage, so the in-place step stores it as one `Rc` clone (`Tracked::fold_share`); the storage may be a node the embed table registered, which is why every write copies a container with a second strong reference first (#3241). A marker an `as` binding made still makes the step decline (#3241, #4005).
+  A plain `as` rebind of the fold's own marker (`$v as $n | .x = $n`, `$v as $n | .x = $n.items`) gives the new name the same marker, so it stores the element's storage too ([#5938](https://github.com/rust-works/succinctly/issues/5938)).
   Peak memory of these folds is higher: the accumulator keeps the materialized element where it kept a compact rebuilt copy (+13% to +42% peak RSS on 40,000 records, linear).
 - **An `as` destructuring** ([#5539](https://github.com/rust-works/succinctly/issues/5539)).
   A container a pattern binds from a value that names no node of the document is spliced as the same kind of marker, wherever the body reads the name other than in an assignment's or arithmetic's operands.
@@ -12050,10 +12051,11 @@ The shortcut fires only where `==` is handed two handles on one storage, so the 
 
 Still different:
 
-- **A field read through an `as` rebind of a fold's loop variable** ([#5938](https://github.com/rust-works/succinctly/issues/5938)).
-  `[{"items":[nan]}] as $in | reduce $in[] as $r ({}; $r as $s | .a = $s.items) | .a == $in[0].items` is `true` in jq and `false` here.
-  The stored member is rebuilt, because a binder's body does not take the fold's in-place step with the rebound name marked (the marker made `fold_assign_step_copies_nothing_3138` copy the accumulator on every step).
-  Reading the member before the rebind (`$r.items as $i | .a = $i`) and storing the whole variable (`$r as $s | .x = $s`) both match jq.
+- **A field read through an `as` rebind of a fold's loop variable, in a shape the in-place step does not take** ([#5938](https://github.com/rust-works/succinctly/issues/5938)).
+  `[{"items":[nan]}] as $in | reduce $in[] as $r (null; $r as $s | . + $s.items) | . == $in[0].items` is `true` in jq and `false` here.
+  So are the same read stored in a pipe of writes (`$r as $s | .a = $s.items | .b = 1`) and read through a destructuring pattern (`$r as {items: $i} | .a = $i`).
+  The stored member is rebuilt, because the in-place step takes a rebind only as `$r as $s | ASSIGNMENT`, a single assignment under it.
+  `.a = $s.items`, `.a += $s.items`, `.[$s.n] = $s.items` and a rebind of a rebind match jq.
   The comparison needs a NaN-bearing container to observe this.
 - **Slices.** `.[0:]` and any other full-range slice hand back the array itself, as jq's view
   does. An equal-bounds *partial* slice is a view onto the same storage in jq (pointer, offset
