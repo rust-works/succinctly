@@ -55,10 +55,41 @@ fn a_fault_in_moved_bytes_names_the_file_it_was_read_in_6004() -> Result<()> {
         args.extend(paths.iter().map(String::as_str));
         let (stdout, stderr, code) = run_jq_full(&args, None)?;
         assert_eq!(
-            (stdout.as_str(), stderr.lines().next(), code),
-            ("", Some(want.replace("{DIR}", &prefix).as_str()), 5),
+            (stdout.as_str(), stderr.as_str(), code),
+            (
+                "",
+                format!("{}\n", want.replace("{DIR}", &prefix)).as_str(),
+                5
+            ),
             "{files:?}"
         );
     }
+    Ok(())
+}
+
+/// A program that does not call `input` stops at the fault with jq's own `parse error`, which names
+/// no file, however the bytes were moved.
+#[test]
+fn a_fault_in_moved_bytes_names_no_file_without_input_6004() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let paths: Vec<String> = [(&b"["[..], "a"), (&b"\xe1\n"[..], "b"), (&b"]"[..], "c")]
+        .into_iter()
+        .map(|(bytes, name)| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes)?;
+            Ok(path.to_string_lossy().into_owned())
+        })
+        .collect::<Result<_>>()?;
+    let mut args = vec!["-c", "."];
+    args.extend(paths.iter().map(String::as_str));
+    let (stdout, stderr, code) = run_jq_full(&args, None)?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        (
+            "",
+            "jq: parse error: Invalid numeric literal at line 2, column 0\n",
+            5
+        ),
+    );
     Ok(())
 }
