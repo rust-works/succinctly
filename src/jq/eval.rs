@@ -96968,6 +96968,9 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // week number next to a month read is exempt from the upper bound too:
     // the libc sets it past 31 or below 1 itself, and jq prints it
     // (`"2015 March 05" | strptime("%Y %B %U")` is March -27, #5754).
+    // Since #5947 a month or day read is range-checked as it is read, as the libc does, so this
+    // is a backstop: nothing reaches it, and it keeps an out-of-range month from indexing past
+    // `yearday_for_civil`'s table should that ever change.
     if !(1..=12).contains(&month) || (day > 31 && !mday_from_week) {
         return Err(format!("month {month} or day {day} out of range"));
     }
