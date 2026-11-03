@@ -27803,17 +27803,8 @@ fn translate_posix_brackets(
     pattern: &str,
     extended: bool,
 ) -> Result<std::borrow::Cow<'_, str>, EvalError> {
-    if !pattern.contains('[')
-        && !pattern.contains("\\w")
-        && !pattern.contains("\\W")
-        && !pattern.contains("\\<")
-        && !pattern.contains("\\>")
-        && !pattern.contains("\\b{")
-        && !pattern.contains("(?P")
-        && !may_hold_oniguruma_escape(pattern)
-        && !may_hold_literal_brace(pattern)
-        && !may_hold_assertion(pattern)
-    {
+    // A backslash, a `(` or a `{` may hold Oniguruma syntax this scan rewrites or refuses (#6070).
+    if !pattern.contains(['[', '\\', '(', '{']) && !may_hold_assertion(pattern) {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
     let chars: Vec<char> = pattern.chars().collect();
@@ -27826,6 +27817,13 @@ fn translate_posix_brackets(
     // Whether the token just before this one is an assertion (`^`, `$`, `\b`, ...), which
     // Oniguruma refuses to repeat (#5535).
     let mut prev_assertion = false;
+    // #6070: the capture groups opened so far (`\10` is a backreference only up to this many),
+    // where the innermost open group's body starts, whether the token before is a `|`, and the
+    // group counts of the whole pattern, which a conditional is checked against.
+    let mut groups_opened = 0usize;
+    let mut body_start = 0usize;
+    let mut prev_pipe = false;
+    let mut group_facts: Option<GroupFacts> = None;
     // The extended mode's ignored blanks are invisible to this scan (`^ *` is a repeated
     // assertion there), so it leaves the repetition check to the crate rather than judge it.
     let check_repetition = !extended && !inline_extended(pattern);
@@ -27836,6 +27834,7 @@ fn translate_posix_brackets(
     while i < chars.len() {
         let c = chars[i];
         let was_assertion = std::mem::take(&mut prev_assertion);
+        let after_pipe = std::mem::take(&mut prev_pipe);
         // #5550: a comment is text jq ignores, so nothing in it is a group, a class or an escape:
         // `(?#...)` always, and `#` to the end of the line where the extended mode is on. Copied
         // through whole, as the `fancy-regex` scan does.
@@ -27862,6 +27861,16 @@ fn translate_posix_brackets(
             }
         }
         if c == '\\' {
+            // #6070: the escapes Oniguruma reads that the `regex` crate refuses or reads another way.
+            if let Some((text, used)) =
+                rewrite_onig_escape(&chars, i, depth > 0, groups_opened, &mut group_facts)?
+            {
+                out.push_str(&text);
+                changed = true;
+                at_start = false;
+                i += used;
+                continue;
+            }
             // #5373: jq's `\w` is its POSIX `word` plus six Latin-1 characters and without the
             // two joiners the `regex` crate's `\w` adds. Always a bracketed class, so that a
             // following `-` in `[\w-.]` is a literal and not the end of a range (jq refuses a range
@@ -27983,10 +27992,35 @@ fn translate_posix_brackets(
                 ));
             }
             prev_assertion = c == '^' || c == '$';
+            prev_pipe = c == '|';
+            // #6070: an interval with nothing before it to repeat (`{1}`, `a|{2}`, `(?:{2})`) is
+            // an error in jq, a literal run in the `regex` crate. `{,2}` and `{x}` are literal in
+            // both (see `starts_repetition`).
+            if c == '{'
+                && check_repetition
+                && starts_repetition(&chars[i..])
+                && (i == body_start || after_pipe)
+            {
+                return Err(EvalError::new(
+                    "invalid regex: target of repeat operator is not specified",
+                ));
+            }
             // #5529: jq refuses Python-style named groups (`(?P<n>...)`, `(?P=n)`, `(?P>n)`);
             // the `regex` crate accepts the first and would answer where jq errors.
             if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'P') {
                 return Err(EvalError::new("invalid regex: undefined group option"));
+            }
+            // #6070: `(*FAIL)` is the verb that never matches, `(?!)` here.
+            if c == '(' && chars[i + 1..].starts_with(&['*', 'F', 'A', 'I', 'L', ')']) {
+                out.push_str("(?!)");
+                changed = true;
+                i += 7;
+                continue;
+            }
+            if c == '(' {
+                let opened = open_group(&chars, i, &mut group_facts)?;
+                groups_opened += usize::from(opened.captures);
+                body_start = opened.body_start;
             }
             // Follow the extended mode through the groups, to know where `#` starts a comment.
             if c == '(' {
@@ -28096,28 +28130,6 @@ fn translate_posix_brackets(
     })
 }
 
-/// Whether `pattern` holds one of the escapes Oniguruma reads as something other than the `regex`
-/// crate does (#6068): `\u` and `\U`, `\p` and `\P`. A pattern with none keeps the borrowed fast
-/// path.
-#[cfg(feature = "regex")]
-fn may_hold_oniguruma_escape(pattern: &str) -> bool {
-    ["\\u", "\\U", "\\p", "\\P"]
-        .iter()
-        .any(|escape| pattern.contains(escape))
-}
-
-/// Whether `pattern` holds a `{` that opens no interval (#6068), which Oniguruma reads as the
-/// literal brace. A pattern with none, or with only intervals (`a{2}`, `a{1,3}`), keeps the
-/// borrowed fast path.
-#[cfg(feature = "regex")]
-fn may_hold_literal_brace(pattern: &str) -> bool {
-    if !pattern.contains('{') {
-        return false;
-    }
-    let chars: Vec<char> = pattern.chars().collect();
-    (0..chars.len()).any(|at| chars[at] == '{' && !opens_interval(&chars, at))
-}
-
 /// Whether the `{` at `chars[at]` opens an interval quantifier in jq's Perl syntax: `{n}`, `{n,}`
 /// or `{n,m}`. A low bound is required, so `{,m}` and `{,}` are the literal text there, as they
 /// are for [`starts_repetition`]; [`interval_quantifier_at`] also takes them, for the possessive
@@ -28126,6 +28138,333 @@ fn may_hold_literal_brace(pattern: &str) -> bool {
 fn opens_interval(chars: &[char], at: usize) -> bool {
     chars.get(at + 1).is_some_and(char::is_ascii_digit)
         && interval_quantifier_at(chars, at).is_some()
+}
+
+/// The regex written for the character `v`, safe anywhere in a pattern, a class and the extended
+/// mode included.
+#[cfg(feature = "regex")]
+fn regex_char(v: u32) -> String {
+    format!("\\x{{{v:X}}}")
+}
+
+/// An escape Oniguruma's Perl syntax reads that the `regex` crate refuses or reads another way,
+/// as the pattern text to put in its place and the number of characters it covers (#6070).
+/// `None` leaves the escape to the scan's other rules and to the engines.
+///
+/// Every row was captured from jq 1.7.1; the sweep of `\` + each printable ASCII character found
+/// the letters below.
+/// - A letter with no meaning there is that letter: `\g`, `\h`, `\i`, `\j`, `\l`, `\m`, `\q`, `\u`,
+///   `\C`, `\E`, `\F`, `\H`, `\I`, `\J`, `\L`, `\M`, `\T`, `\U`, `\V`, and `\k`, `\o`, `\p`, `\P` and
+///   `\g` when no `<`, `'` or `{` follows to make them a backreference, a property or a call.
+/// - `\N` is any character but a newline and `\O` any character (outside a class).
+/// - `\Q...\E` quotes what it holds, to the end of the pattern when `\E` is missing.
+/// - `\0` and a number that is no backreference are octal (`\101` is `A`); a backreference is
+///   `\1`..`\9` always and a larger number only up to the groups opened so far, as in
+///   Oniguruma's tokenizer. `\8` and `\9` that are no backreference are the digit.
+/// - `\cX` is control-X (`\c?` is DEL).
+/// - `\xHH` at 0x80 or above is a byte of a UTF-8 sequence: `\xc3\xa9` is `é`, and a sequence that
+///   stops short is an error. A sequence that is no character (`\xed\xa0\x80`, `\xf8`) compiles
+///   and matches nothing.
+///
+/// Not covered, and left to the engines' refusal: `\X`, `\y`, `\Y` (text segments), an octal
+/// value of 0x80 or more, and `\x` with a single digit.
+#[cfg(feature = "regex")]
+fn rewrite_onig_escape(
+    chars: &[char],
+    i: usize,
+    in_class: bool,
+    groups_opened: usize,
+    facts: &mut Option<GroupFacts>,
+) -> Result<Option<(String, usize)>, EvalError> {
+    let Some(&next) = chars.get(i + 1) else {
+        return Ok(None);
+    };
+    let after = chars.get(i + 2).copied();
+    let literal = |c: char| Ok(Some((c.to_string(), 2)));
+    match next {
+        'h' | 'H' | 'i' | 'j' | 'l' | 'm' | 'q' | 'u' | 'C' | 'E' | 'F' | 'I' | 'J' | 'L' | 'M'
+        | 'T' | 'U' | 'V' => literal(next),
+        'g' if !matches!(after, Some('<' | '\'' | '0'..='9' | '-' | '+')) => literal(next),
+        'k' if !matches!(after, Some('<' | '\'')) => literal(next),
+        'o' | 'p' | 'P' if after != Some('{') && after != Some('^') => literal(next),
+        'N' if !in_class => Ok(Some(("[^\\n]".to_string(), 2))),
+        'O' if !in_class => Ok(Some(("(?s:.)".to_string(), 2))),
+        // Inside a class these have no meaning of their own (`[\N]` is `N`).
+        'N' | 'O' | 'y' | 'X' | 'Y' if in_class => literal(next),
+        'Q' if in_class => literal(next),
+        'Q' => {
+            let mut text = String::new();
+            let mut j = i + 2;
+            while j < chars.len() && !(chars[j] == '\\' && chars.get(j + 1) == Some(&'E')) {
+                let q = chars[j];
+                if q.is_ascii_alphanumeric() || !q.is_ascii() {
+                    text.push(q);
+                } else {
+                    text.push_str(&regex_char(u32::from(q)));
+                }
+                j += 1;
+            }
+            let end = if j < chars.len() { j + 2 } else { j };
+            Ok(Some((text, end - i)))
+        }
+        '0'..='9' => {
+            let run = chars[i + 1..]
+                .iter()
+                .take_while(|c| c.is_ascii_digit())
+                .count();
+            let number = chars[i + 1..i + 1 + run]
+                .iter()
+                .collect::<String>()
+                .parse::<usize>()
+                .ok();
+            if !in_class && next != '0' && number.is_some_and(|n| n <= 9 || n <= groups_opened) {
+                // A backreference to a group the pattern does not have is jq's error, not the
+                // engines' (it may name a group opened later).
+                let total = facts.get_or_insert_with(|| group_facts_of(chars)).total;
+                if number.is_some_and(|n| n > total) {
+                    return Err(EvalError::new("invalid regex: invalid backref number/name"));
+                }
+                return Ok(None);
+            }
+            if next == '8' || next == '9' {
+                return literal(next);
+            }
+            let digits = chars[i + 1..]
+                .iter()
+                .take(3)
+                .take_while(|c| ('0'..='7').contains(c))
+                .count();
+            let value = chars[i + 1..i + 1 + digits]
+                .iter()
+                .fold(0u32, |v, c| v * 8 + c.to_digit(8).unwrap_or(0));
+            Ok((value <= 0x7F).then(|| (regex_char(value), 1 + digits)))
+        }
+        'c' => match after {
+            None => Err(EvalError::new("invalid regex: end pattern at control")),
+            Some(x) if (' '..='~').contains(&x) && x != '\\' => {
+                let value = if x == '?' { 0x7F } else { u32::from(x) & 0x9F };
+                Ok(Some((regex_char(value), 3)))
+            }
+            _ => Ok(None),
+        },
+        'x' if !in_class => rewrite_hex_escape(chars, i),
+        _ => Ok(None),
+    }
+}
+
+/// `\x` outside a class (#6070): a lone one at the end of the pattern is `x`, and `\xHH` at 0x80 or
+/// above is a byte of a UTF-8 sequence, which Oniguruma reads as the character the bytes spell.
+#[cfg(feature = "regex")]
+fn rewrite_hex_escape(chars: &[char], i: usize) -> Result<Option<(String, usize)>, EvalError> {
+    let byte_at = |at: usize| -> Option<u32> {
+        if chars.get(at) != Some(&'\\') || chars.get(at + 1) != Some(&'x') {
+            return None;
+        }
+        let hi = chars.get(at + 2)?.to_digit(16)?;
+        let lo = chars.get(at + 3)?.to_digit(16)?;
+        Some(hi * 16 + lo)
+    };
+    // Oniguruma reads up to two hex digits and, finding none, a NUL; at the very end of the
+    // pattern there is nothing to read and the `x` is itself.
+    match chars.get(i + 2) {
+        None => return Ok(Some(("x".to_string(), 2))),
+        Some('{') => return Ok(None),
+        Some(&c) => match c.to_digit(16) {
+            None => return Ok(Some((regex_char(0), 2))),
+            Some(first) if !chars.get(i + 3).is_some_and(char::is_ascii_hexdigit) => {
+                return Ok(Some((regex_char(first), 3)));
+            }
+            Some(_) => {}
+        },
+    }
+    let Some(lead) = byte_at(i).filter(|b| *b >= 0x80) else {
+        return Ok(None);
+    };
+    let need = match lead {
+        0x80..=0xBF => return Err(EvalError::new("invalid regex: invalid code point value")),
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        // Not the start of a character in any encoding: compiles, and nothing matches.
+        _ => return Ok(Some(("(?!)".to_string(), 4))),
+    };
+    let mut bytes = vec![lead as u8];
+    for k in 1..need {
+        match byte_at(i + 4 * k) {
+            Some(b @ 0x80..=0xBF) => bytes.push(b as u8),
+            Some(_) => return Err(EvalError::new("invalid regex: invalid code point value")),
+            None => {
+                return Err(EvalError::new(
+                    "invalid regex: too short multibyte code string",
+                ))
+            }
+        }
+    }
+    let used = 4 * need;
+    Ok(Some(match core::str::from_utf8(&bytes) {
+        Ok(text) => (
+            regex_char(u32::from(text.chars().next().unwrap_or('\0'))),
+            used,
+        ),
+        // Overlong, a surrogate or past U+10FFFF: it compiles and nothing matches.
+        Err(_) => ("(?!)".to_string(), used),
+    }))
+}
+
+/// The capture groups of a whole pattern, and the names among them (#6070): what a conditional
+/// `(?(1)..)` or `(?(<n>)..)` is checked against, since it may name a group opened later.
+#[cfg(feature = "regex")]
+struct GroupFacts {
+    total: usize,
+    names: Vec<String>,
+}
+
+#[cfg(feature = "regex")]
+fn group_facts_of(chars: &[char]) -> GroupFacts {
+    let mut facts = GroupFacts {
+        total: 0,
+        names: Vec::new(),
+    };
+    let mut j = 0;
+    while j < chars.len() {
+        match chars[j] {
+            '\\' => j += 2,
+            '[' => {
+                // A class: `]` first is a literal, and an escape inside it is one character.
+                j += 1;
+                if chars.get(j) == Some(&'^') {
+                    j += 1;
+                }
+                if chars.get(j) == Some(&']') {
+                    j += 1;
+                }
+                while j < chars.len() && chars[j] != ']' {
+                    j += if chars[j] == '\\' { 2 } else { 1 };
+                }
+                j += 1;
+            }
+            '(' if chars.get(j + 1) == Some(&'?') && chars.get(j + 2) == Some(&'#') => {
+                while j < chars.len() && chars[j] != ')' {
+                    j += if chars[j] == '\\' { 2 } else { 1 };
+                }
+            }
+            '(' if j >= 2 && chars[j - 1] == '?' && chars[j - 2] == '(' => j += 1,
+            '(' => {
+                let (captures, name, _) = group_header(chars, j);
+                facts.total += usize::from(captures);
+                facts.names.extend(name);
+                j += 1;
+            }
+            _ => j += 1,
+        }
+    }
+    facts
+}
+
+/// The group opened by the `(` at `chars[i]` (#6070): whether it captures, its name, and where its
+/// body starts (`usize::MAX` when that is not known, which no position equals).
+#[cfg(feature = "regex")]
+fn group_header(chars: &[char], i: usize) -> (bool, Option<String>, usize) {
+    match (chars.get(i + 1), chars.get(i + 2)) {
+        (Some('?'), Some(':' | '=' | '!' | '>')) => (false, None, i + 3),
+        (Some('?'), Some('<')) if matches!(chars.get(i + 3), Some('=' | '!')) => {
+            (false, None, i + 4)
+        }
+        (Some('?'), Some(&open @ ('<' | '\''))) => {
+            let close = if open == '<' { '>' } else { '\'' };
+            match chars[i + 3..].iter().position(|&c| c == close) {
+                Some(n) => (
+                    true,
+                    Some(chars[i + 3..i + 3 + n].iter().collect()),
+                    i + 4 + n,
+                ),
+                None => (false, None, usize::MAX),
+            }
+        }
+        (Some('?'), Some('(')) => match chars[i + 3..].iter().position(|&c| c == ')') {
+            Some(n) => (false, None, i + 4 + n),
+            None => (false, None, usize::MAX),
+        },
+        (Some('?'), Some(_)) => {
+            let letters = chars[i + 2..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphabetic() || **c == '-')
+                .count();
+            if chars.get(i + 2 + letters) == Some(&':') {
+                (false, None, i + 3 + letters)
+            } else {
+                (false, None, usize::MAX)
+            }
+        }
+        (Some('*'), _) => (false, None, usize::MAX),
+        _ => (true, None, i + 1),
+    }
+}
+
+#[cfg(feature = "regex")]
+struct GroupOpen {
+    captures: bool,
+    body_start: usize,
+}
+
+/// A `(` at `chars[i]`: what it opens, refusing what Oniguruma refuses (#6070). A group name that
+/// is empty or starts with a digit is an error, and so is a conditional on a group the pattern
+/// does not have. The `regex` crate and `fancy-regex` accept the first two, and the conditional
+/// panicked inside `fancy-regex`.
+#[cfg(feature = "regex")]
+fn open_group(
+    chars: &[char],
+    i: usize,
+    facts: &mut Option<GroupFacts>,
+) -> Result<GroupOpen, EvalError> {
+    // The parenthesis that opens a conditional's condition, `(?(1)`, is not a group.
+    if i >= 2 && chars[i - 1] == '?' && chars[i - 2] == '(' {
+        return Ok(GroupOpen {
+            captures: false,
+            body_start: usize::MAX,
+        });
+    }
+    let (captures, name, body_start) = group_header(chars, i);
+    if let Some(name) = &name {
+        if name.is_empty() {
+            return Err(EvalError::new("invalid regex: group name is empty"));
+        }
+        if name.starts_with(|c: char| c.is_ascii_digit()) {
+            return Err(EvalError::new(format!(
+                "invalid regex: invalid group name <{name}>"
+            )));
+        }
+    }
+    if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'(') {
+        if let Some(n) = chars[i + 3..].iter().position(|&c| c == ')') {
+            let condition: String = chars[i + 3..i + 3 + n].iter().collect();
+            let facts = facts.get_or_insert_with(|| group_facts_of(chars));
+            if !condition.is_empty() && condition.chars().all(|c| c.is_ascii_digit()) {
+                let number = condition.parse::<usize>().unwrap_or(usize::MAX);
+                if number == 0 || number > facts.total {
+                    return Err(EvalError::new("invalid regex: invalid backref number/name"));
+                }
+            } else if let Some(name) = condition
+                .strip_prefix('<')
+                .and_then(|c| c.strip_suffix('>'))
+                .or_else(|| {
+                    condition
+                        .strip_prefix('\'')
+                        .and_then(|c| c.strip_suffix('\''))
+                })
+            {
+                if !facts.names.iter().any(|known| known == name) {
+                    return Err(EvalError::new(format!(
+                        "invalid regex: undefined name <{name}> reference"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(GroupOpen {
+        captures,
+        body_start,
+    })
 }
 
 /// Whether `pattern` could hold an assertion `starts_repetition` has to look after: `^`, `$` or
