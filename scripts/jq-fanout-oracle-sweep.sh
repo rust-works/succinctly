@@ -114,7 +114,7 @@ X_TERMS=(
 # exit code neither binary actually returned. Same family as the
 # `cargo test | grep | tail` false-green. A redirect has no writer to kill.
 STDIN_DOCS='1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20'
-STDIN_FILE="$(mktemp -t jq-fanout-sweep-stdin)"
+STDIN_FILE="$(mktemp "${TMPDIR:-/tmp}/jq-fanout-sweep-stdin.XXXXXX")"
 trap 'rm -f "$STDIN_FILE" /tmp/jq-fanout-sweep.err /tmp/succ-fanout-sweep.err' EXIT
 printf '%s' "$STDIN_DOCS" > "$STDIN_FILE"
 
