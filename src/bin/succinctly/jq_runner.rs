@@ -8150,16 +8150,22 @@ fn open_chunked_inputs(files: &[PathBuf], open_failed: &mut bool) -> Result<Chun
         }));
         return Ok((opened, openers));
     }
+    let mut dash_seen = false;
     for path in files {
         if is_stdin_dash(path) {
-            // `-` is standard input, read once (a second one is empty), held whole.
-            match read_stdin_bytes() {
-                Ok(bytes) => {
+            // `-` is standard input: the first one holds it all (kept whole), a later one is empty.
+            let first = !std::mem::replace(&mut dash_seen, true);
+            let read = if first {
+                dash_stdin_bytes()
+            } else {
+                Ok(Vec::new())
+            };
+            match read {
+                Ok(mut bytes) => {
                     let skip = bom_to_skip(&bytes[..bytes.len().min(3)], &mut look_for_bom);
+                    bytes.drain(..skip);
                     opened.push(path.clone());
-                    openers.push(Box::new(move || {
-                        Ok(Box::new(std::io::Cursor::new(bytes[skip..].to_vec())))
-                    }));
+                    openers.push(Box::new(move || Ok(Box::new(std::io::Cursor::new(bytes)))));
                 }
                 Err(e) => {
                     let e = InputFileOpenError::new(path, e.to_string());
@@ -8235,6 +8241,25 @@ fn is_stdin_dash(path: &Path) -> bool {
     path.as_os_str() == "-"
 }
 
+thread_local! {
+    /// What standard input held when a `-` input first asked for it (#6023). A route can read the
+    /// file list, decline it and leave the next route to read it again; stdin can be read once, so
+    /// the bytes are kept and each pass over the list hands them to its first `-` again.
+    static DASH_STDIN: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
+/// Standard input as the first `-` of a pass over the input files sees it: all of it. A later `-`
+/// in the same pass reads nothing, as jq's does (its stdin is spent).
+fn dash_stdin_bytes() -> Result<Vec<u8>> {
+    DASH_STDIN.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.is_none() {
+            *cache = Some(read_stdin_bytes()?);
+        }
+        Ok(cache.clone().unwrap_or_default())
+    })
+}
+
 /// How an input file is named in `input_filename` and in error locations: jq calls `-` `<stdin>`.
 fn input_display_name(path: &Path) -> String {
     if is_stdin_dash(path) {
@@ -8253,9 +8278,6 @@ fn input_display_name(path: &Path) -> String {
 /// rather than letting it escape as `Error: .../Caused by:` at exit 1
 /// (#3098).
 fn read_file_bytes(path: &Path) -> std::result::Result<Vec<u8>, InputFileOpenError> {
-    if is_stdin_dash(path) {
-        return read_stdin_bytes().map_err(|e| InputFileOpenError::new(path, e.to_string()));
-    }
     std::fs::read(path).map_err(|e| InputFileOpenError::new(path, strerror_only(&e)))
 }
 
@@ -8352,8 +8374,20 @@ fn read_input_files(files: &[PathBuf]) -> (Vec<PathBuf>, Vec<Vec<u8>>, OpenFailu
     let mut opened = Vec::with_capacity(files.len());
     let mut raws = Vec::with_capacity(files.len());
     let mut failures = Vec::new();
+    let mut dash_seen = false;
     for path in files {
-        match read_file_bytes(path) {
+        let read = if is_stdin_dash(path) {
+            // `-` is standard input: the first one holds it all, a later one is empty.
+            let first = !std::mem::replace(&mut dash_seen, true);
+            if first {
+                dash_stdin_bytes().map_err(|e| InputFileOpenError::new(path, e.to_string()))
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            read_file_bytes(path)
+        };
+        match read {
             Ok(raw) => {
                 opened.push(path.clone());
                 raws.push(raw);
@@ -10225,9 +10259,17 @@ fn slurp_fault(
     raw: &[u8],
     origin: (usize, usize),
 ) -> Option<String> {
-    let earlier: Option<Vec<Vec<u8>>> = files
-        .get(..=idx)
-        .and_then(|files| files.iter().map(|path| std::fs::read(path).ok()).collect());
+    let earlier: Option<Vec<Vec<u8>>> = files.get(..=idx).and_then(|files| {
+        files
+            .iter()
+            // A `-` is stdin, which cannot be read again (and not a file of that name).
+            .map(|path| {
+                (!is_stdin_dash(path))
+                    .then(|| std::fs::read(path).ok())
+                    .flatten()
+            })
+            .collect()
+    });
     match earlier {
         Some(mut all) if idx > 0 => {
             strip_leading_json_bom(all.iter_mut());
@@ -10247,18 +10289,24 @@ fn slurp_fault(
 fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
     let mut unreadable = false;
     let mut at_front = true;
-    let chunks = files.iter().map_while(|path| match std::fs::read(path) {
-        Ok(mut raw) => {
-            // The bytes as read, not as substituted: jq's parser counts those (#5964).
-            if at_front && !raw.is_empty() {
-                at_front = false;
-                raw.drain(..crate::front_matter::leading_bom_len(&raw));
+    let chunks = files.iter().map_while(|path| {
+        match if is_stdin_dash(path) {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        } else {
+            std::fs::read(path)
+        } {
+            Ok(mut raw) => {
+                // The bytes as read, not as substituted: jq's parser counts those (#5964).
+                if at_front && !raw.is_empty() {
+                    at_front = false;
+                    raw.drain(..crate::front_matter::leading_bom_len(&raw));
+                }
+                Some(raw)
             }
-            Some(raw)
-        }
-        Err(_) => {
-            unreadable = true;
-            None
+            Err(_) => {
+                unreadable = true;
+                None
+            }
         }
     });
     let fault = jq::jq_stream_fault(chunks, 1, 0);

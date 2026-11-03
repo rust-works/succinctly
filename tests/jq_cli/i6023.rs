@@ -63,3 +63,25 @@ fn the_other_file_options_do_not_read_stdin_for_a_dash() -> Result<()> {
     }
     Ok(())
 }
+
+/// A route that reads the file list, declines it and leaves the next route to read it again must
+/// find stdin's bytes still there: `--seq` on a stream with no RS byte declines the plain route,
+/// and the warning's position came out as column 0 when the bytes had gone. The text is jq's.
+#[test]
+fn stdin_given_as_a_dash_survives_a_route_that_declines_it() -> Result<()> {
+    for (stdin, want) in [
+        (
+            "{\"a\":",
+            "jq: ignoring parse error: Unfinished abandoned text at EOF at line 1, column 5",
+        ),
+        (
+            "a\nb\n",
+            "jq: ignoring parse error: Unfinished abandoned text at EOF at line 3, column 0",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["--seq", "-c", ".", "-"], Some(stdin))?;
+        assert_eq!((out.as_str(), code), ("", 0), "{stdin:?}");
+        assert_eq!(err.lines().next(), Some(want), "{stdin:?}");
+    }
+    Ok(())
+}
