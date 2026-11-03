@@ -86720,6 +86720,11 @@ pub(crate) fn range_from_literal_override(value: &OwnedValue) -> Option<&OwnedVa
     match value {
         OwnedValue::NumberLiteral(NumberRepr::Float(_), _) => Some(value),
         OwnedValue::NumberLiteral(NumberRepr::Int(0), text) if text.starts_with('-') => Some(value),
+        // #6064: an integer `f64` cannot hold keeps its digits as the first value, as jq
+        // emits `$from` itself; the check is an `i64` compare, so `range(0; n)` clones nothing.
+        OwnedValue::NumberLiteral(NumberRepr::Int(n), _) if !jq_int_within_exact_f64_range(*n) => {
+            Some(value)
+        }
         _ => None,
     }
 }
