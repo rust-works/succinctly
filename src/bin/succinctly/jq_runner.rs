@@ -14928,15 +14928,7 @@ mod tests {
             let (eager, eager_lazy) = observe_inputs_with(dir.path(), files, &["-R"], true);
             assert_eq!(eager_lazy, 0, "the reference route is eager");
             let (lazy, lazy_files) = observe_inputs_with(dir.path(), files, &["-R"], false);
-            assert_eq!(
-                lazy,
-                eager,
-                "{:?}",
-                files
-                    .iter()
-                    .map(|f| String::from_utf8_lossy(f))
-                    .collect::<Vec<_>>()
-            );
+            assert_eq!(lazy, eager, "{files:?}");
             checked += 1;
             lazy_streams += usize::from(lazy_files > 0);
         };
