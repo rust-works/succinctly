@@ -10196,6 +10196,18 @@ succinctly answers the date's own weekday and yearday (`[1900,0,0,10,15,0,0,-1]`
 `%j` next to a month or day (`%m`, `%d`, `%e`, `%b`, `%D`, `%F`) or with no year is order-dependent in the pin's libc and aborts jq on several rows (`Assertion failed: (yday == tm->tm_yday || tm->tm_yday == 367)` in `set_tm_yday`, e.g. `"060" | strptime("%j")`), so there is no answer to match; succinctly keeps the month and day as read and recomputes the yearday from them.
 glibc's `%j` was not captured, so the rows above are the macOS pin's and glibc may differ on them.
 
+### `strptime`'s weekday in January and February of a century year that is not a leap year is the calendar's, where jq's macOS build is a day early (#970, #5946)
+
+jq's macOS build fills `tm_wday` itself (`set_tm_wday()` in `builtin.c`, a Gauss-style routine whose own comment admits it "produces the wrong day-of-the-week number" for 1900-01-01..1900-02-28 and 2100-01-01..2100-02-28).
+glibc leaves the weekday to its `strptime` and answers the calendar's (jq 1.6 on Linux, the only glibc build captured: `"2100" | strptime("%Y")` is weekday `4` and `"1900-01-01" | strptime("%Y-%m-%d")` is `1`).
+succinctly answers the calendar's on both, so it matches glibc and differs from the macOS pin.
+This is the "matching would corrupt data" condition of ADR-0018: the pin's answer is a weekday that is not the date's, and the owner decided in #970 to keep the correct one.
+`"2100" | strptime("%Y")` is `[2100,0,0,0,0,0,3,-1]` in jq on macOS and `[2100,0,0,0,0,0,4,-1]` here; `"1900-01-01" | strptime("%Y-%m-%d")` is weekday `0` there and `1` here.
+A sweep of every `%Y-%m-%d` date for years 1583 to 2400, months 1 to 12 and days 0 to 31 (314,112 dates) against the macOS pin found 384 differences.
+They are every day (0 to 31) of January and February in 1700, 1800, 1900, 2100, 2200 and 2300, the century years that are not leap years.
+The leap century years (1600, 2000, 2400), every other year and every March day agree, since the macOS routine corrects itself from March.
+The unit test `test_strptime_weekday_correct_for_century_non_leap_years_970` (`src/jq/eval.rs`) pins the calendar's weekday for those dates.
+
 ### `truncate_stream` with a `NaN` depth slices from 0 (#4971)
 
 `nan | truncate_stream(stream)` compares each path length against `NaN` as jq's ordering does and slices the path
