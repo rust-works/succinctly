@@ -6679,30 +6679,68 @@ fn holds_unicode_scalar_break(bytes: &[u8]) -> bool {
     false
 }
 
+const SWAR_LOW: u64 = 0x0101_0101_0101_0101;
+const SWAR_HIGH: u64 = 0x8080_8080_8080_8080;
+
+/// The high bit of each byte of `w` that is zero, and nothing else when none is (exact as a
+/// yes/no: the classic `haszero`).
+#[inline(always)]
+fn zero_bytes(w: u64) -> u64 {
+    w.wrapping_sub(SWAR_LOW) & !w & SWAR_HIGH
+}
+
+/// Whether a quoted or plain body is its own text, in one pass (#4913): it holds neither
+/// `special` (the quote or backslash that needs unescaping), nor a line break to fold (`\n`,
+/// `\r`, and when `unicode` U+0085/U+2028/U+2029).
+///
+/// This is the gate of every reader of a scalar, run for every scalar of a document, so it is one
+/// pass eight bytes at a time that also notes whether any byte is non-ASCII; only a body that
+/// has one pays for [`holds_unicode_scalar_break`]. The gate used to be three `contains` passes
+/// (`special`, `\n`, `\r`), and four or five once the lead bytes of the three characters were
+/// added, which timed +5% on every row of `dev bench`-shaped YAML on both a 7950X and an M4 Pro.
+#[inline]
+fn body_is_verbatim(bytes: &[u8], special: u8, unicode: bool) -> bool {
+    let special_word = SWAR_LOW * u64::from(special);
+    let lf_word = SWAR_LOW * u64::from(b'\n');
+    let cr_word = SWAR_LOW * u64::from(b'\r');
+    let mut non_ascii = 0u64;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(chunk);
+        let w = u64::from_ne_bytes(word);
+        if zero_bytes(w ^ special_word) | zero_bytes(w ^ lf_word) | zero_bytes(w ^ cr_word) != 0 {
+            return false;
+        }
+        non_ascii |= w & SWAR_HIGH;
+    }
+    for &b in chunks.remainder() {
+        if b == special || b == b'\n' || b == b'\r' {
+            return false;
+        }
+        non_ascii |= u64::from(b & 0x80);
+    }
+    !(unicode && non_ascii != 0 && holds_unicode_scalar_break(bytes))
+}
+
 /// Whether a single-quoted body is its own text: no `''` pair to unescape and no line break to
 /// fold. The gate of every single-quoted reader, one definition so that they agree (#4913).
 #[inline]
 fn single_quoted_is_verbatim(bytes: &[u8]) -> bool {
-    !bytes.contains(&b'\'')
-        && !bytes.contains(&b'\n')
-        && !bytes.contains(&b'\r')
-        && !holds_unicode_scalar_break(bytes)
+    body_is_verbatim(bytes, b'\'', true)
 }
 
 /// Whether a double-quoted body is its own text: no escape and no line break to fold. A
 /// JSON-sourced scalar never folds, so U+0085/U+2028/U+2029 in one are content (#3380, #4913).
 #[inline]
 fn double_quoted_is_verbatim(bytes: &[u8], json_sourced: bool) -> bool {
-    !bytes.contains(&b'\\')
-        && !bytes.contains(&b'\n')
-        && !bytes.contains(&b'\r')
-        && (json_sourced || !holds_unicode_scalar_break(bytes))
+    body_is_verbatim(bytes, b'\\', !json_sourced)
 }
 
 /// Whether a plain body is its own text: no line break to fold (#4913).
 #[inline]
 fn plain_is_verbatim(bytes: &[u8]) -> bool {
-    !bytes.contains(&b'\n') && !bytes.contains(&b'\r') && !holds_unicode_scalar_break(bytes)
+    body_is_verbatim(bytes, b'\n', true)
 }
 
 /// Decode a single-quoted YAML string, handling '' escapes and line folding.
@@ -11703,6 +11741,78 @@ mod tests {
                     other => panic!("expected a string document for {doc:?}, got {other:?}"),
                 }
             }
+        }
+    }
+
+    /// #4913: the one-pass gate every scalar reader asks agrees with the three `contains` it
+    /// replaced plus a window scan for the three characters, at every length and alignment of a
+    /// body built from the bytes that matter (a quote, a backslash, both ASCII breaks, the lead
+    /// and continuation bytes of U+0085/U+2028/U+2029, their near-misses, plain text).
+    #[test]
+    fn test_body_is_verbatim_agrees_with_the_naive_gate_4913() {
+        fn naive(bytes: &[u8], special: u8, unicode: bool) -> bool {
+            let unicode_break = bytes.windows(2).any(|w| w == [0xC2, 0x85])
+                || bytes
+                    .windows(3)
+                    .any(|w| w[0] == 0xE2 && w[1] == 0x80 && matches!(w[2], 0xA8 | 0xA9));
+            !bytes.contains(&special)
+                && !bytes.contains(&b'\n')
+                && !bytes.contains(&b'\r')
+                && !(unicode && unicode_break)
+        }
+        let alphabet: [&[u8]; 14] = [
+            b"a",
+            b"x",
+            b" ",
+            b"'",
+            b"\\",
+            b"\n",
+            b"\r",
+            b"\xC2\x85",
+            b"\xE2\x80\xA8",
+            b"\xE2\x80\xA9",
+            b"\xE2\x80\xA6",
+            b"\xC3\xA9",
+            b"\xC2\xA0",
+            b"\xE2\x80\xA7",
+        ];
+        let mut state = 0x4913_u64;
+        let mut next = |n: usize| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % n
+        };
+        for case in 0..30_000 {
+            let mut body = Vec::new();
+            let pieces = next(14);
+            for _ in 0..pieces {
+                // Mostly plain text, so that a break is the exception, as in a document.
+                let piece = if next(4) == 0 {
+                    alphabet[next(alphabet.len())]
+                } else {
+                    alphabet[next(4)]
+                };
+                body.extend_from_slice(piece);
+            }
+            for (special, unicode) in [(b'\'', true), (b'\\', true), (b'\\', false), (b'\n', true)]
+            {
+                assert_eq!(
+                    body_is_verbatim(&body, special, unicode),
+                    naive(&body, special, unicode),
+                    "case {case}: {body:?}, special {special}, unicode {unicode}"
+                );
+            }
+            assert_eq!(single_quoted_is_verbatim(&body), naive(&body, b'\'', true));
+            assert_eq!(
+                double_quoted_is_verbatim(&body, true),
+                naive(&body, b'\\', false)
+            );
+            assert_eq!(
+                double_quoted_is_verbatim(&body, false),
+                naive(&body, b'\\', true)
+            );
+            assert_eq!(plain_is_verbatim(&body), naive(&body, b'\n', true));
         }
     }
 
