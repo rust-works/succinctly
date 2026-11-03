@@ -6170,13 +6170,21 @@ unchanged: it JSON-encodes. Not matched:
 - a flow container *nested* in a block one prints block (`.` on `a: ...\nb: [1, 2]`): an
   `OwnedValue` carries no per-node style (#739, #865);
 - `-I4` is ignored (yq indents the text by the flag; ours is always two spaces);
-- string interpolation (`"x\([1, 2])y"`) still JSON-encodes where yq interpolates the same
-  YAML text, and a container rebuilt by `with_entries` or read under `--eval-all` takes the
-  block style whatever its source;
+- a container rebuilt by `with_entries` or read under `--eval-all` takes the block style
+  whatever its source;
 - quote style, comments, anchors and aliases the source carried do not survive into the text
   (`c: ["x: y", 'z']` gives `['x: y', z]`, `y: *a` gives the anchored sequence, not `*a`);
 - a string with a line break is double-quoted (`"l1\nl2\n"`) where yq writes a literal block
   (`|`), the CLI writer's own rendering of a built value.
+
+String interpolation matches too (#6092): the slot of `"I \(.m)"` is a `to_string` stage, so a
+mapping or sequence interpolates as the YAML text `to_string` makes of it (`I {an: apple}` over
+`m: {an: apple}`, `"x\([1, 2])y"` is `"x- 1\n- 2y"`), and a node written in flow style stays flow.
+The slot is read at its cursor for plain navigation and `//` of it (`"\(.m)"`, `"\(.a // "d")"`).
+Any other slot (a call, `..`, an assignment's right-hand side) is read from an owned copy, which carries
+no style, so a flow container there interpolates as block: `.x = "got \(.m)"` writes `got an: apple`
+where yq writes `got {an: apple}`.
+jq mode is unchanged: it interpolates `tostring`'s JSON text, as jq does.
 
 `tojson` is unchanged and still renders compactly, without that trailing newline. Captured
 live (v4.53.3, `null` on stdin):
