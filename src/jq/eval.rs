@@ -53059,14 +53059,14 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     // sub-expression (a residual, documented divergence, not fixed by this
     // change).
     //
-    // Still doesn't cover every context: when this same value is being used
-    // as an assignment *target* for further indexing rather than
-    // `path(...)`'s own leaf (`(range(3) | .[("x","y")]) = 9`, or the
-    // single-output `(1 | .[("x","y")]) = 9`), real jq instead raises the
-    // "near attempt to access element ... of ..." wording (confirmed live
-    // for both) — `resolve_leaf` has no way to tell that context apart from
-    // `path(...)`'s own leaf today; filed as #989 rather than attempted
-    // here.
+    // The assignment-*target* context needs no separate handling (#989, fixed): when this
+    // same value is used as a target for further indexing rather than as `path(...)`'s own
+    // leaf (`(range(3) | .[("x","y")]) = 9`, or the single-output
+    // `(1 | .[("x","y")]) = 9`), real jq raises the "near attempt to access element ... of
+    // ..." wording, and so do we. Each branch carries its own trackability (#986), so
+    // `resolve_index_expr` already knows its target is untracked -- see the `PathBranch`
+    // construction below. `test_deferred_trackability_matches_jq_986_989` in
+    // `tests/jq_cli_tests.rs` pins both filters against jq 1.7.1.
     //
     // `keep` (#1872) is the one dial on that rule. It is [`Keep::First`] for
     // every ordinary `path()`/`=`/`|=`/`del()` entry, which is exactly the
