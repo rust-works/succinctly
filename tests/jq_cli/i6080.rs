@@ -100,6 +100,8 @@ fn an_escaped_letter_jq_does_not_define_is_the_letter() -> Result<()> {
         (r#""h h" | [match("\\h\\s\\h";"x")|.string]"#, r#"["h h"]"#),
         (r#""a1" | [match("\\d\\i?")|.string]"#, r#"["1"]"#),
         (r#""gg" | [match("\\g{2}")|.string]"#, r#"["gg"]"#),
+        (r#""abg1" | test("(ab)\\g1")"#, "true"),
+        (r#""abab" | test("(ab)\\g1")"#, "false"),
         (r#""g" | sub("\\g";"X")"#, r#""X""#),
         (r#""g" | split("\\g";null)"#, r#"["",""]"#),
         (r#""u00e9" | test("\\u00e9")"#, "true"),
