@@ -2847,6 +2847,10 @@ struct HeadFootComment {
     /// The text before the first document's content, when it holds an explicit `---`
     /// marker (#4086); only ever set on a document's root node.
     preamble: Option<String>,
+    /// Whether the head lines were written by the program (`. head_comment = "x"`) rather than
+    /// read from the document. yq prints the comments it reads from before a document apart
+    /// from it when it colors, and one the program wrote as part of it (#5416).
+    head_written: bool,
 }
 
 impl HeadFootComment {
@@ -2860,7 +2864,7 @@ impl HeadFootComment {
         tag: Option<String>,
         spelling: Option<String>,
     ) -> Option<Box<Self>> {
-        Self::boxed_if_any_full(head, foot, tag, spelling, None)
+        Self::boxed_if_any_full(head, foot, tag, spelling, None, false)
     }
 
     /// [`Self::boxed_if_any_with_tag`] plus the document preamble (#4086).
@@ -2870,6 +2874,7 @@ impl HeadFootComment {
         tag: Option<String>,
         spelling: Option<String>,
         preamble: Option<String>,
+        head_written: bool,
     ) -> Option<Box<Self>> {
         if head.is_empty()
             && foot.is_empty()
@@ -2885,6 +2890,7 @@ impl HeadFootComment {
                 tag,
                 spelling,
                 preamble,
+                head_written,
             }))
         }
     }
@@ -2974,9 +2980,35 @@ impl NodeMeta {
                 self.tag_owned(),
                 self.spelling_owned(),
                 self.preamble_owned(),
+                self.head_written(),
             ),
             ..self.clone()
         }
+    }
+
+    /// [`Self::with_head_foot`] for lines the program wrote (`. head_comment = "x"`), which yq
+    /// prints as part of the document and not as what it read from before it (#5416).
+    #[must_use]
+    pub fn with_written_head_foot(&self, head: Vec<String>, foot: Vec<String>) -> Self {
+        Self {
+            head_foot_comment: HeadFootComment::boxed_if_any_full(
+                head,
+                foot,
+                self.tag_owned(),
+                self.spelling_owned(),
+                self.preamble_owned(),
+                true,
+            ),
+            ..self.clone()
+        }
+    }
+
+    /// Whether the head lines were written by the program rather than read from the document
+    /// (#5416).
+    pub fn head_written(&self) -> bool {
+        self.head_foot_comment
+            .as_deref()
+            .is_some_and(|hf| hf.head_written)
     }
 
     /// The explicit tag this node was written with (`!Ref`, `!!str`), verbatim,
@@ -3019,6 +3051,7 @@ impl NodeMeta {
                 self.tag_owned(),
                 self.spelling_owned(),
                 preamble,
+                self.head_written(),
             ),
             ..self.clone()
         }
@@ -3052,6 +3085,7 @@ impl NodeMeta {
                 self.tag_owned(),
                 spelling,
                 self.preamble_owned(),
+                self.head_written(),
             ),
             ..self.clone()
         }
@@ -3072,6 +3106,7 @@ impl NodeMeta {
                 tag,
                 self.spelling_owned(),
                 self.preamble_owned(),
+                self.head_written(),
             ),
             ..self.clone()
         }

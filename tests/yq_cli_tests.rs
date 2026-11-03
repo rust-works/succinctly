@@ -8976,7 +8976,7 @@ fn test_nul_output_colors_multidoc_separator_survives_1709() -> Result<()> {
     // for the newline-before-`---` fix, unaffected by this PR).
     assert_eq!(
         output,
-        "\u{1b}[36ma\u{1b}[0m: 1\u{1b}[0m\0\n---\n\u{1b}[36mb\u{1b}[0m: 2\u{1b}[0m\0"
+        "\u{1b}[36ma\u{1b}[0m:\u{1b}[95m 1\u{1b}[0m\0\n---\n\u{1b}[36mb\u{1b}[0m:\u{1b}[95m 2\u{1b}[0m\0"
     );
     Ok(())
 }
@@ -8987,7 +8987,8 @@ fn test_nul_output_colors_multidoc_separator_survives_1709() -> Result<()> {
 /// earlier results too.
 #[test]
 fn test_nul_output_colors_flushes_earlier_results_then_stops_2004() -> Result<()> {
-    let colored = |s: &str| format!("\u{1b}[36m{s}\u{1b}[0m\0");
+    // A scalar result is printed bare, so there is nothing to color (#5416).
+    let colored = |s: &str| format!("{s}\0");
     // NUL in the middle: the first result survives, nothing from the NUL on.
     let (stdout, stderr, code) = run_yq_stdin_with_stderr(
         ".[]",
@@ -9031,7 +9032,7 @@ fn test_nul_output_colors_no_stray_separator_around_empty_document_1709() -> Res
     assert_eq!(output.matches("---").count(), 1, "got: {output:?}");
     assert_eq!(
         output,
-        "\u{1b}[36ma\u{1b}[0m: 1\0\u{1b}[0m\n---\n\u{1b}[36ma\u{1b}[0m: 3\0"
+        "\u{1b}[36ma\u{1b}[0m:\u{1b}[95m 1\u{1b}[0m\0\n---\n\u{1b}[36ma\u{1b}[0m:\u{1b}[95m 3\u{1b}[0m\0"
     );
     Ok(())
 }
@@ -9269,7 +9270,8 @@ fn test_join_output_is_not_a_yq_flag_1731() -> Result<()> {
 /// branch and the DOM path, both already correct.
 #[test]
 fn test_color_terminator_ordering_evaluated_1708() -> Result<()> {
-    let (output, code) = run_yq_stdin(".a", "a: 1\n", &["-C", "-0"])?;
+    // A mapping result: a scalar result is printed bare, with no colors to reset (#5416).
+    let (output, code) = run_yq_stdin(".a", "a: {b: 1}\n", &["-C", "-0"])?;
     assert_eq!(code, 0);
     let reset_pos = output.find("\x1b[0m").expect("expected a reset code");
     let terminator_pos = output.find('\0').expect("expected a NUL terminator");
@@ -9320,7 +9322,7 @@ fn test_color_terminator_ordering_json_output_unaffected_1708() -> Result<()> {
 /// centralization (see this issue's "Why not fixed in #1701's own PR").
 #[test]
 fn test_color_terminator_ordering_multi_result_1708() -> Result<()> {
-    let (output, code) = run_yq_stdin(".a[]", "a: [1, 2]\n", &["-C", "-0"])?;
+    let (output, code) = run_yq_stdin(".a[]", "a: [{b: 1}, {b: 2}]\n", &["-C", "-0"])?;
     assert_eq!(code, 0);
     let terminator_positions: Vec<usize> = output.match_indices('\0').map(|(i, _)| i).collect();
     assert_eq!(
@@ -9354,7 +9356,11 @@ fn test_color_terminator_ordering_multi_result_1708() -> Result<()> {
 /// preceding reset at all, the exact bug this issue was filed for.
 #[test]
 fn test_color_terminator_ordering_survives_unbalanced_quote_in_value_1708() -> Result<()> {
-    let (output, code) = run_yq_stdin(".a[]", "a: [\"it's here\", \"second\"]\n", &["-C", "-0"])?;
+    let (output, code) = run_yq_stdin(
+        ".a[]",
+        "a: [{k: \"it's here\"}, {k: \"second\"}]\n",
+        &["-C", "-0"],
+    )?;
     assert_eq!(code, 0);
     let terminator_positions: Vec<usize> = output.match_indices('\0').map(|(i, _)| i).collect();
     assert_eq!(
@@ -9384,7 +9390,7 @@ fn test_color_terminator_ordering_survives_unbalanced_quote_in_value_1708() -> R
 /// byte value the source data happens to contain.
 #[test]
 fn test_color_terminator_ordering_survives_embedded_control_char_in_value_1708() -> Result<()> {
-    let (output, code) = run_yq_stdin(".a", "a: \"x\x01y\"\n", &["-C", "-0"])?;
+    let (output, code) = run_yq_stdin(".a", "a: {k: \"x\x01y\"}\n", &["-C", "-0"])?;
     assert_eq!(code, 0);
     let terminator_positions: Vec<usize> = output.match_indices('\0').map(|(i, _)| i).collect();
     assert_eq!(
@@ -13153,13 +13159,14 @@ fn test_colorized_yaml_output_mapping() -> Result<()> {
 
 #[test]
 fn test_colorized_yaml_output_sequence_dash() -> Result<()> {
-    // Block-sequence dashes are colored yellow by the YAML colorizer.
+    // Block-sequence dashes are not colored: yq prints them as they are (#5416).
     let input = "items:\n  - a\n  - b\n";
     let (output, exit_code) = run_yq_stdin(".", input, &["-C"])?;
     assert_eq!(exit_code, 0);
-    assert!(
-        output.contains("\u{1b}[33m-\u{1b}[0m"),
-        "yellow sequence dash missing: {output:?}"
+    assert_eq!(
+        output,
+        "\u{1b}[36mitems\u{1b}[0m:\n  -\u{1b}[32m a\u{1b}[0m\n\u{1b}[32m  \u{1b}[0m-\u{1b}[32m b\u{1b}[0m\n",
+        "yq's colors for a sequence"
     );
     Ok(())
 }
@@ -13181,7 +13188,7 @@ fn test_duplicate_mapping_key_survives_color_yaml_output() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(
         output,
-        "\u{1b}[36ma\u{1b}[0m: 1\n\u{1b}[36ma\u{1b}[0m: 2\u{1b}[0m\n"
+        "\u{1b}[36ma\u{1b}[0m:\u{1b}[95m 1\u{1b}[0m\n\u{1b}[95m\u{1b}[0m\u{1b}[36ma\u{1b}[0m:\u{1b}[95m 2\u{1b}[0m\n"
     );
 
     Ok(())
@@ -13219,7 +13226,7 @@ fn test_duplicate_mapping_key_survives_color_compact() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(
         output,
-        "\u{1b}[36ma\u{1b}[0m: 1\n\u{1b}[36ma\u{1b}[0m: 2\u{1b}[0m\n"
+        "\u{1b}[36ma\u{1b}[0m:\u{1b}[95m 1\u{1b}[0m\n\u{1b}[95m\u{1b}[0m\u{1b}[36ma\u{1b}[0m:\u{1b}[95m 2\u{1b}[0m\n"
     );
 
     let (json, code) = run_yq_stdin(".", yaml, &["-C", "-o", "json", "-I0"])?;
@@ -13245,14 +13252,11 @@ fn test_color_output_survives_iteration_with_duplicate_keys() -> Result<()> {
 
     let (output, code) = run_yq_stdin(".[]", yaml, &["-C"])?;
     assert_eq!(code, 0);
-    // No trailing `\x1b[0m` after the last result's own newline terminator
-    // (#1708 second review pass): that extra reset used to fire even when
-    // every result's own boundary-close had already emitted one, which is
-    // the same "reset after terminator" defect this issue was filed for,
-    // just for the default newline terminator instead of `-0`'s NUL.
+    // Real yq's colors, byte for byte (#5416): a span closes before the terminator, never after
+    // it (#1708), and the empty span after a line break is yq's own.
     assert_eq!(
         output,
-        "\u{1b}[36ma\u{1b}[0m: 1\n\u{1b}[36ma\u{1b}[0m: 2\n\u{1b}[36mb\u{1b}[0m: 3\n"
+        "\u{1b}[36ma\u{1b}[0m:\u{1b}[95m 1\u{1b}[0m\n\u{1b}[95m\u{1b}[0m\u{1b}[36ma\u{1b}[0m:\u{1b}[95m 2\u{1b}[0m\n\u{1b}[36mb\u{1b}[0m:\u{1b}[95m 3\u{1b}[0m\n"
     );
 
     Ok(())
@@ -13292,21 +13296,11 @@ fn test_slurp_color_output_yaml() -> Result<()> {
 
     let (output, code) = run_yq_stdin(".", yaml, &["--slurp", "-C"])?;
     assert_eq!(code, 0);
-    // Renders in real yq's "compact" form (#785): `- ` shares its line
-    // with the mapping's own first field. `colorize_yaml` is a simple
-    // single-pass text colorizer (its own scheme, not oracle-matched
-    // against real yq's `-C`, which uses entirely different codes/colors)
-    // whose `at_key_start` flag was never previously reachable directly
-    // after a list marker - compact form is the first shape that puts a
-    // key there instead of a value or a newline. It now peeks ahead
-    // (`compact_item_opens_with_key`) to tell a compact key from a bare
-    // scalar value in that position before deciding whether to color it,
-    // so this first "a" gets its cyan key coloring too, matching every
-    // other key in the document.
+    // Renders in real yq's "compact" form (#785): `- ` shares its line with the mapping's own
+    // first field, colored as yq colors it (#5416). (Real yq refuses the duplicate key here.)
     assert_eq!(
         output,
-        "\u{1b}[33m-\u{1b}[0m \u{1b}[36ma\u{1b}[0m: 1\n  \u{1b}[36ma\u{1b}[0m: 2\u{1b}[0m\n"
-    );
+        "-\u{1b}[36m a\u{1b}[0m:\u{1b}[95m 1\u{1b}[0m\n\u{1b}[95m  \u{1b}[0m\u{1b}[36ma\u{1b}[0m:\u{1b}[95m 2\u{1b}[0m\n");
 
     Ok(())
 }
@@ -13328,7 +13322,7 @@ fn test_color_compact_quoted_key_with_colon_785() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(
         output,
-        "\u{1b}[33m-\u{1b}[0m \u{1b}[32m\"x: y\"\u{1b}[0m: 1\n  \u{1b}[36mb\u{1b}[0m: 2\u{1b}[0m\n"
+"-\u{1b}[36m \"x: y\"\u{1b}[0m:\u{1b}[95m 1\u{1b}[0m\n\u{1b}[95m  \u{1b}[0m\u{1b}[36mb\u{1b}[0m:\u{1b}[95m 2\u{1b}[0m\n"
     );
 
     Ok(())
@@ -13346,7 +13340,7 @@ fn test_color_compact_quoted_key_with_escaped_quote_785() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(
         output,
-        "\u{1b}[33m-\u{1b}[0m \u{1b}[32m\"a\\\"b: c\"\u{1b}[0m: 1\n  \u{1b}[36md\u{1b}[0m: 2\u{1b}[0m\n"
+"-\u{1b}[36m \"a\\\"b: c\"\u{1b}[0m:\u{1b}[95m 1\u{1b}[0m\n\u{1b}[95m  \u{1b}[0m\u{1b}[36md\u{1b}[0m:\u{1b}[95m 2\u{1b}[0m\n"
     );
 
     Ok(())
@@ -13383,7 +13377,7 @@ fn test_duplicate_mapping_key_survives_slurp_json_color() -> Result<()> {
 fn test_null_input_color_output_yaml() -> Result<()> {
     let (output, code) = run_yq_stdin(r#"{"a": 1}"#, "", &["-n", "-C"])?;
     assert_eq!(code, 0);
-    assert_eq!(output, "\u{1b}[36ma\u{1b}[0m: 1\u{1b}[0m\n");
+    assert_eq!(output, "\u{1b}[36ma\u{1b}[0m:\u{1b}[95m 1\u{1b}[0m\n");
     Ok(())
 }
 

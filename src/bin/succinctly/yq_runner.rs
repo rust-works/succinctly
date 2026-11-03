@@ -49,6 +49,9 @@ use crate::output::{
     JsonFormatOpts, LoudFlushWriter, Terminator,
 };
 
+mod go_yaml_color;
+use go_yaml_color::YamlColorizer;
+use succinctly::text::stream_region::{current_region, StreamRegion};
 mod reshape_presentation;
 mod source_positions;
 
@@ -114,6 +117,12 @@ struct Colorizer {
     lexer: ColorLexer,
     raw: String,
     colored: String,
+    /// The part of a result `raw` was written as (#5416), which the streamers announce through
+    /// [`current_region`]; YAML only.
+    region: StreamRegion,
+    /// The text of a leading or trailing region, held until the region ends: yq colors it line
+    /// by line, and a write need not end on a line.
+    region_text: String,
 }
 
 /// How much text [`Colorizer`] collects before coloring and writing it: the
@@ -137,10 +146,61 @@ impl Colorizer {
             lexer,
             raw: String::new(),
             colored: String::new(),
+            region: StreamRegion::Body,
+            region_text: String::new(),
         }
     }
 
+    /// Notes a change of region before anything is written under the new one (#5416).
+    fn enter_region(&mut self, region: StreamRegion) {
+        if region == self.region || !matches!(self.lexer, ColorLexer::Yaml(_)) {
+            return;
+        }
+        self.color_raw();
+        self.leave_region();
+        self.region = region;
+    }
+
+    /// Ends the region `raw` was last written under: a leading region is printed, a trailing
+    /// one is fed to the scanner as yq feeds it its own.
+    fn leave_region(&mut self) {
+        let text = core::mem::take(&mut self.region_text);
+        match self.region {
+            StreamRegion::LeadingContent => {
+                go_yaml_color::color_leading_content(&text, &mut self.colored);
+            }
+            StreamRegion::TrailingContent => {
+                if let ColorLexer::Yaml(yaml) = &mut self.lexer {
+                    let mut fed = String::new();
+                    go_yaml_color::color_trailing_content(&text, &mut fed);
+                    yaml.push_str(&fed, &mut self.colored);
+                }
+            }
+            StreamRegion::Body | StreamRegion::RawScalar => {}
+        }
+        self.region = StreamRegion::Body;
+    }
+
+    /// [`Self::write`] for text that was written as `region`, wherever the streamers are now.
+    fn write_in<W: Write>(
+        &mut self,
+        writer: &mut W,
+        s: &str,
+        region: StreamRegion,
+    ) -> core::fmt::Result {
+        if s.is_empty() {
+            return Ok(());
+        }
+        self.enter_region(region);
+        self.write_here(writer, s)
+    }
+
     fn write<W: Write>(&mut self, writer: &mut W, s: &str) -> core::fmt::Result {
+        self.enter_region(current_region());
+        self.write_here(writer, s)
+    }
+
+    fn write_here<W: Write>(&mut self, writer: &mut W, s: &str) -> core::fmt::Result {
         if self.raw.len() + s.len() < COLOR_BLOCK_BYTES {
             self.raw.push_str(s);
             return Ok(());
@@ -174,6 +234,7 @@ impl Colorizer {
         }
         // YAML's boundary goes after everything written before it.
         self.color_raw();
+        self.leave_region();
         if let ColorLexer::Yaml(yaml) = &mut self.lexer {
             yaml.boundary(terminator, &mut self.colored);
         }
@@ -188,6 +249,7 @@ impl Colorizer {
     /// holds.
     fn finish<W: Write>(&mut self, writer: &mut W) -> core::fmt::Result {
         self.color_raw();
+        self.leave_region();
         match &mut self.lexer {
             ColorLexer::Yaml(yaml) => yaml.finish(&mut self.colored),
             ColorLexer::Json(json, scheme) => json.finish(scheme, &mut self.colored),
@@ -204,7 +266,13 @@ impl Colorizer {
 
     fn color(&mut self, s: &str) {
         match &mut self.lexer {
-            ColorLexer::Yaml(yaml) => yaml.push_str(s, &mut self.colored),
+            ColorLexer::Yaml(yaml) => match self.region {
+                StreamRegion::Body => yaml.push_str(s, &mut self.colored),
+                StreamRegion::RawScalar => self.colored.push_str(s),
+                StreamRegion::LeadingContent | StreamRegion::TrailingContent => {
+                    self.region_text.push_str(s);
+                }
+            },
             ColorLexer::Json(json, scheme) => json.push_str(s, scheme, &mut self.colored),
         }
     }
@@ -244,7 +312,7 @@ impl<W: Write> core::fmt::Write for ColorSink<'_, W> {
         match self {
             ColorSink::Colored(writer, colorizer) => colorizer.write(*writer, s),
             ColorSink::Direct(w) => w.write_str(s),
-            ColorSink::NulChecked(sink) => sink.buf.write_str(s),
+            ColorSink::NulChecked(sink) => sink.push(s),
         }
     }
 }
@@ -310,12 +378,46 @@ struct PendingSeparator<'a> {
 struct NulCheckedSink<'a, W: Write> {
     writer: &'a mut W,
     buf: String,
+    /// Where in `buf` each part of a result begins that the streamers wrote as other than the
+    /// document (#5416), with which part it is: `buf` is colored after the render, when the
+    /// streamers' note of what they were writing is gone.
+    regions: Vec<(usize, StreamRegion)>,
     nul_detected: &'a Cell<bool>,
     separator: Option<PendingSeparator<'a>>,
     colorizer: Option<Colorizer>,
 }
 
 impl<W: Write> NulCheckedSink<'_, W> {
+    /// Buffers `s`, noting the region it was written as when that changes.
+    fn push(&mut self, s: &str) -> core::fmt::Result {
+        if self.colorizer.is_some() {
+            let region = current_region();
+            let last = self.regions.last().map_or(StreamRegion::Body, |r| r.1);
+            if region != last {
+                self.regions.push((self.buf.len(), region));
+            }
+        }
+        self.buf.push_str(s);
+        Ok(())
+    }
+
+    /// Writes the buffered result through the colorizer, a region at a time.
+    fn write_colored(&mut self) -> core::fmt::Result {
+        let Some(colorizer) = &mut self.colorizer else {
+            return Ok(());
+        };
+        let mut start = 0;
+        let mut region = StreamRegion::Body;
+        for &(at, next) in &self.regions {
+            colorizer.write_in(self.writer, &self.buf[start..at], region)?;
+            start = at;
+            region = next;
+        }
+        colorizer.write_in(self.writer, &self.buf[start..], region)?;
+        self.regions.clear();
+        Ok(())
+    }
+
     /// Checks the current per-result buffer for an embedded NUL byte,
     /// clearing the buffer either way. On success, writes the pending
     /// `---` separator first (if this is the document's first surviving
@@ -329,17 +431,19 @@ impl<W: Write> NulCheckedSink<'_, W> {
         if self.buf.as_bytes().contains(&0) {
             self.nul_detected.set(true);
             self.buf.clear();
+            self.regions.clear();
             return Err(core::fmt::Error);
         }
         self.settle_separator()?;
-        match &mut self.colorizer {
-            Some(colorizer) => colorizer.write(self.writer, &self.buf)?,
-            None => self
-                .writer
+        if self.colorizer.is_some() {
+            self.write_colored()?;
+        } else {
+            self.writer
                 .write_all(self.buf.as_bytes())
-                .map_err(|_| core::fmt::Error)?,
+                .map_err(|_| core::fmt::Error)?;
         }
         self.buf.clear();
+        self.regions.clear();
         Ok(())
     }
 
@@ -606,6 +710,7 @@ fn stream_maybe_colored<W: Write, T>(
         let sink_state = NulCheckedSink {
             writer,
             buf: String::new(),
+            regions: Vec::new(),
             nul_detected: &nul_detected,
             separator: separator.map(|s| PendingSeparator {
                 doc_streamed: s.doc_streamed,
@@ -6368,7 +6473,11 @@ fn apply_meta_assign_writes(
                 let meta = node.meta();
                 let new_head = head.clone().unwrap_or_else(|| meta.head_comment().to_vec());
                 let new_foot = foot.clone().unwrap_or_else(|| meta.foot_comment().to_vec());
-                *node.meta_mut() = meta.with_head_foot(new_head, new_foot);
+                *node.meta_mut() = if head.is_some() {
+                    meta.with_written_head_foot(new_head, new_foot)
+                } else {
+                    meta.with_head_foot(new_head, new_foot)
+                };
                 if line.is_some() && !defers_to_own_block(node_value, node) {
                     node.meta_mut().comment.clone_from(line);
                 }
@@ -8472,10 +8581,20 @@ fn output_value<W: Write>(
         // pinned real `yq` binary, `# lead\n42\n` keeps `# lead` on both the
         // streaming and DOM routes (the streaming route's own `foot` root
         // exclusion just below is scalar-only).
-        let body = prepend_head_comment_lines(body, comments.meta().head_comment(), "");
+        let head = prepend_head_comment_lines(String::new(), comments.meta().head_comment(), "");
+        let head_is_leading = !comments.meta().head_written();
+        let body = if head_is_leading {
+            body
+        } else {
+            format!("{head}{body}")
+        };
         // The first document's `---` marker, with the comments and blank lines before it,
         // verbatim (#4086). `-N` keeps the comments and drops the marker lines.
-        let body = match comments.meta().preamble() {
+        //
+        // The preamble is `leading`, kept apart from the `body` because yq prints what it read from
+        // before the document apart from the document when it colors (#5416). A head comment
+        // written by the filter is part of the document's text, and colored with it.
+        let leading = match comments.meta().preamble() {
             Some(preamble) => {
                 let preamble: String = if config.no_doc {
                     preamble
@@ -8485,9 +8604,14 @@ fn output_value<W: Write>(
                 } else {
                     preamble.to_string()
                 };
-                format!("{preamble}{body}")
+                preamble
             }
-            None => body,
+            None => String::new(),
+        };
+        let leading = if head_is_leading {
+            format!("{leading}{head}")
+        } else {
+            leading
         };
         // Every non-root node's own trailing comment is appended by its
         // *parent* during `emit_yaml_value`'s recursion (see its Array/Object
@@ -8511,7 +8635,7 @@ fn output_value<W: Write>(
         // comment already flagged this as the reason it couldn't match real
         // `yq`'s flow-preserving output, before `CommentTree` carried style
         // data to tell the two cases apart.
-        let output = if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+        let (body, trailing) = if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
             let with_own_comment = if is_flow_safe(value, comments) {
                 format!("{body}{}", trailing_comment_suffix(comments, ""))
             } else {
@@ -8522,16 +8646,24 @@ fn output_value<W: Write>(
             // roots only, matching the streaming route's own scalar-root
             // exclusion (`# lead\n42\n# foot` keeps `# lead`, drops `# foot`,
             // live-verified against pinned yq; the getter still answers it).
-            append_foot_comment_lines(with_own_comment, comments.meta().foot_comment(), "").0
+            let trailing =
+                append_foot_comment_lines(String::new(), comments.meta().foot_comment(), "").0;
+            (with_own_comment, trailing)
         } else {
-            body
+            (body, String::new())
         };
+        let output = format!("{leading}{body}{trailing}");
         reject_nul_output(&output, config)?;
         write_pending_separator(writer, separator, terminator_from_config(config))?;
         if config.use_color {
             // No boundary here -- `write_terminator` below writes directly
             // to `writer`, after the colored text (#1708).
-            write!(writer, "{}", colorize_yaml(&output))?;
+            let bare_scalar = !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
+            write!(
+                writer,
+                "{}",
+                colorize_yaml_document(&leading, &body, &trailing, bare_scalar)
+            )?;
         } else {
             write!(writer, "{output}")?;
         }
@@ -10051,339 +10183,35 @@ fn yaml_quote_key(s: &str, style: &str, flow: bool, json_sourced: bool) -> Strin
     }
 }
 
-/// Whether a compact block-sequence item opens with a mapping key rather
-/// than a scalar value — i.e. whether an unquoted `:` appears before the
-/// line ends. Fed the item one character at a time, from its first
-/// non-blank character, by [`YamlColorizer`], which holds the text back
-/// until [`Self::step`] answers.
-///
-/// `colorize_yaml`'s state machine colors a token *as it's written*, one
-/// `char` at a time, with no ability to go back and re-color something it
-/// already emitted — so at the position right after `- `, it has to decide
-/// up front whether what follows is a key (color it) or a value (don't),
-/// and the only way to tell is to look ahead. Before #785, `- ` was always
-/// followed by either a scalar value or a newline (a container value's
-/// mapping always started on its own line), so this ambiguity never arose.
-/// A purely scalar nested sequence (`- - 1\n  - 2`) does not color the
-/// inner marker - real, but narrow and, like the rest of this colorizer,
-/// not oracle-matched against real yq's own (differently coded) `-C`
-/// output, so left as a known residual gap rather than chased further
-/// (#785).
-///
-/// The answer is bounded by the item's own line, its own result and
-/// [`LOOKAHEAD_LIMIT`] (#808): the whole-buffer scan this replaced read on
-/// through a quote that never closed on its line (an apostrophe in
-/// `- don't`) and into the next result, which a streamed render can only
-/// follow by holding everything after the marker. Neither reach was right:
-/// text past the line or the result is not part of the item.
-#[derive(Default)]
-struct CompactItemLookahead {
-    /// The item's text so far, replayed once the answer is in.
-    held: String,
-    quote: Option<char>,
-    skip_next: bool,
-}
-
-/// The most text a [`CompactItemLookahead`] holds before answering "not a
-/// key": a mapping key this long in a compact sequence item is colored as a
-/// value instead, so that `-C` stays within a bounded working set (#808).
-const LOOKAHEAD_LIMIT: usize = 64 * 1024;
-
-impl CompactItemLookahead {
-    /// The answer, once `c` settles it.
-    fn step(&mut self, c: char) -> Option<bool> {
-        if c == '\n' {
-            return Some(false);
-        }
-        if self.skip_next {
-            self.skip_next = false; // The escaped character.
-            return None;
-        }
-        match self.quote {
-            Some(q) => {
-                if c == '\\' {
-                    self.skip_next = true;
-                } else if c == q {
-                    self.quote = None;
-                }
-                None
-            }
-            None => match c {
-                '"' | '\'' => {
-                    self.quote = Some(c);
-                    None
-                }
-                ':' => Some(true),
-                _ => None,
-            },
-        }
+/// A document as yq's `-C` prints it (#5416): the comments and `---` lines kept from before it, in
+/// grey and apart from it; then the document, colored by its tokens, with `trailing` comments
+/// added to its text; or, for a scalar result, `body` as it is.
+fn colorize_yaml_document(leading: &str, body: &str, trailing: &str, bare_scalar: bool) -> String {
+    let mut result = String::with_capacity((leading.len() + body.len() + trailing.len()) * 2);
+    go_yaml_color::color_leading_content(leading, &mut result);
+    if bare_scalar {
+        result.push_str(body);
+        return result;
     }
+    let mut colorizer = YamlColorizer::default();
+    colorizer.push_str(body, &mut result);
+    if !trailing.is_empty() {
+        let mut fed = String::new();
+        go_yaml_color::color_trailing_content(trailing, &mut fed);
+        colorizer.push_str(&fed, &mut result);
+    }
+    colorizer.finish(&mut result);
+    result
 }
 
-/// Where [`YamlColorizer`] is relative to a list marker's question: does the
-/// item open with a key?
-enum MarkerState {
-    /// No question open.
-    None,
-    /// Right after a marker, before the item's first non-blank character.
-    /// Blanks pass straight through; a quote, a line break or a result
-    /// boundary makes the answer irrelevant (each colors the same either
-    /// way), so only another character opens [`Self::Holding`].
-    AfterMarker,
-    /// Holding the item's text until its line answers.
-    Holding(CompactItemLookahead),
-}
-
-/// The bytes that can move [`YamlColorizer`] or its lookahead out of a state
-/// in which it writes each character unchanged: quotes, the escape, a key's
-/// `:` and the end of a line.
-fn is_yaml_color_stop(b: u8) -> bool {
-    matches!(b, b'\n' | b'"' | b'\'' | b':' | b'\\')
-}
-
-/// Colorize YAML output (basic ANSI colors).
+/// Colorize YAML text as yq's `-C` does (#5416).
+#[cfg(test)]
 fn colorize_yaml(yaml: &str) -> String {
     let mut result = String::with_capacity(yaml.len() * 2);
     let mut colorizer = YamlColorizer::default();
     colorizer.push_str(yaml, &mut result);
     colorizer.finish(&mut result);
     result
-}
-
-/// [`colorize_yaml`] one chunk at a time, for a streamed render (#808): a
-/// result is colored as it is written instead of after the whole output has
-/// been buffered. Only a list marker's [`CompactItemLookahead`] holds text
-/// back, and only until the item's line answers it.
-struct YamlColorizer {
-    in_string: bool,
-    escape_next: bool,
-    at_key_start: bool,
-    in_key: bool,
-    /// Whether [`Self::finish`]'s trailing reset is still needed.
-    /// [`Self::boundary`] (a result was just closed) clears it; any
-    /// subsequently pushed content sets it again. Stays `true` throughout
-    /// when no boundary is ever recorded (the identity/DOM callers).
-    trailing_reset_needed: bool,
-    marker: MarkerState,
-    /// The answer a held item settled on, while its text is replayed. A
-    /// nested marker in it (`- - a: 1`) asks the same question of the same
-    /// rest of the line, so it takes this answer instead of holding the line
-    /// again -- which kept a line of `- - - …` linear rather than holding one
-    /// copy of it per marker.
-    replay_answer: Option<bool>,
-}
-
-impl Default for YamlColorizer {
-    fn default() -> Self {
-        Self {
-            in_string: false,
-            escape_next: false,
-            at_key_start: true,
-            in_key: false,
-            trailing_reset_needed: true,
-            marker: MarkerState::None,
-            replay_answer: None,
-        }
-    }
-}
-
-impl YamlColorizer {
-    fn push_str(&mut self, yaml: &str, result: &mut String) {
-        let mut rest = yaml;
-        while let Some(c) = rest.chars().next() {
-            // A run of bytes that cannot change the state is copied whole:
-            // per character, the loop costs twice what coloring a buffered
-            // render did (#808). Every byte that can is ASCII, so a run ends
-            // on a character boundary.
-            let run = match &mut self.marker {
-                MarkerState::Holding(lookahead) if !lookahead.skip_next => {
-                    let room = LOOKAHEAD_LIMIT.saturating_sub(lookahead.held.len());
-                    let mut run = output::plain_run(rest, is_yaml_color_stop).min(room);
-                    while !rest.is_char_boundary(run) {
-                        run -= 1;
-                    }
-                    lookahead.held.push_str(&rest[..run]);
-                    if lookahead.held.len() >= LOOKAHEAD_LIMIT {
-                        self.settle(false, result);
-                    }
-                    run
-                }
-                MarkerState::AfterMarker => {
-                    let run = output::plain_run(rest, |b| b != b' ');
-                    result.push_str(&rest[..run]);
-                    run
-                }
-                MarkerState::None if !self.escape_next => {
-                    // A key's indentation leaves `at_key_start` set.
-                    let run = if self.at_key_start {
-                        output::plain_run(rest, |b| b != b' ')
-                    } else {
-                        output::plain_run(rest, is_yaml_color_stop)
-                    };
-                    result.push_str(&rest[..run]);
-                    run
-                }
-                _ => 0,
-            };
-            if run > 0 {
-                self.trailing_reset_needed = true;
-                rest = &rest[run..];
-                continue;
-            }
-            self.push_char(c, result);
-            rest = &rest[c.len_utf8()..];
-        }
-    }
-
-    /// Ends a streamed result: closes both spans it can end inside (a still
-    /// open key *or* string color), so a leftover open span from one result
-    /// can never bleed its missing reset into the next, then writes
-    /// `terminator` (#1708). An item still held is answered first: the
-    /// result's end is the end of its line.
-    fn boundary(&mut self, terminator: Terminator, result: &mut String) {
-        self.settle(false, result);
-        self.marker = MarkerState::None;
-        if self.in_key || self.in_string {
-            result.push_str("\x1b[0m");
-            self.in_key = false;
-            self.in_string = false;
-        }
-        result.push_str(terminator.as_str());
-        self.at_key_start = true;
-        self.escape_next = false;
-        self.trailing_reset_needed = false;
-    }
-
-    /// Answers an item the input ended inside (the end of the text is the
-    /// end of its line), then closes the last span unless a boundary already
-    /// did -- a reset *after* that boundary's terminator would be the same
-    /// "reset must precede terminator" defect #1708 was filed for, just
-    /// relocated to the tail of the output.
-    fn finish(&mut self, result: &mut String) {
-        self.settle(false, result);
-        if self.trailing_reset_needed {
-            result.push_str("\x1b[0m");
-        }
-    }
-
-    fn push_char(&mut self, c: char, result: &mut String) {
-        match &mut self.marker {
-            MarkerState::None => {}
-            MarkerState::AfterMarker => {
-                if c.is_whitespace() && c != '\n' {
-                    result.push(c);
-                    self.trailing_reset_needed = true;
-                    return;
-                }
-                self.marker = MarkerState::None;
-                if !matches!(c, '"' | '\'' | '\n') {
-                    match self.replay_answer {
-                        Some(opens_with_key) => self.at_key_start = opens_with_key,
-                        None => {
-                            self.marker = MarkerState::Holding(CompactItemLookahead::default());
-                            return self.push_char(c, result);
-                        }
-                    }
-                }
-            }
-            MarkerState::Holding(lookahead) => {
-                lookahead.held.push(c);
-                if let Some(opens_with_key) = lookahead.step(c) {
-                    self.settle(opens_with_key, result);
-                } else if lookahead.held.len() >= LOOKAHEAD_LIMIT {
-                    self.settle(false, result);
-                }
-                return;
-            }
-        }
-        // Real content follows -- if a boundary just fired, its terminator
-        // is no longer the output's final byte, so the trailing safety-net
-        // reset is needed again.
-        self.trailing_reset_needed = true;
-
-        if self.escape_next {
-            result.push(c);
-            self.escape_next = false;
-            return;
-        }
-
-        if c == '\\' && (self.in_string || self.in_key) {
-            result.push(c);
-            self.escape_next = true;
-            return;
-        }
-
-        match c {
-            '"' | '\'' => {
-                if self.in_string {
-                    result.push(c);
-                    result.push_str("\x1b[0m");
-                    self.in_string = false;
-                } else {
-                    result.push_str("\x1b[32m"); // Green for strings
-                    result.push(c);
-                    self.in_string = true;
-                }
-                self.at_key_start = false;
-            }
-            ':' if !self.in_string => {
-                // Only close a color span that's actually open (`in_key`)
-                // - otherwise this `:` belongs to a value that was never
-                // colored (e.g. a quoted-key's colon after the closing
-                // quote already reset color, or a `:` inside an uncolored
-                // token), and unconditionally emitting a reset here would
-                // write an orphaned `\x1b[0m` with no matching open.
-                if self.in_key {
-                    result.push_str("\x1b[0m");
-                }
-                result.push(c);
-                self.in_key = false;
-                self.at_key_start = false;
-            }
-            '\n' => {
-                result.push(c);
-                self.at_key_start = true;
-                self.in_key = false;
-            }
-            '-' if self.at_key_start => {
-                result.push_str("\x1b[33m"); // Yellow for list markers
-                result.push(c);
-                result.push_str("\x1b[0m");
-                // A real-yq "compact" block-sequence item (`- key: value`,
-                // #785) puts its mapping's first key directly after `- `
-                // on the same line, instead of on a fresh line (which
-                // already re-triggers `at_key_start` via the `\n` arm
-                // above) - see `CompactItemLookahead`'s doc comment.
-                self.marker = MarkerState::AfterMarker;
-            }
-            _ if self.at_key_start && !c.is_whitespace() && !self.in_string => {
-                result.push_str("\x1b[36m"); // Cyan for keys
-                result.push(c);
-                self.in_key = true;
-                self.at_key_start = false;
-            }
-            _ => {
-                result.push(c);
-                if !c.is_whitespace() {
-                    self.at_key_start = false;
-                }
-            }
-        }
-    }
-
-    /// Answers a held item, then colors the text it held back. A nested
-    /// marker in that text takes the same answer ([`Self::replay_answer`]).
-    fn settle(&mut self, opens_with_key: bool, result: &mut String) {
-        let MarkerState::Holding(lookahead) =
-            core::mem::replace(&mut self.marker, MarkerState::None)
-        else {
-            return;
-        };
-        self.at_key_start = opens_with_key;
-        self.replay_answer = Some(opens_with_key);
-        self.push_str(&lookahead.held, result);
-        self.replay_answer = None;
-    }
 }
 
 /// Parse a `--argjson` value into an `OwnedValue`.
@@ -13569,36 +13397,43 @@ mod tests {
         }
     }
 
-    /// #808: a list item's "does it open with a key" lookahead stops at the end of its own line
-    /// and its own result, and after [`LOOKAHEAD_LIMIT`] bytes, so a streamed `-C` holds at
-    /// most that much. The whole-buffer scan it replaced read on into the next result (coloring
-    /// `foo` as a key because the *next* result is `bar: 1`) and, through an apostrophe, onto
-    /// later lines; a streamed render could only follow either by holding the rest of the output.
+    /// #808, #5416: a streamed `-C` holds a line and the line after it, not the output: the
+    /// first line of a long render has reached `out` long before the render ends.
     #[test]
-    fn test_yaml_colorizer_lookahead_is_bounded_808() {
-        let marker = "\x1b[33m-\x1b[0m";
-        assert_eq!(
-            colorize_yaml_in_pieces("- foobar: 1", Terminator::Newline, &[5], &[]),
-            format!("{marker} foo\n\x1b[36mbar\x1b[0m: 1\x1b[0m")
-        );
+    fn test_yaml_colorizer_holds_lines_not_the_output_808() {
+        let mut colorizer = YamlColorizer::default();
+        let mut out = String::new();
+        let line = "key: value\n";
+        for _ in 0..50 {
+            colorizer.push_str(line, &mut out);
+        }
+        let colored_so_far = out.len();
         assert!(
-            colorize_yaml("- don't\nk's: 1\n").starts_with(&format!("{marker} don")),
-            "an apostrophe's quote ends with its line"
+            colored_so_far > 40 * line.len(),
+            "only {colored_so_far} bytes written after 50 lines"
         );
-        let key = "x".repeat(100);
-        assert!(colorize_yaml(&format!("- {key}: 1"))
-            .starts_with(&format!("{marker} \x1b[36m{key}\x1b[0m:")));
-        let long_key = "x".repeat(LOOKAHEAD_LIMIT);
-        assert!(
-            colorize_yaml(&format!("- {long_key}: 1")).starts_with(&format!("{marker} xxx")),
-            "past the limit the item is answered as a value"
-        );
-        // Each nested marker takes the outer answer rather than holding the rest of the line
-        // again: one copy of the line, not one per marker.
-        let nested = format!("{}a: 1", "- ".repeat(10_000));
-        let colored = colorize_yaml(&nested);
-        assert_eq!(colored.matches(marker).count(), 10_000);
-        assert!(colored.ends_with("\x1b[36ma\x1b[0m: 1\x1b[0m"));
+        for _ in 0..50 {
+            colorizer.push_str(line, &mut out);
+        }
+        assert!(out.len() > colored_so_far);
+    }
+
+    /// #5416: a quoted scalar is not started until its closing quote has arrived, wherever the
+    /// pieces fall, and one that never closes still prints once the result ends.
+    #[test]
+    fn test_yaml_colorizer_waits_for_a_quoted_scalars_close_5416() {
+        let whole = "a: \"x\ny\"\nb: 'it''s'\n";
+        let expected = colorize_yaml(whole);
+        for cut in 1..whole.len() {
+            let mut colorizer = YamlColorizer::default();
+            let mut out = String::new();
+            colorizer.push_str(&whole[..cut], &mut out);
+            colorizer.push_str(&whole[cut..], &mut out);
+            colorizer.finish(&mut out);
+            assert_eq!(out, expected, "cut at {cut}");
+        }
+        let colored = colorize_yaml("a: \"never closed\n");
+        assert!(colored.contains("never closed"), "{colored:?}");
     }
 
     /// A `Write` that shares what it was handed, so a test can read it while the writer is
@@ -13762,28 +13597,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.to_string(), "Write error");
-    }
-
-    /// #808: the lookahead's quote tracking (an escaped quote does not close a quote, a closing
-    /// quote re-exposes the `:`), the cut at the limit falling inside a character, and a blank
-    /// other than a space after a marker.
-    #[test]
-    fn test_yaml_colorizer_lookahead_edges_808() {
-        let key = "\x1b[36m";
-        assert!(
-            colorize_yaml("- x\"a\\\"b\": 1\n").contains(key),
-            "key after a quoted run"
-        );
-        assert!(
-            !colorize_yaml("- x\"a\\\":b\" c\n").contains(key),
-            "a colon inside the quote is not a key"
-        );
-        // `é` straddles the limit: the run stops before it and the character itself settles it.
-        let straddle = format!("- {}é: 1\n", "x".repeat(LOOKAHEAD_LIMIT - 1));
-        assert!(!colorize_yaml(&straddle).contains(key));
-        let tab = colorize_yaml("- \tk: 1\n");
-        assert!(tab.contains('\t'), "{tab:?}");
-        assert!(tab.contains(&format!("{key}k")), "{tab:?}");
     }
 
     /// #2706: a write followed by a *static* navigation is split into the write and the steps
