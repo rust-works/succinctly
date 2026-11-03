@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 
-use crate::run_jq_full;
+use crate::{run_jq_full, run_jq_over_files};
 
 /// `(stdin, stdout, exit code, the first line of stderr)`
 type Row = (&'static str, &'static str, i32, &'static str);
@@ -188,6 +188,80 @@ fn a_stream_slurp_holds_the_events_read_before_a_fault_met_after_the_array_close
             first_stderr,
             "{text:?}: stderr"
         );
+    }
+    Ok(())
+}
+
+/// `(flags, filter, stdin, stdout, exit code, the first line of stderr)`: a fault after more than
+/// the eight events the stream reader keeps locations for, one on a later line than the array's
+/// close, one that `input` and `[inputs]` reach after the array, and `-e`.
+type ShapeRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    i32,
+    &'static str,
+);
+
+const SHAPE_ROWS: &[ShapeRow] = &[
+    ("-cs", ".", "[1,\n}\n1 2", "", 5, "jq: parse error: Expected another key:value pair at line 2, column 1"),
+    ("-cs", ".", "[1,\n}\n1", "", 5, "jq: parse error: Expected another key:value pair at line 2, column 1"),
+    ("-cs", ".", "[1,\n1[", "", 5, "jq: parse error: Expected a separator between values at line 2, column 2"),
+    ("-cs", ".", "[1,\n}\n[2]", "", 5, "jq: parse error: Expected another key:value pair at line 2, column 1"),
+    ("-cs", ".", "[1,\n2,\n}\n3", "", 5, "jq: parse error: Expected another key:value pair at line 3, column 1"),
+    ("-cs", ".", "[1,}2", "", 5, "jq: parse error: Expected another key:value pair at line 1, column 4"),
+    ("-cs", ".", "1 ]2", "", 5, "jq: parse error: Unmatched ']' at the top-level at line 1, column 3"),
+    ("-cs", ".", "[1,2,3,4,5,6,7,8,9,10,11,12,", "[[[0],1],[[1],2],[[2],3],[[3],4],[[4],5],[[5],6],[[6],7],[[7],8],[[8],9],[[9],10],[[10],11],[[11],12]]", 5, "jq: parse error: Unfinished JSON term at EOF at line 1, column 28"),
+    ("-cs", ".", "1 2 3 4 5 6 7 8 9 10 11 12 [", "", 5, "jq: parse error: Unfinished JSON term at EOF at line 1, column 28"),
+    ("-cs", "input", "1[", "", 5, "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 2"),
+    ("-cs", "input", "[1,", "", 5, "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 3"),
+    ("-cs", "[inputs]", "[1,", "", 5, "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 3"),
+    ("-cs", "try input catch .", "1[", "\"Unfinished JSON term at EOF at line 1, column 2\"", 0, ""),
+    ("-cse", ".", "1[", "[[[],1]]", 5, "jq: parse error: Unfinished JSON term at EOF at line 1, column 2"),
+    ("-cse", ".", "[1,2", "", 5, "jq: parse error: Unfinished JSON term at EOF at line 1, column 4"),
+    ("-cs", "length", "1[", "1", 5, "jq: parse error: Unfinished JSON term at EOF at line 1, column 2"),
+
+];
+
+#[test]
+fn a_stream_slurp_fault_after_the_array_reads_as_jq_does_across_lines_programs_and_flags(
+) -> Result<()> {
+    for &(flags, filter, text, stdout, code, first_stderr) in SHAPE_ROWS {
+        let (out, err, exit) = run_jq_full(&[flags, "--stream", filter], Some(text))?;
+        assert_eq!(
+            out.trim_end().replace('\n', "\\n"),
+            stdout,
+            "{flags} {filter} {text:?}: stdout"
+        );
+        assert_eq!(exit, code, "{flags} {filter} {text:?}: exit code");
+        assert_eq!(
+            err.lines().next().unwrap_or(""),
+            first_stderr,
+            "{flags} {filter} {text:?}: stderr"
+        );
+    }
+    Ok(())
+}
+
+/// jq reads the files as one stream, so the array closes at the last byte of the last one.
+#[test]
+fn a_stream_slurp_over_several_files_closes_its_array_at_the_last_byte_of_the_last() -> Result<()> {
+    let rows: &[(&str, &str, &str, i32)] = &[
+        ("[1]", "[2,", "[[[0],1],[[0]],[[0],2]]", 5),
+        ("[1,", "[2]", "[[[0],1],[[1,0],2]]\\n[[1,0]]", 5),
+        ("1", "2[", "[[[],12]]", 5),
+        ("[1]\n", "}\n3", "", 5),
+        ("1 2", "3 [", "", 5),
+    ];
+    for &(first, second, stdout, code) in rows {
+        let (out, _, exit, _) = run_jq_over_files(&["-cs", "--stream", "."], &[first, second])?;
+        assert_eq!(
+            out.trim_end().replace('\n', "\\n"),
+            stdout,
+            "{first:?} {second:?}: stdout"
+        );
+        assert_eq!(exit, code, "{first:?} {second:?}: exit code");
     }
     Ok(())
 }
