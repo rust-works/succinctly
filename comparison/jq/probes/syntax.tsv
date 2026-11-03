@@ -594,3 +594,506 @@ num-lit-double-dot-neg	operators	["-n", "-c", "-1..e1"]	-
 num-lit-double-dot-neg-space	operators	["-n", "-c", "-1 .e1"]	-
 num-lit-leading-zero-empty-fraction-exp	operators	["-n", "-c", "00.e1"]	-
 num-lit-leading-zero-empty-fraction-int	operators	["-n", "-c", "007.e1"]	-
+# What the jq 1.7.1 manual states in prose beyond its example programs (#6007): types and values, conditionals, advanced features, math, I/O, streaming, assignment. Expected output is whatever /usr/bin/jq prints.
+man-number-literal-preserved	manual-types	["-n", "-c", "100000000000000000000"]	-
+man-number-literal-mutated	manual-types	["-n", "-c", "100000000000000000000 + 0"]	-
+man-number-literal-in-array	manual-types	["-n", "-c", "[100000000000000000000]|.[0]"]	-
+man-number-literal-eq-neighbour	manual-types	["-n", "-c", "100000000000000000000 == 100000000000000000001"]	-
+man-number-literal-lt-neighbour	manual-types	["-n", "-c", "100000000000000000000 < 100000000000000000001"]	-
+man-number-literal-trailing-zeros	manual-types	["-n", "-c", "[1.000, 1.10, 1E2, 0.10]"]	-
+man-number-literal-neg-zero	manual-types	["-n", "-c", "[-0, -0.0, 0e5]"]	-
+man-number-literal-unique	manual-types	["-n", "-c", "[1, 1.0, 1.00]|unique"]	-
+man-number-literal-group	manual-types	["-n", "-c", "[1, 1.0]|group_by(.)|length"]	-
+man-number-literal-tostring	manual-types	["-n", "-c", "[1.000, 1e2]|map(tostring)"]	-
+man-number-literal-tojson-roundtrip	manual-types	["-n", "-c", "100000000000000000000|tojson|fromjson"]	-
+man-number-literal-doc	manual-types	["-c", "."]	"[100000000000000000000, 1.000, 1E2]"
+man-number-literal-doc-sort	manual-types	["-c", "sort"]	"[100000000000000000001, 100000000000000000000, 1.0, 1]"
+man-number-literal-doc-add	manual-types	["-c", "add"]	"[100000000000000000000, 1]"
+man-number-literal-doc-min	manual-types	["-c", "min"]	"[100000000000000000001, 100000000000000000000]"
+man-number-literal-doc-eq	manual-types	["-c", ".[0] == .[1]"]	"[100000000000000000000, 100000000000000000001]"
+man-number-double-sum	manual-types	["-n", "-c", "0.1 + 0.2"]	-
+man-number-double-large-int	manual-types	["-n", "-c", "9007199254740993 + 0"]	-
+man-number-double-mul-big	manual-types	["-n", "-c", "1e308 * 10"]	-
+man-number-double-neg-big	manual-types	["-n", "-c", "-1e308 * 10"]	-
+man-number-small-denormal	manual-types	["-n", "-c", "5e-324 / 2"]	-
+man-array-construct-pipeline	manual-types	["-n", "-c", "[1,2,3]|[.[]|.*2]"]	-
+man-array-collect-generator	manual-types	["-n", "-c", "[(1,2),(3,4)]"]	-
+man-array-empty-collect	manual-types	["-n", "-c", "[empty]"]	-
+man-array-nested-generators	manual-types	["-n", "-c", "[[1,2][], [3][]]"]	-
+man-object-ident-key	manual-types	["-n", "-c", "{a:1, b:2}"]	-
+man-object-string-key	manual-types	["-n", "-c", "{\"a b\":1}"]	-
+man-object-var-key	manual-types	["-n", "-c", "\"f o o\" as $foo | \"b a r\" as $bar | {$foo, $bar:$foo}"]	-
+man-object-expr-key	manual-types	["-n", "-c", "{(\"a\"+\"b\"):59}"]	-
+man-object-shorthand	manual-types	["-n", "-c", "{\"user\":\"u\",\"title\":\"t\",\"id\":1}|{user, title}"]	-
+man-object-shorthand-string	manual-types	["-n", "-c", "{\"a b\":1}|{\"a b\"}"]	-
+man-object-multi-value	manual-types	["-n", "-c", "{\"user\":\"s\",\"titles\":[\"A\",\"B\"]}|{user, title: .titles[]}"]	-
+man-object-multi-key	manual-types	["-n", "-c", "{\"user\":\"s\",\"titles\":[\"A\",\"B\"]}|{(.user): .titles}"]	-
+man-object-cartesian	manual-types	["-n", "-c", "{a:(1,2), b:(3,4)}"]	-
+man-object-cartesian-keys	manual-types	["-n", "-c", "{((\"a\",\"b\")):(1,2)}"]	-
+man-object-key-non-string	manual-types	["-n", "-c", "try {(1):2} catch ."]	-
+man-object-key-null	manual-types	["-n", "-c", "try {(null):2} catch ."]	-
+man-object-key-array	manual-types	["-n", "-c", "try {([1]):2} catch ."]	-
+man-object-key-var-non-string	manual-types	["-n", "-c", "1 as $x | try {$x:2} catch ."]	-
+man-object-value-pipe	manual-types	["-n", "-c", "{a: (1|.+1)}"]	-
+man-object-value-comma-needs-parens	manual-types	["-n", "-c", "try ({a:1,2}) catch ."]	-
+man-object-value-alt	manual-types	["-n", "-c", "{a: null // 5}"]	-
+man-object-dup-key-last-wins	manual-types	["-n", "-c", "{\"a\":1,\"a\":2}"]	-
+man-object-dup-key-doc	manual-types	["-c", "."]	"{\"a\":1,\"a\":2}"
+man-object-key-order-output	manual-types	["-n", "-c", "{\"b\":1,\"a\":2}"]	-
+man-object-key-order-keys	manual-types	["-n", "-c", "{\"b\":1,\"a\":2}|keys, keys_unsorted"]	-
+man-object-loc	manual-types	["-n", "-c", "{$__loc__}"]	-
+man-object-env-key	manual-types	["-n", "-c", "{$ENV}|keys"]	-
+man-object-string-interp-key	manual-types	["-n", "-c", "{\"a\\(1)\":2}"]	-
+man-object-format-key	manual-types	["-n", "-c", "{@base64 \"k\":1}"]	-
+man-object-at-key-expr	manual-types	["-n", "-c", "{(@json \"x\"):1}"]	-
+man-object-keyword-key	manual-types	["-n", "-c", "{if:1, then:2, and:3, or:4, not:5, def:6, reduce:7, foreach:8, try:9, catch:10, label:11, import:12, include:13, __loc__:14}"]	-
+man-object-keyword-field-access	manual-types	["-n", "-c", "{\"if\":1}|.if, .and?, .not?"]	-
+man-object-numeric-key-literal	manual-types	["-n", "-c", "try ({1:2}) catch ."]	-
+man-recurse-dotdot	manual-types	["-n", "-c", "[[{\"a\":1}]]|[..]"]	-
+man-recurse-dotdot-a	manual-types	["-n", "-c", "[[{\"a\":1}]]|.. | .a?"]	-
+man-recurse-dotdot-order	manual-types	["-n", "-c", "{\"a\":[1,{\"b\":2}],\"c\":3}|[..]"]	-
+man-recurse-dotdot-path-form	manual-types	["-n", "-c", "try (..a) catch ."]	-
+man-recurse-dotdot-scalar	manual-types	["-n", "-c", "1|[..]"]	-
+man-recurse-dotdot-null	manual-types	["-n", "-c", "null|[..]"]	-
+man-recurse-dotdot-paths	manual-types	["-n", "-c", "{\"a\":[1]}|[path(..)]"]	-
+man-eq-string-number	manual-conditionals	["-n", "-c", "\"1\" == 1"]	-
+man-eq-key-order	manual-conditionals	["-n", "-c", "{\"a\":1,\"b\":2} == {\"b\":2,\"a\":1}"]	-
+man-eq-int-float	manual-conditionals	["-n", "-c", "1 == 1.0"]	-
+man-eq-strict-null-false	manual-conditionals	["-n", "-c", "null == false"]	-
+man-eq-nested	manual-conditionals	["-n", "-c", "[{\"a\":[1,{\"b\":2}]}] == [{\"a\":[1,{\"b\":2.0}]}]"]	-
+man-ne-basic	manual-conditionals	["-n", "-c", "1 != 1.0, \"a\" != \"a\", [] != {}"]	-
+man-if-multi-cond	manual-conditionals	["-n", "-c", "[if (true,false,null,1) then 1 else 2 end]"]	-
+man-if-multi-branch	manual-conditionals	["-n", "-c", "[if true then (1,2) else 3 end]"]	-
+man-if-empty-cond	manual-conditionals	["-n", "-c", "[if empty then 1 else 2 end]"]	-
+man-if-no-else	manual-conditionals	["-n", "-c", "2|if . > 5 then 1 end"]	-
+man-if-no-else-elif	manual-conditionals	["-n", "-c", "2|if . > 5 then 1 elif . > 3 then 2 end"]	-
+man-if-elif-else	manual-conditionals	["-n", "-c", "[0,1,2]|map(if .==0 then \"zero\" elif .==1 then \"one\" else \"many\" end)"]	-
+man-if-truthy-zero	manual-conditionals	["-n", "-c", "[0, \"\", [], {}]|map(if . then 1 else 0 end)"]	-
+man-if-false-null	manual-conditionals	["-n", "-c", "[false, null]|map(if . then 1 else 0 end)"]	-
+man-if-string-empty	manual-conditionals	["-n", "-c", "\"\" | if . then \"t\" else \"f\" end"]	-
+man-cmp-order-types	manual-conditionals	["-n", "-c", "[null,true,false,0,\"a\",[],{}]|sort"]	-
+man-cmp-order-cross	manual-conditionals	["-n", "-c", "[null<false, false<true, true<0, 0<\"a\", \"a\"<[], []<{}]"]	-
+man-cmp-order-strings-unicode	manual-conditionals	["-n", "-c", "[\"a\",\"B\",\"é\",\"z\",\"Z\",\"\\u00e9a\"]|sort"]	-
+man-cmp-order-array	manual-conditionals	["-n", "-c", "[[1,2],[1],[2],[1,1],[]]|sort"]	-
+man-cmp-order-object-keys	manual-conditionals	["-n", "-c", "[{\"b\":1},{\"a\":2},{\"a\":1,\"b\":0},{}]|sort"]	-
+man-cmp-order-object-values	manual-conditionals	["-n", "-c", "[{\"a\":2},{\"a\":1},{\"a\":3,\"b\":1}]|sort"]	-
+man-cmp-nan	manual-conditionals	["-n", "-c", "[nan<1, nan>1, nan==nan, nan<nan, nan>=nan]"]	-
+man-cmp-nan-sort	manual-conditionals	["-n", "-c", "[nan,1,null,false]|sort|map(tostring)"]	-
+man-cmp-ge-le	manual-conditionals	["-n", "-c", "[1>=1, 1<=1, 2>=3, \"b\">=\"a\"]"]	-
+man-and-multi-left	manual-conditionals	["-n", "-c", "[(true,false) and true]"]	-
+man-and-multi-both	manual-conditionals	["-n", "-c", "[(true,false) and (true,false)]"]	-
+man-or-multi-both	manual-conditionals	["-n", "-c", "[(true,false) or (true,false)]"]	-
+man-and-short-circuit	manual-conditionals	["-n", "-c", "[false and error(\"x\")]"]	-
+man-or-short-circuit	manual-conditionals	["-n", "-c", "[true or error(\"x\")]"]	-
+man-and-or-null	manual-conditionals	["-n", "-c", "[null and 1, null or 1, 1 and null, 0 and 0]"]	-
+man-and-empty	manual-conditionals	["-n", "-c", "[empty and true, true and empty, empty or true, false or empty]"]	-
+man-not-builtin	manual-conditionals	["-n", "-c", "[true,false,null,0,\"\"]|map(not)"]	-
+man-not-pipe	manual-conditionals	["-n", "-c", "{\"foo\":1,\"bar\":null}|.foo and .bar|not"]	-
+man-alt-basic	manual-conditionals	["-n", "-c", "[null // 1, false // 2, 3 // 4, empty // 5]"]	-
+man-alt-generator-left	manual-conditionals	["-n", "-c", "[(false,null,1,2) // 42]"]	-
+man-alt-generator-all-false	manual-conditionals	["-n", "-c", "[(false,null) // 42]"]	-
+man-alt-pipe-form	manual-conditionals	["-n", "-c", "[(false,null,1)|. // 42]"]	-
+man-alt-comma-precedence	manual-conditionals	["-n", "-c", "[false, 1 // 2]"]	-
+man-alt-error-left	manual-conditionals	["-n", "-c", "[(1, error(\"x\")) // 2]"]	-
+man-alt-error-left-first	manual-conditionals	["-n", "-c", "[error(\"x\") // 2]"]	-
+man-alt-try-error-left	manual-conditionals	["-n", "-c", "[try error(\"x\") // 2]"]	-
+man-alt-right-multi	manual-conditionals	["-n", "-c", "[null // (1,2)]"]	-
+man-alt-chain	manual-conditionals	["-n", "-c", "[null // false // 3, null // 2 // 3]"]	-
+man-alt-field-default	manual-conditionals	["-n", "-c", "{\"foo\":19}|.foo // 1, .bar // 2"]	-
+man-alt-empty-array-truthy	manual-conditionals	["-n", "-c", "[] // 1, {} // 2, 0 // 3, \"\" // 4"]	-
+man-alt-first-vs-empty	manual-conditionals	["-n", "-c", "[first(empty) // 7]"]	-
+man-alt-after-empty-field	manual-conditionals	["-n", "-c", "{}|[.[]? // 5]"]	-
+man-try-basic	manual-conditionals	["-n", "-c", "[.[]|try if . == 0 then error(\"x\") else . end]"]	"[0,1,2]"
+man-try-catch-msg	manual-conditionals	["-n", "-c", "try error(\"bad\") catch ."]	-
+man-try-catch-object	manual-conditionals	["-n", "-c", "try error({\"a\":1}) catch .a"]	-
+man-try-catch-null	manual-conditionals	["-n", "-c", "try error(null) catch ."]	-
+man-try-error-no-arg	manual-conditionals	["-n", "-c", "try error catch ."]	-
+man-try-no-catch-empty	manual-conditionals	["-n", "-c", "[try error(\"x\")]"]	-
+man-try-body-stops	manual-conditionals	["-n", "-c", "[try (1, error(\"x\"), 3) catch .]"]	-
+man-try-catch-rethrow	manual-conditionals	["-n", "-c", "try (try error(\"a\") catch error(\"b\")) catch ."]	-
+man-try-nested-outer	manual-conditionals	["-n", "-c", "try (try error(\"a\") catch .) catch \"outer\""]	-
+man-try-catch-multi	manual-conditionals	["-n", "-c", "try error(\"x\") catch (., .)"]	-
+man-try-in-path	manual-conditionals	["-n", "-c", "[.[]|(.a)?]"]	"[1,{\"a\":2},\"x\",null]"
+man-opt-iterate	manual-conditionals	["-n", "-c", "[.[]?]"]	"1"
+man-opt-generator-partial	manual-conditionals	["-n", "-c", "[(1,2)|if .==2 then error(\"x\") else . end]?"]	-
+man-opt-index-string	manual-conditionals	["-n", "-c", "[.[\"a\"]?]"]	"[1]"
+man-opt-chain	manual-conditionals	["-n", "-c", "[.a?.b?.c?]"]	"{\"a\":1}"
+man-opt-vs-try-same	manual-conditionals	["-n", "-c", "[(1|keys)?], [try (1|keys)]"]	-
+man-error-non-string-message	manual-conditionals	["-n", "-c", "try error({a:1}) catch ."]	-
+man-error-uncaught-object	manual-conditionals	["-n", "-c", "error({a:1})"]	-
+man-error-uncaught-string	manual-conditionals	["-n", "-c", "error(\"x\")"]	-
+man-error-uncaught-null	manual-conditionals	["-n", "-c", "error(null)"]	-
+man-error-uncaught-no-arg	manual-conditionals	["-n", "-c", "null|error"]	-
+man-error-uncaught-number	manual-conditionals	["-n", "-c", "error(1)"]	-
+man-break-labels	manual-conditionals	["-n", "-c", "[label $out | 1, 2, break $out, 3]"]	-
+man-break-nested	manual-conditionals	["-n", "-c", "[label $a | label $b | 1, break $a, 2]"]	-
+man-break-inner	manual-conditionals	["-n", "-c", "[label $a | (label $b | 1, break $b, 2), 3]"]	-
+man-break-shadow	manual-conditionals	["-n", "-c", "[label $a | (label $a | 1, break $a), 2]"]	-
+man-break-reduce	manual-conditionals	["-n", "-c", "label $out | reduce .[] as $i (0; if $i > 2 then ., break $out else . + $i end)"]	"[1,2,3,4]"
+man-break-reduce-prints-nothing	manual-conditionals	["-n", "-c", "[label $out | reduce range(10) as $i (0; if $i == 3 then break $out else . + $i end)]"]	-
+man-break-foreach	manual-conditionals	["-n", "-c", "[label $f | foreach range(10) as $i (0; .+$i; if . > 5 then ., break $f else . end)]"]	-
+man-break-in-function	manual-conditionals	["-n", "-c", "def f: label $x | (1, break $x, 2); [f, f]"]	-
+man-break-limit-like	manual-conditionals	["-n", "-c", "[label $o | range(10) | ., (select(. == 3) | break $o)]"]	-
+man-break-no-label	manual-conditionals	["-n", "-c", "break $out"]	-
+man-break-label-not-visible	manual-conditionals	["-n", "-c", "(label $out | 1), break $out"]	-
+man-break-in-try	manual-conditionals	["-n", "-c", "[label $o | try (1, break $o, 2) catch \"c\"]"]	-
+man-break-through-try-catch-all	manual-conditionals	["-n", "-c", "[label $o | try error(\"x\") catch break $o]"]	-
+man-repeat-break-idiom	manual-conditionals	["-n", "-c", "try (0|[limit(3;repeat(.+1;)]) catch ."]	-
+man-var-average	manual-advanced	["-n", "-c", "length as $n | add / $n"]	"[1,2,3,4]"
+man-var-multi-value	manual-advanced	["-n", "-c", "[(1,2) as $x | $x * 10]"]	-
+man-var-multi-value-product	manual-advanced	["-n", "-c", "[(1,2) as $x | (3,4) as $y | $x * $y]"]	-
+man-var-shorthand-object	manual-advanced	["-n", "-c", "1 as $foo | {$foo}"]	-
+man-var-destructure-array-short	manual-advanced	["-n", "-c", "[1] as [$a,$b] | [$a,$b]"]	-
+man-var-destructure-array-long	manual-advanced	["-n", "-c", "[1,2,3] as [$a,$b] | [$a,$b]"]	-
+man-var-destructure-null-array	manual-advanced	["-n", "-c", "null as [$a] | $a"]	-
+man-var-destructure-object-missing	manual-advanced	["-n", "-c", "{\"a\":1} as {a:$x, b:$y} | [$x,$y]"]	-
+man-var-destructure-object-null	manual-advanced	["-n", "-c", "null as {a:$x} | $x"]	-
+man-var-destructure-nested	manual-advanced	["-n", "-c", "[[1,2],[3]] as [[$a],[$b]] | [$a,$b]"]	-
+man-var-destructure-key-var	manual-advanced	["-n", "-c", "{\"a\":1,\"b\":2} as {$a, $b} | [$a,$b]"]	-
+man-var-destructure-key-expr	manual-advanced	["-n", "-c", "\"a\" as $k | {\"a\":5} as {($k):$v} | $v"]	-
+man-var-destructure-string-key	manual-advanced	["-n", "-c", "{\"a b\":5} as {\"a b\":$v} | $v"]	-
+man-var-destructure-key-and-bind	manual-advanced	["-n", "-c", "{\"a\":{\"x\":1}} as {a:{$x}} | $x"]	-
+man-var-destructure-dollar-key-both	manual-advanced	["-n", "-c", "{\"a\":[1,2]} as {$a:[$f,$s]} | [$a,$f,$s]"]	-
+man-var-destructure-wrong-type	manual-advanced	["-n", "-c", "try ({} as [$a] | $a) catch ."]	-
+man-var-destructure-wrong-type-obj	manual-advanced	["-n", "-c", "try ([] as {a:$a} | $a) catch ."]	-
+man-var-destructure-string-as-array	manual-advanced	["-n", "-c", "try (\"ab\" as [$a] | $a) catch ."]	-
+man-var-scope-parens	manual-advanced	["-n", "-c", "try ((1 as $x | 2) | $x) catch ."]	-
+man-var-scope-visible-right	manual-advanced	["-n", "-c", "1 as $x | (2 as $y | [$x,$y])"]	-
+man-var-scope-shadow	manual-advanced	["-n", "-c", "1 as $x | 2 as $x | $x"]	-
+man-var-scope-shadow-restored	manual-advanced	["-n", "-c", "1 as $x | [(2 as $x | $x), $x]"]	-
+man-var-no-mutation	manual-advanced	["-n", "-c", "1 as $x | (2 as $x | $x) , $x"]	-
+man-var-undefined	manual-advanced	["-n", "-c", "$nope"]	-
+man-var-input-captured	manual-advanced	["-n", "-c", "[.[] as $x | . | length]"]	"[1,2]"
+man-var-loc	manual-advanced	["-n", "-c", "$__loc__"]	-
+man-var-prog-args	manual-advanced	["-n", "-c", "--arg", "a", "1", "$ARGS"]	-
+man-var-env-builtin	manual-advanced	["-n", "-c", "env|type"]	-
+man-destr-alt-first	manual-advanced	["-c", ".[] as [$a] ?// $a | [$a]"]	"[[1],2]"
+man-destr-alt-doc-example	manual-advanced	["-c", ".[] as [$id, $kind] ?// {$id, $kind} | [$id,$kind]"]	"[[1,\"a\"],{\"id\":2,\"kind\":\"b\"}]"
+man-destr-alt-vars-null	manual-advanced	["-c", ".[] as {$a} ?// [$b] | [$a,$b]"]	"[{\"a\":1},[2]]"
+man-destr-alt-error-next	manual-advanced	["-n", "-c", "[[3]] | .[] as [$a] ?// [$b] | if $a != null then error(\"err: \\($a)\") else {$a,$b} end"]	-
+man-destr-alt-error-final	manual-advanced	["-n", "-c", "[[3]] | try (.[] as [$a] ?// [$b] | error(\"e\\($a)\\($b)\")) catch ."]	-
+man-destr-alt-three	manual-advanced	["-c", ".[] as [$a] ?// {a:$a} ?// $a | $a"]	"[[1],{\"a\":2},3]"
+man-destr-alt-body-multi	manual-advanced	["-n", "-c", "[[1,2]] | [.[] as [$a] ?// $a | ($a, 9)]"]	-
+man-destr-alt-body-error-after-output	manual-advanced	["-n", "-c", "[[1]] | [.[] as [$a] ?// $a | ($a, error(\"x\"))]?"]	-
+man-def-increment	manual-advanced	["-n", "-c", "def increment: . + 1; 1|increment"]	-
+man-def-args-filters	manual-advanced	["-n", "-c", "def foo(f): f|f; 5|foo(.*2)"]	-
+man-def-args-value	manual-advanced	["-n", "-c", "def addvalue($f): map(. + $f); [[1,2],[10,20]]|addvalue(.[0])"]	-
+man-def-args-value-generator	manual-advanced	["-n", "-c", "def addvalue($f): map(. + $f); [[1,2],[10,20]]|[addvalue(.[])]"]	-
+man-def-args-as	manual-advanced	["-n", "-c", "def addvalue(f): f as $x | map(. + $x); [[1,2],[10,20]]|addvalue(.[0])"]	-
+man-def-redef-arity	manual-advanced	["-n", "-c", "def f(x): x; def f(x;y): x+y; [f(1), f(1;2)]"]	-
+man-def-redef-same-arity	manual-advanced	["-n", "-c", "def f: 1; def f: 2; f"]	-
+man-def-redef-earlier-callers	manual-advanced	["-n", "-c", "def f: 1; def g: f; def f: 2; [g, f]"]	-
+man-def-recursion	manual-advanced	["-n", "-c", "def fac: if . <= 1 then 1 else . * (. - 1 | fac) end; 10|fac"]	-
+man-def-nested	manual-advanced	["-n", "-c", "def f: def g: 3; g * 2; f"]	-
+man-def-nested-not-visible	manual-advanced	["-n", "-c", "def f: def g: 3; g; g"]	-
+man-def-closure	manual-advanced	["-n", "-c", "def f(x): def g: x; g; f(5)"]	-
+man-def-param-shadow	manual-advanced	["-n", "-c", "def f(x): def x: 9; x; f(1)"]	-
+man-def-dollar-and-filter	manual-advanced	["-n", "-c", "def f($a; b): $a + b; f(1; 2)"]	-
+man-def-dollar-name-as-filter	manual-advanced	["-n", "-c", "def f($a): a; f(5)"]	-
+man-def-multi-output-param	manual-advanced	["-n", "-c", "def f($a): $a; [f(1,2)]"]	-
+man-def-two-dollar-product	manual-advanced	["-n", "-c", "def f($a; $b): [$a,$b]; [f(1,2; 3,4)]"]	-
+man-def-self-reference-only	manual-advanced	["-n", "-c", "def f: g; def g: 1; f"]	-
+man-def-main-needs-expression	manual-advanced	["-n", "-c", "def f: 1;"]	-
+man-def-keywords-as-names	manual-advanced	["-n", "-c", "def reduce: 1; reduce"]	-
+man-def-recursion-tail-1e5	manual-advanced	["-n", "-c", "def f: if . < 100000 then .+1|f else . end; 0|f"]	-
+man-def-recursion-tail-generator	manual-advanced	["-n", "-c", "[limit(3; def r: ., (.+1|r); 0|r)]"]	-
+man-def-recursion-range-like	manual-advanced	["-n", "-c", "def r(a;b): if a < b then a, r(a+1;b) else empty end; [r(0;5)]"]	-
+man-def-recurse-f-null-stops	manual-advanced	["-n", "-c", "[2|recurse(if . < 20 then .*. else null end)]"]	-
+man-isempty-basic	manual-advanced	["-n", "-c", "isempty(empty), isempty(1), isempty(1,2)"]	-
+man-isempty-error-after-first	manual-advanced	["-n", "-c", "isempty(1, error(\"x\"))"]	-
+man-isempty-error-first	manual-advanced	["-n", "-c", "try isempty(error(\"x\")) catch ."]	-
+man-limit-basic	manual-advanced	["-n", "-c", "[limit(3; range(10))]"]	-
+man-limit-zero	manual-advanced	["-n", "-c", "[limit(0; 1,2)]"]	-
+man-limit-negative	manual-advanced	["-n", "-c", "[limit(-1; 1,2)]"]	-
+man-limit-more-than-available	manual-advanced	["-n", "-c", "[limit(5; 1,2)]"]	-
+man-limit-no-evaluate-extra	manual-advanced	["-n", "-c", "[limit(1; 1, error(\"x\"))]"]	-
+man-limit-multi-n	manual-advanced	["-n", "-c", "[limit(1,2; 5,6,7)]"]	-
+man-first-last-nth-expr	manual-advanced	["-n", "-c", "[first(range(10)), last(range(10)), nth(5; range(10))]"]	-
+man-first-empty	manual-advanced	["-n", "-c", "[first(empty)]"]	-
+man-last-empty	manual-advanced	["-n", "-c", "[last(empty)]"]	-
+man-nth-negative	manual-advanced	["-n", "-c", "try nth(-1; 1,2) catch ."]	-
+man-nth-out-of-range	manual-advanced	["-n", "-c", "[nth(5; 1,2)]"]	-
+man-first-no-evaluate-extra	manual-advanced	["-n", "-c", "first(1, error(\"x\"))"]	-
+man-first-array	manual-advanced	["-n", "-c", "[[1,2,3]|first, last, nth(1)]"]	-
+man-first-array-empty	manual-advanced	["-n", "-c", "[[]|first, last, nth(0)]"]	-
+man-nth-array-negative	manual-advanced	["-n", "-c", "try ([1,2]|nth(-1)) catch ."]	-
+man-first-nonarray	manual-advanced	["-n", "-c", "try ({\"a\":1}|first) catch ."]	-
+man-reduce-sum	manual-advanced	["-n", "-c", "reduce .[] as $item (0; . + $item)"]	"[1,2,3]"
+man-reduce-empty-source	manual-advanced	["-n", "-c", "reduce empty as $x (0; .+1)"]	-
+man-reduce-update-empty	manual-advanced	["-n", "-c", "reduce (1,2) as $x (0; empty)"]	-
+man-reduce-update-multi-last	manual-advanced	["-n", "-c", "reduce (1,2) as $x (0; (.+$x, .+10*$x))"]	-
+man-reduce-init-multi	manual-advanced	["-n", "-c", "[reduce (1,2) as $x ((0,100); .+$x)]"]	-
+man-reduce-destructure	manual-advanced	["-n", "-c", "reduce ([1,2],[3,4]) as [$a,$b] (0; . + $a * $b)"]	-
+man-reduce-init-uses-input	manual-advanced	["-n", "-c", "reduce .[] as $x (.[0]; . + $x)"]	"[1,2,3]"
+man-reduce-nested	manual-advanced	["-n", "-c", "reduce range(3) as $i ([]; . + [reduce range($i) as $j (0; .+1)])"]	-
+man-reduce-source-multi-generators	manual-advanced	["-n", "-c", "reduce ((1,2),(3,4)) as $x (0; .+$x)"]	-
+man-reduce-error-in-update	manual-advanced	["-n", "-c", "try reduce (1,2) as $x (0; error(\"e\\($x)\")) catch ."]	-
+man-reduce-path-update	manual-advanced	["-n", "-c", "reduce range(3) as $i ({}; .[\"k\\($i)\"] = $i)"]	-
+man-foreach-basic	manual-advanced	["-n", "-c", "[foreach (1,2,3) as $x (0; .+$x; [$x, .*2])]"]	-
+man-foreach-no-extract	manual-advanced	["-n", "-c", "[foreach (1,2,3) as $x (0; .+$x)]"]	-
+man-foreach-extract-multi	manual-advanced	["-n", "-c", "[foreach (1,2) as $x (0; .+$x; ., 100)]"]	-
+man-foreach-extract-empty	manual-advanced	["-n", "-c", "[foreach range(5) as $i (null; $i; select(. % 2 == 0))]"]	-
+man-foreach-update-multi	manual-advanced	["-n", "-c", "[foreach (1,2) as $x (0; (.+$x, .+10*$x); .)]"]	-
+man-foreach-update-empty	manual-advanced	["-n", "-c", "[foreach (1,2) as $x (0; empty; .)]"]	-
+man-foreach-init-multi	manual-advanced	["-n", "-c", "[foreach (1,2) as $x ((0,10); .+$x; .)]"]	-
+man-foreach-destructure	manual-advanced	["-n", "-c", "[foreach ([1,2],[3,4]) as [$a,$b] (0; .+$a; [., $b])]"]	-
+man-foreach-source-empty	manual-advanced	["-n", "-c", "[foreach empty as $x (0; .+1; .)]"]	-
+man-foreach-error-in-extract	manual-advanced	["-n", "-c", "try [foreach (1,2) as $x (0; .+$x; error(\"e\\(.)\"))] catch ."]	-
+man-foreach-limit-like	manual-advanced	["-n", "-c", "[foreach range(10) as $i (0; .+$i; select(. > 10))]|.[0:2]"]	-
+man-generators-comma	manual-advanced	["-n", "-c", "[(1,2),(3,4)]"]	-
+man-generators-empty-backtrack	manual-advanced	["-n", "-c", "[1,(empty,2),3]"]	-
+man-generators-range-two-args	manual-advanced	["-n", "-c", "[range(0;10)]|length"]	-
+man-generators-range-step	manual-advanced	["-n", "-c", "[range(0;10;3)], [range(10;0;-3)], [range(0;1;0.3)]"]	-
+man-generators-range-empty	manual-advanced	["-n", "-c", "[range(5;0)], [range(0)], [range(-1)]"]	-
+man-generators-range-multi-args	manual-advanced	["-n", "-c", "[range(1,2;3,4)]"]	-
+man-generators-range-nonnumber	manual-advanced	["-n", "-c", "try [range(\"a\")] catch ."]	-
+man-generators-range-float	manual-advanced	["-n", "-c", "[range(0.5;3)]"]	-
+man-generators-range-zero-step-limit	manual-advanced	["-n", "-c", "[limit(3; range(0;1;0))]"]	-
+man-generators-recurse-default	manual-advanced	["-n", "-c", "[[1,[2]]|recurse]"]	-
+man-generators-recurse-f	manual-advanced	["-n", "-c", "[2|recurse(. * .; . < 100)]"]	-
+man-generators-while	manual-advanced	["-n", "-c", "[1|while(. < 100; . * 2)]"]	-
+man-generators-until	manual-advanced	["-n", "-c", "1|until(. > 100; . * 2)"]	-
+man-generators-repeat	manual-advanced	["-n", "-c", "[limit(5; 1|repeat(. * 2))]"]	-
+man-generators-repeat-defn	manual-advanced	["-n", "-c", "[limit(4; 1|repeat(.+1; . < 3))]?"]	-
+man-generators-range-in-def	manual-advanced	["-n", "-c", "def _range(f; t): if f < t then f, _range(f+1; t) else empty end; [_range(0;5)]"]	-
+man-generators-input-filename-null	manual-advanced	["-n", "-c", "input_filename"]	-
+man-generators-ltrimstr-generators	manual-advanced	["-n", "-c", "[\"ab\",\"cd\"]|[.[]|ltrimstr(\"a\",\"c\")]"]	-
+man-generators-index-multi	manual-advanced	["-n", "-c", "[(\"a\",\"b\") as $x | {($x): 1}]"]	-
+man-generators-path-multi	manual-advanced	["-n", "-c", "[path(.a, .b)]"]	"{\"a\":1}"
+man-generators-env-pipeline	manual-advanced	["-n", "-c", "[1,2,3] | map(select(. > 1) | . * 2)"]	-
+man-one-input-defined-acos	manual-math	["-n", "-c", "[0.5 | try acos catch \"E\"] | map(type)"]	-
+man-one-input-defined-acosh	manual-math	["-n", "-c", "[0.5 | try acosh catch \"E\"] | map(type)"]	-
+man-one-input-defined-asin	manual-math	["-n", "-c", "[0.5 | try asin catch \"E\"] | map(type)"]	-
+man-one-input-defined-asinh	manual-math	["-n", "-c", "[0.5 | try asinh catch \"E\"] | map(type)"]	-
+man-one-input-defined-atan	manual-math	["-n", "-c", "[0.5 | try atan catch \"E\"] | map(type)"]	-
+man-one-input-defined-atanh	manual-math	["-n", "-c", "[0.5 | try atanh catch \"E\"] | map(type)"]	-
+man-one-input-defined-cbrt	manual-math	["-n", "-c", "[0.5 | try cbrt catch \"E\"] | map(type)"]	-
+man-one-input-defined-ceil	manual-math	["-n", "-c", "[0.5 | try ceil catch \"E\"] | map(type)"]	-
+man-one-input-defined-cos	manual-math	["-n", "-c", "[0.5 | try cos catch \"E\"] | map(type)"]	-
+man-one-input-defined-cosh	manual-math	["-n", "-c", "[0.5 | try cosh catch \"E\"] | map(type)"]	-
+man-one-input-defined-erf	manual-math	["-n", "-c", "[0.5 | try erf catch \"E\"] | map(type)"]	-
+man-one-input-defined-erfc	manual-math	["-n", "-c", "[0.5 | try erfc catch \"E\"] | map(type)"]	-
+man-one-input-defined-exp	manual-math	["-n", "-c", "[0.5 | try exp catch \"E\"] | map(type)"]	-
+man-one-input-defined-exp10	manual-math	["-n", "-c", "[0.5 | try exp10 catch \"E\"] | map(type)"]	-
+man-one-input-defined-exp2	manual-math	["-n", "-c", "[0.5 | try exp2 catch \"E\"] | map(type)"]	-
+man-one-input-defined-expm1	manual-math	["-n", "-c", "[0.5 | try expm1 catch \"E\"] | map(type)"]	-
+man-one-input-defined-fabs	manual-math	["-n", "-c", "[0.5 | try fabs catch \"E\"] | map(type)"]	-
+man-one-input-defined-floor	manual-math	["-n", "-c", "[0.5 | try floor catch \"E\"] | map(type)"]	-
+man-one-input-defined-gamma	manual-math	["-n", "-c", "[0.5 | try gamma catch \"E\"] | map(type)"]	-
+man-one-input-defined-j0	manual-math	["-n", "-c", "[0.5 | try j0 catch \"E\"] | map(type)"]	-
+man-one-input-defined-j1	manual-math	["-n", "-c", "[0.5 | try j1 catch \"E\"] | map(type)"]	-
+man-one-input-defined-lgamma	manual-math	["-n", "-c", "[0.5 | try lgamma catch \"E\"] | map(type)"]	-
+man-one-input-defined-log	manual-math	["-n", "-c", "[0.5 | try log catch \"E\"] | map(type)"]	-
+man-one-input-defined-log10	manual-math	["-n", "-c", "[0.5 | try log10 catch \"E\"] | map(type)"]	-
+man-one-input-defined-log1p	manual-math	["-n", "-c", "[0.5 | try log1p catch \"E\"] | map(type)"]	-
+man-one-input-defined-log2	manual-math	["-n", "-c", "[0.5 | try log2 catch \"E\"] | map(type)"]	-
+man-one-input-defined-logb	manual-math	["-n", "-c", "[0.5 | try logb catch \"E\"] | map(type)"]	-
+man-one-input-defined-nearbyint	manual-math	["-n", "-c", "[0.5 | try nearbyint catch \"E\"] | map(type)"]	-
+man-one-input-defined-pow10	manual-math	["-n", "-c", "[0.5 | try pow10 catch \"E\"] | map(type)"]	-
+man-one-input-defined-rint	manual-math	["-n", "-c", "[0.5 | try rint catch \"E\"] | map(type)"]	-
+man-one-input-defined-round	manual-math	["-n", "-c", "[0.5 | try round catch \"E\"] | map(type)"]	-
+man-one-input-defined-significand	manual-math	["-n", "-c", "[0.5 | try significand catch \"E\"] | map(type)"]	-
+man-one-input-defined-sin	manual-math	["-n", "-c", "[0.5 | try sin catch \"E\"] | map(type)"]	-
+man-one-input-defined-sinh	manual-math	["-n", "-c", "[0.5 | try sinh catch \"E\"] | map(type)"]	-
+man-one-input-defined-sqrt	manual-math	["-n", "-c", "[0.5 | try sqrt catch \"E\"] | map(type)"]	-
+man-one-input-defined-tan	manual-math	["-n", "-c", "[0.5 | try tan catch \"E\"] | map(type)"]	-
+man-one-input-defined-tanh	manual-math	["-n", "-c", "[0.5 | try tanh catch \"E\"] | map(type)"]	-
+man-one-input-defined-tgamma	manual-math	["-n", "-c", "[0.5 | try tgamma catch \"E\"] | map(type)"]	-
+man-one-input-defined-trunc	manual-math	["-n", "-c", "[0.5 | try trunc catch \"E\"] | map(type)"]	-
+man-one-input-defined-y0	manual-math	["-n", "-c", "[0.5 | try y0 catch \"E\"] | map(type)"]	-
+man-one-input-defined-y1	manual-math	["-n", "-c", "[0.5 | try y1 catch \"E\"] | map(type)"]	-
+man-two-input-defined-atan2	manual-math	["-n", "-c", "[try atan2(2; 3) catch \"E\"] | map(type)"]	-
+man-two-input-defined-copysign	manual-math	["-n", "-c", "[try copysign(2; 3) catch \"E\"] | map(type)"]	-
+man-two-input-defined-drem	manual-math	["-n", "-c", "[try drem(2; 3) catch \"E\"] | map(type)"]	-
+man-two-input-defined-fdim	manual-math	["-n", "-c", "[try fdim(2; 3) catch \"E\"] | map(type)"]	-
+man-two-input-defined-fmax	manual-math	["-n", "-c", "[try fmax(2; 3) catch \"E\"] | map(type)"]	-
+man-two-input-defined-fmin	manual-math	["-n", "-c", "[try fmin(2; 3) catch \"E\"] | map(type)"]	-
+man-two-input-defined-fmod	manual-math	["-n", "-c", "[try fmod(2; 3) catch \"E\"] | map(type)"]	-
+man-zero-arg-defined-frexp	manual-math	["-n", "-c", "[0.5 | try frexp catch \"E\"] | map(type)"]	-
+man-two-input-defined-hypot	manual-math	["-n", "-c", "[try hypot(2; 3) catch \"E\"] | map(type)"]	-
+man-two-input-defined-jn	manual-math	["-n", "-c", "[try jn(2; 3) catch \"E\"] | map(type)"]	-
+man-two-input-defined-ldexp	manual-math	["-n", "-c", "[try ldexp(2; 3) catch \"E\"] | map(type)"]	-
+man-zero-arg-defined-modf	manual-math	["-n", "-c", "[0.5 | try modf catch \"E\"] | map(type)"]	-
+man-two-input-defined-nextafter	manual-math	["-n", "-c", "[try nextafter(2; 3) catch \"E\"] | map(type)"]	-
+man-two-input-defined-nexttoward	manual-math	["-n", "-c", "[try nexttoward(2; 3) catch \"E\"] | map(type)"]	-
+man-two-input-defined-pow	manual-math	["-n", "-c", "[try pow(2; 3) catch \"E\"] | map(type)"]	-
+man-two-input-defined-remainder	manual-math	["-n", "-c", "[try remainder(2; 3) catch \"E\"] | map(type)"]	-
+man-two-input-defined-scalb	manual-math	["-n", "-c", "[try scalb(2; 3) catch \"E\"] | map(type)"]	-
+man-two-input-defined-scalbln	manual-math	["-n", "-c", "[try scalbln(2; 3) catch \"E\"] | map(type)"]	-
+man-two-input-defined-yn	manual-math	["-n", "-c", "[try yn(2; 3) catch \"E\"] | map(type)"]	-
+man-three-input-fma	manual-math	["-n", "-c", "fma(2;3;4)"]	-
+man-two-input-ignore-dot	manual-math	["-n", "-c", "\"x\" | pow(2;3)"]	-
+man-two-input-ignore-dot-atan2	manual-math	["-n", "-c", "[1] | atan2(1;1) | . * 4"]	-
+man-three-input-ignore-dot	manual-math	["-n", "-c", "{} | fma(1;2;3)"]	-
+man-one-input-non-number	manual-math	["-n", "-c", "try (\"a\"|sin) catch ."]	-
+man-one-input-null	manual-math	["-n", "-c", "try (null|floor) catch ."]	-
+man-one-input-array	manual-math	["-n", "-c", "try ([1]|sqrt) catch ."]	-
+man-two-input-non-number	manual-math	["-n", "-c", "try pow(\"a\";2) catch ."]	-
+man-two-input-multi	manual-math	["-n", "-c", "[pow(2,3;1,2)]"]	-
+man-two-input-multi-order	manual-math	["-n", "-c", "[atan2(1,2; 3,4)]|map(.*1000|floor)"]	-
+man-three-input-multi	manual-math	["-n", "-c", "[fma(1,2;3,4;5,6)]"]	-
+man-frexp-values	manual-math	["-n", "-c", "[8, 0, -3.5, 1e300]|map(frexp)"]	-
+man-modf-values	manual-math	["-n", "-c", "[3.7, -3.7, 0, 1e300]|map(modf)"]	-
+man-ldexp-values	manual-math	["-n", "-c", "[ldexp(1;10), ldexp(1;-1074), ldexp(1;2000)]"]	-
+man-scalb-values	manual-math	["-n", "-c", "[scalb(1;3), scalbln(1;3), scalbln(1;-2)]"]	-
+man-drem-values	manual-math	["-n", "-c", "[drem(5;3), drem(-5;3), drem(5;0)]|map(tostring)"]	-
+man-nearbyint-rounding	manual-math	["-n", "-c", "[0.5,1.5,2.5,-0.5,-1.5]|map(nearbyint)"]	-
+man-rint-rounding	manual-math	["-n", "-c", "[0.5,1.5,2.5,-0.5,-1.5]|map(rint)"]	-
+man-round-rounding	manual-math	["-n", "-c", "[0.5,1.5,2.5,-0.5,-1.5]|map(round)"]	-
+man-trunc-values	manual-math	["-n", "-c", "[1.9,-1.9,0.5]|map(trunc)"]	-
+man-significand-values	manual-math	["-n", "-c", "[8,10,0,-3]|map(significand)"]	-
+man-logb-values	manual-math	["-n", "-c", "[8,10,0.1,0]|map(logb)|map(tostring)"]	-
+man-gamma-values	manual-math	["-n", "-c", "[1,5,0.5]|map(gamma)|map(.*1000|floor)"]	-
+man-lgamma-r	manual-math	["-n", "-c", "[5|lgamma_r]"]	-
+man-pow10-values	manual-math	["-n", "-c", "[0,2,-1]|map(pow10)"]	-
+man-exp10-values	manual-math	["-n", "-c", "[0,2,-1]|map(exp10)"]	-
+man-infinite-nan-ops	manual-math	["-n", "-c", "[infinite, -infinite, nan]|map(isinfinite, isnan, isnormal)"]	-
+man-nan-tostring	manual-math	["-n", "-c", "[nan, -nan, infinite, -infinite]|map(tostring)"]	-
+man-nan-tojson	manual-math	["-n", "-c", "[nan, infinite]|tojson"]	-
+man-nan-output	manual-math	["-n", "-c", "nan, infinite, -infinite"]	-
+man-nan-in-array-output	manual-math	["-n", "-c", "[nan, infinite]"]	-
+man-nan-in-object-output	manual-math	["-n", "-c", "{a:nan}"]	-
+man-nan-key-sort	manual-math	["-n", "-c", "[nan, nan]|sort|length"]	-
+man-nan-unique	manual-math	["-n", "-c", "[nan, nan]|unique|length"]	-
+man-nan-group	manual-math	["-n", "-c", "[nan, nan]|group_by(.)|length"]	-
+man-nan-min-max	manual-math	["-n", "-c", "[[nan,1]|min, [nan,1]|max]|map(tostring)"]	-
+man-nan-index	manual-math	["-n", "-c", "[nan]|index(nan)"]	-
+man-nan-contains	manual-math	["-n", "-c", "[nan]|contains([nan])"]	-
+man-nan-inside	manual-math	["-n", "-c", "[nan] | inside([nan])"]	-
+man-nan-to-entries-key	manual-math	["-n", "-c", "{a:nan}|to_entries|.[0].value|isnan"]	-
+man-nan-tonumber	manual-math	["-n", "-c", "try (\"nan\"|tonumber) catch ."]	-
+man-nan-literal-doc	manual-math	["-c", "."]	"nan"
+man-nan-literal-doc-arr	manual-math	["-c", "."]	"[NaN, Infinity, -Infinity]"
+man-int-division	manual-math	["-n", "-c", "[5/2, -5/2, 1/3*3, 6/3]"]	-
+man-mod-rules	manual-math	["-n", "-c", "[5%3, -5%3, 5%-3, -5%-3, 5.9%3.1, 5%0.9]?"]	-
+man-mod-zero-error	manual-math	["-n", "-c", "try (5 % 0) catch ."]	-
+man-mod-nan-inf	manual-math	["-n", "-c", "[nan % 5, 5 % nan, infinite % 5, 5 % infinite, -infinite % 5]|map(tostring)"]	-
+man-mod-large	manual-math	["-n", "-c", "[1e19 % 7, -1e19 % 7, 5 % 1e19]"]	-
+man-div-zero-error	manual-math	["-n", "-c", "try (1/0) catch ."]	-
+man-div-zero-zero	manual-math	["-n", "-c", "try (0/0) catch ."]	-
+man-div-by-negzero	manual-math	["-n", "-c", "try (1 / -0) catch ."]	-
+man-arith-overflow	manual-math	["-n", "-c", "[1e308 + 1e308, -1e308 - 1e308, 1e308 * 1e308]|map(tostring)"]	-
+man-arith-string-number	manual-math	["-n", "-c", "try (\"a\" + 1) catch ."]	-
+man-arith-null-identity	manual-math	["-n", "-c", "[null + 1, 1 + null, null + null, null + \"a\", null + [1], null + {a:1}]"]	-
+man-arith-neg-string	manual-math	["-n", "-c", "try (-\"a\") catch ."]	-
+man-arith-neg-null	manual-math	["-n", "-c", "try (-null) catch ."]	-
+man-arith-array-minus	manual-math	["-n", "-c", "[1,2,3,2,1] - [2]"]	-
+man-arith-object-mul-recursive	manual-math	["-n", "-c", "{\"a\":{\"b\":1},\"c\":2} * {\"a\":{\"d\":3},\"c\":{\"e\":4}}"]	-
+man-arith-string-mul	manual-math	["-n", "-c", "[\"ab\" * 3, \"ab\" * 0, \"ab\" * 0.5, \"ab\" * 1.5, 3 * \"ab\"]"]	-
+man-arith-string-mul-negative	manual-math	["-n", "-c", "\"ab\" * -1"]	-
+man-arith-string-div	manual-math	["-n", "-c", "\"a,b, cd,e\" / \", \""]	-
+man-arith-string-div-empty	manual-math	["-n", "-c", "[\"abc\" / \"\", \"\" / \"a\", \"\" / \"\"]"]	-
+man-arith-object-add-order	manual-math	["-n", "-c", "{\"b\":1} + {\"a\":2, \"b\":3}"]	-
+man-arith-array-div	manual-math	["-n", "-c", "try ([1] / [2]) catch ."]	-
+man-arith-number-compare-large	manual-math	["-n", "-c", "[9007199254740992 == 9007199254740993, 1e17 + 1 == 1e17]"]	-
+man-input-first-lost	manual-io	["-c", "[., input]"]	"1 2 3 4"
+man-input-interleaved	manual-io	["-c", "[., input]"]	"1 2 3"
+man-inputs-reduce	manual-io	["-n", "reduce inputs as $i (0; . + $i)"]	"1 2 3"
+man-inputs-without-n	manual-io	["-c", "[inputs]"]	"1 2 3"
+man-inputs-empty	manual-io	["-n", "-c", "[inputs]"]	""
+man-input-none-left	manual-io	["-n", "-c", "try input catch ."]	""
+man-input-after-all	manual-io	["-c", "[., (try input catch \"none\")]"]	"1"
+man-debug-passthrough	manual-io	["-n", "-c", "[1|debug]"]	-
+man-debug-msg-passthrough	manual-io	["-n", "-c", "1 as $x | 2 | debug(\"a \\($x)\", .) | (.+1)"]	-
+man-debug-multi-msgs	manual-io	["-n", "-c", "[debug(1,2)]"]	-
+man-debug-empty-msgs	manual-io	["-n", "-c", "[debug(empty)]"]	-
+man-stderr-passthrough	manual-io	["-n", "-c", "\"a\\nb\" | stderr"]	-
+man-stderr-number	manual-io	["-n", "-c", "1.0|stderr"]	-
+man-stderr-object	manual-io	["-n", "-c", "{\"a\":[1,2]}|stderr|length"]	-
+man-input-line-number-lines	manual-io	["-c", "input_line_number"]	"1\n2\n\n3"
+man-input-line-number-no-newline	manual-io	["-c", "input_line_number"]	"1\n2"
+man-input-line-number-multi-on-line	manual-io	["-c", "input_line_number"]	"1 2\n3 4\n"
+man-input-line-number-null-input	manual-io	["-n", "input_line_number"]	-
+man-streaming-truncate	manual-io	["-n", "-c", "[1|truncate_stream([[0],1],[[1,0],2],[[1,0]],[[1]])]"]	-
+man-streaming-truncate-expr-input	manual-io	["-n", "-c", "[1|truncate_stream([[0],1],[[1,0],2],[[1,0]],[[1]])]"]	-
+man-streaming-truncate-depth-2	manual-io	["-n", "-c", "[2|truncate_stream([[0],1],[[1,0],2],[[1,0]],[[1]])]"]	-
+man-streaming-truncate-depth-0	manual-io	["-n", "-c", "[0|truncate_stream([[0],1],[[1,0],2],[[1,0]],[[1]])]"]	-
+man-streaming-truncate-stream-input	manual-io	["-n", "-c", "[[1,0],2],[[1,0]],[[1]] | [1|truncate_stream(.)]"]	-
+man-streaming-truncate-one-arg	manual-io	["-n", "-c", "[[0,[1]] | tostream] | map(select(length==2)) | length"]	-
+man-streaming-truncate-via-input	manual-io	["-n", "-c", "[1|truncate_stream([[0],1],[[1,0],2],[[1,0]],[[1]])]"]	-
+man-streaming-fromstream	manual-io	["-n", "-c", "fromstream(1|truncate_stream([[0],1],[[1,0],2],[[1,0]],[[1]]))"]	-
+man-streaming-fromstream-top	manual-io	["-n", "-c", "fromstream([[0],1],[[1,0],2],[[1,0]],[[1]])"]	-
+man-streaming-fromstream-scalar	manual-io	["-n", "-c", "fromstream([[],3])"]	-
+man-streaming-fromstream-empty-containers	manual-io	["-n", "-c", "[fromstream(([],{},[[]],[{}])|tostream)]"]	-
+man-streaming-fromstream-multi-tops	manual-io	["-n", "-c", "[fromstream(([1],[2,3],{\"a\":4})|tostream)]"]	-
+man-streaming-fromstream-incomplete	manual-io	["-n", "-c", "[fromstream([[0],1])]"]	-
+man-streaming-fromstream-bad	manual-io	["-n", "-c", "try [fromstream(1)] catch ."]	-
+man-streaming-fromstream-nested	manual-io	["-n", "-c", "[fromstream({\"a\":[1,{\"b\":2}]}|tostream)]"]	-
+man-streaming-tostream	manual-io	["-n", "-c", "[0,[1,{\"a\":1},{\"b\":2}]] | [tostream]"]	-
+man-streaming-tostream-roundtrip	manual-io	["-c", ". as $dot|fromstream($dot|tostream)|.==$dot"]	"[0,[1,{\"a\":1},{\"b\":2}]]"
+man-streaming-tostream-scalar	manual-io	["-n", "-c", "[1,\"a\",null,true]|map([tostream])"]	-
+man-streaming-tostream-empty	manual-io	["-n", "-c", "[[],{},[[]],{\"a\":{}}]|map([tostream])"]	-
+man-streaming-tostream-object-key-order	manual-io	["-n", "-c", "{\"b\":1,\"a\":2}|[tostream]"]	-
+man-streaming-flag-forms	manual-io	["-c", "--stream", "."]	"[0,[1]]"
+man-streaming-flag-scalar	manual-io	["-c", "--stream", "."]	"\"a\""
+man-streaming-flag-empty-containers	manual-io	["-c", "--stream", "."]	"[[],\"a\",[\"b\"]]"
+man-streaming-flag-end-forms	manual-io	["-c", "--stream", "length"]	"{\"a\":[1,{\"b\":2}]}"
+man-streaming-flag-multi	manual-io	["-c", "--stream", "."]	"[1] {\"a\":2} 3"
+man-streaming-flag-getpath	manual-io	["-c", "--stream", "-r", "select(length==2)|.[0]|join(\".\")?"]	"{\"a\":{\"b\":1}}"
+man-streaming-reduce-count	manual-io	["-c", "--stream", "-n", "reduce (inputs|select(length==2)) as $e (0;.+1)"]	"[1,[2,3],{\"a\":4}]"
+man-streaming-fromstream-inputs	manual-io	["-c", "--stream", "-n", "fromstream(inputs)"]	"{\"a\":[1,2]} [3]"
+man-streaming-fromstream-1-truncate-inputs	manual-io	["-c", "--stream", "-n", "fromstream(1|truncate_stream(inputs))"]	"{\"a\":[1,2],\"b\":3}"
+man-streaming-errors-example	manual-io	["-c", "--stream-errors", "."]	"[\"a\",n]"
+man-streaming-errors-implies-stream	manual-io	["-c", "--stream-errors", "."]	"[1,2]"
+man-streaming-no-errors-without-flag	manual-io	["-c", "--stream", "."]	"[1,2"
+man-streaming-seq-flag	manual-io	["-c", "--stream", "--seq", "."]	"[1]"
+man-streaming-stream-slurp	manual-io	["-c", "--stream", "-s", "."]	"[1] 2"
+man-streaming-stream-raw-input	manual-io	["-c", "--stream", "-R", "."]	"[1]"
+man-streaming-limit-inputs	manual-io	["-c", "--stream", "-n", "[limit(2; inputs)]"]	"[1,2]"
+man-streaming-first-inputs	manual-io	["-c", "--stream", "-n", "first(inputs)"]	"[1,2]"
+man-streaming-input-line-number	manual-io	["-c", "--stream", "[., input_line_number]"]	"[1,\n2]\n"
+man-assign-rhs-input-is-dot	manual-assignment	["-c", ".a = .b"]	"{\"a\":1,\"b\":2}"
+man-assign-rhs-multi	manual-assignment	["-c", "[.a = (1,2)]"]	"{\"a\":0}"
+man-assign-lhs-multi-paths	manual-assignment	["-c", "(.a, .b) = 9"]	"{\"a\":0,\"b\":0}"
+man-assign-update-empty-deletes	manual-assignment	["-c", "(.[] | select(. >= 2)) |= empty"]	"[1,5,3,0,7]"
+man-assign-update-rhs-first-only	manual-assignment	["-c", "(.a, .b) |= (1, 2)"]	"{\"a\":0,\"b\":0}"
+man-assign-update-arith	manual-assignment	["-c", ".a += 1, .a -= 1, .a *= 3, .a /= 2, .a %= 2, .a //= 9"]	"{\"a\":4}"
+man-assign-update-arith-rhs-input	manual-assignment	["-c", ".a += .b"]	"{\"a\":1,\"b\":2}"
+man-assign-update-arith-rhs-multi	manual-assignment	["-c", "[.a += (1,2)]"]	"{\"a\":1}"
+man-assign-update-arith-lhs-multi	manual-assignment	["-c", "(.a,.b) += 1"]	"{\"a\":1,\"b\":2}"
+man-assign-alt-update	manual-assignment	["-c", ".a //= 3, .b //= 3"]	"{\"a\":null,\"b\":2}"
+man-assign-alt-update-false	manual-assignment	["-c", ".a //= 3"]	"{\"a\":false}"
+man-assign-complex-lhs	manual-assignment	["-c", ".[] |= (.+1)"]	"[1,2]"
+man-assign-paths-create	manual-assignment	["-c", ".a.b.c = 1"]	"null"
+man-assign-paths-negative-index	manual-assignment	["-c", ".[-1] = 9"]	"[1,2,3]"
+man-assign-paths-negative-index-out	manual-assignment	["-c", "try (.[-5] = 9) catch ."]	"[1,2,3]"
+man-assign-paths-slice	manual-assignment	["-c", ".[1:2] = [\"x\",\"y\"]"]	"[1,2,3]"
+man-assign-paths-slice-null	manual-assignment	["-c", ".[1:] = null"]	"[1,2,3]"
+man-assign-paths-slice-update	manual-assignment	["-c", ".[1:] |= map(.*2)"]	"[1,2,3]"
+man-assign-paths-extend-array	manual-assignment	["-c", ".[5] = 1"]	"[1]"
+man-assign-paths-null-to-array	manual-assignment	["-c", ".[2] = 1"]	"null"
+man-assign-paths-null-to-object	manual-assignment	["-c", ".a = 1"]	"null"
+man-assign-paths-type-error	manual-assignment	["-c", "try (.a = 1) catch ."]	"[1]"
+man-assign-paths-dollar-var	manual-assignment	["-c", "1 as $x | .[$x] = 9"]	"[1,2,3]"
+man-assign-paths-getpath	manual-assignment	["-c", "getpath([\"a\",\"b\"]) = 5"]	"null"
+man-assign-paths-first	manual-assignment	["-c", "first(.[]) = 9"]	"[1,2,3]"
+man-assign-paths-select	manual-assignment	["-c", "(.[] | select(. > 1)) = 0"]	"[1,2,3]"
+man-assign-paths-recurse	manual-assignment	["-c", "(..|numbers) |= .+1"]	"[1,[2,{\"a\":3}]]"
+man-assign-paths-if	manual-assignment	["-c", "(if .a then .b else .c end) = 9"]	"{\"a\":true,\"b\":0,\"c\":0}"
+man-assign-paths-alt	manual-assignment	["-c", "(.a // .b) = 9"]	"{\"a\":null,\"b\":0}"
+man-assign-paths-reduce-foreach-labels	manual-assignment	["-c", "(reduce path(.a) as $p (.; .)) = 1"]	"{\"a\":0}"
+man-assign-paths-literal-lhs	manual-assignment	["-n", "-c", "try (1 = 2) catch ."]	-
+man-assign-paths-empty-lhs	manual-assignment	["-c", "empty = 1"]	"{}"
+man-assign-paths-error-lhs	manual-assignment	["-c", "try (error(\"x\") = 1) catch ."]	"{}"
+man-assign-delete-multiple	manual-assignment	["-c", "del(.[0], .[2])"]	"[1,2,3,4]"
+man-assign-delete-slice	manual-assignment	["-c", "del(.[1:3])"]	"[1,2,3,4]"
+man-assign-delete-select	manual-assignment	["-c", "del(.[] | select(. == 2))"]	"[1,2,3,2]"
+man-assign-delete-missing	manual-assignment	["-c", "del(.x)"]	"{\"a\":1}"
+man-assign-delete-null	manual-assignment	["-c", "del(.a)"]	"null"
+man-assign-delete-recursive	manual-assignment	["-c", "del(..|select(. == 1))"]	"[1,[1,2],{\"a\":1}]"
+man-assign-delete-whole	manual-assignment	["-c", "del(.)"]	"[1]"
+man-assign-delete-type-error	manual-assignment	["-c", "try del(.a) catch ."]	"[1]"
+man-assign-to-entries-roundtrip	manual-assignment	["-c", "to_entries|from_entries"]	"{\"a\":1,\"b\":2}"
+man-assign-setpath-delpaths	manual-assignment	["-c", "setpath([\"a\",0]; 1) | delpaths([[\"a\",0]])"]	"null"
+man-assign-complex-merge	manual-assignment	["-c", ".a += {b:2}"]	"{\"a\":{\"c\":1}}"
+man-assign-complex-merge-arrays	manual-assignment	["-c", ".a += [3]"]	"{\"a\":[1]}"
+man-assign-complex-multiply-objects	manual-assignment	["-c", ".a *= {b:{c:2}}"]	"{\"a\":{\"b\":{\"d\":1}}}"
+man-assign-update-with-error-in-rhs	manual-assignment	["-c", "try (.a |= error(\"x\")) catch ."]	"{\"a\":1}"
+man-assign-update-keeps-order	manual-assignment	["-c", ".b = 1"]	"{\"b\":0,\"a\":0}"
+man-assign-update-new-key-order	manual-assignment	["-c", ".c = 1"]	"{\"b\":0,\"a\":0}"
+man-assign-update-array-of-objects	manual-assignment	["-c", ".[].a |= .+1"]	"[{\"a\":1},{\"a\":2},{\"b\":3}]"
+man-assign-update-null-path-optional	manual-assignment	["-c", "(.a?) = 1"]	"[1]"
+man-assign-update-optional-lhs	manual-assignment	["-c", ".[]? |= 1"]	"5"
+man-assign-update-pick	manual-assignment	["-c", "pick(.a, .b.c)"]	"{\"a\":1,\"b\":{\"c\":2,\"d\":3},\"e\":4}"
+man-assign-update-limit-path	manual-assignment	["-c", "limit(2; .[]) |= 0"]	"[1,2,3]"
+man-assign-update-paths-with-var	manual-assignment	["-c", ". as $d | path(..) | select(length == 1)"]	"{\"a\":1,\"b\":2}"
