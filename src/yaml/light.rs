@@ -5930,10 +5930,12 @@ impl<'a> YamlString<'a> {
     }
 
     /// Whether this source single-quoted scalar may hold a line feed: its source spans a line, the
-    /// only way a `\n` gets into one (an empty line; a single break folds to a space, #6058).
+    /// only way a `\n` gets into one (an empty line; a single break folds to a space, #6058). A lone
+    /// CR breaks a line too.
     #[must_use]
     pub(crate) fn may_hold_line_feed(&self) -> bool {
-        matches!(self, Self::SingleQuoted { .. }) && self.raw_bytes().contains(&b'\n')
+        matches!(self, Self::SingleQuoted { .. })
+            && self.raw_bytes().iter().any(|&b| matches!(b, b'\n' | b'\r'))
     }
 
     /// Whether this source scalar may hold U+2028 or U+2029, by a scan of its source bytes for the
@@ -9338,22 +9340,27 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
     if let (Some((scalar_indent, step)), Some(YamlValue::String(string))) =
         (&item_indent, &resolved)
     {
-        // #6058: a single-quoted item with an empty line keeps its quotes across the break.
-        if string.may_hold_line_feed() {
+        // #6058: a single-quoted item with an empty line keeps its quotes across the break, and
+        // #4865: one holding U+2028/U+2029 is spelled across lines too. One decode serves both.
+        let (feed, separator) = (
+            string.may_hold_line_feed(),
+            string.may_hold_unicode_line_separator(),
+        );
+        if feed || separator {
             if let Ok(text) = string.as_str() {
-                if let Some(scalar) = go_yaml_single_quoted_line_feed(&text, scalar_indent) {
-                    if let Some(tag) = value.explicit_tag_at(resolved.as_ref()) {
-                        out.write_str(tag)?;
-                        out.write_char(' ')?;
-                    }
-                    return Ok(out.write_str(&scalar)?);
+                let scalar = if feed {
+                    go_yaml_single_quoted_line_feed(&text, scalar_indent)
+                } else {
+                    None
                 }
-            }
-        }
-        if string.may_hold_unicode_line_separator() {
-            if let Ok(text) = string.as_str() {
-                if let Some(scalar) = go_yaml_unicode_separator_scalar(&text, scalar_indent, *step)
-                {
+                .or_else(|| {
+                    if separator {
+                        go_yaml_unicode_separator_scalar(&text, scalar_indent, *step)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(scalar) = scalar {
                     if let Some(tag) = value.explicit_tag_at(resolved.as_ref()) {
                         out.write_str(tag)?;
                         out.write_char(' ')?;

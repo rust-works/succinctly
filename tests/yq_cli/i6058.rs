@@ -44,6 +44,19 @@ const ROWS: &[(&str, &str, &str)] = &[
         ".",
         "---\na: 'x\n\n  y'\n---\nb: 'p\n\n  q'\n",
     ),
+    // Lines broken by a lone CR, and a CRLF source, read as the same breaks.
+    ("a: 'x\r\r y'\n", ".", "a: 'x\n\n  y'\n"),
+    ("a: 'x\r\n\r\ny'\n", ".", "a: 'x\n\n  y'\n"),
+    // A trailing break inside a nested mapping leaves the closing quote at the start of its line.
+    ("k:\n  a: 'x\n\n'\n", ".", "k:\n  a: 'x\n\n'\n"),
+    // A tab beside the break stops single quotes.
+    ("a: 'x\n\ny\tz'\n", ".", "a: \"x\\ny\\tz\"\n"),
+    // A flow item rewritten with `style=`.
+    (
+        "a: [x]\n",
+        ".a[0] = \"p\\nq\" | .a[0] style=\"single\"",
+        "a: ['p\n\n    q']\n",
+    ),
     // A space next to the break stops single quotes (go-yaml's analysis): the value is the same.
     ("a: 'x \n\ny'\n", ".", "a: 'x\n\n  y'\n"),
     // A write elsewhere in the document keeps the scalar, and `style=` re-spells it.
