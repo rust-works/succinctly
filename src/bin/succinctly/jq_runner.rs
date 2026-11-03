@@ -9970,48 +9970,71 @@ struct LazyScan {
 /// number or literal directly before the fault is left to it too: jq never reads one the fault's
 /// own byte completes (`1 2 3}` is `1 2` and then the error, [`bare_token_lost_to_fault`]).
 fn lazy_json_scan(raw: &str) -> LazyScan {
-    let none = LazyScan {
+    let mut chunk = lazy_json_scan_chunk(raw, 0, usize::MAX);
+    // The prefix is kept for the whole run; the stream's full count of documents is not.
+    chunk.spans.shrink_to_fit();
+    LazyScan {
+        spans: chunk.spans,
+        clean: chunk.end == ChunkEnd::Done,
+    }
+}
+
+/// How far a [`LazyChunk`] got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkEnd {
+    /// The chunk's documents are clean and more text follows them.
+    More,
+    /// The chunk's documents are clean and are the last of the stream.
+    Done,
+    /// A fault, a BOM, a document too deep to convert lazily or a disagreement between the two
+    /// parsers follows the chunk's documents (or, with none, starts the text).
+    Fault,
+}
+
+/// The documents [`lazy_json_scan_chunk`] found, and what follows them.
+struct LazyChunk {
+    spans: Vec<(usize, usize)>,
+    end: ChunkEnd,
+}
+
+/// [`lazy_json_scan`] a piece at a time (#5856): the documents of `raw` from byte `from`, a
+/// document start or white space before one, up to the first that ends `budget` bytes or more on.
+/// The scan of a stream is the sum of its chunks', each of which the two parsers check against each
+/// other over the chunk's text alone, so a program that stops early pays for the chunks it read.
+///
+/// The first chunk (`from == 0`) also answers for a BOM and a text of white space only, which are
+/// no lazy stream. A chunk never ends on a number or literal directly followed by another byte
+/// (`split_json_values_until`): that byte may be a fault that takes it, which the eager reader is
+/// the one to decide.
+fn lazy_json_scan_chunk(raw: &str, from: usize, budget: usize) -> LazyChunk {
+    let none = LazyChunk {
         spans: Vec::new(),
-        clean: false,
+        end: ChunkEnd::Fault,
     };
-    if raw.starts_with('\u{feff}') {
+    if from == 0 && (raw.starts_with('\u{feff}') || raw.trim().is_empty()) {
         return none;
     }
-    let lead = raw.len() - raw.trim_start().len();
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return none;
-    }
-    let mut clean = true;
-    let mut ends = Vec::new();
-    let mut stream =
-        serde_json::Deserializer::from_str(trimmed).into_iter::<serde::de::IgnoredAny>();
-    while let Some(value) = stream.next() {
-        if value.is_err() {
-            clean = false;
-            break;
-        }
-        ends.push(lead + stream.byte_offset());
-    }
-    // Past a fault `serde_json` found, the splitter's documents are not needed: it reads only the
-    // region `serde_json` accepted, so an early fault does not cost a pass over the whole stream.
-    let region = if clean {
-        raw.as_bytes()
-    } else {
-        &raw.as_bytes()[..ends.last().copied().unwrap_or(0)]
-    };
-    let (mut spans, split_error) = split_json_values(region);
-    clean &= split_error.is_none();
-    // Where the two parsers stop agreeing on a document's end, the stream stops being lazy.
-    let agreed = spans
-        .iter()
-        .zip(&ends)
-        .take_while(|&(&(_, end), &serde_end)| end == serde_end)
-        .count();
-    clean &= agreed == spans.len() && agreed == ends.len();
-    spans.truncate(agreed);
-    // A document too deep to convert lazily ends the lazy prefix there.
     let bytes = raw.as_bytes();
+    let (mut spans, split_error, stopped) =
+        split_json_values_until(bytes, from, from.saturating_add(budget));
+    let mut fault = split_error.is_some();
+    // Where the two parsers stop agreeing on a document's end, the stream stops being lazy.
+    if let (Some(&(first, _)), Some(&(_, last))) = (spans.first(), spans.last()) {
+        let mut stream = serde_json::Deserializer::from_str(&raw[first..last])
+            .into_iter::<serde::de::IgnoredAny>();
+        let agreed = spans
+            .iter()
+            .take_while(|&&(_, end)| {
+                stream.next().is_some_and(|value| value.is_ok())
+                    && first + stream.byte_offset() == end
+            })
+            .count();
+        if agreed < spans.len() {
+            fault = true;
+            spans.truncate(agreed);
+        }
+    }
+    // A document too deep to convert lazily ends the lazy prefix there.
     let shallow = spans
         .iter()
         .take_while(|&&(start, end)| {
@@ -10019,20 +10042,33 @@ fn lazy_json_scan(raw: &str) -> LazyScan {
                 || json_depth_at_most(&bytes[start..end], LAZY_JSON_MAX_DEPTH)
         })
         .count();
-    clean &= shallow == spans.len();
-    spans.truncate(shallow);
-    // The prefix is kept for the whole run; the stream's full count of documents is not.
-    spans.shrink_to_fit();
-    // The last document before a fault, when it is a number or literal, is the eager route's to
-    // decide: the fault's own byte may complete it, and jq then never reads it.
-    if !clean {
+    if shallow < spans.len() {
+        fault = true;
+        spans.truncate(shallow);
+    }
+    if fault {
+        // The last document before a fault, when it is a number or literal, is the eager route's
+        // to decide: the fault's own byte may complete it, and jq then never reads it.
         if let Some(&(start, _)) = spans.last() {
             if !matches!(bytes[start], b'{' | b'[' | b'"') {
                 spans.pop();
             }
         }
     }
-    LazyScan { spans, clean }
+    let end = if fault {
+        ChunkEnd::Fault
+    } else if stopped
+        && spans.last().is_some_and(|&(_, last)| {
+            bytes[last..]
+                .iter()
+                .any(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        })
+    {
+        ChunkEnd::More
+    } else {
+        ChunkEnd::Done
+    };
+    LazyChunk { spans, end }
 }
 
 /// [`find_json_values`] without discarding what it found before a failure:
@@ -10045,8 +10081,23 @@ fn lazy_json_scan(raw: &str) -> LazyScan {
 /// emit values use this to do the same; the scan itself is unchanged, so the
 /// hot input path does exactly the work it did before.
 fn split_json_values(bytes: &[u8]) -> (Vec<(usize, usize)>, Option<usize>) {
+    let (values, error, _) = split_json_values_until(bytes, 0, usize::MAX);
+    (values, error)
+}
+
+/// [`split_json_values`] from `from`, which stops after the first value that ends at `stop_at` or
+/// later and that jq reads whatever follows it: a string or container, or a number or literal
+/// followed by white space. A number or literal directly followed by another byte is read with it
+/// (the byte may be the fault that completes it). The flag says the stop was made, with the text
+/// not yet at its end (#5856).
+#[inline(always)]
+fn split_json_values_until(
+    bytes: &[u8],
+    from: usize,
+    stop_at: usize,
+) -> (Vec<(usize, usize)>, Option<usize>, bool) {
     let mut values = Vec::new();
-    let mut pos = 0;
+    let mut pos = from;
 
     while pos < bytes.len() {
         // Skip whitespace: space, tab, LF and CR only, as jq's lexer does; a form feed starts a
@@ -10071,17 +10122,25 @@ fn split_json_values(bytes: &[u8]) -> (Vec<(usize, usize)>, Option<usize>) {
                 if !matches!(bytes[start], b'{' | b'[' | b'"')
                     && bytes.get(end).is_some_and(|&b| !is_jq_token_boundary(b)) =>
             {
-                return (values, Some(start));
+                return (values, Some(start), false);
             }
             Some(end) => {
                 values.push((start, end));
                 pos = end;
+                if end >= stop_at
+                    && (matches!(bytes[start], b'{' | b'[' | b'"')
+                        || bytes
+                            .get(end)
+                            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r')))
+                {
+                    return (values, None, true);
+                }
             }
-            None => return (values, Some(start)),
+            None => return (values, Some(start), false),
         }
     }
 
-    (values, None)
+    (values, None, false)
 }
 
 /// Whether `b` ends a bare token in jq's lexer: space, tab, CR, LF and `"[{,:]}` (`jv_parse.c`;
