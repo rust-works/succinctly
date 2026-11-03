@@ -97065,7 +97065,6 @@ fn parse_signed_field(
     Ok(if negative { -digits } else { digits })
 }
 
-/// Parse up to n digits from input
 /// `%d` and `%e` (#5974). Both read a day of up to two digits, but the pinned libc lets white space
 /// stand before them. A white-space character takes the place of the first digit: `%d` reads `" 5"`
 /// and `"\t5"` as day 5, and refuses `"  5"` (the second space is no digit) and `" 05"` (one digit
@@ -97093,6 +97092,7 @@ fn parse_day_of_month(
     Ok(day)
 }
 
+/// Parse up to n digits from input
 fn parse_digits(
     input: &mut core::iter::Peekable<core::str::Chars>,
     max_digits: usize,

@@ -3,8 +3,8 @@
 //! refuses `"  5"` and `" 05"`, `%e` skips one white-space character first and then reads as `%d`
 //! does, a day above 31 is refused where it is read, and `%D`, `%F`, `%c` and `%x` read their day the
 //! same way (they stand for `%d`). Every expectation was captured from jq 1.7.1 (`/usr/bin/jq`,
-//! macOS). Only the first six fields are compared: the weekday of January 1900 is the macOS routine's
-//! (#5946), and the yearday follows the date.
+//! macOS). Most rows compare the first six fields only: the weekday of January 1900 is the macOS
+//! routine's (#5946); the rows that name a year compare the whole array.
 
 use anyhow::Result;
 
@@ -93,4 +93,38 @@ fn a_day_reads_the_white_space_before_it_as_the_libc_does() -> Result<()> {
             Some("[2015,2,5,10,11,12]"),
         ),
     ])
+}
+
+/// Vertical tab, form feed and carriage return are white space to the libc as space, tab and newline
+/// are (`is_c_space`).
+#[test]
+fn every_c_white_space_character_pads_a_day() -> Result<()> {
+    check(&[
+        ("%d", "\x0b5", Some("[1900,0,5,0,0,0]")),
+        ("%d", "\x0c5", Some("[1900,0,5,0,0,0]")),
+        ("%d", "\r5", Some("[1900,0,5,0,0,0]")),
+        ("%e", "\x0b\x0c5", Some("[1900,0,5,0,0,0]")),
+    ])
+}
+
+/// A padded day lands on the weekday and yearday of its date, not only in the first six fields.
+#[test]
+fn a_padded_day_has_its_weekday_and_yearday() -> Result<()> {
+    for (fmt, input) in [
+        ("%F", "2015-03- 5"),
+        ("%Y-%m-%e", "2015-03-  5"),
+        ("%D", "03/\t5/15"),
+        ("%Y %m %e", "2015 03 \x0b5"),
+    ] {
+        let (out, code) = run_jq_null(
+            "$i|strptime($f)",
+            &["-c", "--arg", "i", input, "--arg", "f", fmt],
+        )?;
+        assert_eq!(
+            (out.trim_end(), code),
+            ("[2015,2,5,0,0,0,4,63]", 0),
+            "{input:?} | strptime({fmt:?})"
+        );
+    }
+    Ok(())
 }
