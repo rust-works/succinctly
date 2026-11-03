@@ -15620,10 +15620,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // cursor threaded into every slot -- the wildcard bridge below materialized
         // and reindexed the whole ambient value to read a field of it, so
         // `[.users[] | "\(.name)"]` and `map("\(.name)")` copied every record.
-        // Every other slot, and yq mode (`eval::eval_string_interpolation`: its slots
-        // take only a first value, which this recursion does not model), keep the bridge.
+        // Every other slot keeps the bridge. yq mode (#6092) reads its slots here as well, a
+        // first value each (`yq_interpolation_text`; `eval::eval_string_interpolation` is its
+        // bridge twin), because its slots are `to_string` stages that need the node's own style.
         Expr::StringInterpolation(parts)
-            if S::TAG != EvalTag::Yq && interpolation_reads_by_navigation(parts) =>
+            if interpolation_reads_by_navigation(parts, S::TAG == EvalTag::Yq) =>
         {
             collect_string_interpolation_generic::<S, V>(parts, &value, optional, cursor)
         }
@@ -16608,7 +16609,9 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // its original shape, one call, and decides inside: this function is on every
         // recursion's path, and a second arm grew its debug frame past ADR-0025's floor
         // (`test_literal_dollar_argument_matches_jq_3260`).
-        Expr::StringInterpolation(_) if S::TAG != EvalTag::Yq => {
+        Expr::StringInterpolation(parts)
+            if S::TAG != EvalTag::Yq || interpolation_reads_by_navigation(parts, true) =>
+        {
             each_string_interpolation_generic::<S, V>(expr, value, cursor, optional, sink)
         }
         // -- #1556's `eval.rs` twin, mirrored here at last (#2180 WP2b): the
@@ -22847,24 +22850,65 @@ const MAX_CURSOR_INTERPOLATION_PARTS: usize = 64;
 /// bridge, which evaluates the whole interpolation against one copy of the ambient value. The
 /// walk is bounded by the slot's own text (the parser caps expression nesting at 256) and never
 /// enters a nested interpolation, so it cannot compound with nesting depth.
-fn interpolation_reads_by_navigation(parts: &[StringPart]) -> bool {
-    fn navigation(expr: &Expr) -> bool {
+///
+/// `yq` is yq mode (#6092), whose parser wraps every slot in a `to_string` stage: that one
+/// stage is admitted, so the slot is still read at the cursor and `to_string` sees the node's
+/// own style.
+fn interpolation_reads_by_navigation(parts: &[StringPart], yq: bool) -> bool {
+    fn navigation(expr: &Expr, yq: bool) -> bool {
         match expr {
             Expr::Identity
             | Expr::Field(_)
             | Expr::Index { .. }
             | Expr::Iterate
             | Expr::Literal(_) => true,
-            Expr::Optional(inner) | Expr::Paren(inner) => navigation(inner),
-            Expr::Pipe(stages) => stages.iter().all(navigation),
+            Expr::Builtin(Builtin::ToString) => yq,
+            // `.a // "d"` reads the node `.a` reached, as `.a` does: yq mode only, because a jq
+            // slot of that shape has always kept the owned bridge.
+            Expr::Alternative(left, right) => yq && navigation(left, yq) && navigation(right, yq),
+            Expr::Optional(inner) | Expr::Paren(inner) => navigation(inner, yq),
+            Expr::Pipe(stages) => stages.iter().all(|stage| navigation(stage, yq)),
             _ => false,
         }
     }
     parts.len() <= MAX_CURSOR_INTERPOLATION_PARTS
         && parts.iter().all(|part| match part {
             StringPart::Literal(_) => true,
-            StringPart::Expr(expr) => navigation(expr),
+            StringPart::Expr(expr) => navigation(expr, yq),
         })
+}
+
+/// yq mode's interpolation read at the cursor (#6092): the text of the first value of each
+/// `\(...)` slot, as `eval::eval_string_interpolation_single_value` takes it, with a slot that
+/// raises (or breaks, or halts) ending the string at once. The slots are already
+/// `to_string` stages ([`interpolation_reads_by_navigation`]), so a container reaches the string as
+/// its YAML text in the style the node was written in.
+fn yq_interpolation_text<S: EvalSemantics, V: DocumentValue>(
+    parts: &[StringPart],
+    value: &V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> Result<String, Control> {
+    let mut text = String::new();
+    for part in parts {
+        match part {
+            StringPart::Literal(literal) => text.push_str(literal),
+            StringPart::Expr(expr) => {
+                let mut vals = Vec::new();
+                let trailing = push_generic_owned_values::<_, S>(
+                    eval_single::<S, V>(expr, value.clone(), optional, cursor),
+                    &mut vals,
+                );
+                if let Some(control) = trailing {
+                    return Err(control);
+                }
+                if let Some(first) = vals.first() {
+                    text.push_str(&crate::jq::eval::owned_to_string::<S>(first));
+                }
+            }
+        }
+    }
+    Ok(text)
 }
 
 /// [`eval_each_generic`]'s jq-mode `Expr::StringInterpolation` arm, out of line (#5305): an
@@ -22883,8 +22927,17 @@ fn each_string_interpolation_generic<S: EvalSemantics, V: DocumentValue>(
     let Expr::StringInterpolation(parts) = expr else {
         unreachable!("only the interpolation arm calls this"); // patchcov: coverage tolerate-line reason="unreachable: the one call site matches Expr::StringInterpolation"
     };
-    if !interpolation_reads_by_navigation(parts) {
+    if !interpolation_reads_by_navigation(parts, S::TAG == EvalTag::Yq) {
         return bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink);
+    }
+    if S::TAG == EvalTag::Yq {
+        return match yq_interpolation_text::<S, V>(parts, &value, optional, cursor) {
+            Ok(text) => match sink.push(GenericItem::Owned(OwnedValue::String(text.into()))) {
+                Demand::Continue => Flow::Exhausted,
+                Demand::Stop => Flow::Stopped { pending: None },
+            },
+            Err(control) => Flow::Escaped(control),
+        };
     }
     let mut slots: Vec<String> = vec![String::new(); parts.len()];
     each_string_parts_generic::<S, V>(parts, value, optional, cursor, &mut slots, sink)
@@ -22898,6 +22951,12 @@ fn collect_string_interpolation_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    if S::TAG == EvalTag::Yq {
+        return match yq_interpolation_text::<S, V>(parts, value, optional, cursor) {
+            Ok(text) => GenericResult::Owned(OwnedValue::String(text.into())),
+            Err(control) => partial_generic(Vec::new(), control),
+        };
+    }
     let mut slots: Vec<String> = vec![String::new(); parts.len()];
     let mut out = Vec::new();
     match build_string_parts_generic::<S, V>(parts, value, optional, cursor, &mut slots, &mut out) {

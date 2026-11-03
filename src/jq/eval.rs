@@ -113460,7 +113460,9 @@ mod tests {
             br#"[1,2,"ok",4]"#,
             r#""\(.[:])""#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, r#"[1,2,"ok",4]"#);
+                // #6092: a container interpolates as its YAML text (block here: this harness
+                // has no source style to keep), not as JSON.
+                assert_eq!(s, "- 1\n- 2\n- ok\n- 4");
             }
         );
     }

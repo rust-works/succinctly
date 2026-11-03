@@ -2190,6 +2190,17 @@ impl<'a> Parser<'a> {
                             let expr = expr?;
                             self.skip_ws();
                             self.expect(')')?;
+                            // #6092: yq writes a mapping or sequence into a string as its YAML text, in
+                            // the style the node was written in, which is what its `to_string` makes
+                            // (`I {an: apple}`), where jq's interpolation is `tostring`'s JSON text. A
+                            // scalar reads the same either way. Spelled as the pipe the format prefix
+                            // makes (`@base64 "\(.)"`), so the slot's cursor reaches `to_string` and
+                            // its flow style is seen; yq has no format-prefixed string to clash with.
+                            let expr = if self.mode == ParserMode::Yq {
+                                Expr::Pipe(vec![expr, Expr::Builtin(Builtin::ToString)].into())
+                            } else {
+                                expr
+                            };
                             parts.push(StringPart::Expr(Box::new(expr)));
                         }
                         Some('"') => {

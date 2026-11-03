@@ -20406,13 +20406,12 @@ mod tostring_container_1130 {
         Ok(())
     }
 
-    /// Known gap, pinned so a change is deliberate: yq interpolates the YAML text as it does for tostring.
-    /// yq prints "\"x- 1\\n- 2y\"" here.
+    /// #6092 closed the gap #1130 pinned here: yq interpolates the YAML text as it does for tostring.
     #[test]
-    fn string_interpolation_of_a_container_is_still_json_gap_1130() -> Result<()> {
+    fn string_interpolation_of_a_container_is_yaml_text_6092() -> Result<()> {
         assert_eq!(
             yq("\"x\\([1, 2])y\"", SOURCE, &["-o=json"])?,
-            "\"x[1,2]y\"\n"
+            "\"x- 1\\n- 2y\"\n"
         );
         Ok(())
     }
@@ -63173,7 +63172,8 @@ fn range_bound_positional_builtin_resolves_on_every_route_2803() -> Result<()> {
         ),
         (
             r#".aa | "\([range(0;(key|length))])""#,
-            r#""[0,1]""#,
+            // #6092: a container interpolates as its YAML text.
+            r#""- 0\n- 1""#,
             "string interpolation",
         ),
         // Discriminating on purpose: each member's bound resolves at that
@@ -63251,7 +63251,8 @@ fn consumer_argument_positional_read_resolves_on_every_route_2968() -> Result<()
         ),
         (
             format!(r#".aa | "\([skip(1; {g})])""#),
-            r#""[1]""#,
+            // #6092: a container interpolates as its YAML text.
+            r#""- 1""#,
             "interpolation skip",
         ),
         (
