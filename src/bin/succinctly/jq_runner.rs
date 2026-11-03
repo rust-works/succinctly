@@ -8387,6 +8387,11 @@ struct Seam {
     /// The files the `base` bytes came from before the last, front to back (#5936). `None`
     /// when they came from one file, which is nearly always.
     earlier: Option<std::rc::Rc<[SeamPart]>>,
+    /// Where each share of the moved bytes ended before the invalid-UTF-8 substitution, front to
+    /// back as [`parts`](Self::parts) gives them (#5990): the ends there are offsets in the text,
+    /// and a share can end inside a replacement, where jq's next read starts on a byte the text
+    /// no longer has. `None` for a file the substitution left alone.
+    raw_ends: Option<std::rc::Rc<[usize]>>,
 }
 
 /// One file's share of the bytes moved onto the front of a later file (#5936).
@@ -8407,6 +8412,7 @@ impl Seam {
         moved_newline: None,
         prev_lines: 0,
         earlier: None,
+        raw_ends: None,
     };
 
     /// The file's own bytes: `raw` without the ones moved onto its front.
@@ -8458,26 +8464,60 @@ impl Seam {
     /// it ends, as `base` always was, so a multi-byte character split across a file boundary is
     /// the case this does not follow (#5964 left it, see `docs/compliance/jq/limitations.md`).
     fn after_substitution(self, raw: &[u8]) -> Self {
-        let prefix = &raw[..self.base.min(raw.len())];
-        let lossy_end = |end: usize| {
-            succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(
-                &prefix[..end.min(prefix.len())],
-            )
-            .len()
+        let raw_ends: std::rc::Rc<[usize]> = self.parts().map(|(_, part)| part.end).collect();
+        // The ends are placed by the substitution of the whole file, not of the bytes up to each:
+        // a character cut at the end of a share is a replacement only if no byte after it
+        // completes it (#5990).
+        let (_, edits) =
+            succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped(raw);
+        let text_end = |end: usize| {
+            let end = end.min(raw.len());
+            if let Some(edit) = edits
+                .iter()
+                .find(|edit| edit.raw.start < end && end < edit.raw.end)
+            {
+                // Inside a replacement the text has no such place: after it, and `raw_ends` has
+                // the place in the bytes as read.
+                return edit.text.end;
+            }
+            let before = edits.partition_point(|edit| edit.raw.end <= end);
+            match before.checked_sub(1).map(|i| &edits[i]) {
+                Some(edit) => end - edit.raw.end + edit.text.end,
+                None => end,
+            }
         };
         Self {
-            base: lossy_end(prefix.len()),
+            base: text_end(self.base),
             earlier: self.earlier.map(|earlier| {
                 earlier
                     .iter()
                     .map(|part| SeamPart {
-                        end: lossy_end(part.end),
+                        end: text_end(part.end),
                         lines: part.lines,
                     })
                     .collect()
             }),
+            raw_ends: Some(raw_ends),
             ..self
         }
+    }
+
+    /// Where the next read starts in the file's bytes as read, when a share of the moved bytes
+    /// ends at `text_end` in the text and that end is inside a replacement: jq's read of the
+    /// next file starts on a byte of the replaced run, which the text no longer has (#5990).
+    /// `None` when `text_end` is not the end of a share, or the share ends outside any edit.
+    fn raw_start_inside_edit(&self, text_end: usize, lossy: &LossySource) -> Option<usize> {
+        let raw_ends = self.raw_ends.as_deref()?;
+        let raw_end = self
+            .parts()
+            .zip(raw_ends)
+            .find(|((_, part), _)| part.end == text_end)
+            .map(|(_, &raw_end)| raw_end)?;
+        lossy
+            .edits
+            .iter()
+            .any(|edit| edit.raw.start < raw_end && raw_end < edit.raw.end)
+            .then_some(raw_end)
     }
 }
 
@@ -9486,20 +9526,28 @@ fn read_json_tail(
             })
         });
         let mut next = resume;
+        // #5990: the read this one's end leaves starts inside a replacement when
+        // the share of moved bytes it ends is cut through the run the
+        // substitution replaced (a character the next file does not complete).
+        let mut inside_edit = cx
+            .lossy
+            .and_then(|lossy| cx.seam.raw_start_inside_edit(resume, lossy));
         // A read that starts inside a character starts on a byte
         // no JSON token begins with: jq raises there too and
         // discards that read as well (`}` padded so the read ends
         // inside `é`, then ` 7\n8\n`, reads the error twice, then
         // `8`).
-        while next < raw.len() && !raw.is_char_boundary(next) {
+        while next < raw.len() && (inside_edit.is_some() || !raw.is_char_boundary(next)) {
             let line = faults.line_at_read_of(next);
+            let raw_start = inside_edit.take();
             // #5975: the fault is the parser's own, read from the byte the read
             // starts on, from where the parser stood at the last fault.
             let fault = parser_at.and_then(|(line, column)| {
-                let read = cx.lossy.map_or_else(
-                    || &raw.as_bytes()[next..],
-                    |lossy| lossy.bytes(next..raw.len()),
-                );
+                let read = match (raw_start, cx.lossy) {
+                    (Some(raw_start), Some(lossy)) => &lossy.original[raw_start..],
+                    (None, Some(lossy)) => lossy.bytes(next..raw.len()),
+                    (_, None) => &raw.as_bytes()[next..],
+                };
                 jq::jq_stream_fault_end([read], line, column)
             });
             let (error, fault_end) = match fault {
@@ -18123,6 +18171,33 @@ mod tests {
         // One file's moved bytes have nothing earlier to move.
         let one = Seam::base(2).after_substitution(b"\xff1");
         assert_eq!((one.base, one.earlier), (4, None));
+    }
+
+    /// #5990: the end of a share of moved bytes is placed by the substitution of the whole file.
+    /// A character a share cuts and the file's own bytes complete is not a replacement, so the
+    /// share ends inside it; one nothing completes is, and the share ends after the replacement,
+    /// with its end in the bytes as read kept for the read that starts there.
+    #[test]
+    fn a_share_cut_through_a_replacement_keeps_its_end_in_the_bytes_as_read_5990() {
+        // `\xe2\x82` is the share, `\xac"` completes the character: the text is `\u{20ac}"`.
+        let completed = b"\xe2\x82\xac\"";
+        let after = Seam::base(2).after_substitution(completed);
+        assert_eq!(after.base, 2);
+        let (_, edits) =
+            succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped(completed);
+        let lossy = LossySource::new(completed.to_vec(), edits);
+        assert_eq!(after.raw_start_inside_edit(2, &lossy), None);
+        // `a\xe2` is the share and `\x82"` follows: `\xe2\x82` is one replacement across the seam.
+        let cut = b"a\xe2\x82\"";
+        let after = Seam::base(2).after_substitution(cut);
+        assert_eq!(after.base, 4, "after the replacement, `a` and U+FFFD");
+        assert_eq!(after.raw_ends.as_deref(), Some(&[2][..]));
+        let (_, edits) =
+            succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped(cut);
+        let lossy = LossySource::new(cut.to_vec(), edits);
+        assert_eq!(after.raw_start_inside_edit(4, &lossy), Some(2));
+        // Not at the end of any share.
+        assert_eq!(after.raw_start_inside_edit(3, &lossy), None);
     }
 
     /// #4316: a counter for a stitched file counts the file as it was on disk.
