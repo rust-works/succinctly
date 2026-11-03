@@ -28293,6 +28293,16 @@ fn refuse_possessive_quantifier(
                 }
                 i += 2;
             }
+            // A braced escape (`\x{41}`, `\p{Lu}`, `\k{n}`) is one atom: its digits in braces are not
+            // an interval, and a `+` after it is a plain greedy quantifier (#6079).
+            '\\' if matches!(chars.get(i + 1), Some('x' | 'p' | 'P' | 'k' | 'g' | 'N'))
+                && chars.get(i + 2) == Some(&'{') =>
+            {
+                i = chars[i + 3..]
+                    .iter()
+                    .position(|&c| c == '}')
+                    .map_or(i + 3, |close| i + 3 + close + 1);
+            }
             '\\' => i += 2,
             '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') => {
                 while i < chars.len() && chars[i] != ')' {
@@ -28334,6 +28344,7 @@ fn refuse_possessive_quantifier(
                 // quantifier matches the same text.
                 if chars[i + 1..].iter().all(|&c| c == ')') {
                     drops.push(i);
+                    // Only `)` follows, so there is nothing left to scan.
                     break;
                 }
                 return Err(refusal());
@@ -28368,12 +28379,15 @@ fn refuse_possessive_quantifier(
     if drops.is_empty() {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
+    // Both lists are in ascending order, so each is walked once.
+    let mut dropped = drops.iter().copied().peekable();
+    let mut swapped = optional.iter().copied().peekable();
     let mut rewritten = String::new();
     for (at, &c) in chars.iter().enumerate() {
-        if drops.contains(&at) {
+        if dropped.next_if_eq(&at).is_some() {
             continue;
         }
-        if optional.contains(&at) {
+        if swapped.next_if_eq(&at).is_some() {
             rewritten.push_str("{0,1}");
         } else {
             rewritten.push(c);
@@ -141384,7 +141398,17 @@ mod tests {
         }
         // Left as written: a repeat of a repeat in jq too, a class, an escaped brace, and a `+`
         // that the extended mode separates from its quantifier.
-        for pattern in ["a{2}?+", "[a{2}+]", r"\{2}+", "a{2}", "a{2,3}"] {
+        for pattern in [
+            "a{2}?+",
+            "[a{2}+]",
+            r"\{2}+",
+            "a{2}",
+            "a{2,3}",
+            // A braced escape is one atom: its `{41}` is not a count, and its `+` repeats.
+            r"\x{41}+",
+            r"\p{Lu}+",
+            r"\x{41}{2}",
+        ] {
             assert!(
                 matches!(
                     refuse_possessive_quantifier(pattern, false),

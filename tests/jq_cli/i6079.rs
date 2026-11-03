@@ -279,3 +279,39 @@ fn a_fixed_count_followed_by_plus_is_the_count() -> Result<()> {
     }
     Ok(())
 }
+
+/// A braced escape is one atom, not a fixed interval: `\x{41}+` repeats it (the `{41}` is not a
+/// count), and the extended mode, a class and a group name keep their own `+`.
+#[test]
+fn a_plus_after_a_braced_escape_still_repeats() -> Result<()> {
+    let program = r#"$s | try ([match($p; $f) | [.offset, .length, .string, (.captures | map(.string))]]) catch "ERR""#;
+    for (text, pattern, flags, want) in [
+        (r"AAA", r"\x{41}+", r"", r#"[[0,3,"AAA",[]]]"#),
+        (r"AAA", r"\x{41}+", r"g", r#"[[0,3,"AAA",[]]]"#),
+        (r"  ", r"\x{20}+", r"", r#"[[0,2,"  ",[]]]"#),
+        (r"AAA", r"\x{41}+a", r"i", r#"[[0,3,"AAA",[]]]"#),
+        (r"AAA", r"\x{41}{2}+", r"", r#"[[0,2,"AA",[]]]"#),
+        (r"AAA", r"\x{41}{2}+a", r"i", r#"[[0,3,"AAA",[]]]"#),
+        (r"A1", r"\p{Lu}+\d+", r"", r#"[[0,2,"A1",[]]]"#),
+        (r"AB", r"\p{Lu}+", r"", r#"[[0,2,"AB",[]]]"#),
+        (r"AAA", r"[\x{41}]{1}+", r"", r#"[[0,1,"A",[]]]"#),
+        (r"a{2}+", r"[a{2}+]+", r"", r#"[[0,5,"a{2}+",[]]]"#),
+        (r"aa", r"a{2} +", r"x", r#"[[0,2,"aa",[]]]"#),
+        (r"aaaa", "a{2}+ # c\n", r"x", r#"[[0,2,"aa",[]]]"#),
+        (r"aaaa", r"a{2}+a", r"x", r#"[[0,3,"aaa",[]]]"#),
+        (r"aaa", r"(?<n>a){1}+\k<n>", r"", r#"[[0,2,"aa",["a"]]]"#),
+        (r"aaaa", r"a{2}+?+", r"", r#"[[0,2,"aa",[]]]"#),
+        (r"aaaa", r"a{2}+++", r"", r#"[[0,4,"aaaa",[]]]"#),
+        (r"aaaa", r"a{2}+??", r"", r#"[[0,0,"",[]]]"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(
+            &[
+                "-nc", "--arg", "s", text, "--arg", "p", pattern, "--arg", "f", flags, program,
+            ],
+            None,
+        )?;
+        assert_eq!(code, 0, "{text:?} ~ {pattern:?} [{flags}]: {stderr}");
+        assert_eq!(stdout.trim(), want, "{text:?} ~ {pattern:?} [{flags}]");
+    }
+    Ok(())
+}

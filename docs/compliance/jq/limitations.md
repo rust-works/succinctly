@@ -7427,7 +7427,9 @@ What jq itself reads as a repeat of a repeat stays as it was: a lazy quantifier 
 The interval forms follow jq 1.7.1: `{n,}+`, `{n,m}+` and `{,m}+` are possessive.
 A fixed `{n}+` is neither possessive nor a repeat: it is `{n}` (#6079).
 `"aaaa" | match("a{2}+")` is `aa` in jq, since a fixed count has nothing to give back, and this was `aaaa`, the `regex` crate's `(?:a{2})+`.
-The `+` is dropped, and a quantifier after it applies to the `{n}`: `{n}++` repeats it, and `{n}+?` makes it optional.
+The `+` is dropped, and a quantifier after it applies to the `{n}`: `{n}++` repeats it, and `{n}+?` makes it optional (written `{0,1}`, since the crate would read a bare `?` there as lazy).
+A braced escape is not a count: `\x{41}+` and `\p{Lu}+` repeat as before.
+A possessive quantifier that follows (`{n}+?+`, `{n}+++`) is refused unless it is last, like any other (`"aaaa" | match("a{2}+?+a")` is `aaa` in jq).
 Pinned against jq 1.7.1 on 180 pattern x text x flag rows in `tests/jq_cli/i6079.rs`.
 A possessive quantifier that used to agree because nothing after it needed a character back (`"aaab" | test("a++b")`) is refused too, since the scan does not look at what follows.
 The second engine added by #5502 (`fancy-regex`, below) does not help: a pattern the `regex` crate accepts never reaches it, and it makes `*+`, `++` and `?+` atomic as jq does but reads `{n,m}+` as a repeat of a repeat, so an interval would stay refused.
