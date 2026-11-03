@@ -10196,7 +10196,11 @@ The weekday and yearday of a format that sets no date are the platform libc's in
 glibc leaves jq's sentinels `8` and `367` (`[1900,0,0,10,15,0,8,367]`), and the macOS pin computes them from `mday = 0` with the 1900 weekday error jq's own comment admits (`[1900,0,0,10,15,0,6,-1]`, and weekday `0` for `"15" | strptime("%d")`, where 15 Jan 1900 was a Monday).
 succinctly answers the date's own weekday and yearday (`[1900,0,0,10,15,0,0,-1]`, `[1900,0,15,0,0,0,1,14]`), which matches neither libc on those rows and the macOS pin on every row that sets a date.
 `%j` with a year read (`%Y`, `%y`, `%C`) and nothing that sets the month or day derives them from the day of year, as the pin's libc does (#5383): `"2015 060" | strptime("%Y %j")` is `[2015,2,1,0,0,0,0,59]`, `"2015 366"` rolls into `[2016,0,1,...]`, and day 0 and 367 are refused.
-`%j` next to a month or day (`%m`, `%d`, `%e`, `%b`, `%D`, `%F`) or with no year is order-dependent in the pin's libc and aborts jq on several rows (`Assertion failed: (yday == tm->tm_yday || tm->tm_yday == 367)` in `set_tm_yday`, e.g. `"060" | strptime("%j")`), so there is no answer to match; succinctly keeps the month and day as read and recomputes the yearday from them.
+With a month read beside `%j` (`%m`, `%b`) and a year, the month is kept and the day counted from its start, so it can pass 31 or go below 1 and the year does not roll: `"2015 03 050" | strptime("%Y %m %j")` is `[2015,2,-9,0,0,0,4,49]` and `"2015 02 366"` is February 335 (#5934).
+The yearday printed is the day of year as read.
+A day read beside `%j` with no month takes its month from the day of year, and a month and a day together stay as read.
+jq aborts on its own `set_tm_yday` assertion (`Assertion failed: (yday == tm->tm_yday || tm->tm_yday == 367)`) whenever a day read disagrees with the day of year, and for a month or day with no year (`"060" | strptime("%j")`), so there is no answer to match on those rows.
+succinctly keeps the month and day as read there and recomputes the yearday from them.
 glibc's `%j` was not captured, so the rows above are the macOS pin's and glibc may differ on them.
 
 ### `strptime`'s weekday in January and February of a century year that is not a leap year is the calendar's, where jq's macOS build is a day early (#970, #5946)

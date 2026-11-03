@@ -5,9 +5,9 @@ use anyhow::Result;
 use crate::assert_path_rows_both_routes_3749;
 
 // The libc fills `tm_mon`/`tm_mday` from `tm_yday` when a year was read and nothing set the month or day (a day
-// past the end of the year rolls into the next), and refuses a day of year outside 1-366. `%j` next to `%m`/`%d`/`%e`
-// /`%D`/`%F`, or with no year, is order- and platform-dependent in the libc and some rows abort jq, so those stay as
-// read. Every row captured from `/usr/bin/jq` 1.7.1 (stdout, error message, exit code), both routes.
+// past the end of the year rolls into the next), and refuses a day of year outside 1-366. `%j` next to a `%d`/`%e`/`%D`/`%F`
+// that disagrees with it, or with no year, aborts jq, so those stay as read (a month beside it: #5934).
+// Every row captured from `/usr/bin/jq` 1.7.1 (stdout, error message, exit code), both routes.
 
 /// #5383: the day of year with a year read (`%Y`, `%y`, `%C`), in either order, in leap and common years.
 #[test]
@@ -177,8 +177,9 @@ fn test_5383_strptime_day_of_year_sets_month_and_day() -> Result<()> {
     ])
 }
 
-/// #5383: `%j` next to a month or day, or with no year, keeps the month and day as read. These are succinctly's own
-/// answers, not the pin's: the libc is order-dependent there and `/usr/bin/jq` aborts on all of them but the last
+/// #5383: `%j` next to a day that disagrees with it, or with no year, keeps the month and day as read (a month beside it
+/// counts the day from the month's start, #5934). These are succinctly's own
+/// answers, not the pin's: the libc is order-dependent there and `/usr/bin/jq` aborts on all of them
 /// (`Assertion failed: (yday == tm->tm_yday || tm->tm_yday == 367)`), so there is nothing to match.
 #[test]
 fn test_5383_strptime_day_of_year_next_to_a_date_or_without_a_year_is_unchanged() -> Result<()> {
@@ -222,13 +223,6 @@ fn test_5383_strptime_day_of_year_next_to_a_date_or_without_a_year_is_unchanged(
             "null",
             r#""060 10:30" | strptime("%j %H:%M")"#,
             "[1900,0,0,10,30,0,0,-1]\n",
-            "",
-            0,
-        ),
-        (
-            "null",
-            r#""2015 03 060" | strptime("%Y %m %j")"#,
-            "[2015,2,0,0,0,0,6,58]\n",
             "",
             0,
         ),
