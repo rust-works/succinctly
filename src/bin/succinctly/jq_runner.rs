@@ -6660,7 +6660,16 @@ fn get_inputs(
     // spans answer it without the strict scan (`EofTail::of_clean_source`), and the scan runs
     // only if the route turns the stream down, or here, over the bytes as read, for a stream
     // that is not UTF-8.
-    let lazy_candidate = records_eof && json_input_mode && !args.stream && raw_bytes.len() == 1;
+    // #5857: several files take it when every one is UTF-8, so the bytes as read are the text
+    // the route holds, and `--validate` (strict per file) is off.
+    let lazy_candidate = records_eof
+        && json_input_mode
+        && !args.stream
+        && (raw_bytes.len() == 1
+            || (!args.validate
+                && raw_bytes
+                    .iter()
+                    .all(|(_, raw)| succinctly::text::utf8::validate_utf8(raw).is_ok())));
     let mut eof_tail = (records_eof && !lazy_candidate).then(|| {
         let sources: Vec<&[u8]> = raw_bytes.iter().map(|(_, raw)| raw.as_slice()).collect();
         EofTail::of(&sources, args.raw_input, &seams, args.stream)
@@ -6892,6 +6901,34 @@ fn get_inputs(
         let mut lazy_inputs = false;
         let counts_files = !args.stream && args.input_dsv.is_none();
         let mut next_file = StreamOrigin::ALONE.file;
+        // #5857: a clean stream of several files converts each document when the program reads
+        // it, as a single file does. One file the route turns down sends them all to the loop
+        // below, with the end of the stream read from the files' bytes up front.
+        let raw_inputs = if lazy_candidate && raw_inputs.len() > 1 && !lazy_route_forced_off() {
+            match lazy_json_sources(&raw_inputs, &seams) {
+                Some((tail, spans)) => {
+                    locations.eof_tail = Some(tail);
+                    for ((file_idx, raw), (spans, seam)) in raw_inputs.into_iter().zip(spans) {
+                        defer_lazy_start(std::rc::Rc::new(raw), spans, file_idx.unwrap_or(0), seam);
+                    }
+                    lazy_inputs = true;
+                    Vec::new()
+                }
+                None => {
+                    let sources: Vec<&[u8]> =
+                        raw_inputs.iter().map(|(_, raw)| raw.as_bytes()).collect();
+                    locations.eof_tail = Some(EofTail::of(&sources, false, &seams, false));
+                    raw_inputs
+                }
+            }
+        } else {
+            if lazy_candidate && raw_inputs.len() > 1 {
+                let sources: Vec<&[u8]> =
+                    raw_inputs.iter().map(|(_, raw)| raw.as_bytes()).collect();
+                locations.eof_tail = Some(EofTail::of(&sources, false, &seams, false));
+            }
+            raw_inputs
+        };
         for (pos, (file_idx, raw)) in raw_inputs.into_iter().enumerate() {
             let src = file_idx.unwrap_or(0);
             let file_start = next_file;
@@ -6966,7 +7003,7 @@ fn get_inputs(
                             if locations.eof_tail.is_none() {
                                 debug_assert_eq!(seam, Seam::NONE, "a lone source is unstitched");
                                 locations.eof_tail =
-                                    Some(EofTail::of_clean_source(raw.as_bytes(), &spans));
+                                    Some(EofTail::of_clean_source(raw.as_bytes(), &spans, 0));
                             }
                             defer_lazy_start(std::rc::Rc::new(raw), spans, src, seam);
                             lazy_inputs = true;
@@ -7560,13 +7597,17 @@ impl EofTail {
     /// completes on its closing byte or, for a number or literal, at the byte after it: the
     /// answer [`json_value_completes_in_final_read`](Self::json_value_completes_in_final_read)
     /// reaches with a strict scan of the whole source.
-    fn of_clean_source(bytes: &[u8], spans: &[(usize, usize)]) -> Self {
-        let final_read = Self::final_read_start(bytes, 0);
+    ///
+    /// `base` is how many of the source's first bytes were moved onto it from an earlier file
+    /// (#4316, #5857): they are not part of its reads or its lines.
+    fn of_clean_source(bytes: &[u8], spans: &[(usize, usize)], base: usize) -> Self {
+        let base = base.min(bytes.len());
+        let final_read = Self::final_read_start(bytes, base);
         let unknown = spans
             .last()
             .is_some_and(|&(start, end)| Self::completes_at(bytes, start, end) >= final_read);
         Self {
-            newlines: count_newlines(bytes) as u32,
+            newlines: count_newlines(&bytes[base..]) as u32,
             unknown,
         }
     }
@@ -9141,8 +9182,9 @@ fn find_json_values(bytes: &[u8]) -> core::result::Result<Vec<(usize, usize)>, u
     }
 }
 
-/// Documents of a clean single-source JSON stream that a program reading `input`/`inputs` converts when
-/// they are read, not up front (#5661): the text and each document's byte range in it.
+/// Documents of one source of a clean JSON stream that a program reading `input`/`inputs` converts
+/// when they are read, not up front (#5661): the text and each document's byte range in it. A
+/// stream of several files is one of these per file, in order (#5857).
 struct LazyJsonInputs {
     text: std::rc::Rc<String>,
     spans: Vec<(usize, usize)>,
@@ -9257,21 +9299,26 @@ impl LazyBatch {
 /// that may have turned malformed after its lazy start (#5853): once
 /// every lazy document has been read, `tail` (the documents and parse errors the eager route read
 /// after them, in order) is handed out, and then the end of the stream.
+///
+/// `sources` are the files of the stream in order (#5857), each with its own line count and source
+/// tag. A source's text is dropped with its last document.
 fn lazy_json_producer_then(
-    lazy: LazyJsonInputs,
+    sources: std::collections::VecDeque<LazyJsonInputs>,
     mut tail: std::collections::VecDeque<jq::ProducedInput>,
     exhausted: Option<(u32, u32)>,
 ) -> jq::InputProducer {
-    // The counter's place in the text, kept between reads without a borrow of it.
-    let mut lines = LineCounter::at_seam(lazy.text.as_bytes(), lazy.seam.clone()).place();
+    // A source with no documents (an empty file) has nothing to hand out.
+    let mut sources = sources;
+    sources.retain(|source| !source.spans.is_empty());
+    // The counter's place in the front source's text, kept between reads without a borrow of
+    // it; `None` before its first read.
+    let mut lines: Option<LinePlace> = None;
     let mut next = 0;
     // The index over the documents being read, and how much text the next one covers (#5854).
     let mut batch: Option<LazyBatch> = None;
     let mut batch_bytes = LAZY_BATCH_FIRST_BYTES;
-    // The stream's text goes with its last document, not with the read past it.
-    let mut stream = (!lazy.spans.is_empty()).then_some(lazy);
     Box::new(move || {
-        let Some(lazy) = stream.as_ref() else {
+        let Some(lazy) = sources.front() else {
             return tail
                 .pop_front()
                 .unwrap_or(jq::ProducedInput::End(exhausted));
@@ -9284,9 +9331,12 @@ fn lazy_json_producer_then(
         }
         let at = next;
         next += 1;
-        let mut counter = LineCounter::resume(bytes, &lines);
+        let place = lines
+            .take()
+            .unwrap_or_else(|| LineCounter::at_seam(bytes, lazy.seam.clone()).place());
+        let mut counter = LineCounter::resume(bytes, &place);
         let line = counter.read_end_line(end);
-        lines = counter.place();
+        lines = Some(counter.place());
         debug_assert!(
             json_depth_at_most(&bytes[start..end], LAZY_JSON_MAX_DEPTH),
             "a lazily converted document is within the depth the route admits"
@@ -9301,22 +9351,30 @@ fn lazy_json_producer_then(
         // Narrowed as `InputLocations::push` narrows the eager route's lines.
         let produced = jq::ProducedInput::converted(converted, lazy.source, line as u32);
         if next == lazy.spans.len() {
-            stream = None;
+            // The source's text goes with its last document, not with the read past it; the next
+            // source starts its own count.
+            sources.pop_front();
+            next = 0;
             batch = None;
+            batch_bytes = LAZY_BATCH_FIRST_BYTES;
+            lines = None;
         }
         produced
     })
 }
 
 /// Leaves a stream's lazy documents for the call site that seeds the `input` queue, which takes them.
+/// A stream of several files defers one source per file, in order (#5857).
 fn defer_lazy_start(text: std::rc::Rc<String>, spans: Vec<(usize, usize)>, src: usize, seam: Seam) {
     LAZY_JSON_INPUTS.with(|slot| {
-        *slot.borrow_mut() = Some(LazyJsonInputs {
-            text,
-            spans,
-            source: src as u32,
-            seam,
-        });
+        slot.borrow_mut()
+            .get_or_insert_with(std::collections::VecDeque::new)
+            .push_back(LazyJsonInputs {
+                text,
+                spans,
+                source: src as u32,
+                seam,
+            });
     });
 }
 
@@ -9485,7 +9543,7 @@ thread_local! {
     static LAZY_STREAM_INPUTS: std::cell::RefCell<Option<LazyStreamInputs>> =
         const { std::cell::RefCell::new(None) };
     /// Set by [`get_inputs`] for the call site that seeds the `input` queue, which takes it.
-    static LAZY_JSON_INPUTS: std::cell::RefCell<Option<LazyJsonInputs>> =
+    static LAZY_JSON_INPUTS: std::cell::RefCell<Option<std::collections::VecDeque<LazyJsonInputs>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -9646,6 +9704,41 @@ fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Ve
         }
     }
     Ok(raw)
+}
+
+/// The lazy route's sources for a stream of several files (#5857): each file's documents and its
+/// [`Seam`], and the end of the stream read from the last file's spans, or `None` when any file
+/// is not clean plain JSON the route converts (a parse error, a BOM, a document nested too deeply)
+/// or the last one holds no document, whose end marker the earlier files decide.
+///
+/// A file of white space holds no document and takes no part in the stream's reads.
+fn lazy_json_sources(
+    raw_inputs: &[(Option<usize>, String)],
+    seams: &[Seam],
+) -> Option<(EofTail, Vec<(Vec<(usize, usize)>, Seam)>)> {
+    let mut sources = Vec::with_capacity(raw_inputs.len());
+    for (pos, (_, raw)) in raw_inputs.iter().enumerate() {
+        let spans = if raw
+            .bytes()
+            .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            Vec::new()
+        } else {
+            let scan = lazy_json_scan(raw);
+            if !scan.clean {
+                return None;
+            }
+            scan.spans
+        };
+        sources.push((spans, seams.get(pos).cloned().unwrap_or_default()));
+    }
+    let (last_spans, last_seam) = sources.last()?;
+    if last_spans.is_empty() {
+        return None;
+    }
+    let last = raw_inputs.last()?.1.as_bytes();
+    let tail = EofTail::of_clean_source(last, last_spans, last_seam.base);
+    Some((tail, sources))
 }
 
 /// The byte range of every document of `raw`, when a program reading `input`/`inputs` can convert them as
@@ -14277,7 +14370,8 @@ mod tests {
         let lazy = LAZY_JSON_INPUTS
             .with(|slot| slot.borrow_mut().take())
             .expect("the clean start is deferred");
-        assert_eq!(lazy.spans, vec![(0, 7), (8, 11)]);
+        assert_eq!(lazy.len(), 1);
+        assert_eq!(lazy[0].spans, vec![(0, 7), (8, 11)]);
         // The eager route holds the documents after the fault only, at their own lines.
         assert_eq!(
             inputs,
@@ -14305,6 +14399,50 @@ mod tests {
         assert_eq!(kinds, ["error", "document", "document"]);
     }
 
+    /// What a program reading `input` sees of `files` (written under `dir`, in order): the end
+    /// marker, then every document and parse error `input` pops, with the `(at ...)` location
+    /// after each, through and past the end (#4303); and how many documents the lazy route holds.
+    /// `lazy_off` is the eager route, the reference the lazy one is held to (#5958).
+    fn observe_inputs(
+        dir: &std::path::Path,
+        files: &[&[u8]],
+        lazy_off: bool,
+    ) -> (Vec<String>, usize) {
+        use clap::Parser;
+
+        let mut argv = vec!["jq".to_string(), "-n".to_string(), "inputs".to_string()];
+        for (index, bytes) in files.iter().enumerate() {
+            let path = dir.join(format!("stream{index}.json"));
+            std::fs::write(&path, bytes).unwrap();
+            argv.push(path.to_string_lossy().into_owned());
+        }
+        let cmd = JqCommand::try_parse_from(argv).unwrap();
+        LAZY_ROUTE_OFF.with(|f| f.set(lazy_off));
+        let (mut open_failed, mut opened) = (false, Vec::new());
+        let read = get_inputs(&cmd, true, true, &mut open_failed, &mut opened);
+        LAZY_ROUTE_OFF.with(|f| f.set(false));
+        let (inputs, locations, trailing, resumed) = read.expect("no exit code").expect("reads");
+        let lazy_documents = LAZY_JSON_INPUTS.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map_or(0, |lazy| lazy.iter().map(|source| source.spans.len()).sum())
+        });
+        seed_input_queue(false, inputs, &locations, trailing, resumed);
+        let mut seen = vec![format!("tail {:?}", locations.eof_tail)];
+        for _ in 0..40 {
+            let popped = match jq::pop_input() {
+                jq::InputPop::Document(v) => format!("doc {v:?}"),
+                jq::InputPop::ParseError(e) => format!("error {}", e.message),
+                jq::InputPop::Exhausted => "end".to_string(),
+            };
+            seen.push(format!("{popped} at {:?}", jq::current_input_location()));
+            if popped == "end" && seen.iter().filter(|s| s.starts_with("end")).count() > 2 {
+                break;
+            }
+        }
+        (seen, lazy_documents)
+    }
+
     /// #5853: a stream that turns malformed reads the same whether its clean start is converted
     /// lazily and the rest handed to the eager loop, or the whole stream is read eagerly: every
     /// document and error `input` pops and the `(at ...)` marker (source and line) after each pop,
@@ -14314,38 +14452,8 @@ mod tests {
     /// off), or with the lazy documents left out of an error's "documents before it".
     #[test]
     fn a_lazy_prefix_with_an_eager_handoff_reads_as_the_eager_route_does_5853() {
-        use clap::Parser;
-
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("stream.json");
-        let path_str = path.to_string_lossy().into_owned();
-        let cmd = JqCommand::try_parse_from(["jq", "-n", "inputs", path_str.as_str()]).unwrap();
-        let observe = |bytes: &[u8], lazy_off: bool| {
-            std::fs::write(&path, bytes).unwrap();
-            LAZY_ROUTE_OFF.with(|f| f.set(lazy_off));
-            let (mut open_failed, mut opened) = (false, Vec::new());
-            let read = get_inputs(&cmd, true, true, &mut open_failed, &mut opened);
-            LAZY_ROUTE_OFF.with(|f| f.set(false));
-            let (inputs, locations, trailing, resumed) =
-                read.expect("no exit code").expect("reads");
-            let lazy_documents = LAZY_JSON_INPUTS
-                .with(|slot| slot.borrow().as_ref().map_or(0, |lazy| lazy.spans.len()));
-            seed_input_queue(false, inputs, &locations, trailing, resumed);
-            let mut seen = vec![format!("tail {:?}", locations.eof_tail)];
-            // Past the end: the first failed read, then the later ones (#4303).
-            for _ in 0..40 {
-                let popped = match jq::pop_input() {
-                    jq::InputPop::Document(v) => format!("doc {v:?}"),
-                    jq::InputPop::ParseError(e) => format!("error {}", e.message),
-                    jq::InputPop::Exhausted => "end".to_string(),
-                };
-                seen.push(format!("{popped} at {:?}", jq::current_input_location()));
-                if popped == "end" && seen.iter().filter(|s| s.starts_with("end")).count() > 2 {
-                    break;
-                }
-            }
-            (seen, lazy_documents)
-        };
+        let observe = |bytes: &[u8], lazy_off: bool| observe_inputs(dir.path(), &[bytes], lazy_off);
         let docs: [&[u8]; 6] = [b"1", b"\"a\"", b"[1,2]", b"{\"a\":null}", b"true", b"-0.5"];
         let seps: [&[u8]; 3] = [b"\n", b" ", b"\r\n"];
         let faults: [&[u8]; 14] = [
@@ -14432,6 +14540,77 @@ mod tests {
         );
     }
 
+    /// #5857: a stream of several files reads the same whether its documents are converted when
+    /// the program reads them or the whole stream is read first: every document and parse error
+    /// `input` pops, the `(at ...)` location after each (the file and its line, so a document
+    /// that begins in one file and ends in the next, an empty file and a file of white space are
+    /// all in play), and the end marker, through and past the end. The streams are the ones of
+    /// the single-file differential cut into two files at every byte, and into three. The pin
+    /// must be able to fail: it does with a source's line count started at the front of the
+    /// stream's text, with the end marker read from the first file, or with the seam left out of
+    /// the last file's marker.
+    #[test]
+    fn a_lazy_stream_of_several_files_reads_as_the_eager_route_does_5857() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let docs: [&[u8]; 6] = [b"1", b"\"a\"", b"[1,2]", b"{\"a\":null}", b"true", b"-0.5"];
+        let seps: [&[u8]; 4] = [b"\n", b" ", b"\r\n", b"\n\n"];
+        let mut bases: Vec<Vec<u8>> = Vec::new();
+        for (i, a) in docs.iter().enumerate() {
+            for b in &docs[i..] {
+                for sep in seps {
+                    for end in [&b""[..], b"\n"] {
+                        bases.push([*a, sep, *b, end].concat());
+                    }
+                }
+            }
+        }
+        bases.push([docs[0], b"\n", docs[1], b"\n", docs[2], b"\n", docs[4]].concat());
+        bases.push(b"[1,\n2]\n{\"a\":\n1}\n7".to_vec());
+        let (mut checked, mut lazy_streams) = (0usize, 0usize);
+        let mut compare = |files: &[&[u8]]| {
+            let (eager, eager_lazy) = observe_inputs(dir.path(), files, true);
+            assert_eq!(eager_lazy, 0, "the reference route is eager");
+            let (lazy, lazy_documents) = observe_inputs(dir.path(), files, false);
+            assert_eq!(
+                lazy,
+                eager,
+                "{:?} (lazy documents {lazy_documents})",
+                files
+                    .iter()
+                    .map(|f| String::from_utf8_lossy(f))
+                    .collect::<Vec<_>>()
+            );
+            checked += 1;
+            lazy_streams += usize::from(lazy_documents > 0);
+        };
+        for base in &bases {
+            for at in 0..=base.len() {
+                compare(&[&base[..at], &base[at..]]);
+                // A third file between: empty, white space, or the rest cut again.
+                compare(&[&base[..at], b"", &base[at..]]);
+                compare(&[&base[..at], b"\n", &base[at..]]);
+                for then in at..=base.len() {
+                    compare(&[&base[..at], &base[at..then], &base[then..]]);
+                }
+            }
+        }
+        // Streams the route turns down in one file read as the eager route reads them too.
+        for fault in [&b"}"[..], b"x", b"007", b"\"unclosed", b"\xff"] {
+            for base in bases.iter().step_by(7) {
+                for at in 0..=base.len() {
+                    compare(&[fault, base]);
+                    compare(&[base, fault]);
+                    compare(&[&base[..at], fault, &base[at..]]);
+                }
+            }
+        }
+        assert!(checked > 20000, "{checked} streams");
+        assert!(
+            lazy_streams > 10000,
+            "{lazy_streams} streams took the lazy route"
+        );
+    }
+
     /// [`lazy_json_scan`]'s spans for a stream it reads whole.
     fn lazy_json_spans(raw: &str) -> Option<Vec<(usize, usize)>> {
         let scan = lazy_json_scan(raw);
@@ -14443,7 +14622,11 @@ mod tests {
         lazy: LazyJsonInputs,
         exhausted: Option<(u32, u32)>,
     ) -> jq::InputProducer {
-        lazy_json_producer_then(lazy, std::collections::VecDeque::new(), exhausted)
+        lazy_json_producer_then(
+            std::collections::VecDeque::from([lazy]),
+            std::collections::VecDeque::new(),
+            exhausted,
+        )
     }
 
     /// #5853: the tail a malformed stream hands out after its lazy start is in the order the queue
@@ -14512,12 +14695,12 @@ mod tests {
                     }
                     let tail = lazy_tail_items(values(), &locations, trailing_error(), resumed());
                     jq::seed_remaining_inputs_from(lazy_json_producer_then(
-                        LazyJsonInputs {
+                        std::collections::VecDeque::from([LazyJsonInputs {
                             text: std::rc::Rc::new(String::new()),
                             spans: Vec::new(),
                             source: 0,
                             seam: Seam::NONE,
-                        },
+                        }]),
                         tail,
                         None,
                     ));
@@ -14709,7 +14892,7 @@ mod tests {
             let spans = lazy_json_spans(text).expect("a clean stream");
             let bytes = text.as_bytes();
             assert_eq!(
-                EofTail::of_clean_source(bytes, &spans),
+                EofTail::of_clean_source(bytes, &spans, 0),
                 EofTail::of(&[bytes], false, &[], false),
                 "{:?}",
                 text.get(text.len().saturating_sub(12)..).unwrap_or(text)
@@ -14764,7 +14947,7 @@ mod tests {
         );
         assert!(!trailing && resumed == 0);
         let lazy = lazy.expect("deferred");
-        assert_eq!(lazy.spans, vec![(0, 1), (2, 9), (10, 13)]);
+        assert_eq!(lazy[0].spans, vec![(0, 1), (2, 9), (10, 13)]);
         // A stream the route turns down still gets the end the strict scan finds.
         let bare_end = write("bare_end.json", "1\n2\n007");
         let (_, (_, tail), ..) = read(&["jq", "-n", "inputs", &bare_end]);
@@ -14798,7 +14981,7 @@ mod tests {
             })
         );
         assert_eq!(
-            lazy.expect("deferred").spans,
+            lazy.expect("deferred")[0].spans,
             vec![(0, 1), (2, 9), (10, 13)]
         );
         // A stream the route turns down, or that is not UTF-8, still gets the strict scan.
@@ -14859,7 +15042,7 @@ mod tests {
         ] {
             let (inputs, _, _, resumed, lazy) = read(&argv);
             let lazy = lazy.expect("the clean start is deferred");
-            assert_eq!(lazy.spans, vec![(0, 1), (2, 3)], "{argv:?}");
+            assert_eq!(lazy[0].spans, vec![(0, 1), (2, 3)], "{argv:?}");
             assert_eq!(inputs, vec![OwnedValue::Int(3)], "{argv:?}");
             assert_eq!(resumed, 1, "{argv:?}");
         }
