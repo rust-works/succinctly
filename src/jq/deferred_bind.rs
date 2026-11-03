@@ -247,7 +247,7 @@ fn count_var_reads(body: &Expr, var: &str, mut fields: Option<&mut Vec<String>>)
             Expr::Pipe(stages) => {
                 for pair in stages.windows(2) {
                     // `($x).k` reads the member as `$x.k` does: a parenthesis only groups (#5544).
-                    if !matches!(unwrap_paren(&pair[0]), Expr::Var(name) if name == var) {
+                    if !is_var(&pair[0], var) {
                         continue;
                     }
                     if let Some(field) = field_read(&pair[1]) {
@@ -316,14 +316,19 @@ fn may_yield_many(expr: &Expr) -> bool {
     }
 }
 
-/// The field a stage reads from an object: `.k`, `.k?`.
+/// Whether `stage` is the variable itself: `$x`, `($x)`. A parenthesis only groups, so this is the
+/// one definition of "the head of a field chain" for the fold's projection ([`count_var_reads`])
+/// and the deferred bind's walk ([`walk_pipe`]) (#5957).
+fn is_var(stage: &Expr, var: &str) -> bool {
+    matches!(unwrap_paren(stage), Expr::Var(name) if name == var)
+}
+
+/// The field a stage reads from an object: `.k`, `.k?`, however many parentheses and `?`s group it
+/// (`(.k)`, `(.k)?`, `(.k?)`, `(.k?)?`), as [`is_var`] sees through them for the head (#5957).
 fn field_read(stage: &Expr) -> Option<&String> {
-    match stage {
+    match unwrap_paren(stage) {
         Expr::Field(field) => Some(field),
-        Expr::Optional(inner) => match inner.as_ref() {
-            Expr::Field(field) => Some(field),
-            _ => None,
-        },
+        Expr::Optional(inner) => field_read(inner),
         _ => None,
     }
 }
@@ -490,7 +495,7 @@ fn walk_pipe(stages: &[Expr], var: &str, st: State, piped: bool) -> Option<State
     let mut cur = st;
     let mut i = 0;
     while i < stages.len() {
-        if matches!(&stages[i], Expr::Var(name) if name == var) && cur.repeated {
+        if is_var(&stages[i], var) && cur.repeated {
             let end = i
                 + 1
                 + stages[i + 1..]
@@ -627,25 +632,97 @@ mod tests {
         assert_eq!(reads(". as $x | ($x).a + [$x]"), Some(DeferredReads::Whole));
     }
 
-    /// The bare spelling is admitted under a repeated ambient and the parenthesised one is not, because
-    /// `walk_pipe` tests the head of a field chain itself and does not see through a parenthesis
-    /// (#5957). Pinned so that fixing it must change these rows.
+    /// #5957: a parenthesis only groups, so the deferred bind's walk reads `($x).k`, `$x | (.k)` and
+    /// `$x | (.k)?` under a repeated ambient as it reads `$x.k` (it used to refuse them, keeping the
+    /// bind eager), and the fold's projection ([`var_reads`]) agrees with it on the same spellings.
     #[test]
-    fn a_parenthesized_head_under_a_repeated_ambient_is_refused_until_5957() {
-        for (bare, paren) in [
+    fn a_parenthesized_read_under_a_repeated_ambient_is_classified_as_the_bare_one_5957() {
+        for (bare, parens) in [
             (
                 ". as $x | .users[] | $x.limit",
-                ". as $x | .users[] | ($x).limit",
+                &[
+                    ". as $x | .users[] | ($x).limit",
+                    ". as $x | .users[] | (($x)).limit",
+                    ". as $x | .users[] | $x | (.limit)",
+                    ". as $x | .users[] | ($x) | (.limit)",
+                ][..],
             ),
             (
                 ". as $x | .users[] | select(.n > $x.limit)",
-                ". as $x | .users[] | select(.n > ($x).limit)",
+                &[". as $x | .users[] | select(.n > ($x).limit)"][..],
             ),
-            (". as $x | [.[] | $x.a]", ". as $x | [.[] | ($x).a]"),
+            (
+                ". as $x | [.[] | $x.a]",
+                &[". as $x | [.[] | ($x).a]", ". as $x | [.[] | $x | ((.a))]"][..],
+            ),
+            (
+                ". as $x | .users[] | $x.a?",
+                &[
+                    ". as $x | .users[] | ($x).a?",
+                    ". as $x | .users[] | $x | (.a)?",
+                    ". as $x | .users[] | $x | (.a?)",
+                    ". as $x | .users[] | $x | (.a?)?",
+                ][..],
+            ),
+            (
+                ". as $x | .users[] | $x.a.b",
+                &[
+                    ". as $x | .users[] | ($x).a.b",
+                    ". as $x | .users[] | $x | (.a) | .b",
+                ][..],
+            ),
         ] {
             assert_eq!(reads(bare), Some(DeferredReads::Members), "{bare}");
-            assert_eq!(reads(paren), None, "{paren}");
+            for paren in parens {
+                assert_eq!(reads(paren), reads(bare), "{paren}");
+            }
         }
+    }
+
+    /// #5957: only the head and the field stages see through a parenthesis. A whole-node read under a
+    /// repeated ambient, however it is grouped, and a read the walk cannot place, are refused or
+    /// shared exactly as the bare spelling is.
+    #[test]
+    fn a_parenthesized_whole_read_under_a_repeated_ambient_is_unchanged_5957() {
+        for (bare, paren) in [
+            (". as $x | .users[] | $x", ". as $x | .users[] | ($x)"),
+            (
+                ". as $x | .users[] | $x | length",
+                ". as $x | .users[] | ($x) | length",
+            ),
+            (
+                ". as $x | .users[] | $x.a[0]",
+                ". as $x | .users[] | ($x).a[0]",
+            ),
+            (
+                ". as $x | .users[] | $x | .a[]",
+                ". as $x | .users[] | ($x) | (.a[])",
+            ),
+        ] {
+            assert_eq!(reads(paren), reads(bare), "{paren}");
+        }
+        // The head the walk admits is a field chain nothing consumes: a stage after it still refuses.
+        assert_eq!(reads(". as $x | .users[] | ($x).a | length"), None);
+        assert_eq!(reads(". as $x | .users[] | $x | (.a) | length"), None);
+    }
+
+    /// #5957: the fold's projection and the deferred bind's walk share one definition of a field-head
+    /// read, so a parenthesis around the field stage is a head read for both.
+    #[test]
+    fn a_parenthesized_field_stage_is_a_field_head_read_5957() {
+        let heads = |fields: &[&str]| {
+            fields
+                .iter()
+                .copied()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(field_heads("$u | (.a)"), (heads(&["a"]), false));
+        assert_eq!(field_heads("$u | (.a)?"), (heads(&["a"]), false));
+        assert_eq!(field_heads("($u) | ((.a?))"), (heads(&["a"]), false));
+        // A parenthesised stage that is not a field is still a whole-node read.
+        assert_eq!(field_heads("$u | (.a | length)"), (heads(&[]), true));
+        assert_eq!(field_heads("$u | (.[0])"), (heads(&[]), true));
     }
 
     #[test]
