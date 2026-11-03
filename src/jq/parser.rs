@@ -1407,6 +1407,45 @@ fn collect_sites<'a, T>(
 /// See [`Parser::shadow_retry_budget`].
 const SHADOW_RETRY_BUDGET: usize = 64;
 
+/// The other spellings yq's lexer accepts for an operator this parser spells with underscores
+/// (#6078): `line_?comment|lineComment` is `line_comment`, `linecomment` and `lineComment`; a
+/// rule such as `to_?entries|toEntries` adds `toentries` and `toEntries` to `to_entries`. Read
+/// from the rule table of `pkg/yqlib/lexer_participle.go` (v4.53.3). Yq mode only: jq has none of
+/// them, and `succinctly jq 'groupby(.)'` stays an undefined function.
+const YQ_SPELLINGS: &[(&str, &[&str])] = &[
+    ("line_comment", &["lineComment", "linecomment"]),
+    ("head_comment", &["headComment", "headcomment"]),
+    ("foot_comment", &["footComment", "footcomment"]),
+    ("document_index", &["documentIndex", "documentindex"]),
+    ("file_index", &["fileindex"]),
+    ("filename", &["fileName", "file_name"]),
+    ("split_doc", &["splitDoc", "splitdoc"]),
+    ("map_values", &["mapvalues"]),
+    ("group_by", &["groupby"]),
+    ("sort_by", &["sortby"]),
+    ("unique_by", &["uniqueby"]),
+    ("sort_keys", &["sortkeys"]),
+    ("to_entries", &["toentries", "toEntries"]),
+    ("from_entries", &["fromentries", "fromEntries"]),
+    ("with_entries", &["withentries", "withEntries"]),
+    ("from_unix", &["fromunix"]),
+    ("to_unix", &["tounix"]),
+    (
+        "array_to_map",
+        &["array_tomap", "arrayto_map", "arraytomap"],
+    ),
+];
+
+/// The other spellings of `keyword` in yq mode: none for most.
+fn yq_spellings_of(keyword: &str) -> impl Iterator<Item = &'static str> {
+    YQ_SPELLINGS
+        .iter()
+        .find(|(canonical, _)| *canonical == keyword)
+        .map_or(&[][..], |(_, spellings)| *spellings)
+        .iter()
+        .copied()
+}
+
 /// The seven yq metadata-assignment keywords (#798): `PATH <slot> = value` /
 /// `PATH <slot> |= filter` selects the assign variant when one of these is
 /// immediately followed by `=`/`|=`. Shared by `Parser::try_parse_meta_op`
@@ -1725,6 +1764,13 @@ impl<'a> Parser<'a> {
 
     /// Check if current position matches a keyword (followed by non-ident char).
     fn matches_keyword(&self, keyword: &str) -> bool {
+        self.matches_spelling(keyword)
+            || (self.mode == ParserMode::Yq
+                && yq_spellings_of(keyword).any(|spelling| self.matches_spelling(spelling)))
+    }
+
+    /// Whether the input is at `keyword` exactly as spelled, with no name character after it.
+    fn matches_spelling(&self, keyword: &str) -> bool {
         if !self.input[self.pos..].starts_with(keyword) {
             return false;
         }
@@ -1853,6 +1899,15 @@ impl<'a> Parser<'a> {
 
     /// Consume a keyword.
     fn consume_keyword(&mut self, keyword: &str) {
+        // The spelling the input has: `keyword` itself, or in yq mode one of its other spellings.
+        if self.mode == ParserMode::Yq && !self.input[self.pos..].starts_with(keyword) {
+            if let Some(spelling) = yq_spellings_of(keyword)
+                .find(|spelling| self.input[self.pos..].starts_with(spelling))
+            {
+                self.pos += spelling.len();
+                return;
+            }
+        }
         self.pos += keyword.len();
     }
 
@@ -4314,6 +4369,23 @@ impl<'a> Parser<'a> {
                 {
                     // #4206: yq's `to_json` / `to_yaml`, each with an optional literal indent.
                     self.parse_yq_to_text_operator()
+                } else if self.mode == ParserMode::Yq && self.matches_keyword("root") {
+                    // #6078: yq's `root`, the document's root node: `parent(-1)`.
+                    self.consume_keyword("root");
+                    let desugared =
+                        parse_with_mode_and_extensions("parent(-1)", ParserMode::Yq, true)?;
+                    self.zero_arity_or_wrong_arity_call(keyword_start, Some("root"), desugared)
+                } else if self.mode == ParserMode::Yq && self.matches_keyword("parents") {
+                    // #6078: yq's `parents`, the node's ancestors as a sequence, the nearest first
+                    // and the document root last (`[]` at the root). `parent(n)` is empty past the
+                    // root, which is where the walk stops.
+                    self.consume_keyword("parents");
+                    let desugared = parse_with_mode_and_extensions(
+                        "[label $out | range(1; 1000) as $n | (parent($n) // break $out)]",
+                        ParserMode::Yq,
+                        true,
+                    )?;
+                    self.zero_arity_or_wrong_arity_call(keyword_start, Some("parents"), desugared)
                 } else if self.mode == ParserMode::Yq && self.matches_keyword("array_to_map") {
                     // #5458: yq's `array_to_map`: an array becomes a map keyed by index and a map
                     // keeps its entries, each with its null values skipped; a scalar is `{}`. An
@@ -15640,6 +15712,7 @@ mod tests {
             "omit",
             "or",
             "parent",
+            "parents",
             "pick",
             "pivot",
             "reverse",
@@ -15648,6 +15721,7 @@ mod tests {
             "shuffle",
             "sort",
             "sortKeys",
+            "root",
             "sort_by",
             "sort_keys",
             "split",
