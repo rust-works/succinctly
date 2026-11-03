@@ -1349,6 +1349,10 @@ fn a_negative_number_is_computed_however_spelled_5223() {
             ("null", "[-1] | path(.[0] | -1)", ok(&["[0]"])),
             ("null", "[-00] | path(.[0] | -00)", ok(&["[0]"])),
             ("null", "[-0] | path(.[0] | -0)", ok(&["[0]"])),
+            // The sign survives where path mode takes the number as its register value (#6042).
+            ("null", "-0 | del(empty)", ok(&["-0"])),
+            ("null", "[-0 | try path(error) catch .]", ok(&["[-0]"])),
+            ("null", "[-00 | try pick(error) catch .]", ok(&["[-0]"])),
         ]);
     });
 }

@@ -21,6 +21,12 @@ fn a_negative_zero_literal_keeps_its_sign_through_path_mode() -> Result<()> {
         ("[-0|try path(error) catch .]", "[-0]"),
         ("[-0|try pick(error) catch .]", "[-0]"),
         ("[-0|try error catch .]", "[-0]"),
+        // The other spellings of the same negation.
+        ("[-00|try path(error) catch .]", "[-0]"),
+        ("[- 0|try path(error) catch .]", "[-0]"),
+        ("[-(0)|try path(error) catch .]", "[-0]"),
+        ("[-0e0|try path(error) catch .]", "[-0]"),
+        ("-00 | del(empty)", "-0"),
         // Neighbours that must not change: a read `-0` float, a computed zero, and negatives that
         // are plain integers.
         ("[-0.0|try path(error) catch .]", "[-0]"),
