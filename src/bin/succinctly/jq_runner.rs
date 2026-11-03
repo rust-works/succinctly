@@ -5005,7 +5005,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     break;
                 }
                 jq::cli_context::set_current_source(u32::try_from(file_idx).ok());
-                let file = files.get(file_idx).map(|p| p.to_string_lossy().to_string());
+                let file = files.get(file_idx).map(|p| input_display_name(p));
 
                 // Build DSV index (memory-efficient with SIMD)
                 let config = DsvConfig::default().with_delimiter(delimiter as u8);
@@ -5218,7 +5218,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }
                 // patchcov: coverage tolerate reason="defensive: the splitter stops only at a fault jq's parser also meets, so `slurp_fault` names one; kept so a disagreement between them prints the old line-0 message rather than none (#5555)"
                 Err(SlurpFailure::Unsplittable(None)) => {
-                    let file = files.first().map(|p| p.to_string_lossy().to_string());
+                    let file = files.first().map(|p| input_display_name(p));
                     sink.report(
                         DiagStyle::Jq,
                         &EvalError::new("Invalid JSON text"),
@@ -5281,8 +5281,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // `InputLocations::single` always did.
             let source = slurped.as_ref().map_or(idx, |s| s.last_source);
             jq::cli_context::set_current_source(u32::try_from(source).ok());
-            let filename: Option<String> =
-                files.get(source).map(|p| p.to_string_lossy().to_string());
+            let filename: Option<String> = files.get(source).map(|p| input_display_name(p));
             // Validate JSON if --validate flag is set. Under `--slurp` this
             // already ran per file, on each file's own bytes, inside
             // `slurp_documents`; the synthesized buffer is not input.
@@ -5743,8 +5742,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 let malformed = e.downcast::<MalformedJsonError>()?;
                 let err = malformed.to_eval_error();
                 // The files that opened: `source` indexes them (#5472).
-                let name_of =
-                    |source: usize| opened.get(source).map(|p| p.to_string_lossy().to_string());
+                let name_of = |source: usize| opened.get(source).map(|p| input_display_name(p));
                 // #5555: jq's own parse error reads a slurped stream before the program
                 // runs, so it is a parse error; under `-n` it is the error `inputs` raises,
                 // at the position the parser stood on.
@@ -6368,12 +6366,8 @@ fn get_inputs(
             Err(e) => return Ok(Err(e)),
         };
         opened.clone_from(&files);
-        let locations = InputLocations::new(
-            files
-                .iter()
-                .map(|p| Some(p.to_string_lossy().to_string()))
-                .collect(),
-        );
+        let locations =
+            InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
         let tags = if files.is_empty() {
             vec![None]
         } else {
@@ -6608,16 +6602,12 @@ fn get_inputs(
     if (args.stream_errors || stream_by_reader) && json_input_mode {
         if args.validate {
             for (file_idx, raw) in &raw_bytes {
-                let filename = file_idx.map(|idx| files[idx].to_string_lossy().to_string());
+                let filename = file_idx.map(|idx| input_display_name(&files[idx]));
                 validate_json_input(raw, filename.as_deref())?;
             }
         }
-        let mut locations = InputLocations::new(
-            files
-                .iter()
-                .map(|p| Some(p.to_string_lossy().to_string()))
-                .collect(),
-        );
+        let mut locations =
+            InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
         // #5498: the program reads its inputs through `input`/`inputs` (under `-n`) or the driver
         // loop pops them (a plain walk), and the reader hands them out as they are asked for, so a
         // stream of events is never held. `--stream-errors` without `-n` keeps its eager read.
@@ -6775,7 +6765,7 @@ fn get_inputs(
                 // it is unreachable in JSON mode; it stays for the modes that
                 // never validate.
                 if args.validate && json_input_mode {
-                    let filename = file_idx.map(|idx| files[idx].to_string_lossy().to_string());
+                    let filename = file_idx.map(|idx| input_display_name(&files[idx]));
                     validate_json_input(e.as_bytes(), filename.as_deref())?;
                 }
                 if lazy_candidate {
@@ -6836,12 +6826,8 @@ fn get_inputs(
     }
 
     debug_assert!(seams.is_empty() || seams.len() == raw_inputs.len());
-    let mut locations = InputLocations::new(
-        files
-            .iter()
-            .map(|p| Some(p.to_string_lossy().to_string()))
-            .collect(),
-    );
+    let mut locations =
+        InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
     locations.eof_tail = eof_tail;
 
     // `--slurp`'s single combined value has no content of its own to name a
@@ -7077,7 +7063,7 @@ fn get_inputs(
             } else {
                 // JSON input: validate first if --validate is set
                 if args.validate {
-                    let filename = file_idx.map(|idx| files[idx].to_string_lossy().to_string());
+                    let filename = file_idx.map(|idx| input_display_name(&files[idx]));
                     validate_json_input(raw.as_bytes(), filename.as_deref())?;
                 }
                 // #4311: a program using `input`/`inputs` sees jq resume after
@@ -7496,10 +7482,7 @@ fn input_names(files: &[std::path::PathBuf]) -> Vec<Option<String>> {
     if files.is_empty() {
         vec![None]
     } else {
-        files
-            .iter()
-            .map(|p| Some(p.to_string_lossy().to_string()))
-            .collect()
+        files.iter().map(|p| Some(input_display_name(p))).collect()
     }
 }
 
@@ -8224,7 +8207,31 @@ fn open_chunked_inputs(files: &[PathBuf], open_failed: &mut bool) -> Result<Chun
         }));
         return Ok((opened, openers));
     }
+    let mut dash_seen = false;
     for path in files {
+        if is_stdin_dash(path) {
+            // `-` is standard input: the first one holds it all (kept whole), a later one is empty.
+            let first = !std::mem::replace(&mut dash_seen, true);
+            let read = if first {
+                dash_stdin_bytes()
+            } else {
+                Ok(Vec::new())
+            };
+            match read {
+                Ok(mut bytes) => {
+                    let skip = bom_to_skip(&bytes[..bytes.len().min(3)], &mut look_for_bom);
+                    bytes.drain(..skip);
+                    opened.push(path.clone());
+                    openers.push(Box::new(move || Ok(Box::new(std::io::Cursor::new(bytes)))));
+                }
+                Err(e) => {
+                    let e = InputFileOpenError::new(path, e.to_string());
+                    note_open_failure_at(opened.len());
+                    report_unopenable_input(&e, open_failed);
+                }
+            }
+            continue;
+        }
         let probed = std::fs::File::open(path)
             .and_then(|mut file| read_head(&mut file))
             .map_err(|e| InputFileOpenError::new(path, strerror_only(&e)));
@@ -8284,6 +8291,39 @@ fn read_stdin_bytes() -> Result<Vec<u8>> {
         .read_to_end(&mut buf)
         .context("Failed to read from stdin")?;
     Ok(buf)
+}
+
+/// Whether an input file argument is `-`, which jq reads as standard input (#6023).
+fn is_stdin_dash(path: &Path) -> bool {
+    path.as_os_str() == "-"
+}
+
+thread_local! {
+    /// What standard input held when a `-` input first asked for it (#6023). A route can read the
+    /// file list, decline it and leave the next route to read it again; stdin can be read once, so
+    /// the bytes are kept and each pass over the list hands them to its first `-` again.
+    static DASH_STDIN: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
+/// Standard input as the first `-` of a pass over the input files sees it: all of it. A later `-`
+/// in the same pass reads nothing, as jq's does (its stdin is spent).
+fn dash_stdin_bytes() -> Result<Vec<u8>> {
+    DASH_STDIN.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.is_none() {
+            *cache = Some(read_stdin_bytes()?);
+        }
+        Ok(cache.clone().unwrap_or_default())
+    })
+}
+
+/// How an input file is named in `input_filename` and in error locations: jq calls `-` `<stdin>`.
+fn input_display_name(path: &Path) -> String {
+    if is_stdin_dash(path) {
+        "<stdin>".to_string()
+    } else {
+        path.to_string_lossy().to_string()
+    }
 }
 
 /// Read a file to bytes.
@@ -8391,8 +8431,20 @@ fn read_input_files(files: &[PathBuf]) -> (Vec<PathBuf>, Vec<Vec<u8>>, OpenFailu
     let mut opened = Vec::with_capacity(files.len());
     let mut raws = Vec::with_capacity(files.len());
     let mut failures = Vec::new();
+    let mut dash_seen = false;
     for path in files {
-        match read_file_bytes(path) {
+        let read = if is_stdin_dash(path) {
+            // `-` is standard input: the first one holds it all, a later one is empty.
+            let first = !std::mem::replace(&mut dash_seen, true);
+            if first {
+                dash_stdin_bytes().map_err(|e| InputFileOpenError::new(path, e.to_string()))
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            read_file_bytes(path)
+        };
+        match read {
             Ok(raw) => {
                 opened.push(path.clone());
                 raws.push(raw);
@@ -10331,9 +10383,17 @@ fn slurp_fault(
     raw: &[u8],
     origin: (usize, usize),
 ) -> Option<String> {
-    let earlier: Option<Vec<Vec<u8>>> = files
-        .get(..=idx)
-        .and_then(|files| files.iter().map(|path| std::fs::read(path).ok()).collect());
+    let earlier: Option<Vec<Vec<u8>>> = files.get(..=idx).and_then(|files| {
+        files
+            .iter()
+            // A `-` is stdin, which cannot be read again (and not a file of that name).
+            .map(|path| {
+                (!is_stdin_dash(path))
+                    .then(|| std::fs::read(path).ok())
+                    .flatten()
+            })
+            .collect()
+    });
     match earlier {
         Some(mut all) if idx > 0 => {
             strip_leading_json_bom(all.iter_mut());
@@ -10353,18 +10413,24 @@ fn slurp_fault(
 fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
     let mut unreadable = false;
     let mut at_front = true;
-    let chunks = files.iter().map_while(|path| match std::fs::read(path) {
-        Ok(mut raw) => {
-            // The bytes as read, not as substituted: jq's parser counts those (#5964).
-            if at_front && !raw.is_empty() {
-                at_front = false;
-                raw.drain(..crate::front_matter::leading_bom_len(&raw));
+    let chunks = files.iter().map_while(|path| {
+        match if is_stdin_dash(path) {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        } else {
+            std::fs::read(path)
+        } {
+            Ok(mut raw) => {
+                // The bytes as read, not as substituted: jq's parser counts those (#5964).
+                if at_front && !raw.is_empty() {
+                    at_front = false;
+                    raw.drain(..crate::front_matter::leading_bom_len(&raw));
+                }
+                Some(raw)
             }
-            Some(raw)
-        }
-        Err(_) => {
-            unreadable = true;
-            None
+            Err(_) => {
+                unreadable = true;
+                None
+            }
         }
     });
     let fault = jq::jq_stream_fault(chunks, 1, 0);
@@ -10406,7 +10472,7 @@ fn slurp_documents(
     let mut origin = StreamOrigin::ALONE.file;
     for (idx, raw) in raw_inputs.into_iter().enumerate() {
         if validate {
-            let filename = files.get(idx).map(|p| p.to_string_lossy().to_string());
+            let filename = files.get(idx).map(|p| input_display_name(p));
             validate_json_input(&raw, filename.as_deref()).map_err(SlurpFailure::Validation)?;
         }
         let (spans, split_error) = split_json_values(&raw);
