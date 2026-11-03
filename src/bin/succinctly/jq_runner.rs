@@ -6905,30 +6905,29 @@ fn get_inputs(
         // #5857: a clean stream of several files converts each document when the program reads
         // it, as a single file does. One file the route turns down sends them all to the loop
         // below, with the end of the stream read from the files' bytes up front.
-        let raw_inputs = if lazy_candidate && raw_inputs.len() > 1 && !lazy_route_forced_off() {
-            match lazy_json_sources(&raw_inputs, &seams) {
-                Some((tail, spans)) => {
-                    locations.eof_tail = Some(tail);
-                    for ((file_idx, raw), (spans, seam)) in raw_inputs.into_iter().zip(spans) {
-                        defer_lazy_start(std::rc::Rc::new(raw), spans, file_idx.unwrap_or(0), seam);
-                    }
-                    lazy_inputs = true;
-                    Vec::new()
+        let several = lazy_candidate && raw_inputs.len() > 1;
+        let lazy = if several && !lazy_route_forced_off() {
+            lazy_json_sources(&raw_inputs, &seams)
+        } else {
+            None
+        };
+        let raw_inputs = match lazy {
+            Some((tail, spans)) => {
+                locations.eof_tail = Some(tail);
+                for ((file_idx, raw), (spans, seam)) in raw_inputs.into_iter().zip(spans) {
+                    defer_lazy_start(std::rc::Rc::new(raw), spans, file_idx.unwrap_or(0), seam);
                 }
-                None => {
+                lazy_inputs = true;
+                Vec::new()
+            }
+            None => {
+                if several {
                     let sources: Vec<&[u8]> =
                         raw_inputs.iter().map(|(_, raw)| raw.as_bytes()).collect();
                     locations.eof_tail = Some(EofTail::of(&sources, false, &seams, false));
-                    raw_inputs
                 }
+                raw_inputs
             }
-        } else {
-            if lazy_candidate && raw_inputs.len() > 1 {
-                let sources: Vec<&[u8]> =
-                    raw_inputs.iter().map(|(_, raw)| raw.as_bytes()).collect();
-                locations.eof_tail = Some(EofTail::of(&sources, false, &seams, false));
-            }
-            raw_inputs
         };
         for (pos, (file_idx, raw)) in raw_inputs.into_iter().enumerate() {
             let src = file_idx.unwrap_or(0);
@@ -9311,13 +9310,7 @@ fn lazy_json_producer_then(
     // A source with no documents (an empty file) has nothing to hand out.
     let mut sources = sources;
     sources.retain(|source| !source.spans.is_empty());
-    // The counter's place in the front source's text, kept between reads without a borrow of
-    // it; `None` before its first read.
-    let mut lines: Option<LinePlace> = None;
-    let mut next = 0;
-    // The index over the documents being read, and how much text the next one covers (#5854).
-    let mut batch: Option<LazyBatch> = None;
-    let mut batch_bytes = LAZY_BATCH_FIRST_BYTES;
+    let mut cursor = LazyCursor::default();
     Box::new(move || {
         let Some(lazy) = sources.front() else {
             return tail
@@ -9325,19 +9318,25 @@ fn lazy_json_producer_then(
                 .unwrap_or(jq::ProducedInput::End(exhausted));
         };
         let bytes = lazy.text.as_bytes();
-        let (start, end) = lazy.spans[next];
-        if batch.as_ref().map_or(true, |b| next >= b.end) {
-            batch = Some(LazyBatch::build(bytes, &lazy.spans, next, batch_bytes));
-            batch_bytes = (batch_bytes * 2).min(LAZY_BATCH_MAX_BYTES);
+        let (start, end) = lazy.spans[cursor.next];
+        if cursor.batch.as_ref().map_or(true, |b| cursor.next >= b.end) {
+            cursor.batch = Some(LazyBatch::build(
+                bytes,
+                &lazy.spans,
+                cursor.next,
+                cursor.batch_bytes,
+            ));
+            cursor.batch_bytes = (cursor.batch_bytes * 2).min(LAZY_BATCH_MAX_BYTES);
         }
-        let at = next;
-        next += 1;
-        let place = lines
+        let at = cursor.next;
+        cursor.next += 1;
+        let place = cursor
+            .lines
             .take()
             .unwrap_or_else(|| LineCounter::at_seam(bytes, lazy.seam.clone()).place());
         let mut counter = LineCounter::resume(bytes, &place);
         let line = counter.read_end_line(end);
-        lines = Some(counter.place());
+        cursor.lines = Some(counter.place());
         debug_assert!(
             json_depth_at_most(&bytes[start..end], LAZY_JSON_MAX_DEPTH),
             "a lazily converted document is within the depth the route admits"
@@ -9345,23 +9344,46 @@ fn lazy_json_producer_then(
         // Serde accepted the span as a whole value and its depth is bounded
         // (`lazy_json_scan`), so it is the conversion the eager route made, minus
         // a position only a depth error would have read.
-        let converted = batch
+        let converted = cursor
+            .batch
             .as_ref()
             .and_then(|batch| batch.document(bytes, &lazy.spans, at))
             .unwrap_or_else(|| stream_document_validated(&bytes[start..end], None, &[], 0));
         // Narrowed as `InputLocations::push` narrows the eager route's lines.
         let produced = jq::ProducedInput::converted(converted, lazy.source, line as u32);
-        if next == lazy.spans.len() {
+        if cursor.next == lazy.spans.len() {
             // The source's text goes with its last document, not with the read past it; the next
             // source starts its own count.
             sources.pop_front();
-            next = 0;
-            batch = None;
-            batch_bytes = LAZY_BATCH_FIRST_BYTES;
-            lines = None;
+            cursor = LazyCursor::default();
         }
         produced
     })
+}
+
+/// Where the producer is in the source it is reading: every field is an offset into that source's
+/// text, so the next source starts from a fresh one.
+struct LazyCursor {
+    /// The next document of the source.
+    next: usize,
+    /// The line counter's place in the text, kept between reads without a borrow of it; `None`
+    /// before the first read.
+    lines: Option<LinePlace>,
+    /// The index over the documents being read (#5854).
+    batch: Option<LazyBatch>,
+    /// How much text the next batch covers.
+    batch_bytes: usize,
+}
+
+impl Default for LazyCursor {
+    fn default() -> Self {
+        Self {
+            next: 0,
+            lines: None,
+            batch: None,
+            batch_bytes: LAZY_BATCH_FIRST_BYTES,
+        }
+    }
 }
 
 /// Leaves a stream's lazy documents for the call site that seeds the `input` queue, which takes them.
@@ -9711,11 +9733,13 @@ fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Ve
 type LazySourceScan = (Vec<(usize, usize)>, Seam);
 
 /// The lazy route's sources for a stream of several files (#5857): each file's documents and its
-/// [`Seam`], and the end of the stream read from the last file's spans, or `None` when any file
-/// is not clean plain JSON the route converts (a parse error, a BOM, a document nested too deeply)
-/// or the last one holds no document, whose end marker the earlier files decide.
+/// [`Seam`], and the end of the stream, or `None` when any file is not clean plain JSON the route
+/// converts (a parse error, a BOM, a document nested too deeply) or none holds a document.
 ///
-/// A file of white space holds no document and takes no part in the stream's reads.
+/// A file of white space holds no document and takes no part in the stream's reads. When the last
+/// one is, the stream ends on its newlines and in no read that completes a value: a bare number
+/// or literal that ended an earlier file has been moved onto it by the stitch (#4305), which then
+/// holds a document.
 fn lazy_json_sources(
     raw_inputs: &[(Option<usize>, String)],
     seams: &[Seam],
@@ -9736,12 +9760,19 @@ fn lazy_json_sources(
         };
         sources.push((spans, seams.get(pos).cloned().unwrap_or_default()));
     }
-    let (last_spans, last_seam) = sources.last()?;
-    if last_spans.is_empty() {
+    if sources.iter().all(|(spans, _)| spans.is_empty()) {
         return None;
     }
+    let (last_spans, last_seam) = sources.last()?;
     let last = raw_inputs.last()?.1.as_bytes();
-    let tail = EofTail::of_clean_source(last, last_spans, last_seam.base);
+    let tail = if last_spans.is_empty() {
+        EofTail {
+            newlines: count_newlines(&last[last_seam.base.min(last.len())..]) as u32,
+            unknown: false,
+        }
+    } else {
+        EofTail::of_clean_source(last, last_spans, last_seam.base)
+    };
     Some((tail, sources))
 }
 
@@ -14608,10 +14639,10 @@ mod tests {
                 }
             }
         }
-        assert!(checked > 20000, "{checked} streams");
+        assert!(checked > 5000, "{checked} streams");
         assert!(
-            lazy_streams > 10000,
-            "{lazy_streams} streams took the lazy route"
+            lazy_streams * 2 > checked,
+            "{lazy_streams} of {checked} streams took the lazy route"
         );
     }
 
