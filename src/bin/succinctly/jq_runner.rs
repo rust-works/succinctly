@@ -6947,7 +6947,13 @@ fn get_inputs(
             Some((tail, spans)) => {
                 locations.eof_tail = Some(tail);
                 for ((file_idx, raw), (spans, seam)) in raw_inputs.into_iter().zip(spans) {
-                    defer_lazy_start(std::rc::Rc::new(raw), spans, file_idx.unwrap_or(0), seam);
+                    defer_lazy_start(
+                        std::rc::Rc::new(raw),
+                        spans,
+                        file_idx.unwrap_or(0),
+                        seam,
+                        None,
+                    );
                 }
                 lazy_inputs = true;
                 Vec::new()
@@ -7021,23 +7027,46 @@ fn get_inputs(
                     let mut lazy_prefix: Option<Vec<(usize, usize)>> = None;
                     if !args.stream && pos == 0 && last == 0 {
                         let scan = if lazy_route_forced_off() {
-                            LazyScan {
+                            LazyChunk {
                                 spans: Vec::new(),
-                                clean: false,
+                                end: ChunkEnd::Fault,
                             }
                         } else {
-                            lazy_json_scan(&raw)
+                            lazy_json_scan_chunk(&raw, 0, lazy_chunk_budget(0))
                         };
-                        if scan.clean {
-                            let spans = scan.spans;
+                        if scan.end != ChunkEnd::Fault {
+                            let mut spans = scan.spans;
                             // Set already only for a stream that is not UTF-8, the one case
                             // whose seam the substitution moves.
-                            if locations.eof_tail.is_none() {
+                            let recorded_tail = locations.eof_tail;
+                            // #5856: a stream with more text than the first chunk covers is
+                            // scanned on as the program reads it, and its end is settled when the
+                            // scan reaches it; until then it is recorded as one jq has not read to.
+                            let more = (scan.end == ChunkEnd::More).then(|| LazyMore {
+                                scanned_to: spans.last().map_or(0, |&(_, end)| end),
+                                chunks: 1,
+                                file_start,
+                                seams: seams.clone(),
+                                last_source: locations.last_src(),
+                                lossy: lossy.cloned(),
+                                last_span: None,
+                                recorded_tail,
+                            });
+                            if recorded_tail.is_none() {
                                 debug_assert_eq!(seam, Seam::NONE, "a lone source is unstitched");
-                                locations.eof_tail =
-                                    Some(EofTail::of_clean_source(raw.as_bytes(), &spans, 0));
+                                locations.eof_tail = Some(if more.is_some() {
+                                    EofTail {
+                                        newlines: 0,
+                                        unknown: true,
+                                    }
+                                } else {
+                                    EofTail::of_clean_source(raw.as_bytes(), &spans, 0)
+                                });
                             }
-                            defer_lazy_start(std::rc::Rc::new(raw), spans, src, seam);
+                            if more.is_none() {
+                                spans.shrink_to_fit();
+                            }
+                            defer_lazy_start(std::rc::Rc::new(raw), spans, src, seam, more);
                             lazy_inputs = true;
                             continue;
                         }
@@ -7066,7 +7095,7 @@ fn get_inputs(
                     let mut offset = 0;
                     if let Some(spans) = lazy_prefix {
                         offset = spans.last().map_or(0, |&(_, end)| end);
-                        defer_lazy_start(std::rc::Rc::clone(&raw), spans, src, seam.clone());
+                        defer_lazy_start(std::rc::Rc::clone(&raw), spans, src, seam.clone(), None);
                         lazy_inputs = true;
                     }
                     let tail_cx = TailContext {
@@ -7870,6 +7899,7 @@ fn parser_chunks<'a>(
 /// invalid bytes into one three-byte U+FFFD, so counted over the text a column is too high by
 /// two for each lone invalid byte. A literal U+FFFD in the document is three bytes to jq as
 /// well, so the two cannot be told apart in the text: the original has to be kept.
+#[derive(Clone)]
 struct LossySource {
     original: Vec<u8>,
     /// Where the substitution changed the document, in order (#5975): a run it replaced by one
@@ -9355,6 +9385,64 @@ struct LazyJsonInputs {
     source: u32,
     /// The source's [`Seam`], which its line counting starts from.
     seam: Seam,
+    /// What the producer needs to scan the rest of the text when it has read `spans`; `None` when
+    /// they are all of it (#5856).
+    more: Option<LazyMore>,
+}
+
+/// A lazy stream whose scan is not finished (#5856): the producer scans the next chunk of `text`
+/// when it has read the documents of the last, and hands a fault to the eager reader as
+/// [`get_inputs`] does for one it finds up front.
+struct LazyMore {
+    /// Where the next chunk starts: the end of the last document scanned.
+    scanned_to: usize,
+    /// How many chunks have been scanned, which sizes the next.
+    chunks: usize,
+    /// Where the file starts in jq's input (#5497).
+    file_start: (usize, usize),
+    /// The seams of every source, which the end of a stream that turned malformed is read with.
+    seams: Vec<Seam>,
+    /// The tag of the last source, which the end of the stream names.
+    last_source: u32,
+    /// The bytes jq read, where the text is a substitution of them (#5964).
+    lossy: Option<LossySource>,
+    /// The last document of a chunk already read, which is all the end of the stream is read off.
+    last_span: Option<(usize, usize)>,
+    /// The end of the stream where [`get_inputs`] recorded it before the scan, for a stream that is
+    /// not UTF-8 (the one case whose seam the substitution moves); else it is read off the spans
+    /// when the scan reaches the end.
+    recorded_tail: Option<EofTail>,
+}
+
+/// The first chunk of a lazy stream covers about this much text, and each chunk after it twice the
+/// one before up to [`LAZY_CHUNK_MAX_BYTES`], so a program that stops early (`first(inputs)`)
+/// scans little more than it reads (#5856).
+const LAZY_CHUNK_FIRST_BYTES: usize = 1 << 16;
+
+/// The most text a chunk of a lazy stream covers, past its first document.
+const LAZY_CHUNK_MAX_BYTES: usize = 1 << 22;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the size of every chunk, in place of the doubling from
+    /// [`LAZY_CHUNK_FIRST_BYTES`], so short streams are scanned in several (#5856).
+    static LAZY_CHUNK_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Test-only: the chunks [`lazy_scan_on`] scanned, and how many of them ended at a fault.
+    static LAZY_CHUNKS_SCANNED: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The budget of the `index`th chunk of a stream (0 is the first).
+fn lazy_chunk_budget(index: usize) -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = LAZY_CHUNK_BYTES.with(std::cell::Cell::get) {
+        return bytes;
+    }
+    LAZY_CHUNK_FIRST_BYTES
+        .checked_shl(index.min(32) as u32)
+        .map_or(LAZY_CHUNK_MAX_BYTES, |bytes| {
+            bytes.min(LAZY_CHUNK_MAX_BYTES)
+        })
 }
 
 /// The text a batch's index covers is at most this long, past its first document (#5854).
@@ -9467,18 +9555,33 @@ impl LazyBatch {
 /// tag. A source's text is dropped with its last document.
 fn lazy_json_producer_then(
     sources: std::collections::VecDeque<LazyJsonInputs>,
-    mut tail: std::collections::VecDeque<jq::ProducedInput>,
-    exhausted: Option<(u32, u32)>,
+    mut tail: Box<dyn Iterator<Item = jq::ProducedInput>>,
+    mut exhausted: Option<(u32, u32)>,
 ) -> jq::InputProducer {
     // A source with no documents (an empty file) has nothing to hand out.
     let mut sources = sources;
-    sources.retain(|source| !source.spans.is_empty());
+    sources.retain(|source| !source.spans.is_empty() || source.more.is_some());
     let mut cursor = LazyCursor::default();
     Box::new(move || {
+        loop {
+            let Some(lazy) = sources.front_mut() else {
+                return tail.next().unwrap_or(jq::ProducedInput::End(exhausted));
+            };
+            // Every document scanned so far is read: scan the next chunk (#5856).
+            if cursor.next < lazy.spans.len() {
+                break;
+            }
+            lazy_scan_on(lazy, &mut tail, &mut exhausted);
+            // The documents read are forgotten, so the spans held are a chunk's, not the stream's.
+            cursor.next = 0;
+            cursor.batch = None;
+            if lazy.spans.is_empty() {
+                sources.pop_front();
+                cursor = LazyCursor::default();
+            }
+        }
         let Some(lazy) = sources.front() else {
-            return tail
-                .pop_front()
-                .unwrap_or(jq::ProducedInput::End(exhausted));
+            return tail.next().unwrap_or(jq::ProducedInput::End(exhausted));
         };
         let bytes = lazy.text.as_bytes();
         let (start, end) = lazy.spans[cursor.next];
@@ -9505,7 +9608,7 @@ fn lazy_json_producer_then(
             "a lazily converted document is within the depth the route admits"
         );
         // Serde accepted the span as a whole value and its depth is bounded
-        // (`lazy_json_scan`), so it is the conversion the eager route made, minus
+        // (`lazy_json_scan_chunk`), so it is the conversion the eager route made, minus
         // a position only a depth error would have read.
         let converted = cursor
             .batch
@@ -9514,7 +9617,7 @@ fn lazy_json_producer_then(
             .unwrap_or_else(|| stream_document_validated(&bytes[start..end], None, &[], 0));
         // Narrowed as `InputLocations::push` narrows the eager route's lines.
         let produced = jq::ProducedInput::converted(converted, lazy.source, line as u32);
-        if cursor.next == lazy.spans.len() {
+        if cursor.next == lazy.spans.len() && lazy.more.is_none() {
             // The source's text goes with its last document, not with the read past it; the next
             // source starts its own count.
             sources.pop_front();
@@ -9522,6 +9625,89 @@ fn lazy_json_producer_then(
         }
         produced
     })
+}
+
+/// Scans the next chunk of a lazy stream (#5856): its documents replace `lazy.spans`. At the end of
+/// the text the end of the stream is settled (`exhausted`); at a fault the eager reader reads the
+/// rest from the end of the last document read, and the documents and parse errors it finds are
+/// queued in `tail`, exactly as [`get_inputs`] queues them for a fault it finds up front.
+fn lazy_scan_on(
+    lazy: &mut LazyJsonInputs,
+    tail: &mut Box<dyn Iterator<Item = jq::ProducedInput>>,
+    exhausted: &mut Option<(u32, u32)>,
+) {
+    let Some(mut more) = lazy.more.take() else {
+        lazy.spans.clear();
+        return;
+    };
+    more.last_span = lazy.spans.last().copied().or(more.last_span);
+    lazy.spans.clear();
+    let chunk = lazy_json_scan_chunk(&lazy.text, more.scanned_to, lazy_chunk_budget(more.chunks));
+    more.chunks += 1;
+    #[cfg(test)]
+    LAZY_CHUNKS_SCANNED.with(|n| {
+        let (chunks, faults) = n.get();
+        n.set((
+            chunks + 1,
+            faults + usize::from(chunk.end == ChunkEnd::Fault),
+        ));
+    });
+    // At a fault the chunk's own documents are the eager reader's too, from the end of the last
+    // document read: the text is then done with as soon as it has read them (a stream with a fault
+    // early in it held 4% to 12% more memory than the eager route while its last chunk's documents
+    // were read lazily), and a number or literal directly before the fault is its to decide.
+    if chunk.end != ChunkEnd::Fault {
+        lazy.spans.extend(chunk.spans);
+    }
+    let end_of_last = lazy.spans.last().map_or(more.scanned_to, |&(_, end)| end);
+    let settled = |tail: EofTail| (!tail.unknown).then_some((more.last_source, tail.newlines));
+    match chunk.end {
+        ChunkEnd::More => {
+            more.scanned_to = end_of_last;
+            lazy.more = Some(more);
+        }
+        ChunkEnd::Done => {
+            let last = lazy.spans.last().copied().or(more.last_span);
+            *exhausted = settled(more.recorded_tail.unwrap_or_else(|| {
+                EofTail::of_clean_source(lazy.text.as_bytes(), last.as_slice(), 0)
+            }));
+        }
+        ChunkEnd::Fault => {
+            let text = lazy.text.as_str();
+            let cx = TailContext {
+                stream: false,
+                file_start: more.file_start,
+                src: lazy.source as usize,
+                seam: &lazy.seam,
+                lossy: more.lossy.as_ref(),
+            };
+            let (mut values, mut ends, mut errors) = (Vec::new(), Vec::new(), Vec::new());
+            match read_json_tail(text, end_of_last, &cx, &mut values, &mut ends, &mut errors) {
+                Ok(_) => {
+                    let mut locations = InputLocations::new(Vec::new());
+                    locations.extend_from_ends(
+                        lazy.source as usize,
+                        text,
+                        lazy.seam.clone(),
+                        &ends,
+                        values.len(),
+                    );
+                    *tail = Box::new(lazy_tail_items(values, &locations, None, errors));
+                }
+                // patchcov: coverage tolerate reason="unreachable: the splitter is the more lenient of the two parsers and the prefix parse materializes from its spans, so it cannot find fewer values (the guard `read_json_tail` keeps per segment, #4311)"
+                Err(error) => {
+                    *tail = Box::new(std::iter::once(jq::ProducedInput::Error(
+                        EvalError::new(error.to_string()),
+                        (lazy.source, UNKNOWN_LINE),
+                    )))
+                } // patchcov: coverage end
+            }
+            *exhausted = settled(
+                more.recorded_tail
+                    .unwrap_or_else(|| EofTail::of(&[text.as_bytes()], false, &more.seams, false)),
+            );
+        }
+    }
 }
 
 /// Where the producer is in the source it is reading: every field is an offset into that source's
@@ -9551,7 +9737,13 @@ impl Default for LazyCursor {
 
 /// Leaves a stream's lazy documents for the call site that seeds the `input` queue, which takes them.
 /// A stream of several files defers one source per file, in order (#5857).
-fn defer_lazy_start(text: std::rc::Rc<String>, spans: Vec<(usize, usize)>, src: usize, seam: Seam) {
+fn defer_lazy_start(
+    text: std::rc::Rc<String>,
+    spans: Vec<(usize, usize)>,
+    src: usize,
+    seam: Seam,
+    more: Option<LazyMore>,
+) {
     LAZY_JSON_INPUTS.with(|slot| {
         slot.borrow_mut()
             .get_or_insert_with(std::collections::VecDeque::new)
@@ -9560,6 +9752,7 @@ fn defer_lazy_start(text: std::rc::Rc<String>, spans: Vec<(usize, usize)>, src: 
                 spans,
                 source: src as u32,
                 seam,
+                more,
             });
     });
 }
@@ -9584,7 +9777,7 @@ fn seed_input_queue(
         let tail = lazy_tail_items(inputs, locations, trailing_error, resumed_errors);
         jq::seed_remaining_inputs_from(lazy_json_producer_then(
             lazy,
-            tail,
+            Box::new(tail),
             locations.exhausted(slurp),
         ));
         if locations.eof_tail.is_some() {
@@ -9641,35 +9834,59 @@ fn lazy_tail_items(
     locations: &InputLocations,
     trailing_error: Option<TrailingParseError>,
     resumed_errors: Vec<(usize, TrailingParseError)>,
-) -> std::collections::VecDeque<jq::ProducedInput> {
+) -> LazyTail {
     debug_assert_eq!(
         inputs.len(),
         locations.per_value().len(),
         "one location per queued document"
     );
     let documents = inputs.len();
-    // As a plain error: jq's `try input catch .` catches a parse error like any other, where the
-    // materializer's own error is tagged as an uncatchable decode failure.
-    let error_of = |t: TrailingParseError| {
-        jq::ProducedInput::Error(EvalError::new(t.error.message), (t.source, t.line))
-    };
-    let mut errors = resumed_errors
-        .into_iter()
-        .chain(trailing_error.map(|t| (documents, t)))
-        .peekable();
-    let mut out = std::collections::VecDeque::with_capacity(documents);
-    for (index, (value, &(source, line))) in
-        inputs.into_iter().zip(locations.per_value()).enumerate()
-    {
-        while errors.peek().is_some_and(|&(before, _)| before <= index) {
-            if let Some((_, t)) = errors.next() {
-                out.push_back(error_of(t));
-            }
-        }
-        out.push_back(jq::ProducedInput::Document(value, source, line));
+    LazyTail {
+        values: inputs.into_iter(),
+        places: locations.per_value().to_vec(),
+        index: 0,
+        errors: resumed_errors
+            .into_iter()
+            .chain(trailing_error.map(|t| (documents, t)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .peekable(),
     }
-    out.extend(errors.map(|(_, t)| error_of(t)));
-    out
+}
+
+/// The items [`lazy_tail_items`] hands out, one at a time: building them all up front would hold a
+/// second copy of every value's slot beside the vector they come from (#5856).
+struct LazyTail {
+    values: std::vec::IntoIter<OwnedValue>,
+    /// `(source, line)` of every value, in order.
+    places: Vec<(u32, u32)>,
+    /// How many values were handed out.
+    index: usize,
+    errors: std::iter::Peekable<std::vec::IntoIter<(usize, TrailingParseError)>>,
+}
+
+impl Iterator for LazyTail {
+    type Item = jq::ProducedInput;
+
+    fn next(&mut self) -> Option<jq::ProducedInput> {
+        // Each error comes ahead of the document its count names, and the ones left after the last
+        // document come last.
+        let error_next = self
+            .errors
+            .peek()
+            .is_some_and(|&(before, _)| before <= self.index || self.values.len() == 0);
+        if error_next {
+            // As a plain error: jq's `try input catch .` catches a parse error like any other,
+            // where the materializer's own error is tagged as an uncatchable decode failure.
+            return self.errors.next().map(|(_, t)| {
+                jq::ProducedInput::Error(EvalError::new(t.error.message), (t.source, t.line))
+            });
+        }
+        let value = self.values.next()?;
+        let (source, line) = self.places[self.index];
+        self.index += 1;
+        Some(jq::ProducedInput::Document(value, source, line))
+    }
 }
 
 /// `--stream` and `--stream-errors` inputs read as the program asks for them (#5498): jq's streaming parser over
@@ -14653,7 +14870,6 @@ mod tests {
         // The queue hands them out in that order.
         let tail = lazy_tail_items(inputs, &locations, trailing, resumed);
         let kinds: Vec<&str> = tail
-            .iter()
             .map(|item| match item {
                 jq::ProducedInput::Document(..) => "document",
                 jq::ProducedInput::Error(..) => "error",
@@ -14671,6 +14887,7 @@ mod tests {
         dir: &std::path::Path,
         files: &[&[u8]],
         lazy_off: bool,
+        chunk: Option<usize>,
     ) -> (Vec<String>, usize) {
         use clap::Parser;
 
@@ -14682,6 +14899,7 @@ mod tests {
         }
         let cmd = JqCommand::try_parse_from(argv).unwrap();
         LAZY_ROUTE_OFF.with(|f| f.set(lazy_off));
+        LAZY_CHUNK_BYTES.with(|c| c.set(chunk));
         let (mut open_failed, mut opened) = (false, Vec::new());
         let read = get_inputs(&cmd, true, true, &mut open_failed, &mut opened);
         LAZY_ROUTE_OFF.with(|f| f.set(false));
@@ -14692,18 +14910,28 @@ mod tests {
                 .map_or(0, |lazy| lazy.iter().map(|source| source.spans.len()).sum())
         });
         seed_input_queue(false, inputs, &locations, trailing, resumed);
-        let mut seen = vec![format!("tail {:?}", locations.eof_tail)];
-        for _ in 0..40 {
+        // The end marker is read off the pops past the end (#4303): a scan that has not reached it
+        // yet records a placeholder in `locations`.
+        let mut seen = Vec::new();
+        loop {
             let popped = match jq::pop_input() {
                 jq::InputPop::Document(v) => format!("doc {v:?}"),
                 jq::InputPop::ParseError(e) => format!("error {}", e.message),
                 jq::InputPop::Exhausted => "end".to_string(),
             };
             seen.push(format!("{popped} at {:?}", jq::current_input_location()));
-            if popped == "end" && seen.iter().filter(|s| s.starts_with("end")).count() > 2 {
+            if popped == "end"
+                && seen
+                    .iter()
+                    .rev()
+                    .take_while(|s| s.starts_with("end"))
+                    .count()
+                    > 2
+            {
                 break;
             }
         }
+        LAZY_CHUNK_BYTES.with(|c| c.set(None));
         (seen, lazy_documents)
     }
 
@@ -14717,7 +14945,9 @@ mod tests {
     #[test]
     fn a_lazy_prefix_with_an_eager_handoff_reads_as_the_eager_route_does_5853() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let observe = |bytes: &[u8], lazy_off: bool| observe_inputs(dir.path(), &[bytes], lazy_off);
+        let observe = |bytes: &[u8], lazy_off: bool, chunk: Option<usize>| {
+            observe_inputs(dir.path(), &[bytes], lazy_off, chunk)
+        };
         let docs: [&[u8]; 6] = [b"1", b"\"a\"", b"[1,2]", b"{\"a\":null}", b"true", b"-0.5"];
         let seps: [&[u8]; 3] = [b"\n", b" ", b"\r\n"];
         let faults: [&[u8]; 14] = [
@@ -14752,17 +14982,20 @@ mod tests {
             for at in 0..=base.len() {
                 for fault in faults {
                     let stream = [&base[..at], fault, &base[at..]].concat();
-                    let (eager, eager_lazy) = observe(&stream, true);
+                    let (eager, eager_lazy) = observe(&stream, true, None);
                     assert_eq!(eager_lazy, 0, "the reference route is eager");
-                    let (hybrid, lazy_documents) = observe(&stream, false);
-                    assert_eq!(
-                        hybrid,
-                        eager,
-                        "{:?} (a lazy prefix of {lazy_documents})",
-                        String::from_utf8_lossy(&stream)
-                    );
-                    checked += 1;
-                    lazy_prefixes += usize::from(lazy_documents > 0);
+                    // Scanned in one chunk, and a document at a time (#5856).
+                    for chunk in [None, Some(1)] {
+                        let (hybrid, lazy_documents) = observe(&stream, false, chunk);
+                        assert_eq!(
+                            hybrid,
+                            eager,
+                            "{:?} (a lazy prefix of {lazy_documents}, chunks of {chunk:?})",
+                            String::from_utf8_lossy(&stream)
+                        );
+                        checked += 1;
+                        lazy_prefixes += usize::from(lazy_documents > 0);
+                    }
                 }
             }
         }
@@ -14782,12 +15015,13 @@ mod tests {
                     for then in 0..=once.len() {
                         for second in more {
                             let stream = [&once[..then], second, &once[then..]].concat();
-                            let (eager, _) = observe(&stream, true);
-                            let (hybrid, lazy_documents) = observe(&stream, false);
+                            let (eager, _) = observe(&stream, true, None);
+                            let chunk = Some(3);
+                            let (hybrid, lazy_documents) = observe(&stream, false, chunk);
                             assert_eq!(
                                 hybrid,
                                 eager,
-                                "{:?} (a lazy prefix of {lazy_documents})",
+                                "{:?} (a lazy prefix of {lazy_documents}, chunks of {chunk:?})",
                                 String::from_utf8_lossy(&stream)
                             );
                             pairs += 1;
@@ -14802,6 +15036,14 @@ mod tests {
             lazy_pairs > 500,
             "{lazy_pairs} two-fault streams kept a lazy prefix"
         );
+        // A fault met by a later chunk is the eager reader's from the end of the last document the
+        // chunks before it read (#5856): the sweep reached that many, with a clean end as well.
+        let (chunks, late_faults) = LAZY_CHUNKS_SCANNED.with(std::cell::Cell::get);
+        assert!(
+            late_faults > 1000,
+            "{late_faults} faults met by a later chunk"
+        );
+        assert!(chunks > late_faults + 1000, "{chunks} chunks scanned");
     }
 
     /// #5857: a stream of several files reads the same whether its documents are converted when
@@ -14832,9 +15074,9 @@ mod tests {
         bases.push(b"[1,\n2]\n{\"a\":\n1}\n7".to_vec());
         let (mut checked, mut lazy_streams) = (0usize, 0usize);
         let mut compare = |files: &[&[u8]]| {
-            let (eager, eager_lazy) = observe_inputs(dir.path(), files, true);
+            let (eager, eager_lazy) = observe_inputs(dir.path(), files, true, None);
             assert_eq!(eager_lazy, 0, "the reference route is eager");
-            let (lazy, lazy_documents) = observe_inputs(dir.path(), files, false);
+            let (lazy, lazy_documents) = observe_inputs(dir.path(), files, false, None);
             assert_eq!(lazy, eager, "{files:?} (lazy documents {lazy_documents})");
             checked += 1;
             lazy_streams += usize::from(lazy_documents > 0);
@@ -14910,6 +15152,80 @@ mod tests {
         assert!(sources(&["1\n", "\u{feff}2\n"]).is_none());
     }
 
+    /// #5856: a fault met by a chunk after the first, in a stream the default chunks cover several
+    /// of, reads as the eager route reads it: every document and error and the `(at ...)` marker
+    /// after each pop, through and past the end. The fault sits in the first, a middle and the last
+    /// chunk, and past the last document.
+    #[test]
+    fn a_fault_met_by_a_late_chunk_reads_as_the_eager_route_does_5856() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let records: String = (0..20_000)
+            .map(|i| format!("{{\"id\":{i},\"s\":\"{}\"}}\n", "x".repeat(i % 40)))
+            .collect();
+        assert!(records.len() > 4 * LAZY_CHUNK_FIRST_BYTES, "several chunks");
+        let at = |fraction: usize| {
+            let cut = records.len() * fraction / 100;
+            cut + records[cut..].find('\n').map_or(0, |n| n + 1)
+        };
+        LAZY_CHUNKS_SCANNED.with(|n| n.set((0, 0)));
+        for (name, cuts) in [
+            ("one fault", vec![(at(2), "}")]),
+            ("a fault past the first chunks", vec![(at(30), "x ")]),
+            ("a fault in the last chunk", vec![(at(97), "}")]),
+            ("a bare token the fault takes", vec![(at(50), "7}")]),
+            ("two faults", vec![(at(40), "]"), (at(80), "nan")]),
+        ] {
+            let mut stream = records.clone();
+            for &(cut, fault) in cuts.iter().rev() {
+                stream.insert_str(cut, fault);
+            }
+            let (eager, _) = observe_inputs(dir.path(), &[stream.as_bytes()], true, None);
+            let (hybrid, _) = observe_inputs(dir.path(), &[stream.as_bytes()], false, None);
+            assert!(
+                hybrid == eager,
+                "{name}: the chunked route reads another stream than the eager one"
+            );
+        }
+        let (chunks, faults) = LAZY_CHUNKS_SCANNED.with(std::cell::Cell::get);
+        assert!(
+            faults >= 4,
+            "{faults} faults of {chunks} chunks met after the first"
+        );
+        // A clean stream ends where the eager route ends it, with a bare token last or not.
+        for tail in ["", "1", "1\n", "\"a\"", "\n\n"] {
+            let stream = format!("{records}{tail}");
+            let (eager, _) = observe_inputs(dir.path(), &[stream.as_bytes()], true, None);
+            let (hybrid, _) = observe_inputs(dir.path(), &[stream.as_bytes()], false, None);
+            assert!(hybrid == eager, "a clean stream ending in {tail:?}");
+        }
+    }
+
+    /// #5856: the chunks of a clean stream hold the documents of the scan of the whole of it, and
+    /// end it where it ends, whatever their size.
+    #[test]
+    fn the_chunks_of_a_stream_are_its_scan_5856() {
+        for stream in batched_streams_5854() {
+            let whole = lazy_json_spans(&stream).expect("a clean stream the lazy route admits");
+            for budget in [1, 7, 64, 1000, usize::MAX] {
+                let (mut spans, mut from) = (Vec::new(), 0);
+                loop {
+                    let chunk = lazy_json_scan_chunk(&stream, from, budget);
+                    assert_ne!(
+                        chunk.end,
+                        ChunkEnd::Fault,
+                        "{stream:?} in chunks of {budget}"
+                    );
+                    spans.extend(chunk.spans);
+                    if chunk.end == ChunkEnd::Done {
+                        break;
+                    }
+                    from = spans.last().map_or(0, |&(_, end)| end);
+                }
+                assert_eq!(spans, whole, "{stream:?} in chunks of {budget}");
+            }
+        }
+    }
+
     /// [`lazy_json_scan`]'s spans for a stream it reads whole.
     fn lazy_json_spans(raw: &str) -> Option<Vec<(usize, usize)>> {
         let scan = lazy_json_scan(raw);
@@ -14923,7 +15239,7 @@ mod tests {
     ) -> jq::InputProducer {
         lazy_json_producer_then(
             std::collections::VecDeque::from([lazy]),
-            std::collections::VecDeque::new(),
+            Box::new(std::iter::empty()),
             exhausted,
         )
     }
@@ -14999,8 +15315,9 @@ mod tests {
                             spans: Vec::new(),
                             source: 0,
                             seam: Seam::NONE,
+                            more: None,
                         }]),
-                        tail,
+                        Box::new(tail),
                         None,
                     ));
                     assert_eq!(
@@ -15149,6 +15466,7 @@ mod tests {
                 spans: spans.clone(),
                 source: 0,
                 seam: Seam::NONE,
+                more: None,
             },
             None,
         );
@@ -15390,6 +15708,7 @@ mod tests {
                 spans: vec![(0, 1), (2, 9), (11, 14)],
                 source: 3,
                 seam: Seam::NONE,
+                more: None,
             },
             Some((3, 4)),
         );
@@ -15415,6 +15734,7 @@ mod tests {
                     spans: Vec::new(),
                     source: 0,
                     seam: Seam::NONE,
+                    more: None,
                 },
                 None,
             )(),
