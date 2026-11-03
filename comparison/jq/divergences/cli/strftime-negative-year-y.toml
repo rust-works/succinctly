@@ -1,0 +1,4 @@
+category = "host-dependent"
+issue = "#6030"
+reason = "`[-5,0,1,0,0,0,0,0] | strftime(\"%y|%C|%D\")` is `05|-0|01/01/05` in jq 1.7.1 on macOS (the libc's `_yconv`: the remainder's absolute value, and `-0` for a century of 0) and succinctly follows it. A glibc jq prints `95|-1|01/01/95` (the floored remainder and quotient), as it prints `%Y` of year -5 as `-5` where the pin prints `-005` (docs/compliance/jq/limitations.md, \"negative years\"). Measured on Ubuntu 22.04 with a source-built jq 1.7.1."
+platform = "linux"
