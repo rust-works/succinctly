@@ -96044,9 +96044,6 @@ struct StrptimeSpecPrefix {
     width: usize,
     /// The specifier that ends the prefix; `None` at the end of the format.
     spec: Option<char>,
-    /// The prefix ends in a modifier or a `+` flag, with no width after it. The libc refuses a `%`
-    /// specifier then (`%+%`, `%E%`) and reads it after a width (`%5%`, `%E4%`, #5754).
-    ends_in_marker: bool,
     /// Every character read after the `%`, the specifier included; empty unless the caller asked
     /// to keep it (only the layout expansion needs it, to copy a prefix it does not replace).
     consumed: String,
@@ -96062,11 +96059,13 @@ fn read_strptime_spec_prefix(
         modifier: None,
         width: 0,
         spec: None,
-        ends_in_marker: false,
         consumed: String::new(),
         error: None,
     };
     let mut flag_allowed = true;
+    // The prefix so far ends in a modifier or a `+` flag, with no width after it. The libc refuses
+    // a `%` specifier then (`%+%`, `%E%`) and reads it after a width (`%5%`, `%E4%`, #5754).
+    let mut ends_in_marker = false;
     let mut run: Option<usize> = None;
     loop {
         let next = chars.next();
@@ -96080,7 +96079,7 @@ fn read_strptime_spec_prefix(
                     return prefix;
                 }
                 flag_allowed = true;
-                prefix.ends_in_marker = true;
+                ends_in_marker = true;
                 run = None;
             }
             Some('+') => {
@@ -96089,7 +96088,7 @@ fn read_strptime_spec_prefix(
                     return prefix;
                 }
                 flag_allowed = false;
-                prefix.ends_in_marker = true;
+                ends_in_marker = true;
                 run = None;
             }
             Some(d) if d.is_ascii_digit() => {
@@ -96102,9 +96101,13 @@ fn read_strptime_spec_prefix(
                     prefix.width = value;
                 }
                 flag_allowed = false;
-                prefix.ends_in_marker = false;
+                ends_in_marker = false;
             }
             other => {
+                if other == Some('%') && ends_in_marker {
+                    prefix.error =
+                        Some("a '%' specifier straight after a modifier or '+' flag".to_string());
+                }
                 prefix.spec = other;
                 return prefix;
             }
@@ -96262,15 +96265,11 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                 modifier,
                 width,
                 spec,
-                ends_in_marker,
                 error,
                 ..
             } = read_strptime_spec_prefix(&mut fmt_iter, false);
             if let Some(error) = error {
                 return Err(error);
-            }
-            if spec == Some('%') && ends_in_marker {
-                return Err("expected a specifier after a modifier or '+' flag".to_string());
             }
             if let Some(modifier) = modifier {
                 match spec {
