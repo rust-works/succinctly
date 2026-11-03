@@ -38,7 +38,12 @@ class RunnerPinTests(unittest.TestCase):
         text = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
         for job in ("clippy", "docs", "perf-guard", "coverage"):
             with self.subTest(job=job):
-                self.assertRegex(text, rf"\n  {job}:\n(?:.*\n)*?.*ubuntu-24\.04\n")
+                # The job's own block: from its key to the next top-level job key.
+                match = re.search(rf"\n  {job}:\n(?:.*\n)*?(?=  [A-Za-z0-9_-]+:\n|\Z)", text)
+                self.assertIsNotNone(match)
+                block = match.group(0)
+                self.assertIn("ubuntu-24.04", block)
+                self.assertNotIn("ubuntu-26.04", block)
 
 
 if __name__ == "__main__":

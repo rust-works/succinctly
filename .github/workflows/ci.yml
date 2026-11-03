@@ -804,9 +804,9 @@ jobs:
       - name: coverage-shards.py self-tests
         run: python3 scripts/test_coverage_shards.py -v
 
-      # #5878: pins every x86_64 Linux runner to ubuntu-24.04 until the perf guard, coverage and
-      # release jobs are verified on 26.04 (the jq libm goldens already hold there, #5926); a
-      # runner-image move then has to edit that test, not happen silently.
+      # #5878: pins every x86_64 Linux runner but the test matrix to ubuntu-24.04 until the perf
+      # guard, coverage and release jobs are verified on 26.04 (the jq libm goldens already hold
+      # there, #5926); a runner-image move then has to edit that test, not happen silently.
       - name: ci-runner-pin self-tests
         run: python3 scripts/test_ci_runner_pin.py -v
 
