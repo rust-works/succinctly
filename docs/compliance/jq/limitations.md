@@ -7462,7 +7462,7 @@ Three differences remain.
   Pinned by `test_lookbehind_oniguruma_refuses_is_answered_5502`.
 - **Oniguruma syntax outside the checked list stays refused.**
   The second engine takes only constructs and escapes whose meaning there was compared with jq's.
-  `\g<name>`, the absence operator `(?~…)`, `\X` and `\y` keep the `invalid regex` error.
+  `\g<name>` and `\g'name'`, the absence operator `(?~…)`, `\X` and `\y` keep the `invalid regex` error.
   (`\h`, `\H` and `\g1` are the letters in jq and here, #6080: see the escaped-letter paragraph above.)
   So do two that jq reads differently from `fancy-regex`: a reversed interval (`a{3,2}`), an error in jq, and a `+` after an interval (`a{2,3}+`), possessive in jq for `{n,m}+` and `{n,}+` but not for `{n}+`.
   A `(?P…)` group is refused before either engine, with jq's `undefined group option` (above).

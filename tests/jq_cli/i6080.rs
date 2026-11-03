@@ -58,6 +58,36 @@ fn a_dollar_that_something_follows_leaves_the_final_newline_to_the_next_token() 
         (r#""ab\n" | [scan("b$\\n")]"#, r#"["b\n"]"#),
         (r#""ab\n" | capture("(?<x>b)$\\n")"#, r#"{"x":"b"}"#),
         (r#""éb\n" | [match("b$\\n")|[.offset,.length]]"#, "[[1,2]]"),
+        // A group or a look-around that holds the `$`, repeated or not.
+        (
+            r#""a\n" | [match("(a$)+\\n")|[.offset,.length]]"#,
+            "[[0,2]]",
+        ),
+        (r#""a\n" | [match("(?:a$){2}")|[.offset,.length]]"#, "[]"),
+        (
+            r#""a\n" | [match("(?=a$)a\\n")|[.offset,.length]]"#,
+            "[[0,2]]",
+        ),
+        (
+            r#""a\n" | [match("(?=a$\\n)a")|[.offset,.length]]"#,
+            "[[0,1]]",
+        ),
+        (
+            r#""a\n" | [match("a(?=$\\n)")|[.offset,.length]]"#,
+            "[[0,1]]",
+        ),
+        (
+            r#""a\n" | [match("(?<=a)$\\n")|[.offset,.length]]"#,
+            "[[1,1]]",
+        ),
+        (
+            r#""a\n" | [match("[[:alpha:]$]\\n")|[.offset,.length]]"#,
+            "[[0,2]]",
+        ),
+        (
+            r#""a\n" | [match("(?x) a # see $ below\n$\\n")|[.offset,.length]]"#,
+            "[[0,2]]",
+        ),
         // Only one final newline is the `$`'s to leave.
         (r#""ab\n\n" | [match("b$\\n")|[.offset,.length]]"#, "[]"),
         (r#""ab\n\n" | [match("$\\n")|[.offset,.length]]"#, "[[3,1]]"),
