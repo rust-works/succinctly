@@ -116,6 +116,14 @@ GATES = (
         cost=0,
     ),
     Gate(
+        "skill-lint",
+        "fast",
+        ("python3 scripts/skill_lint.py",),
+        (r"^python3 scripts/skill_lint\.py$",),
+        paths=(".claude/skills/*", ".agents/skills", "scripts/skill_lint.py"),
+        cost=0,
+    ),
+    Gate(
         "fmt",
         "fast",
         ("cargo fmt --all -- --check",),
