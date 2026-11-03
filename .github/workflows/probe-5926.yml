@@ -1,0 +1,33 @@
+name: probe 5926
+
+# Throwaway: which jq libm golden elements differ on ubuntu-26.04 (#5926). Not to be merged.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/probe-5926.yml'
+      - 'scripts/probe_5926.py'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu-24.04, ubuntu-26.04]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build succinctly
+        run: cargo build --release --features cli
+      - name: Build jq 1.7.1
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq autoconf automake libtool bison flex > /dev/null
+          curl -fsSL https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-1.7.1.tar.gz | tar xz
+          cd jq-1.7.1 && ./configure --with-oniguruma=builtin --disable-docs --disable-maintainer-mode > /dev/null && make -j4 > /dev/null
+          ./jq --version; ldd --version | head -1
+      - name: Compare the two libm cases
+        run: python3 scripts/probe_5926.py jq-1.7.1/jq target/release/succinctly
