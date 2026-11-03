@@ -99974,6 +99974,9 @@ fn builtin_isnormal<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: isfinite
+///
+/// #6041: jq defines it as `type == "number" and (isinfinite | not)`, so a NaN is finite
+/// (`nan | isfinite` is `true`), unlike `f64::is_finite`.
 fn builtin_isfinite<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
@@ -99981,7 +99984,7 @@ fn builtin_isfinite<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // The error is discarded, so don't let `get_float_value` build its
     // `number required` preview (a deep copy of the value, #3042 review).
     match get_float_value_with::<W, S>(&value, optional, || EvalError::new("")) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Bool(n.is_finite())),
+        Ok(n) => QueryResult::Owned(OwnedValue::Bool(!n.is_infinite())),
         Err(_) => QueryResult::Owned(OwnedValue::Bool(false)),
     }
 }
@@ -136557,6 +136560,10 @@ mod tests {
             assert!(b);
         });
         query!(b"1.0", "isfinite", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        });
+        // #6041: a NaN is finite in jq (`type == "number" and (isinfinite | not)`).
+        query!(b"null", "nan | isfinite", QueryResult::Owned(OwnedValue::Bool(b)) => {
             assert!(b);
         });
     }

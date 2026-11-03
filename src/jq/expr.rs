@@ -3743,7 +3743,7 @@ pub enum Builtin {
     IsNan,
     /// `isnormal` - true if value is a normal number (not zero, infinite, NaN, or subnormal)
     IsNormal,
-    /// `isfinite` - true if value is finite (not infinite or NaN)
+    /// `isfinite` - true for a number that is not infinite (a NaN included, as in jq, #6041)
     IsFinite,
 
     // Phase 10: Debug
