@@ -13,6 +13,9 @@ on:
       - 'scripts/pre_push.py'
       - 'scripts/pre-push.sh'
       - 'scripts/test_pre_push.py'
+      # #5955: a new, renamed or deleted script test can leave one that no workflow runs, which
+      # test_pre_push.py's `test_every_script_self_test_runs_in_a_workflow` checks.
+      - 'scripts/test_*.py'
       - 'scripts/lib/clippy-variants.sh'
       - 'scripts/ledger_refs.py'
       - 'scripts/changelog.py'

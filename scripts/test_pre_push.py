@@ -89,6 +89,25 @@ class WorkflowDriftTests(unittest.TestCase):
             "(with a reason): add a Gate that mirrors it, or an exclusion",
         )
 
+    def test_every_script_self_test_runs_in_a_workflow(self):
+        # #5955: the push gate's `script-tests` loop runs every `scripts/test_*.py`, but CI runs
+        # only those a workflow names, so a new one guarded nothing in CI until someone added a
+        # step (`test_jq_grammar_fuzz.py` went unrun that way).
+        commands = list(workflow_commands())
+        unwired = [
+            os.path.basename(t)
+            for t in sorted(glob.glob(os.path.join(ROOT, "scripts", "test_*.py")))
+            if not any(
+                re.search(rf"\bscripts/{re.escape(os.path.basename(t))}\b", c) for c in commands
+            )
+        ]
+        self.assertEqual(
+            unwired,
+            [],
+            "a scripts/test_*.py is run by no workflow: add a self-tests step for it (ci.yml has "
+            "the no-build ones), or run it in the workflow that owns the script it tests",
+        )
+
     def test_every_mirror_and_exclusion_still_matches_a_workflow_command(self):
         commands = list(workflow_commands())
         for gate in pre_push.GATES:
