@@ -4153,7 +4153,7 @@ Profiling 1MB YAML (111,529 nodes, 93% strings) reveals:
 - Time per string: ~241 ns
 
 **Key functions called per scalar** (before `bp_to_text_end` optimization):
-1. `compute_base_indent_and_root_flag()` - scans backward to line start, forward to find `:`, `-`, `?`
+1. `compute_base_indent_and_root_flag()` - scans backward to line start, forward to find `:`, `-`, `?` **(unused since, deleted in #5951)**
 2. ~~`find_plain_scalar_end()` - scans forward to find scalar boundary~~ **(eliminated by bp_to_text_end)**
 3. `is_in_flow_context()` - quick path if no `[` or `{` in recent text
 
