@@ -479,19 +479,32 @@ fn cv_pct(samples: &[f64]) -> f64 {
 }
 
 /// Is any tool's median over [`SLOW_ROW_MS`]?
+#[cfg(test)]
 fn is_slow(samples: &[Vec<f64>]) -> bool {
+    is_slow_over(samples, SLOW_ROW_MS)
+}
+
+/// [`is_slow`] against a threshold of the caller's choosing (#5931): a test that must not depend
+/// on how fast the host spawns a process names its own.
+fn is_slow_over(samples: &[Vec<f64>], slow_ms: f64) -> bool {
     samples
         .iter()
         .filter(|s| !s.is_empty())
-        .any(|s| stats(s).median_ms > SLOW_ROW_MS)
+        .any(|s| stats(s).median_ms > slow_ms)
 }
 
 /// How many repetitions to add to `done` already taken: none for a row whose
 /// slowest median is at most [`SLOW_ROW_MS`]; otherwise up to
 /// [`SLOW_ROW_REPS`] in total, held to [`SLOW_ROW_EXTRA_BUDGET_MS`] of extra
 /// wall time across every tool.
+#[cfg(test)]
 fn extra_reps(samples: &[Vec<f64>], done: usize) -> usize {
-    if !is_slow(samples) {
+    extra_reps_over(samples, done, SLOW_ROW_MS)
+}
+
+/// [`extra_reps`] against the threshold [`is_slow_over`] takes.
+fn extra_reps_over(samples: &[Vec<f64>], done: usize, slow_ms: f64) -> usize {
+    if !is_slow_over(samples, slow_ms) {
         return 0;
     }
     let per_rep: f64 = samples
@@ -596,6 +609,19 @@ pub fn run_row_with(
     reps: usize,
     valgrind: Option<&Path>,
 ) -> Result<PerfRow> {
+    run_row_over(tools, q, input, inputs_dir, reps, valgrind, SLOW_ROW_MS)
+}
+
+/// [`run_row_with`] against the slow-row threshold of the caller's choosing (#5931).
+fn run_row_over(
+    tools: &[Tool],
+    q: &PerfQuery,
+    input: Option<&InputSpec>,
+    inputs_dir: &Path,
+    reps: usize,
+    valgrind: Option<&Path>,
+    slow_ms: f64,
+) -> Result<PerfRow> {
     let file = input.map(|i| format!("{}.json", i.id));
     let args = args_for(q, file.as_deref());
     // Output-identity gate: hash each tool's stdout, compare with its exit status.
@@ -656,7 +682,7 @@ pub fn run_row_with(
         }
         rep += 1;
         if rep == reps {
-            total += extra_reps(&samples, reps);
+            total += extra_reps_over(&samples, reps, slow_ms);
         }
     }
     row.reps = total;
@@ -679,7 +705,7 @@ pub fn run_row_with(
     row.noisy = row.tools.iter().any(|t| t.cv_pct.is_some_and(|c| c > 5.0));
     // A slow row's median moves with the run (a control read 0.75x-1.40x, #5581) while its
     // minimum does not, so a row that got the full top-up rates each pair by the minimum.
-    row.ratio_from_min = is_slow(&samples) && total >= SLOW_ROW_REPS;
+    row.ratio_from_min = is_slow_over(&samples, slow_ms) && total >= SLOW_ROW_REPS;
     let from_min = row.ratio_from_min;
     let stat = |i: usize, min: bool| {
         row.tools[i]
@@ -1047,13 +1073,31 @@ mod tests {
         );
     }
 
+    /// Fast or slow is a comparison with the threshold, so a threshold no spawn can exceed makes the
+    /// row fast whatever the host's load (#5931: spawning `sh` took over 15 ms at load average 25
+    /// and the row was topped up to 21 repetitions). The real 15 ms threshold is pinned against fixed
+    /// timings by `only_a_slow_row_is_topped_up_and_the_extra_time_is_capped`.
     #[test]
     fn a_fast_row_keeps_the_requested_repetitions() {
         let q = parse_queries("q\t-\tx\tnone\t1mb\n").unwrap().remove(0);
         let t = sh("t", ":");
-        let row = run_row(&[t.clone(), t], &q, None, Path::new("."), 3).unwrap();
+        let row =
+            run_row_over(&[t.clone(), t], &q, None, Path::new("."), 3, None, f64::MAX).unwrap();
         assert_eq!(row.reps, 3);
         assert!(!row.ratio_from_min, "a fast row keeps the median ratio");
+        assert!(row.tools.iter().all(|t| t.stats.as_ref().unwrap().n == 3));
+    }
+
+    /// The injected threshold is the only thing that decides: the same timings are fast over one
+    /// threshold and slow over another.
+    #[test]
+    fn the_slow_row_threshold_can_be_named_by_the_caller() {
+        let samples = vec![vec![40.0; 3], vec![50.0; 3]];
+        assert!(is_slow(&samples));
+        assert!(is_slow_over(&samples, SLOW_ROW_MS));
+        assert!(!is_slow_over(&samples, 60.0));
+        assert_eq!(extra_reps_over(&samples, 3, 60.0), 0);
+        assert_eq!(extra_reps_over(&samples, 3, SLOW_ROW_MS), SLOW_ROW_REPS - 3);
     }
 
     #[test]
