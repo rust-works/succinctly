@@ -6624,6 +6624,42 @@ fn get_inputs(
             });
             return Ok(Ok((Vec::new(), locations, None, Vec::new())));
         }
+        // #6005: under `-n` jq reads on the first `input`, so a fault is an input of its own: the
+        // faults the slurp loop meets come first, one per call, then the array, then whatever the
+        // loop left for the calls after it. A program that never asks for one prints its result.
+        if args.slurp && args.null_input && stream_by_reader {
+            let read = crate::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
+            let place = |at| stream_location(&raw_bytes, at);
+            let fault = |message: String, at: (usize, usize)| {
+                let (source, line) = place(at);
+                TrailingParseError {
+                    error: EvalError::new(message),
+                    source: u32::try_from(source).unwrap_or(u32::MAX),
+                    line: u32::try_from(line).unwrap_or(u32::MAX),
+                    seq_warning: false,
+                }
+            };
+            let mut resumed: Vec<(usize, TrailingParseError)> = Vec::new();
+            for (message, at) in read.before {
+                resumed.push((0, fault(message, at)));
+            }
+            let mut values = vec![OwnedValue::array_from(read.array)];
+            let (source, line) = place(read.slurp_at);
+            locations.push(source, line);
+            for item in read.after {
+                match item {
+                    crate::jq_stream_errors::Afterwards::Value(value, at) => {
+                        let (source, line) = place(at);
+                        locations.push(source, line);
+                        values.push(value);
+                    }
+                    crate::jq_stream_errors::Afterwards::Fault(message, at) => {
+                        resumed.push((values.len(), fault(message, at)));
+                    }
+                }
+            }
+            return Ok(Ok((values, locations, None, resumed)));
+        }
         let mut read = if args.slurp {
             crate::jq_stream_errors::read_for_slurp(&raw_bytes, stream_by_reader)
         } else {
@@ -6659,17 +6695,9 @@ fn get_inputs(
             values.extend(outside);
             value_locations.extend(outside_locations);
         }
-        for &(source, line) in &value_locations {
-            if line == crate::jq_stream_errors::CLOSED {
-                locations.push(0, UNKNOWN_LINE as usize);
-            } else {
-                // `get` and not an index: a slurped array has a location even when no file
-                // opened (`--stream -s` over only a missing file is `[]`, #6006).
-                locations.push(
-                    raw_bytes.get(source).and_then(|raw| raw.0).unwrap_or(0),
-                    line,
-                );
-            }
+        for &at in &value_locations {
+            let (source, line) = stream_location(&raw_bytes, at);
+            locations.push(source, line);
         }
         if track_eof && !args.slurp {
             locations.eof_tail = Some(EofTail {
@@ -7370,6 +7398,22 @@ fn stream_walk_by_reader(args: &JqCommand) -> bool {
         && args.input_dsv.is_none()
         && !args.raw_input
         && !args.seq
+}
+
+/// The source tag and line an input of the stream reader is placed at: `(source, line)` as the
+/// reader gives it, with a closed input (`input_filename` is `null`, `input_line_number` is `0`)
+/// and a source that never opened placed where the rest of the queue puts them.
+fn stream_location(
+    sources: &[(Option<usize>, Vec<u8>)],
+    (source, line): (usize, usize),
+) -> (usize, usize) {
+    if line == crate::jq_stream_errors::CLOSED {
+        (0, UNKNOWN_LINE as usize)
+    } else {
+        // `get` and not an index: a slurped array has a location even when no file opened
+        // (`--stream -s` over only a missing file is `[]`, #6006).
+        (sources.get(source).and_then(|raw| raw.0).unwrap_or(0), line)
+    }
 }
 
 /// Whether `--stream -s` (#5498) is read by the stream reader: the array holds the events, and the
