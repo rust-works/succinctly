@@ -293,3 +293,30 @@ fn test_compound_store_with_a_container_operand_keeps_its_results_5761() -> Resu
     }
     Ok(())
 }
+
+/// A container read off the loop variable (`$r.items`) and stored is the element's own member, so
+/// `==` (which short-circuits on `jv_identical`, while `[nan] == [nan]` is `false`) sees one array
+/// in jq. Each was `false` here. Every answer was captured from jq 1.7.1.
+#[test]
+fn test_fold_store_of_a_field_read_keeps_the_members_identity_5761() -> Result<()> {
+    for filter in [
+        "[{\"items\":[nan]}] as $in | reduce $in[] as $r ({}; .a = $r.items) | .a == $in[0].items",
+        "[{\"items\":[nan]}] as $in | reduce $in[] as $r ({}; .a += $r.items) | .a == $in[0].items",
+        "[{\"items\":[nan]}] as $in | reduce $in[] as $r (null; . + $r.items) | . == $in[0].items",
+        "[{\"n\":\"k\",\"items\":[nan]}] as $in | reduce $in[] as $r ({}; .[$r.n] = $r.items) | .k == $in[0].items",
+        "[{\"items\":[nan]}] as $in | foreach $in[] as $r ({}; .a = $r.items; .a == $in[0].items)",
+        "[{\"items\":[nan]}] as $in | reduce $in[] as $r ({}; .a //= $r.items) | .a == $in[0].items",
+        "[{\"items\":[nan]}] as $in | reduce $in[] as $r ({}; .a |= $r.items) | .a == $in[0].items",
+        "[{\"items\":[nan]}] as $in | reduce $in[] as $r ({}; $r.items as $i | .a = $i) | .a == $in[0].items",
+    ] {
+        assert_eq!(answer(filter)?, "true\n", "{filter}");
+    }
+    // Growing the stored member afterwards still builds a new container, as in jq.
+    assert_eq!(
+        answer(
+            "[{\"items\":[nan]}] as $in | reduce $in[] as $r ({}; .a = $r.items | .a += [1]) | .a == $in[0].items"
+        )?,
+        "false\n"
+    );
+    Ok(())
+}
