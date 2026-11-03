@@ -290,7 +290,7 @@ R_ENTRIES=(
 SWEEP_TMP=()
 mk_tmp() { # mk_tmp VAR PREFIX: create a temp file, name it in VAR
   local created
-  created="$(mktemp -t "$2")"
+  created="$(mktemp "${TMPDIR:-/tmp}/$2.XXXXXX")"
   SWEEP_TMP+=("$created")
   printf -v "$1" '%s' "$created"
 }

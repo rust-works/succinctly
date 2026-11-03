@@ -176,9 +176,9 @@ esc() {
     | awk 'BEGIN{ORS=""} NR>1{print "\\n"} {print}'
 }
 
-DOC_FILE="$(mktemp -t assign-sweep-doc)"
-S_ERR="$(mktemp -t assign-sweep-serr)"
-O_ERR="$(mktemp -t assign-sweep-oerr)"
+DOC_FILE="$(mktemp "${TMPDIR:-/tmp}/assign-sweep-doc.XXXXXX")"
+S_ERR="$(mktemp "${TMPDIR:-/tmp}/assign-sweep-serr.XXXXXX")"
+O_ERR="$(mktemp "${TMPDIR:-/tmp}/assign-sweep-oerr.XXXXXX")"
 trap 'rm -f "$DOC_FILE" "$S_ERR" "$O_ERR"' EXIT
 
 total=0

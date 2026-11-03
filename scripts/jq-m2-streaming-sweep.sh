@@ -95,7 +95,7 @@ else
 fi
 echo "oracle: $JQ ($("$JQ" --version)), succinctly: $SUCC" >&2
 
-WORK="$(mktemp -d -t jq-m2-sweep)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/jq-m2-sweep.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 DOC_FILE="$WORK/doc.json"
 
