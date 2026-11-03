@@ -492,7 +492,20 @@ impl Ctx {
         cnt
     }
     fn exists_buffer(&self) -> bool {
+        if self.mstate.is_none() {
+            // The common case, without building the text `buffered_src` would.
+            return self.not_space_char_pos.min(self.buf.len()) != 0;
+        }
         !self.buffered_src().is_empty()
+    }
+
+    /// Whether the origin text so far, less one leading space, begins with a tab.
+    fn origin_starts_with_tab(&self) -> bool {
+        let rest = match self.obuf.first() {
+            Some(' ') => &self.obuf[1..],
+            _ => &self.obuf[..],
+        };
+        rest.first() == Some(&'\t')
     }
     fn is_multi_line(&self) -> bool {
         self.mstate.is_some()
@@ -1435,13 +1448,11 @@ impl Scanner {
                 }
             }
         }
-        let ob = s_of(&ctx.obuf);
-        let ob_trim = ob.strip_prefix(' ').unwrap_or(&ob);
-        if ob_trim.starts_with('\t') && !s_of(&ctx.buf).starts_with('\t') {
+        if ctx.origin_starts_with_tab() && ctx.buf.first() != Some(&'\t') {
             self.progress_column(ctx, 1);
             return Err(invalid(
                 "tab character cannot use as a map key directly",
-                ob,
+                s_of(&ctx.obuf),
                 self.pos(),
             ));
         }
@@ -1527,13 +1538,11 @@ impl Scanner {
         if nc != '\0' && nc != ' ' && nc != '\t' && !Self::is_new_line_char(nc) {
             return Ok(false);
         }
-        let ob = s_of(&ctx.obuf);
-        let ob_trim = ob.strip_prefix(' ').unwrap_or(&ob);
-        if ob_trim.starts_with('\t') {
+        if ctx.origin_starts_with_tab() {
             self.progress_column(ctx, 1);
             return Err(invalid(
                 "tab character cannot use as a sequence delimiter",
-                ob,
+                s_of(&ctx.obuf),
                 self.pos(),
             ));
         }

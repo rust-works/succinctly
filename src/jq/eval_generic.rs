@@ -3779,8 +3779,8 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
         (Vec::new(), Vec::new())
     };
     // #5416: the first document's head comments are the header yq reads before the document.
-    let head_is_header = !own_head.is_empty()
-        && cursor.is_some_and(DocumentCursor::is_first_document_content);
+    let head_is_header =
+        !own_head.is_empty() && cursor.is_some_and(DocumentCursor::is_first_document_content);
     let own_meta = NodeMeta {
         comment: own_comment,
         style: own_style,
