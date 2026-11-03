@@ -10368,6 +10368,15 @@ What differs from jq 1.7.1:
   macOS fails the same way for `ja_JP`'s `%c`, which holds `%_m`; glibc may read such a layout, so a glibc `jq` can accept text this rejects.
   `%E*` and `%O*` modifiers (`%Ex`, `%Ec`, `%Oy`) are read by `strptime` as the plain specifier, as jq reads them (`"03/05/15" | strptime("%Ex")`).
   Only a specifier can follow a modifier: `%E%`, `%EE` and a bare `%E` are no match.
+  Between the `%` and the specifier `strptime` also reads what the pin's libc does (#5989): one `E` or `O` before or after the rest, a `+` flag at the start or straight after the modifier, and a decimal width.
+  `%++Y`, `%4+Y` and `%0+Y` are no match, a second modifier is no match, and `_` and `-` stay no match, as in jq.
+  The width is the most digits a numeric field takes: `"012" | strptime("%3m")` is month 12, `"31" | strptime("%1d")` leaves the `1` behind and is no match.
+  A `0` before the digits belongs to the width (`%04Y` is 4, `%40Y` is 40), a width of 0 is the field's own (`%0d` is `%d`), and a year's sign counts in it (`"-2015" | strptime("%5Y")` is year -2015).
+  A modifier ends a run of digits, so `%4E5Y` is a width of 5, but a run of 0 changes nothing (`%4E0Y` is 4).
+  `%s`, `%w`, `%u`, the names, `%z`, `%n`, `%t` and the composite `%D %F %R %T` ignore it, and `%c %x %X %r` stand for their layouts under any prefix.
+  A padded `%d` or `%e` day is one digit whatever the width (`" 5" | strptime("%3d")` is day 5, `" 05"` is no match).
+  `%Z` with a width reads exactly that many capitals: `"GMT" | strptime("%3Z")` is read, `%4Z` and `%2Z` are no match.
+  Checked against `/usr/bin/jq` 1.7.1 (macOS) over 24,000 prefix-and-specifier rows and 9,000 random formats; a glibc `jq` was not checked.
   The pin's libc reads `%OB` from the alternative month names, which C holds as the full names alone, so `%OB` takes `March` but not `Mar`, and `%Ob` and `%Oh` take neither; a glibc `jq` reads the abbreviation with `%O` as it does without.
   The pin's libc puts no limit on which specifier a modifier precedes; glibc reads `%E` only before `c C x X y Y` and `%O` only before `d e H I m M S U V W w y`, so a glibc `jq` rejects `"03" | strptime("%Em")`.
   `%k` and `%l` are read as `%H` and `%I`.
