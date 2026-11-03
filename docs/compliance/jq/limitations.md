@@ -10208,7 +10208,7 @@ A day above 31 is refused where it is read (`"500"` against `"%d%d"` reads 50 fi
 `%D`, `%F`, `%c` and `%x` stand for `%d` and read their day the same way, and `%Ed`, `%Od`, `%Ee` and `%Oe` as the plain specifier.
 glibc's `strptime` skips any run of white space before a number, so jq 1.6 on Linux reads `" 5"`, `"  5"`, `" 05"` and `" 55"` against `%d` or `%d%d` as day 5 (captured on terminus; 1.7.1 on glibc was not).
 succinctly follows the pin, as it does for the other `strptime` rows of this page.
-A 93,600-row grid of 20 formats (`%d`, `%e`, their `%E` and `%O` forms, pairs of them, `%D`, `%F`, `%Y-%m-%d`) over every string of up to four characters from space, tab, newline, `0`, `1`, `5`, `-` and `/` matched the pin on every row that does not read a `%Y` or `%y` from an empty field (#5947).
+A 93,600-row grid of 20 formats (`%d`, `%e`, their `%E` and `%O` forms, pairs of them, `%D`, `%F`, `%Y-%m-%d`) over every string of up to four characters from space, tab, newline, `0`, `1`, `5`, `-` and `/` matched the pin on every row (weekday and yearday left out, see the century weekday below); 3,324 rows differed before.
 
 ### `strptime`'s weekday in January and February of a century year that is not a leap year is the calendar's, where jq's macOS build is a day early (#970, #5946)
 
