@@ -7406,6 +7406,12 @@ A `{` that does not open `{n}`, `{n,}` or `{n,m}` is the literal brace: `a{ 1}`,
 Inside a class they fold in both.
 A `\p` or `\P` with no brace is the letter, in a class or out of one (`"pL" | test("\\pL")` is `true`, and `"a"` does not match it); the crate reads `\pL` as the letter property.
 Pinned against jq 1.7.1 on 1,512 pattern x text x flag rows (all agree) and in `tests/jq_cli/i6068.rs`.
+An escaped letter Oniguruma does not define is the letter, as `\u` and `\U` are (#6080): `\g`, `\h`, `\i`, `\j`, `\k`, `\l`, `\m`, `\o`, `\q`, `\v` and the capitals `\C`, `\E`, `\F`, `\H`, `\I`, `\J`, `\L`, `\M`, `\T`, `\V`, in a class and out of one and under the `x` flag.
+The set was captured from jq 1.7.1 over every ASCII character.
+The `regex` crate refused most of them, and read `\v` as a vertical tab (`"v" | test("\\v")` is `true` in jq).
+`\g` and `\k` are the letter only where no `<` or `'` follows: `\g<n>` calls a group and `\k<n>` is a back-reference.
+`\x` is not in the set: jq reads hex digits after it, and a lone `\x` at the end of a pattern is the letter while `\xZ` matches nothing, which this does not reproduce (it stays the crate's error).
+Pinned in `tests/jq_cli/i6080.rs`.
 A Python-style group (`(?P<n>a)`, `(?P=n)`, `(?P>n)`) is an error in jq (`undefined group option`), and the `regex` crate would accept the first.
 It is an error here too, with this crate's `invalid regex:` prefix where jq says `Regex failure:`, the same wording difference every refused pattern has.
 The crate's `\b{start}`, `\b{end}`, `\b{start-half}` and `\b{end-half}` are `\b` followed by the literal text in jq, and are rewritten to that.
@@ -7456,7 +7462,8 @@ Three differences remain.
   Pinned by `test_lookbehind_oniguruma_refuses_is_answered_5502`.
 - **Oniguruma syntax outside the checked list stays refused.**
   The second engine takes only constructs and escapes whose meaning there was compared with jq's.
-  `\g<name>`/`\g1`, the absence operator `(?~…)`, `\X` and `\y` keep the `invalid regex` error.
+  `\g<name>`, the absence operator `(?~…)`, `\X` and `\y` keep the `invalid regex` error.
+  (`\h`, `\H` and `\g1` are the letters in jq and here, #6080: see the escaped-letter paragraph above.)
   So do two that jq reads differently from `fancy-regex`: a reversed interval (`a{3,2}`), an error in jq, and a `+` after an interval (`a{2,3}+`), possessive in jq for `{n,m}+` and `{n,}+` but not for `{n}+`.
   A `(?P…)` group is refused before either engine, with jq's `undefined group option` (above).
   Pinned by `test_constructs_read_differently_stay_refused_5502`.
@@ -7584,9 +7591,12 @@ A text that ends in two newlines is searched the same way, because `$` is just b
 - **A tie whose exact search runs out of budget keeps the trimmed match.**
   The exact engine backtracks, and a pathological pattern (`(a+)+\s*$` on a long run of `a`) can exhaust its budget where the `regex` crate answers in linear time.
   The filter does not fail for it: the trimmed text's match stands, as it did before #5572.
-- **Text that follows a `$` is not searched.**
-  Neither search can match `a$\n` (the `$`, then the newline it stands before) in `"a\n"`, which jq does, and `$[^a]?` on `"\n\n"` finds an empty match at 1 where jq's `[^a]?` takes the newline.
-  A pattern with `\z` as well (`a$|b\z`) is not affected by `\z` in the trimmed text, because it is read by the `fancy-regex` route alone, which has jq's meaning for both.
+- **A `$` that something follows is read by the exact engine alone (#6080).**
+  Neither search can match `a$\n` (the `$`, then the newline it stands before) in `"a\n"`, which jq does, so a pattern with a `$` that is not the last token of its pattern, of a top-level alternative or of the groups that end it is read by the `fancy-regex` route alone, as one with `\z` is.
+  `"ab\n" | match("b$\\n")` is `[1,2]` and `$[^a]?` on `"\n\n"` takes the newline, as in jq.
+  A `$` ending a branch inside a group counts as followed (`(?:b$|x)\n`), and under the `x` flag so does one before blanks or a comment.
+  A pattern `fancy-regex` cannot compile keeps the two searches (the first bullet above).
+  Pinned in `tests/jq_cli/i6080.rs`.
 
 ## A slice is a path component
 

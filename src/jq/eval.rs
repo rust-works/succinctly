@@ -27329,6 +27329,69 @@ fn pattern_has_escape_z(pattern: &str) -> bool {
     false
 }
 
+/// Whether `pattern` has a `$` that something can follow (#6080): not the last token of the
+/// pattern, of a top-level alternative (`b$|x`), or of the groups that end the pattern.
+///
+/// jq's `$` matches before a final `\n` and leaves it for the next token (`"ab\n" | match("b$\\n")`
+/// is `[1,2]`), which neither haystack view of [`dv_captures_at`] can show: the trimmed one has no
+/// `\n` left to consume and the full one has `$` only after it. Only the exact engine reads that.
+/// A `$` ending a branch inside a group counts as followed, because the group can be (`(?:b$|x)\\n`).
+/// Escapes, classes and `(?#...)` comments are stepped over; a `$` followed by blanks or a `#`
+/// comment under the `x` flag counts as followed, which only costs the exact engine's speed.
+#[cfg(feature = "regex")]
+fn pattern_has_interior_dollar(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '[' => {
+                // A class runs to its first `]` that is not the leading one.
+                i += 1;
+                if chars.get(i) == Some(&'^') {
+                    i += 1;
+                }
+                if chars.get(i) == Some(&']') {
+                    i += 1;
+                }
+                while i < chars.len() && chars[i] != ']' {
+                    i += if chars[i] == '\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') => {
+                while i < chars.len() && chars[i] != ')' {
+                    i += if chars[i] == '\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            '(' => {
+                depth += 1;
+                i += 1;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            '$' => {
+                let followed = match chars.get(i + 1) {
+                    None => false,
+                    Some('|') => depth > 0,
+                    Some(')') => chars[i + 1..].iter().any(|&c| c != ')'),
+                    Some(_) => true,
+                };
+                if followed {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// Whether `pattern` needs the dual-haystack-view trailing-newline check at
 /// all (see `dv_captures_at`). Deliberately naive about escaping/character
 /// classes — a false positive (an escaped `\$` or a `$` inside `[...]`)
@@ -28015,12 +28078,16 @@ fn translate_posix_brackets(
             // #6068: `\u` and `\U` are not escapes in Oniguruma's Perl syntax, they are the
             // letter: `"\u00e9"` matches the text `u00e9`, and a lone `\u` matches `u`. The
             // `regex` crate reads `\u00e9` and `\u{e9}` as code points and refuses the rest.
-            if let Some(&letter @ ('u' | 'U')) = chars.get(i + 1) {
-                out.push(letter);
-                changed = true;
-                at_start = false;
-                i += 2;
-                continue;
+            // #6080: so are the other letters Oniguruma does not define (`\g` matches `g`), which
+            // the crate refuses or, for `\v`, reads as a vertical tab.
+            if let Some(&letter) = chars.get(i + 1) {
+                if is_plain_letter_escape(letter, chars.get(i + 2).copied()) {
+                    out.push(letter);
+                    changed = true;
+                    at_start = false;
+                    i += 2;
+                    continue;
+                }
             }
             // #6068: `\p{..}` and `\P{..}` outside a class are not case-folded under `i` in
             // Oniguruma (`"a" | test("\\p{Lu}"; "i")` is `false`; inside `[...]` they fold, and so
@@ -28226,6 +28293,24 @@ fn translate_posix_brackets(
     } else {
         std::borrow::Cow::Borrowed(pattern)
     })
+}
+
+/// Whether the escape `\<letter>` is just the letter in jq's Oniguruma (#6068, #6080), `after`
+/// being the character that follows it.
+///
+/// The set is captured from jq-1.7.1 over every ASCII character, in and out of a class and under
+/// the `x` flag: `g h i j k l m o q u v C E F H I J L M T U V`. `\g` and `\k` are the letter only
+/// where no `<` or `'` follows (`\g<n>` calls a group, `\k<n>` is a back-reference). `\x` is not
+/// here: it reads hex digits, and what follows it decides the meaning. `\p` and `\P` have their
+/// own rule below.
+#[cfg(feature = "regex")]
+fn is_plain_letter_escape(letter: char, after: Option<char>) -> bool {
+    match letter {
+        'g' | 'k' => !matches!(after, Some('<' | '\'')),
+        'h' | 'i' | 'j' | 'l' | 'm' | 'o' | 'q' | 'u' | 'v' | 'C' | 'E' | 'F' | 'H' | 'I' | 'J'
+        | 'L' | 'M' | 'T' | 'U' | 'V' => true,
+        _ => false,
+    }
 }
 
 /// Whether the `{` at `chars[at]` opens an interval quantifier in jq's Perl syntax: `{n}`, `{n,}`
@@ -29182,7 +29267,13 @@ fn build_regex_uncached<S: EvalSemantics>(
     // `dv_captures_at`) cannot say: it would end `b\z` before a final `\n` that is really there. A
     // pattern with both `$` and `\z` is therefore read by the exact engine alone (after the `l`/`n` route above,
     // which reads `$` the same way).
-    if S::TAG != EvalTag::Yq && needs_trailing_nl_check && pattern_has_escape_z(&pattern) {
+    //
+    // #6080: so is one whose `$` something follows, since that token can consume the `\n` the `$` stood
+    // before (`"ab\n" | match("b$\\n")`).
+    if S::TAG != EvalTag::Yq
+        && needs_trailing_nl_check
+        && (pattern_has_escape_z(&pattern) || pattern_has_interior_dollar(&pattern))
+    {
         if let Some(re) = build_fancy_regex::<S>(&pattern) {
             return Ok(JqRegex {
                 engine: RegexEngine::Fancy(re),
