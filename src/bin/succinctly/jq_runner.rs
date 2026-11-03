@@ -4536,7 +4536,7 @@ fn jq_exit_code(
     mut last_output: Option<OwnedValue>,
     open_failed: bool,
 ) -> i32 {
-    if open_failed {
+    if open_failed || INPUT_READ_FAILED.with(std::cell::Cell::get) {
         return exit_codes::USAGE_ERROR;
     }
     let failed = match args.on_error {
@@ -7875,6 +7875,8 @@ thread_local! {
     /// the clean kind it serves (#5674): stdin can be read once, and the materializing route
     /// reads it through [`read_stdin_bytes`].
     static STDIN_PUSHBACK: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    /// A source the stream reader was reading failed part-way (#5498): jq reports it and exits 2.
+    static INPUT_READ_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether the `--stream` events are read a chunk at a time (#5498): the reader serves them to the
@@ -7890,67 +7892,78 @@ fn stream_read_in_chunks(args: &JqCommand, track_eof: bool) -> bool {
         && (args.null_input || stream_walk_by_reader(args))
 }
 
-/// The input files that opened and a buffered reader for each ([`open_chunked_inputs`]).
-type ChunkedInputs = (Vec<PathBuf>, Vec<Box<dyn std::io::BufRead>>);
+/// The input files that opened and how to open each again for the reader ([`open_chunked_inputs`]).
+type ChunkedInputs = (Vec<PathBuf>, Vec<crate::jq_stream_errors::Opener>);
 
 /// Open the main input files, or stdin, for the stream reader (#5498): a source that does not
 /// open is reported and left out, as [`read_input_files`] does (#5472).
 ///
-/// Each source is probed with a read of its first bytes, so a file that opens but cannot be read
-/// (a directory) fails here with the message `std::fs::read` gave, and the BOM jq skips at the
-/// front of its input (#5291) is taken off the first source that has any bytes.
+/// Each file is probed with a read of its first bytes and closed, so a file that opens but cannot
+/// be read (a directory) fails here with the message `std::fs::read` gave, and the BOM jq skips at
+/// the front of its input (#5291) is found on the first source that has bytes. The reader opens
+/// each file when it gets to it and drops it when it is read, so a run over many files holds one.
+/// Stdin is read for its first bytes and kept.
 fn open_chunked_inputs(files: &[PathBuf], open_failed: &mut bool) -> Result<ChunkedInputs> {
     let mut opened = Vec::with_capacity(files.len());
-    let mut readers: Vec<Box<dyn std::io::BufRead>> = Vec::with_capacity(files.len().max(1));
+    let mut openers: Vec<crate::jq_stream_errors::Opener> = Vec::with_capacity(files.len().max(1));
     let mut look_for_bom = true;
     if files.is_empty() {
         let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
-        let stdin = std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(std::io::stdin());
-        let reader =
-            chunked_reader(stdin, &mut look_for_bom).context("Failed to read from stdin")?;
-        readers.push(reader);
-        return Ok((opened, readers));
+        let mut stdin =
+            std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(std::io::stdin());
+        let head = read_head(&mut stdin).context("Failed to read from stdin")?;
+        let skip = bom_to_skip(&head, &mut look_for_bom);
+        openers.push(Box::new(move || {
+            let rest = std::io::Cursor::new(head[skip..].to_vec()).chain(stdin);
+            Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, rest)))
+        }));
+        return Ok((opened, openers));
     }
     for path in files {
-        let reader = std::fs::File::open(path)
-            .and_then(|file| chunked_reader(file, &mut look_for_bom))
+        let probed = std::fs::File::open(path)
+            .and_then(|mut file| read_head(&mut file))
             .map_err(|e| InputFileOpenError::new(path, strerror_only(&e)));
-        match reader {
-            Ok(reader) => {
+        match probed {
+            Ok(head) => {
+                let skip = bom_to_skip(&head, &mut look_for_bom);
+                let path = path.clone();
                 opened.push(path.clone());
-                readers.push(reader);
+                openers.push(Box::new(move || {
+                    use std::io::Seek;
+                    let mut file = std::fs::File::open(&path)?;
+                    file.seek(std::io::SeekFrom::Start(skip as u64))?;
+                    Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, file)))
+                }));
             }
             Err(e) => report_unopenable_input(&e, open_failed),
         }
     }
-    Ok((opened, readers))
+    Ok((opened, openers))
 }
 
-/// `inner` as a buffered reader that has been read from for its first three bytes, which are put
-/// back unless they are the BOM to skip (`look_for_bom`, cleared once a source has bytes).
-fn chunked_reader<R: std::io::Read + 'static>(
-    mut inner: R,
-    look_for_bom: &mut bool,
-) -> std::io::Result<Box<dyn std::io::BufRead>> {
+/// The first three bytes of `reader`, or fewer at its end.
+fn read_head(reader: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
     let mut head = Vec::with_capacity(3);
     let mut byte = [0u8; 3];
     while head.len() < 3 {
-        match inner.read(&mut byte[..3 - head.len()]) {
+        match reader.read(&mut byte[..3 - head.len()]) {
             Ok(0) => break,
             Ok(n) => head.extend_from_slice(&byte[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
     }
-    if *look_for_bom && !head.is_empty() {
-        *look_for_bom = false;
-        let bom_len = crate::front_matter::leading_bom_len(&head);
-        head.drain(..bom_len);
+    Ok(head)
+}
+
+/// How many bytes of a source that starts with `head` are the BOM jq skips: the first source that
+/// has bytes may start with one (`look_for_bom`, cleared once a source has any).
+fn bom_to_skip(head: &[u8], look_for_bom: &mut bool) -> usize {
+    if !*look_for_bom || head.is_empty() {
+        return 0;
     }
-    Ok(Box::new(std::io::BufReader::with_capacity(
-        64 * 1024,
-        std::io::Cursor::new(head).chain(inner),
-    )))
+    *look_for_bom = false;
+    crate::front_matter::leading_bom_len(head)
 }
 
 /// Read stdin to bytes.
@@ -9420,12 +9433,19 @@ fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
                 _ => jq::ProducedInput::Document(input.value, tag, line),
             }
         }
-        None => jq::ProducedInput::End(
-            reader
-                .end()
-                .open_at_end
-                .map(|lines| (last_source, u32::try_from(lines).unwrap_or(u32::MAX))),
-        ),
+        None => {
+            // A source that failed part-way ended there: jq reports it and exits 2 (#5498).
+            if let Some(error) = reader.take_error() {
+                eprintln!("jq: error: {}", strerror_only(&error));
+                INPUT_READ_FAILED.with(|failed| failed.set(true));
+            }
+            jq::ProducedInput::End(
+                reader
+                    .end()
+                    .open_at_end
+                    .map(|lines| (last_source, u32::try_from(lines).unwrap_or(u32::MAX))),
+            )
+        }
     })
 }
 

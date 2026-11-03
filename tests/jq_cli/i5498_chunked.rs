@@ -188,3 +188,98 @@ fn the_bom_is_skipped_once_at_the_front_of_the_chunked_read_5498() -> Result<()>
     assert_eq!(code, 5, "{stderr}");
     Ok(())
 }
+
+/// A producer that writes a line and waits gets that line's events at once: the reader finds out
+/// whether a source ended by the read that follows, not by one that looks past the line.
+#[test]
+fn a_line_from_a_slow_producer_is_answered_before_the_next_one_arrives_5498() -> Result<()> {
+    use std::io::{BufRead, BufReader};
+    for args in [
+        vec!["--unbuffered", "-c", "--stream", "."],
+        vec!["--unbuffered", "-nc", "--stream", "inputs"],
+    ] {
+        let mut child = Command::new(succinctly_bin())
+            .arg("jq")
+            .args(&args)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut input = child.stdin.take().expect("a piped stdin");
+        let mut lines = BufReader::new(child.stdout.take().expect("a piped stdout")).lines();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            while let Some(Ok(line)) = lines.next() {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        input.write_all(b"[1]\n")?;
+        input.flush()?;
+        // The stdin is still open: the events of the line must come without the next one.
+        let timeout = std::time::Duration::from_secs(30);
+        assert_eq!(receiver.recv_timeout(timeout)?, "[[0],1]", "{args:?}");
+        assert_eq!(receiver.recv_timeout(timeout)?, "[[0]]", "{args:?}");
+        input.write_all(b"[2]\n")?;
+        drop(input);
+        assert_eq!(receiver.recv_timeout(timeout)?, "[[0],2]", "{args:?}");
+        assert_eq!(receiver.recv_timeout(timeout)?, "[[0]]", "{args:?}");
+        assert!(child.wait()?.success(), "{args:?}");
+        reader.join().expect("the output reader");
+    }
+    Ok(())
+}
+
+/// A file that does not open, or opens and cannot be read (a directory), is reported when the files
+/// are checked and left out, as it was when each was read whole (#5472); the others are read.
+#[test]
+fn an_unreadable_file_is_reported_and_left_out_of_the_chunked_read_5498() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let good = dir.path().join("good.json");
+    std::fs::write(&good, "[1]\n")?;
+    let missing = dir.path().join("missing.json");
+    let folder = dir.path().join("folder");
+    std::fs::create_dir(&folder)?;
+    let (good, missing, folder) = (
+        good.to_string_lossy().into_owned(),
+        missing.to_string_lossy().into_owned(),
+        folder.to_string_lossy().into_owned(),
+    );
+    for (unreadable, detail) in [
+        (&missing, "No such file or directory"),
+        (&folder, "Is a directory"),
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-nc", "--stream", "[inputs]", unreadable, &good], None)?;
+        assert_eq!(stdout, "[[[0],1],[[0]]]\n");
+        assert_eq!(
+            stderr,
+            format!("jq: error: Could not open file {unreadable}: {detail}\n")
+        );
+        assert_eq!(code, 2);
+    }
+    Ok(())
+}
+
+/// Many small files are read one after the other, each opened when it is reached.
+#[test]
+fn many_files_are_read_one_at_a_time_5498() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let paths: Vec<String> = (0..600)
+        .map(|n| {
+            let path = dir.path().join(format!("f{n}.json"));
+            std::fs::write(&path, format!("[{n}]\n"))?;
+            Ok(path.to_string_lossy().into_owned())
+        })
+        .collect::<Result<_>>()?;
+    let mut args = vec!["-nc", "--stream", "[inputs|select(length==2)|.[1]]|add"];
+    args.extend(paths.iter().map(String::as_str));
+    let (stdout, stderr, code) = run_jq_full(&args, None)?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("179700\n", "", 0)
+    );
+    Ok(())
+}

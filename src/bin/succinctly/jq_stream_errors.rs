@@ -120,11 +120,21 @@ pub(crate) trait RefillSource {
     /// The next refill, its bytes left in `buf` (which is cleared first), or `None` once the empty
     /// closing refill, if there is one, has been handed out.
     fn next_refill(&mut self, buf: &mut Vec<u8>) -> Option<Refill>;
+
+    /// The first read error that ended a source early, if one did: a source read from a file or
+    /// stdin can fail part-way, where one already read cannot.
+    fn take_error(&mut self) -> Option<std::io::Error> {
+        None
+    }
 }
 
 impl RefillSource for Box<dyn RefillSource> {
     fn next_refill(&mut self, buf: &mut Vec<u8>) -> Option<Refill> {
         (**self).next_refill(buf)
+    }
+
+    fn take_error(&mut self) -> Option<std::io::Error> {
+        (**self).take_error()
     }
 }
 
@@ -156,49 +166,84 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> RefillSource for MemorySources<S> {
     }
 }
 
-/// jq's refills over files and stdin, read a chunk at a time (#5498): what is held is one `fgets`
-/// chunk, 4095 bytes at most, and the reader's own buffer, not the input.
+/// Opens one source when the reader reaches it.
+pub(crate) type Opener = Box<dyn FnOnce() -> std::io::Result<Box<dyn std::io::BufRead>>>;
+
+/// jq's refills over files and stdin, read a chunk at a time (#5498): what is held is the source
+/// being read, with its buffer, and one `fgets` chunk, 4095 bytes at most, not the input.
 ///
 /// The refills are the ones [`MemorySources`] makes over the same bytes: a chunk runs through the
 /// next newline or 4095 bytes, an empty source is a refill of its own, and the last chunk of the
 /// last source is the last refill unless it filled the buffer or ended in a newline.
+///
+/// A source is opened when it is reached and dropped when it is read, so many files hold one
+/// descriptor and one buffer. Whether a chunk that ended at a newline or at 4095 bytes was the end
+/// of its source is found by the next call, which reads first, so a stream that stops after a
+/// line (a pipe from a slow producer) has handed over that line without waiting for the next one.
 pub(crate) struct ChunkedSources {
-    readers: Vec<Box<dyn std::io::BufRead>>,
+    openers: Vec<Option<Opener>>,
+    current: Option<Box<dyn std::io::BufRead>>,
     source: usize,
+    /// The chunk handed out last ended at a newline or filled the buffer, so it is not yet known
+    /// whether it was the end of `current`.
+    unsettled: bool,
     last: Option<(usize, bool)>,
     closed: bool,
+    error: Option<std::io::Error>,
 }
 
 impl ChunkedSources {
-    /// `readers` in input order, each already past a leading BOM that is to be skipped.
-    pub(crate) fn new(readers: Vec<Box<dyn std::io::BufRead>>) -> Self {
+    /// `openers` in input order, each giving the reader of one source, already past a leading BOM
+    /// that is to be skipped.
+    pub(crate) fn new(openers: Vec<Opener>) -> Self {
         Self {
-            readers,
+            openers: openers.into_iter().map(Some).collect(),
+            current: None,
             source: 0,
+            unsettled: false,
             last: None,
             closed: false,
+            error: None,
         }
+    }
+
+    fn fail(&mut self, error: std::io::Error) {
+        self.error.get_or_insert(error);
     }
 }
 
-/// One `fgets` chunk of `reader` appended to `buf`: through the next newline, or 4095 bytes.
-/// An error ends the chunk where it fell, as the end of the source does.
-fn read_chunk(reader: &mut dyn std::io::BufRead, buf: &mut Vec<u8>) {
+/// How [`read_chunk`] stopped.
+#[derive(PartialEq, Eq)]
+enum ChunkEnd {
+    /// After a newline.
+    Newline,
+    /// At [`JQ_FGETS_CHUNK`] bytes.
+    Full,
+    /// The source has no more bytes, or failed.
+    Eof,
+}
+
+/// One `fgets` chunk of `reader` appended to `buf`: through the next newline, or 4095 bytes. An
+/// error ends the chunk where it fell, as the end of the source does, and is handed back.
+fn read_chunk(
+    reader: &mut dyn std::io::BufRead,
+    buf: &mut Vec<u8>,
+) -> (ChunkEnd, Option<std::io::Error>) {
     while buf.len() < JQ_FGETS_CHUNK {
         let available = match reader.fill_buf() {
             Ok(available) => available,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return,
+            Err(e) => return (ChunkEnd::Eof, Some(e)),
         };
         if available.is_empty() {
-            return;
+            return (ChunkEnd::Eof, None);
         }
         let window = &available[..available.len().min(JQ_FGETS_CHUNK - buf.len())];
         match window.iter().position(|&byte| byte == b'\n') {
             Some(newline) => {
                 buf.extend_from_slice(&window[..=newline]);
                 reader.consume(newline + 1);
-                return;
+                return (ChunkEnd::Newline, None);
             }
             None => {
                 buf.extend_from_slice(window);
@@ -207,18 +252,63 @@ fn read_chunk(reader: &mut dyn std::io::BufRead, buf: &mut Vec<u8>) {
             }
         }
     }
+    (ChunkEnd::Full, None)
 }
 
 impl RefillSource for ChunkedSources {
     fn next_refill(&mut self, buf: &mut Vec<u8>) -> Option<Refill> {
-        let count = self.readers.len();
-        if let Some(reader) = self.readers.get_mut(self.source) {
+        let count = self.openers.len();
+        while self.source < count {
             let source = self.source;
             let last_source = source + 1 == count;
+            if self.current.is_none() {
+                let opened = self.openers[source].take().map_or_else(
+                    || {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "a source opened twice",
+                        ))
+                    },
+                    |open| open(),
+                );
+                self.current = Some(match opened {
+                    Ok(reader) => reader,
+                    Err(e) => {
+                        // A source that opened when the files were checked and no longer does
+                        // reads as empty, with the error kept.
+                        self.fail(e);
+                        Box::new(std::io::BufReader::new(std::io::empty()))
+                    }
+                });
+            }
+            let reader = self.current.as_mut().expect("a source is open");
+            if self.unsettled {
+                self.unsettled = false;
+                // Whether the last chunk ended its source is found now, by the first read of the
+                // next one.
+                let ended = match reader.fill_buf() {
+                    Ok(available) => available.is_empty(),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => false,
+                    Err(e) => {
+                        self.fail(e);
+                        true
+                    }
+                };
+                if ended {
+                    self.current = None;
+                    self.source += 1;
+                    continue;
+                }
+            }
+            let reader = self.current.as_mut().expect("a source is open");
             buf.clear();
-            read_chunk(reader.as_mut(), buf);
+            let (end, error) = read_chunk(reader.as_mut(), buf);
+            if let Some(e) = error {
+                self.fail(e);
+            }
             if buf.is_empty() {
                 // A source with no bytes is a refill of its own.
+                self.current = None;
                 self.source += 1;
                 self.last = Some((source, last_source));
                 return Some(Refill {
@@ -227,19 +317,21 @@ impl RefillSource for ChunkedSources {
                     is_last: last_source,
                 });
             }
-            let at_end = reader.fill_buf().map_or(true, <[u8]>::is_empty);
-            if at_end {
-                self.source += 1;
-            }
             let newline = buf.ends_with(b"\n");
-            let hit_eof = !newline && buf.len() < JQ_FGETS_CHUNK;
+            let hit_eof = end == ChunkEnd::Eof && !newline;
+            if end == ChunkEnd::Eof {
+                self.current = None;
+                self.source += 1;
+            } else {
+                self.unsettled = true;
+            }
             if !newline {
                 // The parser sees a chunk with no newline up to its first NUL (`strlen`).
                 if let Some(nul) = buf.iter().position(|&byte| byte == 0) {
                     buf.truncate(nul);
                 }
             }
-            let is_last = last_source && at_end && hit_eof;
+            let is_last = last_source && hit_eof;
             self.last = Some((source, is_last));
             return Some(Refill {
                 source,
@@ -259,6 +351,10 @@ impl RefillSource for ChunkedSources {
             }
         }
         None
+    }
+
+    fn take_error(&mut self) -> Option<std::io::Error> {
+        self.error.take()
     }
 }
 
@@ -476,6 +572,11 @@ impl<R: RefillSource> Reader<R> {
             self.inside = Some(parser.yielded);
             self.slurp_at = (parser.source, parser.lines_read);
         }
+    }
+
+    /// The read error that ended a source early, if one did (see [`RefillSource::take_error`]).
+    pub(crate) fn take_error(&mut self) -> Option<std::io::Error> {
+        self.source.take_error()
     }
 
     /// How the read ended. Meaningful once [`next`](Self::next) has returned `None`.
@@ -1201,29 +1302,157 @@ mod tests {
             let want = observe(Reader::new(&sources));
             for limit in [1, 2, 3, 7, 64, 100_000] {
                 for capacity in [1, 3, 16, 8192] {
-                    let readers: Vec<Box<dyn std::io::BufRead>> = files
+                    let openers: Vec<Opener> = files
                         .iter()
-                        .map(|text| -> Box<dyn std::io::BufRead> {
-                            Box::new(std::io::BufReader::with_capacity(
-                                capacity,
-                                Trickle {
-                                    data: text.as_bytes().to_vec(),
-                                    pos: 0,
-                                    limit,
-                                },
-                            ))
+                        .map(|text| -> Opener {
+                            let data = text.as_bytes().to_vec();
+                            Box::new(move || -> std::io::Result<Box<dyn std::io::BufRead>> {
+                                Ok(Box::new(std::io::BufReader::with_capacity(
+                                    capacity,
+                                    Trickle {
+                                        data,
+                                        pos: 0,
+                                        limit,
+                                    },
+                                )))
+                            })
                         })
                         .collect();
-                    let got = observe(Reader::from_source(ChunkedSources::new(readers)));
+                    let got = observe(Reader::from_source(ChunkedSources::new(openers)));
                     assert_eq!(
                         got, want,
                         "{files:?} read {limit} at a time through {capacity}"
                     );
+                    if files
+                        .iter()
+                        .any(|text| text.contains('[') || text.contains('{'))
+                    {
+                        assert!(!got.0.is_empty(), "{files:?} yields inputs");
+                    }
                     compared += 1;
                 }
             }
         }
         assert_eq!(compared, streams.len() * 6 * 4);
+    }
+
+    /// A `Read` that counts its calls, to see when the chunked reader reads.
+    struct Counting {
+        data: Vec<u8>,
+        pos: usize,
+        reads: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl std::io::Read for Counting {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.set(self.reads.get() + 1);
+            let n = out.len().min(self.data.len() - self.pos);
+            out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// #5498: a line is handed over without a read to find out whether another follows, so a pipe
+    /// from a producer that writes a line and waits gets that line's events at once.
+    #[test]
+    fn a_line_is_handed_over_before_the_source_is_read_again_5498() {
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = std::rc::Rc::clone(&reads);
+        let opener: Opener = Box::new(move || {
+            Ok(Box::new(std::io::BufReader::with_capacity(
+                8192,
+                Counting {
+                    data: b"[1]\n[2]\n".to_vec(),
+                    pos: 0,
+                    reads: counter,
+                },
+            )))
+        });
+        let mut sources = ChunkedSources::new(vec![opener]);
+        let mut buf = Vec::new();
+        let first = sources.next_refill(&mut buf).expect("a first refill");
+        assert_eq!(
+            (buf.as_slice(), first.newline, first.is_last),
+            (&b"[1]\n"[..], true, false)
+        );
+        assert_eq!(
+            reads.get(),
+            1,
+            "the buffer was filled once, and no read looked past the line"
+        );
+        let second = sources.next_refill(&mut buf).expect("a second refill");
+        assert_eq!((buf.as_slice(), second.is_last), (&b"[2]\n"[..], false));
+        assert_eq!(reads.get(), 1, "the second line was in the buffer");
+        // The closing refill is found by the read that finds the end.
+        let closing = sources.next_refill(&mut buf).expect("the closing refill");
+        assert_eq!((buf.is_empty(), closing.is_last), (true, true));
+        assert_eq!(reads.get(), 2);
+        assert!(sources.next_refill(&mut buf).is_none());
+    }
+
+    /// #5498: a source opens when it is reached and is dropped when it is read, and one that no
+    /// longer opens reads as empty with its error kept.
+    #[test]
+    fn a_source_opens_when_reached_and_a_failed_open_reads_as_empty_5498() {
+        let opened = std::rc::Rc::new(std::cell::Cell::new(0));
+        let make = |text: &'static str, opened: std::rc::Rc<std::cell::Cell<usize>>| -> Opener {
+            Box::new(move || {
+                opened.set(opened.get() + 1);
+                Ok(Box::new(std::io::Cursor::new(text.as_bytes().to_vec())))
+            })
+        };
+        let failing: Opener =
+            Box::new(|| Err(std::io::Error::new(std::io::ErrorKind::Other, "gone")));
+        let mut reader = Reader::from_source(ChunkedSources::new(vec![
+            make("[1]\n", std::rc::Rc::clone(&opened)),
+            failing,
+            make("[2]\n", std::rc::Rc::clone(&opened)),
+        ]));
+        assert_eq!(opened.get(), 0, "nothing is opened before the first read");
+        let first = reader.next_yielded().expect("an input");
+        assert_eq!(first.value.to_json(), "[[0],1]");
+        assert_eq!(opened.get(), 1);
+        let mut rest = Vec::new();
+        while let Some(item) = reader.next_yielded() {
+            rest.push(item.value.to_json());
+        }
+        assert_eq!(rest, ["[[0]]", "[[0],2]", "[[0]]"]);
+        assert_eq!(opened.get(), 2);
+        assert_eq!(
+            reader.take_error().map(|e| e.to_string()),
+            Some("gone".to_string())
+        );
+    }
+
+    /// #5498: a read that fails part-way ends its source there and is kept for the caller.
+    #[test]
+    fn a_read_error_ends_the_source_and_is_kept_5498() {
+        struct Failing(usize);
+        impl std::io::Read for Failing {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "input/output error",
+                    ));
+                }
+                self.0 -= 1;
+                out[..4].copy_from_slice(b"[1]\n");
+                Ok(4)
+            }
+        }
+        let opener: Opener = Box::new(|| Ok(Box::new(std::io::BufReader::new(Failing(1)))));
+        let mut reader = Reader::from_source(ChunkedSources::new(vec![opener]));
+        let mut values = Vec::new();
+        while let Some(item) = reader.next_yielded() {
+            values.push(item.value.to_json());
+        }
+        assert_eq!(values, ["[[0],1]", "[[0]]"]);
+        assert_eq!(
+            reader.take_error().map(|e| e.to_string()),
+            Some("input/output error".to_string())
+        );
     }
 
     /// #5498: `--slurp` keeps the location of the last few values only, and of the first error, and
