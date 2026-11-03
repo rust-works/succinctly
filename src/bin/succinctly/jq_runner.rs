@@ -14665,7 +14665,7 @@ mod tests {
         use clap::Parser;
 
         let mut argv = vec!["jq".to_string(), "-n".to_string()];
-        argv.extend(flags.iter().map(|flag| flag.to_string()));
+        argv.extend(flags.iter().map(|&flag| flag.to_owned()));
         argv.push("inputs".to_string());
         for (index, bytes) in files.iter().enumerate() {
             let path = dir.join(format!("stream{index}.json"));
