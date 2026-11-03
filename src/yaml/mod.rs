@@ -277,7 +277,7 @@ pub(crate) enum QuotedSpanEnd {
 pub use encode_style::{
     go_yaml_block_scalar, go_yaml_explicit_key_scalar, go_yaml_forces_double_quotes,
     go_yaml_key_is_simple, go_yaml_multiline_scalar, go_yaml_resolved_tag,
-    go_yaml_unicode_separator_scalar, has_unwritable_char,
+    go_yaml_single_quoted_line_feed, go_yaml_unicode_separator_scalar, has_unwritable_char,
 };
 pub use encode_style::{
     go_yaml_dom_scalar, go_yaml_double_quoted_scalar, go_yaml_tagged_str_scalar,

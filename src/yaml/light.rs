@@ -22,9 +22,9 @@ use std::string::ToString;
 
 use super::encode_style::{
     flow_plain_needs_single_quotes, go_yaml_explicit_key_scalar, go_yaml_key_is_simple,
-    go_yaml_multiline_scalar, go_yaml_unicode_separator_scalar, has_unwritable_char,
-    has_unwritable_char_in_block, write_go_yaml_double_quoted, write_go_yaml_single_quoted,
-    write_go_yaml_string,
+    go_yaml_multiline_scalar, go_yaml_single_quoted_line_feed, go_yaml_unicode_separator_scalar,
+    has_unwritable_char, has_unwritable_char_in_block, write_go_yaml_double_quoted,
+    write_go_yaml_single_quoted, write_go_yaml_string,
 };
 use super::index::YamlIndex;
 use super::line_break::{blank_line_between, is_line_break, line_break_len};
@@ -5929,6 +5929,13 @@ impl<'a> YamlString<'a> {
         }
     }
 
+    /// Whether this source single-quoted scalar may hold a line feed: its source spans a line, the
+    /// only way a `\n` gets into one (an empty line; a single break folds to a space, #6058).
+    #[must_use]
+    pub(crate) fn may_hold_line_feed(&self) -> bool {
+        matches!(self, Self::SingleQuoted { .. }) && self.raw_bytes().contains(&b'\n')
+    }
+
     /// Whether this source scalar may hold U+2028 or U+2029, by a scan of its source bytes for the
     /// lead byte `0xE2` (a single- or un-quoted scalar has no escape that spells either, so the
     /// bytes are all there is; every other style is `false`). A cheap filter ahead of a decode
@@ -9331,6 +9338,18 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
     if let (Some((scalar_indent, step)), Some(YamlValue::String(string))) =
         (&item_indent, &resolved)
     {
+        // #6058: a single-quoted item with an empty line keeps its quotes across the break.
+        if string.may_hold_line_feed() {
+            if let Ok(text) = string.as_str() {
+                if let Some(scalar) = go_yaml_single_quoted_line_feed(&text, scalar_indent) {
+                    if let Some(tag) = value.explicit_tag_at(resolved.as_ref()) {
+                        out.write_str(tag)?;
+                        out.write_char(' ')?;
+                    }
+                    return Ok(out.write_str(&scalar)?);
+                }
+            }
+        }
         if string.may_hold_unicode_line_separator() {
             if let Ok(text) = string.as_str() {
                 if let Some(scalar) = go_yaml_unicode_separator_scalar(&text, scalar_indent, *step)
@@ -10516,7 +10535,17 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
             }
         }
         YamlString::DoubleQuoted { .. } => Ok(write_go_yaml_double_quoted(out, &str_val)?),
-        YamlString::SingleQuoted { .. } => Ok(write_go_yaml_single_quoted(out, &str_val)?),
+        YamlString::SingleQuoted { .. } => {
+            // #6058: yq keeps the single quotes across a line feed, one empty line per `\n`.
+            if let Some(scalar) = block.and_then(|(indent, _)| {
+                s.may_hold_line_feed()
+                    .then(|| go_yaml_single_quoted_line_feed(&str_val, indent))
+                    .flatten()
+            }) {
+                return Ok(out.write_str(&scalar)?);
+            }
+            Ok(write_go_yaml_single_quoted(out, &str_val)?)
+        }
         YamlString::Unquoted { .. } => {
             // #996: checked before the verbatim-echo fallback below,
             // which is for genuine YAML source text only. A non-finite
