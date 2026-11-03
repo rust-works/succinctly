@@ -5188,14 +5188,16 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // same file still exits 1. Nothing is lost by skipping it here --
         // any document that would have been substituted is a document
         // `validate_json_input` rejects.
-        let raw_inputs: Vec<Vec<u8>> = if args.validate {
-            raw_inputs
+        // #5964: jq's parser counts the bytes as read, so a message that names where it stopped
+        // is worded over the originals of the files the substitution changed.
+        let (raw_inputs, originals): (Vec<Vec<u8>>, Vec<Option<Vec<u8>>>) = if args.validate {
+            (raw_inputs, Vec::new())
         } else {
             raw_inputs
                 .into_iter()
                 .enumerate()
                 .map(|(index, raw)| utf8_lossy_document(raw, seams.get_mut(index)))
-                .collect()
+                .unzip()
         };
 
         // #2847: `--slurp` replaces the per-file documents with the single
@@ -5204,7 +5206,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // diagnostic names) is carried here instead, since the one document
         // no longer belongs to any single file.
         let (raw_inputs, slurped) = if args.slurp {
-            match slurp_documents(raw_inputs, &files, args.validate, &seams) {
+            match slurp_documents(raw_inputs, &originals, &files, args.validate, &seams) {
                 Ok(mut slurped) => (vec![std::mem::take(&mut slurped.combined)], Some(slurped)),
                 // `--validate` already printed its own report.
                 Err(SlurpFailure::Validation(exit_code)) => return Ok(exit_code),
@@ -5237,11 +5239,18 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // parser words it, from the stream's first fault. The buffers are shared with the loop
         // below, not copied; a slurped stream's are gone, so it is read again from its files.
         let raw_inputs = std::rc::Rc::new(raw_inputs);
+        // A slurped stream is one buffer now, and its fault is read again from the files.
+        let originals = std::rc::Rc::new(if slurped.is_some() {
+            Vec::new()
+        } else {
+            originals
+        });
         sink.set_stream_fault(match slurped {
             None => {
                 let raw_inputs = std::rc::Rc::clone(&raw_inputs);
+                let originals = std::rc::Rc::clone(&originals);
                 StreamFault::new(move || {
-                    jq::jq_stream_fault(raw_inputs.iter().map(Vec::as_slice), 1, 0)
+                    jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0)
                 })
             }
             Some(_) => {
@@ -5653,7 +5662,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // limit or not, and a value the splitter delimits can hold one ahead of the
                 // splitter's.
                 if let Some(message) =
-                    jq::jq_stream_fault(raw_inputs.iter().map(Vec::as_slice), 1, 0)
+                    jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0)
                 {
                     sink.report_parse_error(&message);
                     run_stopped = true;
@@ -6663,7 +6672,10 @@ fn get_inputs(
     // All reads happen first, then decoding: a later file's read error still
     // outranks an earlier file's content error, as it did before.
     let mut raw_inputs: Vec<(Option<usize>, String)> = Vec::with_capacity(raw_bytes.len());
+    // #5964: the files the substitution changed, as read. A source nothing changed has none.
+    let mut lossy_sources: Vec<Option<LossySource>> = Vec::with_capacity(raw_bytes.len());
     for (pos, (file_idx, raw)) in raw_bytes.into_iter().enumerate() {
+        let mut lossy = None;
         // `String::from_utf8`, not `String::from_utf8_lossy(&raw).into_owned()`:
         // the latter allocates and copies the whole document even when it is
         // valid, because the `Cow` it returns is `Borrowed` and `into_owned`
@@ -6723,7 +6735,12 @@ fn get_inputs(
                     if let Some(seam) = seams.get_mut(pos) {
                         *seam = std::mem::take(seam).after_substitution(e.as_bytes());
                     }
-                    succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(e.as_bytes())
+                    let substituted =
+                        succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(
+                            e.as_bytes(),
+                        );
+                    lossy = Some(LossySource::new(e.into_bytes(), substituted.as_bytes()));
+                    substituted
                 } else {
                     // `--raw-input --slurp` (the non-slurp `-R` took the
                     // per-line branch above) is genuinely whole-buffer in
@@ -6737,6 +6754,7 @@ fn get_inputs(
             }
         };
         raw_inputs.push((file_idx, raw));
+        lossy_sources.push(lossy);
     }
 
     debug_assert!(seams.is_empty() || seams.len() == raw_inputs.len());
@@ -6895,14 +6913,20 @@ fn get_inputs(
         for (pos, (file_idx, raw)) in raw_inputs.into_iter().enumerate() {
             let src = file_idx.unwrap_or(0);
             let file_start = next_file;
+            // #5964: jq counts the bytes it read, not the text the substitution made of them.
+            let lossy = lossy_sources.get(pos).and_then(Option::as_ref);
             if counts_files && pos < last {
-                next_file = advance_position(next_file, raw.as_bytes());
+                next_file = advance_position(
+                    next_file,
+                    lossy.map_or(raw.as_bytes(), |lossy| &lossy.original),
+                );
             }
             // `--stream` reads with jq's streaming parser, which has no depth limit.
             let origin = |before| {
                 (!args.stream).then_some(StreamOrigin {
                     file: file_start,
                     before,
+                    read: lossy.map(|lossy| lossy.original.as_slice()),
                 })
             };
             // #4316: the bytes a stitched file starts with came from the previous file, so
@@ -7007,10 +7031,22 @@ fn get_inputs(
                         let segment = &raw[offset..];
                         let seg_pos = (!args.stream).then(|| {
                             parser_at.unwrap_or_else(|| {
-                                advance_position(file_start, &raw.as_bytes()[..offset])
+                                advance_source(file_start, raw.as_bytes(), lossy, 0..offset)
                             })
                         });
-                        let seg_origin = seg_pos.map(|file| StreamOrigin { file, before: &[] });
+                        // The bytes jq read of this segment, where they are known.
+                        let read = lossy.and_then(|lossy| {
+                            if offset == 0 {
+                                Some(lossy.original.as_slice())
+                            } else {
+                                lossy.bytes(offset..raw.len())
+                            }
+                        });
+                        let seg_origin = seg_pos.map(|file| StreamOrigin {
+                            file,
+                            before: &[],
+                            read,
+                        });
                         let (parsed, parse_error, fault_end) =
                             parse_json_stream_prefix_ending(segment, seg_origin, form);
                         let (spans, split_error) = split_json_values(segment.as_bytes());
@@ -7053,8 +7089,9 @@ fn get_inputs(
                         values.extend(parsed);
                         let (Some(error), Some(start)) = (parse_error, start) else {
                             if parser_at.is_some() {
-                                file_end =
-                                    seg_pos.map(|at| advance_position(at, segment.as_bytes()));
+                                file_end = seg_pos.map(|at| {
+                                    advance_source(at, raw.as_bytes(), lossy, offset..raw.len())
+                                });
                             }
                             break;
                         };
@@ -7088,7 +7125,8 @@ fn get_inputs(
                         // from where this segment started.
                         parser_at = fault_end.or_else(|| {
                             seg_pos.map(|at| {
-                                advance_position(at, &raw.as_bytes()[offset..resume.min(raw.len())])
+                                let end = resume.min(raw.len());
+                                advance_source(at, raw.as_bytes(), lossy, offset..end)
                             })
                         });
                         let mut next = resume;
@@ -8062,16 +8100,128 @@ impl ErrorAt<'_> {
 ///
 /// A file [`stitch_json_file_seams`] changed has its `seam` carried through the substitution
 /// ([`Seam::after_substitution`], #4316); `None` for a file nothing was moved on or off.
-fn utf8_lossy_document(raw: Vec<u8>, seam: Option<&mut Seam>) -> Vec<u8> {
+///
+/// The second value is the bytes as read when the substitution changed them (#5964): jq's parser
+/// counts those, so a message that names where it stopped has to as well.
+fn utf8_lossy_document(raw: Vec<u8>, seam: Option<&mut Seam>) -> (Vec<u8>, Option<Vec<u8>>) {
     match succinctly::text::utf8::validate_utf8(&raw) {
-        Ok(()) => raw,
+        Ok(()) => (raw, None),
         Err(_) => {
             if let Some(seam) = seam {
                 *seam = std::mem::take(seam).after_substitution(&raw);
             }
-            succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(&raw).into_bytes()
+            let substituted =
+                succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(&raw)
+                    .into_bytes();
+            (substituted, Some(raw))
         }
     }
+}
+
+/// What jq's parser read of each file: the bytes as they were where the invalid-UTF-8
+/// substitution changed them, the file as handed over otherwise (#5964). `originals` is empty
+/// when no file was substituted.
+fn parser_chunks<'a>(
+    raws: &'a [Vec<u8>],
+    originals: &'a [Option<Vec<u8>>],
+) -> impl Iterator<Item = &'a [u8]> {
+    raws.iter().enumerate().map(move |(index, raw)| {
+        originals
+            .get(index)
+            .and_then(Option::as_deref)
+            .unwrap_or(raw.as_slice())
+    })
+}
+
+/// A document's bytes as read, kept beside the text the invalid-UTF-8 substitution made of
+/// them, so an offset in that text can be counted over the bytes jq's parser counted (#5964).
+///
+/// jq's parser advances its column once per byte read, and the substitution turns each run of
+/// invalid bytes into one three-byte U+FFFD, so counted over the text a column is too high by
+/// two for each lone invalid byte. A literal U+FFFD in the document is three bytes to jq as
+/// well, so the two cannot be told apart in the text: the original has to be kept.
+struct LossySource {
+    original: Vec<u8>,
+    /// Where each substitution's U+FFFD sits in the text, ordered. `None` when the text is not
+    /// the original with each run replaced by one U+FFFD and nothing else (jq collapses or
+    /// drops a run inside a string, and an escape the text re-spells): an offset in it then has
+    /// no place in the original.
+    runs: Option<Vec<LossyRun>>,
+}
+
+#[derive(Clone, Copy)]
+struct LossyRun {
+    /// Offset of the U+FFFD in the substituted text.
+    at: usize,
+    /// How many bytes shorter the original is than the text, through this run.
+    shrink: usize,
+}
+
+impl LossySource {
+    /// `original` read as `substituted`.
+    fn new(original: Vec<u8>, substituted: &[u8]) -> Self {
+        let runs = (substituted == String::from_utf8_lossy(&original).as_bytes())
+            .then(|| Self::runs_of(&original));
+        Self { original, runs }
+    }
+
+    /// The runs of invalid bytes in `original`, as the lossy conversion replaces them.
+    fn runs_of(original: &[u8]) -> Vec<LossyRun> {
+        let (mut runs, mut text, mut shrink) = (Vec::new(), 0, 0);
+        let mut rest = original;
+        while !rest.is_empty() {
+            // (`Utf8Chunks` is newer than this crate's MSRV.)
+            let (valid, invalid) = match core::str::from_utf8(rest) {
+                Ok(_) => (rest.len(), 0),
+                Err(e) => (
+                    e.valid_up_to(),
+                    e.error_len()
+                        .unwrap_or_else(|| rest.len() - e.valid_up_to()),
+                ),
+            };
+            text += valid;
+            if invalid > 0 {
+                shrink += 3 - invalid;
+                runs.push(LossyRun { at: text, shrink });
+                text += 3;
+            }
+            rest = &rest[valid + invalid..];
+        }
+        runs
+    }
+
+    /// The offset in the original of `at` in the text; inside a U+FFFD, where its run starts.
+    fn original_offset(runs: &[LossyRun], at: usize) -> usize {
+        let before = runs.partition_point(|run| run.at + 3 <= at);
+        let shrunk = |index: usize| index.checked_sub(1).map_or(0, |i| runs[i].shrink);
+        match runs.get(before) {
+            Some(run) if run.at <= at => run.at - shrunk(before),
+            _ => at - shrunk(before),
+        }
+    }
+
+    /// The original's bytes for `range` of the text, or `None` when no place can be given.
+    fn bytes(&self, range: core::ops::Range<usize>) -> Option<&[u8]> {
+        let runs = self.runs.as_deref()?;
+        Some(
+            &self.original
+                [Self::original_offset(runs, range.start)..Self::original_offset(runs, range.end)],
+        )
+    }
+}
+
+/// `at` moved past `range` of `text`, counted over the bytes jq read where the text is a
+/// substitution of them (#5964).
+fn advance_source(
+    at: (usize, usize),
+    text: &[u8],
+    lossy: Option<&LossySource>,
+    range: core::ops::Range<usize>,
+) -> (usize, usize) {
+    let bytes = lossy
+        .and_then(|lossy| lossy.bytes(range.clone()))
+        .unwrap_or(&text[range]);
+    advance_position(at, bytes)
 }
 
 thread_local! {
@@ -8308,7 +8458,7 @@ impl Seam {
     /// `moved_len` and `moved_newline` stay as they are: they measure the file's own bytes as
     /// jq reads them, as [`EofTail`] does. Each end is where the substitution of the bytes up to
     /// it ends, as `base` always was, so a multi-byte character split across a file boundary is
-    /// the case this does not follow (#5964 holds the rest of the invalid-UTF-8 gap).
+    /// the case this does not follow (#5964 left it, see `docs/compliance/jq/limitations.md`).
     fn after_substitution(self, raw: &[u8]) -> Self {
         let prefix = &raw[..self.base.min(raw.len())];
         let lossy_end = |end: usize| {
@@ -8594,6 +8744,9 @@ fn advance_position((line, column): (usize, usize), bytes: &[u8]) -> (usize, usi
 struct StreamOrigin<'a> {
     file: (usize, usize),
     before: &'a [u8],
+    /// The bytes jq's parser read of the text, when the invalid-UTF-8 substitution changed it
+    /// (#5964): its message names the column over those.
+    read: Option<&'a [u8]>,
 }
 
 impl StreamOrigin<'_> {
@@ -8601,6 +8754,7 @@ impl StreamOrigin<'_> {
     const ALONE: StreamOrigin<'static> = StreamOrigin {
         file: (1, 0),
         before: &[],
+        read: None,
     };
 
     /// The position of `text[offset]`, `text` being the text this origin places.
@@ -9991,14 +10145,15 @@ fn slurp_fault(
 /// `None` when jq's parser reads it all or a file cannot be read again (#5576). Stdin has no file
 /// to read again, so a stream slurped from it keeps the evaluator's own wording.
 ///
-/// Each file is read as the default route reads it, a BOM skipped at the front of the stream and an
-/// invalid byte substituted, so the position is the one a stream that was not slurped names.
+/// Each file is read as the default route reads it, a BOM skipped at the front of the stream, and
+/// counted as the bytes it holds, an invalid one included, so the position is the one a stream
+/// that was not slurped names.
 fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
     let mut unreadable = false;
     let mut at_front = true;
     let chunks = files.iter().map_while(|path| match std::fs::read(path) {
-        Ok(raw) => {
-            let mut raw = utf8_lossy_document(raw, None);
+        Ok(mut raw) => {
+            // The bytes as read, not as substituted: jq's parser counts those (#5964).
             if at_front && !raw.is_empty() {
                 at_front = false;
                 raw.drain(..crate::front_matter::leading_bom_len(&raw));
@@ -10035,6 +10190,7 @@ fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
 /// `get_inputs` has always done.
 fn slurp_documents(
     raw_inputs: Vec<Vec<u8>>,
+    originals: &[Option<Vec<u8>>],
     files: &[PathBuf],
     validate: bool,
     seams: &[Seam],
@@ -10057,8 +10213,12 @@ fn slurp_documents(
             if jq::jq_depth_fault_offset(&raw[offset..]).is_some() {
                 return Err(SlurpFailure::DepthLimit);
             }
+            let read = originals
+                .get(idx)
+                .and_then(Option::as_deref)
+                .unwrap_or(&raw);
             return Err(SlurpFailure::Unsplittable(slurp_fault(
-                files, idx, &raw, origin,
+                files, idx, read, origin,
             )));
         }
         if idx != last {
@@ -10301,7 +10461,7 @@ fn parse_json_stream_prefix_ending(
     let jq_fault = || {
         origin.and_then(|origin| {
             let (line, column) = origin.position(text, 0);
-            jq::jq_stream_fault_end([text], line, column)
+            jq::jq_stream_fault_end([origin.read.unwrap_or(text)], line, column)
         })
     };
     let bytes = s.as_bytes();
@@ -16623,11 +16783,12 @@ mod tests {
         let bom = file(b"\xef\xbb\xbf1\n");
         assert_eq!(reread_stream_fault(&paths(&[&bom])), None);
         assert!(reread_stream_fault(&paths(&[&a, &bom])).is_some());
-        // An invalid byte is substituted before it is counted, as the default route does.
+        // An invalid byte is one column, as jq's parser counts the bytes it reads (#5964), which
+        // is how the default route counts it.
         let bad = file(b"1\n[1,\xff,,2]\n");
         assert_eq!(
             reread_stream_fault(&paths(&[&bad])).as_deref(),
-            Some("Invalid numeric literal at line 2, column 7")
+            Some("Invalid numeric literal at line 2, column 5")
         );
         // A file that is gone leaves no fault to name, even when an earlier file has one.
         let gone = PathBuf::from("/nonexistent-5576/gone.json");
@@ -16733,6 +16894,50 @@ mod tests {
 
     /// #4349: the substituted copy is mapped back to the original only when it differs from it by
     /// one U+FFFD per invalid run; a fault past the byte is found at the matching original byte.
+    #[test]
+    fn lossy_source_counts_the_bytes_jq_read_5964() {
+        let substitute = |original: &[u8]| {
+            succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(original)
+                .into_bytes()
+        };
+        // Two lone invalid bytes (one U+FFFD each) and a truncated three-byte lead (one for two).
+        let original = b"a\xffb\xe2\x82c\x80 }".to_vec();
+        let text = substitute(&original);
+        let lossy = LossySource::new(original.clone(), &text);
+        assert!(lossy.runs.is_some());
+        // Every character boundary of the text maps to the matching byte of the original.
+        assert_eq!(lossy.bytes(0..text.len()), Some(original.as_slice()));
+        assert_eq!(lossy.bytes(0..1), Some(&b"a"[..]));
+        assert_eq!(lossy.bytes(1..4), Some(&b"\xff"[..]));
+        assert_eq!(lossy.bytes(4..5), Some(&b"b"[..]));
+        assert_eq!(lossy.bytes(5..8), Some(&b"\xe2\x82"[..]));
+        // Inside a U+FFFD, the offset is where the run starts.
+        assert_eq!(lossy.bytes(2..2), Some(&b""[..]));
+        assert_eq!(lossy.bytes(1..2), Some(&b""[..]));
+        // The column counted over the bytes read, not the text.
+        assert_eq!(advance_position((1, 0), &text), (1, text.len()));
+        assert_eq!(
+            advance_source((1, 0), &text, Some(&lossy), 0..text.len()),
+            (1, original.len())
+        );
+        // Past a newline, the column restarts, and a U+FFFD that was in the input stays three.
+        let original = b"\xff\n\xef\xbf\xbd\xff }".to_vec();
+        let text = substitute(&original);
+        let lossy = LossySource::new(original.clone(), &text);
+        assert_eq!(
+            advance_source((1, 0), &text, Some(&lossy), 0..text.len()),
+            (2, 6)
+        );
+        // Without a source, the text is what is counted.
+        assert_eq!(advance_source((1, 0), &text, None, 0..4), (2, 0));
+        // A run jq collapses or drops inside a string has no place in the original.
+        let original = b"\"\xe1A\" }".to_vec();
+        let text = substitute(&original);
+        let lossy = LossySource::new(original, &text);
+        assert!(lossy.runs.is_none());
+        assert_eq!(lossy.bytes(0..1), None);
+    }
+
     #[test]
     fn fault_past_invalid_utf8_maps_back_one_for_one_4349() {
         // Nothing left to fault on once the byte is substituted.
@@ -17071,7 +17276,7 @@ mod tests {
     fn slurp_documents_joins_every_value_in_file_order_2847() {
         let join_with = |files: &[&str], validate: bool| {
             let raw = files.iter().map(|f| f.as_bytes().to_vec()).collect();
-            match slurp_documents(raw, &[], validate, &[]) {
+            match slurp_documents(raw, &[], &[], validate, &[]) {
                 Ok(s) => Ok((
                     String::from_utf8(s.combined).unwrap(),
                     s.last_source,
