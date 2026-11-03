@@ -9421,7 +9421,7 @@ struct LazyMore {
 const LAZY_CHUNK_FIRST_BYTES: usize = 1 << 16;
 
 /// The most text a chunk of a lazy stream covers, past its first document.
-const LAZY_CHUNK_MAX_BYTES: usize = 1 << 22;
+const LAZY_CHUNK_MAX_BYTES: usize = 1 << 19;
 
 #[cfg(test)]
 thread_local! {
@@ -9439,8 +9439,8 @@ fn lazy_chunk_budget(index: usize) -> usize {
     if let Some(bytes) = LAZY_CHUNK_BYTES.with(std::cell::Cell::get) {
         return bytes;
     }
-    // 64 KiB doubled six times is the 4 MiB cap, so the shift cannot overflow.
-    (LAZY_CHUNK_FIRST_BYTES << index.min(6)).min(LAZY_CHUNK_MAX_BYTES)
+    // 64 KiB doubled three times is the 512 KiB cap, so the shift cannot overflow.
+    (LAZY_CHUNK_FIRST_BYTES << index.min(3)).min(LAZY_CHUNK_MAX_BYTES)
 }
 
 /// The text a batch's index covers is at most this long, past its first document (#5854).
