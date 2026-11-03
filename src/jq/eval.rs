@@ -28308,8 +28308,8 @@ fn is_plain_letter_escape(letter: char, after: Option<char>) -> bool {
     match letter {
         'g' | 'k' => !matches!(after, Some('<' | '\'')),
         'o' => after != Some('{'),
-        'h' | 'i' | 'j' | 'l' | 'm' | 'q' | 'u' | 'v' | 'C' | 'E' | 'F' | 'H' | 'I' | 'J'
-        | 'L' | 'M' | 'T' | 'U' | 'V' => true,
+        'h' | 'i' | 'j' | 'l' | 'm' | 'q' | 'u' | 'v' | 'C' | 'E' | 'F' | 'H' | 'I' | 'J' | 'L'
+        | 'M' | 'T' | 'U' | 'V' => true,
         _ => false,
     }
 }
