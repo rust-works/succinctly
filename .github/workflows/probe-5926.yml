@@ -1,33 +1,24 @@
 name: probe 5926
 
-# Throwaway: which jq libm golden elements differ on ubuntu-26.04 (#5926). Not to be merged.
+# Throwaway: the whole test suite on ubuntu-26.04 after trimming the libm goldens (#5926). Not to be merged.
 on:
   pull_request:
     paths:
       - '.github/workflows/probe-5926.yml'
-      - 'scripts/probe_5926.py'
 
 permissions:
   contents: read
 
 jobs:
   probe:
-    name: probe (${{ matrix.image }})
-    runs-on: ${{ matrix.image }}
-    strategy:
-      fail-fast: false
-      matrix:
-        image: [ubuntu-24.04, ubuntu-26.04]
+    name: probe (ubuntu-26.04)
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build succinctly
-        run: cargo build --release --features cli
-      - name: Build jq 1.7.1
+      - name: Every test binary, no fail-fast
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq autoconf automake libtool bison flex libonig-dev > /dev/null
-          curl -fsSL https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-1.7.1.tar.gz | tar xz
-          cd jq-1.7.1 && CFLAGS="-O2 -std=gnu17" ./configure --with-oniguruma=yes --disable-docs --disable-maintainer-mode > /dev/null && make -j4 > /dev/null
-          ./jq --version; ldd --version | head -1
-      - name: Compare the two libm cases
-        run: python3 scripts/probe_5926.py jq-1.7.1/jq target/release/succinctly
+          skip=$(scripts/deep-recursion-tests.sh skip-args)
+          cargo test --no-fail-fast --features cli,simd,regex,serde -- $skip 2>&1 | tee /tmp/test.log | grep -E "^(test result|error|failures:|     Running|    [a-z_:0-9]+$)|FAILED|panicked" | grep -vE "ok\. " | head -150
+          echo "=== summary"; grep -E "^test result" /tmp/test.log | sort | uniq -c | sort -rn | head -5
+          ! grep -qE "^test result: FAILED|^error: " /tmp/test.log
