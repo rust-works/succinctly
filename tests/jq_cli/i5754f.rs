@@ -60,6 +60,10 @@ fn a_percent_specifier_needs_a_width_after_a_modifier_or_plus() -> Result<()> {
         ("%EE4%", None),
         ("%E++%", None),
         ("%4+%", None),
+        ("%E", None),
+        ("%+", None),
+        ("%4", None),
+        ("%E4", None),
     ] {
         assert_eq!(
             strptime_percent(fmt)?.as_deref(),
