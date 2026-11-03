@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use std::borrow::Cow;
 
 use alloc::rc::Rc;
+use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 
 use indexmap::IndexMap;
@@ -2321,7 +2322,7 @@ macro_rules! shared_container {
                     Some(inner) => core::mem::take(inner),
                     None => {
                         note_forced_copy!($on_unwrap);
-                        (*self.0).clone()
+                        (**self.0).clone()
                     }
                 }
             }
@@ -2394,7 +2395,7 @@ macro_rules! shared_container {
         impl<V: Teardown> From<$target> for $wrapper<V> {
             #[inline]
             fn from(inner: $target) -> Self {
-                Self(Rc::new(inner))
+                Self(ManuallyDrop::new(Rc::new(inner)))
             }
         }
 
@@ -2439,8 +2440,11 @@ pub struct ArrayOf<V: Teardown>(ArrayInnerOf<V>);
 /// (Unrelated to the `arrayvec` crate.)
 pub type ArrayVec = ArrayOf<OwnedValue>;
 
-/// [`ArrayOf`]'s inner representation: refcounted.
-type ArrayInnerOf<V> = Rc<Vec<V>>;
+/// [`ArrayOf`]'s inner representation: refcounted, and released by
+/// [`ArrayOf`]'s own `Drop` rather than by drop glue, so that releasing the
+/// last handle -- `Rc::drop_slow`, which drops every element -- runs inside a
+/// level of `drop_depth`'s count (#5868).
+type ArrayInnerOf<V> = ManuallyDrop<Rc<Vec<V>>>;
 
 shared_container! {
     ArrayOf, ArrayInnerOf, target = Vec<V>,
@@ -2476,30 +2480,39 @@ impl<V: Teardown> ArrayOf<V> {
 /// several on the same child is released first, which leaves the next as
 /// the last holder, so a diamond-shaped value (`[S, S]` per level) is torn
 /// down as well.
+///
+/// Within the limit the level wraps the release of the `Rc` itself, so the
+/// elements are dropped by `Rc::drop_slow` -- the one out-of-line call per
+/// array that drop glue made before #5782 -- and no loop over them is
+/// inlined into `OwnedValue`'s drop glue. Clearing the `Vec` here instead
+/// (#5815) inlined that loop, which made the glue save 10 registers on every
+/// drop, scalars included, and left `drop_slow` as a second call (#5868).
 impl<V: Teardown> Drop for ArrayOf<V> {
     #[inline]
+    #[allow(unsafe_code)] // releases the `ManuallyDrop` field, once (#5868)
     fn drop(&mut self) {
-        if !V::ITERATIVE {
-            return;
-        }
-        let Some(vec) = self.unique_vec() else {
-            return;
-        };
-        if vec.is_empty() {
-            return;
-        }
-        #[cfg(feature = "std")]
-        {
-            if let Some(_level) = drop_depth::enter() {
-                vec.clear();
-                return;
+        // Releasing the last handle (no `Weak` is ever made) drops the
+        // elements: the only release that can recurse.
+        if V::ITERATIVE && Rc::strong_count(&self.0) == 1 && !self.0.is_empty() {
+            #[cfg(feature = "std")]
+            {
+                if let Some(_level) = drop_depth::enter() {
+                    // SAFETY: the field is not used again: `drop` returns
+                    // here, and nothing else releases it.
+                    unsafe { ManuallyDrop::drop(&mut self.0) };
+                    return;
+                }
+                self.tear_down_cold();
             }
-            self.tear_down_cold();
+            #[cfg(not(feature = "std"))]
+            if self.0.iter().any(V::is_nonempty_container) {
+                self.tear_down_cold();
+            }
         }
-        #[cfg(not(feature = "std"))]
-        if vec.iter().any(V::is_nonempty_container) {
-            self.tear_down_cold();
-        }
+        // SAFETY: as above; the one release on every path that did not
+        // return early (a shared or empty array, one torn down past the
+        // limit, or an element type without the teardown).
+        unsafe { ManuallyDrop::drop(&mut self.0) };
     }
 }
 
@@ -2509,9 +2522,10 @@ pub(crate) mod drop_depth {
     //! a drop recurses through the ordinary drop glue while the value is
     //! shallow and takes the rest of a deep one apart on a worklist (#5782).
     //!
-    //! A container drop that is still within [`LIMIT`] levels drops its
-    //! children itself, inside a level of this count, and pays nothing per
-    //! child; only a drop past it reaches [`tear_down`](super::tear_down).
+    //! A container drop that is still within [`LIMIT`] levels releases its
+    //! storage, and so its children, inside a level of this count, and pays
+    //! nothing per child; only a drop past it reaches
+    //! [`tear_down`](super::tear_down).
     //! Scanning every unique container's children for a container instead
     //! (and tearing down on a worklist whenever one turned up) cost +2% to
     //! +11% wall-clock on a 7950X; this costs two thread-local accesses per
@@ -11579,5 +11593,61 @@ mod tests {
         )]));
         let entries: Vec<_> = map.into_iter().collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    /// Releasing a container releases each handle it holds exactly once, on
+    /// every path its `Drop` takes since it releases its own `ManuallyDrop`
+    /// storage (#5868): a probe held both here and inside the container is
+    /// unshared again once the container is gone, and still shared while
+    /// another handle on the container remains.
+    #[test]
+    fn every_container_release_releases_its_children_once_5868() {
+        fn probe() -> OwnedValue {
+            OwnedValue::array_from(vec![OwnedValue::Int(1)])
+        }
+        fn shared(value: &OwnedValue) -> bool {
+            match value {
+                OwnedValue::Array(items) => items.is_shared(),
+                _ => unreachable!("the probe is an array"),
+            }
+        }
+        let wrap_array = |p: &OwnedValue| OwnedValue::array_from(vec![p.clone(), OwnedValue::Null]);
+        let wrap_object = |p: &OwnedValue| {
+            let mut map = ObjectMap::new();
+            map.insert("k".to_string(), p.clone());
+            // The earlier entry of a repeated key holds the probe too.
+            map.push_occurrence("k".to_string(), p.clone());
+            OwnedValue::Object(map)
+        };
+        let check = |wrap: &dyn Fn(&OwnedValue) -> OwnedValue| {
+            let p = probe();
+            drop(wrap(&p));
+            assert!(!shared(&p), "a unique container released its children");
+
+            let first = wrap(&p);
+            let second = first.clone();
+            drop(first);
+            assert!(shared(&p), "a shared handle only decrements");
+            drop(second);
+            assert!(!shared(&p), "the last handle released its children");
+        };
+        check(&wrap_array);
+        check(&wrap_object);
+
+        // Past the depth limit the container is torn down on the worklist
+        // and then released, empty.
+        #[cfg(feature = "std")]
+        {
+            let mut held: Vec<_> = core::iter::from_fn(drop_depth::enter).collect();
+            check(&wrap_array);
+            check(&wrap_object);
+            // Innermost level first, so the count unwinds back to zero.
+            while let Some(level) = held.pop() {
+                drop(level);
+            }
+            assert_eq!(drop_depth::current(), 0);
+        }
+        drop(OwnedValue::array());
+        drop(OwnedValue::Object(ObjectMap::new()));
     }
 }
