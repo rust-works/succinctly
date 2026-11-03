@@ -8614,13 +8614,15 @@ fn output_value<W: Write>(
         // After an explicit `---`, the comments and blank lines up to the content are part of the
         // header too. They are kept on the first node (here, at the top of its text) unless the
         // root has a head comment of its own.
-        let (leading, body) =
-            if comments.meta().preamble().is_some() && comments.meta().head_comment().is_empty() {
-                let (header, rest) = split_leading_comment_lines(&body);
-                (format!("{leading}{header}"), rest.to_string())
-            } else {
-                (leading, body)
-            };
+        let (leading, body) = if comments.meta().preamble().is_some()
+            && comments.meta().head_comment().is_empty()
+            && matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+        {
+            let (header, rest) = split_leading_comment_lines(&body);
+            (format!("{leading}{header}"), rest.to_string())
+        } else {
+            (leading, body)
+        };
         // Every non-root node's own trailing comment is appended by its
         // *parent* during `emit_yaml_value`'s recursion (see its Array/Object
         // arms), but the root has no parent call site to do that for it —

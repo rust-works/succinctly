@@ -249,14 +249,13 @@ impl StreamableValue for OwnedValue {
         // top-level entry point - bypassing it inside
         // `stream_owned_value_yaml` itself would drop quoting from every
         // nested string field too, not just the root.
-        if let Self::String(s) = self {
-            // #5416: yq prints a scalar result bare, with no YAML around it to color.
-            let _region = RegionGuard::enter(StreamRegion::RawScalar);
-            return out.write_str(s);
-        }
-        // Any other scalar result is printed bare as well (`.a + 1` is `2`, not a document).
+        // #5416: yq prints a scalar result bare, with no YAML around it to color
+        // (`.a + 1` is `2`, not a document).
         let _region = (!matches!(self, Self::Array(_) | Self::Object(_)))
             .then(|| RegionGuard::enter(StreamRegion::RawScalar));
+        if let Self::String(s) = self {
+            return out.write_str(s);
+        }
         stream_owned_value_yaml(self, out, "", indent.width, indent.unit, sort_keys)
     }
 

@@ -9268,6 +9268,7 @@ fn test_join_output_is_not_a_yq_flag_1731() -> Result<()> {
 /// ended up sandwiched before the function's one unconditional trailing
 /// reset. The reset must come before the terminator, matching the identity
 /// branch and the DOM path, both already correct.
+/// (#5416 replaced that colorizer with a port of yq's own; the property is still pinned.)
 #[test]
 fn test_color_terminator_ordering_evaluated_1708() -> Result<()> {
     // A mapping result: a scalar result is printed bare, with no colors to reset (#5416).
@@ -9354,6 +9355,7 @@ fn test_color_terminator_ordering_multi_result_1708() -> Result<()> {
 /// -- without closing *every* open span (not just an open key) at each
 /// result boundary, that desync left a later result's terminator with no
 /// preceding reset at all, the exact bug this issue was filed for.
+/// (#5416 replaced that colorizer with a port of yq's own; the property is still pinned.)
 #[test]
 fn test_color_terminator_ordering_survives_unbalanced_quote_in_value_1708() -> Result<()> {
     let (output, code) = run_yq_stdin(
@@ -9413,6 +9415,7 @@ fn test_color_terminator_ordering_survives_embedded_control_char_in_value_1708()
 /// reset *after* the terminator instead of nothing at all, relocating (not
 /// fixing) the "reset must precede terminator" defect to the tail of the
 /// buffer. The terminator must be the actual last byte of output.
+/// (#5416 replaced that colorizer with a port of yq's own; the property is still pinned.)
 #[test]
 fn test_color_terminator_ordering_terminator_is_final_byte_1708() -> Result<()> {
     let (output, code) = run_yq_stdin(".a", "a: 1\n", &["-C", "-0"])?;
@@ -13314,6 +13317,7 @@ fn test_slurp_color_output_yaml() -> Result<()> {
 /// doesn't change what's visible - it pins the lookahead's own quote
 /// entry/exit and in-quote-skip behavior directly, which no other test
 /// exercises.
+/// (#5416 replaced that colorizer with a port of yq's own; the property is still pinned.)
 #[test]
 fn test_color_compact_quoted_key_with_colon_785() -> Result<()> {
     let yaml = "- \"x: y\": 1\n  b: 2\n";

@@ -89,7 +89,12 @@ struct Pos {
 fn tok(ty: Ty, value: &str, origin: String, pos: Pos) -> Tok {
     Tok {
         ty,
-        value: value.to_string(),
+        // Only a tag's text is read back, by the value that follows it.
+        value: if ty == Ty::Tag {
+            value.to_string()
+        } else {
+            String::new()
+        },
         origin,
         column: pos.column,
         quoted: false,
@@ -347,6 +352,15 @@ impl Src {
             .and_then(|abs| abs.checked_sub(self.origin))
             .filter(|rel| *rel >= from)
     }
+    /// Empties the text, keeping the room it had.
+    fn reset(&mut self) {
+        self.window.clear();
+        self.base = 0;
+        self.origin = 0;
+        self.last_newline = None;
+        self.prev_newline = None;
+    }
+
     /// Drops the text before relative position `keep_from`, less a little history the scanner
     /// reads behind itself.
     fn compact(&mut self, keep_from: usize) {
@@ -417,6 +431,15 @@ impl Ctx {
     }
     fn size(&self) -> usize {
         self.src.len()
+    }
+    /// Back to a context with nothing scanned, keeping the room its buffers had.
+    fn reset(&mut self) {
+        self.idx = 0;
+        self.src.reset();
+        self.reset_buffer();
+        self.tokens.clear();
+        self.last = None;
+        self.mstate = None;
     }
     fn clear(&mut self) {
         self.reset_buffer();
@@ -2089,7 +2112,15 @@ impl YamlColorizer {
             self.run(out);
             self.printer.finish(out);
         }
-        *self = Self::default();
+        // A new result is scanned afresh, in the buffers this one used.
+        self.scanner = Scanner {
+            long_line: self.scanner.long_line,
+            tail: self.scanner.tail,
+            ..Scanner::new()
+        };
+        self.ctx.reset();
+        self.printer = Printer::default();
+        self.fed = false;
     }
 }
 

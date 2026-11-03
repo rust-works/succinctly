@@ -228,6 +228,13 @@ const ORACLE_ROWS: &[(&str, &str, &str, &[&str], &str)] = &[
         &["-C", "-P"],
         "\u{1b}[36ma\u{1b}[0m:\u{1b}[36m\u{1b}[0m\n\u{1b}[36m  b\u{1b}[0m:\u{1b}[95m 1\u{1b}[0m\n",
     ),
+    (
+        "scalar_after_header",
+        "---\nb: 1\n",
+        ". = \"# hi\"",
+        &["-C"],
+        "---\n# hi\n",
+    ),
 ];
 
 #[test]

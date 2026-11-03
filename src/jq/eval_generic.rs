@@ -2965,18 +2965,7 @@ impl NodeMeta {
     /// already gets — see the field's own doc comment for why that matters.
     pub fn with_head_foot(&self, head: Vec<String>, foot: Vec<String>) -> Self {
         // A head the program rewrote is no longer the header read from the file.
-        let head_is_header = self.head_is_header() && head == self.head_comment();
-        Self {
-            head_foot_comment: HeadFootComment::boxed_if_any_full(
-                head,
-                foot,
-                self.tag_owned(),
-                self.spelling_owned(),
-                self.preamble_owned(),
-                head_is_header,
-            ),
-            ..self.clone()
-        }
+        self.with_head_foot_of(head, foot, self)
     }
 
     /// [`Self::with_head_foot`] for lines taken from `source`'s metadata, which carry its mark of

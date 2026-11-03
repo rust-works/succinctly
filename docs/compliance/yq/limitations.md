@@ -6842,7 +6842,7 @@ Several thousand generated documents (comments, anchors, aliases, tags, block an
 Pinned by `tests/yq_cli/i5416.rs`, whose rows were captured from yq v4.53.3.
 
 One difference remains: **a double-quoted escape keeps its digits** (ADR-0018 rule 4(b): matching would corrupt data).
-go-yaml leaves the `x`, `u` or `U` and the hex digits of `\\x01`, `\\u0001` and `\\U0001F600` out of the token's origin text, so yq's `-C` prints `a: "x\\u0001y"` as `a: "x\\y"`, a different string.
+go-yaml leaves the `x`, `u` or `U` and the hex digits of `\x01`, `\u0001` and `\U0001F600` out of the token's origin text, so yq's `-C` prints `a: "x\u0001y"` as `a: "x\y"`, a different string.
 `succinctly yq -C` prints the escape whole.
 Every other character go-yaml drops from a token's text is dropped here too, because the line it prints would otherwise differ from yq's.
 
