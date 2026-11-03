@@ -41,6 +41,19 @@ fn a_negative_zero_index_or_bound_is_negative_zero_in_the_path() -> Result<()> {
         ("[1,2,3] | [path(.[-0|.])]", "[[-0]]"),
         ("[1,2,3] | [path(.[if true then -0 else 1 end])]", "[[-0]]"),
         ("null | [path(.[-0])]", "[[-0]]"),
+        (
+            "[1,2,3] | [path(.[(-0):])]",
+            "[[{\"start\":-0,\"end\":null}]]",
+        ),
+        ("[1,2,3] | [path(.[-0]?)]", "[[-0]]"),
+        (
+            "[1,2,3] | [path(.[-0:]?)]",
+            "[[{\"start\":-0,\"end\":null}]]",
+        ),
+        // A second negation of the same zero is a positive zero, as in jq.
+        ("[1,2,3] | [path(.[-1 * -0])]", "[[0]]"),
+        ("[1,2,3] | [path(.[-(-0)])]", "[[0]]"),
+        ("[1,2,3] | [path(.[-0 | -.])]", "[[0]]"),
         // Neighbours that must not change: the value, the writes and the other zeros.
         ("[1,2,3] | .[-0]", "1"),
         ("[1,2,3] | .[-0:]", "[1,2,3]"),
