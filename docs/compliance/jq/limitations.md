@@ -7460,6 +7460,15 @@ Three differences remain.
   So do two that jq reads differently from `fancy-regex`: a reversed interval (`a{3,2}`), an error in jq, and a `+` after an interval (`a{2,3}+`), possessive in jq for `{n,m}+` and `{n,}+` but not for `{n}+`.
   A `(?P…)` group is refused before either engine, with jq's `undefined group option` (above).
   Pinned by `test_constructs_read_differently_stay_refused_5502`.
+- **Two greedy `X+` repeats with one optional repeat between them are refused on the second engine (#6096).**
+  `fancy-regex` 0.20.0 answers wrongly for them: `"a" | test("(?=a)a+a*a+")` is `true` there, and `false` in jq and in the `regex` crate.
+  It is wrong for `a+b*a+` and `.+.*.+` too (the repeat between the plusses can be any atom, and any `{0,n}`), for a chain of them (`a+b*a+b*a+` on `aa`), and for `(?:ab)+c*(?:ab)+`.
+  Two repeats between them, a mandatory item, a different atom for either plus, bounded repeats such as `a{1,3}b*a{1,3}`, a lazy plus at either end, and an alternation or a capture group as the middle repeat (`a+(?:a|)a+`, `a+(a*)a+`) are answered correctly, and not refused.
+  The shape is found wherever it sits: inside a group, an alternation, an atomic group, a look-ahead or a look-behind.
+  A pattern with the shape that needs the second engine (a lookaround, a backreference, `\K`) gets the `invalid regex` error whatever the text, though the engine answers some texts right (`aa` for `a+a*a+`), since a pattern cannot tell which.
+  Without a second-engine feature the shape keeps the `regex` crate, and `l` and `n` keep their old route for it, so those answer as jq does.
+  Pinned by `tests/jq_cli/i6096.rs` (a mutant that drops the guard, one that ignores that the two plusses must match, and one that ignores that the repeat between them must be optional all fail it).
+  Upstream: the report to `fancy-regex` is not filed from here; the Rust case is in #6096.
 
 ### Oniguruma escapes and group syntax read before either engine (#6070)
 

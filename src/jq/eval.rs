@@ -29495,6 +29495,10 @@ fn build_fancy_regex_at<S: EvalSemantics>(
     if modes.longest && fancy_has_lazy_repeat(&tree.expr) {
         return None;
     }
+    // #6096: an upstream bug; the pattern keeps the `regex` crate's route, or its refusal.
+    if fancy_has_squeezed_plus_run(&tree.expr) {
+        return None;
+    }
     let pattern = if modes.longest && pattern_is_variable_length(source) {
         format!("{FANCY_UNBOUNDED_DEAD_BRANCH}|{pattern}")
     } else {
@@ -29511,6 +29515,37 @@ fn build_fancy_regex_at<S: EvalSemantics>(
         .backtrack_limit(FANCY_BACKTRACK_LIMIT)
         .build()
         .ok()
+}
+
+/// Whether `expr` holds two greedy `X+` repeats of the same expression with exactly one repeat that
+/// can match nothing between them (`a+a*a+`, `a+b*a+`, `a+.?a+`, `(?:ab)+c*(?:ab)+`), which
+/// `fancy-regex` 0.20.0 answers wrongly: `"a" | test("(?=a)a+a*a+")` is `true` (#6096; jq and the
+/// `regex` crate say `false`). Two stars between them, a mandatory item, another atom for either
+/// plus and a bounded repeat (`a{1,3}b*a{1,3}`) all match correctly, and are not caught.
+#[cfg(feature = "regex")]
+fn fancy_has_squeezed_plus_run(expr: &fancy_regex::Expr) -> bool {
+    use fancy_regex::Expr;
+    fn plus(e: &Expr) -> Option<&Expr> {
+        match e {
+            Expr::Repeat {
+                child,
+                lo: 1,
+                hi: usize::MAX,
+                greedy: true,
+            } => Some(child),
+            _ => None,
+        }
+    }
+    let squeezed = |e: &Expr| match e {
+        Expr::Concat(items) => items.windows(3).any(|w| {
+            matches!(
+                (plus(&w[0]), &w[1], plus(&w[2])),
+                (Some(first), Expr::Repeat { lo: 0, .. }, Some(last)) if first == last
+            )
+        }),
+        _ => false,
+    };
+    squeezed(expr) || expr.has_descendant(squeezed)
 }
 
 /// Whether `expr` has a lazy quantifier (`*?`, `+?`, `??`, `{n,m}?`).
