@@ -10387,6 +10387,8 @@ What differs from jq 1.7.1:
   `%n` and `%t` read at least one white-space character, the whole run of it: `"2015" | strptime("%Y%n")` is no match, and so is `"2015  " | strptime("%Y %n")`, whose format space has taken the run already; the run is ASCII white space only, as the libc's `isspace` has it.
   That is the pin's libc: a glibc `jq` takes `%n` and `%t` as plain white-space directives that match none too.
   Still different: a year of 1800, 1900 or 2100 gets the weekday jq's own routine computes, one off from the calendar's for the century years in January and February.
+  `strftime`'s `%y` and `%C` of a negative year follow the pin's libc (#6030): `%y` is the absolute value of the year's remainder by 100 (year -5 is `05`), and `%C` is `-0` when the century is 0 and the year negative.
+  A glibc `jq` prints them differently (not measured).
   `%Y`, `%y`, `%M` and `%S`, and those fields inside `%R`, `%T` and `%D`, read nothing at the end of the input or before white space and succeed, leaving the field as it was and not counting it as read (`"" | strptime("%Y")` is the zeroed time, `"10:30:" | strptime("%T")` has no seconds), as the pin's libc does (#5947).
   `%Y`, `%y` and `%C` (and the years inside `%D` and `%F`) take a sign, which uses one character of the field's width, and a sign with no digits reads 0 (`"+" | strptime("%Y")` is year 0, `"-5" | strptime("%y")` is 1995, `"+20" | strptime("%y")` is no match); `%s` with no digits reads 0 and consumes nothing (#5947).
   The pin's libc does not skip a leading space before them (`" 9" | strptime("%k")` is an error, as here), where glibc does.
