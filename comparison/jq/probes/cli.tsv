@@ -473,3 +473,9 @@ library-path-empty	program	["-L", "", "-n", "1"]	-
 library-path-empty-import	program	["-L", "", "-n", "import \"a\" as a; 1"]	-
 library-path-empty-then-real-dir	program	["-L", "", "-L", "mod", "-n", "import \"lib\" as l; 1"]	-
 indent-swallows-next-option	output	["--indent", "-c", "."]	"{\"a\":[1]}"
+files-dash-is-stdin	files	["-c", ".", "-"]	"{\"a\":1}\n"
+files-dash-between-files	files	["-c", "[., input_filename]", "data.json", "-", "data2.json"]	"{\"a\":1}\n"
+files-dash-twice	files	["-c", ".", "-", "-"]	"{\"a\":1}\n"
+files-dash-slurp	files	["-s", "-c", ".", "-"]	"1 2\n"
+files-dash-null-input	files	["-n", "-c", "[inputs]", "-"]	"1 2\n"
+files-dash-slurpfile-is-an-error	files	["-n", "-c", "--slurpfile", "x", "-", "$x"]	"1"
