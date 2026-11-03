@@ -9699,6 +9699,8 @@ reads) plus two consequences of the route:
   string — and `--validate` still checks each file in order first. `1 2 }` and `[1,2` exit 5
   with no output and jq's own parse error (`jq: parse error: Unfinished JSON term at EOF at line 3, column 0`, [#5555](https://github.com/rust-works/succinctly/issues/5555)).
   `-n -s` with `inputs` raises it as jq does, `jq: error (at <file>:<line>): …` at the position jq's parser stood on.
+  Under `-n -s` jq reads on the first `input`, and so does succinctly since [#6019](https://github.com/rust-works/succinctly/issues/6019): each fault the stream holds is the error of one call, all of them ahead of the array, which holds every value read (the ones after a fault too, since jq goes on with the next line); `try input catch "E"` on `1 2 }` prints `"E"`, and a program that never calls `input` prints its result.
+  One case still differs, tracked as [#6004](https://github.com/rust-works/succinctly/issues/6004): a stream that ends in a bare token and the one character that ends it (`1[`) closes jq's array before the end-of-file fault, which then comes after the array and names `<unknown>`.
   A file earlier than the one the splitter stopped in is read again from disk to find a fault ahead of it, since its buffer is gone.
 - A value jq rejects as undecodable (`"\ud800"`, `"\x"`) is echoed raw, as on the default
   route ([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md)), where

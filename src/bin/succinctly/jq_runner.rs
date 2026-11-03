@@ -6922,6 +6922,8 @@ fn get_inputs(
     // filter's own `input`. jq has lost its position by then -- the call
     // that raises it closed the stream -- so it names `<unknown>`.
     let mut resumed_errors: Vec<(usize, TrailingParseError)> = seq_fault_errors;
+    // #6019: whether `-n -s` read a stream with a fault the resuming way (below).
+    let mut resume_slurp_done = false;
     let mut trailing_error: Option<TrailingParseError> =
         seq_deferred_warning.map(|message| TrailingParseError {
             error: EvalError::new(message),
@@ -7019,6 +7021,21 @@ fn get_inputs(
                 raw_inputs
             }
         };
+        // #6019: under `-n -s` jq reads on the first `input`, so a stream with a fault is read the
+        // way the resuming route reads it (the faults are inputs, the documents after them are
+        // read), and the faults then come out ahead of the array. A clean stream, or a program
+        // that does not read inputs, keeps the single parse. (`track_eof` is set only for a program
+        // that reads inputs, so the probe parse is paid by `-n -s` with `input`/`inputs` alone.)
+        let resume_slurp = args.slurp
+            && args.null_input
+            && track_eof
+            && !args.stream
+            && !args.seq
+            && args.input_dsv.is_none()
+            && raw_inputs
+                .iter()
+                .any(|(_, raw)| parse_json_stream_prefix(raw, None).1.is_some());
+        resume_slurp_done = resume_slurp;
         for (pos, (file_idx, raw)) in raw_inputs.into_iter().enumerate() {
             let src = file_idx.unwrap_or(0);
             let file_start = next_file;
@@ -7065,7 +7082,7 @@ fn get_inputs(
                 }
                 // #4311: a program using `input`/`inputs` sees jq resume after
                 // a parse error, at the read after the one that met the fault.
-                if track_eof && !args.slurp {
+                if track_eof && (!args.slurp || resume_slurp) {
                     // #5661: one clean plain-JSON source converts each document when the
                     // program reads it, so `first(inputs)` neither parses nor holds the rest.
                     // Anything unusual (an error, a BOM, a deep document) takes the route below.
@@ -7077,7 +7094,7 @@ fn get_inputs(
                     // and the eager loop below reads it from the end of the last lazy document
                     // (#5853).
                     let mut lazy_prefix: Option<Vec<(usize, usize)>> = None;
-                    if !args.stream && pos == 0 && last == 0 {
+                    if !args.stream && !args.slurp && pos == 0 && last == 0 {
                         let scan = if lazy_route_forced_off() {
                             LazyScan {
                                 spans: Vec::new(),
@@ -7399,6 +7416,22 @@ fn get_inputs(
             None => InputLocation::unknown(),
         };
         let slurped = vec![OwnedValue::array_from(values)];
+        // #6019: the faults a stream held come out of `input` one per call, all of them ahead of
+        // the array, the one that ended the stream included. Each names its file by the table
+        // `locations` holds, so the array's location is one entry in that table.
+        if resume_slurp_done {
+            let (src, line) = locations
+                .slurp_eof(slurp_eof_line)
+                .unwrap_or((0, UNKNOWN_LINE));
+            let mut slurped_locations = InputLocations::new(locations.files().to_vec());
+            slurped_locations.push(src as usize, line as usize);
+            let mut ahead: Vec<(usize, TrailingParseError)> = resumed_errors
+                .into_iter()
+                .map(|(_, fault)| (0, fault))
+                .collect();
+            ahead.extend(trailing_error.take().map(|fault| (0, fault)));
+            return Ok(Ok((slurped, slurped_locations, None, ahead)));
+        }
         let slurped_locations = InputLocations::single(at);
         Ok(Ok((
             slurped,
