@@ -7402,6 +7402,14 @@ Three exotic shapes still differ: a range from a POSIX bracket (`[[:alpha:]-z]`)
 An unknown bracket name (`[[:foo:]]`, `[[:ALPHA:]]`) is an error in both, with this crate's wording.
 In jq mode a `[`, `&` or `~` inside a class is the literal character, as in Oniguruma's Perl syntax, where the `regex` crate would read a nested class, an intersection and a symmetric difference.
 In jq mode `\<` and `\>` are the literal characters `<` and `>`, as in Oniguruma's Perl syntax (#5529), where the `regex` crate reads them as start-of-word and end-of-word assertions.
+`\u` and `\U` are not escapes in jq's Perl syntax but the letter (#6068): `"u00e9" | test("\\u00e9")` is `true` and `"é"` does not match it, and a lone `\u` matches `u`.
+The `regex` crate reads `\u00e9` and `\u{e9}` as code points and refuses the rest, so they are rewritten to the letter, in a class and out of one.
+A `{` that does not open `{n}`, `{n,}` or `{n,m}` is the literal brace: `a{ 1}`, `a{1 }`, `a{1, 2}` and `a{,2}` match their own text in jq, and the crate allows blanks inside an interval and repeated `a`.
+`{,m}` is literal in jq, which the crate also reads that way; the pass escapes it too so that does not rest on the crate.
+`\p{..}` and `\P{..}` outside a class are not case-folded under `i` or an inline `(?i)` in jq (`"a" | test("\\p{Lu}"; "i")` is `false`), where the crate folds; they are pinned case-sensitive.
+Inside a class they fold in both.
+A `\p` or `\P` with no brace is the letter, in a class or out of one (`"pL" | test("\\pL")` is `true`, and `"a"` does not match it); the crate reads `\pL` as the letter property.
+Pinned against jq 1.7.1 on 1,512 pattern x text x flag rows (all agree) and in `tests/jq_cli/i6068.rs`.
 A Python-style group (`(?P<n>a)`, `(?P=n)`, `(?P>n)`) is an error in jq (`undefined group option`), and the `regex` crate would accept the first.
 It is an error here too, with this crate's `invalid regex:` prefix where jq says `Regex failure:`, the same wording difference every refused pattern has.
 The crate's `\b{start}`, `\b{end}`, `\b{start-half}` and `\b{end-half}` are `\b` followed by the literal text in jq, and are rewritten to that.
