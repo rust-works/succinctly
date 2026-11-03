@@ -2361,32 +2361,34 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some(']') => {
                 self.next();
-                Ok(match Self::fold_index_key(&key) {
-                    // #3374: a wildcard key is a generator over the matching keys.
-                    Some(Expr::Field(name))
-                        if self.mode == ParserMode::Yq && Expr::is_yq_key_pattern(&name) =>
-                    {
-                        Bracket::Dynamic {
-                            key: Expr::yq_wildcard_keys(&name),
-                            optional: false,
+                Ok(
+                    match Self::fold_index_key(&key, self.mode == ParserMode::Jq) {
+                        // #3374: a wildcard key is a generator over the matching keys.
+                        Some(Expr::Field(name))
+                            if self.mode == ParserMode::Yq && Expr::is_yq_key_pattern(&name) =>
+                        {
+                            Bracket::Dynamic {
+                                key: Expr::yq_wildcard_keys(&name),
+                                optional: false,
+                            }
                         }
-                    }
-                    // #2126: yq reads `.["k0"]` through `traverseArrayOperator`, not the
-                    // `.k0` field traversal, and the two part ways on `null` -- the array
-                    // operator turns a `!!null` it indexes into the empty container the key
-                    // implies (`{}` for a string key), the field traversal leaves it alone.
-                    // Folding the bracket form into `Expr::Field` erases the difference, so a
-                    // `del()` argument keeps a string key as the computed key it is.
-                    Some(Expr::Field(_)) if self.keep_bracket_keys => Bracket::Dynamic {
-                        key,
-                        optional: false,
+                        // #2126: yq reads `.["k0"]` through `traverseArrayOperator`, not the
+                        // `.k0` field traversal, and the two part ways on `null` -- the array
+                        // operator turns a `!!null` it indexes into the empty container the key
+                        // implies (`{}` for a string key), the field traversal leaves it alone.
+                        // Folding the bracket form into `Expr::Field` erases the difference, so a
+                        // `del()` argument keeps a string key as the computed key it is.
+                        Some(Expr::Field(_)) if self.keep_bracket_keys => Bracket::Dynamic {
+                            key,
+                            optional: false,
+                        },
+                        Some(folded) => Bracket::Static(folded),
+                        None => Bracket::Dynamic {
+                            key,
+                            optional: false,
+                        },
                     },
-                    Some(folded) => Bracket::Static(folded),
-                    None => Bracket::Dynamic {
-                        key,
-                        optional: false,
-                    },
-                })
+                )
             }
             Some(':') => {
                 // `[n:]` or `[n:m]` - slice.
@@ -2441,8 +2443,9 @@ impl<'a> Parser<'a> {
     /// time and refuses it, so it stays a runtime bound where the pull
     /// helpers can raise (an unreached branch must not).
     fn finish_slice(start: Option<Expr>, end: Option<Expr>, yq: bool) -> Bracket {
-        let fold =
-            |bound: &Expr| Self::fold_slice_bound(bound).filter(|(_, key)| !(yq && key.is_some()));
+        let fold = |bound: &Expr| {
+            Self::fold_slice_bound(bound, !yq).filter(|(_, key)| !(yq && key.is_some()))
+        };
         let start_folded = start.as_ref().and_then(fold);
         let end_folded = end.as_ref().and_then(fold);
         let start_dynamic = start.is_some() && start_folded.is_none();
@@ -2657,9 +2660,9 @@ impl<'a> Parser<'a> {
     /// `true` and `{}` deliberately do *not* fold — they must reach the
     /// evaluator so the error is jq's runtime `Cannot index …`, not a parse
     /// error (issue #360).
-    fn fold_index_key(key: &Expr) -> Option<Expr> {
+    fn fold_index_key(key: &Expr, jq: bool) -> Option<Expr> {
         match key {
-            Expr::Paren(inner) => Self::fold_index_key(inner),
+            Expr::Paren(inner) => Self::fold_index_key(inner, jq),
             Expr::Literal(Literal::String(s)) => Some(Expr::Field(s.to_string())),
             Expr::Literal(Literal::Int(i)) => Some(Expr::Index { idx: *i, key: None }),
             // Every number written in filter source arrives as
@@ -2691,6 +2694,14 @@ impl<'a> Parser<'a> {
             // `path(.[2.00])` is `[2.00]` and `path(.[1e10])` is `[1E+10]`.
             // `idx` is the identical `i64` either way.
             Expr::Literal(Literal::NumberLiteral(repr, text)) => match *repr {
+                // #6049: jq computes `-0` as `_negate` of the literal `0`, so
+                // its path component is the float `-0`, not the integer `0`
+                // its `Int` repr reads as. The spelling is the only place the
+                // sign survives. yq reads it as `0` (`.[-0] | path` is `[0]`).
+                NumberRepr::Int(0) if jq && text.starts_with('-') => Some(Expr::Index {
+                    idx: 0,
+                    key: Some(NumberKey::Float(-0.0)),
+                }),
                 NumberRepr::Int(i) => Some(Expr::Index { idx: i, key: None }),
                 NumberRepr::Float(f)
                     if f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64 =>
@@ -2729,7 +2740,7 @@ impl<'a> Parser<'a> {
                 right,
                 ..
             } if matches!(**left, Expr::Literal(Literal::Int(-1))) => {
-                match Self::fold_index_key(right)? {
+                match Self::fold_index_key(right, jq)? {
                     // #3044: an `Int`-sourced fold (`key: None`, per the
                     // doc comment below) whose magnitude is past
                     // `jq_int_within_exact_f64_range` must NOT fold here --
@@ -2798,8 +2809,8 @@ impl<'a> Parser<'a> {
     /// navigation step uses, and the key to preserve alongside it, which is
     /// `None` for an integer-spelled bound. `finish_slice` hands each bound's
     /// key straight to [`Expr::Slice`]'s matching field.
-    fn fold_slice_bound(key: &Expr) -> Option<(i64, Option<NumberKey>)> {
-        match Self::fold_index_key(key)? {
+    fn fold_slice_bound(key: &Expr, jq: bool) -> Option<(i64, Option<NumberKey>)> {
+        match Self::fold_index_key(key, jq)? {
             Expr::Index { idx, key } => Some((idx, key)),
             _ => None,
         }
@@ -9805,7 +9816,7 @@ impl<'a> Parser<'a> {
                     key: Some(NumberKey::Float(*f)),
                 })
             }
-            Expr::Literal(Literal::NumberLiteral(..)) => Self::fold_index_key(key),
+            Expr::Literal(Literal::NumberLiteral(..)) => Self::fold_index_key(key, false),
             _ => None,
         }
     }
