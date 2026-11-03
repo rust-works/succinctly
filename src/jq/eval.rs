@@ -28012,6 +28012,8 @@ fn translate_posix_brackets(
             }
             // #6070: `(*FAIL)` is the verb that never matches, `(?!)` here.
             if c == '(' && chars[i + 1..].starts_with(&['*', 'F', 'A', 'I', 'L', ')']) {
+                // Not `NEVER_MATCHES`: a verb cannot be repeated in jq (`(*FAIL)+` is `target of
+                // repeat operator is invalid`), and a lookahead cannot be either.
                 out.push_str("(?!)");
                 changed = true;
                 i += 7;
@@ -28140,6 +28142,12 @@ fn opens_interval(chars: &[char], at: usize) -> bool {
         && interval_quantifier_at(chars, at).is_some()
 }
 
+/// A class nothing is in: what a byte sequence that is no character compiles to. A class and not
+/// `(?!)`, so that a quantifier after it (`\xf8*`) is as legal as in jq and the pattern stays on the
+/// `regex` crate.
+#[cfg(feature = "regex")]
+const NEVER_MATCHES: &str = "[^\\s\\S]";
+
 /// The regex written for the character `v`, safe anywhere in a pattern, a class and the extended
 /// mode included.
 #[cfg(feature = "regex")]
@@ -28160,7 +28168,8 @@ fn regex_char(v: u32) -> String {
 /// - `\Q...\E` quotes what it holds, to the end of the pattern when `\E` is missing.
 /// - `\0` and a number that is no backreference are octal (`\101` is `A`); a backreference is
 ///   `\1`..`\9` always and a larger number only up to the groups opened so far, as in
-///   Oniguruma's tokenizer. `\8` and `\9` that are no backreference are the digit.
+///   Oniguruma's tokenizer. A number starting with `8` or `9` that is no backreference (`\81`) reads
+///   that digit as itself, and the digits after it are text.
 /// - `\cX` is control-X (`\c?` is DEL).
 /// - `\xHH` at 0x80 or above is a byte of a UTF-8 sequence: `\xc3\xa9` is `é`, and a sequence that
 ///   stops short is an error. A sequence that is no character (`\xed\xa0\x80`, `\xf8`) compiles
@@ -28286,7 +28295,7 @@ fn rewrite_hex_escape(chars: &[char], i: usize) -> Result<Option<(String, usize)
         0xE0..=0xEF => 3,
         0xF0..=0xF4 => 4,
         // Not the start of a character in any encoding: compiles, and nothing matches.
-        _ => return Ok(Some(("(?!)".to_string(), 4))),
+        _ => return Ok(Some((NEVER_MATCHES.to_string(), 4))),
     };
     let mut bytes = vec![lead as u8];
     for k in 1..need {
@@ -28307,8 +28316,24 @@ fn rewrite_hex_escape(chars: &[char], i: usize) -> Result<Option<(String, usize)
             used,
         ),
         // Overlong, a surrogate or past U+10FFFF: it compiles and nothing matches.
-        Err(_) => ("(?!)".to_string(), used),
+        Err(_) => (NEVER_MATCHES.to_string(), used),
     }))
+}
+
+/// Whether the `(` at `chars[at]` is the parenthesis of a conditional's condition, `(?(1)`: the
+/// two characters before it are an unescaped `(?` (an escaped one, `\(?(a)`, is a literal
+/// parenthesis, an optional one, and a group).
+#[cfg(feature = "regex")]
+fn opens_condition(chars: &[char], at: usize) -> bool {
+    if at < 2 || chars[at - 1] != '?' || chars[at - 2] != '(' {
+        return false;
+    }
+    let backslashes = chars[..at - 2]
+        .iter()
+        .rev()
+        .take_while(|c| **c == '\\')
+        .count();
+    backslashes % 2 == 0
 }
 
 /// The capture groups of a whole pattern, and the names among them (#6070): what a conditional
@@ -28328,6 +28353,14 @@ fn group_facts_of(chars: &[char]) -> GroupFacts {
     let mut j = 0;
     while j < chars.len() {
         match chars[j] {
+            // A quoted run holds no group; it ends at `\E`, or at the end of the pattern.
+            '\\' if chars.get(j + 1) == Some(&'Q') => {
+                j += 2;
+                while j < chars.len() && !(chars[j] == '\\' && chars.get(j + 1) == Some(&'E')) {
+                    j += 1;
+                }
+                j += 2;
+            }
             '\\' => j += 2,
             '[' => {
                 // A class: `]` first is a literal, and an escape inside it is one character.
@@ -28348,7 +28381,7 @@ fn group_facts_of(chars: &[char]) -> GroupFacts {
                     j += if chars[j] == '\\' { 2 } else { 1 };
                 }
             }
-            '(' if j >= 2 && chars[j - 1] == '?' && chars[j - 2] == '(' => j += 1,
+            '(' if opens_condition(chars, j) => j += 1,
             '(' => {
                 let (captures, name, _) = group_header(chars, j);
                 facts.total += usize::from(captures);
@@ -28418,7 +28451,7 @@ fn open_group(
     facts: &mut Option<GroupFacts>,
 ) -> Result<GroupOpen, EvalError> {
     // The parenthesis that opens a conditional's condition, `(?(1)`, is not a group.
-    if i >= 2 && chars[i - 1] == '?' && chars[i - 2] == '(' {
+    if opens_condition(chars, i) {
         return Ok(GroupOpen {
             captures: false,
             body_start: usize::MAX,

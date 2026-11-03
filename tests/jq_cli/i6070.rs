@@ -203,6 +203,15 @@ fn test_valid_neighbours_do_not_change_6070() -> Result<()> {
         (r#""a1" | [match("\\w\\d";"g") | .string]"#, r#"["a1"]"#),
         (r#""xay" | [match("x\\Ky";"g") | .string]"#, "[]"),
         (r#""aa" | [match("(a)(a)\\2";"g") | .string]"#, "[]"),
+        (r#""aa" | [match("\\(?(a)\\1";"g") | .string]"#, r#"["aa"]"#),
+        (
+            r#""aa" | [match("(\\(?(a))\\2";"g") | .string]"#,
+            r#"["aa"]"#,
+        ),
+        (r#""(a" | [match("\\(?(a)";"g") | .string]"#, r#"["(a"]"#),
+        (r#""a" | [match("\\xf8*";"g") | .string]"#, r#"["",""]"#),
+        (r#""a" | [match("\\xed\\xa0\\x80+";"g") | .string]"#, "[]"),
+        (r#""a" | [match("\\xf8?a";"g") | .string]"#, r#"["a"]"#),
     ])
 }
 
@@ -229,6 +238,8 @@ fn test_patterns_jq_refuses_are_refused_6070() -> Result<()> {
         ("a(?:{2})", "target of repeat operator is not specified"),
         ("(?(2)a|b)", "invalid backref number/name"),
         ("(?(0)a|b)", "invalid backref number/name"),
+        (r"\Q(\E(?(1)a|b)", "invalid backref number/name"),
+        (r"\Q(\E\1", "invalid backref number/name"),
         ("(?(1)a)", "invalid backref number/name"),
         ("(?(<n>)a|b)", "undefined name <n> reference"),
         ("(?('n')a|b)", "undefined name <n> reference"),
@@ -240,8 +251,7 @@ fn test_patterns_jq_refuses_are_refused_6070() -> Result<()> {
         (r"(a)\2", "invalid backref number/name"),
         ("^{1}", "target of repeat operator is invalid"),
     ] {
-        let quoted = format!("\"{}\"", pattern.replace('\\', "\\\\").replace('"', "\\\""));
-        let filter = format!("\"a\" | test({quoted})");
+        let filter = format!("\"a\" | test({})", serde_json::to_string(pattern)?);
         let (stdout, stderr, code) = run(&filter)?;
         assert_eq!((stdout.as_str(), code), ("", 5), "{pattern}: {stderr}");
         assert!(
