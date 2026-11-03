@@ -790,6 +790,32 @@ pub fn format_byte(byte: u8) -> String {
 /// assert_eq!(substitute_invalid_utf8_jq_style(&[0xFF, 0xFE]), "\u{FFFD}\u{FFFD}");
 /// ```
 pub fn substitute_invalid_utf8_jq_style(input: &[u8]) -> String {
+    substitute_invalid_utf8_jq_style_observed(input, |_, _, _| {})
+}
+
+/// [`substitute_invalid_utf8_jq_style`], telling `on_run` where each replacement came from
+/// (#5975): `on_run(start, end, at)` means `input[start..end]` became one U+FFFD that starts at
+/// byte `at` of the result.
+///
+/// The runs arrive in order, and `end - start` is not always the three bytes of the U+FFFD: a
+/// lone invalid byte is one, and the drop quirk above makes a run of the whole tail.
+///
+/// # Examples
+///
+/// ```
+/// use succinctly::text::utf8::substitute_invalid_utf8_jq_style_observed;
+///
+/// let mut runs = Vec::new();
+/// let text = substitute_invalid_utf8_jq_style_observed(b"a\xffb", |start, end, at| {
+///     runs.push((start, end, at));
+/// });
+/// assert_eq!(text, "a\u{FFFD}b");
+/// assert_eq!(runs, [(1, 2, 1)]);
+/// ```
+pub fn substitute_invalid_utf8_jq_style_observed(
+    input: &[u8],
+    mut on_run: impl FnMut(usize, usize, usize),
+) -> String {
     let len = input.len();
     let mut out = String::with_capacity(len);
     let mut pos = 0;
@@ -810,6 +836,7 @@ pub fn substitute_invalid_utf8_jq_style(input: &[u8]) -> String {
                 out.push_str(
                     core::str::from_utf8(&input[run_start..pos]).expect("already validated"),
                 );
+                on_run(pos, resume_at, out.len());
                 out.push('\u{FFFD}');
                 pos = resume_at;
                 run_start = pos;
