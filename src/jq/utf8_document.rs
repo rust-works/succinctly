@@ -63,12 +63,13 @@ use crate::text::utf8::substitute_invalid_utf8_jq_style;
 /// [`substitute_invalid_utf8_jq_style`] to each JSON string rather than to
 /// the whole buffer (#1743).
 ///
-/// Bytes outside any string are substituted too, per contiguous segment:
-/// the result has to be valid UTF-8 for the rest of the pipeline to treat
-/// it as text at all. Real jq rejects a document with a bad byte outside a
-/// string (`printf '{"a":\xe1\x41 1}' | jq .` is a parse error), and so
-/// does succinctly, so the exact replacement chosen there is only ever
-/// visible in an error message.
+/// Bytes outside any string are substituted too, one U+FFFD for each maximal
+/// ill-formed run (`String::from_utf8_lossy`): the result has to be valid UTF-8 for the rest
+/// of the pipeline to treat it as text at all. Real jq substitutes nothing
+/// there: a bad byte is part of a literal token, which is a parse error
+/// (`printf '{"a":\xe1\x41 1}' | jq .`), and so it is in succinctly. The
+/// white space after it must survive, since jq counts its newlines and a
+/// read that resumes after the fault starts from them (#5994).
 ///
 /// Only for JSON-shaped input. `--raw-input` is line-scoped (#1742, handled
 /// by its own caller), `--raw-input --slurp` is genuinely whole-buffer in
@@ -134,8 +135,8 @@ pub fn substitute_invalid_utf8_jq_document(raw: &[u8]) -> String {
 /// it is not already valid UTF-8.
 ///
 /// The check is not an optimisation on top of a different answer -- it *is*
-/// the same answer: [`substitute_invalid_utf8_jq_style`] returns valid input
-/// byte-for-byte unchanged, pinned by #1247's own guard test. Skipping it
+/// the same answer: `String::from_utf8_lossy` returns valid input
+/// byte-for-byte unchanged. Skipping it
 /// skips an allocation and a second scan, and that is worth having because
 /// segment count scales with the document, not with the corruption in it: a
 /// file with one bad byte still has one segment per JSON string, so building
@@ -144,7 +145,12 @@ pub fn substitute_invalid_utf8_jq_document(raw: &[u8]) -> String {
 fn push_segment(out: &mut String, bytes: &[u8]) {
     match core::str::from_utf8(bytes) {
         Ok(s) => out.push_str(s),
-        Err(_) => out.push_str(&substitute_invalid_utf8_jq_style(bytes)),
+        // One U+FFFD per maximal ill-formed run, never the string-scoped short-tail rule: jq
+        // substitutes nothing outside a string (a bad byte is part of a literal token), so a lead
+        // byte must not take the white space after it, or the newline that ends the token
+        // (`\xe1\n"a" 1` lost its newline, and the read that resumed after the fault lost `"a"` and
+        // `1`, #5994).
+        Err(_) => out.push_str(&String::from_utf8_lossy(bytes)),
     }
 }
 
@@ -211,8 +217,8 @@ fn repair_string_body(out: &mut String, body: &[u8], has_escape: bool) {
 
     // jq's lexer refuses a raw control character in a string before it substitutes anything, so a
     // body holding one is a parse error at that character. The drop quirk must not take it with a
-    // lead byte (`"\xe1\n"` would read as a lone U+FFFD): substitute byte by byte instead, which
-    // keeps every ASCII byte where the parser will find it (#5990).
+    // lead byte (`"\xe1\n"` would read as a lone U+FFFD): substitute each ill-formed run on its own
+    // instead, which keeps every ASCII byte where the parser will find it (#5990).
     if body.iter().any(|&b| b < 0x20) {
         out.push_str(&String::from_utf8_lossy(body));
         return;
@@ -267,6 +273,20 @@ mod tests {
         assert_eq!(
             substitute_invalid_utf8_jq_document(b"\"\xe1A\" 1"),
             "\"\u{fffd}\" 1"
+        );
+    }
+
+    /// #5994: outside a string each ill-formed run is one U+FFFD on its own, so a lead byte keeps
+    /// the white space after it; jq's parser counts that newline and ends the literal token at it.
+    #[test]
+    fn a_lead_byte_outside_a_string_keeps_the_white_space_after_it_5994() {
+        assert_eq!(
+            substitute_invalid_utf8_jq_document(b"\xe1\n\"a\" 1"),
+            "\u{fffd}\n\"a\" 1"
+        );
+        assert_eq!(
+            substitute_invalid_utf8_jq_document(b"1 \xf0\x90\n\"a\""),
+            "1 \u{fffd}\n\"a\""
         );
     }
 
