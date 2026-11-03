@@ -96859,31 +96859,56 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
 
     // #5383: with a year read and no month or day, the libc derives them from `%j`
     // (`"2015 060" | strptime("%Y %j")` is `[2015,2,1,0,0,0,0,59]`), a day past the end of the
-    // year rolling into the next (`"2015 366"` is 2016-01-01). A month or day read next to `%j`
-    // is order- and platform-dependent in the libc (some rows abort jq) and stays as read.
-    let date_read = month_read || mday_read;
+    // year rolling into the next (`"2015 366"` is 2016-01-01).
+    // #5934: a month read beside it keeps the month and counts the day from the month's start, so
+    // the day can pass 31 or go below 1 and the year does not roll (`"2015 03 050" |
+    // strptime("%Y %m %j")` is `[2015,2,-9,0,0,0,4,49]`, `"2015 02 366"` is February 335). A day
+    // read with no month takes its month from the day of year. jq aborts on its own `set_tm_yday`
+    // assertion unless that day is the one the day of year gives, and where it is not there is no
+    // answer to match, so the month and day stay as read. Both a month and a day read leave the
+    // date as read, and so does a format with no year (the same assertion).
+    // A day counted from a month's start by `%j` or a week number is exempt from the range check
+    // below, since the libc sets it past 31 or below 1 itself.
+    let mut mday_from_week = false;
+    let date_read = month_read && mday_read;
     if let (Some(mut yd), true, false) = (day_of_year, year_read, date_read) {
-        let days_in_year = if yearday_for_civil(year, 12, 31) == 365 {
-            366
-        } else {
-            365
-        };
-        if yd > days_in_year {
-            yd -= days_in_year;
-            year += 1;
+        let mut derived_year = year;
+        if !month_read {
+            let days_in_year = if yearday_for_civil(year, 12, 31) == 365 {
+                366
+            } else {
+                365
+            };
+            if yd > days_in_year {
+                yd -= days_in_year;
+                derived_year += 1;
+            }
         }
-        let leap = yearday_for_civil(year, 12, 31) == 365;
+        let leap = yearday_for_civil(derived_year, 12, 31) == 365;
         let month_start: [i64; 12] = if leap {
             [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
         } else {
             [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
         };
-        let idx = month_start
-            .iter()
-            .rposition(|&start| start < yd)
-            .unwrap_or(0);
-        month = idx as i64 + 1;
-        day = yd - month_start[idx];
+        let idx = if month_read {
+            // An out-of-range month is refused below.
+            usize::try_from(month - 1).ok().filter(|&i| i < 12)
+        } else {
+            Some(
+                month_start
+                    .iter()
+                    .rposition(|&start| start < yd)
+                    .unwrap_or(0),
+            )
+        };
+        if let Some(idx) = idx.filter(|&idx| !mday_read || day == yd - month_start[idx]) {
+            year = derived_year;
+            month = idx as i64 + 1;
+            if !mday_read {
+                day = yd - month_start[idx];
+                mday_from_week = month_read;
+            }
+        }
     }
 
     // #5754: with a year read, no `%j` and not both a month and a day, the libc places the date by
@@ -96895,7 +96920,6 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // can pass 31 or go below 1 (`"2015 01 09" | strptime("%Y %m %U")` is January 60, March 1); a
     // day read with no month is kept beside the month the week falls in, which jq's own check
     // aborts on unless the two agree.
-    let mut mday_from_week = false;
     if let (Some((number, spec)), true, None, false, true) = (
         week,
         year_read,
