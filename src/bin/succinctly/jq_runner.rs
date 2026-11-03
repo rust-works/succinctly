@@ -18292,11 +18292,14 @@ mod tests {
         let raw = b"[\xe2\x82]\xac\" 1";
         let seam = Seam {
             base: 3,
-            earlier: Some([SeamPart {
-                end: 2,
-                lines: 0,
-                source: 0,
-            }].into()),
+            earlier: Some(
+                [SeamPart {
+                    end: 2,
+                    lines: 0,
+                    source: 0,
+                }]
+                .into(),
+            ),
             ..Seam::NONE
         };
         let (after, edits) = substituted(seam, raw);
