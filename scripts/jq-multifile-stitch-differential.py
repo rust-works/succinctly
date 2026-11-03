@@ -105,7 +105,7 @@ def main():
     ap.add_argument("--pool", choices=["clean", "nasty"], default="clean")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--streams", type=int, default=250)
-    ap.add_argument("--files", type=int, choices=[2, 3, 4], default=0, help="0: either, at random")
+    ap.add_argument("--files", type=int, choices=[2, 3, 4], default=0, help="0: two or three, at random; four only when asked for")
     ap.add_argument("--max-tokens", type=int, default=6)
     ap.add_argument("--timeout", type=float, default=20.0)
     ap.add_argument("--show", type=int, default=5, help="runs to print per class")

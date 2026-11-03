@@ -8366,7 +8366,9 @@ impl Seam {
     /// substitution ([`utf8_lossy_document`]), which turns each invalid byte into a three-byte
     /// U+FFFD and so moves `base` (#4316) and the end of each share before it (#5936).
     /// `moved_len` and `moved_newline` stay as they are: they measure the file's own bytes as
-    /// jq reads them, as [`EofTail`] does.
+    /// jq reads them, as [`EofTail`] does. Each end is where the substitution of the bytes up to
+    /// it ends, as `base` always was, so a multi-byte character split across a file boundary is
+    /// the case this does not follow (#5964 holds the rest of the invalid-UTF-8 gap).
     fn after_substitution(self, raw: &[u8]) -> Self {
         let prefix = &raw[..self.base.min(raw.len())];
         let lossy_end = |end: usize| {
@@ -9100,6 +9102,12 @@ fn stitch_json_file_seams<'a>(
                         lines: newlines(seams[index].own(raw)),
                     }]
                 };
+                debug_assert!(
+                    carry_parts.windows(2).all(|pair| pair[0].end < pair[1].end)
+                        && carry_parts.first().is_some_and(|part| part.end > 0)
+                        && carry_parts.last().map(|part| part.end) == Some(carry.len()),
+                    "the shares are non-empty, ascending, and end with the carried bytes"
+                );
                 // The part of it that is this file's own, which jq's reads of the file go on
                 // into (a tail that began in an earlier file is that file's).
                 let own = carry.get(base.saturating_sub(start)..).unwrap_or(&[]);
@@ -16727,7 +16735,8 @@ mod tests {
     }
 
     /// #4376: a fault met in the moved bytes resumes at the end of the previous file's read and
-    /// names that file's line; a chained or later fault is the counter's own.
+    /// names that file's line; a fault from more than one file's bytes is in the share of the file it
+    /// is in (#5936), and a later fault is the counter's own.
     #[test]
     fn meet_fault_reads_the_moved_bytes_as_the_previous_files_4376() {
         // `[ "x\ny" ` (a raw newline in a string: met at its closing quote, offset 6) is the
@@ -16744,13 +16753,13 @@ mod tests {
         assert_eq!(meet_fault(&mut counter, stitched, 0, false), (6, 3, 8));
         // From two files, the same bytes split after `[ "x\n`: the fault is in the second
         // file's share, whose read ends where that file does (#5936) and whose lines are its own.
-        let chained = Seam {
+        let two_files = Seam {
             base: 8,
             prev_lines: 0,
             earlier: Some([SeamPart { end: 5, lines: 2 }].into()),
             ..Seam::NONE
         };
-        let mut counter = LineCounter::at_seam(stitched, chained);
+        let mut counter = LineCounter::at_seam(stitched, two_files);
         assert_eq!(meet_fault(&mut counter, stitched, 0, false), (6, 0, 8));
         // ... and the first file's share, when the fault is in it (the same bytes, a newline
         // among them): its read ends at the end of that file.
