@@ -104,14 +104,162 @@ pub(crate) struct StreamErrorsRead {
 /// The line count of a value yielded once jq's input is closed.
 pub(crate) const CLOSED: usize = usize::MAX;
 
-/// One refill of jq's input buffer (`jq_util_input_read_more`).
-struct Refill<'a> {
+/// One refill of jq's input buffer (`jq_util_input_read_more`), with the bytes of it left in the
+/// buffer [`RefillSource::next_refill`] was given.
+pub(crate) struct Refill {
     source: usize,
-    bytes: &'a [u8],
     /// Whether the chunk holds a newline, which `read_more` counts as a line.
     newline: bool,
     /// Whether this refill is the last one, `read_more`'s return value.
     is_last: bool,
+}
+
+/// Where jq's refills come from: the sources' bytes already read ([`MemorySources`]), or files and
+/// stdin read a chunk at a time ([`ChunkedSources`], #5498).
+pub(crate) trait RefillSource {
+    /// The next refill, its bytes left in `buf` (which is cleared first), or `None` once the empty
+    /// closing refill, if there is one, has been handed out.
+    fn next_refill(&mut self, buf: &mut Vec<u8>) -> Option<Refill>;
+}
+
+impl RefillSource for Box<dyn RefillSource> {
+    fn next_refill(&mut self, buf: &mut Vec<u8>) -> Option<Refill> {
+        (**self).next_refill(buf)
+    }
+}
+
+/// The sources' bytes as read, a leading BOM already removed.
+pub(crate) struct MemorySources<S: AsRef<[(Option<usize>, Vec<u8>)]>> {
+    sources: S,
+    cursor: RefillCursor,
+}
+
+impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> MemorySources<S> {
+    pub(crate) fn new(sources: S) -> Self {
+        Self {
+            sources,
+            cursor: RefillCursor::default(),
+        }
+    }
+}
+
+impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> RefillSource for MemorySources<S> {
+    fn next_refill(&mut self, buf: &mut Vec<u8>) -> Option<Refill> {
+        let refill = self.cursor.next(self.sources.as_ref())?;
+        buf.clear();
+        buf.extend_from_slice(refill.bytes);
+        Some(Refill {
+            source: refill.source,
+            newline: refill.newline,
+            is_last: refill.is_last,
+        })
+    }
+}
+
+/// jq's refills over files and stdin, read a chunk at a time (#5498): what is held is one `fgets`
+/// chunk, 4095 bytes at most, and the reader's own buffer, not the input.
+///
+/// The refills are the ones [`MemorySources`] makes over the same bytes: a chunk runs through the
+/// next newline or 4095 bytes, an empty source is a refill of its own, and the last chunk of the
+/// last source is the last refill unless it filled the buffer or ended in a newline.
+pub(crate) struct ChunkedSources {
+    readers: Vec<Box<dyn std::io::BufRead>>,
+    source: usize,
+    last: Option<(usize, bool)>,
+    closed: bool,
+}
+
+impl ChunkedSources {
+    /// `readers` in input order, each already past a leading BOM that is to be skipped.
+    pub(crate) fn new(readers: Vec<Box<dyn std::io::BufRead>>) -> Self {
+        Self {
+            readers,
+            source: 0,
+            last: None,
+            closed: false,
+        }
+    }
+}
+
+/// One `fgets` chunk of `reader` appended to `buf`: through the next newline, or 4095 bytes.
+/// An error ends the chunk where it fell, as the end of the source does.
+fn read_chunk(reader: &mut dyn std::io::BufRead, buf: &mut Vec<u8>) {
+    while buf.len() < JQ_FGETS_CHUNK {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        if available.is_empty() {
+            return;
+        }
+        let window = &available[..available.len().min(JQ_FGETS_CHUNK - buf.len())];
+        match window.iter().position(|&byte| byte == b'\n') {
+            Some(newline) => {
+                buf.extend_from_slice(&window[..=newline]);
+                reader.consume(newline + 1);
+                return;
+            }
+            None => {
+                buf.extend_from_slice(window);
+                let taken = window.len();
+                reader.consume(taken);
+            }
+        }
+    }
+}
+
+impl RefillSource for ChunkedSources {
+    fn next_refill(&mut self, buf: &mut Vec<u8>) -> Option<Refill> {
+        let count = self.readers.len();
+        if let Some(reader) = self.readers.get_mut(self.source) {
+            let source = self.source;
+            let last_source = source + 1 == count;
+            buf.clear();
+            read_chunk(reader.as_mut(), buf);
+            if buf.is_empty() {
+                // A source with no bytes is a refill of its own.
+                self.source += 1;
+                self.last = Some((source, last_source));
+                return Some(Refill {
+                    source,
+                    newline: false,
+                    is_last: last_source,
+                });
+            }
+            let at_end = reader.fill_buf().map_or(true, <[u8]>::is_empty);
+            if at_end {
+                self.source += 1;
+            }
+            let newline = buf.ends_with(b"\n");
+            let hit_eof = !newline && buf.len() < JQ_FGETS_CHUNK;
+            if !newline {
+                // The parser sees a chunk with no newline up to its first NUL (`strlen`).
+                if let Some(nul) = buf.iter().position(|&byte| byte == 0) {
+                    buf.truncate(nul);
+                }
+            }
+            let is_last = last_source && at_end && hit_eof;
+            self.last = Some((source, is_last));
+            return Some(Refill {
+                source,
+                newline,
+                is_last,
+            });
+        }
+        if !self.closed {
+            self.closed = true;
+            if let Some((source, false)) = self.last {
+                buf.clear();
+                return Some(Refill {
+                    source,
+                    newline: false,
+                    is_last: true,
+                });
+            }
+        }
+        None
+    }
 }
 
 /// Where the refills jq makes over a list of sources have got to, so that the next one can be
@@ -132,8 +280,16 @@ struct RefillCursor {
     closed: bool,
 }
 
+/// A refill of the in-memory sources, with its bytes borrowed from them.
+struct CursorRefill<'a> {
+    source: usize,
+    bytes: &'a [u8],
+    newline: bool,
+    is_last: bool,
+}
+
 impl RefillCursor {
-    fn next<'a>(&mut self, sources: &'a [(Option<usize>, Vec<u8>)]) -> Option<Refill<'a>> {
+    fn next<'a>(&mut self, sources: &'a [(Option<usize>, Vec<u8>)]) -> Option<CursorRefill<'a>> {
         while let Some((_, raw)) = sources.get(self.source) {
             let last_source = self.source + 1 == sources.len();
             let source = self.source;
@@ -141,7 +297,7 @@ impl RefillCursor {
                 self.source += 1;
                 let is_last = last_source;
                 self.last = Some((source, is_last));
-                return Some(Refill {
+                return Some(CursorRefill {
                     source,
                     bytes: &[],
                     newline: false,
@@ -169,7 +325,7 @@ impl RefillCursor {
             };
             let is_last = last_source && at_end && hit_eof;
             self.last = Some((source, is_last));
-            return Some(Refill {
+            return Some(CursorRefill {
                 source,
                 bytes,
                 newline,
@@ -179,7 +335,7 @@ impl RefillCursor {
         if !self.closed {
             self.closed = true;
             if let Some((source, false)) = self.last {
-                return Some(Refill {
+                return Some(CursorRefill {
                     source,
                     bytes: &[],
                     newline: false,
@@ -215,12 +371,13 @@ pub(crate) struct ReadEnd {
     pub(crate) first_error: Option<usize>,
 }
 
-/// jq's reader over `S`, the sources' bytes as read, handing out the inputs one at a time as the
+/// jq's reader over `R`, where its refills come from, handing out the inputs one at a time as the
 /// refills that complete them are fed to the parser: the parser's state and the refill being
 /// read are all it holds, not the values it has yielded.
-pub(crate) struct Reader<S: AsRef<[(Option<usize>, Vec<u8>)]>> {
-    sources: S,
-    cursor: RefillCursor,
+pub(crate) struct Reader<R: RefillSource> {
+    source: R,
+    /// The bytes of the refill being fed to the parser.
+    buf: Vec<u8>,
     parser: Parser,
     /// What the last byte of a refill left for the next call to hand out.
     deferred: Vec<OwnedValue>,
@@ -231,11 +388,18 @@ pub(crate) struct Reader<S: AsRef<[(Option<usize>, Vec<u8>)]>> {
     done: bool,
 }
 
-impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> Reader<S> {
+impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> Reader<MemorySources<S>> {
+    /// The reader over sources already read, a leading BOM removed.
     pub(crate) fn new(sources: S) -> Self {
+        Self::from_source(MemorySources::new(sources))
+    }
+}
+
+impl<R: RefillSource> Reader<R> {
+    pub(crate) fn from_source(source: R) -> Self {
         Self {
-            sources,
-            cursor: RefillCursor::default(),
+            source,
+            buf: Vec::new(),
             parser: Parser::new(),
             deferred: Vec::new(),
             inside: None,
@@ -269,7 +433,7 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> Reader<S> {
 
     /// One refill of jq's input buffer, or what follows the last one.
     fn step(&mut self) {
-        let Some(refill) = self.cursor.next(self.sources.as_ref()) else {
+        let Some(refill) = self.source.next_refill(&mut self.buf) else {
             // Whatever is left comes from calls made after jq has closed its input.
             self.parser.closed = true;
             for value in std::mem::take(&mut self.deferred) {
@@ -297,10 +461,10 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> Reader<S> {
         for value in std::mem::take(&mut self.deferred) {
             parser.yield_value(value);
         }
-        let ended_with_value = parser.feed(refill.bytes, &mut self.deferred);
+        let ended_with_value = parser.feed(&self.buf, &mut self.deferred);
         if refill.is_last {
             // The slurp loop ends with the first call that leaves nothing in the buffer.
-            let first_call_empties = if refill.bytes.is_empty() {
+            let first_call_empties = if self.buf.is_empty() {
                 drained
             } else {
                 ended_with_value
@@ -969,6 +1133,99 @@ mod tests {
             .collect()
     }
 
+    /// A `Read` that hands over `limit` bytes at most per call, as a pipe does.
+    struct Trickle {
+        data: Vec<u8>,
+        pos: usize,
+        limit: usize,
+    }
+
+    impl std::io::Read for Trickle {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = out.len().min(self.limit).min(self.data.len() - self.pos);
+            out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    type Observed = (
+        Vec<(String, (usize, usize), Option<String>)>,
+        (usize, (usize, usize), Option<usize>),
+    );
+
+    fn observe<R: RefillSource>(mut reader: Reader<R>) -> Observed {
+        let mut yielded = Vec::new();
+        while let Some(item) = reader.next_yielded() {
+            yielded.push((item.value.to_json(), item.location, item.error));
+        }
+        let end = reader.end();
+        (yielded, (end.inside, end.slurp_at, end.open_at_end))
+    }
+
+    /// #5498: the chunked reader makes the refills the in-memory one makes, however the underlying
+    /// reads are cut, so every input, location and the end of the stream agree.
+    #[test]
+    fn a_chunked_reader_yields_what_the_in_memory_reader_does_5498() {
+        let long_line = format!("[{}1]\n[2]\n", "1,".repeat(3000));
+        let exact: String = format!("[{}]\n{{\"a\":1}}\n", "1".repeat(4095 - 3)); // 4095-byte first line
+        let one_over: String = format!("[{}]\n7", "1".repeat(4096 - 3));
+        let streams: Vec<Vec<&str>> = vec![
+            vec![""],
+            vec!["1"],
+            vec!["[1,2]"],
+            vec!["[1,2]\n"],
+            vec!["{\"a\":[1,{\"b\":null}],\"c\":\"x\"}\n\"s\"\n3\n"],
+            vec!["[1,\n}\n]\n}\n7"],
+            vec!["\u{feff}[1]\n"],
+            vec!["[1,", "2]\n"],
+            vec!["", "[1]", "", "\n[2]", ""],
+            vec!["1", "2", "3 }", "4\n"],
+            vec!["tru", "e\n[", "]\n"],
+            vec!["[1]\n", "}\n", "[2"],
+            vec!["a\u{0}b [1]\n", "[2]\u{0}[3]"],
+            vec![&long_line],
+            vec![&exact],
+            vec![&one_over],
+            vec![&long_line, &exact, "7"],
+            vec!["\"x\ny\"\n[1]\n", "{\"a\"}\n"],
+            vec!["\"\u{e9}\u{20ac}\"\n[\"\u{1f600}\"]\n"],
+        ];
+        let mut compared = 0;
+        for files in &streams {
+            let sources: Vec<(Option<usize>, Vec<u8>)> = files
+                .iter()
+                .enumerate()
+                .map(|(i, text)| (Some(i), text.as_bytes().to_vec()))
+                .collect();
+            let want = observe(Reader::new(&sources));
+            for limit in [1, 2, 3, 7, 64, 100_000] {
+                for capacity in [1, 3, 16, 8192] {
+                    let readers: Vec<Box<dyn std::io::BufRead>> = files
+                        .iter()
+                        .map(|text| -> Box<dyn std::io::BufRead> {
+                            Box::new(std::io::BufReader::with_capacity(
+                                capacity,
+                                Trickle {
+                                    data: text.as_bytes().to_vec(),
+                                    pos: 0,
+                                    limit,
+                                },
+                            ))
+                        })
+                        .collect();
+                    let got = observe(Reader::from_source(ChunkedSources::new(readers)));
+                    assert_eq!(
+                        got, want,
+                        "{files:?} read {limit} at a time through {capacity}"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert_eq!(compared, streams.len() * 6 * 4);
+    }
+
     /// #5498: `--slurp` keeps the location of the last few values only, and of the first error, and
     /// reads the same values as the full read.
     #[test]
@@ -1440,14 +1697,14 @@ mod tests {
         let (first, _) = reader.next().expect("a first input");
         assert_eq!(first.to_json(), "[[0],0]");
         assert!(
-            reader.cursor.pos < 64,
+            reader.source.cursor.pos < 64,
             "{} of {total} bytes fed",
-            reader.cursor.pos
+            reader.source.cursor.pos
         );
         // `[0]` completed two events (the leaf and the close); the second waits in the queue.
         assert_eq!(reader.parser.pending.len(), 1);
         assert_eq!(reader.next().expect("the close").0.to_json(), "[[0]]");
-        assert!(reader.cursor.pos < 64);
+        assert!(reader.source.cursor.pos < 64);
         // Reading on to the end hands out every event and then nothing.
         let mut count = 2;
         while reader.next().is_some() {
@@ -1455,7 +1712,7 @@ mod tests {
         }
         assert_eq!(count, 10_000);
         assert!(
-            reader.cursor.source == sources.len() && reader.cursor.closed,
+            reader.source.cursor.source == sources.len() && reader.source.cursor.closed,
             "the cursor has moved past the last source"
         );
     }

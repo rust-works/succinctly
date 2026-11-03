@@ -6351,6 +6351,39 @@ fn get_inputs(
     // Get input files
     let files = get_input_files(args);
 
+    // #5498: a program that asks for the `--stream` events as it goes reads them from the files a
+    // chunk at a time, as jq does, and not from their bytes read whole first.
+    if stream_read_in_chunks(args, track_eof) {
+        let (files, readers) = match open_chunked_inputs(&files, open_failed) {
+            Ok(opened_inputs) => opened_inputs,
+            Err(e) => return Ok(Err(e)),
+        };
+        opened.clone_from(&files);
+        let locations = InputLocations::new(
+            files
+                .iter()
+                .map(|p| Some(p.to_string_lossy().to_string()))
+                .collect(),
+        );
+        let tags = if files.is_empty() {
+            vec![None]
+        } else {
+            (0..files.len()).map(Some).collect()
+        };
+        LAZY_STREAM_INPUTS.with(|slot| {
+            *slot.borrow_mut() = Some(LazyStreamInputs {
+                last_source: u32::try_from(locations.files().len().saturating_sub(1))
+                    .unwrap_or(u32::MAX),
+                files: tags,
+                reader: crate::jq_stream_errors::Reader::from_source(Box::new(
+                    crate::jq_stream_errors::ChunkedSources::new(readers),
+                )),
+                raise_errors: !args.stream_errors,
+            });
+        });
+        return Ok(Ok((Vec::new(), locations, None, Vec::new())));
+    }
+
     // Collect raw input from files or stdin. Read as bytes and decode below
     // rather than through `read_to_string`, which refused the whole input on
     // a stray byte and reported it as a *read* failure when the read had in
@@ -6582,7 +6615,9 @@ fn get_inputs(
                     files: raw_bytes.iter().map(|(file, _)| *file).collect(),
                     last_source: u32::try_from(locations.files().len().saturating_sub(1))
                         .unwrap_or(u32::MAX),
-                    reader: crate::jq_stream_errors::Reader::new(raw_bytes),
+                    reader: crate::jq_stream_errors::Reader::from_source(Box::new(
+                        crate::jq_stream_errors::MemorySources::new(raw_bytes),
+                    )),
                     raise_errors: stream_by_reader,
                 });
             });
@@ -7840,6 +7875,82 @@ thread_local! {
     /// the clean kind it serves (#5674): stdin can be read once, and the materializing route
     /// reads it through [`read_stdin_bytes`].
     static STDIN_PUSHBACK: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
+/// Whether the `--stream` events are read a chunk at a time (#5498): the reader serves them to the
+/// program as it asks (`-n` with `input`/`inputs`, or a plain walk the driver loop pops), so it
+/// need not hold the files. `--validate` reads the bytes whole, and `-s` holds every event anyway.
+fn stream_read_in_chunks(args: &JqCommand, track_eof: bool) -> bool {
+    let json_input_mode = args.input_dsv.is_none() && !args.raw_input && !args.seq;
+    json_input_mode
+        && !args.validate
+        && !args.slurp
+        && track_eof
+        && (args.stream || args.stream_errors)
+        && (args.null_input || stream_walk_by_reader(args))
+}
+
+/// Open the main input files, or stdin, for the stream reader (#5498): a source that does not
+/// open is reported and left out, as [`read_input_files`] does (#5472).
+///
+/// Each source is probed with a read of its first bytes, so a file that opens but cannot be read
+/// (a directory) fails here with the message `std::fs::read` gave, and the BOM jq skips at the
+/// front of its input (#5291) is taken off the first source that has any bytes.
+fn open_chunked_inputs(
+    files: &[PathBuf],
+    open_failed: &mut bool,
+) -> Result<(Vec<PathBuf>, Vec<Box<dyn std::io::BufRead>>)> {
+    let mut opened = Vec::with_capacity(files.len());
+    let mut readers: Vec<Box<dyn std::io::BufRead>> = Vec::with_capacity(files.len().max(1));
+    let mut look_for_bom = true;
+    if files.is_empty() {
+        let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
+        let stdin = std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(std::io::stdin());
+        let reader =
+            chunked_reader(stdin, &mut look_for_bom).context("Failed to read from stdin")?;
+        readers.push(reader);
+        return Ok((opened, readers));
+    }
+    for path in files {
+        let reader = std::fs::File::open(path)
+            .and_then(|file| chunked_reader(file, &mut look_for_bom))
+            .map_err(|e| InputFileOpenError::new(path, strerror_only(&e)));
+        match reader {
+            Ok(reader) => {
+                opened.push(path.clone());
+                readers.push(reader);
+            }
+            Err(e) => report_unopenable_input(&e, open_failed),
+        }
+    }
+    Ok((opened, readers))
+}
+
+/// `inner` as a buffered reader that has been read from for its first three bytes, which are put
+/// back unless they are the BOM to skip (`look_for_bom`, cleared once a source has bytes).
+fn chunked_reader<R: std::io::Read + 'static>(
+    mut inner: R,
+    look_for_bom: &mut bool,
+) -> std::io::Result<Box<dyn std::io::BufRead>> {
+    let mut head = Vec::with_capacity(3);
+    let mut byte = [0u8; 3];
+    while head.len() < 3 {
+        match inner.read(&mut byte[..3 - head.len()]) {
+            Ok(0) => break,
+            Ok(n) => head.extend_from_slice(&byte[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if *look_for_bom && !head.is_empty() {
+        *look_for_bom = false;
+        let bom_len = crate::front_matter::leading_bom_len(&head);
+        head.drain(..bom_len);
+    }
+    Ok(Box::new(std::io::BufReader::with_capacity(
+        64 * 1024,
+        std::io::Cursor::new(head).chain(inner),
+    )))
 }
 
 /// Read stdin to bytes.
@@ -9269,7 +9380,7 @@ fn lazy_tail_items(
 /// `--stream` and `--stream-errors` inputs read as the program asks for them (#5498): jq's streaming parser over
 /// the sources' bytes, and what its source indices mean.
 struct LazyStreamInputs {
-    reader: crate::jq_stream_errors::Reader<Vec<(Option<usize>, Vec<u8>)>>,
+    reader: crate::jq_stream_errors::Reader<Box<dyn crate::jq_stream_errors::RefillSource>>,
     /// The file each source was read from, as `get_inputs` tags its values.
     files: Vec<Option<usize>>,
     /// The tag of the last source, which the end of the stream names.
