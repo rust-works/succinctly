@@ -7890,16 +7890,16 @@ fn stream_read_in_chunks(args: &JqCommand, track_eof: bool) -> bool {
         && (args.null_input || stream_walk_by_reader(args))
 }
 
+/// The input files that opened and a buffered reader for each ([`open_chunked_inputs`]).
+type ChunkedInputs = (Vec<PathBuf>, Vec<Box<dyn std::io::BufRead>>);
+
 /// Open the main input files, or stdin, for the stream reader (#5498): a source that does not
 /// open is reported and left out, as [`read_input_files`] does (#5472).
 ///
 /// Each source is probed with a read of its first bytes, so a file that opens but cannot be read
 /// (a directory) fails here with the message `std::fs::read` gave, and the BOM jq skips at the
 /// front of its input (#5291) is taken off the first source that has any bytes.
-fn open_chunked_inputs(
-    files: &[PathBuf],
-    open_failed: &mut bool,
-) -> Result<(Vec<PathBuf>, Vec<Box<dyn std::io::BufRead>>)> {
+fn open_chunked_inputs(files: &[PathBuf], open_failed: &mut bool) -> Result<ChunkedInputs> {
     let mut opened = Vec::with_capacity(files.len());
     let mut readers: Vec<Box<dyn std::io::BufRead>> = Vec::with_capacity(files.len().max(1));
     let mut look_for_bom = true;
