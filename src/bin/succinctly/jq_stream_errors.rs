@@ -73,10 +73,16 @@ fn classify(c: u8) -> Cls {
 /// The inputs `--stream-errors` hands the program, with where jq's reader stood for each.
 pub(crate) struct StreamErrorsRead {
     pub(crate) values: Vec<OwnedValue>,
-    /// Parallel to `values`: the index into the source list and the number of lines jq had read
-    /// from that source when it yielded the value, or [`CLOSED`] for a value jq yielded after
-    /// it had closed its input (`input_filename` is `null` and `input_line_number` `0` there).
+    /// Parallel to `values[locations_from..]`: the index into the source list and the number of
+    /// lines jq had read from that source when it yielded the value, or [`CLOSED`] for a value jq
+    /// yielded after it had closed its input (`input_filename` is `null` and `input_line_number`
+    /// `0` there).
     pub(crate) locations: Vec<(usize, usize)>,
+    /// Where `locations` starts in `values`: 0, except for [`read_for_slurp`], which keeps only the
+    /// last few.
+    pub(crate) locations_from: usize,
+    /// The location of the first parse error jq turned into an input, if there was one.
+    pub(crate) first_error_location: Option<(usize, usize)>,
     /// How many of `values` jq's `--slurp` loop puts in its array. The loop ends at the first call
     /// that consumes the last byte of the last read, so what that call leaves pending (the close
     /// of a container) and the EOF branch's report come out after the array, as inputs of their
@@ -240,6 +246,7 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> Reader<S> {
     /// The next input and the `(source index, lines read)` jq's reader stood at when it yielded
     /// it ([`CLOSED`] for the lines of one yielded after jq closed its input), or `None` once
     /// jq's reader has nothing left.
+    #[cfg(test)]
     pub(crate) fn next(&mut self) -> Option<(OwnedValue, (usize, usize))> {
         self.next_yielded().map(|y| (y.value, y.location))
     }
@@ -319,12 +326,35 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> Reader<S> {
 /// Read `sources` (each source's bytes as read, a leading BOM already removed) the way
 /// `jq --stream-errors` does.
 pub(crate) fn read(sources: &[(Option<usize>, Vec<u8>)]) -> StreamErrorsRead {
+    read_keeping(sources, usize::MAX)
+}
+
+/// How many trailing locations [`read_for_slurp`] keeps: the values jq's `--slurp` loop leaves
+/// after its array are the close it still held and the EOF report.
+const SLURP_TAIL: usize = 8;
+
+/// [`read`] for `--slurp`, which puts every value in one array and so needs the location of only the
+/// values after it, and of the first parse error (#5498). A location is 16 bytes a value, and a
+/// stream of events has one per event.
+pub(crate) fn read_for_slurp(sources: &[(Option<usize>, Vec<u8>)]) -> StreamErrorsRead {
+    read_keeping(sources, SLURP_TAIL)
+}
+
+/// [`read`], keeping the location of the last `keep` values only.
+fn read_keeping(sources: &[(Option<usize>, Vec<u8>)], keep: usize) -> StreamErrorsRead {
     let mut reader = Reader::new(sources);
     let mut values = Vec::new();
-    let mut locations = Vec::new();
-    while let Some((value, location)) = reader.next() {
-        values.push(value);
-        locations.push(location);
+    let mut locations = std::collections::VecDeque::new();
+    let mut first_error_location = None;
+    while let Some(yielded) = reader.next_yielded() {
+        if yielded.error.is_some() && first_error_location.is_none() {
+            first_error_location = Some(yielded.location);
+        }
+        values.push(yielded.value);
+        if locations.len() == keep {
+            locations.pop_front();
+        }
+        locations.push_back(yielded.location);
     }
     let end = reader.end();
     StreamErrorsRead {
@@ -332,8 +362,10 @@ pub(crate) fn read(sources: &[(Option<usize>, Vec<u8>)]) -> StreamErrorsRead {
         slurp_at: end.slurp_at,
         open_at_end: end.open_at_end,
         first_error: end.first_error,
+        locations_from: values.len() - locations.len(),
+        first_error_location,
         values,
-        locations,
+        locations: locations.into(),
     }
 }
 
@@ -922,6 +954,34 @@ mod tests {
             .take(end)
             .map(|(event, lines)| (event.to_json(), lines))
             .collect()
+    }
+
+    /// #5498: `--slurp` keeps the location of the last few values only, and of the first error, and
+    /// reads the same values as the full read.
+    #[test]
+    fn a_read_for_slurp_keeps_the_tail_of_the_locations_5498() {
+        let events: String = (0..40).map(|n| format!("[{n}]\n")).collect();
+        let sources = [(None, events.into_bytes())];
+        let (full, slurp) = (read(&sources), read_for_slurp(&sources));
+        let json = |read: &StreamErrorsRead| {
+            read.values
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(json(&full), json(&slurp));
+        assert_eq!((full.inside, full.slurp_at), (slurp.inside, slurp.slurp_at));
+        assert_eq!(slurp.locations.len(), SLURP_TAIL);
+        assert_eq!(slurp.locations_from, full.values.len() - SLURP_TAIL);
+        assert_eq!(slurp.locations[..], full.locations[slurp.locations_from..]);
+        assert_eq!(full.locations_from, 0);
+        assert!(full.first_error_location.is_none() && slurp.first_error_location.is_none());
+        // The first error's location is kept wherever it falls.
+        let broken = [(None, b"[1]\n}\n[2]\n}\n".to_vec())];
+        let (full, slurp) = (read(&broken), read_for_slurp(&broken));
+        let first = full.first_error.expect("a fault");
+        assert_eq!(slurp.first_error_location, Some(full.locations[first]));
+        assert_eq!(full.first_error_location, slurp.first_error_location);
     }
 
     /// The fast paths (#5498) must build what the checked document parser builds, to the literal:

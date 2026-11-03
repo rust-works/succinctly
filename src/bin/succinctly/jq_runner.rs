@@ -6602,11 +6602,15 @@ fn get_inputs(
             });
             return Ok(Ok((Vec::new(), locations, None, Vec::new())));
         }
-        let read = crate::jq_stream_errors::read(&raw_bytes);
+        let read = if args.slurp {
+            crate::jq_stream_errors::read_for_slurp(&raw_bytes)
+        } else {
+            crate::jq_stream_errors::read(&raw_bytes)
+        };
         // Without `--stream-errors` a fault is not an input: `-s` reads everything before it
         // runs the program, so the first one is the whole result (#5498).
         if let (true, Some(first)) = (stream_by_reader, read.first_error) {
-            let (source, line) = read.locations[first];
+            let (source, line) = read.first_error_location.unwrap_or_default();
             let message = crate::jq_stream_errors::error_message(&read.values[first]);
             return Ok(Err(MalformedJsonError::new(EvalError::new(message))
                 .at_stream_fault(source, line)
@@ -6617,8 +6621,13 @@ fn get_inputs(
         // `--slurp` closes its array at the call that empties jq's buffer, so what that call left
         // behind comes out after the array as inputs of their own.
         let after_array = args.slurp.then(|| {
+            debug_assert!(
+                read.inside >= read.locations_from,
+                "the values after the array keep their locations"
+            );
             let outside = values.split_off(read.inside);
-            let outside_locations = value_locations.split_off(read.inside);
+            let outside_locations =
+                value_locations.split_off(read.inside.saturating_sub(read.locations_from));
             let (source, line) = read.slurp_at;
             values = vec![OwnedValue::array_from(std::mem::take(&mut values))];
             value_locations = vec![(source, line)];
