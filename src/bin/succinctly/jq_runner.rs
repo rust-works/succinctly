@@ -4580,6 +4580,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 
 fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     super::sigpipe::restore_default();
+    // A run starts with every file still to open (#6006): a thread that ran jq before must not
+    // carry a missing file's stop into this run.
+    FIRST_OPEN_FAILURE_AT.with(|first| first.set(None));
     silence_depth_guard_panic_line();
     args.resolve_positional_args();
     // The order only matters between two or more named flags: a command line with fewer builds no clap definition for it.
