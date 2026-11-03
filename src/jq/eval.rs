@@ -48559,7 +48559,7 @@ fn sole_update_mark<S: EvalSemantics>(body: &Expr, fold: FoldBody) -> Option<fol
 /// Peel any wrapping `Expr::Paren` down to the inner expression — `(false)`
 /// and `false` are the same node for a caller that only cares about literal
 /// shape, not surface syntax (`Expr::Alternative`'s `#845` fix, below).
-fn unwrap_paren(expr: &Expr) -> &Expr {
+pub(crate) fn unwrap_paren(expr: &Expr) -> &Expr {
     match expr {
         Expr::Paren(inner) => unwrap_paren(inner),
         other => other,

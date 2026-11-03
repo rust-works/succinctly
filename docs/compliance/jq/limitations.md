@@ -9551,6 +9551,9 @@ A bare `$u`, `$u[..]`, an array pattern, an object pattern with a computed key o
 On the document below, `reduce .[] as {b: $b} (0; . + $b)` was `error` (as jq's) and now answers `5`, the same row as `. + $u.b`.
 A plain `.[] as {b: $b} | $b` still raises there, because the deferred bind (#3856) does not destructure.
 How the update spells its read (`. + $u.b`, `. - $u.b`, `($u.b | floor)`, `$u.a == $u.b`) does not matter: all of them project.
+A parenthesis around the loop variable at the head of the read does not matter either (`($u).b`, `(($u)).b`, `($u)["b"]`, #5544): it only groups, so those project as `$u.b` does, where they converted the element whole before and raised on the row above.
+A parenthesis that is not the head of a field (`($u)`, `($u | length)`, `[$u]`) is still a read of the whole element, and so is one around the field stage (`$u | (.b)`).
+The deferred bind's own walk still refuses a parenthesised head under a repeated ambient (`.users[] | ($x).limit`) where it admits `$x.limit` ([#5957](https://github.com/rust-works/succinctly/issues/5957)).
 For a fold that reads a member, the object's own frame is still checked as the whole conversion checks it (each key, the delimiters between members, the tail), so a malformed element fails the fold as before; only the value of a member nothing reads is left undecoded.
 A loop variable nothing reads (`reduce .[] as $u (0; . + 1)`) materializes nothing of its element, so it checks nothing, as `.[] as $x | 1` checks nothing: `[{,}]` answers `1` where jq refuses the document.
 On `[{"a":"\ud800","b":5}]`:
