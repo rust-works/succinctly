@@ -8585,7 +8585,7 @@ fn output_value<W: Write>(
         // exclusion just below is scalar-only).
         let head = prepend_head_comment_lines(String::new(), comments.meta().head_comment(), "");
         let head_is_leading = comments.meta().head_is_header();
-        let body = if head_is_leading {
+        let body = if head_is_leading || head.is_empty() {
             body
         } else {
             format!("{head}{body}")
@@ -8666,8 +8666,9 @@ fn output_value<W: Write>(
         } else {
             (body, String::new())
         };
-        let output = format!("{leading}{body}{trailing}");
-        reject_nul_output(&output, config)?;
+        for part in [&leading, &body, &trailing] {
+            reject_nul_output(part, config)?;
+        }
         write_pending_separator(writer, separator, terminator_from_config(config))?;
         if config.use_color {
             // No boundary here -- `write_terminator` below writes directly
@@ -8679,7 +8680,7 @@ fn output_value<W: Write>(
                 colorize_yaml_document(&leading, &body, &trailing, bare_scalar)
             )?;
         } else {
-            write!(writer, "{output}")?;
+            write!(writer, "{leading}{body}{trailing}")?;
         }
         // A document with no content at all (`# c`, a bare `---`) prints only the header
         // it was written with, and that header's own last line break already ends it:
