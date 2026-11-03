@@ -6464,6 +6464,14 @@ fn decode_double_quoted(bytes: &[u8], json_sourced: bool) -> Result<String, Yaml
                         }
                         continue; // Don't increment i again at end of loop
                     }
+                    0xC2 | 0xE2 if scalar_break(bytes, i, unicode).is_some() => {
+                        // An escaped U+0085/U+2028/U+2029 continues the line the same way (#4913).
+                        i += scalar_break(bytes, i, unicode).map_or(0, |b| b.width);
+                        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+                            i += 1;
+                        }
+                        continue;
+                    }
                     b'x' => {
                         // \xNN - 2 hex digits
                         if i + 2 >= bytes.len() {
@@ -6648,6 +6656,19 @@ fn scalar_break(bytes: &[u8], i: usize, unicode: bool) -> Option<ScalarBreak> {
     }
 }
 
+impl ScalarBreak {
+    /// What this break, the one at `bytes[i]`, leaves in a decoded value once it is not the first
+    /// of its run: `\n` for the ASCII spellings and U+0085, itself for U+2028/U+2029.
+    #[inline]
+    fn kept(self, bytes: &[u8], i: usize) -> char {
+        if self.separator {
+            separator_char(bytes, i)
+        } else {
+            '\n'
+        }
+    }
+}
+
 /// The character of the U+2028/U+2029 whose bytes start at `bytes[i]`.
 #[inline]
 fn separator_char(bytes: &[u8], i: usize) -> char {
@@ -6661,9 +6682,10 @@ fn separator_char(bytes: &[u8], i: usize) -> char {
 /// Whether `bytes` holds U+0085, U+2028 or U+2029 (#4913): the one test every decoder and every
 /// "does this body need decoding" gate asks, so that they cannot disagree.
 ///
-/// The lead bytes `0xC2` and `0xE2` are tried first with `memchr`, which a body without either
-/// (all ASCII, or most prose) pays and nothing more; a hit is then confirmed against the whole
-/// sequence, since both lead bytes are common (`é`'s neighbours, `…`, `—`, `€`).
+/// The lead bytes `0xC2` and `0xE2` are tried first with `contains` (a `memchr`), which a body
+/// without either pays and nothing more; a hit is then confirmed against the whole sequence, since
+/// both lead bytes are common (`©`, `…`, `—`, `€`). The hot gates reach this only for a body with a
+/// non-ASCII byte ([`body_is_verbatim`]).
 #[inline]
 fn holds_unicode_scalar_break(bytes: &[u8]) -> bool {
     if !bytes.contains(&0xC2) && !bytes.contains(&0xE2) {
@@ -6841,11 +6863,7 @@ fn fold_quoted_line_break(bytes: &[u8], mut i: usize, unicode: bool, result: &mu
         }
         match scalar_break(bytes, i, unicode) {
             Some(b) => {
-                kept.push(if b.separator {
-                    separator_char(bytes, i)
-                } else {
-                    '\n'
-                });
+                kept.push(b.kept(bytes, i));
                 i += b.width;
             }
             None => break,
@@ -6940,11 +6958,7 @@ fn fold_plain_line_break(
 
         // Check if this is an empty line
         if let Some(b) = scalar_break(bytes, i, unicode) {
-            kept.push(if b.separator {
-                separator_char(bytes, i)
-            } else {
-                '\n'
-            });
+            kept.push(b.kept(bytes, i));
             i += b.width;
         } else if i >= bytes.len() {
             // End of content
@@ -6964,11 +6978,7 @@ fn fold_plain_line_break(
                 })
             }) {
                 // Line is all whitespace - treat as empty line
-                kept.push(if b.separator {
-                    separator_char(bytes, check)
-                } else {
-                    '\n'
-                });
+                kept.push(b.kept(bytes, check));
                 i = check + b.width;
                 // Continue looking for more empty lines
             } else {
@@ -7769,7 +7779,8 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
                 ..
             }) => {
                 let bytes = text.get(*start..*end)?;
-                if bytes.contains(&b'\n') {
+                // A body that folds is not its own text (#4913: the same test every reader asks).
+                if !plain_is_verbatim(bytes) {
                     return None;
                 }
                 core::str::from_utf8(bytes).ok().map(Cow::Borrowed)
@@ -11734,6 +11745,13 @@ mod tests {
             ("[x\u{202a}y]", "[\"x\u{202a}y\"]"),
             ("[x\u{c2}y]", "[\"x\u{c2}y\"]"),
             ("[x\u{2013}y]", "[\"x\u{2013}y\"]"),
+            // A backslash before any of the three continues the line (yq v4.53.3):
+            ("\"x\\\u{85}   y\"", "\"xy\""),
+            ("\"x\\\u{2028}   y\"", "\"xy\""),
+            ("\"x\\\u{2029}\t y\"", "\"xy\""),
+            ("\"x \\\u{85} y\"", "\"x y\""),
+            ("\"x\\\u{85}\\\u{2028} y\"", "\"xy\""),
+            ("\"x\\\n \\\u{85} y\"", "\"xy\""),
         ];
         assert!(cases.len() > 50, "the table lost rows");
 
