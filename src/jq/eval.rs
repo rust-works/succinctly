@@ -96408,6 +96408,31 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // The process locale's names (#5754); `None` reads the English ones.
     let names = locale_time::names();
 
+    // #5947: `%Y`, `%y`, `%M` and `%S` (and those fields inside `%R`, `%T` and `%D`) read nothing
+    // and succeed at the end of the input or before white space, as the pin's libc does: the field
+    // is left as it was and counts as not read (`"" | strptime("%Y")` is the zeroed time).
+    // The libc refuses a month outside 1-12 and a day past 31 as it reads them, so a later `%s`
+    // cannot hide one (`"13" | strptime("%m%s")` is no match, #5947); a day of 0 reads.
+    let read_month = |it: &mut core::iter::Peekable<core::str::Chars<'_>>| {
+        let m = parse_digits(it, 2)?;
+        if (1..=12).contains(&m) {
+            Ok(m)
+        } else {
+            Err(format!("month {m} out of range"))
+        }
+    };
+    let read_day = |it: &mut core::iter::Peekable<core::str::Chars<'_>>| {
+        let d = parse_digits(it, 2)?;
+        if d <= 31 {
+            Ok(d)
+        } else {
+            Err(format!("day {d} out of range"))
+        }
+    };
+    let field_is_empty = |it: &core::iter::Peekable<core::str::Chars<'_>>| {
+        it.clone().next().map_or(true, is_c_space)
+    };
+
     while let Some(fc) = fmt_iter.next() {
         if fc == '%' {
             // `%E` and `%O` modify the specifier after them and read as it does (#5754): jq's libc
@@ -96436,29 +96461,33 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                         return Err("expected '%'".to_string());
                     }
                 }
+                Some('Y') if field_is_empty(&input_iter) => {}
                 Some('Y') => {
-                    year = parse_digits(&mut input_iter, 4)?;
+                    year = parse_signed_field(&mut input_iter, 4)?;
                     century = None;
                     two_digit_year = None;
                     year_read = true;
                 }
+                Some('y') if field_is_empty(&input_iter) => {}
                 Some('y') => {
-                    let y = parse_digits(&mut input_iter, 2)?;
+                    let y = parse_signed_field(&mut input_iter, 2)?;
                     if let Some(c) = century.take() {
                         year = c * 100 + y;
                         two_digit_year = None;
                     } else {
                         year = if y >= 69 { 1900 + y } else { 2000 + y };
-                        two_digit_year = Some(y);
+                        // The year's last two digits, which for a signed `%y` are not the ones read
+                        // (`-5` is 1995, so a later `%C` takes 95, #5947).
+                        two_digit_year = Some(year % 100);
                     }
                     year_read = true;
                 }
                 Some('m') => {
-                    month = parse_digits(&mut input_iter, 2)?;
+                    month = read_month(&mut input_iter)?;
                     month_read = true;
                 }
                 Some('d') => {
-                    day = parse_digits(&mut input_iter, 2)?;
+                    day = read_day(&mut input_iter)?;
                     mday_read = true;
                 }
                 Some('e') => {
@@ -96467,7 +96496,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     if input_iter.peek() == Some(&' ') {
                         input_iter.next();
                     }
-                    day = parse_digits(&mut input_iter, 2)?;
+                    day = read_day(&mut input_iter)?;
                 }
                 // `%k` and `%l` read as `%H` and `%I`: the libc takes them as the hour in 24- and 12-hour
                 // form, with no padding of their own to read (#5754).
@@ -96479,6 +96508,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     // "00"); will be adjusted by %p if present.
                     hour = check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=12, "hour")?;
                 }
+                Some('M') if field_is_empty(&input_iter) => {}
                 Some('M') => {
                     minute =
                         check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=59, "minute")?;
@@ -96493,6 +96523,9 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     // time, #5754). It replaces the date and time read so far
                     // (`"2015 1425599621" | strptime("%Y %s")` is the instant's year);
                     // weekday and yearday are recomputed below.
+                    // `strtol`: with no digits after the white space and sign it reads 0 and
+                    // consumes nothing (`"" | strptime("%s")` is the epoch, #5947).
+                    let before = input_iter.clone();
                     while input_iter.peek().is_some_and(|&c| is_c_space(c)) {
                         input_iter.next();
                     }
@@ -96507,7 +96540,12 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                         }
                         _ => false,
                     };
-                    let magnitude = parse_digits(&mut input_iter, 19)?;
+                    let magnitude = if input_iter.peek().is_some_and(char::is_ascii_digit) {
+                        parse_digits(&mut input_iter, 19)?
+                    } else {
+                        input_iter = before;
+                        0
+                    };
                     let secs = if negative { -magnitude } else { magnitude };
                     let t = broken_down_time_from_unix_secs(secs).map_err(|e| e.to_string())?;
                     gmt = true;
@@ -96524,6 +96562,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     minute = t.minute;
                     second = t.second;
                 }
+                Some('S') if field_is_empty(&input_iter) => {}
                 Some('S') => {
                     // Upper bound 60, not 59: a leap second is valid and
                     // real jq accepts it (confirmed live, #971).
@@ -96646,7 +96685,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     }
                 }
                 Some('C') => {
-                    let c = parse_digits(&mut input_iter, 2)?;
+                    let c = parse_signed_field(&mut input_iter, 2)?;
                     if let Some(y) = two_digit_year.take() {
                         year = c * 100 + y;
                         century = None;
@@ -96660,57 +96699,68 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     // mm/dd/yy
                     month_read = true;
                     mday_read = true;
-                    month = parse_digits(&mut input_iter, 2)?;
+                    month = read_month(&mut input_iter)?;
                     if input_iter.next() != Some('/') {
                         return Err("expected '/'".to_string());
                     }
-                    day = parse_digits(&mut input_iter, 2)?;
+                    day = read_day(&mut input_iter)?;
                     if input_iter.next() != Some('/') {
                         return Err("expected '/'".to_string());
                     }
-                    let y = parse_digits(&mut input_iter, 2)?;
-                    year = if y >= 69 { 1900 + y } else { 2000 + y };
+                    // Its `%y` reads nothing at the end or before white space (#5947), leaving the
+                    // year as it was; the century is cleared either way.
+                    if !field_is_empty(&input_iter) {
+                        let y = parse_signed_field(&mut input_iter, 2)?;
+                        year = if y >= 69 { 1900 + y } else { 2000 + y };
+                    }
                     century = None;
                     two_digit_year = None;
                 }
                 Some('F') => {
-                    // yyyy-mm-dd
+                    // yyyy-mm-dd, the year signed as `%Y` reads it (#5947)
                     month_read = true;
                     mday_read = true;
-                    year = parse_digits(&mut input_iter, 4)?;
+                    year = parse_signed_field(&mut input_iter, 4)?;
                     century = None;
                     two_digit_year = None;
                     if input_iter.next() != Some('-') {
                         return Err("expected '-'".to_string());
                     }
-                    month = parse_digits(&mut input_iter, 2)?;
+                    month = read_month(&mut input_iter)?;
                     if input_iter.next() != Some('-') {
                         return Err("expected '-'".to_string());
                     }
-                    day = parse_digits(&mut input_iter, 2)?;
+                    day = read_day(&mut input_iter)?;
                 }
                 Some('R') => {
-                    // HH:MM
+                    // HH:MM, the minutes empty at the end or before white space (#5947)
                     hour = check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=23, "hour")?;
                     if input_iter.next() != Some(':') {
                         return Err("expected ':'".to_string());
                     }
-                    minute =
-                        check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=59, "minute")?;
+                    if !field_is_empty(&input_iter) {
+                        minute =
+                            check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=59, "minute")?;
+                    }
                 }
                 Some('T') => {
-                    // HH:MM:SS
+                    // HH:MM:SS, the minutes and seconds empty at the end or before white space
+                    // (#5947)
                     hour = check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=23, "hour")?;
                     if input_iter.next() != Some(':') {
                         return Err("expected ':'".to_string());
                     }
-                    minute =
-                        check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=59, "minute")?;
+                    if !field_is_empty(&input_iter) {
+                        minute =
+                            check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=59, "minute")?;
+                    }
                     if input_iter.next() != Some(':') {
                         return Err("expected ':'".to_string());
                     }
-                    second =
-                        check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=60, "second")?;
+                    if !field_is_empty(&input_iter) {
+                        second =
+                            check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=60, "second")?;
+                    }
                 }
                 Some('n' | 't') => {
                     // The libc takes at least one white-space character (the run of them, not
@@ -96853,11 +96903,29 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
         month_read && mday_read,
         (1..=12).contains(&month),
     ) {
-        let jan1 =
-            (checked_days_from_civil(year, 1, 1).map_err(|e| e.to_string())? % 7 + 4 + 7) % 7;
+        // The libc's `first_wday_of`, in C's truncating `/` and `%` (as Rust's are): the weekday of
+        // 1 January for a year from 0 up, and for a negative year a value that can itself be
+        // negative, which the week arithmetic below takes as it comes, as the libc does (#5947:
+        // `"-999 09" | strptime("%Y %U")` is February 28 in jq).
+        let jan1 = {
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            (2 * (3 - (year / 100) % 4)
+                + year % 100
+                + (year % 100) / 4
+                + if leap { 6 } else { 0 }
+                + 1)
+                % 7
+        };
         let week_start = i64::from(spec != 'U');
         let first_week_start = if spec == 'V' {
-            3 - (jan1 + 2) % 7
+            // The Monday of ISO week 1: in the year's first days when 1 January is a Monday to
+            // Thursday, else after them, from the libc's `jan1` as is (a negative year's can be
+            // -6, #5947).
+            if (1..=4).contains(&jan1) {
+                1 - jan1
+            } else {
+                (8 - jan1) % 7
+            }
         } else {
             (7 - jan1 + week_start) % 7
         };
@@ -96900,6 +96968,9 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // week number next to a month read is exempt from the upper bound too:
     // the libc sets it past 31 or below 1 itself, and jq prints it
     // (`"2015 March 05" | strptime("%Y %B %U")` is March -27, #5754).
+    // Since #5947 a month or day read is range-checked as it is read, as the libc does, so this
+    // is a backstop: nothing reaches it, and it keeps an out-of-range month from indexing past
+    // `yearday_for_civil`'s table should that ever change.
     if !(1..=12).contains(&month) || (day > 31 && !mday_from_week) {
         return Err(format!("month {month} or day {day} out of range"));
     }
@@ -96981,6 +97052,28 @@ fn check_clock_field(
     } else {
         Err(format!("{field} {value} out of range"))
     }
+}
+
+/// `%Y`, `%y` and `%C` as the pin's libc reads them (#5947): an optional sign, which takes one of
+/// the field's `width` characters, then the digits that fit in the rest. A sign with no digits
+/// after it reads 0 (`"+" | strptime("%Y")` is year 0, `"-5" | strptime("%y")` is 1995); with no
+/// sign at least one digit is needed.
+fn parse_signed_field(
+    input: &mut core::iter::Peekable<core::str::Chars>,
+    width: usize,
+) -> Result<i64, String> {
+    let negative = match input.peek() {
+        Some('+') => false,
+        Some('-') => true,
+        _ => return parse_digits(input, width),
+    };
+    input.next();
+    let digits = if input.peek().is_some_and(char::is_ascii_digit) {
+        parse_digits(input, width - 1)?
+    } else {
+        0
+    };
+    Ok(if negative { -digits } else { digits })
 }
 
 /// Parse up to n digits from input
