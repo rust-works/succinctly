@@ -204,7 +204,10 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-24.04
+    # #5926: the first x86_64 job off the ubuntu-24.04 pin. The suite passes on 26.04 (glibc 2.43)
+    # once the libm goldens stopped pinning digits that libm moves, and these legs are what keep it
+    # passing there. The jobs below stay on 24.04 until each has run on 26.04 (the pin test lists them).
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:

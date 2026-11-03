@@ -281,7 +281,7 @@ What each CI runner exercises for real:
 
 | Runner                        | CPU           | Backends asserted in CI                |
 |-------------------------------|---------------|----------------------------------------|
-| `ubuntu-24.04` (Test x86_64)  | AMD EPYC 7763 | POPCNT, SSE4.1/4.2, **BMI2**, **AVX2** |
+| `ubuntu-26.04` (Test x86_64)  | AMD EPYC 7763 | POPCNT, SSE4.1/4.2, **BMI2**, **AVX2** |
 | `ubuntu-24.04-arm` (Test ARM) | Neoverse-N2   | NEON, **SVE2**, **SVE2-BITPERM**       |
 | `macos-latest` (Test macOS)   | Apple Silicon | NEON                                   |
 
