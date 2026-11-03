@@ -2532,9 +2532,11 @@ pub(crate) mod drop_depth {
     //! unique container. `no_std` has no `thread_local!`, so there every
     //! unique container still scans.
     //!
-    //! The limit keeps a drop's native stack small: about 64 bytes per array
-    //! level and 160 per object level in a release build, so at most about
-    //! 43 KB.
+    //! The limit keeps a drop's native stack small. Since #5868 a level is
+    //! the drop glue's frame plus `Rc::drop_slow`'s (and, for an object,
+    //! `ObjectMapOf::drop`'s and the entry's), about 112 bytes per array
+    //! level and 210 per object level in an M4 Pro release build, read off
+    //! the frame sizes, so at most about 54 KB.
 
     use std::cell::Cell;
 
@@ -11619,16 +11621,27 @@ mod tests {
             map.push_occurrence("k".to_string(), p.clone());
             OwnedValue::Object(map)
         };
+        // `q` is a second outside handle, so the count is pinned exactly: a
+        // leak leaves `p` shared after `q` goes, and a double release
+        // unshares it while `q` is still alive.
         let check = |wrap: &dyn Fn(&OwnedValue) -> OwnedValue| {
             let p = probe();
+            let q = p.clone();
             drop(wrap(&p));
+            assert!(shared(&p), "a unique container released its children once");
+            drop(q);
             assert!(!shared(&p), "a unique container released its children");
 
+            let q = p.clone();
             let first = wrap(&p);
             let second = first.clone();
             drop(first);
+            drop(q);
             assert!(shared(&p), "a shared handle only decrements");
+            let q = p.clone();
             drop(second);
+            assert!(shared(&p), "the last handle released its children once");
+            drop(q);
             assert!(!shared(&p), "the last handle released its children");
         };
         check(&wrap_array);
