@@ -245,7 +245,8 @@ fn count_var_reads(body: &Expr, var: &str, mut fields: Option<&mut Vec<String>>)
             Expr::Var(name) if name == var => reads += 1,
             Expr::Pipe(stages) => {
                 for pair in stages.windows(2) {
-                    if !matches!(&pair[0], Expr::Var(name) if name == var) {
+                    // `($x).k` reads the member as `$x.k` does: a parenthesis only groups (#5544).
+                    if !matches!(without_parens(&pair[0]), Expr::Var(name) if name == var) {
                         continue;
                     }
                     if let Some(field) = field_read(&pair[1]) {
@@ -312,6 +313,14 @@ fn may_yield_many(expr: &Expr) -> bool {
         Expr::As { expr, body, .. } => may_yield_many(expr) || may_yield_many(body),
         _ => true,
     }
+}
+
+/// `expr` with the parentheses around it taken off: `(($x))` is `$x`.
+fn without_parens(mut expr: &Expr) -> &Expr {
+    while let Expr::Paren(inner) = expr {
+        expr = inner;
+    }
+    expr
 }
 
 /// The field a stage reads from an object: `.k`, `.k?`.
@@ -570,6 +579,33 @@ mod tests {
     /// hold it.
     fn sharing() -> Option<DeferredReads> {
         LAZY_SHARES.then_some(DeferredReads::Sharing)
+    }
+
+    /// `var_reads` of `$u` in `body` as (fields read as a head, whether anything else reads it).
+    fn field_heads(body: &str) -> (Vec<String>, bool) {
+        let body = parse(body).expect("parses");
+        let reads = var_reads(&body, "u");
+        (reads.fields, reads.whole)
+    }
+
+    /// #5544: a parenthesis only groups, so `($u).k`, `(($u)).k` and `($u)["k"]` are field-head reads
+    /// as `$u.k` is, and a bare `$u` or a `$u` in a parenthesis that is not the head of a field is
+    /// still a read of the whole node.
+    #[test]
+    fn a_parenthesized_head_is_a_field_head_read_5544() {
+        let heads = |fields: &[&str]| fields.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+        assert_eq!(field_heads("$u.a"), (heads(&["a"]), false));
+        assert_eq!(field_heads("($u).a"), (heads(&["a"]), false));
+        assert_eq!(field_heads("(($u)).a"), (heads(&["a"]), false));
+        assert_eq!(field_heads(r#"($u)["a"]"#), (heads(&["a"]), false));
+        assert_eq!(field_heads("($u).a? + $u.b"), (heads(&["a", "b"]), false));
+        assert_eq!(field_heads("($u).a + ($u | .a)"), (heads(&["a"]), false));
+        // Whole-node reads, however they are spelled around a field head.
+        assert_eq!(field_heads("($u).a + [$u]"), (heads(&["a"]), true));
+        assert_eq!(field_heads("($u)"), (heads(&[]), true));
+        assert_eq!(field_heads("($u) | length"), (heads(&[]), true));
+        assert_eq!(field_heads("($u | length)"), (heads(&[]), true));
+        assert_eq!(field_heads("($u).a[0]"), (heads(&["a"]), false));
     }
 
     #[test]
