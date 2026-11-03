@@ -96355,6 +96355,13 @@ fn advance_chars(input: &mut core::iter::Peekable<core::str::Chars<'_>>, n: usiz
     }
 }
 
+/// C's `isspace` in the C locale, which the libc's `strptime` tests on bytes: space, tab, newline,
+/// vertical tab, form feed and carriage return. Other Unicode white space is text to match, under a
+/// UTF-8 locale as well (`"2015\u{a0}x" | strptime("%Y x")` is no match in jq, #5960).
+fn is_c_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
+}
+
 /// Parse a time string according to strptime format specifiers
 #[allow(clippy::type_complexity)] // STYLE-0004: return mirrors strptime's broken-down-time field set
 fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), String> {
@@ -96379,9 +96386,12 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     let mut mday_read = false;
     // #5754: the last `%U`, `%W` or `%V` read, as its number and specifier.
     let mut week: Option<(i64, char)> = None;
-    // #5754: whether `%s` or `%Z` naming `GMT` was read, so the fields are UTC and go to the
-    // local zone at the end.
+    // #5754, #5960: whether `%s`, `%z` or `%Z` naming `GMT` was read, so the fields are UTC and go
+    // to the local zone at the end.
     let mut gmt = false;
+    // #5960: the offset east of UTC the last `%z` read, subtracted once the fields are a UTC
+    // instant; a later `%s` or `%Z` naming `GMT` drops it.
+    let mut utc_offset: i64 = 0;
 
     // `%c`, `%x`, `%X` and `%r` stand for the locale's layouts (C's without one): read as
     // if the format spelled them out (#5754).
@@ -96469,7 +96479,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     // time, #5754). It replaces the date and time read so far
                     // (`"2015 1425599621" | strptime("%Y %s")` is the instant's year);
                     // weekday and yearday are recomputed below.
-                    while input_iter.peek().is_some_and(|c| c.is_whitespace()) {
+                    while input_iter.peek().is_some_and(|&c| is_c_space(c)) {
                         input_iter.next();
                     }
                     let negative = match input_iter.peek() {
@@ -96487,6 +96497,8 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     let secs = if negative { -magnitude } else { magnitude };
                     let t = broken_down_time_from_unix_secs(secs).map_err(|e| e.to_string())?;
                     gmt = true;
+                    // The libc drops an offset an earlier `%z` read (#5960).
+                    utc_offset = 0;
                     year = t.year;
                     month = t.month;
                     day = t.day;
@@ -96511,6 +96523,10 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                         Some(n) => (n.am.as_str(), n.pm.as_str()),
                         None => ("AM", "PM"),
                     };
+                    // #5960: an hour past 12 read before the marker is no match.
+                    if hour > 12 {
+                        return Err(format!("hour {hour} with an am/pm marker"));
+                    }
                     if let Some(len) = strptime_prefix_len(&input_iter, am) {
                         advance_chars(&mut input_iter, len);
                         if hour == 12 {
@@ -96681,17 +96697,24 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     }
                 }
                 Some('z') => {
-                    // Skip timezone offset like +0000 or -0500
-                    if let Some(&c) = input_iter.peek() {
-                        if c == '+' || c == '-' {
-                            input_iter.next();
-                            for _ in 0..4 {
-                                if input_iter.peek().is_some_and(char::is_ascii_digit) {
-                                    input_iter.next();
-                                }
-                            }
+                    // #5960: a sign and exactly four digits, `hhmm` (minutes not range-checked:
+                    // `+0060` is an hour). It turns the GMT flag on, and the offset is subtracted
+                    // from the UTC instant at the end; the last one read counts, and a later `%s` or
+                    // `%Z` naming `GMT` drops it.
+                    let sign = match input_iter.next() {
+                        Some('+') => 1,
+                        Some('-') => -1,
+                        _ => return Err("expected a sign before the offset".to_string()),
+                    };
+                    let mut hhmm = 0;
+                    for _ in 0..4 {
+                        match input_iter.next().and_then(|c| c.to_digit(10)) {
+                            Some(d) => hhmm = hhmm * 10 + i64::from(d),
+                            None => return Err("expected four offset digits".to_string()),
                         }
                     }
+                    utc_offset = sign * (hhmm / 100 * 3_600 + hhmm % 100 * 60);
+                    gmt = true;
                 }
                 Some('Z') => {
                     // #5754: a run of capital letters naming `GMT`, which turns the GMT flag on,
@@ -96705,6 +96728,8 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     let name: String = input_iter.clone().take(len).collect();
                     if name == "GMT" {
                         gmt = true;
+                        // As `%s` does, `GMT` drops an offset an earlier `%z` read (#5960).
+                        utc_offset = 0;
                     } else if name.is_empty()
                         || !local_zone::tzname()
                             .iter()
@@ -96720,10 +96745,10 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                 Some(other) => return Err(format!("unknown specifier '%{other}'")),
                 None => return Err("format ends in '%'".to_string()),
             }
-        } else if fc.is_whitespace() {
+        } else if is_c_space(fc) {
             // Skip any whitespace in input
             while let Some(&c) = input_iter.peek() {
-                if c.is_whitespace() {
+                if is_c_space(c) {
                     input_iter.next();
                 } else {
                     break;
@@ -96745,7 +96770,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // appended to the result as a string (`"2020-01-01 x"` gives a ninth element `" x"`).
     if input_iter
         .peek()
-        .is_some_and(|c| !matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'))
+        .is_some_and(|&c| !is_c_space(c))
     {
         return Err("trailing input".to_string());
     }
@@ -96869,9 +96894,12 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
         let days = checked_days_from_civil(year, month, day).map_err(|e| e.to_string())?;
         let mut secs =
             to_secs(days).ok_or_else(|| EvalError::datetime_out_of_range().to_string())?;
-        if secs < START_OF_1900 {
-            secs = -1;
-        }
+        // The `%z` offset comes off a `timegm` that succeeded (#5960); a failed one is -1 as is.
+        secs = if secs < START_OF_1900 {
+            -1
+        } else {
+            secs - utc_offset
+        };
         let local = secs
             .checked_add(local_zone::at_instant(secs).offset_secs)
             .ok_or_else(|| EvalError::datetime_out_of_range().to_string())?;
