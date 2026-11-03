@@ -314,6 +314,10 @@ struct Src {
     base: usize,
     /// The absolute position the scan's own `0` is.
     origin: usize,
+    /// The absolute positions of the last two `\n` pushed, found as the text arrives so that
+    /// finding where the scan may stop does not read the window again.
+    last_newline: Option<usize>,
+    prev_newline: Option<usize>,
 }
 
 impl Src {
@@ -321,7 +325,20 @@ impl Src {
         self.base + self.window.len() - self.origin
     }
     fn push_str(&mut self, s: &str) {
-        self.window.extend(s.chars());
+        for c in s.chars() {
+            if c == '\n' {
+                self.prev_newline = self.last_newline;
+                self.last_newline = Some(self.base + self.window.len());
+            }
+            self.window.push(c);
+        }
+    }
+
+    /// The relative position of the second-to-last line break, if it is at or after `from`.
+    fn prev_newline_from(&self, from: usize) -> Option<usize> {
+        self.prev_newline
+            .and_then(|abs| abs.checked_sub(self.origin))
+            .filter(|rel| *rel >= from)
     }
     /// Drops the text before relative position `keep_from`, less a little history the scanner
     /// reads behind itself.
@@ -600,6 +617,9 @@ struct Scanner {
     /// Whether the end of the text has been fed in. Until it has, the scan stops short of the
     /// last complete line, and a quoted scalar waits for its closing quote.
     eof: bool,
+    /// How far the search for the closing quote of the scalar waiting at `.0` has read, so that
+    /// each piece of text that arrives is read once, not the scalar again from its opening.
+    quote_probe: Option<(usize, usize)>,
 }
 
 impl Scanner {
@@ -620,6 +640,7 @@ impl Scanner {
             indent_state: IndentState::Equal,
             saved_pos: None,
             eof: false,
+            quote_probe: None,
         }
     }
 
@@ -731,24 +752,37 @@ impl Scanner {
     }
 
     /// Whether the closing quote of the scalar opened at `ctx.idx` is in the text so far.
-    fn quote_is_closed(ctx: &Ctx, quote: char) -> bool {
+    fn quote_is_closed(&mut self, ctx: &Ctx, quote: char) -> bool {
         let size = ctx.size();
-        let mut i = ctx.idx + 1;
+        let mut i = match self.quote_probe {
+            Some((start, read_to)) if start == ctx.idx => read_to,
+            _ => ctx.idx + 1,
+        };
         while i < size {
             let c = ctx.src[i];
             if quote == '"' && c == '\\' {
+                if i + 1 >= size {
+                    break; // The escaped character has not arrived.
+                }
                 i += 2;
                 continue;
             }
             if c == quote {
-                if quote == '\'' && i + 1 < size && ctx.src[i + 1] == '\'' {
-                    i += 2;
-                    continue;
+                if quote == '\'' {
+                    if i + 1 >= size {
+                        break; // A doubled quote or the end: the next character says.
+                    }
+                    if ctx.src[i + 1] == '\'' {
+                        i += 2;
+                        continue;
+                    }
                 }
+                self.quote_probe = None;
                 return true;
             }
             i += 1;
         }
+        self.quote_probe = Some((ctx.idx, i));
         false
     }
 
@@ -1736,19 +1770,9 @@ impl Scanner {
         if self.eof {
             return ctx.size();
         }
-        let size = ctx.size();
-        let mut i = size;
-        let mut newlines = 0;
-        while i > ctx.idx {
-            i -= 1;
-            if ctx.src[i] == '\n' {
-                newlines += 1;
-                if newlines == 2 {
-                    return i + 1;
-                }
-            }
-        }
-        ctx.idx
+        ctx.src
+            .prev_newline_from(ctx.idx)
+            .map_or(ctx.idx, |newline| newline + 1)
     }
 
     /// Scans the text so far, as far as `stop` allows. Returns an error token to print and
@@ -1761,7 +1785,7 @@ impl Scanner {
                 && (c == '"' || c == '\'')
                 && !ctx.is_multi_line()
                 && !ctx.exists_buffer()
-                && !Self::quote_is_closed(ctx, c)
+                && !self.quote_is_closed(ctx, c)
             {
                 return Ok(());
             }
@@ -1954,6 +1978,7 @@ impl YamlColorizer {
                     self.ctx.reset_buffer();
                     self.ctx.mstate = None;
                     self.ctx.last = None;
+                    self.scanner.quote_probe = None;
                     // An invalid token can leave the scan past the end of the text.
                     let consumed = self.ctx.idx.min(self.ctx.size());
                     self.ctx.src.origin += consumed;
@@ -2085,6 +2110,34 @@ mod tests {
         for size in [1, 2, 3, 5, 8, 13, 100] {
             assert_eq!(color_in_pieces(text, size), whole, "pieces of {size}");
         }
+    }
+
+    /// A very long line, and a quoted scalar that takes many pieces to close, are each read once
+    /// as they arrive, not again from their start with every piece.
+    #[test]
+    fn a_long_line_and_a_long_quoted_scalar_cost_linear_time_5416() {
+        let started = std::time::Instant::now();
+        for text in [
+            format!("a: [{}]\n", "1, ".repeat(400_000)),
+            format!("a: \"{}\"\nb: 1\n", "x ".repeat(400_000)),
+            format!("a: '{}'\nb: 1\n", "y''".repeat(300_000)),
+        ] {
+            let mut colorizer = YamlColorizer::default();
+            let mut out = String::new();
+            let chars: Vec<char> = text.chars().collect();
+            for piece in chars.chunks(4096) {
+                let piece: String = piece.iter().collect();
+                colorizer.push_str(&piece, &mut out);
+            }
+            colorizer.finish(&mut out);
+            assert!(out.len() > text.len());
+        }
+        // Quadratic reading is minutes at this size; linear is well under a second in a debug build.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
