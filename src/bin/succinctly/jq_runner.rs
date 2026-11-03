@@ -7069,152 +7069,24 @@ fn get_inputs(
                         defer_lazy_start(std::rc::Rc::clone(&raw), spans, src, seam.clone());
                         lazy_inputs = true;
                     }
-                    let mut faults = LineCounter::at_seam(raw.as_bytes(), seam.clone());
-                    // #5923: where jq's parser stands at the start of each segment. The first is
-                    // where the file starts; after a fault it is where the fault left the parser,
-                    // since jq drops the rest of the read and never counts it.
-                    let mut parser_at: Option<(usize, usize)> = None;
-                    // ... and where it stands at the end of the file once a fault has moved it off
-                    // the real position: the next file starts there, since jq carries its counters
-                    // from one file to the next.
-                    let mut file_end: Option<(usize, usize)> = None;
-                    loop {
-                        let segment = &raw[offset..];
-                        let seg_pos = (!args.stream).then(|| {
-                            parser_at.unwrap_or_else(|| {
-                                advance_source(file_start, raw.as_bytes(), lossy, 0..offset)
-                            })
-                        });
-                        // The bytes jq read of this segment, where they are known.
-                        let read = lossy.map(|lossy| {
-                            if offset == 0 {
-                                lossy.original.as_slice()
-                            } else {
-                                lossy.bytes(offset..raw.len())
-                            }
-                        });
-                        let seg_origin = seg_pos.map(|file| StreamOrigin {
-                            file,
-                            before: &[],
-                            read,
-                        });
-                        let (parsed, parse_error, fault_end) =
-                            parse_json_stream_prefix_ending(segment, seg_origin);
-                        let (spans, split_error) = split_json_values(segment.as_bytes());
-                        if spans.len() < parsed.len() {
-                            // patchcov: coverage tolerate reason="unreachable: the splitter is the more lenient of the two and the prefix parse materializes from its spans, so it cannot find fewer values -- the same internal-error guard as the non-resuming branch below (#1064), kept per segment (#4311)"
-                            return Ok(Err(anyhow::anyhow!(
-                                "internal error: the JSON splitter found {} values where the \
-                                 stream parse found {}",
-                                spans.len(),
-                                parsed.len()
-                            )));
-                            // patchcov: coverage end
-                        }
-                        let mut parsed = parsed;
-                        let start = parse_error.is_some().then(|| {
-                            offset
-                                + spans
-                                    .get(parsed.len())
-                                    .map(|&(start, _)| start)
-                                    .or(split_error)
-                                    .unwrap_or(segment.len())
-                        });
-                        // A number or literal the fault's own byte completes is
-                        // never read.
-                        if let (Some(start), Some(&(s, e))) = (
-                            start,
-                            parsed.len().checked_sub(1).and_then(|i| spans.get(i)),
-                        ) {
-                            if bare_token_lost_to_fault(
-                                raw.as_bytes(),
-                                (offset + s, offset + e),
-                                start,
-                                args.stream,
-                            ) {
-                                parsed.pop();
-                            }
-                        }
-                        let read = parsed.len();
-                        ends.extend(spans.iter().take(read).map(|&(_, end)| offset + end));
-                        values.extend(parsed);
-                        let (Some(error), Some(start)) = (parse_error, start) else {
-                            if parser_at.is_some() {
-                                file_end = seg_pos.map(|at| {
-                                    advance_source(at, raw.as_bytes(), lossy, offset..raw.len())
-                                });
-                            }
-                            break;
-                        };
-                        let (_, line, resume) =
-                            meet_fault(&mut faults, raw.as_bytes(), start, args.stream);
-                        resumed_errors.push((
-                            values.len(),
-                            TrailingParseError {
-                                error,
-                                source: u32::try_from(src).unwrap_or(u32::MAX),
-                                line: u32::try_from(line).unwrap_or(u32::MAX),
-                                seq_warning: false,
-                            },
-                        ));
-                        // The next segment starts where the parser stopped, unless the fault's
-                        // wording was not the parser's own: then it is the dropped bytes counted
-                        // from where this segment started.
-                        parser_at = fault_end.or_else(|| {
-                            seg_pos.map(|at| {
-                                let end = resume.min(raw.len());
-                                advance_source(at, raw.as_bytes(), lossy, offset..end)
-                            })
-                        });
-                        let mut next = resume;
-                        // A read that starts inside a character starts on a byte
-                        // no JSON token begins with: jq raises there too and
-                        // discards that read as well (`}` padded so the read ends
-                        // inside `é`, then ` 7\n8\n`, reads the error twice, then
-                        // `8`).
-                        while next < raw.len() && !raw.is_char_boundary(next) {
-                            let line = faults.line_at_read_of(next);
-                            // #5975: the fault is the parser's own, read from the byte the read
-                            // starts on, from where the parser stood at the last fault.
-                            let fault = parser_at.and_then(|(line, column)| {
-                                let read = lossy.map_or_else(
-                                    || &raw.as_bytes()[next..],
-                                    |lossy| lossy.bytes(next..raw.len()),
-                                );
-                                jq::jq_stream_fault_end([read], line, column)
-                            });
-                            let (error, fault_end) = match fault {
-                                Some((message, end)) => (EvalError::new(message), Some(end)),
-                                // patchcov: coverage tolerate reason="unreachable: the read starts on a UTF-8 continuation byte, which no JSON token begins with, so the parser always names a fault in it; kept so a read it could not name is still an error and not silently dropped (#5975)"
-                                None => (EvalError::new("Invalid JSON text"), None),
-                                // patchcov: coverage end
-                            };
-                            resumed_errors.push((
-                                values.len(),
-                                TrailingParseError {
-                                    error,
-                                    source: u32::try_from(src).unwrap_or(u32::MAX),
-                                    line: u32::try_from(line).unwrap_or(u32::MAX),
-                                    seq_warning: false,
-                                },
-                            ));
-                            let read_end = faults.read_end(next);
-                            // Without the parser's own end, the bytes it dropped are counted on.
-                            parser_at = fault_end.or_else(|| {
-                                // patchcov: coverage tolerate reason="unreachable with the arm above: the parser always names the fault, so the dropped bytes are never counted by hand (#5975)"
-                                parser_at.map(|at| {
-                                    advance_source(at, raw.as_bytes(), lossy, next..read_end)
-                                })
-                                // patchcov: coverage end
-                            });
-                            next = read_end;
-                        }
-                        if next >= raw.len() {
-                            file_end = parser_at;
-                            break;
-                        }
-                        offset = next;
-                    }
+                    let tail_cx = TailContext {
+                        stream: args.stream,
+                        file_start,
+                        src,
+                        seam: &seam,
+                        lossy,
+                    };
+                    let file_end = match read_json_tail(
+                        &raw,
+                        offset,
+                        &tail_cx,
+                        &mut values,
+                        &mut ends,
+                        &mut resumed_errors,
+                    ) {
+                        Ok(file_end) => file_end,
+                        Err(error) => return Ok(Err(error)),
+                    };
                     if let (true, Some(end)) = (counts_files && pos < last, file_end) {
                         next_file = end;
                     }
@@ -9306,6 +9178,171 @@ fn find_json_values(bytes: &[u8]) -> core::result::Result<Vec<(usize, usize)>, u
         (values, None) => Ok(values),
         (_, Some(offset)) => Err(offset),
     }
+}
+
+/// What [`read_json_tail`] needs to know of the source it reads.
+struct TailContext<'a> {
+    /// `--stream`: the documents are read as its events, and no position is kept for the depth limit.
+    stream: bool,
+    /// Where the file starts in jq's input (#5497).
+    file_start: (usize, usize),
+    src: usize,
+    seam: &'a Seam,
+    /// The bytes jq read, where the text is a substitution of them (#5964).
+    lossy: Option<&'a LossySource>,
+}
+
+/// The eager reader of a JSON text from byte `offset` on (#4311): the documents it holds, each ending
+/// at `ends` in `raw`, and the parse errors jq meets on the way, which it resumes after. They are
+/// appended to `values`, `ends` and `resumed_errors`, each error counting the documents in `values`
+/// before it. Returns where jq's parser stands at the end of the text once a fault has moved it off
+/// the real position (#5923).
+fn read_json_tail(
+    raw: &str,
+    mut offset: usize,
+    cx: &TailContext,
+    values: &mut Vec<OwnedValue>,
+    ends: &mut Vec<usize>,
+    resumed_errors: &mut Vec<(usize, TrailingParseError)>,
+) -> Result<Option<(usize, usize)>> {
+    let mut faults = LineCounter::at_seam(raw.as_bytes(), cx.seam.clone());
+    // #5923: where jq's parser stands at the start of each segment. The first is
+    // where the file starts; after a fault it is where the fault left the parser,
+    // since jq drops the rest of the read and never counts it.
+    let mut parser_at: Option<(usize, usize)> = None;
+    // ... and where it stands at the end of the file once a fault has moved it off
+    // the real position: the next file starts there, since jq carries its counters
+    // from one file to the next.
+    let mut file_end: Option<(usize, usize)> = None;
+    loop {
+        let segment = &raw[offset..];
+        let seg_pos = (!cx.stream).then(|| {
+            parser_at.unwrap_or_else(|| {
+                advance_source(cx.file_start, raw.as_bytes(), cx.lossy, 0..offset)
+            })
+        });
+        // The bytes jq read of this segment, where they are known.
+        let read = cx.lossy.map(|lossy| {
+            if offset == 0 {
+                lossy.original.as_slice()
+            } else {
+                lossy.bytes(offset..raw.len())
+            }
+        });
+        let seg_origin = seg_pos.map(|file| StreamOrigin {
+            file,
+            before: &[],
+            read,
+        });
+        let (parsed, parse_error, fault_end) = parse_json_stream_prefix_ending(segment, seg_origin);
+        let (spans, split_error) = split_json_values(segment.as_bytes());
+        if spans.len() < parsed.len() {
+            // patchcov: coverage tolerate reason="unreachable: the splitter is the more lenient of the two and the prefix parse materializes from its spans, so it cannot find fewer values -- the same internal-error guard as the non-resuming branch below (#1064), kept per segment (#4311)"
+            return Err(anyhow::anyhow!(
+                "internal error: the JSON splitter found {} values where the \
+                 stream parse found {}",
+                spans.len(),
+                parsed.len()
+            ));
+            // patchcov: coverage end
+        }
+        let mut parsed = parsed;
+        let start = parse_error.is_some().then(|| {
+            offset
+                + spans
+                    .get(parsed.len())
+                    .map(|&(start, _)| start)
+                    .or(split_error)
+                    .unwrap_or(segment.len())
+        });
+        // A number or literal the fault's own byte completes is
+        // never read.
+        if let (Some(start), Some(&(s, e))) = (
+            start,
+            parsed.len().checked_sub(1).and_then(|i| spans.get(i)),
+        ) {
+            if bare_token_lost_to_fault(raw.as_bytes(), (offset + s, offset + e), start, cx.stream)
+            {
+                parsed.pop();
+            }
+        }
+        let read = parsed.len();
+        ends.extend(spans.iter().take(read).map(|&(_, end)| offset + end));
+        values.extend(parsed);
+        let (Some(error), Some(start)) = (parse_error, start) else {
+            if parser_at.is_some() {
+                file_end = seg_pos
+                    .map(|at| advance_source(at, raw.as_bytes(), cx.lossy, offset..raw.len()));
+            }
+            break;
+        };
+        let (_, line, resume) = meet_fault(&mut faults, raw.as_bytes(), start, cx.stream);
+        resumed_errors.push((
+            values.len(),
+            TrailingParseError {
+                error,
+                source: u32::try_from(cx.src).unwrap_or(u32::MAX),
+                line: u32::try_from(line).unwrap_or(u32::MAX),
+                seq_warning: false,
+            },
+        ));
+        // The next segment starts where the parser stopped, unless the fault's
+        // wording was not the parser's own: then it is the dropped bytes counted
+        // from where this segment started.
+        parser_at = fault_end.or_else(|| {
+            seg_pos.map(|at| {
+                let end = resume.min(raw.len());
+                advance_source(at, raw.as_bytes(), cx.lossy, offset..end)
+            })
+        });
+        let mut next = resume;
+        // A read that starts inside a character starts on a byte
+        // no JSON token begins with: jq raises there too and
+        // discards that read as well (`}` padded so the read ends
+        // inside `é`, then ` 7\n8\n`, reads the error twice, then
+        // `8`).
+        while next < raw.len() && !raw.is_char_boundary(next) {
+            let line = faults.line_at_read_of(next);
+            // #5975: the fault is the parser's own, read from the byte the read
+            // starts on, from where the parser stood at the last fault.
+            let fault = parser_at.and_then(|(line, column)| {
+                let read = cx.lossy.map_or_else(
+                    || &raw.as_bytes()[next..],
+                    |lossy| lossy.bytes(next..raw.len()),
+                );
+                jq::jq_stream_fault_end([read], line, column)
+            });
+            let (error, fault_end) = match fault {
+                Some((message, end)) => (EvalError::new(message), Some(end)),
+                // patchcov: coverage tolerate reason="unreachable: the read starts on a UTF-8 continuation byte, which no JSON token begins with, so the parser always names a fault in it; kept so a read it could not name is still an error and not silently dropped (#5975)"
+                None => (EvalError::new("Invalid JSON text"), None),
+                // patchcov: coverage end
+            };
+            resumed_errors.push((
+                values.len(),
+                TrailingParseError {
+                    error,
+                    source: u32::try_from(cx.src).unwrap_or(u32::MAX),
+                    line: u32::try_from(line).unwrap_or(u32::MAX),
+                    seq_warning: false,
+                },
+            ));
+            let read_end = faults.read_end(next);
+            // Without the parser's own end, the bytes it dropped are counted on.
+            parser_at = fault_end.or_else(|| {
+                // patchcov: coverage tolerate reason="unreachable with the arm above: the parser always names the fault, so the dropped bytes are never counted by hand (#5975)"
+                parser_at.map(|at| advance_source(at, raw.as_bytes(), cx.lossy, next..read_end))
+                // patchcov: coverage end
+            });
+            next = read_end;
+        }
+        if next >= raw.len() {
+            file_end = parser_at;
+            break;
+        }
+        offset = next;
+    }
+    Ok(file_end)
 }
 
 /// Documents of one source of a clean JSON stream that a program reading `input`/`inputs` converts
