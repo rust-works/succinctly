@@ -6539,7 +6539,12 @@ fn decode_double_quoted(bytes: &[u8], json_sourced: bool) -> Result<String, Yaml
             }
             _ if scalar_break(bytes, i, unicode).is_some() => {
                 // Line folding: handle newlines
-                i = fold_quoted_line_break(bytes, i, unicode, carried, &mut result);
+                let run = if carried {
+                    FoldRun::AfterEscapedBreak
+                } else {
+                    FoldRun::Ordinary
+                };
+                i = fold_quoted_line_break(bytes, i, unicode, run, &mut result);
             }
             _ => {
                 // Regular content - copy until we hit escape or newline
@@ -6730,7 +6735,10 @@ fn holds_unicode_scalar_break(bytes: &[u8]) -> bool {
 /// of a line, so the first break after it is not folded to a space), where an ordinary run drops
 /// the first and keeps the rest (#6067).
 fn holds_break_after_escaped_break(bytes: &[u8]) -> bool {
-    if !bytes.contains(&b'\\') {
+    // An escaped break and a break after it: two breaks, and a body with a backslash and no
+    // ASCII line break holds at most Unicode ones, which `holds_unicode_scalar_break` has already
+    // sent to the decoder. Most escape-only scalars (`\"`, `\n`, `\t`) stop at these two probes.
+    if !bytes.contains(&b'\\') || !(bytes.contains(&b'\n') || bytes.contains(&b'\r')) {
         return false;
     }
     let mut i = 0;
@@ -6867,7 +6875,7 @@ fn decode_single_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
             }
             _ if scalar_break(bytes, i, unicode).is_some() => {
                 // Line folding
-                i = fold_quoted_line_break(bytes, i, unicode, false, &mut result);
+                i = fold_quoted_line_break(bytes, i, unicode, FoldRun::Ordinary, &mut result);
             }
             _ => {
                 // Regular content
@@ -6896,6 +6904,14 @@ fn decode_single_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
     Ok(result)
 }
 
+/// Where a run of line breaks in a quoted scalar starts: after content, or right after an escaped
+/// line break (`\⏎`), where go-yaml is already at the start of a line (#6067).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FoldRun {
+    Ordinary,
+    AfterEscapedBreak,
+}
+
 /// Handle line folding for quoted strings.
 /// Returns the new position after processing the line break(s).
 ///
@@ -6905,7 +6921,7 @@ fn decode_single_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
 /// - With more, a first break that is not U+2028/U+2029 is dropped and each of the others stays
 ///   (`\n` for the ASCII spellings and U+0085, the character itself for U+2028/U+2029).
 /// - A first break that is U+2028/U+2029 stays, with the others after it.
-/// - `after_escaped_break` (#6067): the run follows a double-quoted scalar's escaped line break,
+/// - `FoldRun::AfterEscapedBreak` (#6067): the run follows a double-quoted scalar's escaped line break,
 ///   which leaves go-yaml at the start of a line, so it keeps *every* break, the first included:
 ///   one is a `\n` and not a space, and two are two.
 ///
@@ -6916,7 +6932,7 @@ fn fold_quoted_line_break(
     bytes: &[u8],
     mut i: usize,
     unicode: bool,
-    after_escaped_break: bool,
+    run: FoldRun,
     result: &mut String,
 ) -> usize {
     let Some(first) = scalar_break(bytes, i, unicode) else {
@@ -6944,7 +6960,7 @@ fn fold_quoted_line_break(
     if first.separator {
         result.push(separator_char(bytes, first_at));
         result.push_str(&kept);
-    } else if after_escaped_break {
+    } else if run == FoldRun::AfterEscapedBreak {
         result.push(first.kept(bytes, first_at));
         result.push_str(&kept);
     } else if kept.is_empty() {
@@ -10770,6 +10786,67 @@ fn looks_like_yaml_number(s: &str) -> bool {
 mod tests {
     use super::*;
     use crate::yaml::{YamlError, YamlIndex};
+
+    /// #6067: the writers that transcode a double-quoted body to JSON, and the one that streams it,
+    /// hand a body to [`decode_double_quoted`] when it holds a break they do not fold
+    /// ([`double_quoted_needs_decoder`]). The two must agree with the decoder on every body, or the
+    /// YAML and JSON outputs of one scalar differ: every body of up to six characters over the
+    /// breaks, blanks, a backslash, an `n` (so `\n` is an escape) and U+0085.
+    #[test]
+    fn the_json_writers_agree_with_the_decoder_on_every_short_body_6067() {
+        const ALPHABET: [char; 8] = ['\\', '\n', '\r', ' ', '\t', 'a', 'n', '\u{85}'];
+        let mut checked = 0usize;
+        let mut body = String::new();
+        // Odometer over the alphabet, lengths 1..=6.
+        for len in 1..=6usize {
+            let mut digits = vec![0usize; len];
+            loop {
+                body.clear();
+                body.extend(digits.iter().map(|&d| ALPHABET[d]));
+                // A body that does not decode (an escape that does not exist, a backslash at the
+                // end) is an error in every writer and says nothing about the dispatch.
+                if let Ok(decoded) = decode_double_quoted(body.as_bytes(), false) {
+                    let mut want = String::new();
+                    write_json_string(&mut want, &decoded);
+                    let text = format!("\"{body}\"");
+                    let scalar = YamlString::DoubleQuoted {
+                        text: text.as_bytes(),
+                        start: 0,
+                        json_sourced: false,
+                    };
+                    let mut whole = String::new();
+                    write_yaml_string_to_json_at(&mut whole, &scalar).expect("decodes");
+                    assert_eq!(whole, want, "whole-document writer, body {body:?}");
+                    let mut streamed = String::new();
+                    stream_yaml_string_to_json(&mut streamed, &scalar)
+                        .unwrap_or_else(|_| panic!("decodes: {body:?}"));
+                    assert_eq!(streamed, want, "streaming writer, body {body:?}");
+                    checked += 1;
+                }
+                // Next body.
+                let mut at = len;
+                loop {
+                    if at == 0 {
+                        break;
+                    }
+                    at -= 1;
+                    digits[at] += 1;
+                    if digits[at] < ALPHABET.len() {
+                        break;
+                    }
+                    digits[at] = 0;
+                    if at == 0 {
+                        at = usize::MAX;
+                        break;
+                    }
+                }
+                if at == usize::MAX {
+                    break;
+                }
+            }
+        }
+        assert!(checked > 100_000, "only {checked} bodies decoded");
+    }
 
     /// #3600: a JSON document has no merge key, so its mappings list `<<` as the ordinary key it
     /// is, where the same text read as YAML merges it in.

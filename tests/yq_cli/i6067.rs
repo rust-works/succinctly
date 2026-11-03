@@ -42,6 +42,7 @@ const ROWS: &[(&str, &str, &str)] = &[
     ("x\\\n\u{2028} y", "\"x\\u2028y\"\n", "x\u{2028}y\n"),
     ("p\\\n\n\\\n\n q", "\"p\\n\\nq\"\n", "p\n\nq\n"),
     ("p\\\n\n \\\n q", "\"p\\nq\"\n", "p\nq\n"),
+    ("x\\\n\n  ", "\"x\\n\"\n", "x\n\n"),
 ];
 
 #[test]
@@ -71,6 +72,27 @@ fn a_break_after_an_escaped_break_is_kept_in_nested_values() -> Result<()> {
         ("[.[]]", &["-o=json", "-I0"], "[\"z\\nx\",[\"p\\nq\",1],{\"k\":\"r \\n\\ns\"}]\n"),
         (".", &["-o=yaml"], "a: \"z\\nx\"\nb: [\"p\\nq\", 1]\nc: {k: \"r \\n\\ns\"}\n"),
         (".. | select(tag == \"!!str\")", &["-o=json", "-I0"], "\"z\\nx\"\n\"p\\nq\"\n\"r \\n\\ns\"\n"),
+    ];
+    for (filter, args, want) in rows {
+        let (out, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "{filter} {args:?}");
+        assert_eq!(out, *want, "{filter} {args:?}");
+    }
+    Ok(())
+}
+
+/// A key (an explicit `? key` entry, since an implicit key cannot span lines), a second document and
+/// `--eval-all`: every route that decodes a double-quoted scalar.
+#[test]
+fn a_break_after_an_escaped_break_is_kept_in_keys_and_documents() -> Result<()> {
+    let doc = "? \"k\\\n\n x\"\n: 1\n? \"m\\\n\n\n n\"\n: \"v\\\n\n w\"\n---\nb: \"q\\\n\n r\"\n";
+    let rows: &[(&str, &[&str], &str)] = &[
+        (".", &["-o=json", "-I0"], "{\"k\\nx\":1,\"m\\n\\nn\":\"v\\nw\"}\n{\"b\":\"q\\nr\"}\n"),
+        ("keys", &["-o=json", "-I0"], "[\"k\\nx\",\"m\\n\\nn\"]\n[\"b\"]\n"),
+        (".[]", &["-o=json", "-I0"], "1\n\"v\\nw\"\n\"q\\nr\"\n"),
+        (".", &["-o=yaml"], "? \"k\\nx\"\n: 1\n? \"m\\n\\nn\"\n: \"v\\nw\"\n---\nb: \"q\\nr\"\n"),
+        ("to_entries", &["-o=json", "-I0"], "[{\"key\":\"k\\nx\",\"value\":1},{\"key\":\"m\\n\\nn\",\"value\":\"v\\nw\"}]\n[{\"key\":\"b\",\"value\":\"q\\nr\"}]\n"),
+        ("[.]", &["--eval-all", "-o=json", "-I0"], "[{\"k\\nx\":1,\"m\\n\\nn\":\"v\\nw\"},{\"b\":\"q\\nr\"}]\n"),
     ];
     for (filter, args, want) in rows {
         let (out, code) = run_yq_stdin(filter, doc, args)?;
