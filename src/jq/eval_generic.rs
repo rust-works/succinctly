@@ -2470,7 +2470,9 @@ impl YqStringOp {
             | Builtin::MatchFlags(..)
             | Builtin::Capture(_)
             | Builtin::CaptureFlags(..) => Self::Match,
-            Builtin::AsciiUpcase | Builtin::AsciiDowncase => Self::ChangeCase,
+            Builtin::AsciiUpcase | Builtin::AsciiDowncase | Builtin::Upcase | Builtin::Downcase => {
+                Self::ChangeCase
+            }
             Builtin::Trim => Self::Trim,
             _ => return None,
         })
@@ -37730,6 +37732,8 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::Envsubst(_)
             | Builtin::AsciiDowncase
             | Builtin::AsciiUpcase
+            | Builtin::Downcase
+            | Builtin::Upcase
             | Builtin::Length
             | Builtin::Type
             | Builtin::ToEntries

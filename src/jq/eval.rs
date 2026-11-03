@@ -14032,7 +14032,13 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
 pub(crate) fn is_closed_unary_builtin(stage: &Expr) -> bool {
     matches!(
         unwrap_paren(stage),
-        Expr::Builtin(Builtin::Length | Builtin::AsciiDowncase | Builtin::AsciiUpcase)
+        Expr::Builtin(
+            Builtin::Length
+                | Builtin::AsciiDowncase
+                | Builtin::AsciiUpcase
+                | Builtin::Downcase
+                | Builtin::Upcase,
+        )
     ) || matches!(unwrap_paren(stage), Expr::Builtin(builtin) if is_unary_math_builtin(builtin))
 }
 
@@ -18265,6 +18271,8 @@ fn builtin_operand_is_input(builtin: &Builtin) -> bool {
             | Builtin::MaxBy(_)
             | Builtin::AsciiDowncase
             | Builtin::AsciiUpcase
+            | Builtin::Downcase
+            | Builtin::Upcase
             | Builtin::Ltrimstr(_)
             | Builtin::Rtrimstr(_)
             | Builtin::Startswith(_)
@@ -18547,6 +18555,8 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Phase 5: String Functions
         Builtin::AsciiDowncase => builtin_ascii_downcase::<W>(value, optional),
         Builtin::AsciiUpcase => builtin_ascii_upcase::<W>(value, optional),
+        Builtin::Downcase => builtin_unicode_case::<W>(value, optional, false),
+        Builtin::Upcase => builtin_unicode_case::<W>(value, optional, true),
         Builtin::Ltrimstr(s) => builtin_ltrimstr::<W, S>(s, value, optional),
         Builtin::Rtrimstr(s) => builtin_rtrimstr::<W, S>(s, value, optional),
         Builtin::Startswith(s) => builtin_startswith::<W, S>(s, value, optional),
@@ -20990,6 +21000,70 @@ fn builtin_ascii_upcase<W: Clone + AsRef<[u64]>>(
         // As `ascii_downcase`: jq defines both as `explode | map(…) | implode`,
         // so both report `explode`'s refusal.
         _ => QueryResult::Error(EvalError::new("explode input must be a string")),
+    }
+}
+
+/// Builtin: yq's `upcase`/`downcase` (#6091): each character through Go's simple case mapping,
+/// which is Rust's when that is one character and the character itself when it is not (`ß` has
+/// no single-character uppercase and stays); [`simple_case`] has the exceptions.
+fn builtin_unicode_case<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
+    optional: bool,
+    upper: bool,
+) -> QueryResult<'_, W> {
+    match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => {
+                let mapped: String = cow.chars().map(|c| simple_case(c, upper)).collect();
+                QueryResult::Owned(OwnedValue::String(mapped.into()))
+            }
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::new("explode input must be a string")),
+    }
+}
+
+/// Go's `unicode.ToUpper`/`ToLower` of `c`: the one-character mapping, else `c`.
+///
+/// Rust's `to_uppercase`/`to_lowercase` are the *full* mappings, which differ from Go's simple ones
+/// in three places, each checked against yq v4.53.3 over every printable BMP code point (#6091):
+/// the Greek letters with an iota subscript (`ᾀ`) have a simple uppercase (the titlecase letter
+/// `ᾈ`) and a two-character full one, and `İ` has a simple lowercase (`i`) and a two-character
+/// full one; and Go's tables are Unicode 15, so a pair Unicode 16 added (`ɤ`/`Ɤ`, `ƛ`/`Ƛ`, the
+/// Garay letters) maps neither way.
+fn simple_case(c: char, upper: bool) -> char {
+    let cp = c as u32;
+    if matches!(
+        cp,
+        0x19B | 0x264 | 0xA7CB..=0xA7CD | 0xA7DA..=0xA7DC | 0x10D50..=0x10D65 | 0x10D70..=0x10D85
+    ) {
+        return c;
+    }
+    if upper {
+        let titlecase = match cp {
+            0x1F80..=0x1F87 | 0x1F90..=0x1F97 | 0x1FA0..=0x1FA7 => Some(cp + 8),
+            0x1FB3 => Some(0x1FBC),
+            0x1FC3 => Some(0x1FCC),
+            0x1FF3 => Some(0x1FFC),
+            _ => None,
+        };
+        if let Some(mapped) = titlecase.and_then(char::from_u32) {
+            return mapped;
+        }
+    } else if cp == 0x130 {
+        return 'i';
+    }
+    let (first, second) = if upper {
+        let mut mapped = c.to_uppercase();
+        (mapped.next(), mapped.next())
+    } else {
+        let mut mapped = c.to_lowercase();
+        (mapped.next(), mapped.next())
+    };
+    match (first, second) {
+        (Some(single), None) => single,
+        _ => c,
     }
 }
 
@@ -38558,6 +38632,8 @@ fn builtin_yields_at_least_one_value(builtin: &Builtin) -> bool {
         | Builtin::ToNumber
         | Builtin::AsciiDowncase
         | Builtin::AsciiUpcase
+        | Builtin::Downcase
+        | Builtin::Upcase
         | Builtin::Sort
         | Builtin::Reverse
         | Builtin::Unique
@@ -38634,7 +38710,9 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::ToString
         | Builtin::ToNumber
         | Builtin::AsciiDowncase
-        | Builtin::AsciiUpcase => true,
+        | Builtin::AsciiUpcase
+        | Builtin::Downcase
+        | Builtin::Upcase => true,
         // `empty` yields zero, which the gate admits -- see
         // `resolves_to_at_most_one_path`'s doc comment on the zero-path case.
         Builtin::Empty => true,
@@ -53050,6 +53128,8 @@ fn live_path_refusal(expr: &Expr) -> Option<RefusalShape> {
             | Builtin::GsubFlags(_, _, _)
             | Builtin::AsciiDowncase
             | Builtin::AsciiUpcase
+            | Builtin::Downcase
+            | Builtin::Upcase
             | Builtin::Match(_)
             | Builtin::MatchFlags(_, _)
             | Builtin::Scan(_)

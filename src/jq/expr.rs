@@ -3544,6 +3544,11 @@ pub enum Builtin {
     AsciiDowncase,
     /// `ascii_upcase` - uppercase ASCII characters
     AsciiUpcase,
+    /// yq's `downcase` - lowercase by Go's simple Unicode case mapping (#6091); jq has no such
+    /// builtin, its `ascii_downcase` stays ASCII.
+    Downcase,
+    /// yq's `upcase` - uppercase by Go's simple Unicode case mapping (#6091).
+    Upcase,
     /// `ltrimstr(s)` - remove prefix s
     Ltrimstr(Box<Expr>),
     /// `rtrimstr(s)` - remove suffix s
