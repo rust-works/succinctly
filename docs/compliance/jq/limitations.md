@@ -494,13 +494,13 @@ What remains, recorded here:
   rows (a multiply-add recurrence over `j0`/`j1`) were reduced to their `n = 0, ±1`
   cases plus the order rules as equalities, since no AArch64 Linux host was available to
   measure them on.
-  **Ubuntu 26.04's glibc is a fifth libm** (#5878).
-  It moves last digits in both cases, as the failing CI runs of #5878 show: `tgamma` prints `-3.544907701811032` where the golden has `-3.5449077018110318`, and `lgamma` prints `12.801827480081469` where the golden has `12.80182748008147`.
-  Whether a jq 1.7.1 built on that image prints the same new digits has not been measured yet; that is the first step of un-pinning.
-  `asinh`, `acosh` and the sign `lgamma_r` reports at a pole move too.
-  Every x86_64 Linux CI job is pinned to `ubuntu-24.04` for that reason.
+  **Ubuntu 26.04's glibc (2.43) is a fifth libm** (#5878, #5926).
+  It moves last digits in both cases, as the failing CI runs of #5878 show: `tgamma` printed `-3.544907701811032` where the golden had `-3.5449077018110318`, and `lgamma` printed `12.801827480081469` where the golden had `12.80182748008147`.
+  A jq 1.7.1 built on that image prints exactly what succinctly prints there, for both cases in full (the jq needs `-std=gnu17` and the system Oniguruma to build under GCC 15), so the difference is the libm's and not succinctly's.
+  The inputs 26.04 prints differently left the goldens, as AArch64's did: `tgamma(-0.5)`, `lgamma` at 10 and 100, `lgamma_r` at -1 (the sign it reports at the pole), 10 and 100, `erf(0.25)`, `erfc(3)`, two of `asinh`'s four points and one of `acosh`'s.
+  Both goldens hold on Apple, glibc 2.35, 2.39 and 2.43 now, and the whole test suite passes on a 26.04 runner.
+  The x86_64 Linux CI jobs are still pinned to `ubuntu-24.04`, no longer for the goldens: the perf guard (valgrind), coverage and release jobs have not been run on 26.04.
   `scripts/test_ci_runner_pin.py` fails if one is moved to `ubuntu-latest`.
-  Un-pinning means re-sweeping with `scripts/jq-libm-oracle-sweep.sh` against a jq 1.7.1 built on the new image, then dropping the rows the libms disagree on, as was done for AArch64.
 
 ## Behaviour and parser gaps
 
