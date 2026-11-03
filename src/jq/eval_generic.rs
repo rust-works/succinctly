@@ -2470,7 +2470,9 @@ impl YqStringOp {
             | Builtin::MatchFlags(..)
             | Builtin::Capture(_)
             | Builtin::CaptureFlags(..) => Self::Match,
-            Builtin::AsciiUpcase | Builtin::AsciiDowncase => Self::ChangeCase,
+            Builtin::AsciiUpcase | Builtin::AsciiDowncase | Builtin::Upcase | Builtin::Downcase => {
+                Self::ChangeCase
+            }
             Builtin::Trim => Self::Trim,
             _ => return None,
         })
@@ -37589,11 +37591,10 @@ fn owned_identity_ancestor<V: DocumentValue>(
 /// evaluator, exactly as before, so an unlisted builtin can only cost the
 /// migration, never an answer. Every entry is an oracle capture (see
 /// [`OwnedIdentity`]); a builtin real yq's lexer rejects (`add`, `explode`)
-/// has no row to match and is deliberately absent. `Builtin::AsciiDowncase`/
-/// `AsciiUpcase` do have a row below despite the name -- they're reached by
-/// real yq's own `downcase`/`upcase` spellings, not just the jq-only
-/// `ascii_downcase`/`ascii_upcase` ones gated behind `--jq-extensions`
-/// (#2462).
+/// has no row to match and is deliberately absent. `Builtin::Downcase`/`Upcase`
+/// are real yq's own `downcase`/`upcase` (#2462, #6091); `AsciiDowncase`/
+/// `AsciiUpcase` are the jq-only spellings gated behind `--jq-extensions`, and
+/// have a row too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum OwnedIdentityRule {
     /// The output stands where the input stood: `to_entries`, `sort`,
@@ -37730,6 +37731,8 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::Envsubst(_)
             | Builtin::AsciiDowncase
             | Builtin::AsciiUpcase
+            | Builtin::Downcase
+            | Builtin::Upcase
             | Builtin::Length
             | Builtin::Type
             | Builtin::ToEntries

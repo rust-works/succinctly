@@ -673,6 +673,8 @@ fn is_surely_single_valued(expr: &Expr) -> bool {
             | Builtin::Type
             | Builtin::AsciiDowncase
             | Builtin::AsciiUpcase
+            | Builtin::Downcase
+            | Builtin::Upcase
             | Builtin::Floor
             | Builtin::Ceil
             | Builtin::Round,
@@ -7234,11 +7236,11 @@ impl<'a> Parser<'a> {
         // (falls through to jq's own "downcase/0 is not defined") (#2462).
         if self.mode == ParserMode::Yq && self.matches_keyword("downcase") {
             self.consume_keyword("downcase");
-            return Ok(Some(Builtin::AsciiDowncase));
+            return Ok(Some(Builtin::Downcase));
         }
         if self.mode == ParserMode::Yq && self.matches_keyword("upcase") {
             self.consume_keyword("upcase");
-            return Ok(Some(Builtin::AsciiUpcase));
+            return Ok(Some(Builtin::Upcase));
         }
         // `sort_keys(f)` is a real yq v4.53.3 builtin with no jq equivalent
         // (jq 1.7.1 also reports "sort_keys/1 is not defined") -- the same

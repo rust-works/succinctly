@@ -67,7 +67,7 @@ pub enum BuiltinKids<'a> {
 /// is paid silently and repeatedly by everyone downstream.
 pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
     match builtin {
-        // --- No sub-expression (126) ---------------------------------------
+        // --- No sub-expression (128) ---------------------------------------
         Builtin::SortKeysOneLevel
         | Builtin::Type
         | Builtin::IsNull
@@ -97,6 +97,8 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::Max
         | Builtin::AsciiDowncase
         | Builtin::AsciiUpcase
+        | Builtin::Downcase
+        | Builtin::Upcase
         | Builtin::First
         | Builtin::Last
         | Builtin::Reverse
@@ -385,7 +387,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
 /// sub-expression-carrying arms at all.
 pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr) -> Builtin {
     match builtin {
-        // --- No sub-expression (126) ---------------------------------------
+        // --- No sub-expression (128) ---------------------------------------
         Builtin::SortKeysOneLevel
         | Builtin::Type
         | Builtin::IsNull
@@ -415,6 +417,8 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         | Builtin::Max
         | Builtin::AsciiDowncase
         | Builtin::AsciiUpcase
+        | Builtin::Downcase
+        | Builtin::Upcase
         | Builtin::First
         | Builtin::Last
         | Builtin::Reverse
@@ -1758,6 +1762,8 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
             | Builtin::MaxBy(_)
             | Builtin::AsciiDowncase
             | Builtin::AsciiUpcase
+            | Builtin::Downcase
+            | Builtin::Upcase
             | Builtin::Ltrimstr(_)
             | Builtin::Rtrimstr(_)
             | Builtin::Startswith(_)
@@ -2115,6 +2121,8 @@ fn node_reads_ambient(node: &Expr) -> bool {
             | Builtin::MaxBy(_)
             | Builtin::AsciiDowncase
             | Builtin::AsciiUpcase
+            | Builtin::Downcase
+            | Builtin::Upcase
             | Builtin::Ltrimstr(_)
             | Builtin::Rtrimstr(_)
             | Builtin::Startswith(_)

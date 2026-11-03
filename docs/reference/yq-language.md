@@ -393,8 +393,8 @@ succinctly yq --jq-extensions --eval-all '[.] | reduce .[] as $item ({}; . * $it
 | `parent(n)`    | Return nth parent node                       | `parent(2)`                     |
 | `parents`      | The node's ancestors, nearest first          | `.a.b[1].c \| parents`          |
 | `root`         | The document's root node (`parent(-1)`)      | `.a.b[1].c \| root`             |
-| `downcase`     | Lowercase ASCII characters                   | `"HELLO" \| downcase`           |
-| `upcase`       | Uppercase ASCII characters                   | `"hello" \| upcase`             |
+| `downcase`     | Lowercase (Unicode simple mapping)           | `"HELLO" \| downcase`           |
+| `upcase`       | Uppercase (Unicode simple mapping)           | `"hello" \| upcase`             |
 | `sort_keys(f)` | Sort a mapping's own keys, shallow (yq only) | `sort_keys(.)`                  |
 
 `succinctly yq` accepts the other spellings of an operator that yq's lexer does (#6078): `lineComment`, `headComment` and `footComment`; `documentIndex`; `fileName`/`file_name` and `fileindex`; `splitDoc`; `mapvalues`, `groupby`, `sortby`, `uniqueby` and `sortkeys`; `toentries`/`toEntries`, `fromentries`/`fromEntries` and `withentries`/`withEntries`; `fromunix` and `tounix`; and the spellings of `array_to_map` without one or both underscores. They are yq mode only: `succinctly jq 'groupby(.)'` is an undefined function.
