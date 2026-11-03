@@ -44691,7 +44691,7 @@ fn key_to_path_component<S: EvalSemantics>(
                 return Err(EvalError::cannot_index(owned_type_name(container), key));
             }
             match numeric_key_to_index(key) {
-                Some(idx) => Ok(numeric_path_component(idx, key)),
+                Some(idx) => Ok(numeric_path_component::<S>(idx, key)),
                 // #5245: jq names the NaN element in a path (`path(.[nan])` is `[null]`) and
                 // refuses only the write that reaches it, so the component carries the key as
                 // it is and each write step raises `Cannot set array element at NaN index`.
@@ -44762,11 +44762,14 @@ fn descriptor_path_component<S: EvalSemantics>(
 /// preservation, and succinctly's arithmetic already collapses
 /// `NumberLiteral` to plain `Float` for exactly the same reason. A negative
 /// float arriving from *data* keeps its spelling in both.
-fn numeric_path_component(idx: i64, key: &OwnedValue) -> Expr {
-    Expr::Index {
-        idx,
-        key: number_key_for(key),
-    }
+fn numeric_path_component<S: EvalSemantics>(idx: i64, key: &OwnedValue) -> Expr {
+    // #6049: a `-0` literal key is `-0` in jq's path, the one integer literal
+    // whose sign lives only in its spelling. yq's path says `0`.
+    let key = number_key_for(key).or_else(|| {
+        (S::TAG != EvalTag::Yq && is_negative_zero_int_literal(key))
+            .then_some(NumberKey::Float(-0.0))
+    });
+    Expr::Index { idx, key }
 }
 
 /// The [`NumberKey`] a resolved numeric value should preserve in `path()`
@@ -101816,7 +101819,7 @@ impl PatternKey<'_> {
                     // contract); `i64::MAX` is a guaranteed-out-of-range
                     // position `child` resolves to `null`, not a real one.
                     let idx = numeric_key_to_index(key).unwrap_or(i64::MAX);
-                    Ok(numeric_path_component(idx, key))
+                    Ok(numeric_path_component::<S>(idx, key))
                 }
                 // #3300: a slice descriptor, as `.[k]`'s own path step
                 // spells it.
