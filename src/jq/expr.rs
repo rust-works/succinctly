@@ -1554,6 +1554,15 @@ impl SharedArg {
     /// per call: read off the run's own remembered answer, it is not walked
     /// again. A run is evaluated as the stages it holds, so its answer is
     /// theirs; an argument's is not, and is walked as before.
+    /// A kept run of `stages` (#5441), as a tail plan builds one, for the tests that need a stage
+    /// that is one.
+    #[cfg(test)]
+    pub(crate) fn kept_run(stages: PipeStages) -> Self {
+        let mut arg = Self::new(Expr::Pipe(stages));
+        arg.run = true;
+        arg
+    }
+
     pub(crate) fn run_stages(&self) -> Option<&PipeStages> {
         match &self.expr {
             Expr::Pipe(stages) if self.run => Some(stages),
@@ -2604,6 +2613,16 @@ impl PipeStages {
             split.tails.origin = Some((Weak::clone(table), base + from + first - 1));
         }
         Some(split)
+    }
+
+    /// The shared storage this pipe's stages are in, and where in it they start (#5488, #5488
+    /// slice 2): `None` for a pipe that owns its stages. Every view of one storage answers with
+    /// the same `Rc`, so what is worked out about the storage once is the answer for each of them.
+    pub(crate) fn shared_view(&self) -> Option<(&Rc<Vec<Expr>>, usize)> {
+        match &self.storage {
+            Storage::Shared { stages, start } => Some((stages, *start as usize)),
+            Storage::Own(_) => None,
+        }
     }
 
     /// A pipe of `stages`, some of this pipe's own, that starts with every `false` this pipe has

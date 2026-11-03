@@ -3535,11 +3535,161 @@ pub(crate) fn pipe_needs_path_context(stages: &PipeStages) -> bool {
 /// replaces, stopped at the first hit as that walk was, so a pipe that holds
 /// the node pays no more than it did and one that does not pays once.
 pub(crate) fn pipe_holds_tracked_var(stages: &PipeStages) -> bool {
-    stages.holds_tracked_var_or_init(|stages| {
-        stages.iter().any(|stage| match kept_run_of(stage) {
-            Some(run) => kept_run_answers(run, pipe_holds_tracked_var),
-            None => any_subexpr(stage, &mut |e| matches!(e, Expr::TrackedVar(_))),
+    stages.holds_tracked_var_or_init(|tail| {
+        let scanned = tail.len().min(FACT_SCAN_STAGES);
+        if tail[..scanned].iter().any(stage_holds_tracked_var) {
+            return true;
+        }
+        if scanned == tail.len() {
+            return false;
+        }
+        #[cfg(feature = "std")]
+        if let Some((storage, start)) = stages.shared_view() {
+            return storage_facts(storage).tracked_end(storage) > start;
+        }
+        tail[scanned..].iter().any(stage_holds_tracked_var)
+    })
+}
+
+/// Whether `stage` holds a node [`pipe_holds_tracked_var`] looks for, a kept run asked as the pipe
+/// it stands for.
+fn stage_holds_tracked_var(stage: &Expr) -> bool {
+    match kept_run_of(stage) {
+        Some(run) => kept_run_answers(run, pipe_holds_tracked_var),
+        None => any_subexpr(stage, &mut |e| matches!(e, Expr::TrackedVar(_))),
+    }
+}
+
+/// How many leading stages of a pipe are scanned for a fact before the facts of the storage it
+/// is a view of are worked out instead (#5488, third step): a pipe that holds the node early pays
+/// what it did, and only a long one whose hit is late, or whose answer is `true` at its end,
+/// takes the facts.
+const FACT_SCAN_STAGES: usize = 8;
+
+/// What is true of the stages of one shared storage ([`PipeStages::shared_view`]), each fact worked
+/// out the first time it is asked and answered for every view of it (#5488, third step). A body that
+/// reads its variable late, with stages in front that are not arithmetic, is a pipe of `n` stages
+/// that each of its `n` tails is a view of; each tail asked the walk below for the marker at its
+/// end, which was `n` walks of up to `n` stages per value.
+///
+/// Each fact is the last stage that holds something, so it is looked for from the end of the
+/// storage: a body that holds the node in its last stage answers at once, and one that never does
+/// is walked once, as the scan of its first view was.
+#[cfg(feature = "std")]
+struct StorageFacts {
+    /// Weak, so that the address this is keyed by cannot be taken by another storage while the
+    /// entry lives: the allocation is held until the entry is dropped.
+    storage: alloc::rc::Weak<Vec<Expr>>,
+    /// One past the last stage that holds a marker, 0 when none does.
+    tracked_end: core::cell::OnceCell<usize>,
+    /// One past the last stage that holds a node that can start a resolver invocation.
+    resolver_end: core::cell::OnceCell<usize>,
+    /// The index of every stage that holds an `Expr::TrackedVar`. Not the markers themselves: a
+    /// marker carries the value it was bound to, which an entry that outlives the run would keep.
+    marker_stages: core::cell::OnceCell<Vec<usize>>,
+}
+
+#[cfg(feature = "std")]
+impl StorageFacts {
+    fn of(storage: &Rc<Vec<Expr>>) -> Self {
+        #[cfg(all(test, feature = "std"))]
+        STORAGE_FACTS_BUILT.with(|n| n.set(n.get() + 1));
+        Self {
+            storage: Rc::downgrade(storage),
+            tracked_end: core::cell::OnceCell::new(),
+            resolver_end: core::cell::OnceCell::new(),
+            marker_stages: core::cell::OnceCell::new(),
+        }
+    }
+
+    /// One past the last stage of `storage`, which this was made for, that holds a marker.
+    fn tracked_end(&self, storage: &Rc<Vec<Expr>>) -> usize {
+        *self.tracked_end.get_or_init(|| {
+            #[cfg(all(test, feature = "std"))]
+            STORAGE_FACT_WALKS.with(|n| n.set(n.get() + 1));
+            storage
+                .iter()
+                .rposition(|stage| any_subexpr(stage, &mut |e| matches!(e, Expr::TrackedVar(_))))
+                .map_or(0, |last| last + 1)
         })
+    }
+
+    /// One past the last stage of `storage` that holds a node that can start a resolver invocation.
+    fn resolver_end(&self, storage: &Rc<Vec<Expr>>) -> usize {
+        *self.resolver_end.get_or_init(|| {
+            #[cfg(all(test, feature = "std"))]
+            STORAGE_FACT_WALKS.with(|n| n.set(n.get() + 1));
+            storage
+                .iter()
+                .rposition(|stage| any_subexpr(stage, &mut may_enter_resolver_node))
+                .map_or(0, |last| last + 1)
+        })
+    }
+
+    /// The stages of `storage` that hold a marker, in order.
+    fn marker_stages(&self, storage: &Rc<Vec<Expr>>) -> &[usize] {
+        self.marker_stages.get_or_init(|| {
+            #[cfg(all(test, feature = "std"))]
+            STORAGE_FACT_WALKS.with(|n| n.set(n.get() + 1));
+            // Only the stages up to the last that holds one are walked.
+            storage
+                .iter()
+                .enumerate()
+                .take(self.tracked_end(storage))
+                .filter(|(_, stage)| any_subexpr(stage, &mut |e| matches!(e, Expr::TrackedVar(_))))
+                .map(|(index, _)| index)
+                .collect()
+        })
+    }
+}
+
+// How many `StorageFacts` this thread made, and how many walks of a storage they made, for the
+// tests that pin the work to once per storage (#5488, third step).
+#[cfg(all(test, feature = "std"))]
+std::thread_local! {
+    static STORAGE_FACTS_BUILT: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static STORAGE_FACT_WALKS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// How many storages' facts [`storage_facts`] keeps: the one a body's tails are views of, and a
+/// few that the stages themselves run through.
+#[cfg(feature = "std")]
+const STORAGE_FACTS_KEPT: usize = 8;
+
+/// The facts of `storage`, from the entries kept on this thread or worked out and kept.
+#[cfg(feature = "std")]
+fn storage_facts(storage: &Rc<Vec<Expr>>) -> Rc<StorageFacts> {
+    use std::cell::RefCell;
+    std::thread_local! {
+        static FACTS: RefCell<Vec<Rc<StorageFacts>>> = const { RefCell::new(Vec::new()) };
+    }
+    let key = Rc::as_ptr(storage);
+    // The entries are in the order they were last used, the most recent last, so that the storages a
+    // body is run down stay while a long stage's own pipes come and go.
+    let lookup = |facts: &mut Vec<Rc<StorageFacts>>| {
+        let at = facts
+            .iter()
+            .position(|facts| facts.storage.as_ptr() == key)?;
+        let hit = facts.remove(at);
+        facts.push(Rc::clone(&hit));
+        Some(hit)
+    };
+    if let Some(kept) = FACTS.with(|facts| lookup(&mut facts.borrow_mut())) {
+        return kept;
+    }
+    FACTS.with(|facts| {
+        let mut facts = facts.borrow_mut();
+        // `of` walks nothing, so nothing was asked for while it ran; looked up again all the same,
+        // so that an entry is never made twice for one storage.
+        if let Some(kept) = lookup(&mut facts) {
+            return kept;
+        }
+        if facts.len() == STORAGE_FACTS_KEPT {
+            facts.remove(0);
+        }
+        let built = Rc::new(StorageFacts::of(storage));
+        facts.push(Rc::clone(&built));
+        built
     })
 }
 
@@ -3571,12 +3721,29 @@ fn kept_run_answers(run: &PipeStages, fact: fn(&PipeStages) -> bool) -> bool {
 /// A kept run is asked for its stages, not counted as the `Shared` around them
 /// (#5441): it is evaluated as those stages.
 pub(crate) fn pipe_holds_resolver_node(stages: &PipeStages) -> bool {
-    stages.holds_resolver_node_or_init(|stages| {
-        stages.iter().any(|stage| match kept_run_of(stage) {
-            Some(run) => kept_run_answers(run, pipe_holds_resolver_node),
-            None => any_subexpr(stage, &mut may_enter_resolver_node),
-        })
+    stages.holds_resolver_node_or_init(|tail| {
+        let scanned = tail.len().min(FACT_SCAN_STAGES);
+        if tail[..scanned].iter().any(stage_holds_resolver_node) {
+            return true;
+        }
+        if scanned == tail.len() {
+            return false;
+        }
+        #[cfg(feature = "std")]
+        if let Some((storage, start)) = stages.shared_view() {
+            return storage_facts(storage).resolver_end(storage) > start;
+        }
+        tail[scanned..].iter().any(stage_holds_resolver_node)
     })
+}
+
+/// Whether `stage` holds a node [`pipe_holds_resolver_node`] looks for, a kept run asked as the
+/// pipe it stands for.
+fn stage_holds_resolver_node(stage: &Expr) -> bool {
+    match kept_run_of(stage) {
+        Some(run) => kept_run_answers(run, pipe_holds_resolver_node),
+        None => any_subexpr(stage, &mut may_enter_resolver_node),
+    }
 }
 
 /// Whether the stages of a pipe hold an `Expr::As`, remembered on the pipe
@@ -45603,6 +45770,23 @@ fn reentry_can_observe(expr: &Expr, rewrite: &dyn Fn(&Tracked) -> Option<Origin>
     if let Expr::Pipe(stages) = expr {
         if !pipe_holds_tracked_var(stages) || !pipe_holds_resolver_node(stages) {
             return false;
+        }
+        // The pipe holds both halves, so only whether a marker is one `rewrite` changes is left to
+        // ask, and the markers of a view are known (#5488, third step): walking its stages for them
+        // was a walk to its last stage for each of its tails when that is where the variable is read.
+        #[cfg(feature = "std")]
+        if stages.len() > FACT_SCAN_STAGES {
+            if let Some((storage, start)) = stages.shared_view() {
+                let facts = storage_facts(storage);
+                let marked = facts.marker_stages(storage);
+                let from = marked.partition_point(|index| *index < start);
+                return marked[from..].iter().any(|&index| {
+                    any_subexpr(
+                        &storage[index],
+                        &mut |e| matches!(e, Expr::TrackedVar(marker) if rewrite(marker).is_some()),
+                    )
+                });
+            }
         }
     }
     // One walk for both questions: this runs once per re-entry, which on a
@@ -119202,6 +119386,146 @@ mod tests {
         assert!(
             more <= 36 * 4 * 51,
             "36 more values cloned {more} stages, so each tail past the call was copied again"
+        );
+    }
+
+    /// The walk [`reentry_can_observe`] made before it asked a view's storage for its markers
+    /// (#5488, third step), kept here as the reference the facts must answer as.
+    fn reentry_can_observe_by_walking(
+        expr: &Expr,
+        rewrite: &dyn Fn(&Tracked) -> Option<Origin>,
+    ) -> bool {
+        let (mut rewritable, mut resolver) = (false, false);
+        any_subexpr(expr, &mut |e| {
+            rewritable |= matches!(e, Expr::TrackedVar(marker) if rewrite(marker).is_some());
+            resolver |= may_enter_resolver_node(e);
+            false
+        });
+        rewritable && resolver
+    }
+
+    /// #5488, third step: what a view of a shared storage answers about its markers and resolver
+    /// nodes, from the facts worked out once for the storage, is what the stages answer one by one
+    /// -- for every view of pipes longer than the stages scanned first, wherever the marker and the
+    /// resolver node are (or are not), whether they sit in a stage of their own or in a kept run
+    /// (#5441), and whether or not the rewrite changes the marker.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_storage_facts_answer_as_the_stages_do_for_every_view_5488() {
+        let marker = Expr::TrackedVar(Rc::new(Tracked {
+            value: OwnedValue::Int(1),
+            origin: Origin::Untracked,
+            node: None,
+            fold_share: false,
+        }));
+        let resolver = parse("keys").unwrap();
+        let plain = parse(". + 1").unwrap();
+        assert!(may_enter_resolver_node(&resolver));
+        // The node as a stage, and inside a kept run, which the stage-by-stage answer asks as the
+        // pipe it stands for and the facts walk into.
+        let in_run = |node: &Expr| {
+            Expr::Shared(Rc::new(SharedArg::kept_run(PipeStages::from(vec![
+                plain.clone(),
+                node.clone(),
+            ]))))
+        };
+        let mut checked = 0;
+        for len in [FACT_SCAN_STAGES + 1, FACT_SCAN_STAGES + 4, 24] {
+            for tracked_at in [None, Some(0), Some(len / 2), Some(len - 1)] {
+                for resolver_at in [None, Some(1), Some(len - 2)] {
+                    for kept in [false, true] {
+                        if tracked_at == resolver_at {
+                            continue;
+                        }
+                        let mut stages = vec![plain.clone(); len];
+                        if let Some(at) = tracked_at {
+                            stages[at] = if kept {
+                                in_run(&marker)
+                            } else {
+                                marker.clone()
+                            };
+                        }
+                        if let Some(at) = resolver_at {
+                            stages[at] = if kept {
+                                in_run(&resolver)
+                            } else {
+                                resolver.clone()
+                            };
+                        }
+                        let owner = PipeStages::from(stages).tail_copy(1, |_| 0, |_| 0);
+                        assert!(owner.shared_view().is_some(), "a shareable copy");
+                        for from in 0..owner.len() - 1 {
+                            let expr = Expr::Pipe(owner.tail_copy(from, |_| 0, |_| 0));
+                            let Expr::Pipe(view) = &expr else {
+                                unreachable!()
+                            };
+                            let context = format!(
+                                "{len} stages, marker {tracked_at:?}, resolver {resolver_at:?}, \
+                                 kept {kept}, from {from}"
+                            );
+                            assert_eq!(
+                                pipe_holds_tracked_var(view),
+                                view.iter().any(stage_holds_tracked_var),
+                                "tracked: {context}"
+                            );
+                            assert_eq!(
+                                pipe_holds_resolver_node(view),
+                                view.iter().any(stage_holds_resolver_node),
+                                "resolver: {context}"
+                            );
+                            for (name, changes) in [("rewritten", true), ("kept", false)] {
+                                let rewrite = |_: &Tracked| changes.then_some(Origin::Untracked);
+                                assert_eq!(
+                                    reentry_can_observe(&expr, &rewrite),
+                                    reentry_can_observe_by_walking(&expr, &rewrite),
+                                    "{name}: {context}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 1_000, "the grid was walked: {checked}");
+    }
+
+    /// #5488, third step: a body that reads its variable in its last stage, behind stages that are
+    /// not arithmetic, has what its pipe holds worked out once per body, not once per tail: 20 more
+    /// values of an 80-stage body make a few storages and a few walks of each, where each of the 79
+    /// tails per value was a walk of up to 79 stages. The pin counts storages and walks, not time.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_a_read_last_body_works_out_what_its_pipe_holds_once_per_storage_5488() {
+        let stages = [vec!["[.][0]"; 79], vec![". + $x"]].concat().join(" | ");
+        let program = |values: usize| {
+            let built = STORAGE_FACTS_BUILT.with(core::cell::Cell::get);
+            let walks = STORAGE_FACT_WALKS.with(core::cell::Cell::get);
+            let run = run_owned_pipe_program::<JqSemantics>(
+                &format!("[range(0;{values}) | . as $x | ({stages})] | length"),
+                b"null",
+            );
+            assert_eq!(run.output, values.to_string());
+            (
+                STORAGE_FACTS_BUILT.with(core::cell::Cell::get) - built,
+                STORAGE_FACT_WALKS.with(core::cell::Cell::get) - walks,
+            )
+        };
+        let ((built_few, walks_few), (built_many, walks_many)) = (program(4), program(24));
+        let (built, walks) = (
+            built_many.saturating_sub(built_few),
+            walks_many.saturating_sub(walks_few),
+        );
+        // A bounded number of storages per value, whatever the body's length ...
+        assert!(
+            built <= 20 * 4,
+            "20 more values made {built} storages' facts: they are worked out per tail"
+        );
+        // ... and each fact of one is a walk made once (three kinds: the last marker, the last
+        // resolver node and the stages that hold a marker).
+        assert!(
+            walks <= built * 3,
+            "{built} storages were walked {walks} times: a fact is worked out per ask"
         );
     }
 
