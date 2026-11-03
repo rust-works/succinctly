@@ -204,7 +204,10 @@ jobs:
     needs: gate
     # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
     if: needs.gate.outputs.retest != 'false'
-    runs-on: ubuntu-24.04
+    # #5926: the first x86_64 job off the ubuntu-24.04 pin. The suite passes on 26.04 (glibc 2.43)
+    # once the libm goldens stopped pinning digits that libm moves, and these legs are what keep it
+    # passing there. The jobs below stay on 24.04 until each has run on 26.04 (the pin test lists them).
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -801,9 +804,9 @@ jobs:
       - name: coverage-shards.py self-tests
         run: python3 scripts/test_coverage_shards.py -v
 
-      # #5878: pins every x86_64 Linux runner to ubuntu-24.04 until the perf guard, coverage and
-      # release jobs are verified on 26.04 (the jq libm goldens already hold there, #5926); a
-      # runner-image move then has to edit that test, not happen silently.
+      # #5878: pins every x86_64 Linux runner but the test matrix to ubuntu-24.04 until the perf
+      # guard, coverage and release jobs are verified on 26.04 (the jq libm goldens already hold
+      # there, #5926); a runner-image move then has to edit that test, not happen silently.
       - name: ci-runner-pin self-tests
         run: python3 scripts/test_ci_runner_pin.py -v
 
