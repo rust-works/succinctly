@@ -926,17 +926,32 @@ mod tests {
             program: "true".into(),
             prefix: vec![],
         };
+        // A stub written a moment ago can fail to exec with ETXTBSY: another test's `fork` in
+        // this binary inherits the stub's write descriptor until that child's own `exec` closes
+        // it (#5970). `ir_once` reports the failed spawn as no count, so a stub expected to
+        // count is run again; a rename into place would not help, the inode is the same.
+        let counted = |valgrind: &Path| {
+            let mut got = None;
+            for _ in 0..100 {
+                got = ir_once(valgrind, &tool, &[], &dir);
+                if got.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            got
+        };
         let ok = stub(
             "ok",
             &format!("{log}\necho '==1== I   refs:      42' > \"$f\""),
         );
-        assert_eq!(ir_once(&ok, &tool, &[], &dir), Some(42));
+        assert_eq!(counted(&ok), Some(42));
         // The traced program's own non-zero exit passes through valgrind; its count is valid.
         let failing = stub(
             "failing",
             &format!("{log}\necho '==1== I   refs:      42' > \"$f\"\nexit 1"),
         );
-        assert_eq!(ir_once(&failing, &tool, &[], &dir), Some(42));
+        assert_eq!(counted(&failing), Some(42));
         let silent = stub("silent", "exit 0");
         assert_eq!(ir_once(&silent, &tool, &[], &dir), None);
         assert_eq!(ir_once(&dir.join("absent"), &tool, &[], &dir), None);
