@@ -7548,7 +7548,7 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   Pinned by `test_a_repeated_empty_group_keeps_its_old_search_5530`.
 - **A group that iterates over the empty string is read differently, with or without a flag.**
   Oniguruma stops a loop after an iteration that matched nothing and keeps that iteration: `"a" | match("(a*)*")` has `[1,0,""]` for group 1, and `"bcba" | match("b(c|(|.))*")` is `"bc"`.
-  The `regex` crate keeps the last non-empty iteration (`[0,1,"a"]`) and `"bcba"`.
+  The `regex` crate kept the last non-empty iteration (`[0,1,"a"]`) until such a loop was rewritten to end with its empty iteration (#6069, the entry below), and it still matches `"bcba"` (#6106).
   `fancy-regex` reports the empty iteration as jq does for the captures, so `"a" | match("(a*)*";"n")` now agrees, but it backtracks out of an empty iteration to a longer match, so `"bcba" | match("b(c|(|.))*";"n")` is still `"bcba"`.
   A repeated group with an empty alternative and `n` is another shape: `"ab" | match("(((b)|(|a))){2}";"n")` is `"ab"` in jq, `"a"` here and `"b"` before.
   This predates `l` and `n`, which only move a pattern to the other route.
@@ -7573,33 +7573,32 @@ exists for the two-sided check to pin, the same caveat
 [ADR-0018](../../adrs/adr-0018.md)'s Consequences already record for
 [yq Limitations](../yq/limitations.md).
 
-## A capture under an unbounded repeat keeps its last non-empty iteration (#6069)
+## A capture under an unbounded repeat on the `fancy-regex` route keeps its last non-empty iteration (#6069)
 
-Oniguruma tries one more iteration after the last non-empty one of an unbounded repeat (`*`, `+`, or `{0,}` and `{1,}`, which spell them).
-When the group's body can match the empty string there, it records that empty match.
-`"ab" | match("(a*)*b").captures[0]` is `{"offset":1,"length":0,"string":"","name":null}` in jq 1.7.1, and `{"offset":0,"length":1,"string":"a","name":null}` here.
-The matched text, its offsets and every other capture agree.
-Only a group whose body can match empty and sits under `*` or `+` differs:
+Oniguruma ends a greedy unbounded repeat (`*`, `+`, `{0,}` or `{1,}`) whose body can match empty with an iteration that matches empty, and a group in the body keeps that iteration.
+`"ab" | match("(a*)*b").captures[0]` is `[1,0,""]` in jq 1.7.1 (a capture is shown as `[offset, length, string]`).
+The `regex` crate never makes an empty iteration, and reported the last non-empty one, `[0,1,"a"]`.
+Since #6069 such a repeat is rewritten before the crate compiles it (`src/jq/onig_loop.rs`).
+`X*` becomes the loop followed by a copy of `X` whose characters, classes and `.` never match, so the copy is the empty last iteration, and each group reads the last of its copies that the match set.
+That also covers a group nested in the body, which keeps what an earlier iteration captured as in jq (`"abc" | match("((a)|b*)*c")` has `(a)` at `[0,1,"a"]`).
+It covers a body that tries the empty match first (`(a??)*b`), and a loop that gives characters back to the rest of the pattern (`"aab" | match("(a*)*ab")` is `[1,0,""]`).
+A differential fuzz of 18,000 random patterns (named groups, the `i`, `s`, `x` and `g` flags, `^`, `$` and `\b`) against jq 1.7.1 found none that the rewrite made wrong.
 
-- `match("(a*)*b")` over `"ab"`: jq `[1,0,""]`, here `[0,1,"a"]`.
-- `match("(a*)+b")` over `"aab"`: jq `[2,0,""]`, here `[0,2,"aa"]`.
-- `match("(a?)*b")` over `"ab"`: jq `[1,0,""]`, here `[0,1,"a"]`.
-- `match("(a|b*)*c")` over `"abc"`: jq `[2,0,""]`, here `[1,1,"b"]`.
-- `match("(\\w*\\s*)*$")` over `"ab cd"`: jq `[5,0,""]`, here `[3,2,"cd"]`.
-- `capture("(?<x>a*)*b")` over `"aab"`: jq `{"x":""}`, here `{"x":"aa"}`.
-- `[match("(a*)*b";"g").captures[0].string]` over `"aab ab"`: jq `["",""]`, here `["aa","a"]`.
+What still differs:
 
-A capture is shown as `[offset, length, string]`; `capture` and the last row show the program's output.
-A body that cannot match empty (`(a+)*b`), a lazy repeat (`(a*)*?b`) and a body with text outside the group (`(?:(a*),)*b`) agree.
-So does a bounded repeat (`(a*){0,5}b`, `(a*){2}b`) and `(a*){2,}b`, because the `regex` crate expands it into copies and the last copy matches empty, which is an accident of the expansion and not a rule.
-`(a*){0,}b` and `(a*){1,}b` are written as unbounded repeats and differ like `*` and `+`.
+- **A pattern on the `fancy-regex` route.**
+  A lookaround, a backreference, the `l` flag, or `$` together with `\z` sends the pattern to `fancy-regex`, which keeps the last non-empty iteration for some of these bodies: `"ab" | match("(?=)(a*)*b")` and `"ab" | match("(a*)*b"; "l")` have `[0,1,"a"]` here, and so does `"ab" | match("(?=)(a?)*b")`, though `"ab" | match("(a?)*b"; "l")` agrees.
+  So does the `fancy-regex` reading that settles a tie between the two views of a text that ends in `\n` (#5572, the next entry).
+  `onig` and `pcre2`, which would end the loop as jq does, fail the portability bar ([ADR-0019](../../adrs/adr-0019.md)'s candidates table).
+- **A body that matches empty only where an assertion holds.**
+  `(a|$)*` is not rewritten, because a copy of it could fail where Oniguruma's loop simply stops.
+  A body with an empty way around its assertion is rewritten (`(a*|\b)*b` agrees).
+- **A rewrite longer than 64 KiB.**
+  The pattern is compiled as written.
+- **Where the loop ends.**
+  When an alternative that matches empty comes before one that consumes text, Oniguruma ends the loop at the empty iteration and the `regex` crate goes on, so the match itself differs (#6106).
 
-Neither engine in the stack ends a loop this way.
-`"ab" | match("(?=)(a*)*b")` is routed to `fancy-regex` by the empty lookahead and answers `[0,1,"a"]`, the same as the plain pattern.
-`onig` and `pcre2` fail the portability bar ([ADR-0019](../../adrs/adr-0019.md)'s candidates table).
-A post-processing fix, replacing the capture with an empty one at the end of the last iteration, is unsound.
-Where the loop ends depends on backtracking from the rest of the pattern: `"aab" | match("(a*)*ab").captures[0]` is `[1,0,""]` in jq, with the loop giving back a character the rest of the pattern needs.
-The divergence is recorded, not accepted under [ADR-0018](../../adrs/adr-0018.md) rule 4(d), whose candidates-table bar this entry does not claim to meet.
+A bounded repeat (`(a*){0,5}b`, `(a*){2}b`) and `(a*){2,}b` are not rewritten and agree, because the crate expands them into copies and the last copy matches empty.
 
 ## `$` before a final newline (#5572)
 

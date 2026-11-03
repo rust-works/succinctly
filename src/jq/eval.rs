@@ -27635,6 +27635,13 @@ struct LongestSearch {
 enum RegexEngine {
     Std(regex::Regex),
     Fancy(fancy_regex::Regex),
+    /// The `regex` crate on a pattern [`super::onig_loop::rewrite`] wrote so that a repeated group
+    /// that can match empty reports Oniguruma's last, empty iteration (#6069). Its groups are
+    /// copies of the original pattern's, read back through `groups`.
+    Rewritten {
+        re: regex::Regex,
+        groups: super::onig_loop::LoopRewrite,
+    },
 }
 
 /// One match's capture groups, from either [`RegexEngine`].
@@ -27642,6 +27649,30 @@ enum RegexEngine {
 enum RegexCaptures<'h> {
     Std(regex::Captures<'h>),
     Fancy(fancy_regex::Captures<'h, str>),
+    /// A [`RegexEngine::Rewritten`] match, its copies already read back into the original
+    /// pattern's groups (each the last of its copies the match set).
+    Mapped(Vec<Option<RegexMatch<'h>>>),
+}
+
+#[cfg(feature = "regex")]
+impl<'h> RegexCaptures<'h> {
+    /// `caps`, a match of a rewritten pattern, as the original pattern's groups.
+    fn mapped(caps: regex::Captures<'h>, groups: &super::onig_loop::LoopRewrite) -> Self {
+        RegexCaptures::Mapped(
+            groups
+                .copies
+                .iter()
+                .map(|copies| {
+                    copies.iter().rev().find_map(|&i| {
+                        caps.get(i).map(|m| RegexMatch {
+                            text: m.as_str(),
+                            start: m.start(),
+                        })
+                    })
+                })
+                .collect(),
+        )
+    }
 }
 
 /// One capture group's span: the subset of `regex::Match` the builtins read, for either engine.
@@ -27687,6 +27718,7 @@ impl<'h> RegexCaptures<'h> {
                 text: m.as_str(),
                 start: m.start(),
             }),
+            RegexCaptures::Mapped(groups) => groups.get(i).copied().flatten(),
         }
     }
 
@@ -27713,6 +27745,7 @@ impl<'h> RegexCaptures<'h> {
 enum RegexCaptureNames<'r> {
     Std(regex::CaptureNames<'r>),
     Fancy(fancy_regex::CaptureNames<'r>),
+    Mapped(core::slice::Iter<'r, Option<Box<str>>>),
 }
 
 #[cfg(feature = "regex")]
@@ -27723,6 +27756,7 @@ impl<'r> Iterator for RegexCaptureNames<'r> {
         match self {
             RegexCaptureNames::Std(names) => names.next(),
             RegexCaptureNames::Fancy(names) => names.next(),
+            RegexCaptureNames::Mapped(names) => names.next().map(Option::as_deref),
         }
     }
 }
@@ -27742,7 +27776,9 @@ impl JqRegex {
             return Ok(first_captures(self, input)?.is_some());
         }
         match &self.engine {
-            RegexEngine::Std(re) => Ok(dv_is_match(re, input, self.needs_trailing_nl_check)),
+            RegexEngine::Std(re) | RegexEngine::Rewritten { re, .. } => {
+                Ok(dv_is_match(re, input, self.needs_trailing_nl_check))
+            }
             RegexEngine::Fancy(re) => re.is_match(input).map_err(fancy_match_error),
         }
     }
@@ -27782,6 +27818,19 @@ impl JqRegex {
                 self.needs_trailing_nl_check,
                 self.exact_end.as_ref(),
             )),
+            // A tie between the two views of a final `\n` is settled by the exact engine, which
+            // compiled the original pattern, so its captures need no reading back.
+            RegexEngine::Rewritten { re, groups } => Ok(dv_captures_at(
+                re,
+                input,
+                start,
+                self.needs_trailing_nl_check,
+                self.exact_end.as_ref(),
+            )
+            .map(|caps| match caps {
+                RegexCaptures::Std(caps) => RegexCaptures::mapped(caps, groups),
+                other => other,
+            })),
             RegexEngine::Fancy(re) if self.longest.is_some() => {
                 if let Some(starts) = starts {
                     return match starts.winner_from(start) {
@@ -27811,6 +27860,7 @@ impl JqRegex {
         match &self.engine {
             RegexEngine::Std(re) => RegexCaptureNames::Std(re.capture_names()),
             RegexEngine::Fancy(re) => RegexCaptureNames::Fancy(re.capture_names()),
+            RegexEngine::Rewritten { groups, .. } => RegexCaptureNames::Mapped(groups.names.iter()),
         }
     }
 
@@ -27818,6 +27868,7 @@ impl JqRegex {
         match &self.engine {
             RegexEngine::Std(re) => re.captures_len(),
             RegexEngine::Fancy(re) => re.captures_len(),
+            RegexEngine::Rewritten { groups, .. } => groups.names.len(),
         }
     }
 }
@@ -29584,7 +29635,22 @@ fn build_regex_uncached<S: EvalSemantics>(
 
     match regex::Regex::new(&pattern) {
         Ok(re) => Ok(JqRegex {
-            engine: RegexEngine::Std(re),
+            // #6069: a repeated group that can match empty reports Oniguruma's last iteration
+            // only from a rewritten pattern. One the crate refuses (its size limit) keeps `re`.
+            engine: S::TAG
+                .ne(&EvalTag::Yq)
+                .then(|| super::onig_loop::rewrite(&pattern))
+                .flatten()
+                .and_then(|groups| {
+                    let rewritten = regex::Regex::new(&groups.pattern).ok()?;
+                    (rewritten.captures_len() == groups.compiled_groups).then_some(
+                        RegexEngine::Rewritten {
+                            re: rewritten,
+                            groups,
+                        },
+                    )
+                })
+                .unwrap_or(RegexEngine::Std(re)),
             needs_trailing_nl_check,
             exact_end: needs_trailing_nl_check.then(|| ExactEnd::new(&pattern)),
             suppress_empty,
