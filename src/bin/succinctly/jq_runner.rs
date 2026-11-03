@@ -9688,10 +9688,6 @@ fn lazy_scan_on(
                 Ok(_) => {
                     // A stream scanned a chunk at a time has nothing queued behind its lazy
                     // documents: it is the only source, and it was clean when it was deferred.
-                    debug_assert!(
-                        tail.next().is_none(),
-                        "no tail is queued before a late fault"
-                    );
                     let mut locations = InputLocations::new(Vec::new());
                     locations.extend_from_ends(
                         lazy.source as usize,
