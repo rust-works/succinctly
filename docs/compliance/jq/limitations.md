@@ -10359,6 +10359,8 @@ What differs from jq 1.7.1:
   A month read beside a week is kept and the day counted from its start, so `"2015 01 09" | strptime("%Y %m %U")` is January 60 (`[2015,0,60,0,0,0,0,59]`), as in jq.
   A day read beside a week with no month is kept beside the month the week falls in; jq aborts on its own `set_tm_yday` assertion unless the two agree, so there is no answer to match where they do not.
   `%w` refuses 7 and up and `%u` refuses 0 and 8 up, as the pin's libc does.
+  `%z` reads a sign and four digits `hhmm` and, like `GMT`, makes the fields a UTC instant, its offset taken off once `timegm` succeeds; the last `%z` read counts, and a later `%s` or `%Z` naming `GMT` drops it (#5960).
+  White space in the format, before `%s` and at the end of the input is C's `isspace` (space, tab, newline, vertical tab, form feed, carriage return), as in the pin's libc under a UTF-8 locale too: other Unicode white space is text to match (#5960).
   `%Z` reads a run of capital letters naming `GMT` or one of the local zone's `tzname` names, its latest standard and daylight-time names (`AEST` and `AEDT` in Sydney, `HST` and `HPT` in Honolulu), and anything else is no match, as in the pin's libc; `UTC` reads only where the zone is UTC, and under an empty `TZ` only `GMT` reads.
   As in the pin's libc, `tzname` is process state: `localtime`, `strflocaltime` of a number and a `GMT` or `%s` conversion each rename the slot of the converted instant's kind, so in Honolulu `HWT` reads after a 1944 instant is converted and `HPT` no longer does.
   The pin's libc ends the run of capitals with `isupper` on bytes, which in a UTF-8 locale is true of some lead bytes (`0xC3`), so `"GMTÉ" | strptime("%ZÉ")` is no match there; here the run is ASCII capitals, so it reads.
