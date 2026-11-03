@@ -16697,9 +16697,10 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // #3850: `path(..)`, `path(recurse)` and `path(recurse(.[]?))` stream their paths from
         // the cursor, past the 256 levels the materializing route below stops at.
         Expr::Builtin(Builtin::Path(path_expr))
-            if cursor.is_some() && path_expr_is_bare_descent(path_expr) =>
+            if cursor.is_some() && path_expr_descent(path_expr).is_some() =>
         {
-            each_path_descent_generic::<S, V>(cursor.expect("guarded"), sink)
+            let cond = path_expr_descent(path_expr).expect("guarded");
+            each_path_descent_generic::<S, V>(cursor.expect("guarded"), cond, sink)
         }
 
         // #2908: `path(f)` is a generator, so a consumer satisfied by the
@@ -27444,6 +27445,24 @@ fn path_expr_is_bare_descent(expr: &Expr) -> bool {
     }
 }
 
+/// The descent [`path_descent_each`] walks for `path(expr)`: `Some(None)` for a bare `..` (see
+/// [`path_expr_is_bare_descent`]), `Some(Some(cond))` for a `recurse(f; cond)` whose `cond` the position
+/// walk takes ([`recurse_cond_is_walkable`], #5504), `None` for anything else. A gated descent was
+/// the one spelling of `path(recurse(...))` still materializing the document, which expands every
+/// alias where `..` stops at one (#4214).
+fn path_expr_descent(expr: &Expr) -> Option<Option<&Expr>> {
+    if path_expr_is_bare_descent(expr) {
+        return Some(None);
+    }
+    match expr {
+        Expr::Paren(inner) => path_expr_descent(inner),
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) if recurse_cond_is_walkable(f, cond) => {
+            Some(Some(cond))
+        }
+        _ => None,
+    }
+}
+
 /// Whether an array constructor may keep `expr`'s branches as cursors and
 /// regroup or reorder them (#3317's `[a, b]`, #3473, #3476's
 /// `[(a, b) | c]`) -- the array routes' own admission test (#3501).
@@ -28581,15 +28600,35 @@ fn path_descent_children<S: EvalSemantics, V: DocumentValue>(
 /// stop; whatever was emitted before an `Err` stands.
 fn path_descent_each<S: EvalSemantics, V: DocumentValue>(
     root: V::Cursor,
+    cond: Option<&Expr>,
     emit: &mut dyn FnMut(OwnedValue) -> Demand,
-) -> Result<Demand, EvalError> {
+) -> Result<Demand, Control> {
     let mut pending = vec![(PathTrail::root(), PathNode::At(root))];
     while let Some((at, here)) = pending.pop() {
         guard_path_walk_depth(at.depth())?;
         if matches!(emit(OwnedValue::Array(at.to_vec().into())), Demand::Stop) {
             return Ok(Demand::Stop);
         }
-        pending.extend(path_descent_children::<S, V>(&here, &at)?.into_iter().rev());
+        let mut children = path_descent_children::<S, V>(&here, &at)?;
+        if let Some(cond) = cond {
+            // #5504: `recurse(f; cond)` asks `cond` of each child before descending into it, and
+            // never of the root, as the position walk does ([`path_context_step_recurse_each`]).
+            // Asked here, as the walk reaches the parent, a stop from `emit` has already ended the
+            // walk before a later sibling's `cond` runs.
+            let mut kept = Vec::with_capacity(children.len());
+            for (trail, node) in children {
+                let keeps = match &node {
+                    PathNode::At(cursor) => recurse_cond_keeps_cursor::<S, V>(cond, *cursor)?,
+                    // A child of a live node is a live node: `path_descent_children` iterates a cursor.
+                    PathNode::Absent | PathNode::Owned(_) => true,
+                };
+                if keeps {
+                    kept.push((trail, node));
+                }
+            }
+            children = kept;
+        }
+        pending.extend(children.into_iter().rev());
     }
     Ok(Demand::Continue)
 }
@@ -28597,12 +28636,13 @@ fn path_descent_each<S: EvalSemantics, V: DocumentValue>(
 /// [`path_descent_each`] as a `Flow` into a generic sink.
 fn each_path_descent_generic<S: EvalSemantics, V: DocumentValue>(
     root: V::Cursor,
+    cond: Option<&Expr>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    match path_descent_each::<S, V>(root, &mut |path| sink.push(GenericItem::Owned(path))) {
+    match path_descent_each::<S, V>(root, cond, &mut |path| sink.push(GenericItem::Owned(path))) {
         Ok(Demand::Stop) => Flow::Stopped { pending: None },
         Ok(Demand::Continue) => Flow::Exhausted,
-        Err(e) => Flow::Escaped(Control::Error(e)),
+        Err(control) => Flow::Escaped(control),
     }
 }
 
@@ -32857,11 +32897,15 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
         }
         Expr::Label { body, .. } => step_can_yield_absent(body, incoming),
         Expr::Shared(inner) => step_can_yield_absent(inner, incoming),
-        // #3773: a structural `recurse(.[]?)` is deliberately not listed with `..`
-        // here or in `path_context_stage_preserves_node`: both fall to the
-        // conservative arm, which only sends such a pipe down the owned route
-        // and answers identically, so an arm could not be pinned.
-        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => incoming,
+        // #5504: `recurse(f)` and `recurse(f; cond)` step like `..`: the input and real descendants
+        // of it. #3773 left them out, on the argument that the conservative arm only sends such a
+        // pipe down the owned route and "answers identically"; it does not. That route is
+        // element-major for a union after a position stage, and it navigates alias-dereferenced
+        // values (`[recurse(.[]?) | (path, key)]` against `[.. | (path, key)]`).
+        Expr::RecursiveDescent
+        | Expr::Builtin(
+            Builtin::Recurse | Builtin::RecurseDown | Builtin::RecurseF(_) | Builtin::RecurseCond(..),
+        ) => incoming,
         Expr::Break(_)
         | Expr::Error(_)
         | Expr::Builtin(
@@ -36552,14 +36596,14 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // #3850: a bare `..`/`recurse` over a live node is walked by `path_descent_each`, so it
             // takes the path walkers' 384 ceiling; over a computed value (no cursor) it still
             // materializes below and keeps 256.
-            if let Some(root) = cursor.filter(|_| path_expr_is_bare_descent(path_expr)) {
+            if let (Some(root), Some(cond)) = (cursor, path_expr_descent(path_expr)) {
                 let mut out = Vec::new();
-                return match path_descent_each::<S, V>(root, &mut |path| {
+                return match path_descent_each::<S, V>(root, cond, &mut |path| {
                     out.push(path);
                     Demand::Continue
                 }) {
                     Ok(_) => owned_vec_to_generic_result(out),
-                    Err(e) => partial_generic(out, Control::Error(e)),
+                    Err(control) => partial_generic(out, control),
                 };
             }
             // #2061: `path(...)` output is small and bounded, but this arm
@@ -56916,6 +56960,34 @@ mod tests {
             ".[]",
         ] {
             assert!(!path_expr_is_bare_descent(&stage(other)), "{other}");
+        }
+    }
+
+    /// #5504: `path(recurse(f; cond))` is walked by `path_descent_each` for a `cond` the position walk
+    /// takes, and only then; a `cond` that reads a position, or an `f` that is not a structural
+    /// descent, keeps the route it had.
+    #[test]
+    fn test_gated_descent_predicate_5504() {
+        let stage = |query: &str| crate::jq::parse(query).unwrap();
+        for (gated, has_cond) in [
+            ("..", false),
+            ("recurse(.[]?; true)", true),
+            ("(recurse(.[]?; . != 1))", true),
+            ("recurse(.[]?; type == \"object\")", true),
+        ] {
+            let expr = stage(gated);
+            let got = path_expr_descent(&expr).unwrap_or_else(|| panic!("{gated}"));
+            assert_eq!(got.is_some(), has_cond, "{gated}");
+        }
+        for other in [
+            "recurse(.a; true)",
+            "recurse(.[]; type == \"object\")",
+            "recurse(.[]?; key == \"a\")",
+            "recurse(.[]?; (true, true))",
+            ".a | recurse(.[]?; true)",
+            "recurse(.[]?; true) | .a",
+        ] {
+            assert!(path_expr_descent(&stage(other)).is_none(), "{other}");
         }
     }
 
