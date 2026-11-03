@@ -824,6 +824,12 @@ double-quotes), a multi-line source scalar that holds a `\n` as well, and a *blo
 with such a break, which yq rejects (`could not find expected ':'`) and the parser has always
 accepted (a semi-index does not validate to that depth). The decode half is
 [#4913](https://github.com/rust-works/succinctly/issues/4913).
+The decode half landed with #4913 for a quoted scalar and a flow collection's plain scalar.
+U+0085 folds like a `\n` there (`'x\u0085y'` is `x y`).
+U+2028 and U+2029 stay in the value.
+The blanks beside any of the three are trimmed as beside a `\n`, so the space-beside-the-break case in the list above is fixed.
+A backslash before any of the three continues the line in a double-quoted scalar, as it does before a `\n`.
+A quoted implicit key that spans such a break is accepted for the same reason as a block plain scalar with one.
 
 **One deliberate divergence (ADR-0018, output the reference cannot read back).** go-yaml tests only the
 first character of the string for the indentation indicator, so a string that starts with a break and
