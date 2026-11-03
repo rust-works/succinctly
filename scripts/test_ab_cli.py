@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -183,17 +184,61 @@ class GateTests(unittest.TestCase):
 
 class BusyProcessTests(unittest.TestCase):
     """#3695: the idleness probe must match the build or benchmark *process*, not any
-    command line that mentions a build tool. These start real processes (`sleep` under other
-    names) and ask the real `pgrep`, because what is under test is how the pattern behaves
-    against it."""
+    command line that mentions a build tool. These start real processes (an idle program
+    under other names) and ask the real `pgrep`, because what is under test is how the pattern
+    behaves against it.
+
+    The idle program is whichever of `sleep` and the Python interpreter stays alive under a
+    different name (#5927). Observed: on Ubuntu 26.04 `sleep` is uutils coreutils, one
+    multi-call binary that refuses to run under another name (`Security violation: Requested
+    utility `cargo` does not match executable name`), so a `sleep` symlinked as `cargo` exits at
+    once and nothing is left for `pgrep` to find; on macOS the Xcode `python3` did not stay alive
+    under another name (three of these tests failed with it) and `sleep` does. If neither does,
+    the set-up fails: a skip would hide that the idleness probe is untested."""
+
+    _idle = None  # (program, args), found once for the class
+
+    @classmethod
+    def setUpClass(cls):
+        cls._idle = cls._find_idle_program()
+
+    @staticmethod
+    def _find_idle_program():
+        """`(program, args)` of an idle process that keeps running under another name."""
+        candidates = [
+            (shutil.which("sleep"), ("30",)),
+            (sys.executable, ("-c", "import time; time.sleep(30)")),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = pathlib.Path(tmp) / "probe-idle"
+            for program, args in candidates:
+                if not program:
+                    continue
+                probe.symlink_to(program)
+                proc = None
+                try:
+                    proc = subprocess.Popen([str(probe), *args], stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL)
+                    time.sleep(0.5)  # a refusal is immediate; this is only slow on a loaded host
+                    if proc.poll() is None:
+                        return program, args
+                except OSError:
+                    pass  # cannot be started under another name: try the next
+                finally:
+                    if proc is not None and proc.poll() is None:
+                        proc.kill()
+                    if proc is not None:
+                        proc.wait()
+                    probe.unlink()
+        raise AssertionError("no program stays alive under another name: nothing to find with pgrep")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.dir = pathlib.Path(self._tmp.name)
-        self.sleep = shutil.which("sleep")
         self._procs = []
         self.addCleanup(self._stop)
+        self.idle_program, self.idle_args = self._idle
 
     def _stop(self):
         for proc in self._procs:
@@ -207,10 +252,10 @@ class BusyProcessTests(unittest.TestCase):
         self._procs.append(proc)
         return proc
 
-    def link_to_sleep(self, relative):
+    def link_to_idle_program(self, relative):
         path = self.dir / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.symlink_to(self.sleep)
+        path.symlink_to(self.idle_program)
         return path
 
     @staticmethod
@@ -220,17 +265,17 @@ class BusyProcessTests(unittest.TestCase):
     def test_a_process_under_dot_cargo_is_not_a_build(self):
         # `cargo install`ed tools (here, anything under `.cargo/bin`) matched the old
         # `pgrep -fl "cargo|rustc|criterion"` however idle they were.
-        proc = self.start(self.link_to_sleep(".cargo/bin/fake-tool"), "30")
+        proc = self.start(self.link_to_idle_program(".cargo/bin/fake-tool"), *self.idle_args)
         old = ab_cli.run_text(["pgrep", "-fl", "cargo|rustc|criterion"]).splitlines()
         self.assertTrue(self.listed(proc, old), "premise: the old pattern flags it")
         self.assertFalse(self.listed(proc, ab_cli.busy_processes()))
 
     def test_a_process_named_cargo_is_a_build(self):
-        proc = self.start(self.link_to_sleep("cargo"), "30")
+        proc = self.start(self.link_to_idle_program("cargo"), *self.idle_args)
         self.assertTrue(self.listed(proc, ab_cli.busy_processes()))
 
     def test_a_process_named_rustc_is_a_build(self):
-        proc = self.start(self.link_to_sleep("rustc"), "30")
+        proc = self.start(self.link_to_idle_program("rustc"), *self.idle_args)
         self.assertTrue(self.listed(proc, ab_cli.busy_processes()))
 
     def test_a_bench_binary_is_a_build(self):
