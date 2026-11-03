@@ -23,8 +23,12 @@ regression that a pinned test caught (#5197), so a different message is a mismat
 Exit status 1 when any row is REGRESS, when NEW answers (exit 0) a row jq refuses and BASE did not
 (a newly silent accept: `del`/`|=`/`=` write through it), or when NEW times out (counted apart, since two
 hung builds are otherwise just `still_wrong`). A row jq itself times out on is skipped. `changed_wrong`
-alone does not fail the run: read it. `still_wrong` is large by construction, since both builds word many
-of jq's errors differently; compare it between runs, never against zero.
+alone does not fail the run: read it. `still_wrong` was large when this grid was written, since both builds worded many of jq's
+errors differently; on `main` at #5552 every row of the default draw matches jq, message included.
+`--jq-gate` also fails the run on any row where NEW does not match jq (stdout, exit code and message):
+with NEW passed as BASE too, that is the gate against jq alone, and it is how `succinctly dev compare jq
+--dimension sweeps` runs this script (#5552). No residual is documented, so a residual that becomes
+accepted has to be listed here first.
 
 Usage: scripts/jq-nested-fold-source-sweep.py BASE NEW [N [SEED]] [--show N] [--dump FILE] [--jobs N] [--jq JQ]
   BASE, NEW  succinctly builds (the change's parent, normally `main`, and the build under test)
@@ -166,6 +170,11 @@ def main():
     ap.add_argument("--show", type=int, default=6, help="rows printed per section")
     ap.add_argument("--dump", help="write every row that is not ok to this file as JSON")
     ap.add_argument("--jobs", type=int, default=8)
+    ap.add_argument(
+        "--jq-gate",
+        action="store_true",
+        help="also fail on any row where NEW differs from jq (the gate without a base: pass NEW as BASE too, #5552)",
+    )
     args = ap.parse_args()
 
     grid = rows(args.n, args.seed)
@@ -212,7 +221,15 @@ def main():
     for klass in ("REGRESS", "NEWACC", "changed_wrong", "fixed"):
         for (doc, program), oracle, base, new in shown[klass][: args.show]:
             print(f"{klass} {doc} | {program}\n   jq   {oracle}\n   base {base}\n   new  {new}")
-    return 1 if counts["REGRESS"] or new_timeouts or new_accepts else 0
+    # No residual is documented, so against jq alone any row NEW does not match is unexpected.
+    jq_wrong = sum(n for klass, n in counts.items() if klass not in ("ok", "fixed"))
+    if args.jq_gate:
+        print(f"rows where NEW differs from jq (--jq-gate): {jq_wrong}")
+        for klass in ("still_wrong",):
+            for (doc, program), oracle, base, new in shown[klass][: args.show]:
+                print(f"{klass} {doc} | {program}\n   jq   {oracle}\n   new  {new}")
+    failed = counts["REGRESS"] or new_timeouts or new_accepts or (args.jq_gate and jq_wrong)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

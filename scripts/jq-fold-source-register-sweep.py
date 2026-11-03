@@ -37,11 +37,16 @@ docs/compliance/jq/limitations.md) -- and on any recorded pair that
 *stops* occurring, so the table cannot go stale. `--print-residuals` prints
 the observed table for regenerating it after a deliberate change.
 
+`--sample K` runs every Kth case (the list is 112,320 cases, small enough to hold), and skips the
+staleness half of the gate, since a sample can miss a recorded pair's rows: `succinctly dev
+compare jq --dimension sweeps` runs it as `--sample 4` (#5552), about two minutes on an M4 Pro
+against about seven for the whole list. `KNOWN_RESIDUALS` is empty, so nothing is skipped today.
+
 Usage:
     cargo build --release --features cli
-    ./scripts/jq-fold-source-register-sweep.py [--bin PATH] [--jq PATH] [--show K] [--jobs N] [--self-test]
-    (~80k cases, two process spawns each: tens of minutes at the default --jobs, not seconds --
-    not run in CI.)
+    ./scripts/jq-fold-source-register-sweep.py [--bin PATH] [--jq PATH] [--show K] [--jobs N] [--sample K]
+                                               [--self-test]
+    (112,320 cases, two process spawns each: about seven minutes on an M4 Pro at the default --jobs.)
 Exit 1 on any unexpected divergence or a stale residual entry.
 """
 import argparse, collections, concurrent.futures as cf, itertools, re, subprocess, sys
@@ -119,6 +124,8 @@ def main():
     ap.add_argument('--show', type=int, default=3)
     ap.add_argument('--jobs', type=int, default=8, help='parallel case runners')
     ap.add_argument('--self-test', action='store_true')
+    ap.add_argument('--sample', type=int, default=1,
+                    help='run every Kth case; a sampled run does not check KNOWN_RESIDUALS for staleness')
     ap.add_argument('--print-residuals', action='store_true',
                     help='print the observed (source -> categories) table and exit 0')
     args = ap.parse_args()
@@ -128,6 +135,8 @@ def main():
         for form in FORMS
         for inp in INPUTS
     ]
+    if args.sample > 1 and not args.self_test:
+        cases = cases[::args.sample]
     if args.self_test:
         print(f'{len(SRCS)} sources, {len(UPDS)} updates, {len(INITS)} inits, '
               f'{len(INPUTS)} documents, {len(cases)} cases')
@@ -172,6 +181,8 @@ def main():
     bad = [d for d in diffs if d[0] not in KNOWN_RESIDUALS.get(source_of(d[1]), ())]
     stale = sorted((src, cat) for src, cats in KNOWN_RESIDUALS.items() for cat in cats
                    if cat not in observed.get(src, ()))
+    if args.sample > 1:
+        stale = []  # a sample can miss a recorded pair's rows, so its absence proves nothing
     for cat, f, inp, j, s_ in bad[:args.show]:
         print(f'[{cat}] {f}   in={inp}\n   jq({j[0]})=[{j[1].strip()}]  succinctly({s_[0]})=[{s_[1].strip()}]')
     if counts['timeout']:

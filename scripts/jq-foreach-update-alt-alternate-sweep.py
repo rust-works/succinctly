@@ -14,8 +14,12 @@ context (`path`, `?`, `try .. catch`, `|=`, `del`) x document.
 Rows are compared against `/usr/bin/jq` on stdout and exit status. `fixed`: wrong on `--base`, matching on `--bin`. `regress`: matching on
 `--base`, not on `--bin`. `newwrong`: wrong on both, and differently (a prefix of jq's paths before a refusal is one). Exit status 1 on any
 `regress`. Run `--base` as a build from before the change.
+`--jq-gate` also fails the run on any row where `--bin` differs from jq on stdout or exit status (`jqwrong`), and
+is the only judgement when `--base` is not given. No residual is documented today, and it is how
+`succinctly dev compare jq --dimension sweeps` runs this script (#5552); a residual that becomes accepted has to
+be listed here first.
 
-Usage: scripts/jq-foreach-update-alt-alternate-sweep.py --bin BIN --base BIN [--jq JQ] [--n N] [--seed S] [--show N] [-v]
+Usage: scripts/jq-foreach-update-alt-alternate-sweep.py --bin BIN (--base BIN | --jq-gate) [--jq JQ] [--n N] [--seed S] [--show N] [-v]
 """
 import argparse
 import concurrent.futures as cf
@@ -25,7 +29,9 @@ import sys
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--bin", required=True)
-ap.add_argument("--base", required=True)
+ap.add_argument("--base")
+ap.add_argument("--jq-gate", action="store_true",
+                help="also fail on any row where --bin differs from jq (the gate without --base, #5552)")
 ap.add_argument("--jq", default="/usr/bin/jq")
 ap.add_argument("--n", type=int, default=40000)
 ap.add_argument("--seed", type=int, default=1)
@@ -33,6 +39,8 @@ ap.add_argument("--show", type=int, default=40)
 ap.add_argument("--jobs", type=int, default=8)
 ap.add_argument("-v", action="store_true")
 args = ap.parse_args()
+if not args.base and not args.jq_gate:
+    ap.error('pass --base to judge a change against a build, or --jq-gate to judge --bin against jq alone')
 BASE, NEW, N = args.base, args.bin, args.n
 random.seed(args.seed)
 docs=['{"a":null}','{"a":{"a":null}}','{"a":true}','{"a":1}','{"a":[null]}','{"a":{"b":1}}','null','{"a":{"a":{"a":null}}}','{"a":false}','[null]']
@@ -69,12 +77,20 @@ def run(cmd, inp, f):
     except subprocess.TimeoutExpired: return ('TIMEOUT',-1,'')
 def one(r):
     inp,f=r
-    return r, run([args.jq],inp,f), run([BASE,'jq'],inp,f), run([NEW,'jq'],inp,f)
-cnt={'ok':0,'fixed':0,'regress':0,'bothbad':0,'newwrong':0}
+    return r, run([args.jq],inp,f), (run([BASE,'jq'],inp,f) if BASE else None), run([NEW,'jq'],inp,f)
+cnt={'ok':0,'fixed':0,'regress':0,'bothbad':0,'newwrong':0,'jqwrong':0}
 out=[]
 with cf.ThreadPoolExecutor(args.jobs) as ex:
     for r,j,b,n in ex.map(one,rows):
-        bm2=(b[:2]==j[:2]); nm2=(n[:2]==j[:2])
+        nm2=(n[:2]==j[:2])
+        # A row jq itself times out on (load, not the row) is no evidence against --bin.
+        if not nm2 and j[0]!='TIMEOUT': cnt['jqwrong']+=1
+        if b is None:
+            # No base: the row is judged against jq alone (--jq-gate).
+            cnt['ok' if nm2 else 'bothbad']+=1
+            if not nm2: out.append(('JQWRONG',r,j,None,n))
+            continue
+        bm2=(b[:2]==j[:2])
         if bm2 and not nm2: k='regress'
         elif nm2 and not bm2: k='fixed'
         elif nm2 and bm2: k='ok'
@@ -87,4 +103,4 @@ with cf.ThreadPoolExecutor(args.jobs) as ex:
 for k,r,j,b,n in out[:args.show]:
     print(f'{k.upper()}: {r[0]} | {r[1]}\n   jq  : {j}\n   base: {b}\n   new : {n}')
 print(cnt, 'rows', len(rows))
-sys.exit(1 if cnt['regress'] else 0)
+sys.exit(1 if (args.jq_gate and cnt['jqwrong']) or cnt['regress'] else 0)

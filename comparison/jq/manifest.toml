@@ -169,6 +169,16 @@ script = "scripts/jq-alt-retry-oracle-sweep.sh"
 args = ["{subject}"]
 timeout_s = 300
 
+# The jq-mode half only, with `--gate`: the yq half is a recording (904 of its 10,248 cases differ
+# from yq v4.53.3 at #5552), and the harness's reference is jq. All 10,248 jq cases agree, 3.3 minutes.
+# `--gate` re-runs a diverging case once before it counts: on macOS about one case in 20,000 has recorded
+# exit 0 for a run that printed its error, then agreed on every re-run (#5952).
+[[sweep]]
+id = "assign-path"
+script = "scripts/jq-assign-path-oracle-sweep.sh"
+args = ["--jq-only", "--gate", "{subject}"]
+timeout_s = 2000
+
 [[sweep]]
 id = "assign-rhs"
 script = "scripts/jq-assign-rhs-oracle-sweep.py"
@@ -187,6 +197,14 @@ script = "scripts/jq-fanout-oracle-sweep.sh"
 args = ["{subject}"]
 timeout_s = 300
 
+# `--jq-gate` adds DIFF to the script's own ACCEPT_WRONG gate. About one row in 40 of the 1,215,396-row
+# grid (30,446 rows, 71 s); the whole grid is about 53 minutes on an M4 Pro.
+[[sweep]]
+id = "fold-body-register-grid"
+script = "scripts/jq-fold-body-register-grid-sweep.py"
+args = ["--bin", "{subject}", "--jq", "{jq}", "--jq-gate", "--sample", "40"]
+timeout_s = 900
+
 [[sweep]]
 id = "fold-fresh-source"
 script = "scripts/jq-fold-fresh-source-sweep.py"
@@ -199,6 +217,28 @@ script = "scripts/jq-fold-source-alt-chain-sweep.py"
 args = ["--bin", "{subject}", "--jq", "{jq}"]
 timeout_s = 300
 
+# Every 4th of its 112,320 cases (65 s; the whole list is about 7 minutes). Its residual table is empty.
+[[sweep]]
+id = "fold-source-register"
+script = "scripts/jq-fold-source-register-sweep.py"
+args = ["--bin", "{subject}", "--jq", "{jq}", "--sample", "4"]
+timeout_s = 900
+
+# `--jq-gate`, about one row in 200 of the 6,879,600-row `foreach` grid, drawn while it is generated
+# (34,000 rows, 84 s).
+[[sweep]]
+id = "fold-update-alt-bind"
+script = "scripts/jq-fold-update-alt-bind-sweep.py"
+args = ["--bin", "{subject}", "--jq", "{jq}", "--jq-gate", "--sample", "200"]
+timeout_s = 900
+
+# `--jq-gate` without `--base`: the default fixed-seed 40,000-row draw, 97 s.
+[[sweep]]
+id = "foreach-update-alt-alternate"
+script = "scripts/jq-foreach-update-alt-alternate-sweep.py"
+args = ["--bin", "{subject}", "--jq", "{jq}", "--jq-gate"]
+timeout_s = 1200
+
 # `--jq-gate`: without `--base` this sweep fails only on a timeout; the flag fails it on any wrong
 # answer against jq too. The default 40,000-row sample of the 7.9M-row product, under a fixed seed.
 [[sweep]]
@@ -206,6 +246,20 @@ id = "foreach-update-if-arm"
 script = "scripts/jq-foreach-update-if-arm-sweep.py"
 args = ["--bin", "{subject}", "--jq", "{jq}", "--jq-gate"]
 timeout_s = 1200
+
+# `--jq-gate` without `--base`: the default fixed-seed 40,000-row draw, 97 s.
+[[sweep]]
+id = "foreach-update-null-marker"
+script = "scripts/jq-foreach-update-null-marker-sweep.py"
+args = ["--bin", "{subject}", "--jq", "{jq}", "--jq-gate"]
+timeout_s = 1200
+
+# The script takes BASE NEW; with the subject as both, `--jq-gate` is its gate against jq alone.
+[[sweep]]
+id = "foreach-update-state-register"
+script = "scripts/jq-foreach-update-state-register-sweep.py"
+args = ["{subject}", "{subject}", "--jq", "{jq}", "--jq-gate"]
+timeout_s = 300
 
 [[sweep]]
 id = "libm"
@@ -236,6 +290,28 @@ id = "nested-fold-outer-var"
 script = "scripts/jq-nested-fold-outer-var-sweep.py"
 args = ["--bin", "{subject}", "--jq", "{jq}"]
 timeout_s = 600
+
+# As for foreach-update-state-register.
+[[sweep]]
+id = "nested-fold-source"
+script = "scripts/jq-nested-fold-source-sweep.py"
+args = ["{subject}", "{subject}", "--jq", "{jq}", "--jq-gate"]
+timeout_s = 300
+
+# The jq-mode half only (`--jq-only`): the yq half needs the pinned yq, which this harness does not have.
+[[sweep]]
+id = "path-context"
+script = "scripts/jq-path-context-oracle-sweep.sh"
+args = ["--jq-only", "{subject}"]
+timeout_s = 600
+
+# `--jq-gate`, a 20,000-row sample of the 63.6M-row grid drawn while it is generated, plus the 27 chain
+# rows (55 s, 80 MB; listing the grid first took about 15 GB).
+[[sweep]]
+id = "path-register"
+script = "scripts/jq-path-register-sweep.py"
+args = ["--candidate", "{subject}", "--jq", "{jq}", "--jq-gate", "--sample", "20000", "--seed", "7"]
+timeout_s = 900
 
 # `--jq-gate`, as for foreach-update-if-arm. Every 4th row of the 108,864-row grid: the whole grid is
 # all MATCH and takes about 7.5 minutes on an M4 Pro, the sample about 1.5.

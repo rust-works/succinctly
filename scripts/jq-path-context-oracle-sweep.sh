@@ -329,7 +329,7 @@ self_test() {
 
   if ((failures > 0)); then
     echo "FAIL: $failures self-test failure(s)" >&2
-    exit 1
+    exit 2
   fi
   echo "self-test ok: ${#CASES[@]} cases, all combination classes present, no #2420 precedence hazards" >&2
 }
@@ -353,16 +353,22 @@ self_test
 # /usr/bin/jq; a PATH jq, e.g. Homebrew's, is often newer) — same reasoning as
 # scripts/jq-fanout-oracle-sweep.sh. For yq the pin is the opposite way round:
 # Homebrew's *is* the pin.
+#
+# A setup error exits 2, not 1: `succinctly dev compare jq --dimension sweeps` (#5552) runs
+# `--jq-only` and reads 1 as "diverges". It sets `JQ_ORACLE` to its pinned reference, which
+# is taken first when it matches the pin.
 JQ=""
 YQ=""
 if ((RUN_JQ)); then
-  if [[ -x /usr/bin/jq ]] && /usr/bin/jq --version | grep -q "^$JQ_PIN"; then
+  if [[ -n "${JQ_ORACLE:-}" ]] && "$JQ_ORACLE" --version 2>/dev/null | grep -q "^$JQ_PIN"; then
+    JQ="$JQ_ORACLE"
+  elif [[ -x /usr/bin/jq ]] && /usr/bin/jq --version | grep -q "^$JQ_PIN"; then
     JQ=/usr/bin/jq
   elif command -v jq >/dev/null 2>&1 && jq --version | grep -q "^$JQ_PIN"; then
     JQ="$(command -v jq)"
   else
-    echo "error: no jq matching pin $JQ_PIN found at /usr/bin/jq or on PATH" >&2
-    exit 1
+    echo "error: no jq matching pin $JQ_PIN found at \$JQ_ORACLE, /usr/bin/jq or on PATH" >&2
+    exit 2
   fi
 fi
 if ((RUN_YQ)); then
@@ -370,13 +376,13 @@ if ((RUN_YQ)); then
     YQ="$(command -v yq)"
   else
     echo "error: no yq matching pin $YQ_PIN found on PATH" >&2
-    exit 1
+    exit 2
   fi
 fi
 
 if [[ ! -x "$SUCC" ]]; then
   echo "error: succinctly binary not found at $SUCC — run: cargo build --release --features cli,simd,regex,serde" >&2
-  exit 1
+  exit 2
 fi
 echo "oracles: ${JQ:-<skipped>} ${YQ:-<skipped>}; succinctly: $SUCC" >&2
 
@@ -447,7 +453,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done < "$KNOWN_FILE"
 ((${#KNOWN_PATTERNS[@]} > 0)) || {
   echo "error: $KNOWN_FILE has no entries — a truncated manifest would turn every known gap into a failure" >&2
-  exit 1
+  exit 2
 }
 
 # Attribute a divergence to an already-tracked gap, or return 1 for "this is
@@ -546,7 +552,7 @@ if [[ -n "${YQ:-}" ]]; then
   for f in one two; do
     if [[ "$("$YQ" -o=json -I=0 . "$WORK/$f-block.yaml")" != "$(cat "$WORK/$f.yaml")" ]]; then
       echo "error: $WORK/$f-block.yaml does not decode to $WORK/$f.yaml" >&2
-      exit 1
+      exit 2
     fi
   done
 fi
@@ -572,6 +578,12 @@ done
 
 stale=0
 for ((i = 0; i < ${#KNOWN_PATTERNS[@]}; i++)); do
+  # A pattern for a mode this run skipped (`--jq-only`, `--yq-only`) had no case
+  # to match, so its silence says nothing about whether it is fixed (#5952).
+  case "${KNOWN_PATTERNS[i]}" in
+    jq/*) ((RUN_JQ)) || continue ;;
+    yq/*) ((RUN_YQ)) || continue ;;
+  esac
   if [[ "${KNOWN_HITS[i]}" == 0 ]]; then
     echo "STALE: no divergence matched ${KNOWN_PATTERNS[i]} — if it is fixed, drop the line from" >&2
     echo "       tests/data/jq-path-context-sweep-known-divergences.txt" >&2

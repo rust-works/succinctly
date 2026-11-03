@@ -83,9 +83,10 @@ That is enough to iterate on, and not enough to judge a stage-level rule by (see
      `--stage-only` alone over every operand (636,027 rows, about 53 minutes).
   2. To judge the change: `--operand ...` without `--stage-only` over the touched
      operands (83,187 rows for 14 operands took about 22 minutes at `--jobs 6` on a
-     box at load 100), plus a seeded `--sample N --seed S` over the whole grid
-     (`--sample 6000 --seed 7` is about 30 seconds). Keep the seed in the PR so the same
-     rows can be re-run.
+     box at load 100), plus a seeded `--sample N --seed S` over the whole grid. Keep the
+     seed in the PR so the same rows can be re-run. The sample is drawn while the grid is
+     generated (it holds N rows, not the 63.6M-row grid's ~15 GB), so a seed picks
+     different rows than it did before #5552.
 
 Run the whole grid only when the change reaches every operand.
 
@@ -99,7 +100,11 @@ cubic can time out here and not in a release build.
 This is a verification tool, not a CI gate. The pinned `*_3456` rows in
 `tests/jq_cli_tests.rs` are what CI enforces (one per round-2 category); run
 this after touching `PathBranch::register`, `Frame::register_loss`, or any
-path-mode producer/consumer of them in `src/jq/eval.rs`.
+path-mode producer/consumer of them in `src/jq/eval.rs`. Without `--base` only
+`--jq-gate` fails the run: on any ACCEPT_WRONG, DIFF or TIMEOUT of the candidate
+against jq. No residual is documented, and it is how `succinctly dev compare jq
+--dimension sweeps` runs a sample of the grid (#5552); a residual that becomes
+accepted has to be listed here first.
 
 Usage:
   cargo build --features cli
@@ -116,6 +121,7 @@ import argparse
 import concurrent.futures
 import itertools
 import json
+import math
 import os
 import pathlib
 import random
@@ -3045,16 +3051,19 @@ def shapes_for(operand, stage_only=False):
 
 
 def build_rows(operands=None, stage_only=False, contexts=None):
-    """The grid and the chain rows, separately: (label, input, program).
+    """The grid and the chain rows, separately, as lists: (label, input, program).
 
     The chain rows are the timing axis and are never sampled away. `operands`
     restricts the grid to a subset of OPERANDS (the `--operand` flag): a fast
     targeted run while iterating, never the number a gate is judged on. `contexts` likewise
-    restricts the grid to the named CONTEXTS (the `--context` flag).
+    restricts the grid to the named CONTEXTS (the `--context` flag). The whole grid is
+    63.6M rows and about 15 GB as a list, so `--sample` draws from `iter_grid` instead.
     """
-    ctx = dict(CONTEXTS)
-    rows = []
-    chains = []
+    return list(iter_grid(operands, stage_only, contexts)), chain_rows()
+
+
+def iter_grid(operands=None, stage_only=False, contexts=None):
+    """`build_rows`'s grid rows, generated one at a time and in the same order."""
     for operand in OPERANDS if operands is None else operands:
         for shape in shapes_for(operand, stage_only):
             for cname, template in CONTEXTS:
@@ -3073,14 +3082,49 @@ def build_rows(operands=None, stage_only=False, contexts=None):
                     continue
                 program = template.replace("{X}", shape)
                 for doc in INPUTS:
-                    rows.append((f"{cname}|{shape}", doc, program))
+                    yield (f"{cname}|{shape}", doc, program)
+
+
+def chain_rows():
+    """The timing-axis rows: an `and` chain of each length in each chain context."""
+    ctx = dict(CONTEXTS)
+    chains = []
     for n in CHAIN_LENGTHS:
         for cname in CHAIN_CONTEXTS:
             chain = " and ".join([".a"] * n)
             program = ctx[cname].replace("{X}", chain)
             for doc in ('{"a":true}', '{"a":false}', "[true]"):
                 chains.append((f"chain{n}|{cname}", doc, program))
-    return rows, chains
+    return chains
+
+
+def _open_unit(rng):
+    """A uniform draw from the open interval (0, 1), so its logarithm is finite and nonzero."""
+    while True:
+        u = rng.random()
+        if u > 0.0:
+            return u
+
+
+def reservoir_sample(items, k, rng):
+    """A uniform sample of `k` of `items` (all of them if there are fewer), holding only `k` in memory.
+
+    Li's Algorithm L: it draws a skip length instead of a random number per item, so the
+    63.6M-row grid costs about `k * log(n / k)` draws. The same `rng` seed gives the same
+    rows on every machine; the order of the result is not the order of `items`.
+    """
+    it = iter(items)
+    sample = list(itertools.islice(it, k))
+    if k <= 0 or len(sample) < k:
+        return sample
+    w = math.exp(math.log(_open_unit(rng)) / k)
+    while True:
+        skip = math.floor(math.log(_open_unit(rng)) / math.log1p(-w)) if w < 1.0 else 0
+        nxt = next(itertools.islice(it, skip, None), None)
+        if nxt is None:
+            return sample
+        sample[rng.randrange(k)] = nxt
+        w *= math.exp(math.log(_open_unit(rng)) / k)
 
 
 # ---------------------------------------------------------------------------
@@ -3273,6 +3317,7 @@ def format_duration(seconds):
 
 
 def main():
+    global ORACLE
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--candidate", help="build under test")
     ap.add_argument(
@@ -3284,6 +3329,7 @@ def main():
     )
     ap.add_argument("--sample", type=int, default=0, help="run a seeded sample of N rows")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--jq", default=ORACLE, help=f"the pinned oracle ({ORACLE_VERSION}, default {ORACLE})")
     ap.add_argument("--timeout", type=float, default=20.0)
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--show", type=int, default=25, help="max rows printed per section")
@@ -3315,7 +3361,14 @@ def main():
         "pipe too)",
     )
     ap.add_argument("--list-axes", action="store_true", help="print the grid's size and exit")
+    ap.add_argument(
+        "--jq-gate",
+        action="store_true",
+        help="also fail on any ACCEPT_WRONG, DIFF or TIMEOUT of --candidate against jq "
+        "(the gate without --base, #5552)",
+    )
     args = ap.parse_args()
+    ORACLE = args.jq  # `evaluate` and the version check read the module's oracle
 
     unknown = [o for o in args.operand if o not in OPERANDS]
     if unknown:
@@ -3324,11 +3377,13 @@ def main():
     unknown = [c for c in args.context if c not in known_contexts]
     if unknown:
         ap.error(f"--context {unknown[0]!r} is not a context; see CONTEXTS")
-    grid, chains = build_rows(args.operand or None, args.stage_only, args.context or None)
+    grid_args = (args.operand or None, args.stage_only, args.context or None)
+    chains = chain_rows()
     if args.list_axes:
+        n_grid = sum(1 for _ in iter_grid(*grid_args))
         print(f"operands={len(OPERANDS)} companions={len(COMPANIONS)} inputs={len(INPUTS)} "
               f"contexts={len(CONTEXTS)}")
-        print(f"rows={len(grid) + len(chains)} ({len(grid)} grid + {len(chains)} chain)")
+        print(f"rows={n_grid + len(chains)} ({n_grid} grid + {len(chains)} chain)")
         for operand in OPERANDS:
             print(f"  operand: {operand}")
         return 0
@@ -3348,15 +3403,19 @@ def main():
         if not os.access(path, os.X_OK):
             print(f"error: {name} build {path!r} is not executable", file=sys.stderr)
             return 2
+    if not os.access(ORACLE, os.X_OK):
+        print(f"error: oracle {ORACLE!r} is not executable", file=sys.stderr)
+        return 2
     ver = subprocess.run([ORACLE, "--version"], capture_output=True, text=True).stdout.strip()
     if not ver.startswith(ORACLE_VERSION):
         print(f"error: oracle is {ver!r}, expected {ORACLE_VERSION}*", file=sys.stderr)
         return 2
 
-    rows = grid
-    if args.sample and args.sample < len(rows):
-        random.Random(args.seed).shuffle(rows)
-        rows = rows[: args.sample]
+    if args.sample:
+        # Drawn while generating: the whole grid as a list is about 15 GB (#5552).
+        rows = reservoir_sample(iter_grid(*grid_args), args.sample, random.Random(args.seed))
+    else:
+        rows = list(iter_grid(*grid_args))
     rows = rows + chains  # the timing axis is never sampled away
     print(f"{len(rows)} rows x {len(builds)} builds + oracle; {args.jobs} jobs", file=sys.stderr)
 
@@ -3429,10 +3488,23 @@ def main():
         partial.close()
         os.remove(partial.name)
 
+    failed = False
     if regressions:
         print(f"\nFAIL: {len(regressions)} regression(s) vs {base}")
+        failed = True
+    if args.jq_gate:
+        # No residual is documented, so against jq alone a wrong answer or a timeout is never expected.
+        wrong = [r for r in records if r["classes"][cand] in ("ACCEPT_WRONG", "DIFF", "TIMEOUT")]
+        print(f"\nACCEPT_WRONG, DIFF or TIMEOUT of the candidate against jq (--jq-gate): {len(wrong)}")
+        for r in wrong[: args.show]:
+            print(f"  [{r['label']}] input={r['input']} {r['classes'][cand]}")
+            print(f"    program  : {r['program']}")
+            print(f"    jq       : {r['oracle']}")
+            print(f"    candidate: {r['outputs'][cand]}")
+        failed = failed or bool(wrong)
+    if failed:
         return 1
-    print("\nOK" if base else "\ndone")
+    print("\nOK" if base or args.jq_gate else "\ndone")
     return 0
 
 
