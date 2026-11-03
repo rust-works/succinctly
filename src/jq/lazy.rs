@@ -1301,11 +1301,13 @@ mod tests {
         }
     }
 
-    /// #2868: a trailing dot without an exponent takes the raw-number
-    /// parser's plain Float fallback. In this range the generic document
-    /// conversion would instead wrap the float in a decimal NumberLiteral.
+    /// #2868: both cursor materializers agree on a trailing dot without an
+    /// exponent. They took the raw-number parser's plain Float fallback until
+    /// #6052, which keeps the digits as a literal instead (jq prints
+    /// `100000000000000000000` for this token); the value and its text are
+    /// pinned here.
     #[test]
-    fn lazy_cursor_materialization_keeps_plain_float_fallback_2868() {
+    fn lazy_cursor_materialization_reads_a_trailing_dot_as_an_integer_literal_2868() {
         use crate::json::JsonIndex;
         let json = br"[100000000000000000000.]";
         let index = JsonIndex::build(json);
@@ -1318,7 +1320,11 @@ mod tests {
                 panic!("expected an array")
             };
             assert_eq!(values.len(), 1);
-            assert!(matches!(values[0], OwnedValue::Float(f) if f == 1e20));
+            assert_eq!(values[0].as_f64(), Some(1e20));
+            assert_eq!(
+                values[0].number_str().as_deref(),
+                Some("100000000000000000000")
+            );
         }
     }
 

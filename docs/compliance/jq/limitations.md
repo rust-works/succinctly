@@ -11869,55 +11869,31 @@ behaviours to make. Pinned against jq 1.7.1 on a 2,015-row table
 (`tests/data/jq-literal-17-digit-oracle-2936.tsv`) plus the entry-point matrix in
 `tests/jq_cli_tests.rs` and the two-evaluator rows in `tests/jq_evaluator_parity_tests.rs`.
 
-### `--argjson`/`--jsonargs`/`fromjson` still reject a bare trailing decimal point with no exponent (`1.`) — accepted divergence, ADR-0018 rule 4c (#2240, #3032)
+### A bare trailing decimal point with no exponent (`1.`) reads as the integer (#6052) — divergence closed
 
-Real jq's own number reader accepts a bare trailing `.` with nothing after it at all,
-treating it the same as if the dot weren't there:
+Real jq's number reader accepts a bare trailing `.` with nothing after it and reads the integer:
+`jq -n --argjson x '1.' '$x'` is `1`, `"99999999999999999." | fromjson` is `99999999999999999`.
 
-```console
-$ jq -n --argjson x '1.' '$x'
-1
-$ succinctly jq -n --argjson x '1.' '$x'
-Error: Invalid JSON for --argjson x
-```
-
-#2240 fixed `--argjson`/`--jsonargs` to accept the *other* two number leniencies real jq's
-own parser tolerates that strict RFC 8259 doesn't — a leading decimal point (`.5`, #1171)
-and a trailing decimal point immediately *before an exponent marker* (`1.e5`, #2220) — but
-deliberately not this third, narrower shape. Accepting it would route the literal through
-`OwnedValue::from_number_bytes`/`StandardJson::number_literal()`'s shared, pre-existing
-large-integer-precision gap: a bare trailing dot with no exponent on an integer too large
-for `f64` to represent exactly materializes as the wrong integer regardless of entry point
-(confirmed live via plain document input, unrelated to `--argjson`):
+`--argjson`, `--jsonargs` and `fromjson` refused it from #2240 until #6052 (ADR-0018 rule 4c), and `succinctly jq -c .` on a large one answered the wrong integer:
 
 ```console
 $ jq -c '.' <<< '99999999999999999.'
 99999999999999999
-$ succinctly jq -c '.' <<< '99999999999999999.'
+$ succinctly jq -c '.' <<< '99999999999999999.'      # before #6052
 100000000000000000
 ```
 
-#2052 later replaced the whole validation gate behind these flags -- `serde_json` plus one
-text-rewriting normalizer per leniency became one lenient mode on this crate's own RFC 8259
-validator (`json::validate::validate_jq_lenient`) -- and this rejection moved with it,
-unchanged and for the same reason: the lenient mode admits the other three spellings and
-refuses a bare trailing dot explicitly, with `validate_number`'s own comment pointing back
-at this row. The accept-set is pinned against jq 1.7.1 in
-`test_argjson_accept_set_matches_jq_2052`/`test_argjson_reject_set_2052`
-(`tests/jq_cli_tests.rs`).
+The dot went to the lossy `f64` fallback, which cannot hold an integer past 2^53.
+Accepting the token in the validator would have spread that wrong integer to every entry point, so the validator refused it.
 
-`from_number_bytes`'s own doc comment already documents this trade-off for the *general*
-(non-`--argjson`) case as deliberate, reasoning that real jq doesn't preserve this exact
-spelling either (`[1.] -> [1]` on both sides) — true only for a small value where the lossy
-`f64` round-trip happens to be lossless, not for a large one. Extending `--argjson`'s own
-acceptance to this shape would mean trading a clean rejection (the pre-#2240 status quo)
-for a value that's silently wrong rather than absent, for the one case where the
-underlying gap actually bites. Per ADR-0018 rule 4c: matching real jq's own acceptance here
-would risk corrupting data, the worse failure mode for the input shapes this actually
-covers — so `--argjson x '1.'` stays a clean, catchable error rather than a silent
-magnitude error, a narrower divergence from real jq than #2240's own issue text first
-scoped this fix to. Fixing the underlying large-integer-precision gap itself (so `1.` could
-be accepted safely at every magnitude) is out of scope for #2240 and not separately filed.
+The three funnels that turn a token into a number now drop the dot first (`json::validate::strip_bare_trailing_dot`): `OwnedValue::from_number_bytes`, the generic document materializer (`eval_generic::jq_bare_trailing_dot_number`) and `tonumber`.
+The literal they keep is the digits, so every other leniency composes with it (`+5.`, `007.`, `-0.`), the value prints as jq prints it, and the lenient validator can accept the token.
+It still needs an integer part: `.`, `-.`, `1.5.`, `1..` and `1.x` are refused, as in jq.
+
+jq mode only.
+yq reads the token as a float, so `succinctly yq` is unchanged (`5.` is `!!float`, a large one is `1e+17`).
+So is yq's own `--argjson` extension, which keeps refusing the token (`Validator::refusing_bare_trailing_dot`): real yq has no such flag to match, and its other route would read `5.` as `5.0` where the `-p json` reader reads `5`.
+Pinned in `tests/jq_cli/i6052.rs` against jq 1.7.1 (`fromjson`, `--argjson`, `tonumber` and the document reader on thirteen spellings).
 
 ### A plain decimal and an overflowing literal render with decNumber's notation (#3212) — divergence closed
 

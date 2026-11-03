@@ -24895,6 +24895,15 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
             .unwrap_or(c_text)
             .trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
     };
+    // jq reads a bare trailing dot as the integer (`"99999999999999999." | tonumber` is
+    // `99999999999999999`), so it is dropped here and the digits take every route below,
+    // `+` and leading-zero spellings included (#6052). yq reads the token as a float.
+    let trimmed = if yq_mode {
+        trimmed
+    } else {
+        crate::json::validate::strip_bare_trailing_dot(trimmed.as_bytes())
+            .map_or(trimmed, |digits| &trimmed[..digits.len()])
+    };
     // Materialize a JSON-shaped number as a `NumberLiteral` so it keeps its
     // *source spelling*, rather than collapsing it through a bare
     // `parse::<i64>()`/`parse::<f64>()` pair. Both oracles preserve the
@@ -25044,15 +25053,11 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
             OwnedValue::Float(f)
         });
     }
-    // The remaining lenient spellings jq's decNumber reader accepts but
-    // does not preserve the spelling of even on the document path -- a
-    // bare trailing `.` with no exponent (`5.` -> `5`, matching
-    // `from_number_bytes`'s own "deliberately left alone" rule, since real
-    // jq doesn't preserve that spelling either) -- fall through to a plain
-    // `Int`/`Float`, read under jq's number model (#2936) --
-    // `"14455058590201385605." | tonumber + 0` is `14455058590201387000`
-    // in jq, the same 17-digit rounding a document number gets, where
-    // Rust's own parse gave `…385000`.
+    // What reaches here is a spelling jq's decNumber reader accepts but whose text is not
+    // preserved, read as a plain `Int`/`Float` under jq's number model (#2936) --
+    // `"14455058590201385605.0" | tonumber + 0` is `14455058590201387000` in jq, the same
+    // 17-digit rounding a document number gets, where Rust's own parse gave `…385000`. (A bare
+    // trailing dot, `5.`, no longer arrives: it is dropped above, #6052.)
     if let Some(repr) = super::value::parse_i64_or_f64_in::<JqSemantics>(trimmed) {
         return Ok(match repr {
             NumberRepr::Int(i) => OwnedValue::Int(i),

@@ -10427,7 +10427,12 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
     if s.is_empty() {
         return Ok(OwnedValue::Null);
     }
-    validate::validate_jq_lenient(s.as_bytes())
+    // A bare trailing dot (`5.`) stays refused here: jq mode reads it since #6052, but this
+    // flag is yq's own extension and its reading of the token is undecided (#6052 follow-up).
+    validate::Validator::new(s.as_bytes())
+        .jq_lenient()
+        .refusing_bare_trailing_dot()
+        .validate()
         .map_err(|e| anyhow::anyhow!("invalid JSON: {s}: {e}"))?;
     let index = JsonIndex::build(s.as_bytes());
     let cursor = index.root(s.as_bytes());

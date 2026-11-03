@@ -176,6 +176,9 @@ pub struct Validator<'a> {
     /// Whether to accept the number and escape spellings real jq accepts
     /// but RFC 8259 does not -- see [`validate_jq_lenient`].
     jq_lenient: bool,
+    /// Whether [`jq_lenient`](Self::jq_lenient) still refuses a bare trailing dot (`5.`) -- see
+    /// [`refusing_bare_trailing_dot`](Self::refusing_bare_trailing_dot).
+    refuse_bare_trailing_dot: bool,
     /// The deepest container nesting accepted, [`MAX_NESTING_DEPTH`] unless
     /// [`with_max_depth`](Self::with_max_depth) raised it.
     max_depth: usize,
@@ -193,6 +196,7 @@ impl<'a> Validator<'a> {
             column: 1,
             nesting_depth: 0,
             jq_lenient: false,
+            refuse_bare_trailing_dot: false,
             max_depth: MAX_NESTING_DEPTH,
             deepest: 0,
         }
@@ -219,6 +223,16 @@ impl<'a> Validator<'a> {
     #[must_use]
     pub fn jq_lenient(mut self) -> Self {
         self.jq_lenient = true;
+        self
+    }
+
+    /// This validator, still in jq's accept-set, but refusing a bare trailing dot (`5.`) as it
+    /// did before #6052. `succinctly yq`'s `--argjson` keeps that refusal: it is an extension
+    /// real yq does not have, its reading of `5.` would differ from the `-p json` reader's, and
+    /// #6052 was a jq-mode change.
+    #[must_use]
+    pub fn refusing_bare_trailing_dot(mut self) -> Self {
+        self.refuse_bare_trailing_dot = true;
         self
     }
 
@@ -271,7 +285,7 @@ impl<'a> Validator<'a> {
             Some(b'.') if self.jq_lenient => self.validate_number(),
             // #2877: a leading `+` likewise -- `validate_number` peels it
             // exactly as it peels `-`, so `+X` is accepted iff `X` is,
-            // rule 4c's refusal of a bare trailing dot included (`+5.`).
+            // a bare trailing dot included (`+5.`, #6052).
             Some(b'+') if self.jq_lenient => self.validate_number(),
             Some(b't' | b'f' | b'n') => self.validate_keyword(),
             Some(b'+') => Err(self.error(ValidationErrorKind::LeadingPlus)),
@@ -712,17 +726,18 @@ impl<'a> Validator<'a> {
             // except in lenient mode, where a fraction elided before an
             // exponent (`1.e5`, #2240) is a spelling jq accepts.
             //
-            // A *bare* trailing dot (`5.`, `007.`, `0.`) stays rejected even
-            // there, and deliberately: jq answers `5`, but admitting it here
-            // would route `99999999999999999.` through `from_number_bytes`'s
-            // large-integer gap and materialize the wrong integer. That is
-            // the recorded rule-4c divergence in
-            // `docs/compliance/jq/limitations.md` (#2240), and this is the
-            // check that holds it.
+            // A *bare* trailing dot (`5.`, `007.`, `0.`) is jq's too, and
+            // reads as the integer (`99999999999999999.` is
+            // `99999999999999999`). It was refused here for #2240 (rule 4c)
+            // because the materializers turned a large one into the wrong
+            // integer; they drop the dot first now ([`strip_bare_trailing_dot`],
+            // #6052), so this admits it. The dot still needs an integer part:
+            // `.` and `-.` stay refused, as in jq.
             let fraction_digits = self.skip_digits();
-            let elided_before_exponent =
-                self.jq_lenient && integer_digits > 0 && matches!(self.peek(), Some(b'e' | b'E'));
-            if fraction_digits == 0 && !elided_before_exponent {
+            let elided = self.jq_lenient
+                && integer_digits > 0
+                && (!self.refuse_bare_trailing_dot || matches!(self.peek(), Some(b'e' | b'E')));
+            if fraction_digits == 0 && !elided {
                 return Err(self.error(ValidationErrorKind::InvalidNumber {
                     reason: "expected digit after decimal point",
                 }));
@@ -885,10 +900,9 @@ pub fn validate(input: &[u8]) -> Result<(), ValidationError> {
 /// `infinity1`) and a NaN with anything but digits after it (`nan1.5`,
 /// `nan(1)`) stay rejected, as they are in jq.
 ///
-/// **A bare trailing dot (`5.`, `007.`, `0.`) is rejected on purpose**,
-/// even though jq answers `5`: see `Validator::validate_number`'s own
-/// comment (private) and the rule-4c row in
-/// `docs/compliance/jq/limitations.md` (#2240).
+/// A bare trailing dot (`5.`, `007.`, `0.`) is accepted and read as the integer, as jq does
+/// (#6052). It was refused from #2240 until then, because the materializers turned a large
+/// one into the wrong integer; [`strip_bare_trailing_dot`] is what they apply now.
 ///
 /// This mode exists because the alternative -- rewriting the input text
 /// once per leniency to get it past a stricter validator -- does not scale.
@@ -916,7 +930,9 @@ pub fn validate(input: &[u8]) -> Result<(), ValidationError> {
 ///
 /// assert!(validate(b"007").is_err());
 /// assert!(validate_jq_lenient(b"007").is_ok());
-/// assert!(validate_jq_lenient(b"5.").is_err()); // rule-4c divergence, on purpose
+/// assert!(validate_jq_lenient(b"5.").is_ok());
+/// assert!(validate(b"5.").is_err());
+/// assert!(validate_jq_lenient(b".").is_err());
 /// ```
 pub fn validate_jq_lenient(input: &[u8]) -> Result<(), ValidationError> {
     Validator::new(input).jq_lenient().validate()
@@ -1041,6 +1057,39 @@ pub fn strip_redundant_leading_zeros(bytes: &[u8]) -> Option<Vec<u8>> {
     stripped.extend_from_slice(sign);
     stripped.extend_from_slice(&rest[i..]);
     Some(stripped)
+}
+
+/// `bytes` without its final `.` when it is an optionally signed run of digits and nothing but
+/// a bare trailing dot (`5.` -> `5`, `-007.` -> `-007`, `+5.` -> `+5`); `None` for anything
+/// else, `1.5.` and `.` included.
+///
+/// jq reads such a token as the integer and prints it as one (`99999999999999999.` is
+/// `99999999999999999`, #6052). The three funnels that turn a token into a number
+/// ([`OwnedValue::from_number_bytes`](crate::jq::OwnedValue::from_number_bytes), the
+/// document reader's `number_literal` and `tonumber`) apply this first, so the literal they
+/// keep is the digits and every other leniency (a `+`, a redundant leading zero) composes with
+/// it. Before #6052 the dot was left to the lossy `f64` fallback, which turned a large integer
+/// into the wrong one. jq mode only: yq reads the token as a float.
+///
+/// # Example
+///
+/// ```
+/// use succinctly::json::validate::strip_bare_trailing_dot;
+///
+/// assert_eq!(strip_bare_trailing_dot(b"99999999999999999."), Some(&b"99999999999999999"[..]));
+/// assert_eq!(strip_bare_trailing_dot(b"-007."), Some(&b"-007"[..]));
+/// assert_eq!(strip_bare_trailing_dot(b"1.5."), None);
+/// assert_eq!(strip_bare_trailing_dot(b"1.e5"), None);
+/// assert_eq!(strip_bare_trailing_dot(b"."), None);
+/// ```
+#[must_use]
+pub fn strip_bare_trailing_dot(bytes: &[u8]) -> Option<&[u8]> {
+    let body = bytes.strip_suffix(b".")?;
+    let digits = body
+        .strip_prefix(b"-")
+        .or_else(|| body.strip_prefix(b"+"))
+        .unwrap_or(body);
+    (!digits.is_empty() && digits.iter().all(u8::is_ascii_digit)).then_some(body)
 }
 
 /// Whether `bytes` becomes valid RFC 8259 number syntax after inserting a
@@ -1227,8 +1276,8 @@ pub fn may_spell_nan(text: &[u8]) -> bool {
 /// `+007.e5` -> `7E+5` (captured live). So the rule every caller applies is
 /// "`+X` behaves exactly like `X`": peel the sign here, then run the
 /// unsigned text through whatever the caller already does for `X` -- the
-/// strict grammar, the leading-dot/leading-zero/trailing-dot escapes, the
-/// rule-4c refusal of a bare trailing dot -- so the two spellings cannot
+/// strict grammar, the leading-dot/leading-zero/trailing-dot escapes, a
+/// bare trailing dot (dropped first, #6052) -- so the two spellings cannot
 /// drift apart. The literal a caller stores is the *unsigned* text, because
 /// a `NumberLiteral`'s text is re-read as JSON by the reindex bridge and
 /// storing `+…` would make that reparse depend on this leniency.
@@ -1849,12 +1898,10 @@ mod tests {
     }
 
     /// Lenient mode moves nothing else. The first group is rejected by jq
-    /// too; the second is the deliberate rule-4c divergence (jq accepts a
-    /// bare trailing dot, this validator must not -- see
-    /// `Validator::validate_number`), which a leading `+` must not route
-    /// around (#2877); the third is every way the #2877 word and sign
-    /// gates can fail to fire -- each row captured as `Invalid numeric
-    /// literal` (or `Invalid literal`) from jq 1.7.1.
+    /// too; the second is every way the #2877 word and sign gates can fail
+    /// to fire -- each row captured as `Invalid numeric literal` (or
+    /// `Invalid literal`) from jq 1.7.1. (A bare trailing dot used to be a
+    /// third group, rule 4c; it is accepted since #6052 and pinned below.)
     #[test]
     fn jq_lenient_rejects_everything_outside_the_four_leniencies_2052() {
         for s in [
@@ -1879,17 +1926,11 @@ mod tests {
             "\"tab\tin\"",
             "[,]",
             "{,}",
-            // rule-4c: jq answers 5 / 7 / 0 for these; rejected on purpose
-            "5.",
-            "-5.",
-            "[5.]",
-            r#"{"a":5.}"#,
-            "1.",
-            "0.",
-            "007.",
-            "+5.",
-            "+1.",
-            "+007.",
+            "1.5.",
+            "1..",
+            "5.x",
+            "+.",
+            "+-5.",
             // #2877: not decNumber's words, not a peelable `+`
             "nana",
             "nanx",
@@ -1998,6 +2039,15 @@ mod tests {
             "42",
             "-1.5e-3",
             "1e400",
+            // #6052: a bare trailing dot, jq's `5`, `7`, `0` and `99999999999999999`
+            "5.",
+            "-5.",
+            "1.",
+            "0.",
+            "007.",
+            "+5.",
+            "+007.",
+            "99999999999999999.",
             // #2877
             "+1",
             "+01",
@@ -2027,6 +2077,54 @@ mod tests {
                 "validator admits a number the decoder does not read as one: {s:?}"
             );
         }
+    }
+
+    /// #6052: jq reads a bare trailing dot as the integer and prints it as one. The literal the
+    /// decoder keeps is the digits -- `99999999999999999.` was `100000000000000000` while the dot
+    /// went to the lossy `f64` fallback, which is why rule 4c refused it. Each row captured from
+    /// jq 1.7.1 (`printf %s <tok> | jq -c .`, and `fromjson` and `--argjson` agree).
+    #[test]
+    fn a_bare_trailing_dot_is_the_integer_6052() {
+        use crate::jq::OwnedValue;
+        for (s, literal) in [
+            ("5.", "5"),
+            ("-5.", "-5"),
+            ("0.", "0"),
+            ("-0.", "-0"),
+            ("007.", "7"),
+            ("+5.", "5"),
+            ("99999999999999999.", "99999999999999999"),
+            ("-99999999999999999.", "-99999999999999999"),
+            ("100000000000000000000.", "100000000000000000000"),
+        ] {
+            assert!(validate_jq_lenient(s.as_bytes()).is_ok(), "{s:?}");
+            assert_eq!(
+                OwnedValue::from_number_bytes::<JqSemantics>(s.as_bytes())
+                    .number_str()
+                    .as_deref(),
+                Some(literal),
+                "{s:?}"
+            );
+        }
+        for s in ["[5.]", r#"{"a":5.}"#, "[1., 2.]", "1. ", " 1."] {
+            assert!(validate_jq_lenient(s.as_bytes()).is_ok(), "{s:?}");
+        }
+        // Not a number token in jq either: no integer part, a second dot, a trailing letter.
+        for s in [".", "-.", "+.", "1.5.", "1..", "1.x", "[1.x]"] {
+            assert!(validate_jq_lenient(s.as_bytes()).is_err(), "{s:?}");
+        }
+        // Strict mode keeps RFC 8259, and yq's `--argjson` keeps refusing the dot.
+        assert!(validate(b"5.").is_err());
+        let yq_flag = |s: &str| {
+            Validator::new(s.as_bytes())
+                .jq_lenient()
+                .refusing_bare_trailing_dot()
+                .validate()
+        };
+        assert!(yq_flag("5.").is_err());
+        assert!(yq_flag("[5.]").is_err());
+        assert!(yq_flag("1.e5").is_ok());
+        assert!(yq_flag(".5").is_ok());
     }
 
     // ========================================================================
@@ -2160,7 +2258,8 @@ mod tests {
     }
 
     /// `+X` is preservable exactly when `X` is: the peel and the four gates
-    /// compose, and the bare-trailing-dot refusal (rule 4c) rides along.
+    /// compose. A bare trailing dot is not a preservable literal *as written*; the funnels drop
+    /// it first ([`strip_bare_trailing_dot`], #6052), so it rides along as not preservable.
     #[test]
     fn is_preservable_number_literal_names_the_four_gates_2877() {
         for s in [
