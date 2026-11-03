@@ -4845,9 +4845,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // #5498: a plain `--stream` walk (no `-n`, no `-s`) reads its events through the same queue, from
     // the stream reader, so it holds neither the document nor its event list; the driver loop pops
     // them as `input` does. `-n` has no input of its own, so it reads only if the program does.
-    // So this is "reads through the queue", not "calls `input`": `stream_mode` and the reader's
-    // seeding in `get_inputs` check `stream_walk_by_reader` themselves, so a caller of either cannot
-    // send a plain walk down the eager expansion by mistake (`stream_walk_by_reader_agrees_with_get_inputs_5498`).
+    // So this is "reads through the queue", not "calls `input`": the reader's seeding in
+    // `get_inputs` checks `stream_walk_by_reader` itself, so a caller cannot send a plain walk down
+    // the document parse by mistake (`stream_walk_by_reader_agrees_with_get_inputs_5498`).
     let uses_input_builtins = jq::walk::uses_input_builtins(&expr) || stream_walk_by_reader(&args);
 
     // Configure output
@@ -5928,9 +5928,6 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }
             }
         } else {
-            let faulted = trailing_error.as_ref().is_some_and(|t| !t.seq_warning);
-            let stream_events_lazily =
-                stream_mode(&args, uses_input_builtins, faulted) == StreamMode::Lazy;
             'documents: for (idx, document) in inputs.iter().enumerate() {
                 // `UNKNOWN_LINE`, not just any missing entry, must clear the
                 // source too (#3202): `input_filename` can't otherwise tell
@@ -5952,9 +5949,6 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // mid-stream `debug`/`stderr`/`error` side effect lands ahead
                 // of output that logically preceded it.
                 //
-                // #4397: under `--stream` the program reads one `tostream` event at a time,
-                // each walked out of its document as the program asks for it, not kept.
-                let mut walk = stream_events_lazily.then(|| jq::tostream_events_iter(document));
                 // #5675: a `-R` line is already the string the filter reads, so it is handed over
                 // as that tree rather than written out as JSON text, indexed and read back for
                 // every line.
@@ -5967,57 +5961,39 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // without the reindex bridge; any other reads the array's own index, as before #5744,
                 // which that bridge made 10-15% slower on `[limit(5;.[])]` and `select`.
                 let owned_route = owned_route_for(
-                    walk.is_some(),
+                    false,
                     args.raw_input
                         && args.input_dsv.is_none()
                         && matches!(document, OwnedValue::String(_)),
-                    args.slurp
-                        && stream_mode(&args, uses_input_builtins, faulted) == StreamMode::Eager
-                        && matches!(document, OwnedValue::Array(_)),
+                    stream_slurp_by_reader(&args) && matches!(document, OwnedValue::Array(_)),
                 );
-                let mut whole = Some(document);
-                loop {
-                    let input = match walk.as_mut() {
-                        Some(events) => events.next().map(std::borrow::Cow::Owned),
-                        None => whole.take().map(std::borrow::Cow::Borrowed),
-                    };
-                    let Some(input) = input else {
-                        break;
-                    };
-                    // Each `--stream` event is a top-level input of its own,
-                    // as in jq, which runs the program once per event.
-                    if !finished.next_input(
-                        args.on_error,
-                        &mut sink,
-                        &mut had_output,
-                        &mut last_output,
-                    ) {
-                        break 'documents;
-                    }
-                    evaluate_input_streaming_via(
-                        &input,
-                        &expr,
-                        &context,
-                        &at,
-                        &mut sink,
-                        &output_config,
-                        owned_route,
-                        &mut |sink, result| {
-                            had_output = true;
-                            last_output = Some(result.clone());
-                            let stop = route_write_error(
-                                sink,
-                                &mut out,
-                                || at.resolve(),
-                                |o| write_output_owned_value(o, &result, &output_config),
-                            )?;
-                            Ok(!stop)
-                        },
-                    )?;
-                    if let Some(code) = sink.halted() {
-                        out.flush()?;
-                        return Ok(halt_exit_code(code, open_failed));
-                    }
+                if !finished.next_input(args.on_error, &mut sink, &mut had_output, &mut last_output)
+                {
+                    break 'documents;
+                }
+                evaluate_input_streaming_via(
+                    &std::borrow::Cow::Borrowed(document),
+                    &expr,
+                    &context,
+                    &at,
+                    &mut sink,
+                    &output_config,
+                    owned_route,
+                    &mut |sink, result| {
+                        had_output = true;
+                        last_output = Some(result.clone());
+                        let stop = route_write_error(
+                            sink,
+                            &mut out,
+                            || at.resolve(),
+                            |o| write_output_owned_value(o, &result, &output_config),
+                        )?;
+                        Ok(!stop)
+                    },
+                )?;
+                if let Some(code) = sink.halted() {
+                    out.flush()?;
+                    return Ok(halt_exit_code(code, open_failed));
                 }
             }
             // The parse error the stream ended in, reported after the
@@ -6415,7 +6391,10 @@ fn get_inputs(
     // #5498: plain `--stream`, under `-n`, reads the way `--stream-errors` does (jq's streaming
     // parser, which carries a token over a file boundary itself) and raises each fault as the
     // error jq raises; the rest of `--stream` keeps its own route for now.
-    let stream_by_reader = args.stream && !args.stream_errors && track_eof && !args.slurp;
+    // `-s` (#5498) reads the same way, whether or not the program reads `input`: the array holds
+    // the events, and the first fault is the error jq raises.
+    let stream_by_reader =
+        json_input_mode && args.stream && !args.stream_errors && (track_eof || args.slurp);
     let mut seams = if json_input_mode && !args.validate && !args.stream_errors && !stream_by_reader
     {
         stitch_json_file_seams(
@@ -6609,14 +6588,32 @@ fn get_inputs(
             });
             return Ok(Ok((Vec::new(), locations, None, Vec::new())));
         }
-        let read = crate::jq_stream_errors::read(&raw_bytes);
+        let mut read = if args.slurp {
+            crate::jq_stream_errors::read_for_slurp(&raw_bytes, stream_by_reader)
+        } else {
+            crate::jq_stream_errors::read(&raw_bytes)
+        };
+        // Without `--stream-errors` a fault is not an input: `-s` reads everything before it
+        // runs the program, so the first one is the whole result (#5498), and the read stopped
+        // there.
+        if let (true, Some((message, (source, line)))) = (stream_by_reader, read.first_fault.take())
+        {
+            return Ok(Err(MalformedJsonError::new(EvalError::new(message))
+                .at_stream_fault(source, line)
+                .into()));
+        }
+        // The slurp read keeps the last few locations only: more values after the array than that
+        // (none seen) are read again with all of them.
+        if args.slurp && read.inside < read.locations_from {
+            read = crate::jq_stream_errors::read(&raw_bytes);
+        }
         let mut values = read.values;
         let mut value_locations = read.locations;
         // `--slurp` closes its array at the call that empties jq's buffer, so what that call left
         // behind comes out after the array as inputs of their own.
         let after_array = args.slurp.then(|| {
             let outside = values.split_off(read.inside);
-            let outside_locations = value_locations.split_off(read.inside);
+            let outside_locations = value_locations.split_off(read.inside - read.locations_from);
             let (source, line) = read.slurp_at;
             values = vec![OwnedValue::array_from(std::mem::take(&mut values))];
             value_locations = vec![(source, line)];
@@ -6774,7 +6771,6 @@ fn get_inputs(
     } else {
         raw_inputs.last().map(|(_, raw)| raw.as_bytes())
     };
-    let last_ends_on_close = raw_inputs.last().is_some_and(|(_, raw)| ends_on_close(raw));
     let slurp_eof_line: Option<usize> = if args.slurp {
         last_source.and_then(|raw| {
             // #1550: the drop check reads across every file as one stream,
@@ -6827,20 +6823,6 @@ fn get_inputs(
     // filter's own `input`. jq has lost its position by then -- the call
     // that raises it closed the stream -- so it names `<unknown>`.
     let mut resumed_errors: Vec<(usize, TrailingParseError)> = seq_fault_errors;
-    // #5635: the `--stream` events of the document the parse error ended, which jq's streaming
-    // parser yielded before it met the fault -- `(event, source, line)`.
-    let mut stream_prefix: Vec<StreamPrefix> = Vec::new();
-    // ... and of each fault a program using `input`/`inputs` resumes after, parallel to
-    // `resumed_errors`.
-    let mut resumed_prefixes: Vec<Vec<StreamPrefix>> = Vec::new();
-    let prefix_wanted = args.stream && stream_mode(args, track_eof, true) != StreamMode::Off;
-    // #5618: a run known to keep the `--stream` events builds each document as its events, so
-    // the documents that parse are never built as values.
-    let form = if stream_mode(args, track_eof, false) == StreamMode::Eager {
-        DocumentForm::StreamEvents
-    } else {
-        DocumentForm::Value
-    };
     let mut trailing_error: Option<TrailingParseError> =
         seq_deferred_warning.map(|message| TrailingParseError {
             error: EvalError::new(message),
@@ -7012,7 +6994,7 @@ fn get_inputs(
                         });
                         let seg_origin = seg_pos.map(|file| StreamOrigin { file, before: &[] });
                         let (parsed, parse_error, fault_end) =
-                            parse_json_stream_prefix_ending(segment, seg_origin, form);
+                            parse_json_stream_prefix_ending(segment, seg_origin);
                         let (spans, split_error) = split_json_values(segment.as_bytes());
                         if spans.len() < parsed.len() {
                             // patchcov: coverage tolerate reason="unreachable: the splitter is the more lenient of the two and the prefix parse materializes from its spans, so it cannot find fewer values -- the same internal-error guard as the non-resuming branch below (#1064), kept per segment (#4311)"
@@ -7058,22 +7040,8 @@ fn get_inputs(
                             }
                             break;
                         };
-                        // #5635: what jq's streaming parser read of the malformed document before it
-                        // met the fault, ahead of the error.
-                        let base = if prefix_wanted {
-                            faults.line_at_read_of(start);
-                            faults.newlines_before_pos
-                        } else {
-                            0
-                        };
                         let (_, line, resume) =
                             meet_fault(&mut faults, raw.as_bytes(), start, args.stream);
-                        resumed_prefixes.push(if prefix_wanted {
-                            let end = resume.clamp(start, raw.len());
-                            stream_prefix_events(&raw.as_bytes()[start..end], src, base)
-                        } else {
-                            Vec::new()
-                        });
                         resumed_errors.push((
                             values.len(),
                             TrailingParseError {
@@ -7099,7 +7067,6 @@ fn get_inputs(
                         // `8`).
                         while next < raw.len() && !raw.is_char_boundary(next) {
                             let line = faults.line_at_read_of(next);
-                            resumed_prefixes.push(Vec::new());
                             resumed_errors.push((
                                 values.len(),
                                 TrailingParseError {
@@ -7131,7 +7098,7 @@ fn get_inputs(
                 }
                 // Parse as JSON stream: the clean prefix, and the parse error
                 // that ended it if the stream turned malformed (#2961).
-                let (mut parsed, parse_error) = parse_json_stream_prefix(&raw, origin(&[]), form);
+                let (mut parsed, parse_error) = parse_json_stream_prefix(&raw, origin(&[]));
                 // `--slurp` stays all-or-nothing: jq prints nothing for a
                 // slurped stream it could not finish parsing. The error goes
                 // out in jq's channel at exit 5, like every other malformed
@@ -7154,7 +7121,6 @@ fn get_inputs(
                 // `locations.extend_from_ends`, so slurp mode skips that scan
                 // entirely rather than running it and discarding the result.
                 let mut error_line = 0;
-                let mut fault_start = None;
                 if !args.slurp {
                     // The splitter recognizes every span the parse above
                     // produced a value for (it is the more lenient of the two,
@@ -7200,7 +7166,6 @@ fn get_inputs(
                     locations.extend_from_ends(src, &raw, seam.clone(), &ends, parsed.len());
                     if let Some(start) = malformed_start {
                         error_line = parse_error_line(raw.as_bytes(), start, seam, args.stream);
-                        fault_start = Some(start);
                     }
                 }
                 values.extend(parsed);
@@ -7208,15 +7173,6 @@ fn get_inputs(
                 // after it is read, this file or any later one, and the error
                 // is raised once the documents before it have been (#2961).
                 if let Some(error) = parse_error {
-                    // #5635: `--stream` hands the program what jq's streaming parser read of the
-                    // malformed document before it met the fault, ahead of the error.
-                    if let Some(start) = fault_start.filter(|_| prefix_wanted) {
-                        let bytes = raw.as_bytes();
-                        let end =
-                            fault_read_end(bytes, parse_error_detection(bytes, start, args.stream));
-                        let base = count_newlines(&bytes[..start]);
-                        stream_prefix = stream_prefix_events(&bytes[start..end], src, base);
-                    }
                     trailing_error = Some(TrailingParseError {
                         error,
                         source: u32::try_from(src).unwrap_or(u32::MAX),
@@ -7247,45 +7203,14 @@ fn get_inputs(
         "the end of stream is recorded where it can be read"
     );
 
-    // #4397: `--stream` feeds the program `tostream`'s events in place of each document, `-s`
-    // slurping the events and `input`/`inputs` reading them. Each event keeps its document's
-    // location. Only those two need the events kept; a program that reads `.` walks each
-    // document's events one at a time in `run_jq`'s loop instead.
-    let mut unflushed_close = None;
-    let faulted = trailing_error.as_ref().is_some_and(|t| !t.seq_warning);
-    if stream_mode(args, track_eof, faulted) == StreamMode::Eager {
-        expand_into_stream_events(&mut values, &mut locations, &mut resumed_errors, form);
-        insert_stream_prefixes(
-            &mut values,
-            &mut locations,
-            &mut resumed_errors,
-            resumed_prefixes,
-        );
-        for (event, source, line) in stream_prefix {
-            values.push(event);
-            locations.push(source, line);
-        }
-        // #5548: only the slurped array is wrapped up front; the event jq's parser still holds at
-        // EOF is a value of its own after it.
-        if args.slurp && last_ends_on_close {
-            unflushed_close = take_unflushed_close(&mut values);
-        }
-    }
-
     // Slurp mode: wrap all inputs in an array
     if args.slurp {
         let at = match locations.slurp_eof(slurp_eof_line) {
             Some((src, line)) => locations.resolve(src, line),
             None => InputLocation::unknown(),
         };
-        let mut slurped = vec![OwnedValue::array_from(values)];
-        let mut slurped_locations = InputLocations::single(at);
-        if let Some(close) = unflushed_close {
-            slurped.push(close);
-            // Read after the input is exhausted: no file, no line (`input_line_number` 0,
-            // `input_filename` null, `(at <unknown>)`).
-            slurped_locations.push(NO_SOURCE as usize, UNKNOWN_LINE as usize);
-        }
+        let slurped = vec![OwnedValue::array_from(values)];
+        let slurped_locations = InputLocations::single(at);
         Ok(Ok((
             slurped,
             slurped_locations,
@@ -7303,47 +7228,6 @@ fn get_inputs(
     }
 }
 
-/// Whether the last byte of a file is the `]` or `}` that closes its document, with no whitespace
-/// after it (#5548).
-fn ends_on_close(raw: &str) -> bool {
-    matches!(raw.as_bytes().last(), Some(b']' | b'}'))
-}
-
-/// jq's streaming parser emits a scalar element's value event when the `,` or closer after it
-/// arrives, and the closing event of a top-level array or object that scalar ends only at the next
-/// byte -- or, when there is none, once its input is exhausted (#5548). `jq -s --stream` has
-/// finished the array by then, so that one event is a value after it: `[1,2]` with no trailing
-/// newline slurps to `[[[0],1],[[1],2]]` and then `[[1]]`, where `[1,2]\n` and `[1,[2]]` slurp
-/// whole. Removes and returns that event from the `--stream` events of the last document.
-fn take_unflushed_close(events: &mut Vec<OwnedValue>) -> Option<OwnedValue> {
-    let [.., before, close] = events.as_slice() else {
-        return None;
-    };
-    let is_close = matches!(close, OwnedValue::Array(parts) if parts.len() == 1);
-    let is_scalar_leaf = matches!(
-        before,
-        OwnedValue::Array(parts) if parts.len() == 2
-            && !matches!(parts[1], OwnedValue::Array(_) | OwnedValue::Object(_))
-    );
-    if is_close && is_scalar_leaf {
-        events.pop()
-    } else {
-        None
-    }
-}
-
-/// How `--stream` hands the program its events (#4397): not at all, expanded up front in
-/// [`get_inputs`] (a program that slurps or reads `input`/`inputs` keeps them), or walked one at a
-/// time by `run_jq`'s loop. One definition for both sites, so they cannot disagree about who
-/// expands. The `-n` placeholder `null` is not a document, and `-R`, `--seq` and DSV input have
-/// no JSON documents to expand.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StreamMode {
-    Off,
-    Eager,
-    Lazy,
-}
-
 /// Whether a plain `--stream` walk (#5498) is read by the stream reader through the input queue:
 /// a program with no `-n` and no `-s`, over JSON documents. Under `-n` the program asks for its
 /// inputs itself, and `-s` holds the whole array.
@@ -7357,138 +7241,15 @@ fn stream_walk_by_reader(args: &JqCommand) -> bool {
         && !args.seq
 }
 
-fn stream_mode(args: &JqCommand, uses_input_builtins: bool, faulted: bool) -> StreamMode {
-    let json_documents = args.input_dsv.is_none() && !args.raw_input && !args.seq;
-    // `--stream-errors` reads the events itself (#5474), so there is nothing left to expand.
-    // A plain walk (#5498) is read by the stream reader through the input queue, whichever way
-    // `uses_input_builtins` was set for it: nothing is left to expand.
-    if !args.stream || args.stream_errors || !json_documents || stream_walk_by_reader(args) {
-        StreamMode::Off
-    } else if args.slurp || uses_input_builtins {
-        StreamMode::Eager
-    } else if args.null_input {
-        StreamMode::Off
-    } else if faulted {
-        // #5635: the events of the document the parse error ended come with the error, after the
-        // events of the documents before it.
-        StreamMode::Eager
-    } else {
-        StreamMode::Lazy
-    }
-}
-
-/// One `--stream` event jq's streaming parser yielded before it met a fault (#5635): the event,
-/// and the source and line of the read that yielded it.
-type StreamPrefix = (OwnedValue, usize, usize);
-
-/// Where the read of jq's that holds the byte it detects a fault at ends: through the next
-/// newline, or the end of the input (#5635). The streaming parser has met the fault by then, so
-/// it need read no further.
-fn fault_read_end(bytes: &[u8], detected: usize) -> usize {
-    let detected = detected.min(bytes.len());
-    bytes[detected..]
-        .iter()
-        .position(|&b| b == b'\n')
-        .map_or(bytes.len(), |newline| detected + newline + 1)
-}
-
-/// The events of the malformed document `document` holds, which jq's streaming parser yielded
-/// before it met the fault (#5635): `document` runs from the start of the malformed value to the
-/// end of the read that holds the fault, so a large input is not read on past it.
-/// `newlines_before` is the number of newlines before the document, which the parser's own count
-/// of the lines it has read goes on from.
-fn stream_prefix_events(
-    document: &[u8],
-    source: usize,
-    newlines_before: usize,
-) -> Vec<StreamPrefix> {
-    crate::jq_stream_errors::events_before_fault(document)
-        .into_iter()
-        .map(|(event, lines)| (event, source, newlines_before + lines))
-        .collect()
-}
-
-/// Put each resumed fault's [`StreamPrefix`] events in front of the fault, in `values` already
-/// expanded to events, and move every fault to the end of its events (#5635). One pass over
-/// `values`, since a file can hold many faults.
-fn insert_stream_prefixes(
-    values: &mut Vec<OwnedValue>,
-    locations: &mut InputLocations,
-    resumed_errors: &mut [(usize, TrailingParseError)],
-    prefixes: Vec<Vec<StreamPrefix>>,
-) {
-    if prefixes.iter().all(Vec::is_empty) || prefixes.len() != resumed_errors.len() {
-        return;
-    }
-    let located = locations.per_value.len() == values.len();
-    let added = prefixes.iter().map(Vec::len).sum::<usize>();
-    let mut old_values = std::mem::take(values).into_iter();
-    let mut old_locations = std::mem::take(&mut locations.per_value).into_iter();
-    values.reserve(old_values.len() + added);
-    let mut copied = 0;
-    let mut inserted = 0;
-    for ((at, _), prefix) in resumed_errors.iter_mut().zip(prefixes) {
-        // The faults are in stream order, so each `at` is no less than the one before it.
-        let take = at.saturating_sub(copied);
-        values.extend(old_values.by_ref().take(take));
-        if located {
-            locations
-                .per_value
-                .extend(old_locations.by_ref().take(take));
-        }
-        copied += take;
-        inserted += prefix.len();
-        for (event, source, line) in prefix {
-            values.push(event);
-            if located {
-                locations.per_value.push((source as u32, line as u32));
-            }
-        }
-        *at += inserted;
-    }
-    values.extend(old_values);
-    if located {
-        locations.per_value.extend(old_locations);
-    }
-}
-
-/// Replace each of `values` with its `tostream` events (#4397), repeating its location for every
-/// event and moving each resumed error to the same place in the longer stream. Under
-/// [`DocumentForm::StreamEvents`] each of `values` is already the array of its events (#5618).
-fn expand_into_stream_events(
-    values: &mut Vec<OwnedValue>,
-    locations: &mut InputLocations,
-    resumed_errors: &mut [(usize, TrailingParseError)],
-    form: DocumentForm,
-) {
-    let documents = std::mem::take(values);
-    let document_count = documents.len();
-    let located = locations.per_value.len() == document_count;
-    let old_locations = std::mem::take(&mut locations.per_value);
-    let mut starts = Vec::with_capacity(document_count + 1);
-    for (index, document) in documents.into_iter().enumerate() {
-        starts.push(values.len());
-        // Under `StreamEvents` the parse built each document as its events (#5618). Otherwise
-        // `into_iter` hands over one document at a time and it is dropped once its events exist,
-        // so the events take its leaves instead of copying them (#5611).
-        let events = match (form, document) {
-            (DocumentForm::StreamEvents, OwnedValue::Array(events)) => events.into_vec(),
-            (DocumentForm::StreamEvents, document) => {
-                unreachable!("a document built as its events is an array: {document:?}")
-                // patchcov: coverage tolerate-line reason="unreachable: under StreamEvents every value get_inputs parses is built by json_document_to_owned_value as the array of its events, and nothing else is pushed before the expansion (#5618)"
-            }
-            (DocumentForm::Value, document) => succinctly::jq::tostream_events_owned(document),
-        };
-        if located {
-            let target = locations.per_value.len() + events.len();
-            locations.per_value.resize(target, old_locations[index]);
-        }
-        values.extend(events);
-    }
-    starts.push(values.len());
-    for (position, _) in resumed_errors.iter_mut() {
-        *position = starts[(*position).min(document_count)];
-    }
+/// Whether `--stream -s` (#5498) is read by the stream reader: the array holds the events, and the
+/// first fault is the parse error jq raises.
+fn stream_slurp_by_reader(args: &JqCommand) -> bool {
+    args.stream
+        && !args.stream_errors
+        && args.slurp
+        && args.input_dsv.is_none()
+        && !args.raw_input
+        && !args.seq
 }
 
 /// `input_filename`'s name for each input source tag (#3046): one per file,
@@ -9374,9 +9135,7 @@ fn lazy_json_producer_then(
         let converted = batch
             .as_ref()
             .and_then(|batch| batch.document(bytes, &lazy.spans, at))
-            .unwrap_or_else(|| {
-                stream_document_validated(&bytes[start..end], None, &[], 0, DocumentForm::Value)
-            });
+            .unwrap_or_else(|| stream_document_validated(&bytes[start..end], None, &[], 0));
         // Narrowed as `InputLocations::push` narrows the eager route's lines.
         let produced = jq::ProducedInput::converted(converted, lazy.source, line as u32);
         if next == lazy.spans.len() {
@@ -10226,7 +9985,7 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
     }
 
     let origin = Some(StreamOrigin::ALONE);
-    match parse_json_stream_strict(s, origin, text, lead, DocumentForm::Value) {
+    match parse_json_stream_strict(s, origin, text, lead) {
         Ok(values) => Ok(values),
         Err(e) => {
             let bytes = s.as_bytes();
@@ -10234,13 +9993,7 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
                 Ok(spans) => spans
                     .into_iter()
                     .map(|(start, end)| {
-                        stream_document_checked(
-                            &bytes[start..end],
-                            origin,
-                            text,
-                            lead + start,
-                            DocumentForm::Value,
-                        )
+                        stream_document_checked(&bytes[start..end], origin, text, lead + start)
                     })
                     // Wrapped rather than flattened, for the same reason as
                     // the sibling site in `parse_json_stream_strict`: the
@@ -10269,9 +10022,8 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
 fn parse_json_stream_prefix(
     s: &str,
     origin: Option<StreamOrigin<'_>>,
-    form: DocumentForm,
 ) -> (Vec<OwnedValue>, Option<EvalError>) {
-    let (values, error, _) = parse_json_stream_prefix_ending(s, origin, form);
+    let (values, error, _) = parse_json_stream_prefix_ending(s, origin);
     (values, error)
 }
 
@@ -10281,7 +10033,6 @@ fn parse_json_stream_prefix(
 fn parse_json_stream_prefix_ending(
     s: &str,
     origin: Option<StreamOrigin<'_>>,
-    form: DocumentForm,
 ) -> (Vec<OwnedValue>, Option<EvalError>, Option<(usize, usize)>) {
     // The same trim as [`parse_json_stream`]'s (#5654), so the two accept the same text.
     let (text, lead) = (
@@ -10292,7 +10043,7 @@ fn parse_json_stream_prefix_ending(
     if s.is_empty() {
         return (vec![], None, None);
     }
-    if let Ok(values) = parse_json_stream_strict(s, origin, text, lead, form) {
+    if let Ok(values) = parse_json_stream_strict(s, origin, text, lead) {
         return (values, None, None);
     }
     // #5555: jq's parser names the first fault of the text, which can sit inside a value the
@@ -10308,7 +10059,7 @@ fn parse_json_stream_prefix_ending(
     let (spans, split_error) = split_json_values(bytes);
     let mut values = Vec::with_capacity(spans.len());
     for (start, end) in spans {
-        match stream_document_checked(&bytes[start..end], origin, text, lead + start, form) {
+        match stream_document_checked(&bytes[start..end], origin, text, lead + start) {
             Ok(value) => values.push(value),
             Err(error) if error.is_decode_failure() => {
                 return match jq_fault() {
@@ -10339,7 +10090,6 @@ fn parse_json_stream_strict(
     origin: Option<StreamOrigin<'_>>,
     text: &[u8],
     lead: usize,
-    form: DocumentForm,
 ) -> Result<Vec<OwnedValue>> {
     // Validate the whole stream via `serde_json::Deserializer` (for its own error message and its
     // rejection of anything that isn't valid, whitespace-or-self-delineated-separated JSON) --
@@ -10391,7 +10141,7 @@ fn parse_json_stream_strict(
             // this call's guard rather than an incidental by-product of
             // whatever validated the text -- and since #5608 it is the only
             // one: `IgnoredAny` has no recursion limit to lean on.
-            stream_document_validated(&bytes[start..end], origin, text, lead + start, form)
+            stream_document_validated(&bytes[start..end], origin, text, lead + start)
                 .map_err(|e| anyhow::Error::from(MalformedJsonError::new(e)))?,
         );
         prev_end = end;
@@ -10921,14 +10671,14 @@ fn evaluate_input_streaming(
     )
 }
 
-/// The route `run_jq` gives an input that is already a tree (#5681, #5764): a lazily walked
-/// `--stream` event or a `-R` line (`lazy_events`, `raw_line`) always reads it where it is; the array
-/// `--stream -s` slurps (`eager_slurped_array`) does so only for a program the owned evaluator
+/// The route `run_jq` gives an input that is already a tree (#5681, #5764): a
+/// `--stream` event or a `-R` line (`events`, `raw_line`) always reads it where it is; the array
+/// `--stream -s` slurps (`slurped_stream_array`) does so only for a program the owned evaluator
 /// answers without re-indexing; anything else is written out and read through its own index.
-fn owned_route_for(lazy_events: bool, raw_line: bool, eager_slurped_array: bool) -> OwnedRoute {
-    if lazy_events || raw_line {
+fn owned_route_for(events: bool, raw_line: bool, slurped_stream_array: bool) -> OwnedRoute {
+    if events || raw_line {
         OwnedRoute::Always
-    } else if eager_slurped_array {
+    } else if slurped_stream_array {
         OwnedRoute::WhereAnswered
     } else {
         OwnedRoute::Off
@@ -13027,20 +12777,7 @@ fn json_document_to_owned_value_checked(
     bytes: &[u8],
     at: Option<&dyn Fn() -> (usize, usize)>,
 ) -> core::result::Result<OwnedValue, EvalError> {
-    json_document_to_owned_value(bytes, at, Delimiters::Walk, DocumentForm::Value)
-}
-
-/// What [`json_document_to_owned_value`] builds of a document.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DocumentForm {
-    /// The document's value.
-    Value,
-    /// The array of the `tostream` events `--stream` replaces the document with, for a run that
-    /// keeps them ([`StreamMode::Eager`] known before the parse, #5618), which
-    /// [`expand_into_stream_events`] then flattens. The events are walked from the document's
-    /// index ([`jq::json_tostream_events`]) without building the value; a document that walk
-    /// declines is converted, and the value's events are taken.
-    StreamEvents,
+    json_document_to_owned_value(bytes, at, Delimiters::Walk)
 }
 
 /// How [`json_document_to_owned_value`] establishes that the delimiters of `bytes` are in place
@@ -13063,7 +12800,6 @@ fn json_document_to_owned_value(
     bytes: &[u8],
     at: Option<&dyn Fn() -> (usize, usize)>,
     delimiters: Delimiters,
-    form: DocumentForm,
 ) -> core::result::Result<OwnedValue, EvalError> {
     let index = JsonIndex::build(bytes);
     if let Some(at) = at {
@@ -13077,12 +12813,6 @@ fn json_document_to_owned_value(
     if let Delimiters::Walk = delimiters {
         validate_json_delimiters(&cursor, 0)?;
     }
-    // The delimiters are in place either way now, which is all the index walk leaves unchecked.
-    if form == DocumentForm::StreamEvents {
-        if let Some(events) = jq::json_tostream_events(&cursor) {
-            return Ok(OwnedValue::array_from(events));
-        }
-    }
     // `bytes` is often a temporary (an `--argjson` string, a `--seq` record),
     // so each NaN gets an identity of its own rather than its address (#3309).
     let value = match delimiters {
@@ -13091,12 +12821,7 @@ fn json_document_to_owned_value(
         }
         Delimiters::SerdeValidated => serde_validated_value(&cursor, bytes)?,
     };
-    Ok(match form {
-        DocumentForm::Value => value,
-        DocumentForm::StreamEvents => {
-            OwnedValue::array_from(succinctly::jq::tostream_events_owned(value))
-        }
-    })
+    Ok(value)
 }
 
 /// The value of the document `cursor` is at, for text `serde_json` has accepted as a whole value
@@ -13120,9 +12845,8 @@ fn stream_document_checked(
     origin: Option<StreamOrigin<'_>>,
     text: &[u8],
     offset: usize,
-    form: DocumentForm,
 ) -> core::result::Result<OwnedValue, EvalError> {
-    stream_document(bytes, origin, text, offset, Delimiters::Walk, form)
+    stream_document(bytes, origin, text, offset, Delimiters::Walk)
 }
 
 /// [`stream_document_checked`] for a span `serde_json` has just accepted as a whole value
@@ -13133,16 +12857,8 @@ fn stream_document_validated(
     origin: Option<StreamOrigin<'_>>,
     text: &[u8],
     offset: usize,
-    form: DocumentForm,
 ) -> core::result::Result<OwnedValue, EvalError> {
-    stream_document(
-        bytes,
-        origin,
-        text,
-        offset,
-        Delimiters::SerdeValidated,
-        form,
-    )
+    stream_document(bytes, origin, text, offset, Delimiters::SerdeValidated)
 }
 
 fn stream_document(
@@ -13151,16 +12867,12 @@ fn stream_document(
     text: &[u8],
     offset: usize,
     delimiters: Delimiters,
-    form: DocumentForm,
 ) -> core::result::Result<OwnedValue, EvalError> {
     match origin {
-        Some(origin) => json_document_to_owned_value(
-            bytes,
-            Some(&|| origin.position(text, offset)),
-            delimiters,
-            form,
-        ),
-        None => json_document_to_owned_value(bytes, None, delimiters, form),
+        Some(origin) => {
+            json_document_to_owned_value(bytes, Some(&|| origin.position(text, offset)), delimiters)
+        }
+        None => json_document_to_owned_value(bytes, None, delimiters),
     }
 }
 
@@ -14705,13 +14417,7 @@ mod tests {
                     );
                     for at in next..batch.end {
                         let (start, end) = spans[at];
-                        let alone = stream_document_validated(
-                            &bytes[start..end],
-                            None,
-                            &[],
-                            0,
-                            DocumentForm::Value,
-                        );
+                        let alone = stream_document_validated(&bytes[start..end], None, &[], 0);
                         match batch.document(bytes, &spans, at) {
                             Some(together) => {
                                 batched += 1;
@@ -14790,14 +14496,8 @@ mod tests {
             None,
         );
         for (i, &(start, end)) in spans.iter().enumerate() {
-            let alone = stream_document_validated(
-                &stream.as_bytes()[start..end],
-                None,
-                &[],
-                0,
-                DocumentForm::Value,
-            )
-            .expect("converts");
+            let alone = stream_document_validated(&stream.as_bytes()[start..end], None, &[], 0)
+                .expect("converts");
             match producer() {
                 jq::ProducedInput::Document(value, _, line) => {
                     assert_eq!(value, alone, "document {i}");
@@ -14973,13 +14673,6 @@ mod tests {
             );
             if by_reader {
                 assert!(inputs.is_empty() && lazy.is_none(), "{argv:?}");
-                // The mode every caller of `stream_mode` sees, wherever it got the flag from.
-                assert!(
-                    [false, true]
-                        .into_iter()
-                        .all(|reads| stream_mode(&cmd, reads, false) == StreamMode::Off),
-                    "{argv:?}"
-                );
             }
         }
         // A stream that turns malformed keeps its clean start lazy (#5853); the number last before
@@ -16380,8 +16073,7 @@ mod tests {
             "",
         ] {
             let strict = parse_json_stream(text).ok().map(|values| values.len());
-            let (prefix, error) =
-                parse_json_stream_prefix(text, Some(StreamOrigin::ALONE), DocumentForm::Value);
+            let (prefix, error) = parse_json_stream_prefix(text, Some(StreamOrigin::ALONE));
             let by_prefix = error.is_none().then_some(prefix.len());
             assert_eq!(strict, by_prefix, "{text:?}");
         }
@@ -16699,18 +16391,6 @@ mod tests {
         );
         assert_eq!(stitched(&[b"{\"a\":"]), vec![b"{\"a\":".to_vec()]);
         assert_eq!(stitched(&[]), Vec::<Vec<u8>>::new());
-    }
-
-    /// #5635: the read holding the fault runs through the next newline, or to the end of the input.
-    #[test]
-    fn fault_read_end_runs_through_the_newline_after_the_fault_5635() {
-        let bytes = b"[1,2 x]\n[3]\n";
-        assert_eq!(fault_read_end(bytes, 5), 8);
-        // A fault on a newline is in the read that ends there.
-        assert_eq!(fault_read_end(bytes, 7), 8);
-        assert_eq!(fault_read_end(b"[1,2 x]", 5), 7);
-        assert_eq!(fault_read_end(b"[1,2 x]", 99), 7);
-        assert_eq!(fault_read_end(b"", 0), 0);
     }
 
     /// #4349: a fault in a value that also holds an invalid UTF-8 byte is placed as it is with a
@@ -17124,16 +16804,11 @@ mod tests {
             show(parse_json_stream_prefix(
                 "1 007 \"x\"",
                 Some(StreamOrigin::ALONE),
-                DocumentForm::Value
             )),
             (vec!["1".into(), "7".into(), "\"x\"".into()], None)
         );
         assert_eq!(
-            show(parse_json_stream_prefix(
-                "  ",
-                Some(StreamOrigin::ALONE),
-                DocumentForm::Value
-            )),
+            show(parse_json_stream_prefix("  ", Some(StreamOrigin::ALONE),)),
             (vec![], None)
         );
         // A splitter failure: truncated, unterminated, unmatched.
@@ -17143,23 +16818,18 @@ mod tests {
             ("1 2 \"abc", "Unfinished string at EOF at line 1, column 8"),
             ("1 2 }", "Unmatched '}' at line 1, column 5"),
         ] {
-            let (values, error) = show(parse_json_stream_prefix(
-                text,
-                Some(StreamOrigin::ALONE),
-                DocumentForm::Value,
-            ));
+            let (values, error) = show(parse_json_stream_prefix(text, Some(StreamOrigin::ALONE)));
             assert_eq!(values, vec!["1", "2"], "{text}");
             assert_eq!(error.as_deref(), Some(message), "{text}");
         }
         // Without an origin (`--stream`) the splitter's wording stands.
-        let (_, error) = show(parse_json_stream_prefix("1 2 }", None, DocumentForm::Value));
+        let (_, error) = show(parse_json_stream_prefix("1 2 }", None));
         assert_eq!(error.as_deref(), Some("Invalid JSON text"));
         // A span the splitter accepts but the materializer rejects: the
         // prefix ends there, and nothing after it is kept.
         let (values, error) = show(parse_json_stream_prefix(
             "1 2 {invalid} 3",
             Some(StreamOrigin::ALONE),
-            DocumentForm::Value,
         ));
         assert_eq!(values, vec!["1", "2"]);
         assert_eq!(
@@ -17176,7 +16846,7 @@ mod tests {
     #[test]
     fn strict_stream_route_agrees_with_the_checked_route_5608() {
         let strict = |text: &str, origin: Option<StreamOrigin<'_>>| {
-            parse_json_stream_strict(text, origin, text.as_bytes(), 0, DocumentForm::Value)
+            parse_json_stream_strict(text, origin, text.as_bytes(), 0)
         };
         let checked = |text: &str, origin: Option<StreamOrigin<'_>>| -> Vec<String> {
             let bytes = text.as_bytes();
@@ -17185,15 +16855,9 @@ mod tests {
             spans
                 .into_iter()
                 .map(|(start, end)| {
-                    stream_document_checked(
-                        &bytes[start..end],
-                        origin,
-                        bytes,
-                        start,
-                        DocumentForm::Value,
-                    )
-                    .expect("the checked route accepts it")
-                    .to_json()
+                    stream_document_checked(&bytes[start..end], origin, bytes, start)
+                        .expect("the checked route accepts it")
+                        .to_json()
                 })
                 .collect()
         };

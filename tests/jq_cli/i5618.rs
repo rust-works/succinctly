@@ -374,19 +374,19 @@ const ROWS: &[Row] = &[
     ),
 ];
 
-/// A repeated key on the routes that still decode the document first (`-s`, no `-n`): compared
-/// after decoding, first position, last value, one event.
+/// A repeated key under `-s`, which reads jq's streaming parser too since #5498: every
+/// occurrence is an event, as in jq 1.7.1.
 const COLLAPSED: &[Row] = &[
     (
         &["--stream", "-c", "-s", "."],
         r#"{"a":1,"a":2}"#,
-        "[[[\"a\"],2]]\n[[\"a\"]]",
+        "[[[\"a\"],1],[[\"a\"],2]]\n[[\"a\"]]",
         0,
     ),
     (
         &["--stream", "-c", "-s", "."],
         r#"{"a":1,"b":2,"a":3}"#,
-        "[[[\"a\"],3],[[\"b\"],2]]\n[[\"b\"]]",
+        "[[[\"a\"],1],[[\"b\"],2],[[\"a\"],3]]\n[[\"a\"]]",
         0,
     ),
 ];

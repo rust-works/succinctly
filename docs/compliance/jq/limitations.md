@@ -9601,7 +9601,7 @@ which keeps the splitter's clean prefix instead of discarding it, and queues the
 behind it for `input`/`inputs` (catchable there, delivered once, `break` after).
 The error is jq's parser's own text and position since [#5555](https://github.com/rust-works/succinctly/issues/5555) (`jq: parse error: Unfinished JSON term at EOF at line 2, column 5`, with no `(at …)` marker from the driver loop; under `input`/`inputs` it is `jq: error (at <file>:<line>): …`).
 It is the first fault in jq's input, counting lines across files, whether the splitter stopped there or on a later one.
-`--stream` reads with jq's streaming parser, and a splitter failure there reads that parser's own text (`Unmatched '}' at the top-level at line 1, column 5`) since #5498, except under `-s`, which still reads `Invalid JSON text`.
+`--stream` reads with jq's streaming parser, and a splitter failure there reads that parser's own text (`Unmatched '}' at the top-level at line 1, column 5`) since #5498, under `-s` too.
 A malformed *member* the semi-index accepts is a separate case below: it is found when the filter reads it, and is worded as jq's parser words it since [#5576](https://github.com/rust-works/succinctly/issues/5576).
 A parse error stops the whole input stream on both routes, as it
 does in jq: the files after the malformed one are not read ([#4313](https://github.com/rust-works/succinctly/issues/4313);
@@ -13695,55 +13695,40 @@ To move to a newer jq, bump `JQ_VERSION`, install that version, run
 `./scripts/sync-jq-error-messages.sh` and `./scripts/sync-jq-golden.sh`, and review the
 diff.
 
-## `--stream` feeds `tostream` events, expanded per document (#4397)
+## `--stream` feeds `tostream` events (#4397)
 
 `succinctly jq --stream` replaces each input document with the events `tostream` emits for it (`[[path],leaf]` for a
 leaf or an empty container, `[[path]]` closing a non-empty one), so `.` sees one event at a time, `-s` slurps every
 event into one array, and `input`/`inputs` read events (`fromstream(inputs)` and `1|truncate_stream(inputs)` fold
 them back). `-R` ignores the flag, as in jq. Pinned by `test_jq_stream_flag_feeds_tostream_events_4397`.
 
-jq emits events while it parses, so one thing differs for the shapes below, a recorded divergence:
+Since #5498 every `--stream` route reads with the same port of jq's streaming parser that `--stream-errors` uses (`jq_stream_errors.rs`), so the events are jq's: each carries the line jq had read when it yielded it, a repeated key is emitted every time (`{"a":1,"a":2}` prints `[["a"],1]`, `[["a"],2]` and `[["a"]]`), a document of any depth is read, and a parse error is jq's own text and position (`Expected separator between values at line 2, column 7`).
+The events before a fault come out first, as in jq (`printf '[1,' | jq --stream -c .` prints `[[0],1]` and then the parse error).
+A plain walk prints the fault as jq's main loop does, `jq: parse error: <message>` with no `(at …)` marker, at exit 5; under `-n` it is the error `input`/`inputs` raise; under `-s` it is the whole result, with nothing else printed, as jq's `--slurp` loop stops at it.
+A plain walk and `-n` with `input`/`inputs` hand each event to the program when it asks for it, so memory holds the input's bytes and the parser's state, not the events.
+`-s` keeps every event, as jq does, so it still grows with the input; it holds them as the reader built them, with no parsed document beside them.
+`tests/jq_cli/i5498.rs`, `tests/jq_cli/i5498_plain_walk.rs`, `tests/jq_cli/i5498_slurp.rs` and the `--stream` rows of `tests/jq_cli/i5618.rs` pin it, and 6,040 stream-by-program runs over malformed and well-formed streams, one or two files, matched `/usr/bin/jq` 1.7.1 on stdout, stderr and exit status, as did a 1,980-row differential run of a plain walk (22 streams, 15 programs, 3 flag sets, a file and stdin).
+A 70 MB document walked with `select(length==2)|empty` peaks at 72 MB (the old walk: 664 MB; jq: 2 MB, which reads 4 KB at a time where the reader here takes the file whole).
+Three differences remain:
 
-- **`input_line_number`** is the line the parser is on when jq emits the event, so the events of a document that spans
-  lines carry different numbers; every event here carries the line its document completes on.
 - **`--seq`** combines with `--stream` in jq (`echo '[1] 2' | jq --seq --stream -c .` prints each event after an RS
   byte); here `--seq` wins and the flag is ignored.
-- **A duplicate object key** is emitted once: the events come from the parsed value, which keeps the last
-  occurrence (`{"a":1,"a":2}` prints `[["a"],2]` and `[["a"]]`), where jq's `--stream` emits every occurrence
-  (`docs/plan/jq-duplicate-key-collapse.md`).
-  Since #5618 a run that keeps the events (`-s`, `input`/`inputs`) builds them from the document's index instead, and a document with a repeated key (compared after decoding, so `"\u0061"` repeats `"a"`) is still sent through the parsed value so that the collapse stays.
-
-Since #5498, `--stream` without `-s` and `--seq` does not have the three divergences above, and does not materialize its events: under `-n` with `input`/`inputs`, and, since the plain walk was routed too, as a program that reads `.`.
-It reads with the same port of jq's streaming parser that `--stream-errors` uses, and hands each event to the program when it asks for it, so memory holds the input's bytes and the parser's state, not the events.
-Each event carries the line jq had read when it yielded it, a repeated key is emitted every time, a document of any depth is read, and a parse error is raised by the read that reaches it, with jq's own text and position (`Expected separator between values at line 2, column 7`), as `input` raises it.
-A plain walk prints a fault as jq's main loop does, `jq: parse error: <message>` with no `(at …)` marker, after the events before it, at exit 5.
-`tests/jq_cli/i5498.rs`, `tests/jq_cli/i5498_plain_walk.rs` and the `--stream` rows of `tests/jq_cli/i5618.rs` pin it, and 6,040 stream-by-program runs over malformed and well-formed streams, one or two files, matched `/usr/bin/jq` 1.7.1 on stdout, stderr and exit status, as did a 1,980-row differential run of a plain walk (22 streams, 15 programs, 3 flag sets, a file and stdin), of which 1,264 rows are pinned by `tests/jq_cli/i5498_plain_walk.rs`.
-A 70 MB document walked with `select(length==2)|empty` peaks at 72 MB (the old walk: 664 MB; jq: 2 MB, which reads 4 KB at a time where the reader here takes the file whole).
-The one other `--stream` route, `-s`, still builds the events from the parsed document and keeps every difference described here.
-One difference is not about the route: a file that does not open and is named before one that does makes jq's `--stream` stop after the first event of the later file (`jq -c --stream . missing.json a.json` prints `[[0],1]` and the open error, exit 2), where succinctly prints every event.
-Both `-n` with `inputs` and a non-stream run agree with jq there, so the quirk is in jq's streaming parser's state after the failed open, not in what the program reads.
+- **`-n` with `-s`** reads the whole stream before the program runs, so a fault in it is raised there, as `jq: error (at <file>:<line>): <message>`; jq reads on the first `input`, so a program that never calls it prints its result, and one that does can catch the fault (`jq -n -s --stream 'try input catch "E"'` on `1 2 }` prints `"E"`).
+  The text of the fault is jq's.
+- **A file that does not open** and is named before one that does makes jq's `--stream` stop after the first event of the later file (`jq -c --stream . missing.json a.json` prints `[[0],1]` and the open error, exit 2), where succinctly prints every event.
+  Both `-n` with `inputs` and a non-stream run agree with jq there, so the quirk is in jq's streaming parser's state after the failed open, not in what the program reads.
 
 `--stream-errors` is accepted (#5474).
 It implies `--stream` and reports a parse error as an input of the form `[message, path]`, as jq does, and goes on reading with the next line.
-Unlike `--stream`, it does not build its events from a whole-document parse: the events a malformed document produced before the fault, and the path at the fault, are properties of jq's own incremental parser, so `jq_stream_errors.rs` is a port of the streaming half of jq 1.7.1's `jv_parse.c`.
+The events a malformed document produced before the fault, and the path at the fault, are properties of jq's own incremental parser, so `jq_stream_errors.rs` is a port of the streaming half of jq 1.7.1's `jv_parse.c`.
 It follows jq in four details: it reads one `fgets` line at a time (the rest of a line is dropped after an error), a value completed by the byte that then fails is lost, there is no depth limit, and `--slurp` closes its array at the call that empties jq's buffer.
 Its events are materialized rather than streamed, so memory grows with the input, except under `-n` with `input`/`inputs` (no `-s`), where they are handed out as the program asks (#5498).
 `--validate` still runs first and rejects a malformed input outright, since strict validation is what it asks for.
 Under `-R` and `--input-dsv` the flag is ignored, as `--stream` is.
 It is pinned by `tests/jq_cli/i5474.rs` and was checked against `/usr/bin/jq` on random malformed inputs, with stdout, exit status and the `(at <file>:<line>)` marker compared.
 One shape differs: `--seq` combines with `--stream-errors` in jq (`printf '[1,2' | jq --seq --stream-errors -c .` prints `["Unfinished abandoned text at EOF at line 1, column 4",[]]`), and here `--seq` wins and the flag is ignored, as it is for `--stream`.
-A document that fails to parse part-way has already emitted the events of what it finished in jq (`printf '[1,' | jq --stream -c .` prints `[[0],1]` and then the parse error).
-Since #5635 `succinctly jq --stream` prints them too, in front of the error, and they carry the line jq had read when it yielded each.
-Without `-s` the reader above yields them as it goes (#5498), and the rest of this paragraph describes `-s` and `--stream-errors` without `-n`.
-The document is parsed whole first, so the events are not streamed: once that parse fails, the bytes from the malformed document through the end of the read that holds the fault are read again with the port of jq's streaming parser that `--stream-errors` uses (`jq_stream_errors::events_before_fault`).
-A program using `input`/`inputs` gets them ahead of each fault it resumes after, and one that never reads past them never meets the fault.
-A stream that fails to parse is therefore expanded to events up front, where a stream that parses is walked one document at a time, so a large input with a syntax error near its end holds every earlier document's events in memory first.
-The error text and position are the ones the whole-document parse gives (stderr is not compared).
 
 `-b` is accepted and ignored, as jq does outside Windows; `--binary` is rejected there (`Unknown option --binary`, exit 2) and here.
-
-`--stream -s` still parses the document whole, so it does not give jq's constant-memory streaming of a large document: it keeps every event, as jq does, but builds them from the parsed document, so a 10.8 MB array of 120,000 records peaked at 622 MB with the events kept, against jq's 2.4 MB for a walk.
-A plain walk, which used to read `tostream_events_iter` over that document at 310 MB, is read by the reader above since #5498.
 
 ## ANSI color bytes: `-C` writes jq 1.7.1's bytes, redundant repeats included ([#5473](https://github.com/rust-works/succinctly/issues/5473))
 
