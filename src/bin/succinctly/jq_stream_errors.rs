@@ -656,6 +656,57 @@ fn read_keeping(
     }
 }
 
+/// What `-n -s --stream` hands the program, in the order jq's `input` returns it (#6005).
+///
+/// Under `-n` jq reads on the first `input`, and a fault ends the call that meets it: the next call
+/// goes on with the rest of the stream. So every fault the slurp loop meets before it closes its
+/// array comes out first, one per call, then the array, and what the loop left for the calls after
+/// it (the close it still held, a fault at the end of the stream) comes out in order after it.
+pub(crate) struct DeferredSlurp {
+    /// The events the array holds.
+    pub(crate) array: Vec<OwnedValue>,
+    /// Where jq stood when it closed the array: a source index and a line count.
+    pub(crate) slurp_at: (usize, usize),
+    /// The faults raised before the array, in order, each with where jq stood.
+    pub(crate) before: Vec<(String, (usize, usize))>,
+    /// The inputs after the array, in order.
+    pub(crate) after: Vec<Afterwards>,
+}
+
+/// One input of [`DeferredSlurp::after`].
+pub(crate) enum Afterwards {
+    Value(OwnedValue, (usize, usize)),
+    Fault(String, (usize, usize)),
+}
+
+/// [`read_for_slurp`] for `-n -s --stream`: the whole stream, with every fault set apart from the
+/// events instead of stopping the read at the first one.
+pub(crate) fn read_for_deferred_slurp(sources: &[(Option<usize>, Vec<u8>)]) -> DeferredSlurp {
+    let mut reader = Reader::new(sources);
+    let mut yielded = Vec::new();
+    while let Some(item) = reader.next_yielded() {
+        yielded.push(item);
+    }
+    let end = reader.end();
+    let mut read = DeferredSlurp {
+        array: Vec::new(),
+        slurp_at: end.slurp_at,
+        before: Vec::new(),
+        after: Vec::new(),
+    };
+    for (index, item) in yielded.into_iter().enumerate() {
+        match (index < end.inside, item.error) {
+            (true, None) => read.array.push(item.value),
+            (true, Some(message)) => read.before.push((message, item.location)),
+            (false, None) => read
+                .after
+                .push(Afterwards::Value(item.value, item.location)),
+            (false, Some(message)) => read.after.push(Afterwards::Fault(message, item.location)),
+        }
+    }
+    read
+}
+
 /// A parse error as `--stream-errors` hands it over (`[message, path]`) and the message alone.
 struct ParseFault {
     value: OwnedValue,
