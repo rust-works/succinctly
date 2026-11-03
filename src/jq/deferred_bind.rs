@@ -323,15 +323,12 @@ fn is_var(stage: &Expr, var: &str) -> bool {
     matches!(unwrap_paren(stage), Expr::Var(name) if name == var)
 }
 
-/// The field a stage reads from an object: `.k`, `.k?`, however many parentheses group it
-/// (`(.k)`, `(.k)?`, `(.k?)`), as [`is_var`] sees through them for the head (#5957).
+/// The field a stage reads from an object: `.k`, `.k?`, however many parentheses and `?`s group it
+/// (`(.k)`, `(.k)?`, `(.k?)`, `(.k?)?`), as [`is_var`] sees through them for the head (#5957).
 fn field_read(stage: &Expr) -> Option<&String> {
     match unwrap_paren(stage) {
         Expr::Field(field) => Some(field),
-        Expr::Optional(inner) => match unwrap_paren(inner) {
-            Expr::Field(field) => Some(field),
-            _ => None,
-        },
+        Expr::Optional(inner) => field_read(inner),
         _ => None,
     }
 }
@@ -664,6 +661,7 @@ mod tests {
                     ". as $x | .users[] | ($x).a?",
                     ". as $x | .users[] | $x | (.a)?",
                     ". as $x | .users[] | $x | (.a?)",
+                    ". as $x | .users[] | $x | (.a?)?",
                 ][..],
             ),
             (
