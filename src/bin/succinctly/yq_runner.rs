@@ -8680,7 +8680,11 @@ fn output_value<W: Write>(
                 colorize_yaml_document(&leading, &body, &trailing, bare_scalar)
             )?;
         } else {
-            write!(writer, "{leading}{body}{trailing}")?;
+            for part in [&leading, &body, &trailing] {
+                if !part.is_empty() {
+                    writer.write_all(part.as_bytes())?;
+                }
+            }
         }
         // A document with no content at all (`# c`, a bare `---`) prints only the header
         // it was written with, and that header's own last line break already ends it:
