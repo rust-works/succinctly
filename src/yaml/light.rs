@@ -3644,10 +3644,14 @@ fn write_yaml_string_to_json_at(
             let bytes = &text[*start + 1..end - 1]; // Strip quotes
 
             // Check if we need decoding (has escapes or newlines)
-            if !bytes.contains(&b'\\') && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+            if double_quoted_is_verbatim(bytes, *json_sourced) {
                 // Fast path: no decoding needed, just JSON-escape
                 let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
                 write_json_string(output, s);
+            } else if !json_sourced && holds_unicode_scalar_break(bytes) {
+                // U+0085/U+2028/U+2029 fold as go-yaml reads them (#4913). Rare, so decode and
+                // escape rather than teach the transcoder a second kind of break.
+                write_json_string(output, &decode_double_quoted(bytes, false)?);
             } else {
                 // Transcode directly: YAML escapes → JSON escapes
                 transcode_double_quoted_to_json(output, bytes, *json_sourced)?;
@@ -3659,10 +3663,13 @@ fn write_yaml_string_to_json_at(
             let bytes = &text[*start + 1..end - 1]; // Strip quotes
 
             // Check if we need decoding (has '' or newlines)
-            if !bytes.contains(&b'\'') && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+            if single_quoted_is_verbatim(bytes) {
                 // Fast path: no decoding needed, just JSON-escape
                 let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
                 write_json_string(output, s);
+            } else if holds_unicode_scalar_break(bytes) {
+                // See the double-quoted arm (#4913).
+                write_json_string(output, &decode_single_quoted(bytes)?);
             } else {
                 // Transcode directly
                 transcode_single_quoted_to_json(output, bytes)?;
@@ -4562,10 +4569,14 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
             let end = YamlString::find_double_quote_end(text, *start);
             let bytes = &text[*start + 1..end - 1];
 
-            if !bytes.contains(&b'\\') && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+            if double_quoted_is_verbatim(bytes, *json_sourced) {
                 let s = core::str::from_utf8(bytes)
                     .map_err(|_| decode_failure(YamlStringError::InvalidUtf8))?;
                 stream_json_string(out, s)?;
+            } else if !json_sourced && holds_unicode_scalar_break(bytes) {
+                // U+0085/U+2028/U+2029 fold as go-yaml reads them (#4913): decode, then escape.
+                let decoded = decode_double_quoted(bytes, false).map_err(decode_failure)?;
+                stream_json_string(out, &decoded)?;
             } else {
                 // `Out` cannot be rewound the way `write_yaml_string_to_json`'s
                 // `String` can, so transcode into a scratch buffer and commit
@@ -4586,10 +4597,13 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
             let end = YamlString::find_single_quote_end(text, *start);
             let bytes = &text[*start + 1..end - 1];
 
-            if !bytes.contains(&b'\'') && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+            if single_quoted_is_verbatim(bytes) {
                 let s = core::str::from_utf8(bytes)
                     .map_err(|_| decode_failure(YamlStringError::InvalidUtf8))?;
                 stream_json_string(out, s)?;
+            } else if holds_unicode_scalar_break(bytes) {
+                let decoded = decode_single_quoted(bytes).map_err(decode_failure)?;
+                stream_json_string(out, &decoded)?;
             } else {
                 // Same commit-on-success rollback as the double-quoted arm
                 // above (#1247), with the same capacity hint (#1622).
@@ -5936,7 +5950,7 @@ impl<'a> YamlString<'a> {
                 let end = Self::find_double_quote_end(text, *start);
                 let bytes = &text[*start + 1..end - 1]; // Strip quotes
                                                         // Need decoding if contains escapes or newlines (multiline folding)
-                if !bytes.contains(&b'\\') && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+                if double_quoted_is_verbatim(bytes, *json_sourced) {
                     let s =
                         core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
                     Ok(Cow::Borrowed(s))
@@ -5948,7 +5962,7 @@ impl<'a> YamlString<'a> {
                 let end = Self::find_single_quote_end(text, *start);
                 let bytes = &text[*start + 1..end - 1]; // Strip quotes
                                                         // Need decoding if contains escaped quotes or newlines (multiline folding)
-                if !bytes.contains(&b'\'') && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+                if single_quoted_is_verbatim(bytes) {
                     let s =
                         core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
                     Ok(Cow::Borrowed(s))
@@ -5965,7 +5979,7 @@ impl<'a> YamlString<'a> {
             } => {
                 let bytes = &text[*start..*end];
                 // Need folding if contains newlines (multiline plain scalar)
-                if !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+                if plain_is_verbatim(bytes) {
                     let s =
                         core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
                     Ok(Cow::Borrowed(s))
@@ -6412,6 +6426,8 @@ impl core::fmt::Display for YamlStringError {
 /// this function already preserves verbatim (tab, U+00A0, ...).
 fn decode_double_quoted(bytes: &[u8], json_sourced: bool) -> Result<String, YamlStringError> {
     let mut result = String::with_capacity(bytes.len());
+    // A JSON-sourced scalar never folds (#3380), so U+0085/U+2028/U+2029 in one are content.
+    let unicode = !json_sourced && holds_unicode_scalar_break(bytes);
     let mut i = 0;
 
     while i < bytes.len() {
@@ -6489,14 +6505,17 @@ fn decode_double_quoted(bytes: &[u8], json_sourced: bool) -> Result<String, Yaml
                 result.push(b as char);
                 i += 1;
             }
-            b'\r' | b'\n' => {
+            _ if scalar_break(bytes, i, unicode).is_some() => {
                 // Line folding: handle newlines
-                i = fold_quoted_line_break(bytes, i, &mut result);
+                i = fold_quoted_line_break(bytes, i, unicode, &mut result);
             }
             _ => {
                 // Regular content - copy until we hit escape or newline
                 let start = i;
-                while i < bytes.len() && !matches!(bytes[i], b'\\' | b'\n' | b'\r') {
+                while i < bytes.len()
+                    && bytes[i] != b'\\'
+                    && scalar_break(bytes, i, unicode).is_none()
+                {
                     i += 1;
                 }
                 // Trailing literal whitespace folds away before a literal
@@ -6504,7 +6523,7 @@ fn decode_double_quoted(bytes: &[u8], json_sourced: bool) -> Result<String, Yaml
                 // arms and is never trimmed. Never trimmed when
                 // `json_sourced`: there is no fold ahead to trim for (#3380).
                 let mut end = i;
-                if !json_sourced && i < bytes.len() && is_line_break(bytes[i]) {
+                if !json_sourced && scalar_break(bytes, i, unicode).is_some() {
                     while end > start && matches!(bytes[end - 1], b' ' | b'\t') {
                         end -= 1;
                     }
@@ -6580,14 +6599,122 @@ fn json_surrogate_escape(first: u32, rest: &[u8]) -> (char, usize) {
     }
 }
 
+/// A line break inside a quoted or flow scalar, as go-yaml's scanner reads one (#4913).
+///
+/// `\n`, a lone `\r` and `\r\n` are one break; so is U+0085 (`C2 85`), which go-yaml normalises to
+/// `\n` and folds like one. U+2028 and U+2029 (`E2 80 A8`/`E2 80 A9`) are breaks to the scanner
+/// too, but it keeps them in the value (`separator`): the blanks beside one are trimmed as beside
+/// any break, and it is never folded to a space.
+#[derive(Clone, Copy)]
+struct ScalarBreak {
+    /// Width in bytes.
+    width: usize,
+    /// U+2028/U+2029, which stay in the decoded value.
+    separator: bool,
+}
+
+/// The line break at `bytes[i]`, if any. `unicode` is whether U+0085/U+2028/U+2029 count, which
+/// the decoders settle once per scalar with [`holds_unicode_scalar_break`] so that a scalar
+/// without one pays a single predictable branch here.
+#[inline]
+fn scalar_break(bytes: &[u8], i: usize, unicode: bool) -> Option<ScalarBreak> {
+    match *bytes.get(i)? {
+        b'\n' => Some(ScalarBreak {
+            width: 1,
+            separator: false,
+        }),
+        b'\r' => Some(ScalarBreak {
+            width: if bytes.get(i + 1) == Some(&b'\n') {
+                2
+            } else {
+                1
+            },
+            separator: false,
+        }),
+        0xC2 if unicode && bytes.get(i + 1) == Some(&0x85) => Some(ScalarBreak {
+            width: 2,
+            separator: false,
+        }),
+        0xE2 if unicode
+            && bytes.get(i + 1) == Some(&0x80)
+            && matches!(bytes.get(i + 2), Some(0xA8 | 0xA9)) =>
+        {
+            Some(ScalarBreak {
+                width: 3,
+                separator: true,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The character of the U+2028/U+2029 whose bytes start at `bytes[i]`.
+#[inline]
+fn separator_char(bytes: &[u8], i: usize) -> char {
+    if bytes[i + 2] == 0xA8 {
+        '\u{2028}'
+    } else {
+        '\u{2029}'
+    }
+}
+
+/// Whether `bytes` holds U+0085, U+2028 or U+2029 (#4913): the one test every decoder and every
+/// "does this body need decoding" gate asks, so that they cannot disagree.
+///
+/// The lead bytes `0xC2` and `0xE2` are tried first with `memchr`, which a body without either
+/// (all ASCII, or most prose) pays and nothing more; a hit is then confirmed against the whole
+/// sequence, since both lead bytes are common (`é`'s neighbours, `…`, `—`, `€`).
+#[inline]
+fn holds_unicode_scalar_break(bytes: &[u8]) -> bool {
+    if !bytes.contains(&0xC2) && !bytes.contains(&0xE2) {
+        return false;
+    }
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if matches!(bytes[i], 0xC2 | 0xE2) && scalar_break(bytes, i, true).is_some() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether a single-quoted body is its own text: no `''` pair to unescape and no line break to
+/// fold. The gate of every single-quoted reader, one definition so that they agree (#4913).
+#[inline]
+fn single_quoted_is_verbatim(bytes: &[u8]) -> bool {
+    !bytes.contains(&b'\'')
+        && !bytes.contains(&b'\n')
+        && !bytes.contains(&b'\r')
+        && !holds_unicode_scalar_break(bytes)
+}
+
+/// Whether a double-quoted body is its own text: no escape and no line break to fold. A
+/// JSON-sourced scalar never folds, so U+0085/U+2028/U+2029 in one are content (#3380, #4913).
+#[inline]
+fn double_quoted_is_verbatim(bytes: &[u8], json_sourced: bool) -> bool {
+    !bytes.contains(&b'\\')
+        && !bytes.contains(&b'\n')
+        && !bytes.contains(&b'\r')
+        && (json_sourced || !holds_unicode_scalar_break(bytes))
+}
+
+/// Whether a plain body is its own text: no line break to fold (#4913).
+#[inline]
+fn plain_is_verbatim(bytes: &[u8]) -> bool {
+    !bytes.contains(&b'\n') && !bytes.contains(&b'\r') && !holds_unicode_scalar_break(bytes)
+}
+
 /// Decode a single-quoted YAML string, handling '' escapes and line folding.
 ///
 /// Line folding rules for single-quoted strings:
 /// - A single line break becomes a space
 /// - Multiple consecutive line breaks: first becomes space, rest become \n
 /// - Leading whitespace on continuation lines is trimmed
+/// - U+0085 folds like `\n`; U+2028/U+2029 are kept (see [`ScalarBreak`])
 fn decode_single_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
     let mut result = String::with_capacity(bytes.len());
+    let unicode = holds_unicode_scalar_break(bytes);
     let mut i = 0;
 
     while i < bytes.len() {
@@ -6597,15 +6724,15 @@ fn decode_single_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
                 result.push('\'');
                 i += 2;
             }
-            b'\r' | b'\n' => {
+            _ if scalar_break(bytes, i, unicode).is_some() => {
                 // Line folding
-                i = fold_quoted_line_break(bytes, i, &mut result);
+                i = fold_quoted_line_break(bytes, i, unicode, &mut result);
             }
             _ => {
                 // Regular content
                 let start = i;
                 while i < bytes.len()
-                    && !is_line_break(bytes[i])
+                    && scalar_break(bytes, i, unicode).is_none()
                     && !(bytes[i] == b'\'' && i + 1 < bytes.len() && bytes[i + 1] == b'\'')
                 {
                     i += 1;
@@ -6613,7 +6740,7 @@ fn decode_single_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
                 // Trailing literal whitespace folds away before a literal
                 // line break
                 let mut end = i;
-                if i < bytes.len() && is_line_break(bytes[i]) {
+                if scalar_break(bytes, i, unicode).is_some() {
                     while end > start && matches!(bytes[end - 1], b' ' | b'\t') {
                         end -= 1;
                     }
@@ -6631,48 +6758,51 @@ fn decode_single_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
 /// Handle line folding for quoted strings.
 /// Returns the new position after processing the line break(s).
 ///
-/// Rules:
-/// - Skip the line break
-/// - Count consecutive empty lines (they become \n)
-/// - Skip leading whitespace on the continuation line
-/// - Add a space for the line break (or \n for each empty line)
+/// go-yaml's rule, which the YAML spec's 7.3 folding is the ASCII case of: the blanks and breaks
+/// between two pieces of content are one run, whose blanks are all dropped.
+/// - With no more breaks after the first, a first break that is not U+2028/U+2029 is a space.
+/// - With more, a first break that is not U+2028/U+2029 is dropped and each of the others stays
+///   (`\n` for the ASCII spellings and U+0085, the character itself for U+2028/U+2029).
+/// - A first break that is U+2028/U+2029 stays, with the others after it.
 ///
 /// Trailing literal whitespace before the break is trimmed by the callers;
 /// escaped whitespace already in `result` is content and must not be
 /// trimmed here.
-fn fold_quoted_line_break(bytes: &[u8], mut i: usize, result: &mut String) -> usize {
-    // Skip the first line break
-    i += line_break_len(bytes, i);
+fn fold_quoted_line_break(bytes: &[u8], mut i: usize, unicode: bool, result: &mut String) -> usize {
+    let Some(first) = scalar_break(bytes, i, unicode) else {
+        return i;
+    };
+    let first_at = i;
+    i += first.width;
 
-    // Count empty lines (lines with only whitespace)
-    let mut empty_lines = 0;
+    // The breaks after the first, as they stay in the value.
+    let mut kept = String::new();
     loop {
         // Skip whitespace at start of line
         while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
             i += 1;
         }
-
-        // Check if this is an empty line
-        if i < bytes.len() && is_line_break(bytes[i]) {
-            empty_lines += 1;
-            i += line_break_len(bytes, i);
-        } else {
-            // Non-empty line - we're done counting empty lines
-            // i is now positioned after the leading whitespace
-            break;
+        match scalar_break(bytes, i, unicode) {
+            Some(b) => {
+                kept.push(if b.separator {
+                    separator_char(bytes, i)
+                } else {
+                    '\n'
+                });
+                i += b.width;
+            }
+            None => break,
         }
     }
 
-    // Output the folded content
-    if empty_lines == 0 {
+    if first.separator {
+        result.push(separator_char(bytes, first_at));
+        result.push_str(&kept);
+    } else if kept.is_empty() {
         // Single line break -> space
         result.push(' ');
     } else {
-        // Empty lines -> newlines (first line break becomes space, rest become \n)
-        // Actually per YAML spec: empty lines preserve as \n each
-        for _ in 0..empty_lines {
-            result.push('\n');
-        }
+        result.push_str(&kept);
     }
 
     i
@@ -6686,31 +6816,31 @@ fn fold_quoted_line_break(bytes: &[u8], mut i: usize, result: &mut String) -> us
 /// - Empty lines (only whitespace) become literal newlines
 /// - Leading whitespace on continuation lines is stripped (up to a reasonable amount)
 /// - Trailing whitespace on each line is stripped
+/// - U+0085 folds like `\n`; U+2028/U+2029 are kept (see [`ScalarBreak`]). Only a flow
+///   collection's plain scalar can hold one: in block context go-yaml ends the line there
 fn decode_plain_scalar(bytes: &[u8], base_indent: usize) -> Result<String, YamlStringError> {
     let mut result = String::with_capacity(bytes.len());
+    let unicode = holds_unicode_scalar_break(bytes);
     let mut i = 0;
 
     while i < bytes.len() {
-        match bytes[i] {
-            b'\r' | b'\n' => {
-                // Line folding
-                i = fold_plain_line_break(bytes, i, base_indent, &mut result);
+        if scalar_break(bytes, i, unicode).is_some() {
+            // Line folding
+            i = fold_plain_line_break(bytes, i, base_indent, unicode, &mut result);
+        } else {
+            // Regular content - read until end of line
+            let start = i;
+            while i < bytes.len() && scalar_break(bytes, i, unicode).is_none() {
+                i += 1;
             }
-            _ => {
-                // Regular content - read until end of line
-                let start = i;
-                while i < bytes.len() && !is_line_break(bytes[i]) {
-                    i += 1;
-                }
-                // Trim trailing whitespace
-                let mut end = i;
-                while end > start && matches!(bytes[end - 1], b' ' | b'\t') {
-                    end -= 1;
-                }
-                let chunk = core::str::from_utf8(&bytes[start..end])
-                    .map_err(|_| YamlStringError::InvalidUtf8)?;
-                result.push_str(chunk);
+            // Trim trailing whitespace
+            let mut end = i;
+            while end > start && matches!(bytes[end - 1], b' ' | b'\t') {
+                end -= 1;
             }
+            let chunk = core::str::from_utf8(&bytes[start..end])
+                .map_err(|_| YamlStringError::InvalidUtf8)?;
+            result.push_str(chunk);
         }
     }
 
@@ -6725,17 +6855,24 @@ fn decode_plain_scalar(bytes: &[u8], base_indent: usize) -> Result<String, YamlS
 /// - Count consecutive empty lines (they become \n)
 /// - Skip leading whitespace on the continuation line (indentation)
 /// - Add a space for the line break (or \n for each empty line)
+/// - A U+2028/U+2029 is kept, and as the first break it is not folded (see
+///   [`fold_quoted_line_break`])
 fn fold_plain_line_break(
     bytes: &[u8],
     mut i: usize,
     base_indent: usize,
+    unicode: bool,
     result: &mut String,
 ) -> usize {
+    let Some(first) = scalar_break(bytes, i, unicode) else {
+        return i;
+    };
+    let first_at = i;
     // Skip the first line break
-    i += line_break_len(bytes, i);
+    i += first.width;
 
-    // Count empty lines (lines with only whitespace)
-    let mut empty_lines = 0;
+    // The breaks after the first, as they stay in the value (an empty line is a `\n`).
+    let mut kept = String::new();
     loop {
         // Skip leading whitespace (spaces for indentation)
         let line_start = i;
@@ -6745,9 +6882,13 @@ fn fold_plain_line_break(
         let line_indent = i - line_start;
 
         // Check if this is an empty line
-        if i < bytes.len() && is_line_break(bytes[i]) {
-            empty_lines += 1;
-            i += line_break_len(bytes, i);
+        if let Some(b) = scalar_break(bytes, i, unicode) {
+            kept.push(if b.separator {
+                separator_char(bytes, i)
+            } else {
+                '\n'
+            });
+            i += b.width;
         } else if i >= bytes.len() {
             // End of content
             break;
@@ -6758,10 +6899,20 @@ fn fold_plain_line_break(
             while check < bytes.len() && matches!(bytes[check], b'\t' | b' ') {
                 check += 1;
             }
-            if check >= bytes.len() || is_line_break(bytes[check]) {
+            if let Some(b) = scalar_break(bytes, check, unicode).or_else(|| {
+                // The end of the content is an empty line too.
+                (check >= bytes.len()).then_some(ScalarBreak {
+                    width: 0,
+                    separator: false,
+                })
+            }) {
                 // Line is all whitespace - treat as empty line
-                empty_lines += 1;
-                i = check + line_break_len(bytes, check);
+                kept.push(if b.separator {
+                    separator_char(bytes, check)
+                } else {
+                    '\n'
+                });
+                i = check + b.width;
                 // Continue looking for more empty lines
             } else {
                 // Tab followed by content - skip the tabs as indentation
@@ -6786,16 +6937,17 @@ fn fold_plain_line_break(
     }
 
     // Output the folded content
-    if empty_lines == 0 {
+    if first.separator {
+        result.push(separator_char(bytes, first_at));
+        result.push_str(&kept);
+    } else if kept.is_empty() {
         // Single line break -> space
         if !result.is_empty() {
             result.push(' ');
         }
     } else {
         // Empty lines -> newlines
-        for _ in 0..empty_lines {
-            result.push('\n');
-        }
+        result.push_str(&kept);
     }
 
     i
@@ -11451,6 +11603,106 @@ mod tests {
                 "stream_json mismatch for {:?}",
                 core::str::from_utf8(yaml).unwrap()
             );
+        }
+    }
+
+    /// #4913: go-yaml's scanner reads U+0085, U+2028 and U+2029 as line breaks inside a quoted
+    /// scalar and inside a flow collection's plain scalar. U+0085 folds like `\n`; U+2028/U+2029
+    /// stay in the value, and the blanks beside either are trimmed as beside any break. The
+    /// decoders (`as_str`) and both JSON writers (`to_json_document`, `stream_json_document`)
+    /// must agree, the last rows being near-misses that are not breaks. Expected JSON is
+    /// mikefarah/yq v4.53.3's `-o=json -I0` for the same text.
+    #[test]
+    fn test_unicode_line_breaks_fold_as_go_yaml_reads_them_4913() {
+        let cases: &[(&str, &str)] = &[
+            ("'x\u{85}y'", "\"x y\""),
+            ("'x \u{85} y'", "\"x y\""),
+            ("'x\u{2028}y'", "\"x\\u2028y\""),
+            ("'x \u{2028} y'", "\"x\\u2028y\""),
+            ("'x\t\u{2029}\ty'", "\"x\\u2029y\""),
+            ("'x\u{85}\u{85}y'", "\"x\\ny\""),
+            ("'x\n\u{85}y'", "\"x\\ny\""),
+            ("'x\u{85}\ny'", "\"x\\ny\""),
+            ("'x\u{2028}\ny'", "\"x\\u2028\\ny\""),
+            ("'x\n\u{2028}y'", "\"x\\u2028y\""),
+            ("'x\u{2028}\u{2028}y'", "\"x\\u2028\\u2028y\""),
+            ("'x\r\u{85}y'", "\"x\\ny\""),
+            ("'x\u{2028}\u{2029}y'", "\"x\\u2028\\u2029y\""),
+            ("'x \n \u{2028} \n y'", "\"x\\u2028\\ny\""),
+            ("'x\u{85}  \u{85}  y'", "\"x\\ny\""),
+            ("'x\u{2026}y'", "\"x\u{2026}y\""),
+            ("'x\u{e9}y'", "\"x\u{e9}y\""),
+            ("'x\u{2027}y'", "\"x\u{2027}y\""),
+            ("'x\u{202a}y'", "\"x\u{202a}y\""),
+            ("'x\u{c2}y'", "\"x\u{c2}y\""),
+            ("'x\u{2013}y'", "\"x\u{2013}y\""),
+            ("\"x\u{85}y\"", "\"x y\""),
+            ("\"x \u{85} y\"", "\"x y\""),
+            ("\"x\u{2028}y\"", "\"x\\u2028y\""),
+            ("\"x \u{2028} y\"", "\"x\\u2028y\""),
+            ("\"x\t\u{2029}\ty\"", "\"x\\u2029y\""),
+            ("\"x\u{85}\u{85}y\"", "\"x\\ny\""),
+            ("\"x\n\u{85}y\"", "\"x\\ny\""),
+            ("\"x\u{85}\ny\"", "\"x\\ny\""),
+            ("\"x\u{2028}\ny\"", "\"x\\u2028\\ny\""),
+            ("\"x\n\u{2028}y\"", "\"x\\u2028y\""),
+            ("\"x\u{2028}\u{2028}y\"", "\"x\\u2028\\u2028y\""),
+            ("\"x\r\u{85}y\"", "\"x\\ny\""),
+            ("\"x\u{2028}\u{2029}y\"", "\"x\\u2028\\u2029y\""),
+            ("\"x \n \u{2028} \n y\"", "\"x\\u2028\\ny\""),
+            ("\"x\u{85}  \u{85}  y\"", "\"x\\ny\""),
+            ("\"x\u{2026}y\"", "\"x\u{2026}y\""),
+            ("\"x\u{e9}y\"", "\"x\u{e9}y\""),
+            ("\"x\u{2027}y\"", "\"x\u{2027}y\""),
+            ("\"x\u{202a}y\"", "\"x\u{202a}y\""),
+            ("\"x\u{c2}y\"", "\"x\u{c2}y\""),
+            ("\"x\u{2013}y\"", "\"x\u{2013}y\""),
+            ("[x\u{85}y]", "[\"x y\"]"),
+            ("[x \u{85} y]", "[\"x y\"]"),
+            ("[x\u{2028}y]", "[\"x\\u2028y\"]"),
+            ("[x \u{2028} y]", "[\"x\\u2028y\"]"),
+            ("[x\u{85}\u{85}y]", "[\"x\\ny\"]"),
+            ("[x\n\u{85}y]", "[\"x\\ny\"]"),
+            ("[x\u{85}\ny]", "[\"x\\ny\"]"),
+            ("[x\u{2028}\ny]", "[\"x\\u2028\\ny\"]"),
+            ("[x\n\u{2028}y]", "[\"x\\u2028y\"]"),
+            ("[x\u{2028}\u{2028}y]", "[\"x\\u2028\\u2028y\"]"),
+            ("[x\r\u{85}y]", "[\"x\\ny\"]"),
+            ("[x\u{2028}\u{2029}y]", "[\"x\\u2028\\u2029y\"]"),
+            ("[x \n \u{2028} \n y]", "[\"x\\u2028\\ny\"]"),
+            ("[x\u{85}  \u{85}  y]", "[\"x\\ny\"]"),
+            ("[x\u{2026}y]", "[\"x\u{2026}y\"]"),
+            ("[x\u{e9}y]", "[\"x\u{e9}y\"]"),
+            ("[x\u{2027}y]", "[\"x\u{2027}y\"]"),
+            ("[x\u{202a}y]", "[\"x\u{202a}y\"]"),
+            ("[x\u{c2}y]", "[\"x\u{c2}y\"]"),
+            ("[x\u{2013}y]", "[\"x\u{2013}y\"]"),
+        ];
+        assert!(cases.len() > 50, "the table lost rows");
+
+        for (doc, expected_json) in cases {
+            let yaml = doc.as_bytes();
+            let index = YamlIndex::build(yaml).unwrap();
+            let json = index.root(yaml).to_json_document();
+            let mut streamed = String::new();
+            index
+                .root(yaml)
+                .stream_json_document(&mut streamed, IndentSpec::COMPACT, false)
+                .unwrap();
+            assert_eq!(&json, expected_json, "to_json mismatch for {doc:?}");
+            assert_eq!(&streamed, expected_json, "stream_json mismatch for {doc:?}");
+
+            // A quoted scalar at the root is also read by the DOM decoder.
+            if !doc.starts_with('[') {
+                match first_doc(index.root(yaml)) {
+                    YamlValue::String(s) => {
+                        let mut as_json = String::new();
+                        write_json_string(&mut as_json, &s.as_str().unwrap());
+                        assert_eq!(&as_json, expected_json, "as_str mismatch for {doc:?}");
+                    }
+                    other => panic!("expected a string document for {doc:?}, got {other:?}"),
+                }
+            }
         }
     }
 
