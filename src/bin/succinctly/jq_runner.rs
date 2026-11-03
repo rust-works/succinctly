@@ -4580,6 +4580,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 
 fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     super::sigpipe::restore_default();
+    // A run starts with every file still to open (#6006): a thread that ran jq before must not
+    // carry a missing file's stop into this run.
+    FIRST_OPEN_FAILURE_AT.with(|first| first.set(None));
     silence_depth_guard_panic_line();
     args.resolve_positional_args();
     // The order only matters between two or more named flags: a command line with fewer builds no clap definition for it.
@@ -5854,7 +5857,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // loop reports it uncaught, at exit 5, and stops -- the prefix
                 // before it already ran, and nothing after it exists (#2961).
                 loop {
-                    if stopped(args.on_error, &sink) {
+                    if stopped(args.on_error, &sink) || !main_loop_reads_on() {
                         break;
                     }
                     let input = match jq::pop_input() {
@@ -6394,6 +6397,9 @@ fn get_inputs(
         }
     } else {
         let (files, raws, failures) = read_input_files(&files);
+        if let Some(&(at, _)) = failures.first() {
+            note_open_failure_at(at);
+        }
         report_open_failures(&failures, open_failed);
         let raws = raws
             .into_iter()
@@ -6656,7 +6662,12 @@ fn get_inputs(
             if line == crate::jq_stream_errors::CLOSED {
                 locations.push(0, UNKNOWN_LINE as usize);
             } else {
-                locations.push(raw_bytes[source].0.unwrap_or(0), line);
+                // `get` and not an index: a slurped array has a location even when no file
+                // opened (`--stream -s` over only a missing file is `[]`, #6006).
+                locations.push(
+                    raw_bytes.get(source).and_then(|raw| raw.0).unwrap_or(0),
+                    line,
+                );
             }
         }
         if track_eof && !args.slurp {
@@ -8061,6 +8072,32 @@ thread_local! {
     static STDIN_PUSHBACK: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
     /// A source the stream reader was reading failed part-way (#5498): jq reports it and exits 2.
     static INPUT_READ_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Where the first input that would not open was among the ones that did, as the queue's
+    /// source tags count them (#6006): jq's main loop reads no further input once its reader has
+    /// moved past it.
+    static FIRST_OPEN_FAILURE_AT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Note that the input at `at` (among the ones that opened) is past a file that did not open,
+/// unless an earlier one already was (#6006).
+fn note_open_failure_at(at: usize) {
+    FIRST_OPEN_FAILURE_AT.with(|first| {
+        if first.get().is_none() {
+            first.set(Some(at));
+        }
+    });
+}
+
+/// Whether jq's main loop would read another input: not once its reader has read from a file past
+/// one that did not open (`while (jq_util_input_errors(...) == 0 && ...)` in jq's `main`). The
+/// input that took it there is still processed: `missing a.json` under `--stream` prints the first
+/// event of `a.json` and stops (#6006).
+fn main_loop_reads_on() -> bool {
+    match FIRST_OPEN_FAILURE_AT.with(std::cell::Cell::get) {
+        None => true,
+        Some(at) => jq::current_input_location().map_or(true, |(source, _)| (source as usize) < at),
+    }
 }
 
 /// Whether the `--stream` events are read a chunk at a time (#5498): the reader serves them to the
@@ -8119,7 +8156,10 @@ fn open_chunked_inputs(files: &[PathBuf], open_failed: &mut bool) -> Result<Chun
                     Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, file)))
                 }));
             }
-            Err(e) => report_unopenable_input(&e, open_failed),
+            Err(e) => {
+                note_open_failure_at(opened.len());
+                report_unopenable_input(&e, open_failed);
+            }
         }
     }
     Ok((opened, openers))
