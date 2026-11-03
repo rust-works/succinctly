@@ -5797,66 +5797,14 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 debug_assert_eq!(locations.per_value(), &[]);
                 jq::seed_remaining_inputs_from(stream_reader_producer(lazy));
                 jq::count_reads_past_end();
-            } else if let Some(lazy) = LAZY_JSON_INPUTS.with(|slot| slot.borrow_mut().take()) {
-                // #5661: a stream whose documents are converted as the program reads them. A clean
-                // one has `inputs` empty, and so is `locations`' line table: each document's line
-                // is counted when it is read, one forward pass over the text in all. One that
-                // turned malformed (#5853) has the documents and parse errors after its lazy start
-                // in `inputs` and `resumed_errors`, and they follow it in order.
-                let tail = lazy_tail_items(inputs, &locations, trailing_error, resumed_errors);
-                jq::seed_remaining_inputs_from(lazy_json_producer_then(
-                    lazy,
-                    tail,
-                    locations.exhausted(args.slurp),
-                ));
-                if locations.eof_tail.is_some() {
-                    jq::count_reads_past_end();
-                }
             } else {
-                // Moves rather than clones: `inputs` isn't read again on
-                // this branch (the null-input arm below uses `OwnedValue::
-                // Null` directly; the non-null arm pops from the queue this
-                // seeds, not from `inputs`) -- review catch: an earlier
-                // version cloned every document here for no reason, doubling
-                // peak memory for the whole input set.
-                //
-                // `locations` itself is *not* consumed: it stays alive as the
-                // file table `ErrorAt::Live` resolves the queue's opaque
-                // source tags against (#1309).
-                debug_assert_eq!(
-                    inputs.len(),
-                    locations.per_value().len(),
-                    "one location per queued document"
+                seed_input_queue(
+                    args.slurp,
+                    inputs,
+                    &locations,
+                    trailing_error,
+                    resumed_errors,
                 );
-                let queue: Vec<(OwnedValue, u32, u32)> = inputs
-                    .into_iter()
-                    .zip(locations.per_value().iter().copied())
-                    .map(|(v, (src, line))| (v, src, line))
-                    .collect();
-                // A stream that turned malformed partway queues each parse
-                // error behind the documents before it (#2961), and the
-                // documents jq read after resuming behind it (#4311).
-                let documents = queue.len();
-                let errors = resumed_errors
-                    .into_iter()
-                    .chain(trailing_error.map(|t| (documents, t)))
-                    // As a plain error: jq's `try input catch .` catches a
-                    // parse error like any other, where the materializer's
-                    // own error is tagged as an uncatchable decode failure.
-                    .map(|(before, t)| {
-                        (before, EvalError::new(t.error.message), (t.source, t.line))
-                    })
-                    .collect();
-                jq::seed_remaining_inputs_with_errors(
-                    queue,
-                    locations.exhausted(args.slurp),
-                    errors,
-                );
-                // #4303: where the stream's own end was recorded, reads past it
-                // move on from it as jq's do.
-                if locations.eof_tail.is_some() {
-                    jq::count_reads_past_end();
-                }
             }
 
             if args.null_input {
@@ -7012,7 +6960,14 @@ fn get_inputs(
                     // (#5853).
                     let mut lazy_prefix: Option<Vec<(usize, usize)>> = None;
                     if !args.stream && pos == 0 && last == 0 {
-                        let scan = lazy_json_scan(&raw);
+                        let scan = if lazy_route_forced_off() {
+                            LazyScan {
+                                spans: Vec::new(),
+                                clean: false,
+                            }
+                        } else {
+                            lazy_json_scan(&raw)
+                        };
                         if scan.clean {
                             let spans = scan.spans;
                             // Set already only for a stream that is not UTF-8, the one case
@@ -9374,6 +9329,74 @@ fn defer_lazy_start(text: std::rc::Rc<String>, spans: Vec<(usize, usize)>, src: 
     });
 }
 
+/// Seeds the `input` queue with what [`get_inputs`] read (#723): the lazy stream it deferred, whose
+/// documents are converted as the program reads them (#5661), or the documents it read eagerly,
+/// with the parse errors that came with them. Taking [`LAZY_JSON_INPUTS`] is what tells the two
+/// apart, so a test can seed the queue the way [`run`] does (#5958).
+fn seed_input_queue(
+    slurp: bool,
+    inputs: Vec<OwnedValue>,
+    locations: &InputLocations,
+    trailing_error: Option<TrailingParseError>,
+    resumed_errors: Vec<(usize, TrailingParseError)>,
+) {
+    if let Some(lazy) = LAZY_JSON_INPUTS.with(|slot| slot.borrow_mut().take()) {
+        // #5661: a stream whose documents are converted as the program reads them. A clean
+        // one has `inputs` empty, and so is `locations`' line table: each document's line
+        // is counted when it is read, one forward pass over the text in all. One that
+        // turned malformed (#5853) has the documents and parse errors after its lazy start
+        // in `inputs` and `resumed_errors`, and they follow it in order.
+        let tail = lazy_tail_items(inputs, locations, trailing_error, resumed_errors);
+        jq::seed_remaining_inputs_from(lazy_json_producer_then(
+            lazy,
+            tail,
+            locations.exhausted(slurp),
+        ));
+        if locations.eof_tail.is_some() {
+            jq::count_reads_past_end();
+        }
+    } else {
+        // Moves rather than clones: `inputs` isn't read again on
+        // this branch (the null-input arm below uses `OwnedValue::
+        // Null` directly; the non-null arm pops from the queue this
+        // seeds, not from `inputs`) -- review catch: an earlier
+        // version cloned every document here for no reason, doubling
+        // peak memory for the whole input set.
+        //
+        // `locations` itself is *not* consumed: it stays alive as the
+        // file table `ErrorAt::Live` resolves the queue's opaque
+        // source tags against (#1309).
+        debug_assert_eq!(
+            inputs.len(),
+            locations.per_value().len(),
+            "one location per queued document"
+        );
+        let queue: Vec<(OwnedValue, u32, u32)> = inputs
+            .into_iter()
+            .zip(locations.per_value().iter().copied())
+            .map(|(v, (src, line))| (v, src, line))
+            .collect();
+        // A stream that turned malformed partway queues each parse
+        // error behind the documents before it (#2961), and the
+        // documents jq read after resuming behind it (#4311).
+        let documents = queue.len();
+        let errors = resumed_errors
+            .into_iter()
+            .chain(trailing_error.map(|t| (documents, t)))
+            // As a plain error: jq's `try input catch .` catches a
+            // parse error like any other, where the materializer's
+            // own error is tagged as an uncatchable decode failure.
+            .map(|(before, t)| (before, EvalError::new(t.error.message), (t.source, t.line)))
+            .collect();
+        jq::seed_remaining_inputs_with_errors(queue, locations.exhausted(slurp), errors);
+        // #4303: where the stream's own end was recorded, reads past it
+        // move on from it as jq's do.
+        if locations.eof_tail.is_some() {
+            jq::count_reads_past_end();
+        }
+    }
+}
+
 /// What a stream that turned malformed after its lazy start (#5853) hands out once the lazy
 /// documents are read: the documents the eager loop read after them, each parse error ahead of the
 /// document its "documents before it" count names, then the trailing error. The same order
@@ -9473,6 +9496,25 @@ thread_local! {
     /// Set by [`get_inputs`] for the call site that seeds the `input` queue, which takes it.
     static LAZY_JSON_INPUTS: std::cell::RefCell<Option<LazyJsonInputs>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: makes [`get_inputs`] take the eager route for every stream, the reference the
+    /// lazy route is compared with (#5958).
+    static LAZY_ROUTE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a test has turned the lazy route off ([`LAZY_ROUTE_OFF`]); never outside tests.
+fn lazy_route_forced_off() -> bool {
+    #[cfg(test)]
+    {
+        LAZY_ROUTE_OFF.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 /// A document at most this long cannot nest deeper than [`LAZY_JSON_MAX_DEPTH`].
@@ -14304,6 +14346,133 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, ["error", "document", "document"]);
+    }
+
+    /// #5853: a stream that turns malformed reads the same whether its clean start is converted
+    /// lazily and the rest handed to the eager loop, or the whole stream is read eagerly: every
+    /// document and error `input` pops and the `(at ...)` marker (source and line) after each pop,
+    /// through and past the end. The streams put one fault of each kind at
+    /// every byte position of short clean streams (#5958). The pin must be able to fail: it does with the
+    /// handoff cut at the end of a bare token the fault completes (`lazy_json_scan` not backing
+    /// off), or with the lazy documents left out of an error's "documents before it".
+    #[test]
+    fn a_lazy_prefix_with_an_eager_handoff_reads_as_the_eager_route_does_5853() {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("stream.json");
+        let path_str = path.to_string_lossy().into_owned();
+        let cmd = JqCommand::try_parse_from(["jq", "-n", "inputs", path_str.as_str()]).unwrap();
+        let observe = |bytes: &[u8], lazy_off: bool| {
+            std::fs::write(&path, bytes).unwrap();
+            LAZY_ROUTE_OFF.with(|f| f.set(lazy_off));
+            let (mut open_failed, mut opened) = (false, Vec::new());
+            let read = get_inputs(&cmd, true, true, &mut open_failed, &mut opened);
+            LAZY_ROUTE_OFF.with(|f| f.set(false));
+            let (inputs, locations, trailing, resumed) =
+                read.expect("no exit code").expect("reads");
+            let lazy_documents = LAZY_JSON_INPUTS
+                .with(|slot| slot.borrow().as_ref().map_or(0, |lazy| lazy.spans.len()));
+            seed_input_queue(false, inputs, &locations, trailing, resumed);
+            let mut seen = vec![format!("tail {:?}", locations.eof_tail)];
+            // Past the end: the first failed read, then the later ones (#4303).
+            for _ in 0..40 {
+                let popped = match jq::pop_input() {
+                    jq::InputPop::Document(v) => format!("doc {v:?}"),
+                    jq::InputPop::ParseError(e) => format!("error {}", e.message),
+                    jq::InputPop::Exhausted => "end".to_string(),
+                };
+                seen.push(format!("{popped} at {:?}", jq::current_input_location()));
+                if popped == "end" && seen.iter().filter(|s| s.starts_with("end")).count() > 2 {
+                    break;
+                }
+            }
+            (seen, lazy_documents)
+        };
+        let docs: [&[u8]; 6] = [b"1", b"\"a\"", b"[1,2]", b"{\"a\":null}", b"true", b"-0.5"];
+        let seps: [&[u8]; 3] = [b"\n", b" ", b"\r\n"];
+        let faults: [&[u8]; 14] = [
+            b"}",
+            b"]",
+            b"x",
+            b"nan",
+            b"1e1000",
+            b"007",
+            b"\"unclosed",
+            b"\0",
+            b"\xef\xbb\xbf",
+            b"\xff",
+            b"[1,]",
+            b"{\"a\"}",
+            b"'",
+            b"3}",
+        ];
+        let mut bases: Vec<Vec<u8>> = Vec::new();
+        for (i, a) in docs.iter().enumerate() {
+            for b in &docs[i..] {
+                for sep in seps {
+                    for end in [&b""[..], b"\n"] {
+                        bases.push([*a, sep, *b, end].concat());
+                    }
+                }
+            }
+        }
+        bases.push([docs[0], b"\n", docs[1], b"\n", docs[2], b"\n", docs[4]].concat());
+        let (mut checked, mut lazy_prefixes) = (0usize, 0usize);
+        for base in &bases {
+            for at in 0..=base.len() {
+                for fault in faults {
+                    let stream = [&base[..at], fault, &base[at..]].concat();
+                    let (eager, eager_lazy) = observe(&stream, true);
+                    assert_eq!(eager_lazy, 0, "the reference route is eager");
+                    let (hybrid, lazy_documents) = observe(&stream, false);
+                    assert_eq!(
+                        hybrid,
+                        eager,
+                        "{:?} (a lazy prefix of {lazy_documents})",
+                        String::from_utf8_lossy(&stream)
+                    );
+                    checked += 1;
+                    lazy_prefixes += usize::from(lazy_documents > 0);
+                }
+            }
+        }
+        assert!(checked > 5000, "{checked} streams");
+        assert!(
+            lazy_prefixes > 1000,
+            "{lazy_prefixes} streams kept a lazy prefix"
+        );
+        // Two faults in one stream: the eager loop resumes after the first and meets the second,
+        // so the parse errors' "documents before it" counts are several (`lazy_tail_items`).
+        let more: [&[u8]; 5] = [b"}", b"x", b"007", b"3}", b"\"unclosed"];
+        let (mut pairs, mut lazy_pairs) = (0usize, 0usize);
+        for base in [&b"1\n[2]\n"[..], b"\"a\" {\"a\":null}", b"[1,2] true\n"] {
+            for at in 0..=base.len() {
+                for first in more {
+                    let once = [&base[..at], first, &base[at..]].concat();
+                    for then in 0..=once.len() {
+                        for second in more {
+                            let stream = [&once[..then], second, &once[then..]].concat();
+                            let (eager, _) = observe(&stream, true);
+                            let (hybrid, lazy_documents) = observe(&stream, false);
+                            assert_eq!(
+                                hybrid,
+                                eager,
+                                "{:?} (a lazy prefix of {lazy_documents})",
+                                String::from_utf8_lossy(&stream)
+                            );
+                            pairs += 1;
+                            lazy_pairs += usize::from(lazy_documents > 0);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(pairs > 3000, "{pairs} two-fault streams");
+        assert!(
+            lazy_pairs > 500,
+            "{lazy_pairs} two-fault streams kept a lazy prefix"
+        );
     }
 
     /// [`lazy_json_scan`]'s spans for a stream it reads whole.
