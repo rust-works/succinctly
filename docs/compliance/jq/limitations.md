@@ -9700,7 +9700,10 @@ reads) plus two consequences of the route:
   with no output and jq's own parse error (`jq: parse error: Unfinished JSON term at EOF at line 3, column 0`, [#5555](https://github.com/rust-works/succinctly/issues/5555)).
   `-n -s` with `inputs` raises it as jq does, `jq: error (at <file>:<line>): …` at the position jq's parser stood on.
   Under `-n -s` jq reads on the first `input`, and so does succinctly since [#6019](https://github.com/rust-works/succinctly/issues/6019): each fault the stream holds is the error of one call, all of them ahead of the array, which holds every value read (the ones after a fault too, since jq goes on with the next line); `try input catch "E"` on `1 2 }` prints `"E"`, and a program that never calls `input` prints its result.
-  One case still differs, tracked as [#6004](https://github.com/rust-works/succinctly/issues/6004): a stream that ends in a bare token and the one character that ends it (`1[`) closes jq's array before the end-of-file fault, which then comes after the array and names `<unknown>`.
+  A stream that ends in a bare token and the one character that ends it (`1[`, `true{`) closes jq's array before the end-of-file fault, which then comes after the array and names `<unknown>`.
+  So does succinctly since [#6004](https://github.com/rust-works/succinctly/issues/6004): `printf '1[' | jq -cs .` prints `[1]` and then the parse error, and an `input` that meets the fault names `(at <unknown>)`.
+  Only that shape does, and only where it ends the whole stream: `1 [`, `"a"[` and `[1][` keep the all-or-nothing slurp and the file in the marker, as in jq, and so does a token followed by a file that would not open.
+  `--stream -s` still prints nothing for it, where jq prints the token's events (`printf '1[' | jq -cs --stream .` is `[[[],1]]` before the error).
   A file earlier than the one the splitter stopped in is read again from disk to find a fault ahead of it, since its buffer is gone.
 - A value jq rejects as undecodable (`"\ud800"`, `"\x"`) is echoed raw, as on the default
   route ([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md)), where
