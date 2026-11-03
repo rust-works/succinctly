@@ -29633,24 +29633,25 @@ fn build_regex_uncached<S: EvalSemantics>(
         }
     }
 
-    match regex::Regex::new(&pattern) {
-        Ok(re) => Ok(JqRegex {
-            // #6069: a repeated group that can match empty reports Oniguruma's last iteration
-            // only from a rewritten pattern. One the crate refuses (its size limit) keeps `re`.
-            engine: S::TAG
-                .ne(&EvalTag::Yq)
-                .then(|| super::onig_loop::rewrite(&pattern))
-                .flatten()
-                .and_then(|groups| {
-                    let rewritten = regex::Regex::new(&groups.pattern).ok()?;
-                    (rewritten.captures_len() == groups.compiled_groups).then_some(
-                        RegexEngine::Rewritten {
-                            re: rewritten,
-                            groups,
-                        },
-                    )
-                })
-                .unwrap_or(RegexEngine::Std(re)),
+    // #6069: a repeated group that can match empty reports Oniguruma's last iteration only from a
+    // rewritten pattern. The rewrite keeps every character, class and escape of the pattern, so
+    // one the crate compiles stands for the pattern; one it refuses (its size limit) leaves the
+    // pattern to compile as written, with the crate's own error if it has one.
+    let rewritten = (S::TAG != EvalTag::Yq)
+        .then(|| super::onig_loop::rewrite(&pattern))
+        .flatten()
+        .and_then(|groups| {
+            let re = regex::Regex::new(&groups.pattern).ok()?;
+            (re.captures_len() == groups.compiled_groups)
+                .then_some(RegexEngine::Rewritten { re, groups })
+        });
+    let compiled = match rewritten {
+        Some(engine) => Ok(engine),
+        None => regex::Regex::new(&pattern).map(RegexEngine::Std),
+    };
+    match compiled {
+        Ok(engine) => Ok(JqRegex {
+            engine,
             needs_trailing_nl_check,
             exact_end: needs_trailing_nl_check.then(|| ExactEnd::new(&pattern)),
             suppress_empty,
