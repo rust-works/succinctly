@@ -61,38 +61,76 @@ fn a_slurped_stream_answers_as_jq_5498() -> Result<()> {
 }
 
 /// The files are one stream to jq's parser: a token open where one ends continues in the next, and
-/// a fault in the second file names its line and column there.
+/// a fault in a later file names its line and column there. Expected strings from `/usr/bin/jq`
+/// 1.7.1; `{DIR}` is the directory the files are written to.
 #[test]
-fn a_slurped_stream_over_two_files_is_one_stream_5498() -> Result<()> {
+fn a_slurped_stream_over_several_files_is_one_stream_5498() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let write = |name: &str, text: &str| -> Result<String> {
-        let path = dir.path().join(name);
-        std::fs::write(&path, text)?;
-        Ok(path.to_string_lossy().into_owned())
-    };
-    for (first, second, want_out, want_err, want_code) in [
-        ("[1,", "2]\n", "[[[0],1],[[1],2],[[1]]]\n", "", 0),
+    let prefix = dir.path().to_string_lossy().into_owned();
+    #[allow(clippy::type_complexity)]
+    let rows: &[(&[&str], &[&str], &str, &str, i32)] = &[
+        (&["[1,", "2]\n"], &["-c", "--stream", "-s", "."], "[[[0],1],[[1],2],[[1]]]\n", "", 0),
+        (&["[1", ",2", "]\n"], &["-c", "--stream", "-s", "."], "[[[0],1],[[1],2],[[1]]]\n", "", 0),
         (
-            "{\"a\":1}\n",
-            "[2]\n",
+            &["{\"a\":1}\n", "[2]\n"],
+            &["-c", "--stream", "-s", "."],
             "[[[\"a\"],1],[[\"a\"]],[[0],2],[[0]]]\n",
             "",
             0,
         ),
+        (&["{\"a\":1}\n", "{\"a\":", "2}\n", "[3]\n"], &["-c", "--stream", "-s", "length"], "6\n", "", 0),
+        (&["[1]\n", "[2]\n"], &["-c", "--stream", "-s", "input_filename"], "\"{DIR}/f1.json\"\n", "", 0),
         (
-            "[1]\n",
-            "}\n",
+            &["[1]\n", "}\n"],
+            &["-c", "--stream", "-s", "."],
             "",
             "jq: parse error: Unmatched '}' at the top-level at line 2, column 1\n",
             5,
         ),
-    ] {
-        let (a, b) = (write("a.json", first)?, write("b.json", second)?);
-        let (stdout, stderr, code) = run_jq_full(&["-c", "--stream", "-s", ".", &a, &b], None)?;
+        (
+            &["[1]\n", "[2,\n}\n"],
+            &["-c", "--stream", "-s", "."],
+            "",
+            "jq: parse error: Expected another key:value pair at line 3, column 1\n",
+            5,
+        ),
+        (
+            &["1 ", "2\n3 }\n"],
+            &["-c", "--stream", "-s", "."],
+            "",
+            "jq: parse error: Unmatched '}' at the top-level at line 2, column 3\n",
+            5,
+        ),
+        // `--stream-errors` makes the fault an input, inside the array.
+        (
+            &["[1]\n", "[2]\n}\n"],
+            &["-c", "--stream-errors", "-s", "."],
+            "[[[0],1],[[0]],[[0],2],[[0]],[\"Unmatched '}' at the top-level at line 3, column 1\",[]]]\n",
+            "",
+            0,
+        ),
+    ];
+    for (files, flags, want_out, want_err, want_code) in rows {
+        let paths = files
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let path = dir.path().join(format!("f{i}.json"));
+                std::fs::write(&path, text)?;
+                Ok(path.to_string_lossy().into_owned())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut args: Vec<&str> = flags.to_vec();
+        args.extend(paths.iter().map(String::as_str));
+        let (stdout, stderr, code) = run_jq_full(&args, None)?;
         assert_eq!(
             (stdout.as_str(), stderr.as_str(), code),
-            (want_out, want_err, want_code),
-            "{first:?} then {second:?}"
+            (
+                want_out.replace("{DIR}", &prefix).as_str(),
+                want_err.replace("{DIR}", &prefix).as_str(),
+                *want_code
+            ),
+            "{files:?} under {flags:?}"
         );
     }
     Ok(())

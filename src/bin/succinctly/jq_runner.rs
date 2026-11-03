@@ -6408,7 +6408,8 @@ fn get_inputs(
     // error jq raises; the rest of `--stream` keeps its own route for now.
     // `-s` (#5498) reads the same way, whether or not the program reads `input`: the array holds
     // the events, and the first fault is the error jq raises.
-    let stream_by_reader = args.stream && !args.stream_errors && (track_eof || args.slurp);
+    let stream_by_reader =
+        json_input_mode && args.stream && !args.stream_errors && (track_eof || args.slurp);
     let mut seams = if json_input_mode && !args.validate && !args.stream_errors && !stream_by_reader
     {
         stitch_json_file_seams(
@@ -6602,32 +6603,32 @@ fn get_inputs(
             });
             return Ok(Ok((Vec::new(), locations, None, Vec::new())));
         }
-        let read = if args.slurp {
-            crate::jq_stream_errors::read_for_slurp(&raw_bytes)
+        let mut read = if args.slurp {
+            crate::jq_stream_errors::read_for_slurp(&raw_bytes, stream_by_reader)
         } else {
             crate::jq_stream_errors::read(&raw_bytes)
         };
         // Without `--stream-errors` a fault is not an input: `-s` reads everything before it
-        // runs the program, so the first one is the whole result (#5498).
-        if let (true, Some(first)) = (stream_by_reader, read.first_error) {
-            let (source, line) = read.first_error_location.unwrap_or_default();
-            let message = crate::jq_stream_errors::error_message(&read.values[first]);
+        // runs the program, so the first one is the whole result (#5498), and the read stopped
+        // there.
+        if let (true, Some((message, (source, line)))) = (stream_by_reader, read.first_fault.take())
+        {
             return Ok(Err(MalformedJsonError::new(EvalError::new(message))
                 .at_stream_fault(source, line)
                 .into()));
+        }
+        // The slurp read keeps the last few locations only: more values after the array than that
+        // (none seen) are read again with all of them.
+        if args.slurp && read.inside < read.locations_from {
+            read = crate::jq_stream_errors::read(&raw_bytes);
         }
         let mut values = read.values;
         let mut value_locations = read.locations;
         // `--slurp` closes its array at the call that empties jq's buffer, so what that call left
         // behind comes out after the array as inputs of their own.
         let after_array = args.slurp.then(|| {
-            debug_assert!(
-                read.inside >= read.locations_from,
-                "the values after the array keep their locations"
-            );
             let outside = values.split_off(read.inside);
-            let outside_locations =
-                value_locations.split_off(read.inside.saturating_sub(read.locations_from));
+            let outside_locations = value_locations.split_off(read.inside - read.locations_from);
             let (source, line) = read.slurp_at;
             values = vec![OwnedValue::array_from(std::mem::take(&mut values))];
             value_locations = vec![(source, line)];
