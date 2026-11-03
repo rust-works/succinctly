@@ -34,15 +34,40 @@ pub(super) fn supported(expr: &Expr) -> bool {
         Expr::Builtin(
             Builtin::Keys | Builtin::KeysUnsorted | Builtin::ToEntries | Builtin::FromEntries,
         ) => true,
-        Expr::Builtin(
-            Builtin::WithEntries(f) | Builtin::Map(f) | Builtin::MapValues(f) | Builtin::SortBy(f),
-        ) => supported(f),
+        Expr::Builtin(Builtin::WithEntries(f) | Builtin::Map(f) | Builtin::MapValues(f)) => {
+            supported(f)
+        }
+        Expr::Builtin(Builtin::SortBy(f)) => supported(f) || sort_key_filter(f),
         Expr::Builtin(Builtin::Sort | Builtin::Flatten) => true,
         Expr::Builtin(Builtin::FlattenDepth(depth)) => is_closed_literal(depth),
         // Paths given as a literal; one built from the document is for the plain route.
         Expr::Builtin(Builtin::Pick(paths)) => is_closed_literal(paths),
         Expr::Assign { path, value } => static_path(path) && supported(value),
         Expr::Update { path, filter } => static_path(path) && supported(filter),
+        _ => false,
+    }
+}
+
+/// A `sort_by` filter that reads the entry's own `key` (#6099): `key`, `key | f`, a comma of those
+/// and of supported filters. A `key` below another step is not one, and stays unsupported.
+fn sort_key_filter(f: &Expr) -> bool {
+    match f {
+        Expr::Builtin(Builtin::Key) => true,
+        Expr::Paren(inner) => sort_key_filter(inner),
+        Expr::Pipe(parts) => match parts.split_first() {
+            Some((first, rest)) => {
+                sort_key_filter(first)
+                    && rest.iter().all(|stage| {
+                        supported(stage)
+                            || matches!(
+                                stage,
+                                Expr::Builtin(Builtin::Length | Builtin::Tag | Builtin::Type)
+                            )
+                    })
+            }
+            None => false,
+        },
+        Expr::Comma(parts) => parts.iter().all(|p| supported(p) || sort_key_filter(p)),
         _ => false,
     }
 }

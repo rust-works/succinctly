@@ -54,8 +54,8 @@ use super::tail_call::{
     Tail, TailRounds,
 };
 use super::walk::{
-    any_pattern_key, any_subexpr, map_builtin_subexprs, map_pattern_subexprs, map_subexprs,
-    search_subexpr, Visit,
+    any_pattern_key, any_subexpr, contains_builtin, map_builtin_subexprs, map_pattern_subexprs,
+    map_subexprs, search_subexpr, Visit,
 };
 
 /// Which `EvalSemantics` implementor a value carries, as a runtime tag.
@@ -22578,6 +22578,45 @@ pub(crate) fn yq_sort_repeated_key_error<F: DocumentFields>(fields: &F) -> Optio
     None
 }
 
+/// `f` with the `key` stages that read an entry's key replaced by `key_expr` (#6099), or `None`
+/// when `f` has none to replace.
+///
+/// Only a `key` that stands where the entry does counts: `key`, `key | g`, a parenthesized or
+/// comma'd form of those. A `key` below another navigation step (`.a | key`, `g | key`) names
+/// that step's member, and is left for the evaluator.
+fn bind_entry_key(f: &Expr, key_expr: &Expr) -> Option<Expr> {
+    let reads_key = |e: &Expr| contains_builtin(e, |b| matches!(b, Builtin::Key));
+    match f {
+        Expr::Builtin(Builtin::Key) => Some(key_expr.clone()),
+        Expr::Paren(inner) => bind_entry_key(inner, key_expr).map(|e| Expr::Paren(Box::new(e))),
+        Expr::Pipe(stages) => {
+            let (first, rest) = stages.split_first()?;
+            if rest.iter().any(reads_key) {
+                return None;
+            }
+            let first = bind_entry_key(first, key_expr)?;
+            let mut out = vec_with_capacity(stages.len());
+            out.push(first);
+            out.extend(rest.iter().cloned());
+            Some(Expr::pipe(out))
+        }
+        Expr::Comma(items) => {
+            let mut changed = false;
+            let mut out = vec_with_capacity(items.len());
+            for item in items {
+                if reads_key(item) {
+                    out.push(bind_entry_key(item, key_expr)?);
+                    changed = true;
+                } else {
+                    out.push(item.clone());
+                }
+            }
+            changed.then(|| Expr::Comma(out))
+        }
+        _ => None,
+    }
+}
+
 /// yq mode only (#2064): `sort` and `sort_by(f)` on a mapping reorder its entries by the
 /// values (or by `[f]` of each value), keeping the keys, and answer a mapping. Stable, with
 /// yq's comparator ([`yq_sort_by`]). jq has no such reading and keeps its pairing error.
@@ -22602,16 +22641,36 @@ fn yq_sort_mapping<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         vec_with_capacity(checked.len());
     // #4054: see `by_key_scope`.
     let _scope = f.and_then(|_| by_key_scope::<S>());
+    // #6099: a filter that reads the entry's `key` (`sort_by(key)`, `sort_by(key | downcase)`).
+    let reads_key = f.is_some_and(|f| contains_builtin(f, |b| matches!(b, Builtin::Key)));
     for field in checked {
         let Some((key, is_fallback)) = key_display_string_kind(&field.key) else {
             return QueryResult::Error(fields.malformed_member_error());
         };
         let key = key.into_owned();
         let sort_key = match f {
-            Some(f) => match collect_array_items::<W, S>(f, field.value.clone(), optional) {
-                Ok(items) => Some(items),
-                Err(escape) => return escape,
-            },
+            Some(f) => {
+                // The entry's key node, as the scalar its text resolves to: a plain `10` is an
+                // `!!int` that sorts as a number, `null` and `true` sort by their kind. The
+                // mapping reaches here as JSON text, which no longer says whether the key was
+                // quoted, so a quoted `"10"` resolves the same way (docs/compliance/yq).
+                let bound = if reads_key {
+                    let key_value = if is_fallback {
+                        OwnedValue::String(key.clone().into())
+                    } else {
+                        crate::yaml::resolve_plain_sourced(&key, false)
+                            .to_owned_value(Cow::Borrowed(key.as_str()))
+                    };
+                    bind_entry_key(f, &owned_to_expr(&key_value))
+                } else {
+                    None
+                };
+                let f = bound.as_ref().unwrap_or(f);
+                match collect_array_items::<W, S>(f, field.value.clone(), optional) {
+                    Ok(items) => Some(items),
+                    Err(escape) => return escape,
+                }
+            }
             None => None,
         };
         let owned = match to_owned::<S, _>(&field.value) {

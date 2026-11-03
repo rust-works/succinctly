@@ -5538,6 +5538,11 @@ position and then by length, as `sort_by(.a, .b)` is in yq. jq mode is untouched
   key is refused** (`cannot sort a mapping with the repeated key "a"`) instead of answering
   with an entry gone, which a sort written back with `-i` would make permanent (the ADR-0018
   data-loss exception).
+  `sort_by(key)` and `sort_by(key | f)` sort by the entry's key ([#6099](https://github.com/rust-works/succinctly/issues/6099)).
+  The key is the scalar its text resolves to, as a plain key is in yq (`10` is an integer and follows `9`, `null` and `true` sort by their kind).
+  The mapping reaches the sort as JSON text, which no longer says whether the key was quoted, so a quoted `"10"` sorts as the integer here and as a string in yq.
+  A `key` below another step (`sort_by(.a | key)`) is that step's and is left as it was.
+  Comments, anchors and styles follow their entries for `key`, `key | length`, `key | tag` and `key | type`; another `f` after the `key` (`key | downcase`) sorts correctly but takes the route that carries none of them.
 - **An array's head comment** ([#4926](https://github.com/rust-works/succinctly/issues/4926)).
   yq's `sort`, `sort_by`, `reverse`, `unique` and `unique_by` reorder the sequence node in
   place, so the comment block above a document's sequence (a config file's banner) stays on
