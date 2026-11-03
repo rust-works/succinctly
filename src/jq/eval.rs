@@ -27392,6 +27392,12 @@ struct JqRegex {
     /// The exact reading of `$` for a pattern with `needs_trailing_nl_check` (#5572).
     exact_end: Option<ExactEnd>,
     suppress_empty: bool,
+    /// `n` is enforced by the `fancy-regex` engine itself (its not-empty mode, #5530), which
+    /// refuses a match that ends where the attempt began, as Oniguruma's
+    /// `ONIG_OPTION_FIND_NOT_EMPTY` does. The match it returns may still be empty once `\K` has
+    /// moved its start (`"a1" | match("1\\K";"n")` is the empty match at offset 2 in jq), so the
+    /// emptiness filter of the other routes must not run again (#6083).
+    engine_not_empty: bool,
     /// `l` on the `fancy-regex` engine: a search returns the longest match anywhere at or after
     /// its start, not the leftmost one (see [`fancy_longest_captures`]).
     longest: Option<LongestSearch>,
@@ -27512,6 +27518,14 @@ impl<'r> Iterator for RegexCaptureNames<'r> {
 
 #[cfg(feature = "regex")]
 impl JqRegex {
+    /// Whether the caller, and not the engine, refuses an empty match under the `n` flag: the
+    /// routes whose engine enforces `n` (`engine_not_empty`) have refused the matches that end
+    /// where their attempt began, and re-testing the span `\K` keeps would refuse one jq returns
+    /// (#6083).
+    fn caller_skips_empty(&self) -> bool {
+        self.suppress_empty && !self.engine_not_empty
+    }
+
     fn is_match(&self, input: &str) -> Result<bool, EvalError> {
         if self.suppress_empty {
             return Ok(first_captures(self, input)?.is_some());
@@ -29072,6 +29086,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                     needs_trailing_nl_check: false,
                     exact_end: None,
                     suppress_empty,
+                    engine_not_empty: modes.not_empty,
                     longest: modes.longest.then_some(LongestSearch {
                         max_len,
                         start_independent: !pattern.contains("\\G"),
@@ -29092,6 +29107,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 needs_trailing_nl_check: false,
                 exact_end: None,
                 suppress_empty,
+                engine_not_empty: false,
                 longest: None,
             });
         }
@@ -29103,6 +29119,7 @@ fn build_regex_uncached<S: EvalSemantics>(
             needs_trailing_nl_check,
             exact_end: needs_trailing_nl_check.then(|| ExactEnd::new(&pattern)),
             suppress_empty,
+            engine_not_empty: false,
             longest: None,
         }),
         // #5502: lookaround, backreferences, atomic groups and the like are Oniguruma syntax the
@@ -29115,6 +29132,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 needs_trailing_nl_check: false,
                 exact_end: None,
                 suppress_empty,
+                engine_not_empty: false,
                 longest: None,
             }),
             None => Err(EvalError::new(format!("invalid regex: {e}"))),
@@ -29972,7 +29990,7 @@ fn next_match_step<'h>(
         .get(0)
         .expect("capture group 0 is always present on a match");
     let (m_start, m_end) = (m.start(), m.end());
-    let accepted = !re.suppress_empty || m_end > m_start;
+    let accepted = !re.caller_skips_empty() || m_end > m_start;
     let next_start = if m_end > m_start {
         m_end
     } else {
