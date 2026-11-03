@@ -11,10 +11,12 @@ if jq -e '.stop_hook_active == true' <<<"$input" >/dev/null 2>&1; then
   exit 0
 fi
 
+# `.agents/skills` is a symlink to `.claude/skills` (#5956); the trailing slash
+# makes `find` descend into it, which it does not for a bare symlink argument.
 skills_dir="$root/.agents/skills"
 [ -d "$skills_dir" ] || { printf '{}\n'; exit 0; }
 
-bad="$(find "$skills_dir" -maxdepth 2 -iname 'skill.md' ! -name 'SKILL.md')"
+bad="$(find "$skills_dir/" -maxdepth 2 -iname 'skill.md' ! -name 'SKILL.md')"
 if [ -z "$bad" ]; then
   printf '{}\n'
   exit 0

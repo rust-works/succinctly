@@ -1,3 +1,8 @@
+---
+name: release
+description: Create a succinctly release when asked to release, publish, or prepare a new version.
+---
+
 # Release Skill
 
 Creates releases for the succinctly crate. Triggered by terms like "release", "publish", "new version".
