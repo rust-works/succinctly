@@ -1128,6 +1128,14 @@ jobs:
       - name: Check both skill-casing hooks reject a lowercase skill.md (#5956)
         run: python3 scripts/test_skill_hooks.py -v
 
+      # A skill with a bad name, an over-long description, an unknown frontmatter key or a dead
+      # link is skipped by the host with no error (#5971).
+      - name: Lint the skills' frontmatter, size and links (#5971)
+        run: python3 scripts/skill_lint.py
+
+      - name: Skill lint self-tests (#5971)
+        run: python3 scripts/test_skill_lint.py -v
+
   docs:
     name: Documentation
     needs: gate

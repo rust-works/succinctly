@@ -118,6 +118,9 @@ Deploy the application:
 - Put reference content in task skills (use `context: fork` instead)
 - Create skills for one-off tasks (just ask Claude directly)
 - Exceed 500 lines in SKILL.md (use supporting files)
+- Leave a skill's frontmatter, size or links unchecked: `python3 scripts/skill_lint.py` fails on a bad
+  `name` (it must equal the directory), a `description` over 1024 characters, an unknown frontmatter key,
+  a body over 500 lines and a dead relative link; CI and the push gate run it (#5971)
 - Use `disable-model-invocation` for reference skills
 
 ## When to Create a Skill
