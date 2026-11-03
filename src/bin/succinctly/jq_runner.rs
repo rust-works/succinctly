@@ -19,6 +19,7 @@ use succinctly::jq::eval_generic::{
     check_nesting_depth, depth_guard_panic_message, eval_with_cursor, to_owned as generic_to_owned,
     to_owned_checked as generic_to_owned_checked, validate_cursor, GenericResult, LazyElem,
 };
+use succinctly::jq::utf8_document::SubstitutionEdit;
 use succinctly::jq::walk::{map_builtin_subexprs, map_pattern_subexprs, stamp_loc_file};
 use succinctly::jq::{
     self, format_number_jq_compat, jq_bare_float_display, nonfinite_display_string, Builtin,
@@ -6773,11 +6774,11 @@ fn get_inputs(
                     if let Some(seam) = seams.get_mut(pos) {
                         *seam = std::mem::take(seam).after_substitution(e.as_bytes());
                     }
-                    let substituted =
-                        succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(
+                    let (substituted, edits) =
+                        succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped(
                             e.as_bytes(),
                         );
-                    lossy = Some(LossySource::new(e.into_bytes(), substituted.as_bytes()));
+                    lossy = Some(LossySource::new(e.into_bytes(), edits));
                     substituted
                 } else {
                     // `--raw-input --slurp` (the non-slurp `-R` took the
@@ -7085,9 +7086,9 @@ fn get_inputs(
                             })
                         });
                         // The bytes jq read of this segment, where they are known.
-                        let read = lossy.and_then(|lossy| {
+                        let read = lossy.map(|lossy| {
                             if offset == 0 {
-                                Some(lossy.original.as_slice())
+                                lossy.original.as_slice()
                             } else {
                                 lossy.bytes(offset..raw.len())
                             }
@@ -7173,16 +7174,40 @@ fn get_inputs(
                         // `8`).
                         while next < raw.len() && !raw.is_char_boundary(next) {
                             let line = faults.line_at_read_of(next);
+                            // #5975: the fault is the parser's own, read from the byte the read
+                            // starts on, from where the parser stood at the last fault.
+                            let fault = parser_at.and_then(|(line, column)| {
+                                let read = lossy.map_or_else(
+                                    || &raw.as_bytes()[next..],
+                                    |lossy| lossy.bytes(next..raw.len()),
+                                );
+                                jq::jq_stream_fault_end([read], line, column)
+                            });
+                            let (error, fault_end) = match fault {
+                                Some((message, end)) => (EvalError::new(message), Some(end)),
+                                // patchcov: coverage tolerate reason="unreachable: the read starts on a UTF-8 continuation byte, which no JSON token begins with, so the parser always names a fault in it; kept so a read it could not name is still an error and not silently dropped (#5975)"
+                                None => (EvalError::new("Invalid JSON text"), None),
+                                // patchcov: coverage end
+                            };
                             resumed_errors.push((
                                 values.len(),
                                 TrailingParseError {
-                                    error: EvalError::new("Invalid JSON text"),
+                                    error,
                                     source: u32::try_from(src).unwrap_or(u32::MAX),
                                     line: u32::try_from(line).unwrap_or(u32::MAX),
                                     seq_warning: false,
                                 },
                             ));
-                            next = faults.read_end(next);
+                            let read_end = faults.read_end(next);
+                            // Without the parser's own end, the bytes it dropped are counted on.
+                            parser_at = fault_end.or_else(|| {
+                                // patchcov: coverage tolerate reason="unreachable with the arm above: the parser always names the fault, so the dropped bytes are never counted by hand (#5975)"
+                                parser_at.map(|at| {
+                                    advance_source(at, raw.as_bytes(), lossy, next..read_end)
+                                })
+                                // patchcov: coverage end
+                            });
+                            next = read_end;
                         }
                         if next >= raw.len() {
                             file_end = parser_at;
@@ -7975,79 +8000,33 @@ fn parser_chunks<'a>(
 /// well, so the two cannot be told apart in the text: the original has to be kept.
 struct LossySource {
     original: Vec<u8>,
-    /// Where each substitution's U+FFFD sits in the text, ordered. `None` when the text is not
-    /// the original with each run replaced by one U+FFFD and nothing else (jq collapses or
-    /// drops a run inside a string, and an escape the text re-spells): an offset in it then has
-    /// no place in the original.
-    runs: Option<Vec<LossyRun>>,
-}
-
-#[derive(Clone, Copy)]
-struct LossyRun {
-    /// Offset of the U+FFFD in the substituted text.
-    at: usize,
-    /// How many bytes shorter the original is than the text, through this run.
-    shrink: usize,
+    /// Where the substitution changed the document, in order (#5975): a run it replaced by one
+    /// U+FFFD, however many bytes the run was (jq collapses or drops a run inside a string), and
+    /// a string it rewrote whole. Between two edits the text is the document byte for byte.
+    edits: Vec<SubstitutionEdit>,
 }
 
 impl LossySource {
-    /// `original` read as `substituted`.
-    fn new(original: Vec<u8>, substituted: &[u8]) -> Self {
-        let runs = Self::runs_of(&original, substituted);
-        Self { original, runs }
+    /// `original`, which the substitution changed in the places `edits` name.
+    fn new(original: Vec<u8>, edits: Vec<SubstitutionEdit>) -> Self {
+        Self { original, edits }
     }
 
-    /// The runs of invalid bytes in `original`, as the lossy conversion replaces them, or `None`
-    /// when `substituted` is anything but that conversion. Checked as the runs are found, so
-    /// no second copy of the document is made to compare with.
-    fn runs_of(original: &[u8], substituted: &[u8]) -> Option<Vec<LossyRun>> {
-        const REPLACEMENT: &[u8] = "\u{fffd}".as_bytes();
-        let (mut runs, mut text, mut shrink) = (Vec::new(), 0, 0);
-        let mut rest = original;
-        while !rest.is_empty() {
-            // (`Utf8Chunks` is newer than this crate's MSRV.)
-            let (valid, invalid) = match core::str::from_utf8(rest) {
-                Ok(_) => (rest.len(), 0),
-                Err(e) => (
-                    e.valid_up_to(),
-                    e.error_len()
-                        .unwrap_or_else(|| rest.len() - e.valid_up_to()),
-                ),
-            };
-            if substituted.get(text..text + valid) != Some(&rest[..valid]) {
-                return None;
-            }
-            text += valid;
-            if invalid > 0 {
-                if substituted.get(text..text + 3) != Some(REPLACEMENT) {
-                    return None;
-                }
-                shrink += 3 - invalid;
-                runs.push(LossyRun { at: text, shrink });
-                text += 3;
-            }
-            rest = &rest[valid + invalid..];
-        }
-        (text == substituted.len()).then_some(runs)
-    }
-
-    /// The offset in the original of `at` in the text; inside a U+FFFD, where its run starts.
-    fn original_offset(runs: &[LossyRun], at: usize) -> usize {
-        let before = runs.partition_point(|run| run.at + 3 <= at);
-        let shrunk = |index: usize| index.checked_sub(1).map_or(0, |i| runs[i].shrink);
-        match runs.get(before) {
-            Some(run) if run.at <= at => run.at - shrunk(before),
-            _ => at - shrunk(before),
+    /// The offset in the original of `at` in the text; inside an edit, where its bytes start.
+    fn original_offset(&self, at: usize) -> usize {
+        let before = self.edits.partition_point(|edit| edit.text.end <= at);
+        match self.edits.get(before) {
+            Some(edit) if edit.text.start <= at => edit.raw.start,
+            _ => match before.checked_sub(1).map(|i| &self.edits[i]) {
+                Some(edit) => at - edit.text.end + edit.raw.end,
+                None => at,
+            },
         }
     }
 
-    /// The original's bytes for `range` of the text, or `None` when no place can be given.
-    fn bytes(&self, range: core::ops::Range<usize>) -> Option<&[u8]> {
-        let runs = self.runs.as_deref()?;
-        Some(
-            &self.original
-                [Self::original_offset(runs, range.start)..Self::original_offset(runs, range.end)],
-        )
+    /// The original's bytes for `range` of the text.
+    fn bytes(&self, range: core::ops::Range<usize>) -> &[u8] {
+        &self.original[self.original_offset(range.start)..self.original_offset(range.end)]
     }
 }
 
@@ -8059,9 +8038,7 @@ fn advance_source(
     lossy: Option<&LossySource>,
     range: core::ops::Range<usize>,
 ) -> (usize, usize) {
-    let bytes = lossy
-        .and_then(|lossy| lossy.bytes(range.clone()))
-        .unwrap_or_else(|| &text[range]);
+    let bytes = lossy.map_or_else(|| &text[range.clone()], |lossy| lossy.bytes(range.clone()));
     advance_position(at, bytes)
 }
 
@@ -17012,24 +16989,26 @@ mod tests {
 
     #[test]
     fn lossy_source_counts_the_bytes_jq_read_5964() {
-        let substitute = |original: &[u8]| {
-            succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(original)
-                .into_bytes()
+        let lossy_of = |original: &[u8]| {
+            let (text, edits) =
+                succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped(original);
+            (
+                text.into_bytes(),
+                LossySource::new(original.to_vec(), edits),
+            )
         };
         // Two lone invalid bytes (one U+FFFD each) and a truncated three-byte lead (one for two).
         let original = b"a\xffb\xe2\x82c\x80 }".to_vec();
-        let text = substitute(&original);
-        let lossy = LossySource::new(original.clone(), &text);
-        assert!(lossy.runs.is_some());
+        let (text, lossy) = lossy_of(&original);
         // Every character boundary of the text maps to the matching byte of the original.
-        assert_eq!(lossy.bytes(0..text.len()), Some(original.as_slice()));
-        assert_eq!(lossy.bytes(0..1), Some(&b"a"[..]));
-        assert_eq!(lossy.bytes(1..4), Some(&b"\xff"[..]));
-        assert_eq!(lossy.bytes(4..5), Some(&b"b"[..]));
-        assert_eq!(lossy.bytes(5..8), Some(&b"\xe2\x82"[..]));
+        assert_eq!(lossy.bytes(0..text.len()), original.as_slice());
+        assert_eq!(lossy.bytes(0..1), &b"a"[..]);
+        assert_eq!(lossy.bytes(1..4), &b"\xff"[..]);
+        assert_eq!(lossy.bytes(4..5), &b"b"[..]);
+        assert_eq!(lossy.bytes(5..8), &b"\xe2\x82"[..]);
         // Inside a U+FFFD, the offset is where the run starts.
-        assert_eq!(lossy.bytes(2..2), Some(&b""[..]));
-        assert_eq!(lossy.bytes(1..2), Some(&b""[..]));
+        assert_eq!(lossy.bytes(2..2), &b""[..]);
+        assert_eq!(lossy.bytes(1..2), &b""[..]);
         // The column counted over the bytes read, not the text.
         assert_eq!(advance_position((1, 0), &text), (1, text.len()));
         assert_eq!(
@@ -17038,33 +17017,31 @@ mod tests {
         );
         // Past a newline, the column restarts, and a U+FFFD that was in the input stays three.
         let original = b"\xff\n\xef\xbf\xbd\xff }".to_vec();
-        let text = substitute(&original);
-        let lossy = LossySource::new(original.clone(), &text);
+        let (text, lossy) = lossy_of(&original);
         assert_eq!(
             advance_source((1, 0), &text, Some(&lossy), 0..text.len()),
             (2, 6)
         );
         // Without a source, the text is what is counted.
         assert_eq!(advance_source((1, 0), &text, None, 0..4), (2, 0));
-        // A run jq collapses or drops inside a string has no place in the original.
+        // A run jq collapses or drops inside a string is one U+FFFD for the bytes it covered
+        // (#5975): the lead byte takes the `A` with it, so two bytes are one character.
         let original = b"\"\xe1A\" }".to_vec();
-        let text = substitute(&original);
-        let lossy = LossySource::new(original, &text);
-        assert!(lossy.runs.is_none());
-        assert_eq!(lossy.bytes(0..1), None);
-        // Nor does text that is not the original at all: a replacement that is not U+FFFD, a text
-        // that stops short, a text that goes on.
-        assert!(LossySource::new(b"a\xffb".to_vec(), b"axxxb")
-            .runs
-            .is_none());
-        assert!(LossySource::new(b"a\xffb".to_vec(), "a\u{fffd}".as_bytes())
-            .runs
-            .is_none());
-        assert!(
-            LossySource::new(b"a\xffb".to_vec(), "a\u{fffd}bc".as_bytes())
-                .runs
-                .is_none()
+        let (text, lossy) = lossy_of(&original);
+        assert_eq!(text, "\"\u{fffd}\" }".as_bytes());
+        assert_eq!(lossy.bytes(1..4), &b"\xe1A"[..]);
+        assert_eq!(lossy.bytes(4..text.len()), &b"\" }"[..]);
+        assert_eq!(
+            advance_source((1, 0), &text, Some(&lossy), 0..text.len()),
+            (1, original.len())
         );
+        // A string rewritten whole (an escape had to be decoded to judge the lead byte) is one
+        // edit: its end maps, and so does everything after it.
+        let original = b"\"\xe1\\u0041\" }".to_vec();
+        let (text, lossy) = lossy_of(&original);
+        assert_eq!(text, "\"\u{fffd}\" }".as_bytes());
+        assert_eq!(lossy.bytes(0..text.len()), original.as_slice());
+        assert_eq!(lossy.bytes(4..text.len()), &b"\" }"[..]);
     }
 
     /// #4349: the substituted copy is mapped back to the original only when it differs from it by

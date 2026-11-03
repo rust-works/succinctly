@@ -57,7 +57,10 @@ use alloc::vec::Vec;
 
 use crate::jq::escape::{escape_json_body, write_json_body_jq};
 use crate::json::light::decode_escapes_into;
-use crate::text::utf8::substitute_invalid_utf8_jq_style;
+use crate::text::utf8::{
+    substitute_invalid_utf8_jq_style, substitute_invalid_utf8_jq_style_observed,
+};
+use core::ops::Range;
 
 /// Lossily decode a JSON *document* as UTF-8 the way jq 1.7.1 does, scoping
 /// [`substitute_invalid_utf8_jq_style`] to each JSON string rather than to
@@ -96,6 +99,48 @@ use crate::text::utf8::substitute_invalid_utf8_jq_style;
 /// );
 /// ```
 pub fn substitute_invalid_utf8_jq_document(raw: &[u8]) -> String {
+    substitute_document(raw, &mut |_| {})
+}
+
+/// One place where [`substitute_invalid_utf8_jq_document_mapped`] changed the document: `raw` is
+/// the bytes of the document, `text` what they became in the result (#5975).
+///
+/// Between two edits the text is the document byte for byte, so an offset there moves by the
+/// edits before it alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubstitutionEdit {
+    /// The bytes of the document that were replaced.
+    pub raw: Range<usize>,
+    /// Where those bytes are in the result.
+    pub text: Range<usize>,
+}
+
+/// [`substitute_invalid_utf8_jq_document`], with every place it changed the document, in order
+/// (#5975).
+///
+/// A run of invalid bytes outside a string, or inside one with no escape in it, is one edit for
+/// the run, which is one U+FFFD in the text. The drop quirk makes the run of a string's whole
+/// tail one edit as well. A string whose escapes had to be decoded to be judged (`"\xe1\u0041"`)
+/// is rewritten whole, so it is one edit for the whole body: an offset inside it has no place in
+/// the document, and a position the parser stops at is never inside a string it read.
+///
+/// # Examples
+///
+/// ```
+/// use succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped;
+///
+/// // jq drops the `A` with the lead byte: two bytes of the document are one U+FFFD.
+/// let (text, edits) = substitute_invalid_utf8_jq_document_mapped(b"\"\xe1A\" }");
+/// assert_eq!(text, "\"\u{fffd}\" }");
+/// assert_eq!((edits[0].raw.clone(), edits[0].text.clone()), (1..3, 1..4));
+/// ```
+pub fn substitute_invalid_utf8_jq_document_mapped(raw: &[u8]) -> (String, Vec<SubstitutionEdit>) {
+    let mut edits = Vec::new();
+    let text = substitute_document(raw, &mut |edit| edits.push(edit));
+    (text, edits)
+}
+
+fn substitute_document(raw: &[u8], on_edit: &mut impl FnMut(SubstitutionEdit)) -> String {
     let mut out = String::with_capacity(raw.len());
     // Start of the current run of bytes outside any string.
     let mut segment_start = 0;
@@ -107,12 +152,18 @@ pub fn substitute_invalid_utf8_jq_document(raw: &[u8]) -> String {
             continue;
         }
 
-        push_segment(&mut out, &raw[segment_start..i]);
+        push_segment(&mut out, &raw[segment_start..i], segment_start, on_edit);
         out.push('"');
 
         let body_start = i + 1;
         let (body_end, has_escape) = scan_string_body(raw, body_start);
-        repair_string_body(&mut out, &raw[body_start..body_end], has_escape);
+        repair_string_body(
+            &mut out,
+            &raw[body_start..body_end],
+            body_start,
+            has_escape,
+            on_edit,
+        );
 
         if body_end < raw.len() {
             // The closing quote, consumed here so the scan resumes outside
@@ -127,7 +178,7 @@ pub fn substitute_invalid_utf8_jq_document(raw: &[u8]) -> String {
         segment_start = i;
     }
 
-    push_segment(&mut out, &raw[segment_start..]);
+    push_segment(&mut out, &raw[segment_start..], segment_start, on_edit);
     out
 }
 
@@ -142,7 +193,12 @@ pub fn substitute_invalid_utf8_jq_document(raw: &[u8]) -> String {
 /// file with one bad byte still has one segment per JSON string, so building
 /// a `String` for each is millions of short-lived allocations on a large
 /// input where a borrow would do.
-fn push_segment(out: &mut String, bytes: &[u8]) {
+fn push_segment(
+    out: &mut String,
+    bytes: &[u8],
+    base: usize,
+    on_edit: &mut impl FnMut(SubstitutionEdit),
+) {
     match core::str::from_utf8(bytes) {
         Ok(s) => out.push_str(s),
         // One U+FFFD per maximal ill-formed run, never the string-scoped short-tail rule: jq
@@ -150,8 +206,50 @@ fn push_segment(out: &mut String, bytes: &[u8]) {
         // byte must not take the white space after it, or the newline that ends the token
         // (`\xe1\n"a" 1` lost its newline, and the read that resumed after the fault lost `"a"` and
         // `1`, #5994).
-        Err(_) => out.push_str(&String::from_utf8_lossy(bytes)),
+        Err(_) => push_lossy(out, bytes, base, on_edit),
     }
+}
+
+/// Append `bytes` (at `base` in the document) substituted, one edit per run replaced.
+fn push_substituted(
+    out: &mut String,
+    bytes: &[u8],
+    base: usize,
+    on_edit: &mut impl FnMut(SubstitutionEdit),
+) {
+    let text = out.len();
+    let substituted = substitute_invalid_utf8_jq_style_observed(bytes, |start, end, at| {
+        on_edit(SubstitutionEdit {
+            raw: base + start..base + end,
+            text: text + at..text + at + '\u{FFFD}'.len_utf8(),
+        });
+    });
+    out.push_str(&substituted);
+}
+
+/// Append `bytes` (at `base` in the document) as `String::from_utf8_lossy` reads them, one edit
+/// per run it replaces (#5990, #5975).
+fn push_lossy(
+    out: &mut String,
+    bytes: &[u8],
+    base: usize,
+    on_edit: &mut impl FnMut(SubstitutionEdit),
+) {
+    let mut at = 0;
+    while let Err(error) = core::str::from_utf8(&bytes[at..]) {
+        let valid = error.valid_up_to();
+        let invalid = error.error_len().unwrap_or(bytes.len() - at - valid);
+        // The bytes up to `valid` were just checked.
+        out.push_str(&String::from_utf8_lossy(&bytes[at..at + valid]));
+        let text = out.len();
+        out.push('\u{FFFD}');
+        on_edit(SubstitutionEdit {
+            raw: base + at + valid..base + at + valid + invalid,
+            text: text..text + '\u{FFFD}'.len_utf8(),
+        });
+        at += valid + invalid;
+    }
+    out.push_str(&String::from_utf8_lossy(&bytes[at..]));
 }
 
 /// The offset of the string's closing quote (or `raw.len()` if it is
@@ -209,7 +307,13 @@ fn scan_string_body(raw: &[u8], body_start: usize) -> (usize, bool) {
 /// surviving `\` is either a U+FFFD or a byte copied from a body the scan
 /// already proved holds no unescaped quote. The result is an invalid escape
 /// either way, which is exactly the error the caller wants reported.
-fn repair_string_body(out: &mut String, body: &[u8], has_escape: bool) {
+fn repair_string_body(
+    out: &mut String,
+    body: &[u8],
+    base: usize,
+    has_escape: bool,
+    on_edit: &mut impl FnMut(SubstitutionEdit),
+) {
     if let Ok(s) = core::str::from_utf8(body) {
         out.push_str(s);
         return;
@@ -220,22 +324,27 @@ fn repair_string_body(out: &mut String, body: &[u8], has_escape: bool) {
     // lead byte (`"\xe1\n"` would read as a lone U+FFFD): substitute each ill-formed run on its own
     // instead, which keeps every ASCII byte where the parser will find it (#5990).
     if body.iter().any(|&b| b < 0x20) {
-        out.push_str(&String::from_utf8_lossy(body));
+        push_lossy(out, body, base, on_edit);
         return;
     }
 
     if has_escape {
         let mut decoded = Vec::with_capacity(body.len());
         if decode_escapes_into::<false>(body, &mut decoded).is_ok() {
+            let text = out.len();
             out.push_str(&escape_json_body(
                 write_json_body_jq,
                 &substitute_invalid_utf8_jq_style(&decoded),
             ));
+            on_edit(SubstitutionEdit {
+                raw: base..base + body.len(),
+                text: text..out.len(),
+            });
             return;
         }
     }
 
-    out.push_str(&substitute_invalid_utf8_jq_style(body));
+    push_substituted(out, body, base, on_edit);
 }
 
 #[cfg(test)]
@@ -445,5 +554,50 @@ mod tests {
             substitute_invalid_utf8_jq_document(b"{\"a\":\"\xe1\x41"),
             "{\"a\":\"\u{fffd}".to_string()
         );
+    }
+
+    /// #5975: the mapped substitution answers the same text as the plain one, and names the bytes
+    /// each replacement stands for.
+    #[test]
+    fn the_mapped_substitution_names_the_bytes_each_replacement_covers_5975() {
+        let edit = |raw: Range<usize>, text: Range<usize>| SubstitutionEdit { raw, text };
+        for (raw, text, edits) in [
+            // Outside a string: one edit per run, a lone byte and a truncated sequence alike.
+            (
+                &b"a\xffb\xe2\x82c"[..],
+                "a\u{fffd}b\u{fffd}c",
+                vec![edit(1..2, 1..4), edit(3..5, 5..8)],
+            ),
+            // Inside a string with no escape: the drop quirk takes the `A` with the lead byte.
+            (b"\"\xe1A\" 1", "\"\u{fffd}\" 1", vec![edit(1..3, 1..4)]),
+            // Inside a string with room to judge the lead byte: the `A` stays.
+            (b"\"\xe1Ax\"", "\"\u{fffd}Ax\"", vec![edit(1..2, 1..4)]),
+            // A string rewritten whole because an escape had to be decoded: one edit for the body.
+            (
+                b"\"\xe1\\u0041\" 1",
+                "\"\u{fffd}\" 1",
+                vec![edit(1..8, 1..4)],
+            ),
+            // A raw control character keeps the string out of the drop quirk (#5990): every
+            // invalid run is its own replacement, as `String::from_utf8_lossy` makes them.
+            (
+                b"\"\xe1\n\xff\"",
+                "\"\u{fffd}\n\u{fffd}\"",
+                vec![edit(1..2, 1..4), edit(3..4, 5..8)],
+            ),
+            // Valid text has no edit.
+            (b"{\"a\":\"\xc3\xa9\"}", "{\"a\":\"\u{e9}\"}", vec![]),
+            // Offsets after an earlier edit move with it.
+            (
+                b"\"\xe1A\" \"\xff\" \xff",
+                "\"\u{fffd}\" \"\u{fffd}\" \u{fffd}",
+                vec![edit(1..3, 1..4), edit(6..7, 7..10), edit(9..10, 12..15)],
+            ),
+        ] {
+            let (mapped, got) = substitute_invalid_utf8_jq_document_mapped(raw);
+            assert_eq!(mapped, text, "{raw:?}");
+            assert_eq!(mapped, substitute_invalid_utf8_jq_document(raw), "{raw:?}");
+            assert_eq!(got, edits, "{raw:?}");
+        }
     }
 }
