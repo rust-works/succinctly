@@ -2039,6 +2039,16 @@ double-quoted scalars are a different lexer (YAML, see above) and are unchanged.
 the regex dialect (read as Go's since [#5388](https://github.com/rust-works/succinctly/issues/5388), see "Regex patterns are read as Go's `regexp` reads them" below)
 and a string-literal `@format` (`@base64 "x\q"`, where both refuse with different wording).
 
+### `|=` over a descent writes deepest first; a comma of nested paths keeps its named order (#6087)
+
+yq updates the nodes a descent selects, so an outer node's update cannot move an inner one out of reach.
+`succinctly yq` addresses them by path, so for an update whose path expression contains `..`, `recurse` or `recurse(f)` and resolves to several paths, the paths are written deepest first (equal depths keep their order).
+`(.. | select(tag == "!!map")) |= with_entries(.key |= "KEY_" + .)` then renames every level, as yq does.
+Still different:
+- a comma of nested paths, which is not a descent: `(.a, .a.b) |= {"w": .}` over `a: {b: 1}` is `a: {w: {b: 1}, b: {w: null}}` here and `a: {w: {b: {w: 1}}}` in yq, and the reverse order, `(.a.b, .a) |= {"w": .}`, differs from yq the other way (`tests/yq_cli/i6087.rs`);
+- a descent reached through a user `def` or a builtin other than `..`, `recurse` and `recurse(f)`, which keeps document order;
+- jq mode keeps document order: jq's `_modify` resolves its paths first and updates in order, so the same program answers differently there by design.
+
 ### String interpolation with a multi-valued `\(...)` slot — yq takes the first value only
 
 [#1403](https://github.com/rust-works/succinctly/issues/1403) fixed jq mode's `"\(...)"` string

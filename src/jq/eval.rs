@@ -37959,8 +37959,9 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // one out of reach: `(.. | select(tag == "!!map")) |= with_entries(.key |= "K_" + .)` renames every
     // level. These writes address nodes by path, and an outer rename invalidates the path an inner
     // update was recorded under (it then wrote `b: null` at the old name), so the deepest are written
-    // first, which leaves a parent's paths intact. Equal depths keep their order, and a path set that
-    // is not from a descent keeps the order it was named in (`(.a, .a.b) |= f`).
+    // first, which leaves a parent's paths intact. Equal depths keep their order, and a path
+    // expression with no descent in it keeps the order it was named in (`(.a, .a.b) |= f`). A descent
+    // reached through a user `def` or another builtin is not recognised here.
     if S::TAG == EvalTag::Yq
         && paths.len() > 1
         && any_subexpr(path_expr, &mut |e| {
@@ -37971,12 +37972,12 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             )
         })
     {
-        let depth = |path: &Expr| {
+        // Cached: the key spells out a path's components, once per path and not once per comparison.
+        paths.sort_by_cached_key(|path| {
             let mut steps = Vec::new();
             push_path_components(&mut steps, path);
-            steps.len()
-        };
-        paths.sort_by_key(|path| core::cmp::Reverse(depth(path)));
+            core::cmp::Reverse(steps.len())
+        });
     }
 
     // yq's slice-assignment no-op (#1101, generalized to any chain depth by
