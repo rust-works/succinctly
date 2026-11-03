@@ -704,10 +704,10 @@ fn to_owned_checked_at_depth<S: EvalSemantics, V: DocumentValue>(
         // `from_document_float` below, which would re-bake it past yq's
         // threshold; see `DocumentValue::bridge_computed_float`.
         Ok(OwnedValue::Float(f))
-    } else if let Some(owned) = jq_bare_trailing_dot_number::<S, V>(value) {
-        Ok(owned)
     } else if let Some(literal) = value.number_literal() {
         Ok(OwnedValue::from_number_literal::<S>(&literal))
+    } else if let Some(owned) = jq_bare_trailing_dot_number::<S, V>(value) {
+        Ok(owned)
     } else if let Some(i) = value.as_i64() {
         Ok(OwnedValue::Int(i))
     } else if let Some(f) = document_number_f64_generic::<S, V>(value) {
@@ -951,14 +951,6 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
-/// The scalar half of [`to_owned_at_depth`]: `value` is known not to be a
-/// container. `keep` is whether the caller wants the value or only whether it
-/// decodes -- `false` answers the same `Ok`/`Err` through the same accessors
-/// in the same order, but hands back a bare `Null` where the value would have
-/// cost an allocation (a string) or a number-literal conversion, which is all
-/// [`validate_cursor`]'s walk would do with it before dropping it (#3478).
-/// One chain, so the two can never disagree about which scalars raise.
-#[inline(always)]
 /// A document number written with a bare trailing dot (`5.`, `99999999999999999.`), read the way
 /// jq reads it: as the integer, its digits kept as the literal (#6052). `number_literal()` declines
 /// such a span, and the `as_f64` fallback after it turned a large one into the wrong integer.
@@ -976,6 +968,14 @@ fn jq_bare_trailing_dot_number<S: EvalSemantics, V: DocumentValue>(
     Some(OwnedValue::from_number_bytes::<S>(text.as_bytes()))
 }
 
+/// The scalar half of [`to_owned_at_depth`]: `value` is known not to be a
+/// container. `keep` is whether the caller wants the value or only whether it
+/// decodes -- `false` answers the same `Ok`/`Err` through the same accessors
+/// in the same order, but hands back a bare `Null` where the value would have
+/// cost an allocation (a string) or a number-literal conversion, which is all
+/// [`validate_cursor`]'s walk would do with it before dropping it (#3478).
+/// One chain, so the two can never disagree about which scalars raise.
+#[inline(always)]
 fn scalar_to_owned<S: EvalSemantics, V: DocumentValue>(
     value: &V,
     keep: bool,
@@ -992,14 +992,14 @@ fn scalar_to_owned<S: EvalSemantics, V: DocumentValue>(
         // `from_document_float` below, which would re-bake it past yq's
         // threshold; see `DocumentValue::bridge_computed_float`.
         Ok(OwnedValue::Float(f))
-    } else if let Some(owned) = jq_bare_trailing_dot_number::<S, V>(value) {
-        Ok(if keep { owned } else { OwnedValue::Null })
     } else if let Some(literal) = value.number_literal() {
         Ok(if keep {
             OwnedValue::from_number_literal::<S>(&literal)
         } else {
             OwnedValue::Null
         })
+    } else if let Some(owned) = jq_bare_trailing_dot_number::<S, V>(value) {
+        Ok(if keep { owned } else { OwnedValue::Null })
     } else if let Some(i) = value.as_i64() {
         Ok(OwnedValue::Int(i))
     } else if let Some(f) = document_number_f64_generic::<S, V>(value) {

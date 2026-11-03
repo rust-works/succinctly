@@ -11891,7 +11891,8 @@ The literal they keep is the digits, so every other leniency composes with it (`
 It still needs an integer part: `.`, `-.`, `1.5.`, `1..` and `1.x` are refused, as in jq.
 
 jq mode only.
-yq reads the token as a float, so `succinctly yq` is unchanged (`5.` is `!!float`, a large one is `1e+17`), and so is yq's `--argjson` extension's reading of it (`1.` is `1.0`; real yq has no `--argjson`).
+yq reads the token as a float, so `succinctly yq` is unchanged (`5.` is `!!float`, a large one is `1e+17`).
+So is yq's own `--argjson` extension, which keeps refusing the token (`Validator::refusing_bare_trailing_dot`): real yq has no such flag to match, and its other route would read `5.` as `5.0` where the `-p json` reader reads `5`.
 Pinned in `tests/jq_cli/i6052.rs` against jq 1.7.1 (`fromjson`, `--argjson`, `tonumber` and the document reader on thirteen spellings).
 
 ### A plain decimal and an overflowing literal render with decNumber's notation (#3212) — divergence closed

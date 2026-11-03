@@ -1307,7 +1307,7 @@ mod tests {
     /// `100000000000000000000` for this token); the value and its text are
     /// pinned here.
     #[test]
-    fn lazy_cursor_materialization_keeps_plain_float_fallback_2868() {
+    fn lazy_cursor_materialization_reads_a_trailing_dot_as_an_integer_literal_2868() {
         use crate::json::JsonIndex;
         let json = br"[100000000000000000000.]";
         let index = JsonIndex::build(json);

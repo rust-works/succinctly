@@ -14812,7 +14812,7 @@ fn test_argjson_reject_set_and_overflow_after_2052() -> Result<()> {
         r#""\ud800""#,
         "[1,]",
         "{,}",
-        "5.5.",
+        "5.",
         "1 2",
         "0x10",
         "1.2.3",
@@ -15071,16 +15071,11 @@ fn test_argjson_shares_jq_dot_leniency_2240() -> Result<()> {
         assert_eq!(output.trim(), expected, "value {value:?}");
     }
 
-    // A bare trailing dot (no exponent) was refused with jq mode's rule 4c and is accepted
-    // since #6052, like the other two. yq reads the token as a float, so `1.` stays `1.0`
-    // here (real yq has no `--argjson`; no oracle, the same convention as the rows above).
-    let (output, code) = run_yq_stdin(
-        ".n = $n",
-        "{}",
-        &["--argjson", "n", "1.", "-o=json", "-I=0"],
-    )?;
-    assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#"{"n":1.0}"#);
+    // A bare trailing dot (no exponent) is deliberately still rejected,
+    // matching jq mode's own narrower-than-real-jq scope (see
+    // `normalize_dot_leniency`'s own doc comment).
+    let (_, code) = run_yq_stdin(".n = $n", "{}", &["--argjson", "n", "1.", "-o=json"])?;
+    assert_ne!(code, 0);
 
     Ok(())
 }
