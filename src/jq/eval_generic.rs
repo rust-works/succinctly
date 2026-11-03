@@ -2868,29 +2868,25 @@ struct HeadFootComment {
     /// The text before the first document's content, when it holds an explicit `---`
     /// marker (#4086); only ever set on a document's root node.
     preamble: Option<String>,
+    /// Whether the head lines are the ones read from before the first document, unchanged: yq
+    /// prints them apart from the document when it colors, and any other head comment as part
+    /// of the document's text (#5416).
+    head_is_header: bool,
 }
 
 impl HeadFootComment {
-    /// `None` when there is no head, foot or tag, else boxed -- the one place this
-    /// "only allocate when there's something to say" rule is defined, shared by
-    /// every [`NodeMeta`] construction site that can produce head/foot/tag data
-    /// (#2795 PR B, #4078).
-    fn boxed_if_any_with_tag(
-        head: Vec<String>,
-        foot: Vec<String>,
-        tag: Option<String>,
-        spelling: Option<String>,
-    ) -> Option<Box<Self>> {
-        Self::boxed_if_any_full(head, foot, tag, spelling, None)
-    }
-
-    /// [`Self::boxed_if_any_with_tag`] plus the document preamble (#4086).
+    /// `None` when there is no head, foot, tag, spelling or preamble, else boxed -- the one place
+    /// this "only allocate when there's something to say" rule is defined, shared by every
+    /// [`NodeMeta`] construction site that can produce head/foot/tag data (#2795 PR B, #4078,
+    /// #4086). `head_is_header` marks the head lines as the ones read before the first document
+    /// (#5416).
     fn boxed_if_any_full(
         head: Vec<String>,
         foot: Vec<String>,
         tag: Option<String>,
         spelling: Option<String>,
         preamble: Option<String>,
+        head_is_header: bool,
     ) -> Option<Box<Self>> {
         if head.is_empty()
             && foot.is_empty()
@@ -2906,6 +2902,7 @@ impl HeadFootComment {
                 tag,
                 spelling,
                 preamble,
+                head_is_header,
             }))
         }
     }
@@ -2988,6 +2985,15 @@ impl NodeMeta {
     /// same "one pointer, no allocation" shape every other construction site
     /// already gets — see the field's own doc comment for why that matters.
     pub fn with_head_foot(&self, head: Vec<String>, foot: Vec<String>) -> Self {
+        // A head the program rewrote is no longer the header read from the file.
+        self.with_head_foot_of(head, foot, self)
+    }
+
+    /// [`Self::with_head_foot`] for lines taken from `source`'s metadata, which carry its mark of
+    /// being the header read before the first document along with them (#5416).
+    #[must_use]
+    pub fn with_head_foot_of(&self, head: Vec<String>, foot: Vec<String>, source: &Self) -> Self {
+        let head_is_header = source.head_is_header() && head == source.head_comment();
         Self {
             head_foot_comment: HeadFootComment::boxed_if_any_full(
                 head,
@@ -2995,9 +3001,18 @@ impl NodeMeta {
                 self.tag_owned(),
                 self.spelling_owned(),
                 self.preamble_owned(),
+                head_is_header,
             ),
             ..self.clone()
         }
+    }
+
+    /// Whether the head lines are the ones read from before the first document, unchanged
+    /// (#5416): what yq prints apart from the document when it colors.
+    pub fn head_is_header(&self) -> bool {
+        self.head_foot_comment
+            .as_deref()
+            .is_some_and(|hf| hf.head_is_header)
     }
 
     /// The explicit tag this node was written with (`!Ref`, `!!str`), verbatim,
@@ -3040,6 +3055,7 @@ impl NodeMeta {
                 self.tag_owned(),
                 self.spelling_owned(),
                 preamble,
+                self.head_is_header(),
             ),
             ..self.clone()
         }
@@ -3073,6 +3089,7 @@ impl NodeMeta {
                 self.tag_owned(),
                 spelling,
                 self.preamble_owned(),
+                self.head_is_header(),
             ),
             ..self.clone()
         }
@@ -3093,6 +3110,7 @@ impl NodeMeta {
                 tag,
                 self.spelling_owned(),
                 self.preamble_owned(),
+                self.head_is_header(),
             ),
             ..self.clone()
         }
@@ -3770,11 +3788,14 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
     } else {
         (Vec::new(), Vec::new())
     };
+    // #5416: the first document's head comments are the header yq reads before the document.
+    let head_is_header =
+        !own_head.is_empty() && cursor.is_some_and(DocumentCursor::is_first_document_content);
     let own_meta = NodeMeta {
         comment: own_comment,
         style: own_style,
         anchor: own_anchor,
-        head_foot_comment: HeadFootComment::boxed_if_any_with_tag(
+        head_foot_comment: HeadFootComment::boxed_if_any_full(
             own_head,
             own_foot,
             // #4078: the explicit tag, verbatim. Not on an alias node (its tag, if
@@ -3791,6 +3812,8 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
                 })
             },
             None,
+            None,
+            head_is_header,
         ),
     };
     if let Some(fields) = value.as_object_rendered() {

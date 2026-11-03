@@ -872,6 +872,13 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         false
     }
 
+    /// Whether this cursor is the content node of the first document (#5416): the one whose
+    /// leading comments yq reads as a header and, when it colors, prints apart from the
+    /// document. `false` for formats with no such header.
+    fn is_first_document_content(&self) -> bool {
+        false
+    }
+
     /// Whether this cursor's *document* declares any `*name` alias at all.
     ///
     /// A whole-document property, not a property of this node, and O(1) --

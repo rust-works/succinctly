@@ -34,6 +34,7 @@ use super::scalar::{
     whole_float_as_int, ResolvedScalar,
 };
 use super::{starts_inline_seq_entry, starts_seq_entry};
+use crate::text::stream_region::{RegionGuard, StreamRegion};
 
 // ============================================================================
 // YamlCursor: Position in the YAML structure
@@ -1200,6 +1201,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         let mut dash_comment: Option<String> = None;
         if is_document {
             if is_first_document {
+                // #5416: yq keeps this header apart from the document, so a colorizer must too.
+                let _region = RegionGuard::enter(StreamRegion::LeadingContent);
                 write_yq_header(out, self_.text, self_.index)?;
             }
             if is_first_document || is_collection_root {
@@ -1256,6 +1259,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // Same family as #1085 (a node can carry only one comment slot).
         let self_ = resolved;
         if let YamlValue::String(s) = &value {
+            // #5416: yq prints a scalar result bare, with no YAML around it to color.
+            let _region = RegionGuard::enter(StreamRegion::RawScalar);
             // #1615: this root-scalar shortcut bypasses `stream_yaml_value`/
             // `stream_yaml_string_value` entirely (see this function's own doc
             // comment), so it needs its own copy of their decode-failure
@@ -1316,6 +1321,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             // a scalar root's foot is silently dropped (`# lead\n42\n# foot`
             // prints `# lead\n42`, measured), so it is inside this guard.
             if is_document {
+                // #5416: yq adds these to the text it colors, in grey of its own.
+                let _region = RegionGuard::enter(StreamRegion::TrailingContent);
                 self_.write_foot_comments_at(out, "", self_.bp_pos)?;
             }
         }
@@ -7750,6 +7757,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     #[inline]
     fn is_document_content(&self) -> bool {
         YamlCursor::is_document_content(self)
+    }
+
+    #[inline]
+    fn is_first_document_content(&self) -> bool {
+        self.bp_pos == FIRST_DOCUMENT_BP && YamlCursor::is_document_content(self)
     }
 
     #[inline]

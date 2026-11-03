@@ -29,6 +29,7 @@ use super::document::{
 use super::error::EvalError;
 use super::escape::{write_json_body_jq, write_json_body_yq};
 use super::eval_generic::key_owned_value;
+use crate::text::stream_region::{RegionGuard, StreamRegion};
 // Key retyping (`1: x` is an `!!int` key, #2785) is real yq's rule and
 // `key_owned_value` already spells the check under `YqSemantics`; a jq key is
 // always a string and returns before the number model is consulted, so the
@@ -248,6 +249,10 @@ impl StreamableValue for OwnedValue {
         // top-level entry point - bypassing it inside
         // `stream_owned_value_yaml` itself would drop quoting from every
         // nested string field too, not just the root.
+        // #5416: yq prints a scalar result bare, with no YAML around it to color
+        // (`.a + 1` is `2`, not a document).
+        let _region = (!matches!(self, Self::Array(_) | Self::Object(_)))
+            .then(|| RegionGuard::enter(StreamRegion::RawScalar));
         if let Self::String(s) = self {
             return out.write_str(s);
         }

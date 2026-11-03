@@ -50,6 +50,7 @@
 
 pub mod line_break;
 pub mod lines;
+pub mod stream_region;
 pub mod utf8;
 
 // Re-export commonly used types. The broadword engine is portable, so unlike

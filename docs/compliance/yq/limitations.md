@@ -5236,8 +5236,7 @@ comments). One related gap stays: the cursor-streaming identity route (`yq .` wi
 still prints `2 # child` / `  ]` for the `[1, 2 # child\n]` source where yq prints
 `[1, 2, # child` / `]`; the DOM route (any write, `-P`, `--arg`) matches. And a comment on a flow element does not survive
 extracting the container (`.a[0] line_comment = "y" | .a`, `.b = .a`): the reshaped value carries no
-flow style or comment tree (#3615), where yq keeps both. `-C` does not colour a flow collection
-the way yq does (it never did), so the closing-bracket line of a commented one is coloured as a key.
+flow style or comment tree (#3615), where yq keeps both.
 
 One rendering divergence, readable back and pinned:
 
@@ -6215,10 +6214,10 @@ but `null` itself is never colored at all, unlike `succinctly yq`'s bright-black
 from jq). No rule-4 condition licenses this on its own merits (the output is readable, nothing
 is corrupted, and matching real yq's own JSON-coloring scheme is not a resource cost anyone has
 measured) -- it is recorded here because it was never written down, not because it was newly
-decided. Given `succinctly yq`'s YAML-target coloring is a separate code path
-(`colorize_yaml`) with its own scheme, closing this would mean either giving JSON-target output
-its own yq-specific colorizer or accepting the jq-styled one as a permanent, documented
-extension under ADR-0018 rule 5 -- a decision this entry doesn't make, only surfaces.
+decided. `succinctly yq`'s YAML-target coloring is a separate code path that has matched yq byte for
+byte since #5416, so closing this would mean either giving JSON-target output its own yq-specific
+colorizer or accepting the jq-styled one as a permanent, documented extension under ADR-0018
+rule 5 -- a decision this entry doesn't make, only surfaces.
 
 ## Evaluator resource caps apply in yq mode too, and are uncatchable (#2132)
 
@@ -6834,3 +6833,27 @@ Checked on a 16 MiB evaluation thread (a throwaway build): the build and every c
 A fold that builds a deep value is quadratic in yq mode, as it is in jq mode before [#5875](https://github.com/rust-works/succinctly/issues/5875): 100,000 levels does not finish inside two minutes.
 The reshape of a result's presentation (its comments and styles) gives up on a navigation construction or a merge deeper than 384 levels and falls back to the plain result, so such a result loses the comments it would otherwise carry; the value itself is unaffected.
 A document whose aliases expand to a deep value is not covered: `-P` and `explode(.)` over a chain of 385 anchors that each wrap the previous one still refuse at 256 levels, where yq answers.
+
+## `-C` colors YAML as yq's go-yaml printer does, with one deliberate difference ([#5416](https://github.com/rust-works/succinctly/issues/5416))
+
+yq has no color scheme of its own.
+It tokenizes the text it just encoded with go-yaml's scanner and prints each line of a token's origin text in the color of the token's type: keys cyan, strings green, numbers and booleans bright magenta, anchors and aliases bright yellow, comments grey, everything else (null, hex and octal integers, `.inf`, tags, the dashes and colons) as it is.
+Where a span opens and closes follows from how the scanner cuts the text: on the space before a value, across the line break a token carries to the next line's indentation (the empty span at the start of a line), and over the indentation of a continuation line.
+`succinctly yq -C` runs a port of that scanner and printer (`src/bin/succinctly/yq_runner/go_yaml_color.rs`) over the text it writes, so those spans fall where yq's do.
+Before #5416 it colored with a fixed three-color re-lexer that matched yq on almost no document.
+Results are colored one at a time, as yq does: a custom tag makes the value after it a string (`!custom 5` is green), a reserved tag does not (`!!str 1` is magenta), a trailing comment of the document is added to the text that is tokenized, and a document's comments from before its content are printed apart from it, in grey, with their line break inside the span.
+A scalar result (`.a` over `a: 1`, `.a + 1`) is printed bare and not colored at all, as in yq.
+The text is fed to the scanner a line at a time, and a line is scanned once the next complete line has arrived, so a streamed `-C` still holds a line and its successor rather than the output (#808); a block scalar is one token, and is held whole.
+Several thousand generated documents (comments, anchors, aliases, tags, block and flow styles, quoted and plain scalars of every type, several documents to a stream) through about twenty filters and the `-P`, `-I`, `-N`, `--no-doc`, `-e` and `-0` flags agree with yq v4.53.3 byte for byte wherever the uncolored output already agrees.
+Pinned by `tests/yq_cli/i5416.rs`, whose rows were captured from yq v4.53.3.
+
+One difference remains: **a double-quoted escape keeps its digits** (ADR-0018 rule 4(b): matching would corrupt data).
+go-yaml leaves the `x`, `u` or `U` and the hex digits of `\x01`, `\u0001` and `\U0001F600` out of the token's origin text, so yq's `-C` prints `a: "x\u0001y"` as `a: "x\y"`, a different string.
+`succinctly yq -C` prints the escape whole.
+Every other character go-yaml drops from a token's text is dropped here too, because the line it prints would otherwise differ from yq's.
+
+A very long line is the one shape that is not streamed in constant memory.
+A line is scanned once it is 64 KiB long even if its end has not arrived, so a long line of many small tokens (a flow sequence of millions of numbers) is read as it comes.
+A single token is held whole while it is scanned, as go-yaml holds it: a quoted or plain scalar of tens of megabytes on one line, or a block scalar, takes several times its size in memory until it ends.
+
+yq's own colorizer also repeats the line break after a tag that ends its line (`a: !tag` / `  b: 1` prints a blank line between them), and `succinctly yq -C` repeats it as well.
