@@ -84258,11 +84258,16 @@ pub(crate) fn fold_loop_variable_shares_identity<S: EvalSemantics>(
 /// ([`Tracked::fold_share`]) as one `Rc` clone. A field read hands on the member itself, a
 /// container when the member is one.
 ///
-/// A binder's source reaches the output only through the names it binds: `$r as
-/// $s | .[$s.name] = $s.score` and `reduce $r.tags[] as $t (.; .[$t] += 1)` hand
+/// A binder's source reaches the output only through the names it binds:
+/// `reduce $r.tags[] as $t (.; .[$t] += 1)` and `$r as {name: $n} | .[$n] = 1` hand
 /// nothing on, so the names join the search of the body (and of a fold's UPDATE
 /// and EXTRACT) instead, and the in-place step they feed keeps its unmarked
-/// operands. A position left out, or a binder's source, still counts when it can
+/// operands. A plain rebind of the variable under an assignment (`$r as $s | .a =
+/// $s.items`, #5938) is the exception: [`owned_assign_step`] gives the new name the
+/// variable's own marker, so the name joins `names` and a field read of it counts
+/// like one of the variable's. The two must agree (a rebind this accepts that the
+/// step declines would rebuild the member), which `tests/jq_cli/i5938.rs`
+/// pins. A position left out, or a binder's source, still counts when it can
 /// raise while reading a name, since `try ... catch .` hands the error value on
 /// (`try (error($a) and true) catch .`).
 ///
