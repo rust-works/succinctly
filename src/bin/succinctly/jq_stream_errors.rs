@@ -681,30 +681,55 @@ pub(crate) enum Afterwards {
 
 /// [`read_for_slurp`] for `-n -s --stream`: the whole stream, with every fault set apart from the
 /// events instead of stopping the read at the first one.
+///
+/// Memory is the events and one entry per fault, as [`read_for_slurp`]'s is: the location of only
+/// the last [`SLURP_TAIL`] events is kept, since the inputs after the array are among them.
 pub(crate) fn read_for_deferred_slurp(sources: &[(Option<usize>, Vec<u8>)]) -> DeferredSlurp {
     let mut reader = Reader::new(sources);
-    let mut yielded = Vec::new();
+    // Every event, and the faults with where they came in the sequence of inputs jq yielded.
+    let mut events = Vec::new();
+    let mut faults: Vec<(usize, String, (usize, usize))> = Vec::new();
+    // The index and location of the last few events, which may come after the array.
+    let mut tail = std::collections::VecDeque::new();
+    let mut index = 0;
     while let Some(item) = reader.next_yielded() {
-        yielded.push(item);
+        match item.error {
+            Some(message) => faults.push((index, message, item.location)),
+            None => {
+                events.push(item.value);
+                if tail.len() == SLURP_TAIL {
+                    tail.pop_front();
+                }
+                tail.push_back((index, item.location));
+            }
+        }
+        index += 1;
     }
     let end = reader.end();
-    let mut read = DeferredSlurp {
-        array: Vec::new(),
-        slurp_at: end.slurp_at,
-        before: Vec::new(),
-        after: Vec::new(),
-    };
-    for (index, item) in yielded.into_iter().enumerate() {
-        match (index < end.inside, item.error) {
-            (true, None) => read.array.push(item.value),
-            (true, Some(message)) => read.before.push((message, item.location)),
-            (false, None) => read
-                .after
-                .push(Afterwards::Value(item.value, item.location)),
-            (false, Some(message)) => read.after.push(Afterwards::Fault(message, item.location)),
+    // The events past `inside` are left for the calls after the array: the last few.
+    let outside = tail.iter().filter(|(at, _)| *at >= end.inside).count();
+    let after_events = events.split_off(events.len() - outside);
+    let mut after: Vec<(usize, Afterwards)> = tail
+        .iter()
+        .skip(tail.len() - outside)
+        .zip(after_events)
+        .map(|(&(at, location), value)| (at, Afterwards::Value(value, location)))
+        .collect();
+    let mut before = Vec::new();
+    for (at, message, location) in faults {
+        if at < end.inside {
+            before.push((message, location));
+        } else {
+            after.push((at, Afterwards::Fault(message, location)));
         }
     }
-    read
+    after.sort_by_key(|(at, _)| *at);
+    DeferredSlurp {
+        array: events,
+        slurp_at: end.slurp_at,
+        before,
+        after: after.into_iter().map(|(_, item)| item).collect(),
+    }
 }
 
 /// A parse error as `--stream-errors` hands it over (`[message, path]`) and the message alone.
@@ -1995,5 +2020,48 @@ mod tests {
             reader.source.cursor.source == sources.len() && reader.source.cursor.closed,
             "the cursor has moved past the last source"
         );
+    }
+
+    /// #6005: the faults jq's slurp loop meets come before the array, the array holds the events on
+    /// both sides of a fault, and what the loop left for the calls after it comes out in order.
+    #[test]
+    fn a_deferred_slurp_sets_the_faults_apart_from_the_events_6005() {
+        let read = |streams: &[&[u8]]| {
+            let sources: Vec<(Option<usize>, Vec<u8>)> = streams
+                .iter()
+                .enumerate()
+                .map(|(i, bytes)| (Some(i), bytes.to_vec()))
+                .collect();
+            read_for_deferred_slurp(&sources)
+        };
+        let shape = |read: &DeferredSlurp| {
+            let after: Vec<String> = read
+                .after
+                .iter()
+                .map(|item| match item {
+                    Afterwards::Value(_, _) => "value".to_string(),
+                    Afterwards::Fault(message, _) => message.clone(),
+                })
+                .collect();
+            (read.array.len(), read.before.len(), after)
+        };
+        // Nothing to read: an empty array.
+        assert_eq!(shape(&read(&[b""])), (0, 0, vec![]));
+        // A clean stream is the array, and the close of the last container that jq's loop still
+        // held when it closed the array.
+        assert_eq!(shape(&read(&[b"1 [2]"])), (2, 0, vec!["value".to_string()]));
+        // A fault in the middle comes before the array, which holds the events around it.
+        assert_eq!(shape(&read(&[b"1 2 }\n3"])), (3, 1, vec![]));
+        // Two faults are two calls before the array.
+        assert_eq!(shape(&read(&[b"1 }\n2 }\n3"])), (3, 2, vec![]));
+        // A fault at the end of the stream is the call after the array.
+        let eof = read(&[b"1 [2,"]);
+        assert_eq!(eof.array.len(), 2);
+        assert_eq!(eof.before.len(), 0);
+        assert!(
+            matches!(eof.after.as_slice(), [Afterwards::Fault(m, _)] if m.starts_with("Unfinished JSON term"))
+        );
+        // Only faults: an empty array, and each fault before it.
+        assert_eq!(shape(&read(&[b"}\n}"])), (0, 2, vec![]));
     }
 }

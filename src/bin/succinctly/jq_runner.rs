@@ -6629,16 +6629,7 @@ fn get_inputs(
         // loop left for the calls after it. A program that never asks for one prints its result.
         if args.slurp && args.null_input && stream_by_reader {
             let read = crate::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
-            let place = |(source, line): (usize, usize)| {
-                if line == crate::jq_stream_errors::CLOSED {
-                    (0, UNKNOWN_LINE as usize)
-                } else {
-                    (
-                        raw_bytes.get(source).and_then(|raw| raw.0).unwrap_or(0),
-                        line,
-                    )
-                }
-            };
+            let place = |at| stream_location(&raw_bytes, at);
             let fault = |message: String, at: (usize, usize)| {
                 let (source, line) = place(at);
                 TrailingParseError {
@@ -6704,17 +6695,9 @@ fn get_inputs(
             values.extend(outside);
             value_locations.extend(outside_locations);
         }
-        for &(source, line) in &value_locations {
-            if line == crate::jq_stream_errors::CLOSED {
-                locations.push(0, UNKNOWN_LINE as usize);
-            } else {
-                // `get` and not an index: a slurped array has a location even when no file
-                // opened (`--stream -s` over only a missing file is `[]`, #6006).
-                locations.push(
-                    raw_bytes.get(source).and_then(|raw| raw.0).unwrap_or(0),
-                    line,
-                );
-            }
+        for &at in &value_locations {
+            let (source, line) = stream_location(&raw_bytes, at);
+            locations.push(source, line);
         }
         if track_eof && !args.slurp {
             locations.eof_tail = Some(EofTail {
@@ -7415,6 +7398,22 @@ fn stream_walk_by_reader(args: &JqCommand) -> bool {
         && args.input_dsv.is_none()
         && !args.raw_input
         && !args.seq
+}
+
+/// The source tag and line an input of the stream reader is placed at: `(source, line)` as the
+/// reader gives it, with a closed input (`input_filename` is `null`, `input_line_number` is `0`)
+/// and a source that never opened placed where the rest of the queue puts them.
+fn stream_location(
+    sources: &[(Option<usize>, Vec<u8>)],
+    (source, line): (usize, usize),
+) -> (usize, usize) {
+    if line == crate::jq_stream_errors::CLOSED {
+        (0, UNKNOWN_LINE as usize)
+    } else {
+        // `get` and not an index: a slurped array has a location even when no file opened
+        // (`--stream -s` over only a missing file is `[]`, #6006).
+        (sources.get(source).and_then(|raw| raw.0).unwrap_or(0), line)
+    }
 }
 
 /// Whether `--stream -s` (#5498) is read by the stream reader: the array holds the events, and the
