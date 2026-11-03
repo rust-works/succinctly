@@ -28368,7 +28368,7 @@ fn refuse_possessive_quantifier(
     if drops.is_empty() {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
-    let mut rewritten = String::with_capacity(pattern.len() + 4 * optional.len());
+    let mut rewritten = String::new();
     for (at, &c) in chars.iter().enumerate() {
         if drops.contains(&at) {
             continue;
