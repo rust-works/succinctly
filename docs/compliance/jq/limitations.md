@@ -7423,8 +7423,12 @@ The `regex` crate reads the same text as a quantifier on a quantifier, `(a*)+`, 
 As the last character of the pattern, or followed only by closing parentheses (`(?:a++)`), nothing after it can fail, so it is rewritten to the plain quantifier instead (`sub("a*+";"X")`, `gsub("a++";"X")`).
 The flags are checked first, as in jq, so a bad flag string is the error whatever the pattern.
 The scan steps over escapes, classes, `\Q..\E`, `(?#..)` and, under the `x` flag, `#` comments; an inline `(?x)` is not modelled, and a `*+` in its comments is refused.
-What jq itself reads as a repeat of a repeat stays as it was: `{n}+`, and a lazy quantifier followed by `+` (`a*?+`).
-The interval forms follow jq 1.7.1: `{n,}+`, `{n,m}+` and `{,m}+` are possessive, `{n}+` is not.
+What jq itself reads as a repeat of a repeat stays as it was: a lazy quantifier followed by `+` (`a*?+`) and `{n}?+`.
+The interval forms follow jq 1.7.1: `{n,}+`, `{n,m}+` and `{,m}+` are possessive.
+A fixed `{n}+` is neither possessive nor a repeat: it is `{n}` (#6079).
+`"aaaa" | match("a{2}+")` is `aa` in jq, since a fixed count has nothing to give back, and this was `aaaa`, the `regex` crate's `(?:a{2})+`.
+The `+` is dropped, and a quantifier after it applies to the `{n}`: `{n}++` repeats it, and `{n}+?` makes it optional.
+Pinned against jq 1.7.1 on 180 pattern x text x flag rows in `tests/jq_cli/i6079.rs`.
 A possessive quantifier that used to agree because nothing after it needed a character back (`"aaab" | test("a++b")`) is refused too, since the scan does not look at what follows.
 The second engine added by #5502 (`fancy-regex`, below) does not help: a pattern the `regex` crate accepts never reaches it, and it makes `*+`, `++` and `?+` atomic as jq does but reads `{n,m}+` as a repeat of a repeat, so an interval would stay refused.
 yq mode is unchanged: Go's `regexp` rejects the form (`invalid nested repetition operator: `*+``), as yq does.
