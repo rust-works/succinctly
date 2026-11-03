@@ -2241,6 +2241,259 @@ mod tests {
         }
     }
 
+    /// How yq v4.53.3 colors a plain scalar of each spelling, captured with `yq -C` over `a: <it>`:
+    /// the span that opens after the colon is magenta for a number or a boolean, green for a
+    /// string and absent for a null, a hex, octal or binary integer, `.inf` and `.nan`.
+    const SCALAR_COLORS: &[(&str, &str)] = &[
+        ("5", "num"),
+        ("-5", "num"),
+        ("+5", "num"),
+        ("0", "num"),
+        ("007", "none"),
+        ("09", "str"),
+        ("0x1f", "none"),
+        ("-0x1f", "none"),
+        ("0X1F", "str"),
+        ("0o17", "none"),
+        ("0b101", "none"),
+        ("0b102", "str"),
+        ("1_000", "num"),
+        ("_1", "str"),
+        ("1__0", "num"),
+        ("1.5", "num"),
+        ("-1.5", "num"),
+        ("+.5", "num"),
+        ("5.", "num"),
+        ("1e5", "str"),
+        ("1.5e-3", "num"),
+        ("1.5E+3", "num"),
+        ("1e", "str"),
+        ("1.2.3", "str"),
+        (".inf", "none"),
+        ("-.inf", "none"),
+        ("+.inf", "str"),
+        (".Inf", "none"),
+        (".INF", "none"),
+        (".nan", "none"),
+        (".NaN", "none"),
+        ("99999999999999999999", "str"),
+        ("-99999999999999999999", "str"),
+        ("9223372036854775807", "num"),
+        ("9223372036854775808", "num"),
+        ("-9223372036854775808", "num"),
+        ("-9223372036854775809", "str"),
+        ("18446744073709551615", "num"),
+        ("18446744073709551616", "str"),
+        ("true", "num"),
+        ("True", "num"),
+        ("TRUE", "num"),
+        ("tRUE", "str"),
+        ("false", "num"),
+        ("null", "none"),
+        ("Null", "none"),
+        ("NULL", "none"),
+        ("~", "none"),
+        ("nul", "str"),
+        ("yes", "str"),
+        ("on", "str"),
+        ("y", "str"),
+        ("0x", "str"),
+        ("0o", "str"),
+        ("0b", "str"),
+        ("0.", "num"),
+        ("-.5", "num"),
+        ("+", "str"),
+        ("1:2", "str"),
+        ("12:30", "str"),
+        ("2024-01-01", "str"),
+        ("1e1000", "str"),
+    ];
+
+    #[test]
+    fn a_plain_scalar_is_colored_by_its_kind_as_yq_does_5416() {
+        for &(scalar, expected) in SCALAR_COLORS {
+            let colored = color(&format!("a: {scalar}\n"));
+            let after_colon = &colored[colored.find(':').expect("a colon") + 1..];
+            let kind = if after_colon.starts_with(MAGENTA) {
+                "num"
+            } else if after_colon.starts_with(GREEN) {
+                "str"
+            } else {
+                "none"
+            };
+            assert_eq!(kind, expected, "`a: {scalar}` colored {colored:?}");
+        }
+    }
+
+    /// Texts that exercise the scanner's rarer paths: valid YAML in every spelling go-yaml reads.
+    const SPELLINGS: &[&str] = &[
+        "%YAML 1.2\n---\na: 1\n",
+        "%TAG ! tag:example.com,2000:\n---\n- a\n",
+        "a: 1\n...\n---\nb: 2\n",
+        "--- a\n",
+        "--- |\n  x\n",
+        "---\n",
+        "--- # c\na: 1\n",
+        "x: &a {k: v}\ny:\n  <<: *a\n  z: 1\n",
+        "<<: *a\nb: 1\n",
+        "a:\t1\n",
+        "a: b\t# c\n",
+        "- \tx\n",
+        "[a,\tb]\n",
+        "a: \"\\0\\a\\b\\t\\n\\v\\f\\r\\e\\ \\\"\\/\\\\\\N\\_\\L\\P\\x41\\u00e9\\U0001F600\\ud83d\\ude00\"\n",
+        "a: \"one\n  two\"\nb: 1\n",
+        "a: 'one\n\n  two'\nb: 1\n",
+        "a: \"one\\\n  two\"\n",
+        "a: \"one  \t\ntwo\"\n",
+        "a: |\n  lit\n   more\n\n  last\n",
+        "a: |-\n  lit\n\n\nb: 1\n",
+        "a: |+\n  lit\n\n\nb: 1\n",
+        "a: >\n  one\n  two\n\n  three\n   indented\n  four\nb: 1\n",
+        "a: >-\n  one\n  two\nb: 1\n",
+        "a: >+\n  one\n\n\nb: 1\n",
+        "a: |2\n    two spaces kept\n",
+        "a: >1-\n  one\n",
+        "a: | # comment\n  lit\n",
+        "a: |\nb: 1\n",
+        "a: |\n  lit",
+        "a: |\r\n  lit\r\nb: 1\r\n",
+        "a: one\n  two\n\n  three\nb: 1\n",
+        "a: b\n  - c\n",
+        "&a\n- x\n",
+        "*a : v\n",
+        "- !!str\n- !<tag:x> v\n- !a\n",
+        "[!a, b]\n",
+        "{!a x: 1}\n",
+        "{a: http://x, b: [c, d], e: {f: g}}\n",
+        "[\n  a,\n  b\n]\n",
+        "? a\n: b\n? - x\n: y\n",
+        "a: b #c\nd: e#f\n#only\n",
+        "a: 1\r\nb: 2\r\n",
+        "a: 1\rb: 2\r",
+        "日本: 😀\n",
+        "",
+        "\n",
+        " ",
+        "# c",
+        "a:",
+        "a: 1\n\n\n",
+        "- - - a\n    - b\n",
+        "a:\n  - b\n  -\n    c: d\n",
+        "k: v # c\n# foot\n",
+        "a:\n  b: \"x\n    \ty\"\n",
+        "a:\n  b: 'x\n    \ty'\n",
+        "a: \"x\\\r\n  y\"\n",
+        "a: \"x\ty\"\nb: \"x\t\"\nc: \"x\t \ny\"\n",
+        "<<  : *a\nb: 1\n",
+        "<<x: 1\n",
+        "a: <<\n",
+        "<<\n",
+        "!a,b v\n",
+        "a: !tag",
+        "a: 1 #c",
+        "- a\n-",
+        "a: |\n  x\ty\n",
+        "a: |\n  x\n ",
+        "a: b                              # comment here\n",
+        "k: !tag                              v\n",
+        "m:                                   |\n  x\n",
+        "<<:                                  *a\n",
+        "m:                                   >\n  x\n",
+        "- {a: 1}                             # c\n",
+    ];
+
+    /// Texts go-yaml's scanner refuses: tokenizing goes on after them, as `lexer.Tokenize` does,
+    /// and none of it may panic or stop short.
+    const REFUSED: &[&str] = &[
+        "@a: 1\n",
+        "a: `b\n",
+        "- @x\n",
+        "a: \"\\q\"\n",
+        "a: \"\\x4\"\n",
+        "a: \"\\u12\"\n",
+        "a: \"\\ud83d\"\n",
+        "a: \"\\ud83dx\"\n",
+        "a: \"abc\n",
+        "a: 'abc\n",
+        "a: \"x\n---\n\"\n",
+        "a: 'x\n...\n'\n",
+        "\t- x\n",
+        "a:\n\t- x\n",
+        "!{x} v\n",
+        "a: |\n\tx\n",
+        "a: |\n  x\n\t y\n",
+        "a: |x\n  y\n",
+        "a: |2\n y\n",
+        "a: b\n---\n  c: |\n",
+        "a: \"\\U0001\n",
+        "\t\ta: 1\n",
+        "? \tk\n",
+        "a: \"\\ud83d\\u0041\"\n",
+        "a: \"\\ud83dxxxxxxxx\"\n",
+        "a: \"\\u12",
+        "a: 'one\n\ttwo'\n",
+        "a: \"one\n\ttwo\"\n",
+        "a: |\n     \n  x\n",
+        "- |\n- x\n",
+        "|\nx\n",
+        "a: \"x\n  y\"z\n",
+    ];
+
+    fn color_in_equal_pieces(text: &str, size: usize, limits: Option<(usize, usize)>) -> String {
+        let mut colorizer = match limits {
+            Some((long_line, tail)) => YamlColorizer::with_line_limits(long_line, tail),
+            None => YamlColorizer::default(),
+        };
+        let mut out = String::new();
+        let chars: Vec<char> = text.chars().collect();
+        for piece in chars.chunks(size) {
+            colorizer.push_str(&piece.iter().collect::<String>(), &mut out);
+        }
+        colorizer.finish(&mut out);
+        out
+    }
+
+    /// Every spelling colors the same whichever pieces it arrives in, and whether its lines are
+    /// read whole or as they arrive.
+    #[test]
+    fn spellings_color_as_the_whole_does_in_any_pieces_5416() {
+        for text in SPELLINGS {
+            let whole = color(text);
+            for size in [1, 3, 8, 64] {
+                for limits in [None, Some((1, 8)), Some((12, 16))] {
+                    assert_eq!(
+                        color_in_equal_pieces(text, size, limits),
+                        whole,
+                        "{text:?} in pieces of {size}, limits {limits:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A text the scanner refuses is still printed, to its end, in any pieces.
+    #[test]
+    fn refused_texts_are_still_printed_5416() {
+        for text in REFUSED {
+            let whole = color(text);
+            assert!(!whole.is_empty(), "{text:?}");
+            for size in [1, 5, 64] {
+                // Where the scan gives up is the same, but how much is read before the end of the
+                // text arrives is not promised for text that is not YAML; it must finish.
+                let pieces = color_in_equal_pieces(text, size, None);
+                assert!(!pieces.is_empty(), "{text:?} in pieces of {size}");
+            }
+        }
+    }
+
+    /// What yq adds to the text it colors for a document's trailing comments.
+    #[test]
+    fn trailing_content_is_grey_with_its_escape_codes_in_the_text_5416() {
+        let mut out = String::new();
+        color_trailing_content("\n# one\n\n# two", &mut out);
+        assert_eq!(out, "\n\x1b[90m# one\n\x1b[0m\n\x1b[90m# two\x1b[0m");
+    }
+
     /// A very long line, and a quoted scalar that takes many pieces to close, are each read once
     /// as they arrive, not again from their start with every piece.
     #[test]
