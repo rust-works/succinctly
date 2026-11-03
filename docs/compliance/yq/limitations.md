@@ -6841,15 +6841,13 @@ The text is fed to the scanner a line at a time, and a line is scanned once the 
 Several thousand generated documents (comments, anchors, aliases, tags, block and flow styles, quoted and plain scalars of every type, several documents to a stream) through about twenty filters and the `-P`, `-I`, `-N`, `--no-doc`, `-e` and `-0` flags agree with yq v4.53.3 byte for byte wherever the uncolored output already agrees.
 Pinned by `tests/yq_cli/i5416.rs`, whose rows were captured from yq v4.53.3.
 
-Two differences remain.
+One difference remains: **a double-quoted escape keeps its digits** (ADR-0018 rule 4(b): matching would corrupt data).
+go-yaml leaves the `x`, `u` or `U` and the hex digits of `\\x01`, `\\u0001` and `\\U0001F600` out of the token's origin text, so yq's `-C` prints `a: "x\\u0001y"` as `a: "x\\y"`, a different string.
+`succinctly yq -C` prints the escape whole.
+Every other character go-yaml drops from a token's text is dropped here too, because the line it prints would otherwise differ from yq's.
 
-- **A double-quoted escape keeps its digits** (ADR-0018 rule 4(b): matching would corrupt data).
-  go-yaml leaves the `x`, `u` or `U` and the hex digits of `\x01`, `\u0001` and `\U0001F600` out of the token's origin text, so yq's `-C` prints `a: "x\u0001y"` as `a: "x\y"`, a different string.
-  `succinctly yq -C` prints the escape whole.
-  Every other character go-yaml drops from a token's text is dropped here too, because the line it prints would otherwise differ from yq's.
-- **A comment directly after an explicit leading `---` is colored as part of the document on the rebuilt route.**
-  yq reads the `---` and the comments and blank lines around it before the first document as a header and prints them apart from it.
-  The streaming route does the same.
-  The route that rebuilds the document (`-P`, a write, `style =`) keeps such a comment as the head comment of the first node, so it is colored with the document: the text is the same, and the grey span ends before its line break and an empty span follows, where yq's holds the line break.
+A very long line is the one shape that is not streamed in constant memory.
+A line is scanned once it is 64 KiB long even if its end has not arrived, so a long line of many small tokens (a flow sequence of millions of numbers) is read as it comes.
+A single token is held whole while it is scanned, as go-yaml holds it: a quoted or plain scalar of tens of megabytes on one line, or a block scalar, takes several times its size in memory until it ends.
 
 yq's own colorizer also repeats the line break after a tag that ends its line (`a: !tag` / `  b: 1` prints a blank line between them), and `succinctly yq -C` repeats it as well.
