@@ -27787,6 +27787,10 @@ const JQ_WORD_CLASS_IN_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}";
 /// a POSIX class is an error, as in jq (`invalid POSIX bracket type`); `ascii` and `xdigit` are
 /// ASCII in both engines and are left to the crate.
 ///
+/// The same pass takes three more (#6068): `\u` and `\U` are the letter, a `{` that opens no
+/// interval is a literal brace, and `\p{..}`/`\P{..}` outside a class do not case-fold (a `\p`
+/// with no brace is the letter).
+///
 /// The same pass takes the other spellings the `regex` crate reads differently from Oniguruma
 /// (#5529): `\<` and `\>` are the literal characters (the crate's word-boundary assertions),
 /// `\b{start}` and its three siblings are `\b` and a literal `{...}`, and a Python-style
@@ -27806,6 +27810,7 @@ fn translate_posix_brackets(
         && !pattern.contains("\\>")
         && !pattern.contains("\\b{")
         && !pattern.contains("(?P")
+        && !pattern.contains(['{', '\\'])
         && !may_hold_assertion(pattern)
     {
         return Ok(std::borrow::Cow::Borrowed(pattern));
@@ -27901,6 +27906,59 @@ fn translate_posix_brackets(
                 i += 2;
                 continue;
             }
+            // #6068: `\u` and `\U` are not escapes in Oniguruma's Perl syntax, they are the
+            // letter: `"\u00e9"` matches the text `u00e9`, and a lone `\u` matches `u`. The
+            // `regex` crate reads `\u00e9` and `\u{e9}` as code points and refuses the rest.
+            if let Some(&letter @ ('u' | 'U')) = chars.get(i + 1) {
+                out.push(letter);
+                changed = true;
+                at_start = false;
+                i += 2;
+                continue;
+            }
+            // #6068: `\p{..}` and `\P{..}` outside a class are not case-folded under `i` in
+            // Oniguruma (`"a" | test("\\p{Lu}"; "i")` is `false`; inside `[...]` they fold, and so
+            // do they in the crate everywhere). Pinning case sensitivity on the property keeps jq's
+            // answer under the `i` flag and under an inline `(?i)`. A `\p` or `\P` with no brace
+            // is the letter, in a class or out (`"pL" | test("\\pL")` is `true`, and `"a"` does not
+            // match it); the crate reads `\pL` as the Unicode letter property.
+            if let Some(&kind @ ('p' | 'P')) = chars.get(i + 1) {
+                if chars.get(i + 2) == Some(&'{') {
+                    if let Some(close) = chars[i + 3..].iter().position(|&c| c == '}') {
+                        let end = i + 3 + close + 1;
+                        if depth == 0 {
+                            out.push_str("(?-i:");
+                            out.extend(&chars[i..end]);
+                            out.push(')');
+                            changed = true;
+                        } else {
+                            out.extend(&chars[i..end]);
+                        }
+                        at_start = false;
+                        i = end;
+                        continue;
+                    }
+                } else {
+                    out.push(kind);
+                    changed = true;
+                    at_start = false;
+                    i += 2;
+                    continue;
+                }
+            }
+            // The braces of `\x{..}`, `\k{..}` and the like belong to the escape: they are not an
+            // interval, and the brace scan below must not see them.
+            if matches!(chars.get(i + 1), Some('x' | 'k' | 'g' | 'N'))
+                && chars.get(i + 2) == Some(&'{')
+            {
+                if let Some(close) = chars[i + 3..].iter().position(|&c| c == '}') {
+                    let end = i + 3 + close + 1;
+                    out.extend(&chars[i..end]);
+                    at_start = false;
+                    i = end;
+                    continue;
+                }
+            }
             out.push(c);
             if let Some(&next) = chars.get(i + 1) {
                 out.push(next);
@@ -27962,6 +28020,15 @@ fn translate_posix_brackets(
                 }
             } else if c == ')' && extended_in.len() > 1 {
                 extended_in.pop();
+            }
+            // #6068: a `{` that does not open `{n}`, `{n,}`, `{n,m}` or `{,m}` is the literal brace
+            // in Oniguruma (`a{ 1}`, `a{1 }`, `a{1, 2}`); the `regex` crate allows blanks inside
+            // an interval and repeats `a`.
+            if c == '{' && interval_quantifier_at(&chars, i).is_none() {
+                out.push_str("\\{");
+                changed = true;
+                i += 1;
+                continue;
             }
             if c == '[' {
                 depth = 1;
