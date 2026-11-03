@@ -10207,6 +10207,18 @@ jq aborts on its own `set_tm_yday` assertion (`Assertion failed: (yday == tm->tm
 succinctly keeps the month and day as read there and recomputes the yearday from them.
 glibc's `%j` was not captured, so the rows above are the macOS pin's and glibc may differ on them.
 
+### `strptime`'s `%d` and `%e` read the white space before the day as the macOS pin's libc does, where glibc skips any amount (#5974)
+
+In the pin's libc a white-space character stands in for the first of the day's two digits.
+`%d` reads `" 5"` and `"\t5"` as day 5 and refuses `"  5"` and `" 05"`.
+`%e` skips one white-space character that is there and then reads as `%d` does, so `"  5"` and `" 05"` are day 5 and `"   5"` and `"  05"` are no match.
+A white-space character and one digit are all `%d` takes then, so a digit straight after them is no match when something follows (`" 55"` against `"%d%d"`), where `" 5 5"` is day 5 twice.
+A day above 31 is refused where it is read (`"500"` against `"%d%d"` reads 50 first).
+`%D`, `%F`, `%c` and `%x` stand for `%d` and read their day the same way, and `%Ed`, `%Od`, `%Ee` and `%Oe` as the plain specifier.
+glibc's `strptime` skips any run of white space before a number, so jq 1.6 on Linux reads `" 5"`, `"  5"`, `" 05"` and `" 55"` against `%d` or `%d%d` as day 5 (captured on terminus; 1.7.1 on glibc was not).
+succinctly follows the pin, as it does for the other `strptime` rows of this page.
+A 93,600-row grid of 20 formats (`%d`, `%e`, their `%E` and `%O` forms, pairs of them, `%D`, `%F`, `%Y-%m-%d`) over every string of up to four characters from space, tab, newline, `0`, `1`, `5`, `-` and `/` matched the pin on every row (weekday and yearday left out, see the century weekday below); 3,324 rows differed before.
+
 ### `strptime`'s weekday in January and February of a century year that is not a leap year is the calendar's, where jq's macOS build is a day early (#970, #5946)
 
 jq's macOS build fills `tm_wday` itself (`set_tm_wday()` in `builtin.c`, a Gauss-style routine whose own comment admits it "produces the wrong day-of-the-week number" for 1900-01-01..1900-02-28 and 2100-01-01..2100-02-28).

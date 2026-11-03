@@ -96412,21 +96412,14 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // and succeed at the end of the input or before white space, as the pin's libc does: the field
     // is left as it was and counts as not read (`"" | strptime("%Y")` is the zeroed time).
     // The libc refuses a month outside 1-12 and a day past 31 as it reads them, so a later `%s`
-    // cannot hide one (`"13" | strptime("%m%s")` is no match, #5947); a day of 0 reads.
+    // cannot hide one (`"13" | strptime("%m%s")` is no match, #5947); a day of 0 reads
+    // (`parse_day_of_month` does the day, #5974).
     let read_month = |it: &mut core::iter::Peekable<core::str::Chars<'_>>| {
         let m = parse_digits(it, 2)?;
         if (1..=12).contains(&m) {
             Ok(m)
         } else {
             Err(format!("month {m} out of range"))
-        }
-    };
-    let read_day = |it: &mut core::iter::Peekable<core::str::Chars<'_>>| {
-        let d = parse_digits(it, 2)?;
-        if d <= 31 {
-            Ok(d)
-        } else {
-            Err(format!("day {d} out of range"))
         }
     };
     let field_is_empty = |it: &core::iter::Peekable<core::str::Chars<'_>>| {
@@ -96487,16 +96480,12 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     month_read = true;
                 }
                 Some('d') => {
-                    day = read_day(&mut input_iter)?;
+                    day = parse_day_of_month(&mut input_iter, false)?;
                     mday_read = true;
                 }
                 Some('e') => {
                     mday_read = true;
-                    // Skip leading space if present
-                    if input_iter.peek() == Some(&' ') {
-                        input_iter.next();
-                    }
-                    day = read_day(&mut input_iter)?;
+                    day = parse_day_of_month(&mut input_iter, true)?;
                 }
                 // `%k` and `%l` read as `%H` and `%I`: the libc takes them as the hour in 24- and 12-hour
                 // form, with no padding of their own to read (#5754).
@@ -96703,7 +96692,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     if input_iter.next() != Some('/') {
                         return Err("expected '/'".to_string());
                     }
-                    day = read_day(&mut input_iter)?;
+                    day = parse_day_of_month(&mut input_iter, false)?;
                     if input_iter.next() != Some('/') {
                         return Err("expected '/'".to_string());
                     }
@@ -96730,7 +96719,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     if input_iter.next() != Some('-') {
                         return Err("expected '-'".to_string());
                     }
-                    day = read_day(&mut input_iter)?;
+                    day = parse_day_of_month(&mut input_iter, false)?;
                 }
                 Some('R') => {
                     // HH:MM, the minutes empty at the end or before white space (#5947)
@@ -97098,6 +97087,33 @@ fn parse_signed_field(
         0
     };
     Ok(if negative { -digits } else { digits })
+}
+
+/// `%d` and `%e` (#5974). Both read a day of up to two digits, but the pinned libc lets white space
+/// stand before them. A white-space character takes the place of the first digit: `%d` reads `" 5"`
+/// and `"\t5"` as day 5, and refuses `"  5"` (the second space is no digit) and `" 05"` (one digit
+/// fits beside the space, so the `5` is left over). It also refuses a digit straight after that one
+/// digit, which shows only when something follows the `%d`: `" 55"` against `"%d%d"` is no match, and
+/// `" 5 5"` is day 5 twice. `%e` first skips one white-space character that is there, then reads as
+/// `%d` does, so `"  5"` and `" 05"` are day 5 and `"   5"` and `"  05"` are no match.
+fn parse_day_of_month(
+    input: &mut core::iter::Peekable<core::str::Chars>,
+    skip_one: bool,
+) -> Result<i64, String> {
+    if skip_one {
+        let _ = input.next_if(|&c| is_c_space(c));
+    }
+    let padded = input.next_if(|&c| is_c_space(c)).is_some();
+    let day = parse_digits(input, if padded { 1 } else { 2 })?;
+    if padded && input.peek().is_some_and(char::is_ascii_digit) {
+        return Err("expected one digit after a padding space".to_string());
+    }
+    // The libc refuses a day above 31 where it reads it, not only in the date that is left at the end
+    // (`"500" | strptime("%d%d")` reads 50 first).
+    if day > 31 {
+        return Err(format!("day {day} out of range"));
+    }
+    Ok(day)
 }
 
 /// Parse up to n digits from input
