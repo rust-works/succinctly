@@ -1223,6 +1223,15 @@ fn differential_corpus() -> Vec<(String, String)> {
         let stdin = row["stdin"].as_str().expect("stdin").trim().to_string();
         rows.push((stdin, filter.to_string()));
     }
+    // #6042: the literal `-0` is negative zero in both routes.
+    for filter in [
+        "[-0|try path(error) catch .]",
+        "[-0|try pick(error) catch .]",
+        "-0|del(empty)",
+        "[-0, 0, -1] | map(try path(error) catch .)",
+    ] {
+        rows.push(("null".to_string(), filter.to_string()));
+    }
     let stages = [
         ".",
         ".a",
