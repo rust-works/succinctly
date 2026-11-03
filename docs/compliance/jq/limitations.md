@@ -10331,6 +10331,10 @@ What differs from jq 1.7.1:
   The pin's libc reads `%OB` from the alternative month names, which C holds as the full names alone, so `%OB` takes `March` but not `Mar`, and `%Ob` and `%Oh` take neither; a glibc `jq` reads the abbreviation with `%O` as it does without.
   The pin's libc puts no limit on which specifier a modifier precedes; glibc reads `%E` only before `c C x X y Y` and `%O` only before `d e H I m M S U V W w y`, so a glibc `jq` rejects `"03" | strptime("%Em")`.
   `%k` and `%l` are read as `%H` and `%I`.
+  `%C` and `%y` complete each other in the order the libc reads them: `%C` after `%Y` replaces the year with the century (`"2015 20" | strptime("%Y %C")` is year 2000), a `%C` and a `%y` give the year `century * 100 + y` whichever comes first and use each other up, and `%Y`, `%D` and `%F` clear a pending half (#5934).
+  `%n` and `%t` read at least one white-space character, the whole run of it: `"2015" | strptime("%Y%n")` is no match, and so is `"2015  " | strptime("%Y %n")`, whose format space has taken the run already; the run is ASCII white space only, as the libc's `isspace` has it.
+  That is the pin's libc: a glibc `jq` takes `%n` and `%t` as plain white-space directives that match none too.
+  Still different: a year of 1800, 1900 or 2100 gets the weekday jq's own routine computes, one off from the calendar's for the century years in January and February, and an empty or white-space-only input reads in jq as the zeroed time where it is no match here.
   The pin's libc does not skip a leading space before them (`" 9" | strptime("%k")` is an error, as here), where glibc does.
   A specifier the libc does not know (`%Q`, `%P`, `%5`) and a `%` that ends the format are no match, where they were once matched as a literal.
   `%g` and `%G` are no match in the pin's libc and here, and glibc reads them.

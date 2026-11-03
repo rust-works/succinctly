@@ -96363,6 +96363,12 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // epoch's 1970-01-01. `weekday`/`yearday` are then computed from that date, `mday = 0`
     // included (`"2015" | strptime("%Y")` is `[2015,0,0,0,0,0,3,-1]`).
     let mut year: i64 = 1900;
+    // #5934: `%C` and `%y` pass a half of the year to each other, as the libc does. A `%C` waits
+    // for a `%y` to complete it (`century`), a `%y` waits for a `%C` (`two_digit_year`), and the
+    // one that arrives second uses the other up. `%Y` (and `%D`, `%F`, `%s`, which set the year
+    // whole) clears both. A `%y` with no century is the 1969-2068 window.
+    let mut century: Option<i64> = None;
+    let mut two_digit_year: Option<i64> = None;
     let mut month: i64 = 1;
     let mut day: i64 = 0;
     let mut hour: i64 = 0;
@@ -96422,11 +96428,19 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                 }
                 Some('Y') => {
                     year = parse_digits(&mut input_iter, 4)?;
+                    century = None;
+                    two_digit_year = None;
                     year_read = true;
                 }
                 Some('y') => {
                     let y = parse_digits(&mut input_iter, 2)?;
-                    year = if y >= 69 { 1900 + y } else { 2000 + y };
+                    if let Some(c) = century.take() {
+                        year = c * 100 + y;
+                        two_digit_year = None;
+                    } else {
+                        year = if y >= 69 { 1900 + y } else { 2000 + y };
+                        two_digit_year = Some(y);
+                    }
                     year_read = true;
                 }
                 Some('m') => {
@@ -96488,6 +96502,8 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     let t = broken_down_time_from_unix_secs(secs).map_err(|e| e.to_string())?;
                     gmt = true;
                     year = t.year;
+                    century = None;
+                    two_digit_year = None;
                     month = t.month;
                     day = t.day;
                     month_read = true;
@@ -96614,8 +96630,14 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     }
                 }
                 Some('C') => {
-                    let century = parse_digits(&mut input_iter, 2)?;
-                    year = century * 100 + (year % 100);
+                    let c = parse_digits(&mut input_iter, 2)?;
+                    if let Some(y) = two_digit_year.take() {
+                        year = c * 100 + y;
+                        century = None;
+                    } else {
+                        year = c * 100;
+                        century = Some(c);
+                    }
                     year_read = true;
                 }
                 Some('D') => {
@@ -96632,12 +96654,16 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     }
                     let y = parse_digits(&mut input_iter, 2)?;
                     year = if y >= 69 { 1900 + y } else { 2000 + y };
+                    century = None;
+                    two_digit_year = None;
                 }
                 Some('F') => {
                     // yyyy-mm-dd
                     month_read = true;
                     mday_read = true;
                     year = parse_digits(&mut input_iter, 4)?;
+                    century = None;
+                    two_digit_year = None;
                     if input_iter.next() != Some('-') {
                         return Err("expected '-'".to_string());
                     }
@@ -96671,13 +96697,21 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                         check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=60, "second")?;
                 }
                 Some('n' | 't') => {
-                    // Skip whitespace
+                    // The libc takes at least one white-space character (the run of them, not
+                    // just one): `"2015" | strptime("%Y%n")` is no match, `"2015 "` reads (#5934).
+                    let mut skipped = false;
+                    // ASCII white space only, as the libc's `isspace` in the C locale: a no-break
+                    // space does not count.
                     while let Some(&c) = input_iter.peek() {
-                        if c.is_whitespace() {
+                        if matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r') {
                             input_iter.next();
+                            skipped = true;
                         } else {
                             break;
                         }
+                    }
+                    if !skipped {
+                        return Err("expected white space".to_string());
                     }
                 }
                 Some('z') => {
