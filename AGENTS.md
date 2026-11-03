@@ -56,4 +56,4 @@ Never edit `CHANGELOG.md` in a PR. Add `changelog.d/<issue>.<type>.md` (types: `
 
 The knowledge wiki begins at [docs/index.md](docs/index.md). Coding conventions are in [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md); architecture decisions are in [docs/adrs/README.md](docs/adrs/README.md). Update relevant docs when changing behavior or performance claims.
 
-Repository skills live in `.agents/skills/`. Use the relevant `SKILL.md` for benchmark documentation, bit/SIMD optimization, JSON/YAML indexing, testing, Markdown tables, ADR reviews, release work, and commit messages. Keep skill manifests named exactly `SKILL.md`.
+Repository skills live in `.claude/skills/`; `.agents/skills` is a symlink to it, so edit them there and never replace the link with a copy (#5956). Use the relevant `SKILL.md` for benchmark documentation, bit/SIMD optimization, JSON/YAML indexing, testing, Markdown tables, ADR reviews, release work, and commit messages. Keep skill manifests named exactly `SKILL.md`.

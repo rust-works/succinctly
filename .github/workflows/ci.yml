@@ -1117,6 +1117,17 @@ jobs:
             exit 1
           fi
 
+      # Codex reads `.agents/skills`; a real directory there is a second copy that drifts (#5956).
+      - name: Check .agents/skills is a symlink to .claude/skills (#5956)
+        run: |
+          if [ "$(readlink .agents/skills)" != "../.claude/skills" ]; then
+            echo "::error::.agents/skills must be a symlink to ../.claude/skills (see #5956)"
+            exit 1
+          fi
+
+      - name: Check both skill-casing hooks reject a lowercase skill.md (#5956)
+        run: python3 scripts/test_skill_hooks.py -v
+
   docs:
     name: Documentation
     needs: gate
