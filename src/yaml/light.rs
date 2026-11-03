@@ -6703,22 +6703,40 @@ fn body_is_verbatim(bytes: &[u8], special: u8, unicode: bool) -> bool {
     let special_word = SWAR_LOW * u64::from(special);
     let lf_word = SWAR_LOW * u64::from(b'\n');
     let cr_word = SWAR_LOW * u64::from(b'\r');
-    let mut non_ascii = 0u64;
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
+    // Whether a word holds one of the three bytes, as the bits of its non-ASCII bytes too.
+    let load = |chunk: &[u8]| {
         let mut word = [0u8; 8];
         word.copy_from_slice(chunk);
-        let w = u64::from_ne_bytes(word);
-        if zero_bytes(w ^ special_word) | zero_bytes(w ^ lf_word) | zero_bytes(w ^ cr_word) != 0 {
-            return false;
+        u64::from_ne_bytes(word)
+    };
+    let hit =
+        |w: u64| zero_bytes(w ^ special_word) | zero_bytes(w ^ lf_word) | zero_bytes(w ^ cr_word);
+    let mut non_ascii = 0u64;
+    if bytes.len() >= 8 {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            let w = load(chunk);
+            if hit(w) != 0 {
+                return false;
+            }
+            non_ascii |= w & SWAR_HIGH;
         }
-        non_ascii |= w & SWAR_HIGH;
-    }
-    for &b in chunks.remainder() {
-        if b == special || b == b'\n' || b == b'\r' {
-            return false;
+        if !chunks.remainder().is_empty() {
+            // The last eight bytes again, overlapping the last chunk: it re-tests a few bytes
+            // rather than looping over the 1-7 that are left.
+            let w = load(&bytes[bytes.len() - 8..]);
+            if hit(w) != 0 {
+                return false;
+            }
+            non_ascii |= w & SWAR_HIGH;
         }
-        non_ascii |= u64::from(b & 0x80);
+    } else {
+        for &b in bytes {
+            if b == special || b == b'\n' || b == b'\r' {
+                return false;
+            }
+            non_ascii |= u64::from(b & 0x80);
+        }
     }
     !(unicode && non_ascii != 0 && holds_unicode_scalar_break(bytes))
 }
