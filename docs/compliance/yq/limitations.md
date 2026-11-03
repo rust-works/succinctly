@@ -817,13 +817,15 @@ indent (written here with `\u2028`/`\u2029` for the character itself: `a: 'x\u20
 becoming single-quoted). The streaming route used to copy the source text. The indent is the
 enclosing collection's plus one step, so a flow item under a block mapping sits two steps in and a
 root flow collection's items one step past that; the streaming route knows it for the first flow
-level only, the DOM route (a write) at every depth. Not covered: a flow collection nested in
-another on the streaming route (`a: [[x\u2028y]]`), an explicit-key scalar (`? 'x\u2028y'`), a scalar
-whose source has a space beside the break (yq trims it on decode, this keeps it and so
-double-quotes), a multi-line source scalar that holds a `\n` as well, and a *block* plain scalar
+level only, the DOM route (a write) at every depth.
+The decode half landed with [#4913](https://github.com/rust-works/succinctly/issues/4913): in a quoted scalar and in a flow collection's plain scalar, U+0085 folds like a `\n` (`'x\u0085y'` is `x y`), U+2028 and U+2029 stay in the value, and the blanks beside any of the three are trimmed as beside a `\n`.
+Not covered: a flow collection nested in
+another on the streaming route (`a: [[x\u2028y]]`), an explicit-key scalar (`? 'x\u2028y'`),
+a multi-line source scalar that holds a `\n` as well,
+and a *block* plain scalar
 with such a break, which yq rejects (`could not find expected ':'`) and the parser has always
-accepted (a semi-index does not validate to that depth). The decode half is
-[#4913](https://github.com/rust-works/succinctly/issues/4913).
+accepted (a semi-index does not validate to that depth).
+A quoted implicit key that spans such a break is accepted for the same reason.
 
 **One deliberate divergence (ADR-0018, output the reference cannot read back).** go-yaml tests only the
 first character of the string for the indentation indicator, so a string that starts with a break and
