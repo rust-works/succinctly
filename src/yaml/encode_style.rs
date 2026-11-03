@@ -559,6 +559,58 @@ pub fn go_yaml_unicode_separator_scalar(s: &str, indent: &str, step: usize) -> O
     go_yaml_multiline_scalar(s, indent, step)
 }
 
+/// A source single-quoted scalar whose value holds a line feed, as yq writes it back (#6058).
+///
+/// `None` for a string with no `\n` (a plain one-line value, or one whose only breaks are
+/// U+2028/U+2029, which [`go_yaml_unicode_separator_scalar`] spells). A single-quoted scalar
+/// holds a `\n` only where its source had an empty line, and go-yaml keeps the style it was
+/// read in (`yaml_emitter_write_single_quoted`): a `\n` that follows a non-break character is
+/// written twice (a single break would fold back to a space), later breaks of the same run once,
+/// and the next character after a break is indented by `indent`, the indent of the scalar's
+/// continuation lines. `a: 'x<LF><LF>  y'` is `x\ny`; the break at the very end is written
+/// the same way and leaves the closing quote at the start of its line.
+///
+/// A character the emitter will not write raw, or a space next to a break (the analysis that
+/// stops single quotes), gives double quotes, as in [`go_yaml_multiline_scalar`].
+#[must_use]
+pub fn go_yaml_single_quoted_line_feed(s: &str, indent: &str) -> Option<String> {
+    if !s.contains('\n') {
+        return None;
+    }
+    let mut previous = '\0';
+    let refused = s.chars().any(|c| {
+        let adjacent = (previous == ' ' && is_break(c)) || (is_break(previous) && c == ' ');
+        previous = c;
+        !is_printable(c) || adjacent
+    });
+    if refused {
+        return Some(go_yaml_double_quoted_scalar(s));
+    }
+    let mut out = String::with_capacity(s.len() + 4);
+    out.push('\'');
+    let mut breaks = false;
+    for c in s.chars() {
+        if is_break(c) {
+            if !breaks && c == '\n' {
+                out.push('\n');
+            }
+            out.push(c);
+            breaks = true;
+        } else {
+            if breaks {
+                out.push_str(indent);
+            }
+            if c == '\'' {
+                out.push('\'');
+            }
+            out.push(c);
+            breaks = false;
+        }
+    }
+    out.push('\'');
+    Some(out)
+}
+
 /// Whether `s` holds a character go-yaml's emitter will not write raw.
 ///
 /// A tab, DEL, a C1 control, U+FEFF or a character outside the BMP keeps a string out of the plain
@@ -1260,6 +1312,37 @@ mod tests {
             None
         );
         assert_eq!(go_yaml_unicode_separator_scalar("plain", "  ", 2), None);
+        // #6058: a source single-quoted scalar's `\n` is an empty line, indented after the break.
+        assert_eq!(go_yaml_single_quoted_line_feed("plain", "  "), None);
+        assert_eq!(
+            go_yaml_single_quoted_line_feed("x\ny", "  ").as_deref(),
+            Some("'x\n\n  y'")
+        );
+        assert_eq!(
+            go_yaml_single_quoted_line_feed("x\n\ny", "    ").as_deref(),
+            Some("'x\n\n\n    y'")
+        );
+        assert_eq!(
+            go_yaml_single_quoted_line_feed("x\n", "  ").as_deref(),
+            Some("'x\n\n'")
+        );
+        assert_eq!(
+            go_yaml_single_quoted_line_feed("\nx", "  ").as_deref(),
+            Some("'\n\n  x'")
+        );
+        assert_eq!(
+            go_yaml_single_quoted_line_feed("it's\nx", "  ").as_deref(),
+            Some("'it''s\n\n  x'")
+        );
+        // A space next to a break, or a character the emitter will not write raw: double quotes.
+        assert_eq!(
+            go_yaml_single_quoted_line_feed("x \ny", "  ").as_deref(),
+            Some("\"x \\ny\"")
+        );
+        assert_eq!(
+            go_yaml_single_quoted_line_feed("x\ny\tz", "  ").as_deref(),
+            Some("\"x\\ny\\tz\"")
+        );
         assert!(has_unwritable_char("a\tb") && !has_unwritable_char_in_block("a\tb"));
         assert!(has_unwritable_char_in_block("a\u{7f}b"));
         assert!(!has_unwritable_char("plain text\nsecond line"));

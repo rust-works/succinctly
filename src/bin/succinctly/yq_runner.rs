@@ -37,8 +37,9 @@ use succinctly::yaml::{
     deeper_yaml_indent, format_float_yq_yaml, format_float_yq_yaml_nested, go_yaml_block_scalar,
     go_yaml_dom_scalar, go_yaml_double_quoted_scalar, go_yaml_explicit_key_scalar,
     go_yaml_forces_double_quotes, go_yaml_key_is_simple, go_yaml_resolved_tag,
-    go_yaml_tagged_str_scalar, go_yaml_unicode_separator_scalar, resolve_plain_sourced,
-    stream_json_sequence, stream_yaml_sequence, ResolvedScalar, YamlCursor, YamlIndex, YamlValue,
+    go_yaml_single_quoted_line_feed, go_yaml_tagged_str_scalar, go_yaml_unicode_separator_scalar,
+    resolve_plain_sourced, stream_json_sequence, stream_yaml_sequence, ResolvedScalar, YamlCursor,
+    YamlIndex, YamlValue,
 };
 
 use super::m2_gate::{can_use_m2_streaming, eval_all_matches_per_document};
@@ -10022,6 +10023,12 @@ fn emit_string_scalar(
             if let Some(block) = go_yaml_block_scalar(s, folded, indent, config.indent_str.len()) {
                 return block;
             }
+        }
+    }
+    // #6058: a source single-quoted scalar with a line feed keeps its quotes across the break.
+    if style == "single" {
+        if let Some(scalar) = go_yaml_single_quoted_line_feed(s, indent) {
+            return scalar;
         }
     }
     // U+2028/U+2029 alone: single quotes across lines where go-yaml allows them (#3587), and a
