@@ -96768,10 +96768,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // character (`end == NULL || (*end != '\0' && !isspace(*end))`), so text left after the format
     // (`"2020-01-01x" | strptime("%Y-%m-%d")`) is a mismatch. What is left after white space is
     // appended to the result as a string (`"2020-01-01 x"` gives a ninth element `" x"`).
-    if input_iter
-        .peek()
-        .is_some_and(|&c| !is_c_space(c))
-    {
+    if input_iter.peek().is_some_and(|&c| !is_c_space(c)) {
         return Err("trailing input".to_string());
     }
     let remainder: String = input_iter.collect();
