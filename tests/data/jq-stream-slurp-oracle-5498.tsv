@@ -1,0 +1,1311 @@
+{"a":1,"b":[2,3]}\n	.	-c --stream -s	[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]]\n		0
+{"a":1,"b":[2,3]}\n	.	-c --stream -s -n	null\n		0
+{"a":1,"b":[2,3]}\n	.	-c --stream -s -e	[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]]\n		0
+{"a":1,"b":[2,3]}\n	length	-c --stream -s	5\n		0
+{"a":1,"b":[2,3]}\n	length	-c --stream -s -n	0\n		0
+{"a":1,"b":[2,3]}\n	length	-c --stream -s -e	5\n		0
+{"a":1,"b":[2,3]}\n	.[0]	-c --stream -s	[["a"],1]\n		0
+{"a":1,"b":[2,3]}\n	.[0]	-c --stream -s -n	null\n		0
+{"a":1,"b":[2,3]}\n	.[0]	-c --stream -s -e	[["a"],1]\n		0
+{"a":1,"b":[2,3]}\n	[limit(5;.[])]	-c --stream -s	[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]]\n		0
+{"a":1,"b":[2,3]}\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1,"b":[2,3]}\n	[limit(5;.[])]	-c --stream -s -e	[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]]\n		0
+{"a":1,"b":[2,3]}\n	map(select(length==2))|length	-c --stream -s	3\n		0
+{"a":1,"b":[2,3]}\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1,"b":[2,3]}\n	map(select(length==2))|length	-c --stream -s -e	3\n		0
+{"a":1,"b":[2,3]}\n	map(select(length==1))|length	-c --stream -s	2\n		0
+{"a":1,"b":[2,3]}\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1,"b":[2,3]}\n	map(select(length==1))|length	-c --stream -s -e	2\n		0
+{"a":1,"b":[2,3]}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s	6\n		0
+{"a":1,"b":[2,3]}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1,"b":[2,3]}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	6\n		0
+{"a":1,"b":[2,3]}\n	input_line_number	-c --stream -s	1\n		0
+{"a":1,"b":[2,3]}\n	input_line_number	-c --stream -s -n	0\n		0
+{"a":1,"b":[2,3]}\n	input_line_number	-c --stream -s -e	1\n		0
+{"a":1,"b":[2,3]}\n	[., input_line_number]	-c --stream -s	[[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]],1]\n		0
+{"a":1,"b":[2,3]}\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+{"a":1,"b":[2,3]}\n	[., input_line_number]	-c --stream -s -e	[[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]],1]\n		0
+{"a":1,"b":[2,3]}\n	first	-c --stream -s	[["a"],1]\n		0
+{"a":1,"b":[2,3]}\n	first	-c --stream -s -n	null\n		0
+{"a":1,"b":[2,3]}\n	first	-c --stream -s -e	[["a"],1]\n		0
+{"a":1,"b":[2,3]}\n	last	-c --stream -s	[["b"]]\n		0
+{"a":1,"b":[2,3]}\n	last	-c --stream -s -n	null\n		0
+{"a":1,"b":[2,3]}\n	last	-c --stream -s -e	[["b"]]\n		0
+{"a":1,"b":[2,3]}\n	tojson	-c --stream -s	"[[[\\"a\\"],1],[[\\"b\\",0],2],[[\\"b\\",1],3],[[\\"b\\",1]],[[\\"b\\"]]]"\n		0
+{"a":1,"b":[2,3]}\n	tojson	-c --stream -s -n	"null"\n		0
+{"a":1,"b":[2,3]}\n	tojson	-c --stream -s -e	"[[[\\"a\\"],1],[[\\"b\\",0],2],[[\\"b\\",1],3],[[\\"b\\",1]],[[\\"b\\"]]]"\n		0
+{"a":1,"b":[2,3]}\n	map(.[0])|unique	-c --stream -s	[["a"],["b"],["b",0],["b",1]]\n		0
+{"a":1,"b":[2,3]}\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1,"b":[2,3]}\n	map(.[0])|unique	-c --stream -s -e	[["a"],["b"],["b",0],["b",1]]\n		0
+{"a":1,"b":[2,3]}\n	try input catch "E"	-c --stream -s	"E"\n		0
+{"a":1,"b":[2,3]}\n	try input catch "E"	-c --stream -s -n	[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]]\n		0
+{"a":1,"b":[2,3]}\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+{"a":1,"b":[2,3]}\n	[inputs]|length	-c --stream -s	0\n		0
+{"a":1,"b":[2,3]}\n	[inputs]|length	-c --stream -s -n	1\n		0
+{"a":1,"b":[2,3]}\n	[inputs]|length	-c --stream -s -e	0\n		0
+[1,2]\n{"a":3}\n"x"\n	.	-c --stream -s	[[[0],1],[[1],2],[[1]],[["a"],3],[["a"]],[[],"x"]]\n		0
+[1,2]\n{"a":3}\n"x"\n	.	-c --stream -s -n	null\n		0
+[1,2]\n{"a":3}\n"x"\n	.	-c --stream -s -e	[[[0],1],[[1],2],[[1]],[["a"],3],[["a"]],[[],"x"]]\n		0
+[1,2]\n{"a":3}\n"x"\n	length	-c --stream -s	6\n		0
+[1,2]\n{"a":3}\n"x"\n	length	-c --stream -s -n	0\n		0
+[1,2]\n{"a":3}\n"x"\n	length	-c --stream -s -e	6\n		0
+[1,2]\n{"a":3}\n"x"\n	.[0]	-c --stream -s	[[0],1]\n		0
+[1,2]\n{"a":3}\n"x"\n	.[0]	-c --stream -s -n	null\n		0
+[1,2]\n{"a":3}\n"x"\n	.[0]	-c --stream -s -e	[[0],1]\n		0
+[1,2]\n{"a":3}\n"x"\n	[limit(5;.[])]	-c --stream -s	[[[0],1],[[1],2],[[1]],[["a"],3],[["a"]]]\n		0
+[1,2]\n{"a":3}\n"x"\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n{"a":3}\n"x"\n	[limit(5;.[])]	-c --stream -s -e	[[[0],1],[[1],2],[[1]],[["a"],3],[["a"]]]\n		0
+[1,2]\n{"a":3}\n"x"\n	map(select(length==2))|length	-c --stream -s	4\n		0
+[1,2]\n{"a":3}\n"x"\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n{"a":3}\n"x"\n	map(select(length==2))|length	-c --stream -s -e	4\n		0
+[1,2]\n{"a":3}\n"x"\n	map(select(length==1))|length	-c --stream -s	2\n		0
+[1,2]\n{"a":3}\n"x"\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n{"a":3}\n"x"\n	map(select(length==1))|length	-c --stream -s -e	2\n		0
+[1,2]\n{"a":3}\n"x"\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: error (at <stdin>:3): number (6) and string ("x") cannot be added\n	5
+[1,2]\n{"a":3}\n"x"\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n{"a":3}\n"x"\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: error (at <stdin>:3): number (6) and string ("x") cannot be added\n	5
+[1,2]\n{"a":3}\n"x"\n	input_line_number	-c --stream -s	3\n		0
+[1,2]\n{"a":3}\n"x"\n	input_line_number	-c --stream -s -n	0\n		0
+[1,2]\n{"a":3}\n"x"\n	input_line_number	-c --stream -s -e	3\n		0
+[1,2]\n{"a":3}\n"x"\n	[., input_line_number]	-c --stream -s	[[[[0],1],[[1],2],[[1]],[["a"],3],[["a"]],[[],"x"]],3]\n		0
+[1,2]\n{"a":3}\n"x"\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+[1,2]\n{"a":3}\n"x"\n	[., input_line_number]	-c --stream -s -e	[[[[0],1],[[1],2],[[1]],[["a"],3],[["a"]],[[],"x"]],3]\n		0
+[1,2]\n{"a":3}\n"x"\n	first	-c --stream -s	[[0],1]\n		0
+[1,2]\n{"a":3}\n"x"\n	first	-c --stream -s -n	null\n		0
+[1,2]\n{"a":3}\n"x"\n	first	-c --stream -s -e	[[0],1]\n		0
+[1,2]\n{"a":3}\n"x"\n	last	-c --stream -s	[[],"x"]\n		0
+[1,2]\n{"a":3}\n"x"\n	last	-c --stream -s -n	null\n		0
+[1,2]\n{"a":3}\n"x"\n	last	-c --stream -s -e	[[],"x"]\n		0
+[1,2]\n{"a":3}\n"x"\n	tojson	-c --stream -s	"[[[0],1],[[1],2],[[1]],[[\\"a\\"],3],[[\\"a\\"]],[[],\\"x\\"]]"\n		0
+[1,2]\n{"a":3}\n"x"\n	tojson	-c --stream -s -n	"null"\n		0
+[1,2]\n{"a":3}\n"x"\n	tojson	-c --stream -s -e	"[[[0],1],[[1],2],[[1]],[[\\"a\\"],3],[[\\"a\\"]],[[],\\"x\\"]]"\n		0
+[1,2]\n{"a":3}\n"x"\n	map(.[0])|unique	-c --stream -s	[[],[0],[1],["a"]]\n		0
+[1,2]\n{"a":3}\n"x"\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n{"a":3}\n"x"\n	map(.[0])|unique	-c --stream -s -e	[[],[0],[1],["a"]]\n		0
+[1,2]\n{"a":3}\n"x"\n	try input catch "E"	-c --stream -s	"E"\n		0
+[1,2]\n{"a":3}\n"x"\n	try input catch "E"	-c --stream -s -n	[[[0],1],[[1],2],[[1]],[["a"],3],[["a"]],[[],"x"]]\n		0
+[1,2]\n{"a":3}\n"x"\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+[1,2]\n{"a":3}\n"x"\n	[inputs]|length	-c --stream -s	0\n		0
+[1,2]\n{"a":3}\n"x"\n	[inputs]|length	-c --stream -s -n	1\n		0
+[1,2]\n{"a":3}\n"x"\n	[inputs]|length	-c --stream -s -e	0\n		0
+1 2 3\n	.	-c --stream -s	[[[],1],[[],2],[[],3]]\n		0
+1 2 3\n	.	-c --stream -s -n	null\n		0
+1 2 3\n	.	-c --stream -s -e	[[[],1],[[],2],[[],3]]\n		0
+1 2 3\n	length	-c --stream -s	3\n		0
+1 2 3\n	length	-c --stream -s -n	0\n		0
+1 2 3\n	length	-c --stream -s -e	3\n		0
+1 2 3\n	.[0]	-c --stream -s	[[],1]\n		0
+1 2 3\n	.[0]	-c --stream -s -n	null\n		0
+1 2 3\n	.[0]	-c --stream -s -e	[[],1]\n		0
+1 2 3\n	[limit(5;.[])]	-c --stream -s	[[[],1],[[],2],[[],3]]\n		0
+1 2 3\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 2 3\n	[limit(5;.[])]	-c --stream -s -e	[[[],1],[[],2],[[],3]]\n		0
+1 2 3\n	map(select(length==2))|length	-c --stream -s	3\n		0
+1 2 3\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 2 3\n	map(select(length==2))|length	-c --stream -s -e	3\n		0
+1 2 3\n	map(select(length==1))|length	-c --stream -s	0\n		0
+1 2 3\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 2 3\n	map(select(length==1))|length	-c --stream -s -e	0\n		0
+1 2 3\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s	6\n		0
+1 2 3\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 2 3\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	6\n		0
+1 2 3\n	input_line_number	-c --stream -s	1\n		0
+1 2 3\n	input_line_number	-c --stream -s -n	0\n		0
+1 2 3\n	input_line_number	-c --stream -s -e	1\n		0
+1 2 3\n	[., input_line_number]	-c --stream -s	[[[[],1],[[],2],[[],3]],1]\n		0
+1 2 3\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+1 2 3\n	[., input_line_number]	-c --stream -s -e	[[[[],1],[[],2],[[],3]],1]\n		0
+1 2 3\n	first	-c --stream -s	[[],1]\n		0
+1 2 3\n	first	-c --stream -s -n	null\n		0
+1 2 3\n	first	-c --stream -s -e	[[],1]\n		0
+1 2 3\n	last	-c --stream -s	[[],3]\n		0
+1 2 3\n	last	-c --stream -s -n	null\n		0
+1 2 3\n	last	-c --stream -s -e	[[],3]\n		0
+1 2 3\n	tojson	-c --stream -s	"[[[],1],[[],2],[[],3]]"\n		0
+1 2 3\n	tojson	-c --stream -s -n	"null"\n		0
+1 2 3\n	tojson	-c --stream -s -e	"[[[],1],[[],2],[[],3]]"\n		0
+1 2 3\n	map(.[0])|unique	-c --stream -s	[[]]\n		0
+1 2 3\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 2 3\n	map(.[0])|unique	-c --stream -s -e	[[]]\n		0
+1 2 3\n	try input catch "E"	-c --stream -s	"E"\n		0
+1 2 3\n	try input catch "E"	-c --stream -s -n	[[[],1],[[],2],[[],3]]\n		0
+1 2 3\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+1 2 3\n	[inputs]|length	-c --stream -s	0\n		0
+1 2 3\n	[inputs]|length	-c --stream -s -n	1\n		0
+1 2 3\n	[inputs]|length	-c --stream -s -e	0\n		0
+	.	-c --stream -s	[]\n		0
+	.	-c --stream -s -n	null\n		0
+	.	-c --stream -s -e	[]\n		0
+	length	-c --stream -s	0\n		0
+	length	-c --stream -s -n	0\n		0
+	length	-c --stream -s -e	0\n		0
+	.[0]	-c --stream -s	null\n		0
+	.[0]	-c --stream -s -n	null\n		0
+	.[0]	-c --stream -s -e	null\n		1
+	[limit(5;.[])]	-c --stream -s	[]\n		0
+	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+	[limit(5;.[])]	-c --stream -s -e	[]\n		0
+	map(select(length==2))|length	-c --stream -s	0\n		0
+	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+	map(select(length==2))|length	-c --stream -s -e	0\n		0
+	map(select(length==1))|length	-c --stream -s	0\n		0
+	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+	map(select(length==1))|length	-c --stream -s -e	0\n		0
+	[.[]|select(length==2)|.[1]]|add	-c --stream -s	null\n		0
+	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	null\n		1
+	input_line_number	-c --stream -s	0\n		0
+	input_line_number	-c --stream -s -n	0\n		0
+	input_line_number	-c --stream -s -e	0\n		0
+	[., input_line_number]	-c --stream -s	[[],0]\n		0
+	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+	[., input_line_number]	-c --stream -s -e	[[],0]\n		0
+	first	-c --stream -s	null\n		0
+	first	-c --stream -s -n	null\n		0
+	first	-c --stream -s -e	null\n		1
+	last	-c --stream -s	null\n		0
+	last	-c --stream -s -n	null\n		0
+	last	-c --stream -s -e	null\n		1
+	tojson	-c --stream -s	"[]"\n		0
+	tojson	-c --stream -s -n	"null"\n		0
+	tojson	-c --stream -s -e	"[]"\n		0
+	map(.[0])|unique	-c --stream -s	[]\n		0
+	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+	map(.[0])|unique	-c --stream -s -e	[]\n		0
+	try input catch "E"	-c --stream -s	"E"\n		0
+	try input catch "E"	-c --stream -s -n	[]\n		0
+	try input catch "E"	-c --stream -s -e	"E"\n		0
+	[inputs]|length	-c --stream -s	0\n		0
+	[inputs]|length	-c --stream -s -n	1\n		0
+	[inputs]|length	-c --stream -s -e	0\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	.	-c --stream -s	[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	.	-c --stream -s -n	null\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	.	-c --stream -s -e	[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	length	-c --stream -s	5\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	length	-c --stream -s -n	0\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	length	-c --stream -s -e	5\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	.[0]	-c --stream -s	[["a"],1]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	.[0]	-c --stream -s -n	null\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	.[0]	-c --stream -s -e	[["a"],1]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	[limit(5;.[])]	-c --stream -s	[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":\n1,\n"b":[2,\n3]}\n	[limit(5;.[])]	-c --stream -s -e	[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	map(select(length==2))|length	-c --stream -s	3\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":\n1,\n"b":[2,\n3]}\n	map(select(length==2))|length	-c --stream -s -e	3\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	map(select(length==1))|length	-c --stream -s	2\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":\n1,\n"b":[2,\n3]}\n	map(select(length==1))|length	-c --stream -s -e	2\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s	6\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":\n1,\n"b":[2,\n3]}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	6\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	input_line_number	-c --stream -s	4\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	input_line_number	-c --stream -s -n	0\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	input_line_number	-c --stream -s -e	4\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	[., input_line_number]	-c --stream -s	[[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]],4]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	[., input_line_number]	-c --stream -s -e	[[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]],4]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	first	-c --stream -s	[["a"],1]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	first	-c --stream -s -n	null\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	first	-c --stream -s -e	[["a"],1]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	last	-c --stream -s	[["b"]]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	last	-c --stream -s -n	null\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	last	-c --stream -s -e	[["b"]]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	tojson	-c --stream -s	"[[[\\"a\\"],1],[[\\"b\\",0],2],[[\\"b\\",1],3],[[\\"b\\",1]],[[\\"b\\"]]]"\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	tojson	-c --stream -s -n	"null"\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	tojson	-c --stream -s -e	"[[[\\"a\\"],1],[[\\"b\\",0],2],[[\\"b\\",1],3],[[\\"b\\",1]],[[\\"b\\"]]]"\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	map(.[0])|unique	-c --stream -s	[["a"],["b"],["b",0],["b",1]]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":\n1,\n"b":[2,\n3]}\n	map(.[0])|unique	-c --stream -s -e	[["a"],["b"],["b",0],["b",1]]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	try input catch "E"	-c --stream -s	"E"\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	try input catch "E"	-c --stream -s -n	[[["a"],1],[["b",0],2],[["b",1],3],[["b",1]],[["b"]]]\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	[inputs]|length	-c --stream -s	0\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	[inputs]|length	-c --stream -s -n	1\n		0
+{"a":\n1,\n"b":[2,\n3]}\n	[inputs]|length	-c --stream -s -e	0\n		0
+{"a":1,"a":2}\n	.	-c --stream -s	[[["a"],1],[["a"],2],[["a"]]]\n		0
+{"a":1,"a":2}\n	.	-c --stream -s -n	null\n		0
+{"a":1,"a":2}\n	.	-c --stream -s -e	[[["a"],1],[["a"],2],[["a"]]]\n		0
+{"a":1,"a":2}\n	length	-c --stream -s	3\n		0
+{"a":1,"a":2}\n	length	-c --stream -s -n	0\n		0
+{"a":1,"a":2}\n	length	-c --stream -s -e	3\n		0
+{"a":1,"a":2}\n	.[0]	-c --stream -s	[["a"],1]\n		0
+{"a":1,"a":2}\n	.[0]	-c --stream -s -n	null\n		0
+{"a":1,"a":2}\n	.[0]	-c --stream -s -e	[["a"],1]\n		0
+{"a":1,"a":2}\n	[limit(5;.[])]	-c --stream -s	[[["a"],1],[["a"],2],[["a"]]]\n		0
+{"a":1,"a":2}\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1,"a":2}\n	[limit(5;.[])]	-c --stream -s -e	[[["a"],1],[["a"],2],[["a"]]]\n		0
+{"a":1,"a":2}\n	map(select(length==2))|length	-c --stream -s	2\n		0
+{"a":1,"a":2}\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1,"a":2}\n	map(select(length==2))|length	-c --stream -s -e	2\n		0
+{"a":1,"a":2}\n	map(select(length==1))|length	-c --stream -s	1\n		0
+{"a":1,"a":2}\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1,"a":2}\n	map(select(length==1))|length	-c --stream -s -e	1\n		0
+{"a":1,"a":2}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s	3\n		0
+{"a":1,"a":2}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1,"a":2}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	3\n		0
+{"a":1,"a":2}\n	input_line_number	-c --stream -s	1\n		0
+{"a":1,"a":2}\n	input_line_number	-c --stream -s -n	0\n		0
+{"a":1,"a":2}\n	input_line_number	-c --stream -s -e	1\n		0
+{"a":1,"a":2}\n	[., input_line_number]	-c --stream -s	[[[["a"],1],[["a"],2],[["a"]]],1]\n		0
+{"a":1,"a":2}\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+{"a":1,"a":2}\n	[., input_line_number]	-c --stream -s -e	[[[["a"],1],[["a"],2],[["a"]]],1]\n		0
+{"a":1,"a":2}\n	first	-c --stream -s	[["a"],1]\n		0
+{"a":1,"a":2}\n	first	-c --stream -s -n	null\n		0
+{"a":1,"a":2}\n	first	-c --stream -s -e	[["a"],1]\n		0
+{"a":1,"a":2}\n	last	-c --stream -s	[["a"]]\n		0
+{"a":1,"a":2}\n	last	-c --stream -s -n	null\n		0
+{"a":1,"a":2}\n	last	-c --stream -s -e	[["a"]]\n		0
+{"a":1,"a":2}\n	tojson	-c --stream -s	"[[[\\"a\\"],1],[[\\"a\\"],2],[[\\"a\\"]]]"\n		0
+{"a":1,"a":2}\n	tojson	-c --stream -s -n	"null"\n		0
+{"a":1,"a":2}\n	tojson	-c --stream -s -e	"[[[\\"a\\"],1],[[\\"a\\"],2],[[\\"a\\"]]]"\n		0
+{"a":1,"a":2}\n	map(.[0])|unique	-c --stream -s	[["a"]]\n		0
+{"a":1,"a":2}\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1,"a":2}\n	map(.[0])|unique	-c --stream -s -e	[["a"]]\n		0
+{"a":1,"a":2}\n	try input catch "E"	-c --stream -s	"E"\n		0
+{"a":1,"a":2}\n	try input catch "E"	-c --stream -s -n	[[["a"],1],[["a"],2],[["a"]]]\n		0
+{"a":1,"a":2}\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+{"a":1,"a":2}\n	[inputs]|length	-c --stream -s	0\n		0
+{"a":1,"a":2}\n	[inputs]|length	-c --stream -s -n	1\n		0
+{"a":1,"a":2}\n	[inputs]|length	-c --stream -s -e	0\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	.	-c --stream -s	[[["a","b","c",0],1],[["a","b","c",1,"d"],2],[["a","b","c",1,"d"]],[["a","b","c",1]],[["a","b","c"]],[["a","b"]],[["a"]],[[0,0],[]],[[0,0]],[[0]],[[],{}]]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	.	-c --stream -s -n	null\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	.	-c --stream -s -e	[[["a","b","c",0],1],[["a","b","c",1,"d"],2],[["a","b","c",1,"d"]],[["a","b","c",1]],[["a","b","c"]],[["a","b"]],[["a"]],[[0,0],[]],[[0,0]],[[0]],[[],{}]]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	length	-c --stream -s	11\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	length	-c --stream -s -n	0\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	length	-c --stream -s -e	11\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	.[0]	-c --stream -s	[["a","b","c",0],1]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	.[0]	-c --stream -s -n	null\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	.[0]	-c --stream -s -e	[["a","b","c",0],1]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[limit(5;.[])]	-c --stream -s	[[["a","b","c",0],1],[["a","b","c",1,"d"],2],[["a","b","c",1,"d"]],[["a","b","c",1]],[["a","b","c"]]]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[limit(5;.[])]	-c --stream -s -e	[[["a","b","c",0],1],[["a","b","c",1,"d"],2],[["a","b","c",1,"d"]],[["a","b","c",1]],[["a","b","c"]]]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	map(select(length==2))|length	-c --stream -s	4\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	map(select(length==2))|length	-c --stream -s -e	4\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	map(select(length==1))|length	-c --stream -s	7\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	map(select(length==1))|length	-c --stream -s -e	7\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: error (at <stdin>:3): number (3) and array ([]) cannot be added\n	5
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: error (at <stdin>:3): number (3) and array ([]) cannot be added\n	5
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	input_line_number	-c --stream -s	3\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	input_line_number	-c --stream -s -n	0\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	input_line_number	-c --stream -s -e	3\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[., input_line_number]	-c --stream -s	[[[["a","b","c",0],1],[["a","b","c",1,"d"],2],[["a","b","c",1,"d"]],[["a","b","c",1]],[["a","b","c"]],[["a","b"]],[["a"]],[[0,0],[]],[[0,0]],[[0]],[[],{}]],3]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[., input_line_number]	-c --stream -s -e	[[[["a","b","c",0],1],[["a","b","c",1,"d"],2],[["a","b","c",1,"d"]],[["a","b","c",1]],[["a","b","c"]],[["a","b"]],[["a"]],[[0,0],[]],[[0,0]],[[0]],[[],{}]],3]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	first	-c --stream -s	[["a","b","c",0],1]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	first	-c --stream -s -n	null\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	first	-c --stream -s -e	[["a","b","c",0],1]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	last	-c --stream -s	[[],{}]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	last	-c --stream -s -n	null\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	last	-c --stream -s -e	[[],{}]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	tojson	-c --stream -s	"[[[\\"a\\",\\"b\\",\\"c\\",0],1],[[\\"a\\",\\"b\\",\\"c\\",1,\\"d\\"],2],[[\\"a\\",\\"b\\",\\"c\\",1,\\"d\\"]],[[\\"a\\",\\"b\\",\\"c\\",1]],[[\\"a\\",\\"b\\",\\"c\\"]],[[\\"a\\",\\"b\\"]],[[\\"a\\"]],[[0,0],[]],[[0,0]],[[0]],[[],{}]]"\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	tojson	-c --stream -s -n	"null"\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	tojson	-c --stream -s -e	"[[[\\"a\\",\\"b\\",\\"c\\",0],1],[[\\"a\\",\\"b\\",\\"c\\",1,\\"d\\"],2],[[\\"a\\",\\"b\\",\\"c\\",1,\\"d\\"]],[[\\"a\\",\\"b\\",\\"c\\",1]],[[\\"a\\",\\"b\\",\\"c\\"]],[[\\"a\\",\\"b\\"]],[[\\"a\\"]],[[0,0],[]],[[0,0]],[[0]],[[],{}]]"\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	map(.[0])|unique	-c --stream -s	[[],[0],[0,0],["a"],["a","b"],["a","b","c"],["a","b","c",0],["a","b","c",1],["a","b","c",1,"d"]]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	map(.[0])|unique	-c --stream -s -e	[[],[0],[0,0],["a"],["a","b"],["a","b","c"],["a","b","c",0],["a","b","c",1],["a","b","c",1,"d"]]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	try input catch "E"	-c --stream -s	"E"\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	try input catch "E"	-c --stream -s -n	[[["a","b","c",0],1],[["a","b","c",1,"d"],2],[["a","b","c",1,"d"]],[["a","b","c",1]],[["a","b","c"]],[["a","b"]],[["a"]],[[0,0],[]],[[0,0]],[[0]],[[],{}]]\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[inputs]|length	-c --stream -s	0\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[inputs]|length	-c --stream -s -n	1\n		0
+{"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[inputs]|length	-c --stream -s -e	0\n		0
+{"a":1}	.	-c --stream -s	[[["a"],1]]\n[["a"]]\n		0
+{"a":1}	.	-c --stream -s -n	null\n		0
+{"a":1}	.	-c --stream -s -e	[[["a"],1]]\n[["a"]]\n		0
+{"a":1}	length	-c --stream -s	1\n1\n		0
+{"a":1}	length	-c --stream -s -n	0\n		0
+{"a":1}	length	-c --stream -s -e	1\n1\n		0
+{"a":1}	.[0]	-c --stream -s	[["a"],1]\n["a"]\n		0
+{"a":1}	.[0]	-c --stream -s -n	null\n		0
+{"a":1}	.[0]	-c --stream -s -e	[["a"],1]\n["a"]\n		0
+{"a":1}	[limit(5;.[])]	-c --stream -s	[[["a"],1]]\n[["a"]]\n		0
+{"a":1}	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}	[limit(5;.[])]	-c --stream -s -e	[[["a"],1]]\n[["a"]]\n		0
+{"a":1}	map(select(length==2))|length	-c --stream -s	1\n0\n		0
+{"a":1}	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}	map(select(length==2))|length	-c --stream -s -e	1\n0\n		0
+{"a":1}	map(select(length==1))|length	-c --stream -s	0\n1\n		0
+{"a":1}	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}	map(select(length==1))|length	-c --stream -s -e	0\n1\n		0
+{"a":1}	[.[]|select(length==2)|.[1]]|add	-c --stream -s	1\nnull\n		0
+{"a":1}	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	1\nnull\n		1
+{"a":1}	input_line_number	-c --stream -s	0\n0\n		0
+{"a":1}	input_line_number	-c --stream -s -n	0\n		0
+{"a":1}	input_line_number	-c --stream -s -e	0\n0\n		0
+{"a":1}	[., input_line_number]	-c --stream -s	[[[["a"],1]],0]\n[[["a"]],0]\n		0
+{"a":1}	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+{"a":1}	[., input_line_number]	-c --stream -s -e	[[[["a"],1]],0]\n[[["a"]],0]\n		0
+{"a":1}	first	-c --stream -s	[["a"],1]\n["a"]\n		0
+{"a":1}	first	-c --stream -s -n	null\n		0
+{"a":1}	first	-c --stream -s -e	[["a"],1]\n["a"]\n		0
+{"a":1}	last	-c --stream -s	[["a"],1]\n["a"]\n		0
+{"a":1}	last	-c --stream -s -n	null\n		0
+{"a":1}	last	-c --stream -s -e	[["a"],1]\n["a"]\n		0
+{"a":1}	tojson	-c --stream -s	"[[[\\"a\\"],1]]"\n"[[\\"a\\"]]"\n		0
+{"a":1}	tojson	-c --stream -s -n	"null"\n		0
+{"a":1}	tojson	-c --stream -s -e	"[[[\\"a\\"],1]]"\n"[[\\"a\\"]]"\n		0
+{"a":1}	map(.[0])|unique	-c --stream -s	[["a"]]\n["a"]\n		0
+{"a":1}	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}	map(.[0])|unique	-c --stream -s -e	[["a"]]\n["a"]\n		0
+{"a":1}	try input catch "E"	-c --stream -s	[["a"]]\n		0
+{"a":1}	try input catch "E"	-c --stream -s -n	[[["a"],1]]\n		0
+{"a":1}	try input catch "E"	-c --stream -s -e	[["a"]]\n		0
+{"a":1}	[inputs]|length	-c --stream -s	1\n		0
+{"a":1}	[inputs]|length	-c --stream -s -n	2\n		0
+{"a":1}	[inputs]|length	-c --stream -s -e	1\n		0
+\n\n[1]\n\n{"a":[]}\n	.	-c --stream -s	[[[0],1],[[0]],[["a"],[]],[["a"]]]\n		0
+\n\n[1]\n\n{"a":[]}\n	.	-c --stream -s -n	null\n		0
+\n\n[1]\n\n{"a":[]}\n	.	-c --stream -s -e	[[[0],1],[[0]],[["a"],[]],[["a"]]]\n		0
+\n\n[1]\n\n{"a":[]}\n	length	-c --stream -s	4\n		0
+\n\n[1]\n\n{"a":[]}\n	length	-c --stream -s -n	0\n		0
+\n\n[1]\n\n{"a":[]}\n	length	-c --stream -s -e	4\n		0
+\n\n[1]\n\n{"a":[]}\n	.[0]	-c --stream -s	[[0],1]\n		0
+\n\n[1]\n\n{"a":[]}\n	.[0]	-c --stream -s -n	null\n		0
+\n\n[1]\n\n{"a":[]}\n	.[0]	-c --stream -s -e	[[0],1]\n		0
+\n\n[1]\n\n{"a":[]}\n	[limit(5;.[])]	-c --stream -s	[[[0],1],[[0]],[["a"],[]],[["a"]]]\n		0
+\n\n[1]\n\n{"a":[]}\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\n\n[1]\n\n{"a":[]}\n	[limit(5;.[])]	-c --stream -s -e	[[[0],1],[[0]],[["a"],[]],[["a"]]]\n		0
+\n\n[1]\n\n{"a":[]}\n	map(select(length==2))|length	-c --stream -s	2\n		0
+\n\n[1]\n\n{"a":[]}\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\n\n[1]\n\n{"a":[]}\n	map(select(length==2))|length	-c --stream -s -e	2\n		0
+\n\n[1]\n\n{"a":[]}\n	map(select(length==1))|length	-c --stream -s	2\n		0
+\n\n[1]\n\n{"a":[]}\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\n\n[1]\n\n{"a":[]}\n	map(select(length==1))|length	-c --stream -s -e	2\n		0
+\n\n[1]\n\n{"a":[]}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: error (at <stdin>:5): number (1) and array ([]) cannot be added\n	5
+\n\n[1]\n\n{"a":[]}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\n\n[1]\n\n{"a":[]}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: error (at <stdin>:5): number (1) and array ([]) cannot be added\n	5
+\n\n[1]\n\n{"a":[]}\n	input_line_number	-c --stream -s	5\n		0
+\n\n[1]\n\n{"a":[]}\n	input_line_number	-c --stream -s -n	0\n		0
+\n\n[1]\n\n{"a":[]}\n	input_line_number	-c --stream -s -e	5\n		0
+\n\n[1]\n\n{"a":[]}\n	[., input_line_number]	-c --stream -s	[[[[0],1],[[0]],[["a"],[]],[["a"]]],5]\n		0
+\n\n[1]\n\n{"a":[]}\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+\n\n[1]\n\n{"a":[]}\n	[., input_line_number]	-c --stream -s -e	[[[[0],1],[[0]],[["a"],[]],[["a"]]],5]\n		0
+\n\n[1]\n\n{"a":[]}\n	first	-c --stream -s	[[0],1]\n		0
+\n\n[1]\n\n{"a":[]}\n	first	-c --stream -s -n	null\n		0
+\n\n[1]\n\n{"a":[]}\n	first	-c --stream -s -e	[[0],1]\n		0
+\n\n[1]\n\n{"a":[]}\n	last	-c --stream -s	[["a"]]\n		0
+\n\n[1]\n\n{"a":[]}\n	last	-c --stream -s -n	null\n		0
+\n\n[1]\n\n{"a":[]}\n	last	-c --stream -s -e	[["a"]]\n		0
+\n\n[1]\n\n{"a":[]}\n	tojson	-c --stream -s	"[[[0],1],[[0]],[[\\"a\\"],[]],[[\\"a\\"]]]"\n		0
+\n\n[1]\n\n{"a":[]}\n	tojson	-c --stream -s -n	"null"\n		0
+\n\n[1]\n\n{"a":[]}\n	tojson	-c --stream -s -e	"[[[0],1],[[0]],[[\\"a\\"],[]],[[\\"a\\"]]]"\n		0
+\n\n[1]\n\n{"a":[]}\n	map(.[0])|unique	-c --stream -s	[[0],["a"]]\n		0
+\n\n[1]\n\n{"a":[]}\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\n\n[1]\n\n{"a":[]}\n	map(.[0])|unique	-c --stream -s -e	[[0],["a"]]\n		0
+\n\n[1]\n\n{"a":[]}\n	try input catch "E"	-c --stream -s	"E"\n		0
+\n\n[1]\n\n{"a":[]}\n	try input catch "E"	-c --stream -s -n	[[[0],1],[[0]],[["a"],[]],[["a"]]]\n		0
+\n\n[1]\n\n{"a":[]}\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+\n\n[1]\n\n{"a":[]}\n	[inputs]|length	-c --stream -s	0\n		0
+\n\n[1]\n\n{"a":[]}\n	[inputs]|length	-c --stream -s -n	1\n		0
+\n\n[1]\n\n{"a":[]}\n	[inputs]|length	-c --stream -s -e	0\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	.	-c --stream -s -n	null\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	length	-c --stream -s	257\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	length	-c --stream -s -n	0\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	length	-c --stream -s -e	257\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	.[0]	-c --stream -s	[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[]]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	.[0]	-c --stream -s -n	null\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	.[0]	-c --stream -s -e	[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[]]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	[limit(5;.[])]	-c --stream -s	[[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[]],[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]],[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]],[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]],[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]]]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	[limit(5;.[])]	-c --stream -s -e	[[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[]],[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]],[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]],[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]],[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]]]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	map(select(length==2))|length	-c --stream -s	1\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	map(select(length==2))|length	-c --stream -s -e	1\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	map(select(length==1))|length	-c --stream -s	256\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	map(select(length==1))|length	-c --stream -s -e	256\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s	[]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	[]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	input_line_number	-c --stream -s	1\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	input_line_number	-c --stream -s -n	0\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	input_line_number	-c --stream -s -e	1\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	first	-c --stream -s	[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[]]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	first	-c --stream -s -n	null\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	first	-c --stream -s -e	[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[]]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	last	-c --stream -s	[[0]]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	last	-c --stream -s -n	null\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	last	-c --stream -s -e	[[0]]\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	tojson	-c --stream -s -n	"null"\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	try input catch "E"	-c --stream -s	"E"\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	[inputs]|length	-c --stream -s	0\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	[inputs]|length	-c --stream -s -n	1\n		0
+[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n	[inputs]|length	-c --stream -s -e	0\n		0
+[]\n{}\n[[],{}]\n	.	-c --stream -s	[[[],[]],[[],{}],[[0],[]],[[1],{}],[[1]]]\n		0
+[]\n{}\n[[],{}]\n	.	-c --stream -s -n	null\n		0
+[]\n{}\n[[],{}]\n	.	-c --stream -s -e	[[[],[]],[[],{}],[[0],[]],[[1],{}],[[1]]]\n		0
+[]\n{}\n[[],{}]\n	length	-c --stream -s	5\n		0
+[]\n{}\n[[],{}]\n	length	-c --stream -s -n	0\n		0
+[]\n{}\n[[],{}]\n	length	-c --stream -s -e	5\n		0
+[]\n{}\n[[],{}]\n	.[0]	-c --stream -s	[[],[]]\n		0
+[]\n{}\n[[],{}]\n	.[0]	-c --stream -s -n	null\n		0
+[]\n{}\n[[],{}]\n	.[0]	-c --stream -s -e	[[],[]]\n		0
+[]\n{}\n[[],{}]\n	[limit(5;.[])]	-c --stream -s	[[[],[]],[[],{}],[[0],[]],[[1],{}],[[1]]]\n		0
+[]\n{}\n[[],{}]\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[]\n{}\n[[],{}]\n	[limit(5;.[])]	-c --stream -s -e	[[[],[]],[[],{}],[[0],[]],[[1],{}],[[1]]]\n		0
+[]\n{}\n[[],{}]\n	map(select(length==2))|length	-c --stream -s	4\n		0
+[]\n{}\n[[],{}]\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[]\n{}\n[[],{}]\n	map(select(length==2))|length	-c --stream -s -e	4\n		0
+[]\n{}\n[[],{}]\n	map(select(length==1))|length	-c --stream -s	1\n		0
+[]\n{}\n[[],{}]\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[]\n{}\n[[],{}]\n	map(select(length==1))|length	-c --stream -s -e	1\n		0
+[]\n{}\n[[],{}]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: error (at <stdin>:3): array ([]) and object ({}) cannot be added\n	5
+[]\n{}\n[[],{}]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[]\n{}\n[[],{}]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: error (at <stdin>:3): array ([]) and object ({}) cannot be added\n	5
+[]\n{}\n[[],{}]\n	input_line_number	-c --stream -s	3\n		0
+[]\n{}\n[[],{}]\n	input_line_number	-c --stream -s -n	0\n		0
+[]\n{}\n[[],{}]\n	input_line_number	-c --stream -s -e	3\n		0
+[]\n{}\n[[],{}]\n	[., input_line_number]	-c --stream -s	[[[[],[]],[[],{}],[[0],[]],[[1],{}],[[1]]],3]\n		0
+[]\n{}\n[[],{}]\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+[]\n{}\n[[],{}]\n	[., input_line_number]	-c --stream -s -e	[[[[],[]],[[],{}],[[0],[]],[[1],{}],[[1]]],3]\n		0
+[]\n{}\n[[],{}]\n	first	-c --stream -s	[[],[]]\n		0
+[]\n{}\n[[],{}]\n	first	-c --stream -s -n	null\n		0
+[]\n{}\n[[],{}]\n	first	-c --stream -s -e	[[],[]]\n		0
+[]\n{}\n[[],{}]\n	last	-c --stream -s	[[1]]\n		0
+[]\n{}\n[[],{}]\n	last	-c --stream -s -n	null\n		0
+[]\n{}\n[[],{}]\n	last	-c --stream -s -e	[[1]]\n		0
+[]\n{}\n[[],{}]\n	tojson	-c --stream -s	"[[[],[]],[[],{}],[[0],[]],[[1],{}],[[1]]]"\n		0
+[]\n{}\n[[],{}]\n	tojson	-c --stream -s -n	"null"\n		0
+[]\n{}\n[[],{}]\n	tojson	-c --stream -s -e	"[[[],[]],[[],{}],[[0],[]],[[1],{}],[[1]]]"\n		0
+[]\n{}\n[[],{}]\n	map(.[0])|unique	-c --stream -s	[[],[0],[1]]\n		0
+[]\n{}\n[[],{}]\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[]\n{}\n[[],{}]\n	map(.[0])|unique	-c --stream -s -e	[[],[0],[1]]\n		0
+[]\n{}\n[[],{}]\n	try input catch "E"	-c --stream -s	"E"\n		0
+[]\n{}\n[[],{}]\n	try input catch "E"	-c --stream -s -n	[[[],[]],[[],{}],[[0],[]],[[1],{}],[[1]]]\n		0
+[]\n{}\n[[],{}]\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+[]\n{}\n[[],{}]\n	[inputs]|length	-c --stream -s	0\n		0
+[]\n{}\n[[],{}]\n	[inputs]|length	-c --stream -s -n	1\n		0
+[]\n{}\n[[],{}]\n	[inputs]|length	-c --stream -s -e	0\n		0
+{"a":1}\r\n[2]\r\n	.	-c --stream -s	[[["a"],1],[["a"]],[[0],2],[[0]]]\n		0
+{"a":1}\r\n[2]\r\n	.	-c --stream -s -n	null\n		0
+{"a":1}\r\n[2]\r\n	.	-c --stream -s -e	[[["a"],1],[["a"]],[[0],2],[[0]]]\n		0
+{"a":1}\r\n[2]\r\n	length	-c --stream -s	4\n		0
+{"a":1}\r\n[2]\r\n	length	-c --stream -s -n	0\n		0
+{"a":1}\r\n[2]\r\n	length	-c --stream -s -e	4\n		0
+{"a":1}\r\n[2]\r\n	.[0]	-c --stream -s	[["a"],1]\n		0
+{"a":1}\r\n[2]\r\n	.[0]	-c --stream -s -n	null\n		0
+{"a":1}\r\n[2]\r\n	.[0]	-c --stream -s -e	[["a"],1]\n		0
+{"a":1}\r\n[2]\r\n	[limit(5;.[])]	-c --stream -s	[[["a"],1],[["a"]],[[0],2],[[0]]]\n		0
+{"a":1}\r\n[2]\r\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}\r\n[2]\r\n	[limit(5;.[])]	-c --stream -s -e	[[["a"],1],[["a"]],[[0],2],[[0]]]\n		0
+{"a":1}\r\n[2]\r\n	map(select(length==2))|length	-c --stream -s	2\n		0
+{"a":1}\r\n[2]\r\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}\r\n[2]\r\n	map(select(length==2))|length	-c --stream -s -e	2\n		0
+{"a":1}\r\n[2]\r\n	map(select(length==1))|length	-c --stream -s	2\n		0
+{"a":1}\r\n[2]\r\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}\r\n[2]\r\n	map(select(length==1))|length	-c --stream -s -e	2\n		0
+{"a":1}\r\n[2]\r\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s	3\n		0
+{"a":1}\r\n[2]\r\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}\r\n[2]\r\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	3\n		0
+{"a":1}\r\n[2]\r\n	input_line_number	-c --stream -s	2\n		0
+{"a":1}\r\n[2]\r\n	input_line_number	-c --stream -s -n	0\n		0
+{"a":1}\r\n[2]\r\n	input_line_number	-c --stream -s -e	2\n		0
+{"a":1}\r\n[2]\r\n	[., input_line_number]	-c --stream -s	[[[["a"],1],[["a"]],[[0],2],[[0]]],2]\n		0
+{"a":1}\r\n[2]\r\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+{"a":1}\r\n[2]\r\n	[., input_line_number]	-c --stream -s -e	[[[["a"],1],[["a"]],[[0],2],[[0]]],2]\n		0
+{"a":1}\r\n[2]\r\n	first	-c --stream -s	[["a"],1]\n		0
+{"a":1}\r\n[2]\r\n	first	-c --stream -s -n	null\n		0
+{"a":1}\r\n[2]\r\n	first	-c --stream -s -e	[["a"],1]\n		0
+{"a":1}\r\n[2]\r\n	last	-c --stream -s	[[0]]\n		0
+{"a":1}\r\n[2]\r\n	last	-c --stream -s -n	null\n		0
+{"a":1}\r\n[2]\r\n	last	-c --stream -s -e	[[0]]\n		0
+{"a":1}\r\n[2]\r\n	tojson	-c --stream -s	"[[[\\"a\\"],1],[[\\"a\\"]],[[0],2],[[0]]]"\n		0
+{"a":1}\r\n[2]\r\n	tojson	-c --stream -s -n	"null"\n		0
+{"a":1}\r\n[2]\r\n	tojson	-c --stream -s -e	"[[[\\"a\\"],1],[[\\"a\\"]],[[0],2],[[0]]]"\n		0
+{"a":1}\r\n[2]\r\n	map(.[0])|unique	-c --stream -s	[[0],["a"]]\n		0
+{"a":1}\r\n[2]\r\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}\r\n[2]\r\n	map(.[0])|unique	-c --stream -s -e	[[0],["a"]]\n		0
+{"a":1}\r\n[2]\r\n	try input catch "E"	-c --stream -s	"E"\n		0
+{"a":1}\r\n[2]\r\n	try input catch "E"	-c --stream -s -n	[[["a"],1],[["a"]],[[0],2],[[0]]]\n		0
+{"a":1}\r\n[2]\r\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+{"a":1}\r\n[2]\r\n	[inputs]|length	-c --stream -s	0\n		0
+{"a":1}\r\n[2]\r\n	[inputs]|length	-c --stream -s -n	1\n		0
+{"a":1}\r\n[2]\r\n	[inputs]|length	-c --stream -s -e	0\n		0
+[1,2]\n{"a":1}\n}	.	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	.	-c --stream -s -n	null\n		0
+[1,2]\n{"a":1}\n}	.	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	length	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	length	-c --stream -s -n	0\n		0
+[1,2]\n{"a":1}\n}	length	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	.[0]	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	.[0]	-c --stream -s -n	null\n		0
+[1,2]\n{"a":1}\n}	.[0]	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[limit(5;.[])]	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n{"a":1}\n}	[limit(5;.[])]	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	map(select(length==2))|length	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n{"a":1}\n}	map(select(length==2))|length	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	map(select(length==1))|length	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n{"a":1}\n}	map(select(length==1))|length	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n{"a":1}\n}	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	input_line_number	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	input_line_number	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[., input_line_number]	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[., input_line_number]	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	first	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	first	-c --stream -s -n	null\n		0
+[1,2]\n{"a":1}\n}	first	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	last	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	last	-c --stream -s -n	null\n		0
+[1,2]\n{"a":1}\n}	last	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	tojson	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	tojson	-c --stream -s -n	"null"\n		0
+[1,2]\n{"a":1}\n}	tojson	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	map(.[0])|unique	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n{"a":1}\n}	map(.[0])|unique	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	try input catch "E"	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	try input catch "E"	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[inputs]|length	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[inputs]|length	-c --stream -s -n		jq: error (at <stdin>:2): Unmatched '}' at the top-level at line 3, column 1\n	5
+[1,2]\n{"a":1}\n}	[inputs]|length	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 3, column 1\n	5
+[1]\n{"a" 2}\n[3]\n	.	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	.	-c --stream -s -n	null\n		0
+[1]\n{"a" 2}\n[3]\n	.	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	length	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	length	-c --stream -s -n	0\n		0
+[1]\n{"a" 2}\n[3]\n	length	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	.[0]	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	.[0]	-c --stream -s -n	null\n		0
+[1]\n{"a" 2}\n[3]\n	.[0]	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	[limit(5;.[])]	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1]\n{"a" 2}\n[3]\n	[limit(5;.[])]	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	map(select(length==2))|length	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1]\n{"a" 2}\n[3]\n	map(select(length==2))|length	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	map(select(length==1))|length	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1]\n{"a" 2}\n[3]\n	map(select(length==1))|length	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1]\n{"a" 2}\n[3]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	input_line_number	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	input_line_number	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	[., input_line_number]	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	[., input_line_number]	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	first	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	first	-c --stream -s -n	null\n		0
+[1]\n{"a" 2}\n[3]\n	first	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	last	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	last	-c --stream -s -n	null\n		0
+[1]\n{"a" 2}\n[3]\n	last	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	tojson	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	tojson	-c --stream -s -n	"null"\n		0
+[1]\n{"a" 2}\n[3]\n	tojson	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	map(.[0])|unique	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1]\n{"a" 2}\n[3]\n	map(.[0])|unique	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	try input catch "E"	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	try input catch "E"	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	[inputs]|length	-c --stream -s		jq: parse error: Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	[inputs]|length	-c --stream -s -n		jq: error (at <stdin>:2): Expected separator between values at line 2, column 7\n	5
+[1]\n{"a" 2}\n[3]\n	[inputs]|length	-c --stream -s -e		jq: parse error: Expected separator between values at line 2, column 7\n	5
+{"a":[1,2	.	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	.	-c --stream -s -n	null\n		0
+{"a":[1,2	.	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	length	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	length	-c --stream -s -n	0\n		0
+{"a":[1,2	length	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	.[0]	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	.[0]	-c --stream -s -n	null\n		0
+{"a":[1,2	.[0]	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[limit(5;.[])]	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":[1,2	[limit(5;.[])]	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	map(select(length==2))|length	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":[1,2	map(select(length==2))|length	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	map(select(length==1))|length	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":[1,2	map(select(length==1))|length	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":[1,2	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	input_line_number	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	input_line_number	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[., input_line_number]	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[., input_line_number]	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	first	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	first	-c --stream -s -n	null\n		0
+{"a":[1,2	first	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	last	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	last	-c --stream -s -n	null\n		0
+{"a":[1,2	last	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	tojson	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	tojson	-c --stream -s -n	"null"\n		0
+{"a":[1,2	tojson	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	map(.[0])|unique	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":[1,2	map(.[0])|unique	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	try input catch "E"	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	try input catch "E"	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[inputs]|length	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[inputs]|length	-c --stream -s -n		jq: error (at <stdin>:0): Unfinished JSON term at EOF at line 1, column 9\n	5
+{"a":[1,2	[inputs]|length	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 9\n	5
+"abc\\q"	.	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	.	-c --stream -s -n	null\n		0
+"abc\\q"	.	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	length	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	length	-c --stream -s -n	0\n		0
+"abc\\q"	length	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	.[0]	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	.[0]	-c --stream -s -n	null\n		0
+"abc\\q"	.[0]	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	[limit(5;.[])]	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+"abc\\q"	[limit(5;.[])]	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	map(select(length==2))|length	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+"abc\\q"	map(select(length==2))|length	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	map(select(length==1))|length	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+"abc\\q"	map(select(length==1))|length	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+"abc\\q"	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	input_line_number	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	input_line_number	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	[., input_line_number]	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	[., input_line_number]	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	first	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	first	-c --stream -s -n	null\n		0
+"abc\\q"	first	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	last	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	last	-c --stream -s -n	null\n		0
+"abc\\q"	last	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	tojson	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	tojson	-c --stream -s -n	"null"\n		0
+"abc\\q"	tojson	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	map(.[0])|unique	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+"abc\\q"	map(.[0])|unique	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	try input catch "E"	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	try input catch "E"	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	[inputs]|length	-c --stream -s		jq: parse error: Invalid escape at line 1, column 7\n	5
+"abc\\q"	[inputs]|length	-c --stream -s -n		jq: error (at <stdin>:0): Invalid escape at line 1, column 7\n	5
+"abc\\q"	[inputs]|length	-c --stream -s -e		jq: parse error: Invalid escape at line 1, column 7\n	5
+[1,2]]	.	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	.	-c --stream -s -n	null\n		0
+[1,2]]	.	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	length	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	length	-c --stream -s -n	0\n		0
+[1,2]]	length	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	.[0]	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	.[0]	-c --stream -s -n	null\n		0
+[1,2]]	.[0]	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[limit(5;.[])]	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]]	[limit(5;.[])]	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	map(select(length==2))|length	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]]	map(select(length==2))|length	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	map(select(length==1))|length	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]]	map(select(length==1))|length	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]]	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	input_line_number	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	input_line_number	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[., input_line_number]	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[., input_line_number]	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	first	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	first	-c --stream -s -n	null\n		0
+[1,2]]	first	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	last	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	last	-c --stream -s -n	null\n		0
+[1,2]]	last	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	tojson	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	tojson	-c --stream -s -n	"null"\n		0
+[1,2]]	tojson	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	map(.[0])|unique	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]]	map(.[0])|unique	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	try input catch "E"	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	try input catch "E"	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[inputs]|length	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[inputs]|length	-c --stream -s -n		jq: error (at <stdin>:0): Unmatched ']' at the top-level at line 1, column 6\n	5
+[1,2]]	[inputs]|length	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 6\n	5
+[1]\n{"x":1,}\n	.	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	.	-c --stream -s -n	null\n		0
+[1]\n{"x":1,}\n	.	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	length	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	length	-c --stream -s -n	0\n		0
+[1]\n{"x":1,}\n	length	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	.[0]	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	.[0]	-c --stream -s -n	null\n		0
+[1]\n{"x":1,}\n	.[0]	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[limit(5;.[])]	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1]\n{"x":1,}\n	[limit(5;.[])]	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	map(select(length==2))|length	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1]\n{"x":1,}\n	map(select(length==2))|length	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	map(select(length==1))|length	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1]\n{"x":1,}\n	map(select(length==1))|length	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1]\n{"x":1,}\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	input_line_number	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	input_line_number	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[., input_line_number]	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[., input_line_number]	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	first	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	first	-c --stream -s -n	null\n		0
+[1]\n{"x":1,}\n	first	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	last	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	last	-c --stream -s -n	null\n		0
+[1]\n{"x":1,}\n	last	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	tojson	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	tojson	-c --stream -s -n	"null"\n		0
+[1]\n{"x":1,}\n	tojson	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	map(.[0])|unique	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1]\n{"x":1,}\n	map(.[0])|unique	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	try input catch "E"	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	try input catch "E"	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[inputs]|length	-c --stream -s		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[inputs]|length	-c --stream -s -n		jq: error (at <stdin>:2): Expected another key:value pair at line 2, column 8\n	5
+[1]\n{"x":1,}\n	[inputs]|length	-c --stream -s -e		jq: parse error: Expected another key:value pair at line 2, column 8\n	5
+\u{feff}[1]\n	.	-c --stream -s	[[[0],1],[[0]]]\n		0
+\u{feff}[1]\n	.	-c --stream -s -n	null\n		0
+\u{feff}[1]\n	.	-c --stream -s -e	[[[0],1],[[0]]]\n		0
+\u{feff}[1]\n	length	-c --stream -s	2\n		0
+\u{feff}[1]\n	length	-c --stream -s -n	0\n		0
+\u{feff}[1]\n	length	-c --stream -s -e	2\n		0
+\u{feff}[1]\n	.[0]	-c --stream -s	[[0],1]\n		0
+\u{feff}[1]\n	.[0]	-c --stream -s -n	null\n		0
+\u{feff}[1]\n	.[0]	-c --stream -s -e	[[0],1]\n		0
+\u{feff}[1]\n	[limit(5;.[])]	-c --stream -s	[[[0],1],[[0]]]\n		0
+\u{feff}[1]\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\u{feff}[1]\n	[limit(5;.[])]	-c --stream -s -e	[[[0],1],[[0]]]\n		0
+\u{feff}[1]\n	map(select(length==2))|length	-c --stream -s	1\n		0
+\u{feff}[1]\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\u{feff}[1]\n	map(select(length==2))|length	-c --stream -s -e	1\n		0
+\u{feff}[1]\n	map(select(length==1))|length	-c --stream -s	1\n		0
+\u{feff}[1]\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\u{feff}[1]\n	map(select(length==1))|length	-c --stream -s -e	1\n		0
+\u{feff}[1]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s	1\n		0
+\u{feff}[1]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\u{feff}[1]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	1\n		0
+\u{feff}[1]\n	input_line_number	-c --stream -s	1\n		0
+\u{feff}[1]\n	input_line_number	-c --stream -s -n	0\n		0
+\u{feff}[1]\n	input_line_number	-c --stream -s -e	1\n		0
+\u{feff}[1]\n	[., input_line_number]	-c --stream -s	[[[[0],1],[[0]]],1]\n		0
+\u{feff}[1]\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+\u{feff}[1]\n	[., input_line_number]	-c --stream -s -e	[[[[0],1],[[0]]],1]\n		0
+\u{feff}[1]\n	first	-c --stream -s	[[0],1]\n		0
+\u{feff}[1]\n	first	-c --stream -s -n	null\n		0
+\u{feff}[1]\n	first	-c --stream -s -e	[[0],1]\n		0
+\u{feff}[1]\n	last	-c --stream -s	[[0]]\n		0
+\u{feff}[1]\n	last	-c --stream -s -n	null\n		0
+\u{feff}[1]\n	last	-c --stream -s -e	[[0]]\n		0
+\u{feff}[1]\n	tojson	-c --stream -s	"[[[0],1],[[0]]]"\n		0
+\u{feff}[1]\n	tojson	-c --stream -s -n	"null"\n		0
+\u{feff}[1]\n	tojson	-c --stream -s -e	"[[[0],1],[[0]]]"\n		0
+\u{feff}[1]\n	map(.[0])|unique	-c --stream -s	[[0]]\n		0
+\u{feff}[1]\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\u{feff}[1]\n	map(.[0])|unique	-c --stream -s -e	[[0]]\n		0
+\u{feff}[1]\n	try input catch "E"	-c --stream -s	"E"\n		0
+\u{feff}[1]\n	try input catch "E"	-c --stream -s -n	[[[0],1],[[0]]]\n		0
+\u{feff}[1]\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+\u{feff}[1]\n	[inputs]|length	-c --stream -s	0\n		0
+\u{feff}[1]\n	[inputs]|length	-c --stream -s -n	1\n		0
+\u{feff}[1]\n	[inputs]|length	-c --stream -s -e	0\n		0
+[1,nan]\n	.	-c --stream -s	[[[0],1],[[1],null],[[1]]]\n		0
+[1,nan]\n	.	-c --stream -s -n	null\n		0
+[1,nan]\n	.	-c --stream -s -e	[[[0],1],[[1],null],[[1]]]\n		0
+[1,nan]\n	length	-c --stream -s	3\n		0
+[1,nan]\n	length	-c --stream -s -n	0\n		0
+[1,nan]\n	length	-c --stream -s -e	3\n		0
+[1,nan]\n	.[0]	-c --stream -s	[[0],1]\n		0
+[1,nan]\n	.[0]	-c --stream -s -n	null\n		0
+[1,nan]\n	.[0]	-c --stream -s -e	[[0],1]\n		0
+[1,nan]\n	[limit(5;.[])]	-c --stream -s	[[[0],1],[[1],null],[[1]]]\n		0
+[1,nan]\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,nan]\n	[limit(5;.[])]	-c --stream -s -e	[[[0],1],[[1],null],[[1]]]\n		0
+[1,nan]\n	map(select(length==2))|length	-c --stream -s	2\n		0
+[1,nan]\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,nan]\n	map(select(length==2))|length	-c --stream -s -e	2\n		0
+[1,nan]\n	map(select(length==1))|length	-c --stream -s	1\n		0
+[1,nan]\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,nan]\n	map(select(length==1))|length	-c --stream -s -e	1\n		0
+[1,nan]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s	null\n		0
+[1,nan]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,nan]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	null\n		0
+[1,nan]\n	input_line_number	-c --stream -s	1\n		0
+[1,nan]\n	input_line_number	-c --stream -s -n	0\n		0
+[1,nan]\n	input_line_number	-c --stream -s -e	1\n		0
+[1,nan]\n	[., input_line_number]	-c --stream -s	[[[[0],1],[[1],null],[[1]]],1]\n		0
+[1,nan]\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+[1,nan]\n	[., input_line_number]	-c --stream -s -e	[[[[0],1],[[1],null],[[1]]],1]\n		0
+[1,nan]\n	first	-c --stream -s	[[0],1]\n		0
+[1,nan]\n	first	-c --stream -s -n	null\n		0
+[1,nan]\n	first	-c --stream -s -e	[[0],1]\n		0
+[1,nan]\n	last	-c --stream -s	[[1]]\n		0
+[1,nan]\n	last	-c --stream -s -n	null\n		0
+[1,nan]\n	last	-c --stream -s -e	[[1]]\n		0
+[1,nan]\n	tojson	-c --stream -s	"[[[0],1],[[1],null],[[1]]]"\n		0
+[1,nan]\n	tojson	-c --stream -s -n	"null"\n		0
+[1,nan]\n	tojson	-c --stream -s -e	"[[[0],1],[[1],null],[[1]]]"\n		0
+[1,nan]\n	map(.[0])|unique	-c --stream -s	[[0],[1]]\n		0
+[1,nan]\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,nan]\n	map(.[0])|unique	-c --stream -s -e	[[0],[1]]\n		0
+[1,nan]\n	try input catch "E"	-c --stream -s	"E"\n		0
+[1,nan]\n	try input catch "E"	-c --stream -s -n	[[[0],1],[[1],null],[[1]]]\n		0
+[1,nan]\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+[1,nan]\n	[inputs]|length	-c --stream -s	0\n		0
+[1,nan]\n	[inputs]|length	-c --stream -s -n	1\n		0
+[1,nan]\n	[inputs]|length	-c --stream -s -e	0\n		0
+[1e1000, 100000000000000000000000000]\n	.	-c --stream -s	[[[0],1E+1000],[[1],100000000000000000000000000],[[1]]]\n		0
+[1e1000, 100000000000000000000000000]\n	.	-c --stream -s -n	null\n		0
+[1e1000, 100000000000000000000000000]\n	.	-c --stream -s -e	[[[0],1E+1000],[[1],100000000000000000000000000],[[1]]]\n		0
+[1e1000, 100000000000000000000000000]\n	length	-c --stream -s	3\n		0
+[1e1000, 100000000000000000000000000]\n	length	-c --stream -s -n	0\n		0
+[1e1000, 100000000000000000000000000]\n	length	-c --stream -s -e	3\n		0
+[1e1000, 100000000000000000000000000]\n	.[0]	-c --stream -s	[[0],1E+1000]\n		0
+[1e1000, 100000000000000000000000000]\n	.[0]	-c --stream -s -n	null\n		0
+[1e1000, 100000000000000000000000000]\n	.[0]	-c --stream -s -e	[[0],1E+1000]\n		0
+[1e1000, 100000000000000000000000000]\n	[limit(5;.[])]	-c --stream -s	[[[0],1E+1000],[[1],100000000000000000000000000],[[1]]]\n		0
+[1e1000, 100000000000000000000000000]\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1e1000, 100000000000000000000000000]\n	[limit(5;.[])]	-c --stream -s -e	[[[0],1E+1000],[[1],100000000000000000000000000],[[1]]]\n		0
+[1e1000, 100000000000000000000000000]\n	map(select(length==2))|length	-c --stream -s	2\n		0
+[1e1000, 100000000000000000000000000]\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1e1000, 100000000000000000000000000]\n	map(select(length==2))|length	-c --stream -s -e	2\n		0
+[1e1000, 100000000000000000000000000]\n	map(select(length==1))|length	-c --stream -s	1\n		0
+[1e1000, 100000000000000000000000000]\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1e1000, 100000000000000000000000000]\n	map(select(length==1))|length	-c --stream -s -e	1\n		0
+[1e1000, 100000000000000000000000000]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s	1.7976931348623157e+308\n		0
+[1e1000, 100000000000000000000000000]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1e1000, 100000000000000000000000000]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	1.7976931348623157e+308\n		0
+[1e1000, 100000000000000000000000000]\n	input_line_number	-c --stream -s	1\n		0
+[1e1000, 100000000000000000000000000]\n	input_line_number	-c --stream -s -n	0\n		0
+[1e1000, 100000000000000000000000000]\n	input_line_number	-c --stream -s -e	1\n		0
+[1e1000, 100000000000000000000000000]\n	[., input_line_number]	-c --stream -s	[[[[0],1E+1000],[[1],100000000000000000000000000],[[1]]],1]\n		0
+[1e1000, 100000000000000000000000000]\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+[1e1000, 100000000000000000000000000]\n	[., input_line_number]	-c --stream -s -e	[[[[0],1E+1000],[[1],100000000000000000000000000],[[1]]],1]\n		0
+[1e1000, 100000000000000000000000000]\n	first	-c --stream -s	[[0],1E+1000]\n		0
+[1e1000, 100000000000000000000000000]\n	first	-c --stream -s -n	null\n		0
+[1e1000, 100000000000000000000000000]\n	first	-c --stream -s -e	[[0],1E+1000]\n		0
+[1e1000, 100000000000000000000000000]\n	last	-c --stream -s	[[1]]\n		0
+[1e1000, 100000000000000000000000000]\n	last	-c --stream -s -n	null\n		0
+[1e1000, 100000000000000000000000000]\n	last	-c --stream -s -e	[[1]]\n		0
+[1e1000, 100000000000000000000000000]\n	tojson	-c --stream -s	"[[[0],1E+1000],[[1],100000000000000000000000000],[[1]]]"\n		0
+[1e1000, 100000000000000000000000000]\n	tojson	-c --stream -s -n	"null"\n		0
+[1e1000, 100000000000000000000000000]\n	tojson	-c --stream -s -e	"[[[0],1E+1000],[[1],100000000000000000000000000],[[1]]]"\n		0
+[1e1000, 100000000000000000000000000]\n	map(.[0])|unique	-c --stream -s	[[0],[1]]\n		0
+[1e1000, 100000000000000000000000000]\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1e1000, 100000000000000000000000000]\n	map(.[0])|unique	-c --stream -s -e	[[0],[1]]\n		0
+[1e1000, 100000000000000000000000000]\n	try input catch "E"	-c --stream -s	"E"\n		0
+[1e1000, 100000000000000000000000000]\n	try input catch "E"	-c --stream -s -n	[[[0],1E+1000],[[1],100000000000000000000000000],[[1]]]\n		0
+[1e1000, 100000000000000000000000000]\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+[1e1000, 100000000000000000000000000]\n	[inputs]|length	-c --stream -s	0\n		0
+[1e1000, 100000000000000000000000000]\n	[inputs]|length	-c --stream -s -n	1\n		0
+[1e1000, 100000000000000000000000000]\n	[inputs]|length	-c --stream -s -e	0\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	.	-c --stream -s	[[[0],"\u{e9}"],[[1],"\u{e9}"],[[2],"\u{1f600}"],[[2]]]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	.	-c --stream -s -n	null\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	.	-c --stream -s -e	[[[0],"\u{e9}"],[[1],"\u{e9}"],[[2],"\u{1f600}"],[[2]]]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	length	-c --stream -s	4\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	length	-c --stream -s -n	0\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	length	-c --stream -s -e	4\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	.[0]	-c --stream -s	[[0],"\u{e9}"]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	.[0]	-c --stream -s -n	null\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	.[0]	-c --stream -s -e	[[0],"\u{e9}"]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[limit(5;.[])]	-c --stream -s	[[[0],"\u{e9}"],[[1],"\u{e9}"],[[2],"\u{1f600}"],[[2]]]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[limit(5;.[])]	-c --stream -s -e	[[[0],"\u{e9}"],[[1],"\u{e9}"],[[2],"\u{1f600}"],[[2]]]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	map(select(length==2))|length	-c --stream -s	3\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	map(select(length==2))|length	-c --stream -s -e	3\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	map(select(length==1))|length	-c --stream -s	1\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	map(select(length==1))|length	-c --stream -s -e	1\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s	"\u{e9}\u{e9}\u{1f600}"\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	"\u{e9}\u{e9}\u{1f600}"\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	input_line_number	-c --stream -s	1\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	input_line_number	-c --stream -s -n	0\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	input_line_number	-c --stream -s -e	1\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[., input_line_number]	-c --stream -s	[[[[0],"\u{e9}"],[[1],"\u{e9}"],[[2],"\u{1f600}"],[[2]]],1]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[., input_line_number]	-c --stream -s -e	[[[[0],"\u{e9}"],[[1],"\u{e9}"],[[2],"\u{1f600}"],[[2]]],1]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	first	-c --stream -s	[[0],"\u{e9}"]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	first	-c --stream -s -n	null\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	first	-c --stream -s -e	[[0],"\u{e9}"]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	last	-c --stream -s	[[2]]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	last	-c --stream -s -n	null\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	last	-c --stream -s -e	[[2]]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	tojson	-c --stream -s	"[[[0],\\"\u{e9}\\"],[[1],\\"\u{e9}\\"],[[2],\\"\u{1f600}\\"],[[2]]]"\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	tojson	-c --stream -s -n	"null"\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	tojson	-c --stream -s -e	"[[[0],\\"\u{e9}\\"],[[1],\\"\u{e9}\\"],[[2],\\"\u{1f600}\\"],[[2]]]"\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	map(.[0])|unique	-c --stream -s	[[0],[1],[2]]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	map(.[0])|unique	-c --stream -s -e	[[0],[1],[2]]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	try input catch "E"	-c --stream -s	"E"\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	try input catch "E"	-c --stream -s -n	[[[0],"\u{e9}"],[[1],"\u{e9}"],[[2],"\u{1f600}"],[[2]]]\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[inputs]|length	-c --stream -s	0\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[inputs]|length	-c --stream -s -n	1\n		0
+["\u{e9}","\\u00e9","\\ud83d\\ude00"]\n	[inputs]|length	-c --stream -s -e	0\n		0
+1 2 }	.	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	.	-c --stream -s -n	null\n		0
+1 2 }	.	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	length	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	length	-c --stream -s -n	0\n		0
+1 2 }	length	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	.[0]	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	.[0]	-c --stream -s -n	null\n		0
+1 2 }	.[0]	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	[limit(5;.[])]	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 2 }	[limit(5;.[])]	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	map(select(length==2))|length	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 2 }	map(select(length==2))|length	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	map(select(length==1))|length	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 2 }	map(select(length==1))|length	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 2 }	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	input_line_number	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	input_line_number	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	[., input_line_number]	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	[., input_line_number]	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	first	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	first	-c --stream -s -n	null\n		0
+1 2 }	first	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	last	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	last	-c --stream -s -n	null\n		0
+1 2 }	last	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	tojson	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	tojson	-c --stream -s -n	"null"\n		0
+1 2 }	tojson	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	map(.[0])|unique	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 2 }	map(.[0])|unique	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	try input catch "E"	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	try input catch "E"	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	[inputs]|length	-c --stream -s		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	[inputs]|length	-c --stream -s -n		jq: error (at <stdin>:0): Unmatched '}' at the top-level at line 1, column 5\n	5
+1 2 }	[inputs]|length	-c --stream -s -e		jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n	5
+[1,{"a":2}] [3	.	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	.	-c --stream -s -n	null\n		0
+[1,{"a":2}] [3	.	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	length	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	length	-c --stream -s -n	0\n		0
+[1,{"a":2}] [3	length	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	.[0]	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	.[0]	-c --stream -s -n	null\n		0
+[1,{"a":2}] [3	.[0]	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	[limit(5;.[])]	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,{"a":2}] [3	[limit(5;.[])]	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	map(select(length==2))|length	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,{"a":2}] [3	map(select(length==2))|length	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	map(select(length==1))|length	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,{"a":2}] [3	map(select(length==1))|length	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,{"a":2}] [3	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	input_line_number	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	input_line_number	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	[., input_line_number]	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	[., input_line_number]	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	first	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	first	-c --stream -s -n	null\n		0
+[1,{"a":2}] [3	first	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	last	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	last	-c --stream -s -n	null\n		0
+[1,{"a":2}] [3	last	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	tojson	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	tojson	-c --stream -s -n	"null"\n		0
+[1,{"a":2}] [3	tojson	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	map(.[0])|unique	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,{"a":2}] [3	map(.[0])|unique	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	try input catch "E"	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	try input catch "E"	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	[inputs]|length	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	[inputs]|length	-c --stream -s -n		jq: error (at <stdin>:0): Unfinished JSON term at EOF at line 1, column 14\n	5
+[1,{"a":2}] [3	[inputs]|length	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 14\n	5
+1 ]	.	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	.	-c --stream -s -n	null\n		0
+1 ]	.	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	length	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	length	-c --stream -s -n	0\n		0
+1 ]	length	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	.[0]	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	.[0]	-c --stream -s -n	null\n		0
+1 ]	.[0]	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	[limit(5;.[])]	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 ]	[limit(5;.[])]	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	map(select(length==2))|length	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 ]	map(select(length==2))|length	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	map(select(length==1))|length	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 ]	map(select(length==1))|length	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 ]	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	input_line_number	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	input_line_number	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	[., input_line_number]	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	[., input_line_number]	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	first	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	first	-c --stream -s -n	null\n		0
+1 ]	first	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	last	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	last	-c --stream -s -n	null\n		0
+1 ]	last	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	tojson	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	tojson	-c --stream -s -n	"null"\n		0
+1 ]	tojson	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	map(.[0])|unique	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+1 ]	map(.[0])|unique	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	try input catch "E"	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	try input catch "E"	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	[inputs]|length	-c --stream -s		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	[inputs]|length	-c --stream -s -n		jq: error (at <stdin>:0): Unmatched ']' at the top-level at line 1, column 3\n	5
+1 ]	[inputs]|length	-c --stream -s -e		jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n	5
+\n	.	-c --stream -s	[]\n		0
+\n	.	-c --stream -s -n	null\n		0
+\n	.	-c --stream -s -e	[]\n		0
+\n	length	-c --stream -s	0\n		0
+\n	length	-c --stream -s -n	0\n		0
+\n	length	-c --stream -s -e	0\n		0
+\n	.[0]	-c --stream -s	null\n		0
+\n	.[0]	-c --stream -s -n	null\n		0
+\n	.[0]	-c --stream -s -e	null\n		1
+\n	[limit(5;.[])]	-c --stream -s	[]\n		0
+\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\n	[limit(5;.[])]	-c --stream -s -e	[]\n		0
+\n	map(select(length==2))|length	-c --stream -s	0\n		0
+\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\n	map(select(length==2))|length	-c --stream -s -e	0\n		0
+\n	map(select(length==1))|length	-c --stream -s	0\n		0
+\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\n	map(select(length==1))|length	-c --stream -s -e	0\n		0
+\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s	null\n		0
+\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	null\n		1
+\n	input_line_number	-c --stream -s	1\n		0
+\n	input_line_number	-c --stream -s -n	0\n		0
+\n	input_line_number	-c --stream -s -e	1\n		0
+\n	[., input_line_number]	-c --stream -s	[[],1]\n		0
+\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+\n	[., input_line_number]	-c --stream -s -e	[[],1]\n		0
+\n	first	-c --stream -s	null\n		0
+\n	first	-c --stream -s -n	null\n		0
+\n	first	-c --stream -s -e	null\n		1
+\n	last	-c --stream -s	null\n		0
+\n	last	-c --stream -s -n	null\n		0
+\n	last	-c --stream -s -e	null\n		1
+\n	tojson	-c --stream -s	"[]"\n		0
+\n	tojson	-c --stream -s -n	"null"\n		0
+\n	tojson	-c --stream -s -e	"[]"\n		0
+\n	map(.[0])|unique	-c --stream -s	[]\n		0
+\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+\n	map(.[0])|unique	-c --stream -s -e	[]\n		0
+\n	try input catch "E"	-c --stream -s	"E"\n		0
+\n	try input catch "E"	-c --stream -s -n	[]\n		0
+\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+\n	[inputs]|length	-c --stream -s	0\n		0
+\n	[inputs]|length	-c --stream -s -n	1\n		0
+\n	[inputs]|length	-c --stream -s -e	0\n		0
+[1,2]\n[3,4]\n	.	-c --stream -s	[[[0],1],[[1],2],[[1]],[[0],3],[[1],4],[[1]]]\n		0
+[1,2]\n[3,4]\n	.	-c --stream -s -n	null\n		0
+[1,2]\n[3,4]\n	.	-c --stream -s -e	[[[0],1],[[1],2],[[1]],[[0],3],[[1],4],[[1]]]\n		0
+[1,2]\n[3,4]\n	length	-c --stream -s	6\n		0
+[1,2]\n[3,4]\n	length	-c --stream -s -n	0\n		0
+[1,2]\n[3,4]\n	length	-c --stream -s -e	6\n		0
+[1,2]\n[3,4]\n	.[0]	-c --stream -s	[[0],1]\n		0
+[1,2]\n[3,4]\n	.[0]	-c --stream -s -n	null\n		0
+[1,2]\n[3,4]\n	.[0]	-c --stream -s -e	[[0],1]\n		0
+[1,2]\n[3,4]\n	[limit(5;.[])]	-c --stream -s	[[[0],1],[[1],2],[[1]],[[0],3],[[1],4]]\n		0
+[1,2]\n[3,4]\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n[3,4]\n	[limit(5;.[])]	-c --stream -s -e	[[[0],1],[[1],2],[[1]],[[0],3],[[1],4]]\n		0
+[1,2]\n[3,4]\n	map(select(length==2))|length	-c --stream -s	4\n		0
+[1,2]\n[3,4]\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n[3,4]\n	map(select(length==2))|length	-c --stream -s -e	4\n		0
+[1,2]\n[3,4]\n	map(select(length==1))|length	-c --stream -s	2\n		0
+[1,2]\n[3,4]\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n[3,4]\n	map(select(length==1))|length	-c --stream -s -e	2\n		0
+[1,2]\n[3,4]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s	10\n		0
+[1,2]\n[3,4]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n[3,4]\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	10\n		0
+[1,2]\n[3,4]\n	input_line_number	-c --stream -s	2\n		0
+[1,2]\n[3,4]\n	input_line_number	-c --stream -s -n	0\n		0
+[1,2]\n[3,4]\n	input_line_number	-c --stream -s -e	2\n		0
+[1,2]\n[3,4]\n	[., input_line_number]	-c --stream -s	[[[[0],1],[[1],2],[[1]],[[0],3],[[1],4],[[1]]],2]\n		0
+[1,2]\n[3,4]\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+[1,2]\n[3,4]\n	[., input_line_number]	-c --stream -s -e	[[[[0],1],[[1],2],[[1]],[[0],3],[[1],4],[[1]]],2]\n		0
+[1,2]\n[3,4]\n	first	-c --stream -s	[[0],1]\n		0
+[1,2]\n[3,4]\n	first	-c --stream -s -n	null\n		0
+[1,2]\n[3,4]\n	first	-c --stream -s -e	[[0],1]\n		0
+[1,2]\n[3,4]\n	last	-c --stream -s	[[1]]\n		0
+[1,2]\n[3,4]\n	last	-c --stream -s -n	null\n		0
+[1,2]\n[3,4]\n	last	-c --stream -s -e	[[1]]\n		0
+[1,2]\n[3,4]\n	tojson	-c --stream -s	"[[[0],1],[[1],2],[[1]],[[0],3],[[1],4],[[1]]]"\n		0
+[1,2]\n[3,4]\n	tojson	-c --stream -s -n	"null"\n		0
+[1,2]\n[3,4]\n	tojson	-c --stream -s -e	"[[[0],1],[[1],2],[[1]],[[0],3],[[1],4],[[1]]]"\n		0
+[1,2]\n[3,4]\n	map(.[0])|unique	-c --stream -s	[[0],[1]]\n		0
+[1,2]\n[3,4]\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[1,2]\n[3,4]\n	map(.[0])|unique	-c --stream -s -e	[[0],[1]]\n		0
+[1,2]\n[3,4]\n	try input catch "E"	-c --stream -s	"E"\n		0
+[1,2]\n[3,4]\n	try input catch "E"	-c --stream -s -n	[[[0],1],[[1],2],[[1]],[[0],3],[[1],4],[[1]]]\n		0
+[1,2]\n[3,4]\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+[1,2]\n[3,4]\n	[inputs]|length	-c --stream -s	0\n		0
+[1,2]\n[3,4]\n	[inputs]|length	-c --stream -s -n	1\n		0
+[1,2]\n[3,4]\n	[inputs]|length	-c --stream -s -e	0\n		0
+{"a":1}  	.	-c --stream -s	[[["a"],1],[["a"]]]\n		0
+{"a":1}  	.	-c --stream -s -n	null\n		0
+{"a":1}  	.	-c --stream -s -e	[[["a"],1],[["a"]]]\n		0
+{"a":1}  	length	-c --stream -s	2\n		0
+{"a":1}  	length	-c --stream -s -n	0\n		0
+{"a":1}  	length	-c --stream -s -e	2\n		0
+{"a":1}  	.[0]	-c --stream -s	[["a"],1]\n		0
+{"a":1}  	.[0]	-c --stream -s -n	null\n		0
+{"a":1}  	.[0]	-c --stream -s -e	[["a"],1]\n		0
+{"a":1}  	[limit(5;.[])]	-c --stream -s	[[["a"],1],[["a"]]]\n		0
+{"a":1}  	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}  	[limit(5;.[])]	-c --stream -s -e	[[["a"],1],[["a"]]]\n		0
+{"a":1}  	map(select(length==2))|length	-c --stream -s	1\n		0
+{"a":1}  	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}  	map(select(length==2))|length	-c --stream -s -e	1\n		0
+{"a":1}  	map(select(length==1))|length	-c --stream -s	1\n		0
+{"a":1}  	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}  	map(select(length==1))|length	-c --stream -s -e	1\n		0
+{"a":1}  	[.[]|select(length==2)|.[1]]|add	-c --stream -s	1\n		0
+{"a":1}  	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}  	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	1\n		0
+{"a":1}  	input_line_number	-c --stream -s	0\n		0
+{"a":1}  	input_line_number	-c --stream -s -n	0\n		0
+{"a":1}  	input_line_number	-c --stream -s -e	0\n		0
+{"a":1}  	[., input_line_number]	-c --stream -s	[[[["a"],1],[["a"]]],0]\n		0
+{"a":1}  	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+{"a":1}  	[., input_line_number]	-c --stream -s -e	[[[["a"],1],[["a"]]],0]\n		0
+{"a":1}  	first	-c --stream -s	[["a"],1]\n		0
+{"a":1}  	first	-c --stream -s -n	null\n		0
+{"a":1}  	first	-c --stream -s -e	[["a"],1]\n		0
+{"a":1}  	last	-c --stream -s	[["a"]]\n		0
+{"a":1}  	last	-c --stream -s -n	null\n		0
+{"a":1}  	last	-c --stream -s -e	[["a"]]\n		0
+{"a":1}  	tojson	-c --stream -s	"[[[\\"a\\"],1],[[\\"a\\"]]]"\n		0
+{"a":1}  	tojson	-c --stream -s -n	"null"\n		0
+{"a":1}  	tojson	-c --stream -s -e	"[[[\\"a\\"],1],[[\\"a\\"]]]"\n		0
+{"a":1}  	map(.[0])|unique	-c --stream -s	[["a"]]\n		0
+{"a":1}  	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":1}  	map(.[0])|unique	-c --stream -s -e	[["a"]]\n		0
+{"a":1}  	try input catch "E"	-c --stream -s	"E"\n		0
+{"a":1}  	try input catch "E"	-c --stream -s -n	[[["a"],1],[["a"]]]\n		0
+{"a":1}  	try input catch "E"	-c --stream -s -e	"E"\n		0
+{"a":1}  	[inputs]|length	-c --stream -s	0\n		0
+{"a":1}  	[inputs]|length	-c --stream -s -n	1\n		0
+{"a":1}  	[inputs]|length	-c --stream -s -e	0\n		0
+[	.	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	.	-c --stream -s -n	null\n		0
+[	.	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	length	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	length	-c --stream -s -n	0\n		0
+[	length	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	.[0]	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	.[0]	-c --stream -s -n	null\n		0
+[	.[0]	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	[limit(5;.[])]	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[	[limit(5;.[])]	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	map(select(length==2))|length	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[	map(select(length==2))|length	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	map(select(length==1))|length	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[	map(select(length==1))|length	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	input_line_number	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	input_line_number	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	[., input_line_number]	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	[., input_line_number]	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	first	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	first	-c --stream -s -n	null\n		0
+[	first	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	last	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	last	-c --stream -s -n	null\n		0
+[	last	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	tojson	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	tojson	-c --stream -s -n	"null"\n		0
+[	tojson	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	map(.[0])|unique	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+[	map(.[0])|unique	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	try input catch "E"	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	try input catch "E"	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	[inputs]|length	-c --stream -s		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+[	[inputs]|length	-c --stream -s -n		jq: error (at <stdin>:0): Unfinished JSON term at EOF at line 1, column 1\n	5
+[	[inputs]|length	-c --stream -s -e		jq: parse error: Unfinished JSON term at EOF at line 1, column 1\n	5
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	.	-c --stream -s	[[["a",0],1],[["a",1,"b"],null],[["a",1,"b"]],[["a",1]],[["c"],"x"],[["c"]],[[],"s"],[[],3]]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	.	-c --stream -s -n	null\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	.	-c --stream -s -e	[[["a",0],1],[["a",1,"b"],null],[["a",1,"b"]],[["a",1]],[["c"],"x"],[["c"]],[[],"s"],[[],3]]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	length	-c --stream -s	8\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	length	-c --stream -s -n	0\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	length	-c --stream -s -e	8\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	.[0]	-c --stream -s	[["a",0],1]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	.[0]	-c --stream -s -n	null\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	.[0]	-c --stream -s -e	[["a",0],1]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	[limit(5;.[])]	-c --stream -s	[[["a",0],1],[["a",1,"b"],null],[["a",1,"b"]],[["a",1]],[["c"],"x"]]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	[limit(5;.[])]	-c --stream -s -e	[[["a",0],1],[["a",1,"b"],null],[["a",1,"b"]],[["a",1]],[["c"],"x"]]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	map(select(length==2))|length	-c --stream -s	5\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	map(select(length==2))|length	-c --stream -s -e	5\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	map(select(length==1))|length	-c --stream -s	3\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	map(select(length==1))|length	-c --stream -s -e	3\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s		jq: error (at <stdin>:3): number (1) and string ("x") cannot be added\n	5
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e		jq: error (at <stdin>:3): number (1) and string ("x") cannot be added\n	5
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	input_line_number	-c --stream -s	3\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	input_line_number	-c --stream -s -n	0\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	input_line_number	-c --stream -s -e	3\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	[., input_line_number]	-c --stream -s	[[[["a",0],1],[["a",1,"b"],null],[["a",1,"b"]],[["a",1]],[["c"],"x"],[["c"]],[[],"s"],[[],3]],3]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	[., input_line_number]	-c --stream -s -e	[[[["a",0],1],[["a",1,"b"],null],[["a",1,"b"]],[["a",1]],[["c"],"x"],[["c"]],[[],"s"],[[],3]],3]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	first	-c --stream -s	[["a",0],1]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	first	-c --stream -s -n	null\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	first	-c --stream -s -e	[["a",0],1]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	last	-c --stream -s	[[],3]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	last	-c --stream -s -n	null\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	last	-c --stream -s -e	[[],3]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	tojson	-c --stream -s	"[[[\\"a\\",0],1],[[\\"a\\",1,\\"b\\"],null],[[\\"a\\",1,\\"b\\"]],[[\\"a\\",1]],[[\\"c\\"],\\"x\\"],[[\\"c\\"]],[[],\\"s\\"],[[],3]]"\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	tojson	-c --stream -s -n	"null"\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	tojson	-c --stream -s -e	"[[[\\"a\\",0],1],[[\\"a\\",1,\\"b\\"],null],[[\\"a\\",1,\\"b\\"]],[[\\"a\\",1]],[[\\"c\\"],\\"x\\"],[[\\"c\\"]],[[],\\"s\\"],[[],3]]"\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	map(.[0])|unique	-c --stream -s	[[],["a",0],["a",1],["a",1,"b"],["c"]]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	map(.[0])|unique	-c --stream -s -e	[[],["a",0],["a",1],["a",1,"b"],["c"]]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	try input catch "E"	-c --stream -s	"E"\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	try input catch "E"	-c --stream -s -n	[[["a",0],1],[["a",1,"b"],null],[["a",1,"b"]],[["a",1]],[["c"],"x"],[["c"]],[[],"s"],[[],3]]\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	try input catch "E"	-c --stream -s -e	"E"\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	[inputs]|length	-c --stream -s	0\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	[inputs]|length	-c --stream -s -n	1\n		0
+{"a":[1,{"b":null}],"c":"x"}\n"s"\n3\n	[inputs]|length	-c --stream -s -e	0\n		0

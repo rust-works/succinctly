@@ -337,24 +337,16 @@ pub(crate) fn read(sources: &[(Option<usize>, Vec<u8>)]) -> StreamErrorsRead {
     }
 }
 
-/// The events jq's streaming parser yields for `bytes` before the parse error that ends them
-/// (#5635), each with the number of lines of `bytes` jq had read when it yielded it.
-///
-/// `bytes` starts at a value: the document `--stream` could not finish. The events come from the
-/// same port `--stream-errors` reads with, since which events a malformed document produced
-/// before its fault is a property of jq's incremental parser, not of a whole-document parse.
-/// Empty when the parser meets no fault in `bytes`, so a document it reads through is left to the
-/// caller's own error.
-pub(crate) fn events_before_fault(bytes: &[u8]) -> Vec<(OwnedValue, usize)> {
-    let read = read(&[(None, bytes.to_vec())]);
-    let Some(end) = read.first_error else {
-        return Vec::new();
-    };
-    read.values
-        .into_iter()
-        .zip(read.locations.into_iter().map(|(_, lines)| lines))
-        .take(end)
-        .collect()
+/// The message of the input `--stream-errors` hands over for a parse error, `[message, path]`:
+/// the error jq raises without that flag (#5498). Empty for a value that is not one.
+pub(crate) fn error_message(input: &OwnedValue) -> String {
+    match input {
+        OwnedValue::Array(parts) => match parts.first() {
+            Some(OwnedValue::String(message)) => message.to_string(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
 }
 
 /// A parse error as `--stream-errors` hands it over (`[message, path]`) and the message alone.
@@ -918,9 +910,16 @@ mod tests {
         read(&[(None, input.to_vec())])
     }
 
+    /// The events the reader yielded before the first parse error, each with the lines it had read.
     fn before_fault(input: &str) -> Vec<(String, usize)> {
-        events_before_fault(input.as_bytes())
-            .into_iter()
+        let read = read_one(input.as_bytes());
+        let Some(end) = read.first_error else {
+            return Vec::new();
+        };
+        read.values
+            .iter()
+            .zip(read.locations.iter().map(|&(_, lines)| lines))
+            .take(end)
             .map(|(event, lines)| (event.to_json(), lines))
             .collect()
     }
@@ -1013,7 +1012,7 @@ mod tests {
 
     /// #5635: the events a malformed document yielded before its fault, with the lines read.
     #[test]
-    fn events_before_fault_stop_at_the_first_error_5635() {
+    fn the_events_before_a_fault_stop_at_the_first_error_5635() {
         let row = |event: &str, lines| (event.to_string(), lines);
         assert_eq!(
             before_fault("[1,2,3 x]"),
@@ -1033,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn events_before_fault_are_empty_when_the_parser_meets_none_5635() {
+    fn no_events_come_before_a_fault_the_parser_does_not_meet_5635() {
         assert_eq!(before_fault("[1,2]\n"), []);
         assert_eq!(before_fault(""), []);
         // Truncation is a fault at EOF: the events are the ones before it.
