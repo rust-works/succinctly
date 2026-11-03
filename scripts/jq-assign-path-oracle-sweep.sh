@@ -35,8 +35,10 @@
 # `--jq-only` records the jq-mode half only (no yq is needed), and `--gate` exits 1
 # on any succinctly-vs-oracle divergence: together they are how `succinctly dev
 # compare jq --dimension sweeps` runs this script (#5552), where the jq half's 10,248
-# cases all agree with jq 1.7.1. The yq half has 904 divergences on `main` at #5552,
-# so `--gate` without `--jq-only` fails; it is a recording, not a gate, there. The
+# cases all agree with jq 1.7.1. The yq half agrees with yq v4.53.3 on all 10,248 cases too
+# (#5998), so `--gate` without `--jq-only` passes; the harness folds only the jq half. The
+# 904 divergences #5552 recorded came from a host whose yq was v4.52.2, which answers a slice
+# assignment differently, so the yq oracle is held to `tests/data/yq-golden/YQ_VERSION` below. The
 # harness sets `JQ_ORACLE` to its pinned reference, taken first when it matches the
 # pin, and a setup error exits 2, since 1 means "diverges".
 #
@@ -92,10 +94,11 @@ if ((USE_ORACLE)); then
     exit 2
   fi
   if [[ " ${MODES[*]} " == *" yq "* ]]; then
-    if command -v yq >/dev/null 2>&1 && yq --version | grep -q 'v4\.'; then
+    YQ_PIN="$(cat "$REPO_ROOT/tests/data/yq-golden/YQ_VERSION")"
+    if command -v yq >/dev/null 2>&1 && yq --version | grep -qF "version $YQ_PIN"; then
       YQ="$(command -v yq)"
     else
-      echo "error: no yq v4 found on PATH" >&2
+      echo "error: no yq matching pin $YQ_PIN found on PATH ($(yq --version 2>&1 | tail -1))" >&2
       exit 2
     fi
   fi
