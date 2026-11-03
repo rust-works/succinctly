@@ -130,14 +130,14 @@ struct Colorizer {
 const COLOR_BLOCK_BYTES: usize = 8 * 1024;
 
 enum ColorLexer {
-    Yaml(YamlColorizer),
+    Yaml(Box<YamlColorizer>),
     Json(output::JsonColorizer, Box<ColorScheme>),
 }
 
 impl Colorizer {
     fn new(syntax: ColorSyntax) -> Self {
         let lexer = match syntax {
-            ColorSyntax::Yaml => ColorLexer::Yaml(YamlColorizer::default()),
+            ColorSyntax::Yaml => ColorLexer::Yaml(Box::default()),
             ColorSyntax::Json => {
                 ColorLexer::Json(output::JsonColorizer::per_token(), Box::default())
             }

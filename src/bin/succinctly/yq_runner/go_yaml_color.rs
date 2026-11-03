@@ -403,7 +403,7 @@ struct Ctx {
 
 impl Ctx {
     fn new() -> Self {
-        Ctx {
+        Self {
             idx: 0,
             not_space_char_pos: 0,
             not_space_org_char_pos: 0,
@@ -643,7 +643,7 @@ const TOKEN_BATCH: usize = 512;
 
 impl Scanner {
     fn new() -> Self {
-        Scanner {
+        Self {
             line: 1,
             column: 1,
             last_delim_column: 0,
@@ -682,12 +682,13 @@ impl Scanner {
         if let Some(p) = self.saved_pos.take() {
             return ctx.buffered_token(p);
         }
-        let mut column = self.column - ctx.buf.len() as i64;
-        if ctx.is_multi_line() {
+        let column = if ctx.is_multi_line() {
             let obuf = s_of(&ctx.obuf);
             let buf = s_of(&ctx.buf);
-            column = obuf.find(&buf).map_or(-1, |i| i as i64) + 1;
-        }
+            obuf.find(&buf).map_or(-1, |i| i as i64) + 1
+        } else {
+            self.column - ctx.buf.len() as i64
+        };
         ctx.buffered_token(Pos { column })
     }
 
@@ -695,7 +696,7 @@ impl Scanner {
         self.column += num as i64;
         ctx.idx += num;
     }
-    fn progress_only(&mut self, ctx: &mut Ctx, num: usize) {
+    fn progress_only(ctx: &mut Ctx, num: usize) {
         ctx.idx += num;
     }
     fn progress_line(&mut self, ctx: &mut Ctx) {
@@ -709,7 +710,7 @@ impl Scanner {
         self.is_directive = false;
         ctx.idx += 1;
     }
-    fn progress(&mut self, ctx: &mut Ctx, num: usize) {
+    fn progress(ctx: &mut Ctx, num: usize) {
         ctx.idx += num;
     }
     fn is_new_line_char(c: char) -> bool {
@@ -1101,7 +1102,7 @@ impl Scanner {
         true
     }
 
-    fn is_merge_key(&self, ctx: &Ctx) -> bool {
+    fn is_merge_key(ctx: &Ctx) -> bool {
         if ctx.repeat_num('<') != 2 {
             return false;
         }
@@ -1132,7 +1133,7 @@ impl Scanner {
             return Ok(false);
         }
         ctx.add_origin_buf('!');
-        self.progress(ctx, 1);
+        Self::progress(ctx, 1);
         let base = ctx.idx;
         let size = ctx.size();
         let mut idx = 0usize;
@@ -1197,7 +1198,7 @@ impl Scanner {
         }
         self.add_buffered_token_if_exists(ctx);
         ctx.add_origin_buf('#');
-        self.progress(ctx, 1);
+        Self::progress(ctx, 1);
         let base = ctx.idx;
         let n = ctx.size() - base;
         for idx in 0..n {
@@ -1285,7 +1286,7 @@ impl Scanner {
         if c == '\r' {
             if ctx.next_char() == '\n' {
                 ctx.add_origin_buf('\n');
-                self.progress(ctx, 1);
+                Self::progress(ctx, 1);
             }
             c = '\n';
         }
@@ -1391,7 +1392,7 @@ impl Scanner {
         ctx.remove_right_space_from_buf();
         if c == '\r' && ctx.next_char() == '\n' {
             ctx.add_origin_buf('\r');
-            self.progress(ctx, 1);
+            Self::progress(ctx, 1);
             c = '\n';
         }
         if ctx.is_eos() || self.is_anchor || self.is_alias || self.is_directive {
@@ -1560,7 +1561,7 @@ impl Scanner {
         true
     }
     fn scan_merge_key(&mut self, ctx: &mut Ctx) -> bool {
-        if !self.is_merge_key(ctx) {
+        if !Self::is_merge_key(ctx) {
             return false;
         }
         self.last_delim_column = self.column;
@@ -1622,7 +1623,7 @@ impl Scanner {
     fn scan_multi_line_header_option(&mut self, ctx: &mut Ctx) {
         let header = ctx.current_char();
         ctx.add_origin_buf(header);
-        self.progress(ctx, 1);
+        Self::progress(ctx, 1);
         let mut progress = 0usize;
         let mut crlf = false;
         let base = ctx.idx;
@@ -1908,7 +1909,7 @@ impl Scanner {
                     {
                         self.indent_num += 1;
                         ctx.add_origin_buf(c);
-                        self.progress_only(ctx, 1);
+                        Self::progress_only(ctx, 1);
                         true
                     } else {
                         self.scan_tab(ctx, c)?;
@@ -1950,9 +1951,8 @@ struct Printer {
 
 impl Printer {
     fn property(prev: Option<Ty>, tk: &Tok, next: Option<Ty>) -> Option<&'static str> {
-        match prev {
-            Some(Ty::Anchor | Ty::Alias) => return Some(YELLOW),
-            _ => {}
+        if let Some(Ty::Anchor | Ty::Alias) = prev {
+            return Some(YELLOW);
         }
         if next == Some(Ty::MappingValue) {
             return Some(CYAN);
