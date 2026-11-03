@@ -4157,7 +4157,7 @@ Profiling 1MB YAML (111,529 nodes, 93% strings) reveals:
 2. ~~`find_plain_scalar_end()` - scans forward to find scalar boundary~~ **(eliminated by bp_to_text_end)**
 3. `is_in_flow_context()` - quick path if no `[` or `{` in recent text
 
-**Post-optimization status**: String boundary pre-computation (Opportunity 4) has been implemented. The `find_plain_scalar_end()` function is now unused during traversal - scalar end positions are looked up in O(1) from `bp_to_text_end`. Measured improvement: ~5-7% for 10KB files.
+**Post-optimization status**: String boundary pre-computation (Opportunity 4) has been implemented. The `find_plain_scalar_end()` function was unused during traversal - scalar end positions are looked up in O(1) from `bp_to_text_end` - and it was deleted, with `compute_base_indent_and_root_flag()`, in #5951. Measured improvement: ~5-7% for 10KB files.
 
 ---
 

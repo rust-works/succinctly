@@ -27,7 +27,7 @@ use super::encode_style::{
     write_go_yaml_string,
 };
 use super::index::YamlIndex;
-use super::line_break::{blank_line_between, is_line_break, line_break_len, line_break_len_before};
+use super::line_break::{blank_line_between, is_line_break, line_break_len};
 use super::scalar::{
     could_be_null_or_bool, is_overflowed_int_literal, is_preservable_float_literal, is_spelled_int,
     preservable_float_literal_text, resolve_plain, resolve_plain_sourced, resolve_tagged,
@@ -774,185 +774,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         Self::compute_line_indent_static(self.text, line_start)
     }
 
-    /// Compute the base indent for plain scalar continuation.
-    /// For values on their own line (after key:), this returns the key's indent.
-    /// For values on the same line as the key, this returns that line's indent.
-    /// Compute base indent for plain scalar continuation checking.
-    /// Returns (base_indent, is_document_root) where is_document_root is true
-    /// if this scalar is the document root content (right after --- or at start).
-    #[allow(dead_code)] // STYLE-0005: alternate parse-path helper; unused in current path
-    fn compute_base_indent_and_root_flag(&self, value_pos: usize) -> (usize, bool) {
-        // Find start of current line
-        let mut line_start = value_pos;
-        while line_start > 0 && !is_line_break(self.text[line_start - 1]) {
-            line_start -= 1;
-        }
-
-        // Compute line indent (spaces at start of line)
-        let line_indent = Self::compute_line_indent_static(self.text, line_start);
-
-        // Check for explicit key indicator `? `, explicit value indicator `: `,
-        // and sequence indicator `- ` before the value on this line.
-        // Also check for key separators (`:` followed by space/tab/newline).
-        let mut last_seq_col = None;
-        let mut explicit_indicator_col = None;
-        let mut last_key_separator_pos = None;
-        let mut scan = line_start + line_indent; // Skip leading whitespace
-        while scan < value_pos {
-            if self.text[scan] == b'?' {
-                // Check if this is an explicit key indicator (followed by space/tab/newline)
-                if scan + 1 < self.text.len()
-                    && matches!(self.text[scan + 1], b' ' | b'\t' | b'\n' | b'\r')
-                {
-                    explicit_indicator_col = Some(scan - line_start);
-                }
-            }
-            if self.text[scan] == b':' {
-                // Check if this colon is a key separator (followed by space/tab/newline)
-                if scan + 1 < self.text.len()
-                    && matches!(self.text[scan + 1], b' ' | b'\t' | b'\n' | b'\r')
-                {
-                    // Check if this is an explicit value indicator at start of content
-                    if scan == line_start + line_indent {
-                        explicit_indicator_col = Some(scan - line_start);
-                    } else {
-                        // This is a key separator for `key: value`
-                        last_key_separator_pos = Some(scan);
-                    }
-                }
-            }
-            if self.text[scan] == b'-' {
-                // Check if this is a sequence indicator (followed by space/tab)
-                if scan + 1 < self.text.len() && matches!(self.text[scan + 1], b' ' | b'\t') {
-                    // This is a sequence indicator at column (scan - line_start)
-                    last_seq_col = Some(scan - line_start);
-                }
-            }
-            scan += 1;
-        }
-
-        // If there's a key separator after the sequence indicator, use the key:value logic
-        // (handled below in has_colon_before). This handles `- key: value` patterns.
-        // Only use sequence indicator if there's no key separator between it and the value.
-        let seq_col_before_key = match (last_seq_col, last_key_separator_pos) {
-            (Some(seq_col), Some(key_sep_pos)) => {
-                // Check if sequence indicator is before the key separator
-                let seq_pos = line_start + seq_col;
-                if seq_pos < key_sep_pos {
-                    // Key separator is after sequence indicator - don't use seq_col
-                    None
-                } else {
-                    Some(seq_col)
-                }
-            }
-            (Some(seq_col), None) => Some(seq_col),
-            _ => None,
-        };
-
-        if let Some(seq_col) = seq_col_before_key {
-            return (seq_col, false);
-        }
-        if let Some(exp_col) = explicit_indicator_col {
-            return (exp_col, false);
-        }
-
-        // Check if there's a colon before us on this line (meaning key: value on same line)
-        let mut has_colon_before = false;
-        let mut colon_pos = 0;
-        scan = line_start;
-        while scan < value_pos {
-            if self.text[scan] == b':' {
-                // Check if this colon is a key separator (followed by space/tab/newline)
-                if scan + 1 < self.text.len() {
-                    let next = self.text[scan + 1];
-                    if matches!(next, b' ' | b'\t' | b'\n' | b'\r') {
-                        has_colon_before = true;
-                        colon_pos = scan;
-                    }
-                }
-            }
-            scan += 1;
-        }
-
-        if has_colon_before {
-            // Value is on same line as key - not a document root
-            // Find the effective content indent, which is the column of the key.
-            // For compact mappings in sequences like "- key: value", we need to
-            // find where the actual content starts (after any "- " indicators).
-
-            // Scan backwards from the colon to find the key start
-            let mut key_start = colon_pos;
-            while key_start > line_start {
-                let prev = self.text[key_start - 1];
-                if prev == b' ' || prev == b'\t' {
-                    break;
-                }
-                // Skip over quoted key content
-                if prev == b'"' || prev == b'\'' {
-                    // This is end of a quoted key - harder to handle, just use line indent
-                    return (
-                        Self::compute_line_indent_static(self.text, value_pos),
-                        false,
-                    );
-                }
-                key_start -= 1;
-            }
-
-            // key_start is now at the start of the key
-            // The base indent is the column position of the key
-            (key_start - line_start, false)
-        } else {
-            // Value is on its own line
-            // (Sequence indicators were already handled above)
-
-            // Check if previous line is a document marker (---) or if we're at start
-            if line_start == 0 {
-                // No previous line, this is document root
-                return (0, true);
-            }
-
-            // Step back over the break that ended the previous line — the whole
-            // break, not one byte. Stepping back a fixed 1 landed on the `\n`
-            // of a CRLF, so the walk below stopped dead on its `\r` and the
-            // previous line came out as `---\r`, which never matched the
-            // document marker (#324).
-            let prev_line_end = line_start - line_break_len_before(self.text, line_start).max(1);
-
-            // Go to the start of that line
-            let mut prev_line_start = prev_line_end;
-            while prev_line_start > 0 && !is_line_break(self.text[prev_line_start - 1]) {
-                prev_line_start -= 1;
-            }
-
-            // Check if previous line is "---" (document start marker)
-            let prev_line = &self.text[prev_line_start..prev_line_end];
-            let trimmed = prev_line
-                .iter()
-                .copied()
-                .skip_while(|&b| b == b' ')
-                .collect::<alloc::vec::Vec<u8>>();
-
-            if trimmed.starts_with(b"---") {
-                let rest = &trimmed[3..];
-                if rest.is_empty() || rest.iter().all(|&b| b == b' ' || b == b'\t') {
-                    // Previous line is just "---" (possibly with trailing whitespace)
-                    return (0, true);
-                }
-            }
-
-            // Not at document root - return previous line's indent
-            (
-                Self::compute_line_indent_static(self.text, prev_line_start),
-                false,
-            )
-        }
-    }
-
     /// Check if a position is inside a flow context (inside `[]` or `{}`).
     /// Returns true if there's an unmatched `[` or `{` before the position.
     ///
     /// No longer dead code as of #434: `find_scalar_end` (a live path) calls
-    /// this directly, in addition to the still-unused `find_plain_scalar_end`.
+    /// this directly.
     fn is_in_flow_context(&self, pos: usize) -> bool {
         // Find start of line containing pos
         let mut line_start = pos;
@@ -1094,248 +920,6 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             end -= 1;
         }
         end
-    }
-
-    /// Find the end of a plain (unquoted) scalar, including continuation lines.
-    /// A continuation line is more indented than base_indent (in block context),
-    /// or any line that doesn't start with a flow delimiter (in flow context).
-    /// For document root scalars (is_doc_root=true), continuation at indent 0 is allowed.
-    #[allow(dead_code)] // STYLE-0005: alternate parse-path helper; unused in current path
-    fn find_plain_scalar_end(&self, start: usize, base_indent: usize, is_doc_root: bool) -> usize {
-        let in_flow = self.is_in_flow_context(start);
-        let mut end = start;
-
-        loop {
-            // Find end of current line content
-            while end < self.text.len() {
-                match self.text[end] {
-                    b'\n' | b'\r' => break,
-                    b'#' => {
-                        // # preceded by whitespace (space or tab) is a comment
-                        if end > start && matches!(self.text[end - 1], b' ' | b'\t') {
-                            break;
-                        }
-                        end += 1;
-                    }
-                    // Flow context delimiters - only terminate in flow context
-                    b',' | b']' | b'}' if in_flow => break,
-                    b':' => {
-                        // Colon followed by space, newline, or EOF ends the scalar
-                        if end + 1 >= self.text.len() {
-                            break;
-                        }
-                        if matches!(self.text[end + 1], b' ' | b'\t' | b'\n' | b'\r') {
-                            break;
-                        }
-                        end += 1;
-                    }
-                    _ => end += 1,
-                }
-            }
-
-            // Trim trailing whitespace (spaces, tabs, and a CR that a SIMD skip
-            // may have carried past) from current line
-            let mut line_end = end;
-            while line_end > start && matches!(self.text[line_end - 1], b' ' | b'\t' | b'\r') {
-                line_end -= 1;
-            }
-
-            // Check if there's a continuation line
-            if end >= self.text.len() || !is_line_break(self.text[end]) {
-                // No line break, end of text or hit delimiter
-                return line_end;
-            }
-
-            // Look ahead to see if next line is a continuation
-            let newline_pos = end;
-            end += line_break_len(self.text, end); // Skip the line break
-
-            // Skip empty lines (they can be part of multiline scalar)
-            let mut empty_lines_end = end;
-            while empty_lines_end < self.text.len() {
-                // Count indentation of this line
-                let mut line_indent = 0;
-                while empty_lines_end + line_indent < self.text.len()
-                    && self.text[empty_lines_end + line_indent] == b' '
-                {
-                    line_indent += 1;
-                }
-
-                // Check what's after the indentation
-                let after_indent = empty_lines_end + line_indent;
-                if after_indent >= self.text.len() {
-                    // EOF after spaces
-                    return line_end;
-                }
-
-                match self.text[after_indent] {
-                    b'\n' | b'\r' => {
-                        // Empty line - continue looking. CRLF is one break.
-                        empty_lines_end = after_indent + line_break_len(self.text, after_indent);
-                    }
-                    b'\t' => {
-                        // Tabs after spaces - check if rest of line is whitespace only
-                        // If so, this is an empty line for folding purposes
-                        let mut check_pos = after_indent;
-                        while check_pos < self.text.len()
-                            && matches!(self.text[check_pos], b'\t' | b' ')
-                        {
-                            check_pos += 1;
-                        }
-                        if check_pos >= self.text.len() || is_line_break(self.text[check_pos]) {
-                            // Line has only whitespace - treat as empty line, continue looking
-                            empty_lines_end = check_pos + line_break_len(self.text, check_pos);
-                            // Continue the loop to check the next line
-                        } else if in_flow
-                            || line_indent > base_indent
-                            || (is_doc_root && line_indent == 0)
-                        {
-                            // Tab followed by content, with sufficient indent - this is a continuation.
-                            // For document root scalars (base_indent=0), tabs at start of line
-                            // are valid continuation per YAML spec example 7.12 "Plain Lines".
-                            end = empty_lines_end;
-                            break;
-                        } else {
-                            // Tab after indent, followed by content, not enough indent - not a continuation
-                            return line_end;
-                        }
-                    }
-                    b'#' => {
-                        // Comment line - not a continuation
-                        return line_end;
-                    }
-                    b'-' => {
-                        // Check for document start marker "---" at column 0
-                        if line_indent == 0
-                            && after_indent + 2 < self.text.len()
-                            && self.text[after_indent + 1] == b'-'
-                            && self.text[after_indent + 2] == b'-'
-                        {
-                            // Check what follows the "---"
-                            let after_marker = after_indent + 3;
-                            if after_marker >= self.text.len()
-                                || matches!(self.text[after_marker], b' ' | b'\t' | b'\n' | b'\r')
-                            {
-                                // This is a document start marker - not a continuation
-                                return line_end;
-                            }
-                            // "---" followed by content is a plain scalar continuation
-                            // (like "---word1")
-                        }
-                        // Possible sequence indicator
-                        if after_indent + 1 < self.text.len()
-                            && (self.text[after_indent + 1] == b' '
-                                || self.text[after_indent + 1] == b'\t'
-                                || self.text[after_indent + 1] == b'\n')
-                        {
-                            // This looks like a sequence indicator `- `.
-                            // It's only a real sequence indicator if the indent matches
-                            // the base indent. If the `- ` is more indented, it's part
-                            // of the scalar content (like AB8U test case).
-                            if line_indent == base_indent || (is_doc_root && line_indent == 0) {
-                                // This is a sequence item at correct indent - not a continuation
-                                return line_end;
-                            }
-                            // `- ` at greater indent is scalar content - continue below
-                        }
-                        // Not a sequence indicator (dash not followed by space/newline)
-                        // Check if it's a continuation based on indentation or flow context
-                        // For document root scalars, allow same-level continuation at indent 0
-                        if in_flow || line_indent > base_indent || (is_doc_root && line_indent == 0)
-                        {
-                            end = empty_lines_end;
-                            break;
-                        }
-                        return line_end;
-                    }
-                    // Flow delimiters terminate the scalar regardless of indentation
-                    b']' | b'}' | b',' => {
-                        return line_end;
-                    }
-                    b'?' => {
-                        // Check for explicit key indicator "?" at start of line
-                        // `? ` or `?\n` or `?` at EOF is an explicit key indicator
-                        if after_indent + 1 >= self.text.len()
-                            || matches!(self.text[after_indent + 1], b' ' | b'\t' | b'\n' | b'\r')
-                        {
-                            // This is an explicit key indicator - not a continuation
-                            return line_end;
-                        }
-                        // `?` followed by content is a plain scalar continuation
-                        // Check if it's a continuation based on indentation or flow context
-                        if in_flow || line_indent > base_indent || (is_doc_root && line_indent == 0)
-                        {
-                            end = empty_lines_end;
-                            break;
-                        }
-                        return line_end;
-                    }
-                    b':' => {
-                        // Check for explicit value indicator ":" at start of line
-                        // `: ` or `:\n` or `:` at EOF is an explicit value indicator
-                        if after_indent + 1 >= self.text.len()
-                            || matches!(self.text[after_indent + 1], b' ' | b'\t' | b'\n' | b'\r')
-                        {
-                            // This is an explicit value indicator - not a continuation
-                            return line_end;
-                        }
-                        // `:` followed by content is a plain scalar continuation
-                        // Check if it's a continuation based on indentation or flow context
-                        if in_flow || line_indent > base_indent || (is_doc_root && line_indent == 0)
-                        {
-                            end = empty_lines_end;
-                            break;
-                        }
-                        return line_end;
-                    }
-                    b'.' => {
-                        // Check for document end marker "..." at column 0
-                        if line_indent == 0
-                            && after_indent + 2 < self.text.len()
-                            && self.text[after_indent + 1] == b'.'
-                            && self.text[after_indent + 2] == b'.'
-                        {
-                            // Check what follows the "..."
-                            let after_marker = after_indent + 3;
-                            if after_marker >= self.text.len()
-                                || matches!(self.text[after_marker], b' ' | b'\t' | b'\n' | b'\r')
-                            {
-                                // This is a document end marker - not a continuation
-                                return line_end;
-                            }
-                        }
-                        // Not a document marker, check if it's a continuation
-                        if in_flow || line_indent > base_indent || (is_doc_root && line_indent == 0)
-                        {
-                            end = empty_lines_end;
-                            break;
-                        }
-                        return line_end;
-                    }
-                    _ => {
-                        // Non-empty line - check indentation or flow context
-                        // For document root scalars, allow same-level continuation at indent 0
-                        if in_flow || line_indent > base_indent || (is_doc_root && line_indent == 0)
-                        {
-                            // Continuation line (in flow context, any non-delimiter continues)
-                            end = empty_lines_end;
-                            break;
-                        }
-                        // Not indented enough - scalar ends before this
-                        return line_end;
-                    }
-                }
-            }
-
-            // If we fell through the empty lines loop without finding continuation
-            if empty_lines_end >= self.text.len() {
-                return line_end;
-            }
-
-            // Continue to include this continuation line
-            // The newline and any empty lines become part of the scalar
-            let _ = newline_pos; // newline_pos marks where content ended
-        }
     }
 
     /// Get children of this cursor for traversal.
@@ -3651,111 +3235,6 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
 
         // Use cursor_at_offset to find the node
         self.cursor_at_offset(offset)
-    }
-}
-
-/// Write a YAML value as JSON from a bare `YamlValue` with no cursor of its
-/// own — e.g. one already extracted via `YamlElements::uncons`/`get`.
-///
-/// No production call site reaches this anymore (#224): every real path
-/// recurses via a cursor instead (`YamlElements::uncons_cursor` +
-/// `YamlCursor::write_json_to`), since a node's own tag lives on its
-/// `bp_pos`, which a bare `YamlValue` has already lost. Kept as the
-/// value-only half of `test_sequence_element_accessors_agree`, which asserts
-/// `uncons`/`get`/`uncons_cursor` all produce identical JSON (#332).
-#[allow(dead_code)] // STYLE-0005: used in tests
-fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlValue<'_, W>) {
-    match value {
-        YamlValue::Null => output.push_str("null"),
-        YamlValue::String(s) => {
-            // Direct transcoding optimization (avoids intermediate allocation for quoted strings)
-            match write_yaml_string_to_json(output, &s) {
-                Ok(true) => {} // Written directly as JSON string
-                Ok(false) => {
-                    if let Ok(str_val) = s.as_str() {
-                        if s.is_unquoted() {
-                            // Plain scalar - resolve per the core schema.
-                            // `false`: this function takes a bare `YamlValue`
-                            // with no `YamlIndex` to read #996's
-                            // `canonicalize_numbers` flag from, and per this
-                            // function's own doc comment has no production
-                            // call site to matter for anyway (test-only).
-                            write_yaml_scalar_as_json(output, &str_val, false);
-                        } else {
-                            // Block scalars are always strings
-                            write_json_string(output, &str_val);
-                        }
-                    } else {
-                        output.push_str("null");
-                    }
-                }
-                Err(_) => output.push_str("null"),
-            }
-        }
-        YamlValue::Mapping(fields) => {
-            // #4983: a mapping renders through yq's rendering expansion, not the iteration one.
-            let fields = fields.rendered_for_json();
-            output.push('{');
-            let mut first = true;
-            for field in fields {
-                if !first {
-                    output.push(',');
-                }
-                first = false;
-
-                // Write key - try direct transcoding first
-                if let YamlValue::String(s) = field.key() {
-                    match write_yaml_string_to_json(output, &s) {
-                        Ok(true) => {} // Written directly
-                        Ok(false) | Err(_) => {
-                            // Fall back to original path
-                            if let Ok(key_str) = s.as_str() {
-                                write_json_string(output, &key_str);
-                            } else {
-                                output.push_str("\"\"");
-                            }
-                        }
-                    }
-                } else {
-                    // Alias/complex key (#222): resolve alias-to-scalar,
-                    // else "" — the entry is kept, never dropped
-                    write_json_string(output, &field.key().key_string());
-                }
-
-                output.push(':');
-                field.value_cursor().write_json_to(output);
-            }
-            output.push('}');
-        }
-        YamlValue::Sequence(elements) => {
-            output.push('[');
-            let mut first = true;
-            let mut rest = elements;
-            // `uncons_resolved_cursor`, not `uncons_cursor` (#835): see the
-            // matching comment in `stream_json_value`'s `Sequence` arm -
-            // `write_json_to` (called below) has the same unresolved
-            // `explicit_tag()` dependency in its own String arm.
-            while let Some((cursor, next)) = rest.uncons_resolved_cursor() {
-                if !first {
-                    output.push(',');
-                }
-                first = false;
-                rest = next;
-                // A child element does have a cursor even though this
-                // function's own top-level `value` doesn't - use it so a
-                // nested element's tag isn't lost either.
-                cursor.write_json_to(output);
-            }
-            output.push(']');
-        }
-        YamlValue::Alias { target, .. } => {
-            if let Some(target_cursor) = target {
-                target_cursor.write_json_to(output);
-            } else {
-                output.push_str("null");
-            }
-        }
-        YamlValue::Error(_) => output.push_str("null"),
     }
 }
 
@@ -7300,8 +6779,8 @@ fn fold_plain_line_break(
                 // Valid continuation - position is after the indentation
                 break;
             }
-            // This shouldn't happen if find_plain_scalar_end worked correctly
-            // but handle it gracefully
+            // This shouldn't happen if the scalar's end (`bp_to_text_end`) was
+            // computed correctly, but handle it gracefully
             break;
         }
     }
@@ -16373,15 +15852,14 @@ mod tests {
     }
 
     // ========================================================================
-    // The alternate-parse-path scanners (#324)
+    // Private scanners that need a cursor (#324)
     //
-    // The `#[allow(dead_code)]` STYLE-0005 helpers below are not on the current
-    // parse path, so no integration test can reach them. They were still made
-    // CR-aware, because a helper that silently keeps LF-only semantics is a
-    // trap for whoever re-enables it. These tests pin that behaviour directly
-    // so it cannot rot unnoticed.
+    // `is_in_flow_context` is private, so these tests pin its CR-aware line
+    // walks directly. (`find_plain_scalar_end` and
+    // `compute_base_indent_and_root_flag` were tested here too until #5951,
+    // when `bp_to_text_end` having replaced them left them dead.)
     //
-    // The line-break predicates they build on moved to `super::line_break` in
+    // The line-break predicates it builds on moved to `super::line_break` in
     // #341 and are tested there.
     // ========================================================================
 
@@ -16389,187 +15867,6 @@ mod tests {
     /// below that need a `YamlCursor` but not a particular node.
     fn cursor_over(yaml: &[u8]) -> (YamlIndex<Vec<u64>>, &[u8]) {
         (YamlIndex::build(yaml).expect("parses"), yaml)
-    }
-
-    #[test]
-    fn find_plain_scalar_end_stops_at_every_break_form() {
-        // `value` starts at offset 3 in each spelling; the scan must end at 8,
-        // never carrying the break into the scalar.
-        for yaml in [
-            b"a: value\nb: 2\n".as_slice(),
-            b"a: value\r\nb: 2\r\n".as_slice(),
-            b"a: value\rb: 2\r".as_slice(),
-        ] {
-            let (index, text) = cursor_over(yaml);
-            let root = index.root(text);
-            let input = String::from_utf8_lossy(yaml);
-            assert_eq!(
-                root.find_plain_scalar_end(3, 0, false),
-                8,
-                "input {input:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn find_plain_scalar_end_folds_continuation_lines() {
-        // A more-indented next line continues the scalar under every spelling.
-        for yaml in [
-            b"a: one\n  two\n".as_slice(),
-            b"a: one\r\n  two\r\n".as_slice(),
-            b"a: one\r  two\r".as_slice(),
-        ] {
-            let (index, text) = cursor_over(yaml);
-            let root = index.root(text);
-            let end = root.find_plain_scalar_end(3, 0, false);
-            let input = String::from_utf8_lossy(yaml);
-            let scanned = String::from_utf8_lossy(&text[3..end]);
-            assert!(
-                scanned.ends_with("two"),
-                "input {input:?} scanned {scanned:?}"
-            );
-        }
-    }
-
-    /// A blank line between two content lines does not end a plain scalar —
-    /// the scan steps over it and keeps going. The blank-line arm is where the
-    /// scan measures a break rather than assuming one byte, so a CRLF blank
-    /// line would otherwise leave it standing on the orphaned LF and read that
-    /// as a second blank line (#341).
-    #[test]
-    fn find_plain_scalar_end_steps_over_blank_lines() {
-        for yaml in [
-            b"a: one\n\n  two\nb: 2\n".as_slice(),
-            b"a: one\r\n\r\n  two\r\nb: 2\r\n".as_slice(),
-            b"a: one\r\r  two\rb: 2\r".as_slice(),
-        ] {
-            let (index, text) = cursor_over(yaml);
-            let root = index.root(text);
-            let end = root.find_plain_scalar_end(3, 0, false);
-            let input = String::from_utf8_lossy(yaml);
-            let scanned = String::from_utf8_lossy(&text[3..end]);
-            assert!(
-                scanned.ends_with("two"),
-                "input {input:?} scanned {scanned:?}"
-            );
-        }
-    }
-
-    /// A line holding only spaces and tabs counts as blank for folding, and the
-    /// scan resumes after *its* break. Reached through the tab arm, which walks
-    /// the whitespace run itself and so must measure the break at wherever that
-    /// run stops rather than at the line's start (#341).
-    #[test]
-    fn find_plain_scalar_end_treats_a_whitespace_only_line_as_blank() {
-        for yaml in [
-            b"a: one\n \t \n  two\nb: 2\n".as_slice(),
-            b"a: one\r\n \t \r\n  two\r\nb: 2\r\n".as_slice(),
-            b"a: one\r \t \r  two\rb: 2\r".as_slice(),
-        ] {
-            let (index, text) = cursor_over(yaml);
-            let root = index.root(text);
-            let end = root.find_plain_scalar_end(3, 0, false);
-            let input = String::from_utf8_lossy(yaml);
-            let scanned = String::from_utf8_lossy(&text[3..end]);
-            assert!(
-                scanned.ends_with("two"),
-                "input {input:?} scanned {scanned:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn find_plain_scalar_end_keeps_a_colon_that_is_not_a_separator() {
-        // `12:30` and `http://` hold colons the scan must walk past — only a
-        // colon followed by whitespace or a break ends the scalar.
-        for yaml in [
-            b"a: at 12:30 sharp\nb: 2\n".as_slice(),
-            b"a: at 12:30 sharp\r\nb: 2\r\n".as_slice(),
-            b"a: at 12:30 sharp\rb: 2\r".as_slice(),
-        ] {
-            let (index, text) = cursor_over(yaml);
-            let root = index.root(text);
-            let end = root.find_plain_scalar_end(3, 0, false);
-            let input = String::from_utf8_lossy(yaml);
-            assert_eq!(&text[3..end], b"at 12:30 sharp", "input {input:?}");
-        }
-    }
-
-    #[test]
-    fn compute_base_indent_and_root_flag_finds_the_line_start() {
-        // Second line's value sits at indent 2 and is not document root. The
-        // walk back to the line start has to recognise the preceding break.
-        for yaml in [
-            b"top:\n  key: value\n".as_slice(),
-            b"top:\r\n  key: value\r\n".as_slice(),
-            b"top:\r  key: value\r".as_slice(),
-        ] {
-            let (index, text) = cursor_over(yaml);
-            let root = index.root(text);
-            let value_pos = text
-                .windows(5)
-                .position(|w| w == b"value")
-                .expect("input holds `value`");
-            let (indent, is_root) = root.compute_base_indent_and_root_flag(value_pos);
-            assert_eq!(
-                (indent, is_root),
-                (2, false),
-                "input {:?}",
-                String::from_utf8_lossy(yaml)
-            );
-        }
-    }
-
-    /// The line scan also recognises an explicit-key indicator (`? `), whose
-    /// terminator set includes both break bytes.
-    #[test]
-    fn compute_base_indent_and_root_flag_sees_an_explicit_key_indicator() {
-        for yaml in [
-            b"? key\n: value\n".as_slice(),
-            b"? key\r\n: value\r\n".as_slice(),
-            b"? key\r: value\r".as_slice(),
-        ] {
-            let (index, text) = cursor_over(yaml);
-            let root = index.root(text);
-            let key_pos = text
-                .windows(3)
-                .position(|w| w == b"key")
-                .expect("input holds `key`");
-            // Reached at all is the point: the `?` branch is on this path only
-            // when the indicator is followed by whitespace or a break.
-            let (indent, _) = root.compute_base_indent_and_root_flag(key_pos);
-            assert_eq!(indent, 0, "input {:?}", String::from_utf8_lossy(yaml));
-        }
-    }
-
-    #[test]
-    fn compute_base_indent_and_root_flag_looks_back_for_a_document_marker() {
-        // A value alone on its line sends the scan back over the *previous*
-        // line to look for `---`. That walk-back is a second line-start scan,
-        // and a lone CR hides the boundary from an LF-only one.
-        for (yaml, expect_root) in [
-            (b"---\nplain\n".as_slice(), true),
-            (b"---\r\nplain\r\n".as_slice(), true),
-            (b"---\rplain\r".as_slice(), true),
-            // No marker on the previous line: not document root.
-            (b"key:\nplain\n".as_slice(), false),
-            (b"key:\r\nplain\r\n".as_slice(), false),
-            (b"key:\rplain\r".as_slice(), false),
-        ] {
-            let (index, text) = cursor_over(yaml);
-            let root = index.root(text);
-            let value_pos = text
-                .windows(5)
-                .position(|w| w == b"plain")
-                .expect("input holds `plain`");
-            let (_, is_root) = root.compute_base_indent_and_root_flag(value_pos);
-            assert_eq!(
-                is_root,
-                expect_root,
-                "input {:?}",
-                String::from_utf8_lossy(yaml)
-            );
-        }
     }
 
     #[test]
@@ -17145,6 +16442,110 @@ mod tests {
             }
         }
         panic!("Could not find value");
+    }
+
+    /// Write a YAML value as JSON from a bare `YamlValue` with no cursor of its
+    /// own — e.g. one already extracted via `YamlElements::uncons`/`get`.
+    ///
+    /// No production call site reaches this (#224, #5951): every real path
+    /// recurses via a cursor instead (`YamlElements::uncons_cursor` +
+    /// `YamlCursor::write_json_to`), since a node's own tag lives on its
+    /// `bp_pos`, which a bare `YamlValue` has already lost. It is the
+    /// value-only half of `test_sequence_element_accessors_agree`, which asserts
+    /// `uncons`/`get`/`uncons_cursor` all produce identical JSON (#332).
+    fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlValue<'_, W>) {
+        match value {
+            YamlValue::Null => output.push_str("null"),
+            YamlValue::String(s) => {
+                // Direct transcoding optimization (avoids intermediate allocation for quoted strings)
+                match write_yaml_string_to_json(output, &s) {
+                    Ok(true) => {} // Written directly as JSON string
+                    Ok(false) => {
+                        if let Ok(str_val) = s.as_str() {
+                            if s.is_unquoted() {
+                                // Plain scalar - resolve per the core schema.
+                                // `false`: this function takes a bare `YamlValue`
+                                // with no `YamlIndex` to read #996's
+                                // `canonicalize_numbers` flag from, and per this
+                                // function's own doc comment has no production
+                                // call site to matter for anyway (test-only).
+                                write_yaml_scalar_as_json(output, &str_val, false);
+                            } else {
+                                // Block scalars are always strings
+                                write_json_string(output, &str_val);
+                            }
+                        } else {
+                            output.push_str("null");
+                        }
+                    }
+                    Err(_) => output.push_str("null"),
+                }
+            }
+            YamlValue::Mapping(fields) => {
+                // #4983: a mapping renders through yq's rendering expansion, not the iteration one.
+                let fields = fields.rendered_for_json();
+                output.push('{');
+                let mut first = true;
+                for field in fields {
+                    if !first {
+                        output.push(',');
+                    }
+                    first = false;
+
+                    // Write key - try direct transcoding first
+                    if let YamlValue::String(s) = field.key() {
+                        match write_yaml_string_to_json(output, &s) {
+                            Ok(true) => {} // Written directly
+                            Ok(false) | Err(_) => {
+                                // Fall back to original path
+                                if let Ok(key_str) = s.as_str() {
+                                    write_json_string(output, &key_str);
+                                } else {
+                                    output.push_str("\"\"");
+                                }
+                            }
+                        }
+                    } else {
+                        // Alias/complex key (#222): resolve alias-to-scalar,
+                        // else "" — the entry is kept, never dropped
+                        write_json_string(output, &field.key().key_string());
+                    }
+
+                    output.push(':');
+                    field.value_cursor().write_json_to(output);
+                }
+                output.push('}');
+            }
+            YamlValue::Sequence(elements) => {
+                output.push('[');
+                let mut first = true;
+                let mut rest = elements;
+                // `uncons_resolved_cursor`, not `uncons_cursor` (#835): see the
+                // matching comment in `stream_json_value`'s `Sequence` arm -
+                // `write_json_to` (called below) has the same unresolved
+                // `explicit_tag()` dependency in its own String arm.
+                while let Some((cursor, next)) = rest.uncons_resolved_cursor() {
+                    if !first {
+                        output.push(',');
+                    }
+                    first = false;
+                    rest = next;
+                    // A child element does have a cursor even though this
+                    // function's own top-level `value` doesn't - use it so a
+                    // nested element's tag isn't lost either.
+                    cursor.write_json_to(output);
+                }
+                output.push(']');
+            }
+            YamlValue::Alias { target, .. } => {
+                if let Some(target_cursor) = target {
+                    target_cursor.write_json_to(output);
+                } else {
+                    output.push_str("null");
+                }
+            }
+            YamlValue::Error(_) => output.push_str("null"),
+        }
     }
 
     /// Helper: render a `YamlValue` as JSON, matching `to_json`'s output.
