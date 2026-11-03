@@ -87263,10 +87263,18 @@ pub(crate) fn each_range_batches(
         // `from_literal` is forwarded on this arm too (#3103): an integer
         // literal generally renders identically to its own `i64` (so it is
         // usually `None` here anyway), but `-0` is the one legal-JSON exception.
+        //
+        // Only that `-0` is kept here: any other integer literal (#6064's past-2^53 one
+        // included) is the same `i64` the walk pushes, as an exact `Int`.
         (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => drive_range_batches(
             f,
             cap,
-            |from, max_len| range_batch_int(from, t, st, first_value.take(), max_len),
+            |from, max_len| {
+                let first = first_value
+                    .take()
+                    .filter(|v| matches!(v, OwnedValue::NumberLiteral(NumberRepr::Int(0), _)));
+                range_batch_int(from, t, st, first, max_len)
+            },
             each,
         ),
         (f, t, st) => {
