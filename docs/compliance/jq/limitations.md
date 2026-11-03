@@ -7463,7 +7463,8 @@ Three differences remain.
 - **Two greedy `X+` repeats with one optional repeat between them are refused on the second engine (#6096).**
   `fancy-regex` 0.20.0 answers wrongly for them: `"a" | test("(?=a)a+a*a+")` is `true` there, and `false` in jq and in the `regex` crate.
   It is wrong for `a+b*a+` and `.+.*.+` too (the repeat between the plusses can be any atom, and any `{0,n}`), for a chain of them (`a+b*a+b*a+` on `aa`), and for `(?:ab)+c*(?:ab)+`.
-  Two repeats between them, a mandatory item, a different atom for either plus and bounded repeats such as `a{1,3}b*a{1,3}` are answered correctly, and not refused.
+  Two repeats between them, a mandatory item, a different atom for either plus, bounded repeats such as `a{1,3}b*a{1,3}`, a lazy plus at either end, and an alternation or a capture group as the middle repeat (`a+(?:a|)a+`, `a+(a*)a+`) are answered correctly, and not refused.
+  The shape is found wherever it sits: inside a group, an alternation, an atomic group, a look-ahead or a look-behind.
   A pattern with the shape that needs the second engine (a lookaround, a backreference, `\K`) gets the `invalid regex` error whatever the text, though the engine answers some texts right (`aa` for `a+a*a+`), since a pattern cannot tell which.
   Without a second-engine feature the shape keeps the `regex` crate, and `l` and `n` keep their old route for it, so those answer as jq does.
   Pinned by `tests/jq_cli/i6096.rs` (a mutant that drops the guard, one that ignores that the two plusses must match, and one that ignores that the repeat between them must be optional all fail it).

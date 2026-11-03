@@ -557,3 +557,79 @@ fn nearby_shapes_on_the_second_engine_still_agree_with_jq() -> Result<()> {
     }
     Ok(())
 }
+
+/// The run is found wherever it sits: in a group, an alternation, an atomic group, a repeated group, a
+/// look-ahead and a look-behind.
+#[test]
+fn a_squeezed_plus_run_nested_in_another_construct_is_refused() -> Result<()> {
+    const SHAPES: &[&str] = &[
+        r"(?=[\s\S])(a+a*a+)",
+        r"(?=[\s\S])(?:x|a+a*a+)",
+        r"(?=[\s\S])(?>a+a*a+)",
+        r"(?=[\s\S])(?:a+a*a+)+",
+        r"(?=[\s\S])b(?=a+a*a+)",
+        r"(?=[\s\S])(?<=x)a+a*a+",
+    ];
+    for pattern in SHAPES {
+        for text in ["a", "xa", "ba", "aa"] {
+            assert_eq!(
+                test_on(text, pattern, "")?,
+                r#""ERR""#,
+                "{text:?} ~ {pattern:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Variants the engine answers correctly, so they are not refused: a lazy plus at either end, an
+/// alternation or a capture group as the middle repeat.
+#[test]
+fn variants_the_engine_gets_right_are_not_refused() -> Result<()> {
+    const ROWS: &[(&str, &str, &str, &str)] = &[
+        (r"a", r"(?=[\s\S])a+(?:a|)a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+(?:a|)a+", "", r"true"),
+        (r"aaa", r"(?=[\s\S])a+(?:a|)a+", "", r"true"),
+        (r"xa", r"(?=[\s\S])a+(?:a|)a+", "", r"false"),
+        (r"ba", r"(?=[\s\S])a+(?:a|)a+", "", r"false"),
+        (r"xaa", r"(?=[\s\S])a+(?:a|)a+", "", r"true"),
+        (r"a", r"(?=[\s\S])a+(a*)a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+(a*)a+", "", r"true"),
+        (r"aaa", r"(?=[\s\S])a+(a*)a+", "", r"true"),
+        (r"xa", r"(?=[\s\S])a+(a*)a+", "", r"false"),
+        (r"ba", r"(?=[\s\S])a+(a*)a+", "", r"false"),
+        (r"xaa", r"(?=[\s\S])a+(a*)a+", "", r"true"),
+        (r"a", r"(?=[\s\S])a+(?:a|b)a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+(?:a|b)a+", "", r"false"),
+        (r"aaa", r"(?=[\s\S])a+(?:a|b)a+", "", r"true"),
+        (r"xa", r"(?=[\s\S])a+(?:a|b)a+", "", r"false"),
+        (r"ba", r"(?=[\s\S])a+(?:a|b)a+", "", r"false"),
+        (r"xaa", r"(?=[\s\S])a+(?:a|b)a+", "", r"false"),
+        (r"a", r"(?=[\s\S])a+?a*a+?", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+?a*a+?", "", r"true"),
+        (r"aaa", r"(?=[\s\S])a+?a*a+?", "", r"true"),
+        (r"xa", r"(?=[\s\S])a+?a*a+?", "", r"false"),
+        (r"ba", r"(?=[\s\S])a+?a*a+?", "", r"false"),
+        (r"xaa", r"(?=[\s\S])a+?a*a+?", "", r"true"),
+        (r"a", r"(?=[\s\S])a+?a*a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+?a*a+", "", r"true"),
+        (r"aaa", r"(?=[\s\S])a+?a*a+", "", r"true"),
+        (r"xa", r"(?=[\s\S])a+?a*a+", "", r"false"),
+        (r"ba", r"(?=[\s\S])a+?a*a+", "", r"false"),
+        (r"xaa", r"(?=[\s\S])a+?a*a+", "", r"true"),
+        (r"a", r"(?=[\s\S])a+a*a+?", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+a*a+?", "", r"true"),
+        (r"aaa", r"(?=[\s\S])a+a*a+?", "", r"true"),
+        (r"xa", r"(?=[\s\S])a+a*a+?", "", r"false"),
+        (r"ba", r"(?=[\s\S])a+a*a+?", "", r"false"),
+        (r"xaa", r"(?=[\s\S])a+a*a+?", "", r"true"),
+    ];
+    for (text, pattern, flags, want) in ROWS {
+        assert_eq!(
+            test_on(text, pattern, flags)?,
+            *want,
+            "{text:?} ~ {pattern:?} [{flags}]"
+        );
+    }
+    Ok(())
+}
