@@ -7505,6 +7505,34 @@ exists for the two-sided check to pin, the same caveat
 [ADR-0018](../../adrs/adr-0018.md)'s Consequences already record for
 [yq Limitations](../yq/limitations.md).
 
+## A capture under an unbounded repeat keeps its last non-empty iteration (#6069)
+
+Oniguruma tries one more iteration after the last non-empty one of an unbounded repeat (`*`, `+`, or `{0,}` and `{1,}`, which spell them).
+When the group's body can match the empty string there, it records that empty match.
+`"ab" | match("(a*)*b").captures[0]` is `{"offset":1,"length":0,"string":"","name":null}` in jq 1.7.1, and `{"offset":0,"length":1,"string":"a","name":null}` here.
+The matched text, its offsets and every other capture agree.
+Only a group whose body can match empty and sits under `*` or `+` differs:
+
+- `match("(a*)*b")` over `"ab"`: jq `[1,0,""]`, here `[0,1,"a"]`.
+- `match("(a*)+b")` over `"aab"`: jq `[2,0,""]`, here `[0,2,"aa"]`.
+- `match("(a?)*b")` over `"ab"`: jq `[1,0,""]`, here `[0,1,"a"]`.
+- `match("(a|b*)*c")` over `"abc"`: jq `[2,0,""]`, here `[1,1,"b"]`.
+- `match("(\\w*\\s*)*$")` over `"ab cd"`: jq `[5,0,""]`, here `[3,2,"cd"]`.
+- `capture("(?<x>a*)*b")` over `"aab"`: jq `{"x":""}`, here `{"x":"aa"}`.
+- `[match("(a*)*b";"g").captures[0].string]` over `"aab ab"`: jq `["",""]`, here `["aa","a"]`.
+
+A capture is shown as `[offset, length, string]`; `capture` and the last row show the program's output.
+A body that cannot match empty (`(a+)*b`), a lazy repeat (`(a*)*?b`) and a body with text outside the group (`(?:(a*),)*b`) agree.
+So does a bounded repeat (`(a*){0,5}b`, `(a*){2}b`) and `(a*){2,}b`, because the `regex` crate expands it into copies and the last copy matches empty, which is an accident of the expansion and not a rule.
+`(a*){0,}b` and `(a*){1,}b` are written as unbounded repeats and differ like `*` and `+`.
+
+Neither engine in the stack ends a loop this way.
+`"ab" | match("(?=)(a*)*b")` is routed to `fancy-regex` by the empty lookahead and answers `[0,1,"a"]`, the same as the plain pattern.
+`onig` and `pcre2` fail the portability bar ([ADR-0019](../../adrs/adr-0019.md)'s candidates table).
+A post-processing fix, replacing the capture with an empty one at the end of the last iteration, is unsound.
+Where the loop ends depends on backtracking from the rest of the pattern: `"aab" | match("(a*)*ab").captures[0]` is `[1,0,""]` in jq, with the loop giving back a character the rest of the pattern needs.
+The divergence is recorded, not accepted under [ADR-0018](../../adrs/adr-0018.md) rule 4(d), whose candidates-table bar this entry does not claim to meet.
+
 ## `$` before a final newline (#5572)
 
 jq's `$` matches at the end of the text or just before a final `\n`, and the `regex` crate's does not, so a pattern with `$` is searched in the text and again in the text without its last `\n` (`dv_captures_at`).
