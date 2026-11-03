@@ -6968,6 +6968,7 @@ fn get_inputs(
                                 file_start,
                                 seams: seams.clone(),
                                 last_source: locations.last_src(),
+                                last_span: None,
                                 recorded_tail,
                             });
                             if recorded_tail.is_none() {
@@ -9309,6 +9310,8 @@ struct LazyMore {
     seams: Vec<Seam>,
     /// The tag of the last source, which the end of the stream names.
     last_source: u32,
+    /// The last document of a chunk already read, which is all the end of the stream is read off.
+    last_span: Option<(usize, usize)>,
     /// The end of the stream where [`get_inputs`] recorded it before the scan, for a stream that is
     /// not UTF-8 (the one case whose seam the substitution moves); else it is read off the spans
     /// when the scan reaches the end.
@@ -9473,7 +9476,10 @@ fn lazy_json_producer_then(
         // Every document scanned so far is read: scan the next chunk (#5856).
         if next == lazy.spans.len() {
             lazy_scan_on(lazy, &mut tail, &mut exhausted);
-            if next == lazy.spans.len() {
+            // The documents read are forgotten, so the spans held are a chunk's, not the stream's.
+            next = 0;
+            batch = None;
+            if lazy.spans.is_empty() {
                 stream = None;
                 batch = None;
                 return tail
@@ -9525,8 +9531,11 @@ fn lazy_scan_on(
     exhausted: &mut Option<(u32, u32)>,
 ) {
     let Some(mut more) = lazy.more.take() else {
+        lazy.spans.clear();
         return;
     };
+    more.last_span = lazy.spans.last().copied().or(more.last_span);
+    lazy.spans.clear();
     let chunk = lazy_json_scan_chunk(&lazy.text, more.scanned_to, lazy_chunk_budget(more.chunks));
     more.chunks += 1;
     #[cfg(test)]
@@ -9552,10 +9561,10 @@ fn lazy_scan_on(
             lazy.more = Some(more);
         }
         ChunkEnd::Done => {
-            *exhausted =
-                settled(more.recorded_tail.unwrap_or_else(|| {
-                    EofTail::of_clean_source(lazy.text.as_bytes(), &lazy.spans)
-                }));
+            let last = lazy.spans.last().copied().or(more.last_span);
+            *exhausted = settled(more.recorded_tail.unwrap_or_else(|| {
+                EofTail::of_clean_source(lazy.text.as_bytes(), last.as_slice())
+            }));
         }
         ChunkEnd::Fault => {
             let text = lazy.text.as_str();
