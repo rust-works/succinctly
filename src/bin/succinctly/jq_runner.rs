@@ -6666,7 +6666,8 @@ fn get_inputs(
         && json_input_mode
         && !args.stream
         && (raw_bytes.len() == 1
-            || (!args.validate
+            || (raw_bytes.len() > 1
+                && !args.validate
                 && raw_bytes
                     .iter()
                     .all(|(_, raw)| succinctly::text::utf8::validate_utf8(raw).is_ok())));
@@ -9706,6 +9707,9 @@ fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Ve
     Ok(raw)
 }
 
+/// One file's documents and its [`Seam`] (#5857).
+type LazySourceScan = (Vec<(usize, usize)>, Seam);
+
 /// The lazy route's sources for a stream of several files (#5857): each file's documents and its
 /// [`Seam`], and the end of the stream read from the last file's spans, or `None` when any file
 /// is not clean plain JSON the route converts (a parse error, a BOM, a document nested too deeply)
@@ -9715,7 +9719,7 @@ fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Ve
 fn lazy_json_sources(
     raw_inputs: &[(Option<usize>, String)],
     seams: &[Seam],
-) -> Option<(EofTail, Vec<(Vec<(usize, usize)>, Seam)>)> {
+) -> Option<(EofTail, Vec<LazySourceScan>)> {
     let mut sources = Vec::with_capacity(raw_inputs.len());
     for (pos, (_, raw)) in raw_inputs.iter().enumerate() {
         let spans = if raw
