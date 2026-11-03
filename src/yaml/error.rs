@@ -9,7 +9,11 @@ use alloc::string::String;
 use core::fmt;
 
 /// Errors that can occur during YAML parsing.
+///
+/// Marked `#[non_exhaustive]` so a variant can be added or removed without breaking a
+/// downstream `match`; add a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum YamlError {
     /// Tab character used for indentation (YAML forbids tabs).
     TabIndentation {
@@ -41,23 +45,6 @@ pub enum YamlError {
     InvalidUtf8 {
         /// Byte offset where invalid UTF-8 starts
         offset: usize,
-    },
-
-    /// Document marker found but multi-document not supported.
-    /// Note: Multi-document streams are now supported in Phase 5+.
-    #[deprecated(note = "Multi-document streams are now supported in Phase 5+")]
-    MultiDocumentNotSupported {
-        /// Byte offset of the `---` marker
-        offset: usize,
-    },
-
-    /// Flow style (`{` or `[`) - kept for backwards compatibility but no longer used.
-    #[deprecated(note = "Flow style is now supported in Phase 2+")]
-    FlowStyleNotSupported {
-        /// Byte offset of the flow character
-        offset: usize,
-        /// The flow character found
-        char: char,
     },
 
     /// Invalid anchor name (empty or contains invalid characters).
@@ -105,7 +92,12 @@ pub enum YamlError {
     },
 
     /// Tag not supported - kept for backwards compatibility but no longer used.
-    #[deprecated(note = "Tags are now supported (#224)")]
+    ///
+    /// Returned by 0.7.0 and earlier for a `!` tag. Removal is planned for 0.9.0.
+    #[deprecated(
+        since = "0.8.0",
+        note = "tags are resolved since #224, so this is never returned; to be removed in 0.9.0"
+    )]
     TagNotSupported {
         /// Byte offset of the `!`
         offset: usize,
@@ -206,19 +198,6 @@ impl fmt::Display for YamlError {
             }
             Self::InvalidUtf8 { offset } => {
                 write!(f, "invalid UTF-8 sequence at offset {offset}")
-            }
-            #[allow(deprecated)]
-            // STYLE-0004: Display arm for a deprecated error variant kept for back-compat
-            Self::MultiDocumentNotSupported { offset } => {
-                write!(
-                    f,
-                    "multi-document YAML not supported (found `---` at offset {offset})"
-                )
-            }
-            #[allow(deprecated)]
-            // STYLE-0004: Display arm for a deprecated error variant kept for back-compat
-            Self::FlowStyleNotSupported { offset, char } => {
-                write!(f, "flow style '{char}' not supported at offset {offset}")
             }
             Self::InvalidAnchorName { offset, reason } => {
                 write!(f, "invalid anchor name at offset {offset}: {reason}")
@@ -451,23 +430,6 @@ mod tests {
             err.to_string(),
             "input too large: 5000000000 bytes exceeds the u32::MAX-byte (4 GiB) indexing limit"
         );
-    }
-
-    #[test]
-    #[allow(deprecated)] // STYLE-0004: test intentionally exercises deprecated variants' Display arms
-    fn test_deprecated_variant_display() {
-        // Deprecated but still part of the enum and its Display arms.
-        let err = YamlError::MultiDocumentNotSupported { offset: 0 };
-        assert_eq!(
-            err.to_string(),
-            "multi-document YAML not supported (found `---` at offset 0)"
-        );
-
-        let err = YamlError::FlowStyleNotSupported {
-            offset: 3,
-            char: '[',
-        };
-        assert_eq!(err.to_string(), "flow style '[' not supported at offset 3");
     }
 
     #[test]
