@@ -593,7 +593,13 @@ mod tests {
     /// still a read of the whole node.
     #[test]
     fn a_parenthesized_head_is_a_field_head_read_5544() {
-        let heads = |fields: &[&str]| fields.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+        let heads = |fields: &[&str]| {
+            fields
+                .iter()
+                .copied()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(field_heads("$u.a"), (heads(&["a"]), false));
         assert_eq!(field_heads("($u).a"), (heads(&["a"]), false));
         assert_eq!(field_heads("(($u)).a"), (heads(&["a"]), false));
