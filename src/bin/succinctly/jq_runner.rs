@@ -14423,7 +14423,8 @@ mod tests {
             for at in 0..=base.len() {
                 for fault in faults {
                     let stream = [&base[..at], fault, &base[at..]].concat();
-                    let (eager, _) = observe(&stream, true);
+                    let (eager, eager_lazy) = observe(&stream, true);
+                    assert_eq!(eager_lazy, 0, "the reference route is eager");
                     let (hybrid, lazy_documents) = observe(&stream, false);
                     assert_eq!(
                         hybrid,
@@ -14440,6 +14441,37 @@ mod tests {
         assert!(
             lazy_prefixes > 1000,
             "{lazy_prefixes} streams kept a lazy prefix"
+        );
+        // Two faults in one stream: the eager loop resumes after the first and meets the second,
+        // so the parse errors' "documents before it" counts are several (`lazy_tail_items`).
+        let more: [&[u8]; 5] = [b"}", b"x", b"007", b"3}", b"\"unclosed"];
+        let (mut pairs, mut lazy_pairs) = (0usize, 0usize);
+        for base in [&b"1\n[2]\n"[..], b"\"a\" {\"a\":null}", b"[1,2] true\n"] {
+            for at in 0..=base.len() {
+                for first in more {
+                    let once = [&base[..at], first, &base[at..]].concat();
+                    for then in 0..=once.len() {
+                        for second in more {
+                            let stream = [&once[..then], second, &once[then..]].concat();
+                            let (eager, _) = observe(&stream, true);
+                            let (hybrid, lazy_documents) = observe(&stream, false);
+                            assert_eq!(
+                                hybrid,
+                                eager,
+                                "{:?} (a lazy prefix of {lazy_documents})",
+                                String::from_utf8_lossy(&stream)
+                            );
+                            pairs += 1;
+                            lazy_pairs += usize::from(lazy_documents > 0);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(pairs > 3000, "{pairs} two-fault streams");
+        assert!(
+            lazy_pairs > 500,
+            "{lazy_pairs} two-fault streams kept a lazy prefix"
         );
     }
 
