@@ -12,10 +12,15 @@ const MAX_WIDTH: usize = 80;
 /// `line_content` as it is shown under an error at the 1-based byte `column`, and how many
 /// characters of the shown line (the `...` prefix included) come before the caret.
 ///
+/// `column` counts bytes of `line_content` (the validators' positions do); one that falls inside a
+/// character, or past the end of the line, is moved down to a boundary.
+///
 /// A line of [`MAX_WIDTH`] bytes or fewer is shown whole. A longer one shows its first
 /// [`MAX_WIDTH`] bytes when the error is in the first half of one, its last [`MAX_WIDTH`] bytes
 /// when it is in the last half, and a window centred on the error otherwise, each side that was
-/// cut marked with `...`.
+/// cut marked with `...`. A window that starts mid-character starts on the character's first
+/// byte, so it can be up to three bytes wider than [`MAX_WIDTH`]. The caret counts characters, not
+/// display columns: a wide character or a tab before the error still counts one.
 pub(crate) fn truncate_line(line_content: &str, column: usize) -> (String, usize) {
     let floor_boundary = |mut at: usize| {
         at = at.min(line_content.len());
