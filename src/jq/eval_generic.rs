@@ -15618,8 +15618,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // cursor threaded into every slot -- the wildcard bridge below materialized
         // and reindexed the whole ambient value to read a field of it, so
         // `[.users[] | "\(.name)"]` and `map("\(.name)")` copied every record.
-        // Every other slot, and yq mode (`eval::eval_string_interpolation`: its slots
-        // take only a first value, which this recursion does not model), keep the bridge.
+        // Every other slot keeps the bridge. yq mode (#6092) reads its slots here as well, a
+        // first value each (`yq_interpolation_text`; `eval::eval_string_interpolation` is its
+        // bridge twin), because its slots are `to_string` stages that need the node's own style.
         Expr::StringInterpolation(parts)
             if interpolation_reads_by_navigation(parts, S::TAG == EvalTag::Yq) =>
         {
