@@ -9794,7 +9794,8 @@ reads) plus two consequences of the route:
   A stream that ends in a bare token and the one character that ends it (`1[`, `true{`) closes jq's array before the end-of-file fault, which then comes after the array and names `<unknown>`.
   So does succinctly since [#6004](https://github.com/rust-works/succinctly/issues/6004): `printf '1[' | jq -cs .` prints `[1]` and then the parse error, and an `input` that meets the fault names `(at <unknown>)`.
   Only that shape does, and only where it ends the whole stream: `1 [`, `"a"[` and `[1][` keep the all-or-nothing slurp and the file in the marker, as in jq, and so does a token followed by a file that would not open.
-  `--stream -s` still prints nothing for it, where jq prints the token's events (`printf '1[' | jq -cs --stream .` is `[[[],1]]` before the error).
+  `--stream -s` does the same since [#6061](https://github.com/rust-works/succinctly/issues/6061), and for every fault met by a call after the one that closes its array: jq closes the array at the call that consumes the last byte, so an event that byte completes is in it (`printf '1[' | jq -cs --stream .` is `[[[],1]]`, `[1,` is `[[[0],1]]`, `[{}` is `[[[0],{}]]`) and the end-of-input fault comes after it.
+  A fault met by that call or an earlier one is still the whole result (`[1,2`, `1 [`).
   A file earlier than the one the splitter stopped in is read again from disk to find a fault ahead of it, since its buffer is gone.
 - A value jq rejects as undecodable (`"\ud800"`, `"\x"`) is echoed raw, as on the default
   route ([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md)), where
