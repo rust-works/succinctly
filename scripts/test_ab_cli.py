@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -188,11 +189,48 @@ class BusyProcessTests(unittest.TestCase):
     behaves against it.
 
     The idle program is whichever of `sleep` and the Python interpreter stays alive under a
-    different name (#5927). On Ubuntu 26.04 `sleep` is uutils coreutils, one multi-call binary
-    that refuses to run under another name (`Security violation: Requested utility `cargo`
-    does not match executable name`), so a `sleep` symlinked as `cargo` exits at once and
-    nothing is left for `pgrep` to find; on macOS the system `python3` is a launcher that does
-    not survive a rename either, and `sleep` does."""
+    different name (#5927). Observed: on Ubuntu 26.04 `sleep` is uutils coreutils, one
+    multi-call binary that refuses to run under another name (`Security violation: Requested
+    utility `cargo` does not match executable name`), so a `sleep` symlinked as `cargo` exits at
+    once and nothing is left for `pgrep` to find; on macOS the Xcode `python3` did not stay alive
+    under another name (three of these tests failed with it) and `sleep` does. If neither does,
+    the set-up fails: a skip would hide that the idleness probe is untested."""
+
+    _idle = None  # (program, args), found once for the class
+
+    @classmethod
+    def setUpClass(cls):
+        cls._idle = cls._find_idle_program()
+
+    @staticmethod
+    def _find_idle_program():
+        """`(program, args)` of an idle process that keeps running under another name."""
+        candidates = [
+            (shutil.which("sleep"), ("30",)),
+            (sys.executable, ("-c", "import time; time.sleep(30)")),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = pathlib.Path(tmp) / "probe-idle"
+            for program, args in candidates:
+                if not program:
+                    continue
+                probe.symlink_to(program)
+                proc = None
+                try:
+                    proc = subprocess.Popen([str(probe), *args], stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL)
+                    time.sleep(0.5)  # a refusal is immediate; this is only slow on a loaded host
+                    if proc.poll() is None:
+                        return program, args
+                except OSError:
+                    pass  # cannot be started under another name: try the next
+                finally:
+                    if proc is not None and proc.poll() is None:
+                        proc.kill()
+                    if proc is not None:
+                        proc.wait()
+                    probe.unlink()
+        raise AssertionError("no program stays alive under another name: nothing to find with pgrep")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -200,32 +238,7 @@ class BusyProcessTests(unittest.TestCase):
         self.dir = pathlib.Path(self._tmp.name)
         self._procs = []
         self.addCleanup(self._stop)
-        self.interpreter, self.idle_args = self._idle_program()
-
-    def _idle_program(self):
-        """`(program, args)` of an idle process that keeps running under another name."""
-        candidates = [
-            (shutil.which("sleep"), ("30",)),
-            (sys.executable, ("-c", "import time; time.sleep(30)")),
-        ]
-        for program, args in candidates:
-            if not program:
-                continue
-            probe = self.dir / "probe-idle"
-            probe.symlink_to(program)
-            proc = subprocess.Popen([str(probe), *args], stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
-            try:
-                alive = proc.wait(timeout=0.5) is None
-            except subprocess.TimeoutExpired:
-                alive = True
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-            probe.unlink()
-            if alive:
-                return program, args
-        self.skipTest("no program stays alive under another name")
+        self.idle_program, self.idle_args = self._idle
 
     def _stop(self):
         for proc in self._procs:
@@ -242,7 +255,7 @@ class BusyProcessTests(unittest.TestCase):
     def link_to_idle_program(self, relative):
         path = self.dir / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.symlink_to(self.interpreter)
+        path.symlink_to(self.idle_program)
         return path
 
     @staticmethod
