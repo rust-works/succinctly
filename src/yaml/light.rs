@@ -3655,9 +3655,10 @@ fn write_yaml_string_to_json_at(
                 // Fast path: no decoding needed, just JSON-escape
                 let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
                 write_json_string(output, s);
-            } else if !json_sourced && holds_unicode_scalar_break(bytes) {
-                // U+0085/U+2028/U+2029 fold as go-yaml reads them (#4913). Rare, so decode and
-                // escape rather than teach the transcoder a second kind of break.
+            } else if !json_sourced && double_quoted_needs_decoder(bytes) {
+                // U+0085/U+2028/U+2029 fold as go-yaml reads them (#4913), and a break after an
+                // escaped break is kept (#6067). Rare, so decode and escape rather than teach the
+                // transcoder a second kind of break.
                 write_json_string(output, &decode_double_quoted(bytes, false)?);
             } else {
                 // Transcode directly: YAML escapes → JSON escapes
@@ -4580,8 +4581,9 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
                 let s = core::str::from_utf8(bytes)
                     .map_err(|_| decode_failure(YamlStringError::InvalidUtf8))?;
                 stream_json_string(out, s)?;
-            } else if !json_sourced && holds_unicode_scalar_break(bytes) {
-                // U+0085/U+2028/U+2029 fold as go-yaml reads them (#4913): decode, then escape.
+            } else if !json_sourced && double_quoted_needs_decoder(bytes) {
+                // U+0085/U+2028/U+2029 fold as go-yaml reads them (#4913), and a break after an
+                // escaped break is kept (#6067): decode, then escape.
                 let decoded = decode_double_quoted(bytes, false).map_err(decode_failure)?;
                 stream_json_string(out, &decoded)?;
             } else {
@@ -6445,8 +6447,12 @@ fn decode_double_quoted(bytes: &[u8], json_sourced: bool) -> Result<String, Yaml
     // A JSON-sourced scalar never folds (#3380), so U+0085/U+2028/U+2029 in one are content.
     let unicode = !json_sourced && holds_unicode_scalar_break(bytes);
     let mut i = 0;
+    // Whether the text just before `i` is an escaped line break and the blanks after it: go-yaml
+    // is then at the start of a line, so a literal break that follows is kept, not folded (#6067).
+    let mut after_escaped_break = false;
 
     while i < bytes.len() {
+        let carried = core::mem::take(&mut after_escaped_break);
         match bytes[i] {
             b'\\' => {
                 if i + 1 >= bytes.len() {
@@ -6478,6 +6484,7 @@ fn decode_double_quoted(bytes: &[u8], json_sourced: bool) -> Result<String, Yaml
                         while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
                             i += 1;
                         }
+                        after_escaped_break = true;
                         continue; // Don't increment i again at end of loop
                     }
                     0xC2 | 0xE2 if scalar_break(bytes, i, unicode).is_some() => {
@@ -6486,6 +6493,7 @@ fn decode_double_quoted(bytes: &[u8], json_sourced: bool) -> Result<String, Yaml
                         while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
                             i += 1;
                         }
+                        after_escaped_break = true;
                         continue;
                     }
                     b'x' => {
@@ -6531,7 +6539,7 @@ fn decode_double_quoted(bytes: &[u8], json_sourced: bool) -> Result<String, Yaml
             }
             _ if scalar_break(bytes, i, unicode).is_some() => {
                 // Line folding: handle newlines
-                i = fold_quoted_line_break(bytes, i, unicode, &mut result);
+                i = fold_quoted_line_break(bytes, i, unicode, carried, &mut result);
             }
             _ => {
                 // Regular content - copy until we hit escape or newline
@@ -6717,6 +6725,44 @@ fn holds_unicode_scalar_break(bytes: &[u8]) -> bool {
     false
 }
 
+/// Whether a double-quoted body has a line break after an escaped one (`z\⏎⏎ x`), with only blanks
+/// between them. go-yaml keeps every break of such a run (the escaped break leaves it at the start
+/// of a line, so the first break after it is not folded to a space), where an ordinary run drops
+/// the first and keeps the rest (#6067).
+fn holds_break_after_escaped_break(bytes: &[u8]) -> bool {
+    if !bytes.contains(&b'\\') {
+        return false;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        // `bytes[i]` is what the backslash escapes; only a break there is an escaped break.
+        let Some(escaped) = scalar_break(bytes, i, true) else {
+            i += 1;
+            continue;
+        };
+        i += escaped.width;
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+            i += 1;
+        }
+        if scalar_break(bytes, i, true).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the double-quoted transcoders must hand a body to [`decode_double_quoted`]: it holds a
+/// kind of break they do not fold ([`holds_unicode_scalar_break`], #4913) or a break after an
+/// escaped one ([`holds_break_after_escaped_break`], #6067). One definition for both callers.
+fn double_quoted_needs_decoder(bytes: &[u8]) -> bool {
+    holds_unicode_scalar_break(bytes) || holds_break_after_escaped_break(bytes)
+}
+
 const SWAR_LOW: u64 = 0x0101_0101_0101_0101;
 const SWAR_HIGH: u64 = 0x8080_8080_8080_8080;
 
@@ -6821,7 +6867,7 @@ fn decode_single_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
             }
             _ if scalar_break(bytes, i, unicode).is_some() => {
                 // Line folding
-                i = fold_quoted_line_break(bytes, i, unicode, &mut result);
+                i = fold_quoted_line_break(bytes, i, unicode, false, &mut result);
             }
             _ => {
                 // Regular content
@@ -6859,11 +6905,20 @@ fn decode_single_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
 /// - With more, a first break that is not U+2028/U+2029 is dropped and each of the others stays
 ///   (`\n` for the ASCII spellings and U+0085, the character itself for U+2028/U+2029).
 /// - A first break that is U+2028/U+2029 stays, with the others after it.
+/// - `after_escaped_break` (#6067): the run follows a double-quoted scalar's escaped line break,
+///   which leaves go-yaml at the start of a line, so it keeps *every* break, the first included:
+///   one is a `\n` and not a space, and two are two.
 ///
 /// Trailing literal whitespace before the break is trimmed by the callers;
 /// escaped whitespace already in `result` is content and must not be
 /// trimmed here.
-fn fold_quoted_line_break(bytes: &[u8], mut i: usize, unicode: bool, result: &mut String) -> usize {
+fn fold_quoted_line_break(
+    bytes: &[u8],
+    mut i: usize,
+    unicode: bool,
+    after_escaped_break: bool,
+    result: &mut String,
+) -> usize {
     let Some(first) = scalar_break(bytes, i, unicode) else {
         return i;
     };
@@ -6888,6 +6943,9 @@ fn fold_quoted_line_break(bytes: &[u8], mut i: usize, unicode: bool, result: &mu
 
     if first.separator {
         result.push(separator_char(bytes, first_at));
+        result.push_str(&kept);
+    } else if after_escaped_break {
+        result.push(first.kept(bytes, first_at));
         result.push_str(&kept);
     } else if kept.is_empty() {
         // Single line break -> space
