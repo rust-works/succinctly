@@ -11205,8 +11205,8 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
         // `min_by`/`max_by` over `compare_values`, exactly as
         // `builtin_min`/`builtin_max` do -- including which of two equal
         // elements each keeps.
-        Builtin::Min => items.into_iter().min_by(compare_values::<S>)?,
-        Builtin::Max => items.into_iter().max_by(compare_values::<S>)?,
+        Builtin::Min => jq_min_by(items, compare_values::<S>)?,
+        Builtin::Max => jq_max_by(items, compare_values::<S>)?,
         _ => return None,
     };
     // The gate: divert only what the bridge would have rebuilt from a node
@@ -11247,7 +11247,7 @@ fn relocate_elements<S: EvalSemantics>(
             } else {
                 // jq mode: sort, then drop adjacent equals (`unique`). yq's `unique` took the
                 // first-occurrence arm above and yq's `sort` the arm just before this one.
-                items.sort_by(compare_values::<S>);
+                sort_like_jq(&mut items, compare_values::<S>, value_has_nan);
                 if matches!(builtin, Builtin::Unique) {
                     items.dedup_by(|a, b| owned_value_eq::<S>(a, b));
                 }
@@ -17442,15 +17442,97 @@ pub(crate) fn try_compare_op<S: EvalSemantics>(
 /// length uses plain insertion sort, which cannot panic regardless of
 /// comparator validity, and stress-testing (1,510 randomized/adversarial
 /// trials up to length 5000 and 90% NaN density) found no panics at any size.
-/// `min`/`max`/`min_by`/`max_by` never sort (`Iterator::min_by`/`max_by` fold
+/// `min`/`max`/`min_by`/`max_by` never sort ([`jq_min_by`]/[`jq_max_by`] fold
 /// left-to-right) and `unique`'s/`unique_by`'s `dedup_by` only compares
-/// adjacent elements, so neither has any panic surface at all. See
-/// `test_sort_many_nans_does_not_panic_421`.
+/// adjacent elements, so neither has any panic surface at all. Since #6008 the
+/// sorts do not feed the NaN pair to `[T]::sort_by` as `Less` both ways
+/// either: [`sort_like_jq`] turns it into a tie, so a sort over NaNs keeps
+/// input order as jq's does. See `test_sort_many_nans_does_not_panic_421`.
 pub(crate) fn compare_values<S: EvalSemantics>(
     left: &OwnedValue,
     right: &OwnedValue,
 ) -> core::cmp::Ordering {
     compare_values_at_depth::<S>(left, right, 0)
+}
+
+/// Whether `value` is, or holds anywhere, a NaN: the scan [`sort_like_jq`] makes first, so that
+/// the second comparison it needs for a pair of NaN-bearing keys is paid only by data that has
+/// one.
+pub(crate) fn value_has_nan(value: &OwnedValue) -> bool {
+    match value {
+        OwnedValue::Array(items) => items.iter().any(value_has_nan),
+        OwnedValue::Object(fields) => fields.values().any(value_has_nan),
+        number => number.as_f64().is_some_and(f64::is_nan),
+    }
+}
+
+/// Whether any of the `[f]` keys of a sort is, or holds, a NaN.
+pub(crate) fn keys_have_nan(keys: &[OwnedValue]) -> bool {
+    keys.iter().any(value_has_nan)
+}
+
+/// Sort `items` as jq sorts, which differs from a plain `sort_by(compare)` for NaN (#6008).
+///
+/// jq orders a NaN before every number and before another NaN (`jv_cmp` answers -1 for `nan`
+/// against `nan` both ways, see [`compare_values`]), and its sort returns that comparison, or the
+/// difference of the two positions when it is 0: so two items that each compare `Less` than the
+/// other are a tie that keeps input order, as glibc's merge sort leaves them (`[3,1,2] |
+/// sort_by(nan)` is `[3,1,2]`). Rust's stable merge takes the right item when it compares `Less`,
+/// which reverses them. A pair that compares `Less` in both directions is therefore treated as
+/// equal, which makes the comparator a total preorder; the second comparison is made only if
+/// `has_nan` finds a NaN in `items`.
+///
+/// Apple's `qsort`, which the pinned jq 1.7.1 runs on macOS, leaves such ties in input order up to
+/// six items and permutes longer runs, which is its algorithm and not a rule.
+pub(crate) fn sort_like_jq<T>(
+    items: &mut [T],
+    compare: impl Fn(&T, &T) -> core::cmp::Ordering,
+    has_nan: impl Fn(&T) -> bool,
+) {
+    use core::cmp::Ordering;
+    if items.iter().any(has_nan) {
+        items.sort_by(|a, b| match compare(a, b) {
+            Ordering::Less if compare(b, a) == Ordering::Less => Ordering::Equal,
+            ordering => ordering,
+        });
+    } else {
+        items.sort_by(compare);
+    }
+}
+
+/// jq's `min`/`min_by` choice among `items` (`minmax_by` in `builtin.c`): an item replaces the one
+/// held when it compares `Less` than it, so the first of equal items stays, and with `nan < nan`
+/// the last of a run of NaNs wins (#6008). `Iterator::min_by` keeps the first for any comparator
+/// that does not answer `Greater`.
+pub(crate) fn jq_min_by<T>(
+    items: impl IntoIterator<Item = T>,
+    compare: impl Fn(&T, &T) -> core::cmp::Ordering,
+) -> Option<T> {
+    let mut items = items.into_iter();
+    let mut held = items.next()?;
+    for item in items {
+        if compare(&item, &held) == core::cmp::Ordering::Less {
+            held = item;
+        }
+    }
+    Some(held)
+}
+
+/// jq's `max`/`max_by` choice (`minmax_by` in `builtin.c`): an item replaces the one held unless
+/// it compares `Less` than it, so the last of equal items wins and, with `nan < nan`, the first of
+/// a run of NaNs stays (#6008).
+pub(crate) fn jq_max_by<T>(
+    items: impl IntoIterator<Item = T>,
+    compare: impl Fn(&T, &T) -> core::cmp::Ordering,
+) -> Option<T> {
+    let mut items = items.into_iter();
+    let mut held = items.next()?;
+    for item in items {
+        if compare(&item, &held) != core::cmp::Ordering::Less {
+            held = item;
+        }
+    }
+    Some(held)
 }
 
 /// yq mode only (#2799): real yq's `sort`/`sort_by` ordering
@@ -20582,7 +20664,7 @@ fn builtin_min<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             if S::MIN_MAX_NEED_AN_ELEMENT {
                 return yq_extremum_result::<W>(items, false, optional);
             }
-            let min = items.into_iter().min_by(compare_values::<S>).unwrap();
+            let min = jq_min_by(items, compare_values::<S>).unwrap();
             QueryResult::Owned(min)
         }
         // #4236 (yq): a mapping is the extremum of its values (`{"a": 2, "b": 1} | min` is `1`),
@@ -20634,7 +20716,7 @@ fn builtin_max<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             if S::MIN_MAX_NEED_AN_ELEMENT {
                 return yq_extremum_result::<W>(items, true, optional);
             }
-            let max = items.into_iter().max_by(compare_values::<S>).unwrap();
+            let max = jq_max_by(items, compare_values::<S>).unwrap();
             QueryResult::Owned(max)
         }
         // #4236 (yq): see `builtin_min`.
@@ -20768,10 +20850,7 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // string result must raise, not silently return "".
             // #2327: suppress_or_raise, not a bare match -- see
             // `builtin_del`'s doc comment for the shared reasoning.
-            let (_, v) = keyed
-                .into_iter()
-                .min_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b))
-                .unwrap();
+            let (_, v) = jq_min_by(keyed, |(a, _), (b, _)| compare_key_arrays::<S>(a, b)).unwrap();
             let min = match to_owned::<S, _>(&v) {
                 Ok(v) => v,
                 Err(e) => return suppress_or_raise(e, optional),
@@ -20830,10 +20909,7 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // string result must raise, not silently return "".
             // #2327: suppress_or_raise, not a bare match -- see
             // `builtin_min_by`'s sibling comment above.
-            let (_, v) = keyed
-                .into_iter()
-                .max_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b))
-                .unwrap();
+            let (_, v) = jq_max_by(keyed, |(a, _), (b, _)| compare_key_arrays::<S>(a, b)).unwrap();
             let max = match to_owned::<S, _>(&v) {
                 Ok(v) => v,
                 Err(e) => return suppress_or_raise(e, optional),
@@ -22237,7 +22313,11 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
 
             // Sort by key
-            keyed.sort_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b));
+            sort_like_jq(
+                &mut keyed,
+                |(a, _), (b, _)| compare_key_arrays::<S>(a, b),
+                |(key, _)| keys_have_nan(key),
+            );
 
             // Group consecutive items with same key
             let mut groups: Vec<OwnedValue> = Vec::new();
@@ -22328,7 +22408,7 @@ fn builtin_unique<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
 
             // Sort first (jq's unique returns sorted unique values)
-            items.sort_by(compare_values::<S>);
+            sort_like_jq(&mut items, compare_values::<S>, value_has_nan);
 
             // Remove consecutive duplicates. `owned_value_eq::<S>`, not
             // `compare_values(..) == Equal` (#950 review, same reasoning
@@ -22425,7 +22505,11 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
 
             // Sort by key
-            keyed.sort_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b));
+            sort_like_jq(
+                &mut keyed,
+                |(a, _), (b, _)| compare_key_arrays::<S>(a, b),
+                |(key, _)| keys_have_nan(key),
+            );
 
             // Remove consecutive duplicates by key. `owned_value_eq::<S>`,
             // not `compare_values(..) == Equal` (#950 review, same
@@ -22553,7 +22637,7 @@ fn builtin_sort<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // #2799: yq's comparator and sort -- see `yq_sort_by`.
                 yq_sort_by::<_, S>(&mut items, core::slice::from_ref);
             } else {
-                items.sort_by(compare_values::<S>);
+                sort_like_jq(&mut items, compare_values::<S>, value_has_nan);
             }
             QueryResult::Owned(OwnedValue::array_from(items))
         }
@@ -22621,7 +22705,11 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // #2799: yq's comparator and sort -- see `yq_sort_by`.
                 yq_sort_by::<_, S>(&mut keyed, |(key, _)| key.as_slice());
             } else {
-                keyed.sort_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b));
+                sort_like_jq(
+                    &mut keyed,
+                    |(a, _), (b, _)| compare_key_arrays::<S>(a, b),
+                    |(key, _)| keys_have_nan(key),
+                );
             }
 
             let result: Vec<OwnedValue> = keyed.into_iter().map(|(_, v)| v).collect();
