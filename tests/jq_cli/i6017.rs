@@ -60,6 +60,10 @@ fn the_option_values_are_read_as_jq_reads_them() -> Result<()> {
         (&["-L", "", "-n", "1"], "", "1\n", 0),
         (&["-L", "", "-n", "import \"nope\" as n; 1"], "", "", 3),
         (&["-L", "", "-nc", "get_search_list"], "", "[\"\"]\n", 0),
+        (&["--indent", "-c", "."], "{\"a\":[1]}", "{\"a\":[1]}\n", 0),
+        (&["--indent", "--tab", "."], "{\"a\":[1]}", "{\"a\":[1]}\n", 0),
+        (&["--indent", "-C", "."], "{\"a\":[1]}", "{\"a\":[1]}\n", 0),
+        (&["--indent", "1", "--indent", "-c", "."], "{\"a\":[1]}", "{\"a\":[1]}\n", 0),
     ];
     for &(args, stdin, want_out, want_code) in rows {
         let (out, _, code) = run_jq_full(args, Some(stdin))?;

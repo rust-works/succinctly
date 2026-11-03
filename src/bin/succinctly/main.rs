@@ -851,7 +851,8 @@ const JQ_OUTPUT_FORMAT_FLAGS: &[&str] = &["compact_output", "tab", "indent"];
 /// Leading white space and one sign are skipped, the digits that follow are read and anything after
 /// them is ignored, so `" 2"` and `"3x"` are 2 and 3 and text that starts with anything else (`""`,
 /// `"abc"`, `"0x2"`) is 0. A value past a `long` clamps to it and then wraps to an `int`, as the C
-/// cast does (`99999999999999999999` is `-1`). jq refuses what is outside -1 to 7; `-1` is a tab.
+/// cast does (`99999999999999999999` is `-1`): that is a 64-bit `long`'s, as on macOS and Linux
+/// (a 32-bit-`long` libc clamps at an `int` instead). jq refuses what is outside -1 to 7; `-1` is a tab.
 fn parse_jq_indent(text: &str) -> Result<i8, String> {
     let mut bytes = text.bytes().peekable();
     while bytes
