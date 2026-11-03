@@ -3171,7 +3171,7 @@ struct OutputConfig {
 
 impl OutputConfig {
     fn from_args(args: &JqCommand) -> Self {
-        let indent_string = if args.tab {
+        let indent_string = if args.tab || args.indent == Some(-1) {
             "\t".to_string()
         } else if let Some(n) = args.indent {
             " ".repeat(n as usize)
@@ -4935,7 +4935,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // streamer needs the semantic width/unit pair, not rendered text.
     // Priority matches `OutputConfig::from_args`'s `indent_string`
     // construction exactly (tab > explicit `--indent N` > `-c` > default 2).
-    let json_indent = if args.tab {
+    let json_indent = if args.tab || args.indent == Some(-1) {
         IndentSpec {
             width: 1,
             unit: '\t',
