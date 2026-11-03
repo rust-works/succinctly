@@ -9954,6 +9954,7 @@ fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Ve
 /// placement, as it always did.
 /// What the lazy input route reads of a stream (#5853): the documents before the first fault, and
 /// whether there was one.
+#[cfg(test)]
 struct LazyScan {
     /// The byte range of each document `serde_json` and the splitter agree on, shallow enough to
     /// convert, before the first thing that is not one.
@@ -9969,6 +9970,7 @@ struct LazyScan {
 /// placed, the documents jq reads after resuming and the end marker are that route's own. A
 /// number or literal directly before the fault is left to it too: jq never reads one the fault's
 /// own byte completes (`1 2 3}` is `1 2` and then the error, [`bare_token_lost_to_fault`]).
+#[cfg(test)]
 fn lazy_json_scan(raw: &str) -> LazyScan {
     let mut chunk = lazy_json_scan_chunk(raw, 0, usize::MAX);
     // The prefix is kept for the whole run; the stream's full count of documents is not.
@@ -14828,7 +14830,8 @@ mod tests {
                         for second in more {
                             let stream = [&once[..then], second, &once[then..]].concat();
                             let (eager, _) = observe(&stream, true, None);
-                            for chunk in [Some(3)] {
+                            {
+                                let chunk = Some(3);
                                 let (hybrid, lazy_documents) = observe(&stream, false, chunk);
                                 assert_eq!(
                                     hybrid,
