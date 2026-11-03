@@ -95890,6 +95890,83 @@ fn strptime_name_len(
         .find_map(|name| strptime_prefix_len(input, name))
 }
 
+/// What a strptime format holds between a `%` and its specifier, as the pin's libc reads it
+/// (#5754, #5989):
+/// - one `E` or `O`, before or after the width, which makes the specifier read as it does without
+///   it; a second one is no match;
+/// - a `+` flag, which reads like no flag, only at the start or straight after that modifier
+///   (`%+Y`, `%E+Y`, `%+E+Y`; not `%++Y`, `%4+Y` or `%0+Y`);
+/// - a decimal width, the most digits a numeric field takes. A `0` before the digits is part of
+///   them (`%04Y` is a width of 4, `%40Y` of 40), and a run of digits that is 0 changes nothing
+///   (`%0d` is `%d`). A modifier ends a run, so a second run after it replaces the first
+///   (`%4E5Y` is a width of 5) unless it is 0 (`%4E0Y` is 4).
+struct StrptimeSpecPrefix {
+    modifier: Option<char>,
+    /// 0 when the format names none.
+    width: usize,
+    /// The specifier that ends the prefix; `None` at the end of the format.
+    spec: Option<char>,
+    /// Every character read after the `%`, the specifier included; empty unless the caller asked
+    /// to keep it (only the layout expansion needs it, to copy a prefix it does not replace).
+    consumed: String,
+    /// Why the prefix is no match, where it is not (the characters after it are left unread).
+    error: Option<String>,
+}
+
+fn read_strptime_spec_prefix(
+    chars: &mut impl Iterator<Item = char>,
+    keep_consumed: bool,
+) -> StrptimeSpecPrefix {
+    let mut prefix = StrptimeSpecPrefix {
+        modifier: None,
+        width: 0,
+        spec: None,
+        consumed: String::new(),
+        error: None,
+    };
+    let mut flag_allowed = true;
+    let mut run: Option<usize> = None;
+    loop {
+        let next = chars.next();
+        if let (Some(c), true) = (next, keep_consumed) {
+            prefix.consumed.push(c);
+        }
+        match next {
+            Some(m @ ('E' | 'O')) => {
+                if prefix.modifier.replace(m).is_some() {
+                    prefix.error = Some(format!("a second modifier '{m}'"));
+                    return prefix;
+                }
+                flag_allowed = true;
+                run = None;
+            }
+            Some('+') => {
+                if !flag_allowed {
+                    prefix.error = Some("a '+' flag after a width or another flag".to_string());
+                    return prefix;
+                }
+                flag_allowed = false;
+                run = None;
+            }
+            Some(d) if d.is_ascii_digit() => {
+                let value = run
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add(d as usize - '0' as usize);
+                run = Some(value);
+                if value > 0 {
+                    prefix.width = value;
+                }
+                flag_allowed = false;
+            }
+            other => {
+                prefix.spec = other;
+                return prefix;
+            }
+        }
+    }
+}
+
 /// `fmt` with `%c`, `%x`, `%X` and `%r` replaced by the layout each stands for: the process
 /// locale's, else C's (`%a %b %e %H:%M:%S %Y`, `%m/%d/%y`, `%H:%M:%S`, `%I:%M:%S %p`), which is
 /// what the libc reads. A layout can name another (`en_US`'s `%c` holds `%X`), so this repeats
@@ -95899,11 +95976,8 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
         let mut chars = text.chars();
         while let Some(c) = chars.next() {
             if c == '%' {
-                let mut next = chars.next();
-                if matches!(next, Some('E' | 'O')) {
-                    next = chars.next();
-                }
-                if matches!(next, Some('c' | 'x' | 'X' | 'r')) {
+                let prefix = read_strptime_spec_prefix(&mut chars, false);
+                if prefix.error.is_none() && matches!(prefix.spec, Some('c' | 'x' | 'X' | 'r')) {
                     return true;
                 }
             }
@@ -95935,26 +96009,17 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
                 out.push(c);
                 continue;
             }
-            match chars.next() {
-                Some(spec @ ('c' | 'x' | 'X' | 'r')) => out.push_str(layout(spec)),
-                // `%Ec` and `%Ox` stand for the plain layout, as `%EY` is `%Y` (#5754).
-                Some(modifier @ ('E' | 'O')) => match chars.next() {
-                    Some(spec @ ('c' | 'x' | 'X' | 'r')) => out.push_str(layout(spec)),
-                    Some(other) => {
-                        out.push('%');
-                        out.push(modifier);
-                        out.push(other);
-                    }
-                    None => {
-                        out.push('%');
-                        out.push(modifier);
-                    }
-                },
-                Some(other) => {
-                    out.push('%');
-                    out.push(other);
+            // `%c`, `%Ex`, `%5X` and `%+r` all stand for the plain layout: the width and the
+            // modifier change nothing (#5754, #5989).
+            let prefix = read_strptime_spec_prefix(&mut chars, true);
+            match prefix.spec {
+                Some(spec @ ('c' | 'x' | 'X' | 'r')) if prefix.error.is_none() => {
+                    out.push_str(layout(spec));
                 }
-                None => out.push('%'),
+                _ => {
+                    out.push('%');
+                    out.push_str(&prefix.consumed);
+                }
             }
         }
         text = out;
@@ -96030,8 +96095,8 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // The libc refuses a month outside 1-12 and a day past 31 as it reads them, so a later `%s`
     // cannot hide one (`"13" | strptime("%m%s")` is no match, #5947); a day of 0 reads
     // (`parse_day_of_month` does the day, #5974).
-    let read_month = |it: &mut core::iter::Peekable<core::str::Chars<'_>>| {
-        let m = parse_digits(it, 2)?;
+    let read_month = |it: &mut core::iter::Peekable<core::str::Chars<'_>>, width: usize| {
+        let m = parse_digits(it, width)?;
         if (1..=12).contains(&m) {
             Ok(m)
         } else {
@@ -96044,26 +96109,34 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
 
     while let Some(fc) = fmt_iter.next() {
         if fc == '%' {
-            // `%E` and `%O` modify the specifier after them and read as it does (#5754): jq's libc
-            // takes `%Ey`, `%Od` and `%Ec` for `%y`, `%d` and `%c` in every locale this reads. Only a
-            // specifier can follow: `%E%`, `%EE`, `%E5` and a bare `%E` are no match. The pin's libc
-            // reads the month with `%O` from the alternative names, which C holds as the full ones
-            // alone, so `%OB` takes `March` but not `Mar` and `%Ob` and `%Oh` take neither.
-            let mut spec = fmt_iter.next();
-            let mut alternative_names = false;
-            if let Some(modifier @ ('E' | 'O')) = spec {
-                spec = fmt_iter.next();
+            // What the pin's libc reads between the `%` and the specifier: see
+            // `read_strptime_spec_prefix` (#5754, #5989). The month with `%O` comes from the
+            // alternative names, which C holds as the full ones alone, so `%OB` takes `March` but
+            // not `Mar` and `%Ob` and `%Oh` take neither.
+            let StrptimeSpecPrefix {
+                modifier,
+                width,
+                spec,
+                error,
+                ..
+            } = read_strptime_spec_prefix(&mut fmt_iter, false);
+            if let Some(error) = error {
+                return Err(error);
+            }
+            if let Some(modifier) = modifier {
                 match spec {
-                    Some('%' | 'E' | 'O') | None => {
+                    Some('%') | None => {
                         return Err(format!("expected a specifier after '%{modifier}'"));
                     }
                     Some('b' | 'h') if modifier == 'O' => {
                         return Err("unrecognized month name".to_string());
                     }
-                    Some('B') => alternative_names = modifier == 'O',
                     _ => {}
                 }
             }
+            let alternative_names = modifier == Some('O') && spec == Some('B');
+            // The digits a numeric field takes: the width, else the field's own count.
+            let digits = |own: usize| if width == 0 { own } else { width };
             match spec {
                 Some('%') => {
                     if input_iter.next() != Some('%') {
@@ -96072,14 +96145,14 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                 }
                 Some('Y') if field_is_empty(&input_iter) => {}
                 Some('Y') => {
-                    year = parse_signed_field(&mut input_iter, 4)?;
+                    year = parse_signed_field(&mut input_iter, digits(4))?;
                     century = None;
                     two_digit_year = None;
                     year_read = true;
                 }
                 Some('y') if field_is_empty(&input_iter) => {}
                 Some('y') => {
-                    let y = parse_signed_field(&mut input_iter, 2)?;
+                    let y = parse_signed_field(&mut input_iter, digits(2))?;
                     if let Some(c) = century.take() {
                         year = c * 100 + y;
                         two_digit_year = None;
@@ -96092,31 +96165,42 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     year_read = true;
                 }
                 Some('m') => {
-                    month = read_month(&mut input_iter)?;
+                    month = read_month(&mut input_iter, digits(2))?;
                     month_read = true;
                 }
                 Some('d') => {
-                    day = parse_day_of_month(&mut input_iter, false)?;
+                    day = parse_day_of_month(&mut input_iter, false, digits(2))?;
                     mday_read = true;
                 }
                 Some('e') => {
                     mday_read = true;
-                    day = parse_day_of_month(&mut input_iter, true)?;
+                    day = parse_day_of_month(&mut input_iter, true, digits(2))?;
                 }
                 // `%k` and `%l` read as `%H` and `%I`: the libc takes them as the hour in 24- and 12-hour
                 // form, with no padding of their own to read (#5754).
                 Some('H' | 'k') => {
-                    hour = check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=23, "hour")?;
+                    hour = check_clock_field(
+                        parse_digits(&mut input_iter, digits(2))?,
+                        0..=23,
+                        "hour",
+                    )?;
                 }
                 Some('I' | 'l') => {
                     // 0 is valid (confirmed live: real jq accepts `%I`
                     // "00"); will be adjusted by %p if present.
-                    hour = check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=12, "hour")?;
+                    hour = check_clock_field(
+                        parse_digits(&mut input_iter, digits(2))?,
+                        0..=12,
+                        "hour",
+                    )?;
                 }
                 Some('M') if field_is_empty(&input_iter) => {}
                 Some('M') => {
-                    minute =
-                        check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=59, "minute")?;
+                    minute = check_clock_field(
+                        parse_digits(&mut input_iter, digits(2))?,
+                        0..=59,
+                        "minute",
+                    )?;
                 }
                 Some('s') => {
                     // #5303: seconds since the epoch -- leading white space, an optional
@@ -96171,8 +96255,11 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                 Some('S') => {
                     // Upper bound 60, not 59: a leap second is valid and
                     // real jq accepts it (confirmed live, #971).
-                    second =
-                        check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=60, "second")?;
+                    second = check_clock_field(
+                        parse_digits(&mut input_iter, digits(2))?,
+                        0..=60,
+                        "second",
+                    )?;
                 }
                 Some('p') => {
                     // The locale's am marker, else its pm marker, each ASCII-case-insensitively,
@@ -96205,7 +96292,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     // #5383: the libc rejects day 0 and 367+ outright; the yearday printed is
                     // recomputed from the date, which this day of year only sets (below) when a
                     // year was read and nothing set the month or day.
-                    let yd = parse_digits(&mut input_iter, 3)?;
+                    let yd = parse_digits(&mut input_iter, digits(3))?;
                     if !(1..=366).contains(&yd) {
                         return Err(format!("day of year {yd} out of range"));
                     }
@@ -96230,7 +96317,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                 Some(spec @ ('U' | 'W' | 'V')) => {
                     // #5754: a week number of up to two digits, 0-53 (`%V` 1-53), which places the
                     // date at the end once a year is read.
-                    let number = parse_digits(&mut input_iter, 2)?;
+                    let number = parse_digits(&mut input_iter, digits(2))?;
                     let first = i64::from(spec == 'V');
                     if !(first..=53).contains(&number) {
                         return Err(format!("week {number} out of range"));
@@ -96290,7 +96377,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     }
                 }
                 Some('C') => {
-                    let c = parse_signed_field(&mut input_iter, 2)?;
+                    let c = parse_signed_field(&mut input_iter, digits(2))?;
                     if let Some(y) = two_digit_year.take() {
                         year = c * 100 + y;
                         century = None;
@@ -96304,11 +96391,11 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     // mm/dd/yy
                     month_read = true;
                     mday_read = true;
-                    month = read_month(&mut input_iter)?;
+                    month = read_month(&mut input_iter, 2)?;
                     if input_iter.next() != Some('/') {
                         return Err("expected '/'".to_string());
                     }
-                    day = parse_day_of_month(&mut input_iter, false)?;
+                    day = parse_day_of_month(&mut input_iter, false, 2)?;
                     if input_iter.next() != Some('/') {
                         return Err("expected '/'".to_string());
                     }
@@ -96331,11 +96418,11 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     if input_iter.next() != Some('-') {
                         return Err("expected '-'".to_string());
                     }
-                    month = read_month(&mut input_iter)?;
+                    month = read_month(&mut input_iter, 2)?;
                     if input_iter.next() != Some('-') {
                         return Err("expected '-'".to_string());
                     }
-                    day = parse_day_of_month(&mut input_iter, false)?;
+                    day = parse_day_of_month(&mut input_iter, false, 2)?;
                 }
                 Some('R') => {
                     // HH:MM, the minutes empty at the end or before white space (#5947)
@@ -96410,10 +96497,27 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     // or one of the local zone's `tzname` names (`AEST` or `AEDT` in Sydney),
                     // which changes nothing printed. Anything else, an empty run included, is
                     // no match: the pin's libc knows no other name, not even `UTC` outside UTC.
-                    let len = input_iter
-                        .clone()
-                        .take_while(char::is_ascii_uppercase)
-                        .count();
+                    // #5989: a width is the exact length of the name, not a limit: `%3Z` reads
+                    // `GMT` and `%4Z` and `%2Z` read nothing of it.
+                    let len = if width == 0 {
+                        input_iter
+                            .clone()
+                            .take_while(char::is_ascii_uppercase)
+                            .count()
+                    } else {
+                        width
+                    };
+                    // A width past the rest of the input is refused before anything is copied.
+                    if width != 0
+                        && input_iter
+                            .clone()
+                            .take(width)
+                            .filter(char::is_ascii_uppercase)
+                            .count()
+                            != width
+                    {
+                        return Err(format!("no zone name of {width} capitals"));
+                    }
                     let name: String = input_iter.clone().take(len).collect();
                     if name == "GMT" {
                         gmt = true;
@@ -96715,12 +96819,13 @@ fn parse_signed_field(
 fn parse_day_of_month(
     input: &mut core::iter::Peekable<core::str::Chars>,
     skip_one: bool,
+    width: usize,
 ) -> Result<i64, String> {
     if skip_one {
         let _ = input.next_if(|&c| is_c_space(c));
     }
     let padded = input.next_if(|&c| is_c_space(c)).is_some();
-    let day = parse_digits(input, if padded { 1 } else { 2 })?;
+    let day = parse_digits(input, if padded { 1 } else { width })?;
     if padded && input.peek().is_some_and(char::is_ascii_digit) {
         return Err("expected one digit after a padding space".to_string());
     }
