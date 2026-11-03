@@ -9216,13 +9216,12 @@ fn queued_items(
 ) -> std::collections::VecDeque<jq::ProducedInput> {
     let mut items = std::collections::VecDeque::with_capacity(documents.len() + errors.len());
     let mut errors = errors.into_iter().peekable();
-    let mut handed = lazy_count;
-    for (value, source, line) in documents {
+    for (index, (value, source, line)) in documents.into_iter().enumerate() {
+        let handed = lazy_count + index;
         while let Some((_, error, at)) = errors.next_if(|e| e.0 <= handed) {
             items.push_back(jq::ProducedInput::Error(error, at));
         }
         items.push_back(jq::ProducedInput::Document(value, source, line));
-        handed += 1;
     }
     items.extend(errors.map(|(_, error, at)| jq::ProducedInput::Error(error, at)));
     items
@@ -14358,7 +14357,7 @@ mod tests {
                 source: 0,
                 seam: Seam::NONE,
             },
-            Default::default(),
+            std::collections::VecDeque::default(),
             None,
         );
         for (i, &(start, end)) in spans.iter().enumerate() {
@@ -14694,7 +14693,7 @@ mod tests {
                 source: 3,
                 seam: Seam::NONE,
             },
-            Default::default(),
+            std::collections::VecDeque::default(),
             Some((3, 4)),
         );
         // `jq -nc '[inputs|input_line_number]'` on the same text is `[1,2,4]`.
@@ -14720,7 +14719,7 @@ mod tests {
                     source: 0,
                     seam: Seam::NONE,
                 },
-                Default::default(),
+                std::collections::VecDeque::default(),
                 None,
             )(),
             jq::ProducedInput::End(None)
