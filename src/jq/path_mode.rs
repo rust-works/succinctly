@@ -1399,6 +1399,12 @@ impl<'e> Interp<'e> {
                 // parser folds some negations itself (`-01`, `-1.5`, a
                 // negative past 2^53) into a spelling-less `Int`/`Float`.
                 None => match lit {
+                    // `-0` is the one negative whose sign lives only in its
+                    // spelling (`Int(0)` has none): jq computes `-0.0`, a
+                    // number identical to another by its bits (#6042).
+                    Literal::NumberLiteral(NumberRepr::Int(0), _) => {
+                        sink(OwnedValue::Float(-0.0), reg)
+                    }
                     Literal::NumberLiteral(NumberRepr::Int(i), _) | Literal::Int(i) => {
                         sink(OwnedValue::Int(*i), reg)
                     }

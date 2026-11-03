@@ -693,6 +693,8 @@ impl<'e> Interp<'e> {
                 None => match lit {
                     Literal::NumberLiteral(repr, _) => {
                         let value = match repr {
+                            // `-0`'s sign lives only in its spelling (#6042).
+                            NumberRepr::Int(0) => OwnedValue::Float(-0.0),
                             NumberRepr::Int(i) => OwnedValue::Int(*i),
                             NumberRepr::Float(f) => OwnedValue::Float(*f),
                         };
