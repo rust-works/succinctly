@@ -9669,7 +9669,11 @@ fn lazy_scan_on(
         ChunkEnd::Done => {
             let last = lazy.spans.last().copied().or(more.last_span);
             *exhausted = settled(more.recorded_tail.unwrap_or_else(|| {
-                EofTail::of_clean_source(lazy.text.as_bytes(), last.as_slice(), 0)
+                EofTail::of_clean_source(
+                    lazy.text.as_bytes(),
+                    last.as_ref().map_or(&[][..], std::slice::from_ref),
+                    0,
+                )
             }));
         }
         ChunkEnd::Fault => {
@@ -9699,7 +9703,7 @@ fn lazy_scan_on(
                     *tail = Box::new(std::iter::once(jq::ProducedInput::Error(
                         EvalError::new(error.to_string()),
                         (lazy.source, UNKNOWN_LINE),
-                    )))
+                    )));
                 } // patchcov: coverage end
             }
             *exhausted = settled(
