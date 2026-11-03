@@ -82,6 +82,7 @@ use alloc::vec::Vec;
 
 use alloc::rc::Rc;
 use core::hash::Hash;
+use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 
 use indexmap::{Equivalent, IndexMap};
@@ -131,8 +132,11 @@ macro_rules! note_forced_copy {
 /// `IndexMap::....into()`) and read through
 /// [`OwnedValue::as_object`](super::OwnedValue::as_object).
 pub struct ObjectMapOf<V: Teardown> {
-    /// The collapsed view (I1).
-    map: ObjectMapInnerOf<V>,
+    /// The collapsed view (I1). Released by the wrapper's own `Drop`, never
+    /// by drop glue, so that releasing the last handle -- `Rc::drop_slow`,
+    /// which drops every value -- runs inside a level of `drop_depth`'s count
+    /// (#5868).
+    map: ManuallyDrop<ObjectMapInnerOf<V>>,
     /// Every repeated key's earlier entries, or `None` when no key repeats
     /// (I2).
     shadows: Option<ShadowsInnerOf<V>>,
@@ -374,14 +378,15 @@ impl<V: Teardown> ObjectMapOf<V> {
     #[inline]
     #[allow(unsafe_code)] // the one by-value move out of a wrapper that has a `Drop` (#5782)
     fn into_parts(self) -> (ObjectMapInnerOf<V>, Option<ShadowsInnerOf<V>>) {
-        let this = core::mem::ManuallyDrop::new(self);
+        let this = ManuallyDrop::new(self);
         // Named exhaustively, so a field added later is a compile error here
         // rather than a leak in every by-value conversion.
         let Self { map, shadows } = &*this;
         // SAFETY: `this` is never dropped and never used again, so each
         // field is read exactly once and the wrapper's `Drop` (which would
-        // have read them too) cannot run.
-        unsafe { (core::ptr::read(map), core::ptr::read(shadows)) }
+        // have released them too) cannot run.
+        let (map, shadows) = unsafe { (core::ptr::read(map), core::ptr::read(shadows)) };
+        (ManuallyDrop::into_inner(map), shadows)
     }
 
     /// The map, if this handle owns it alone.
@@ -441,38 +446,43 @@ impl<V: Teardown> ObjectMapOf<V> {
 /// `Drop` and `drop_depth`. On the worklist the values are visited in order
 /// and only containers are swapped out, so siblings that share a child are
 /// released before the last one is judged.
+///
+/// Within the limit the level wraps the release of the map's `Rc` (and the
+/// side list's) itself, so the values are dropped by `Rc::drop_slow` and no
+/// loop over them is inlined into `OwnedValue`'s drop glue (#5868); see
+/// `ArrayOf`'s `Drop`.
 impl<V: Teardown> Drop for ObjectMapOf<V> {
     #[inline]
+    #[allow(unsafe_code)] // releases the `ManuallyDrop` map, once (#5868)
     fn drop(&mut self) {
-        if !V::ITERATIVE {
-            return;
-        }
-        #[cfg(feature = "std")]
-        {
-            if !self.is_detachable() {
-                return;
-            }
-            // `clear`, not `take`: an empty `IndexMap` would build a fresh
-            // `RandomState`.
-            if let Some(_level) = super::drop_depth::enter() {
-                if let Some(map) = self.unique_map() {
-                    map.clear();
+        if V::ITERATIVE {
+            #[cfg(feature = "std")]
+            if self.is_detachable() {
+                if let Some(_level) = super::drop_depth::enter() {
+                    // SAFETY: the field is not used again: `drop` returns
+                    // here, and nothing else releases it.
+                    unsafe { ManuallyDrop::drop(&mut self.map) };
+                    drop(self.shadows.take());
+                    return;
                 }
-                drop(self.shadows.take());
-                return;
-            }
-            self.tear_down_cold();
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            let holds_container = self.shadows.is_some()
-                || self
-                    .unique_map()
-                    .is_some_and(|map| map.values().any(V::is_nonempty_container));
-            if holds_container {
                 self.tear_down_cold();
             }
+            #[cfg(not(feature = "std"))]
+            {
+                let holds_container = self.shadows.is_some()
+                    || self
+                        .unique_map()
+                        .is_some_and(|map| map.values().any(V::is_nonempty_container));
+                if holds_container {
+                    self.tear_down_cold();
+                }
+            }
         }
+        // SAFETY: as above; the one release on every path that did not
+        // return early. What it releases is a shared handle, an empty map, a
+        // map emptied past the limit, or one whose element type has no
+        // teardown; the side list goes with the drop glue that follows.
+        unsafe { ManuallyDrop::drop(&mut self.map) };
     }
 }
 
@@ -1128,7 +1138,7 @@ impl<V: Teardown> From<IndexMap<String, V>> for ObjectMapOf<V> {
     #[inline]
     fn from(map: IndexMap<String, V>) -> Self {
         Self {
-            map: Rc::new(map),
+            map: ManuallyDrop::new(Rc::new(map)),
             shadows: None,
         }
     }
@@ -1363,6 +1373,33 @@ mod tests {
         drop(shared);
         let (made, dropped) = counter.get();
         assert!(made > 0);
+        assert_eq!(made, dropped, "every element made is dropped exactly once");
+    }
+
+    /// The array twin, for an element type without the teardown: its `Drop`
+    /// releases the `ManuallyDrop` storage on every path, unique or shared,
+    /// whole or after a by-value conversion (#5868).
+    #[test]
+    fn every_array_release_drops_each_element_exactly_once_5868() {
+        use super::super::ArrayOf;
+        let counter = std::rc::Rc::new(core::cell::Cell::new((0, 0)));
+        let build = || ArrayOf::from(vec![Counted::new(&counter), Counted::new(&counter)]);
+        drop(build());
+        drop(ArrayOf::<Counted>::new());
+        drop(build().into_vec());
+        drop(build().into_iter().collect::<Vec<_>>());
+        let shared = build();
+        let other = shared.clone();
+        drop(shared.clone().into_vec());
+        drop(shared.clone().into_iter().collect::<Vec<_>>());
+        drop(shared);
+        assert_eq!(
+            counter.get().0,
+            counter.get().1 + 2,
+            "the last handle still holds two"
+        );
+        drop(other);
+        let (made, dropped) = counter.get();
         assert_eq!(made, dropped, "every element made is dropped exactly once");
     }
 
