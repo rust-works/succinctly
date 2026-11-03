@@ -96867,9 +96867,9 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // assertion unless that day is the one the day of year gives, and where it is not there is no
     // answer to match, so the month and day stay as read. Both a month and a day read leave the
     // date as read, and so does a format with no year (the same assertion).
-    // A day counted from a month's start by `%j` or a week number is exempt from the range check
-    // below, since the libc sets it past 31 or below 1 itself.
-    let mut mday_from_week = false;
+    // A day counted from a month's start by `%j` or by a week number is exempt from the range
+    // check below, since the libc sets it past 31 or below 1 itself.
+    let mut mday_from_month_start = false;
     let date_read = month_read && mday_read;
     if let (Some(mut yd), true, false) = (day_of_year, year_read, date_read) {
         let mut derived_year = year;
@@ -96906,7 +96906,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
             month = idx as i64 + 1;
             if !mday_read {
                 day = yd - month_start[idx];
-                mday_from_week = month_read;
+                mday_from_month_start = month_read;
             }
         }
     }
@@ -96971,7 +96971,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
         }
         if !mday_read {
             day = yd - yearday_for_civil(year, month, 1) + 1;
-            mday_from_week = true;
+            mday_from_month_start = true;
         }
     }
 
@@ -96995,7 +96995,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // Since #5947 a month or day read is range-checked as it is read, as the libc does, so this
     // is a backstop: nothing reaches it, and it keeps an out-of-range month from indexing past
     // `yearday_for_civil`'s table should that ever change.
-    if !(1..=12).contains(&month) || (day > 31 && !mday_from_week) {
+    if !(1..=12).contains(&month) || (day > 31 && !mday_from_month_start) {
         return Err(format!("month {month} or day {day} out of range"));
     }
 

@@ -80,3 +80,29 @@ fn a_day_read_that_agrees_with_the_day_of_year_takes_its_month_from_it_5934() ->
         ("02/19/15 050", "%D %j", Some("[2015,1,19,0,0,0,4,49]")),
     ])
 }
+
+#[test]
+fn the_year_rolled_by_the_day_of_year_and_other_year_spellings_5934() -> Result<()> {
+    check(&[
+        // A 366th day in a common year rolls the year even beside a day that agrees with the roll.
+        ("2015 01 366", "%Y %d %j", Some("[2016,0,1,0,0,0,5,0]")),
+        (
+            "20 15 03 050",
+            "%C %y %m %j",
+            Some("[2015,2,-9,0,0,0,4,49]"),
+        ),
+        (
+            "20 15 19 050",
+            "%C %y %d %j",
+            Some("[2015,1,19,0,0,0,4,49]"),
+        ),
+    ])
+}
+
+#[test]
+fn a_month_out_of_range_beside_the_day_of_year_is_no_match_5934() -> Result<()> {
+    check(&[
+        ("2015 13 050", "%Y %m %j", None),
+        ("2015 00 050", "%Y %m %j", None),
+    ])
+}

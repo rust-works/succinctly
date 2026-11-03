@@ -6,7 +6,8 @@ use crate::assert_path_rows_both_routes_3749;
 
 // The libc fills `tm_mon`/`tm_mday` from `tm_yday` when a year was read and nothing set the month or day (a day
 // past the end of the year rolls into the next), and refuses a day of year outside 1-366. `%j` next to a `%d`/`%e`/`%D`/`%F`
-// that disagrees with it, or with no year, aborts jq, so those stay as read (a month beside it: #5934). Every row captured from `/usr/bin/jq` 1.7.1 (stdout, error message, exit code), both routes.
+// that disagrees with it, or with no year, aborts jq, so those stay as read (a month beside it: #5934).
+// Every row captured from `/usr/bin/jq` 1.7.1 (stdout, error message, exit code), both routes.
 
 /// #5383: the day of year with a year read (`%Y`, `%y`, `%C`), in either order, in leap and common years.
 #[test]
