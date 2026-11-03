@@ -96146,7 +96146,14 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                         _ => false,
                     };
                     let magnitude = if input_iter.peek().is_some_and(char::is_ascii_digit) {
-                        parse_digits(&mut input_iter, 19)?
+                        // `strtol` reads the whole run and leading zeros count for nothing, so
+                        // the 19-digit limit is on the significant digits (#5996).
+                        while input_iter.next_if_eq(&'0').is_some() {}
+                        if input_iter.peek().is_some_and(char::is_ascii_digit) {
+                            parse_digits(&mut input_iter, 19)?
+                        } else {
+                            0
+                        }
                     } else {
                         input_iter = before;
                         0
