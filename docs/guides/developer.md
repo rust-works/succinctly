@@ -216,8 +216,9 @@ give the base its own checkout so it is not rebuilt. Read each script's header f
 `--jq-gate` (and `assign-path`'s `--gate`) fails a run on a wrong answer against jq alone; without it a script
 that judges a change against `--base` gates nothing when it has no base (#5552). None of the folded scripts
 documents a residual for it, so a residual that becomes accepted is listed in the script first. The two
-dual-mode shell sweeps fold only their jq half: `assign-path`'s yq half differs from yq v4.53.3 on 904 of 10,248
-cases and is a recording, not a gate. `fold-body-message` stays a manual A/B tool: its verdict is a message
+dual-mode shell sweeps fold only their jq half: `assign-path`'s yq half agrees with yq v4.53.3 on all 10,248
+cases (#5998; the 904 once recorded came from a host with yq v4.52.2) and can be gated by hand with
+`--gate`, but the harness has no yq oracle to fold it with. `fold-body-message` stays a manual A/B tool: its verdict is a message
 that changed against `--base`, and against jq alone 273 of a 43,407-row slice differ only in wording while
 `fold-body-register-grid` already gates the same rows' output and exit code. `jq-grammar-fuzz.py` is not a
 sweep: it is the `fuzz` dimension. `jq-path-register-sweep.py`'s own self-tests run in `ci.yml`.
