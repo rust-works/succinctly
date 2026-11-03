@@ -14,7 +14,12 @@ What to expect, and why it is a report and not a gate:
 
 * `localtime` and `mktime(localtime)` for IANA names and the system zone agree
   with every jq tried (1.7.1 and 1.8.2, macOS and glibc) on every timestamp
-  within +-10^12 seconds.
+  within +-10^12 seconds, except that `mktime` of a wall-clock time before 1900
+  raises here and on the macOS jq and converts on glibc (the documented
+  macOS-modelled `timegm` rule, #6035). `--check-fields` counts those rows
+  apart from the failures. Past +-10^12 seconds glibc's jq stops following a
+  zone's daylight-time rule at about 3e14 (year 9.5 million): `America/New_York`
+  in July is standard time there, daylight time here and on the macOS jq.
 * `%z`, `%Z` and `%s` are the zone's own for the instant. jq 1.7.1 labels a
   daylight-time instant with the zone's standard offset and name (and `+0000`
   for `%z` on glibc), so the agreement with 1.7.1 is low there *by design*
@@ -43,6 +48,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ORACLE = os.environ.get("JQ_ORACLE", "/usr/bin/jq")
+# 1900-01-01T00:00:00 as a wall-clock second count: `mktime` raises before it (eval.rs `jq_timegm_secs`).
+PRE_1900 = -2_208_988_800
 
 # (category, TZ). None is "TZ unset": the system zone.
 TZS = (
@@ -122,6 +129,7 @@ def main():
     total = collections.Counter()
     divergences = []
     fails = 0
+    pre_1900 = 0
     truth_ok = collections.Counter()
     truth_total = collections.Counter()
     iana = [tz for cat, tz in TZS if cat.startswith("A") and tz not in (None, ":Asia/Tokyo", "UTC", "GMT", "Etc/GMT+5")]
@@ -139,7 +147,13 @@ def main():
                     else:
                         divergences.append(f"TZ={tz!r} {item} {col}: succinctly {got[i][c]!r} / oracle {want[i][c]!r}")
                         if check and cat.startswith("A") and scope == "ordinary" and c < 2:
-                            fails += 1
+                            if (col == "mktime(localtime)" and got[i][c] == "ERR"
+                                    and isinstance(want[i][c], (int, float)) and want[i][c] < PRE_1900):
+                                # A reference whose `timegm` converts a wall-clock time before 1900
+                                # (glibc) answers where succinctly refuses, as the macOS jq does.
+                                pre_1900 += 1
+                            else:
+                                fails += 1
             if with_truth and tz in iana and scope == "ordinary":
                 # Whole seconds zoneinfo can place (year 1..9999), from 1900: succinctly's `%s` rule
                 # before 1900 is a documented macOS-modelled divergence, not the zone's.
@@ -175,6 +189,9 @@ def main():
     print(f"{len(divergences)} divergences written to {path}")
     for line in divergences[:show]:
         print("  " + line)
+    if check and pre_1900:
+        print(f"--check-fields: {pre_1900} mktime(localtime) rows before 1900 where the oracle converts and "
+              "succinctly raises (the documented macOS-modelled rule, #6035)")
     if check and fails:
         print(f"--check-fields: {fails} localtime/mktime divergences for an IANA name or the system zone")
         sys.exit(1)

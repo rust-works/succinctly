@@ -10331,6 +10331,10 @@ and the `jq-linux-arm64` release binaries):
 - **`mktime` and `%s` before 1900** fail (`mktime`) or print `-1` (`%s`) by succinctly's existing
   `timegm` rule, modelled on the macOS jq; jq on Linux converts such dates. This is unrelated to
   the zone source and is the same with any `TZ`.
+  `scripts/jq-localtime-oracle-sweep.py --check-fields` counts those rows apart from its failures (#6035).
+- **A July instant from about year 9.5 million** (`TZ=America/New_York`, `300000000000000` and `1000000000000000`) is standard time in jq 1.7.1 built on glibc (Ubuntu 22.04) and daylight time here and in the macOS jq.
+  The instants tried from `1000000000000` (year 33658) to `100000000000000` (year 3170843) agree on all three.
+  The cause was not traced; glibc is the odd one out, the macOS jq and this implementation agreeing at `1000000000000000`.
 
 ### `strftime`/`strflocaltime` localize through the C library where there is one (#5754)
 
