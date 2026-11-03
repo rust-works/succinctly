@@ -6322,6 +6322,11 @@ fn get_inputs(
     open_failed: &mut bool,
     opened: &mut Vec<PathBuf>,
 ) -> std::result::Result<Result<Inputs>, i32> {
+    // What an earlier read on this thread deferred for the queue and did not hand over is not
+    // this read's (#5857): the call site that seeds the queue takes the first slot it finds.
+    LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
+    LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
+    LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
     // Null input mode: use null as the single input -- unless the filter
     // itself uses `input`/`inputs`/`input_line_number` (#723), in which case
     // the caller passes `force_read_under_null_input: true` to fall through
@@ -6915,7 +6920,12 @@ fn get_inputs(
                 *slot.borrow_mut() = Some(
                     raw_inputs
                         .into_iter()
-                        .map(|(file_idx, raw)| (file_idx.unwrap_or(0) as u32, raw))
+                        .map(|(file_idx, raw)| {
+                            (
+                                u32::try_from(file_idx.unwrap_or(0)).unwrap_or(u32::MAX),
+                                raw,
+                            )
+                        })
                         .collect(),
                 );
             });
@@ -9523,30 +9533,25 @@ fn lazy_raw_producer(
 ) -> jq::InputProducer {
     let mut files = files;
     let last = files.len().saturating_sub(1);
-    // The file being read and the offset in it, the line counter's place in that file, and the
-    // front of a line an earlier file left open.
+    // The file being read and the offset in it, the newlines of that file read so far (a line's
+    // number is the count at its own newline, and a final line without one is on the file's
+    // last), and the front of a line an earlier file left open.
     let (mut file, mut at) = (0usize, 0usize);
-    let mut place: Option<LinePlace> = None;
+    let mut newlines = 0u32;
     let mut open = String::new();
     Box::new(move || {
         while file < files.len() {
             let (tag, text) = &files[file];
-            let bytes = text.as_bytes();
-            if let Some(newline) = bytes[at..].iter().position(|&b| b == b'\n') {
+            if let Some(newline) = text.as_bytes()[at..].iter().position(|&b| b == b'\n') {
                 let end = at + newline;
                 let mut line = std::mem::take(&mut open);
                 line.push_str(&text[at..end]);
-                let mut counter = match place.take() {
-                    Some(place) => LineCounter::resume(bytes, &place),
-                    None => LineCounter::new(bytes),
-                };
-                let number = counter.advance_to(end);
-                place = Some(counter.place());
                 at = end + 1;
+                newlines = newlines.saturating_add(1);
                 return jq::ProducedInput::Document(
                     OwnedValue::String(line.into()),
                     *tag,
-                    u32::try_from(number).unwrap_or(u32::MAX),
+                    newlines,
                 );
             }
             open.push_str(&text[at..]);
@@ -9557,22 +9562,15 @@ fn lazy_raw_producer(
             files[file].1 = String::new();
             file += 1;
             at = 0;
-            place = None;
+            newlines = 0;
         }
         if open.is_empty() {
             return jq::ProducedInput::End(exhausted);
         }
-        // A final line without a newline: the last file's, at the length of that file.
-        let (tag, text) = &files[last];
-        let mut counter = LineCounter::new(text.as_bytes());
-        let number = counter.advance_to(text.len());
+        // A final line without a newline: the last file's, on that file's last line.
         let line = std::mem::take(&mut open);
         file = files.len();
-        jq::ProducedInput::Document(
-            OwnedValue::String(line.into()),
-            *tag,
-            u32::try_from(number).unwrap_or(u32::MAX),
-        )
+        jq::ProducedInput::Document(OwnedValue::String(line.into()), files[last].0, newlines)
     })
 }
 
@@ -14906,14 +14904,15 @@ mod tests {
     /// #5857: `-R` reads the same whether each line becomes a string when the program reads it
     /// or all of them up front: every line `input` pops, the `(at ...)` location after each (the
     /// file and its line, with a line that one file leaves open and the next finishes, an empty
-    /// file, a file with no final newline), and the end marker, through and past the end. Every
-    /// stream is cut into two files at every byte, and into three. The pin must be able to fail:
-    /// it does with a line placed in the file it starts in, not the one holding its newline, or
-    /// with the final line placed in the file it ends in.
+    /// file, a file with no final newline, an invalid UTF-8 byte), and the end marker, through and
+    /// past the end. Every third stream of four pieces is cut into two files at every byte, and
+    /// into three at every other pair of bytes. The pin must be able to fail: it does with the line
+    /// number carried from one file to the next, or with the final line numbered from the first
+    /// file.
     #[test]
     fn a_lazy_raw_stream_reads_as_the_eager_route_does_5857() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let pieces: [&[u8]; 6] = [b"a", b"", b"bc", b"\n", b"\r\n", b"\xc3\xa9"];
+        let pieces: [&[u8]; 7] = [b"a", b"", b"bc", b"\n", b"\r\n", b"\xc3\xa9", b"\xff"];
         let mut bases: Vec<Vec<u8>> = Vec::new();
         for a in pieces {
             for b in pieces {
