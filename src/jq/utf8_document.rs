@@ -216,8 +216,8 @@ fn repair_string_body(out: &mut String, body: &[u8], has_escape: bool) {
 
     // jq's lexer refuses a raw control character in a string before it substitutes anything, so a
     // body holding one is a parse error at that character. The drop quirk must not take it with a
-    // lead byte (`"\xe1\n"` would read as a lone U+FFFD): substitute each ill-formed run on its own instead, which
-    // keeps every ASCII byte where the parser will find it (#5990).
+    // lead byte (`"\xe1\n"` would read as a lone U+FFFD): substitute each ill-formed run on its own
+    // instead, which keeps every ASCII byte where the parser will find it (#5990).
     if body.iter().any(|&b| b < 0x20) {
         out.push_str(&String::from_utf8_lossy(body));
         return;
