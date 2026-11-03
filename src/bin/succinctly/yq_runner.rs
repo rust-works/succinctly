@@ -3963,13 +3963,14 @@ fn kind_changed_leaf(
     // written `.a = 1` is `# c` / `a: 1`, and so is a comment-only file. The head always; the
     // foot with a container, which prints it (a scalar root does not).
     let meta = match rewritten_document {
-        Some(container) => meta.with_head_foot(
+        Some(container) => meta.with_head_foot_of(
             pristine_tree.meta().head_comment().to_vec(),
             if container {
                 pristine_tree.meta().foot_comment().to_vec()
             } else {
                 Vec::new()
             },
+            pristine_tree.meta(),
         ),
         None => meta,
     };
@@ -6473,11 +6474,7 @@ fn apply_meta_assign_writes(
                 let meta = node.meta();
                 let new_head = head.clone().unwrap_or_else(|| meta.head_comment().to_vec());
                 let new_foot = foot.clone().unwrap_or_else(|| meta.foot_comment().to_vec());
-                *node.meta_mut() = if head.is_some() {
-                    meta.with_written_head_foot(new_head, new_foot)
-                } else {
-                    meta.with_head_foot(new_head, new_foot)
-                };
+                *node.meta_mut() = meta.with_head_foot(new_head, new_foot);
                 if line.is_some() && !defers_to_own_block(node_value, node) {
                     node.meta_mut().comment.clone_from(line);
                 }
@@ -7887,6 +7884,7 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
         for (value, comments) in docs.iter_mut() {
             if !matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_)) {
                 let head = comments.meta().head_comment().to_vec();
+                let source = comments.meta().clone();
                 // The first document's `---` marker survives too (#4086).
                 let preamble = comments.meta().preamble().map(str::to_string);
                 // The text the scalar was written with (`~`, `True`, `0x1F`, or nothing for
@@ -7896,7 +7894,7 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
                 *comments = CommentTree::Leaf(
                     NodeMeta::from_comment_and_style(comments.own().map(str::to_string), "")
                         .with_spelling(spelling)
-                        .with_head_foot(head, Vec::new())
+                        .with_head_foot_of(head, Vec::new(), &source)
                         .with_preamble(preamble),
                 );
             }
@@ -8582,7 +8580,7 @@ fn output_value<W: Write>(
         // streaming and DOM routes (the streaming route's own `foot` root
         // exclusion just below is scalar-only).
         let head = prepend_head_comment_lines(String::new(), comments.meta().head_comment(), "");
-        let head_is_leading = !comments.meta().head_written();
+        let head_is_leading = comments.meta().head_is_header();
         let body = if head_is_leading {
             body
         } else {

@@ -7541,6 +7541,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn is_first_document_content(&self) -> bool {
+        self.bp_pos == FIRST_DOCUMENT_BP && YamlCursor::is_document_content(self)
+    }
+
+    #[inline]
     fn document_has_aliases(&self) -> bool {
         self.index.has_aliases()
     }
