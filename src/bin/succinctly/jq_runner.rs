@@ -14993,16 +14993,30 @@ mod tests {
         let (inputs, (_, tail), ..) = read(&["jq", "inputs", &latin1]);
         assert!(inputs.is_empty(), "the substituted text is still clean");
         assert_eq!(tail, Some(scanned));
-        // Not with `-s` or with several files.
+        // Not with `-s`.
         for argv in [
             vec!["jq", "-s", "inputs", &clean],
-            vec!["jq", "inputs", &clean, &clean],
             vec!["jq", "-n", "-s", "inputs", &clean],
-            vec!["jq", "-n", "inputs", &clean, &clean],
+            vec!["jq", "-s", "inputs", &clean, &clean],
         ] {
             let (inputs, _, _, _, lazy) = read(&argv);
             assert!(lazy.is_none(), "{argv:?}");
             assert!(!inputs.is_empty(), "{argv:?}");
+        }
+        // Several files are one source each (#5857).
+        for argv in [
+            vec!["jq", "inputs", &clean, &clean],
+            vec!["jq", "-n", "inputs", &clean, &clean],
+        ] {
+            let (inputs, _, _, _, lazy) = read(&argv);
+            assert!(inputs.is_empty(), "{argv:?}");
+            let lazy = lazy.expect("deferred");
+            assert_eq!(lazy.len(), 2, "{argv:?}");
+            assert_eq!(
+                (lazy[0].source, lazy[1].source),
+                (0, 1),
+                "one source tag per file: {argv:?}"
+            );
         }
         // A plain `--stream` walk without `-n` is read by the stream reader too (#5498): the driver
         // loop pops its events, so nothing is queued up front, and the reader takes exactly the
