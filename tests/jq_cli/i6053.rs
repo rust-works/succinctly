@@ -34,3 +34,23 @@ fn an_interpolated_string_after_a_dot_indexes_by_the_computed_key() -> Result<()
     }
     Ok(())
 }
+
+#[test]
+fn plain_quoted_steps_and_generator_keys_read_as_before() -> Result<()> {
+    let rows: &[(&str, &str)] = &[
+        (r#"{"a\tb":1} | ."a\tb""#, r"1"),
+        (r#"{"é":2} | ."é""#, r"2"),
+        (r#"{"":3} | ."""#, r"3"),
+        (r#"{"a\"b":4} | ."a\"b""#, r"4"),
+        (r#"{"a\\b":5} | ."a\\b""#, r"5"),
+        (r#"{"a1":1,"a2":2} | [."a\(1,2)"]"#, r"[1,2]"),
+        (r#"{"a3":5} | ."a\(1+2)" as $v | $v + 1"#, r"6"),
+        (r#"{"a":{"b":1}} | [."a"."b", ."a"."b"?]"#, r"[1,1]"),
+    ];
+    for (program, want) in rows {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", program], None)?;
+        assert_eq!(code, 0, "`{program}` failed: {stderr}");
+        assert_eq!(stdout.trim_end(), *want, "`{program}`");
+    }
+    Ok(())
+}

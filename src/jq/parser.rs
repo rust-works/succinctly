@@ -2217,14 +2217,16 @@ impl<'a> Parser<'a> {
         self.parse_path_step_name().map(PathStep::Field)
     }
 
-    /// The quoted name of a dotted path step, `."key"` (#4916). In jq mode that is an ordinary string
-    /// literal. yq reads the text between the quotes **raw**, escapes included, up to the next `"`:
-    /// `.x."a\tb"` selects the key `a\tb` (a backslash and a `t`), where `.x["a\tb"]` selects the one
-    /// with a TAB, and `."a\"` is the key `a\` (live against the pinned v4.53.3).
+    /// The quoted name of a dotted path step, `."key"`, in yq mode (#4916; jq mode goes through
+    /// [`Self::parse_path_step`]). yq reads the text between the quotes **raw**, escapes included, up
+    /// to the next `"`: `.x."a\tb"` selects the key `a\tb` (a backslash and a `t`), where `.x["a\tb"]`
+    /// selects the one with a TAB, and `."a\"` is the key `a\` (live against the pinned v4.53.3).
     fn parse_path_step_name(&mut self) -> Result<String, ParseError> {
-        if self.mode != ParserMode::Yq {
-            return self.parse_string_literal();
-        }
+        debug_assert_eq!(
+            self.mode,
+            ParserMode::Yq,
+            "jq mode reads a step with parse_path_step"
+        );
         // A quoted step is a string literal to yq's lexer too (#5452).
         if self.interp_depth > 0 {
             self.reject_unless_jq_extensions("string literal inside \\(...)")?;
