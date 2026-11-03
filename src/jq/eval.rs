@@ -86716,6 +86716,13 @@ pub(crate) fn range_num(value: &OwnedValue) -> Result<RangeNum, EvalError> {
 /// is a plain byte comparison (no allocation), unlike comparing against a
 /// freshly-`to_string()`-ed `i64`, so the common (non-`-0`) case pays only
 /// that one cheap check before falling through to `None`.
+///
+/// A second `Int` shape qualifies since #6064: one `f64` cannot hold
+/// (`jq_int_within_exact_f64_range`), which jq emits unrounded as `range`'s first
+/// value, but only when the range runs on doubles (a float bound or step). The
+/// all-`Int` walk pushes the same `i64` anyway, so [`each_range_batches`] keeps just the
+/// `-0` of the two there; the check here is an `i64` compare and returns a reference, so
+/// neither route pays for a clone it does not use.
 pub(crate) fn range_from_literal_override(value: &OwnedValue) -> Option<&OwnedValue> {
     match value {
         OwnedValue::NumberLiteral(NumberRepr::Float(_), _) => Some(value),
@@ -87261,11 +87268,12 @@ pub(crate) fn each_range_batches(
         // `i64` overflow ends its loop and keeps whatever was already pushed,
         // rather than bailing; see `range_batch_int`'s own doc comment.
         // `from_literal` is forwarded on this arm too (#3103): an integer
-        // literal generally renders identically to its own `i64` (so it is
-        // usually `None` here anyway), but `-0` is the one legal-JSON exception.
+        // literal generally renders identically to its own `i64`, but `-0` is the one
+        // legal-JSON exception.
         //
-        // Only that `-0` is kept here: any other integer literal (#6064's past-2^53 one
-        // included) is the same `i64` the walk pushes, as an exact `Int`.
+        // Only that `-0` is kept here: any other integer literal, #6064's past-2^53 one
+        // included, is the same `i64` the walk pushes, as an exact `Int`. The float arm
+        // below keeps every literal [`range_from_literal_override`] returns.
         (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => drive_range_batches(
             f,
             cap,
@@ -110369,6 +110377,63 @@ mod tests {
             }
         }
         assert_eq!(combos, from_anchors.len() * steps.len() * ks.len());
+    }
+
+    /// #6064: the first value's own literal reaches the float walk for an integer past 2^53,
+    /// and the all-`Int` walk keeps only a `-0` of the two shapes `range_from_literal_override`
+    /// returns, so one predicate decides what each route does with it.
+    #[test]
+    fn test_range_first_value_literal_per_route_6064() {
+        fn first(from: RangeNum, to: RangeNum, literal: &OwnedValue) -> OwnedValue {
+            let mut out = Vec::new();
+            each_range_batches(
+                from,
+                to,
+                RangeNum::Int(1),
+                true,
+                Some(literal),
+                1,
+                &mut |batch| {
+                    out.extend(batch);
+                    Demand::Continue
+                },
+            );
+            out.remove(0)
+        }
+        let big = OwnedValue::NumberLiteral(
+            NumberRepr::Int(9_007_199_254_740_993),
+            "9007199254740993".into(),
+        );
+        let neg_zero = OwnedValue::NumberLiteral(NumberRepr::Int(0), "-0".into());
+        // The double walk keeps the literal.
+        let value = first(
+            RangeNum::Int(9_007_199_254_740_993),
+            RangeNum::Float(9_007_199_254_741_000.5),
+            &big,
+        );
+        assert_eq!(value, big);
+        // The integer walk pushes the exact `Int`.
+        let value = first(
+            RangeNum::Int(9_007_199_254_740_993),
+            RangeNum::Int(9_007_199_254_741_000),
+            &big,
+        );
+        assert!(
+            matches!(value, OwnedValue::Int(9_007_199_254_740_993)),
+            "{value:?}"
+        );
+        // `-0` is kept by both.
+        for to in [RangeNum::Int(3), RangeNum::Float(3.5)] {
+            let value = first(RangeNum::Int(0), to, &neg_zero);
+            assert_eq!(value, neg_zero);
+        }
+        // The override itself: past 2^53 only.
+        assert!(range_from_literal_override(&big).is_some());
+        let at_limit = OwnedValue::NumberLiteral(
+            NumberRepr::Int(9_007_199_254_740_992),
+            "9007199254740992".into(),
+        );
+        assert!(range_from_literal_override(&at_limit).is_none());
     }
 
     /// #2131 (revised fix)/#2219, end to end through the full
