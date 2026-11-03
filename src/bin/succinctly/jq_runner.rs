@@ -3177,6 +3177,15 @@ struct OutputConfig {
 }
 
 impl OutputConfig {
+    /// This config with `-C` off, for the one record [`drops_color_for_ascii_raw`] says jq writes uncolored (#6047).
+    /// Cloned only when `-C`, `-a` and a raw string coincide, so no other record pays for it.
+    fn without_color(&self) -> Self {
+        Self {
+            color_output: false,
+            ..self.clone()
+        }
+    }
+
     fn from_args(args: &JqCommand) -> Self {
         let indent_string = if args.uses_tab_indent() {
             "\t".to_string()
@@ -13040,10 +13049,7 @@ fn write_output_jq_value_colored<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     // #6047: `-C` is dropped for a string `-a` keeps quoted under a raw mode.
     let uncolored;
     let (config, stream_color) = if drops_color_for_ascii_raw(&as_str, config) {
-        uncolored = OutputConfig {
-            color_output: false,
-            ..config.clone()
-        };
+        uncolored = config.without_color();
         (&uncolored, false)
     } else {
         (config, stream_color)
@@ -13407,10 +13413,7 @@ fn write_output_owned_value<Out: Write>(
     // #6047: `-C` is dropped for a string `-a` keeps quoted under a raw mode.
     let uncolored;
     let config = if drops_color_for_ascii_raw(&raw, config) {
-        uncolored = OutputConfig {
-            color_output: false,
-            ..config.clone()
-        };
+        uncolored = config.without_color();
         &uncolored
     } else {
         config
@@ -19606,10 +19609,7 @@ mod tests {
             // #6047: the one rule this route has gained since; `-C` is dropped for a string `-a` keeps quoted.
             let uncolored;
             let config = if drops_color_for_ascii_raw(&raw, config) {
-                uncolored = OutputConfig {
-                    color_output: false,
-                    ..config.clone()
-                };
+                uncolored = config.without_color();
                 &uncolored
             } else {
                 config
