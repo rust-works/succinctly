@@ -7048,7 +7048,9 @@ fn get_inputs(
                                 file_start,
                                 seams: seams.clone(),
                                 last_source: locations.last_src(),
-                                lossy: lossy.cloned(),
+                                // Moved: the stream is this source's alone, and nothing reads it
+                                // from here but the producer's fault tail.
+                                lossy: lossy_sources.get_mut(pos).and_then(Option::take),
                                 last_span: None,
                                 recorded_tail,
                             });
@@ -7899,7 +7901,6 @@ fn parser_chunks<'a>(
 /// invalid bytes into one three-byte U+FFFD, so counted over the text a column is too high by
 /// two for each lone invalid byte. A literal U+FFFD in the document is three bytes to jq as
 /// well, so the two cannot be told apart in the text: the original has to be kept.
-#[derive(Clone)]
 struct LossySource {
     original: Vec<u8>,
     /// Where the substitution changed the document, in order (#5975): a run it replaced by one
@@ -9438,11 +9439,8 @@ fn lazy_chunk_budget(index: usize) -> usize {
     if let Some(bytes) = LAZY_CHUNK_BYTES.with(std::cell::Cell::get) {
         return bytes;
     }
-    LAZY_CHUNK_FIRST_BYTES
-        .checked_shl(index.min(32) as u32)
-        .map_or(LAZY_CHUNK_MAX_BYTES, |bytes| {
-            bytes.min(LAZY_CHUNK_MAX_BYTES)
-        })
+    // 64 KiB doubled six times is the 4 MiB cap, so the shift cannot overflow.
+    (LAZY_CHUNK_FIRST_BYTES << index.min(6)).min(LAZY_CHUNK_MAX_BYTES)
 }
 
 /// The text a batch's index covers is at most this long, past its first document (#5854).
@@ -9575,7 +9573,7 @@ fn lazy_json_producer_then(
             // The documents read are forgotten, so the spans held are a chunk's, not the stream's.
             cursor.next = 0;
             cursor.batch = None;
-            if lazy.spans.is_empty() {
+            if lazy.spans.is_empty() && lazy.more.is_none() {
                 sources.pop_front();
                 cursor = LazyCursor::default();
             }
@@ -9688,6 +9686,12 @@ fn lazy_scan_on(
             let (mut values, mut ends, mut errors) = (Vec::new(), Vec::new(), Vec::new());
             match read_json_tail(text, end_of_last, &cx, &mut values, &mut ends, &mut errors) {
                 Ok(_) => {
+                    // A stream scanned a chunk at a time has nothing queued behind its lazy
+                    // documents: it is the only source, and it was clean when it was deferred.
+                    debug_assert!(
+                        tail.next().is_none(),
+                        "no tail is queued before a late fault"
+                    );
                     let mut locations = InputLocations::new(Vec::new());
                     locations.extend_from_ends(
                         lazy.source as usize,
@@ -10302,8 +10306,43 @@ fn lazy_json_scan_chunk(raw: &str, from: usize, budget: usize) -> LazyChunk {
 /// emit values use this to do the same; the scan itself is unchanged, so the
 /// hot input path does exactly the work it did before.
 fn split_json_values(bytes: &[u8]) -> (Vec<(usize, usize)>, Option<usize>) {
-    let (values, error, _) = split_json_values_until(bytes, 0, usize::MAX);
-    (values, error)
+    let mut values = Vec::new();
+    let mut pos = 0;
+
+    while pos < bytes.len() {
+        // Skip whitespace: space, tab, LF and CR only, as jq's lexer does; a form feed starts a
+        // token no value can begin with (#5650).
+        while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+
+        let start = pos;
+
+        match scan_one_json_token(bytes, pos) {
+            // jq's lexer takes the whole run of bytes up to a boundary as one token, so a
+            // number directly followed by another token byte (`23null`, `1true`, `0x`) is one
+            // malformed token, not two values (#4358). (A keyword is already whole-run:
+            // `find_literal_end`.) A container or string needs no boundary after it (`[1]2`,
+            // `"a"2` are two values). `--seq`'s scanner shares `scan_one_json_token` and keeps the
+            // old splitting; its records are RS-delimited.
+            Some(end)
+                if !matches!(bytes[start], b'{' | b'[' | b'"')
+                    && bytes.get(end).is_some_and(|&b| !is_jq_token_boundary(b)) =>
+            {
+                return (values, Some(start));
+            }
+            Some(end) => {
+                values.push((start, end));
+                pos = end;
+            }
+            None => return (values, Some(start)),
+        }
+    }
+
+    (values, None)
 }
 
 /// [`split_json_values`] from `from`, which stops after the first value that ends at `stop_at` or
@@ -10311,7 +10350,6 @@ fn split_json_values(bytes: &[u8]) -> (Vec<(usize, usize)>, Option<usize>) {
 /// followed by white space. A number or literal directly followed by another byte is read with it
 /// (the byte may be the fault that completes it). The flag says the stop was made, with the text
 /// not yet at its end (#5856).
-#[inline(always)]
 fn split_json_values_until(
     bytes: &[u8],
     from: usize,
@@ -15226,6 +15264,70 @@ mod tests {
                     from = spans.last().map_or(0, |&(_, end)| end);
                 }
                 assert_eq!(spans, whole, "{stream:?} in chunks of {budget}");
+            }
+        }
+    }
+
+    /// #5856: the splitter the chunked scan stops with is the splitter, without the stop: the two
+    /// are separate loops (the shared one is the hot path of every JSON read), so this holds them
+    /// to each other, over clean streams and over every shape that makes the splitter give up.
+    #[test]
+    fn the_chunk_splitter_without_a_stop_is_the_splitter_5856() {
+        let mut streams = batched_streams_5854();
+        streams.extend(
+            [
+                "",
+                " ",
+                "1",
+                "1 2 3}",
+                "23null",
+                "[1]2",
+                "1[2]",
+                "\"a\"2",
+                "x",
+                "[1,",
+                "{\"a\"",
+                "\"unclosed",
+                "tru",
+                "true false null",
+                "nan -Infinity",
+                "-e5 1",
+                "1e",
+                ".5 .",
+                "}",
+                "\u{c}1",
+                "1\u{c}",
+                "[1]\n\n\t\r\n[2]  ",
+                "0x",
+                "007",
+                "1 2\u{0}",
+            ]
+            .map(String::from),
+        );
+        for stream in &streams {
+            let bytes = stream.as_bytes();
+            let (spans, error) = split_json_values(bytes);
+            assert_eq!(
+                split_json_values_until(bytes, 0, usize::MAX),
+                (spans.clone(), error, false),
+                "{stream:?}"
+            );
+            // Stopped early, the documents are a prefix of the whole, and what it stops before is
+            // read from where it left off.
+            for stop_at in [1, 5, 40] {
+                let (head, head_error, stopped) = split_json_values_until(bytes, 0, stop_at);
+                assert_eq!(head, spans[..head.len()], "{stream:?} stopped at {stop_at}");
+                if stopped {
+                    let from = head.last().map_or(0, |&(_, end)| end);
+                    let (rest, rest_error, _) = split_json_values_until(bytes, from, usize::MAX);
+                    assert_eq!(head_error, None);
+                    assert_eq!(
+                        [head.as_slice(), rest.as_slice()].concat(),
+                        spans,
+                        "{stream:?} resumed after stopping at {stop_at}"
+                    );
+                    assert_eq!(rest_error, error, "{stream:?}");
+                }
             }
         }
     }
