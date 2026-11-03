@@ -12103,6 +12103,20 @@ Ordering is unchanged in both: NaN sorts below NaN, itself included. A mixed-ins
 `sort`/`unique`/`group_by` (`[.a,.b,.a] | unique` over two NaN tokens) depends on the sort's
 comparison order in jq, and may group differently here.
 
+### NaN ties in `sort`, `unique`, `group_by`, `min` and `max` keep jq's order (#6008)
+
+jq orders a NaN before every number and before another NaN (`nan < nan` is true in both directions), and settles the tie by input position.
+`sort`, `sort_by`, `unique`, `unique_by` and `group_by` leave NaN-keyed items in input order, `min` and `min_by` return the last of a run of NaNs, and `max` and `max_by` the first.
+`succinctly jq` does the same: a pair of keys that each compare below the other is a tie in the sort, and `min`/`max` use jq's own replace-if-less loop.
+`[{"a":nan,"b":1},{"a":nan,"b":2}] | sort` is `[{"a":null,"b":1},{"a":null,"b":2}]` and `[3,1,2] | min_by(nan), max_by(nan)` is `2` and `3`, as in jq.
+A bare NaN prints as `null`, so only records, arrays or `_by` keys that carry a NaN can show the order.
+`tests/jq_cli/i6008.rs` pins 208 rows captured from jq 1.7.1.
+
+jq's `sort` is the C library's `qsort` with a comparator that answers `Less` both ways for two NaNs, so past a few items its order for NaN ties is the library's.
+glibc's merge sort and Apple's insertion sort (up to six items) leave them in input order, which is what is matched here.
+Apple's `qsort` permutes longer runs (`[range(8)] | sort_by(nan)` is `[7,1,2,3,0,5,6,4]` on macOS), an order that comes from its algorithm and is not reproduced.
+The scan for a NaN before a sort costs one pass over the keys; a sort of keys without one is unchanged.
+
 ### A partial BOM at the start of the input stream is worded as a numeric-literal fault (#5804)
 
 jq's parser reports a text that opens with part of the UTF-8 BOM (`EF`, or `EF BB`) and then departs from it as `Malformed BOM`.

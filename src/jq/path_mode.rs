@@ -3952,7 +3952,11 @@ fn sort_by_keys(input: &OwnedValue, keys: &OwnedValue, group: bool) -> Result<Ow
         ));
     }
     let mut order: Vec<usize> = (0..items.len()).collect();
-    order.sort_by(|&a, &b| compare_values::<JqSemantics>(&ks[a], &ks[b]));
+    super::eval::sort_like_jq(
+        &mut order,
+        |&a, &b| compare_values::<JqSemantics>(&ks[a], &ks[b]),
+        |&i| super::eval::value_has_nan(&ks[i]),
+    );
     if !group {
         return Ok(OwnedValue::Array(
             order.iter().map(|&i| items[i].clone()).collect(),

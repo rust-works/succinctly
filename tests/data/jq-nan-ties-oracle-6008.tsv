@@ -1,0 +1,208 @@
+[3,1,2] | min	1\n		0
+[3,1,2] | max	3\n		0
+[3,1,2] | min_by(nan)	2\n		0
+[3,1,2] | max_by(nan)	3\n		0
+[3,1,2] | min_by(.)	1\n		0
+[3,1,2] | max_by(.)	3\n		0
+[3,1,2] | min_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[3,1,2] | max_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[3,1,2] | sort	[1,2,3]\n		0
+[3,1,2] | sort_by(nan)	[3,1,2]\n		0
+[3,1,2] | sort_by(.)	[1,2,3]\n		0
+[3,1,2] | group_by(.)	[[1],[2],[3]]\n		0
+[3,1,2] | unique	[1,2,3]\n		0
+[3,1,2] | unique_by(.)	[1,2,3]\n		0
+[3,1,2] | group_by(nan)	[[3],[1],[2]]\n		0
+[3,1,2] | unique_by(nan)	[3,1,2]\n		0
+[nan,1,2] | min	null\n		0
+[nan,1,2] | max	2\n		0
+[nan,1,2] | min_by(nan)	2\n		0
+[nan,1,2] | max_by(nan)	null\n		0
+[nan,1,2] | min_by(.)	null\n		0
+[nan,1,2] | max_by(.)	2\n		0
+[nan,1,2] | min_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[nan,1,2] | max_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[nan,1,2] | sort	[null,1,2]\n		0
+[nan,1,2] | sort_by(nan)	[null,1,2]\n		0
+[nan,1,2] | sort_by(.)	[null,1,2]\n		0
+[nan,1,2] | group_by(.)	[[null],[1],[2]]\n		0
+[nan,1,2] | unique	[null,1,2]\n		0
+[nan,1,2] | unique_by(.)	[null,1,2]\n		0
+[nan,1,2] | group_by(nan)	[[null],[1],[2]]\n		0
+[nan,1,2] | unique_by(nan)	[null,1,2]\n		0
+[1,nan,2] | min	null\n		0
+[1,nan,2] | max	2\n		0
+[1,nan,2] | min_by(nan)	2\n		0
+[1,nan,2] | max_by(nan)	1\n		0
+[1,nan,2] | min_by(.)	null\n		0
+[1,nan,2] | max_by(.)	2\n		0
+[1,nan,2] | min_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[1,nan,2] | max_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[1,nan,2] | sort	[null,1,2]\n		0
+[1,nan,2] | sort_by(nan)	[1,null,2]\n		0
+[1,nan,2] | sort_by(.)	[null,1,2]\n		0
+[1,nan,2] | group_by(.)	[[null],[1],[2]]\n		0
+[1,nan,2] | unique	[null,1,2]\n		0
+[1,nan,2] | unique_by(.)	[null,1,2]\n		0
+[1,nan,2] | group_by(nan)	[[1],[null],[2]]\n		0
+[1,nan,2] | unique_by(nan)	[1,null,2]\n		0
+[1,2,nan] | min	null\n		0
+[1,2,nan] | max	2\n		0
+[1,2,nan] | min_by(nan)	null\n		0
+[1,2,nan] | max_by(nan)	1\n		0
+[1,2,nan] | min_by(.)	null\n		0
+[1,2,nan] | max_by(.)	2\n		0
+[1,2,nan] | min_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[1,2,nan] | max_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[1,2,nan] | sort	[null,1,2]\n		0
+[1,2,nan] | sort_by(nan)	[1,2,null]\n		0
+[1,2,nan] | sort_by(.)	[null,1,2]\n		0
+[1,2,nan] | group_by(.)	[[null],[1],[2]]\n		0
+[1,2,nan] | unique	[null,1,2]\n		0
+[1,2,nan] | unique_by(.)	[null,1,2]\n		0
+[1,2,nan] | group_by(nan)	[[1],[2],[null]]\n		0
+[1,2,nan] | unique_by(nan)	[1,2,null]\n		0
+[nan,nan] | min	null\n		0
+[nan,nan] | max	null\n		0
+[nan,nan] | min_by(nan)	null\n		0
+[nan,nan] | max_by(nan)	null\n		0
+[nan,nan] | min_by(.)	null\n		0
+[nan,nan] | max_by(.)	null\n		0
+[nan,nan] | min_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[nan,nan] | max_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[nan,nan] | sort	[null,null]\n		0
+[nan,nan] | sort_by(nan)	[null,null]\n		0
+[nan,nan] | sort_by(.)	[null,null]\n		0
+[nan,nan] | group_by(.)	[[null],[null]]\n		0
+[nan,nan] | unique	[null,null]\n		0
+[nan,nan] | unique_by(.)	[null,null]\n		0
+[nan,nan] | group_by(nan)	[[null],[null]]\n		0
+[nan,nan] | unique_by(nan)	[null,null]\n		0
+[nan,nan,1] | min	null\n		0
+[nan,nan,1] | max	1\n		0
+[nan,nan,1] | min_by(nan)	1\n		0
+[nan,nan,1] | max_by(nan)	null\n		0
+[nan,nan,1] | min_by(.)	null\n		0
+[nan,nan,1] | max_by(.)	1\n		0
+[nan,nan,1] | min_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[nan,nan,1] | max_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[nan,nan,1] | sort	[null,null,1]\n		0
+[nan,nan,1] | sort_by(nan)	[null,null,1]\n		0
+[nan,nan,1] | sort_by(.)	[null,null,1]\n		0
+[nan,nan,1] | group_by(.)	[[null],[null],[1]]\n		0
+[nan,nan,1] | unique	[null,null,1]\n		0
+[nan,nan,1] | unique_by(.)	[null,null,1]\n		0
+[nan,nan,1] | group_by(nan)	[[null],[null],[1]]\n		0
+[nan,nan,1] | unique_by(nan)	[null,null,1]\n		0
+[1,nan,nan] | min	null\n		0
+[1,nan,nan] | max	1\n		0
+[1,nan,nan] | min_by(nan)	null\n		0
+[1,nan,nan] | max_by(nan)	1\n		0
+[1,nan,nan] | min_by(.)	null\n		0
+[1,nan,nan] | max_by(.)	1\n		0
+[1,nan,nan] | min_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[1,nan,nan] | max_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[1,nan,nan] | sort	[null,null,1]\n		0
+[1,nan,nan] | sort_by(nan)	[1,null,null]\n		0
+[1,nan,nan] | sort_by(.)	[null,null,1]\n		0
+[1,nan,nan] | group_by(.)	[[null],[null],[1]]\n		0
+[1,nan,nan] | unique	[null,null,1]\n		0
+[1,nan,nan] | unique_by(.)	[null,null,1]\n		0
+[1,nan,nan] | group_by(nan)	[[1],[null],[null]]\n		0
+[1,nan,nan] | unique_by(nan)	[1,null,null]\n		0
+[[nan,1],[nan,0]] | min	[null,0]\n		0
+[[nan,1],[nan,0]] | max	[null,1]\n		0
+[[nan,1],[nan,0]] | min_by(nan)	[null,0]\n		0
+[[nan,1],[nan,0]] | max_by(nan)	[null,1]\n		0
+[[nan,1],[nan,0]] | min_by(.)	[null,0]\n		0
+[[nan,1],[nan,0]] | max_by(.)	[null,1]\n		0
+[[nan,1],[nan,0]] | min_by(.a)		jq: error (at <unknown>): Cannot index array with string "a"\n	5
+[[nan,1],[nan,0]] | max_by(.a)		jq: error (at <unknown>): Cannot index array with string "a"\n	5
+[[nan,1],[nan,0]] | sort	[[null,1],[null,0]]\n		0
+[[nan,1],[nan,0]] | sort_by(nan)	[[null,1],[null,0]]\n		0
+[[nan,1],[nan,0]] | sort_by(.)	[[null,1],[null,0]]\n		0
+[[nan,1],[nan,0]] | group_by(.)	[[[null,1]],[[null,0]]]\n		0
+[[nan,1],[nan,0]] | unique	[[null,1],[null,0]]\n		0
+[[nan,1],[nan,0]] | unique_by(.)	[[null,1],[null,0]]\n		0
+[[nan,1],[nan,0]] | group_by(nan)	[[[null,1]],[[null,0]]]\n		0
+[[nan,1],[nan,0]] | unique_by(nan)	[[null,1],[null,0]]\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | min	{"a":null,"b":2}\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | max	{"a":null,"b":1}\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | min_by(nan)	{"a":null,"b":2}\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | max_by(nan)	{"a":null,"b":1}\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | min_by(.)	{"a":null,"b":2}\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | max_by(.)	{"a":null,"b":1}\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | min_by(.a)	{"a":null,"b":2}\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | max_by(.a)	{"a":null,"b":1}\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | sort	[{"a":null,"b":1},{"a":null,"b":2}]\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | sort_by(nan)	[{"a":null,"b":1},{"a":null,"b":2}]\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | sort_by(.)	[{"a":null,"b":1},{"a":null,"b":2}]\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | group_by(.)	[[{"a":null,"b":1}],[{"a":null,"b":2}]]\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | unique	[{"a":null,"b":1},{"a":null,"b":2}]\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | unique_by(.)	[{"a":null,"b":1},{"a":null,"b":2}]\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | group_by(nan)	[[{"a":null,"b":1}],[{"a":null,"b":2}]]\n		0
+[{"a":nan,"b":1},{"a":nan,"b":2}] | unique_by(nan)	[{"a":null,"b":1},{"a":null,"b":2}]\n		0
+[null,nan,1] | min	null\n		0
+[null,nan,1] | max	1\n		0
+[null,nan,1] | min_by(nan)	1\n		0
+[null,nan,1] | max_by(nan)	null\n		0
+[null,nan,1] | min_by(.)	null\n		0
+[null,nan,1] | max_by(.)	1\n		0
+[null,nan,1] | min_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[null,nan,1] | max_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[null,nan,1] | sort	[null,null,1]\n		0
+[null,nan,1] | sort_by(nan)	[null,null,1]\n		0
+[null,nan,1] | sort_by(.)	[null,null,1]\n		0
+[null,nan,1] | group_by(.)	[[null],[null],[1]]\n		0
+[null,nan,1] | unique	[null,null,1]\n		0
+[null,nan,1] | unique_by(.)	[null,null,1]\n		0
+[null,nan,1] | group_by(nan)	[[null],[null],[1]]\n		0
+[null,nan,1] | unique_by(nan)	[null,null,1]\n		0
+[nan,null] | min	null\n		0
+[nan,null] | max	null\n		0
+[nan,null] | min_by(nan)	null\n		0
+[nan,null] | max_by(nan)	null\n		0
+[nan,null] | min_by(.)	null\n		0
+[nan,null] | max_by(.)	null\n		0
+[nan,null] | min_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[nan,null] | max_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[nan,null] | sort	[null,null]\n		0
+[nan,null] | sort_by(nan)	[null,null]\n		0
+[nan,null] | sort_by(.)	[null,null]\n		0
+[nan,null] | group_by(.)	[[null],[null]]\n		0
+[nan,null] | unique	[null,null]\n		0
+[nan,null] | unique_by(.)	[null,null]\n		0
+[nan,null] | group_by(nan)	[[null],[null]]\n		0
+[nan,null] | unique_by(nan)	[null,null]\n		0
+[] | min	null\n		0
+[] | max	null\n		0
+[] | min_by(nan)	null\n		0
+[] | max_by(nan)	null\n		0
+[] | min_by(.)	null\n		0
+[] | max_by(.)	null\n		0
+[] | min_by(.a)	null\n		0
+[] | max_by(.a)	null\n		0
+[] | sort	[]\n		0
+[] | sort_by(nan)	[]\n		0
+[] | sort_by(.)	[]\n		0
+[] | group_by(.)	[]\n		0
+[] | unique	[]\n		0
+[] | unique_by(.)	[]\n		0
+[] | group_by(nan)	[]\n		0
+[] | unique_by(nan)	[]\n		0
+[nan] | min	null\n		0
+[nan] | max	null\n		0
+[nan] | min_by(nan)	null\n		0
+[nan] | max_by(nan)	null\n		0
+[nan] | min_by(.)	null\n		0
+[nan] | max_by(.)	null\n		0
+[nan] | min_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[nan] | max_by(.a)		jq: error (at <unknown>): Cannot index number with string "a"\n	5
+[nan] | sort	[null]\n		0
+[nan] | sort_by(nan)	[null]\n		0
+[nan] | sort_by(.)	[null]\n		0
+[nan] | group_by(.)	[[null]]\n		0
+[nan] | unique	[null]\n		0
+[nan] | unique_by(.)	[null]\n		0
+[nan] | group_by(nan)	[[null]]\n		0
+[nan] | unique_by(nan)	[null]\n		0
