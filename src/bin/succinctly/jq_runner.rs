@@ -5890,12 +5890,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                             sink.report_parse_error(&error.message);
                             break;
                         }
+                        // A parse error the main loop meets is jq's `parse error`, with no
+                        // input location, as when the program reads no input (#5965). Only the
+                        // program's own `input` raises it as an error with a marker.
                         jq::InputPop::ParseError(error) => {
-                            sink.report(
-                                DiagStyle::Jq,
-                                &error,
-                                &ErrorAt::Live(&locations).resolve(),
-                            );
+                            sink.report_parse_error(&error.message);
                             break;
                         }
                         jq::InputPop::Exhausted => break,
