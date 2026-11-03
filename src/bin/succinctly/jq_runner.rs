@@ -90,6 +90,12 @@ pub(crate) fn named_flag_order(argv: &[String]) -> Vec<NamedFlag> {
 }
 
 impl JqCommand {
+    /// Whether the output is indented with tabs: `--tab`, or `--indent -1`, which jq 1.7.1 treats
+    /// as the same thing (#6017). The one definition for both indent derivations.
+    fn uses_tab_indent(&self) -> bool {
+        self.tab || self.indent == Some(-1)
+    }
+
     /// Turn clap's greedy `--args`/`--jsonargs` captures into the filter and
     /// the ordered positional words jq's own `main.c` produces (#3412).
     ///
@@ -3171,7 +3177,7 @@ struct OutputConfig {
 
 impl OutputConfig {
     fn from_args(args: &JqCommand) -> Self {
-        let indent_string = if args.tab {
+        let indent_string = if args.uses_tab_indent() {
             "\t".to_string()
         } else if let Some(n) = args.indent {
             " ".repeat(n as usize)
@@ -4935,7 +4941,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // streamer needs the semantic width/unit pair, not rendered text.
     // Priority matches `OutputConfig::from_args`'s `indent_string`
     // construction exactly (tab > explicit `--indent N` > `-c` > default 2).
-    let json_indent = if args.tab {
+    let json_indent = if args.uses_tab_indent() {
         IndentSpec {
             width: 1,
             unit: '\t',
@@ -6326,6 +6332,11 @@ fn get_inputs(
     open_failed: &mut bool,
     opened: &mut Vec<PathBuf>,
 ) -> std::result::Result<Result<Inputs>, i32> {
+    // What an earlier read on this thread deferred for the queue and did not hand over is not
+    // this read's (#5857): the call site that seeds the queue takes the first slot it finds.
+    LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
+    LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
+    LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
     // Null input mode: use null as the single input -- unless the filter
     // itself uses `input`/`inputs`/`input_line_number` (#723), in which case
     // the caller passes `force_read_under_null_input: true` to fall through
@@ -6624,6 +6635,42 @@ fn get_inputs(
             });
             return Ok(Ok((Vec::new(), locations, None, Vec::new())));
         }
+        // #6005: under `-n` jq reads on the first `input`, so a fault is an input of its own: the
+        // faults the slurp loop meets come first, one per call, then the array, then whatever the
+        // loop left for the calls after it. A program that never asks for one prints its result.
+        if args.slurp && args.null_input && stream_by_reader {
+            let read = crate::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
+            let place = |at| stream_location(&raw_bytes, at);
+            let fault = |message: String, at: (usize, usize)| {
+                let (source, line) = place(at);
+                TrailingParseError {
+                    error: EvalError::new(message),
+                    source: u32::try_from(source).unwrap_or(u32::MAX),
+                    line: u32::try_from(line).unwrap_or(u32::MAX),
+                    seq_warning: false,
+                }
+            };
+            let mut resumed: Vec<(usize, TrailingParseError)> = Vec::new();
+            for (message, at) in read.before {
+                resumed.push((0, fault(message, at)));
+            }
+            let mut values = vec![OwnedValue::array_from(read.array)];
+            let (source, line) = place(read.slurp_at);
+            locations.push(source, line);
+            for item in read.after {
+                match item {
+                    crate::jq_stream_errors::Afterwards::Value(value, at) => {
+                        let (source, line) = place(at);
+                        locations.push(source, line);
+                        values.push(value);
+                    }
+                    crate::jq_stream_errors::Afterwards::Fault(message, at) => {
+                        resumed.push((values.len(), fault(message, at)));
+                    }
+                }
+            }
+            return Ok(Ok((values, locations, None, resumed)));
+        }
         let mut read = if args.slurp {
             crate::jq_stream_errors::read_for_slurp(&raw_bytes, stream_by_reader)
         } else {
@@ -6659,17 +6706,9 @@ fn get_inputs(
             values.extend(outside);
             value_locations.extend(outside_locations);
         }
-        for &(source, line) in &value_locations {
-            if line == crate::jq_stream_errors::CLOSED {
-                locations.push(0, UNKNOWN_LINE as usize);
-            } else {
-                // `get` and not an index: a slurped array has a location even when no file
-                // opened (`--stream -s` over only a missing file is `[]`, #6006).
-                locations.push(
-                    raw_bytes.get(source).and_then(|raw| raw.0).unwrap_or(0),
-                    line,
-                );
-            }
+        for &at in &value_locations {
+            let (source, line) = stream_location(&raw_bytes, at);
+            locations.push(source, line);
         }
         if track_eof && !args.slurp {
             locations.eof_tail = Some(EofTail {
@@ -6883,6 +6922,8 @@ fn get_inputs(
     // filter's own `input`. jq has lost its position by then -- the call
     // that raises it closed the stream -- so it names `<unknown>`.
     let mut resumed_errors: Vec<(usize, TrailingParseError)> = seq_fault_errors;
+    // #6019: whether `-n -s` read a stream with a fault the resuming way (below).
+    let mut resume_slurp_done = false;
     let mut trailing_error: Option<TrailingParseError> =
         seq_deferred_warning.map(|message| TrailingParseError {
             error: EvalError::new(message),
@@ -6920,8 +6961,26 @@ fn get_inputs(
     } else if args.raw_input && args.input_dsv.is_none() {
         // Never reached with `args.slurp`: `-R -s` without `--input-dsv`
         // already returned early above this point.
-        values = build_raw_input_values(&raw_inputs, &mut locations);
-        debug_assert_eq!(locations.len(), values.len(), "one location per value");
+        if track_eof && !args.stream && !lazy_route_forced_off() {
+            // #5857: each line becomes a string when the program reads it, as a JSON document
+            // does (#5661). The end of the stream was recorded above, from the bytes as read.
+            LAZY_RAW_INPUTS.with(|slot| {
+                *slot.borrow_mut() = Some(
+                    raw_inputs
+                        .into_iter()
+                        .map(|(file_idx, raw)| {
+                            (
+                                u32::try_from(file_idx.unwrap_or(0)).unwrap_or(u32::MAX),
+                                raw,
+                            )
+                        })
+                        .collect(),
+                );
+            });
+        } else {
+            values = build_raw_input_values(&raw_inputs, &mut locations);
+            debug_assert_eq!(locations.len(), values.len(), "one location per value");
+        }
     } else {
         // Where the next file starts in jq's input, which reads every file as one stream; only
         // the depth limit's message reads it (#5497). The files are consumed as they are read,
@@ -6930,6 +6989,7 @@ fn get_inputs(
         // no message can read it (`--stream`, DSV).
         let last = raw_inputs.len().saturating_sub(1);
         LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
+        LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
         LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
         let mut lazy_inputs = false;
         let counts_files = !args.stream && args.input_dsv.is_none();
@@ -6967,6 +7027,21 @@ fn get_inputs(
                 raw_inputs
             }
         };
+        // #6019: under `-n -s` jq reads on the first `input`, so a stream with a fault is read the
+        // way the resuming route reads it (the faults are inputs, the documents after them are
+        // read), and the faults then come out ahead of the array. A clean stream, or a program
+        // that does not read inputs, keeps the single parse. (`track_eof` is set only for a program
+        // that reads inputs, so the probe parse is paid by `-n -s` with `input`/`inputs` alone.)
+        let resume_slurp = args.slurp
+            && args.null_input
+            && track_eof
+            && !args.stream
+            && !args.seq
+            && args.input_dsv.is_none()
+            && raw_inputs
+                .iter()
+                .any(|(_, raw)| parse_json_stream_prefix(raw, None).1.is_some());
+        resume_slurp_done = resume_slurp;
         for (pos, (file_idx, raw)) in raw_inputs.into_iter().enumerate() {
             let src = file_idx.unwrap_or(0);
             let file_start = next_file;
@@ -7013,7 +7088,7 @@ fn get_inputs(
                 }
                 // #4311: a program using `input`/`inputs` sees jq resume after
                 // a parse error, at the read after the one that met the fault.
-                if track_eof && !args.slurp {
+                if track_eof && (!args.slurp || resume_slurp) {
                     // #5661: one clean plain-JSON source converts each document when the
                     // program reads it, so `first(inputs)` neither parses nor holds the rest.
                     // Anything unusual (an error, a BOM, a deep document) takes the route below.
@@ -7025,7 +7100,7 @@ fn get_inputs(
                     // and the eager loop below reads it from the end of the last lazy document
                     // (#5853).
                     let mut lazy_prefix: Option<Vec<(usize, usize)>> = None;
-                    if !args.stream && pos == 0 && last == 0 {
+                    if !args.stream && !args.slurp && pos == 0 && last == 0 {
                         let scan = if lazy_route_forced_off() {
                             LazyChunk {
                                 spans: Vec::new(),
@@ -7244,6 +7319,22 @@ fn get_inputs(
             None => InputLocation::unknown(),
         };
         let slurped = vec![OwnedValue::array_from(values)];
+        // #6019: the faults a stream held come out of `input` one per call, all of them ahead of
+        // the array, the one that ended the stream included. Each names its file by the table
+        // `locations` holds, so the array's location is one entry in that table.
+        if resume_slurp_done {
+            let (src, line) = locations
+                .slurp_eof(slurp_eof_line)
+                .unwrap_or((0, UNKNOWN_LINE));
+            let mut slurped_locations = InputLocations::new(locations.files().to_vec());
+            slurped_locations.push(src as usize, line as usize);
+            let mut ahead: Vec<(usize, TrailingParseError)> = resumed_errors
+                .into_iter()
+                .map(|(_, fault)| (0, fault))
+                .collect();
+            ahead.extend(trailing_error.take().map(|fault| (0, fault)));
+            return Ok(Ok((slurped, slurped_locations, None, ahead)));
+        }
         let slurped_locations = InputLocations::single(at);
         Ok(Ok((
             slurped,
@@ -7273,6 +7364,22 @@ fn stream_walk_by_reader(args: &JqCommand) -> bool {
         && args.input_dsv.is_none()
         && !args.raw_input
         && !args.seq
+}
+
+/// The source tag and line an input of the stream reader is placed at: `(source, line)` as the
+/// reader gives it, with a closed input (`input_filename` is `null`, `input_line_number` is `0`)
+/// and a source that never opened placed where the rest of the queue puts them.
+fn stream_location(
+    sources: &[(Option<usize>, Vec<u8>)],
+    (source, line): (usize, usize),
+) -> (usize, usize) {
+    if line == crate::jq_stream_errors::CLOSED {
+        (0, UNKNOWN_LINE as usize)
+    } else {
+        // `get` and not an index: a slurped array has a location even when no file opened
+        // (`--stream -s` over only a missing file is `[]`, #6006).
+        (sources.get(source).and_then(|raw| raw.0).unwrap_or(0), line)
+    }
 }
 
 /// Whether `--stream -s` (#5498) is read by the stream reader: the array holds the events, and the
@@ -9736,6 +9843,61 @@ impl Default for LazyCursor {
     }
 }
 
+/// The producer the `input` queue pulls `-R`'s lines from (#5857): jq reads the files as one stream
+/// of lines, so a line that a file ends without a newline goes on into the next, and each read
+/// converts the next line to a string and counts its line number.
+///
+/// A line is placed where [`remap_ends_to_locations`] places it: in the file holding its newline,
+/// at that file's count of newlines before it, and a final line without one in the last file, at
+/// that file's own length. `files` are each source's tag and text; the end of the stream is
+/// `exhausted`.
+fn lazy_raw_producer(
+    files: Vec<(u32, String)>,
+    exhausted: Option<(u32, u32)>,
+) -> jq::InputProducer {
+    let mut files = files;
+    let last = files.len().saturating_sub(1);
+    // The file being read and the offset in it, the newlines of that file read so far (a line's
+    // number is the count at its own newline, and a final line without one is on the file's
+    // last), and the front of a line an earlier file left open.
+    let (mut file, mut at) = (0usize, 0usize);
+    let mut newlines = 0u32;
+    let mut open = String::new();
+    Box::new(move || {
+        while file < files.len() {
+            let (tag, text) = &files[file];
+            if let Some(newline) = text.as_bytes()[at..].iter().position(|&b| b == b'\n') {
+                let end = at + newline;
+                let mut line = std::mem::take(&mut open);
+                line.push_str(&text[at..end]);
+                at = end + 1;
+                newlines = newlines.saturating_add(1);
+                return jq::ProducedInput::Document(
+                    OwnedValue::String(line.into()),
+                    *tag,
+                    newlines,
+                );
+            }
+            open.push_str(&text[at..]);
+            if file == last {
+                break;
+            }
+            // Past the file: its text is no longer needed.
+            files[file].1 = String::new();
+            file += 1;
+            at = 0;
+            newlines = 0;
+        }
+        if open.is_empty() {
+            return jq::ProducedInput::End(exhausted);
+        }
+        // A final line without a newline: the last file's, on that file's last line.
+        let line = std::mem::take(&mut open);
+        file = files.len();
+        jq::ProducedInput::Document(OwnedValue::String(line.into()), files[last].0, newlines)
+    })
+}
+
 /// Leaves a stream's lazy documents for the call site that seeds the `input` queue, which takes them.
 /// A stream of several files defers one source per file, in order (#5857).
 fn defer_lazy_start(
@@ -9769,7 +9931,15 @@ fn seed_input_queue(
     trailing_error: Option<TrailingParseError>,
     resumed_errors: Vec<(usize, TrailingParseError)>,
 ) {
-    if let Some(lazy) = LAZY_JSON_INPUTS.with(|slot| slot.borrow_mut().take()) {
+    if let Some(files) = LAZY_RAW_INPUTS.with(|slot| slot.borrow_mut().take()) {
+        // #5857: `-R`'s lines, converted as the program reads them. There is no parse error to
+        // queue behind them, and `inputs` is empty.
+        debug_assert!(inputs.is_empty() && trailing_error.is_none() && resumed_errors.is_empty());
+        jq::seed_remaining_inputs_from(lazy_raw_producer(files, locations.exhausted(slurp)));
+        if locations.eof_tail.is_some() {
+            jq::count_reads_past_end();
+        }
+    } else if let Some(lazy) = LAZY_JSON_INPUTS.with(|slot| slot.borrow_mut().take()) {
         // #5661: a stream whose documents are converted as the program reads them. A clean
         // one has `inputs` empty, and so is `locations`' line table: each document's line
         // is counted when it is read, one forward pass over the text in all. One that
@@ -9955,6 +10125,10 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     /// Set by [`get_inputs`] for the call site that seeds the `input` queue, which takes it.
     static LAZY_JSON_INPUTS: std::cell::RefCell<Option<std::collections::VecDeque<LazyJsonInputs>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set by [`get_inputs`] for `-R` (#5857): each file's source tag and text, in order, which the
+    /// call site that seeds the `input` queue takes.
+    static LAZY_RAW_INPUTS: std::cell::RefCell<Option<Vec<(u32, String)>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -14924,9 +15098,22 @@ mod tests {
         lazy_off: bool,
         chunk: Option<usize>,
     ) -> (Vec<String>, usize) {
+        observe_inputs_with(dir, files, &[], lazy_off, chunk)
+    }
+
+    /// [`observe_inputs`] with `flags` (`-R`) before the program.
+    fn observe_inputs_with(
+        dir: &std::path::Path,
+        files: &[&[u8]],
+        flags: &[&str],
+        lazy_off: bool,
+        chunk: Option<usize>,
+    ) -> (Vec<String>, usize) {
         use clap::Parser;
 
-        let mut argv = vec!["jq".to_string(), "-n".to_string(), "inputs".to_string()];
+        let mut argv = vec!["jq".to_string(), "-n".to_string()];
+        argv.extend(flags.iter().map(|&flag| flag.to_owned()));
+        argv.push("inputs".to_string());
         for (index, bytes) in files.iter().enumerate() {
             let path = dir.join(format!("stream{index}.json"));
             std::fs::write(&path, bytes).unwrap();
@@ -14943,7 +15130,8 @@ mod tests {
             slot.borrow()
                 .as_ref()
                 .map_or(0, |lazy| lazy.iter().map(|source| source.spans.len()).sum())
-        });
+        }) + LAZY_RAW_INPUTS
+            .with(|slot| slot.borrow().as_ref().map_or(0, Vec::len));
         seed_input_queue(false, inputs, &locations, trailing, resumed);
         // The end marker is read off the pops past the end (#4303): a scan that has not reached it
         // yet records a placeholder in `locations`.
@@ -15323,6 +15511,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #5857: `-R` reads the same whether each line becomes a string when the program reads it
+    /// or all of them up front: every line `input` pops, the `(at ...)` location after each (the
+    /// file and its line, with a line that one file leaves open and the next finishes, an empty
+    /// file, a file with no final newline, an invalid UTF-8 byte), and the end marker, through and
+    /// past the end. Every third stream of four pieces is cut into two files at every byte, and
+    /// into three at every other pair of bytes. The pin must be able to fail: it does with the line
+    /// number carried from one file to the next, or with the final line numbered from the first
+    /// file.
+    #[test]
+    fn a_lazy_raw_stream_reads_as_the_eager_route_does_5857() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pieces: [&[u8]; 7] = [b"a", b"", b"bc", b"\n", b"\r\n", b"\xc3\xa9", b"\xff"];
+        let mut bases: Vec<Vec<u8>> = Vec::new();
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    for d in pieces {
+                        bases.push([a, b, c, d].concat());
+                    }
+                }
+            }
+        }
+        let (mut checked, mut lazy_streams) = (0usize, 0usize);
+        let mut compare = |files: &[&[u8]]| {
+            let (eager, eager_lazy) = observe_inputs_with(dir.path(), files, &["-R"], true, None);
+            assert_eq!(eager_lazy, 0, "the reference route is eager");
+            let (lazy, lazy_files) = observe_inputs_with(dir.path(), files, &["-R"], false, None);
+            assert_eq!(lazy, eager, "{files:?}");
+            checked += 1;
+            lazy_streams += usize::from(lazy_files > 0);
+        };
+        for base in bases.iter().step_by(3) {
+            compare(&[base]);
+            for at in 0..=base.len() {
+                compare(&[&base[..at], &base[at..]]);
+                compare(&[&base[..at], b"", &base[at..]]);
+                for then in (at..=base.len()).step_by(2) {
+                    compare(&[&base[..at], &base[at..then], &base[then..]]);
+                }
+            }
+        }
+        assert!(checked > 10000, "{checked} streams");
+        assert_eq!(
+            lazy_streams, checked,
+            "every `-R` stream takes the lazy route"
+        );
     }
 
     /// [`lazy_json_scan`]'s spans for a stream it reads whole.
