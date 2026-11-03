@@ -76,6 +76,21 @@ fn test_a_pattern_k_leaves_empty_is_found_under_n_6083() -> Result<()> {
 }
 
 #[test]
+fn test_the_other_builtins_find_it_too_6083() -> Result<()> {
+    assert_rows(&[
+        (r#""a1" | test("1\\K";"n")"#, "true"),
+        (r#""a1" | test("\\K";"n")"#, "false"),
+        (r#""a1b" | [scan("1\\K";"n")]"#, r#"[""]"#),
+        (r#""a1b" | [scan("1\\K|b";"ng")]"#, r#"[""]"#),
+        (r#""a1b" | sub("1\\K";"X";"n")"#, r#""a1Xb""#),
+        (r#""a1b" | gsub("1\\K";"X";"ng")"#, r#""a1Xb""#),
+        (r#""a1b1" | gsub("1\\K";"X";"ng")"#, r#""a1Xb1X""#),
+        (r#""a1b" | [splits("1\\K";"n")]"#, r#"["a1","b"]"#),
+        (r#""a1b1c" | [splits("1\\K";"ng")]"#, r#"["a1","b1","c"]"#),
+    ])
+}
+
+#[test]
 fn test_n_still_skips_an_empty_match_and_needs_something_consumed_6083() -> Result<()> {
     assert_rows(&[
         (r#""xyz" | [match("x*";"n")|[.offset,.length]]"#, "[[0,1]]"),

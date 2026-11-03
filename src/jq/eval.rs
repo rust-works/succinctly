@@ -27518,6 +27518,14 @@ impl<'r> Iterator for RegexCaptureNames<'r> {
 
 #[cfg(feature = "regex")]
 impl JqRegex {
+    /// Whether the caller, and not the engine, refuses an empty match under the `n` flag: the
+    /// routes whose engine enforces `n` (`engine_not_empty`) have refused the matches that end
+    /// where their attempt began, and re-testing the span `\K` keeps would refuse one jq returns
+    /// (#6083).
+    fn caller_skips_empty(&self) -> bool {
+        self.suppress_empty && !self.engine_not_empty
+    }
+
     fn is_match(&self, input: &str) -> Result<bool, EvalError> {
         if self.suppress_empty {
             return Ok(first_captures(self, input)?.is_some());
@@ -29935,7 +29943,7 @@ fn next_match_step<'h>(
         .get(0)
         .expect("capture group 0 is always present on a match");
     let (m_start, m_end) = (m.start(), m.end());
-    let accepted = !re.suppress_empty || re.engine_not_empty || m_end > m_start;
+    let accepted = !re.caller_skips_empty() || m_end > m_start;
     let next_start = if m_end > m_start {
         m_end
     } else {
