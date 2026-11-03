@@ -10371,6 +10371,7 @@ What differs from jq 1.7.1:
   macOS fails the same way for `ja_JP`'s `%c`, which holds `%_m`; glibc may read such a layout, so a glibc `jq` can accept text this rejects.
   `%E*` and `%O*` modifiers (`%Ex`, `%Ec`, `%Oy`) are read by `strptime` as the plain specifier, as jq reads them (`"03/05/15" | strptime("%Ex")`).
   Only a specifier can follow a modifier: `%E%`, `%EE` and a bare `%E` are no match.
+  A `%` specifier is no match straight after a modifier or a `+` flag (`%+%`, `%E%`, `%E+%`, `%4E%`) and reads after a width (`%5%`, `%+0%`, `%E4%`, `%E+0%`), as in jq.
   Between the `%` and the specifier `strptime` also reads what the pin's libc does (#5989): one `E` or `O` before or after the rest, a `+` flag at the start or straight after the modifier, and a decimal width.
   `%++Y`, `%4+Y` and `%0+Y` are no match, a second modifier is no match, and `_` and `-` stay no match, as in jq.
   The width is the most digits a numeric field takes: `"012" | strptime("%3m")` is month 12, `"31" | strptime("%1d")` leaves the `1` behind and is no match.
