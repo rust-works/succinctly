@@ -14,7 +14,7 @@
 //! copy and not the others. #341 collapsed them onto `yaml::line_break`; #228
 //! added a fourth consumer outside `yaml`, so the definition moved here and
 //! `yaml::line_break` (a private module, not doc-linkable from here) re-exports
-//! it. Callers that need a different *shape* adapt around these three
+//! it. Callers that need a different *shape* adapt around these
 //! functions rather than restating the rule.
 //!
 //! Two exceptions survive, both in YAML and both documented at their sites:
@@ -85,26 +85,6 @@ pub(crate) fn blank_line_between(text: &[u8], from: usize, to: usize) -> bool {
     false
 }
 
-/// Width in bytes of the line break ending immediately *before* `pos`: 2 for
-/// `\r\n`, 1 for a lone `\r` or `\n`, 0 if `pos` is not preceded by one.
-///
-/// The mirror of [`line_break_len`], for backwards scans. Stepping back a fixed
-/// one byte lands in the middle of a CRLF, which leaves the `\r` attached to the
-/// previous line's text (#324).
-///
-/// Note this answers "is there break *text* behind me", not "does a break *end*
-/// here": standing on the `\n` of a CRLF it reports 1, for the `\r` behind it.
-/// Callers asking the latter want `line_break_len(text, pos - 1) == 1`, which is
-/// true only when the break starting one byte back also finishes there.
-#[inline]
-pub(crate) fn line_break_len_before(text: &[u8], pos: usize) -> usize {
-    match pos.checked_sub(1).and_then(|i| text.get(i)) {
-        Some(b'\n') if pos >= 2 && text[pos - 2] == b'\r' => 2,
-        Some(b'\n' | b'\r') => 1,
-        _ => 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,26 +130,6 @@ mod tests {
     }
 
     #[test]
-    fn line_break_len_before_measures_backwards() {
-        // b"a\r\nb\rc\nd"
-        //   0 1 2 3 4 5 6 7
-        let text = b"a\r\nb\rc\nd";
-        assert_eq!(line_break_len_before(text, 3), 2, "CRLF ends before `b`");
-        assert_eq!(line_break_len_before(text, 2), 1, "just the CR of a CRLF");
-        assert_eq!(line_break_len_before(text, 5), 1, "lone CR ends before `c`");
-        assert_eq!(line_break_len_before(text, 7), 1, "LF ends before `d`");
-        assert_eq!(line_break_len_before(text, 1), 0, "`a` is not a break");
-        assert_eq!(
-            line_break_len_before(text, 0),
-            0,
-            "nothing before the start"
-        );
-        assert_eq!(line_break_len_before(b"", 0), 0);
-        // A bare LF at index 0 is a one-byte break with no CR in front of it.
-        assert_eq!(line_break_len_before(b"\nx", 1), 1);
-    }
-
-    #[test]
     fn blank_line_between_needs_a_blank_line_not_a_line_of_content() {
         // Adjacent comments, and one with a CRLF break between.
         assert!(!blank_line_between(b"# a\n# b\n", 3, 4));
@@ -189,18 +149,10 @@ mod tests {
         assert!(blank_line_between(b"# a\n\n", 3, 99));
     }
 
-    /// The three helpers are one rule seen from three angles, and must not
-    /// drift apart: a byte is a break iff a break has non-zero width there, and
-    /// a break of width `n` *starting* at `i` is the break of width `n` ending
-    /// at `i + n`.
-    ///
-    /// The round trip is asserted only where `pos` really starts a break. On
-    /// the LF of a CRLF the forward width is 1 (that LF) while the backward
-    /// width is 2 (the whole CRLF) — the two helpers answer different
-    /// questions there, by design, and `find_block_content_range` depends on
-    /// exactly that difference.
+    /// The two helpers are one rule seen from two angles, and must not drift
+    /// apart: a byte is a break iff a break has non-zero width there.
     #[test]
-    fn the_three_helpers_agree_over_every_break_form() {
+    fn the_two_helpers_agree_over_every_break_form() {
         for text in [
             b"a\r\nb\rc\nd".as_slice(),
             b"\r\n",
@@ -211,24 +163,11 @@ mod tests {
             b"",
         ] {
             for pos in 0..=text.len() {
-                let here = line_break_len(text, pos);
-
                 assert_eq!(
-                    here > 0,
+                    line_break_len(text, pos) > 0,
                     text.get(pos).copied().is_some_and(is_line_break),
                     "{text:?} @ {pos}: width disagrees with the byte predicate"
                 );
-
-                let inside_a_crlf = pos > 0 && line_break_len(text, pos - 1) == 2;
-                if here > 0 && !inside_a_crlf {
-                    let ends_at = pos + here;
-                    assert_eq!(
-                        line_break_len_before(text, ends_at),
-                        here,
-                        "{text:?} @ {pos}: a break of width {here} starting here \
-                         must be the break of width {here} ending at {ends_at}"
-                    );
-                }
             }
         }
     }
