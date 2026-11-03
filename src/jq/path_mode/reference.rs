@@ -691,8 +691,12 @@ impl<'e> Interp<'e> {
                 Some(value) => sink(value, reg),
                 // A negative spelling is `_negate` of a literal: computed.
                 None => match lit {
-                    Literal::NumberLiteral(repr, _) => {
+                    Literal::NumberLiteral(repr, spelling) => {
                         let value = match repr {
+                            // `-0` is negative zero, as in the shipped route (#6042).
+                            NumberRepr::Int(0) if spelling.starts_with('-') => {
+                                OwnedValue::Float(-0.0)
+                            }
                             NumberRepr::Int(i) => OwnedValue::Int(*i),
                             NumberRepr::Float(f) => OwnedValue::Float(*f),
                         };
