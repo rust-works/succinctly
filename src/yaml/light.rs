@@ -11774,10 +11774,10 @@ mod tests {
                 || bytes
                     .windows(3)
                     .any(|w| w[0] == 0xE2 && w[1] == 0x80 && matches!(w[2], 0xA8 | 0xA9));
-            !bytes.contains(&special)
-                && !bytes.contains(&b'\n')
-                && !bytes.contains(&b'\r')
-                && !(unicode && unicode_break)
+            if unicode && unicode_break {
+                return false;
+            }
+            !bytes.contains(&special) && !bytes.contains(&b'\n') && !bytes.contains(&b'\r')
         }
         let alphabet: [&[u8]; 14] = [
             b"a",
