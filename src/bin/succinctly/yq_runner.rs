@@ -137,7 +137,11 @@ enum ColorLexer {
 impl Colorizer {
     fn new(syntax: ColorSyntax) -> Self {
         let lexer = match syntax {
-            ColorSyntax::Yaml => ColorLexer::Yaml(Box::default()),
+            ColorSyntax::Yaml => {
+                // The streamers leave their note of what they are writing only when asked.
+                succinctly::text::stream_region::enable();
+                ColorLexer::Yaml(Box::default())
+            }
             ColorSyntax::Json => {
                 ColorLexer::Json(output::JsonColorizer::per_token(), Box::default())
             }
