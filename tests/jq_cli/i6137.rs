@@ -29,6 +29,11 @@ const ROWS: &[(&str, &str, bool, &str, &str, i32)] = &[
     ("\x1e0\n\x1e1[", "[.,(try input catch .)]", false, "\x1e[0,\"break\"]\n\x1e[1,\"Unfinished JSON term at EOF at line 2, column 3\"]\n", "", 0),
     ("\x1e0\n\x1e1[", "[.,input]", false, "", "jq: error (at <stdin>:1): break\njq: error (at <unknown>): Unfinished JSON term at EOF at line 2, column 3\n", 5),
     ("\x1e0\n\x1e1", "[limit(4;repeat(try input catch .))]", false, "\x1e[\"break\",\"Potentially truncated top-level numeric value at EOF at line 2, column 2\",\"break\",\"break\"]\n", "", 0),
+    // An empty record's stop is the same return (#6141's rows over documents): `inputs` ends at
+    // it, and the main loop reads on to the value and the fault behind it.
+    ("\x1e1\n\x1e\x1e2", "[inputs]", false, "\x1e[]\n", "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 3\n", 0),
+    ("\x1e1\n\x1e\x1e2", "[.,(try input catch .)], input_line_number", false, "\x1e[1,\"break\"]\n\x1e1\n", "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 3\n", 0),
+    ("\x1e1\n\x1e\x1e2", "first(inputs)", false, "", "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 3\n", 0),
     // `-s` reads the whole stream, warning as it goes, before the program runs.
     ("\x1e1\n\x1e[1,]\n\x1e2\n\x1e3\n", "[.,input]", true, "", "jq: ignoring parse error: Expected another array element at line 2, column 5 (need RS to resync)\njq: error (at <unknown>): break\n", 5),
 ];
