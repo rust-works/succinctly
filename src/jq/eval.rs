@@ -31183,7 +31183,20 @@ fn atomize_option_group(pattern: &str, at: usize) -> Option<String> {
         }
         i += 1;
     }
-    let open = matched?;
+    let mut open = matched?;
+    let mut close = start - 1;
+    // #6187: a plain group whose whole body is one group (`(?:(?i:\K))*`, `(?:(?:(?i:\G)))*`) is a
+    // repeat of that inner group, which `fancy-regex` refuses for the same reason. Only the group
+    // that holds the zero-width body can be made atomic, so it is the one rewritten; `(?:\K)*` and
+    // `(?:(?:\G))*` have none and stay refused, as they are in jq.
+    while pattern.get(open..)?.starts_with("(?:") {
+        let inner = open + 3;
+        if bytes.get(inner) != Some(&b'(') || matching_close(bytes, inner)? + 1 != close {
+            return None;
+        }
+        close = matching_close(bytes, inner)?;
+        open = inner;
+    }
     // `(?` + at least one flag letter or `-` + `:`.
     let header = pattern.get(open..)?.strip_prefix("(?")?;
     let letters = header
@@ -31201,9 +31214,43 @@ fn atomize_option_group(pattern: &str, at: usize) -> Option<String> {
     Some(format!(
         "{}(?>{}|(?!))){}",
         &pattern[..=colon],
-        &pattern[colon + 1..start - 1],
-        &pattern[start..]
+        &pattern[colon + 1..close],
+        &pattern[close + 1..]
     ))
+}
+
+/// The byte index of the `)` that closes the `(` at `open`, skipping escapes and classes.
+#[cfg(feature = "regex")]
+fn matching_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut class_depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'[' => {
+                class_depth += 1;
+                // A `]` right after `[` or `[^` is a member.
+                if bytes.get(i + 1) == Some(&b'^') {
+                    i += 1;
+                }
+                if bytes.get(i + 1) == Some(&b']') {
+                    i += 1;
+                }
+            }
+            b']' if class_depth > 0 => class_depth -= 1,
+            b'(' if class_depth == 0 => depth += 1,
+            b')' if class_depth == 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Whether `expr` holds a lazy repeat that may stop at once (`*?`, `??`, `{0,n}?`) of a body with a
