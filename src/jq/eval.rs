@@ -30432,21 +30432,87 @@ fn build_fancy_regex_at<S: EvalSemantics>(
 /// The parse tree of `pattern` under the flags [`build_fancy_regex_at`]'s builder uses, and the
 /// pattern it was parsed from, which differs from `pattern` where [`atomize_option_group`] had to
 /// rewrite an option group (#6164).
+///
+/// Oniguruma's mode reads more repeats than the default mode (a stacked one, a repeat of an empty
+/// group), as jq does. It also reads a repeat that follows nothing but a comment as a repeat of an
+/// empty group, where jq refuses it (`(?#)?`: `target of repeat operator is not specified`), because
+/// a comment is invisible to jq: a pattern with one is read again without them, and a repeat left
+/// with no target refuses the pattern as it did before #6165.
 #[cfg(feature = "regex")]
-fn parse_fancy_tree(mut pattern: String) -> Option<(fancy_regex::Expr, String)> {
+fn parse_fancy_tree(pattern: String) -> Option<(fancy_regex::Expr, String)> {
+    let (expr, pattern) = parse_fancy_tree_in_oniguruma_mode(pattern)?;
+    if pattern.contains("(?#") {
+        parse_fancy_tree_in_oniguruma_mode(strip_comments(&pattern))?;
+    }
+    Some((expr, pattern))
+}
+
+/// [`parse_fancy_tree`] without the check for comments.
+#[cfg(feature = "regex")]
+fn parse_fancy_tree_in_oniguruma_mode(mut pattern: String) -> Option<(fancy_regex::Expr, String)> {
     use fancy_regex::internal::{FLAG_ONIGURUMA_MODE, FLAG_UNICODE};
     // One rewrite per repeated option group; a pattern with more than this many keeps the refusal.
     for _ in 0..64 {
         match fancy_regex::Expr::parse_tree_with_flags(&pattern, FLAG_UNICODE | FLAG_ONIGURUMA_MODE)
         {
             Ok(tree) => return Some((tree.expr, pattern)),
-            Err(fancy_regex::Error::ParseError(at, fancy_regex::ParseError::TargetNotRepeatable)) => {
+            Err(fancy_regex::Error::ParseError(
+                at,
+                fancy_regex::ParseError::TargetNotRepeatable,
+            )) => {
                 pattern = atomize_option_group(&pattern, at)?;
             }
             Err(_) => return None,
         }
     }
     None
+}
+
+/// `pattern` without its `(?#...)` comments, which end at the first `)` that no backslash escapes.
+/// An escape and a class are copied through, so a `(?#` inside either stays. A comment of the
+/// extended mode (`# ...`) is not followed, so a parenthesis in one can make the result a pattern
+/// that does not parse, which refuses the original as before.
+#[cfg(feature = "regex")]
+fn strip_comments(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len());
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                out.extend(chars.get(i..i + 2).unwrap_or(&chars[i..]));
+                i += 2;
+                continue;
+            }
+            '[' => {
+                depth += 1;
+                out.push('[');
+                // A `]` right after `[` or `[^` is a member.
+                if chars.get(i + 1) == Some(&'^') {
+                    out.push('^');
+                    i += 1;
+                }
+                if chars.get(i + 1) == Some(&']') {
+                    out.push(']');
+                    i += 1;
+                }
+            }
+            ']' if depth > 0 => {
+                depth -= 1;
+                out.push(']');
+            }
+            '(' if depth == 0 && chars.get(i + 1..i + 3) == Some(&['?', '#']) => {
+                i += 3;
+                while i < chars.len() && chars[i] != ')' {
+                    i += if chars[i] == '\\' { 2 } else { 1 };
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    out
 }
 
 /// `pattern` with the group that the repeat operator at byte `at` follows made atomic, when it is
@@ -134212,16 +134278,16 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
-    fn test_dollar_tie_keeps_the_trimmed_match_when_fancy_regex_refuses_5572() {
-        // `fancy-regex`'s parser refuses a repeat of an empty group, so the exact engine is not
-        // available for this pattern and the tie keeps the trimmed text's (shorter) match. jq 1.7.1
-        // has `[3,2]`. Pinned as the divergence it is: when it is closed this test is the one to flip.
+    fn test_dollar_tie_takes_the_exact_match_through_a_repeated_empty_group_6165() {
+        // The exact engine was not available for a repeat of an empty group while the tree was read
+        // outside Oniguruma's mode (#6165), and the tie kept the trimmed text's (shorter) match,
+        // `[3,1]`. jq 1.7.1 has `[3,2]`, as the exact engine does now.
         assert_eq!(
             outputs(
                 br#""abc \n""#,
                 r#"[match("(?:)+\\s+$") | [.offset, .length]]"#
             ),
-            ["[[3,1]]"]
+            ["[[3,2]]"]
         );
     }
 
@@ -134393,14 +134459,40 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_strip_comments_drops_what_jq_cannot_see_6165() {
+        assert_eq!(strip_comments("a(?#c)?b"), "a?b");
+        assert_eq!(strip_comments(r"(?#a\)b)?"), "?");
+        assert_eq!(strip_comments("(?#"), "");
+        assert_eq!(strip_comments("(?#a(?#b)c"), "c");
+        // An escape and a class keep a `(?#` as text.
+        assert_eq!(strip_comments(r"\(?#c)"), r"\(?#c)");
+        assert_eq!(strip_comments("[(?#]a"), "[(?#]a");
+        assert_eq!(strip_comments("[^]](?#c)"), "[^]]");
+        assert_eq!(strip_comments("plain"), "plain");
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_build_fancy_regex_reads_the_pattern_as_the_builder_does_6164_6165() {
         // A repeated option group of a zero-width body, and a stacked repeat of a group holding `\K`.
-        for pattern in [r"(?i:\K)*", r"(?x:\G){2}", r"(?i:(?=a))+", r"(?:\Ka)**", r"(?:\Ka){2}*"] {
-            assert!(build_fancy_regex::<JqSemantics>(pattern).is_some(), "{pattern}");
+        for pattern in [
+            r"(?i:\K)*",
+            r"(?x:\G){2}",
+            r"(?i:(?=a))+",
+            r"(?:\Ka)**",
+            r"(?:\Ka){2}*",
+        ] {
+            assert!(
+                build_fancy_regex::<JqSemantics>(pattern).is_some(),
+                "{pattern}"
+            );
         }
         // Not valid in Oniguruma either: a plain group or a bare escape repeated.
         for pattern in [r"(?:\K)*", r"\K*"] {
-            assert!(build_fancy_regex::<JqSemantics>(pattern).is_none(), "{pattern}");
+            assert!(
+                build_fancy_regex::<JqSemantics>(pattern).is_none(),
+                "{pattern}"
+            );
         }
     }
 
@@ -135846,20 +135938,20 @@ mod tests {
             outputs(br#""aa""#, r#"match("a*?"; "l") | [.offset, .string]"#),
             [r#"[0,""]"#]
         );
-        // `fancy-regex`'s parser refuses a repeat of an empty non-capturing group
-        // (`TargetNotRepeatable`), so a pattern with one keeps its old search under either flag
-        // (`"a" | match("(?:)+?|a"; "n")` is `"a"` in jq, `"ba" | match("(?:){1,2}a?||"; "l")`
-        // is `"a"` at offset 1). `()` is a group, not an empty expression, and is routed.
+        // A repeat of an empty non-capturing group took the old search under either flag while the
+        // tree was read outside Oniguruma's mode (#6165); it is routed now and agrees with jq
+        // (`"a" | match("(?:)+?|a"; "n")` is `"a"`, `"ba" | match("(?:){1,2}a?||"; "l")` is `"a"` at
+        // offset 1).
         assert_eq!(
             outputs(br#""a""#, r#"[match("(?:)+?|a"; "n") | .string]"#),
-            ["[]"]
+            [r#"["a"]"#]
         );
         assert_eq!(
             outputs(
                 br#""ba""#,
                 r#"[match("(?:){1,2}a?||"; "l") | [.offset, .string]]"#
             ),
-            [r#"[[0,""]]"#]
+            [r#"[[1,"a"]]"#]
         );
         // `ln` keeps its old route whole too, `n`'s skip-forward search included: fixing `n` alone
         // would change which wrong answer the pair gives (`"aa" | match("a*?"; "ln")` is `"aa"`

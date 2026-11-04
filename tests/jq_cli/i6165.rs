@@ -36,3 +36,24 @@ fn test_a_stacked_repeat_of_a_group_holding_a_keep_answers_as_jq_6165() -> Resul
     }
     Ok(())
 }
+
+/// Oniguruma's mode reads a repeat that follows only a comment as a repeat of an empty group, where
+/// jq refuses it, because a comment is invisible to jq (`a(?#)?` is `a?`, a bare `(?#)?` is a repeat
+/// with no target). The pattern is read again without its comments to keep the refusal.
+#[test]
+fn test_a_repeat_with_only_a_comment_before_it_stays_refused_6165() -> Result<()> {
+    for pattern in [r"(?#)?", "(?#c)+", "(?:(?#)?)", "a|(?#x)*", r"(?#a\)b)?"] {
+        let (stdout, stderr, code) = matches(pattern)?;
+        assert_eq!(code, 5, "{pattern}: stdout={stdout:?} stderr={stderr:?}");
+        assert!(stderr.contains("invalid regex"), "{pattern}: {stderr:?}");
+    }
+    for (pattern, expected) in [
+        ("a(?#)?", r#"[[0,0,""],[1,1,"a"],[2,0,""],[3,0,""]]"#),
+        (r"(?:\Ka)(?#c)**", r#"[[0,0,""],[1,1,"a"],[2,0,""],[3,0,""]]"#),
+    ] {
+        let (stdout, stderr, code) = matches(pattern)?;
+        assert_eq!(code, 0, "{pattern}: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{pattern}");
+    }
+    Ok(())
+}
