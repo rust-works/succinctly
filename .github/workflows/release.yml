@@ -45,6 +45,10 @@ jobs:
         build: [linux-x64, linux-arm64, macos-arm64, windows]
         include:
         - build: linux-x64
+          # #5926: deliberately not the newest image, unlike the CI jobs. The shipped binary links
+          # the glibc of the image that builds it and runs only where the host's glibc has every
+          # symbol version it references, so a newer image can raise the floor above what Ubuntu
+          # 24.04 and Debian 12 hosts have. Moving it is a release-policy decision, not a CI one.
           os: ubuntu-24.04
           rust: stable
           target: x86_64-unknown-linux-gnu

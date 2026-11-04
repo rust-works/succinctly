@@ -178,6 +178,13 @@ without it, prints a message naming the requirement and `cargo install succinctl
 build) instead of dying on `Illegal instruction`. State the CPU floor in the release notes of the first release
 that ships this. `cargo install` and the library keep the baseline target.
 
+The Linux archives are built on `ubuntu-24.04` and `ubuntu-24.04-arm`, although the x86_64 CI jobs run on
+`ubuntu-26.04` since #5926. The reason is the glibc floor: a binary links the glibc of the
+image that builds it and runs only on hosts whose glibc has every symbol version it references, so building on a newer
+image can lock out hosts that run today's archive. Moving `build-release` to a newer image is a release-policy
+decision (name the oldest supported distribution, then check `objdump -T succinctly | grep GLIBC_` on the build), not
+a CI cleanup; `scripts/test_ci_runner_pin.py` fails until that is a deliberate edit.
+
 A change to those flags is measured the way #5035 was: the same tree built with and without them, and
 `scripts/ab-cli.py` (`--control` first) over `yaml generate-suite` / `json generate-suite` inputs of 1 MB and 10 MB
 ([simd.md](../optimizations/simd.md#per-word-popcounts-on-baseline-x86_64-5035)).
