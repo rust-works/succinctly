@@ -270,3 +270,52 @@ fn test_a_path_update_answers_as_jq_does_6199() -> Result<()> {
     }
     Ok(())
 }
+
+/// The same updates on a document big enough for the cursor route to take them (the rows above are
+/// below its size floor). The expected text is built from the records, and every row was checked
+/// against jq 1.7.1.
+#[test]
+fn test_a_path_update_of_a_large_target_answers_as_jq_does_6199() -> Result<()> {
+    let ages: Vec<usize> = (1..=40).map(|i| i % 7 + 3).collect();
+    let users = |items: &[String]| items.join(",");
+    let record = |i: usize| format!(r#"{{"id":{i},"age":{}}}"#, ages[i - 1]);
+    let all: Vec<String> = (1..=40).map(record).collect();
+    let input = format!(r#"{{"users":[{}],"n":7,"tail":[1,2]}}"#, users(&all));
+    let doc = |value: &str| format!(r#"{{"users":{value},"n":7,"tail":[1,2]}}"#);
+    let list = |items: Vec<String>| format!("[{}]", items.join(","));
+    for (filter, expected) in [
+        (".users |= length", doc("40")),
+        (".users |= first", doc(&record(1))),
+        (".users |= .[0]", doc(&record(1))),
+        (".users |= .[:2]", doc(&list(vec![record(1), record(2)]))),
+        (".users |= .[38:]", doc(&list(vec![record(39), record(40)]))),
+        (
+            ".users |= map(.age)",
+            doc(&list(ages.iter().map(ToString::to_string).collect())),
+        ),
+        (
+            ".users |= map(.age + 1)",
+            doc(&list(ages.iter().map(|a| (a + 1).to_string()).collect())),
+        ),
+        (
+            ".users |= (map(.age) | add)",
+            doc(&ages.iter().sum::<usize>().to_string()),
+        ),
+        (".users |= limit(2; .[])", doc(&record(1))),
+        (".users |= map(select(.age > 100))", doc("[]")),
+        (
+            ".users |= sort_by(-.id) | .users | length",
+            "40".to_string(),
+        ),
+        (".users |= error(\"boom\")", String::new()),
+    ] {
+        let (stdout, status) = run_jq_stdin(filter, &input, &["-c"])?;
+        let code = i32::from(expected.is_empty()) * 5;
+        assert_eq!(
+            (stdout.trim_end(), status),
+            (expected.as_str(), code),
+            "{filter}"
+        );
+    }
+    Ok(())
+}

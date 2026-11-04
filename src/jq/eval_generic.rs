@@ -6031,6 +6031,11 @@ mod update_target {
 /// whole-document copy takes, so it only pays where the target is most of the document.
 const CURSOR_UPDATE_TARGET_SHARE: usize = 2;
 
+/// The fewest nodes a document must have for [`update_on_cursor`] to be tried (#6199). A smaller one
+/// is copied faster than it is looked into, and the updates inside a loop over small records
+/// (`map(.name |= length)`) are all of that size.
+const CURSOR_UPDATE_MIN_NODES: usize = 32;
+
 /// Whether `filter` can be evaluated twice with nothing observable but the time (#6199): no
 /// `input`, `debug`, `stderr` or `halt`, and no call to a function the program defines (its body
 /// is out of sight). [`update_on_cursor`] declines after running a filter that answered nothing,
@@ -6250,6 +6255,20 @@ fn update_on_cursor_gated<S: EvalSemantics, V: DocumentValue>(
     {
         return None;
     }
+    // The gates that only decide whether the route pays off, cheapest first: an update inside a
+    // loop over small records (`map(.name |= length)`) leaves here without a lookup or an allocation.
+    let root_span = if share_gate {
+        if !update_filter_reduces(filter) {
+            return None;
+        }
+        let span = root.subtree_end()?.checked_sub(root.node_id())?;
+        if span < CURSOR_UPDATE_MIN_NODES {
+            return None;
+        }
+        span
+    } else {
+        0
+    };
     let mut steps = Vec::new();
     static_path_steps(path, &mut steps)?;
     if steps.is_empty() || !update_filter_is_repeatable(filter) {
@@ -6257,12 +6276,7 @@ fn update_on_cursor_gated<S: EvalSemantics, V: DocumentValue>(
     }
     let target = update_target_cursor(root, &steps)?;
     if share_gate {
-        if !update_filter_reduces(filter) {
-            return None;
-        }
-        let (root_end, target_end) = (root.subtree_end()?, target.subtree_end()?);
-        let root_span = root_end.checked_sub(root.node_id())?;
-        let target_span = target_end.checked_sub(target.node_id())?;
+        let target_span = target.subtree_end()?.checked_sub(target.node_id())?;
         if target_span.saturating_mul(CURSOR_UPDATE_TARGET_SHARE) < root_span {
             return None;
         }
@@ -55097,7 +55111,11 @@ mod tests {
             }
             run::<S, _>(&path, &filter, &cursor)
         }
-        let users = r#"{"users":[{"id":1,"age":3},{"id":2,"age":4},{"id":3,"age":5}],"n":7}"#;
+        let records: Vec<String> = (1..=20)
+            .map(|i| format!(r#"{{"id":{i},"age":{}}}"#, i % 7 + 3))
+            .collect();
+        let users = format!(r#"{{"users":[{}],"n":7}}"#, records.join(","));
+        let users = users.as_str();
         for program in [
             ".users |= map(.age + 1)",
             ".users |= length",
@@ -55127,9 +55145,19 @@ mod tests {
         }
         assert!(!takes::<YqSemantics>(users, ".users |= length"));
         // A target that is a small part of the document is left to the plain read of all of it.
-        let wide = r#"{"big":[1,2,3,4,5,6,7,8,9,10],"small":[1,2]}"#;
-        assert!(takes::<JqSemantics>(wide, ".big |= length"));
-        assert!(!takes::<JqSemantics>(wide, ".small |= length"));
+        let big = (1..=40)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let wide =
+            format!(r#"{{"big":[{big}],"small":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18]}}"#);
+        assert!(takes::<JqSemantics>(&wide, ".big |= length"));
+        assert!(!takes::<JqSemantics>(&wide, ".small |= length"));
+        // A document below the size floor is copied, whatever the update.
+        assert!(!takes::<JqSemantics>(
+            r#"{"users":[1,2,3]}"#,
+            ".users |= length"
+        ));
     }
 
     /// #3909: the CLI's `LazySeq` printer takes the canonical echo scan's `Some`
