@@ -87,3 +87,19 @@ fn what_jq_accepts_inside_a_look_behind_still_answers_6197() -> Result<()> {
     }
     Ok(())
 }
+
+/// A verb other than `(*FAIL)` is no group to the look-behind rules and stays refused by the
+/// engine, as `undefined callout name` in jq.
+#[test]
+fn a_verb_in_a_look_behind_is_still_refused_6197() -> Result<()> {
+    for pattern in ["(?<!(*SKIP))b", "(?<=(*COMMIT)a)b"] {
+        let filter = format!(
+            r#""cb" | [match({};"g") | .string]"#,
+            serde_json::to_string(pattern)?
+        );
+        let (stdout, _stderr, code) = run_jq_full(&["-nc", &filter], None)?;
+        assert_eq!(stdout.trim_end(), "", "{pattern}");
+        assert_ne!(code, 0, "{pattern}");
+    }
+    Ok(())
+}
