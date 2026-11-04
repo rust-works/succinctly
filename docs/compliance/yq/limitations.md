@@ -6892,3 +6892,10 @@ Only the first stage after `$i` is read from the node: in `$i | parent | key` th
 A `$i | READ` stays a value read in an update that binds `$i` again anywhere (the rewrite cannot tell which `$i` a read means), in a nested `ireduce` over the same name, and in a fold whose pattern is not a single `$i` (`as [$a, $b] ireduce`).
 Every read the update names is taken for every element, whether or not the step reaches it.
 `parent` copies the parent once per element, so it costs the parent's size per step.
+
+## `@csv` and `@tsv` spell a `null` as `null` ([#6131](https://github.com/rust-works/succinctly/issues/6131))
+
+yq's `@csv` and `@tsv` are Go's `encoding/csv` over the node, and a field is the node's text.
+`succinctly yq` encodes the same way (minimal quoting, arrays of arrays and of flat objects, a scalar input as its text, yq's error lines), pinned by `tests/yq_cli/i6131.rs`.
+The one difference is a `null` element: yq writes the spelling the document used (`~` for `[~, a]`, `null` for `[null, a]`), and a value does not hold it, so `succinctly yq` writes `null` for both.
+A number keeps its source text (`1.50`, `0x1f`, `1_0`) in both.
