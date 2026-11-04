@@ -5,7 +5,7 @@
 
 Takes every name in the property table of the `regex-syntax` version `Cargo.lock` pins (the names
 the `regex` crate reads), adds a few hand-picked spellings, and runs each in nine forms
-(`\\p{N}`, `\\P{N}`, `\\p{^N}`, `\\P{^N}`, `[\\p{N}]`, `[^\\P{N}]`, `[a\\p{N}b]`) over a string of
+(`\\p{N}`, `\\P{N}`, `\\p{^N}`, `\\P{^N}`, `[\\p{N}]`, `[^\\P{N}]`, `[a\\p{N}b]`, `[\\P{N}]`, `[\\p{^N}]`) over a string of
 varied characters in jq and in `succinctly jq`. A case differs when one tool refuses and the other
 answers, or when both answer differently; two refusals are not compared by wording. A new
 `regex-syntax` release can add names Oniguruma (jq 1.7.1) lacks: they show up here, and belong in
@@ -61,7 +61,7 @@ def block_cases():
                     edges.add(cp)
         if not edges:
             edges = {0x41, 0x3BB}
-        cases.append((name, sorted(edges)[:200]))
+        cases.append((name, sorted(edges)))
     return cases
 
 
