@@ -28681,6 +28681,8 @@ fn translate_posix_brackets_scan(
                     let (on_x, rest) = (run.x_after(outer), i + 2 + run.consumed);
                     changed = true;
                     if run.closes_group {
+                        // #6181: a bare option group, so a repeat operator after it has no target.
+                        prev_option_group = true;
                         // `(?flags)`: the rest of the enclosing group. Dropped when it names no
                         // option, so a repeat after it would repeat what comes before: jq refuses it.
                         if run.flags.is_empty()

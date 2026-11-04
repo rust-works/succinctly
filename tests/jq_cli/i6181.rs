@@ -58,6 +58,10 @@ fn test_a_repeat_after_a_bare_option_group_is_refused_6181() -> Result<()> {
         // A group of only minus signs is a bare option group too.
         "(?-)*a",
         "(?i-)*a",
+        // #6133 rewrites a run that repeats or ends on a `-`; the group is still bare.
+        "(?i--)*a",
+        "(?i-m-s)+a",
+        "a(?i-){2}b",
     ] {
         assert_not_specified(pattern)?;
     }
