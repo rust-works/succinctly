@@ -24,6 +24,12 @@ fn a_read_past_a_slurped_value_resets_input_line_number_6145() -> Result<()> {
             "\x1e[3,\"break\",0,\"break\",0]",
         ),
         (&["-c", "-s", "-R"], "a\nb\n", r#"[2,"break",0,"break",0]"#),
+        (&["-c", "-s"], "", r#"[0,"break",0,"break",0]"#),
+        (
+            &["-c", "-s", "--stream"],
+            "[1]\n2\n",
+            r#"[2,"break",0,"break",0]"#,
+        ),
     ] {
         let (out, code) = run_jq_stdin(PAST_END_TWICE, input, flags)?;
         assert_eq!(code, 0, "{flags:?} {input:?}");
