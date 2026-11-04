@@ -57,6 +57,11 @@ fn test_a_possessive_quantifier_followed_by_more_pattern_is_atomic_6172() -> Res
         (r#""aaab""#, r#"test("(?<n>a)\\k<n>*+b")"#, "true\n"),
         (r#""aaaa""#, r#"test("(a)\\1++a")"#, "false\n"),
         (r#""aaaa""#, r#"test("(?<n>a)\\k<n>?+a")"#, "true\n"),
+        (r#""u0041b""#, r#"test("\\u0041*+b")"#, "true\n"),
+        (r#""AAb""#, r#"test("\\u0041*+b")"#, "false\n"),
+        (r#""a{xxb""#, r#"test("a{x*+b")"#, "true\n"),
+        (r#""{{b""#, r#"test("{*+b")"#, "true\n"),
+        (r#""a{b""#, r#"test("a{*+b")"#, "true\n"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(input))?;
         assert_eq!(
