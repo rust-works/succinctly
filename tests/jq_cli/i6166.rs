@@ -71,6 +71,17 @@ fn test_a_lazy_repeat_of_a_g_k_body_finds_the_later_match_6166() -> Result<()> {
         (r"(?:\Gb?){0,2}?$", r#"[[3,0,""]]"#, r#"[[4,0,""]]"#),
         (r"(?x: \Gc? ){0,1}?b+", r#"[[2,1,"b"]]"#, r#"[[2,2,"bb"]]"#),
         (r"(?>\Ga??)??b+", r#"[[2,1,"b"]]"#, r#"[[2,2,"bb"]]"#),
+        // A `#` that is escaped or in a class opens no comment.
+        (
+            r"[#]?(?:\K\G)*?b",
+            r#"[[2,1,"b"]]"#,
+            r#"[[2,1,"b"],[3,1,"b"]]"#,
+        ),
+        (
+            r"\#?(?:\K\G)*?b",
+            r#"[[2,1,"b"]]"#,
+            r#"[[2,1,"b"],[3,1,"b"]]"#,
+        ),
         // The same group repeated greedily, or with a capture, answered before.
         (r"(?:\K\G)*b", r#"[[2,1,"b"]]"#, r#"[[2,1,"b"],[3,1,"b"]]"#),
         (r"(\K\G)*?b", r#"[[2,1,"b"]]"#, r#"[[2,1,"b"],[3,1,"b"]]"#),
