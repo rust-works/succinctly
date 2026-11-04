@@ -20370,12 +20370,16 @@ mod tests {
             (outputs, bridge_docs::built() - before)
         };
         // (program, bridge documents `WhereAnswered` builds: 0 where a door answers).
-        let rows: [(&str, usize); 6] = [
+        let rows: [(&str, usize); 8] = [
             ("length", 0),
             (".[1]", 0),
             ("[limit(2;.[])]", 1),
             ("[.[]|select(length==2)]|length", 1),
-            ("map(.[0][0])|unique", 1),
+            // #6122: `map` of static steps is a door, bare and as the first stage of a pipe.
+            ("map(.[1])", 0),
+            ("map(.[0][0])|unique", 0),
+            // ... and a `map` whose body is not static steps is still the index's.
+            ("map(.[0]|length)|unique", 1),
             (".[]|select(length==2)", 1),
         ];
         for (filter, docs) in rows {
