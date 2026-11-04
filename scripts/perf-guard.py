@@ -752,6 +752,27 @@ def measure_query(valgrind_bin, binary, mode, flags, filter_expr, fixture_path, 
     return round(statistics.median(counts))
 
 
+def measured_path(tmp, binary):
+    """The path `binary` is executed from under valgrind (#6153): a symlink to it named
+    `<tmp>/bin/succinctly`, so that two binaries measured by one run, or by two runs, are
+    both started from a path of the same length however the caller spelled them.
+
+    The path is not free. On the ubuntu-26.04 runner (glibc 2.43, valgrind 3.26) the instruction
+    count of `arrays_map_iterate` is 900.79M when the executable's path is 35 characters or
+    fewer or 52 or more, and 956.33M for 36 to 51, for the same bytes (a sweep of both a fresh
+    build and a reused artifact agreed to within 3k). The guard started the current binary
+    from `target/release/succinctly` (24 characters) and a baseline binary reused from `main`'s
+    push run from `/tmp/perf-guard-baseline-bin/succinctly` (39), so every run that reused an
+    artifact read a 5.8% improvement on that row that no commit made. A baseline built in the
+    job (`/tmp/perf-guard-merge-base/target/release/succinctly`, 52) happened to fall outside
+    the window, which is why only the reused ones failed."""
+    bin_dir = os.path.join(tmp, "bin")
+    os.makedirs(bin_dir)
+    path = os.path.join(bin_dir, "succinctly")
+    os.symlink(os.path.abspath(binary), path)
+    return path
+
+
 def measure_all(binary, valgrind_bin, reps, label="binary"):
     """Generate each distinct (pattern, size) fixture exactly once -- several
     `QUERIES` rows share one, and regenerating an identical file per row
@@ -811,6 +832,10 @@ def measure_all(binary, valgrind_bin, reps, label="binary"):
         generate_mid_width_fixture(mid_width_path)
         derived_fixture_paths[MID_WIDTH_ROW] = mid_width_path
 
+        # What valgrind starts, and so what `argv[0]` is: see `measured_path`. The fixtures above
+        # are still written by `binary` itself, from wherever the caller put it.
+        run_binary = measured_path(tmp, binary)
+
         measured = {}
         print(f"Measuring {label} ({binary}):")
         print(f"{'query':<26} {'instructions':>16}")
@@ -820,7 +845,7 @@ def measure_all(binary, valgrind_bin, reps, label="binary"):
             # default eagerly, and a derived row has no generated fixture.
             fixture_path = derived_fixture_paths.get(query_id) or fixture_paths[(pattern, size)]
             flags = QUERY_FLAGS.get(query_id, [])
-            ir = measure_query(valgrind_bin, binary, mode, flags, filter_expr, fixture_path, reps)
+            ir = measure_query(valgrind_bin, run_binary, mode, flags, filter_expr, fixture_path, reps)
             measured[query_id] = ir
             print(f"{query_id:<26} {ir:>16,.0f}")
             sys.stdout.flush()

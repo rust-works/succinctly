@@ -179,5 +179,65 @@ class CensusRowTests(unittest.TestCase):
             self.assertEqual(a.read(), b.read())
 
 
+class MeasuredPathTests(unittest.TestCase):
+    """#6153: valgrind starts every measured binary from a path of one length."""
+
+    def run_measure_all(self, binary):
+        started = []
+
+        def fake_measure(valgrind_bin, run_binary, mode, flags, filter_expr, fixture_path, reps):
+            started.append(run_binary)
+            return 1
+
+        def fake_generate(binary, pattern, size, seed, out_path):
+            with open(out_path, "w") as f:
+                f.write("{}")
+
+        def fake_derive(binary, source_path, out_path):
+            with open(out_path, "w") as f:
+                f.write('{"users":[{"age":1,"score":1}]}')
+
+        with contextlib.ExitStack() as stack:
+            for name, fn in {
+                "generate_fixture": fake_generate,
+                "generate_compact_fixture": fake_derive,
+                "generate_lines_fixture": fake_derive,
+                "measure_query": fake_measure,
+            }.items():
+                stack.enter_context(mock.patch.object(perf_guard, name, fn))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            perf_guard.measure_all(binary, "valgrind", 1)
+        return started
+
+    def test_binaries_spelled_with_paths_of_different_lengths_start_from_one_length(self):
+        # The two spellings the CI job used: the current binary relative, a baseline binary
+        # reused from main's push run absolute and longer.
+        short = self.run_measure_all("target/release/succinctly")
+        long = self.run_measure_all("/tmp/perf-guard-baseline-bin/succinctly")
+        self.assertTrue(short and long)
+        self.assertEqual({len(p) for p in short + long}, {len(short[0])})
+
+    def test_the_started_path_is_a_symlink_to_the_binary_named_succinctly(self):
+        seen = []
+
+        def fake_measure(valgrind_bin, run_binary, *rest):
+            seen.append((os.path.basename(run_binary), os.path.islink(run_binary),
+                         os.readlink(run_binary)))
+            return 1
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(perf_guard, "measure_query", fake_measure))
+            for name in ("generate_fixture", "generate_compact_fixture", "generate_lines_fixture"):
+                stack.enter_context(mock.patch.object(
+                    perf_guard, name,
+                    lambda *a: pathlib.Path(a[-1]).write_text('{"users":[{"age":1,"score":1}]}')))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            perf_guard.measure_all("some/relative/bin", "valgrind", 1)
+        name, is_link, target = seen[0]
+        self.assertEqual(name, "succinctly")
+        self.assertTrue(is_link)
+        self.assertEqual(target, os.path.abspath("some/relative/bin"))
+
+
 if __name__ == "__main__":
     unittest.main()
