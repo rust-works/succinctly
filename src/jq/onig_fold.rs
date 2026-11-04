@@ -594,7 +594,8 @@ mod tests {
         // A group that starts its branch and holds more than literals is a list of its own.
         assert_eq!(rewrite("(?i)(?:a\\d)s"), None);
         assert_eq!(rewrite("(?i)(?:s\\d)s"), None);
-        assert!(rewrite("(?i)x(?:s\\d)s").is_some());
+        assert!(rewrite("(?i)x(?:\\ds)s").is_some());
+        assert_eq!(rewrite("(?i)x(?:s\\d)s"), None);
         assert!(rewrite("(?i)(?:ss)s").is_some());
         // A repeated group, a capture group and an option group do not.
         for pattern in [
