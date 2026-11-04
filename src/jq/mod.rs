@@ -103,6 +103,8 @@ mod onig_capture_loop;
 mod onig_loop;
 mod parse_message;
 mod parser;
+#[cfg(feature = "regex")]
+mod regex_blocks;
 // #5223: the register-carrying path-mode interpreter, reachable only from
 // `succinctly dev jq-path-mode` and its own tests.
 #[doc(hidden)]
