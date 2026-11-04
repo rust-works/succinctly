@@ -65,3 +65,29 @@ fn test_a_repeated_plain_group_of_a_zero_width_body_stays_refused_6164() -> Resu
     }
     Ok(())
 }
+
+/// The option group keeps its flags: `i` still folds a lookaround's letter, `x` still skips the blanks
+/// of its body, and a `#` outside an extended-mode comment is a literal. Rows are
+/// `(subject, pattern, flags, expected)`, captured from jq 1.7.1.
+#[test]
+fn test_a_repeated_option_group_keeps_its_flags_6164() -> Result<()> {
+    for (subject, pattern, flags, expected) in [
+        ("A", r"(?i:(?=a))+", "g", "[[0,0]]"),
+        ("A", r"(?-i:(?=a))+", "gi", "[]"),
+        ("A", r"(?-i:(?=a))+", "g", "[]"),
+        ("ab", r"(?x: \K )+b", "g", "[[1,1]]"),
+        ("ab", r"(?x:(?=a) )+", "g", "[[0,0]]"),
+        ("A", r"(?i:(?!a)){2}", "g", "[[1,0]]"),
+        ("ab", r"(?i:\K)*[#]", "g", "[]"),
+        ("a#", r"(?i:\K)*#", "g", "[[1,1]]"),
+    ] {
+        let filter = format!(
+            r#""{subject}" | [match("{}"; "{flags}") | [.offset, .length]]"#,
+            pattern.replace('\\', "\\\\")
+        );
+        let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
+        assert_eq!(code, 0, "{pattern}: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{subject} {pattern} {flags}");
+    }
+    Ok(())
+}

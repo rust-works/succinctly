@@ -30519,23 +30519,22 @@ fn strip_comments(pattern: &str) -> String {
 /// an option group (`(?i:...)`, `(?-s:...)`) and so a valid target of a repeat in Oniguruma
 /// (#6164): `(?i:\K)*` is accepted by jq, where `fancy-regex` refuses a repeat of a zero-width
 /// body (`\K`, `\G`, a lookaround) even in a group. The body of such a group has one way to
-/// match and no text to give back, so `(?>...)` (which `fancy-regex` takes as a target) matches
-/// as the option group does, and the flags change nothing for a zero-width body. A plain `(?:...)`
-/// and a bare `\K*` are refused by jq as well, and are left to the refusal. `None` when the
-/// operator does not follow an option group, or the pattern holds a `#` (an extended-mode comment
-/// could hide a parenthesis from the scan).
+/// match and no text to give back, so an atomic `(?>...)` inside it (which `fancy-regex` takes as
+/// a target) matches as the group does. The flags stay on the group, as they still change what a
+/// lookaround or an extended-mode body reads. A plain `(?:...)` and a bare `\K*` are refused by jq
+/// as well, and are left to the refusal. `None` when the operator does not follow an option group,
+/// or a `#` before it could open an extended-mode comment.
 #[cfg(feature = "regex")]
 fn atomize_option_group(pattern: &str, at: usize) -> Option<String> {
-    if pattern.contains('#') {
-        return None;
-    }
     let bytes = pattern.as_bytes();
     // The first byte of the operator: an interval is reported at its closing brace.
     let start = match bytes.get(at)? {
         b'}' => pattern.get(..at)?.rfind('{')?,
         _ => at,
     };
-    if start == 0 || bytes[start - 1] != b')' {
+    // A `#` before the group could open an extended-mode comment that hides a parenthesis from the
+    // scan; one after it cannot.
+    if start == 0 || bytes[start - 1] != b')' || pattern.get(..start)?.contains('#') {
         return None;
     }
     // The `(` that matches the `)` before the operator, by a forward scan that skips escapes and
@@ -30578,9 +30577,10 @@ fn atomize_option_group(pattern: &str, at: usize) -> Option<String> {
     // The `|(?!)` is a way that never matches. Without it `fancy-regex` 0.20.0 loses a lazy repeat of
     // an atomic `\G`: `"cab" | test("(?>\\G)*?b")` is `false`, where `(?>\\G|(?!))*?b` and
     // `(\\G)*?b` are `true` as in jq.
+    // The group keeps its flags: `i` still folds a lookaround's letters and `x` still skips blanks.
     Some(format!(
-        "{}(?>{}|(?!)){}",
-        &pattern[..open],
+        "{}(?>{}|(?!))){}",
+        &pattern[..=colon],
         &pattern[colon + 1..start - 1],
         &pattern[start..]
     ))
@@ -134427,24 +134427,24 @@ mod tests {
     #[cfg(feature = "regex")]
     #[test]
     fn test_atomize_option_group_names_the_group_a_repeat_follows_6164() {
-        // The operator at `at` follows an option group: its header becomes `(?>`, whatever the flags.
+        // The operator at `at` follows an option group: its body becomes an atomic group, flags kept.
         assert_eq!(
             atomize_option_group(r"a(?i:\K)*b", 8).as_deref(),
-            Some(r"a(?>\K|(?!))*b")
+            Some(r"a(?i:(?>\K|(?!)))*b")
         );
         assert_eq!(
             atomize_option_group(r"(?-s:(?=a))+", 11).as_deref(),
-            Some(r"(?>(?=a)|(?!))+")
+            Some(r"(?-s:(?>(?=a)|(?!)))+")
         );
         // An interval is reported at its closing brace.
         assert_eq!(
             atomize_option_group(r"(?x:\G){0,2}", 11).as_deref(),
-            Some(r"(?>\G|(?!)){0,2}")
+            Some(r"(?x:(?>\G|(?!))){0,2}")
         );
         // The group is the one that closes before the operator, past a class or an escaped paren.
         assert_eq!(
             atomize_option_group(r"[(]\)(?i:\K)*", 12).as_deref(),
-            Some(r"[(]\)(?>\K|(?!))*")
+            Some(r"[(]\)(?i:(?>\K|(?!)))*")
         );
         // A plain group, a bare escape, a capture and an atomic group are not option groups (jq
         // refuses the first two; the others are valid targets already).
@@ -134453,7 +134453,12 @@ mod tests {
         }
         // An operator that follows nothing, or a pattern with a `#` that could hide a parenthesis.
         assert_eq!(atomize_option_group("*", 0), None);
-        assert_eq!(atomize_option_group("(?i:\\K)*#", 7), None);
+        assert_eq!(atomize_option_group("#(?i:\\K)*", 8), None);
+        // One after the group is no comment of the extended mode it could hide anything from.
+        assert_eq!(
+            atomize_option_group(r"(?i:\K)*#", 7).as_deref(),
+            Some(r"(?i:(?>\K|(?!)))*#")
+        );
         assert_eq!(atomize_option_group("(?i:", 99), None);
     }
 
