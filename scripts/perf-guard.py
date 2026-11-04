@@ -522,6 +522,14 @@ DEFAULT_THRESHOLD = 5.0
 # the PR's own merge-base, outputs byte-identical). Remove it once `main` carries the change and the
 # row reads ~0% against a merge-base that includes it.
 #
+# `arrays_map_iterate` (#6069) carries an override of the same one-off kind, but for a codegen
+# ripple rather than a change to the row's own work: `map(length) | .[]` runs no regex, and #6069
+# only adds a pattern rewrite to the regex builtins (`src/jq/onig_capture_loop.rs` and the
+# `RegexEngine::Rewritten` arms in `src/jq/eval.rs`). The row read -5.8% x86_64 / -0.0%
+# ARM64-Linux against the PR's own merge-base, so it is x86_64 instruction selection around the
+# changed code, not work the row stopped doing. Remove it once `main` carries #6069 and the row
+# reads ~0% against a merge-base that includes it.
+#
 # `users_del_select` / `users_del_bound_select` / `users_assign_scores` / `users_update_select`
 # (#6125) carry overrides of the same one-off kind: materializing a container of plain JSON reads
 # its own text in one pass instead of walking the cursor, and these write shapes materialize the
@@ -532,6 +540,7 @@ QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
     "users_yq_raw_test": 65.0,
     "users_yq_raw_slice": 10.0,
+    "arrays_map_iterate": 8.0,
     "users_del_select": 30.0,
     "users_del_bound_select": 30.0,
     "users_assign_scores": 30.0,

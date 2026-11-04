@@ -98,6 +98,8 @@ mod local_zone;
 mod locale_time;
 mod math;
 #[cfg(feature = "regex")]
+mod onig_capture_loop;
+#[cfg(feature = "regex")]
 mod onig_loop;
 mod parse_message;
 mod parser;
