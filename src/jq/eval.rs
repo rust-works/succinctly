@@ -29686,6 +29686,10 @@ fn translate_posix_brackets_scan(
             }
         }
         if c == '\\' {
+            // #6229: a backslash that ends the pattern escapes nothing.
+            if i + 1 == chars.len() {
+                return Err(EvalError::new("invalid regex: end pattern at escape"));
+            }
             // #6220: `\X` has no fixed width, which a look-behind needs.
             if depth == 0
                 && chars.get(i + 1) == Some(&'X')
@@ -30150,6 +30154,9 @@ fn translate_posix_brackets_scan(
                 out.push_str("\\x{80}-\\x{10FFFF}");
                 changed = true;
             }
+        } else if c == ']' && !closes_later(&chars[i + 1..]) {
+            // #6229: a `]` first in a class is a member only when another `]` follows to close it.
+            return Err(EvalError::new("invalid regex: empty char-class"));
         } else if c == '&' || c == '~' {
             out.push('\\');
             changed = true;
@@ -30179,11 +30186,23 @@ fn translate_posix_brackets_scan(
         out.push(c);
         i += 1;
     }
+    // #6229: a class still open at the end of the pattern.
+    if depth > 0 {
+        return Err(EvalError::new("invalid regex: premature end of char-class"));
+    }
     Ok(if changed {
         std::borrow::Cow::Owned(out)
     } else {
         std::borrow::Cow::Borrowed(pattern)
     })
+}
+
+/// Whether `rest` holds a `]` at all, which decides whether a `]` first in a class is a member or
+/// an empty class (#6229). Oniguruma's own scan for it skips the character after a backslash only
+/// in name: an escaped `]` counts (`[]\\]` is a class that never closes, not an empty one).
+#[cfg(feature = "regex")]
+fn closes_later(rest: &[char]) -> bool {
+    rest.contains(&']')
 }
 
 /// Keep the capture slot of a group repeated zero times (#6108). A group followed by `{0}` or

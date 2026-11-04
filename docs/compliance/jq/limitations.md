@@ -7663,6 +7663,18 @@ Left as they were:
 - jq reports a look-behind that holds a multibyte character as an empty match at a later offset *and* one that starts before the search did (`"ßß" | [match("(?<=ß)";"g")|[.offset,.length]]` is `[[1,0],[0,2],[2,0]]`), with or without `i`; that is a separate difference from this one, and the empty matches are left out of the comparison.
 - The Turkish and Azeri folding Oniguruma has behind a locale option is not reachable from jq, and is not read.
 
+### A malformed character class has Oniguruma's message, but not always its place in the order (#6229)
+
+A class that opens with `]` and has no other `]` after it is `empty char-class` (`[]`, `[^]`, `a[]`, `[]a`), and any other class the pattern ends inside is `premature end of char-class` (`[a`, `[^`, `[\]`, `[a-`).
+A `]` first in a class is a member only when a later `]` closes it, and an escaped `]` counts for that (`[]\]` never closes: `premature end of char-class`, as in jq).
+A pattern that ends in a lone backslash is `end pattern at escape`.
+`translate_posix_brackets_scan` raises all three before the crate parses, worded `invalid regex: <message>` where jq words them `Regex failure: <message>`.
+jq reports the first error in parse order; the scan reports an earlier error only when the scan itself finds it.
+A pattern with two errors, the earlier one an error only the crate or a later pass finds, reports the class error instead (`\p{Foo}[` is `invalid character property name {Foo}` in jq, `(?<=a)*[` is `target of repeat operator is invalid`).
+Both still exit 5 with no output.
+The other malformed-pattern messages (`(`, `)`, `(?`, `(?<n`) are still the crate's `regex parse error`.
+Pinned by `tests/jq_cli/i6229.rs`.
+
 ### A group repeated `{0}` keeps its capture entry (#6108)
 
 Oniguruma numbers a group repeated zero times (`{0}`, `{0,0}`), so jq reports an entry for it: offset `-1` and string `null`, or an empty string at the match offset when the whole match is empty.
