@@ -29862,6 +29862,19 @@ fn starts_repetition(chars: &[char]) -> bool {
     }
 }
 
+/// Whether a dash sits beside a set escape (`\w-`, `-\d`), which no range can start or end.
+#[cfg(feature = "regex")]
+fn dash_beside_set(bytes: &[u8]) -> bool {
+    bytes.windows(3).any(|w| {
+        (w[0] == b'\\'
+            && matches!(w[1], b'd' | b'D' | b'w' | b'W' | b's' | b'S' | b'}')
+            && w[2] == b'-')
+            || (w[0] == b'-'
+                && w[1] == b'\\'
+                && matches!(w[2], b'd' | b'D' | b'w' | b'W' | b's' | b'S' | b'p' | b'P'))
+    })
+}
+
 /// Read the dashes of a character class as Oniguruma does (#6184): the `regex` crate reads `--`
 /// as set difference and a `]` that opens a class as a literal that no range can start, so
 /// `[+--]` (the range `+` to `-`), `[--{]` (`-` to `{`) and `[]-b]` (`]` to `b`) came out as other
@@ -29878,7 +29891,12 @@ fn escape_class_range_dashes(
     pattern: &str,
     extended: bool,
 ) -> Result<std::borrow::Cow<'_, str>, EvalError> {
-    if !(pattern.contains("--") || pattern.contains("]-") || pattern.contains("-[:")) {
+    if !pattern.contains('[')
+        || !(pattern.contains("--")
+            || pattern.contains("]-")
+            || pattern.contains("-[:")
+            || dash_beside_set(pattern.as_bytes()))
+    {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
     if pattern.contains("\\Q")
@@ -29940,9 +29958,8 @@ fn escape_class_range_dashes(
                     out.push('\\');
                     out.push(next);
                     i += 2;
-                    if matches!(next, 'x' | 'p' | 'P' | 'k' | 'g' | 'N')
-                        && chars.get(i) == Some(&'{')
-                    {
+                    let braced = chars.get(i) == Some(&'{');
+                    if matches!(next, 'x' | 'p' | 'P' | 'k' | 'g' | 'N') && braced {
                         let end = chars[i..]
                             .iter()
                             .position(|&c| c == '}')
@@ -29950,9 +29967,10 @@ fn escape_class_range_dashes(
                         out.extend(&chars[i..end]);
                         i = end;
                     }
-                    // A class escape stands for a set and starts no range.
-                    let single = !next.is_ascii_alphabetic()
-                        || matches!(next, 'n' | 'r' | 't' | 'f' | 'v' | 'a' | 'e' | 'x');
+                    // A set (`\d`, `\w`, `\s`, `\p{..}`) starts no range and ends none; every other
+                    // escape is one character (`\b` is a backspace here, `\h` the letter).
+                    let single = !(matches!(next, 'd' | 'D' | 'w' | 'W' | 's' | 'S')
+                        || (matches!(next, 'p' | 'P') && braced));
                     if after_operator && !single {
                         return Err(EvalError::new(
                             "invalid regex: char-class value at end of range",
@@ -144195,6 +144213,7 @@ mod tests {
             ("[\\--{]", r"[\--{]"),
             (r"[\x{2d}--a]", r"[\x{2d}-\-a]"),
             (r"[\n--a]", r"[\n-\-a]"),
+            (r"[\b--a]", r"[\b-\-a]"),
             ("[[:alpha:]-]", "[[:alpha:]-]"),
             ("[a[x--z]", r"[a[x-\-z]"),
             // Outside a class nothing changes, and an escaped bracket opens none.
@@ -144223,6 +144242,8 @@ mod tests {
         // A range that starts or ends on a set is an error.
         for pattern in [
             "[[:alpha:]-a]",
+            r"[\w-.]",
+            r"[+-\w]",
             r"[\w--+]",
             r"[\d--]",
             "[a-[:alpha:]]",

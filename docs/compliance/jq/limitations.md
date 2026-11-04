@@ -7393,15 +7393,15 @@ Nothing jq matches is missed, and the only extra matches are code points that th
 yq mode keeps the ASCII classes, as Go's `regexp` has them.
 `\w` and `\W` are rewritten to jq's word class too (#5373): outside a class it adds U+00B2, U+00B3, U+00B9 and U+00BC-U+00BE and drops U+200C and U+200D, which is how Oniguruma's Latin-1 table and the `regex` crate's `\w` differ.
 `\b` is still the crate's, so a boundary next to one of those six characters differs.
-A range that starts or ends at a `\w` (`[\w-.]`, `[+-\w]`) is accepted here and an error in jq.
+A range that starts or ends at a `\w` (`[\w-.]`, `[+-\w]`) was accepted here and an error in jq until #6184.
 One exotic shape still differs: a negated bracket under the `i` flag (`test("[[:^upper:]]";"i")`) is case-folded before the negation here and is not in jq.
 A range from a POSIX bracket (`[[:alpha:]-z]`) and a doubled hyphen (`[a--b]`) were accepted here and an error in jq until #6184.
 An unknown bracket name (`[[:foo:]]`, `[[:ALPHA:]]`) is an error in both, with this crate's wording.
 In jq mode a `[`, `&` or `~` inside a class is the literal character, as in Oniguruma's Perl syntax, where the `regex` crate would read a nested class, an intersection and a symmetric difference.
 A dash is read as Oniguruma reads it (#6184), where the `regex` crate takes `--` for set difference and a `]` that opens a class for a literal that no range can start.
 `[+--]` is the range `+` to `-`, `[--{]` the range `-` to `{`, and `[]-b{]` the range `]` to `b`; the reversed `[?--]` and `[]-(]` are errors, as `[b-a]` is.
-A range that starts or ends on a set (`[[:alpha:]-a]`, `[a-[:alpha:]]`, `[\w--+]`) is an error in jq and here.
-The dashes are written for the crate before the scan (`[+--]` as `[+-\-]`, a leading `]` as `\]`), only in a pattern that holds `--`, `]-` or `-[:`; a quoted run, a comment or a class that never closes leaves it as written.
+A range that starts or ends on a set (`[[:alpha:]-a]`, `[a-[:alpha:]]`, `[\w-.]`, `[+-\w]`) is an error in jq and here; `\b`, `\h` and `\cA` in a class are single characters and can bound a range.
+The dashes are written for the crate before the scan (`[+--]` as `[+-\-]`, a leading `]` as `\]`), only in a pattern that holds `--`, `]-`, `-[:` or a dash beside a set escape; a quoted run, a comment or a class that never closes leaves it as written.
 Pinned against jq 1.7.1 in `tests/jq_cli/i6184.rs`, and 80,000 generated classes (items from dashes, brackets, escapes, POSIX brackets and operators, bare and inside groups and repeats, with the `i` flag) matched `/usr/bin/jq` where `main` differed on 40 to 65 in every 8,000.
 In jq mode `\<` and `\>` are the literal characters `<` and `>`, as in Oniguruma's Perl syntax (#5529), where the `regex` crate reads them as start-of-word and end-of-word assertions.
 `\u` and `\U` are not escapes in jq's Perl syntax but the letter (#6068): `"u00e9" | test("\\u00e9")` is `true` and `"é"` does not match it, and a lone `\u` matches `u`.
