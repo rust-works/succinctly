@@ -28501,6 +28501,37 @@ fn translate_posix_brackets(
     Ok(translated)
 }
 
+/// Whether a repetition operator follows the comments that start at `at` (`(?#...)`, any number of
+/// them), as in `b(?#)(?#)*` (#6128).
+#[cfg(feature = "regex")]
+fn repeat_follows_comments(chars: &[char], mut at: usize) -> bool {
+    while chars.get(at..at + 3) == Some(&['(', '?', '#']) {
+        let mut end = at + 3;
+        while end < chars.len() && chars[end] != ')' {
+            end += if chars[end] == '\\' { 2 } else { 1 };
+        }
+        at = (end + 1).min(chars.len());
+    }
+    starts_repetition(chars.get(at..).unwrap_or(&[]))
+}
+
+/// Whether `out` ends in a quantifier character that is not escaped (`b*`, `b{2}`, not `\\*`) (#6128).
+#[cfg(feature = "regex")]
+fn ends_with_quantifier(out: &str) -> bool {
+    let Some(last) = out.chars().next_back() else {
+        return false;
+    };
+    if !matches!(last, '*' | '+' | '?' | '}') {
+        return false;
+    }
+    let backslashes = out[..out.len() - 1]
+        .chars()
+        .rev()
+        .take_while(|&c| c == '\\')
+        .count();
+    backslashes % 2 == 0
+}
+
 /// [`translate_posix_brackets`]' rewrite and its refusals, one pass over the pattern.
 #[cfg(feature = "regex")]
 fn translate_posix_brackets_scan(
@@ -28566,7 +28597,22 @@ fn translate_posix_brackets_scan(
                     end += if chars[end] == '\\' { 2 } else { 1 };
                 }
                 let end = (end + 1).min(chars.len());
-                out.extend(&chars[i..end]);
+                // #6128: a repeat operator after a comment repeats the item before the comment, as
+                // if the comment were not there (`b(?#)*` is `b*`). The `regex` crate and
+                // `fancy-regex` repeat the comment instead, which has no empty way of its own to
+                // give a loop (`(?:b(?#)*|a)+`), so the comment is left out of what they read.
+                // Where nothing repeatable stands before it (the start of a body, a `|`, a quantifier
+                // already) it is kept, as it always was.
+                if check_repetition
+                    && i != body_start
+                    && !after_pipe
+                    && !ends_with_quantifier(&out)
+                    && repeat_follows_comments(&chars, end)
+                {
+                    changed = true;
+                } else {
+                    out.extend(&chars[i..end]);
+                }
                 // #6170: a comment is invisible to jq, so what stood before it still stands (the
                 // extended mode's comments need no such care, that mode skips the check).
                 prev_assertion = was_assertion;
