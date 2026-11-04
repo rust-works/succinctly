@@ -29020,6 +29020,9 @@ enum PropertyName {
     /// `In_Basic_Latin` and the other Unicode block names (#6228): the block's inclusive code point
     /// ranges, which the crate has no names for.
     Block(&'static [(u32, u32)]),
+    /// `Word`: the class `\w` is, with its six Latin-1 characters outside a class and without the
+    /// two joiners the crate's property has (#6227).
+    Word,
     /// A name Oniguruma refuses (`invalid character property name`) that the crate reads: a
     /// `name=value` or `name:value` form, and the properties newer than the Unicode tables jq 1.7.1
     /// links.
@@ -29079,6 +29082,7 @@ fn property_name_kind(raw: &str) -> PropertyName {
     }
     match name.as_str() {
         "xdigit" => PropertyName::XDigit,
+        "word" => PropertyName::Word,
         "bidimirrored"
         | "bidim"
         | "idsunaryoperator"
@@ -29372,6 +29376,24 @@ fn translate_posix_brackets_scan(
                                 if depth == 0 {
                                     out.push(')');
                                 }
+                                changed = true;
+                                at_start = false;
+                                i = end;
+                                continue;
+                            }
+                            PropertyName::Word => {
+                                // The same class as `\w` and `\W` (#5373), whichever way it is
+                                // negated.
+                                out.push('[');
+                                if (kind == 'P') != caret {
+                                    out.push('^');
+                                }
+                                out.push_str(if depth == 0 {
+                                    JQ_WORD_CLASS
+                                } else {
+                                    JQ_WORD_CLASS_IN_CLASS
+                                });
+                                out.push(']');
                                 changed = true;
                                 at_start = false;
                                 i = end;
