@@ -88,6 +88,12 @@ const ORACLE_ROWS: &[(&str, &str, &str)] = &[
         ".b[] as $i ireduce([]; . as $i | . + [$i|path])",
         "- []\n- []\n",
     ),
+    // A read that outputs nothing still outputs nothing in the update.
+    (
+        "key_of_the_root_is_empty",
+        ". as $i ireduce([]; . + [($i|key)])",
+        "[]\n",
+    ),
     // No node read: the fold is left as written.
     (
         "value_only_fold_unchanged",

@@ -87,8 +87,10 @@ fn rebinds_name(expr: &Expr, name: &str) -> bool {
     })
 }
 
-/// `update` with each `$name | READ` (READ a node-reading builtin, [`is_node_read`]) replaced by a
-/// variable of its own, the READ appended to `reads` the first time it is met.
+/// `update` with each `$name | READ` (READ a node-reading builtin, [`is_node_read`]) replaced by
+/// `$bound | .[]`, `$bound` a variable of the READ's own holding all it outputs, the READ appended
+/// to `reads` the first time it is met. A READ that outputs nothing (`key` of a root) then still
+/// outputs nothing in the update.
 fn replace_node_reads(update: &Expr, name: &str, reads: &mut Vec<(Builtin, String)>) -> Expr {
     if let Expr::Pipe(stages) = update {
         if let [Expr::Var(var), read @ Expr::Builtin(builtin), rest @ ..] = &stages[..] {
@@ -101,7 +103,7 @@ fn replace_node_reads(update: &Expr, name: &str, reads: &mut Vec<(Builtin, Strin
                         bound
                     }
                 };
-                let mut out = vec![Expr::Var(bound)];
+                let mut out = vec![Expr::Var(bound), Expr::Iterate];
                 out.extend(rest.iter().map(|s| replace_node_reads(s, name, reads)));
                 return Expr::pipe(out);
             }
@@ -115,9 +117,10 @@ fn replace_node_reads(update: &Expr, name: &str, reads: &mut Vec<(Builtin, Strin
 /// element's value instead, and `path` of a value is `[]`.
 ///
 /// Each such read is taken where the node is still in hand: `SRC | [., READ, ...]` yields the
-/// element and every READ the update makes of it, `$v` is bound to the first and each read to its
-/// own variable, and the update's `$v | READ` becomes that variable. An update with no such read,
-/// a pattern that is not a single `$v`, and an update that binds `$v` again are left as written.
+/// element and every READ the update makes of it, each collected as `[READ]`, `$v` is bound to the
+/// first and each read to its own variable, and the update's `$v | READ` becomes that variable's
+/// `.[]`. An update with no such read, a pattern that is not a single `$v`, and an update that
+/// binds `$v` again anywhere are left as written.
 fn bind_ireduce_node_reads(
     source: Expr,
     patterns: Vec<Pattern>,
@@ -135,7 +138,11 @@ fn bind_ireduce_node_reads(
         return (source, patterns, update);
     }
     let mut tuple = vec![Expr::Identity];
-    tuple.extend(reads.iter().map(|(read, _)| Expr::Builtin(read.clone())));
+    tuple.extend(
+        reads
+            .iter()
+            .map(|(read, _)| Expr::Array(Box::new(Expr::Builtin(read.clone())))),
+    );
     let source = Expr::pipe(vec![
         Expr::Paren(Box::new(source)),
         Expr::Array(Box::new(Expr::comma(tuple))),

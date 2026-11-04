@@ -6888,6 +6888,7 @@ yq's own colorizer also repeats the line break after a tag that ends its line (`
 yq binds `$i` in `SRC as $i ireduce (INIT; UPDATE)` to the node `SRC` selected, so `$i | path`, `$i | key`, `$i | line` and the other node reads answer from where it sits.
 `succinctly yq` binds the element's value, and takes each of those reads before the fold, at the one place the node is still in hand: `SRC | [., READ, ...]` feeds the fold, and the update's `$i | READ` is replaced by what that read answered.
 The reads are `path`, `key`, `parent`, `line`, `column`, `document_index`, `file_index`, `filename`, `tag`, `anchor`, `alias`, `style`, `kind`, `line_comment`, `head_comment` and `foot_comment`, and the answer is yq's for each.
-A read that is not the first stage after `$i` still sees a value: `$i | parent | key` is `[]` where yq prints the parent's key.
-So does a `$i` read inside an update that binds `$i` again, which is a different variable, and a fold whose pattern is not a single `$i` (`as [$a, $b] ireduce`).
-`parent` is read once per element, so it costs the parent's size per step.
+Only the first stage after `$i` is read from the node: in `$i | parent | key` the `parent` is, and the `key` of the parent sees a value, so it is `[]` where yq prints the parent's key.
+A `$i | READ` stays a value read in an update that binds `$i` again anywhere (the rewrite cannot tell which `$i` a read means), in a nested `ireduce` over the same name, and in a fold whose pattern is not a single `$i` (`as [$a, $b] ireduce`).
+Every read the update names is taken for every element, whether or not the step reaches it.
+`parent` copies the parent once per element, so it costs the parent's size per step.
