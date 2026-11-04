@@ -7671,6 +7671,7 @@ A pattern that ends in a lone backslash is `end pattern at escape`.
 `translate_posix_brackets_scan` raises all three before the crate parses, worded `invalid regex: <message>` where jq words them `Regex failure: <message>`.
 jq reports the first error in parse order; the scan reports an earlier error only when the scan itself finds it.
 A pattern with two errors, the earlier one an error only the crate or a later pass finds, reports the class error instead (`\p{Foo}[` is `invalid character property name {Foo}` in jq, `(?<=a)*[` is `target of repeat operator is invalid`).
+Inside a class the pattern ends in, jq reports an error in the class's own members first: `[b-a` is `empty range in char class`, `[a-\]` the same, and `[\d-` is `unmatched range specifier in char-class`; this reports `premature end of char-class`.
 Both still exit 5 with no output.
 The other malformed-pattern messages (`(`, `)`, `(?`, `(?<n`) are still the crate's `regex parse error`.
 Pinned by `tests/jq_cli/i6229.rs`.
