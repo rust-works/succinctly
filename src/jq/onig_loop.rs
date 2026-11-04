@@ -74,6 +74,10 @@ struct Rewriter<'p> {
     /// The longest text a piece may grow to: the rewrite copies a loop's body, and nested loops
     /// copy the copies.
     limit: usize,
+    /// The bytes of text built so far, and their bound: a body of many items that can match
+    /// nothing rebuilds its listed ways at each item, quadratic in the items.
+    work: core::cell::Cell<usize>,
+    work_limit: usize,
     changed: bool,
 }
 
@@ -92,10 +96,17 @@ fn rewrite_parsed(pattern: &str) -> Option<String> {
     let mut rewriter = Rewriter {
         source: pattern,
         limit: pattern.len().saturating_mul(16).saturating_add(1024),
+        work: core::cell::Cell::new(0),
+        work_limit: pattern.len().saturating_mul(64).saturating_add(64 * 1024),
         changed: false,
     };
-    let piece = rewriter.convert(&ast).ok()?;
-    rewriter.changed.then_some(piece.text.text)
+    let piece = rewriter.convert(&ast, false).ok()?;
+    // The rewrite can drop a piece that matches only the empty string (`\p{Foo}{0}`), and with it
+    // an error the crate would have reported for the pattern as written.
+    let valid = regex_syntax::hir::translate::Translator::new()
+        .translate(pattern, &ast)
+        .is_ok();
+    (rewriter.changed && valid).then_some(piece.text.text)
 }
 
 /// Whether `pattern` may hold a loop [`rewrite`] changes, judged from its bytes so that every other
@@ -104,7 +115,7 @@ fn rewrite_parsed(pattern: &str) -> Option<String> {
 /// only through a `*`, a `?` or `{0`/`{,` quantifier, an empty alternative or an empty group, and
 /// has a consuming way after the empty one only through a `|` or a lazy quantifier. Whitespace
 /// between tokens is skipped, and a `#` (a comment under `x`, which can stand between them) counts
-/// for both.
+/// for all three.
 fn may_need_rewrite(pattern: &str) -> bool {
     let bytes = pattern.as_bytes();
     let next = |i: usize| {
@@ -132,7 +143,7 @@ fn may_need_rewrite(pattern: &str) -> bool {
                 nullable |= matches!(prev, None | Some(b'(' | b'|' | b':'))
                     || matches!(next(i), None | Some(b')' | b'|'));
             }
-            b'#' => (nullable, later_way) = (true, true),
+            b'#' => (group_repeat, nullable, later_way) = (true, true, true),
             _ => {}
         }
         if !c.is_ascii_whitespace() {
@@ -144,7 +155,9 @@ fn may_need_rewrite(pattern: &str) -> bool {
 
 impl Rewriter<'_> {
     fn text(&self, text: String, prec: Prec) -> Result<Text, GiveUp> {
-        if text.len() > self.limit {
+        let work = self.work.get() + text.len();
+        self.work.set(work);
+        if text.len() > self.limit || work > self.work_limit {
             return Err(GiveUp);
         }
         Ok(Text { text, prec })
@@ -154,7 +167,9 @@ impl Rewriter<'_> {
         &self.source[span.start.offset..span.end.offset]
     }
 
-    fn convert(&mut self, ast: &Ast) -> Result<Piece, GiveUp> {
+    /// `ast` as a piece. Its ways are listed only when `listed`, that is under a repeat, which is
+    /// the only place they are read.
+    fn convert(&mut self, ast: &Ast, listed: bool) -> Result<Piece, GiveUp> {
         match ast {
             Ast::Empty(_) => Ok(Piece {
                 text: Text {
@@ -189,9 +204,9 @@ impl Rewriter<'_> {
                     ways: Ways::Unknown,
                 })
             }
-            Ast::Group(group) => self.group(group),
+            Ast::Group(group) => self.group(group, listed),
             Ast::Repetition(rep) => {
-                let body = self.convert(&rep.ast)?;
+                let body = self.convert(&rep.ast, true)?;
                 let (min, max) = match &rep.op.kind {
                     RepetitionKind::ZeroOrOne => (0, Some(1)),
                     RepetitionKind::ZeroOrMore => (0, None),
@@ -206,25 +221,25 @@ impl Rewriter<'_> {
                 let items = alt
                     .asts
                     .iter()
-                    .map(|a| self.convert(a))
+                    .map(|a| self.convert(a, listed))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.alt(&items)
+                self.alt(&items, listed)
             }
             Ast::Concat(concat) => {
                 let items = concat
                     .asts
                     .iter()
-                    .map(|a| self.convert(a))
+                    .map(|a| self.convert(a, listed))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.concat(&items)
+                self.concat(&items, listed)
             }
         }
     }
 
     /// A group keeps its own opening and closing text. A capture group's ways are not listed; a
     /// non-capturing one's are its body's, each wrapped in the group's flags when it has any.
-    fn group(&mut self, group: &ast::Group) -> Result<Piece, GiveUp> {
-        let body = self.convert(&group.ast)?;
+    fn group(&mut self, group: &ast::Group, listed: bool) -> Result<Piece, GiveUp> {
+        let body = self.convert(&group.ast, listed)?;
         let inner = group.ast.span();
         let open = &self.source[group.span.start.offset..inner.start.offset];
         let close = &self.source[inner.end.offset..group.span.end.offset];
@@ -310,7 +325,7 @@ impl Rewriter<'_> {
         self.text(text, Prec::Concat)
     }
 
-    fn concat(&self, items: &[Piece]) -> Result<Piece, GiveUp> {
+    fn concat(&self, items: &[Piece], listed: bool) -> Result<Piece, GiveUp> {
         let Some((first, rest)) = items.split_first() else {
             return Ok(Piece {
                 text: Text {
@@ -325,7 +340,11 @@ impl Rewriter<'_> {
         };
         // Left to right: the prefix `P = A1 | ε | B1` followed by `Q = A2 | ε | B2` tries
         // `A1 Q`, then `Q` from where `P` began (`A2`, `ε`, `B2`), then `B1 Q`.
-        let mut ways = first.ways.clone();
+        let mut ways = if listed {
+            first.ways.clone()
+        } else {
+            Ways::Unknown
+        };
         for next in rest {
             ways = match (ways, &next.ways) {
                 (Ways::Unknown, _) | (_, Ways::Unknown) => Ways::Unknown,
@@ -364,12 +383,15 @@ impl Rewriter<'_> {
         })
     }
 
-    fn alt(&self, items: &[Piece]) -> Result<Piece, GiveUp> {
+    fn alt(&self, items: &[Piece], listed: bool) -> Result<Piece, GiveUp> {
         let mut before = Vec::new();
         let mut after = Vec::new();
         let mut nullable = false;
-        let mut unknown = false;
+        let mut unknown = !listed;
         for item in items {
+            if unknown {
+                break;
+            }
             match &item.ways {
                 Ways::Unknown => unknown = true,
                 Ways::Consuming if nullable => after.push(item.text.clone()),
@@ -447,7 +469,7 @@ impl Rewriter<'_> {
             // `X+?` is `X X*?`, as Oniguruma tries it.
             (Ways::Nullable { .. }, 1, None, false) => {
                 let rest = self.repeat(body.clone(), 0, None, false)?;
-                self.concat(&[body, rest])?.ways
+                self.concat(&[body, rest], true)?.ways
             }
             (Ways::Nullable { before, after }, _, None, true) => {
                 return self.exit_on_empty(before.clone(), after.clone(), text);
@@ -481,15 +503,15 @@ impl Rewriter<'_> {
             .transpose()?;
         let mut parts: Vec<Piece> = star.iter().cloned().collect();
         let Some(b) = after else {
-            let mut piece = self.concat(&parts)?;
+            let mut piece = self.concat(&parts, true)?;
             piece.text = written;
             return Ok(piece);
         };
         let mut iteration = alloc::vec![consuming(b)];
         iteration.extend(star);
-        let iteration = self.concat(&iteration)?;
+        let iteration = self.concat(&iteration, true)?;
         parts.push(self.repeat(iteration, 0, None, false)?);
-        let piece = self.concat(&parts)?;
+        let piece = self.concat(&parts, true)?;
         self.changed = true;
         Ok(Piece {
             text: self.text(format!("(?:{})", piece.text.text), Prec::Atom)?,
@@ -529,11 +551,11 @@ impl Rewriter<'_> {
         for _ in 1..n {
             let mut ways = Vec::new();
             if let Some(a) = &before {
-                ways.push(self.concat(&[consuming(a.clone()), loop_rest.clone()])?);
+                ways.push(self.concat(&[consuming(a.clone()), loop_rest.clone()], true)?);
             }
-            ways.push(self.concat(&[])?);
-            ways.push(self.concat(&[consuming(b.clone()), loop_rest])?);
-            loop_rest = self.alt(&ways)?;
+            ways.push(self.concat(&[], true)?);
+            ways.push(self.concat(&[consuming(b.clone()), loop_rest], true)?);
+            loop_rest = self.alt(&ways, true)?;
         }
         self.changed = true;
         Ok(Piece {
@@ -655,6 +677,36 @@ mod tests {
         assert!(changed > 500, "the grammar reaches the rewrite ({changed})");
         assert!(!may_need_rewrite("(?:a|b)+"));
         assert!(!may_need_rewrite("(?:ab)*c"));
+    }
+
+    /// A piece that matches only the empty string is not copied into the rewrite, so a pattern the
+    /// crate refuses for it is left as written and keeps its error.
+    #[test]
+    fn a_pattern_the_crate_refuses_is_left_as_written() {
+        assert_eq!(rewrite(r"(?:\p{Foo}{0}|a)+"), None);
+        assert_eq!(rewrite(r"(?:b*|\p{Foo}{0}|a)+"), None);
+        assert!(rewrite(r"(?:b*|\pL{0}|a)+").is_some());
+    }
+
+    /// Under `x`, a comment can stand between a group and its quantifier.
+    #[test]
+    fn a_comment_before_the_quantifier_still_admits_the_loop() {
+        assert_eq!(
+            rewrite("(?x)(?:b*|a) #c\n +").as_deref(),
+            Some("(?x)(?:(?:b+)*(?:a(?:b+)*)*?)")
+        );
+    }
+
+    /// Ways are listed only under a repeat: a long run of items that can match nothing outside any
+    /// loop costs nothing, and one inside a loop's body gives up on the work budget instead of
+    /// rebuilding its ways at every item.
+    #[test]
+    fn a_long_run_of_nullable_items_is_linear_or_given_up() {
+        let outside = format!("{}(?:b*|a)+", "a?".repeat(20_000));
+        let rewritten = rewrite(&outside).expect("the loop is rewritten");
+        assert!(rewritten.ends_with("(?:(?:b+)*(?:a(?:b+)*)*?)"));
+        let inside = format!("(?:{}|b)+", "a?".repeat(20_000));
+        assert_eq!(rewrite(&inside), None);
     }
 
     #[test]

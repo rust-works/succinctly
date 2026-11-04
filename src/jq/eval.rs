@@ -29372,7 +29372,7 @@ fn build_regex_uncached<S: EvalSemantics>(
     // `regex` crate tries the body's later ways first (see `onig_loop`). Not under `l`: the span of
     // the longest match does not depend on that order, and `fancy-regex`'s longest mode refuses the
     // lazy repeat the rewrite writes, which would leave `l` a no-op. The pattern as written is kept
-    // for when the copies the rewrite makes outgrow the crate's size or nesting limit.
+    // for when the copies the rewrite makes outgrow an engine's size or nesting limit.
     let mut as_written = None;
     if S::TAG != EvalTag::Yq && !longest {
         if let Some(rewritten) = super::onig_loop::rewrite(&pattern) {
@@ -29405,7 +29405,12 @@ fn build_regex_uncached<S: EvalSemantics>(
         // old route whole: the flags are not independent (`ln` is the longest *non-empty* match
         // anywhere), so fixing `n` alone would change which wrong answer it gives.
         if modes.longest || modes.not_empty {
-            if let Some(re) = build_fancy_regex_with::<S>(&pattern, modes) {
+            let built = build_fancy_regex_with::<S>(&pattern, modes).or_else(|| {
+                as_written
+                    .as_deref()
+                    .and_then(|written| build_fancy_regex_with::<S>(written, modes))
+            });
+            if let Some(re) = built {
                 // #6085: an `l` search with `\K` measures a match from where its attempt began.
                 // Under the `x` flag the closing parenthesis follows a newline, so that a `#`
                 // comment at the end of the pattern cannot swallow it; an inline `(?x)`, a switch
@@ -29448,7 +29453,9 @@ fn build_regex_uncached<S: EvalSemantics>(
         && needs_trailing_nl_check
         && (pattern_has_escape_z(&pattern) || pattern_has_interior_dollar(&pattern))
     {
-        if let Some(re) = build_fancy_regex::<S>(&pattern) {
+        let built = build_fancy_regex::<S>(&pattern)
+            .or_else(|| as_written.as_deref().and_then(build_fancy_regex::<S>));
+        if let Some(re) = built {
             return Ok(JqRegex {
                 engine: RegexEngine::Fancy(re),
                 needs_trailing_nl_check: false,
