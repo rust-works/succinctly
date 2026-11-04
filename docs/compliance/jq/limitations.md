@@ -7626,7 +7626,9 @@ These keep their loop as written, and still match longer than jq where the shape
   The switch reaches every later way of the group, which the rewrite would move out of its reach.
   A flag group (`(?i:b*)`) is rewritten.
 - **A pattern the `regex` crate's parser cannot read** (lookaround, a backreference, `\K`, `\G`), which goes to `fancy-regex` unrewritten: `"ba" | match("(?:b*|a)+(?=)")` is `"b"` in jq and `"ba"` here.
-- **A lazy repeat that must run twice or more:** `"bab" | [match("(?:(?:b|c)||[ab]){2,3}?"; "gn") | .string]` is `["b","ab"]` in jq and `["b","a","b"]` here.
+- **A lazy repeat that must run twice or more of a body with a consuming way before its empty one, without an upper bound** (`{n,}?`, n of 2 or more): `"ab" | [match("(?:b?|\\w){2,}?"; "gn") | .string]` is `["a","b"]` in jq and `["ab"]` here.
+  The same repeat with an upper bound (`{2,3}?`) and one whose body has no consuming way before its empty one are rewritten ([#6128](https://github.com/rust-works/succinctly/issues/6128)): `"bab" | [match("(?:(?:b|c)||[ab]){2,3}?"; "gn") | .string]` is `["b","ab"]`, as in jq.
+  A lazy repeat that runs once at most (`*?`, `+?`, `??`, `{1,3}?`) already agrees with jq.
 - **The `l` flag:** the longest match's span does not depend on the order the ways are tried in, and `fancy-regex`'s longest mode refuses the lazy repeat the rewrite writes.
 - **A pattern whose rewrite would grow past sixteen times its length and a kilobyte** (nested loops copy their bodies), or past the `regex` crate's size or nesting limit.
 
