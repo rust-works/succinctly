@@ -28868,12 +28868,14 @@ fn guard_prefix_lifting(pattern: &str, oniguruma: bool) -> Option<String> {
     if !pattern.contains('|') {
         return None;
     }
-    let shadow = if oniguruma {
-        std::borrow::Cow::Owned(oniguruma_shadow(pattern)?)
-    } else {
-        std::borrow::Cow::Borrowed(pattern)
+    // A pattern the parser reads as written is read as written; the copy is for one it refuses.
+    let tree = match ast::parse::Parser::new().parse(pattern) {
+        Ok(tree) => tree,
+        Err(_) if oniguruma => ast::parse::Parser::new()
+            .parse(&oniguruma_shadow(pattern)?.text)
+            .ok()?,
+        Err(_) => return None,
     };
-    let tree = ast::parse::Parser::new().parse(&shadow).ok()?;
     let Ok(mut guards) = ast::visit(&tree, Guards(Vec::new()));
     if guards.is_empty() {
         return None;
@@ -28899,15 +28901,16 @@ fn guard_prefix_lifting(pattern: &str, oniguruma: bool) -> Option<String> {
 }
 
 /// `pattern` with the Oniguruma syntax only `fancy-regex` reads written as plain syntax of the same
-/// length, so that `regex-syntax`'s parser finds [`guard_prefix_lifting`] the same groups and
-/// branches at the same offsets: a lookaround or atomic group opener becomes a plain group's,
+/// length, so that `regex-syntax`'s parser finds [`guard_prefix_lifting`] and `onig_loop`'s rewrite
+/// (#6128) the same groups and branches at the same offsets: a lookaround or atomic group opener becomes a plain group's,
 /// `(?#...)` a group of `x`s, `\K`, `\G` and `\Z` the assertion `\b`, and `\R`, `\k` and `\1`-`\9`
 /// the escape `\.`. A character class is copied as it is. `None` for a comment that never closes or
 /// crosses a line, since under the `x` flag that newline can end the `#` comment it is in.
 #[cfg(feature = "regex")]
-fn oniguruma_shadow(pattern: &str) -> Option<String> {
+pub(crate) fn oniguruma_shadow(pattern: &str) -> Option<OnigurumaShadow> {
     let bytes = pattern.as_bytes();
     let mut out = vec_with_capacity(bytes.len());
+    let mut opaque = Vec::new();
     // Open classes (they nest), and whether the next byte is the first of the class, where a `]` is
     // a literal -- as in [`keep_zero_count_groups`].
     let mut class_depth = 0usize;
@@ -28922,7 +28925,13 @@ fn oniguruma_shadow(pattern: &str) -> Option<String> {
             };
             let plain = match next {
                 b'K' | b'G' | b'Z' if class_depth == 0 => b'b',
-                b'R' | b'k' | b'1'..=b'9' => b'.',
+                b'R' => b'.',
+                b'k' | b'1'..=b'9' => {
+                    if class_depth == 0 {
+                        opaque.push(i);
+                    }
+                    b'.'
+                }
                 other => other,
             };
             out.extend_from_slice(&[b'\\', plain]);
@@ -28949,10 +28958,12 @@ fn oniguruma_shadow(pattern: &str) -> Option<String> {
             class_depth = 1;
             class_start = true;
         } else if rest.starts_with(b"(?=") || rest.starts_with(b"(?!") || rest.starts_with(b"(?>") {
+            opaque.push(i);
             out.extend_from_slice(b"(?:");
             i += 3;
             continue;
         } else if rest.starts_with(b"(?<=") || rest.starts_with(b"(?<!") {
+            opaque.push(i);
             out.extend_from_slice(b"(?i:");
             i += 4;
             continue;
@@ -28965,6 +28976,7 @@ fn oniguruma_shadow(pattern: &str) -> Option<String> {
             if comment.contains(&b'\n') {
                 return None;
             }
+            opaque.push(i);
             out.extend_from_slice(b"(?:");
             out.extend(core::iter::repeat(b'x').take(comment.len() - 4));
             out.push(b')');
@@ -28974,7 +28986,21 @@ fn oniguruma_shadow(pattern: &str) -> Option<String> {
         out.push(b);
         i += 1;
     }
-    String::from_utf8(out).ok()
+    Some(OnigurumaShadow {
+        text: String::from_utf8(out).ok()?,
+        opaque,
+    })
+}
+
+/// What [`oniguruma_shadow`] writes for a pattern.
+#[cfg(feature = "regex")]
+pub(crate) struct OnigurumaShadow {
+    /// The pattern with its Oniguruma-only syntax written plainly, at the same offsets.
+    pub(crate) text: String,
+    /// Where each construct the plain text reads as something it is not starts, in order: a
+    /// lookaround, atomic or comment group (read as a plain group of what it holds) and a
+    /// backreference (read as one literal character).
+    pub(crate) opaque: Vec<usize>,
 }
 
 /// The regex written for the character `v`, safe anywhere in a pattern, a class and the extended
@@ -30215,10 +30241,16 @@ fn build_regex_uncached<S: EvalSemantics>(
         }
     }
 
+    // The pattern as written replaces the rewrite only when it compiles where the rewrite does not
+    // (an engine limit). A pattern the crate refuses either way keeps its rewrite for `fancy-regex`
+    // (#6128), and is refused in the words of the pattern as written.
     let compiled = match std_regex(&pattern) {
         Err(_) if as_written.is_some() => {
-            pattern = as_written.take().unwrap_or_default();
-            std_regex(&pattern)
+            let written = std_regex(as_written.as_deref().unwrap_or_default());
+            if written.is_ok() {
+                pattern = as_written.take().unwrap_or_default();
+            }
+            written
         }
         compiled => compiled,
     };
@@ -30235,7 +30267,9 @@ fn build_regex_uncached<S: EvalSemantics>(
         // #5502: lookaround, backreferences, atomic groups and the like are Oniguruma syntax the
         // `regex` crate refuses. A pattern `fancy-regex` cannot take either keeps the crate's
         // own refusal, so its message is what it always was.
-        Err(e) => match build_fancy_regex::<S>(&pattern) {
+        Err(e) => match build_fancy_regex::<S>(&pattern)
+            .or_else(|| as_written.as_deref().and_then(build_fancy_regex::<S>))
+        {
             Some(re) => Ok(JqRegex {
                 engine: RegexEngine::Fancy(re),
                 // `build_fancy_regex` rewrote `$` itself: see [`prepare_fancy_pattern`].

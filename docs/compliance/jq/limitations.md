@@ -7629,7 +7629,15 @@ These keep their loop as written, and still match longer than jq where the shape
 - **A body with a flag switch** (`(?i)` inside it): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and `["ba",""]` here.
   The switch reaches every later way of the group, which the rewrite would move out of its reach.
   A flag group (`(?i:b*)`) is rewritten.
-- **A pattern the `regex` crate's parser cannot read** (lookaround, a backreference, `\K`, `\G`), which goes to `fancy-regex` unrewritten: `"ba" | match("(?:b*|a)+(?=)")` is `"b"` in jq and `"ba"` here.
+- **A body with syntax only `fancy-regex` reads** (a lookaround, an atomic group, a backreference, `\K`, `\G`, or a comment with a quantifier after it) keeps its loop, which `fancy-regex` then runs itself and mostly as jq does.
+  Over 40,000 generated cases with such syntax in a loop body, 42 were fixed, none broken, and 2,356 differ as before, of three kinds.
+  1,648 are `\K` as a bare alternative (`(?:\K|a)+`), a pattern jq refuses and succinctly accepts ([#6157](https://github.com/rust-works/succinctly/issues/6157)).
+  689 are a comment followed by a quantifier, which Oniguruma applies to the item before the comment (`b(?#)*` is `b*`): `"bab" | [match("(?:b(?#)*|a)+"; "g") | .string]` is `["b","","b",""]` in jq and `["bab",""]` here.
+  19 are scattered over the other constructs.
+  A comment with no quantifier after it matches nothing, and its loop is rewritten.
+  A loop beside or around such syntax is rewritten since [#6128](https://github.com/rust-works/succinctly/issues/6128): the rewrite reads a pattern the `regex` crate's parser refuses through a copy that writes that syntax plainly at the same offsets (`oniguruma_shadow` in `src/jq/eval.rs`), so `"ba" | match("(?:b*|a)+(?=)")` is jq's `"b"` (it was `"ba"`), and a loop inside a lookaround or atomic group is rewritten too.
+  Over 30,000 generated cases with such syntax beside or around a loop, 235 were fixed, none broken, and 4 differ as before: a loop inside a lookahead followed by `.+` or `.*` (`"aaac" | match("(?=(?:[bc]*c??|){2,}c).+")`), where jq finds no match at all although the lookahead holds at offset 3.
+  A pattern with a conditional (`(?(1)...)`) is read as before.
 - **An unbounded lazy repeat that must run twice or more, over a body with a consuming way before its empty one** (`{n,}?`, n of 2 or more; the `b` of `b?` in `(?:b?|\\w)`): `"ab" | [match("(?:b?|\\w){2,}?"; "gn") | .string]` is `["a","b"]` in jq and `["ab"]` here, although the repeat is rewritten.
   Pinned by `tests/jq_cli/i6128.rs`.
   The same repeat with an upper bound (`{2,3}?`) and one whose body has no consuming way before its empty one are rewritten ([#6128](https://github.com/rust-works/succinctly/issues/6128)): `"bab" | [match("(?:(?:b|c)||[ab]){2,3}?"; "gn") | .string]` is `["b","ab"]`, as in jq.
