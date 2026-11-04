@@ -4384,6 +4384,15 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         true
     }
 
+    fn certified_well_formed(&self, depth: usize) -> bool {
+        // The scan counts against the printer's ceiling (384), the walk against its own (256):
+        // the walk's `depth` is the scan's `depth` plus the difference (#3909).
+        self.canonical_compact_span(
+            MAX_VALUE_TREE_DEPTH - crate::jq::eval_generic::MAX_NESTING_DEPTH + depth,
+        )
+        .is_some()
+    }
+
     fn plain_owned_jq(&self) -> Option<OwnedValue> {
         if !self.is_container() {
             return None;

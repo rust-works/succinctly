@@ -92,6 +92,7 @@ use super::eval::{
     RootWitness, SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics,
     DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
+use super::eval::{owned_slot_mut, static_path_steps, StepKey};
 #[cfg(test)]
 use super::expr::FuncDefBound;
 use super::expr::{
@@ -5949,6 +5950,11 @@ fn bridge_update_flow<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
+    if let (Expr::Update { path, filter }, Some(at)) = (expr, cursor.as_ref()) {
+        if let Some(updated) = update_on_cursor::<S, V>(path, filter, at) {
+            return drain_result_generic(GenericResult::Owned(updated), sink);
+        }
+    }
     let root = RootWitness::of(cursor.as_ref());
     match bridge_ambient_input::<_, S>(expr, &value, cursor) {
         Ok(owned) => {
@@ -5960,6 +5966,335 @@ fn bridge_update_flow<S: EvalSemantics, V: DocumentValue>(
         Err(e) if suppresses(&e, optional) => Flow::Exhausted,
         Err(e) => Flow::Escaped(Control::Error(e)),
     }
+}
+
+/// How much of the document a `path |= f` target must hold, as a share, for [`update_on_cursor`] to
+/// take it: the target's span times this must reach the document's (#6199). The route reads what is
+/// not the target as the whole-document copy does, so it only pays where the target is most of
+/// the document.
+const CURSOR_UPDATE_TARGET_SHARE: usize = 2;
+
+/// The fewest balanced-parentheses positions (two per node) a document must span for
+/// [`update_on_cursor`] to be tried (#6199). What the route saves is the build of the part of the
+/// target the filter does not keep, and it pays for that with a lookup, a check of the target and a
+/// second walk of the rest. For a record of a few thousand nodes that costs more than the copy it
+/// replaces (an update inside `map(..)` measured 22-30% slower at 256 to 4000 nodes), so the floor
+/// is a document, not a record: 65 536 nodes, about 1 MB of JSON.
+const CURSOR_UPDATE_MIN_SPAN: usize = 1 << 17;
+
+/// The deepest nesting `parse_plain_at` reads, which a sibling built by it may add to its depth.
+const PLAIN_READ_DEPTH: usize = super::json_fast::MAX_DEPTH;
+
+/// Whether `filter` can be evaluated twice with nothing observable but the time (#6199):
+/// [`update_on_cursor`] declines after running a filter that answered nothing, raised or broke, and
+/// the whole-document route then runs it again to answer as it always did. A filter that writes,
+/// reads the input stream, ends the process or calls what the tree holds no body of
+/// ([`walk_body_may_have_effects`](super::eval::walk_body_may_have_effects), the set a probe must
+/// not re-run) is not, and neither is one that reads the cursor's position (`line`, `at_offset`):
+/// the whole-document route answers those from a rebuilt copy.
+fn update_filter_is_repeatable(filter: &Expr) -> bool {
+    !super::eval::walk_body_may_have_effects(filter)
+        && !crate::jq::walk::uses_cursor_metadata_builtins(filter)
+}
+
+/// Whether `expr` only navigates: `.`, `.[]`, `.name`, `.[n]` and pipes and parens of them.
+fn is_navigation(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity | Expr::Iterate | Expr::Field(_) | Expr::Index { .. } => true,
+        Expr::Paren(inner) => is_navigation(inner),
+        Expr::Pipe(stages) => stages.iter().all(is_navigation),
+        _ => false,
+    }
+}
+
+/// Whether `body` projects a small value out of its input: a field or an element, a literal,
+/// `length`, and arithmetic of those.
+fn projects_small(body: &Expr) -> bool {
+    match body {
+        Expr::Field(_) | Expr::Index { .. } | Expr::Literal(_) => true,
+        Expr::Paren(inner) => projects_small(inner),
+        Expr::Pipe(stages) => stages.iter().all(projects_small),
+        Expr::Arithmetic { left, right, .. } => projects_small(left) && projects_small(right),
+        Expr::Builtin(Builtin::Length) => true,
+        _ => false,
+    }
+}
+
+/// Whether the filter of a `path |= filter` is one [`update_on_cursor`] answers as the
+/// whole-document route does, and gains on (#6199).
+///
+/// **Answers.** The generic evaluator runs a `map(f)` lazily and a truncating consumer of it
+/// (`first`, an index, a slice, `limit`) never runs the elements it did not need, where the
+/// whole-document route raises the error of one of them (the #725 divergence of plain filters). So
+/// a `map` is only taken as the whole filter, which the update reads to the end, and what takes
+/// the first of a generator takes it from navigation, which cannot raise on the way.
+///
+/// **Gain.** A filter that keeps most of the target (`.`, `sort_by`, `reverse`, `map(select(..))`,
+/// `map(.age += 1)`) builds it again anyway and costs the check of the target on top: `sort_by`
+/// measured 1.26x-1.37x slower on a 7 MB document.
+fn update_filter_is_native(filter: &Expr) -> bool {
+    match filter {
+        Expr::Paren(inner) => update_filter_is_native(inner),
+        // A reduced target, then what reads it to the end.
+        Expr::Pipe(stages) => {
+            let mut stages = stages.iter();
+            stages.next().is_some_and(update_filter_is_native)
+                && stages.all(|stage| {
+                    matches!(
+                        stage,
+                        Expr::Builtin(Builtin::Length | Builtin::Add | Builtin::Min | Builtin::Max)
+                    )
+                })
+        }
+        Expr::Slice { .. } | Expr::SliceExpr { .. } | Expr::Index { .. } => true,
+        Expr::FirstExpr(inner) | Expr::LastExpr(inner) => is_navigation(inner),
+        Expr::Limit { expr, .. } => is_navigation(expr),
+        Expr::Builtin(Builtin::Length | Builtin::Add | Builtin::First | Builtin::Last) => true,
+        Expr::Builtin(Builtin::Map(body)) => projects_small(body),
+        _ => false,
+    }
+}
+
+/// The node `steps` name below `root`, found by lookup, or `None` where a step does not land on
+/// the container it needs (a `null` on the way, a missing key, an index past the end).
+fn update_target_cursor<C: DocumentCursor>(root: &C, steps: &[StepKey<'_>]) -> Option<C> {
+    let mut at = *root;
+    for step in steps {
+        let value = at.value();
+        at = match step {
+            StepKey::Field(name) => value.as_object_rendered()?.find_cursor(name).ok()??,
+            StepKey::Index(index) => value
+                .as_array()?
+                .get_cursor(usize::try_from(*index).ok()?)?,
+        };
+    }
+    Some(at)
+}
+
+/// `cursor`'s owned value with a `null` where `target` stands, which is below it by `steps`
+/// (#6199): [`to_owned_cursor_at_depth`]'s walk of the containers on the way, with the same key,
+/// delimiter and nesting checks in the same order. A member that is not on the way is read in one
+/// pass where the text is plain JSON ([`DocumentCursor::plain_owned_jq`], as the whole-document
+/// copy reads the root) and walked otherwise. The target is neither built nor checked here;
+/// [`update_on_cursor`] has checked it.
+///
+/// `Ok(None)` where the target is not the node the steps reach (a key repeated in an object, so
+/// that the lookup and the walk disagree about which member is the target); an `Err` is the
+/// walk's, a malformed document, which the caller leaves to the whole-document route to raise.
+fn owned_around_target<S: EvalSemantics, C: DocumentCursor>(
+    cursor: &C,
+    steps: &[StepKey<'_>],
+    target: &C,
+    depth: usize,
+) -> Result<Option<OwnedValue>, EvalError> {
+    nesting_depth_check(depth)?;
+    let Some((step, rest)) = steps.split_first() else {
+        return Ok(None); // patchcov: coverage tolerate-line reason="unreachable: update_on_cursor passes a non-empty path, and the recursion stops at its last step"
+    };
+    let value = cursor.value();
+    // The child on the way: the target itself, left out, or the next container down.
+    let on_the_way = |child: &C| -> Result<Option<OwnedValue>, EvalError> {
+        if rest.is_empty() {
+            Ok(child.same_node(target).then_some(OwnedValue::Null))
+        } else {
+            owned_around_target::<S, _>(child, rest, target, depth + 1)
+        }
+    };
+    let off_the_way = |child: &C, capacity: usize| {
+        if depth + 1 + PLAIN_READ_DEPTH <= MAX_NESTING_DEPTH {
+            if let Some(plain) = child.plain_owned_jq() {
+                return Ok(plain);
+            }
+        }
+        walk_child::<S, _, BuildOwned>(
+            child,
+            None,
+            capacity,
+            depth + 1,
+            &nesting_depth_check,
+            &|_, _| None,
+            &[],
+        )
+    };
+    match step {
+        StepKey::Field(name) => {
+            let Some(fields) = value.as_object_rendered() else {
+                return Ok(None); // patchcov: coverage tolerate-line reason="unreachable: the lookup that found the target went through this container as an object"
+            };
+            let mut map = ObjectBuilder::with_capacity(0);
+            let mut guard = DisplayKeyGuard::default();
+            let mut f = fields;
+            let mut is_first = true;
+            let mut last_field: Option<C> = None;
+            while let Some((field, rest_fields)) = f.uncons() {
+                let key = field.checked_key(&f, map.map(), &mut guard, is_first)?;
+                // A repeated key is a member that is not the target node, which declines.
+                let child = if key == name.as_ref() {
+                    match on_the_way(&field.value_cursor)? {
+                        Some(child) => child,
+                        None => return Ok(None),
+                    }
+                } else {
+                    off_the_way(&field.value_cursor, 0)?
+                };
+                map.push::<S>(key, child);
+                last_field = Some(field.value_cursor);
+                f = rest_fields;
+                is_first = false;
+            }
+            if f.ends_unpaired() {
+                return Err(f.malformed_member_error());
+            }
+            container_tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
+            Ok(Some(BuildOwned::object(map)))
+        }
+        StepKey::Index(index) => {
+            let Ok(want) = usize::try_from(*index) else {
+                return Ok(None); // patchcov: coverage tolerate-line reason="unreachable: update_target_cursor declined a negative index"
+            };
+            let Some(elements) = value.as_array() else {
+                return Ok(None); // patchcov: coverage tolerate-line reason="unreachable: the lookup that found the target went through this container as an array"
+            };
+            let mut items = Vec::new();
+            let mut elems = elements;
+            let mut is_first = true;
+            let mut last_elem: Option<C> = None;
+            let mut siblings = SiblingShape::default();
+            while let Some((elem_cursor, rest_elems)) = elems.uncons_cursor() {
+                if !elem_cursor.element_gap_ok(is_first) {
+                    return Err(elem_cursor.malformed_delimiter_error());
+                }
+                let capacity = siblings.capacity();
+                let child = if items.len() == want {
+                    match on_the_way(&elem_cursor)? {
+                        Some(child) => child,
+                        None => return Ok(None), // patchcov: coverage tolerate-line reason="unreachable: an array has one element at this index, and the lookup chose it"
+                    }
+                } else {
+                    off_the_way(&elem_cursor, capacity)?
+                };
+                siblings.push(
+                    <BuildOwned as CursorWalkOutput>::object_len(&child),
+                    capacity,
+                );
+                items.push(child);
+                last_elem = Some(elem_cursor);
+                elems = rest_elems;
+                is_first = false;
+            }
+            container_tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
+            Ok(Some(BuildOwned::array(items)))
+        }
+    }
+}
+
+/// `path |= filter` answered on the document's cursor, or `None` to leave it to the whole-document
+/// route (#6199). Only for a jq-mode update of a static path of object keys and array indexes in a
+/// JSON document, with a filter that is [native](update_filter_is_native) and
+/// [repeatable](update_filter_is_repeatable), that reaches most of a large document.
+///
+/// The whole-document route copies every node of the document into one owned value and writes into
+/// that copy. Here the target is checked (one scan, [`DocumentCursor::certified_well_formed`],
+/// else the walk), `filter` runs on the target in the document and its one output is kept, and the
+/// containers on the path are rebuilt around it ([`owned_around_target`]), so a filter that keeps
+/// little of the target (`.users |= .[:10]`, `map(.age + 1)`) never builds the rest.
+///
+/// Whatever is not one clean output of `filter` (nothing, an error, a `break`, a `halt`, a `?//`
+/// retry that offers a second), a target that does not check, a path that does not land and a
+/// repeated key on it are left to the whole-document route, which answers as it always did.
+#[inline(never)]
+fn update_on_cursor<S: EvalSemantics, V: DocumentValue>(
+    path: &Expr,
+    filter: &Expr,
+    root: &V::Cursor,
+) -> Option<OwnedValue> {
+    update_on_cursor_gated::<S, V>(path, filter, root, true)
+}
+
+/// [`update_on_cursor`], with the size gates (`size_gates`: the document's floor and the target's
+/// share) that only decide whether the route pays off, not whether its answer is right: a test
+/// passes `false` to hold every update to the whole-document answer.
+#[inline(never)]
+fn update_on_cursor_gated<S: EvalSemantics, V: DocumentValue>(
+    path: &Expr,
+    filter: &Expr,
+    root: &V::Cursor,
+    size_gates: bool,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq
+        || <V::Cursor as DocumentCursor>::REUSE_FIELD_VALUE
+        || !root.materializes_members_one_to_one()
+        || embed_table_active()
+        || !update_filter_is_native(filter)
+    {
+        return None;
+    }
+    // The gates that only decide whether the route pays off come first: an update inside a loop
+    // over small records (`map(.name |= length)`) leaves here without a lookup or an allocation.
+    let root_span = root.subtree_end()?.checked_sub(root.node_id())?;
+    if size_gates && root_span < CURSOR_UPDATE_MIN_SPAN {
+        return None;
+    }
+    let mut steps = Vec::new();
+    static_path_steps(path, &mut steps)?;
+    let target = update_target_cursor(root, &steps)?;
+    if size_gates {
+        let target_span = target.subtree_end()?.checked_sub(target.node_id())?;
+        if target_span.saturating_mul(CURSOR_UPDATE_TARGET_SHARE) < root_span {
+            return None;
+        }
+    }
+    // Only a route that is about to run the filter needs to know it can run twice: the walks that
+    // tell are not paid by an update inside a loop over small records.
+    if !update_filter_is_repeatable(filter) {
+        return None;
+    }
+    // The whole-document copy checks every node of the target, at the depth the path puts it.
+    if !target.certified_well_formed(steps.len())
+        && to_owned_cursor_at_depth::<S, _, CheckOnly>(
+            &target,
+            None,
+            0,
+            steps.len(),
+            &nesting_depth_check,
+            &|_, _| None,
+            &[],
+        )
+        .is_err()
+    {
+        return None;
+    }
+    let mut first = None;
+    let mut outputs = 0usize;
+    let flow = each_first_generic::<S, V>(
+        filter,
+        target.value(),
+        false,
+        Some(target),
+        &mut |item: GenericItem<V>| {
+            outputs += 1;
+            if outputs == 1 {
+                first = Some(generic_item_into_owned::<V, S>(item));
+            }
+            Demand::Stop
+        },
+    );
+    if outputs != 1 || !matches!(flow, Flow::Stopped { pending: None }) {
+        return None;
+    }
+    let Some(Ok(new)) = first else {
+        return None;
+    };
+    // A malformed sibling is left to the whole-document copy, which raises its error.
+    let mut around = owned_around_target::<S, _>(root, &steps, &target, 0)
+        .ok()
+        .flatten()?;
+    let mut slot = &mut around;
+    for step in &steps {
+        slot = owned_slot_mut(step, slot)?; // patchcov: coverage tolerate-line reason="unreachable: the walk built a container of the kind each step names, with the target's slot in it"
+    }
+    *slot = new;
+    Some(around)
 }
 
 /// Convert a `QueryResult` produced by `eval.rs` into the generic
@@ -54465,6 +54800,426 @@ mod tests {
         // proved nothing.
         assert!(errs > 200, "too few failing documents: {errs}");
         assert!(collisions > 20, "too few collisions: {collisions}");
+    }
+
+    /// #6199: `update_on_cursor` answers what the whole-document route answers. Random documents,
+    /// some damaged, a static path walked down into each and a filter from a pool that includes the
+    /// ones that decline (empty, an error): whenever the cursor route answers, the whole-document
+    /// copy evaluated by the owned evaluator must yield exactly that one value.
+    #[test]
+    fn update_on_cursor_agrees_with_the_whole_document_route_6199() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self, n: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                (self.0 % n as u64) as usize
+            }
+        }
+        enum Node {
+            Scalar(&'static str),
+            Object(Vec<(&'static str, Self)>),
+            Array(Vec<Self>),
+        }
+        impl Node {
+            fn render(&self, out: &mut String) {
+                match self {
+                    Self::Scalar(text) => out.push_str(text),
+                    Self::Object(members) => {
+                        out.push('{');
+                        for (i, (key, value)) in members.iter().enumerate() {
+                            if i > 0 {
+                                out.push(',');
+                            }
+                            out.push_str(key);
+                            out.push(':');
+                            value.render(out);
+                        }
+                        out.push('}');
+                    }
+                    Self::Array(items) => {
+                        out.push('[');
+                        for (i, item) in items.iter().enumerate() {
+                            if i > 0 {
+                                out.push(',');
+                            }
+                            item.render(out);
+                        }
+                        out.push(']');
+                    }
+                }
+            }
+            fn size(&self) -> usize {
+                match self {
+                    Self::Scalar(_) => 1,
+                    Self::Object(m) => 1 + m.iter().map(|(_, v)| v.size()).sum::<usize>(),
+                    Self::Array(a) => 1 + a.iter().map(Self::size).sum::<usize>(),
+                }
+            }
+        }
+        // Each key is the text in the document and the name the path spells for it.
+        const KEYS: &[(&str, &str)] = &[
+            (r#""a""#, "a"),
+            (r#""b""#, "b"),
+            (r#""a""#, "a"),
+            (r#""k""#, "k"),
+            (r#""\u0061""#, "a"),
+            (r#""\u0062""#, "b"),
+            (r#""\u006b""#, "k"),
+        ];
+        const SCALARS: &[&str] = &[
+            "1",
+            "2.5",
+            "-0",
+            "1e999",
+            "null",
+            "true",
+            "false",
+            r#""s""#,
+            r#""\q""#,
+            "100000000000000000000000",
+        ];
+        fn gen(rng: &mut Rng, depth: usize) -> Node {
+            match if depth > 3 { 0 } else { rng.next(3) } {
+                0 => Node::Scalar(SCALARS[rng.next(SCALARS.len())]),
+                1 => Node::Object(
+                    (0..rng.next(5))
+                        .map(|_| (KEYS[rng.next(KEYS.len())].0, gen(rng, depth + 1)))
+                        .collect(),
+                ),
+                _ => Node::Array((0..rng.next(5)).map(|_| gen(rng, depth + 1)).collect()),
+            }
+        }
+        // A path down from `node`: at each container, the biggest child or a random one.
+        fn descend(rng: &mut Rng, node: &Node, path: &mut String) {
+            if rng.next(4) == 0 && !path.is_empty() {
+                return;
+            }
+            match node {
+                Node::Scalar(_) => {}
+                Node::Object(members) if !members.is_empty() => {
+                    let at = if rng.next(3) == 0 {
+                        rng.next(members.len())
+                    } else {
+                        (0..members.len())
+                            .max_by_key(|i| members[*i].1.size())
+                            .unwrap_or(0)
+                    };
+                    let name = KEYS
+                        .iter()
+                        .find(|k| k.0 == members[at].0)
+                        .map_or("a", |k| k.1);
+                    path.push('.');
+                    path.push_str(name);
+                    descend(rng, &members[at].1, path);
+                }
+                Node::Array(items) if !items.is_empty() => {
+                    let at = if rng.next(3) == 0 {
+                        rng.next(items.len())
+                    } else {
+                        (0..items.len())
+                            .max_by_key(|i| items[*i].size())
+                            .unwrap_or(0)
+                    };
+                    path.push_str(&format!(".[{at}]"));
+                    descend(rng, &items[at], path);
+                }
+                _ => {}
+            }
+        }
+        const DAMAGE: &[&str] = &[",", ":", "x", "{", "}", "[", "]", "\"", "\\", " "];
+        const FILTERS: &[&str] = &[
+            // The shapes the route takes.
+            "length",
+            "add",
+            "first",
+            "last",
+            ".[0]",
+            ".[1]",
+            ".[-1]",
+            ".[:2]",
+            ".[1:]",
+            "map(.a)",
+            "map(.a + 1)",
+            "map(.[0])",
+            "map(length)",
+            "(map(.a) | add)",
+            "(map(.a) | length)",
+            "limit(2; .[])",
+            "first(.[])",
+            "last(.[])",
+            "first(.[] | .a)",
+            "limit(2; .[]?)",
+            "limit(line; .[])",
+            "limit(1 | column; .[])",
+            // Shapes it leaves, and what it must hand back: nothing, an error, an error inside a
+            // lazy `map` under a truncating consumer, a `?//` retry, a position.
+            ".",
+            "empty",
+            "first(empty)",
+            "error(\"Ex\")",
+            "(1, error(\"Ex\"))",
+            "first(map(.a))",
+            "(map(.a) | first)",
+            "(map(.a) | .[0])",
+            "first(map(.a) | .[])",
+            "(map(.a + 1) | add)",
+            "first(1 as $x ?// $y | $x + 1)",
+            "limit(1; . as [$x] ?// $x | $x)",
+            "first(. as [$a] ?// {a: $b} | $a)",
+            "line",
+            "first(column)",
+            "first(at_offset(0))",
+            "input?",
+            "tojson",
+            "{x: .}",
+            "keys?",
+            "sort_by(.a)?",
+            "map(select(.a))?",
+            "map(.a += 1)?",
+        ];
+        fn route<C: DocumentCursor>(path: &Expr, filter: &Expr, cursor: &C) -> Option<OwnedValue> {
+            update_on_cursor_gated::<JqSemantics, C::Value>(path, filter, cursor, false)
+        }
+        // Whether the cursor route answered; it must then answer as the whole-document copy does.
+        fn compare(doc: &str, program: &str) -> bool {
+            let Ok(expr) = crate::jq::parser::parse(program) else {
+                return false;
+            };
+            let Expr::Update {
+                path: path_expr,
+                filter: filter_expr,
+            } = &expr
+            else {
+                return false;
+            };
+            let index = JsonIndex::build(doc.as_bytes());
+            let cursor = index.root(doc.as_bytes());
+            let fast = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                route(path_expr, filter_expr, &cursor)
+            }));
+            let whole = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let owned = to_owned_cursor::<JqSemantics, _>(&cursor)?;
+                let mut outs = Vec::new();
+                let flow = eval_each_owned::<JqSemantics>(
+                    &expr,
+                    &owned,
+                    false,
+                    Reentry::REBUILT,
+                    &mut |v| {
+                        outs.push(v);
+                        Demand::Continue
+                    },
+                );
+                Ok::<_, EvalError>((outs, matches!(flow, Flow::Exhausted)))
+            }));
+            let fast = match fast {
+                Ok(fast) => fast,
+                Err(_) => {
+                    assert!(
+                        whole.is_err(),
+                        "the cursor route panics alone on {program} over {doc}"
+                    );
+                    return false;
+                }
+            };
+            let Some(fast) = fast else { return false };
+            let (outs, exhausted) = whole
+                .unwrap_or_else(|_| {
+                    panic!("the whole-document route panics alone on {program} over {doc}")
+                })
+                .unwrap_or_else(|e| {
+                    panic!("the cursor route answers where the copy raises {e:?}: {program} over {doc}")
+                });
+            assert!(
+                exhausted && outs.len() == 1,
+                "{program} over {doc}: {} outputs",
+                outs.len()
+            );
+            assert_eq!(
+                fast.to_json_for_reindex::<JqSemantics>()
+                    .map_err(|e| e.message),
+                outs[0]
+                    .to_json_for_reindex::<JqSemantics>()
+                    .map_err(|e| e.message),
+                "{program} over {doc}"
+            );
+            true
+        }
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        let (mut taken, mut tried) = (0usize, 0usize);
+        for _ in 0..30000 {
+            let tree = gen(&mut rng, 0);
+            let mut doc = String::new();
+            tree.render(&mut doc);
+            let mut path = String::new();
+            descend(&mut rng, &tree, &mut path);
+            // A path that goes nowhere the document does, now and then.
+            if path.is_empty() || rng.next(12) == 0 {
+                path.push_str([".a", ".[0]", ".a.b", ".[1].a", ".[-1]"][rng.next(5)]);
+            }
+            if rng.next(5) == 0 {
+                let at = (0..=doc.len())
+                    .filter(|i| doc.is_char_boundary(*i))
+                    .nth(rng.next(doc.chars().count() + 1))
+                    .unwrap_or(0);
+                if rng.next(2) == 0 {
+                    doc.insert_str(at, DAMAGE[rng.next(DAMAGE.len())]);
+                } else if at < doc.len() {
+                    doc.remove(at);
+                }
+            }
+            let filter = FILTERS[rng.next(FILTERS.len())];
+            let program = format!("{path} |= {filter}");
+            tried += 1;
+            taken += usize::from(compare(&doc, &program));
+        }
+        let mut at_ceiling = 0usize;
+        // The nesting ceiling (256) counts from the document: a sibling or a target nested to
+        // within a few levels of it is refused by the copy, and the route must not read it.
+        for depth in 250..=258 {
+            let (open, close) = ("[".repeat(depth), "]".repeat(depth));
+            for doc in [
+                format!(r#"{{"a":[1,2],"z":{open}0{close}}}"#),
+                format!(r#"{{"a":{open}0{close},"z":1}}"#),
+                format!(r#"[{{"a":[1,2]}},{open}0{close}]"#),
+            ] {
+                for program in [".a |= length", ".a |= first", ".[0].a |= length"] {
+                    at_ceiling += usize::from(compare(&doc, program));
+                }
+            }
+        }
+        assert!(
+            at_ceiling > 0,
+            "no update at the nesting ceiling took the route"
+        );
+        // A document that is malformed outside the target is left to the copy to raise.
+        for doc in [
+            r#"{"a":[1,2],"z"}"#,
+            r#"{"a":[1,2],"z":}"#,
+            r#"{"a":[1,2] "z":1}"#,
+            r#"{"a":[1,2],"z":1,}"#,
+            r#"{"a":[1,2],"z":[1,,2]}"#,
+            r#"[[1,2],"\q"]"#,
+            r#"[[1,2],{"z":1},]"#,
+            r#"{"a":[1,2],"a":[3]}"#,
+        ] {
+            assert!(!compare(doc, ".a |= length"), "{doc}");
+            assert!(!compare(doc, ".[0] |= length"), "{doc}");
+        }
+        // The run must reach the route, or it proved nothing.
+        assert!(
+            taken > 300,
+            "too few updates took the cursor route: {taken} of {tried}"
+        );
+    }
+
+    /// #6199: only JSON text is certified by one scan; a format whose text is not canonical JSON
+    /// answers "not told", and the caller walks.
+    #[test]
+    fn a_yaml_cursor_certifies_nothing_by_scan_6199() {
+        use crate::yaml::YamlIndex;
+        let yaml = b"name: Alice\nage: 30";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+        assert!(!cursor.certified_well_formed(0));
+        assert!(!cursor.first_child().unwrap().certified_well_formed(3));
+    }
+
+    /// #6199: which updates take the cursor route is a decision about answers (a `map` under a
+    /// truncating consumer) and about cost (a filter that keeps the target, a small document), so
+    /// it is pinned: the shapes the route wins on take it, the others and the documents it would
+    /// lose on do not.
+    #[test]
+    fn update_on_cursor_takes_the_native_shapes_6199() {
+        fn takes<S: EvalSemantics>(doc: &str, program: &str) -> bool {
+            let Ok(Expr::Update { path, filter }) = crate::jq::parser::parse(program) else {
+                panic!("{program} is not an update");
+            };
+            let index = JsonIndex::build(doc.as_bytes());
+            let cursor = index.root(doc.as_bytes());
+            fn run<S: EvalSemantics, C: DocumentCursor>(p: &Expr, f: &Expr, c: &C) -> bool {
+                update_on_cursor::<S, C::Value>(p, f, c).is_some()
+            }
+            run::<S, _>(&path, &filter, &cursor)
+        }
+        // 30 000 records of 3 nodes: 90 000 nodes, over the floor of 65 536.
+        let records: Vec<String> = (1..=30_000)
+            .map(|i| format!(r#"{{"id":{i},"age":{}}}"#, i % 7 + 3))
+            .collect();
+        let users = format!(r#"{{"users":[{}],"n":7}}"#, records.join(","));
+        let users = users.as_str();
+        for program in [
+            ".users |= map(.age + 1)",
+            ".users |= map(.age)",
+            ".users |= length",
+            ".users |= .[:2]",
+            ".users |= .[0]",
+            ".users |= first",
+            ".users |= last",
+            ".users |= add",
+            ".users |= limit(2; .[])",
+            ".users |= first(.[])",
+            ".users |= (map(.age) | add)",
+            ".users |= (map(.age) | length)",
+            ".users |= (map(.age) | min)",
+            ".users |= (map(.age) | max)",
+            ".users |= map((.age))",
+            ".users |= map(.age | length)",
+            ".users |= map(.age * 2 + 1)",
+            ".users |= first((.[]))",
+            ".users |= (first)",
+        ] {
+            assert!(takes::<JqSemantics>(users, program), "{program}");
+        }
+        for program in [
+            // Keeps most of the target.
+            ".users |= .",
+            ".users |= sort_by(.age)",
+            ".users |= reverse",
+            ".users |= map(select(.age > 3))",
+            ".users |= map(.age += 1)",
+            ".users |= map(.)",
+            // A lazy `map` under a consumer that stops early raises nothing in the generic
+            // evaluator and the element's error in the copy.
+            ".users |= (map(.age) | first)",
+            ".users |= (map(.age) | .[0])",
+            ".users |= first(map(.age) | .[])",
+            ".users |= first(.[] | select(.age > 3))",
+            ".users |= first(1 as $x ?// $y | $x)",
+            // Cannot be run twice, or reads the position: the count of a `limit` is any
+            // expression, so a shape the route takes can still hold one.
+            ".users |= (debug | length)",
+            ".users |= input",
+            ".users |= first(line)",
+            ".users |= first(at_offset(0))",
+            ".users |= limit(1 | debug; .[])",
+            ".users |= limit(input; .[])",
+            ".users |= limit(line; .[])",
+            ".users |= limit(1 | halt_error; .[])",
+            // Nothing to keep, or an error.
+            ".users |= empty",
+            ".users |= error(\"x\")",
+            // A path that does not land, and a target that is a small part of the document.
+            ".nope |= length",
+            ".users[0] |= length",
+            ".n |= length",
+        ] {
+            assert!(!takes::<JqSemantics>(users, program), "{program}");
+        }
+        assert!(!takes::<YqSemantics>(users, ".users |= length"));
+        // A document below the floor is copied, whatever the update.
+        let small = r#"{"users":[1,2,3,4,5,6,7,8,9,10]}"#;
+        assert!(!takes::<JqSemantics>(small, ".users |= length"));
+        // A target that is less than half of the document is left to the plain read of all of it.
+        let big = (1..=40_000)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let wide = format!(r#"{{"big":[{big}],"small":[{big},{big},{big}]}}"#);
+        assert!(takes::<JqSemantics>(&wide, ".small |= length"));
+        assert!(!takes::<JqSemantics>(&wide, ".big |= length"));
     }
 
     /// #3909: the CLI's `LazySeq` printer takes the canonical echo scan's `Some`
