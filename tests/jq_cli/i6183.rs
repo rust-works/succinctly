@@ -80,10 +80,22 @@ fn a_paren_in_a_class_or_comment_does_not_end_the_wrapped_body_6183() -> Result<
             r#""aab" | [match("(?=[[:alpha:])](?i)a)aB";"g")|.string]"#,
             "[]",
         ),
+        (r#""]ab" | [match("(?=[]](?i)a)]aB";"g")|.string]"#, "[]"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!(stdout.trim_end(), expected, "{filter}: stderr={stderr:?}");
         assert_eq!(code, 0, "{filter}");
+    }
+    Ok(())
+}
+
+/// A lookahead that never closes is refused, as jq does, with or without an option run in it.
+#[test]
+fn an_unclosed_lookaround_is_still_refused_6183() -> Result<()> {
+    for filter in [r#""ab" | test("(?=a")"#, r#""ab" | test("(?<=a")"#] {
+        let (stdout, _stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout.trim_end(), "", "{filter}");
+        assert_ne!(code, 0, "{filter}");
     }
     Ok(())
 }
