@@ -5805,11 +5805,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         let trailing_is_seq_warning = trailing_error.as_ref().is_some_and(|t| t.seq_warning);
         // #6115: `--seq --stream` reads a fault as a record's end, and the main loop warns and goes
         // on to the next input.
-        let seq_stream_warns = args.seq
-            && args.stream
-            && !args.stream_errors
-            && !args.raw_input
-            && args.input_dsv.is_none();
+        let seq_stream_warns = seq_by_stream_reader(&args) && !args.stream_errors;
         if uses_input_builtins {
             // Seed `input`/`inputs`/`input_line_number`'s shared queue
             // (#723) with every document `get_inputs` just read -- under
@@ -6472,10 +6468,7 @@ fn get_inputs(
     let json_input_mode = args.input_dsv.is_none() && !args.raw_input && !args.seq;
     // #6115: `--seq` with `--stream` or `--stream-errors` reads with jq's streaming parser in its
     // record-sequence mode: the program reads the events a record produces, not its document.
-    let seq_by_stream_reader = args.seq
-        && !args.raw_input
-        && args.input_dsv.is_none()
-        && (args.stream || args.stream_errors);
+    let seq_by_stream_reader = seq_by_stream_reader(args);
     if json_input_mode || seq_by_stream_reader {
         // #5291: jq skips a BOM at the start of its input.
         strip_leading_json_bom(raw_bytes.iter_mut().map(|(_, raw)| raw));
@@ -6688,7 +6681,9 @@ fn get_inputs(
                 );
             } else if trailing_error.is_none() {
                 // The warning of a call after the slurped array: jq prints it once the program
-                // has run on the array, and has lost its position by then (#3201).
+                // has run on the array, and has lost its position by then (#3201). Only one can
+                // come after it: what follows the array is the events the last byte left pending
+                // and the one report of the EOF branch.
                 trailing_error = Some(TrailingParseError {
                     error: EvalError::new(fault.message),
                     source: NO_SOURCE,
@@ -7551,6 +7546,13 @@ fn stream_location(
         // (`--stream -s` over only a missing file is `[]`, #6006).
         (sources.get(source).and_then(|raw| raw.0).unwrap_or(0), line)
     }
+}
+
+/// Whether `--seq` is read by the streaming parser in its record-sequence mode (#6115): with
+/// `--stream` or `--stream-errors`, and not under `-R` or `--input-dsv`, which take over the input.
+/// One definition for the read in `get_inputs` and for the main loop that warns about its faults.
+fn seq_by_stream_reader(args: &JqCommand) -> bool {
+    args.seq && !args.raw_input && args.input_dsv.is_none() && (args.stream || args.stream_errors)
 }
 
 /// Whether `--stream -s` (#5498) is read by the stream reader: the array holds the events, and the

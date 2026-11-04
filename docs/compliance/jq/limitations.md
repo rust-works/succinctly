@@ -13871,6 +13871,8 @@ Two differences remain:
   Two differences remain, both shared with `--seq` over documents.
   A plain run prints its warnings before it evaluates anything, so a runtime error or `halt` on an earlier event comes after warnings jq would not have printed yet.
   And the end of the stream that jq's non-slurp rule draws on an empty record in the last read (#2998) ends the stream here for a program that calls `input`, where jq's main loop reads on after the call that met it and so also reads what follows: `printf '\x1e[1]\n\x1e[2' | jq -c --seq --stream '[inputs]'` prints `[[[0]]]` and then the warning `Unfinished JSON term at EOF`, where this prints only `[[[0]]]`.
+  What follows can also be a fault that a later `input` raises, so the difference can cost an error and an exit status (`jq -e` exits 5 where this exits 0), not only a warning ([#6141](https://github.com/rust-works/succinctly/issues/6141)).
+  The events of a `--seq --stream` run are read whole before the program starts, so memory grows with the input; the chunked reader that plain `--stream` uses (#5498) does not serve `--seq`.
 - **A file that does not open** and is named before one that does makes jq's `--stream` stop after the first event of the later file (`jq -c --stream . missing.json a.json` prints `[[0],1]` and the open error, exit 2), where succinctly prints every event.
   Both `-n` with `inputs` and a non-stream run agree with jq there, so the quirk is in jq's streaming parser's state after the failed open, not in what the program reads.
 

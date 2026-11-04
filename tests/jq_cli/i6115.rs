@@ -60,16 +60,19 @@ const ROWS: &[Row] = &[
 
 #[test]
 fn the_filter_reads_the_events_of_each_record_6115() -> Result<()> {
+    // Every row runs, and the ones that differ are reported together.
+    let mut mismatches = Vec::new();
     for (input, flags, program, want_out, want_err, want_code) in ROWS {
         let mut args: Vec<&str> = flags.to_vec();
         args.push(program);
         let (stdout, stderr, code) = run_jq_full(&args, Some(input))?;
-        assert_eq!(
-            (stdout.as_str(), stderr.as_str(), code),
-            (*want_out, *want_err, *want_code),
-            "{input:?} {flags:?} {program}"
-        );
+        if (stdout.as_str(), stderr.as_str(), code) != (*want_out, *want_err, *want_code) {
+            mismatches.push(format!(
+                "{input:?} {flags:?} {program}: got ({stdout:?}, {stderr:?}, {code}), want ({want_out:?}, {want_err:?}, {want_code})"
+            ));
+        }
     }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     Ok(())
 }
 
