@@ -7637,6 +7637,18 @@ These keep their loop as written, and still match longer than jq where the shape
 - **The `l` flag:** the longest match's span does not depend on the order the ways are tried in, and `fancy-regex`'s longest mode refuses the lazy repeat the rewrite writes.
 - **A pattern whose rewrite would grow past sixteen times its length and a kilobyte** (nested loops copy their bodies), or past the `regex` crate's size or nesting limit.
 
+## An alternation's branches share a prefix that can match more than one way (#6134)
+
+`regex-syntax` 0.8.11 factors a prefix that every branch of an alternation starts with out of it, `XA|XB` becoming `X(?:A|B)`, which changes the leftmost-first match when `X` can match more than one way ([rust-lang/regex#1400](https://github.com/rust-lang/regex/issues/1400)).
+`"aab" | match("a*a|a*b")` is `"aa"` in jq 1.7.1 (and in yq v4.53.3) and was `"aab"` here, and the lazy `"aab" | match("(?:a*a|a*b)+?")` went on to `"aab"` too.
+`fancy-regex` hands the alternations it does not run itself to the same constructor, so lookaround and backreference patterns matched the same way.
+Both modes now answer as the reference does.
+An alternation whose branches are all sequences holding a repeat or another alternation gets a first branch that never matches (`[^\s\S]`, with the first branch's leading and trailing assertions so that the alternation keeps its anchoring), and the factoring stops at it (`guard_prefix_lifting` in `src/jq/eval.rs`).
+A differential against jq 1.7.1 over 80,000 generated cases found 882 fixed, 182 still differing for other reasons, and 11 that agreed before and now differ.
+Each of the 11 is a loop whose body can match nothing and holds a capture group, the first bullet of [#6106](#a-loop-ends-at-an-iteration-that-matches-nothing-6106)'s list: the factoring had cancelled that difference out.
+
+A pattern whose guarded form the `regex` crate refuses for its size, where the pattern as written fits, compiles as written and keeps the factored match.
+
 ## `$` before a final newline (#5572)
 
 jq's `$` matches at the end of the text or just before a final `\n`, and the `regex` crate's does not, so a pattern with `$` is searched in the text and again in the text without its last `\n` (`dv_captures_at`).
