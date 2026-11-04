@@ -69,3 +69,33 @@ fn a_number_that_converts_keeps_the_format_error() -> Result<()> {
     );
     Ok(())
 }
+
+/// jq has no wording for a number that fails `localtime` either (it aborts on `jv_array_get`), so
+/// the local-zone builtin raises the same conversion error `strftime` does.
+#[test]
+fn strflocaltime_reports_the_conversion_of_a_number_that_fails() -> Result<()> {
+    for fmt in ["1", r#""%Y""#] {
+        assert_eq!(
+            caught(&format!("strflocaltime({fmt})"), "1e1000")?,
+            r#""error converting number of seconds since epoch to datetime""#,
+        );
+    }
+    Ok(())
+}
+
+/// Each format of a fan-out is tested on its own, and `?` and `try` swallow the fault.
+#[test]
+fn a_fan_out_of_formats_and_the_optional_forms() -> Result<()> {
+    assert_eq!(
+        caught("[strftime(1, null)?]", "[]")?,
+        "[]",
+        "`?` swallows the first fault"
+    );
+    let (out, code) = run_jq_stdin("[.[] | try strftime(1) catch .]", "[null,[],{}]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim_end(),
+        r#"["strftime/1 requires parsed datetime inputs","strftime/1 requires a string format","strftime/1 requires parsed datetime inputs"]"#
+    );
+    Ok(())
+}

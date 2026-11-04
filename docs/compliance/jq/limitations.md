@@ -10354,8 +10354,11 @@ succinctly raises a catchable error at exit 5 instead — the "would take the ho
 down" condition. The wording is succinctly's own (`expected string, got strflocaltime
 format`), since jq has none to match.
 That holds only for a number that converts (#6111).
-jq tests the input before it reads the format, so `null | strftime(1)` is `strftime/1 requires parsed datetime inputs`, `[] | strftime(1)` is `strftime/1 requires a string format`, and `1e1000 | strftime(1)` is the conversion error, and so are these here.
-`1e1000 | strflocaltime("%Y")` aborts jq on a second assertion (`jv_array_get`) and raises the conversion error here.
+jq tests the input before it reads the format.
+`null | strftime(1)` is `strftime/1 requires parsed datetime inputs` in both.
+`[] | strftime(1)` is `strftime/1 requires a string format` in both.
+`1e1000 | strftime(1)` is `error converting number of seconds since epoch to datetime` in both.
+`1e1000 | strflocaltime("%Y")` aborts jq on a second assertion (`jv_array_get`) and raises that conversion error here.
 
 `strflocaltime` uses the local zone `localtime` uses, so the two agree with each other
 ([#3054](https://github.com/rust-works/succinctly/issues/3054)). Both resolve `TZ` as an IANA

@@ -96614,6 +96614,13 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // only an array gets to `requires a string format`. A number that converts then
                 // meets a format `jv_string_value` aborts on (#3046), which raises here.
                 _ => {
+                    // `optional` is false from here on (the arm above took it), which the
+                    // `false` below relies on.
+                    if !matches!(value, StandardJson::Number(_)) {
+                        if let Some(e) = scalar_decode_failure(&value) {
+                            return QueryResult::Error(e);
+                        }
+                    }
                     return match &value {
                         StandardJson::Number(_) => {
                             match broken_down_time_fields::<W, S>(&value, false, local, false, name)
@@ -96629,7 +96636,7 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             QueryResult::Error(EvalError::requires_string_format(name))
                         }
                         _ => QueryResult::Error(EvalError::requires_parsed_datetime_inputs(name)),
-                    }
+                    };
                 }
             };
 
