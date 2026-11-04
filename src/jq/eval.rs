@@ -28501,6 +28501,179 @@ fn translate_posix_brackets(
     Ok(translated)
 }
 
+/// Pin each backreference to the case mode in force where it stands (#6196).
+///
+/// Oniguruma compares `\1` under the options at the backreference, not those the group matched
+/// under: `"aA" | test("((?i)a)\\1")` is `false` (the `(?i)` ended with its group) and
+/// `test("(?i)((?-i)a)\\1")` is `true`. The `fancy-regex` route, which a backreference takes, applies
+/// the option in force where the group ended, so each backreference is written as `(?i:\1)` or
+/// `(?-i:\1)`. `base_i` is the `i` modifier. `None` when the pattern holds no backreference or no
+/// inline `i` option (the case mode is then the modifier's everywhere), and for a pattern under the
+/// extended mode, whose comments the walk cannot see.
+#[cfg(feature = "regex")]
+fn pin_backreference_case(pattern: &str, base_i: bool) -> Option<String> {
+    if !pattern.contains("(?") || !pattern.contains('\\') || inline_extended(pattern) {
+        return None;
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::new();
+    // Whether `i` is on, for each open group.
+    let mut stack = vec![base_i];
+    let (mut saw_inline_i, mut wrapped) = (false, false);
+    // Open classes (the translation nests them), and whether the next char starts one.
+    let mut class_depth = 0usize;
+    let mut class_start = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            let next = chars.get(i + 1).copied();
+            // The extent of a backreference: `\1`, `\12`, `\k<n>`, `\k'n'`.
+            let end = match next {
+                Some('1'..='9') if class_depth == 0 => {
+                    let mut end = i + 2;
+                    while chars.get(end).is_some_and(char::is_ascii_digit) {
+                        end += 1;
+                    }
+                    Some(end)
+                }
+                Some('k') if class_depth == 0 => match chars.get(i + 2) {
+                    Some(&open @ ('<' | '\'')) => {
+                        let close = if open == '<' { '>' } else { '\'' };
+                        chars[i + 3..]
+                            .iter()
+                            .position(|&c| c == close)
+                            .map(|n| i + 3 + n + 1)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(end) = end {
+                let on = stack.last().copied().unwrap_or(base_i);
+                out.push_str(if on { "(?i:" } else { "(?-i:" });
+                out.extend(&chars[i..end]);
+                out.push(')');
+                wrapped = true;
+                i = end;
+                continue;
+            }
+            // `\Q...\E` quotes text, parentheses included.
+            if next == Some('Q') && class_depth == 0 {
+                let mut end = i + 2;
+                while end < chars.len() && !(chars[end] == '\\' && chars.get(end + 1) == Some(&'E'))
+                {
+                    end += 1;
+                }
+                let end = (end + 2).min(chars.len());
+                out.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
+            let end = (i + 2).min(chars.len());
+            out.extend(&chars[i..end]);
+            class_start = false;
+            i = end;
+            continue;
+        }
+        if class_depth > 0 {
+            match c {
+                '[' => {
+                    class_depth += 1;
+                    class_start = true;
+                    out.push(c);
+                    if chars.get(i + 1) == Some(&'^') {
+                        out.push('^');
+                        i += 1;
+                    }
+                }
+                ']' if !class_start => {
+                    class_depth -= 1;
+                    out.push(c);
+                }
+                _ => {
+                    class_start = false;
+                    out.push(c);
+                }
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '[' => {
+                class_depth = 1;
+                class_start = true;
+                out.push(c);
+                if chars.get(i + 1) == Some(&'^') {
+                    out.push('^');
+                    i += 1;
+                }
+                i += 1;
+            }
+            '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') => {
+                // A comment: a backslash escapes the next character, `)` included.
+                let mut end = i + 3;
+                while end < chars.len() && chars[end] != ')' {
+                    end += if chars[end] == '\\' { 2 } else { 1 };
+                }
+                let end = (end + 1).min(chars.len());
+                out.extend(&chars[i..end]);
+                i = end;
+            }
+            '(' => {
+                let outer = stack.last().copied().unwrap_or(base_i);
+                let mut inner = outer;
+                let mut closes = false;
+                let mut len = 1;
+                if chars.get(i + 1) == Some(&'?') {
+                    let run = &chars[i + 2..];
+                    let letters = run
+                        .iter()
+                        .take_while(|c| c.is_ascii_alphabetic() || **c == '-')
+                        .count();
+                    let after = run.get(letters).copied();
+                    if letters > 0 && matches!(after, Some(')' | ':')) {
+                        let mut on = true;
+                        for &f in &run[..letters] {
+                            match f {
+                                '-' => on = false,
+                                'i' => {
+                                    inner = on;
+                                    saw_inline_i = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        closes = after == Some(')');
+                        len = 2 + letters + 1;
+                    }
+                }
+                if closes {
+                    if let Some(top) = stack.last_mut() {
+                        *top = inner;
+                    }
+                } else {
+                    stack.push(inner);
+                }
+                out.extend(&chars[i..(i + len).min(chars.len())]);
+                i += len;
+            }
+            ')' => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+                out.push(c);
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    (wrapped && saw_inline_i).then_some(out)
+}
+
 /// Whether a repetition operator follows the comments that start at `at` (`(?#...)`, any number of
 /// them), as in `b(?#)(?#)*` (#6128).
 #[cfg(feature = "regex")]
@@ -30802,8 +30975,16 @@ fn build_regex_uncached<S: EvalSemantics>(
         };
         match translate_posix_brackets(&scanned, extended) {
             // #6108: a group repeated `{0}` keeps its capture slot.
-            Ok(translated) => keep_zero_count_groups(&translated, extended)
-                .unwrap_or_else(|| translated.into_owned()),
+            Ok(translated) => {
+                // #6196: each backreference carries the case mode in force where it stands.
+                let base_i = flags.is_some_and(|flags| flags.contains('i'));
+                let translated = match pin_backreference_case(&translated, base_i) {
+                    Some(pinned) => std::borrow::Cow::Owned(pinned),
+                    None => translated,
+                };
+                keep_zero_count_groups(&translated, extended)
+                    .unwrap_or_else(|| translated.into_owned())
+            }
             Err(refusal) => {
                 deferred_refusal.get_or_insert(refusal);
                 String::new()
