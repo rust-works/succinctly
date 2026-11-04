@@ -157,15 +157,6 @@ impl Emitter<'_> {
             | Ast::ClassUnicode(_)
             | Ast::ClassPerl(_)
             | Ast::ClassBracketed(_)
-                if projected =>
-            {
-                self.push(NEVER)
-            }
-            Ast::Literal(_)
-            | Ast::Dot(_)
-            | Ast::ClassUnicode(_)
-            | Ast::ClassPerl(_)
-            | Ast::ClassBracketed(_)
             | Ast::Assertion(_) => {
                 let text = String::from(self.text(ast.span()));
                 self.push(&text)

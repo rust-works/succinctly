@@ -131,3 +131,28 @@ fn capture_scan_and_sub_read_the_same_groups() -> Result<()> {
     }
     Ok(())
 }
+
+/// A loop nested in a rewritten body, a body whose repeat counts and groups decide whether it can
+/// match empty, and a flag group inside the repeat: the shapes the rewrite walks past without
+/// changing the answer jq gives.
+#[test]
+fn nested_and_counted_bodies_report_jqs_groups() -> Result<()> {
+    assert_rows(&[
+        ("abcabc", "((a|b*)*c)*", "", "[[0,6,[3,3,null],[5,0,null]]]"),
+        ("aabc", "((a+)|b)*c", "", "[[0,4,[2,1,null],[0,2,null]]]"),
+        ("aab", "(a{2})*b", "", "[[0,3,[0,2,null]]]"),
+        ("aabc", "(a{1,2}|b?)*c", "", "[[0,4,[3,0,null]]]"),
+        ("ab", "((a?)*)*b", "", "[[0,2,[1,0,null],[1,0,null]]]"),
+        ("abac", "((a)b?)*c", "", "[[0,4,[2,1,null],[2,1,null]]]"),
+        ("abcd", "((b|c*)|a)*d", "", "[[0,4,[3,0,null],[3,0,null]]]"),
+        ("AAb", "(((?i)a)*)*b", "", "[[0,3,[2,0,null],[1,1,null]]]"),
+        ("aAb", "((?i:a)*)*b", "", "[[0,3,[2,0,null]]]"),
+        ("abdcde", "(([ab]|c*)*d)*e", "", "[[0,6,[3,2,null],[4,0,null]]]"),
+        ("xabxby", "(x(a|b*)*)*y", "", "[[0,6,[3,2,null],[5,0,null]]]"),
+        ("abc", r"(((?:\b|a)|)b*)*c", "", "[[0,3,[2,0,null],[2,0,null]]]"),
+        ("aabc", r"(((?:\ba|a)|)b*)*c", "", "[[0,4,[3,0,null],[3,0,null]]]"),
+        ("aaab", "(a{2,}|)*b", "", "[[0,4,[3,0,null]]]"),
+        ("ab", r"((?:\b|a)|b?)*b", "", "[[0,2,[1,0,null]]]"),
+        ("abab", "((?:^|a)|b?)*b", "", "[[0,4,[3,0,null]]]"),
+    ])
+}
