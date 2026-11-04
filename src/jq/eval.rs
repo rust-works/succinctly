@@ -24234,12 +24234,12 @@ fn format_yq_csv<S: EvalSemantics>(value: &OwnedValue, comma: char) -> Result<St
             yq_csv_tag(v)
         ))
     }
-    fn record(out: &mut String, fields: &[String], comma: char) {
+    fn record<F: AsRef<str>>(out: &mut String, fields: &[F], comma: char) {
         for (i, field) in fields.iter().enumerate() {
             if i > 0 {
                 out.push(comma);
             }
-            out.push_str(&yq_csv_field(field, comma));
+            out.push_str(&yq_csv_field(field.as_ref(), comma));
         }
         out.push('\n');
     }
@@ -24257,11 +24257,7 @@ fn format_yq_csv<S: EvalSemantics>(value: &OwnedValue, comma: char) -> Result<St
         None => {}
         Some(OwnedValue::Object(header)) => {
             let keys: Vec<&String> = header.keys().collect();
-            record(
-                &mut out,
-                &keys.iter().map(|k| (*k).clone()).collect::<Vec<_>>(),
-                comma,
-            );
+            record(&mut out, &keys, comma);
             for (i, item) in items.iter().enumerate() {
                 let OwnedValue::Object(row) = item else {
                     return Err(EvalError::new(format!(

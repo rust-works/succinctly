@@ -9,6 +9,9 @@ use crate::{run_yq_stdin, run_yq_stdin_with_stderr};
 
 /// (document, filter, expected stdout).
 const ROWS: &[(&str, &str, &str)] = &[
+    ("[{a: 1}, {a: 3, b: [4]}]\n", "@csv", "\"a\\n1\\n3\"\n"),
+    ("[[\"a\"], [\"\"]]\n", "@csv", "\"a\"\n"),
+    ("[\"\\tx\", \"y\"]\n", "@tsv", "\"\\\"\\tx\\\"\\ty\"\n"),
     ("[1, a, b]\n", "@csv", "\"1,a,b\"\n"),
     ("[1, a, b]\n", "@tsv", "\"1\\ta\\tb\"\n"),
     (
