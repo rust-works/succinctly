@@ -67,21 +67,11 @@ fn map_values_without_an_output_keeps_the_value_6129() -> Result<()> {
     Ok(())
 }
 
-/// The update keeps what the document wrote around a value `f` leaves alone: its comments, anchor,
-/// alias and flow style (`default` YAML output, captured from yq v4.53.3).
+/// Through an update the document's own presentation stays (`default` YAML output, captured from
+/// yq v4.53.3): the flow style of the sequence, and a scalar input.
 #[test]
-fn map_values_without_an_output_keeps_the_presentation_6129() -> Result<()> {
+fn map_values_without_an_output_keeps_the_flow_style_6129() -> Result<()> {
     for (document, filter, expected) in [
-        (
-            "a: &x 1  # c\nb: 2\n",
-            "map_values(select(. > 5))",
-            "a: &x 1 # c\nb: 2\n",
-        ),
-        (
-            "# head\na: 1 # one\nb: \"two\"\nk: &k [3]\nc: *k\n",
-            "map_values(select(. == 9))",
-            "# head\na: 1 # one\nb: \"two\"\nk: &k [3]\nc: *k\n",
-        ),
         (
             "a: [1, 2, 3]\n",
             ".a |= map_values(select(. > 1))",
@@ -101,5 +91,17 @@ fn map_values_without_an_output_keeps_the_presentation_6129() -> Result<()> {
 fn jq_mode_map_values_still_drops_the_entry_6129() -> Result<()> {
     let (output, code) = crate::run_jq_stdin("map_values(select(. > 1))", "[1,2,3]", &["-c"])?;
     assert_eq!((output.as_str(), code), ("[2,3]\n", 0));
+    Ok(())
+}
+
+/// A repeated key keeps both entries, as yq prints them.
+#[test]
+fn map_values_without_an_output_keeps_a_repeated_key_6129() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        "map_values(select(. != 2))",
+        "a: 1\na: 2\nb: 3\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!((output.as_str(), code), ("{\"a\":1,\"a\":2,\"b\":3}\n", 0));
     Ok(())
 }

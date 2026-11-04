@@ -19774,7 +19774,10 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // is atomic in jq -- see `eval_object_construction` -- so a `Partial` surfaces its control).
             let rewrite =
                 |field_val: StandardJson<'a, W>| -> Result<Option<OwnedValue>, QueryResult<'a, W>> {
-                    Ok(
+                    // yq's `map_values(f)` is `.[] |= f`: an `f` with no output leaves the value
+                    // (#6129).
+                    let original = (S::TAG == EvalTag::Yq).then(|| field_val.clone());
+                    let rewritten = Ok(
                         match first_output_only::<W, S>(
                             eval_single::<W, S>(f, field_val, optional).materialize_cursor(),
                         ) {
@@ -19806,7 +19809,14 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 return Err(QueryResult::Halt(code));
                             }
                         },
-                    )
+                    );
+                    match (rewritten, original) {
+                        (Ok(None), Some(original)) => match to_owned::<S, _>(&original) {
+                            Ok(owned) => Ok(Some(owned)),
+                            Err(e) => Err(suppress_or_raise(e, optional)),
+                        },
+                        (rewritten, _) => rewritten,
+                    }
                 };
             if S::COLLAPSE_DUPLICATE_KEYS {
                 // `checked` is already collapsed: one pass, each key checked as it is inserted.
@@ -19909,6 +19919,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             let mut results: Vec<OwnedValue> = vec_with_capacity(cursors.len());
             for cursor in cursors {
+                let before = results.len();
                 // `cursor.value()` re-resolves `text_position()` a second
                 // time here -- the same known, documented, not-fixed-here
                 // cost `to_entries`'s own array arm carries (its own doc
@@ -19916,6 +19927,8 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // already resolved each element's position once internally
                 // to run its delimiter check, then discards it.
                 let elem = cursor.value();
+                // #6129: yq's `.[] |= f` leaves an element `f` has no output for.
+                let original = (S::TAG == EvalTag::Yq).then(|| elem.clone());
                 match first_output_only::<W, S>(
                     eval_single::<W, S>(f, elem, optional).materialize_cursor(),
                 ) {
@@ -19951,6 +19964,12 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                     QueryResult::Partial(_, Control::Halt(code)) => {
                         return QueryResult::Halt(code);
+                    }
+                }
+                if let (true, Some(original)) = (results.len() == before, original) {
+                    match to_owned::<S, _>(&original) {
+                        Ok(owned) => results.push(owned),
+                        Err(e) => return suppress_or_raise(e, optional),
                     }
                 }
             }

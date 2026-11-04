@@ -4604,19 +4604,7 @@ impl<'a> Parser<'a> {
                                 if shadow_candidate {
                                     Expr::Builtin(builtin)
                                 } else {
-                                    match builtin {
-                                        // yq's `map_values(f)` is `.[] |= f` (#6129): an `f` that
-                                        // yields nothing leaves the value, where jq's deletes it.
-                                        Builtin::MapValues(filter)
-                                            if self.mode == ParserMode::Yq =>
-                                        {
-                                            Expr::Update {
-                                                path: Box::new(Expr::Iterate),
-                                                filter,
-                                            }
-                                        }
-                                        builtin => bind_retrying_value_arg(builtin),
-                                    }
+                                    bind_retrying_value_arg(builtin)
                                 },
                             )
                         }
