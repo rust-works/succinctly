@@ -15621,8 +15621,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         | Expr::AlternativeAssign { .. }
         | Expr::Update { .. }
             if cursor.is_some()
-                && needs_path_context(expr)
-                && owned_identity_pipe_supported(core::slice::from_ref(expr)) =>
+                && ((needs_path_context(expr)
+                    && owned_identity_pipe_supported(core::slice::from_ref(expr)))
+                    || owned_update_skips_bridge::<S>(expr)) =>
         {
             collect_each_generic::<S, V>(expr, value, optional, cursor)
         }
@@ -16394,8 +16395,9 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         | Expr::AlternativeAssign { .. }
         | Expr::Update { .. }
             if cursor.is_some()
-                && needs_path_context(expr)
-                && owned_identity_pipe_supported(core::slice::from_ref(expr)) =>
+                && ((needs_path_context(expr)
+                    && owned_identity_pipe_supported(core::slice::from_ref(expr)))
+                    || owned_update_skips_bridge::<S>(expr)) =>
         {
             eval_positioned_stage_generic::<S, V>(expr, cursor.expect("guarded"), optional, sink)
         }
@@ -38226,6 +38228,46 @@ fn owned_identity_body_stages(body: &Expr) -> &[Expr] {
         Expr::Pipe(stages) => stages,
         other => core::slice::from_ref(other),
     }
+}
+
+/// Whether `expr` is a `|=` update the owned identity pipe runs instead of the wildcard bridge
+/// although it reads no path context (#6122).
+///
+/// The bridge turns the ambient value into an owned copy, writes that copy out as text and
+/// indexes the text again, to give the full evaluator a cursor; the update then reads the value
+/// back out of that index. The owned identity pipe ([`eval_positioned_stage_generic`]) runs the
+/// same update on the one owned copy, so `.users |= map(.age)` on a 74 MB document no longer
+/// materializes it twice (0.62x of jq 1.7.1 before).
+///
+/// Only jq mode and only an update with no variable or call in it: the bridge registers
+/// provenance for the text it writes ([`EvalSemantics::REINDEX_BRIDGE_KEEPS_IDENTITY`], #3069) so
+/// that a bound variable stays identical to the node it names (#2642, #3037), which the owned
+/// route reaches through the identity it carries and not through that registration. A program
+/// with nothing to bind has no identity to keep. yq mode keeps its bridge, whose index carries
+/// the document's styles and comments.
+fn owned_update_skips_bridge<S: EvalSemantics>(expr: &Expr) -> bool {
+    S::TAG == EvalTag::Jq
+        && matches!(expr, Expr::Update { .. })
+        && !needs_path_context(expr)
+        && !crate::jq::walk::any_subexpr(expr, &mut |e| {
+            matches!(
+                e,
+                Expr::Var(_)
+                    | Expr::TrackedVar(_)
+                    | Expr::FuncCall { .. }
+                    | Expr::NamespacedCall { .. }
+                    | Expr::DefCall { .. }
+                    | Expr::FuncDef { .. }
+                    | Expr::Shared(_)
+                    | Expr::As { .. }
+                    | Expr::AsPattern { .. }
+                    | Expr::Reduce { .. }
+                    | Expr::Foreach { .. }
+                    | Expr::Label { .. }
+                    | Expr::Break(_)
+            )
+        })
+        && owned_identity_pipe_supported(core::slice::from_ref(expr))
 }
 
 /// The static gate for the owned identity pipe: every stage of `stages` is
