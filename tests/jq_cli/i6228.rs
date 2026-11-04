@@ -23,7 +23,12 @@ fn test_block_names_read_as_their_code_points_6228() -> Result<()> {
         (r#""a\u00e9""#, r"\P{^In_Basic_Latin}", "", "[true,false]"),
         (r#""a\u00e9""#, r"\p{In basic-LATIN}", "", "[true,false]"),
         (r#""a\u00e9""#, r"\p{IN_BASICLATIN}", "", "[true,false]"),
-        (r#""a\u00e9""#, r"\p{in latin_1 SUPPLEMENT}", "", "[false,true]"),
+        (
+            r#""a\u00e9""#,
+            r"\p{in latin_1 SUPPLEMENT}",
+            "",
+            "[false,true]",
+        ),
         (
             r#""λxж""#,
             r"[\p{In_Greek_and_Coptic}x]",
@@ -59,7 +64,12 @@ fn test_block_names_read_as_their_code_points_6228() -> Result<()> {
         // Outside a class a property is not case-folded, inside one it is.
         (r#""\u212a""#, r"\p{In_Basic_Latin}", "i", "[false]"),
         (r#""K""#, r"[\p{In_Letterlike_Symbols}]", "i", "[true]"),
-        (r#""\u00ff""#, r"[^\P{In_Latin_1_Supplement}]", "i", "[false]"),
+        (
+            r#""\u00ff""#,
+            r"[^\P{In_Latin_1_Supplement}]",
+            "i",
+            "[false]",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", &filter(text, pattern, flags)], None)?;
         assert_eq!(
