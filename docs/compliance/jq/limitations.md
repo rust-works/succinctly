@@ -9409,6 +9409,14 @@ $ printf '\x1e"a"\n\x1e"b"\n' | jq --seq -c '.'   # "a" and "b" -- trailing newl
 All three now match (`succinctly jq` reproduces every row above, including `-s`); before
 #2998 `succinctly jq` also printed `"b"` on the middle row.
 
+### Past the end of a `--seq` stream, `input` names the plain-JSON position (#6146)
+
+Without `-s`, an `input` that runs past the end of a `--seq` stream names its source by the rule plain JSON follows (#4303).
+The position is `<unknown>` when the read that reached the end of input completed the stream's last value, and the last source's newline count otherwise, a stream with no value at all included.
+The values are the ones the `--seq` reader yields, and a string or container completes on its closing byte, a number or literal on the byte after it.
+`scripts/jq-seq-eof-position-sweep.py SUBJECT` sweeps 4,662 streams against jq (not part of the CI gate).
+It leaves 30 differences, all streams that end in a fault after their last value (`\x1e[1]1`), which are #6137's family and not placed by this rule.
+
 ### `--seq -s` keeps its EOF location when the final byte completes a value (#3003)
 
 The same per-call local decides whether a runtime error under `--seq -s` can still name a

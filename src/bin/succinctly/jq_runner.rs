@@ -7018,6 +7018,14 @@ fn get_inputs(
         );
         if !args.slurp {
             debug_assert_eq!(locations.len(), values.len(), "one location per value");
+            // #6146: where an `input` that runs past the end of the stream names its source. jq's
+            // rule is the one for plain JSON (#4303), with the values the `--seq` reader yielded:
+            // the position is lost when the read that reached the end of input completed the
+            // stream's last value, and is the last source's newline count otherwise, a stream
+            // with no value at all included.
+            if track_eof {
+                locations.eof_tail = Some(seq_eof_tail(&seq_raw, &seq_values));
+            }
         }
     } else if args.raw_input && args.input_dsv.is_none() {
         // Never reached with `args.slurp`: `-R -s` without `--input-dsv`
@@ -7398,9 +7406,10 @@ fn get_inputs(
 
     // #5661: a lazy candidate's tail is set on whichever route took the stream, as every other
     // stream's is above.
+    // #6146: a `--seq` stream's is recorded from its own reader's values (`seq_eof_tail`).
     debug_assert_eq!(
         locations.eof_tail.is_some(),
-        records_eof,
+        records_eof || (track_eof && !args.slurp && seq_stream_shape),
         "the end of stream is recorded where it can be read"
     );
 
@@ -7781,6 +7790,36 @@ impl EofTail {
             .is_some_and(|&(start, end)| {
                 end == bytes.len() && !matches!(bytes[start], b'"' | b'[' | b'{')
             })
+    }
+}
+
+/// How a `--seq` stream ends for an `input` that runs past it (#6146): [`EofTail`]'s rule over the
+/// values the `--seq` reader yielded (`ranges`, offsets into the concatenation of `sources`).
+fn seq_eof_tail(sources: &[(Option<usize>, Vec<u8>)], ranges: &[(usize, usize)]) -> EofTail {
+    let Some((_, last)) = sources.last() else {
+        return EofTail {
+            newlines: 0,
+            unknown: false,
+        };
+    };
+    let total: usize = sources.iter().map(|(_, raw)| raw.len()).sum();
+    let last_starts = total - last.len();
+    let unknown = ranges.last().is_some_and(|&(start, end)| {
+        let combined: std::borrow::Cow<'_, [u8]> = match sources {
+            [(_, only)] => std::borrow::Cow::Borrowed(only),
+            _ => std::borrow::Cow::Owned(
+                sources
+                    .iter()
+                    .flat_map(|(_, raw)| raw.iter().copied())
+                    .collect(),
+            ),
+        };
+        EofTail::completes_at(&combined, start, end)
+            >= last_starts + EofTail::final_read_start(last, 0)
+    });
+    EofTail {
+        newlines: u32::try_from(count_newlines(last)).unwrap_or(u32::MAX),
+        unknown,
     }
 }
 
