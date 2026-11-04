@@ -752,6 +752,29 @@ def measure_query(valgrind_bin, binary, mode, flags, filter_expr, fixture_path, 
     return round(statistics.median(counts))
 
 
+# #6153: where the scratch directory of a measurement lives. Not `$TMPDIR`: the length of the path a
+# binary is started from moves some rows' instruction counts (see `measured_path`), so it has to be
+# the same on every machine. `/tmp/tmpXXXXXXXX/bin/succinctly` is 31 characters.
+SCRATCH_ROOT = "/tmp" if os.path.isdir("/tmp") else None
+
+# The lengths of the started path that read 956.33M on `arrays_map_iterate` where 900.79M is the
+# other answer (ubuntu-26.04, glibc 2.43, valgrind 3.26): 36 to 51 characters. `measured_path` stays
+# out of it, and the self-tests pin that.
+SLOW_PATH_LENGTHS = range(36, 52)
+
+
+def measured_path(tmp, binary):
+    """The path `binary` is started from under valgrind (#6153): a symlink to it named
+    `<tmp>/bin/succinctly`, so every binary the guard measures, in any run, is started from a path
+    of one length however its caller spelled it. The instruction count of a row can depend on that
+    length; docs/guides/benchmarking.md has the sweep and the rows it moved."""
+    bin_dir = os.path.join(tmp, "bin")
+    os.makedirs(bin_dir)
+    path = os.path.join(bin_dir, "succinctly")
+    os.symlink(os.path.abspath(binary), path)
+    return path
+
+
 def measure_all(binary, valgrind_bin, reps, label="binary"):
     """Generate each distinct (pattern, size) fixture exactly once -- several
     `QUERIES` rows share one, and regenerating an identical file per row
@@ -759,7 +782,7 @@ def measure_all(binary, valgrind_bin, reps, label="binary"):
     Returns {query_id: median instruction count}. `label` only affects the
     printed header, distinguishing this run's output in CI logs when
     `measure_all` is called twice (current binary, then --baseline-binary)."""
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as tmp:
         fixture_paths = {}
         for _, pattern, size, _, _ in QUERIES:
             shape = (pattern, size)
@@ -811,6 +834,10 @@ def measure_all(binary, valgrind_bin, reps, label="binary"):
         generate_mid_width_fixture(mid_width_path)
         derived_fixture_paths[MID_WIDTH_ROW] = mid_width_path
 
+        # What valgrind starts, and so what `argv[0]` is: see `measured_path`. The fixtures above
+        # are still written by `binary` itself, from wherever the caller put it.
+        run_binary = measured_path(tmp, binary)
+
         measured = {}
         print(f"Measuring {label} ({binary}):")
         print(f"{'query':<26} {'instructions':>16}")
@@ -820,7 +847,7 @@ def measure_all(binary, valgrind_bin, reps, label="binary"):
             # default eagerly, and a derived row has no generated fixture.
             fixture_path = derived_fixture_paths.get(query_id) or fixture_paths[(pattern, size)]
             flags = QUERY_FLAGS.get(query_id, [])
-            ir = measure_query(valgrind_bin, binary, mode, flags, filter_expr, fixture_path, reps)
+            ir = measure_query(valgrind_bin, run_binary, mode, flags, filter_expr, fixture_path, reps)
             measured[query_id] = ir
             print(f"{query_id:<26} {ir:>16,.0f}")
             sys.stdout.flush()
