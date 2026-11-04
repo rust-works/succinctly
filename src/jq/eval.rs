@@ -29794,7 +29794,7 @@ fn interval_quantifier_at(chars: &[char], at: usize) -> Option<(usize, bool)> {
 /// the atomic group of its atom and quantifier (`a*+b` as `(?>a*)b`, #6172), which the crate
 /// refuses and the second engine reads as jq does.
 /// The scan finds where the atom starts (a group's `(`, a class's `[`, an escape, a character);
-/// one it cannot place (a quoted run, a back-reference, a group of flags) keeps the refusal,
+/// one it cannot place (a quoted run, an escape it does not size, a group of flags) keeps the refusal,
 /// and so does a pattern holding a lazy quantifier followed by `+`, which the second engine
 /// reads otherwise.
 /// The exception is a quantifier that ends the pattern, or ends it but for closing parentheses

@@ -7437,7 +7437,7 @@ The `regex` crate reads the same text as a quantifier on a quantifier, `(a*)+`, 
 Since #6172 the quantifier is written as the atomic group of its atom and quantifier, `a*+a` as `(?>a*)a`, which the crate refuses and the second engine (`fancy-regex`, below) reads as jq does.
 That includes a repeat after the possessive quantifier (`a?+*`, `a*+*`, `a?+{2}`, `(?:a*+b)*+`), which `fancy-regex` cannot read written out, and an interval (`a{1,2}+*`), which it would read as a repeat of a repeat.
 The scan finds where the atom starts: a group's `(`, a class's `[`, an escape, a character.
-Where it cannot place one, the pattern is refused as before, with `invalid regex: regex parse error: possessive quantifier is not supported` (exit 5): a quantifier on a quoted run (`\Qab\E*+c`), after a back-reference (`(a)\1*+c`) or a named one, or on a group of flags (`(?i)*+c`).
+Where it cannot place one, the pattern is refused as before, with `invalid regex: regex parse error: possessive quantifier is not supported` (exit 5): a quantifier on a quoted run (`\Qab\E*+c`), after an escape the scan does not size (`\C-a`), or on a group of flags (`(?i)*+c`), and any pattern with an inline `(?x)`, whose blanks the scan does not model.
 So is a pattern that also holds a lazy quantifier followed by `+` (`c?+a+?+`): jq reads that as a repeat of a repeat, and the second engine reads it otherwise.
 A repeat of a repeat that the second engine refuses (`a**+b`, `a{2}+++a`) is an error from it, not a wrong answer.
 As the last character of the pattern, or followed only by closing parentheses (`(?:a++)`), nothing after it can fail, so it is rewritten to the plain quantifier instead (`sub("a*+";"X")`, `gsub("a++";"X")`), and stays on the first engine.
