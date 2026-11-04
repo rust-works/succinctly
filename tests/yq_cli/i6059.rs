@@ -58,3 +58,25 @@ fn a_tab_deeper_than_the_block_indent_or_outside_a_plain_scalar_is_read_6059() -
     }
     Ok(())
 }
+
+/// The check looks at a bounded number of lines per break: a run of blank lines inside a flow
+/// scalar (100,000 of them, 0.01 s) was quadratic in a first version of the check.
+#[test]
+fn a_long_run_of_blank_lines_in_a_flow_scalar_stays_linear_6059() -> Result<()> {
+    let input = format!("a:\n  b: [x{} y]\n", "\n".repeat(100_000));
+    let (out, code) = run_yq_stdin(".a.b[0] | length", &input, &["-o=json", "-I=0"])?;
+    assert_eq!((out.trim_end(), code), ("100001", 0));
+    Ok(())
+}
+
+/// A tab on the line after a run of blank lines is still refused.
+#[test]
+fn a_tab_after_a_run_of_blank_lines_is_still_refused_6059() -> Result<()> {
+    for blanks in [1, 2, 3, 7] {
+        let input = format!("a:\n  b: [x{}\ty]\n", "\n".repeat(blanks));
+        let (out, code) = run_yq_stdin(".", &input, &["-o=json", "-I=0"])?;
+        assert_eq!(out.trim_end(), "", "{blanks} blank lines");
+        assert_ne!(code, 0, "{blanks} blank lines");
+    }
+    Ok(())
+}

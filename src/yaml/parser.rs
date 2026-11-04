@@ -7340,25 +7340,26 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return Ok(());
         }
         let limit = self.innermost_block_indent();
+        // The line after the break, and the one after it when that one is empty: the scanners skip an
+        // empty line's break along with the previous one, so its successor is never a break they stop
+        // at. Every other blank line is a break of its own, which checks its successor in turn.
         let mut line = break_pos;
-        // Each line after the break, through the blank ones: go-yaml checks every tab in the run.
-        while is_line_break(self.input.get(line).copied().unwrap_or(0)) {
-            let mut at = line + self.break_len_at(line);
-            let mut column = 0;
+        for _ in 0..2 {
+            if !is_line_break(self.input.get(line).copied().unwrap_or(0)) {
+                break;
+            }
+            let start = line + self.break_len_at(line);
+            let mut at = start;
             while self.input.get(at) == Some(&b' ') {
                 at += 1;
-                column += 1;
             }
-            if self.input.get(at) == Some(&b'\t') && column <= limit {
+            if self.input.get(at) == Some(&b'\t') && at - start <= limit {
                 return Err(YamlError::TabIndentation {
                     line: self.current_line(),
                     offset: at,
                 });
             }
-            while matches!(self.input.get(at), Some(b' ' | b'\t')) {
-                at += 1;
-            }
-            line = at;
+            line = start;
         }
         Ok(())
     }
