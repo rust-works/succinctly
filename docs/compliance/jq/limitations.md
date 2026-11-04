@@ -9506,8 +9506,10 @@ warning after evaluating the values read before it, so a runtime error on an ear
 comes first, and `halt` suppresses the warnings after it. jq's `input`/`inputs` read each
 warning as an error instead, and `succinctly jq` raises them the same way since #5640, at the
 position jq names (see the `-n` paragraph below): behind the values before it, with the reads
-after it resuming, and under `-s` before the slurped array. A plain run prints all the
-warnings up front, before any of that can happen.
+after it resuming, and under `-s` before the slurped array.
+A program that reads `input`/`inputs` without `-n` or `-s` gets the same since [#6137](https://github.com/rust-works/succinctly/issues/6137), so the records after a fault pair with the main loop as in jq, and the main loop prints a warning the program did not read when it reaches it, after the values before it.
+The reader's message-less return (#5662) ends that main loop as it ends jq's, so the values behind it reach only `input`.
+Any other program without `-s` prints all the warnings up front, before any of that can happen.
 
 The differential guard remains deliberately asymmetric: **0 stdout supersets** across the
 randomized corpus. A fabricated value is a correctness failure even where an unrelated jq
