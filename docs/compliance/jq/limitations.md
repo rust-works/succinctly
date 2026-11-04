@@ -7569,13 +7569,27 @@ jq also ends a cluster after 4095 code points of extending marks, which this doe
 A very long cluster (tens of thousands of marks) followed by a pattern that fails after `\X` is quadratic here, as the same shape is for any atomic group on the second engine.
 Pinned by `tests/jq_cli/i6220.rs`.
 
-### Multi-character case folding is not read under the `i` flag ([#6225](https://github.com/rust-works/succinctly/issues/6225))
+### Oniguruma's multi-character case folding is written into the pattern (#6225)
 
-Oniguruma folds case with the full Unicode table, where the `regex` crate (and `fancy-regex`) fold one character to one.
-Under `i`, jq reads `ß` as also `ss`, `ss` as also `ß` and `ẞ`, `ﬁ` as `fi`, `ﬀ` as `ff`, in a literal and in a class that holds the character: `"STRASSE" | match("ß";"i")` is `[4,2]` in jq and empty here, `"Straße" | match("ss";"i")` is `[4,1]` there and empty here, `"fi" | test("ﬁ";"i")` is `true` there and `false` here.
-`s+` and `[s]` do not match `ß` in jq either, so the fold is that of a literal string or of a class holding the folding character, not of every `s`.
-One-to-one folds (`K` and the Kelvin sign, `σ`, `ς` and `Σ`, `ǅ`, `ǆ` and `Ǆ`, `µ` and `μ`) agree.
-It is not reproduced: no dependency reads the full fold table, and a rewrite of literals under `i` needs the whole `CaseFolding.txt` `F` list captured against jq first (#6225).
+Under the `i` option Oniguruma folds with all of `CaseFolding.txt`, including the entries that fold one character to two or three: `ß` is `ss`, `ﬁ` is `fi`, `ﬃ` is `ffi`, `ŉ` is `ʼn`, and the Greek letters with an iota subscript are two letters.
+The `regex` crate folds one character to one, so `"SS" | test("ß";"i")` was `false` where jq answers `true`.
+`build_regex_uncached` now rewrites the pattern (`src/jq/onig_fold.rs`) to the expansion Oniguruma makes of it, a port of `unravel_case_fold_string` and `get_case_fold_codes_by_str` over the library's own tables (`scripts/gen_onig_fold_data.py`, Oniguruma v6.9.8, Unicode 14).
+The rules are Oniguruma's, not "the folded text is equal":
+
+- A string is the literals with nothing between them but a non-capturing group that is not repeated, a comment, a blank under `x`, or an option that leaves `i` as it was; `{1}` repeats nothing and does not end it.
+  A quantifier takes the last character off its string, so `ß+` repeats `ß` and `ss+` has no pair.
+- The string is walked from the left, and the library asks for the longest fold that starts at each place: three characters, then two, then the character alone (which expands only if it is itself a character that folds to several).
+  The alternation covers exactly the characters it read, and the walk goes on after them, so `sss` is `ss` then `s`: it matches `"ßs"` and not `"sß"`, and `ffi` is a three-character fold, so it matches `"ﬃ"` and not `"ﬀi"`.
+- A bracketed class that holds a character folding to several gains an alternative that spells the fold (`[ß]` matches `"ss"`), whether it holds the character as a literal, in a range (`[ß-ÿ]`) or in a property (`[\w]`, which gains one alternative per fold, about a hundred); a negated class and a class of other characters do not.
+- A look-behind expands one character at a time in the library, so nothing is added there.
+- `{1}`, a comment and a blank are not part of a string, and `\x73`, `\x{DF}` and `\Q..\E` are literals.
+
+The alternatives are checked against jq 1.7.1 over 40,000 random patterns and subjects built from the folding characters, with every difference explained below, and pinned by `tests/jq_cli/i6225.rs`.
+Left as they were:
+
+- A pattern neither `regex-syntax` nor the Oniguruma-only shadow parse (a conditional group, a call) is not rewritten, so it keeps the one-to-one folding.
+- jq reports a look-behind that holds a multibyte character as an empty match at a later offset *and* one that starts before the search did (`"ßß" | [match("(?<=ß)";"g")|[.offset,.length]]` is `[[1,0],[0,2],[2,0]]`), with or without `i`; that is a separate difference from this one, and the empty matches are left out of the comparison.
+- The Turkish and Azeri folding Oniguruma has behind a locale option is not reachable from jq, and is not read.
 
 ### A group repeated `{0}` keeps its capture entry (#6108)
 

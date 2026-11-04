@@ -100,6 +100,10 @@ mod math;
 #[cfg(feature = "regex")]
 mod onig_capture_loop;
 #[cfg(feature = "regex")]
+mod onig_fold;
+#[cfg(feature = "regex")]
+mod onig_fold_data;
+#[cfg(feature = "regex")]
 mod onig_loop;
 mod parse_message;
 mod parser;

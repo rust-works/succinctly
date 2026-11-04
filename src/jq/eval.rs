@@ -31610,9 +31610,18 @@ fn build_regex_uncached<S: EvalSemantics>(
     // lazy repeat the rewrite writes, which would leave `l` a no-op. The pattern as written is kept
     // for when the copies the rewrite makes outgrow an engine's size or nesting limit.
     let mut as_written = None;
+    // #6225: Oniguruma's multi-character case folding (`ß` is `ss`) is written into the pattern as
+    // the alternation it expands to. It comes first, so that the loop rewrite reads the pattern it
+    // will run, and the pattern as written is the user's.
+    if S::TAG != EvalTag::Yq {
+        if let Some(folded) = super::onig_fold::rewrite(&pattern) {
+            as_written = Some(core::mem::replace(&mut pattern, folded));
+        }
+    }
     if S::TAG != EvalTag::Yq && !longest {
         if let Some(rewritten) = super::onig_loop::rewrite(&pattern) {
-            as_written = Some(core::mem::replace(&mut pattern, rewritten));
+            let before = core::mem::replace(&mut pattern, rewritten);
+            as_written.get_or_insert(before);
         }
     }
 
