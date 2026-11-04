@@ -49,3 +49,26 @@ fn an_integer_index_past_a_sequence_is_still_null_6155() -> Result<()> {
     assert_eq!(code, 1);
     Ok(())
 }
+
+/// A computed index misses the same way, and a member whose key is the index is found.
+#[test]
+fn a_computed_index_and_a_member_named_by_the_index_read_as_in_yq_6155() -> Result<()> {
+    for (document, filter, expected) in [
+        ("a: 1\nb: 2\n", "0 as $i | .a + .[$i]", "1\n"),
+        ("a: 1\nb: 2\n", ".a + .[1+1]", "1\n"),
+        ("a: 1\nb: 2\n\"0\": 7\n", "0 as $i | .a + .[$i]", "8\n"),
+        (
+            "a: 1\nb: 2\n\"0\": 7\n",
+            ".x = .[0] + 1",
+            "{\"a\":1,\"b\":2,\"0\":7,\"x\":8}\n",
+        ),
+    ] {
+        let (output, code) = run_yq_stdin(filter, document, &["-o=json", "-I=0"])?;
+        assert_eq!(
+            (output.as_str(), code),
+            (expected, 0),
+            "`{filter}` over {document:?}"
+        );
+    }
+    Ok(())
+}

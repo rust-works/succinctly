@@ -33827,8 +33827,8 @@ fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Some(e) => QueryResult::Error(e),
             None => QueryResult::One(StandardJson::Null),
         },
-        // (#4079: the callers that know the literal's spelling look the member up first.)
-        // #6155: a key that misses finds no node under yq's read-only rule.
+        // #6155: a key that misses finds no node under yq's read-only rule. (#4079: the callers
+        // that know the literal's spelling look the member up first.)
         StandardJson::Object(_)
             if yq_numeric_index_on_object_is_null::<S>() && yq_absent_key_read_is_empty::<S>() =>
         {
