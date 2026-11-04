@@ -7519,6 +7519,12 @@ Every row was captured from jq 1.7.1.
 - **`\0` and a number that is no backreference are octal** (`\101` is `A`, `\012` a newline).
   `\1`..`\9` are always backreferences, a larger number only up to the groups opened so far, as in Oniguruma's tokenizer.
   A backreference to a group the pattern does not have is jq's `invalid backref number/name`.
+- **A backreference compares under the case mode in force where it stands** (#6196), not the one its group matched under.
+  `"aA" | test("((?i)a)\\1")` is `false` in jq, because the `(?i)` ended with its group, and `test("(?i)((?-i)a)\\1")` is `true`.
+  `fancy-regex` applied the mode in force where the group ended, so a pattern with a backreference and an inline `i` option writes each backreference as `(?i:\1)` or `(?-i:\1)` for the mode at its position (`\k<name>` too), tracking `(?i)`, `(?-i)`, `(?i:...)` and the end of each group.
+  The `x` modifier's `#` comments are skipped; a pattern with an inline `(?x)` is left as it was, because the walk cannot place its comments (`"aA" | test("(?x)((?i)a)\n# (\n\\1")` is `false` in jq and `true` here).
+  A level reference (`\k<1+0>`) and a subexpression call (`\g<1>`) stay refused, as before.
+  Over a grid of 2,598 patterns and strings (options before, inside and after the group, in lookarounds, atomic groups and classes) the answers match jq 1.7.1, where 94 differed.
 - **`\cX` is control-X** (`\c?` is DEL), and `\c` at the end of the pattern is `end pattern at control`.
 - **`\xHH` at 0x80 or above is a byte of a UTF-8 sequence:** `\xc3\xa9` is `é`.
   A sequence that stops short is `too short multibyte code string`, a continuation byte first or a bad one inside is `invalid code point value`, and one that is no character (`\xed\xa0\x80`, `\xf8`) compiles and matches nothing.
