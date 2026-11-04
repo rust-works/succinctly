@@ -5919,6 +5919,42 @@ fn bridge_to_each_owned_flow<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// [`bridge_to_each_owned_flow`] for a `|=` update (#6122): the update's outputs are collected,
+/// the owned copy of the input is dropped, and only then are they pushed to `sink`.
+///
+/// An update yields its one result when it has finished, so nothing is lost by waiting for it; what
+/// is gained is that the update's frames and the input copy are gone before the rest of the pipe
+/// runs. Pushing from inside the update's callback kept both alive for every later stage, and a
+/// recursion through an update (`def f($n): ... (.v |= 1) as $x | f($n - 1) ...`) reached the native
+/// stack floor about a fifth sooner (jq 1.7.1 and the bridge it replaces answer `f(9000)`).
+fn bridge_update_flow<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    cursor: Option<V::Cursor>,
+    optional: bool,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let root = RootWitness::of(cursor.as_ref());
+    match bridge_ambient_input::<_, S>(expr, &value, cursor) {
+        Ok(owned) => {
+            let mut outputs = Vec::new();
+            let flow =
+                eval_each_owned::<S>(expr, &owned, optional, Reentry::Against(root), &mut |v| {
+                    outputs.push(v);
+                    Demand::Continue
+                });
+            drop(owned);
+            let result = match flow {
+                Flow::Escaped(control) => partial_generic(outputs, control),
+                Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_generic_result(outputs),
+            };
+            drain_result_generic(result, sink)
+        }
+        Err(e) if suppresses(&e, optional) => Flow::Exhausted,
+        Err(e) => Flow::Escaped(Control::Error(e)),
+    }
+}
+
 /// Convert a `QueryResult` produced by `eval.rs` into the generic
 /// evaluator's own `GenericResult`.
 ///
@@ -16863,9 +16899,9 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // #6122: `|=` too, unless it reads path context. The wildcard in `eval_single` turned the
         // ambient value into an owned copy, wrote that copy out as text and indexed it again for
         // the full evaluator, so `.users |= .` on a 100 MB document materialized it twice; this
-        // bridge converts it once and runs the update on that copy, as it does for `=`.
+        // bridge converts it once and runs the update on that copy, as `=` does.
         Expr::Update { .. } if S::TAG == EvalTag::Jq && !needs_path_context(expr) => {
-            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+            bridge_update_flow::<S, V>(expr, value, cursor, optional, sink)
         }
 
         _ => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
@@ -42319,6 +42355,49 @@ mod tests {
                 .collect_owned::<JqSemantics>()
                 .unwrap();
             assert!(!result.is_empty(), "{filter}");
+            assert_eq!(
+                reindex_count::get() - before,
+                0,
+                "{filter} bridged the input"
+            );
+        }
+    }
+
+    /// #6122: a `|=` update that reads no path context is run on one owned copy of the input, not
+    /// bridged: the bridge writes the copy out as JSON and indexes it again (`reindex_count` counts
+    /// exactly that) before the update runs, a second materialization of the whole document. The
+    /// shapes are the ones `eval_each_owned` answers from the tree, at the top level and collected
+    /// (`[..]`, `map(..)`). Output is compared with the bridge's, which the other arm of each pair
+    /// is: an update that reads path context keeps its own route and still answers as it did. The
+    /// pin must be able to fail: it does, with the two `Expr::Update` arms removed.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_path_free_update_is_not_bridged_6122() {
+        use crate::jq::value::reindex_count;
+
+        let json = br#"{"a":1,"arr":[{"x":1},{"x":2}],"o":{"p":3}}"#;
+        let index = JsonIndex::build(json);
+        for (filter, want) in [
+            (".a |= .", r#"{"a":1,"arr":[{"x":1},{"x":2}],"o":{"p":3}}"#),
+            (
+                ".o.p |= 7",
+                r#"{"a":1,"arr":[{"x":1},{"x":2}],"o":{"p":7}}"#,
+            ),
+            (
+                ".a |= .+1",
+                r#"{"a":2,"arr":[{"x":1},{"x":2}],"o":{"p":3}}"#,
+            ),
+            ("[.a |= 5] | length", "1"),
+            (".arr | map(.x |= .+1) | length", "2"),
+            ("[.arr[] | (.x |= .+1)] | length", "2"),
+        ] {
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::get();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            let shown: Vec<String> = result.iter().map(OwnedValue::to_json).collect();
+            assert_eq!(shown, [want], "{filter}");
             assert_eq!(
                 reindex_count::get() - before,
                 0,
