@@ -49,6 +49,9 @@ const ROWS: &[(&str, &str, &str)] = &[
     ),
     ("- a\n- ~\n- b\n- null\n", "unique | length", "4\n"),
     ("- [1]\n- [1]\n", "unique", "- [1]\n"),
+    ("- \"\"\n-\n", "unique", "- \"\"\n"),
+    ("-\n- \"\"\n", "unique", "-\n"),
+    ("- [&a ~]\n- [null]\n", "unique | length", "2\n"),
 ];
 
 #[test]
@@ -57,6 +60,41 @@ fn test_unique_keeps_null_spellings_apart_as_yq_does_6103() -> Result<()> {
         let (output, code) = run_yq_stdin(filter, document, &[])?;
         assert_eq!(code, 0, "{filter} on {document:?}");
         assert_eq!(output, expected, "{filter} on {document:?}");
+    }
+    Ok(())
+}
+
+/// JSON has no plain scalars, so a `null` has one spelling and `unique` keeps one of them, as yq does.
+#[test]
+fn test_unique_of_json_nulls_keeps_one_6103() -> Result<()> {
+    let (output, code) = run_yq_stdin("unique", "[null, null]", &["-p=json", "-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "[null]\n");
+    Ok(())
+}
+
+/// Where the key is not a node of the document, `~` and `null` are still one key here and two in
+/// yq (the first two columns are this tool's answer, pinned so the limitations page stays true;
+/// the last is yq v4.53.3's).
+const GAPS: &[(&str, &str, &str, &str)] = &[
+    (
+        "- a: ~\n- a: null\n",
+        "unique_by(.a) | length",
+        "1\n",
+        "2\n",
+    ),
+    ("- ~\n- null\n", "group_by(.) | length", "1\n", "2\n"),
+    ("- ~\n- null\n", "map(.) | unique | length", "1\n", "2\n"),
+    ("- ~\n- null\n", ". + [] | unique | length", "1\n", "2\n"),
+    ("- &a ~\n- *a\n- null\n", "unique | length", "1\n", "3\n"),
+];
+
+#[test]
+fn test_unique_without_a_document_node_still_merges_null_spellings_6103() -> Result<()> {
+    for &(document, filter, here, _yq) in GAPS {
+        let (output, code) = run_yq_stdin(filter, document, &[])?;
+        assert_eq!(code, 0, "{filter} on {document:?}");
+        assert_eq!(output, here, "{filter} on {document:?}");
     }
     Ok(())
 }
