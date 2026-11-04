@@ -5455,6 +5455,10 @@ untouched. The key is `tostring`'s text, so `==` and `unique` agree about a numb
   Where the key is not a node of the document, no spelling is left to read, and `~` and `null` are one key:
   a key computed from the element (`unique_by(.a)` on `a: ~` and `a: null` has 1 element here and 2 in yq), `group_by` (`group_by(.) | length` over `~` and `null` is 1 here and 2 in yq), an array the filter builds or copies (`map(.) | unique | length` and `. + [] | unique | length` are 1 here and 2 in yq), and `--eval-all`, whose elements are no longer document nodes.
   An anchored or aliased element has no plain spelling to read either (`- &a ~`, `- *a`, `- null` has 1 element here and 3 in yq).
+- **`pivot`'s padding** ([#6102](https://github.com/rust-works/succinctly/issues/6102)): yq pads a row that is too short with an empty node, which prints as nothing (`-` with no value, `key:` bare) and as `null` in JSON.
+  `succinctly yq 'pivot'` as the whole filter does the same, and moves every other cell with its comment, quoting, anchor, alias and tag, with the keys of a mapping new strings that stay quoted when they read as another type.
+  Where the `pivot` is part of a larger filter, the padding is a `null` that prints as `null`: `[pivot]` and `.x |= pivot` print `null` where yq prints nothing, and `pivot | .[1][1]` prints `null` where yq prints an empty line.
+  `.x |= pivot` also keeps the flow style of the rows it replaces, where yq prints block sequences.
 - **Alias nodes.** yq keys an alias element (`*x`) differently from the anchor's node, since its
   container key is the YAML encoding and an alias encodes as itself: `anch: [&x {p: 1}, *x, {p: 1}]`
   gives `.anch | unique | length` of `3` in yq and `1` here (`group_by(.) | length` is `2` there and
