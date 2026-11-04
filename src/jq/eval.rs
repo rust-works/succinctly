@@ -28440,6 +28440,117 @@ fn translate_posix_brackets(
     })
 }
 
+/// Keep the capture slot of a group repeated zero times (#6108). A group followed by `{0}` or
+/// `{0,0}` can never take part in a match, but Oniguruma still numbers it, so jq reports an entry for
+/// it (offset `-1` and string `null`; `"ab" | match("(a){0}b")` has one capture). The `regex` crate
+/// compiles `x{0}` to the empty expression and loses every group inside it, so the capture list came
+/// out short whenever no later group followed.
+///
+/// A zero-count group that holds a capture becomes `(?:(?:X[^\s\S])?)`: the same groups in the same
+/// order, which can start to match and never finish. The outer group keeps a quantifier that follows
+/// (`{0}?`, `{0}*`, which jq accepts) a plain repetition of a group. `None` when nothing needs it.
+///
+/// The scan does not read an extended-mode pattern that holds a `#`, whose comments may hold a
+/// parenthesis; that pattern keeps the short list.
+#[cfg(feature = "regex")]
+fn keep_zero_count_groups(pattern: &str, extended: bool) -> Option<String> {
+    if !pattern.contains("{0") || (extended || inline_extended(pattern)) && pattern.contains('#') {
+        return None;
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = string_with_capacity(pattern.len());
+    // One entry per open group: where it starts in `out`, and whether it holds a capture.
+    let mut open: Vec<(usize, bool)> = Vec::new();
+    // Open character classes (they nest in the `regex` crate), and whether the next character is
+    // the first of the class, where a `]` is a literal.
+    let mut class_depth = 0usize;
+    let mut class_start = false;
+    let mut changed = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            out.push(c);
+            if let Some(&next) = chars.get(i + 1) {
+                out.push(next);
+            }
+            class_start = false;
+            i += 2;
+            continue;
+        }
+        if class_depth > 0 {
+            match c {
+                '[' => {
+                    class_depth += 1;
+                    class_start = true;
+                }
+                ']' if !class_start => class_depth -= 1,
+                '^' if class_start => {}
+                _ => class_start = false,
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '[' {
+            class_depth = 1;
+            class_start = true;
+        } else if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') {
+            // A comment: copied through to its closing parenthesis.
+            let mut end = i + 3;
+            while end < chars.len() && chars[end] != ')' {
+                end += if chars[end] == '\\' { 2 } else { 1 };
+            }
+            let end = (end + 1).min(chars.len());
+            out.extend(&chars[i..end]);
+            i = end;
+            continue;
+        } else if c == '(' {
+            let captures = !opens_condition(&chars, i) && group_header(&chars, i).0;
+            open.push((out.len(), captures));
+        } else if c == ')' {
+            out.push(c);
+            i += 1;
+            let Some((start, holds_capture)) = open.pop() else {
+                continue;
+            };
+            if let Some(parent) = open.last_mut() {
+                parent.1 |= holds_capture;
+            }
+            if holds_capture && chars.get(i) == Some(&'{') {
+                if let Some((end, true)) = interval_quantifier_at(&chars, i)
+                    .map(|(end, comma)| (end, zero_interval(&chars[i..end], comma)))
+                {
+                    let group = out.split_off(start);
+                    out.push_str("(?:(?:");
+                    out.push_str(&group);
+                    out.push_str(NEVER_MATCHES);
+                    out.push_str(")?)");
+                    changed = true;
+                    i = end;
+                }
+            }
+            continue;
+        } else {
+            class_start = false;
+        }
+        out.push(c);
+        i += 1;
+    }
+    changed.then_some(out)
+}
+
+/// Whether the interval `{n}` or `{n,m}` in `text` repeats zero times, `{0}` and `{0,0}` (`{00}`
+/// too): its low bound and its high bound, if it has one, are both zero. `{0,}` is not.
+#[cfg(feature = "regex")]
+fn zero_interval(text: &[char], comma: bool) -> bool {
+    let body: String = text.iter().filter(|c| !matches!(c, '{' | '}')).collect();
+    let mut bounds = body.splitn(2, ',');
+    let zero =
+        |bound: Option<&str>| bound.is_some_and(|b| !b.is_empty() && b.chars().all(|c| c == '0'));
+    zero(bounds.next()) && (!comma || zero(bounds.next()))
+}
+
 /// Whether the escape `\<letter>` is just the letter in jq's Oniguruma (#6068, #6080), `after`
 /// being the character that follows it.
 ///
@@ -29297,7 +29408,9 @@ fn build_regex_uncached<S: EvalSemantics>(
             std::borrow::Cow::Borrowed(pattern)
         });
         match translate_posix_brackets(&scanned, extended) {
-            Ok(translated) => translated.into_owned(),
+            // #6108: a group repeated `{0}` keeps its capture slot.
+            Ok(translated) => keep_zero_count_groups(&translated, extended)
+                .unwrap_or_else(|| translated.into_owned()),
             Err(refusal) => {
                 deferred_refusal.get_or_insert(refusal);
                 String::new()
