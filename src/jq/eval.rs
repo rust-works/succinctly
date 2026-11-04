@@ -147552,6 +147552,8 @@ mod tests {
             // A repeat that must run at least once over such an alternation, alone or in a
             // concatenation, through groups.
             "(?<=(?:a|bc)+)d",
+            "(?<=(?:a|bc)d|ef)g",
+            "(?<=a{2,2}|b)d",
             "(?<=(?:a|bc){1,2})d",
             "(?<=(?:a|bc){2,})d",
             "(?<=x(?:a|bc)+)d",
@@ -147574,6 +147576,13 @@ mod tests {
             "(?<=(?:a|bc)?)d",
             "(?<=(?:a|bc)*)d",
             "(?<=(?:(?:bc)?){2}|a)d",
+            // A branch that holds an alternation of its own, a repeat of a fixed count `{n,n}`, or a
+            // repeat of a varying count is sized as far as it can be.
+            "(?<=(?:a|b)c|de)f",
+            "(?<=a{2,2}|bc)d",
+            "(?<=(?:a+|bc)+)d",
+            // A pattern whose shadow cannot be made (a comment that never closes).
+            "(?<=a|bc)d(?#",
             // A repeat that may run zero times, or sits under another, or beside an empty branch.
             "(?<=(?:a|bc){0,2})d",
             "(?<=(?:(?:a|bc)+)?)d",
