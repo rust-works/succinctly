@@ -28942,6 +28942,18 @@ fn translate_posix_brackets_scan(
     let mut wrapped = vec![false];
     // One entry per open group too: what it is, for the look-behind rules (#6197).
     let mut kinds = vec![GroupKind::Other];
+    // Whether the pattern has an inline option run (`(?i)`, `(?-x)`) anywhere: the common one does
+    // not, and then no group body needs scanning for one (#6212).
+    let any_option_run = chars.windows(2).enumerate().any(|(at, pair)| {
+        pair == ['(', '?'] && {
+            let rest = &chars[at + 2..];
+            let letters = rest
+                .iter()
+                .take_while(|c| c.is_ascii_alphabetic() || **c == '-')
+                .count();
+            letters > 0 && rest.get(letters) == Some(&')')
+        }
+    });
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -29272,7 +29284,7 @@ fn translate_posix_brackets_scan(
                             // `)` in `fancy-regex`; Oniguruma ends it there, as a group does.
                             let head = scoped_group_head(flags);
                             let body = &chars[(i + 2 + head).min(chars.len())..];
-                            if head > 0 && holds_inline_option_run(body, outer) {
+                            if head > 0 && any_option_run && holds_inline_option_run(body, outer) {
                                 out.extend(&chars[i..i + 2 + head]);
                                 out.push_str("(?:");
                                 changed = true;
@@ -29289,7 +29301,7 @@ fn translate_posix_brackets_scan(
                     // #6212: an inline `(?i)` in a capture group lasts past its `)` in
                     // `fancy-regex` too; Oniguruma ends it there.
                     let body = &chars[(i + 1).min(chars.len())..];
-                    if holds_inline_option_run(body, outer) {
+                    if any_option_run && holds_inline_option_run(body, outer) {
                         out.push_str("((?:");
                         changed = true;
                         wrapped.push(true);
