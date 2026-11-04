@@ -28450,11 +28450,18 @@ fn translate_posix_brackets(
 /// order, which can start to match and never finish. The outer group keeps a quantifier that follows
 /// (`{0}?`, `{0}*`, which jq accepts) a plain repetition of a group. `None` when nothing needs it.
 ///
-/// The scan does not read an extended-mode pattern that holds a `#`, whose comments may hold a
-/// parenthesis; that pattern keeps the short list.
+/// Under the `x` flag the scan skips the blanks before the interval and copies a `#` comment through
+/// (`(a) {0} b`). It does not follow an inline `(?x)` or a switch that turns a flag off: a pattern
+/// with one keeps the short list, and so does an inline-extended pattern that holds a `#`, whose
+/// comments may hold a parenthesis.
 #[cfg(feature = "regex")]
 fn keep_zero_count_groups(pattern: &str, extended: bool) -> Option<String> {
-    if !pattern.contains("{0") || (extended || inline_extended(pattern)) && pattern.contains('#') {
+    if !pattern.contains("{0") {
+        return None;
+    }
+    // The blanks and comments of the `x` flag are followed only where no inline flag changes them.
+    let blanks = extended && !flag_switched_off(pattern) && !inline_extended(pattern);
+    if !blanks && inline_extended(pattern) && pattern.contains('#') {
         return None;
     }
     let chars: Vec<char> = pattern.chars().collect();
@@ -28492,6 +28499,15 @@ fn keep_zero_count_groups(pattern: &str, extended: bool) -> Option<String> {
             i += 1;
             continue;
         }
+        if c == '#' && blanks {
+            let end = chars[i..]
+                .iter()
+                .position(|&c| c == '\n')
+                .map_or(chars.len(), |n| i + n);
+            out.extend(&chars[i..end]);
+            i = end;
+            continue;
+        }
         if c == '[' {
             class_depth = 1;
             class_start = true;
@@ -28517,9 +28533,13 @@ fn keep_zero_count_groups(pattern: &str, extended: bool) -> Option<String> {
             if let Some(parent) = open.last_mut() {
                 parent.1 |= holds_capture;
             }
-            if holds_capture && chars.get(i) == Some(&'{') {
-                if let Some((end, true)) = interval_quantifier_at(&chars, i)
-                    .map(|(end, comma)| (end, zero_interval(&chars[i..end], comma)))
+            let mut at = i;
+            while blanks && chars.get(at).is_some_and(|c| c.is_whitespace()) {
+                at += 1;
+            }
+            if holds_capture && chars.get(at) == Some(&'{') {
+                if let Some((end, true)) = interval_quantifier_at(&chars, at)
+                    .map(|(end, comma)| (end, zero_interval(&chars[at..end], comma)))
                 {
                     let group = out.split_off(start);
                     out.push_str("(?:(?:");

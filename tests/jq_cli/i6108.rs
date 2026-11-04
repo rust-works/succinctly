@@ -17,9 +17,7 @@ fn jq(text: &str, program: &str) -> Result<String> {
 
 /// The captures of every match of `pattern` in `text`, as `[offset, string]` pairs.
 fn captures(text: &str, pattern: &str) -> Result<String> {
-    let program = format!(
-        r#"[match("{pattern}"; "g") | .captures | map([.offset, .string])]"#
-    );
+    let program = format!(r#"[match("{pattern}"; "g") | .captures | map([.offset, .string])]"#);
     jq(text, &program)
 }
 
@@ -54,7 +52,10 @@ fn the_zero_spellings_and_the_groups_inside_one_are_counted() -> Result<()> {
         "[[[-1,null],[-1,null],[-1,null]]]"
     );
     assert_eq!(captures("ab", "(a(b){0}){0}b")?, "[[[-1,null],[-1,null]]]");
-    assert_eq!(captures("ab", "(a)|(b){0}")?, r#"[[[0,"a"],[-1,null]],[[1,""],[1,""]],[[2,""],[2,""]]]"#);
+    assert_eq!(
+        captures("ab", "(a)|(b){0}")?,
+        r#"[[[0,"a"],[-1,null]],[[1,""],[1,""]],[[2,""],[2,""]]]"#
+    );
     Ok(())
 }
 
@@ -89,6 +90,16 @@ fn flags_keep_the_group() -> Result<()> {
     for flags in ["i", "x", "gl", "ix"] {
         let program = format!(r#"[match("(a){{0}}b"; "{flags}") | .captures | length]"#);
         assert_eq!(jq("ab", &program)?, "[1]", "{flags}");
+    }
+    Ok(())
+}
+
+/// Under the `x` flag the blanks and comments around the interval are skipped.
+#[test]
+fn the_x_flag_skips_blanks_and_comments_before_the_interval() -> Result<()> {
+    for pattern in ["(a) {0} b", "(a){0} b # c", "(a)\\n{0}b # c(d){0}"] {
+        let program = format!(r#"[match("{pattern}"; "x") | .captures | length]"#);
+        assert_eq!(jq("ab", &program)?, "[1]", "{pattern}");
     }
     Ok(())
 }

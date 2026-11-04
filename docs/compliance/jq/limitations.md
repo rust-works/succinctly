@@ -7501,6 +7501,14 @@ Still refused with the crate's `invalid regex` error, where jq answers: `\X` (on
 Whether one of them matches needs Unicode text segmentation or Oniguruma's byte-level reading of a multibyte pattern.
 Pinned by `tests/jq_cli/i6070.rs`.
 
+### A group repeated `{0}` keeps its capture entry (#6108)
+
+Oniguruma numbers a group repeated zero times (`{0}`, `{0,0}`), so jq reports an entry for it: offset `-1` and string `null`, or an empty string at the match offset when the whole match is empty.
+The `regex` crate drops such a group, so `build_regex_uncached` rewrites it to `(?:(?:X[^\s\S])?)` (`keep_zero_count_groups`) to keep the entry.
+Under the `x` flag the rewrite skips the blanks and `#` comments around the interval.
+Still one entry short: an inline `(?x)` pattern that holds a `#`, and any pattern that switches a flag off inline (`(?-x)`) under the `x` flag, where a blank sits between the group and its `{0}`.
+Pinned by `tests/jq_cli/i6108.rs`.
+
 The `l` and `n` flags use the second engine too, and are described in the next section.
 
 ## Regex flags `l` and `n`
