@@ -29849,6 +29849,8 @@ fn refuse_possessive_quantifier(
     let mut open_groups: Vec<(usize, bool)> = Vec::new();
     // An escape the scan does not size (`\x41`, `\1`, `\k<n>`) leaves the atoms after it unknown.
     let mut unsure = false;
+    // An inline `(?x)` is not modelled: the blank before a quantifier would be taken for the atom.
+    let inline_x = inline_extended(pattern);
     // A lazy quantifier directly followed by `+` is a repeat of a repeat in jq, and the second
     // engine reads it otherwise, so a pattern with one stays on the first engine.
     let mut lazy_then_plus = false;
@@ -29901,6 +29903,28 @@ fn refuse_possessive_quantifier(
                                 i += 1;
                             }
                         }
+                    }
+                    // A back-reference by number, a named one (`\k<n>`, `\g<n>`) and a control
+                    // character (`\cA`) are one atom each.
+                    Some(c) if c.is_ascii_digit() => {
+                        atom = Some(i);
+                        i += 1;
+                        while chars.get(i).is_some_and(char::is_ascii_digit) {
+                            i += 1;
+                        }
+                    }
+                    Some('k' | 'g') if matches!(chars.get(i + 2), Some('<' | '\'')) => {
+                        let close = if chars[i + 2] == '<' { '>' } else { '\'' };
+                        atom = Some(i);
+                        i += 3;
+                        while i < chars.len() && chars[i] != close {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    Some('c') if i + 2 < chars.len() => {
+                        atom = Some(i);
+                        i += 3;
                     }
                     Some(c)
                         if c.is_ascii_alphanumeric()
@@ -30010,7 +30034,7 @@ fn refuse_possessive_quantifier(
                 match atom {
                     // The group makes the repeat atomic, so the `+` goes, which also spares the
                     // second engine an interval it would read as a repeat of a repeat.
-                    Some(start) if !unsure => {
+                    Some(start) if !unsure && !inline_x => {
                         opens.push(start);
                         closes.push(i + 1);
                         drops.push(i);
@@ -143580,20 +143604,25 @@ mod tests {
             ("(?#c)a*+b", "(?#c)(?>a*)b"),
             ("(?i)a*+b", "(?i)(?>a*)b"),
             ("a|b*+c", "a|(?>b*)c"),
-            // Under `x` a blank between an atom and its quantifier is ignored.
-            ("ab *+c", "a(?>b *)c"),
+            (r"(a)\12*+c", r"(a)(?>\12*)c"),
+            (r"\k<n>*+c", r"(?>\k<n>*)c"),
+            (r"\cA*+c", r"(?>\cA*)c"),
+            (r"(a)\1 b*+c", r"(a)\1 (?>b*)c"),
         ] {
-            let extended = pattern.contains(' ');
-            let got = refuse_possessive_quantifier(pattern, extended).unwrap();
+            let got = refuse_possessive_quantifier(pattern, false).unwrap();
             assert_eq!(got, want, "{pattern}");
         }
+        // Under the `x` flag a blank between an atom and its quantifier is ignored.
+        let got = refuse_possessive_quantifier("ab *+c", true).unwrap();
+        assert_eq!(got, "a(?>b *)c");
         // An atom the scan cannot place keeps the refusal, and so does a lazy quantifier followed by
         // `+`, which the second engine reads otherwise.
         for pattern in [
             r"\Qab\E*+c",
-            r"(a)\1*+c",
-            r"\k<n>*+c",
+            r"\C-a*+c",
             "(?i)*+c",
+            // An inline `(?x)` is not modelled.
+            "(?x)a *+ c",
             "*+c",
             "c?+a+?+",
             "c?+a??+",

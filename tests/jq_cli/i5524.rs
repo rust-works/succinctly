@@ -53,6 +53,10 @@ fn test_a_possessive_quantifier_followed_by_more_pattern_is_atomic_6172() -> Res
         (r#""aaa""#, r#"test("^(?=a)a{2,3}+a$")"#, "false\n"),
         (r#""aaa""#, r#"test("a *+ a";"x")"#, "false\n"),
         (r#""aaa""#, r#"test("a*+ # c\na";"x")"#, "false\n"),
+        (r#""aab""#, r#"test("(a)\\1*+b")"#, "true\n"),
+        (r#""aaab""#, r#"test("(?<n>a)\\k<n>*+b")"#, "true\n"),
+        (r#""aaaa""#, r#"test("(a)\\1++a")"#, "false\n"),
+        (r#""aaaa""#, r#"test("(?<n>a)\\k<n>?+a")"#, "true\n"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(input))?;
         assert_eq!(
@@ -65,13 +69,14 @@ fn test_a_possessive_quantifier_followed_by_more_pattern_is_atomic_6172() -> Res
 }
 
 /// What the scan cannot place an atom for keeps the refusal: a quantifier on a quoted run, on a
-/// group of flags, after a back-reference, and a pattern the second engine would read otherwise
+/// group of flags, after a control-character escape, under an inline `(?x)`, and a pattern the second engine would read otherwise
 /// (a lazy quantifier followed by `+`, which jq reads as a repeat of a repeat).
 #[test]
 fn test_a_possessive_quantifier_without_a_known_atom_is_refused_5524() -> Result<()> {
     for program in [
         r#"test("\\Qab\\E*+b")"#,
-        r#"test("(a)\\1*+a")"#,
+        r#"test("\\C-a*+b")"#,
+        r#"test("(?x)a *+ b")"#,
         r#"test("(?i)*+a")"#,
         r#"test("c?+a+?+")"#,
     ] {
