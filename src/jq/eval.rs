@@ -9660,7 +9660,12 @@ fn each_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     let mut already_emitted = false;
+    // #6130: the condition reads read-only, the sink does not (it runs inside the condition's own).
+    let previous = yq_read_only_context::active();
+    let _scope = yq_as_source_scope::<S>();
     eval_each::<W, S>(cond, value.clone(), optional, &mut |item| {
+        let _sink_scope =
+            S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(|| yq_read_only_context::restore(previous));
         if select_emits::<S>(item.is_truthy(), &mut already_emitted) {
             sink(Item::Borrowed(value.clone()))
         } else {
@@ -12819,7 +12824,7 @@ fn owned_select_door<S: EvalSemantics>(
         };
         // `optional` is gated at the top, so the verdict is the shared one
         // ([`owned_cond_verdict`], #3697) and the two doors cannot drift.
-        let Some(verdict) = owned_cond_verdict::<S>(cond, input, false) else {
+        let Some(verdict) = owned_select_cond_verdict::<S>(cond, input) else {
             break;
         };
         match verdict.map(|truthy| truthy != inverted) {
@@ -13519,9 +13524,11 @@ fn text_peel_after_refusal<S: EvalSemantics>(
 /// them under `try` or `?` (a text stage cannot fail, so the guard changes nothing).
 fn text_stage_text<S: EvalSemantics>(stage: &Expr, input: &OwnedValue) -> Option<String> {
     match unwrap_paren(stage) {
-        Expr::Builtin(Builtin::ToJson) | Expr::Format(FormatType::Json) => {
+        // (yq's `tojson` is `to_json`, #6158: it renders more than the value's JSON.)
+        Expr::Builtin(Builtin::ToJson) if S::TAG != EvalTag::Yq => {
             Some(owned_value_to_json::<S>(input))
         }
+        Expr::Format(FormatType::Json) => Some(owned_value_to_json::<S>(input)),
         Expr::Builtin(Builtin::ToString) | Expr::Format(FormatType::Text) => {
             Some(tostring_text::<S>(input, false))
         }
@@ -19597,7 +19604,11 @@ fn builtin_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let cond_result = eval_single::<W, S>(cond, value.clone(), optional);
+    // #6130: yq's `select` runs its condition read-only, so a pipe from an absent key is empty.
+    let cond_result = {
+        let _scope = yq_as_source_scope::<S>();
+        eval_single::<W, S>(cond, value.clone(), optional)
+    };
     let mut already_emitted = false;
     eval_fanout::<_, S>(cond_result, |truthy| {
         if select_emits::<S>(truthy, &mut already_emitted) {
@@ -19774,7 +19785,10 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // is atomic in jq -- see `eval_object_construction` -- so a `Partial` surfaces its control).
             let rewrite =
                 |field_val: StandardJson<'a, W>| -> Result<Option<OwnedValue>, QueryResult<'a, W>> {
-                    Ok(
+                    // yq's `map_values(f)` is `.[] |= f`: an `f` with no output leaves the value
+                    // (#6129).
+                    let original = (S::TAG == EvalTag::Yq).then(|| field_val.clone());
+                    let rewritten = Ok(
                         match first_output_only::<W, S>(
                             eval_single::<W, S>(f, field_val, optional).materialize_cursor(),
                         ) {
@@ -19806,7 +19820,14 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 return Err(QueryResult::Halt(code));
                             }
                         },
-                    )
+                    );
+                    match (rewritten, original) {
+                        (Ok(None), Some(original)) => match to_owned::<S, _>(&original) {
+                            Ok(owned) => Ok(Some(owned)),
+                            Err(e) => Err(suppress_or_raise(e, optional)),
+                        },
+                        (rewritten, _) => rewritten,
+                    }
                 };
             if S::COLLAPSE_DUPLICATE_KEYS {
                 // `checked` is already collapsed: one pass, each key checked as it is inserted.
@@ -19909,6 +19930,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             let mut results: Vec<OwnedValue> = vec_with_capacity(cursors.len());
             for cursor in cursors {
+                let before = results.len();
                 // `cursor.value()` re-resolves `text_position()` a second
                 // time here -- the same known, documented, not-fixed-here
                 // cost `to_entries`'s own array arm carries (its own doc
@@ -19916,6 +19938,8 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // already resolved each element's position once internally
                 // to run its delimiter check, then discards it.
                 let elem = cursor.value();
+                // #6129: yq's `.[] |= f` leaves an element `f` has no output for.
+                let original = (S::TAG == EvalTag::Yq).then(|| elem.clone());
                 match first_output_only::<W, S>(
                     eval_single::<W, S>(f, elem, optional).materialize_cursor(),
                 ) {
@@ -19951,6 +19975,12 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                     QueryResult::Partial(_, Control::Halt(code)) => {
                         return QueryResult::Halt(code);
+                    }
+                }
+                if let (true, Some(original)) = (results.len() == before, original) {
+                    match to_owned::<S, _>(&original) {
+                        Ok(owned) => results.push(owned),
+                        Err(e) => return suppress_or_raise(e, optional),
                     }
                 }
             }
@@ -20640,22 +20670,20 @@ fn yq_extremum_result<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// yq's `min`/`max` of a mapping: the extremum of its values, nothing for an empty one (#4236).
+/// yq's `min`/`max` of a mapping: the extremum of its values, compared as a sequence's elements
+/// are (#6162: a string, boolean, array or map among them is refused), nothing for an empty one
+/// (#4236).
 /// `items` is the values already materialised, so a decode failure surfaces here once.
-fn mapping_extremum<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+fn mapping_extremum<'a, W: Clone + AsRef<[u64]>>(
     items: Result<Vec<OwnedValue>, EvalError>,
     optional: bool,
     want_max: bool,
 ) -> QueryResult<'a, W> {
     match items {
-        Ok(items) => {
-            let pick = if want_max {
-                items.into_iter().max_by(compare_values::<S>)
-            } else {
-                items.into_iter().min_by(compare_values::<S>)
-            };
-            pick.map_or(QueryResult::None, QueryResult::Owned)
-        }
+        // The values compare as a sequence's elements do (#6162): yq refuses a string, an array
+        // or a map among them, where the extremum of mixed numbers still picks one.
+        Ok(items) if items.is_empty() => QueryResult::None,
+        Ok(items) => yq_extremum_result::<W>(items, want_max, optional),
         Err(e) => suppress_or_raise(e, optional),
     }
 }
@@ -20690,8 +20718,8 @@ fn builtin_min<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(min)
         }
         // #4236 (yq): a mapping is the extremum of its values (`{"a": 2, "b": 1} | min` is `1`),
-        // and an empty one has none.
-        StandardJson::Object(fields) if S::MIN_MAX_NEED_AN_ELEMENT => mapping_extremum::<W, S>(
+        // compared as a sequence's are (#6162), and an empty one has none.
+        StandardJson::Object(fields) if S::MIN_MAX_NEED_AN_ELEMENT => mapping_extremum::<W>(
             // STYLE-0012: routed, at `mapping_extremum`'s `Err(e) => suppress_or_raise(e, optional)`.
             fields.map(|f| to_owned::<S, _>(&f.value())).collect(),
             optional,
@@ -20742,7 +20770,7 @@ fn builtin_max<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(max)
         }
         // #4236 (yq): see `builtin_min`.
-        StandardJson::Object(fields) if S::MIN_MAX_NEED_AN_ELEMENT => mapping_extremum::<W, S>(
+        StandardJson::Object(fields) if S::MIN_MAX_NEED_AN_ELEMENT => mapping_extremum::<W>(
             // STYLE-0012: routed, at `mapping_extremum`'s `Err(e) => suppress_or_raise(e, optional)`.
             fields.map(|f| to_owned::<S, _>(&f.value())).collect(),
             optional,
@@ -24188,8 +24216,122 @@ fn format_csv_row_element<S: EvalSemantics>(
     }
 }
 
+/// The tag yq names a node by in its csv encoder's errors.
+fn yq_csv_tag(v: &OwnedValue) -> &'static str {
+    match v {
+        OwnedValue::Object(_) => "!!map",
+        OwnedValue::Array(_) => "!!seq",
+        OwnedValue::String(_) => "!!str",
+        OwnedValue::Bool(_) => "!!bool",
+        OwnedValue::Null => "!!null",
+        OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => "!!int",
+        _ => "!!float",
+    }
+}
+
+/// A field Go's `encoding/csv` writer quotes (`fieldNeedsQuotes`): a field that holds the
+/// separator, a double quote, CR or LF, starts with a space, or is exactly `\.`.
+fn yq_csv_field(field: &str, comma: char) -> String {
+    let needs_quotes = !field.is_empty()
+        && (field == "\\."
+            || field.contains(comma)
+            || field.contains(['"', '\r', '\n'])
+            || field.starts_with(char::is_whitespace));
+    if needs_quotes {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// yq's `@csv`/`@tsv` (#6131): Go's `encoding/csv` over the node. A scalar is its text, an array
+/// of scalars one record, an array of arrays one record each, and an array of flat objects a
+/// header record of the first object's keys then one record each. The trailing newlines are
+/// trimmed. A `null` is spelled `null` (yq keeps the source spelling, `~` included).
+fn format_yq_csv<S: EvalSemantics>(value: &OwnedValue, comma: char) -> Result<String, EvalError> {
+    fn scalar<S: EvalSemantics>(v: &OwnedValue) -> Option<String> {
+        match v {
+            OwnedValue::Array(_) | OwnedValue::Object(_) => None,
+            OwnedValue::Null => Some("null".to_string()),
+            other => Some(owned_to_string::<S>(other)),
+        }
+    }
+    fn not_scalars(index: usize, v: &OwnedValue) -> EvalError {
+        EvalError::new(format!(
+            "csv encoding only works for arrays of scalars (string/numbers/booleans), child[{index}] is a {}",
+            yq_csv_tag(v)
+        ))
+    }
+    fn record<F: AsRef<str>>(out: &mut String, fields: &[F], comma: char) {
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(comma);
+            }
+            out.push_str(&yq_csv_field(field.as_ref(), comma));
+        }
+        out.push('\n');
+    }
+    let items = match value {
+        OwnedValue::Array(items) => items,
+        OwnedValue::Object(_) => {
+            return Err(EvalError::new(
+                "csv encoding only works for arrays, got: !!map".to_string(),
+            ))
+        }
+        scalar_input => return Ok(scalar::<S>(scalar_input).unwrap_or_default()),
+    };
+    let mut out = String::new();
+    match items.first() {
+        None => {}
+        Some(OwnedValue::Object(header)) => {
+            let keys: Vec<&String> = header.keys().collect();
+            record(&mut out, &keys, comma);
+            for (i, item) in items.iter().enumerate() {
+                let OwnedValue::Object(row) = item else {
+                    return Err(EvalError::new(format!(
+                        "csv object encoding only works for arrays of flat objects (string key => string/numbers/boolean value), child[{i}] is a {}",
+                        yq_csv_tag(item)
+                    )));
+                };
+                let mut fields = vec_with_capacity(keys.len());
+                for (at, key) in keys.iter().enumerate() {
+                    match row.get(key.as_str()) {
+                        None => fields.push(String::new()),
+                        Some(v) => fields.push(scalar::<S>(v).ok_or_else(|| not_scalars(at, v))?),
+                    }
+                }
+                record(&mut out, &fields, comma);
+            }
+        }
+        Some(OwnedValue::Array(_)) => {
+            for (i, item) in items.iter().enumerate() {
+                let OwnedValue::Array(row) = item else {
+                    return Err(not_scalars(i, item));
+                };
+                let mut fields = vec_with_capacity(row.len());
+                for (at, v) in row.iter().enumerate() {
+                    fields.push(scalar::<S>(v).ok_or_else(|| not_scalars(at, v))?);
+                }
+                record(&mut out, &fields, comma);
+            }
+        }
+        Some(_) => {
+            let mut fields = vec_with_capacity(items.len());
+            for (at, v) in items.iter().enumerate() {
+                fields.push(scalar::<S>(v).ok_or_else(|| not_scalars(at, v))?);
+            }
+            record(&mut out, &fields, comma);
+        }
+    }
+    out.truncate(out.trim_end_matches('\n').len());
+    Ok(out)
+}
+
 /// @csv - CSV format (for arrays)
 fn format_csv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    if S::TAG == EvalTag::Yq {
+        return format_yq_csv::<S>(value, ',');
+    }
     match value {
         OwnedValue::Array(arr) => {
             let parts = arr
@@ -24207,6 +24349,9 @@ fn format_csv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<St
 
 /// @tsv - TSV format (for arrays)
 fn format_tsv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    if S::TAG == EvalTag::Yq {
+        return format_yq_csv::<S>(value, '\t');
+    }
     match value {
         OwnedValue::Array(arr) => {
             let parts = arr
@@ -25648,6 +25793,12 @@ fn builtin_tojson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `builtin_tostring`'s identical reasoning -- no principled exemption
     // documented anywhere for this sibling either.
     let owned = to_owned_or_suppress!(&value, optional);
+    // #6158: yq's `tojson` is `to_json`: indented, with a line break of its own.
+    if S::TAG == EvalTag::Yq {
+        return QueryResult::Owned(OwnedValue::String(
+            super::stream::owned_value_to_yq_json_string(&owned, 2).into(),
+        ));
+    }
     QueryResult::Owned(OwnedValue::String(owned_value_to_json::<S>(&owned).into()))
 }
 
@@ -27635,12 +27786,12 @@ struct LongestSearch {
 enum RegexEngine {
     Std(regex::Regex),
     Fancy(fancy_regex::Regex),
-    /// The `regex` crate on a pattern [`super::onig_loop::rewrite`] wrote so that a repeated group
+    /// The `regex` crate on a pattern [`super::onig_capture_loop::rewrite`] wrote so that a repeated group
     /// that can match empty reports Oniguruma's last, empty iteration (#6069). Its groups are
     /// copies of the original pattern's, read back through `groups`.
     Rewritten {
         re: regex::Regex,
-        groups: super::onig_loop::LoopRewrite,
+        groups: super::onig_capture_loop::LoopRewrite,
     },
 }
 
@@ -27657,7 +27808,7 @@ enum RegexCaptures<'h> {
 #[cfg(feature = "regex")]
 impl<'h> RegexCaptures<'h> {
     /// `caps`, a match of a rewritten pattern, as the original pattern's groups.
-    fn mapped(caps: regex::Captures<'h>, groups: &super::onig_loop::LoopRewrite) -> Self {
+    fn mapped(caps: regex::Captures<'h>, groups: &super::onig_capture_loop::LoopRewrite) -> Self {
         RegexCaptures::Mapped(
             groups
                 .copies
@@ -28155,6 +28306,28 @@ const JQ_WORD_CLASS_IN_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}";
 /// ignored blanks are the part this scan still does not see (see `check_repetition` below).
 #[cfg(feature = "regex")]
 fn translate_posix_brackets(
+    pattern: &str,
+    extended: bool,
+) -> Result<std::borrow::Cow<'_, str>, EvalError> {
+    let translated = translate_posix_brackets_scan(pattern, extended)?;
+    // #6127: a repeated group whose body Oniguruma reads as an assertion. After the scan, so that an
+    // error earlier in the pattern (jq reports the first in parse order) is the one reported; the
+    // extended mode's ignored blanks are invisible to this check, as to the one in the scan.
+    if pattern.contains('(')
+        && !extended
+        && !inline_extended(pattern)
+        && repeats_assertion_group(&pattern.chars().collect::<Vec<_>>())
+    {
+        return Err(EvalError::new(
+            "invalid regex: target of repeat operator is invalid",
+        ));
+    }
+    Ok(translated)
+}
+
+/// [`translate_posix_brackets`]' rewrite and its refusals, one pass over the pattern.
+#[cfg(feature = "regex")]
+fn translate_posix_brackets_scan(
     pattern: &str,
     extended: bool,
 ) -> Result<std::borrow::Cow<'_, str>, EvalError> {
@@ -28657,6 +28830,228 @@ fn opens_interval(chars: &[char], at: usize) -> bool {
 #[cfg(feature = "regex")]
 const NEVER_MATCHES: &str = "[^\\s\\S]";
 
+/// Keep `regex-syntax` from factoring a shared prefix that can match more than one way out of an
+/// alternation (#6134, rust-lang/regex#1400). It rewrites `XA|XB` as `X(?:A|B)` whenever every
+/// branch starts with the same items, which keeps the leftmost-first match only when `X` matches
+/// one way: `"aab" | match("a*a|a*b")` is `"aa"` in jq and in yq, and was `"aab"` in both modes.
+/// `fancy-regex` hands the alternations it does not run itself to the same constructor.
+///
+/// The rewrite needs every branch to be a sequence, so a branch that never matches
+/// ([`NEVER_MATCHES`]) stops it without changing which branch wins. It goes first, because under
+/// the `x` flag the last branch can end in a comment, and it carries the first branch's leading and
+/// trailing assertions (`^a+x|^a+y` gets `^[^\s\S]`): without them the alternation would lose its
+/// anchoring, and the crate would scan the whole text for a match it checks at one end.
+///
+/// Only an alternation the rewrite could get wrong gets the branch: each of its branches is a
+/// sequence of two items or more, one of them a repetition or another alternation (a shared prefix
+/// of literals, classes and assertions matches one way). With `oniguruma` the pattern may hold
+/// syntax only `fancy-regex` reads, which [`oniguruma_shadow`] writes plainly for `regex-syntax`'s
+/// parser. `None` when no alternation needs the branch, or the parser refuses the pattern (a
+/// conditional): such a pattern keeps the factored match.
+#[cfg(feature = "regex")]
+fn guard_prefix_lifting(pattern: &str, oniguruma: bool) -> Option<String> {
+    use regex_syntax::ast::{self, Ast, RepetitionKind, RepetitionRange};
+    fn backtracks(ast: &Ast) -> bool {
+        match ast {
+            Ast::Repetition(rep) => match rep.op.kind {
+                RepetitionKind::Range(RepetitionRange::Exactly(_)) => backtracks(&rep.ast),
+                RepetitionKind::Range(RepetitionRange::Bounded(lo, hi)) if lo == hi => {
+                    backtracks(&rep.ast)
+                }
+                _ => true,
+            },
+            Ast::Alternation(_) => true,
+            Ast::Group(group) => backtracks(&group.ast),
+            Ast::Concat(concat) => concat.asts.iter().any(backtracks),
+            _ => false,
+        }
+    }
+    /// The items of `ast` as the sequence `regex-syntax` makes of it: through the groups that
+    /// capture nothing, without the flag switches.
+    fn items<'a>(ast: &'a Ast, out: &mut Vec<&'a Ast>) {
+        match ast {
+            Ast::Concat(concat) => concat.asts.iter().for_each(|item| items(item, out)),
+            Ast::Group(group) if group.capture_index().is_none() => items(&group.ast, out),
+            Ast::Flags(_) | Ast::Empty(_) => {}
+            _ => out.push(ast),
+        }
+    }
+    /// Where each alternation to guard starts, and the spans of its first branch's leading and
+    /// trailing assertions.
+    #[allow(clippy::type_complexity)]
+    struct Guards(Vec<(usize, Vec<ast::Span>, Vec<ast::Span>)>);
+    impl ast::Visitor for Guards {
+        type Output = Vec<(usize, Vec<ast::Span>, Vec<ast::Span>)>;
+        type Err = core::convert::Infallible;
+        fn finish(self) -> Result<Self::Output, Self::Err> {
+            Ok(self.0)
+        }
+        fn visit_pre(&mut self, ast: &Ast) -> Result<(), Self::Err> {
+            let Ast::Alternation(alt) = ast else {
+                return Ok(());
+            };
+            let branches: Vec<Vec<&Ast>> = alt
+                .asts
+                .iter()
+                .map(|branch| {
+                    let mut seq = Vec::new();
+                    items(branch, &mut seq);
+                    seq
+                })
+                .collect();
+            if branches
+                .iter()
+                .all(|seq| seq.len() >= 2 && seq.iter().any(|item| backtracks(item)))
+            {
+                let assertion = |item: &&&Ast| matches!(item, Ast::Assertion(_));
+                let first = &branches[0];
+                let lead = first.iter().take_while(assertion).map(|a| *a.span());
+                let mut trail: Vec<_> = first.iter().rev().take_while(assertion).collect();
+                trail.reverse();
+                let trail = trail.into_iter().map(|a| *a.span()).collect();
+                self.0.push((alt.span.start.offset, lead.collect(), trail));
+            }
+            Ok(())
+        }
+    }
+    if !pattern.contains('|') {
+        return None;
+    }
+    // A pattern the parser reads as written is read as written; the copy is for one it refuses.
+    let tree = match ast::parse::Parser::new().parse(pattern) {
+        Ok(tree) => tree,
+        Err(_) if oniguruma => ast::parse::Parser::new()
+            .parse(&oniguruma_shadow(pattern)?.text)
+            .ok()?,
+        Err(_) => return None,
+    };
+    let Ok(mut guards) = ast::visit(&tree, Guards(Vec::new()));
+    if guards.is_empty() {
+        return None;
+    }
+    guards.sort_unstable_by_key(|guard| guard.0);
+    let text = |span: &ast::Span| &pattern[span.start.offset..span.end.offset];
+    let mut out = string_with_capacity(pattern.len() + guards.len() * (NEVER_MATCHES.len() + 1));
+    let mut from = 0;
+    for (start, lead, trail) in &guards {
+        out.push_str(&pattern[from..*start]);
+        for span in lead {
+            out.push_str(text(span));
+        }
+        out.push_str(NEVER_MATCHES);
+        for span in trail {
+            out.push_str(text(span));
+        }
+        out.push('|');
+        from = *start;
+    }
+    out.push_str(&pattern[from..]);
+    Some(out)
+}
+
+/// `pattern` with the Oniguruma syntax only `fancy-regex` reads written as plain syntax of the same
+/// length, so that `regex-syntax`'s parser finds [`guard_prefix_lifting`] and `onig_loop`'s rewrite
+/// (#6128) the same groups and branches at the same offsets: a lookaround or atomic group opener becomes a plain group's,
+/// `(?#...)` a group of `x`s, `\K`, `\G` and `\Z` the assertion `\b`, and `\R`, `\k` and `\1`-`\9`
+/// the escape `\.`. A character class is copied as it is. `None` for a comment that never closes or
+/// crosses a line, since under the `x` flag that newline can end the `#` comment it is in.
+#[cfg(feature = "regex")]
+pub(crate) fn oniguruma_shadow(pattern: &str) -> Option<OnigurumaShadow> {
+    let bytes = pattern.as_bytes();
+    let mut out = vec_with_capacity(bytes.len());
+    let mut opaque = Vec::new();
+    // Open classes (they nest), and whether the next byte is the first of the class, where a `]` is
+    // a literal -- as in [`keep_zero_count_groups`].
+    let mut class_depth = 0usize;
+    let mut class_start = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            let Some(&next) = bytes.get(i + 1) else {
+                out.push(b);
+                break;
+            };
+            let plain = match next {
+                b'K' | b'G' | b'Z' if class_depth == 0 => b'b',
+                b'R' => b'.',
+                b'k' | b'1'..=b'9' => {
+                    if class_depth == 0 {
+                        opaque.push(i);
+                    }
+                    b'.'
+                }
+                other => other,
+            };
+            out.extend_from_slice(&[b'\\', plain]);
+            class_start = false;
+            i += 2;
+            continue;
+        }
+        if class_depth > 0 {
+            match b {
+                b'[' => {
+                    class_depth += 1;
+                    class_start = true;
+                }
+                b']' if !class_start => class_depth -= 1,
+                b'^' if class_start => {}
+                _ => class_start = false,
+            }
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        let rest = &bytes[i..];
+        if b == b'[' {
+            class_depth = 1;
+            class_start = true;
+        } else if rest.starts_with(b"(?=") || rest.starts_with(b"(?!") || rest.starts_with(b"(?>") {
+            opaque.push(i);
+            out.extend_from_slice(b"(?:");
+            i += 3;
+            continue;
+        } else if rest.starts_with(b"(?<=") || rest.starts_with(b"(?<!") {
+            opaque.push(i);
+            out.extend_from_slice(b"(?i:");
+            i += 4;
+            continue;
+        } else if rest.starts_with(b"(?#") {
+            let mut end = 3;
+            while rest.get(end).is_some_and(|&c| c != b')') {
+                end += if rest[end] == b'\\' { 2 } else { 1 };
+            }
+            let comment = rest.get(..=end)?;
+            if comment.contains(&b'\n') {
+                return None;
+            }
+            opaque.push(i);
+            out.extend_from_slice(b"(?:");
+            out.extend(core::iter::repeat(b'x').take(comment.len() - 4));
+            out.push(b')');
+            i += comment.len();
+            continue;
+        }
+        out.push(b);
+        i += 1;
+    }
+    Some(OnigurumaShadow {
+        text: String::from_utf8(out).ok()?,
+        opaque,
+    })
+}
+
+/// What [`oniguruma_shadow`] writes for a pattern.
+#[cfg(feature = "regex")]
+pub(crate) struct OnigurumaShadow {
+    /// The pattern with its Oniguruma-only syntax written plainly, at the same offsets.
+    pub(crate) text: String,
+    /// Where each construct the plain text reads as something it is not starts, in order: a
+    /// lookaround, atomic or comment group (read as a plain group of what it holds) and a
+    /// backreference (read as one literal character).
+    pub(crate) opaque: Vec<usize>,
+}
+
 /// The regex written for the character `v`, safe anywhere in a pattern, a class and the extended
 /// mode included.
 #[cfg(feature = "regex")]
@@ -29029,6 +29424,249 @@ fn inline_extended(pattern: &str) -> bool {
             .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
             .any(|c| c == 'x')
     })
+}
+
+/// Whether `pattern` repeats a group Oniguruma reads as an assertion, which it refuses with
+/// `target of repeat operator is invalid` (#6127).
+///
+/// Oniguruma decides from the parsed node (`is_invalid_quantifier_target`, `regparse.c`): an
+/// assertion (`^ $ \A \z \Z \G \b \B`, a look-ahead or look-behind) is an invalid target; a
+/// sequence of several nodes is not, whatever it holds (`(?:\b\b)*` compiles); an alternation is
+/// invalid when any one alternative is, so `(?:a|\b)*` is refused and `(?:a|\b\b)*` is not; a
+/// plain `(?:...)` group disappears into its body, so `(?:\b)*` and `(?:(?:\b)|c)*` are refused; a
+/// capturing, named, atomic or option group is an enclosure and may repeat anything. The rule was
+/// captured from jq 1.7.1 over 75,780 generated groups.
+///
+/// Anything this scan is unsure of reads as a valid target, which is what it was before.
+#[cfg(feature = "regex")]
+fn repeats_assertion_group(chars: &[char]) -> bool {
+    struct Scan<'a> {
+        chars: &'a [char],
+        at: usize,
+        /// Set when the scan gave up (nesting past any real pattern): it answers `false`.
+        abandoned: bool,
+    }
+    /// One alternative's items: how many, and whether the only one is an invalid target.
+    #[derive(Default)]
+    struct Branch {
+        items: usize,
+        invalid: bool,
+    }
+    impl Scan<'_> {
+        fn peek(&self) -> Option<char> {
+            self.chars.get(self.at).copied()
+        }
+        /// The body of a group or of the whole pattern, up to its `)` (not consumed): whether it is
+        /// an invalid repeat target, or `Err` at a repeat of one.
+        fn body(&mut self, depth: usize) -> Result<bool, ()> {
+            // Deeper than any real pattern: leave it to the crate, the whole pattern with it (resuming
+            // mid-pattern would read later groups at the wrong depth).
+            if depth > 200 {
+                self.abandoned = true;
+                self.at = self.chars.len();
+                return Ok(false);
+            }
+            let mut invalid = false;
+            let mut branch = Branch::default();
+            // An option group `(?i)` that nothing follows in its alternative is an item of its own.
+            let mut trailing_option = false;
+            while let Some(c) = self.peek() {
+                match c {
+                    ')' => break,
+                    '|' => {
+                        if trailing_option {
+                            branch.items += 1;
+                            branch.invalid = false;
+                        }
+                        invalid |= branch.items == 1 && branch.invalid;
+                        branch = Branch::default();
+                        trailing_option = false;
+                        self.at += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                let Some(item) = self.item(depth, &mut trailing_option)? else {
+                    continue;
+                };
+                trailing_option = false;
+                let mut target_invalid = item;
+                // Repetitions stack (`a**` is valid): the first one is checked, the rest follow it.
+                let mut repeated = false;
+                while starts_repetition(self.chars.get(self.at..).unwrap_or(&[])) {
+                    if !repeated && target_invalid {
+                        return Err(());
+                    }
+                    repeated = true;
+                    target_invalid = false;
+                    self.at += 1;
+                    if self.chars[self.at - 1] == '{' {
+                        while self.peek().is_some_and(|c| c != '}') {
+                            self.at += 1;
+                        }
+                        self.at += 1;
+                    }
+                    // Lazy and possessive suffixes.
+                    if matches!(self.peek(), Some('?' | '+')) {
+                        self.at += 1;
+                    }
+                }
+                branch.items += 1;
+                branch.invalid = target_invalid;
+            }
+            if trailing_option {
+                branch.items += 1;
+                branch.invalid = false;
+            }
+            invalid |= branch.items == 1 && branch.invalid;
+            Ok(invalid)
+        }
+
+        /// The item at `at`, consumed: `Some(true)` for an invalid repeat target, `Some(false)` for
+        /// any other, `None` for text that is no item (a comment, or an inline option group
+        /// `(?i)`, which sets `option` and is no item unless nothing follows it in its alternative).
+        fn item(&mut self, depth: usize, option: &mut bool) -> Result<Option<bool>, ()> {
+            let c = self.chars[self.at];
+            match c {
+                '^' | '$' => {
+                    self.at += 1;
+                    Ok(Some(true))
+                }
+                '\\' => {
+                    let next = self.chars.get(self.at + 1).copied();
+                    self.at += 2;
+                    match next {
+                        Some('b' | 'B' | 'A' | 'z' | 'Z' | 'G') => Ok(Some(true)),
+                        Some('p' | 'P' | 'x' | 'k' | 'g' | 'N' | 'o') => {
+                            // `\p{L}`, `\x{41}`, `\k<n>`, `\g<n>`: a name may hold `)`.
+                            let close = match self.peek() {
+                                Some('{') => Some('}'),
+                                Some('<') => Some('>'),
+                                Some('\'') => Some('\''),
+                                _ => None,
+                            };
+                            if let Some(close) = close {
+                                // Unterminated: only the escape, not the rest of the pattern.
+                                if let Some(n) =
+                                    self.chars[self.at + 1..].iter().position(|&c| c == close)
+                                {
+                                    self.at += n + 2;
+                                }
+                            }
+                            Ok(Some(false))
+                        }
+                        // `\Q...\E` quotes text: one item, even when empty.
+                        Some('Q') => {
+                            while self.peek().is_some() {
+                                if self.peek() == Some('\\')
+                                    && self.chars.get(self.at + 1) == Some(&'E')
+                                {
+                                    self.at += 2;
+                                    break;
+                                }
+                                self.at += 1;
+                            }
+                            Ok(Some(false))
+                        }
+                        _ => Ok(Some(false)),
+                    }
+                }
+                '[' => {
+                    self.skip_class();
+                    Ok(Some(false))
+                }
+                '(' => self.group(depth, option),
+                _ => {
+                    self.at += 1;
+                    Ok(Some(false))
+                }
+            }
+        }
+
+        /// A character class, nested classes and escapes included.
+        fn skip_class(&mut self) {
+            let mut depth = 0usize;
+            let mut first = true;
+            while let Some(c) = self.peek() {
+                self.at += 1;
+                match c {
+                    '\\' => self.at += 1,
+                    '[' => {
+                        depth += 1;
+                        first = true;
+                        continue;
+                    }
+                    '^' if first => continue,
+                    ']' if !first => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+                first = false;
+            }
+        }
+
+        fn group(&mut self, depth: usize, option: &mut bool) -> Result<Option<bool>, ()> {
+            let rest = self.chars.get(self.at..).unwrap_or(&[]);
+            let starts = |prefix: &str| {
+                prefix
+                    .chars()
+                    .enumerate()
+                    .all(|(n, p)| rest.get(n) == Some(&p))
+            };
+            if starts("(?#") {
+                let mut end = self.at + 3;
+                while end < self.chars.len() && self.chars[end] != ')' {
+                    end += if self.chars[end] == '\\' { 2 } else { 1 };
+                }
+                self.at = (end + 1).min(self.chars.len());
+                return Ok(None);
+            }
+            // What the group is: a plain group (its body is its own target), an assertion, or an
+            // enclosure (may repeat anything).
+            let (prefix, kind) = if starts("(?:") {
+                (3, Some(false))
+            } else if starts("(?=") || starts("(?!") {
+                (3, Some(true))
+            } else if starts("(?<=") || starts("(?<!") {
+                (4, Some(true))
+            } else if starts("(?") {
+                // An option group, `(?i)` or `(?i:...)`, a named or atomic group, a conditional,
+                // an absent operator: an enclosure, whose own body is still checked inside.
+                let letters = rest[2..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphabetic() || **c == '-')
+                    .count();
+                if rest.get(2 + letters) == Some(&')') {
+                    *option = true;
+                    self.at += 3 + letters;
+                    return Ok(None);
+                }
+                (2, None)
+            } else {
+                (1, None)
+            };
+            self.at += prefix;
+            let inner = self.body(depth + 1)?;
+            if self.peek() == Some(')') {
+                self.at += 1;
+            }
+            Ok(Some(match kind {
+                Some(false) => inner,
+                Some(true) => true,
+                None => false,
+            }))
+        }
+    }
+    let mut scan = Scan {
+        chars,
+        at: 0,
+        abandoned: false,
+    };
+    scan.body(0).is_err() && !scan.abandoned
 }
 
 /// Whether `chars` begins with a repetition operator as Oniguruma's Perl syntax reads one: `*`,
@@ -29552,6 +30190,18 @@ fn build_regex_uncached<S: EvalSemantics>(
         return Err(refusal);
     }
 
+    // #6106: Oniguruma leaves a greedy loop at the first iteration that matches nothing, where the
+    // `regex` crate tries the body's later ways first (see `onig_loop`). Not under `l`: the span of
+    // the longest match does not depend on that order, and `fancy-regex`'s longest mode refuses the
+    // lazy repeat the rewrite writes, which would leave `l` a no-op. The pattern as written is kept
+    // for when the copies the rewrite makes outgrow an engine's size or nesting limit.
+    let mut as_written = None;
+    if S::TAG != EvalTag::Yq && !longest {
+        if let Some(rewritten) = super::onig_loop::rewrite(&pattern) {
+            as_written = Some(core::mem::replace(&mut pattern, rewritten));
+        }
+    }
+
     // jq's un-flagged `$` matches at the absolute end of the string, or
     // immediately before a final `\n` (Perl's `\Z` semantics) —
     // unlike Rust regex's un-flagged `$`, which only matches the absolute
@@ -29577,7 +30227,12 @@ fn build_regex_uncached<S: EvalSemantics>(
         // old route whole: the flags are not independent (`ln` is the longest *non-empty* match
         // anywhere), so fixing `n` alone would change which wrong answer it gives.
         if modes.longest || modes.not_empty {
-            if let Some(re) = build_fancy_regex_with::<S>(&pattern, modes) {
+            let built = build_fancy_regex_with::<S>(&pattern, modes).or_else(|| {
+                as_written
+                    .as_deref()
+                    .and_then(|written| build_fancy_regex_with::<S>(written, modes))
+            });
+            if let Some(re) = built {
                 // #6085: an `l` search with `\K` measures a match from where its attempt began.
                 // Under the `x` flag the closing parenthesis follows a newline, so that a `#`
                 // comment at the end of the pattern cannot swallow it; an inline `(?x)`, a switch
@@ -29620,7 +30275,9 @@ fn build_regex_uncached<S: EvalSemantics>(
         && needs_trailing_nl_check
         && (pattern_has_escape_z(&pattern) || pattern_has_interior_dollar(&pattern))
     {
-        if let Some(re) = build_fancy_regex::<S>(&pattern) {
+        let built = build_fancy_regex::<S>(&pattern)
+            .or_else(|| as_written.as_deref().and_then(build_fancy_regex::<S>));
+        if let Some(re) = built {
             return Ok(JqRegex {
                 engine: RegexEngine::Fancy(re),
                 needs_trailing_nl_check: false,
@@ -29638,16 +30295,29 @@ fn build_regex_uncached<S: EvalSemantics>(
     // one the crate compiles stands for the pattern; one it refuses (its size limit) leaves the
     // pattern to compile as written, with the crate's own error if it has one.
     let rewritten = (S::TAG != EvalTag::Yq)
-        .then(|| super::onig_loop::rewrite(&pattern))
+        .then(|| super::onig_capture_loop::rewrite(&pattern))
         .flatten()
         .and_then(|groups| {
             let re = regex::Regex::new(&groups.pattern).ok()?;
             (re.captures_len() == groups.compiled_groups)
                 .then_some(RegexEngine::Rewritten { re, groups })
         });
+    // The pattern as written replaces the #6106 rewrite only when it compiles where the rewrite does
+    // not (an engine limit). A pattern the crate refuses either way keeps its rewrite for
+    // `fancy-regex` (#6128), and is refused in the words of the pattern as written.
     let compiled = match rewritten {
         Some(engine) => Ok(engine),
-        None => regex::Regex::new(&pattern).map(RegexEngine::Std),
+        None => match std_regex(&pattern) {
+            Err(_) if as_written.is_some() => {
+                let written = std_regex(as_written.as_deref().unwrap_or_default());
+                if written.is_ok() {
+                    pattern = as_written.take().unwrap_or_default();
+                }
+                written
+            }
+            compiled => compiled,
+        }
+        .map(RegexEngine::Std),
     };
     match compiled {
         Ok(engine) => Ok(JqRegex {
@@ -29662,7 +30332,9 @@ fn build_regex_uncached<S: EvalSemantics>(
         // #5502: lookaround, backreferences, atomic groups and the like are Oniguruma syntax the
         // `regex` crate refuses. A pattern `fancy-regex` cannot take either keeps the crate's
         // own refusal, so its message is what it always was.
-        Err(e) => match build_fancy_regex::<S>(&pattern) {
+        Err(e) => match build_fancy_regex::<S>(&pattern)
+            .or_else(|| as_written.as_deref().and_then(build_fancy_regex::<S>))
+        {
             Some(re) => Ok(JqRegex {
                 engine: RegexEngine::Fancy(re),
                 // `build_fancy_regex` rewrote `$` itself: see [`prepare_fancy_pattern`].
@@ -29675,6 +30347,17 @@ fn build_regex_uncached<S: EvalSemantics>(
             }),
             None => Err(EvalError::new(format!("invalid regex: {e}"))),
         },
+    }
+}
+
+/// The `regex` crate's compilation of `pattern`, guarded by [`guard_prefix_lifting`] (#6134). A
+/// pattern the crate refuses is refused in its own words, not the guarded pattern's.
+#[cfg(feature = "regex")]
+fn std_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    // A guarded pattern the crate refuses only for its size compiles as written, factored.
+    match guard_prefix_lifting(pattern, false) {
+        Some(guarded) => regex::Regex::new(&guarded).or_else(|_| regex::Regex::new(pattern)),
+        None => regex::Regex::new(pattern),
     }
 }
 
@@ -29777,7 +30460,11 @@ fn build_fancy_regex_at<S: EvalSemantics>(
         return None;
     }
     let source = pattern;
-    let pattern = prepare_fancy_pattern(source)?;
+    // Under `l` the order the branches are tried in does not change the longest match.
+    let guarded = (!modes.longest)
+        .then(|| guard_prefix_lifting(source, true))
+        .flatten();
+    let pattern = prepare_fancy_pattern(guarded.as_deref().unwrap_or(source))?;
     let tree = fancy_regex::Expr::parse_tree(&pattern).ok()?;
     if !fancy_expr_is_oniguruma(&tree.expr)
         || tree.expr.has_descendant(|e| !fancy_expr_is_oniguruma(e))
@@ -33458,7 +34145,13 @@ fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Some(e) => QueryResult::Error(e),
             None => QueryResult::One(StandardJson::Null),
         },
-        // (#4079: the callers that know the literal's spelling look the member up first.)
+        // #6155: a key that misses finds no node under yq's read-only rule. (#4079: the callers
+        // that know the literal's spelling look the member up first.)
+        StandardJson::Object(_)
+            if yq_numeric_index_on_object_is_null::<S>() && yq_absent_key_read_is_empty::<S>() =>
+        {
+            QueryResult::None
+        }
         StandardJson::Object(_) if yq_numeric_index_on_object_is_null::<S>() => {
             QueryResult::One(StandardJson::Null)
         }
@@ -50234,9 +50927,12 @@ fn resolve_cond_fork_stream<S: EvalSemantics>(
     cond: &Expr,
     value: &OwnedValue,
     trackable: bool,
+    read_only: bool,
     mut dispatch: impl FnMut(bool) -> ResolveFlow,
 ) -> ResolveFlow {
-    resolve_value_fork_stream::<S>(cond, value, trackable, |c| dispatch(c.is_truthy()))
+    resolve_value_fork_stream::<S>(cond, value, trackable, read_only, |c| {
+        dispatch(c.is_truthy())
+    })
 }
 
 /// [`resolve_cond_fork_stream`] for a generator whose outputs are values a
@@ -50245,12 +50941,23 @@ fn resolve_cond_fork_stream<S: EvalSemantics>(
 /// is pulled one output at a time, the first `dispatch` answer that is not
 /// [`ResolveFlow::Exhausted`] ends the fork, and a `?//` inside `generator`
 /// retries past it.
+///
+/// `read_only` runs `generator` under yq's read-only absent-key rule (#6130): `select`'s condition
+/// does, an `if`'s and a `limit`'s count do not. `dispatch` runs inside `generator`'s own sink and
+/// leaves the scope it was entered from.
 fn resolve_value_fork_stream<S: EvalSemantics>(
     cond: &Expr,
     value: &OwnedValue,
     trackable: bool,
+    read_only: bool,
     mut dispatch: impl FnMut(OwnedValue) -> ResolveFlow,
 ) -> ResolveFlow {
+    let previous = yq_read_only_context::active();
+    let _scope = if read_only {
+        yq_as_source_scope::<S>()
+    } else {
+        None
+    };
     // #3293: a [`StashedVerdict`]. A `?//` inside `cond` retries past the
     // stop `dispatch` answered (#1519), and a retry that emits again drops
     // the stale answer at the top of the sink; one that produces nothing or
@@ -50265,6 +50972,8 @@ fn resolve_value_fork_stream<S: EvalSemantics>(
         Reentry::at_register(trackable),
         &mut |c| {
             dispatched.begin();
+            let _sink_scope = (read_only && S::READ_ONLY_ABSENT_KEY_IS_EMPTY)
+                .then(|| yq_read_only_context::restore(previous));
             match dispatch(c) {
                 ResolveFlow::Exhausted => Demand::Continue,
                 other => {
@@ -50567,7 +51276,7 @@ fn resolve_limit_sink<'a, S: EvalSemantics>(
     // fork `if`'s `cond` uses, so a failure the body raises reaches a `?//` inside
     // the count -- `path(limit(([1] as $q ?// $b | $q); .a))` is `["a"]` in jq
     // 1.7.1. This collected the whole count generator first.
-    resolve_value_fork_stream::<S>(n_expr, value, trackable, |n_value| {
+    resolve_value_fork_stream::<S>(n_expr, value, trackable, false, |n_value| {
         match classify_limit_n(n_value) {
             LimitN::Unlimited => {
                 resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, sink)
@@ -51193,7 +51902,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // error/break still escapes with the correct (now-capped) prefix.
         Expr::Builtin(Builtin::Select(cond)) => {
             let mut already_emitted = false;
-            resolve_cond_fork_stream::<S>(cond, value, trackable, |truthy| {
+            resolve_cond_fork_stream::<S>(cond, value, trackable, true, |truthy| {
                 if select_emits::<S>(truthy, &mut already_emitted) {
                     emit_passthrough(value, trackable, snapshot, sink)
                 } else {
@@ -51241,7 +51950,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             cond,
             then_branch,
             else_branch,
-        } => resolve_cond_fork_stream::<S>(cond, value, trackable, |truthy| {
+        } => resolve_cond_fork_stream::<S>(cond, value, trackable, false, |truthy| {
             let branch = if truthy { then_branch } else { else_branch };
             // #3914: the branch that runs starts from the register the `if` was entered
             // with (the condition is a subexp), so a by-value branch states it as a
@@ -78743,7 +79452,7 @@ fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
             unwrap_paren(stage),
             Expr::Builtin(Builtin::ToString | Builtin::Length | Builtin::ToJson | Builtin::Type)
                 | Expr::Not
-                | Expr::Format(FormatType::Json)
+                | Expr::Format(FormatType::Json | FormatType::YqJson(_) | FormatType::YqYaml(_))
         )
     };
     match expr {
@@ -82292,11 +83001,14 @@ fn eval_owned_navigation<S: EvalSemantics>(
             // own `Object` arm. See `yq_numeric_index_on_object_is_null`.
             OwnedValue::Object(map) if yq_numeric_index_on_object_is_null::<S>() => {
                 // #4079: the member whose key text is the literal.
-                Ok(Some(
-                    yq_literal_index_text::<S>(*idx, key.as_ref())
-                        .and_then(|text| map.get(text.as_str()).cloned())
-                        .unwrap_or(OwnedValue::Null),
-                ))
+                match yq_literal_index_text::<S>(*idx, key.as_ref())
+                    .and_then(|text| map.get(text.as_str()).cloned())
+                {
+                    Some(found) => Ok(Some(found)),
+                    // #6155: a key that misses finds no node under the read-only rule.
+                    None if yq_absent_key_read_is_empty::<S>() => Ok(None),
+                    None => Ok(Some(OwnedValue::Null)),
+                }
             }
             // #2482 (yq mode): `.s[0]` on a scalar `s` -- same empty rule as
             // the sibling `Expr::Field` arm above.
@@ -87220,6 +87932,16 @@ impl<'e> LoopOperand<'e> {
             None => eval_owned_expr_fork::<S>(expr, input, optional, Reentry::Proven),
         }
     }
+}
+
+/// [`owned_cond_verdict`] for a `select` condition (#6130): yq reads it read-only, so a read of an
+/// absent key finds no output, the pure grammar declines, and the bridge answers it.
+pub(crate) fn owned_select_cond_verdict<S: EvalSemantics>(
+    cond: &Expr,
+    state: &OwnedValue,
+) -> Option<Result<bool, EvalError>> {
+    let _scope = yq_as_source_scope::<S>();
+    owned_cond_verdict::<S>(cond, state, false)
 }
 
 /// The verdict of an `until`/`while` condition over a state the loop owns,
@@ -96676,12 +97398,8 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let fmt = match fmt_owned {
                 OwnedValue::String(s) => s,
                 _ if optional => return QueryResult::None,
-                _ => {
-                    return QueryResult::Error(EvalError::type_error(
-                        "string",
-                        &format!("{name} format"),
-                    ))
-                }
+                // jq tests the input before it reads the format (#6111).
+                _ => return strftime_format_error::<W, S>(&value, local, name),
             };
 
             // jq hands the libc a C string, so a NUL ends the format (`"a\u0000b"` formats as
@@ -96732,6 +97450,39 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::String(result.into()))
         },
     )
+}
+
+/// The error `strftime`/`strflocaltime` raise for a format that is not a string (#6111).
+///
+/// jq tests the input before it reads the format: a number is converted first and a failed
+/// conversion is the error, a non-array is not a datetime, and only an array gets to `requires a
+/// string format`. A number that converts then meets a format `jv_string_value` aborts on (#3046),
+/// which raises here. Out of line and cold so the builtin's hot path keeps its shape.
+#[cold]
+#[inline(never)]
+fn strftime_format_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'a, W>,
+    local: bool,
+    name: &str,
+) -> QueryResult<'a, W> {
+    if !matches!(value, StandardJson::Number(_)) {
+        if let Some(e) = scalar_decode_failure(value) {
+            return QueryResult::Error(e);
+        }
+    }
+    match value {
+        StandardJson::Number(_) => {
+            // `optional` is false here: the caller took that arm first.
+            match broken_down_time_fields::<W, S>(value, false, local, false, name) {
+                Err(r) => r,
+                Ok(_) => {
+                    QueryResult::Error(EvalError::type_error("string", &format!("{name} format")))
+                }
+            }
+        }
+        StandardJson::Array(_) => QueryResult::Error(EvalError::requires_string_format(name)),
+        _ => QueryResult::Error(EvalError::requires_parsed_datetime_inputs(name)),
+    }
 }
 
 /// `%y` as the pinned libc prints it (`_yconv`, #6030): the year's remainder by 100 under C's
@@ -133965,6 +134716,153 @@ mod tests {
         );
     }
 
+    /// #6106: a loop rewritten for Oniguruma's empty-iteration exit is what the `regex` crate
+    /// compiles, and a rewrite the crate refuses (here, nested past its limit) falls back to the
+    /// pattern as written instead of becoming an error.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn build_regex_falls_back_to_the_pattern_as_written_6106() {
+        let compiled = |pattern: &str| match build_regex_uncached::<JqSemantics>(pattern, None) {
+            Ok(JqRegex {
+                engine: RegexEngine::Std(re),
+                ..
+            }) => re.as_str().to_string(),
+            _ => panic!("{pattern} compiles with the regex crate"),
+        };
+        // #6134: the crate is handed each pattern through `guard_prefix_lifting`.
+        let guarded = |pattern: String| guard_prefix_lifting(&pattern, false).unwrap_or(pattern);
+        assert_eq!(
+            compiled("(?:b*|a)+"),
+            guarded(super::super::onig_loop::rewrite("(?:b*|a)+").unwrap())
+        );
+        let nested =
+            |depth: usize| format!("{}(?:b*|a)+{}", "(?:".repeat(depth), ")".repeat(depth));
+        let depth = (200..260)
+            .find(|&d| {
+                super::super::onig_loop::rewrite(&nested(d))
+                    .is_some_and(|rewritten| regex::Regex::new(&rewritten).is_err())
+            })
+            .expect("some depth nests the rewrite past the crate's limit");
+        assert!(regex::Regex::new(&nested(depth)).is_ok());
+        assert_eq!(compiled(&nested(depth)), guarded(nested(depth)));
+    }
+
+    /// #6134: an alternation whose branches are all sequences holding a repeat gets a first branch
+    /// that never matches, at the start of the alternation, with the first branch's leading and
+    /// trailing assertions, so that `regex-syntax` cannot factor a shared prefix out of it and the
+    /// alternation keeps its anchoring. Other alternations, and a pattern the parser refuses, are
+    /// left alone.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn guard_prefix_lifting_puts_a_dead_branch_first_6134() {
+        let dead = NEVER_MATCHES;
+        for (pattern, want) in [
+            ("a*a|a*b", format!("{dead}|a*a|a*b")),
+            ("x(a*a|a*b)y", format!("x({dead}|a*a|a*b)y")),
+            ("(?:a*?b|a*?a)+?", format!("(?:{dead}|a*?b|a*?a)+?")),
+            ("a{1,2}x|a{1,2}y", format!("{dead}|a{{1,2}}x|a{{1,2}}y")),
+            ("(?:a|b)x|(?:a|b)y", format!("{dead}|(?:a|b)x|(?:a|b)y")),
+            ("(?:a*a)|(?:a*b)", format!("{dead}|(?:a*a)|(?:a*b)")),
+            ("(?x) a*a | a*b # c", format!("{dead}|(?x) a*a | a*b # c")),
+            (
+                "a*(?:b+c|b+d)|a*d",
+                format!("{dead}|a*(?:{dead}|b+c|b+d)|a*d"),
+            ),
+            ("^a+x|^a+y", format!("^{dead}|^a+x|^a+y")),
+            (
+                r"\A(?:)\ba*x$|a*y$",
+                format!(r"\A\b{dead}$|\A(?:)\ba*x$|a*y$"),
+            ),
+            (r"\w+x$|\w+y$", format!(r"{dead}$|\w+x$|\w+y$")),
+        ] {
+            for oniguruma in [false, true] {
+                let guarded = guard_prefix_lifting(pattern, oniguruma);
+                assert_eq!(guarded.as_deref(), Some(want.as_str()), "{pattern}");
+            }
+        }
+        for (pattern, want) in [
+            ("(?=a*a|a*b)", format!("(?={dead}|a*a|a*b)")),
+            ("(?<=x)(?:a*a|a*b)", format!("(?<=x)(?:{dead}|a*a|a*b)")),
+            ("(?>a*a|a*b)", format!("(?>{dead}|a*a|a*b)")),
+            (r"(x)\1?(?:a*a|a*b)", format!(r"(x)\1?(?:{dead}|a*a|a*b)")),
+            (
+                r"(?<n>x)\k<n>(?:a*a|a*b)",
+                format!(r"(?<n>x)\k<n>(?:{dead}|a*a|a*b)"),
+            ),
+            (r"\\1(?:a*a|a*b)", format!(r"\\1(?:{dead}|a*a|a*b)")),
+            (r"x\K(?:a*a|a*b)\Z", format!(r"x\K(?:{dead}|a*a|a*b)\Z")),
+            (r"\G(?:a*a|a*b)\R", format!(r"\G(?:{dead}|a*a|a*b)\R")),
+            (r"\Ga*a|\Ga*b", format!(r"\G{dead}|\Ga*a|\Ga*b")),
+            ("(?#c)(?:a*a|a*b)", format!("(?#c)(?:{dead}|a*a|a*b)")),
+            ("(?#a|b)a*a|a*b", format!("{dead}|(?#a|b)a*a|a*b")),
+            ("[(?#]a*a|a*b", format!("{dead}|[(?#]a*a|a*b")),
+            (r"(?#\))a*a|a*b", format!(r"{dead}|(?#\))a*a|a*b")),
+            ("[a[b]]a*x|a*y", format!("{dead}|[a[b]]a*x|a*y")),
+            ("[^]a]a*x|a*y", format!("{dead}|[^]a]a*x|a*y")),
+            ("(ba*)x|(ba*)y", format!("{dead}|(ba*)x|(ba*)y")),
+        ] {
+            let guarded = guard_prefix_lifting(pattern, true);
+            assert_eq!(guarded.as_deref(), Some(want.as_str()), "{pattern}");
+        }
+        for pattern in [
+            "a*b",
+            "ab|ac",
+            "[ab]x|[ab]y",
+            "a{2}x|a{2}y",
+            "a{2,2}x|a{2,2}y",
+            "a*a|a*b\\",
+            r"\bx|\by",
+            "(?:ab|ac)+",
+            "a*|b*",
+            "a*x|bx",
+            "(a*a)|(a*b)",
+            "(a)?(?(1)a*a|a*b)",
+            "(?#a\nb)a*a|a*b",
+            "(?#a",
+            "(",
+        ] {
+            assert_eq!(guard_prefix_lifting(pattern, true), None, "{pattern}");
+        }
+        // The crate's own route reads none of `fancy-regex`'s syntax.
+        assert_eq!(guard_prefix_lifting("(?=a)(?:a*a|a*b)", false), None);
+        let hir = |pattern: &str| regex_syntax::parse(pattern).unwrap();
+        let branches = |pattern: &str| match hir(pattern).into_kind() {
+            regex_syntax::hir::HirKind::Alternation(branches) => branches.len(),
+            _ => 0,
+        };
+        assert_eq!(
+            branches("a*a|a*b"),
+            0,
+            "regex-syntax factors the prefix out"
+        );
+        assert_eq!(
+            branches(&guard_prefix_lifting("a*a|a*b", false).unwrap()),
+            3
+        );
+        let anchored = hir(&guard_prefix_lifting("^a+x|^a+y", false).unwrap());
+        assert!(anchored
+            .properties()
+            .look_set_prefix()
+            .contains(regex_syntax::hir::Look::Start));
+        let at_end = hir(&guard_prefix_lifting(r"\w+x$|\w+y$", false).unwrap());
+        assert!(at_end
+            .properties()
+            .look_set_suffix()
+            .contains(regex_syntax::hir::Look::End));
+    }
+
+    /// #6134: a pattern the `regex` crate refuses is refused in its own words, without the branch
+    /// the guard puts in front of it.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn std_regex_refuses_in_the_pattern_s_own_words_6134() {
+        let pattern = r"a*\p{Foo}|a*x";
+        assert!(guard_prefix_lifting(pattern, false).is_some());
+        let refusal = std_regex(pattern).unwrap_err().to_string();
+        assert_eq!(refusal, regex::Regex::new(pattern).unwrap_err().to_string());
+        assert!(!refusal.contains(NEVER_MATCHES), "{refusal}");
+    }
+
     /// #5531: `build_regex` keeps the result for a `(mode, pattern, flags)` it has built twice and
     /// hands the same value back, errors included; a different flag string, mode or pattern is its
     /// own entry, a pattern seen once is not kept, a long pattern never is, and the oldest entry
@@ -142338,6 +143236,60 @@ mod tests {
         assert_eq!(owned(br"[1,2,3]", ".[]").len(), 3);
         // One: field access returns a scalar reference.
         assert_eq!(owned(br#"{"a":1}"#, ".a"), vec![OwnedValue::Int(1)]);
+    }
+
+    /// #6127: the scan for a repeated group that is an assertion reads any text without panicking
+    /// (a backslash or a group that ends the pattern, an unclosed class, comment or escape payload, stray `)`, nesting past the scan's cap), and
+    /// answers the fixed rows jq 1.7.1 answers (`tests/jq_cli/i6127.rs` holds the captured sweep).
+    #[cfg(feature = "regex")]
+    #[test]
+    fn repeats_assertion_group_reads_any_text_6127() {
+        let scan = |p: &str| repeats_assertion_group(&p.chars().collect::<Vec<_>>());
+        for (pattern, refused) in [
+            (r"(?:\b)*", true),
+            (r"(?:a|\b)+", true),
+            ("(?:a|$)?", true),
+            (r"(?:\b\b)*", false),
+            (r"(\b)*", false),
+            (r"(?:\b)x", false),
+            ("(?:", false),
+            ("(?", false),
+            ("(", false),
+            (")", false),
+            ("\\", false),
+            ("[", false),
+            ("[]", false),
+            ("(?#", false),
+            ("(?:\\", false),
+            ("(?:a|", false),
+            ("(?:\\Q", false),
+            ("\\k<", false),
+        ] {
+            assert_eq!(scan(pattern), refused, "{pattern}");
+        }
+        // Nesting past the scan's cap abandons the whole pattern, a later repeat of an assertion with it.
+        let deep = format!("{}a{}(?:\\b)*", "(?:".repeat(300), ")".repeat(300));
+        assert!(!scan(&deep));
+        let alphabet: Vec<char> = "(){}[]|?*+\\^$:=!<>#.-,abwbBAzZGQEik0129 "
+            .chars()
+            .collect();
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let len = (state % 14) as usize;
+            let mut s = state;
+            let text: Vec<char> = (0..len)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    alphabet[((s >> 33) as usize) % alphabet.len()]
+                })
+                .collect();
+            let _ = repeats_assertion_group(&text);
+        }
     }
 
     /// #6068: the pass leaves an ordinary pattern as written (no allocation), and rewrites exactly

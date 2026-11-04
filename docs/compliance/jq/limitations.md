@@ -7419,8 +7419,12 @@ The crate's `\b{start}`, `\b{end}`, `\b{start-half}` and `\b{end-half}` are `\b`
 These rewrites skip comments, as jq does (#5550): `(?#...)`, and `#` to the end of the line where the extended mode is on, from the `x` flag or an inline `(?x)`, `(?x:...)` or `(?-x)` followed group by group.
 So a `(?P` or a `[` in a comment is text (`test("ab # (?P\n"; "x")` is `true` in both), while without `x` the `#` is a literal and the `(?P` is refused in both.
 A repetition operator right after an assertion (`^*`, `$+`, `\b?`, `\A{2}`, `\z*`) is an error in jq (`target of repeat operator is invalid`) and is refused here too (#5535), where the `regex` crate repeats the empty match and answered `true`.
-Only a direct repetition is refused: a non-capturing group of an assertion (`(?:^)*`), which jq also refuses, is still accepted here.
-Under the `x` flag, or a pattern with an inline flag group naming `x`, the check stands down, because the scan cannot see the mode's ignored blanks (it does skip its comments); `test(\"^ *\"; \"x\")` is an error in jq and `true` here.
+A repeated group Oniguruma reads as an assertion is refused as well (#6127).
+It decides from the parsed node: an assertion (`^ $ \A \z \Z \G \b \B`, a look-ahead or look-behind) is an invalid target, a sequence of several nodes is not (`(?:\b\b)*` compiles), an alternation is invalid when any one alternative is (`(?:a|\b)*` is refused, `(?:a|\b\b)*` is not), a plain `(?:...)` group is its body (`(?:(?:\b))*` and `(?:(?:\b)|c)*` are refused), and a capturing, named, atomic or option group may repeat anything (`(\b)*`, `(?i:\b)*`).
+The rule was captured from jq 1.7.1 over 75,780 generated groups, and the scan agrees on all of them: `scripts/jq-regex-repeat-target-sweep.py SUBJECT` regenerates the sweep and compares (not part of the CI gate), and `tests/jq_cli/i6127.rs` pins hand-picked rows.
+The check runs after the pattern's other refusals, so an error earlier in the pattern is the one reported.
+What jq's answer is for a pattern it does compile is the matcher's, not this check's: `"aBcb" | [match("(?:[ab]\\w|\\b\\b||c)*";"g") | .string]` is `["aB","","",""]` in jq, because an empty alternative ends the repeat (#6106).
+Under the `x` flag, or a pattern with an inline flag group naming `x`, both checks stand down, because the scan cannot see the mode's ignored blanks (it does skip its comments); `test(\"^ *\"; \"x\")` is an error in jq and `true` here.
 
 ## Possessive quantifiers are refused (#5524)
 
@@ -7548,7 +7552,8 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   Pinned by `test_a_repeated_empty_group_keeps_its_old_search_5530`.
 - **A group that iterates over the empty string is read differently, with or without a flag.**
   Oniguruma stops a loop after an iteration that matched nothing and keeps that iteration: `"a" | match("(a*)*")` has `[1,0,""]` for group 1, and `"bcba" | match("b(c|(|.))*")` is `"bc"`.
-  The `regex` crate kept the last non-empty iteration (`[0,1,"a"]`) until such a loop was rewritten to end with its empty iteration (#6069, the entry below), and it still matches `"bcba"` (#6106).
+  The `regex` crate kept the last non-empty iteration (`[0,1,"a"]`) until such a loop was rewritten to end with its empty iteration (#6069, the entry below), and with a capture group it still matches `"bcba"` (#6106).
+  Without the capture groups the match agrees: `"bcba" | match("b(?:c|(?:|.))*")` is `"bc"` in both since [#6106](#a-loop-ends-at-an-iteration-that-matches-nothing-6106), which leaves a body with a group as written.
   `fancy-regex` reports the empty iteration as jq does for the captures, so `"a" | match("(a*)*";"n")` now agrees, but it backtracks out of an empty iteration to a longer match, so `"bcba" | match("b(c|(|.))*";"n")` is still `"bcba"`.
   A repeated group with an empty alternative and `n` is another shape: `"ab" | match("(((b)|(|a))){2}";"n")` is `"ab"` in jq, `"a"` here and `"b"` before.
   This predates `l` and `n`, which only move a pattern to the other route.
@@ -7578,7 +7583,7 @@ exists for the two-sided check to pin, the same caveat
 Oniguruma ends a greedy unbounded repeat (`*`, `+`, `{0,}` or `{1,}`) whose body can match empty with an iteration that matches empty, and a group in the body keeps that iteration.
 `"ab" | match("(a*)*b").captures[0]` is `[1,0,""]` in jq 1.7.1 (a capture is shown as `[offset, length, string]`).
 The `regex` crate never makes an empty iteration, and reported the last non-empty one, `[0,1,"a"]`.
-Since #6069 such a repeat is rewritten before the crate compiles it (`src/jq/onig_loop.rs`).
+Since #6069 such a repeat is rewritten before the crate compiles it (`src/jq/onig_capture_loop.rs`).
 `X*` becomes the loop followed by a copy of `X` whose characters, classes and `.` never match, so the copy is the empty last iteration, and each group reads the last of its copies that the match set.
 That also covers a group nested in the body, which keeps what an earlier iteration captured as in jq (`"abc" | match("((a)|b*)*c")` has `(a)` at `[0,1,"a"]`).
 It covers a body that tries the empty match first (`(a??)*b`), and a loop that gives characters back to the rest of the pattern (`"aab" | match("(a*)*ab")` is `[1,0,""]`).
@@ -7599,6 +7604,56 @@ What still differs:
   When an alternative that matches empty comes before one that consumes text, Oniguruma ends the loop at the empty iteration and the `regex` crate goes on, so the match itself differs (#6106).
 
 A bounded repeat (`(a*){0,5}b`, `(a*){2}b`) and `(a*){2,}b` are not rewritten and agree, because the crate expands them into copies and the last copy matches empty.
+
+## A loop ends at an iteration that matches nothing (#6106)
+
+Oniguruma tries a greedy repeat's body one way at a time, and when the way it is trying matches nothing, its empty-iteration check ends the loop: the rest of the pattern runs there, and the body's later ways are tried only if that fails.
+The `regex` crate drops an empty iteration and tries the body's later ways first, so a body whose empty way comes before a consuming one matched longer: `"ba" | match("(?:b*|a)+")` is `"b"` in jq 1.7.1 and was `"ba"` here, and `"foo-bar" | gsub("(?:\\w*|-)+"; "X")` is `"XX-XX"` in jq and was `"XX"`.
+Both now answer as jq does.
+The empty way ends the loop before its minimum count too: `"bab" | [match("(?:b*|a){2,}"; "g") | .string]` is `["b","","b",""]`.
+So does a bounded repeat's, where the `regex` crate went on to the next copy's ways: `"bab" | [match("(?:(?:b|c)||[ab]){2}"; "gn") | .string]` is `["b","ab"]` in jq and was `["b","a","b"]`.
+
+The pattern is rewritten before either engine sees it (`src/jq/onig_loop.rs`).
+A body's ways to match, in the order a backtracking engine tries them, are the consuming ways before its first empty way (`A`), that empty way, and the consuming ways after it (`B`), and Oniguruma's loop is `A*(?:B A*)*?`, in which no iteration is empty.
+Only a loop with a `B` is rewritten, since without one the two engines agree.
+The rewrite applies to `test`, `match`, `capture`, `scan`, `split`, `splits`, `sub` and `gsub` alike, and never in yq mode, whose Go `regexp` has no empty-iteration check (`"ba" | match("(?:b*|a)+")` is `"ba"` in yq v4.53.3).
+A differential against jq 1.7.1 over 160,000 cases (5,000 generated capture-free patterns, each on strings over `{a,b,c}` under the flags `g`, `gn`, `gi` and none) found 614 cases fixed, none broken and none left.
+
+These keep their loop as written, and still match longer than jq where the shape occurs:
+
+- **A body with a capture group:** `"ba" | match("(b*|a)+")` is `"b"` in jq and `"ba"` here.
+  An empty iteration also sets the group in Oniguruma ([#6069](#a-capture-under-an-unbounded-repeat-on-the-fancy-regex-route-keeps-its-last-non-empty-iteration-6069)).
+- **A body with a zero-width assertion** (`^`, `$`, `\b`, `\A`, `\z`): its empty way depends on where it stands, which the rewrite does not express.
+- **A body with a flag switch** (`(?i)` inside it): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and `["ba",""]` here.
+  The switch reaches every later way of the group, which the rewrite would move out of its reach.
+  A flag group (`(?i:b*)`) is rewritten.
+- **A body with syntax only `fancy-regex` reads** (a lookaround, an atomic group, a backreference, `\K`, `\G`, or a comment with a quantifier after it) keeps its loop, which `fancy-regex` then runs itself and mostly as jq does.
+  Over 40,000 generated cases with such syntax in a loop body, 42 were fixed, none broken, and 2,356 differ as before, of three kinds.
+  1,648 are `\K` as a bare alternative (`(?:\K|a)+`), a pattern jq refuses and succinctly accepts ([#6157](https://github.com/rust-works/succinctly/issues/6157)).
+  689 are a comment followed by a quantifier, which Oniguruma applies to the item before the comment (`b(?#)*` is `b*`): `"bab" | [match("(?:b(?#)*|a)+"; "g") | .string]` is `["b","","b",""]` in jq and `["bab",""]` here.
+  19 are scattered over the other constructs.
+  A comment with no quantifier after it matches nothing, and its loop is rewritten.
+  A loop beside or around such syntax is rewritten since [#6128](https://github.com/rust-works/succinctly/issues/6128): the rewrite reads a pattern the `regex` crate's parser refuses through a copy that writes that syntax plainly at the same offsets (`oniguruma_shadow` in `src/jq/eval.rs`), so `"ba" | match("(?:b*|a)+(?=)")` is jq's `"b"` (it was `"ba"`), and a loop inside a lookaround or atomic group is rewritten too.
+  Over 30,000 generated cases with such syntax beside or around a loop, 235 were fixed, none broken, and 4 differ as before: a loop inside a lookahead followed by `.+` or `.*` (`"aaac" | match("(?=(?:[bc]*c??|){2,}c).+")`), where jq finds no match at all although the lookahead holds at offset 3.
+  A pattern with a conditional (`(?(1)...)`) is read as before.
+- **An unbounded lazy repeat that must run twice or more, over a body with a consuming way before its empty one** (`{n,}?`, n of 2 or more; the `b` of `b?` in `(?:b?|\\w)`): `"ab" | [match("(?:b?|\\w){2,}?"; "gn") | .string]` is `["a","b"]` in jq and `["ab"]` here, although the repeat is rewritten.
+  Pinned by `tests/jq_cli/i6128.rs`.
+  The same repeat with an upper bound (`{2,3}?`) and one whose body has no consuming way before its empty one are rewritten ([#6128](https://github.com/rust-works/succinctly/issues/6128)): `"bab" | [match("(?:(?:b|c)||[ab]){2,3}?"; "gn") | .string]` is `["b","ab"]`, as in jq.
+  A lazy repeat that runs once at most (`*?`, `+?`, `??`, `{1,3}?`) already agrees with jq.
+- **The `l` flag:** the longest match's span does not depend on the order the ways are tried in, and `fancy-regex`'s longest mode refuses the lazy repeat the rewrite writes.
+- **A pattern whose rewrite would grow past sixteen times its length and a kilobyte** (nested loops copy their bodies), or past the `regex` crate's size or nesting limit.
+
+## An alternation's branches share a prefix that can match more than one way (#6134)
+
+`regex-syntax` 0.8.11 factors a prefix that every branch of an alternation starts with out of it, `XA|XB` becoming `X(?:A|B)`, which changes the leftmost-first match when `X` can match more than one way ([rust-lang/regex#1400](https://github.com/rust-lang/regex/issues/1400)).
+`"aab" | match("a*a|a*b")` is `"aa"` in jq 1.7.1 (and in yq v4.53.3) and was `"aab"` here, and the lazy `"aab" | match("(?:a*a|a*b)+?")` went on to `"aab"` too.
+`fancy-regex` hands the alternations it does not run itself to the same constructor, so lookaround and backreference patterns matched the same way.
+Both modes now answer as the reference does.
+An alternation whose branches are all sequences holding a repeat or another alternation gets a first branch that never matches (`[^\s\S]`, with the first branch's leading and trailing assertions so that the alternation keeps its anchoring), and the factoring stops at it (`guard_prefix_lifting` in `src/jq/eval.rs`).
+A differential against jq 1.7.1 over 80,000 generated cases found 882 fixed, 182 still differing for other reasons, and 11 that agreed before and now differ.
+Each of the 11 is a loop whose body can match nothing and holds a capture group, the first bullet of [#6106](#a-loop-ends-at-an-iteration-that-matches-nothing-6106)'s list: the factoring had cancelled that difference out.
+
+A pattern whose guarded form the `regex` crate refuses for its size, where the pattern as written fits, compiles as written and keeps the factored match.
 
 ## `$` before a final newline (#5572)
 
@@ -9372,6 +9427,14 @@ $ printf '\x1e"a"\n\x1e"b"\n' | jq --seq -c '.'   # "a" and "b" -- trailing newl
 All three now match (`succinctly jq` reproduces every row above, including `-s`); before
 #2998 `succinctly jq` also printed `"b"` on the middle row.
 
+### Past the end of a `--seq` stream, `input` names the plain-JSON position (#6146)
+
+Without `-s`, an `input` that runs past the end of a `--seq` stream names its source by the rule plain JSON follows (#4303).
+The position is `<unknown>` when the read that reached the end of input completed the stream's last value, and the last source's newline count otherwise, a stream with no value at all included.
+The values are the ones the `--seq` reader yields, and a string or container completes on its closing byte, a number or literal on the byte after it.
+`scripts/jq-seq-eof-position-sweep.py SUBJECT` sweeps 1,554 streams, each through three programs (4,662 runs), against jq (not part of the CI gate).
+It leaves 30 differences, all streams that end in a fault after their last value (`\x1e[1]1`), which are #6137's family and not placed by this rule.
+
 ### `--seq -s` keeps its EOF location when the final byte completes a value (#3003)
 
 The same per-call local decides whether a runtime error under `--seq -s` can still name a
@@ -9449,8 +9512,10 @@ warning after evaluating the values read before it, so a runtime error on an ear
 comes first, and `halt` suppresses the warnings after it. jq's `input`/`inputs` read each
 warning as an error instead, and `succinctly jq` raises them the same way since #5640, at the
 position jq names (see the `-n` paragraph below): behind the values before it, with the reads
-after it resuming, and under `-s` before the slurped array. A plain run prints all the
-warnings up front, before any of that can happen.
+after it resuming, and under `-s` before the slurped array.
+A program that reads `input`/`inputs` without `-n` or `-s` gets the same since [#6137](https://github.com/rust-works/succinctly/issues/6137), so the records after a fault pair with the main loop as in jq, and the main loop prints a warning the program did not read when it reaches it, after the values before it.
+The reader's message-less return (#5662) ends that main loop as it ends jq's, so the values behind it reach only `input`.
+Any other program without `-s` prints all the warnings up front, before any of that can happen.
 
 The differential guard remains deliberately asymmetric: **0 stdout supersets** across the
 randomized corpus. A fabricated value is a correctness failure even where an unrelated jq
@@ -10352,6 +10417,12 @@ starts the slice at 0. Every other depth (a negative or fractional number, `null
 succinctly raises a catchable error at exit 5 instead — the "would take the host process
 down" condition. The wording is succinctly's own (`expected string, got strflocaltime
 format`), since jq has none to match.
+That holds only for a number that converts (#6111).
+jq tests the input before it reads the format.
+`null | strftime(1)` is `strftime/1 requires parsed datetime inputs` in both.
+`[] | strftime(1)` is `strftime/1 requires a string format` in both.
+`1e1000 | strftime(1)` is `error converting number of seconds since epoch to datetime` in both.
+`1e1000 | strflocaltime("%Y")` aborts jq on a second assertion (`jv_array_get`) and raises that conversion error here.
 
 `strflocaltime` uses the local zone `localtime` uses, so the two agree with each other
 ([#3054](https://github.com/rust-works/succinctly/issues/3054)). Both resolve `TZ` as an IANA
@@ -13862,8 +13933,17 @@ A plain walk and `-n` with `input`/`inputs` hand each event to the program when 
 A 70 MB document walked with `select(length==2)|empty` peaks at 72 MB (the old walk: 664 MB; jq: 2 MB, which reads 4 KB at a time where the reader here takes the file whole).
 Two differences remain:
 
-- **`--seq`** combines with `--stream` in jq (`echo '[1] 2' | jq --seq --stream -c .` prints each event after an RS
-  byte); here `--seq` wins and the flag is ignored.
+- **`--seq`** combines with `--stream` since [#6115](https://github.com/rust-works/succinctly/issues/6115): the program reads the events of each record (`printf '\x1e[1]\n\x1e{"a":2}\n' | jq --seq --stream -c .` prints `[[0],1]`, `[[0]]`, `[["a"],2]` and `[["a"]]`, each after an RS byte), a record cut short gives the events before the cut, and the fault is the warning `jq: ignoring parse error: ...` that `--seq` prints for a document.
+  The same port of jq's streaming parser reads it, with the record-sequence rules of `jv_parse.c` added to `Parser` (`JV_PARSER_WAITING_FOR_RS`, the `Truncated value` check at an RS, the `(need RS to resync)` suffix, the abandoned-text report at EOF, and a fault that ends its call and not the rest of the line).
+  A fault is the error `input`/`inputs` raise when the program reads one, and a warning when the main loop reads it.
+  A byte-order mark that breaks off (`\xef\xbb` and then another byte) is consumed without a column and wipes the parser at the start of every call, as jq's `jv_parser_set_buf` leaves it, which costs a container the close event that was pending.
+  `-s` closes its array at the call jq's `--slurp` loop ends in, which a fault earlier in the last read moves past the events that read left pending, and leaves `input_filename` `null` and `input_line_number` `0` after a fault in that read.
+  `tests/jq_cli/i6115.rs` pins it, and 15,500 random record sequences (one to three files, lines across jq's 4,095-byte read, `-s`, `-n`, `input`, `inputs`, `input_line_number`, `input_filename`) matched `/usr/bin/jq` 1.7.1 on stdout, status and the set of stderr lines.
+  Two differences remain, both shared with `--seq` over documents.
+  A plain run prints its warnings before it evaluates anything, so a runtime error or `halt` on an earlier event comes after warnings jq would not have printed yet.
+  And the end of the stream that jq's non-slurp rule draws on an empty record in the last read (#2998) ends the stream here for a program that calls `input`, where jq's main loop reads on after the call that met it and so also reads what follows: `printf '\x1e[1]\n\x1e[2' | jq -c --seq --stream '[inputs]'` prints `[[[0]]]` and then the warning `Unfinished JSON term at EOF`, where this prints only `[[[0]]]`.
+  What follows can also be a fault that a later `input` raises, so the difference can cost an error and an exit status (`jq -e` exits 5 where this exits 0), not only a warning ([#6141](https://github.com/rust-works/succinctly/issues/6141)).
+  The events of a `--seq --stream` run are read whole before the program starts, so memory grows with the input; the chunked reader that plain `--stream` uses (#5498) does not serve `--seq`.
 - **A file that does not open** and is named before one that does makes jq's `--stream` stop after the first event of the later file (`jq -c --stream . missing.json a.json` prints `[[0],1]` and the open error, exit 2), where succinctly prints every event.
   Both `-n` with `inputs` and a non-stream run agree with jq there, so the quirk is in jq's streaming parser's state after the failed open, not in what the program reads.
 
@@ -13875,7 +13955,7 @@ Its events are materialized rather than streamed, so memory grows with the input
 `--validate` still runs first and rejects a malformed input outright, since strict validation is what it asks for.
 Under `-R` and `--input-dsv` the flag is ignored, as `--stream` is.
 It is pinned by `tests/jq_cli/i5474.rs` and was checked against `/usr/bin/jq` on random malformed inputs, with stdout, exit status and the `(at <file>:<line>)` marker compared.
-One shape differs: `--seq` combines with `--stream-errors` in jq (`printf '[1,2' | jq --seq --stream-errors -c .` prints `["Unfinished abandoned text at EOF at line 1, column 4",[]]`), and here `--seq` wins and the flag is ignored, as it is for `--stream`.
+`--seq` combines with it since #6115, as with `--stream` above: `printf '[1,2' | jq --seq --stream-errors -c .` prints `["Unfinished abandoned text at EOF at line 1, column 4",[]]`, and a fault in a record is the event `[message, path]` and not a warning.
 
 `-b` is accepted and ignored, as jq does outside Windows; `--binary` is rejected there (`Unknown option --binary`, exit 2) and here.
 

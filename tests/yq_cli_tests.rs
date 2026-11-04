@@ -63379,7 +63379,7 @@ fn any_all_cond_reads_the_element_position_2968() -> Result<()> {
         // `parent` from inside `cond` climbs from the element (scalar compare: a container
         // pairing is never equal in yq mode since #2799)
         (
-            r#".aa | any(.[]; ((parent | keys) | tojson) == "[\"bbb\",\"c\"]")"#,
+            r#".aa | any(.[]; ((parent | keys) | @json) == "[\"bbb\",\"c\"]")"#,
             "true",
         ),
     ] {
@@ -63527,7 +63527,7 @@ fn any_all_cond_read_resolves_on_rewritten_routes_3079() -> Result<()> {
             r#"{"bbb":"bbb","c":"c"}"#,
         ),
         (
-            r#".aa | map_values(any(.[]; ((parent|keys) | tojson) == "[\"y\"]"))"#,
+            r#".aa | map_values(any(.[]; ((parent|keys) | @json) == "[\"y\"]"))"#,
             r#"{"bbb":false,"c":true}"#,
         ),
         (

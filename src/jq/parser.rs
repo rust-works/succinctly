@@ -34,8 +34,9 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::eval::{
-    apply_compare_op, arith_combine, contains_retrying_pattern_bind, try_compare_op, EvalError,
-    EvalSemantics, JqSemantics, YqSemantics,
+    apply_compare_op, arith_combine, contains_retrying_pattern_bind,
+    pattern_alternatives_var_names, try_compare_op, EvalError, EvalSemantics, JqSemantics,
+    YqSemantics,
 };
 use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import,
@@ -45,6 +46,112 @@ use super::expr::{
 };
 use super::value::{parse_i64_or_f64_in, NumberRepr, OwnedValue};
 use super::walk::{any_subexpr, map_subexprs};
+
+/// The builtins that answer from the *node* their input is, which a fold's loop variable loses:
+/// the fold binds the element's value, and a value has no position, comments, style or anchor.
+fn is_node_read(stage: &Expr) -> bool {
+    matches!(
+        stage,
+        Expr::Builtin(
+            Builtin::PathNoArg
+                | Builtin::Key
+                | Builtin::Parent
+                | Builtin::Line
+                | Builtin::Column
+                | Builtin::DocumentIndex
+                | Builtin::FileIndex
+                | Builtin::Filename
+                | Builtin::Tag
+                | Builtin::Anchor
+                | Builtin::Alias
+                | Builtin::Style
+                | Builtin::Kind
+                | Builtin::LineComment
+                | Builtin::HeadComment
+                | Builtin::FootComment
+        )
+    )
+}
+
+/// Whether `expr` binds `name` anew, so a `$name` inside it is not the loop variable.
+fn rebinds_name(expr: &Expr, name: &str) -> bool {
+    any_subexpr(expr, &mut |e| match e {
+        Expr::As { var, .. } => var == name,
+        Expr::AsPattern { patterns, .. }
+        | Expr::Reduce { patterns, .. }
+        | Expr::Foreach { patterns, .. } => pattern_alternatives_var_names(patterns)
+            .iter()
+            .any(|bound| bound == name),
+        Expr::FuncDef { params, .. } => params.iter().any(|p| p.name() == name),
+        _ => false,
+    })
+}
+
+/// `update` with each `$name | READ` (READ a node-reading builtin, [`is_node_read`]) replaced by
+/// `$bound | .[]`, `$bound` a variable of the READ's own holding all it outputs, the READ appended
+/// to `reads` the first time it is met. A READ that outputs nothing (`key` of a root) then still
+/// outputs nothing in the update.
+fn replace_node_reads(update: &Expr, name: &str, reads: &mut Vec<(Builtin, String)>) -> Expr {
+    if let Expr::Pipe(stages) = update {
+        if let [Expr::Var(var), read @ Expr::Builtin(builtin), rest @ ..] = &stages[..] {
+            if var == name && is_node_read(read) {
+                let bound = match reads.iter().find(|(seen, _)| seen == builtin) {
+                    Some((_, bound)) => bound.clone(),
+                    None => {
+                        let bound = format!("{name}\u{1}{}", reads.len());
+                        reads.push((builtin.clone(), bound.clone()));
+                        bound
+                    }
+                };
+                let mut out = vec![Expr::Var(bound), Expr::Iterate];
+                out.extend(rest.iter().map(|s| replace_node_reads(s, name, reads)));
+                return Expr::pipe(out);
+            }
+        }
+    }
+    map_subexprs(update, &mut |e| replace_node_reads(e, name, reads))
+}
+
+/// yq's `SRC as $v ireduce (INIT; UPDATE)` binds `$v` to the node `SRC` selected, so `$v | path`,
+/// `$v | key`, `$v | line` and the rest answer from where that node sits (#6088). The fold binds the
+/// element's value instead, and `path` of a value is `[]`.
+///
+/// Each such read is taken where the node is still in hand: `SRC | [., READ, ...]` yields the
+/// element and every READ the update makes of it, each collected as `[READ]`, `$v` is bound to the
+/// first and each read to its own variable, and the update's `$v | READ` becomes that variable's
+/// `.[]`. An update with no such read, a pattern that is not a single `$v`, and an update that
+/// binds `$v` again anywhere are left as written.
+#[inline(never)] // one rare call site (`ireduce`): out of line, so it does not grow the parser's inlined body (#6088)
+fn bind_ireduce_node_reads(
+    source: Expr,
+    patterns: Vec<Pattern>,
+    update: Expr,
+) -> (Expr, Vec<Pattern>, Expr) {
+    let [Pattern::Var(name)] = patterns.as_slice() else {
+        return (source, patterns, update);
+    };
+    if rebinds_name(&update, name) {
+        return (source, patterns, update);
+    }
+    let mut reads: Vec<(Builtin, String)> = Vec::new();
+    let replaced = replace_node_reads(&update, name, &mut reads);
+    if reads.is_empty() {
+        return (source, patterns, update);
+    }
+    let mut tuple = vec![Expr::Identity];
+    tuple.extend(
+        reads
+            .iter()
+            .map(|(read, _)| Expr::Array(Box::new(Expr::Builtin(read.clone())))),
+    );
+    let source = Expr::pipe(vec![
+        Expr::Paren(Box::new(source)),
+        Expr::Array(Box::new(Expr::comma(tuple))),
+    ]);
+    let mut vars = vec![Pattern::Var(name.clone())];
+    vars.extend(reads.into_iter().map(|(_, bound)| Pattern::Var(bound)));
+    (source, vec![Pattern::Array(vars)], replaced)
+}
 
 /// Parser mode controls syntax differences between jq and yq.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -4378,7 +4485,12 @@ impl<'a> Parser<'a> {
                             && !self.shadowable_defs.contains("to_yaml"))
                         // #5456: yq also spells it `toyaml`.
                         || (self.matches_keyword("toyaml")
-                            && !self.shadowable_defs.contains("toyaml")))
+                            && !self.shadowable_defs.contains("toyaml"))
+                        // #6158: and `to_json(N)` as `tojson(N)`; a bare `tojson` stays the builtin,
+                        // which renders as `to_json` does in yq mode.
+                        || (self.matches_keyword("tojson")
+                            && self.input[self.pos + "tojson".len()..].starts_with('(')
+                            && !self.shadowable_defs.contains("tojson")))
                 {
                     // #4206: yq's `to_json` / `to_yaml`, each with an optional literal indent.
                     self.parse_yq_to_text_operator()
@@ -5002,9 +5114,11 @@ impl<'a> Parser<'a> {
     /// non-negative integer literal: yq's parser rejects any other argument (`to_json(.a)`,
     /// `to_json(2+2)`, `to_json(-1)`) as `bad expression`.
     fn parse_yq_to_text_operator(&mut self) -> Result<Expr, ParseError> {
-        let json = self.matches_keyword("to_json");
-        self.consume_keyword(if json {
+        let json = self.matches_keyword("to_json") || self.matches_keyword("tojson");
+        self.consume_keyword(if self.matches_keyword("to_json") {
             "to_json"
+        } else if self.matches_keyword("tojson") {
+            "tojson"
         } else if self.matches_keyword("toyaml") {
             "toyaml"
         } else {
@@ -10474,6 +10588,7 @@ impl<'a> Parser<'a> {
             let update = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
+            let (expr, patterns, update) = bind_ireduce_node_reads(expr, patterns, update);
             return Ok(Expr::Reduce {
                 input: Box::new(expr),
                 patterns,
@@ -15981,5 +16096,53 @@ mod tests {
         }
         assert!(parse_program("if . then 1 end").is_ok());
         assert!(parse_program(". and true").is_ok());
+    }
+    /// The patterns of the `reduce` an `ireduce` filter parses to, in yq mode.
+    fn ireduce_patterns(filter: &str) -> Vec<Pattern> {
+        match parse_with_mode_and_extensions(filter, ParserMode::Yq, true).unwrap() {
+            Expr::Reduce { patterns, .. } => patterns,
+            other => panic!("{filter:?} parsed to {other:?}"),
+        }
+    }
+
+    /// #6088: an `ireduce` whose update reads the loop variable's node binds the element and one
+    /// variable per distinct read, and declines wherever it could not tell which `$i` a read means.
+    #[test]
+    fn ireduce_node_reads_bind_a_variable_per_distinct_read_6088() {
+        // One read, read twice: one variable beside the element.
+        let Pattern::Array(vars) =
+            &ireduce_patterns(".[] as $i ireduce([]; . + [($i|path), ($i|path)])")[0]
+        else {
+            panic!("the reads were not bound");
+        };
+        assert_eq!(vars.len(), 2);
+        // Two reads, two variables.
+        let Pattern::Array(vars) =
+            &ireduce_patterns(".[] as $i ireduce([]; . + [($i|path), ($i|key)])")[0]
+        else {
+            panic!("the reads were not bound");
+        };
+        assert_eq!(vars.len(), 3);
+    }
+
+    #[test]
+    fn ireduce_leaves_a_fold_it_cannot_read_as_written_6088() {
+        let single = vec![Pattern::Var("i".into())];
+        for filter in [
+            // No node read.
+            ".[] as $i ireduce([]; . + [$i])",
+            // A `$i` the update binds again, by every binder there is.
+            ".[] as $i ireduce([]; . + [($i|path)] | . as $i | .)",
+            ".[] as $i ireduce([]; . + [($i|path)] | . as [$i] | .)",
+            ".[] as $i ireduce([]; . + [($i|path)] | (.[] as $i ireduce(0; .)))",
+            ".[] as $i ireduce([]; . + [($i|path)] | [foreach .[] as $i (0; .)])",
+            ".[] as $i ireduce([]; . + [($i|path)] | def f($i): .; f(1))",
+        ] {
+            assert_eq!(ireduce_patterns(filter), single, "{filter}");
+        }
+        // A pattern that is not a single `$i`.
+        let patterns = ireduce_patterns(".[] as [$a, $b] ireduce([]; . + [($a|path)])");
+        assert_eq!(patterns.len(), 1);
+        assert!(matches!(&patterns[0], Pattern::Array(vars) if vars.len() == 2));
     }
 }

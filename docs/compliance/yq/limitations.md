@@ -1966,6 +1966,13 @@ A yq re-pinned to a build with a newer Go needs the table re-derived; it was gen
 Still different: a named group whose name starts with a digit (`(?P<1n>a)`) or repeats an earlier one (`(?P<a>x)(?P<a>y)`) is accepted, as in yq, but the group is unnamed here (the crate refuses both), so `capture` does not report that name; and a surrogate escape (`\x{D800}`), which Go reads as a rune no text contains, is read here as U+FFFD.
 jq mode keeps Oniguruma's own rules (see the jq limitations).
 
+### A prefix shared by every branch of an alternation stays in each branch (#6134)
+
+Go's `regexp` factors only a simple prefix (a literal, a class) out of an alternation, so `.s | match("a*a|a*b")` on `s: aab` is `"aa"` in yq v4.53.3.
+The `regex` crate's parser also factored out a prefix that can match more than one way, and the second branch's `"aab"` won; `succinctly yq` now answers `"aa"` too.
+The mechanism, shared with jq mode, and the one shape it leaves (a pattern whose guarded form the `regex` crate refuses for its size) are in the jq limitations' #6134 entry.
+Pinned by `tests/yq_cli/i6134.rs`.
+
 ### Global regex zero-width-match iteration — resolved, real yq uses Go's `regexp`
 
 [#1255](https://github.com/rust-works/succinctly/issues/1255) resolved a divergence in
@@ -6124,7 +6131,8 @@ not a literal block; a flow-sourced container is block; see the `@yaml` table be
 `to_json` of a string holding a backslash-`u` escape in a filter literal differs because filter
 literals are unescaped here (`"\u0001"`) where yq keeps the backslash. `to_json`/`to_yaml` print
 the same bytes as `@json`/`@yaml` plus yq's indent and trailing line break; `tojson` is
-unchanged (see the `tojson` entry). An indent past 100000 is refused at parse time (yq would try to build it).
+`to_json` (#6158).
+An indent past 100000 is refused at parse time (yq would try to build it).
 
 `from_json`/`from_yaml` decode through the same scalar resolution as input documents, so an
 implicit-tag scalar yq types specially keeps succinctly's type: `"2020-01-01" | from_json | tag`
@@ -6171,12 +6179,12 @@ Not matched: an array reaches `join` the same way whether the document or the ex
 It follows the document case because that is the one real inputs hit.
 The separator is an evaluated expression: `join({})` is `1{}2` as in yq, and a `{}` separator that came from the document through `$s` is `1{}2` here for the same missing-origin reason (`. as $s | [1,2] | join($s)` over `{}` is `12` in yq).
 
-## `tostring` of a container is YAML since #1130; `tojson` still renders compactly ([#2902](https://github.com/rust-works/succinctly/issues/2902), [#1130](https://github.com/rust-works/succinctly/issues/1130))
+## `tostring` of a container is YAML since #1130 ([#2902](https://github.com/rust-works/succinctly/issues/2902), [#1130](https://github.com/rust-works/succinctly/issues/1130))
 
 Real yq's `tostring` on a container is its YAML encoder (block style, `!!float` tags
-where the spelling needs one, a node written in flow style kept in flow), and its `tojson`
-is its indented JSON encoder, which ends every string it produces -- scalar or container --
-with a newline of its own.
+where the spelling needs one, a node written in flow style kept in flow).
+Its `tojson` is `to_json`, its indented JSON encoder, which ends every string it produces --
+scalar or container -- with a newline of its own; `succinctly yq` reads `tojson` as `to_json` since [#6158](https://github.com/rust-works/succinctly/issues/6158), `tojson(0)` included.
 
 `tostring` now matches (#1130): a container becomes the YAML the CLI would print for it, with
 the one trailing line break chomped (`[1, 2] | tostring` is `"- 1\n- 2"`, `[1.0 * 3]` is
@@ -6882,3 +6890,20 @@ A line is scanned once it is 64 KiB long even if its end has not arrived, so a l
 A single token is held whole while it is scanned, as go-yaml holds it: a quoted or plain scalar of tens of megabytes on one line, or a block scalar, takes several times its size in memory until it ends.
 
 yq's own colorizer also repeats the line break after a tag that ends its line (`a: !tag` / `  b: 1` prints a blank line between them), and `succinctly yq -C` repeats it as well.
+
+## An `ireduce` loop variable answers a node read only when the read is its first stage ([#6088](https://github.com/rust-works/succinctly/issues/6088))
+
+yq binds `$i` in `SRC as $i ireduce (INIT; UPDATE)` to the node `SRC` selected, so `$i | path`, `$i | key`, `$i | line` and the other node reads answer from where it sits.
+`succinctly yq` binds the element's value, and takes each of those reads before the fold, at the one place the node is still in hand: `SRC | [., READ, ...]` feeds the fold, and the update's `$i | READ` is replaced by what that read answered.
+The reads are `path`, `key`, `parent`, `line`, `column`, `document_index`, `file_index`, `filename`, `tag`, `anchor`, `alias`, `style`, `kind`, `line_comment`, `head_comment` and `foot_comment`, and the answer is yq's for each.
+Only the first stage after `$i` is read from the node: in `$i | parent | key` the `parent` is, and the `key` of the parent sees a value, so it is `[]` where yq prints the parent's key.
+A `$i | READ` stays a value read in an update that binds `$i` again anywhere (the rewrite cannot tell which `$i` a read means), in a nested `ireduce` over the same name, and in a fold whose pattern is not a single `$i` (`as [$a, $b] ireduce`).
+Every read the update names is taken for every element, whether or not the step reaches it.
+`parent` copies the parent once per element, so it costs the parent's size per step.
+
+## `@csv` and `@tsv` spell a `null` as `null` ([#6131](https://github.com/rust-works/succinctly/issues/6131))
+
+yq's `@csv` and `@tsv` are Go's `encoding/csv` over the node, and a field is the node's text.
+`succinctly yq` encodes the same way (minimal quoting, arrays of arrays and of flat objects, a scalar input as its text, yq's error lines), pinned by `tests/yq_cli/i6131.rs`.
+The one difference is a `null` element: yq writes the spelling the document used (`~` for `[~, a]`, `null` for `[null, a]`), and a value does not hold it, so `succinctly yq` writes `null` for both.
+A number keeps its source text (`1.50`, `0x1f`, `1_0`) in both.

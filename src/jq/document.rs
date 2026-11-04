@@ -341,6 +341,16 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         false
     }
 
+    /// jq mode's owned value of the container this cursor stands on, read in one pass over its
+    /// own text when that text is plain RFC 8259 JSON, or `None` for the caller's walk to build
+    /// (#6125). The value is the one the walk builds. A format whose text is not JSON answers
+    /// `None`, as does JSON for a scalar, an empty `{}`/`[]` (nothing to save), a leniency, a repeated
+    /// key or deep nesting; the caller then walks, so a declined container costs a failed attempt
+    /// that stops at the offending token.
+    fn plain_owned_jq(&self) -> Option<OwnedValue> {
+        None
+    }
+
     /// The parent *within the document*: [`parent`](Self::parent), except
     /// that a document root has none. JSON has a single root; YAML's
     /// [`parent`](Self::parent) of a document root is the document stream,

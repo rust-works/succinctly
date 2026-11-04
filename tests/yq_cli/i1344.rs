@@ -362,12 +362,15 @@ fn an_earlier_entry_does_not_repeat_its_siblings_anchor_1344() -> Result<()> {
     Ok(())
 }
 
-/// `map_values(f)` where `f` yields nothing for a key's live entry drops the key, every entry of
-/// it. That is the answer on a document with no repeated key too (yq keeps the entry there, an
-/// older gap), so the repeated-key document is consistent with it rather than a new divergence.
+/// `map_values(f)` where `f` yields nothing for a key's live entry leaves the entry, as yq's
+/// `.[] |= f` does (#6129; it dropped the key, every entry of it, until then). A repeated key is
+/// consistent with that: the document keeps both entries, as yq prints them.
 #[test]
-fn map_values_that_yields_nothing_drops_the_whole_key_1344() -> Result<()> {
-    for (doc, expected) in [("a: 2\nb: 3\n", r#"{"b":3}"#), (D, r#"{"b":3}"#)] {
+fn map_values_that_yields_nothing_leaves_the_key_1344() -> Result<()> {
+    for (doc, expected) in [
+        ("a: 2\nb: 3\n", r#"{"a":2,"b":3}"#),
+        (D, r#"{"a":1,"a":2,"b":3}"#),
+    ] {
         let (out, code) = run_yq_stdin("map_values(select(. != 2))", doc, &["-o=json", "-I=0"])?;
         assert_eq!(code, 0, "{doc:?}");
         assert_eq!(out.trim(), expected, "{doc:?}");

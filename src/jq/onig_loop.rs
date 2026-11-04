@@ -1,380 +1,693 @@
-//! Oniguruma's last iteration of a repeat whose body can match empty, written into a pattern for
-//! the `regex` crate (#6069).
+//! Oniguruma's exit from a loop at an iteration that matches nothing, written into a jq pattern
+//! for the `regex` crate (#6106).
 //!
-//! Oniguruma runs a greedy unbounded repeat (`*`, `+`, `{0,}`, `{1,}`) until an iteration matches
-//! empty, and that empty iteration is the one its captures keep: `"ab" | match("(a*)*b")` has the
-//! group at `[1,0,""]` in jq. The `regex` crate never makes an empty iteration (the thread meets a
-//! loop state it has already visited at that position and is dropped), so it reports the last
-//! non-empty one, `[0,1,"a"]`. Fixing the capture after the match cannot work, because where the
-//! loop ends depends on backtracking from the rest of the pattern (`"aab" | match("(a*)*ab")` gives
-//! a character back and is `[1,0,""]` in jq).
+//! Oniguruma tries a greedy, unbounded repeat's body one way at a time, and when the way it is
+//! trying matches nothing, its empty-iteration check ends the loop there: the rest of the pattern
+//! runs, and only when that fails are the body's later ways tried. The `regex` crate never makes
+//! an empty iteration (the thread that would comes back to a loop state it has already visited at
+//! that position, and is dropped), so it tries the later ways first and leaves the loop only after
+//! all of them: `"ba" | match("(?:b*|a)+")` is `"b"` in jq and was `"ba"` here.
 //!
-//! So the pattern says it instead. Without a backreference, an Oniguruma match of such a loop always
-//! ends with an empty iteration, and that iteration is the body's *first* way to match empty: the
-//! rest of the pattern runs at the same position whichever empty way it is, so a later one would
-//! fail where the first did. [`rewrite`] therefore writes `X*` as
+//! The ways a body `X` can match, in the order a backtracking engine tries them, are those that
+//! consume text before its first empty way (`A`), that empty way, and the consuming ways after it
+//! (`B`; a later empty way only repeats an exit that has already failed). Oniguruma's `X*` is then
+//! `L = A L | (exit) | B L`, which is `A*(?:B A*)*?` in a pattern no iteration of which can be
+//! empty. The empty way ends the loop even before it has run its minimum count, so `X+` and
+//! `X{n,}` are `L` too, and a bounded `X{m,n}` is `n` nested copies that each end at the empty way
+//! instead of going on to the next copy. [`rewrite`] writes that form for every such loop with a
+//! `B`, which is where the two engines can disagree; without one, they agree.
 //!
-//! ```text
-//! (?:X*E)      E = X with every character, class and `.` replaced by one that never matches
-//! ```
+//! A body whose ways are not listed here keeps its loop as written: one with a capture group (an
+//! empty iteration also sets the group, #6069), a zero-width assertion (its empty way depends on
+//! where it stands), or a flag switch.
 //!
-//! The loop still decides where the repeat ends, and `E`, which can only match empty and does so
-//! the way `X` would first, is the final iteration. A group inside `X` now has two copies: the one
-//! in the loop keeps what earlier iterations captured (Oniguruma keeps a group an iteration skipped:
-//! `"abc" | match("((a)|b*)*c")` has `(a)` at `[0,1]`), and the one in `E` holds what the empty
-//! iteration set. A group reads the last of its copies that the match set
-//! ([`LoopRewrite::copies`]). The repeated group itself is captured in `E` only, since `E` always
-//! matches and so always has the last word.
-//!
-//! The crate's capture engine pays for every state and slot over the length of a match, so `E` is
-//! kept small: a part of it with no group only says whether it can match empty there, and is written
-//! as nothing when it always can and as one failing class when it never can (`(\w*\s*)*` ends with
-//! `()`). A part that sets a flag is kept, as `(?m)` changes what a later `$` means.
-//!
-//! Only a body that matches empty at every position is rewritten: one whose every empty way passes an
-//! assertion (`(a|$)*`) matches empty at some positions and not others, so `E` could fail where
-//! Oniguruma's loop would simply stop. An assertion on a body that also has a way around it stays in
-//! `E` wherever a group needs it, since which empty way succeeds depends on the position only.
-//! Neither is a lazy repeat rewritten (`(a*)*?b` already agrees) nor a counted one from `{2,}` up,
-//! which the crate expands into copies whose last one matches empty. A projected loop (`X*` inside
-//! some `E`) is written as `E` alone: its loop copy could only make empty iterations, which the crate
-//! drops, so it would never set a group. That keeps the rewritten pattern linear in the nesting depth
-//! instead of doubling per level; [`MAX_REWRITTEN_LEN`] bounds it all the same.
+//! A pattern with syntax only `fancy-regex` reads (a lookaround, an atomic group, a backreference,
+//! `\K`, `\G`, a comment) is parsed through `oniguruma_shadow`'s copy of it, which writes that syntax
+//! plainly at the same offsets, and every piece's text is still taken from the pattern (#6128).
+//! Those constructs are opaque: a body holding one keeps its loop, and a lookaround or atomic
+//! group has its own body rewritten. A lazy repeat that must run twice or more is written copy by
+//! copy by `Rewriter::lazy_counted`; for an unbounded one over a body with a consuming way before
+//! its empty one that form still differs from Oniguruma's on a few patterns (#6128).
 
-use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
-use regex_syntax::ast::{
-    self, Ast, Flag, FlagsItemKind, GroupKind, RepetitionKind, RepetitionRange,
-};
+use regex_syntax::ast::{self, Ast, Flag, GroupKind, RepetitionKind, RepetitionRange};
 
-/// A class that matches no character: `E`'s stand-in for every character, class and `.` of `X`.
-const NEVER: &str = r"[^\s\S]";
-
-/// The longest rewritten pattern [`rewrite`] writes. A longer one keeps the pattern as it was,
-/// with its old captures, rather than hand the crate a pattern it may refuse for size.
-const MAX_REWRITTEN_LEN: usize = 1 << 16;
-
-/// A pattern rewritten by [`rewrite`], with what reading its groups back takes.
-pub(crate) struct LoopRewrite {
-    /// The pattern to compile.
-    pub(crate) pattern: String,
-    /// For each group of the original pattern (0 is the whole match), the groups of [`pattern`]
-    /// that hold a copy of it, in the order they open. The group's value is the last one set.
-    ///
-    /// [`pattern`]: Self::pattern
-    pub(crate) copies: Box<[Box<[usize]>]>,
-    /// The original pattern's group names, by group: every copy in [`pattern`](Self::pattern) is
-    /// unnamed, since the crate refuses a name used twice.
-    pub(crate) names: Box<[Option<Box<str>>]>,
-    /// How many groups [`pattern`](Self::pattern) has, the whole match included.
-    pub(crate) compiled_groups: usize,
+/// How a piece of pattern text may be joined to others without a group around it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Prec {
+    /// An alternation: needs a group to be concatenated or repeated.
+    Alt,
+    /// A concatenation or a repeat: needs a group to be repeated.
+    Concat,
+    /// One item that a quantifier may follow.
+    Atom,
 }
 
-/// `pattern` with every greedy unbounded repeat of a group that can match empty written so that the
-/// `regex` crate reports Oniguruma's captures (see the module docs), or `None` when no repeat
-/// needs it, the pattern does not parse, it uses `U` (which swaps what greedy means), or the result
-/// would pass [`MAX_REWRITTEN_LEN`].
-pub(crate) fn rewrite(pattern: &str) -> Option<LoopRewrite> {
-    if !pattern.contains('(') || !pattern.contains(['*', '+', '{']) {
+/// A piece of pattern text.
+#[derive(Clone)]
+struct Text {
+    text: String,
+    prec: Prec,
+}
+
+/// The ways a piece can match, in the order they are tried.
+#[derive(Clone)]
+enum Ways {
+    /// Every way consumes text.
+    Consuming,
+    /// Some way matches nothing. `before` holds the consuming ways tried before the first such
+    /// way and `after` those tried after it, each `None` when there are none; both consume text.
+    Nullable {
+        before: Option<Text>,
+        after: Option<Text>,
+    },
+    /// Not listed: a capture group, an assertion, a flag switch, or something holding one.
+    Unknown,
+}
+
+#[derive(Clone)]
+struct Piece {
+    text: Text,
+    ways: Ways,
+}
+
+/// Why the rewrite was abandoned; the pattern is then used as written.
+struct GiveUp;
+
+struct Rewriter<'p> {
+    /// The pattern as written. Every piece's text is taken from it, by the offsets of the parse.
+    source: &'p str,
+    /// Where each construct the parsed copy of `source` reads as something it is not starts
+    /// ([`oniguruma_shadow`](super::eval::oniguruma_shadow)): it is copied as written, and its ways
+    /// are not listed.
+    opaque: &'p [usize],
+    /// The longest text a piece may grow to: the rewrite copies a loop's body, and nested loops
+    /// copy the copies.
+    limit: usize,
+    /// The bytes of text built so far, and their bound: a body of many items that can match
+    /// nothing rebuilds its listed ways at each item, quadratic in the items.
+    work: core::cell::Cell<usize>,
+    work_limit: usize,
+    changed: bool,
+}
+
+/// `pattern` with every greedy, unbounded loop whose body can match nothing before trying a way
+/// that consumes text written so that the `regex` crate leaves the loop where Oniguruma does, or
+/// `None` when no loop needs it (or the pattern does not parse, or the rewrite grows too large).
+pub(crate) fn rewrite(pattern: &str) -> Option<String> {
+    if !may_need_rewrite(pattern) {
         return None;
     }
-    let ast = ast::parse::Parser::new().parse(pattern).ok()?;
-    if swaps_greed(&ast) || !has_candidate(&ast) {
-        return None;
-    }
-    let mut names = vec![None];
-    collect_names(&ast, &mut names);
-    let mut emitter = Emitter {
-        src: pattern,
-        out: String::with_capacity(pattern.len() * 2),
-        copies: vec![Vec::new(); names.len()],
-        next: 1,
-    };
-    emitter.copies[0].push(0);
-    emitter.emit(&ast, false).ok()?;
-    Some(LoopRewrite {
-        pattern: emitter.out,
-        copies: emitter
-            .copies
-            .into_iter()
-            .map(Vec::into_boxed_slice)
-            .collect(),
-        names: names.into_boxed_slice(),
-        compiled_groups: emitter.next,
-    })
+    rewrite_parsed(pattern)
 }
 
-/// The pattern grew past [`MAX_REWRITTEN_LEN`].
-struct TooLong;
-
-struct Emitter<'p> {
-    src: &'p str,
-    out: String,
-    copies: Vec<Vec<usize>>,
-    next: usize,
-}
-
-impl Emitter<'_> {
-    fn push(&mut self, s: &str) -> Result<(), TooLong> {
-        self.out.push_str(s);
-        if self.out.len() > MAX_REWRITTEN_LEN {
-            return Err(TooLong);
+fn rewrite_parsed(pattern: &str) -> Option<String> {
+    // #6128: a pattern with Oniguruma syntax only `fancy-regex` reads (lookaround, a backreference,
+    // `\K`) is parsed through a copy that writes that syntax plainly at the same offsets. A pattern
+    // the parser reads as written is read as written.
+    let shadow;
+    let (parsed, ast, opaque) = match ast::parse::Parser::new().parse(pattern) {
+        Ok(ast) => (pattern, ast, &[][..]),
+        Err(_) => {
+            shadow = super::eval::oniguruma_shadow(pattern)?;
+            let ast = ast::parse::Parser::new().parse(&shadow.text).ok()?;
+            (shadow.text.as_str(), ast, shadow.opaque.as_slice())
         }
-        Ok(())
+    };
+    let mut rewriter = Rewriter {
+        source: pattern,
+        opaque,
+        limit: pattern.len().saturating_mul(16).saturating_add(1024),
+        work: core::cell::Cell::new(0),
+        work_limit: pattern.len().saturating_mul(64).saturating_add(64 * 1024),
+        changed: false,
+    };
+    let piece = rewriter.convert(&ast, false).ok()?;
+    // The rewrite can drop a piece that matches only the empty string (`\p{Foo}{0}`), and with it
+    // an error the crate would have reported for the pattern as written.
+    let valid = regex_syntax::hir::translate::Translator::new()
+        .translate(parsed, &ast)
+        .is_ok();
+    (rewriter.changed && valid).then_some(piece.text.text)
+}
+
+/// Whether `pattern` may hold a loop [`rewrite`] changes, judged from its bytes so that every other
+/// pattern is spared the parse, which cost a fresh compile of `(?:a|b)+` 19% on a 7950X. Such a loop
+/// is a group under a quantifier (a `)` followed by `*`, `+` or `{`). Its body can match nothing
+/// only through a `*`, a `?` or `{0`/`{,` quantifier, an empty alternative or an empty group, and
+/// has a consuming way after the empty one only through a `|` or a lazy quantifier. Whitespace
+/// between tokens is skipped, and a `#` (a comment under `x`, which can stand between them) counts
+/// for all three.
+fn may_need_rewrite(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let next = |i: usize| {
+        bytes[i + 1..]
+            .iter()
+            .find(|c| !c.is_ascii_whitespace())
+            .copied()
+    };
+    let (mut group_repeat, mut nullable, mut later_way) = (false, false, false);
+    let mut prev = None;
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b')' => {
+                group_repeat |= matches!(next(i), Some(b'*' | b'+' | b'{'));
+                nullable |= matches!(prev, Some(b'(' | b':'));
+            }
+            b'*' => nullable = true,
+            b'?' => {
+                nullable |= prev != Some(b'(');
+                later_way |= matches!(prev, Some(b'*' | b'+' | b'?' | b'}'));
+            }
+            b'{' => nullable |= matches!(next(i), Some(b'0' | b',')),
+            b'|' => {
+                later_way = true;
+                nullable |= matches!(prev, None | Some(b'(' | b'|' | b':'))
+                    || matches!(next(i), None | Some(b')' | b'|'));
+            }
+            b'#' => (group_repeat, nullable, later_way) = (true, true, true),
+            _ => {}
+        }
+        if !c.is_ascii_whitespace() {
+            prev = Some(c);
+        }
+    }
+    group_repeat && nullable && later_way
+}
+
+impl Rewriter<'_> {
+    fn text(&self, text: String, prec: Prec) -> Result<Text, GiveUp> {
+        let work = self.work.get() + text.len();
+        self.work.set(work);
+        if text.len() > self.limit || work > self.work_limit {
+            return Err(GiveUp);
+        }
+        Ok(Text { text, prec })
     }
 
-    fn text(&self, span: &ast::Span) -> &str {
-        &self.src[span.start.offset..span.end.offset]
+    fn verbatim(&self, span: &ast::Span) -> &str {
+        &self.source[span.start.offset..span.end.offset]
     }
 
-    /// Write `ast`, or with `projected` its `E`: every character, class and `.` never matches.
-    fn emit(&mut self, ast: &Ast, projected: bool) -> Result<(), TooLong> {
-        // In `E` a part with no group matters only by whether it can match empty where it stands,
-        // so one that always can is written as nothing and one that never can as one failing
-        // class. Fewer states make the capture engine faster on a long match (#6069: a 1.4 MB
-        // match of `(\w*\s*)*c` took 30% longer with the part projected class by class). A part
-        // that sets a flag is kept whole, since the flag reaches what follows it.
-        if projected && !has_group(ast) && !sets_flags(ast) {
-            if always_matches_empty(ast) {
-                return Ok(());
-            }
-            if !may_match_empty(ast) {
-                return self.push(NEVER);
-            }
+    /// `ast` as a piece. Its ways are listed only when `listed`, that is under a repeat, which is
+    /// the only place they are read.
+    fn convert(&mut self, ast: &Ast, listed: bool) -> Result<Piece, GiveUp> {
+        if matches!(ast, Ast::Group(_) | Ast::Literal(_))
+            && self.opaque.binary_search(&ast.span().start.offset).is_ok()
+        {
+            return self.opaque(ast);
         }
         match ast {
-            Ast::Empty(_) => Ok(()),
+            Ast::Empty(_) => Ok(Piece {
+                text: Text {
+                    text: String::new(),
+                    prec: Prec::Concat,
+                },
+                ways: Ways::Nullable {
+                    before: None,
+                    after: None,
+                },
+            }),
+            Ast::Literal(_)
+            | Ast::Dot(_)
+            | Ast::ClassUnicode(_)
+            | Ast::ClassPerl(_)
+            | Ast::ClassBracketed(_) => Ok(Piece {
+                text: self.text(self.verbatim(ast.span()).into(), Prec::Atom)?,
+                ways: Ways::Consuming,
+            }),
+            Ast::Assertion(_) => Ok(Piece {
+                text: self.text(self.verbatim(ast.span()).into(), Prec::Atom)?,
+                ways: Ways::Unknown,
+            }),
             Ast::Flags(set) => {
-                let text = self.text(&set.span);
-                let text = String::from(text);
-                self.push(&text)
-            }
-            Ast::Literal(_)
-            | Ast::Dot(_)
-            | Ast::ClassUnicode(_)
-            | Ast::ClassPerl(_)
-            | Ast::ClassBracketed(_)
-                if projected =>
-            {
-                self.push(NEVER)
-            }
-            Ast::Literal(_)
-            | Ast::Dot(_)
-            | Ast::ClassUnicode(_)
-            | Ast::ClassPerl(_)
-            | Ast::ClassBracketed(_)
-            | Ast::Assertion(_) => {
-                let text = String::from(self.text(ast.span()));
-                self.push(&text)
-            }
-            Ast::Group(group) => {
-                match &group.kind {
-                    GroupKind::CaptureIndex(index) => {
-                        self.record(*index as usize);
-                        self.push("(")?;
-                    }
-                    GroupKind::CaptureName { name, .. } => {
-                        self.record(name.index as usize);
-                        self.push("(")?;
-                    }
-                    GroupKind::NonCapturing(flags) => {
-                        let open = alloc::format!("(?{}:", self.text(&flags.span));
-                        self.push(&open)?;
-                    }
+                // `U` swaps what `*` and `*?` mean, which the greedy/lazy reading below does not
+                // follow, so a pattern with it is left as written.
+                if set.flags.flag_state(Flag::SwapGreed).is_some() {
+                    return Err(GiveUp);
                 }
-                self.emit(&group.ast, projected)?;
-                self.push(")")
+                Ok(Piece {
+                    text: self.text(self.verbatim(&set.span).into(), Prec::Concat)?,
+                    ways: Ways::Unknown,
+                })
             }
-            Ast::Repetition(rep) if is_candidate(rep) => {
-                self.push("(?:")?;
-                if !projected {
-                    // The repeated group's own loop copy is never read: `E` always matches, so
-                    // its copy of the group is always set and always the last. Leaving it
-                    // uncaptured keeps the crate's capture slots at the pattern's count for the
-                    // common `(a*)*`, which a long match pays for per slot.
-                    match &*rep.ast {
-                        Ast::Group(group) if group.capture_index().is_some() => {
-                            self.push("(?:")?;
-                            self.emit(&group.ast, false)?;
-                            self.push(")")?;
-                        }
-                        body => self.emit(body, false)?,
-                    }
-                    self.push("*")?;
-                }
-                self.emit(&rep.ast, true)?;
-                self.push(")")
-            }
+            Ast::Group(group) => self.group(group, listed),
             Ast::Repetition(rep) => {
-                self.emit(&rep.ast, projected)?;
-                let op = String::from(self.text(&rep.op.span));
-                self.push(&op)
+                let body = self.convert(&rep.ast, true)?;
+                let (min, max) = match &rep.op.kind {
+                    RepetitionKind::ZeroOrOne => (0, Some(1)),
+                    RepetitionKind::ZeroOrMore => (0, None),
+                    RepetitionKind::OneOrMore => (1, None),
+                    RepetitionKind::Range(RepetitionRange::Exactly(n)) => (*n, Some(*n)),
+                    RepetitionKind::Range(RepetitionRange::AtLeast(n)) => (*n, None),
+                    RepetitionKind::Range(RepetitionRange::Bounded(m, n)) => (*m, Some(*n)),
+                };
+                self.repeat(body, min, max, rep.greedy)
             }
             Ast::Alternation(alt) => {
-                for (i, branch) in alt.asts.iter().enumerate() {
-                    if i > 0 {
-                        self.push("|")?;
-                    }
-                    self.emit(branch, projected)?;
-                }
-                Ok(())
+                let items = alt
+                    .asts
+                    .iter()
+                    .map(|a| self.convert(a, listed))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.alt(&items, listed)
             }
             Ast::Concat(concat) => {
-                for item in &concat.asts {
-                    self.emit(item, projected)?;
-                }
-                Ok(())
+                let items = concat
+                    .asts
+                    .iter()
+                    .map(|a| self.convert(a, listed))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.concat(&items, listed)
             }
         }
     }
 
-    /// The next group opened is a copy of the original pattern's group `original`.
-    fn record(&mut self, original: usize) {
-        self.copies[original].push(self.next);
-        self.next += 1;
-    }
-}
-
-/// A greedy `*`, `+`, `{0,}` or `{1,}` of a body that holds a group and matches empty at every
-/// position: the repeats whose captures the crate and Oniguruma report differently.
-fn is_candidate(rep: &ast::Repetition) -> bool {
-    let unbounded = matches!(
-        rep.op.kind,
-        RepetitionKind::ZeroOrMore
-            | RepetitionKind::OneOrMore
-            | RepetitionKind::Range(RepetitionRange::AtLeast(0 | 1))
-    );
-    unbounded && rep.greedy && has_group(&rep.ast) && always_matches_empty(&rep.ast)
-}
-
-fn has_candidate(ast: &Ast) -> bool {
-    match ast {
-        Ast::Repetition(rep) => is_candidate(rep) || has_candidate(&rep.ast),
-        Ast::Group(group) => has_candidate(&group.ast),
-        Ast::Alternation(alt) => alt.asts.iter().any(has_candidate),
-        Ast::Concat(concat) => concat.asts.iter().any(has_candidate),
-        _ => false,
-    }
-}
-
-/// The fewest times `rep` repeats its body.
-fn min_repeats(rep: &ast::Repetition) -> u32 {
-    match &rep.op.kind {
-        RepetitionKind::ZeroOrOne | RepetitionKind::ZeroOrMore => 0,
-        RepetitionKind::OneOrMore => 1,
-        RepetitionKind::Range(
-            RepetitionRange::Exactly(n)
-            | RepetitionRange::AtLeast(n)
-            | RepetitionRange::Bounded(n, _),
-        ) => *n,
-    }
-}
-
-/// Whether `ast` matches empty wherever it is tried: some way through it consumes nothing and passes
-/// no assertion, which can fail.
-fn always_matches_empty(ast: &Ast) -> bool {
-    match ast {
-        Ast::Empty(_) | Ast::Flags(_) => true,
-        Ast::Assertion(_)
-        | Ast::Literal(_)
-        | Ast::Dot(_)
-        | Ast::ClassUnicode(_)
-        | Ast::ClassPerl(_)
-        | Ast::ClassBracketed(_) => false,
-        Ast::Repetition(rep) => min_repeats(rep) == 0 || always_matches_empty(&rep.ast),
-        Ast::Group(group) => always_matches_empty(&group.ast),
-        Ast::Alternation(alt) => alt.asts.iter().any(always_matches_empty),
-        Ast::Concat(concat) => concat.asts.iter().all(always_matches_empty),
-    }
-}
-
-/// Whether `ast` can match empty somewhere: some way through it consumes nothing, assertions
-/// allowed.
-fn may_match_empty(ast: &Ast) -> bool {
-    match ast {
-        Ast::Empty(_) | Ast::Flags(_) | Ast::Assertion(_) => true,
-        Ast::Literal(_)
-        | Ast::Dot(_)
-        | Ast::ClassUnicode(_)
-        | Ast::ClassPerl(_)
-        | Ast::ClassBracketed(_) => false,
-        Ast::Repetition(rep) => min_repeats(rep) == 0 || may_match_empty(&rep.ast),
-        Ast::Group(group) => may_match_empty(&group.ast),
-        Ast::Alternation(alt) => alt.asts.iter().any(may_match_empty),
-        Ast::Concat(concat) => concat.asts.iter().all(may_match_empty),
-    }
-}
-
-/// Whether `ast` holds a flag-setting item (`(?m)`), whose flags reach past it in its group.
-fn sets_flags(ast: &Ast) -> bool {
-    match ast {
-        Ast::Flags(_) => true,
-        Ast::Group(group) => sets_flags(&group.ast),
-        Ast::Repetition(rep) => sets_flags(&rep.ast),
-        Ast::Alternation(alt) => alt.asts.iter().any(sets_flags),
-        Ast::Concat(concat) => concat.asts.iter().any(sets_flags),
-        _ => false,
-    }
-}
-
-fn has_group(ast: &Ast) -> bool {
-    match ast {
-        Ast::Group(group) => group.capture_index().is_some() || has_group(&group.ast),
-        Ast::Repetition(rep) => has_group(&rep.ast),
-        Ast::Alternation(alt) => alt.asts.iter().any(has_group),
-        Ast::Concat(concat) => concat.asts.iter().any(has_group),
-        _ => false,
-    }
-}
-
-/// Whether `U` is set anywhere: it makes `*` lazy and `*?` greedy, so `rep.greedy` would not say
-/// which the crate runs.
-fn swaps_greed(ast: &Ast) -> bool {
-    let has_u = |flags: &ast::Flags| {
-        flags
-            .items
-            .iter()
-            .any(|item| matches!(item.kind, FlagsItemKind::Flag(Flag::SwapGreed)))
-    };
-    match ast {
-        Ast::Flags(set) => has_u(&set.flags),
-        Ast::Group(group) => {
-            matches!(&group.kind, GroupKind::NonCapturing(flags) if has_u(flags))
-                || swaps_greed(&group.ast)
+    /// A construct the parsed copy reads as something it is not. A comment matches nothing, as an
+    /// empty group does, unless a quantifier follows it: that quantifier is Oniguruma's to read
+    /// (`(?#)?` is refused, `b(?#)*` is `b*`), and the copy gives it the comment's group to repeat,
+    /// so such a comment's ways are not listed. A lookaround or atomic group keeps its opening and
+    /// closing text and has its body rewritten, a backreference is copied as written, and neither
+    /// has its ways listed.
+    fn opaque(&mut self, ast: &Ast) -> Result<Piece, GiveUp> {
+        let span = ast.span();
+        let comment = self.verbatim(span).starts_with("(?#");
+        let quantified = || {
+            self.source[span.end.offset..]
+                .bytes()
+                .find(|c| !c.is_ascii_whitespace())
+                .is_some_and(|c| matches!(c, b'*' | b'+' | b'?' | b'{'))
+        };
+        if comment && !quantified() {
+            return Ok(Piece {
+                text: self.text(self.verbatim(span).into(), Prec::Atom)?,
+                ways: Ways::Nullable {
+                    before: None,
+                    after: None,
+                },
+            });
         }
-        Ast::Repetition(rep) => swaps_greed(&rep.ast),
-        Ast::Alternation(alt) => alt.asts.iter().any(swaps_greed),
-        Ast::Concat(concat) => concat.asts.iter().any(swaps_greed),
-        _ => false,
+        let text = match ast {
+            Ast::Group(group) if !self.verbatim(span).starts_with("(?#") => {
+                let body = self.convert(&group.ast, false)?;
+                let inner = group.ast.span();
+                let open = &self.source[span.start.offset..inner.start.offset];
+                let close = &self.source[inner.end.offset..span.end.offset];
+                format!("{open}{}{close}", body.text.text)
+            }
+            _ => self.verbatim(span).into(),
+        };
+        Ok(Piece {
+            text: self.text(text, Prec::Atom)?,
+            ways: Ways::Unknown,
+        })
     }
-}
 
-/// Every group's name, by group index (`None` for an unnamed one).
-fn collect_names(ast: &Ast, names: &mut Vec<Option<Box<str>>>) {
-    match ast {
-        Ast::Group(group) => {
-            let slot = match &group.kind {
-                GroupKind::CaptureIndex(index) => Some((*index as usize, None)),
-                GroupKind::CaptureName { name, .. } => {
-                    Some((name.index as usize, Some(Box::from(name.name.as_str()))))
+    /// A group keeps its own opening and closing text. A capture group's ways are not listed; a
+    /// non-capturing one's are its body's, each wrapped in the group's flags when it has any.
+    fn group(&mut self, group: &ast::Group, listed: bool) -> Result<Piece, GiveUp> {
+        let body = self.convert(&group.ast, listed)?;
+        let inner = group.ast.span();
+        let open = &self.source[group.span.start.offset..inner.start.offset];
+        let close = &self.source[inner.end.offset..group.span.end.offset];
+        let text = self.text(format!("{open}{}{close}", body.text.text), Prec::Atom)?;
+        let ways = match &group.kind {
+            GroupKind::CaptureIndex(_) | GroupKind::CaptureName { .. } => Ways::Unknown,
+            GroupKind::NonCapturing(flags) if flags.items.is_empty() => body.ways,
+            GroupKind::NonCapturing(flags) => {
+                if flags.flag_state(Flag::SwapGreed).is_some() {
+                    return Err(GiveUp);
                 }
-                GroupKind::NonCapturing(_) => None,
+                match body.ways {
+                    Ways::Nullable { before, after } => {
+                        let wrap = |t: Option<Text>| -> Result<Option<Text>, GiveUp> {
+                            t.map(|t| self.text(format!("{open}{})", t.text), Prec::Atom))
+                                .transpose()
+                        };
+                        Ways::Nullable {
+                            before: wrap(before)?,
+                            after: wrap(after)?,
+                        }
+                    }
+                    ways => ways,
+                }
+            }
+        };
+        Ok(Piece { text, ways })
+    }
+
+    fn concat_text(&self, items: &[&Text]) -> Result<Text, GiveUp> {
+        if let [one] = items {
+            return Ok((*one).clone());
+        }
+        let mut text = String::new();
+        for item in items {
+            if item.prec == Prec::Alt {
+                text.push_str("(?:");
+                text.push_str(&item.text);
+                text.push(')');
+            } else {
+                text.push_str(&item.text);
+            }
+        }
+        self.text(text, Prec::Concat)
+    }
+
+    fn alt_text(&self, items: &[Text]) -> Result<Option<Text>, GiveUp> {
+        match items {
+            [] => Ok(None),
+            [one] => Ok(Some(one.clone())),
+            _ => {
+                let text = items
+                    .iter()
+                    .map(|t| t.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("|");
+                self.text(text, Prec::Alt).map(Some)
+            }
+        }
+    }
+
+    fn repeat_text(
+        &self,
+        body: &Text,
+        min: u32,
+        max: Option<u32>,
+        greedy: bool,
+    ) -> Result<Text, GiveUp> {
+        let op = match (min, max) {
+            (0, None) => String::from("*"),
+            (1, None) => String::from("+"),
+            (0, Some(1)) => String::from("?"),
+            (n, None) => format!("{{{n},}}"),
+            (m, Some(n)) if m == n => format!("{{{n}}}"),
+            (m, Some(n)) => format!("{{{m},{n}}}"),
+        };
+        let lazy = if greedy { "" } else { "?" };
+        let text = if body.prec == Prec::Atom {
+            format!("{}{op}{lazy}", body.text)
+        } else {
+            format!("(?:{}){op}{lazy}", body.text)
+        };
+        self.text(text, Prec::Concat)
+    }
+
+    fn concat(&self, items: &[Piece], listed: bool) -> Result<Piece, GiveUp> {
+        let Some((first, rest)) = items.split_first() else {
+            return Ok(Piece {
+                text: Text {
+                    text: String::new(),
+                    prec: Prec::Concat,
+                },
+                ways: Ways::Nullable {
+                    before: None,
+                    after: None,
+                },
+            });
+        };
+        // Left to right: the prefix `P = A1 | ε | B1` followed by `Q = A2 | ε | B2` tries
+        // `A1 Q`, then `Q` from where `P` began (`A2`, `ε`, `B2`), then `B1 Q`.
+        let mut ways = if listed {
+            first.ways.clone()
+        } else {
+            Ways::Unknown
+        };
+        for next in rest {
+            ways = match (ways, &next.ways) {
+                (Ways::Unknown, _) | (_, Ways::Unknown) => Ways::Unknown,
+                (Ways::Consuming, _) | (Ways::Nullable { .. }, Ways::Consuming) => Ways::Consuming,
+                (
+                    Ways::Nullable {
+                        before: a1,
+                        after: b1,
+                    },
+                    Ways::Nullable {
+                        before: a2,
+                        after: b2,
+                    },
+                ) => {
+                    let mut before = Vec::new();
+                    if let Some(a1) = a1 {
+                        before.push(self.concat_text(&[&a1, &next.text])?);
+                    }
+                    before.extend(a2.clone());
+                    let mut after = Vec::new();
+                    after.extend(b2.clone());
+                    if let Some(b1) = b1 {
+                        after.push(self.concat_text(&[&b1, &next.text])?);
+                    }
+                    Ways::Nullable {
+                        before: self.alt_text(&before)?,
+                        after: self.alt_text(&after)?,
+                    }
+                }
             };
-            if let Some((index, name)) = slot {
-                if names.len() <= index {
-                    names.resize(index + 1, None);
-                }
-                names[index] = name;
-            }
-            collect_names(&group.ast, names);
         }
-        Ast::Repetition(rep) => collect_names(&rep.ast, names),
-        Ast::Alternation(alt) => alt.asts.iter().for_each(|a| collect_names(a, names)),
-        Ast::Concat(concat) => concat.asts.iter().for_each(|a| collect_names(a, names)),
-        _ => {}
+        let texts: Vec<&Text> = items.iter().map(|p| &p.text).collect();
+        Ok(Piece {
+            text: self.concat_text(&texts)?,
+            ways,
+        })
+    }
+
+    fn alt(&self, items: &[Piece], listed: bool) -> Result<Piece, GiveUp> {
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        let mut nullable = false;
+        let mut unknown = !listed;
+        for item in items {
+            if unknown {
+                break;
+            }
+            match &item.ways {
+                Ways::Unknown => unknown = true,
+                Ways::Consuming if nullable => after.push(item.text.clone()),
+                Ways::Consuming => before.push(item.text.clone()),
+                // A later empty way is an exit that the first one has already tried.
+                Ways::Nullable {
+                    before: a,
+                    after: b,
+                } => {
+                    if nullable {
+                        after.extend(a.clone());
+                    } else {
+                        before.extend(a.clone());
+                        nullable = true;
+                    }
+                    after.extend(b.clone());
+                }
+            }
+        }
+        let ways = if unknown {
+            Ways::Unknown
+        } else if nullable {
+            Ways::Nullable {
+                before: self.alt_text(&before)?,
+                after: self.alt_text(&after)?,
+            }
+        } else {
+            Ways::Consuming
+        };
+        let texts: Vec<Text> = items.iter().map(|p| p.text.clone()).collect();
+        let text = self.alt_text(&texts)?.unwrap_or(Text {
+            text: String::new(),
+            prec: Prec::Concat,
+        });
+        Ok(Piece { text, ways })
+    }
+
+    fn repeat(
+        &mut self,
+        body: Piece,
+        min: u32,
+        max: Option<u32>,
+        greedy: bool,
+    ) -> Result<Piece, GiveUp> {
+        let text = self.repeat_text(&body.text, min, max, greedy)?;
+        let ways = match (&body.ways, min, max, greedy) {
+            (Ways::Unknown, ..) => Ways::Unknown,
+            (_, _, Some(0), _) => Ways::Nullable {
+                before: None,
+                after: None,
+            },
+            (Ways::Consuming, 1.., ..) => Ways::Consuming,
+            (Ways::Consuming, 0, _, true) => Ways::Nullable {
+                before: Some(self.repeat_text(&body.text, 1, max, true)?),
+                after: None,
+            },
+            (Ways::Consuming, 0, _, false) => Ways::Nullable {
+                before: None,
+                after: Some(self.repeat_text(&body.text, 1, max, false)?),
+            },
+            (Ways::Nullable { .. }, _, Some(1), true) | (Ways::Nullable { .. }, 1, Some(1), _) => {
+                body.ways.clone()
+            }
+            (Ways::Nullable { before, after }, 0, Some(1) | None, false) => {
+                // Lazy: leave first, then each consuming way of the body (followed by the loop).
+                let ways: Vec<Text> = before.iter().chain(after.iter()).cloned().collect();
+                Ways::Nullable {
+                    before: None,
+                    after: match self.alt_text(&ways)? {
+                        Some(once) if max.is_none() => Some(self.concat_text(&[&once, &text])?),
+                        once => once,
+                    },
+                }
+            }
+            // `X+?` is `X X*?`, as Oniguruma tries it.
+            (Ways::Nullable { .. }, 1, None, false) => {
+                let rest = self.repeat(body.clone(), 0, None, false)?;
+                self.concat(&[body, rest], true)?.ways
+            }
+            (Ways::Nullable { before, after }, _, None, true) => {
+                return self.exit_on_empty(before.clone(), after.clone(), text);
+            }
+            (Ways::Nullable { before, after }, _, Some(n), true) => {
+                return self.bounded(&body, before.clone(), after.clone(), n, text);
+            }
+            (
+                Ways::Nullable {
+                    before,
+                    after: Some(after),
+                },
+                ..,
+            ) if !greedy && min >= 2 => {
+                return self.lazy_counted(before.clone(), after.clone(), min, max);
+            }
+            // A lazy repeat that runs once at most leaves where Oniguruma does (a differential over
+            // 2,800 generated patterns found no difference with or without the rewrite), and a
+            // body with no consuming way after its empty one is left as it is.
+            _ => Ways::Unknown,
+        };
+        Ok(Piece { text, ways })
+    }
+
+    /// Oniguruma's greedy `X{min,}` for a body `X = A | ε | B`, which is `A*(?:B A*)*?` whatever
+    /// `min` is: an empty iteration ends the loop even before it has run `min` times, and `X`'s
+    /// own empty way is there to take. Written out only when `B` is not empty; with no `B`, the
+    /// loop as written already leaves where Oniguruma's does, and keeps its text.
+    fn exit_on_empty(
+        &mut self,
+        before: Option<Text>,
+        after: Option<Text>,
+        written: Text,
+    ) -> Result<Piece, GiveUp> {
+        let consuming = |text: Text| Piece {
+            text,
+            ways: Ways::Consuming,
+        };
+        let star = before
+            .map(|a| self.repeat(consuming(a), 0, None, true))
+            .transpose()?;
+        let mut parts: Vec<Piece> = star.iter().cloned().collect();
+        let Some(b) = after else {
+            let mut piece = self.concat(&parts, true)?;
+            piece.text = written;
+            return Ok(piece);
+        };
+        let mut iteration = alloc::vec![consuming(b)];
+        iteration.extend(star);
+        let iteration = self.concat(&iteration, true)?;
+        parts.push(self.repeat(iteration, 0, None, false)?);
+        let piece = self.concat(&parts, true)?;
+        self.changed = true;
+        Ok(Piece {
+            text: self.text(format!("(?:{})", piece.text.text), Prec::Atom)?,
+            ways: piece.ways,
+        })
+    }
+
+    /// Oniguruma's lazy `X{min,max}?` that must run twice or more, for a body `X = A | ε | B`: copy `k` tries `ε A R(k+1) B R(k+1)` once `k` is past `min` (leaving
+    /// first, as a lazy repeat does) and `A R(k+1) ε B R(k+1)` before it, where `R(k)` is the copies
+    /// from `k` on, the lazy `(?:A|B)*?` once an unbounded repeat has run its `min`, and nothing after
+    /// `max`. The empty way leaves the loop at any copy, as it does a greedy one. Written out only
+    /// when `B` is not empty, as [`Self::bounded`] is.
+    fn lazy_counted(
+        &mut self,
+        before: Option<Text>,
+        after: Text,
+        min: u32,
+        max: Option<u32>,
+    ) -> Result<Piece, GiveUp> {
+        let consuming = |text: Text| Piece {
+            text,
+            ways: Ways::Consuming,
+        };
+        let mut rest = match max {
+            Some(_) => self.concat(&[], true)?,
+            None => {
+                let ways: Vec<Text> = before.iter().cloned().chain([after.clone()]).collect();
+                let body = self.alt_text(&ways)?.ok_or(GiveUp)?;
+                self.repeat(consuming(body), 0, None, false)?
+            }
+        };
+        for k in (1..=max.unwrap_or(min)).rev() {
+            let exit = self.concat(&[], true)?;
+            let mut ways = Vec::new();
+            if k > min {
+                ways.push(exit.clone());
+            }
+            if let Some(a) = &before {
+                ways.push(self.concat(&[consuming(a.clone()), rest.clone()], true)?);
+            }
+            if k <= min {
+                ways.push(exit);
+            }
+            ways.push(self.concat(&[consuming(after.clone()), rest.clone()], true)?);
+            rest = self.alt(&ways, true)?;
+        }
+        self.changed = true;
+        Ok(Piece {
+            text: self.text(format!("(?:{})", rest.text.text), Prec::Atom)?,
+            ways: rest.ways,
+        })
+    }
+
+    /// Oniguruma's greedy `X{min,n}` for a body `X = A | ε | B` and `n` of 2 or more: `T(n)`, where
+    /// `T(1)` is `X` and `T(k)` is `(?:A T(k-1)||B T(k-1))`. The empty way ends the loop, whatever
+    /// `min` is, where the `regex` crate's copies of `X` would go on to try the next copy's ways
+    /// first. Written out only when `B` is not empty; with no `B`, the next copy can only fail
+    /// where `A` failed, so the copies agree with Oniguruma and the loop keeps its text.
+    fn bounded(
+        &mut self,
+        body: &Piece,
+        before: Option<Text>,
+        after: Option<Text>,
+        n: u32,
+        written: Text,
+    ) -> Result<Piece, GiveUp> {
+        let Some(b) = after else {
+            let rest = self.repeat_text(&body.text, 0, Some(n - 1), true)?;
+            let before = before.map(|a| self.concat_text(&[&a, &rest])).transpose()?;
+            return Ok(Piece {
+                text: written,
+                ways: Ways::Nullable {
+                    before,
+                    after: None,
+                },
+            });
+        };
+        let consuming = |text: Text| Piece {
+            text,
+            ways: Ways::Consuming,
+        };
+        let mut loop_rest = body.clone();
+        for _ in 1..n {
+            let mut ways = Vec::new();
+            if let Some(a) = &before {
+                ways.push(self.concat(&[consuming(a.clone()), loop_rest.clone()], true)?);
+            }
+            ways.push(self.concat(&[], true)?);
+            ways.push(self.concat(&[consuming(b.clone()), loop_rest], true)?);
+            loop_rest = self.alt(&ways, true)?;
+        }
+        self.changed = true;
+        Ok(Piece {
+            text: self.text(format!("(?:{})", loop_rest.text.text), Prec::Atom)?,
+            ways: loop_rest.ways,
+        })
     }
 }
 
@@ -382,115 +695,228 @@ fn collect_names(ast: &Ast, names: &mut Vec<Option<Box<str>>>) {
 mod tests {
     use super::*;
 
-    fn rewritten(pattern: &str) -> Option<String> {
-        rewrite(pattern).map(|rw| rw.pattern)
-    }
-
+    /// #6128: beside syntax only `fancy-regex` reads, a loop is rewritten as it is alone, and that
+    /// syntax is copied as written; inside a lookaround or atomic group, too. A loop whose body
+    /// holds such syntax keeps its text.
     #[test]
-    fn rewrites_a_repeat_of_a_group_that_can_match_empty() {
-        assert_eq!(rewritten("(a*)*b").as_deref(), Some(r"(?:(?:a*)*())b"));
-        assert_eq!(rewritten("(a*)+b").as_deref(), Some(r"(?:(?:a*)*())b"));
-        assert_eq!(rewritten("(a?){0,}").as_deref(), Some(r"(?:(?:a?)*())"));
-        assert_eq!(
-            rewritten("(?:b*|(a))+").as_deref(),
-            Some(r"(?:(?:b*|(a))*(?:|([^\s\S])))")
-        );
-    }
-
-    #[test]
-    fn leaves_every_other_repeat_alone() {
-        // No group, a body that cannot match empty, a lazy repeat, a counted repeat from 2 up,
-        // a bounded one, an assertion in the body, and `U`.
-        for pattern in [
-            "a*b",
-            "(?:a*)*b",
-            "(a+)*b",
-            "(a*)*?b",
-            "(a*){2,}b",
-            "(a*){0,5}b",
-            "(a|$)*",
-            r"(a|\b)*b",
-            "(?U)(a*)*b",
-            "plain",
-            "(a)",
+    fn a_loop_beside_fancy_regex_syntax_is_rewritten_6128() {
+        let looped = rewrite("(?:b*|a)+").unwrap();
+        for (before, after) in [
+            ("", "(?=)"),
+            ("(?<=x)", ""),
+            ("(?<!x)", "(?!c)"),
+            (r"(b)\1", ""),
+            (r"(?<n>x)\k<n>", ""),
+            ("(?#é|x)", ""),
+            (r"\G", r"\Z"),
+            (r"x\K", ""),
         ] {
-            assert_eq!(rewritten(pattern), None, "{pattern}");
-        }
-    }
-
-    #[test]
-    fn maps_every_group_to_its_copies_and_keeps_the_names() {
-        let rw = rewrite("(?<x>(a)|b*)*(c)").expect("rewritten");
-        // `x`'s own loop copy is left uncaptured: the last iteration's copy always wins.
-        assert_eq!(rw.pattern, r"(?:(?:(a)|b*)*(([^\s\S])|))(c)");
-        let copies: Vec<&[usize]> = rw.copies.iter().map(|c| &c[..]).collect();
-        assert_eq!(copies, [&[0][..], &[2], &[1, 3], &[4]]);
-        assert_eq!(
-            rw.names.iter().map(|n| n.as_deref()).collect::<Vec<_>>(),
-            [None, Some("x"), None, None]
-        );
-        assert_eq!(rw.compiled_groups, 5);
-    }
-
-    #[test]
-    fn a_nested_repeat_is_projected_once_not_doubled() {
-        assert_eq!(
-            rewritten("((a*)*)*").as_deref(),
-            Some(r"(?:(?:(?:(?:a*)*()))*((?:())))")
-        );
-    }
-
-    #[test]
-    fn the_last_iteration_keeps_only_what_a_group_or_a_flag_needs() {
-        // No group in the body: the last iteration is the empty group, whichever empty way the
-        // body has (`\b` where it holds, `a*` where not).
-        assert_eq!(
-            rewritten(r"(\b|a*)*b").as_deref(),
-            Some(r"(?:(?:\b|a*)*())b")
-        );
-        // A part that cannot match empty fails as one class; one that sets a flag is kept,
-        // since `(?m)` changes what the `$` after it means.
-        assert_eq!(
-            rewritten(r"(ab(c)|((?m)$|d*))*").as_deref(),
-            Some(r"(?:(?:ab(c)|((?m)$|d*))*([^\s\S][^\s\S]([^\s\S])|((?m)$|)))")
-        );
-    }
-
-    #[test]
-    fn every_rewrite_compiles_with_the_groups_it_counted() {
-        for pattern in [
-            "(a*)*b",
-            "((a*)*)*",
-            "(?<x>(a)|b*)*(c)",
-            r"(?x)( a* | \  )+",
-            r"(?i)(\x41*?|[b-c]\.)*",
-            r"(\p{L}*|\d)*",
-        ] {
-            let rw = rewrite(pattern).expect("rewritten");
-            let re = regex::Regex::new(&rw.pattern).expect("compiles");
-            assert_eq!(re.captures_len(), rw.compiled_groups, "{pattern}");
+            let pattern = format!("{before}(?:b*|a)+{after}");
             assert_eq!(
-                rw.copies.iter().map(|c| c.len()).sum::<usize>(),
-                rw.compiled_groups
+                rewrite(&pattern),
+                Some(format!("{before}{looped}{after}")),
+                "{pattern}"
             );
         }
+        assert_eq!(rewrite("(?>(?:b*|a)+)"), Some(format!("(?>{looped})")));
+        assert_eq!(rewrite("(?=(?:b*|a)+c)"), Some(format!("(?={looped}c)")));
+        // A quantifier after a comment is Oniguruma's to read: the comment is copied as written.
+        assert_eq!(rewrite("(?:b*|a)+(?#)?"), Some(format!("{looped}(?#)?")));
+        // Under `x`, a `(?#` in a `#` comment the copy cannot follow: read as written.
+        assert_eq!(
+            rewrite("(?x)(?:b*|a)+ # (?#"),
+            rewrite("(?x)(?:b*|a)+ # c").map(|r| r.replace("# c", "# (?#"))
+        );
+        // A comment with no quantifier after it matches nothing, as an empty group does.
+        assert_eq!(rewrite("(?:(?#c)b*|a)+"), Some(looped.clone()));
+        for pattern in [
+            "(?:(?#)?|b)+",
+            "(?:(?#) ?|b)+",
+            "(?:b(?#)*|a)+",
+            "(?:(?=b)b*|a)+",
+            r"(b)(?:\1|b*|a)+",
+            "(?#a\nb)(?:b*|a)+",
+        ] {
+            assert_eq!(rewrite(pattern), None, "{pattern}");
+        }
     }
 
     #[test]
-    fn keeps_flags_escapes_and_lazy_inner_repeats_verbatim() {
+    fn a_loop_with_a_consuming_way_after_its_first_empty_one_is_rewritten() {
         assert_eq!(
-            rewritten(r"(?i)(\x41*?|[b-c]\.)*").as_deref(),
-            Some(r"(?i)(?:(?:\x41*?|[b-c]\.)*())")
+            rewrite("(?:b*|a)+").as_deref(),
+            Some("(?:(?:b+)*(?:a(?:b+)*)*?)")
         );
         assert_eq!(
-            rewritten("(?s:(.*))*").as_deref(),
-            Some(r"(?:(?s:(.*))*(?s:()))")
+            rewrite("(?:b*|a)*").as_deref(),
+            Some("(?:(?:b+)*(?:a(?:b+)*)*?)")
+        );
+        assert_eq!(
+            rewrite("(?:b*|a){2,}").as_deref(),
+            Some("(?:(?:b+)*(?:a(?:b+)*)*?)")
+        );
+        assert_eq!(rewrite("(?:|a)*").as_deref(), Some("(?:a*?)"));
+        assert_eq!(
+            rewrite("(?:b*|a){2}").as_deref(),
+            Some("(?:b+(?:b*|a)||a(?:b*|a))")
+        );
+        assert_eq!(
+            rewrite("(?:b*|a){0,3}").as_deref(),
+            Some("(?:b+(?:b+(?:b*|a)||a(?:b*|a))||a(?:b+(?:b*|a)||a(?:b*|a)))")
         );
     }
 
     #[test]
-    fn gives_up_past_the_length_cap() {
-        let deep = "(a*)*".repeat(MAX_REWRITTEN_LEN / 4);
-        assert!(rewrite(&deep).is_none());
+    fn a_loop_the_engines_agree_on_keeps_its_text() {
+        for pattern in [
+            "(?:a|b*)+",      // the empty way comes last
+            "(?:b*|a)*?",     // lazy
+            "(?:b*|a){1,2}?", // lazy, runs once at most
+            "(?:a|b*){2}",
+            "(b*|a)+",     // a capture group
+            "(?:^|a)+",    // an assertion
+            "(?:b*|(a))+", // a capture group in a later way
+            "(?U)(?:b*|a)+",
+            "(?:(?U:b*)|a)+",
+            "(?:a+)*",
+            "abc",
+            "(?:b*|a",
+        ] {
+            assert_eq!(rewrite(pattern), None, "{pattern}");
+        }
+    }
+
+    /// A lazy repeat that must run twice or more (#6128): copy `k` leaves first once it is past the
+    /// minimum, and takes its empty way in place before it.
+    #[test]
+    fn a_lazy_counted_loop_is_written_copy_by_copy() {
+        assert_eq!(
+            rewrite("(?:b*|a){2}?").as_deref(),
+            Some("(?:b+(?:b+||a)||a(?:b+||a))")
+        );
+        for pattern in ["(?:b*|a){2,3}?", "(?:b*|a){2,}?", "(?:b*|a){3,4}?"] {
+            assert!(rewrite(pattern).is_some(), "{pattern}");
+        }
+        // Past the minimum a copy leaves first: `{2,3}?` is `{2}?`'s copies, each of the second
+        // preceded by the empty way.
+        assert_eq!(
+            rewrite("(?:b*|a){2,3}?").as_deref(),
+            Some("(?:b+(?:b+(?:|b+|a)||a(?:|b+|a))||a(?:b+(?:|b+|a)||a(?:|b+|a)))")
+        );
+        // No consuming way after the empty one: the copies agree with Oniguruma.
+        assert_eq!(rewrite("(?:a|b*){2,3}?"), None);
+    }
+
+    /// The copies multiply with the count, so a large one hits the size limit and is left as
+    /// written, quickly.
+    #[test]
+    fn a_lazy_counted_loop_with_a_large_count_is_given_up() {
+        assert_eq!(rewrite("(?:b*|a){2,1000}?"), None);
+        assert_eq!(rewrite("(?:b*|a){1000,}?"), None);
+    }
+
+    #[test]
+    fn a_flag_group_wraps_the_ways_taken_out_of_it() {
+        assert_eq!(
+            rewrite("(?:(?i:b*)|a)+").as_deref(),
+            Some("(?:(?i:b+)*(?:a(?i:b+)*)*?)")
+        );
+    }
+
+    #[test]
+    fn a_nested_loop_is_rewritten_inside_a_capture_group() {
+        assert_eq!(
+            rewrite("((?:b*|a)+)").as_deref(),
+            Some("((?:(?:b+)*(?:a(?:b+)*)*?))")
+        );
+    }
+
+    /// The byte test never turns away a pattern the rewrite changes: checked over every pattern a
+    /// small grammar of groups, alternatives and quantifiers generates from a fixed seed.
+    #[test]
+    fn the_byte_test_admits_every_pattern_the_rewrite_changes() {
+        const ATOMS: &[&str] = &["a", "b", ".", "[ab]", "\\w", "$", ""];
+        const QUANTIFIERS: &[&str] = &[
+            "*", "+", "?", "*?", "+?", "??", "{0,}", "{1,}", "{2,}", "{1,2}", "{0,2}", "{2}",
+        ];
+        let mut seed: u64 = 6106;
+        let mut roll = |n: usize| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize % n
+        };
+        fn generate(depth: u32, roll: &mut dyn FnMut(usize) -> usize) -> String {
+            let pick = if depth == 0 { 0 } else { roll(4) };
+            match pick {
+                0 => ATOMS[roll(ATOMS.len())].into(),
+                1 => (0..2 + roll(2))
+                    .map(|_| generate(depth - 1, roll))
+                    .collect(),
+                2 => {
+                    let ways: Vec<String> = (0..2 + roll(2))
+                        .map(|_| generate(depth - 1, roll))
+                        .collect();
+                    format!("(?:{})", ways.join("|"))
+                }
+                _ => {
+                    let body = generate(depth - 1, roll);
+                    let quantifier = QUANTIFIERS[roll(QUANTIFIERS.len())];
+                    let space = if roll(4) == 0 { " " } else { "" };
+                    format!("(?:{body}){space}{quantifier}")
+                }
+            }
+        }
+        let mut changed = 0;
+        for _ in 0..20_000 {
+            let extended = if roll(4) == 0 { "(?x)" } else { "" };
+            let pattern = format!("{extended}{}", generate(4, &mut roll));
+            if rewrite_parsed(&pattern).is_some() {
+                changed += 1;
+                assert!(may_need_rewrite(&pattern), "{pattern}");
+            }
+        }
+        assert!(changed > 500, "the grammar reaches the rewrite ({changed})");
+        assert!(!may_need_rewrite("(?:a|b)+"));
+        assert!(!may_need_rewrite("(?:ab)*c"));
+    }
+
+    /// A piece that matches only the empty string is not copied into the rewrite, so a pattern the
+    /// crate refuses for it is left as written and keeps its error.
+    #[test]
+    fn a_pattern_the_crate_refuses_is_left_as_written() {
+        assert_eq!(rewrite(r"(?:\p{Foo}{0}|a)+"), None);
+        assert_eq!(rewrite(r"(?:b*|\p{Foo}{0}|a)+"), None);
+        assert!(rewrite(r"(?:b*|\pL{0}|a)+").is_some());
+    }
+
+    /// Under `x`, a comment can stand between a group and its quantifier.
+    #[test]
+    fn a_comment_before_the_quantifier_still_admits_the_loop() {
+        assert_eq!(
+            rewrite("(?x)(?:b*|a) #c\n +").as_deref(),
+            Some("(?x)(?:(?:b+)*(?:a(?:b+)*)*?)")
+        );
+    }
+
+    /// Ways are listed only under a repeat: a long run of items that can match nothing outside any
+    /// loop costs nothing, and one inside a loop's body gives up on the work budget instead of
+    /// rebuilding its ways at every item.
+    #[test]
+    fn a_long_run_of_nullable_items_is_linear_or_given_up() {
+        let outside = format!("{}(?:b*|a)+", "a?".repeat(20_000));
+        let rewritten = rewrite(&outside).expect("the loop is rewritten");
+        assert!(rewritten.ends_with("(?:(?:b+)*(?:a(?:b+)*)*?)"));
+        let inside = format!("(?:{}|b)+", "a?".repeat(20_000));
+        assert_eq!(rewrite(&inside), None);
+    }
+
+    #[test]
+    fn a_rewrite_that_grows_past_its_limit_is_abandoned() {
+        let mut pattern = String::from("(?:b*|a)+");
+        for _ in 0..12 {
+            pattern = format!("(?:{pattern}|c*|d)+");
+        }
+        assert_eq!(rewrite(&pattern), None);
     }
 }

@@ -1114,6 +1114,14 @@ pub fn to_owned_cursor<S: EvalSemantics, C: DocumentCursor>(
             embed_table::LazyHit::Absent => {}
         }
     }
+    // #6125: a container of plain RFC 8259 JSON is read in one pass over its own text, which
+    // builds what the walk below builds without a rank and a select per node. Not where a
+    // binding is in scope (the walk shares what a bound node already holds) and not in yq mode.
+    if S::TAG == EvalTag::Jq && nested.is_empty() && !fill_lazy {
+        if let Some(plain) = cursor.plain_owned_jq() {
+            return Ok(plain);
+        }
+    }
     let result = to_owned_cursor_at_depth::<S, _, BuildOwned>(
         cursor,
         None,
@@ -1566,7 +1574,7 @@ const MAX_SIBLING_CAPACITY: usize = 16;
 /// the first object that turns out smaller than the room it was given ends the
 /// guessing for the rest of the array: at most one map per array is oversized.
 #[derive(Default)]
-struct SiblingShape {
+pub(super) struct SiblingShape {
     last: usize,
     before_last: usize,
     overshot: bool,
@@ -1574,7 +1582,7 @@ struct SiblingShape {
 
 impl SiblingShape {
     /// How many members to make room for in the next element's map.
-    fn capacity(&self) -> usize {
+    pub(super) fn capacity(&self) -> usize {
         if !self.overshot && self.last == self.before_last {
             self.last
         } else {
@@ -1584,7 +1592,7 @@ impl SiblingShape {
 
     /// Record an element that was given room for `given` members and holds
     /// `members` if it is an object (`None` for anything else).
-    fn push(&mut self, members: Option<usize>, given: usize) {
+    pub(super) fn push(&mut self, members: Option<usize>, given: usize) {
         let members = members.unwrap_or(0);
         self.overshot |= members < given;
         self.before_last = self.last;
@@ -5510,12 +5518,13 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
         && !embed_table_active();
     if plain || container {
         match strip_parens(expr) {
-            Expr::Builtin(Builtin::ToJson) => {
+            // (Not in yq mode, where `tojson` is `to_json`, #6158.)
+            Expr::Builtin(Builtin::ToJson) if S::TAG != EvalTag::Yq => {
                 return GenericResult::Owned(tostring_owned::<S>(owned));
             }
             Expr::Builtin(Builtin::Empty) => return GenericResult::None,
             Expr::Builtin(Builtin::Select(cond)) if !optional => {
-                if let Some(verdict) = crate::jq::eval::owned_cond_verdict::<S>(cond, &owned, false)
+                if let Some(verdict) = crate::jq::eval::owned_select_cond_verdict::<S>(cond, &owned)
                 {
                     return match verdict {
                         Ok(true) => GenericResult::Owned(owned),
@@ -5576,7 +5585,7 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     if matches!(owned, OwnedValue::String(_)) && !optional && !embed_table_active() {
         match strip_parens(expr) {
             Expr::Builtin(Builtin::Select(cond)) => {
-                if let Some(verdict) = crate::jq::eval::owned_cond_verdict::<S>(cond, &owned, false)
+                if let Some(verdict) = crate::jq::eval::owned_select_cond_verdict::<S>(cond, &owned)
                 {
                     return match verdict {
                         Ok(true) => GenericResult::Owned(owned),
@@ -5905,6 +5914,42 @@ fn bridge_to_each_owned_flow<S: EvalSemantics, V: DocumentValue>(
             eval_each_owned::<S>(expr, &owned, optional, Reentry::Against(root), &mut |v| {
                 sink.push(GenericItem::Owned(v))
             })
+        }
+        Err(e) if suppresses(&e, optional) => Flow::Exhausted,
+        Err(e) => Flow::Escaped(Control::Error(e)),
+    }
+}
+
+/// Whether a `|=` update runs on one owned copy of its input (`bridge_update_flow`, #6122): jq mode,
+/// and a body that reads no path context. One definition for the two arms that route it
+/// (`eval_single`'s collected form and `eval_each_generic`'s sink form), so they cannot disagree.
+fn update_takes_owned_door<S: EvalSemantics>(expr: &Expr) -> bool {
+    S::TAG == EvalTag::Jq && !needs_path_context(expr)
+}
+
+/// [`bridge_to_each_owned_flow`] for a `|=` update (#6122): the update's outputs are collected,
+/// the owned copy of the input is dropped, and only then are they pushed to `sink`.
+///
+/// An update yields its one result when it has finished, so nothing is lost by waiting for it; what
+/// is gained is that the update's frames and the input copy are gone before the rest of the pipe
+/// runs. Pushing from inside the update's callback kept both alive for every later stage, and a
+/// recursion through an update (`def f($n): ... (.v |= 1) as $x | f($n - 1) ...`) reached the native
+/// stack floor about a fifth sooner (in a release build jq 1.7.1 and the bridge it replaces answer
+/// `f(9000)`; a debug build's frames are larger and fail earlier on every route).
+fn bridge_update_flow<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    cursor: Option<V::Cursor>,
+    optional: bool,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let root = RootWitness::of(cursor.as_ref());
+    match bridge_ambient_input::<_, S>(expr, &value, cursor) {
+        Ok(owned) => {
+            let result =
+                eval_each_owned_collect::<S, V>(expr, &owned, optional, Reentry::Against(root));
+            drop(owned);
+            drain_result_generic(result, sink)
         }
         Err(e) if suppresses(&e, optional) => Flow::Exhausted,
         Err(e) => Flow::Escaped(Control::Error(e)),
@@ -14613,6 +14658,8 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     &yq_literal_index_text::<S>(*idx, key.as_ref()).unwrap_or_default(),
                 ) {
                     Ok(Some(c)) => GenericResult::OneCursor(c),
+                    // #6155: a key that misses finds no node under yq's read-only rule.
+                    Ok(None) if yq_absent_key_read_is_empty::<S>() => GenericResult::None,
                     Ok(None) => GenericResult::Owned(OwnedValue::Null),
                     Err(err) => GenericResult::Error(err),
                 }
@@ -15614,6 +15661,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 && needs_path_context(expr)
                 && owned_identity_pipe_supported(core::slice::from_ref(expr)) =>
         {
+            collect_each_generic::<S, V>(expr, value, optional, cursor)
+        }
+        // #6122: a collected `|=` (`[.a |= 5]`, `map(.x |= f)`) takes the same bridge as the sink
+        // route, see `eval_each_generic`'s arm.
+        Expr::Update { .. } if update_takes_owned_door::<S>(expr) => {
             collect_each_generic::<S, V>(expr, value, optional, cursor)
         }
         // #5305: jq mode's interpolation of plain navigation, collected, with the
@@ -16844,6 +16896,13 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             if S::TAG == EvalTag::Jq =>
         {
             bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+        }
+        // #6122: `|=` too, unless it reads path context. The wildcard in `eval_single` turned the
+        // ambient value into an owned copy, wrote that copy out as text and indexed it again for
+        // the full evaluator, so `.users |= .` on a 100 MB document materialized it twice; this
+        // bridge converts it once and runs the update on that copy, as `=` does.
+        Expr::Update { .. } if update_takes_owned_door::<S>(expr) => {
+            bridge_update_flow::<S, V>(expr, value, cursor, optional, sink)
         }
 
         _ => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
@@ -20187,7 +20246,13 @@ fn each_select_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     let mut already_emitted = false;
     let mut escape: Option<Control> = None;
+    // #6130: yq's `select` reads its condition read-only (a pipe from an absent key is empty); the
+    // sink runs inside the condition's own sink and does not.
+    let previous = yq_read_only_context::active();
+    let _scope = super::eval::yq_as_source_scope::<S>();
     let flow = eval_each_generic::<S, V>(cond, value.clone(), false, cursor, &mut |item| {
+        let _sink_scope =
+            S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(|| yq_read_only_context::restore(previous));
         let truthy = match generic_item_truthiness::<_, S>(item) {
             Ok(b) => b,
             Err(control) => return stop_with_escape(&mut escape, control),
@@ -24160,7 +24225,12 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
             // #2459: yq mode only, the `Object` half of this condition --
             // see `yq_numeric_index_on_object_is_null`.
             } else if target.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>() {
-                GenericResult::Owned(OwnedValue::Null)
+                // #6155: a key that misses finds no node under yq's read-only rule.
+                if yq_absent_key_read_is_empty::<S>() {
+                    GenericResult::None
+                } else {
+                    GenericResult::Owned(OwnedValue::Null)
+                }
             } else if target_is_null() {
                 // #4275 (yq): `null` is an empty array for a negative index.
                 if let Some(e) = idx.and_then(|i| yq_negative_index_check::<S>(i, i, 0)) {
@@ -35310,7 +35380,12 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
         Builtin::Select(cond) => {
             // Evaluate condition with cursor context preserved.
             // This is critical for select(di == N) to work correctly.
-            let cond_result = eval_single::<S, _>(cond, value.clone(), false, cursor);
+            // #6130: yq's `select` reads its condition read-only, so a pipe from an absent key is
+            // empty; the scope is gone before anything downstream runs.
+            let cond_result = {
+                let _scope = super::eval::yq_as_source_scope::<S>();
+                eval_single::<S, _>(cond, value.clone(), false, cursor)
+            };
 
             let mut bits = Vec::new();
             let cond_control = push_generic_truthiness::<_, S>(cond_result, &mut bits);
@@ -40350,6 +40425,9 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
     };
     for (component, member) in members {
         let member_id = id.child(&parent, component.clone());
+        // #6129: yq's `map_values(f)` is `.[] |= f`, which leaves a member `f` has no output for.
+        let original = (S::TAG == EvalTag::Yq && matches!(family, MapFamily::MapValues))
+            .then(|| member.clone());
         let mut outputs: Vec<OwnedValue> = Vec::new();
         let flow = eval_owned_identity_stages::<S, V>(
             stages,
@@ -40373,8 +40451,8 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         match family {
             MapFamily::Map | MapFamily::WithEntries => array.extend(outputs),
             MapFamily::MapValues => {
-                let Some(value) = outputs.into_iter().next() else {
-                    // No output removes the member (every entry of its key).
+                let Some(value) = outputs.into_iter().next().or(original) else {
+                    // No output removes the member (every entry of its key); in yq it leaves it.
                     if keeps_container && !matches!(component, OwnedValue::Int(_)) {
                         object.shift_remove(owned_to_string::<S>(&component).as_str());
                     }
@@ -42278,6 +42356,49 @@ mod tests {
                 .collect_owned::<JqSemantics>()
                 .unwrap();
             assert!(!result.is_empty(), "{filter}");
+            assert_eq!(
+                reindex_count::get() - before,
+                0,
+                "{filter} bridged the input"
+            );
+        }
+    }
+
+    /// #6122: a `|=` update that reads no path context is run on one owned copy of the input, not
+    /// bridged: the bridge writes the copy out as JSON and indexes it again (`reindex_count` counts
+    /// exactly that) before the update runs, a second materialization of the whole document. The
+    /// shapes are the ones `eval_each_owned` answers from the tree, at the top level and collected
+    /// (`[..]`, `map(..)`). Output is compared with the bridge's, which the other arm of each pair
+    /// is: an update that reads path context keeps its own route and still answers as it did. The
+    /// pin must be able to fail: it does, with the two `Expr::Update` arms removed.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_path_free_update_is_not_bridged_6122() {
+        use crate::jq::value::reindex_count;
+
+        let json = br#"{"a":1,"arr":[{"x":1},{"x":2}],"o":{"p":3}}"#;
+        let index = JsonIndex::build(json);
+        for (filter, want) in [
+            (".a |= .", r#"{"a":1,"arr":[{"x":1},{"x":2}],"o":{"p":3}}"#),
+            (
+                ".o.p |= 7",
+                r#"{"a":1,"arr":[{"x":1},{"x":2}],"o":{"p":7}}"#,
+            ),
+            (
+                ".a |= .+1",
+                r#"{"a":2,"arr":[{"x":1},{"x":2}],"o":{"p":3}}"#,
+            ),
+            ("[.a |= 5] | length", "1"),
+            (".arr | map(.x |= .+1) | length", "2"),
+            ("[.arr[] | (.x |= .+1)] | length", "2"),
+        ] {
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::get();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            let shown: Vec<String> = result.iter().map(OwnedValue::to_json).collect();
+            assert_eq!(shown, [want], "{filter}");
             assert_eq!(
                 reindex_count::get() - before,
                 0,
@@ -63011,6 +63132,169 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// #6125: for every container of a generated document, the one-pass read of its own text
+    /// (`plain_owned_jq`) is the value the walk builds, wherever it answers: the values, and their
+    /// JSON text, which keeps a number's spelling. Documents are valid and mangled, with repeated
+    /// keys, escapes, number spellings, nesting and non-ASCII text.
+    #[cfg(feature = "std")]
+    #[test]
+    fn plain_owned_read_of_a_container_equals_the_walk_6125() {
+        type Cursor<'a> = crate::json::light::JsonCursor<'a, Vec<u64>>;
+
+        fn visit(c: &Cursor<'_>, out: &mut Vec<usize>) {
+            out.push(c.node_id());
+            let mut child = c.first_child();
+            while let Some(n) = child {
+                visit(&n, out);
+                child = n.next_sibling();
+            }
+        }
+        fn gen(next: &mut impl FnMut() -> u64, depth: usize, out: &mut String) {
+            match next() % if depth > 4 { 6 } else { 9 } {
+                0 => out.push_str("null"),
+                1 => out.push_str(if next() % 2 == 0 { "true" } else { "false" }),
+                2 => {
+                    let n = [
+                        "0",
+                        "-0",
+                        "7",
+                        "-12",
+                        "3.5",
+                        "-0.25",
+                        "1e3",
+                        "2E-2",
+                        "1.0",
+                        "10.50",
+                        "123456789012345678",
+                        "9223372036854775808",
+                        "1e999",
+                        "0.1e1",
+                        "007",
+                        "1.",
+                    ];
+                    out.push_str(n[(next() % n.len() as u64) as usize]);
+                }
+                3..=5 => {
+                    let w = [
+                        "",
+                        "a",
+                        "caf\u{e9}",
+                        "\u{1f600}",
+                        "a\\nb",
+                        "q\\\"q",
+                        "\\u0041",
+                        "\\ud83d\\ude00",
+                        "\\udc00",
+                        "\\ud800",
+                        "tab\\t",
+                        "\\u0000",
+                        "\\/",
+                        "a b",
+                    ];
+                    out.push('"');
+                    out.push_str(w[(next() % w.len() as u64) as usize]);
+                    out.push('"');
+                }
+                6 | 7 => {
+                    out.push('[');
+                    for i in 0..next() % 5 {
+                        if i > 0 {
+                            out.push(if next() % 30 == 0 { ' ' } else { ',' });
+                        }
+                        gen(next, depth + 1, out);
+                    }
+                    out.push(']');
+                }
+                _ => {
+                    out.push('{');
+                    for i in 0..next() % 5 {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        let k = [
+                            "a",
+                            "b",
+                            "id",
+                            "a",
+                            "k\\u00e9",
+                            "x y",
+                            "\\u0000",
+                            "caf\u{e9}",
+                        ];
+                        out.push('"');
+                        out.push_str(k[(next() % k.len() as u64) as usize]);
+                        out.push_str("\":");
+                        gen(next, depth + 1, out);
+                    }
+                    out.push('}');
+                }
+            }
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (mut answered, mut declined) = (0usize, 0usize);
+        for _ in 0..20_000 {
+            let mut text = String::new();
+            if next() % 4 == 0 {
+                text.push_str("  ");
+            }
+            gen(&mut next, 0, &mut text);
+            // A third of the documents get one byte-level mutation (a deleted, inserted or replaced
+            // byte), so the read also meets text the walk may reject or read differently.
+            let mut bytes = text.clone().into_bytes();
+            if next() % 3 == 0 && !bytes.is_empty() {
+                let at = (next() % bytes.len() as u64) as usize;
+                let junk = b",:[]{}\"\\ 0e-.\t\0xn";
+                match next() % 3 {
+                    0 => {
+                        bytes.remove(at);
+                    }
+                    1 => bytes.insert(at, junk[(next() % junk.len() as u64) as usize]),
+                    _ => bytes[at] = junk[(next() % junk.len() as u64) as usize],
+                }
+            }
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let doc = text.as_bytes();
+            let index = JsonIndex::build(doc);
+            let root = index.root(doc);
+            let mut nodes = Vec::new();
+            visit(&root, &mut nodes);
+            for id in nodes {
+                // A mutated text may index into nodes the root cannot reach again.
+                let Some(cur) = root.at_node_id(id) else {
+                    continue;
+                };
+                let Some(fast) = cur.plain_owned_jq() else {
+                    declined += 1;
+                    continue;
+                };
+                answered += 1;
+                let walk = to_owned_cursor_at_depth::<JqSemantics, _, BuildOwned>(
+                    &cur,
+                    None,
+                    0,
+                    0,
+                    &nesting_depth_check,
+                    &|_, _| None,
+                    &[],
+                )
+                .unwrap_or_else(|e| panic!("{text:?} at node {id}: the walk refuses it: {e:?}"));
+                assert_eq!(fast, walk, "{text:?} at node {id}");
+                assert_eq!(fast.to_json(), walk.to_json(), "{text:?} at node {id}");
+            }
+        }
+        assert!(
+            answered > 5_000,
+            "the sweep must reach the read: {answered}"
+        );
+        assert!(declined > 1_000, "and the walk: {declined}");
     }
 
     /// #3483: the node-only step and the generic walk that decodes every key

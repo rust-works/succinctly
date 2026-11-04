@@ -4384,6 +4384,15 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         true
     }
 
+    fn plain_owned_jq(&self) -> Option<OwnedValue> {
+        if !self.is_container() {
+            return None;
+        }
+        let (value, nodes) = crate::jq::parse_plain_at(self.text, self.text_position()?)?;
+        // The read holds only where the index nests the container as the text does.
+        (self.index.bp().subtree_size(self.bp_pos)? == nodes).then_some(value)
+    }
+
     #[inline]
     fn same_node(&self, other: &Self) -> bool {
         self.bp_pos == other.bp_pos

@@ -193,7 +193,19 @@ see #1582 below for why. On `push` runs (every commit the merge queue lands on
 `tests/data/perf-guard-baseline.json` is now only a fallback for the rare case
 neither can supply a binary (a branch's first push, or a `before` SHA the checkout
 doesn't have), and a seed for running the script locally with no comparison binary
-of your own. To deliberately update that file after a real, understood cost change:
+of your own.
+
+**The path a binary is started from moves its instruction count.** On the ubuntu-26.04 runner
+(glibc 2.43, valgrind 3.26) `arrays_map_iterate` counts 900.79M when the executable's path is 35
+characters or fewer or 52 or more, and 956.33M for 36 to 51, for the same bytes: a fresh build and a
+reused artifact agree at every length, and 21 of the 22 rows do not move at all (#6153). The guard
+started the current binary from `target/release/succinctly` and a baseline reused from `main`'s push
+run from `/tmp/perf-guard-baseline-bin/succinctly`, so every such run read a 5.8% "improvement" no
+commit had made. `measure_all` now starts both from a symlink `/tmp/tmpXXXXXXXX/bin/succinctly` (31 characters, outside the window, and the same wherever `$TMPDIR` points). Any other
+valgrind A/B of two binaries should start both from paths of one length too; a counting run that
+differs only in where the binary lives is not a result.
+
+To deliberately update that file after a real, understood cost change:
 
 ```bash
 cargo build --release --features cli
