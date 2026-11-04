@@ -1047,7 +1047,7 @@ mod tests {
         assert_eq!(ops("(?i)b"), None, "the flag itself is not counted");
         assert_eq!(
             ops("(?:a*b)*"),
-            Some(2 + 3 + 1 + 0),
+            Some(2 + 3 + 1),
             "a body that is not nullable"
         );
         assert_eq!(ops("(?:a*b*)*"), Some(2 + (3 + 3 + 2)), "a body that is");
