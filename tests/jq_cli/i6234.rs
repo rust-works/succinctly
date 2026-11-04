@@ -32,6 +32,9 @@ fn test_a_hex_escape_that_is_not_two_digits_in_a_class_reads_as_jq_does_6234() -
         (r"(?i)[\xg]", "[\"g\",\"\\u0000\"]", 0),
         (r"[[:alpha:]\x]", "[\"a\",\"x\",\"g\",\"\\u0000\",\"A\"]", 0),
         (r"[\w\x]", "[\"a\",\"x\",\"g\",\"\\u0000\",\"A\"]", 0),
+        (r"[\x1-\x5]", "[\"\\u0001\"]", 0),
+        (r"[\x0-\x1]", "[\"\\u0000\",\"\\u0001\"]", 0),
+        (r"[\x1-\x]", "", 5),
     ] {
         let (stdout, _, status) = run_jq_full(
             &[
