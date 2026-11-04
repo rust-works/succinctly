@@ -7569,6 +7569,14 @@ jq also ends a cluster after 4095 code points of extending marks, which this doe
 A very long cluster (tens of thousands of marks) followed by a pattern that fails after `\X` is quadratic here, as the same shape is for any atomic group on the second engine.
 Pinned by `tests/jq_cli/i6220.rs`.
 
+### Multi-character case folding is not read under the `i` flag ([#6225](https://github.com/rust-works/succinctly/issues/6225))
+
+Oniguruma folds case with the full Unicode table, where the `regex` crate (and `fancy-regex`) fold one character to one.
+Under `i`, jq reads `ß` as also `ss`, `ss` as also `ß` and `ẞ`, `ﬁ` as `fi`, `ﬀ` as `ff`, in a literal and in a class that holds the character: `"STRASSE" | match("ß";"i")` is `[4,2]` in jq and empty here, `"Straße" | match("ss";"i")` is `[4,1]` there and empty here, `"fi" | test("ﬁ";"i")` is `true` there and `false` here.
+`s+` and `[s]` do not match `ß` in jq either, so the fold is that of a literal string or of a class holding the folding character, not of every `s`.
+One-to-one folds (`K` and the Kelvin sign, `σ`, `ς` and `Σ`, `ǅ`, `ǆ` and `Ǆ`, `µ` and `μ`) agree.
+It is not reproduced: no dependency reads the full fold table, and a rewrite of literals under `i` needs the whole `CaseFolding.txt` `F` list captured against jq first (#6225).
+
 ### A group repeated `{0}` keeps its capture entry (#6108)
 
 Oniguruma numbers a group repeated zero times (`{0}`, `{0,0}`), so jq reports an entry for it: offset `-1` and string `null`, or an empty string at the match offset when the whole match is empty.
