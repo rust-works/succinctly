@@ -6221,7 +6221,6 @@ fn update_on_cursor_gated<S: EvalSemantics, V: DocumentValue>(
         || !root.materializes_members_one_to_one()
         || embed_table_active()
         || !update_filter_is_native(filter)
-        || !update_filter_is_repeatable(filter)
     {
         return None;
     }
@@ -6242,6 +6241,11 @@ fn update_on_cursor_gated<S: EvalSemantics, V: DocumentValue>(
         if target_span.saturating_mul(CURSOR_UPDATE_TARGET_SHARE) < root_span {
             return None;
         }
+    }
+    // Only a route that is about to run the filter needs to know it can run twice: the walks that
+    // tell are not paid by an update inside a loop over small records.
+    if !update_filter_is_repeatable(filter) {
+        return None;
     }
     // The whole-document copy checks every node of the target, at the depth the path puts it.
     if !target.certified_well_formed(steps.len())
