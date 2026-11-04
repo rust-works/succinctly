@@ -7493,7 +7493,7 @@ Three differences remain.
   Pinned by `tests/jq_cli/i6169.rs`.
 - **Oniguruma syntax outside the checked list stays refused.**
   The second engine takes only constructs and escapes whose meaning there was compared with jq's.
-  `\g<name>` and `\g'name'`, the absence operator `(?~…)`, `\X` and `\y` keep the `invalid regex` error.
+  `\g<name>` and `\g'name'`, the absence operator `(?~…)` and `\y` keep the `invalid regex` error.
   (`\h`, `\H` and `\g1` are the letters in jq and here, #6080: see the escaped-letter paragraph above.)
   So do two that jq reads differently from `fancy-regex`: a reversed interval (`a{3,2}`), an error in jq, and a `+` after an interval (`a{2,3}+`), possessive in jq for `{n,m}+` and `{n,}+` but not for `{n}+`.
   A `(?P…)` group is refused before either engine, with jq's `undefined group option` (above).
@@ -7533,9 +7533,18 @@ Every row was captured from jq 1.7.1.
 - **jq's refusals:** an interval with nothing to repeat (`{1}`, `a|{2}`, `(?:{2})`: `target of repeat operator is not specified`), a conditional on a group the pattern lacks (`(?(2)a|b)`: `invalid backref number/name`, and `undefined name <n> reference` for a name), and a group name that is empty or starts with a digit.
   `"a" | test("(?(2)a|b)")` panicked inside `fancy-regex` before this.
 
-Still refused with the crate's `invalid regex` error, where jq answers: `\X` (one grapheme cluster), `\y` and `\Y` (text-segment boundaries), `\g<name>` (a call), `\o{…}`, an octal escape of 0x80 or more (`\377`), `\cé`, and `\x{110000}`.
+Still refused with the crate's `invalid regex` error, where jq answers: `\y` and `\Y` (text-segment boundaries), `\g<name>` (a call), `\o{…}`, an octal escape of 0x80 or more (`\377`), `\cé`, and `\x{110000}`.
 Whether one of them matches needs Unicode text segmentation or Oniguruma's byte-level reading of a multibyte pattern.
 Pinned by `tests/jq_cli/i6070.rs`.
+
+### `\X`, an extended grapheme cluster, follows the `regex` crate's Unicode tables (#6220)
+
+`\X` is rewritten to the UAX #29 rules over the crate's `Grapheme_Cluster_Break` and `Extended_Pictographic` properties.
+It is an atomic group, as in Oniguruma, and is refused inside a look-behind with `invalid pattern in look-behind`, as in jq.
+Over 85,259 strings drawn from every break class and 800,000 random strings, every cluster is the same as jq 1.7.1's except where a character's class changed after the Unicode tables jq's Oniguruma carries.
+The characters seen are U+1B44 and U+A9C0 (spacing marks before Unicode 15.1, extending marks since), and the Unicode 16 additions such as U+16D63, U+16124 and U+1F8BA.
+Around them the crate follows its own tables, so a cluster that holds one can split differently from jq.
+Pinned by `tests/jq_cli/i6220.rs`.
 
 ### A group repeated `{0}` keeps its capture entry (#6108)
 
