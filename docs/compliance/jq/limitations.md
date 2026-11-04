@@ -7413,6 +7413,14 @@ A `{` that does not open `{n}`, `{n,}` or `{n,m}` is the literal brace: `a{ 1}`,
 Inside a class they fold in both.
 A `\p` or `\P` with no brace is the letter, in a class or out of one (`"pL" | test("\\pL")` is `true`, and `"a"` does not match it); the crate reads `\pL` as the letter property.
 Pinned against jq 1.7.1 on 1,512 pattern x text x flag rows (all agree) and in `tests/jq_cli/i6068.rs`.
+
+A property name is read as Oniguruma reads it (#6217).
+`\p{XDigit}` is the ASCII hex digits (the crate has no such name), also as `\P{XDigit}`, `\p{^XDigit}` and inside a class.
+A name with `=` or `:` (`\p{Age=1.1}`, `\p{Script=Latin}`, `\p{gc=L}`) and the properties newer than the Unicode tables jq 1.7.1 links (`Bidi_Mirrored`, `IDS_Unary_Operator`, `ID_Compat_Math_Start`, `ID_Compat_Math_Continue`, `Modifier_Combining_Mark` and their abbreviations) are `invalid character property name {NAME}`, the name as written, as in jq.
+Case, blanks, `_` and `-` do not matter in a name.
+Over every name in the `regex` crate's property table (413) in seven spellings, the answers match jq 1.7.1 except for two unfixed gaps: the `In_*` block names (`\p{In_Basic_Latin}`) are answered by jq and refused here, since the crate has no block table, and a name neither tool knows (`\p{Foo}`) is refused in both with each tool's own wording.
+Pinned by `tests/jq_cli/i6217.rs`.
+
 An escaped letter Oniguruma does not define is the letter, as `\u` and `\U` are (#6080): `\g`, `\h`, `\i`, `\j`, `\k`, `\l`, `\m`, `\o`, `\q`, `\v` and the capitals `\C`, `\E`, `\F`, `\H`, `\I`, `\J`, `\L`, `\M`, `\T`, `\V`, in a class and out of one and under the `x` flag.
 The set was captured from jq 1.7.1 over every ASCII character.
 The `regex` crate refused most of them, and read `\v` as a vertical tab (`"v" | test("\\v")` is `true` in jq).

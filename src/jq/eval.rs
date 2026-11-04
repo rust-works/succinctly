@@ -28864,6 +28864,44 @@ fn pin_backreference_case(pattern: &str, base_i: bool, extended: bool) -> Option
     (wrapped && saw_inline_i).then_some(out)
 }
 
+/// How a `\p{..}` property name reads in Oniguruma, which the `regex` crate reads otherwise (#6217).
+#[cfg(feature = "regex")]
+enum PropertyName {
+    /// `XDigit`: the ASCII hex digits, a name the crate lacks.
+    XDigit,
+    /// A name Oniguruma refuses (`invalid character property name`) that the crate reads: a
+    /// `name=value` or `name:value` form, and the properties newer than the Unicode tables jq 1.7.1
+    /// links.
+    Refused,
+    Other,
+}
+
+/// Classify the text between the braces of `\p{..}`, without its `^`. Oniguruma ignores case,
+/// blanks, `_` and `-` in a name.
+#[cfg(feature = "regex")]
+fn property_name_kind(raw: &str) -> PropertyName {
+    if raw.contains(['=', ':']) {
+        return PropertyName::Refused;
+    }
+    let name: String = raw
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '_' | '-'))
+        .flat_map(char::to_lowercase)
+        .collect();
+    match name.as_str() {
+        "xdigit" => PropertyName::XDigit,
+        "bidimirrored"
+        | "bidim"
+        | "idsunaryoperator"
+        | "idsu"
+        | "idcompatmathcontinue"
+        | "idcompatmathstart"
+        | "modifiercombiningmark"
+        | "mcm" => PropertyName::Refused,
+        _ => PropertyName::Other,
+    }
+}
+
 /// Whether a repetition operator follows the comments that start at `at` (`(?#...)`, any number of
 /// them), as in `b(?#)(?#)*` (#6128).
 #[cfg(feature = "regex")]
@@ -29074,6 +29112,32 @@ fn translate_posix_brackets_scan(
                 if chars.get(i + 2) == Some(&'{') {
                     if let Some(close) = chars[i + 3..].iter().position(|&c| c == '}') {
                         let end = i + 3 + close + 1;
+                        // #6217: the names Oniguruma reads, which differ from the crate's.
+                        let name = &chars[i + 3..i + 3 + close];
+                        let caret = name.first() == Some(&'^');
+                        let raw: String = name[usize::from(caret)..].iter().collect();
+                        match property_name_kind(&raw) {
+                            PropertyName::Refused => {
+                                return Err(EvalError::new(format!(
+                                    "invalid regex: invalid character property name {{{raw}}}"
+                                )));
+                            }
+                            PropertyName::XDigit => {
+                                // ASCII hex digits, which the crate has no name for.
+                                if (kind == 'P') != caret {
+                                    out.push_str("[^0-9A-Fa-f]");
+                                } else if depth == 0 {
+                                    out.push_str("[0-9A-Fa-f]");
+                                } else {
+                                    out.push_str("0-9A-Fa-f");
+                                }
+                                changed = true;
+                                at_start = false;
+                                i = end;
+                                continue;
+                            }
+                            PropertyName::Other => {}
+                        }
                         if depth == 0 {
                             out.push_str("(?-i:");
                             out.extend(&chars[i..end]);
