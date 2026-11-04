@@ -605,6 +605,7 @@ mod tests {
             "(?:^|a)+",    // an assertion
             "(?:b*|(a))+", // a capture group in a later way
             "(?U)(?:b*|a)+",
+            "(?:(?U:b*)|a)+",
             "(?:a+)*",
             "abc",
             "(?:b*|a",

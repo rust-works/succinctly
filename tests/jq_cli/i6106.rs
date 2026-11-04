@@ -78,10 +78,12 @@ fn test_counted_and_lazy_repeats_end_at_an_empty_iteration_6106() -> Result<()> 
 }
 
 /// An `x`-mode comment between a group and its quantifier, and a loop nested deep enough that
-/// `fancy-regex` (the `n` route) refuses the rewrite but not the pattern as written.
+/// `fancy-regex` (the `n` route, and the route for `$` with `\z`) refuses the rewrite but not the
+/// pattern as written.
 #[test]
 fn test_a_comment_before_the_quantifier_and_a_deep_n_loop_6106() -> Result<()> {
     let deep = format!("{}(?:b*|a)+{}", "(?:".repeat(61), ")".repeat(61));
+    let deep_end = format!(r#""ba" | [match("{deep}(?:\\z|$|)"; "g") | .string]"#);
     let deep = format!(r#""ba" | [match("{deep}"; "gn") | .string]"#);
     assert_rows(&[
         (
@@ -93,6 +95,8 @@ fn test_a_comment_before_the_quantifier_and_a_deep_n_loop_6106() -> Result<()> {
             r#"["b"]"#,
         ),
         (&deep, r#"["b","a"]"#),
+        // `$` and `\z` together take the `fancy-regex` route too.
+        (&deep_end, r#"["b","",""]"#),
     ])
 }
 
