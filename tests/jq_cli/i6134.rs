@@ -65,6 +65,10 @@ fn test_the_first_branch_of_a_shared_prefix_alternation_wins_6134() -> Result<()
             r#""aab\n" | [match("(?:a*a|a*b)$\\n") | .string]"#,
             r#"["aab\n"]"#,
         ),
+        // The dead branch carries the first branch's anchors, which still hold.
+        (r#""aab" | [match("^a*a|^a*b") | .string]"#, r#"["aa"]"#),
+        (r#""zaab" | [match("^a*a|^a*b") | .string]"#, r#"[]"#),
+        (r#""aab" | [match("a*a$|a*b$") | .string]"#, r#"["aab"]"#),
     ])
 }
 
@@ -92,6 +96,14 @@ fn test_a_shared_prefix_alternation_beside_oniguruma_syntax_6134() -> Result<()>
         ),
         (
             r#""xaab" | [match("x\\K(?:a*a|a*b)") | .string]"#,
+            r#"["aa"]"#,
+        ),
+        (
+            r#""aab" | [match("(?#c)(?:a*a|a*b)") | .string]"#,
+            r#"["aa"]"#,
+        ),
+        (
+            r#""aab" | [match("(?#a|b)a*a|a*b") | .string]"#,
             r#"["aa"]"#,
         ),
     ])
