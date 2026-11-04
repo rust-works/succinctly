@@ -29017,11 +29017,49 @@ fn pin_backreference_case(pattern: &str, base_i: bool, extended: bool) -> Option
 enum PropertyName {
     /// `XDigit`: the ASCII hex digits, a name the crate lacks.
     XDigit,
+    /// `In_Basic_Latin` and the other Unicode block names (#6228): the block's inclusive code point
+    /// ranges, which the crate has no names for.
+    Block(&'static [(u32, u32)]),
     /// A name Oniguruma refuses (`invalid character property name`) that the crate reads: a
     /// `name=value` or `name:value` form, and the properties newer than the Unicode tables jq 1.7.1
     /// links.
     Refused,
     Other,
+}
+
+/// The code points of a block, or all the other scalar values when `negate` (#6228), as inclusive
+/// ranges in order. The surrogates are in neither: the crate refuses `\x{D800}`.
+#[cfg(feature = "regex")]
+fn block_set(ranges: &[(u32, u32)], negate: bool) -> Vec<(u32, u32)> {
+    if !negate {
+        return ranges.to_vec();
+    }
+    let mut set = Vec::new();
+    let mut next = 0u32;
+    for &(lo, hi) in ranges {
+        if lo > next {
+            set.push((next, lo - 1));
+        }
+        next = hi + 1;
+    }
+    if next <= 0x10FFFF {
+        set.push((next, 0x10FFFF));
+    }
+    // Carve the surrogate gap out of whichever range holds it.
+    let mut out = Vec::new();
+    for (lo, hi) in set {
+        if lo <= 0xDFFF && hi >= 0xD800 {
+            if lo < 0xD800 {
+                out.push((lo, 0xD7FF));
+            }
+            if hi > 0xDFFF {
+                out.push((0xE000, hi));
+            }
+        } else {
+            out.push((lo, hi));
+        }
+    }
+    out
 }
 
 /// Classify the text between the braces of `\p{..}`, without its `^`. Oniguruma ignores case,
@@ -29036,6 +29074,9 @@ fn property_name_kind(raw: &str) -> PropertyName {
         .filter(|c| !matches!(c, ' ' | '_' | '-'))
         .flat_map(char::to_lowercase)
         .collect();
+    if let Ok(at) = super::regex_blocks::BLOCKS.binary_search_by_key(&name.as_str(), |b| b.0) {
+        return PropertyName::Block(super::regex_blocks::BLOCKS[at].1);
+    }
     match name.as_str() {
         "xdigit" => PropertyName::XDigit,
         "bidimirrored"
@@ -29301,6 +29342,35 @@ fn translate_posix_brackets_scan(
                                     out.push_str("[0-9A-Fa-f]");
                                 } else {
                                     out.push_str("0-9A-Fa-f");
+                                }
+                                changed = true;
+                                at_start = false;
+                                i = end;
+                                continue;
+                            }
+                            PropertyName::Block(ranges) => {
+                                // #6228: a class of the block's ranges. Outside a class it is
+                                // pinned case-sensitive, like every `\p{..}` there (#6068).
+                                if depth == 0 {
+                                    out.push_str("(?-i:");
+                                }
+                                // Always positive ranges, the complement spelled out for a negated
+                                // one: inside a class under `i` Oniguruma folds the complement,
+                                // where the crate would fold the block and then negate it.
+                                let negate = (kind == 'P') != caret;
+                                let set = block_set(ranges, negate);
+                                out.push('[');
+                                if set.is_empty() {
+                                    // The surrogate blocks hold no scalar value: no member at all.
+                                    out.push_str("^\\x{0}-\\x{10FFFF}");
+                                }
+                                for (lo, hi) in set {
+                                    use std::fmt::Write as _;
+                                    let _ = write!(out, "\\x{{{lo:X}}}-\\x{{{hi:X}}}");
+                                }
+                                out.push(']');
+                                if depth == 0 {
+                                    out.push(')');
                                 }
                                 changed = true;
                                 at_start = false;
