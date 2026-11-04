@@ -28709,9 +28709,13 @@ fn guard_prefix_lifting(pattern: &str, oniguruma: bool) -> Option<String> {
     let mut from = 0;
     for (start, lead, trail) in &guards {
         out.push_str(&pattern[from..*start]);
-        lead.iter().for_each(|span| out.push_str(text(span)));
+        for span in lead {
+            out.push_str(text(span));
+        }
         out.push_str(NEVER_MATCHES);
-        trail.iter().for_each(|span| out.push_str(text(span)));
+        for span in trail {
+            out.push_str(text(span));
+        }
         out.push('|');
         from = *start;
     }
@@ -28728,7 +28732,7 @@ fn guard_prefix_lifting(pattern: &str, oniguruma: bool) -> Option<String> {
 #[cfg(feature = "regex")]
 fn oniguruma_shadow(pattern: &str) -> Option<String> {
     let bytes = pattern.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+    let mut out = vec_with_capacity(bytes.len());
     // Open classes (they nest), and whether the next byte is the first of the class, where a `]` is
     // a literal -- as in [`keep_zero_count_groups`].
     let mut class_depth = 0usize;
@@ -28787,7 +28791,7 @@ fn oniguruma_shadow(pattern: &str) -> Option<String> {
                 return None;
             }
             out.extend_from_slice(b"(?:");
-            out.resize(out.len() + comment.len() - 4, b'x');
+            out.extend(core::iter::repeat(b'x').take(comment.len() - 4));
             out.push(b')');
             i += comment.len();
             continue;
