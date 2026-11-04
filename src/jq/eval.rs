@@ -28312,6 +28312,66 @@ fn refuse_unknown_group_option(rest: &[char]) -> Result<(), EvalError> {
     Ok(())
 }
 
+#[cfg(feature = "regex")]
+/// An option run Oniguruma reads and the `regex` crate refuses (#6133): `(?-)`, `(?--i)`,
+/// `(?i-m-s)`, `(?i-:...)`. Oniguruma turns options off from the first `-` on and a later `-` is a
+/// no-op, so `(?i-m-s)` is `i` on and `m`, `s` off. `rest` is the text after `(?`; the result is
+/// `None` for anything the crate reads the same way (at most one `-`, and a letter after it).
+fn single_minus_option_run(rest: &[char]) -> Option<OptionRun> {
+    let letters = rest
+        .iter()
+        .take_while(|c| c.is_ascii_alphabetic() || **c == '-')
+        .count();
+    let closes_group = match rest.get(letters) {
+        Some(')') => true,
+        Some(':') => false,
+        _ => return None,
+    };
+    let run = &rest[..letters];
+    let dashes = run.iter().filter(|&&c| c == '-').count();
+    if dashes == 0 || (dashes == 1 && run.last() != Some(&'-')) {
+        return None;
+    }
+    let first = run.iter().position(|&c| c == '-')?;
+    let on: String = run[..first].iter().collect();
+    let off: String = run[first..].iter().filter(|&&c| c != '-').collect();
+    let flags = if off.is_empty() {
+        on.clone()
+    } else {
+        format!("{on}-{off}")
+    };
+    Some(OptionRun {
+        flags,
+        x_on: on.contains('x'),
+        x_off: off.contains('x'),
+        consumed: letters + 1,
+        closes_group,
+    })
+}
+
+#[cfg(feature = "regex")]
+/// What [`single_minus_option_run`] found: the run with one `-` at most, whether `x` is named on or
+/// off, how much of the pattern it spans (through its `)` or `:`) and which of the two closes it.
+struct OptionRun {
+    flags: String,
+    x_on: bool,
+    x_off: bool,
+    consumed: usize,
+    closes_group: bool,
+}
+
+#[cfg(feature = "regex")]
+impl OptionRun {
+    /// Whether the extended mode is on after the run, given the mode before it.
+    fn x_after(&self, outer: bool) -> bool {
+        if self.x_off {
+            false
+        } else {
+            self.x_on || outer
+        }
+    }
+}
+
 /// Rewrite the character classes of a jq pattern to what Oniguruma's Perl syntax means by them
 /// (#5367): the POSIX brackets (`[:alpha:]`, `[:^alpha:]`) inside a class become nested Unicode
 /// classes, and a `[`, `&` or `~` inside a class is the literal character. Oniguruma's are
@@ -28576,6 +28636,36 @@ fn translate_posix_brackets_scan(
             // jq.
             if c == '(' && chars.get(i + 1) == Some(&'?') {
                 refuse_unknown_group_option(&chars[i + 2..])?;
+            }
+            // #6133: an option run that repeats `-` or ends on one, which the `regex` crate refuses.
+            if c == '(' && chars.get(i + 1) == Some(&'?') {
+                if let Some(run) = single_minus_option_run(&chars[i + 2..]) {
+                    let opened = open_group(&chars, i, &mut group_facts)?;
+                    groups_opened += usize::from(opened.captures);
+                    body_start = opened.body_start;
+                    let outer = extended_in.last().copied().unwrap_or(false);
+                    let (on_x, rest) = (run.x_after(outer), i + 2 + run.consumed);
+                    changed = true;
+                    if run.closes_group {
+                        // `(?flags)`: the rest of the enclosing group.
+                        if let Some(group) = extended_in.last_mut() {
+                            *group = on_x;
+                        }
+                        if !run.flags.is_empty() {
+                            out.push_str("(?");
+                            out.push_str(&run.flags);
+                            out.push(')');
+                        }
+                    } else {
+                        // `(?flags:...)`: this group only.
+                        extended_in.push(on_x);
+                        out.push_str("(?");
+                        out.push_str(&run.flags);
+                        out.push(':');
+                    }
+                    i = rest;
+                    continue;
+                }
             }
             // #6070: `(*FAIL)` is the verb that never matches, `(?!)` here.
             if c == '(' && chars[i + 1..].starts_with(&['*', 'F', 'A', 'I', 'L', ')']) {
