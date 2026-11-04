@@ -115,9 +115,9 @@ fn the_update_is_taken_once_per_input_6122() -> Result<()> {
 }
 
 // `map(.a)`, `map(.a.b)` and `map(.[n])` over an owned array are answered from the tree, not through
-// the reindex bridge (`.users |= map(.age)` was 0.84x of jq 1.7.1 on a 7 MB document). The answer must
-// be the one the bridge gave, and a step that raises must still raise the bridge's error. Every row
-// was captured from jq 1.7.1 (`/usr/bin/jq -c`).
+// the reindex bridge (`.users |= map(.age)` was 0.73x of jq 1.7.1 on a Ryzen 9 7950X and 0.92x on an Apple
+// M4 Pro at 7 MB). The answer must be the one the bridge gave, and a step that raises must still raise the
+// bridge's error. Every row was captured from jq 1.7.1 (`/usr/bin/jq -c`).
 
 /// (input, filter, jq 1.7.1's `-c` output).
 const ANSWERED: &[(&str, &str, &str)] = &[
@@ -248,6 +248,42 @@ const ANSWERED: &[(&str, &str, &str)] = &[
         r#"{"u":[]}
 "#,
     ),
+    (
+        r#"{"u":[{"a":1},{"a":2}],"w":3}"#,
+        r".w = (.u | map(.a))",
+        r#"{"u":[{"a":1},{"a":2}],"w":[1,2]}
+"#,
+    ),
+    (
+        r#"{"u":[{"a":1},{"a":2}],"w":3}"#,
+        r".u |= (map(.a) | length)",
+        r#"{"u":2,"w":3}
+"#,
+    ),
+    (
+        r#"{"u":[{"a":1},{"a":2}]}"#,
+        r".u |= (. | map(.a))",
+        r#"{"u":[1,2]}
+"#,
+    ),
+    (
+        r#"[{"a":1},{"a":2}]"#,
+        r". += map(.a)",
+        r#"[{"a":1},{"a":2},1,2]
+"#,
+    ),
+    (
+        r#"{"s":[{"x":{"x":{"x":1}}}]}"#,
+        r"reduce range(3) as $i (.; .s |= map(.x))",
+        r#"{"s":[1]}
+"#,
+    ),
+    (
+        r#"{"s":[{"x":1},{"x":2}]}"#,
+        r".s |= (map(.x) as $v | $v)",
+        r#"{"s":[1,2]}
+"#,
+    ),
 ];
 
 /// (input, filter, jq 1.7.1's stderr).
@@ -298,6 +334,12 @@ const RAISED: &[(&str, &str, &str)] = &[
         r#"{"u":[{"a":1},{"a":2}]}"#,
         r"(.u, .u) |= map(.a)",
         r#"jq: error (at <stdin>:0): Cannot index number with string "a"
+"#,
+    ),
+    (
+        r#"{"s":[{"x":1},{"x":2}]}"#,
+        r"reduce range(3) as $i (.; .s |= map(.x))",
+        r#"jq: error (at <stdin>:0): Cannot index number with string "x"
 "#,
     ),
 ];
