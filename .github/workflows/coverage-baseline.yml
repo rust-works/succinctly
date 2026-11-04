@@ -48,8 +48,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # #5926: on the image the pull-request coverage job in ci.yml uses (a PR's patch coverage
+          # is diffed against this baseline).
           - name: x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - name: ARM64
             runner: ubuntu-24.04-arm
     # The called workflow's report job asks for `pull-requests: write` (its sticky comment, which a

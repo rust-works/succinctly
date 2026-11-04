@@ -206,7 +206,7 @@ jobs:
           # "Patchcov migration verification" (lint-markers, then a diff of two real
           # main lcov artifacts) before moving this pin.
           version: 0.4.0
-          use-prebuilt-binary: 'true'     # prebuilt patchcov for the runner's arch (glibc >= 2.35; both images have 2.39) (#3873)
+          use-prebuilt-binary: 'true'     # prebuilt patchcov for the runner's arch (glibc >= 2.35; ubuntu-24.04 has 2.39, ubuntu-26.04 2.43) (#3873)
           # Thin mode: the shards ran the tests; this combines their reports (#5711).
           run-coverage: false
           shard-reports: shards/shard-*.lcov
