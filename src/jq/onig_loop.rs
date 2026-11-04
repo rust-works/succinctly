@@ -81,9 +81,13 @@ struct Rewriter<'p> {
 /// that consumes text written so that the `regex` crate leaves the loop where Oniguruma does, or
 /// `None` when no loop needs it (or the pattern does not parse, or the rewrite grows too large).
 pub(crate) fn rewrite(pattern: &str) -> Option<String> {
-    if !has_group_repeat(pattern) {
+    if !may_need_rewrite(pattern) {
         return None;
     }
+    rewrite_parsed(pattern)
+}
+
+fn rewrite_parsed(pattern: &str) -> Option<String> {
     let ast = ast::parse::Parser::new().parse(pattern).ok()?;
     let mut rewriter = Rewriter {
         source: pattern,
@@ -94,18 +98,48 @@ pub(crate) fn rewrite(pattern: &str) -> Option<String> {
     rewriter.changed.then_some(piece.text.text)
 }
 
-/// Whether `pattern` may hold a group under a quantifier, the only shape whose body can match
-/// nothing (a single character or class always consumes one): a `)` followed, after any
-/// whitespace, by `*`, `+` or `{`. A cheap test that spares every other pattern the parse.
-fn has_group_repeat(pattern: &str) -> bool {
+/// Whether `pattern` may hold a loop [`rewrite`] changes, judged from its bytes so that every other
+/// pattern is spared the parse, which cost a fresh compile of `(?:a|b)+` 19% on a 7950X. Such a loop
+/// is a group under a quantifier (a `)` followed by `*`, `+` or `{`). Its body can match nothing
+/// only through a `*`, a `?` or `{0`/`{,` quantifier, an empty alternative or an empty group, and
+/// has a consuming way after the empty one only through a `|` or a lazy quantifier. Whitespace
+/// between tokens is skipped, and a `#` (a comment under `x`, which can stand between them) counts
+/// for both.
+fn may_need_rewrite(pattern: &str) -> bool {
     let bytes = pattern.as_bytes();
-    bytes.iter().enumerate().any(|(i, &b)| {
-        b == b')'
-            && bytes[i + 1..]
-                .iter()
-                .find(|c| !c.is_ascii_whitespace())
-                .is_some_and(|c| matches!(c, b'*' | b'+' | b'{'))
-    })
+    let next = |i: usize| {
+        bytes[i + 1..]
+            .iter()
+            .find(|c| !c.is_ascii_whitespace())
+            .copied()
+    };
+    let (mut group_repeat, mut nullable, mut later_way) = (false, false, false);
+    let mut prev = None;
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b')' => {
+                group_repeat |= matches!(next(i), Some(b'*' | b'+' | b'{'));
+                nullable |= matches!(prev, Some(b'(' | b':'));
+            }
+            b'*' => nullable = true,
+            b'?' => {
+                nullable |= prev != Some(b'(');
+                later_way |= matches!(prev, Some(b'*' | b'+' | b'?' | b'}'));
+            }
+            b'{' => nullable |= matches!(next(i), Some(b'0' | b',')),
+            b'|' => {
+                later_way = true;
+                nullable |= matches!(prev, None | Some(b'(' | b'|' | b':'))
+                    || matches!(next(i), None | Some(b')' | b'|'));
+            }
+            b'#' => (nullable, later_way) = (true, true),
+            _ => {}
+        }
+        if !c.is_ascii_whitespace() {
+            prev = Some(c);
+        }
+    }
+    group_repeat && nullable && later_way
 }
 
 impl Rewriter<'_> {
@@ -276,7 +310,7 @@ impl Rewriter<'_> {
         self.text(text, Prec::Concat)
     }
 
-    fn concat(&mut self, items: &[Piece]) -> Result<Piece, GiveUp> {
+    fn concat(&self, items: &[Piece]) -> Result<Piece, GiveUp> {
         let Some((first, rest)) = items.split_first() else {
             return Ok(Piece {
                 text: Text {
@@ -330,7 +364,7 @@ impl Rewriter<'_> {
         })
     }
 
-    fn alt(&mut self, items: &[Piece]) -> Result<Piece, GiveUp> {
+    fn alt(&self, items: &[Piece]) -> Result<Piece, GiveUp> {
         let mut before = Vec::new();
         let mut after = Vec::new();
         let mut nullable = false;
@@ -571,6 +605,59 @@ mod tests {
             rewrite("((?:b*|a)+)").as_deref(),
             Some("((?:(?:b+)*(?:a(?:b+)*)*?))")
         );
+    }
+
+    /// The byte test never turns away a pattern the rewrite changes: checked over every pattern a
+    /// small grammar of groups, alternatives and quantifiers generates from a fixed seed.
+    #[test]
+    fn the_byte_test_admits_every_pattern_the_rewrite_changes() {
+        const ATOMS: &[&str] = &["a", "b", ".", "[ab]", "\\w", "$", ""];
+        const QUANTIFIERS: &[&str] = &[
+            "*", "+", "?", "*?", "+?", "??", "{0,}", "{1,}", "{2,}", "{1,2}", "{0,2}", "{2}",
+        ];
+        let mut seed: u64 = 6106;
+        let mut roll = |n: usize| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize % n
+        };
+        fn generate(depth: u32, roll: &mut dyn FnMut(usize) -> usize) -> String {
+            let pick = if depth == 0 { 0 } else { roll(4) };
+            match pick {
+                0 => ATOMS[roll(ATOMS.len())].into(),
+                1 => (0..2 + roll(2))
+                    .map(|_| generate(depth - 1, roll))
+                    .collect(),
+                2 => {
+                    let ways: Vec<String> = (0..2 + roll(2))
+                        .map(|_| generate(depth - 1, roll))
+                        .collect();
+                    format!("(?:{})", ways.join("|"))
+                }
+                _ => {
+                    let body = generate(depth - 1, roll);
+                    let quantifier = QUANTIFIERS[roll(QUANTIFIERS.len())];
+                    let space = if roll(4) == 0 { " " } else { "" };
+                    format!("(?:{body}){space}{quantifier}")
+                }
+            }
+        }
+        let mut changed = 0;
+        for _ in 0..20_000 {
+            let extended = if roll(4) == 0 { "(?x)" } else { "" };
+            let pattern = format!("{extended}{}", generate(4, &mut roll));
+            if rewrite_parsed(&pattern).is_some() {
+                changed += 1;
+                assert!(may_need_rewrite(&pattern), "{pattern}");
+            }
+        }
+        assert!(
+            changed > 500,
+            "the grammar reaches the rewrite ({changed})"
+        );
+        assert!(!may_need_rewrite("(?:a|b)+"));
+        assert!(!may_need_rewrite("(?:ab)*c"));
     }
 
     #[test]
