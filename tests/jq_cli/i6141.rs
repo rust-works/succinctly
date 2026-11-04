@@ -133,6 +133,31 @@ const ROWS: &[Row] = &[
         "jq: ignoring parse error: Unfinished JSON term at EOF at line 2, column 4\n",
         0,
     ),
+    ("\x1e[1]\n\x1e", &["-c"], "[inputs]", "\x1e[[[0]]]\n", "", 0),
+    (
+        "\x1e[1]\n\x1e",
+        &["-c", "-n"],
+        "[inputs],input_line_number",
+        "\x1e[[[0],1],[[0]]]\n\x1e1\n",
+        "",
+        0,
+    ),
+    (
+        "\x1e[1]\n\x1e\x1e[2]\n",
+        &["-c"],
+        "[inputs],input_line_number,input_filename",
+        "\x1e[[[0]],[[0],2],[[0]]]\n\x1e2\n\x1e\"<stdin>\"\n",
+        "",
+        0,
+    ),
+    (
+        "\x1e[1]\n\x1e\x1e[2]\n",
+        &["-c", "-n"],
+        "(try input catch .),input_line_number,input",
+        "\x1e[[0],1]\n\x1e1\n\x1e[[0]]\n",
+        "",
+        0,
+    ),
 ];
 
 #[test]
