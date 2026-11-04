@@ -178,17 +178,7 @@ fn may_be_empty(ast: &Ast) -> bool {
         Ast::Group(group) => may_be_empty(&group.ast),
         Ast::Alternation(alt) => alt.asts.iter().any(may_be_empty),
         Ast::Concat(concat) => concat.asts.iter().all(may_be_empty),
-        Ast::Repetition(rep) => {
-            may_be_empty(&rep.ast)
-                || matches!(
-                    rep.op.kind,
-                    RepetitionKind::ZeroOrOne
-                        | RepetitionKind::ZeroOrMore
-                        | RepetitionKind::Range(
-                            RepetitionRange::AtLeast(0) | RepetitionRange::Bounded(0, _)
-                        )
-                )
-        }
+        Ast::Repetition(rep) => bounds(&rep.op.kind).0 == 0 || may_be_empty(&rep.ast),
     }
 }
 
@@ -1022,6 +1012,59 @@ mod tests {
         assert_eq!(ops("^a"), None);
         assert_eq!(ops("(?i)a"), None);
         assert_eq!(ops("(?i:a)"), None);
+    }
+
+    /// The repeat arms of the count, from the formulas in Oniguruma's `compile_length_quantifier_node`.
+    #[test]
+    fn a_repeat_is_counted_by_its_kind() {
+        assert_eq!(ops("a{0}"), Some(0), "never compiled");
+        assert_eq!(ops("a{2}"), Some(2), "unrolled copies");
+        assert_eq!(ops("a{2,3}"), Some(4), "copies and a push for the third");
+        assert_eq!(
+            ops("a{2,3}?"),
+            Some(3),
+            "a lazy bounded repeat is a counted loop"
+        );
+        assert_eq!(ops("a{2,}"), Some(2 + 2 + 1), "copies, then a star");
+        assert_eq!(ops("a+"), Some(1 + 2 + 1));
+        assert_eq!(ops("a+?"), Some(1 + 2 + 1));
+        assert_eq!(ops("a*?"), Some(3));
+        assert_eq!(ops("(?:a|b)*"), Some(2 + 4));
+        // An empty check costs two more, whatever makes the body nullable.
+        assert_eq!(ops("(?:a?b?)*"), Some(2 + (4 + 2)));
+        assert_eq!(ops("(?:a|b?)*"), Some(2 + (5 + 2)));
+        assert_eq!(ops("(?:a{0,})*"), None, "a repeat of a repeat");
+        assert_eq!(
+            ops("(?:(?:a|b))*"),
+            Some(2 + 4),
+            "a plain group is looked through"
+        );
+        // A body past the expansion limit is entered through a jump.
+        assert_eq!(ops("(?:a|b|c|d|e|f)+"), Some(1 + 2 + 16));
+        // A flag group, a folded literal run, a bracketed class under folding: not counted.
+        assert_eq!(ops("(?s:a)"), None);
+        assert_eq!(ops("(?s:a)*"), None);
+        assert_eq!(ops("(?i)b"), None, "the flag itself is not counted");
+        assert_eq!(
+            ops("(?:a*b)*"),
+            Some(2 + 3 + 1 + 0),
+            "a body that is not nullable"
+        );
+        assert_eq!(ops("(?:a*b*)*"), Some(2 + (3 + 3 + 2)), "a body that is");
+        assert_eq!(ops("(?:)*"), Some(0));
+        // Under case folding, as the flag sets it: a run of letters may fold together, a letter
+        // that starts a fold or a class may be more than one operation, any other letter and `.`
+        // is one.
+        let folding =
+            |pattern: &str| onig_ops(&ast::parse::Parser::new().parse(pattern).unwrap(), true);
+        assert_eq!(folding("b"), Some(1));
+        assert_eq!(folding("."), Some(1));
+        assert_eq!(folding("s"), None);
+        assert_eq!(folding("\u{DF}"), None);
+        assert_eq!(folding("bc"), None);
+        assert_eq!(folding("[ab]"), None);
+        assert_eq!(folding("\\p{L}"), None);
+        assert_eq!(folding("\\w"), Some(1));
     }
 
     /// `X{n,}?` over a body of five operations is plain copies at `{2,}?` and a counted loop from
