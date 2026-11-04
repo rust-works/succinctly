@@ -140,3 +140,17 @@ fn test_text_that_only_looks_like_a_group_option_is_unchanged_6126() -> Result<(
     }
     Ok(())
 }
+
+/// A pattern that ends inside an option run is refused as before, in the crate's words: jq says
+/// `end pattern in group` (see the limitations entry), and what the reader leaves alone is not
+/// answered either.
+#[test]
+fn test_a_pattern_that_ends_inside_an_option_run_stays_refused_6126() -> Result<()> {
+    for filter in [r#""a" | test("(?i")"#, r#""a" | test("a(?-")"#] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 5, "{filter}: stdout={stdout:?} stderr={stderr:?}");
+        assert_eq!(stdout, "", "{filter}");
+        assert!(stderr.contains("invalid regex:"), "{filter}: {stderr:?}");
+    }
+    Ok(())
+}
