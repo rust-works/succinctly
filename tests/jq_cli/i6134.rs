@@ -67,7 +67,7 @@ fn test_the_first_branch_of_a_shared_prefix_alternation_wins_6134() -> Result<()
         ),
         // The dead branch carries the first branch's anchors, which still hold.
         (r#""aab" | [match("^a*a|^a*b") | .string]"#, r#"["aa"]"#),
-        (r#""zaab" | [match("^a*a|^a*b") | .string]"#, r#"[]"#),
+        (r#""zaab" | [match("^a*a|^a*b") | .string]"#, "[]"),
         (r#""aab" | [match("a*a$|a*b$") | .string]"#, r#"["aab"]"#),
     ])
 }
