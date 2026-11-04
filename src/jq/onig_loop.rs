@@ -19,7 +19,13 @@
 //!
 //! A body whose ways are not listed here keeps its loop as written: one with a capture group (an
 //! empty iteration also sets the group, #6069), a zero-width assertion (its empty way depends on
-//! where it stands), or a flag switch. A lazy repeat that must run twice or more is written copy by
+//! where it stands), or a flag switch.
+//!
+//! A pattern with syntax only `fancy-regex` reads (a lookaround, an atomic group, a backreference,
+//! `\K`, `\G`, a comment) is parsed through `oniguruma_shadow`'s copy of it, which writes that syntax
+//! plainly at the same offsets, and every piece's text is still taken from the pattern (#6128).
+//! Those constructs are opaque: a body holding one keeps its loop, and a lookaround or atomic
+//! group has its own body rewritten. A lazy repeat that must run twice or more is written copy by
 //! copy by `Rewriter::lazy_counted`; for an unbounded one over a body with a consuming way before
 //! its empty one that form still differs from Oniguruma's on a few patterns (#6128).
 
@@ -100,12 +106,20 @@ pub(crate) fn rewrite(pattern: &str) -> Option<String> {
 
 fn rewrite_parsed(pattern: &str) -> Option<String> {
     // #6128: a pattern with Oniguruma syntax only `fancy-regex` reads (lookaround, a backreference,
-    // `\K`) is parsed through a copy that writes that syntax plainly at the same offsets.
-    let shadow = super::eval::oniguruma_shadow(pattern)?;
-    let ast = ast::parse::Parser::new().parse(&shadow.text).ok()?;
+    // `\K`) is parsed through a copy that writes that syntax plainly at the same offsets. A pattern
+    // the parser reads as written is read as written.
+    let shadow;
+    let (parsed, ast, opaque) = match ast::parse::Parser::new().parse(pattern) {
+        Ok(ast) => (pattern, ast, &[][..]),
+        Err(_) => {
+            shadow = super::eval::oniguruma_shadow(pattern)?;
+            let ast = ast::parse::Parser::new().parse(&shadow.text).ok()?;
+            (shadow.text.as_str(), ast, shadow.opaque.as_slice())
+        }
+    };
     let mut rewriter = Rewriter {
         source: pattern,
-        opaque: &shadow.opaque,
+        opaque,
         limit: pattern.len().saturating_mul(16).saturating_add(1024),
         work: core::cell::Cell::new(0),
         work_limit: pattern.len().saturating_mul(64).saturating_add(64 * 1024),
@@ -115,7 +129,7 @@ fn rewrite_parsed(pattern: &str) -> Option<String> {
     // The rewrite can drop a piece that matches only the empty string (`\p{Foo}{0}`), and with it
     // an error the crate would have reported for the pattern as written.
     let valid = regex_syntax::hir::translate::Translator::new()
-        .translate(&shadow.text, &ast)
+        .translate(parsed, &ast)
         .is_ok();
     (rewriter.changed && valid).then_some(piece.text.text)
 }
@@ -253,11 +267,21 @@ impl Rewriter<'_> {
     }
 
     /// A construct the parsed copy reads as something it is not. A comment matches nothing, as an
-    /// empty group does. A lookaround or atomic group keeps its opening and closing text and has its
-    /// body rewritten, a backreference is copied as written, and neither has its ways listed.
+    /// empty group does, unless a quantifier follows it: that quantifier is Oniguruma's to read
+    /// (`(?#)?` is refused, `b(?#)*` is `b*`), and the copy gives it the comment's group to repeat,
+    /// so such a comment's ways are not listed. A lookaround or atomic group keeps its opening and
+    /// closing text and has its body rewritten, a backreference is copied as written, and neither
+    /// has its ways listed.
     fn opaque(&mut self, ast: &Ast) -> Result<Piece, GiveUp> {
         let span = ast.span();
-        if self.verbatim(span).starts_with("(?#") {
+        let comment = self.verbatim(span).starts_with("(?#");
+        let quantified = || {
+            self.source[span.end.offset..]
+                .bytes()
+                .find(|c| !c.is_ascii_whitespace())
+                .is_some_and(|c| matches!(c, b'*' | b'+' | b'?' | b'{'))
+        };
+        if comment && !quantified() {
             return Ok(Piece {
                 text: self.text(self.verbatim(span).into(), Prec::Atom)?,
                 ways: Ways::Nullable {
@@ -267,7 +291,7 @@ impl Rewriter<'_> {
             });
         }
         let text = match ast {
-            Ast::Group(group) => {
+            Ast::Group(group) if !self.verbatim(span).starts_with("(?#") => {
                 let body = self.convert(&group.ast, false)?;
                 let inner = group.ast.span();
                 let open = &self.source[span.start.offset..inner.start.offset];
@@ -696,9 +720,23 @@ mod tests {
         }
         assert_eq!(rewrite("(?>(?:b*|a)+)"), Some(format!("(?>{looped})")));
         assert_eq!(rewrite("(?=(?:b*|a)+c)"), Some(format!("(?={looped}c)")));
-        // A comment in the body matches nothing, as an empty group does.
+        // A quantifier after a comment is Oniguruma's to read: the comment is copied as written.
+        assert_eq!(rewrite("(?:b*|a)+(?#)?"), Some(format!("{looped}(?#)?")));
+        // Under `x`, a `(?#` in a `#` comment the copy cannot follow: read as written.
+        assert_eq!(
+            rewrite("(?x)(?:b*|a)+ # (?#"),
+            rewrite("(?x)(?:b*|a)+ # c").map(|r| r.replace("# c", "# (?#"))
+        );
+        // A comment with no quantifier after it matches nothing, as an empty group does.
         assert_eq!(rewrite("(?:(?#c)b*|a)+"), Some(looped.clone()));
-        for pattern in ["(?:(?=b)b*|a)+", r"(b)(?:\1|b*|a)+", "(?#a\nb)(?:b*|a)+"] {
+        for pattern in [
+            "(?:(?#)?|b)+",
+            "(?:(?#) ?|b)+",
+            "(?:b(?#)*|a)+",
+            "(?:(?=b)b*|a)+",
+            r"(b)(?:\1|b*|a)+",
+            "(?#a\nb)(?:b*|a)+",
+        ] {
             assert_eq!(rewrite(pattern), None, "{pattern}");
         }
     }

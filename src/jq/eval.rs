@@ -28860,12 +28860,14 @@ fn guard_prefix_lifting(pattern: &str, oniguruma: bool) -> Option<String> {
     if !pattern.contains('|') {
         return None;
     }
-    let shadow = if oniguruma {
-        std::borrow::Cow::Owned(oniguruma_shadow(pattern)?.text)
-    } else {
-        std::borrow::Cow::Borrowed(pattern)
+    // A pattern the parser reads as written is read as written; the copy is for one it refuses.
+    let tree = match ast::parse::Parser::new().parse(pattern) {
+        Ok(tree) => tree,
+        Err(_) if oniguruma => ast::parse::Parser::new()
+            .parse(&oniguruma_shadow(pattern)?.text)
+            .ok()?,
+        Err(_) => return None,
     };
-    let tree = ast::parse::Parser::new().parse(&shadow).ok()?;
     let Ok(mut guards) = ast::visit(&tree, Guards(Vec::new()));
     if guards.is_empty() {
         return None;
@@ -28917,7 +28919,9 @@ pub(crate) fn oniguruma_shadow(pattern: &str) -> Option<OnigurumaShadow> {
                 b'K' | b'G' | b'Z' if class_depth == 0 => b'b',
                 b'R' => b'.',
                 b'k' | b'1'..=b'9' => {
-                    opaque.push(i);
+                    if class_depth == 0 {
+                        opaque.push(i);
+                    }
                     b'.'
                 }
                 other => other,

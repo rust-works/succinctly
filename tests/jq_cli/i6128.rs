@@ -125,6 +125,12 @@ fn test_a_loop_beside_fancy_regex_syntax_ends_at_its_empty_iteration_6128() -> R
             r#"["b","",""]"#,
         ),
         (r#""ba" | sub("(?:b*|a)+(?=)"; "X")"#, r#""Xa""#),
+        // A comment in the body matches nothing; under `x`, a `(?#` inside a `#` comment is text.
+        (r#""ba" | [match("(?:(?#c)b*|a)+") | .string]"#, r#"["b"]"#),
+        (
+            r#""ba" | [match("(?:b*|a)+ # note (?#"; "x") | .string]"#,
+            r#"["b"]"#,
+        ),
         // A loop whose body holds such syntax is still as written, and agrees here.
         (r#""ba" | [match("(?:(?=b)b*|a)+") | .string]"#, r#"["ba"]"#),
     ] {
@@ -135,5 +141,18 @@ fn test_a_loop_beside_fancy_regex_syntax_ends_at_its_empty_iteration_6128() -> R
             "{filter}: stderr {stderr}"
         );
     }
+    Ok(())
+}
+
+/// A quantifier after a comment has no target in jq (`(?#)?` is refused), so a loop over one is not
+/// rewritten into a pattern the `regex` crate would accept.
+#[test]
+fn test_a_quantified_comment_in_a_loop_body_is_still_refused_6128() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-nc", r#""bab" | [match("(?:(?#)?|b)+"; "g") | .string]"#],
+        None,
+    )?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "stderr {stderr}");
+    assert!(stderr.contains("invalid regex"), "{stderr}");
     Ok(())
 }
