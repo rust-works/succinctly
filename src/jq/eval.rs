@@ -134245,6 +134245,9 @@ mod tests {
             ("(?#a|b)a*a|a*b", format!("{dead}|(?#a|b)a*a|a*b")),
             ("[(?#]a*a|a*b", format!("{dead}|[(?#]a*a|a*b")),
             (r"(?#\))a*a|a*b", format!(r"{dead}|(?#\))a*a|a*b")),
+            ("[a[b]]a*x|a*y", format!("{dead}|[a[b]]a*x|a*y")),
+            ("[^]a]a*x|a*y", format!("{dead}|[^]a]a*x|a*y")),
+            ("(ba*)x|(ba*)y", format!("{dead}|(ba*)x|(ba*)y")),
         ] {
             let guarded = guard_prefix_lifting(pattern, true);
             assert_eq!(guarded.as_deref(), Some(want.as_str()), "{pattern}");
@@ -134254,6 +134257,8 @@ mod tests {
             "ab|ac",
             "[ab]x|[ab]y",
             "a{2}x|a{2}y",
+            "a{2,2}x|a{2,2}y",
+            "a*a|a*b\\",
             r"\bx|\by",
             "(?:ab|ac)+",
             "a*|b*",
