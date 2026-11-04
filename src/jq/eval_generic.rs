@@ -6311,9 +6311,10 @@ fn update_on_cursor_gated<S: EvalSemantics, V: DocumentValue>(
         return None;
     };
     // The whole-document copy checks every node of the target. What the filter did not walk is
-    // checked here, so a malformed document is still left to that copy to raise (the nesting
-    // ceiling counts from the target, not the document, where the filter walked it: a target
-    // nested to within the path's length of it is read where the copy refuses it).
+    // checked here, so a malformed document is still left to that copy to raise. Where the filter
+    // walked the target, the nesting ceiling counts from the target, not the document, so a target
+    // nested to within the path's length of 256 is read where the copy refuses it; the CLI never
+    // sees such a document (a parse depth of 128 is refused first, #5497), a library caller can.
     if !whole
         && to_owned_cursor_at_depth::<S, _, CheckOnly>(
             &target,
