@@ -7471,6 +7471,7 @@ Under the `n` flag the end of the pattern is where an empty match fails, so the 
 A trailing possessive quantifier over an atom that can match nothing on its first try (a lazy quantifier or an alternation inside it: `(?:a??)*+`, `(?:|a)++`) keeps its atomic group, which takes the empty way and fails: `"cabb" | [match("(?:a??)*+"; "gn")]` is `[]` in jq, and was `[{"offset":1,...}]` here.
 An ungrouped lazy quantifier followed by `+` (`a??+`) is written as the group it stands for, `(?:a??)+`, under `n`.
 Over a matrix of 14,280 pattern x text x flag cases (empty-matching atoms, seven possessive forms, six endings, flags `g`, `n`, `gn`, `gln`), the `n` and `gn` answers match jq except `X?++` (`a*?++`, `a+?++`, `a??++`), which stays refused; with `l` (`ln`) the lazy shapes differ whether or not they are possessive (`"cabb" | [match("(?:a??)+"; "ln")]` is `["a"]` in jq and `[]` here), a limit of the longest-match mode.
+A fixed count then `+` over such an atom (`(?:a??){2}+`) is `{2}` here (#6079) and is `[]` under `n` in jq; the rest of 160 edge cases (an escaped `|`, a class holding `|`, a greedy empty-first atom, nested groups) agree.
 Pinned by `tests/jq_cli/i6218.rs`.
 The interval forms follow jq 1.7.1: `{n,}+`, `{n,m}+` and `{,m}+` are possessive.
 A fixed `{n}+` is neither possessive nor a repeat: it is `{n}` (#6079).
