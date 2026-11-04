@@ -7629,7 +7629,13 @@ These keep their loop as written, and still match longer than jq where the shape
 - **A body with a flag switch** (`(?i)` inside it): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and `["ba",""]` here.
   The switch reaches every later way of the group, which the rewrite would move out of its reach.
   A flag group (`(?i:b*)`) is rewritten.
-- **A pattern the `regex` crate's parser cannot read** (lookaround, a backreference, `\K`, `\G`), which goes to `fancy-regex` unrewritten: `"ba" | match("(?:b*|a)+(?=)")` is `"b"` in jq and `"ba"` here.
+- **A body with syntax only `fancy-regex` reads** (a lookaround, an atomic group, a backreference, `\K`, `\G`) keeps its loop, which `fancy-regex` then runs itself and mostly as jq does: 12 of 20,000 generated cases with such syntax in the body differ, as they did before #6128.
+  (A further 961 with `\K` as a bare alternative, `(?:\K|a)+`, are patterns jq refuses and succinctly accepts, [#6157](https://github.com/rust-works/succinctly/issues/6157).)
+  A comment in the body matches nothing, and the loop is rewritten.
+  A loop beside or around such syntax is rewritten since [#6128](https://github.com/rust-works/succinctly/issues/6128): the rewrite reads the pattern through a copy that writes that syntax plainly at the same offsets (`oniguruma_shadow` in `src/jq/eval.rs`), so `"ba" | match("(?:b*|a)+(?=)")` is jq's `"b"` (it was `"ba"`), and a loop inside a lookaround or atomic group is rewritten too.
+  A differential against jq 1.7.1 found 257 cases fixed and none broken over 50,000 generated patterns with such syntax beside, around or inside a loop.
+  Of the cases with such syntax beside or around a loop, 4 differed before and still do: a loop inside a lookahead followed by `.+` or `.*` (`"aaac" | match("(?=(?:[bc]*c??|){2,}c).+")`), where jq finds no match at all although the lookahead holds at offset 3.
+  A pattern with a conditional (`(?(1)...)`) or a comment that crosses a line is read as before.
 - **An unbounded lazy repeat that must run twice or more, over a body with a consuming way before its empty one** (`{n,}?`, n of 2 or more; the `b` of `b?` in `(?:b?|\\w)`): `"ab" | [match("(?:b?|\\w){2,}?"; "gn") | .string]` is `["a","b"]` in jq and `["ab"]` here, although the repeat is rewritten.
   Pinned by `tests/jq_cli/i6128.rs`.
   The same repeat with an upper bound (`{2,3}?`) and one whose body has no consuming way before its empty one are rewritten ([#6128](https://github.com/rust-works/succinctly/issues/6128)): `"bab" | [match("(?:(?:b|c)||[ab]){2,3}?"; "gn") | .string]` is `["b","ab"]`, as in jq.

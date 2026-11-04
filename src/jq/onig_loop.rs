@@ -252,13 +252,22 @@ impl Rewriter<'_> {
         }
     }
 
-    /// A construct the parsed copy reads as something it is not. A lookaround or atomic group keeps
-    /// its opening and closing text and has its body rewritten; a comment and a backreference are
-    /// copied as written. None of them has its ways listed.
+    /// A construct the parsed copy reads as something it is not. A comment matches nothing, as an
+    /// empty group does. A lookaround or atomic group keeps its opening and closing text and has its
+    /// body rewritten, a backreference is copied as written, and neither has its ways listed.
     fn opaque(&mut self, ast: &Ast) -> Result<Piece, GiveUp> {
         let span = ast.span();
+        if self.verbatim(span).starts_with("(?#") {
+            return Ok(Piece {
+                text: self.text(self.verbatim(span).into(), Prec::Atom)?,
+                ways: Ways::Nullable {
+                    before: None,
+                    after: None,
+                },
+            });
+        }
         let text = match ast {
-            Ast::Group(group) if !self.verbatim(span).starts_with("(?#") => {
+            Ast::Group(group) => {
                 let body = self.convert(&group.ast, false)?;
                 let inner = group.ast.span();
                 let open = &self.source[span.start.offset..inner.start.offset];
@@ -661,6 +670,38 @@ impl Rewriter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6128: beside syntax only `fancy-regex` reads, a loop is rewritten as it is alone, and that
+    /// syntax is copied as written; inside a lookaround or atomic group, too. A loop whose body
+    /// holds such syntax keeps its text.
+    #[test]
+    fn a_loop_beside_fancy_regex_syntax_is_rewritten_6128() {
+        let looped = rewrite("(?:b*|a)+").unwrap();
+        for (before, after) in [
+            ("", "(?=)"),
+            ("(?<=x)", ""),
+            ("(?<!x)", "(?!c)"),
+            (r"(b)\1", ""),
+            (r"(?<n>x)\k<n>", ""),
+            ("(?#é|x)", ""),
+            (r"\G", r"\Z"),
+            (r"x\K", ""),
+        ] {
+            let pattern = format!("{before}(?:b*|a)+{after}");
+            assert_eq!(
+                rewrite(&pattern),
+                Some(format!("{before}{looped}{after}")),
+                "{pattern}"
+            );
+        }
+        assert_eq!(rewrite("(?>(?:b*|a)+)"), Some(format!("(?>{looped})")));
+        assert_eq!(rewrite("(?=(?:b*|a)+c)"), Some(format!("(?={looped}c)")));
+        // A comment in the body matches nothing, as an empty group does.
+        assert_eq!(rewrite("(?:(?#c)b*|a)+"), Some(looped.clone()));
+        for pattern in ["(?:(?=b)b*|a)+", r"(b)(?:\1|b*|a)+", "(?#a\nb)(?:b*|a)+"] {
+            assert_eq!(rewrite(pattern), None, "{pattern}");
+        }
+    }
 
     #[test]
     fn a_loop_with_a_consuming_way_after_its_first_empty_one_is_rewritten() {
