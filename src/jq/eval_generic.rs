@@ -6089,7 +6089,7 @@ fn update_filter_reduces(filter: &Expr) -> bool {
 /// The node `steps` name below `root`, found by lookup, or `None` where a step does not land on
 /// the container it needs (a `null` on the way, a missing key, an index past the end).
 fn update_target_cursor<C: DocumentCursor>(root: &C, steps: &[StepKey<'_>]) -> Option<C> {
-    let mut at = root.clone();
+    let mut at = *root;
     for step in steps {
         let value = at.value();
         at = match step {
@@ -6279,7 +6279,7 @@ fn update_on_cursor_gated<S: EvalSemantics, V: DocumentValue>(
             filter,
             target.value(),
             false,
-            Some(target.clone()),
+            Some(target),
             &mut |item: GenericItem<V>| {
                 // An output that is the target itself is built whole by the conversion below.
                 whole = matches!(
@@ -54834,14 +54834,14 @@ mod tests {
         }
         enum Node {
             Scalar(&'static str),
-            Object(Vec<(&'static str, Node)>),
-            Array(Vec<Node>),
+            Object(Vec<(&'static str, Self)>),
+            Array(Vec<Self>),
         }
         impl Node {
             fn render(&self, out: &mut String) {
                 match self {
-                    Node::Scalar(text) => out.push_str(text),
-                    Node::Object(members) => {
+                    Self::Scalar(text) => out.push_str(text),
+                    Self::Object(members) => {
                         out.push('{');
                         for (i, (key, value)) in members.iter().enumerate() {
                             if i > 0 {
@@ -54853,7 +54853,7 @@ mod tests {
                         }
                         out.push('}');
                     }
-                    Node::Array(items) => {
+                    Self::Array(items) => {
                         out.push('[');
                         for (i, item) in items.iter().enumerate() {
                             if i > 0 {
@@ -54867,9 +54867,9 @@ mod tests {
             }
             fn size(&self) -> usize {
                 match self {
-                    Node::Scalar(_) => 1,
-                    Node::Object(m) => 1 + m.iter().map(|(_, v)| v.size()).sum::<usize>(),
-                    Node::Array(a) => 1 + a.iter().map(Node::size).sum::<usize>(),
+                    Self::Scalar(_) => 1,
+                    Self::Object(m) => 1 + m.iter().map(|(_, v)| v.size()).sum::<usize>(),
+                    Self::Array(a) => 1 + a.iter().map(Self::size).sum::<usize>(),
                 }
             }
         }
@@ -54968,7 +54968,7 @@ mod tests {
         }
         // Whether the cursor route answered; it must then answer as the whole-document copy does.
         fn compare(doc: &str, program: &str) -> bool {
-            let Ok(expr) = crate::jq::parser::parse(&program) else {
+            let Ok(expr) = crate::jq::parser::parse(program) else {
                 return false;
             };
             let Expr::Update {
