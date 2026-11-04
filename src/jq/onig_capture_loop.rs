@@ -40,6 +40,16 @@
 //! some `E`) is written as `E` alone: its loop copy could only make empty iterations, which the crate
 //! drops, so it would never set a group. That keeps the rewritten pattern linear in the nesting depth
 //! instead of doubling per level; [`MAX_REWRITTEN_LEN`] bounds it all the same.
+//!
+//! `test` and `is_match` run the rewritten pattern too, and a second, plain regex for them is not
+//! worth its compile (#6175). They never read a capture, and the crate's search for a match without
+//! captures does not walk the extra groups: 40 `test`s of `(\w*\s*)*Q` over a 10 MB string (no match,
+//! so every byte is scanned) retired 7,647M instructions on the rewritten pattern and 7,653M with
+//! the plain one compiled beside it, the 6M being that second compile. `(\w*\s*)*c`, `((\w+)\s*|x*)*Q`
+//! and a four-deep nest scan the same, and 300,000 short strings differ by less than the run
+//! varies by itself (about 2%). Apple M5 Max, retired instructions, binaries interleaved; x86_64 was
+//! not measured. The 30% above is the capture engine, which `match` and `capture` use and `test`
+//! does not.
 
 use alloc::boxed::Box;
 use alloc::string::String;
