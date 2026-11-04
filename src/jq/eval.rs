@@ -28387,7 +28387,8 @@ fn unicode_posix_class(name: &str) -> Option<&'static str> {
 /// crate's `\w` has those six missing and U+200C/U+200D (`Join_Control`) extra. Only outside a
 /// class: inside `[...]` jq's `\w` is the plain Unicode word, without the six.
 #[cfg(feature = "regex")]
-const JQ_WORD_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\x{B2}\x{B3}\x{B9}\x{BC}-\x{BE}";
+pub(super) const JQ_WORD_CLASS: &str =
+    r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\x{B2}\x{B3}\x{B9}\x{BC}-\x{BE}";
 
 /// The same inside a character class (`[\w-]`, `[^\W]`), where Oniguruma does not apply the
 /// Latin-1 table: the six characters are not in it (#5373).
@@ -31680,9 +31681,18 @@ fn build_regex_uncached<S: EvalSemantics>(
     // lazy repeat the rewrite writes, which would leave `l` a no-op. The pattern as written is kept
     // for when the copies the rewrite makes outgrow an engine's size or nesting limit.
     let mut as_written = None;
+    // #6225: Oniguruma's multi-character case folding (`ß` is `ss`) is written into the pattern as
+    // the alternation it expands to. It comes first, so that the loop rewrite reads the pattern it
+    // will run, and the pattern as written is the user's.
+    if S::TAG != EvalTag::Yq {
+        if let Some(folded) = super::onig_fold::rewrite(&pattern) {
+            as_written = Some(core::mem::replace(&mut pattern, folded));
+        }
+    }
     if S::TAG != EvalTag::Yq && !longest {
         if let Some(rewritten) = super::onig_loop::rewrite(&pattern) {
-            as_written = Some(core::mem::replace(&mut pattern, rewritten));
+            let before = core::mem::replace(&mut pattern, rewritten);
+            as_written.get_or_insert(before);
         }
     }
 
