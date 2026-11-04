@@ -1114,6 +1114,14 @@ pub fn to_owned_cursor<S: EvalSemantics, C: DocumentCursor>(
             embed_table::LazyHit::Absent => {}
         }
     }
+    // #6125: a container of plain RFC 8259 JSON is read in one pass over its own text, which
+    // builds what the walk below builds without a rank and a select per node. Not where a
+    // binding is in scope (the walk shares what a bound node already holds) and not in yq mode.
+    if S::TAG == EvalTag::Jq && nested.is_empty() && !fill_lazy {
+        if let Some(plain) = cursor.plain_owned_jq() {
+            return Ok(plain);
+        }
+    }
     let result = to_owned_cursor_at_depth::<S, _, BuildOwned>(
         cursor,
         None,
@@ -63011,6 +63019,151 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// #6125: for every container of a generated document, the one-pass read of its own text
+    /// (`plain_owned_jq`) is the value the walk builds, wherever it answers: the values, and their
+    /// JSON text, which keeps a number's spelling. Documents are valid and mangled, with repeated
+    /// keys, escapes, number spellings, nesting and non-ASCII text.
+    #[cfg(feature = "std")]
+    #[test]
+    fn plain_owned_read_of_a_container_equals_the_walk_6125() {
+        type Cursor<'a> = crate::json::light::JsonCursor<'a, Vec<u64>>;
+
+        fn visit(c: &Cursor<'_>, out: &mut Vec<usize>) {
+            out.push(c.node_id());
+            let mut child = c.first_child();
+            while let Some(n) = child {
+                visit(&n, out);
+                child = n.next_sibling();
+            }
+        }
+        fn gen(next: &mut impl FnMut() -> u64, depth: usize, out: &mut String) {
+            match next() % if depth > 4 { 6 } else { 9 } {
+                0 => out.push_str("null"),
+                1 => out.push_str(if next() % 2 == 0 { "true" } else { "false" }),
+                2 => {
+                    let n = [
+                        "0",
+                        "-0",
+                        "7",
+                        "-12",
+                        "3.5",
+                        "-0.25",
+                        "1e3",
+                        "2E-2",
+                        "1.0",
+                        "10.50",
+                        "123456789012345678",
+                        "9223372036854775808",
+                        "1e999",
+                        "0.1e1",
+                        "007",
+                        "1.",
+                    ];
+                    out.push_str(n[(next() % n.len() as u64) as usize]);
+                }
+                3..=5 => {
+                    let w = [
+                        "",
+                        "a",
+                        "caf\u{e9}",
+                        "\u{1f600}",
+                        "a\\nb",
+                        "q\\\"q",
+                        "\\u0041",
+                        "\\ud83d\\ude00",
+                        "\\udc00",
+                        "\\ud800",
+                        "tab\\t",
+                        "\\u0000",
+                        "\\/",
+                        "a b",
+                    ];
+                    out.push('"');
+                    out.push_str(w[(next() % w.len() as u64) as usize]);
+                    out.push('"');
+                }
+                6 | 7 => {
+                    out.push('[');
+                    for i in 0..next() % 5 {
+                        if i > 0 {
+                            out.push(if next() % 30 == 0 { ' ' } else { ',' });
+                        }
+                        gen(next, depth + 1, out);
+                    }
+                    out.push(']');
+                }
+                _ => {
+                    out.push('{');
+                    for i in 0..next() % 5 {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        let k = [
+                            "a",
+                            "b",
+                            "id",
+                            "a",
+                            "k\\u00e9",
+                            "x y",
+                            "\\u0000",
+                            "caf\u{e9}",
+                        ];
+                        out.push('"');
+                        out.push_str(k[(next() % k.len() as u64) as usize]);
+                        out.push_str("\":");
+                        gen(next, depth + 1, out);
+                    }
+                    out.push('}');
+                }
+            }
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (mut answered, mut declined) = (0usize, 0usize);
+        for _ in 0..20_000 {
+            let mut text = String::new();
+            if next() % 4 == 0 {
+                text.push_str("  ");
+            }
+            gen(&mut next, 0, &mut text);
+            let doc = text.as_bytes();
+            let index = JsonIndex::build(doc);
+            let root = index.root(doc);
+            let mut nodes = Vec::new();
+            visit(&root, &mut nodes);
+            for id in nodes {
+                let cur = root.at_node_id(id).unwrap();
+                let Some(fast) = cur.plain_owned_jq() else {
+                    declined += 1;
+                    continue;
+                };
+                answered += 1;
+                let walk = to_owned_cursor_at_depth::<JqSemantics, _, BuildOwned>(
+                    &cur,
+                    None,
+                    0,
+                    0,
+                    &nesting_depth_check,
+                    &|_, _| None,
+                    &[],
+                )
+                .unwrap_or_else(|e| panic!("{text:?} at node {id}: the walk refuses it: {e:?}"));
+                assert_eq!(fast, walk, "{text:?} at node {id}");
+                assert_eq!(fast.to_json(), walk.to_json(), "{text:?} at node {id}");
+            }
+        }
+        assert!(
+            answered > 5_000,
+            "the sweep must reach the read: {answered}"
+        );
+        assert!(declined > 1_000, "and the walk: {declined}");
     }
 
     /// #3483: the node-only step and the generic walk that decodes every key

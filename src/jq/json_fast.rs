@@ -38,7 +38,7 @@ const _: () = assert!(MAX_DEPTH <= super::eval_generic::MAX_NESTING_DEPTH);
 /// whitespace; `None` when it is anything else, for the caller's general route to decide.
 pub fn parse_plain(text: &str) -> Option<OwnedValue> {
     let mut reader = Reader {
-        text,
+        text: Some(text),
         bytes: text.as_bytes(),
         at: 0,
     };
@@ -57,7 +57,7 @@ pub fn parse_plain(text: &str) -> Option<OwnedValue> {
 /// `1[2]` and `"a""b"` (which a stream parser may split) are the general route's too.
 pub fn parse_plain_stream(text: &str) -> Option<Vec<OwnedValue>> {
     let mut reader = Reader {
-        text,
+        text: Some(text),
         bytes: text.as_bytes(),
         at: 0,
     };
@@ -76,13 +76,37 @@ pub fn parse_plain_stream(text: &str) -> Option<Vec<OwnedValue>> {
     }
 }
 
+/// The plain JSON value that starts at `bytes[start]`, with whatever follows it left alone; `None`
+/// when it is anything else, for the caller's general route to decide (#6125). `bytes` is a
+/// document's text, so a string is checked for UTF-8 as it is cut.
+pub(crate) fn parse_plain_at(bytes: &[u8], start: usize) -> Option<OwnedValue> {
+    let mut reader = Reader {
+        text: None,
+        bytes,
+        at: start,
+    };
+    reader.value(0)
+}
+
 struct Reader<'a> {
-    text: &'a str,
+    /// The text as a `&str` when the caller has one (slices are then cut on the checked
+    /// boundaries); `None` for bytes of a document, whose slices are validated as they are cut.
+    text: Option<&'a str>,
     bytes: &'a [u8],
     at: usize,
 }
 
-impl Reader<'_> {
+impl<'a> Reader<'a> {
+    /// `bytes[from..to]` as text; `None` where it is not (a split character, or invalid UTF-8
+    /// in a document read from bytes).
+    #[inline]
+    fn slice(&self, from: usize, to: usize) -> Option<&'a str> {
+        match self.text {
+            Some(text) => text.get(from..to),
+            None => core::str::from_utf8(self.bytes.get(from..to)?).ok(),
+        }
+    }
+
     #[inline]
     fn space(&mut self) {
         while matches!(self.bytes.get(self.at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
@@ -144,7 +168,7 @@ impl Reader<'_> {
         }
         self.at = end;
         Some(OwnedValue::from_number_literal::<JqSemantics>(
-            self.text.get(start..end)?,
+            self.slice(start, end)?,
         ))
     }
 
@@ -159,14 +183,14 @@ impl Reader<'_> {
             match *self.bytes.get(at)? {
                 b'"' => {
                     self.at = at + 1;
-                    return self.text.get(start..at).map(String::from);
+                    return self.slice(start, at).map(String::from);
                 }
                 b'\\' => break,
                 0..=0x1f => return None,
                 _ => at += 1,
             }
         }
-        let mut out = String::from(self.text.get(start..at)?);
+        let mut out = String::from(self.slice(start, at)?);
         loop {
             match *self.bytes.get(at)? {
                 b'"' => {
@@ -184,7 +208,7 @@ impl Reader<'_> {
                         b'r' => '\r',
                         b't' => '\t',
                         b'u' => {
-                            let hex = self.text.get(at + 2..at + 6)?;
+                            let hex = self.slice(at + 2, at + 6)?;
                             if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                                 return None;
                             }
@@ -195,7 +219,7 @@ impl Reader<'_> {
                                 if self.bytes.get(at + 6..at + 8)? != b"\\u" {
                                     return None;
                                 }
-                                let low_hex = self.text.get(at + 8..at + 12)?;
+                                let low_hex = self.slice(at + 8, at + 12)?;
                                 if !low_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                                     return None;
                                 }
@@ -230,7 +254,7 @@ impl Reader<'_> {
                     {
                         at += 1;
                     }
-                    out.push_str(self.text.get(run..at)?);
+                    out.push_str(self.slice(run, at)?);
                 }
             }
         }
