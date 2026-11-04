@@ -7614,6 +7614,9 @@ These keep their loop as written, and still match longer than jq where the shape
 - **A body with a capture group:** `"ba" | match("(b*|a)+")` is `"b"` in jq and `"ba"` here.
   An empty iteration also sets the group in Oniguruma ([#6069](#a-capture-under-an-unbounded-repeat-keeps-its-last-non-empty-iteration-6069)).
 - **A body with a zero-width assertion** (`^`, `$`, `\b`, `\A`, `\z`): its empty way depends on where it stands, which the rewrite does not express.
+- **A body with a flag switch** (`(?i)` inside it): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and `["ba",""]` here.
+  The switch reaches every later way of the group, which the rewrite would move out of its reach.
+  A flag group (`(?i:b*)`) is rewritten.
 - **A pattern the `regex` crate's parser cannot read** (lookaround, a backreference, `\K`, `\G`), which goes to `fancy-regex` unrewritten: `"ba" | match("(?:b*|a)+(?=)")` is `"b"` in jq and `"ba"` here.
 - **A lazy repeat that must run twice or more:** `"bab" | [match("(?:(?:b|c)||[ab]){2,3}?"; "gn") | .string]` is `["b","ab"]` in jq and `["b","a","b"]` here.
 - **The `l` flag:** the longest match's span does not depend on the order the ways are tried in, and `fancy-regex`'s longest mode refuses the lazy repeat the rewrite writes.
