@@ -206,7 +206,7 @@ jobs:
     if: needs.gate.outputs.retest != 'false'
     # #5926: the first x86_64 job off the ubuntu-24.04 pin. The suite passes on 26.04 (glibc 2.43)
     # once the libm goldens stopped pinning digits that libm moves, and these legs are what keep it
-    # passing there. The coverage job stays on 24.04 until it has run on 26.04 (the pin test lists it).
+    # passing there.
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
@@ -808,8 +808,8 @@ jobs:
       - name: coverage-shards.py self-tests
         run: python3 scripts/test_coverage_shards.py -v
 
-      # #5878: pins every x86_64 Linux runner but the test matrix, clippy, docs and perf guard to
-      # ubuntu-24.04 until the coverage and release jobs are verified on 26.04 (the jq libm goldens
+      # #5878: pins every x86_64 Linux runner but the test matrix, clippy, docs, perf guard and
+      # coverage to ubuntu-24.04 until the release job is verified on 26.04 (the jq libm goldens
       # already hold there, #5926); a runner-image move then has to edit that test, not happen
       # silently.
       - name: ci-runner-pin self-tests
@@ -1197,8 +1197,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # #5926: the x86_64 leg is off the ubuntu-24.04 pin, with coverage-baseline.yml, so a
+          # PR's patch coverage is diffed against a baseline measured on the same image.
           - name: x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - name: ARM64
             runner: ubuntu-24.04-arm
     # A called workflow cannot hold more than its caller grants it.
