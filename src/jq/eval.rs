@@ -14422,7 +14422,7 @@ fn owned_self_read_grow<S: EvalSemantics>(
 
 /// The steps of a path of static `.name`/`.[n]` steps only, in any paren and pipe nesting, or
 /// `None` for anything else (a key that is computed, a `.[]`).
-fn static_path_steps<'e>(path: &'e Expr, steps: &mut Vec<StepKey<'e>>) -> Option<()> {
+pub(crate) fn static_path_steps<'e>(path: &'e Expr, steps: &mut Vec<StepKey<'e>>) -> Option<()> {
     match path {
         Expr::Paren(inner) => static_path_steps(inner, steps),
         Expr::Pipe(stages) => stages
@@ -14467,7 +14467,7 @@ fn owned_grow<S: EvalSemantics>(slot: &mut OwnedValue, right: OwnedValue) -> Res
 }
 
 /// The slot `step` names inside `container`, if it holds one already.
-fn owned_slot_mut<'v>(
+pub(crate) fn owned_slot_mut<'v>(
     step: &StepKey<'_>,
     container: &'v mut OwnedValue,
 ) -> Option<&'v mut OwnedValue> {
@@ -14539,7 +14539,7 @@ fn unreachable_owned_assign_write() -> EvalError {
 /// index, the two components [`key_to_path_component`] produces for a
 /// string or an integer-spelled number.
 #[derive(PartialEq)]
-enum StepKey<'e> {
+pub(crate) enum StepKey<'e> {
     Field(Cow<'e, str>),
     Index(i64),
 }
