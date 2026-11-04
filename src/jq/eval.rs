@@ -10839,6 +10839,76 @@ pub(crate) fn eval_owned_count_door<S: EvalSemantics>(
     eval_owned_length(expr, input).or_else(|| eval_owned_string_door::<S>(expr, input))
 }
 
+/// `map(.a)`, `map(.a.b)`, `map(.[0])` over an owned array, answered from the tree instead of
+/// through the re-index bridge (#6122): `.users |= map(.age)` ran its right side on a copy of the
+/// whole `users` array that was written out as text and indexed again, to read one field of each
+/// element. That was 1.1 G of the 2.1 G instructions the update took on a 7 MB document, and left
+/// it at 0.84x of jq 1.7.1.
+///
+/// The body is a chain of static `.name` / `.[n]` steps (see [`static_path_steps`]), so each
+/// element has exactly one output and the result is the array of them, which is what `[.[] | f]`
+/// is. A step is read as `eval_owned_navigation` reads it in jq mode: a missing key, an
+/// out-of-range index and `null` give `null`, and a negative index counts from the end.
+///
+/// Everything that would raise declines instead, so the bridge keeps its diagnostics: an element
+/// that is not an object (or `null`) at a `.name` step, or not an array (or `null`) at a `.[n]`
+/// step, and an input that is not an array (`map` over an object, which iterates its values in
+/// an order of its own, and a scalar, which raises). Nothing has been sent to the sink by then, and
+/// the walk has no side effect, so the bridge can start over. jq mode only: yq's `map` and its
+/// navigation have rules of their own. Not under an embed table, as [`owned_select_door`]: a node
+/// a binding tracks is answered by the bridge, which can name it.
+///
+/// The elements the result holds are the input's own (a refcount bump for a container), where the
+/// bridge hands back copies it re-read from its serialization: a number nested in one is an `Int`
+/// here and a `NumberLiteral` there, two spellings of one value that every printer renders alike
+/// (pinned by `owned_map_projection_agrees_with_the_reindex_bridge_6122`).
+pub(crate) fn eval_owned_map_projection<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let Expr::Builtin(Builtin::Map(body)) = unwrap_paren(expr) else {
+        return None;
+    };
+    let OwnedValue::Array(items) = input else {
+        return None;
+    };
+    let mut steps = Vec::new();
+    static_path_steps(body, &mut steps)?;
+    if steps.is_empty() || super::eval_generic::embed_table_active() {
+        return None;
+    }
+    let null = OwnedValue::Null;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        let mut at = item;
+        for step in &steps {
+            at = match (step, at) {
+                (StepKey::Field(name), OwnedValue::Object(map)) => {
+                    map.get(name.as_ref()).unwrap_or(&null)
+                }
+                (StepKey::Index(idx), OwnedValue::Array(elements)) => {
+                    let resolved = if *idx < 0 {
+                        elements.len() as i64 + idx
+                    } else {
+                        *idx
+                    };
+                    usize::try_from(resolved)
+                        .ok()
+                        .and_then(|i| elements.get(i))
+                        .unwrap_or(&null)
+                }
+                (_, OwnedValue::Null) => &null,
+                _ => return None,
+            };
+        }
+        out.push(at.clone());
+    }
+    Some(OwnedValue::array_from(out))
+}
+
 /// A stage that never reads `.`, answered without the owned input (#4053).
 ///
 /// `[$x] | 1` handed the stage `1` an owned array holding the whole of `$x`, and
@@ -11960,6 +12030,14 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
     // or prefix/suffix test the string written out and indexed again.
     if let Some(count) = eval_owned_count_door::<S>(expr, input) {
         return Some(match sink(count) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        });
+    }
+    // #6122: `map(.age)` reads one field of each element of an owned array, not the array written
+    // out and indexed again.
+    if let Some(mapped) = eval_owned_map_projection::<S>(expr, input) {
+        return Some(match sink(mapped) {
             Demand::Continue => Flow::Exhausted,
             Demand::Stop => Flow::Stopped { pending: None },
         });
@@ -143058,6 +143136,188 @@ mod tests {
         assert!(
             matches!((&out[0], &deep), (OwnedValue::Array(a), OwnedValue::Array(b)) if a.ptr_eq(b))
         );
+    }
+
+    /// The projection door's answer for `src` over `input`, or `None` when it declined.
+    fn map_projection_outcome<S: EvalSemantics>(
+        src: &str,
+        input: &OwnedValue,
+    ) -> Option<(Vec<OwnedValue>, String)> {
+        let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+        eval_owned_map_projection::<S>(&expr, input).map(|v| (vec![v], "ok".to_string()))
+    }
+
+    /// #6122: [`eval_owned_map_projection`] answers what the reindex bridge answers for every
+    /// array x body it takes -- the array it builds, each element's spelling included -- and
+    /// declines the rest (a step that would raise, a non-array input) so the bridge keeps its
+    /// diagnostics.
+    #[test]
+    fn owned_map_projection_agrees_with_the_reindex_bridge_6122() {
+        use indexmap::IndexMap;
+        let object = |pairs: &[(&str, OwnedValue)]| {
+            let mut map = IndexMap::new();
+            for (k, v) in pairs {
+                map.insert((*k).to_string(), v.clone());
+            }
+            OwnedValue::Object(map.into())
+        };
+        let big = OwnedValue::from_number_literal::<JqSemantics>("100000000000000000000");
+        let literal = OwnedValue::from_number_literal::<JqSemantics>("1.50");
+        let inner = OwnedValue::array_from(vec![OwnedValue::Int(7), OwnedValue::Null]);
+        let mut values = vec![
+            OwnedValue::array_from(vec![]),
+            OwnedValue::array_from(vec![object(&[("a", OwnedValue::Int(1))])]),
+            OwnedValue::array_from(vec![
+                object(&[("a", OwnedValue::Int(1)), ("b", OwnedValue::Null)]),
+                object(&[("b", OwnedValue::Int(2))]),
+                object(&[("a", literal.clone())]),
+                object(&[("a", big.clone()), ("c", inner.clone())]),
+                OwnedValue::Null,
+            ]),
+            OwnedValue::array_from(vec![
+                object(&[("a", object(&[("b", OwnedValue::Int(3))]))]),
+                object(&[("a", object(&[("b", OwnedValue::String("x".into()))]))]),
+                object(&[("a", OwnedValue::Null)]),
+                object(&[("a", inner.clone())]),
+                object(&[]),
+            ]),
+            OwnedValue::array_from(vec![
+                inner.clone(),
+                OwnedValue::array_from(vec![]),
+                OwnedValue::array_from(vec![literal.clone(), big.clone(), OwnedValue::Float(-0.0)]),
+                OwnedValue::Null,
+            ]),
+            OwnedValue::array_from(vec![
+                object(&[("a", OwnedValue::Int(1))]),
+                OwnedValue::Int(5),
+            ]),
+            OwnedValue::array_from(vec![object(&[("a", inner.clone())]), inner.clone()]),
+            OwnedValue::array_from(vec![OwnedValue::String("s".into())]),
+            OwnedValue::array_from((0..40).map(OwnedValue::Int).collect()),
+            OwnedValue::Null,
+            OwnedValue::Int(1),
+            object(&[("a", OwnedValue::Int(1))]),
+        ];
+        values.extend(pure_value_matrix());
+        let filters = [
+            "map(.a)",
+            "map(.b)",
+            "map(.a.b)",
+            "map(.a | .b)",
+            "(map(.a))",
+            "map((.a))",
+            "map(.a[1])",
+            "map(.a[0].b)",
+            "map(.[0])",
+            "map(.[1])",
+            "map(.[-1])",
+            "map(.[-3])",
+            "map(.[100])",
+            "map(.[0][0])",
+            "map(.c[0])",
+            // What the door must leave to the bridge.
+            "map(.a?)",
+            "map(.[]?)",
+            "map(.a + 1)",
+            "map(.a, .b)",
+            "map(.)",
+            "map(length)",
+            "map(select(.a))",
+            "map(.[\"a\"])",
+            "map(.a.[0])",
+        ];
+        let (mut taken, mut declined) = (0, 0);
+        for src in filters {
+            for value in &values {
+                let expr = parse(src).unwrap();
+                let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                let Some(door) = map_projection_outcome::<JqSemantics>(src, value) else {
+                    declined += 1;
+                    continue;
+                };
+                taken += 1;
+                assert_eq!(
+                    select_door_observable(&door),
+                    select_door_observable(&bridge),
+                    "{src:?} on {value:?} disagrees with the reindex bridge"
+                );
+                assert!(
+                    map_projection_outcome::<YqSemantics>(src, value).is_none(),
+                    "yq mode must keep its own `map`: {src:?}"
+                );
+            }
+        }
+        assert!(taken > 150, "the matrix must reach the door: {taken}");
+        assert!(declined > 150, "the matrix must reach the declines too");
+    }
+
+    /// #6122: the door declines what it cannot answer identically. An element that raises at a
+    /// step, a non-array input, a body that is not a chain of static steps, and an embed table in
+    /// scope are the bridge's.
+    #[test]
+    fn owned_map_projection_declines_what_it_cannot_answer_identically_6122() {
+        let array = |items: Vec<OwnedValue>| OwnedValue::array_from(items);
+        let mut one = indexmap::IndexMap::new();
+        one.insert("a".to_string(), OwnedValue::Int(1));
+        let obj = OwnedValue::Object(one.into());
+        let run = |src: &str, input: &OwnedValue| map_projection_outcome::<JqSemantics>(src, input);
+        // The step raises on a number, a string, a boolean, and on an array at a name.
+        for element in [
+            OwnedValue::Int(1),
+            OwnedValue::String("s".into()),
+            OwnedValue::Bool(true),
+            array(vec![]),
+        ] {
+            assert!(run("map(.a)", &array(vec![obj.clone(), element])).is_none());
+        }
+        // ... and on an object at an index.
+        assert!(run("map(.[0])", &array(vec![obj.clone()])).is_none());
+        // `map` over anything but an array is the bridge's: an object iterates its values, a
+        // scalar raises.
+        assert!(run("map(.a)", &obj).is_none());
+        assert!(run("map(.a)", &OwnedValue::Null).is_none());
+        assert!(run("map(.a)", &OwnedValue::Int(1)).is_none());
+        // A body that is not static steps.
+        for src in [
+            "map(.)",
+            "map(.a?)",
+            "map(.a, .b)",
+            "map(.[])",
+            "map(.a + 1)",
+            "map(empty)",
+        ] {
+            assert!(run(src, &array(vec![obj.clone()])).is_none(), "{src}");
+        }
+        // Not a `map` at all.
+        assert!(run(".a", &array(vec![obj.clone()])).is_none());
+    }
+
+    /// #6122: the door is reached from [`eval_each_owned`] and never crosses the bridge. A value
+    /// past `MAX_VALUE_TREE_DEPTH` is the probe the other doors' pins use: the bridge refuses it, so
+    /// an answer from [`eval_each_owned`] is the door's. The pin fails with the hook in
+    /// `eval_each_owned_front_doors` removed.
+    #[test]
+    fn owned_map_projection_is_reached_and_skips_the_bridge_6122() {
+        let mut deep = OwnedValue::Null;
+        for _ in 0..crate::jq::value::MAX_VALUE_TREE_DEPTH {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        let expr = parse("map(.[0])").unwrap();
+        assert!(matches!(
+            eval_owned_input_bridge::<Vec<u64>, JqSemantics>(&expr, &deep, false),
+            QueryResult::Error(_)
+        ));
+        let mut out = Vec::new();
+        let flow =
+            eval_each_owned::<JqSemantics>(&expr, &deep, false, Reentry::REBUILT, &mut |v| {
+                out.push(v);
+                Demand::Continue
+            });
+        assert!(matches!(flow, Flow::Exhausted));
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], OwnedValue::Array(items) if items.len() == 1));
     }
 
     /// #5840: a program that answers nothing (`empty`, `error("x")?`, a pipe that starts with
