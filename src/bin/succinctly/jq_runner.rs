@@ -10220,7 +10220,7 @@ fn seed_input_queue(
         // queue behind them, and `inputs` is empty.
         debug_assert!(inputs.is_empty() && trailing_error.is_none() && resumed_errors.is_empty());
         jq::seed_remaining_inputs_from(lazy_raw_producer(files, locations.exhausted(slurp)));
-        if locations.eof_tail.is_some() {
+        if locations.eof_tail.is_some() || slurp {
             jq::count_reads_past_end();
         }
     } else if let Some(lazy) = LAZY_JSON_INPUTS.with(|slot| slot.borrow_mut().take()) {
@@ -10235,7 +10235,7 @@ fn seed_input_queue(
             Box::new(tail),
             locations.exhausted(slurp),
         ));
-        if locations.eof_tail.is_some() {
+        if locations.eof_tail.is_some() || slurp {
             jq::count_reads_past_end();
         }
     } else {
@@ -10273,8 +10273,9 @@ fn seed_input_queue(
             .collect();
         jq::seed_remaining_inputs_with_errors(queue, locations.exhausted(slurp), errors);
         // #4303: where the stream's own end was recorded, reads past it
-        // move on from it as jq's do.
-        if locations.eof_tail.is_some() {
+        // move on from it as jq's do. A slurp read the whole stream to build its one value, so
+        // every read past that value is already past the end: line 0 and `<unknown>` (#6145).
+        if locations.eof_tail.is_some() || slurp {
             jq::count_reads_past_end();
         }
     }
