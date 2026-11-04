@@ -7657,7 +7657,8 @@ These keep their loop as written, and still match longer than jq where the shape
   Since [#6128](https://github.com/rust-works/succinctly/issues/6128) a comment that a repeat operator follows, with an item before it, is left out of what the engines read, so `b(?#)*` is `b*` and the loop is rewritten as `(?:b*|a)+` is.
   A comment right after a quantifier is kept (`b*(?#)*` is `b**` in jq, and leaving the comment out of `b+(?#)?` would read the lazy `b+?`), so `"bab" | [match("(?:b*(?#)*|a)+"; "g") | .string]` is `["b","","b",""]` in jq and `["bab",""]` here.
   So is a comment before a capture group's quantifier inside a loop, which is the capture-group gap above.
-  Over 29,976 generated cases (loop bodies with a quantified comment, on four strings, with and without `g`), 336 were fixed, none broken, and the 704 that differ all have the comment after a quantifier.
+  Over 68,970 generated cases (loop bodies with a quantified comment, on five strings, with and without `g`), 588 were fixed and none broken.
+  The 794 that still differ, in 200 patterns, all have the comment after a quantifier or a capture group as the repeated item.
   `scripts/jq-regex-comment-quantifier-sweep.py SUBJECT BASELINE` regenerates the sweep, and `tests/jq_cli/i6128_comment.rs` pins rows of it.
   19 are scattered over the other constructs.
   A comment with no quantifier after it matches nothing, and its loop is rewritten.

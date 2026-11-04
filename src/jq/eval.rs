@@ -28426,7 +28426,6 @@ fn translate_posix_brackets(
     Ok(translated)
 }
 
-/// [`translate_posix_brackets`]' rewrite and its refusals, one pass over the pattern.
 /// Whether a repetition operator follows the comments that start at `at` (`(?#...)`, any number of
 /// them), as in `b(?#)(?#)*` (#6128).
 #[cfg(feature = "regex")]
@@ -28441,6 +28440,24 @@ fn repeat_follows_comments(chars: &[char], mut at: usize) -> bool {
     starts_repetition(chars.get(at..).unwrap_or(&[]))
 }
 
+/// Whether `out` ends in a quantifier character that is not escaped (`b*`, `b{2}`, not `\\*`) (#6128).
+#[cfg(feature = "regex")]
+fn ends_with_quantifier(out: &str) -> bool {
+    let Some(last) = out.chars().next_back() else {
+        return false;
+    };
+    if !matches!(last, '*' | '+' | '?' | '}') {
+        return false;
+    }
+    let backslashes = out[..out.len() - 1]
+        .chars()
+        .rev()
+        .take_while(|&c| c == '\\')
+        .count();
+    backslashes % 2 == 0
+}
+
+/// [`translate_posix_brackets`]' rewrite and its refusals, one pass over the pattern.
 #[cfg(feature = "regex")]
 fn translate_posix_brackets_scan(
     pattern: &str,
@@ -28511,7 +28528,7 @@ fn translate_posix_brackets_scan(
                 if check_repetition
                     && i != body_start
                     && !after_pipe
-                    && !out.ends_with(['*', '+', '?', '}'])
+                    && !ends_with_quantifier(&out)
                     && repeat_follows_comments(&chars, end)
                 {
                     changed = true;
