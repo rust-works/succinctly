@@ -30150,6 +30150,18 @@ fn rewrite_onig_escape(
             _ => Ok(None),
         },
         'x' if !in_class => rewrite_hex_escape(chars, i),
+        // #6234: inside a class only a `\x` that is not two hex digits is rewritten, as outside one
+        // (`[\x]` is NUL, `[\xg]` NUL and `g`, `[\x1]` U+0001): the `regex` crate refuses it.
+        'x' => Ok(match after {
+            None | Some('{') => None,
+            Some(c) => match c.to_digit(16) {
+                None => Some((regex_char(0), 2)),
+                Some(first) if !chars.get(i + 3).is_some_and(char::is_ascii_hexdigit) => {
+                    Some((regex_char(first), 3))
+                }
+                Some(_) => None,
+            },
+        }),
         _ => Ok(None),
     }
 }
