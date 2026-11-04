@@ -28452,6 +28452,9 @@ fn translate_posix_brackets_scan(
     let mut groups_opened = 0usize;
     let mut body_start = 0usize;
     let mut prev_pipe = false;
+    // #6181: whether the item just before this one is a bare option group (`(?i)`), which is no
+    // item to jq: a repeat operator after it has nothing to repeat.
+    let mut prev_option_group = false;
     let mut group_facts: Option<GroupFacts> = None;
     // The extended mode's ignored blanks are invisible to this scan (`^ *` is a repeated
     // assertion there), so it leaves the repetition check to the crate rather than judge it.
@@ -28464,6 +28467,7 @@ fn translate_posix_brackets_scan(
         let c = chars[i];
         let was_assertion = std::mem::take(&mut prev_assertion);
         let after_pipe = std::mem::take(&mut prev_pipe);
+        let was_option = std::mem::take(&mut prev_option_group);
         // #5550: a comment is text jq ignores, so nothing in it is a group, a class or an escape:
         // `(?#...)` always, and `#` to the end of the line where the extended mode is on. Copied
         // through whole, as the `fancy-regex` scan does.
@@ -28492,6 +28496,9 @@ fn translate_posix_brackets_scan(
                 if i == body_start {
                     body_start = end;
                 }
+                // #6181: a comment is invisible to jq, so a bare option group before it still
+                // stands before a repeat operator after it.
+                prev_option_group = was_option;
                 i = end;
                 continue;
             }
@@ -28632,6 +28639,14 @@ fn translate_posix_brackets_scan(
                     "invalid regex: target of repeat operator is invalid",
                 ));
             }
+            // #6181: a repeat operator right after a bare option group (`(?i)*`, `a(?i)+`,
+            // `(?i){1}`) has no target in jq, where the `regex` crate repeated the zero-width flag
+            // item. `{,2}` is the literal run it is everywhere (see `starts_repetition`).
+            if check_repetition && was_option && starts_repetition(&chars[i..]) {
+                return Err(EvalError::new(
+                    "invalid regex: target of repeat operator is not specified",
+                ));
+            }
             prev_assertion = c == '^' || c == '$';
             prev_pipe = c == '|';
             // #6070: an interval with nothing before it to repeat (`{1}`, `a|{2}`, `(?:{2})`) is
@@ -28733,6 +28748,7 @@ fn translate_posix_brackets_scan(
                                 *group = inner;
                             }
                             out.extend(&chars[i..=i + 2 + letters]);
+                            prev_option_group = true;
                             i += 2 + letters + 1;
                             continue;
                         }

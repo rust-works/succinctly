@@ -7424,6 +7424,11 @@ These rewrites skip comments, as jq does (#5550): `(?#...)`, and `#` to the end 
 So a `(?P` or a `[` in a comment is text (`test("ab # (?P\n"; "x")` is `true` in both), while without `x` the `#` is a literal and the `(?P` is refused in both.
 A repetition operator right after an assertion (`^*`, `$+`, `\b?`, `\A{2}`, `\z*`) is an error in jq (`target of repeat operator is invalid`) and is refused here too (#5535), where the `regex` crate repeats the empty match and answered `true`.
 A repeated group Oniguruma reads as an assertion is refused as well (#6127).
+A repetition operator right after a bare option group (`(?i)*`, `a(?i)+`, `(?-i){1}`, `(?i)(?m)?`, also past comments) has nothing to repeat in jq and is refused too, as `target of repeat operator is not specified` whether the group starts the pattern or follows an item (#6181).
+The `regex` crate repeated the zero-width flag item, so `"caab" | test("(?i)*a")` was `true`.
+An option group with a body (`(?i:a)*`) and a group around one (`((?i))*`) are items and may repeat; `{,2}` is the literal run it is everywhere.
+A possessive operator after the group (`(?i)*+`) is worded by the possessive refusal below (#6184), and a pattern with an inline `(?x)` stands down as the paragraph after next says.
+Pinned by `tests/jq_cli/i6181.rs`, a slice of a 1,350-pattern sweep over nine option groups, fifteen operators and ten positions.
 It decides from the parsed node: an assertion (`^ $ \A \z \Z \G \b \B`, a look-ahead or look-behind) is an invalid target, a sequence of several nodes is not (`(?:\b\b)*` compiles), an alternation is invalid when any one alternative is (`(?:a|\b)*` is refused, `(?:a|\b\b)*` is not), a plain `(?:...)` group is its body (`(?:(?:\b))*` and `(?:(?:\b)|c)*` are refused), and a capturing, named, atomic or option group may repeat anything (`(\b)*`, `(?i:\b)*`).
 The rule was captured from jq 1.7.1 over 75,780 generated groups, and the scan agrees on all of them: `scripts/jq-regex-repeat-target-sweep.py SUBJECT` regenerates the sweep and compares (not part of the CI gate), and `tests/jq_cli/i6127.rs` pins hand-picked rows.
 The check runs after the pattern's other refusals, so an error earlier in the pattern is the one reported.
