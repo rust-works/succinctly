@@ -28501,18 +28501,38 @@ fn translate_posix_brackets(
     Ok(translated)
 }
 
+/// Whether `pattern` holds both a backreference (`\1`..`\9`, `\k<`, `\k'`) and an inline `i` option
+/// (`(?i)`, `(?-i:`, `(?mi)`): the only patterns [`pin_backreference_case`] can change (#6196).
+#[cfg(feature = "regex")]
+fn may_pin_backreference_case(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let backreference = bytes
+        .windows(2)
+        .any(|w| w[0] == b'\\' && (matches!(w[1], b'1'..=b'9') || w[1] == b'k'));
+    backreference
+        && pattern.match_indices("(?").any(|(at, _)| {
+            let run: Vec<u8> = bytes[at + 2..]
+                .iter()
+                .copied()
+                .take_while(|b| b.is_ascii_alphabetic() || *b == b'-')
+                .collect();
+            run.contains(&b'i') && matches!(bytes.get(at + 2 + run.len()), Some(b')' | b':'))
+        })
+}
+
 /// Pin each backreference to the case mode in force where it stands (#6196).
 ///
 /// Oniguruma compares `\1` under the options at the backreference, not those the group matched
 /// under: `"aA" | test("((?i)a)\\1")` is `false` (the `(?i)` ended with its group) and
 /// `test("(?i)((?-i)a)\\1")` is `true`. The `fancy-regex` route, which a backreference takes, applies
 /// the option in force where the group ended, so each backreference is written as `(?i:\1)` or
-/// `(?-i:\1)`. `base_i` is the `i` modifier. `None` when the pattern holds no backreference or no
-/// inline `i` option (the case mode is then the modifier's everywhere), and for a pattern under the
-/// extended mode, whose comments the walk cannot see.
+/// `(?-i:\1)`. `base_i` is the `i` modifier and `extended` the `x` modifier, whose `#` comments the
+/// walk skips. `None` when the pattern holds no backreference or no inline `i` option (the case mode
+/// is then the modifier's everywhere), and for a pattern with an inline `(?x)`, whose comments the
+/// walk cannot place.
 #[cfg(feature = "regex")]
-fn pin_backreference_case(pattern: &str, base_i: bool) -> Option<String> {
-    if !pattern.contains("(?") || !pattern.contains('\\') || inline_extended(pattern) {
+fn pin_backreference_case(pattern: &str, base_i: bool, extended: bool) -> Option<String> {
+    if !may_pin_backreference_case(pattern) || inline_extended(pattern) {
         return None;
     }
     let chars: Vec<char> = pattern.chars().collect();
@@ -28600,6 +28620,15 @@ fn pin_backreference_case(pattern: &str, base_i: bool) -> Option<String> {
             continue;
         }
         match c {
+            // The extended mode's comment runs to the end of the line.
+            '#' if extended => {
+                let end = chars[i..]
+                    .iter()
+                    .position(|&c| c == '\n')
+                    .map_or(chars.len(), |n| i + n);
+                out.extend(&chars[i..end]);
+                i = end;
+            }
             '[' => {
                 class_depth = 1;
                 class_start = true;
@@ -30978,7 +31007,7 @@ fn build_regex_uncached<S: EvalSemantics>(
             Ok(translated) => {
                 // #6196: each backreference carries the case mode in force where it stands.
                 let base_i = flags.is_some_and(|flags| flags.contains('i'));
-                let translated = match pin_backreference_case(&translated, base_i) {
+                let translated = match pin_backreference_case(&translated, base_i, extended) {
                     Some(pinned) => std::borrow::Cow::Owned(pinned),
                     None => translated,
                 };

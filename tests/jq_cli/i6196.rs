@@ -53,6 +53,45 @@ fn test_a_backreference_compares_under_the_option_in_force_where_it_stands_6196(
         (r"(a)\Q(?i)\E\1", "a(?i)a", "g", r#"["a(?i)a"]"#),
         (r"(a)(?#i)\1", "aA", "g", r"[]"),
         (r"(a)(?i)(?#)\1", "aA", "g", r#"["aA"]"#),
+        (r"(a)|(?i)b\1", "aA", "g", r#"["a"]"#),
+        (r"(a)(?:x|(?i)b)\1", "abA", "g", r"[]"),
+        (r"(a)(?:b|(?i)c)\1", "acA", "g", r"[]"),
+        (r"(?'n'(?i)a)\k'n'", "aA", "g", r"[]"),
+        (r"(?'n'(?i)a)\k<n>", "aA", "g", r"[]"),
+        (r"((?i)a)[\1]", "a1", "g", r"[]"),
+        (
+            r"((?i)a) # note (
+\1",
+            "aA",
+            "gx",
+            r"[]",
+        ),
+        (
+            r"((?i)a) # note )
+\1",
+            "aA",
+            "gx",
+            r"[]",
+        ),
+        (
+            r"((?i)a) # [
+\1",
+            "aA",
+            "gx",
+            r"[]",
+        ),
+        (
+            r"(a) # (
+(?i)\1",
+            "aA",
+            "gx",
+            r#"["aA"]"#,
+        ),
+        (r"((?i)a)\1", "aA", "gs", r"[]"),
+        (r"((?i)a)\1", "aA", "gm", r"[]"),
+        (r"((?i)a)\1", "aA", "gl", r"[]"),
+        (r"((?i)a)\1\1", "aAA", "g", r"[]"),
+        (r"(?i)((?-i)a)\1\1", "aAA", "g", r#"["aAA"]"#),
     ] {
         assert_eq!(
             answer(pattern, input, flags)?,
