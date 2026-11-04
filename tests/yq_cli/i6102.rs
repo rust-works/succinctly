@@ -122,10 +122,14 @@ const GAPS: &[(&str, &str, &str, &str)] = &[
 
 #[test]
 fn test_pivot_inside_another_filter_still_pads_with_null_6102() -> Result<()> {
-    for &(document, filter, ours, _yq) in GAPS {
+    for &(document, filter, ours, yq) in GAPS {
         let (output, code) = run_yq_stdin(filter, document, &[])?;
         assert_eq!(code, 0, "{filter} on {document:?}");
         assert_eq!(output, ours, "{filter} on {document:?}");
+        assert_ne!(
+            ours, yq,
+            "{filter}: no longer a gap, drop it from the table"
+        );
     }
     Ok(())
 }
