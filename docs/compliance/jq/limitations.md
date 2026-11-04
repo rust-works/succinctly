@@ -7577,6 +7577,7 @@ The `regex` crate folds one character to one, so `"SS" | test("ß";"i")` was `fa
 The rules are Oniguruma's, not "the folded text is equal":
 
 - A string is the literals with nothing between them but a non-capturing group that is not repeated, a comment, a blank under `x`, or an option that leaves `i` as it was; `{1}` repeats nothing and does not end it.
+  A group that starts its branch and holds more than literals is a list of its own in the library, so the strings inside it do not join those outside: `(?:a\\ds)s` is not `ss` but `x(?:a\\ds)s` is.
   A quantifier takes the last character off its string, so `ß+` repeats `ß` and `ss+` has no pair.
 - The string is walked from the left, and the library asks for the longest fold that starts at each place: three characters, then two, then the character alone (which expands only if it is itself a character that folds to several).
   The alternation covers exactly the characters it read, and the walk goes on after them, so `sss` is `ss` then `s`: it matches `"ßs"` and not `"sß"`, and `ffi` is a three-character fold, so it matches `"ﬃ"` and not `"ﬀi"`.
@@ -7584,7 +7585,7 @@ The rules are Oniguruma's, not "the folded text is equal":
 - A look-behind expands one character at a time in the library, so nothing is added there.
 - `{1}`, a comment and a blank are not part of a string, and `\x73`, `\x{DF}` and `\Q..\E` are literals.
 
-The alternatives are checked against jq 1.7.1 over 40,000 random patterns and subjects built from the folding characters, with every difference explained below, and pinned by `tests/jq_cli/i6225.rs`.
+The alternatives are checked against jq 1.7.1 over 60,000 random patterns and subjects built from the folding characters, with every difference explained below, and pinned by `tests/jq_cli/i6225.rs`.
 Left as they were:
 
 - A pattern neither `regex-syntax` nor the Oniguruma-only shadow parse (a conditional group, a call) is not rewritten, so it keeps the one-to-one folding.

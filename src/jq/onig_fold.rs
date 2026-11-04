@@ -29,11 +29,12 @@
 //! The tables are the library's own, in [`onig_fold_data`](super::onig_fold_data).
 
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use regex_syntax::ast::{self, Ast, Flag, FlagsItemKind, GroupKind};
 
+use super::eval::JQ_WORD_CLASS;
 use super::onig_fold_data::{FOLDS2, FOLDS3, FOLD_KEY};
 
 /// The `i` and `x` options in force at a point of the pattern.
@@ -175,10 +176,7 @@ fn ascii_fold_pair(bytes: &[u8]) -> bool {
         }
         if b.is_ascii_alphabetic() {
             let b = b.to_ascii_lowercase();
-            if matches!(
-                (prev, b),
-                (b's', b's') | (b'f', b'f') | (b'f', b'i') | (b'f', b'l') | (b's', b't')
-            ) {
+            if matches!((prev, b), (b's', b's' | b't') | (b'f', b'f' | b'i' | b'l')) {
                 return true;
             }
             prev = b;
@@ -219,6 +217,7 @@ impl Walker<'_> {
                 let mut run_options = *options;
                 self.sequence(
                     concat.asts.iter(),
+                    true,
                     options,
                     look_behind,
                     &mut run,
@@ -232,19 +231,19 @@ impl Walker<'_> {
                 }
             }
             Ast::Repetition(rep) => self.visit(&rep.ast, options, look_behind),
-            Ast::Group(group) => self.group(group, options, look_behind),
+            Ast::Group(group) => self.group(group, *options, look_behind),
             Ast::ClassBracketed(class) => self.class(class, *options, look_behind),
             _ => {}
         }
     }
 
-    fn group(&mut self, group: &ast::Group, options: &mut Options, look_behind: bool) {
+    fn group(&mut self, group: &ast::Group, options: Options, look_behind: bool) {
         let text = self.verbatim(&group.span);
         // A comment holds text, not pattern.
         if text.starts_with("(?#") {
             return;
         }
-        let mut inner = *options;
+        let mut inner = options;
         let mut look_behind = look_behind;
         if let GroupKind::NonCapturing(flags) = &group.kind {
             inner.apply(flags);
@@ -259,15 +258,29 @@ impl Walker<'_> {
     /// extends it; a non-capturing group that is not repeated is part of the sequence; anything
     /// else ends it (the string is then expanded) and is walked on its own. A repeated literal is
     /// a string of its own, since the quantifier binds the last character only.
+    ///
+    /// `head` is whether the first of `items` starts its branch. The library splices a group's
+    /// parts into the sequence around it only from the second place on: a group that starts its
+    /// branch and holds anything but literals is a list of its own, and the strings inside it do
+    /// not join those outside (`(?:a\d)s`).
     fn sequence<'x>(
         &mut self,
         items: impl Iterator<Item = &'x Ast>,
+        head: bool,
         options: &mut Options,
         look_behind: bool,
         run: &mut Vec<Lit>,
         run_options: &mut Options,
     ) {
+        // An option set (`(?i)`) takes the rest of the branch as its body, which starts anew.
+        let mut head_now = head;
         for item in items {
+            let at_head = head_now;
+            head_now = match item {
+                Ast::Flags(_) => true,
+                Ast::Group(group) if self.verbatim(&group.span).starts_with("(?#") => head_now,
+                _ => false,
+            };
             match item {
                 Ast::Literal(lit) if !self.is_opaque(&lit.span) => {
                     if run_options.ignore_case != options.ignore_case {
@@ -284,6 +297,7 @@ impl Walker<'_> {
                 Ast::Repetition(rep) if is_once(rep) => {
                     self.sequence(
                         core::iter::once(&*rep.ast),
+                        at_head,
                         options,
                         look_behind,
                         run,
@@ -295,7 +309,8 @@ impl Walker<'_> {
                 Ast::Group(group)
                     if matches!(&group.kind, GroupKind::NonCapturing(flags) if flags.items.is_empty())
                         && !self.is_opaque(&group.span)
-                        && !matches!(*group.ast, Ast::Alternation(_)) =>
+                        && !matches!(*group.ast, Ast::Alternation(_))
+                        && (!at_head || self.is_plain_string(&group.ast)) =>
                 {
                     // Options set inside the group end with it.
                     let mut inner = *options;
@@ -303,6 +318,7 @@ impl Walker<'_> {
                         Ast::Concat(concat) => {
                             self.sequence(
                                 concat.asts.iter(),
+                                true,
                                 &mut inner,
                                 look_behind,
                                 run,
@@ -310,8 +326,10 @@ impl Walker<'_> {
                             );
                         }
                         other => {
+                            // A branch of one node passes it up as it is, a list included.
                             self.sequence(
                                 core::iter::once(other),
+                                at_head,
                                 &mut inner,
                                 look_behind,
                                 run,
@@ -326,6 +344,23 @@ impl Walker<'_> {
                     self.visit(other, options, look_behind);
                 }
             }
+        }
+    }
+
+    /// Whether `ast` is only literals, which the library reads as one string node.
+    fn is_plain_string(&self, ast: &Ast) -> bool {
+        match ast {
+            Ast::Literal(lit) => !self.is_opaque(&lit.span),
+            Ast::Concat(concat) => concat
+                .asts
+                .iter()
+                .all(|item| matches!(item, Ast::Literal(lit) if !self.is_opaque(&lit.span))),
+            Ast::Group(group) => {
+                matches!(&group.kind, GroupKind::NonCapturing(flags) if flags.items.is_empty())
+                    && !self.is_opaque(&group.span)
+                    && self.is_plain_string(&group.ast)
+            }
+            _ => false,
         }
     }
 
@@ -359,6 +394,11 @@ impl Walker<'_> {
         }
         let text = self.verbatim(&class.span);
         if text.is_ascii() && !text.contains('\\') {
+            return;
+        }
+        // The class the translation writes for `\w` is not a class of the pattern: Oniguruma reads
+        // `\w` as a character type, and adds nothing to it.
+        if text.strip_prefix('[').and_then(|t| t.strip_suffix(']')) == Some(JQ_WORD_CLASS) {
             return;
         }
         let x = if options.extended { "x" } else { "" };
@@ -465,11 +505,11 @@ fn fold_at(chars: &[char]) -> Option<Fold> {
 fn alternation(spelling: &str, unfolds: &[char], first: Option<char>) -> String {
     let mut out = String::from("(?:");
     if let Some(c) = first {
-        out.push_str(&c.to_string());
+        out.push(c);
         out.push('|');
     }
     for unfold in unfolds.iter().filter(|u| Some(**u) != first) {
-        out.push_str(&unfold.to_string());
+        out.push(*unfold);
         out.push('|');
     }
     out.push_str(spelling);
@@ -551,6 +591,11 @@ mod tests {
             rewrite("(?i)s(?m)s").as_deref(),
             Some(format!("(?i){SS}(?m)").as_str())
         );
+        // A group that starts its branch and holds more than literals is a list of its own.
+        assert_eq!(rewrite("(?i)(?:a\\d)s"), None);
+        assert_eq!(rewrite("(?i)(?:s\\d)s"), None);
+        assert!(rewrite("(?i)x(?:s\\d)s").is_some());
+        assert!(rewrite("(?i)(?:ss)s").is_some());
         // A repeated group, a capture group and an option group do not.
         for pattern in [
             "(?i)s(?:s)+",
@@ -645,11 +690,11 @@ mod tests {
     fn the_tables_agree_with_themselves() {
         assert!(FOLD_KEY.windows(2).all(|w| w[0].0 < w[1].0));
         for (fold, unfolds) in FOLDS2.iter().map(|(f, u)| (&f[..], *u)) {
-            assert!(!unfolds.is_empty());
+            assert_ne!(unfolds.len(), 0);
             assert!(fold.iter().all(|c| key_of(*c) == *c), "{fold:?}");
         }
         for (fold, unfolds) in FOLDS3.iter().map(|(f, u)| (&f[..], *u)) {
-            assert!(!unfolds.is_empty());
+            assert_ne!(unfolds.len(), 0);
             assert!(fold.iter().all(|c| key_of(*c) == *c), "{fold:?}");
         }
         // 104 characters fold to several.
