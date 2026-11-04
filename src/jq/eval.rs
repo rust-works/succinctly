@@ -9660,7 +9660,12 @@ fn each_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     let mut already_emitted = false;
+    // #6130: the condition reads read-only, the sink does not (it runs inside the condition's own).
+    let previous = yq_read_only_context::active();
+    let _scope = yq_as_source_scope::<S>();
     eval_each::<W, S>(cond, value.clone(), optional, &mut |item| {
+        let _sink_scope =
+            S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(|| yq_read_only_context::restore(previous));
         if select_emits::<S>(item.is_truthy(), &mut already_emitted) {
             sink(Item::Borrowed(value.clone()))
         } else {
@@ -12819,7 +12824,13 @@ fn owned_select_door<S: EvalSemantics>(
         };
         // `optional` is gated at the top, so the verdict is the shared one
         // ([`owned_cond_verdict`], #3697) and the two doors cannot drift.
-        let Some(verdict) = owned_cond_verdict::<S>(cond, input, false) else {
+        // #6130: yq's `select` reads its condition read-only, so a read of an absent key finds no
+        // output here and the door declines, as the bridge answers it.
+        let verdict = {
+            let _scope = yq_as_source_scope::<S>();
+            owned_cond_verdict::<S>(cond, input, false)
+        };
+        let Some(verdict) = verdict else {
             break;
         };
         match verdict.map(|truthy| truthy != inverted) {
@@ -19597,7 +19608,11 @@ fn builtin_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let cond_result = eval_single::<W, S>(cond, value.clone(), optional);
+    // #6130: yq's `select` runs its condition read-only, so a pipe from an absent key is empty.
+    let cond_result = {
+        let _scope = yq_as_source_scope::<S>();
+        eval_single::<W, S>(cond, value.clone(), optional)
+    };
     let mut already_emitted = false;
     eval_fanout::<_, S>(cond_result, |truthy| {
         if select_emits::<S>(truthy, &mut already_emitted) {
@@ -50193,9 +50208,12 @@ fn resolve_cond_fork_stream<S: EvalSemantics>(
     cond: &Expr,
     value: &OwnedValue,
     trackable: bool,
+    read_only: bool,
     mut dispatch: impl FnMut(bool) -> ResolveFlow,
 ) -> ResolveFlow {
-    resolve_value_fork_stream::<S>(cond, value, trackable, |c| dispatch(c.is_truthy()))
+    resolve_value_fork_stream::<S>(cond, value, trackable, read_only, |c| {
+        dispatch(c.is_truthy())
+    })
 }
 
 /// [`resolve_cond_fork_stream`] for a generator whose outputs are values a
@@ -50204,12 +50222,23 @@ fn resolve_cond_fork_stream<S: EvalSemantics>(
 /// is pulled one output at a time, the first `dispatch` answer that is not
 /// [`ResolveFlow::Exhausted`] ends the fork, and a `?//` inside `generator`
 /// retries past it.
+///
+/// `read_only` runs `generator` under yq's read-only absent-key rule (#6130): `select`'s condition
+/// does, an `if`'s and a `limit`'s count do not. `dispatch` runs inside `generator`'s own sink and
+/// leaves the scope it was entered from.
 fn resolve_value_fork_stream<S: EvalSemantics>(
     cond: &Expr,
     value: &OwnedValue,
     trackable: bool,
+    read_only: bool,
     mut dispatch: impl FnMut(OwnedValue) -> ResolveFlow,
 ) -> ResolveFlow {
+    let previous = yq_read_only_context::active();
+    let _scope = if read_only {
+        yq_as_source_scope::<S>()
+    } else {
+        None
+    };
     // #3293: a [`StashedVerdict`]. A `?//` inside `cond` retries past the
     // stop `dispatch` answered (#1519), and a retry that emits again drops
     // the stale answer at the top of the sink; one that produces nothing or
@@ -50224,6 +50253,8 @@ fn resolve_value_fork_stream<S: EvalSemantics>(
         Reentry::at_register(trackable),
         &mut |c| {
             dispatched.begin();
+            let _sink_scope = (read_only && S::READ_ONLY_ABSENT_KEY_IS_EMPTY)
+                .then(|| yq_read_only_context::restore(previous));
             match dispatch(c) {
                 ResolveFlow::Exhausted => Demand::Continue,
                 other => {
@@ -50526,7 +50557,7 @@ fn resolve_limit_sink<'a, S: EvalSemantics>(
     // fork `if`'s `cond` uses, so a failure the body raises reaches a `?//` inside
     // the count -- `path(limit(([1] as $q ?// $b | $q); .a))` is `["a"]` in jq
     // 1.7.1. This collected the whole count generator first.
-    resolve_value_fork_stream::<S>(n_expr, value, trackable, |n_value| {
+    resolve_value_fork_stream::<S>(n_expr, value, trackable, false, |n_value| {
         match classify_limit_n(n_value) {
             LimitN::Unlimited => {
                 resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, sink)
@@ -51152,7 +51183,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // error/break still escapes with the correct (now-capped) prefix.
         Expr::Builtin(Builtin::Select(cond)) => {
             let mut already_emitted = false;
-            resolve_cond_fork_stream::<S>(cond, value, trackable, |truthy| {
+            resolve_cond_fork_stream::<S>(cond, value, trackable, true, |truthy| {
                 if select_emits::<S>(truthy, &mut already_emitted) {
                     emit_passthrough(value, trackable, snapshot, sink)
                 } else {
@@ -51200,7 +51231,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             cond,
             then_branch,
             else_branch,
-        } => resolve_cond_fork_stream::<S>(cond, value, trackable, |truthy| {
+        } => resolve_cond_fork_stream::<S>(cond, value, trackable, false, |truthy| {
             let branch = if truthy { then_branch } else { else_branch };
             // #3914: the branch that runs starts from the register the `if` was entered
             // with (the condition is a subexp), so a by-value branch states it as a
