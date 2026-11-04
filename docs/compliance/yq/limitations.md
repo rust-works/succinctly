@@ -1966,6 +1966,13 @@ A yq re-pinned to a build with a newer Go needs the table re-derived; it was gen
 Still different: a named group whose name starts with a digit (`(?P<1n>a)`) or repeats an earlier one (`(?P<a>x)(?P<a>y)`) is accepted, as in yq, but the group is unnamed here (the crate refuses both), so `capture` does not report that name; and a surrogate escape (`\x{D800}`), which Go reads as a rune no text contains, is read here as U+FFFD.
 jq mode keeps Oniguruma's own rules (see the jq limitations).
 
+### A prefix shared by every branch of an alternation stays in each branch (#6134)
+
+Go's `regexp` factors only a simple prefix (a literal, a class) out of an alternation, so `.s | match("a*a|a*b")` on `s: aab` is `"aa"` in yq v4.53.3.
+The `regex` crate's parser also factored out a prefix that can match more than one way, and the second branch's `"aab"` won; `succinctly yq` now answers `"aa"` too.
+The mechanism, shared with jq mode, and the one shape it leaves (a pattern whose guarded form the `regex` crate refuses for its size) are in the jq limitations' #6134 entry.
+Pinned by `tests/yq_cli/i6134.rs`.
+
 ### Global regex zero-width-match iteration — resolved, real yq uses Go's `regexp`
 
 [#1255](https://github.com/rust-works/succinctly/issues/1255) resolved a divergence in
