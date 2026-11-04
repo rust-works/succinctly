@@ -29862,6 +29862,192 @@ fn starts_repetition(chars: &[char]) -> bool {
     }
 }
 
+/// Whether a dash sits beside a set escape (`\w-`, `-\d`), which no range can start or end.
+#[cfg(feature = "regex")]
+fn dash_beside_set(bytes: &[u8]) -> bool {
+    bytes.windows(3).any(|w| {
+        (w[0] == b'\\'
+            && matches!(w[1], b'd' | b'D' | b'w' | b'W' | b's' | b'S' | b'}')
+            && w[2] == b'-')
+            || (w[0] == b'-'
+                && w[1] == b'\\'
+                && matches!(w[2], b'd' | b'D' | b'w' | b'W' | b's' | b'S' | b'p' | b'P'))
+    })
+}
+
+/// Read the dashes of a character class as Oniguruma does (#6184): the `regex` crate reads `--`
+/// as set difference and a `]` that opens a class as a literal that no range can start, so
+/// `[+--]` (the range `+` to `-`), `[--{]` (`-` to `{`) and `[]-b]` (`]` to `b`) came out as other
+/// sets, and the reversed `[?--]` and `[]-(]`, errors in jq, were accepted.
+///
+/// A dash is a range operator after an item that can start a range, when an item follows; the
+/// item after an operator ends the range, and any other dash is a literal. Every dash that sits
+/// next to another is written `\-` where it is a literal or a range end, so the crate never meets
+/// `--`, and a leading `]` is written `\]`. A class holding a class escape (`\d`) or a bracket
+/// before a dash it would pair with, a quoted run, a comment, and a pattern with a class that
+/// does not close are left as written.
+#[cfg(feature = "regex")]
+fn escape_class_range_dashes(
+    pattern: &str,
+    extended: bool,
+) -> Result<std::borrow::Cow<'_, str>, EvalError> {
+    if !pattern.contains('[')
+        || !(pattern.contains("--")
+            || pattern.contains("]-")
+            || pattern.contains("-[:")
+            || dash_beside_set(pattern.as_bytes()))
+    {
+        return Ok(std::borrow::Cow::Borrowed(pattern));
+    }
+    if pattern.contains("\\Q")
+        || pattern.contains("(?#")
+        || ((extended || inline_extended(pattern)) && pattern.contains('#'))
+    {
+        return Ok(std::borrow::Cow::Borrowed(pattern));
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = string_with_capacity(pattern.len() + 4);
+    let mut changed = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            out.push(c);
+            if let Some(&next) = chars.get(i + 1) {
+                out.push(next);
+            }
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+        if c != '[' {
+            continue;
+        }
+        // A class: its optional `^`, then a `]` that is a literal if it comes first.
+        if chars.get(i) == Some(&'^') {
+            out.push('^');
+            i += 1;
+        }
+        // Whether the item before can start a range, and whether the dash before was an operator.
+        let mut starts_range = false;
+        let mut after_operator = false;
+        // Whether the item before is a set (`\\d`, `[:alpha:]`), which no range can start.
+        let mut after_set = false;
+        if chars.get(i) == Some(&']') {
+            out.push_str("\\]");
+            changed = true;
+            starts_range = true;
+            i += 1;
+        }
+        loop {
+            let Some(&ch) = chars.get(i) else {
+                // The class never closes: the engine reports it.
+                return Ok(std::borrow::Cow::Borrowed(pattern));
+            };
+            match ch {
+                ']' => {
+                    out.push(']');
+                    i += 1;
+                    break;
+                }
+                '\\' => {
+                    let Some(&next) = chars.get(i + 1) else {
+                        return Ok(std::borrow::Cow::Borrowed(pattern));
+                    };
+                    out.push('\\');
+                    out.push(next);
+                    i += 2;
+                    let braced = chars.get(i) == Some(&'{');
+                    if matches!(next, 'x' | 'p' | 'P' | 'k' | 'g' | 'N') && braced {
+                        let end = chars[i..]
+                            .iter()
+                            .position(|&c| c == '}')
+                            .map_or(chars.len(), |close| i + close + 1);
+                        out.extend(&chars[i..end]);
+                        i = end;
+                    }
+                    // A set (`\d`, `\w`, `\s`, `\p{..}`) starts no range and ends none; every other
+                    // escape is one character (`\b` is a backspace here, `\h` the letter).
+                    let single = !(matches!(next, 'd' | 'D' | 'w' | 'W' | 's' | 'S')
+                        || (matches!(next, 'p' | 'P') && braced));
+                    if after_operator && !single {
+                        return Err(EvalError::new(
+                            "invalid regex: char-class value at end of range",
+                        ));
+                    }
+                    // A class escape starts no range, but a dash after it is still the operator
+                    // that jq refuses.
+                    starts_range = !after_operator;
+                    after_set = !single;
+                    after_operator = false;
+                }
+                '[' => {
+                    if let Some((end, ..)) = posix_bracket_at(&chars, i) {
+                        if after_operator {
+                            return Err(EvalError::new(
+                                "invalid regex: char-class value at end of range",
+                            ));
+                        }
+                        out.extend(&chars[i..end]);
+                        i = end;
+                        starts_range = true;
+                        after_set = true;
+                    } else {
+                        out.push('[');
+                        i += 1;
+                        starts_range = !after_operator;
+                        after_set = false;
+                    }
+                    after_operator = false;
+                }
+                '-' => {
+                    let next = chars.get(i + 1).copied();
+                    if after_operator {
+                        // The end of the range.
+                        out.push_str("\\-");
+                        changed = true;
+                        after_operator = false;
+                        starts_range = false;
+                    } else if starts_range && next.is_some_and(|n| n != ']') {
+                        if after_set {
+                            return Err(EvalError::new(
+                                "invalid regex: unmatched range specifier in char-class",
+                            ));
+                        }
+                        out.push('-');
+                        after_operator = true;
+                        starts_range = false;
+                    } else {
+                        // A literal dash can start a range itself (`[--{]`).
+                        if next == Some('-') {
+                            out.push_str("\\-");
+                            changed = true;
+                        } else {
+                            out.push('-');
+                        }
+                        starts_range = true;
+                    }
+                    after_set = false;
+                    i += 1;
+                }
+                _ => {
+                    out.push(ch);
+                    i += 1;
+                    starts_range = !after_operator;
+                    after_operator = false;
+                    after_set = false;
+                }
+            }
+        }
+    }
+    Ok(if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(pattern)
+    })
+}
+
 /// The POSIX bracket starting at `chars[at]` (a `[`): the index just past its closing `:]`,
 /// whether it is negated (`[:^name:]`), and its name. `None` unless it is `[:` + an optional `^` +
 /// ASCII letters + `:]`, so a `[:` that is not a bracket costs a few characters, not a
@@ -30442,6 +30628,13 @@ fn build_regex_uncached<S: EvalSemantics>(
             deferred_refusal = Some(refusal);
             std::borrow::Cow::Borrowed(pattern)
         });
+        let scanned = match escape_class_range_dashes(&scanned, extended) {
+            Ok(classed) => classed,
+            Err(refusal) => {
+                deferred_refusal.get_or_insert(refusal);
+                scanned
+            }
+        };
         match translate_posix_brackets(&scanned, extended) {
             // #6108: a group repeated `{0}` keeps its capture slot.
             Ok(translated) => keep_zero_count_groups(&translated, extended)
@@ -144275,6 +144468,65 @@ mod tests {
         ] {
             assert!(
                 refuse_possessive_quantifier(pattern, false).is_err(),
+                "{pattern}"
+            );
+        }
+    }
+
+    /// #6184: the dashes of a class are written so that the `regex` crate reads the ranges
+    /// Oniguruma reads.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_class_dash_is_written_for_the_crate_6184() {
+        use std::borrow::Cow;
+        for (pattern, want) in [
+            ("[+--]", r"[+-\-]"),
+            ("[--{]", r"[\--{]"),
+            ("[--]", r"[\--]"),
+            ("[]-b]", r"[\]-b]"),
+            ("[^]-b]", r"[^\]-b]"),
+            ("[a-c--e]", r"[a-c\--e]"),
+            ("[\\--{]", r"[\--{]"),
+            (r"[\x{2d}--a]", r"[\x{2d}-\-a]"),
+            (r"[\n--a]", r"[\n-\-a]"),
+            (r"[\b--a]", r"[\b-\-a]"),
+            ("[[:alpha:]-]", "[[:alpha:]-]"),
+            ("[a[x--z]", r"[a[x-\-z]"),
+            // Outside a class nothing changes, and an escaped bracket opens none.
+            ("a--b", "a--b"),
+            (r"\[--]", r"\[--]"),
+            ("[a-]", "[a-]"),
+        ] {
+            let got = escape_class_range_dashes(pattern, false).unwrap();
+            assert_eq!(got, want, "{pattern}");
+        }
+        // Left as written: a quoted run, a comment, a class that never closes, an escape with
+        // nothing after it.
+        for pattern in [r"\Q--\E[--]", "(?#--)[--]", "[a--", r"[a--\"] {
+            assert!(
+                matches!(
+                    escape_class_range_dashes(pattern, false),
+                    Ok(Cow::Borrowed(_))
+                ),
+                "{pattern}"
+            );
+        }
+        assert!(matches!(
+            escape_class_range_dashes("[--]#", true),
+            Ok(Cow::Borrowed(_))
+        ));
+        // A range that starts or ends on a set is an error.
+        for pattern in [
+            "[[:alpha:]-a]",
+            r"[\w-.]",
+            r"[+-\w]",
+            r"[\w--+]",
+            r"[\d--]",
+            "[a-[:alpha:]]",
+            r"[a-\d--]",
+        ] {
+            assert!(
+                escape_class_range_dashes(pattern, false).is_err(),
                 "{pattern}"
             );
         }
