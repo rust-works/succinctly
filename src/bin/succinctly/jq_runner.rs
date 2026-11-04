@@ -5803,6 +5803,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // queue holds at most this one trailing error, so whatever
         // `InputPop::ParseError` the driver pops *is* it.
         let trailing_is_seq_warning = trailing_error.as_ref().is_some_and(|t| t.seq_warning);
+        // #6115: `--seq --stream` reads a fault as a record's end, and the main loop warns and goes
+        // on to the next input.
+        let seq_stream_warns = args.seq
+            && args.stream
+            && !args.stream_errors
+            && !args.raw_input
+            && args.input_dsv.is_none();
         if uses_input_builtins {
             // Seed `input`/`inputs`/`input_line_number`'s shared queue
             // (#723) with every document `get_inputs` just read -- under
@@ -5895,6 +5902,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     }
                     let input = match jq::pop_input() {
                         jq::InputPop::Document(input) => input,
+                        jq::InputPop::ParseError(error) if seq_stream_warns => {
+                            eprintln!(
+                                "{}",
+                                crate::jq_seq_reader::ignored_parse_error(&error.message)
+                            );
+                            continue;
+                        }
                         // jq's main loop prints a `--seq` parse error as
                         // ignored, and reads on to the end (#3201).
                         jq::InputPop::ParseError(error) if trailing_is_seq_warning => {
@@ -6456,7 +6470,13 @@ fn get_inputs(
     // JSON input mode is the only mode that runs the strict validator at all
     // -- `-R`, `--seq` and DSV never do, and must not start now.
     let json_input_mode = args.input_dsv.is_none() && !args.raw_input && !args.seq;
-    if json_input_mode {
+    // #6115: `--seq` with `--stream` or `--stream-errors` reads with jq's streaming parser in its
+    // record-sequence mode: the program reads the events a record produces, not its document.
+    let seq_by_stream_reader = args.seq
+        && !args.raw_input
+        && args.input_dsv.is_none()
+        && (args.stream || args.stream_errors);
+    if json_input_mode || seq_by_stream_reader {
         // #5291: jq skips a BOM at the start of its input.
         strip_leading_json_bom(raw_bytes.iter_mut().map(|(_, raw)| raw));
     }
@@ -6530,8 +6550,10 @@ fn get_inputs(
     // future change to it can't desynchronize them (CLAUDE.md: "Duplicated
     // predicates diverge silently").
     let seq_stream_shape = args.seq && !args.raw_input && args.input_dsv.is_none();
-    let seq_warnings_apply = seq_stream_shape && !args.null_input;
-    if seq_warnings_apply {
+    let seq_warnings_apply = seq_stream_shape && !args.null_input && !seq_by_stream_reader;
+    if seq_by_stream_reader {
+        // The streaming reader finds the records and their faults itself.
+    } else if seq_warnings_apply {
         // A *malformed* BOM is the one case where "no RS byte anywhere"
         // does not imply #1525's template: it costs jq a `parser_reset`
         // that leaves the parser reading rather than waiting for an RS, so
@@ -6623,6 +6645,61 @@ fn get_inputs(
             crate::jq_seq_reader::slurp_eof_position_lost(&raw_bytes)
         }
     };
+
+    // #6115: the events `--seq --stream` reads, with the faults of the records as the warnings
+    // jq's main loop prints for `--seq` (or, under `--stream-errors`, as events of their own).
+    if seq_by_stream_reader {
+        let read = crate::jq_stream_errors::read_seq(&raw_bytes, args.slurp, args.stream_errors);
+        let mut locations =
+            InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
+        for &at in &read.locations {
+            let (source, line) = stream_location(&raw_bytes, at);
+            locations.push(source, line);
+        }
+        if track_eof && !args.slurp {
+            locations.eof_tail = Some(EofTail {
+                newlines: u32::try_from(read.open_at_end.unwrap_or(0)).unwrap_or(u32::MAX),
+                unknown: read.open_at_end.is_none(),
+            });
+        }
+        let mut resumed: Vec<(usize, TrailingParseError)> = Vec::new();
+        let mut trailing_error = None;
+        // A program that reads inputs gets each fault in its queue: `input` raises it, and the main
+        // loop warns when it pops one (#5640). Any other plain run warns up front.
+        let faults_as_inputs = args.null_input || track_eof;
+        for fault in read.faults {
+            if faults_as_inputs {
+                // `input`/`inputs` raise what a plain run only warns about (#5640).
+                let (source, line) = stream_location(&raw_bytes, fault.location);
+                resumed.push((
+                    fault.before,
+                    TrailingParseError {
+                        error: EvalError::new(fault.message),
+                        source: u32::try_from(source).unwrap_or(u32::MAX),
+                        line: u32::try_from(line).unwrap_or(u32::MAX),
+                        seq_warning: false,
+                        as_parse_error: false,
+                    },
+                ));
+            } else if !fault.after_array {
+                eprintln!(
+                    "{}",
+                    crate::jq_seq_reader::ignored_parse_error(&fault.message)
+                );
+            } else if trailing_error.is_none() {
+                // The warning of a call after the slurped array: jq prints it once the program
+                // has run on the array, and has lost its position by then (#3201).
+                trailing_error = Some(TrailingParseError {
+                    error: EvalError::new(fault.message),
+                    source: NO_SOURCE,
+                    line: UNKNOWN_LINE,
+                    seq_warning: true,
+                    as_parse_error: false,
+                });
+            }
+        }
+        return Ok(Ok((read.values, locations, trailing_error, resumed)));
+    }
 
     // `--seq` keeps its raw bytes: its values are ranges into them, and
     // each is substituted on its own in `build_seq_values` (#3247). The
