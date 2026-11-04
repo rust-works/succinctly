@@ -89,6 +89,7 @@ mod go_regex;
 mod go_sort;
 mod go_time;
 mod json_fast;
+pub use json_fast::{parse_plain, parse_plain_stream};
 mod key_index;
 mod lazy;
 mod local_zone;

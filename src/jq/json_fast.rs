@@ -15,6 +15,9 @@
 //! the general route accepts or builds has to be mirrored here or declined here.
 //!
 //! `tonumber` reaches this only through its `is_ok()` probe on the error path.
+//!
+//! The stream loaders read through it too (#6110): `--slurpfile` and the lazy `inputs` producer
+//! hand it a document or a whole stream and fall back to their own routes when it declines.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -33,7 +36,7 @@ const _: () = assert!(MAX_DEPTH <= super::eval_generic::MAX_NESTING_DEPTH);
 
 /// `text` as an [`OwnedValue`] if it is one plain JSON value, optionally surrounded by JSON
 /// whitespace; `None` when it is anything else, for the caller's general route to decide.
-pub(crate) fn parse_plain(text: &str) -> Option<OwnedValue> {
+pub fn parse_plain(text: &str) -> Option<OwnedValue> {
     let mut reader = Reader {
         text,
         bytes: text.as_bytes(),
@@ -43,6 +46,34 @@ pub(crate) fn parse_plain(text: &str) -> Option<OwnedValue> {
     let value = reader.value(0)?;
     reader.space();
     (reader.at == reader.bytes.len()).then_some(value)
+}
+
+/// Every value of a stream of plain JSON values, or `None` if any one is anything else (#6110).
+///
+/// `text` is the stream as `--slurpfile` and `inputs` read it, its values separated and surrounded
+/// by JSON white space. A `None` leaves the whole text to the caller's general route.
+///
+/// A value is taken only when white space or the end of the text follows it, so `[1][2]`,
+/// `1[2]` and `"a""b"` (which a stream parser may split) are the general route's too.
+pub fn parse_plain_stream(text: &str) -> Option<Vec<OwnedValue>> {
+    let mut reader = Reader {
+        text,
+        bytes: text.as_bytes(),
+        at: 0,
+    };
+    let mut values = Vec::new();
+    loop {
+        reader.space();
+        if reader.at == reader.bytes.len() {
+            return Some(values);
+        }
+        values.push(reader.value(0)?);
+        if let Some(next) = reader.bytes.get(reader.at) {
+            if !matches!(next, b' ' | b'\t' | b'\n' | b'\r') {
+                return None;
+            }
+        }
+    }
 }
 
 struct Reader<'a> {
@@ -361,6 +392,54 @@ mod tests {
         ] {
             assert!(parse_plain(text).is_none(), "accepted {text:?}");
         }
+    }
+
+    /// The stream form (#6110): every value, or `None` if any one is declined.
+    #[test]
+    fn a_stream_of_plain_values_is_read_value_by_value() {
+        let one = |text: &str| parse_plain_stream(text).map(|v| v.len());
+        assert_eq!(one(""), Some(0));
+        assert_eq!(one(" \t\r\n "), Some(0));
+        assert_eq!(one("1"), Some(1));
+        assert_eq!(one("1 2\n3"), Some(3));
+        assert_eq!(one("{\"a\":1}\n{\"a\":2}\n[3]\n"), Some(3));
+        assert_eq!(one("\"a\" \"b\" null true []"), Some(5));
+        let values = parse_plain_stream("{\"a\":1} [2] \"c\" 4.50").unwrap();
+        let each: Vec<OwnedValue> = ["{\"a\":1}", "[2]", "\"c\"", "4.50"]
+            .iter()
+            .map(|t| parse_plain(t).unwrap())
+            .collect();
+        assert_eq!(values, each);
+        assert_eq!(
+            values.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+            each.iter().map(OwnedValue::to_json).collect::<Vec<_>>()
+        );
+    }
+
+    /// A value the text does not set apart, or any one the reader declines, declines the stream:
+    /// the general route reads the whole text.
+    #[test]
+    fn a_stream_with_one_declined_value_is_declined() {
+        for text in [
+            "[1][2]",
+            "1[2]",
+            "\"a\"\"b\"",
+            "{}{}",
+            "1,2",
+            "[1] ]",
+            "[1] nan",
+            "[1] 007",
+            "[1] {\"a\":1,\"a\":2}",
+            "[1] \"\\ud800\"",
+            "[1] [1,]",
+            "[1] \"unterminated",
+            "\u{feff}[1]",
+            "[1]\u{c}",
+        ] {
+            assert!(parse_plain_stream(text).is_none(), "accepted {text:?}");
+        }
+        let deep = alloc::format!("{}{}", "[".repeat(MAX_DEPTH + 1), "]".repeat(MAX_DEPTH + 1));
+        assert!(parse_plain_stream(&alloc::format!("1 {deep}")).is_none());
     }
 
     #[test]
