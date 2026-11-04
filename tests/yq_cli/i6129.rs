@@ -67,6 +67,35 @@ fn map_values_without_an_output_keeps_the_value_6129() -> Result<()> {
     Ok(())
 }
 
+/// The update keeps what the document wrote around a value `f` leaves alone: its comments, anchor,
+/// alias and flow style (`default` YAML output, captured from yq v4.53.3).
+#[test]
+fn map_values_without_an_output_keeps_the_presentation_6129() -> Result<()> {
+    for (document, filter, expected) in [
+        (
+            "a: &x 1  # c\nb: 2\n",
+            "map_values(select(. > 5))",
+            "a: &x 1 # c\nb: 2\n",
+        ),
+        (
+            "# head\na: 1 # one\nb: \"two\"\nk: &k [3]\nc: *k\n",
+            "map_values(select(. == 9))",
+            "# head\na: 1 # one\nb: \"two\"\nk: &k [3]\nc: *k\n",
+        ),
+        (
+            "a: [1, 2, 3]\n",
+            ".a |= map_values(select(. > 1))",
+            "a: [1, 2, 3]\n",
+        ),
+        ("5\n", "map_values(.)", "5\n"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, document, &[])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(output, expected, "`{filter}` over {document:?}");
+    }
+    Ok(())
+}
+
 /// jq's `map_values` is unchanged: an entry whose `f` yields nothing is dropped.
 #[test]
 fn jq_mode_map_values_still_drops_the_entry_6129() -> Result<()> {
