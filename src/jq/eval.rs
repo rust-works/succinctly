@@ -28606,6 +28606,83 @@ fn opens_interval(chars: &[char], at: usize) -> bool {
 #[cfg(feature = "regex")]
 const NEVER_MATCHES: &str = "[^\\s\\S]";
 
+/// Keep `regex-syntax` from factoring a shared prefix that can match more than one way out of an
+/// alternation (#6134, rust-lang/regex#1400). It rewrites `XA|XB` as `X(?:A|B)` whenever every
+/// branch starts with the same items, which keeps the leftmost-first match only when `X` matches
+/// one way: `"aab" | match("a*a|a*b")` is `"aa"` in jq and in yq, and was `"aab"` in both modes.
+/// `fancy-regex` hands the alternations it does not run itself to the same constructor.
+///
+/// The rewrite needs every branch to be a sequence, so a branch that never matches
+/// ([`NEVER_MATCHES`]) stops it without changing which branch wins. It goes first, because under
+/// the `x` flag the last branch can end in a comment. Only an alternation with a branch that holds a
+/// repetition or another alternation gets one: a prefix of literals, classes and assertions matches
+/// one way.
+///
+/// The alternations are found by `regex-syntax`'s parser, with lookaround and atomic group openers
+/// read as plain groups of the same length. `None` when no alternation needs the branch, or the
+/// parser still refuses the pattern (a backreference): such a pattern keeps the factored match.
+#[cfg(feature = "regex")]
+fn guard_prefix_lifting(pattern: &str) -> Option<String> {
+    use regex_syntax::ast::{self, Ast, RepetitionKind, RepetitionRange};
+    fn backtracks(ast: &Ast) -> bool {
+        match ast {
+            Ast::Repetition(rep) => match rep.op.kind {
+                RepetitionKind::Range(RepetitionRange::Exactly(_)) => backtracks(&rep.ast),
+                RepetitionKind::Range(RepetitionRange::Bounded(lo, hi)) if lo == hi => {
+                    backtracks(&rep.ast)
+                }
+                _ => true,
+            },
+            Ast::Alternation(_) => true,
+            Ast::Group(group) => backtracks(&group.ast),
+            Ast::Concat(concat) => concat.asts.iter().any(backtracks),
+            _ => false,
+        }
+    }
+    struct Starts(Vec<usize>);
+    impl ast::Visitor for Starts {
+        type Output = Vec<usize>;
+        type Err = core::convert::Infallible;
+        fn finish(self) -> Result<Vec<usize>, Self::Err> {
+            Ok(self.0)
+        }
+        fn visit_pre(&mut self, ast: &Ast) -> Result<(), Self::Err> {
+            if let Ast::Alternation(alt) = ast {
+                if alt.asts.iter().any(backtracks) {
+                    self.0.push(alt.span.start.offset);
+                }
+            }
+            Ok(())
+        }
+    }
+    if !pattern.contains('|') {
+        return None;
+    }
+    // Each replacement is as long as what it replaces, so the offsets hold for `pattern`.
+    let shadow = pattern
+        .replace("(?<=", "(?i:")
+        .replace("(?<!", "(?i:")
+        .replace("(?=", "(?:")
+        .replace("(?!", "(?:")
+        .replace("(?>", "(?:");
+    let tree = ast::parse::Parser::new().parse(&shadow).ok()?;
+    let Ok(mut starts) = ast::visit(&tree, Starts(Vec::new()));
+    if starts.is_empty() {
+        return None;
+    }
+    starts.sort_unstable();
+    let mut out = string_with_capacity(pattern.len() + starts.len() * (NEVER_MATCHES.len() + 1));
+    let mut from = 0;
+    for start in starts {
+        out.push_str(&pattern[from..start]);
+        out.push_str(NEVER_MATCHES);
+        out.push('|');
+        from = start;
+    }
+    out.push_str(&pattern[from..]);
+    Some(out)
+}
+
 /// The regex written for the character `v`, safe anywhere in a pattern, a class and the extended
 /// mode included.
 #[cfg(feature = "regex")]
@@ -29601,10 +29678,10 @@ fn build_regex_uncached<S: EvalSemantics>(
         }
     }
 
-    let compiled = match regex::Regex::new(&pattern) {
+    let compiled = match std_regex(&pattern) {
         Err(_) if as_written.is_some() => {
             pattern = as_written.take().unwrap_or_default();
-            regex::Regex::new(&pattern)
+            std_regex(&pattern)
         }
         compiled => compiled,
     };
@@ -29634,6 +29711,16 @@ fn build_regex_uncached<S: EvalSemantics>(
             }),
             None => Err(EvalError::new(format!("invalid regex: {e}"))),
         },
+    }
+}
+
+/// The `regex` crate's compilation of `pattern`, guarded by [`guard_prefix_lifting`] (#6134). A
+/// pattern the crate refuses is refused in its own words, not the guarded pattern's.
+#[cfg(feature = "regex")]
+fn std_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    match guard_prefix_lifting(pattern) {
+        Some(guarded) => regex::Regex::new(&guarded).or_else(|_| regex::Regex::new(pattern)),
+        None => regex::Regex::new(pattern),
     }
 }
 
@@ -29736,7 +29823,8 @@ fn build_fancy_regex_at<S: EvalSemantics>(
         return None;
     }
     let source = pattern;
-    let pattern = prepare_fancy_pattern(source)?;
+    let guarded = guard_prefix_lifting(source);
+    let pattern = prepare_fancy_pattern(guarded.as_deref().unwrap_or(source))?;
     let tree = fancy_regex::Expr::parse_tree(&pattern).ok()?;
     if !fancy_expr_is_oniguruma(&tree.expr)
         || tree.expr.has_descendant(|e| !fancy_expr_is_oniguruma(e))
