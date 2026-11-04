@@ -28614,16 +28614,18 @@ const NEVER_MATCHES: &str = "[^\\s\\S]";
 ///
 /// The rewrite needs every branch to be a sequence, so a branch that never matches
 /// ([`NEVER_MATCHES`]) stops it without changing which branch wins. It goes first, because under
-/// the `x` flag the last branch can end in a comment. Only an alternation with a branch that holds a
-/// repetition or another alternation gets one: a prefix of literals, classes and assertions matches
-/// one way.
+/// the `x` flag the last branch can end in a comment, and it carries the first branch's leading and
+/// trailing assertions (`^a+x|^a+y` gets `^[^\s\S]`): without them the alternation would lose its
+/// anchoring, and the crate would scan the whole text for a match it checks at one end.
 ///
-/// The alternations are found by `regex-syntax`'s parser, with the Oniguruma syntax only
-/// `fancy-regex` reads (lookaround and atomic groups, backreferences, `\K`, `\G`, `\Z`, `\R`) read as
-/// plain syntax of the same length. `None` when no alternation needs the branch, or the parser
-/// still refuses the pattern (a conditional): such a pattern keeps the factored match.
+/// Only an alternation the rewrite could get wrong gets the branch: each of its branches is a
+/// sequence of two items or more, one of them a repetition or another alternation (a shared prefix
+/// of literals, classes and assertions matches one way). With `oniguruma` the pattern may hold
+/// syntax only `fancy-regex` reads, which [`oniguruma_shadow`] writes plainly for `regex-syntax`'s
+/// parser. `None` when no alternation needs the branch, or the parser refuses the pattern (a
+/// conditional): such a pattern keeps the factored match.
 #[cfg(feature = "regex")]
-fn guard_prefix_lifting(pattern: &str) -> Option<String> {
+fn guard_prefix_lifting(pattern: &str, oniguruma: bool) -> Option<String> {
     use regex_syntax::ast::{self, Ast, RepetitionKind, RepetitionRange};
     fn backtracks(ast: &Ast) -> bool {
         match ast {
@@ -28640,18 +28642,50 @@ fn guard_prefix_lifting(pattern: &str) -> Option<String> {
             _ => false,
         }
     }
-    struct Starts(Vec<usize>);
-    impl ast::Visitor for Starts {
-        type Output = Vec<usize>;
+    /// The items of `ast` as the sequence `regex-syntax` makes of it: through the groups that
+    /// capture nothing, without the flag switches.
+    fn items<'a>(ast: &'a Ast, out: &mut Vec<&'a Ast>) {
+        match ast {
+            Ast::Concat(concat) => concat.asts.iter().for_each(|item| items(item, out)),
+            Ast::Group(group) if group.capture_index().is_none() => items(&group.ast, out),
+            Ast::Flags(_) | Ast::Empty(_) => {}
+            _ => out.push(ast),
+        }
+    }
+    /// Where each alternation to guard starts, and the spans of its first branch's leading and
+    /// trailing assertions.
+    #[allow(clippy::type_complexity)]
+    struct Guards(Vec<(usize, Vec<ast::Span>, Vec<ast::Span>)>);
+    impl ast::Visitor for Guards {
+        type Output = Vec<(usize, Vec<ast::Span>, Vec<ast::Span>)>;
         type Err = core::convert::Infallible;
-        fn finish(self) -> Result<Vec<usize>, Self::Err> {
+        fn finish(self) -> Result<Self::Output, Self::Err> {
             Ok(self.0)
         }
         fn visit_pre(&mut self, ast: &Ast) -> Result<(), Self::Err> {
-            if let Ast::Alternation(alt) = ast {
-                if alt.asts.iter().any(backtracks) {
-                    self.0.push(alt.span.start.offset);
-                }
+            let Ast::Alternation(alt) = ast else {
+                return Ok(());
+            };
+            let branches: Vec<Vec<&Ast>> = alt
+                .asts
+                .iter()
+                .map(|branch| {
+                    let mut seq = Vec::new();
+                    items(branch, &mut seq);
+                    seq
+                })
+                .collect();
+            if branches
+                .iter()
+                .all(|seq| seq.len() >= 2 && seq.iter().any(|item| backtracks(item)))
+            {
+                let assertion = |item: &&&Ast| matches!(item, Ast::Assertion(_));
+                let first = &branches[0];
+                let lead = first.iter().take_while(assertion).map(|a| *a.span());
+                let mut trail: Vec<_> = first.iter().rev().take_while(assertion).collect();
+                trail.reverse();
+                let trail = trail.into_iter().map(|a| *a.span()).collect();
+                self.0.push((alt.span.start.offset, lead.collect(), trail));
             }
             Ok(())
         }
@@ -28659,47 +28693,109 @@ fn guard_prefix_lifting(pattern: &str) -> Option<String> {
     if !pattern.contains('|') {
         return None;
     }
-    // Each replacement is as long as what it replaces, so the offsets hold for `pattern`, and leaves
-    // the groups and branches where they were (in `\\1` it replaces a literal `1` with `.`).
-    let mut shadow = pattern.to_string();
-    for (oniguruma, plain) in [
-        ("(?<=", "(?i:"),
-        ("(?<!", "(?i:"),
-        ("(?=", "(?:"),
-        ("(?!", "(?:"),
-        ("(?>", "(?:"),
-        ("\\K", "\\b"),
-        ("\\G", "\\b"),
-        ("\\Z", "\\b"),
-        ("\\R", "\\."),
-        ("\\k", "\\."),
-    ] {
-        if shadow.contains(oniguruma) {
-            shadow = shadow.replace(oniguruma, plain);
-        }
-    }
-    for digit in '1'..='9' {
-        let backref = ['\\', digit].iter().collect::<String>();
-        if shadow.contains(&backref) {
-            shadow = shadow.replace(&backref, "\\.");
-        }
-    }
+    let shadow = if oniguruma {
+        std::borrow::Cow::Owned(oniguruma_shadow(pattern)?)
+    } else {
+        std::borrow::Cow::Borrowed(pattern)
+    };
     let tree = ast::parse::Parser::new().parse(&shadow).ok()?;
-    let Ok(mut starts) = ast::visit(&tree, Starts(Vec::new()));
-    if starts.is_empty() {
+    let Ok(mut guards) = ast::visit(&tree, Guards(Vec::new()));
+    if guards.is_empty() {
         return None;
     }
-    starts.sort_unstable();
-    let mut out = string_with_capacity(pattern.len() + starts.len() * (NEVER_MATCHES.len() + 1));
+    guards.sort_unstable_by_key(|guard| guard.0);
+    let text = |span: &ast::Span| &pattern[span.start.offset..span.end.offset];
+    let mut out = string_with_capacity(pattern.len() + guards.len() * (NEVER_MATCHES.len() + 1));
     let mut from = 0;
-    for start in starts {
-        out.push_str(&pattern[from..start]);
+    for (start, lead, trail) in &guards {
+        out.push_str(&pattern[from..*start]);
+        lead.iter().for_each(|span| out.push_str(text(span)));
         out.push_str(NEVER_MATCHES);
+        trail.iter().for_each(|span| out.push_str(text(span)));
         out.push('|');
-        from = start;
+        from = *start;
     }
     out.push_str(&pattern[from..]);
     Some(out)
+}
+
+/// `pattern` with the Oniguruma syntax only `fancy-regex` reads written as plain syntax of the same
+/// length, so that `regex-syntax`'s parser finds [`guard_prefix_lifting`] the same groups and
+/// branches at the same offsets: a lookaround or atomic group opener becomes a plain group's,
+/// `(?#...)` a group of `x`s, `\K`, `\G` and `\Z` the assertion `\b`, and `\R`, `\k` and `\1`-`\9`
+/// the escape `\.`. A character class is copied as it is. `None` for a comment that never closes or
+/// crosses a line, since under the `x` flag that newline can end the `#` comment it is in.
+#[cfg(feature = "regex")]
+fn oniguruma_shadow(pattern: &str) -> Option<String> {
+    let bytes = pattern.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    // Open classes (they nest), and whether the next byte is the first of the class, where a `]` is
+    // a literal -- as in [`keep_zero_count_groups`].
+    let mut class_depth = 0usize;
+    let mut class_start = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            let Some(&next) = bytes.get(i + 1) else {
+                out.push(b);
+                break;
+            };
+            let plain = match next {
+                b'K' | b'G' | b'Z' if class_depth == 0 => b'b',
+                b'R' | b'k' | b'1'..=b'9' => b'.',
+                other => other,
+            };
+            out.extend_from_slice(&[b'\\', plain]);
+            class_start = false;
+            i += 2;
+            continue;
+        }
+        if class_depth > 0 {
+            match b {
+                b'[' => {
+                    class_depth += 1;
+                    class_start = true;
+                }
+                b']' if !class_start => class_depth -= 1,
+                b'^' if class_start => {}
+                _ => class_start = false,
+            }
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        let rest = &bytes[i..];
+        if b == b'[' {
+            class_depth = 1;
+            class_start = true;
+        } else if rest.starts_with(b"(?=") || rest.starts_with(b"(?!") || rest.starts_with(b"(?>") {
+            out.extend_from_slice(b"(?:");
+            i += 3;
+            continue;
+        } else if rest.starts_with(b"(?<=") || rest.starts_with(b"(?<!") {
+            out.extend_from_slice(b"(?i:");
+            i += 4;
+            continue;
+        } else if rest.starts_with(b"(?#") {
+            let mut end = 3;
+            while rest.get(end).is_some_and(|&c| c != b')') {
+                end += if rest[end] == b'\\' { 2 } else { 1 };
+            }
+            let comment = rest.get(..=end)?;
+            if comment.contains(&b'\n') {
+                return None;
+            }
+            out.extend_from_slice(b"(?:");
+            out.resize(out.len() + comment.len() - 4, b'x');
+            out.push(b')');
+            i += comment.len();
+            continue;
+        }
+        out.push(b);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
 }
 
 /// The regex written for the character `v`, safe anywhere in a pattern, a class and the extended
@@ -29737,7 +29833,8 @@ fn build_regex_uncached<S: EvalSemantics>(
 /// pattern the crate refuses is refused in its own words, not the guarded pattern's.
 #[cfg(feature = "regex")]
 fn std_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
-    match guard_prefix_lifting(pattern) {
+    // A guarded pattern the crate refuses only for its size compiles as written, factored.
+    match guard_prefix_lifting(pattern, false) {
         Some(guarded) => regex::Regex::new(&guarded).or_else(|_| regex::Regex::new(pattern)),
         None => regex::Regex::new(pattern),
     }
@@ -29842,7 +29939,10 @@ fn build_fancy_regex_at<S: EvalSemantics>(
         return None;
     }
     let source = pattern;
-    let guarded = guard_prefix_lifting(source);
+    // Under `l` the order the branches are tried in does not change the longest match.
+    let guarded = (!modes.longest)
+        .then(|| guard_prefix_lifting(source, true))
+        .flatten();
     let pattern = prepare_fancy_pattern(guarded.as_deref().unwrap_or(source))?;
     let tree = fancy_regex::Expr::parse_tree(&pattern).ok()?;
     if !fancy_expr_is_oniguruma(&tree.expr)
@@ -134074,7 +134174,7 @@ mod tests {
             _ => panic!("{pattern} compiles with the regex crate"),
         };
         // #6134: the crate is handed each pattern through `guard_prefix_lifting`.
-        let guarded = |pattern: String| guard_prefix_lifting(&pattern).unwrap_or(pattern);
+        let guarded = |pattern: String| guard_prefix_lifting(&pattern, false).unwrap_or(pattern);
         assert_eq!(
             compiled("(?:b*|a)+"),
             guarded(super::super::onig_loop::rewrite("(?:b*|a)+").unwrap())
@@ -134091,14 +134191,14 @@ mod tests {
         assert_eq!(compiled(&nested(depth)), guarded(nested(depth)));
     }
 
-    /// #6134: an alternation with a branch that can match more than one way gets a first branch
-    /// that never matches, at the start of the alternation, so that `regex-syntax` cannot factor a
-    /// shared prefix out of it. A prefix that matches one way, a pattern with no such branch, and a
-    /// pattern the parser refuses even with the Oniguruma syntax read as plain are left alone.
+    /// #6134: an alternation whose branches are all sequences holding a repeat gets a first branch
+    /// that never matches, at the start of the alternation, with the first branch's leading and
+    /// trailing assertions, so that `regex-syntax` cannot factor a shared prefix out of it and the
+    /// alternation keeps its anchoring. Other alternations, and a pattern the parser refuses, are
+    /// left alone.
     #[cfg(feature = "regex")]
     #[test]
     fn guard_prefix_lifting_puts_a_dead_branch_first_6134() {
-        let guarded = |pattern: &str| guard_prefix_lifting(pattern);
         let dead = NEVER_MATCHES;
         for (pattern, want) in [
             ("a*a|a*b", format!("{dead}|a*a|a*b")),
@@ -134106,8 +134206,25 @@ mod tests {
             ("(?:a*?b|a*?a)+?", format!("(?:{dead}|a*?b|a*?a)+?")),
             ("a{1,2}x|a{1,2}y", format!("{dead}|a{{1,2}}x|a{{1,2}}y")),
             ("(?:a|b)x|(?:a|b)y", format!("{dead}|(?:a|b)x|(?:a|b)y")),
+            ("(?:a*a)|(?:a*b)", format!("{dead}|(?:a*a)|(?:a*b)")),
             ("(?x) a*a | a*b # c", format!("{dead}|(?x) a*a | a*b # c")),
-            ("a*(?:b+|c)|d", format!("{dead}|a*(?:{dead}|b+|c)|d")),
+            (
+                "a*(?:b+c|b+d)|a*d",
+                format!("{dead}|a*(?:{dead}|b+c|b+d)|a*d"),
+            ),
+            ("^a+x|^a+y", format!("^{dead}|^a+x|^a+y")),
+            (
+                r"\A(?:)\ba*x$|a*y$",
+                format!(r"\A\b{dead}$|\A(?:)\ba*x$|a*y$"),
+            ),
+            (r"\w+x$|\w+y$", format!(r"{dead}$|\w+x$|\w+y$")),
+        ] {
+            for oniguruma in [false, true] {
+                let guarded = guard_prefix_lifting(pattern, oniguruma);
+                assert_eq!(guarded.as_deref(), Some(want.as_str()), "{pattern}");
+            }
+        }
+        for (pattern, want) in [
             ("(?=a*a|a*b)", format!("(?={dead}|a*a|a*b)")),
             ("(?<=x)(?:a*a|a*b)", format!("(?<=x)(?:{dead}|a*a|a*b)")),
             ("(?>a*a|a*b)", format!("(?>{dead}|a*a|a*b)")),
@@ -134119,12 +134236,14 @@ mod tests {
             (r"\\1(?:a*a|a*b)", format!(r"\\1(?:{dead}|a*a|a*b)")),
             (r"x\K(?:a*a|a*b)\Z", format!(r"x\K(?:{dead}|a*a|a*b)\Z")),
             (r"\G(?:a*a|a*b)\R", format!(r"\G(?:{dead}|a*a|a*b)\R")),
+            (r"\Ga*a|\Ga*b", format!(r"\G{dead}|\Ga*a|\Ga*b")),
+            ("(?#c)(?:a*a|a*b)", format!("(?#c)(?:{dead}|a*a|a*b)")),
+            ("(?#a|b)a*a|a*b", format!("{dead}|(?#a|b)a*a|a*b")),
+            ("[(?#]a*a|a*b", format!("{dead}|[(?#]a*a|a*b")),
+            (r"(?#\))a*a|a*b", format!(r"{dead}|(?#\))a*a|a*b")),
         ] {
-            assert_eq!(
-                guarded(pattern).as_deref(),
-                Some(want.as_str()),
-                "{pattern}"
-            );
+            let guarded = guard_prefix_lifting(pattern, true);
+            assert_eq!(guarded.as_deref(), Some(want.as_str()), "{pattern}");
         }
         for pattern in [
             "a*b",
@@ -134133,17 +134252,42 @@ mod tests {
             "a{2}x|a{2}y",
             r"\bx|\by",
             "(?:ab|ac)+",
+            "a*|b*",
+            "a*x|bx",
+            "(a*a)|(a*b)",
             "(a)?(?(1)a*a|a*b)",
+            "(?#a\nb)a*a|a*b",
+            "(?#a",
             "(",
         ] {
-            assert_eq!(guarded(pattern), None, "{pattern}");
+            assert_eq!(guard_prefix_lifting(pattern, true), None, "{pattern}");
         }
-        let starts = |pattern: &str| match regex_syntax::parse(pattern).map(|hir| hir.into_kind()) {
-            Ok(regex_syntax::hir::HirKind::Alternation(branches)) => branches.len(),
+        // The crate's own route reads none of `fancy-regex`'s syntax.
+        assert_eq!(guard_prefix_lifting("(?=a)(?:a*a|a*b)", false), None);
+        let hir = |pattern: &str| regex_syntax::parse(pattern).unwrap();
+        let branches = |pattern: &str| match hir(pattern).into_kind() {
+            regex_syntax::hir::HirKind::Alternation(branches) => branches.len(),
             _ => 0,
         };
-        assert_eq!(starts("a*a|a*b"), 0, "regex-syntax factors the prefix out");
-        assert_eq!(starts(&guarded("a*a|a*b").unwrap()), 3);
+        assert_eq!(
+            branches("a*a|a*b"),
+            0,
+            "regex-syntax factors the prefix out"
+        );
+        assert_eq!(
+            branches(&guard_prefix_lifting("a*a|a*b", false).unwrap()),
+            3
+        );
+        let anchored = hir(&guard_prefix_lifting("^a+x|^a+y", false).unwrap());
+        assert!(anchored
+            .properties()
+            .look_set_prefix()
+            .contains(regex_syntax::hir::Look::Start));
+        let at_end = hir(&guard_prefix_lifting(r"\w+x$|\w+y$", false).unwrap());
+        assert!(at_end
+            .properties()
+            .look_set_suffix()
+            .contains(regex_syntax::hir::Look::End));
     }
 
     /// #6134: a pattern the `regex` crate refuses is refused in its own words, without the branch
@@ -134151,8 +134295,8 @@ mod tests {
     #[cfg(feature = "regex")]
     #[test]
     fn std_regex_refuses_in_the_pattern_s_own_words_6134() {
-        let pattern = r"\p{Foo}|a*";
-        assert!(guard_prefix_lifting(pattern).is_some());
+        let pattern = r"a*\p{Foo}|a*x";
+        assert!(guard_prefix_lifting(pattern, false).is_some());
         let refusal = std_regex(pattern).unwrap_err().to_string();
         assert_eq!(refusal, regex::Regex::new(pattern).unwrap_err().to_string());
         assert!(!refusal.contains(NEVER_MATCHES), "{refusal}");
