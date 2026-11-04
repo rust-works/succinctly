@@ -5901,6 +5901,14 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     }
                     let input = match jq::pop_input() {
                         jq::InputPop::Document(input) => input,
+                        // #6141: `--seq --stream`'s end-of-stream stop ends the input call that met it,
+                        // and the main loop when it is the one that pops it.
+                        jq::InputPop::ParseError(error)
+                            if seq_by_stream_reader(&args)
+                                && error.message == crate::jq_seq_reader::MESSAGELESS_RETURN =>
+                        {
+                            break;
+                        }
                         jq::InputPop::ParseError(error) if seq_stream_warns => {
                             eprintln!(
                                 "{}",
@@ -6641,7 +6649,17 @@ fn get_inputs(
     // #6115: the events `--seq --stream` reads, with the faults of the records as the warnings
     // jq's main loop prints for `--seq` (or, under `--stream-errors`, as events of their own).
     if seq_by_stream_reader {
-        let read = crate::jq_stream_errors::read_seq(&raw_bytes, args.slurp, args.stream_errors);
+        // A program that reads inputs gets each fault in its queue: `input` raises it, and the main
+        // loop warns when it pops one (#5640). Any other plain run warns up front.
+        let faults_as_inputs = args.null_input || track_eof;
+        // And the end-of-stream stop (#2998) is a barrier in that queue, behind which the stream
+        // goes on (#6141); a run that never reads an input ends at it.
+        let read = crate::jq_stream_errors::read_seq(
+            &raw_bytes,
+            args.slurp,
+            args.stream_errors,
+            faults_as_inputs,
+        );
         let mut locations =
             InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
         for &at in &read.locations {
@@ -6656,9 +6674,6 @@ fn get_inputs(
         }
         let mut resumed: Vec<(usize, TrailingParseError)> = Vec::new();
         let mut trailing_error = None;
-        // A program that reads inputs gets each fault in its queue: `input` raises it, and the main
-        // loop warns when it pops one (#5640). Any other plain run warns up front.
-        let faults_as_inputs = args.null_input || track_eof;
         for fault in read.faults {
             if faults_as_inputs {
                 // `input`/`inputs` raise what a plain run only warns about (#5640).
