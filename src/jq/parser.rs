@@ -16089,4 +16089,52 @@ mod tests {
         assert!(parse_program("if . then 1 end").is_ok());
         assert!(parse_program(". and true").is_ok());
     }
+    /// The patterns of the `reduce` an `ireduce` filter parses to, in yq mode.
+    fn ireduce_patterns(filter: &str) -> Vec<Pattern> {
+        match parse_with_mode_and_extensions(filter, ParserMode::Yq, true).unwrap() {
+            Expr::Reduce { patterns, .. } => patterns,
+            other => panic!("{filter:?} parsed to {other:?}"),
+        }
+    }
+
+    /// #6088: an `ireduce` whose update reads the loop variable's node binds the element and one
+    /// variable per distinct read, and declines wherever it could not tell which `$i` a read means.
+    #[test]
+    fn ireduce_node_reads_bind_a_variable_per_distinct_read_6088() {
+        // One read, read twice: one variable beside the element.
+        let Pattern::Array(vars) =
+            &ireduce_patterns(".[] as $i ireduce([]; . + [($i|path), ($i|path)])")[0]
+        else {
+            panic!("the reads were not bound");
+        };
+        assert_eq!(vars.len(), 2);
+        // Two reads, two variables.
+        let Pattern::Array(vars) =
+            &ireduce_patterns(".[] as $i ireduce([]; . + [($i|path), ($i|key)])")[0]
+        else {
+            panic!("the reads were not bound");
+        };
+        assert_eq!(vars.len(), 3);
+    }
+
+    #[test]
+    fn ireduce_leaves_a_fold_it_cannot_read_as_written_6088() {
+        let single = vec![Pattern::Var("i".into())];
+        for filter in [
+            // No node read.
+            ".[] as $i ireduce([]; . + [$i])",
+            // A `$i` the update binds again, by every binder there is.
+            ".[] as $i ireduce([]; . + [($i|path)] | . as $i | .)",
+            ".[] as $i ireduce([]; . + [($i|path)] | . as [$i] | .)",
+            ".[] as $i ireduce([]; . + [($i|path)] | (.[] as $i ireduce(0; .)))",
+            ".[] as $i ireduce([]; . + [($i|path)] | [foreach .[] as $i (0; .)])",
+            ".[] as $i ireduce([]; . + [($i|path)] | def f($i): .; f(1))",
+        ] {
+            assert_eq!(ireduce_patterns(filter), single, "{filter}");
+        }
+        // A pattern that is not a single `$i`.
+        let patterns = ireduce_patterns(".[] as [$a, $b] ireduce([]; . + [($a|path)])");
+        assert_eq!(patterns.len(), 1);
+        assert!(matches!(&patterns[0], Pattern::Array(vars) if vars.len() == 2));
+    }
 }
