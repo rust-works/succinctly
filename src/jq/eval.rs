@@ -10881,8 +10881,8 @@ pub(crate) fn eval_owned_map_projection<S: EvalSemantics>(
         return None;
     }
     let null = OwnedValue::Null;
-    let mut out = Vec::with_capacity(items.len());
-    for item in items.iter() {
+    let mut out = vec_with_capacity(items.len());
+    for item in items {
         let mut at = item;
         for step in &steps {
             at = match (step, at) {

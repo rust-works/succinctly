@@ -123,109 +123,109 @@ fn the_update_is_taken_once_per_input_6122() -> Result<()> {
 const ANSWERED: &[(&str, &str, &str)] = &[
     (
         r#"{"users":[{"age":1,"n":"a"},{"age":2,"n":"b"},{"n":"c"},null]}"#,
-        r#".users |= map(.age)"#,
+        r".users |= map(.age)",
         r#"{"users":[1,2,null,null]}
 "#,
     ),
     (
         r#"{"users":[{"age":1,"n":"a"},{"age":2,"n":"b"},{"n":"c"},null]}"#,
-        r#".users |= map(.n)"#,
+        r".users |= map(.n)",
         r#"{"users":["a","b","c",null]}
 "#,
     ),
     (
         r#"{"a":{"b":[{"c":1},{"c":[2,3]},{"c":{"d":4}}]},"z":9}"#,
-        r#".a.b |= map(.c)"#,
+        r".a.b |= map(.c)",
         r#"{"a":{"b":[1,[2,3],{"d":4}]},"z":9}
 "#,
     ),
     (
         r#"{"a":{"b":[{"c":{"d":1}},{"c":{"d":[5]}},{"c":null},{}]}}"#,
-        r#".a.b |= map(.c.d)"#,
+        r".a.b |= map(.c.d)",
         r#"{"a":{"b":[1,[5],null,null]}}
 "#,
     ),
     (
         r#"{"a":{"b":[{"c":{"d":1}},{"c":{"d":[5]}},{"c":null},{}]}}"#,
-        r#".a.b |= map(.c | .d)"#,
+        r".a.b |= map(.c | .d)",
         r#"{"a":{"b":[1,[5],null,null]}}
 "#,
     ),
     (
         r#"{"u":[[1,2,3],[4],[],null]}"#,
-        r#".u |= map(.[0])"#,
+        r".u |= map(.[0])",
         r#"{"u":[1,4,null,null]}
 "#,
     ),
     (
         r#"{"u":[[1,2,3],[4],[],null]}"#,
-        r#".u |= map(.[-1])"#,
+        r".u |= map(.[-1])",
         r#"{"u":[3,4,null,null]}
 "#,
     ),
     (
         r#"{"u":[[1,2,3],[4],[],null]}"#,
-        r#".u |= map(.[-4])"#,
+        r".u |= map(.[-4])",
         r#"{"u":[null,null,null,null]}
 "#,
     ),
     (
         r#"{"u":[[[1,2],[3]],[[4]],[[]]]}"#,
-        r#".u |= map(.[0][0])"#,
+        r".u |= map(.[0][0])",
         r#"{"u":[1,4,null]}
 "#,
     ),
     (
         r#"{"u":[{"a":100000000000000000000},{"a":1.50},{"a":-0},{"a":0.10}]}"#,
-        r#".u |= map(.a)"#,
+        r".u |= map(.a)",
         r#"{"u":[100000000000000000000,1.50,-0,0.10]}
 "#,
     ),
     (
         r#"{"u":[{"a":1,"a":2},{"b":1,"b":null,"b":3}]}"#,
-        r#".u |= map(.a)"#,
+        r".u |= map(.a)",
         r#"{"u":[2,null]}
 "#,
     ),
     (
         r#"{"u":[{"a":{"p":1}},{"a":{"p":2}}]}"#,
-        r#".u |= map(.a)"#,
+        r".u |= map(.a)",
         r#"{"u":[{"p":1},{"p":2}]}
 "#,
     ),
     (
         r#"{"u":[{"a":1},{"a":2}],"v":3}"#,
-        r#".u |= map(.a) | .v += 1"#,
+        r".u |= map(.a) | .v += 1",
         r#"{"u":[1,2],"v":4}
 "#,
     ),
     (
         r#"{"u":[{"a":1},{"a":2}]}"#,
-        r#". as $d | .u |= map(.a) | [., $d]"#,
+        r". as $d | .u |= map(.a) | [., $d]",
         r#"[{"u":[1,2]},{"u":[{"a":1},{"a":2}]}]
 "#,
     ),
     (
         r#"{"u":[{"a":1},{"a":2}]}"#,
-        r#".u as $x | .u |= map(.a) | [., $x]"#,
+        r".u as $x | .u |= map(.a) | [., $x]",
         r#"[{"u":[1,2]},[{"a":1},{"a":2}]]
 "#,
     ),
     (
         r#"[[{"a":1}],[{"a":2}]]"#,
-        r#".[] |= map(.a)"#,
-        r#"[[1],[2]]
-"#,
+        r".[] |= map(.a)",
+        r"[[1],[2]]
+",
     ),
     (
         r#"{"u":[{"a":"é\u0000x"},{"a":"\ud83d\ude00"}]}"#,
-        r#".u |= map(.a)"#,
+        r".u |= map(.a)",
         r#"{"u":["é\u0000x","😀"]}
 "#,
     ),
     (
         r#"{"u":[{"a":1},2]}"#,
-        r#".u |= map(.a?)"#,
+        r".u |= map(.a?)",
         r#"{"u":[1]}
 "#,
     ),
@@ -235,16 +235,16 @@ const ANSWERED: &[(&str, &str, &str)] = &[
         r#""caught"
 "#,
     ),
-    (r#"{"u":[{"a":1},2]}"#, r#"(.u |= map(.a))?"#, r#""#),
+    (r#"{"u":[{"a":1},2]}"#, r"(.u |= map(.a))?", r""),
     (
         r#"{"u":{"x":{"a":1},"y":{"a":2}}}"#,
-        r#".u |= map(.a)"#,
+        r".u |= map(.a)",
         r#"{"u":[1,2]}
 "#,
     ),
     (
         r#"{"u":[]}"#,
-        r#".u |= map(.a)"#,
+        r".u |= map(.a)",
         r#"{"u":[]}
 "#,
     ),
@@ -254,49 +254,49 @@ const ANSWERED: &[(&str, &str, &str)] = &[
 const RAISED: &[(&str, &str, &str)] = &[
     (
         r#"{"u":[1,2]}"#,
-        r#".u |= map(.a)"#,
+        r".u |= map(.a)",
         r#"jq: error (at <stdin>:0): Cannot index number with string "a"
 "#,
     ),
     (
         r#"{"u":["x"]}"#,
-        r#".u |= map(.a)"#,
+        r".u |= map(.a)",
         r#"jq: error (at <stdin>:0): Cannot index string with string "a"
 "#,
     ),
     (
         r#"{"u":[true]}"#,
-        r#".u |= map(.a)"#,
+        r".u |= map(.a)",
         r#"jq: error (at <stdin>:0): Cannot index boolean with string "a"
 "#,
     ),
     (
         r#"{"u":[[1]]}"#,
-        r#".u |= map(.a)"#,
+        r".u |= map(.a)",
         r#"jq: error (at <stdin>:0): Cannot index array with string "a"
 "#,
     ),
     (
         r#"{"u":[{"a":1}]}"#,
-        r#".u |= map(.[0])"#,
-        r#"jq: error (at <stdin>:0): Cannot index object with number
-"#,
+        r".u |= map(.[0])",
+        r"jq: error (at <stdin>:0): Cannot index object with number
+",
     ),
     (
         r#"{"u":[{"a":1},2]}"#,
-        r#".u |= map(.a)"#,
+        r".u |= map(.a)",
         r#"jq: error (at <stdin>:0): Cannot index number with string "a"
 "#,
     ),
     (
         r#"{"u":7}"#,
-        r#".u |= map(.a)"#,
-        r#"jq: error (at <stdin>:0): Cannot iterate over number (7)
-"#,
+        r".u |= map(.a)",
+        r"jq: error (at <stdin>:0): Cannot iterate over number (7)
+",
     ),
     (
         r#"{"u":[{"a":1},{"a":2}]}"#,
-        r#"(.u, .u) |= map(.a)"#,
+        r"(.u, .u) |= map(.a)",
         r#"jq: error (at <stdin>:0): Cannot index number with string "a"
 "#,
     ),
