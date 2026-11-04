@@ -28413,6 +28413,13 @@ fn translate_posix_brackets_scan(
                 }
                 let end = (end + 1).min(chars.len());
                 out.extend(&chars[i..end]);
+                // #6170: a comment is invisible to jq, so what stood before it still stands (the
+                // extended mode's comments need no such care, that mode skips the check).
+                prev_assertion = was_assertion;
+                prev_pipe = after_pipe;
+                if i == body_start {
+                    body_start = end;
+                }
                 i = end;
                 continue;
             }
