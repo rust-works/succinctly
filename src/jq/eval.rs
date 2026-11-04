@@ -30475,13 +30475,13 @@ fn parse_fancy_tree_in_oniguruma_mode(mut pattern: String) -> Option<(fancy_rege
 #[cfg(feature = "regex")]
 fn strip_comments(pattern: &str) -> String {
     let chars: Vec<char> = pattern.chars().collect();
-    let mut out = String::with_capacity(pattern.len());
+    let mut out = string_with_capacity(pattern.len());
     let mut depth = 0usize;
     let mut i = 0;
     while i < chars.len() {
         match chars[i] {
             '\\' => {
-                out.extend(chars.get(i..i + 2).unwrap_or(&chars[i..]));
+                out.extend(chars.get(i..i + 2).unwrap_or_else(|| &chars[i..]));
                 i += 2;
                 continue;
             }
