@@ -45,3 +45,17 @@ fn jq_mode_tojson_stays_compact_6158() -> Result<()> {
     assert_eq!((output.as_str(), code), ("\"{\\\"a\\\":1}\"\n", 0));
     Ok(())
 }
+
+/// A `del` through `to_json` or `tojson(N)` deletes the node it derives from, as through `tojson`.
+#[test]
+fn del_through_a_json_text_stage_keeps_the_slot_6158() -> Result<()> {
+    for filter in [
+        "del(.s | tojson)",
+        "del(.s | tojson(0))",
+        "del(.s | to_json)",
+    ] {
+        let (output, code) = run_yq_stdin(filter, "s: x\nt: 1\n", &["-o=json", "-I=0"])?;
+        assert_eq!((output.as_str(), code), ("{\"t\":1}\n", 0), "{filter}");
+    }
+    Ok(())
+}

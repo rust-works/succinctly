@@ -79347,7 +79347,7 @@ fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
             unwrap_paren(stage),
             Expr::Builtin(Builtin::ToString | Builtin::Length | Builtin::ToJson | Builtin::Type)
                 | Expr::Not
-                | Expr::Format(FormatType::Json)
+                | Expr::Format(FormatType::Json | FormatType::YqJson(_) | FormatType::YqYaml(_))
         )
     };
     match expr {
