@@ -6131,7 +6131,7 @@ not a literal block; a flow-sourced container is block; see the `@yaml` table be
 `to_json` of a string holding a backslash-`u` escape in a filter literal differs because filter
 literals are unescaped here (`"\u0001"`) where yq keeps the backslash. `to_json`/`to_yaml` print
 the same bytes as `@json`/`@yaml` plus yq's indent and trailing line break; `tojson` is
-unchanged (see the `tojson` entry). An indent past 100000 is refused at parse time (yq would try to build it).
+`to_json` (#6158). An indent past 100000 is refused at parse time (yq would try to build it).
 
 `from_json`/`from_yaml` decode through the same scalar resolution as input documents, so an
 implicit-tag scalar yq types specially keeps succinctly's type: `"2020-01-01" | from_json | tag`
@@ -6178,12 +6178,12 @@ Not matched: an array reaches `join` the same way whether the document or the ex
 It follows the document case because that is the one real inputs hit.
 The separator is an evaluated expression: `join({})` is `1{}2` as in yq, and a `{}` separator that came from the document through `$s` is `1{}2` here for the same missing-origin reason (`. as $s | [1,2] | join($s)` over `{}` is `12` in yq).
 
-## `tostring` of a container is YAML since #1130; `tojson` still renders compactly ([#2902](https://github.com/rust-works/succinctly/issues/2902), [#1130](https://github.com/rust-works/succinctly/issues/1130))
+## `tostring` of a container is YAML since #1130 ([#2902](https://github.com/rust-works/succinctly/issues/2902), [#1130](https://github.com/rust-works/succinctly/issues/1130))
 
 Real yq's `tostring` on a container is its YAML encoder (block style, `!!float` tags
-where the spelling needs one, a node written in flow style kept in flow), and its `tojson`
-is its indented JSON encoder, which ends every string it produces -- scalar or container --
-with a newline of its own.
+where the spelling needs one, a node written in flow style kept in flow).
+Its `tojson` is `to_json`, its indented JSON encoder, which ends every string it produces --
+scalar or container -- with a newline of its own; `succinctly yq` reads `tojson` as `to_json` since [#6158](https://github.com/rust-works/succinctly/issues/6158), `tojson(0)` included.
 
 `tostring` now matches (#1130): a container becomes the YAML the CLI would print for it, with
 the one trailing line break chomped (`[1, 2] | tostring` is `"- 1\n- 2"`, `[1.0 * 3]` is

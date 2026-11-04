@@ -99,8 +99,7 @@ does. `from_json` and `from_yaml` both decode YAML and answer the first document
 a trailing line break, `to_json(N)` takes the indent (`0` is compact with no line break), and
 `to_yaml` / `to_yaml(N)` is the `@yaml` encoder (yq reads an indent of `0` as four spaces and `1`
 as two). The indent must be a non-negative integer literal directly after the name, as in yq.
-`tojson` is not `to_json`: it still renders compactly (see the
-[limitations entry](../compliance/yq/limitations.md#tostring-of-a-container-is-yaml-since-1130-tojson-still-renders-compactly-2902-1130)).
+`tojson` is `to_json` (#6158).
 
 ### `envsubst` (#4872)
 

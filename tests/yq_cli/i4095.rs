@@ -86,7 +86,7 @@ fn test_recurse_cond_keeps_each_nodes_position_4095() -> Result<()> {
             r#"["a","c",2,"l","dup","m"]"#,
         ),
         (
-            r".a | [recurse(.[]?; length > 0) | [key, (parent | key)] | tojson]",
+            r".a | [recurse(.[]?; length > 0) | [key, (parent | key)] | @json]",
             r#"["[\"a\"]","[\"b\",\"a\"]","[\"c\",\"a\"]","[0,\"c\"]","[1,\"c\"]","[2,\"c\"]","[\"d\",2]"]"#,
         ),
         (r"[recurse(.[]?; false) | path]", "[[]]"),
