@@ -2054,9 +2054,6 @@ fn bridge_ambient_input<V: DocumentValue, S: EvalSemantics>(
     cursor: Option<V::Cursor>,
 ) -> Result<OwnedValue, EvalError> {
     if crate::jq::walk::reads_ambient_value(expr) {
-        if let Some(c) = &cursor {
-            update_target::note_materialized(c.node_id(), c.document_token());
-        }
         to_owned_with_cursor::<_, S>(value, cursor)
     } else {
         Ok(OwnedValue::Null)
@@ -5965,128 +5962,90 @@ fn bridge_update_flow<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
-/// The node a cursor-native `path |= f` is running its filter on, and whether the filter has
-/// materialized that whole node (#6199): a bridge into the owned evaluator that was handed the
-/// target's own cursor builds the target, checks everything it walks, and so leaves nothing for
-/// [`update_on_cursor`] to validate. Thread-local state with an RAII guard that restores the
-/// enclosing update's, because a filter can hold an update of its own.
-#[cfg(feature = "std")]
-mod update_target {
-    use core::cell::Cell;
-
-    std::thread_local! {
-        static TARGET: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
-        static MATERIALIZED: Cell<bool> = const { Cell::new(false) };
-    }
-
-    pub(super) struct Guard {
-        target: Option<(usize, usize)>,
-        materialized: bool,
-    }
-
-    pub(super) fn enter(node: usize, document: usize) -> Guard {
-        Guard {
-            target: TARGET.with(|t| t.replace(Some((node, document)))),
-            materialized: MATERIALIZED.with(|m| m.replace(false)),
-        }
-    }
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            TARGET.with(|t| t.set(self.target));
-            MATERIALIZED.with(|m| m.set(self.materialized));
-        }
-    }
-
-    /// A walk of the whole subtree at `node` is about to run.
-    pub(super) fn note_materialized(node: usize, document: usize) {
-        if TARGET.with(Cell::get) == Some((node, document)) {
-            MATERIALIZED.with(|m| m.set(true));
-        }
-    }
-
-    pub(super) fn materialized() -> bool {
-        MATERIALIZED.with(Cell::get)
-    }
-}
-
-#[cfg(not(feature = "std"))]
-mod update_target {
-    pub(super) struct Guard;
-
-    pub(super) fn enter(_node: usize, _document: usize) -> Guard {
-        Guard
-    }
-
-    pub(super) fn note_materialized(_node: usize, _document: usize) {}
-
-    pub(super) fn materialized() -> bool {
-        false
-    }
-}
-
 /// How much of the document a `path |= f` target must hold, as a share, for [`update_on_cursor`] to
-/// take it: the target's node span times this must reach the document's (#6199). The route rebuilds
-/// what is not the target without the one-pass plain read ([`DocumentCursor::plain_owned_jq`]) the
-/// whole-document copy takes, so it only pays where the target is most of the document.
+/// take it: the target's span times this must reach the document's (#6199). The route reads what is
+/// not the target as the whole-document copy does, so it only pays where the target is most of
+/// the document.
 const CURSOR_UPDATE_TARGET_SHARE: usize = 2;
 
-/// The fewest nodes a document must have for [`update_on_cursor`] to be tried (#6199). A smaller one
-/// is copied faster than it is looked into, and the updates inside a loop over small records
-/// (`map(.name |= length)`) are all of that size.
-const CURSOR_UPDATE_MIN_NODES: usize = 32;
+/// The fewest balanced-parentheses positions (two per node) a document must span for
+/// [`update_on_cursor`] to be tried (#6199). What the route saves is the build of the part of the
+/// target the filter does not keep, and it pays for that with a lookup, a check of the target and a
+/// second walk of the rest. For a record of a few thousand nodes that costs more than the copy it
+/// replaces (an update inside `map(..)` measured 22-30% slower at 256 to 4000 nodes), so the floor
+/// is a document, not a record: 65 536 nodes, about 1 MB of JSON.
+const CURSOR_UPDATE_MIN_SPAN: usize = 1 << 17;
 
-/// Whether `filter` can be evaluated twice with nothing observable but the time (#6199): no
-/// `input`, `debug`, `stderr` or `halt`, and no call to a function the program defines (its body
-/// is out of sight). [`update_on_cursor`] declines after running a filter that answered nothing,
-/// raised or broke, and the whole-document route then runs it again to answer as it always did.
+/// The deepest nesting `parse_plain_at` reads, which a sibling built by it may add to its depth.
+const PLAIN_READ_DEPTH: usize = super::json_fast::MAX_DEPTH;
+
+/// Whether `filter` can be evaluated twice with nothing observable but the time (#6199):
+/// [`update_on_cursor`] declines after running a filter that answered nothing, raised or broke, and
+/// the whole-document route then runs it again to answer as it always did. A filter that writes,
+/// reads the input stream, ends the process or calls what the tree holds no body of
+/// ([`walk_body_may_have_effects`](super::eval::walk_body_may_have_effects), the set a probe must
+/// not re-run) is not, and neither is one that reads the cursor's position (`line`, `at_offset`):
+/// the whole-document route answers those from a rebuilt copy.
 fn update_filter_is_repeatable(filter: &Expr) -> bool {
-    !crate::jq::walk::any_subexpr(filter, &mut |e| match e {
-        Expr::DefCall { .. } | Expr::FuncDef { .. } => true,
-        Expr::Builtin(b) => matches!(
-            b,
-            Builtin::Input
-                | Builtin::Inputs
-                | Builtin::InputLineNumber
-                | Builtin::Debug
-                | Builtin::DebugMsg(_)
-                | Builtin::Stderr
-                | Builtin::Halt
-                | Builtin::HaltError
-                | Builtin::HaltErrorCode(_)
-        ),
-        _ => false,
-    })
+    !super::eval::walk_body_may_have_effects(filter)
+        && !crate::jq::walk::uses_cursor_metadata_builtins(filter)
 }
 
-/// Whether `filter` starts by reducing the target to a part of it or to something computed from
-/// it (#6199): `map(..)` without a `select`, `length`, `add`, `first`, `last`, `limit`, an index
-/// or a slice. A filter that keeps most of the target (`.`, `sort_by`, `reverse`, `map(select(..))`)
-/// builds the target again anyway, and the check of the target that the route owes the
-/// whole-document copy then costs more than the copy it replaced (measured: `.users |= sort_by(.age)`
-/// 1.26x-1.37x slower on a 7 MB document). A rule of thumb for when to try the route, not for
-/// whether its answer is right.
-fn update_filter_reduces(filter: &Expr) -> bool {
+/// Whether `expr` only navigates: `.`, `.[]`, `.name`, `.[n]` and pipes and parens of them.
+fn is_navigation(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity | Expr::Iterate | Expr::Field(_) | Expr::Index { .. } => true,
+        Expr::Paren(inner) => is_navigation(inner),
+        Expr::Pipe(stages) => stages.iter().all(is_navigation),
+        _ => false,
+    }
+}
+
+/// Whether `body` projects a small value out of its input: a field or an element, a literal,
+/// `length`, and arithmetic of those.
+fn projects_small(body: &Expr) -> bool {
+    match body {
+        Expr::Field(_) | Expr::Index { .. } | Expr::Literal(_) => true,
+        Expr::Paren(inner) => projects_small(inner),
+        Expr::Pipe(stages) => stages.iter().all(projects_small),
+        Expr::Arithmetic { left, right, .. } => projects_small(left) && projects_small(right),
+        Expr::Builtin(Builtin::Length) => true,
+        _ => false,
+    }
+}
+
+/// Whether the filter of a `path |= filter` is one [`update_on_cursor`] answers as the
+/// whole-document route does, and gains on (#6199).
+///
+/// **Answers.** The generic evaluator runs a `map(f)` lazily and a truncating consumer of it
+/// (`first`, an index, a slice, `limit`) never runs the elements it did not need, where the
+/// whole-document route raises the error of one of them (the #725 divergence of plain filters). So
+/// a `map` is only taken as the whole filter, which the update reads to the end, and what takes
+/// the first of a generator takes it from navigation, which cannot raise on the way.
+///
+/// **Gain.** A filter that keeps most of the target (`.`, `sort_by`, `reverse`, `map(select(..))`,
+/// `map(.age += 1)`) builds it again anyway and costs the check of the target on top: `sort_by`
+/// measured 1.26x-1.37x slower on a 7 MB document.
+fn update_filter_is_native(filter: &Expr) -> bool {
     match filter {
-        Expr::Pipe(stages) => stages.first().is_some_and(update_filter_reduces),
-        Expr::Paren(inner) => update_filter_reduces(inner),
-        Expr::Slice { .. }
-        | Expr::SliceExpr { .. }
-        | Expr::Index { .. }
-        | Expr::FirstExpr(_)
-        | Expr::LastExpr(_)
-        | Expr::Limit { .. } => true,
-        Expr::Builtin(Builtin::Map(body)) => !crate::jq::walk::any_subexpr(body, &mut |e| {
-            matches!(
-                e,
-                Expr::Builtin(
-                    Builtin::Select(_) | Builtin::Empty | Builtin::Sort | Builtin::SortBy(_)
-                )
-            )
-        }),
-        Expr::Builtin(
-            Builtin::Length | Builtin::Add | Builtin::First | Builtin::Last | Builtin::Limit(_, _),
-        ) => true,
+        Expr::Paren(inner) => update_filter_is_native(inner),
+        // A reduced target, then what reads it to the end.
+        Expr::Pipe(stages) => {
+            let mut stages = stages.iter();
+            stages.next().is_some_and(update_filter_is_native)
+                && stages.all(|stage| {
+                    matches!(
+                        stage,
+                        Expr::Builtin(Builtin::Length | Builtin::Add | Builtin::Min | Builtin::Max)
+                    )
+                })
+        }
+        Expr::Slice { .. } | Expr::SliceExpr { .. } | Expr::Index { .. } => true,
+        Expr::FirstExpr(inner) | Expr::LastExpr(inner) => is_navigation(inner),
+        Expr::Limit { expr, .. } => is_navigation(expr),
+        Expr::Builtin(Builtin::Length | Builtin::Add | Builtin::First | Builtin::Last) => true,
+        Expr::Builtin(Builtin::Limit(_, generator)) => is_navigation(generator),
+        Expr::Builtin(Builtin::Map(body)) => projects_small(body),
         _ => false,
     }
 }
@@ -6109,13 +6068,14 @@ fn update_target_cursor<C: DocumentCursor>(root: &C, steps: &[StepKey<'_>]) -> O
 
 /// `cursor`'s owned value with a `null` where `target` stands, which is below it by `steps`
 /// (#6199): [`to_owned_cursor_at_depth`]'s walk of the containers on the way, with the same key,
-/// delimiter and nesting checks in the same order, and the members that are not on the way built
-/// as that walk builds them. The target is neither built nor checked here: [`update_on_cursor`]
-/// checks it after its filter has run, unless the filter has walked all of it.
+/// delimiter and nesting checks in the same order. A member that is not on the way is read in one
+/// pass where the text is plain JSON ([`DocumentCursor::plain_owned_jq`], as the whole-document
+/// copy reads the root) and walked otherwise. The target is neither built nor checked here;
+/// [`update_on_cursor`] has checked it.
 ///
-/// `None` where the walk cannot say what the copy would: the target is not the node the steps
-/// reach (a key repeated in an object), a container on the way is not the kind its step needs, or
-/// the step names nothing.
+/// `Ok(None)` where the target is not the node the steps reach (a key repeated in an object, so
+/// that the lookup and the walk disagree about which member is the target); an `Err` is the
+/// walk's, a malformed document, which the caller leaves to the whole-document route to raise.
 fn owned_around_target<S: EvalSemantics, C: DocumentCursor>(
     cursor: &C,
     steps: &[StepKey<'_>],
@@ -6124,10 +6084,10 @@ fn owned_around_target<S: EvalSemantics, C: DocumentCursor>(
 ) -> Result<Option<OwnedValue>, EvalError> {
     nesting_depth_check(depth)?;
     let Some((step, rest)) = steps.split_first() else {
-        return Ok(None);
+        return Ok(None); // patchcov: coverage tolerate-line reason="unreachable: update_on_cursor passes a non-empty path, and the recursion stops at its last step"
     };
     let value = cursor.value();
-    // The child on the way: the target itself, checked and left out, or the next container down.
+    // The child on the way: the target itself, left out, or the next container down.
     let on_the_way = |child: &C| -> Result<Option<OwnedValue>, EvalError> {
         if rest.is_empty() {
             Ok(child.same_node(target).then_some(OwnedValue::Null))
@@ -6136,6 +6096,11 @@ fn owned_around_target<S: EvalSemantics, C: DocumentCursor>(
         }
     };
     let off_the_way = |child: &C, capacity: usize| {
+        if depth + 1 + PLAIN_READ_DEPTH <= MAX_NESTING_DEPTH {
+            if let Some(plain) = child.plain_owned_jq() {
+                return Ok(plain);
+            }
+        }
         walk_child::<S, _, BuildOwned>(
             child,
             None,
@@ -6149,19 +6114,17 @@ fn owned_around_target<S: EvalSemantics, C: DocumentCursor>(
     match step {
         StepKey::Field(name) => {
             let Some(fields) = value.as_object_rendered() else {
-                return Ok(None);
+                return Ok(None); // patchcov: coverage tolerate-line reason="unreachable: the lookup that found the target went through this container as an object"
             };
             let mut map = ObjectBuilder::with_capacity(0);
             let mut guard = DisplayKeyGuard::default();
             let mut f = fields;
             let mut is_first = true;
             let mut last_field: Option<C> = None;
-            let mut found = false;
             while let Some((field, rest_fields)) = f.uncons() {
                 let key = field.checked_key(&f, map.map(), &mut guard, is_first)?;
+                // A repeated key is a member that is not the target node, which declines.
                 let child = if key == name.as_ref() {
-                    // A repeated key is a member that is not the target node, which declines.
-                    found = true;
                     match on_the_way(&field.value_cursor)? {
                         Some(child) => child,
                         None => return Ok(None),
@@ -6178,14 +6141,14 @@ fn owned_around_target<S: EvalSemantics, C: DocumentCursor>(
                 return Err(f.malformed_member_error());
             }
             container_tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
-            Ok(found.then(|| BuildOwned::object(map)))
+            Ok(Some(BuildOwned::object(map)))
         }
         StepKey::Index(index) => {
             let Ok(want) = usize::try_from(*index) else {
-                return Ok(None);
+                return Ok(None); // patchcov: coverage tolerate-line reason="unreachable: update_target_cursor declined a negative index"
             };
             let Some(elements) = value.as_array() else {
-                return Ok(None);
+                return Ok(None); // patchcov: coverage tolerate-line reason="unreachable: the lookup that found the target went through this container as an array"
             };
             let mut items = Vec::new();
             let mut elems = elements;
@@ -6200,7 +6163,7 @@ fn owned_around_target<S: EvalSemantics, C: DocumentCursor>(
                 let child = if items.len() == want {
                     match on_the_way(&elem_cursor)? {
                         Some(child) => child,
-                        None => return Ok(None),
+                        None => return Ok(None), // patchcov: coverage tolerate-line reason="unreachable: an array has one element at this index, and the lookup chose it"
                     }
                 } else {
                     off_the_way(&elem_cursor, capacity)?
@@ -6215,22 +6178,26 @@ fn owned_around_target<S: EvalSemantics, C: DocumentCursor>(
                 is_first = false;
             }
             container_tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
-            Ok((want < items.len()).then(|| BuildOwned::array(items)))
+            Ok(Some(BuildOwned::array(items)))
         }
     }
 }
 
 /// `path |= filter` answered on the document's cursor, or `None` to leave it to the whole-document
-/// route (#6199). Only for a jq-mode update of a static path of object keys and array indexes, that
-/// reaches a node holding most of the document, with a filter that can be evaluated twice
-/// ([`update_filter_is_repeatable`]).
+/// route (#6199). Only for a jq-mode update of a static path of object keys and array indexes in a
+/// JSON document, with a filter that is [native](update_filter_is_native) and
+/// [repeatable](update_filter_is_repeatable), that reaches most of a large document.
 ///
 /// The whole-document route copies every node of the document into one owned value and writes into
-/// that copy. Here the containers on the path are rebuilt around a `null` ([`owned_around_target`]),
-/// `filter` runs on the target's cursor and its first output goes into that `null`, so a filter
-/// that keeps little of the target (`.users |= .[:10]`, `map(.age + 1)`) never builds the rest.
-/// Whatever the filter does not answer with one output (nothing, an error, a `break`, a `halt`) is
-/// left to the whole-document route, which runs it again and raises as it always did.
+/// that copy. Here the target is checked (one scan, [`DocumentCursor::certified_well_formed`],
+/// else the walk), `filter` runs on the target in the document and its one output is kept, and the
+/// containers on the path are rebuilt around it ([`owned_around_target`]), so a filter that keeps
+/// little of the target (`.users |= .[:10]`, `map(.age + 1)`) never builds the rest.
+///
+/// Whatever is not one clean output of `filter` (nothing, an error, a `break`, a `halt`, a `?//`
+/// retry that offers a second), a target that does not check, a path that does not land and a
+/// repeated key on it are left to the whole-document route, which answers as it always did.
+#[inline(never)]
 fn update_on_cursor<S: EvalSemantics, V: DocumentValue>(
     path: &Expr,
     filter: &Expr,
@@ -6239,83 +6206,45 @@ fn update_on_cursor<S: EvalSemantics, V: DocumentValue>(
     update_on_cursor_gated::<S, V>(path, filter, root, true)
 }
 
-/// [`update_on_cursor`], with the gates (`share_gate`: the target's share of the document and the
-/// filter's shape) that only decide whether the route pays off, not whether it is right: a test passes `false` to hold every update to the
-/// whole-document answer.
+/// [`update_on_cursor`], with the size gates (`size_gates`: the document's floor and the target's
+/// share) that only decide whether the route pays off, not whether its answer is right: a test
+/// passes `false` to hold every update to the whole-document answer.
+#[inline(never)]
 fn update_on_cursor_gated<S: EvalSemantics, V: DocumentValue>(
     path: &Expr,
     filter: &Expr,
     root: &V::Cursor,
-    share_gate: bool,
+    size_gates: bool,
 ) -> Option<OwnedValue> {
     if S::TAG != EvalTag::Jq
         || <V::Cursor as DocumentCursor>::REUSE_FIELD_VALUE
         || !root.materializes_members_one_to_one()
         || embed_table_active()
+        || !update_filter_is_native(filter)
+        || !update_filter_is_repeatable(filter)
     {
         return None;
     }
-    // The gates that only decide whether the route pays off, cheapest first: an update inside a
-    // loop over small records (`map(.name |= length)`) leaves here without a lookup or an allocation.
-    let root_span = if share_gate {
-        if !update_filter_reduces(filter) {
-            return None;
-        }
-        let span = root.subtree_end()?.checked_sub(root.node_id())?;
-        if span < CURSOR_UPDATE_MIN_NODES {
-            return None;
-        }
-        span
-    } else {
-        0
-    };
+    // The gates that only decide whether the route pays off come first: an update inside a loop
+    // over small records (`map(.name |= length)`) leaves here without a lookup or an allocation.
+    let root_span = root.subtree_end()?.checked_sub(root.node_id())?;
+    if size_gates && root_span < CURSOR_UPDATE_MIN_SPAN {
+        return None;
+    }
     let mut steps = Vec::new();
     static_path_steps(path, &mut steps)?;
-    if steps.is_empty() || !update_filter_is_repeatable(filter) {
+    if steps.is_empty() {
         return None;
     }
     let target = update_target_cursor(root, &steps)?;
-    if share_gate {
+    if size_gates {
         let target_span = target.subtree_end()?.checked_sub(target.node_id())?;
         if target_span.saturating_mul(CURSOR_UPDATE_TARGET_SHARE) < root_span {
             return None;
         }
     }
-    // A malformed document is left to the whole-document copy, which raises its error.
-    let mut around = owned_around_target::<S, _>(root, &steps, &target, 0)
-        .ok()
-        .flatten()?;
-    let mut first = None;
-    let mut whole = false;
-    {
-        let _target = update_target::enter(target.node_id(), target.document_token());
-        each_first_generic::<S, V>(
-            filter,
-            target.value(),
-            false,
-            Some(target),
-            &mut |item: GenericItem<V>| {
-                // An output that is the target itself is built whole by the conversion below.
-                whole = matches!(
-                    &item,
-                    GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _)
-                        if c.same_node(&target)
-                );
-                first = Some(generic_item_into_owned::<V, S>(item));
-                Demand::Stop
-            },
-        );
-        whole |= update_target::materialized();
-    }
-    let Some(Ok(new)) = first else {
-        return None;
-    };
-    // The whole-document copy checks every node of the target. What the filter did not walk is
-    // checked here, so a malformed document is still left to that copy to raise. Where the filter
-    // walked the target, the nesting ceiling counts from the target, not the document, so a target
-    // nested to within the path's length of 256 is read where the copy refuses it; the CLI never
-    // sees such a document (a parse depth of 128 is refused first, #5497), a library caller can.
-    if !whole
+    // The whole-document copy checks every node of the target, at the depth the path puts it.
+    if !target.certified_well_formed(steps.len())
         && to_owned_cursor_at_depth::<S, _, CheckOnly>(
             &target,
             None,
@@ -6329,9 +6258,34 @@ fn update_on_cursor_gated<S: EvalSemantics, V: DocumentValue>(
     {
         return None;
     }
+    let mut first = None;
+    let mut outputs = 0usize;
+    let flow = each_first_generic::<S, V>(
+        filter,
+        target.value(),
+        false,
+        Some(target),
+        &mut |item: GenericItem<V>| {
+            outputs += 1;
+            if outputs == 1 {
+                first = Some(generic_item_into_owned::<V, S>(item));
+            }
+            Demand::Stop
+        },
+    );
+    if outputs != 1 || !matches!(flow, Flow::Stopped { pending: None }) {
+        return None;
+    }
+    let Some(Ok(new)) = first else {
+        return None;
+    };
+    // A malformed sibling is left to the whole-document copy, which raises its error.
+    let mut around = owned_around_target::<S, _>(root, &steps, &target, 0)
+        .ok()
+        .flatten()?;
     let mut slot = &mut around;
     for step in &steps {
-        slot = owned_slot_mut(step, slot)?;
+        slot = owned_slot_mut(step, slot)?; // patchcov: coverage tolerate-line reason="unreachable: the walk built a container of the kind each step names, with the target's slot in it"
     }
     *slot = new;
     Some(around)
@@ -54894,7 +54848,9 @@ mod tests {
             (r#""b""#, "b"),
             (r#""a""#, "a"),
             (r#""k""#, "k"),
-            (r#""a""#, "a"),
+            (r#""\u0061""#, "a"),
+            (r#""\u0062""#, "b"),
+            (r#""\u006b""#, "k"),
         ];
         const SCALARS: &[&str] = &[
             "1",
@@ -54958,25 +54914,53 @@ mod tests {
         }
         const DAMAGE: &[&str] = &[",", ":", "x", "{", "}", "[", "]", "\"", "\\", " "];
         const FILTERS: &[&str] = &[
-            ".",
+            // The shapes the route takes.
             "length",
+            "add",
+            "first",
+            "last",
+            ".[0]",
+            ".[1]",
+            ".[-1]",
+            ".[:2]",
+            ".[1:]",
+            "map(.a)",
+            "map(.a + 1)",
+            "map(.[0])",
+            "map(length)",
+            "(map(.a) | add)",
+            "(map(.a) | length)",
+            "limit(2; .[])",
+            "first(.[])",
+            "last(.[])",
+            "first(.[] | .a)",
+            "limit(2; .[]?)",
+            // Shapes it leaves, and what it must hand back: nothing, an error, an error inside a
+            // lazy `map` under a truncating consumer, a `?//` retry, a position.
+            ".",
             "empty",
-            "[.]",
-            "null",
-            "1",
-            r#"error("x")"#,
-            "(., .)",
-            "keys?",
-            "tostring",
-            ".[0]?",
-            "map(.)?",
-            "first(.[]?)",
-            "{x: .}",
+            "first(empty)",
+            "error(\"Ex\")",
+            "(1, error(\"Ex\"))",
+            "first(map(.a))",
+            "(map(.a) | first)",
+            "(map(.a) | .[0])",
+            "first(map(.a) | .[])",
+            "(map(.a + 1) | add)",
+            "first(1 as $x ?// $y | $x + 1)",
+            "limit(1; . as [$x] ?// $x | $x)",
+            "first(. as [$a] ?// {a: $b} | $a)",
+            "line",
+            "first(column)",
+            "first(at_offset(0))",
+            "(debug | length)",
+            "input?",
             "tojson",
-            "[.[]?]",
-            "(1, error(\"x\"))",
-            ". + 1",
-            "type",
+            "{x: .}",
+            "keys?",
+            "sort_by(.a)?",
+            "map(select(.a))?",
+            "map(.a += 1)?",
         ];
         fn route<C: DocumentCursor>(path: &Expr, filter: &Expr, cursor: &C) -> Option<OwnedValue> {
             update_on_cursor_gated::<JqSemantics, C::Value>(path, filter, cursor, false)
@@ -55048,7 +55032,7 @@ mod tests {
         }
         let mut rng = Rng(0xD1B5_4A32_D192_ED03);
         let (mut taken, mut tried) = (0usize, 0usize);
-        for _ in 0..8000 {
+        for _ in 0..30000 {
             let tree = gen(&mut rng, 0);
             let mut doc = String::new();
             tree.render(&mut doc);
@@ -55074,6 +55058,7 @@ mod tests {
             tried += 1;
             taken += usize::from(compare(&doc, &program));
         }
+        let mut at_ceiling = 0usize;
         // The nesting ceiling (256) counts from the document: a sibling or a target nested to
         // within a few levels of it is refused by the copy, and the route must not read it.
         for depth in 250..=258 {
@@ -55083,11 +55068,15 @@ mod tests {
                 format!(r#"{{"a":{open}0{close},"z":1}}"#),
                 format!(r#"[{{"a":[1,2]}},{open}0{close}]"#),
             ] {
-                for program in [".a |= length", ".a |= first?", ".[0].a |= length"] {
-                    compare(&doc, program);
+                for program in [".a |= length", ".a |= first", ".[0].a |= length"] {
+                    at_ceiling += usize::from(compare(&doc, program));
                 }
             }
         }
+        assert!(
+            at_ceiling > 0,
+            "no update at the nesting ceiling took the route"
+        );
         // The run must reach the route, or it proved nothing.
         assert!(
             taken > 300,
@@ -55095,12 +55084,12 @@ mod tests {
         );
     }
 
-    /// #6199: which updates take the cursor route is a performance decision, so it is pinned: the
-    /// shapes the route wins on take it, the ones that keep most of the target (where it measured
-    /// slower than the whole-document copy), a target that is a small part of the document, a
-    /// filter that cannot run twice, a mode other than jq and an embed table in scope do not.
+    /// #6199: which updates take the cursor route is a decision about answers (a `map` under a
+    /// truncating consumer) and about cost (a filter that keeps the target, a small document), so
+    /// it is pinned: the shapes the route wins on take it, the others and the documents it would
+    /// lose on do not.
     #[test]
-    fn update_on_cursor_takes_the_reducing_shapes_6199() {
+    fn update_on_cursor_takes_the_native_shapes_6199() {
         fn takes<S: EvalSemantics>(doc: &str, program: &str) -> bool {
             let Ok(Expr::Update { path, filter }) = crate::jq::parser::parse(program) else {
                 panic!("{program} is not an update");
@@ -55112,32 +55101,52 @@ mod tests {
             }
             run::<S, _>(&path, &filter, &cursor)
         }
-        let records: Vec<String> = (1..=20)
+        // 30 000 records of 3 nodes: 90 000 nodes, over the floor of 65 536.
+        let records: Vec<String> = (1..=30_000)
             .map(|i| format!(r#"{{"id":{i},"age":{}}}"#, i % 7 + 3))
             .collect();
         let users = format!(r#"{{"users":[{}],"n":7}}"#, records.join(","));
         let users = users.as_str();
         for program in [
             ".users |= map(.age + 1)",
+            ".users |= map(.age)",
             ".users |= length",
             ".users |= .[:2]",
             ".users |= .[0]",
             ".users |= first",
+            ".users |= last",
             ".users |= add",
             ".users |= limit(2; .[])",
+            ".users |= first(.[])",
             ".users |= (map(.age) | add)",
+            ".users |= (map(.age) | length)",
         ] {
             assert!(takes::<JqSemantics>(users, program), "{program}");
         }
         for program in [
+            // Keeps most of the target.
             ".users |= .",
             ".users |= sort_by(.age)",
             ".users |= reverse",
             ".users |= map(select(.age > 3))",
-            ".users |= empty",
-            ".users |= error(\"x\")",
+            ".users |= map(.age += 1)",
+            ".users |= map(.)",
+            // A lazy `map` under a consumer that stops early raises nothing in the generic
+            // evaluator and the element's error in the copy.
+            ".users |= (map(.age) | first)",
+            ".users |= (map(.age) | .[0])",
+            ".users |= first(map(.age) | .[])",
+            ".users |= first(.[] | select(.age > 3))",
+            ".users |= first(1 as $x ?// $y | $x)",
+            // Cannot be run twice, or reads the position.
             ".users |= (debug | length)",
             ".users |= input",
+            ".users |= first(line)",
+            ".users |= first(at_offset(0))",
+            // Nothing to keep, or an error.
+            ".users |= empty",
+            ".users |= error(\"x\")",
+            // A path that does not land, and a target that is a small part of the document.
             ".nope |= length",
             ".users[0] |= length",
             ".n |= length",
@@ -55145,20 +55154,17 @@ mod tests {
             assert!(!takes::<JqSemantics>(users, program), "{program}");
         }
         assert!(!takes::<YqSemantics>(users, ".users |= length"));
-        // A target that is a small part of the document is left to the plain read of all of it.
-        let big = (1..=40)
+        // A document below the floor is copied, whatever the update.
+        let small = r#"{"users":[1,2,3,4,5,6,7,8,9,10]}"#;
+        assert!(!takes::<JqSemantics>(small, ".users |= length"));
+        // A target that is less than half of the document is left to the plain read of all of it.
+        let big = (1..=40_000)
             .map(|i| i.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let wide =
-            format!(r#"{{"big":[{big}],"small":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18]}}"#);
-        assert!(takes::<JqSemantics>(&wide, ".big |= length"));
-        assert!(!takes::<JqSemantics>(&wide, ".small |= length"));
-        // A document below the size floor is copied, whatever the update.
-        assert!(!takes::<JqSemantics>(
-            r#"{"users":[1,2,3]}"#,
-            ".users |= length"
-        ));
+        let wide = format!(r#"{{"big":[{big}],"small":[{big},{big},{big}]}}"#);
+        assert!(takes::<JqSemantics>(&wide, ".small |= length"));
+        assert!(!takes::<JqSemantics>(&wide, ".big |= length"));
     }
 
     /// #3909: the CLI's `LazySeq` printer takes the canonical echo scan's `Some`

@@ -28,7 +28,7 @@ use super::value::OwnedValue;
 
 /// Deeper than this the general route decides (it enforces the document nesting ceilings and
 /// words the refusal).
-const MAX_DEPTH: usize = 64;
+pub(crate) const MAX_DEPTH: usize = 64;
 
 // The reader must never accept what a ceiling of the general route refuses.
 const _: () = assert!(MAX_DEPTH <= crate::json::validate::MAX_NESTING_DEPTH);

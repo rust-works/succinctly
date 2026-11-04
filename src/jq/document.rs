@@ -351,6 +351,15 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
+    /// Whether one scan of this node's text certifies it well formed, so that
+    /// [`validate_cursor`](super::eval_generic::validate_cursor) started `depth` levels down would
+    /// accept it (#6199, #3909): no malformed member or delimiter, no scalar that fails to decode,
+    /// no repeated key, nesting within the ceiling counted from `depth`. `false` is "not told",
+    /// not "refused": the caller walks. A format whose text is not canonical JSON answers `false`.
+    fn certified_well_formed(&self, _depth: usize) -> bool {
+        false
+    }
+
     /// The parent *within the document*: [`parent`](Self::parent), except
     /// that a document root has none. JSON has a single root; YAML's
     /// [`parent`](Self::parent) of a document root is the document stream,

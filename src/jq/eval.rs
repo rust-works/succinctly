@@ -55811,7 +55811,7 @@ fn drain_fork(
 /// tree does not hold the body of (an unresolved [`Expr::FuncCall`]), which may
 /// do any of those. The set a probe must not re-run (#2744); read-only builtins
 /// (`input_line_number`, `input_filename`, `env`, `now`) are not in it.
-fn walk_body_may_have_effects(f: &Expr) -> bool {
+pub(crate) fn walk_body_may_have_effects(f: &Expr) -> bool {
     any_subexpr(f, &mut |e| {
         matches!(
             e,
