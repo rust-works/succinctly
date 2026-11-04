@@ -5807,8 +5807,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // on to the next input.
         let seq_stream_warns = seq_by_stream_reader(&args) && !args.stream_errors;
         // #6137: the `--seq` reader's faults the queue holds behind the documents, read as inputs.
-        let seq_faults_warn =
-            args.seq && !args.null_input && seq_faults_queued(&args, uses_input_builtins);
+        // Under `-n` there is no main loop to pop one.
+        let seq_faults_warn = !args.null_input && seq_faults_queued(&args, uses_input_builtins);
         if uses_input_builtins {
             // Seed `input`/`inputs`/`input_line_number`'s shared queue
             // (#723) with every document `get_inputs` just read -- under
@@ -7532,9 +7532,13 @@ fn get_inputs(
 /// under `-n`, and for a program that reads `input`/`inputs` without `-s` (#6137). jq's `input`
 /// raises a fault it reads as an error, and its main loop prints one it pops as ignored and reads
 /// on, so the records after a fault pair with the main loop as they do in jq. `-s` reads the whole
-/// stream before the program runs, warning as it goes.
+/// stream before the program runs, warning as it goes. Only a `--seq` stream read as JSON texts
+/// has the reader: `-R` and `--input-dsv` take over from it.
 fn seq_faults_queued(args: &JqCommand, track_eof: bool) -> bool {
-    args.null_input || (track_eof && !args.slurp)
+    args.seq
+        && !args.raw_input
+        && args.input_dsv.is_none()
+        && (args.null_input || (track_eof && !args.slurp))
 }
 
 /// The `--seq` reader's faults ([`crate::jq_seq_reader::walk_stream_collecting`]) as the parse

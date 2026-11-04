@@ -51,6 +51,28 @@ fn test_seq_input_raises_the_readers_parse_errors_without_null_input_6137() -> R
     Ok(())
 }
 
+/// `-e` judges the last output, past a fault the main loop skipped or `input` raised.
+#[test]
+fn test_seq_input_exit_status_past_a_fault_6137() -> Result<()> {
+    /// `(stdin, filter, stdout, stderr, exit status)`.
+    const EXIT_ROWS: &[(&str, &str, &str, &str, i32)] = &[
+        ("\x1e1\n\x1e[1,]\n\x1e2\n\x1e3\n", "[.,input] | .[1] > 5", "\x1efalse\n", "jq: error (at <stdin>:2): Expected another array element at line 2, column 5 (need RS to resync)\n", 1),
+        ("\x1e1\n\x1e2\n\x1e[1,]\n", "[.,input] | .[1] == 2", "\x1etrue\n", "jq: ignoring parse error: Expected another array element at line 3, column 5 (need RS to resync)\n", 0),
+        ("\x1e1\n\x1e[1,]\n\x1e2\n", "if . == 1 then true else input end", "\x1etrue\n", "jq: ignoring parse error: Expected another array element at line 2, column 5 (need RS to resync)\njq: error (at <stdin>:3): break\n", 5),
+        ("\x1e1\n\x1e[1,]\n\x1e2\n", "input_line_number == 3", "\x1efalse\n\x1etrue\n", "jq: ignoring parse error: Expected another array element at line 2, column 5 (need RS to resync)\n", 0),
+    ];
+    for (stdin, filter, stdout, stderr, code) in EXIT_ROWS {
+        let args = ["-ce", "--seq", filter];
+        let (out, err, status) = run_jq_full(&args, Some(stdin))?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), status),
+            (*stdout, *stderr, *code),
+            "{args:?} {stdin:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The fault names the file it is in, and `input_filename` the file of the value read after it.
 #[test]
 fn test_seq_input_names_the_file_of_a_fault_6137() -> Result<()> {
