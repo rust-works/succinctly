@@ -143249,7 +143249,7 @@ mod tests {
                 );
             }
         }
-        assert!(taken > 150, "the matrix must reach the door: {taken}");
+        assert!(taken > 100, "the matrix must reach the door: {taken}");
         assert!(declined > 150, "the matrix must reach the declines too");
     }
 

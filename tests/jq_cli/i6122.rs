@@ -11,7 +11,7 @@
 
 use anyhow::Result;
 
-use crate::run_jq_full;
+use crate::{run_jq_full, run_jq_stdin_streams};
 
 const DOC: &str = r#"{"a":1,"arr":[1,2,3,4],"o":{"p":3,"q":"s"},"s":"abca","n":null}"#;
 
@@ -111,5 +111,219 @@ fn the_update_is_taken_once_per_input_6122() -> Result<()> {
     let line =
         "{\"a\":1,\"arr\":[2,4,6,8],\"o\":{\"p\":3,\"q\":\"s\"},\"s\":\"abca\",\"n\":null}\n";
     assert_eq!(stdout, format!("{line}{line}"));
+    Ok(())
+}
+
+// `map(.a)`, `map(.a.b)` and `map(.[n])` over an owned array are answered from the tree, not through
+// the reindex bridge (`.users |= map(.age)` was 0.84x of jq 1.7.1 on a 7 MB document). The answer must
+// be the one the bridge gave, and a step that raises must still raise the bridge's error. Every row
+// was captured from jq 1.7.1 (`/usr/bin/jq -c`).
+
+/// (input, filter, jq 1.7.1's `-c` output).
+const ANSWERED: &[(&str, &str, &str)] = &[
+    (
+        r#"{"users":[{"age":1,"n":"a"},{"age":2,"n":"b"},{"n":"c"},null]}"#,
+        r#".users |= map(.age)"#,
+        r#"{"users":[1,2,null,null]}
+"#,
+    ),
+    (
+        r#"{"users":[{"age":1,"n":"a"},{"age":2,"n":"b"},{"n":"c"},null]}"#,
+        r#".users |= map(.n)"#,
+        r#"{"users":["a","b","c",null]}
+"#,
+    ),
+    (
+        r#"{"a":{"b":[{"c":1},{"c":[2,3]},{"c":{"d":4}}]},"z":9}"#,
+        r#".a.b |= map(.c)"#,
+        r#"{"a":{"b":[1,[2,3],{"d":4}]},"z":9}
+"#,
+    ),
+    (
+        r#"{"a":{"b":[{"c":{"d":1}},{"c":{"d":[5]}},{"c":null},{}]}}"#,
+        r#".a.b |= map(.c.d)"#,
+        r#"{"a":{"b":[1,[5],null,null]}}
+"#,
+    ),
+    (
+        r#"{"a":{"b":[{"c":{"d":1}},{"c":{"d":[5]}},{"c":null},{}]}}"#,
+        r#".a.b |= map(.c | .d)"#,
+        r#"{"a":{"b":[1,[5],null,null]}}
+"#,
+    ),
+    (
+        r#"{"u":[[1,2,3],[4],[],null]}"#,
+        r#".u |= map(.[0])"#,
+        r#"{"u":[1,4,null,null]}
+"#,
+    ),
+    (
+        r#"{"u":[[1,2,3],[4],[],null]}"#,
+        r#".u |= map(.[-1])"#,
+        r#"{"u":[3,4,null,null]}
+"#,
+    ),
+    (
+        r#"{"u":[[1,2,3],[4],[],null]}"#,
+        r#".u |= map(.[-4])"#,
+        r#"{"u":[null,null,null,null]}
+"#,
+    ),
+    (
+        r#"{"u":[[[1,2],[3]],[[4]],[[]]]}"#,
+        r#".u |= map(.[0][0])"#,
+        r#"{"u":[1,4,null]}
+"#,
+    ),
+    (
+        r#"{"u":[{"a":100000000000000000000},{"a":1.50},{"a":-0},{"a":0.10}]}"#,
+        r#".u |= map(.a)"#,
+        r#"{"u":[100000000000000000000,1.50,-0,0.10]}
+"#,
+    ),
+    (
+        r#"{"u":[{"a":1,"a":2},{"b":1,"b":null,"b":3}]}"#,
+        r#".u |= map(.a)"#,
+        r#"{"u":[2,null]}
+"#,
+    ),
+    (
+        r#"{"u":[{"a":{"p":1}},{"a":{"p":2}}]}"#,
+        r#".u |= map(.a)"#,
+        r#"{"u":[{"p":1},{"p":2}]}
+"#,
+    ),
+    (
+        r#"{"u":[{"a":1},{"a":2}],"v":3}"#,
+        r#".u |= map(.a) | .v += 1"#,
+        r#"{"u":[1,2],"v":4}
+"#,
+    ),
+    (
+        r#"{"u":[{"a":1},{"a":2}]}"#,
+        r#". as $d | .u |= map(.a) | [., $d]"#,
+        r#"[{"u":[1,2]},{"u":[{"a":1},{"a":2}]}]
+"#,
+    ),
+    (
+        r#"{"u":[{"a":1},{"a":2}]}"#,
+        r#".u as $x | .u |= map(.a) | [., $x]"#,
+        r#"[{"u":[1,2]},[{"a":1},{"a":2}]]
+"#,
+    ),
+    (
+        r#"[[{"a":1}],[{"a":2}]]"#,
+        r#".[] |= map(.a)"#,
+        r#"[[1],[2]]
+"#,
+    ),
+    (
+        r#"{"u":[{"a":"é\u0000x"},{"a":"\ud83d\ude00"}]}"#,
+        r#".u |= map(.a)"#,
+        r#"{"u":["é\u0000x","😀"]}
+"#,
+    ),
+    (
+        r#"{"u":[{"a":1},2]}"#,
+        r#".u |= map(.a?)"#,
+        r#"{"u":[1]}
+"#,
+    ),
+    (
+        r#"{"u":[{"a":1},2]}"#,
+        r#"try (.u |= map(.a)) catch "caught""#,
+        r#""caught"
+"#,
+    ),
+    (r#"{"u":[{"a":1},2]}"#, r#"(.u |= map(.a))?"#, r#""#),
+    (
+        r#"{"u":{"x":{"a":1},"y":{"a":2}}}"#,
+        r#".u |= map(.a)"#,
+        r#"{"u":[1,2]}
+"#,
+    ),
+    (
+        r#"{"u":[]}"#,
+        r#".u |= map(.a)"#,
+        r#"{"u":[]}
+"#,
+    ),
+];
+
+/// (input, filter, jq 1.7.1's stderr).
+const RAISED: &[(&str, &str, &str)] = &[
+    (
+        r#"{"u":[1,2]}"#,
+        r#".u |= map(.a)"#,
+        r#"jq: error (at <stdin>:0): Cannot index number with string "a"
+"#,
+    ),
+    (
+        r#"{"u":["x"]}"#,
+        r#".u |= map(.a)"#,
+        r#"jq: error (at <stdin>:0): Cannot index string with string "a"
+"#,
+    ),
+    (
+        r#"{"u":[true]}"#,
+        r#".u |= map(.a)"#,
+        r#"jq: error (at <stdin>:0): Cannot index boolean with string "a"
+"#,
+    ),
+    (
+        r#"{"u":[[1]]}"#,
+        r#".u |= map(.a)"#,
+        r#"jq: error (at <stdin>:0): Cannot index array with string "a"
+"#,
+    ),
+    (
+        r#"{"u":[{"a":1}]}"#,
+        r#".u |= map(.[0])"#,
+        r#"jq: error (at <stdin>:0): Cannot index object with number
+"#,
+    ),
+    (
+        r#"{"u":[{"a":1},2]}"#,
+        r#".u |= map(.a)"#,
+        r#"jq: error (at <stdin>:0): Cannot index number with string "a"
+"#,
+    ),
+    (
+        r#"{"u":7}"#,
+        r#".u |= map(.a)"#,
+        r#"jq: error (at <stdin>:0): Cannot iterate over number (7)
+"#,
+    ),
+    (
+        r#"{"u":[{"a":1},{"a":2}]}"#,
+        r#"(.u, .u) |= map(.a)"#,
+        r#"jq: error (at <stdin>:0): Cannot index number with string "a"
+"#,
+    ),
+];
+
+#[test]
+fn test_map_projection_in_an_update_answers_as_jq_does_6122() -> Result<()> {
+    for (input, filter, expected) in ANSWERED {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, input, &["-c"])?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*expected, 0),
+            "{filter} over {input}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_map_projection_in_an_update_raises_what_jq_raises_6122() -> Result<()> {
+    for (input, filter, expected) in RAISED {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, input, &["-c"])?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("", *expected, 5),
+            "{filter} over {input}"
+        );
+    }
     Ok(())
 }
