@@ -28333,8 +28333,20 @@ fn single_minus_option_run(rest: &[char]) -> Option<OptionRun> {
         return None;
     }
     let first = run.iter().position(|&c| c == '-')?;
-    let on: String = run[..first].iter().collect();
-    let off: String = run[first..].iter().filter(|&&c| c != '-').collect();
+    // Each letter once, and a letter named on and then off is off: Oniguruma applies the run in
+    // order, while the `regex` crate refuses a repeated letter or reads it differently.
+    let mut off = String::new();
+    for &c in run[first..].iter().filter(|&&c| c != '-') {
+        if !off.contains(c) {
+            off.push(c);
+        }
+    }
+    let mut on = String::new();
+    for &c in &run[..first] {
+        if !on.contains(c) && !off.contains(c) {
+            on.push(c);
+        }
+    }
     let flags = if off.is_empty() {
         on.clone()
     } else {
@@ -28782,6 +28794,16 @@ fn translate_posix_brackets_scan(
         } else if c == '^' && at_start {
             // A leading `^` keeps the position "first".
             out.push(c);
+            i += 1;
+            continue;
+        } else if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
+            && extended_in.last().copied().unwrap_or(false)
+        {
+            // Oniguruma's extended mode ignores blanks outside a class only; the `regex` crate
+            // drops them inside one as well (`(?x:[a b])+` lost its space, #6133 review).
+            out.push_str(&format!("\\x{:02x}", c as u32));
+            changed = true;
+            at_start = false;
             i += 1;
             continue;
         } else {

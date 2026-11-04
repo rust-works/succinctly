@@ -91,3 +91,51 @@ fn a_repeat_after_an_empty_option_group_is_refused_6133() -> Result<()> {
     }
     Ok(())
 }
+
+/// Review finding: the `regex` crate drops blanks inside a class under `x`, Oniguruma keeps them,
+/// and the rewritten `(?x-:` run reached that route (`(?x:[a b])+` was already wrong). Rows from
+/// jq 1.7.1.
+#[test]
+fn a_blank_in_a_class_stays_literal_under_the_extended_mode_6133() -> Result<()> {
+    for (filter, expected) in [
+        (
+            r#""a b\nA B" | [match("(?x-:[a b])+";"g") | .string]"#,
+            r#"["a b"," "]"#,
+        ),
+        (
+            r#""a b\nA B" | [match("(?x:[a b])+";"g") | .string]"#,
+            r#"["a b"," "]"#,
+        ),
+        (
+            r#""a b\nA B" | [match("(?x)[a b]+";"g") | .string]"#,
+            r#"["a b"," "]"#,
+        ),
+        (r#""a b" | [match("[a b]+";"gx") | .string]"#, r#"["a b"]"#),
+        (r#""a b" | test("(?-x)[a b]+$")"#, "true"),
+        // Outside a class the blank is still ignored.
+        (r#""ab" | test("(?x-:a b)")"#, "true"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout.trim_end(), expected, "{filter}: stderr={stderr:?}");
+        assert_eq!(code, 0, "{filter}");
+    }
+    Ok(())
+}
+
+/// A letter repeated in a run, or named on and then off, is applied in order as Oniguruma does.
+#[test]
+fn a_repeated_letter_in_a_dash_run_is_applied_in_order_6133() -> Result<()> {
+    for (filter, expected) in [
+        (r#""aAbB" | [match("((?i-ss-)a)B";"g") | .string]"#, "[]"),
+        (
+            r#""a b #c\nA" | [match("(?x)(a (?-x-x) b) #c\nA";"g") | .string]"#,
+            "[]",
+        ),
+        (r#""A" | test("(?i-i)a")"#, "false"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout.trim_end(), expected, "{filter}: stderr={stderr:?}");
+        assert_eq!(code, 0, "{filter}");
+    }
+    Ok(())
+}
