@@ -29501,6 +29501,18 @@ fn build_regex_uncached<S: EvalSemantics>(
         return Err(refusal);
     }
 
+    // #6106: Oniguruma leaves a greedy loop at the first iteration that matches nothing, where the
+    // `regex` crate tries the body's later ways first (see `onig_loop`). Not under `l`: the span of
+    // the longest match does not depend on that order, and `fancy-regex`'s longest mode refuses the
+    // lazy repeat the rewrite writes, which would leave `l` a no-op. The pattern as written is kept
+    // for when the copies the rewrite makes outgrow an engine's size or nesting limit.
+    let mut as_written = None;
+    if S::TAG != EvalTag::Yq && !longest {
+        if let Some(rewritten) = super::onig_loop::rewrite(&pattern) {
+            as_written = Some(core::mem::replace(&mut pattern, rewritten));
+        }
+    }
+
     // jq's un-flagged `$` matches at the absolute end of the string, or
     // immediately before a final `\n` (Perl's `\Z` semantics) —
     // unlike Rust regex's un-flagged `$`, which only matches the absolute
@@ -29526,7 +29538,12 @@ fn build_regex_uncached<S: EvalSemantics>(
         // old route whole: the flags are not independent (`ln` is the longest *non-empty* match
         // anywhere), so fixing `n` alone would change which wrong answer it gives.
         if modes.longest || modes.not_empty {
-            if let Some(re) = build_fancy_regex_with::<S>(&pattern, modes) {
+            let built = build_fancy_regex_with::<S>(&pattern, modes).or_else(|| {
+                as_written
+                    .as_deref()
+                    .and_then(|written| build_fancy_regex_with::<S>(written, modes))
+            });
+            if let Some(re) = built {
                 // #6085: an `l` search with `\K` measures a match from where its attempt began.
                 // Under the `x` flag the closing parenthesis follows a newline, so that a `#`
                 // comment at the end of the pattern cannot swallow it; an inline `(?x)`, a switch
@@ -29569,7 +29586,9 @@ fn build_regex_uncached<S: EvalSemantics>(
         && needs_trailing_nl_check
         && (pattern_has_escape_z(&pattern) || pattern_has_interior_dollar(&pattern))
     {
-        if let Some(re) = build_fancy_regex::<S>(&pattern) {
+        let built = build_fancy_regex::<S>(&pattern)
+            .or_else(|| as_written.as_deref().and_then(build_fancy_regex::<S>));
+        if let Some(re) = built {
             return Ok(JqRegex {
                 engine: RegexEngine::Fancy(re),
                 needs_trailing_nl_check: false,
@@ -29582,7 +29601,14 @@ fn build_regex_uncached<S: EvalSemantics>(
         }
     }
 
-    match regex::Regex::new(&pattern) {
+    let compiled = match regex::Regex::new(&pattern) {
+        Err(_) if as_written.is_some() => {
+            pattern = as_written.take().unwrap_or_default();
+            regex::Regex::new(&pattern)
+        }
+        compiled => compiled,
+    };
+    match compiled {
         Ok(re) => Ok(JqRegex {
             engine: RegexEngine::Std(re),
             needs_trailing_nl_check,
@@ -133925,6 +133951,35 @@ mod tests {
         query!(br#""abc""#, r#"match("[0-9]+"; "")?"#,
             QueryResult::None => {}
         );
+    }
+
+    /// #6106: a loop rewritten for Oniguruma's empty-iteration exit is what the `regex` crate
+    /// compiles, and a rewrite the crate refuses (here, nested past its limit) falls back to the
+    /// pattern as written instead of becoming an error.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn build_regex_falls_back_to_the_pattern_as_written_6106() {
+        let compiled = |pattern: &str| match build_regex_uncached::<JqSemantics>(pattern, None) {
+            Ok(JqRegex {
+                engine: RegexEngine::Std(re),
+                ..
+            }) => re.as_str().to_string(),
+            _ => panic!("{pattern} compiles with the regex crate"),
+        };
+        assert_eq!(
+            compiled("(?:b*|a)+"),
+            super::super::onig_loop::rewrite("(?:b*|a)+").unwrap()
+        );
+        let nested =
+            |depth: usize| format!("{}(?:b*|a)+{}", "(?:".repeat(depth), ")".repeat(depth));
+        let depth = (200..260)
+            .find(|&d| {
+                super::super::onig_loop::rewrite(&nested(d))
+                    .is_some_and(|rewritten| regex::Regex::new(&rewritten).is_err())
+            })
+            .expect("some depth nests the rewrite past the crate's limit");
+        assert!(regex::Regex::new(&nested(depth)).is_ok());
+        assert_eq!(compiled(&nested(depth)), nested(depth));
     }
 
     /// #5531: `build_regex` keeps the result for a `(mode, pattern, flags)` it has built twice and

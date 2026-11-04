@@ -7549,6 +7549,7 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
 - **A group that iterates over the empty string is read differently, with or without a flag.**
   Oniguruma stops a loop after an iteration that matched nothing and keeps that iteration: `"a" | match("(a*)*")` has `[1,0,""]` for group 1, and `"bcba" | match("b(c|(|.))*")` is `"bc"`.
   The `regex` crate keeps the last non-empty iteration (`[0,1,"a"]`) and `"bcba"`.
+  Without the capture groups the match agrees: `"bcba" | match("b(?:c|(?:|.))*")` is `"bc"` in both since [#6106](#a-loop-ends-at-an-iteration-that-matches-nothing-6106), which leaves a body with a group as written.
   `fancy-regex` reports the empty iteration as jq does for the captures, so `"a" | match("(a*)*";"n")` now agrees, but it backtracks out of an empty iteration to a longer match, so `"bcba" | match("b(c|(|.))*";"n")` is still `"bcba"`.
   A repeated group with an empty alternative and `n` is another shape: `"ab" | match("(((b)|(|a))){2}";"n")` is `"ab"` in jq, `"a"` here and `"b"` before.
   This predates `l` and `n`, which only move a pattern to the other route.
@@ -7600,6 +7601,34 @@ Neither engine in the stack ends a loop this way.
 A post-processing fix, replacing the capture with an empty one at the end of the last iteration, is unsound.
 Where the loop ends depends on backtracking from the rest of the pattern: `"aab" | match("(a*)*ab").captures[0]` is `[1,0,""]` in jq, with the loop giving back a character the rest of the pattern needs.
 The divergence is recorded, not accepted under [ADR-0018](../../adrs/adr-0018.md) rule 4(d), whose candidates-table bar this entry does not claim to meet.
+The rewrite of the next section ends a loop at its empty iteration for the match, and leaves a body with a capture group as written, so this entry is unchanged by it.
+
+## A loop ends at an iteration that matches nothing (#6106)
+
+Oniguruma tries a greedy repeat's body one way at a time, and when the way it is trying matches nothing, its empty-iteration check ends the loop: the rest of the pattern runs there, and the body's later ways are tried only if that fails.
+The `regex` crate drops an empty iteration and tries the body's later ways first, so a body whose empty way comes before a consuming one matched longer: `"ba" | match("(?:b*|a)+")` is `"b"` in jq 1.7.1 and was `"ba"` here, and `"foo-bar" | gsub("(?:\\w*|-)+"; "X")` is `"XX-XX"` in jq and was `"XX"`.
+Both now answer as jq does.
+The empty way ends the loop before its minimum count too: `"bab" | [match("(?:b*|a){2,}"; "g") | .string]` is `["b","","b",""]`.
+So does a bounded repeat's, where the `regex` crate went on to the next copy's ways: `"bab" | [match("(?:(?:b|c)||[ab]){2}"; "gn") | .string]` is `["b","ab"]` in jq and was `["b","a","b"]`.
+
+The pattern is rewritten before either engine sees it (`src/jq/onig_loop.rs`).
+A body's ways to match, in the order a backtracking engine tries them, are the consuming ways before its first empty way (`A`), that empty way, and the consuming ways after it (`B`), and Oniguruma's loop is `A*(?:B A*)*?`, in which no iteration is empty.
+Only a loop with a `B` is rewritten, since without one the two engines agree.
+The rewrite applies to `test`, `match`, `capture`, `scan`, `split`, `splits`, `sub` and `gsub` alike, and never in yq mode, whose Go `regexp` has no empty-iteration check (`"ba" | match("(?:b*|a)+")` is `"ba"` in yq v4.53.3).
+A differential against jq 1.7.1 over 160,000 cases (5,000 generated capture-free patterns, each on strings over `{a,b,c}` under the flags `g`, `gn`, `gi` and none) found 614 cases fixed, none broken and none left.
+
+These keep their loop as written, and still match longer than jq where the shape occurs:
+
+- **A body with a capture group:** `"ba" | match("(b*|a)+")` is `"b"` in jq and `"ba"` here.
+  An empty iteration also sets the group in Oniguruma ([#6069](#a-capture-under-an-unbounded-repeat-keeps-its-last-non-empty-iteration-6069)).
+- **A body with a zero-width assertion** (`^`, `$`, `\b`, `\A`, `\z`): its empty way depends on where it stands, which the rewrite does not express.
+- **A body with a flag switch** (`(?i)` inside it): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and `["ba",""]` here.
+  The switch reaches every later way of the group, which the rewrite would move out of its reach.
+  A flag group (`(?i:b*)`) is rewritten.
+- **A pattern the `regex` crate's parser cannot read** (lookaround, a backreference, `\K`, `\G`), which goes to `fancy-regex` unrewritten: `"ba" | match("(?:b*|a)+(?=)")` is `"b"` in jq and `"ba"` here.
+- **A lazy repeat that must run twice or more:** `"bab" | [match("(?:(?:b|c)||[ab]){2,3}?"; "gn") | .string]` is `["b","ab"]` in jq and `["b","a","b"]` here.
+- **The `l` flag:** the longest match's span does not depend on the order the ways are tried in, and `fancy-regex`'s longest mode refuses the lazy repeat the rewrite writes.
+- **A pattern whose rewrite would grow past sixteen times its length and a kilobyte** (nested loops copy their bodies), or past the `regex` crate's size or nesting limit.
 
 ## `$` before a final newline (#5572)
 
