@@ -53,3 +53,27 @@ fn test_a_stacked_repeat_on_a_fancy_routed_pattern_matches_as_jq_does_6165() -> 
     }
     Ok(())
 }
+
+/// Oniguruma mode gives a repeat after a comment a target, where jq refuses it
+/// (`target of repeat operator is invalid`), so a pattern with a comment keeps the default
+/// dialect's refusal even when it also holds a stacked repeat.
+#[test]
+fn test_a_comment_then_a_repeat_stays_refused_6165() -> Result<()> {
+    for pattern in [
+        r"(?#)?",
+        r"(?#)*",
+        r"(?#c)+a",
+        r"(?:(?#)?|b)",
+        r"(?=b)(?#)?b",
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-nc", "--arg", "p", pattern, r#""bab" | test($p)"#], None)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "{pattern}: stderr {stderr}"
+        );
+        assert!(stderr.contains("invalid regex"), "{pattern}: {stderr}");
+    }
+    Ok(())
+}
