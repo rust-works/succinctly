@@ -56,3 +56,34 @@ fn a_letter_repeated_in_a_run_is_applied_once_6183() -> Result<()> {
     }
     Ok(())
 }
+
+/// A `)` in a class, or in a `#` comment under `x`, before the option run does not end the body.
+#[test]
+fn a_paren_in_a_class_or_comment_does_not_end_the_wrapped_body_6183() -> Result<()> {
+    for (filter, expected) in [
+        (r#"")ab" | [match("(?=[)](?i)a)[)]aB";"g")|.string]"#, "[]"),
+        (
+            r#""xab" | [match("(?=[^)](?i)a)[^)]aB";"g")|.string]"#,
+            "[]",
+        ),
+        (r#"")abb" | [match("(?<=[)](?i)a)bB";"g")|.string]"#, "[]"),
+        (r#"")abb" | [match("(?>[)](?i)a)bB";"g")|.string]"#, "[]"),
+        (
+            r#""ab" | [match("(?x)(?=a # )\n(?i)b)aB";"g")|.string]"#,
+            "[]",
+        ),
+        (
+            r#""abC" | [match("(?x)(?<=a # )\n(?i)b)c";"g")|.string]"#,
+            "[]",
+        ),
+        (
+            r#""aab" | [match("(?=[[:alpha:])](?i)a)aB";"g")|.string]"#,
+            "[]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout.trim_end(), expected, "{filter}: stderr={stderr:?}");
+        assert_eq!(code, 0, "{filter}");
+    }
+    Ok(())
+}

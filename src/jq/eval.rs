@@ -28324,15 +28324,41 @@ fn scoped_group_head(flags: &[char]) -> usize {
 }
 
 /// Whether the group body `body` (the text after a group's head, up to and past its `)`) holds an
-/// inline option run `(?i)` or `(?-x)`, in a nested group too. Over-reports on a `)` inside a
-/// class, which only wraps a body that needed no wrapping.
+/// inline option run `(?i)` or `(?-x)`, in a nested group too. A `)` in a class, and in a `#`
+/// comment where `extended` is on, does not close a group; a `(?x)` inside the body that turns the
+/// comments on is not followed, which only wraps a body that needed no wrapping or misses one.
 #[cfg(feature = "regex")]
-fn holds_inline_option_run(body: &[char]) -> bool {
+fn holds_inline_option_run(body: &[char], extended: bool) -> bool {
     let mut depth = 1usize;
     let mut j = 0;
     while j < body.len() {
         match body[j] {
             '\\' => j += 1,
+            '[' => {
+                // A class: `]` first is a literal, `[:alpha:]` is a POSIX bracket, `\]` is escaped.
+                j += 1;
+                if body.get(j) == Some(&'^') {
+                    j += 1;
+                }
+                if body.get(j) == Some(&']') {
+                    j += 1;
+                }
+                while j < body.len() && body[j] != ']' {
+                    if body[j] == '\\' {
+                        j += 1;
+                    } else if body[j] == '[' && body.get(j + 1) == Some(&':') {
+                        if let Some(n) = body[j + 2..].windows(2).position(|w| w == [':', ']']) {
+                            j += n + 3;
+                        }
+                    }
+                    j += 1;
+                }
+            }
+            '#' if extended => {
+                while j < body.len() && body[j] != '\n' {
+                    j += 1;
+                }
+            }
             '(' => {
                 if body.get(j + 1) == Some(&'?') {
                     let run = body[j + 2..]
@@ -28801,7 +28827,7 @@ fn translate_posix_brackets_scan(
                             // `)` in `fancy-regex`; Oniguruma ends it there, as a group does.
                             let head = scoped_group_head(flags);
                             let body = &chars[(i + 2 + head).min(chars.len())..];
-                            if head > 0 && holds_inline_option_run(body) {
+                            if head > 0 && holds_inline_option_run(body, outer) {
                                 out.extend(&chars[i..i + 2 + head]);
                                 out.push_str("(?:");
                                 changed = true;
