@@ -49,7 +49,10 @@ fn test_a_repeat_with_only_a_comment_before_it_stays_refused_6165() -> Result<()
     }
     for (pattern, expected) in [
         ("a(?#)?", r#"[[0,0,""],[1,1,"a"],[2,0,""],[3,0,""]]"#),
-        (r"(?:\Ka)(?#c)**", r#"[[0,0,""],[1,1,"a"],[2,0,""],[3,0,""]]"#),
+        (
+            r"(?:\Ka)(?#c)**",
+            r#"[[0,0,""],[1,1,"a"],[2,0,""],[3,0,""]]"#,
+        ),
     ] {
         let (stdout, stderr, code) = matches(pattern)?;
         assert_eq!(code, 0, "{pattern}: stderr={stderr:?}");
