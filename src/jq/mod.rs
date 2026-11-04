@@ -94,6 +94,8 @@ mod lazy;
 mod local_zone;
 mod locale_time;
 mod math;
+#[cfg(feature = "regex")]
+mod onig_loop;
 mod parse_message;
 mod parser;
 // #5223: the register-carrying path-mode interpreter, reachable only from
