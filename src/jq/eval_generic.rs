@@ -14856,6 +14856,14 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             cursor.map_or(GenericResult::One(value), GenericResult::OneCursor)
         }
 
+        // #6231: any other slice of an array is read where it stands: the elements of its range,
+        // by index, not the whole array materialized by the wildcard bridge below and indexed
+        // again. `slice_one_generic` is what `E[S:T]` has answered with since #4287, so the two
+        // spellings of one slice agree, in both modes.
+        Expr::Slice { start, end, .. } if value.as_array().is_some() => {
+            slice_one_generic::<S, V>(value, *start, *end, optional)
+        }
+
         Expr::Field(name) => {
             // #2470 (yq mode, read-only context only): see
             // `eval::yq_absent_key_read_is_empty` -- the same rule the eager
