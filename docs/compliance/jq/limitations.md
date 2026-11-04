@@ -7469,6 +7469,12 @@ Three differences remain.
   `fancy-regex` matches them, correctly.
   Oniguruma's rule is not a simple one (`(?<=a|b+)` and `(?<!a+)` are accepted), and reproducing it would mean reproducing its lookbehind compiler.
   Pinned by `test_lookbehind_oniguruma_refuses_is_answered_5502`.
+- **A `\K` that ends a look-behind match ends the global search here; jq's never ends.**
+  `"cab" | [match("(?<=a\\Kb)";"g")]` never answers in jq 1.7.1: the match is `[2,3)`, jq resumes at its end (3), and the look-behind finds the same match from there, so the search pushes it for ever and grows without bound.
+  Matching that would take the host process down, so a match that begins before the offset the search resumed from and ends at it is skipped, and the search moves on one character: the answer is `["b"]` ([#6169](https://github.com/rust-works/succinctly/issues/6169)).
+  Over 2,538 generated `\K` patterns (look-behinds, look-aheads and plain groups, on three strings), jq 1.7.1 loops on 113 and answers or refuses the rest; those it answers are identical here, and none loops here.
+  The same patterns with a variable-length body after the `\K` (`(?<=a\K.?)b?`, `(?<=\K.*)`) are refused by jq with `invalid pattern in look-behind` and answered here, as in the paragraph above.
+  Pinned by `tests/jq_cli/i6169.rs`.
 - **Oniguruma syntax outside the checked list stays refused.**
   The second engine takes only constructs and escapes whose meaning there was compared with jq's.
   `\g<name>` and `\g'name'`, the absence operator `(?~…)`, `\X` and `\y` keep the `invalid regex` error.
