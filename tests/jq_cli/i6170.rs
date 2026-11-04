@@ -78,3 +78,40 @@ fn test_an_interval_that_has_a_target_or_is_literal_still_answers_6170() -> Resu
     }
     Ok(())
 }
+
+/// A comment between an assertion and its repeat leaves the repeat on the assertion, which jq
+/// refuses as an invalid target (`^(?#)*`), so the scan keeps "an assertion stood before this"
+/// across the comment as well.
+#[test]
+fn test_a_repeat_after_an_assertion_and_a_comment_is_still_refused_6170() -> Result<()> {
+    for pattern in [
+        r"^(?#)*",
+        r"^(?#){2}",
+        r"\b(?#){2}",
+        r"$(?#)+",
+        r"(?:^(?#)?)",
+        r"a|^(?#){1}",
+        r"\K(?#){2}",
+        r"(?#)\b{2}",
+    ] {
+        let (stdout, stderr, code) = run(pattern, "")?;
+        assert_eq!((stdout.as_str(), code), ("", 5), "{pattern:?}: {stderr}");
+        assert!(
+            stderr.contains("invalid regex: target of repeat operator is invalid"),
+            "{pattern:?}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// A star, plus or question mark with nothing but a comment before it is refused too (by the
+/// `regex` crate's own parse, in its words).
+#[test]
+fn test_a_star_after_only_a_comment_is_refused_6170() -> Result<()> {
+    for pattern in [r"(?#)*a", r"(?#)+a", r"(?#)?a"] {
+        let (stdout, stderr, code) = run(pattern, "")?;
+        assert_eq!((stdout.as_str(), code), ("", 5), "{pattern:?}: {stderr}");
+        assert!(stderr.contains("invalid regex"), "{pattern:?}: {stderr}");
+    }
+    Ok(())
+}
