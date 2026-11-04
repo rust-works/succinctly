@@ -7544,6 +7544,12 @@ It is an atomic group, as in Oniguruma, and is refused inside a look-behind with
 Over 85,259 strings drawn from every break class and 800,000 random strings, every cluster is the same as jq 1.7.1's except where a character's class changed after the Unicode tables jq's Oniguruma carries.
 The characters seen are U+1B44 and U+A9C0 (spacing marks before Unicode 15.1, extending marks since), and the Unicode 16 additions such as U+16D63, U+16124 and U+1F8BA.
 Around them the crate follows its own tables, so a cluster that holds one can split differently from jq.
+That holds for a search that starts `\X` on a cluster boundary, which is every plain `\X` scan.
+A pattern whose first attempt fails and is retried one code point later (`\X\X`, `\Xa`, `.\X`, `\X\w`) starts `\X` inside a cluster, and there jq's `\X` reads the characters to its left where this one starts a fresh cluster.
+They differ in two shapes: a regional-indicator run (jq takes one indicator at the second of a pair, this takes the pair: `"🇦🇧🇨a" | match("\\Xa")` is `[2,2]` in jq and `[1,3]` here) and an emoji joined by ZWJ (jq takes the ZWJ and the emoji after it when it starts at the ZWJ, this takes the ZWJ alone).
+Closing them needs a look-behind of unbounded width, which neither engine has.
+jq also ends a cluster after 4095 code points of extending marks, which this does not.
+A very long cluster (tens of thousands of marks) followed by a pattern that fails after `\X` is quadratic here, as the same shape is for any atomic group on the second engine.
 Pinned by `tests/jq_cli/i6220.rs`.
 
 ### A group repeated `{0}` keeps its capture entry (#6108)
