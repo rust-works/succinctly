@@ -5449,6 +5449,12 @@ untouched. The key is `tostring`'s text, so `==` and `unique` agree about a numb
   classes agree (equal contents dedup, different ones do not, field order matters) and the bytes
   do not. yq's key is also style-sensitive (a flow `[1]` and a block `- 1` can be two keys), which
   a value-level key cannot see.
+- **A `null`'s spelling** ([#6103](https://github.com/rust-works/succinctly/issues/6103)): yq keys a node on its text, so `~`, `null`, `Null` and an empty value are four keys, and `[~]` and `[null]` are two.
+  `unique` and `unique_by(.)` over the elements of a document keep them apart, as yq does: `printf -- '- ~\n- null\n- ~\n- 1\n- null\n' | yq unique` is `~`, `null`, `1`, and a container is keyed by the spellings of the nulls in it as well as its encoding.
+  A string with the same text is the same key, as in yq: `"~"` and `~` are one element.
+  Where the key is not a node of the document, no spelling is left to read, and `~` and `null` are one key:
+  a key computed from the element (`unique_by(.a)` on `a: ~` and `a: null` has 1 element here and 2 in yq), `group_by` (`group_by(.) | length` over `~` and `null` is 1 here and 2 in yq), and an array built by the filter (`[.[] | select(. == null)] | unique | length`).
+  An anchored or aliased element has no plain spelling to read either (`- &a ~`, `- *a`, `- null` has 1 element here and 3 in yq).
 - **Alias nodes.** yq keys an alias element (`*x`) differently from the anchor's node, since its
   container key is the YAML encoding and an alias encodes as itself: `anch: [&x {p: 1}, *x, {p: 1}]`
   gives `.anch | unique | length` of `3` in yq and `1` here (`group_by(.) | length` is `2` there and
