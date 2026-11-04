@@ -67,6 +67,10 @@ fn test_a_k_ending_a_look_behind_match_ends_the_global_search_6169() -> Result<(
         (r#""cab" | [scan("(?<=a\\Kb)")]"#, r#"["b"]"#),
         (r#""cab" | gsub("(?<=a\\Kb)"; "X")"#, r#""caX""#),
         (r#""cab" | [splits("(?<=a\\Kb)")]"#, r#"["ca",""]"#),
+        // Offsets are in codepoints, past a multi-byte character.
+        (r#""éabéab" | [match("(?<=a\\Kb)";"g") | .offset]"#, "[2,5]"),
+        (r#""éab" | [match("(?<=é\\Ka)";"g") | .string]"#, r#"["a"]"#),
+        (r#""éabéab" | gsub("(?<=a\\Kb)"; "é")"#, r#""éaééaé""#),
         // The refused-in-jq look-behinds (`.?`, `.*` after the `\K`) end too.
         (
             r#""cab" | [match("(?<=a\\K.?)b?";"g") | .string]"#,
