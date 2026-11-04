@@ -63,9 +63,14 @@ A generator that emits a large computed container into a later pipe stage
 (`range([]; {}; [1]) | ...`, `while(...; . + [1]) | ...`) reaches the bridge once
 per output, and the bridge serializes and indexes the whole container each time:
 linear per output, quadratic over the run. A few stages therefore answer from the
-owned tree instead -- `length`, a leading `.field`/`.[n]`, and (#3439) `select(cond)`
+owned tree instead -- `length`, a leading `.field`/`.[n]`, (#3439) `select(cond)`
 when `cond` is a comparison/boolean over `type`, `length` of an array or object and
-navigation -- and any other stage still pays the bridge. The producing loop is not
+navigation, and (#6122) `map(.field)` / `map(.a.b)` / `map(.[n])` over an array
+(each element's steps read off the tree; an element a step would raise on, or a
+non-array, keeps the bridge) -- and any other stage still pays the bridge. The same
+`map` is what lets `.users |= map(.age)` run on the one owned copy of the document:
+it was written out as text and indexed once more, and read at 0.75x of jq 1.7.1 on a
+Ryzen 9 7950X and 0.93x on an Apple M4 Pro at 7 MB. The producing loop is not
 the cost: `range/3`'s generic loop appends to its accumulator in place once its
 consumer lets go of each value; only a consumer that *keeps* every value forces a
 copy per step, in jq as well (`/usr/bin/jq` 1.7.1: 0.16 s at 10,000 steps, 0.71 s at 20,000).

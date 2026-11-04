@@ -5620,6 +5620,12 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
         return GenericResult::Owned(count);
     }
 
+    // #6122: `map(.field)` over an owned array reads one field of each element, not the array
+    // written out and indexed again.
+    if let Some(mapped) = crate::jq::eval::eval_owned_map_projection::<S>(expr, &owned) {
+        return GenericResult::Owned(mapped);
+    }
+
     // #4053: a stage that never reads `.` needs no index over it either.
     if let Some(value) = crate::jq::eval::eval_owned_closed::<S>(expr) {
         return GenericResult::Owned(value);
@@ -42430,7 +42436,7 @@ mod tests {
     /// bridged: the bridge writes the copy out as JSON and indexes it again (`reindex_count` counts
     /// exactly that) before the update runs, a second materialization of the whole document. The
     /// shapes are the ones `eval_each_owned` answers from the tree, at the top level and collected
-    /// (`[..]`, `map(..)`). Output is compared with the bridge's, which the other arm of each pair
+    /// (`[..]`, `map(..)`), and (#6122) `map(.field)` as the update's right side. Output is compared with the bridge's, which the other arm of each pair
     /// is: an update that reads path context keeps its own route and still answers as it did. The
     /// pin must be able to fail: it does, with the two `Expr::Update` arms removed.
     #[cfg(feature = "std")]
@@ -42451,6 +42457,16 @@ mod tests {
                 r#"{"a":2,"arr":[{"x":1},{"x":2}],"o":{"p":3}}"#,
             ),
             ("[.a |= 5] | length", "1"),
+            // `map` of a static field reads each element, not the array written out and indexed.
+            (".arr |= map(.x)", r#"{"a":1,"arr":[1,2],"o":{"p":3}}"#),
+            (
+                ".arr |= (. | map(.x))",
+                r#"{"a":1,"arr":[1,2],"o":{"p":3}}"#,
+            ),
+            (
+                ".arr |= (map(.x) | length)",
+                r#"{"a":1,"arr":2,"o":{"p":3}}"#,
+            ),
             (".arr | map(.x |= .+1) | length", "2"),
             ("[.arr[] | (.x |= .+1)] | length", "2"),
         ] {

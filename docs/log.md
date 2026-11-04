@@ -2,6 +2,17 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-11-05 — The owned front doors answer `map(.field)` (issue #6122)
+
+**Sources ingested:**
+- `src/jq/eval.rs` (`eval_owned_map_projection`, `owned_state_expr_shape`) and the A/B recorded in
+  PR #6191: `.users |= map(.age)` on a 74 MB `users` document, Ryzen 9 7950X 1583 ms to 986 ms
+  (0.80x to 1.28x of jq 1.7.1) and Apple M4 Pro 820 ms to 423 ms (0.92x to 1.79x)
+
+**Pages updated:**
+- [reference/jq-evaluator.md](reference/jq-evaluator.md) — the list of stages that answer from the
+  owned tree gains `map` of static steps, and says what it does for `|=`
+
 ## 2026-11-02 — Audit of docs/plan/: archive finished plans in place (issue #5847)
 
 **Sources ingested:**
