@@ -14621,6 +14621,8 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     &yq_literal_index_text::<S>(*idx, key.as_ref()).unwrap_or_default(),
                 ) {
                     Ok(Some(c)) => GenericResult::OneCursor(c),
+                    // #6155: a key that misses finds no node under yq's read-only rule.
+                    Ok(None) if yq_absent_key_read_is_empty::<S>() => GenericResult::None,
                     Ok(None) => GenericResult::Owned(OwnedValue::Null),
                     Err(err) => GenericResult::Error(err),
                 }
@@ -24174,7 +24176,12 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
             // #2459: yq mode only, the `Object` half of this condition --
             // see `yq_numeric_index_on_object_is_null`.
             } else if target.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>() {
-                GenericResult::Owned(OwnedValue::Null)
+                // #6155: a key that misses finds no node under yq's read-only rule.
+                if yq_absent_key_read_is_empty::<S>() {
+                    GenericResult::None
+                } else {
+                    GenericResult::Owned(OwnedValue::Null)
+                }
             } else if target_is_null() {
                 // #4275 (yq): `null` is an empty array for a negative index.
                 if let Some(e) = idx.and_then(|i| yq_negative_index_check::<S>(i, i, 0)) {
