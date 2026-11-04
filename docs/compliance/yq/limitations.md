@@ -2046,7 +2046,7 @@ double-quoted scalars are a different lexer (YAML, see above) and are unchanged.
 the regex dialect (read as Go's since [#5388](https://github.com/rust-works/succinctly/issues/5388), see "Regex patterns are read as Go's `regexp` reads them" below)
 and a string-literal `@format` (`@base64 "x\q"`, where both refuse with different wording).
 
-### Renaming a key with `(PATH | key) = ...` — the rename matches; five shapes still differ ([#6089](https://github.com/rust-works/succinctly/issues/6089))
+### Renaming a key with `(PATH | key) = ...` — the rename matches; seven shapes still differ ([#6089](https://github.com/rust-works/succinctly/issues/6089))
 
 `(.a.x | key) = "meow"` and `(.a.x | key) |= "m_" + .` rename the key of the member the path names, in place, as yq does.
 The new name keeps the key's quoting, anchor and comments, and the value under it is untouched.
@@ -2069,7 +2069,7 @@ Not reproduced:
 - **A `select` over `key` in the target resolves to nothing**, as it does for any assignment here: `(.. | select(key == "x") | key) = "q"` renames nothing where yq renames every `x`.
 - **`+=`, `-=`, `*=` and `//=` on a `(PATH | key)` target are a parse error.**
   yq accepts `+=` (`(.a.x | key) += "z"` is `xz`) and errors for the others.
-  They used to be a silent no-op.
+  They used to be a silent no-op, which discarded the write (ADR-0018 rule 4(b)); a refusal keeps the write from vanishing.
 - **A rename through an alias** (`a: &r {x: 1}` / `b: *r`, `(.b.x | key) = "z"`) renames only the copy under `b`, and prints it as a mapping, where yq renames the anchor's node (`a: &r {z: 1}` / `b: *r`).
 
 ### `|=` over a descent writes deepest first; a comma of nested paths keeps its named order (#6087)

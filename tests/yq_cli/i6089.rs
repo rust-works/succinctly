@@ -451,3 +451,18 @@ fn test_key_assignment_gaps_still_differ_from_yq_6089() -> Result<()> {
     }
     Ok(())
 }
+
+/// Members renamed together are checked as a whole: names that swap are fine, though renaming one
+/// at a time would meet the other's old name. yq has no `if`, so this row has no oracle; it pins the
+/// mapping being rebuilt once per parent.
+#[test]
+fn test_key_assignment_swapping_two_names_is_not_a_collision_6089() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        r#"(.a[] | key) |= (if . == "x" then "y" else "x" end)"#,
+        "a: {x: 1, y: 2}\n",
+        &["--jq-extensions"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: {y: 1, x: 2}\n");
+    Ok(())
+}
