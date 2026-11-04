@@ -9957,7 +9957,16 @@ fn lazy_json_producer_then(
         };
         let bytes = lazy.text.as_bytes();
         let (start, end) = lazy.spans[cursor.next];
-        if cursor.batch.as_ref().map_or(true, |b| cursor.next >= b.end) {
+        // #6110: a document of plain RFC 8259 text is read in one pass, without the batch's index;
+        // the batch is built when a document is not, and serves the documents it covers, so a
+        // declined document is not parsed twice and a run of them reads as it did.
+        let batched = cursor.batch.as_ref().is_some_and(|b| cursor.next < b.end);
+        let plain = if batched {
+            None
+        } else {
+            lazy.text.get(start..end).and_then(jq::parse_plain)
+        };
+        if plain.is_none() && !batched {
             cursor.batch = Some(LazyBatch::build(
                 bytes,
                 &lazy.spans,
@@ -9982,11 +9991,14 @@ fn lazy_json_producer_then(
         // Serde accepted the span as a whole value and its depth is bounded
         // (`lazy_json_scan_chunk`), so it is the conversion the eager route made, minus
         // a position only a depth error would have read.
-        let converted = cursor
-            .batch
-            .as_ref()
-            .and_then(|batch| batch.document(bytes, &lazy.spans, at))
-            .unwrap_or_else(|| stream_document_validated(&bytes[start..end], None, &[], 0));
+        let converted = match plain {
+            Some(value) => Ok(value),
+            None => cursor
+                .batch
+                .as_ref()
+                .and_then(|batch| batch.document(bytes, &lazy.spans, at))
+                .unwrap_or_else(|| stream_document_validated(&bytes[start..end], None, &[], 0)),
+        };
         // Narrowed as `InputLocations::push` narrows the eager route's lines.
         let produced = jq::ProducedInput::converted(converted, lazy.source, line as u32);
         if cursor.next == lazy.spans.len() && lazy.more.is_none() {
@@ -11343,6 +11355,25 @@ fn parse_json_stream_prefix_ending(
 /// `s` starts `lead` bytes into `text`, which `origin` places in jq's input (#5497). `form` is
 /// what each document becomes.
 fn parse_json_stream_strict(
+    s: &str,
+    origin: Option<StreamOrigin<'_>>,
+    text: &[u8],
+    lead: usize,
+) -> Result<Vec<OwnedValue>> {
+    // #6110: first the one-pass reader of plain RFC 8259 text, which is what a stream almost
+    // always holds. It builds each value as the route below does and declines anything else
+    // (a leniency, a repeated key, a lone surrogate, nesting past 64, an error), in which case
+    // its values are dropped and that route runs over the whole text, so every message and
+    // position stays its own.
+    if let Some(values) = jq::parse_plain_stream(s) {
+        return Ok(values);
+    }
+    parse_json_stream_serde(s, origin, text, lead)
+}
+
+/// [`parse_json_stream_strict`]'s route for everything the one-pass reader declines (#6110): the
+/// `serde_json` validation and the materializer, which also decides every error.
+fn parse_json_stream_serde(
     s: &str,
     origin: Option<StreamOrigin<'_>>,
     text: &[u8],
@@ -16145,6 +16176,63 @@ mod tests {
         assert!(matches!(producer(), jq::ProducedInput::End(None)));
     }
 
+    /// #6110: the producer reads a stream that mixes documents the one-pass reader takes with ones
+    /// it declines (a leniency, a repeated key, a lone surrogate, deep nesting) as it read each
+    /// document alone, whatever the batches around a declined one cover.
+    #[test]
+    fn the_producer_reads_plain_and_declined_documents_alike_6110() {
+        let deep = format!("{}{}", "[".repeat(80), "]".repeat(80));
+        let odd = [
+            "007".to_string(),
+            "{\"a\":1,\"a\":2}".to_string(),
+            "\"\\udc00x\"".to_string(),
+            "1e999".to_string(),
+            deep,
+        ];
+        // Only what the lazy route admits as a document of a clean stream.
+        let odd: Vec<String> = odd
+            .into_iter()
+            .filter(|doc| lazy_json_spans(&format!("{doc}\n")).is_some())
+            .collect();
+        assert!(odd.len() >= 3, "the lazy route admits {odd:?}");
+        let mut stream = String::new();
+        for i in 0..1500 {
+            if i % 97 == 5 {
+                stream.push_str(&odd[(i / 97) % odd.len()]);
+            } else {
+                stream.push_str(&format!(
+                    "{{\"id\":{i},\"s\":\"{}\",\"n\":{i}.50}}",
+                    "x".repeat(i % 40)
+                ));
+            }
+            stream.push('\n');
+        }
+        let spans = lazy_json_spans(&stream).expect("a clean stream the lazy route admits");
+        assert!(spans.last().unwrap().1 > 2 * LAZY_BATCH_FIRST_BYTES);
+        let mut producer = lazy_json_producer(
+            LazyJsonInputs {
+                text: std::rc::Rc::new(stream.clone()),
+                spans: spans.clone(),
+                source: 0,
+                seam: Seam::NONE,
+                more: None,
+            },
+            None,
+        );
+        for (i, &(start, end)) in spans.iter().enumerate() {
+            let alone = stream_document_validated(&stream.as_bytes()[start..end], None, &[], 0);
+            match (producer(), alone) {
+                (jq::ProducedInput::Document(value, _, line), Ok(alone)) => {
+                    assert_eq!(value, alone, "document {i}");
+                    assert_eq!(value.to_json(), alone.to_json(), "document {i}");
+                    assert_eq!(line as usize, i + 1, "document {i}'s line");
+                }
+                (_, alone) => panic!("document {i} is a converted value, alone: {alone:?}"),
+            }
+        }
+        assert!(matches!(producer(), jq::ProducedInput::End(None)));
+    }
+
     /// #5661: the lazy route's end of stream, read off its spans, is the one the strict scan of
     /// [`EofTail::of`] finds, over every shape #4303 turns on: a last line of 4093 to 4096 bytes
     /// ending in a bare token or a container, trailing blank lines, CRLF, no trailing newline,
@@ -18703,6 +18791,129 @@ mod tests {
         );
     }
 
+    /// #6110: wherever the one-pass reader takes a stream it builds what the `serde_json` route
+    /// and the splitter's checked route build, value for value (the values themselves, and their
+    /// JSON text, which keeps a number's spelling), over generated streams: valid and mangled,
+    /// with repeated keys, escapes and number spellings.
+    #[test]
+    fn plain_stream_reader_agrees_with_the_checked_route_6110() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        fn gen(next: &mut impl FnMut() -> u64, depth: usize, out: &mut String) {
+            match next() % if depth > 3 { 6 } else { 9 } {
+                0 => out.push_str("null"),
+                1 => out.push_str(if next() % 2 == 0 { "true" } else { "false" }),
+                2 => {
+                    let n = [
+                        "0",
+                        "-0",
+                        "7",
+                        "-12",
+                        "3.5",
+                        "-0.25",
+                        "1e3",
+                        "2E-2",
+                        "1.0",
+                        "10.50",
+                        "123456789012345678",
+                        "9223372036854775808",
+                        "1e999",
+                        "0.1e1",
+                        "007",
+                        "1.",
+                    ];
+                    out.push_str(n[(next() % n.len() as u64) as usize]);
+                }
+                3..=5 => {
+                    let w = [
+                        "",
+                        "a",
+                        "caf\u{e9}",
+                        "\u{1f600}",
+                        "a\\nb",
+                        "q\\\"q",
+                        "\\u0041",
+                        "\\ud83d\\ude00",
+                        "\\udc00",
+                        "\\ud800",
+                        "tab\\t",
+                        "\\u0000",
+                        "\\/",
+                    ];
+                    out.push('"');
+                    out.push_str(w[(next() % w.len() as u64) as usize]);
+                    out.push('"');
+                }
+                6 | 7 => {
+                    out.push('[');
+                    for i in 0..next() % 4 {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        gen(next, depth + 1, out);
+                    }
+                    out.push(']');
+                }
+                _ => {
+                    out.push('{');
+                    for i in 0..next() % 4 {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        let k = ["a", "b", "id", "a", "k\\u00e9", "x y", "\\u0000"];
+                        out.push('"');
+                        out.push_str(k[(next() % k.len() as u64) as usize]);
+                        out.push_str("\":");
+                        gen(next, depth + 1, out);
+                    }
+                    out.push('}');
+                }
+            }
+        }
+        let checked = |text: &str| -> Option<Vec<OwnedValue>> {
+            let bytes = text.as_bytes();
+            let (spans, error) = split_json_values(bytes);
+            if error.is_some() {
+                return None;
+            }
+            spans
+                .into_iter()
+                .map(|(start, end)| {
+                    stream_document_checked(&bytes[start..end], None, bytes, start).ok()
+                })
+                .collect()
+        };
+        let json =
+            |values: &[OwnedValue]| values.iter().map(OwnedValue::to_json).collect::<Vec<_>>();
+        let mut taken = 0;
+        for _ in 0..20_000 {
+            let mut text = String::new();
+            for _ in 0..=next() % 4 {
+                gen(&mut next, 0, &mut text);
+                text.push_str([" ", "\n", "  ", "\r\n", "", " "][(next() % 6) as usize]);
+            }
+            if next() % 11 == 0 {
+                text.push_str(["x", ",", "]", "\u{c}"][(next() % 4) as usize]);
+            }
+            if let Some(fast) = jq::parse_plain_stream(&text) {
+                taken += 1;
+                let serde = parse_json_stream_serde(&text, None, text.as_bytes(), 0)
+                    .unwrap_or_else(|e| panic!("{text:?}: the serde route refuses it: {e}"));
+                assert_eq!(fast, serde, "{text:?}");
+                assert_eq!(json(&fast), json(&serde), "{text:?}");
+                let checked = checked(&text).unwrap_or_else(|| panic!("{text:?}: checked route"));
+                assert_eq!(fast, checked, "{text:?}");
+                assert_eq!(json(&fast), json(&checked), "{text:?}");
+            }
+        }
+        assert!(taken > 3_000, "the sweep must reach the reader: {taken}");
+    }
+
     /// #5608: the strict route validates with `serde_json` (into `IgnoredAny`, which builds
     /// nothing) and then materializes each span without walking its delimiters again, so it
     /// must never be the route that accepts a stream whose delimiters are wrong, and for every
@@ -18711,7 +18922,7 @@ mod tests {
     #[test]
     fn strict_stream_route_agrees_with_the_checked_route_5608() {
         let strict = |text: &str, origin: Option<StreamOrigin<'_>>| {
-            parse_json_stream_strict(text, origin, text.as_bytes(), 0)
+            parse_json_stream_serde(text, origin, text.as_bytes(), 0)
         };
         let checked = |text: &str, origin: Option<StreamOrigin<'_>>| -> Vec<String> {
             let bytes = text.as_bytes();
