@@ -31306,9 +31306,11 @@ fn strip_comments(pattern: &str) -> String {
 /// body (`\K`, `\G`, a lookaround) even in a group. The body of such a group has one way to
 /// match and no text to give back, so an atomic `(?>...)` inside it (which `fancy-regex` takes as
 /// a target) matches as the group does. The flags stay on the group, as they still change what a
-/// lookaround or an extended-mode body reads. A plain `(?:...)` and a bare `\K*` are refused by jq
-/// as well, and are left to the refusal. `None` when the operator does not follow an option group,
-/// or a `#` before it could open an extended-mode comment.
+/// lookaround or an extended-mode body reads. A plain `(?:...)` whose whole body is one group
+/// (#6187: `(?:(?i:\K))*`, `(?:(?:(?i:\G)))*`) is a repeat of that inner group, and it is the one
+/// rewritten. A plain group or a bare `\K*` that holds no option group is refused by jq as well, and
+/// is left to the refusal. `None` when the operator does not follow an option group (or plain
+/// groups around one), or a `#` before it could open an extended-mode comment.
 #[cfg(feature = "regex")]
 fn atomize_option_group(pattern: &str, at: usize) -> Option<String> {
     let bytes = pattern.as_bytes();
@@ -31348,7 +31350,25 @@ fn atomize_option_group(pattern: &str, at: usize) -> Option<String> {
         }
         i += 1;
     }
-    let open = matched?;
+    let mut open = matched?;
+    // The `)` before the operator must be the real close of that group: an escaped one (`\)`) is no
+    // close, and the scan above skipped it.
+    let mut close = matching_close(bytes, open)?;
+    if close != start - 1 {
+        return None;
+    }
+    // #6187: a plain group whose whole body is one group (`(?:(?i:\K))*`, `(?:(?:(?i:\G)))*`) is a
+    // repeat of that inner group, which `fancy-regex` refuses for the same reason. Only the group
+    // that holds the zero-width body can be made atomic, so it is the one rewritten; `(?:\K)*` and
+    // `(?:(?:\G))*` have none and stay refused, as they are in jq.
+    while pattern.get(open..)?.starts_with("(?:") {
+        let inner = open + 3;
+        let inner_close = matching_close(bytes, inner)?;
+        if inner_close + 1 != close {
+            return None;
+        }
+        (open, close) = (inner, inner_close);
+    }
     // `(?` + at least one flag letter or `-` + `:`.
     let header = pattern.get(open..)?.strip_prefix("(?")?;
     let letters = header
@@ -31366,9 +31386,47 @@ fn atomize_option_group(pattern: &str, at: usize) -> Option<String> {
     Some(format!(
         "{}(?>{}|(?!))){}",
         &pattern[..=colon],
-        &pattern[colon + 1..start - 1],
-        &pattern[start..]
+        &pattern[colon + 1..close],
+        &pattern[close + 1..]
     ))
+}
+
+/// The byte index of the `)` that closes the `(` at `open`, skipping escapes and classes. `None`
+/// when `open` is no `(` or the group never closes.
+#[cfg(feature = "regex")]
+fn matching_close(bytes: &[u8], open: usize) -> Option<usize> {
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut class_depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'[' => {
+                class_depth += 1;
+                // A `]` right after `[` or `[^` is a member.
+                if bytes.get(i + 1) == Some(&b'^') {
+                    i += 1;
+                }
+                if bytes.get(i + 1) == Some(&b']') {
+                    i += 1;
+                }
+            }
+            b']' if class_depth > 0 => class_depth -= 1,
+            b'(' if class_depth == 0 => depth += 1,
+            b')' if class_depth == 0 => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Whether `expr` holds a lazy repeat that may stop at once (`*?`, `??`, `{0,n}?`) of a body with a
@@ -135365,6 +135423,62 @@ mod tests {
         assert!(build_fancy_regex::<JqSemantics>(r"(a)(?1)").is_none());
         // A pattern neither engine parses.
         assert!(build_fancy_regex::<JqSemantics>("(?<=x").is_none());
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_matching_close_skips_escapes_and_classes_6187() {
+        let close = |p: &str, open: usize| matching_close(p.as_bytes(), open);
+        assert_eq!(close("(ab)c", 0), Some(3));
+        assert_eq!(close("(a(b)c)d", 0), Some(6));
+        // An escaped parenthesis, and one in a class, close and open nothing.
+        assert_eq!(close(r"(a\)b)", 0), Some(5));
+        assert_eq!(close("(a[)]b)", 0), Some(6));
+        assert_eq!(close("(a[^)]b)", 0), Some(7));
+        // A `]` right after `[` or `[^` is a member, and does not end the class.
+        assert_eq!(close("(a[])]b)", 0), Some(7));
+        assert_eq!(close("(a[^])]b)", 0), Some(8));
+        // No close, a stray close before any open, and a start that is no `(`.
+        assert_eq!(close("(a(b)", 0), None);
+        assert_eq!(close("a)", 0), None);
+        assert_eq!(close("ab", 0), None);
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_atomize_option_group_steps_through_plain_groups_of_one_group_6187() {
+        // The operator `fancy-regex` reports: the last `*`, or the closing brace of an interval.
+        let at = |pattern: &str| pattern.rfind(['*', '}']).expect(pattern);
+        // A plain group whose whole body is one group is a repeat of that group: the option group
+        // at the bottom is the one made atomic, however many plain groups wrap it.
+        let (one, two) = (r"(?:(?i:\K))*", r"a(?:(?:(?x:\G))){1,2}");
+        assert_eq!(
+            atomize_option_group(one, at(one)).as_deref(),
+            Some(r"(?:(?i:(?>\K|(?!))))*")
+        );
+        assert_eq!(
+            atomize_option_group(two, at(two)).as_deref(),
+            Some(r"a(?:(?:(?x:(?>\G|(?!))))){1,2}")
+        );
+        // The wrapper must hold that one group and nothing else, and the `)` before the operator
+        // must close the group the scan found (an escaped one closes nothing). `fancy-regex` never
+        // asks about these, because it takes a repeat of a body with another node, but the guards
+        // are what keep a corrupt rewrite from being offered if it ever does.
+        for pattern in [
+            r"(?:a(?i:\K))*",
+            r"(?:(?i:\K)a)*",
+            r"(?:(?i:\K)|b)*",
+            r"(?:(?i:\K)(?i:\G))*",
+            r"(?:(?i:\K))\)*",
+            r"(?:\K)*",
+            r"(?:(?:\G))*",
+        ] {
+            assert_eq!(
+                atomize_option_group(pattern, at(pattern)),
+                None,
+                "{pattern}"
+            );
+        }
     }
 
     #[cfg(feature = "regex")]
