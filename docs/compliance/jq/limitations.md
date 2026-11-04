@@ -13905,8 +13905,17 @@ A plain walk and `-n` with `input`/`inputs` hand each event to the program when 
 A 70 MB document walked with `select(length==2)|empty` peaks at 72 MB (the old walk: 664 MB; jq: 2 MB, which reads 4 KB at a time where the reader here takes the file whole).
 Two differences remain:
 
-- **`--seq`** combines with `--stream` in jq (`echo '[1] 2' | jq --seq --stream -c .` prints each event after an RS
-  byte); here `--seq` wins and the flag is ignored.
+- **`--seq`** combines with `--stream` since [#6115](https://github.com/rust-works/succinctly/issues/6115): the program reads the events of each record (`printf '\x1e[1]\n\x1e{"a":2}\n' | jq --seq --stream -c .` prints `[[0],1]`, `[[0]]`, `[["a"],2]` and `[["a"]]`, each after an RS byte), a record cut short gives the events before the cut, and the fault is the warning `jq: ignoring parse error: ...` that `--seq` prints for a document.
+  The same port of jq's streaming parser reads it, with the record-sequence rules of `jv_parse.c` added to `Parser` (`JV_PARSER_WAITING_FOR_RS`, the `Truncated value` check at an RS, the `(need RS to resync)` suffix, the abandoned-text report at EOF, and a fault that ends its call and not the rest of the line).
+  A fault is the error `input`/`inputs` raise when the program reads one, and a warning when the main loop reads it.
+  A byte-order mark that breaks off (`\xef\xbb` and then another byte) is consumed without a column and wipes the parser at the start of every call, as jq's `jv_parser_set_buf` leaves it, which costs a container the close event that was pending.
+  `-s` closes its array at the call jq's `--slurp` loop ends in, which a fault earlier in the last read moves past the events that read left pending, and leaves `input_filename` `null` and `input_line_number` `0` after a fault in that read.
+  `tests/jq_cli/i6115.rs` pins it, and 15,500 random record sequences (one to three files, lines across jq's 4,095-byte read, `-s`, `-n`, `input`, `inputs`, `input_line_number`, `input_filename`) matched `/usr/bin/jq` 1.7.1 on stdout, status and the set of stderr lines.
+  Two differences remain, both shared with `--seq` over documents.
+  A plain run prints its warnings before it evaluates anything, so a runtime error or `halt` on an earlier event comes after warnings jq would not have printed yet.
+  And the end of the stream that jq's non-slurp rule draws on an empty record in the last read (#2998) ends the stream here for a program that calls `input`, where jq's main loop reads on after the call that met it and so also reads what follows: `printf '\x1e[1]\n\x1e[2' | jq -c --seq --stream '[inputs]'` prints `[[[0]]]` and then the warning `Unfinished JSON term at EOF`, where this prints only `[[[0]]]`.
+  What follows can also be a fault that a later `input` raises, so the difference can cost an error and an exit status (`jq -e` exits 5 where this exits 0), not only a warning ([#6141](https://github.com/rust-works/succinctly/issues/6141)).
+  The events of a `--seq --stream` run are read whole before the program starts, so memory grows with the input; the chunked reader that plain `--stream` uses (#5498) does not serve `--seq`.
 - **A file that does not open** and is named before one that does makes jq's `--stream` stop after the first event of the later file (`jq -c --stream . missing.json a.json` prints `[[0],1]` and the open error, exit 2), where succinctly prints every event.
   Both `-n` with `inputs` and a non-stream run agree with jq there, so the quirk is in jq's streaming parser's state after the failed open, not in what the program reads.
 
@@ -13918,7 +13927,7 @@ Its events are materialized rather than streamed, so memory grows with the input
 `--validate` still runs first and rejects a malformed input outright, since strict validation is what it asks for.
 Under `-R` and `--input-dsv` the flag is ignored, as `--stream` is.
 It is pinned by `tests/jq_cli/i5474.rs` and was checked against `/usr/bin/jq` on random malformed inputs, with stdout, exit status and the `(at <file>:<line>)` marker compared.
-One shape differs: `--seq` combines with `--stream-errors` in jq (`printf '[1,2' | jq --seq --stream-errors -c .` prints `["Unfinished abandoned text at EOF at line 1, column 4",[]]`), and here `--seq` wins and the flag is ignored, as it is for `--stream`.
+`--seq` combines with it since #6115, as with `--stream` above: `printf '[1,2' | jq --seq --stream-errors -c .` prints `["Unfinished abandoned text at EOF at line 1, column 4",[]]`, and a fault in a record is the event `[message, path]` and not a warning.
 
 `-b` is accepted and ignored, as jq does outside Windows; `--binary` is rejected there (`Unknown option --binary`, exit 2) and here.
 
