@@ -72,7 +72,12 @@ struct Piece {
 struct GiveUp;
 
 struct Rewriter<'p> {
+    /// The pattern as written. Every piece's text is taken from it, by the offsets of the parse.
     source: &'p str,
+    /// Where each construct the parsed copy of `source` reads as something it is not starts
+    /// ([`oniguruma_shadow`](super::eval::oniguruma_shadow)): it is copied as written, and its ways
+    /// are not listed.
+    opaque: &'p [usize],
     /// The longest text a piece may grow to: the rewrite copies a loop's body, and nested loops
     /// copy the copies.
     limit: usize,
@@ -94,9 +99,13 @@ pub(crate) fn rewrite(pattern: &str) -> Option<String> {
 }
 
 fn rewrite_parsed(pattern: &str) -> Option<String> {
-    let ast = ast::parse::Parser::new().parse(pattern).ok()?;
+    // #6128: a pattern with Oniguruma syntax only `fancy-regex` reads (lookaround, a backreference,
+    // `\K`) is parsed through a copy that writes that syntax plainly at the same offsets.
+    let shadow = super::eval::oniguruma_shadow(pattern)?;
+    let ast = ast::parse::Parser::new().parse(&shadow.text).ok()?;
     let mut rewriter = Rewriter {
         source: pattern,
+        opaque: &shadow.opaque,
         limit: pattern.len().saturating_mul(16).saturating_add(1024),
         work: core::cell::Cell::new(0),
         work_limit: pattern.len().saturating_mul(64).saturating_add(64 * 1024),
@@ -106,7 +115,7 @@ fn rewrite_parsed(pattern: &str) -> Option<String> {
     // The rewrite can drop a piece that matches only the empty string (`\p{Foo}{0}`), and with it
     // an error the crate would have reported for the pattern as written.
     let valid = regex_syntax::hir::translate::Translator::new()
-        .translate(pattern, &ast)
+        .translate(&shadow.text, &ast)
         .is_ok();
     (rewriter.changed && valid).then_some(piece.text.text)
 }
@@ -172,6 +181,11 @@ impl Rewriter<'_> {
     /// `ast` as a piece. Its ways are listed only when `listed`, that is under a repeat, which is
     /// the only place they are read.
     fn convert(&mut self, ast: &Ast, listed: bool) -> Result<Piece, GiveUp> {
+        if matches!(ast, Ast::Group(_) | Ast::Literal(_))
+            && self.opaque.binary_search(&ast.span().start.offset).is_ok()
+        {
+            return self.opaque(ast);
+        }
         match ast {
             Ast::Empty(_) => Ok(Piece {
                 text: Text {
@@ -236,6 +250,27 @@ impl Rewriter<'_> {
                 self.concat(&items, listed)
             }
         }
+    }
+
+    /// A construct the parsed copy reads as something it is not. A lookaround or atomic group keeps
+    /// its opening and closing text and has its body rewritten; a comment and a backreference are
+    /// copied as written. None of them has its ways listed.
+    fn opaque(&mut self, ast: &Ast) -> Result<Piece, GiveUp> {
+        let span = ast.span();
+        let text = match ast {
+            Ast::Group(group) if !self.verbatim(span).starts_with("(?#") => {
+                let body = self.convert(&group.ast, false)?;
+                let inner = group.ast.span();
+                let open = &self.source[span.start.offset..inner.start.offset];
+                let close = &self.source[inner.end.offset..span.end.offset];
+                format!("{open}{}{close}", body.text.text)
+            }
+            _ => self.verbatim(span).into(),
+        };
+        Ok(Piece {
+            text: self.text(text, Prec::Atom)?,
+            ways: Ways::Unknown,
+        })
     }
 
     /// A group keeps its own opening and closing text. A capture group's ways are not listed; a
