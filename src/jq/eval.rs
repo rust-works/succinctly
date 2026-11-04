@@ -28618,9 +28618,10 @@ const NEVER_MATCHES: &str = "[^\\s\\S]";
 /// repetition or another alternation gets one: a prefix of literals, classes and assertions matches
 /// one way.
 ///
-/// The alternations are found by `regex-syntax`'s parser, with lookaround and atomic group openers
-/// read as plain groups of the same length. `None` when no alternation needs the branch, or the
-/// parser still refuses the pattern (a backreference): such a pattern keeps the factored match.
+/// The alternations are found by `regex-syntax`'s parser, with the Oniguruma syntax only
+/// `fancy-regex` reads (lookaround and atomic groups, backreferences, `\K`, `\G`, `\Z`, `\R`) read as
+/// plain syntax of the same length. `None` when no alternation needs the branch, or the parser
+/// still refuses the pattern (a conditional): such a pattern keeps the factored match.
 #[cfg(feature = "regex")]
 fn guard_prefix_lifting(pattern: &str) -> Option<String> {
     use regex_syntax::ast::{self, Ast, RepetitionKind, RepetitionRange};
@@ -28658,13 +28659,31 @@ fn guard_prefix_lifting(pattern: &str) -> Option<String> {
     if !pattern.contains('|') {
         return None;
     }
-    // Each replacement is as long as what it replaces, so the offsets hold for `pattern`.
-    let shadow = pattern
-        .replace("(?<=", "(?i:")
-        .replace("(?<!", "(?i:")
-        .replace("(?=", "(?:")
-        .replace("(?!", "(?:")
-        .replace("(?>", "(?:");
+    // Each replacement is as long as what it replaces, so the offsets hold for `pattern`, and leaves
+    // the groups and branches where they were (in `\\1` it replaces a literal `1` with `.`).
+    let mut shadow = pattern.to_string();
+    for (oniguruma, plain) in [
+        ("(?<=", "(?i:"),
+        ("(?<!", "(?i:"),
+        ("(?=", "(?:"),
+        ("(?!", "(?:"),
+        ("(?>", "(?:"),
+        ("\\K", "\\b"),
+        ("\\G", "\\b"),
+        ("\\Z", "\\b"),
+        ("\\R", "\\."),
+        ("\\k", "\\."),
+    ] {
+        if shadow.contains(oniguruma) {
+            shadow = shadow.replace(oniguruma, plain);
+        }
+    }
+    for digit in '1'..='9' {
+        let backref = ['\\', digit].iter().collect::<String>();
+        if shadow.contains(&backref) {
+            shadow = shadow.replace(&backref, "\\.");
+        }
+    }
     let tree = ast::parse::Parser::new().parse(&shadow).ok()?;
     let Ok(mut starts) = ast::visit(&tree, Starts(Vec::new()));
     if starts.is_empty() {
@@ -134054,9 +134073,11 @@ mod tests {
             }) => re.as_str().to_string(),
             _ => panic!("{pattern} compiles with the regex crate"),
         };
+        // #6134: the crate is handed each pattern through `guard_prefix_lifting`.
+        let guarded = |pattern: String| guard_prefix_lifting(&pattern).unwrap_or(pattern);
         assert_eq!(
             compiled("(?:b*|a)+"),
-            super::super::onig_loop::rewrite("(?:b*|a)+").unwrap()
+            guarded(super::super::onig_loop::rewrite("(?:b*|a)+").unwrap())
         );
         let nested =
             |depth: usize| format!("{}(?:b*|a)+{}", "(?:".repeat(depth), ")".repeat(depth));
@@ -134067,7 +134088,74 @@ mod tests {
             })
             .expect("some depth nests the rewrite past the crate's limit");
         assert!(regex::Regex::new(&nested(depth)).is_ok());
-        assert_eq!(compiled(&nested(depth)), nested(depth));
+        assert_eq!(compiled(&nested(depth)), guarded(nested(depth)));
+    }
+
+    /// #6134: an alternation with a branch that can match more than one way gets a first branch
+    /// that never matches, at the start of the alternation, so that `regex-syntax` cannot factor a
+    /// shared prefix out of it. A prefix that matches one way, a pattern with no such branch, and a
+    /// pattern the parser refuses even with the Oniguruma syntax read as plain are left alone.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn guard_prefix_lifting_puts_a_dead_branch_first_6134() {
+        let guarded = |pattern: &str| guard_prefix_lifting(pattern);
+        let dead = NEVER_MATCHES;
+        for (pattern, want) in [
+            ("a*a|a*b", format!("{dead}|a*a|a*b")),
+            ("x(a*a|a*b)y", format!("x({dead}|a*a|a*b)y")),
+            ("(?:a*?b|a*?a)+?", format!("(?:{dead}|a*?b|a*?a)+?")),
+            ("a{1,2}x|a{1,2}y", format!("{dead}|a{{1,2}}x|a{{1,2}}y")),
+            ("(?:a|b)x|(?:a|b)y", format!("{dead}|(?:a|b)x|(?:a|b)y")),
+            ("(?x) a*a | a*b # c", format!("{dead}|(?x) a*a | a*b # c")),
+            ("a*(?:b+|c)|d", format!("{dead}|a*(?:{dead}|b+|c)|d")),
+            ("(?=a*a|a*b)", format!("(?={dead}|a*a|a*b)")),
+            ("(?<=x)(?:a*a|a*b)", format!("(?<=x)(?:{dead}|a*a|a*b)")),
+            ("(?>a*a|a*b)", format!("(?>{dead}|a*a|a*b)")),
+            (r"(x)\1?(?:a*a|a*b)", format!(r"(x)\1?(?:{dead}|a*a|a*b)")),
+            (
+                r"(?<n>x)\k<n>(?:a*a|a*b)",
+                format!(r"(?<n>x)\k<n>(?:{dead}|a*a|a*b)"),
+            ),
+            (r"\\1(?:a*a|a*b)", format!(r"\\1(?:{dead}|a*a|a*b)")),
+            (r"x\K(?:a*a|a*b)\Z", format!(r"x\K(?:{dead}|a*a|a*b)\Z")),
+            (r"\G(?:a*a|a*b)\R", format!(r"\G(?:{dead}|a*a|a*b)\R")),
+        ] {
+            assert_eq!(
+                guarded(pattern).as_deref(),
+                Some(want.as_str()),
+                "{pattern}"
+            );
+        }
+        for pattern in [
+            "a*b",
+            "ab|ac",
+            "[ab]x|[ab]y",
+            "a{2}x|a{2}y",
+            r"\bx|\by",
+            "(?:ab|ac)+",
+            "(a)?(?(1)a*a|a*b)",
+            "(",
+        ] {
+            assert_eq!(guarded(pattern), None, "{pattern}");
+        }
+        let starts = |pattern: &str| match regex_syntax::parse(pattern).map(|hir| hir.into_kind()) {
+            Ok(regex_syntax::hir::HirKind::Alternation(branches)) => branches.len(),
+            _ => 0,
+        };
+        assert_eq!(starts("a*a|a*b"), 0, "regex-syntax factors the prefix out");
+        assert_eq!(starts(&guarded("a*a|a*b").unwrap()), 3);
+    }
+
+    /// #6134: a pattern the `regex` crate refuses is refused in its own words, without the branch
+    /// the guard puts in front of it.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn std_regex_refuses_in_the_pattern_s_own_words_6134() {
+        let pattern = r"\p{Foo}|a*";
+        assert!(guard_prefix_lifting(pattern).is_some());
+        let refusal = std_regex(pattern).unwrap_err().to_string();
+        assert_eq!(refusal, regex::Regex::new(pattern).unwrap_err().to_string());
+        assert!(!refusal.contains(NEVER_MATCHES), "{refusal}");
     }
 
     /// #5531: `build_regex` keeps the result for a `(mode, pattern, flags)` it has built twice and
