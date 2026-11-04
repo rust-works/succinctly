@@ -28283,6 +28283,35 @@ const JQ_WORD_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\x{B2}\x{B3}\x{B9}\
 #[cfg(feature = "regex")]
 const JQ_WORD_CLASS_IN_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}";
 
+#[cfg(feature = "regex")]
+/// #6126: Oniguruma reads the options after `(?` one character at a time, and its Perl syntax
+/// knows only `i`, `m`, `x`, `s` and `-`; anything else before the closing `)` or `:` is
+/// `undefined group option`, whatever the `regex` crate makes of it (`U` swaps greed, `u` and `R`
+/// are crate flags, the rest a parse error with the crate's wording). `rest` is the text after
+/// `(?`. A first character that is not a letter or `-` is another group form (`(?:`, `(?<n>`, ...)
+/// and is not read here, and neither is `(?-1)`, a relative group call. `(?R)` is a call of the
+/// whole pattern in Oniguruma, which jq reports as `unmatched close parenthesis`.
+fn refuse_unknown_group_option(rest: &[char]) -> Result<(), EvalError> {
+    match rest.first() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        Some('-') if !rest.get(1).is_some_and(char::is_ascii_digit) => {}
+        // `(?)`: no option at all.
+        Some(')') => return Err(EvalError::new("invalid regex: undefined group option")),
+        _ => return Ok(()),
+    }
+    if rest.starts_with(&['R', ')']) {
+        return Err(EvalError::new("invalid regex: unmatched close parenthesis"));
+    }
+    for &c in rest {
+        match c {
+            'i' | 'm' | 'x' | 's' | '-' => {}
+            ')' | ':' => return Ok(()),
+            _ => return Err(EvalError::new("invalid regex: undefined group option")),
+        }
+    }
+    Ok(())
+}
+
 /// Rewrite the character classes of a jq pattern to what Oniguruma's Perl syntax means by them
 /// (#5367): the POSIX brackets (`[:alpha:]`, `[:^alpha:]`) inside a class become nested Unicode
 /// classes, and a `[`, `&` or `~` inside a class is the literal character. Oniguruma's are
@@ -28509,7 +28538,8 @@ fn translate_posix_brackets_scan(
             out.push(c);
             if let Some(&next) = chars.get(i + 1) {
                 out.push(next);
-                prev_assertion = depth == 0 && matches!(next, 'b' | 'B' | 'A' | 'z' | 'Z' | 'G');
+                prev_assertion =
+                    depth == 0 && matches!(next, 'b' | 'B' | 'A' | 'z' | 'Z' | 'G' | 'K');
             }
             at_start = false;
             i += 2;
@@ -28541,6 +28571,11 @@ fn translate_posix_brackets_scan(
             // the `regex` crate accepts the first and would answer where jq errors.
             if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'P') {
                 return Err(EvalError::new("invalid regex: undefined group option"));
+            }
+            // #6126: a group option other than `i`, `m`, `x`, `s` (`(?U)`, `(?u:...)`) is an error in
+            // jq.
+            if c == '(' && chars.get(i + 1) == Some(&'?') {
+                refuse_unknown_group_option(&chars[i + 2..])?;
             }
             // #6070: `(*FAIL)` is the verb that never matches, `(?!)` here.
             if c == '(' && chars[i + 1..].starts_with(&['*', 'F', 'A', 'I', 'L', ')']) {
@@ -29430,7 +29465,7 @@ fn inline_extended(pattern: &str) -> bool {
 /// `target of repeat operator is invalid` (#6127).
 ///
 /// Oniguruma decides from the parsed node (`is_invalid_quantifier_target`, `regparse.c`): an
-/// assertion (`^ $ \A \z \Z \G \b \B`, a look-ahead or look-behind) is an invalid target; a
+/// assertion (`^ $ \A \z \Z \G \K \b \B`, a look-ahead or look-behind) is an invalid target; a
 /// sequence of several nodes is not, whatever it holds (`(?:\b\b)*` compiles); an alternation is
 /// invalid when any one alternative is, so `(?:a|\b)*` is refused and `(?:a|\b\b)*` is not; a
 /// plain `(?:...)` group disappears into its body, so `(?:\b)*` and `(?:(?:\b)|c)*` are refused; a
@@ -29536,7 +29571,7 @@ fn repeats_assertion_group(chars: &[char]) -> bool {
                     let next = self.chars.get(self.at + 1).copied();
                     self.at += 2;
                     match next {
-                        Some('b' | 'B' | 'A' | 'z' | 'Z' | 'G') => Ok(Some(true)),
+                        Some('b' | 'B' | 'A' | 'z' | 'Z' | 'G' | 'K') => Ok(Some(true)),
                         Some('p' | 'P' | 'x' | 'k' | 'g' | 'N' | 'o') => {
                             // `\p{L}`, `\x{41}`, `\k<n>`, `\g<n>`: a name may hold `)`.
                             let close = match self.peek() {
