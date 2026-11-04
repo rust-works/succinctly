@@ -60533,8 +60533,9 @@ mod key_node_metadata_2763 {
             ("[.[] | key]", MIXED, "- a\n- x\n- \"qk\"\n- k2\n"),
             ("keys", MIXED, "- a\n- x\n- \"qk\"\n- k2\n"),
             (".a | key | tostring | key", KEYC, "a\n"),
-            // A write *through* a key is still positional, unchanged.
-            ("(.a | key) = \"z\"", KEYC, "a: # keyc\n  b: 1\n"),
+            // A write to a key renames it and its comment goes with it (#6089); a write to the
+            // key's own line comment through `key | line_comment` stays a no-op, as in yq.
+            ("(.a | key) = \"z\"", KEYC, "z: # keyc\n  b: 1\n"),
             (
                 "(.a | key | line_comment) = \"x\"",
                 KEYC,
