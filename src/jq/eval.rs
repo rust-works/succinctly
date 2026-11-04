@@ -29359,7 +29359,7 @@ fn open_group(
 #[cfg(feature = "regex")]
 fn may_hold_assertion(pattern: &str) -> bool {
     pattern.contains(['^', '$'])
-        || ["\\b", "\\B", "\\A", "\\z", "\\Z", "\\G", "\\K"]
+        || ["\\b", "\\B", "\\A", "\\z", "\\Z", "\\G"]
             .iter()
             .any(|assertion| pattern.contains(assertion))
 }

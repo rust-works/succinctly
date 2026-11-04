@@ -38,6 +38,10 @@ fn test_a_repeated_group_that_is_a_bare_k_is_refused_6157() -> Result<()> {
         r"\K{2}",
         r"a\K*b",
         r"x(?:\K|y){2,3}",
+        r"(?<=a(?:\K|b)*)",
+        r"(?<!\K)+",
+        r"(?!\K)*",
+        r"(?<=\K)*",
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", &filter(pattern)], None)?;
         assert_eq!(code, 5, "{pattern}: stdout={stdout:?} stderr={stderr:?}");
@@ -63,6 +67,8 @@ fn test_a_repeated_group_that_holds_k_among_several_nodes_still_answers_6157() -
         (r"(?:\Kb|a)+", "true"),
         (r"(?:\K){,2}", "false"),
         (r"(?:a\K)?", "true"),
+        (r"(?<=\K)", "true"),
+        (r"(?<=a\K)", "true"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", &filter(pattern)], None)?;
         assert_eq!(
