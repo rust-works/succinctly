@@ -28707,6 +28707,15 @@ fn strip_extended_blanks(pattern: &str) -> String {
             }
             if let Some(&next) = chars.get(i + 1) {
                 out.push(next);
+                // `\1 0` is the reference `\1` and a `0`: a blank is kept so that the digits do not
+                // run into one number.
+                if next.is_ascii_digit() && class_depth == 0 {
+                    let rest = &chars[i + 2..];
+                    let blanks = rest.iter().take_while(|b| b.is_whitespace()).count();
+                    if blanks > 0 && rest.get(blanks).is_some_and(char::is_ascii_digit) {
+                        out.push(' ');
+                    }
+                }
             }
             class_start = false;
             i += 2;
@@ -28727,7 +28736,12 @@ fn strip_extended_blanks(pattern: &str) -> String {
             continue;
         }
         if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') {
+            // A comment runs to the first `)` that no backslash escapes.
             while i < chars.len() && chars[i] != ')' {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    out.push(chars[i]);
+                    i += 1;
+                }
                 out.push(chars[i]);
                 i += 1;
             }
@@ -28742,6 +28756,22 @@ fn strip_extended_blanks(pattern: &str) -> String {
                 class_depth = 1;
                 class_start = true;
                 out.push(c);
+            }
+            // `{1, 2}` holds a blank, so it is no interval but the literal text, blank and all, in
+            // the extended mode too (#6068): copied through, not read as `{1,2}`.
+            '{' if chars[i + 1..]
+                .iter()
+                .position(|&n| n == '}')
+                .is_some_and(|close| {
+                    chars[i + 1..i + 1 + close]
+                        .iter()
+                        .all(|n| n.is_ascii_digit() || *n == ',' || n.is_whitespace())
+                }) =>
+            {
+                let close = chars[i + 1..].iter().position(|&n| n == '}').unwrap_or(0);
+                out.extend(&chars[i..=i + 1 + close]);
+                i += close + 2;
+                continue;
             }
             '#' => {
                 while i < chars.len() && chars[i] != '\n' {
