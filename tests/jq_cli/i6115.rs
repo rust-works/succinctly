@@ -194,6 +194,71 @@ const ROWS: &[Row] = &[
         "",
         0,
     ),
+    // The call that reads the final buffer ends a plain read on a record's empty reset (#2998), and
+    // `-s` reads on past it; `input` raises `break` there and the next read goes on (#5662).
+    (
+        "\u{1e}[1]\n\u{1e}[2]",
+        &["-c", "--seq", "--stream", "."],
+        "\u{1e}[[0],1]\n\u{1e}[[0]]\n",
+        "",
+        0,
+    ),
+    (
+        "\u{1e}]\n\u{1e}[1]",
+        &["-c", "--seq", "--stream-errors", "."],
+        "\u{1e}[\"Unmatched ']' at the top-level at line 1, column 2 (need RS to resync)\",[]]\n",
+        "",
+        0,
+    ),
+    (
+        "\u{1e}{\"a\":1,\u{1e}[3]",
+        &["-c", "--seq", "--stream", "-s", "."],
+        "\u{1e}[[[\"a\"],1],[[0],3],[[0]]]\n",
+        "jq: ignoring parse error: Truncated value at line 1, column 9\n",
+        0,
+    ),
+    (
+        "\u{1e}\"abc\u{1e}[1]",
+        &["-c", "--seq", "--stream", "-s", "."],
+        "\u{1e}[[[0],1],[[0]]]\n",
+        "jq: ignoring parse error: Invalid numeric literal at line 1, column 6\n",
+        0,
+    ),
+    (
+        "\u{1e}[1,}2]\u{1e}[3]",
+        &["-c", "--seq", "--stream", "-s", "."],
+        "\u{1e}[[[0],1],[[0],3],[[0]]]\n",
+        "jq: ignoring parse error: Expected another key:value pair at line 1, column 5 (need RS to resync)\njq: ignoring parse error: Unmatched ']' at the top-level at line 1, column 7 (need RS to resync)\n",
+        0,
+    ),
+    (
+        "\u{1e}[1]\n\u{1e}[2]",
+        &["-c", "--seq", "--stream", "-n", "[.,input,input]"],
+        "\u{1e}[null,[[0],1],[[0]]]\n",
+        "",
+        0,
+    ),
+    (
+        "\u{1e}[1]\n\u{1e}[2]",
+        &["-c", "--seq", "--stream", "-n", "[.,input,input,input]"],
+        "",
+        "jq: error (at <stdin>:1): break\n",
+        5,
+    ),
+    (
+        "\u{1e}[1]\n\u{1e}[2]",
+        &["-c", "--seq", "--stream", "-n", "[inputs]"],
+        "\u{1e}[[[0],1],[[0]]]\n",
+        "",
+        0,
+    ),
+    (
+        "\u{1e}[11\n::,true[",
+        &["-c", "--seq", "--stream-errors", "-n", "-s", "[inputs]"],
+        "\u{1e}[[[\"':' not as part of an object at line 2, column 1 (need RS to resync)\",[0]],[\"':' not as part of an object at line 2, column 2 (need RS to resync)\",[]],[\"Expected value before ',' at line 2, column 3 (need RS to resync)\",[]],[[],true]],[\"Unfinished JSON term at EOF at line 2, column 8\",[0]]]\n",
+        "",
+        0,
+    ),
 ];
 
 #[test]

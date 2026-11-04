@@ -55,6 +55,18 @@ enum St {
     WaitingForRs,
 }
 
+/// Whether the stream is a `--seq` stream, and what a fault is to jq's driver there (#6115).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Seq {
+    /// A plain JSON stream.
+    Off,
+    /// `--seq --stream`: a fault is an invalid value with a message, which ends the driver's call.
+    Stream,
+    /// `--seq --stream-errors`: a fault is the value `[message, path]`, which the driver hands out
+    /// (or slurps) as it does any other.
+    StreamErrors,
+}
+
 /// The record separator a `--seq` stream puts before each value (RFC 7464).
 const RS: u8 = 0x1e;
 
@@ -465,6 +477,10 @@ pub(crate) struct Yielded {
     /// The message, when the input is a parse error: `[message, path]` is the input under
     /// `--stream-errors`, and the message is the error jq raises without it.
     pub(crate) error: Option<String>,
+    /// A `--seq` stream's message-less return from the call that read its final buffer (#6115):
+    /// jq's main loop ends there, and `input` raises `break` and the next read goes on, as for a
+    /// `--seq` stream read without `--stream` (#2998, #5662). Its `error` is `break`.
+    pub(crate) gap: bool,
 }
 
 /// How jq's reader ended, known once [`Reader::next`] has returned `None`.
@@ -496,6 +512,14 @@ pub(crate) struct Reader<R: RefillSource> {
     finished: bool,
     values_before_last_refill: usize,
     done: bool,
+    /// For a `--seq` stream, which is read a call at a time: how far the parser has read `buf`,
+    /// and whether the buffer is not the last one (`is_partial`).
+    pos: usize,
+    partial: bool,
+    /// Whether jq's `--slurp` loop is still filling its array.
+    slurping: bool,
+    /// Whether a fault is a value to jq's driver (`--stream-errors`).
+    faults_are_values: bool,
 }
 
 impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> Reader<MemorySources<S>> {
@@ -507,27 +531,33 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> Reader<MemorySources<S>> {
 
 impl<R: RefillSource> Reader<R> {
     pub(crate) fn from_source(source: R) -> Self {
-        Self::reading(source, false)
+        Self::reading(source, Seq::Off, false)
     }
 
     /// The reader of a `--seq` stream (`JV_PARSE_SEQ`, #6115): records start at an RS, the parser
     /// waits for the first one, and it skips a BOM at the front of the bytes itself, so the
-    /// sources keep theirs.
-    pub(crate) fn from_seq_source(source: R) -> Self {
-        Self::reading(source, true)
+    /// sources keep theirs. It is read the way `jq_util_input_next_input` reads it, a call to
+    /// `jv_parser_next` at a time, since which call reads the final buffer decides what that buffer
+    /// yields: `slurp` is jq's `--slurp` loop, which reads past where a plain read stops.
+    pub(crate) fn from_seq_source(source: R, seq: Seq, slurp: bool) -> Self {
+        Self::reading(source, seq, slurp)
     }
 
-    fn reading(source: R, seq: bool) -> Self {
+    fn reading(source: R, seq: Seq, slurp: bool) -> Self {
         Self {
             source,
             buf: Vec::new(),
-            parser: Parser::new(seq),
+            parser: Parser::new(seq != Seq::Off),
             deferred: Vec::new(),
             inside: None,
             slurp_at: (0, 0),
             finished: false,
             values_before_last_refill: 0,
             done: false,
+            pos: 0,
+            partial: true,
+            slurping: slurp,
+            faults_are_values: seq == Seq::StreamErrors,
         }
     }
 
@@ -548,8 +578,83 @@ impl<R: RefillSource> Reader<R> {
             if self.done {
                 return None;
             }
-            self.step();
+            if self.parser.seq {
+                self.next_input();
+            } else {
+                self.step();
+            }
         }
+    }
+
+    /// One call to jq's `jq_util_input_next_input` over a `--seq` stream (#6115). `is_last` is a
+    /// local of the call, so only the call that reads the final buffer can end the read on a
+    /// message-less return; and `--slurp` reads on while the buffer has bytes (`has_more`), so it
+    /// appends every value to its array and stops only at a fault that is not a value, which jq
+    /// hands back before the array.
+    fn next_input(&mut self) {
+        let mut is_last = false;
+        loop {
+            if self.pos == self.buf.len() {
+                is_last = self.read_more();
+            }
+            let call = self
+                .parser
+                .next_call(&self.buf, &mut self.pos, self.partial);
+            let has_more = self.slurping && self.pos < self.buf.len();
+            match call {
+                Call::Value(value) => {
+                    self.parser.yield_value(value);
+                    if !self.slurping {
+                        return;
+                    }
+                }
+                Call::Fault(fault) => {
+                    self.parser.yield_error(fault);
+                    if !(self.slurping && self.faults_are_values) {
+                        return;
+                    }
+                }
+                Call::Nothing => {}
+            }
+            if is_last && !has_more {
+                break;
+            }
+        }
+        if self.slurping {
+            self.slurping = false;
+            self.inside = Some(self.parser.yielded);
+            self.slurp_at = (self.parser.source, self.parser.lines_read);
+        } else if self.parser.eof {
+            self.done = true;
+        } else {
+            self.parser.yield_gap();
+        }
+    }
+
+    /// jq's `jq_util_input_read_more` and `jv_parser_set_buf` for a `--seq` stream: the next refill,
+    /// or the empty read jq makes after its input has closed, and whether it is the last.
+    fn read_more(&mut self) -> bool {
+        self.pos = 0;
+        let Some(refill) = self.source.next_refill(&mut self.buf) else {
+            self.parser.closed = true;
+            self.buf.clear();
+            self.partial = false;
+            return true;
+        };
+        let parser = &mut self.parser;
+        if refill.is_last {
+            self.values_before_last_refill = parser.yielded;
+        }
+        if parser.source != refill.source {
+            parser.source = refill.source;
+            parser.lines_read = 0;
+        }
+        if refill.newline {
+            parser.lines_read += 1;
+        }
+        parser.strip_bom(&mut self.buf);
+        self.partial = !refill.is_last;
+        refill.is_last
     }
 
     /// One refill of jq's input buffer, or what follows the last one.
@@ -577,15 +682,8 @@ impl<R: RefillSource> Reader<R> {
         if refill.newline {
             parser.lines_read += 1;
         }
-        if parser.seq {
-            parser.strip_bom(&mut self.buf);
-        }
         // The call that follows a refill starts with `stream_check_done`.
         let drained = !self.deferred.is_empty();
-        if parser.resets_each_call() {
-            self.deferred.clear();
-            parser.reset();
-        }
         for value in std::mem::take(&mut self.deferred) {
             parser.yield_value(value);
         }
@@ -626,8 +724,18 @@ impl<R: RefillSource> Reader<R> {
 
 /// Read `sources` (each source's bytes as read, a leading BOM already removed) the way
 /// `jq --stream-errors` does.
-pub(crate) fn read(sources: &[(Option<usize>, Vec<u8>)], seq: bool) -> StreamErrorsRead {
-    read_keeping(sources, usize::MAX, false, seq)
+pub(crate) fn read(sources: &[(Option<usize>, Vec<u8>)], seq: Seq) -> StreamErrorsRead {
+    read_keeping(sources, usize::MAX, false, seq, false)
+}
+
+/// [`read_for_slurp`] keeping every location, for a slurp whose values after its array were not
+/// all kept: [`read`] reads a `--seq` stream as a plain read does, which ends where `--slurp`
+/// reads on (#6115).
+pub(crate) fn read_all_for_slurp(
+    sources: &[(Option<usize>, Vec<u8>)],
+    seq: Seq,
+) -> StreamErrorsRead {
+    read_keeping(sources, usize::MAX, false, seq, true)
 }
 
 /// How many trailing locations [`read_for_slurp`] keeps: the values jq's `--slurp` loop leaves
@@ -645,20 +753,24 @@ const SLURP_TAIL: usize = 8;
 pub(crate) fn read_for_slurp(
     sources: &[(Option<usize>, Vec<u8>)],
     stop_at_fault: bool,
-    seq: bool,
+    seq: Seq,
 ) -> StreamErrorsRead {
-    read_keeping(sources, SLURP_TAIL, stop_at_fault, seq)
+    read_keeping(sources, SLURP_TAIL, stop_at_fault, seq, true)
 }
 
 /// Sources already read: each one's tag and bytes.
 type ReadSources<'a> = &'a [(Option<usize>, Vec<u8>)];
 
-/// The reader over sources already read, of a `--seq` stream when `seq`.
-fn memory_reader(sources: ReadSources<'_>, seq: bool) -> Reader<MemorySources<ReadSources<'_>>> {
-    if seq {
-        Reader::from_seq_source(MemorySources::new(sources))
-    } else {
-        Reader::new(sources)
+/// The reader over sources already read, of a `--seq` stream unless `seq` is [`Seq::Off`], read by
+/// jq's `--slurp` loop when `slurp`.
+fn memory_reader(
+    sources: ReadSources<'_>,
+    seq: Seq,
+    slurp: bool,
+) -> Reader<MemorySources<ReadSources<'_>>> {
+    match seq {
+        Seq::Off => Reader::new(sources),
+        seq => Reader::from_seq_source(MemorySources::new(sources), seq, slurp),
     }
 }
 
@@ -668,13 +780,18 @@ fn read_keeping(
     sources: &[(Option<usize>, Vec<u8>)],
     keep: usize,
     stop_at_fault: bool,
-    seq: bool,
+    seq: Seq,
+    slurp: bool,
 ) -> StreamErrorsRead {
-    let mut reader = memory_reader(sources, seq);
+    let mut reader = memory_reader(sources, seq, slurp);
     let mut values = Vec::new();
     let mut locations = std::collections::VecDeque::new();
     let mut first_fault = None;
     while let Some(yielded) = reader.next_yielded() {
+        // jq's main loop ends at a `--seq` gap: what it holds is read only by an `input` (#6115).
+        if yielded.gap {
+            break;
+        }
         if let (Some(message), None) = (yielded.error, &first_fault) {
             first_fault = Some((message, yielded.location));
             if stop_at_fault {
@@ -732,9 +849,9 @@ pub(crate) enum Afterwards {
 /// the last [`SLURP_TAIL`] events is kept, since the inputs after the array are among them.
 pub(crate) fn read_for_deferred_slurp(
     sources: &[(Option<usize>, Vec<u8>)],
-    seq: bool,
+    seq: Seq,
 ) -> DeferredSlurp {
-    let mut reader = memory_reader(sources, seq);
+    let mut reader = memory_reader(sources, seq, true);
     // Every event, and the faults with where they came in the sequence of inputs jq yielded.
     let mut events = Vec::new();
     let mut faults: Vec<(usize, String, (usize, usize))> = Vec::new();
@@ -787,6 +904,24 @@ struct ParseFault {
     message: String,
 }
 
+/// What one call to `jv_parser_next` returned, for a `--seq` stream (#6115).
+enum Call {
+    Value(OwnedValue),
+    Fault(ParseFault),
+    /// An invalid value with no message: the buffer ran out, or an RS ended a record with nothing
+    /// left in it.
+    Nothing,
+}
+
+/// What `scan` made of one byte.
+enum Scanned {
+    /// Nothing to hand out yet.
+    More,
+    Value(OwnedValue),
+    /// `scan` returned `OK` with no value: an RS ended a record, and the parser was reset.
+    Reset,
+}
+
 struct Parser {
     line: usize,
     column: usize,
@@ -814,6 +949,8 @@ struct Parser {
     pending: std::collections::VecDeque<Yielded>,
     /// How many values the parser has yielded in all, handed out or not.
     yielded: usize,
+    /// jq's `p->eof`: the EOF branch has run, so every later call returns nothing.
+    eof: bool,
     /// `JV_PARSE_SEQ`: the input is a `--seq` stream (#6115).
     seq: bool,
     /// jq's `bom_strip_position`: how much of a BOM the front of the input has matched, then
@@ -841,6 +978,7 @@ impl Parser {
             closed: false,
             pending: std::collections::VecDeque::new(),
             yielded: 0,
+            eof: false,
             seq,
             bom: if seq { 0 } else { BOM_DONE },
             #[cfg(test)]
@@ -887,13 +1025,23 @@ impl Parser {
     }
 
     fn push(&mut self, value: OwnedValue, error: Option<String>) {
+        self.push_item(value, error, false);
+    }
+
+    fn push_item(&mut self, value: OwnedValue, error: Option<String>, gap: bool) {
         let line = if self.closed { CLOSED } else { self.lines_read };
         self.pending.push_back(Yielded {
             value,
             location: (self.source, line),
             error,
+            gap,
         });
         self.yielded += 1;
+    }
+
+    /// See [`Yielded::gap`].
+    fn yield_gap(&mut self) {
+        self.push_item(OwnedValue::Null, Some("break".to_string()), true);
     }
 
     /// [`Parser::yield_value`] for a parse error, remembering where the first one fell.
@@ -926,28 +1074,9 @@ impl Parser {
     fn feed(&mut self, chunk: &[u8], deferred: &mut Vec<OwnedValue>) -> bool {
         for (index, &ch) in chunk.iter().enumerate() {
             let last = index + 1 == chunk.len();
-            if self.st == St::WaitingForRs {
-                if ch == b'\n' {
-                    self.line += 1;
-                    self.column = 0;
-                } else {
-                    self.column += 1;
-                }
-                if ch == RS {
-                    self.st = St::Normal;
-                }
-                continue;
-            }
             match self.scan(ch) {
-                Ok(Some(value)) => {
+                Ok(Scanned::Value(value)) => {
                     self.yield_value(value);
-                    if self.resets_each_call() {
-                        self.reset();
-                        if last {
-                            return true;
-                        }
-                        continue;
-                    }
                     // The next call starts with `stream_check_done`, which hands out whatever the
                     // byte left pending (the close of a container) before it scans another.
                     while let Some(value) = self.check_done() {
@@ -961,73 +1090,115 @@ impl Parser {
                         return true;
                     }
                 }
-                Ok(None) => {}
+                Ok(Scanned::More | Scanned::Reset) => {}
                 Err(message) => {
-                    // A `--seq` parser names the RS it will look for, unless the RS is what failed,
-                    // and then goes on reading where it stopped: `parser_reset` leaves it reading,
-                    // not waiting for an RS, and the refill is kept.
-                    let resync = if self.seq && ch != RS {
-                        " (need RS to resync)"
-                    } else {
-                        ""
-                    };
-                    let error = self.error_value(format!(
-                        "{message} at line {}, column {}{resync}",
-                        self.line, self.column
-                    ));
-                    self.reset();
+                    let error = self.fault(message, ch);
                     self.yield_error(error);
                     // `p->curr_buf = 0`: the rest of this refill is thrown away.
-                    if !self.seq || last {
-                        return true;
-                    }
+                    return true;
                 }
             }
         }
         false
     }
 
-    /// The EOF branch of `jv_parser_next`.
+    /// The EOF branch of `jv_parser_next`, yielding what it returns.
     fn finish(&mut self) {
+        match self.eof_branch() {
+            Some(Ok(value)) => self.yield_value(value),
+            Some(Err(fault)) => self.yield_error(fault),
+            None => {}
+        }
+    }
+
+    /// The EOF branch of `jv_parser_next`: the last event, a fault, or nothing.
+    fn eof_branch(&mut self) -> Option<Result<OwnedValue, ParseFault>> {
+        let (line, column) = (self.line, self.column);
+        let fault = |parser: &Self, what: &str| {
+            Some(Err(parser.error_value(format!(
+                "{what} at EOF at line {line}, column {column}"
+            ))))
+        };
+        if self.st == St::WaitingForRs {
+            return fault(self, "Unfinished abandoned text");
+        }
+        if self.st != St::Normal {
+            return fault(self, "Unfinished string");
+        }
+        if let Err(message) = self.check_literal() {
+            return fault(self, message);
+        }
+        if !self.path.is_empty() {
+            return fault(self, "Unfinished JSON term");
+        }
+        let value = self.next.take()?;
+        Some(Ok(OwnedValue::array_from(vec![self.path_value(), value])))
+    }
+
+    /// The fault `jv_parser_next` makes of `message`, met at `ch`, with the parser reset after it.
+    /// A `--seq` parser names the RS it will resync at, unless the RS is what failed, though
+    /// `parser_reset` leaves it reading rather than waiting for one.
+    fn fault(&mut self, message: &str, ch: u8) -> ParseFault {
+        let resync = if self.seq && ch != RS {
+            " (need RS to resync)"
+        } else {
+            ""
+        };
+        let fault = self.error_value(format!(
+            "{message} at line {}, column {}{resync}",
+            self.line, self.column
+        ));
+        self.reset();
+        fault
+    }
+
+    /// One call to `jv_parser_next` for a `--seq` parser (#6115), over `buf[*pos..]`, which is the
+    /// last buffer unless `partial`. A fault keeps the rest of the buffer for the next call, as jq
+    /// does for a `--seq` parser.
+    fn next_call(&mut self, buf: &[u8], pos: &mut usize, partial: bool) -> Call {
+        if self.eof {
+            return Call::Nothing;
+        }
         if self.resets_each_call() {
             self.reset();
         }
-        let (line, column) = (self.line, self.column);
-        if self.st == St::WaitingForRs {
-            let error = self.error_value(format!(
-                "Unfinished abandoned text at EOF at line {line}, column {column}"
-            ));
-            self.yield_error(error);
-            return;
+        if let Some(value) = self.check_done() {
+            return Call::Value(value);
         }
-        if self.st != St::Normal {
-            let error = self.error_value(format!(
-                "Unfinished string at EOF at line {line}, column {column}"
-            ));
-            self.yield_error(error);
-            return;
+        while let Some(&ch) = buf.get(*pos) {
+            *pos += 1;
+            if self.st == St::WaitingForRs {
+                if ch == b'\n' {
+                    self.line += 1;
+                    self.column = 0;
+                } else {
+                    self.column += 1;
+                }
+                if ch == RS {
+                    self.st = St::Normal;
+                }
+                continue;
+            }
+            match self.scan(ch) {
+                Ok(Scanned::More) => {}
+                Ok(Scanned::Value(value)) => return Call::Value(value),
+                Ok(Scanned::Reset) => return Call::Nothing,
+                Err(message) => return Call::Fault(self.fault(message, ch)),
+            }
         }
-        if let Err(message) = self.check_literal() {
-            let error =
-                self.error_value(format!("{message} at EOF at line {line}, column {column}"));
-            self.yield_error(error);
-            return;
+        if partial {
+            return Call::Nothing;
         }
-        if !self.path.is_empty() {
-            let error = self.error_value(format!(
-                "Unfinished JSON term at EOF at line {line}, column {column}"
-            ));
-            self.yield_error(error);
-            return;
-        }
-        if let Some(value) = self.next.take() {
-            let event = OwnedValue::array_from(vec![self.path_value(), value]);
-            self.yield_value(event);
+        self.eof = true;
+        match self.eof_branch() {
+            Some(Ok(value)) => Call::Value(value),
+            Some(Err(fault)) => Call::Fault(fault),
+            None => Call::Nothing,
         }
     }
 
     /// jq's `scan`, for a streaming parser.
-    fn scan(&mut self, ch: u8) -> Result<Option<OwnedValue>, &'static str> {
+    fn scan(&mut self, ch: u8) -> Result<Scanned, &'static str> {
         self.column += 1;
         if ch == b'\n' {
             self.line += 1;
@@ -1070,7 +1241,7 @@ impl Parser {
                 St::Str
             };
         }
-        Ok(answer)
+        Ok(answer.map_or(Scanned::More, Scanned::Value))
     }
 
     /// `scan`'s RS branch: a value the RS cuts short is an error, and otherwise the RS ends the one
@@ -1080,18 +1251,18 @@ impl Parser {
     /// `Potentially truncated top-level numeric value` for a number at the top level, but neither
     /// holds at an RS: a scalar at the top level is handed out by the `check_done` of the byte that
     /// completes it, so only an open container is cut short.
-    fn record_separator(&mut self) -> Result<Option<OwnedValue>, &'static str> {
+    fn record_separator(&mut self) -> Result<Scanned, &'static str> {
         if !self.path.is_empty() {
             return Err("Truncated value");
         }
         self.check_literal()?;
         if self.st == St::Normal {
             if let Some(value) = self.check_done() {
-                return Ok(Some(value));
+                return Ok(Scanned::Value(value));
             }
         }
         self.reset();
-        Ok(None)
+        Ok(Scanned::Reset)
     }
 
     /// jq's `tokenadd`, growth policy included.
@@ -1437,7 +1608,7 @@ mod tests {
     use super::*;
 
     fn read_one(input: &[u8]) -> StreamErrorsRead {
-        read(&[(None, input.to_vec())], false)
+        read(&[(None, input.to_vec())], Seq::Off)
     }
 
     /// The events the reader yielded before the first parse error, each with the lines it had read.
@@ -1682,8 +1853,8 @@ mod tests {
         let events: String = (0..40).map(|n| format!("[{n}]\n")).collect();
         let sources = [(None, events.into_bytes())];
         let (full, slurp) = (
-            read(&sources, false),
-            read_for_slurp(&sources, false, false),
+            read(&sources, Seq::Off),
+            read_for_slurp(&sources, false, Seq::Off),
         );
         let json = |read: &StreamErrorsRead| {
             read.values
@@ -1701,8 +1872,11 @@ mod tests {
         // The first error's message and location are kept wherever it falls, and a read told to stop
         // there reads no further.
         let broken = [(None, b"[1]\n}\n[2]\n}\n".to_vec())];
-        let (full, slurp) = (read(&broken, false), read_for_slurp(&broken, false, false));
-        let stopped = read_for_slurp(&broken, true, false);
+        let (full, slurp) = (
+            read(&broken, Seq::Off),
+            read_for_slurp(&broken, false, Seq::Off),
+        );
+        let stopped = read_for_slurp(&broken, true, Seq::Off);
         let first = full.first_error.expect("a fault");
         assert_eq!(
             full.first_fault.as_ref().map(|f| f.1),
@@ -1741,7 +1915,7 @@ mod tests {
             "\"x\"",
             "[\"a\",\"b\"]\n[\"c\"]",
         ] {
-            let read = read_for_slurp(&[(None, stream.as_bytes().to_vec())], false, false);
+            let read = read_for_slurp(&[(None, stream.as_bytes().to_vec())], false, Seq::Off);
             assert!(read.inside >= read.locations_from, "{stream:?}");
             assert!(read.values.len() - read.inside <= SLURP_TAIL, "{stream:?}");
         }
@@ -1937,7 +2111,7 @@ mod tests {
     fn a_token_continues_into_the_next_source() {
         let read = read(
             &[(Some(0), b"[1".to_vec()), (Some(1), b"2]\n".to_vec())],
-            false,
+            Seq::Off,
         );
         let events: Vec<String> = read.values.iter().map(OwnedValue::to_json).collect();
         assert_eq!(events, ["[[0],12]", "[[0]]"]);
@@ -2008,7 +2182,10 @@ mod tests {
     fn an_empty_source_is_a_refill_that_hands_out_what_the_last_byte_left() {
         // `[1]` leaves its close pending after the last byte; the empty source after it is the
         // call that hands it out, at that source's own position.
-        let read = read(&[(Some(0), b"[1]".to_vec()), (Some(1), Vec::new())], false);
+        let read = read(
+            &[(Some(0), b"[1]".to_vec()), (Some(1), Vec::new())],
+            Seq::Off,
+        );
         let events: Vec<String> = read.values.iter().map(OwnedValue::to_json).collect();
         assert_eq!(events, ["[[0],1]", "[[0]]"]);
         assert_eq!(read.locations, [(0, 0), (1, 0)]);
@@ -2122,7 +2299,7 @@ mod tests {
             (Some(0), b"[1,2]\n{\"a\" 2}\n[3".to_vec()),
             (Some(1), b"]\n4 5\n".to_vec()),
         ];
-        let batch = read(&sources, false);
+        let batch = read(&sources, Seq::Off);
         let mut reader = Reader::new(&sources);
         let mut pulled = Vec::new();
         while let Some(item) = reader.next() {
@@ -2182,7 +2359,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, bytes)| (Some(i), bytes.to_vec()))
                 .collect();
-            read_for_deferred_slurp(&sources, false)
+            read_for_deferred_slurp(&sources, Seq::Off)
         };
         let shape = |read: &DeferredSlurp| {
             let after: Vec<String> = read
@@ -2223,7 +2400,7 @@ mod tests {
     #[test]
     fn a_seq_stream_is_read_record_by_record_6115() {
         let events = |input: &[u8]| -> Vec<String> {
-            read(&[(None, input.to_vec())], true)
+            read(&[(None, input.to_vec())], Seq::StreamErrors)
                 .values
                 .iter()
                 .map(OwnedValue::to_json)
@@ -2266,7 +2443,7 @@ mod tests {
         assert_eq!(events(b"\xef\xbb\x1e[1]\n"), [r"[[0],1]"]);
         // Without `--seq` an RS is a literal byte, as before.
         assert_eq!(
-            read(&[(None, b"[1]\n".to_vec())], false)
+            read(&[(None, b"[1]\n".to_vec())], Seq::Off)
                 .values
                 .iter()
                 .map(OwnedValue::to_json)
