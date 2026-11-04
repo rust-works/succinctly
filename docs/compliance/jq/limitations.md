@@ -7421,7 +7421,8 @@ So a `(?P` or a `[` in a comment is text (`test("ab # (?P\n"; "x")` is `true` in
 A repetition operator right after an assertion (`^*`, `$+`, `\b?`, `\A{2}`, `\z*`) is an error in jq (`target of repeat operator is invalid`) and is refused here too (#5535), where the `regex` crate repeats the empty match and answered `true`.
 A repeated group Oniguruma reads as an assertion is refused as well (#6127).
 It decides from the parsed node: an assertion (`^ $ \A \z \Z \G \b \B`, a look-ahead or look-behind) is an invalid target, a sequence of several nodes is not (`(?:\b\b)*` compiles), an alternation is invalid when any one alternative is (`(?:a|\b)*` is refused, `(?:a|\b\b)*` is not), a plain `(?:...)` group is its body (`(?:(?:\b))*` and `(?:(?:\b)|c)*` are refused), and a capturing, named, atomic or option group may repeat anything (`(\b)*`, `(?i:\b)*`).
-The rule was captured from jq 1.7.1 over 75,780 generated groups, and the scan agrees on all of them (`tests/jq_cli/i6127.rs`).
+The rule was captured from jq 1.7.1 over 75,780 generated groups, and the scan agrees on all of them: `scripts/jq-regex-repeat-target-sweep.py SUBJECT` regenerates the sweep and compares (not part of the CI gate), and `tests/jq_cli/i6127.rs` pins hand-picked rows.
+The check runs after the pattern's other refusals, so an error earlier in the pattern is the one reported.
 What jq's answer is for a pattern it does compile is the matcher's, not this check's: `"aBcb" | [match("(?:[ab]\\w|\\b\\b||c)*";"g") | .string]` is `["aB","","",""]` in jq, because an empty alternative ends the repeat (#6106).
 Under the `x` flag, or a pattern with an inline flag group naming `x`, both checks stand down, because the scan cannot see the mode's ignored blanks (it does skip its comments); `test(\"^ *\"; \"x\")` is an error in jq and `true` here.
 

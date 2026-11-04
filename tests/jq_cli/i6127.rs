@@ -4,7 +4,8 @@
 //! assertion is an invalid target, a sequence of several nodes is not, an alternation is when any
 //! one alternative is, a plain `(?:...)` group is its body, and a capturing, named, atomic or option
 //! group is an enclosure that may repeat anything. Every row was captured from jq 1.7.1
-//! (`/usr/bin/jq -n`) over a sweep of 75,780 generated groups.
+//! (`/usr/bin/jq -n`); `scripts/jq-regex-repeat-target-sweep.py` regenerates the 75,780-group sweep
+//! they were picked from.
 
 use anyhow::Result;
 

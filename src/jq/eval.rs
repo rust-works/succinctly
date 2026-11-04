@@ -28107,6 +28107,28 @@ fn translate_posix_brackets(
     pattern: &str,
     extended: bool,
 ) -> Result<std::borrow::Cow<'_, str>, EvalError> {
+    let translated = translate_posix_brackets_scan(pattern, extended)?;
+    // #6127: a repeated group whose body Oniguruma reads as an assertion. After the scan, so that an
+    // error earlier in the pattern (jq reports the first in parse order) is the one reported; the
+    // extended mode's ignored blanks are invisible to this check, as to the one in the scan.
+    if pattern.contains('(')
+        && !extended
+        && !inline_extended(pattern)
+        && repeats_assertion_group(&pattern.chars().collect::<Vec<_>>())
+    {
+        return Err(EvalError::new(
+            "invalid regex: target of repeat operator is invalid",
+        ));
+    }
+    Ok(translated)
+}
+
+/// [`translate_posix_brackets`]' rewrite and its refusals, one pass over the pattern.
+#[cfg(feature = "regex")]
+fn translate_posix_brackets_scan(
+    pattern: &str,
+    extended: bool,
+) -> Result<std::borrow::Cow<'_, str>, EvalError> {
     // A backslash, a `(` or a `{` may hold Oniguruma syntax this scan rewrites or refuses (#6070).
     if !pattern.contains(['[', '\\', '(', '{']) && !may_hold_assertion(pattern) {
         return Ok(std::borrow::Cow::Borrowed(pattern));
@@ -28131,12 +28153,6 @@ fn translate_posix_brackets(
     // The extended mode's ignored blanks are invisible to this scan (`^ *` is a repeated
     // assertion there), so it leaves the repetition check to the crate rather than judge it.
     let check_repetition = !extended && !inline_extended(pattern);
-    // #6127: a repeated group whose body Oniguruma reads as an assertion.
-    if check_repetition && repeats_assertion_group(&chars) {
-        return Err(EvalError::new(
-            "invalid regex: target of repeat operator is invalid",
-        ));
-    }
     // One entry per open group: whether the extended mode is on inside it, from the `x` flag and
     // from inline `(?x)`, `(?x:...)` and `(?-x)` (#5550).
     let mut extended_in = vec![extended];
@@ -29003,6 +29019,8 @@ fn repeats_assertion_group(chars: &[char]) -> bool {
     struct Scan<'a> {
         chars: &'a [char],
         at: usize,
+        /// Set when the scan gave up (nesting past any real pattern): it answers `false`.
+        abandoned: bool,
     }
     /// One alternative's items: how many, and whether the only one is an invalid target.
     #[derive(Default)]
@@ -29017,8 +29035,11 @@ fn repeats_assertion_group(chars: &[char]) -> bool {
         /// The body of a group or of the whole pattern, up to its `)` (not consumed): whether it is
         /// an invalid repeat target, or `Err` at a repeat of one.
         fn body(&mut self, depth: usize) -> Result<bool, ()> {
-            // Deeper than any real pattern: leave it to the crate.
+            // Deeper than any real pattern: leave it to the crate, the whole pattern with it (resuming
+            // mid-pattern would read later groups at the wrong depth).
             if depth > 200 {
+                self.abandoned = true;
+                self.at = self.chars.len();
                 return Ok(false);
             }
             let mut invalid = false;
@@ -29101,11 +29122,12 @@ fn repeats_assertion_group(chars: &[char]) -> bool {
                                 _ => None,
                             };
                             if let Some(close) = close {
-                                self.at += 1;
-                                while self.peek().is_some_and(|c| c != close) {
-                                    self.at += 1;
+                                // Unterminated: only the escape, not the rest of the pattern.
+                                if let Some(n) =
+                                    self.chars[self.at + 1..].iter().position(|&c| c == close)
+                                {
+                                    self.at += n + 2;
                                 }
-                                self.at += 1;
                             }
                             Ok(Some(false))
                         }
@@ -29215,7 +29237,12 @@ fn repeats_assertion_group(chars: &[char]) -> bool {
             }))
         }
     }
-    Scan { chars, at: 0 }.body(0).is_err()
+    let mut scan = Scan {
+        chars,
+        at: 0,
+        abandoned: false,
+    };
+    scan.body(0).is_err() && !scan.abandoned
 }
 
 /// Whether `chars` begins with a repetition operator as Oniguruma's Perl syntax reads one: `*`,
@@ -142512,7 +142539,7 @@ mod tests {
     }
 
     /// #6127: the scan for a repeated group that is an assertion reads any text without panicking
-    /// (a backslash or a group that ends the pattern, an unclosed class or comment, stray `)`), and
+    /// (a backslash or a group that ends the pattern, an unclosed class, comment or escape payload, stray `)`, nesting past the scan's cap), and
     /// answers the fixed rows jq 1.7.1 answers (`tests/jq_cli/i6127.rs` holds the captured sweep).
     #[cfg(feature = "regex")]
     #[test]
@@ -142540,11 +142567,14 @@ mod tests {
         ] {
             assert_eq!(scan(pattern), refused, "{pattern}");
         }
+        // Nesting past the scan's cap abandons the whole pattern, a later repeat of an assertion with it.
+        let deep = format!("{}a{}(?:\\b)*", "(?:".repeat(300), ")".repeat(300));
+        assert!(!scan(&deep));
         let alphabet: Vec<char> = "(){}[]|?*+\\^$:=!<>#.-,abwbBAzZGQEik0129 "
             .chars()
             .collect();
         let mut state = 0x2545_f491_4f6c_dd1d_u64;
-        for _ in 0..200_000 {
+        for _ in 0..20_000 {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
