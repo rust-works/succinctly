@@ -1517,6 +1517,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             unit,
             sort_keys,
             known_not_flow,
+            None,
         )
     }
 
@@ -1540,6 +1541,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         unit: char,
         sort_keys: bool,
         known_not_flow: bool,
+        nested_flow: Option<(&str, usize)>,
     ) -> StreamResult {
         match known_value.unwrap_or_else(|| self.value()) {
             YamlValue::Null => Ok(out.write_str("null")?),
@@ -1719,7 +1721,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             field.value_cursor(),
                             unit,
                             sort_keys,
-                            (indent_spaces != 0).then_some((indent, indent_spaces)),
+                            if indent_spaces != 0 {
+                                Some((indent, indent_spaces))
+                            } else {
+                                nested_flow
+                            },
                         )?;
                         if i == last_index {
                             let value_cursor = field.value_cursor();
@@ -1956,7 +1962,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             cursor,
                             unit,
                             sort_keys,
-                            (indent_spaces != 0).then_some((indent, indent_spaces)),
+                            if indent_spaces != 0 {
+                                Some((indent, indent_spaces))
+                            } else {
+                                nested_flow
+                            },
                         )?;
                         if rest.is_empty() {
                             let comment = cursor.line_comment_raw();
@@ -9088,6 +9098,7 @@ fn write_deferred_value<Out: core::fmt::Write, W: AsRef<[u64]>>(
             unit,
             sort_keys,
             false,
+            None,
         )?;
     }
     Ok(())
@@ -9288,6 +9299,31 @@ fn write_yaml_block_field_key_checked<W: AsRef<[u64]>, Out: core::fmt::Write>(
     // An alias key is written as `*name` however long its target is (#5469).
     if !field.key_cursor().index.canonicalize_numbers() && !field.key_cursor().is_alias() {
         if let YamlValue::String(s) = field.key() {
+            // #6075: a source single-quoted key with an empty line keeps its quotes across the
+            // break, written after `? ` with the continuation one step in (`? 'k<LF><LF>  z'`),
+            // as yq's emitter does for a key that holds a line break.
+            if matches!(s, YamlString::SingleQuoted { .. }) && s.may_hold_line_feed() {
+                if let Ok(decoded) = s.as_str() {
+                    let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
+                    if let Some(scalar) = go_yaml_single_quoted_line_feed(&decoded, &child_indent) {
+                        out.write_str("? ")?;
+                        // The key's own anchor and tag, as `write_yaml_field_key` writes them.
+                        if let Some(anchor) = field.key_cursor().anchor() {
+                            out.write_char('&')?;
+                            out.write_str(anchor)?;
+                            out.write_char(' ')?;
+                        }
+                        if let Some(tag) = field.key_cursor().explicit_tag_at(None) {
+                            out.write_str(tag)?;
+                            out.write_char(' ')?;
+                        }
+                        out.write_str(&scalar)?;
+                        out.write_char('\n')?;
+                        out.write_str(indent)?;
+                        return Ok(true);
+                    }
+                }
+            }
             // A break is spelled as an escape in a one-line key, so it takes a backslash.
             let long = match s {
                 YamlString::Unquoted { start, end, .. } => end.saturating_sub(start) > 128,
@@ -9463,7 +9499,13 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
             );
         }
     }
-    value.stream_yaml_value_at(resolved, out, "", 0, unit, sort_keys, false)
+    // #6075: a flow collection inside another is written with the indent `0` that forces flow
+    // style, and hands the scalars it holds the continuation indent of the parent's items, one more
+    // step in, through a channel of its own.
+    let nested_flow = item_indent
+        .as_ref()
+        .map(|(indent, step)| (indent.as_str(), *step));
+    value.stream_yaml_value_at(resolved, out, "", 0, unit, sort_keys, false, nested_flow)
 }
 
 /// Write a trailing same-line comment after a value, if present (issue

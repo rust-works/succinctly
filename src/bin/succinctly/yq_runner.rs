@@ -9397,6 +9397,13 @@ fn emit_yaml_value_at_depth(
                             // the text it was written with: go-yaml's choice would quote a
                             // key that reads as a number, which it did not (#4950).
                             go_yaml_explicit_key_scalar(k, &val_indent, config.indent_str.len())
+                        } else if let Some(scalar) = (kc.key_style(k) == "single")
+                            .then(|| go_yaml_single_quoted_line_feed(k, &val_indent))
+                            .flatten()
+                        {
+                            // #6075: a source single-quoted key with an empty line keeps its
+                            // quotes across the break, the continuation one step in.
+                            Some(with_key_anchor(kc, k, scalar, false))
                         } else {
                             Some(with_key_anchor(
                                 kc,
