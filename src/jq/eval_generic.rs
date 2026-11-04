@@ -27052,6 +27052,66 @@ impl SortKey {
     }
 }
 
+/// The key real yq's `unique` maps an element on, with a `null` keyed by the way the source spells
+/// it (#6103): yq compares the node's *text*, so `~`, `null`, `Null` and an empty value are four
+/// elements (`- ~` / `- null` keeps both), where [`SortKey::yq_dedup_key`] reads a decoded `null`
+/// and has one spelling for all of them. A container that holds a `null` is keyed by the spellings
+/// of the nulls in it as well (`[~]` and `[null]` are two elements in yq).
+///
+/// `spelled` is false for a key computed from the element (`unique_by(.a)`), which is a decoded
+/// value with no node behind it: those keep the decoded-value key and the gap recorded in
+/// `docs/compliance/yq/limitations.md`. A spelling is only there for a document that has plain
+/// scalars (YAML), so a JSON element keys as before.
+fn yq_unique_key<S: EvalSemantics, V: DocumentValue>(
+    key: &SortKey,
+    cursor: &V::Cursor,
+    spelled: bool,
+) -> String {
+    let base = key.yq_dedup_key::<S>();
+    if !spelled {
+        return base;
+    }
+    let element = match key {
+        SortKey::Own(v) => Some(v),
+        SortKey::By(parts) => parts.first(),
+    };
+    match element {
+        Some(OwnedValue::Null) => {
+            let value = cursor.value();
+            cursor
+                .plain_scalar_source(&value)
+                .map_or(base, Cow::into_owned)
+        }
+        // A key that never spells `null` holds no null to tell apart.
+        Some(OwnedValue::Array(_) | OwnedValue::Object(_)) if base.contains("null") => {
+            let mut spellings = String::new();
+            let mut stack = vec![*cursor];
+            while let Some(at) = stack.pop() {
+                let value = at.value();
+                if value.is_null() {
+                    spellings.push('\u{0}');
+                    match at.plain_scalar_source(&value) {
+                        Some(text) => spellings.push_str(&text),
+                        None => spellings.push_str("null"),
+                    }
+                } else if let Some(elements) = value.as_array() {
+                    stack.extend(elements.collect_cursors().into_iter().rev());
+                } else if let Some(fields) = value.as_object() {
+                    stack.extend(
+                        fields
+                            .all_fields()
+                            .into_iter()
+                            .rev()
+                            .map(|f| f.value_cursor),
+                    );
+                }
+            }
+            base + &spellings
+        }
+        _ => base,
+    }
+}
+
 /// Pair every element of `cursors` with its comparison key, keeping the
 /// cursor itself untouched.
 ///
@@ -36525,9 +36585,11 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 // #2799: yq's `unique`/`unique_by` keep the first of each distinct text key in
                 // input order and never sort (`sort`/`sort_by` still do: part 3 of the issue).
                 if dedup && S::TAG == EvalTag::Yq {
+                    // #6103: the element itself is the key for `unique` and `unique_by(.)`.
+                    let spelled = key.map_or(true, |f| unwrap_paren(f).is_identity());
                     let keyed = keyed
                         .into_iter()
-                        .map(|(key, cursor)| (key.yq_dedup_key::<S>(), cursor));
+                        .map(|(k, cursor)| (yq_unique_key::<S, V>(&k, &cursor, spelled), cursor));
                     return yq_first_of_each_key(keyed);
                 }
                 sort_keyed_elements::<S, V>(&mut keyed);
