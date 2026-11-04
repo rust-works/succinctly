@@ -54935,6 +54935,8 @@ mod tests {
             "last(.[])",
             "first(.[] | .a)",
             "limit(2; .[]?)",
+            "limit(line; .[])",
+            "limit(1 | column; .[])",
             // Shapes it leaves, and what it must hand back: nothing, an error, an error inside a
             // lazy `map` under a truncating consumer, a `?//` retry, a position.
             ".",
@@ -55138,11 +55140,16 @@ mod tests {
             ".users |= first(map(.age) | .[])",
             ".users |= first(.[] | select(.age > 3))",
             ".users |= first(1 as $x ?// $y | $x)",
-            // Cannot be run twice, or reads the position.
+            // Cannot be run twice, or reads the position: the count of a `limit` is any
+            // expression, so a shape the route takes can still hold one.
             ".users |= (debug | length)",
             ".users |= input",
             ".users |= first(line)",
             ".users |= first(at_offset(0))",
+            ".users |= limit(1 | debug; .[])",
+            ".users |= limit(input; .[])",
+            ".users |= limit(line; .[])",
+            ".users |= limit(1 | halt_error; .[])",
             // Nothing to keep, or an error.
             ".users |= empty",
             ".users |= error(\"x\")",
