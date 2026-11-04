@@ -7394,6 +7394,7 @@ yq mode keeps the ASCII classes, as Go's `regexp` has them.
 `\w` and `\W` are rewritten to jq's word class too (#5373): outside a class it adds U+00B2, U+00B3, U+00B9 and U+00BC-U+00BE and drops U+200C and U+200D, which is how Oniguruma's Latin-1 table and the `regex` crate's `\w` differ.
 `\p{Word}`, `\P{Word}` and `\p{^Word}` are that same class (#6227), inside a class and out.
 `\b` and `\B` still use the `regex` crate's word definition, which lacks the six characters and has the two joiners: `"\u00b2" | test("\\b")` is `true` in jq and `false` here, and `"\u00bd" | test("\\B")` is `false` there and `true` here.
+The joiners go the other way: `"a\u200cb" | test("a\\b")` is `true` in jq and `false` here, and `test("a\\B")` is `false` there and `true` here.
 A word boundary built from jq's class would need a look-around on every pattern with `\b`, which would move all of them to the second engine, so it is not reproduced.
 `\p{Graph}` and `\p{Print}` also differ on a few format characters (U+00AD, U+200B, U+FEFF) and `\p{Print}` on U+2028.
 A range that starts or ends at a `\w` (`[\w-.]`, `[+-\w]`) was accepted here and an error in jq until #6184.

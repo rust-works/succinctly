@@ -299,3 +299,90 @@ fn test_p_word_is_the_class_w_is_6227() -> Result<()> {
     }
     Ok(())
 }
+
+/// (subject, whether jq refuses the pattern, jq's `[offset, length]` list when it does not).
+type RangeAnswer = (&'static str, bool, &'static str);
+
+/// A property is a set, so a range cannot start or end at one: jq refuses `[\p{Word}-x]` with
+/// `unmatched range specifier`, and the rewrite of `\p{Word}` to a class of its own must not make
+/// the crate read the dash as a literal. A dash at either end of the class is a literal.
+const RANGE_ROWS: &[(&str, &[RangeAnswer])] = &[
+    (
+        "[\\p{Word}-x]",
+        &[("a-x", true, ""), ("+", true, ""), ("-", true, "")],
+    ),
+    (
+        "[+-\\p{Word}]",
+        &[("a-x", true, ""), ("+", true, ""), ("-", true, "")],
+    ),
+    (
+        "[a\\p{Word}-z]",
+        &[("a-x", true, ""), ("+", true, ""), ("-", true, "")],
+    ),
+    (
+        "[\\P{Word}-x]",
+        &[("a-x", true, ""), ("+", true, ""), ("-", true, "")],
+    ),
+    (
+        "[\\p{^Word}-x]",
+        &[("a-x", true, ""), ("+", true, ""), ("-", true, "")],
+    ),
+    (
+        "[\\p{XDigit}-x]",
+        &[("a-x", true, ""), ("+", true, ""), ("-", true, "")],
+    ),
+    (
+        "[\\p{Word}-]",
+        &[
+            ("a-x", false, "[[0,1],[1,1],[2,1]]"),
+            ("+", false, "[]"),
+            ("-", false, "[[0,1]]"),
+        ],
+    ),
+    (
+        "[-\\p{Word}]",
+        &[
+            ("a-x", false, "[[0,1],[1,1],[2,1]]"),
+            ("+", false, "[]"),
+            ("-", false, "[[0,1]]"),
+        ],
+    ),
+    (
+        "[^\\p{Word}-x]",
+        &[("a-x", true, ""), ("+", true, ""), ("-", true, "")],
+    ),
+    (
+        "[\\p{L}-x]",
+        &[("a-x", true, ""), ("+", true, ""), ("-", true, "")],
+    ),
+    (
+        "[\\p{L}-\\p{N}]",
+        &[("a-x", true, ""), ("+", true, ""), ("-", true, "")],
+    ),
+];
+
+#[test]
+fn test_a_range_cannot_start_or_end_at_p_word_6227() -> Result<()> {
+    for &(pattern, expected) in RANGE_ROWS {
+        for &(subject, refused, stdout) in expected {
+            let (out, err, code) = run_jq_full(
+                &[
+                    "-nc",
+                    "--arg",
+                    "p",
+                    pattern,
+                    "--arg",
+                    "s",
+                    subject,
+                    r#"$s | [match($p; "g") | [.offset, .length]]"#,
+                ],
+                None,
+            )?;
+            assert_eq!(code != 0, refused, "{subject:?} {pattern}: {err:?}");
+            if !refused {
+                assert_eq!(out.trim_end(), stdout, "{subject:?} {pattern}");
+            }
+        }
+    }
+    Ok(())
+}

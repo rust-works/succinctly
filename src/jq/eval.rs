@@ -28394,6 +28394,22 @@ const JQ_WORD_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\x{B2}\x{B3}\x{B9}\
 #[cfg(feature = "regex")]
 const JQ_WORD_CLASS_IN_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}";
 
+/// Write jq's word class as a bracketed class, negated or not, for a `\w`, `\W` or `\p{Word}`
+/// (#5373, #6227): with the six Latin-1 characters outside a class, without them inside one.
+#[cfg(feature = "regex")]
+fn push_word_class(out: &mut String, negated: bool, in_class: bool) {
+    out.push('[');
+    if negated {
+        out.push('^');
+    }
+    out.push_str(if in_class {
+        JQ_WORD_CLASS_IN_CLASS
+    } else {
+        JQ_WORD_CLASS
+    });
+    out.push(']');
+}
+
 #[cfg(feature = "regex")]
 /// #6126: Oniguruma reads the options after `(?` one character at a time, and its Perl syntax
 /// knows only `i`, `m`, `x`, `s` and `-`; anything else before the closing `)` or `:` is
@@ -29264,16 +29280,7 @@ fn translate_posix_brackets_scan(
             // following `-` in `[\w-.]` is a literal and not the end of a range (jq refuses a range
             // from `\w` as an error, which this accepts).
             if let Some(&w @ ('w' | 'W')) = chars.get(i + 1) {
-                out.push('[');
-                if w == 'W' {
-                    out.push('^');
-                }
-                out.push_str(if depth == 0 {
-                    JQ_WORD_CLASS
-                } else {
-                    JQ_WORD_CLASS_IN_CLASS
-                });
-                out.push(']');
+                push_word_class(&mut out, w == 'W', depth > 0);
                 changed = true;
                 at_start = false;
                 i += 2;
@@ -29384,16 +29391,7 @@ fn translate_posix_brackets_scan(
                             PropertyName::Word => {
                                 // The same class as `\w` and `\W` (#5373), whichever way it is
                                 // negated.
-                                out.push('[');
-                                if (kind == 'P') != caret {
-                                    out.push('^');
-                                }
-                                out.push_str(if depth == 0 {
-                                    JQ_WORD_CLASS
-                                } else {
-                                    JQ_WORD_CLASS_IN_CLASS
-                                });
-                                out.push(']');
+                                push_word_class(&mut out, (kind == 'P') != caret, depth > 0);
                                 changed = true;
                                 at_start = false;
                                 i = end;
@@ -30794,6 +30792,10 @@ fn dash_beside_set(bytes: &[u8]) -> bool {
         (w[0] == b'\\'
             && matches!(w[1], b'd' | b'D' | b'w' | b'W' | b's' | b'S' | b'}')
             && w[2] == b'-')
+            // The close of a `\p{..}` before a dash (#6227): the property is rewritten to a class
+            // of its own after this scan, and a class is a range end the crate reads, so the
+            // refusal has to be made on the pattern as written.
+            || (w[1] == b'}' && w[2] == b'-')
             || (w[0] == b'-'
                 && w[1] == b'\\'
                 && matches!(w[2], b'd' | b'D' | b'w' | b'W' | b's' | b'S' | b'p' | b'P'))
