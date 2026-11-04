@@ -34038,7 +34038,13 @@ fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Some(e) => QueryResult::Error(e),
             None => QueryResult::One(StandardJson::Null),
         },
-        // (#4079: the callers that know the literal's spelling look the member up first.)
+        // #6155: a key that misses finds no node under yq's read-only rule. (#4079: the callers
+        // that know the literal's spelling look the member up first.)
+        StandardJson::Object(_)
+            if yq_numeric_index_on_object_is_null::<S>() && yq_absent_key_read_is_empty::<S>() =>
+        {
+            QueryResult::None
+        }
         StandardJson::Object(_) if yq_numeric_index_on_object_is_null::<S>() => {
             QueryResult::One(StandardJson::Null)
         }
@@ -82888,11 +82894,14 @@ fn eval_owned_navigation<S: EvalSemantics>(
             // own `Object` arm. See `yq_numeric_index_on_object_is_null`.
             OwnedValue::Object(map) if yq_numeric_index_on_object_is_null::<S>() => {
                 // #4079: the member whose key text is the literal.
-                Ok(Some(
-                    yq_literal_index_text::<S>(*idx, key.as_ref())
-                        .and_then(|text| map.get(text.as_str()).cloned())
-                        .unwrap_or(OwnedValue::Null),
-                ))
+                match yq_literal_index_text::<S>(*idx, key.as_ref())
+                    .and_then(|text| map.get(text.as_str()).cloned())
+                {
+                    Some(found) => Ok(Some(found)),
+                    // #6155: a key that misses finds no node under the read-only rule.
+                    None if yq_absent_key_read_is_empty::<S>() => Ok(None),
+                    None => Ok(Some(OwnedValue::Null)),
+                }
             }
             // #2482 (yq mode): `.s[0]` on a scalar `s` -- same empty rule as
             // the sibling `Expr::Field` arm above.
