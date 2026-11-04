@@ -1245,12 +1245,10 @@ impl Parser {
         }
         if self.seq && ch == RS {
             if self.check_truncation() {
-                // `check_literal(p) == 0 && is_top_num(p)`: a literal that fails reads as no number.
-                return Err(if self.check_literal().is_ok() && self.is_top_num() {
-                    "Potentially truncated top-level numeric value"
-                } else {
-                    "Truncated value"
-                });
+                // jq words it `Potentially truncated top-level numeric value` when the open record
+                // is a top-level number, which a streaming parser never has: `check_done` hands a
+                // value at depth 0 out in the scan that completes it, so none is pending here.
+                return Err("Truncated value");
             }
             self.check_literal()?;
             if self.st == St::Normal {
@@ -1298,18 +1296,11 @@ impl Parser {
         Ok(answer.map_or(Scanned::More, Scanned::Value))
     }
 
-    /// jq's `stream_seq_check_truncation`: an RS arrived while a record was still open, or a scalar
-    /// that could have been cut short is waiting.
+    /// jq's `stream_seq_check_truncation`: an RS arrived while a record was still open. jq also
+    /// tests the pending scalar, but one is never pending at depth 0 (see [`Parser::scan`]), and at
+    /// any other depth the path has already answered.
     fn check_truncation(&self) -> bool {
         !self.path.is_empty()
-            || self.next.as_ref().is_some_and(|next| {
-                is_number(next) || matches!(next, OwnedValue::Bool(_) | OwnedValue::Null)
-            })
-    }
-
-    /// jq's `stream_is_top_num`.
-    fn is_top_num(&self) -> bool {
-        self.path.is_empty() && self.next.as_ref().is_some_and(is_number)
     }
 
     /// jq's `tokenadd`, growth policy included.
@@ -1623,13 +1614,6 @@ impl Parser {
         self.token_len = 0;
         Ok(())
     }
-}
-
-fn is_number(value: &OwnedValue) -> bool {
-    matches!(
-        value,
-        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
-    )
 }
 
 /// The number a token spells, read as the document path reads it but without that path's index

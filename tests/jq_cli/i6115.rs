@@ -56,6 +56,12 @@ const ROWS: &[Row] = &[
     ("\u{1e}[1]\n\u{1e}[2", &["-c", "--seq", "--stream", "-s"], ".", "\u{1e}[[[0],1],[[0]]]\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 2, column 3\n", 0),
     ("\u{1e}[1]\n\u{1e}[2]\n", &["-c", "--seq", "--stream", "-s"], "input_line_number", "\u{1e}2\n", "", 0),
     ("\u{1e}1.5x}[1]", &["-c", "--seq", "--stream", "-s"], "length", "\u{1e}2\n", "jq: ignoring parse error: Invalid numeric literal at line 1, column 6 (need RS to resync)\n", 0),
+    ("\u{1e}[1,2]", &["-c", "--seq", "--stream", "-s"], ".", "\u{1e}[[[0],1],[[1],2]]\n\u{1e}[[1]]\n", "", 0),
+    ("\u{1e}[1,", &["-c", "--seq", "--stream", "-s"], ".", "\u{1e}[[[0],1]]\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 4\n", 0),
+    ("\u{1e}[1,", &["-c", "--seq", "--stream", "-s"], "error", "", "jq: error (at <stdin>:0) (not a string): [[[0],1]]\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 4\n", 5),
+    ("\u{1e}[1]\u{1e}", &["-c", "--seq", "--stream"], ".", "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
+    ("\u{1e}\"ab\u{1e}[1]\n", &["-c", "--seq", "--stream"], ".", "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "jq: ignoring parse error: Invalid numeric literal at line 1, column 5\n", 0),
+    ("\u{1e}[\"ab\u{1e}1]\n", &["-c", "--seq", "--stream"], ".", "", "jq: ignoring parse error: Truncated value at line 1, column 6\njq: ignoring parse error: Unmatched ']' at the top-level at line 1, column 8 (need RS to resync)\n", 0),
 ];
 
 #[test]
