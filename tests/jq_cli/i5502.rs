@@ -157,7 +157,7 @@ fn test_empty_match_reports_every_group_empty_5502() -> Result<()> {
 
 /// Escapes and constructs `fancy-regex` reads differently from Oniguruma, or that were not checked
 /// against it, keep the `regex` crate's refusal rather than answering differently from jq
-/// (jq 1.7.1: `true`, `true`, an error, `false`). A `(?P...)` group never gets this
+/// (jq 1.7.1: `true`, `true`, an error). A `(?P...)` group never gets this
 /// far: #5529 refuses it before either engine, with jq's own message (`tests/jq_cli/i5529.rs`).
 /// `\h` and `\g1` were two of them until #6080: `\h` is the letter `h` in jq, and `\g1` the letter `g`
 /// and a `1`, as is every escaped letter jq does not define (`tests/jq_cli/i6080.rs`).
@@ -168,8 +168,6 @@ fn test_constructs_read_differently_stay_refused_5502() -> Result<()> {
         r#""abc" | test("(?~b)")"#,
         // jq errors on this one; `fancy-regex` would answer it.
         r#""aaa" | test("a{3,2}")"#,
-        // Possessive in jq, a repeat of a repeat in `fancy-regex` (jq: `false`).
-        r#""aaa" | test("^(?=a)a{2,3}+a$")"#,
     ] {
         let (stdout, stderr, code) = run(filter)?;
         assert_eq!((stdout.as_str(), code), ("", 5), "{filter}");

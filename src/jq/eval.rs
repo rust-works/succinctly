@@ -29910,15 +29910,20 @@ fn interval_quantifier_at(chars: &[char], at: usize) -> Option<(usize, bool)> {
     (chars.get(j) == Some(&'}')).then_some((j + 1, comma))
 }
 
-/// Refuse a possessive quantifier (#5524): a greedy `*`, `+`, `?` or an interval with a comma
+/// Read a possessive quantifier (#5524): a greedy `*`, `+`, `?` or an interval with a comma
 /// (`{n,}`, `{n,m}`) directly followed by `+`.
 ///
 /// Oniguruma reads it as possessive (the repetition never gives characters back), where the
 /// `regex` crate reads a quantifier applied to a quantifier, so `"aaa" | test("a*+a")` is `false`
 /// in jq and was `true` here: the pattern compiles in both and answered differently without a
 /// word.
-/// The crate has no atomic group to rewrite it to, so it is refused like the other
-/// Oniguruma-only syntax.
+/// The crate has no atomic group, so a possessive quantifier that something follows is written as
+/// the atomic group of its atom and quantifier (`a*+b` as `(?>a*)b`, #6172), which the crate
+/// refuses and the second engine reads as jq does.
+/// The scan finds where the atom starts (a group's `(`, a class's `[`, an escape, a character);
+/// one it cannot place (a quoted run, an escape it does not size, a group of flags) keeps the refusal,
+/// and so does a pattern holding a lazy quantifier followed by `+`, which the second engine
+/// reads otherwise.
 /// The exception is a quantifier that ends the pattern, or ends it but for closing parentheses
 /// (`(?:a++)`): nothing after it can fail, so the plain quantifier matches the same text
 /// (`sub("a*+";"X")`) and the `+` is dropped.
@@ -29962,16 +29967,35 @@ fn refuse_possessive_quantifier(
     let mut drops: Vec<usize> = Vec::new();
     // A `?` after such a `{n}+`, written `{0,1}` so that it stays the greedy optional.
     let mut optional: Vec<usize> = Vec::new();
+    // #6172: a possessive quantifier something follows is the atomic group of its atom and
+    // quantifier, `X*+` for `(?>X*)`, which the second engine reads. The atom starts where the scan
+    // last saw one begin (a group's `(`, a class's `[`, an escape, a character), and the group
+    // opens there and closes after the `+`.
+    let mut atom: Option<usize> = None;
+    // The `(` of each group still open, and whether it only sets flags (`(?i)`), which is no atom.
+    let mut open_groups: Vec<(usize, bool)> = Vec::new();
+    // An escape the scan does not size (`\x41`, `\1`, `\k<n>`) leaves the atoms after it unknown.
+    let mut unsure = false;
+    // An inline `(?x)` is not modelled: the blank before a quantifier would be taken for the atom.
+    let inline_x = inline_extended(pattern);
+    // A lazy quantifier directly followed by `+` is a repeat of a repeat in jq, and the second
+    // engine reads it otherwise, so a pattern with one stays on the first engine.
+    let mut lazy_then_plus = false;
+    let mut opens: Vec<usize> = Vec::new();
+    let mut closes: Vec<usize> = Vec::new();
     let mut i = 0;
     while i < chars.len() {
         let before = std::mem::replace(&mut last, Last::Other);
         match chars[i] {
             '\\' if chars.get(i + 1) == Some(&'Q') => {
-                // A quoted run is literal up to `\E`, or to the end.
+                // A quoted run is literal up to `\E`, or to the end. A quantifier after it repeats
+                // the run's last character, which a group cannot wrap without opening inside the
+                // quote, so the atom stays unknown.
                 i += 2;
                 while i < chars.len() && !(chars[i] == '\\' && chars.get(i + 1) == Some(&'E')) {
                     i += 1;
                 }
+                atom = None;
                 i += 2;
             }
             // A braced escape (`\x{41}`, `\p{Lu}`, `\k{n}`) is one atom: its digits in braces are not
@@ -29979,16 +30003,121 @@ fn refuse_possessive_quantifier(
             '\\' if matches!(chars.get(i + 1), Some('x' | 'p' | 'P' | 'k' | 'g' | 'N'))
                 && chars.get(i + 2) == Some(&'{') =>
             {
+                atom = Some(i);
                 i = chars[i + 3..]
                     .iter()
                     .position(|&c| c == '}')
                     .map_or(i + 3, |close| i + 3 + close + 1);
             }
-            '\\' => i += 2,
+            '\\' => {
+                let next = chars.get(i + 1).copied();
+                match next {
+                    Some('x') => {
+                        // Up to two hexadecimal digits.
+                        atom = Some(i);
+                        i += 2;
+                        for _ in 0..2 {
+                            if chars.get(i).is_some_and(char::is_ascii_hexdigit) {
+                                i += 1;
+                            }
+                        }
+                    }
+                    Some('u') => {
+                        atom = Some(i);
+                        i += 2;
+                        for _ in 0..4 {
+                            if chars.get(i).is_some_and(char::is_ascii_hexdigit) {
+                                i += 1;
+                            }
+                        }
+                    }
+                    // A back-reference by number, a named one (`\k<n>`, `\g<n>`) and a control
+                    // character (`\cA`) are one atom each.
+                    Some(c) if c.is_ascii_digit() => {
+                        atom = Some(i);
+                        i += 1;
+                        while chars.get(i).is_some_and(char::is_ascii_digit) {
+                            i += 1;
+                        }
+                    }
+                    Some('k' | 'g') if matches!(chars.get(i + 2), Some('<' | '\'')) => {
+                        let close = if chars[i + 2] == '<' { '>' } else { '\'' };
+                        atom = Some(i);
+                        i += 3;
+                        while i < chars.len() && chars[i] != close {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    Some('c') if i + 2 < chars.len() => {
+                        atom = Some(i);
+                        i += 3;
+                    }
+                    Some(c)
+                        if c.is_ascii_alphanumeric()
+                            && !"dDwWsShHntrfvaeRXbBAzZGKN".contains(c) =>
+                    {
+                        unsure = true;
+                        i += 2;
+                    }
+                    _ => {
+                        atom = Some(i);
+                        i += 2;
+                    }
+                }
+            }
             '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') => {
+                // A comment is invisible: it neither is an atom nor ends one.
                 while i < chars.len() && chars[i] != ')' {
                     i += 1;
                 }
+                i += 1;
+            }
+            '(' => {
+                let start = i;
+                i += 1;
+                let mut flags_only = false;
+                if chars.get(i) == Some(&'?') {
+                    i += 1;
+                    match chars.get(i) {
+                        Some(':' | '>' | '=' | '!' | '~') => i += 1,
+                        Some('<') if matches!(chars.get(i + 1), Some('=' | '!')) => i += 2,
+                        Some(&open @ ('<' | '\'')) => {
+                            let close = if open == '<' { '>' } else { '\'' };
+                            i += 1;
+                            while i < chars.len() && chars[i] != close {
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                        _ => {
+                            // Flags, then `:` for a group of its own or `)` for a switch.
+                            while chars
+                                .get(i)
+                                .is_some_and(|c| c.is_ascii_alphabetic() || *c == '-')
+                            {
+                                i += 1;
+                            }
+                            if chars.get(i) == Some(&':') {
+                                i += 1;
+                            } else {
+                                flags_only = true;
+                            }
+                        }
+                    }
+                }
+                open_groups.push((start, flags_only));
+                atom = None;
+            }
+            ')' => {
+                atom = match open_groups.pop() {
+                    Some((start, false)) => Some(start),
+                    _ => None,
+                };
+                i += 1;
+            }
+            '|' => {
+                atom = None;
                 i += 1;
             }
             '#' if extended => {
@@ -29997,6 +30126,7 @@ fn refuse_possessive_quantifier(
                 }
             }
             '[' => {
+                atom = Some(i);
                 // A class runs to its first `]` that is not the leading one; a POSIX bracket
                 // (`[:alpha:]`) and an escape inside it are stepped over whole.
                 i += 1;
@@ -30028,7 +30158,17 @@ fn refuse_possessive_quantifier(
                     // Only `)` follows, so there is nothing left to scan.
                     break;
                 }
-                return Err(refusal());
+                match atom {
+                    // The group makes the repeat atomic, so the `+` goes, which also spares the
+                    // second engine an interval it would read as a repeat of a repeat.
+                    Some(start) if !unsure && !inline_x => {
+                        opens.push(start);
+                        closes.push(i + 1);
+                        drops.push(i);
+                        i += 1;
+                    }
+                    _ => return Err(refusal()),
+                }
             }
             // #6079: a fixed count has nothing to give back, so jq's `{n}+` is `{n}`; a quantifier
             // after it applies to that.
@@ -30042,7 +30182,10 @@ fn refuse_possessive_quantifier(
                 }
             }
             // The lazy marker of the quantifier before it; what follows is a new quantifier.
-            '?' if before != Last::Other => i += 1,
+            '?' if before != Last::Other => {
+                lazy_then_plus |= chars.get(i + 1) == Some(&'+');
+                i += 1;
+            }
             '*' | '+' | '?' => {
                 last = Last::Greedy;
                 i += 1;
@@ -30052,19 +30195,40 @@ fn refuse_possessive_quantifier(
                     last = if comma { Last::Greedy } else { Last::Fixed };
                     i = end;
                 }
-                None => i += 1,
+                None => {
+                    atom = Some(i);
+                    i += 1;
+                }
             },
-            _ => i += 1,
+            // Under `x` a blank between an atom and its quantifier is ignored.
+            c if extended && c.is_whitespace() => i += 1,
+            _ => {
+                atom = Some(i);
+                i += 1;
+            }
         }
     }
-    if drops.is_empty() {
+    if lazy_then_plus && !opens.is_empty() {
+        return Err(refusal());
+    }
+    if drops.is_empty() && opens.is_empty() {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
-    // Both lists are in ascending order, so each is walked once.
+    // Every list is in ascending order once sorted, so each is walked once.
+    opens.sort_unstable();
     let mut dropped = drops.iter().copied().peekable();
     let mut swapped = optional.iter().copied().peekable();
+    let mut opening = opens.iter().copied().peekable();
+    let mut closing = closes.iter().copied().peekable();
     let mut rewritten = String::new();
-    for (at, &c) in chars.iter().enumerate() {
+    for at in 0..=chars.len() {
+        while closing.next_if_eq(&at).is_some() {
+            rewritten.push(')');
+        }
+        while opening.next_if_eq(&at).is_some() {
+            rewritten.push_str("(?>");
+        }
+        let Some(&c) = chars.get(at) else { break };
         if dropped.next_if_eq(&at).is_some() {
             continue;
         }
@@ -143783,6 +143947,58 @@ mod tests {
                     refuse_possessive_quantifier(pattern, false),
                     Ok(Cow::Borrowed(_))
                 ),
+                "{pattern}"
+            );
+        }
+    }
+
+    /// #6172: a possessive quantifier something follows is the atomic group of its atom and
+    /// quantifier, wherever the atom starts.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_possessive_quantifier_becomes_an_atomic_group_6172() {
+        for (pattern, want) in [
+            ("a*+b", "(?>a*)b"),
+            ("a?+*", "(?>a?)*"),
+            ("a++{2}", "(?>a+){2}"),
+            ("xa{1,2}+b", "x(?>a{1,2})b"),
+            ("[ab]*+c", "(?>[ab]*)c"),
+            ("(ab)*+c", "(?>(ab)*)c"),
+            ("(?:a*+b)*+c", "(?>(?:(?>a*)b)*)c"),
+            ("a*+b*+c", "(?>a*)(?>b*)c"),
+            (r"\d*+c", r"(?>\d*)c"),
+            (r"\x41*+c", r"(?>\x41*)c"),
+            (r"\u0041*+c", r"(?>\u0041*)c"),
+            ("a{x*+c", "a{(?>x*)c"),
+            (r"\p{L}*+c", r"(?>\p{L}*)c"),
+            ("(?#c)a*+b", "(?#c)(?>a*)b"),
+            ("(?i)a*+b", "(?i)(?>a*)b"),
+            ("a|b*+c", "a|(?>b*)c"),
+            (r"(a)\12*+c", r"(a)(?>\12*)c"),
+            (r"\k<n>*+c", r"(?>\k<n>*)c"),
+            (r"\cA*+c", r"(?>\cA*)c"),
+            (r"(a)\1 b*+c", r"(a)\1 (?>b*)c"),
+        ] {
+            let got = refuse_possessive_quantifier(pattern, false).unwrap();
+            assert_eq!(got, want, "{pattern}");
+        }
+        // Under the `x` flag a blank between an atom and its quantifier is ignored.
+        let got = refuse_possessive_quantifier("ab *+c", true).unwrap();
+        assert_eq!(got, "a(?>b *)c");
+        // An atom the scan cannot place keeps the refusal, and so does a lazy quantifier followed by
+        // `+`, which the second engine reads otherwise.
+        for pattern in [
+            r"\Qab\E*+c",
+            r"\C-a*+c",
+            "(?i)*+c",
+            // An inline `(?x)` is not modelled.
+            "(?x)a *+ c",
+            "*+c",
+            "c?+a+?+",
+            "c?+a??+",
+        ] {
+            assert!(
+                refuse_possessive_quantifier(pattern, false).is_err(),
                 "{pattern}"
             );
         }
