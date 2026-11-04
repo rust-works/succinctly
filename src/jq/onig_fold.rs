@@ -641,6 +641,24 @@ mod tests {
     }
 
     #[test]
+    fn parts_that_hold_no_string_are_walked_past() {
+        // A branch that is only an option set or a comment.
+        assert!(rewrite("(?i)ß|(?m)").is_some());
+        assert!(rewrite("(?i)ß|(?#c)").is_some());
+        // A group that starts its branch is one string only if it holds nothing else.
+        assert!(rewrite("(?i)(?:(?:ss))s").is_some());
+        assert!(rewrite("(?i)(?:\\d)ss").is_some());
+        assert_eq!(rewrite("(?i)(?:\\d)s"), None);
+        // The class the translation writes for `\w`, and a class of ASCII letters, gain nothing.
+        let word = format!("(?i)[{JQ_WORD_CLASS}]");
+        assert_eq!(rewrite(&word), None);
+        assert_eq!(
+            rewrite("(?i)[s]ss").as_deref(),
+            Some(format!("(?i)[s]{SS}").as_str())
+        );
+    }
+
+    #[test]
     fn a_look_behind_expands_one_character_at_a_time() {
         for pattern in ["(?i)(?<=ss)a", "(?i)(?<!ß)a", "(?i)(?<=[ß])a"] {
             assert_eq!(rewrite(pattern), None, "{pattern}");
