@@ -7518,8 +7518,10 @@ Three differences remain.
   `fancy-regex` matches them, correctly.
   Oniguruma's rule is not a simple one (`(?<=a?)`, `(?<=a*)`, `(?<!a+)` and `(?<=a*a)` are accepted, `(?<=a*bc)` and `(?<=aa*)` are not), and reproducing it would mean reproducing its lookbehind compiler.
   An alternation whose branches are of fixed, differing widths is the part that is modelled (#6201): `(?<=a|bc)`, `(?<!a(?:b|cd))` and `(?<=(?:a|bc){2})` are refused here as in jq, wherever the alternation sits in a body with no repeat of a varying count.
-  Alternatives of one width (`(?<=ab|cd)`), a branch written empty (`(?<=a|)`) and a body with a varying repeat (`(?<=(?:a|bc)?)`) are accepted by both, and a branch holding a backreference, an atomic group or a comment is not counted.
-  Over 8,000 generated look-behinds with no varying repeat the two agree on every pattern, and none that jq accepts is refused over 12,000 more with them.
+  So is one under a repeat that must run at least once, when the repeat is the body or an item of its concatenation (`(?<=(?:a|bc)+)`, `(?<=x(?:a|bc){1,2})`).
+  Alternatives of one width (`(?<=ab|cd)`), a branch written empty (`(?<=a|)`) and a body with a varying repeat that may run zero times (`(?<=(?:a|bc)?)`, `(?<=(?:a|bc)*)`) are accepted by both, and a branch holding a backreference, an atomic group or a comment is not counted.
+  Left accepted here though jq refuses them: `(?<=(?:a|bc)*e)` (the same repeat beside another item), `(?<=(?:a|b)+)`, `(?<=\R|a)` (`\R` is one or two characters), a branch with an anchor beside a character (`(?<=a|b\z)`), and any look-behind under the `x` flag or an inline `(?x)`, whose blanks the check cannot see.
+  Over 8,000 generated look-behinds with no varying repeat the two agree on every pattern, and none that jq accepts is refused over 32,000 more with them.
   The part about a lookahead inside a look-behind (`(?<=(?=a)a)`) is #6197.
   Pinned by `test_lookbehind_oniguruma_refuses_is_answered_5502`.
 - **A `\K` that ends a look-behind match ends the global search here; jq's never ends.**

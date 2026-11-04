@@ -29431,14 +29431,58 @@ fn look_behind_alternatives_differ(pattern: &str) -> bool {
         }
     }
 
+    /// Whether `ast`, a look-behind's body, is or concatenates a repeat of a varying count that must
+    /// run at least once over an alternation of differing fixed widths, none written empty
+    /// (`(?:a|bc)+`, `x(?:a|bc){1,2}`): Oniguruma refuses that. Under another repeat or beside a
+    /// branch that can be empty it is held to other rules, which are not modelled
+    /// (`(?<=(?:(?:a|bc)+)?)` is accepted), and under a repeat that may run zero times it is too.
+    fn repeated_differs(ast: &Ast, opaque: &[usize], behind: &[usize]) -> bool {
+        match ast {
+            Ast::Group(group) => {
+                let start = group.span.start.offset;
+                !opaque.contains(&start)
+                    && !behind.contains(&start)
+                    && repeated_differs(&group.ast, opaque, behind)
+            }
+            Ast::Concat(concat) => concat
+                .asts
+                .iter()
+                .any(|ast| repeated_differs(ast, opaque, behind)),
+            Ast::Repetition(repetition) => {
+                let at_least_once = match &repetition.op.kind {
+                    RepetitionKind::OneOrMore => true,
+                    RepetitionKind::Range(RepetitionRange::AtLeast(n)) => *n >= 1,
+                    RepetitionKind::Range(RepetitionRange::Bounded(low, high)) => {
+                        low != high && *low >= 1
+                    }
+                    _ => false,
+                };
+                let mut body: &Ast = &repetition.ast;
+                while let Ast::Group(group) = body {
+                    let start = group.span.start.offset;
+                    if opaque.contains(&start) || behind.contains(&start) {
+                        break;
+                    }
+                    body = &group.ast;
+                }
+                at_least_once
+                    && matches!(body, Ast::Alternation(_))
+                    && no_empty_branch(body)
+                    && differs(body, opaque, behind)
+            }
+            _ => false,
+        }
+    }
+
     /// Whether `ast` holds a look-behind with such an alternation in its body.
     fn refused(ast: &Ast, opaque: &[usize], behind: &[usize]) -> bool {
         match ast {
             Ast::Group(group) => {
                 (behind.contains(&group.span.start.offset)
-                    && fixed_counts(&group.ast)
-                    && no_empty_branch(&group.ast)
-                    && differs(&group.ast, opaque, behind))
+                    && ((fixed_counts(&group.ast)
+                        && no_empty_branch(&group.ast)
+                        && differs(&group.ast, opaque, behind))
+                        || repeated_differs(&group.ast, opaque, behind)))
                     || refused(&group.ast, opaque, behind)
             }
             Ast::Repetition(repetition) => refused(&repetition.ast, opaque, behind),
@@ -147505,6 +147549,15 @@ mod tests {
             "(?<=(?<=a|bc)d)e",
             "x|(?<=a|bc)d",
             "(?:(?<=a|bc)d)+",
+            // A repeat that must run at least once over such an alternation, alone or in a
+            // concatenation, through groups.
+            "(?<=(?:a|bc)+)d",
+            "(?<=(?:a|bc){1,2})d",
+            "(?<=(?:a|bc){2,})d",
+            "(?<=x(?:a|bc)+)d",
+            "(?<=((?:a|bc)+))d",
+            "(?<=(?:(?:a|bc))+)d",
+            "(?<=(?<=a|bc)+)d",
         ] {
             assert!(look_behind_alternatives_differ(pattern), "{pattern}");
         }
@@ -147521,7 +147574,13 @@ mod tests {
             "(?<=(?:a|bc)?)d",
             "(?<=(?:a|bc)*)d",
             "(?<=(?:(?:bc)?){2}|a)d",
-            "(?<=(?:a|bc){1,2})d",
+            // A repeat that may run zero times, or sits under another, or beside an empty branch.
+            "(?<=(?:a|bc){0,2})d",
+            "(?<=(?:(?:a|bc)+)?)d",
+            "(?<=(?:a|bc|)+)d",
+            "(?<=(?:a|b)+)d",
+            "(?<=(?>a|bc)+)d",
+            "(?<=a+)d",
             // Anything this cannot size: a backreference, an atomic group, a comment.
             r"(?<=\1|bc)d",
             "(?<=(?>a|bc))d",

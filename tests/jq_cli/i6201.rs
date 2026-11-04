@@ -41,6 +41,16 @@ const ROWS: &[(&str, Option<&str>)] = &[
     (r"(?<=(a)|bc)d", None),
     (r"(?<=\p{L}|bc)d", None),
     (r"(?<=.|bc)d", None),
+    (r"(?<=(?:a|bc)+)d", None),
+    (r"(?<=(?:a|bc){1,2})d", None),
+    (r"(?<=(?:a|bc){2,})d", None),
+    (r"(?<=(?:a|bc)+?)d", None),
+    (r"x(?<=ab(?:a|bc)+)d", None),
+    (r"(?<=(?:a|bc)*)d", Some("[[3,1]]")),
+    (r"(?<=(?:a|bc)?)d", Some("[[3,1]]")),
+    (r"(?<=(?:(?:a|bc)+)?)d", Some("[[3,1]]")),
+    (r"(?<=(?:a|bc){0,2})d", Some("[[3,1]]")),
+    (r"(?<=(?:(?:a|bc)+)*)d", Some("[[3,1]]")),
 ];
 
 #[test]
