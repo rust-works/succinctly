@@ -158,18 +158,17 @@ fn test_the_regex_cache_keeps_l_and_n_apart_5530() -> Result<()> {
     ])
 }
 
-/// A repeat of an empty non-capturing group keeps the search the pattern had: `fancy-regex`'s
-/// parser refuses it (`TargetNotRepeatable`), so neither mode can be applied
-/// (`"a" | match("(?:)+?|a"; "n")` is `"a"` in jq 1.7.1, and
-/// `"ba" | match("(?:){1,2}a?||"; "l")` is `"a"` at offset 1). Pinned as the divergence it is
-/// (docs/compliance/jq/limitations.md), so closing it is a visible change. `()` is not affected.
+/// A repeat of an empty non-capturing group takes `n` and `l` like any other pattern (#6165):
+/// `fancy-regex`'s default dialect refuses it (`TargetNotRepeatable`) but Oniguruma mode does not,
+/// and the pattern is read in that mode. `"a" | match("(?:)+?|a"; "n")` is `"a"` in jq 1.7.1, and
+/// `"ba" | match("(?:){1,2}a?||"; "l")` is `"a"` at offset 1. `()` was never affected.
 #[test]
-fn test_a_repeated_empty_group_keeps_its_old_search_5530() -> Result<()> {
+fn test_a_repeated_empty_group_takes_n_and_l_5530() -> Result<()> {
     for (filter, expected) in [
-        (r#""a" | [match("(?:)+?|a"; "n") | .string]"#, "[]"),
+        (r#""a" | [match("(?:)+?|a"; "n") | .string]"#, r#"["a"]"#),
         (
             r#""ba" | [match("(?:){1,2}a?||"; "l") | [.offset, .string]]"#,
-            r#"[[0,""]]"#,
+            r#"[[1,"a"]]"#,
         ),
         (r#""a" | [match("()+?|a"; "n") | .string]"#, r#"["a"]"#),
     ] {

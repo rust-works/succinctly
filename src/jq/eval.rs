@@ -30399,7 +30399,21 @@ fn build_fancy_regex_at<S: EvalSemantics>(
         .then(|| guard_prefix_lifting(source, true))
         .flatten();
     let pattern = prepare_fancy_pattern(guarded.as_deref().unwrap_or(source))?;
-    let tree = fancy_regex::Expr::parse_tree(&pattern).ok()?;
+    // #6165: the tree is read the way the builder below reads the pattern when the default parse
+    // refuses it. A stacked repeat (`a**`, `a+*`, `a?*`) and a repeated empty group (`(?:)+`) are
+    // refused there and taken in Oniguruma mode, as in jq. A pattern with a `(?#...)` comment is
+    // not read that way: Oniguruma mode gives a repeat after a comment a target, where jq refuses
+    // `(?#)?` and `(?:(?#)?|b)` with `target of repeat operator is invalid` (#6128).
+    let tree = fancy_regex::Expr::parse_tree(&pattern).ok().or_else(|| {
+        if pattern.contains("(?#") {
+            return None;
+        }
+        fancy_regex::Expr::parse_tree_with_flags(
+            &pattern,
+            fancy_regex::internal::FLAG_ONIGURUMA_MODE | fancy_regex::internal::FLAG_UNICODE,
+        )
+        .ok()
+    })?;
     if !fancy_expr_is_oniguruma(&tree.expr)
         || tree.expr.has_descendant(|e| !fancy_expr_is_oniguruma(e))
     {
@@ -134122,16 +134136,16 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
-    fn test_dollar_tie_keeps_the_trimmed_match_when_fancy_regex_refuses_5572() {
-        // `fancy-regex`'s parser refuses a repeat of an empty group, so the exact engine is not
-        // available for this pattern and the tie keeps the trimmed text's (shorter) match. jq 1.7.1
-        // has `[3,2]`. Pinned as the divergence it is: when it is closed this test is the one to flip.
+    fn test_dollar_tie_takes_the_longer_match_of_a_repeated_empty_group_6165() {
+        // `fancy-regex`'s default dialect refuses a repeat of an empty group, which left the exact
+        // engine unavailable and the tie on the trimmed text's shorter match (`[3,1]`). The pattern
+        // is read in Oniguruma mode now (#6165), so the tie is decided as jq 1.7.1 decides it.
         assert_eq!(
             outputs(
                 br#""abc \n""#,
                 r#"[match("(?:)+\\s+$") | [.offset, .length]]"#
             ),
-            ["[[3,1]]"]
+            ["[[3,2]]"]
         );
     }
 
@@ -135710,20 +135724,20 @@ mod tests {
             outputs(br#""aa""#, r#"match("a*?"; "l") | [.offset, .string]"#),
             [r#"[0,""]"#]
         );
-        // `fancy-regex`'s parser refuses a repeat of an empty non-capturing group
-        // (`TargetNotRepeatable`), so a pattern with one keeps its old search under either flag
-        // (`"a" | match("(?:)+?|a"; "n")` is `"a"` in jq, `"ba" | match("(?:){1,2}a?||"; "l")`
-        // is `"a"` at offset 1). `()` is a group, not an empty expression, and is routed.
+        // A repeat of an empty non-capturing group is routed too (#6165: the default dialect of
+        // `fancy-regex` refuses it, Oniguruma mode does not), as jq answers it:
+        // `"a" | match("(?:)+?|a"; "n")` is `"a"`, `"ba" | match("(?:){1,2}a?||"; "l")` is `"a"` at
+        // offset 1.
         assert_eq!(
             outputs(br#""a""#, r#"[match("(?:)+?|a"; "n") | .string]"#),
-            ["[]"]
+            [r#"["a"]"#]
         );
         assert_eq!(
             outputs(
                 br#""ba""#,
                 r#"[match("(?:){1,2}a?||"; "l") | [.offset, .string]]"#
             ),
-            [r#"[[0,""]]"#]
+            [r#"[[1,"a"]]"#]
         );
         // `ln` keeps its old route whole too, `n`'s skip-forward search included: fixing `n` alone
         // would change which wrong answer the pair gives (`"aa" | match("a*?"; "ln")` is `"aa"`
