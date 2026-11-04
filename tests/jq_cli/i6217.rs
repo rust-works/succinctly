@@ -21,6 +21,26 @@ fn filter(pattern: &str) -> String {
 fn test_xdigit_is_the_ascii_hex_digits_6217() -> Result<()> {
     for (pattern, expected) in [
         (
+            r"[^\p{XDigit}x]",
+            "[false,false,false,false,true,true,true,true,true,true]",
+        ),
+        (
+            r"[a\P{XDigit}]",
+            "[true,false,false,false,true,true,true,true,true,true]",
+        ),
+        (
+            r"[^\P{XDigit}x]",
+            "[true,true,true,true,false,false,false,false,false,false]",
+        ),
+        (
+            r"[\p{^XDigit}]",
+            "[false,false,false,false,true,true,true,true,true,true]",
+        ),
+        (
+            r"[\p{XDigit}\p{L}]",
+            "[true,true,true,true,true,false,false,false,true,false]",
+        ),
+        (
             r"\p{XDigit}",
             "[true,true,true,true,false,false,false,false,false,false]",
         ),
