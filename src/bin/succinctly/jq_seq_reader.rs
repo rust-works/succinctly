@@ -82,6 +82,11 @@ const ASCII_RS: u8 = 0x1e;
 /// `char buf[4096]`, and `fgets` reserves one byte for the terminating NUL.
 pub(crate) const JQ_FGETS_CHUNK: usize = 4095;
 
+/// The fault the reader records for `jv_parser_next`'s message-less return (#5662): `input` raises
+/// it as `break`, the error an exhausted stream raises, and jq's main loop takes it for the end of
+/// the stream and stops reading, where it prints any other fault as ignored (#6137).
+pub(crate) const MESSAGELESS_RETURN: &str = "break";
+
 /// jq 1.7.1's `main` line for a `--seq` parse error it skips
 /// (`fprintf(stderr, "jq: ignoring parse error: %s\n", ...)`), for the
 /// parse error `body`. The one spelling of it: the reader's warnings, #1525's
@@ -1138,7 +1143,7 @@ impl<'a> Reader<'a> {
                     // return is its `break` -- the error an exhausted stream raises -- but the
                     // stream is not over: the next read scans on, and the call that
                     // performed the terminal refill is spent.
-                    self.record_fault("break");
+                    self.record_fault(MESSAGELESS_RETURN);
                     self.yielded_in_final_buffer = true;
                 } else {
                     self.stopped = true;
