@@ -31775,6 +31775,17 @@ fn atomize_option_group(pattern: &str, at: usize) -> Option<String> {
     if close != start - 1 {
         return None;
     }
+    // #6221: a plain group whose body is a sequence of two nodes (`(?:\G(?m))*`, `(?:\G(?:(?m)))*`)
+    // is a valid target to Oniguruma. Its body is zero-width (that is why the
+    // crate refused it), so an atomic group matches as it does.
+    if pattern.get(open..)?.starts_with("(?:") && body_is_a_sequence(&pattern[open + 3..close]) {
+        return Some(format!(
+            "{}(?>{}|(?!)){}",
+            &pattern[..open],
+            &pattern[open + 3..close],
+            &pattern[close + 1..]
+        ));
+    }
     // #6187: a plain group whose whole body is one group (`(?:(?i:\K))*`, `(?:(?:(?i:\G)))*`) is a
     // repeat of that inner group, which `fancy-regex` refuses for the same reason. Only the group
     // that holds the zero-width body can be made atomic, so it is the one rewritten; `(?:\K)*` and
@@ -31807,6 +31818,81 @@ fn atomize_option_group(pattern: &str, at: usize) -> Option<String> {
         &pattern[colon + 1..close],
         &pattern[close + 1..]
     ))
+}
+
+/// Whether the body of a plain group has no top-level `|` and is a sequence of two nodes or more to
+/// Oniguruma (#6221): `\G(?m)` and `\G(?:(?m))` are, `\G` and `(?m)\Z` are not. A bare option
+/// group (`(?m)`, `(?-x)`) is a node only after another one: one that comes first is the enclosing
+/// group of the rest (`(?m)\Z` is `(?m:\Z)`). A `(?#...)` comment is no node.
+#[cfg(feature = "regex")]
+fn body_is_a_sequence(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    let mut items = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'|' => return false,
+            b'\\' => {
+                items += 1;
+                i += 2;
+                continue;
+            }
+            b'[' => {
+                items += 1;
+                let mut depth = 1usize;
+                i += 1;
+                if bytes.get(i) == Some(&b'^') {
+                    i += 1;
+                }
+                if bytes.get(i) == Some(&b']') {
+                    i += 1;
+                }
+                while i < bytes.len() && depth > 0 {
+                    match bytes[i] {
+                        b'\\' => i += 1,
+                        b'[' => depth += 1,
+                        b']' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            b'(' => {
+                let rest = &body[i + 1..];
+                if let Some(flags) = rest.strip_prefix('?') {
+                    let letters = flags
+                        .bytes()
+                        .take_while(|b| b.is_ascii_alphabetic() || *b == b'-')
+                        .count();
+                    if letters > 0 && flags.as_bytes().get(letters) == Some(&b')') {
+                        // A bare option group: a node only after another one.
+                        if items > 0 {
+                            items += 1;
+                        }
+                        i += 2 + letters + 1;
+                        continue;
+                    }
+                    if flags.starts_with('#') {
+                        match matching_close(bytes, i) {
+                            Some(close) => i = close + 1,
+                            None => return false,
+                        }
+                        continue;
+                    }
+                }
+                items += 1;
+                match matching_close(bytes, i) {
+                    Some(close) => i = close + 1,
+                    None => return false,
+                }
+                continue;
+            }
+            _ => items += 1,
+        }
+        i += 1;
+    }
+    items >= 2
 }
 
 /// The byte index of the `)` that closes the `(` at `open`, skipping escapes and classes. `None`
@@ -136121,18 +136207,29 @@ mod tests {
             atomize_option_group(two, at(two)).as_deref(),
             Some(r"a(?:(?:(?x:(?>\G|(?!))))){1,2}")
         );
-        // The wrapper must hold that one group and nothing else, and the `)` before the operator
-        // must close the group the scan found (an escaped one closes nothing). `fancy-regex` never
-        // asks about these, because it takes a repeat of a body with another node, but the guards
-        // are what keep a corrupt rewrite from being offered if it ever does.
+        // A body of two nodes is a valid target too (#6221); `fancy-regex` asks about one only when
+        // the body is nothing but zero-width, the rewrite being the atomic group of the body.
+        for (pattern, rewritten) in [
+            (r"(?:a(?i:\K))*", r"(?>a(?i:\K)|(?!))*"),
+            (r"(?:(?i:\K)a)*", r"(?>(?i:\K)a|(?!))*"),
+            (r"(?:(?i:\K)(?i:\G))*", r"(?>(?i:\K)(?i:\G)|(?!))*"),
+            (r"(?:\G(?m))*", r"(?>\G(?m)|(?!))*"),
+        ] {
+            assert_eq!(
+                atomize_option_group(pattern, at(pattern)).as_deref(),
+                Some(rewritten),
+                "{pattern}"
+            );
+        }
+        // An alternation, a body of one node, a bare option group first (it encloses the rest), and a
+        // `)` before the operator that does not close the group the scan found (an escaped one closes
+        // nothing) are not offered a rewrite.
         for pattern in [
-            r"(?:a(?i:\K))*",
-            r"(?:(?i:\K)a)*",
             r"(?:(?i:\K)|b)*",
-            r"(?:(?i:\K)(?i:\G))*",
             r"(?:(?i:\K))\)*",
             r"(?:\K)*",
             r"(?:(?:\G))*",
+            r"(?:(?m)\Z)*",
         ] {
             assert_eq!(
                 atomize_option_group(pattern, at(pattern)),
