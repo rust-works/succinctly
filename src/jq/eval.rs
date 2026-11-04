@@ -28716,6 +28716,16 @@ fn translate_posix_brackets(
             "invalid regex: target of repeat operator is invalid",
         ));
     }
+    // #6201: a look-behind with alternatives of different widths.
+    if (pattern.contains("(?<=") || pattern.contains("(?<!"))
+        && !extended
+        && !inline_extended(pattern)
+        && look_behind_alternatives_differ(pattern)
+    {
+        return Err(EvalError::new(
+            "invalid regex: invalid pattern in look-behind",
+        ));
+    }
     Ok(translated)
 }
 
@@ -29285,6 +29295,187 @@ fn property_name_kind(raw: &str) -> PropertyName {
         | "mcm" => PropertyName::Refused,
         _ => PropertyName::Other,
     }
+}
+
+/// Whether some look-behind of `pattern` holds an alternation whose branches are all of fixed width
+/// and not all the same, none written as empty (#6201): `(?<=a|bc)`, `(?<!a(?:b|cd))`,
+/// `(?<=(?:a|bc){2})`. Oniguruma, in the Perl syntax jq uses, refuses it (`invalid pattern in
+/// look-behind`), and the `regex` crate answers it.
+///
+/// This is part of what Oniguruma refuses, not all: a body whose width varies by a repeat (`a?`,
+/// `a*bc`) is refused in some shapes and not in others, and every shape that was tried is kept
+/// where it was. Alternation branches of one width (`ab|cd`) and a branch that can be empty (`a|`)
+/// are accepted. A branch holding anything this cannot size (a backreference, a nested lookaround or
+/// atomic group, a comment) is not counted.
+#[cfg(feature = "regex")]
+fn look_behind_alternatives_differ(pattern: &str) -> bool {
+    use regex_syntax::ast::{self, Ast, RepetitionKind, RepetitionRange};
+
+    /// The one width `ast` can match, if it has one and this can tell.
+    fn fixed(ast: &Ast, opaque: &[usize], behind: &[usize]) -> Option<usize> {
+        match ast {
+            Ast::Empty(_) | Ast::Flags(_) | Ast::Assertion(_) => Some(0),
+            Ast::Literal(literal) => {
+                // A backreference is read as one literal character here, and is not one.
+                (!opaque.contains(&literal.span.start.offset)).then_some(1)
+            }
+            Ast::Dot(_) | Ast::ClassUnicode(_) | Ast::ClassPerl(_) | Ast::ClassBracketed(_) => {
+                Some(1)
+            }
+            Ast::Group(group) => {
+                let start = group.span.start.offset;
+                if behind.contains(&start) {
+                    // A look-behind inside one takes up no width of its own.
+                    Some(0)
+                } else if opaque.contains(&start) {
+                    None
+                } else {
+                    fixed(&group.ast, opaque, behind)
+                }
+            }
+            Ast::Concat(concat) => concat.asts.iter().try_fold(0usize, |total, ast| {
+                fixed(ast, opaque, behind).map(|w| total.saturating_add(w))
+            }),
+            Ast::Alternation(alternation) => {
+                let mut widths = alternation
+                    .asts
+                    .iter()
+                    .map(|ast| fixed(ast, opaque, behind));
+                let first = widths.next()??;
+                widths.all(|w| w == Some(first)).then_some(first)
+            }
+            Ast::Repetition(repetition) => {
+                let count = match &repetition.op.kind {
+                    RepetitionKind::Range(RepetitionRange::Exactly(n)) => *n as usize,
+                    RepetitionKind::Range(RepetitionRange::Bounded(low, high)) if low == high => {
+                        *low as usize
+                    }
+                    _ => return None,
+                };
+                fixed(&repetition.ast, opaque, behind).map(|w| w.saturating_mul(count))
+            }
+        }
+    }
+
+    /// Whether every repeat in `ast` has a fixed count. A body with a repeat of a varying count is
+    /// held to other rules, which are not modelled (`(?<=(?:a|bc)?)` is accepted).
+    fn fixed_counts(ast: &Ast) -> bool {
+        match ast {
+            Ast::Repetition(repetition) => {
+                let exact = match &repetition.op.kind {
+                    RepetitionKind::Range(RepetitionRange::Exactly(_)) => true,
+                    RepetitionKind::Range(RepetitionRange::Bounded(low, high)) => low == high,
+                    _ => false,
+                };
+                exact && fixed_counts(&repetition.ast)
+            }
+            Ast::Group(group) => fixed_counts(&group.ast),
+            Ast::Concat(concat) => concat.asts.iter().all(fixed_counts),
+            Ast::Alternation(alternation) => alternation.asts.iter().all(fixed_counts),
+            _ => true,
+        }
+    }
+
+    /// Whether `ast` is written as nothing at all (`a|`, `(?:)`), which is not the same as an
+    /// assertion, whose width is none too: `(?<=(?:.|\b))` is refused, `(?<=(?:.|))` is not.
+    fn written_empty(ast: &Ast) -> bool {
+        match ast {
+            Ast::Empty(_) => true,
+            Ast::Group(group) => written_empty(&group.ast),
+            Ast::Concat(concat) => concat.asts.iter().all(written_empty),
+            _ => false,
+        }
+    }
+
+    /// Whether no alternation in `ast` has a branch that matches nothing. One that does makes the
+    /// body optional, and is held to other rules (`(?<=(?:a|bc)|)` is accepted).
+    fn no_empty_branch(ast: &Ast) -> bool {
+        match ast {
+            Ast::Alternation(alternation) => alternation
+                .asts
+                .iter()
+                .all(|ast| !written_empty(ast) && no_empty_branch(ast)),
+            Ast::Group(group) => no_empty_branch(&group.ast),
+            Ast::Repetition(repetition) => no_empty_branch(&repetition.ast),
+            Ast::Concat(concat) => concat.asts.iter().all(no_empty_branch),
+            _ => true,
+        }
+    }
+
+    /// Whether `ast`, inside a look-behind, holds an alternation of differing fixed widths.
+    fn differs(ast: &Ast, opaque: &[usize], behind: &[usize]) -> bool {
+        match ast {
+            Ast::Alternation(alternation) => {
+                let widths: Vec<Option<usize>> = alternation
+                    .asts
+                    .iter()
+                    .map(|ast| fixed(ast, opaque, behind))
+                    .collect();
+                let sized: Option<Vec<usize>> = widths.into_iter().collect();
+                if let Some(sized) = sized {
+                    if sized.iter().any(|&w| w != sized[0]) {
+                        return true;
+                    }
+                }
+                alternation
+                    .asts
+                    .iter()
+                    .any(|ast| differs(ast, opaque, behind))
+            }
+            Ast::Group(group) => {
+                !opaque.contains(&group.span.start.offset) && differs(&group.ast, opaque, behind)
+            }
+            Ast::Repetition(repetition) => differs(&repetition.ast, opaque, behind),
+            Ast::Concat(concat) => concat.asts.iter().any(|ast| differs(ast, opaque, behind)),
+            _ => false,
+        }
+    }
+
+    /// Whether `ast` holds a look-behind with such an alternation in its body.
+    fn refused(ast: &Ast, opaque: &[usize], behind: &[usize]) -> bool {
+        match ast {
+            Ast::Group(group) => {
+                (behind.contains(&group.span.start.offset)
+                    && fixed_counts(&group.ast)
+                    && no_empty_branch(&group.ast)
+                    && differs(&group.ast, opaque, behind))
+                    || refused(&group.ast, opaque, behind)
+            }
+            Ast::Repetition(repetition) => refused(&repetition.ast, opaque, behind),
+            Ast::Concat(concat) => concat.asts.iter().any(|ast| refused(ast, opaque, behind)),
+            Ast::Alternation(alternation) => alternation
+                .asts
+                .iter()
+                .any(|ast| refused(ast, opaque, behind)),
+            _ => false,
+        }
+    }
+
+    let Some(shadow) = oniguruma_shadow(pattern) else {
+        return false;
+    };
+    let Ok(ast) = ast::parse::Parser::new().parse(&shadow.text) else {
+        return false;
+    };
+    // The look-behind groups are among the opaque offsets; their bodies are read.
+    let is_behind = |at: usize| {
+        pattern
+            .get(at..)
+            .is_some_and(|rest| rest.starts_with("(?<=") || rest.starts_with("(?<!"))
+    };
+    let behind: Vec<usize> = shadow
+        .opaque
+        .iter()
+        .copied()
+        .filter(|&at| is_behind(at))
+        .collect();
+    let opaque: Vec<usize> = shadow
+        .opaque
+        .iter()
+        .copied()
+        .filter(|&at| !is_behind(at))
+        .collect();
+    refused(&ast, &opaque, &behind)
 }
 
 /// Whether a repetition operator follows the comments that start at `at` (`(?#...)`, any number of
@@ -147286,6 +147477,61 @@ mod tests {
                 escape_class_range_dashes(pattern, false).is_err(),
                 "{pattern}"
             );
+        }
+    }
+
+    /// #6201: which look-behinds the width check refuses, one per kind of item it sizes.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_look_behind_of_alternatives_of_different_widths_is_found_6201() {
+        for pattern in [
+            "(?<=a|bc)d",
+            "(?<!a|bc)d",
+            "(?<=(?:a|bc)d)e",
+            "(?<=a(?:b|cd))e",
+            "(?<=(?:a|bc){2})d",
+            "(?<=(?:a|bc){2,2})d",
+            "(?<=(?:ab){2}|cdc)e",
+            r"(?<=\d|ab)c",
+            "(?<=.|bc)d",
+            "(?<=[ab]|cd)e",
+            "(?<=[^a]|cd)e",
+            r"(?<=\p{L}|cd)e",
+            r"(?<=\b|a)b",
+            "(?<=(?i)a|bc)d",
+            "(?<=(?i:a)|bc)d",
+            // A look-behind inside one takes up no width, and is checked itself.
+            "(?<=(?<=a)b|cd)e",
+            "(?<=(?<=a|bc)d)e",
+            "x|(?<=a|bc)d",
+            "(?:(?<=a|bc)d)+",
+        ] {
+            assert!(look_behind_alternatives_differ(pattern), "{pattern}");
+        }
+        for pattern in [
+            "(?<=ab|cd)e",
+            "(?<=a|b)c",
+            "(?<=a{2}|bc)d",
+            "(?<=(?:a|b){2})d",
+            "(?<=(?:ab){2}|cdcd)e",
+            // A branch written as empty, or a repeat of a varying count, is held to other rules.
+            "(?<=a|)c",
+            "(?<=(?:a|bc)|)d",
+            "(?<=a?)c",
+            "(?<=(?:a|bc)?)d",
+            "(?<=(?:a|bc)*)d",
+            "(?<=(?:(?:bc)?){2}|a)d",
+            "(?<=(?:a|bc){1,2})d",
+            // Anything this cannot size: a backreference, an atomic group, a comment.
+            r"(?<=\1|bc)d",
+            "(?<=(?>a|bc))d",
+            "(?<=(?#c)a|bc)d",
+            // No look-behind, a lookahead, an unclosed group.
+            "a|bc",
+            "(?=a|bc)d",
+            "(?<=a|bc",
+        ] {
+            assert!(!look_behind_alternatives_differ(pattern), "{pattern}");
         }
     }
 

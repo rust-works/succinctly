@@ -7514,9 +7514,13 @@ Three differences remain.
   `?` and `try` catch the error like any other.
   Pinned by `test_backtrack_limit_is_a_catchable_error_5502`.
 - **Some lookbehinds Oniguruma refuses are answered.**
-  Oniguruma refuses a lookbehind whose alternatives have different fixed lengths (`(?<=ab|c)`, `(?<!a|bb)`), one holding a lookahead (`(?<=(?=a)a)`) and some others (`(?<!a*b)`), with `invalid pattern in look-behind`.
+  Oniguruma refuses a lookbehind whose body repeats a varying number of times in some shapes (`(?<!a*b)`, `(?<=a*bc)`, `(?<=aa*)`), with `invalid pattern in look-behind`.
   `fancy-regex` matches them, correctly.
-  Oniguruma's rule is not a simple one (`(?<=a|b+)` and `(?<!a+)` are accepted), and reproducing it would mean reproducing its lookbehind compiler.
+  Oniguruma's rule is not a simple one (`(?<=a?)`, `(?<=a*)`, `(?<!a+)` and `(?<=a*a)` are accepted, `(?<=a*bc)` and `(?<=aa*)` are not), and reproducing it would mean reproducing its lookbehind compiler.
+  An alternation whose branches are of fixed, differing widths is the part that is modelled (#6201): `(?<=a|bc)`, `(?<!a(?:b|cd))` and `(?<=(?:a|bc){2})` are refused here as in jq, wherever the alternation sits in a body with no repeat of a varying count.
+  Alternatives of one width (`(?<=ab|cd)`), a branch written empty (`(?<=a|)`) and a body with a varying repeat (`(?<=(?:a|bc)?)`) are accepted by both, and a branch holding a backreference, an atomic group or a comment is not counted.
+  Over 8,000 generated look-behinds with no varying repeat the two agree on every pattern, and none that jq accepts is refused over 12,000 more with them.
+  The part about a lookahead inside a look-behind (`(?<=(?=a)a)`) is #6197.
   Pinned by `test_lookbehind_oniguruma_refuses_is_answered_5502`.
 - **A `\K` that ends a look-behind match ends the global search here; jq's never ends.**
   `"cab" | [match("(?<=a\\Kb)";"g")]` never answers in jq 1.7.1: the match is `[2,3)`, jq resumes at its end (3), and the look-behind finds the same match from there, so the search pushes it for ever and grows without bound.
