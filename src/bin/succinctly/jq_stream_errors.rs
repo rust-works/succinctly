@@ -650,11 +650,11 @@ pub(crate) fn read_for_slurp(
     read_keeping(sources, SLURP_TAIL, stop_at_fault, seq)
 }
 
+/// Sources already read: each one's tag and bytes.
+type ReadSources<'a> = &'a [(Option<usize>, Vec<u8>)];
+
 /// The reader over sources already read, of a `--seq` stream when `seq`.
-fn memory_reader(
-    sources: &[(Option<usize>, Vec<u8>)],
-    seq: bool,
-) -> Reader<MemorySources<&[(Option<usize>, Vec<u8>)]>> {
+fn memory_reader(sources: ReadSources<'_>, seq: bool) -> Reader<MemorySources<ReadSources<'_>>> {
     if seq {
         Reader::from_seq_source(MemorySources::new(sources))
     } else {
@@ -2232,38 +2232,38 @@ mod tests {
         assert_eq!(
             events(b"\x1e[1,2\x1e[3]\n"),
             [
-                r#"[[0],1]"#,
+                r"[[0],1]",
                 r#"["Truncated value at line 1, column 6",[1]]"#,
-                r#"[[0],3]"#,
-                r#"[[0]]"#
+                r"[[0],3]",
+                r"[[0]]"
             ]
         );
         assert_eq!(
             events(b"\x1e[1,}2]\n\x1e[3]\n"),
             [
-                r#"[[0],1]"#,
+                r"[[0],1]",
                 r#"["Expected another key:value pair at line 1, column 5 (need RS to resync)",[1]]"#,
                 r#"["Unmatched ']' at the top-level at line 1, column 7 (need RS to resync)",[]]"#,
-                r#"[[0],3]"#,
-                r#"[[0]]"#
+                r"[[0],3]",
+                r"[[0]]"
             ]
         );
         assert_eq!(
             events(b"\x1e{\"a\"\x1e[1]\n"),
             [
                 r#"["Truncated value at line 1, column 6",[null]]"#,
-                r#"[[0],1]"#,
-                r#"[[0]]"#
+                r"[[0],1]",
+                r"[[0]]"
             ]
         );
         assert_eq!(
             events(b"[1]\n"),
             [r#"["Unfinished abandoned text at EOF at line 2, column 0",[]]"#]
         );
-        assert_eq!(events(b"x\x1e[1]\n"), [r#"[[0],1]"#, r#"[[0]]"#]);
+        assert_eq!(events(b"x\x1e[1]\n"), [r"[[0],1]", r"[[0]]"]);
         // A whole BOM is skipped; one that stops short resets the parser at every call.
-        assert_eq!(events(b"\xef\xbb\xbf\x1e[1]\n"), [r#"[[0],1]"#, r#"[[0]]"#]);
-        assert_eq!(events(b"\xef\xbb\x1e[1]\n"), [r#"[[0],1]"#]);
+        assert_eq!(events(b"\xef\xbb\xbf\x1e[1]\n"), [r"[[0],1]", r"[[0]]"]);
+        assert_eq!(events(b"\xef\xbb\x1e[1]\n"), [r"[[0],1]"]);
         // Without `--seq` an RS is a literal byte, as before.
         assert_eq!(
             read(&[(None, b"[1]\n".to_vec())], false)
@@ -2271,7 +2271,7 @@ mod tests {
                 .iter()
                 .map(OwnedValue::to_json)
                 .collect::<Vec<_>>(),
-            [r#"[[0],1]"#, r#"[[0]]"#]
+            [r"[[0],1]", r"[[0]]"]
         );
     }
 }
