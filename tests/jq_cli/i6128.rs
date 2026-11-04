@@ -75,8 +75,8 @@ fn test_a_lazy_counted_repeat_ends_at_its_empty_way_6128() -> Result<()> {
 /// is five operations, so `{2,}?` is plain copies and `{3,}?` is a counted loop that leaves at
 /// the empty way. The rewrite is for the counted loop only. Rows from jq 1.7.1.
 #[test]
-fn test_an_unbounded_lazy_repeat_over_a_leading_consuming_way_is_unrolled_by_size_6128() -> Result<()>
-{
+fn test_an_unbounded_lazy_repeat_over_a_leading_consuming_way_is_unrolled_by_size_6128(
+) -> Result<()> {
     for (filter, expected) in [
         // Two copies of five operations: unrolled, the plain copies the `regex` crate reads.
         (
