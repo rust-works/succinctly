@@ -19,7 +19,9 @@
 //!
 //! A body whose ways are not listed here keeps its loop as written: one with a capture group (an
 //! empty iteration also sets the group, #6069), a zero-width assertion (its empty way depends on
-//! where it stands), or a flag switch. So does a lazy repeat that must run twice or more.
+//! where it stands), or a flag switch. A lazy repeat that must run twice or more is written copy by
+//! copy by `Rewriter::lazy_counted`; for an unbounded one over a body with a consuming way before
+//! its empty one that form still differs from Oniguruma's on a few patterns (#6128).
 
 use alloc::format;
 use alloc::string::String;
@@ -477,8 +479,18 @@ impl Rewriter<'_> {
             (Ways::Nullable { before, after }, _, Some(n), true) => {
                 return self.bounded(&body, before.clone(), after.clone(), n, text);
             }
-            // A lazy repeat that must run twice tries its later copies before leaving at an empty
-            // iteration, as Oniguruma does not.
+            (
+                Ways::Nullable {
+                    before,
+                    after: Some(after),
+                },
+                ..,
+            ) if !greedy && min >= 2 => {
+                return self.lazy_counted(before.clone(), after.clone(), min, max);
+            }
+            // A lazy repeat that runs once at most leaves where Oniguruma does (a differential over
+            // 2,800 generated patterns found no difference with or without the rewrite), and a
+            // body with no consuming way after its empty one is left as it is.
             _ => Ways::Unknown,
         };
         Ok(Piece { text, ways })
@@ -516,6 +528,52 @@ impl Rewriter<'_> {
         Ok(Piece {
             text: self.text(format!("(?:{})", piece.text.text), Prec::Atom)?,
             ways: piece.ways,
+        })
+    }
+
+    /// Oniguruma's lazy `X{min,max}?` that must run twice or more, for a body `X = A | ε | B`: copy `k` tries `ε A R(k+1) B R(k+1)` once `k` is past `min` (leaving
+    /// first, as a lazy repeat does) and `A R(k+1) ε B R(k+1)` before it, where `R(k)` is the copies
+    /// from `k` on, the lazy `(?:A|B)*?` once an unbounded repeat has run its `min`, and nothing after
+    /// `max`. The empty way leaves the loop at any copy, as it does a greedy one. Written out only
+    /// when `B` is not empty, as [`Self::bounded`] is.
+    fn lazy_counted(
+        &mut self,
+        before: Option<Text>,
+        after: Text,
+        min: u32,
+        max: Option<u32>,
+    ) -> Result<Piece, GiveUp> {
+        let consuming = |text: Text| Piece {
+            text,
+            ways: Ways::Consuming,
+        };
+        let mut rest = match max {
+            Some(_) => self.concat(&[], true)?,
+            None => {
+                let ways: Vec<Text> = before.iter().cloned().chain([after.clone()]).collect();
+                let body = self.alt_text(&ways)?.ok_or(GiveUp)?;
+                self.repeat(consuming(body), 0, None, false)?
+            }
+        };
+        for k in (1..=max.unwrap_or(min)).rev() {
+            let exit = self.concat(&[], true)?;
+            let mut ways = Vec::new();
+            if k > min {
+                ways.push(exit.clone());
+            }
+            if let Some(a) = &before {
+                ways.push(self.concat(&[consuming(a.clone()), rest.clone()], true)?);
+            }
+            if k <= min {
+                ways.push(exit);
+            }
+            ways.push(self.concat(&[consuming(after.clone()), rest.clone()], true)?);
+            rest = self.alt(&ways, true)?;
+        }
+        self.changed = true;
+        Ok(Piece {
+            text: self.text(format!("(?:{})", rest.text.text), Prec::Atom)?,
+            ways: rest.ways,
         })
     }
 
@@ -597,10 +655,10 @@ mod tests {
     #[test]
     fn a_loop_the_engines_agree_on_keeps_its_text() {
         for pattern in [
-            "(?:a|b*)+",  // the empty way comes last
-            "(?:b*|a)*?", // lazy
+            "(?:a|b*)+",      // the empty way comes last
+            "(?:b*|a)*?",     // lazy
+            "(?:b*|a){1,2}?", // lazy, runs once at most
             "(?:a|b*){2}",
-            "(?:b*|a){1,2}?",
             "(b*|a)+",     // a capture group
             "(?:^|a)+",    // an assertion
             "(?:b*|(a))+", // a capture group in a later way
@@ -612,6 +670,35 @@ mod tests {
         ] {
             assert_eq!(rewrite(pattern), None, "{pattern}");
         }
+    }
+
+    /// A lazy repeat that must run twice or more (#6128): copy `k` leaves first once it is past the
+    /// minimum, and takes its empty way in place before it.
+    #[test]
+    fn a_lazy_counted_loop_is_written_copy_by_copy() {
+        assert_eq!(
+            rewrite("(?:b*|a){2}?").as_deref(),
+            Some("(?:b+(?:b+||a)||a(?:b+||a))")
+        );
+        for pattern in ["(?:b*|a){2,3}?", "(?:b*|a){2,}?", "(?:b*|a){3,4}?"] {
+            assert!(rewrite(pattern).is_some(), "{pattern}");
+        }
+        // Past the minimum a copy leaves first: `{2,3}?` is `{2}?`'s copies, each of the second
+        // preceded by the empty way.
+        assert_eq!(
+            rewrite("(?:b*|a){2,3}?").as_deref(),
+            Some("(?:b+(?:b+(?:|b+|a)||a(?:|b+|a))||a(?:b+(?:|b+|a)||a(?:|b+|a)))")
+        );
+        // No consuming way after the empty one: the copies agree with Oniguruma.
+        assert_eq!(rewrite("(?:a|b*){2,3}?"), None);
+    }
+
+    /// The copies multiply with the count, so a large one hits the size limit and is left as
+    /// written, quickly.
+    #[test]
+    fn a_lazy_counted_loop_with_a_large_count_is_given_up() {
+        assert_eq!(rewrite("(?:b*|a){2,1000}?"), None);
+        assert_eq!(rewrite("(?:b*|a){1000,}?"), None);
     }
 
     #[test]
