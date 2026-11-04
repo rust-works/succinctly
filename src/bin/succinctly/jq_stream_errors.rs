@@ -527,21 +527,31 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> Reader<MemorySources<S>> {
     }
 }
 
+/// How a `--seq` [`Reader`] differs from a plain one.
+#[derive(Clone, Copy)]
+struct SeqMode {
+    /// Whether the run slurps, which keeps jq's loop reading after an empty record.
+    slurp: bool,
+    /// Whether a parse error is an input of its own (`--stream-errors`).
+    errors_are_events: bool,
+    /// Whether the program reads inputs of its own, which meet the end-of-stream stop as a
+    /// barrier (#6141).
+    stop_is_barrier: bool,
+}
+
 impl<R: RefillSource> Reader<R> {
     pub(crate) fn from_source(source: R) -> Self {
-        Self::with_seq(source, false, false, true, false)
+        Self::with_seq(source, None)
     }
 
-    /// The reader over `source` for `--seq` when `seq` is set (#6115). `slurp` is whether the run
-    /// slurps, which keeps jq's loop reading after an empty record. `stop_is_barrier` is whether
-    /// the program reads inputs of its own, which meet the stop as a barrier (#6141).
-    fn with_seq(
-        source: R,
-        seq: bool,
-        slurp: bool,
-        errors_are_events: bool,
-        stop_is_barrier: bool,
-    ) -> Self {
+    /// The reader over `source` for `--seq` when `seq` is given (#6115).
+    fn with_seq(source: R, seq: Option<SeqMode>) -> Self {
+        let mode = seq.unwrap_or(SeqMode {
+            slurp: false,
+            errors_are_events: true,
+            stop_is_barrier: false,
+        });
+        let seq = seq.is_some();
         Self {
             source,
             buf: Vec::new(),
@@ -552,9 +562,9 @@ impl<R: RefillSource> Reader<R> {
             finished: false,
             values_before_last_refill: 0,
             done: false,
-            stops_on_empty: seq && !slurp,
-            stop_is_barrier,
-            errors_end_call: seq && !errors_are_events,
+            stops_on_empty: seq && !mode.slurp,
+            stop_is_barrier: mode.stop_is_barrier,
+            errors_end_call: seq && !mode.errors_are_events,
             terminal_fault: false,
         }
     }
@@ -798,10 +808,11 @@ pub(crate) fn read_seq(
 ) -> SeqRead {
     let mut reader = Reader::with_seq(
         MemorySources::new(sources),
-        true,
-        slurp,
-        errors_are_events,
-        stop_is_barrier,
+        Some(SeqMode {
+            slurp,
+            errors_are_events,
+            stop_is_barrier,
+        }),
     );
     // Each event and each fault with its place in the sequence of inputs jq yielded.
     let mut events: Vec<(usize, OwnedValue, (usize, usize))> = Vec::new();
@@ -1795,7 +1806,12 @@ mod tests {
         assert_eq!(read.faults.len(), 1);
         assert_eq!(read.locations, vec![(0, CLOSED)]);
         assert!(!read.faults[0].after_array);
-        let read = read_seq(&[(None, b"\x1e[1]\n\x1e[2]\n".to_vec())], true, false, false);
+        let read = read_seq(
+            &[(None, b"\x1e[1]\n\x1e[2]\n".to_vec())],
+            true,
+            false,
+            false,
+        );
         assert!(read.faults.is_empty());
         assert_ne!(read.locations[0].1, CLOSED);
     }
