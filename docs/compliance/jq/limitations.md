@@ -7415,6 +7415,10 @@ The `regex` crate refused most of them, and read `\v` as a vertical tab (`"v" | 
 Pinned in `tests/jq_cli/i6080.rs`.
 A Python-style group (`(?P<n>a)`, `(?P=n)`, `(?P>n)`) is an error in jq (`undefined group option`), and the `regex` crate would accept the first.
 It is an error here too, with this crate's `invalid regex:` prefix where jq says `Regex failure:`, the same wording difference every refused pattern has.
+A group option other than `i`, `m`, `x`, `s` and `-` is the same error (`(?U)`, `(?u:a)`, `(?-R)`, `(?a)`, `(?)`, #6126), where the `regex` crate took `U` (swap greed), `u` and `R` as flags and rejected the other letters in its own words.
+`(?R)` is `unmatched close parenthesis` in jq, and here.
+The set was captured from jq 1.7.1 over every ASCII letter in five spellings each, and pinned in `tests/jq_cli/i6126.rs`.
+Not reproduced: an option run with a repeated `-` (`(?-)a`, `(?--i)a`, `(?i-m-s)a`) is accepted by jq and is the crate's parse error here, and a group call (`(?-1)a`, `(?1)a`, `(?&n)a`) or a pattern that ends inside `(?` is refused with the crate's wording where jq names the reason.
 The crate's `\b{start}`, `\b{end}`, `\b{start-half}` and `\b{end-half}` are `\b` followed by the literal text in jq, and are rewritten to that.
 These rewrites skip comments, as jq does (#5550): `(?#...)`, and `#` to the end of the line where the extended mode is on, from the `x` flag or an inline `(?x)`, `(?x:...)` or `(?-x)` followed group by group.
 So a `(?P` or a `[` in a comment is text (`test("ab # (?P\n"; "x")` is `true` in both), while without `x` the `#` is a literal and the `(?P` is refused in both.
