@@ -10843,7 +10843,7 @@ pub(crate) fn eval_owned_count_door<S: EvalSemantics>(
 /// through the re-index bridge (#6122): `.users |= map(.age)` ran its right side on a copy of the
 /// whole `users` array that was written out as text and indexed again, to read one field of each
 /// element. That was 1.1 G of the 2.1 G instructions the update took on a 7 MB document, and left
-/// it at 0.73x of jq 1.7.1 on a Ryzen 9 7950X and 0.92x on an Apple M4 Pro.
+/// it at 0.75x of jq 1.7.1 on a Ryzen 9 7950X and 0.93x on an Apple M4 Pro.
 ///
 /// The body is a chain of static `.name` / `.[n]` steps (see [`static_path_steps`]), so each
 /// element has exactly one output and the result is the array of them, which is what `[.[] | f]`

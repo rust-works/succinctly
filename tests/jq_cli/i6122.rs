@@ -115,7 +115,7 @@ fn the_update_is_taken_once_per_input_6122() -> Result<()> {
 }
 
 // `map(.a)`, `map(.a.b)` and `map(.[n])` over an owned array are answered from the tree, not through
-// the reindex bridge (`.users |= map(.age)` was 0.73x of jq 1.7.1 on a Ryzen 9 7950X and 0.92x on an Apple
+// the reindex bridge (`.users |= map(.age)` was 0.75x of jq 1.7.1 on a Ryzen 9 7950X and 0.93x on an Apple
 // M4 Pro at 7 MB). The answer must be the one the bridge gave, and a step that raises must still raise the
 // bridge's error. Every row was captured from jq 1.7.1 (`/usr/bin/jq -c`).
 
