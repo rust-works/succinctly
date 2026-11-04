@@ -28312,6 +28312,56 @@ fn refuse_unknown_group_option(rest: &[char]) -> Result<(), EvalError> {
     Ok(())
 }
 
+/// What a `(` opens, as far as the look-behind rules care (#6197).
+#[cfg(feature = "regex")]
+#[derive(Clone, Copy, PartialEq)]
+enum GroupKind {
+    /// A capture group, numbered or named.
+    Capture,
+    /// A lookahead, positive or negative.
+    LookAhead,
+    /// A look-behind.
+    LookBehind { negative: bool },
+    /// Anything else: `(?:`, an option group, an atomic group, a conditional.
+    Other,
+}
+
+/// The kind of the group the `(` at `chars[i]` opens.
+#[cfg(feature = "regex")]
+fn group_kind(chars: &[char], i: usize) -> GroupKind {
+    if opens_condition(chars, i) {
+        return GroupKind::Other;
+    }
+    match chars.get(i + 1) {
+        Some('?') => match (chars.get(i + 2), chars.get(i + 3)) {
+            (Some('=' | '!'), _) => GroupKind::LookAhead,
+            (Some('<'), Some('=')) => GroupKind::LookBehind { negative: false },
+            (Some('<'), Some('!')) => GroupKind::LookBehind { negative: true },
+            (Some('<' | '\''), Some(_)) => GroupKind::Capture,
+            _ => GroupKind::Other,
+        },
+        Some('*') => GroupKind::Other,
+        _ => GroupKind::Capture,
+    }
+}
+
+/// Whether a group of `kind` may not sit inside the open groups `open`: Oniguruma refuses a
+/// capture or a lookahead inside a negative look-behind, and a lookahead or a negative
+/// look-behind inside a positive one, at any depth (`(?<!(a))b`, `(?<=(?<!a)b)`).
+#[cfg(feature = "regex")]
+fn look_behind_refuses(open: &[GroupKind], kind: GroupKind) -> bool {
+    open.iter().any(|outer| match outer {
+        GroupKind::LookBehind { negative: true } => {
+            matches!(kind, GroupKind::Capture | GroupKind::LookAhead)
+        }
+        GroupKind::LookBehind { negative: false } => matches!(
+            kind,
+            GroupKind::LookAhead | GroupKind::LookBehind { negative: true }
+        ),
+        _ => false,
+    })
+}
+
 /// How many characters after `(?` open a lookaround or an atomic group, whose body `fancy-regex`
 /// does not scope inline options to: `=`, `!`, `>` (1), `<=`, `<!` (2); 0 for any other group.
 #[cfg(feature = "regex")]
@@ -28540,6 +28590,8 @@ fn translate_posix_brackets_scan(
     // One entry per open group, in step with `extended_in`: whether the group's body was wrapped in
     // `(?:...)` here, so its closing `)` needs a second `)` before it (#6183).
     let mut wrapped = vec![false];
+    // One entry per open group too: what it is, for the look-behind rules (#6197).
+    let mut kinds = vec![GroupKind::Other];
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -28782,6 +28834,7 @@ fn translate_posix_brackets_scan(
                         // `(?flags:...)`: this group only.
                         extended_in.push(on_x);
                         wrapped.push(false);
+                        kinds.push(GroupKind::Other);
                         out.push_str("(?");
                         out.push_str(&run.flags);
                         out.push(':');
@@ -28806,6 +28859,13 @@ fn translate_posix_brackets_scan(
             }
             // Follow the extended mode through the groups, to know where `#` starts a comment.
             if c == '(' {
+                // #6197: what Oniguruma refuses inside a look-behind.
+                let kind = group_kind(&chars, i);
+                if look_behind_refuses(&kinds, kind) {
+                    return Err(EvalError::new(
+                        "invalid regex: invalid pattern in look-behind",
+                    ));
+                }
                 let outer = extended_in.last().copied().unwrap_or(false);
                 let flags = &chars[(i + 2).min(chars.len())..];
                 if chars.get(i + 1) == Some(&'?') {
@@ -28837,10 +28897,12 @@ fn translate_posix_brackets_scan(
                         Some(':') => {
                             extended_in.push(inner);
                             wrapped.push(false);
+                            kinds.push(GroupKind::Other);
                         }
                         // A lookaround, a named or atomic group: the enclosing mode.
                         _ => {
                             extended_in.push(outer);
+                            kinds.push(kind);
                             // #6183: an inline `(?i)` in a lookaround or atomic group lasts past its
                             // `)` in `fancy-regex`; Oniguruma ends it there, as a group does.
                             let head = scoped_group_head(flags);
@@ -28859,9 +28921,11 @@ fn translate_posix_brackets_scan(
                 } else {
                     extended_in.push(outer);
                     wrapped.push(false);
+                    kinds.push(kind);
                 }
             } else if c == ')' && extended_in.len() > 1 {
                 extended_in.pop();
+                kinds.pop();
                 if wrapped.pop() == Some(true) {
                     out.push(')');
                 }
