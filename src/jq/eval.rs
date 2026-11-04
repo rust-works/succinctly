@@ -28798,6 +28798,18 @@ fn strip_extended_blanks(pattern: &str) -> String {
     out
 }
 
+/// Whether the atom and quantifier `text` (a trailing possessive quantifier's, without its `+`) can
+/// match nothing on their first try: a lazy quantifier (`??`, `*?`, `+?`, `}?`) or an alternation
+/// anywhere in it. An over-approximation: the group it keeps changes the route and never the answer
+/// (#6218).
+#[cfg(feature = "regex")]
+fn may_match_empty_first(text: &[char]) -> bool {
+    text.contains(&'|')
+        || text
+            .windows(2)
+            .any(|pair| pair[1] == '?' && matches!(pair[0], '?' | '*' | '+' | '}'))
+}
+
 /// Whether `pattern` holds both a backreference (`\1`..`\9`, `\k<`, `\k'`) and an inline `i` option
 /// (`(?i)`, `(?-i:`, `(?mi)`): the only patterns [`pin_backreference_case`] can change (#6196).
 #[cfg(feature = "regex")]
@@ -30943,10 +30955,25 @@ fn interval_quantifier_at(chars: &[char], at: usize) -> Option<(usize, bool)> {
 /// whitespace separates from its quantifier under the `x` flag (`a* +`).
 /// Escapes, character classes, `\Q..\E`, `(?#..)` and, under `x`, `#` comments are stepped over;
 /// an inline `(?x)` is not modelled, so a `#` comment under it is read as pattern.
-#[cfg(feature = "regex")]
+#[cfg(all(feature = "regex", test))]
 fn refuse_possessive_quantifier(
     pattern: &str,
     extended: bool,
+) -> Result<std::borrow::Cow<'_, str>, EvalError> {
+    refuse_possessive_quantifier_for(pattern, extended, false)
+}
+
+/// [`refuse_possessive_quantifier`], told whether the `n` flag is on. Under `n` the end of the pattern
+/// is where an empty match fails, so a trailing possessive quantifier over an atom that can match
+/// empty on its first try (a lazy quantifier or an alternation inside it: `(?:a??)*+`, `(?:|a)++`)
+/// is not the plain one: it stands for the atomic group, which takes its empty way and fails
+/// (#6218). That quantifier keeps its group like one something follows; one on an atom the scan
+/// cannot place is dropped as it always was.
+#[cfg(feature = "regex")]
+fn refuse_possessive_quantifier_for(
+    pattern: &str,
+    extended: bool,
+    suppress_empty: bool,
 ) -> Result<std::borrow::Cow<'_, str>, EvalError> {
     // Cheap exit for the common pattern: a possessive `+` follows a quantifier character.
     if !pattern
@@ -30990,6 +31017,9 @@ fn refuse_possessive_quantifier(
     let mut lazy_then_plus = false;
     let mut opens: Vec<usize> = Vec::new();
     let mut closes: Vec<usize> = Vec::new();
+    // #6218: under `n`, a lazy quantifier followed by `+` is written as the plain group of its atom
+    // and lazy quantifier, `(?:a??)+`, which jq reads it as and the engines answer as jq does.
+    let mut plain_opens: Vec<usize> = Vec::new();
     let mut i = 0;
     while i < chars.len() {
         let before = std::mem::replace(&mut last, Last::Other);
@@ -31161,6 +31191,22 @@ fn refuse_possessive_quantifier(
                 // Nothing after it can fail, so it never has to give anything back: the plain
                 // quantifier matches the same text.
                 if chars[i + 1..].iter().all(|&c| c == ')') {
+                    // #6218: under `n`, an atom that may be empty on its first try keeps its group.
+                    let group = match atom {
+                        Some(start)
+                            if suppress_empty
+                                && !unsure
+                                && !inline_x
+                                && may_match_empty_first(&chars[start..i]) =>
+                        {
+                            Some(start)
+                        }
+                        _ => None,
+                    };
+                    if let Some(start) = group {
+                        opens.push(start);
+                        closes.push(i + 1);
+                    }
                     drops.push(i);
                     // Only `)` follows, so there is nothing left to scan.
                     break;
@@ -31190,7 +31236,19 @@ fn refuse_possessive_quantifier(
             }
             // The lazy marker of the quantifier before it; what follows is a new quantifier.
             '?' if before != Last::Other => {
-                lazy_then_plus |= chars.get(i + 1) == Some(&'+');
+                let plus_next = chars.get(i + 1) == Some(&'+');
+                lazy_then_plus |= plus_next;
+                if suppress_empty
+                    && plus_next
+                    && chars.get(i + 2) != Some(&'+')
+                    && !unsure
+                    && !inline_x
+                {
+                    if let Some(start) = atom {
+                        plain_opens.push(start);
+                        closes.push(i + 1);
+                    }
+                }
                 i += 1;
             }
             '*' | '+' | '?' => {
@@ -31218,14 +31276,17 @@ fn refuse_possessive_quantifier(
     if lazy_then_plus && !opens.is_empty() {
         return Err(refusal());
     }
-    if drops.is_empty() && opens.is_empty() {
+    if drops.is_empty() && opens.is_empty() && plain_opens.is_empty() {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
     // Every list is in ascending order once sorted, so each is walked once.
     opens.sort_unstable();
+    plain_opens.sort_unstable();
+    closes.sort_unstable();
     let mut dropped = drops.iter().copied().peekable();
     let mut swapped = optional.iter().copied().peekable();
     let mut opening = opens.iter().copied().peekable();
+    let mut plain_opening = plain_opens.iter().copied().peekable();
     let mut closing = closes.iter().copied().peekable();
     let mut rewritten = String::new();
     for at in 0..=chars.len() {
@@ -31234,6 +31295,9 @@ fn refuse_possessive_quantifier(
         }
         while opening.next_if_eq(&at).is_some() {
             rewritten.push_str("(?>");
+        }
+        while plain_opening.next_if_eq(&at).is_some() {
+            rewritten.push_str("(?:");
         }
         let Some(&c) = chars.get(at) else { break };
         if dropped.next_if_eq(&at).is_some() {
@@ -31445,10 +31509,12 @@ fn build_regex_uncached<S: EvalSemantics>(
         super::go_regex::translate(pattern).map_err(EvalError::new)?
     } else {
         let extended = flags.is_some_and(|flags| flags.contains('x'));
-        let scanned = refuse_possessive_quantifier(pattern, extended).unwrap_or_else(|refusal| {
-            deferred_refusal = Some(refusal);
-            std::borrow::Cow::Borrowed(pattern)
-        });
+        let n_flag = flags.is_some_and(|flags| flags.contains('n'));
+        let scanned =
+            refuse_possessive_quantifier_for(pattern, extended, n_flag).unwrap_or_else(|refusal| {
+                deferred_refusal = Some(refusal);
+                std::borrow::Cow::Borrowed(pattern)
+            });
         let scanned = match escape_class_range_dashes(&scanned, extended) {
             Ok(classed) => classed,
             Err(refusal) => {

@@ -7467,6 +7467,12 @@ As the last character of the pattern, or followed only by closing parentheses (`
 The flags are checked first, as in jq, so a bad flag string is the error whatever the pattern.
 The scan steps over escapes, classes, `\Q..\E`, `(?#..)` and, under the `x` flag, `#` comments and blanks; an inline `(?x)` is not modelled, and a `*+` in its comments is read as a quantifier.
 What jq itself reads as a repeat of a repeat stays as it was: a lazy quantifier followed by `+` (`a*?+`) and `{n}?+`.
+Under the `n` flag the end of the pattern is where an empty match fails, so the dropped `+` matters there (#6218).
+A trailing possessive quantifier over an atom that can match nothing on its first try (a lazy quantifier or an alternation inside it: `(?:a??)*+`, `(?:|a)++`) keeps its atomic group, which takes the empty way and fails: `"cabb" | [match("(?:a??)*+"; "gn")]` is `[]` in jq, and was `[{"offset":1,...}]` here.
+An ungrouped lazy quantifier followed by `+` (`a??+`) is written as the group it stands for, `(?:a??)+`, under `n`.
+Over a matrix of 14,280 pattern x text x flag cases (empty-matching atoms, seven possessive forms, six endings, flags `g`, `n`, `gn`, `gln`), the `n` and `gn` answers match jq except `X?++` (`a*?++`, `a+?++`, `a??++`), which stays refused; with `l` (`ln`) the lazy shapes differ whether or not they are possessive (`"cabb" | [match("(?:a??)+"; "ln")]` is `["a"]` in jq and `[]` here), a limit of the longest-match mode.
+A fixed count then `+` over such an atom (`(?:a??){2}+`) is `{2}` here (#6079) and is `[]` under `n` in jq; the rest of 160 edge cases (an escaped `|`, a class holding `|`, a greedy empty-first atom, nested groups) agree.
+Pinned by `tests/jq_cli/i6218.rs`.
 The interval forms follow jq 1.7.1: `{n,}+`, `{n,m}+` and `{,m}+` are possessive.
 A fixed `{n}+` is neither possessive nor a repeat: it is `{n}` (#6079).
 `"aaaa" | match("a{2}+")` is `aa` in jq, since a fixed count has nothing to give back, and this was `aaaa`, the `regex` crate's `(?:a{2})+`.
