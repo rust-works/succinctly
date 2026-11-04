@@ -74,6 +74,7 @@ fn a_leading_slash_is_joined_onto_each_search_directory() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn an_absolute_path_is_not_a_module_name_and_a_missing_one_is_not_found() -> Result<()> {
     let dir = fixture()?;
@@ -92,11 +93,51 @@ fn an_absolute_path_is_not_a_module_name_and_a_missing_one_is_not_found() -> Res
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn the_root_directory_as_a_search_directory_still_reaches_an_absolute_name() -> Result<()> {
     let dir = fixture()?;
     let abs = dir.path().join("lib").join("a");
     let program = format!(r#"import "{}" as a; a::f"#, abs.display());
     answers(&dir, &["-L", "/", "-nc", &program], "\"a.f\"\n")?;
+    Ok(())
+}
+
+/// The directory-module spellings (`b/b.jq`, `p/jq/main.jq`) are joined the same way, and a name
+/// that is only a slash, or ends in one, is refused or not found as it is without the slash.
+#[test]
+fn the_directory_module_spellings_follow_a_leading_slash() -> Result<()> {
+    let dir = fixture()?;
+    for (sub, file, text) in [
+        ("lib/b", "b.jq", "def f: \"b/b\";"),
+        ("lib/p/jq", "main.jq", "def f: \"p/jq/main\";"),
+    ] {
+        std::fs::create_dir_all(dir.path().join(sub))?;
+        std::fs::write(dir.path().join(sub).join(file), text)?;
+    }
+    answers(
+        &dir,
+        &["-L", "lib", "-nc", r#"import "/b" as a; a::f"#],
+        "\"b/b\"\n",
+    )?;
+    answers(
+        &dir,
+        &["-L", "lib", "-nc", r#"import "/p" as a; a::f"#],
+        "\"p/jq/main\"\n",
+    )?;
+    let (stdout, stderr, code) = run(&dir, &["-L", "lib", "-nc", r#"import "/" as a; a::f"#])?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        (
+            "",
+            "jq: error: module names must not have equal consecutive components: /\n\njq: 1 compile error\n",
+            3
+        )
+    );
+    not_found(
+        &dir,
+        &["-L", "lib", "-nc", r#"import "a/" as a; a::f"#],
+        "a/",
+    )?;
     Ok(())
 }
