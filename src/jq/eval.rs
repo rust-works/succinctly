@@ -29181,6 +29181,17 @@ fn translate_posix_brackets_scan(
             }
         }
         if c == '\\' {
+            // #6220: `\X` has no fixed width, which a look-behind needs.
+            if depth == 0
+                && chars.get(i + 1) == Some(&'X')
+                && kinds
+                    .iter()
+                    .any(|kind| matches!(kind, GroupKind::LookBehind { .. }))
+            {
+                return Err(EvalError::new(
+                    "invalid regex: invalid pattern in look-behind",
+                ));
+            }
             // #6070: the escapes Oniguruma reads that the `regex` crate refuses or reads another way.
             if let Some((text, used)) =
                 rewrite_onig_escape(&chars, i, depth > 0, groups_opened, &mut group_facts)?
@@ -30017,8 +30028,34 @@ fn regex_char(v: u32) -> String {
 ///   stops short is an error. A sequence that is no character (`\xed\xa0\x80`, `\xf8`) compiles
 ///   and matches nothing.
 ///
-/// Not covered, and left to the engines' refusal: `\X`, `\y`, `\Y` (text segments), an octal
+/// Not covered, and left to the engines' refusal: `\y`, `\Y` (text segments), an octal
 /// value of 0x80 or more, and `\x` with a single digit.
+/// `\X`, an extended grapheme cluster (#6220): the rules of Unicode UAX #29 over the `regex` crate's
+/// `Grapheme_Cluster_Break` and `Extended_Pictographic` properties, which Oniguruma reads as one
+/// escape. In order: CR LF; a lone control; a prepend run, then a regional-indicator pair, a Hangul
+/// syllable (`L* (V+ | LV V* | LVT) T*`, or a run of `L` or `T`), an emoji joined by ZWJ, or any
+/// other character, then the extending marks; a prepend run before a control. Case folding is
+/// switched off so an `(?i)` around the escape cannot widen the property classes, and the whole is an
+/// atomic group, as Oniguruma reads the escape: a cluster is never given back in part (`\r\n` then
+/// `\n` does not match `"\r\n"`).
+#[cfg(feature = "regex")]
+const GRAPHEME_CLUSTER: &str = concat!(
+    r"(?>(?-i:(?:\r\n",
+    r"|[\p{Grapheme_Cluster_Break=Control}\r\n]",
+    r"|\p{Grapheme_Cluster_Break=Prepend}*(?:",
+    r"\p{Grapheme_Cluster_Break=Regional_Indicator}\p{Grapheme_Cluster_Break=Regional_Indicator}",
+    r"|\p{Grapheme_Cluster_Break=L}*(?:\p{Grapheme_Cluster_Break=V}+",
+    r"|\p{Grapheme_Cluster_Break=LV}\p{Grapheme_Cluster_Break=V}*",
+    r"|\p{Grapheme_Cluster_Break=LVT})\p{Grapheme_Cluster_Break=T}*",
+    r"|\p{Grapheme_Cluster_Break=L}+|\p{Grapheme_Cluster_Break=T}+",
+    r"|\p{Extended_Pictographic}(?:\p{Grapheme_Cluster_Break=Extend}*",
+    r"\p{Grapheme_Cluster_Break=ZWJ}\p{Extended_Pictographic})*",
+    r"|[^\p{Grapheme_Cluster_Break=Control}\r\n])",
+    r"(?:\p{Grapheme_Cluster_Break=Extend}|\p{Grapheme_Cluster_Break=ZWJ}",
+    r"|\p{Grapheme_Cluster_Break=SpacingMark})*",
+    r"|\p{Grapheme_Cluster_Break=Prepend}+)))"
+);
+
 #[cfg(feature = "regex")]
 fn rewrite_onig_escape(
     chars: &[char],
@@ -30039,6 +30076,8 @@ fn rewrite_onig_escape(
         'k' if !matches!(after, Some('<' | '\'')) => literal(next),
         'o' | 'p' | 'P' if after != Some('{') && after != Some('^') => literal(next),
         'N' if !in_class => Ok(Some(("[^\\n]".to_string(), 2))),
+        // #6220: the extended grapheme cluster, which the `regex` crate has no escape for.
+        'X' if !in_class => Ok(Some((GRAPHEME_CLUSTER.to_string(), 2))),
         'O' if !in_class => Ok(Some(("(?s:.)".to_string(), 2))),
         // Inside a class these have no meaning of their own (`[\N]` is `N`).
         'N' | 'O' | 'y' | 'X' | 'Y' if in_class => literal(next),
