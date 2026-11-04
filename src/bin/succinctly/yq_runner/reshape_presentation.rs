@@ -11,7 +11,9 @@ use super::{
 use succinctly::jq::document::{
     DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields, DocumentValue,
 };
-use succinctly::jq::eval_generic::{to_owned_with_comments, AnchorMark, KeyMeta, LazyElem};
+use succinctly::jq::eval_generic::{
+    to_owned_with_comments, AnchorMark, KeyMeta, LazyElem, KEY_STYLE_STRING,
+};
 use succinctly::jq::{ArithOp, Builtin, EvalError, ObjectKey, MAX_VALUE_TREE_DEPTH};
 use succinctly::jq::{EvalSemantics, YqSemantics};
 
@@ -38,7 +40,7 @@ pub(super) fn supported(expr: &Expr) -> bool {
             supported(f)
         }
         Expr::Builtin(Builtin::SortBy(f)) => supported(f) || sort_key_filter(f),
-        Expr::Builtin(Builtin::Sort | Builtin::Flatten) => true,
+        Expr::Builtin(Builtin::Sort | Builtin::Flatten | Builtin::Pivot) => true,
         Expr::Builtin(Builtin::FlattenDepth(depth)) => is_closed_literal(depth),
         // Paths given as a literal; one built from the document is for the plain route.
         Expr::Builtin(Builtin::Pick(paths)) => is_closed_literal(paths),
@@ -790,6 +792,9 @@ fn trace_at_depth(
                 CommentTree::Array(meta, trees),
             ))
         }
+        // #6102: `pivot` moves each cell into a new sequence or mapping, with its comment, style,
+        // anchor and tag, and pads a short row with an empty node, which yq prints as nothing.
+        Expr::Builtin(Builtin::Pivot) => pivot_pair(expr, input),
         Expr::Builtin(Builtin::Map(f)) => {
             let OwnedValue::Array(items) = value else {
                 return None;
@@ -826,6 +831,71 @@ fn trace_at_depth(
             Some((result, meta))
         }
         _ if is_closed_literal(expr) => Some((evaluated(expr, value)?, CommentTree::empty())),
+        _ => None,
+    }
+}
+
+/// The tree of a node `pivot` creates to pad a short row (#6102): a `null` with an empty spelling,
+/// which yq prints as nothing (`-` with no value, `key:` bare) and `-o=json` as `null`.
+fn pivot_padding() -> CommentTree {
+    CommentTree::Leaf(NodeMeta::empty().with_spelling(Some(String::new())))
+}
+
+/// `pivot` replayed from the cells' own nodes (#6102): every cell keeps its comment, style, anchor
+/// and tag, the sequences and mapping it builds are new block nodes, and a cell the row lacks is
+/// [`pivot_padding`]. The value is built by the authoritative evaluation, which the caller
+/// compares with the traced one.
+fn pivot_pair(expr: &Expr, input: &ResultWithComments) -> Option<ResultWithComments> {
+    let (value, tree) = input;
+    let OwnedValue::Array(rows) = value else {
+        return None;
+    };
+    let result = evaluated(expr, value)?;
+    // A cell of the row at `row` and position `at`, from the row's own tree.
+    let cell = |row: usize, at: &dyn Fn(&CommentTree) -> CommentTree, present: bool| {
+        if present {
+            at(tree.at_index(row))
+        } else {
+            pivot_padding()
+        }
+    };
+    let column = |cells: Vec<CommentTree>| CommentTree::Array(NodeMeta::empty(), cells);
+    match &result {
+        OwnedValue::Array(columns) => {
+            let mut trees = Vec::with_capacity(columns.len());
+            for col in 0..columns.len() {
+                let cells = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(row, item)| {
+                        let present = matches!(item, OwnedValue::Array(r) if col < r.len());
+                        cell(row, &|t| t.at_index(col).clone(), present)
+                    })
+                    .collect();
+                trees.push(column(cells));
+            }
+            Some((result, CommentTree::Array(NodeMeta::empty(), trees)))
+        }
+        OwnedValue::Object(columns) => {
+            let mut fields = IndexMap::new();
+            let mut keys = IndexMap::new();
+            for key in columns.keys() {
+                // The key is a new string node, so one that reads as another type stays quoted.
+                if let Some(meta) = KeyMeta::new(None, false, KEY_STYLE_STRING) {
+                    keys.insert(key.clone(), meta);
+                }
+                let cells = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(row, item)| {
+                        let present = matches!(item, OwnedValue::Object(o) if o.contains_key(key));
+                        cell(row, &|t| t.field(key).clone(), present)
+                    })
+                    .collect();
+                fields.insert(key.clone(), column(cells));
+            }
+            Some((result, CommentTree::Object(NodeMeta::empty(), fields, keys)))
+        }
         _ => None,
     }
 }
