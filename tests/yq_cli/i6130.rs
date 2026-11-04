@@ -98,7 +98,42 @@ fn a_negative_index_on_an_absent_key_in_select_skips_the_item_6130() -> Result<(
 /// as outside it.
 #[test]
 fn an_empty_sequence_is_not_an_absent_key_6130() -> Result<()> {
-    let (_, code) = run_yq_stdin("select(.tags[-1])", "tags: []\n", &[])?;
+    let (_, stderr, code) =
+        crate::run_yq_stdin_with_stderr("select(.tags[-1])", "tags: []\n", &[])?;
     assert_eq!(code, 1);
+    assert!(
+        stderr.contains("index [-1] out of range, array size is 0"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+/// Shapes that reach the other `select` routes: nested, after a bind, after a construction, in a
+/// boolean, under `first`, over a computed value (the owned door).
+const ROUTE_ROWS: &[(&str, &str)] = &[
+    ("[.[] | select(.zz | not)] | length", "0\n"),
+    ("map(select(select(.zz | not)))", "[]\n"),
+    (".[] as $x | $x | select(.zz | not)", ""),
+    ("map({\"v\": .} | select(.v.zz | not))", "[]\n"),
+    ("map(select(.a.b | not))", "[]\n"),
+    ("[.[] | {\"k\": .} | .k | select(.zz | not)]", "[]\n"),
+    ("(. as $r | $r | .[] | select(.zz | not))", ""),
+    ("map(. * {\"q\": 1} | select(.zz | not))", "[]\n"),
+    ("to_entries | map(select(.value.zz | not))", "[]\n"),
+    (
+        ".[] | select(.n == 1 or (.zz | not))",
+        "{\"t\":[1],\"n\":1}\n",
+    ),
+    ("map(select((.zz | not) and true))", "[]\n"),
+];
+
+#[test]
+fn every_select_route_reads_its_condition_read_only_6130() -> Result<()> {
+    let document = "- t: [1]\n  n: 1\n- a: 1\n- t: []\n  n: 0\n";
+    for &(filter, expected) in ROUTE_ROWS {
+        let (output, code) = run_yq_stdin(filter, document, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(output, expected, "`{filter}`");
+    }
     Ok(())
 }

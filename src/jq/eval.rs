@@ -12824,13 +12824,7 @@ fn owned_select_door<S: EvalSemantics>(
         };
         // `optional` is gated at the top, so the verdict is the shared one
         // ([`owned_cond_verdict`], #3697) and the two doors cannot drift.
-        // #6130: yq's `select` reads its condition read-only, so a read of an absent key finds no
-        // output here and the door declines, as the bridge answers it.
-        let verdict = {
-            let _scope = yq_as_source_scope::<S>();
-            owned_cond_verdict::<S>(cond, input, false)
-        };
-        let Some(verdict) = verdict else {
+        let Some(verdict) = owned_select_cond_verdict::<S>(cond, input) else {
             break;
         };
         match verdict.map(|truthy| truthy != inverted) {
@@ -87210,6 +87204,16 @@ impl<'e> LoopOperand<'e> {
             None => eval_owned_expr_fork::<S>(expr, input, optional, Reentry::Proven),
         }
     }
+}
+
+/// [`owned_cond_verdict`] for a `select` condition (#6130): yq reads it read-only, so a read of an
+/// absent key finds no output, the pure grammar declines, and the bridge answers it.
+pub(crate) fn owned_select_cond_verdict<S: EvalSemantics>(
+    cond: &Expr,
+    state: &OwnedValue,
+) -> Option<Result<bool, EvalError>> {
+    let _scope = yq_as_source_scope::<S>();
+    owned_cond_verdict::<S>(cond, state, false)
 }
 
 /// The verdict of an `until`/`while` condition over a state the loop owns,

@@ -5515,7 +5515,7 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
             }
             Expr::Builtin(Builtin::Empty) => return GenericResult::None,
             Expr::Builtin(Builtin::Select(cond)) if !optional => {
-                if let Some(verdict) = crate::jq::eval::owned_cond_verdict::<S>(cond, &owned, false)
+                if let Some(verdict) = crate::jq::eval::owned_select_cond_verdict::<S>(cond, &owned)
                 {
                     return match verdict {
                         Ok(true) => GenericResult::Owned(owned),
@@ -5576,7 +5576,7 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     if matches!(owned, OwnedValue::String(_)) && !optional && !embed_table_active() {
         match strip_parens(expr) {
             Expr::Builtin(Builtin::Select(cond)) => {
-                if let Some(verdict) = crate::jq::eval::owned_cond_verdict::<S>(cond, &owned, false)
+                if let Some(verdict) = crate::jq::eval::owned_select_cond_verdict::<S>(cond, &owned)
                 {
                     return match verdict {
                         Ok(true) => GenericResult::Owned(owned),
