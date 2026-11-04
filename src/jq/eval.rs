@@ -28458,7 +28458,8 @@ fn translate_posix_brackets_scan(
             out.push(c);
             if let Some(&next) = chars.get(i + 1) {
                 out.push(next);
-                prev_assertion = depth == 0 && matches!(next, 'b' | 'B' | 'A' | 'z' | 'Z' | 'G');
+                prev_assertion =
+                    depth == 0 && matches!(next, 'b' | 'B' | 'A' | 'z' | 'Z' | 'G' | 'K');
             }
             at_start = false;
             i += 2;
@@ -29379,7 +29380,7 @@ fn inline_extended(pattern: &str) -> bool {
 /// `target of repeat operator is invalid` (#6127).
 ///
 /// Oniguruma decides from the parsed node (`is_invalid_quantifier_target`, `regparse.c`): an
-/// assertion (`^ $ \A \z \Z \G \b \B`, a look-ahead or look-behind) is an invalid target; a
+/// assertion (`^ $ \A \z \Z \G \K \b \B`, a look-ahead or look-behind) is an invalid target; a
 /// sequence of several nodes is not, whatever it holds (`(?:\b\b)*` compiles); an alternation is
 /// invalid when any one alternative is, so `(?:a|\b)*` is refused and `(?:a|\b\b)*` is not; a
 /// plain `(?:...)` group disappears into its body, so `(?:\b)*` and `(?:(?:\b)|c)*` are refused; a
@@ -29485,7 +29486,7 @@ fn repeats_assertion_group(chars: &[char]) -> bool {
                     let next = self.chars.get(self.at + 1).copied();
                     self.at += 2;
                     match next {
-                        Some('b' | 'B' | 'A' | 'z' | 'Z' | 'G') => Ok(Some(true)),
+                        Some('b' | 'B' | 'A' | 'z' | 'Z' | 'G' | 'K') => Ok(Some(true)),
                         Some('p' | 'P' | 'x' | 'k' | 'g' | 'N' | 'o') => {
                             // `\p{L}`, `\x{41}`, `\k<n>`, `\g<n>`: a name may hold `)`.
                             let close = match self.peek() {
