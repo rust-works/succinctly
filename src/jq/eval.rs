@@ -24188,8 +24188,126 @@ fn format_csv_row_element<S: EvalSemantics>(
     }
 }
 
+/// The tag yq names a node by in its csv encoder's errors.
+fn yq_csv_tag(v: &OwnedValue) -> &'static str {
+    match v {
+        OwnedValue::Object(_) => "!!map",
+        OwnedValue::Array(_) => "!!seq",
+        OwnedValue::String(_) => "!!str",
+        OwnedValue::Bool(_) => "!!bool",
+        OwnedValue::Null => "!!null",
+        OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => "!!int",
+        _ => "!!float",
+    }
+}
+
+/// A field Go's `encoding/csv` writer quotes (`fieldNeedsQuotes`): a field that holds the
+/// separator, a double quote, CR or LF, starts with a space, or is exactly `\.`.
+fn yq_csv_field(field: &str, comma: char) -> String {
+    let needs_quotes = !field.is_empty()
+        && (field == "\\."
+            || field.contains(comma)
+            || field.contains(['"', '\r', '\n'])
+            || field.starts_with(char::is_whitespace));
+    if needs_quotes {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// yq's `@csv`/`@tsv` (#6131): Go's `encoding/csv` over the node. A scalar is its text, an array
+/// of scalars one record, an array of arrays one record each, and an array of flat objects a
+/// header record of the first object's keys then one record each. The trailing newlines are
+/// trimmed. A `null` is spelled `null` (yq keeps the source spelling, `~` included).
+fn format_yq_csv<S: EvalSemantics>(value: &OwnedValue, comma: char) -> Result<String, EvalError> {
+    fn scalar<S: EvalSemantics>(v: &OwnedValue) -> Option<String> {
+        match v {
+            OwnedValue::Array(_) | OwnedValue::Object(_) => None,
+            OwnedValue::Null => Some("null".to_string()),
+            other => Some(owned_to_string::<S>(other)),
+        }
+    }
+    fn not_scalars(index: usize, v: &OwnedValue) -> EvalError {
+        EvalError::new(format!(
+            "csv encoding only works for arrays of scalars (string/numbers/booleans), child[{index}] is a {}",
+            yq_csv_tag(v)
+        ))
+    }
+    fn record(out: &mut String, fields: &[String], comma: char) {
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(comma);
+            }
+            out.push_str(&yq_csv_field(field, comma));
+        }
+        out.push('\n');
+    }
+    let items = match value {
+        OwnedValue::Array(items) => items,
+        OwnedValue::Object(_) => {
+            return Err(EvalError::new(
+                "csv encoding only works for arrays, got: !!map".to_string(),
+            ))
+        }
+        scalar_input => return Ok(scalar::<S>(scalar_input).unwrap_or_default()),
+    };
+    let mut out = String::new();
+    match items.first() {
+        None => {}
+        Some(OwnedValue::Object(header)) => {
+            let keys: Vec<&String> = header.keys().collect();
+            record(
+                &mut out,
+                &keys.iter().map(|k| (*k).clone()).collect::<Vec<_>>(),
+                comma,
+            );
+            for (i, item) in items.iter().enumerate() {
+                let OwnedValue::Object(row) = item else {
+                    return Err(EvalError::new(format!(
+                        "csv object encoding only works for arrays of flat objects (string key => string/numbers/boolean value), child[{i}] is a {}",
+                        yq_csv_tag(item)
+                    )));
+                };
+                let mut fields = vec_with_capacity(keys.len());
+                for (at, key) in keys.iter().enumerate() {
+                    match row.get(key.as_str()) {
+                        None => fields.push(String::new()),
+                        Some(v) => fields.push(scalar::<S>(v).ok_or_else(|| not_scalars(at, v))?),
+                    }
+                }
+                record(&mut out, &fields, comma);
+            }
+        }
+        Some(OwnedValue::Array(_)) => {
+            for (i, item) in items.iter().enumerate() {
+                let OwnedValue::Array(row) = item else {
+                    return Err(not_scalars(i, item));
+                };
+                let mut fields = vec_with_capacity(row.len());
+                for (at, v) in row.iter().enumerate() {
+                    fields.push(scalar::<S>(v).ok_or_else(|| not_scalars(at, v))?);
+                }
+                record(&mut out, &fields, comma);
+            }
+        }
+        Some(_) => {
+            let mut fields = vec_with_capacity(items.len());
+            for (at, v) in items.iter().enumerate() {
+                fields.push(scalar::<S>(v).ok_or_else(|| not_scalars(at, v))?);
+            }
+            record(&mut out, &fields, comma);
+        }
+    }
+    out.truncate(out.trim_end_matches('\n').len());
+    Ok(out)
+}
+
 /// @csv - CSV format (for arrays)
 fn format_csv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    if S::TAG == EvalTag::Yq {
+        return format_yq_csv::<S>(value, ',');
+    }
     match value {
         OwnedValue::Array(arr) => {
             let parts = arr
@@ -24207,6 +24325,9 @@ fn format_csv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<St
 
 /// @tsv - TSV format (for arrays)
 fn format_tsv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    if S::TAG == EvalTag::Yq {
+        return format_yq_csv::<S>(value, '\t');
+    }
     match value {
         OwnedValue::Array(arr) => {
             let parts = arr
