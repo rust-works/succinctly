@@ -30221,7 +30221,28 @@ fn rewrite_onig_escape(
             _ => Ok(None),
         },
         'x' if !in_class => rewrite_hex_escape(chars, i),
+        // #6234: inside a class only the short forms are rewritten, as outside one.
+        'x' => Ok(short_hex_escape(chars, i)),
         _ => Ok(None),
+    }
+}
+
+/// The short forms of `\x`, in a class or outside one (#6070, #6234): Oniguruma reads up to two hex
+/// digits and, finding none, a NUL (`\xg` is NUL and `g`); one digit followed by a non-digit is that
+/// digit's value (`\x1`). `None` for two digits, a brace and the end of the pattern, which the callers
+/// read themselves.
+#[cfg(feature = "regex")]
+fn short_hex_escape(chars: &[char], i: usize) -> Option<(String, usize)> {
+    let c = *chars.get(i + 2)?;
+    if c == '{' {
+        return None;
+    }
+    match c.to_digit(16) {
+        None => Some((regex_char(0), 2)),
+        Some(first) if !chars.get(i + 3).is_some_and(char::is_ascii_hexdigit) => {
+            Some((regex_char(first), 3))
+        }
+        Some(_) => None,
     }
 }
 
@@ -30237,18 +30258,14 @@ fn rewrite_hex_escape(chars: &[char], i: usize) -> Result<Option<(String, usize)
         let lo = chars.get(at + 3)?.to_digit(16)?;
         Some(hi * 16 + lo)
     };
-    // Oniguruma reads up to two hex digits and, finding none, a NUL; at the very end of the
-    // pattern there is nothing to read and the `x` is itself.
+    // At the very end of the pattern there is nothing to read and the `x` is itself.
     match chars.get(i + 2) {
         None => return Ok(Some(("x".to_string(), 2))),
         Some('{') => return Ok(None),
-        Some(&c) => match c.to_digit(16) {
-            None => return Ok(Some((regex_char(0), 2))),
-            Some(first) if !chars.get(i + 3).is_some_and(char::is_ascii_hexdigit) => {
-                return Ok(Some((regex_char(first), 3)));
-            }
-            Some(_) => {}
-        },
+        Some(_) => {}
+    }
+    if let Some(short) = short_hex_escape(chars, i) {
+        return Ok(Some(short));
     }
     let Some(lead) = byte_at(i).filter(|b| *b >= 0x80) else {
         return Ok(None);
