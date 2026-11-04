@@ -4856,11 +4856,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // So this is "reads through the queue", not "calls `input`": the reader's seeding in
     // `get_inputs` checks `stream_walk_by_reader` itself, so a caller cannot send a plain walk down
     // the document parse by mistake (`stream_walk_by_reader_agrees_with_get_inputs_5498`).
+    // `program_reads_inputs` is that meaning alone; the lazy route's gate below keeps it, so that
+    // a clean `--seq` stream still takes #5674's route.
+    let program_reads_inputs = jq::walk::uses_input_builtins(&expr) || stream_walk_by_reader(&args);
     // #6147: a `--seq` run reads through the queue whatever the program is, so that the reader's
-    // faults come out in order with the values, as jq's main loop meets them.
-    let uses_input_builtins = jq::walk::uses_input_builtins(&expr)
-        || stream_walk_by_reader(&args)
-        || seq_faults_by_queue(&args);
+    // faults come out in order with the values, as jq's main loop meets them. A clean stream has
+    // no fault to order and is taken off the queue again by #5674's probe.
+    let uses_input_builtins = program_reads_inputs || seq_faults_by_queue(&args);
 
     // Configure output
     let output_config = OutputConfig::from_args(&args);
@@ -5138,7 +5140,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // (`slurp_documents`). `-n -s` is still excluded by the `!args.null_input`
     // test below, and `-R`/`--seq`/DSV `-s` stay on the materializing path.
     //
-    // #5674: `--seq` input joins them when the stream is clean (see
+    // #5674: `--seq` input joins them when the stream is clean, whatever the program (see
     // [`seq_plain_json_inputs`]): the records are then a plain JSON stream, and reading them as
     // one skips the per-record index the materializing route builds.
     // Everything but `--seq` itself that the lazy route requires, named once so the probe below
@@ -5147,7 +5149,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         && args.input_dsv.is_none()
         && !args.stream // the program reads tostream events, not documents (#4397)
         && !args.stream_errors // ... read by jq's own streaming parser (#5474)
-        && !uses_input_builtins;
+        && !program_reads_inputs; // not `uses_input_builtins`: a clean `--seq` stream has no fault to queue (#6147)
     let mut seq_plain: Option<PreparedInputs> =
         if args.seq && lazy_route_open && !args.validate && !args.null_input {
             seq_plain_json_inputs(&args)?
@@ -5812,7 +5814,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         let seq_stream_warns = seq_by_stream_reader(&args) && !args.stream_errors;
         // #6137: the `--seq` reader's faults the queue holds behind the documents, read as inputs.
         // Under `-n` there is no main loop to pop one.
-        let seq_faults_warn = !args.null_input && seq_faults_queued(&args, uses_input_builtins);
+        let seq_faults_warn = seq_faults_by_queue(&args);
         if uses_input_builtins {
             // Seed `input`/`inputs`/`input_line_number`'s shared queue
             // (#723) with every document `get_inputs` just read -- under
@@ -6653,8 +6655,8 @@ fn get_inputs(
     // #6115: the events `--seq --stream` reads, with the faults of the records as the warnings
     // jq's main loop prints for `--seq` (or, under `--stream-errors`, as events of their own).
     if seq_by_stream_reader {
-        // A program that reads inputs gets each fault in its queue: `input` raises it, and the main
-        // loop warns when it pops one (#5640). Any other plain run warns up front.
+        // A `--seq` run without `-s` gets each fault in its queue: `input` raises it, and the main
+        // loop warns when it pops one (#5640, #6147). Only `-s` warns up front.
         let faults_as_inputs = args.null_input || track_eof;
         // And the end-of-stream stop (#2998) is a barrier in that queue, behind which the stream
         // goes on (#6141); a run that never reads an input ends at it.
@@ -7548,8 +7550,8 @@ fn get_inputs(
 
 /// Whether the faults of a `--seq` stream's reader are queued for `input`/`inputs` to raise
 /// (#5640), where a plain run prints each as an ignored parse error before the program runs:
-/// under `-n`, and for a program that reads `input`/`inputs` without `-s` (#6137). jq's `input`
-/// raises a fault it reads as an error, and its main loop prints one it pops as ignored and reads
+/// under `-n`, and without `-s` (#6137 for a program that reads `input`/`inputs`, #6147 for any
+/// other). jq's `input` raises a fault it reads as an error, and its main loop prints one it pops as ignored and reads
 /// on, so the records after a fault pair with the main loop as they do in jq. `-s` reads the whole
 /// stream before the program runs, warning as it goes. Only a `--seq` stream read as JSON texts
 /// has the reader: `-R` and `--input-dsv` take over from it, and `--stream`/`--stream-errors` read
