@@ -784,7 +784,10 @@ fn resolve_with_suffix(
     ];
     for base in search_path {
         for spelling in &spellings {
-            let full_path = base.join(spelling);
+            // #6120: jq joins the directory and the name with a `/`, so a name that starts with
+            // one is `lib//a.jq`, the file system's `lib/a.jq`. `Path::join` would take it as an
+            // absolute path and drop the directory.
+            let full_path = base.join(spelling.trim_start_matches('/'));
             if full_path.is_file() {
                 return Some(full_path);
             }
