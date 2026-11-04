@@ -5523,7 +5523,7 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
             }
             Expr::Builtin(Builtin::Empty) => return GenericResult::None,
             Expr::Builtin(Builtin::Select(cond)) if !optional => {
-                if let Some(verdict) = crate::jq::eval::owned_cond_verdict::<S>(cond, &owned, false)
+                if let Some(verdict) = crate::jq::eval::owned_select_cond_verdict::<S>(cond, &owned)
                 {
                     return match verdict {
                         Ok(true) => GenericResult::Owned(owned),
@@ -5584,7 +5584,7 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     if matches!(owned, OwnedValue::String(_)) && !optional && !embed_table_active() {
         match strip_parens(expr) {
             Expr::Builtin(Builtin::Select(cond)) => {
-                if let Some(verdict) = crate::jq::eval::owned_cond_verdict::<S>(cond, &owned, false)
+                if let Some(verdict) = crate::jq::eval::owned_select_cond_verdict::<S>(cond, &owned)
                 {
                     return match verdict {
                         Ok(true) => GenericResult::Owned(owned),
@@ -20195,7 +20195,13 @@ fn each_select_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     let mut already_emitted = false;
     let mut escape: Option<Control> = None;
+    // #6130: yq's `select` reads its condition read-only (a pipe from an absent key is empty); the
+    // sink runs inside the condition's own sink and does not.
+    let previous = yq_read_only_context::active();
+    let _scope = super::eval::yq_as_source_scope::<S>();
     let flow = eval_each_generic::<S, V>(cond, value.clone(), false, cursor, &mut |item| {
+        let _sink_scope =
+            S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(|| yq_read_only_context::restore(previous));
         let truthy = match generic_item_truthiness::<_, S>(item) {
             Ok(b) => b,
             Err(control) => return stop_with_escape(&mut escape, control),
@@ -35318,7 +35324,12 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
         Builtin::Select(cond) => {
             // Evaluate condition with cursor context preserved.
             // This is critical for select(di == N) to work correctly.
-            let cond_result = eval_single::<S, _>(cond, value.clone(), false, cursor);
+            // #6130: yq's `select` reads its condition read-only, so a pipe from an absent key is
+            // empty; the scope is gone before anything downstream runs.
+            let cond_result = {
+                let _scope = super::eval::yq_as_source_scope::<S>();
+                eval_single::<S, _>(cond, value.clone(), false, cursor)
+            };
 
             let mut bits = Vec::new();
             let cond_control = push_generic_truthiness::<_, S>(cond_result, &mut bits);
