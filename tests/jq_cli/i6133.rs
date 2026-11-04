@@ -57,3 +57,37 @@ fn the_rewrite_reaches_match_sub_and_scan_6133() -> Result<()> {
     }
     Ok(())
 }
+
+/// An option group that names no option is dropped, so a repeat after it has no target in jq either.
+#[test]
+fn a_repeat_after_an_empty_option_group_is_refused_6133() -> Result<()> {
+    for pattern in [
+        "(?-)*a",
+        "(?-)+a",
+        "(?-)?a",
+        "(?-){2}a",
+        "(?-){1,}a",
+        "a(?-)*",
+        "a(?-)+",
+        "a(?-)*?",
+        "a(?--)?",
+        "a(?-){2}",
+        "x(?--){1,2}",
+        "a|(?-){2}",
+        "^(?-)*a",
+        "^(?-)+",
+        "$(?-)*",
+        r"\\b(?-)*",
+        r"\\b(?--)+a",
+    ] {
+        let filter = format!(r#""aab" | test("{pattern}")"#);
+        let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
+        assert_eq!(code, 5, "{filter}: stdout={stdout:?} stderr={stderr:?}");
+        assert!(
+            stderr.contains("invalid regex: target of repeat operator is not specified")
+                || stderr.contains("Regex failure: target of repeat operator is not specified"),
+            "{filter}: {stderr:?}"
+        );
+    }
+    Ok(())
+}

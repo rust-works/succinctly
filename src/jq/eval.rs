@@ -28647,7 +28647,15 @@ fn translate_posix_brackets_scan(
                     let (on_x, rest) = (run.x_after(outer), i + 2 + run.consumed);
                     changed = true;
                     if run.closes_group {
-                        // `(?flags)`: the rest of the enclosing group.
+                        // `(?flags)`: the rest of the enclosing group. Dropped when it names no
+                        // option, so a repeat after it would repeat what comes before: jq refuses it.
+                        if run.flags.is_empty()
+                            && starts_repetition(&chars[rest.min(chars.len())..])
+                        {
+                            return Err(EvalError::new(
+                                "invalid regex: target of repeat operator is not specified",
+                            ));
+                        }
                         if let Some(group) = extended_in.last_mut() {
                             *group = on_x;
                         }
