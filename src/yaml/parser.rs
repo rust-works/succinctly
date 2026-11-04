@@ -7142,6 +7142,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     self.advance();
                 }
                 b'\n' | b'\r' => {
+                    self.reject_tab_in_flow_plain_continuation(self.pos)?;
                     // Multiline key - check if next line continues the key
                     // Skip the line break (CRLF counts as the one break it is)
                     let mut lookahead = self.pos + self.break_len_at(self.pos);
@@ -7250,7 +7251,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
             _ => {
                 let start = self.pos;
-                let end = self.parse_flow_unquoted_value();
+                let end = self.parse_flow_unquoted_value()?;
                 self.check_json_strict_scalar(start, end)?;
                 end
             }
@@ -7268,7 +7269,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// from the file (#1960). A `:` before a flow indicator is content, exactly as in
     /// [`Self::parse_explicit_flow_unquoted_key`] (#402): `{a: 1:, b: 2}` keeps `"1:"`.
     /// Returns the absolute end position (with trailing whitespace trimmed).
-    fn parse_flow_unquoted_value(&mut self) -> usize {
+    fn parse_flow_unquoted_value(&mut self) -> Result<usize, YamlError> {
         let start = self.pos;
 
         while let Some(b) = self.peek() {
@@ -7283,6 +7284,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     self.advance();
                 }
                 b'\n' | b'\r' => {
+                    self.reject_tab_in_flow_plain_continuation(self.pos)?;
                     // Multiline value - check if next line continues the value
                     // Skip the line break (CRLF counts as the one break it is)
                     let mut lookahead = self.pos + self.break_len_at(self.pos);
@@ -7326,7 +7328,40 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             end -= 1;
         }
 
-        end
+        Ok(end)
+    }
+
+    /// #6059: go-yaml refuses a plain scalar that continues on a line whose leading blanks hold a tab at
+    /// a column below the enclosing block's indent plus one (`found a tab character that violates
+    /// indentation`), in a flow collection as in block context. `break_pos` is the line break after the
+    /// scalar's text; a collection at the document root has no block indent to violate.
+    fn reject_tab_in_flow_plain_continuation(&self, break_pos: usize) -> Result<(), YamlError> {
+        if self.indent_stack.len() <= 1 {
+            return Ok(());
+        }
+        let limit = self.innermost_block_indent();
+        // The line after the break, and the one after it when that one is empty: the scanners skip an
+        // empty line's break along with the previous one, so its successor is never a break they stop
+        // at. Every other blank line is a break of its own, which checks its successor in turn.
+        let mut line = break_pos;
+        for _ in 0..2 {
+            if !is_line_break(self.input.get(line).copied().unwrap_or(0)) {
+                break;
+            }
+            let start = line + self.break_len_at(line);
+            let mut at = start;
+            while self.input.get(at) == Some(&b' ') {
+                at += 1;
+            }
+            if self.input.get(at) == Some(&b'\t') && at - start <= limit {
+                return Err(YamlError::TabIndentation {
+                    line: self.current_line(),
+                    offset: at,
+                });
+            }
+            line = start;
+        }
+        Ok(())
     }
 
     /// Parse an explicit flow key scalar.
@@ -7396,6 +7431,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     self.advance();
                 }
                 b'\n' | b'\r' => {
+                    self.reject_tab_in_flow_plain_continuation(self.pos)?;
                     // Multiline key - check if next line continues the key
                     // Skip the line break (CRLF counts as the one break it is)
                     let mut lookahead = self.pos + self.break_len_at(self.pos);
