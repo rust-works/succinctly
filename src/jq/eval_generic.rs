@@ -63133,13 +63133,31 @@ mod tests {
                 text.push_str("  ");
             }
             gen(&mut next, 0, &mut text);
+            // A third of the documents get one byte-level mutation (a deleted, inserted or replaced
+            // byte), so the read also meets text the walk may reject or read differently.
+            let mut bytes = text.clone().into_bytes();
+            if next() % 3 == 0 && !bytes.is_empty() {
+                let at = (next() % bytes.len() as u64) as usize;
+                let junk = b",:[]{}\"\\ 0e-.\t\0xn";
+                match next() % 3 {
+                    0 => {
+                        bytes.remove(at);
+                    }
+                    1 => bytes.insert(at, junk[(next() % junk.len() as u64) as usize]),
+                    _ => bytes[at] = junk[(next() % junk.len() as u64) as usize],
+                }
+            }
+            let text = String::from_utf8_lossy(&bytes).into_owned();
             let doc = text.as_bytes();
             let index = JsonIndex::build(doc);
             let root = index.root(doc);
             let mut nodes = Vec::new();
             visit(&root, &mut nodes);
             for id in nodes {
-                let cur = root.at_node_id(id).unwrap();
+                // A mutated text may index into nodes the root cannot reach again.
+                let Some(cur) = root.at_node_id(id) else {
+                    continue;
+                };
                 let Some(fast) = cur.plain_owned_jq() else {
                     declined += 1;
                     continue;

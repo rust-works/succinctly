@@ -41,6 +41,7 @@ pub fn parse_plain(text: &str) -> Option<OwnedValue> {
         text: Some(text),
         bytes: text.as_bytes(),
         at: 0,
+        nodes: 0,
     };
     reader.space();
     let value = reader.value(0)?;
@@ -60,6 +61,7 @@ pub fn parse_plain_stream(text: &str) -> Option<Vec<OwnedValue>> {
         text: Some(text),
         bytes: text.as_bytes(),
         at: 0,
+        nodes: 0,
     };
     let mut values = Vec::new();
     loop {
@@ -76,16 +78,22 @@ pub fn parse_plain_stream(text: &str) -> Option<Vec<OwnedValue>> {
     }
 }
 
-/// The plain JSON value that starts at `bytes[start]`, with whatever follows it left alone; `None`
-/// when it is anything else, for the caller's general route to decide (#6125). `bytes` is a
+/// The plain JSON value that starts at `bytes[start]`, with whatever follows it left alone, and
+/// how many nodes the semi-index holds under it (values and object keys, not the value itself);
+/// `None` when it is anything else, for the caller's general route to decide (#6125). `bytes` is a
 /// document's text, so a string is checked for UTF-8 as it is cut.
-pub(crate) fn parse_plain_at(bytes: &[u8], start: usize) -> Option<OwnedValue> {
+///
+/// The count lets the caller hold the read to the index: a text the index nests differently (a
+/// stray quote earlier in a malformed document flips what is a string) is the walk's to judge.
+pub(crate) fn parse_plain_at(bytes: &[u8], start: usize) -> Option<(OwnedValue, usize)> {
     let mut reader = Reader {
         text: None,
         bytes,
         at: start,
+        nodes: 0,
     };
-    reader.value(0)
+    let value = reader.value(0)?;
+    Some((value, reader.nodes - 1))
 }
 
 struct Reader<'a> {
@@ -94,6 +102,8 @@ struct Reader<'a> {
     text: Option<&'a str>,
     bytes: &'a [u8],
     at: usize,
+    /// The values and keys read so far: the nodes a semi-index holds for them.
+    nodes: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -126,6 +136,7 @@ impl<'a> Reader<'a> {
     /// [`value`](Self::value), with room for `capacity` members if it is an object (the
     /// walk's sibling sizing, #5594).
     fn value_sized(&mut self, depth: usize, capacity: usize) -> Option<OwnedValue> {
+        self.nodes += 1;
         if depth >= MAX_DEPTH {
             return None;
         }
@@ -314,6 +325,7 @@ impl<'a> Reader<'a> {
                 return None;
             }
             let key = self.string()?;
+            self.nodes += 1;
             self.space();
             self.eat(b':')?;
             self.space();
@@ -487,7 +499,8 @@ mod tests {
     #[test]
     fn a_value_at_an_offset_of_bytes_is_read_and_what_follows_is_left_alone() {
         let doc = br#"  {"a":[1,"x\u00e9"],"b":null} trailing {"#;
-        let value = parse_plain_at(doc, 2).expect("the object is plain");
+        let (value, nodes) = parse_plain_at(doc, 2).expect("the object is plain");
+        assert_eq!(nodes, 6, "two keys, `[1,\"x\"]`, its two items and `null`");
         assert_eq!(
             value,
             parse_plain(r#"{"a":[1,"x\u00e9"],"b":null}"#).unwrap()
