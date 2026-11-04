@@ -4856,7 +4856,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // So this is "reads through the queue", not "calls `input`": the reader's seeding in
     // `get_inputs` checks `stream_walk_by_reader` itself, so a caller cannot send a plain walk down
     // the document parse by mistake (`stream_walk_by_reader_agrees_with_get_inputs_5498`).
-    let uses_input_builtins = jq::walk::uses_input_builtins(&expr) || stream_walk_by_reader(&args);
+    // #6147: a `--seq` run reads through the queue whatever the program is, so that the reader's
+    // faults come out in order with the values, as jq's main loop meets them.
+    let uses_input_builtins = jq::walk::uses_input_builtins(&expr)
+        || stream_walk_by_reader(&args)
+        || seq_faults_by_queue(&args);
 
     // Configure output
     let output_config = OutputConfig::from_args(&args);
@@ -7556,6 +7560,13 @@ fn seq_faults_queued(args: &JqCommand, track_eof: bool) -> bool {
         && args.input_dsv.is_none()
         && !seq_by_stream_reader(args)
         && (args.null_input || (track_eof && !args.slurp))
+}
+
+/// Whether a `--seq` run holds the reader's faults in the input queue whatever the program is: a
+/// program with no `-n` and no `-s`, over a stream read as JSON texts. jq's main loop prints each
+/// fault when it reaches it, after the values before it (#6147).
+fn seq_faults_by_queue(args: &JqCommand) -> bool {
+    seq_faults_queued(args, true) && !args.null_input
 }
 
 /// The `--seq` reader's faults ([`crate::jq_seq_reader::walk_stream_collecting`]) as the parse
