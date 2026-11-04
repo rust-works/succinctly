@@ -1864,6 +1864,12 @@ impl EvalError {
         Self::new(format!("{name}/1 requires parsed datetime inputs"))
     }
 
+    /// `<name>/1 requires a string format` — `strftime` or `strflocaltime` on a
+    /// broken-down-time array with a format that is not a string (#6111).
+    pub fn requires_string_format(name: &str) -> Self {
+        Self::new(format!("{name}/1 requires a string format"))
+    }
+
     /// `<name>/1: unknown system failure` — the C library's `strftime` returned 0 for
     /// `strftime` or `strflocaltime`: an empty result, or one that did not fit jq's buffer
     /// of `strlen(fmt) + 100` bytes (#5754).
