@@ -28520,7 +28520,8 @@ fn translate_posix_brackets_scan(
             if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'P') {
                 return Err(EvalError::new("invalid regex: undefined group option"));
             }
-            // #6126: a group option other than `i`, `m`, `x`, `s` (`(?U)`, `(?u:...)`) is an error in jq.
+            // #6126: a group option other than `i`, `m`, `x`, `s` (`(?U)`, `(?u:...)`) is an error in
+            // jq.
             if c == '(' && chars.get(i + 1) == Some(&'?') {
                 refuse_unknown_group_option(&chars[i + 2..])?;
             }
