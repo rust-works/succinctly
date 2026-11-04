@@ -19,9 +19,9 @@
 //!
 //! A body whose ways are not listed here keeps its loop as written: one with a capture group (an
 //! empty iteration also sets the group, #6069), a zero-width assertion (its empty way depends on
-//! where it stands), or a flag switch. So does an unbounded lazy repeat that must run twice or more
-//! of a body with a consuming way before its empty one: the engines differ there in a way the
-//! copy-by-copy form of `Rewriter::lazy_counted` does not follow (#6128).
+//! where it stands), or a flag switch. A lazy repeat that must run twice or more is written copy by
+//! copy by `Rewriter::lazy_counted`; for an unbounded one over a body with a consuming way before
+//! its empty one that form still differs from Oniguruma's on a few patterns (#6128).
 
 use alloc::format;
 use alloc::string::String;
@@ -691,6 +691,14 @@ mod tests {
         );
         // No consuming way after the empty one: the copies agree with Oniguruma.
         assert_eq!(rewrite("(?:a|b*){2,3}?"), None);
+    }
+
+    /// The copies multiply with the count, so a large one hits the size limit and is left as
+    /// written, quickly.
+    #[test]
+    fn a_lazy_counted_loop_with_a_large_count_is_given_up() {
+        assert_eq!(rewrite("(?:b*|a){2,1000}?"), None);
+        assert_eq!(rewrite("(?:b*|a){1000,}?"), None);
     }
 
     #[test]
