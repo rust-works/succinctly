@@ -55,6 +55,9 @@ fn test_a_repeat_after_a_bare_option_group_is_refused_6181() -> Result<()> {
         "(?i){0}a",
         "(?i){0,1}a",
         "x|(?i){1}",
+        // A group of only minus signs is a bare option group too.
+        "(?-)*a",
+        "(?i-)*a",
     ] {
         assert_not_specified(pattern)?;
     }
@@ -101,6 +104,34 @@ fn test_what_is_not_a_repeat_of_an_option_group_still_answers_6181() -> Result<(
             (stdout.trim_end(), code),
             (expected, 0),
             "{pattern}: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The empty group `(?)` is `undefined group option` before any repeat is looked at.
+#[test]
+fn test_an_empty_option_group_keeps_its_own_refusal_6181() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", &filter("(?)*a")], None)?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "stderr={stderr:?}");
+    assert!(
+        stderr.contains("invalid regex: undefined group option"),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
+/// An inline `(?x)` makes the scan stand down (it cannot see the mode's ignored blanks), so these
+/// stay as they were. jq refuses all three (`target of repeat operator is not specified`): an
+/// unfixed gap, recorded in `docs/compliance/jq/limitations.md`, so this pins what is.
+#[test]
+fn test_the_extended_mode_is_left_alone_6181() -> Result<()> {
+    for pattern in ["(?x)(?i)*a", "(?x) a(?i)+", "(?i)(?x)*a"] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", &filter(pattern)], None)?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            ("true", 0),
+            "{pattern}: {stderr:?}"
         );
     }
     Ok(())
