@@ -28473,13 +28473,24 @@ fn look_behind_refuses(open: &[GroupKind], kind: GroupKind) -> bool {
     })
 }
 
-/// How many characters after `(?` open a lookaround or an atomic group, whose body `fancy-regex`
-/// does not scope inline options to: `=`, `!`, `>` (1), `<=`, `<!` (2); 0 for any other group.
+/// How many characters after `(?` open a group whose body `fancy-regex` does not scope inline
+/// options to: a lookaround or an atomic group (`=`, `!`, `>` is 1, `<=`, `<!` is 2) or a named
+/// capture group (`<n>`, `'n'`, `P<n>`, up to and with the closing delimiter, #6212); 0 for any
+/// other group, and for a name that is never closed.
 #[cfg(feature = "regex")]
 fn scoped_group_head(flags: &[char]) -> usize {
+    let after = |from: usize, close: char| {
+        flags[from..]
+            .iter()
+            .position(|&c| c == close)
+            .map_or(0, |at| from + at + 1)
+    };
     match (flags.first(), flags.get(1)) {
         (Some('=' | '!' | '>'), _) => 1,
         (Some('<'), Some('=' | '!')) => 2,
+        (Some('<'), Some(_)) => after(1, '>'),
+        (Some('\''), Some(_)) => after(1, '\''),
+        (Some('P'), Some('<')) => after(2, '>'),
         _ => 0,
     }
 }
@@ -28938,6 +28949,18 @@ fn translate_posix_brackets_scan(
     let mut wrapped = vec![false];
     // One entry per open group too: what it is, for the look-behind rules (#6197).
     let mut kinds = vec![GroupKind::Other];
+    // Whether the pattern has an inline option run (`(?i)`, `(?-x)`) anywhere: the common one does
+    // not, and then no group body needs scanning for one (#6212).
+    let any_option_run = chars.windows(2).enumerate().any(|(at, pair)| {
+        pair == ['(', '?'] && {
+            let rest = &chars[at + 2..];
+            let letters = rest
+                .iter()
+                .take_while(|c| c.is_ascii_alphabetic() || **c == '-')
+                .count();
+            letters > 0 && rest.get(letters) == Some(&')')
+        }
+    });
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -29268,7 +29291,7 @@ fn translate_posix_brackets_scan(
                             // `)` in `fancy-regex`; Oniguruma ends it there, as a group does.
                             let head = scoped_group_head(flags);
                             let body = &chars[(i + 2 + head).min(chars.len())..];
-                            if head > 0 && holds_inline_option_run(body, outer) {
+                            if head > 0 && any_option_run && holds_inline_option_run(body, outer) {
                                 out.extend(&chars[i..i + 2 + head]);
                                 out.push_str("(?:");
                                 changed = true;
@@ -29281,8 +29304,18 @@ fn translate_posix_brackets_scan(
                     }
                 } else {
                     extended_in.push(outer);
-                    wrapped.push(false);
                     kinds.push(kind);
+                    // #6212: an inline `(?i)` in a capture group lasts past its `)` in
+                    // `fancy-regex` too; Oniguruma ends it there.
+                    let body = &chars[(i + 1).min(chars.len())..];
+                    if any_option_run && holds_inline_option_run(body, outer) {
+                        out.push_str("((?:");
+                        changed = true;
+                        wrapped.push(true);
+                        i += 1;
+                        continue;
+                    }
+                    wrapped.push(false);
                 }
             } else if c == ')' && extended_in.len() > 1 {
                 extended_in.pop();
