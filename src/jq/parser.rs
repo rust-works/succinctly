@@ -121,6 +121,7 @@ fn replace_node_reads(update: &Expr, name: &str, reads: &mut Vec<(Builtin, Strin
 /// first and each read to its own variable, and the update's `$v | READ` becomes that variable's
 /// `.[]`. An update with no such read, a pattern that is not a single `$v`, and an update that
 /// binds `$v` again anywhere are left as written.
+#[inline(never)] // one rare call site (`ireduce`): out of line, so it does not grow the parser's inlined body (#6088)
 fn bind_ireduce_node_reads(
     source: Expr,
     patterns: Vec<Pattern>,
