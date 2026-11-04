@@ -7419,6 +7419,7 @@ A property name is read as Oniguruma reads it (#6217).
 A name with `=` or `:` (`\p{Age=1.1}`, `\p{Script=Latin}`, `\p{gc=L}`) and the properties newer than the Unicode tables jq 1.7.1 links (`Bidi_Mirrored`, `IDS_Unary_Operator`, `ID_Compat_Math_Start`, `ID_Compat_Math_Continue`, `Modifier_Combining_Mark` and their abbreviations) are `invalid character property name {NAME}`, the name as written, as in jq.
 Case, blanks, `_` and `-` do not matter in a name.
 Over every name in the `regex` crate's property table (413) in seven spellings, the answers match jq 1.7.1 except for two unfixed gaps: the `In_*` block names (`\p{In_Basic_Latin}`) are answered by jq and refused here, since the crate has no block table, and a name neither tool knows (`\p{Foo}`) is refused in both with each tool's own wording.
+`scripts/jq-regex-property-name-sweep.py` regenerates the sweep from the `regex-syntax` version `Cargo.lock` pins, so a release that adds a name Oniguruma lacks shows up there.
 Pinned by `tests/jq_cli/i6217.rs`.
 
 An escaped letter Oniguruma does not define is the letter, as `\u` and `\U` are (#6080): `\g`, `\h`, `\i`, `\j`, `\k`, `\l`, `\m`, `\o`, `\q`, `\v` and the capitals `\C`, `\E`, `\F`, `\H`, `\I`, `\J`, `\L`, `\M`, `\T`, `\V`, in a class and out of one and under the `x` flag.
