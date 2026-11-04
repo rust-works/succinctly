@@ -7634,8 +7634,10 @@ These keep their loop as written, and still match longer than jq where the shape
   The switch reaches every later way of the group, which the rewrite would move out of its reach.
   A flag group (`(?i:b*)`) is rewritten.
 - **A body with syntax only `fancy-regex` reads** (a lookaround, an atomic group, a backreference, `\K`, `\G`, or a comment with a quantifier after it) keeps its loop, which `fancy-regex` then runs itself and mostly as jq does.
-  Over 40,000 generated cases with such syntax in a loop body, 42 were fixed, none broken, and 2,356 differ as before, of three kinds.
-  1,648 are `\K` as a bare alternative (`(?:\K|a)+`), a pattern jq refuses and succinctly accepts ([#6157](https://github.com/rust-works/succinctly/issues/6157)).
+  Over 40,000 generated cases with such syntax in a loop body, 42 were fixed, none broken, and 2,356 differed as before, of three kinds.
+  1,648 were `\K` as a bare alternative (`(?:\K|a)+`), a pattern jq refuses and succinctly accepted.
+  It is refused here since [#6157](https://github.com/rust-works/succinctly/issues/6157), as `\G` is: `\K` is an assertion to Oniguruma, so a repeated group whose body is a bare `\K` is `target of repeat operator is invalid`.
+  A `\K` in a capture, atomic or option group, or beside another node, may repeat, as in jq (`(\K)*`, `(?>\K)*`, `(?:a\K|b)*`).
   689 are a comment followed by a quantifier, which Oniguruma applies to the item before the comment (`b(?#)*` is `b*`): `"bab" | [match("(?:b(?#)*|a)+"; "g") | .string]` is `["b","","b",""]` in jq and `["bab",""]` here.
   19 are scattered over the other constructs.
   A comment with no quantifier after it matches nothing, and its loop is rewritten.
