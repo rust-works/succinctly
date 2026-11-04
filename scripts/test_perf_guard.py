@@ -217,6 +217,18 @@ class MeasuredPathTests(unittest.TestCase):
         self.assertTrue(short and long)
         self.assertEqual({len(p) for p in short + long}, {len(short[0])})
 
+    def test_the_started_path_stays_out_of_the_slow_lengths_wherever_tmpdir_points(self):
+        # The length is the same on every machine and outside the window that costs
+        # `arrays_map_iterate` 5.8%: `$TMPDIR` does not reach it.
+        lengths = set()
+        for tmpdir in (None, "/var/tmp", "/home/runner/work/_temp", "/a/very/long/tmpdir/" + "x" * 30):
+            with mock.patch.object(tempfile, "tempdir", tmpdir):
+                lengths.update(len(p) for p in self.run_measure_all("target/release/succinctly"))
+        self.assertEqual(len(lengths), 1, lengths)
+        (length,) = lengths
+        self.assertNotIn(length, perf_guard.SLOW_PATH_LENGTHS)
+        self.assertEqual(length, len("/tmp/tmpXXXXXXXX/bin/succinctly"))
+
     def test_the_started_path_is_a_symlink_to_the_binary_named_succinctly(self):
         seen = []
 

@@ -752,20 +752,22 @@ def measure_query(valgrind_bin, binary, mode, flags, filter_expr, fixture_path, 
     return round(statistics.median(counts))
 
 
-def measured_path(tmp, binary):
-    """The path `binary` is executed from under valgrind (#6153): a symlink to it named
-    `<tmp>/bin/succinctly`, so that two binaries measured by one run, or by two runs, are
-    both started from a path of the same length however the caller spelled them.
+# #6153: where the scratch directory of a measurement lives. Not `$TMPDIR`: the length of the path a
+# binary is started from moves some rows' instruction counts (see `measured_path`), so it has to be
+# the same on every machine. `/tmp/tmpXXXXXXXX/bin/succinctly` is 31 characters.
+SCRATCH_ROOT = "/tmp" if os.path.isdir("/tmp") else None
 
-    The path is not free. On the ubuntu-26.04 runner (glibc 2.43, valgrind 3.26) the instruction
-    count of `arrays_map_iterate` is 900.79M when the executable's path is 35 characters or
-    fewer or 52 or more, and 956.33M for 36 to 51, for the same bytes (a sweep of both a fresh
-    build and a reused artifact agreed to within 3k). The guard started the current binary
-    from `target/release/succinctly` (24 characters) and a baseline binary reused from `main`'s
-    push run from `/tmp/perf-guard-baseline-bin/succinctly` (39), so every run that reused an
-    artifact read a 5.8% improvement on that row that no commit made. A baseline built in the
-    job (`/tmp/perf-guard-merge-base/target/release/succinctly`, 52) happened to fall outside
-    the window, which is why only the reused ones failed."""
+# The lengths of the started path that read 956.33M on `arrays_map_iterate` where 900.79M is the
+# other answer (ubuntu-26.04, glibc 2.43, valgrind 3.26): 36 to 51 characters. `measured_path` stays
+# out of it, and the self-tests pin that.
+SLOW_PATH_LENGTHS = range(36, 52)
+
+
+def measured_path(tmp, binary):
+    """The path `binary` is started from under valgrind (#6153): a symlink to it named
+    `<tmp>/bin/succinctly`, so every binary the guard measures, in any run, is started from a path
+    of one length however its caller spelled it. The instruction count of a row can depend on that
+    length; docs/guides/benchmarking.md has the sweep and the rows it moved."""
     bin_dir = os.path.join(tmp, "bin")
     os.makedirs(bin_dir)
     path = os.path.join(bin_dir, "succinctly")
@@ -780,7 +782,7 @@ def measure_all(binary, valgrind_bin, reps, label="binary"):
     Returns {query_id: median instruction count}. `label` only affects the
     printed header, distinguishing this run's output in CI logs when
     `measure_all` is called twice (current binary, then --baseline-binary)."""
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as tmp:
         fixture_paths = {}
         for _, pattern, size, _, _ in QUERIES:
             shape = (pattern, size)

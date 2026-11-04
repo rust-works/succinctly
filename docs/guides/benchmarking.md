@@ -201,7 +201,7 @@ characters or fewer or 52 or more, and 956.33M for 36 to 51, for the same bytes:
 reused artifact agree at every length, and 21 of the 22 rows do not move at all (#6153). The guard
 started the current binary from `target/release/succinctly` and a baseline reused from `main`'s push
 run from `/tmp/perf-guard-baseline-bin/succinctly`, so every such run read a 5.8% "improvement" no
-commit had made. `measure_all` now starts both from a symlink `<tmp>/bin/succinctly`. Any other
+commit had made. `measure_all` now starts both from a symlink `/tmp/tmpXXXXXXXX/bin/succinctly` (31 characters, outside the window, and the same wherever `$TMPDIR` points). Any other
 valgrind A/B of two binaries should start both from paths of one length too; a counting run that
 differs only in where the binary lives is not a result.
 
