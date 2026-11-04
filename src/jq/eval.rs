@@ -28658,9 +28658,25 @@ fn translate_posix_brackets(
     extended: bool,
 ) -> Result<std::borrow::Cow<'_, str>, EvalError> {
     let translated = translate_posix_brackets_scan(pattern, extended)?;
+    // #6215: under the `x` flag the blanks and comments hide what a quantifier follows, so the same
+    // two checks run over the pattern without them. Only their refusals count: an earlier error of
+    // the scan above is the one jq reports first.
+    if extended && !inline_extended(pattern) {
+        let bare = strip_extended_blanks(pattern);
+        if let Err(refusal) = translate_posix_brackets_scan(&bare, false) {
+            if refusal.to_string().contains("target of repeat operator") {
+                return Err(refusal);
+            }
+        }
+        if bare.contains('(') && repeats_assertion_group(&bare.chars().collect::<Vec<_>>()) {
+            return Err(EvalError::new(
+                "invalid regex: target of repeat operator is invalid",
+            ));
+        }
+        return Ok(translated);
+    }
     // #6127: a repeated group whose body Oniguruma reads as an assertion. After the scan, so that an
-    // error earlier in the pattern (jq reports the first in parse order) is the one reported; the
-    // extended mode's ignored blanks are invisible to this check, as to the one in the scan.
+    // error earlier in the pattern (jq reports the first in parse order) is the one reported.
     if pattern.contains('(')
         && !extended
         && !inline_extended(pattern)
@@ -28671,6 +28687,115 @@ fn translate_posix_brackets(
         ));
     }
     Ok(translated)
+}
+
+/// `pattern` without what the `x` flag ignores: blanks and `#` comments outside a class, an escape,
+/// a `\Q..\E` run and a `(?#...)` comment (#6215). An escaped blank stays, as the literal it is.
+#[cfg(feature = "regex")]
+fn strip_extended_blanks(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = string_with_capacity(pattern.len());
+    let mut class_depth = 0usize;
+    let mut class_start = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            out.push(c);
+            if chars.get(i + 1) == Some(&'Q') {
+                // A quoted run is literal up to `\E`, or to the end.
+                let mut j = i + 1;
+                while j < chars.len() && !(chars[j] == '\\' && chars.get(j + 1) == Some(&'E')) {
+                    out.push(chars[j]);
+                    j += 1;
+                }
+                if j < chars.len() {
+                    out.push_str("\\E");
+                }
+                i = j + 2;
+                class_start = false;
+                continue;
+            }
+            if let Some(&next) = chars.get(i + 1) {
+                out.push(next);
+                // `\1 0` is the reference `\1` and a `0`: a blank is kept so that the digits do not
+                // run into one number.
+                if next.is_ascii_digit() && class_depth == 0 {
+                    let rest = &chars[i + 2..];
+                    let blanks = rest.iter().take_while(|b| b.is_whitespace()).count();
+                    if blanks > 0 && rest.get(blanks).is_some_and(char::is_ascii_digit) {
+                        out.push(' ');
+                    }
+                }
+            }
+            class_start = false;
+            i += 2;
+            continue;
+        }
+        if class_depth > 0 {
+            match c {
+                '[' => {
+                    class_depth += 1;
+                    class_start = true;
+                }
+                ']' if !class_start => class_depth -= 1,
+                '^' if class_start => {}
+                _ => class_start = false,
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') {
+            // A comment runs to the first `)` that no backslash escapes.
+            while i < chars.len() && chars[i] != ')' {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() {
+                out.push(')');
+                i += 1;
+            }
+            continue;
+        }
+        match c {
+            '[' => {
+                class_depth = 1;
+                class_start = true;
+                out.push(c);
+            }
+            // `{1, 2}` holds a blank, so it is no interval but the literal text, blank and all, in
+            // the extended mode too (#6068): copied through, not read as `{1,2}`.
+            '{' if chars[i + 1..]
+                .iter()
+                .position(|&n| n == '}')
+                .is_some_and(|close| {
+                    chars[i + 1..i + 1 + close]
+                        .iter()
+                        .all(|n| n.is_ascii_digit() || *n == ',' || n.is_whitespace())
+                }) =>
+            {
+                let close = chars[i + 1..].iter().position(|&n| n == '}').unwrap_or(0);
+                out.extend(&chars[i..=i + 1 + close]);
+                i += close + 2;
+                continue;
+            }
+            '#' => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            c if c.is_whitespace() => {}
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Whether `pattern` holds both a backreference (`\1`..`\9`, `\k<`, `\k'`) and an inline `i` option

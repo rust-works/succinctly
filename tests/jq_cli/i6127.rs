@@ -98,12 +98,19 @@ fn test_a_repeated_group_that_is_not_an_assertion_still_answers_6127() -> Result
     Ok(())
 }
 
-/// The extended mode's ignored blanks are invisible to the scan, so it leaves the check to the
-/// crate there, as the #5535 check does. jq refuses this pattern under `x` (an unfixed gap, recorded
-/// in `docs/compliance/jq/limitations.md`), so this pins what is, not jq's answer.
+/// Under the `x` flag the check reads the pattern without the blanks and comments the flag ignores
+/// (#6215), so the repeated assertion group is refused there as it is without the flag; jq refuses
+/// it in both.
 #[test]
-fn test_the_extended_mode_is_left_alone_6127() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(&["-nc", r#""ab" | test("(?:a|\\b)*";"x")"#], None)?;
-    assert_eq!((stdout.trim_end(), code), ("true", 0), "stderr={stderr:?}");
+fn test_the_extended_mode_is_checked_without_its_blanks_6127() -> Result<()> {
+    for pattern in [r"(?:a|\\b)*", r"(?: a | \\b )*"] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-nc", &format!(r#""ab" | test("{pattern}";"x")"#)], None)?;
+        assert_eq!((stdout.trim_end(), code), ("", 5), "{pattern}: {stderr:?}");
+        assert!(
+            stderr.contains("target of repeat operator is invalid"),
+            "{pattern}: {stderr:?}"
+        );
+    }
     Ok(())
 }
