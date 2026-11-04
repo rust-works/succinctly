@@ -7739,7 +7739,12 @@ impl EofTail {
     /// Where jq completes the value spanning `start..end` of `bytes`: a string or container on
     /// its closing byte, a number or literal at the byte after it (or at the end of input).
     fn completes_at(bytes: &[u8], start: usize, end: usize) -> usize {
-        if matches!(bytes[start], b'"' | b'[' | b'{') {
+        Self::completes_at_byte(bytes[start], end)
+    }
+
+    /// [`completes_at`](Self::completes_at) for a value whose first byte is `first`.
+    fn completes_at_byte(first: u8, end: usize) -> usize {
+        if matches!(first, b'"' | b'[' | b'{') {
             end - 1
         } else {
             end
@@ -7794,7 +7799,9 @@ impl EofTail {
 }
 
 /// How a `--seq` stream ends for an `input` that runs past it (#6146): [`EofTail`]'s rule over the
-/// values the `--seq` reader yielded (`ranges`, offsets into the concatenation of `sources`).
+/// values the `--seq` reader yielded (`ranges`, offsets into the concatenation of `sources`; a
+/// value the materializer would drop is not told apart here, as it is for the locations, because
+/// the reader has already checked the grammar).
 fn seq_eof_tail(sources: &[(Option<usize>, Vec<u8>)], ranges: &[(usize, usize)]) -> EofTail {
     let Some((_, last)) = sources.last() else {
         return EofTail {
@@ -7803,19 +7810,18 @@ fn seq_eof_tail(sources: &[(Option<usize>, Vec<u8>)], ranges: &[(usize, usize)])
         };
     };
     let total: usize = sources.iter().map(|(_, raw)| raw.len()).sum();
-    let last_starts = total - last.len();
     let unknown = ranges.last().is_some_and(|&(start, end)| {
-        let combined: std::borrow::Cow<'_, [u8]> = match sources {
-            [(_, only)] => std::borrow::Cow::Borrowed(only),
-            _ => std::borrow::Cow::Owned(
-                sources
-                    .iter()
-                    .flat_map(|(_, raw)| raw.iter().copied())
-                    .collect(),
-            ),
-        };
-        EofTail::completes_at(&combined, start, end)
-            >= last_starts + EofTail::final_read_start(last, 0)
+        // The value's first byte, found by walking the sources' lengths: no concatenation.
+        let mut base = 0;
+        let first = sources.iter().find_map(|(_, raw)| {
+            let at = start.checked_sub(base).filter(|&at| at < raw.len());
+            base += raw.len();
+            at.map(|at| raw[at])
+        });
+        first.is_some_and(|first| {
+            EofTail::completes_at_byte(first, end)
+                >= total - last.len() + EofTail::final_read_start(last, 0)
+        })
     });
     EofTail {
         newlines: u32::try_from(count_newlines(last)).unwrap_or(u32::MAX),

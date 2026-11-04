@@ -31,9 +31,12 @@ def run(job):
     subject, oracle, stream, program, flags = job
     out = []
     for argv in ([oracle], [subject, "jq"]):
-        done = subprocess.run(argv + ["-c", "--seq"] + flags + [program],
-                              input=stream.encode(), capture_output=True, timeout=10)
-        out.append((done.returncode, done.stdout, marker(done.stderr.decode())))
+        try:
+            done = subprocess.run(argv + ["-c", "--seq"] + flags + [program],
+                                  input=stream.encode(), capture_output=True, timeout=10)
+            out.append((done.returncode, done.stdout, marker(done.stderr.decode())))
+        except subprocess.TimeoutExpired:
+            out.append(("timeout", b"", None))
     return job, out
 
 
@@ -58,4 +61,5 @@ def main():
     sys.exit(1 if kinds else 0)
 
 
-main()
+if __name__ == "__main__":
+    main()
