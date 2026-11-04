@@ -28443,6 +28443,8 @@ fn translate_posix_brackets_scan(
     // where a `]` is a literal.
     let mut depth = 0usize;
     let mut at_start = false;
+    // Whether the class's negating `^` has been read, so that the next one is a member (#6193).
+    let mut caret_taken = false;
     // Whether the token just before this one is an assertion (`^`, `$`, `\b`, ...), which
     // Oniguruma refuses to repeat (#5535).
     let mut prev_assertion = false;
@@ -28759,6 +28761,7 @@ fn translate_posix_brackets_scan(
             if c == '[' {
                 depth = 1;
                 at_start = true;
+                caret_taken = false;
             }
             out.push(c);
             i += 1;
@@ -28798,8 +28801,9 @@ fn translate_posix_brackets_scan(
             out.push('\\');
             changed = true;
             at_start = false;
-        } else if c == '^' && at_start {
-            // A leading `^` keeps the position "first".
+        } else if c == '^' && at_start && !caret_taken {
+            // The leading `^` keeps the position "first"; a second one is a member (#6193).
+            caret_taken = true;
             out.push(c);
             i += 1;
             continue;
@@ -28858,6 +28862,8 @@ fn keep_zero_count_groups(pattern: &str, extended: bool) -> Option<String> {
     // the first of the class, where a `]` is a literal.
     let mut class_depth = 0usize;
     let mut class_start = false;
+    // Whether the class's negating `^` has been read, so that the next one is a member (#6193).
+    let mut caret_taken = false;
     let mut changed = false;
     let mut i = 0;
     while i < chars.len() {
@@ -28876,9 +28882,10 @@ fn keep_zero_count_groups(pattern: &str, extended: bool) -> Option<String> {
                 '[' => {
                     class_depth += 1;
                     class_start = true;
+                    caret_taken = false;
                 }
                 ']' if !class_start => class_depth -= 1,
-                '^' if class_start => {}
+                '^' if class_start && !caret_taken => caret_taken = true,
                 _ => class_start = false,
             }
             out.push(c);
@@ -28897,6 +28904,7 @@ fn keep_zero_count_groups(pattern: &str, extended: bool) -> Option<String> {
         if c == '[' {
             class_depth = 1;
             class_start = true;
+            caret_taken = false;
         } else if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') {
             // A comment: copied through to its closing parenthesis.
             let mut end = i + 3;
@@ -29126,6 +29134,8 @@ pub(crate) fn oniguruma_shadow(pattern: &str) -> Option<OnigurumaShadow> {
     // a literal -- as in [`keep_zero_count_groups`].
     let mut class_depth = 0usize;
     let mut class_start = false;
+    // Whether the class's negating `^` has been read, so that the next one is a member (#6193).
+    let mut caret_taken = false;
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
@@ -29155,9 +29165,10 @@ pub(crate) fn oniguruma_shadow(pattern: &str) -> Option<OnigurumaShadow> {
                 b'[' => {
                     class_depth += 1;
                     class_start = true;
+                    caret_taken = false;
                 }
                 b']' if !class_start => class_depth -= 1,
-                b'^' if class_start => {}
+                b'^' if class_start && !caret_taken => caret_taken = true,
                 _ => class_start = false,
             }
             out.push(b);
@@ -29168,6 +29179,7 @@ pub(crate) fn oniguruma_shadow(pattern: &str) -> Option<OnigurumaShadow> {
         if b == b'[' {
             class_depth = 1;
             class_start = true;
+            caret_taken = false;
         } else if rest.starts_with(b"(?=") || rest.starts_with(b"(?!") || rest.starts_with(b"(?>") {
             opaque.push(i);
             out.extend_from_slice(b"(?:");

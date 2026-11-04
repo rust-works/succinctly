@@ -7398,6 +7398,7 @@ One exotic shape still differs: a negated bracket under the `i` flag (`test("[[:
 A range from a POSIX bracket (`[[:alpha:]-z]`) and a doubled hyphen (`[a--b]`) were accepted here and an error in jq until #6184.
 An unknown bracket name (`[[:foo:]]`, `[[:ALPHA:]]`) is an error in both, with this crate's wording.
 In jq mode a `[`, `&` or `~` inside a class is the literal character, as in Oniguruma's Perl syntax, where the `regex` crate would read a nested class, an intersection and a symmetric difference.
+Only the first `^` after a class's `[` negates it (#6193): `[^^]` is a negated class holding `^`, and a `]` after the second `^` closes it, so an unterminated class after it (`[^^]z[]`) is an error as in jq.
 A dash is read as Oniguruma reads it (#6184), where the `regex` crate takes `--` for set difference and a `]` that opens a class for a literal that no range can start.
 `[+--]` is the range `+` to `-`, `[--{]` the range `-` to `{`, and `[]-b{]` the range `]` to `b`; the reversed `[?--]` and `[]-(]` are errors, as `[b-a]` is.
 A range that starts or ends on a set (`[[:alpha:]-a]`, `[a-[:alpha:]]`, `[\w-.]`, `[+-\w]`) is an error in jq and here; `\b`, `\h` and `\cA` in a class are single characters and can bound a range.
