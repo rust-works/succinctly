@@ -20668,7 +20668,9 @@ fn yq_extremum_result<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// yq's `min`/`max` of a mapping: the extremum of its values, nothing for an empty one (#4236).
+/// yq's `min`/`max` of a mapping: the extremum of its values, compared as a sequence's elements
+/// are (#6162: a string, boolean, array or map among them is refused), nothing for an empty one
+/// (#4236).
 /// `items` is the values already materialised, so a decode failure surfaces here once.
 fn mapping_extremum<'a, W: Clone + AsRef<[u64]>>(
     items: Result<Vec<OwnedValue>, EvalError>,
@@ -20676,7 +20678,7 @@ fn mapping_extremum<'a, W: Clone + AsRef<[u64]>>(
     want_max: bool,
 ) -> QueryResult<'a, W> {
     match items {
-        // The values compare as a sequence's elements do (#6161): yq refuses a string, an array
+        // The values compare as a sequence's elements do (#6162): yq refuses a string, an array
         // or a map among them, where the extremum of mixed numbers still picks one.
         Ok(items) if items.is_empty() => QueryResult::None,
         Ok(items) => yq_extremum_result::<W>(items, want_max, optional),
@@ -20714,7 +20716,7 @@ fn builtin_min<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(min)
         }
         // #4236 (yq): a mapping is the extremum of its values (`{"a": 2, "b": 1} | min` is `1`),
-        // and an empty one has none.
+        // compared as a sequence's are (#6162), and an empty one has none.
         StandardJson::Object(fields) if S::MIN_MAX_NEED_AN_ELEMENT => mapping_extremum::<W>(
             // STYLE-0012: routed, at `mapping_extremum`'s `Err(e) => suppress_or_raise(e, optional)`.
             fields.map(|f| to_owned::<S, _>(&f.value())).collect(),

@@ -96,3 +96,23 @@ fn a_mappings_extremum_refuses_what_a_sequences_does_6162() -> Result<()> {
     }
     Ok(())
 }
+
+/// The same answer through a path, `map`, an iteration and a construction.
+#[test]
+fn a_mappings_extremum_agrees_on_every_route_6162() -> Result<()> {
+    let document = "a: {p: 1, q: x}\nb: {p: 2, q: 3}\nc: [{u: 1}, {u: y}]\n";
+    for (filter, expected) in [
+        (".b | max", "3\n"),
+        (".b | min", "2\n"),
+        (".c[] | max", "1\n\"y\"\n"),
+        (".c | map(max)", "[1,\"y\"]\n"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, document, &["-o=json", "-I=0"])?;
+        assert_eq!((output.as_str(), code), (expected, 0), "{filter}");
+    }
+    for filter in [".a | max", ".[] | max", "{\"k\": .a} | .k | max"] {
+        let (_, code) = run_yq_stdin(filter, document, &[])?;
+        assert_eq!(code, 1, "{filter}");
+    }
+    Ok(())
+}
