@@ -481,3 +481,34 @@ fn test_a_repeated_two_node_zero_width_group_is_a_valid_target_6221() -> Result<
     }
     Ok(())
 }
+
+/// Under the `x` flag, inline or as a flag, a blank or a `#` comment is no node: `(?:\G )*` is a body
+/// of one, which jq refuses, so the rewrite is not offered a body that holds either.
+#[test]
+fn test_a_blank_in_the_body_is_no_node_under_the_x_flag_6221() -> Result<()> {
+    for (pattern, flags) in [
+        (r"(?x)(?:\G )*", "g"),
+        (r"(?:\G )*", "gx"),
+        ("(?:\\G #c\n)*", "gx"),
+        (r"(?x)(?:\K  )+b", "g"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(
+            &[
+                "-nc",
+                "--arg",
+                "p",
+                pattern,
+                "--arg",
+                "f",
+                flags,
+                r#""cab" | [match($p; $f) | .string]"#,
+            ],
+            None,
+        )?;
+        assert_eq!(
+            code, 5,
+            "{pattern:?} {flags}: stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}

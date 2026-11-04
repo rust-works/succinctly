@@ -31778,7 +31778,14 @@ fn atomize_option_group(pattern: &str, at: usize) -> Option<String> {
     // #6221: a plain group whose body is a sequence of two nodes (`(?:\G(?m))*`, `(?:\G(?:(?m)))*`)
     // is a valid target to Oniguruma. Its body is zero-width (that is why the
     // crate refused it), so an atomic group matches as it does.
-    if pattern.get(open..)?.starts_with("(?:") && body_is_a_sequence(&pattern[open + 3..close]) {
+    // Not where a blank or a `#` is in the body: under the `x` flag (inline or not) they are ignored
+    // and this scan counts them as nodes, so `(?x)(?:\G )*`, a body of one node, would pass.
+    if pattern.get(open..)?.starts_with("(?:")
+        && !pattern[open + 3..close]
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b == b'#')
+        && body_is_a_sequence(&pattern[open + 3..close])
+    {
         return Some(format!(
             "{}(?>{}|(?!)){}",
             &pattern[..open],
