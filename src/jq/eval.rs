@@ -135257,6 +135257,24 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_matching_close_skips_escapes_and_classes_6187() {
+        let close = |p: &str, open: usize| matching_close(p.as_bytes(), open);
+        assert_eq!(close("(ab)c", 0), Some(3));
+        assert_eq!(close("(a(b)c)d", 0), Some(6));
+        // An escaped parenthesis, and one in a class, close and open nothing.
+        assert_eq!(close(r"(a\)b)", 0), Some(5));
+        assert_eq!(close("(a[)]b)", 0), Some(6));
+        assert_eq!(close("(a[^)]b)", 0), Some(7));
+        // A `]` right after `[` or `[^` is a member, and does not end the class.
+        assert_eq!(close("(a[])]b)", 0), Some(7));
+        assert_eq!(close("(a[^])]b)", 0), Some(8));
+        // No close, a stray close before any open, and a start that is no `(`.
+        assert_eq!(close("(a(b)", 0), None);
+        assert_eq!(close("a)", 0), None);
+        assert_eq!(close("ab", 0), None);
+    }
+
+    #[test]
     fn test_atomize_option_group_steps_through_plain_groups_of_one_group_6187() {
         // The operator `fancy-regex` reports: the last `*`, or the closing brace of an interval.
         let at = |pattern: &str| pattern.rfind(['*', '}']).expect(pattern);
