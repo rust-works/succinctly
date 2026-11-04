@@ -23,7 +23,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::eval::JqSemantics;
-use super::eval_generic::ObjectBuilder;
+use super::eval_generic::{ObjectBuilder, SiblingShape};
 use super::value::OwnedValue;
 
 /// Deeper than this the general route decides (it enforces the document nesting ceilings and
@@ -38,9 +38,10 @@ const _: () = assert!(MAX_DEPTH <= super::eval_generic::MAX_NESTING_DEPTH);
 /// whitespace; `None` when it is anything else, for the caller's general route to decide.
 pub fn parse_plain(text: &str) -> Option<OwnedValue> {
     let mut reader = Reader {
-        text,
+        text: Some(text),
         bytes: text.as_bytes(),
         at: 0,
+        nodes: 0,
     };
     reader.space();
     let value = reader.value(0)?;
@@ -57,9 +58,10 @@ pub fn parse_plain(text: &str) -> Option<OwnedValue> {
 /// `1[2]` and `"a""b"` (which a stream parser may split) are the general route's too.
 pub fn parse_plain_stream(text: &str) -> Option<Vec<OwnedValue>> {
     let mut reader = Reader {
-        text,
+        text: Some(text),
         bytes: text.as_bytes(),
         at: 0,
+        nodes: 0,
     };
     let mut values = Vec::new();
     loop {
@@ -76,13 +78,45 @@ pub fn parse_plain_stream(text: &str) -> Option<Vec<OwnedValue>> {
     }
 }
 
-struct Reader<'a> {
-    text: &'a str,
-    bytes: &'a [u8],
-    at: usize,
+/// The plain JSON value that starts at `bytes[start]`, with whatever follows it left alone, and
+/// how many nodes the semi-index holds under it (values and object keys, not the value itself);
+/// `None` when it is anything else, for the caller's general route to decide (#6125). `bytes` is a
+/// document's text, so a string is checked for UTF-8 as it is cut.
+///
+/// The count lets the caller hold the read to the index: a text the index nests differently (a
+/// stray quote earlier in a malformed document flips what is a string) is the walk's to judge.
+pub(crate) fn parse_plain_at(bytes: &[u8], start: usize) -> Option<(OwnedValue, usize)> {
+    let mut reader = Reader {
+        text: None,
+        bytes,
+        at: start,
+        nodes: 0,
+    };
+    let value = reader.value(0)?;
+    Some((value, reader.nodes - 1))
 }
 
-impl Reader<'_> {
+struct Reader<'a> {
+    /// The text as a `&str` when the caller has one (slices are then cut on the checked
+    /// boundaries); `None` for bytes of a document, whose slices are validated as they are cut.
+    text: Option<&'a str>,
+    bytes: &'a [u8],
+    at: usize,
+    /// The values and keys read so far: the nodes a semi-index holds for them.
+    nodes: usize,
+}
+
+impl<'a> Reader<'a> {
+    /// `bytes[from..to]` as text; `None` where it is not (a split character, or invalid UTF-8
+    /// in a document read from bytes).
+    #[inline]
+    fn slice(&self, from: usize, to: usize) -> Option<&'a str> {
+        match self.text {
+            Some(text) => text.get(from..to),
+            None => core::str::from_utf8(self.bytes.get(from..to)?).ok(),
+        }
+    }
+
     #[inline]
     fn space(&mut self) {
         while matches!(self.bytes.get(self.at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
@@ -96,11 +130,18 @@ impl Reader<'_> {
     }
 
     fn value(&mut self, depth: usize) -> Option<OwnedValue> {
+        self.value_sized(depth, 0)
+    }
+
+    /// [`value`](Self::value), with room for `capacity` members if it is an object (the
+    /// walk's sibling sizing, #5594).
+    fn value_sized(&mut self, depth: usize, capacity: usize) -> Option<OwnedValue> {
+        self.nodes += 1;
         if depth >= MAX_DEPTH {
             return None;
         }
         match *self.bytes.get(self.at)? {
-            b'{' => self.object(depth),
+            b'{' => self.object(depth, capacity),
             b'[' => self.array(depth),
             b'"' => self.string().map(|s| OwnedValue::String(s.into())),
             b't' => self.literal(b"true", OwnedValue::Bool(true)),
@@ -144,7 +185,7 @@ impl Reader<'_> {
         }
         self.at = end;
         Some(OwnedValue::from_number_literal::<JqSemantics>(
-            self.text.get(start..end)?,
+            self.slice(start, end)?,
         ))
     }
 
@@ -159,14 +200,14 @@ impl Reader<'_> {
             match *self.bytes.get(at)? {
                 b'"' => {
                     self.at = at + 1;
-                    return self.text.get(start..at).map(String::from);
+                    return self.slice(start, at).map(String::from);
                 }
                 b'\\' => break,
                 0..=0x1f => return None,
                 _ => at += 1,
             }
         }
-        let mut out = String::from(self.text.get(start..at)?);
+        let mut out = String::from(self.slice(start, at)?);
         loop {
             match *self.bytes.get(at)? {
                 b'"' => {
@@ -184,7 +225,7 @@ impl Reader<'_> {
                         b'r' => '\r',
                         b't' => '\t',
                         b'u' => {
-                            let hex = self.text.get(at + 2..at + 6)?;
+                            let hex = self.slice(at + 2, at + 6)?;
                             if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                                 return None;
                             }
@@ -195,7 +236,7 @@ impl Reader<'_> {
                                 if self.bytes.get(at + 6..at + 8)? != b"\\u" {
                                     return None;
                                 }
-                                let low_hex = self.text.get(at + 8..at + 12)?;
+                                let low_hex = self.slice(at + 8, at + 12)?;
                                 if !low_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                                     return None;
                                 }
@@ -230,7 +271,7 @@ impl Reader<'_> {
                     {
                         at += 1;
                     }
-                    out.push_str(self.text.get(run..at)?);
+                    out.push_str(self.slice(run, at)?);
                 }
             }
         }
@@ -244,9 +285,19 @@ impl Reader<'_> {
             self.at += 1;
             return Some(OwnedValue::array_from(items));
         }
+        let mut siblings = SiblingShape::default();
         loop {
             self.space();
-            items.push(self.value(depth + 1)?);
+            let capacity = siblings.capacity();
+            let item = self.value_sized(depth + 1, capacity)?;
+            siblings.push(
+                match &item {
+                    OwnedValue::Object(map) => Some(map.len()),
+                    _ => None,
+                },
+                capacity,
+            );
+            items.push(item);
             self.space();
             match *self.bytes.get(self.at)? {
                 b',' => self.at += 1,
@@ -259,10 +310,10 @@ impl Reader<'_> {
         }
     }
 
-    fn object(&mut self, depth: usize) -> Option<OwnedValue> {
+    fn object(&mut self, depth: usize, capacity: usize) -> Option<OwnedValue> {
         self.at += 1;
         self.space();
-        let mut members = ObjectBuilder::<OwnedValue>::new();
+        let mut members = ObjectBuilder::<OwnedValue>::with_capacity(capacity);
         if self.bytes.get(self.at) == Some(&b'}') {
             self.at += 1;
             return Some(OwnedValue::Object(members.finish()));
@@ -274,6 +325,7 @@ impl Reader<'_> {
                 return None;
             }
             let key = self.string()?;
+            self.nodes += 1;
             self.space();
             self.eat(b':')?;
             self.space();
@@ -440,6 +492,38 @@ mod tests {
         }
         let deep = alloc::format!("{}{}", "[".repeat(MAX_DEPTH + 1), "]".repeat(MAX_DEPTH + 1));
         assert!(parse_plain_stream(&alloc::format!("1 {deep}")).is_none());
+    }
+
+    /// The bytes form (#6125): the value at an offset, whatever follows it, and a string checked
+    /// for UTF-8 as it is cut.
+    #[test]
+    fn a_value_at_an_offset_of_bytes_is_read_and_what_follows_is_left_alone() {
+        let doc = br#"  {"a":[1,"x\u00e9"],"b":null} trailing {"#;
+        let (value, nodes) = parse_plain_at(doc, 2).expect("the object is plain");
+        assert_eq!(nodes, 6, "two keys, `[1,\"x\"]`, its two items and `null`");
+        assert_eq!(
+            value,
+            parse_plain(r#"{"a":[1,"x\u00e9"],"b":null}"#).unwrap()
+        );
+        assert_eq!(value.to_json(), r#"{"a":[1,"xé"],"b":null}"#);
+        // An offset inside the text, a container among others.
+        assert!(parse_plain_at(br"[[1],[2,3]]", 1).is_some());
+        // What is not plain is declined, as `parse_plain` declines it.
+        for bad in [
+            &br#"{"a":1,"a":2}"#[..],
+            br"[1,]",
+            br"[007]",
+            br#"["\ud800"]"#,
+            b"[\"\xff\"]",
+            b"[\"caf\xc3\"]",
+            br"[nan]",
+            br#"{"a":"#,
+        ] {
+            assert!(parse_plain_at(bad, 0).is_none(), "accepted {bad:?}");
+        }
+        // Past the end, and on a byte that starts no value.
+        assert!(parse_plain_at(b"[1]", 3).is_none());
+        assert!(parse_plain_at(b"[1]", 2).is_none());
     }
 
     #[test]

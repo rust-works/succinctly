@@ -521,10 +521,21 @@ DEFAULT_THRESHOLD = 5.0
 # writes the three lines of every `-R` document it slices (-5.0% x86_64 / -6.0% ARM64-Linux against
 # the PR's own merge-base, outputs byte-identical). Remove it once `main` carries the change and the
 # row reads ~0% against a merge-base that includes it.
+#
+# `users_del_select` / `users_del_bound_select` / `users_assign_scores` / `users_update_select`
+# (#6125) carry overrides of the same one-off kind: materializing a container of plain JSON reads
+# its own text in one pass instead of walking the cursor, and these write shapes materialize the
+# document they write into (-18.4% / -17.2% / -15.9% / -17.3% x86_64, -22.6% / -22.2% / -20.2% /
+# -21.7% ARM64-Linux against the PR's own merge-base, outputs byte-identical). Remove them once
+# `main` carries the change and the rows read ~0% against a merge-base that includes it.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
     "users_yq_raw_test": 65.0,
     "users_yq_raw_slice": 10.0,
+    "users_del_select": 30.0,
+    "users_del_bound_select": 30.0,
+    "users_assign_scores": 30.0,
+    "users_update_select": 30.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
