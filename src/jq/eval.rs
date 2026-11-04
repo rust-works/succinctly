@@ -30848,7 +30848,23 @@ fn parse_fancy_tree_in_oniguruma_mode(mut pattern: String) -> Option<(fancy_rege
     for _ in 0..64 {
         match fancy_regex::Expr::parse_tree_with_flags(&pattern, FLAG_UNICODE | FLAG_ONIGURUMA_MODE)
         {
-            Ok(tree) => return Some((tree.expr, pattern)),
+            Ok(tree) => {
+                // #6166: a lazy repeat that may stop at once of a body that holds a `\G`. The scan can
+                // decline (a `#` before the group, a capture group), and the guarded pattern is read
+                // again; where either does not give a pattern the crate reads, the pattern stays as it
+                // was, which is how it answered before the guard.
+                if fancy_has_lazy_repeat_holding_g(&tree.expr) {
+                    if let Some(guarded) = guard_lazy_repeats_holding_g(&pattern) {
+                        if let Ok(tree) = fancy_regex::Expr::parse_tree_with_flags(
+                            &guarded,
+                            FLAG_UNICODE | FLAG_ONIGURUMA_MODE,
+                        ) {
+                            return Some((tree.expr, guarded));
+                        }
+                    }
+                }
+                return Some((tree.expr, pattern));
+            }
             Err(fancy_regex::Error::ParseError(
                 at,
                 fancy_regex::ParseError::TargetNotRepeatable,
@@ -30977,6 +30993,152 @@ fn atomize_option_group(pattern: &str, at: usize) -> Option<String> {
         &pattern[colon + 1..start - 1],
         &pattern[start..]
     ))
+}
+
+/// Whether `expr` holds a lazy repeat that may stop at once (`*?`, `??`, `{0,n}?`) of a body with a
+/// `\G` in it (#6166).
+#[cfg(feature = "regex")]
+fn fancy_has_lazy_repeat_holding_g(expr: &fancy_regex::Expr) -> bool {
+    use fancy_regex::Expr;
+    let is_g = |e: &Expr| matches!(e, Expr::ContinueFromPreviousMatchEnd);
+    let found = |e: &Expr| {
+        matches!(
+            e,
+            Expr::Repeat { child, lo: 0, greedy: false, .. } if is_g(child) || child.has_descendant(is_g)
+        )
+    };
+    found(expr) || expr.has_descendant(found)
+}
+
+/// `pattern` with a way that never matches, `|(?!)`, added to the body of each non-capturing group
+/// that a lazy repeat which may stop at once (`*?`, `??`, `{0,n}?`) follows, where the body holds a
+/// `\G` (#6166). `fancy-regex` 0.20.0 gives a `\G` that is outside every capture group and
+/// alternation an early exit: where it fails away from the search start, the whole search ends
+/// instead of moving on to the next start. That is right only where the `\G` is on every path, and
+/// a lazy repeat of zero iterations is a path without it (its exit is tried first, so it is no
+/// longer on the stack when the `\G` fails): `"cab" | match("(?:\\K\\G)*?b")` finds nothing where jq
+/// finds the `b` at 2, and so do `(?>\\G)*?b` and `(?:\\K\\Ga?)*?b`. A way inside the body makes the
+/// `\G` part of an alternation, which has no early exit. It matches nothing, so no match changes
+/// (the remedy [`atomize_option_group`] applies to an option group, for the same reason). A capture
+/// group answers without it. A `#` (not escaped, not in a class) before the group may open an
+/// extended-mode comment that hides a parenthesis from the scan, so such a group is left alone, as
+/// it was before. `None` when no group needed the way.
+#[cfg(feature = "regex")]
+fn guard_lazy_repeats_holding_g(pattern: &str) -> Option<String> {
+    let bytes = pattern.as_bytes();
+    let mut open = Vec::new();
+    let mut at = Vec::new();
+    let mut class_depth = 0usize;
+    // A `#` that is not escaped or in a class, before the group.
+    let mut hashed = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'[' => {
+                class_depth += 1;
+                // A `]` right after `[` or `[^` is a member.
+                if bytes.get(i + 1) == Some(&b'^') {
+                    i += 1;
+                }
+                if bytes.get(i + 1) == Some(&b']') {
+                    i += 1;
+                }
+            }
+            b']' if class_depth > 0 => class_depth -= 1,
+            b'#' if class_depth == 0 => hashed = true,
+            b'(' if class_depth == 0 => open.push(i),
+            // A `)` with no `(` is in an extended-mode comment, which is not followed.
+            b')' if class_depth == 0 => {
+                if let Some(start) = open.pop() {
+                    if !hashed
+                        && lazy_may_stop_at_once(&bytes[i + 1..])
+                        && group_holds_g(&pattern[start..i])
+                    {
+                        at.push(i);
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if at.is_empty() {
+        return None;
+    }
+    let mut out = string_with_capacity(pattern.len() + 5 * at.len());
+    let mut from = 0;
+    for close in at {
+        out.push_str(&pattern[from..close]);
+        out.push_str("|(?!)");
+        from = close;
+    }
+    out.push_str(&pattern[from..]);
+    Some(out)
+}
+
+/// Whether `rest` starts with a lazy quantifier that allows no repetition: `*?`, `??`, `{0,n}?`,
+/// `{,n}?` or `{0}?`.
+#[cfg(feature = "regex")]
+fn lazy_may_stop_at_once(rest: &[u8]) -> bool {
+    match rest {
+        [b'*' | b'?', b'?', ..] => true,
+        [b'{', tail @ ..] => {
+            let Some(end) = tail.iter().position(|b| *b == b'}') else {
+                return false;
+            };
+            let (interval, after) = tail.split_at(end);
+            let lo = interval.split(|b| *b == b',').next().unwrap_or(&[]);
+            after.get(1) == Some(&b'?')
+                && interval.iter().all(|b| b.is_ascii_digit() || *b == b',')
+                && lo.iter().all(|b| *b == b'0')
+                && interval.iter().any(u8::is_ascii_digit)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `group` (from its `(` up to, not including, its `)`) is a non-capturing group, plain,
+/// atomic or with flags, whose body holds a `\G` that is not in a class.
+#[cfg(feature = "regex")]
+fn group_holds_g(group: &str) -> bool {
+    let b = group.as_bytes();
+    let Some(rest) = b.strip_prefix(b"(?") else {
+        return false;
+    };
+    let letters = rest
+        .iter()
+        .take_while(|c| c.is_ascii_alphabetic() || **c == b'-')
+        .count();
+    if !matches!(rest.get(letters), Some(b':' | b'>')) {
+        return false;
+    }
+    let mut i = 2 + letters + 1;
+    let mut class_depth = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                if class_depth == 0 && b.get(i + 1) == Some(&b'G') {
+                    return true;
+                }
+                i += 1;
+            }
+            b'[' => {
+                class_depth += 1;
+                // A `]` right after `[` or `[^` is a member.
+                if b.get(i + 1) == Some(&b'^') {
+                    i += 1;
+                }
+                if b.get(i + 1) == Some(&b']') {
+                    i += 1;
+                }
+            }
+            b']' if class_depth > 0 => class_depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Whether `expr` holds two greedy `X+` repeats of the same expression with exactly one repeat that
@@ -134860,6 +135022,120 @@ mod tests {
             Some(r"(?i:(?>\K|(?!)))*#")
         );
         assert_eq!(atomize_option_group("(?i:", 99), None);
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_guard_lazy_repeats_holding_g_adds_a_dead_way_to_the_group_6166() {
+        // A non-capturing group with a `\G` in it that a lazy repeat which may stop at once follows.
+        for (pattern, expected) in [
+            (r"(?:\K\G)*?b", r"(?:\K\G|(?!))*?b"),
+            (r"(?>\G)??b", r"(?>\G|(?!))??b"),
+            (r"(?i:\K\G){0,2}?b", r"(?i:\K\G|(?!)){0,2}?b"),
+            (r"(?:\K\G){0}?b", r"(?:\K\G|(?!)){0}?b"),
+            (r"(?x: \K \G )*?b", r"(?x: \K \G |(?!))*?b"),
+            (r"(?:\K(?:\G))*?b", r"(?:\K(?:\G)|(?!))*?b"),
+            (r"[(]\)(?:\G\K)*?b", r"[(]\)(?:\G\K|(?!))*?b"),
+            (r"(?:\K\G)*?(?>\G\G)??", r"(?:\K\G|(?!))*?(?>\G\G|(?!))??"),
+            // A body that can match text as well.
+            (r"(?:\K\Ga?)*?b", r"(?:\K\Ga?|(?!))*?b"),
+            (r"(?i:\Ga*)*?b+", r"(?i:\Ga*|(?!))*?b+"),
+            (r"(?:(?=a)\G){0,}?(?=b)", r"(?:(?=a)\G|(?!)){0,}?(?=b)"),
+            (r"(?:\G(?:a|))??b", r"(?:\G(?:a|)|(?!))??b"),
+            // A `#` that is escaped or in a class opens no comment; one after the group hides nothing,
+            // and neither does an unmatched `)` there.
+            (r"[#]x(?:\K\G)*?b", r"[#]x(?:\K\G|(?!))*?b"),
+            (r"\#(?:\K\G)*?b", r"\#(?:\K\G|(?!))*?b"),
+            (r"(?x)(?:\K\G)*?b # note)", r"(?x)(?:\K\G|(?!))*?b # note)"),
+        ] {
+            assert_eq!(
+                guard_lazy_repeats_holding_g(pattern).as_deref(),
+                Some(expected),
+                "{pattern}"
+            );
+        }
+        // A capture, a greedy repeat, a minimum of one, a body without a `\G` (or one in a class or
+        // escaped), a group with no body and a `#` that could hide a parenthesis are left alone.
+        // (A lone `\G` is read here as a body; the tree check that gates the call is what leaves it
+        // refused.)
+        for pattern in [
+            r"(\K\G)*?b",
+            r"(?<n>\K\G)*?b",
+            r"(?:\K\G)*b",
+            r"(?:\K\G)+?b",
+            r"(?:\K\G){1,}?b",
+            r"(?:\K\G){2,3}?b",
+            r"(?:\Ka)*?b",
+            r"(?:[\G])*?b",
+            r"(?:\\G)*?b",
+            r"(?:)*?b",
+            r"#(?:\K\G)*?b",
+            r"(?x) a # )\n(?:\K\G)*?b",
+            r"(?:\K\G)",
+            r"{0,2}?",
+        ] {
+            assert_eq!(guard_lazy_repeats_holding_g(pattern), None, "{pattern}");
+        }
+    }
+
+    /// The tree check that gates the rewrite and the text scan that makes it read one pattern two
+    /// ways, so they are pinned to agree: every pattern the scan rewrites is flagged by the tree, and
+    /// the repeats the tree leaves alone (greedy, a minimum of one, no `\G`) are not rewritten.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_the_tree_gate_and_the_text_scan_agree_on_lazy_repeats_holding_g_6166() {
+        use fancy_regex::internal::{FLAG_ONIGURUMA_MODE, FLAG_UNICODE};
+        let gate = |pattern: &str| {
+            let tree = fancy_regex::Expr::parse_tree_with_flags(
+                pattern,
+                FLAG_UNICODE | FLAG_ONIGURUMA_MODE,
+            )
+            .unwrap_or_else(|e| panic!("{pattern}: {e:?}"));
+            fancy_has_lazy_repeat_holding_g(&tree.expr)
+        };
+        for pattern in [
+            r"(?:\K\G)*?b",
+            r"(?>\G)??b",
+            r"(?i:\K\G){0,2}?b",
+            r"(?:\K\Ga?)*?b",
+            r"(?i:\Ga*)*?b+",
+            r"(?:(?=a)\G){0,}?(?=b)",
+            r"(?:\G(?:a|))??b",
+            r"(?:\K\G)*?(?>\G\G)??",
+        ] {
+            assert!(gate(pattern), "{pattern}");
+            assert!(guard_lazy_repeats_holding_g(pattern).is_some(), "{pattern}");
+        }
+        for pattern in [
+            r"(?:\K\G)*b",
+            r"(?:\K\G)+?b",
+            r"(?:\K\G){2,3}?b",
+            r"(?:\K\Ga)*?b",
+            r"(?:\Ka?)*?b",
+            r"a*?b",
+        ] {
+            let flagged = gate(pattern);
+            let rewritten = guard_lazy_repeats_holding_g(pattern).is_some();
+            assert_eq!(flagged, rewritten, "{pattern}");
+            // `(?:\K\Ga)*?b` holds a `\G` under a lazy repeat that may stop at once: both see it.
+            assert_eq!(flagged, pattern == r"(?:\K\Ga)*?b", "{pattern}");
+        }
+        // A capture group is flagged by the tree and left alone by the scan: it answers already.
+        assert!(gate(r"(\K\G)*?b"));
+        assert_eq!(guard_lazy_repeats_holding_g(r"(\K\G)*?b"), None);
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_lazy_may_stop_at_once_reads_the_quantifier_6166() {
+        for rest in ["*?b", "??b", "{0,2}?", "{0}?", "{00,}?", "{0,0}?", "{,2}?"] {
+            assert!(lazy_may_stop_at_once(rest.as_bytes()), "{rest}");
+        }
+        for rest in [
+            "*b", "?b", "+?", "{1,2}?", "{0,2}", "{2}?", "{}?", "{,}?", "{0,2", "{a}?", "", "b",
+        ] {
+            assert!(!lazy_may_stop_at_once(rest.as_bytes()), "{rest}");
+        }
     }
 
     #[cfg(feature = "regex")]
