@@ -6044,7 +6044,6 @@ fn update_filter_is_native(filter: &Expr) -> bool {
         Expr::FirstExpr(inner) | Expr::LastExpr(inner) => is_navigation(inner),
         Expr::Limit { expr, .. } => is_navigation(expr),
         Expr::Builtin(Builtin::Length | Builtin::Add | Builtin::First | Builtin::Last) => true,
-        Expr::Builtin(Builtin::Limit(_, generator)) => is_navigation(generator),
         Expr::Builtin(Builtin::Map(body)) => projects_small(body),
         _ => false,
     }
@@ -6232,9 +6231,6 @@ fn update_on_cursor_gated<S: EvalSemantics, V: DocumentValue>(
     }
     let mut steps = Vec::new();
     static_path_steps(path, &mut steps)?;
-    if steps.is_empty() {
-        return None;
-    }
     let target = update_target_cursor(root, &steps)?;
     if size_gates {
         let target_span = target.subtree_end()?.checked_sub(target.node_id())?;
@@ -54959,7 +54955,6 @@ mod tests {
             "line",
             "first(column)",
             "first(at_offset(0))",
-            "(debug | length)",
             "input?",
             "tojson",
             "{x: .}",
@@ -55083,11 +55078,37 @@ mod tests {
             at_ceiling > 0,
             "no update at the nesting ceiling took the route"
         );
+        // A document that is malformed outside the target is left to the copy to raise.
+        for doc in [
+            r#"{"a":[1,2],"z"}"#,
+            r#"{"a":[1,2],"z":}"#,
+            r#"{"a":[1,2] "z":1}"#,
+            r#"{"a":[1,2],"z":1,}"#,
+            r#"{"a":[1,2],"z":[1,,2]}"#,
+            r#"[[1,2],"\q"]"#,
+            r#"[[1,2],{"z":1},]"#,
+            r#"{"a":[1,2],"a":[3]}"#,
+        ] {
+            assert!(!compare(doc, ".a |= length"), "{doc}");
+            assert!(!compare(doc, ".[0] |= length"), "{doc}");
+        }
         // The run must reach the route, or it proved nothing.
         assert!(
             taken > 300,
             "too few updates took the cursor route: {taken} of {tried}"
         );
+    }
+
+    /// #6199: only JSON text is certified by one scan; a format whose text is not canonical JSON
+    /// answers "not told", and the caller walks.
+    #[test]
+    fn a_yaml_cursor_certifies_nothing_by_scan_6199() {
+        use crate::yaml::YamlIndex;
+        let yaml = b"name: Alice\nage: 30";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+        assert!(!cursor.certified_well_formed(0));
+        assert!(!cursor.first_child().unwrap().certified_well_formed(3));
     }
 
     /// #6199: which updates take the cursor route is a decision about answers (a `map` under a
@@ -55126,6 +55147,13 @@ mod tests {
             ".users |= first(.[])",
             ".users |= (map(.age) | add)",
             ".users |= (map(.age) | length)",
+            ".users |= (map(.age) | min)",
+            ".users |= (map(.age) | max)",
+            ".users |= map((.age))",
+            ".users |= map(.age | length)",
+            ".users |= map(.age * 2 + 1)",
+            ".users |= first((.[]))",
+            ".users |= (first)",
         ] {
             assert!(takes::<JqSemantics>(users, program), "{program}");
         }
