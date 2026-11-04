@@ -19,21 +19,27 @@
 //! ```
 //!
 //! The loop still decides where the repeat ends, and `E`, which can only match empty and does so
-//! the way `X` would first, is the final iteration. Each group of `X` now has two copies: the one in
-//! the loop keeps what earlier iterations captured (Oniguruma keeps a group an iteration skipped:
+//! the way `X` would first, is the final iteration. A group inside `X` now has two copies: the one
+//! in the loop keeps what earlier iterations captured (Oniguruma keeps a group an iteration skipped:
 //! `"abc" | match("((a)|b*)*c")` has `(a)` at `[0,1]`), and the one in `E` holds what the empty
 //! iteration set. A group reads the last of its copies that the match set
-//! ([`LoopRewrite::copies`]).
+//! ([`LoopRewrite::copies`]). The repeated group itself is captured in `E` only, since `E` always
+//! matches and so always has the last word.
+//!
+//! The crate's capture engine pays for every state and slot over the length of a match, so `E` is
+//! kept small: a part of it with no group only says whether it can match empty there, and is written
+//! as nothing when it always can and as one failing class when it never can (`(\w*\s*)*` ends with
+//! `()`). A part that sets a flag is kept, as `(?m)` changes what a later `$` means.
 //!
 //! Only a body that matches empty at every position is rewritten: one whose every empty way passes an
 //! assertion (`(a|$)*`) matches empty at some positions and not others, so `E` could fail where
-//! Oniguruma's loop would simply stop. An assertion on a body that also has a way around it is kept
-//! in `E` (`(\b|a*)*` ends with `\b` where it holds and `a*` where it does not, in both engines),
-//! since which empty way succeeds depends on the position only. Neither is a lazy repeat (`(a*)*?b` already agrees) or a counted one from `{2,}` up, which the crate expands into
-//! copies whose last one matches empty. A projected loop (`X*` inside some `E`) is written as `E`
-//! alone: its loop copy could only make empty iterations, which the crate drops, so it would never
-//! set a group. That keeps the rewritten pattern linear in the nesting depth instead of doubling
-//! per level; [`MAX_REWRITTEN_LEN`] bounds it all the same.
+//! Oniguruma's loop would simply stop. An assertion on a body that also has a way around it stays in
+//! `E` wherever a group needs it, since which empty way succeeds depends on the position only.
+//! Neither is a lazy repeat rewritten (`(a*)*?b` already agrees) nor a counted one from `{2,}` up,
+//! which the crate expands into copies whose last one matches empty. A projected loop (`X*` inside
+//! some `E`) is written as `E` alone: its loop copy could only make empty iterations, which the crate
+//! drops, so it would never set a group. That keeps the rewritten pattern linear in the nesting depth
+//! instead of doubling per level; [`MAX_REWRITTEN_LEN`] bounds it all the same.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -126,6 +132,19 @@ impl Emitter<'_> {
 
     /// Write `ast`, or with `projected` its `E`: every character, class and `.` never matches.
     fn emit(&mut self, ast: &Ast, projected: bool) -> Result<(), TooLong> {
+        // In `E` a part with no group matters only by whether it can match empty where it stands,
+        // so one that always can is written as nothing and one that never can as one failing
+        // class. Fewer states make the capture engine faster on a long match (#6069: a 1.4 MB
+        // match of `(\w*\s*)*c` took 30% longer with the part projected class by class). A part
+        // that sets a flag is kept whole, since the flag reaches what follows it.
+        if projected && !has_group(ast) && !sets_flags(ast) {
+            if always_matches_empty(ast) {
+                return Ok(());
+            }
+            if !may_match_empty(ast) {
+                return self.push(NEVER);
+            }
+        }
         match ast {
             Ast::Empty(_) => Ok(()),
             Ast::Flags(set) => {
@@ -172,7 +191,18 @@ impl Emitter<'_> {
             Ast::Repetition(rep) if is_candidate(rep) => {
                 self.push("(?:")?;
                 if !projected {
-                    self.emit(&rep.ast, false)?;
+                    // The repeated group's own loop copy is never read: `E` always matches, so
+                    // its copy of the group is always set and always the last. Leaving it
+                    // uncaptured keeps the crate's capture slots at the pattern's count for the
+                    // common `(a*)*`, which a long match pays for per slot.
+                    match &*rep.ast {
+                        Ast::Group(group) if group.capture_index().is_some() => {
+                            self.push("(?:")?;
+                            self.emit(&group.ast, false)?;
+                            self.push(")")?;
+                        }
+                        body => self.emit(body, false)?,
+                    }
                     self.push("*")?;
                 }
                 self.emit(&rep.ast, true)?;
@@ -230,6 +260,19 @@ fn has_candidate(ast: &Ast) -> bool {
     }
 }
 
+/// The fewest times `rep` repeats its body.
+fn min_repeats(rep: &ast::Repetition) -> u32 {
+    match &rep.op.kind {
+        RepetitionKind::ZeroOrOne | RepetitionKind::ZeroOrMore => 0,
+        RepetitionKind::OneOrMore => 1,
+        RepetitionKind::Range(
+            RepetitionRange::Exactly(n)
+            | RepetitionRange::AtLeast(n)
+            | RepetitionRange::Bounded(n, _),
+        ) => *n,
+    }
+}
+
 /// Whether `ast` matches empty wherever it is tried: some way through it consumes nothing and passes
 /// no assertion, which can fail.
 fn always_matches_empty(ast: &Ast) -> bool {
@@ -241,21 +284,39 @@ fn always_matches_empty(ast: &Ast) -> bool {
         | Ast::ClassUnicode(_)
         | Ast::ClassPerl(_)
         | Ast::ClassBracketed(_) => false,
-        Ast::Repetition(rep) => {
-            let min = match &rep.op.kind {
-                RepetitionKind::ZeroOrOne | RepetitionKind::ZeroOrMore => 0,
-                RepetitionKind::OneOrMore => 1,
-                RepetitionKind::Range(
-                    RepetitionRange::Exactly(n)
-                    | RepetitionRange::AtLeast(n)
-                    | RepetitionRange::Bounded(n, _),
-                ) => *n,
-            };
-            min == 0 || always_matches_empty(&rep.ast)
-        }
+        Ast::Repetition(rep) => min_repeats(rep) == 0 || always_matches_empty(&rep.ast),
         Ast::Group(group) => always_matches_empty(&group.ast),
         Ast::Alternation(alt) => alt.asts.iter().any(always_matches_empty),
         Ast::Concat(concat) => concat.asts.iter().all(always_matches_empty),
+    }
+}
+
+/// Whether `ast` can match empty somewhere: some way through it consumes nothing, assertions
+/// allowed.
+fn may_match_empty(ast: &Ast) -> bool {
+    match ast {
+        Ast::Empty(_) | Ast::Flags(_) | Ast::Assertion(_) => true,
+        Ast::Literal(_)
+        | Ast::Dot(_)
+        | Ast::ClassUnicode(_)
+        | Ast::ClassPerl(_)
+        | Ast::ClassBracketed(_) => false,
+        Ast::Repetition(rep) => min_repeats(rep) == 0 || may_match_empty(&rep.ast),
+        Ast::Group(group) => may_match_empty(&group.ast),
+        Ast::Alternation(alt) => alt.asts.iter().any(may_match_empty),
+        Ast::Concat(concat) => concat.asts.iter().all(may_match_empty),
+    }
+}
+
+/// Whether `ast` holds a flag-setting item (`(?m)`), whose flags reach past it in its group.
+fn sets_flags(ast: &Ast) -> bool {
+    match ast {
+        Ast::Flags(_) => true,
+        Ast::Group(group) => sets_flags(&group.ast),
+        Ast::Repetition(rep) => sets_flags(&rep.ast),
+        Ast::Alternation(alt) => alt.asts.iter().any(sets_flags),
+        Ast::Concat(concat) => concat.asts.iter().any(sets_flags),
+        _ => false,
     }
 }
 
@@ -327,21 +388,12 @@ mod tests {
 
     #[test]
     fn rewrites_a_repeat_of_a_group_that_can_match_empty() {
-        assert_eq!(
-            rewritten("(a*)*b").as_deref(),
-            Some(r"(?:(a*)*([^\s\S]*))b")
-        );
-        assert_eq!(
-            rewritten("(a*)+b").as_deref(),
-            Some(r"(?:(a*)*([^\s\S]*))b")
-        );
-        assert_eq!(
-            rewritten("(a?){0,}").as_deref(),
-            Some(r"(?:(a?)*([^\s\S]?))")
-        );
+        assert_eq!(rewritten("(a*)*b").as_deref(), Some(r"(?:(?:a*)*())b"));
+        assert_eq!(rewritten("(a*)+b").as_deref(), Some(r"(?:(?:a*)*())b"));
+        assert_eq!(rewritten("(a?){0,}").as_deref(), Some(r"(?:(?:a?)*())"));
         assert_eq!(
             rewritten("(?:b*|(a))+").as_deref(),
-            Some(r"(?:(?:b*|(a))*(?:[^\s\S]*|([^\s\S])))")
+            Some(r"(?:(?:b*|(a))*(?:|([^\s\S])))")
         );
     }
 
@@ -369,29 +421,38 @@ mod tests {
     #[test]
     fn maps_every_group_to_its_copies_and_keeps_the_names() {
         let rw = rewrite("(?<x>(a)|b*)*(c)").expect("rewritten");
-        assert_eq!(rw.pattern, r"(?:((a)|b*)*(([^\s\S])|[^\s\S]*))(c)");
+        // `x`'s own loop copy is left uncaptured: the last iteration's copy always wins.
+        assert_eq!(rw.pattern, r"(?:(?:(a)|b*)*(([^\s\S])|))(c)");
         let copies: Vec<&[usize]> = rw.copies.iter().map(|c| &c[..]).collect();
-        assert_eq!(copies, [&[0][..], &[1, 3], &[2, 4], &[5]]);
+        assert_eq!(copies, [&[0][..], &[2], &[1, 3], &[4]]);
         assert_eq!(
             rw.names.iter().map(|n| n.as_deref()).collect::<Vec<_>>(),
             [None, Some("x"), None, None]
         );
-        assert_eq!(rw.compiled_groups, 6);
+        assert_eq!(rw.compiled_groups, 5);
     }
 
     #[test]
     fn a_nested_repeat_is_projected_once_not_doubled() {
         assert_eq!(
             rewritten("((a*)*)*").as_deref(),
-            Some(r"(?:((?:(a*)*([^\s\S]*)))*((?:([^\s\S]*))))")
+            Some(r"(?:(?:(?:(?:a*)*()))*((?:())))")
         );
     }
 
     #[test]
-    fn an_assertion_with_a_way_around_it_stays_in_the_last_iteration() {
+    fn the_last_iteration_keeps_only_what_a_group_or_a_flag_needs() {
+        // No group in the body: the last iteration is the empty group, whichever empty way the
+        // body has (`\b` where it holds, `a*` where not).
         assert_eq!(
             rewritten(r"(\b|a*)*b").as_deref(),
-            Some(r"(?:(\b|a*)*(\b|[^\s\S]*))b")
+            Some(r"(?:(?:\b|a*)*())b")
+        );
+        // A part that cannot match empty fails as one class; one that sets a flag is kept,
+        // since `(?m)` changes what the `$` after it means.
+        assert_eq!(
+            rewritten(r"(ab(c)|((?m)$|d*))*").as_deref(),
+            Some(r"(?:(?:ab(c)|((?m)$|d*))*([^\s\S][^\s\S]([^\s\S])|((?m)$|)))")
         );
     }
 
@@ -419,11 +480,11 @@ mod tests {
     fn keeps_flags_escapes_and_lazy_inner_repeats_verbatim() {
         assert_eq!(
             rewritten(r"(?i)(\x41*?|[b-c]\.)*").as_deref(),
-            Some(r"(?i)(?:(\x41*?|[b-c]\.)*([^\s\S]*?|[^\s\S][^\s\S]))")
+            Some(r"(?i)(?:(?:\x41*?|[b-c]\.)*())")
         );
         assert_eq!(
             rewritten("(?s:(.*))*").as_deref(),
-            Some(r"(?:(?s:(.*))*(?s:([^\s\S]*)))")
+            Some(r"(?:(?s:(.*))*(?s:()))")
         );
     }
 

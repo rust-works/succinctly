@@ -7582,7 +7582,7 @@ Since #6069 such a repeat is rewritten before the crate compiles it (`src/jq/oni
 `X*` becomes the loop followed by a copy of `X` whose characters, classes and `.` never match, so the copy is the empty last iteration, and each group reads the last of its copies that the match set.
 That also covers a group nested in the body, which keeps what an earlier iteration captured as in jq (`"abc" | match("((a)|b*)*c")` has `(a)` at `[0,1,"a"]`).
 It covers a body that tries the empty match first (`(a??)*b`), and a loop that gives characters back to the rest of the pattern (`"aab" | match("(a*)*ab")` is `[1,0,""]`).
-A differential fuzz of 18,000 random patterns (named groups, the `i`, `s`, `x` and `g` flags, `^`, `$` and `\b`) against jq 1.7.1 found none that the rewrite made wrong.
+A differential fuzz of 18,000 random patterns (named groups, the `i`, `m`, `s`, `x` and `g` flags, `^`, `$` and `\b`) against jq 1.7.1 found none that the rewrite made wrong.
 
 What still differs:
 
