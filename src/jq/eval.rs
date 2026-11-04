@@ -28131,6 +28131,12 @@ fn translate_posix_brackets(
     // The extended mode's ignored blanks are invisible to this scan (`^ *` is a repeated
     // assertion there), so it leaves the repetition check to the crate rather than judge it.
     let check_repetition = !extended && !inline_extended(pattern);
+    // #6127: a repeated group whose body Oniguruma reads as an assertion.
+    if check_repetition && repeats_assertion_group(&chars) {
+        return Err(EvalError::new(
+            "invalid regex: target of repeat operator is invalid",
+        ));
+    }
     // One entry per open group: whether the extended mode is on inside it, from the `x` flag and
     // from inline `(?x)`, `(?x:...)` and `(?-x)` (#5550).
     let mut extended_in = vec![extended];
@@ -28978,6 +28984,238 @@ fn inline_extended(pattern: &str) -> bool {
             .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
             .any(|c| c == 'x')
     })
+}
+
+/// Whether `pattern` repeats a group Oniguruma reads as an assertion, which it refuses with
+/// `target of repeat operator is invalid` (#6127).
+///
+/// Oniguruma decides from the parsed node (`is_invalid_quantifier_target`, `regparse.c`): an
+/// assertion (`^ $ \A \z \Z \G \b \B`, a look-ahead or look-behind) is an invalid target; a
+/// sequence of several nodes is not, whatever it holds (`(?:\b\b)*` compiles); an alternation is
+/// invalid when any one alternative is, so `(?:a|\b)*` is refused and `(?:a|\b\b)*` is not; a
+/// plain `(?:...)` group disappears into its body, so `(?:\b)*` and `(?:(?:\b)|c)*` are refused; a
+/// capturing, named, atomic or option group is an enclosure and may repeat anything. The rule was
+/// captured from jq 1.7.1 over 75,780 generated groups.
+///
+/// Anything this scan is unsure of reads as a valid target, which is what it was before.
+#[cfg(feature = "regex")]
+fn repeats_assertion_group(chars: &[char]) -> bool {
+    struct Scan<'a> {
+        chars: &'a [char],
+        at: usize,
+    }
+    /// One alternative's items: how many, and whether the only one is an invalid target.
+    #[derive(Default)]
+    struct Branch {
+        items: usize,
+        invalid: bool,
+    }
+    impl Scan<'_> {
+        fn peek(&self) -> Option<char> {
+            self.chars.get(self.at).copied()
+        }
+        /// The body of a group or of the whole pattern, up to its `)` (not consumed): whether it is
+        /// an invalid repeat target, or `Err` at a repeat of one.
+        fn body(&mut self, depth: usize) -> Result<bool, ()> {
+            // Deeper than any real pattern: leave it to the crate.
+            if depth > 200 {
+                return Ok(false);
+            }
+            let mut invalid = false;
+            let mut branch = Branch::default();
+            // An option group `(?i)` that nothing follows in its alternative is an item of its own.
+            let mut trailing_option = false;
+            while let Some(c) = self.peek() {
+                match c {
+                    ')' => break,
+                    '|' => {
+                        if trailing_option {
+                            branch.items += 1;
+                            branch.invalid = false;
+                        }
+                        invalid |= branch.items == 1 && branch.invalid;
+                        branch = Branch::default();
+                        trailing_option = false;
+                        self.at += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                let Some(item) = self.item(depth, &mut trailing_option)? else {
+                    continue;
+                };
+                trailing_option = false;
+                let mut target_invalid = item;
+                // Repetitions stack (`a**` is valid): the first one is checked, the rest follow it.
+                let mut repeated = false;
+                while starts_repetition(self.chars.get(self.at..).unwrap_or(&[])) {
+                    if !repeated && target_invalid {
+                        return Err(());
+                    }
+                    repeated = true;
+                    target_invalid = false;
+                    self.at += 1;
+                    if self.chars[self.at - 1] == '{' {
+                        while self.peek().is_some_and(|c| c != '}') {
+                            self.at += 1;
+                        }
+                        self.at += 1;
+                    }
+                    // Lazy and possessive suffixes.
+                    if matches!(self.peek(), Some('?' | '+')) {
+                        self.at += 1;
+                    }
+                }
+                branch.items += 1;
+                branch.invalid = target_invalid;
+            }
+            if trailing_option {
+                branch.items += 1;
+                branch.invalid = false;
+            }
+            invalid |= branch.items == 1 && branch.invalid;
+            Ok(invalid)
+        }
+
+        /// The item at `at`, consumed: `Some(true)` for an invalid repeat target, `Some(false)` for
+        /// any other, `None` for text that is no item (a comment, or an inline option group
+        /// `(?i)`, which sets `option` and is no item unless nothing follows it in its alternative).
+        fn item(&mut self, depth: usize, option: &mut bool) -> Result<Option<bool>, ()> {
+            let c = self.chars[self.at];
+            match c {
+                '^' | '$' => {
+                    self.at += 1;
+                    Ok(Some(true))
+                }
+                '\\' => {
+                    let next = self.chars.get(self.at + 1).copied();
+                    self.at += 2;
+                    match next {
+                        Some('b' | 'B' | 'A' | 'z' | 'Z' | 'G') => Ok(Some(true)),
+                        Some('p' | 'P' | 'x' | 'k' | 'g' | 'N' | 'o') => {
+                            // `\p{L}`, `\x{41}`, `\k<n>`, `\g<n>`: a name may hold `)`.
+                            let close = match self.peek() {
+                                Some('{') => Some('}'),
+                                Some('<') => Some('>'),
+                                Some('\'') => Some('\''),
+                                _ => None,
+                            };
+                            if let Some(close) = close {
+                                self.at += 1;
+                                while self.peek().is_some_and(|c| c != close) {
+                                    self.at += 1;
+                                }
+                                self.at += 1;
+                            }
+                            Ok(Some(false))
+                        }
+                        // `\Q...\E` quotes text: one item, even when empty.
+                        Some('Q') => {
+                            while self.peek().is_some() {
+                                if self.peek() == Some('\\')
+                                    && self.chars.get(self.at + 1) == Some(&'E')
+                                {
+                                    self.at += 2;
+                                    break;
+                                }
+                                self.at += 1;
+                            }
+                            Ok(Some(false))
+                        }
+                        _ => Ok(Some(false)),
+                    }
+                }
+                '[' => {
+                    self.skip_class();
+                    Ok(Some(false))
+                }
+                '(' => self.group(depth, option),
+                _ => {
+                    self.at += 1;
+                    Ok(Some(false))
+                }
+            }
+        }
+
+        /// A character class, nested classes and escapes included.
+        fn skip_class(&mut self) {
+            let mut depth = 0usize;
+            let mut first = true;
+            while let Some(c) = self.peek() {
+                self.at += 1;
+                match c {
+                    '\\' => self.at += 1,
+                    '[' => {
+                        depth += 1;
+                        first = true;
+                        continue;
+                    }
+                    '^' if first => continue,
+                    ']' if !first => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+                first = false;
+            }
+        }
+
+        fn group(&mut self, depth: usize, option: &mut bool) -> Result<Option<bool>, ()> {
+            let rest = self.chars.get(self.at..).unwrap_or(&[]);
+            let starts = |prefix: &str| {
+                prefix
+                    .chars()
+                    .enumerate()
+                    .all(|(n, p)| rest.get(n) == Some(&p))
+            };
+            if starts("(?#") {
+                let mut end = self.at + 3;
+                while end < self.chars.len() && self.chars[end] != ')' {
+                    end += if self.chars[end] == '\\' { 2 } else { 1 };
+                }
+                self.at = (end + 1).min(self.chars.len());
+                return Ok(None);
+            }
+            // What the group is: a plain group (its body is its own target), an assertion, or an
+            // enclosure (may repeat anything).
+            let (prefix, kind) = if starts("(?:") {
+                (3, Some(false))
+            } else if starts("(?=") || starts("(?!") {
+                (3, Some(true))
+            } else if starts("(?<=") || starts("(?<!") {
+                (4, Some(true))
+            } else if starts("(?") {
+                // An option group, `(?i)` or `(?i:...)`, a named or atomic group, a conditional,
+                // an absent operator: an enclosure, whose own body is still checked inside.
+                let letters = rest[2..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphabetic() || **c == '-')
+                    .count();
+                if rest.get(2 + letters) == Some(&')') {
+                    *option = true;
+                    self.at += 3 + letters;
+                    return Ok(None);
+                }
+                (2, None)
+            } else {
+                (1, None)
+            };
+            self.at += prefix;
+            let inner = self.body(depth + 1)?;
+            if self.peek() == Some(')') {
+                self.at += 1;
+            }
+            Ok(Some(match kind {
+                Some(false) => inner,
+                Some(true) => true,
+                None => false,
+            }))
+        }
+    }
+    Scan { chars, at: 0 }.body(0).is_err()
 }
 
 /// Whether `chars` begins with a repetition operator as Oniguruma's Perl syntax reads one: `*`,
@@ -142271,6 +142509,57 @@ mod tests {
         assert_eq!(owned(br"[1,2,3]", ".[]").len(), 3);
         // One: field access returns a scalar reference.
         assert_eq!(owned(br#"{"a":1}"#, ".a"), vec![OwnedValue::Int(1)]);
+    }
+
+    /// #6127: the scan for a repeated group that is an assertion reads any text without panicking
+    /// (a backslash or a group that ends the pattern, an unclosed class or comment, stray `)`), and
+    /// answers the fixed rows jq 1.7.1 answers (`tests/jq_cli/i6127.rs` holds the captured sweep).
+    #[cfg(feature = "regex")]
+    #[test]
+    fn repeats_assertion_group_reads_any_text_6127() {
+        let scan = |p: &str| repeats_assertion_group(&p.chars().collect::<Vec<_>>());
+        for (pattern, refused) in [
+            (r"(?:\b)*", true),
+            (r"(?:a|\b)+", true),
+            ("(?:a|$)?", true),
+            (r"(?:\b\b)*", false),
+            (r"(\b)*", false),
+            (r"(?:\b)x", false),
+            ("(?:", false),
+            ("(?", false),
+            ("(", false),
+            (")", false),
+            ("\\", false),
+            ("[", false),
+            ("[]", false),
+            ("(?#", false),
+            ("(?:\\", false),
+            ("(?:a|", false),
+            ("(?:\\Q", false),
+            ("\\k<", false),
+        ] {
+            assert_eq!(scan(pattern), refused, "{pattern}");
+        }
+        let alphabet: Vec<char> = "(){}[]|?*+\\^$:=!<>#.-,abwbBAzZGQEik0129 "
+            .chars()
+            .collect();
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for _ in 0..200_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let len = (state % 14) as usize;
+            let mut s = state;
+            let text: Vec<char> = (0..len)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    alphabet[((s >> 33) as usize) % alphabet.len()]
+                })
+                .collect();
+            let _ = repeats_assertion_group(&text);
+        }
     }
 
     /// #6068: the pass leaves an ordinary pattern as written (no allocation), and rewrites exactly
