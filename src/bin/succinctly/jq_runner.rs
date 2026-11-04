@@ -6469,7 +6469,8 @@ fn get_inputs(
     // #6115: `--seq` with `--stream` or `--stream-errors` reads with jq's streaming parser in its
     // record-sequence mode: the program reads the events a record produces, not its document.
     let seq_by_stream_reader = seq_by_stream_reader(args);
-    if json_input_mode || seq_by_stream_reader {
+    // `--seq` keeps the mark: its reader removes it as jq's does, and reacts to one that breaks off.
+    if json_input_mode {
         // #5291: jq skips a BOM at the start of its input.
         strip_leading_json_bom(raw_bytes.iter_mut().map(|(_, raw)| raw));
     }

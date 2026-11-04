@@ -56,6 +56,10 @@ enum St {
     WaitingForRs,
 }
 
+const UTF8_BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
+const BOM_DONE: u8 = 3;
+const BOM_MALFORMED: u8 = 0xff;
+
 /// ASCII RS, the byte that opens every record of a `--seq` stream (RFC 7464).
 const RS: u8 = 0x1e;
 
@@ -573,12 +577,13 @@ impl<R: RefillSource> Reader<R> {
                 self.parser.yield_value(value);
             }
             if !self.finished {
-                self.parser.finish();
+                self.parser.finish(true);
             }
             self.done = true;
             return;
         };
         let parser = &mut self.parser;
+        parser.strip_bom(&mut self.buf);
         if refill.is_last {
             self.values_before_last_refill = parser.yielded;
         }
@@ -631,7 +636,7 @@ impl<R: RefillSource> Reader<R> {
                 for value in std::mem::take(&mut self.deferred) {
                     parser.yield_value(value);
                 }
-                parser.finish();
+                parser.finish(fed.ended || self.buf.is_empty());
                 self.finished = true;
             }
             // A call that returned an error was followed by another that read again, and the read
@@ -943,6 +948,11 @@ struct Parser {
     /// Whether this is a `--seq` parser (`JV_PARSE_SEQ`): records are opened by an RS byte, and a
     /// fault abandons the record instead of the rest of the refill (#6115).
     seq: bool,
+    /// jq's `bom_strip_position`: how much of a leading byte-order mark `jv_parser_set_buf` has
+    /// matched, `3` once it is past the mark (or found none), and `0xff` for a mark that started
+    /// and then broke off. Only a `--seq` parser keeps the mark (the other modes have it removed
+    /// before they read), and a broken one wipes its state at the start of every call.
+    bom: u8,
     line: usize,
     column: usize,
     st: St,
@@ -979,6 +989,7 @@ impl Parser {
     fn new(seq: bool) -> Self {
         Self {
             seq,
+            bom: if seq { 0 } else { BOM_DONE },
             line: 1,
             column: 0,
             st: if seq { St::WaitingForRs } else { St::Normal },
@@ -997,6 +1008,25 @@ impl Parser {
             #[cfg(test)]
             first_error: None,
         }
+    }
+
+    /// The leading-mark loop of jq's `jv_parser_set_buf`, over a refill: the bytes that match the
+    /// mark are removed from it and never counted as columns.
+    fn strip_bom(&mut self, buf: &mut Vec<u8>) {
+        let mut skip = 0;
+        while skip < buf.len() && self.bom < BOM_DONE {
+            if buf[skip] == UTF8_BOM[usize::from(self.bom)] {
+                skip += 1;
+                self.bom += 1;
+            } else if self.bom == 0 {
+                // No mark in this document.
+                self.bom = BOM_DONE;
+            } else {
+                // A mark that started and broke off.
+                self.bom = BOM_MALFORMED;
+            }
+        }
+        buf.drain(..skip);
     }
 
     /// jq's `parser_reset` for a streaming parser.
@@ -1059,8 +1089,15 @@ impl Parser {
     fn feed(&mut self, chunk: &[u8], deferred: &mut Vec<OwnedValue>, stops_on_empty: bool) -> Fed {
         let mut first_call = true;
         let mut errored = false;
+        let mut call_start = true;
         for (index, &ch) in chunk.iter().enumerate() {
             let last = index + 1 == chunk.len();
+            if call_start && self.bom == BOM_MALFORMED {
+                // `jv_parser_next` begins by wiping the state of a parser whose mark broke off,
+                // which includes anything the last call left pending.
+                self.reset();
+            }
+            call_start = false;
             if self.st == St::WaitingForRs {
                 // `jv_parser_next` skips to the next RS without scanning, but counts the position.
                 if ch == b'\n' {
@@ -1077,10 +1114,15 @@ impl Parser {
             match self.scan(ch) {
                 Ok(Scanned::Value(value)) => {
                     first_call = false;
+                    call_start = true;
                     self.yield_value(value);
                     // The next call starts with `stream_check_done`, which hands out whatever the
-                    // byte left pending (the close of a container) before it scans another.
-                    while let Some(value) = self.check_done() {
+                    // byte left pending (the close of a container) before it scans another, unless
+                    // a broken mark wiped it first.
+                    while self.bom != BOM_MALFORMED {
+                        let Some(value) = self.check_done() else {
+                            break;
+                        };
                         if last {
                             deferred.push(value);
                         } else {
@@ -1096,6 +1138,7 @@ impl Parser {
                 }
                 Ok(Scanned::More) => {}
                 Ok(Scanned::Empty) => {
+                    call_start = true;
                     if first_call && stops_on_empty {
                         return Fed {
                             ended: true,
@@ -1126,6 +1169,7 @@ impl Parser {
                     self.reset();
                     self.yield_error(error);
                     errored = true;
+                    call_start = true;
                     if !self.seq {
                         // `p->curr_buf = 0`: the rest of this refill is thrown away.
                         return Fed {
@@ -1151,7 +1195,13 @@ impl Parser {
     }
 
     /// The EOF branch of `jv_parser_next`.
-    fn finish(&mut self) {
+    ///
+    /// `new_call` is whether a call ended on the last byte, so that this one begins with the wipe a
+    /// broken mark costs; the EOF branch of the call still scanning the last bytes does not.
+    fn finish(&mut self, new_call: bool) {
+        if new_call && self.bom == BOM_MALFORMED {
+            self.reset();
+        }
         let (line, column) = (self.line, self.column);
         if self.st == St::WaitingForRs {
             let error = self.error_value(format!(

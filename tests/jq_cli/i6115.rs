@@ -76,6 +76,33 @@ fn the_filter_reads_the_events_of_each_record_6115() -> Result<()> {
     Ok(())
 }
 
+const BOM_ROWS: &[(&[u8], &[&str], &str, &str)] = &[
+    (b"\xef\xbb\xbf\x1e[1]\n", &["-c", "--seq", "--stream", "."], "\u{1e}[[0],1]\n\u{1e}[[0]]\n", ""),
+    (b"\xef\xbb\x1e[1]\n", &["-c", "--seq", "--stream", "."], "\u{1e}[[0],1]\n", ""),
+    (b"\xef\x1e[1]\n\x1e[2]\n", &["-c", "--seq", "--stream", "."], "\u{1e}[[0],1]\n\u{1e}[[0],2]\n", ""),
+    (b"\xef\xbb1 2", &["-c", "--seq", "--stream", "."], "\u{1e}[[],1]\n\u{1e}[[],2]\n", ""),
+    (b"\xef\xbb\x1e[1]\n\x1e[2]\n", &["-c", "--seq", "--stream-errors", "-s", "."], "\u{1e}[[[0],1],[[0],2]]\n", ""),
+    (b"\xef\xbb1.5r[]]:\xef\xbbtrx][][ \n", &["-c", "--seq", "--stream", "-s", "length"], "\u{1e}1\n", "jq: ignoring parse error: Invalid numeric literal at line 1, column 5 (need RS to resync)\njq: ignoring parse error: Unmatched ']' at the top-level at line 1, column 6 (need RS to resync)\njq: ignoring parse error: Unmatched ']' at the top-level at line 1, column 7 (need RS to resync)\njq: ignoring parse error: ':' not as part of an object at line 1, column 8 (need RS to resync)\njq: ignoring parse error: Invalid numeric literal at line 1, column 14 (need RS to resync)\n"),
+];
+
+/// A byte-order mark is matched by `--seq`'s reader as jq matches it: one that breaks off (`\xef\xbb`
+/// and then something else) is consumed, counts no column, and wipes the parser at the start of
+/// every call, which costs a container the close event that was pending.
+#[test]
+fn a_broken_byte_order_mark_wipes_the_parser_at_every_call_6115() -> Result<()> {
+    let mut mismatches = Vec::new();
+    for (input, flags, want_out, want_err) in BOM_ROWS {
+        let (stdout, stderr, code, _) = run_jq_over_byte_files(flags, &[input])?;
+        if (stdout.as_str(), stderr.as_str(), code) != (*want_out, *want_err, 0) {
+            mismatches.push(format!(
+                "{input:?} {flags:?}: got ({stdout:?}, {stderr:?}, {code})"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    Ok(())
+}
+
 /// A token that ends a file continues in the next one, as it does in jq's single byte stream.
 #[test]
 fn a_record_continues_across_files_6115() -> Result<()> {
