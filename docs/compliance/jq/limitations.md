@@ -7550,10 +7550,6 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   Pinned by `test_regex_l_and_n_keep_their_old_search_where_fancy_regex_disagrees_5530` and `test_l_flag_on_a_lazy_quantifier_is_still_a_no_op_5530`.
 - **`n` backtracks to a non-empty match at the same position.**
   `ONIG_OPTION_FIND_NOT_EMPTY` refuses an empty match and tries another way to match where it stands, which the skip-forward search could not: `"xaab" | gsub("a*?";"X";"gn")` is `"xXXb"` in jq and now here, where it was a no-op.
-- **A repeat of an empty non-capturing group keeps the old search under either flag.**
-  `fancy-regex`'s parser refuses `(?:)+?` and `(?:){1,2}` (`TargetNotRepeatable`), where the `regex` crate and Oniguruma accept them, so a pattern with one is not routed and behaves as before #5530: `"a" | match("(?:)+?|a";"n")` is no match where jq has `"a"`, and `"ba" | match("(?:){1,2}a?||";"l")` stops at the empty match where jq has `"a"` at offset 1.
-  Nobody writes this (the group matches nothing and the repeat repeats nothing), and `()+?` is a group and is routed.
-  Pinned by `test_a_repeated_empty_group_keeps_its_old_search_5530`.
 - **A group that iterates over the empty string is read differently, with or without a flag.**
   Oniguruma stops a loop after an iteration that matched nothing and keeps that iteration: `"a" | match("(a*)*")` has `[1,0,""]` for group 1, and `"bcba" | match("b(c|(|.))*")` is `"bc"`.
   The `regex` crate kept the last non-empty iteration (`[0,1,"a"]`) until such a loop was rewritten to end with its empty iteration (#6069, the entry below), and with a capture group it still matches `"bcba"` (#6106).
@@ -7668,9 +7664,6 @@ When the two searches match at the same start and differ, which one jq finds dep
 That tie is decided by the `fancy-regex` route, built the first time it is needed, which reads `$` as `(?=\n?\z)` as Oniguruma does.
 A text that ends in two newlines is searched the same way, because `$` is just before the last one of them (`"a\n\n" | [match("$";"g").offset]` is `[2,3]`).
 
-- **A pattern `fancy-regex` cannot compile keeps the shorter match on a tie.**
-  `fancy-regex`'s parser refuses a repeat of an empty group, so `"abc \n" | match("(?:)+\\s+$")` is `[3,1]` here and `[3,2]` in jq.
-  Pinned by `test_dollar_tie_keeps_the_trimmed_match_when_fancy_regex_refuses_5572`.
 - **A tie whose exact search runs out of budget keeps the trimmed match.**
   The exact engine backtracks, and a pathological pattern (`(a+)+\s*$` on a long run of `a`) can exhaust its budget where the `regex` crate answers in linear time.
   The filter does not fail for it: the trimmed text's match stands, as it did before #5572.

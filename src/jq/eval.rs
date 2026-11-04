@@ -30500,17 +30500,17 @@ fn build_fancy_regex_at<S: EvalSemantics>(
         .then(|| guard_prefix_lifting(source, true))
         .flatten();
     let pattern = prepare_fancy_pattern(guarded.as_deref().unwrap_or(source))?;
-    let tree = fancy_regex::Expr::parse_tree(&pattern).ok()?;
-    if !fancy_expr_is_oniguruma(&tree.expr)
-        || tree.expr.has_descendant(|e| !fancy_expr_is_oniguruma(e))
-    {
+    // The tree is read the way the builder below reads the pattern (#6165): in Oniguruma's mode a
+    // stacked repeat (`a**`) is valid, which the default reading refuses.
+    let (expr, pattern) = parse_fancy_tree(pattern)?;
+    if !fancy_expr_is_oniguruma(&expr) || expr.has_descendant(|e| !fancy_expr_is_oniguruma(e)) {
         return None;
     }
-    if modes.longest && fancy_has_lazy_repeat(&tree.expr) {
+    if modes.longest && fancy_has_lazy_repeat(&expr) {
         return None;
     }
     // #6096: an upstream bug; the pattern keeps the `regex` crate's route, or its refusal.
-    if fancy_has_squeezed_plus_run(&tree.expr) {
+    if fancy_has_squeezed_plus_run(&expr) {
         return None;
     }
     let pattern = if modes.longest && pattern_is_variable_length(source) {
@@ -30529,6 +30529,163 @@ fn build_fancy_regex_at<S: EvalSemantics>(
         .backtrack_limit(FANCY_BACKTRACK_LIMIT)
         .build()
         .ok()
+}
+
+/// The parse tree of `pattern` under the flags [`build_fancy_regex_at`]'s builder uses, and the
+/// pattern it was parsed from, which differs from `pattern` where [`atomize_option_group`] had to
+/// rewrite an option group (#6164).
+///
+/// Oniguruma's mode reads more repeats than the default mode (a stacked one, a repeat of an empty
+/// group), as jq does. It also reads a repeat that follows nothing but a comment as a repeat of an
+/// empty group, where jq refuses it (`(?#)?`: `target of repeat operator is not specified`), because
+/// a comment is invisible to jq: a pattern with one is read again without them, and a repeat left
+/// with no target refuses the pattern as it did before #6165.
+#[cfg(feature = "regex")]
+fn parse_fancy_tree(pattern: String) -> Option<(fancy_regex::Expr, String)> {
+    let (expr, pattern) = parse_fancy_tree_in_oniguruma_mode(pattern)?;
+    if pattern.contains("(?#") {
+        parse_fancy_tree_in_oniguruma_mode(strip_comments(&pattern))?;
+    }
+    Some((expr, pattern))
+}
+
+/// [`parse_fancy_tree`] without the check for comments.
+#[cfg(feature = "regex")]
+fn parse_fancy_tree_in_oniguruma_mode(mut pattern: String) -> Option<(fancy_regex::Expr, String)> {
+    use fancy_regex::internal::{FLAG_ONIGURUMA_MODE, FLAG_UNICODE};
+    // One rewrite per repeated option group; a pattern with more than this many keeps the refusal.
+    for _ in 0..64 {
+        match fancy_regex::Expr::parse_tree_with_flags(&pattern, FLAG_UNICODE | FLAG_ONIGURUMA_MODE)
+        {
+            Ok(tree) => return Some((tree.expr, pattern)),
+            Err(fancy_regex::Error::ParseError(
+                at,
+                fancy_regex::ParseError::TargetNotRepeatable,
+            )) => {
+                pattern = atomize_option_group(&pattern, at)?;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// `pattern` without its `(?#...)` comments, which end at the first `)` that no backslash escapes.
+/// An escape and a class are copied through, so a `(?#` inside either stays. A comment of the
+/// extended mode (`# ...`) is not followed, so a parenthesis in one can make the result a pattern
+/// that does not parse, which refuses the original as before.
+#[cfg(feature = "regex")]
+fn strip_comments(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = string_with_capacity(pattern.len());
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                out.extend(chars.get(i..i + 2).unwrap_or_else(|| &chars[i..]));
+                i += 2;
+                continue;
+            }
+            '[' => {
+                depth += 1;
+                out.push('[');
+                // A `]` right after `[` or `[^` is a member.
+                if chars.get(i + 1) == Some(&'^') {
+                    out.push('^');
+                    i += 1;
+                }
+                if chars.get(i + 1) == Some(&']') {
+                    out.push(']');
+                    i += 1;
+                }
+            }
+            ']' if depth > 0 => {
+                depth -= 1;
+                out.push(']');
+            }
+            '(' if depth == 0 && chars.get(i + 1..i + 3) == Some(&['?', '#']) => {
+                i += 3;
+                while i < chars.len() && chars[i] != ')' {
+                    i += if chars[i] == '\\' { 2 } else { 1 };
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `pattern` with the group that the repeat operator at byte `at` follows made atomic, when it is
+/// an option group (`(?i:...)`, `(?-s:...)`) and so a valid target of a repeat in Oniguruma
+/// (#6164): `(?i:\K)*` is accepted by jq, where `fancy-regex` refuses a repeat of a zero-width
+/// body (`\K`, `\G`, a lookaround) even in a group. The body of such a group has one way to
+/// match and no text to give back, so an atomic `(?>...)` inside it (which `fancy-regex` takes as
+/// a target) matches as the group does. The flags stay on the group, as they still change what a
+/// lookaround or an extended-mode body reads. A plain `(?:...)` and a bare `\K*` are refused by jq
+/// as well, and are left to the refusal. `None` when the operator does not follow an option group,
+/// or a `#` before it could open an extended-mode comment.
+#[cfg(feature = "regex")]
+fn atomize_option_group(pattern: &str, at: usize) -> Option<String> {
+    let bytes = pattern.as_bytes();
+    // The first byte of the operator: an interval is reported at its closing brace.
+    let start = match bytes.get(at)? {
+        b'}' => pattern.get(..at)?.rfind('{')?,
+        _ => at,
+    };
+    // A `#` before the group could open an extended-mode comment that hides a parenthesis from the
+    // scan; one after it cannot.
+    if start == 0 || bytes[start - 1] != b')' || pattern.get(..start)?.contains('#') {
+        return None;
+    }
+    // The `(` that matches the `)` before the operator, by a forward scan that skips escapes and
+    // classes.
+    let mut open = Vec::new();
+    let mut matched = None;
+    let mut class_depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() && i < start {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'[' => {
+                class_depth += 1;
+                // A `]` right after `[` or `[^` is a member.
+                if bytes.get(i + 1) == Some(&b'^') {
+                    i += 1;
+                }
+                if bytes.get(i + 1) == Some(&b']') {
+                    i += 1;
+                }
+            }
+            b']' if class_depth > 0 => class_depth -= 1,
+            b'(' if class_depth == 0 => open.push(i),
+            b')' if class_depth == 0 => matched = open.pop(),
+            _ => {}
+        }
+        i += 1;
+    }
+    let open = matched?;
+    // `(?` + at least one flag letter or `-` + `:`.
+    let header = pattern.get(open..)?.strip_prefix("(?")?;
+    let letters = header
+        .bytes()
+        .take_while(|b| b.is_ascii_alphabetic() || *b == b'-')
+        .count();
+    if letters == 0 || header.as_bytes().get(letters) != Some(&b':') {
+        return None;
+    }
+    let colon = open + 2 + letters;
+    // The `|(?!)` is a way that never matches. Without it `fancy-regex` 0.20.0 loses a lazy repeat of
+    // an atomic `\G`: `"cab" | test("(?>\\G)*?b")` is `false`, where `(?>\\G|(?!))*?b` and
+    // `(\\G)*?b` are `true` as in jq.
+    // The group keeps its flags: `i` still folds a lookaround's letters and `x` still skips blanks.
+    Some(format!(
+        "{}(?>{}|(?!))){}",
+        &pattern[..=colon],
+        &pattern[colon + 1..start - 1],
+        &pattern[start..]
+    ))
 }
 
 /// Whether `expr` holds two greedy `X+` repeats of the same expression with exactly one repeat that
@@ -134223,16 +134380,16 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
-    fn test_dollar_tie_keeps_the_trimmed_match_when_fancy_regex_refuses_5572() {
-        // `fancy-regex`'s parser refuses a repeat of an empty group, so the exact engine is not
-        // available for this pattern and the tie keeps the trimmed text's (shorter) match. jq 1.7.1
-        // has `[3,2]`. Pinned as the divergence it is: when it is closed this test is the one to flip.
+    fn test_dollar_tie_takes_the_exact_match_through_a_repeated_empty_group_6165() {
+        // The exact engine was not available for a repeat of an empty group while the tree was read
+        // outside Oniguruma's mode (#6165), and the tie kept the trimmed text's (shorter) match,
+        // `[3,1]`. jq 1.7.1 has `[3,2]`, as the exact engine does now.
         assert_eq!(
             outputs(
                 br#""abc \n""#,
                 r#"[match("(?:)+\\s+$") | [.offset, .length]]"#
             ),
-            ["[[3,1]]"]
+            ["[[3,2]]"]
         );
     }
 
@@ -134367,6 +134524,83 @@ mod tests {
         assert!(build_fancy_regex::<JqSemantics>(r"(a)(?1)").is_none());
         // A pattern neither engine parses.
         assert!(build_fancy_regex::<JqSemantics>("(?<=x").is_none());
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_atomize_option_group_names_the_group_a_repeat_follows_6164() {
+        // The operator at `at` follows an option group: its body becomes an atomic group, flags kept.
+        assert_eq!(
+            atomize_option_group(r"a(?i:\K)*b", 8).as_deref(),
+            Some(r"a(?i:(?>\K|(?!)))*b")
+        );
+        assert_eq!(
+            atomize_option_group(r"(?-s:(?=a))+", 11).as_deref(),
+            Some(r"(?-s:(?>(?=a)|(?!)))+")
+        );
+        // An interval is reported at its closing brace.
+        assert_eq!(
+            atomize_option_group(r"(?x:\G){0,2}", 11).as_deref(),
+            Some(r"(?x:(?>\G|(?!))){0,2}")
+        );
+        // The group is the one that closes before the operator, past a class or an escaped paren.
+        assert_eq!(
+            atomize_option_group(r"[(]\)(?i:\K)*", 12).as_deref(),
+            Some(r"[(]\)(?i:(?>\K|(?!)))*")
+        );
+        // A plain group, a bare escape, a capture and an atomic group are not option groups (jq
+        // refuses the first two; the others are valid targets already).
+        for (pattern, at) in [(r"(?:\K)*", 6), (r"\K*", 2), (r"(\K)*", 4), (r"(?>\K)*", 6)] {
+            assert_eq!(atomize_option_group(pattern, at), None, "{pattern}");
+        }
+        // An operator that follows nothing, or a pattern with a `#` that could hide a parenthesis.
+        assert_eq!(atomize_option_group("*", 0), None);
+        assert_eq!(atomize_option_group("#(?i:\\K)*", 8), None);
+        // One after the group is no comment of the extended mode it could hide anything from.
+        assert_eq!(
+            atomize_option_group(r"(?i:\K)*#", 7).as_deref(),
+            Some(r"(?i:(?>\K|(?!)))*#")
+        );
+        assert_eq!(atomize_option_group("(?i:", 99), None);
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_strip_comments_drops_what_jq_cannot_see_6165() {
+        assert_eq!(strip_comments("a(?#c)?b"), "a?b");
+        assert_eq!(strip_comments(r"(?#a\)b)?"), "?");
+        assert_eq!(strip_comments("(?#"), "");
+        assert_eq!(strip_comments("(?#a(?#b)c"), "c");
+        // An escape and a class keep a `(?#` as text.
+        assert_eq!(strip_comments(r"\(?#c)"), r"\(?#c)");
+        assert_eq!(strip_comments("[(?#]a"), "[(?#]a");
+        assert_eq!(strip_comments("[^]](?#c)"), "[^]]");
+        assert_eq!(strip_comments("plain"), "plain");
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_build_fancy_regex_reads_the_pattern_as_the_builder_does_6164_6165() {
+        // A repeated option group of a zero-width body, and a stacked repeat of a group holding `\K`.
+        for pattern in [
+            r"(?i:\K)*",
+            r"(?x:\G){2}",
+            r"(?i:(?=a))+",
+            r"(?:\Ka)**",
+            r"(?:\Ka){2}*",
+        ] {
+            assert!(
+                build_fancy_regex::<JqSemantics>(pattern).is_some(),
+                "{pattern}"
+            );
+        }
+        // Not valid in Oniguruma either: a plain group or a bare escape repeated.
+        for pattern in [r"(?:\K)*", r"\K*"] {
+            assert!(
+                build_fancy_regex::<JqSemantics>(pattern).is_none(),
+                "{pattern}"
+            );
+        }
     }
 
     #[cfg(feature = "regex")]
@@ -135811,20 +136045,20 @@ mod tests {
             outputs(br#""aa""#, r#"match("a*?"; "l") | [.offset, .string]"#),
             [r#"[0,""]"#]
         );
-        // `fancy-regex`'s parser refuses a repeat of an empty non-capturing group
-        // (`TargetNotRepeatable`), so a pattern with one keeps its old search under either flag
-        // (`"a" | match("(?:)+?|a"; "n")` is `"a"` in jq, `"ba" | match("(?:){1,2}a?||"; "l")`
-        // is `"a"` at offset 1). `()` is a group, not an empty expression, and is routed.
+        // A repeat of an empty non-capturing group took the old search under either flag while the
+        // tree was read outside Oniguruma's mode (#6165); it is routed now and agrees with jq
+        // (`"a" | match("(?:)+?|a"; "n")` is `"a"`, `"ba" | match("(?:){1,2}a?||"; "l")` is `"a"` at
+        // offset 1).
         assert_eq!(
             outputs(br#""a""#, r#"[match("(?:)+?|a"; "n") | .string]"#),
-            ["[]"]
+            [r#"["a"]"#]
         );
         assert_eq!(
             outputs(
                 br#""ba""#,
                 r#"[match("(?:){1,2}a?||"; "l") | [.offset, .string]]"#
             ),
-            [r#"[[0,""]]"#]
+            [r#"[[1,"a"]]"#]
         );
         // `ln` keeps its old route whole too, `n`'s skip-forward search included: fixing `n` alone
         // would change which wrong answer the pair gives (`"aa" | match("a*?"; "ln")` is `"aa"`
