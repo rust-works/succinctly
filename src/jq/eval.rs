@@ -13524,9 +13524,11 @@ fn text_peel_after_refusal<S: EvalSemantics>(
 /// them under `try` or `?` (a text stage cannot fail, so the guard changes nothing).
 fn text_stage_text<S: EvalSemantics>(stage: &Expr, input: &OwnedValue) -> Option<String> {
     match unwrap_paren(stage) {
-        Expr::Builtin(Builtin::ToJson) | Expr::Format(FormatType::Json) => {
+        // (yq's `tojson` is `to_json`, #6158: it renders more than the value's JSON.)
+        Expr::Builtin(Builtin::ToJson) if S::TAG != EvalTag::Yq => {
             Some(owned_value_to_json::<S>(input))
         }
+        Expr::Format(FormatType::Json) => Some(owned_value_to_json::<S>(input)),
         Expr::Builtin(Builtin::ToString) | Expr::Format(FormatType::Text) => {
             Some(tostring_text::<S>(input, false))
         }
@@ -25793,6 +25795,12 @@ fn builtin_tojson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `builtin_tostring`'s identical reasoning -- no principled exemption
     // documented anywhere for this sibling either.
     let owned = to_owned_or_suppress!(&value, optional);
+    // #6158: yq's `tojson` is `to_json`: indented, with a line break of its own.
+    if S::TAG == EvalTag::Yq {
+        return QueryResult::Owned(OwnedValue::String(
+            super::stream::owned_value_to_yq_json_string(&owned, 2).into(),
+        ));
+    }
     QueryResult::Owned(OwnedValue::String(owned_value_to_json::<S>(&owned).into()))
 }
 
@@ -79345,7 +79353,7 @@ fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
             unwrap_paren(stage),
             Expr::Builtin(Builtin::ToString | Builtin::Length | Builtin::ToJson | Builtin::Type)
                 | Expr::Not
-                | Expr::Format(FormatType::Json)
+                | Expr::Format(FormatType::Json | FormatType::YqJson(_) | FormatType::YqYaml(_))
         )
     };
     match expr {

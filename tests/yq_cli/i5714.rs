@@ -11,10 +11,10 @@ use crate::run_yq_stdin;
 fn test_named_string_door_counts_bytes_as_yq_does_5714() -> Result<()> {
     for (filter, expected) in [
         ("$s|length", "6\n"),
-        ("[$s|length]|tojson", "[6]\n"),
+        ("[$s|length]|@json", "[6]\n"),
         ("$s|startswith(\"h\")", "true\n"),
         ("$s|endswith(\"llo\")", "true\n"),
-        ("[$s|endswith(\"x\")]|tojson", "[false]\n"),
+        ("[$s|endswith(\"x\")]|@json", "[false]\n"),
     ] {
         let (stdout, code) = run_yq_stdin(
             filter,

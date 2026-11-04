@@ -5518,7 +5518,8 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
         && !embed_table_active();
     if plain || container {
         match strip_parens(expr) {
-            Expr::Builtin(Builtin::ToJson) => {
+            // (Not in yq mode, where `tojson` is `to_json`, #6158.)
+            Expr::Builtin(Builtin::ToJson) if S::TAG != EvalTag::Yq => {
                 return GenericResult::Owned(tostring_owned::<S>(owned));
             }
             Expr::Builtin(Builtin::Empty) => return GenericResult::None,

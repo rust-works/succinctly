@@ -4485,7 +4485,12 @@ impl<'a> Parser<'a> {
                             && !self.shadowable_defs.contains("to_yaml"))
                         // #5456: yq also spells it `toyaml`.
                         || (self.matches_keyword("toyaml")
-                            && !self.shadowable_defs.contains("toyaml")))
+                            && !self.shadowable_defs.contains("toyaml"))
+                        // #6158: and `to_json(N)` as `tojson(N)`; a bare `tojson` stays the builtin,
+                        // which renders as `to_json` does in yq mode.
+                        || (self.matches_keyword("tojson")
+                            && self.input[self.pos + "tojson".len()..].starts_with('(')
+                            && !self.shadowable_defs.contains("tojson")))
                 {
                     // #4206: yq's `to_json` / `to_yaml`, each with an optional literal indent.
                     self.parse_yq_to_text_operator()
@@ -5109,9 +5114,11 @@ impl<'a> Parser<'a> {
     /// non-negative integer literal: yq's parser rejects any other argument (`to_json(.a)`,
     /// `to_json(2+2)`, `to_json(-1)`) as `bad expression`.
     fn parse_yq_to_text_operator(&mut self) -> Result<Expr, ParseError> {
-        let json = self.matches_keyword("to_json");
-        self.consume_keyword(if json {
+        let json = self.matches_keyword("to_json") || self.matches_keyword("tojson");
+        self.consume_keyword(if self.matches_keyword("to_json") {
             "to_json"
+        } else if self.matches_keyword("tojson") {
+            "tojson"
         } else if self.matches_keyword("toyaml") {
             "toyaml"
         } else {
