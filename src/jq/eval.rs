@@ -96609,11 +96609,27 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let fmt = match fmt_owned {
                 OwnedValue::String(s) => s,
                 _ if optional => return QueryResult::None,
+                // jq tests the input before it reads the format (#6111): a number is converted
+                // first and a failed conversion is the error, a non-array is not a datetime, and
+                // only an array gets to `requires a string format`. A number that converts then
+                // meets a format `jv_string_value` aborts on (#3046), which raises here.
                 _ => {
-                    return QueryResult::Error(EvalError::type_error(
-                        "string",
-                        &format!("{name} format"),
-                    ))
+                    return match &value {
+                        StandardJson::Number(_) => {
+                            match broken_down_time_fields::<W, S>(&value, false, local, false, name)
+                            {
+                                Err(r) => r,
+                                Ok(_) => QueryResult::Error(EvalError::type_error(
+                                    "string",
+                                    &format!("{name} format"),
+                                )),
+                            }
+                        }
+                        StandardJson::Array(_) => {
+                            QueryResult::Error(EvalError::requires_string_format(name))
+                        }
+                        _ => QueryResult::Error(EvalError::requires_parsed_datetime_inputs(name)),
+                    }
                 }
             };
 
