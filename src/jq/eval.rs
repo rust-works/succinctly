@@ -4315,6 +4315,13 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::AlternativeAssign { path, value: val } => {
             eval_alternative_assign::<W, S>(path, val, value, optional)
         }
+        // #6089: `(PATH | key) = ...` renames a key, which is a write to the value tree.
+        Expr::MetaAssign {
+            target,
+            slot: MetaSlot::KeyName,
+            value: rhs,
+            is_update,
+        } => eval_key_rename::<W, S>(target, rhs, *is_update, value, optional),
         Expr::MetaAssign { target, slot, .. } => {
             eval_meta_assign::<W, S>(target, *slot, value, optional)
         }
@@ -42399,6 +42406,240 @@ fn assign_one<S: EvalSemantics>(
     Ok(result)
 }
 
+/// The key a `(PATH | key)` rename gives the member: the text of the scalar the right side
+/// produced, and whether it was a string (#6089). A mapping or a sequence is not a key `OwnedValue`
+/// can hold (yq writes it as a complex `? ` key), and neither is a text with a line break (yq
+/// writes a `? |-` block key); both are refused rather than written wrong.
+fn rename_key_text<S: EvalSemantics>(value: &OwnedValue) -> Result<(String, bool), EvalError> {
+    match value {
+        OwnedValue::Array(_) | OwnedValue::Object(_) => Err(EvalError::new(
+            "a mapping key cannot be a mapping or a sequence here (#6089)",
+        )),
+        scalar => {
+            let is_string = matches!(scalar, OwnedValue::String(_));
+            let OwnedValue::String(text) = tostring_owned::<S>(scalar.clone()) else {
+                return Err(EvalError::new("a mapping key must be a scalar (#6089)"));
+            };
+            if text.contains('\n') || text.contains('\r') {
+                return Err(EvalError::new(
+                    "a mapping key with a line break is not supported here (#6089)",
+                ));
+            }
+            Ok((text.to_string(), is_string))
+        }
+    }
+}
+
+/// The name of the mapping member the concrete path `path` ends at, or `None` where it ends at a
+/// sequence item or nowhere: a sequence item has no key node to rename (#6089).
+fn member_name(path: &Expr) -> Option<String> {
+    let mut components = Vec::new();
+    push_path_components(&mut components, path);
+    match unwrap_path_component(components.last()?).0 {
+        Expr::Field(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// The mapping the concrete components `parents` lead to from `root`, or `None` where they lead to
+/// anything else or nowhere (#6089).
+fn mapping_at_mut<'v>(
+    root: &'v mut OwnedValue,
+    parents: &[Expr],
+) -> Option<&'v mut super::value::ObjectMap> {
+    let mut node = root;
+    for component in parents {
+        node = match (unwrap_path_component(component).0, node) {
+            (Expr::Field(name), OwnedValue::Object(map)) => map.get_mut(name.as_str())?,
+            (Expr::Index { idx, .. }, OwnedValue::Array(items)) => {
+                let len = items.len() as i64;
+                let at = if *idx < 0 { len + idx } else { *idx };
+                items.get_mut(usize::try_from(at).ok()?)?
+            }
+            _ => return None,
+        };
+    }
+    match node {
+        OwnedValue::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
+/// The `(old, new)` names given to the members of one mapping, with the components that lead to it.
+type RenameGroup = (Vec<Expr>, Vec<(String, String)>);
+
+/// Rename the mapping members at the concrete paths of `renames` to their new names, keeping each
+/// member's position and value (#6089). A path that ends at a sequence item or at no mapping, or
+/// at a member the mapping lacks, renames nothing. The members of one mapping are renamed together
+/// and the result is checked as a whole, so names that swap (`x` to `y` and `y` to `x`) are fine;
+/// a name that two members end up sharing is an error, since yq keeps both entries and a mapping
+/// here cannot.
+fn rename_members(root: &mut OwnedValue, renames: &[(Expr, String)]) -> Result<(), EvalError> {
+    // The renames of each parent mapping, in the order the parents first appear.
+    let mut groups: Vec<RenameGroup> = Vec::new();
+    for (path, new_key) in renames {
+        let mut components = Vec::new();
+        push_path_components(&mut components, path);
+        let Some((last, parents)) = components.split_last() else {
+            continue;
+        };
+        let Expr::Field(old_key) = unwrap_path_component(last).0 else {
+            continue;
+        };
+        let pair = (old_key.clone(), new_key.clone());
+        match groups.iter_mut().find(|(known, _)| known == parents) {
+            Some((_, pairs)) => pairs.push(pair),
+            None => groups.push((parents.to_vec(), vec![pair])),
+        }
+    }
+    for (parents, pairs) in groups {
+        let Some(map) = mapping_at_mut(root, &parents) else {
+            continue;
+        };
+        // The last name given to a member wins; one the mapping lacks is skipped.
+        let mut wanted: IndexMap<&str, &str> = IndexMap::new();
+        for (old_key, new_key) in &pairs {
+            if map.contains_key(old_key.as_str()) {
+                wanted.insert(old_key.as_str(), new_key.as_str());
+            }
+        }
+        if wanted.iter().all(|(old_key, new_key)| old_key == new_key) {
+            continue;
+        }
+        let mut renamed: IndexMap<String, OwnedValue> = IndexMap::new();
+        for (key, value) in map.iter() {
+            let name = wanted.get(key.as_str()).copied().unwrap_or(key.as_str());
+            if renamed.insert(name.to_string(), value.clone()).is_some() {
+                let old_key = wanted
+                    .iter()
+                    .find(|(_, new_key)| **new_key == name)
+                    .map_or(key.as_str(), |(old_key, _)| *old_key);
+                return Err(EvalError::new(format!(
+                    "cannot rename key '{old_key}' to '{name}': the mapping already has that key (#6089)"
+                )));
+            }
+        }
+        *map = renamed.into();
+    }
+    Ok(())
+}
+
+/// `(PATH | key) = value` and `(PATH | key) |= filter` (yq mode, #6089): rename the key of the
+/// member each node `PATH` selects, in place and keeping its position. `=` evaluates its right
+/// side against the document, once, and every target takes its last output; `|=` binds `.` to each
+/// key's own text and takes the first output. A right side that produces nothing renames nothing.
+///
+/// The target is resolved and vivified as for any yq assignment (`(.a.zz | key) = "q"` creates
+/// `zz: null` and renames it), so this reuses that machinery instead of walking the paths again.
+/// Targets are renamed deepest first, so that renaming a member and one below it (`((.a | key),
+/// (.a.x | key)) = "z"`) finds the lower one still where its path says.
+fn eval_key_rename<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    target: &Expr,
+    value_expr: &Expr,
+    is_update: bool,
+    input: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let Some(prefix) = target.key_node_prefix() else {
+        // patchcov: coverage tolerate reason="unreachable: the parser builds a KeyName write only from a `(PATH | key)` target (#6089)"
+        return QueryResult::Error(EvalError::new(
+            "a key rename needs a target spelled (PATH | key)",
+        ));
+        // patchcov: coverage end
+    };
+    let yq_targets = match yq_resolve_assign_targets::<W, S>(
+        &prefix,
+        value_expr,
+        &input,
+        optional,
+        ScalarNoop::On,
+    ) {
+        Ok(Some(targets)) => targets,
+        Ok(None) => return QueryResult::Error(EvalError::new("(PATH | key) is a yq write")), // patchcov: coverage tolerate-line reason="unreachable: the parser builds a KeyName write in yq mode only (#6089)"
+        Err(early_return) => return early_return,
+    };
+    let rhs_document = yq_targets.rhs_document().cloned();
+    let YqAssignTargets {
+        doc: mut pristine, ..
+    } = yq_targets;
+    // Each target as the concrete path it names in the vivified document (`.a[]` as `.a.x`, `.a.y`).
+    let Some(mut paths) = concrete_update_paths::<S>(&prefix, &pristine) else {
+        return QueryResult::Error(EvalError::new(
+            "(PATH | key) names members that cannot be resolved to paths (#6089)",
+        ));
+    };
+    paths.sort_by_cached_key(|path| {
+        let mut components = Vec::new();
+        push_path_components(&mut components, path);
+        core::cmp::Reverse(components.len())
+    });
+
+    if is_update {
+        let mut pending: Vec<(Expr, String)> = Vec::new();
+        for path in &paths {
+            let Some(old_key) = member_name(path) else {
+                continue;
+            };
+            let key_doc = OwnedValue::String(old_key.as_str().into());
+            let (outputs, terminal) =
+                match collect_rhs_outputs::<W, S>(value_expr, &input, Some(&key_doc), optional) {
+                    Ok(v) => v,
+                    Err(early_return) => return early_return,
+                };
+            if let Some(control) = terminal {
+                return match control {
+                    Control::Error(_) if optional => QueryResult::None,
+                    control => partial(Vec::new(), control),
+                };
+            }
+            let Some(output) = outputs.into_iter().next() else {
+                continue;
+            };
+            match rename_key_text::<S>(&output) {
+                Ok((text, _)) => pending.push((path.clone(), text)),
+                Err(e) => return suppress_or_raise(e, optional),
+            }
+        }
+        if let Err(e) = rename_members(&mut pristine, &pending) {
+            return suppress_or_raise(e, optional);
+        }
+        return QueryResult::Owned(pristine);
+    }
+
+    let (rhs_values, terminal) =
+        match collect_rhs_outputs::<W, S>(value_expr, &input, rhs_document.as_ref(), optional) {
+            Ok(v) => v,
+            Err(early_return) => return early_return,
+        };
+    let (rhs_values, terminal) = match normalize_rhs_values_for_fork::<W, S>(
+        rhs_values,
+        terminal,
+        optional,
+        Some(&pristine),
+    ) {
+        Ok(v) => v,
+        Err(early_return) => return early_return,
+    };
+    fork_rhs_over_paths::<W, _>(
+        pristine,
+        &paths,
+        rhs_values,
+        terminal,
+        optional,
+        |value| (value, Vec::<(Expr, String)>::new()),
+        |result, path, (value, pending), is_last_path| {
+            let (text, _) = rename_key_text::<S>(value)?;
+            pending.push((path.clone(), text));
+            // Every target is named first, then the mapping is rebuilt once, so that renames
+            // that swap names are not checked against a half-renamed mapping.
+            if is_last_path {
+                rename_members(result, pending).map_err(EvalEscape::from)?;
+            }
+            Ok(())
+        },
+    )
+}
+
 /// Evaluate a yq metadata assignment: `PATH <slot> = value` / `PATH <slot>
 /// |= filter` (#798), e.g. `.a line_comment = "hi"`, `.a style = "flow"`,
 /// `.a anchor = "z"`.
@@ -42463,6 +42704,9 @@ fn eval_meta_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             eval_update::<W, S>(target, &identity, input, optional, true)
         }
+        // patchcov: coverage tolerate reason="unreachable: eval dispatches a KeyName write to eval_key_rename before it reaches here (#6089)"
+        MetaSlot::KeyName => unreachable!("a key rename is evaluated by eval_key_rename"),
+        // patchcov: coverage end
     }
 }
 

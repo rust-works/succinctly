@@ -5248,6 +5248,8 @@ impl WritableSlot {
             MetaSlot::FootComment => Some(Self::FootComment),
             MetaSlot::Comments => Some(Self::Comments),
             MetaSlot::Tag => Some(Self::Tag),
+            // A key rename is a write to the value, done by the evaluator (#6089).
+            MetaSlot::KeyName => None,
         }
     }
 }
@@ -5471,7 +5473,11 @@ fn evaluate_input_quiet(input: &OwnedValue, expr: &jq::Expr) -> Option<Vec<Owned
 fn count_meta_assigns(expr: &Expr) -> usize {
     let mut count = 0;
     jq::walk::any_subexpr(expr, &mut |e| {
-        if matches!(e, Expr::MetaAssign { .. }) {
+        // A key rename (#6089) is a value write the evaluator did: nothing to resolve here.
+        if matches!(
+            e,
+            Expr::MetaAssign { slot, .. } if *slot != MetaSlot::KeyName
+        ) {
             count += 1;
         }
         false
@@ -5883,7 +5889,7 @@ fn reachable_meta_assigns(stages: &[&Expr]) -> usize {
     stages
         .iter()
         .map(|stage| match stage {
-            Expr::MetaAssign { .. } => 1,
+            Expr::MetaAssign { slot, .. } => usize::from(*slot != MetaSlot::KeyName),
             Expr::As { body, .. } => {
                 let mut inner = Vec::new();
                 flatten_pipe_stages(body, &mut inner);

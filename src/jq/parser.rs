@@ -10093,6 +10093,46 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// yq mode: an operator assignment (`+=`, `-=`, `*=`, `//=`, ...) to a `(PATH | key)` target
+    /// is refused out loud, as a silent no-op was the answer before key writes existed (#6089).
+    /// `=` and `|=` rename the key ([`Self::assign_or_rename_key`]).
+    fn refuse_key_operator_assign(&self, left: &Expr) -> Result<(), ParseError> {
+        if self.mode == ParserMode::Yq && left.key_node_prefix().is_some() {
+            return Err(ParseError::new(
+                "(PATH | key) can only be assigned with = or |= (#6089)",
+                self.pos,
+            ));
+        }
+        Ok(())
+    }
+
+    /// The `=` / `|=` node for `left`: in yq mode a target spelled `(PATH | key)` renames the key of
+    /// the member `PATH` names (#6089), and is a [`Expr::MetaAssign`] of [`MetaSlot::KeyName`]; any
+    /// other target is an ordinary [`Expr::Assign`] / [`Expr::Update`]. Out of line so the recursive
+    /// assignment parser keeps one `Expr`-sized local.
+    fn assign_or_rename_key(&self, left: Expr, value: Expr, is_update: bool) -> Expr {
+        let target = Self::fold_sum_or_merge_key(left);
+        if self.mode == ParserMode::Yq && target.key_node_prefix().is_some() {
+            return Expr::MetaAssign {
+                target: Box::new(target),
+                slot: MetaSlot::KeyName,
+                value: Box::new(value),
+                is_update,
+            };
+        }
+        if is_update {
+            Expr::Update {
+                path: Box::new(target),
+                filter: Box::new(value),
+            }
+        } else {
+            Expr::Assign {
+                path: Box::new(target),
+                value: Box::new(value),
+            }
+        }
+    }
+
     /// Parse assignment expressions: `path = value`, `path |= filter`, `path += value`, etc.
     /// Assignment has higher precedence than pipe; against `//` see [`Self::parse_assignment`].
     fn parse_assignment_level(&mut self) -> Result<Expr, ParseError> {
@@ -10133,10 +10173,7 @@ impl<'a> Parser<'a> {
             self.next(); // =
             self.skip_ws();
             let filter = self.parse_assignment_operand()?;
-            return Ok(Expr::Update {
-                path: Box::new(Self::fold_sum_or_merge_key(left)),
-                filter: Box::new(filter),
-            });
+            return Ok(self.assign_or_rename_key(left, filter, true));
         }
 
         // Check for //= (alternative assignment)
@@ -10145,6 +10182,7 @@ impl<'a> Parser<'a> {
             self.next(); // /
             self.next(); // =
             self.skip_ws();
+            self.refuse_key_operator_assign(&left)?;
             let value = self.parse_assignment_operand()?;
             return Ok(Expr::AlternativeAssign {
                 path: Box::new(Self::fold_sum_or_merge_key(left)),
@@ -10165,6 +10203,7 @@ impl<'a> Parser<'a> {
                 MergeFlags::default()
             };
             self.skip_ws();
+            self.refuse_key_operator_assign(&left)?;
             let value = self.parse_assignment_operand()?;
             return Ok(Expr::CompoundAssign {
                 op: AssignOp::Mul(flags),
@@ -10188,6 +10227,7 @@ impl<'a> Parser<'a> {
                 self.next(); // op char
                 self.next(); // =
                 self.skip_ws();
+                self.refuse_key_operator_assign(&left)?;
                 let value = self.parse_assignment_operand()?;
                 return Ok(Expr::CompoundAssign {
                     op,
@@ -10203,10 +10243,7 @@ impl<'a> Parser<'a> {
             self.next(); // =
             self.skip_ws();
             let value = self.parse_assignment_operand()?;
-            return Ok(Expr::Assign {
-                path: Box::new(Self::fold_sum_or_merge_key(left)),
-                value: Box::new(value),
-            });
+            return Ok(self.assign_or_rename_key(left, value, false));
         }
 
         if self.mode == ParserMode::Yq {

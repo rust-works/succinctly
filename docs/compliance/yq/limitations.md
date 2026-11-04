@@ -2046,6 +2046,32 @@ double-quoted scalars are a different lexer (YAML, see above) and are unchanged.
 the regex dialect (read as Go's since [#5388](https://github.com/rust-works/succinctly/issues/5388), see "Regex patterns are read as Go's `regexp` reads them" below)
 and a string-literal `@format` (`@base64 "x\q"`, where both refuse with different wording).
 
+### Renaming a key with `(PATH | key) = ...` — the rename matches; seven shapes still differ ([#6089](https://github.com/rust-works/succinctly/issues/6089))
+
+`(.a.x | key) = "meow"` and `(.a.x | key) |= "m_" + .` rename the key of the member the path names, in place, as yq does.
+The new name keeps the key's quoting, anchor and comments, and the value under it is untouched.
+`=` evaluates its right side against the document and every target takes its last output; `|=` binds `.` to each key's text and takes the first.
+A target that is a sequence item or the document root renames nothing, as in yq.
+A target that does not exist is created as `null` and renamed (`(.a.zz | key) = "q"` adds `q: null`), as in yq.
+
+Not reproduced:
+
+- **A name that is already a member is an error.**
+  yq keeps both entries (`(.a | key) = "b"` over `a: 1` / `b: 2` prints `b: 1` and `b: 2`).
+  A mapping here cannot hold a repeated key, and overwriting one would lose a value, so the rename is refused with `cannot rename key 'a' to 'b': the mapping already has that key`.
+  `(.a[] | key) = "k"` over two members is the same refusal.
+- **A key is text.**
+  `(.a.x | key) = 7` prints `7:` as yq does, but a later stage reads the key back as the string `"7"` where yq reads the number (`| .a | keys` is `- "7"` here and `- 7` in yq).
+- **A name that is a mapping, a sequence or a text with a line break is refused**, where yq writes a complex `? ` key or a `? |-` block key.
+- **The key keeps its quoting only where the presentation replay reads the filter.**
+  A target of fields, indexes and `.[]`, and a right side of literals, `.` and arithmetic on them, keep the key's quoting, anchor and comments.
+  Any other filter (`(.a.x | key) = (.a.y | tostring)`, a target with a `select`) still renames, but the document's comments and quoting are lost, and a string name that reads as another type is printed plain (`4:` where yq prints `"4":`).
+- **A `select` over `key` in the target resolves to nothing**, as it does for any assignment here: `(.. | select(key == "x") | key) = "q"` renames nothing where yq renames every `x`.
+- **`+=`, `-=`, `*=` and `//=` on a `(PATH | key)` target are a parse error.**
+  yq accepts `+=` (`(.a.x | key) += "z"` is `xz`) and errors for the others.
+  They used to be a silent no-op, which discarded the write (ADR-0018 rule 4(b)); a refusal keeps the write from vanishing.
+- **A rename through an alias** (`a: &r {x: 1}` / `b: *r`, `(.b.x | key) = "z"`) renames only the copy under `b`, and prints it as a mapping, where yq renames the anchor's node (`a: &r {z: 1}` / `b: *r`).
+
 ### `|=` over a descent writes deepest first; a comma of nested paths keeps its named order (#6087)
 
 yq updates the nodes a descent selects, so an outer node's update cannot move an inner one out of reach.

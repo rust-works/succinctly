@@ -999,6 +999,10 @@ pub enum MetaSlot {
     FootComment,
     /// `comments = ...` — sets head/line/foot together. Parses; not yet supported (#798 PR1).
     Comments,
+    /// `(PATH | key) = ...` / `(PATH | key) |= ...` (#6089): renames the mapping key of the member
+    /// each node `PATH` selects, in place. Unlike the slots above it changes the value tree (a key is
+    /// part of the document), so the evaluator does the write; the target keeps its trailing `| key`.
+    KeyName,
 }
 
 /// A [`Expr::DefCall`]'s substituted body, computed on first evaluation and

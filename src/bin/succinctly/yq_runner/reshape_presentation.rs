@@ -14,7 +14,7 @@ use succinctly::jq::document::{
 use succinctly::jq::eval_generic::{
     to_owned_with_comments, AnchorMark, KeyMeta, LazyElem, KEY_STYLE_STRING,
 };
-use succinctly::jq::{ArithOp, Builtin, EvalError, ObjectKey, MAX_VALUE_TREE_DEPTH};
+use succinctly::jq::{ArithOp, Builtin, EvalError, MetaSlot, ObjectKey, MAX_VALUE_TREE_DEPTH};
 use succinctly::jq::{EvalSemantics, YqSemantics};
 
 /// Whether yq's key listing folds a repeated key into one (it does not: both are listed).
@@ -45,6 +45,18 @@ pub(super) fn supported(expr: &Expr) -> bool {
         // Paths given as a literal; one built from the document is for the plain route.
         Expr::Builtin(Builtin::Pick(paths)) => is_closed_literal(paths),
         Expr::Assign { path, value } => static_path(path) && supported(value),
+        // #6089: a key rename, whose target is a path and whose new name is a supported expression.
+        Expr::MetaAssign {
+            target,
+            slot: MetaSlot::KeyName,
+            value,
+            ..
+        } => {
+            target
+                .key_node_prefix()
+                .is_some_and(|prefix| rename_target(&prefix))
+                && supported(value)
+        }
         Expr::Update { path, filter } => static_path(path) && supported(filter),
         _ => false,
     }
@@ -130,6 +142,18 @@ fn array_operands(inner: &Expr) -> Vec<&Expr> {
             array_operands(inner)
         }
         other => vec![other],
+    }
+}
+
+/// The member a key rename names (#6089): a path of fields, indexes and iterations. The tree is
+/// read off what the write changed, not off this path, so it may fan out where a write's own target
+/// may not.
+fn rename_target(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => true,
+        Expr::Pipe(parts) => parts.iter().all(rename_target),
+        Expr::Paren(inner) => rename_target(inner),
+        _ => false,
     }
 }
 
@@ -551,7 +575,12 @@ pub(super) fn needed(expr: &Expr) -> bool {
         return false;
     }
     match expr {
-        Expr::Builtin(_) | Expr::Arithmetic { .. } => true,
+        Expr::Builtin(_)
+        | Expr::Arithmetic { .. }
+        | Expr::MetaAssign {
+            slot: MetaSlot::KeyName,
+            ..
+        } => true,
         Expr::Pipe(parts) => parts.iter().any(needed),
         Expr::Paren(inner) => needed(inner),
         _ => false,
@@ -830,6 +859,28 @@ fn trace_at_depth(
             let meta = reconcile_presentation(value, tree, &result, &targets);
             Some((result, meta))
         }
+        // #6089: a renamed key keeps its node: its quoting, anchor and comments move to the new name,
+        // and the value under it is untouched.
+        Expr::MetaAssign {
+            slot: MetaSlot::KeyName,
+            value: rhs,
+            is_update,
+            ..
+        } => {
+            let result = evaluated(expr, value)?;
+            // Whether the name a key was given is a string, which decides whether a plain key that
+            // reads as another type is quoted (`= "1"` is `"1":`, `= 1` is `1:`).
+            let is_string = |old: &str| {
+                let operand = if *is_update {
+                    OwnedValue::String(old.into())
+                } else {
+                    value.clone()
+                };
+                evaluated(rhs, &operand).map(|name| matches!(name, OwnedValue::String(_)))
+            };
+            let tree = renamed_tree(value, &result, tree, &is_string, depth + 1)?;
+            Some((result, tree))
+        }
         _ if is_closed_literal(expr) => Some((evaluated(expr, value)?, CommentTree::empty())),
         _ => None,
     }
@@ -897,6 +948,83 @@ fn pivot_pair(expr: &Expr, input: &ResultWithComments) -> Option<ResultWithComme
             Some((result, CommentTree::Object(NodeMeta::empty(), fields, keys)))
         }
         _ => None,
+    }
+}
+
+/// The tree of `new`, the document `old` became when a key rename gave some of its mapping members
+/// new names (#6089): the same tree with each renamed member's field and key entry moved to the new
+/// name, in the same position. `None` where the two differ in anything but the names (a member added
+/// by the write, say), which the caller's plain route answers.
+fn renamed_tree(
+    old: &OwnedValue,
+    new: &OwnedValue,
+    tree: &CommentTree,
+    is_string: &dyn Fn(&str) -> Option<bool>,
+    depth: usize,
+) -> Option<CommentTree> {
+    if depth >= MAX_VALUE_TREE_DEPTH {
+        return None;
+    }
+    match (old, new) {
+        (OwnedValue::Object(before), OwnedValue::Object(after)) => {
+            if before.len() != after.len() {
+                return None;
+            }
+            let mut fields = IndexMap::new();
+            let mut keys = IndexMap::new();
+            for ((old_key, old_value), (new_key, new_value)) in before.iter().zip(after.iter()) {
+                let child = renamed_tree(
+                    old_value,
+                    new_value,
+                    tree.field(old_key),
+                    is_string,
+                    depth + 1,
+                )?;
+                fields.insert(new_key.clone(), child);
+                let meta = if old_key == new_key {
+                    tree.key_meta(old_key).cloned()
+                } else {
+                    // A quoted key stays quoted; a plain one is a string key when it was given a
+                    // string, so that it is quoted if it reads as another type.
+                    let style = if !is_string(old_key)? {
+                        ""
+                    } else if tree.key_meta(old_key).is_some_and(KeyMeta::is_quoted) {
+                        tree.key_style(old_key)
+                    } else {
+                        KEY_STYLE_STRING
+                    };
+                    KeyMeta::with_alias(
+                        tree.key_comment(old_key).map(str::to_string),
+                        false,
+                        style,
+                        tree.key_anchor(old_key).map(str::to_string),
+                        tree.key_tag(old_key).map(str::to_string),
+                        tree.key_alias(old_key).map(str::to_string),
+                    )
+                };
+                if let Some(meta) = meta {
+                    keys.insert(new_key.clone(), meta);
+                }
+            }
+            Some(CommentTree::Object(tree.meta().clone(), fields, keys))
+        }
+        (OwnedValue::Array(before), OwnedValue::Array(after)) => {
+            if before.len() != after.len() {
+                return None;
+            }
+            let mut items = Vec::with_capacity(before.len());
+            for (i, (old_item, new_item)) in before.iter().zip(after.iter()).enumerate() {
+                items.push(renamed_tree(
+                    old_item,
+                    new_item,
+                    tree.at_index(i),
+                    is_string,
+                    depth + 1,
+                )?);
+            }
+            Some(CommentTree::Array(tree.meta().clone(), items))
+        }
+        (old, new) => (old == new).then(|| tree.clone()),
     }
 }
 
