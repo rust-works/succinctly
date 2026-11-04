@@ -5919,6 +5919,13 @@ fn bridge_to_each_owned_flow<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// Whether a `|=` update runs on one owned copy of its input (`bridge_update_flow`, #6122): jq mode,
+/// and a body that reads no path context. One definition for the two arms that route it
+/// (`eval_single`'s collected form and `eval_each_generic`'s sink form), so they cannot disagree.
+fn update_takes_owned_door<S: EvalSemantics>(expr: &Expr) -> bool {
+    S::TAG == EvalTag::Jq && !needs_path_context(expr)
+}
+
 /// [`bridge_to_each_owned_flow`] for a `|=` update (#6122): the update's outputs are collected,
 /// the owned copy of the input is dropped, and only then are they pushed to `sink`.
 ///
@@ -5926,7 +5933,8 @@ fn bridge_to_each_owned_flow<S: EvalSemantics, V: DocumentValue>(
 /// is gained is that the update's frames and the input copy are gone before the rest of the pipe
 /// runs. Pushing from inside the update's callback kept both alive for every later stage, and a
 /// recursion through an update (`def f($n): ... (.v |= 1) as $x | f($n - 1) ...`) reached the native
-/// stack floor about a fifth sooner (jq 1.7.1 and the bridge it replaces answer `f(9000)`).
+/// stack floor about a fifth sooner (in a release build jq 1.7.1 and the bridge it replaces answer
+/// `f(9000)`; a debug build's frames are larger and fail earlier on every route).
 fn bridge_update_flow<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,
@@ -5937,17 +5945,9 @@ fn bridge_update_flow<S: EvalSemantics, V: DocumentValue>(
     let root = RootWitness::of(cursor.as_ref());
     match bridge_ambient_input::<_, S>(expr, &value, cursor) {
         Ok(owned) => {
-            let mut outputs = Vec::new();
-            let flow =
-                eval_each_owned::<S>(expr, &owned, optional, Reentry::Against(root), &mut |v| {
-                    outputs.push(v);
-                    Demand::Continue
-                });
+            let result =
+                eval_each_owned_collect::<S, V>(expr, &owned, optional, Reentry::Against(root));
             drop(owned);
-            let result = match flow {
-                Flow::Escaped(control) => partial_generic(outputs, control),
-                Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_generic_result(outputs),
-            };
             drain_result_generic(result, sink)
         }
         Err(e) if suppresses(&e, optional) => Flow::Exhausted,
@@ -15664,7 +15664,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         }
         // #6122: a collected `|=` (`[.a |= 5]`, `map(.x |= f)`) takes the same bridge as the sink
         // route, see `eval_each_generic`'s arm.
-        Expr::Update { .. } if S::TAG == EvalTag::Jq && !needs_path_context(expr) => {
+        Expr::Update { .. } if update_takes_owned_door::<S>(expr) => {
             collect_each_generic::<S, V>(expr, value, optional, cursor)
         }
         // #5305: jq mode's interpolation of plain navigation, collected, with the
@@ -16900,7 +16900,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // ambient value into an owned copy, wrote that copy out as text and indexed it again for
         // the full evaluator, so `.users |= .` on a 100 MB document materialized it twice; this
         // bridge converts it once and runs the update on that copy, as `=` does.
-        Expr::Update { .. } if S::TAG == EvalTag::Jq && !needs_path_context(expr) => {
+        Expr::Update { .. } if update_takes_owned_door::<S>(expr) => {
             bridge_update_flow::<S, V>(expr, value, cursor, optional, sink)
         }
 

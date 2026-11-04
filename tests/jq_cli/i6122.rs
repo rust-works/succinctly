@@ -1,4 +1,5 @@
-//! #6122: a `|=` update that reads no path context is bridged through `eval_each_owned`, as `=`,
+//! #6122: a `|=` update that reads no path context (variables, definitions, `reduce`, `label` and
+//! `$__loc__` included) is bridged through `eval_each_owned`, as `=`,
 //! `+=` and `//=` already were in jq mode, instead of through the wildcard that wrote the owned
 //! copy of the document out as text and indexed it again for the full evaluator (a second
 //! materialization of the whole document). The route must answer exactly as the wildcard did, so
@@ -47,10 +48,22 @@ const ROWS: &[(&str, &str, i32)] = &[
     (". |= empty", "null\n", 0),
     (r#".a |= error("x")"#, "", 5),
     (".arr |= (.[] | tostring)", "{\"a\":1,\"arr\":\"1\",\"o\":{\"p\":3,\"q\":\"s\"},\"s\":\"abca\",\"n\":null}\n", 0),
+    (r".a as $x | .arr |= map(select(. != $x))", "{\"a\":1,\"arr\":[2,3,4],\"o\":{\"p\":3,\"q\":\"s\"},\"s\":\"abca\",\"n\":null}\n", 0),
+    (r". as $d | .a |= $d.arr[0]", "{\"a\":1,\"arr\":[1,2,3,4],\"o\":{\"p\":3,\"q\":\"s\"},\"s\":\"abca\",\"n\":null}\n", 0),
+    (r".arr |= (. as $a | length)", "{\"a\":1,\"arr\":4,\"o\":{\"p\":3,\"q\":\"s\"},\"s\":\"abca\",\"n\":null}\n", 0),
+    (r".a |= $__loc__.line", "{\"a\":1,\"arr\":[1,2,3,4],\"o\":{\"p\":3,\"q\":\"s\"},\"s\":\"abca\",\"n\":null}\n", 0),
+    (r"first(.arr |= map(.+1))", "{\"a\":1,\"arr\":[2,3,4,5],\"o\":{\"p\":3,\"q\":\"s\"},\"s\":\"abca\",\"n\":null}\n", 0),
+    (r"[limit(2; .a |= (.,.))] | length", "1\n", 0),
+    (r"def f: .a |= .+1; f | f", "{\"a\":3,\"arr\":[1,2,3,4],\"o\":{\"p\":3,\"q\":\"s\"},\"s\":\"abca\",\"n\":null}\n", 0),
+    (r".a as $x | (.arr[] | select(. == $x)) |= 10", "{\"a\":1,\"arr\":[10,2,3,4],\"o\":{\"p\":3,\"q\":\"s\"},\"s\":\"abca\",\"n\":null}\n", 0),
+    (r"reduce range(3) as $i (.; .a |= .+$i)", "{\"a\":4,\"arr\":[1,2,3,4],\"o\":{\"p\":3,\"q\":\"s\"},\"s\":\"abca\",\"n\":null}\n", 0),
+    (r"[.arr[] as $v | .a |= $v] | length", "4\n", 0),
+    (r".arr |= map(. as $e | $e * $e)", "{\"a\":1,\"arr\":[1,4,9,16],\"o\":{\"p\":3,\"q\":\"s\"},\"s\":\"abca\",\"n\":null}\n", 0),
+    (r#"try (.a |= error("x")) catch "caught""#, "\"caught\"\n", 0),
 ];
 
 #[test]
-fn a_variable_free_update_answers_as_jq_does_6122() -> Result<()> {
+fn a_path_free_update_answers_as_jq_does_6122() -> Result<()> {
     for (program, want, want_code) in ROWS {
         let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(DOC))?;
         assert_eq!(
