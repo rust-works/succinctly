@@ -109,6 +109,11 @@ fn test_an_unbounded_lazy_repeat_over_a_leading_consuming_way_is_unrolled_by_siz
             r#""abababab" | [match("(?:b*|\\w){6,}?"; "gn") | .string]"#,
             r#"["ab","ab","ab","ab"]"#,
         ),
+        // Under an ignore-case flag a letter that starts no fold is still one operation.
+        (
+            r#""ab" | [match("(?i)(?:b?|.){2,}?"; "gn") | .string]"#,
+            r#"["a","b"]"#,
+        ),
         // Without `n` the two forms agree.
         (
             r#""abb" | [match("(?:b?|\\w){2,}?"; "g") | .string]"#,

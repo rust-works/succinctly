@@ -90,6 +90,10 @@ struct Rewriter<'p> {
     /// Whether a flag group of the pattern may switch case folding on, which Oniguruma reads a
     /// letter under as more than one operation (a multi-character fold such as `ss`).
     folds: bool,
+    /// Whether the parse is of a copy of the pattern that writes Oniguruma syntax plainly
+    /// ([`oniguruma_shadow`](super::eval::oniguruma_shadow)): what a node there is no longer says
+    /// how many operations Oniguruma makes of it.
+    shadowed: bool,
     /// The bytes of text built so far, and their bound: a body of many items that can match
     /// nothing rebuilds its listed ways at each item, quadratic in the items.
     work: core::cell::Cell<usize>,
@@ -125,10 +129,11 @@ fn rewrite_parsed(pattern: &str) -> Option<String> {
         opaque,
         limit: pattern
             .len()
-            .saturating_mul(64)
+            .saturating_mul(16)
             .saturating_add(1024)
             .max(32 * 1024),
         folds: may_fold_case(pattern),
+        shadowed: parsed != pattern,
         work: core::cell::Cell::new(0),
         work_limit: pattern
             .len()
@@ -187,6 +192,18 @@ fn may_be_empty(ast: &Ast) -> bool {
     }
 }
 
+/// The least and most times a repeat operator repeats its item.
+fn bounds(kind: &RepetitionKind) -> (u32, Option<u32>) {
+    match kind {
+        RepetitionKind::ZeroOrOne => (0, Some(1)),
+        RepetitionKind::ZeroOrMore => (0, None),
+        RepetitionKind::OneOrMore => (1, None),
+        RepetitionKind::Range(RepetitionRange::Exactly(n)) => (*n, Some(*n)),
+        RepetitionKind::Range(RepetitionRange::AtLeast(n)) => (*n, None),
+        RepetitionKind::Range(RepetitionRange::Bounded(m, n)) => (*m, Some(*n)),
+    }
+}
+
 /// The number of operations Oniguruma 6.9.8 compiles `ast` to (`compile_length_tree`), or `None`
 /// for a construct whose length is not worked out here: a capture group, an assertion, a flag
 /// switch, a letter under case folding, and a repeat of a repeat (Oniguruma reduces those).
@@ -196,7 +213,12 @@ fn may_be_empty(ast: &Ast) -> bool {
 fn onig_ops(ast: &Ast, folds: bool) -> Option<usize> {
     match ast {
         Ast::Empty(_) => Some(0),
-        Ast::Literal(lit) => (!(folds && lit.c.is_alphabetic())).then_some(1),
+        // Under case folding a letter that starts a multi-character fold (`ss`, `fi`, `ʼn`) is
+        // more than one operation, and so is a class holding one.
+        Ast::Literal(lit) => (!(folds
+            && (!lit.c.is_ascii() || "sfiltjnhwy".contains(lit.c.to_ascii_lowercase()))))
+        .then_some(1),
+        Ast::ClassUnicode(_) | Ast::ClassBracketed(_) if folds => None,
         Ast::Dot(_) | Ast::ClassUnicode(_) | Ast::ClassPerl(_) | Ast::ClassBracketed(_) => Some(1),
         Ast::Assertion(_) | Ast::Flags(_) => None,
         Ast::Group(group) => match &group.kind {
@@ -216,6 +238,9 @@ fn onig_ops(ast: &Ast, folds: bool) -> Option<usize> {
             for item in &concat.asts {
                 // Adjacent literals are one string.
                 let literal = matches!(item, Ast::Literal(_));
+                if literal && in_run && folds {
+                    return None;
+                }
                 if !(literal && in_run) {
                     total += onig_ops(item, folds)?;
                 }
@@ -238,35 +263,24 @@ fn onig_ops(ast: &Ast, folds: bool) -> Option<usize> {
             if tlen == 0 {
                 return Some(0);
             }
-            let (min, max) = match &rep.op.kind {
-                RepetitionKind::ZeroOrOne => (0, Some(1)),
-                RepetitionKind::ZeroOrMore => (0, None),
-                RepetitionKind::OneOrMore => (1, None),
-                RepetitionKind::Range(RepetitionRange::Exactly(n)) => {
-                    (*n as usize, Some(*n as usize))
-                }
-                RepetitionKind::Range(RepetitionRange::AtLeast(n)) => (*n as usize, None),
-                RepetitionKind::Range(RepetitionRange::Bounded(m, n)) => {
-                    (*m as usize, Some(*n as usize))
-                }
-            };
-
+            let (min, max) = bounds(&rep.op.kind);
+            let (min, max) = (min as usize, max.map(|n| n as usize));
             let mod_tlen = tlen + if may_be_empty(&rep.ast) { 2 } else { 0 };
             Some(match max {
                 None if min <= 1 || tlen.checked_mul(min)? <= ONIG_EXPAND_LIMIT => {
                     let head = if min == 1 && tlen > ONIG_EXPAND_LIMIT {
                         1
                     } else {
-                        tlen * min
+                        tlen.saturating_mul(min)
                     };
-                    head + 2 + mod_tlen
+                    head.saturating_add(2 + mod_tlen)
                 }
                 Some(0) => 0,
                 Some(max)
                     if rep.greedy
                         && (max == 1 || (tlen + 1).checked_mul(max)? <= ONIG_EXPAND_LIMIT) =>
                 {
-                    tlen * min + (1 + tlen) * (max - min)
+                    tlen * min + (1 + tlen).saturating_mul(max - min)
                 }
                 Some(1) if min == 0 => 2 + tlen,
                 _ => 2 + mod_tlen,
@@ -378,14 +392,7 @@ impl Rewriter<'_> {
             Ast::Group(group) => self.group(group, listed),
             Ast::Repetition(rep) => {
                 let body = self.convert(&rep.ast, true)?;
-                let (min, max) = match &rep.op.kind {
-                    RepetitionKind::ZeroOrOne => (0, Some(1)),
-                    RepetitionKind::ZeroOrMore => (0, None),
-                    RepetitionKind::OneOrMore => (1, None),
-                    RepetitionKind::Range(RepetitionRange::Exactly(n)) => (*n, Some(*n)),
-                    RepetitionKind::Range(RepetitionRange::AtLeast(n)) => (*n, None),
-                    RepetitionKind::Range(RepetitionRange::Bounded(m, n)) => (*m, Some(*n)),
-                };
+                let (min, max) = bounds(&rep.op.kind);
                 if !rep.greedy && max.is_none() && self.oniguruma_unrolls(&rep.ast, min) {
                     return self.lazy_unrolled(body, min);
                 }
@@ -749,8 +756,12 @@ impl Rewriter<'_> {
     /// the body's empty way even before the minimum, and is what [`Self::lazy_counted`] writes.
     /// `false` when the length cannot be told, which keeps the rewrite.
     fn oniguruma_unrolls(&self, body: &Ast, min: u32) -> bool {
+        // A body of no operations (`(?:)`) has no empty way to take and no count to bound the
+        // copies, so it is never the one this is for.
         min >= 2
+            && !self.shadowed
             && onig_ops(body, self.folds)
+                .filter(|&ops| ops > 0)
                 .and_then(|ops| ops.checked_mul(min as usize))
                 .is_some_and(|total| total <= ONIG_EXPAND_LIMIT)
     }
@@ -1023,8 +1034,14 @@ mod tests {
         assert!(rewrite("(?:b?|a){4,}?").is_some());
         // A body of more operations is a counted loop at two.
         assert!(rewrite("(?:b*|a){2,}?").is_some());
-        // An ignore-case flag may fold the letters into more operations: not worked out.
-        assert!(rewrite("(?i)(?:b?|a){2,}?").is_some());
+        // An ignore-case flag may fold a letter that starts a multi-character fold into more
+        // operations: not worked out.
+        assert!(rewrite("(?i)(?:s?|a){2,}?").is_some());
+        // A body of no operations has no empty way to take, and no count to bound its copies.
+        assert_eq!(rewrite("(?:){4000000000,}?"), None);
+        // Under an ignore-case flag a plain letter is still one operation, and `.` too.
+        assert_eq!(rewrite("(?i)(?:b?|.){2,}?"), None);
+        assert!(rewrite("(?i)(?:s?|.){2,}?").is_some(), "`s` starts a fold");
         // The copies a count of six or seven makes are written out in full.
         assert!(rewrite("(?:b*|\\w){6,}?").is_some());
     }
