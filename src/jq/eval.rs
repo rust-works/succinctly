@@ -31461,13 +31461,20 @@ fn next_match_step<'h>(
         .get(0)
         .expect("capture group 0 is always present on a match");
     let (m_start, m_end) = (m.start(), m.end());
-    let accepted = !re.caller_skips_empty() || m_end > m_start;
-    let next_start = if m_end > m_start {
+    // #6169: a `\K` inside a look-behind starts the match before the position the search began at
+    // (`(?<=a\Kb)` on `"cab"` from offset 3 is `[2,3)`, as it was from offset 0). Resuming at
+    // that match's end finds it again, so the search never ends, pushing a match each time (jq
+    // 1.7.1 does the same, without end). Such a match ends where the search began: it was found
+    // by the search before, so it is skipped and the search moves on one character.
+    let backward_repeat = m_start < start && m_end <= start;
+    let accepted = !backward_repeat && (!re.caller_skips_empty() || m_end > m_start);
+    let next_start = if m_end > m_start && !backward_repeat {
         m_end
     } else {
-        match input[m_end..].chars().next() {
-            Some(c) => m_end + c.len_utf8(),
-            None => m_end + 1,
+        let from = m_end.max(start);
+        match input[from..].chars().next() {
+            Some(c) => from + c.len_utf8(),
+            None => from + 1,
         }
     };
     Ok(Some((caps, accepted, next_start, m_start, m_end)))
