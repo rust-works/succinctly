@@ -407,11 +407,7 @@ impl Walker<'_> {
         };
         let mut buf = [0u8; 4];
         let mut alternatives: Vec<String> = Vec::new();
-        for (fold, unfolds) in FOLDS2
-            .iter()
-            .map(|(fold, unfolds)| (&fold[..], *unfolds))
-            .chain(FOLDS3.iter().map(|(fold, unfolds)| (&fold[..], *unfolds)))
-        {
+        for (fold, unfolds) in all_folds() {
             if unfolds.iter().any(|c| re.is_match(c.encode_utf8(&mut buf))) {
                 let spelling = spell(fold);
                 if !alternatives.contains(&spelling) {
@@ -455,6 +451,15 @@ fn key_of(c: char) -> char {
         .map_or(c, |at| FOLD_KEY[at].1)
 }
 
+/// Every entry of the tables, the two-character ones first: the fold, and the characters that
+/// fold to it. One definition, so a class and a literal read the same set.
+fn all_folds() -> impl Iterator<Item = (&'static [char], &'static [char])> {
+    FOLDS2
+        .iter()
+        .map(|(fold, unfolds)| (&fold[..], *unfolds))
+        .chain(FOLDS3.iter().map(|(fold, unfolds)| (&fold[..], *unfolds)))
+}
+
 /// Every spelling of the characters `fold`: each character in each of its cases.
 fn spell(fold: &[char]) -> String {
     fold.iter().map(|c| format!("(?i:{c})")).collect()
@@ -484,11 +489,7 @@ fn fold_at(chars: &[char]) -> Option<Fold> {
     // A character that itself folds to several: itself, the others that fold the same way, then
     // every spelling of the fold.
     let c = chars[0];
-    let entries = FOLDS2
-        .iter()
-        .map(|(fold, unfolds)| (&fold[..], *unfolds))
-        .chain(FOLDS3.iter().map(|(fold, unfolds)| (&fold[..], *unfolds)));
-    for (fold, unfolds) in entries {
+    for (fold, unfolds) in all_folds() {
         if unfolds.contains(&c) {
             return Some(Fold {
                 len: 1,

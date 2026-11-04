@@ -311,3 +311,52 @@ fn a_look_behind_expands_one_character_at_a_time_6225() -> Result<()> {
         ),
     ])
 }
+
+/// `{1}` repeats nothing, in every spelling, so what it held stays in the string; `{0,1}` and `{2}` do repeat.
+#[test]
+fn a_repeat_of_once_does_not_end_a_string_6225() -> Result<()> {
+    check(&[
+        (
+            r#""\u00df" | [match("s{1}+s"; "gi") | [.offset,.length]]"#,
+            r"[[0,1]]",
+        ),
+        (
+            r#""\u00df" | [match("s{1,1}s"; "gi") | [.offset,.length]]"#,
+            r"[[0,1]]",
+        ),
+        (
+            r#""\u00df" | [match("s{1}?s"; "gi") | [.offset,.length]]"#,
+            r"[[0,1]]",
+        ),
+        (
+            r#""\u00df" | [match("ss{1}?"; "gi") | [.offset,.length]]"#,
+            r"[[0,1]]",
+        ),
+        (
+            r#""\u00df" | [match("(?:s){1}s"; "gi") | [.offset,.length]]"#,
+            r"[[0,1]]",
+        ),
+        (
+            r#""\u00df" | [match("s{1}{1}s"; "gi") | [.offset,.length]]"#,
+            r"[[0,1]]",
+        ),
+        (
+            r#""\u00df" | [match("s{0,1}s"; "gi") | [.offset,.length]]"#,
+            r"[]",
+        ),
+        (
+            r#""\u00df" | [match("s{2}"; "gi") | [.offset,.length]]"#,
+            r"[]",
+        ),
+    ])
+}
+
+/// `succinctly yq` reads Go's `regexp`, which folds one character to one: the rewrite is jq's.
+#[test]
+fn yq_mode_keeps_the_one_to_one_fold_6225() -> Result<()> {
+    let output = std::process::Command::new(crate::succinctly_bin())
+        .args(["yq", "-n", r#""SS" | test("(?i)ß")"#])
+        .output()?;
+    assert_eq!(String::from_utf8(output.stdout)?.trim_end(), "false");
+    Ok(())
+}
