@@ -652,10 +652,7 @@ mod tests {
                 assert!(may_need_rewrite(&pattern), "{pattern}");
             }
         }
-        assert!(
-            changed > 500,
-            "the grammar reaches the rewrite ({changed})"
-        );
+        assert!(changed > 500, "the grammar reaches the rewrite ({changed})");
         assert!(!may_need_rewrite("(?:a|b)+"));
         assert!(!may_need_rewrite("(?:ab)*c"));
     }
