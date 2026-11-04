@@ -7533,11 +7533,13 @@ fn get_inputs(
 /// raises a fault it reads as an error, and its main loop prints one it pops as ignored and reads
 /// on, so the records after a fault pair with the main loop as they do in jq. `-s` reads the whole
 /// stream before the program runs, warning as it goes. Only a `--seq` stream read as JSON texts
-/// has the reader: `-R` and `--input-dsv` take over from it.
+/// has the reader: `-R` and `--input-dsv` take over from it, and `--stream`/`--stream-errors` read
+/// it with the streaming parser instead ([`seq_by_stream_reader`]).
 fn seq_faults_queued(args: &JqCommand, track_eof: bool) -> bool {
     args.seq
         && !args.raw_input
         && args.input_dsv.is_none()
+        && !seq_by_stream_reader(args)
         && (args.null_input || (track_eof && !args.slurp))
 }
 
