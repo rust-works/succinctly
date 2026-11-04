@@ -9307,6 +9307,16 @@ fn write_yaml_block_field_key_checked<W: AsRef<[u64]>, Out: core::fmt::Write>(
                     let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
                     if let Some(scalar) = go_yaml_single_quoted_line_feed(&decoded, &child_indent) {
                         out.write_str("? ")?;
+                        // The key's own anchor and tag, as `write_yaml_field_key` writes them.
+                        if let Some(anchor) = field.key_cursor().anchor() {
+                            out.write_char('&')?;
+                            out.write_str(anchor)?;
+                            out.write_char(' ')?;
+                        }
+                        if let Some(tag) = field.key_cursor().explicit_tag_at(None) {
+                            out.write_str(tag)?;
+                            out.write_char(' ')?;
+                        }
                         out.write_str(&scalar)?;
                         out.write_char('\n')?;
                         out.write_str(indent)?;
