@@ -6882,3 +6882,12 @@ A line is scanned once it is 64 KiB long even if its end has not arrived, so a l
 A single token is held whole while it is scanned, as go-yaml holds it: a quoted or plain scalar of tens of megabytes on one line, or a block scalar, takes several times its size in memory until it ends.
 
 yq's own colorizer also repeats the line break after a tag that ends its line (`a: !tag` / `  b: 1` prints a blank line between them), and `succinctly yq -C` repeats it as well.
+
+## An `ireduce` loop variable answers a node read only when the read is its first stage ([#6088](https://github.com/rust-works/succinctly/issues/6088))
+
+yq binds `$i` in `SRC as $i ireduce (INIT; UPDATE)` to the node `SRC` selected, so `$i | path`, `$i | key`, `$i | line` and the other node reads answer from where it sits.
+`succinctly yq` binds the element's value, and takes each of those reads before the fold, at the one place the node is still in hand: `SRC | [., READ, ...]` feeds the fold, and the update's `$i | READ` is replaced by what that read answered.
+The reads are `path`, `key`, `parent`, `line`, `column`, `document_index`, `file_index`, `filename`, `tag`, `anchor`, `alias`, `style`, `kind`, `line_comment`, `head_comment` and `foot_comment`, and the answer is yq's for each.
+A read that is not the first stage after `$i` still sees a value: `$i | parent | key` is `[]` where yq prints the parent's key.
+So does a `$i` read inside an update that binds `$i` again, which is a different variable, and a fold whose pattern is not a single `$i` (`as [$a, $b] ireduce`).
+`parent` is read once per element, so it costs the parent's size per step.

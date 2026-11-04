@@ -34,8 +34,9 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::eval::{
-    apply_compare_op, arith_combine, contains_retrying_pattern_bind, try_compare_op, EvalError,
-    EvalSemantics, JqSemantics, YqSemantics,
+    apply_compare_op, arith_combine, contains_retrying_pattern_bind,
+    pattern_alternatives_var_names, try_compare_op, EvalError, EvalSemantics, JqSemantics,
+    YqSemantics,
 };
 use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import,
@@ -45,6 +46,104 @@ use super::expr::{
 };
 use super::value::{parse_i64_or_f64_in, NumberRepr, OwnedValue};
 use super::walk::{any_subexpr, map_subexprs};
+
+/// The builtins that answer from the *node* their input is, which a fold's loop variable loses:
+/// the fold binds the element's value, and a value has no position, comments, style or anchor.
+fn is_node_read(stage: &Expr) -> bool {
+    matches!(
+        stage,
+        Expr::Builtin(
+            Builtin::PathNoArg
+                | Builtin::Key
+                | Builtin::Parent
+                | Builtin::Line
+                | Builtin::Column
+                | Builtin::DocumentIndex
+                | Builtin::FileIndex
+                | Builtin::Filename
+                | Builtin::Tag
+                | Builtin::Anchor
+                | Builtin::Alias
+                | Builtin::Style
+                | Builtin::Kind
+                | Builtin::LineComment
+                | Builtin::HeadComment
+                | Builtin::FootComment
+        )
+    )
+}
+
+/// Whether `expr` binds `name` anew, so a `$name` inside it is not the loop variable.
+fn rebinds_name(expr: &Expr, name: &str) -> bool {
+    any_subexpr(expr, &mut |e| match e {
+        Expr::As { var, .. } => var == name,
+        Expr::AsPattern { patterns, .. }
+        | Expr::Reduce { patterns, .. }
+        | Expr::Foreach { patterns, .. } => pattern_alternatives_var_names(patterns)
+            .iter()
+            .any(|bound| bound == name),
+        Expr::FuncDef { params, .. } => params.iter().any(|p| p.name() == name),
+        _ => false,
+    })
+}
+
+/// `update` with each `$name | READ` (READ a node-reading builtin, [`is_node_read`]) replaced by a
+/// variable of its own, the READ appended to `reads` the first time it is met.
+fn replace_node_reads(update: &Expr, name: &str, reads: &mut Vec<(Builtin, String)>) -> Expr {
+    if let Expr::Pipe(stages) = update {
+        if let [Expr::Var(var), read @ Expr::Builtin(builtin), rest @ ..] = &stages[..] {
+            if var == name && is_node_read(read) {
+                let bound = match reads.iter().find(|(seen, _)| seen == builtin) {
+                    Some((_, bound)) => bound.clone(),
+                    None => {
+                        let bound = format!("{name}\u{1}{}", reads.len());
+                        reads.push((builtin.clone(), bound.clone()));
+                        bound
+                    }
+                };
+                let mut out = vec![Expr::Var(bound)];
+                out.extend(rest.iter().map(|s| replace_node_reads(s, name, reads)));
+                return Expr::pipe(out);
+            }
+        }
+    }
+    map_subexprs(update, &mut |e| replace_node_reads(e, name, reads))
+}
+
+/// yq's `SRC as $v ireduce (INIT; UPDATE)` binds `$v` to the node `SRC` selected, so `$v | path`,
+/// `$v | key`, `$v | line` and the rest answer from where that node sits (#6088). The fold binds the
+/// element's value instead, and `path` of a value is `[]`.
+///
+/// Each such read is taken where the node is still in hand: `SRC | [., READ, ...]` yields the
+/// element and every READ the update makes of it, `$v` is bound to the first and each read to its
+/// own variable, and the update's `$v | READ` becomes that variable. An update with no such read,
+/// a pattern that is not a single `$v`, and an update that binds `$v` again are left as written.
+fn bind_ireduce_node_reads(
+    source: Expr,
+    patterns: Vec<Pattern>,
+    update: Expr,
+) -> (Expr, Vec<Pattern>, Expr) {
+    let [Pattern::Var(name)] = patterns.as_slice() else {
+        return (source, patterns, update);
+    };
+    if rebinds_name(&update, name) {
+        return (source, patterns, update);
+    }
+    let mut reads: Vec<(Builtin, String)> = Vec::new();
+    let replaced = replace_node_reads(&update, name, &mut reads);
+    if reads.is_empty() {
+        return (source, patterns, update);
+    }
+    let mut tuple = vec![Expr::Identity];
+    tuple.extend(reads.iter().map(|(read, _)| Expr::Builtin(read.clone())));
+    let source = Expr::pipe(vec![
+        Expr::Paren(Box::new(source)),
+        Expr::Array(Box::new(Expr::comma(tuple))),
+    ]);
+    let mut vars = vec![Pattern::Var(name.clone())];
+    vars.extend(reads.into_iter().map(|(_, bound)| Pattern::Var(bound)));
+    (source, vec![Pattern::Array(vars)], replaced)
+}
 
 /// Parser mode controls syntax differences between jq and yq.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -10474,6 +10573,7 @@ impl<'a> Parser<'a> {
             let update = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
+            let (expr, patterns, update) = bind_ireduce_node_reads(expr, patterns, update);
             return Ok(Expr::Reduce {
                 input: Box::new(expr),
                 patterns,
