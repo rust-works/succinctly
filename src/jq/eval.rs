@@ -135274,6 +135274,7 @@ mod tests {
         assert_eq!(close("ab", 0), None);
     }
 
+    #[cfg(feature = "regex")]
     #[test]
     fn test_atomize_option_group_steps_through_plain_groups_of_one_group_6187() {
         // The operator `fancy-regex` reports: the last `*`, or the closing brace of an interval.
