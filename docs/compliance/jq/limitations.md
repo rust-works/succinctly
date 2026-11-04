@@ -7648,12 +7648,17 @@ These keep their loop as written, and still match longer than jq where the shape
 - **A body with a flag switch** (`(?i)` inside it): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and `["ba",""]` here.
   The switch reaches every later way of the group, which the rewrite would move out of its reach.
   A flag group (`(?i:b*)`) is rewritten.
-- **A body with syntax only `fancy-regex` reads** (a lookaround, an atomic group, a backreference, `\K`, `\G`, or a comment with a quantifier after it) keeps its loop, which `fancy-regex` then runs itself and mostly as jq does.
+- **A body with syntax only `fancy-regex` reads** (a lookaround, an atomic group, a backreference, `\K`, `\G`, or a comment and a quantifier after a quantifier) keeps its loop, which `fancy-regex` then runs itself and mostly as jq does.
   Over 40,000 generated cases with such syntax in a loop body, 42 were fixed, none broken, and 2,356 differed as before, of three kinds.
   1,648 were `\K` as a bare alternative (`(?:\K|a)+`), a pattern jq refuses and succinctly accepted.
   It is refused here since [#6157](https://github.com/rust-works/succinctly/issues/6157), as `\G` is: `\K` is an assertion to Oniguruma, so a repeated group whose body is a bare `\K` is `target of repeat operator is invalid`.
   A `\K` in a capture, atomic or option group, or beside another node, may repeat, as in jq (`(\K)*`, `(?>\K)*`, `(?:a\K|b)*`).
-  689 are a comment followed by a quantifier, which Oniguruma applies to the item before the comment (`b(?#)*` is `b*`): `"bab" | [match("(?:b(?#)*|a)+"; "g") | .string]` is `["b","","b",""]` in jq and `["bab",""]` here.
+  689 were a comment followed by a quantifier, which Oniguruma applies to the item before the comment (`b(?#)*` is `b*`): `"bab" | [match("(?:b(?#)*|a)+"; "g") | .string]` is `["b","","b",""]` in jq and was `["bab",""]` here.
+  Since [#6128](https://github.com/rust-works/succinctly/issues/6128) a comment that a repeat operator follows, with an item before it, is left out of what the engines read, so `b(?#)*` is `b*` and the loop is rewritten as `(?:b*|a)+` is.
+  A comment right after a quantifier is kept (`b*(?#)*` is `b**` in jq, and leaving the comment out of `b+(?#)?` would read the lazy `b+?`), so `"bab" | [match("(?:b*(?#)*|a)+"; "g") | .string]` is `["b","","b",""]` in jq and `["bab",""]` here.
+  So is a comment before a capture group's quantifier inside a loop, which is the capture-group gap above.
+  Over 29,976 generated cases (loop bodies with a quantified comment, on four strings, with and without `g`), 336 were fixed, none broken, and the 704 that differ all have the comment after a quantifier.
+  `scripts/jq-regex-comment-quantifier-sweep.py SUBJECT BASELINE` regenerates the sweep, and `tests/jq_cli/i6128_comment.rs` pins rows of it.
   19 are scattered over the other constructs.
   A comment with no quantifier after it matches nothing, and its loop is rewritten.
   A loop beside or around such syntax is rewritten since [#6128](https://github.com/rust-works/succinctly/issues/6128): the rewrite reads a pattern the `regex` crate's parser refuses through a copy that writes that syntax plainly at the same offsets (`oniguruma_shadow` in `src/jq/eval.rs`), so `"ba" | match("(?:b*|a)+(?=)")` is jq's `"b"` (it was `"ba"`), and a loop inside a lookaround or atomic group is rewritten too.
