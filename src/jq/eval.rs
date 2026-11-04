@@ -28312,11 +28312,84 @@ fn refuse_unknown_group_option(rest: &[char]) -> Result<(), EvalError> {
     Ok(())
 }
 
+/// How many characters after `(?` open a lookaround or an atomic group, whose body `fancy-regex`
+/// does not scope inline options to: `=`, `!`, `>` (1), `<=`, `<!` (2); 0 for any other group.
+#[cfg(feature = "regex")]
+fn scoped_group_head(flags: &[char]) -> usize {
+    match (flags.first(), flags.get(1)) {
+        (Some('=' | '!' | '>'), _) => 1,
+        (Some('<'), Some('=' | '!')) => 2,
+        _ => 0,
+    }
+}
+
+/// Whether the group body `body` (the text after a group's head, up to and past its `)`) holds an
+/// inline option run `(?i)` or `(?-x)`, in a nested group too. A `)` in a class, and in a `#`
+/// comment where `extended` is on, does not close a group; a `(?x)` inside the body that turns the
+/// comments on is not followed, which only wraps a body that needed no wrapping or misses one.
+#[cfg(feature = "regex")]
+fn holds_inline_option_run(body: &[char], extended: bool) -> bool {
+    let mut depth = 1usize;
+    let mut j = 0;
+    while j < body.len() {
+        match body[j] {
+            '\\' => j += 1,
+            '[' => {
+                // A class: `]` first is a literal, `[:alpha:]` is a POSIX bracket, `\]` is escaped.
+                j += 1;
+                if body.get(j) == Some(&'^') {
+                    j += 1;
+                }
+                if body.get(j) == Some(&']') {
+                    j += 1;
+                }
+                while j < body.len() && body[j] != ']' {
+                    if body[j] == '\\' {
+                        j += 1;
+                    } else if body[j] == '[' && body.get(j + 1) == Some(&':') {
+                        if let Some(n) = body[j + 2..].windows(2).position(|w| w == [':', ']']) {
+                            j += n + 3;
+                        }
+                    }
+                    j += 1;
+                }
+            }
+            '#' if extended => {
+                while j < body.len() && body[j] != '\n' {
+                    j += 1;
+                }
+            }
+            '(' => {
+                if body.get(j + 1) == Some(&'?') {
+                    let run = body[j + 2..]
+                        .iter()
+                        .take_while(|c| matches!(c, 'i' | 'm' | 's' | 'x' | '-'))
+                        .count();
+                    if run > 0 && body.get(j + 2 + run) == Some(&')') {
+                        return true;
+                    }
+                }
+                depth += 1;
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    false
+}
+
 #[cfg(feature = "regex")]
 /// An option run Oniguruma reads and the `regex` crate refuses (#6133): `(?-)`, `(?--i)`,
 /// `(?i-m-s)`, `(?i-:...)`. Oniguruma turns options off from the first `-` on and a later `-` is a
 /// no-op, so `(?i-m-s)` is `i` on and `m`, `s` off. `rest` is the text after `(?`; the result is
-/// `None` for anything the crate reads the same way (at most one `-`, and a letter after it).
+/// `None` for anything the crate reads the same way (at most one `-`, a letter after it, and no
+/// letter named twice: `(?ii)` is `(?i)`, #6183).
 fn single_minus_option_run(rest: &[char]) -> Option<OptionRun> {
     let letters = rest
         .iter()
@@ -28329,10 +28402,7 @@ fn single_minus_option_run(rest: &[char]) -> Option<OptionRun> {
     };
     let run = &rest[..letters];
     let dashes = run.iter().filter(|&&c| c == '-').count();
-    if dashes == 0 || (dashes == 1 && run.last() != Some(&'-')) {
-        return None;
-    }
-    let first = run.iter().position(|&c| c == '-')?;
+    let first = run.iter().position(|&c| c == '-').unwrap_or(run.len());
     // Each letter once, and a letter named on and then off is off: Oniguruma applies the run in
     // order, while the `regex` crate refuses a repeated letter or reads it differently.
     let mut off = String::new();
@@ -28352,6 +28422,11 @@ fn single_minus_option_run(rest: &[char]) -> Option<OptionRun> {
     } else {
         format!("{on}-{off}")
     };
+    // One `-` in the middle and no repeated letter: the crate reads the run as Oniguruma does.
+    let as_written: String = run.iter().collect();
+    if (dashes == 0 || (dashes == 1 && run.last() != Some(&'-'))) && flags == as_written {
+        return None;
+    }
     Some(OptionRun {
         flags,
         x_on: on.contains('x'),
@@ -28462,6 +28537,9 @@ fn translate_posix_brackets_scan(
     // One entry per open group: whether the extended mode is on inside it, from the `x` flag and
     // from inline `(?x)`, `(?x:...)` and `(?-x)` (#5550).
     let mut extended_in = vec![extended];
+    // One entry per open group, in step with `extended_in`: whether the group's body was wrapped in
+    // `(?:...)` here, so its closing `)` needs a second `)` before it (#6183).
+    let mut wrapped = vec![false];
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -28703,6 +28781,7 @@ fn translate_posix_brackets_scan(
                     } else {
                         // `(?flags:...)`: this group only.
                         extended_in.push(on_x);
+                        wrapped.push(false);
                         out.push_str("(?");
                         out.push_str(&run.flags);
                         out.push(':');
@@ -28755,15 +28834,37 @@ fn translate_posix_brackets_scan(
                             continue;
                         }
                         // `(?flags:...)`: this group only.
-                        Some(':') => extended_in.push(inner),
+                        Some(':') => {
+                            extended_in.push(inner);
+                            wrapped.push(false);
+                        }
                         // A lookaround, a named or atomic group: the enclosing mode.
-                        _ => extended_in.push(outer),
+                        _ => {
+                            extended_in.push(outer);
+                            // #6183: an inline `(?i)` in a lookaround or atomic group lasts past its
+                            // `)` in `fancy-regex`; Oniguruma ends it there, as a group does.
+                            let head = scoped_group_head(flags);
+                            let body = &chars[(i + 2 + head).min(chars.len())..];
+                            if head > 0 && holds_inline_option_run(body, outer) {
+                                out.extend(&chars[i..i + 2 + head]);
+                                out.push_str("(?:");
+                                changed = true;
+                                wrapped.push(true);
+                                i += 2 + head;
+                                continue;
+                            }
+                            wrapped.push(false);
+                        }
                     }
                 } else {
                     extended_in.push(outer);
+                    wrapped.push(false);
                 }
             } else if c == ')' && extended_in.len() > 1 {
                 extended_in.pop();
+                if wrapped.pop() == Some(true) {
+                    out.push(')');
+                }
             }
             // #6068: a `{` that does not open `{n}`, `{n,}` or `{n,m}` is the literal brace in
             // Oniguruma (`a{ 1}`, `a{1 }`, `a{1, 2}`, `a{,2}`); the `regex` crate allows blanks
