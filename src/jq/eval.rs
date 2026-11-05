@@ -30297,7 +30297,9 @@ fn raw_byte_token(chars: &[char], at: usize) -> Option<(u32, usize)> {
     })
 }
 
-/// The atom a run of `\xHH` bytes spells inside a class, and the characters it covers (#6240).
+/// The atom a run of `\xHH` bytes spells inside a class, and the characters it covers (#6240). Outside a
+/// class [`rewrite_hex_escape`] reads the same sequences with the same two errors, and a byte that
+/// starts none is refused there where a class holds it as a byte.
 /// Oniguruma reads as many following byte tokens as the first byte's UTF-8 length asks for: `C0`..`DF`
 /// two, `E0`..`EF` three, `F0`..`F4` four, and any other byte (a continuation byte, `F5`..`FF`) stands
 /// alone as a byte that no character starts with. Too few tokens is `too short multibyte code string`
@@ -30374,6 +30376,9 @@ fn class_atoms_range(x: ClassAtom, y: ClassAtom) -> Result<String, EvalError> {
     // the characters that exist), so they are one range. Two ranges that abut across the surrogate
     // gap are what the `regex` crate negates wrongly (`[^\x{BF}-\x{D7FF}\x{E000}-\x{10000}]`
     // matches U+D7FF and U+E000), which is why they are not written as two.
+    debug_assert!(parts
+        .windows(2)
+        .all(|w| w[0].1 + 1 == w[1].0 || (w[0].1 == 0xD7FF && w[1].0 == 0xE000)));
     let (Some(&(lo, _)), Some(&(_, hi))) = (parts.first(), parts.last()) else {
         return Ok(NEVER_MATCHES.to_string());
     };
@@ -30404,6 +30409,12 @@ fn class_member(chars: &[char], at: usize) -> Option<(Option<ClassAtom>, usize)>
         'x' if chars.get(at + 2) == Some(&'{') => {
             let close = chars[at + 3..].iter().position(|&c| c == '}')?;
             let digits: String = chars[at + 3..at + 3 + close].iter().collect();
+            if digits.is_empty()
+                || digits.len() > 8
+                || !digits.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return None;
+            }
             let value = u32::from_str_radix(&digits, 16).ok()?;
             let scalar = char::from_u32(value)?;
             atom(value, scalar.is_ascii(), close + 4)
@@ -30412,6 +30423,27 @@ fn class_member(chars: &[char], at: usize) -> Option<(Option<ClassAtom>, usize)>
             Ok(Some((atom, used))) => Some((Some(atom), used)),
             _ => None,
         },
+        // An octal escape of up to three digits (`\1`, `\101`), the control escapes `\b` and `\cX`, and
+        // `\8`, `\9` as the digit; an octal value of 0x80 or more is not read here.
+        '0'..='7' => {
+            let digits = chars[at + 1..]
+                .iter()
+                .take(3)
+                .take_while(|c| ('0'..='7').contains(c))
+                .count();
+            let value = chars[at + 1..at + 1 + digits]
+                .iter()
+                .fold(0u32, |v, c| v * 8 + c.to_digit(8).unwrap_or(0));
+            (value <= 0x7F).then_some(())?;
+            atom(value, true, 1 + digits)
+        }
+        '8' | '9' => atom(u32::from(next), true, 2),
+        'b' => atom(8, true, 2),
+        'c' => {
+            let x = *chars.get(at + 2)?;
+            ((' '..='~').contains(&x) && x != '\\').then_some(())?;
+            atom(if x == '?' { 0x7F } else { u32::from(x) & 0x9F }, true, 3)
+        }
         'n' => atom(10, true, 2),
         't' => atom(9, true, 2),
         'r' => atom(13, true, 2),
@@ -30477,8 +30509,13 @@ fn rewrite_class_hex_escape(
     if atom.byte && atom.value < 0x80 {
         return Ok(None);
     }
-    // A range that ends here: the start is already out, so only the end is.
-    if let Some(start) = class_range_start(chars, class_from, i) {
+    // A range that ends here: the start is already out, so only the end is. A range end follows its
+    // `-` directly, which keeps a class of many byte runs from being read afresh at each one.
+    if let Some(start) = i
+        .checked_sub(1)
+        .filter(|dash| chars[*dash] == '-')
+        .and_then(|_| class_range_start(chars, class_from, i))
+    {
         if start.value > atom.value {
             return Err(EvalError::new("invalid regex: empty range in char class"));
         }

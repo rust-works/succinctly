@@ -7560,7 +7560,8 @@ Every row was captured from jq 1.7.1.
   A range whose end is a surrogate or past U+10FFFF stops at the nearest character that exists (`[a-\xED\xA0\x80]` is `a` to U+D7FF).
   A `-` after a finished range is a member.
   The errors are the ones outside a class, and `empty range in char class` for a start above its end.
-  Not covered: a negated class under `(?i)` with a byte-to-byte range that reaches above 0x7F (`(?i)[^\x7F-\xF5]` is `1-7E` in jq), and an octal byte at 0x80 or above.
+  Not covered: a negated class of bytes only whose range covers the lead bytes, which jq tests by the first byte alone (`[^\x80-\xFF]` matches no multibyte character in jq, #6246).
+  Also not covered: an octal byte at 0x80 or above, and a range that ends in `\xHH` and is followed by `-\d` (`[\x41-\x42-\d]` is refused, #6244).
   Pinned by `tests/jq_cli/i6240.rs`.
 - **`(*FAIL)` never matches.**
 - **jq's refusals:** an interval with nothing to repeat (`{1}`, `a|{2}`, `(?:{2})`: `target of repeat operator is not specified`), a conditional on a group the pattern lacks (`(?(2)a|b)`: `invalid backref number/name`, and `undefined name <n> reference` for a name), and a group name that is empty or starts with a digit.
