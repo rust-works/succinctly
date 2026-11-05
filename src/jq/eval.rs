@@ -29918,6 +29918,9 @@ fn translate_posix_brackets_scan(
             out.push('\\');
             changed = true;
             at_start = false;
+        } else if c == '-' && !at_start && class_range_is_descending(&chars, class_from, i) {
+            // #6273: the `regex` crate's own text for it differs from jq's.
+            return Err(EvalError::new("invalid regex: empty range in char class"));
         } else if c == '^' && at_start && !caret_taken {
             // The leading `^` keeps the position "first"; a second one is a member (#6193).
             caret_taken = true;
@@ -30882,13 +30885,18 @@ fn pattern_may_set_ignore_case(pattern: &str) -> bool {
     })
 }
 
-/// The atom a range that ends at `chars[at]` started at, reading the class from its `[` at
-/// `chars[class_from]` the way Oniguruma does (#6240): a `-` after a member makes a range with the next
-/// member, one that follows a finished range or a member that is no atom, or ends the class, is a
-/// character of its own. `None` when `at` is no range end, and when the class has a member this does
+/// What the class that opens at `chars[class_from]` holds before `chars[at]`, read left to right the way
+/// Oniguruma does (#6240): the last member that could start a range, and the start of a range that
+/// is open (its `-` read, its end not). A `-` after a member makes a range with the next member; one
+/// that follows a finished range or a member that is no atom, or ends the class, is a character of
+/// its own. `None` when `at` is not where a member starts, and when the class has a member this does
 /// not read.
 #[cfg(feature = "regex")]
-fn class_range_start(chars: &[char], class_from: usize, at: usize) -> Option<ClassAtom> {
+fn class_state_before(
+    chars: &[char],
+    class_from: usize,
+    at: usize,
+) -> Option<(Option<ClassAtom>, Option<ClassAtom>)> {
     let mut j = class_from + 1;
     if chars.get(j) == Some(&'^') {
         j += 1;
@@ -30905,11 +30913,27 @@ fn class_range_start(chars: &[char], class_from: usize, at: usize) -> Option<Cla
         j += used;
         member = if open.take().is_some() { None } else { atom };
     }
-    if j == at {
-        open
-    } else {
-        None
+    (j == at).then_some((member, open))
+}
+
+/// The atom a range that ends at `chars[at]` started at (#6240). `None` when `at` is no range end.
+#[cfg(feature = "regex")]
+fn class_range_start(chars: &[char], class_from: usize, at: usize) -> Option<ClassAtom> {
+    class_state_before(chars, class_from, at)?.1
+}
+
+/// Whether the `-` at `chars[dash]` makes a range whose start is above its end (`[z-a]`), which
+/// Oniguruma refuses as `empty range in char class` (#6273). A range whose start or end is no atom
+/// (`[a-\d]`) has its own refusals and is not judged here.
+#[cfg(feature = "regex")]
+fn class_range_is_descending(chars: &[char], class_from: usize, dash: usize) -> bool {
+    let Some((Some(start), None)) = class_state_before(chars, class_from, dash) else {
+        return false;
+    };
+    if chars.get(dash + 1) == Some(&']') {
+        return false;
     }
+    matches!(class_member(chars, dash + 1), Some((Some(end), _)) if start.value > end.value)
 }
 
 /// `\x` inside a class (#6234, #6240): the short forms, and `\xHH` bytes at 0x80 or above, which
