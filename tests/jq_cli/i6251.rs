@@ -32,6 +32,7 @@ fn a_hex_brace_escape_is_a_code_point_6251() -> Result<()> {
         (r"\x{41}+", "[\"A\"]"),
         (r"(?i)\x{41}", "[\"a\",\"A\"]"),
         (r"\x{41}\o{102}", "[\"AB\"]"),
+        (r"\x{13FFFF}", "[]"),
         (r"\x{10FFFF}", "[]"),
         (r"\x{110000}", "[]"),
         (r"\x{13FFFF}", "[]"),
@@ -61,6 +62,8 @@ fn a_hex_brace_escape_is_a_code_point_6251() -> Result<()> {
 #[test]
 fn a_malformed_hex_brace_escape_is_refused_as_jq_does_6251() -> Result<()> {
     for (pattern, message) in [
+        (r"[a-\x{000000041}]", "too long wide-char value"),
+        (r"[a-\x{1G}]", "invalid code point value"),
         (r"\x{140000}", "invalid code point value"),
         (r"\x{1FFFFF}", "invalid code point value"),
         (r"\x{FFFFFFFF}", "invalid code point value"),

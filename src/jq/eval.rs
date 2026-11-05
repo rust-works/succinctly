@@ -30332,7 +30332,10 @@ fn parse_brace_escape(
     if value > limit {
         return Err(EvalError::new("invalid regex: invalid code point value"));
     }
-    Ok(BraceEscape::Point(value as u32, at + 1 - i))
+    Ok(BraceEscape::Point(
+        u32::try_from(value).unwrap_or(u32::MAX),
+        at + 1 - i,
+    ))
 }
 
 /// [`parse_brace_escape`] for the rewrite. A hex escape that names a character is left to the
