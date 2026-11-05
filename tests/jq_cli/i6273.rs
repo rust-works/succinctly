@@ -74,3 +74,48 @@ fn test_an_ascending_range_or_a_literal_dash_in_a_class_still_matches_6273() -> 
     }
     Ok(())
 }
+
+/// What the check leaves alone keeps its own message: a range with no single character at either end.
+#[test]
+fn test_a_range_with_a_class_at_an_end_keeps_its_own_refusal_6273() -> Result<()> {
+    for (pattern, reason) in [
+        (r"[a-\d]", "char-class value at end of range"),
+        (r"[\d-a]", "unmatched range specifier in char-class"),
+        (r"[[:alpha:]-a]", "unmatched range specifier in char-class"),
+        (r"[a-\p{L}]", "char-class value at end of range"),
+    ] {
+        let (stdout, stderr, status) =
+            run_jq_full(&["-n", "--arg", "p", pattern, r#""a" | test($p)"#], None)?;
+        assert_eq!((stdout.as_str(), status), ("", 5), "{pattern}: {stderr}");
+        assert!(
+            stderr.contains(&format!("invalid regex: {reason}")),
+            "{pattern}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// Every regex builtin refuses it, and a class of thousands of ranges is not read quadratically.
+#[test]
+fn test_every_regex_builtin_refuses_a_descending_range_6273() -> Result<()> {
+    for filter in [
+        r#""a" | sub($p; "x")"#,
+        r#""a" | gsub($p; "x")"#,
+        r#""a" | [scan($p)]"#,
+        r#""a" | [splits($p)]"#,
+        r#""a" | capture($p)"#,
+        r#""a" | [match($p; "g")]"#,
+        r#""a" | test($p; "i")"#,
+    ] {
+        let (stdout, stderr, status) = run_jq_full(&["-n", "--arg", "p", "[z-a]", filter], None)?;
+        assert_eq!((stdout.as_str(), status), ("", 5), "{filter}: {stderr}");
+        assert!(
+            stderr.contains("invalid regex: empty range in char class"),
+            "{filter}: {stderr}"
+        );
+    }
+    let wide = format!("[{}z-a]", "a-b".repeat(20_000));
+    let (_, _, status) = run_jq_full(&["-n", "--arg", "p", &wide, r#""a" | test($p)"#], None)?;
+    assert_eq!(status, 5);
+    Ok(())
+}

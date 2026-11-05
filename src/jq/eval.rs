@@ -30922,11 +30922,20 @@ fn class_range_start(chars: &[char], class_from: usize, at: usize) -> Option<Cla
     class_state_before(chars, class_from, at)?.1
 }
 
+/// How far back into a class [`class_range_is_descending`] reads (#6273).
+#[cfg(feature = "regex")]
+const MAX_CLASS_REREAD: usize = 2048;
+
 /// Whether the `-` at `chars[dash]` makes a range whose start is above its end (`[z-a]`), which
 /// Oniguruma refuses as `empty range in char class` (#6273). A range whose start or end is no atom
 /// (`[a-\d]`) has its own refusals and is not judged here.
 #[cfg(feature = "regex")]
 fn class_range_is_descending(chars: &[char], class_from: usize, dash: usize) -> bool {
+    // The class is read from its start for each `-`: past this many characters it is left to the
+    // `regex` crate, so a class of thousands of ranges is not read quadratically.
+    if dash - class_from > MAX_CLASS_REREAD {
+        return false;
+    }
     let Some((Some(start), None)) = class_state_before(chars, class_from, dash) else {
         return false;
     };
