@@ -4,8 +4,9 @@
 //! (`(?:b*(?#)*|a)+`) matched `"bab"` whole where jq 1.7.1 answers `b`, `""`, `b`, `""`. A greedy `*`, `+` or
 //! `?` that ends the item and is followed, past the comments, by a greedy `*`, `+` or `?` that nothing
 //! quantifies is now the one quantifier with the same language, and the comment is left out. Every row was
-//! captured from jq 1.7.1 (`/usr/bin/jq -n`). Left out: `b*(?#){2}`, a repeat of a repeat by an interval, which
-//! still differs (`docs/compliance/jq/limitations.md`).
+//! captured from jq 1.7.1 (`/usr/bin/jq -n`). Left out, because they still differ (`docs/compliance/jq/limitations.md`):
+//! `b*(?#){2}`, a repeat of a repeat by an interval, a group as the item (`(?:(b)*(?#)*|a)+`) and a lazy second
+//! repeat (`(?:a|b*(?#)*?)+`).
 
 use anyhow::Result;
 
@@ -331,6 +332,19 @@ fn a_repeat_after_a_comment_after_a_quantifier_repeats_the_quantified_item_6303(
             "g",
             "[[0,0,\"\"],[1,0,\"\"],[2,0,\"\"],[3,0,\"\"]]",
         ),
+        // Outside a loop, under a flag, beside other text, and a brace that starts no interval.
+        ("b*(?#)*", "bbb", "g", "[[0,3,\"bbb\"],[3,0,\"\"]]"),
+        ("b+(?#)?", "bbb", "g", "[[0,3,\"bbb\"],[3,0,\"\"]]"),
+        ("b?(?#)+", "bbb", "", "[[0,3,\"bbb\"]]"),
+        (
+            "(?i)(?:B*(?#)*|a)+",
+            "bab",
+            "g",
+            "[[0,1,\"b\"],[1,0,\"\"],[2,1,\"b\"],[3,0,\"\"]]",
+        ),
+        ("(?:b*(?#)*|a)+", "bab", "", "[[0,1,\"b\"]]"),
+        ("a(?:b*(?#)*|c)d", "abbd", "", "[[0,4,\"abbd\"]]"),
+        ("b*(?#)*{x}", "b{x}", "g", "[[0,4,\"b{x}\"]]"),
     ] {
         assert_eq!(
             answer(pattern, input, flags)?,
