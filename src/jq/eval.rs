@@ -33205,7 +33205,7 @@ fn compose_group_copies(
     copied: super::onig_loop::GroupRewrite,
     pattern: &str,
 ) -> Option<super::onig_capture_loop::LoopRewrite> {
-    let (names, copies): (Box<[Option<Box<str>>]>, Vec<Box<[usize]>>) = match base {
+    let (names, copies) = match base {
         Some(base) => (
             base.names.clone(),
             base.copies
@@ -33214,16 +33214,16 @@ fn compose_group_copies(
                     through
                         .iter()
                         .flat_map(|&group| copied.copies.get(group).into_iter().flatten().copied())
-                        .collect()
+                        .collect::<Box<[usize]>>()
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         ),
         None => {
             let names = std_regex(pattern)
                 .ok()?
                 .capture_names()
                 .map(|name| name.map(Box::from))
-                .collect();
+                .collect::<Box<[_]>>();
             (
                 names,
                 copied

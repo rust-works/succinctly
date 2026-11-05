@@ -971,9 +971,9 @@ impl Rewriter<'_> {
                     if let Some(a1) = a1 {
                         before.push(self.concat_text(&[&a1, &next.text])?);
                     }
-                    before.extend(after_empty(&a2)?);
+                    before.extend(after_empty(a2)?);
                     let mut after = Vec::new();
-                    after.extend(after_empty(&b2)?);
+                    after.extend(after_empty(b2)?);
                     if let Some(b1) = b1 {
                         after.push(self.concat_text(&[&b1, &next.text])?);
                     }
