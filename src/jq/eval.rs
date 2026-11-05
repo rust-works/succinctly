@@ -29444,7 +29444,7 @@ fn translate_posix_brackets_scan(
             }
             // The braces of `\x{..}`, `\k{..}` and the like belong to the escape: they are not an
             // interval, and the brace scan below must not see them.
-            if matches!(chars.get(i + 1), Some('x' | 'k' | 'g' | 'N'))
+            if matches!(chars.get(i + 1), Some('x' | 'k' | 'g' | 'N' | 'o'))
                 && chars.get(i + 2) == Some(&'{')
             {
                 let end = chars[i + 3..]
@@ -30198,6 +30198,8 @@ fn rewrite_onig_escape(
         'g' if !matches!(after, Some('<' | '\'' | '0'..='9' | '-' | '+')) => literal(next),
         'k' if !matches!(after, Some('<' | '\'')) => literal(next),
         'o' | 'p' | 'P' if after != Some('{') && after != Some('^') => literal(next),
+        // #6248: `\o{ddd}`, an octal code point.
+        'o' if after == Some('{') => octal_brace_escape(chars, i, in_class),
         'N' if !in_class => Ok(Some(("[^\\n]".to_string(), 2))),
         // #6220: the extended grapheme cluster, which the `regex` crate has no escape for.
         'X' if !in_class => Ok(Some((GRAPHEME_CLUSTER.to_string(), 2))),
@@ -30265,6 +30267,68 @@ fn rewrite_onig_escape(
         'x' => rewrite_class_hex_escape(chars, i, class_from),
         _ => Ok(None),
     }
+}
+
+/// `\o{ddd}`, an octal code point in braces (#6248), in a class or outside one.
+///
+/// Every row was captured from jq 1.7.1 (Oniguruma 6.9.8). Up to eleven octal digits are read; a value
+/// past 32 bits is `too big number`, and a decimal digit after the digits (`\o{8}`, a twelfth digit)
+/// is `too long wide-char value`. With at least one digit and a closing brace the escape is that code
+/// point, which the engine refuses as `invalid code point value` from U+140000 outside a class and
+/// from U+200000 inside one, and which matches nothing when it is a surrogate or past U+10FFFF
+/// (`\x{D800}`, `\o{4200000}`: no error), except as an end of a range in a class, which is left to the
+/// crate's refusal. With at least one digit and no brace the escape is `invalid code point value`
+/// (`\o{101`, `\o{1x}`). With no digit it is the letter `o`, and the brace after it is read as it
+/// would be after any letter (`\o{ 1}`, `\o{}`).
+#[cfg(feature = "regex")]
+fn octal_brace_escape(
+    chars: &[char],
+    i: usize,
+    in_class: bool,
+) -> Result<Option<(String, usize)>, EvalError> {
+    let mut at = i + 3;
+    let mut value: u64 = 0;
+    let mut digits = 0;
+    while digits < 11 {
+        let Some(digit) = chars.get(at).and_then(|c| c.to_digit(8)) else {
+            break;
+        };
+        value = value * 8 + u64::from(digit);
+        digits += 1;
+        at += 1;
+    }
+    if value > u64::from(u32::MAX) {
+        return Err(EvalError::new("invalid regex: too big number"));
+    }
+    if chars.get(at).is_some_and(char::is_ascii_digit) {
+        return Err(EvalError::new("invalid regex: too long wide-char value"));
+    }
+    if digits == 0 {
+        return Ok(Some(("o".to_string(), 2)));
+    }
+    if chars.get(at) != Some(&'}') {
+        return Err(EvalError::new("invalid regex: invalid code point value"));
+    }
+    let limit = if in_class { 0x1F_FFFF } else { 0x13_FFFF };
+    if value > limit {
+        return Err(EvalError::new("invalid regex: invalid code point value"));
+    }
+    let used = at + 1 - i;
+    let text = match u32::try_from(value).ok().and_then(char::from_u32) {
+        Some(c) => regex_char(u32::from(c)),
+        // A surrogate or a value past U+10FFFF names no character the crate can write. As the end
+        // of a range in a class jq clamps the range (`[a-\o{154000}]` runs to U+D7FF), which is
+        // left to the crate's refusal rather than read as an empty set.
+        None if in_class
+            && (chars.get(i.wrapping_sub(1)) == Some(&'-')
+                || (chars.get(i + used) == Some(&'-')
+                    && chars.get(i + used + 1).is_some_and(|c| *c != ']'))) =>
+        {
+            return Ok(None);
+        }
+        None => NEVER_MATCHES.to_string(),
+    };
+    Ok(Some((text, used)))
 }
 
 /// The short forms of `\x`, in a class or outside one (#6070, #6234): Oniguruma reads up to two hex
@@ -31206,7 +31270,7 @@ fn escape_class_range_dashes(
                     out.push(next);
                     i += 2;
                     let braced = chars.get(i) == Some(&'{');
-                    if matches!(next, 'x' | 'p' | 'P' | 'k' | 'g' | 'N') && braced {
+                    if matches!(next, 'x' | 'p' | 'P' | 'k' | 'g' | 'N' | 'o') && braced {
                         let end = chars[i..]
                             .iter()
                             .position(|&c| c == '}')
@@ -31472,8 +31536,10 @@ fn refuse_possessive_quantifier_for(
             }
             // A braced escape (`\x{41}`, `\p{Lu}`, `\k{n}`) is one atom: its digits in braces are not
             // an interval, and a `+` after it is a plain greedy quantifier (#6079).
-            '\\' if matches!(chars.get(i + 1), Some('x' | 'p' | 'P' | 'k' | 'g' | 'N'))
-                && chars.get(i + 2) == Some(&'{') =>
+            '\\' if matches!(
+                chars.get(i + 1),
+                Some('x' | 'p' | 'P' | 'k' | 'g' | 'N' | 'o')
+            ) && chars.get(i + 2) == Some(&'{') =>
             {
                 atom = Some(i);
                 i = chars[i + 3..]
@@ -32993,7 +33059,7 @@ fn prepare_fancy_pattern(pattern: &str) -> Option<String> {
                 out.push_str(END);
             } else {
                 // `\p{L}`, `\x{41}`: the braces are the escape's own, not an interval.
-                if matches!(next, Some('p' | 'P' | 'x')) && chars.get(end) == Some(&'{') {
+                if matches!(next, Some('p' | 'P' | 'x' | 'o')) && chars.get(end) == Some(&'{') {
                     end = chars[end..]
                         .iter()
                         .position(|&c| c == '}')
