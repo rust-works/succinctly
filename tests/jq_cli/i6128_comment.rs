@@ -118,24 +118,25 @@ fn test_a_repeat_after_a_comment_repeats_the_item_before_it_6128() -> Result<()>
     Ok(())
 }
 
-/// A comment after a quantifier is kept, as it always was: `b*(?#)*` is `b**` in jq, and dropping
-/// the comment from `b+(?#)?` would read the lazy `b+?`. These rows pin what is, which differs
-/// from jq inside a loop (`"bab"` whole, where jq answers `b`, `""`, `b`, `""`): an unfixed gap,
-/// recorded in `docs/compliance/jq/limitations.md`.
+/// A comment after a quantifier followed by an interval or a lazy repeat is kept: `b*(?#){2}` is a
+/// repeat of a repeat in jq and `b*(?#)*?` a lazy repeat of `b*`, which the engines read another
+/// way inside a loop (`"bab"` whole, where jq answers `b`, `""`, `b`, `""`). An unfixed gap,
+/// recorded in `docs/compliance/jq/limitations.md`; the greedy `*`, `+` and `?` after a comment
+/// are merged since #6303 (`tests/jq_cli/i6303.rs`).
 #[test]
 fn test_a_comment_after_a_quantifier_is_kept_6128() -> Result<()> {
     for (pattern, input, flags, jq_answer) in [
         (
-            r"(?:b*(?#)*|a)+",
+            r"(?:b*(?#){2}|a)+",
             "bab",
             "g",
             r#"[[0,1,"b"],[1,0,""],[2,1,"b"],[3,0,""]]"#,
         ),
         (
-            r"(?:b+(?#)?|a)+",
+            r"(?:a|b*(?#)*?)+",
             "bab",
             "g",
-            r#"[[0,1,"b"],[1,0,""],[2,1,"b"],[3,0,""]]"#,
+            r#"[[0,0,""],[1,1,"a"],[2,0,""],[3,0,""]]"#,
         ),
     ] {
         let ours = answer(pattern, input, flags)?;

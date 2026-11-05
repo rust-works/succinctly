@@ -7795,10 +7795,11 @@ These keep their loop as written, and still match longer than jq where the shape
   A `\K` in a capture, atomic or option group, or beside another node, may repeat, as in jq (`(\K)*`, `(?>\K)*`, `(?:a\K|b)*`).
   689 were a comment followed by a quantifier, which Oniguruma applies to the item before the comment (`b(?#)*` is `b*`): `"bab" | [match("(?:b(?#)*|a)+"; "g") | .string]` is `["b","","b",""]` in jq and was `["bab",""]` here.
   Since [#6128](https://github.com/rust-works/succinctly/issues/6128) a comment that a repeat operator follows, with an item before it, is left out of what the engines read, so `b(?#)*` is `b*` and the loop is rewritten as `(?:b*|a)+` is.
-  A comment right after a quantifier is kept (`b*(?#)*` is `b**` in jq, and leaving the comment out of `b+(?#)?` would read the lazy `b+?`), so `"bab" | [match("(?:b*(?#)*|a)+"; "g") | .string]` is `["b","","b",""]` in jq and `["bab",""]` here.
-  So is a comment before a capture group's quantifier inside a loop, which is the capture-group gap above.
-  Over 68,970 generated cases (loop bodies with a quantified comment, on five strings, with and without `g`), 588 were fixed and none broken.
-  The 794 that still differ, in 200 patterns, all have the comment after a quantifier or a capture group as the repeated item.
+  A comment right after a quantifier was kept at first (`b*(?#)*` is `b**` in jq, and leaving the comment out of `b+(?#)?` would read the lazy `b+?`), so `"bab" | [match("(?:b*(?#)*|a)+"; "g") | .string]` was `["b","","b",""]` in jq and `["bab",""]` here.
+  Since [#6303](https://github.com/rust-works/succinctly/issues/6303) a greedy `*`, `+` or `?` that ends an item that is not a group and that no other quantifier touches, followed past the comments by a greedy `*`, `+` or `?`, is the one quantifier with the same language (`b*(?#)*`, `b+(?#)?` and `b?(?#)+` are `b*`, `b+(?#)+` is `b+`, `b?(?#)?` is `b?`), and the comment is left out.
+  Over 68,970 generated cases (loop bodies with a quantified comment, on five strings, with and without `g`), #6195 fixed 588 and none broken, and 794 still differed, in 200 patterns, all with the comment after a quantifier or a capture group as the repeated item.
+  #6303 fixed 544 of those 794 and broke none.
+  The 250 that still differ, in 100 patterns, are 36 with a group as the quantified item (`(b)*(?#)*` is `((b)*)*` in jq, and a capture group is the gap above, #6309, #6310), 48 where an interval repeats it (`b*(?#){2}`, `b+(?#){1,2}`), and 16 where a lazy `*?` does (`(?:a|b*(?#)*?)+`).
   `scripts/jq-regex-comment-quantifier-sweep.py SUBJECT BASELINE` regenerates the sweep, and `tests/jq_cli/i6128_comment.rs` pins rows of it.
   19 are scattered over the other constructs.
   A comment with no quantifier after it matches nothing, and its loop is rewritten.

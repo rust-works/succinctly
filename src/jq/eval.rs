@@ -29523,18 +29523,73 @@ fn look_behind_alternatives_differ(pattern: &str) -> bool {
     refused(&ast, &opaque, &behind)
 }
 
+/// The index after the comment `(?#...)` that starts at `start`: a backslash escapes the next
+/// character, `)` included, and an unterminated comment runs to the end (#6128).
+#[cfg(feature = "regex")]
+fn comment_end(chars: &[char], start: usize) -> usize {
+    let mut end = start + 3;
+    while end < chars.len() && chars[end] != ')' {
+        end += if chars[end] == '\\' { 2 } else { 1 };
+    }
+    (end + 1).min(chars.len())
+}
+
+/// The index after the comments `(?#...)`, any number of them, that start at `at` (#6128).
+#[cfg(feature = "regex")]
+fn skip_comments(chars: &[char], mut at: usize) -> usize {
+    while chars.get(at..at + 3) == Some(&['(', '?', '#']) {
+        at = comment_end(chars, at);
+    }
+    at
+}
+
 /// Whether a repetition operator follows the comments that start at `at` (`(?#...)`, any number of
 /// them), as in `b(?#)(?#)*` (#6128).
 #[cfg(feature = "regex")]
-fn repeat_follows_comments(chars: &[char], mut at: usize) -> bool {
-    while chars.get(at..at + 3) == Some(&['(', '?', '#']) {
-        let mut end = at + 3;
-        while end < chars.len() && chars[end] != ')' {
-            end += if chars[end] == '\\' { 2 } else { 1 };
-        }
-        at = (end + 1).min(chars.len());
+fn repeat_follows_comments(chars: &[char], at: usize) -> bool {
+    starts_repetition(chars.get(skip_comments(chars, at)..).unwrap_or(&[]))
+}
+
+/// A greedy `*`, `+` or `?` that ends `out` and is the item's only quantifier (`b*`, not `b*?`,
+/// `b{2}*` or `\\*`), merged with the greedy `*`, `+` or `?` that follows the comments from `at`
+/// on, as the one quantifier with the language of the repeat of a repeat; with the index after the
+/// second one (#6303). `None` unless both are simple and nothing quantifies the second.
+#[cfg(feature = "regex")]
+fn merge_repeat_after_comments(out: &str, chars: &[char], at: usize) -> Option<(char, usize)> {
+    let first = out
+        .chars()
+        .next_back()
+        .filter(|c| matches!(c, '*' | '+' | '?'))?;
+    // The first quantifier must not be escaped (`\\*`).
+    if out.chars().rev().skip(1).take_while(|&c| c == '\\').count() % 2 == 1 {
+        return None;
     }
-    starts_repetition(chars.get(at..).unwrap_or(&[]))
+    // And nothing may quantify the item already: not a quantifier before it (`b*?` is lazy, `b{2}*`
+    // a repeat of a repeat) unless that character is escaped (`\\**`). Nor may the item be a group
+    // (`(b)*(?#)*` is `((b)*)*` in jq, whose captures the merged `(b)*` does not give): the string
+    // cannot say which group it is, so none is merged.
+    let mut before = out.chars().rev().skip(1);
+    if let Some(prev) = before.next() {
+        if prev == ')' {
+            return None;
+        }
+        if matches!(prev, '*' | '+' | '?' | '}')
+            && before.take_while(|&c| c == '\\').count() % 2 == 0
+        {
+            return None;
+        }
+    }
+    let at = skip_comments(chars, at);
+    let second = *chars.get(at).filter(|c| matches!(c, '*' | '+' | '?'))?;
+    if starts_repetition(chars.get(at + 1..).unwrap_or(&[])) {
+        return None;
+    }
+    let merged = match (first, second) {
+        ('+', '+') => '+',
+        ('?', '?') => '?',
+        _ => '*',
+    };
+    Some((merged, at + 1))
 }
 
 /// Whether `out` ends in a quantifier character that is not escaped (`b*`, `b{2}`, not `\\*`) (#6128).
@@ -29640,11 +29695,7 @@ fn translate_posix_brackets_scan(
             }
             if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') {
                 // A backslash escapes the next character, `)` included: `(?#\))` is one comment.
-                let mut end = i + 3;
-                while end < chars.len() && chars[end] != ')' {
-                    end += if chars[end] == '\\' { 2 } else { 1 };
-                }
-                let end = (end + 1).min(chars.len());
+                let end = comment_end(&chars, i);
                 // #6128: a repeat operator after a comment repeats the item before the comment, as
                 // if the comment were not there (`b(?#)*` is `b*`). The `regex` crate and
                 // `fancy-regex` repeat the comment instead, which has no empty way of its own to
@@ -29668,6 +29719,23 @@ fn translate_posix_brackets_scan(
                     && repeat_follows_comments(&chars, end)
                 {
                     changed = true;
+                } else if let Some((merged, next)) =
+                    (check_repetition && i != body_start && !after_pipe)
+                        .then(|| merge_repeat_after_comments(&out, &chars, end))
+                        .flatten()
+                {
+                    // #6303: a quantifier, a comment and a second greedy `*`, `+` or `?` is a repeat
+                    // of the quantified item in jq (`b*(?#)*` is `(?:b*)*`, `b+(?#)?` is `(?:b+)?`,
+                    // not the lazy `b+?`), which is the one quantifier with the same language
+                    // (`b*`), and the comment is not copied.
+                    out.pop();
+                    out.push(merged);
+                    changed = true;
+                    prev_assertion = was_assertion;
+                    prev_pipe = after_pipe;
+                    prev_option_group = was_option;
+                    i = next;
+                    continue;
                 } else {
                     out.extend(&chars[i..end]);
                 }
@@ -111185,6 +111253,68 @@ fn eval_func_call<'a, W: Clone + AsRef<[u64]>>(
 
 #[cfg(test)]
 mod tests {
+
+    /// #6303: the quantifier that stands for a greedy quantifier, a comment and a second greedy
+    /// quantifier, and the cases it leaves to the engines.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_repeat_after_a_comment_after_a_quantifier_merges_greedy_pairs_6303() {
+        let merge = |out: &str, rest: &str| {
+            let chars: Vec<char> = rest.chars().collect();
+            merge_repeat_after_comments(out, &chars, 0)
+        };
+        for (first, second, merged) in [
+            ("*", "*", '*'),
+            ("*", "+", '*'),
+            ("*", "?", '*'),
+            ("+", "*", '*'),
+            ("+", "+", '+'),
+            ("+", "?", '*'),
+            ("?", "*", '*'),
+            ("?", "+", '*'),
+            ("?", "?", '?'),
+        ] {
+            let out = format!("(?:b{first}");
+            assert_eq!(
+                merge(&out, &format!("{second})")),
+                Some((merged, 1)),
+                "{out} {second}"
+            );
+            // Past more comments, too.
+            assert_eq!(
+                merge(&out, &format!("(?#a)(?#b){second})")),
+                Some((merged, 11)),
+                "{out} comments {second}"
+            );
+        }
+        // A lazy or possessive first quantifier, a repeat of a repeat, an interval, an escaped
+        // quantifier, and a second one that something follows are left as they were.
+        for (out, rest) in [
+            ("b*?", "*"),
+            ("b*+", "*"),
+            ("b{2}", "*"),
+            ("b{2}*", "*"),
+            ("b**", "*"),
+            (r"b\*", "*"),
+            ("b", "*"),
+            ("", "*"),
+            ("b*", "{2}"),
+            ("b*", "*?"),
+            ("b*", "*+"),
+            ("b*", "**"),
+            ("b*", "{2,}"),
+            ("(b)*", "*"),
+            ("(?:b|c)*", "*"),
+            ("b*", "b"),
+            ("b*", ""),
+        ] {
+            assert_eq!(merge(out, rest), None, "{out} {rest}");
+        }
+        // An escaped quantifier character before the quantifier is an item, and a brace that
+        // starts no interval is text.
+        assert_eq!(merge(r"b\**", "*"), Some(('*', 1)));
+        assert_eq!(merge("b*", "*{x}"), Some(('*', 1)));
+    }
     use super::*;
     use crate::jq::error::EvalErrorPayload;
     use crate::jq::{parse, parse_with_mode_and_extensions, ParserMode};
