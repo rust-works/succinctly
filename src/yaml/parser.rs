@@ -6378,6 +6378,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // #409) binds via `record_key_anchor` / `record_key_alias` to this
         // already-open key node, rather than `parse_anchor`/`parse_alias`'s
         // "next node opened" semantics binding to the wrong node.
+        let key_start = self.pos;
         self.set_ib();
         self.write_bp_open();
         if !self.parse_flow_key()? {
@@ -6388,8 +6389,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
         self.write_bp_close();
 
+        // #6208: a simple key has no line break between its first character and its `:`
+        // (`[{x⏎}: 1]`, `["x⏎ y": 1]`, `[[a,⏎ b]: 1]`), as in a flow mapping's key; the break
+        // before the `:` (`["x"⏎ : 1]`) is refused below, where only blanks may precede it.
+        let key_end = self.pos;
+
         // Skip whitespace before colon
         self.skip_inline_whitespace();
+
+        if self.peek() == Some(b':')
+            && self.input[key_start..key_end]
+                .iter()
+                .any(|&b| matches!(b, b'\n' | b'\r'))
+        {
+            return Err(self.err_unexpected_char(key_start, "expected ',' or ']' after a key"));
+        }
 
         // Expect and skip colon
         if self.peek() != Some(b':') {
@@ -6995,6 +7009,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
 
             // Parse key
+            let key_start = self.pos;
             self.set_ib();
             self.write_bp_open();
             if explicit {
@@ -7012,6 +7027,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             // Check for colon - if missing, value is implicitly null
             if self.peek() == Some(b':') {
+                // #6208: an implicit key is a simple key, which has no line break between its
+                // first character and its `:` (`{x⏎ y: 1}`, `{x⏎: 1}`, `{"x"⏎ : 1}`, a
+                // multi-line quoted or nested-collection key); yq refuses it as `did not
+                // find expected ',' or '}'`. Without a `:` the same text is a multi-line plain
+                // scalar entry (`{x⏎ y}`), and the explicit `? key` form may span lines.
+                if !explicit
+                    && self.input[key_start..self.pos]
+                        .iter()
+                        .any(|&b| matches!(b, b'\n' | b'\r'))
+                {
+                    return Err(
+                        self.err_unexpected_char(key_start, "expected ',' or '}' after a key")
+                    );
+                }
                 self.advance(); // Skip `:`
                 self.skip_flow_whitespace();
 

@@ -38,11 +38,16 @@
 #               individually triaged.
 
 2SXE      structure         document/block structure differs from spec
+4MUZ/00   structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
+4MUZ/01   structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
+4MUZ/02   structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 5LLU      lax:indentation   indentation not validated — #223
+5MUD      structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 7Z25      structure         bare document after a `...` end marker (`---` / `scalar1` / `...` / `key: value`): valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected <document start>": a document after `...` needs its own `---`) — we follow yq, the same policy as CFD4/FRK4/NKF9 — #5089
 8G76      structure         comment-only stream: spec wants zero documents, succinctly now synthesizes one null document to match real yq's CLI decode loop (`yq '1'` on `# c` answers `1`, not zero) — deliberate #2795 review fidelity choice (ADR-0018), not a regression
 98YD      structure         same shape and reason as 8G76 — #2795 review
 9C9N      lax:indentation   indentation not validated — #223
+9SA2      structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 AVM7      scalars           scalar content/folding differs from spec
 CFD4      structure         empty implicit key in a single-pair flow sequence (`[ : x ]`): valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected node content") — we follow yq, the same policy as FRK4/JEF9/02 — #4558
 CXX2      lax:anchors       anchor/alias rules not validated — #223
@@ -53,17 +58,20 @@ G9HC      lax:indentation   indentation not validated — #223
 GT5M      lax:anchors       anchor/alias rules not validated — #223
 H7J7      lax:anchors       anchored key's value on the next line, unindented relative to the key (`key: &x` / `!!map` at the same column) — read as null per indentation, but the tag's own deferred mapping content is then dropped rather than rejected — #223 (surfaced by #224 the same way as 9HCY)
 JEF9/02   scalars           blank final line with no break — follows yq, which gives "" — #344
+K3WX      structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 L24T/00   scalars           scalar content/folding differs from spec
 L24T/01   scalars           literal block ending the input with a line of spaces and no break: the spec's `b-chomped-last` counts the end of input as a break (`"x\n \n"`), real yq gives `"x\n "` — we follow yq, the same policy as JEF9/02 — #4959
 M7A3      structure         bare document / `...` end-marker mis-parsed (both paths agree)
 MUS6/01   lax:documents     directive/document rules not validated — #223
+NJ66      structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 NKF9      structure         an empty key in a flow mapping (`{ : empty key }`): valid YAML 1.2, rejected by real yq (a key cannot open with `:`) — we follow yq — #4558
 QLJ7      lax:documents     directive/document rules not validated — #223
 S4JQ      tags              non-specific tag (`!` alone) resolution: spec's "conventional resolution" forces `!!str`, but real yq v4.53.3 leaves the content's natural type untouched (`! 12` stays the number 12) — we follow yq, the same policy as FRK4/JEF9/02 — #224
 S98Z      lax:block-scalar  block scalar header not validated — #223
 U99R      lax:tags          tag containing a disallowed flow indicator (`!!str,`) absorbed as text (block context has no special meaning for `,`) rather than rejected — #224
 UGM3      structure         document/block structure differs from spec
-VJP3/00   lax:flow          flow syntax not validated — #223
+UT92      structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
+VJP3/01   structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 W4TN      scalars           scalar content/folding differs from spec
 W5VH      structure         document/block structure differs from spec
 W9L4      lax:block-scalar  block scalar header not validated — #223
