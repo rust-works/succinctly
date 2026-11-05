@@ -69,26 +69,61 @@ fn test_a_lazy_counted_repeat_ends_at_its_empty_way_6128() -> Result<()> {
     Ok(())
 }
 
-/// The shape the rewrite still gets wrong, pinned so that a change to it is seen. An unbounded
-/// `{n,}?` (n of 2 or more) over a body with a consuming way before its empty one: jq prints
-/// `["b","a","b","a","b"]` for the first row and `["a","b"]` for the second
-/// (`docs/compliance/jq/limitations.md`, #6128).
+/// An unbounded `{n,}?` (n of 2 or more) over a body with a consuming way before its empty one.
+/// Oniguruma writes a repeat out as plain copies of its body when the body's compiled length
+/// times the count is at most ten, and the empty way then does not end the loop: `(?:b?|\w)`
+/// is five operations, so `{2,}?` is plain copies and `{3,}?` is a counted loop that leaves at
+/// the empty way. The rewrite is for the counted loop only. Rows from jq 1.7.1.
 #[test]
-fn test_an_unbounded_lazy_repeat_over_a_leading_consuming_way_still_differs_6128() -> Result<()> {
-    for (filter, ours) in [
+fn test_an_unbounded_lazy_repeat_over_a_leading_consuming_way_is_unrolled_by_size_6128(
+) -> Result<()> {
+    for (filter, expected) in [
+        // Two copies of five operations: unrolled, the plain copies the `regex` crate reads.
         (
             r#""babab" | [match("(?:b?|\\w){2,}?"; "gn") | .string]"#,
-            r#"["b","ab","ab"]"#,
+            r#"["b","a","b","a","b"]"#,
         ),
         (
             r#""ab" | [match("(?:b?|\\w){2,}?"; "gn") | .string]"#,
+            r#"["a","b"]"#,
+        ),
+        (
+            r#""abb" | [match("(?:b?|a){2,}?"; "gn") | .string]"#,
+            r#"["a","bb"]"#,
+        ),
+        (
+            r#""abab" | [match("(?:b?|ab){2,}?"; "gn") | .string]"#,
+            r#"["ab","ab"]"#,
+        ),
+        // Three copies make fifteen: a counted loop, which leaves at the empty way.
+        (
+            r#""abbb" | [match("(?:b?|a){3,}?"; "gn") | .string]"#,
+            r#"["abb","b"]"#,
+        ),
+        (
+            r#""ab" | [match("(?:b?|\\w){4,}?"; "gn") | .string]"#,
             r#"["ab"]"#,
+        ),
+        // A count past the old size limit of the rewrite, over a body that is a Unicode class.
+        (
+            r#""abababab" | [match("(?:b*|\\w){6,}?"; "gn") | .string]"#,
+            r#"["ab","ab","ab","ab"]"#,
+        ),
+        // Under an ignore-case flag a letter that starts no fold is still one operation.
+        (
+            r#""ab" | [match("(?i)(?:b?|.){2,}?"; "gn") | .string]"#,
+            r#"["a","b"]"#,
+        ),
+        // Without `n` the two forms agree.
+        (
+            r#""abb" | [match("(?:b?|\\w){2,}?"; "g") | .string]"#,
+            r#"["","bb",""]"#,
         ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!(
             (stdout.trim_end(), code),
-            (ours, 0),
+            (expected, 0),
             "{filter}: stderr {stderr}"
         );
     }

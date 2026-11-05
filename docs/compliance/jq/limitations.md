@@ -7737,12 +7737,16 @@ These keep their loop as written, and still match longer than jq where the shape
   A loop beside or around such syntax is rewritten since [#6128](https://github.com/rust-works/succinctly/issues/6128): the rewrite reads a pattern the `regex` crate's parser refuses through a copy that writes that syntax plainly at the same offsets (`oniguruma_shadow` in `src/jq/eval.rs`), so `"ba" | match("(?:b*|a)+(?=)")` is jq's `"b"` (it was `"ba"`), and a loop inside a lookaround or atomic group is rewritten too.
   Over 30,000 generated cases with such syntax beside or around a loop, 235 were fixed, none broken, and 4 differ as before: a loop inside a lookahead followed by `.+` or `.*` (`"aaac" | match("(?=(?:[bc]*c??|){2,}c).+")`), where jq finds no match at all although the lookahead holds at offset 3.
   A pattern with a conditional (`(?(1)...)`) is read as before.
-- **An unbounded lazy repeat that must run twice or more, over a body with a consuming way before its empty one** (`{n,}?`, n of 2 or more; the `b` of `b?` in `(?:b?|\\w)`): `"ab" | [match("(?:b?|\\w){2,}?"; "gn") | .string]` is `["a","b"]` in jq and `["ab"]` here, although the repeat is rewritten.
+- **An unbounded lazy repeat with a large count, over a body with a consuming way before its empty one** (`{n,}?`, n of 7 or more, or fewer over a longer body; the `b` of `b?` in `(?:b?|\\w)`): `"ab" | [match("(?:b*||\\w){8,}?"; "gn") | .string]` is `["ab"]` in jq and `["a","b"]` here.
+  Oniguruma writes `X{n,}?` out as `n` plain copies of `X` when the body's compiled length times `n` is at most ten, so `(?:b?|\\w){2,}?` leaves its loop at no empty way, and the `regex` crate reads it the same way; since [#6128](https://github.com/rust-works/succinctly/issues/6128) such a repeat keeps its text (`"ab" | [match("(?:b?|\\w){2,}?"; "gn") | .string]` is `["a","b"]` in both).
+  A longer body (`(?:b?|\\w){3,}?` and up) is a counted loop that leaves at the body's empty way even before its minimum, and is rewritten copy by copy.
+  Each count doubles the copies, so the rewrite is given up past about six copies of a body of a few operations, and the repeat keeps the plain copies' answer.
+  The operation count is worked out for literals, classes, `.`, alternations, groups and `?`, `*`, `+` and counted repeats; a capture group, an assertion, a flag switch, a lookaround or atomic group, or a body under an `i` flag that holds a letter that starts a multi-character fold or a bracketed class is counted as long, so those keep the rewrite.
   Pinned by `tests/jq_cli/i6128.rs`.
   The same repeat with an upper bound (`{2,3}?`) and one whose body has no consuming way before its empty one are rewritten ([#6128](https://github.com/rust-works/succinctly/issues/6128)): `"bab" | [match("(?:(?:b|c)||[ab]){2,3}?"; "gn") | .string]` is `["b","ab"]`, as in jq.
   A lazy repeat that runs once at most (`*?`, `+?`, `??`, `{1,3}?`) already agrees with jq.
 - **The `l` flag:** the longest match's span does not depend on the order the ways are tried in, and `fancy-regex`'s longest mode refuses the lazy repeat the rewrite writes.
-- **A pattern whose rewrite would grow past sixteen times its length and a kilobyte** (nested loops copy their bodies), or past the `regex` crate's size or nesting limit.
+- **A pattern whose rewrite would grow past sixteen times its length and a kilobyte, or 32 KiB if that is more** (nested loops copy their bodies), or past the `regex` crate's size or nesting limit.
 
 ## An alternation's branches share a prefix that can match more than one way (#6134)
 
