@@ -8159,6 +8159,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 reason: "unterminated verbatim tag (missing closing '>')",
             });
         }
+        // #6298: a verbatim tag (`!<...>`) ends at its `>`, and yq's scanner wants whitespace, a
+        // line break or the end of the input right after it (`a: !<tag:x>x`, `!<tag:x>"q"`,
+        // `!<tag:x>#c`: `did not find expected whitespace or line break`).
+        if self.input.get(start + 1) == Some(&b'<')
+            && !matches!(
+                self.input.get(end),
+                None | Some(b' ' | b'\t' | b'\n' | b'\r')
+            )
+        {
+            return Err(YamlError::InvalidTag {
+                offset: end,
+                reason: "a verbatim tag must be followed by whitespace or a line break",
+            });
+        }
         // #6293: a tag runs to the next space, and a flow indicator right after it is part of that
         // run for yq's scanner, which then refuses the character (`[!!str]`, `{a: !!str}`,
         // `[!!str, 1]`, `a: !!str]`: `found character ']' that is not allowed in a YAML tag`). The
