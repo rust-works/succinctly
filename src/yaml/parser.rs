@@ -8824,6 +8824,49 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         None
     }
 
+    /// Whether a scalar, alias or flow collection that opens a line at `indent` has nothing to
+    /// attach to (#6343): the nearest block mapping or sequence at that indent has no value waiting
+    /// for a node on a line of its own. A mapping value, a key's content and a continuation all
+    /// stand more indented than the key, so a node level with the key (or with the `-` markers) is
+    /// what yq refuses with `while scanning a simple key` (`a: |` / `  x` / `stray`, `k: &a` / `q`,
+    /// `? k` / `q`), where it was dropped or read as a value. A bare `?` does not take it as its
+    /// key's content either (`?` / `q` is refused; only a block sequence may stand level with a
+    /// `?`, YAML test suite 6PBE). The document root is not judged here.
+    ///
+    /// A block scalar header is the content of the entry above it when that entry is a sequence
+    /// item (`- &x` / `|`) or a key still waiting for its value, as yq reads it; after a completed
+    /// mapping entry (`a: |` / `  x` / `|`) it is stray like any other node.
+    fn node_has_no_owner_at_container_indent(&self, indent: usize) -> bool {
+        if self.type_stack.len() <= 1 {
+            return false;
+        }
+        let Some(mut landing) = self.indent_stack.len().checked_sub(1) else {
+            return false;
+        };
+        while landing > 0 && self.indent_stack[landing] > indent {
+            landing -= 1;
+        }
+        let Some(&kind) = self.type_stack.get(landing) else {
+            return false;
+        };
+        if self.indent_stack[landing] != indent
+            || !matches!(kind, NodeType::Mapping | NodeType::Sequence)
+        {
+            return false;
+        }
+        let header = matches!(self.peek(), Some(b'|' | b'>'));
+        !(header && (kind == NodeType::Sequence || self.previous_content_line_defers_its_value()))
+    }
+
+    /// Refuse the node at the cursor when it has no owner at `indent`
+    /// ([`Self::node_has_no_owner_at_container_indent`]).
+    fn reject_node_without_owner(&self, indent: usize) -> Result<(), YamlError> {
+        if self.node_has_no_owner_at_container_indent(indent) {
+            return Err(self.err_stray_line());
+        }
+        Ok(())
+    }
+
     /// The error for a line with nothing to attach to (#5068).
     fn err_stray_line(&self) -> YamlError {
         self.err_unexpected_char(
@@ -9196,6 +9239,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // Flow mapping or sequence at document root
                 // Same ambiguous-gap error as parse_mapping_entry (#901, #959).
                 self.check_mapping_under_mapping_gap(indent, false)?;
+                self.reject_node_without_owner(indent)?;
                 self.close_deeper_indents(indent);
                 self.attach_document_root_node(indent);
                 self.parse_value(indent)?;
@@ -9362,6 +9406,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 } else {
                     // Same ambiguous-gap error as parse_mapping_entry (#901, #959).
                     self.check_mapping_under_mapping_gap(indent, false)?;
+                    self.reject_node_without_owner(indent)?;
                     // Standalone alias value
                     self.close_deeper_indents(indent);
                     self.attach_document_root_node(indent);
@@ -9415,6 +9460,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     if self.line_is_stray_after_a_plain_scalar(ended, indent, true) {
                         return Err(self.err_stray_line());
                     }
+                    self.reject_node_without_owner(indent)?;
                     // Scalar value - either bare document scalar or value in a container
                     self.close_deeper_indents(indent);
                     self.attach_document_root_node(indent);
