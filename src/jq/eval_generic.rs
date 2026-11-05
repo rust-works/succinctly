@@ -25880,9 +25880,24 @@ fn slice_pair_generic<S: EvalSemantics, V: DocumentValue>(
             }
             GenericResult::One(v) => Targets::Borrowed(vec![v]),
             GenericResult::Many(vs) => Targets::Borrowed(vs),
-            GenericResult::OneCursor(c) => Targets::Borrowed(vec![c.value()]),
+            // #6257: the walk of a slice sees no gap in an array with no element (`[,]`, #2594), and
+            // the cursor is gone once the targets are values: the check is made here, as the
+            // literal spelling makes it (#6231).
+            GenericResult::OneCursor(c) => {
+                let v = c.value();
+                if let Some(err) = empty_container_gap_error(&v, Some(&c)) {
+                    escape!(Control::Error(err));
+                }
+                Targets::Borrowed(vec![v])
+            }
             GenericResult::ManyCursor(cs) => {
-                Targets::Borrowed(cs.iter().map(DocumentCursor::value).collect())
+                let vs: Vec<V> = cs.iter().map(DocumentCursor::value).collect();
+                for (v, c) in vs.iter().zip(&cs) {
+                    if let Some(err) = empty_container_gap_error(v, Some(c)) {
+                        escape!(Control::Error(err));
+                    }
+                }
+                Targets::Borrowed(vs)
             }
             // See `eval_index_expr`'s identical arm for the
             // accepted, pre-existing error-swallowing note that
@@ -26272,7 +26287,7 @@ fn slice_one_generic_computed<S: EvalSemantics, V: DocumentValue>(
         Err(_) if optional => return GenericResult::None,
         Err(e) => return GenericResult::Error(e),
     };
-    slice_one_generic::<S, V>(target, s, e, optional, false)
+    slice_one_generic::<S, V>(target, s, e, optional, true)
 }
 
 /// What a fused slice stage answers from the resolved range (#4195).
@@ -26616,6 +26631,11 @@ fn fused_slice_window<S: EvalSemantics, V: DocumentValue>(
         None => literal_bounds,
     };
     let len = crate::jq::array_index::len_checked_memoized(&elements).ok()?;
+    // #6257: the walk above sees no gap in an array with no element (`[,]`, #2594), which the
+    // ordinary route checks and raises; an empty array has nothing to fuse.
+    if len == 0 {
+        return None;
+    }
     let range = SliceBounds::from_literals(start, end).resolve(len);
     Some((elements, range))
 }

@@ -10363,7 +10363,9 @@ The same mechanism as the [#2698](https://github.com/rust-works/succinctly/issue
 A slice with literal bounds (`.[:10]`) took the wildcard bridge for every range but the full one, which materialized the whole array and indexed it again, so it validated every element of an array it kept ten of.
 [#6231](https://github.com/rust-works/succinctly/issues/6231) reads it as the computed spelling `E[S:T]` has been read since [#4287](https://github.com/rust-works/succinctly/issues/4287): the elements of its range, by index, and nothing else decoded.
 What the bridge also checked and this keeps checking is the array's own structure: a missing separator, a stray or trailing comma, a comma in an array with no element and a glued token (`[1 2 3]`, `[1,,2]`, `[1,2,]`, `[,]`) still exit 5 on every partial slice.
-The computed spelling does not: `.[0+0:0+2]` on `[1 2 3]` answers `[1,2]`, an older and separate divergence of its own (its walk's error is swallowed, #4287).
+The computed spelling reads them the same way since [#6257](https://github.com/rust-works/succinctly/issues/6257): `.[0+0:0+2]` on `[1 2 3]`, `[1,,2]`, `[1,2,]` and `[,]` exit 5 as `.[0:2]` does, where it answered `[1,2]`, `[2]` and `[]` before (its walk's error was swallowed, #4287).
+The fused reads (`.[0+0:1] | length`, `| first`, `[k]`) decline an empty array so that this route raises it too.
+A computed index of the same array (`.[0+0]` on `[,]`) still answers `null`.
 What goes unread is the text inside an element the slice drops.
 
 On `["a","bad\x",3,4]`, whose second element has an invalid escape, and which jq 1.7.1 rejects at parse time for every filter:
