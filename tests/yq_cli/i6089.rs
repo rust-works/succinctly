@@ -8,6 +8,13 @@ use crate::run_yq_stdin;
 
 /// (document, filter, extra arguments, expected stdout).
 const ROWS: &[(&str, &str, &[&str], &str)] = &[
+    // A `select` over `key` in the target reaches every matching node (#6206).
+    (
+        "a: {x: 1, y: {x: 2}}\n",
+        r#"(.. | select(key == "x") | key) = "q""#,
+        &[],
+        "a: {q: 1, y: {q: 2}}\n",
+    ),
     (
         "a:\n  x: 3\n  y: 4\n",
         "(.a.x | key) = \"meow\"",
@@ -428,13 +435,6 @@ const GAPS: &[(&str, &str, &str, &str)] = &[
         "(.a.x | key) = (.a.y | tostring)",
         "a:\n  4: 3\n  y: 4\n",
         "a:\n  \"4\": 3\n  y: 4\n",
-    ),
-    // A `select` over `key` in the target resolves to nothing, as it does for any assignment.
-    (
-        "a: {x: 1, y: {x: 2}}\n",
-        r#"(.. | select(key == "x") | key) = "q""#,
-        "a: {x: 1, y: {x: 2}}\n",
-        "a: {q: 1, y: {q: 2}}\n",
     ),
 ];
 
