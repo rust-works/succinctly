@@ -12214,6 +12214,32 @@ behaviours to make. Pinned against jq 1.7.1 on a 2,015-row table
 (`tests/data/jq-literal-17-digit-oracle-2936.tsv`) plus the entry-point matrix in
 `tests/jq_cli_tests.rs` and the two-evaluator rows in `tests/jq_evaluator_parity_tests.rs`.
 
+### A computed integer compares as a double, except where it crosses the reindex bridge or starts a `range` (#6275)
+
+jq compares two number literals exactly (`decNumberCompare`) and any pair that involves a computed number as doubles.
+`jq_numeric_cmp` read a bare `OwnedValue::Int` as a literal, but arithmetic, `length` and the rounding builtins all return a bare `Int`, so a computed integer was compared by its exact decimal digits against a literal that is not its own double.
+A bare `Int` is a computed double now: `(1+1) == 2.00000000000000000001` and `(0+0) == 1e-400` are `true`, as in jq 1.7.1, and `(9007199254740992+0) == 9007199254740993` is `true`.
+Two literals still compare exactly (`2 == 2.00000000000000000001` is `false` in both).
+Past `2^53` the exact `i64` shortcut for two int-bearing operands is kept only for a literal pair, since a bare `Int` there is a double against a literal's 17-digit one.
+
+```console
+$ jq  -nc '(1+1) == 2.00000000000000000001, (0+0) == 1e-400'     # true, true
+$ sjq -nc '(1+1) == 2.00000000000000000001, (0+0) == 1e-400'     # true, true   (false, false before #6275)
+```
+
+Two shapes still read a computed integer as a literal, because the value stops being a bare `Int` on the way to the comparison:
+
+- **The reindex bridge.**
+  A value that crosses it (a multi-output stage, `map(.)`, and the document-input builtins on an array built in the filter) is written as JSON text and read back.
+  A computed `Float` crosses as a bridge-only token that reads back as a bare `Float` (#2902), but a bare `Int` is written as its digits and comes back as a `NumberLiteral`.
+  So `[2.00000000000000000001,(1+1)] | unique` is `[2,2.00000000000000000001]` here and `[2.00000000000000000001]` in jq, and `[1e-400,(0+0)] | sort` is `[0,1E-400]` here and `[1E-400,0]` in jq.
+- **The first value of a `range`.**
+  jq emits `$from` itself, a literal, as the first value and computes the rest.
+  The integer walk pushes a bare `Int` for every value (`range_batch_int`), so the first one is now computed where it used to be right and the others are computed where they used to be literals: `first(range(2;3)) == 2.00000000000000000001` is `true` here and `false` in jq.
+  Keeping the literal would cost an allocation per `range` call (a `NumberLiteral` owns its text).
+
+The other direction is unchanged: the `range` walk past `2^53` stays on its exact `i64` path (see the entry above).
+
 ### A bare trailing decimal point with no exponent (`1.`) reads as the integer (#6052) — divergence closed
 
 Real jq's number reader accepts a bare trailing `.` with nothing after it and reads the integer:

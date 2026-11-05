@@ -5955,10 +5955,11 @@ fn decompose_decimal_literal(text: &str) -> (bool, Vec<u8>, i128) {
 /// 17-digit rounding arithmetic uses ([`jq_literal_int_to_f64`]). `None`
 /// unless both operands are numbers.
 ///
-/// A `NumberLiteral` (either repr) and a bare `Int` are literals (the
-/// invariant [`jq_literal_int_to_f64`] documents); a bare `Float` is
-/// computed. Two literals are ordered by their doubles first and only a
-/// double tie falls through to the digit comparison, so sorting document
+/// A `NumberLiteral` (either repr) is a literal; a bare `Int` or `Float` is
+/// computed (#6275: arithmetic, `length` and the rounding builtins return a
+/// bare `Int`, and jq holds those as doubles). Two literals are ordered by
+/// their doubles first and only a double tie falls through to the digit
+/// comparison, so sorting document
 /// floats pays for text only when two values' doubles coincide (byte-equal
 /// spellings short-circuit). That shortcut is sound only because **both
 /// doubles come from the same monotone rounding** -- jq's 17-digit one
@@ -5974,28 +5975,36 @@ pub(crate) fn jq_numeric_cmp(left: &OwnedValue, right: &OwnedValue) -> Option<co
     use core::cmp::Ordering;
 
     // Two int-bearing operands (bare `Int`, or a `NumberLiteral` carrying an
-    // int repr -- the shape every parsed-JSON integer takes) always end up
-    // at `cmp_literals`'s own `x.cmp(&y)` fast path below regardless of
-    // text or magnitude, so check for that pairing directly rather than
-    // building a `Literal`/`Side` for each operand (and a wasted `as f64`
-    // cast per side) first. This is the hot case: document numbers are
-    // always `NumberLiteral`, so ordinary `sort`/`unique`/`group_by`/
-    // `min`/`max`/`bsearch` over a plain JSON integer array hits it on
-    // every comparison (#2906 code review).
-    fn literal_int(value: &OwnedValue) -> Option<i64> {
+    // int repr -- the shape every parsed-JSON integer takes) compare by
+    // `i64` whenever that agrees with the rule below, without building a
+    // `Literal`/`Side` for each operand (and a wasted `as f64` cast per
+    // side) first. This is the hot case: document numbers are always
+    // `NumberLiteral`, so ordinary `sort`/`unique`/`group_by`/`min`/`max`/
+    // `bsearch` over a plain JSON integer array hits it on every comparison
+    // (#2906 code review). It agrees when both are literals (exact), and
+    // when both magnitudes are within `2^53`, where every `i64` is its own
+    // double and the doubles order as the integers do. A bare `Int` past
+    // `2^53` against anything else is a computed double against a literal's
+    // 17-digit one, which only the general path below orders.
+    fn int_operand(value: &OwnedValue) -> Option<(i64, bool)> {
         match value {
-            OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => Some(*n),
+            OwnedValue::Int(n) => Some((*n, false)),
+            OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => Some((*n, true)),
             _ => None,
         }
     }
-    if let (Some(a), Some(b)) = (literal_int(left), literal_int(right)) {
-        return Some(a.cmp(&b));
+    const EXACT_DOUBLE_LIMIT: u64 = 1 << 53;
+    if let (Some((a, a_literal)), Some((b, b_literal))) = (int_operand(left), int_operand(right)) {
+        if (a_literal && b_literal) || a.unsigned_abs().max(b.unsigned_abs()) <= EXACT_DOUBLE_LIMIT
+        {
+            return Some(a.cmp(&b));
+        }
     }
 
     struct Literal<'a> {
         double: f64,
         int: Option<i64>,
-        text: Option<&'a str>,
+        text: &'a str,
     }
     enum Side<'a> {
         Literal(Literal<'a>),
@@ -6003,20 +6012,20 @@ pub(crate) fn jq_numeric_cmp(left: &OwnedValue, right: &OwnedValue) -> Option<co
     }
     fn side(value: &OwnedValue) -> Option<Side<'_>> {
         Some(match value {
-            OwnedValue::Int(n) => Side::Literal(Literal {
-                double: jq_literal_int_to_f64(*n),
-                int: Some(*n),
-                text: None,
-            }),
+            // A bare `Int` is computed: a program literal (`2`) and a
+            // document number are `NumberLiteral`s (#1035), so the bare one
+            // is what arithmetic, `length`, `floor` and the like return,
+            // and jq holds those as doubles (#6275).
+            OwnedValue::Int(n) => Side::Computed(*n as f64),
             OwnedValue::NumberLiteral(NumberRepr::Int(n), text) => Side::Literal(Literal {
                 double: jq_literal_int_to_f64(*n),
                 int: Some(*n),
-                text: Some(text),
+                text,
             }),
             OwnedValue::NumberLiteral(NumberRepr::Float(f), text) => Side::Literal(Literal {
                 double: *f,
                 int: None,
-                text: Some(text),
+                text,
             }),
             OwnedValue::Float(f) => Side::Computed(*f),
             _ => return None,
@@ -6025,24 +6034,16 @@ pub(crate) fn jq_numeric_cmp(left: &OwnedValue, right: &OwnedValue) -> Option<co
     fn to_double(literal: &Literal<'_>) -> f64 {
         literal.double
     }
-    fn text<'a>(literal: &'a Literal<'a>) -> Cow<'a, str> {
-        match (literal.text, literal.int) {
-            (Some(text), _) => Cow::Borrowed(text),
-            (None, Some(n)) => Cow::Owned(n.to_string()),
-            (None, None) => unreachable!("a literal without text always carries an i64"),
-        }
-    }
     fn cmp_literals(a: &Literal<'_>, b: &Literal<'_>) -> Ordering {
         if let (Some(x), Some(y)) = (a.int, b.int) {
             return x.cmp(&y);
         }
         match cmp_f64(a.double, b.double) {
             Ordering::Equal => {
-                let (a_text, b_text) = (text(a), text(b));
-                if a_text == b_text {
+                if a.text == b.text {
                     Ordering::Equal
                 } else {
-                    cmp_decimal_literals(&a_text, &b_text)
+                    cmp_decimal_literals(a.text, b.text)
                 }
             }
             strict => strict,
@@ -7619,7 +7620,7 @@ mod tests {
         for (a, b, want) in [
             // literal vs computed: widen through the literal rounding
             (lit("869389897822472004"), sum.clone(), Equal),
-            (OwnedValue::Int(869389897822472004), sum.clone(), Equal),
+            (OwnedValue::Int(3), sum.clone(), Less),
             (lit("869389897822472000"), sum.clone(), Equal),
             (lit("869389897822472100"), sum.clone(), Greater),
             (lit("869389897822471936.0"), sum.clone(), Equal),
@@ -7645,10 +7646,45 @@ mod tests {
                 Greater,
             ),
             (lit("869389897822472004"), lit("869389897822472064.0"), Less),
+            // A bare `Int` is computed (#6275): a double against the
+            // literal's digits-rounded double, never the exact digits.
+            (OwnedValue::Int(2), lit("2.00000000000000000001"), Equal),
+            (OwnedValue::Int(2), lit("2.0000000000000004"), Less),
+            (lit("2.00000000000000000001"), OwnedValue::Int(2), Equal),
+            (OwnedValue::Int(0), lit("1e-400"), Equal),
+            (OwnedValue::Int(3), OwnedValue::Float(3.0), Equal),
             (
-                OwnedValue::Int(869389897822472004),
-                lit("869389897822472004.0"),
+                OwnedValue::Int(9007199254740992),
+                lit("9007199254740993"),
                 Equal,
+            ),
+            (
+                OwnedValue::Int(9007199254740992),
+                lit("9007199254740994"),
+                Less,
+            ),
+            (
+                lit("9007199254740993"),
+                OwnedValue::Int(9007199254740992),
+                Equal,
+            ),
+            (
+                OwnedValue::Int(-9007199254740992),
+                lit("-9007199254740993"),
+                Equal,
+            ),
+            // Two bare `Int`s past 2^53 order by their doubles, and a literal
+            // pair past it stays exact.
+            (
+                OwnedValue::Int(9007199254740992),
+                OwnedValue::Int(9007199254740994),
+                Less,
+            ),
+            (lit("9007199254740993"), lit("9007199254740992"), Greater),
+            (
+                lit("9007199254740993"),
+                OwnedValue::Int(9007199254740994),
+                Less,
             ),
             (lit("9007199254740993"), lit("9007199254740992.0"), Greater),
             (lit("1.00000000000000001"), lit("1.0"), Greater),
