@@ -83,13 +83,12 @@ the 76** documents below with zero false positives on the valid corpus (a guardr
 must-fail case as handled if the loader *or* the validator rejects it, which is why the
 Reject figure above is 72/94 rather than 18/94.
 
-The 22 documents the validator does not yet reject (marked `lax:*` in the manifest) need
+The 21 documents the validator does not yet reject (marked `lax:*` in the manifest) need
 deeper structural analysis — cross-line anchor binding, block-scalar content indentation,
 flow multi-line implicit keys, malformed tag syntax — and are tracked in
-[#223](https://github.com/rust-works/succinctly/issues/223) (`lax:tags` under #224, see
-below).
+[#223](https://github.com/rust-works/succinctly/issues/223).
 
-The 22 documents still lax today (neither the loader nor the validator rejects them) break
+The 21 documents still lax today (neither the loader nor the validator rejects them) break
 down as:
 
 | Category           | Cases | What is not checked                                     |
@@ -99,7 +98,6 @@ down as:
 | `lax:flow`         | 3     | Flow collection syntax                                  |
 | `lax:anchors`      | 3     | Anchor and alias rules, incl. an unindented tag target (#224) |
 | `lax:documents`    | 3     | Directive and document-marker placement, incl. a mid-stream `%TAG` (#224) |
-| `lax:tags`         | 1     | Malformed tag syntax (disallowed flow indicators) — #224 |
 | `lax:comments`     | 2     | Comment placement                                       |
 | `lax:block-scalar` | 2     | Block scalar header validity (`\|--` parses)             |
 | `lax:tabs`         | 1     | Tabs where indentation is expected                       |
@@ -117,8 +115,8 @@ mirroring the JSON side's `succinctly json validate` / `sjq --validate`. Validat
 separate pass run before indexing, so the default path pays nothing for it — see
 [`src/yaml/validate.rs`](../../../src/yaml/validate.rs). The 78 cases above were its
 acceptance criteria; it rejects 53 of them today and the default loader rejects 2 more since #4463
-(each `lax:*` line removed from the manifest is a case now rejected; `4JVG`, two anchors on one scalar across lines, left it with #4851), with the 22 harder cases still
-tracked in #223 (`lax:tags` under #224).
+(each `lax:*` line removed from the manifest is a case now rejected; `4JVG`, two anchors on one scalar across lines, left it with #4851), with the 21 harder cases still
+tracked in #223 (`U99R`, a flow indicator right after a tag, left the manifest with #6293).
 
 ### What "accepted" means: the text is kept, not dropped
 
@@ -348,6 +346,12 @@ resolution" for a bare `!` (the non-specific tag, no suffix) forces `!!str`, but
 v4.53.3 leaves the content's natural type untouched (`! 12` stays the number `12`, not
 `"12"`). We follow `yq`, the same policy as [`FRK4`](#frk4-a-divergence-the-ledger-cannot-see)/
 [`JEF9/02`](#jef902-the-one-case-where-we-follow-yq-over-the-suite) below.
+
+A second one is tracked as `tags`/`WZ62` ([#6293](https://github.com/rust-works/succinctly/issues/6293)):
+YAML 1.2 ends a tag at a flow indicator, so `{ foo : !!str, !!str : bar }` is valid and has an empty
+value for `foo`, but real `yq` v4.53.3 takes the `,` as part of the tag and refuses it (`found
+character ',' that is not allowed in a YAML tag`), as it does for `[!!str]`, `{a: !!str}` and
+`a: !!str]`. We follow `yq`; a space first (`[!!str ]`) parses in both.
 
 **Explicit tag introspection**: `YamlCursor::explicit_tag() -> Option<&str>`
 (`src/yaml/light.rs`) returns the literal source tag, distinct from the pre-existing
