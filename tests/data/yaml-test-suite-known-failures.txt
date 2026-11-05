@@ -52,6 +52,7 @@ AVM7      scalars           scalar content/folding differs from spec
 CFD4      structure         empty implicit key in a single-pair flow sequence (`[ : x ]`): valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected node content") — we follow yq, the same policy as FRK4/JEF9/02 — #4558
 CXX2      lax:anchors       anchor/alias rules not validated — #223
 DK3J      scalars           scalar content/folding differs from spec
+DK95/04   structure         a line holding only a tab after `foo: 1` (`foo: 1` / one tab / `bar: 2`): valid YAML 1.2, rejected by real yq v4.53.3 ("found a tab character that violates indentation") — we follow yq, the same policy as FRK4/NKF9 — #6286
 FP8R      scalars           scalar content/folding differs from spec
 FRK4      structure         an entry with an empty key in a flow mapping (`{ ? foo :,\n  : bar }`): valid YAML 1.2, rejected by real yq (a key cannot open with `:`) — we follow yq — #4558
 G9HC      lax:indentation   indentation not validated — #223

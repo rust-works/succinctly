@@ -325,8 +325,16 @@ fn the_loader_never_reports_tab_indentation_for_a_valid_corpus_case() {
     let mut rejected = Vec::new();
     let mut checked = 0usize;
 
+    // Valid per the suite, refused by yq v4.53.3 (`found a tab character that violates indentation`):
+    // `foo: 1` then a line of one tab. Reference fidelity wins (#6286, ADR-0018); the row is listed
+    // in docs/compliance/yaml/limitations.md.
+    const REFUSED_BY_YQ: &[&str] = &["DK95/04"];
+
     for case in &cases {
         if case["fail"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        if REFUSED_BY_YQ.contains(&case["id"].as_str().unwrap_or("")) {
             continue;
         }
         let yaml = case["yaml"].as_str().expect("case has yaml");
