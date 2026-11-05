@@ -10773,9 +10773,10 @@ fn test_yaml_explicit_tag_error_messages_agree_with_type_903() -> Result<()> {
     assert_eq!(code, 1);
     assert!(err.contains("is not an array (it's a !!str)"), "{err}");
 
+    // #6202: `pivot` too, in yq's own wording and with the tag the node reports.
     let (_, err, code) = run_yq_stdin_with_stderr(".a | pivot", input, &[])?;
     assert_eq!(code, 1);
-    assert!(err.contains("expected array, got string"), "{err}");
+    assert!(err.contains("cannot pivot node of type !!str"), "{err}");
 
     let (_, err, code) = run_yq_stdin_with_stderr(".a | shuffle", input, &[])?;
     assert_eq!(code, 1);
