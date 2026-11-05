@@ -25880,8 +25880,21 @@ fn slice_pair_generic<S: EvalSemantics, V: DocumentValue>(
             }
             GenericResult::One(v) => Targets::Borrowed(vec![v]),
             GenericResult::Many(vs) => Targets::Borrowed(vs),
-            GenericResult::OneCursor(c) => Targets::Borrowed(vec![c.value()]),
+            // #6257: the walk of a slice sees no gap in an array with no element (`[,]`, #2594), and
+            // the cursor is gone once the targets are values: the check is made here, as the
+            // literal spelling makes it (#6231).
+            GenericResult::OneCursor(c) => {
+                if let Some(err) = empty_container_gap_error(&c.value(), Some(&c)) {
+                    escape!(Control::Error(err));
+                }
+                Targets::Borrowed(vec![c.value()])
+            }
             GenericResult::ManyCursor(cs) => {
+                for c in &cs {
+                    if let Some(err) = empty_container_gap_error(&c.value(), Some(c)) {
+                        escape!(Control::Error(err));
+                    }
+                }
                 Targets::Borrowed(cs.iter().map(DocumentCursor::value).collect())
             }
             // See `eval_index_expr`'s identical arm for the
@@ -26272,7 +26285,7 @@ fn slice_one_generic_computed<S: EvalSemantics, V: DocumentValue>(
         Err(_) if optional => return GenericResult::None,
         Err(e) => return GenericResult::Error(e),
     };
-    slice_one_generic::<S, V>(target, s, e, optional, false)
+    slice_one_generic::<S, V>(target, s, e, optional, true)
 }
 
 /// What a fused slice stage answers from the resolved range (#4195).
