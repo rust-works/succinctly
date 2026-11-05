@@ -666,8 +666,8 @@ $ printf 'k: !!seq\nj: 1\n' | succinctly yq -o json -I0 .        # {"k":"","j":1
 This answers the empty string for both, as it does for `!!int abc`: the loader absorbs what it cannot read instead of reproducing a Go crash.
 
 Not covered here:
-- `!!bool` compared with a string. yq compares a scalar's text, so an empty `!!bool` equals `""` and `!!bool yes` equals `"yes"`, where this compares the boolean.
-- A value-less tag in a flow collection (`[!!str]`, `{a: !!str}`), which yq refuses and this reads as `[""]`.
+- `!!bool` compared with a string. yq compares a scalar's text, so an empty `!!bool` equals `""` and `!!bool yes` equals `"yes"`, where this compares the boolean ([#6292](https://github.com/rust-works/succinctly/issues/6292)).
+- A value-less tag in a flow collection (`[!!str]`, `{a: !!str}`), which yq refuses and this reads as `[""]` ([#6293](https://github.com/rust-works/succinctly/issues/6293)).
 
 ### Invalid UTF-8 in a `-p json` document — substituted for JSON output and in a YAML-output key; a bad value still differs on the prefix (#1616, #4536)
 
