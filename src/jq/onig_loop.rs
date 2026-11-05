@@ -1042,13 +1042,9 @@ impl Rewriter<'_> {
     /// as the concatenation of those copies, for a loop around this one.
     fn lazy_unrolled(&mut self, body: Piece, min: u32) -> Result<Piece, GiveUp> {
         let text = self.repeat_text(&body.text, min, None, false)?;
-        // #6310: the copies hold the body's groups again.
-        if self.has_groups(&body.text) {
-            return Ok(Piece {
-                text,
-                ways: Ways::Unknown,
-            });
-        }
+        // A body with a capture group is never here: its operation count is not worked out
+        // (`onig_ops`), so `oniguruma_unrolls` does not choose this form, and the copies below
+        // would hold a group twice (#6310).
         let mut copies = alloc::vec![body.clone(); min as usize];
         copies.push(self.repeat(body, 0, None, false)?);
         let ways = self.concat(&copies, true)?.ways;
