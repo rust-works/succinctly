@@ -437,6 +437,16 @@ mod tests {
         );
     }
 
+    /// #6347: a counted repeat of a group that has a group inside it is written only outside another
+    /// repeat (which runs the loop's copies again) and with no flag switch in the group.
+    #[test]
+    fn leaves_a_counted_repeat_of_a_group_with_a_group_inside_in_a_repeat_or_beside_a_switch() {
+        assert_eq!(rewritten("((a)|(?i)b*){2,}"), None);
+        let nested = rewritten("(?:((a)|b*){2,})*").expect("the outer loop is rewritten");
+        assert!(nested.contains("{2,}"), "{nested}");
+        assert!(rewritten("((a)|b*){2,}").is_some_and(|plain| !plain.contains("{2,}")));
+    }
+
     #[test]
     fn leaves_every_other_repeat_alone() {
         // No group, a body that cannot match empty, a lazy repeat, a counted repeat from 2 up over
