@@ -1373,6 +1373,18 @@ pub trait DocumentValue: Sized + Clone {
         None
     }
 
+    /// The `i64` this number token carries if it is the reindex bridge's
+    /// computed-integer token (`crate::json::validate::computed_int_token`,
+    /// #6275), `None` for every other value.
+    ///
+    /// Consulted at the same place as [`bridge_computed_float`](Self::bridge_computed_float),
+    /// for the same reason: the token fails [`as_i64`](Self::as_i64) and decodes
+    /// through [`as_f64`](Self::as_f64), so a materializer that fell through to
+    /// it would hand a computed integer back as a `Float`.
+    fn bridge_computed_int(&self) -> Option<i64> {
+        None
+    }
+
     /// The address of this number token's first byte in the document text,
     /// `None` for anything else and for a reindex bridge token (a computed
     /// value, not a parsed one).

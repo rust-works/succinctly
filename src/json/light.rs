@@ -3293,6 +3293,9 @@ impl<'a> JsonNumber<'a> {
         let bytes = self.raw_bytes();
         crate::jq::OwnedValue::bridge_nonfinite_from_bytes(bytes)
             .or_else(|| crate::json::validate::parse_computed_float_token(bytes))
+            // #6275: a computed integer is the double it names to every reader that has no
+            // integer type of its own; `bridge_computed_int` keeps it an `Int` where one has.
+            .or_else(|| crate::json::validate::parse_computed_int_token(bytes).map(|n| n as f64))
     }
 
     /// The spelling of a document `.inf`/`-.INF`/`.NaN` scalar this span stands for, if it is
@@ -3404,6 +3407,17 @@ impl<'a> JsonNumber<'a> {
             return None;
         }
         crate::json::validate::parse_computed_float_token(self.raw_bytes())
+    }
+
+    /// [`bridge_value`](Self::bridge_value) restricted to the computed-integer
+    /// token (#6275): the `i64` it names, `None` for everything else and for
+    /// everything read outside the bridge.
+    #[inline]
+    pub fn bridge_computed_int(&self) -> Option<i64> {
+        if !self.bridge {
+            return None;
+        }
+        crate::json::validate::parse_computed_int_token(self.raw_bytes())
     }
 
     /// Parse as f64.
@@ -4826,6 +4840,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
     fn bridge_computed_float(&self) -> Option<f64> {
         match self {
             StandardJson::Number(n) => n.bridge_computed_float(),
+            _ => None,
+        }
+    }
+
+    fn bridge_computed_int(&self) -> Option<i64> {
+        match self {
+            StandardJson::Number(n) => n.bridge_computed_int(),
             _ => None,
         }
     }
@@ -10867,6 +10888,77 @@ mod tests {
             let number: StandardJson<'_, Vec<u64>> = StandardJson::Number(n);
             assert_eq!(number.number_literal(), None, "{token}");
         }
+    }
+
+    /// #6275: a computed integer's token is one `Number` span the bridge's index decodes to the
+    /// `i64` it names (`bridge_computed_int`) and to that value as a double (`bridge_value`,
+    /// `as_f64`), while `as_i64` and `number_literal()` refuse it. A document holding the same
+    /// bytes reads none of it, and a float token is no integer.
+    #[test]
+    fn json_number_decodes_the_computed_int_token_6275() {
+        for n in [
+            0i64,
+            1,
+            -1,
+            7,
+            -7,
+            1000,
+            1 << 53,
+            -(1 << 53),
+            i64::MAX,
+            i64::MIN,
+        ] {
+            let token = crate::json::validate::computed_int_token(n);
+            let json = format!("[{token}]");
+            let bytes = json.as_bytes();
+            assert_eq!(nested_number_span(bytes, 1), 1 + token.len());
+            let index = JsonIndex::build_reindex(bytes);
+            let root = index.root(bytes);
+            let StandardJson::Array(mut items) = root.value() else {
+                panic!("expected an array");
+            };
+            let StandardJson::Number(number) = items.next().expect("one element") else {
+                panic!("expected a number");
+            };
+            assert_eq!(number.raw_bytes(), token.as_bytes());
+            assert_eq!(number.bridge_computed_int(), Some(n), "{token}");
+            assert_eq!(number.bridge_computed_float(), None, "{token}");
+            assert_eq!(number.bridge_value(), Some(n as f64), "{token}");
+            assert_eq!(number.as_f64(), Ok(n as f64), "{token}");
+            assert_eq!(number.as_i64(), Err(JsonError::InvalidNumber), "{token}");
+            let value: StandardJson<'_, Vec<u64>> = StandardJson::Number(number);
+            assert_eq!(value.number_literal(), None, "{token}");
+            assert_eq!(
+                DocumentValue::bridge_computed_int(&value),
+                Some(n),
+                "{token}"
+            );
+
+            // The same bytes in a user document are no number at all (#3034).
+            let document = JsonIndex::build(bytes);
+            let root = document.root(bytes);
+            let StandardJson::Array(mut items) = root.value() else {
+                panic!("expected an array");
+            };
+            assert!(
+                !matches!(items.next(), Some(StandardJson::Number(_))),
+                "{token}"
+            );
+        }
+        // A computed float's token is no integer, whatever it spells.
+        let token = crate::json::validate::computed_float_token(2.0);
+        let json = format!("[{token}]");
+        let bytes = json.as_bytes();
+        let index = JsonIndex::build_reindex(bytes);
+        let root = index.root(bytes);
+        let StandardJson::Array(mut items) = root.value() else {
+            panic!("expected an array");
+        };
+        let StandardJson::Number(number) = items.next().expect("one element") else {
+            panic!("expected a number");
+        };
+        assert_eq!(number.bridge_computed_int(), None);
+        assert_eq!(number.bridge_computed_float(), Some(2.0));
     }
 
     /// #2802: the spelling token is one `Number` span the bridge's index decodes to its text

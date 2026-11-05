@@ -19122,6 +19122,7 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             } else if S::TAG == EvalTag::Yq
                 && n.is_bridge()
                 && n.bridge_computed_float().is_none()
+                && n.bridge_computed_int().is_none()
                 && !bridge_integral_float_rendering(n.raw_bytes())
             {
                 // #3604: an owned number written out by the reindex bridge carries the
@@ -126103,7 +126104,9 @@ mod tests {
         assert!(!produces_fresh_value(&expr));
         assert!(eval_owned_pure::<JqSemantics>(&expr, &value, ResultPosition::Fresh).is_none());
 
-        // And this is why: the two disagree on representation.
+        // This used to be why: the two disagreed on representation (the bridge re-baked the
+        // `Int` as a literal). Since #6275 a computed integer crosses as a bare `Int`, so they
+        // agree here, and the gate above is the one that decides.
         let direct = eval_owned_pure::<JqSemantics>(&expr, &value, ResultPosition::Operand)
             .unwrap()
             .unwrap();
@@ -126111,7 +126114,7 @@ mod tests {
             &expr, &value, false,
         ));
         assert_eq!(format!("{direct:?}"), "Int(2)");
-        assert_eq!(bridge, "([NumberLiteral(Int(2), \"2\")], \"ok\")");
+        assert_eq!(bridge, "([Int(2)], \"ok\")");
         // The gate holds: what actually runs is the bridge's answer.
         assert_eq!(
             debug_normalize(eval_owned_input::<Vec<u64>, JqSemantics>(

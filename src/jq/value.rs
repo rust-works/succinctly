@@ -3562,6 +3562,10 @@ impl OwnedValue {
         if let Some(spelling) = n.bridge_spelling() {
             return Self::from_number_literal::<S>(&spelling);
         }
+        // #6275: a computed integer comes back as the bare `Int` it was.
+        if let Some(i) = n.bridge_computed_int() {
+            return Self::Int(i);
+        }
         if let Some(f) = n.bridge_value() {
             return Self::from_bridge_float(f);
         }
@@ -4627,6 +4631,14 @@ impl OwnedValue {
             Self::Null => out.push_str("null"),
             Self::Bool(true) => out.push_str("true"),
             Self::Bool(false) => out.push_str("false"),
+            // #6275: in jq's number model a bare `Int` is a computed double, which the bridge's
+            // reader must not hand back as a literal (a `NumberLiteral` of the same digits
+            // compares exactly where a computed number compares as a double). It crosses as
+            // `computed_int_token` and reads back as a bare `Int`, as a bare `Float` does with
+            // its own token (#2902). Past `2^53` `range`'s exact walk keeps its digits.
+            Self::Int(n) if S::TAG == EvalTag::Jq && n.unsigned_abs() <= 1 << 53 => {
+                crate::json::validate::write_computed_int_token(out, *n);
+            }
             Self::Int(n) => {
                 // Writing into a `String` is infallible.
                 let _ = write!(out, "{n}");
@@ -4744,6 +4756,10 @@ impl OwnedValue {
             // A parsed NaN keeps its instance through the bridge (#3309).
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => nan_instance_token(*f),
             Self::Float(f) if f.is_infinite() => overflow_literal(*f).to_string(),
+            // #6275: a computed integer crosses as its token (see `write_json_for_reindex`).
+            Self::Int(n) if S::TAG == EvalTag::Jq && n.unsigned_abs() <= 1 << 53 => {
+                crate::json::validate::computed_int_token(*n)
+            }
             // The bridge must keep the source literal at every length.
             Self::NumberLiteral(_, literal) => literal.to_string(),
             Self::Array(arr) => {
@@ -5990,6 +6006,13 @@ pub(crate) fn jq_numeric_cmp(left: &OwnedValue, right: &OwnedValue) -> Option<co
     // own double and the doubles order as the integers do. A literal and a
     // bare `Int` past `2^53` is a literal's 17-digit double against a
     // computed one, which only the general path below orders.
+    if let (
+        OwnedValue::NumberLiteral(NumberRepr::Int(a), _),
+        OwnedValue::NumberLiteral(NumberRepr::Int(b), _),
+    ) = (left, right)
+    {
+        return Some(a.cmp(b));
+    }
     fn int_operand(value: &OwnedValue) -> Option<(i64, bool)> {
         match value {
             OwnedValue::Int(n) => Some((*n, false)),
@@ -9034,7 +9057,9 @@ mod tests {
                 OwnedValue::from_number_literal::<YqSemantics>("1.0"),
                 "NumberLiteral(Float(1.0), \"1.0\")",
             ),
-            (OwnedValue::Int(1), "NumberLiteral(Int(1), \"1\")"),
+            // #6275: jq's number model writes a bare `Int` as a computed-integer token and
+            // reads it back bare; yq's has no such token, so it comes back as its digits.
+            (OwnedValue::Int(1), "Int(1)"),
             (OwnedValue::Float(2e16), "Float(2e16)"),
             (
                 OwnedValue::from_number_literal::<YqSemantics>("2e16"),
@@ -9048,7 +9073,11 @@ mod tests {
                 value.to_json_for_reindex::<JqSemantics>().unwrap(),
             ] {
                 let round_tripped = read_as_bridge_text::<YqSemantics>(&json);
-                assert_eq!(format!("{round_tripped:?}"), *want, "{value:?} -> {json}");
+                let want = match (value, json.ends_with("e0e1")) {
+                    (OwnedValue::Int(n), false) => format!("NumberLiteral(Int({n}), \"{n}\")"),
+                    _ => (*want).to_string(),
+                };
+                assert_eq!(format!("{round_tripped:?}"), want, "{value:?} -> {json}");
             }
         }
     }
@@ -10732,8 +10761,8 @@ mod tests {
         let c = OwnedValue::Int(8).reindexed::<JqSemantics>().unwrap();
         assert_eq!(a.root().document_token(), ta);
         assert_ne!(c.root().document_token(), ta);
-        assert_eq!(a.text(), "5");
-        assert_eq!(c.text(), "8");
+        assert_eq!(a.text(), "5e0e1");
+        assert_eq!(c.text(), "8e0e1");
         let _ = tb;
     }
 
