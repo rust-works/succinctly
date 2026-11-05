@@ -2491,6 +2491,35 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// Width of the Unicode line break at `pos` (NEL is two bytes, LS and PS three), or 0. go-yaml
+    /// ends a line at these as at `\n`; the index keeps them as scalar content (#4913).
+    #[inline]
+    fn unicode_break_len_at(&self, pos: usize) -> usize {
+        match self.input.get(pos..) {
+            Some([0xC2, 0x85, ..]) => 2,
+            Some([0xE2, 0x80, 0xA8 | 0xA9, ..]) => 3,
+            _ => 0,
+        }
+    }
+
+    /// A Unicode break inside a flow plain scalar (#6214): the tab rule of #6059 reads the lines after
+    /// it, then the break is passed as the content it stays for the fold (#4913). One definition for
+    /// the three flow scanners.
+    fn pass_unicode_break_in_flow_plain(&mut self) -> Result<(), YamlError> {
+        self.reject_tab_in_flow_plain_continuation(self.pos)?;
+        self.advance_by(self.unicode_break_len_at(self.pos));
+        Ok(())
+    }
+
+    /// Width of the line break at `pos`, ASCII or Unicode, or 0 (#6214).
+    #[inline]
+    fn any_break_len_at(&self, pos: usize) -> usize {
+        match self.input.get(pos) {
+            Some(b'\n' | b'\r') => self.break_len_at(pos).max(1),
+            _ => self.unicode_break_len_at(pos),
+        }
+    }
+
     /// Is the current position at a line break?
     #[inline]
     fn at_break(&self) -> bool {
@@ -7170,6 +7199,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     }
                     self.advance();
                 }
+                // #6214: a Unicode break (NEL, LS, PS) ends a line for go-yaml as `\n` does, so the tab
+                // rule reads the lines after it. It stays content for the fold (#4913).
+                0xC2 | 0xE2 if self.unicode_break_len_at(self.pos) > 0 => {
+                    self.pass_unicode_break_in_flow_plain()?;
+                }
                 b'\n' | b'\r' => {
                     self.reject_tab_in_flow_plain_continuation(self.pos)?;
                     // Multiline key - check if next line continues the key
@@ -7312,6 +7346,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     }
                     self.advance();
                 }
+                // #6214: a Unicode break (NEL, LS, PS) ends a line for go-yaml as `\n` does, so the tab
+                // rule reads the lines after it. It stays content for the fold (#4913).
+                0xC2 | 0xE2 if self.unicode_break_len_at(self.pos) > 0 => {
+                    self.pass_unicode_break_in_flow_plain()?;
+                }
                 b'\n' | b'\r' => {
                     self.reject_tab_in_flow_plain_continuation(self.pos)?;
                     // Multiline value - check if next line continues the value
@@ -7374,10 +7413,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // at. Every other blank line is a break of its own, which checks its successor in turn.
         let mut line = break_pos;
         for _ in 0..2 {
-            if !is_line_break(self.input.get(line).copied().unwrap_or(0)) {
+            let width = self.any_break_len_at(line);
+            if width == 0 {
                 break;
             }
-            let start = line + self.break_len_at(line);
+            let start = line + width;
             let mut at = start;
             while self.input.get(at) == Some(&b' ') {
                 at += 1;
@@ -7458,6 +7498,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     }
                     // Colon not followed by space - include it in the key
                     self.advance();
+                }
+                // #6214: a Unicode break (NEL, LS, PS) ends a line for go-yaml as `\n` does, so the tab
+                // rule reads the lines after it. It stays content for the fold (#4913).
+                0xC2 | 0xE2 if self.unicode_break_len_at(self.pos) > 0 => {
+                    self.pass_unicode_break_in_flow_plain()?;
                 }
                 b'\n' | b'\r' => {
                     self.reject_tab_in_flow_plain_continuation(self.pos)?;
