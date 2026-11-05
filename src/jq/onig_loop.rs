@@ -172,6 +172,30 @@ fn collect_captures(ast: &Ast, out: &mut Vec<Option<String>>) {
     }
 }
 
+/// Whether a loop stands anywhere in `ast`: a repeat that can run its body more than once, over a
+/// body that has a repeat or an alternation of its own. That is what the plain rewrite writes for a
+/// loop with an empty way (`(?:b+)*(?:(a)(?:b+)*)*?`), as does a loop as written.
+fn has_loop(ast: &Ast) -> bool {
+    fn structured(ast: &Ast) -> bool {
+        match ast {
+            Ast::Repetition(_) | Ast::Alternation(_) => true,
+            Ast::Group(group) => structured(&group.ast),
+            Ast::Concat(concat) => concat.asts.iter().any(structured),
+            _ => false,
+        }
+    }
+    match ast {
+        Ast::Repetition(rep) => {
+            (!matches!(bounds(&rep.op.kind).1, Some(0 | 1)) && structured(&rep.ast))
+                || has_loop(&rep.ast)
+        }
+        Ast::Group(group) => has_loop(&group.ast),
+        Ast::Alternation(alt) => alt.asts.iter().any(has_loop),
+        Ast::Concat(concat) => concat.asts.iter().any(has_loop),
+        _ => false,
+    }
+}
+
 /// Whether an assertion or a flag switch stands anywhere in `ast`.
 fn has_assertion_or_flags(ast: &Ast) -> bool {
     match ast {
@@ -205,7 +229,7 @@ pub(crate) fn rewrite(pattern: &str) -> Option<String> {
     if !may_need_rewrite(pattern) {
         return None;
     }
-    rewrite_parsed(pattern, false)
+    rewrite_parsed(pattern, false, "")
 }
 
 /// A pattern [`rewrite_with_groups`] wrote, with how its groups read back into the input's.
@@ -219,13 +243,19 @@ pub(crate) struct GroupRewrite {
     pub(crate) copies: Vec<Vec<usize>>,
     /// How many groups [`pattern`](Self::pattern) has, the whole match included.
     pub(crate) compiled_groups: usize,
+    /// The input pattern's group names, by group (0 is the whole match).
+    pub(crate) names: Vec<Option<Box<str>>>,
 }
 
 /// [`rewrite`] for a pattern whose loops have a capture group where the plain rewrite would copy or
 /// drop it (#6332): the groups are tagged by number, the loops are written as they are without
 /// one, and each group the rewrite copied is read back through [`GroupRewrite::copies`]. `None`
 /// when the pattern has no group, needs no rewrite, or is not one the `regex` crate's parser reads.
-pub(crate) fn rewrite_with_groups(pattern: &str) -> Option<GroupRewrite> {
+pub(crate) fn rewrite_with_groups(input: &str) -> Option<GroupRewrite> {
+    // The flags `i` and `s` of jq put a switch in front of the pattern. It reaches all of it, so it
+    // stays in front and the rest is rewritten, with case folding read from it.
+    let lead_len = leading_switches(input)?;
+    let (lead, pattern) = input.split_at(lead_len);
     if !may_need_rewrite(pattern) || !pattern.contains('(') || pattern.contains(TAG) {
         return None;
     }
@@ -243,13 +273,14 @@ pub(crate) fn rewrite_with_groups(pattern: &str) -> Option<GroupRewrite> {
         at = *end;
     }
     tagged.push_str(&pattern[at..]);
-    let written = rewrite_parsed(&tagged, true)?;
+    let written = rewrite_parsed(&tagged, true, lead)?;
     // Read the tags back: each group of the result is a copy of the group its tag names. The copies
     // share a name, which the parser refuses, so the tags are found by their text.
     let opening = format!("(?<{TAG}");
     let mut copies = vec![Vec::new(); openers.len() + 1];
     copies[0].push(0);
-    let mut pattern = String::with_capacity(written.len());
+    let mut pattern = String::with_capacity(lead.len() + written.len());
+    pattern.push_str(lead);
     let mut rest = written.as_str();
     let mut compiled = 1;
     while let Some(at) = rest.find(&opening) {
@@ -270,11 +301,53 @@ pub(crate) fn rewrite_with_groups(pattern: &str) -> Option<GroupRewrite> {
     if copies.iter().any(Vec::is_empty) || found.len() + 1 != compiled {
         return None;
     }
+    let mut names = Vec::new();
+    capture_names(&ast, &mut names);
+    names.insert(0, None);
     Some(GroupRewrite {
         pattern,
         copies,
         compiled_groups: compiled,
+        names,
     })
+}
+
+/// The length of the flag switches (`(?i)`, `(?s)`, `(?is)`) the pattern starts with, or `None`
+/// when one names `x` or `U`, which change what the rest of the text means.
+fn leading_switches(pattern: &str) -> Option<usize> {
+    let mut at = 0;
+    while pattern[at..].starts_with("(?") {
+        let Some(close) = pattern[at..].find(')') else {
+            break;
+        };
+        let flags = &pattern[at + 2..at + close];
+        if flags.is_empty() || !flags.chars().all(|c| c.is_ascii_alphabetic() || c == '-') {
+            break;
+        }
+        if flags.contains(['x', 'U']) {
+            return None;
+        }
+        at += close + 1;
+    }
+    Some(at)
+}
+
+/// The names of the capture groups of `ast` in the order they open (`None` for an unnamed one).
+fn capture_names(ast: &Ast, out: &mut Vec<Option<Box<str>>>) {
+    match ast {
+        Ast::Group(group) => {
+            match &group.kind {
+                GroupKind::CaptureIndex(_) => out.push(None),
+                GroupKind::CaptureName { name, .. } => out.push(Some(name.name.as_str().into())),
+                GroupKind::NonCapturing(_) => {}
+            }
+            capture_names(&group.ast, out);
+        }
+        Ast::Alternation(alt) => alt.asts.iter().for_each(|a| capture_names(a, out)),
+        Ast::Concat(concat) => concat.asts.iter().for_each(|a| capture_names(a, out)),
+        Ast::Repetition(rep) => capture_names(&rep.ast, out),
+        _ => {}
+    }
 }
 
 /// A class that matches no character: `E`'s stand-in for every character, class and `.` of the body.
@@ -300,7 +373,7 @@ fn capture_openers(ast: &Ast, out: &mut Vec<(usize, usize)>) {
     }
 }
 
-fn rewrite_parsed(pattern: &str, copies: bool) -> Option<String> {
+fn rewrite_parsed(pattern: &str, copies: bool, lead: &str) -> Option<String> {
     // #6128: a pattern with Oniguruma syntax only `fancy-regex` reads (lookaround, a backreference,
     // `\K`) is parsed through a copy that writes that syntax plainly at the same offsets. A pattern
     // the parser reads as written is read as written.
@@ -321,7 +394,7 @@ fn rewrite_parsed(pattern: &str, copies: bool) -> Option<String> {
             .saturating_mul(16)
             .saturating_add(1024)
             .max(32 * 1024),
-        folds: may_fold_case(pattern),
+        folds: may_fold_case(pattern) || may_fold_case(lead),
         shadowed: parsed != pattern,
         work: core::cell::Cell::new(0),
         work_limit: pattern
@@ -632,6 +705,15 @@ impl Rewriter<'_> {
 
                 if !rep.greedy && max.is_none() && self.oniguruma_unrolls(&rep.ast, min) {
                     return self.lazy_unrolled(body, min, grouped);
+                }
+                // #6332: a counted repeat writes its body out as nested copies, and a body that holds
+                // a loop of its own (one the plain rewrite writes first) is not followed through them.
+                let counted = max.is_some_and(|n| n > 1) || (!rep.greedy && min >= 2);
+                if self.copies && grouped && counted && has_loop(&rep.ast) {
+                    return Ok(Piece {
+                        text: self.repeat_text(&body.text, min, max, rep.greedy)?,
+                        ways: Ways::Unknown,
+                    });
                 }
                 if self.copies && grouped {
                     self.exit = Some(self.empty_text(&rep.ast)?);
@@ -1625,6 +1707,20 @@ mod tests {
                 5
             ))
         );
+        // The flags `i` and `s` of jq are a switch in front of the pattern: it stays there, and
+        // case folding is read from it.
+        assert_eq!(
+            copied("(?i)(?:(a)|b*|c)+"),
+            copied("(?:(a)|b*|c)+").map(|(pattern, copies, groups)| (
+                format!("(?i){pattern}"),
+                copies,
+                groups
+            ))
+        );
+        assert_eq!(
+            copied("(?is)(?-i)(?:b*|(a))+").map(|g| g.0.starts_with("(?is)(?-i)")),
+            Some(true)
+        );
         // Nothing to write: no group, no loop that needs it, only a bounded body with no `B`,
         // a flag switch (the empty way of what it reaches is not worked out), or the tag itself.
         for pattern in [
@@ -1632,12 +1728,18 @@ mod tests {
             "(?:b*|a)+",
             "(a)(?:a|b)+",
             "(?:(a)|b*){0,3}",
-            "(?i)(?:b*|(a))+",
+            "(?x)(?:b*|(a))+",
+            "(?U)(?:b*|(a))+",
+            "(?:b*|(a))+(?i)",
             "(?:b*|(a))+__succinctly_g1",
             // A loop inside a repeat that can run it again, which the rewrite does not reach.
             "(?:(?:(a)|b*|c)+)+",
             "(?:(?:(a|b)|(?:|a)){0,3}){2}?",
             "(?:((b|)(|c)){3})+",
+            // A counted repeat over a body with a loop of its own, as written and as the plain
+            // rewrite writes it.
+            "(?:(?:b*|(a))+(a|b)|(?:b*|(a))+){2}",
+            "(?:(?:(?:b+)*(?:(a)(?:b+)*)*?)(a|b)|(?:(?:b+)*(?:(a)(?:b+)*)*?)){2}",
         ] {
             assert_eq!(copied(pattern), None, "{pattern}");
         }
@@ -1895,7 +1997,7 @@ mod tests {
         for _ in 0..20_000 {
             let extended = if roll(4) == 0 { "(?x)" } else { "" };
             let pattern = format!("{extended}{}", generate(4, &mut roll));
-            if rewrite_parsed(&pattern, false).is_some() {
+            if rewrite_parsed(&pattern, false, "").is_some() {
                 changed += 1;
                 assert!(may_need_rewrite(&pattern), "{pattern}");
             }

@@ -27934,9 +27934,9 @@ impl<'h> RegexCaptures<'h> {
                 .iter()
                 .map(|copies| {
                     // The copy the match set last. They run in the order of the text they match, so
-                    // it is the one that starts last, then ends last; a copy numbered later wins a
-                    // tie, as the exit's empty copy over the loop's (#6332: a repeat around the
-                    // copies runs a lower-numbered one again after a higher).
+                    // it is the one that starts last, then ends last; where two cover the same span
+                    // the one numbered later wins, as the exit's empty copy over the loop's (#6332:
+                    // a repeat around the copies runs a lower-numbered one again after a higher).
                     copies
                         .iter()
                         .filter_map(|&i| caps.get(i).map(|m| (m.start(), m.end(), i, m)))
@@ -33114,7 +33114,7 @@ fn build_regex_uncached<S: EvalSemantics>(
         if let Some(copied) = super::onig_loop::rewrite_with_groups(input) {
             if let Ok(re) = regex::Regex::new(&copied.pattern) {
                 if re.captures_len() == copied.compiled_groups {
-                    if let Some(groups) = compose_group_copies(capture.as_ref(), copied, &pattern) {
+                    if let Some(groups) = compose_group_copies(capture.as_ref(), copied) {
                         capture = None;
                         rewritten = Some(RegexEngine::Rewritten { re, groups });
                     }
@@ -33203,13 +33203,12 @@ fn empty_match_is_position_free(pattern: &str) -> bool {
 }
 
 /// The groups of the pattern `copied` was written from, read back from its copies (#6332). When
-/// `base` (the capture rewrite of #6069) wrote that pattern from `pattern`, each of its groups is
-/// read through the copies `base` made of the original's; otherwise `pattern` is the original.
+/// `base` (the capture rewrite of #6069) wrote that pattern, each of its groups is read through the
+/// copies `base` made of the original's; otherwise the pattern is the original.
 #[cfg(feature = "regex")]
 fn compose_group_copies(
     base: Option<&super::onig_capture_loop::LoopRewrite>,
     copied: super::onig_loop::GroupRewrite,
-    pattern: &str,
 ) -> Option<super::onig_capture_loop::LoopRewrite> {
     let (names, copies) = match base {
         Some(base) => (
@@ -33224,21 +33223,14 @@ fn compose_group_copies(
                 })
                 .collect::<Vec<_>>(),
         ),
-        None => {
-            let names = std_regex(pattern)
-                .ok()?
-                .capture_names()
-                .map(|name| name.map(Box::from))
-                .collect::<Box<[_]>>();
-            (
-                names,
-                copied
-                    .copies
-                    .iter()
-                    .map(|group| group.as_slice().into())
-                    .collect(),
-            )
-        }
+        None => (
+            copied.names.clone().into_boxed_slice(),
+            copied
+                .copies
+                .iter()
+                .map(|group| group.as_slice().into())
+                .collect(),
+        ),
     };
     Some(super::onig_capture_loop::LoopRewrite {
         pattern: copied.pattern,

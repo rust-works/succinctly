@@ -118,6 +118,22 @@ fn test_the_builtins_over_a_loop_with_a_group_before_its_empty_way_agree_with_jq
     ])
 }
 
+/// The flags `i` and `p` put a switch in front of the pattern, which the rewrite leaves there.
+#[test]
+fn test_the_flags_that_prefix_a_switch_keep_the_fix_6332() -> Result<()> {
+    assert_rows(&[
+        (
+            r#""ABCA" | [match("(?:(a)|b*|c)+";"gi") | [.string, (.captures|map(.string))]]"#,
+            r#"[["AB",["A"]],["",[""]],["A",["A"]],["",[""]]]"#,
+        ),
+        (
+            r#""abca" | [match("(?:(a)|b*|c)+";"gp") | .string]"#,
+            r#"["ab","","a",""]"#,
+        ),
+        (r#""ABCA" | gsub("(?:(a)|b*|c)+";"X";"gi")"#, r#""XXCXX""#),
+    ])
+}
+
 /// What already agreed keeps agreeing: a counted repeat whose copies Oniguruma writes out, a group
 /// in the first way of a loop with no way after the empty one, and a loop with no group.
 #[test]
@@ -148,6 +164,11 @@ fn test_loops_that_already_agreed_still_do_6332() -> Result<()> {
             "abab",
             r"(?:(?:(a|b)|(?:|a)){0,3}){2}?",
             r#"[[0,"abab",["b"]],[4,"",[""]]]"#,
+        ),
+        (
+            "bab",
+            r"(?:(?:b*|(a))+(a|b)|(?:b*|(a))+){2}",
+            r#"[[0,"bab",[null,"b",null]],[3,"",["","",""]]]"#,
         ),
         (
             "abc",
