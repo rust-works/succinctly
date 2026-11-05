@@ -28880,38 +28880,24 @@ fn number_backreferences(
         let c = chars[i];
         if c == '\\' {
             let next = chars.get(i + 1).copied();
-            if class_depth == 0 {
-                if next == Some('Q') {
-                    let mut end = i + 2;
-                    while end < chars.len()
-                        && !(chars[end] == '\\' && chars.get(end + 1) == Some(&'E'))
-                    {
-                        end += 1;
-                    }
-                    let end = (end + 2).min(chars.len());
-                    out.extend(&chars[i..end]);
-                    i = end;
-                    continue;
-                }
-                if next == Some('k') {
-                    if let Some(&open @ ('<' | '\'')) = chars.get(i + 2) {
-                        let close = if open == '<' { '>' } else { '\'' };
-                        if let Some(n) = chars[i + 3..].iter().position(|&c| c == close) {
-                            let name: String = chars[i + 3..i + 3 + n].iter().collect();
-                            let numbers: Vec<usize> = groups
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, group)| **group == name && !name.is_empty())
-                                .map(|(at, _)| at + 1)
-                                .collect();
-                            if !numbers.is_empty() && shared.contains(&name) {
-                                let ways: Vec<String> =
-                                    numbers.iter().rev().map(|n| format!("\\{n}")).collect();
-                                out.push_str(&format!("(?>{})", ways.join("|")));
-                                changed = true;
-                                i += 3 + n + 1;
-                                continue;
-                            }
+            if class_depth == 0 && next == Some('k') {
+                if let Some(&open @ ('<' | '\'')) = chars.get(i + 2) {
+                    let close = if open == '<' { '>' } else { '\'' };
+                    if let Some(n) = chars[i + 3..].iter().position(|&c| c == close) {
+                        let name: String = chars[i + 3..i + 3 + n].iter().collect();
+                        let numbers: Vec<usize> = groups
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, group)| **group == name && !name.is_empty())
+                            .map(|(at, _)| at + 1)
+                            .collect();
+                        if !numbers.is_empty() && shared.contains(&name) {
+                            let ways: Vec<String> =
+                                numbers.iter().rev().map(|n| format!("\\{n}")).collect();
+                            out.push_str(&format!("(?>{})", ways.join("|")));
+                            changed = true;
+                            i += 3 + n + 1;
+                            continue;
                         }
                     }
                 }
