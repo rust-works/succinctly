@@ -43,6 +43,9 @@ fn an_octal_brace_escape_is_a_code_point_6248() -> Result<()> {
         ),
         (r"\o{154000}", "[]"),
         (r"[\o{7777777}]", "[]"),
+        // The engine's limit outside a class is U+13FFFF, one below the first refusal.
+        (r"\o{4777777}", "[]"),
+        (r"[\o{5000000}]", "[]"),
         (r"\o{ 1}", "[]"),
         (r"\o{x}", "[]"),
         (r"o", "[]"),
@@ -59,6 +62,7 @@ fn an_octal_brace_escape_is_a_code_point_6248() -> Result<()> {
 #[test]
 fn a_malformed_octal_brace_escape_is_refused_as_jq_does_6248() -> Result<()> {
     for (pattern, message) in [
+        (r"\o{5000000}", "invalid code point value"),
         (r"\o{7777777}", "invalid code point value"),
         (r"\o{10000000}", "invalid code point value"),
         (r"\o{17777777777}", "invalid code point value"),
