@@ -10,10 +10,11 @@
 #
 # Categories
 # ----------
-#   tags        Tag *support* landed in #224. One case remains: S4JQ, where the
-#               spec and `yq` disagree on what a bare `!` (non-specific tag)
-#               resolves to and we follow `yq` (same policy as FRK4/JEF9/02
-#               below) — not an absent feature.
+#   tags        Tag *support* landed in #224. Two cases remain, both where the spec
+#               and `yq` disagree and we follow `yq` (same policy as FRK4/JEF9/02
+#               below) — not an absent feature: S4JQ, what a bare `!`
+#               (non-specific tag) resolves to, and WZ62, a flow indicator right
+#               after a tag (#6293).
 #   lax:*       Invalid input that indexing accepts because it does not validate.
 #               This is a property of the default mode, not a defect: succinctly
 #               is a non-validating loader. Rejecting these is the job of the
@@ -22,12 +23,9 @@
 #               must-fail case as handled if the loader OR that validator rejects
 #               it, so the `lax:*` entries that remain here are the cases the
 #               validator does not yet reject (deeper structural analysis). -> #223
-#               `lax:tags` (U99R) is the tag-specific slice of this: a
-#               malformed tag (disallowed characters, a `%TAG`-mid-stream
-#               placement) is absorbed rather than rejected, the same as every
-#               other `lax:*` construct — #224 implemented tag *resolution*,
-#               not tag *validation*, matching the rest of this loader.
-#               (LHL4, the `{}`-flow-indicator variant of this, was moved off
+#               (U99R, a tag containing a flow indicator, left this list when
+#               #6293 made the parser refuse a flow indicator right after a tag
+#               as yq does. LHL4, the `{}`-flow-indicator variant, was moved off
 #               this list by #902's trailing-flow-content validation, which
 #               now incidentally rejects `!invalid{}tag scalar` as "extra
 #               content after the flow mapping's `}`" — not itself a tag
@@ -68,12 +66,12 @@ NKF9      structure         an empty key in a flow mapping (`{ : empty key }`): 
 QLJ7      lax:documents     directive/document rules not validated — #223
 S4JQ      tags              non-specific tag (`!` alone) resolution: spec's "conventional resolution" forces `!!str`, but real yq v4.53.3 leaves the content's natural type untouched (`! 12` stays the number 12) — we follow yq, the same policy as FRK4/JEF9/02 — #224
 S98Z      lax:block-scalar  block scalar header not validated — #223
-U99R      lax:tags          tag containing a disallowed flow indicator (`!!str,`) absorbed as text (block context has no special meaning for `,`) rather than rejected — #224
 UGM3      structure         document/block structure differs from spec
 UT92      structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 VJP3/01   structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 W4TN      scalars           scalar content/folding differs from spec
 W5VH      structure         document/block structure differs from spec
 W9L4      lax:block-scalar  block scalar header not validated — #223
+WZ62      tags              a flow indicator right after a tag (`foo : !!str,`): valid YAML 1.2, where a tag ends at a flow indicator, but rejected by real yq v4.53.3 (`found character ',' that is not allowed in a YAML tag`) — we follow yq, the same policy as S4JQ/FRK4 — #6293
 Y79Y/003  lax:tabs          tab handling not validated — #223
 ZVH3      lax:indentation   indentation not validated — #223

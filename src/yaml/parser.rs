@@ -8159,6 +8159,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 reason: "unterminated verbatim tag (missing closing '>')",
             });
         }
+        // #6293: a tag runs to the next space, and a flow indicator right after it is part of that
+        // run for yq's scanner, which then refuses the character (`[!!str]`, `{a: !!str}`,
+        // `[!!str, 1]`, `a: !!str]`: `found character ']' that is not allowed in a YAML tag`). The
+        // extent stops at the indicator for the lookaheads, which only want to know where the tag
+        // ends; the parse refuses it. A space first (`[!!str ]`) is fine.
+        if matches!(self.input.get(end), Some(b',' | b'[' | b']' | b'{' | b'}')) {
+            return Err(YamlError::InvalidTag {
+                offset: end,
+                reason: "a flow indicator may not follow a tag without a space",
+            });
+        }
         self.pos = end;
         core::str::from_utf8(&self.input[start..end])
             .map(str::to_string)
