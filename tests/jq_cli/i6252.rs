@@ -8,7 +8,7 @@ use anyhow::Result;
 use crate::run_jq_full;
 
 fn matches(subject: &str, pattern: &str, flags: &str) -> Result<(String, i32, String)> {
-    let filter = r#"$s | [match($p; $f) | [.offset, .string]]"#;
+    let filter = r"$s | [match($p; $f) | [.offset, .string]]";
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-nc", "--arg", "s", subject, "--arg", "p", pattern, "--arg", "f", flags, filter,
