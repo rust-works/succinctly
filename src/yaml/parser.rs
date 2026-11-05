@@ -5569,6 +5569,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Skip whitespace/comments after `?`
         self.skip_inline_whitespace();
 
+        // #6325: whether the key content opens with a bare `: ` (`? : x`), before any property
+        // can stand in front of it (`? !!str : x` is an empty key yq reads).
+        let bare_colon_key = self.peek() == Some(b':') && Self::is_ws_break_or_eoi(self.peek_at(1));
+
         // Check for a property before the key
         self.parse_node_properties()?;
 
@@ -5701,6 +5705,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.advance(); // skip `-`
                 self.skip_inline_whitespace();
 
+                // #6325: `? - : x`, the same keyless entry in the key's first item.
+                if self.peek() == Some(b':') && Self::is_ws_break_or_eoi(self.peek_at(1)) {
+                    return Err(self.err_unexpected_char(self.pos, "did not find expected key"));
+                }
+
                 if !self.at_line_end() {
                     // Parse item value
                     if self.looks_like_mapping_entry() {
@@ -5759,6 +5768,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.claim_floated_comment_for_key();
                 self.parse_block_scalar(indent)?;
                 self.reject_line_deeper_than_block_after_block_scalar()?;
+            }
+            _ if bare_colon_key => {
+                // #6325: the compact mapping in the key is an entry with no key and no `?`, which
+                // yq refuses like the keyless `:` of #6288 (`? : x`, `- ? : x`, corpus M2N8/00).
+                return Err(self.err_unexpected_char(self.pos, "did not find expected key"));
             }
             _ if self.looks_like_mapping_entry() => {
                 // `? k: v` — a value indicator on this line means the node after `? `

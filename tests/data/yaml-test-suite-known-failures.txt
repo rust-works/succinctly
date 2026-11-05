@@ -62,6 +62,7 @@ JEF9/02   scalars           blank final line with no break — follows yq, which
 K3WX      structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 L24T/00   scalars           scalar content/folding differs from spec
 L24T/01   scalars           literal block ending the input with a line of spaces and no break: the spec's `b-chomped-last` counts the end of input as a break (`"x\n \n"`), real yq gives `"x\n "` — we follow yq, the same policy as JEF9/02 — #4959
+M2N8/00   structure         a compact entry with an empty key and no `?` before its `:` inside an explicit key (`- ? : x`): valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected key") — we follow yq, as for 2JQS (#6325)
 M7A3      structure         bare document / `...` end-marker mis-parsed (both paths agree)
 MUS6/01   lax:documents     directive/document rules not validated — #223
 NHX8      structure         a block-mapping `:` with no `?` before it (an entry with no key): valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected key") — we follow yq, as for CFD4 (#6288)
