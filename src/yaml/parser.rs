@@ -9881,6 +9881,65 @@ fn build_semi_index_impl(input: &[u8], json_strict: bool) -> Result<SemiIndex, Y
 mod tests {
     use super::*;
 
+    /// #6348: a block scalar header holds one chomping character, one digit 1-9, blanks, a comment
+    /// and the line break. Anything else is refused at the parser, whatever the caller, in every
+    /// position a block scalar can open: this pins the loop's own one-of-each guards apart from the
+    /// post-check that backs them.
+    #[test]
+    fn test_a_block_scalar_header_with_anything_else_is_refused_6348() {
+        for yaml in [
+            &b"a: |  x\n  y\n"[..],
+            b"a: |x\n  y\n",
+            b"a: |--\n  x\n",
+            b"a: |-+\n  x\n",
+            b"a: |+-\n  x\n",
+            b"a: |22\n  x\n",
+            b"a: |0\n  x\n",
+            b"a: |-1-\n  x\n",
+            b"a: |1-1\n  x\n",
+            b"a: !!str |  x\n  y\n",
+            b"a: &x |  x\n  y\n",
+            b"- |  x\n  y\n",
+            b"- &a |--\n  y\n",
+            b"? |0\n  x\n: 1\n",
+            b"|  x\n  y\n",
+            b"--- |  x\n  y\n",
+            b"a:\n  b: |  q\n    r\n",
+        ] {
+            assert!(
+                crate::yaml::YamlIndex::build(yaml).is_err(),
+                "{:?} should be refused",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
+    /// #6348: the refusal's controls: indicators in either order, blanks, a tab and a comment (with
+    /// or without a space before `#`, as yq reads it) before the break all still parse.
+    #[test]
+    fn test_a_block_scalar_header_of_indicators_blanks_and_a_comment_still_parses_6348() {
+        for yaml in [
+            &b"a: |1-\n  x\n"[..],
+            b"a: |-1\n  x\n",
+            b"a: |+2\n   x\n",
+            b"a: |#c\n  x\n",
+            b"a: | #c\n  x\n",
+            b"a: |\t# c\n  x\n",
+            b"a: |  \n  x\n",
+            b"a: |\t\n  x\n",
+            b"a: !!str |-\n  x\n",
+            b"a: &x |#c\n  x\n",
+            b"- >+\n  x\n\n",
+            b"a: |",
+        ] {
+            assert!(
+                crate::yaml::YamlIndex::build(yaml).is_ok(),
+                "{:?} should parse",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
     /// #5062: a `: ` inside a trailing comment does not make a plain scalar a mapping key. yq v4.53.3
     /// reads each of these; they were rejected as `key without value`. `a#b: c` (no space before `#`)
     /// is still the key `a#b`.

@@ -28,6 +28,14 @@ fn test_text_after_a_block_scalar_indicator_is_refused_as_yq_refuses_it_6348() -
         "- |-x\n  y\n",
         "? |  x\n  y\n: 1\n",
         "a: |\n  x\nb: >  z\n  w\n",
+        "a: !!str |  x\n  y\n",
+        "a: &x |  x\n  y\n",
+        "- !!str >  x\n  y\n",
+        "- &a |--\n  y\n",
+        "a:\n  b: |  q\n    r\n",
+        // The line after a marker line is glued onto it (#6276), so `--- |` / `  x` is `--- |  x`.
+        "--- |  x\n  y\n",
+        "--- |\n  x\n",
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, ARGS)?;
         assert_ne!(code, 0, "{doc:?} should be refused, got {stdout:?}");
@@ -90,6 +98,8 @@ fn test_recorded_divergence_a_unicode_break_ends_the_header_in_yq_6348() -> Resu
     for (doc, expected) in [
         ("a: |\u{2028}\n  x\n", "{\"a\":\"x\\n\"}"),
         ("a: |\u{85}\n  x\n", "{\"a\":\"x\\n\"}"),
+        // yq refuses this (`while scanning a simple key`); the rest of the line is dropped here.
+        ("a: |\u{2028}garbage\n  x\n", "{\"a\":\"x\\n\"}"),
     ] {
         let (stdout, code) = run_yq_stdin(".", doc, ARGS)?;
         assert_eq!((stdout.trim_end(), code), (expected, 0), "{doc:?}");
