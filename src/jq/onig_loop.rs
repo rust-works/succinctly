@@ -298,9 +298,7 @@ pub(crate) fn rewrite_with_groups(input: &str) -> Option<GroupRewrite> {
     // the count of the groups the result has must be the count of tags found.
     let mut found = Vec::new();
     capture_openers(&ast::parse::Parser::new().parse(&pattern).ok()?, &mut found);
-    if copies.iter().any(Vec::is_empty) || found.len() + 1 != compiled {
-        return None;
-    }
+    (!copies.iter().any(Vec::is_empty) && found.len() + 1 == compiled).then_some(())?;
     let mut names = Vec::new();
     capture_names(&ast, &mut names);
     names.insert(0, None);
@@ -883,35 +881,21 @@ impl Rewriter<'_> {
             // #6332: with the groups tagged, a copy of one is read back into it, so a group in any
             // position is fine; the empty way the rewrite leaves out of the loop is written back at
             // its exit ([`Rewriter::empty_text`]).
-            GroupKind::CaptureIndex(_) | GroupKind::CaptureName { .. } if self.copies => {
-                match body.ways {
-                    Ways::Consuming => Ways::Consuming,
-                    Ways::Nullable { before, after } => {
-                        let wrap = |t: Option<Text>| -> Result<Option<Text>, GiveUp> {
-                            t.map(|t| self.text(format!("{open}{})", t.text), Prec::Atom))
-                                .transpose()
-                        };
-                        Ways::Nullable {
-                            before: wrap(before)?,
-                            after: wrap(after)?,
-                        }
-                    }
-                    _ => Ways::Unknown,
-                }
-            }
             GroupKind::CaptureIndex(_) | GroupKind::CaptureName { .. } => match body.ways {
                 Ways::Consuming => Ways::Consuming,
-                Ways::Nullable {
-                    before: Some(before),
-                    after,
-                } => {
-                    let wrap = |t: Text| self.text(format!("{open}{})", t.text), Prec::Atom);
+                // Only with the groups tagged (`self.copies`) may the group's own empty way come
+                // first: it is written back at the exit.
+                Ways::Nullable { before, after } if self.copies || before.is_some() => {
+                    let wrap = |t: Option<Text>| -> Result<Option<Text>, GiveUp> {
+                        t.map(|t| self.text(format!("{open}{})", t.text), Prec::Atom))
+                            .transpose()
+                    };
                     Ways::Nullable {
-                        before: Some(wrap(before)?),
-                        after: after.map(wrap).transpose()?,
+                        before: wrap(before)?,
+                        after: wrap(after)?,
                     }
                 }
-                Ways::Nullable { before: None, .. } | Ways::Opaque | Ways::Unknown => Ways::Unknown,
+                Ways::Nullable { .. } | Ways::Opaque | Ways::Unknown => Ways::Unknown,
             },
             GroupKind::NonCapturing(flags) if flags.items.is_empty() => body.ways,
             GroupKind::NonCapturing(flags) => {
@@ -1429,61 +1413,38 @@ impl Rewriter<'_> {
     }
 
     fn empty_into(&self, ast: &Ast, out: &mut String) {
-        if matches!(
-            ast,
-            Ast::Literal(_)
-                | Ast::Dot(_)
-                | Ast::ClassUnicode(_)
-                | Ast::ClassPerl(_)
-                | Ast::ClassBracketed(_)
-        ) {
-            out.push_str(NEVER);
-            return;
-        }
         // A part with no group and no assertion only says whether it can match nothing: it can, at
-        // any position, or it cannot, so it is written as nothing or as one failing class.
+        // any position, or it cannot, so it is written as nothing or as one failing class. That is
+        // every leaf (a character, a class, `.` or nothing) and every part without a group.
         if !has_capture(ast) && !has_assertion_or_flags(ast) {
-            if may_be_empty(ast) {
-                return;
+            if !may_be_empty(ast) {
+                out.push_str(NEVER);
             }
-            out.push_str(NEVER);
-            return;
-        }
-        match ast {
-            Ast::Empty(_) => {}
-            Ast::Flags(_) | Ast::Assertion(_) => out.push_str(self.verbatim(ast.span())),
-            Ast::Literal(_)
-            | Ast::Dot(_)
-            | Ast::ClassUnicode(_)
-            | Ast::ClassPerl(_)
-            | Ast::ClassBracketed(_) => unreachable!("a leaf is written above"),
-            Ast::Group(group) => {
-                let inner = group.ast.span();
-                out.push_str(&self.source[group.span.start.offset..inner.start.offset]);
-                self.empty_into(&group.ast, out);
-                out.push_str(&self.source[inner.end.offset..group.span.end.offset]);
-            }
-            Ast::Alternation(alt) => {
-                for (at, way) in alt.asts.iter().enumerate() {
-                    if at > 0 {
-                        out.push('|');
-                    }
-                    self.empty_into(way, out);
+        } else if let Ast::Group(group) = ast {
+            let inner = group.ast.span();
+            out.push_str(&self.source[group.span.start.offset..inner.start.offset]);
+            self.empty_into(&group.ast, out);
+            out.push_str(&self.source[inner.end.offset..group.span.end.offset]);
+        } else if let Ast::Alternation(alt) = ast {
+            for (at, way) in alt.asts.iter().enumerate() {
+                if at > 0 {
+                    out.push('|');
                 }
+                self.empty_into(way, out);
             }
-            Ast::Concat(concat) => {
-                for item in &concat.asts {
-                    // An alternation is one item only inside a group, as the parser reads it.
-                    self.empty_into(item, out);
-                }
+        } else if let Ast::Concat(concat) = ast {
+            for item in &concat.asts {
+                self.empty_into(item, out);
             }
-            Ast::Repetition(rep) => {
-                out.push_str("(?:");
-                self.empty_into(&rep.ast, out);
-                out.push(')');
-                // The operator's span holds the `?` of a lazy one.
-                out.push_str(self.verbatim(&rep.op.span));
-            }
+        } else if let Ast::Repetition(rep) = ast {
+            out.push_str("(?:");
+            self.empty_into(&rep.ast, out);
+            out.push(')');
+            // The operator's span holds the `?` of a lazy one.
+            out.push_str(self.verbatim(&rep.op.span));
+        } else {
+            // An assertion or a flag switch stays where it stands.
+            out.push_str(self.verbatim(ast.span()));
         }
     }
 
@@ -1761,6 +1722,25 @@ mod tests {
             "(?:(?:(?:b+)*(?:(a)(?:b+)*)*?)(a|b)|(?:(?:b+)*(?:(a)(?:b+)*)*?)){2}",
         ] {
             assert_eq!(copied(pattern), None, "{pattern}");
+        }
+    }
+
+    /// #6332: a loop is a repeat of a body that has a repeat or an alternation of its own; a repeat
+    /// of a plain item is not.
+    #[test]
+    fn a_loop_is_a_repeat_over_a_structured_body_6332() {
+        let loop_in = |pattern: &str| has_loop(&ast::parse::Parser::new().parse(pattern).unwrap());
+        for pattern in [
+            "(?:ab+)*",
+            "(?:a|b)+",
+            "x(?:(a)b*)*y",
+            "(?:(?:a|b)*c)?",
+            "(?:a|(?:b+)*)",
+        ] {
+            assert!(loop_in(pattern), "{pattern}");
+        }
+        for pattern in ["(?:ab)*", "(b)*", "b*", "(?:a|b)?", "(?:a{0}|b)", "a(b)c"] {
+            assert!(!loop_in(pattern), "{pattern}");
         }
     }
 
