@@ -6995,6 +6995,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
 
             // Parse key
+            let key_start = self.pos;
             self.set_ib();
             self.write_bp_open();
             if explicit {
@@ -7012,6 +7013,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             // Check for colon - if missing, value is implicitly null
             if self.peek() == Some(b':') {
+                // #6208: an implicit key is a simple key, which has no line break between its
+                // first character and its `:` (`{x⏎ y: 1}`, `{x⏎: 1}`, `{"x"⏎ : 1}`, a
+                // multi-line quoted or nested-collection key); yq refuses it as `did not
+                // find expected ',' or '}'`. Without a `:` the same text is a multi-line plain
+                // scalar entry (`{x⏎ y}`), and the explicit `? key` form may span lines.
+                if !explicit
+                    && self.input[key_start..self.pos]
+                        .iter()
+                        .any(|&b| matches!(b, b'\n' | b'\r'))
+                {
+                    return Err(
+                        self.err_unexpected_char(key_start, "expected ',' or '}' after a key")
+                    );
+                }
                 self.advance(); // Skip `:`
                 self.skip_flow_whitespace();
 
