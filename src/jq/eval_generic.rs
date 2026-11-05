@@ -36170,16 +36170,8 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 // !!seq types`, an array of aliases or of scalars `can only pivot elements of !!seq
                 // or !!map types, received <tag>`, and so is an empty array (the tag is empty).
                 if S::TAG == EvalTag::Yq {
-                    let mut tags = cursors.iter().map(|c| yq_type_tag(&c.value(), Some(*c)));
-                    let first = tags.next().unwrap_or_default();
-                    let refusal = match tags.find(|tag| *tag != first) {
-                        Some(other) => Some(EvalError::yq_pivot_mixed(&first, &other)),
-                        None if first != "!!seq" && first != "!!map" => {
-                            Some(EvalError::yq_pivot_rows(&first))
-                        }
-                        None => None,
-                    };
-                    if let Some(error) = refusal {
+                    let tags = cursors.iter().map(|c| yq_type_tag(&c.value(), Some(*c)));
+                    if let Some(error) = EvalError::yq_pivot_refusal(tags) {
                         return if optional {
                             GenericResult::None
                         } else {

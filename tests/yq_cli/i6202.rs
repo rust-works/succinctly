@@ -146,3 +146,61 @@ fn test_pivot_of_a_rebuilt_array_still_resolves_its_aliases_6202() -> Result<()>
     assert_eq!(stdout, "[[\"a\",\"c\"],[\"b\",null]]\n");
     Ok(())
 }
+
+/// The owned route (a literal, a variable, a rebuilt array) refuses in the same words: it has no
+/// alias mark to read, but it has the tags.
+const OWNED: &[(&str, &str)] = &[
+    (
+        "[1, 2.5] | pivot",
+        "sequence contains elements of !!int and !!float types",
+    ),
+    (
+        "[[1], {\"a\": 2}] | pivot",
+        "sequence contains elements of !!seq and !!map types",
+    ),
+    (
+        "[null, [1]] | pivot",
+        "sequence contains elements of !!null and !!seq types",
+    ),
+    (
+        "[1, 2] as $x | $x | pivot",
+        "can only pivot elements of !!seq or !!map types, received !!int",
+    ),
+    (
+        "[] | pivot",
+        "can only pivot elements of !!seq or !!map types, received ",
+    ),
+    ("5 | pivot", "cannot pivot node of type !!int"),
+    ("\"s\" | pivot", "cannot pivot node of type !!str"),
+    ("null | pivot", "cannot pivot node of type !!null"),
+    (
+        "[.l[]] | pivot",
+        "sequence contains elements of !!int and !!float types",
+    ),
+];
+
+#[test]
+fn test_pivot_of_a_computed_array_refuses_in_yqs_words_6202() -> Result<()> {
+    for &(filter, message) in OWNED {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "l: [1, 2.5]\n", &[])?;
+        assert_ne!(code, 0, "{filter}: {stdout}");
+        assert!(
+            stderr.contains(&format!("Error: {message}\n")),
+            "{filter}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// `try` (a jq extension in yq mode) catches the refusal on either route.
+#[test]
+fn test_try_pivot_catches_the_refusal_6202() -> Result<()> {
+    let (stdout, _, code) = run_yq_stdin_with_stderr(
+        r#"[(.l | try pivot catch "document"), ([] | try pivot catch "owned")]"#,
+        "l: [1, 2.5]\n",
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[\"document\",\"owned\"]\n");
+    Ok(())
+}

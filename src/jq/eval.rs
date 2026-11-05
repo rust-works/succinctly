@@ -106904,10 +106904,23 @@ fn builtin_pivot<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // #1755: to_owned, not to_owned_lossy -- an undecodable
             // element must raise, not silently become "" and get pivoted
             // in as if it were the real value.
-            let items: Vec<OwnedValue> = match elements.map(|e| to_owned::<S, _>(&e)).collect() {
+            let rows: Vec<(&'static str, OwnedValue)> = match elements
+                .map(|e| {
+                    let tag = yaml_type_tag(&e);
+                    to_owned::<S, _>(&e).map(|v| (tag, v))
+                })
+                .collect()
+            {
                 Ok(v) => v,
                 Err(e) => return suppress_or_raise(e, optional),
             };
+            // #6202: yq compares the rows' tags before it copies any (and refuses an empty array).
+            if S::TAG == EvalTag::Yq {
+                if let Some(error) = EvalError::yq_pivot_refusal(rows.iter().map(|(tag, _)| *tag)) {
+                    return suppress_or_raise(error, optional);
+                }
+            }
+            let items: Vec<OwnedValue> = rows.into_iter().map(|(_, v)| v).collect();
 
             if items.is_empty() {
                 // Empty array pivots to empty array
@@ -106937,6 +106950,10 @@ fn builtin_pivot<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         _ if optional => QueryResult::None,
+        // #6202: yq's own wording (`pivot` is yq-only).
+        _ if S::TAG == EvalTag::Yq => {
+            QueryResult::Error(EvalError::yq_pivot_node(yaml_type_tag(&value)))
+        }
         _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
     }
 }
