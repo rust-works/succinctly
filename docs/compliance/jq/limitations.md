@@ -1581,16 +1581,18 @@ M4 Pro, against 7 ms for the computed form.
 
 This is the posture `.[0]` and `length` already have: neither looks inside a sibling element.
 The unfused spellings above are what a read of the whole slice does, and they still convert
-every element. The cost of the other choice is the point of the fusion: validating the range
+every element of the range. The cost of the other choice is the point of the fusion: validating the range
 means touching all of it, which is the O(tail) per read that made a loop over `.[$i:][0]`
 quadratic. Pinned by `test_fused_slice_read_does_not_convert_siblings_4195` and, for a literal
 slice, `test_fused_literal_slice_read_does_not_convert_siblings_4323` (behind navigation,
 `test_fused_navigated_literal_slice_read_does_not_convert_siblings_4406`). A bare `.[a:b]` with no
 read is not fused and still validates its whole range, as does the unfused `(.[a:b])[k]`. So does a
 parenthesised navigated slice (`(.a[2:]) | length`), and a slice behind a path step that could fan
-out or fail quietly (`.a[]?[2:] | length`, `.a?[2:] | length`), which stay O(tail) per read. The last row shows
-the reach: the unfused literal slice validates the whole *array*, so a malformed element outside the
-range raises there too, and the fused read never looks at it.
+out or fail quietly (`.a[]?[2:] | length`, `.a?[2:] | length`), which stay O(tail) per read. Since
+[#6231](https://github.com/rust-works/succinctly/issues/6231) the unfused literal slice reads only
+its range as well, so a malformed element outside the range no longer raises there either
+(`(.[1:])[0]` on `[tru]` is `null`, as the last row's fused spelling is); it used to validate the
+whole *array*.
 
 Two more routes read the same range, and answer from the owned array rather than from a cursor
 (#4286). A variable bound to a value of the document (`.xs as $a | $a[$i:][0]`) is read as a pure
@@ -10300,7 +10302,9 @@ rows in `test_closed_terms_do_not_validate_2173` (jq) and
 The same mechanism as the [#2698](https://github.com/rust-works/succinctly/issues/2698) entry above, one construct over.
 A slice with literal bounds (`.[:10]`) took the wildcard bridge for every range but the full one, which materialized the whole array and indexed it again, so it validated every element of an array it kept ten of.
 [#6231](https://github.com/rust-works/succinctly/issues/6231) reads it as the computed spelling `E[S:T]` has been read since [#4287](https://github.com/rust-works/succinctly/issues/4287): the elements of its range, by index, and nothing else decoded.
-The array's own structure (a missing separator, a stray comma, an unterminated array) is still checked by the walk that counts the elements; a fault inside an element's text is read only if the element is kept.
+What the bridge also checked and this keeps checking is the array's own structure: a missing separator, a stray or trailing comma, a comma in an array with no element and a glued token (`[1 2 3]`, `[1,,2]`, `[1,2,]`, `[,]`) still exit 5 on every partial slice.
+The computed spelling does not: `.[0+0:0+2]` on `[1 2 3]` answers `[1,2]`, an older and separate divergence of its own (its walk's error is swallowed, #4287).
+What goes unread is the text inside an element the slice drops.
 
 On `["a","bad\x",3,4]`, whose second element has an invalid escape, and which jq 1.7.1 rejects at parse time for every filter:
 
@@ -10311,13 +10315,14 @@ On `["a","bad\x",3,4]`, whose second element has an invalid escape, and which jq
 | `.[1:2]`   | error    | error             | error — unchanged     |
 | `.[:2]`    | error    | error             | error — unchanged     |
 
-A slice that keeps the malformed element still raises, as bare `.[1]` does.
-The computed spelling (`.[0+1:0+2]`) already answered the first two rows, so the two spellings of one slice now agree.
+A slice that keeps the malformed element still raises when the slice is read or printed (`.[1:2] | length` is the fused read of #4195, which counts the range and decodes nothing, and answers `1`).
+The computed spellings of the first two rows (`.[:0+1]`, `.[0+2:]`) already answered, so the two spellings of one slice now agree on a document whose structure is whole.
 Before this, `(.[1:])[0]` on `[tru]` was the one spelling that validated the whole array (`test_fused_literal_slice_read_does_not_convert_siblings_4323` pinned it); it answers `null`, as the fused `.[1:][0]` beside it always did.
 `succinctly jq --validate` is the strict check for a document that must be whole.
+Same in yq mode, where real yq rejects the document at read time and `succinctly yq` now answers (see the yq page).
 
 Sanctioned by ADR-0018's #2103 amendment, like the entries above.
-Pinned by `tests/jq_cli/i6231.rs` (the malformed-leaf rows, with the controls that keep the element) and by the #4323 test above.
+Pinned by `tests/jq_cli/i6231.rs` (the malformed-leaf rows, the controls that keep the element, and the structure rows) and by the #4323 test above.
 
 ### `isempty`/`any`/`all`/`IN`/`skip` validate only what their arguments materialize (#2968)
 
@@ -12416,8 +12421,8 @@ This is ADR-0018's #2103 amendment: a value is validated when, and only when, so
 it (#2692), the rule a malformed object member already follows (#1194). The error is a decode
 failure, so neither `try` nor `?` catches it, as neither can in jq. Truthiness reads nothing
 (#2692), so `-e`, `select`, `if`, `and`/`or`, `not` and `//` still answer on the bad value
-itself (`.[0] | not` is `false`), and a slice raises because it materializes its array, as it
-does for every value the index can't read.
+itself (`.[0] | not` is `false`), and a slice raises when it decodes a malformed element it keeps
+(since #6231 only the elements of its range), as it does for every value the index can't read.
 
 **Until #3222 the span read as `null`** (#966). `null` was a local fallback chosen over the `0`
 the funnels made up before #966. Nobody ever compared it with jq, and it was filed here under

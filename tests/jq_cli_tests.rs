@@ -147164,14 +147164,21 @@ fn test_fused_literal_slice_read_does_not_convert_siblings_4323() -> Result<()> 
         run_jq_stdin("(.[1:])[0]", "[tru]", &["-c"])?,
         ("null\n".to_string(), 0)
     );
-    // The element the slice keeps is still decoded.
+    // An element the slice keeps is still decoded (`.[0:1]` is not the full range, so this
+    // reaches the #6231 arm; a full-range `.[0:]` is answered before it).
     assert_eq!(
-        run_jq_stdin("(.[0:])[0]", "[tru]", &["-c"])?,
+        run_jq_stdin("(.[0:1])[0]", "[tru,1]", &["-c"])?,
         (String::new(), 5)
     );
-    // A bare slice (no read) still validates its whole range.
+    // A bare slice (no read) still validates its whole range; `.[0:3]` is all of `doc`.
     let (stdout, code) = run_jq_stdin(".[0:3]", doc, &["-c"])?;
     assert_eq!((stdout.as_str(), code), ("", 5), "bare slice");
+    let (stdout, code) = run_jq_stdin(".[0:2]", doc, &["-c"])?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("", 5),
+        "bare slice keeping the bad element"
+    );
     Ok(())
 }
 
