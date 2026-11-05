@@ -17,6 +17,11 @@ const ROWS: &[(&str, &str)] = &[
     ("123456789012345678901.", r#"{"n":1.2345678901234568e+20}"#),
     ("5.e0", r#"{"n":5}"#),
     ("1.e5", r#"{"n":100000}"#),
+    ("-9223372036854775808.", r#"{"n":-9223372036854775808}"#),
+    // Go's saturating `f == float64(int64(f))`: 2^63 saturates to `i64::MAX`, 1e19 stays a float.
+    ("9223372036854775808.", r#"{"n":9223372036854775807}"#),
+    ("9223372036854775807.", r#"{"n":9223372036854775807}"#),
+    ("10000000000000000000.", r#"{"n":1e+19}"#),
 ];
 
 #[test]
@@ -42,6 +47,7 @@ fn argjson_bare_trailing_dot_reads_as_the_json_reader_does_6063() {
 fn argjson_bare_trailing_dot_nested_and_yaml_output_6063() {
     for (value, expected) in [
         ("[1., 2.]", "[1,2]"),
+        ("+5.", "5"),
         (r#"{"a":5.,"b":[-0.]}"#, r#"{"a":5,"b":[0]}"#),
     ] {
         let (output, code) =
@@ -75,12 +81,21 @@ fn argjson_dot_without_an_integer_part_or_with_a_second_dot_stays_refused_6063()
 /// The document reader shares the materializer: `--input-format json` with `--slurp` read a
 /// bare trailing dot as the integer too.
 #[test]
-fn json_input_bare_trailing_dot_is_the_integer_under_slurp_6063() {
+fn json_input_bare_trailing_dot_is_the_integer_under_slurp_and_eval_all_6063() {
+    for (filter, flag) in [(".[0].n", "--slurp"), (".n", "--eval-all")] {
+        let (output, code) = run_yq_stdin(
+            filter,
+            r#"{"n":5.}"#,
+            &["--input-format", "json", flag, "-o=json", "-I=0"],
+        )
+        .unwrap();
+        assert_eq!((output.trim(), code), ("5", 0), "{flag}");
+    }
     let (output, code) = run_yq_stdin(
-        ".[0].n",
-        r#"{"n":5.}"#,
+        ".[0]",
+        "[1., -0., 2.5]",
         &["--input-format", "json", "--slurp", "-o=json", "-I=0"],
     )
     .unwrap();
-    assert_eq!((output.trim(), code), ("5", 0));
+    assert_eq!((output.trim(), code), ("[1,0,2.5]", 0));
 }

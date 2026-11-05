@@ -242,7 +242,7 @@ pub fn resolve_plain_sourced(s: &str, json_sourced: bool) -> ResolvedScalar {
 /// ([`resolve_plain_sourced`]) typed these differently until #3577.
 #[must_use]
 #[inline(always)]
-pub(crate) fn whole_float_as_int(f: f64) -> Option<i64> {
+pub fn whole_float_as_int(f: f64) -> Option<i64> {
     (f.is_finite() && (f as i64) as f64 == f).then_some(f as i64)
 }
 

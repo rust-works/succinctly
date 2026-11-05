@@ -2050,7 +2050,8 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
     } else if let Some(i) = value.as_i64() {
         // #999 review: unlike `as_f64` below (reached by a lenient
         // trailing-/leading-dot span like `5.`/`.5`, pinned by
-        // `to_owned_canonicalizing_numbers_falls_back_to_as_f64_for_lenient_spans`),
+        // `to_owned_canonicalizing_numbers_falls_back_to_as_f64_for_lenient_spans`; the
+        // whole-valued one is the integer there since #6063),
         // this arm is unreachable for JSON specifically -- every lenient
         // span `is_valid_number_rejects_lenient_semi_index_spans`
         // (`json/validate.rs`) enumerates either succeeds via `as_f64` or
@@ -2078,12 +2079,13 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
             return Err(EvalError::decode_failure("not a JSON number"));
         }
         // #6063: a whole-valued span (`5.`, `-0.`, `007.`) is the integer, as yq's JSON reader
-        // answers it (`{"n":5.}` is `{"n":5}`); the bound is a strict `<` because
-        // `i64::MAX as f64` rounds up to 2^63. A fractional one (`.5`, `+.5`) stays a float.
-        if f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64 {
-            return Ok(OwnedValue::Int(f as i64));
+        // answers it (`{"n":5.}` is `{"n":5}`), by the one rule the literal route shares
+        // (`whole_float_as_int`, #3577): `9223372036854775808.` saturates to `i64::MAX`, `1e19`
+        // stays a float. A fractional one (`.5`, `+.5`) stays a float.
+        match succinctly::yaml::whole_float_as_int(f) {
+            Some(i) => OwnedValue::Int(i),
+            None => OwnedValue::Float(f),
         }
-        OwnedValue::Float(f)
     } else if let Some(s) = value.as_str() {
         OwnedValue::String(s.into_owned().into())
     } else if let Some(reason) = value.string_decode_error() {
@@ -14644,13 +14646,18 @@ mod tests {
     /// `f64::from_str` accepts both forms outright, so `as_f64` succeeds
     /// where the strict path declined. Confirmed live (`succinctly yq
     /// --input-format json 'to_entries'`) before writing this as a unit
-    /// test: real yq itself has no opinion here (Go's own JSON reader
-    /// rejects both spans as a parse error, unlike this crate's lenient
-    /// semi-indexer), so this pins *this* crate's own accepted behavior,
-    /// not an oracle-matched one.
+    /// test: real yq's JSON reader rejects the leading-dot span as a parse
+    /// error, unlike this crate's lenient semi-indexer, so `.5` pins *this*
+    /// crate's own accepted behavior. The trailing-dot one is oracle-matched
+    /// since #6063: `{"n":5.}` is `{"n":5}` in yq's `-p json` reader, so the
+    /// whole-valued span is the integer and the fractional one stays a float.
     #[test]
     fn to_owned_canonicalizing_numbers_falls_back_to_as_f64_for_lenient_spans() {
-        for json in [br#"{"n": 5.}"#.as_slice(), br#"{"n": .5}"#.as_slice()] {
+        for (json, whole) in [
+            (br#"{"n": 5.}"#.as_slice(), true),
+            (br#"{"n": -0.}"#.as_slice(), true),
+            (br#"{"n": .5}"#.as_slice(), false),
+        ] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
             let owned =
@@ -14658,12 +14665,9 @@ mod tests {
             let OwnedValue::Object(map) = owned else {
                 panic!("expected an object for {json:?}")
             };
-            // #6063: a whole-valued span is the integer (`{"n":5.}` is `{"n":5}` in yq's JSON
-            // reader); a fractional one stays a float.
-            let expected_int = json == br#"{"n": 5.}"#.as_slice();
             assert!(
-                if expected_int {
-                    matches!(map.get("n"), Some(OwnedValue::Int(5)))
+                if whole {
+                    matches!(map.get("n"), Some(OwnedValue::Int(_)))
                 } else {
                     matches!(map.get("n"), Some(OwnedValue::Float(_)))
                 },

@@ -12329,7 +12329,7 @@ The literal they keep is the digits, so every other leniency composes with it (`
 It still needs an integer part: `.`, `-.`, `1.5.`, `1..` and `1.x` are refused, as in jq.
 
 jq mode only.
-yq reads the token as a float, so `succinctly yq` is unchanged (`5.` is `!!float`, a large one is `1e+17`).
+yq's YAML reader reads the token as a float, so `succinctly yq` is unchanged there (`5.` is `!!float`, a large one is `1e+17`).
 `succinctly yq`'s own `--argjson` extension reads the token too, as yq's `-p json` reader does (`5.` is `5`, [#6063](https://github.com/rust-works/succinctly/issues/6063)); it was refused until then.
 Pinned in `tests/jq_cli/i6052.rs` against jq 1.7.1 (`fromjson`, `--argjson`, `tonumber` and the document reader on thirteen spellings).
 
