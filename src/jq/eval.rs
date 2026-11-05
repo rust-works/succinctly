@@ -28673,14 +28673,15 @@ impl OptionRun {
 fn translate_posix_brackets(
     pattern: &str,
     extended: bool,
+    ignore_case: bool,
 ) -> Result<std::borrow::Cow<'_, str>, EvalError> {
-    let translated = translate_posix_brackets_scan(pattern, extended)?;
+    let translated = translate_posix_brackets_scan(pattern, extended, ignore_case)?;
     // #6215: under the `x` flag the blanks and comments hide what a quantifier follows, so the same
     // two checks run over the pattern without them. Only their refusals count: an earlier error of
     // the scan above is the one jq reports first.
     if extended && !inline_extended(pattern) {
         let bare = strip_extended_blanks(pattern);
-        if let Err(refusal) = translate_posix_brackets_scan(&bare, false) {
+        if let Err(refusal) = translate_posix_brackets_scan(&bare, false, ignore_case) {
             if refusal.to_string().contains("target of repeat operator") {
                 return Err(refusal);
             }
@@ -29310,6 +29311,7 @@ fn ends_with_quantifier(out: &str) -> bool {
 fn translate_posix_brackets_scan(
     pattern: &str,
     extended: bool,
+    ignore_case: bool,
 ) -> Result<std::borrow::Cow<'_, str>, EvalError> {
     // A backslash, a `(` or a `{` may hold Oniguruma syntax this scan rewrites or refuses (#6070).
     if !pattern.contains(['[', '\\', '(', '{'])
@@ -29326,6 +29328,8 @@ fn translate_posix_brackets_scan(
     let mut depth = 0usize;
     // Where the class being read opened (#6240).
     let mut class_from = 0usize;
+    // Where the class being read starts in `out` (#6246).
+    let mut class_out_start = 0usize;
     let mut at_start = false;
     // Whether the class's negating `^` has been read, so that the next one is a member (#6193).
     let mut caret_taken = false;
@@ -29831,6 +29835,7 @@ fn translate_posix_brackets_scan(
             if c == '[' {
                 depth = 1;
                 class_from = i;
+                class_out_start = out.len();
                 at_start = true;
                 caret_taken = false;
             }
@@ -29868,6 +29873,25 @@ fn translate_posix_brackets_scan(
             continue;
         } else if c == ']' && !at_start {
             depth -= 1;
+            // #6246: the bytes of a negated class of bytes alone name every lead byte, so no
+            // multibyte character is in what it matches.
+            let case_may_fold = depth == 0 && (ignore_case || pattern_may_set_ignore_case(pattern));
+            if depth == 0
+                && negated_byte_class_excludes_multibyte(&chars, class_from, i, case_may_fold)
+            {
+                if case_may_fold {
+                    // Written into the class, the range would fold under `i` (the Kelvin sign and the
+                    // long s are in it) and take `k` and `s` with it: the character is checked after.
+                    out.insert_str(class_out_start, "(?:");
+                    out.push_str("](?-i:(?<=[\\x00-\\x7F])))");
+                    changed = true;
+                    i += 1;
+                    at_start = false;
+                    continue;
+                }
+                out.push_str("\\x{80}-\\x{10FFFF}");
+                changed = true;
+            }
         } else if c == '&' || c == '~' {
             out.push('\\');
             changed = true;
@@ -30754,6 +30778,86 @@ fn class_member(chars: &[char], at: usize) -> Option<(Option<ClassAtom>, usize)>
         // (`\h`, `\g`, `\q`, #6070).
         c => atom(u32::from(c), c.is_ascii(), 2),
     }
+}
+
+/// Whether the class from `chars[from]` (`[`) to `chars[close]` (`]`) is a negated class of bytes alone
+/// with a range that holds every lead byte, `C2`..`F4` (#6246). Oniguruma keeps the single bytes in a
+/// bitset and the code points in ranges, and a negated class with no code point is tested against the
+/// lead byte of a multibyte character alone: `[^\x80-\xFF]` and `[^\x41-\xF5]` match no multibyte
+/// character at all, `[^\x80-\xBF]` all of them. A member that is a code point (`é`, `\x{E9}`, a
+/// `\xC3\xA9` run) or a class (`\w`, `\p{L}`, `[:alpha:]`) puts the class in the code points, where the
+/// negation is of the characters, and a member this does not read leaves the class as it is. A byte
+/// range ends at a byte below `C0` or at `F5` and above (a lone `F4` is a lead byte, and is refused
+/// for want of its tail), so one that holds a lead byte holds all.
+#[cfg(feature = "regex")]
+fn negated_byte_class_excludes_multibyte(
+    chars: &[char],
+    from: usize,
+    close: usize,
+    case_may_fold: bool,
+) -> bool {
+    if chars.get(from + 1) != Some(&'^') {
+        return false;
+    }
+    let mut j = from + 2;
+    let mut member: Option<ClassAtom> = None;
+    let mut open: Option<ClassAtom> = None;
+    let mut covers = false;
+    let mut folds = false;
+    while j < close {
+        // `[:ascii:]` and `[:xdigit:]` hold ASCII only; the other POSIX classes are Unicode's.
+        if chars[j] == '[' && chars.get(j + 1) == Some(&':') {
+            let rest: String = chars[j..close].iter().collect();
+            if rest.starts_with("[:ascii:]") || rest.starts_with("[:xdigit:]") {
+                // `[:ascii:]` holds `k` and `s`; `[:xdigit:]` neither.
+                folds |= rest.starts_with("[:ascii:]");
+                j += rest.find(":]").map_or(0, |at| at + 2);
+                member = None;
+                continue;
+            }
+        }
+        if chars[j] == '-' && open.is_none() && member.is_some() && j + 1 < close {
+            open = member.take();
+            j += 1;
+            continue;
+        }
+        let Some((Some(atom), used)) = class_member(chars, j) else {
+            return false;
+        };
+        j += used;
+        if !atom.byte {
+            return false;
+        }
+        match open.take() {
+            Some(start) => {
+                covers |= start.value <= 0xC2 && atom.value >= 0xF4;
+                // Under `i` a range that holds `K` or `S` gains the Kelvin sign or the long s.
+                folds |= (start.value..=atom.value).any(|v| matches!(v, 0x4B | 0x53 | 0x6B | 0x73));
+                member = None;
+            }
+            None => {
+                folds |= matches!(atom.value, 0x4B | 0x53 | 0x6B | 0x73);
+                member = Some(atom);
+            }
+        }
+    }
+    // A member that folds to a code point (`k` to the Kelvin sign, `s` to the long s) puts the class
+    // in the code points under `i`, and its lead-byte test is off.
+    covers && !(case_may_fold && folds)
+}
+
+/// Whether `pattern` has an inline option that sets `i` (`(?i)`, `(?mi:`); `(?-i)` only unsets it.
+#[cfg(feature = "regex")]
+fn pattern_may_set_ignore_case(pattern: &str) -> bool {
+    pattern.match_indices("(?").any(|(at, _)| {
+        let run = &pattern.as_bytes()[at + 2..];
+        let letters = run
+            .iter()
+            .take_while(|b| b.is_ascii_alphabetic() || **b == b'-')
+            .count();
+        let sets = run[..letters].split(|b| *b == b'-').next().unwrap_or(&[]);
+        sets.contains(&b'i') && matches!(run.get(letters), Some(b')' | b':'))
+    })
 }
 
 /// The atom a range that ends at `chars[at]` started at, reading the class from its `[` at
@@ -32385,7 +32489,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 scanned
             }
         };
-        match translate_posix_brackets(&scanned, extended) {
+        match translate_posix_brackets(&scanned, extended, flags.is_some_and(|f| f.contains('i'))) {
             // #6108: a group repeated `{0}` keeps its capture slot.
             Ok(translated) => {
                 // #6196: each backreference carries the case mode in force where it stands.
@@ -146811,7 +146915,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    translate_posix_brackets(pattern, false),
+                    translate_posix_brackets(pattern, false, false),
                     Ok(Cow::Borrowed(_))
                 ),
                 "{pattern}"
@@ -146831,12 +146935,12 @@ mod tests {
             // An unclosed brace is copied through, so the crate's error quotes the pattern as written.
             (r"\p{Lu", r"\p{Lu"),
         ] {
-            let got = translate_posix_brackets(pattern, false).unwrap();
+            let got = translate_posix_brackets(pattern, false, false).unwrap();
             assert_eq!(got, want, "{pattern}");
         }
         // An unclosed `\x{` is jq's own error since #6251, not the crate's.
         assert_eq!(
-            translate_posix_brackets(r"\x{e9", false)
+            translate_posix_brackets(r"\x{e9", false, false)
                 .unwrap_err()
                 .message,
             "invalid regex: invalid code point value"
@@ -173738,7 +173842,7 @@ mod repeat_with_nothing_to_repeat_tests_6249 {
     fn the_fast_path_gate_and_the_scan_agree_on_a_branch_that_starts_with_a_repeat() {
         for pattern in ["*a", "+a", "?a", "a|*b", "a|+", "a|?", "*", "x|y|*"] {
             assert!(starts_branch_with_repeat(pattern), "{pattern}");
-            let refusal = translate_posix_brackets_scan(pattern, false)
+            let refusal = translate_posix_brackets_scan(pattern, false, false)
                 .expect_err(pattern)
                 .to_string();
             assert!(refusal.contains("not specified"), "{pattern}: {refusal}");
@@ -173746,9 +173850,51 @@ mod repeat_with_nothing_to_repeat_tests_6249 {
         for pattern in ["a*", "a|b+", "a?", "ab|c*d", "a+|b"] {
             assert!(!starts_branch_with_repeat(pattern), "{pattern}");
             assert!(
-                translate_posix_brackets_scan(pattern, false).is_ok(),
+                translate_posix_brackets_scan(pattern, false, false).is_ok(),
                 "{pattern}"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "regex"))]
+mod negated_byte_class_tests_6246 {
+    use super::{negated_byte_class_excludes_multibyte, pattern_may_set_ignore_case};
+
+    fn excludes(class: &str, case_may_fold: bool) -> bool {
+        let chars: Vec<char> = class.chars().collect();
+        negated_byte_class_excludes_multibyte(&chars, 0, chars.len() - 1, case_may_fold)
+    }
+
+    #[test]
+    fn only_a_negated_class_of_bytes_with_a_range_over_the_lead_bytes_excludes_them() {
+        assert!(excludes(r"[^\x80-\xFF]", false));
+        assert!(excludes(r"[^a\x41-\xF5]", false));
+        assert!(excludes(r"[^\x80-\xFF[:ascii:]]", false));
+        // Not negated; the range stops short of the lead bytes; a code point or a Unicode class.
+        assert!(!excludes(r"[\x80-\xFF]", false));
+        assert!(!excludes(r"[^\x80-\xBF]", false));
+        assert!(!excludes(r"[^\xF5-\xFF]", false));
+        assert!(!excludes(r"[^\x80-\xFFé]", false));
+        assert!(!excludes(r"[^\x80-\xFF\w]", false));
+        assert!(!excludes(r"[^\x80-\xFF[:alpha:]]", false));
+        // A member this does not read leaves the class as it is.
+        assert!(!excludes(r"[^\x80-\xFF\377]", false));
+    }
+
+    #[test]
+    fn under_i_a_k_or_an_s_has_code_points() {
+        assert!(excludes(r"[^k\x80-\xFF]", false));
+        assert!(!excludes(r"[^k\x80-\xFF]", true));
+        assert!(!excludes(r"[^a-z\x80-\xFF]", true));
+        assert!(excludes(r"[^i\x80-\xFF]", true));
+    }
+
+    #[test]
+    fn an_inline_option_that_sets_i_is_found() {
+        assert!(pattern_may_set_ignore_case("(?i)a"));
+        assert!(pattern_may_set_ignore_case("a(?mi:b)"));
+        assert!(!pattern_may_set_ignore_case("(?m)a"));
+        assert!(!pattern_may_set_ignore_case("a"));
     }
 }

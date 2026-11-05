@@ -7587,9 +7587,11 @@ Every row was captured from jq 1.7.1.
   A range whose end is a surrogate or past U+10FFFF stops at the nearest character that exists (`[a-\xED\xA0\x80]` is `a` to U+D7FF).
   A `-` after a finished range is a member.
   The errors are the ones outside a class, and `empty range in char class` for a start above its end.
-  Not covered: a negated class of bytes only whose range covers the lead bytes, which jq tests by the first byte alone (`[^\x80-\xFF]` matches no multibyte character in jq, #6246).
+  A negated class of bytes alone (no code point, no `\w`, `\p{L}` or `[:alpha:]`; `[:ascii:]` and `[:xdigit:]` are bytes) whose range holds every lead byte `C2`..`F4` matches no multibyte character, because jq tests it against the first byte alone: `[^\x80-\xFF]` and `[^\x41-\xF5]` match only ASCII, `[^\x80-\xBF]` matches every character (#6246).
+  Under `i` a class that holds a `k`, an `s`, `[:ascii:]` or a range over them is not read this way (their folds, the Kelvin sign and the long s, are code points), nor is one with an inline `(?i)` written inside the class brackets (`[^(?i)k\x80-\xFF]`, which holds the letters of `(?i)`).
+  "Under `i`" is decided for the whole pattern, from the modifier or any inline option that sets `i`, so a class with a `k` that `(?-i)` turns the option off for (`match("(?-i)[^k\x80-\xFF]";"gi")`) is left as it was too, and the other classes under `i` are written with a look-behind (the backtracking engine).
   Also not covered: an octal byte at 0x80 or above, and a range that ends in `\xHH` and is followed by `-\d` (`[\x41-\x42-\d]` is refused, #6244).
-  Pinned by `tests/jq_cli/i6240.rs`.
+  Pinned by `tests/jq_cli/i6240.rs` and, for the negated class of bytes, `tests/jq_cli/i6246.rs`.
 - **`(*FAIL)` never matches.**
 - **jq's refusals:** an interval with nothing to repeat (`{1}`, `a|{2}`, `(?:{2})`: `target of repeat operator is not specified`), a conditional on a group the pattern lacks (`(?(2)a|b)`: `invalid backref number/name`, and `undefined name <n> reference` for a name), and a group name that is empty or starts with a digit.
   `"a" | test("(?(2)a|b)")` panicked inside `fancy-regex` before this.
