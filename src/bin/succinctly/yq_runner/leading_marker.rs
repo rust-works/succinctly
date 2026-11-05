@@ -96,11 +96,12 @@ fn lost_breaks(text: &[u8]) -> Vec<std::ops::Range<usize>> {
         line.extend_from_slice(physical);
         // The `\r` of a `\r\n` is the last byte of the physical part (the pending part never ends
         // in one: a remainder is cut from a line whose `\r\n` was already taken off).
-        let mut break_start = break_at;
-        if break_at.is_some() && line.last() == Some(&b'\r') {
+        let break_start = if break_at.is_some() && line.last() == Some(&b'\r') {
             line.pop();
-            break_start = break_at.map(|nl| nl - 1);
-        }
+            break_at.map(|nl| nl - 1)
+        } else {
+            break_at
+        };
         pos += physical.len() + usize::from(break_at.is_some());
         match classify(&line) {
             Line::Separator | Line::Header => {}
