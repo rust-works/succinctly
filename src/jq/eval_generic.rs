@@ -25068,12 +25068,26 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             GenericResult::Many(vs) => {
                 KeyTargets::Native(vs.into_iter().map(|v| (v, None)).collect())
             }
-            GenericResult::OneCursor(c) => KeyTargets::Native(vec![(c.value(), Some(c))]),
-            GenericResult::ManyCursor(cs) => KeyTargets::Native(
-                cs.into_iter()
-                    .map(|c| (c.value(), Some(c)))
-                    .collect(),
-            ),
+            // #6270: the walk of an index sees no gap in an array with no element (`[,]`, #2594),
+            // and the cursor is only held here: the check is made as the literal index makes it.
+            GenericResult::OneCursor(c) => {
+                let v = c.value();
+                if let Some(err) = empty_container_gap_error(&v, Some(&c)) {
+                    escape_generic!(Control::Error(err));
+                }
+                KeyTargets::Native(vec![(v, Some(c))])
+            }
+            GenericResult::ManyCursor(cs) => {
+                let mut targets = Vec::new();
+                for c in cs {
+                    let v = c.value();
+                    if let Some(err) = empty_container_gap_error(&v, Some(&c)) {
+                        escape_generic!(Control::Error(err));
+                    }
+                    targets.push((v, Some(c)));
+                }
+                KeyTargets::Native(targets)
+            }
             // An owned target (a computed, non-navigational left side) has
             // no borrowed representation here; round-trip it through the
             // shared owned-value path. `LazySeq` shares this arm too:
