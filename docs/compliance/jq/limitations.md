@@ -10365,7 +10365,7 @@ A slice with literal bounds (`.[:10]`) took the wildcard bridge for every range 
 What the bridge also checked and this keeps checking is the array's own structure: a missing separator, a stray or trailing comma, a comma in an array with no element and a glued token (`[1 2 3]`, `[1,,2]`, `[1,2,]`, `[,]`) still exit 5 on every partial slice.
 The computed spelling reads them the same way since [#6257](https://github.com/rust-works/succinctly/issues/6257): `.[0+0:0+2]` on `[1 2 3]`, `[1,,2]`, `[1,2,]` and `[,]` exit 5 as `.[0:2]` does, where it answered `[1,2]`, `[2]` and `[]` before (its walk's error was swallowed, #4287).
 The fused reads (`.[0+0:1] | length`, `| first`, `[k]`) decline an empty array so that this route raises it too.
-A computed index of the same array (`.[0+0]` on `[,]`) still answers `null`.
+A computed index of it (`.[0+0]` on `[,]`) raises the same since [#6270](https://github.com/rust-works/succinctly/issues/6270).
 What goes unread is the text inside an element the slice drops.
 
 On `["a","bad\x",3,4]`, whose second element has an invalid escape, and which jq 1.7.1 rejects at parse time for every filter:
