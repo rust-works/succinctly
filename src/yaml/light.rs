@@ -14426,8 +14426,9 @@ mod tests {
             (b"- ? k: v\n- z\n", "[{\"\":null},\"z\"]"),
             // Two complex keys in one mapping - yq keeps both `""` entries
             (b"? k: v\n? a: b\n", "{\"\":null,\"\":null}"),
-            // An empty key inside the compact mapping (corpus M2N8/00 shape)
-            (b"? : x\n", "{\"\":null}"),
+            // A tagged empty key inside the compact mapping (corpus M2N8/00 with a property: yq
+            // refuses the bare `? : x`, #6325, and reads this)
+            (b"? !!str : x\n", "{\"\":null}"),
             // #324 composition: the break form cannot change the structure
             (b"? k: v\r\n: w\r\n", "{\"\":\"w\"}"),
             (b"? k: v\r: w\r", "{\"\":\"w\"}"),
