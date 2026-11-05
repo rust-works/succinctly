@@ -11,7 +11,7 @@ fn a_literal_slice_of_an_owned_value_answers_as_jq_does_6258() -> Result<()> {
     for (input, filter, expected) in [
         (
             r#"[1, 2.5, 3.0, 100000000000000000000, null, {"k":[7]}, "x"]"#,
-            r#". as $a | $a[:2], $a[1:3], $a[-2:], $a[2:1], $a[5:10], $a[0:], $a[-100:100]"#,
+            r". as $a | $a[:2], $a[1:3], $a[-2:], $a[2:1], $a[5:10], $a[0:], $a[-100:100]",
             r#"[1,2.5]
 [2.5,3.0]
 [{"k":[7]},"x"]
@@ -22,21 +22,21 @@ fn a_literal_slice_of_an_owned_value_answers_as_jq_does_6258() -> Result<()> {
 "#,
         ),
         (
-            r#"[1, 2.5, 3.0, 100000000000000000000]"#,
-            r#". as $a | [$a[2:4][] | tojson]"#,
+            r"[1, 2.5, 3.0, 100000000000000000000]",
+            r". as $a | [$a[2:4][] | tojson]",
             r#"["3.0","100000000000000000000"]
 "#,
         ),
         (
-            r#"[1.0, 1e1000, 0.10]"#,
-            r#". as $a | $a[:2], $a[1:]"#,
-            r#"[1.0,1E+1000]
+            r"[1.0, 1e1000, 0.10]",
+            r". as $a | $a[:2], $a[1:]",
+            r"[1.0,1E+1000]
 [1E+1000,0.10]
-"#,
+",
         ),
         (
             r#""héllo wörld 😀!""#,
-            r#". as $s | $s[:3], $s[1:-1], $s[-3:], $s[4:2], $s[20:30]"#,
+            r". as $s | $s[:3], $s[1:-1], $s[-3:], $s[4:2], $s[20:30]",
             r#""hél"
 "éllo wörld 😀"
 " 😀!"
@@ -45,47 +45,47 @@ fn a_literal_slice_of_an_owned_value_answers_as_jq_does_6258() -> Result<()> {
 "#,
         ),
         (
-            r#"null"#,
-            r#". as $n | $n[1:2]"#,
-            r#"null
-"#,
+            r"null",
+            r". as $n | $n[1:2]",
+            r"null
+",
         ),
         (
-            r#"[]"#,
-            r#". as $a | $a[:2], $a[0:]"#,
-            r#"[]
+            r"[]",
+            r". as $a | $a[:2], $a[0:]",
+            r"[]
 []
-"#,
+",
         ),
         (
-            r#"[[1,2],[3,4],[5,6]]"#,
-            r#". as $a | $a[1:] | .[0][1]"#,
-            r#"4
-"#,
+            r"[[1,2],[3,4],[5,6]]",
+            r". as $a | $a[1:] | .[0][1]",
+            r"4
+",
         ),
         (
             r#"{"a":1}"#,
-            r#". as $o | try $o[:1] catch ."#,
+            r". as $o | try $o[:1] catch .",
             r#""Cannot index object with object"
 "#,
         ),
         (
-            r#"5"#,
-            r#". as $n | try $n[:1] catch ."#,
+            r"5",
+            r". as $n | try $n[:1] catch .",
             r#""Cannot index number with object"
 "#,
         ),
         (
-            r#"[1,2,3]"#,
-            r#". as $a | reduce range(3) as $i (0; . + ($a[$i:] | length))"#,
-            r#"6
-"#,
+            r"[1,2,3]",
+            r". as $a | reduce range(3) as $i (0; . + ($a[$i:] | length))",
+            r"6
+",
         ),
         (
-            r#"[1,2,3,4]"#,
-            r#". as $a | [limit(3; repeat($a[1:3] | add))]"#,
-            r#"[5,5,5]
-"#,
+            r"[1,2,3,4]",
+            r". as $a | [limit(3; repeat($a[1:3] | add))]",
+            r"[5,5,5]
+",
         ),
     ] {
         let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
