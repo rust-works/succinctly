@@ -43341,6 +43341,25 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         Builtin::DebugMsg(msg) => yields_at_most_one_value(msg),
         // `input` reads exactly one document or raises.
         Builtin::Input => true,
+        // #5506: a node's own tag, kind, style or anchor, its JSON text, and `any`/`all` over an array
+        // are one value per input, or a raise before any value. `line` and `column` are left out:
+        // they read a position in the source, which the cursor walk's `cond` is not asked for.
+        Builtin::Tag
+        | Builtin::Kind
+        | Builtin::Style
+        | Builtin::Anchor
+        | Builtin::ToJson
+        | Builtin::Any
+        | Builtin::All => true,
+        // One answer per pattern (and per flags) value.
+        Builtin::Test(re) => yields_at_most_one_value(re),
+        Builtin::TestFlags(re, flags) => {
+            yields_at_most_one_value(re) && yields_at_most_one_value(flags)
+        }
+        // `isempty(f)` stops at the first output of `f`, so it yields one boolean however `f` fans out
+        // and raises only before it has yielded: it cannot emit and then raise, which is the
+        // invariant `Expr::Try` above relies on.
+        Builtin::IsEmpty(_) => true,
         // Argument-taking, one answer per argument value.
         Builtin::Has(arg)
         | Builtin::In(arg)
@@ -43366,13 +43385,10 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         Builtin::Abs
         | Builtin::Acos
         | Builtin::Acosh
-        | Builtin::All
         | Builtin::AllCond(_, _)
         | Builtin::AllC(..)
         | Builtin::AllF(_)
-        | Builtin::Anchor
         | Builtin::Alias
-        | Builtin::Any
         | Builtin::AnyC(..)
         | Builtin::AnyCond(_, _)
         | Builtin::AnyF(_)
@@ -43441,14 +43457,12 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::InputFilename
         | Builtin::InputLineNumber
         | Builtin::Inputs
-        | Builtin::IsEmpty(_)
         | Builtin::IsFinite
         | Builtin::IsInfinite
         | Builtin::IsNan
         | Builtin::IsNormal
         | Builtin::IsValid(_)
         | Builtin::Key
-        | Builtin::Kind
         | Builtin::Last
         | Builtin::LastStream(_)
         | Builtin::LeafPaths
@@ -43516,17 +43530,12 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::Strflocaltime(_)
         | Builtin::Strftime(_)
         | Builtin::Strptime(_)
-        | Builtin::Style
         | Builtin::Sub(_, _)
         | Builtin::SubFlags(_, _, _)
-        | Builtin::Tag
         | Builtin::Tan
         | Builtin::Tanh
-        | Builtin::Test(_)
-        | Builtin::TestFlags(_, _)
         | Builtin::ToBoolean
         | Builtin::ToEntries
-        | Builtin::ToJson
         | Builtin::ToJsonStream
         | Builtin::ToStream
         | Builtin::ToUnix
