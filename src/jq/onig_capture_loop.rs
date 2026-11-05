@@ -39,7 +39,8 @@
 //! the `*` loop for a body that always matches empty, since the empty iteration ends the loop before
 //! the minimum count (#6309); it is written so only when the repeated item is a capture group with no
 //! group inside it. Over a body with groups in it the crate's own copies (`X X X*`) answer as jq does
-//! more often than `(?:X*E)` would, and the loop rewrite cannot read the loop copy to order its ways.
+//! more often than `(?:X*E)` would, and the loop rewrite cannot read the loop copy to order its
+//! ways.
 //! A projected loop (`X*` inside some `E`) is written as `E` alone: its loop copy could only make empty iterations, which the crate
 //! drops, so it would never set a group. That keeps the rewritten pattern linear in the nesting depth
 //! instead of doubling per level; [`MAX_REWRITTEN_LEN`] bounds it all the same.
@@ -418,8 +419,8 @@ mod tests {
 
     #[test]
     fn leaves_every_other_repeat_alone() {
-        // No group, a body that cannot match empty, a lazy repeat, a counted repeat from 2 up,
-        // a bounded one, an assertion in the body, and `U`.
+        // No group, a body that cannot match empty, a lazy repeat, a counted repeat from 2 up
+        // over a body with a group inside it, a bounded one, an assertion in the body, and `U`.
         for pattern in [
             "a*b",
             "(?:a*)*b",

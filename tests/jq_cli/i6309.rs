@@ -54,6 +54,43 @@ fn test_a_counted_repeat_of_a_capture_group_reports_its_empty_iteration_6309() -
     ])
 }
 
+/// The bodies Oniguruma sizes differently (it writes a small counted body out as copies), an exact
+/// count, a bounded one and the lazy forms: the long and the short body answer alike, and the
+/// other counts are not the `*` loop.
+#[test]
+fn test_body_size_and_the_other_counts_agree_with_jq_6309() -> Result<()> {
+    assert_rows(&[
+        (
+            r#""abcdefgh" | [match("(abcdefghijk*|){2,}";"g") | [.string, .captures[0].string]]"#,
+            r#"[["",""],["",""],["",""],["",""],["",""],["",""],["",""],["",""],["",""]]"#,
+        ),
+        (
+            r#""abcabcdefz" | [match("(abc|abcdefgh|[a-f]*|){2,}z";"g") | [.string, .captures[0].string]]"#,
+            r#"[["abcabcdefz",""]]"#,
+        ),
+        (
+            r#""aaaaaaaaaaaaaaaa" | [match("(a|aaaaaaaaaaaaaaa*|){2,}";"g") | [.string, .captures[0].string]]"#,
+            r#"[["aaaaaaaaaaaaaaaa",""],["",""]]"#,
+        ),
+        (
+            r#""bbb" | [match("(b|){3}";"g") | [.string, .captures[0].string]]"#,
+            r#"[["bbb","b"],["",""]]"#,
+        ),
+        (
+            r#""bbb" | [match("(b|){2,5}";"g") | [.string, .captures[0].string]]"#,
+            r#"[["bbb",""],["",""]]"#,
+        ),
+        (
+            r#""bbb" | [match("(b|){2,}?";"g") | [.string, .captures[0].string]]"#,
+            r#"[["bb","b"],["b",""],["",""]]"#,
+        ),
+        (
+            r#""bbb" | [match("(b|)+?";"g") | [.string, .captures[0].string]]"#,
+            r#"[["b","b"],["b","b"],["b","b"],["",""]]"#,
+        ),
+    ])
+}
+
 /// Bodies with a group inside them keep the `regex` crate's own copies, which answer as jq does for
 /// these.
 #[test]
