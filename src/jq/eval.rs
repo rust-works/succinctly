@@ -28390,6 +28390,18 @@ fn unicode_posix_class(name: &str) -> Option<&'static str> {
 pub(super) const JQ_WORD_CLASS: &str =
     r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\x{B2}\x{B3}\x{B9}\x{BC}-\x{BE}";
 
+/// Whether `class` (a bracketed class as written, `[...]` or `[^...]`) is the one the translation
+/// writes for jq's `\w`, `\W` and `\p{Word}` outside a class (#6263): Oniguruma reads each as one
+/// character type, so a pass over the translated pattern must not read it as a class of the pattern.
+#[cfg(feature = "regex")]
+pub(super) fn is_translated_word_class(class: &str) -> bool {
+    class
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .map(|body| body.strip_prefix('^').unwrap_or(body))
+        == Some(JQ_WORD_CLASS)
+}
+
 /// The same inside a character class (`[\w-]`, `[^\W]`), where Oniguruma does not apply the
 /// Latin-1 table: the six characters are not in it (#5373).
 #[cfg(feature = "regex")]

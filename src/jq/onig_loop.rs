@@ -222,8 +222,7 @@ fn is_word_class(class: &ast::ClassBracketed) -> bool {
     {
         return false;
     }
-    let word = super::eval::JQ_WORD_CLASS;
-    text == format!("[{word}]") || text == format!("[^{word}]")
+    super::eval::is_translated_word_class(&text)
 }
 
 /// The number of operations Oniguruma 6.9.8 compiles `ast` to (`compile_length_tree`), or `None`
@@ -1126,6 +1125,13 @@ mod tests {
         assert_eq!(folding("[ab]"), None);
         assert_eq!(folding("\\p{L}"), None);
         assert_eq!(folding("\\w"), Some(1));
+        // The bracketed class the translation writes for `\w` and `\W` is one operation too (#6263),
+        // a class of the same members written any other way is not.
+        let word = super::super::eval::JQ_WORD_CLASS;
+        assert_eq!(folding(&format!("[{word}]")), Some(1));
+        assert_eq!(folding(&format!("[^{word}]")), Some(1));
+        assert_eq!(folding(&format!("[{word}a]")), None);
+        assert_eq!(folding("[\\p{Alphabetic}]"), None);
     }
 
     /// `X{n,}?` over a body of five operations is plain copies at `{2,}?` and a counted loop from
