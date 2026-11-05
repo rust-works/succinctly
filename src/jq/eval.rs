@@ -30912,7 +30912,7 @@ fn escape_class_range_dashes(
                         out.extend(&chars[i..end]);
                         i = end;
                     }
-                    // The digits of `\x41` and `\101` belong to the escape: read as items of their
+                    // The digits of `\x41` and `\101`, and the letter of `\cA`, belong to the escape: read as items of their
                     // own they would start a range just after one has ended (`[\x41-\x42-\d]`,
                     // #6244).
                     if !braced {
@@ -30926,6 +30926,8 @@ fn escape_class_range_dashes(
                         let more = match next {
                             'x' => digits(char::is_ascii_hexdigit),
                             '0'..='7' => digits(|c| ('0'..='7').contains(c)),
+                            // `\cA`: the control character's letter.
+                            'c' => usize::from(i < chars.len()),
                             _ => 0,
                         };
                         out.extend(&chars[i..i + more]);
