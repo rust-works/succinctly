@@ -7555,6 +7555,7 @@ Every row was captured from jq 1.7.1.
   The case pin above then wraps each number.
   A pattern with an inline `(?x)` is left as it was.
   Still the crate's refusal rather than jq's: `\k<n>` before any group of that name (`undefined name <n> reference`) and `\g<n>` for a shared name (`multiplex definition name <n> call`).
+  A conditional on a shared name tests the last group only (`"ac" | test("(?<n>a)?(?<n>b)?(?(<n>)c|d)")` is `true` in jq and `false` here), and a level reference (`\k<n+0>`) is refused.
   Pinned by `tests/jq_cli/i6254.rs`.
 - **A backreference compares under the case mode in force where it stands** (#6196), not the one its group matched under.
   `"aA" | test("((?i)a)\\1")` is `false` in jq, because the `(?i)` ended with its group, and `test("(?i)((?-i)a)\\1")` is `true`.
