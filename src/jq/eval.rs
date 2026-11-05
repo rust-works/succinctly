@@ -146500,11 +146500,17 @@ mod tests {
             (r"[\pL]", "[pL]"),
             // An unclosed brace is copied through, so the crate's error quotes the pattern as written.
             (r"\p{Lu", r"\p{Lu"),
-            (r"\x{e9", r"\x{e9"),
         ] {
             let got = translate_posix_brackets(pattern, false).unwrap();
             assert_eq!(got, want, "{pattern}");
         }
+        // An unclosed `\x{` is jq's own error since #6251, not the crate's.
+        assert_eq!(
+            translate_posix_brackets(r"\x{e9", false)
+                .unwrap_err()
+                .message,
+            "invalid regex: invalid code point value"
+        );
     }
 
     /// #6079: a fixed `{n}` followed by `+` is `{n}` in jq. The scan drops the `+`; a quantifier
