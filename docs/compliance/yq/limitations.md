@@ -406,6 +406,10 @@ second `&y` that every later `*y` would resolve to. That holds for a source writ
 output, outside the mapping or a sibling of it; an inline source (`<<: {a: &y 1}`, or one inside a `<<`
 sequence), which is written nowhere else, keeps its declaration. An alias inside the merged-in fields
 (`*y`) is kept.
+A `<<` whose value contributes nothing to merge (a scalar, `null`, an alias to a sequence of scalars, a sequence with no mapping in it, an empty mapping) stays an entry of the rewritten mapping since [#6318](https://github.com/rust-works/succinctly/issues/6318).
+`- <<: *seq` over `seq: &seq [one, two]` was written `- {}`, losing the key and the alias; it is `- <<: *seq` now, where yq writes `- !!merge <<: *seq`, which reads back as the same merge scalar.
+The rendering that `tojson` and a nested value read lists such an entry too (`"<<": 5`), where yq's JSON encoder skips a scalar one and refuses an alias to a sequence (`can only use merge anchors with maps (!!map) or sequences (!!seq) of maps`).
+`.[]` and `-o json` skip it, as yq does.
 
 Related open items in the same family, still unresolved:
 [#1359](https://github.com/rust-works/succinctly/issues/1359) (a write that changes a node's
