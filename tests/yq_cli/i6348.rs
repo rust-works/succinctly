@@ -31,7 +31,10 @@ fn test_text_after_a_block_scalar_indicator_is_refused_as_yq_refuses_it_6348() -
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, ARGS)?;
         assert_ne!(code, 0, "{doc:?} should be refused, got {stdout:?}");
-        assert!(stderr.contains("block scalar header"), "{doc:?}: {stderr:?}");
+        assert!(
+            stderr.contains("block scalar header"),
+            "{doc:?}: {stderr:?}"
+        );
     }
     Ok(())
 }
@@ -47,7 +50,10 @@ fn test_a_repeated_or_zero_header_indicator_is_refused_as_yq_refuses_it_6348() -
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, ARGS)?;
         assert_ne!(code, 0, "{doc:?} should be refused, got {stdout:?}");
-        assert!(stderr.contains("block scalar header"), "{doc:?}: {stderr:?}");
+        assert!(
+            stderr.contains("block scalar header"),
+            "{doc:?}: {stderr:?}"
+        );
     }
     Ok(())
 }

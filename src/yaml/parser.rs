@@ -7759,7 +7759,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // break` (`a: |  x`, `a: |x`, `a: |--`, `a: |0`, `a: |"q"`); the text was dropped and the
         // lines below read as the content.
         let mut after = self.pos;
-        while self.input.get(after).copied().is_some_and(Self::is_inline_whitespace) {
+        while self
+            .input
+            .get(after)
+            .copied()
+            .is_some_and(Self::is_inline_whitespace)
+        {
             after += 1;
         }
         // NEL, LS and PS end the line to yq as `\n` does, which the index does not model (#4913):
