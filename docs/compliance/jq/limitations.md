@@ -7808,7 +7808,6 @@ These keep their loop as written, and still match longer than jq where the shape
   A comment with no quantifier after it matches nothing, and its loop is rewritten.
   A loop beside or around such syntax is rewritten since [#6128](https://github.com/rust-works/succinctly/issues/6128): the rewrite reads a pattern the `regex` crate's parser refuses through a copy that writes that syntax plainly at the same offsets (`oniguruma_shadow` in `src/jq/eval.rs`), so `"ba" | match("(?:b*|a)+(?=)")` is jq's `"b"` (it was `"ba"`), and a loop inside a lookaround or atomic group is rewritten too.
   Over 30,000 generated cases with such syntax beside or around a loop, 235 were fixed, none broken, and 4 differ as before: a loop inside a lookahead followed by `.+` or `.*` (`"aaac" | match("(?=(?:[bc]*c??|){2,}c).+")`), where jq finds no match at all although the lookahead holds at offset 3.
-  Tracked in [#6304](https://github.com/rust-works/succinctly/issues/6304).
   A pattern with a conditional (`(?(1)...)`) is read as before.
 - **An unbounded lazy repeat with a large count, over a body with a consuming way before its empty one** (`{n,}?`, n of 7 or more, or fewer over a longer body; the `b` of `b?` in `(?:b?|\\w)`): `"ab" | [match("(?:b*||\\w){8,}?"; "gn") | .string]` is `["ab"]` in jq and `["a","b"]` here.
   Tracked in [#6302](https://github.com/rust-works/succinctly/issues/6302).
