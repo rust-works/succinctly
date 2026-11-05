@@ -308,7 +308,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // text_pos == self.text.len() is used as a sentinel for null values
         // (e.g., explicit keys without values: `? key` with no `: value`)
         if text_pos >= self.text.len() {
-            return YamlValue::Null;
+            return self.value_of_empty_node();
         }
 
         // Check for sequence item wrapper (non-container node starting with "- ").
@@ -354,9 +354,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             text_pos
         };
 
-        // If we're past the end after skipping the property, this is a null
+        // If we're past the end after skipping the property, this is a null -- unless a tag
+        // other than `!!null` decides the kind (#6291): `!!str` at the end of the text is the
+        // empty string, as it is when a following line ends the node.
         if effective_text_pos >= self.text.len() {
-            return YamlValue::Null;
+            return self.value_of_empty_node();
         }
 
         let byte = self.text[effective_text_pos];
@@ -461,6 +463,25 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     json_sourced: self.index.canonicalize_numbers(),
                 })
             }
+        }
+    }
+
+    /// The value of a node with no text of its own: a null, unless an explicit tag other than
+    /// `!!null` decides the kind (#6291), when it is the empty string, as it is for the same node
+    /// followed by another line (`resolve_tagged`'s empty-text rule). Past the end of the text
+    /// are both a tag with nothing after it (`!!str` as the whole document) and the sentinel for
+    /// an explicit key without a value (`? key`), which carries no tag.
+    #[cold]
+    fn value_of_empty_node(&self) -> YamlValue<'a, W> {
+        match self.index.get_tag(self.bp_pos) {
+            Some(tag) if tag != "!!null" => YamlValue::String(YamlString::Unquoted {
+                text: self.text,
+                start: self.text.len(),
+                end: self.text.len(),
+                base_indent: 0,
+                json_sourced: self.index.canonicalize_numbers(),
+            }),
+            _ => YamlValue::Null,
         }
     }
 

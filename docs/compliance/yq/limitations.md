@@ -651,6 +651,24 @@ would cover only the last two spellings, leaving `1_000` → `1000` and `0X2A` �
 perfectly consumable output that succinctly simply declines to match — with no justification
 at all. The justification is the spec target, which is why the case belongs here.
 
+### A tag with no value is the empty string, except `!!int` and `!!float` (#6291)
+
+A node that carries an explicit tag and no value (`k: !!seq`, `- !custom`, `--- !!str`) is the empty string in yq's JSON output and in a comparison with `""`.
+The tag decides the kind, so the empty text is not a null: `!!bool` is `false`, and only `!!null` is `null`.
+This reads it that way for every tag (`resolve_tagged`, and `value_of_empty_node` where the tag is the last thing in the text), where it used to answer `null` for every tag but `!!str` and `!!bool`.
+
+```console
+$ printf 'k: !!seq\nj: 1\n' | yq -o=json -I0 .                  # {"k":"","j":1}
+$ printf 'k: !!seq\nj: 1\n' | succinctly yq -o json -I0 .        # {"k":"","j":1}   ({"k":null,"j":1} before #6291)
+```
+
+`!!int` and `!!float` with no value are a yq encoder failure in JSON output (`json: error calling MarshalJSON ...: strconv.ParseInt: parsing "": invalid syntax`, and `strconv.ParseFloat` for `!!float`), and `yq '.k + 1'` fails the same way.
+This answers the empty string for both, as it does for `!!int abc`: the loader absorbs what it cannot read instead of reproducing a Go crash.
+
+Not covered here:
+- `!!bool` compared with a string. yq compares a scalar's text, so an empty `!!bool` equals `""` and `!!bool yes` equals `"yes"`, where this compares the boolean.
+- A value-less tag in a flow collection (`[!!str]`, `{a: !!str}`), which yq refuses and this reads as `[""]`.
+
 ### Invalid UTF-8 in a `-p json` document — substituted for JSON output and in a YAML-output key; a bad value still differs on the prefix (#1616, #4536)
 
 Real yq turns each invalid byte of a JSON document into U+FFFD and lets the *output* encoder

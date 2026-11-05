@@ -797,6 +797,11 @@ pub fn resolve_tagged(text: &str, tag: &str) -> Option<ResolvedScalar> {
             ResolvedScalar::Int(n) => ResolvedScalar::Float(n as f64),
             _ => ResolvedScalar::Str,
         }),
+        // #6291: a node with an explicit tag and no value is the empty string whatever the tag
+        // (`!!seq`, `!!map`, `!!binary`, `!!timestamp`, `!custom`), as in yq: the tag decides the
+        // kind, so the empty text is not a null. `!!null` and the tags above answer for
+        // themselves; a tag with text goes on being read as that text.
+        _ if text.is_empty() => Some(ResolvedScalar::Str),
         _ => None,
     }
 }
@@ -847,6 +852,29 @@ mod tests {
         ] {
             assert_eq!(whole_float_as_int(f), want, "{f}");
         }
+    }
+
+    /// #6291: an explicit tag on an empty scalar decides the kind, so the text is the empty
+    /// string for every tag but `!!null` (and `!!bool`, which is `false`); a tag with text that
+    /// `resolve_tagged` does not model still falls through.
+    #[test]
+    fn an_empty_scalar_under_any_tag_is_the_empty_string_6291() {
+        for tag in [
+            "!!seq",
+            "!!map",
+            "!!binary",
+            "!!timestamp",
+            "!custom",
+            "!<tag:x,2020:y>",
+        ] {
+            assert_eq!(resolve_tagged("", tag), Some(Str), "{tag}");
+            assert_eq!(resolve_tagged("x", tag), None, "{tag}");
+        }
+        assert_eq!(resolve_tagged("", "!!str"), Some(Str));
+        assert_eq!(resolve_tagged("", "!!null"), Some(Null));
+        assert_eq!(resolve_tagged("", "!!bool"), Some(Bool(false)));
+        assert_eq!(resolve_tagged("", "!!int"), Some(Str));
+        assert_eq!(resolve_tagged("", "!!float"), Some(Str));
     }
 
     #[test]
