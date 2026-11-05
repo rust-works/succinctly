@@ -29150,7 +29150,10 @@ fn translate_posix_brackets_scan(
     extended: bool,
 ) -> Result<std::borrow::Cow<'_, str>, EvalError> {
     // A backslash, a `(` or a `{` may hold Oniguruma syntax this scan rewrites or refuses (#6070).
-    if !pattern.contains(['[', '\\', '(', '{']) && !may_hold_assertion(pattern) {
+    if !pattern.contains(['[', '\\', '(', '{'])
+        && !may_hold_assertion(pattern)
+        && !starts_branch_with_repeat(pattern)
+    {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
     let chars: Vec<char> = pattern.chars().collect();
@@ -29469,10 +29472,17 @@ fn translate_posix_brackets_scan(
             // #6070: an interval with nothing before it to repeat (`{1}`, `a|{2}`, `(?:{2})`) is
             // an error in jq, a literal run in the `regex` crate. `{,2}` and `{x}` are literal in
             // both (see `starts_repetition`).
-            if c == '{'
+            //
+            // #6249: so is `*`, `+` or `?` there (`*0`, `a|+`, `(?:?a)`). The crate refuses them
+            // as well, in its own words; but the flag prefix of the `x` flag is a group that
+            // `fancy-regex` repeats, so under `x` they must be refused here, on the pattern
+            // without the blanks (see `translate_posix_brackets`). A `*` right after a `(` is
+            // Oniguruma's callout (`(*a)`), which is another error in jq.
+            if matches!(c, '{' | '*' | '+' | '?')
                 && check_repetition
                 && starts_repetition(&chars[i..])
                 && (i == body_start || after_pipe)
+                && !(c == '*' && i > 0 && chars[i - 1] == '(')
             {
                 return Err(EvalError::new(
                     "invalid regex: target of repeat operator is not specified",
@@ -30801,6 +30811,13 @@ fn starts_repetition(chars: &[char]) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `pattern` starts a branch (the pattern, or what follows a `|`) with `*`, `+` or `?`: the
+/// repeat with nothing to repeat that the scan refuses (#6249).
+#[cfg(feature = "regex")]
+fn starts_branch_with_repeat(pattern: &str) -> bool {
+    pattern.starts_with(['*', '+', '?']) || ["|*", "|+", "|?"].iter().any(|at| pattern.contains(at))
 }
 
 /// Whether a dash sits beside a set escape (`\w-`, `-\d`), which no range can start or end.
