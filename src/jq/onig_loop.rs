@@ -18,11 +18,13 @@
 //! `B`, which is where the two engines can disagree; without one, they agree.
 //!
 //! A capture group in a way after the empty one is written once, in `B`, and the loop is rewritten
-//! as any other is (#6310); a group the rewrite would copy (in `A`, which it writes twice, or in the
-//! body of a counted repeat) or leave out (in the empty way) keeps its loop as written, as does one
-//! whose own empty way comes first: an empty iteration sets the group in Oniguruma (#6069), and the
-//! way the rewrite drops is the one that sets it. A group's own text is not compared, only how many
-//! there are, and a way that would copy one is not listed ([`Rewriter::has_groups`]). A body whose
+//! as any other is (#6310). Any other position needs a copy of the group (the ways before the empty
+//! one are written twice) or the group's empty way, which sets it when the loop ends (#6069):
+//! [`rewrite_with_groups`] runs over the pattern with its groups tagged by number, writes the loop
+//! with every copy, ends it with `E` (the body's empty way, from [`Rewriter::empty_text`]), and lists
+//! the copies each group has, which the evaluator reads back as the last one the match set (#6332).
+//! The plain [`rewrite`] keeps a loop as written when it would copy or drop a group, and counts the
+//! groups it writes ([`Rewriter::has_groups`]). A body whose
 //! ways are not listed here keeps its loop as written too: one with a way that can match nothing only
 //! where a zero-width assertion holds (`\b` or `a?\b` on its own: its empty way depends on where it
 //! stands), or a flag switch that names `x` or `U`. An assertion beside an item that consumes text
@@ -119,8 +121,14 @@ struct Rewriter<'p> {
     work_limit: usize,
     changed: bool,
     /// Whether the pattern has a capture group at all (#6310): a rewrite that copies text must then
-    /// leave the groups as they were, in number and order.
+    /// leave the groups as they were, in number and order. Never set when `copies` is.
     captures: bool,
+    /// Whether the groups of the pattern are tagged and a rewrite may copy them (#6332): each
+    /// copy is read back into its group ([`rewrite_with_groups`]).
+    copies: bool,
+    /// The empty way of the loop body being converted, set for the one `repeat` call that follows
+    /// when `copies` and the body has a capture group (#6332): see [`Rewriter::empty_text`].
+    exit: Option<Text>,
 }
 
 /// Whether a flag switch (`(?i)`, not a flag group) stands anywhere in `ast`.
@@ -160,6 +168,18 @@ fn collect_captures(ast: &Ast, out: &mut Vec<Option<String>>) {
     }
 }
 
+/// Whether an assertion or a flag switch stands anywhere in `ast`.
+fn has_assertion_or_flags(ast: &Ast) -> bool {
+    match ast {
+        Ast::Assertion(_) | Ast::Flags(_) => true,
+        Ast::Group(group) => has_assertion_or_flags(&group.ast),
+        Ast::Alternation(alt) => alt.asts.iter().any(has_assertion_or_flags),
+        Ast::Concat(concat) => concat.asts.iter().any(has_assertion_or_flags),
+        Ast::Repetition(rep) => has_assertion_or_flags(&rep.ast),
+        _ => false,
+    }
+}
+
 /// A piece that matches only the empty string and has no text of its own.
 fn empty_piece() -> Piece {
     Piece {
@@ -181,10 +201,102 @@ pub(crate) fn rewrite(pattern: &str) -> Option<String> {
     if !may_need_rewrite(pattern) {
         return None;
     }
-    rewrite_parsed(pattern)
+    rewrite_parsed(pattern, false)
 }
 
-fn rewrite_parsed(pattern: &str) -> Option<String> {
+/// A pattern [`rewrite_with_groups`] wrote, with how its groups read back into the input's.
+pub(crate) struct GroupRewrite {
+    /// The pattern to compile; every group in it is unnamed.
+    pub(crate) pattern: String,
+    /// For each group of the input pattern (0 is the whole match), the groups of
+    /// [`pattern`](Self::pattern) that hold a copy of it, in the order they open: the loop rewrite
+    /// writes the consuming ways before the empty one twice, and a counted repeat writes its body
+    /// again for each count. A group's value is the last of its copies that the match set.
+    pub(crate) copies: Vec<Vec<usize>>,
+    /// How many groups [`pattern`](Self::pattern) has, the whole match included.
+    pub(crate) compiled_groups: usize,
+}
+
+/// [`rewrite`] for a pattern whose loops have a capture group where the plain rewrite would copy or
+/// drop it (#6332): the groups are tagged by number, the loops are written as they are without
+/// one, and each group the rewrite copied is read back through [`GroupRewrite::copies`]. `None`
+/// when the pattern has no group, needs no rewrite, or is not one the `regex` crate's parser reads.
+pub(crate) fn rewrite_with_groups(pattern: &str) -> Option<GroupRewrite> {
+    if !may_need_rewrite(pattern) || !pattern.contains('(') || pattern.contains(TAG) {
+        return None;
+    }
+    let ast = ast::parse::Parser::new().parse(pattern).ok()?;
+    let mut openers = Vec::new();
+    capture_openers(&ast, &mut openers);
+    if openers.is_empty() {
+        return None;
+    }
+    let mut tagged = String::with_capacity(pattern.len() + 12 * openers.len());
+    let mut at = 0;
+    for (n, (start, end)) in openers.iter().enumerate() {
+        tagged.push_str(&pattern[at..*start]);
+        tagged.push_str(&format!("(?<{TAG}{}>", n + 1));
+        at = *end;
+    }
+    tagged.push_str(&pattern[at..]);
+    let written = rewrite_parsed(&tagged, true)?;
+    // Read the tags back: each group of the result is a copy of the group its tag names. The copies
+    // share a name, which the parser refuses, so the tags are found by their text.
+    let opening = format!("(?<{TAG}");
+    let mut copies = vec![Vec::new(); openers.len() + 1];
+    copies[0].push(0);
+    let mut pattern = String::with_capacity(written.len());
+    let mut rest = written.as_str();
+    let mut compiled = 1;
+    while let Some(at) = rest.find(&opening) {
+        let tail = &rest[at + opening.len()..];
+        let digits = tail.find('>')?;
+        let group: usize = tail[..digits].parse().ok()?;
+        copies.get_mut(group)?.push(compiled);
+        compiled += 1;
+        pattern.push_str(&rest[..at]);
+        pattern.push('(');
+        rest = &tail[digits + 1..];
+    }
+    pattern.push_str(rest);
+    // A group the rewrite left out would be read as unset, which is not what Oniguruma leaves, and
+    // the count of the groups the result has must be the count of tags found.
+    let mut found = Vec::new();
+    capture_openers(&ast::parse::Parser::new().parse(&pattern).ok()?, &mut found);
+    if copies.iter().any(Vec::is_empty) || found.len() + 1 != compiled {
+        return None;
+    }
+    Some(GroupRewrite {
+        pattern,
+        copies,
+        compiled_groups: compiled,
+    })
+}
+
+/// A class that matches no character: `E`'s stand-in for every character, class and `.` of the body.
+const NEVER: &str = r"[^\s\S]";
+
+/// The name prefix that tags a group of the input pattern in [`rewrite_with_groups`].
+const TAG: &str = "__succinctly_g";
+
+/// The opening of every capture group of `ast` (from the `(` to where its body starts), in the order
+/// the groups open.
+fn capture_openers(ast: &Ast, out: &mut Vec<(usize, usize)>) {
+    match ast {
+        Ast::Group(group) => {
+            if !matches!(group.kind, GroupKind::NonCapturing(_)) {
+                out.push((group.span.start.offset, group.ast.span().start.offset));
+            }
+            capture_openers(&group.ast, out);
+        }
+        Ast::Alternation(alt) => alt.asts.iter().for_each(|a| capture_openers(a, out)),
+        Ast::Concat(concat) => concat.asts.iter().for_each(|a| capture_openers(a, out)),
+        Ast::Repetition(rep) => capture_openers(&rep.ast, out),
+        _ => {}
+    }
+}
+
+fn rewrite_parsed(pattern: &str, copies: bool) -> Option<String> {
     // #6128: a pattern with Oniguruma syntax only `fancy-regex` reads (lookaround, a backreference,
     // `\K`) is parsed through a copy that writes that syntax plainly at the same offsets. A pattern
     // the parser reads as written is read as written.
@@ -214,7 +326,9 @@ fn rewrite_parsed(pattern: &str) -> Option<String> {
             .saturating_add(64 * 1024)
             .max(512 * 1024),
         changed: false,
-        captures: has_capture(&ast),
+        captures: !copies && has_capture(&ast),
+        copies,
+        exit: None,
     };
     let piece = rewriter.convert(&ast, false).ok()?;
     // The rewrite can drop a piece that matches only the empty string (`\p{Foo}{0}`), and with it
@@ -323,7 +437,10 @@ fn onig_ops(ast: &Ast, folds: bool) -> Option<usize> {
         // whether a repeat of it is written out as copies), with the case folding the group sets.
         Ast::Group(group) => match &group.kind {
             GroupKind::NonCapturing(flags) => onig_ops(&group.ast, group_folds(flags, folds)?),
-            _ => None,
+            // #6332: a capture group is its body between the two operations that start and end it.
+            GroupKind::CaptureIndex(_) | GroupKind::CaptureName { .. } => {
+                onig_ops(&group.ast, folds).map(|ops| ops + 2)
+            }
         },
         Ast::Alternation(alt) => {
             let mut total = 2 * alt.asts.len().saturating_sub(1);
@@ -501,9 +618,13 @@ impl Rewriter<'_> {
                 if !rep.greedy && has_switch(&rep.ast) {
                     body.ways = Ways::Unknown;
                 }
+                let grouped = (self.copies || self.captures) && has_capture(&rep.ast);
                 let (min, max) = bounds(&rep.op.kind);
                 if !rep.greedy && max.is_none() && self.oniguruma_unrolls(&rep.ast, min) {
-                    return self.lazy_unrolled(body, min);
+                    return self.lazy_unrolled(body, min, grouped);
+                }
+                if self.copies && grouped {
+                    self.exit = Some(self.empty_text(&rep.ast)?);
                 }
                 self.repeat(body, min, max, rep.greedy)
             }
@@ -516,7 +637,12 @@ impl Rewriter<'_> {
                 for way in &alt.asts {
                     // A way that is only a switch matches nothing, as an empty way does.
                     let piece = match way {
-                        Ast::Flags(set) if self.switch_open(set)?.is_some() => empty_piece(),
+                        Ast::Flags(set) if self.switch_open(set)?.is_some() => {
+                            if self.copies {
+                                return Err(GiveUp);
+                            }
+                            empty_piece()
+                        }
                         _ => self.convert(way, listed)?,
                     };
                     items.push(self.scoped(piece, &active)?);
@@ -540,11 +666,16 @@ impl Rewriter<'_> {
     /// one piece and wrapped in a flag group with the switch's flags (#6301).
     fn convert_concat(&mut self, asts: &[Ast], listed: bool) -> Result<Piece, GiveUp> {
         let mut items = Vec::with_capacity(asts.len());
+        let mut empties = Vec::with_capacity(asts.len());
         for (at, ast) in asts.iter().enumerate() {
             if let Some(open) = match ast {
                 Ast::Flags(set) => self.switch_open(set)?,
                 _ => None,
             } {
+                // #6332: the empty way of what the switch reaches is not worked out.
+                if self.copies {
+                    return Err(GiveUp);
+                }
                 items.push(empty_piece());
                 let rest = &asts[at + 1..];
                 if !rest.is_empty() {
@@ -554,8 +685,18 @@ impl Rewriter<'_> {
                 break;
             }
             items.push(self.convert(ast, listed)?);
+            empties.push(self.empty_if_grouped(ast)?);
         }
-        self.concat(&items, listed)
+        self.concat_with(&items, &empties, listed)
+    }
+
+    /// The empty way of `ast` ([`Self::empty_text`]) when the groups are tagged and it holds one.
+    fn empty_if_grouped(&self, ast: &Ast) -> Result<Option<Text>, GiveUp> {
+        if self.copies && has_capture(ast) {
+            self.empty_text(ast).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// The opening of the flag group that stands for the switch `set` over what it reaches
@@ -647,6 +788,25 @@ impl Rewriter<'_> {
             // consuming way before it, the group is in `A`, which a rewrite refuses
             // ([`Rewriter::groups_only_in_later_ways`]), or stands in a later way, whose empty way
             // is an exit that has already failed.
+            // #6332: with the groups tagged, a copy of one is read back into it, so a group in any
+            // position is fine; the empty way the rewrite leaves out of the loop is written back at
+            // its exit ([`Rewriter::empty_text`]).
+            GroupKind::CaptureIndex(_) | GroupKind::CaptureName { .. } if self.copies => {
+                match body.ways {
+                    Ways::Consuming => Ways::Consuming,
+                    Ways::Nullable { before, after } => {
+                        let wrap = |t: Option<Text>| -> Result<Option<Text>, GiveUp> {
+                            t.map(|t| self.text(format!("{open}{})", t.text), Prec::Atom))
+                                .transpose()
+                        };
+                        Ways::Nullable {
+                            before: wrap(before)?,
+                            after: wrap(after)?,
+                        }
+                    }
+                    _ => Ways::Unknown,
+                }
+            }
             GroupKind::CaptureIndex(_) | GroupKind::CaptureName { .. } => match body.ways {
                 Ways::Consuming => Ways::Consuming,
                 Ways::Nullable {
@@ -741,6 +901,17 @@ impl Rewriter<'_> {
     }
 
     fn concat(&self, items: &[Piece], listed: bool) -> Result<Piece, GiveUp> {
+        self.concat_with(items, &[], listed)
+    }
+
+    /// [`Self::concat`] where `empties[i]` is the empty way of `items[i]` when that way sets a group
+    /// (#6332; none past the end): `Q` from where `P` began is `P`'s empty way and then `Q`'s ways.
+    fn concat_with(
+        &self,
+        items: &[Piece],
+        empties: &[Option<Text>],
+        listed: bool,
+    ) -> Result<Piece, GiveUp> {
         let Some((first, rest)) = items.split_first() else {
             return Ok(Piece {
                 text: Text {
@@ -760,7 +931,10 @@ impl Rewriter<'_> {
         } else {
             Ways::Unknown
         };
-        for next in rest {
+        let empty_of = |at: usize| empties.get(at).cloned().flatten();
+        let mut gone: Option<Text> = empty_of(0);
+        for (at, next) in rest.iter().enumerate() {
+            let own = empty_of(at + 1);
             ways = match (ways, &next.ways) {
                 (Ways::Unknown, _) | (_, Ways::Unknown) => Ways::Unknown,
                 // #6310: `A1 Q` and `B1 Q` each hold `Q` again, and so each of its groups.
@@ -785,13 +959,21 @@ impl Rewriter<'_> {
                         after: b2,
                     },
                 ) => {
+                    // `Q` after `P`'s empty way: it sets the groups that way holds.
+                    let after_empty = |way: &Option<Text>| -> Result<Option<Text>, GiveUp> {
+                        match (&gone, way) {
+                            (Some(gone), Some(way)) => self.concat_text(&[gone, way]).map(Some),
+                            (None, way) => Ok(way.clone()),
+                            (Some(_), None) => Ok(None),
+                        }
+                    };
                     let mut before = Vec::new();
                     if let Some(a1) = a1 {
                         before.push(self.concat_text(&[&a1, &next.text])?);
                     }
-                    before.extend(a2.clone());
+                    before.extend(after_empty(&a2)?);
                     let mut after = Vec::new();
-                    after.extend(b2.clone());
+                    after.extend(after_empty(&b2)?);
                     if let Some(b1) = b1 {
                         after.push(self.concat_text(&[&b1, &next.text])?);
                     }
@@ -800,6 +982,10 @@ impl Rewriter<'_> {
                         after: self.alt_text(&after)?,
                     }
                 }
+            };
+            gone = match (gone, own) {
+                (Some(a), Some(b)) => Some(self.concat_text(&[&a, &b])?),
+                (a, b) => a.or(b),
             };
         }
         let texts: Vec<&Text> = items.iter().map(|p| &p.text).collect();
@@ -866,6 +1052,7 @@ impl Rewriter<'_> {
         max: Option<u32>,
         greedy: bool,
     ) -> Result<Piece, GiveUp> {
+        let exit = self.exit.take();
         let text = self.repeat_text(&body.text, min, max, greedy)?;
         let ways = match (&body.ways, min, max, greedy) {
             (Ways::Unknown, ..) => Ways::Unknown,
@@ -911,13 +1098,13 @@ impl Rewriter<'_> {
             // `X+?` is `X X*?`, as Oniguruma tries it.
             (Ways::Nullable { .. }, 1, None, false) => {
                 let rest = self.repeat(body.clone(), 0, None, false)?;
-                self.concat(&[body, rest], true)?.ways
+                self.concat_with(&[body, rest], &[exit], true)?.ways
             }
             (Ways::Nullable { before, after }, _, None, true) => {
-                return self.exit_on_empty(before.clone(), after.clone(), text);
+                return self.exit_on_empty(before.clone(), after.clone(), text, exit);
             }
             (Ways::Nullable { before, after }, _, Some(n), true) => {
-                return self.bounded(&body, before.clone(), after.clone(), n, text);
+                return self.bounded(&body, before.clone(), after.clone(), n, text, exit);
             }
             (
                 Ways::Nullable {
@@ -926,7 +1113,7 @@ impl Rewriter<'_> {
                 },
                 ..,
             ) if !greedy && min >= 2 => {
-                return self.lazy_counted(before.clone(), after.clone(), min, max, text);
+                return self.lazy_counted(before.clone(), after.clone(), min, max, text, exit);
             }
             // A lazy repeat that runs once at most leaves where Oniguruma does (a differential over
             // 2,800 generated patterns found no difference with or without the rewrite), and a
@@ -945,6 +1132,7 @@ impl Rewriter<'_> {
         before: Option<Text>,
         after: Option<Text>,
         written: Text,
+        exit: Option<Text>,
     ) -> Result<Piece, GiveUp> {
         let consuming = |text: Text| Piece {
             text,
@@ -971,9 +1159,14 @@ impl Rewriter<'_> {
             return Ok(Self::unlisted(written));
         }
         self.changed = true;
+        // #6332: the empty way the loop leaves at, with the groups it sets, ends the rewritten loop.
+        let (text, ways) = match &exit {
+            Some(exit) => (self.concat_text(&[&piece.text, exit])?, Ways::Unknown),
+            None => (piece.text, piece.ways),
+        };
         Ok(Piece {
-            text: self.text(format!("(?:{})", piece.text.text), Prec::Atom)?,
-            ways: piece.ways,
+            text: self.text(format!("(?:{})", text.text), Prec::Atom)?,
+            ways,
         })
     }
 
@@ -1040,11 +1233,15 @@ impl Rewriter<'_> {
     /// `X{min,}?` as Oniguruma unrolls it, `X` `min` times and then `X*?`: the `regex` crate reads
     /// the repeat the same way, so the text stays as written. Only the body's ways are worked out,
     /// as the concatenation of those copies, for a loop around this one.
-    fn lazy_unrolled(&mut self, body: Piece, min: u32) -> Result<Piece, GiveUp> {
+    fn lazy_unrolled(&mut self, body: Piece, min: u32, grouped: bool) -> Result<Piece, GiveUp> {
         let text = self.repeat_text(&body.text, min, None, false)?;
-        // A body with a capture group is never here: its operation count is not worked out
-        // (`onig_ops`), so `oniguruma_unrolls` does not choose this form, and the copies below
-        // would hold a group twice (#6310).
+        // #6310, #6332: the copies would hold the body's groups again, and the text is as it was.
+        if grouped {
+            return Ok(Piece {
+                text,
+                ways: Ways::Unknown,
+            });
+        }
         let mut copies = alloc::vec![body.clone(); min as usize];
         copies.push(self.repeat(body, 0, None, false)?);
         let ways = self.concat(&copies, true)?.ways;
@@ -1063,8 +1260,10 @@ impl Rewriter<'_> {
         min: u32,
         max: Option<u32>,
         written: Text,
+        exit: Option<Text>,
     ) -> Result<Piece, GiveUp> {
-        // #6310: each copy holds the body's groups again.
+        // #6310: each copy holds the body's groups again; only with the groups tagged are they read
+        // back (#6332).
         if self.has_groups(&written) {
             return Ok(Self::unlisted(written));
         }
@@ -1081,16 +1280,17 @@ impl Rewriter<'_> {
             }
         };
         for k in (1..=max.unwrap_or(min)).rev() {
-            let exit = self.concat(&[], true)?;
             let mut ways = Vec::new();
+            // Past the minimum the lazy repeat leaves before it makes an iteration, which sets no
+            // group; before it, the empty way is an iteration that does (#6332).
             if k > min {
-                ways.push(exit.clone());
+                ways.push(self.concat(&[], true)?);
             }
             if let Some(a) = &before {
                 ways.push(self.concat(&[consuming(a.clone()), rest.clone()], true)?);
             }
             if k <= min {
-                ways.push(exit);
+                ways.push(self.exit_piece(&exit)?);
             }
             ways.push(self.concat(&[consuming(after.clone()), rest.clone()], true)?);
             rest = self.alt(&ways, true)?;
@@ -1098,8 +1298,86 @@ impl Rewriter<'_> {
         self.changed = true;
         Ok(Piece {
             text: self.text(format!("(?:{})", rest.text.text), Prec::Atom)?,
-            ways: rest.ways,
+            ways: if exit.is_some() {
+                Ways::Unknown
+            } else {
+                rest.ways
+            },
         })
+    }
+
+    /// The empty way of a counted loop's copy: nothing, or `exit` (#6332).
+    fn exit_piece(&self, exit: &Option<Text>) -> Result<Piece, GiveUp> {
+        match exit {
+            Some(text) => Ok(Piece {
+                text: text.clone(),
+                ways: Ways::Nullable {
+                    before: None,
+                    after: None,
+                },
+            }),
+            None => self.concat(&[], true),
+        }
+    }
+
+    /// `ast` with every character, class and `.` replaced by one that never matches: it can match
+    /// only the empty string, and does so the way `ast` would first, setting the groups that way
+    /// sets (#6332). A loop the rewrite writes without its empty way ends with it, so that those
+    /// groups are set at the exit as Oniguruma's empty iteration sets them (#6069).
+    fn empty_text(&self, ast: &Ast) -> Result<Text, GiveUp> {
+        let mut out = String::new();
+        self.empty_into(ast, &mut out);
+        self.text(out, Prec::Alt)
+    }
+
+    fn empty_into(&self, ast: &Ast, out: &mut String) {
+        // A part with no group and no assertion only says whether it can match nothing: it can, at
+        // any position, or it cannot, so it is written as nothing or as one failing class.
+        if !has_capture(ast) && !has_assertion_or_flags(ast) {
+            if may_be_empty(ast) {
+                return;
+            }
+            out.push_str(NEVER);
+            return;
+        }
+        match ast {
+            Ast::Empty(_) => {}
+            Ast::Flags(_) | Ast::Assertion(_) => out.push_str(self.verbatim(ast.span())),
+            Ast::Literal(_)
+            | Ast::Dot(_)
+            | Ast::ClassUnicode(_)
+            | Ast::ClassPerl(_)
+            | Ast::ClassBracketed(_) => out.push_str(NEVER),
+            Ast::Group(group) => {
+                let inner = group.ast.span();
+                out.push_str(&self.source[group.span.start.offset..inner.start.offset]);
+                self.empty_into(&group.ast, out);
+                out.push_str(&self.source[inner.end.offset..group.span.end.offset]);
+            }
+            Ast::Alternation(alt) => {
+                for (at, way) in alt.asts.iter().enumerate() {
+                    if at > 0 {
+                        out.push('|');
+                    }
+                    self.empty_into(way, out);
+                }
+            }
+            Ast::Concat(concat) => {
+                for item in &concat.asts {
+                    // An alternation is one item only inside a group, as the parser reads it.
+                    self.empty_into(item, out);
+                }
+            }
+            Ast::Repetition(rep) => {
+                out.push_str("(?:");
+                self.empty_into(&rep.ast, out);
+                out.push(')');
+                out.push_str(self.verbatim(&rep.op.span));
+                if !rep.greedy && !self.verbatim(&rep.op.span).ends_with('?') {
+                    out.push('?');
+                }
+            }
+        }
     }
 
     /// Oniguruma's greedy `X{min,n}` for a body `X = A | ε | B` and `n` of 2 or more: `T(n)`, where
@@ -1114,6 +1392,7 @@ impl Rewriter<'_> {
         after: Option<Text>,
         n: u32,
         written: Text,
+        exit: Option<Text>,
     ) -> Result<Piece, GiveUp> {
         let Some(b) = after else {
             let rest = self.repeat_text(&body.text, 0, Some(n - 1), true)?;
@@ -1140,14 +1419,18 @@ impl Rewriter<'_> {
             if let Some(a) = &before {
                 ways.push(self.concat(&[consuming(a.clone()), loop_rest.clone()], true)?);
             }
-            ways.push(self.concat(&[], true)?);
+            ways.push(self.exit_piece(&exit)?);
             ways.push(self.concat(&[consuming(b.clone()), loop_rest], true)?);
             loop_rest = self.alt(&ways, true)?;
         }
         self.changed = true;
         Ok(Piece {
             text: self.text(format!("(?:{})", loop_rest.text.text), Prec::Atom)?,
-            ways: loop_rest.ways,
+            ways: if exit.is_some() {
+                Ways::Unknown
+            } else {
+                loop_rest.ways
+            },
         })
     }
 }
@@ -1281,6 +1564,64 @@ mod tests {
         }
     }
 
+    /// #6332: with the groups tagged, a loop is written with every group it holds copied, and the
+    /// copies are listed for each group of the input. The consuming ways before the empty one are
+    /// written twice, and the empty way, which the loop leaves out, ends it as `E`: the body with
+    /// every character, class and `.` replaced by a class that never matches.
+    #[test]
+    fn a_loop_with_groups_is_written_with_the_copies_listed_6332() {
+        let copied = |pattern: &str| {
+            rewrite_with_groups(pattern).map(|g| (g.pattern, g.copies, g.compiled_groups))
+        };
+        assert_eq!(
+            copied("(?:(a)|b*|c)+"),
+            Some((
+                String::from(r"(?:(?:(a)|b+)*(?:c(?:(a)|b+)*)*?(?:(?:([^\s\S])||[^\s\S])))"),
+                vec![vec![0], vec![1, 2, 3]],
+                4
+            ))
+        );
+        // A group in the empty way is set by `E`, as the empty iteration sets it.
+        assert_eq!(
+            copied("(?:b*|()|a)+"),
+            Some((
+                String::from(r"(?:(?:b+)*(?:a(?:b+)*)*?(?:(?:|()|[^\s\S])))"),
+                vec![vec![0], vec![1]],
+                2
+            ))
+        );
+        // So is a group whose own empty way comes first.
+        assert_eq!(
+            copied("(?:(|a)|b)+"),
+            Some((
+                String::from(r"(?:(?:(a)|b)*?(?:(?:()|[^\s\S])))"),
+                vec![vec![0], vec![1, 2]],
+                3
+            ))
+        );
+        // Groups outside the loop stay as they were, and a name is dropped from every copy.
+        assert_eq!(
+            copied("(a)(?:b*|(c))+(?<n>d)"),
+            Some((
+                String::from(r"(a)(?:(?:b+)*(?:(c)(?:b+)*)*?(?:(?:|([^\s\S]))))(d)"),
+                vec![vec![0], vec![1], vec![2, 3], vec![4]],
+                5
+            ))
+        );
+        // Nothing to write: no group, no loop that needs it, only a bounded body with no `B`,
+        // a flag switch (the empty way of what it reaches is not worked out), or the tag itself.
+        for pattern in [
+            "(?:a|b){2,}",
+            "(?:b*|a)+",
+            "(a)(?:a|b)+",
+            "(?:(a)|b*){0,3}",
+            "(?i)(?:b*|(a))+",
+            "(?:b*|(a))+__succinctly_g1",
+        ] {
+            assert_eq!(copied(pattern), None, "{pattern}");
+        }
+    }
+
     /// A lazy repeat that must run twice or more (#6128): copy `k` leaves first once it is past the
     /// minimum, and takes its empty way in place before it.
     #[test]
@@ -1334,8 +1675,12 @@ mod tests {
         // A body that may match nothing gets an empty check around a loop's body.
         assert_eq!(ops("(?:a?)*"), None, "a repeat of a repeat is reduced");
         assert_eq!(ops("(?:a|)*"), Some(2 + (3 + 2)));
-        // Not worked out: a capture group, an assertion, a flag switch, a folded letter.
-        assert_eq!(ops("(a)"), None);
+        // A capture group is its body between the two operations that start and end it (#6332).
+        assert_eq!(ops("(a)"), Some(3));
+        assert_eq!(ops("(a|b?)"), Some(2 + 2 + 3));
+        assert_eq!(ops("(a)*"), None, "a repeat of a group is not worked out");
+        // Not worked out: an assertion, a flag switch, a folded letter.
+        assert_eq!(ops("(a^)"), None);
         assert_eq!(ops("^a"), None);
         assert_eq!(ops("(?i)a"), None);
         // An option group is its body (#6241), with the folding it sets.
@@ -1529,7 +1874,7 @@ mod tests {
         for _ in 0..20_000 {
             let extended = if roll(4) == 0 { "(?x)" } else { "" };
             let pattern = format!("{extended}{}", generate(4, &mut roll));
-            if rewrite_parsed(&pattern).is_some() {
+            if rewrite_parsed(&pattern, false).is_some() {
                 changed += 1;
                 assert!(may_need_rewrite(&pattern), "{pattern}");
             }

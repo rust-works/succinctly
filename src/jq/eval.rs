@@ -33077,10 +33077,10 @@ fn build_regex_uncached<S: EvalSemantics>(
     // rewritten pattern. The rewrite keeps every character, class and escape of the pattern, so
     // one the crate compiles stands for the pattern; one it refuses (its size limit) leaves the
     // pattern to compile as written, with the crate's own error if it has one.
-    let rewritten = (S::TAG != EvalTag::Yq)
+    let mut capture = (S::TAG != EvalTag::Yq)
         .then(|| super::onig_capture_loop::rewrite(&pattern))
         .flatten()
-        .and_then(|mut groups| {
+        .map(|mut groups| {
             // #6305: the repeated group's own loop copy is now a plain `(?:X)*`, which the #6106
             // rewrite can read (the group itself was a body with a capture group, which it
             // cannot): it leaves that loop where Oniguruma does. It writes no group, so the
@@ -33094,10 +33094,35 @@ fn build_regex_uncached<S: EvalSemantics>(
                     }
                 }
             }
+            groups
+        });
+    // #6332: a loop with a capture group in a way the plain rewrite would copy or drop is written
+    // with the group copied, and each copy is read back into the group (see `onig_loop`). It runs
+    // over the capture rewrite's pattern when there is one, composing the two readings; a result
+    // the crate refuses keeps what there was.
+    let mut rewritten = None;
+    if S::TAG != EvalTag::Yq && !longest {
+        let input = capture
+            .as_ref()
+            .map_or(pattern.as_str(), |groups| groups.pattern.as_str());
+        if let Some(copied) = super::onig_loop::rewrite_with_groups(input) {
+            if let Ok(re) = regex::Regex::new(&copied.pattern) {
+                if re.captures_len() == copied.compiled_groups {
+                    if let Some(groups) = compose_group_copies(capture.as_ref(), copied, &pattern) {
+                        capture = None;
+                        rewritten = Some(RegexEngine::Rewritten { re, groups });
+                    }
+                }
+            }
+        }
+    }
+    let rewritten = rewritten.or_else(|| {
+        capture.and_then(|groups| {
             let re = regex::Regex::new(&groups.pattern).ok()?;
             (re.captures_len() == groups.compiled_groups)
                 .then_some(RegexEngine::Rewritten { re, groups })
-        });
+        })
+    });
     // The pattern as written replaces the #6106 rewrite only when it compiles where the rewrite does
     // not (an engine limit). A pattern the crate refuses either way keeps its rewrite for
     // `fancy-regex` (#6128), and is refused in the words of the pattern as written.
@@ -33169,6 +33194,52 @@ fn empty_match_is_position_free(pattern: &str) -> bool {
     ast::parse::Parser::new()
         .parse(pattern)
         .is_ok_and(|ast| assertion_free(&ast))
+}
+
+/// The groups of the pattern `copied` was written from, read back from its copies (#6332). When
+/// `base` (the capture rewrite of #6069) wrote that pattern from `pattern`, each of its groups is
+/// read through the copies `base` made of the original's; otherwise `pattern` is the original.
+#[cfg(feature = "regex")]
+fn compose_group_copies(
+    base: Option<&super::onig_capture_loop::LoopRewrite>,
+    copied: super::onig_loop::GroupRewrite,
+    pattern: &str,
+) -> Option<super::onig_capture_loop::LoopRewrite> {
+    let (names, copies): (Box<[Option<Box<str>>]>, Vec<Box<[usize]>>) = match base {
+        Some(base) => (
+            base.names.clone(),
+            base.copies
+                .iter()
+                .map(|through| {
+                    through
+                        .iter()
+                        .flat_map(|&group| copied.copies.get(group).into_iter().flatten().copied())
+                        .collect()
+                })
+                .collect(),
+        ),
+        None => {
+            let names = std_regex(pattern)
+                .ok()?
+                .capture_names()
+                .map(|name| name.map(Box::from))
+                .collect();
+            (
+                names,
+                copied
+                    .copies
+                    .iter()
+                    .map(|group| group.as_slice().into())
+                    .collect(),
+            )
+        }
+    };
+    Some(super::onig_capture_loop::LoopRewrite {
+        pattern: copied.pattern,
+        copies: copies.into_boxed_slice(),
+        names,
+        compiled_groups: copied.compiled_groups,
+    })
 }
 
 /// The `regex` crate's compilation of `pattern`, guarded by [`guard_prefix_lifting`] (#6134). A

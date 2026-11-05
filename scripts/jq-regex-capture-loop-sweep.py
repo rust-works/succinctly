@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Differential sweep for #6310: a capture group inside a greedy loop's body.
+"""Differential sweep for #6310 and #6332: a capture group inside a loop's body.
 
     scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--jq /usr/bin/jq]
 
 Oniguruma ends a greedy loop at the first iteration that matches nothing (#6106), and that holds when the
-body has a capture group in a way after its empty one (`(?:b*|(a))+`, #6310). This draws `--count` loops
+body has a capture group: after its empty way (`(?:b*|(a))+`, #6310), or before it, in it, or with its own
+empty way first (`(?:(a)|b*|c)+`, #6332). This draws `--count` loops
 at random from a pool of atoms (capture groups, nullable and consuming, among them), each with a body of
 two or three ways, one of 13 quantifiers, a plain or capturing group around it, and sometimes a prefix or
 a suffix. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
