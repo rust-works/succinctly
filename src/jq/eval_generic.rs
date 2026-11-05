@@ -1731,13 +1731,15 @@ impl<C: DocumentCursor> WalkHole<C> for AroundTarget<'_, C> {
     }
 }
 
-/// A child of a walk that has a hole (#6232): the hole itself is a `null`, a container above it is
-/// walked on, and anything else is read in one pass where the text is plain JSON
-/// ([`DocumentCursor::plain_owned_jq`], as the whole-document copy reads the root) and walked
-/// without a hole otherwise.
+/// A child of a container (#6232), given where it `standing`s to the walk's hole: the hole itself is
+/// a `null`, a container above it is walked on with the hole, and anything else is read in one pass
+/// where the text is plain JSON ([`DocumentCursor::plain_owned_jq`], as the whole-document copy
+/// reads the root) and walked without a hole otherwise. A walk with no hole hands back the bound
+/// node's own value where one is named ([`embed_shared_nested`]), else walks the child.
 #[allow(clippy::too_many_arguments)]
-fn holed_child<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput, H: WalkHole<C>>(
+fn walk_member<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput, H: WalkHole<C>>(
     hole: &H,
+    standing: HoleStanding,
     cursor: &C,
     known: Option<C::Value>,
     capacity: usize,
@@ -1745,10 +1747,23 @@ fn holed_child<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput, H: Walk
     check_depth: &impl Fn(usize) -> Result<(), EvalError>,
     scalar_override: &impl Fn(&C, &C::Value) -> Option<OwnedValue>,
     nested: &[usize],
-) -> Result<(B::Out, HoleStanding), EvalError> {
-    let standing = hole.standing(cursor);
-    let out = match standing {
-        HoleStanding::Target => B::scalar(OwnedValue::Null),
+) -> Result<B::Out, EvalError> {
+    if !H::ACTIVE {
+        return match embed_shared_nested::<_, B>(cursor, depth, nested) {
+            Some(child) => Ok(child),
+            None => walk_child::<S, _, B>(
+                cursor,
+                known,
+                capacity,
+                depth,
+                check_depth,
+                scalar_override,
+                nested,
+            ),
+        };
+    }
+    match standing {
+        HoleStanding::Target => Ok(B::scalar(OwnedValue::Null)),
         HoleStanding::OnPath => walk_child_holed::<S, _, B, H>(
             cursor,
             known,
@@ -1758,7 +1773,7 @@ fn holed_child<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput, H: Walk
             scalar_override,
             nested,
             hole,
-        )?,
+        ),
         HoleStanding::Elsewhere => {
             let plain = if depth + PLAIN_READ_DEPTH <= MAX_NESTING_DEPTH {
                 cursor.plain_owned_jq()
@@ -1766,7 +1781,7 @@ fn holed_child<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput, H: Walk
                 None
             };
             match plain {
-                Some(plain) => B::scalar(plain),
+                Some(plain) => Ok(B::scalar(plain)),
                 None => walk_child::<S, _, B>(
                     cursor,
                     known,
@@ -1775,11 +1790,10 @@ fn holed_child<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput, H: Walk
                     check_depth,
                     scalar_override,
                     nested,
-                )?,
+                ),
             }
         }
-    };
-    Ok((out, standing))
+    }
 }
 
 /// Walk one child of a container: a scalar the format's override answers is
@@ -1964,17 +1978,10 @@ fn to_owned_cursor_at_depth_holed<
                 field.checked_key_lazy(&f, || value.as_object_rendered(), consumed, &mut ledger)?;
                 String::new()
             };
-            let child = if H::ACTIVE {
-                let (child, standing) = holed_child::<S, _, B, H>(
-                    hole,
-                    &field.value_cursor,
-                    C::REUSE_FIELD_VALUE.then_some(field.value),
-                    0,
-                    depth + 1,
-                    check_depth,
-                    scalar_override,
-                    nested,
-                )?;
+            let standing = hole.standing(&field.value_cursor);
+            if H::ACTIVE {
+                // A hole is a `null` in a walk that keeps its members, whose keys this reads.
+                debug_assert!(B::KEEPS_MEMBERS);
                 // A key repeated beside the way to the hole is a member that is not the hole: the
                 // lookup that found it and this walk disagree about which one it is, and the
                 // caller leaves such a document to the whole-document route.
@@ -1986,21 +1993,18 @@ fn to_owned_cursor_at_depth_holed<
                 if standing != HoleStanding::Elsewhere {
                     pinned = Some(key.clone());
                 }
-                child
-            } else {
-                match embed_shared_nested::<_, B>(&field.value_cursor, depth + 1, nested) {
-                    Some(child) => child,
-                    None => walk_child::<S, _, B>(
-                        &field.value_cursor,
-                        C::REUSE_FIELD_VALUE.then_some(field.value),
-                        0,
-                        depth + 1,
-                        check_depth,
-                        scalar_override,
-                        nested,
-                    )?,
-                }
-            };
+            }
+            let child = walk_member::<S, _, B, H>(
+                hole,
+                standing,
+                &field.value_cursor,
+                C::REUSE_FIELD_VALUE.then_some(field.value),
+                0,
+                depth + 1,
+                check_depth,
+                scalar_override,
+                nested,
+            )?;
             if !nested.is_empty() {
                 // A later member with the same key replaces the value, so an
                 // earlier watched member is in no value this walk returns -- except as
@@ -2065,32 +2069,17 @@ fn to_owned_cursor_at_depth_holed<
                 watched.push((elem_cursor.node_id(), OwnedValue::Int(index)));
             }
             let capacity = if sized { siblings.capacity() } else { 0 };
-            let child = if H::ACTIVE {
-                holed_child::<S, _, B, H>(
-                    hole,
-                    &elem_cursor,
-                    C::REUSE_FIELD_VALUE.then(|| elem_cursor.value()),
-                    capacity,
-                    depth + 1,
-                    check_depth,
-                    scalar_override,
-                    nested,
-                )?
-                .0
-            } else {
-                match embed_shared_nested::<_, B>(&elem_cursor, depth + 1, nested) {
-                    Some(child) => child,
-                    None => walk_child::<S, _, B>(
-                        &elem_cursor,
-                        C::REUSE_FIELD_VALUE.then(|| elem_cursor.value()),
-                        capacity,
-                        depth + 1,
-                        check_depth,
-                        scalar_override,
-                        nested,
-                    )?,
-                }
-            };
+            let child = walk_member::<S, _, B, H>(
+                hole,
+                hole.standing(&elem_cursor),
+                &elem_cursor,
+                C::REUSE_FIELD_VALUE.then(|| elem_cursor.value()),
+                capacity,
+                depth + 1,
+                check_depth,
+                scalar_override,
+                nested,
+            )?;
             if sized {
                 siblings.push(B::object_len(&child), capacity);
             }
@@ -6258,19 +6247,11 @@ fn update_filter_is_native(filter: &Expr) -> bool {
     }
 }
 
-/// The node `steps` name below `root`, found by lookup, with the node ids of the containers on the way
-/// to it (the target's ancestors below `root`, outermost first), or `None` where a step does not land
-/// on the container it needs (a `null` on the way, a missing key, an index past the end).
-fn update_target_cursor<C: DocumentCursor>(
-    root: &C,
-    steps: &[StepKey<'_>],
-) -> Option<(C, Vec<usize>)> {
+/// The node `steps` name below `root`, found by lookup, or `None` where a step does not land on
+/// the container it needs (a `null` on the way, a missing key, an index past the end).
+fn update_target_cursor<C: DocumentCursor>(root: &C, steps: &[StepKey<'_>]) -> Option<C> {
     let mut at = *root;
-    let mut above = Vec::new();
-    for (i, step) in steps.iter().enumerate() {
-        if i > 0 {
-            above.push(at.node_id());
-        }
+    for step in steps {
         let value = at.value();
         at = match step {
             StepKey::Field(name) => value.as_object_rendered()?.find_cursor(name).ok()??,
@@ -6279,7 +6260,36 @@ fn update_target_cursor<C: DocumentCursor>(
                 .get_cursor(usize::try_from(*index).ok()?)?,
         };
     }
-    Some((at, above))
+    Some(at)
+}
+
+/// The node ids of the containers `steps` pass through below `root`, outermost first, the target
+/// not among them: the ones [`AroundTarget`] walks. Found after the size gates, so that an update
+/// they decline allocates nothing.
+fn containers_above_target<C: DocumentCursor>(root: &C, steps: &[StepKey<'_>]) -> Vec<usize> {
+    let mut above = Vec::new();
+    let mut at = *root;
+    for (i, step) in steps.iter().enumerate() {
+        if i > 0 {
+            above.push(at.node_id());
+        }
+        let value = at.value();
+        let next = match step {
+            StepKey::Field(name) => value
+                .as_object_rendered()
+                .and_then(|fields| fields.find_cursor(name).ok().flatten()),
+            StepKey::Index(index) => usize::try_from(*index).ok().and_then(|index| {
+                value
+                    .as_array()
+                    .and_then(|elements| elements.get_cursor(index))
+            }),
+        };
+        match next {
+            Some(next) => at = next,
+            None => break, // patchcov: coverage tolerate-line reason="unreachable: update_target_cursor walked these same steps to the target"
+        }
+    }
+    above
 }
 
 /// `path |= filter` answered on the document's cursor, or `None` to leave it to the whole-document
@@ -6331,7 +6341,7 @@ fn update_on_cursor_gated<S: EvalSemantics, V: DocumentValue>(
     }
     let mut steps = Vec::new();
     static_path_steps(path, &mut steps)?;
-    let (target, above) = update_target_cursor(root, &steps)?;
+    let target = update_target_cursor(root, &steps)?;
     if size_gates {
         let target_span = target.subtree_end()?.checked_sub(target.node_id())?;
         if target_span.saturating_mul(CURSOR_UPDATE_TARGET_SHARE) < root_span {
@@ -6382,6 +6392,7 @@ fn update_on_cursor_gated<S: EvalSemantics, V: DocumentValue>(
     // The containers on the way, rebuilt around a `null` where the target stands (#6232: the shared
     // walk with a hole). A malformed sibling, and a key repeated on the way, make the walk fail, which
     // is left to the whole-document copy that raises its error or answers for the repeat.
+    let above = containers_above_target(root, &steps);
     let hole = AroundTarget {
         target: &target,
         above: &above,
