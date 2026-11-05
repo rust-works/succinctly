@@ -138,29 +138,24 @@ fn has_switch(ast: &Ast) -> bool {
 /// Whether a capture group stands anywhere in `ast`.
 fn has_capture(ast: &Ast) -> bool {
     let mut found = Vec::new();
-    collect_captures(ast, "", &mut found);
+    collect_captures(ast, &mut found);
     !found.is_empty()
 }
 
-/// The capture groups of `ast` in the order they open, each as its text in `text` (the text `ast`
-/// was parsed from; `""` when only whether there are any is wanted).
-fn collect_captures<'t>(ast: &Ast, text: &'t str, out: &mut Vec<&'t str>) {
+/// The capture groups of `ast` in the order they open, each as its name (`None` for an unnamed one).
+fn collect_captures(ast: &Ast, out: &mut Vec<Option<String>>) {
     match ast {
         Ast::Group(group) => {
-            if !matches!(group.kind, GroupKind::NonCapturing(_)) {
-                out.push(
-                    text.get(group.span.start.offset..group.span.end.offset)
-                        .unwrap_or(""),
-                );
+            match &group.kind {
+                GroupKind::CaptureIndex(_) => out.push(None),
+                GroupKind::CaptureName { name, .. } => out.push(Some(name.name.clone())),
+                GroupKind::NonCapturing(_) => {}
             }
-            collect_captures(&group.ast, text, out);
+            collect_captures(&group.ast, out);
         }
-        Ast::Alternation(alt) => alt.asts.iter().for_each(|a| collect_captures(a, text, out)),
-        Ast::Concat(concat) => concat
-            .asts
-            .iter()
-            .for_each(|a| collect_captures(a, text, out)),
-        Ast::Repetition(rep) => collect_captures(&rep.ast, text, out),
+        Ast::Alternation(alt) => alt.asts.iter().for_each(|a| collect_captures(a, out)),
+        Ast::Concat(concat) => concat.asts.iter().for_each(|a| collect_captures(a, out)),
+        Ast::Repetition(rep) => collect_captures(&rep.ast, out),
         _ => {}
     }
 }
@@ -971,46 +966,34 @@ impl Rewriter<'_> {
         let iteration = self.concat(&iteration, true)?;
         parts.push(self.repeat(iteration, 0, None, false)?);
         let piece = self.concat(&parts, true)?;
-        let text = self.text(format!("(?:{})", piece.text.text), Prec::Atom)?;
+        // #6310: only a group in `B` survives the rewrite.
         if !self.groups_only_in_later_ways(&written, &before_text, &b_text) {
-            return Ok(Piece {
-                text: written,
-                ways: Ways::Unknown,
-            });
+            return Ok(Self::unlisted(written));
         }
         self.changed = true;
         Ok(Piece {
-            text,
+            text: self.text(format!("(?:{})", piece.text.text), Prec::Atom)?,
             ways: piece.ways,
         })
     }
 
-    /// `written` when it holds no capture group, and `Err(written)` when it does, for a rewrite that
-    /// copies its body (#6310). Only [`Self::exit_on_empty`] may keep a group, in the ways after
-    /// the empty one ([`Self::groups_only_in_later_ways`]): the copies of a counted repeat each
-    /// hold the body's groups again, and an empty way that holds one sets it to the empty string,
-    /// which a rewrite that leaves that way out of the loop does not.
-    fn without_captures(&self, written: Text) -> Result<Text, Text> {
-        if !self.has_groups(&written) {
-            Ok(written)
-        } else {
-            Err(written)
-        }
-    }
-
-    /// The capture groups of `text` in the order they open, each as its own text, or `None` for a
-    /// text the parser cannot read (syntax only `fancy-regex` reads).
-    fn captures_of(text: &str) -> Option<Vec<String>> {
+    /// The capture groups of `text` in the order they open, each as its name, or `None` for a text
+    /// the parser cannot read (syntax only `fancy-regex` reads). The parse is charged to the work
+    /// budget, as building the text was.
+    fn captures_of(&self, text: &str) -> Option<Vec<Option<String>>> {
+        self.work.set(self.work.get().saturating_add(text.len()));
         let ast = ast::parse::Parser::new().parse(text).ok()?;
         let mut found = Vec::new();
-        collect_captures(&ast, text, &mut found);
-        Some(found.into_iter().map(String::from).collect())
+        collect_captures(&ast, &mut found);
+        Some(found)
     }
 
     /// Whether the rewrite `A*(?:B A*)*?` of the loop `written` over `A | ε | B` keeps its capture
-    /// groups exactly (#6310): `B` is written once, so it may hold them, in order, and every one of
-    /// them must be there. `A` is written twice and the empty way not at all, so neither may hold
-    /// one. A text the parser cannot read is not kept.
+    /// groups (#6310): `B` is written once, so it may hold them, and every one of them must be there,
+    /// in the same order, under the same names. `A` is written twice and the empty way not at all, so
+    /// neither may hold one. A group's own text is not compared (`(a*)` is `(a+)` in `B`), and a way
+    /// that would copy a group is not listed ([`Self::has_groups`]), so a way of `B` holds each group
+    /// at most once. A text the parser cannot read is not kept.
     fn groups_only_in_later_ways(
         &self,
         written: &Text,
@@ -1020,17 +1003,22 @@ impl Rewriter<'_> {
         if !self.captures {
             return true;
         }
-        let none = |text: &Option<Text>| text.as_ref().map_or(true, |t| !self.has_groups(t));
-        // The ways are written from the group's body, so a group's text changes (`(a*)` is `(a+)` in
-        // `B`) and only how many there are is compared; none is copied, as `Self::concat` and
-        // `Self::repeat` leave a way that would copy one unlisted.
-        let count = |text: &str| Self::captures_of(text).map(|found| found.len());
-        none(before) && count(&written.text).is_some() && count(&written.text) == count(&after.text)
+        let none = !before.as_ref().is_some_and(|t| self.has_groups(t));
+        let all = self.captures_of(&written.text);
+        none && all.is_some() && all == self.captures_of(&after.text)
     }
 
     /// Whether `text` holds a capture group, or cannot be read to tell (#6310).
     fn has_groups(&self, text: &Text) -> bool {
-        self.captures && Self::captures_of(&text.text) != Some(Vec::new())
+        self.captures && self.captures_of(&text.text) != Some(Vec::new())
+    }
+
+    /// `written`, the loop as it was, for a loop the rewrite leaves alone because of a capture group.
+    fn unlisted(written: Text) -> Piece {
+        Piece {
+            text: written,
+            ways: Ways::Unknown,
+        }
     }
 
     /// Whether Oniguruma writes the lazy, unbounded `X{min,}?` out as `min` plain copies of `X`
@@ -1080,11 +1068,9 @@ impl Rewriter<'_> {
         max: Option<u32>,
         written: Text,
     ) -> Result<Piece, GiveUp> {
-        if let Err(written) = self.without_captures(written) {
-            return Ok(Piece {
-                text: written,
-                ways: Ways::Unknown,
-            });
+        // #6310: each copy holds the body's groups again.
+        if self.has_groups(&written) {
+            return Ok(Self::unlisted(written));
         }
         let consuming = |text: Text| Piece {
             text,
@@ -1148,11 +1134,9 @@ impl Rewriter<'_> {
             text,
             ways: Ways::Consuming,
         };
-        if let Err(written) = self.without_captures(written) {
-            return Ok(Piece {
-                text: written,
-                ways: Ways::Unknown,
-            });
+        // #6310: each copy holds the body's groups again.
+        if self.has_groups(&written) {
+            return Ok(Self::unlisted(written));
         }
         let mut loop_rest = body.clone();
         for _ in 1..n {
