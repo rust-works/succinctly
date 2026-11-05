@@ -1255,6 +1255,36 @@ mod tests {
         assert!(rewrite("(?i)(?:s?|.){2,}?").is_some(), "`s` starts a fold");
         // The copies a count of six or seven makes are written out in full.
         assert!(rewrite("(?:b*|\\w){6,}?").is_some());
+        assert!(rewrite("(?:b*|\\w){7,}?").is_some());
+    }
+
+    /// #6302: each count doubles the text of a lazy `{n,}?` over a body with a consuming way before
+    /// its empty one (`(?:b*||\\w)`), because every level holds the next level twice with the empty
+    /// way between the two, so no spelling in the `regex` crate's syntax is smaller. The text of
+    /// one rewritten pattern is capped at 32 KiB (`Rewriter::limit`): this body, whose `\\w` is two
+    /// characters here and a bracketed class of several hundred once the pattern has been read,
+    /// passes it at `{11,}?`, and `docs/compliance/jq/limitations.md` records the counts at which
+    /// the bodies it names pass it. Lifting the cap would not move that far, since the `regex` crate
+    /// then compiles a pattern that doubles with every further count (0.28 s at `{8,}?` and 74 s at
+    /// `{16,}?` in a debug build, with the cap lifted).
+    #[test]
+    fn a_lazy_counted_repeat_doubles_with_its_count_and_is_given_up_at_eleven_6302() {
+        let size = |n: u32| rewrite(&format!("(?:b*||\\w){{{n},}}?")).map(|text| text.len());
+        let sizes: Vec<Option<usize>> = (4..=10).map(size).collect();
+        assert!(sizes.iter().all(Option::is_some), "{sizes:?}");
+        // Doubling, to within the fixed text each level adds.
+        for pair in sizes.windows(2) {
+            let (small, large) = (pair[0].unwrap(), pair[1].unwrap());
+            assert!(
+                (large * 10 >= small * 19) && (large * 10 <= small * 24),
+                "{small} then {large}"
+            );
+        }
+        assert!(sizes[6].unwrap() < 32 * 1024, "{sizes:?}");
+        assert!(sizes[6].unwrap() * 2 > 32 * 1024, "{sizes:?}");
+        for n in 11..=14 {
+            assert_eq!(size(n), None, "{{{n},}}? is past the cap");
+        }
     }
 
     #[test]
