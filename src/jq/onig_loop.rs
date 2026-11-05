@@ -1429,6 +1429,17 @@ impl Rewriter<'_> {
     }
 
     fn empty_into(&self, ast: &Ast, out: &mut String) {
+        if matches!(
+            ast,
+            Ast::Literal(_)
+                | Ast::Dot(_)
+                | Ast::ClassUnicode(_)
+                | Ast::ClassPerl(_)
+                | Ast::ClassBracketed(_)
+        ) {
+            out.push_str(NEVER);
+            return;
+        }
         // A part with no group and no assertion only says whether it can match nothing: it can, at
         // any position, or it cannot, so it is written as nothing or as one failing class.
         if !has_capture(ast) && !has_assertion_or_flags(ast) {
@@ -1445,7 +1456,7 @@ impl Rewriter<'_> {
             | Ast::Dot(_)
             | Ast::ClassUnicode(_)
             | Ast::ClassPerl(_)
-            | Ast::ClassBracketed(_) => out.push_str(NEVER),
+            | Ast::ClassBracketed(_) => unreachable!("a leaf is written above"),
             Ast::Group(group) => {
                 let inner = group.ast.span();
                 out.push_str(&self.source[group.span.start.offset..inner.start.offset]);
@@ -1470,10 +1481,8 @@ impl Rewriter<'_> {
                 out.push_str("(?:");
                 self.empty_into(&rep.ast, out);
                 out.push(')');
+                // The operator's span holds the `?` of a lazy one.
                 out.push_str(self.verbatim(&rep.op.span));
-                if !rep.greedy && !self.verbatim(&rep.op.span).ends_with('?') {
-                    out.push('?');
-                }
             }
         }
     }
@@ -1721,6 +1730,15 @@ mod tests {
             copied("(?is)(?-i)(?:b*|(a))+").map(|g| g.0.starts_with("(?is)(?-i)")),
             Some(true)
         );
+        // An assertion beside what consumes text is copied with it, and stays in `E`; a lazy repeat
+        // of a group keeps its `?` there.
+        assert_eq!(
+            copied(r"(?:(a)\b|b*|c)+").map(|g| g.0),
+            Some(String::from(
+                r"(?:(?:(a)\b|b+)*(?:c(?:(a)\b|b+)*)*?(?:(?:([^\s\S])\b||[^\s\S])))"
+            ))
+        );
+        assert!(copied("(?:(a)+?|b*|c)+").is_some_and(|g| g.0.contains(r"(?:([^\s\S]))+?")));
         // Nothing to write: no group, no loop that needs it, only a bounded body with no `B`,
         // a flag switch (the empty way of what it reaches is not worked out), or the tag itself.
         for pattern in [
@@ -1731,6 +1749,7 @@ mod tests {
             "(?x)(?:b*|(a))+",
             "(?U)(?:b*|(a))+",
             "(?:b*|(a))+(?i)",
+            "(?:(?i)|b*|(a))+",
             "(?:b*|(a))+__succinctly_g1",
             // A loop inside a repeat that can run it again, which the rewrite does not reach.
             "(?:(?:(a)|b*|c)+)+",

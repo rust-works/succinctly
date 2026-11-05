@@ -139127,6 +139127,48 @@ mod tests {
         assert_eq!(compiled(&nested(depth)), guarded(nested(depth)));
     }
 
+    /// #6332: a loop with a capture group the plain rewrite would copy or drop is written with the
+    /// groups copied, and each group lists its copies; beside a repeated group the capture rewrite
+    /// of #6069 writes too, and the two lists are composed.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn build_regex_lists_the_copies_of_a_loop_with_groups_6332() {
+        let groups = |pattern: &str| match build_regex_uncached::<JqSemantics>(pattern, None) {
+            Ok(JqRegex {
+                engine: RegexEngine::Rewritten { re, groups },
+                ..
+            }) => {
+                assert_eq!(re.captures_len(), groups.compiled_groups, "{pattern}");
+                groups
+            }
+            _ => panic!("{pattern} is rewritten"),
+        };
+        // The loop writes the group twice and its empty way once, and the capture rewrite of #6069,
+        // which reads a repeated body that can match empty, its own empty iteration after that.
+        let g = groups("(?:(?<x>a)|b*|c)+");
+        assert_eq!(
+            g.copies.iter().map(|c| c.to_vec()).collect::<Vec<_>>(),
+            [vec![0], vec![1, 2, 3, 4]]
+        );
+        assert_eq!(g.names.to_vec(), [None, Some("x".into())]);
+        // The repeated group `(a*)*` is captured in the capture rewrite's `E` alone, and the second
+        // group's copies are those of the loop rewrite, each read through the first's.
+        let g = groups("(a*)*(?:(a)|b*|c)+");
+        assert_eq!(
+            g.copies.iter().map(|c| c.to_vec()).collect::<Vec<_>>(),
+            [vec![0], vec![1], vec![2, 3, 4, 5]]
+        );
+        assert_eq!(g.names.len(), 3);
+        // Under the flag `i` the switch in front stays there.
+        match build_regex_uncached::<JqSemantics>("(?:(a)|b*|c)+", Some("i")) {
+            Ok(JqRegex {
+                engine: RegexEngine::Rewritten { groups, .. },
+                ..
+            }) => assert!(groups.pattern.starts_with("(?i)")),
+            _ => panic!("rewritten under i"),
+        }
+    }
+
     /// #6134: an alternation whose branches are all sequences holding a repeat gets a first branch
     /// that never matches, at the start of the alternation, with the first branch's leading and
     /// trailing assertions, so that `regex-syntax` cannot factor a shared prefix out of it and the
