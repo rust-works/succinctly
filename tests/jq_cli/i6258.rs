@@ -87,6 +87,18 @@ fn a_literal_slice_of_an_owned_value_answers_as_jq_does_6258() -> Result<()> {
             r"[5,5,5]
 ",
         ),
+        (
+            r"[0,1,2,3,4,5]",
+            r#". as $a | $a[1.5:3.5], $a[-1.5:], $a[null:2], $a[1:null], $a[{"start":1,"end":2}], $a[nan:2], $a[1:infinite]"#,
+            r"[1,2,3]
+[4,5]
+[0,1]
+[1,2,3,4,5]
+[1]
+[0,1]
+[1,2,3,4,5]
+",
+        ),
     ] {
         let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
         assert_eq!(

@@ -85220,7 +85220,7 @@ pub(crate) fn eval_owned_fast_path<S: EvalSemantics>(
         }
         // #6258: a slice with literal bounds of an owned array or string is a cut of the value, as
         // the computed spelling and the fold step already read it. Through the bridge each call
-        // wrote the whole value out as JSON, indexed it and decoded the kept part: 2.5 s and
+        // wrote the whole value out as JSON, indexed it and decoded the kept part: 1.9 s and
         // 1.2 GB for `. as $a | [range(100) | $a[:2]]` over 200,000 integers. Any other target
         // (null, an object, a scalar) keeps the bridge's answer and its error text.
         Expr::Slice { start, end, .. }
