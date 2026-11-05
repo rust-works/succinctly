@@ -2061,6 +2061,59 @@ mod tests {
         assert_eq!(buf, "null");
     }
 
+    /// #6319: an infinite number is jq's to print under the jq conventions, yq's (`null`) under
+    /// `Preserve`. A computed infinity is the `DBL_MAX` text, an overflowing literal its canonical
+    /// spelling (`JqCompat`) or its own text (`JqPreserveInput`).
+    #[test]
+    fn test_stream_json_infinite_numbers_follow_the_convention_6319() {
+        let literal =
+            || OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1e400".into());
+        let negative =
+            || OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-1e400".into());
+        let float = || OwnedValue::Float(f64::INFINITY);
+        let print = |value: OwnedValue, numbers| {
+            let mut buf = String::new();
+            value
+                .stream_json(&mut buf, IndentSpec::COMPACT, false, numbers)
+                .unwrap();
+            buf
+        };
+        for (numbers, literal_text, negative_text, float_text) in [
+            (
+                JsonConvention::JqCompat,
+                "1E+400",
+                "-1E+400",
+                "1.7976931348623157e+308",
+            ),
+            (
+                JsonConvention::JqPreserveInput,
+                "1e400",
+                "-1e400",
+                "1.7976931348623157e+308",
+            ),
+            (JsonConvention::Preserve, "null", "null", "null"),
+        ] {
+            assert_eq!(
+                print(literal(), numbers),
+                literal_text,
+                "{numbers:?} literal"
+            );
+            assert_eq!(
+                print(negative(), numbers),
+                negative_text,
+                "{numbers:?} negative"
+            );
+            assert_eq!(print(float(), numbers), float_text, "{numbers:?} float");
+        }
+        assert_eq!(
+            print(
+                OwnedValue::Float(f64::NEG_INFINITY),
+                JsonConvention::JqCompat
+            ),
+            "-1.7976931348623157e+308"
+        );
+    }
+
     /// #2209: `JqPreserveInput` is jq mode under `--preserve-input` --
     /// jq's escape table paired with the source number spelling. It is the
     /// one convention neither pre-existing owned-value streamer could
