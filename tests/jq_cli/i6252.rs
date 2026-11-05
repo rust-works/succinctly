@@ -94,7 +94,17 @@ fn test_what_is_not_the_absence_operator_is_left_alone_6252() -> Result<()> {
         (r#"[[0,"ab"],[2,"ab"]]"#, 0),
         "{stderr}"
     );
-    for pattern in ["(?~|ab)", "(?~a(?~b))", r"\Q(?~ab)\E(?~c)", "(?~ab"] {
+    // A `#` in a class or after a backslash is no comment under the `x` flag.
+    let (stdout, code, stderr) = matches("xa#b", r"(?~a)[#]", "gx")?;
+    assert_eq!((stdout.as_str(), code), (r##"[[2,"#"]]"##, 0), "{stderr}");
+    for pattern in [
+        "(?~|ab)",
+        "(?~a(?~b))",
+        r"\Q(?~ab)\E(?~c)",
+        "(?~ab",
+        "(?<=(?~a))b",
+        "(?<!(?~a))b",
+    ] {
         let (stdout, code, stderr) = matches("abab", pattern, "g")?;
         assert_ne!(code, 0, "{pattern}: {stdout}");
         assert!(stderr.contains("invalid regex"), "{pattern}: {stderr}");
