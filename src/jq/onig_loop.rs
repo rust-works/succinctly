@@ -1000,7 +1000,7 @@ impl Rewriter<'_> {
 
     /// The capture groups of `text` in the order they open, each as its own text, or `None` for a
     /// text the parser cannot read (syntax only `fancy-regex` reads).
-    fn captures_of(&self, text: &str) -> Option<Vec<String>> {
+    fn captures_of(text: &str) -> Option<Vec<String>> {
         let ast = ast::parse::Parser::new().parse(text).ok()?;
         let mut found = Vec::new();
         collect_captures(&ast, text, &mut found);
@@ -1020,17 +1020,17 @@ impl Rewriter<'_> {
         if !self.captures {
             return true;
         }
-        let none = |text: &Option<Text>| text.as_ref().is_none_or(|t| !self.has_groups(t));
+        let none = |text: &Option<Text>| text.as_ref().map_or(true, |t| !self.has_groups(t));
         // The ways are written from the group's body, so a group's text changes (`(a*)` is `(a+)` in
         // `B`) and only how many there are is compared; none is copied, as `Self::concat` and
         // `Self::repeat` leave a way that would copy one unlisted.
-        let count = |text: &str| self.captures_of(text).map(|found| found.len());
+        let count = |text: &str| Self::captures_of(text).map(|found| found.len());
         none(before) && count(&written.text).is_some() && count(&written.text) == count(&after.text)
     }
 
     /// Whether `text` holds a capture group, or cannot be read to tell (#6310).
     fn has_groups(&self, text: &Text) -> bool {
-        self.captures && self.captures_of(&text.text) != Some(Vec::new())
+        self.captures && Self::captures_of(&text.text) != Some(Vec::new())
     }
 
     /// Whether Oniguruma writes the lazy, unbounded `X{min,}?` out as `min` plain copies of `X`
