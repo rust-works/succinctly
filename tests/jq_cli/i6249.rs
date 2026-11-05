@@ -28,7 +28,7 @@ fn a_repeat_with_nothing_to_repeat_is_refused_6249() -> Result<()> {
         (r"x0", r"(?:?a)", "g"),
     ] {
         let filter = format!(
-            r#"{} | [match({}; {}) | .string]"#,
+            r"{} | [match({}; {}) | .string]",
             serde_json::to_string(subject)?,
             serde_json::to_string(pattern)?,
             serde_json::to_string(flags)?
