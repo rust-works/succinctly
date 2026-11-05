@@ -17,6 +17,19 @@ const REFUSED: &[&str] = &[
     "a: !<tag:x>{b: 1}\n",
     "[!<tag:x>:1]\n",
     "!<tag:x>: 1\n",
+    // after an anchor, after `---`, as a flow mapping value or key, as an explicit key, before an
+    // alias
+    "&a !<t>x\n",
+    "!<t>&a x\n",
+    "--- !<t>x\n",
+    "{a: !<t>x}\n",
+    "{!<t>x: 1}\n",
+    "? !<t>x\n",
+    "!<t>*a\n",
+    "a: &x v\nb: !<t>*x\n",
+    "- &a !<t>x\n",
+    "- !<t>x: 1\n",
+    "k: !<t>x: 1\n",
 ];
 
 #[test]
@@ -41,6 +54,11 @@ const ACCEPTED: &[(&str, &str)] = &[
     ("!<tag:x>\n", "\"\"\n"),
     ("!<!bar> a\n", "\"a\"\n"),
     ("? !<tag:x> a\n", "{\"a\":null}\n"),
+    ("&a !<t> x\n", "\"x\"\n"),
+    ("--- !<t> x\n", "\"x\"\n"),
+    ("? !<t> x\n", "{\"x\":null}\n"),
+    ("{!<t> x: 1}\n", "{\"x\":1}\n"),
+    ("!<t>\nx: 1\n", "{\"x\":1}\n"),
 ];
 
 #[test]
