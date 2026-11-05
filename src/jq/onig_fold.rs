@@ -34,7 +34,6 @@ use alloc::vec::Vec;
 
 use regex_syntax::ast::{self, Ast, Flag, FlagsItemKind, GroupKind};
 
-use super::eval::JQ_WORD_CLASS;
 use super::onig_fold_data::{FOLDS2, FOLDS3, FOLD_KEY};
 
 /// The `i` and `x` options in force at a point of the pattern.
@@ -398,7 +397,7 @@ impl Walker<'_> {
         }
         // The class the translation writes for `\w` is not a class of the pattern: Oniguruma reads
         // `\w` as a character type, and adds nothing to it.
-        if text.strip_prefix('[').and_then(|t| t.strip_suffix(']')) == Some(JQ_WORD_CLASS) {
+        if super::eval::is_translated_word_class(text) {
             return;
         }
         let x = if options.extended { "x" } else { "" };
@@ -520,6 +519,7 @@ fn alternation(spelling: &str, unfolds: &[char], first: Option<char>) -> String 
 
 #[cfg(test)]
 mod tests {
+    use super::super::eval::JQ_WORD_CLASS;
     use super::*;
 
     const SS: &str = "(?:ß|ẞ|(?i:s)(?i:s))";

@@ -29,6 +29,7 @@
 //! copy by `Rewriter::lazy_counted`; for an unbounded one over a body with a consuming way before
 //! its empty one that form still differs from Oniguruma's on a few patterns (#6128).
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -211,6 +212,19 @@ fn group_folds(flags: &ast::Flags, folds: bool) -> Option<bool> {
     Some(folds)
 }
 
+/// Whether `class` is the bracketed class the translation writes for jq's `\w` or `\W` (and
+/// `\p{Word}`), outside a class (#6263).
+fn is_word_class(class: &ast::ClassBracketed) -> bool {
+    let mut text = String::new();
+    if ast::print::Printer::new()
+        .print(&Ast::ClassBracketed(Box::new(class.clone())), &mut text)
+        .is_err()
+    {
+        return false;
+    }
+    super::eval::is_translated_word_class(&text)
+}
+
 /// The number of operations Oniguruma 6.9.8 compiles `ast` to (`compile_length_tree`), or `None`
 /// for a construct whose length is not worked out here: a capture group, an assertion, a flag
 /// switch, a letter under case folding, and a repeat of a repeat (Oniguruma reduces those).
@@ -225,6 +239,10 @@ fn onig_ops(ast: &Ast, folds: bool) -> Option<usize> {
         Ast::Literal(lit) => (!(folds
             && (!lit.c.is_ascii() || "sfiltjnhwy".contains(lit.c.to_ascii_lowercase()))))
         .then_some(1),
+        // #6263: jq's `\w`, `\W` and `\p{Word}` are one operation in Oniguruma, and the translation
+        // writes each as the bracketed word class (`super::eval::JQ_WORD_CLASS`), which is not a class
+        // that may hold a multi-character fold.
+        Ast::ClassBracketed(class) if folds && is_word_class(class) => Some(1),
         Ast::ClassUnicode(_) | Ast::ClassBracketed(_) if folds => None,
         Ast::Dot(_) | Ast::ClassUnicode(_) | Ast::ClassPerl(_) | Ast::ClassBracketed(_) => Some(1),
         Ast::Assertion(_) | Ast::Flags(_) => None,
@@ -1107,6 +1125,13 @@ mod tests {
         assert_eq!(folding("[ab]"), None);
         assert_eq!(folding("\\p{L}"), None);
         assert_eq!(folding("\\w"), Some(1));
+        // The bracketed class the translation writes for `\w` and `\W` is one operation too (#6263),
+        // a class of the same members written any other way is not.
+        let word = super::super::eval::JQ_WORD_CLASS;
+        assert_eq!(folding(&format!("[{word}]")), Some(1));
+        assert_eq!(folding(&format!("[^{word}]")), Some(1));
+        assert_eq!(folding(&format!("[{word}a]")), None);
+        assert_eq!(folding("[\\p{Alphabetic}]"), None);
     }
 
     /// `X{n,}?` over a body of five operations is plain copies at `{2,}?` and a counted loop from
