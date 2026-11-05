@@ -7777,6 +7777,7 @@ A differential against jq 1.7.1 over 160,000 cases (5,000 generated capture-free
 These keep their loop as written, and still match longer than jq where the shape occurs:
 
 - **A body with a capture group inside it:** `"ba" | [match("(?:b*|(a))+") | .string]` is read as written, and so is `"ba" | [match("(b*|(a))+") | .string]` (`["b"]` in jq).
+  Tracked in [#6310](https://github.com/rust-works/succinctly/issues/6310).
   An empty iteration also sets the group in Oniguruma ([#6069](#a-capture-under-an-unbounded-repeat-on-the-fancy-regex-route-keeps-its-last-non-empty-iteration-6069)), and the rewrite would copy the group.
   A loop over a capture group itself is rewritten since [#6305](https://github.com/rust-works/succinctly/issues/6305): `"ba" | match("(b*|a)+")` is `"b"`, as in jq.
   The capture rewrite of #6069 writes the repeated group's own loop as a plain `(?:X)*` (its copy of the group sits in the final empty iteration), and the loop rewrite reads that.
@@ -7785,6 +7786,7 @@ These keep their loop as written, and still match longer than jq where the shape
   Over 2,498 generated `{2,}`, `{3,}` and `{4,}` patterns, the 519 that differed from jq agree and none changed the other way.
   A counted repeat over a body with a group inside it (`(?:(a*)|b){2,}`, `((a)|b*){2,}`) and a bounded one (`(b|){0,3}`) are read as written.
 - **A body with a zero-width assertion** (`^`, `$`, `\b`, `\A`, `\z`): its empty way depends on where it stands, which the rewrite does not express.
+  Tracked in [#6300](https://github.com/rust-works/succinctly/issues/6300).
 - **A body with a flag switch** (`(?i)` inside it) is rewritten with the switch scoped over what it reaches, as `(?i:..)` around the items after it and around every later way ([#6301](https://github.com/rust-works/succinctly/issues/6301)): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and here.
   A differential over 13,056 cases (16 body shapes with `(?i)`, `(?-i)`, `(?s)`, `(?m)`, `(?i-s)`, `(?is)` and `(?i)(?s)` in each position, six loop forms, 17 strings) differed in 885 before and in none after.
   A switch that names `x` or `U` still keeps its loop as written: `x` makes the text after it blanks and comments, which a closing parenthesis would join to the last comment, and `U` swaps greedy and lazy.
@@ -7806,8 +7808,10 @@ These keep their loop as written, and still match longer than jq where the shape
   A comment with no quantifier after it matches nothing, and its loop is rewritten.
   A loop beside or around such syntax is rewritten since [#6128](https://github.com/rust-works/succinctly/issues/6128): the rewrite reads a pattern the `regex` crate's parser refuses through a copy that writes that syntax plainly at the same offsets (`oniguruma_shadow` in `src/jq/eval.rs`), so `"ba" | match("(?:b*|a)+(?=)")` is jq's `"b"` (it was `"ba"`), and a loop inside a lookaround or atomic group is rewritten too.
   Over 30,000 generated cases with such syntax beside or around a loop, 235 were fixed, none broken, and 4 differ as before: a loop inside a lookahead followed by `.+` or `.*` (`"aaac" | match("(?=(?:[bc]*c??|){2,}c).+")`), where jq finds no match at all although the lookahead holds at offset 3.
+  Tracked in [#6304](https://github.com/rust-works/succinctly/issues/6304).
   A pattern with a conditional (`(?(1)...)`) is read as before.
 - **An unbounded lazy repeat with a large count, over a body with a consuming way before its empty one** (`{n,}?`, n of 7 or more, or fewer over a longer body; the `b` of `b?` in `(?:b?|\\w)`): `"ab" | [match("(?:b*||\\w){8,}?"; "gn") | .string]` is `["ab"]` in jq and `["a","b"]` here.
+  Tracked in [#6302](https://github.com/rust-works/succinctly/issues/6302).
   Oniguruma writes `X{n,}?` out as `n` plain copies of `X` when the body's compiled length times `n` is at most ten, so `(?:b?|\\w){2,}?` leaves its loop at no empty way, and the `regex` crate reads it the same way; since [#6128](https://github.com/rust-works/succinctly/issues/6128) such a repeat keeps its text (`"ab" | [match("(?:b?|\\w){2,}?"; "gn") | .string]` is `["a","b"]` in both).
   A longer body (`(?:b?|\\w){3,}?` and up) is a counted loop that leaves at the body's empty way even before its minimum, and is rewritten copy by copy.
   Each count doubles the copies, so the rewrite is given up past about six copies of a body of a few operations, and the repeat keeps the plain copies' answer.
