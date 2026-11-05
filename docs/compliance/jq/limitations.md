@@ -12230,6 +12230,32 @@ behaviours to make. Pinned against jq 1.7.1 on a 2,015-row table
 (`tests/data/jq-literal-17-digit-oracle-2936.tsv`) plus the entry-point matrix in
 `tests/jq_cli_tests.rs` and the two-evaluator rows in `tests/jq_evaluator_parity_tests.rs`.
 
+### A computed integer compares as a double, except the first value of a `range` (#6275)
+
+jq compares two number literals exactly (`decNumberCompare`) and any pair that involves a computed number as doubles.
+`jq_numeric_cmp` read a bare `OwnedValue::Int` as a literal, but arithmetic, `length` and the rounding builtins all return a bare `Int`, so a computed integer was compared by its exact decimal digits against a literal that is not its own double.
+A bare `Int` is a computed double now: `(1+1) == 2.00000000000000000001` and `(0+0) == 1e-400` are `true`, as in jq 1.7.1, and `(9007199254740992+0) == 9007199254740993` is `true`.
+Two literals still compare exactly (`2 == 2.00000000000000000001` is `false` in both).
+The exact `i64` shortcut for two int-bearing operands stays for a literal pair, for two bare `Int`s (as `compare_values` orders them), and for any pair within `2^53`.
+
+```console
+$ jq  -nc '(1+1) == 2.00000000000000000001, (0+0) == 1e-400'     # true, true
+$ sjq -nc '(1+1) == 2.00000000000000000001, (0+0) == 1e-400'     # true, true   (false, false before #6275)
+$ jq  -nc '[2.00000000000000000001,(1+1)] | unique'              # [2.00000000000000000001]
+$ sjq -nc '[2.00000000000000000001,(1+1)] | unique'              # [2.00000000000000000001]   ([2,2.00000000000000000001] before)
+```
+
+A value that crosses the reindex bridge (a multi-output stage, `map(.)`, `unique`/`sort`/`group_by`/`min`/`max` on an array built in the filter) used to come back a literal, because the bridge wrote a bare `Int` as its digits.
+In jq's number model it now writes one within `2^53` as `computed_int_token` (`2e0e1`), the sibling of the computed-float token (#2902), and reads it back as a bare `Int` (`JsonNumber::bridge_computed_int`).
+A bare `Int` past `2^53` (the `range` walk's exact values) still crosses as its digits, so it comes back a literal.
+Those values stay exact where jq holds them as doubles (see the `range` entry above), so an array that mixes them with a literal past `2^53` can order differently from jq, and no longer transitively: the literal `9007199254740993` equals the bare `9007199254740992` and `9007199254740993` as doubles, which are in turn ordered by their `i64`.
+`succinctly yq` writes the digits as before.
+
+One shape is still wrong, and it is the one the old rule had right: **the first value of a `range`.**
+jq emits `$from` itself, a literal, as the first value and computes the rest, and the integer walk pushes a bare `Int` for every value (`range_batch_int`).
+So `first(range(2;3)) == 2.00000000000000000001` is `true` here and `false` in jq, and `[range(0;3)] | map(. == 1.00000000000000000001)` is jq's `[false,true,false]` here.
+Keeping the first value a literal would cost an allocation per `range` call (a `NumberLiteral` owns its text), for a value that differs only against a decimal literal that is not its own double.
+
 ### A bare trailing decimal point with no exponent (`1.`) reads as the integer (#6052) — divergence closed
 
 Real jq's number reader accepts a bare trailing `.` with nothing after it and reads the integer:

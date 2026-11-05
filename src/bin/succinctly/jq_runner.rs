@@ -13230,10 +13230,14 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
         // spelling: decode it here, so a `RawNumber` only ever holds
         // document text and its readers (`OwnedValue::from_number_bytes`,
         // `format_raw_number`) never see a token.
-        StandardJson::Number(n) => match n.bridge_value() {
-            Some(f) => JqValue::Float(f),
-            // Use RawNumber to preserve original formatting like "4e4"
-            None => JqValue::RawNumber(n.raw_bytes()),
+        StandardJson::Number(n) => match n.bridge_computed_int() {
+            // #6275: a computed integer is the bare `Int` it was, as `from_json_number` reads it.
+            Some(i) => JqValue::Int(i),
+            None => match n.bridge_value() {
+                Some(f) => JqValue::Float(f),
+                // Use RawNumber to preserve original formatting like "4e4"
+                None => JqValue::RawNumber(n.raw_bytes()),
+            },
         },
         StandardJson::String(s) => {
             // Keep string lazy - use raw bytes reference instead of decoding

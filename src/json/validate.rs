@@ -1474,6 +1474,51 @@ pub(crate) fn parse_computed_float_token(bytes: &[u8]) -> Option<f64> {
     f.is_finite().then_some(f)
 }
 
+/// The suffix that marks a [`computed_int_token`]: `e0e1`, so the doubled exponent marker
+/// that makes [`computed_float_token`] unparseable is here too, and the final `1` keeps the
+/// two apart (a float token always ends in `e0`).
+const COMPUTED_INT_TOKEN_SUFFIX: &str = "e0e1";
+
+/// The reindex bridge's spelling of a *computed* integer (#6275) -- a bare
+/// `OwnedValue::Int` in jq's number model, where it is a double and not a literal -- built so
+/// the reparse hands back a bare `Int` instead of a `NumberLiteral` of the same digits (which
+/// compares exactly against a decimal literal, where a computed number compares as a double).
+///
+/// The digits followed by [`COMPUTED_INT_TOKEN_SUFFIX`]: `2e0e1`, `-7e0e1`. Like
+/// [`computed_float_token`], `str::parse::<f64>()` and `::<i64>()` both reject it, it starts
+/// with a digit or `-digit`, and it is drawn from `[0-9e-]` so `nested_number_span` captures it
+/// whole; only a number read through an index built over bridge text decodes one
+/// (`JsonNumber::bridge_computed_int`, #3034).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn computed_int_token(n: i64) -> String {
+    let mut token = String::new();
+    write_computed_int_token(&mut token, n);
+    token
+}
+
+/// [`computed_int_token`], appended to `out` without a `String` of its own: the bridge writes one
+/// per computed integer of the value it serialises.
+pub(crate) fn write_computed_int_token(out: &mut String, n: i64) {
+    use core::fmt::Write;
+    // Writing into a `String` is infallible.
+    let _ = write!(out, "{n}{COMPUTED_INT_TOKEN_SUFFIX}");
+}
+
+/// Decodes a [`computed_int_token`], `None` for anything else -- the one definition of the
+/// spelling, as [`parse_computed_float_token`] is for floats.
+///
+/// `i64::from_str` is the digit check: it takes exactly an optional sign and digits, so the only
+/// thing left to refuse is the `+` it accepts.
+#[must_use]
+pub(crate) fn parse_computed_int_token(bytes: &[u8]) -> Option<i64> {
+    let inner = bytes.strip_suffix(COMPUTED_INT_TOKEN_SUFFIX.as_bytes())?;
+    if inner.first() == Some(&b'+') {
+        return None;
+    }
+    core::str::from_utf8(inner).ok()?.parse().ok()
+}
+
 /// The reindex bridge's spelling of a *document* `.inf`/`-.INF`/`.NaN`
 /// scalar (#1071): `7`, the spelling's position in
 /// [`NONFINITE_LITERALS`](crate::yaml::NONFINITE_LITERALS), then
@@ -1788,6 +1833,66 @@ mod tests {
             let back = parse_computed_float_token(token.as_bytes())
                 .unwrap_or_else(|| panic!("{token} must decode"));
             assert_eq!(back.to_bits(), f.to_bits(), "{token}");
+        }
+    }
+
+    /// #6275: the computed-integer token is reserved the way the float one is: neither number
+    /// parse reads it, no valid JSON number spells it, and the decode is exact over the whole
+    /// `i64` range.
+    #[test]
+    fn computed_int_token_round_trips_and_is_no_real_number_6275() {
+        for n in [
+            0i64,
+            1,
+            -1,
+            7,
+            -7,
+            1000,
+            1 << 53,
+            -(1 << 53),
+            i64::MAX,
+            i64::MIN,
+        ] {
+            let token = computed_int_token(n);
+            assert!(token.parse::<f64>().is_err(), "{token}");
+            assert!(token.parse::<i64>().is_err(), "{token}");
+            assert!(!is_valid_number(token.as_bytes()), "{token}");
+            assert_eq!(
+                parse_computed_int_token(token.as_bytes()),
+                Some(n),
+                "{token}"
+            );
+            assert_eq!(
+                parse_computed_float_token(token.as_bytes()),
+                None,
+                "{token}"
+            );
+        }
+        assert_eq!(computed_int_token(2), "2e0e1");
+        assert_eq!(computed_int_token(-7), "-7e0e1");
+        // Neither token reads as the other, and nothing else reads as an integer token.
+        assert_eq!(
+            parse_computed_int_token(computed_float_token(2.0).as_bytes()),
+            None
+        );
+        for text in [
+            "",
+            "e0e1",
+            "-e0e1",
+            "2",
+            "2e0",
+            "2e0e0",
+            "2e0e1e0",
+            "+2e0e1",
+            "2.5e0e1",
+            "--2e0e1",
+            "2e0e11",
+            " 2e0e1",
+            "2e0e1 ",
+            "0x2e0e1",
+            "92233720368547758080e0e1",
+        ] {
+            assert_eq!(parse_computed_int_token(text.as_bytes()), None, "{text:?}");
         }
     }
 

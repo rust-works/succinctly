@@ -698,6 +698,9 @@ fn to_owned_checked_at_depth<S: EvalSemantics, V: DocumentValue>(
         Ok(OwnedValue::Null)
     } else if let Some(b) = value.as_bool() {
         Ok(OwnedValue::Bool(b))
+    } else if let Some(i) = value.bridge_computed_int() {
+        // #6275: a computed integer re-indexed by the bridge -- bare, never a literal.
+        Ok(OwnedValue::Int(i))
     } else if let Some(f) = value.bridge_computed_float() {
         // #2902: a computed float re-indexed by the bridge (a path-context
         // pipe over an owned container reaches this materializer with the
@@ -986,6 +989,9 @@ fn scalar_to_owned<S: EvalSemantics, V: DocumentValue>(
         Ok(OwnedValue::Null)
     } else if let Some(b) = value.as_bool() {
         Ok(OwnedValue::Bool(b))
+    } else if let Some(i) = value.bridge_computed_int() {
+        // #6275: a computed integer re-indexed by the bridge -- bare, never a literal.
+        Ok(OwnedValue::Int(i))
     } else if let Some(f) = value.bridge_computed_float() {
         // #2902: a computed float re-indexed by the bridge (a path-context
         // pipe over an owned container reaches this materializer with the
@@ -37573,7 +37579,9 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // `.`) it keeps the source literal -- or, for the reindex
             // bridge's computed-float token, stays the bare `Float` it was
             // (#2902, same reasoning as `to_owned_at_depth`'s own arm).
-            if let Some(f) = value.bridge_computed_float() {
+            if let Some(i) = value.bridge_computed_int() {
+                GenericResult::Owned(OwnedValue::Int(i))
+            } else if let Some(f) = value.bridge_computed_float() {
                 GenericResult::Owned(OwnedValue::Float(f))
             } else if S::TAG == EvalTag::Jq && value.number_literal().is_some() {
                 // jq mode: the document's own number, through the embed
@@ -44253,9 +44261,15 @@ mod tests {
         for n in [0i64, 1, -1, 7, -7, 1000, i64::MIN, i64::MAX] {
             let value = OwnedValue::Int(n);
             let expected = alloc::format!("{n}");
+            // #6275: within `2^53` jq's number model writes the computed-integer token.
+            let jq_expected = if crate::jq::value::bridge_keeps_int_computed::<JqSemantics>(n) {
+                alloc::format!("{n}e0e1")
+            } else {
+                expected.clone()
+            };
             assert_eq!(
                 value.to_json_for_reindex::<JqSemantics>().unwrap(),
-                expected,
+                jq_expected,
                 "jq-mode reindex spelling for Int({n})"
             );
             assert_eq!(
@@ -44451,8 +44465,11 @@ mod tests {
         // (`to_json_for_reindex` spells an `Int` as `format!("{n}")`) is
         // asserted on its own in `test_reindex_bridge_int_normalization_1909`
         // rather than left to this comment.
+        //
+        // Since #6275 jq's number model keeps a bare `Int` within `2^53` bare across the bridge
+        // (`computed_int_token`), so only the other cases are normalized.
         let normalized = match value {
-            OwnedValue::Int(n) => {
+            OwnedValue::Int(n) if !crate::jq::value::bridge_keeps_int_computed::<S>(*n) => {
                 OwnedValue::from_number_literal::<JqSemantics>(&alloc::format!("{n}"))
             }
             other => other.clone(),
