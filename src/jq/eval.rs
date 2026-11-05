@@ -103516,6 +103516,10 @@ fn resolve_eval_expr_sink<'a, S: EvalSemantics>(
             return flow_result(escape);
         }
         for text in &texts {
+            // As in [`builtin_eval_expr`]: an absent key names no expression.
+            if text.is_null() {
+                continue;
+            }
             let parsed = match parse_eval_text::<S>(text) {
                 Ok(parsed) => parsed,
                 Err(e) => return ResolveFlow::Escaped(e.into()),
