@@ -12,6 +12,26 @@ use crate::run_jq_full;
 
 /// (stdin, filter, flags, jq 1.7.1's stdout).
 const ROWS: &[(&str, &str, &[&str], &str)] = &[
+    // past decNumber's exponent limit jq prints the DBL_MAX text, as it does for `.`
+    (
+        "[1e1000000000]",
+        "map(.)?",
+        &["-c"],
+        "[1.7976931348623157e+308]\n",
+    ),
+    (
+        "[-1e999999999999]",
+        "map(.)|sort",
+        &["-c"],
+        "[-1.7976931348623157e+308]\n",
+    ),
+    // `-S` orders the keys of an object holding one
+    (
+        r#"{"b":1e1000,"a":[-1e400]}"#,
+        "map(.)?",
+        &["-S", "-c"],
+        "[1E+1000,[-1E+400]]\n",
+    ),
     ("[1e1000]", "map(.)?", &["-c"], "[1E+1000]\n"),
     ("[1e1000]", "map(.)|sort", &["-c"], "[1E+1000]\n"),
     ("[1e1000]", "map(.)|sort|.[0]", &["-c"], "1E+1000\n"),
@@ -86,5 +106,18 @@ fn test_a_sorted_computed_infinity_prints_as_dbl_max_6319() -> Result<()> {
         stdout,
         "[-1.7976931348623157e+308,1.7976931348623157e+308]\n"
     );
+    Ok(())
+}
+
+/// `--preserve-input` is this tool's own flag (jq has none): it echoes an overflowing literal as
+/// written, like every other literal under it.
+#[test]
+fn test_preserve_input_echoes_an_out_of_range_literal_as_written_6319() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["--preserve-input", "-c", "map(.)|sort"],
+        Some("[1e1000,-1e400,1e309]"),
+    )?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "[-1e400,1e309,1e1000]\n");
     Ok(())
 }

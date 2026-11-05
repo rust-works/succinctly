@@ -431,7 +431,8 @@ pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
 /// formatter alone. Against [`stream_owned_value_json`] the escape table is
 /// the *headline* difference but not the only one: this also keeps jq's
 /// float display (`jq_bare_float_display`, so a computed `1.0 + 2.0` prints
-/// `3`) and jq's infinite-value rules, rather than yq's
+/// `3`) and jq's infinite-value rules (a computed infinity is the `DBL_MAX` text, #6319; an
+/// overflowing literal is echoed as written, like every other literal here), rather than yq's
 /// `format_float_with_fraction`. All three are jq-mode rules, which is the
 /// point — this is jq's convention with one axis relaxed, not yq's with one
 /// axis tightened.
