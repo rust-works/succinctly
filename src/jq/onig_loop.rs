@@ -19,7 +19,9 @@
 //!
 //! A body whose ways are not listed here keeps its loop as written: one with a capture group (an
 //! empty iteration also sets the group, #6069), a zero-width assertion (its empty way depends on
-//! where it stands), or a flag switch. A loop over a capture group is still reached: the capture
+//! where it stands), or a flag switch that names `x` or `U`. Any other flag switch reaches the rest
+//! of its group, so under a greedy loop it is written as a flag group over what it reaches before
+//! the ways are listed (#6301). A loop over a capture group is still reached: the capture
 //! rewrite (`onig_capture_loop`) writes the repeated group's own loop as a plain `(?:X)*`, and
 //! the evaluator runs this rewrite again over what it wrote (#6305).
 //!
@@ -102,6 +104,20 @@ struct Rewriter<'p> {
     work: core::cell::Cell<usize>,
     work_limit: usize,
     changed: bool,
+}
+
+/// A piece that matches only the empty string and has no text of its own.
+fn empty_piece() -> Piece {
+    Piece {
+        text: Text {
+            text: String::new(),
+            prec: Prec::Concat,
+        },
+        ways: Ways::Nullable {
+            before: None,
+            after: None,
+        },
+    }
 }
 
 /// `pattern` with every greedy, unbounded loop whose body can match nothing before trying a way
@@ -431,22 +447,85 @@ impl Rewriter<'_> {
                 self.repeat(body, min, max, rep.greedy)
             }
             Ast::Alternation(alt) => {
-                let items = alt
-                    .asts
-                    .iter()
-                    .map(|a| self.convert(a, listed))
-                    .collect::<Result<Vec<_>, _>>()?;
+                // #6301: a flag switch (`(?i)`) reaches the rest of its group, later ways included,
+                // which the ways below would move out of its reach. It is written as a flag group
+                // over what it reaches: `x(?i)y|z` is `x(?i:y)|(?i:z)`.
+                let mut active: Vec<String> = Vec::new();
+                let mut items = Vec::with_capacity(alt.asts.len());
+                for way in &alt.asts {
+                    // A way that is only a switch matches nothing, as an empty way does.
+                    let piece = if let Ast::Flags(set) = way {
+                        self.switch_open(set)?;
+                        empty_piece()
+                    } else {
+                        self.convert(way, listed)?
+                    };
+                    items.push(self.scoped(piece, &active)?);
+                    if let Ast::Concat(concat) = way {
+                        for item in &concat.asts {
+                            if let Ast::Flags(set) = item {
+                                active.push(self.switch_open(set)?);
+                            }
+                        }
+                    } else if let Ast::Flags(set) = way {
+                        active.push(self.switch_open(set)?);
+                    }
+                }
                 self.alt(&items, listed)
             }
-            Ast::Concat(concat) => {
-                let items = concat
-                    .asts
-                    .iter()
-                    .map(|a| self.convert(a, listed))
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.concat(&items, listed)
-            }
+            Ast::Concat(concat) => self.convert_concat(&concat.asts, listed),
         }
+    }
+
+    /// A concatenation. A flag switch in it reaches the items after it, so those are converted as
+    /// one piece and wrapped in a flag group with the switch's flags (#6301).
+    fn convert_concat(&mut self, asts: &[Ast], listed: bool) -> Result<Piece, GiveUp> {
+        let mut items = Vec::with_capacity(asts.len());
+        for (at, ast) in asts.iter().enumerate() {
+            if let Ast::Flags(set) = ast {
+                let open = self.switch_open(set)?;
+                items.push(empty_piece());
+                let rest = &asts[at + 1..];
+                if !rest.is_empty() {
+                    let piece = self.convert_concat(rest, listed)?;
+                    items.push(self.scoped(piece, &[open])?);
+                }
+                break;
+            }
+            items.push(self.convert(ast, listed)?);
+        }
+        self.concat(&items, listed)
+    }
+
+    /// The opening of the flag group that stands for the switch `set` over what it reaches
+    /// (`(?i)` is `(?i:`..`)`). `U` swaps greedy and lazy, which the rewrite does not follow, and
+    /// `x` makes the text after it read as comments and blanks, which a closing parenthesis would
+    /// join to the last comment.
+    fn switch_open(&self, set: &ast::SetFlags) -> Result<String, GiveUp> {
+        if set.flags.flag_state(Flag::SwapGreed).is_some()
+            || set.flags.flag_state(Flag::IgnoreWhitespace) == Some(true)
+        {
+            return Err(GiveUp);
+        }
+        Ok(format!("(?{}:", self.verbatim(&set.flags.span)))
+    }
+
+    /// `piece` inside the flag groups `opens` (outermost first), each of its listed ways too.
+    fn scoped(&self, mut piece: Piece, opens: &[String]) -> Result<Piece, GiveUp> {
+        for open in opens.iter().rev() {
+            let wrap = |t: Text| self.text(format!("{open}{})", t.text), Prec::Atom);
+            piece = Piece {
+                text: wrap(piece.text)?,
+                ways: match piece.ways {
+                    Ways::Nullable { before, after } => Ways::Nullable {
+                        before: before.map(wrap).transpose()?,
+                        after: after.map(wrap).transpose()?,
+                    },
+                    ways => ways,
+                },
+            };
+        }
+        Ok(piece)
     }
 
     /// A construct the parsed copy reads as something it is not. A comment matches nothing, as an
