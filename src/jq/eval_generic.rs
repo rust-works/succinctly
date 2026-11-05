@@ -36164,6 +36164,24 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 // fix as `Shuffle` just above -- free here too, for the
                 // same reason.
                 let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+                // #6202: yq reads the row nodes as they are, and an alias row (`*name`) is neither a
+                // sequence nor a mapping to it, whatever its anchor holds: `[*row, [c]]` is
+                // `sequence contains elements of  and !!seq types` (an alias has no tag), and an
+                // array of aliases `can only pivot elements of !!seq or !!map types, received `.
+                // The rows are compared by tag, as yq does, before any is copied.
+                if S::TAG == EvalTag::Yq && cursors.iter().any(|c| c.is_alias()) {
+                    if optional {
+                        return GenericResult::None;
+                    }
+                    let tags: Vec<String> = cursors
+                        .iter()
+                        .map(|c| yq_type_tag(&c.value(), Some(c.clone())))
+                        .collect();
+                    return GenericResult::Error(match tags.iter().find(|t| **t != tags[0]) {
+                        Some(other) => EvalError::yq_pivot_mixed(&tags[0], other),
+                        None => EvalError::yq_pivot_rows(&tags[0]),
+                    });
+                }
                 let items: Vec<OwnedValue> =
                     owned_or_suppress!(to_owned_all_cursors::<S, _>(&cursors), optional);
                 if items.is_empty() {

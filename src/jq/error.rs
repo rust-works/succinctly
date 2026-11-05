@@ -1666,6 +1666,28 @@ impl EvalError {
         Self::new(format!("node at path [] is not an array (it's a {tag})"))
     }
 
+    /// yq's `pivot` refusals (#6202). `Mixed` is two rows of different tags, `Rows` is rows that
+    /// agree and are not sequences or mappings (an alias row has no tag at all, so an array of
+    /// aliases lands here with an empty one), and `Node` is a pivot of something that is not a
+    /// sequence.
+    pub fn yq_pivot_mixed(first: &str, other: &str) -> Self {
+        Self::new(format!(
+            "sequence contains elements of {first} and {other} types"
+        ))
+    }
+
+    /// See [`yq_pivot_mixed`](Self::yq_pivot_mixed).
+    pub fn yq_pivot_rows(tag: &str) -> Self {
+        Self::new(format!(
+            "can only pivot elements of !!seq or !!map types, received {tag}"
+        ))
+    }
+
+    /// See [`yq_pivot_mixed`](Self::yq_pivot_mixed).
+    pub fn yq_pivot_node(tag: &str) -> Self {
+        Self::new(format!("cannot pivot node of type {tag}"))
+    }
+
     /// `<v> cannot be matched, as it is not a string`.
     pub fn cannot_be_matched(value: &OwnedValue) -> Self {
         Self::subject(value, "cannot be matched, as it is not a string")
