@@ -568,8 +568,9 @@ pub(crate) fn jq_literal_text_to_f64(text: &str) -> Option<f64> {
 /// decimal string of at most 17 digits, so no float arithmetic happens
 /// before the last step.
 ///
-/// **This treats every jq-mode `Int` as a literal.** That is sound for the
-/// `Int`s that are *not* literals: `+`/`-`/`*` already return a `Float` for
+/// **This treats every jq-mode `Int` as a literal when it widens one for
+/// arithmetic** (comparison reads a bare `Int` as computed, #6275, and widens
+/// it the same way). That is sound for the `Int`s that are *not* literals: `+`/`-`/`*` already return a `Float` for
 /// anything past `2^53` (`jq_checked_int_arith`, #2631) and `%` does the
 /// same (`jq_f64_backed_int`); an `Int` that came *from* a double
 /// (`floor`/`ceil`/`round`/`trunc`'s own result, `length`'s magnitude, `%`'s
@@ -611,7 +612,8 @@ pub(crate) fn jq_literal_int_to_f64(n: i64) -> f64 {
 /// model: jq's literal rounding ([`jq_literal_int_to_f64`]) when
 /// `EvalSemantics::DECNUMBER_LITERALS`, otherwise the plain cast real yq's
 /// `int64`-to-`float64` conversion amounts to. (jq-mode comparison has its
-/// own rule, [`jq_numeric_cmp`]: two literals never widen at all.)
+/// own rule, [`jq_numeric_cmp`]: two literals never widen at all, and a bare
+/// `Int` is a computed double there, #6275.)
 #[inline]
 pub(crate) fn int_to_f64<S: EvalSemantics>(n: i64) -> f64 {
     if S::DECNUMBER_LITERALS {
@@ -5981,11 +5983,13 @@ pub(crate) fn jq_numeric_cmp(left: &OwnedValue, right: &OwnedValue) -> Option<co
     // side) first. This is the hot case: document numbers are always
     // `NumberLiteral`, so ordinary `sort`/`unique`/`group_by`/`min`/`max`/
     // `bsearch` over a plain JSON integer array hits it on every comparison
-    // (#2906 code review). It agrees when both are literals (exact), and
-    // when both magnitudes are within `2^53`, where every `i64` is its own
-    // double and the doubles order as the integers do. A bare `Int` past
-    // `2^53` against anything else is a computed double against a literal's
-    // 17-digit one, which only the general path below orders.
+    // (#2906 code review). It agrees when both are literals (exact), when
+    // both are bare (two computed values: `compare_values` orders a bare
+    // pair by `i64` too, so `==` and ordering cannot disagree about one),
+    // and when both magnitudes are within `2^53`, where every `i64` is its
+    // own double and the doubles order as the integers do. A literal and a
+    // bare `Int` past `2^53` is a literal's 17-digit double against a
+    // computed one, which only the general path below orders.
     fn int_operand(value: &OwnedValue) -> Option<(i64, bool)> {
         match value {
             OwnedValue::Int(n) => Some((*n, false)),
@@ -5995,8 +5999,7 @@ pub(crate) fn jq_numeric_cmp(left: &OwnedValue, right: &OwnedValue) -> Option<co
     }
     const EXACT_DOUBLE_LIMIT: u64 = 1 << 53;
     if let (Some((a, a_literal)), Some((b, b_literal))) = (int_operand(left), int_operand(right)) {
-        if (a_literal && b_literal) || a.unsigned_abs().max(b.unsigned_abs()) <= EXACT_DOUBLE_LIMIT
-        {
+        if a_literal == b_literal || a.unsigned_abs().max(b.unsigned_abs()) <= EXACT_DOUBLE_LIMIT {
             return Some(a.cmp(&b));
         }
     }
@@ -6015,8 +6018,11 @@ pub(crate) fn jq_numeric_cmp(left: &OwnedValue, right: &OwnedValue) -> Option<co
             // A bare `Int` is computed: a program literal (`2`) and a
             // document number are `NumberLiteral`s (#1035), so the bare one
             // is what arithmetic, `length`, `floor` and the like return,
-            // and jq holds those as doubles (#6275).
-            OwnedValue::Int(n) => Side::Computed(*n as f64),
+            // and jq holds those as doubles (#6275). It widens the way
+            // arithmetic widens an `Int` (`int_to_f64`), so `$i + 0.0 == $i`
+            // cannot flip for the `range` values past `1e17`, the one
+            // exact-`i64` producer there.
+            OwnedValue::Int(n) => Side::Computed(jq_literal_int_to_f64(*n)),
             OwnedValue::NumberLiteral(NumberRepr::Int(n), text) => Side::Literal(Literal {
                 double: jq_literal_int_to_f64(*n),
                 int: Some(*n),
@@ -7620,6 +7626,7 @@ mod tests {
         for (a, b, want) in [
             // literal vs computed: widen through the literal rounding
             (lit("869389897822472004"), sum.clone(), Equal),
+            (OwnedValue::Int(869389897822472004), sum.clone(), Equal),
             (OwnedValue::Int(3), sum.clone(), Less),
             (lit("869389897822472000"), sum.clone(), Equal),
             (lit("869389897822472100"), sum.clone(), Greater),
@@ -7673,8 +7680,14 @@ mod tests {
                 lit("-9007199254740993"),
                 Equal,
             ),
-            // Two bare `Int`s past 2^53 order by their doubles, and a literal
-            // pair past it stays exact.
+            // Two bare `Int`s past 2^53 stay exact (the `range` walk's values,
+            // ordered by `compare_values` as `i64` too), and so does a
+            // literal pair.
+            (
+                OwnedValue::Int(9007199254740992),
+                OwnedValue::Int(9007199254740993),
+                Less,
+            ),
             (
                 OwnedValue::Int(9007199254740992),
                 OwnedValue::Int(9007199254740994),
