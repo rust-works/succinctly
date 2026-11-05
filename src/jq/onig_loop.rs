@@ -194,6 +194,23 @@ fn bounds(kind: &RepetitionKind) -> (u32, Option<u32>) {
     }
 }
 
+/// Whether case folding is on inside an option group whose flags are `flags`, in a pattern where it
+/// is `folds` outside (#6241); `None` for a flag that changes what the body reads in a way the count
+/// does not follow (`x` and `U` change what the text means, `u` is not an Oniguruma option).
+fn group_folds(flags: &ast::Flags, folds: bool) -> Option<bool> {
+    let mut on = true;
+    let mut folds = folds;
+    for item in &flags.items {
+        match &item.kind {
+            ast::FlagsItemKind::Negation => on = false,
+            ast::FlagsItemKind::Flag(Flag::CaseInsensitive) => folds = on,
+            ast::FlagsItemKind::Flag(Flag::MultiLine | Flag::DotMatchesNewLine) => {}
+            ast::FlagsItemKind::Flag(_) => return None,
+        }
+    }
+    Some(folds)
+}
+
 /// The number of operations Oniguruma 6.9.8 compiles `ast` to (`compile_length_tree`), or `None`
 /// for a construct whose length is not worked out here: a capture group, an assertion, a flag
 /// switch, a letter under case folding, and a repeat of a repeat (Oniguruma reduces those).
@@ -211,8 +228,10 @@ fn onig_ops(ast: &Ast, folds: bool) -> Option<usize> {
         Ast::ClassUnicode(_) | Ast::ClassBracketed(_) if folds => None,
         Ast::Dot(_) | Ast::ClassUnicode(_) | Ast::ClassPerl(_) | Ast::ClassBracketed(_) => Some(1),
         Ast::Assertion(_) | Ast::Flags(_) => None,
+        // #6241: an option group is its body (`(?s:\w)` counts as `\w` in jq, which also decides
+        // whether a repeat of it is written out as copies), with the case folding the group sets.
         Ast::Group(group) => match &group.kind {
-            GroupKind::NonCapturing(flags) if flags.items.is_empty() => onig_ops(&group.ast, folds),
+            GroupKind::NonCapturing(flags) => onig_ops(&group.ast, group_folds(flags, folds)?),
             _ => None,
         },
         Ast::Alternation(alt) => {
@@ -242,7 +261,10 @@ fn onig_ops(ast: &Ast, folds: bool) -> Option<usize> {
             let mut inner = &rep.ast;
             while let Ast::Group(group) = &**inner {
                 match &group.kind {
-                    GroupKind::NonCapturing(flags) if flags.items.is_empty() => inner = &group.ast,
+                    // #6241: an option group is looked through as a plain one is.
+                    GroupKind::NonCapturing(flags) if group_folds(flags, folds).is_some() => {
+                        inner = &group.ast;
+                    }
                     _ => return None,
                 }
             }
@@ -1011,7 +1033,17 @@ mod tests {
         assert_eq!(ops("(a)"), None);
         assert_eq!(ops("^a"), None);
         assert_eq!(ops("(?i)a"), None);
-        assert_eq!(ops("(?i:a)"), None);
+        // An option group is its body (#6241), with the folding it sets.
+        assert_eq!(ops("(?i:a)"), Some(1));
+        assert_eq!(ops("(?s:\\w)"), Some(1));
+        assert_eq!(ops("a?|(?-i:\\p{L})"), Some(5));
+        assert_eq!(
+            ops("(?i:s)"),
+            None,
+            "a letter that starts a multi-character fold"
+        );
+        assert_eq!(ops("(?-i:s)"), Some(1), "no folding inside");
+        assert_eq!(ops("(?x:a)"), None, "extended mode is not followed");
     }
 
     /// The repeat arms of the count, from the formulas in Oniguruma's `compile_length_quantifier_node`.
@@ -1041,9 +1073,19 @@ mod tests {
         );
         // A body past the expansion limit is entered through a jump.
         assert_eq!(ops("(?:a|b|c|d|e|f)+"), Some(1 + 2 + 16));
-        // A flag group, a folded literal run, a bracketed class under folding: not counted.
-        assert_eq!(ops("(?s:a)"), None);
-        assert_eq!(ops("(?s:a)*"), None);
+        // A folded literal run, a bracketed class under folding: not counted. (A flag group is its
+        // body, #6241.)
+        assert_eq!(ops("(?s:a)"), Some(1));
+        assert_eq!(
+            ops("(?s:a)*"),
+            Some(3),
+            "an option group is looked through (#6241)"
+        );
+        assert_eq!(
+            ops("(?s:a?)*"),
+            None,
+            "a repeat of a repeat, through the group"
+        );
         assert_eq!(ops("(?i)b"), None, "the flag itself is not counted");
         assert_eq!(
             ops("(?:a*b)*"),
