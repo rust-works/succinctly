@@ -2075,7 +2075,6 @@ Not reproduced:
 - **The key keeps its quoting only where the presentation replay reads the filter.**
   A target of fields, indexes and `.[]`, and a right side of literals, `.` and arithmetic on them, keep the key's quoting, anchor and comments.
   Any other filter (`(.a.x | key) = (.a.y | tostring)`, a target with a `select`) still renames, but the document's comments and quoting are lost, and a string name that reads as another type is printed plain (`4:` where yq prints `"4":`).
-- **A `select` over `key` in the target resolves to nothing**, as it does for any assignment here: `(.. | select(key == "x") | key) = "q"` renames nothing where yq renames every `x`.
 - **`+=`, `-=`, `*=` and `//=` on a `(PATH | key)` target are a parse error.**
   yq accepts `+=` (`(.a.x | key) += "z"` is `xz`) and errors for the others.
   They used to be a silent no-op, which discarded the write (ADR-0018 rule 4(b)); a refusal keeps the write from vanishing.

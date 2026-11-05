@@ -50277,7 +50277,9 @@ impl Frame {
         // #3134: a navigated binding's marker certified by its anchor is read
         // against the frame's position, so an anchored marker switches `at`
         // on exactly as a binding inside `expr` does.
-        let at = (may_bind_navigated(expr) || may_certify_by_anchor(expr)).then(PathPrefix::root);
+        let at =
+            (may_bind_navigated(expr) || may_certify_by_anchor(expr) || select_reads_key(expr))
+                .then(PathPrefix::root);
         Self {
             invocation,
             at,
@@ -51207,6 +51209,75 @@ fn may_enter_resolver_node(node: &Expr) -> bool {
                 | Expr::FuncDef { .. }
         )
         || matches!(node, Expr::Shared(arg) if arg.run_stages().is_none())
+}
+
+/// Whether `expr` holds a `select` whose condition reads `key` (#6206): the second kind of program
+/// [`Frame::enter`] gives a position, because the condition is judged against the key of the node
+/// the select stands at.
+fn select_reads_key(expr: &Expr) -> bool {
+    any_subexpr(expr, &mut |e| {
+        matches!(e, Expr::Builtin(Builtin::Select(cond))
+            if contains_builtin(cond, |b| matches!(b, Builtin::Key)))
+    })
+}
+
+/// `cond` with the `key` that stands where the select's node does replaced by that node's key
+/// (#6206), or `None` when it has none, the frame has no position (or the root's, which has no key),
+/// or a `key` stands somewhere this cannot name -- the condition then runs as it always did.
+///
+/// A `key` counts where the condition's own input reaches it: bare, in a comparison, an arithmetic
+/// operand, `and`/`or`/`//`, a comma, parentheses, and the head of a pipe. A `key` after the head
+/// of a pipe, or inside any other construct, names another node's key.
+fn bind_select_key(cond: &Expr, frame: &Frame) -> Option<Expr> {
+    if !contains_builtin(cond, |b| matches!(b, Builtin::Key)) {
+        return None;
+    }
+    let key = match frame.at.as_ref()?.last()? {
+        Expr::Field(name) => Literal::String(name.as_str().into()),
+        Expr::Index { idx, key: None } => Literal::Int(*idx),
+        _ => return None,
+    };
+    fn bind(expr: &Expr, key: &Literal) -> Option<Expr> {
+        if !contains_builtin(expr, |b| matches!(b, Builtin::Key)) {
+            return Some(expr.clone());
+        }
+        match expr {
+            Expr::Builtin(Builtin::Key) => Some(Expr::Literal(key.clone())),
+            Expr::Pipe(stages) => {
+                let (head, rest) = stages.split_first()?;
+                if rest
+                    .iter()
+                    .any(|stage| contains_builtin(stage, |b| matches!(b, Builtin::Key)))
+                {
+                    return None;
+                }
+                let mut out = vec_with_capacity(stages.len());
+                out.push(bind(head, key)?);
+                out.extend(rest.iter().cloned());
+                Some(Expr::pipe(out))
+            }
+            Expr::Paren(_)
+            | Expr::Optional(_)
+            | Expr::Negate(_)
+            | Expr::Comma(_)
+            | Expr::Compare { .. }
+            | Expr::Arithmetic { .. }
+            | Expr::And(..)
+            | Expr::Or(..)
+            | Expr::Alternative(..) => {
+                let mut whole = true;
+                let bound = map_subexprs(expr, &mut |child| {
+                    bind(child, key).unwrap_or_else(|| {
+                        whole = false;
+                        child.clone()
+                    })
+                });
+                whole.then_some(bound)
+            }
+            _ => None,
+        }
+    }
+    bind(cond, &key)
 }
 
 /// Whether resolving `expr` can bind a variable from a navigated position
@@ -55306,6 +55377,10 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // error/break still escapes with the correct (now-capped) prefix.
         Expr::Builtin(Builtin::Select(cond)) => {
             let mut already_emitted = false;
+            // #6206: a `key` in the condition reads the key of the node the select stands at, which
+            // the condition alone (evaluated off the value) cannot see.
+            let bound = bind_select_key(cond, frame);
+            let cond: &Expr = bound.as_ref().unwrap_or(cond);
             resolve_cond_fork_stream::<S>(cond, value, trackable, true, |truthy| {
                 if select_emits::<S>(truthy, &mut already_emitted) {
                     emit_passthrough(value, trackable, snapshot, sink)
