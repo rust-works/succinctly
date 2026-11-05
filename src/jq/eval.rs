@@ -85499,6 +85499,16 @@ pub(crate) fn eval_owned_fast_path<S: EvalSemantics>(
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } => {
             eval_owned_navigation::<S>(expr, input, optional)
         }
+        // #6258: a slice with literal bounds of an owned array or string is a cut of the value, as
+        // the computed spelling and the fold step already read it. Through the bridge each call
+        // wrote the whole value out as JSON, indexed it and decoded the kept part: 1.9 s and
+        // 1.2 GB for `. as $a | [range(100) | $a[:2]]` over 200,000 integers. Any other target
+        // (null, an object, a scalar) keeps the bridge's answer and its error text.
+        Expr::Slice { start, end, .. }
+            if matches!(input, OwnedValue::Array(_) | OwnedValue::String(_)) =>
+        {
+            Some(slice_owned_value_read::<S>(input, *start, *end, optional))
+        }
         // A string is handed back as it is, the same handle, as
         // `tostring_owned` does on the other routes (#3191) -- borrowed
         // here, so only a string is cloned, never a container to render.
@@ -121749,6 +121759,102 @@ mod tests {
                 assert_eq!(e.message, "nesting depth exceeds limit of 384");
             }
             other => panic!("expected a clean depth-limit error, got: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#3261)"
+        }
+    }
+
+    /// #6258: a literal-bound slice of an owned array or string is cut in place by
+    /// `eval_owned_fast_path`, where it used to bridge (write the value out as JSON, index it, decode
+    /// the kept part). The bridge is the oracle: every bound shape over elements of each number
+    /// representation, nested containers, and strings, in both modes.
+    #[test]
+    fn a_literal_slice_of_an_owned_value_agrees_with_the_bridge_6258() {
+        let numbers = || {
+            OwnedValue::array_from(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Float(2.5),
+                OwnedValue::from_number_literal::<JqSemantics>("3.0"),
+                OwnedValue::from_number_literal::<JqSemantics>("100000000000000000000"),
+                OwnedValue::Null,
+                OwnedValue::object_from([(
+                    "k".to_string(),
+                    OwnedValue::array_from(vec![OwnedValue::Int(7)]),
+                )]),
+                OwnedValue::string("x"),
+            ])
+        };
+        let inputs = [
+            numbers(),
+            OwnedValue::array(),
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+            OwnedValue::string("h\u{e9}llo w\u{f6}rld"),
+            OwnedValue::string(""),
+            OwnedValue::string("\u{1F600}ab"),
+            OwnedValue::Null,
+            OwnedValue::Int(5),
+            OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]),
+        ];
+        let sources = [
+            ".[:2]",
+            ".[1:]",
+            ".[-2:]",
+            ".[:-1]",
+            ".[2:1]",
+            ".[5:10]",
+            ".[0:]",
+            ".[1:3]",
+            ".[-100:100]",
+            ".[3:3]",
+            ".[:0]",
+            ".[-1:]",
+        ];
+        for source in sources {
+            let expr = parse(source).unwrap();
+            for input in &inputs {
+                for optional in [false, true] {
+                    for mode in [EvalTag::Jq, EvalTag::Yq] {
+                        let (direct, bridge) = if mode == EvalTag::Jq {
+                            (
+                                eval_owned_fast_path::<JqSemantics>(&expr, input, optional),
+                                normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                                    &expr, input, optional,
+                                )),
+                            )
+                        } else {
+                            (
+                                eval_owned_fast_path::<YqSemantics>(&expr, input, optional),
+                                normalize(eval_owned_input_bridge::<Vec<u64>, YqSemantics>(
+                                    &expr, input, optional,
+                                )),
+                            )
+                        };
+                        // A target the fast path declines keeps the bridge, which is what it is
+                        // compared with.
+                        let Some(direct) = direct else {
+                            assert!(
+                                !matches!(input, OwnedValue::Array(_) | OwnedValue::String(_)),
+                                "{mode:?}: {source} on {input:?} must be answered"
+                            );
+                            continue;
+                        };
+                        let direct = match direct {
+                            Ok(Some(value)) => (vec![value.to_json()], "ok".to_string()),
+                            Ok(None) => (Vec::new(), "ok".to_string()),
+                            Err(error) => (Vec::new(), format!("error:{}", error.message)),
+                        };
+                        // The bridge spells a plain integer as a number literal (`Int(1)` comes back
+                        // `NumberLiteral(Int(1), "1")`), so the answers are compared as the JSON they
+                        // print, which is what a later stage and the output see.
+                        let bridge = (
+                            bridge.0.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+                            bridge.1,
+                        );
+                        assert_eq!(
+                            direct, bridge,
+                            "{mode:?} optional={optional}: {source} on {input:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 

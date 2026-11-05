@@ -536,10 +536,16 @@ DEFAULT_THRESHOLD = 5.0
 # document they write into (-18.4% / -17.2% / -15.9% / -17.3% x86_64, -22.6% / -22.2% / -20.2% /
 # -21.7% ARM64-Linux against the PR's own merge-base, outputs byte-identical). Remove them once
 # `main` carries the change and the rows read ~0% against a merge-base that includes it.
+#
+# `users_yq_raw_slice` is raised again (10.0 to 90.0) for #6258: `.[0:3]` over each `-R` line is a
+# literal-bound slice of an owned string, which is now cut in place instead of written out as JSON,
+# indexed and decoded (-84.0% x86_64 / -82.4% ARM64-Linux against the PR's own merge-base, outputs
+# byte-identical). Lower it to 10.0 once `main` carries the change and the row reads ~0% against a
+# merge-base that includes it.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
     "users_yq_raw_test": 65.0,
-    "users_yq_raw_slice": 10.0,
+    "users_yq_raw_slice": 90.0,
     "arrays_map_iterate": 8.0,
     "users_del_select": 30.0,
     "users_del_bound_select": 30.0,
