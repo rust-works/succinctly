@@ -30928,7 +30928,7 @@ fn rewrite_absence_operator(pattern: &str, extended: bool) -> Option<String> {
         (!in_group).then_some(())
     }
     let chars: Vec<char> = pattern.chars().collect();
-    let mut out = String::with_capacity(pattern.len() + 16);
+    let mut out = string_with_capacity(pattern.len() + 16);
     scan(&chars, &mut 0, &mut out, false, false)?;
     Some(out)
 }
