@@ -7028,7 +7028,8 @@ fn decode_plain_scalar(bytes: &[u8], base_indent: usize) -> Result<String, YamlS
 /// Rules:
 /// - Skip the line break
 /// - Count consecutive empty lines (they become \n)
-/// - Skip leading whitespace on the continuation line (indentation)
+/// - Skip every blank in front of a continuation line's text (indentation, and tabs and spaces
+///   after a tab: go-yaml drops them all, #6209)
 /// - Add a space for the line break (or \n for each empty line)
 /// - A U+2028/U+2029 is kept, and as the first break it is not folded (see
 ///   [`fold_quoted_line_break`])
@@ -7082,8 +7083,9 @@ fn fold_plain_line_break(
                 i = check + b.width;
                 // Continue looking for more empty lines
             } else {
-                // Tab followed by content - skip the tabs as indentation
-                while i < bytes.len() && bytes[i] == b'\t' {
+                // Tab followed by content: every blank in front of it is skipped, spaces after
+                // the tab too (#6209). go-yaml drops all the blanks of a continuation line.
+                while i < bytes.len() && matches!(bytes[i], b'\t' | b' ') {
                     i += 1;
                 }
                 break;
