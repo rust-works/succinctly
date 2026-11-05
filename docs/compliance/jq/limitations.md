@@ -7556,6 +7556,17 @@ Every row was captured from jq 1.7.1.
 - **`\xHH` at 0x80 or above is a byte of a UTF-8 sequence:** `\xc3\xa9` is `é`.
   A sequence that stops short is `too short multibyte code string`, a continuation byte first or a bad one inside is `invalid code point value`, and one that is no character (`\xed\xa0\x80`, `\xf8`) compiles and matches nothing.
   `\xH` is the character H, `\x` before anything but a hex digit is NUL (and an `x` at the very end of the pattern is itself).
+- **`\xHH` at 0x80 or above inside a character class is read the same way** (#6240): `[\xC3\xA9]` is `é`.
+  Oniguruma builds a class from a bitset of single bytes, which an ASCII character matches, and ranges of code points, which a multibyte character matches.
+  A byte that starts no sequence (`[\x80]`, `[\xF8]`, and every `\xF5` and above) is a byte and matches nothing, so `[^\x80]` matches every character.
+  A decoded sequence is a code point, and one that is no character (`[\xC1\xBF]`, `[\xED\xA0\x80]`, `[\xF4\x90\x80\x80]`) matches nothing alone.
+  A range between two bytes is the bitset only and between two code points the code ranges only, and between a byte and a code point both: `[\x80-\x90]` matches nothing, `[\x41-\x90]` is `A` to DEL, and `[\x80-\xC3\xA9]` is U+0080 to U+00E9.
+  A range whose end is a surrogate or past U+10FFFF stops at the nearest character that exists (`[a-\xED\xA0\x80]` is `a` to U+D7FF).
+  A `-` after a finished range is a member.
+  The errors are the ones outside a class, and `empty range in char class` for a start above its end.
+  Not covered: a negated class of bytes only whose range covers the lead bytes, which jq tests by the first byte alone (`[^\x80-\xFF]` matches no multibyte character in jq, #6246).
+  Also not covered: an octal byte at 0x80 or above, and a range that ends in `\xHH` and is followed by `-\d` (`[\x41-\x42-\d]` is refused, #6244).
+  Pinned by `tests/jq_cli/i6240.rs`.
 - **`(*FAIL)` never matches.**
 - **jq's refusals:** an interval with nothing to repeat (`{1}`, `a|{2}`, `(?:{2})`: `target of repeat operator is not specified`), a conditional on a group the pattern lacks (`(?(2)a|b)`: `invalid backref number/name`, and `undefined name <n> reference` for a name), and a group name that is empty or starts with a digit.
   `"a" | test("(?(2)a|b)")` panicked inside `fancy-regex` before this.

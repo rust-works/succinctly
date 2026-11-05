@@ -29159,6 +29159,8 @@ fn translate_posix_brackets_scan(
     // Open classes, and whether the next char is the first of the class (after an optional `^`),
     // where a `]` is a literal.
     let mut depth = 0usize;
+    // Where the class being read opened (#6240).
+    let mut class_from = 0usize;
     let mut at_start = false;
     // Whether the class's negating `^` has been read, so that the next one is a member (#6193).
     let mut caret_taken = false;
@@ -29267,9 +29269,25 @@ fn translate_posix_brackets_scan(
                 ));
             }
             // #6070: the escapes Oniguruma reads that the `regex` crate refuses or reads another way.
-            if let Some((text, used)) =
-                rewrite_onig_escape(&chars, i, depth > 0, groups_opened, &mut group_facts)?
-            {
+            if let Some((text, used)) = rewrite_onig_escape(
+                &chars,
+                i,
+                depth > 0,
+                class_from,
+                groups_opened,
+                &mut group_facts,
+            )? {
+                // #6240: a byte run no character has is a member of its own after a `-` that is
+                // itself a member (`[a-c-\xED\xA0\x80]`), which the `regex` crate would read as the
+                // start of a range up to a nested class.
+                if depth > 0
+                    && text.starts_with(NEVER_MATCHES)
+                    && out.ends_with('-')
+                    && !out.ends_with("\\-")
+                {
+                    out.pop();
+                    out.push_str("\\-");
+                }
                 out.push_str(&text);
                 changed = true;
                 at_start = false;
@@ -29638,6 +29656,7 @@ fn translate_posix_brackets_scan(
             }
             if c == '[' {
                 depth = 1;
+                class_from = i;
                 at_start = true;
                 caret_taken = false;
             }
@@ -30164,6 +30183,7 @@ fn rewrite_onig_escape(
     chars: &[char],
     i: usize,
     in_class: bool,
+    class_from: usize,
     groups_opened: usize,
     facts: &mut Option<GroupFacts>,
 ) -> Result<Option<(String, usize)>, EvalError> {
@@ -30241,8 +30261,8 @@ fn rewrite_onig_escape(
             _ => Ok(None),
         },
         'x' if !in_class => rewrite_hex_escape(chars, i),
-        // #6234: inside a class only the short forms are rewritten, as outside one.
-        'x' => Ok(short_hex_escape(chars, i)),
+        // #6234, #6240: inside a class the short forms, and the bytes of a UTF-8 sequence.
+        'x' => rewrite_class_hex_escape(chars, i, class_from),
         _ => Ok(None),
     }
 }
@@ -30264,6 +30284,288 @@ fn short_hex_escape(chars: &[char], i: usize) -> Option<(String, usize)> {
         }
         Some(_) => None,
     }
+}
+
+/// A member of a character class that is one character or one byte, as Oniguruma types it when it
+/// builds a class (#6240). `byte` is its single-byte type: an ASCII character or a raw `\xHH` that
+/// starts no sequence. The other type is a code point, a multibyte character or the bytes of a
+/// sequence, decoded.
+#[cfg(feature = "regex")]
+#[derive(Clone, Copy)]
+struct ClassAtom {
+    value: u32,
+    byte: bool,
+}
+
+/// The `\x` token at `chars[at]` as Oniguruma reads it inside a class: a byte of up to two hex digits,
+/// and none (`\xg`) is NUL. `None` for `\x{`, for anything else and for the end of the pattern.
+#[cfg(feature = "regex")]
+fn raw_byte_token(chars: &[char], at: usize) -> Option<(u32, usize)> {
+    if chars.get(at) != Some(&'\\') || chars.get(at + 1) != Some(&'x') {
+        return None;
+    }
+    let first = *chars.get(at + 2)?;
+    if first == '{' {
+        return None;
+    }
+    let Some(hi) = first.to_digit(16) else {
+        return Some((0, 2));
+    };
+    Some(match chars.get(at + 3).and_then(|c| c.to_digit(16)) {
+        Some(lo) => (hi * 16 + lo, 4),
+        None => (hi, 3),
+    })
+}
+
+/// The atom a run of `\xHH` bytes spells inside a class, and the characters it covers (#6240). Outside a
+/// class [`rewrite_hex_escape`] reads the same sequences with the same two errors, and a byte that
+/// starts none is refused there where a class holds it as a byte.
+/// Oniguruma reads as many following byte tokens as the first byte's UTF-8 length asks for: `C0`..`DF`
+/// two, `E0`..`EF` three, `F0`..`F4` four, and any other byte (a continuation byte, `F5`..`FF`) stands
+/// alone as a byte that no character starts with. Too few tokens is `too short multibyte code string`
+/// (a token that is not a byte, `\x{..}` or a letter, ends the run); a tail byte outside
+/// `80`..`BF` is `invalid code point value`. The bytes are then added up with no further check, so
+/// an overlong form, a surrogate and a value past U+10FFFF each give a value that no character has.
+#[cfg(feature = "regex")]
+fn class_hex_atom(chars: &[char], at: usize) -> Result<Option<(ClassAtom, usize)>, EvalError> {
+    let Some((lead, used)) = raw_byte_token(chars, at) else {
+        return Ok(None);
+    };
+    let need = match lead {
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => {
+            return Ok(Some((
+                ClassAtom {
+                    value: lead,
+                    byte: true,
+                },
+                used,
+            )))
+        }
+    };
+    let mut end = at + used;
+    let mut tail = Vec::new();
+    for _ in 1..need {
+        let Some((byte, n)) = raw_byte_token(chars, end) else {
+            return Err(EvalError::new(
+                "invalid regex: too short multibyte code string",
+            ));
+        };
+        tail.push(byte);
+        end += n;
+    }
+    let mut value = lead & (0x7F >> need);
+    for byte in tail {
+        if !(0x80..=0xBF).contains(&byte) {
+            return Err(EvalError::new("invalid regex: invalid code point value"));
+        }
+        value = value << 6 | (byte & 0x3F);
+    }
+    Ok(Some((ClassAtom { value, byte: false }, end - at)))
+}
+
+/// The characters a range `x-y` (or one atom, `x-x`) holds in a class, as the pattern text for the
+/// `regex` crate (#6240). Oniguruma keeps two sets, a bitset of the single bytes and ranges of code
+/// points. A range between two bytes is bitset only and one between two code points is code points
+/// only; a range between a byte and a code point is both. The bitset matches an ASCII character,
+/// and a code range matches a multibyte one, so an overlong `C1 BF` matches no DEL, `\x80`
+/// matches nothing at all, and `[\x80-\xC3\xA9]` holds U+0080 to U+00E9. A value no character has
+/// (a surrogate, past U+10FFFF) only ends the range at the nearest one that exists.
+#[cfg(feature = "regex")]
+fn class_atoms_range(x: ClassAtom, y: ClassAtom) -> Result<String, EvalError> {
+    if x.value > y.value {
+        return Err(EvalError::new("invalid regex: empty range in char class"));
+    }
+    let mut parts: Vec<(u32, u32)> = Vec::new();
+    if (x.byte || y.byte) && x.value <= 0x7F {
+        parts.push((x.value, y.value.min(0x7F)));
+    }
+    if !(x.byte && y.byte) && y.value >= 0x80 {
+        let lo = x.value.max(0x80);
+        if lo <= 0xD7FF {
+            parts.push((lo, y.value.min(0xD7FF)));
+        }
+        let (lo, hi) = (lo.max(0xE000), y.value.min(0x10FFFF));
+        if lo <= hi {
+            parts.push((lo, hi));
+        }
+    }
+    // The parts meet (ASCII ends at 0x7F where the rest begins, and U+D7FF is followed by U+E000 in
+    // the characters that exist), so they are one range. Two ranges that abut across the surrogate
+    // gap are what the `regex` crate negates wrongly (`[^\x{BF}-\x{D7FF}\x{E000}-\x{10000}]`
+    // matches U+D7FF and U+E000), which is why they are not written as two.
+    debug_assert!(parts
+        .windows(2)
+        .all(|w| w[0].1 + 1 == w[1].0 || (w[0].1 == 0xD7FF && w[1].0 == 0xE000)));
+    let (Some(&(lo, _)), Some(&(_, hi))) = (parts.first(), parts.last()) else {
+        return Ok(NEVER_MATCHES.to_string());
+    };
+    Ok(if lo == hi {
+        regex_char(lo)
+    } else {
+        format!("{}-{}", regex_char(lo), regex_char(hi))
+    })
+}
+
+/// The atom the class member at `chars[at]` is and the characters it covers, for the members a range
+/// can run between (#6240): a character, a `\xHH` byte run, `\x{H}` and the control escapes. `Some(None)`
+/// is a member that is no atom (`\d`, `\p{L}`, `[:alpha:]`), which no range can start or end at, and
+/// `None` is one this does not read (an octal or any letter escape), which ends the reading.
+#[cfg(feature = "regex")]
+fn class_member(chars: &[char], at: usize) -> Option<(Option<ClassAtom>, usize)> {
+    let atom = |value: u32, byte: bool, used: usize| Some((Some(ClassAtom { value, byte }), used));
+    let c = *chars.get(at)?;
+    if c != '\\' {
+        if c == '[' && chars.get(at + 1) == Some(&':') {
+            let close = chars[at + 2..].windows(2).position(|w| w == [':', ']'])?;
+            return Some((None, close + 4));
+        }
+        return atom(u32::from(c), c.is_ascii(), 1);
+    }
+    let next = *chars.get(at + 1)?;
+    match next {
+        'x' if chars.get(at + 2) == Some(&'{') => {
+            let close = chars[at + 3..].iter().position(|&c| c == '}')?;
+            let digits: String = chars[at + 3..at + 3 + close].iter().collect();
+            if digits.is_empty()
+                || digits.len() > 8
+                || !digits.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return None;
+            }
+            let value = u32::from_str_radix(&digits, 16).ok()?;
+            let scalar = char::from_u32(value)?;
+            atom(value, scalar.is_ascii(), close + 4)
+        }
+        'x' => match class_hex_atom(chars, at) {
+            Ok(Some((atom, used))) => Some((Some(atom), used)),
+            _ => None,
+        },
+        // An octal escape of up to three digits (`\1`, `\101`), the control escapes `\b` and `\cX`, and
+        // `\8`, `\9` as the digit; an octal value of 0x80 or more is not read here.
+        '0'..='7' => {
+            let digits = chars[at + 1..]
+                .iter()
+                .take(3)
+                .take_while(|c| ('0'..='7').contains(c))
+                .count();
+            let value = chars[at + 1..at + 1 + digits]
+                .iter()
+                .fold(0u32, |v, c| v * 8 + c.to_digit(8).unwrap_or(0));
+            (value <= 0x7F).then_some(())?;
+            atom(value, true, 1 + digits)
+        }
+        '8' | '9' => atom(u32::from(next), true, 2),
+        'b' => atom(8, true, 2),
+        'c' => {
+            let x = *chars.get(at + 2)?;
+            ((' '..='~').contains(&x) && x != '\\').then_some(())?;
+            atom(if x == '?' { 0x7F } else { u32::from(x) & 0x9F }, true, 3)
+        }
+        'n' => atom(10, true, 2),
+        't' => atom(9, true, 2),
+        'r' => atom(13, true, 2),
+        'f' => atom(12, true, 2),
+        'v' => atom(11, true, 2),
+        'a' => atom(7, true, 2),
+        'e' => atom(27, true, 2),
+        'd' | 'D' | 'w' | 'W' | 's' | 'S' => Some((None, 2)),
+        'p' | 'P' if chars.get(at + 2) == Some(&'{') => {
+            let close = chars[at + 3..].iter().position(|&c| c == '}')?;
+            Some((None, close + 4))
+        }
+        // Any other escaped character is that character; a letter Oniguruma gives no meaning is the letter
+        // (`\h`, `\g`, `\q`, #6070).
+        c => atom(u32::from(c), c.is_ascii(), 2),
+    }
+}
+
+/// The atom a range that ends at `chars[at]` started at, reading the class from its `[` at
+/// `chars[class_from]` the way Oniguruma does (#6240): a `-` after a member makes a range with the next
+/// member, one that follows a finished range or a member that is no atom, or ends the class, is a
+/// character of its own. `None` when `at` is no range end, and when the class has a member this does
+/// not read.
+#[cfg(feature = "regex")]
+fn class_range_start(chars: &[char], class_from: usize, at: usize) -> Option<ClassAtom> {
+    let mut j = class_from + 1;
+    if chars.get(j) == Some(&'^') {
+        j += 1;
+    }
+    let mut member: Option<ClassAtom> = None;
+    let mut open: Option<ClassAtom> = None;
+    while j < at {
+        if chars[j] == '-' && open.is_none() && member.is_some() && chars.get(j + 1) != Some(&']') {
+            open = member.take();
+            j += 1;
+            continue;
+        }
+        let (atom, used) = class_member(chars, j)?;
+        j += used;
+        member = if open.take().is_some() { None } else { atom };
+    }
+    if j == at {
+        open
+    } else {
+        None
+    }
+}
+
+/// `\x` inside a class (#6234, #6240): the short forms, and `\xHH` bytes at 0x80 or above, which
+/// Oniguruma reads as the UTF-8 sequence they spell, with the ranges that end or begin at one. A
+/// two-digit byte below 0x80 is left to the `regex` crate, which reads it the same way.
+#[cfg(feature = "regex")]
+fn rewrite_class_hex_escape(
+    chars: &[char],
+    i: usize,
+    class_from: usize,
+) -> Result<Option<(String, usize)>, EvalError> {
+    if let Some(short) = short_hex_escape(chars, i) {
+        return Ok(Some(short));
+    }
+    let Some((atom, used)) = class_hex_atom(chars, i)? else {
+        return Ok(None);
+    };
+    if atom.byte && atom.value < 0x80 {
+        return Ok(None);
+    }
+    // A range that ends here: the start is already out, so only the end is. A range end follows its
+    // `-` directly, which keeps a class of many byte runs from being read afresh at each one.
+    if let Some(start) = i
+        .checked_sub(1)
+        .filter(|dash| chars[*dash] == '-')
+        .and_then(|_| class_range_start(chars, class_from, i))
+    {
+        if start.value > atom.value {
+            return Err(EvalError::new("invalid regex: empty range in char class"));
+        }
+        let last = if start.byte && atom.byte {
+            atom.value.min(0x7F)
+        } else if (0xD800..=0xDFFF).contains(&atom.value) {
+            0xD7FF
+        } else {
+            atom.value.min(0x10FFFF)
+        };
+        return Ok(Some((regex_char(last), used)));
+    }
+    // A range that starts here, when the member after the `-` is an atom.
+    let end_at = i + used;
+    if chars.get(end_at) == Some(&'-') && chars.get(end_at + 1) != Some(&']') {
+        if let Some((Some(end), end_used)) = class_member(chars, end_at + 1) {
+            let mut text = class_atoms_range(atom, end)?;
+            let mut covered = used + 1 + end_used;
+            // A `-` after a finished range is a member (`[\xC3\xAB-\xC3\xAB-a]` holds `-`). Spelled
+            // out here, because a range that came out as one character, or as no character, would
+            // otherwise start a new range with it in the `regex` crate.
+            if chars.get(i + covered) == Some(&'-') {
+                text.push_str("\\-");
+                covered += 1;
+            }
+            return Ok(Some((text, covered)));
+        }
+    }
+    Ok(Some((class_atoms_range(atom, atom)?, used)))
 }
 
 /// `\x` outside a class (#6070): a lone one at the end of the pattern is `x`, and `\xHH` at 0x80 or
