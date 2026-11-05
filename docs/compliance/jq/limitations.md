@@ -10295,6 +10295,30 @@ Sanctioned by ADR-0018's #2103 amendment, like the entries above. Pinned by the 
 rows in `test_closed_terms_do_not_validate_2173` (jq) and
 `range_bounds_validate_only_what_they_read_2698` (yq).
 
+### A slice of an array validates only the elements it keeps (#6231)
+
+The same mechanism as the [#2698](https://github.com/rust-works/succinctly/issues/2698) entry above, one construct over.
+A slice with literal bounds (`.[:10]`) took the wildcard bridge for every range but the full one, which materialized the whole array and indexed it again, so it validated every element of an array it kept ten of.
+[#6231](https://github.com/rust-works/succinctly/issues/6231) reads it as the computed spelling `E[S:T]` has been read since [#4287](https://github.com/rust-works/succinctly/issues/4287): the elements of its range, by index, and nothing else decoded.
+The array's own structure (a missing separator, a stray comma, an unterminated array) is still checked by the walk that counts the elements; a fault inside an element's text is read only if the element is kept.
+
+On `["a","bad\x",3,4]`, whose second element has an invalid escape, and which jq 1.7.1 rejects at parse time for every filter:
+
+| filter     | jq 1.7.1 | succinctly before | succinctly now        |
+|------------|----------|-------------------|-----------------------|
+| `.[:1]`    | error    | error             | `["a"]`               |
+| `.[2:]`    | error    | error             | `[3,4]`               |
+| `.[1:2]`   | error    | error             | error — unchanged     |
+| `.[:2]`    | error    | error             | error — unchanged     |
+
+A slice that keeps the malformed element still raises, as bare `.[1]` does.
+The computed spelling (`.[0+1:0+2]`) already answered the first two rows, so the two spellings of one slice now agree.
+Before this, `(.[1:])[0]` on `[tru]` was the one spelling that validated the whole array (`test_fused_literal_slice_read_does_not_convert_siblings_4323` pinned it); it answers `null`, as the fused `.[1:][0]` beside it always did.
+`succinctly jq --validate` is the strict check for a document that must be whole.
+
+Sanctioned by ADR-0018's #2103 amendment, like the entries above.
+Pinned by `tests/jq_cli/i6231.rs` (the malformed-leaf rows, with the controls that keep the element) and by the #4323 test above.
+
 ### `isempty`/`any`/`all`/`IN`/`skip` validate only what their arguments materialize (#2968)
 
 The same mechanism again, six constructs over. `isempty(g)`, `any(gen; cond)`,
