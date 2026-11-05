@@ -693,6 +693,15 @@ slice written out in full (`(.[$i:]) | .[0]`) still does. It is an input-validat
 not an evaluator rule, and the same as `.[0]` and `length`; the table and the reasoning are in
 [jq limitations § A fused slice read does not validate the rest of the range](../jq/limitations.md#a-fused-slice-read-does-not-validate-the-rest-of-the-range-4195).
 
+### A slice of a sequence validates only the elements it keeps (#6231)
+
+A literal-bounded slice of a sequence (`.[:10]`, `.c[2:]`) is read by index, not through the bridge that materialized the whole sequence, in yq mode as in jq mode.
+It decodes only the elements it keeps, so a bad value inside an element it drops no longer raises, where yq rejects the document when it reads it.
+On the sequence `- a`, `- "bad\x"`, `- 3`, `- 4`, `.[:1]` is `["a"]` (`-o=json`) and `.[2:]` is `[3,4]`; they raised `invalid escape sequence` before, as yq does.
+`.[1:2]` and `.[:2]`, which keep the element, still raise.
+The structure of the sequence is still checked as before.
+The reasoning, the table and the pin are in [jq limitations § A slice of an array validates only the elements it keeps](../jq/limitations.md#a-slice-of-an-array-validates-only-the-elements-it-keeps-6231); the yq rows are in `tests/yq_cli/i6231.rs`.
+
 ### An explicit `?` key next to a block sequence — rejected when the key has content; the bare `?` shape remains (#1104)
 
 Real yq reads a block sequence at a mapping's indent as the implicit value of an ordinary

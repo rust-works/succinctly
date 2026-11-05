@@ -14945,12 +14945,16 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // only extension real yq's own lexer rejects outright ("bad
         // expression, please check expression syntax"), so yq mode has no
         // oracle-comparable behavior this arm could even be fixing. A
-        // genuinely partial slice already falls through unguarded to the
-        // catch-all below in both modes, unchanged.
+        // genuinely partial slice of an array is read by the arm below (#6231); one of anything
+        // else still falls to the catch-all.
         Expr::Slice { start, end, .. }
             if S::TAG != EvalTag::Yq
                 && value.as_array().is_some_and(|elements| {
-                    SliceBounds::from_literals(*start, *end).is_full_range(elements.len())
+                    // The memoized length (#6231), so slices of one wide array in a loop do not
+                    // each walk it; a malformed array declines here and the arm below raises.
+                    crate::jq::array_index::len_checked_memoized(&elements).is_ok_and(|len| {
+                        SliceBounds::from_literals(*start, *end).is_full_range(len)
+                    })
                 }) =>
         {
             // Validated eagerly despite the fast path:
@@ -14973,6 +14977,22 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 }
             } // patchcov: coverage tolerate-line reason="unreachable: this arm's own match guard already evaluated `value.as_array().is_some_and(..)` as true to be here at all, and `as_array()` is a pure read of `value` -- the second call inside the body can never answer `None` where the guard's own call just answered `Some`"
             cursor.map_or(GenericResult::One(value), GenericResult::OneCursor)
+        }
+
+        // #6231: any other slice of an array is read where it stands: the elements of its range,
+        // by index, not the whole array materialized by the wildcard bridge below and indexed
+        // again. It is `slice_one_generic`, which `E[S:T]` has answered with since #4287, so the
+        // two spellings of one slice agree on a well-formed document, in both modes. Unlike that
+        // spelling, it raises the array's own structural faults (a missing separator, a stray
+        // comma), as the bridge did: only the text inside an element it drops goes unread.
+        Expr::Slice { start, end, .. } if value.as_array().is_some() => {
+            if let Some(elements) = value.as_array() {
+                // #2594: the walk below sees no gap in an array with no element (`[,]`).
+                if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
+            }
+            slice_one_generic::<S, V>(value, *start, *end, optional, true)
         }
 
         Expr::Field(name) => {
@@ -26098,22 +26118,23 @@ fn pull_slice_bound_generic<S: EvalSemantics, V: DocumentValue>(
 }
 
 /// Apply resolved bounds to one borrowed target. Mirrors `eval::eval_single`'s
-/// `Expr::Slice` arm (arrays/strings/null) directly against `DocumentValue` —
-/// there is no native `Expr::Slice` arm here to delegate to, unlike the
-/// non-generic evaluator. Always returns owned, since slicing always
+/// `Expr::Slice` arm (arrays/strings/null) directly against `DocumentValue`:
+/// the literal-bound arm of `eval_single` calls it for an array (#6231), and
+/// `slice_one_generic_computed` for every target. Always returns owned, since slicing always
 /// constructs a fresh value; parallels `index_one_generic` returning `One` or
 /// `Owned`.
 ///
-/// Only called from `eval_slice_expr`'s *read* path, never for an
-/// assignment target — no `S`-gated equivalent of `is_yq_slice_empty_container_scalar`'s
+/// Only called on a *read* path (`eval_slice_expr`, and `eval_single`'s literal-bound arm for an
+/// array), never for an assignment target — no `S`-gated equivalent of `is_yq_slice_empty_container_scalar`'s
 /// caution about `resolve_slice_expr` applies here.
 fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
     target: V,
     start: Option<i64>,
     end: Option<i64>,
     optional: bool,
+    strict: bool,
 ) -> GenericResult<V> {
-    // patchcov: coverage tolerate reason="unreachable: this function's sole caller, slice_one_generic_computed, already runs the identical unreadable_value_error(&target) check on the same target and returns before ever calling here; kept as this function's own contract in case a future literal-bounds caller reaches it directly (#3222)"
+    // patchcov: coverage tolerate reason="unreachable: slice_one_generic_computed already runs the identical unreadable_value_error(&target) check on the same target and returns before calling here, and eval_single's literal-bound arm (#6231) passes only an array, which is never an error value; kept as this function's own contract (#3222)"
     if let Some(err) = unreadable_value_error(&target) {
         return GenericResult::Error(err);
     }
@@ -26131,7 +26152,7 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
         // `optional && !e.is_decode_failure()` to drift (the exact drift
         // `suppresses`'s own doc comment records happening twice already,
         // #1902 and #1934).
-        return match to_owned_array_slice::<S, V>(&elements, start, end) {
+        return match to_owned_array_slice::<S, V>(&elements, start, end, strict) {
             Ok(v) => GenericResult::Owned(OwnedValue::array_from(v)),
             Err(e) if suppresses(&e, optional) => GenericResult::None,
             Err(e) => GenericResult::Error(e),
@@ -26198,21 +26219,28 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
 /// Only the range is read -- by index once the array has proved wide (#4035),
 /// else in one walk that also counts it -- so a narrow slice of a wide array is
 /// O(range), not O(length). A delimiter that walk raises on keeps the
-/// collecting read: the slice never ran its checks, and still does not.
+/// collecting read for the computed spelling `E[S:T]`, which never ran its checks and still
+/// does not; `strict` (the literal spelling, #6231) raises it instead, as the bridge did.
 fn to_owned_array_slice<S: EvalSemantics, V: DocumentValue>(
     elements: &V::Elements,
     start: Option<i64>,
     end: Option<i64>,
+    strict: bool,
 ) -> Result<Vec<OwnedValue>, EvalError> {
     let bounds = SliceBounds::from_literals(start, end);
     let window = match (start.unwrap_or(0), end) {
-        (from, Some(to)) if from >= 0 && to >= 0 => Some(from as usize..to.max(from) as usize),
+        (from, Some(to)) if from >= 0 && to >= 0 => Some(
+            usize::try_from(from).unwrap_or(usize::MAX)
+                ..usize::try_from(to.max(from)).unwrap_or(usize::MAX),
+        ),
         _ => None,
     };
     match crate::jq::array_index::slice_cursors(elements, window, |len| bounds.resolve(len)) {
         // #4328: through the cursor, which alone carries an explicit tag (`!!str 2` stays the
         // string `"2"`); a bare value has already lost it.
         Ok((cursors, range)) => cursors[range].iter().map(to_owned_cursor::<S, _>).collect(),
+        // #6231: the literal spelling raises what the walk found.
+        Err(e) if strict => Err(e),
         // The collecting read, through cursors for the same reason as above.
         Err(_) => {
             let cursors = elements.collect_cursors();
@@ -26244,7 +26272,7 @@ fn slice_one_generic_computed<S: EvalSemantics, V: DocumentValue>(
         Err(_) if optional => return GenericResult::None,
         Err(e) => return GenericResult::Error(e),
     };
-    slice_one_generic::<S, V>(target, s, e, optional)
+    slice_one_generic::<S, V>(target, s, e, optional, false)
 }
 
 /// What a fused slice stage answers from the resolved range (#4195).

@@ -147153,19 +147153,32 @@ fn test_fused_literal_slice_read_does_not_convert_siblings_4323() -> Result<()> 
         let (stdout, code) = run_jq_stdin(filter, doc, &["-c"])?;
         assert_eq!((stdout.as_str(), code), ("", 5), "{filter}");
     }
-    // The unfused literal slice validates the whole array, including elements outside the range
-    // the read names; the fused read does not look at them (jq rejects `[tru]` at parse).
+    // The fused read does not look at an element outside the range (jq rejects `[tru]` at parse).
+    // Neither does the unfused literal slice since #6231: it was the one spelling that validated
+    // the whole array, through the wildcard bridge, and now reads its range like `E[S:T]` does.
     assert_eq!(
         run_jq_stdin(".[1:][0]", "[tru]", &["-c"])?,
         ("null\n".to_string(), 0)
     );
     assert_eq!(
         run_jq_stdin("(.[1:])[0]", "[tru]", &["-c"])?,
+        ("null\n".to_string(), 0)
+    );
+    // An element the slice keeps is still decoded (`.[0:1]` is not the full range, so this
+    // reaches the #6231 arm; a full-range `.[0:]` is answered before it).
+    assert_eq!(
+        run_jq_stdin("(.[0:1])[0]", "[tru,1]", &["-c"])?,
         (String::new(), 5)
     );
-    // A bare slice (no read) still validates its whole range.
+    // A bare slice (no read) still validates its whole range; `.[0:3]` is all of `doc`.
     let (stdout, code) = run_jq_stdin(".[0:3]", doc, &["-c"])?;
     assert_eq!((stdout.as_str(), code), ("", 5), "bare slice");
+    let (stdout, code) = run_jq_stdin(".[0:2]", doc, &["-c"])?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("", 5),
+        "bare slice keeping the bad element"
+    );
     Ok(())
 }
 

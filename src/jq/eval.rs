@@ -115497,14 +115497,13 @@ mod tests {
     /// lines below, missed on the array arm at the time. Exercised via
     /// `eval.rs`'s own library-API dispatch (`query!`), not the CLI, same as
     /// #1755's sort/unique family above (see that test's own comment) --
-    /// `eval_generic.rs` has no native arm for a bare `Expr::Slice`
-    /// either, so its own catch-all fallback reaches
-    /// this exact function too, but only *after* first materializing the
-    /// whole target via its own already-checked `to_owned_with_cursor` and
-    /// re-serializing it to fresh JSON bytes (`eval_generic.rs`'s `_ =>` arm
-    /// in its own `eval_single`) -- so any undecodable element in the
-    /// *original* document is already caught upstream of this arm on that
-    /// route, never reaching it with malformed bytes to reproduce the bug.
+    /// `eval_generic.rs` reads a bare `Expr::Slice` of an array itself (#6231), so
+    /// this function is reached from there only for the other targets and for the shapes
+    /// its native arm declines, and then only *after* first materializing the whole target
+    /// via its own already-checked `to_owned_with_cursor` and re-serializing it to fresh
+    /// JSON bytes (`eval_generic.rs`'s `_ =>` arm in its own `eval_single`) -- so any
+    /// undecodable element in the *original* document is already caught upstream of this
+    /// arm on that route, never reaching it with malformed bytes to reproduce the bug.
     #[test]
     fn test_array_slice_raises_on_element_decode_failure_1932() {
         query!(
