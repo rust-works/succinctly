@@ -101539,6 +101539,11 @@ fn builtin_strptime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 _ => return QueryResult::Error(EvalError::strptime_requires_string()),
             };
 
+            // #6324: jq hands the input and the format to libc as C strings, so a NUL byte ends
+            // each (`"2015-03-05T23:51:47Z\u0000junk" | fromdate` parses, and the error text of a
+            // failure shows the string cut there).
+            let cut = |s: &str| s.split('\0').next().unwrap_or_default().to_owned();
+            let (input, fmt) = (cut(&input), cut(&fmt));
             match parse_strptime(&input, &fmt) {
                 Ok((t, remainder)) => {
                     let mut result = vec![
@@ -102701,6 +102706,8 @@ fn builtin_fromdateiso8601<W: Clone + AsRef<[u64]>>(
         _ => return QueryResult::Error(EvalError::strptime_requires_string()),
     };
     const FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
+    // #6324: the string reaches libc as a C string, as for `strptime`.
+    let input = input.split('\0').next().unwrap_or_default().to_owned();
     let t = match parse_strptime(&input, FORMAT) {
         Ok((t, _)) => t,
         Err(_) if optional => return QueryResult::None,
