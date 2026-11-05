@@ -80,3 +80,44 @@ fn test_repeated_capture_groups_that_already_agreed_still_do_6305() -> Result<()
         ),
     ])
 }
+
+/// The other spellings of the unbounded repeat, a lazy one, a named group, `l`, and a pattern that
+/// holds a plain loop (rewritten by #6106 before the capture rewrite sees it) beside the capture
+/// loop: the second pass leaves the first one's output alone.
+#[test]
+fn test_other_repeat_spellings_and_a_plain_loop_beside_it_6305() -> Result<()> {
+    assert_rows(&[
+        (
+            r#""bacd" | [match("(?:b*|a)+(c*|d)*";"g") | .string]"#,
+            r#"["b","","c","",""]"#,
+        ),
+        (
+            r#""bacd" | [match("(b*|a)+(c*|d)*";"g") | [.string, (.captures|map(.string))]]"#,
+            r#"[["b",["",""]],["",["",""]],["c",["",""]],["",["",""]],["",["",""]]]"#,
+        ),
+        (
+            r#""bacdd" | [match("(?:b*|a)+(?:c*|d)+(x|(b*|a)+)";"g") | [.string, (.captures|map(.string))]]"#,
+            r#"[["b",["",""]],["",["",""]],["c",["",""]],["",["",""]],["",["",""]],["",["",""]]]"#,
+        ),
+        (
+            r#""ba" | [match("(b*|a){0,}";"g") | .string]"#,
+            r#"["b","",""]"#,
+        ),
+        (
+            r#""ba" | [match("(b*|a){1,}";"g") | [.string, (.captures|map(.string))]]"#,
+            r#"[["b",[""]],["",[""]],["",[""]]]"#,
+        ),
+        (
+            r#""ba" | [match("(b*|a)+?";"g") | [.string, (.captures|map(.string))]]"#,
+            r#"[["b",["b"]],["",[""]],["",[""]]]"#,
+        ),
+        (
+            r#""ba" | [match("(?<y>c)?(?<x>b*|a)+z?";"g") | [.string, (.captures|map([.name,.string]))]]"#,
+            r#"[["b",[["y",null],["x",""]]],["",[["y",""],["x",""]]],["",[["y",""],["x",""]]]]"#,
+        ),
+        (
+            r#""ba" | [match("(b*|a)+";"gl") | .string]"#,
+            r#"["ba",""]"#,
+        ),
+    ])
+}
