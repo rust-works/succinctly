@@ -7236,6 +7236,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         break;
                     }
                 }
+                // #6214: a Unicode line break (U+2028, U+2029, U+0085) before a continuation line starts
+                // with blanks that hold a tab is refused as `\n` there is (the text is read on, and the
+                // decoder folds the break).
+                0xC2 | 0xE2 => {
+                    self.reject_tab_in_flow_plain_continuation(self.pos)?;
+                    self.advance();
+                }
                 _ => self.advance(),
             }
         }
@@ -7347,6 +7354,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         self.advance();
                     }
                 }
+                // #6214: a Unicode line break (U+2028, U+2029, U+0085) before a continuation line starts
+                // with blanks that hold a tab is refused as `\n` there is (the text is read on, and the
+                // decoder folds the break).
+                0xC2 | 0xE2 => {
+                    self.reject_tab_in_flow_plain_continuation(self.pos)?;
+                    self.advance();
+                }
                 _ => self.advance(),
             }
         }
@@ -7358,6 +7372,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
 
         Ok(end)
+    }
+
+    /// Width in bytes of the Unicode line break at `pos` (U+2028 and U+2029, three bytes; U+0085, two),
+    /// or 0 (#6214). The scalar decoder folds them as it does `\n` (#4913), but the scanners read
+    /// them as ordinary text.
+    fn unicode_break_len_at(input: &[u8], pos: usize) -> usize {
+        match input.get(pos..) {
+            Some([0xE2, 0x80, 0xA8 | 0xA9, ..]) => 3,
+            Some([0xC2, 0x85, ..]) => 2,
+            _ => 0,
+        }
     }
 
     /// #6059: go-yaml refuses a plain scalar that continues on a line whose leading blanks hold a tab at
@@ -7374,10 +7399,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // at. Every other blank line is a break of its own, which checks its successor in turn.
         let mut line = break_pos;
         for _ in 0..2 {
-            if !is_line_break(self.input.get(line).copied().unwrap_or(0)) {
+            let byte = self.input.get(line).copied().unwrap_or(0);
+            // #6214: U+2028, U+2029 and U+0085 end a line here as `\n` does.
+            let unicode = Self::unicode_break_len_at(self.input, line);
+            if !is_line_break(byte) && unicode == 0 {
                 break;
             }
-            let start = line + self.break_len_at(line);
+            let start = line
+                + if unicode > 0 {
+                    unicode
+                } else {
+                    self.break_len_at(line)
+                };
             let mut at = start;
             while self.input.get(at) == Some(&b' ') {
                 at += 1;
@@ -7540,6 +7573,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     } else {
                         break;
                     }
+                }
+                // #6214: as in `parse_flow_unquoted_key`, a Unicode line break before a continuation line
+                // that starts with blanks holding a tab.
+                0xC2 | 0xE2 => {
+                    self.reject_tab_in_flow_plain_continuation(self.pos)?;
+                    self.advance();
                 }
                 _ => self.advance(),
             }
