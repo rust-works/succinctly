@@ -115,3 +115,34 @@ fn test_recurse_cond_of_the_gained_builtins_over_an_alias_ladder_completes_5506(
     }
     Ok(())
 }
+
+/// The cursor walk answers what the owned walk answers for a `cond` that fans out, is empty or
+/// raises. A `def` parameter keeps the owned walk, so the same `cond` through one is the control.
+#[test]
+fn test_recurse_cond_of_the_gained_builtins_agrees_with_the_owned_walk_5506() -> Result<()> {
+    let doc = "a: {x: 1, y: [1, 2], z: []}\nb: abc\nc: [ab, {k: a}]\nd: ~\n";
+    for cond in [
+        "isempty(.[]?, error)",
+        "isempty(empty)",
+        "isempty(.[]?) | not",
+        r#"test("a")"#,
+        r#"(strings | test("a"))"#,
+        r#"(strings | test("(?i)A"))"#,
+        "any",
+        "all",
+        "(arrays | any)",
+        "(arrays | all)",
+        r#"tag == "!!str""#,
+        r#"kind == "scalar""#,
+        r#"anchor == """#,
+        "(tojson | length) < 5",
+        r#"(tojson | test("1"))"#,
+    ] {
+        let direct = format!("[recurse(.[]?; {cond}) | tojson]");
+        let owned = format!("def f(c): [recurse(.[]?; c) | tojson]; f({cond})");
+        let (out, _, code) = run_yq_stdin_with_stderr(&direct, doc, ARGS)?;
+        let (want, _, want_code) = run_yq_stdin_with_stderr(&owned, doc, ARGS)?;
+        assert_eq!((out.trim(), code), (want.trim(), want_code), "`{cond}`");
+    }
+    Ok(())
+}
