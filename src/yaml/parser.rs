@@ -2502,6 +2502,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// A Unicode break inside a flow plain scalar (#6214): the tab rule of #6059 reads the lines after
+    /// it, then the break is passed as the content it stays for the fold (#4913). One definition for
+    /// the three flow scanners.
+    fn pass_unicode_break_in_flow_plain(&mut self) -> Result<(), YamlError> {
+        self.reject_tab_in_flow_plain_continuation(self.pos)?;
+        self.advance_by(self.unicode_break_len_at(self.pos));
+        Ok(())
+    }
+
     /// Width of the line break at `pos`, ASCII or Unicode, or 0 (#6214).
     #[inline]
     fn any_break_len_at(&self, pos: usize) -> usize {
@@ -7164,8 +7173,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // #6214: a Unicode break (NEL, LS, PS) ends a line for go-yaml as `\n` does, so the tab
                 // rule reads the lines after it. It stays content for the fold (#4913).
                 0xC2 | 0xE2 if self.unicode_break_len_at(self.pos) > 0 => {
-                    self.reject_tab_in_flow_plain_continuation(self.pos)?;
-                    self.advance_by(self.unicode_break_len_at(self.pos));
+                    self.pass_unicode_break_in_flow_plain()?;
                 }
                 b'\n' | b'\r' => {
                     self.reject_tab_in_flow_plain_continuation(self.pos)?;
@@ -7312,8 +7320,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // #6214: a Unicode break (NEL, LS, PS) ends a line for go-yaml as `\n` does, so the tab
                 // rule reads the lines after it. It stays content for the fold (#4913).
                 0xC2 | 0xE2 if self.unicode_break_len_at(self.pos) > 0 => {
-                    self.reject_tab_in_flow_plain_continuation(self.pos)?;
-                    self.advance_by(self.unicode_break_len_at(self.pos));
+                    self.pass_unicode_break_in_flow_plain()?;
                 }
                 b'\n' | b'\r' => {
                     self.reject_tab_in_flow_plain_continuation(self.pos)?;
@@ -7466,8 +7473,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // #6214: a Unicode break (NEL, LS, PS) ends a line for go-yaml as `\n` does, so the tab
                 // rule reads the lines after it. It stays content for the fold (#4913).
                 0xC2 | 0xE2 if self.unicode_break_len_at(self.pos) > 0 => {
-                    self.reject_tab_in_flow_plain_continuation(self.pos)?;
-                    self.advance_by(self.unicode_break_len_at(self.pos));
+                    self.pass_unicode_break_in_flow_plain()?;
                 }
                 b'\n' | b'\r' => {
                     self.reject_tab_in_flow_plain_continuation(self.pos)?;
