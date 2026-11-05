@@ -7766,8 +7766,12 @@ A differential against jq 1.7.1 over 160,000 cases (5,000 generated capture-free
 
 These keep their loop as written, and still match longer than jq where the shape occurs:
 
-- **A body with a capture group:** `"ba" | match("(b*|a)+")` is `"b"` in jq and `"ba"` here.
-  An empty iteration also sets the group in Oniguruma ([#6069](#a-capture-under-an-unbounded-repeat-on-the-fancy-regex-route-keeps-its-last-non-empty-iteration-6069)).
+- **A body with a capture group inside it:** `"ba" | [match("(?:b*|(a))+") | .string]` is read as written, and so is `"ba" | [match("(b*|(a))+") | .string]` (`["b"]` in jq).
+  An empty iteration also sets the group in Oniguruma ([#6069](#a-capture-under-an-unbounded-repeat-on-the-fancy-regex-route-keeps-its-last-non-empty-iteration-6069)), and the rewrite would copy the group.
+  A loop over a capture group itself is rewritten since [#6305](https://github.com/rust-works/succinctly/issues/6305): `"ba" | match("(b*|a)+")` is `"b"`, as in jq.
+  The capture rewrite of #6069 writes the repeated group's own loop as a plain `(?:X)*` (its copy of the group sits in the final empty iteration), and the loop rewrite reads that.
+  Over 3,346 generated patterns (a repeated capture group with `*`, `+`, `{0,}` or `{1,}`, on 19 strings under `g`), the 117 that differed from jq agree and none changed the other way.
+  A repeat with a count of two or more is not a candidate of #6069 either, so its group keeps the crate's last non-empty iteration: `"abb" | [match("(b|){2,}$";"g") | .captures[0].string]` is `["",""]` in jq and `["b",""]` here.
 - **A body with a zero-width assertion** (`^`, `$`, `\b`, `\A`, `\z`): its empty way depends on where it stands, which the rewrite does not express.
 - **A body with a flag switch** (`(?i)` inside it): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and `["ba",""]` here.
   The switch reaches every later way of the group, which the rewrite would move out of its reach.

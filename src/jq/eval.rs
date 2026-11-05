@@ -32983,7 +32983,20 @@ fn build_regex_uncached<S: EvalSemantics>(
     let rewritten = (S::TAG != EvalTag::Yq)
         .then(|| super::onig_capture_loop::rewrite(&pattern))
         .flatten()
-        .and_then(|groups| {
+        .and_then(|mut groups| {
+            // #6305: the repeated group's own loop copy is now a plain `(?:X)*`, which the #6106
+            // rewrite can read (the group itself was a body with a capture group, which it
+            // cannot): it leaves that loop where Oniguruma does. It writes no group, so the
+            // copies stay as counted; a result the crate refuses keeps the capture rewrite alone.
+            if !longest {
+                if let Some(ordered) = super::onig_loop::rewrite(&groups.pattern) {
+                    if regex::Regex::new(&ordered)
+                        .is_ok_and(|re| re.captures_len() == groups.compiled_groups)
+                    {
+                        groups.pattern = ordered;
+                    }
+                }
+            }
             let re = regex::Regex::new(&groups.pattern).ok()?;
             (re.captures_len() == groups.compiled_groups)
                 .then_some(RegexEngine::Rewritten { re, groups })
