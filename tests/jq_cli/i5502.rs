@@ -165,7 +165,8 @@ fn test_empty_match_reports_every_group_empty_5502() -> Result<()> {
 fn test_constructs_read_differently_stay_refused_5502() -> Result<()> {
     for filter in [
         r#""abab" | test("(?<n>ab)\\g<n>")"#,
-        r#""abc" | test("(?~b)")"#,
+        // `(?~b)` is read since #6252 (`tests/jq_cli/i6252.rs`); a range cutter is not.
+        r#""abc" | test("(?~|b)")"#,
         // jq errors on this one; `fancy-regex` would answer it.
         r#""aaa" | test("a{3,2}")"#,
     ] {

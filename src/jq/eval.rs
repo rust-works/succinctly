@@ -31205,6 +31205,145 @@ fn dash_beside_set(bytes: &[u8]) -> bool {
     })
 }
 
+/// Oniguruma's absence operator `(?~X)` (#6252) as the loop it is in jq 1.7.1: any characters,
+/// newline included, up to where `X` would match. `(?~ab)` is `(?:(?:(?!ab)(?s:.))*)`: the group
+/// keeps a quantifier after the operator on the loop, and the loop is the same backtracking
+/// repeat as `*`. Checked inside jq over 850 generated patterns (25 absent bodies; quantifiers
+/// after it, groups, lookarounds, atomic groups, backreferences, anchors, `g` and `gn`).
+///
+/// `None` leaves the pattern as written, so that the engines refuse it as before: when it holds
+/// no `(?~`, a range cutter `(?~|…)` (a different construct), an operator inside another (jq
+/// does not read that as the model) or inside a look-behind (the loop is not of one width), a
+/// quoted run, or a `#` that extended mode reads as a comment, and when a group does not close.
+/// A `(?~` inside a class or after a backslash is not the operator, and a comment `(?#…)` is
+/// copied.
+#[cfg(feature = "regex")]
+fn rewrite_absence_operator(pattern: &str, extended: bool) -> Option<String> {
+    if !pattern.contains("(?~") || pattern.contains("(?~|") || pattern.contains("\\Q") {
+        return None;
+    }
+    let extended = extended || inline_extended(pattern);
+    fn class(chars: &[char], at: &mut usize, out: &mut String) -> Option<()> {
+        // `[`, an optional `^`, a `]` that is a literal if it comes first, then to the matching
+        // `]`; a nested `[` (a set or a POSIX bracket) opens another level.
+        let mut depth = 0usize;
+        let mut just_opened = false;
+        while let Some(&c) = chars.get(*at) {
+            out.push(c);
+            *at += 1;
+            match c {
+                '\\' => {
+                    out.push(*chars.get(*at)?);
+                    *at += 1;
+                    just_opened = false;
+                }
+                '[' => {
+                    depth += 1;
+                    just_opened = true;
+                    if chars.get(*at) == Some(&'^') {
+                        out.push('^');
+                        *at += 1;
+                    }
+                }
+                ']' if just_opened => just_opened = false,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(());
+                    }
+                }
+                _ => just_opened = false,
+            }
+        }
+        None
+    }
+    /// Where the scan stands: inside the body of an operator, or of a look-behind.
+    #[derive(Clone, Copy)]
+    struct Ctx {
+        in_group: bool,
+        in_absent: bool,
+        in_lookbehind: bool,
+    }
+    fn scan(
+        chars: &[char],
+        at: &mut usize,
+        out: &mut String,
+        ctx: Ctx,
+        extended: bool,
+    ) -> Option<()> {
+        while let Some(&c) = chars.get(*at) {
+            match c {
+                '\\' => {
+                    out.push(c);
+                    out.push(*chars.get(*at + 1)?);
+                    *at += 2;
+                }
+                '[' => class(chars, at, out)?,
+                // A `#` that extended mode reads as a comment runs to the end of its line.
+                '#' if extended => return None,
+                '(' if chars[*at..].starts_with(&['(', '?', '#']) => {
+                    while let Some(&d) = chars.get(*at) {
+                        out.push(d);
+                        *at += 1;
+                        if d == ')' {
+                            break;
+                        }
+                    }
+                }
+                '(' if chars[*at..].starts_with(&['(', '?', '~']) => {
+                    // An operator inside another one is not the loop of the model, and a
+                    // look-behind of the loop's variable width is refused by the engine.
+                    if ctx.in_absent || ctx.in_lookbehind {
+                        return None;
+                    }
+                    *at += 3;
+                    let mut inner = String::new();
+                    let inner_ctx = Ctx {
+                        in_group: true,
+                        in_absent: true,
+                        ..ctx
+                    };
+                    scan(chars, at, &mut inner, inner_ctx, extended)?;
+                    out.push_str("(?:(?:(?!");
+                    out.push_str(&inner);
+                    out.push_str(")(?s:.))*)");
+                }
+                '(' => {
+                    let behind = chars[*at..].starts_with(&['(', '?', '<', '='])
+                        || chars[*at..].starts_with(&['(', '?', '<', '!']);
+                    out.push(c);
+                    *at += 1;
+                    let inner_ctx = Ctx {
+                        in_group: true,
+                        in_lookbehind: ctx.in_lookbehind || behind,
+                        ..ctx
+                    };
+                    scan(chars, at, out, inner_ctx, extended)?;
+                    out.push(')');
+                }
+                ')' if ctx.in_group => {
+                    *at += 1;
+                    return Some(());
+                }
+                _ => {
+                    out.push(c);
+                    *at += 1;
+                }
+            }
+        }
+        (!ctx.in_group).then_some(())
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = string_with_capacity(pattern.len() + 16);
+    let top = Ctx {
+        in_group: false,
+        in_absent: false,
+        in_lookbehind: false,
+    };
+    scan(&chars, &mut 0, &mut out, top, extended)?;
+    Some(out)
+}
+
 /// Read the dashes of a character class as Oniguruma does (#6184): the `regex` crate reads `--`
 /// as set difference and a `]` that opens a class as a literal that no range can start, so
 /// `[+--]` (the range `+` to `-`), `[--{]` (`-` to `{`) and `[]-b]` (`]` to `b`) came out as other
@@ -32030,6 +32169,9 @@ fn build_regex_uncached<S: EvalSemantics>(
     } else {
         let extended = flags.is_some_and(|flags| flags.contains('x'));
         let n_flag = flags.is_some_and(|flags| flags.contains('n'));
+        // #6252: the absence operator is written as the loop it is.
+        let absence = rewrite_absence_operator(pattern, extended);
+        let pattern = absence.as_deref().unwrap_or(pattern);
         let scanned =
             refuse_possessive_quantifier_for(pattern, extended, n_flag).unwrap_or_else(|refusal| {
                 deferred_refusal = Some(refusal);
@@ -32314,7 +32456,7 @@ const FANCY_BACKTRACK_LIMIT: usize = 10_000_000;
 /// when the pattern uses anything whose meaning there was not checked against jq-1.7.1 to be
 /// Oniguruma's: syntax [`prepare_fancy_pattern`] refuses (`\h` is a hex digit in `fancy-regex`
 /// and a literal `h` in jq), or a construct outside [`fancy_expr_is_oniguruma`]'s list
-/// (subroutine calls, absence operators, backtracking verbs). Those keep the `invalid regex`
+/// (subroutine calls, absence range cutters `(?~|…)`, backtracking verbs; the plain `(?~X)` is rewritten before either engine, #6252). Those keep the `invalid regex`
 /// refusal rather than answering differently from jq. Never in yq mode, whose dialect is Go's.
 ///
 /// `oniguruma_mode` makes `\<`/`\>` the literal characters and `*+`/`++`/`?+` possessive, as in
@@ -146585,6 +146727,64 @@ mod tests {
                 "{pattern}"
             );
         }
+    }
+
+    /// #6252: `(?~X)` is the loop `(?:(?:(?!X)(?s:.))*)`; what is not the operator is left alone.
+    #[test]
+    #[cfg(feature = "regex")]
+    fn the_absence_operator_is_written_as_its_loop() {
+        for (pattern, expected) in [
+            ("(?~ab)", "(?:(?:(?!ab)(?s:.))*)"),
+            ("a(?~b|c)d", "a(?:(?:(?!b|c)(?s:.))*)d"),
+            ("(?~a)+", "(?:(?:(?!a)(?s:.))*)+"),
+            ("((?~a))(?:b)", "((?:(?:(?!a)(?s:.))*))(?:b)"),
+            ("(?=(?~[)]))", "(?=(?:(?:(?![)])(?s:.))*))"),
+            (r"(?~\)x)", r"(?:(?:(?!\)x)(?s:.))*)"),
+            ("(?~[]a(]x)", "(?:(?:(?![]a(]x)(?s:.))*)"),
+            ("(?~[[:alpha:]]x)", "(?:(?:(?![[:alpha:]]x)(?s:.))*)"),
+            ("(?~[^]a]b)", "(?:(?:(?![^]a]b)(?s:.))*)"),
+            ("(?#(?~x)(?~y)", "(?#(?~x)(?:(?:(?!y)(?s:.))*)"),
+        ] {
+            assert_eq!(
+                rewrite_absence_operator(pattern, false).as_deref(),
+                Some(expected),
+                "{pattern}"
+            );
+        }
+        // Not the operator: the text comes back as it was.
+        for pattern in ["[(?~]", r"\(?~a)", "(?#(?~a)"] {
+            assert_eq!(
+                rewrite_absence_operator(pattern, false).as_deref(),
+                Some(pattern),
+                "{pattern}"
+            );
+        }
+        // Not one this reads: left as written.
+        for pattern in [
+            "ab",
+            "(?~|ab)",
+            "(?~a(?~b))",
+            r"\Q(?~a)\E(?~b)",
+            "(?~ab",
+            "(?~[ab)",
+        ] {
+            assert_eq!(rewrite_absence_operator(pattern, false), None, "{pattern}");
+        }
+        assert_eq!(rewrite_absence_operator("(?~a) # c", true), None);
+        assert_eq!(rewrite_absence_operator("(?x)(?~a) # c", false), None);
+        // A `#` in a class or after a backslash is not a comment, in extended mode too.
+        assert_eq!(
+            rewrite_absence_operator("(?~a)[#]", true).as_deref(),
+            Some("(?:(?:(?!a)(?s:.))*)[#]")
+        );
+        assert_eq!(
+            rewrite_absence_operator(r"(?~a)\#", true).as_deref(),
+            Some(r"(?:(?:(?!a)(?s:.))*)\#")
+        );
+        // The loop is not of one width, so a look-behind around it stays refused.
+        assert_eq!(rewrite_absence_operator("(?<=(?~a))b", false), None);
+        assert_eq!(rewrite_absence_operator("(?<!x(?:(?~a)))b", false), None);
+        assert!(rewrite_absence_operator("(?=(?~a))b", false).is_some());
     }
 
     /// #6184: the dashes of a class are written so that the `regex` crate reads the ranges

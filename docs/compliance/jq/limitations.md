@@ -7525,7 +7525,12 @@ Three differences remain.
   Pinned by `tests/jq_cli/i6169.rs`.
 - **Oniguruma syntax outside the checked list stays refused.**
   The second engine takes only constructs and escapes whose meaning there was compared with jq's.
-  `\g<name>` and `\g'name'`, the absence operator `(?~…)` and `\y` keep the `invalid regex` error.
+  `\g<name>` and `\g'name'` and `\y` keep the `invalid regex` error.
+  The absence operator `(?~X)` is read since [#6252](https://github.com/rust-works/succinctly/issues/6252): it is written as `(?:(?:(?!X)(?s:.))*)` before the engines see the pattern, which is how jq 1.7.1 reads it.
+  Over 5,075 generated cases the answers match jq's, except a lazy repeat of the operator under the `l` flag (the `l` flag's own limit, below) and a pattern that names one group twice.
+  A range cutter `(?~|…)`, an operator inside another one or inside a look-behind (`(?<=(?~a))b`, which jq accepts), and one in a pattern with a quoted run `\Q…\E` or an extended-mode `#` comment keep the `invalid regex` error.
+  On input with a multibyte character the operator shares jq 1.7.1's step into the middle of a character that a plain `x*` has (`"éab" | match("(?~[^a])"; "g")` has an extra empty match at offset 1 in jq): a recorded divergence of the global search, not of this rewrite.
+  Pinned by `tests/jq_cli/i6252.rs`.
   (`\h`, `\H` and `\g1` are the letters in jq and here, #6080: see the escaped-letter paragraph above.)
   So do two that jq reads differently from `fancy-regex`: a reversed interval (`a{3,2}`), an error in jq, and a `+` after an interval (`a{2,3}+`), possessive in jq for `{n,m}+` and `{n,}+` but not for `{n}+`.
   A `(?P…)` group is refused before either engine, with jq's `undefined group option` (above).
