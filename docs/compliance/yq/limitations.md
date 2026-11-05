@@ -673,6 +673,20 @@ Not covered here:
 - `!!bool` compared with a string. yq compares a scalar's text, so an empty `!!bool` equals `""` and `!!bool yes` equals `"yes"`, where this compares the boolean ([#6292](https://github.com/rust-works/succinctly/issues/6292)).
 - A value-less tag in a flow collection (`[!!str]`, `{a: !!str}`), which yq refuses and this reads as `[""]` ([#6293](https://github.com/rust-works/succinctly/issues/6293)).
 
+### A scalar under an unknown `!!` tag is its text (#6299)
+
+yq reads a plain scalar under a tag of the secondary handle that names no core type as its text: `a: !!foo 1` is the string `"1"`, and so are `!!binary 1`, `!!set 1`, `!!seq 1` and `!!str: 1`, where the `:` belongs to the tag.
+A primary-handle custom tag (`!foo 1`) names nothing the loader knows and resolves like the untagged text, `1`.
+The core tags force their own kind as before (`!!int`, `!!float`, `!!bool`, `!!null`, `!!str`).
+`resolve_tagged` answers a string for every other `!!` tag, so the JSON, owned and comparison routes agree (88 rows, `tests/yq_cli/i6299.rs`).
+
+```console
+$ printf 'a: !!str: 1\n' | yq -o=json -I0 .                  # {"a":"1"}
+$ printf 'a: !!str: 1\n' | succinctly yq -o json -I0 .        # {"a":"1"}   ({"a":1} before #6299)
+```
+
+One shape is still read where yq refuses it: a named handle that no `%TAG` directive declares (`a: !x!y 1` is `found undefined tag handle` in yq).
+
 ### Invalid UTF-8 in a `-p json` document — substituted for JSON output and in a YAML-output key; a bad value still differs on the prefix (#1616, #4536)
 
 Real yq turns each invalid byte of a JSON document into U+FFFD and lets the *output* encoder

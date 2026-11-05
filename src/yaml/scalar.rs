@@ -751,13 +751,15 @@ pub(crate) fn needs_explicit_float_tag_in_yaml(text: &str) -> bool {
 /// Handles the 5 core-schema tags (`!!str`, `!!null`, `!!bool`, `!!int`,
 /// `!!float`), matching real `yq`'s behavior of applying tag coercion
 /// *regardless of quoting style* — even a quoted `!!int "5"` becomes the
-/// number `5`, not the string `"5"`. Returns `None` for any other tag (a
-/// custom tag, `!!seq`, `!!map`, `!!set`, `!!omap`, verbatim, or no tag at
-/// all) on a scalar with text, meaning "no override — resolve naturally
-/// instead" (`resolve_plain` for a plain scalar, `Str` for quoted/block).
-/// The one exception is the empty text (#6291): a tag with no value is the
-/// empty string whatever the tag, so those tags answer [`Str`](ResolvedScalar::Str)
-/// there, as yq does, and not the null `resolve_plain("")` would be.
+/// number `5`, not the string `"5"`. Returns `None` for a primary-handle custom
+/// tag (`!foo`), a verbatim or named-handle one, or no tag at all, meaning "no
+/// override — resolve naturally instead" (`resolve_plain` for a plain scalar,
+/// `Str` for quoted/block). Two cases answer [`Str`](ResolvedScalar::Str)
+/// for every other tag: the empty text (#6291), because a tag with no value is
+/// the empty string whatever the tag, and not the null `resolve_plain("")`
+/// would be; and a tag of the secondary handle (`!!binary`, `!!set`, `!!foo`,
+/// `!!str:`) on a plain scalar (#6299), which is its text in yq whatever the
+/// text would resolve to untagged.
 ///
 /// Divergence from `yq`: content that cannot be coerced to the forced numeric
 /// type (`!!int "abc"`, `!!int -0x2A`) resolves to [`Str`](ResolvedScalar::Str)
@@ -805,6 +807,11 @@ pub fn resolve_tagged(text: &str, tag: &str) -> Option<ResolvedScalar> {
         // kind, so the empty text is not a null. `!!null` and the tags above answer for
         // themselves; a tag with text goes on being read as that text.
         _ if text.is_empty() => Some(ResolvedScalar::Str),
+        // #6299: and a plain scalar under any other tag of the secondary handle (`!!binary`,
+        // `!!set`, `!!foo`, and `!!str:`, whose `:` belongs to the tag) is its text, not what the
+        // text would resolve to untagged: `!!foo 1` is the string `"1"`. A primary-handle custom
+        // tag (`!foo 1`) names nothing the loader knows and resolves as the untagged text does.
+        _ if tag.starts_with("!!") => Some(ResolvedScalar::Str),
         _ => None,
     }
 }
@@ -871,13 +878,35 @@ mod tests {
             "!<tag:x,2020:y>",
         ] {
             assert_eq!(resolve_tagged("", tag), Some(Str), "{tag}");
-            assert_eq!(resolve_tagged("x", tag), None, "{tag}");
+            // With text, only a tag of the secondary handle is the text (#6299).
+            let with_text = (!tag.starts_with("!!")).then_some(None);
+            assert_eq!(
+                resolve_tagged("x", tag),
+                with_text.unwrap_or(Some(Str)),
+                "{tag}"
+            );
         }
         assert_eq!(resolve_tagged("", "!!str"), Some(Str));
         assert_eq!(resolve_tagged("", "!!null"), Some(Null));
         assert_eq!(resolve_tagged("", "!!bool"), Some(Bool(false)));
         assert_eq!(resolve_tagged("", "!!int"), Some(Str));
         assert_eq!(resolve_tagged("", "!!float"), Some(Str));
+    }
+
+    /// #6299: a plain scalar under a tag of the secondary handle that is not a core type is its
+    /// text, whatever the text; a primary-handle custom tag falls through.
+    #[test]
+    fn a_plain_scalar_under_an_unknown_secondary_handle_tag_is_its_text_6299() {
+        for tag in [
+            "!!foo", "!!binary", "!!set", "!!seq", "!!str:", "!!int:", "!!int2",
+        ] {
+            for text in ["1", "true", "null", "~", "0x1f", "1.5", "abc"] {
+                assert_eq!(resolve_tagged(text, tag), Some(Str), "{tag} {text}");
+            }
+        }
+        for tag in ["!foo", "!foo:", "!e!tag", "!<tag:x>"] {
+            assert_eq!(resolve_tagged("1", tag), None, "{tag}");
+        }
     }
 
     #[test]
@@ -1150,17 +1179,14 @@ mod tests {
 
     #[test]
     fn untagged_and_non_core_schema_tags_return_none() {
-        // No override for a custom tag, a collection tag, or no tag at all -
-        // the caller falls back to natural resolution.
-        for tag in [
-            "!custom",
-            "!!set",
-            "!!omap",
-            "!!map",
-            "!!seq",
-            "!<tag:x,2000:y>",
-        ] {
+        // No override for a primary-handle custom tag, a verbatim one, or no tag at all -
+        // the caller falls back to natural resolution. (A tag of the secondary handle that is
+        // not a core type is its text, #6299.)
+        for tag in ["!custom", "!<tag:x,2000:y>", "!e!tag"] {
             assert_eq!(resolve_tagged("1", tag), None, "tag: {tag}");
+        }
+        for tag in ["!!set", "!!omap", "!!map", "!!seq"] {
+            assert_eq!(resolve_tagged("1", tag), Some(Str), "tag: {tag}");
         }
     }
 
