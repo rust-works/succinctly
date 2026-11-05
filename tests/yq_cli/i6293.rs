@@ -37,6 +37,9 @@ const REFUSED: &[&str] = &[
     "!!str]\n",
     "!!str,\n",
     "!!str}\n",
+    "a: !<tag:x>}\n",
+    "- !<tag:x>,\n",
+    "!<tag:x>]\n",
 ];
 
 #[test]
