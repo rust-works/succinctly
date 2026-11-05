@@ -27878,6 +27878,10 @@ struct JqRegex {
     /// `ONIG_OPTION_FIND_LONGEST` does, not from where `\K` moved the start (#6085). `fancy-regex`
     /// reports only the span `\K` keeps.
     keep_anchored: Option<fancy_regex::Regex>,
+    /// jq 1.7.1 searches again one *byte* after an empty match, so a multibyte character gives
+    /// the matches at its continuation bytes too (#6326). Set when the pattern has no assertion,
+    /// so that its empty match at a character holds at those bytes as well.
+    empty_steps_bytes: bool,
 }
 
 /// How an `l` search ends early.
@@ -33035,6 +33039,8 @@ fn build_regex_uncached<S: EvalSemantics>(
                         start_independent: !pattern.contains("\\G") && keep_anchored.is_none(),
                     }),
                     keep_anchored,
+                    empty_steps_bytes: S::TAG != EvalTag::Yq
+                        && empty_match_is_position_free(&pattern),
                 });
             }
         }
@@ -33062,6 +33068,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 engine_not_empty: false,
                 longest: None,
                 keep_anchored: None,
+                empty_steps_bytes: false,
             });
         }
     }
@@ -33117,6 +33124,7 @@ fn build_regex_uncached<S: EvalSemantics>(
             engine_not_empty: false,
             longest: None,
             keep_anchored: None,
+            empty_steps_bytes: S::TAG != EvalTag::Yq && empty_match_is_position_free(&pattern),
         }),
         // #5502: lookaround, backreferences, atomic groups and the like are Oniguruma syntax the
         // `regex` crate refuses. A pattern `fancy-regex` cannot take either keeps the crate's
@@ -33133,10 +33141,34 @@ fn build_regex_uncached<S: EvalSemantics>(
                 engine_not_empty: false,
                 longest: None,
                 keep_anchored: None,
+                empty_steps_bytes: false,
             }),
             None => Err(EvalError::new(format!("invalid regex: {e}"))),
         },
     }
+}
+
+/// Whether `pattern` has no assertion, so that an empty match at a character start holds at the
+/// bytes inside that character too (#6326): jq searches again one byte after an empty match, and
+/// Oniguruma matches empty at a continuation byte exactly when the pattern does not look at its
+/// surroundings (`\b`, a look-around, `^`, `$` do). A pattern the `regex` crate's parser refuses
+/// (look-around, a back-reference, `\K`) is not one.
+#[cfg(feature = "regex")]
+fn empty_match_is_position_free(pattern: &str) -> bool {
+    use regex_syntax::ast::{self, Ast};
+    fn assertion_free(ast: &Ast) -> bool {
+        match ast {
+            Ast::Assertion(_) => false,
+            Ast::Group(group) => assertion_free(&group.ast),
+            Ast::Repetition(rep) => assertion_free(&rep.ast),
+            Ast::Alternation(alt) => alt.asts.iter().all(assertion_free),
+            Ast::Concat(concat) => concat.asts.iter().all(assertion_free),
+            _ => true,
+        }
+    }
+    ast::parse::Parser::new()
+        .parse(pattern)
+        .is_ok_and(|ast| assertion_free(&ast))
 }
 
 /// The `regex` crate's compilation of `pattern`, guarded by [`guard_prefix_lifting`] (#6134). A
@@ -34711,6 +34743,22 @@ fn global_captures<'h, S: EvalSemantics>(
             if !go_style_skip {
                 last_match_end = Some(m_end);
                 results.push(caps);
+                // #6326: jq steps one byte after an empty match, so the continuation bytes of a
+                // multibyte character each give an empty match, reported where the next
+                // character starts.
+                if is_empty_match && re.empty_steps_bytes {
+                    if let Some(c) = input[m_start..].chars().next() {
+                        let resume = m_start + c.len_utf8();
+                        let at = RegexMatch {
+                            text: &input[resume..resume],
+                            start: resume,
+                        };
+                        let step = vec![Some(at); re.captures_len()];
+                        for _ in 1..c.len_utf8() {
+                            results.push(RegexCaptures::Mapped(step.clone()));
+                        }
+                    }
+                }
             }
         }
         start = next_start;

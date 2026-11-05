@@ -7538,7 +7538,7 @@ Three differences remain.
   The absence operator `(?~X)` is read since [#6252](https://github.com/rust-works/succinctly/issues/6252): it is written as `(?:(?:(?!X)(?s:.))*)` before the engines see the pattern, which is how jq 1.7.1 reads it.
   Over 5,075 generated cases the answers match jq's, except a lazy repeat of the operator under the `l` flag (the `l` flag's own limit, below) and a pattern that names one group twice.
   A range cutter `(?~|…)`, an operator inside another one or inside a look-behind (`(?<=(?~a))b`, which jq accepts), and one in a pattern with a quoted run `\Q…\E` or an extended-mode `#` comment keep the `invalid regex` error.
-  On input with a multibyte character the operator shares jq 1.7.1's step into the middle of a character that a plain `x*` has (`"éab" | match("(?~[^a])"; "g")` has an extra empty match at offset 1 in jq): a recorded divergence of the global search, not of this rewrite.
+  On input with a multibyte character jq 1.7.1 steps into the middle of a character after an empty match (`"éab" | match("(?~[^a])"; "g")` has an extra empty match at offset 1), and the operator does not follow it: the rewrite reads a look-ahead, which [#6326](https://github.com/rust-works/succinctly/issues/6326)'s byte step leaves to the character step (a recorded divergence of the global search, not of this rewrite).
   Pinned by `tests/jq_cli/i6252.rs`.
   (`\h`, `\H` and `\g1` are the letters in jq and here, #6080: see the escaped-letter paragraph above.)
   So do two that jq reads differently from `fancy-regex`: a reversed interval (`a{3,2}`), an error in jq, and a `+` after an interval (`a{2,3}+`), possessive in jq for `{n,m}+` and `{n,}+` but not for `{n}+`.
@@ -7728,8 +7728,9 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
 - **A search can run out of budget where jq's optimizer does not.**
   `l` and `n` run the backtracking engine on patterns the `regex` crate used to answer in one pass, so a pathological pattern that Oniguruma settles at once can raise `Regex failure: retry-limit-in-match over` here, the budget of the lookaround route (above).
   As in Oniguruma, each start position an `l` search tries has a budget of its own.
-- **Multibyte text and an empty match are a separate jq quirk.**
-  jq 1.7.1 advances one byte after an empty match, so `"éaé" | [match("";"g").offset]` has a duplicate `1` and `3` in jq; this is the same with and without `l` and is not changed here.
+- **Multibyte text and an empty match are a separate jq quirk, followed since [#6326](https://github.com/rust-works/succinctly/issues/6326).**
+  jq 1.7.1 advances one byte after an empty match, so `"éaé" | [match("";"g").offset]` has a duplicate `1` and `3` in jq, and so it does here.
+  This holds with and without `l`.
 
 Both flags go through `first_captures`/`global_captures`/`next_match_step` (`src/jq/eval.rs`), the one choke point every regex builtin shares, so `test`, `match`, `capture`, `scan`, `split`, `splits`, `sub` and `gsub` agree with each other.
 The differential behind this change compared `/usr/bin/jq` 1.7.1, the previous binary and the new one over generated patterns (nested and quantified groups, alternations inside repeats, lazy quantifiers, empty-first alternation, and each with lookbehind) on every string over `{a,b,c}` up to length 5, for `l`, `n`, `ln` and each with `g`.
@@ -14293,3 +14294,26 @@ The refusals above and the answers #5692 fixed are pinned by `tests/jq_cli/i5692
 - [`src/jq/eval_generic.rs`](../../../src/jq/eval_generic.rs) - generic evaluator (CLI path)
 - [jq manual](https://jqlang.github.io/jq/manual/) - upstream reference
 
+## After an empty match jq searches again one byte on, so a multibyte character gives extra empty matches ([#6326](https://github.com/rust-works/succinctly/issues/6326))
+
+jq 1.7.1 resumes a global search one *byte* after an empty match, even when that byte is inside a multibyte character, and Oniguruma matches empty there too.
+Each continuation byte therefore gives an empty match, reported at the codepoint offset of the next character: `"ß" | [match("";"g") | .offset]` is `[0,1,1]` and `"日本" | [match("x*";"g") | .offset]` is `[0,1,1,1,2,2,2]`.
+`gsub`, `scan`, `splits`, `capture` and the other regex builtins see the extra matches as jq does: `"ß" | gsub("";"X")` is `"XßXX"` and `"ß" | [splits("")]` is `["","ß","",""]`.
+`succinctly jq` followed the `regex` crate and stepped by character, so each of these answered with one match fewer per continuation byte.
+
+An empty match at a character is now followed by one more per continuation byte, each with the same empty captures, when the pattern has no assertion and the `regex` crate's parser reads it as written; the `l` route follows too.
+Such a pattern's empty match cannot depend on where it stands, which is what Oniguruma's match at the continuation byte shows.
+The `n` flag drops the empty matches, extra ones included, and yq mode steps by character as Go's `regexp` does.
+Over 1,854 generated patterns (nullable repeats, alternations, groups and classes, on 46 strings of one- to four-byte characters, through `match`, `gsub`, `splits` and `scan`), 1,114 differed from jq before and 3 do now.
+
+These keep the character step, and differ from jq where the shape occurs:
+
+- **A pattern with an assertion, or one the `regex` crate's parser refuses.**
+  `"ßa" | [match("\\b";"g") | .offset]` is `[0,1,2]` in jq and `[0,2]` here: Oniguruma decides `\b` at the continuation byte from the bytes around it, which the `regex` crate cannot be asked.
+  The same holds for `\B`, a look-around (`"é" | [match("(?=)";"g") | .offset]` is `[0,1,1]` in jq and `[0,1]` here), `\G`, `\K`, a back-reference, and the absence operator `(?~X)` (`"éab" | [match("(?~[^a])";"g") | .offset]` is `[0,1,1,2,3]` in jq and `[0,1,2,3]` here), which the rewrite turns into a look-ahead.
+  `^` and `$` give the same matches in both.
+- **A pattern with an alternative that consumes at a continuation byte but not at the character.**
+  `\w[^a]|[^a]??` and `(é*)*\w|(é*)*` are empty at `é` and match the stray byte after it in jq.
+  3 of the 1,854 patterns are of this kind.
+
+Pinned by `tests/jq_cli/i6326.rs`.
