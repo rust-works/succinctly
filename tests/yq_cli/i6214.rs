@@ -1,8 +1,8 @@
 //! #6214 (the flow-collection half): go-yaml ends a line at U+2028, U+2029 and U+0085 as at `\n`, so a
 //! tab at the start of the line after one is refused below the enclosing block's indent, as after a
 //! `\n` (#6059). The break itself stays scalar content that folds as before (#4913). Every row was
-//! captured from yq v4.53.3. The block-context indent rule after such a break and the empty-key host are
-//! not changed (see the issue).
+//! captured from yq v4.53.3. The first two tests cover the flow scanners; the rest of the file covers the
+//! block-context scanners. The empty-key host (`: [x\n\ty]`) is not changed (#6288).
 
 use anyhow::Result;
 
@@ -281,7 +281,8 @@ fn a_unicode_break_in_a_flow_plain_scalar_without_that_tab_is_read_6214() -> Res
     Ok(())
 }
 
-// The block-context half (#6214): the same tab rule after a Unicode break in a block plain scalar.
+// The block-context scanners (#6214): the same tab rule after a Unicode break in a block plain scalar
+// or key. `REFUSED` also holds flow shapes, which pin that the two paths agree.
 
 /// Each shape with each of U+2028, U+2029 and U+0085 for the break.
 const REFUSED: &[&str] = &[

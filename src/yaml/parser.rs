@@ -7391,8 +7391,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
         }
 
-        self.reject_tab_after_unicode_break(start, self.pos)?;
-
         // Trim trailing whitespace
         let mut end = self.pos;
         while end > start && matches!(self.input[end - 1], b' ' | b'\t') {
@@ -7509,8 +7507,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
         }
 
-        self.reject_tab_after_unicode_break(start, self.pos)?;
-
         // Trim trailing whitespace
         let mut end = self.pos;
         while end > start && matches!(self.input[end - 1], b' ' | b'\t') {
@@ -7560,10 +7556,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
-    /// #6214: the same refusal for a line that a U+2028, U+2029 or U+0085 ends inside a plain scalar
-    /// (`input[start..end]`). The scalar decoders fold those as line breaks (#4913) and go-yaml
-    /// scans them as such, so the blanks after one are a continuation line's, but the scanners here
-    /// take them for text and never reach [`Self::reject_tab_in_flow_plain_continuation`].
+    /// #6214: the same refusal for a line that a U+2028, U+2029 or U+0085 ends inside a block plain
+    /// scalar or key (`input[start..end]`). The scalar decoders fold those as line breaks (#4913) and
+    /// go-yaml scans them as such, so the blanks after one are a continuation line's, but the block
+    /// scanners take them for text. The flow scanners stop at the break and call
+    /// [`Self::pass_unicode_break_in_flow_plain`] instead.
     fn reject_tab_after_unicode_break(&self, start: usize, end: usize) -> Result<(), YamlError> {
         if !self.may_hold_unicode_break {
             return Ok(());
@@ -7754,8 +7751,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 _ => self.advance(),
             }
         }
-
-        self.reject_tab_after_unicode_break(start, self.pos)?;
 
         // Trim trailing whitespace
         let mut end = self.pos;
