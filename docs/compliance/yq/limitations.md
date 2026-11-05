@@ -7014,7 +7014,7 @@ A number keeps its source text (`1.50`, `0x1f`, `1_0`) in both.
 `eval(expr)` is yq's: each string `expr` yields is parsed as a yq expression and evaluated against the current node.
 It is new in `succinctly yq` since #6081, and stays undefined in jq mode, where jq has no such builtin.
 A stored expression, a computed one, several at once (`eval(.list[])`), the empty expression, a comment, and a write through `eval` (`eval(".a") = 5`, `del(eval(".a"))`, `(eval(".c[]")) += 1`) answer as yq v4.53.3 does.
-`tests/yq_cli/i6081.rs` pins 41 rows of it, in JSON output.
+`tests/yq_cli/i6081.rs` pins 45 rows of it, in JSON output.
 These differ:
 
 - **The nodes `eval` reaches print in the style of a value the program built.**
