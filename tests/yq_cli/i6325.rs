@@ -12,6 +12,11 @@ const ARGS: &[&str] = &["-o=json", "-I=0"];
 #[test]
 fn test_a_bare_colon_entry_inside_an_explicit_key_is_refused_as_yq_refuses_it_6325() -> Result<()> {
     for doc in [
+        "?\n  : x\n",
+        "? - - : x\n: y\n",
+        "?\n  : x\n: y\n",
+        "- ?\n    : x\n",
+        "? :\tx\n",
         "? : x\n",
         "- ? : x\n",
         "? - : x\n",
@@ -35,6 +40,12 @@ fn test_a_bare_colon_entry_inside_an_explicit_key_is_refused_as_yq_refuses_it_63
 #[test]
 fn test_an_explicit_key_with_a_property_or_a_key_still_reads_6325() -> Result<()> {
     for (doc, expected) in [
+        ("? :x\n", "{\":x\":null}"),
+        ("?\n  !!str : x\n", "{\"\":null}"),
+        ("?\n: b\n", "{\"\":\"b\"}"),
+        ("?\n  a\n: b\n", "{\"a\":\"b\"}"),
+        ("? - - a\n    - b\n: c\n", "{\"\":\"c\"}"),
+        ("? - - !!str : x\n: y\n", "{\"\":\"y\"}"),
         ("? !!str : x\n", "{\"\":null}"),
         ("- ? &a : x\n", "[{\"\":null}]"),
         ("? &a : x\n: y\n", "{\"\":\"y\"}"),

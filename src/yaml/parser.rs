@@ -2855,6 +2855,34 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// byte structurally unlikely there too -- not verified with the same
     /// rigor as `parse_block_scalar_header`'s catch-all below, so kept as a
     /// real (not `unreachable!()`) fallback rather than a proven-dead one.
+    /// Whether the cursor is at a `:` that is a value indicator (a blank, a break or the end follows
+    /// it). With no `?` or key before it on its line it is the keyless entry yq refuses with
+    /// `did not find expected key` (#6288, #6325).
+    #[inline]
+    fn at_bare_colon(&self) -> bool {
+        self.peek() == Some(b':') && Self::is_ws_break_or_eoi(self.peek_at(1))
+    }
+
+    /// Whether a run of block sequence indicators opens at the cursor and ends at a bare `:`
+    /// (`- - : x`), without moving it (#6325).
+    fn dashes_end_in_bare_colon(&self) -> bool {
+        let mut at = self.pos;
+        loop {
+            match self.input.get(at) {
+                Some(b'-') if Self::is_ws_break_or_eoi(self.input.get(at + 1).copied()) => {
+                    at += 1;
+                    while matches!(self.input.get(at), Some(b' ' | b'\t')) {
+                        at += 1;
+                    }
+                }
+                Some(b':') => {
+                    return Self::is_ws_break_or_eoi(self.input.get(at + 1).copied());
+                }
+                _ => return false,
+            }
+        }
+    }
+
     fn err_unexpected_char(&self, offset: usize, context: &'static str) -> YamlError {
         YamlError::UnexpectedCharacter {
             offset,
@@ -4620,7 +4648,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.parse_explicit_key(self.current_column())?;
             // Don't close anything - mapping and item are closed by
             // close_deeper_indents when we see content at lower indent.
-        } else if self.peek() == Some(b':') && Self::is_ws_break_or_eoi(self.peek_at(1)) {
+        } else if self.at_bare_colon() {
             // #6288: `- : b` has no key and no `?` before the `:`, which yq refuses (a tag or an
             // anchor first, `- !!str : b`, is an empty key it reads, and starts with neither).
             return Err(self.err_unexpected_char(self.pos, "did not find expected key"));
@@ -5571,7 +5599,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // #6325: whether the key content opens with a bare `: ` (`? : x`), before any property
         // can stand in front of it (`? !!str : x` is an empty key yq reads).
-        let bare_colon_key = self.peek() == Some(b':') && Self::is_ws_break_or_eoi(self.peek_at(1));
+        let mut bare_colon_key = self.at_bare_colon();
 
         // Check for a property before the key
         self.parse_node_properties()?;
@@ -5658,6 +5686,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // had followed the `?` on its own line, so the key is recorded as pending and
             // the entry after it is not taken for its value (#4532).
             self.advance_by(next_indent);
+            // #6325: and a bare `: ` opening the key's content on the line below (`?⏎  : x`).
+            bare_colon_key = self.at_bare_colon();
             // Node properties on the content line belong to the key, as on the `?` line. When
             // they stand alone on it the key content is a further line down, which the main loop
             // reads as it always has.
@@ -5706,7 +5736,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.skip_inline_whitespace();
 
                 // #6325: `? - : x`, the same keyless entry in the key's first item.
-                if self.peek() == Some(b':') && Self::is_ws_break_or_eoi(self.peek_at(1)) {
+                if self.at_bare_colon() || self.dashes_end_in_bare_colon() {
                     return Err(self.err_unexpected_char(self.pos, "did not find expected key"));
                 }
 
