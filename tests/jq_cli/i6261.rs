@@ -19,6 +19,15 @@ fn test_a_repeat_after_a_comment_with_nothing_before_it_is_refused_under_every_f
         "a|(?#c)*",
         "(?:(?#c)*)",
         "(?#c)(?#d)*",
+        // Or at the start of another group, or after a bare option group.
+        "((?#c)*)",
+        "(?<n>(?#c)+)",
+        "(?=(?#c)*)",
+        "(?i:(?#c)*)",
+        "(?i)(?#c)*",
+        "(?x)(?#c)*",
+        "(?-x)(?#c)*",
+        "a(?i)(?#c)*",
     ] {
         for flags in ["g", "gi", "gx", "gn", "gnx"] {
             let (stdout, stderr, code) = run_jq_full(
