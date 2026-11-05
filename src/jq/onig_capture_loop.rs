@@ -35,9 +35,12 @@
 //! assertion (`(a|$)*`) matches empty at some positions and not others, so `E` could fail where
 //! Oniguruma's loop would simply stop. An assertion on a body that also has a way around it stays in
 //! `E` wherever a group needs it, since which empty way succeeds depends on the position only.
-//! Neither is a lazy repeat rewritten (`(a*)*?b` already agrees) nor a counted one from `{2,}` up,
-//! which the crate expands into copies whose last one matches empty. A projected loop (`X*` inside
-//! some `E`) is written as `E` alone: its loop copy could only make empty iterations, which the crate
+//! Nor is a lazy repeat rewritten (`(a*)*?b` already agrees). A `{n,}` from `{2,}` up is
+//! the `*` loop for a body that always matches empty, since the empty iteration ends the loop before
+//! the minimum count (#6309); it is written so only when the repeated item is a capture group with no
+//! group inside it. Over a body with groups in it the crate's own copies (`X X X*`) answer as jq does
+//! more often than `(?:X*E)` would, and the loop rewrite cannot read the loop copy to order its ways.
+//! A projected loop (`X*` inside some `E`) is written as `E` alone: its loop copy could only make empty iterations, which the crate
 //! drops, so it would never set a group. That keeps the rewritten pattern linear in the nesting depth
 //! instead of doubling per level; [`MAX_REWRITTEN_LEN`] bounds it all the same.
 //!
@@ -240,15 +243,24 @@ impl Emitter<'_> {
 }
 
 /// A greedy `*`, `+`, `{0,}` or `{1,}` of a body that holds a group and matches empty at every
-/// position: the repeats whose captures the crate and Oniguruma report differently.
+/// position: the repeats whose captures the crate and Oniguruma report differently. So is a
+/// `{n,}` with `n` of 2 or more over a capture group that holds no other group (#6309): the empty
+/// iteration ends such a loop even before its minimum count, so it is the `*` loop, and the loop
+/// copy `(?:X)*` is one the loop rewrite (#6106) reads. With a group inside, the crate's own
+/// copies of the body (`X X X*`) answer as Oniguruma does more often than `(?:X*E)` would.
 fn is_candidate(rep: &ast::Repetition) -> bool {
-    let unbounded = matches!(
-        rep.op.kind,
-        RepetitionKind::ZeroOrMore
-            | RepetitionKind::OneOrMore
-            | RepetitionKind::Range(RepetitionRange::AtLeast(0 | 1))
-    );
-    unbounded && rep.greedy && has_group(&rep.ast) && always_matches_empty(&rep.ast)
+    let counted = match rep.op.kind {
+        RepetitionKind::ZeroOrMore | RepetitionKind::OneOrMore => false,
+        RepetitionKind::Range(RepetitionRange::AtLeast(0 | 1)) => false,
+        RepetitionKind::Range(RepetitionRange::AtLeast(_)) => true,
+        _ => return false,
+    };
+    rep.greedy
+        && has_group(&rep.ast)
+        && always_matches_empty(&rep.ast)
+        && (!counted
+            || matches!(&*rep.ast, Ast::Group(group)
+                if group.capture_index().is_some() && !has_group(&group.ast)))
 }
 
 fn has_candidate(ast: &Ast) -> bool {
@@ -399,6 +411,12 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_a_counted_repeat_of_a_plain_capture_group_as_the_star_loop() {
+        assert_eq!(rewritten("(a*){2,}b").as_deref(), Some(r"(?:(?:a*)*())b"));
+        assert_eq!(rewritten("(b|){3,}").as_deref(), Some(r"(?:(?:b|)*())"));
+    }
+
+    #[test]
     fn leaves_every_other_repeat_alone() {
         // No group, a body that cannot match empty, a lazy repeat, a counted repeat from 2 up,
         // a bounded one, an assertion in the body, and `U`.
@@ -407,7 +425,8 @@ mod tests {
             "(?:a*)*b",
             "(a+)*b",
             "(a*)*?b",
-            "(a*){2,}b",
+            "(?:(a*)){2,}b",
+            "((a)*){2,}b",
             "(a*){0,5}b",
             "(a|$)*",
             r"(a|\b)*b",
