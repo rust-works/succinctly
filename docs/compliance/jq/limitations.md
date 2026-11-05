@@ -7568,7 +7568,7 @@ Three differences remain.
   jq does try the pattern at the start of the subject and after each line break (`"x\nc"` matches at offset 2, and `"xc\nc"` with `g` has only the match at offset 3).
   What stays as jq has it: a lookahead that gives Oniguruma a literal to search for (`(?=c+).+` finds offset 1), a dot that is not a greedy star (`.`, `.{1,3}`, `.+?`, `(?s:.+)`), `\w+` for `.+`, something in front of the lookahead (`(?:^|x)(?=c*c).+`, `(?!x)(?=c*c).+`), and a second lookahead (`(?=c*c)(?=c).+`).
   The rows fit Oniguruma's search taking a pattern that starts `.*` as anchored to line starts, which holds here only while its optimizer has no literal to search for; that reading comes from these probes, not from its source.
-  Matching it would mean modelling that optimizer, which ADR-0018's decision order does not ask for when the reference's answer follows from a search shortcut and not from the pattern's meaning, so the match is found wherever it is.
+  Matching it would mean modelling when that optimizer finds a literal, which no rule short of its source states, so #6304 recorded the gap instead and the match is found wherever it is.
   A pattern that needs the later offsets (the lookahead fails at every line start) is the only one affected; in a sweep of 30,000 generated cases of fancy syntax beside a loop, 4 differed this way.
   Pinned by `tests/jq_cli/i6304.rs`.
 
