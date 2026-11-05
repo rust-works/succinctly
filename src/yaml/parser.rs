@@ -7730,23 +7730,47 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let mut chomping = ChompingIndicator::Clip;
         let mut explicit_indent: u8 = 0;
 
-        // Parse optional modifiers (order can vary: |2- or |-2)
+        // Parse optional modifiers (order can vary: |2- or |-2), one of each kind: a second
+        // chomping indicator, a second digit and a `0` are left for the check below, which
+        // refuses them (#6348).
+        let mut chomping_seen = false;
         for _ in 0..2 {
             match self.peek() {
-                Some(b'-') => {
+                Some(b'-') if !chomping_seen => {
                     chomping = ChompingIndicator::Strip;
+                    chomping_seen = true;
                     self.advance();
                 }
-                Some(b'+') => {
+                Some(b'+') if !chomping_seen => {
                     chomping = ChompingIndicator::Keep;
+                    chomping_seen = true;
                     self.advance();
                 }
-                Some(c) if c.is_ascii_digit() && c != b'0' => {
+                Some(c) if c.is_ascii_digit() && c != b'0' && explicit_indent == 0 => {
                     explicit_indent = c - b'0';
                     self.advance();
                 }
                 _ => break,
             }
+        }
+
+        // The header holds nothing else: after the indicators only blanks, a comment and the line
+        // break (#6348). yq stops at anything more with `did not find expected comment or line
+        // break` (`a: |  x`, `a: |x`, `a: |--`, `a: |0`, `a: |"q"`); the text was dropped and the
+        // lines below read as the content.
+        let mut after = self.pos;
+        while self.input.get(after).copied().is_some_and(Self::is_inline_whitespace) {
+            after += 1;
+        }
+        // NEL, LS and PS end the line to yq as `\n` does, which the index does not model (#4913):
+        // left accepted, as before, rather than refused for a value that is already wrong.
+        if !matches!(self.input.get(after), None | Some(b'\n' | b'\r' | b'#'))
+            && self.unicode_break_len_at(after) == 0
+        {
+            return Err(self.err_unexpected_char(
+                after,
+                "did not find expected comment or line break after a block scalar header",
+            ));
         }
 
         Ok(BlockScalarHeader {

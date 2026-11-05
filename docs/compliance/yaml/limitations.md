@@ -99,7 +99,7 @@ down as:
 | `lax:anchors`      | 3     | Anchor and alias rules, incl. an unindented tag target (#224) |
 | `lax:documents`    | 3     | Directive and document-marker placement, incl. a mid-stream `%TAG` (#224) |
 | `lax:comments`     | 2     | Comment placement                                       |
-| `lax:block-scalar` | 2     | Block scalar header validity (`\|--` parses)             |
+| `lax:block-scalar` | 2     | Block scalar content indentation                        |
 | `lax:tabs`         | 1     | Tabs where indentation is expected                       |
 
 Two `lax:mapping` cases (`9KBC`, `EW3V`) left the manifest with #4463: the loader now rejects content after a
