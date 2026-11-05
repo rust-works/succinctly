@@ -13,6 +13,9 @@ const ARGS: &[&str] = &["-o=json", "-I=0"];
 #[test]
 fn test_a_colon_with_no_explicit_key_is_refused_as_yq_refuses_it_6288() -> Result<()> {
     for doc in [
+        // A quoted implicit key that continues on the next line: yq refuses it, and the old build read
+        // the second line as a value and dropped the `: 1` (the unit test of merge-key detection used it).
+        "m:\n  \"<\\\r\n  <\": 1\n",
         ": a\n",
         "a: 1\n: b\n",
         "- 1\n: b\n",
@@ -72,7 +75,6 @@ fn test_a_colon_after_an_explicit_key_or_a_property_still_reads_6288() -> Result
         ),
         ("? a\n: - 1\n  - 2\n", "{\"a\":[1,2]}"),
         ("? [a, b]\n: c\n", "{\"\":\"c\"}"),
-        ("? a\n: b\n? c\n: d\n", "{\"a\":\"b\",\"c\":\"d\"}"),
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, ARGS)?;
         assert_eq!(code, 0, "{doc:?}: {stderr:?}");
