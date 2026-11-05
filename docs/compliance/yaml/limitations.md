@@ -631,7 +631,7 @@ its `explicit_indent` case last.
 YAML 1.2 lets a flow mapping key continue across lines (`{ multi⏎  line: value }`) and lets its `:` stand on the next line (`{"foo"⏎: "bar"}`).
 `yq` v4.53.3 refuses both with `did not find expected ',' or '}'`, because go-yaml's simple-key rule allows no line break between a key's first character and its `:`.
 `succinctly yq` refuses them too since [#6208](https://github.com/rust-works/succinctly/issues/6208); before, it folded the break into the key (`{x⏎ y: 1}` was `{"x y": 1}`).
-The rule covers a plain key, a quoted key that spans lines, a nested-collection key and a key with an anchor or tag, in a block value (`a: {x⏎ y: 1}`) as in a sequence item.
+The rule covers a plain key, a quoted key that spans lines, a nested-collection key and a key with an anchor or tag, in a block value (`a: {x⏎ y: 1}`) and in a sequence item, and the single-pair mapping of a flow sequence (`["x⏎ y": 1]`, `[{x⏎}: 1]`) as well as a flow mapping.
 Text across a break that has no `:` is still a multi-line plain entry (`{x⏎ y}` is `x y: null`), and the explicit `? key` form may span lines.
 Nine corpus cases are valid YAML 1.2 that `yq` refuses, and move into the known-failures manifest: `4MUZ/00`, `4MUZ/01`, `4MUZ/02`, `5MUD`, `9SA2`, `K3WX`, `NJ66`, `UT92` and `VJP3/01`.
 `VJP3/00` (invalid YAML) leaves it, because the loader now rejects it as the suite requires.

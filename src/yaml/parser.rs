@@ -6378,6 +6378,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // #409) binds via `record_key_anchor` / `record_key_alias` to this
         // already-open key node, rather than `parse_anchor`/`parse_alias`'s
         // "next node opened" semantics binding to the wrong node.
+        let key_start = self.pos;
         self.set_ib();
         self.write_bp_open();
         if !self.parse_flow_key()? {
@@ -6388,8 +6389,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
         self.write_bp_close();
 
+        // #6208: a simple key has no line break between its first character and its `:`
+        // (`[{x⏎}: 1]`, `["x⏎ y": 1]`, `[[a,⏎ b]: 1]`), as in a flow mapping's key; the break
+        // before the `:` (`["x"⏎ : 1]`) is refused below, where only blanks may precede it.
+        let key_end = self.pos;
+
         // Skip whitespace before colon
         self.skip_inline_whitespace();
+
+        if self.peek() == Some(b':')
+            && self.input[key_start..key_end]
+                .iter()
+                .any(|&b| matches!(b, b'\n' | b'\r'))
+        {
+            return Err(self.err_unexpected_char(key_start, "expected ',' or ']' after a key"));
+        }
 
         // Expect and skip colon
         if self.peek() != Some(b':') {

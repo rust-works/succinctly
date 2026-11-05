@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 
-use crate::run_yq_stdin;
+use crate::{run_yq_stdin, run_yq_stdin_with_stderr};
 
 #[test]
 fn test_implicit_flow_key_across_a_line_break_is_refused_6208() -> Result<()> {
@@ -28,10 +28,24 @@ fn test_implicit_flow_key_across_a_line_break_is_refused_6208() -> Result<()> {
         "a: {x\n y: 1}\n",
         "- {x\n y: 1}\n",
         "[{\"x\"\n : 1}]\n",
+        "[{x\n}: 1]\n",
+        "[\"x\n y\": 1]\n",
+        "['x\n y': 1]\n",
+        "[[a,\n b]: 1]\n",
+        "[{a: 1,\n b: 2}: 1]\n",
+        "[&a x\n y: 1]\n",
+        "[x\n y: 1]\n",
+        "[x\n: 1]\n",
+        "[a, \"b\n c\": 1]\n",
         "{x y\n z: 1}\n",
     ] {
-        let (stdout, code) = run_yq_stdin(".", doc, &["-o=json", "-I=0"])?;
-        assert_eq!((stdout.as_str(), code), ("", 1), "{doc:?}");
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, &["-o=json", "-I=0"])?;
+        assert_eq!((stdout.as_str(), code), ("", 1), "{doc:?}: {stderr}");
+        // A refusal of the document's syntax (`expected ...`), not some other failure.
+        assert!(
+            stderr.contains("YAML parse error") && stderr.contains("expected"),
+            "{doc:?}: {stderr}"
+        );
     }
     Ok(())
 }
