@@ -2360,12 +2360,24 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // this mapping (`? ? ? a⏎  ? y⏎: c`, #6322): it waits behind the new one.
         if let Some(waiting) = self.pending_explicit_key {
             if waiting < owner_depth {
-                self.pending_explicit_key_below
-                    .push((waiting, self.pending_explicit_key_empty));
+                self.wait_behind_pending_explicit_key(waiting, self.pending_explicit_key_empty);
             }
         }
         self.pending_explicit_key = Some(owner_depth);
         self.pending_explicit_key_empty = empty;
+    }
+
+    /// Records the explicit key of the mapping at `owner_depth` as waiting behind the pending one
+    /// ([`Self::pending_explicit_key_below`]). The one place that list is added to: it is kept in
+    /// order of owner depth, so the last entry is the nearest outer key whichever order the keys
+    /// are found in (a nested key returns after the keys inside it, a key added to a mapping
+    /// above one that waits is found before it).
+    fn wait_behind_pending_explicit_key(&mut self, owner_depth: usize, empty: bool) {
+        let at = self
+            .pending_explicit_key_below
+            .partition_point(|&(depth, _)| depth < owner_depth);
+        self.pending_explicit_key_below
+            .insert(at, (owner_depth, empty));
     }
 
     /// The pending explicit key has its value (or its null): the one behind it, if a nested
@@ -3377,6 +3389,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// This doesn't open a container - the document IS its content.
     fn start_document(&mut self) {
         self.in_document = true;
+        // Every frame of the closing document has been closed, each key with its value or null.
+        self.pending_explicit_key_below.clear();
         // The document that's closing, if any -- `document_start_bp_pos`
         // still holds its root right up until the overwrite below.
         // `seen_any_document` is the only way to tell "no previous document"
@@ -5851,10 +5865,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     ));
                 }
                 self.parse_explicit_key(self.current_column())?;
-                // Each level returns after the ones inside it, so a key goes behind the ones
-                // already waiting: the nearest one is the next to be handed back.
-                self.pending_explicit_key_below
-                    .insert(0, (owner_depth, false));
+                self.wait_behind_pending_explicit_key(owner_depth, false);
                 return Ok(());
             }
             // `? [1, 2]: value`: the node after `? ` is a compact mapping keyed by
@@ -5990,13 +6001,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // key is the one waiting. Only when a nested key waits: for any other key a shallower `:`
         // is misaligned with its `?`, which the check below refuses.
         while let Some(&(outer_owner, _)) = self.pending_explicit_key_below.last() {
-            if !self
-                .pending_explicit_key
-                .is_some_and(|owner_depth| self.indent_stack[owner_depth - 1] > indent)
-            {
+            if !self.pending_explicit_key.is_some_and(|owner_depth| {
+                self.indent_stack
+                    .get(owner_depth - 1)
+                    .is_some_and(|&at| at > indent)
+            }) {
                 break;
             }
+            let open = self.indent_stack.len();
             self.close_deeper_indents_above(indent, outer_owner);
+            if self.indent_stack.len() == open {
+                break;
+            }
         }
 
         // Same ambiguous-column error for a `:` that doesn't match its own

@@ -46,6 +46,11 @@ fn test_an_explicit_key_inside_an_explicit_key_reads_as_yq_reads_it_6322() -> Re
         ("? !!str\n  ? a\n: c\n", "{\"\":\"c\"}"),
         ("? \"?\"\n: c\n", "{\"?\":\"c\"}"),
         ("? ?a\n: c\n", "{\"?a\":\"c\"}"),
+        ("? ? a\n  ? ? b\n  : c\n: d\n", "{\"\":\"d\"}"),
+        ("? ? a\n  : x\n  ? ? b\n  : c\n: d\n", "{\"\":\"d\"}"),
+        ("? ? a\n  ? ? b\n  : c\n  ? ? e\n: d\n", "{\"\":\"d\"}"),
+        ("? ? ? a\n  ? ? b\n: c\n", "{\"\":\"c\"}"),
+        ("? ? ? a\n    ? ? b\n  : c\n: d\n", "{\"\":\"d\"}"),
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, ARGS)?;
         assert_eq!(
