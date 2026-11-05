@@ -19,7 +19,9 @@
 //!
 //! A body whose ways are not listed here keeps its loop as written: one with a capture group (an
 //! empty iteration also sets the group, #6069), a zero-width assertion (its empty way depends on
-//! where it stands), or a flag switch.
+//! where it stands), or a flag switch. A loop over a capture group is still reached: the capture
+//! rewrite (`onig_capture_loop`) writes the repeated group's own loop as a plain `(?:X)*`, and
+//! the evaluator runs this rewrite again over what it wrote (#6305).
 //!
 //! A pattern with syntax only `fancy-regex` reads (a lookaround, an atomic group, a backreference,
 //! `\K`, `\G`, a comment) is parsed through `oniguruma_shadow`'s copy of it, which writes that syntax
