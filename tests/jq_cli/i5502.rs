@@ -208,11 +208,12 @@ fn test_backtrack_limit_is_a_catchable_error_5502() -> Result<()> {
     Ok(())
 }
 
-/// Oniguruma refuses a lookbehind whose alternatives have different fixed lengths
-/// (`invalid pattern in look-behind`); `fancy-regex` matches it. A recorded divergence
-/// (`docs/compliance/jq/limitations.md`): matching would mean reproducing Oniguruma's lookbehind
-/// compiler rules.
+/// Oniguruma refuses a lookbehind whose body repeats a varying number of times in some shapes
+/// (`(?<=a*bc)`, `invalid pattern in look-behind`) and accepts it in others (`(?<=a?)`);
+/// `fancy-regex` matches it. A recorded divergence (`docs/compliance/jq/limitations.md`): matching
+/// would mean reproducing Oniguruma's lookbehind compiler rules. Alternatives of different fixed
+/// widths are refused here too since #6201 (`tests/jq_cli/i6201.rs`).
 #[test]
 fn test_lookbehind_oniguruma_refuses_is_answered_5502() -> Result<()> {
-    assert_rows(&[(r#""aXbX" | test("(?<=a|bb)X")"#, "true")])
+    assert_rows(&[(r#""abcd" | test("(?<=a*bc)d")"#, "true")])
 }
