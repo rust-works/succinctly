@@ -17660,6 +17660,20 @@ fn recurse_cond_keeps_cursor<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// Whether `select(cond)` keeps the node at `cursor`, answered without the general evaluator, or
+/// `None` when only the general evaluator can say (#6350). One definition for both routes of
+/// `select` (the sink route, [`each_select_generic`], and the eager arm of `eval_builtin`), which
+/// differ only in the result they build from it.
+///
+/// A `cond` in [`direct_cond_verdict`]'s grammar yields exactly one value and has no effect, so
+/// the node is kept once or dropped, in either mode.
+fn select_direct_verdict<S: EvalSemantics, V: DocumentValue>(
+    cond: &Expr,
+    cursor: Option<&V::Cursor>,
+) -> Option<bool> {
+    direct_cond_verdict::<S, V>(cond, cursor?)
+}
+
 /// A verdict for a `recurse(.[]?; cond)` `cond` computed without the general evaluator, or `None`
 /// when only the general evaluator can answer it (#4095).
 ///
@@ -20742,14 +20756,12 @@ fn each_select_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     // #6350: a `cond` the direct verdict answers is single-valued and pure, so the node is kept or
     // dropped without the sink, the fan-out and the owned copy the general route makes of it.
-    if let Some(c) = cursor.as_ref() {
-        if let Some(keep) = direct_cond_verdict::<S, V>(cond, c) {
-            return if keep {
-                push_one_generic(GenericItem::OneCursor(*c), sink)
-            } else {
-                Flow::Exhausted
-            };
-        }
+    if let (Some(c), Some(keep)) = (cursor, select_direct_verdict::<S, V>(cond, cursor.as_ref())) {
+        return if keep {
+            push_one_generic(GenericItem::OneCursor(c), sink)
+        } else {
+            Flow::Exhausted
+        };
     }
     let mut already_emitted = false;
     let mut escape: Option<Control> = None;
@@ -35988,14 +36000,14 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::Select(cond) => {
             // #6350: see `each_select_generic`.
-            if let Some(c) = cursor.as_ref() {
-                if let Some(keep) = direct_cond_verdict::<S, V>(cond, c) {
-                    return if keep {
-                        GenericResult::OneCursor(*c)
-                    } else {
-                        GenericResult::None
-                    };
-                }
+            if let (Some(c), Some(keep)) =
+                (cursor, select_direct_verdict::<S, V>(cond, cursor.as_ref()))
+            {
+                return if keep {
+                    GenericResult::OneCursor(c)
+                } else {
+                    GenericResult::None
+                };
             }
             // Evaluate condition with cursor context preserved.
             // This is critical for select(di == N) to work correctly.

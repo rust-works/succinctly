@@ -22,6 +22,8 @@ const CONDS: &[&str] = &[
     ". == \"a\"",
     ". != \"\"",
     "\"a\" < .",
+    "\"string\" == type",
+    "\"null\" != type",
     ". == 1e1000",
     "type == \"null\"",
     "type != \"object\"",
@@ -80,6 +82,25 @@ fn test_select_direct_conditions_answer_as_jq_does_6350() -> Result<()> {
         let (out, err, code) = run_jq_full(&["-c", program], Some(DOC))?;
         assert_eq!(code, 0, "{program}: {err}");
         assert_eq!(out, expected, "{program}");
+    }
+    Ok(())
+}
+
+/// A container compared with a literal is decided by being one, and is not decoded, as
+/// `select(type == "array")` and `select(.)` have never decoded it: malformed JSON nested in it is
+/// not reported through `select` (the minimal validation `--validate` makes strict), where the
+/// copy the general route made used to raise it. jq refuses the whole document up front.
+#[test]
+fn test_select_does_not_decode_a_container_it_compares_with_a_literal_6350() -> Result<()> {
+    let doc = "[[1,tru],2]";
+    for (program, expected) in [
+        ("[.[] | select(. != null)] | length", "2\n"),
+        ("[.[] | select(. == null)] | length", "0\n"),
+        ("[.[] | select(type == \"array\")] | length", "1\n"),
+        ("[.[] | select(.)] | length", "2\n"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", program], Some(doc))?;
+        assert_eq!((code, out.as_str()), (0, expected), "{program}: {err}");
     }
     Ok(())
 }
