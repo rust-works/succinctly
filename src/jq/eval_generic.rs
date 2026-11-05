@@ -2608,7 +2608,8 @@ fn select_by_type_generic<V: DocumentValue>(
 /// through here; a node reached with no cursor (an owned value) has no tag to
 /// consult and keeps the text test.
 /// A tag [`crate::yaml::resolve_tagged`] does not model (`!!map`, `!!seq`, a
-/// custom `!foo`) falls back to the untagged test.
+/// custom `!foo`) falls back to the untagged test, unless the node has no
+/// text: then it is the empty string, not a null (#6291).
 fn tagged_is_null<V: DocumentValue>(value: &V, cursor: &V::Cursor) -> bool {
     cursor
         .explicit_tag()
