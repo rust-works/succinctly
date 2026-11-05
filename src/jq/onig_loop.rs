@@ -18,8 +18,11 @@
 //! `B`, which is where the two engines can disagree; without one, they agree.
 //!
 //! A body whose ways are not listed here keeps its loop as written: one with a capture group (an
-//! empty iteration also sets the group, #6069), a zero-width assertion (its empty way depends on
-//! where it stands), or a flag switch that names `x` or `U`. Any other flag switch reaches the rest
+//! empty iteration also sets the group, #6069), a way that can match nothing only where a zero-width
+//! assertion holds (`\b` or `a?\b` on its own: its empty way depends on where it stands), or a flag
+//! switch that names `x` or `U`. An assertion beside an item that consumes text does not matter: a way
+//! that must consume text always does, and the assertion only decides whether it matches, so `\Ba` and
+//! `a\z` are consuming ways and are copied with the rest (#6300). Any other flag switch reaches the rest
 //! of its group, so under a greedy loop it is written as a flag group over what it reaches before
 //! the ways are listed (#6301); a lazy repeat over such a body keeps its loop. A loop over a capture
 //! group is still reached: the capture rewrite (`onig_capture_loop`) writes the repeated group's own
@@ -69,7 +72,11 @@ enum Ways {
         before: Option<Text>,
         after: Option<Text>,
     },
-    /// Not listed: a capture group, an assertion, a flag switch, or something holding one.
+    /// Not listed, but its text holds only zero-width assertions and what consumes text around
+    /// them: it may be copied, and a consuming item beside it makes the whole consume (`\Ba` and
+    /// `a\z` are consuming ways, #6300), but whether it matches nothing depends on where it stands.
+    Opaque,
+    /// Not listed: a capture group, a flag switch, or something holding one.
     Unknown,
 }
 
@@ -436,7 +443,7 @@ impl Rewriter<'_> {
             }),
             Ast::Assertion(_) => Ok(Piece {
                 text: self.text(self.verbatim(ast.span()).into(), Prec::Atom)?,
-                ways: Ways::Unknown,
+                ways: Ways::Opaque,
             }),
             Ast::Flags(set) => {
                 // `U` swaps what `*` and `*?` mean, which the greedy/lazy reading below does not
@@ -700,7 +707,12 @@ impl Rewriter<'_> {
         for next in rest {
             ways = match (ways, &next.ways) {
                 (Ways::Unknown, _) | (_, Ways::Unknown) => Ways::Unknown,
-                (Ways::Consuming, _) | (Ways::Nullable { .. }, Ways::Consuming) => Ways::Consuming,
+                // One item that consumes text makes the whole way consume, an assertion beside it
+                // included: it only decides whether that way matches (#6300).
+                (Ways::Consuming, _) | (Ways::Opaque | Ways::Nullable { .. }, Ways::Consuming) => {
+                    Ways::Consuming
+                }
+                (Ways::Opaque, _) | (_, Ways::Opaque) => Ways::Opaque,
                 (
                     Ways::Nullable {
                         before: a1,
@@ -740,12 +752,14 @@ impl Rewriter<'_> {
         let mut after = Vec::new();
         let mut nullable = false;
         let mut unknown = !listed;
+        let mut opaque = false;
         for item in items {
             if unknown {
                 break;
             }
             match &item.ways {
                 Ways::Unknown => unknown = true,
+                Ways::Opaque => opaque = true,
                 Ways::Consuming if nullable => after.push(item.text.clone()),
                 Ways::Consuming => before.push(item.text.clone()),
                 // A later empty way is an exit that the first one has already tried.
@@ -765,6 +779,8 @@ impl Rewriter<'_> {
         }
         let ways = if unknown {
             Ways::Unknown
+        } else if opaque {
+            Ways::Opaque
         } else if nullable {
             Ways::Nullable {
                 before: self.alt_text(&before)?,
@@ -791,6 +807,7 @@ impl Rewriter<'_> {
         let text = self.repeat_text(&body.text, min, max, greedy)?;
         let ways = match (&body.ways, min, max, greedy) {
             (Ways::Unknown, ..) => Ways::Unknown,
+            (Ways::Opaque, ..) => Ways::Opaque,
             (_, _, Some(0), _) => Ways::Nullable {
                 before: None,
                 after: None,
