@@ -191,23 +191,50 @@ declare -a div_keys=()
 flaky=0
 
 # Runs one case through succinctly and the oracle into the caller's `s_*`/`o_*` locals.
+#
+# macOS's /bin/bash 3.2 sometimes reads a child's exit status as 0 after `x="$(cmd)"` (#5997): on a
+# loaded machine about one command substitution in 140,000, always a failed child read as a
+# success (a wrapper that wrote the child's own status to a file saw 5 where the shell saw 0, 16
+# times in 110 sweeps; bash 5.1 on Linux lost none in 1.7 million). No case here prints to stderr
+# and succeeds, so a run that exits 0 with text on stderr lost its status and is run again.
+# `lost_status` counts them; a run that still reads 0 after the retries is recorded as it came.
+lost_status=0
+
+# capture_case OUT_VAR CODE_VAR ERR_FILE ERR_VAR cmd...: runs `cmd` with its stderr in ERR_FILE,
+# leaving its stdout and exit status in OUT_VAR and CODE_VAR and the stderr text in ERR_VAR.
+capture_case() {
+  local out_var="$1" code_var="$2" err_file="$3" err_var="$4"
+  shift 4
+  local attempt out code err
+  for attempt in 1 2 3; do
+    out="$("$@" 2>"$err_file")" && code=0 || code=$?
+    err="$(cat "$err_file")"
+    if [[ "$code" != 0 || -z "$err" ]]; then
+      break
+    fi
+    lost_status=$((lost_status + 1))
+    echo "lost-status: exit 0 with stderr from $1 (attempt $attempt of 3), run again" >&2
+  done
+  printf -v "$out_var" '%s' "$out"
+  printf -v "$code_var" '%s' "$code"
+  printf -v "$err_var" '%s' "$err"
+}
+
 exec_case() {
   local mode="$1" filter="$2"
   if [[ "$mode" == jq ]]; then
-    s_out="$("$SUCC" jq -c "$filter" "$DOC_FILE" 2>"$S_ERR")" && s_code=0 || s_code=$?
+    capture_case s_out s_code "$S_ERR" s_err "$SUCC" jq -c "$filter" "$DOC_FILE"
   else
-    s_out="$("$SUCC" yq -o=json -I=0 "$filter" "$DOC_FILE" 2>"$S_ERR")" && s_code=0 || s_code=$?
+    capture_case s_out s_code "$S_ERR" s_err "$SUCC" yq -o=json -I=0 "$filter" "$DOC_FILE"
   fi
-  s_err="$(cat "$S_ERR")"
 
   o_out=""; o_err=""; o_code="-"
   if ((USE_ORACLE)); then
     if [[ "$mode" == jq ]]; then
-      o_out="$("$JQ" -c "$filter" "$DOC_FILE" 2>"$O_ERR")" && o_code=0 || o_code=$?
+      capture_case o_out o_code "$O_ERR" o_err "$JQ" -c "$filter" "$DOC_FILE"
     else
-      o_out="$("$YQ" -o=json -I=0 "$filter" "$DOC_FILE" 2>"$O_ERR")" && o_code=0 || o_code=$?
+      capture_case o_out o_code "$O_ERR" o_err "$YQ" -o=json -I=0 "$filter" "$DOC_FILE"
     fi
-    o_err="$(cat "$O_ERR")"
   fi
 }
 
@@ -323,6 +350,7 @@ else
   echo "== $total cases recorded ($diverged vs-oracle divergences) ==" >&2
 fi
 ((flaky == 0)) || echo "($flaky case(s) diverged once and agreed on a re-run; see the flaky: lines)" >&2
+((lost_status == 0)) || echo "($lost_status run(s) exited 0 with text on stderr and were run again; see the lost-status: lines, #5997)" >&2
 
 if ((GATE && diverged > 0)); then
   echo "FAIL: $diverged succinctly-vs-oracle divergence(s) (--gate)" >&2
