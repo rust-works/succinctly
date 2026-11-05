@@ -5885,7 +5885,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // so it resolves to `""` rather than being dropped (#224).
             // A block sequence at the `:`'s own indent is the value, as it is for an ordinary
             // `key:` entry (#4736).
-            if had_property && self.following_value_is_null_unless_sequence_at(indent) {
+            //
+            // #6321: also with no property. A bare `:` whose value is null needs the same node,
+            // or the key is paired with whatever the next sibling is (`? a` / `:` / `? b` / `: 1`
+            // was `{a: b}`) or has no value at all and the entry is dropped (`? a` / `:` was `{}`).
+            if self.following_value_is_null_unless_sequence_at(indent) {
                 self.set_ib();
                 self.write_bp_open();
                 self.write_bp_close();
