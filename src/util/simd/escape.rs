@@ -21,7 +21,8 @@
 //! new scanner (#124) is a new macro invocation, not another refactor of this
 //! file. [`find_json_escape`] is its only instantiation.
 //!
-//! [`contains_cr`] also lives here, but is hand-written rather than generated:
+//! [`contains_cr`] (and [`contains_byte`], its kernels with the needle as a parameter) also live
+//! here, but are hand-written rather than generated:
 //! it answers "is there a match anywhere" rather than "where is the first one",
 //! and skipping the per-chunk position extraction is worth several times the
 //! throughput. See the comment above its kernels (#340).
@@ -449,8 +450,8 @@ pub fn find_json_escape(bytes: &[u8], start: usize) -> usize {
     not(feature = "scalar-yaml")
 ))]
 #[target_feature(enable = "neon")]
-unsafe fn contains_cr_neon(bytes: &[u8]) -> bool {
-    let needle = vdupq_n_u8(b'\r');
+unsafe fn contains_byte_neon(bytes: &[u8], byte: u8) -> bool {
+    let needle = vdupq_n_u8(byte);
     let p = bytes.as_ptr();
     let n = bytes.len();
     let mut i = 0;
@@ -477,7 +478,7 @@ unsafe fn contains_cr_neon(bytes: &[u8]) -> bool {
         }
         i += 16;
     }
-    bytes[i..].contains(&b'\r')
+    bytes[i..].contains(&byte)
 }
 
 /// AVX2: 128 bytes per iteration, one `vptest`.
@@ -487,8 +488,8 @@ unsafe fn contains_cr_neon(bytes: &[u8]) -> bool {
     any(test, feature = "std")
 ))]
 #[target_feature(enable = "avx2")]
-unsafe fn contains_cr_avx2(bytes: &[u8]) -> bool {
-    let needle = _mm256_set1_epi8(b'\r' as i8);
+unsafe fn contains_byte_avx2(bytes: &[u8], byte: u8) -> bool {
+    let needle = _mm256_set1_epi8(byte as i8);
     let p = bytes.as_ptr();
     let n = bytes.len();
     let mut i = 0;
@@ -518,14 +519,14 @@ unsafe fn contains_cr_avx2(bytes: &[u8]) -> bool {
         }
         i += 32;
     }
-    bytes[i..].contains(&b'\r')
+    bytes[i..].contains(&byte)
 }
 
 /// SSE2 baseline: 64 bytes per iteration, one movemask.
 #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
 #[target_feature(enable = "sse2")]
-unsafe fn contains_cr_sse2(bytes: &[u8]) -> bool {
-    let needle = _mm_set1_epi8(b'\r' as i8);
+unsafe fn contains_byte_sse2(bytes: &[u8], byte: u8) -> bool {
+    let needle = _mm_set1_epi8(byte as i8);
     let p = bytes.as_ptr();
     let n = bytes.len();
     let mut i = 0;
@@ -554,7 +555,7 @@ unsafe fn contains_cr_sse2(bytes: &[u8]) -> bool {
         }
         i += 16;
     }
-    bytes[i..].contains(&b'\r')
+    bytes[i..].contains(&byte)
 }
 
 /// Does `input` contain a carriage return anywhere?
@@ -569,6 +570,14 @@ unsafe fn contains_cr_sse2(bytes: &[u8]) -> bool {
 /// above the kernels for why it is hand-written rather than macro-generated.
 #[inline]
 pub fn contains_cr(input: &[u8]) -> bool {
+    contains_byte(input, b'\r')
+}
+
+/// Does `input` contain `byte` anywhere? The kernels behind [`contains_cr`], with the needle as a
+/// parameter: the YAML parser asks it for a tab too (#6214), so a document without one never pays
+/// for the scan of its plain scalars that a tab after a Unicode line break needs.
+#[inline]
+pub fn contains_byte(input: &[u8], byte: u8) -> bool {
     #[cfg(all(
         target_arch = "aarch64",
         not(feature = "broadword-yaml"),
@@ -576,7 +585,7 @@ pub fn contains_cr(input: &[u8]) -> bool {
     ))]
     {
         // SAFETY: NEON is mandatory on aarch64.
-        unsafe { contains_cr_neon(input) }
+        unsafe { contains_byte_neon(input, byte) }
     }
 
     #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
@@ -584,10 +593,10 @@ pub fn contains_cr(input: &[u8]) -> bool {
         #[cfg(any(test, feature = "std"))]
         if avx2_enabled() {
             // SAFETY: guarded by runtime detection.
-            return unsafe { contains_cr_avx2(input) };
+            return unsafe { contains_byte_avx2(input, byte) };
         }
         // SAFETY: SSE2 is the x86_64 baseline.
-        unsafe { contains_cr_sse2(input) }
+        unsafe { contains_byte_sse2(input, byte) }
     }
 
     // Scalar: under `scalar-yaml`, on aarch64 under `broadword-yaml` (no
@@ -598,7 +607,7 @@ pub fn contains_cr(input: &[u8]) -> bool {
         not(any(target_arch = "aarch64", target_arch = "x86_64"))
     ))]
     {
-        input.contains(&b'\r')
+        input.contains(&byte)
     }
 }
 
@@ -1099,7 +1108,7 @@ mod tests {
                     {
                         // SAFETY: NEON is mandatory on aarch64.
                         assert_eq!(
-                            unsafe { super::super::contains_cr_neon(input) },
+                            unsafe { super::super::contains_byte_neon(input, b'\r') },
                             *want,
                             "NEON, len {len}"
                         );
@@ -1108,7 +1117,7 @@ mod tests {
                     {
                         // SAFETY: SSE2 is the x86_64 baseline.
                         assert_eq!(
-                            unsafe { super::super::contains_cr_sse2(input) },
+                            unsafe { super::super::contains_byte_sse2(input, b'\r') },
                             *want,
                             "SSE2, len {len}"
                         );
@@ -1118,13 +1127,37 @@ mod tests {
                         ) {
                             // SAFETY: guarded by runtime detection.
                             assert_eq!(
-                                unsafe { super::super::contains_cr_avx2(input) },
+                                unsafe { super::super::contains_byte_avx2(input, b'\r') },
                                 *want,
                                 "AVX2, len {len}"
                             );
                         }
                     }
                     assert_eq!(input.contains(&b'\r'), *want, "scalar, len {len}");
+                }
+            }
+        }
+
+        /// #6214: the same kernels answer for any needle, a tab included, and the
+        /// dispatcher agrees with the scalar search at every offset.
+        #[test]
+        fn contains_byte_finds_a_tab_at_every_offset_6214() {
+            for len in [
+                0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 200,
+            ] {
+                let clean = vec![b'a'; len];
+                assert!(!super::super::contains_byte(&clean, b'\t'), "len {len}");
+                for pos in 0..len {
+                    let mut dirty = clean.clone();
+                    dirty[pos] = b'\t';
+                    assert!(
+                        super::super::contains_byte(&dirty, b'\t'),
+                        "tab at {pos} of {len}"
+                    );
+                    assert!(
+                        !super::super::contains_byte(&dirty, b'\r'),
+                        "a tab is no CR: {pos} of {len}"
+                    );
                 }
             }
         }

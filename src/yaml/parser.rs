@@ -522,8 +522,9 @@ struct Parser<'a, const HAS_CR: bool> {
     /// the stack is the *key*, and the owner — the mapping the null belongs to — is
     /// the one below it.
     pending_explicit_key: Option<usize>,
-    /// Whether the input holds a byte that starts U+2028, U+2029 or U+0085 (#6214), so a plain scalar
-    /// is searched for one of them only in a document that can have it.
+    /// Whether the input holds a tab and a byte that starts U+2028, U+2029 or U+0085 (#6214), so a
+    /// plain scalar is searched for one of them only in a document that can be refused for it: the
+    /// refusal needs the tab. The tab test goes first, as a SIMD pass, and most inputs have none.
     may_hold_unicode_break: bool,
 
     /// Where the plain scalar scanned last began and ended, and the indent of the innermost open
@@ -707,7 +708,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             in_document: false,
             document_start_bp_pos: 0,
             pending_explicit_key: None,
-            may_hold_unicode_break: input.iter().any(|&b| b == 0xC2 || b == 0xE2),
+            may_hold_unicode_break: crate::util::simd::escape::contains_byte(input, b'\t')
+                && (input.contains(&0xC2) || input.contains(&0xE2)),
             last_plain_scalar: None,
             pending_explicit_key_empty: false,
             nesting_depth: 0,
