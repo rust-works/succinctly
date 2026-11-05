@@ -2872,7 +2872,8 @@ mod tests {
             ("m:\n  \"\\U0000003c<\": 1\n", true),
             ("a: 1 <<\n", true),
             ("m:\n  \"<\\\n  <\": 1\n", true),
-            ("m:\n  \"<\\\r\n  <\": 1\n", true),
+            // An explicit key: yq refuses a quoted implicit key that continues on the next line.
+            ("m:\n  ? \"<\\\r\n    <\"\n  : 1\n", true),
             ("a: 1 <", false),
         ] {
             let index = YamlIndex::build(text.as_bytes()).expect("should parse");
