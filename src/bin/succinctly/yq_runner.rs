@@ -51,6 +51,7 @@ use crate::output::{
 };
 
 mod go_yaml_color;
+mod leading_marker;
 use go_yaml_color::YamlColorizer;
 use succinctly::text::stream_region::{current_region, StreamRegion};
 mod reshape_presentation;
@@ -1139,6 +1140,13 @@ fn yaml_to_owned_value<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>) -> Re
     to_owned_yaml_cursor::<YqSemantics, _>(&cursor).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// Whether yq's header slurp runs on input number `at` of a run (#6276): on every file, except
+/// that `--eval-all` slurps the header of the first file only (`!dec.prefs.EvaluateTogether ||
+/// dec.firstFile`). The one definition for every route that gathers an input.
+fn glue_leading_marker_for(eval_all: bool, at: usize) -> bool {
+    !(eval_all && at > 0)
+}
+
 /// How an input with no document in it is read (#4099): yq reads no document from it, except that a
 /// run which read no document at all evaluates once against one empty document (`printf '' | yq
 /// '.a'` is `null`, `.a = 1` is `a: 1`, and so is `yq '.a' empty.yaml`). `None` is "skip this input".
@@ -1159,6 +1167,7 @@ fn empty_input_reads_as(
     input_files: &[String],
     at: usize,
     front_matter: bool,
+    glue_leading_marker: bool,
 ) -> Option<(Vec<u8>, InputFormat)> {
     // #5356: yq reads past a UTF-8 byte-order mark at the front of a YAML stream, each file
     // being a stream of its own; it was becoming part of the first key. A JSON document with
@@ -1167,6 +1176,13 @@ fn empty_input_reads_as(
     // emptiness test: a file that is only the mark reads as an empty one.
     if format != InputFormat::Json {
         bytes.drain(..crate::front_matter::leading_bom_len(&bytes));
+        // #6276: the break after a leading `--- text` line is lost to yq's header slurp. Not under
+        // `--front-matter`, whose own extraction reads the input first and was not captured.
+        if !front_matter && glue_leading_marker {
+            if let Some(glued) = leading_marker::glue_after_leading_marker_text(&bytes) {
+                bytes = glued;
+            }
+        }
     } else if bytes.contains(&0) {
         // #5721: yq's JSON reader stops at the first NUL (`printf '\0' | yq -p=json .` is the
         // empty document, `1<NUL>2` is `1`); the rest of the input is never read. The
@@ -1318,7 +1334,7 @@ fn gathered_file_indices(input_files: &[String], format: InputFormat) -> Vec<usi
             seen_stdin = true;
         }
         // An empty file among others reads no document, so it has no source (#4099).
-        if empty_input_reads_as(Vec::new(), format, input_files, index, false).is_none()
+        if empty_input_reads_as(Vec::new(), format, input_files, index, false, false).is_none()
             && input_file_holds_no_document_bytes(file, format)
         {
             continue;
@@ -1817,6 +1833,7 @@ fn gather_input_sources(
     front_matter: Option<FrontMatterMode>,
     validate: bool,
     output_format: OutputFormat,
+    eval_all: bool,
 ) -> Result<(Vec<GatheredSource>, Option<i32>)> {
     let mut sources = Vec::new();
     let resolved_format = resolve_run_input_format(input_format, input_files);
@@ -1827,6 +1844,7 @@ fn gather_input_sources(
             input_files,
             0,
             front_matter.is_some(),
+            true,
         )
         .unwrap_or_else(|| (Vec::new(), resolved_format));
         let (input_bytes, format, body) =
@@ -1848,6 +1866,7 @@ fn gather_input_sources(
                 input_files,
                 at,
                 front_matter.is_some(),
+                glue_leading_marker_for(eval_all, at),
             ) else {
                 continue;
             };
@@ -10826,6 +10845,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             args.front_matter,
             args.validate,
             args.output_format,
+            args.eval_all,
         )?;
         if gathered.1.is_none() {
             let all_docs =
@@ -11555,6 +11575,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 &input_files,
                 0,
                 args.front_matter.is_some(),
+                true,
             )
             .unwrap_or_else(|| (Vec::new(), fmt));
             // #1616: a `-p json` document's invalid UTF-8, for JSON output.
@@ -11761,6 +11782,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         &input_files,
                         file_index,
                         args.front_matter.is_some(),
+                        glue_leading_marker_for(args.eval_all, file_index),
                     ) {
                         Some(read) => read,
                         None => continue,
@@ -11979,6 +12001,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 args.front_matter,
                 args.validate,
                 args.output_format,
+                args.eval_all,
             )?,
         };
         if let Some(code) = validate_exit_code {
@@ -12138,6 +12161,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 args.front_matter,
                 args.validate,
                 args.output_format,
+                args.eval_all,
             )?;
             // #1564: unlike --eval-all/--slurp, each file's split output is
             // already written independently of the others (the loop below)
@@ -12339,6 +12363,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             args.front_matter,
             args.validate,
             args.output_format,
+            args.eval_all,
         )?;
         if let Some(code) = validate_exit_code {
             // #1564: --slurp combines every source into one array (see
@@ -12576,6 +12601,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 &input_files,
                 file_index,
                 args.front_matter.is_some(),
+                glue_leading_marker_for(args.eval_all, file_index),
             ) else {
                 continue;
             };
@@ -13082,6 +13108,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 args.front_matter,
                 args.validate,
                 args.output_format,
+                args.eval_all,
             )?,
         };
         // #1564: each file's results are collected/emitted independently

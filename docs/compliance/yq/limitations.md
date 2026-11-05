@@ -509,7 +509,7 @@ succinctly's default loader now rejects this uniformly ([#1374](https://github.c
 for the ordinary shape above this is bug-for-bug fidelity, not a divergence: real yq errors,
 succinctly errors.
 
-The one shape where this *is* a deliberate divergence is at document-root level, across a
+The one shape where this *was* a deliberate divergence (until #6276, see the end of this section) is at document-root level, across a
 `---` multi-document separator. There, real yq does not error at all — it silently emits
 corrupted output instead, concatenating the first document's scalar value with the literal
 *text* of the following `---`-anchor-alias line:
@@ -523,9 +523,10 @@ $ printf -- '--- &a0 hello\n--- &a1 *a0\n' | yq -o=json .
 ```
 
 (Both confirmed live against yq v4.53.3, exit 0 — real yq does not treat this as an error at
-all.) succinctly rejects this shape too rather than reproduce the corruption, per rule 4(b)
-(matching would corrupt a document): a `"hello--- &a1 *a0"` string is not a value any
-reasonable query result should ever produce, and there is no way to make it round-trip.
+all.)
+succinctly rejected this shape rather than reproduce the corruption, per rule 4(b).
+Since #6276 it reproduces it, with no divergence left to record: yq's header slurp glues the line after a leading `--- text` line onto it (see the header bullet above), so the second `---` is scalar text and the result is the single string `"hello--- &a1 *a0"`, which is no corruption of any alias.
+An alias with its own anchor wherever a marker is a marker is still rejected, as in yq.
 
 ### Merge-flag `+` and `d` combined — **no carve-out; this one is out of policy**
 
@@ -807,12 +808,12 @@ Captured live (yq v4.53.3, `-o json -I0 .`):
 The exit status agrees and the message may differ (yq words a flow key that spans lines as `mapping values are not allowed in this context`); the stdout prefix is the difference that matters.
 This holds for every parse error, and it is the divergence #5070 adds rows to: a scalar, flow collection or block scalar that is a document's root can have nothing after it before the next `---` (`did not find expected <document start>`).
 
-### Content after a `...` end marker — rejected as yq does, with two shapes that still differ ([#5089](https://github.com/rust-works/succinctly/issues/5089))
+### Content after a `...` end marker — rejected as yq does, with one shape that still differs ([#5089](https://github.com/rust-works/succinctly/issues/5089))
 
 A document after a `...` marker needs its own `---`: `a` / `...` / `b` stops with `did not find expected <document start>` in yq and here (YAML Test Suite `7Z25` is valid YAML 1.2 and fails for that reason, as `CFD4` and `FRK4` do).
-Two shapes still differ.
+One shape still differs.
 A directive after the marker (`a` / `...` / `%YAML 1.2` / `---` / `b`) is rejected by yq and read as two documents here, because YAML 1.2 allows it (spec examples 6.18, 6.21 and 9.6 are written that way).
-A stream whose first document is `--- text` followed by `...` and more content reads as one scalar in yq (`--- v` / `...` / `b` is `"v... b"`, the marker folded into the text) and as an error here; it read as two documents (`"v"`, `"b"`) before #5089.
+A stream whose first document is `--- text` followed by `...` and more content reads as one scalar in yq (`--- v` / `...` / `b` is `"v... b"`, the marker folded into the text), and since #6276 here too: yq's header slurp glues the line after the marker line onto it, so the `...` is no longer at the start of a line.
 
 ## Open divergences (bugs, not decisions)
 
@@ -5910,6 +5911,17 @@ What the streaming route reproduces, all measured against pinned v4.53.3:
   `header_verbatim_reproduction_is_streaming_only_2795`
   (`tests/yq_cli_tests.rs`), so a future header-unification fix has a test to flip rather
   than a silent behavior change to notice;
+- the header slurp also **loses a line break**, and `succinctly yq` reproduces the loss (#6276).
+  yq pushes the text after a leading `--- ` back onto its reader without the marker line's own break,
+  so the next line continues it: `--- x` / `y` is `"xy"`, `--- x` / `y: 1` is `{"xy": 1}`, and `--- # c` / `x` / `y` is the comment `# cx` and the document `"y"`.
+  The loop runs over the head of the input only, so a marker after the first content line, a bare `---` line and a lone CR break are unaffected.
+  Each file of a run is a stream of its own; under `--eval-all` only the first file's head is slurped.
+  The input is indexed with that one break cut out and the marker kept (`yaml_runner/leading_marker.rs`), so the line numbers of the nodes after it are one lower, as in yq.
+  `--header-preprocess=false`, which reads `--- x` / `y` as `"x y"`, is not implemented.
+  `load()` reads its file without the slurp, in yq and here.
+  `--front-matter` input is not glued (its own extraction runs first and was not captured against yq).
+  Blanks in front of the first marker and a second marker the pushed-back text starts with (`--- --- x`) are stripped as in yq.
+  A run of leading bare `---` lines is one header in yq and several documents here (`---` / `---` / `x` is `"x"` in yq, `null` then `"x"` here);
 - a scalar root prints its head and *drops* its foot, a flow or block collection root
   prints both (`# lead\n42\n# foot` is `# lead\n42` in yq; the getter still answers
   `foot`). The DOM route reproduces this asymmetry too (#2795 PR B).

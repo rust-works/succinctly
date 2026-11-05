@@ -10932,9 +10932,12 @@ fn test_yaml_tag_gate_gap_document_start_two_documents() -> Result<()> {
     // *second* document — one YAML input streamed as two JSON documents.
     // `parse_block_node`'s combined `&`/`!` arm now consumes the tag first,
     // so `!!omap`'s deferred sequence stays this document's single value.
+    // Since #6276 the line after the marker is glued onto it, as in yq
+    // (`!!omap- a: 1`, one document, `{"a":1}` in JSON), which is still one
+    // document, not two.
     let (out, code) = run_yq_stdin(".", "--- !!omap\n- a: 1\n", &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "[{\"a\":1}]");
+    assert_eq!(out.trim(), "{\"a\":1}");
     Ok(())
 }
 
@@ -12540,24 +12543,21 @@ fn test_yaml_anchor_on_alias_rejected_in_every_position() -> Result<()> {
     Ok(())
 }
 
-/// The one *deliberate* divergence from real yq documented for #1374
-/// (`docs/compliance/yq/limitations.md`, "document root" section): real yq
-/// doesn't error on `&anchor *alias` across a `---` multi-document
-/// separator at all — it silently concatenates the first document's scalar
-/// value with the literal source text of the anchor-alias line
-/// (`"hello--- &a1 *a0"`, confirmed live against yq v4.53.3). succinctly
-/// rejects this shape too, per ADR-0018 rule 4(b) (matching would corrupt a
-/// document) rather than reproduce output with no valid round-trip.
+/// Once a deliberate divergence from real yq (#1374, rule 4(b)): yq does not
+/// error on `&anchor *alias` across a `---` separator, it reads one scalar,
+/// the first document's value followed by the literal source text of the
+/// anchor-alias line (`"hello--- &a1 *a0"`, confirmed live against yq
+/// v4.53.3). That is no divergence since #6276: yq's header slurp glues the
+/// line after the marker onto the marker line, so the second `---` is no
+/// longer at the start of a line and is scalar text, and `succinctly yq`
+/// reads the same scalar. The rejection of `&a *alias` itself is unchanged
+/// everywhere a marker is a marker (the `_rejected_1374` tests above).
 #[test]
-fn test_yaml_document_root_anchor_on_alias_rejected_1374() -> Result<()> {
+fn test_yaml_document_root_anchor_on_alias_is_scalar_text_after_a_marker_line_1374() -> Result<()> {
     let yaml = "--- &a0 hello\n--- &a1 *a0\n";
-    let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", yaml, &[])?;
-    assert_eq!(exit_code, 1, "expected clean error exit, stderr: {stderr}");
-    assert_eq!(stdout, "");
-    assert!(
-        stderr.contains("cannot carry an anchor or tag"),
-        "stderr should name the property-on-alias rejection: {stderr}"
-    );
+    let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", yaml, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "\"hello--- &a1 *a0\"");
     Ok(())
 }
 

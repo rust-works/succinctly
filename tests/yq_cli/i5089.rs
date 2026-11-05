@@ -86,21 +86,21 @@ fn test_documents_separated_by_a_start_marker_after_an_end_marker_are_unchanged_
     Ok(())
 }
 
-/// Recorded divergence: a stream whose first document is `--- text` followed by `...` and more
-/// content. yq folds the `...` into the scalar (`"v... b"`); the document end marker ends it here,
-/// so the content after it is the error. It read as two documents before (`"v"`, `"b"`); both
-/// differ from yq. Pinned to what succinctly answers today; delete a row when it starts to fail.
-const FOLDED_BY_YQ: &[&str] = &[
-    "--- v\n...\nb\n",
-    "--- v w\n...\n  b\n",
-    "--- &a v\n...\nb\n",
+/// A stream whose first document is `--- text` followed by `...` and more content: yq folds the
+/// `...` into the scalar (`"v... b"`), because its header slurp glues the line after the marker
+/// line onto it, so `...` is no longer at the start of a line (#6276). This was a recorded
+/// divergence of #5089 (an error here, two documents before it); it reads as yq does now.
+const FOLDED_BY_YQ: &[(&str, &str)] = &[
+    ("--- v\n...\nb\n", "\"v... b\"\n"),
+    ("--- v w\n...\n  b\n", "\"v w... b\"\n"),
+    ("--- &a v\n...\nb\n", "\"v... b\"\n"),
 ];
 
 #[test]
-fn test_recorded_divergence_yq_folds_the_end_marker_into_an_inline_scalar_5089() -> Result<()> {
-    for doc in FOLDED_BY_YQ {
-        let (stdout, _stderr, code) = run_yq_stdin_with_stderr(".", doc, &[])?;
-        assert_eq!((stdout.as_str(), code), ("", 1), "{doc:?}");
+fn test_yq_folds_the_end_marker_into_an_inline_scalar_5089() -> Result<()> {
+    for (doc, expected) in FOLDED_BY_YQ {
+        let (stdout, code) = run_yq_stdin(".", doc, &["-o", "json", "-I0"])?;
+        assert_eq!((stdout.as_str(), code), (*expected, 0), "{doc:?}");
     }
     Ok(())
 }
