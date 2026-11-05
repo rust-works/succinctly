@@ -2759,6 +2759,36 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             && super::line_is_structural(self.input, self.pos)
     }
 
+    /// #6286: the line at `line_start` is spaces, a tab and nothing else, the tab sits at a column no
+    /// deeper than the block that owns the plain scalar just before it, and only blank lines
+    /// separate the two. go-yaml refuses such a line (`found a tab character that violates
+    /// indentation`); to this parser it is an empty line, so the scalar scanner stops short of it,
+    /// [`Self::skip_newlines`] leaves it, and `parse_document_line` raises the error.
+    fn tab_only_line_ends_plain_scalar(&self, line_start: usize) -> bool {
+        let mut at = line_start;
+        while self.input.get(at) == Some(&b' ') {
+            at += 1;
+        }
+        let indent = at - line_start;
+        if self.input.get(at) != Some(&b'\t') {
+            return false;
+        }
+        while matches!(self.input.get(at), Some(b' ' | b'\t')) {
+            at += 1;
+        }
+        if at < self.input.len() && !is_line_break(self.input[at]) {
+            return false;
+        }
+        let Some(span) = self.last_plain_scalar else {
+            return false;
+        };
+        indent <= span.owner
+            && span.end <= line_start
+            && self.input[span.end..line_start]
+                .iter()
+                .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+    }
+
     /// Skip `s-separate-in-line` whitespace still sitting on the cursor after
     /// the leading indent has already been consumed by `advance_by`.
     ///
@@ -3136,6 +3166,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             } else if b == b' ' {
                 // Check if rest of line is whitespace or comment
                 let start = self.pos;
+                // #6286: a tab-only line go-yaml refuses is left for the line dispatcher to reject.
+                if (start == 0 || Self::is_break(self.input[start - 1]))
+                    && self.tab_only_line_ends_plain_scalar(start)
+                {
+                    break;
+                }
                 self.skip_inline_whitespace();
                 if self.at_break() || self.peek() == Some(b'#') || self.peek().is_none() {
                     if self.peek() == Some(b'#') {
@@ -3621,6 +3657,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     check_pos += 1;
                 }
                 if check_pos >= self.input.len() || Self::is_break(self.input[check_pos]) {
+                    // #6286: a line holding a tab, at a column no deeper than the block that owns
+                    // this scalar, is not an empty line to go-yaml: it stops the scalar and the
+                    // line is refused (`found a tab character that violates indentation`).
+                    // The scalar ends here and `parse_document_line` raises it.
+                    if !is_doc_root
+                        && next_char == b'\t'
+                        && next_indent <= self.innermost_block_indent()
+                    {
+                        break;
+                    }
                     // Empty line - skip it and continue
                     self.skip_line_break(); // Skip the current line break
                                             // Skip to end of empty line
@@ -8580,6 +8626,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // (DK95/00 `foo:\n \tbar`, UV7Q `x:\n - x\n  \tx`), which is why the test is
         // `line_is_structural` and not "is there a tab" (#173).
         if self.tab_indents_block_structure(line_start) {
+            return Err(YamlError::TabIndentation {
+                line: self.current_line(),
+                offset: self.pos,
+            });
+        }
+
+        if self.tab_only_line_ends_plain_scalar(line_start) {
             return Err(YamlError::TabIndentation {
                 line: self.current_line(),
                 offset: self.pos,
