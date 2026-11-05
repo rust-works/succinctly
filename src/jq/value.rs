@@ -27,7 +27,9 @@ use super::error::EvalError;
 #[cfg(test)]
 use super::escape::escape_json_body;
 use super::escape::write_json_body_jq;
-use super::eval::{EvalSemantics, EvalTag, JqSemantics, YqSemantics};
+use super::eval::{
+    jq_int_within_exact_f64_range, EvalSemantics, EvalTag, JqSemantics, YqSemantics,
+};
 use super::expr::Literal;
 
 mod object_map;
@@ -569,8 +571,8 @@ pub(crate) fn jq_literal_text_to_f64(text: &str) -> Option<f64> {
 /// before the last step.
 ///
 /// **This treats every jq-mode `Int` as a literal when it widens one for
-/// arithmetic** (comparison reads a bare `Int` as computed, #6275, and widens
-/// it the same way). That is sound for the `Int`s that are *not* literals: `+`/`-`/`*` already return a `Float` for
+/// arithmetic.** (Comparison reads a bare `Int` as computed, #6275, and
+/// widens it the same way.) That is sound for the `Int`s that are *not* literals: `+`/`-`/`*` already return a `Float` for
 /// anything past `2^53` (`jq_checked_int_arith`, #2631) and `%` does the
 /// same (`jq_f64_backed_int`); an `Int` that came *from* a double
 /// (`floor`/`ceil`/`round`/`trunc`'s own result, `length`'s magnitude, `%`'s
@@ -4636,7 +4638,7 @@ impl OwnedValue {
             // compares exactly where a computed number compares as a double). It crosses as
             // `computed_int_token` and reads back as a bare `Int`, as a bare `Float` does with
             // its own token (#2902). Past `2^53` `range`'s exact walk keeps its digits.
-            Self::Int(n) if S::TAG == EvalTag::Jq && n.unsigned_abs() <= 1 << 53 => {
+            Self::Int(n) if bridge_keeps_int_computed::<S>(*n) => {
                 crate::json::validate::write_computed_int_token(out, *n);
             }
             Self::Int(n) => {
@@ -4757,7 +4759,7 @@ impl OwnedValue {
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => nan_instance_token(*f),
             Self::Float(f) if f.is_infinite() => overflow_literal(*f).to_string(),
             // #6275: a computed integer crosses as its token (see `write_json_for_reindex`).
-            Self::Int(n) if S::TAG == EvalTag::Jq && n.unsigned_abs() <= 1 << 53 => {
+            Self::Int(n) if bridge_keeps_int_computed::<S>(*n) => {
                 crate::json::validate::computed_int_token(*n)
             }
             // The bridge must keep the source literal at every length.
@@ -5966,6 +5968,19 @@ fn decompose_decimal_literal(text: &str) -> (bool, Vec<u8>, i128) {
     (negative, digits, exponent)
 }
 
+/// Whether the reindex bridge writes this bare `Int` as a computed-integer token
+/// (`crate::json::validate::write_computed_int_token`, #6275) so that it reads back bare.
+///
+/// In jq's number model a bare `Int` is a computed double, which a `NumberLiteral` of the same
+/// digits is not (the two compare differently against a decimal literal), so the bridge must not
+/// hand it back as one. Within `2^53` an `Int` is its own double; past it (`range`'s exact walk)
+/// the digits are kept. yq's number model has no such distinction. The one definition both
+/// bridge writers and the round-trip tests consult.
+#[inline]
+pub(crate) fn bridge_keeps_int_computed<S: EvalSemantics>(n: i64) -> bool {
+    S::TAG == EvalTag::Jq && jq_int_within_exact_f64_range(n)
+}
+
 /// jq's own number comparison (`jvp_number_cmp`, `src/jv.c`), behind
 /// jq-mode `==` and ordering (#2906): two *literals* compare exactly as
 /// decimals (`decNumberCompare`), while any pair involving a *computed*
@@ -6020,9 +6035,10 @@ pub(crate) fn jq_numeric_cmp(left: &OwnedValue, right: &OwnedValue) -> Option<co
             _ => None,
         }
     }
-    const EXACT_DOUBLE_LIMIT: u64 = 1 << 53;
     if let (Some((a, a_literal)), Some((b, b_literal))) = (int_operand(left), int_operand(right)) {
-        if a_literal == b_literal || a.unsigned_abs().max(b.unsigned_abs()) <= EXACT_DOUBLE_LIMIT {
+        if a_literal == b_literal
+            || (jq_int_within_exact_f64_range(a) && jq_int_within_exact_f64_range(b))
+        {
             return Some(a.cmp(&b));
         }
     }

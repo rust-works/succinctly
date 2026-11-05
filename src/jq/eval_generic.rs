@@ -44262,7 +44262,7 @@ mod tests {
             let value = OwnedValue::Int(n);
             let expected = alloc::format!("{n}");
             // #6275: within `2^53` jq's number model writes the computed-integer token.
-            let jq_expected = if n.unsigned_abs() <= 1 << 53 {
+            let jq_expected = if crate::jq::value::bridge_keeps_int_computed::<JqSemantics>(n) {
                 alloc::format!("{n}e0e1")
             } else {
                 expected.clone()
@@ -44469,7 +44469,7 @@ mod tests {
         // Since #6275 jq's number model keeps a bare `Int` within `2^53` bare across the bridge
         // (`computed_int_token`), so only the other cases are normalized.
         let normalized = match value {
-            OwnedValue::Int(n) if !(S::TAG == EvalTag::Jq && n.unsigned_abs() <= 1 << 53) => {
+            OwnedValue::Int(n) if !crate::jq::value::bridge_keeps_int_computed::<S>(*n) => {
                 OwnedValue::from_number_literal::<JqSemantics>(&alloc::format!("{n}"))
             }
             other => other.clone(),

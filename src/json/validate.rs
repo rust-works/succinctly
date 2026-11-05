@@ -1492,7 +1492,9 @@ const COMPUTED_INT_TOKEN_SUFFIX: &str = "e0e1";
 #[cfg(test)]
 #[must_use]
 pub(crate) fn computed_int_token(n: i64) -> String {
-    alloc::format!("{n}{COMPUTED_INT_TOKEN_SUFFIX}")
+    let mut token = String::new();
+    write_computed_int_token(&mut token, n);
+    token
 }
 
 /// [`computed_int_token`], appended to `out` without a `String` of its own: the bridge writes one

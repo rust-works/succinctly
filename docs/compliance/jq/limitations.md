@@ -12232,6 +12232,7 @@ $ sjq -nc '[2.00000000000000000001,(1+1)] | unique'              # [2.0000000000
 A value that crosses the reindex bridge (a multi-output stage, `map(.)`, `unique`/`sort`/`group_by`/`min`/`max` on an array built in the filter) used to come back a literal, because the bridge wrote a bare `Int` as its digits.
 In jq's number model it now writes one within `2^53` as `computed_int_token` (`2e0e1`), the sibling of the computed-float token (#2902), and reads it back as a bare `Int` (`JsonNumber::bridge_computed_int`).
 A bare `Int` past `2^53` (the `range` walk's exact values) still crosses as its digits, so it comes back a literal.
+Those values stay exact where jq holds them as doubles (see the `range` entry above), so an array that mixes them with a literal past `2^53` can order differently from jq, and no longer transitively: the literal `9007199254740993` equals the bare `9007199254740992` and `9007199254740993` as doubles, which are in turn ordered by their `i64`.
 `succinctly yq` writes the digits as before.
 
 One shape is still wrong, and it is the one the old rule had right: **the first value of a `range`.**
