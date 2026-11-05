@@ -538,6 +538,27 @@ echo '"aaa"' | succinctly yq 'sub("a"; "X"; "g")'
 # "" — replacement and flags are never read; every match is deleted
 ```
 
+### `eval`
+
+`eval(expr)` reads each string `expr` yields as a yq expression and evaluates it against the
+current node (#6081), so an expression can be stored in the document:
+
+```bash
+printf 'path: .a.b
+a: {b: 7}
+' | succinctly yq 'eval(.path)'
+# 7
+
+printf 'a: {b: 1}
+' | succinctly yq 'eval(".a") = {"c": 2}'
+# a: {c: 2}
+```
+
+A node that is not a scalar has no text, and the empty expression is the node itself. A
+write through `eval` lands on the nodes the expression names. In jq mode the name stays
+undefined, as in jq. See [docs/compliance/yq/limitations.md](../compliance/yq/limitations.md)
+for where the answers differ from yq's.
+
 ### Date/Time Extensions
 
 Beyond jq's standard date functions (`gmtime`, `localtime`, `mktime`, `strftime`,

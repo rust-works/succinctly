@@ -38692,6 +38692,11 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             // `$__loc__`-style metadata and `input_line_number` are
             // literals, like any literal.
             Builtin::Keys | Builtin::KeysUnsorted | Builtin::WithEntries(_) => Detaches,
+            // #6081: the nodes an evaluated expression reaches stand where they stood in the
+            // input, which the identity route does not follow; `eval(".a") | key` prints nothing
+            // (it is `"a"` in yq v4.53.3), as the other computed stages do. A write through
+            // `eval` is resolved in path position and lands.
+            Builtin::EvalExpr(_) => Detaches,
             Builtin::Now
             | Builtin::Env
             | Builtin::EnvObject(_)

@@ -7008,3 +7008,30 @@ yq's `@csv` and `@tsv` are Go's `encoding/csv` over the node, and a field is the
 `succinctly yq` encodes the same way (minimal quoting, arrays of arrays and of flat objects, a scalar input as its text, yq's error lines), pinned by `tests/yq_cli/i6131.rs`.
 The one difference is a `null` element: yq writes the spelling the document used (`~` for `[~, a]`, `null` for `[null, a]`), and a value does not hold it, so `succinctly yq` writes `null` for both.
 A number keeps its source text (`1.50`, `0x1f`, `1_0`) in both.
+
+## `eval(expr)` ([#6081](https://github.com/rust-works/succinctly/issues/6081))
+
+`eval(expr)` is yq's: each string `expr` yields is parsed as a yq expression and evaluated against the current node.
+It is new in `succinctly yq` since #6081, and stays undefined in jq mode, where jq has no such builtin.
+A stored expression, a computed one, several at once (`eval(.list[])`), the empty expression, a comment, and a write through `eval` (`eval(".a") = 5`, `del(eval(".a"))`, `(eval(".c[]")) += 1`) answer as yq v4.53.3 does.
+`tests/yq_cli/i6081.rs` pins 45 rows of it, in JSON output.
+These differ:
+
+- **The nodes `eval` reaches print in the style of a value the program built.**
+  `eval(".a")` on `a: {b: 1}` is `b: 1` here and `{b: 1}` in yq: a node's flow style, comments and quoting do not follow it through `eval`.
+  JSON output agrees.
+- **Nothing follows the node's position out of `eval`.**
+  `eval(".a") | key` prints nothing here and `a` in yq, `eval(".a") | path` is `[]` and not `["a"]`, and `line` and `column` answer 0.
+  A write that names the nodes through `eval` does land.
+- **A variable of the enclosing program is not visible inside the expression.**
+  `.s as $x | eval("$x")` is `.a.b` in yq and nothing here.
+- **`null` yields no expression.**
+  yq reads an absent key as no node (`eval(.zz)` prints nothing) and the node `null` as the expression `null` (`eval(null)` is `null`), and this tells the two apart only by the value, so both give nothing.
+- **yq repeats `eval`'s outputs when the context holds several nodes.**
+  `.c[] | eval(". * 2")` on `c: [1, 2]` is `2 4 2 4 2 4 2 4` in yq and `2 4` here, since `eval` is run once per node.
+- **Expressions nest 32 deep.**
+  A stored expression that evaluates itself (`s: "eval(.s)"`) runs yq out of stack, and stops here with `eval: expressions nest more than 32 deep` (ADR-0018 rule 4, a crash).
+- **The text of the error for an expression that does not parse differs.**
+  yq says `bad expression - probably missing close bracket on (` or reports the lexer's message; both fail with exit 1.
+- **`is_key` is still not defined.**
+  [#6081](https://github.com/rust-works/succinctly/issues/6081) stays open for it.

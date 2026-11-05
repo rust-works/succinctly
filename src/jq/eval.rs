@@ -19055,6 +19055,9 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::FormatDatetime(format) => builtin_format_datetime::<W, S>(format, value, optional),
         Builtin::WithDtf(layout, body) => builtin_with_dtf::<W, S>(layout, body, value, optional),
 
+        // #6081: yq's `eval`.
+        Builtin::EvalExpr(expr) => builtin_eval_expr::<W, S>(expr, value, optional),
+
         // Phase 22: File operations (yq)
         Builtin::Load(file_expr) => builtin_load::<W, S>(file_expr, value, optional),
 
@@ -43567,6 +43570,7 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::Tz(_)
         | Builtin::FormatDatetime(_)
         | Builtin::WithDtf(_, _)
+        | Builtin::EvalExpr(_)
         | Builtin::Unique
         | Builtin::UniqueBy(_)
         | Builtin::UpperIn(_)
@@ -56059,6 +56063,10 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // rejected as "Invalid path expression".
         Expr::Builtin(Builtin::Skip(n, expr)) => {
             resolve_skip_sink::<S>(n, expr, value, trackable, snapshot, frame, keep, sink)
+        }
+        // #6081: `eval(s)` names the paths the expression `s` reads names.
+        Expr::Builtin(Builtin::EvalExpr(arg)) => {
+            resolve_eval_expr_sink::<S>(arg, value, trackable, snapshot, frame, keep, sink)
         }
         // #5863: `with_dtf(layout; f)` names the paths `f` names, so a write through it lands
         // (`with_dtf("2006"; .a) = 5` writes `.a` in yq v4.53.3).
@@ -103394,6 +103402,143 @@ fn builtin_with_dtf<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             EvalError::new("with_dtf requires the std feature"),
             optional,
         )
+    }
+}
+
+/// How deep `eval` may nest, each level reading its expression from data (`s: "eval(.s)"`
+/// would otherwise recurse until the native stack ends, #6081). yq has no limit and runs out of
+/// stack; a bound the same data cannot cross is ADR-0018's "would take the host process down".
+#[cfg(feature = "std")]
+const EVAL_NESTING_LIMIT: u32 = 32;
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    static EVAL_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Runs `body` one `eval` level deeper, or reports the limit.
+#[cfg(feature = "std")]
+fn with_eval_depth<T>(body: impl FnOnce() -> T) -> Result<T, EvalError> {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            EVAL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+    let depth = EVAL_DEPTH.with(|d| {
+        d.set(d.get() + 1);
+        d.get()
+    });
+    let _leave = Leave;
+    if depth > EVAL_NESTING_LIMIT {
+        return Err(EvalError::new(format!(
+            "eval: expressions nest more than {EVAL_NESTING_LIMIT} deep"
+        )));
+    }
+    Ok(body())
+}
+
+/// The expression yq's `eval` reads from one output of its argument: a scalar's text (`null` is
+/// `null`), and nothing for a container, which is the empty expression, that is the node itself.
+#[cfg(feature = "std")]
+fn parse_eval_text<S: EvalSemantics>(text: &OwnedValue) -> Result<Expr, EvalError> {
+    let text = yq_scalar_text::<S>(text)
+        .map(Cow::into_owned)
+        .unwrap_or_default();
+    // An empty expression, or one of only blanks and comments, is the node itself.
+    let blank = text.lines().all(|line| {
+        let line = line.trim();
+        line.is_empty() || line.starts_with('#')
+    });
+    if blank {
+        return Ok(Expr::Identity);
+    }
+    super::parser::parse_with_mode(&text, super::parser::ParserMode::Yq)
+        .map_err(|_| EvalError::new("bad expression, please check expression syntax"))
+}
+
+/// Builtin: `eval(expr)` (yq, #6081): every output of `expr` is read as a yq expression and
+/// evaluated against this node, in order.
+fn builtin_eval_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    arg: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    #[cfg(feature = "std")]
+    {
+        let (texts, trailing) =
+            stream_outputs::<_, S>(eval_single::<W, S>(arg, value.clone(), optional));
+        if let Some(control) = trailing {
+            return partial(Vec::new(), control);
+        }
+        let mut exprs = Vec::new();
+        for text in &texts {
+            // An absent key reads as `null` here and yields nothing in yq (`eval(.zz)` prints
+            // nothing); the node `null` is the expression `null`, which this cannot tell apart.
+            if text.is_null() {
+                continue;
+            }
+            match parse_eval_text::<S>(text) {
+                Ok(parsed) => exprs.push(parsed),
+                Err(e) => return suppress_or_raise(e, optional),
+            }
+        }
+        // The expressions run as one comma, so a node an expression reaches keeps its comments,
+        // style and anchor as `,` keeps them.
+        match with_eval_depth(|| eval_comma::<W, S>(&exprs, value, optional)) {
+            Ok(result) => result,
+            Err(e) => suppress_or_raise(e, optional),
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (arg, value);
+        suppress_or_raise(EvalError::new("eval requires the std feature"), optional)
+    }
+}
+
+/// The path-position twin of [`builtin_eval_expr`]: the paths the evaluated expressions name,
+/// so a write or `del` through `eval(".a")` lands (`eval(".a") = 5` writes `.a` in yq v4.53.3).
+fn resolve_eval_expr_sink<'a, S: EvalSemantics>(
+    arg: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    #[cfg(feature = "std")]
+    {
+        let (texts, escape) = eval_owned_multi_keep_partial::<S>(arg, value);
+        if escape.is_some() {
+            return flow_result(escape);
+        }
+        for text in &texts {
+            // As in [`builtin_eval_expr`]: an absent key names no expression.
+            if text.is_null() {
+                continue;
+            }
+            let parsed = match parse_eval_text::<S>(text) {
+                Ok(parsed) => parsed,
+                Err(e) => return ResolveFlow::Escaped(e.into()),
+            };
+            let flow = match with_eval_depth(|| {
+                resolve_node_sink::<S>(&parsed, value, trackable, snapshot, frame, keep, sink)
+            }) {
+                Ok(flow) => flow,
+                Err(e) => return ResolveFlow::Escaped(e.into()),
+            };
+            if !matches!(flow, ResolveFlow::Exhausted) {
+                return flow;
+            }
+        }
+        ResolveFlow::Exhausted
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (arg, value, trackable, snapshot, frame, keep, sink);
+        ResolveFlow::Escaped(EvalError::new("eval requires the std feature").into())
     }
 }
 

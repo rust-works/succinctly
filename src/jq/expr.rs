@@ -4049,6 +4049,11 @@ pub enum Builtin {
     /// write timestamps with
     WithDtf(Box<Expr>, Box<Expr>),
 
+    /// `eval(expr)` (yq, #6081) - each string `expr` yields is parsed as a yq expression and
+    /// evaluated against the current node; a node that is not a scalar has no text and is the
+    /// empty expression, which is the node itself
+    EvalExpr(Box<Expr>),
+
     // Phase 22: File operations (yq)
     /// `load(file)` - load external YAML/JSON file and return its parsed content
     /// Input: load("config.yaml") -> {parsed content}
