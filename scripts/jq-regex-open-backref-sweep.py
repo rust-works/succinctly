@@ -13,8 +13,8 @@ the group nested in other groups, lookarounds and alternations) on four strings,
 agree, differ, or are refused here (jq answers, SUBJECT says `invalid regex`). It lists, per
 class of pattern, whether the group sits under a repeat that can run twice (the shape
 `fancy_has_open_group_backref` refuses) or not (the shape it must leave alone).
-Exits 1 when a pattern outside the refused shape differs from jq, or a refused one agrees on every
-case (the refusal would then cost a working pattern for nothing).
+Exits 1 when a pattern of the refused shape is answered on some text (the guard is gone or has a
+hole), or one outside it is refused, differs from jq or fails otherwise.
 """
 import argparse
 import collections
@@ -94,8 +94,10 @@ def main():
             kind = "twice" if pats[p] else "once"
             if theirs.startswith("jq: error"):
                 key = "jq-refuses"
-            elif ours.startswith("jq: error") or "invalid regex" in ours:
+            elif "invalid regex" in ours:
                 key = "refused-here"
+            elif ours.startswith("jq: error") or ours == "TIMEOUT":
+                key = "other-failure"
             elif ours == theirs:
                 key = "agree"
             else:
@@ -108,12 +110,14 @@ def main():
         print(kind, row)
     bad = 0
     for p, c in sorted(per_pattern.items()):
-        kind = "twice" if pats[p] else "once"
-        if kind == "once" and (c["differ"] or c["refused-here"]):
+        refused_shape = pats[p]
+        # the refused shape must be refused on every text jq answers, the others never
+        if refused_shape and (c["agree"] or c["differ"] or c["other-failure"]):
+            bad += 1
+            print("NOT REFUSED", p, dict(c))
+        if not refused_shape and (c["differ"] or c["refused-here"] or c["other-failure"]):
             bad += 1
             print("ONCE-SHAPE CHANGED", p, dict(c))
-        if kind == "twice" and c["agree"] and not c["differ"] and not c["refused-here"]:
-            pass
     twice = [c for q, c in per_pattern.items() if pats[q]]
     print(
         "twice-shape patterns:",

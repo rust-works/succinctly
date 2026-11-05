@@ -49,6 +49,8 @@ fn a_reference_to_an_open_group_of_a_repeat_is_refused() -> Result<()> {
         r"(?<n>a|\k<n>)+",
         // the open group is not the first: only its own number counts
         r"(x)(a|\2)+",
+        // a plain group beside a named one still counts (jq captures both)
+        r"(x)(?<n>a|\k<n>)+",
         r"((b)|a(?:\1|c))+",
     ];
     for pattern in SHAPES {
@@ -110,5 +112,28 @@ fn a_repeated_group_without_a_reference_is_unaffected() -> Result<()> {
         r#"[[0,"ab",[1,"b"]]]"#,
         "a repeated group with no reference takes the regex route"
     );
+    Ok(())
+}
+
+/// Every regex builtin builds its pattern the same way, so the refusal reaches all of them. jq
+/// 1.7.1 answers each of these on `"xab"` (`true`, `[["b"]]`, `"X"`, `"xXb"`, `["x","b"]`,
+/// `{"n":"a"}`).
+#[test]
+fn every_regex_builtin_refuses_the_shape() -> Result<()> {
+    const PROGRAMS: &[&str] = &[
+        r#"test("(\\1|\\w)+")"#,
+        r#"test("(\\1|\\w)+"; "i")"#,
+        r#"[scan("(\\1|\\w)+")]"#,
+        r#"sub("(\\1|\\w)+"; "X")"#,
+        r#"gsub("(a|\\1)+"; "X")"#,
+        r#"[splits("(a|\\1)+")]"#,
+        r#"capture("(?<n>a|\\k<n>)+")"#,
+    ];
+    for program in PROGRAMS {
+        let filter = format!(r#""xab" | try ({program}) catch "ERR""#);
+        let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
+        assert_eq!(code, 0, "{program}: {stderr}");
+        assert_eq!(stdout.trim(), r#""ERR""#, "{program}");
+    }
     Ok(())
 }
