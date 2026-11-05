@@ -176,9 +176,6 @@ pub struct Validator<'a> {
     /// Whether to accept the number and escape spellings real jq accepts
     /// but RFC 8259 does not -- see [`validate_jq_lenient`].
     jq_lenient: bool,
-    /// Whether [`jq_lenient`](Self::jq_lenient) still refuses a bare trailing dot (`5.`) -- see
-    /// [`refusing_bare_trailing_dot`](Self::refusing_bare_trailing_dot).
-    refuse_bare_trailing_dot: bool,
     /// The deepest container nesting accepted, [`MAX_NESTING_DEPTH`] unless
     /// [`with_max_depth`](Self::with_max_depth) raised it.
     max_depth: usize,
@@ -196,7 +193,6 @@ impl<'a> Validator<'a> {
             column: 1,
             nesting_depth: 0,
             jq_lenient: false,
-            refuse_bare_trailing_dot: false,
             max_depth: MAX_NESTING_DEPTH,
             deepest: 0,
         }
@@ -223,16 +219,6 @@ impl<'a> Validator<'a> {
     #[must_use]
     pub fn jq_lenient(mut self) -> Self {
         self.jq_lenient = true;
-        self
-    }
-
-    /// This validator, still in jq's accept-set, but refusing a bare trailing dot (`5.`) as it
-    /// did before #6052. `succinctly yq`'s `--argjson` keeps that refusal: it is an extension
-    /// real yq does not have, its reading of `5.` would differ from the `-p json` reader's, and
-    /// #6052 was a jq-mode change.
-    #[must_use]
-    pub fn refusing_bare_trailing_dot(mut self) -> Self {
-        self.refuse_bare_trailing_dot = true;
         self
     }
 
@@ -734,9 +720,7 @@ impl<'a> Validator<'a> {
             // #6052), so this admits it. The dot still needs an integer part:
             // `.` and `-.` stay refused, as in jq.
             let fraction_digits = self.skip_digits();
-            let elided = self.jq_lenient
-                && integer_digits > 0
-                && (!self.refuse_bare_trailing_dot || matches!(self.peek(), Some(b'e' | b'E')));
+            let elided = self.jq_lenient && integer_digits > 0;
             if fraction_digits == 0 && !elided {
                 return Err(self.error(ValidationErrorKind::InvalidNumber {
                     reason: "expected digit after decimal point",
@@ -2218,18 +2202,8 @@ mod tests {
         for s in [".", "-.", "+.", "1.5.", "1..", "1.x", "[1.x]"] {
             assert!(validate_jq_lenient(s.as_bytes()).is_err(), "{s:?}");
         }
-        // Strict mode keeps RFC 8259, and yq's `--argjson` keeps refusing the dot.
+        // Strict mode keeps RFC 8259.
         assert!(validate(b"5.").is_err());
-        let yq_flag = |s: &str| {
-            Validator::new(s.as_bytes())
-                .jq_lenient()
-                .refusing_bare_trailing_dot()
-                .validate()
-        };
-        assert!(yq_flag("5.").is_err());
-        assert!(yq_flag("[5.]").is_err());
-        assert!(yq_flag("1.e5").is_ok());
-        assert!(yq_flag(".5").is_ok());
     }
 
     // ========================================================================

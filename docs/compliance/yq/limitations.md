@@ -6574,6 +6574,13 @@ there with the spelling dropped (`--argjson x +1` is `1`, `[+1.500]` is `[1.5]`)
 the `007`/`.5` mirroring convention this section already records, not a new rule. Pinned in
 `test_p_json_input_is_unmoved_by_2877` and the same reject-set test.
 
+A bare trailing dot (`5.`, `-0.`, `007.`, `12345678901234567.`) is read as the number the `-p json` reader reads
+([#6063](https://github.com/rust-works/succinctly/issues/6063)).
+`printf '{"n":5.}' | yq -p json -o json -I0 .` is `{"n":5}` in real yq v4.53.3, and `--argjson n 5.` answers `5` too, where it was refused before.
+A whole-valued span is the integer, so it prints `5` and not `5.0` (`12345678901234567.` is `12345678901234568`, as in yq; one past `i64` stays a float, `1.2345678901234568e+20`).
+A dot with no integer part (`.`, `-.`) or a second dot (`1.5.`, `1..`) is still refused.
+Pinned in `tests/yq_cli/i6063.rs` against the `-p json` reader on the same nine spellings.
+
 The swap also brings the stray-comma rejection that materializer already carries
 (`--argjson x '[1,]'`, `'{,}'`, #2262/#2781) to this flag -- previously `serde_json` was the
 only thing refusing them, so this is the same guarantee from a different place, not a new
