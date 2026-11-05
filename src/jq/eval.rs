@@ -29179,7 +29179,9 @@ fn translate_posix_brackets_scan(
     let mut prev_option_group = false;
     let mut group_facts: Option<GroupFacts> = None;
     // The extended mode's ignored blanks are invisible to this scan (`^ *` is a repeated
-    // assertion there), so it leaves the repetition check to the crate rather than judge it.
+    // assertion there), so a pattern in that mode is not judged as written: `translate_posix_brackets`
+    // runs the scan again over the pattern without the blanks and comments (#6215, #6249) and keeps
+    // only its repeat-operator refusals. A pattern with an inline `(?x)` is judged by neither.
     let check_repetition = !extended && !inline_extended(pattern);
     // One entry per open group: whether the extended mode is on inside it, from the `x` flag and
     // from inline `(?x)`, `(?x:...)` and `(?-x)` (#5550).
@@ -29476,13 +29478,13 @@ fn translate_posix_brackets_scan(
             // #6249: so is `*`, `+` or `?` there (`*0`, `a|+`, `(?:?a)`). The crate refuses them
             // as well, in its own words; but the flag prefix of the `x` flag is a group that
             // `fancy-regex` repeats, so under `x` they must be refused here, on the pattern
-            // without the blanks (see `translate_posix_brackets`). A `*` right after a `(` is
-            // Oniguruma's callout (`(*a)`), which is another error in jq.
+            // without the blanks (see `translate_posix_brackets`). A `(*` opens Oniguruma's callout
+            // (`(*a)`, another error in jq), which the group header reads as a group of its own and
+            // this check never meets.
             if matches!(c, '{' | '*' | '+' | '?')
                 && check_repetition
                 && starts_repetition(&chars[i..])
                 && (i == body_start || after_pipe)
-                && !(c == '*' && i > 0 && chars[i - 1] == '(')
             {
                 return Err(EvalError::new(
                     "invalid regex: target of repeat operator is not specified",
@@ -172923,5 +172925,30 @@ mod named_args_shared_tests_5690 {
         };
         let _guard = embed_table_push::<JqSemantics>(Some(&origin), &mut bound);
         assert!(matches!(step("[.]"), OwnedStep::Declined(_)));
+    }
+}
+
+#[cfg(all(test, feature = "regex"))]
+mod repeat_with_nothing_to_repeat_tests_6249 {
+    use super::{starts_branch_with_repeat, translate_posix_brackets_scan};
+
+    /// `starts_branch_with_repeat` gates the scan's fast path, so it must hold for every pattern the
+    /// scan refuses for a repeat operator at the start of a branch, and the scan must agree.
+    #[test]
+    fn the_fast_path_gate_and_the_scan_agree_on_a_branch_that_starts_with_a_repeat() {
+        for pattern in ["*a", "+a", "?a", "a|*b", "a|+", "a|?", "*", "x|y|*"] {
+            assert!(starts_branch_with_repeat(pattern), "{pattern}");
+            let refusal = translate_posix_brackets_scan(pattern, false)
+                .expect_err(pattern)
+                .to_string();
+            assert!(refusal.contains("not specified"), "{pattern}: {refusal}");
+        }
+        for pattern in ["a*", "a|b+", "a?", "ab|c*d", "a+|b"] {
+            assert!(!starts_branch_with_repeat(pattern), "{pattern}");
+            assert!(
+                translate_posix_brackets_scan(pattern, false).is_ok(),
+                "{pattern}"
+            );
+        }
     }
 }

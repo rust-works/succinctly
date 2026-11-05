@@ -7463,7 +7463,8 @@ A `*`, `+` or `?` at the start of a branch (`*0`, `a| *b`, `(?: *a)`) is refused
 What is left of #6249 is an inline `(?x)` written in the pattern (`(?x)*0`), which is a bare option group followed by an operator (#6181) and stands down with the rest.
 The check runs after the pattern's other refusals, so an error earlier in the pattern is the one reported.
 What jq's answer is for a pattern it does compile is the matcher's, not this check's: `"aBcb" | [match("(?:[ab]\\w|\\b\\b||c)*";"g") | .string]` is `["aB","","",""]` in jq, because an empty alternative ends the repeat (#6106).
-Under the `x` flag, or a pattern with an inline flag group naming `x`, both checks stand down, because the scan cannot see the mode's ignored blanks (it does skip its comments); `test(\"^ *\"; \"x\")` is an error in jq and `true` here.
+A pattern with an inline flag group naming `x` stands down from both checks, because the scan cannot see the mode's ignored blanks (it does skip its comments); `test(\"(?x)^ *\")` is an error in jq and `true` here.
+Under the `x` flag itself they run over the pattern without the blanks and comments (#6215, #6249).
 
 ## Possessive quantifiers (#5524, #6172)
 

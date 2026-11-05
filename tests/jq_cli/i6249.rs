@@ -37,7 +37,7 @@ fn a_repeat_with_nothing_to_repeat_is_refused_6249() -> Result<()> {
         assert_eq!(stdout.trim_end(), "", "{filter}");
         assert_ne!(code, 0, "{filter}");
         assert!(
-            stderr.contains("repeat operator") || stderr.contains("regex"),
+            stderr.contains("target of repeat operator is not specified"),
             "{filter}: {stderr:?}"
         );
     }
@@ -68,5 +68,22 @@ fn an_operator_with_a_target_still_repeats_it_6249() -> Result<()> {
         assert_eq!(stdout.trim_end(), expected, "{filter}: stderr={stderr:?}");
         assert_eq!(code, 0, "{filter}");
     }
+    Ok(())
+}
+
+/// A `(*` is a callout (another error in jq), and so is a blank between them under `x` (here with
+/// the crate's words); and an inline `(?x)` in the pattern still stands down (a documented gap, #6249).
+#[test]
+fn callouts_and_an_inline_x_6249() -> Result<()> {
+    // jq: `undefined callout name`.
+    let (stdout, _, code) = run_jq_full(&["-nc", r#""x0" | [match("(*a)";"g")]"#], None)?;
+    assert_eq!((stdout.trim_end(), code != 0), ("", true));
+    // jq: `target of repeat operator is not specified`; here the crate's own refusal.
+    let (stdout, _, code) = run_jq_full(&["-nc", r#""x0" | [match("( *a)";"gx")]"#], None)?;
+    assert_eq!((stdout.trim_end(), code != 0), ("", true));
+    // jq refuses this one too (`target of repeat operator is not specified`); here the inline
+    // option group is repeated, as before.
+    let (stdout, _, code) = run_jq_full(&["-nc", r#""x0" | [match("(?x)*0";"g")|.string]"#], None)?;
+    assert_eq!((stdout.trim_end(), code), (r#"["0"]"#, 0));
     Ok(())
 }
