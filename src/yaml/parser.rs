@@ -522,6 +522,9 @@ struct Parser<'a, const HAS_CR: bool> {
     /// the stack is the *key*, and the owner — the mapping the null belongs to — is
     /// the one below it.
     pending_explicit_key: Option<usize>,
+    /// Whether the input holds a byte that starts U+2028, U+2029 or U+0085 (#6214), so a plain scalar
+    /// is searched for one of them only in a document that can have it.
+    may_hold_unicode_break: bool,
 
     /// Where the plain scalar scanned last began and ended, and the indent of the innermost open
     /// block when it did (#5068). The next block-context line takes it
@@ -704,6 +707,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             in_document: false,
             document_start_bp_pos: 0,
             pending_explicit_key: None,
+            may_hold_unicode_break: input.iter().any(|&b| b == 0xC2 || b == 0xE2),
             last_plain_scalar: None,
             pending_explicit_key_empty: false,
             nesting_depth: 0,
@@ -2438,7 +2442,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Only called on error paths, so we pay the cost only when needed.
     #[inline]
     fn current_line(&self) -> usize {
-        // Count line breaks from start to current position, by counting the
+        self.line_at(self.pos)
+    }
+
+    /// The 1-indexed line `offset` is on.
+    fn line_at(&self, offset: usize) -> usize {
+        // Count line breaks from start to `offset`, by counting the
         // bytes each break *ends* at: a break of width 1 ends where it starts,
         // so a CRLF — width 2 at its `\r` — is counted once, at its `\n` (#324).
         //
@@ -2446,7 +2455,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // the cursor sits on the LF of a CRLF, that CR's partner is one byte
         // past the prefix, and measuring within the prefix would read it as a
         // lone CR and report a line too many.
-        let breaks = (0..self.pos)
+        let breaks = (0..offset)
             .filter(|&i| line_break_len(self.input, i) == 1)
             .count();
         breaks + 1
@@ -3819,7 +3828,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         });
 
         // Return absolute end position (not length)
-        self.reject_tab_after_unicode_break(start, end)?;
+        self.reject_tab_after_unicode_break(start, content_end)?;
         Ok(end)
     }
 
@@ -3894,6 +3903,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
             }
         }
+
+        self.reject_tab_after_unicode_break(start, self.pos)?;
 
         // Trim trailing whitespace. `\r` goes with it for the same reason as in
         // `parse_unquoted_value_with_indent_impl`: it is a line break, so it is
@@ -7380,6 +7391,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
         }
 
+        self.reject_tab_after_unicode_break(start, self.pos)?;
+
         // Trim trailing whitespace
         let mut end = self.pos;
         while end > start && matches!(self.input[end - 1], b' ' | b'\t') {
@@ -7552,6 +7565,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// scans them as such, so the blanks after one are a continuation line's, but the scanners here
     /// take them for text and never reach [`Self::reject_tab_in_flow_plain_continuation`].
     fn reject_tab_after_unicode_break(&self, start: usize, end: usize) -> Result<(), YamlError> {
+        if !self.may_hold_unicode_break {
+            return Ok(());
+        }
         let Some(limit) = self.tab_indent_limit() else {
             return Ok(());
         };
@@ -7573,7 +7589,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
             if text.get(tab) == Some(&b'\t') && tab - line <= limit {
                 return Err(YamlError::TabIndentation {
-                    line: self.current_line(),
+                    line: self.line_at(start + tab),
                     offset: start + tab,
                 });
             }
@@ -7738,6 +7754,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 _ => self.advance(),
             }
         }
+
+        self.reject_tab_after_unicode_break(start, self.pos)?;
 
         // Trim trailing whitespace
         let mut end = self.pos;

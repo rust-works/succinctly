@@ -321,6 +321,22 @@ const REFUSED: &[&str] = &[
     "a: x\u{2028}\u{2028}\ty\n",
     "a: x\u{2029}\u{2029}\ty\n",
     "a: x\u{85}\u{85}\ty\n",
+    "a:\n  x\u{2028}\ty: 1\n",
+    "a:\n  x\u{85}\ty: 1\n",
+    "a: {x\u{2028}\ty: 1}\n",
+    "a: {x\u{85}\ty: 1}\n",
+    "a: [x\u{2028}\ty: 1]\n",
+    "a: [x\u{85}\ty: 1]\n",
+    "a: [? x\u{2028}\ty : 1]\n",
+    "a: [? x\u{85}\ty : 1]\n",
+    "a: x\u{2028}\t\nb: 1\n",
+    "a: x\u{85}\t\nb: 1\n",
+    "a: x\u{2028}\t# c\n",
+    "a: x\u{85}\t# c\n",
+    "a: [x\u{2028}\t]\n",
+    "a: [x\u{85}\t]\n",
+    "a:\n  b: x\u{2028}\ty\n  more\n",
+    "a:\n  b: x\u{85}\ty\n  more\n",
 ];
 
 #[test]
@@ -369,5 +385,15 @@ fn a_tab_after_a_unicode_break_clear_of_the_block_indent_is_accepted_6214() -> R
         assert_eq!(out.trim_end(), *expected, "{input:?}");
         assert_eq!(code, 0, "{input:?}");
     }
+    Ok(())
+}
+
+/// The error names the line of the tab, not the line the scanner had reached.
+#[test]
+fn the_error_names_the_line_of_the_tab_6214() -> Result<()> {
+    let input = "a: p\n  q\u{2028}\tz\n  r\n  s\n";
+    let (stdout, stderr, code) = crate::run_yq_stdin_with_stderr(".", input, &[])?;
+    assert_ne!(code, 0, "{stdout:?}");
+    assert!(stderr.contains("line 2"), "{stderr:?}");
     Ok(())
 }
