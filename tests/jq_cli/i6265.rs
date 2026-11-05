@@ -81,3 +81,47 @@ fn a_literal_slice_of_a_document_string_answers_as_jq_does_6265() -> Result<()> 
     }
     Ok(())
 }
+
+/// A string, or the text around one, that is malformed: the slice must raise (or not) as it did through
+/// the bridge, and as jq does. Each row is `(input, filter, stdout, exit code)` from jq 1.7.1.
+#[test]
+fn a_literal_slice_of_a_malformed_string_raises_as_before_6265() -> Result<()> {
+    for (input, filter, expected, expected_code) in [
+        (r#""abc"#, r".[1:3]", r"", 5),
+        (r#""abc"#, r#"try .[1:3] catch "e""#, r"", 5),
+        (r#""a\qb""#, r".[1:3]", r"", 5),
+        (r#""a\ud800b""#, r".[1:3]", r"", 5),
+        (r#""a\u12""#, r".[1:3]", r"", 5),
+        (r#"["abc" "def"]"#, r".[0][1:3]", r"", 5),
+        (r#"{"a":"abcdef""#, r".a[1:3]", r"", 5),
+        (
+            r#""abc" x"#,
+            r".[1:3]",
+            r#""bc"
+"#,
+            5,
+        ),
+        (
+            r#""a	b
+c""#,
+            r".[1:3]",
+            r"",
+            5,
+        ),
+        (
+            r#""abc"]"#,
+            r".[1:3]",
+            r#""bc"
+"#,
+            5,
+        ),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, expected_code),
+            "{filter} on {input}"
+        );
+    }
+    Ok(())
+}

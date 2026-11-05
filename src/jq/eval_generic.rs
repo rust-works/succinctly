@@ -14997,7 +14997,8 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 
         // #6265: a literal-bound slice of a string is read where it stands, as an array's is: the
         // text is borrowed (decoded only where it has escapes) and cut, not copied whole by the
-        // bridge first. jq mode; a YAML scalar carries tags and styles the bridge decodes its own way.
+        // bridge first. jq mode, which reads JSON and DSV; a YAML scalar carries tags and styles the
+        // bridge decodes its own way.
         Expr::Slice { start, end, .. } if S::TAG != EvalTag::Yq && value.as_str().is_some() => {
             slice_one_generic::<S, V>(value, *start, *end, optional, true)
         }
