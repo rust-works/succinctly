@@ -20740,6 +20740,17 @@ fn each_select_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
+    // #6350: a `cond` the direct verdict answers is single-valued and pure, so the node is kept or
+    // dropped without the sink, the fan-out and the owned copy the general route makes of it.
+    if let Some(c) = cursor.as_ref() {
+        if let Some(keep) = direct_cond_verdict::<S, V>(cond, c) {
+            return if keep {
+                push_one_generic(GenericItem::OneCursor(*c), sink)
+            } else {
+                Flow::Exhausted
+            };
+        }
+    }
     let mut already_emitted = false;
     let mut escape: Option<Control> = None;
     // #6130: yq's `select` reads its condition read-only (a pipe from an absent key is empty); the
@@ -35976,6 +35987,16 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
         )),
 
         Builtin::Select(cond) => {
+            // #6350: see `each_select_generic`.
+            if let Some(c) = cursor.as_ref() {
+                if let Some(keep) = direct_cond_verdict::<S, V>(cond, c) {
+                    return if keep {
+                        GenericResult::OneCursor(*c)
+                    } else {
+                        GenericResult::None
+                    };
+                }
+            }
             // Evaluate condition with cursor context preserved.
             // This is critical for select(di == N) to work correctly.
             // #6130: yq's `select` reads its condition read-only, so a pipe from an absent key is
