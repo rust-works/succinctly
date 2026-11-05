@@ -587,7 +587,8 @@ Fixing the folding rule in `decode_block_folded` cleared `4Q9F`, `7T8X`, `93WF`,
 and `TS54`. `DK95/00` (a tab used as separation before a plain scalar, retained as
 content instead of stripped) was fixed by
 [#381](https://github.com/rust-works/succinctly/issues/381).
-`DK95/04` (a line holding only a tab after `foo: 1`) is valid YAML 1.2 and refused by yq v4.53.3, which reports `found a tab character that violates indentation` when the tab is no deeper than the owning block, so it is refused here too ([#6286](https://github.com/rust-works/succinctly/issues/6286)). What remains under
+`DK95/04` (a line holding only a tab after `foo: 1`) is valid YAML 1.2 and refused by yq v4.53.3, which reports `found a tab character that violates indentation` when the tab is no deeper than the owning block, so it is refused here too ([#6286](https://github.com/rust-works/succinctly/issues/6286)).
+What remains under
 `scalars` is unrelated to folding: zero-indented block scalars (`DK3J`, `FP8R`, and
 `W4TN` — moved here from `directives` once #225 fixed the directive line that used to
 mask this same gap), trailing whitespace (`L24T/00`, `JEF9/02`), explicit indentation

@@ -12,6 +12,10 @@ use crate::run_yq_stdin;
 fn a_tab_only_line_at_or_below_the_block_indent_after_a_plain_scalar_is_refused_6286() -> Result<()>
 {
     for input in [
+        "a: x\n  y\n\t\n  z\n",
+        "a: x\n\t\n  z\n",
+        "a: x\n# c\n\t\nb: 1\n",
+        "x\n\n---\n\t\ny\n",
         "a: x\n\t\n",
         "a: x\n\t\t\n",
         "a: x\n\t \n",
@@ -83,6 +87,10 @@ fn a_tab_only_line_at_or_below_the_block_indent_after_a_plain_scalar_is_refused_
 #[test]
 fn a_tab_only_line_deeper_than_the_block_indent_or_at_the_root_is_still_read_6286() -> Result<()> {
     for (input, expected) in [
+        ("a: x\n  y\n \t\n  z\n", "{\"a\":\"x y\\nz\"}"),
+        ("a: x\n  y\n   \t\n  z\n", "{\"a\":\"x y\\nz\"}"),
+        ("a: x\n \t\n  z\n", "{\"a\":\"x\\nz\"}"),
+        ("a: x\n\n \t\n\nb: 1\n", "{\"a\":\"x\",\"b\":1}"),
         ("a: x\n \t\n", "{\"a\":\"x\"}"),
         ("a: x\n  \t\n", "{\"a\":\"x\"}"),
         ("a: x\n   \t\n", "{\"a\":\"x\"}"),
