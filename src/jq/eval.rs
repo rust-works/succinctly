@@ -33163,6 +33163,10 @@ fn build_fancy_regex_at<S: EvalSemantics>(
     if fancy_has_squeezed_plus_run(&expr) {
         return None;
     }
+    // #6262: the engine reads a reference to a still-open group of a repeat as empty.
+    if fancy_has_open_group_backref(&expr) {
+        return None;
+    }
     let pattern = if modes.longest && pattern_is_variable_length(source) {
         format!("{FANCY_UNBOUNDED_DEAD_BRANCH}|{pattern}")
     } else {
@@ -33680,6 +33684,68 @@ fn fancy_has_squeezed_plus_run(expr: &fancy_regex::Expr) -> bool {
         _ => false,
     };
     squeezed(expr) || expr.has_descendant(squeezed)
+}
+
+/// Whether `expr` holds a backreference to a capture group that is still open where the reference
+/// stands, with that group under a repeat that can run twice (`(\1|\w)+`, `(a|\1){2}`, `((?!\1)){2,}`,
+/// `(?:(a|\1)b)+`; #6262).
+///
+/// Oniguruma reads such a reference as the group's last *completed* value, which is unset in the
+/// first pass (so the reference fails) and the previous pass's text after it. `fancy-regex` saves a
+/// group's start as the group opens and reads the reference from the new start to the old end, which
+/// is empty whenever the passes are contiguous: `"ab" | match("(\\1|\\w)+")` has the group at
+/// `[1,"b"]` in jq and matches `a` and `b` separately here. The engine has no option for the other
+/// reading, and a pattern cannot tell which texts reach the reference, so the shape is refused.
+///
+/// A reference to a group that is open but under no such repeat reads an unset group in both
+/// engines (the group never completes before the reference), and is left alone, as is a reference
+/// to a group that has closed.
+///
+/// The tree is read in the order the groups open, which is how Oniguruma and `fancy-regex` number
+/// them, with an explicit stack so that a deeply nested pattern cannot exhaust the native one.
+#[cfg(feature = "regex")]
+fn fancy_has_open_group_backref(expr: &fancy_regex::Expr) -> bool {
+    use fancy_regex::Expr;
+    enum Step<'a> {
+        Visit(&'a Expr, bool),
+        Close,
+    }
+    let mut stack = vec![Step::Visit(expr, false)];
+    // The capture groups open at the node being visited: (group number, under a repeat that can run
+    // twice).
+    let mut open: Vec<(usize, bool)> = Vec::new();
+    let mut opened = 0usize;
+    while let Some(step) = stack.pop() {
+        let (node, repeated) = match step {
+            Step::Close => {
+                open.pop();
+                continue;
+            }
+            Step::Visit(node, repeated) => (node, repeated),
+        };
+        match node {
+            Expr::Backref { group, .. } | Expr::BackrefWithRelativeRecursionLevel { group, .. }
+                if open.iter().any(|&(n, again)| n == *group && again) =>
+            {
+                return true;
+            }
+            Expr::Group(_) => {
+                opened += 1;
+                open.push((opened, repeated));
+                stack.push(Step::Close);
+            }
+            _ => {}
+        }
+        let below = repeated || matches!(node, Expr::Repeat { hi, .. } if *hi > 1);
+        // Pushed last-first, so the children are visited (and their groups numbered) in the order
+        // the pattern writes them.
+        let mark = stack.len();
+        for child in node.children_iter() {
+            stack.push(Step::Visit(child, below));
+        }
+        stack[mark..].reverse();
+    }
+    false
 }
 
 /// Whether `expr` has a lazy quantifier (`*?`, `+?`, `??`, `{n,m}?`).
