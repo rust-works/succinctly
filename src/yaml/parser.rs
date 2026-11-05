@@ -4620,6 +4620,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.parse_explicit_key(self.current_column())?;
             // Don't close anything - mapping and item are closed by
             // close_deeper_indents when we see content at lower indent.
+        } else if self.peek() == Some(b':') && Self::is_ws_break_or_eoi(self.peek_at(1)) {
+            // #6288: `- : b` has no key and no `?` before the `:`, which yq refuses (a tag or an
+            // anchor first, `- !!str : b`, is an empty key it reads, and starts with neither).
+            return Err(self.err_unexpected_char(self.pos, "did not find expected key"));
         } else if self.looks_like_mapping_entry() || self.looks_like_flow_keyed_mapping_entry() {
             // Check for compact mapping: `- key: value` (or `- [a, b]: value`, #1188)
             // This is a mapping entry directly as the sequence item value
@@ -9111,6 +9115,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.parse_explicit_key(indent)?;
             }
             Some(b':') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
+                // #6288: yq reads a `:` line only as the value of a `?` key that is waiting for one;
+                // with none waiting (`: a`, `a: 1⏎: b`, a second `:` after the value) it stops with
+                // `did not find expected key`, where this used to drop or keep the value.
+                if self.pending_explicit_key.is_none() {
+                    return Err(self.err_unexpected_char(self.pos, "did not find expected key"));
+                }
                 // Explicit value indicator (value for previous explicit key)
                 self.parse_explicit_value(indent)?;
             }

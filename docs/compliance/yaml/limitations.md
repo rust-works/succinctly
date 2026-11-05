@@ -674,7 +674,11 @@ Error: YAML parse error: unexpected character ':' ... expected key in flow mappi
 open with `:`. Since [#4558](https://github.com/rust-works/succinctly/issues/4558) `succinctly yq`
 rejects it too, which moves `FRK4` into the known-failures manifest (with `CFD4`,
 `[ : empty key ]`, and `NKF9`, an empty key in a flow mapping: all three are valid YAML 1.2 that
-yq refuses, and we follow yq). The `:` before a flow indicator is key or item content on both
+yq refuses, and we follow yq).
+So is a block-mapping `: value` with no `?` before it (`: a`, `a: 1` then `: b`, `- : b`; [#6288](https://github.com/rust-works/succinctly/issues/6288)): valid YAML 1.2 (spec example 2JQS), `did not find expected key` in yq, and an error here, where it used to read as an empty key, or drop the value after an entry.
+A tag or anchor before the `:` (`!!str : 1`) is an empty key yq reads, and so do we.
+`2JQS`, `6M2F`, `NHX8`, `S3PD`, `SM9W/01` and `UKK6/00` are in the known-failures manifest for it.
+Still read, where yq refuses: the compact entry inside an explicit key (`? : x`, `- ? : x`, corpus `M2N8/00`), which reads as an empty key with a null value. The `:` before a flow indicator is key or item content on both
 sides of that rule: `{a:}` is the key `a:` with no value and `[a:]` the one item `a:`
 (yq v4.53.3), where the spec reads the `:` as the pair's indicator. A `:` glued to text
 (`[:x]`, `[:]`) is still an item. `succinctly yaml validate` rejects a second pair `:` before the
