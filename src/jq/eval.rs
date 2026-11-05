@@ -146773,7 +146773,7 @@ mod tests {
         }
         // An unclosed `\x{` is jq's own error since #6251, not the crate's.
         assert_eq!(
-            translate_posix_brackets(r"\x{e9", false)
+            translate_posix_brackets(r"\x{e9", false, false)
                 .unwrap_err()
                 .message,
             "invalid regex: invalid code point value"
