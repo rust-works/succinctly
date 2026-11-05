@@ -191,23 +191,60 @@ declare -a div_keys=()
 flaky=0
 
 # Runs one case through succinctly and the oracle into the caller's `s_*`/`o_*` locals.
+#
+# macOS's /bin/bash 3.2 sometimes reads a child's exit status as 0 after `x="$(cmd)"` (#5997): on a
+# loaded machine about one command substitution in 140,000, always a failed child read as a
+# success (a wrapper that wrote the child's own status to a file saw 5 where the shell saw 0, 16
+# times in 110 sweeps; bash 5.1 on Linux lost none in 1.7 million). In this sweep every failing
+# case prints a message and no succeeding case prints anything (all 10,248 rows of a recording:
+# 5,848 failures, each with stderr text; 4,400 successes, none), so a run that exits 0 with text on
+# stderr lost its status and is run again, up to twice more. `lost_status` counts the reruns. A case
+# that still reads 0 after the third run is recorded as it came, and says so. The check does not
+# see a lost status on a failure that prints nothing; there is none in this sweep, and a case that
+# adds one (a `halt`, an `-e` exit) must not rely on this. `scripts/test_assign_sweep_capture.py`
+# drives `capture_case` with a child that loses its status.
+lost_status=0
+
+# capture_case OUT_VAR CODE_VAR ERR_FILE ERR_VAR cmd...: runs `cmd` with its stderr in ERR_FILE,
+# leaving its stdout and exit status in OUT_VAR and CODE_VAR and the stderr text in ERR_VAR. The
+# locals are named so that no caller's variable collides with them.
+capture_case() {
+  local _cc_out_var="$1" _cc_code_var="$2" _cc_err_file="$3" _cc_err_var="$4"
+  shift 4
+  local _cc_attempt _cc_out _cc_code _cc_err
+  for _cc_attempt in 1 2 3; do
+    _cc_out="$("$@" 2>"$_cc_err_file")" && _cc_code=0 || _cc_code=$?
+    _cc_err="$(cat "$_cc_err_file")"
+    if [[ "$_cc_code" != 0 || -z "$_cc_err" ]]; then
+      break
+    fi
+    if ((_cc_attempt < 3)); then
+      lost_status=$((lost_status + 1))
+      echo "lost-status: exit 0 with stderr from $1 (run $_cc_attempt of 3), run again" >&2
+    else
+      echo "lost-status: exit 0 with stderr from $1 on all 3 runs, recorded as exit 0" >&2
+    fi
+  done
+  printf -v "$_cc_out_var" '%s' "$_cc_out"
+  printf -v "$_cc_code_var" '%s' "$_cc_code"
+  printf -v "$_cc_err_var" '%s' "$_cc_err"
+}
+
 exec_case() {
   local mode="$1" filter="$2"
   if [[ "$mode" == jq ]]; then
-    s_out="$("$SUCC" jq -c "$filter" "$DOC_FILE" 2>"$S_ERR")" && s_code=0 || s_code=$?
+    capture_case s_out s_code "$S_ERR" s_err "$SUCC" jq -c "$filter" "$DOC_FILE"
   else
-    s_out="$("$SUCC" yq -o=json -I=0 "$filter" "$DOC_FILE" 2>"$S_ERR")" && s_code=0 || s_code=$?
+    capture_case s_out s_code "$S_ERR" s_err "$SUCC" yq -o=json -I=0 "$filter" "$DOC_FILE"
   fi
-  s_err="$(cat "$S_ERR")"
 
   o_out=""; o_err=""; o_code="-"
   if ((USE_ORACLE)); then
     if [[ "$mode" == jq ]]; then
-      o_out="$("$JQ" -c "$filter" "$DOC_FILE" 2>"$O_ERR")" && o_code=0 || o_code=$?
+      capture_case o_out o_code "$O_ERR" o_err "$JQ" -c "$filter" "$DOC_FILE"
     else
-      o_out="$("$YQ" -o=json -I=0 "$filter" "$DOC_FILE" 2>"$O_ERR")" && o_code=0 || o_code=$?
+      capture_case o_out o_code "$O_ERR" o_err "$YQ" -o=json -I=0 "$filter" "$DOC_FILE"
     fi
-    o_err="$(cat "$O_ERR")"
   fi
 }
 
@@ -323,6 +360,7 @@ else
   echo "== $total cases recorded ($diverged vs-oracle divergences) ==" >&2
 fi
 ((flaky == 0)) || echo "($flaky case(s) diverged once and agreed on a re-run; see the flaky: lines)" >&2
+((lost_status == 0)) || echo "($lost_status run(s) exited 0 with text on stderr and were run again; see the lost-status: lines, #5997)" >&2
 
 if ((GATE && diverged > 0)); then
   echo "FAIL: $diverged succinctly-vs-oracle divergence(s) (--gate)" >&2

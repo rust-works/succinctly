@@ -792,6 +792,12 @@ jobs:
       - name: jq-path-register-sweep.py self-tests
         run: python3 scripts/test_jq_path_register_sweep.py -v
 
+      # #5997: the same shape for the assign-path sweep's capture helper: a fake child that exits 0
+      # with stderr as macOS's bash 3.2 reads a failed child's status once in ~140,000 captures. It
+      # pins that the case is run again and the rows do not change.
+      - name: jq-assign-path-oracle-sweep.sh capture self-tests
+        run: python3 scripts/test_assign_sweep_capture.py -v
+
       # #5955: the same shape for the jq grammar fuzzer the `Compare jq ledger` workflow runs:
       # no build, no jq. It pins that the minimizer terminates (#5695 looped forever on a subtree
       # replaced by an equal one), which a ledger run would only show as a hung job.
