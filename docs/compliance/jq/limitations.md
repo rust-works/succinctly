@@ -7802,13 +7802,15 @@ These keep their loop as written, and still match longer than jq where the shape
   Three draws of 6,000 with assertions, `(?i)`, `{3,}` and nested groups among the atoms fixed 213, 250 and 195 and broke none, and four of 6,000 counted repeats near the unrolling limit fixed 221, 231, 202 and 201 and broke none.
   Six draws with the loops also inside an outer repeat or holding a repeated group of their own (`--nest`) fixed 139 to 160 and broke none, and two of them under the flags `gi` fixed 108 and 133 and broke none.
   `scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE` regenerates the first and last.
-  What still differs, in about 50 of the 5,000 plain ones: most are only the captures, in a counted `{n,}` of a capture group that has a group inside it (`((a)|b*){2,}` on `"ba"` has `["a","a"]` where jq has `["","a"]`), and the rest are loops with a flag switch or an assertion beside a group (`"bab" | [match("(?:(a)?|(?i)b)*";"g") | .string]` is `["","a","",""]` in jq and `["","ab",""]` here), or a group name used twice.
+  What still differs, in about 25 of the 5,000 plain ones: loops with a flag switch or an assertion beside a group (`"bab" | [match("(?:(a)?|(?i)b)*";"g") | .string]` is `["","a","",""]` in jq and `["","ab",""]` here), or a group name used twice.
   A group beside a flag switch written inside the pattern keeps its loop: the empty way of what the switch reaches is not worked out.
   The switch the flags `i` and `s` put in front of the pattern is not one of those: it stays in front, and the rest is rewritten (`"ABCA" | [match("(?:(a)|b*|c)+";"gi") | .string]` is `["AB","","A",""]`, as in jq).
   A loop over a capture group itself is rewritten since [#6305](https://github.com/rust-works/succinctly/issues/6305): `"ba" | match("(b*|a)+")` is `"b"`, as in jq.
   The capture rewrite of #6069 writes the repeated group's own loop as a plain `(?:X)*` (its copy of the group sits in the final empty iteration), and the loop rewrite reads that.
   Over 3,346 generated patterns (a repeated capture group with `*`, `+`, `{0,}` or `{1,}`, on 19 strings under `g`), the 117 that differed from jq agree and none changed the other way.
-  A `{n,}` with `n` of 2 or more over a capture group with no group inside it is rewritten the same way since [#6309](https://github.com/rust-works/succinctly/issues/6309), because the empty iteration ends the loop before the minimum count: `"abb" | [match("(b|){2,}$";"g") | .captures[0].string]` is `["",""]`, as in jq.
+  A `{n,}` with `n` of 2 or more over a capture group is rewritten the same way since [#6309](https://github.com/rust-works/succinctly/issues/6309), because the empty iteration ends the loop before the minimum count: `"abb" | [match("(b|){2,}$";"g") | .captures[0].string]` is `["",""]`, as in jq.
+  With a group inside it ([#6347](https://github.com/rust-works/succinctly/issues/6347)) the groups inside are copied and read back by the loop rewrite of #6332: `"ba" | [match("((a)|b*){2,}";"g") | .captures | map(.string)]` has `["","a"]` for its first match, as in jq.
+  That is written only outside another repeat, which would run the loop's copies again, and with no flag switch inside the group.
   Over 2,498 generated `{2,}`, `{3,}` and `{4,}` patterns, the 519 that differed from jq agree and none changed the other way.
 - **A body with a way that matches nothing only where a zero-width assertion holds** (`^`, `$`, `\b`, `\A`, `\z`).
   Such a way is an assertion beside items that can themselves match nothing, as in `(?:b*|a?\b)+`.

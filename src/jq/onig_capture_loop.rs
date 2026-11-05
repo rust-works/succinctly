@@ -37,10 +37,9 @@
 //! `E` wherever a group needs it, since which empty way succeeds depends on the position only.
 //! Nor is a lazy repeat rewritten (`(a*)*?b` already agrees). A `{n,}` from `{2,}` up is
 //! the `*` loop for a body that always matches empty, since the empty iteration ends the loop before
-//! the minimum count (#6309); it is written so only when the repeated item is a capture group with no
-//! group inside it. Over a body with groups in it the crate's own copies (`X X X*`) answer as jq does
-//! more often than `(?:X*E)` would, and the loop rewrite cannot read the loop copy to order its
-//! ways.
+//! the minimum count (#6309); it is written so when the repeated item is a capture group, whether or
+//! not it holds groups of its own: the loop copy `(?:X)*` is read by the loop rewrite, which copies
+//! the groups inside it and lists the copies each group has (#6347; before, it could not read them).
 //! A projected loop (`X*` inside some `E`) is written as `E` alone: its loop copy could only make empty iterations, which the crate
 //! drops, so it would never set a group. That keeps the rewritten pattern linear in the nesting depth
 //! instead of doubling per level; [`MAX_REWRITTEN_LEN`] bounds it all the same.
@@ -96,7 +95,7 @@ pub(crate) fn rewrite(pattern: &str) -> Option<LoopRewrite> {
         return None;
     }
     let ast = ast::parse::Parser::new().parse(pattern).ok()?;
-    if swaps_greed(&ast) || !has_candidate(&ast) {
+    if swaps_greed(&ast) || !has_candidate(&ast, false) {
         return None;
     }
     let mut names = vec![None];
@@ -106,6 +105,7 @@ pub(crate) fn rewrite(pattern: &str) -> Option<LoopRewrite> {
         out: String::with_capacity(pattern.len() * 2),
         copies: vec![Vec::new(); names.len()],
         next: 1,
+        nest: 0,
     };
     emitter.copies[0].push(0);
     emitter.emit(&ast, false).ok()?;
@@ -129,6 +129,8 @@ struct Emitter<'p> {
     out: String,
     copies: Vec<Vec<usize>>,
     next: usize,
+    /// How many repeats the part being written stands inside.
+    nest: u32,
 }
 
 impl Emitter<'_> {
@@ -193,28 +195,17 @@ impl Emitter<'_> {
                 self.emit(&group.ast, projected)?;
                 self.push(")")
             }
-            Ast::Repetition(rep) if is_candidate(rep) => {
-                self.push("(?:")?;
-                if !projected {
-                    // The repeated group's own loop copy is never read: `E` always matches, so
-                    // its copy of the group is always set and always the last. Leaving it
-                    // uncaptured keeps the crate's capture slots at the pattern's count for the
-                    // common `(a*)*`, which a long match pays for per slot.
-                    match &*rep.ast {
-                        Ast::Group(group) if group.capture_index().is_some() => {
-                            self.push("(?:")?;
-                            self.emit(&group.ast, false)?;
-                            self.push(")")?;
-                        }
-                        body => self.emit(body, false)?,
-                    }
-                    self.push("*")?;
-                }
-                self.emit(&rep.ast, true)?;
-                self.push(")")
+            Ast::Repetition(rep) if is_candidate(rep, self.nest > 0) => {
+                self.nest += 1;
+                let written = self.candidate(rep, projected);
+                self.nest -= 1;
+                written
             }
             Ast::Repetition(rep) => {
-                self.emit(&rep.ast, projected)?;
+                self.nest += 1;
+                let written = self.emit(&rep.ast, projected);
+                self.nest -= 1;
+                written?;
                 let op = String::from(self.text(&rep.op.span));
                 self.push(&op)
             }
@@ -236,6 +227,28 @@ impl Emitter<'_> {
         }
     }
 
+    /// A repeat [`is_candidate`] accepts: `X*` followed by `E`, the body projected.
+    fn candidate(&mut self, rep: &ast::Repetition, projected: bool) -> Result<(), TooLong> {
+        self.push("(?:")?;
+        if !projected {
+            // The repeated group's own loop copy is never read: `E` always matches, so
+            // its copy of the group is always set and always the last. Leaving it
+            // uncaptured keeps the crate's capture slots at the pattern's count for the
+            // common `(a*)*`, which a long match pays for per slot.
+            match &*rep.ast {
+                Ast::Group(group) if group.capture_index().is_some() => {
+                    self.push("(?:")?;
+                    self.emit(&group.ast, false)?;
+                    self.push(")")?;
+                }
+                body => self.emit(body, false)?,
+            }
+            self.push("*")?;
+        }
+        self.emit(&rep.ast, true)?;
+        self.push(")")
+    }
+
     /// The next group opened is a copy of the original pattern's group `original`.
     fn record(&mut self, original: usize) {
         self.copies[original].push(self.next);
@@ -245,11 +258,12 @@ impl Emitter<'_> {
 
 /// A greedy `*`, `+`, `{0,}` or `{1,}` of a body that holds a group and matches empty at every
 /// position: the repeats whose captures the crate and Oniguruma report differently. So is a
-/// `{n,}` with `n` of 2 or more over a capture group that holds no other group (#6309): the empty
-/// iteration ends such a loop even before its minimum count, so it is the `*` loop, and the loop
-/// copy `(?:X)*` is one the loop rewrite (#6106) reads. With a group inside, the crate's own
-/// copies of the body (`X X X*`) answer as Oniguruma does more often than `(?:X*E)` would.
-fn is_candidate(rep: &ast::Repetition) -> bool {
+/// `{n,}` with `n` of 2 or more over a capture group (#6309, #6347): the empty iteration ends such
+/// a loop even before its minimum count, so it is the `*` loop, and the loop copy `(?:X)*` is one
+/// the loop rewrite (#6106) reads, with the groups inside it copied and read back. With a group
+/// inside it, only outside another repeat (which would run the loop's copies again) and with no
+/// flag switch inside, which the loop rewrite does not follow.
+fn is_candidate(rep: &ast::Repetition, nested: bool) -> bool {
     let counted = match rep.op.kind {
         RepetitionKind::ZeroOrMore | RepetitionKind::OneOrMore => false,
         RepetitionKind::Range(RepetitionRange::AtLeast(0 | 1)) => false,
@@ -261,15 +275,16 @@ fn is_candidate(rep: &ast::Repetition) -> bool {
         && always_matches_empty(&rep.ast)
         && (!counted
             || matches!(&*rep.ast, Ast::Group(group)
-                if group.capture_index().is_some() && !has_group(&group.ast)))
+                if group.capture_index().is_some()
+                    && (!has_group(&group.ast) || (!nested && !sets_flags(&group.ast)))))
 }
 
-fn has_candidate(ast: &Ast) -> bool {
+fn has_candidate(ast: &Ast, nested: bool) -> bool {
     match ast {
-        Ast::Repetition(rep) => is_candidate(rep) || has_candidate(&rep.ast),
-        Ast::Group(group) => has_candidate(&group.ast),
-        Ast::Alternation(alt) => alt.asts.iter().any(has_candidate),
-        Ast::Concat(concat) => concat.asts.iter().any(has_candidate),
+        Ast::Repetition(rep) => is_candidate(rep, nested) || has_candidate(&rep.ast, true),
+        Ast::Group(group) => has_candidate(&group.ast, nested),
+        Ast::Alternation(alt) => alt.asts.iter().any(|a| has_candidate(a, nested)),
+        Ast::Concat(concat) => concat.asts.iter().any(|a| has_candidate(a, nested)),
         _ => false,
     }
 }
@@ -412,22 +427,26 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_a_counted_repeat_of_a_plain_capture_group_as_the_star_loop() {
+    fn rewrites_a_counted_repeat_of_a_capture_group_as_the_star_loop() {
         assert_eq!(rewritten("(a*){2,}b").as_deref(), Some(r"(?:(?:a*)*())b"));
         assert_eq!(rewritten("(b|){3,}").as_deref(), Some(r"(?:(?:b|)*())"));
+        // A group inside it is copied too (#6347): the loop copy and the exit each hold one.
+        assert_eq!(
+            rewritten("((a)*){2,}b").as_deref(),
+            Some(r"(?:(?:(a)*)*(([^\s\S])*))b")
+        );
     }
 
     #[test]
     fn leaves_every_other_repeat_alone() {
-        // No group, a body that cannot match empty, a lazy repeat, a counted repeat from 2 up
-        // over a body with a group inside it, a bounded one, an assertion in the body, and `U`.
+        // No group, a body that cannot match empty, a lazy repeat, a counted repeat from 2 up over
+        // a group that is not a capture group, a bounded one, an assertion in the body, and `U`.
         for pattern in [
             "a*b",
             "(?:a*)*b",
             "(a+)*b",
             "(a*)*?b",
             "(?:(a*)){2,}b",
-            "((a)*){2,}b",
             "(a*){0,5}b",
             "(a|$)*",
             r"(a|\b)*b",
