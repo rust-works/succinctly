@@ -358,6 +358,17 @@ fn real_output_infinite_float(_negative: bool) -> String {
     "null".to_string()
 }
 
+/// jq's own output for an infinite `Float` (#6319): the `DBL_MAX` text, not `null`.
+///
+/// `null` is yq's rule ([`real_output_infinite_float`]) and RFC 8259's, but jq 1.7.1 prints a
+/// computed infinity (`infinite`, an arithmetic overflow) as `1.7976931348623157e+308` and
+/// `-1.7976931348623157e+308`, which is what the CLI's own printer (`print_owned_json`) has always
+/// written. This streamer is reached for an owned answer through `GenericResult::stream_json`, so
+/// the two had to agree: `[1e1000] | map(.)|sort` is `[1E+1000]` in jq and printed `[null]` here.
+fn jq_output_infinite_float(negative: bool) -> String {
+    infinite_float_preview_text(negative).to_string()
+}
+
 /// The `yq`/real-output convention for an infinite `NumberLiteral` — same
 /// rule as [`real_output_infinite_float`], just for the sibling variant that
 /// also carries the document's raw source text (irrelevant here, since real
@@ -441,8 +452,8 @@ pub(crate) fn stream_owned_value_json_jq_preserve_input<W: core::fmt::Write>(
         sort_keys,
         write_json_body_jq,
         jq_bare_float_display,
-        real_output_infinite_float,
-        real_output_infinite_literal,
+        jq_output_infinite_float,
+        real_output_finite_literal,
         real_output_finite_literal,
         true,
     )
@@ -455,11 +466,12 @@ pub(crate) fn stream_owned_value_json_jq_preserve_input<W: core::fmt::Write>(
 /// text rather than RFC 8259's `null`).
 ///
 /// Shares [`stream_owned_value_json_jq`]'s escape table (`write_json_body_jq`)
-/// and finite-number canonicalization (`format_number_jq_compat`) — both
+/// and number canonicalization (`format_number_jq_compat`) — both
 /// already proven correct against real jq via the jq CLI's existing
 /// non-streaming `print_json`/`escape_json_string` path
-/// (`src/bin/succinctly/output.rs`) — but pairs them with real output's
-/// infinite-value rule (`null`, not a preview) and threads `current_indent`/
+/// (`src/bin/succinctly/output.rs`). An infinite value is jq's, not yq's (#6319): a computed
+/// infinity is the `DBL_MAX` text, and an overflowing literal is its canonical spelling
+/// (`1e1000` is `1E+1000`), where yq and RFC 8259 say `null`. It threads `current_indent`/
 /// `indent_spaces`/`sort_keys` through instead of hardcoding compact/false,
 /// so this can pretty-print and honor `-S` the way genuine output must.
 pub(crate) fn stream_owned_value_json_jq_output<W: core::fmt::Write>(
@@ -479,8 +491,8 @@ pub(crate) fn stream_owned_value_json_jq_output<W: core::fmt::Write>(
         sort_keys,
         write_json_body_jq,
         jq_bare_float_display,
-        real_output_infinite_float,
-        real_output_infinite_literal,
+        jq_output_infinite_float,
+        format_number_jq_compat,
         format_number_jq_compat,
         true,
     )
