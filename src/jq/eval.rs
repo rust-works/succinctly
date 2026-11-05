@@ -27933,12 +27933,18 @@ impl<'h> RegexCaptures<'h> {
                 .copies
                 .iter()
                 .map(|copies| {
-                    copies.iter().rev().find_map(|&i| {
-                        caps.get(i).map(|m| RegexMatch {
+                    // The copy the match set last. They run in the order of the text they match, so
+                    // it is the one that starts last, then ends last; where two cover the same span
+                    // the one numbered later wins, as the exit's empty copy over the loop's (#6332:
+                    // a repeat around the copies runs a lower-numbered one again after a higher).
+                    copies
+                        .iter()
+                        .filter_map(|&i| caps.get(i).map(|m| (m.start(), m.end(), i, m)))
+                        .max_by_key(|&(start, end, i, _)| (start, end, i))
+                        .map(|(_, _, _, m)| RegexMatch {
                             text: m.as_str(),
                             start: m.start(),
                         })
-                    })
                 })
                 .collect(),
         )
@@ -33077,10 +33083,10 @@ fn build_regex_uncached<S: EvalSemantics>(
     // rewritten pattern. The rewrite keeps every character, class and escape of the pattern, so
     // one the crate compiles stands for the pattern; one it refuses (its size limit) leaves the
     // pattern to compile as written, with the crate's own error if it has one.
-    let rewritten = (S::TAG != EvalTag::Yq)
+    let capture = (S::TAG != EvalTag::Yq)
         .then(|| super::onig_capture_loop::rewrite(&pattern))
         .flatten()
-        .and_then(|mut groups| {
+        .map(|mut groups| {
             // #6305: the repeated group's own loop copy is now a plain `(?:X)*`, which the #6106
             // rewrite can read (the group itself was a body with a capture group, which it
             // cannot): it leaves that loop where Oniguruma does. It writes no group, so the
@@ -33094,10 +33100,22 @@ fn build_regex_uncached<S: EvalSemantics>(
                     }
                 }
             }
+            groups
+        });
+    // #6332: a loop with a capture group in a way the plain rewrite would copy or drop is written
+    // with the group copied, and each copy is read back into the group (see `onig_loop`). It runs
+    // over the capture rewrite's pattern when there is one, composing the two readings; a result
+    // the crate refuses keeps what there was.
+    let grouped = (S::TAG != EvalTag::Yq && !longest)
+        .then(|| group_copies_engine(&pattern, capture.as_ref()))
+        .flatten();
+    let rewritten = grouped.or_else(|| {
+        capture.and_then(|groups| {
             let re = regex::Regex::new(&groups.pattern).ok()?;
             (re.captures_len() == groups.compiled_groups)
                 .then_some(RegexEngine::Rewritten { re, groups })
-        });
+        })
+    });
     // The pattern as written replaces the #6106 rewrite only when it compiles where the rewrite does
     // not (an engine limit). A pattern the crate refuses either way keeps its rewrite for
     // `fancy-regex` (#6128), and is refused in the words of the pattern as written.
@@ -33169,6 +33187,61 @@ fn empty_match_is_position_free(pattern: &str) -> bool {
     ast::parse::Parser::new()
         .parse(pattern)
         .is_ok_and(|ast| assertion_free(&ast))
+}
+
+/// The engine for `pattern` written by the loop rewrite with its groups copied (#6332), or `None`
+/// when no loop needs it or the crate refuses the result. It runs over the capture rewrite's
+/// pattern when there is one (`base`, #6069), composing the two readings.
+#[cfg(feature = "regex")]
+fn group_copies_engine(
+    pattern: &str,
+    base: Option<&super::onig_capture_loop::LoopRewrite>,
+) -> Option<RegexEngine> {
+    let copied = super::onig_loop::rewrite_with_groups(
+        base.map_or(pattern, |groups| groups.pattern.as_str()),
+    )?;
+    let re = regex::Regex::new(&copied.pattern).ok()?;
+    (re.captures_len() == copied.compiled_groups).then_some(())?;
+    let groups = compose_group_copies(base, copied)?;
+    Some(RegexEngine::Rewritten { re, groups })
+}
+
+/// The groups of the pattern `copied` was written from, read back from its copies (#6332). When
+/// `base` (the capture rewrite of #6069) wrote that pattern, each of its groups is read through the
+/// copies `base` made of the original's; otherwise the pattern is the original.
+#[cfg(feature = "regex")]
+fn compose_group_copies(
+    base: Option<&super::onig_capture_loop::LoopRewrite>,
+    copied: super::onig_loop::GroupRewrite,
+) -> Option<super::onig_capture_loop::LoopRewrite> {
+    let (names, copies) = match base {
+        Some(base) => (
+            base.names.clone(),
+            base.copies
+                .iter()
+                .map(|through| {
+                    through
+                        .iter()
+                        .flat_map(|&group| copied.copies.get(group).into_iter().flatten().copied())
+                        .collect::<Box<[usize]>>()
+                })
+                .collect::<Vec<_>>(),
+        ),
+        None => (
+            copied.names.clone().into_boxed_slice(),
+            copied
+                .copies
+                .iter()
+                .map(|group| group.as_slice().into())
+                .collect(),
+        ),
+    };
+    Some(super::onig_capture_loop::LoopRewrite {
+        pattern: copied.pattern,
+        copies: copies.into_boxed_slice(),
+        names,
+        compiled_groups: copied.compiled_groups,
+    })
 }
 
 /// The `regex` crate's compilation of `pattern`, guarded by [`guard_prefix_lifting`] (#6134). A
@@ -139056,6 +139129,39 @@ mod tests {
             .expect("some depth nests the rewrite past the crate's limit");
         assert!(regex::Regex::new(&nested(depth)).is_ok());
         assert_eq!(compiled(&nested(depth)), guarded(nested(depth)));
+    }
+
+    /// #6332: a loop with a capture group the plain rewrite would copy or drop is written with the
+    /// groups copied, and each group lists its copies; beside a repeated group the capture rewrite
+    /// of #6069 writes too, and the two lists are composed.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn build_regex_lists_the_copies_of_a_loop_with_groups_6332() {
+        // What each group's copies are, its name, and the pattern, of the engine a pattern builds.
+        let rewritten = |pattern: &str, flags: Option<&str>| {
+            let engine = build_regex_uncached::<JqSemantics>(pattern, flags)
+                .expect(pattern)
+                .engine;
+            let RegexEngine::Rewritten { re, groups } = engine else {
+                panic!("{pattern}")
+            };
+            assert_eq!(re.captures_len(), groups.compiled_groups, "{pattern}");
+            let copies = groups.copies.iter().map(|c| c.to_vec()).collect::<Vec<_>>();
+            (copies, groups.names.to_vec(), groups.pattern)
+        };
+        // The loop writes the group twice and its empty way once, and the capture rewrite of #6069,
+        // which reads a repeated body that can match empty, its own empty iteration after that.
+        let (copies, names, _) = rewritten("(?:(?<x>a)|b*|c)+", None);
+        assert_eq!(copies, [vec![0], vec![1, 2, 3, 4]]);
+        assert_eq!(names, [None, Some("x".into())]);
+        // The repeated group `(a*)*` is captured in the capture rewrite's `E` alone, and the second
+        // group's copies are those of the loop rewrite, each read through the first's.
+        let (copies, names, _) = rewritten("(a*)*(?:(a)|b*|c)+", None);
+        assert_eq!(copies, [vec![0], vec![1], vec![2, 3, 4, 5]]);
+        assert_eq!(names.len(), 3);
+        // Under the flag `i` the switch in front stays there.
+        let (_, _, pattern) = rewritten("(?:(a)|b*|c)+", Some("i"));
+        assert!(pattern.starts_with("(?i)"));
     }
 
     /// #6134: an alternation whose branches are all sequences holding a repeat gets a first branch

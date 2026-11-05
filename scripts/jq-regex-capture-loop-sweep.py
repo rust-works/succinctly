@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Differential sweep for #6310: a capture group inside a greedy loop's body.
+"""Differential sweep for #6310 and #6332: a capture group inside a loop's body.
 
-    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--jq /usr/bin/jq]
+    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest] [--flags g] [--jq /usr/bin/jq]
 
 Oniguruma ends a greedy loop at the first iteration that matches nothing (#6106), and that holds when the
-body has a capture group in a way after its empty one (`(?:b*|(a))+`, #6310). This draws `--count` loops
+body has a capture group: after its empty way (`(?:b*|(a))+`, #6310), or before it, in it, or with its own
+empty way first (`(?:(a)|b*|c)+`, #6332). This draws `--count` loops
 at random from a pool of atoms (capture groups, nullable and consuming, among them), each with a body of
 two or three ways, one of 13 quantifiers, a plain or capturing group around it, and sometimes a prefix or
-a suffix. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
+a suffix, under `--flags`; with `--nest` half of them also stand inside an outer repeat or hold a repeated group of their own,
+which re-runs the copies of a group the rewrite wrote (#6332). Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
 captures are compared. It prints how many patterns SUBJECT fixed (BASELINE differed from jq, SUBJECT does
 not), broke (the reverse) and still differs on, and exits 1 when it broke one.
 
@@ -24,14 +26,18 @@ ATOMS = ["a", "b", "b*", "a*", "b?", "(a)", "(b*)", "(a|b)", "()", "(?:a|b*)", "
          "(a)?", "(?:(a)|b)", r"\w", r"(\w*)", "(a*)", "(?:|a)", "(?:a|)"]
 QUANTS = ["+", "*", "{2}", "{2,}", "{0,3}", "{1,2}", "{2,3}", "+?", "*?", "{2}?", "{2,}?", "{2,3}?",
           "{0,2}?"]
+NESTED = ["(?:b*|(a))+", "(?:(a)|b?){0,2}", "(?:(a)|b)*", "(b|)*", "(?:a|(b))+?"]
+OUTER = ["*", "+", "{2}", "{0,3}", "{2,}?", "{2}?", "{1,2}"]
 SUBJECTS = ["ba", "bab", "abab", "aab", "abba", "baab", "aaa", "bbb", "cba", "abc"]
-PROGRAM = ('.[] as $p | %s[] as $s | [$p,$s,(try ([$s|match($p;"g")|[.offset,.string,'
+PROGRAM = ('.[] as $p | %s[] as $s | [$p,$s,(try ([$s|match($p;$flags)|[.offset,.string,'
            '(.captures|map(.string))]]) catch "ERR")]' % json.dumps(SUBJECTS))
 
 
-def patterns(count, rng):
+def patterns(count, rng, nest=False):
+    pool = ATOMS + (NESTED if nest else [])
+
     def way():
-        return "".join(rng.choice(ATOMS) for _ in range(rng.choice([1, 1, 1, 2])))
+        return "".join(rng.choice(pool) for _ in range(rng.choice([1, 1, 1, 2])))
 
     out = set()
     while len(out) < count:
@@ -44,24 +50,27 @@ def patterns(count, rng):
             pattern = "x?" + pattern
         elif r < 0.4:
             pattern = "(?:" + pattern + ")(b)"
+        if nest and rng.random() < 0.5:
+            pattern = rng.choice(["(?:%s)%s", "(%s)%s"]) % (pattern, rng.choice(OUTER))
         out.add(pattern)
     return sorted(out)
 
 
-def run(cmd, plist):
-    r = subprocess.run(cmd + ["-c", PROGRAM], input=json.dumps(plist), capture_output=True, text=True)
+def run(cmd, plist, flags="g"):
+    r = subprocess.run(cmd + ["-c", "--arg", "flags", flags, PROGRAM], input=json.dumps(plist),
+                       capture_output=True, text=True)
     return r.stdout.splitlines() if r.returncode == 0 else None
 
 
-def answers(cmd, plist):
+def answers(cmd, plist, flags="g"):
     out = {}
     for i in range(0, len(plist), 200):
         chunk = plist[i:i + 200]
-        lines = run(cmd, chunk)
+        lines = run(cmd, chunk, flags)
         if lines is None:
             lines = []
             for p in chunk:
-                lines += run(cmd, [p]) or []
+                lines += run(cmd, [p], flags) or []
         for line in lines:
             row = json.loads(line)
             out[(row[0], row[1])] = row[2]
@@ -74,12 +83,14 @@ def main():
     ap.add_argument("baseline")
     ap.add_argument("--count", type=int, default=5000)
     ap.add_argument("--seed", type=int, default=2)
+    ap.add_argument("--nest", action="store_true", help="also nest loops inside repeats")
+    ap.add_argument("--flags", default="g", help="the match flags (`gi`: case folding)")
     ap.add_argument("--jq", default="/usr/bin/jq")
     args = ap.parse_args()
-    plist = patterns(args.count, random.Random(args.seed))
-    ref = answers([args.jq], plist)
-    base = answers([args.baseline, "jq"], plist)
-    subj = answers([args.subject, "jq"], plist)
+    plist = patterns(args.count, random.Random(args.seed), args.nest)
+    ref = answers([args.jq], plist, args.flags)
+    base = answers([args.baseline, "jq"], plist, args.flags)
+    subj = answers([args.subject, "jq"], plist, args.flags)
     keys = [k for k in ref if k in base and k in subj]
     fixed = {k[0] for k in keys if base[k] != ref[k] and subj[k] == ref[k]}
     broke = {k[0] for k in keys if base[k] == ref[k] and subj[k] != ref[k]}
