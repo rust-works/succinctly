@@ -9088,6 +9088,16 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::ToBoolean));
         }
 
+        // #6081: yq's `eval`, which parses a string at run time. jq has no such builtin, so the
+        // jq-mode parser leaves the name undefined.
+        if self.mode == ParserMode::Yq && self.matches_keyword("eval") {
+            let keyword_start = self.pos;
+            self.consume_keyword("eval");
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|expr| Builtin::EvalExpr(Box::new(expr))));
+        }
+
         // Phase 22: File operations (yq)
         if self.matches_keyword("load") {
             let keyword_start = self.pos;
@@ -15854,6 +15864,7 @@ mod tests {
             "first",
             "flatten",
             "foot_comment",
+            "eval",
             "format_datetime",
             "from_entries",
             "from_json",
