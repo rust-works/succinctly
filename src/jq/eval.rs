@@ -101195,12 +101195,11 @@ fn format_strftime(
     // `%I`/`%r`/`%l` all need the 12-hour form; computed once rather than
     // three times, matching the abbreviated weekday/month arrays' own
     // extraction just below.
-    let hour12 = if hour == 0 {
-        12
-    } else if hour > 12 {
-        hour - 12
-    } else {
-        hour
+    // #6331: the libc's `tm_hour % 12`, 12 for a multiple of 12, with C's sign (an hour outside
+    // 0-23 comes only from a hand-built broken-down time).
+    let hour12 = match hour % 12 {
+        0 => 12,
+        rest => rest,
     };
     const WEEKDAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const WEEKDAY_FULL: [&str; 7] = [
