@@ -29237,6 +29237,14 @@ fn translate_posix_brackets_scan(
                 // give a loop (`(?:b(?#)*|a)+`), so the comment is left out of what they read.
                 // Where nothing repeatable stands before it (the start of a body, a `|`, a quantifier
                 // already) it is kept, as it always was.
+                // Nothing stands before a comment at the start of a body or after a `|`, so a repeat
+                // operator after it has no target in jq, whatever the flags put before it for the
+                // crate (`(?i)(?#c)*` is read by the crate as a repeat of the comment, #6258).
+                if (i == body_start || after_pipe) && repeat_follows_comments(&chars, end) {
+                    return Err(EvalError::new(
+                        "invalid regex: target of repeat operator is not specified",
+                    ));
+                }
                 if check_repetition
                     && i != body_start
                     && !after_pipe
