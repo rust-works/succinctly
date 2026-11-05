@@ -30256,9 +30256,10 @@ fn rewrite_onig_escape(
 /// is `too long wide-char value`. With at least one digit and a closing brace the escape is that code
 /// point, which the engine refuses as `invalid code point value` from U+140000 outside a class and
 /// from U+200000 inside one, and which matches nothing when it is a surrogate or past U+10FFFF
-/// (`\x{D800}`, `\o{4200000}`: no error). With at least one digit and no brace the escape is
-/// `invalid code point value` (`\o{101`, `\o{1x}`). With no digit it is the letter `o`, and the
-/// brace after it is read as it would be after any letter (`\o{ 1}`, `\o{}`).
+/// (`\x{D800}`, `\o{4200000}`: no error), except as an end of a range in a class, which is left to the
+/// crate's refusal. With at least one digit and no brace the escape is `invalid code point value`
+/// (`\o{101`, `\o{1x}`). With no digit it is the letter `o`, and the brace after it is read as it
+/// would be after any letter (`\o{ 1}`, `\o{}`).
 #[cfg(feature = "regex")]
 fn octal_brace_escape(
     chars: &[char],
@@ -30295,7 +30296,16 @@ fn octal_brace_escape(
     let used = at + 1 - i;
     let text = match u32::try_from(value).ok().and_then(char::from_u32) {
         Some(c) => regex_char(u32::from(c)),
-        // A surrogate or a value past U+10FFFF names no character the crate can write.
+        // A surrogate or a value past U+10FFFF names no character the crate can write. As the end
+        // of a range in a class jq clamps the range (`[a-\o{154000}]` runs to U+D7FF), which is
+        // left to the crate's refusal rather than read as an empty set.
+        None if in_class
+            && (chars.get(i.wrapping_sub(1)) == Some(&'-')
+                || (chars.get(i + used) == Some(&'-')
+                    && chars.get(i + used + 1).is_some_and(|c| *c != ']'))) =>
+        {
+            return Ok(None);
+        }
         None => NEVER_MATCHES.to_string(),
     };
     Ok(Some((text, used)))

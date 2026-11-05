@@ -78,3 +78,20 @@ fn a_malformed_octal_brace_escape_is_refused_as_jq_does_6248() -> Result<()> {
     }
     Ok(())
 }
+
+/// A surrogate or a value past U+10FFFF as an end of a range in a class: jq clamps the range
+/// (`[a-\o{154000}]` runs to U+D7FF), which is not reproduced. It stays refused, not read as an empty
+/// set that would answer `[]` where jq answers.
+#[test]
+fn a_range_ending_in_a_non_character_octal_escape_stays_refused_6248() -> Result<()> {
+    for pattern in [
+        r"[a-\o{154000}]",
+        r"[\o{154000}-z]",
+        r"[\o{101}-\o{154000}]",
+        r"[a-\o{4200000}]",
+    ] {
+        let (stdout, _, status) = matches(pattern)?;
+        assert_eq!((stdout.as_str(), status), ("", 5), "{pattern}");
+    }
+    Ok(())
+}

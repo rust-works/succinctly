@@ -7437,6 +7437,8 @@ The set was captured from jq 1.7.1 over every ASCII character.
 The `regex` crate refused most of them, and read `\v` as a vertical tab (`"v" | test("\\v")` is `true` in jq).
 `\g` and `\k` are the letter only where no `<` or `'` follows: `\g<n>` calls a group and `\k<n>` is a back-reference.
 `\o` is the letter only where no `{` follows: `\o{101}` is an octal escape, which is read since #6248.
+A surrogate or a value past U+10FFFF as an end of a range in a class (`[a-\o{154000}]`) is still refused: jq clamps the range to the characters it can hold, and this does not.
+The same escape with `\x{..}` (`\x{D800}`, `\x{110000}`, a ninth digit, a missing brace) is not read as jq reads it either (#6251).
 `\x` is not in the set: jq reads hex digits after it, and a lone `\x` at the end of a pattern is the letter while `\xZ` matches nothing, which this does not reproduce (it stays the crate's error).
 Pinned in `tests/jq_cli/i6080.rs`.
 A Python-style group (`(?P<n>a)`, `(?P=n)`, `(?P>n)`) is an error in jq (`undefined group option`), and the `regex` crate would accept the first.
