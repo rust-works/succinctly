@@ -51226,17 +51226,22 @@ fn select_reads_key(expr: &Expr) -> bool {
 /// or a `key` stands somewhere this cannot name -- the condition then runs as it always did.
 ///
 /// A `key` counts where the condition's own input reaches it: bare, in a comparison, an arithmetic
-/// operand, `and`/`or`/`//`, a comma, parentheses, and the head of a pipe. A `key` after the head
+/// operand, `and`/`or`/`//`, a comma, parentheses, an `as` source or body, an `if` and its branches,
+/// and the head of a pipe. A `key` after the head
 /// of a pipe, or inside any other construct, names another node's key.
 fn bind_select_key(cond: &Expr, frame: &Frame) -> Option<Expr> {
+    // The position first: only a program that holds a `select` over `key` has one (the gate in
+    // [`Frame::enter`]), so every other select returns here without walking its condition.
+    let key = match frame.at.as_ref()?.last()? {
+        Expr::Field(name) => Literal::String(name.as_str().into()),
+        // A negative index is not the node's key (`.l[-1]` is key 2 of three); the array's length
+        // is not in view here, so the condition runs unbound.
+        Expr::Index { idx, key: None } if *idx >= 0 => Literal::Int(*idx),
+        _ => return None,
+    };
     if !contains_builtin(cond, |b| matches!(b, Builtin::Key)) {
         return None;
     }
-    let key = match frame.at.as_ref()?.last()? {
-        Expr::Field(name) => Literal::String(name.as_str().into()),
-        Expr::Index { idx, key: None } => Literal::Int(*idx),
-        _ => return None,
-    };
     fn bind(expr: &Expr, key: &Literal) -> Option<Expr> {
         if !contains_builtin(expr, |b| matches!(b, Builtin::Key)) {
             return Some(expr.clone());
@@ -51264,7 +51269,9 @@ fn bind_select_key(cond: &Expr, frame: &Frame) -> Option<Expr> {
             | Expr::Arithmetic { .. }
             | Expr::And(..)
             | Expr::Or(..)
-            | Expr::Alternative(..) => {
+            | Expr::Alternative(..)
+            | Expr::As { .. }
+            | Expr::If { .. } => {
                 let mut whole = true;
                 let bound = map_subexprs(expr, &mut |child| {
                     bind(child, key).unwrap_or_else(|| {

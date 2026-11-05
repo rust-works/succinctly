@@ -180,6 +180,26 @@ const ROWS: &[(&str, &str, &str)] = &[
         r"(.l[1:] | select(key == 0)) = 9",
         r#"{"l":["a","b","c"]}"#,
     ),
+    (
+        "a: {x: 1, y: {x: 2}}\n",
+        r#"(.. | select(. as $k | key == "x")) = 5"#,
+        r#"{"a":{"x":5,"y":{"x":5}}}"#,
+    ),
+    (
+        "a: {x: 1, y: {x: 2}}\n",
+        r#"(.. | select(. as $k | $k == 1 and key == "x")) = 5"#,
+        r#"{"a":{"x":5,"y":{"x":2}}}"#,
+    ),
+    (
+        "a: {x: 1, y: {x: 2}}\n",
+        r#"(.. | select(key as $k | $k == "x")) = 5"#,
+        r#"{"a":{"x":5,"y":{"x":5}}}"#,
+    ),
+    (
+        "l: [a, b, c]\n",
+        r#"(.l[-1] | select(key == -1)) = "X""#,
+        r#"{"l":["a","b","c"]}"#,
+    ),
 ];
 
 #[test]
@@ -188,6 +208,37 @@ fn a_select_over_key_in_a_write_target_reaches_the_matching_nodes_6206() -> Resu
         let (out, code) = run_yq_stdin(filter, input, &["-o=json", "-I=0"])?;
         assert_eq!(out.trim_end(), *expected, "{filter} on {input:?}");
         assert_eq!(code, 0, "{filter} on {input:?}");
+    }
+    Ok(())
+}
+
+/// Where the write is still not as yq's: (input, filter, this tool's answer, yq v4.53.3's). A `key` after
+/// the head of a pipe names another node's key, and a negative index in the path is not the node's key.
+const GAPS: &[(&str, &str, &str, &str)] = &[
+    (
+        "a: {x: 1, y: {x: 2}}\n",
+        r#"(.. | select(. as $k | $k | key == "x")) = 5"#,
+        r#"{"a":{"x":1,"y":{"x":2}}}"#,
+        r#"{"a":{"x":5,"y":{"x":5}}}"#,
+    ),
+    (
+        "l: [a, b, c]\n",
+        r#"(.l[-1] | select(key == 2)) = "X""#,
+        r#"{"l":["a","b","c"]}"#,
+        r#"{"l":["a","b","X"]}"#,
+    ),
+];
+
+#[test]
+fn a_key_the_binding_does_not_reach_still_differs_from_yq_6206() -> Result<()> {
+    for &(input, filter, ours, yq) in GAPS {
+        let (out, code) = run_yq_stdin(filter, input, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "{filter} on {input:?}");
+        assert_eq!(out.trim_end(), ours, "{filter} on {input:?}");
+        assert_ne!(
+            ours, yq,
+            "{filter}: no longer a gap, drop it from the table"
+        );
     }
     Ok(())
 }
