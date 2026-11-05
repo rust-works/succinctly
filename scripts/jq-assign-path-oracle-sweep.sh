@@ -195,29 +195,39 @@ flaky=0
 # macOS's /bin/bash 3.2 sometimes reads a child's exit status as 0 after `x="$(cmd)"` (#5997): on a
 # loaded machine about one command substitution in 140,000, always a failed child read as a
 # success (a wrapper that wrote the child's own status to a file saw 5 where the shell saw 0, 16
-# times in 110 sweeps; bash 5.1 on Linux lost none in 1.7 million). No case here prints to stderr
-# and succeeds, so a run that exits 0 with text on stderr lost its status and is run again.
-# `lost_status` counts them; a run that still reads 0 after the retries is recorded as it came.
+# times in 110 sweeps; bash 5.1 on Linux lost none in 1.7 million). In this sweep every failing
+# case prints a message and no succeeding case prints anything (all 10,248 rows of a recording:
+# 5,848 failures, each with stderr text; 4,400 successes, none), so a run that exits 0 with text on
+# stderr lost its status and is run again, up to twice more. `lost_status` counts the reruns. A case
+# that still reads 0 after the third run is recorded as it came, and says so. The check does not
+# see a lost status on a failure that prints nothing; there is none in this sweep, and a case that
+# adds one (a `halt`, an `-e` exit) must not rely on this. `scripts/test_assign_sweep_capture.py`
+# drives `capture_case` with a child that loses its status.
 lost_status=0
 
 # capture_case OUT_VAR CODE_VAR ERR_FILE ERR_VAR cmd...: runs `cmd` with its stderr in ERR_FILE,
-# leaving its stdout and exit status in OUT_VAR and CODE_VAR and the stderr text in ERR_VAR.
+# leaving its stdout and exit status in OUT_VAR and CODE_VAR and the stderr text in ERR_VAR. The
+# locals are named so that no caller's variable collides with them.
 capture_case() {
-  local out_var="$1" code_var="$2" err_file="$3" err_var="$4"
+  local _cc_out_var="$1" _cc_code_var="$2" _cc_err_file="$3" _cc_err_var="$4"
   shift 4
-  local attempt out code err
-  for attempt in 1 2 3; do
-    out="$("$@" 2>"$err_file")" && code=0 || code=$?
-    err="$(cat "$err_file")"
-    if [[ "$code" != 0 || -z "$err" ]]; then
+  local _cc_attempt _cc_out _cc_code _cc_err
+  for _cc_attempt in 1 2 3; do
+    _cc_out="$("$@" 2>"$_cc_err_file")" && _cc_code=0 || _cc_code=$?
+    _cc_err="$(cat "$_cc_err_file")"
+    if [[ "$_cc_code" != 0 || -z "$_cc_err" ]]; then
       break
     fi
-    lost_status=$((lost_status + 1))
-    echo "lost-status: exit 0 with stderr from $1 (attempt $attempt of 3), run again" >&2
+    if ((_cc_attempt < 3)); then
+      lost_status=$((lost_status + 1))
+      echo "lost-status: exit 0 with stderr from $1 (run $_cc_attempt of 3), run again" >&2
+    else
+      echo "lost-status: exit 0 with stderr from $1 on all 3 runs, recorded as exit 0" >&2
+    fi
   done
-  printf -v "$out_var" '%s' "$out"
-  printf -v "$code_var" '%s' "$code"
-  printf -v "$err_var" '%s' "$err"
+  printf -v "$_cc_out_var" '%s' "$_cc_out"
+  printf -v "$_cc_code_var" '%s' "$_cc_code"
+  printf -v "$_cc_err_var" '%s' "$_cc_err"
 }
 
 exec_case() {
