@@ -492,7 +492,7 @@ Two interactions were left open by #1709 itself (the second since closed by #200
    the same stdout and exit code as yq.
    Since [#808](https://github.com/rust-works/succinctly/issues/808) `--colors` streams, and `--colors -0` checks one result at a time like uncolored `-0`: each clean result is colorized as it is flushed, which is the same text as that slice of the whole colored render, because the colorizer resets its lexer state at each result boundary.
 
-### Anchor-on-alias at document-root level — rule 4(b) (the `---` shape below is no longer a divergence, #6276)
+### Anchor-on-alias at document-root level — rule 4(b)
 
 An alias node carrying its own `&anchor`/`!tag` (`&a *b`) is invalid per the YAML 1.2
 grammar — an alias node has no properties of its own. Real yq and PyYAML both confirm this
@@ -509,7 +509,7 @@ succinctly's default loader now rejects this uniformly ([#1374](https://github.c
 for the ordinary shape above this is bug-for-bug fidelity, not a divergence: real yq errors,
 succinctly errors.
 
-The one shape where this *is* a deliberate divergence is at document-root level, across a
+The one shape where this *was* a deliberate divergence (until #6276, see the end of this section) is at document-root level, across a
 `---` multi-document separator. There, real yq does not error at all — it silently emits
 corrupted output instead, concatenating the first document's scalar value with the literal
 *text* of the following `---`-anchor-alias line:
@@ -5919,6 +5919,8 @@ What the streaming route reproduces, all measured against pinned v4.53.3:
   The input is indexed with that one break cut out and the marker kept (`yaml_runner/leading_marker.rs`), so the line numbers of the nodes after it are one lower, as in yq.
   `--header-preprocess=false`, which reads `--- x` / `y` as `"x y"`, is not implemented.
   `load()` reads its file without the slurp, in yq and here.
+  `--front-matter` input is not glued (its own extraction runs first and was not captured against yq).
+  Blanks in front of the first marker and a second marker the pushed-back text starts with (`--- --- x`) are stripped as in yq.
   A run of leading bare `---` lines is one header in yq and several documents here (`---` / `---` / `x` is `"x"` in yq, `null` then `"x"` here);
 - a scalar root prints its head and *drops* its foot, a flow or block collection root
   prints both (`# lead\n42\n# foot` is `# lead\n42` in yq; the getter still answers

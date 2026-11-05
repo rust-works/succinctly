@@ -1140,6 +1140,13 @@ fn yaml_to_owned_value<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>) -> Re
     to_owned_yaml_cursor::<YqSemantics, _>(&cursor).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// Whether yq's header slurp runs on input number `at` of a run (#6276): on every file, except
+/// that `--eval-all` slurps the header of the first file only (`!dec.prefs.EvaluateTogether ||
+/// dec.firstFile`). The one definition for every route that gathers an input.
+fn glue_leading_marker_for(eval_all: bool, at: usize) -> bool {
+    !(eval_all && at > 0)
+}
+
 /// How an input with no document in it is read (#4099): yq reads no document from it, except that a
 /// run which read no document at all evaluates once against one empty document (`printf '' | yq
 /// '.a'` is `null`, `.a = 1` is `a: 1`, and so is `yq '.a' empty.yaml`). `None` is "skip this input".
@@ -1859,8 +1866,7 @@ fn gather_input_sources(
                 input_files,
                 at,
                 front_matter.is_some(),
-                // yq's `--eval-all` slurps the header of the first file only (#6276).
-                !(eval_all && at > 0),
+                glue_leading_marker_for(eval_all, at),
             ) else {
                 continue;
             };
@@ -11770,7 +11776,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         &input_files,
                         file_index,
                         args.front_matter.is_some(),
-                        !(args.eval_all && file_index > 0),
+                        glue_leading_marker_for(args.eval_all, file_index),
                     ) {
                         Some(read) => read,
                         None => continue,
@@ -12589,7 +12595,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 &input_files,
                 file_index,
                 args.front_matter.is_some(),
-                !(args.eval_all && file_index > 0),
+                glue_leading_marker_for(args.eval_all, file_index),
             ) else {
                 continue;
             };

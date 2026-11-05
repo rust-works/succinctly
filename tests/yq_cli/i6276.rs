@@ -39,6 +39,12 @@ fn test_the_break_after_a_marker_line_is_lost_so_its_scalar_runs_on_6276() -> Re
         ("--- ? x\ny\n: 1\n", "{\"xy\":1}"),
         ("--- - x\n  y\n", "[\"x  y\"]"),
         ("--- x\ny\n...\n", "\"xy\""),
+        // The blanks before the marker are not in yq's stream, and a second marker is stripped.
+        ("  --- x\ny\n", "\"xy\""),
+        ("  --- x\n  y\n", "\"x  y\""),
+        ("\t--- x\ny\n", "\"xy\""),
+        ("--- --- x\ny\n", "\"xy\""),
+        ("--- --- x\ny\nz\n", "\"xyz\""),
     ] {
         assert_eq!(json_of(doc)?, expected, "{doc:?}");
     }
@@ -97,6 +103,21 @@ fn test_what_yq_does_not_glue_is_read_as_before_6276() -> Result<()> {
         ("--- x\n", "\"x\""),
         // Between flow tokens a break is only white space whether or not it is lost.
         ("--- [a\n, x\ny]\n", "[\"a\",\"x y\"]"),
+    ] {
+        assert_eq!(json_of(doc)?, expected, "{doc:?}");
+    }
+    Ok(())
+}
+
+/// Recorded divergence (#6349): yq sets every leading bare `---` aside as one header and reads one
+/// document; here each is a document start, so the run is several documents. Pinned to what
+/// succinctly answers today; delete a row when it starts to fail.
+#[test]
+fn test_recorded_divergence_a_run_of_bare_leading_markers_is_several_documents_6349() -> Result<()>
+{
+    for (doc, expected) in [
+        ("---\n---\nx\n", "null\n\"x\""),
+        ("---\n--- x\ny\n", "null\n\"xy\""),
     ] {
         assert_eq!(json_of(doc)?, expected, "{doc:?}");
     }

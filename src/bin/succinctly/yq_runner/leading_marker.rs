@@ -19,9 +19,11 @@
 //! eats a second break) or the start of an ordinary line (`--- x⏎--- y` is the scalar
 //! `x--- y`, and `--- a: 1⏎b: 2` is the refused `a: 1b: 2`).
 //!
-//! `succinctly yq` indexes the text it is given, so this port keeps the marker and removes only
-//! the break yq loses: `--- x⏎y` is indexed as `--- xy⏎`. [`glue_after_leading_marker_text`]
-//! returns the bytes with those breaks (`\n`, or `\r\n` as a pair) cut out.
+//! `succinctly yq` indexes the text it is given, so this port keeps the first marker and cuts
+//! out what yq's stream no longer holds: the break yq loses (`--- x⏎y` is indexed as `--- xy⏎`;
+//! a `\n`, or a `\r\n` as a pair), the blanks in front of the marker (`␠␠--- x⏎y` is `xy` in
+//! yq, a scalar `--- xy` if left), and every later marker the pushed-back text starts with.
+//! [`glue_after_leading_marker_text`] returns the bytes with those spans cut out.
 //!
 //! What it leaves alone, because yq's own loop does:
 //!
@@ -35,19 +37,22 @@ fn is_re2_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | 0x0c | b'\r')
 }
 
-/// `strings.TrimSpace(line) == ""` or a bare `---` after it: the two lines yq sets aside whole
-/// by their trimmed text. Go trims by Unicode white space, which is `char::is_whitespace`.
-fn trimmed(line: &[u8]) -> String {
-    String::from_utf8_lossy(line).trim().to_owned()
+/// Whether a line that starts with `first` can be one yq's loop sets aside (white space, `#`,
+/// `%YAML`, `---`, or a non-ASCII byte, which may start Unicode white space such as U+00A0).
+/// Every other first byte makes the line content, and the loop ends there, so an input that
+/// starts on one needs neither a scan nor a copy of its first line. The one definition of the
+/// early exit in [`glue_after_leading_marker_text`] and of its test.
+fn may_start_header_line(first: u8) -> bool {
+    is_re2_space(first) || matches!(first, b'#' | b'%' | b'-' | 0x0b) || first >= 0x80
 }
 
 /// What yq's loop does with one line (newline already removed).
 enum Line {
     /// `^\s*---\s*$` on the trimmed line: set aside whole, keeps its break.
     Separator,
-    /// `^\s*---\s+` on the line: the marker goes, the remainder (starting at this offset of the
-    /// line) is pushed back without a break.
-    MarkerWithText(usize),
+    /// `^\s*---\s+` on the line: `ws` bytes of blanks, the marker, then blanks up to `end`, where
+    /// the remainder starts. The remainder is pushed back without a break.
+    MarkerWithText { ws: usize, end: usize },
     /// A comment, a `%YAML` directive or a blank line: set aside whole.
     Header,
     /// Anything else: the head of the input ends here.
@@ -55,33 +60,40 @@ enum Line {
 }
 
 fn classify(line: &[u8]) -> Line {
-    if trimmed(line) == "---" {
+    // Go trims by Unicode white space, which is `char::is_whitespace`. Once per line.
+    let text = String::from_utf8_lossy(line);
+    let trimmed = text.trim();
+    if trimmed == "---" {
         return Line::Separator;
     }
-    let mut at = 0;
-    while line.get(at).copied().is_some_and(is_re2_space) {
-        at += 1;
+    let mut ws = 0;
+    while line.get(ws).copied().is_some_and(is_re2_space) {
+        ws += 1;
     }
-    if line[at..].starts_with(b"---") && line.get(at + 3).copied().is_some_and(is_re2_space) {
-        let mut end = at + 3;
+    if line[ws..].starts_with(b"---") && line.get(ws + 3).copied().is_some_and(is_re2_space) {
+        let mut end = ws + 3;
         while line.get(end).copied().is_some_and(is_re2_space) {
             end += 1;
         }
-        return Line::MarkerWithText(end);
+        return Line::MarkerWithText { ws, end };
     }
-    if line[at..].starts_with(b"#") || line[at..].starts_with(b"%YAML") || trimmed(line).is_empty()
-    {
+    if line[ws..].starts_with(b"#") || line[ws..].starts_with(b"%YAML") || trimmed.is_empty() {
         return Line::Header;
     }
     Line::Content
 }
 
-/// The spans of `text` (a `\n` or a `\r\n`) that yq's header loop loses, in order.
-fn lost_breaks(text: &[u8]) -> Vec<std::ops::Range<usize>> {
-    let mut lost = Vec::new();
-    // The unread input is `pending` followed by `text[pos..]`.
+/// The spans of `text` that yq's stream no longer holds, in no particular order and possibly
+/// overlapping: the lost line breaks (a `\n` or a `\r\n`), the blanks before the first marker,
+/// and the later markers of a pushed-back line.
+fn cuts(text: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut cuts = Vec::new();
+    // The unread input is `pending` (whose bytes sit at `pending_at` in `text`, not always
+    // contiguously: a cut break lies between two pieces) followed by `text[pos..]`.
     let mut pos = 0;
     let mut pending: Vec<u8> = Vec::new();
+    let mut pending_at: Vec<usize> = Vec::new();
+    let mut kept_marker = false;
     loop {
         let rest = &text[pos..];
         if pending.is_empty() && rest.is_empty() {
@@ -92,12 +104,16 @@ fn lost_breaks(text: &[u8]) -> Vec<std::ops::Range<usize>> {
             Some(nl) => (&rest[..nl], Some(pos + nl)),
             None => (rest, None),
         };
+        let merged = !pending.is_empty();
         let mut line = std::mem::take(&mut pending);
+        let mut at = std::mem::take(&mut pending_at);
         line.extend_from_slice(physical);
+        at.extend(pos..pos + physical.len());
         // The `\r` of a `\r\n` is the last byte of the physical part (the pending part never ends
         // in one: a remainder is cut from a line whose `\r\n` was already taken off).
         let break_start = if break_at.is_some() && line.last() == Some(&b'\r') {
             line.pop();
+            at.pop();
             break_at.map(|nl| nl - 1)
         } else {
             break_at
@@ -105,44 +121,55 @@ fn lost_breaks(text: &[u8]) -> Vec<std::ops::Range<usize>> {
         pos += physical.len() + usize::from(break_at.is_some());
         match classify(&line) {
             Line::Separator | Line::Header => {}
-            Line::MarkerWithText(end) => {
+            Line::MarkerWithText { ws, end } => {
                 // A break with nothing after it glues nothing on: it stays, as the bytes read
                 // the same either way.
                 if let (Some(start), Some(nl)) = (break_start, break_at) {
                     if nl + 1 < text.len() {
-                        lost.push(start..nl + 1);
+                        cuts.push(start..nl + 1);
+                    }
+                }
+                if merged || kept_marker {
+                    // A marker the pushed-back text starts with: yq strips it too.
+                    cuts.push(at[0]..at[end - 1] + 1);
+                } else {
+                    // The first marker stays; the blanks before it are not in yq's stream.
+                    kept_marker = true;
+                    if ws > 0 {
+                        cuts.push(at[0]..at[ws - 1] + 1);
                     }
                 }
                 pending = line.split_off(end);
+                pending_at = at.split_off(end);
             }
             Line::Content => break,
         }
     }
-    lost
+    cuts
 }
 
-/// `text` with the line breaks yq's `--header-preprocess` loses after a leading `--- <text>` line
-/// cut out (#6276), or `None` when it loses none, which is every input that does not begin with
+/// `text` with what yq's `--header-preprocess` drops after a leading `--- <text>` line cut out
+/// (#6276), or `None` when it drops nothing, which is every input that does not begin with
 /// such a marker line.
 pub(super) fn glue_after_leading_marker_text(text: &[u8]) -> Option<Vec<u8>> {
     // The overwhelmingly common input starts on its content (`a: 1`, `{`, `[`, `"`): one byte
-    // settles it, so the first line is neither scanned nor copied. Only a line that can be
-    // header (white space, `#`, `%`, `-`, or a non-ASCII byte, which may start Unicode white
-    // space) needs the loop.
-    if !text.first().is_some_and(|&b| {
-        is_re2_space(b) || matches!(b, b'#' | b'%' | b'-') || b >= 0x80 || b == 0x0b
-    }) {
+    // settles it.
+    if !text.first().copied().is_some_and(may_start_header_line) {
         return None;
     }
-    let lost = lost_breaks(text);
-    if lost.is_empty() {
+    let mut cuts = cuts(text);
+    if cuts.is_empty() {
         return None;
     }
+    cuts.sort_by_key(|span| span.start);
     let mut out = Vec::with_capacity(text.len());
     let mut from = 0;
-    for span in lost {
-        out.extend_from_slice(&text[from..span.start]);
-        from = span.end;
+    for span in cuts {
+        // Spans can overlap (a marker straddling a cut break); `from` only moves forward.
+        if span.start > from {
+            out.extend_from_slice(&text[from..span.start]);
+        }
+        from = from.max(span.end);
     }
     out.extend_from_slice(&text[from..]);
     Some(out)
@@ -193,8 +220,17 @@ mod tests {
     }
 
     #[test]
-    fn a_remainder_that_is_a_marker_loses_the_next_break_too() {
-        assert_eq!(glued("--- --- x\ny\nz\n"), "--- --- xyz\n");
+    fn a_remainder_that_is_a_marker_is_stripped_and_loses_the_next_break_too() {
+        assert_eq!(glued("--- --- x\ny\nz\n"), "--- xyz\n");
+        // The second marker's blanks come from the next line.
+        assert_eq!(glued("--- ---\n x\ny\n"), "--- xy\n");
+    }
+
+    #[test]
+    fn blanks_before_the_first_marker_are_not_in_yqs_stream() {
+        assert_eq!(glued("  --- x\ny\n"), "--- xy\n");
+        assert_eq!(glued("\t--- x\n  y\n"), "--- x  y\n");
+        assert_eq!(glued("# c\n  --- x\ny\n"), "# c\n--- xy\n");
     }
 
     #[test]
@@ -220,18 +256,14 @@ mod tests {
         }
     }
 
-    /// The first-byte early exit in [`glue_after_leading_marker_text`] must never skip an input
-    /// the loop would cut from: every first byte it declines is a content line to the loop too.
+    /// The first-byte early exit must never skip an input the loop would cut from: after a first
+    /// byte it declines, the first line is content, so the marker line behind it is never read.
     #[test]
     fn the_first_byte_early_exit_agrees_with_the_loop() {
         for first in 0u8..=255 {
-            let text = [first, b'\n', b'y', b'\n'];
-            let early_exit = !(is_re2_space(first)
-                || matches!(first, b'#' | b'%' | b'-')
-                || first >= 0x80
-                || first == 0x0b);
-            if early_exit {
-                assert!(lost_breaks(&text).is_empty(), "first byte {first:#x}");
+            let text = [&[first, b'\n'][..], b"--- x\ny\n"].concat();
+            if !may_start_header_line(first) {
+                assert!(cuts(&text).is_empty(), "first byte {first:#x}");
             }
         }
         // A header line that is not a marker, then a marker line: the loop still finds it.
