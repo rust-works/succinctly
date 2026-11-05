@@ -7461,9 +7461,12 @@ It decides from the parsed node: an assertion (`^ $ \A \z \Z \G \b \B`, a look-a
 The rule was captured from jq 1.7.1 over 75,780 generated groups, and the scan agrees on all of them: `scripts/jq-regex-repeat-target-sweep.py SUBJECT` regenerates the sweep and compares (not part of the CI gate), and `tests/jq_cli/i6127.rs` pins hand-picked rows.
 Under the `x` flag these refusals read the pattern without the blanks and `#` comments the flag ignores (`\b *`, `^ +`, `(?: \B ){1,2}` are refused as `\b*`, `^+` and `(?:\B){1,2}` are), and `tests/jq_cli/i6215.rs` pins the rows (#6215).
 Two shapes still stand down under `x`: a pattern with an inline `(?x)`, and a quantifier right after a `(?#...)` comment (`(?#c)*`, `(?# c) *`), which jq refuses and the `regex` crate accepts.
+A `*`, `+` or `?` at the start of a branch (`*0`, `a| *b`, `(?: *a)`) is refused under `x` as without it, on the pattern without the blanks (#6249), and `tests/jq_cli/i6249.rs` pins the rows.
+What is left of #6249 is an inline `(?x)` written in the pattern (`(?x)*0`), which is a bare option group followed by an operator (#6181) and stands down with the rest.
 The check runs after the pattern's other refusals, so an error earlier in the pattern is the one reported.
 What jq's answer is for a pattern it does compile is the matcher's, not this check's: `"aBcb" | [match("(?:[ab]\\w|\\b\\b||c)*";"g") | .string]` is `["aB","","",""]` in jq, because an empty alternative ends the repeat (#6106).
-Under the `x` flag, or a pattern with an inline flag group naming `x`, both checks stand down, because the scan cannot see the mode's ignored blanks (it does skip its comments); `test(\"^ *\"; \"x\")` is an error in jq and `true` here.
+A pattern with an inline flag group naming `x` stands down from both checks, because the scan cannot see the mode's ignored blanks (it does skip its comments); `test(\"(?x)^ *\")` is an error in jq and `true` here.
+Under the `x` flag itself they run over the pattern without the blanks and comments (#6215, #6249).
 
 ## Possessive quantifiers (#5524, #6172)
 
