@@ -8164,10 +8164,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // `[!!str, 1]`, `a: !!str]`: `found character ']' that is not allowed in a YAML tag`). The
         // extent stops at the indicator for the lookaheads, which only want to know where the tag
         // ends; the parse refuses it. A space first (`[!!str ]`) is fine.
-        if matches!(
-            self.input.get(end),
-            Some(b',' | b'[' | b']' | b'{' | b'}')
-        ) {
+        if matches!(self.input.get(end), Some(b',' | b'[' | b']' | b'{' | b'}')) {
             return Err(YamlError::InvalidTag {
                 offset: end,
                 reason: "a flow indicator may not follow a tag without a space",
