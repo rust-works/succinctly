@@ -36164,23 +36164,30 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 // fix as `Shuffle` just above -- free here too, for the
                 // same reason.
                 let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
-                // #6202: yq reads the row nodes as they are, and an alias row (`*name`) is neither a
-                // sequence nor a mapping to it, whatever its anchor holds: `[*row, [c]]` is
-                // `sequence contains elements of  and !!seq types` (an alias has no tag), and an
-                // array of aliases `can only pivot elements of !!seq or !!map types, received `.
-                // The rows are compared by tag, as yq does, before any is copied.
-                if S::TAG == EvalTag::Yq && cursors.iter().any(|c| c.is_alias()) {
-                    if optional {
-                        return GenericResult::None;
-                    }
-                    let tags: Vec<String> = cursors
+                // #6202: yq compares the rows' tags before it copies any, and reads the nodes as they
+                // are: an alias row (`*name`) has no tag, so it is neither a sequence nor a mapping
+                // whatever its anchor holds. `[*row, [c]]` is `sequence contains elements of  and
+                // !!seq types`, an array of aliases or of scalars `can only pivot elements of !!seq
+                // or !!map types, received <tag>`, and so is an empty array (the tag is empty).
+                if S::TAG == EvalTag::Yq {
+                    let mut tags = cursors
                         .iter()
-                        .map(|c| yq_type_tag(&c.value(), Some(c.clone())))
-                        .collect();
-                    return GenericResult::Error(match tags.iter().find(|t| **t != tags[0]) {
-                        Some(other) => EvalError::yq_pivot_mixed(&tags[0], other),
-                        None => EvalError::yq_pivot_rows(&tags[0]),
-                    });
+                        .map(|c| yq_type_tag(&c.value(), Some(c.clone())));
+                    let first = tags.next().unwrap_or_default();
+                    let refusal = match tags.find(|tag| *tag != first) {
+                        Some(other) => Some(EvalError::yq_pivot_mixed(&first, &other)),
+                        None if first != "!!seq" && first != "!!map" => {
+                            Some(EvalError::yq_pivot_rows(&first))
+                        }
+                        None => None,
+                    };
+                    if let Some(error) = refusal {
+                        return if optional {
+                            GenericResult::None
+                        } else {
+                            GenericResult::Error(error)
+                        };
+                    }
                 }
                 let items: Vec<OwnedValue> =
                     owned_or_suppress!(to_owned_all_cursors::<S, _>(&cursors), optional);
@@ -36257,6 +36264,9 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 }
             } else if optional {
                 GenericResult::None
+            } else if S::TAG == EvalTag::Yq {
+                // #6202: yq's own wording (`pivot` is yq-only).
+                GenericResult::Error(EvalError::yq_pivot_node(&yq_type_tag(&value, cursor)))
             } else {
                 GenericResult::Error(EvalError::type_error(
                     "array",
