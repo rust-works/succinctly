@@ -454,21 +454,19 @@ impl Rewriter<'_> {
                 let mut items = Vec::with_capacity(alt.asts.len());
                 for way in &alt.asts {
                     // A way that is only a switch matches nothing, as an empty way does.
-                    let piece = if let Ast::Flags(set) = way {
-                        self.switch_open(set)?;
-                        empty_piece()
-                    } else {
-                        self.convert(way, listed)?
+                    let piece = match way {
+                        Ast::Flags(set) if self.switch_open(set)?.is_some() => empty_piece(),
+                        _ => self.convert(way, listed)?,
                     };
                     items.push(self.scoped(piece, &active)?);
-                    if let Ast::Concat(concat) = way {
-                        for item in &concat.asts {
-                            if let Ast::Flags(set) = item {
-                                active.push(self.switch_open(set)?);
-                            }
+                    let switches: &[Ast] = match way {
+                        Ast::Concat(concat) => &concat.asts,
+                        other => core::slice::from_ref(other),
+                    };
+                    for item in switches {
+                        if let Ast::Flags(set) = item {
+                            active.extend(self.switch_open(set)?);
                         }
-                    } else if let Ast::Flags(set) = way {
-                        active.push(self.switch_open(set)?);
                     }
                 }
                 self.alt(&items, listed)
@@ -482,8 +480,10 @@ impl Rewriter<'_> {
     fn convert_concat(&mut self, asts: &[Ast], listed: bool) -> Result<Piece, GiveUp> {
         let mut items = Vec::with_capacity(asts.len());
         for (at, ast) in asts.iter().enumerate() {
-            if let Ast::Flags(set) = ast {
-                let open = self.switch_open(set)?;
+            if let Some(open) = match ast {
+                Ast::Flags(set) => self.switch_open(set)?,
+                _ => None,
+            } {
                 items.push(empty_piece());
                 let rest = &asts[at + 1..];
                 if !rest.is_empty() {
@@ -498,16 +498,18 @@ impl Rewriter<'_> {
     }
 
     /// The opening of the flag group that stands for the switch `set` over what it reaches
-    /// (`(?i)` is `(?i:`..`)`). `U` swaps greedy and lazy, which the rewrite does not follow, and
-    /// `x` makes the text after it read as comments and blanks, which a closing parenthesis would
-    /// join to the last comment.
-    fn switch_open(&self, set: &ast::SetFlags) -> Result<String, GiveUp> {
-        if set.flags.flag_state(Flag::SwapGreed).is_some()
-            || set.flags.flag_state(Flag::IgnoreWhitespace) == Some(true)
-        {
+    /// (`(?i)` is `(?i:`..`)`), or `None` for a switch that cannot be scoped: `x` makes the text
+    /// after it blanks and comments, which a closing parenthesis would join to the last comment.
+    /// `U` swaps greedy and lazy, which the rewrite does not follow, so a pattern with it is left
+    /// as written.
+    fn switch_open(&self, set: &ast::SetFlags) -> Result<Option<String>, GiveUp> {
+        if set.flags.flag_state(Flag::SwapGreed).is_some() {
             return Err(GiveUp);
         }
-        Ok(format!("(?{}:", self.verbatim(&set.flags.span)))
+        if set.flags.flag_state(Flag::IgnoreWhitespace) == Some(true) {
+            return Ok(None);
+        }
+        Ok(Some(format!("(?{}:", self.verbatim(&set.flags.span))))
     }
 
     /// `piece` inside the flag groups `opens` (outermost first), each of its listed ways too.
