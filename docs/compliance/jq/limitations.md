@@ -7782,9 +7782,10 @@ These keep their loop as written, and still match longer than jq where the shape
   Over 3,346 generated patterns (a repeated capture group with `*`, `+`, `{0,}` or `{1,}`, on 19 strings under `g`), the 117 that differed from jq agree and none changed the other way.
   A repeat with a count of two or more is not a candidate of #6069 either, so its group keeps the crate's last non-empty iteration: `"abb" | [match("(b|){2,}$";"g") | .captures[0].string]` is `["",""]` in jq and `["b",""]` here.
 - **A body with a zero-width assertion** (`^`, `$`, `\b`, `\A`, `\z`): its empty way depends on where it stands, which the rewrite does not express.
-- **A body with a flag switch** (`(?i)` inside it): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and `["ba",""]` here.
-  The switch reaches every later way of the group, which the rewrite would move out of its reach.
-  A flag group (`(?i:b*)`) is rewritten.
+- **A body with a flag switch** (`(?i)` inside it) is rewritten with the switch scoped over what it reaches, as `(?i:..)` around the items after it and around every later way ([#6301](https://github.com/rust-works/succinctly/issues/6301)): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and here.
+  A differential over 13,056 cases (16 body shapes with `(?i)`, `(?-i)`, `(?s)`, `(?m)`, `(?i-s)`, `(?is)` and `(?i)(?s)` in each position, six loop forms, 17 strings) differed in 885 before and in none after.
+  A switch that names `x` or `U` still keeps its loop as written: `x` makes the text after it blanks and comments, which a closing parenthesis would join to the last comment, and `U` swaps greedy and lazy.
+  A lazy repeat over such a body keeps its loop too: whether Oniguruma unrolls it comes from an operation count that does not read a switch, so `"ca-" | match("(?:a?|(?i)\\w){2,}?"; "gn")` is left as it was.
 - **A body with syntax only `fancy-regex` reads** (a lookaround, an atomic group, a backreference, `\K`, `\G`, or a comment and a quantifier after a quantifier) keeps its loop, which `fancy-regex` then runs itself and mostly as jq does.
   Over 40,000 generated cases with such syntax in a loop body, 42 were fixed, none broken, and 2,356 differed as before, of three kinds.
   1,648 were `\K` as a bare alternative (`(?:\K|a)+`), a pattern jq refuses and succinctly accepted.

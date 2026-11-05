@@ -19,9 +19,11 @@
 //!
 //! A body whose ways are not listed here keeps its loop as written: one with a capture group (an
 //! empty iteration also sets the group, #6069), a zero-width assertion (its empty way depends on
-//! where it stands), or a flag switch. A loop over a capture group is still reached: the capture
-//! rewrite (`onig_capture_loop`) writes the repeated group's own loop as a plain `(?:X)*`, and
-//! the evaluator runs this rewrite again over what it wrote (#6305).
+//! where it stands), or a flag switch that names `x` or `U`. Any other flag switch reaches the rest
+//! of its group, so under a greedy loop it is written as a flag group over what it reaches before
+//! the ways are listed (#6301); a lazy repeat over such a body keeps its loop. A loop over a capture
+//! group is still reached: the capture rewrite (`onig_capture_loop`) writes the repeated group's own
+//! loop as a plain `(?:X)*`, and the evaluator runs this rewrite again over what it wrote (#6305).
 //!
 //! A pattern with syntax only `fancy-regex` reads (a lookaround, an atomic group, a backreference,
 //! `\K`, `\G`, a comment) is parsed through `oniguruma_shadow`'s copy of it, which writes that syntax
@@ -102,6 +104,32 @@ struct Rewriter<'p> {
     work: core::cell::Cell<usize>,
     work_limit: usize,
     changed: bool,
+}
+
+/// Whether a flag switch (`(?i)`, not a flag group) stands anywhere in `ast`.
+fn has_switch(ast: &Ast) -> bool {
+    match ast {
+        Ast::Flags(_) => true,
+        Ast::Group(group) => has_switch(&group.ast),
+        Ast::Alternation(alt) => alt.asts.iter().any(has_switch),
+        Ast::Concat(concat) => concat.asts.iter().any(has_switch),
+        Ast::Repetition(rep) => has_switch(&rep.ast),
+        _ => false,
+    }
+}
+
+/// A piece that matches only the empty string and has no text of its own.
+fn empty_piece() -> Piece {
+    Piece {
+        text: Text {
+            text: String::new(),
+            prec: Prec::Concat,
+        },
+        ways: Ways::Nullable {
+            before: None,
+            after: None,
+        },
+    }
 }
 
 /// `pattern` with every greedy, unbounded loop whose body can match nothing before trying a way
@@ -423,7 +451,13 @@ impl Rewriter<'_> {
             }
             Ast::Group(group) => self.group(group, listed),
             Ast::Repetition(rep) => {
-                let body = self.convert(&rep.ast, true)?;
+                let mut body = self.convert(&rep.ast, true)?;
+                // #6301: the scoped switch is verified for the greedy loop. A lazy repeat decides
+                // whether Oniguruma unrolls it from the body's operation count (`onig_ops`), which does
+                // not read a switch, so it keeps the switch as the unknown it was.
+                if !rep.greedy && has_switch(&rep.ast) {
+                    body.ways = Ways::Unknown;
+                }
                 let (min, max) = bounds(&rep.op.kind);
                 if !rep.greedy && max.is_none() && self.oniguruma_unrolls(&rep.ast, min) {
                     return self.lazy_unrolled(body, min);
@@ -431,22 +465,87 @@ impl Rewriter<'_> {
                 self.repeat(body, min, max, rep.greedy)
             }
             Ast::Alternation(alt) => {
-                let items = alt
-                    .asts
-                    .iter()
-                    .map(|a| self.convert(a, listed))
-                    .collect::<Result<Vec<_>, _>>()?;
+                // #6301: a flag switch (`(?i)`) reaches the rest of its group, later ways included,
+                // which the ways below would move out of its reach. It is written as a flag group
+                // over what it reaches: `x(?i)y|z` is `x(?i:y)|(?i:z)`.
+                let mut active: Vec<String> = Vec::new();
+                let mut items = Vec::with_capacity(alt.asts.len());
+                for way in &alt.asts {
+                    // A way that is only a switch matches nothing, as an empty way does.
+                    let piece = match way {
+                        Ast::Flags(set) if self.switch_open(set)?.is_some() => empty_piece(),
+                        _ => self.convert(way, listed)?,
+                    };
+                    items.push(self.scoped(piece, &active)?);
+                    let switches: &[Ast] = match way {
+                        Ast::Concat(concat) => &concat.asts,
+                        other => core::slice::from_ref(other),
+                    };
+                    for item in switches {
+                        if let Ast::Flags(set) = item {
+                            active.extend(self.switch_open(set)?);
+                        }
+                    }
+                }
                 self.alt(&items, listed)
             }
-            Ast::Concat(concat) => {
-                let items = concat
-                    .asts
-                    .iter()
-                    .map(|a| self.convert(a, listed))
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.concat(&items, listed)
-            }
+            Ast::Concat(concat) => self.convert_concat(&concat.asts, listed),
         }
+    }
+
+    /// A concatenation. A flag switch in it reaches the items after it, so those are converted as
+    /// one piece and wrapped in a flag group with the switch's flags (#6301).
+    fn convert_concat(&mut self, asts: &[Ast], listed: bool) -> Result<Piece, GiveUp> {
+        let mut items = Vec::with_capacity(asts.len());
+        for (at, ast) in asts.iter().enumerate() {
+            if let Some(open) = match ast {
+                Ast::Flags(set) => self.switch_open(set)?,
+                _ => None,
+            } {
+                items.push(empty_piece());
+                let rest = &asts[at + 1..];
+                if !rest.is_empty() {
+                    let piece = self.convert_concat(rest, listed)?;
+                    items.push(self.scoped(piece, &[open])?);
+                }
+                break;
+            }
+            items.push(self.convert(ast, listed)?);
+        }
+        self.concat(&items, listed)
+    }
+
+    /// The opening of the flag group that stands for the switch `set` over what it reaches
+    /// (`(?i)` is `(?i:`..`)`), or `None` for a switch that cannot be scoped: `x` makes the text
+    /// after it blanks and comments, which a closing parenthesis would join to the last comment.
+    /// `U` swaps greedy and lazy, which the rewrite does not follow, so a pattern with it is left
+    /// as written.
+    fn switch_open(&self, set: &ast::SetFlags) -> Result<Option<String>, GiveUp> {
+        if set.flags.flag_state(Flag::SwapGreed).is_some() {
+            return Err(GiveUp);
+        }
+        if set.flags.flag_state(Flag::IgnoreWhitespace) == Some(true) {
+            return Ok(None);
+        }
+        Ok(Some(format!("(?{}:", self.verbatim(&set.flags.span))))
+    }
+
+    /// `piece` inside the flag groups `opens` (outermost first), each of its listed ways too.
+    fn scoped(&self, mut piece: Piece, opens: &[String]) -> Result<Piece, GiveUp> {
+        for open in opens.iter().rev() {
+            let wrap = |t: Text| self.text(format!("{open}{})", t.text), Prec::Atom);
+            piece = Piece {
+                text: wrap(piece.text)?,
+                ways: match piece.ways {
+                    Ways::Nullable { before, after } => Ways::Nullable {
+                        before: before.map(wrap).transpose()?,
+                        after: after.map(wrap).transpose()?,
+                    },
+                    ways => ways,
+                },
+            };
+        }
+        Ok(piece)
     }
 
     /// A construct the parsed copy reads as something it is not. A comment matches nothing, as an
