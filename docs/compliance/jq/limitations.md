@@ -7546,6 +7546,16 @@ Three differences remain.
   Without a second-engine feature the shape keeps the `regex` crate, and `l` and `n` keep their old route for it, so those answer as jq does.
   Pinned by `tests/jq_cli/i6096.rs` (a mutant that drops the guard, one that ignores that the two plusses must match, and one that ignores that the repeat between them must be optional all fail it).
   Upstream: the report to `fancy-regex` is not filed from here; the Rust case is in #6096.
+- **A backreference to a group that is still open, under a repeat that can run twice, is refused on the second engine (#6262).**
+  Oniguruma reads `\1` inside group 1 as the group's last completed value: unset on the first pass, so the reference fails, and the previous pass's text after it.
+  `fancy-regex` 0.20.0 saves a group's start as the group opens and reads the reference from the new start to the old end, which is empty whenever the passes are contiguous.
+  `"ab" | [match("(\\1|\\w)+")|[.offset,.string,.captures[0].offset,.captures[0].string]]` is `[[0,"ab",1,"b"]]` in jq and was `[[0,"a",1,""]]` here (and `(a|\1)+` on `"ab"` had the group at `[1,""]` where jq has `[0,"a"]`).
+  The crate has no option for the other reading (`RegexBuilder` offers `oniguruma_mode`, `find_not_empty`, `leftmost_longest`, `backtrack_limit` and `seek`), and rewriting the pattern to carry the previous pass would need two alternating copies of the group, which does not keep the order Oniguruma tries a repeat's ways in.
+  Such a pattern gets the `invalid regex` error whatever the text: `(\1|\w)+`, `(a|\1){2}`, `((?!\1)){2,}`, `(?:(a|\1)b)+`, `(a\1)+`, and the named form `(?<n>a|\k<n>)+`.
+  Over a grid of 468 such patterns (12 group bodies, 11 repeats, 3 outer shapes) on 8 strings and both `g` settings, 185 patterns differed from jq on some text before; the other 283 agreed on every text tried, some of them only because the reference's pass and the plain one end at the same place (`(a\1?)+` on `aaaa`), and are refused with them because a pattern cannot tell which texts reach the reference.
+  A reference to a group that is open under no such repeat (`(a|\1)`, `(a|\1)?`, `(a|\1){1}`) reads a group that never completes in either engine and answers as jq does, and so does a reference to a group that has closed (`(a)\1+`, `(a)(\1)+`).
+  `scripts/jq-regex-open-backref-sweep.py` regenerates the grid.
+  Pinned by `tests/jq_cli/i6262.rs` (a mutant that drops the guard fails it).
 
 ### Oniguruma escapes and group syntax read before either engine (#6070)
 
