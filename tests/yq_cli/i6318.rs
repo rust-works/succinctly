@@ -1,5 +1,5 @@
 //! #6318: a write rebuilds the document from its parts, and a `<<` merge key that names nothing to merge
-//! (`- <<: *seq` where the alias is a sequence of scalars, `<<: 5`, `<<:`, `<<: hello`) was left out, so a
+//! (`- <<: *seq` where the alias is a sequence of scalars, `<<: 5`, `<<:`, `<<: hello`, an empty mapping) was left out, so a
 //! list item came back `- {}` and the key and its alias were gone from the file. yq keeps the entry as
 //! written, spelling the key `!!merge <<`; this keeps it too and writes it plain, which reads back as the
 //! same merge scalar. The rows pin this build's output, so a change in the spelling shows here; a merge of a
@@ -35,6 +35,21 @@ const ROWS: &[(&str, &str, &str)] = &[
         "b: {<<: hello, k: 1}\n",
         ".zzkey = 1",
         "b: {<<: hello, k: 1}\nzzkey: 1\n",
+    ),
+    (
+        "a: &a {}\nb:\n  <<: *a\n  k: 1\n",
+        ".zzkey = 1",
+        "a: &a {}\nb:\n  <<: *a\n  k: 1\nzzkey: 1\n",
+    ),
+    (
+        "b:\n  <<: {}\n  k: 1\n",
+        ".zzkey = 1",
+        "b:\n  <<: {}\n  k: 1\nzzkey: 1\n",
+    ),
+    (
+        "l:\n  - <<: 5\n    b: 2\n  - y\n",
+        ".l[0].b = 3",
+        "l:\n  - <<: 5\n    b: 3\n  - y\n",
     ),
 ];
 

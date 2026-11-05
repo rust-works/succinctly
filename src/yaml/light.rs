@@ -5229,23 +5229,14 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
                 upsert_field(&mut entries, &mut positions, key, value, &key_value);
             }
             let mut views_differ =
-                merge_field_into(&mut entries, &mut positions, field.value_cursor, view);
-            views_differ |=
-                keep_unmergeable_key(&mut entries, &mut positions, &field, &key_value, view);
+                merge_key_field(&mut entries, &mut positions, &field, &key_value, view);
 
             fields = rest;
             while let Some((field, rest)) = fields.uncons() {
                 let key_value = field.key_cursor.value();
                 if is_merge_key_value(&key_value) {
                     views_differ |=
-                        merge_field_into(&mut entries, &mut positions, field.value_cursor, view);
-                    views_differ |= keep_unmergeable_key(
-                        &mut entries,
-                        &mut positions,
-                        &field,
-                        &key_value,
-                        view,
-                    );
+                        merge_key_field(&mut entries, &mut positions, &field, &key_value, view);
                 } else {
                     upsert_field(
                         &mut entries,
@@ -5266,21 +5257,25 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
     }
 }
 
-/// A `<<` field whose value names no mapping to merge (a scalar, `null`, an alias to a sequence of
-/// scalars, a sequence with no mapping in it) stays an ordinary entry of the rendering (#6318): yq
-/// keeps the key as written, so a write that rebuilds the mapping from that list would otherwise
-/// drop the key and its value from the document. The iteration (`.[]`, which yq leaves empty there)
-/// and the JSON rendering (which skips it, as yq's JSON encoder does) do not list it, so the views
-/// differ once one is found (returned).
-fn keep_unmergeable_key<'a, W: AsRef<[u64]>>(
+/// Expand one `<<` field into `entries`, returning whether the views of the mapping can differ.
+///
+/// A `<<` that contributes no field (its value is a scalar, `null`, an alias to a sequence of
+/// scalars, a sequence with no mapping in it, or an empty mapping) stays an ordinary entry of the
+/// rendering (#6318): yq keeps the key as written, so a write that rebuilds the mapping from that
+/// list would otherwise drop the key and its value from the document. The iteration (`.[]`, which yq
+/// leaves empty there) and the JSON rendering (which skips it, as yq's JSON encoder does) do not
+/// list it, so the views differ once one is found.
+fn merge_key_field<'a, W: AsRef<[u64]>>(
     entries: &mut Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>,
     positions: &mut KeyPositions,
     field: &YamlField<'a, W>,
     key_value: &YamlValue<'a, W>,
     view: MergeView,
 ) -> bool {
-    if !merge_sources(field.value_cursor).is_empty() {
-        return false;
+    let (views_differ, contributed) =
+        merge_field_into(entries, positions, field.value_cursor, view);
+    if contributed {
+        return views_differ;
     }
     if view == MergeView::Rendering {
         upsert_field(
@@ -5475,7 +5470,7 @@ fn merge_field_into<'a, W: AsRef<[u64]>>(
     positions: &mut KeyPositions,
     value_cursor: YamlCursor<'a, W>,
     view: MergeView,
-) -> bool {
+) -> (bool, bool) {
     let tagged = merge_sources_tagged(value_cursor);
     // #4987: yq's rendering expands only an alias source; an index that says so drops the rest from
     // that view, which is then not the iteration's list even for a lone source.
@@ -5492,8 +5487,10 @@ fn merge_field_into<'a, W: AsRef<[u64]>>(
         // #4983: in listed order, each field upserting, as yq's iteration walks them.
         MergeView::Iteration => {}
     }
+    let mut contributed = false;
     for source in sources {
         for source_field in YamlFields::raw(source.first_child()) {
+            contributed = true;
             let key_value = source_field.key_cursor.value();
             upsert_field(
                 entries,
@@ -5504,7 +5501,7 @@ fn merge_field_into<'a, W: AsRef<[u64]>>(
             );
         }
     }
-    views_differ
+    (views_differ, contributed)
 }
 
 /// Insert a field by name, or overwrite an existing entry's value in place.
