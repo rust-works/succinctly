@@ -30451,13 +30451,14 @@ fn class_member(chars: &[char], at: usize) -> Option<(Option<ClassAtom>, usize)>
         'v' => atom(11, true, 2),
         'a' => atom(7, true, 2),
         'e' => atom(27, true, 2),
-        'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'h' | 'H' => Some((None, 2)),
+        'd' | 'D' | 'w' | 'W' | 's' | 'S' => Some((None, 2)),
         'p' | 'P' if chars.get(at + 2) == Some(&'{') => {
             let close = chars[at + 3..].iter().position(|&c| c == '}')?;
             Some((None, close + 4))
         }
-        c if !c.is_ascii_alphanumeric() => atom(u32::from(c), c.is_ascii(), 2),
-        _ => None,
+        // Any other escaped character is that character; a letter Oniguruma gives no meaning is the letter
+        // (`\h`, `\g`, `\q`, #6070).
+        c => atom(u32::from(c), c.is_ascii(), 2),
     }
 }
 
