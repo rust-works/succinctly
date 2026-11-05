@@ -14296,7 +14296,7 @@ Each continuation byte therefore gives an empty match, reported at the codepoint
 An empty match at a character is now followed by one more per continuation byte, each with the same empty captures, when the pattern has no assertion (`\b`, `\B`, `^`, `$`, `\A`, `\z`, a look-around) and is read by the `regex` crate or by the `l` route.
 Such a pattern's empty match cannot depend on where it stands, which is what Oniguruma's match at the continuation byte shows.
 The `n` flag drops the empty matches, extra ones included, and yq mode steps by character as Go's `regexp` does.
-Over 2,100 generated patterns (nullable repeats, alternations, groups and classes, on 46 strings of one- to four-byte characters, through `match`, `gsub`, `splits` and `scan`), 1,114 differed from jq before and 2 do now.
+Over 1,854 generated patterns (nullable repeats, alternations, groups and classes, on 46 strings of one- to four-byte characters, through `match`, `gsub`, `splits` and `scan`), 1,114 differed from jq before and 3 do now.
 
 These keep the character step, and differ from jq where the shape occurs:
 
@@ -14304,6 +14304,6 @@ These keep the character step, and differ from jq where the shape occurs:
   `"ßa" | [match("\\b";"g") | .offset]` is `[0,1,2]` in jq and `[0,2]` here: Oniguruma decides `\b` at the continuation byte from the bytes around it, which the `regex` crate cannot be asked.
 - **A pattern with an alternative that consumes at a continuation byte but not at the character.**
   `\w[^a]|[^a]??` and `(é*)*\w|(é*)*` are empty at `é` and match the stray byte after it in jq.
-  2 of the 2,100 patterns are of this kind.
+  3 of the 1,854 patterns are of this kind.
 
 Pinned by `tests/jq_cli/i6326.rs`.
