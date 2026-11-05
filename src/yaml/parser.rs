@@ -8205,6 +8205,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 reason: "unterminated verbatim tag (missing closing '>')",
             });
         }
+        // #6298: a verbatim tag (`!<...>`) ends at its `>`, and yq's scanner wants whitespace, a
+        // line break or the end of the input right after it (`a: !<tag:x>x`, `!<tag:x>"q"`,
+        // `!<tag:x>#c`: `did not find expected whitespace or line break`).
+        if is_verbatim_tag(self.input, start)
+            && self.input.get(end).is_some_and(|&b| !is_tag_blank(b))
+        {
+            return Err(YamlError::InvalidTag {
+                offset: end,
+                reason: "a verbatim tag must be followed by whitespace or a line break",
+            });
+        }
         // #6293: a tag runs to the next space, and a flow indicator right after it is part of that
         // run for yq's scanner, which then refuses the character (`[!!str]`, `{a: !!str}`,
         // `[!!str, 1]`, `a: !!str]`: `found character ']' that is not allowed in a YAML tag`). The
@@ -9545,6 +9556,19 @@ fn line_opens_a_bare_plain_scalar(line: &[u8]) -> bool {
             .any(|w| w[0] == b':' && matches!(w[1], b' ' | b'\t')))
 }
 
+/// A byte that ends a tag's run of characters: a blank or a line break. One definition for
+/// [`scan_tag_extent`] and for [`Parser::parse_tag`]'s check of what follows a tag (#6298).
+#[inline]
+fn is_tag_blank(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Whether the tag at `start` (a `!`) is written verbatim, `!<...>`.
+#[inline]
+fn is_verbatim_tag(bytes: &[u8], start: usize) -> bool {
+    bytes.get(start + 1) == Some(&b'<')
+}
+
 /// Scan a tag's raw extent starting at a `!` in `bytes[start..]` (must be
 /// `b'!'`), returning `(end, ok)`.
 ///
@@ -9575,12 +9599,12 @@ pub(crate) fn scan_tag_extent(bytes: &[u8], start: usize) -> (usize, bool) {
     debug_assert_eq!(bytes.get(start), Some(&b'!'));
     let mut i = start + 1;
 
-    if bytes.get(i) == Some(&b'<') {
+    if is_verbatim_tag(bytes, start) {
         i += 1;
         loop {
             match bytes.get(i) {
                 Some(b'>') => return (i + 1, true),
-                Some(b) if !matches!(b, b' ' | b'\t' | b'\n' | b'\r') => i += 1,
+                Some(&b) if !is_tag_blank(b) => i += 1,
                 _ => return (i, false), // whitespace/break/EOF before `>`
             }
         }
@@ -9600,7 +9624,7 @@ pub(crate) fn scan_tag_extent(bytes: &[u8], start: usize) -> (usize, bool) {
 
     while matches!(
         bytes.get(i),
-        Some(b) if !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b',' | b'[' | b']' | b'{' | b'}')
+        Some(&b) if !is_tag_blank(b) && !matches!(b, b',' | b'[' | b']' | b'{' | b'}')
     ) {
         i += 1;
     }
