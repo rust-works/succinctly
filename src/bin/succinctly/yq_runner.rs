@@ -2077,6 +2077,12 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         if !f.is_finite() {
             return Err(EvalError::decode_failure("not a JSON number"));
         }
+        // #6063: a whole-valued span (`5.`, `-0.`, `007.`) is the integer, as yq's JSON reader
+        // answers it (`{"n":5.}` is `{"n":5}`); the bound is a strict `<` because
+        // `i64::MAX as f64` rounds up to 2^63. A fractional one (`.5`, `+.5`) stays a float.
+        if f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64 {
+            return Ok(OwnedValue::Int(f as i64));
+        }
         OwnedValue::Float(f)
     } else if let Some(s) = value.as_str() {
         OwnedValue::String(s.into_owned().into())
@@ -10307,11 +10313,9 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
     if s.is_empty() {
         return Ok(OwnedValue::Null);
     }
-    // A bare trailing dot (`5.`) stays refused here: jq mode reads it since #6052, but this
-    // flag is yq's own extension and its reading of the token is undecided (#6052 follow-up).
+    // A bare trailing dot (`5.`) is read, as the `-p json` reader reads it (#6063).
     validate::Validator::new(s.as_bytes())
         .jq_lenient()
-        .refusing_bare_trailing_dot()
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid JSON: {s}: {e}"))?;
     let index = JsonIndex::build(s.as_bytes());
@@ -14654,9 +14658,16 @@ mod tests {
             let OwnedValue::Object(map) = owned else {
                 panic!("expected an object for {json:?}")
             };
+            // #6063: a whole-valued span is the integer (`{"n":5.}` is `{"n":5}` in yq's JSON
+            // reader); a fractional one stays a float.
+            let expected_int = json == br#"{"n": 5.}"#.as_slice();
             assert!(
-                matches!(map.get("n"), Some(OwnedValue::Float(_))),
-                "expected a Float for {json:?}, got {:?}",
+                if expected_int {
+                    matches!(map.get("n"), Some(OwnedValue::Int(5)))
+                } else {
+                    matches!(map.get("n"), Some(OwnedValue::Float(_)))
+                },
+                "unexpected number for {json:?}, got {:?}",
                 map.get("n")
             );
         }
