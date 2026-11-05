@@ -5230,6 +5230,8 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
             }
             let mut views_differ =
                 merge_field_into(&mut entries, &mut positions, field.value_cursor, view);
+            views_differ |=
+                keep_unmergeable_key(&mut entries, &mut positions, &field, &key_value, view);
 
             fields = rest;
             while let Some((field, rest)) = fields.uncons() {
@@ -5237,6 +5239,13 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
                 if is_merge_key_value(&key_value) {
                     views_differ |=
                         merge_field_into(&mut entries, &mut positions, field.value_cursor, view);
+                    views_differ |= keep_unmergeable_key(
+                        &mut entries,
+                        &mut positions,
+                        &field,
+                        &key_value,
+                        view,
+                    );
                 } else {
                     upsert_field(
                         &mut entries,
@@ -5255,6 +5264,34 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
         seen.push((field.key_cursor, field.value_cursor, key_value));
         fields = rest;
     }
+}
+
+/// A `<<` field whose value names no mapping to merge (a scalar, `null`, an alias to a sequence of
+/// scalars, a sequence with no mapping in it) stays an ordinary entry of the rendering (#6318): yq
+/// keeps the key as written, so a write that rebuilds the mapping from that list would otherwise
+/// drop the key and its value from the document. The iteration (`.[]`, which yq leaves empty there)
+/// and the JSON rendering (which skips it, as yq's JSON encoder does) do not list it, so the views
+/// differ once one is found (returned).
+fn keep_unmergeable_key<'a, W: AsRef<[u64]>>(
+    entries: &mut Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>,
+    positions: &mut KeyPositions,
+    field: &YamlField<'a, W>,
+    key_value: &YamlValue<'a, W>,
+    view: MergeView,
+) -> bool {
+    if !merge_sources(field.value_cursor).is_empty() {
+        return false;
+    }
+    if view == MergeView::Rendering {
+        upsert_field(
+            entries,
+            positions,
+            field.key_cursor,
+            field.value_cursor,
+            key_value,
+        );
+    }
+    true
 }
 
 /// Where a merged mapping's entry for a key lives, so a later field with the
