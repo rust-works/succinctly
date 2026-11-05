@@ -64,3 +64,96 @@ fn a_computed_slice_of_a_malformed_array_is_an_error_6257() -> Result<()> {
     }
     Ok(())
 }
+
+/// The fused reads of a computed slice (`E[a:b] | length`, `| first`, `[k]`) and a slice of a
+/// non-root array or of several targets are held to the same: a document jq refuses at parse time is
+/// refused (#6257).
+#[test]
+fn a_fused_computed_slice_of_a_malformed_array_is_an_error_6257() -> Result<()> {
+    for (document, filter, expected) in [
+        (r"[,]", r".[0+0:1]|length", None),
+        (r"[,]", r".[0+0:1]|first", None),
+        (r"[,]", r".[0+0:1]|last", None),
+        (r"[,]", r".[0+0:1]|.[0]", None),
+        (r"[,]", r".[0+0:2][0]", None),
+        (r"[,]", r".a[0+0:1]|length", None),
+        (r"[,]", r".[0:1]|length", None),
+        (r"[,]", r"(.a,.a)[0+0:1]", None),
+        (r"[,]", r"[.[0+0:1]]|length", None),
+        (r"[,]", r"[(.a,.)|.[0+0:1]?]|length", None),
+        (r#"{"a":[,]}"#, r".[0+0:1]|length", None),
+        (r#"{"a":[,]}"#, r".[0+0:1]|first", None),
+        (r#"{"a":[,]}"#, r".[0+0:1]|last", None),
+        (r#"{"a":[,]}"#, r".[0+0:1]|.[0]", None),
+        (r#"{"a":[,]}"#, r".[0+0:2][0]", None),
+        (r#"{"a":[,]}"#, r".a[0+0:1]|length", None),
+        (r#"{"a":[,]}"#, r".[0:1]|length", None),
+        (r#"{"a":[,]}"#, r"(.a,.a)[0+0:1]", None),
+        (r#"{"a":[,]}"#, r"[.[0+0:1]]|length", None),
+        (r#"{"a":[,]}"#, r"[(.a,.)|.[0+0:1]?]|length", None),
+        (r"[]", r".[0+0:1]|length", Some(r"0")),
+        (r"[]", r".[0+0:1]|first", Some(r"null")),
+        (r"[]", r".[0+0:1]|last", Some(r"null")),
+        (r"[]", r".[0+0:1]|.[0]", Some(r"null")),
+        (r"[]", r".[0+0:2][0]", Some(r"null")),
+        (r"[]", r".a[0+0:1]|length", None),
+        (r"[]", r".[0:1]|length", Some(r"0")),
+        (r"[]", r"(.a,.a)[0+0:1]", None),
+        (r"[]", r"[.[0+0:1]]|length", Some(r"1")),
+        (r"[]", r"[(.a,.)|.[0+0:1]?]|length", None),
+        (r#"{"a":[]}"#, r".[0+0:1]|length", None),
+        (r#"{"a":[]}"#, r".[0+0:1]|first", None),
+        (r#"{"a":[]}"#, r".[0+0:1]|last", None),
+        (r#"{"a":[]}"#, r".[0+0:1]|.[0]", None),
+        (r#"{"a":[]}"#, r".[0+0:2][0]", None),
+        (r#"{"a":[]}"#, r".a[0+0:1]|length", Some(r"0")),
+        (r#"{"a":[]}"#, r".[0:1]|length", None),
+        (
+            r#"{"a":[]}"#,
+            r"(.a,.a)[0+0:1]",
+            Some(
+                r"[]
+[]",
+            ),
+        ),
+        (r#"{"a":[]}"#, r"[.[0+0:1]]|length", None),
+        (r#"{"a":[]}"#, r"[(.a,.)|.[0+0:1]?]|length", Some(r"1")),
+        (r"[1,,2]", r".[0+0:1]|length", None),
+        (r"[1,,2]", r".[0+0:1]|first", None),
+        (r"[1,,2]", r".[0+0:1]|last", None),
+        (r"[1,,2]", r".[0+0:1]|.[0]", None),
+        (r"[1,,2]", r".[0+0:2][0]", None),
+        (r"[1,,2]", r".a[0+0:1]|length", None),
+        (r"[1,,2]", r".[0:1]|length", None),
+        (r"[1,,2]", r"(.a,.a)[0+0:1]", None),
+        (r"[1,,2]", r"[.[0+0:1]]|length", None),
+        (r"[1,,2]", r"[(.a,.)|.[0+0:1]?]|length", None),
+        (r"[1,2]", r".[0+0:1]|length", Some(r"1")),
+        (r"[1,2]", r".[0+0:1]|first", Some(r"1")),
+        (r"[1,2]", r".[0+0:1]|last", Some(r"1")),
+        (r"[1,2]", r".[0+0:1]|.[0]", Some(r"1")),
+        (r"[1,2]", r".[0+0:2][0]", Some(r"1")),
+        (r"[1,2]", r".a[0+0:1]|length", None),
+        (r"[1,2]", r".[0:1]|length", Some(r"1")),
+        (r"[1,2]", r"(.a,.a)[0+0:1]", None),
+        (r"[1,2]", r"[.[0+0:1]]|length", Some(r"1")),
+        (r"[1,2]", r"[(.a,.)|.[0+0:1]?]|length", None),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(document))?;
+        match expected {
+            Some(expected) => {
+                assert_eq!(
+                    stdout.trim_end(),
+                    expected,
+                    "{document} | {filter}: {stderr:?}"
+                );
+                assert_eq!(code, 0, "{document} | {filter}");
+            }
+            None => {
+                assert_eq!(stdout.trim_end(), "", "{document} | {filter}");
+                assert_ne!(code, 0, "{document} | {filter}");
+            }
+        }
+    }
+    Ok(())
+}

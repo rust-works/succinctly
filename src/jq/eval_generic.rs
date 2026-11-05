@@ -25884,18 +25884,20 @@ fn slice_pair_generic<S: EvalSemantics, V: DocumentValue>(
             // the cursor is gone once the targets are values: the check is made here, as the
             // literal spelling makes it (#6231).
             GenericResult::OneCursor(c) => {
-                if let Some(err) = empty_container_gap_error(&c.value(), Some(&c)) {
+                let v = c.value();
+                if let Some(err) = empty_container_gap_error(&v, Some(&c)) {
                     escape!(Control::Error(err));
                 }
-                Targets::Borrowed(vec![c.value()])
+                Targets::Borrowed(vec![v])
             }
             GenericResult::ManyCursor(cs) => {
-                for c in &cs {
-                    if let Some(err) = empty_container_gap_error(&c.value(), Some(c)) {
+                let vs: Vec<V> = cs.iter().map(DocumentCursor::value).collect();
+                for (v, c) in vs.iter().zip(&cs) {
+                    if let Some(err) = empty_container_gap_error(v, Some(c)) {
                         escape!(Control::Error(err));
                     }
                 }
-                Targets::Borrowed(cs.iter().map(DocumentCursor::value).collect())
+                Targets::Borrowed(vs)
             }
             // See `eval_index_expr`'s identical arm for the
             // accepted, pre-existing error-swallowing note that
@@ -26629,6 +26631,11 @@ fn fused_slice_window<S: EvalSemantics, V: DocumentValue>(
         None => literal_bounds,
     };
     let len = crate::jq::array_index::len_checked_memoized(&elements).ok()?;
+    // #6257: the walk above sees no gap in an array with no element (`[,]`, #2594), which the
+    // ordinary route checks and raises; an empty array has nothing to fuse.
+    if len == 0 {
+        return None;
+    }
     let range = SliceBounds::from_literals(start, end).resolve(len);
     Some((elements, range))
 }
