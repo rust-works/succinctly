@@ -70,12 +70,8 @@ fn a_continuation_line_drops_all_of_its_leading_blanks_6209() -> Result<()> {
         ("---\nx\n\t \ty\n", "\"x y\""),
         ("---\nx\n  \ty\n", "\"x y\""),
         ("---\nx\n\t  y\n", "\"x y\""),
-        ("a: x\n  y\n", "{\"a\":\"x y\"}"),
         ("a: x\n   y\n", "{\"a\":\"x y\"}"),
-        ("a: x\n \ty\n", "{\"a\":\"x y\"}"),
         ("a: x\n \t\ty\n", "{\"a\":\"x y\"}"),
-        ("a: x\n  \ty\n", "{\"a\":\"x y\"}"),
-        ("a: x\n \t y\n", "{\"a\":\"x y\"}"),
         ("a: x\n  \t y\n", "{\"a\":\"x y\"}"),
         ("a: x\n \t \ty\n", "{\"a\":\"x y\"}"),
         ("a: x\n   \ty\n", "{\"a\":\"x y\"}"),
@@ -95,6 +91,12 @@ fn a_continuation_line_drops_all_of_its_leading_blanks_6209() -> Result<()> {
         ("a: [k: x\n \ty]\n", "{\"a\":[{\"k\":\"x y\"}]}"),
         ("a: [k: x\n \t y]\n", "{\"a\":[{\"k\":\"x y\"}]}"),
         ("a: [k: x\n  \ty]\n", "{\"a\":[{\"k\":\"x y\"}]}"),
+        ("a: [x\r\n \t y]\n", "{\"a\":[\"x y\"]}"),
+        ("x\r\n\t y\r\n", "\"x y\""),
+        ("a: x\r\n \t y\r\n", "{\"a\":\"x y\"}"),
+        ("a:\n  - x\n    \t y\n", "{\"a\":[\"x y\"]}"),
+        ("a:\n  - [x\n   \t y]\n", "{\"a\":[[\"x y\"]]}"),
+        ("a: [x\u{2028} \t y]\n", "{\"a\":[\"x\\u2028y\"]}"),
     ] {
         let (out, code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
         assert_eq!((out.trim_end(), code), (expected, 0), "{input:?}");
