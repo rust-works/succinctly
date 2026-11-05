@@ -26,13 +26,13 @@
 //! ways are not listed here keeps its loop as written too: one with a way that can match nothing only
 //! where a zero-width assertion holds (`\b` or `a?\b` on its own: its empty way depends on where it
 //! stands), or a flag switch that names `x` or `U`. An assertion beside an item that consumes text
-//! does not matter: a way that must consume text always does, and the assertion only decides whether it
-//! matches, so `\Ba` and `a\z` are consuming ways and are copied with the rest (#6300). Any other
-//! flag switch reaches the rest
-//! of its group, so under a greedy loop it is written as a flag group over what it reaches before
-//! the ways are listed (#6301); a lazy repeat over such a body keeps its loop. A loop over a capture
-//! group is still reached: the capture rewrite (`onig_capture_loop`) writes the repeated group's own
-//! loop as a plain `(?:X)*`, and the evaluator runs this rewrite again over what it wrote (#6305).
+//! does not matter: a way that must consume text always does, and the assertion only decides whether
+//! it matches, so `\Ba` and `a\z` are consuming ways and are copied with the rest (#6300). Any other
+//! flag switch reaches the rest of its group, so under a greedy loop it is written as a flag group
+//! over what it reaches before the ways are listed (#6301); a lazy repeat over such a body keeps its
+//! loop. A loop over a capture group is still reached: the capture rewrite (`onig_capture_loop`)
+//! writes the repeated group's own loop as a plain `(?:X)*`, and the evaluator runs this rewrite
+//! again over what it wrote (#6305).
 //!
 //! A pattern with syntax only `fancy-regex` reads (a lookaround, an atomic group, a backreference,
 //! `\K`, `\G`, a comment) is parsed through `oniguruma_shadow`'s copy of it, which writes that syntax
@@ -985,8 +985,8 @@ impl Rewriter<'_> {
         })
     }
 
-    /// The loop `written` as it is when it has a capture group and the rewrite would copy or drop
-    /// one (#6310); `None` to go on. Only [`Self::exit_on_empty`] may keep a group, in the ways after
+    /// `written` when it holds no capture group, and `Err(written)` when it does, for a rewrite that
+    /// copies its body (#6310). Only [`Self::exit_on_empty`] may keep a group, in the ways after
     /// the empty one ([`Self::groups_only_in_later_ways`]): the copies of a counted repeat each
     /// hold the body's groups again, and an empty way that holds one sets it to the empty string,
     /// which a rewrite that leaves that way out of the loop does not.
