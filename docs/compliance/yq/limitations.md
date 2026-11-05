@@ -5496,6 +5496,14 @@ untouched. The key is `tostring`'s text, so `==` and `unique` agree about a numb
   `succinctly yq 'pivot'` as the whole filter does the same, and moves every other cell with its comment, quoting, anchor, alias and tag, with the keys of a mapping new strings that stay quoted when they read as another type.
   Where the `pivot` is part of a larger filter, the padding is a `null` that prints as `null`: `[pivot]` and `.x |= pivot` print `null` where yq prints nothing, and `pivot | .[1][1]` prints `null` where yq prints an empty line.
   `.x |= pivot` also keeps the flow style of the rows it replaces, where yq prints block sequences.
+- **`pivot` of an alias row, and of a row with a `<<` merge key** ([#6202](https://github.com/rust-works/succinctly/issues/6202)): yq reads the row nodes as they are.
+  An alias row (`*name`) has no tag, so it is neither a sequence nor a mapping: `.l | pivot` over `[*row, [c]]` is `sequence contains elements of  and !!seq types`, and over `[*row, *row]` it is `can only pivot elements of !!seq or !!map types, received ` (the tag is empty).
+  `succinctly yq` raises the same errors, in yq's words, for an alias row on the document route, and for every other refusal on that route and on the computed one: rows of different tags (`sequence contains elements of !!int and !!float types`), rows that agree and are not collections (`received !!str`, `received !foo`), an empty array (`received `, which yq refuses and `succinctly yq` used to answer `[]`) and a pivot of something that is not an array (`cannot pivot node of type !!int`).
+  The rows are compared by tag, so `[[a], !!seq [b]]` pivots and `[!foo [a], [b]]` does not, as in yq.
+  An array the filter builds or copies (`[.l[]] | pivot`, `.l | map(.) | pivot`) holds the same nodes in yq, aliases included, where here the copy has resolved them (the owned routes keep no alias mark), so those still pivot the anchor's value instead of raising.
+  A mapping row that holds a `<<` merge key is a row with a `<<` key to yq, whose value is the alias, so `{<<: *base, z: 3}` and `{x: 9}` pivot to a `"<<"` column of `[*base, null]`, a `z` column and an `x` column; `succinctly yq` merges the row first and pivots `x`, `y` and `z`.
+  Reading the row's own entries is the gap of `to_entries`, `pick` and `..` ([#4954](https://github.com/rust-works/succinctly/issues/4954)), and a JSON encoding of that pivot in yq is itself a merged view (`{"y":2,"z":[3,null],"x":[null,9]}`), so no row of it is reproduced here.
+  Pinned by `tests/yq_cli/i6202.rs`.
 - **Alias nodes.** yq keys an alias element (`*x`) differently from the anchor's node, since its
   container key is the YAML encoding and an alias encodes as itself: `anch: [&x {p: 1}, *x, {p: 1}]`
   gives `.anch | unique | length` of `3` in yq and `1` here (`group_by(.) | length` is `2` there and

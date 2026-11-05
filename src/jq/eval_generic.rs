@@ -36170,6 +36170,21 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 // fix as `Shuffle` just above -- free here too, for the
                 // same reason.
                 let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+                // #6202: yq compares the rows' tags before it copies any, and reads the nodes as they
+                // are: an alias row (`*name`) has no tag, so it is neither a sequence nor a mapping
+                // whatever its anchor holds. `[*row, [c]]` is `sequence contains elements of  and
+                // !!seq types`, an array of aliases or of scalars `can only pivot elements of !!seq
+                // or !!map types, received <tag>`, and so is an empty array (the tag is empty).
+                if S::TAG == EvalTag::Yq {
+                    let tags = cursors.iter().map(|c| yq_type_tag(&c.value(), Some(*c)));
+                    if let Some(error) = EvalError::yq_pivot_refusal(tags) {
+                        return if optional {
+                            GenericResult::None
+                        } else {
+                            GenericResult::Error(error)
+                        };
+                    }
+                }
                 let items: Vec<OwnedValue> =
                     owned_or_suppress!(to_owned_all_cursors::<S, _>(&cursors), optional);
                 if items.is_empty() {
@@ -36245,6 +36260,9 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 }
             } else if optional {
                 GenericResult::None
+            } else if S::TAG == EvalTag::Yq {
+                // #6202: yq's own wording (`pivot` is yq-only).
+                GenericResult::Error(EvalError::yq_pivot_node(&yq_type_tag(&value, cursor)))
             } else {
                 GenericResult::Error(EvalError::type_error(
                     "array",

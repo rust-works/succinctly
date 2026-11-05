@@ -1666,6 +1666,36 @@ impl EvalError {
         Self::new(format!("node at path [] is not an array (it's a {tag})"))
     }
 
+    /// yq's refusal of a `pivot` over rows tagged `tags` (#6202), or `None` when every row is a
+    /// sequence or every row a mapping. One definition for both evaluators: yq compares the rows'
+    /// tags before it copies any, so rows of two tags are `sequence contains elements of <first>
+    /// and <other> types`, rows that agree and are not collections (an alias row has no tag at all,
+    /// so an array of aliases lands here with an empty one, and so does an empty array) are `can
+    /// only pivot elements of !!seq or !!map types, received <tag>`.
+    pub(crate) fn yq_pivot_refusal<S: AsRef<str>>(
+        tags: impl IntoIterator<Item = S>,
+    ) -> Option<Self> {
+        let mut tags = tags.into_iter();
+        let first = tags.next();
+        let first = first.as_ref().map_or("", AsRef::as_ref);
+        if let Some(other) = tags.find(|tag| tag.as_ref() != first) {
+            return Some(Self::new(format!(
+                "sequence contains elements of {first} and {} types",
+                other.as_ref()
+            )));
+        }
+        (first != "!!seq" && first != "!!map").then(|| {
+            Self::new(format!(
+                "can only pivot elements of !!seq or !!map types, received {first}"
+            ))
+        })
+    }
+
+    /// yq's `pivot` of something that is not a sequence (#6202): `cannot pivot node of type <tag>`.
+    pub fn yq_pivot_node(tag: &str) -> Self {
+        Self::new(format!("cannot pivot node of type {tag}"))
+    }
+
     /// `<v> cannot be matched, as it is not a string`.
     pub fn cannot_be_matched(value: &OwnedValue) -> Self {
         Self::subject(value, "cannot be matched, as it is not a string")
