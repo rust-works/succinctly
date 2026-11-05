@@ -492,7 +492,7 @@ Two interactions were left open by #1709 itself (the second since closed by #200
    the same stdout and exit code as yq.
    Since [#808](https://github.com/rust-works/succinctly/issues/808) `--colors` streams, and `--colors -0` checks one result at a time like uncolored `-0`: each clean result is colorized as it is flushed, which is the same text as that slice of the whole colored render, because the colorizer resets its lexer state at each result boundary.
 
-### Anchor-on-alias at document-root level — rule 4(b)
+### Anchor-on-alias at document-root level — rule 4(b) (the `---` shape below is no longer a divergence, #6276)
 
 An alias node carrying its own `&anchor`/`!tag` (`&a *b`) is invalid per the YAML 1.2
 grammar — an alias node has no properties of its own. Real yq and PyYAML both confirm this
@@ -523,9 +523,10 @@ $ printf -- '--- &a0 hello\n--- &a1 *a0\n' | yq -o=json .
 ```
 
 (Both confirmed live against yq v4.53.3, exit 0 — real yq does not treat this as an error at
-all.) succinctly rejects this shape too rather than reproduce the corruption, per rule 4(b)
-(matching would corrupt a document): a `"hello--- &a1 *a0"` string is not a value any
-reasonable query result should ever produce, and there is no way to make it round-trip.
+all.)
+succinctly rejected this shape rather than reproduce the corruption, per rule 4(b).
+Since #6276 it reproduces it, with no divergence left to record: yq's header slurp glues the line after a leading `--- text` line onto it (see the header bullet above), so the second `---` is scalar text and the result is the single string `"hello--- &a1 *a0"`, which is no corruption of any alias.
+An alias with its own anchor wherever a marker is a marker is still rejected, as in yq.
 
 ### Merge-flag `+` and `d` combined — **no carve-out; this one is out of policy**
 
@@ -807,12 +808,12 @@ Captured live (yq v4.53.3, `-o json -I0 .`):
 The exit status agrees and the message may differ (yq words a flow key that spans lines as `mapping values are not allowed in this context`); the stdout prefix is the difference that matters.
 This holds for every parse error, and it is the divergence #5070 adds rows to: a scalar, flow collection or block scalar that is a document's root can have nothing after it before the next `---` (`did not find expected <document start>`).
 
-### Content after a `...` end marker — rejected as yq does, with two shapes that still differ ([#5089](https://github.com/rust-works/succinctly/issues/5089))
+### Content after a `...` end marker — rejected as yq does, with one shape that still differs ([#5089](https://github.com/rust-works/succinctly/issues/5089))
 
 A document after a `...` marker needs its own `---`: `a` / `...` / `b` stops with `did not find expected <document start>` in yq and here (YAML Test Suite `7Z25` is valid YAML 1.2 and fails for that reason, as `CFD4` and `FRK4` do).
-Two shapes still differ.
+One shape still differs.
 A directive after the marker (`a` / `...` / `%YAML 1.2` / `---` / `b`) is rejected by yq and read as two documents here, because YAML 1.2 allows it (spec examples 6.18, 6.21 and 9.6 are written that way).
-A stream whose first document is `--- text` followed by `...` and more content reads as one scalar in yq (`--- v` / `...` / `b` is `"v... b"`, the marker folded into the text) and as an error here; it read as two documents (`"v"`, `"b"`) before #5089.
+A stream whose first document is `--- text` followed by `...` and more content reads as one scalar in yq (`--- v` / `...` / `b` is `"v... b"`, the marker folded into the text), and since #6276 here too: yq's header slurp glues the line after the marker line onto it, so the `...` is no longer at the start of a line.
 
 ## Open divergences (bugs, not decisions)
 

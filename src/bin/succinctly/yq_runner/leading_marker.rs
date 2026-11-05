@@ -124,6 +124,15 @@ fn lost_breaks(text: &[u8]) -> Vec<std::ops::Range<usize>> {
 /// cut out (#6276), or `None` when it loses none, which is every input that does not begin with
 /// such a marker line.
 pub(super) fn glue_after_leading_marker_text(text: &[u8]) -> Option<Vec<u8>> {
+    // The overwhelmingly common input starts on its content (`a: 1`, `{`, `[`, `"`): one byte
+    // settles it, so the first line is neither scanned nor copied. Only a line that can be
+    // header (white space, `#`, `%`, `-`, or a non-ASCII byte, which may start Unicode white
+    // space) needs the loop.
+    if !text.first().is_some_and(|&b| {
+        is_re2_space(b) || matches!(b, b'#' | b'%' | b'-') || b >= 0x80 || b == 0x0b
+    }) {
+        return None;
+    }
     let lost = lost_breaks(text);
     if lost.is_empty() {
         return None;
@@ -208,6 +217,26 @@ mod tests {
         ] {
             assert_eq!(glued(text), text, "{text:?}");
         }
+    }
+
+    /// The first-byte early exit in [`glue_after_leading_marker_text`] must never skip an input
+    /// the loop would cut from: every first byte it declines is a content line to the loop too.
+    #[test]
+    fn the_first_byte_early_exit_agrees_with_the_loop() {
+        for first in 0u8..=255 {
+            let text = [first, b'\n', b'y', b'\n'];
+            let early_exit = !(is_re2_space(first)
+                || matches!(first, b'#' | b'%' | b'-')
+                || first >= 0x80
+                || first == 0x0b);
+            if early_exit {
+                assert!(lost_breaks(&text).is_empty(), "first byte {first:#x}");
+            }
+        }
+        // A header line that is not a marker, then a marker line: the loop still finds it.
+        assert_eq!(glued("%YAML 1.2\n--- x\ny\n"), "%YAML 1.2\n--- xy\n");
+        assert_eq!(glued("\u{a0}\n--- x\ny\n"), "\u{a0}\n--- xy\n");
+        assert_eq!(glued("\u{b}\n--- x\ny\n"), "\u{b}\n--- xy\n");
     }
 
     #[test]
