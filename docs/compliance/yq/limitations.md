@@ -666,6 +666,10 @@ $ printf 'k: !!seq\nj: 1\n' | succinctly yq -o json -I0 .        # {"k":"","j":1
 This answers the empty string for both, as it does for `!!int abc`: the loader absorbs what it cannot read instead of reproducing a Go crash.
 
 Not covered here:
+- An operator that reads the node's tag on one of these.
+  yq refuses `.k + 1` (`!!seq cannot be added to !!int`, and the same for `!!map`, `!!binary` and a custom tag; a duration error for `!!timestamp`), `.k * 2`, `.k | keys` and `.k | to_number` with errors that name the tag.
+  This reads the empty string and answers `"1"` for `.k + 1`, an empty line for `.k * 2`, and the errors of a string for the other two (`!!str` differs from yq the same way for `keys` and `to_number`).
+  Before this change `.k + 1` answered `1`, from a null, so it was wrong in another way.
 - `!!bool` compared with a string. yq compares a scalar's text, so an empty `!!bool` equals `""` and `!!bool yes` equals `"yes"`, where this compares the boolean ([#6292](https://github.com/rust-works/succinctly/issues/6292)).
 - A value-less tag in a flow collection (`[!!str]`, `{a: !!str}`), which yq refuses and this reads as `[""]` ([#6293](https://github.com/rust-works/succinctly/issues/6293)).
 

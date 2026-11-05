@@ -3,7 +3,7 @@
 //! decides the kind, so the empty text is no null. It read as `null` in JSON output and in a comparison with
 //! `""`; `!!str` already answered. Every row is a live yq v4.53.3 capture (`-o=json -I0`), over a mapping
 //! value, one with a comment, a sequence item, and a whole document with and without `---`.
-//! Left out: `!!bool` compared with `""` (yq compares a scalar's text, so `!!bool` alone is `true`), and
+//! The last rows end the text on the tag, and hold the explicit keys. Left out: `!!bool` compared with `""` (yq compares a scalar's text, so `!!bool` alone is `true`), and
 //! `!!int`/`!!float`, where yq's JSON encoder fails (`docs/compliance/yq/limitations.md`).
 
 use anyhow::Result;
@@ -88,6 +88,28 @@ const ROWS: &[(&str, &str, &str)] = &[
     ("!!null\n", ". == \"\"", "false\n"),
     ("--- !!null\n", ".", "null\n"),
     ("--- !!null\n", ". == \"\"", "false\n"),
+    // The tag is the last text of the document (no trailing newline), a tagged explicit key stays
+    // `null` as an untagged one does, and `!!null` and `!!bool` keep their own readings.
+    ("k: !custom", ".", "{\"k\":\"\"}\n"),
+    ("- !!seq", ".", "[\"\"]\n"),
+    ("k: !!seq # c", ".", "{\"k\":\"\"}\n"),
+    ("!!str", ".", "\"\"\n"),
+    ("!!seq", ".", "\"\"\n"),
+    ("--- !!seq", ".", "\"\"\n"),
+    ("k: !!seq\nj:", ".", "{\"k\":\"\",\"j\":null}\n"),
+    ("? !!seq", ".", "{\"\":null}\n"),
+    ("? !!seq\n: 1", ".", "{\"\":1}\n"),
+    ("? a", ".", "{\"a\":null}\n"),
+    ("? a\n: !!seq", ".", "{\"a\":\"\"}\n"),
+    ("- !!map\n- !!str", ".", "[\"\",\"\"]\n"),
+    ("k: &a !!seq", ".", "{\"k\":\"\"}\n"),
+    ("&a !custom", ".", "\"\"\n"),
+    ("!!seq # c", ".", "\"\"\n"),
+    ("k: !!bool", ".", "{\"k\":false}\n"),
+    ("!!bool", ".", "false\n"),
+    ("- !!bool", ".", "[false]\n"),
+    ("k: !!null", ".", "{\"k\":null}\n"),
+    ("!!null", ".", "null\n"),
 ];
 
 #[test]

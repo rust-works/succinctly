@@ -466,11 +466,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         }
     }
 
-    /// The value of a node with no text of its own: a null, unless an explicit tag other than
-    /// `!!null` decides the kind (#6291), when it is the empty string, as it is for the same node
-    /// followed by another line (`resolve_tagged`'s empty-text rule). Past the end of the text
-    /// are both a tag with nothing after it (`!!str` as the whole document) and the sentinel for
-    /// an explicit key without a value (`? key`), which carries no tag.
+    /// The value of a node that has no text of its own, because the text ends first.
+    ///
+    /// A null, unless an explicit tag other than `!!null` decides the kind (#6291): then the empty
+    /// string, as for the same node followed by another line (`resolve_tagged`'s empty-text rule).
+    /// Two shapes reach here: a tag with nothing after it (`!!str` as the whole document, or the
+    /// last value of the text), and the sentinel for an explicit key without a value (`? key`),
+    /// which is no tagged node and so stays null (pinned in `tests/yq_cli/i6291.rs`).
     #[cold]
     fn value_of_empty_node(&self) -> YamlValue<'a, W> {
         match self.index.get_tag(self.bp_pos) {

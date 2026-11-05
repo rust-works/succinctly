@@ -753,8 +753,11 @@ pub(crate) fn needs_explicit_float_tag_in_yaml(text: &str) -> bool {
 /// *regardless of quoting style* — even a quoted `!!int "5"` becomes the
 /// number `5`, not the string `"5"`. Returns `None` for any other tag (a
 /// custom tag, `!!seq`, `!!map`, `!!set`, `!!omap`, verbatim, or no tag at
-/// all), meaning "no override — resolve naturally instead" (`resolve_plain`
-/// for a plain scalar, `Str` for quoted/block).
+/// all) on a scalar with text, meaning "no override — resolve naturally
+/// instead" (`resolve_plain` for a plain scalar, `Str` for quoted/block).
+/// The one exception is the empty text (#6291): a tag with no value is the
+/// empty string whatever the tag, so those tags answer [`Str`](ResolvedScalar::Str)
+/// there, as yq does, and not the null `resolve_plain("")` would be.
 ///
 /// Divergence from `yq`: content that cannot be coerced to the forced numeric
 /// type (`!!int "abc"`, `!!int -0x2A`) resolves to [`Str`](ResolvedScalar::Str)
