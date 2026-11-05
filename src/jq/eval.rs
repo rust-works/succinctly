@@ -34742,22 +34742,22 @@ fn global_captures<'h, S: EvalSemantics>(
                 S::TAG == EvalTag::Yq && is_empty_match && repeats_previous_match_end;
             if !go_style_skip {
                 last_match_end = Some(m_end);
+                results.push(caps);
                 // #6326: jq steps one byte after an empty match, so the continuation bytes of a
                 // multibyte character each give an empty match, reported where the next
                 // character starts.
-                let steps = match input[m_start..].chars().next() {
-                    Some(c) if is_empty_match && re.empty_steps_bytes => c.len_utf8() - 1,
-                    _ => 0,
-                };
-                let groups = re.captures_len();
-                let resume = m_start + input[m_start..].chars().next().map_or(0, char::len_utf8);
-                results.push(caps);
-                for _ in 0..steps {
-                    let at = RegexMatch {
-                        text: &input[resume..resume],
-                        start: resume,
-                    };
-                    results.push(RegexCaptures::Mapped(vec![Some(at); groups]));
+                if is_empty_match && re.empty_steps_bytes {
+                    if let Some(c) = input[m_start..].chars().next() {
+                        let resume = m_start + c.len_utf8();
+                        let at = RegexMatch {
+                            text: &input[resume..resume],
+                            start: resume,
+                        };
+                        let step = vec![Some(at); re.captures_len()];
+                        for _ in 1..c.len_utf8() {
+                            results.push(RegexCaptures::Mapped(step.clone()));
+                        }
+                    }
                 }
             }
         }

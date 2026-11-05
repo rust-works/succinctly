@@ -70,3 +70,18 @@ fn test_text_without_a_multibyte_empty_match_is_untouched_6326() -> Result<()> {
         (r#""日本" | [match("本";"g") | .offset]"#, "[1]"),
     ])
 }
+
+/// Recorded in `docs/compliance/jq/limitations.md`: a pattern with an assertion, or one the `regex`
+/// crate's parser refuses, keeps the character step, so these answer one match fewer per
+/// continuation byte than jq 1.7.1 (`[0,1,2]`, `[0,1,1]`, `[0,1,1,2,3]` and `[0,1,1]`).
+#[test]
+fn test_a_pattern_with_an_assertion_keeps_the_character_step_6326() -> Result<()> {
+    assert_rows(&[
+        (r#""ßa" | [match("\\b";"g") | .offset]"#, "[0,2]"),
+        (r#""é" | [match("(?=)";"g") | .offset]"#, "[0,1]"),
+        (r#""éab" | [match("(?~[^a])";"g") | .offset]"#, "[0,1,2,3]"),
+        (r#""é" | [match("\\G";"g") | .offset]"#, "[0,1]"),
+        (r#""é" | [match("^";"g") | .offset]"#, "[0]"),
+        (r#""é" | [match("$";"g") | .offset]"#, "[1]"),
+    ])
+}
