@@ -3,7 +3,8 @@
 //! to the tag and not to a mapping. A primary-handle custom tag (`!tag 1`) resolves as the untagged text
 //! does, and the core tags (`!!int`, `!!str`, `!!null`, `!!bool`, `!!float`) force their own kind. Every row
 //! is a live yq v4.53.3 capture (`-o=json -I0`).
-//! Left out: `a: !x!y 1`, which yq refuses (`found undefined tag handle`) and this reads.
+//! Left out, because yq refuses or differs and this does not (`docs/compliance/yq/limitations.md`): `a: !x!y 1` and a
+//! bare `!!`, a `%TAG !!` redefinition, and an operator on the scalar (`.a + 1`).
 
 use anyhow::Result;
 
@@ -107,6 +108,51 @@ const ROWS: &[(&str, &str, &str)] = &[
     ("a: !!foo\n", ".a | type", "\"!!foo\"\n"),
     ("a: !!str:\n", ".", "{\"a\":\"\"}\n"),
     ("a: !!str:\n", ".a | type", "\"!!str:\"\n"),
+    // The verbatim spelling of a core tag is that tag.
+    ("a: !<tag:yaml.org,2002:foo> 1\n", ".", "{\"a\":\"1\"}\n"),
+    (
+        "a: !<tag:yaml.org,2002:foo> 1\n",
+        ".a | type",
+        "\"!!foo\"\n",
+    ),
+    ("a: !<tag:yaml.org,2002:int> \"1\"\n", ".", "{\"a\":1}\n"),
+    (
+        "a: !<tag:yaml.org,2002:int> \"1\"\n",
+        ".a | type",
+        "\"!!int\"\n",
+    ),
+    ("a: !<tag:yaml.org,2002:str> 1\n", ".", "{\"a\":\"1\"}\n"),
+    (
+        "a: !<tag:yaml.org,2002:str> 1\n",
+        ".a | type",
+        "\"!!str\"\n",
+    ),
+    ("a: !<tag:yaml.org,2002:null> x\n", ".", "{\"a\":null}\n"),
+    (
+        "a: !<tag:yaml.org,2002:null> x\n",
+        ".a | type",
+        "\"!!null\"\n",
+    ),
+    ("a: !<tag:yaml.org,2002:bool> yes\n", ".", "{\"a\":true}\n"),
+    (
+        "a: !<tag:yaml.org,2002:bool> yes\n",
+        ".a | type",
+        "\"!!bool\"\n",
+    ),
+    ("a: !<tag:yaml.org,2002:float> 5\n", ".", "{\"a\":5.0}\n"),
+    (
+        "a: !<tag:yaml.org,2002:float> 5\n",
+        ".a | type",
+        "\"!!float\"\n",
+    ),
+    ("a: !<tag:other.org,2002:int> 1\n", ".", "{\"a\":1}\n"),
+    (
+        "a: !<tag:other.org,2002:int> 1\n",
+        ".a | type",
+        "\"tag:other.org,2002:int\"\n",
+    ),
+    ("a: !<tag:x> 1\n", ".", "{\"a\":1}\n"),
+    ("a: !<tag:x> 1\n", ".a | type", "\"tag:x\"\n"),
 ];
 
 #[test]

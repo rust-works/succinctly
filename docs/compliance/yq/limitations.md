@@ -685,7 +685,13 @@ $ printf 'a: !!str: 1\n' | yq -o=json -I0 .                  # {"a":"1"}
 $ printf 'a: !!str: 1\n' | succinctly yq -o json -I0 .        # {"a":"1"}   ({"a":1} before #6299)
 ```
 
-One shape is still read where yq refuses it: a named handle that no `%TAG` directive declares (`a: !x!y 1` is `found undefined tag handle` in yq).
+The verbatim spelling of a core tag is that tag (`!<tag:yaml.org,2002:int> "1"` is `1`, `!<tag:yaml.org,2002:foo> 1` is `"1"`).
+
+Shapes still read where yq differs:
+- A named handle that no `%TAG` directive declares (`a: !x!y 1` is `found undefined tag handle` in yq) and a bare `!!` (`did not find expected tag URI`) are accepted.
+- A `%TAG !! <prefix>` directive that redefines the secondary handle is not seen, so `!!foo 1` under it is `"1"` here and `1` in yq.
+- An operator that reads the node's tag refuses it in yq and does not here: `.a + 1` on `a: !!foo 1` is `!!foo cannot be added to !!int` there and `"11"` here, `.a * 2` is `cannot multiply !!foo with !!int` and `"11"`, and `.a | keys` names the tag.
+  This is the same family as the operators listed under #6291.
 
 ### Invalid UTF-8 in a `-p json` document — substituted for JSON output and in a YAML-output key; a bad value still differs on the prefix (#1616, #4536)
 
