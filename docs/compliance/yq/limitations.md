@@ -5910,6 +5910,15 @@ What the streaming route reproduces, all measured against pinned v4.53.3:
   `header_verbatim_reproduction_is_streaming_only_2795`
   (`tests/yq_cli_tests.rs`), so a future header-unification fix has a test to flip rather
   than a silent behavior change to notice;
+- the header slurp also **loses a line break**, and `succinctly yq` reproduces the loss (#6276).
+  yq pushes the text after a leading `--- ` back onto its reader without the marker line's own break,
+  so the next line continues it: `--- x` / `y` is `"xy"`, `--- x` / `y: 1` is `{"xy": 1}`, and `--- # c` / `x` / `y` is the comment `# cx` and the document `"y"`.
+  The loop runs over the head of the input only, so a marker after the first content line, a bare `---` line and a lone CR break are unaffected.
+  Each file of a run is a stream of its own; under `--eval-all` only the first file's head is slurped.
+  The input is indexed with that one break cut out and the marker kept (`yaml_runner/leading_marker.rs`), so the line numbers of the nodes after it are one lower, as in yq.
+  `--header-preprocess=false`, which reads `--- x` / `y` as `"x y"`, is not implemented.
+  `load()` reads its file without the slurp, in yq and here.
+  A run of leading bare `---` lines is one header in yq and several documents here (`---` / `---` / `x` is `"x"` in yq, `null` then `"x"` here);
 - a scalar root prints its head and *drops* its foot, a flow or block collection root
   prints both (`# lead\n42\n# foot` is `# lead\n42` in yq; the getter still answers
   `foot`). The DOM route reproduces this asymmetry too (#2795 PR B).
