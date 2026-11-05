@@ -211,3 +211,35 @@ fn under_the_i_option_a_class_with_a_k_or_an_s_has_code_points_6246() -> Result<
         ),
     ])
 }
+
+/// `[:ascii:]` holds `k` and `s`, so under `i` it has code points; `[:xdigit:]` does not. `(?-i)` only
+/// unsets the option, so it does not make a class fold.
+#[test]
+fn posix_ascii_under_i_and_an_inline_unset_6246() -> Result<()> {
+    check(&[
+        (
+            r#""kKa\u00e9\u20ac\ud834\udd1e\u00ff ]^[" | [match("[^\\x80-\\xFF[:ascii:]]"; "gi") | .string]"#,
+            r#"["é","€","𝄞","ÿ"]"#,
+        ),
+        (
+            r#""kKa\u00e9\u20ac\ud834\udd1e\u00ff ]^[" | [match("[^\\x80-\\xFF[:ascii:]]"; "g") | .string]"#,
+            r"[]",
+        ),
+        (
+            r#""kKa\u00e9\u20ac\ud834\udd1e\u00ff ]^[" | [match("[^\\x80-\\xFF[:xdigit:]]"; "gi") | .string]"#,
+            r#"["k","K"," ","]","^","["]"#,
+        ),
+        (
+            r#""kKa\u00e9\u20ac\ud834\udd1e\u00ff ]^[" | [match("(?-i)[^k\\x80-\\xFF]"; "g") | .string]"#,
+            r#"["K","a"," ","]","^","["]"#,
+        ),
+        (
+            r#""kKa\u00e9\u20ac\ud834\udd1e\u00ff ]^[" | [match("[^k\\x80-\\xFF](?-i)"; "g") | .string]"#,
+            r#"["K","a"," ","]","^","["]"#,
+        ),
+        (
+            r#""kKa\u00e9\u20ac\ud834\udd1e\u00ff ]^[" | [match("(?-i)[^i\\x80-\\xFF]"; "gi") | .string]"#,
+            r#"["k","K","a"," ","]","^","["]"#,
+        ),
+    ])
+}

@@ -29189,8 +29189,6 @@ fn translate_posix_brackets_scan(
     // runs the scan again over the pattern without the blanks and comments (#6215, #6249) and keeps
     // only its repeat-operator refusals. A pattern with an inline `(?x)` is judged by neither.
     let check_repetition = !extended && !inline_extended(pattern);
-    // Whether a class may fold case (#6246): the `i` modifier, or an inline option that sets it.
-    let case_may_fold = ignore_case || pattern_may_set_ignore_case(pattern);
     // One entry per open group: whether the extended mode is on inside it, from the `x` flag and
     // from inline `(?x)`, `(?x:...)` and `(?-x)` (#5550).
     let mut extended_in = vec![extended];
@@ -29715,6 +29713,7 @@ fn translate_posix_brackets_scan(
             depth -= 1;
             // #6246: the bytes of a negated class of bytes alone name every lead byte, so no
             // multibyte character is in what it matches.
+            let case_may_fold = depth == 0 && (ignore_case || pattern_may_set_ignore_case(pattern));
             if depth == 0
                 && negated_byte_class_excludes_multibyte(&chars, class_from, i, case_may_fold)
             {
@@ -30626,7 +30625,8 @@ fn class_member(chars: &[char], at: usize) -> Option<(Option<ClassAtom>, usize)>
 /// character at all, `[^\x80-\xBF]` all of them. A member that is a code point (`é`, `\x{E9}`, a
 /// `\xC3\xA9` run) or a class (`\w`, `\p{L}`, `[:alpha:]`) puts the class in the code points, where the
 /// negation is of the characters, and a member this does not read leaves the class as it is. A byte
-/// range ends at a byte below `C0` or at `F5` and above, so one that holds a lead byte holds all.
+/// range ends at a byte below `C0` or at `F5` and above (a lone `F4` is a lead byte, and is refused
+/// for want of its tail), so one that holds a lead byte holds all.
 #[cfg(feature = "regex")]
 fn negated_byte_class_excludes_multibyte(
     chars: &[char],
@@ -30647,6 +30647,8 @@ fn negated_byte_class_excludes_multibyte(
         if chars[j] == '[' && chars.get(j + 1) == Some(&':') {
             let rest: String = chars[j..close].iter().collect();
             if rest.starts_with("[:ascii:]") || rest.starts_with("[:xdigit:]") {
+                // `[:ascii:]` holds `k` and `s`; `[:xdigit:]` neither.
+                folds |= rest.starts_with("[:ascii:]");
                 j += rest.find(":]").map_or(0, |at| at + 2);
                 member = None;
                 continue;
@@ -30682,7 +30684,7 @@ fn negated_byte_class_excludes_multibyte(
     covers && !(case_may_fold && folds)
 }
 
-/// Whether `pattern` has an inline option that sets `i` (`(?i)`, `(?mi:`).
+/// Whether `pattern` has an inline option that sets `i` (`(?i)`, `(?mi:`); `(?-i)` only unsets it.
 #[cfg(feature = "regex")]
 fn pattern_may_set_ignore_case(pattern: &str) -> bool {
     pattern.match_indices("(?").any(|(at, _)| {
@@ -30691,7 +30693,8 @@ fn pattern_may_set_ignore_case(pattern: &str) -> bool {
             .iter()
             .take_while(|b| b.is_ascii_alphabetic() || **b == b'-')
             .count();
-        run[..letters].contains(&b'i') && matches!(run.get(letters), Some(b')' | b':'))
+        let sets = run[..letters].split(|b| *b == b'-').next().unwrap_or(&[]);
+        sets.contains(&b'i') && matches!(run.get(letters), Some(b')' | b':'))
     })
 }
 

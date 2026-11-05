@@ -7577,7 +7577,8 @@ Every row was captured from jq 1.7.1.
   A `-` after a finished range is a member.
   The errors are the ones outside a class, and `empty range in char class` for a start above its end.
   A negated class of bytes alone (no code point, no `\w`, `\p{L}` or `[:alpha:]`; `[:ascii:]` and `[:xdigit:]` are bytes) whose range holds every lead byte `C2`..`F4` matches no multibyte character, because jq tests it against the first byte alone: `[^\x80-\xFF]` and `[^\x41-\xF5]` match only ASCII, `[^\x80-\xBF]` matches every character (#6246).
-  Under `i` a class that holds a `k`, an `s` or a range over them is not read this way (their folds, the Kelvin sign and the long s, are code points), nor is one with an inline `(?i)` written inside the class brackets (`[^(?i)k\x80-\xFF]`, which holds the letters of `(?i)`).
+  Under `i` a class that holds a `k`, an `s`, `[:ascii:]` or a range over them is not read this way (their folds, the Kelvin sign and the long s, are code points), nor is one with an inline `(?i)` written inside the class brackets (`[^(?i)k\x80-\xFF]`, which holds the letters of `(?i)`).
+  "Under `i`" is decided for the whole pattern, from the modifier or any inline option that sets `i`, so a class with a `k` that `(?-i)` turns the option off for (`match("(?-i)[^k\x80-\xFF]";"gi")`) is left as it was too, and the other classes under `i` are written with a look-behind (the backtracking engine).
   Also not covered: an octal byte at 0x80 or above, and a range that ends in `\xHH` and is followed by `-\d` (`[\x41-\x42-\d]` is refused, #6244).
   Pinned by `tests/jq_cli/i6240.rs` and, for the negated class of bytes, `tests/jq_cli/i6246.rs`.
 - **`(*FAIL)` never matches.**
