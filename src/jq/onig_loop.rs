@@ -262,7 +262,7 @@ fn onig_ops(ast: &Ast, folds: bool) -> Option<usize> {
             while let Ast::Group(group) = &**inner {
                 match &group.kind {
                     // #6241: an option group is looked through as a plain one is.
-                    GroupKind::NonCapturing(flags) if group_folds(flags, false).is_some() => {
+                    GroupKind::NonCapturing(flags) if group_folds(flags, folds).is_some() => {
                         inner = &group.ast;
                     }
                     _ => return None,

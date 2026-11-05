@@ -36,6 +36,13 @@ fn test_option_group_in_a_lazy_counted_repeat_body_is_counted_as_its_body_6241()
         (r"(?:(?i:b)?|a){2,}?", "cab", "gn", r#"[[1,"a"],[2,"b"]]"#),
         (r"(?:(?-i:b)?|a){2,}?", "cab", "gn", r#"[[1,"a"],[2,"b"]]"#),
         (r"(?:(?s:b)?|a){2,}?", "cab", "gn", r#"[[1,"a"],[2,"b"]]"#),
+        // A repeat of an option group inside the body is looked through.
+        (r"(?:(?s:a)*|\p{L}){2,}?", "ca", "gn", r#"[[0,"ca"]]"#),
+        (r"(?:(?s:a)+|b){2,}?", "cab", "gn", r#"[[1,"ab"]]"#),
+        (r"(?:(?s:a?)*|\p{L}){2,}?", "ca", "gn", r#"[[0,"ca"]]"#),
+        (r"(?:(?s:a){2}|\p{L}){2,}?", "caa", "gn", r#"[[0,"caa"]]"#),
+        (r"(?:a?|(?m:\w)){2,}?", "ca", "gn", r#"[[0,"c"],[1,"a"]]"#),
+        (r"(?:a?|\d){2,}?", "c1", "gn", r#"[[1,"1"]]"#),
         // The controls: a longer body, a bounded count and the `g`-only reading are unchanged.
         (r"(?:a?|\p{L}){3,}?", "ca", "gn", r#"[[0,"ca"]]"#),
         (r"(?:a?|\p{L}){2,3}?", "ca", "gn", r#"[[0,"ca"]]"#),
