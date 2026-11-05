@@ -125,15 +125,21 @@ fn test_loops_the_engines_agree_on_are_unchanged_6106() -> Result<()> {
     ])
 }
 
-/// Recorded in `docs/compliance/jq/limitations.md`: a body holding a capture group inside it (#6069;
-/// a loop over a capture group itself is rewritten since #6305) keeps the longer match; jq 1.7.1
-/// answers `["b"]`. A flag switch in the body is scoped over its ways and ends at the empty iteration
+/// Recorded in `docs/compliance/jq/limitations.md`: a body holding a capture group in a way before
+/// the empty one (#6069; a loop over a capture group itself is rewritten since #6305, and a group
+/// in a later way since #6310) keeps the longer match. A flag switch in the body is scoped over its ways and ends at the empty iteration
 /// as jq's loop does (#6301): `["b","",""]`. (A pattern that goes to `fancy-regex` used to keep the
 /// longer match too; it no longer does since #6128, pinned in `i6128.rs`.)
 #[test]
 fn test_a_capture_still_matches_longer_and_a_flag_switch_no_longer_does_6106() -> Result<()> {
     assert_rows(&[
-        (r#""ba" | [match("(b*|(a))+") | .string]"#, r#"["ba"]"#),
+        // #6310: a group in a way after the empty one is rewritten (`(b*|(a))+` is `["b"]`, as in
+        // jq); one in a way before it is written twice by the rewrite, so the loop is left as it was
+        // (`["ab","","a",""]` in jq).
+        (
+            r#""abca" | [match("(?:(a)|b*|c)+"; "g") | .string]"#,
+            r#"["abca",""]"#,
+        ),
         (
             r#""ba" | [match("(?:(?i)b*|a)+"; "g") | .string]"#,
             r#"["b","",""]"#,

@@ -7789,9 +7789,17 @@ A differential against jq 1.7.1 over 160,000 cases (5,000 generated capture-free
 
 These keep their loop as written, and still match longer than jq where the shape occurs:
 
-- **A body with a capture group inside it:** `"ba" | [match("(?:b*|(a))+") | .string]` is read as written, and so is `"ba" | [match("(b*|(a))+") | .string]` (`["b"]` in jq).
-  Tracked in [#6310](https://github.com/rust-works/succinctly/issues/6310).
-  An empty iteration also sets the group in Oniguruma ([#6069](#a-capture-under-an-unbounded-repeat-on-the-fancy-regex-route-keeps-its-last-non-empty-iteration-6069)), and the rewrite would copy the group.
+- **A body with a capture group inside it** is rewritten when every group is in a way after the empty one ([#6310](https://github.com/rust-works/succinctly/issues/6310)): `"ba" | [match("(?:b*|(a))+") | .string]` is `["b"]`, as in jq.
+  So is `"ba" | [match("(b*|(a))+") | .string]`, whose repeated group the capture rewrite of #6069 first writes as a plain loop over the body.
+  The group is written once, in the iteration, so the groups of the pattern keep their number and order.
+  Over 5,000 generated loops (bodies of two or three ways drawn from 19 atoms, 13 quantifiers, ten strings under `g`), 51 patterns that differed from jq agree and none changed the other way; a second draw of 5,000 fixed 68 and broke none.
+  `scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE` regenerates the sweep.
+  A group the rewrite would copy or drop keeps the loop as written, and the crate's longer match with it:
+  a group in a way before the empty one (`(?:(a)|b*|c)+` on `"abca"` is `["ab","","a",""]` in jq and `["abca",""]` here), which the rewrite writes twice;
+  a group in the empty way itself (`(?:b*|()|a)+`);
+  a group whose own empty way comes first (`(?:(|a)|b)+`), since an empty iteration sets the group in Oniguruma ([#6069](#a-capture-under-an-unbounded-repeat-on-the-fancy-regex-route-keeps-its-last-non-empty-iteration-6069)) and the way the rewrite drops is the one that sets it;
+  and a counted repeat of a body with a group, whose copies would each hold it.
+  Tracked in [#6332](https://github.com/rust-works/succinctly/issues/6332).
   A loop over a capture group itself is rewritten since [#6305](https://github.com/rust-works/succinctly/issues/6305): `"ba" | match("(b*|a)+")` is `"b"`, as in jq.
   The capture rewrite of #6069 writes the repeated group's own loop as a plain `(?:X)*` (its copy of the group sits in the final empty iteration), and the loop rewrite reads that.
   Over 3,346 generated patterns (a repeated capture group with `*`, `+`, `{0,}` or `{1,}`, on 19 strings under `g`), the 117 that differed from jq agree and none changed the other way.
