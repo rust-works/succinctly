@@ -28827,6 +28827,168 @@ fn may_match_empty_first(text: &[char]) -> bool {
             .any(|pair| pair[1] == '?' && matches!(pair[0], '?' | '*' | '+' | '}'))
 }
 
+/// Write `\k<name>` for a name that several groups before it carry as the alternation of their
+/// numbers, last group first (#6254).
+///
+/// Oniguruma lets groups share a name, and a reference to it (`OP_BACKREF_MULTI`) compares the text
+/// of the last of them that is set, then the one before it, and so on; once one matched it is not
+/// given back. A group set later than the reference is not one of them, because the name is looked
+/// up where the reference stands (`\k<n>(?<n>a)` is `undefined name <n> reference`). `fancy-regex`
+/// resolves a name to one group, so `(?<n>a)(?<n>b)\k<n>` missed `aba`. The reference becomes
+/// `(?>\2|\1)`: an atomic alternation of the numbered references, in which an unset group fails to
+/// match and is skipped. Groups are numbered as they open, plain ones too (jq captures them).
+/// [`pin_backreference_case`] runs after and wraps each numbered reference. `None` when no name is
+/// shared by two groups before a reference, and for a pattern with an inline `(?x)`, whose comments
+/// the walk cannot place.
+#[cfg(feature = "regex")]
+fn multiplex_backreferences(pattern: &str, extended: bool) -> Option<String> {
+    if !pattern.contains("\\k") || inline_extended(pattern) {
+        return None;
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    // A first walk finds the names that more than one group carries, anywhere in the pattern.
+    let (_, groups, _) = number_backreferences(&chars, extended, &[]);
+    let mut shared: Vec<String> = Vec::new();
+    for (at, name) in groups.iter().enumerate() {
+        if !name.is_empty() && groups[..at].contains(name) && !shared.contains(name) {
+            shared.push(name.clone());
+        }
+    }
+    if shared.is_empty() {
+        return None;
+    }
+    let (out, _, changed) = number_backreferences(&chars, extended, &shared);
+    changed.then_some(out)
+}
+
+/// One walk of [`multiplex_backreferences`]: the pattern with each `\k<name>` for a `shared` name
+/// written as numbers, the names of its groups in order, and whether anything was written.
+#[cfg(feature = "regex")]
+fn number_backreferences(
+    chars: &[char],
+    extended: bool,
+    shared: &[String],
+) -> (String, Vec<String>, bool) {
+    let mut out = String::new();
+    let mut changed = false;
+    // The groups opened so far: their names (empty for a plain group) in order, which are their numbers.
+    let mut groups: Vec<String> = Vec::new();
+    let mut class_depth = 0usize;
+    let mut class_start = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            let next = chars.get(i + 1).copied();
+            if class_depth == 0 && next == Some('k') {
+                if let Some(&open @ ('<' | '\'')) = chars.get(i + 2) {
+                    let close = if open == '<' { '>' } else { '\'' };
+                    if let Some(n) = chars[i + 3..].iter().position(|&c| c == close) {
+                        let name: String = chars[i + 3..i + 3 + n].iter().collect();
+                        let numbers: Vec<usize> = groups
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, group)| **group == name && !name.is_empty())
+                            .map(|(at, _)| at + 1)
+                            .collect();
+                        if !numbers.is_empty() && shared.contains(&name) {
+                            let ways: Vec<String> =
+                                numbers.iter().rev().map(|n| format!("\\{n}")).collect();
+                            out.push_str(&format!("(?>{})", ways.join("|")));
+                            changed = true;
+                            i += 3 + n + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            let end = (i + 2).min(chars.len());
+            out.extend(&chars[i..end]);
+            class_start = false;
+            i = end;
+            continue;
+        }
+        if class_depth > 0 {
+            match c {
+                '[' => {
+                    class_depth += 1;
+                    class_start = true;
+                    out.push(c);
+                    if chars.get(i + 1) == Some(&'^') {
+                        out.push('^');
+                        i += 1;
+                    }
+                }
+                ']' if !class_start => {
+                    class_depth -= 1;
+                    out.push(c);
+                }
+                _ => {
+                    class_start = false;
+                    out.push(c);
+                }
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '#' if extended => {
+                let end = chars[i..]
+                    .iter()
+                    .position(|&c| c == '\n')
+                    .map_or(chars.len(), |n| i + n);
+                out.extend(&chars[i..end]);
+                i = end;
+            }
+            '[' => {
+                class_depth = 1;
+                class_start = true;
+                out.push(c);
+                if chars.get(i + 1) == Some(&'^') {
+                    out.push('^');
+                    i += 1;
+                }
+                i += 1;
+            }
+            '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') => {
+                let mut end = i + 3;
+                while end < chars.len() && chars[end] != ')' {
+                    end += if chars[end] == '\\' { 2 } else { 1 };
+                }
+                let end = (end + 1).min(chars.len());
+                out.extend(&chars[i..end]);
+                i = end;
+            }
+            '(' => {
+                if chars.get(i + 1) == Some(&'?') {
+                    // A named group: `(?<n>` (not a look-behind) or `(?'n'`.
+                    let open = chars.get(i + 2).copied();
+                    let named = match open {
+                        Some('<') => !matches!(chars.get(i + 3), Some('=' | '!')),
+                        Some('\'') => true,
+                        _ => false,
+                    };
+                    if named {
+                        let close = if open == Some('<') { '>' } else { '\'' };
+                        let name: String =
+                            chars[i + 3..].iter().take_while(|&&c| c != close).collect();
+                        groups.push(name);
+                    }
+                } else if !opens_condition(chars, i) {
+                    groups.push(String::new());
+                }
+                out.push(c);
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    (out, groups, changed)
+}
+
 /// Whether `pattern` holds both a backreference (`\1`..`\9`, `\k<`, `\k'`) and an inline `i` option
 /// (`(?i)`, `(?-i:`, `(?mi)`): the only patterns [`pin_backreference_case`] can change (#6196).
 #[cfg(feature = "regex")]
@@ -32228,6 +32390,11 @@ fn build_regex_uncached<S: EvalSemantics>(
             Ok(translated) => {
                 // #6196: each backreference carries the case mode in force where it stands.
                 let base_i = flags.is_some_and(|flags| flags.contains('i'));
+                // #6254: a name several groups carry becomes the alternation of their numbers.
+                let translated = match multiplex_backreferences(&translated, extended) {
+                    Some(numbered) => std::borrow::Cow::Owned(numbered),
+                    None => translated,
+                };
                 let translated = match pin_backreference_case(&translated, base_i, extended) {
                     Some(pinned) => std::borrow::Cow::Owned(pinned),
                     None => translated,

@@ -7558,6 +7558,17 @@ Every row was captured from jq 1.7.1.
 - **`\0` and a number that is no backreference are octal** (`\101` is `A`, `\012` a newline).
   `\1`..`\9` are always backreferences, a larger number only up to the groups opened so far, as in Oniguruma's tokenizer.
   A backreference to a group the pattern does not have is jq's `invalid backref number/name`.
+- **`\k<name>` for a name several groups carry tries each of them** (#6254), last group first.
+  Oniguruma compares the text of the last of them that is set, then the one before it, and so on, and does not give the match back once one fits.
+  An unset group is skipped.
+  A group that opens after the reference is not one of them, because the name is looked up where the reference stands (`(?<n>a)\k<n>(?<n>b)` reads group 1 only).
+  `fancy-regex` resolves a name to one group, so `"aba" | test("(?<n>a)(?<n>b)\\k<n>")` was `false`.
+  Each `\k<name>` or `\k'name'` for a name defined twice or more is written as the atomic alternation of the numbers of the groups before it, `(?>\2|\1)`, with the groups numbered as they open (plain groups count, as jq captures them).
+  The case pin above then wraps each number.
+  A pattern with an inline `(?x)` is left as it was.
+  Still the crate's refusal rather than jq's: `\k<n>` before any group of that name (`undefined name <n> reference`) and `\g<n>` for a shared name (`multiplex definition name <n> call`).
+  A conditional on a shared name tests the last group only (`"ac" | test("(?<n>a)?(?<n>b)?(?(<n>)c|d)")` is `true` in jq and `false` here), and a level reference (`\k<n+0>`) is refused.
+  Pinned by `tests/jq_cli/i6254.rs`.
 - **A backreference compares under the case mode in force where it stands** (#6196), not the one its group matched under.
   `"aA" | test("((?i)a)\\1")` is `false` in jq, because the `(?i)` ended with its group, and `test("(?i)((?-i)a)\\1")` is `true`.
   `fancy-regex` applied the mode in force where the group ended, so a pattern with a backreference and an inline `i` option writes each backreference as `(?i:\1)` or `(?-i:\1)` for the mode at its position (`\k<name>` too), tracking `(?i)`, `(?-i)`, `(?i:...)` and the end of each group.
