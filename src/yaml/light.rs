@@ -7082,8 +7082,9 @@ fn fold_plain_line_break(
                 i = check + b.width;
                 // Continue looking for more empty lines
             } else {
-                // Tab followed by content - skip the tabs as indentation
-                while i < bytes.len() && bytes[i] == b'\t' {
+                // Tab followed by content: every blank in front of it is skipped, spaces after
+                // the tab too (#6209). go-yaml drops all the blanks of a continuation line.
+                while i < bytes.len() && matches!(bytes[i], b'\t' | b' ') {
                     i += 1;
                 }
                 break;
