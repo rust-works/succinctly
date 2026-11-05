@@ -51,8 +51,14 @@ fn test_a_group_before_the_empty_way_is_copied_and_read_back_6332() -> Result<()
         assert_rows(&[(&row(subject, pattern), expected)])?;
     }
     // Beside a repeated group the capture rewrite of #6069 writes too, and the copies are composed.
-    assert_rows(&[(&row("abc", r"(a*)*(?:(a)|b*|c)+"), r#"[[0,"ab",["",null]],[2,"",["",""]],[3,"",["",""]]]"#)])?;
-    assert_rows(&[(&row("abc", r"((?:(a)|b*|c)+)(b*)*"), r#"[[0,"ab",["ab","a",""]],[2,"",["","",""]],[3,"",["","",""]]]"#)])?;
+    assert_rows(&[(
+        &row("abc", r"(a*)*(?:(a)|b*|c)+"),
+        r#"[[0,"ab",["",null]],[2,"",["",""]],[3,"",["",""]]]"#,
+    )])?;
+    assert_rows(&[(
+        &row("abc", r"((?:(a)|b*|c)+)(b*)*"),
+        r#"[[0,"ab",["ab","a",""]],[2,"",["","",""]],[3,"",["","",""]]]"#,
+    )])?;
     // A name stays on its group, whichever copy the match set.
     assert_rows(&[(
         r#""abca" | [match("(?:(?<x>a)|b*|c)+";"g") | [.string, (.captures|map([.name,.string]))]]"#,
