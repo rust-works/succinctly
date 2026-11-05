@@ -24,26 +24,23 @@ fn assert_rows(rows: &[(&str, &str)]) -> Result<()> {
 #[test]
 fn test_a_multibyte_character_gives_an_empty_match_per_continuation_byte_6326() -> Result<()> {
     assert_rows(&[
-        (r#""ß" | [match("";"g") | .offset]"#, r#"[0,1,1]"#),
-        (r#""aß" | [match("";"g") | .offset]"#, r#"[0,1,2,2]"#),
-        (r#""ßa" | [match("x*";"g") | .offset]"#, r#"[0,1,1,2]"#),
+        (r#""ß" | [match("";"g") | .offset]"#, r"[0,1,1]"),
+        (r#""aß" | [match("";"g") | .offset]"#, r"[0,1,2,2]"),
+        (r#""ßa" | [match("x*";"g") | .offset]"#, r"[0,1,1,2]"),
         (
             r#""日本" | [match("x*";"g") | .offset]"#,
-            r#"[0,1,1,1,2,2,2]"#,
+            r"[0,1,1,1,2,2,2]",
         ),
-        (r#""😀" | [match("x*";"g") | .offset]"#, r#"[0,1,1,1,1]"#),
-        (
-            r#""a😀b" | [match("";"g") | .offset]"#,
-            r#"[0,1,2,2,2,2,3]"#,
-        ),
-        (r#""éaé" | [match("";"g") | .offset]"#, r#"[0,1,1,2,3,3]"#),
+        (r#""😀" | [match("x*";"g") | .offset]"#, r"[0,1,1,1,1]"),
+        (r#""a😀b" | [match("";"g") | .offset]"#, r"[0,1,2,2,2,2,3]"),
+        (r#""éaé" | [match("";"g") | .offset]"#, r"[0,1,1,2,3,3]"),
         (r#""ß" | gsub("";"X")"#, r#""XßXX""#),
         (r#""日a" | gsub("";"-")"#, r#""-日---a-""#),
         (r#""ß" | [splits("")]"#, r#"["","ß","",""]"#),
         (r#""é" | [scan("")]"#, r#"["","",""]"#),
         (
             r#""éa" | [match("a*";"g") | [.offset,.length]]"#,
-            r#"[[0,0],[1,0],[1,1],[2,0]]"#,
+            r"[[0,0],[1,0],[1,1],[2,0]]",
         ),
         (
             r#""éé" | [match("(x)?";"g") | [.offset,(.captures|map(.string))]]"#,
@@ -53,12 +50,12 @@ fn test_a_multibyte_character_gives_an_empty_match_per_continuation_byte_6326() 
             r#""é" | [match("(?<n>x*)";"g") | .captures[0] | [.name,.offset,.string]]"#,
             r#"[["n",0,""],["n",1,""],["n",1,""]]"#,
         ),
-        (r#""ß" | [match("";"gl") | .offset]"#, r#"[0,1,1]"#),
-        (r#""ß" | [match("x*";"gn") | .offset]"#, r#"[]"#),
+        (r#""ß" | [match("";"gl") | .offset]"#, r"[0,1,1]"),
+        (r#""ß" | [match("x*";"gn") | .offset]"#, r"[]"),
         (r#""é" | sub("";"X")"#, r#""Xé""#),
-        (r#""é" | [match("";"") | .offset]"#, r#"[0]"#),
-        (r#""é" | test("")"#, r#"true"#),
-        (r#""abc" | [match("";"g") | .offset]"#, r#"[0,1,2,3]"#),
+        (r#""é" | [match("";"") | .offset]"#, r"[0]"),
+        (r#""é" | test("")"#, r"true"),
+        (r#""abc" | [match("";"g") | .offset]"#, r"[0,1,2,3]"),
         (r#""日本" | gsub("\\s*";"_")"#, r#""_日___本___""#),
     ])
 }
