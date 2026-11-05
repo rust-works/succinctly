@@ -7239,7 +7239,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // #6214: a Unicode line break (U+2028, U+2029, U+0085) before a continuation line starts
                 // with blanks that hold a tab is refused as `\n` there is (the text is read on, and the
                 // decoder folds the break).
-                0xC2 | 0xE2 => {
+                0xC2 | 0xE2 if Self::unicode_break_len_at(self.input, self.pos) > 0 => {
                     self.reject_tab_in_flow_plain_continuation(self.pos)?;
                     self.advance();
                 }
@@ -7357,7 +7357,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // #6214: a Unicode line break (U+2028, U+2029, U+0085) before a continuation line starts
                 // with blanks that hold a tab is refused as `\n` there is (the text is read on, and the
                 // decoder folds the break).
-                0xC2 | 0xE2 => {
+                0xC2 | 0xE2 if Self::unicode_break_len_at(self.input, self.pos) > 0 => {
                     self.reject_tab_in_flow_plain_continuation(self.pos)?;
                     self.advance();
                 }
@@ -7375,12 +7375,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     }
 
     /// Width in bytes of the Unicode line break at `pos` (U+2028 and U+2029, three bytes; U+0085, two),
-    /// or 0 (#6214). The scalar decoder folds them as it does `\n` (#4913), but the scanners read
-    /// them as ordinary text.
+    /// or 0 (#6214). It is the decoder's own recogniser (`light::scalar_break`, #4913), so the
+    /// scanners and the fold cannot disagree on what ends a line; the scanners read these breaks
+    /// as ordinary text.
+    #[inline]
     fn unicode_break_len_at(input: &[u8], pos: usize) -> usize {
-        match input.get(pos..) {
-            Some([0xE2, 0x80, 0xA8 | 0xA9, ..]) => 3,
-            Some([0xC2, 0x85, ..]) => 2,
+        match input.get(pos) {
+            Some(0xC2 | 0xE2) => {
+                super::light::scalar_break(input, pos, true).map_or(0, |b| b.width)
+            }
             _ => 0,
         }
     }
@@ -7576,7 +7579,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
                 // #6214: as in `parse_flow_unquoted_key`, a Unicode line break before a continuation line
                 // that starts with blanks holding a tab.
-                0xC2 | 0xE2 => {
+                0xC2 | 0xE2 if Self::unicode_break_len_at(self.input, self.pos) > 0 => {
                     self.reject_tab_in_flow_plain_continuation(self.pos)?;
                     self.advance();
                 }

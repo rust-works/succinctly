@@ -22,6 +22,10 @@ fn test_tab_after_a_unicode_break_in_a_flow_plain_scalar_is_refused_6214() -> Re
             "a: [x{B}\ty, z]\n",
             "a: [? x{B}\ty : 1]\n",
             "a: {? x{B}\ty : 1}\n",
+            // A tab before a closing indicator, a comma or a comment is refused as well.
+            "a: [x{B}\t]\n",
+            "a: [x{B}\t, z]\n",
+            "a: [x{B}\t# c\n]\n",
         ] {
             let doc = template.replace("{B}", brk);
             let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", &doc, &["-o=json", "-I=0"])?;

@@ -6653,9 +6653,9 @@ fn json_surrogate_escape(first: u32, rest: &[u8]) -> (char, usize) {
 /// too, but it keeps them in the value (`separator`): the blanks beside one are trimmed as beside
 /// any break, and it is never folded to a space.
 #[derive(Clone, Copy)]
-struct ScalarBreak {
+pub(super) struct ScalarBreak {
     /// Width in bytes.
-    width: usize,
+    pub(super) width: usize,
     /// U+2028/U+2029, which stay in the decoded value.
     separator: bool,
 }
@@ -6664,7 +6664,7 @@ struct ScalarBreak {
 /// the decoders settle once per scalar with [`holds_unicode_scalar_break`] so that a scalar
 /// without one pays a single predictable branch here.
 #[inline]
-fn scalar_break(bytes: &[u8], i: usize, unicode: bool) -> Option<ScalarBreak> {
+pub(super) fn scalar_break(bytes: &[u8], i: usize, unicode: bool) -> Option<ScalarBreak> {
     match *bytes.get(i)? {
         b'\n' => Some(ScalarBreak {
             width: 1,
