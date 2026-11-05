@@ -129,6 +129,10 @@ struct Rewriter<'p> {
     /// The empty way of the loop body being converted, set for the one `repeat` call that follows
     /// when `copies` and the body has a capture group (#6332): see [`Rewriter::empty_text`].
     exit: Option<Text>,
+    /// How many enclosing repeats of the part being converted can run their body more than once. A
+    /// loop with groups inside one is left as written (#6332): the enclosing repeat, which the
+    /// rewrite does not reach, takes the empty iteration the loop's rewrite assumes it can end at.
+    repeating: u32,
 }
 
 /// Whether a flag switch (`(?i)`, not a flag group) stands anywhere in `ast`.
@@ -329,6 +333,7 @@ fn rewrite_parsed(pattern: &str, copies: bool) -> Option<String> {
         captures: !copies && has_capture(&ast),
         copies,
         exit: None,
+        repeating: 0,
     };
     let piece = rewriter.convert(&ast, false).ok()?;
     // The rewrite can drop a piece that matches only the empty string (`\p{Foo}{0}`), and with it
@@ -611,7 +616,11 @@ impl Rewriter<'_> {
             }
             Ast::Group(group) => self.group(group, listed),
             Ast::Repetition(rep) => {
-                let mut body = self.convert(&rep.ast, true)?;
+                let again = !matches!(bounds(&rep.op.kind).1, Some(0 | 1));
+                self.repeating += u32::from(again);
+                let body = self.convert(&rep.ast, true);
+                self.repeating -= u32::from(again);
+                let mut body = body?;
                 // #6301: the scoped switch is verified for the greedy loop. A lazy repeat decides
                 // whether Oniguruma unrolls it from the body's operation count (`onig_ops`), which does
                 // not read a switch, so it keeps the switch as the unknown it was.
@@ -620,6 +629,7 @@ impl Rewriter<'_> {
                 }
                 let grouped = (self.copies || self.captures) && has_capture(&rep.ast);
                 let (min, max) = bounds(&rep.op.kind);
+
                 if !rep.greedy && max.is_none() && self.oniguruma_unrolls(&rep.ast, min) {
                     return self.lazy_unrolled(body, min, grouped);
                 }
@@ -1154,8 +1164,14 @@ impl Rewriter<'_> {
         let iteration = self.concat(&iteration, true)?;
         parts.push(self.repeat(iteration, 0, None, false)?);
         let piece = self.concat(&parts, true)?;
-        // #6310: only a group in `B` survives the rewrite.
-        if !self.groups_only_in_later_ways(&written, &before_text, &b_text) {
+        // #6310: only a group in `B` survives the rewrite; with the groups tagged, every one does,
+        // and each copy is read back (#6332), unless a repeat stands around the loop.
+        let kept = if self.copies {
+            exit.is_none() || self.repeating == 0
+        } else {
+            self.groups_only_in_later_ways(&written, &before_text, &b_text)
+        };
+        if !kept {
             return Ok(Self::unlisted(written));
         }
         self.changed = true;
@@ -1262,9 +1278,9 @@ impl Rewriter<'_> {
         written: Text,
         exit: Option<Text>,
     ) -> Result<Piece, GiveUp> {
-        // #6310: each copy holds the body's groups again; only with the groups tagged are they read
-        // back (#6332).
-        if self.has_groups(&written) {
+        // #6310: each copy holds the body's groups again; with the groups tagged they are read back
+        // (#6332), unless a repeat stands around the loop.
+        if self.has_groups(&written) || (exit.is_some() && self.repeating > 0) {
             return Ok(Self::unlisted(written));
         }
         let consuming = |text: Text| Piece {
@@ -1409,8 +1425,9 @@ impl Rewriter<'_> {
             text,
             ways: Ways::Consuming,
         };
-        // #6310: each copy holds the body's groups again.
-        if self.has_groups(&written) {
+        // #6310: each copy holds the body's groups again; with the groups tagged they are read back
+        // (#6332), unless a repeat stands around the loop.
+        if self.has_groups(&written) || (exit.is_some() && self.repeating > 0) {
             return Ok(Self::unlisted(written));
         }
         let mut loop_rest = body.clone();
@@ -1617,6 +1634,10 @@ mod tests {
             "(?:(a)|b*){0,3}",
             "(?i)(?:b*|(a))+",
             "(?:b*|(a))+__succinctly_g1",
+            // A loop inside a repeat that can run it again, which the rewrite does not reach.
+            "(?:(?:(a)|b*|c)+)+",
+            "(?:(?:(a|b)|(?:|a)){0,3}){2}?",
+            "(?:((b|)(|c)){3})+",
         ] {
             assert_eq!(copied(pattern), None, "{pattern}");
         }

@@ -143,6 +143,17 @@ fn test_loops_that_already_agreed_still_do_6332() -> Result<()> {
             r"(?:(|a)|b)+",
             r#"[[0,"",[""]],[1,"",[""]],[2,"",[""]]]"#,
         ),
+        // A loop with groups inside a repeat that runs it again is left as written.
+        (
+            "abab",
+            r"(?:(?:(a|b)|(?:|a)){0,3}){2}?",
+            r#"[[0,"abab",["b"]],[4,"",[""]]]"#,
+        ),
+        (
+            "abc",
+            r"(?:((b|)(|c)){3})+",
+            r#"[[0,"",["","",""]],[1,"b",["","",""]],[2,"",["","",""]],[3,"",["","",""]]]"#,
+        ),
     ] {
         assert_rows(&[(&row(subject, pattern), expected)])?;
     }

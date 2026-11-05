@@ -27933,12 +27933,18 @@ impl<'h> RegexCaptures<'h> {
                 .copies
                 .iter()
                 .map(|copies| {
-                    copies.iter().rev().find_map(|&i| {
-                        caps.get(i).map(|m| RegexMatch {
+                    // The copy the match set last. They run in the order of the text they match, so
+                    // it is the one that starts last, then ends last; a copy numbered later wins a
+                    // tie, as the exit's empty copy over the loop's (#6332: a repeat around the
+                    // copies runs a lower-numbered one again after a higher).
+                    copies
+                        .iter()
+                        .filter_map(|&i| caps.get(i).map(|m| (m.start(), m.end(), i, m)))
+                        .max_by_key(|&(start, end, i, _)| (start, end, i))
+                        .map(|(_, _, _, m)| RegexMatch {
                             text: m.as_str(),
                             start: m.start(),
                         })
-                    })
                 })
                 .collect(),
         )
