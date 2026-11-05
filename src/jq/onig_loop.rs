@@ -21,9 +21,9 @@
 //! empty iteration also sets the group, #6069), a zero-width assertion (its empty way depends on
 //! where it stands), or a flag switch that names `x` or `U`. Any other flag switch reaches the rest
 //! of its group, so under a greedy loop it is written as a flag group over what it reaches before
-//! the ways are listed (#6301). A loop over a capture group is still reached: the capture
-//! rewrite (`onig_capture_loop`) writes the repeated group's own loop as a plain `(?:X)*`, and
-//! the evaluator runs this rewrite again over what it wrote (#6305).
+//! the ways are listed (#6301); a lazy repeat over such a body keeps its loop. A loop over a capture
+//! group is still reached: the capture rewrite (`onig_capture_loop`) writes the repeated group's own
+//! loop as a plain `(?:X)*`, and the evaluator runs this rewrite again over what it wrote (#6305).
 //!
 //! A pattern with syntax only `fancy-regex` reads (a lookaround, an atomic group, a backreference,
 //! `\K`, `\G`, a comment) is parsed through `oniguruma_shadow`'s copy of it, which writes that syntax
@@ -104,6 +104,18 @@ struct Rewriter<'p> {
     work: core::cell::Cell<usize>,
     work_limit: usize,
     changed: bool,
+}
+
+/// Whether a flag switch (`(?i)`, not a flag group) stands anywhere in `ast`.
+fn has_switch(ast: &Ast) -> bool {
+    match ast {
+        Ast::Flags(_) => true,
+        Ast::Group(group) => has_switch(&group.ast),
+        Ast::Alternation(alt) => alt.asts.iter().any(has_switch),
+        Ast::Concat(concat) => concat.asts.iter().any(has_switch),
+        Ast::Repetition(rep) => has_switch(&rep.ast),
+        _ => false,
+    }
 }
 
 /// A piece that matches only the empty string and has no text of its own.
@@ -439,7 +451,13 @@ impl Rewriter<'_> {
             }
             Ast::Group(group) => self.group(group, listed),
             Ast::Repetition(rep) => {
-                let body = self.convert(&rep.ast, true)?;
+                let mut body = self.convert(&rep.ast, true)?;
+                // #6301: the scoped switch is verified for the greedy loop. A lazy repeat decides
+                // whether Oniguruma unrolls it from the body's operation count (`onig_ops`), which does
+                // not read a switch, so it keeps the switch as the unknown it was.
+                if !rep.greedy && has_switch(&rep.ast) {
+                    body.ways = Ways::Unknown;
+                }
                 let (min, max) = bounds(&rep.op.kind);
                 if !rep.greedy && max.is_none() && self.oniguruma_unrolls(&rep.ast, min) {
                     return self.lazy_unrolled(body, min);

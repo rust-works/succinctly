@@ -7776,6 +7776,7 @@ These keep their loop as written, and still match longer than jq where the shape
 - **A body with a flag switch** (`(?i)` inside it) is rewritten with the switch scoped over what it reaches, as `(?i:..)` around the items after it and around every later way ([#6301](https://github.com/rust-works/succinctly/issues/6301)): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and here.
   A differential over 13,056 cases (16 body shapes with `(?i)`, `(?-i)`, `(?s)`, `(?m)`, `(?i-s)`, `(?is)` and `(?i)(?s)` in each position, six loop forms, 17 strings) differed in 885 before and in none after.
   A switch that names `x` or `U` still keeps its loop as written: `x` makes the text after it blanks and comments, which a closing parenthesis would join to the last comment, and `U` swaps greedy and lazy.
+  A lazy repeat over such a body keeps its loop too: whether Oniguruma unrolls it comes from an operation count that does not read a switch, so `"ca-" | match("(?:a?|(?i)\\w){2,}?"; "gn")` is left as it was.
 - **A body with syntax only `fancy-regex` reads** (a lookaround, an atomic group, a backreference, `\K`, `\G`, or a comment and a quantifier after a quantifier) keeps its loop, which `fancy-regex` then runs itself and mostly as jq does.
   Over 40,000 generated cases with such syntax in a loop body, 42 were fixed, none broken, and 2,356 differed as before, of three kinds.
   1,648 were `\K` as a bare alternative (`(?:\K|a)+`), a pattern jq refuses and succinctly accepted.
