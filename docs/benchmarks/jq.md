@@ -178,7 +178,7 @@ Geomean speedup over jq-1.7.1: **1.63x** across 85 timed rows; jq-1.7.1 is faste
 | `corpus_openapi_paths`       | corpus-openapi    |           2.1 |                2.0 |   **1.07x** |        3.47x |
 <!-- /compare:jq-linux-x86_64 -->
 
-The sections below are `bench run jq_bench` and `dev bench jq` results, measured by the method this section's header describes: all jq runs, then all succinctly runs, against the `jq` on `PATH` (the runners have interleaved since #5409; these tables predate that). That is not the interleaved method of [benchmarking.md](../guides/benchmarking.md#ab-benchmarking-method), so where a figure below disagrees with the block above, the block is the measurement.
+The sections below are `bench run jq_bench` and `dev bench jq` results, measured before #5409 made those runners interleave: all jq runs, then all succinctly runs, against the `jq` on `PATH`. That is not the interleaved method of [benchmarking.md](../guides/benchmarking.md#ab-benchmarking-method), so where a figure below disagrees with the block above, the block is the measurement.
 
 ## Query mix (users pattern)
 
@@ -829,7 +829,7 @@ Geomean speedup over jq-1.7.1: **1.85x** across 85 timed rows; jq-1.7.1 is faste
 | `corpus_openapi_paths`       | corpus-openapi    |           2.8 |                2.6 |   **1.06x** |        1.91x |
 <!-- /compare:jq-macos-aarch64 -->
 
-The sections below are `bench run jq_bench` and `dev bench jq` results, measured by the method this section's header describes: all jq runs, then all succinctly runs, against the `jq` on `PATH` (the runners have interleaved since #5409; these tables predate that). That is not the interleaved method of [benchmarking.md](../guides/benchmarking.md#ab-benchmarking-method), so where a figure below disagrees with the block above, the block is the measurement.
+The sections below are `bench run jq_bench` and `dev bench jq` results, measured before #5409 made those runners interleave: all jq runs, then all succinctly runs, against the `jq` on `PATH`. That is not the interleaved method of [benchmarking.md](../guides/benchmarking.md#ab-benchmarking-method), so where a figure below disagrees with the block above, the block is the measurement.
 
 ## Query mix (users pattern)
 

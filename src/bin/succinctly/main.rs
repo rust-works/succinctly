@@ -2260,6 +2260,10 @@ fn run_jq_benchmark(args: BenchJqArgs) -> Result<()> {
         }
     }
 
+    if args.runs == 0 {
+        anyhow::bail!("--runs must be at least 1: the median of no runs is undefined");
+    }
+
     let config = jq_bench::BenchConfig {
         data_dir: args.data_dir,
         patterns,
@@ -3394,6 +3398,17 @@ mod tests {
         assert!(
             msg.contains("jq not found") || msg.contains("binary not found"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_run_jq_benchmark_rejects_zero_runs() {
+        let mut args = bench_jq_args("arrays", "1kb", "identity", "./nonexistent");
+        args.runs = 0;
+        let err = run_jq_benchmark(args).unwrap_err();
+        assert!(
+            err.to_string().contains("--runs must be at least 1"),
+            "{err}"
         );
     }
 
