@@ -8264,6 +8264,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn is_header_only_document(&self) -> bool {
+        YamlCursor::is_header_only_document(self)
+    }
+
+    #[inline]
     fn is_falsy(&self) -> bool {
         // A value is falsy if it's null or false.
         match self.value() {

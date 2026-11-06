@@ -1293,6 +1293,16 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         false
     }
     // patchcov: coverage end
+
+    /// Whether [`stream_yaml_as_document`](Self::stream_yaml_as_document) writes this cursor as
+    /// only the verbatim header the first document carries, so that header's own line break
+    /// already ends the output and the caller's per-result terminator must not follow (#5721).
+    ///
+    /// Only a YAML document with no content of its own (comment-only or blank-only input) is
+    /// one. Default `false`: a format with no such header (JSON) always has a value line.
+    fn is_header_only_document(&self) -> bool {
+        false
+    }
 }
 
 /// A value from a document (JSON value or YAML value).

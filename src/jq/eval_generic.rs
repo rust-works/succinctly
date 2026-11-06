@@ -8710,7 +8710,11 @@ impl<V: DocumentValue> GenericResult<V> {
                     absorb_stream_failure(e, &mut stats)?;
                     return Ok(stats);
                 }
-                on_value(out)?;
+                // #5721: a document with no content prints only its header, whose own line
+                // break already ends it; the terminator would add a blank line yq never writes.
+                if !c.is_header_only_document() {
+                    on_value(out)?;
+                }
                 stats.count = 1;
                 stats.last_was_falsy = c.is_falsy();
                 stats.any_truthy = !stats.last_was_falsy;
@@ -8742,7 +8746,10 @@ impl<V: DocumentValue> GenericResult<V> {
                         stats.count = i;
                         return Ok(stats);
                     }
-                    on_value(out)?;
+                    // #5721: see `OneCursor` above.
+                    if !c.is_header_only_document() {
+                        on_value(out)?;
+                    }
                     stats.last_was_falsy = c.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
                 }

@@ -1161,13 +1161,85 @@ fn glue_leading_marker_for(eval_all: bool, at: usize) -> bool {
 /// be known to be empty before it is read, so a run mixing it with empty files reads nothing from
 /// those.
 fn empty_input_reads_as(
-    mut bytes: Vec<u8>,
+    bytes: Vec<u8>,
     format: InputFormat,
     input_files: &[String],
     at: usize,
     front_matter: bool,
     glue_leading_marker: bool,
 ) -> Option<(Vec<u8>, InputFormat)> {
+    empty_input_reads_as_flagged(
+        bytes,
+        format,
+        input_files,
+        at,
+        front_matter,
+        glue_leading_marker,
+    )
+    .map(|(bytes, format, _synthesized)| (bytes, format))
+}
+
+thread_local! {
+    /// Whether this run's only document is the empty one [`empty_input_reads_as`] synthesizes
+    /// (#5721). That document has no file behind it: `filename` is empty, where a file that
+    /// merely holds a line break is named. Set by [`read_input_noting_empty_document`], cleared
+    /// when a run starts, and read by [`file_index_scope_for`].
+    static EMPTY_DOCUMENT_RUN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// [`empty_input_reads_as`] for the code that reads an input to evaluate it: it records that the
+/// run reads the synthesized empty document, which the probe call in `gathered_file_indices` must
+/// not (#5721).
+fn read_input_noting_empty_document(
+    bytes: Vec<u8>,
+    format: InputFormat,
+    input_files: &[String],
+    at: usize,
+    front_matter: bool,
+    glue_leading_marker: bool,
+) -> Option<(Vec<u8>, InputFormat)> {
+    empty_input_reads_as_flagged(
+        bytes,
+        format,
+        input_files,
+        at,
+        front_matter,
+        glue_leading_marker,
+    )
+    .map(|(bytes, format, synthesized)| {
+        if synthesized {
+            EMPTY_DOCUMENT_RUN.with(|run| run.set(true));
+        }
+        (bytes, format)
+    })
+}
+
+/// The per-file origin scope for input number `file_index` (#2427), except that the synthesized
+/// empty document has no file (#5721): no scope makes `filename` answer `""`, and `file_index`
+/// and `document_index` fall back to the `0` yq gives it.
+fn file_index_scope_for(file_index: usize) -> Option<jq::FileIndexScope> {
+    (!EMPTY_DOCUMENT_RUN.with(Cell::get)).then(|| jq::enter_file_index_scope(file_index))
+}
+
+/// `--eval-all` takes each document's origin from the list it evaluates, not from a per-file scope,
+/// so for the synthesized empty document it empties the name table instead (#5721): the document
+/// keeps its file number `0`, and `filename` finds no name for it.
+fn eval_all_names_scope() -> Option<jq::FileNamesScope> {
+    EMPTY_DOCUMENT_RUN
+        .with(Cell::get)
+        .then(|| jq::enter_file_names_scope(Vec::new()))
+}
+
+/// [`empty_input_reads_as`] with a third element: whether the document is the synthesized empty
+/// one (the input held none), not one the input spelled.
+fn empty_input_reads_as_flagged(
+    mut bytes: Vec<u8>,
+    format: InputFormat,
+    input_files: &[String],
+    at: usize,
+    front_matter: bool,
+    glue_leading_marker: bool,
+) -> Option<(Vec<u8>, InputFormat, bool)> {
     // #5356: yq reads past a UTF-8 byte-order mark at the front of a YAML stream, each file
     // being a stream of its own; it was becoming part of the first key. A JSON document with
     // one is `invalid character 'ï'` in yq, so JSON keeps its mark and is refused as before.
@@ -1192,7 +1264,7 @@ fn empty_input_reads_as(
         }
     }
     if !holds_no_document(&bytes, format) || front_matter {
-        return Some((bytes, format));
+        return Some((bytes, format, false));
     }
     // `at == 0` first: it settles every input but the first without opening a file.
     (at == 0
@@ -1201,8 +1273,8 @@ fn empty_input_reads_as(
                 .iter()
                 .all(|file| input_file_holds_no_document_bytes(file, format))))
     .then(|| match format {
-        InputFormat::Json => (b"\n".to_vec(), InputFormat::Yaml),
-        _ => (b"\n".to_vec(), format),
+        InputFormat::Json => (b"\n".to_vec(), InputFormat::Yaml, true),
+        _ => (b"\n".to_vec(), format, true),
     })
 }
 
@@ -1837,7 +1909,7 @@ fn gather_input_sources(
     let mut sources = Vec::new();
     let resolved_format = resolve_run_input_format(input_format, input_files);
     if input_files.is_empty() {
-        let (raw_bytes, resolved_format) = empty_input_reads_as(
+        let (raw_bytes, resolved_format) = read_input_noting_empty_document(
             read_stdin()?,
             resolved_format,
             input_files,
@@ -1859,7 +1931,7 @@ fn gather_input_sources(
             if is_drained_stdin_file_argument(path) {
                 continue;
             }
-            let Some((raw_bytes, resolved_format)) = empty_input_reads_as(
+            let Some((raw_bytes, resolved_format)) = read_input_noting_empty_document(
                 read_file(path)?,
                 resolved_format,
                 input_files,
@@ -10593,6 +10665,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // line; with no file argument the input is stdin, which real yq names `-`.
     // `-n` reads nothing, so it has no file to name. Held for the whole run:
     // each per-file loop below picks its own entry.
+    EMPTY_DOCUMENT_RUN.with(|run| run.set(false));
     let _file_names_scope = jq::enter_file_names_scope(if args.null_input {
         Vec::new()
     } else if input_files.is_empty() {
@@ -10856,6 +10929,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 &input_files,
                 args.input_format,
             );
+            let _names = eval_all_names_scope();
             let query_result: QueryResult<'_, Vec<u64>> =
                 jq::eval_documents_together::<Vec<u64>, YqSemantics>(&program.expr, &all_docs);
             let results = query_result_to_owned_values(query_result, &mut sink);
@@ -11568,7 +11642,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
 
         if input_files.is_empty() {
             let fmt = resolve_input_format(args.input_format, None);
-            let (yaml_bytes, fmt) = empty_input_reads_as(
+            let (yaml_bytes, fmt) = read_input_noting_empty_document(
                 read_stdin()?,
                 fmt,
                 &input_files,
@@ -11762,7 +11836,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 // (`pkg/yqlib/utils.go:60-89`); this scope is succinctly's
                 // equivalent, and `yq 'file_index' f1 f2` prints `0` then `1`
                 // on both binaries because of it.
-                let _file_index_scope = jq::enter_file_index_scope(file_index);
+                let _file_index_scope = file_index_scope_for(file_index);
                 let path = Path::new(file_path);
                 if is_drained_stdin_file_argument(path) {
                     continue;
@@ -11774,7 +11848,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 // below) -- `flush_then_err` keeps this error as the
                 // reported one even if the flush also fails.
                 let (yaml_bytes, fmt) = match read_file(path) {
-                    Ok(bytes) => match empty_input_reads_as(
+                    Ok(bytes) => match read_input_noting_empty_document(
                         bytes,
                         // #4394: the first file's extension decides for all of them.
                         run_input_format,
@@ -12054,6 +12128,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     &input_files,
                     args.input_format,
                 );
+                let _names = eval_all_names_scope();
                 let query_result: QueryResult<'_, Vec<u64>> =
                     jq::eval_documents_together::<Vec<u64>, YqSemantics>(&program.expr, &all_docs);
                 query_result_to_owned_values(query_result, &mut sink)
@@ -12189,7 +12264,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 // (`pkg/yqlib/utils.go:60-89`); this scope is succinctly's
                 // equivalent, and `yq 'file_index' f1 f2` prints `0` then `1`
                 // on both binaries because of it.
-                let _file_index_scope = jq::enter_file_index_scope(file_index);
+                let _file_index_scope = file_index_scope_for(file_index);
 
                 // Yaml/Auto and Json both go through the same cursor-native
                 // evaluator now (#1398) -- JSON is a YAML subset, and
@@ -12586,7 +12661,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             // (`pkg/yqlib/utils.go:60-89`); this scope is succinctly's
             // equivalent, and `yq 'file_index' f1 f2` prints `0` then `1`
             // on both binaries because of it.
-            let _file_index_scope = jq::enter_file_index_scope(file_index);
+            let _file_index_scope = file_index_scope_for(file_index);
 
             let path = Path::new(file_path);
             if is_drained_stdin_file_argument(path) {
@@ -12594,7 +12669,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             }
             // #4394: the first file's extension decides for all of them.
             let resolved_format = run_input_format;
-            let Some((raw_bytes, resolved_format)) = empty_input_reads_as(
+            let Some((raw_bytes, resolved_format)) = read_input_noting_empty_document(
                 read_file(path)?,
                 resolved_format,
                 &input_files,
@@ -13141,7 +13216,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             // (`pkg/yqlib/utils.go:60-89`); this scope is succinctly's
             // equivalent, and `yq 'file_index' f1 f2` prints `0` then `1`
             // on both binaries because of it.
-            let _file_index_scope = jq::enter_file_index_scope(file_index);
+            let _file_index_scope = file_index_scope_for(file_index);
 
             // Yaml/Auto and Json both go through the same cursor-native
             // evaluator now (#1398) -- see the matching comment on the
