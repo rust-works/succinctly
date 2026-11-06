@@ -6151,12 +6151,14 @@ impl<'a> YamlString<'a> {
 
         // Auto-detect from the first non-empty line. On a document-start line
         // (`--- |`) a zero-indented block scalar is valid, so indent 0 counts.
+        // The indent is the widest of the leading blank lines and the first content line, as
+        // go-yaml has it and `Parser::detect_block_content_indent` does (#6381, #6393).
         match Self::detect_block_indent(text, content_start) {
-            Some(indent)
+            Some((indent, widest_blank))
                 if indent > base_indent
                     || (Self::is_document_start_line(text, indicator_pos) && indent == 0) =>
             {
-                Some(indent)
+                Some(indent.max(widest_blank))
             }
             _ => None,
         }
@@ -6252,6 +6254,12 @@ impl<'a> YamlString<'a> {
 
             let break_len = line_break_len(text, pos);
             if break_len > 0 {
+                // A line of spaces past the indent has the extra spaces as its text (go-yaml eats
+                // spaces only up to the indent column): content, not an empty line (#6393).
+                if line_indent > content_indent {
+                    last_content_end = pos;
+                    has_content = true;
+                }
                 // Empty line - include in content area
                 pos += break_len;
             } else {
@@ -6425,10 +6433,13 @@ impl<'a> YamlString<'a> {
     }
 
     /// Detect content indentation from first non-empty line.
-    /// Returns None if no content lines found, Some(indent) otherwise.
+    /// Returns None if no content lines found, Some((first content line's indent, the widest blank
+    /// line before it)) otherwise: go-yaml's indent is the larger of the two (#6381).
     /// Note: indent can be 0 for content at column 0.
-    fn detect_block_indent(text: &[u8], start: usize) -> Option<usize> {
+    fn detect_block_indent(text: &[u8], start: usize) -> Option<(usize, usize)> {
         let mut pos = start;
+        // The widest blank line before the first content line.
+        let mut widest_blank = 0;
 
         loop {
             if pos >= text.len() {
@@ -6448,12 +6459,13 @@ impl<'a> YamlString<'a> {
 
             match text[pos] {
                 b'\n' | b'\r' => {
+                    widest_blank = widest_blank.max(indent);
                     pos += line_break_len(text, pos);
                 }
                 // Note: '#' is NOT treated as a comment here because this function
                 // is used for block scalar content detection, where '#' is content.
                 _ => {
-                    return Some(indent);
+                    return Some((indent, widest_blank));
                 }
             }
         }
@@ -7375,9 +7387,11 @@ fn decode_block_folded(
             line_indent += 1;
         }
 
-        // Check if this is a blank line
-        let is_blank =
-            pos + line_indent >= content.len() || is_line_break(content[pos + line_indent]);
+        // Check if this is a blank line. A line of spaces past the indent is not one: the extra
+        // spaces are its text, and it is a more-indented line (#6393).
+        let is_blank = (pos + line_indent >= content.len()
+            || is_line_break(content[pos + line_indent]))
+            && line_indent <= indent;
 
         if is_blank {
             // Count it only if its break is really there — trailing whitespace
@@ -13770,6 +13784,55 @@ mod tests {
             (b"fold: >+\n  a\r", "a\n"),
             (b"fold: >\r\n  a\r\n\r\n  b", "a\nb"),
         ]);
+    }
+
+    /// #6393: a line of spaces wider than the indent has the extra spaces as its text, so it is a
+    /// content line (a more-indented one under `>`), at the end of the scalar and in front of the
+    /// first content line; a line no wider than the indent is blank. Expected values are
+    /// mikefarah/yq v4.53.3.
+    #[test]
+    fn test_block_folded_wide_whitespace_line_is_content_6393() {
+        assert_folded(&[
+            (b"fold: >\n  a\n    \nb: 1\n", "a\n  \n"),
+            (b"fold: >\n  a\n   \nb: 1\n", "a\n \n"),
+            (b"fold: >\n  a\n  \nb: 1\n", "a\n"),
+            (b"fold: >-\n  a\n    \nb: 1\n", "a\n  "),
+            (b"fold: >+\n  a\n    \n\nb: 1\n", "a\n  \n\n"),
+            (b"fold: >\n  a\n    \n  b\n", "a\n  \nb\n"),
+            (b"fold: >\n  a\n\n    \n  b\n", "a\n\n  \nb\n"),
+            (b"fold: >2\n    \nb: 1\n", "  \n"),
+            (b"fold: >2\n   \n  x\nb: 1\n", " \nx\n"),
+        ]);
+    }
+
+    /// #6393, literal side: the same line is kept as written, and `|+` already did.
+    #[test]
+    fn test_block_literal_wide_whitespace_line_is_content_6393() {
+        for (yaml, expected) in [
+            (&b"lit: |\n  a\n    \nb: 1\n"[..], "a\n  \n"),
+            (b"lit: |\n  a\n   \nb: 1\n", "a\n \n"),
+            (b"lit: |\n  a\n  \nb: 1\n", "a\n"),
+            (b"lit: |-\n  a\n    \nb: 1\n", "a\n  "),
+            (b"lit: |+\n  a\n    \n\nb: 1\n", "a\n  \n\n"),
+            (b"lit: |\n  a\n    \n    \nb: 1\n", "a\n  \n  \n"),
+            (b"lit: |3\n    \nb: 1\n", " \n"),
+            (b"lit: |\n     \n  # c\nb: 1\n", ""),
+        ] {
+            let index = YamlIndex::build(yaml).unwrap();
+            let root = index.root(yaml);
+            let YamlValue::Mapping(fields) = first_doc(root) else {
+                panic!("expected mapping for {:?}", String::from_utf8_lossy(yaml));
+            };
+            let Some(YamlValue::String(s)) = fields.find("lit") else {
+                panic!("expected string for {:?}", String::from_utf8_lossy(yaml));
+            };
+            assert_eq!(
+                &*s.as_str().unwrap(),
+                expected,
+                "{:?}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
     }
 
     /// Issue #344, folded side: with no content lines at all, keep chomping has
