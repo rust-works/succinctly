@@ -547,10 +547,12 @@ struct Parser<'a, const HAS_CR: bool> {
 
     /// The explicit keys still waiting for a value *behind* the one in
     /// [`Self::pending_explicit_key`], outermost first, as `(owner depth, empty)`
-    /// pairs, the next one to be handed back last. A key whose own content is an explicit key (`? ? a\n  : b\n: c`, #6322) opens
-    /// a mapping that has a `?` of its own: the inner key's `:` has to find the inner owner,
-    /// and the outer key's `:` has to find the outer one once the inner mapping has closed.
-    /// [`Self::clear_pending_explicit_key`] hands the next one back.
+    /// pairs, the next one to be handed back last. A key whose own content is an explicit key (`? ? a\n  : b\n: c`, #6322;
+    /// `? - ? a\n    : b\n: c`, whose first item opens it, #6340) opens a mapping that has a `?` of its own: the inner
+    /// key's `:` has to find the inner owner, and the outer key's `:` has to find the outer one once
+    /// the inner mapping has closed. [`Self::parse_nested_explicit_key`] files the outer one;
+    /// `parse_explicit_key` then leaves the inner key as the pending one rather than writing its own
+    /// owner over it. [`Self::clear_pending_explicit_key`] hands the next one back.
     pending_explicit_key_below: Vec<(usize, bool)>,
 
     /// Current depth of recursively-parsed constructs, capped at
@@ -5762,7 +5764,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
                 if !self.at_line_end() {
                     // Parse item value
-                    if self.looks_like_mapping_entry() {
+                    if self.peek() == Some(b'?') && Self::is_ws_break_or_eoi(self.peek_at(1)) {
+                        // `? - ? x`: the first item is a compact mapping whose first entry is an
+                        // explicit key of its own (#6340), as the node after `? ` is (#6322): the
+                        // outer key waits behind the inner one's. A later item is dispatched by
+                        // `parse_sequence_item`, which finds the outer key already waiting.
+                        self.parse_nested_explicit_key(false, Some(owner_depth))?;
+                    } else if self.looks_like_mapping_entry() {
                         // The key's real column, not a hardcoded `indent + 3`
                         // - `- ` is already skipped above, so `self.pos` sits
                         // at the key. `indent + 3` was wrong even for the
@@ -5783,17 +5791,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // key now waiting for a value; the outer one waits behind it until the inner mapping
             // closes ([`Self::pending_explicit_key_below`]).
             Some(b'?') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
-                // Properties on the line before it (`? !!str ? a`) are refused by yq (`mapping key
-                // is not allowed in this context`), which a property on a compact mapping's own
-                // first entry is not.
-                if key_has_properties {
-                    return Err(self.err_unexpected_char(
-                        self.pos,
-                        "mapping key is not allowed in this context",
-                    ));
-                }
-                self.parse_explicit_key(self.current_column())?;
-                self.wait_behind_pending_explicit_key(owner_depth, false);
+                self.parse_nested_explicit_key(key_has_properties, Some(owner_depth))?;
                 return Ok(());
             }
             // `? [1, 2]: value`: the node after `? ` is a compact mapping keyed by
@@ -5912,13 +5910,54 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
         }
 
-        // Mark that we have an explicit key waiting for a value
-        self.set_pending_explicit_key(owner_depth, false);
+        // Mark that we have an explicit key waiting for a value, unless a key nested in this one's
+        // own content is the one waiting (`? - ? x`, #6340): it took the value first, and this one
+        // is behind it ([`Self::pending_explicit_key_below`]).
+        if !self
+            .pending_explicit_key
+            .is_some_and(|nested| nested > owner_depth)
+        {
+            self.set_pending_explicit_key(owner_depth, false);
+        }
 
         Ok(())
     }
 
     /// Parse an explicit value (`: value` after explicit key).
+    /// An explicit key that is the first entry of a compact mapping standing where a node is expected:
+    /// the node after `? ` (#6322), after the `- ` that opens a key sequence (#6340) and after an
+    /// explicit value's `: ` (#6340). The one place these three sites share, so a refusal added to
+    /// one cannot be missing from the others.
+    ///
+    /// `has_properties`: a property on the line before the `?` (`? !!str ? a`, `: &t ? x`) is refused
+    /// by yq (`mapping key is not allowed in this context`), which a property on a compact mapping's
+    /// own first entry is not. A tab straight after the indicator is refused too, go-yaml skipping no
+    /// tab where a simple key is allowed (`found character that cannot start any token`).
+    ///
+    /// `outer_owner_depth` is the mapping of the explicit key whose content this is, still to get its
+    /// value: it waits behind the inner key ([`Self::pending_explicit_key_below`]). `None` when the
+    /// content is a value, whose key has had its `:` already.
+    fn parse_nested_explicit_key(
+        &mut self,
+        has_properties: bool,
+        outer_owner_depth: Option<usize>,
+    ) -> Result<(), YamlError> {
+        if has_properties {
+            return Err(
+                self.err_unexpected_char(self.pos, "mapping key is not allowed in this context")
+            );
+        }
+        if self.peek_at(1) == Some(b'\t') {
+            return Err(self
+                .err_unexpected_char(self.pos + 1, "found character that cannot start any token"));
+        }
+        self.parse_explicit_key(self.current_column())?;
+        if let Some(owner_depth) = outer_owner_depth {
+            self.wait_behind_pending_explicit_key(owner_depth, false);
+        }
+        Ok(())
+    }
+
     fn parse_explicit_value(&mut self, indent: usize) -> Result<(), YamlError> {
         // Same ambiguous-gap error as parse_mapping_entry (#901).
         self.check_mapping_under_mapping_gap(indent, false)?;
@@ -6039,6 +6078,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // parser opens the item wrapper via `write_bp_open_seq_item`, so
                 // the #332 wrapper-end invariant is enforced here too.
                 self.parse_sequence_item(self.current_column())?;
+            }
+            // `: ? x`: the node after `: ` is a compact mapping whose first entry is an explicit key
+            // of its own, as the node after `- ` is (#339) and the node after `? ` is (#6322). The
+            // `?` indicator wins over a `: ` later on the line, as in the main loop's dispatch.
+            // Properties on the line before it (`: &t ? x`) are refused by yq (`mapping key is not
+            // allowed in this context`), which a property on a compact mapping's own first entry
+            // is not.
+            Some(b'?') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
+                self.parse_nested_explicit_key(had_property, None)?;
             }
             _ if self.looks_like_mapping_entry() => {
                 // `: b: c` — the mirror of the key-side arm above: the node after `: `
