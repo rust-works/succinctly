@@ -118,6 +118,20 @@ pub struct NodeComments {
     pub foot: Vec<(u32, u32)>,
 }
 
+/// What a comment on the line of a flow collection's comma is, when it follows an element and
+/// that line is not the element's own (#6334).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommaLine {
+    /// The comma is on the element's line (or the comment is not on the comma's): a comment on
+    /// that line is the element's line comment.
+    Own,
+    /// The comma starts a line and the element has a line comment already: yq reads the comment
+    /// as the head of what follows.
+    Head,
+    /// Comments on lines of their own came before the comma: yq reads the comment as nothing.
+    Drop,
+}
+
 /// An open block sequence, as [`Parser::seq_frames`] tracks it (#1079).
 ///
 /// This is a second stack, parallel to (not folded into) `indent_stack`/
@@ -377,6 +391,11 @@ struct Parser<'a, const HAS_CR: bool> {
     /// and [`Self::take_pending_head_comment`] claims it once the next
     /// primary node (a mapping key or sequence item) actually opens.
     pending_head_comment: Option<(u32, u32)>,
+
+    /// Comments on lines of their own inside the flow collection being read, awaiting the element
+    /// that follows them (its head) or the closing bracket (the last element's foot) (#6334).
+    /// Every flow level drains it before it reads a nested collection, so one list serves them all.
+    flow_own_comments: Vec<(u32, u32)>,
 
     /// A run of standalone `#` lines awaiting forward attachment as the
     /// *next* node's `head` (#798). Distinct from
@@ -731,6 +750,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             pending_property_bp: None,
             comments: BTreeMap::new(),
             pending_head_comment: None,
+            flow_own_comments: Vec::new(),
             pending_head_lines: Vec::new(),
             last_head_foot_bp: None,
             comment_watermark: 0,
@@ -6322,9 +6342,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     }
 
     /// [`Self::skip_flow_whitespace`] where a comment on the line the cursor starts on, after the
-    /// element at `owner_bp_pos` or its comma, is that element's own line comment (#6334):
-    /// `[a, # c` / `  b]`. A comment on a line of its own is skipped, as before.
-    fn skip_flow_whitespace_noting_line_comment(&mut self, owner_bp_pos: Option<usize>) {
+    /// element at `owner_bp_pos`, is that element's own line comment (#6334): `[a, # c` / `  b]`.
+    /// A comment on a line of its own is held for the element that follows it, or for the
+    /// collection's last element when the closing bracket does (`take_flow_head`,
+    /// `give_flow_foot`). What a comment on the line of a comma that starts its own line is depends
+    /// on `on_comma_line`.
+    fn skip_flow_whitespace_noting_line_comment(
+        &mut self,
+        owner_bp_pos: Option<usize>,
+        on_comma_line: CommaLine,
+    ) {
         let mut same_line = true;
         while let Some(b) = self.peek() {
             match b {
@@ -6334,13 +6361,77 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     self.advance();
                 }
                 b'#' => {
-                    if let Some(owner) = owner_bp_pos.filter(|_| same_line) {
-                        self.maybe_capture_line_comment(owner);
+                    let start = self.pos;
+                    let owner = owner_bp_pos.filter(|_| same_line);
+                    match (owner, on_comma_line) {
+                        (Some(owner), CommaLine::Own) if same_line => {
+                            self.maybe_capture_line_comment(owner);
+                            self.skip_to_eol();
+                        }
+                        _ => {
+                            self.skip_to_eol();
+                            let range = (start as u32, self.pos as u32);
+                            if !same_line || (on_comma_line == CommaLine::Head) {
+                                self.flow_own_comments.push(range);
+                            }
+                        }
                     }
                     same_line = false;
-                    self.skip_to_eol();
                 }
                 _ => break,
+            }
+        }
+    }
+
+    /// What a comment on the line of the comma at `comma_pos` is, after the element at `owner` that
+    /// ended at `element_end` (#6334): the element's line comment, unless own-line comments came
+    /// before the comma (yq reads it as nothing), or the comma starts a line of its own and the
+    /// element has a line comment already (the head of what follows).
+    fn comma_line(&self, owner: Option<usize>, element_end: usize, comma_pos: usize) -> CommaLine {
+        if !self.flow_own_comments.is_empty() {
+            return CommaLine::Drop;
+        }
+        let starts_line = self.input[element_end.min(comma_pos)..comma_pos]
+            .iter()
+            .any(|&b| Self::is_break(b));
+        // Looked up for a comma that starts a line only, which keeps the map off the common path.
+        if starts_line
+            && owner.is_some_and(|bp| self.comments.get(&bp).is_some_and(|c| !c.line.is_empty()))
+        {
+            CommaLine::Head
+        } else {
+            CommaLine::Own
+        }
+    }
+
+    /// Give the comments held on lines of their own to the element about to open at `bp` as its
+    /// head (#6334).
+    fn take_flow_head(&mut self, bp: usize) {
+        if self.flow_own_comments.is_empty() {
+            return;
+        }
+        let held = core::mem::take(&mut self.flow_own_comments);
+        let head = &mut self.comments.entry(bp).or_default().head;
+        for range in held {
+            if !head.contains(&range) {
+                head.push(range);
+            }
+        }
+    }
+
+    /// Give the comments held on lines of their own to the last element, at `bp`, as its foot
+    /// when the closing bracket follows them; with no element to own them they are dropped, as yq
+    /// drops them (#6334).
+    fn give_flow_foot(&mut self, last: Option<usize>) {
+        let held = core::mem::take(&mut self.flow_own_comments);
+        let Some(bp) = last else { return };
+        if held.is_empty() {
+            return;
+        }
+        let foot = &mut self.comments.entry(bp).or_default().foot;
+        for range in held {
+            if !foot.contains(&range) {
+                foot.push(range);
             }
         }
     }
@@ -6868,14 +6959,19 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.write_bp_open();
         self.write_ty(true); // 1 = sequence
 
-        // Skip `[`
+        // Skip `[`; a comment on a line of its own after it heads the first element (#6334), one
+        // on its line is dropped.
         self.advance();
-        self.skip_flow_whitespace();
+        self.skip_flow_whitespace_noting_line_comment(None, CommaLine::Own);
 
         // Parse items
         let mut first = true;
         // The element the cursor is after, which a comment on the same line belongs to (#6334).
         let mut prev_element: Option<usize> = None;
+        // The last element read and where it ended, for a foot comment and for a comma that starts
+        // a line (#6334).
+        let mut last_element: Option<usize> = None;
+        let mut element_end = self.pos;
         while self.peek() != Some(b']') {
             if self.peek().is_none() {
                 return Err(YamlError::UnexpectedEof {
@@ -6902,8 +6998,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     );
                 }
                 let comma_pos = self.pos;
+                let on_comma_line = self.comma_line(prev_element, element_end, comma_pos);
+                // yq reads a comment on a line of its own before a trailing comma as nothing at all,
+                // and with it those after the comma (#6334).
+                let held_before_comma = self.flow_own_comments.len();
                 self.advance(); // Skip `,`
-                self.skip_flow_whitespace_noting_line_comment(prev_element);
+                self.skip_flow_whitespace_noting_line_comment(prev_element, on_comma_line);
 
                 // #2279: `[1,,2]` -- a second `,` where an element belongs
                 // (#2886: in YAML input too, as in go-yaml).
@@ -6923,6 +7023,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                             self.err_unexpected_char(comma_pos, "trailing ',' in JSON array")
                         );
                     }
+                    if held_before_comma > 0 {
+                        self.flow_own_comments.clear();
+                    }
                     break;
                 }
             }
@@ -6941,6 +7044,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // they're hoisted into locals and reused below rather than
             // re-run by the json_strict check and the dispatch separately.
             let element_bp = self.bp_pos;
+            self.take_flow_head(element_bp);
+            last_element = Some(element_bp);
             let is_explicit_key = self.looks_like_explicit_flow_key();
             let is_mapping_entry = is_explicit_key || self.looks_like_flow_mapping_entry();
             if self.json_strict && is_mapping_entry {
@@ -6967,8 +7072,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.parse_flow_value_node()?;
                 prev_element = Some(element_bp);
             }
-            self.skip_flow_whitespace_noting_line_comment(prev_element);
+            element_end = self.pos;
+            self.skip_flow_whitespace_noting_line_comment(prev_element, CommaLine::Own);
         }
+        self.give_flow_foot(last_element);
 
         // Skip `]`
         if self.peek() == Some(b']') {
@@ -7003,9 +7110,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.write_bp_open();
         self.write_ty(false); // 0 = mapping
 
-        // Skip `{`
+        // Skip `{`; as after `[`, a comment on a line of its own heads the first entry (#6334).
         self.advance();
-        self.skip_flow_whitespace();
+        if self.json_strict {
+            self.skip_flow_whitespace();
+        } else {
+            self.skip_flow_whitespace_noting_line_comment(None, CommaLine::Own);
+        }
 
         // #2777: real yq's own JSON-sourced object grammar is not YAML's
         // flow-mapping grammar at all -- see `parse_json_strict_flow_mapping_entries`'s
@@ -7221,6 +7332,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let mut first = true;
         // The value the cursor is after, which a comment on the same line belongs to (#6334).
         let mut prev_value: Option<usize> = None;
+        // The last entry's key and where the entry ended, as in a flow sequence (#6334).
+        let mut last_key: Option<usize> = None;
+        let mut entry_end = self.pos;
         while self.peek() != Some(b'}') {
             if self.peek().is_none() {
                 return Err(YamlError::UnexpectedEof {
@@ -7242,8 +7356,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         self.err_unexpected_char(self.pos, "expected ',' or '}' in flow mapping")
                     );
                 }
+                let on_comma_line = self.comma_line(prev_value, entry_end, self.pos);
+                let held_before_comma = self.flow_own_comments.len();
                 self.advance(); // Skip `,`
-                self.skip_flow_whitespace_noting_line_comment(prev_value);
+                self.skip_flow_whitespace_noting_line_comment(prev_value, on_comma_line);
 
                 // `{a: 1,,b: 2}` -- a second `,` where an entry belongs.
                 if self.peek() == Some(b',') {
@@ -7252,6 +7368,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
                 // Allow trailing comma
                 if self.peek() == Some(b'}') {
+                    if held_before_comma > 0 {
+                        self.flow_own_comments.clear();
+                    }
                     break;
                 }
             }
@@ -7287,6 +7406,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // Parse key
             let key_start = self.pos;
             self.set_ib();
+            // The entry's comments on lines of their own are its key's head, as in a block mapping
+            // (#6334).
+            self.take_flow_head(self.bp_pos);
+            last_key = Some(self.bp_pos);
             self.write_bp_open();
             if explicit {
                 // Records its own end, or none at all for a nested flow container.
@@ -7339,8 +7462,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 ));
             }
 
-            self.skip_flow_whitespace_noting_line_comment(prev_value);
+            entry_end = self.pos;
+            self.skip_flow_whitespace_noting_line_comment(prev_value, CommaLine::Own);
         }
+        self.give_flow_foot(last_key);
 
         Ok(())
     }

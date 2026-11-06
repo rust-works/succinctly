@@ -1736,9 +1736,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     if let Some((continuation, owner)) =
                         flow_comment_layout(indent, indent_spaces, unit, nested_flow).filter(|_| {
                             self.index.has_comments()
-                                && items
-                                    .iter()
-                                    .any(|field| field.value_cursor().line_comment_raw().is_some())
+                                && items.iter().any(|field| {
+                                    field.value_cursor().line_comment_raw().is_some()
+                                        || field.key_cursor().head_comment_raw().next().is_some()
+                                        || field.key_cursor().foot_comment_raw().next().is_some()
+                                })
                         })
                     {
                         let child_flow = if indent_spaces != 0 {
@@ -1762,6 +1764,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 text,
                                 field.value_cursor(),
                                 field.value_cursor(),
+                                field.key_cursor(),
                             ));
                         }
                         let rendered = render_flow('{', '}', entries, &continuation, &owner);
@@ -2012,7 +2015,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     // after the comma and before the next element.
                     if let Some((continuation, owner)) =
                         flow_comment_layout(indent, indent_spaces, unit, nested_flow).filter(|_| {
-                            self.index.has_comments() && flow_elements_have_line_comment(elements)
+                            self.index.has_comments() && flow_elements_have_comment(elements)
                         })
                     {
                         let child_flow = if indent_spaces != 0 {
@@ -2027,7 +2030,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             write_yaml_child_inline(
                                 &mut text, cursor, unit, sort_keys, child_flow,
                             )?;
-                            items.push(flow_item_of(text, cursor, cursor));
+                            items.push(flow_item_of(text, cursor, cursor, cursor));
                             elems = rest;
                         }
                         let rendered = render_flow('[', ']', items, &continuation, &owner);
@@ -10179,10 +10182,13 @@ fn flow_comment_layout(
     })
 }
 
-fn flow_elements_have_line_comment<W: AsRef<[u64]>>(elements: YamlElements<'_, W>) -> bool {
+fn flow_elements_have_comment<W: AsRef<[u64]>>(elements: YamlElements<'_, W>) -> bool {
     let mut elems = elements;
     while let Some((cursor, rest)) = elems.uncons_cursor() {
-        if cursor.line_comment_raw().is_some() {
+        if cursor.line_comment_raw().is_some()
+            || cursor.head_comment_raw().next().is_some()
+            || cursor.foot_comment_raw().next().is_some()
+        {
             return true;
         }
         elems = rest;
@@ -10192,16 +10198,20 @@ fn flow_elements_have_line_comment<W: AsRef<[u64]>>(elements: YamlElements<'_, W
 
 /// A flow collection's element as [`render_flow`] lays it out (#6334; `flow_item` in `yq_runner.rs` is
 /// the same decision for the DOM route): its text, the comment on
-/// `commented`, and whether `shape` is a collection that is not an alias, which a comment follows
-/// differently from a scalar.
+/// `commented`, the head and foot comments of `marked` (the element, or a mapping entry's key), and
+/// whether `shape` is a collection that is not an alias, which a comment follows differently from a
+/// scalar.
 fn flow_item_of<W: AsRef<[u64]>>(
     text: String,
     commented: YamlCursor<'_, W>,
     shape: YamlCursor<'_, W>,
+    marked: YamlCursor<'_, W>,
 ) -> FlowItem {
     FlowItem {
         text,
         comment: commented.line_comment_raw().map(String::from),
+        head: marked.head_comment_raw().map(String::from).collect(),
+        foot: marked.foot_comment_raw().map(String::from).collect(),
         container: !shape.is_alias()
             && matches!(
                 shape.value(),
