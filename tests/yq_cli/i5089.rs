@@ -40,7 +40,7 @@ fn test_content_after_a_document_end_marker_without_a_start_is_rejected_5089() -
 /// Other spellings yq rejects: content on the marker's own line, CRLF, and a directive followed by
 /// content with no `---`. A marker that opens the stream is refused for another reason, and is
 /// pinned in `i6342.rs`.
-const REJECTED_OTHER: &[&str] = &["a\n... b\n", "a\r\n...\r\nb\r\n", "a\n...\n%YAML 1.2\nb\n"];
+const REJECTED_OTHER: &[&str] = &["a\n... b\n", "a\r\n...\r\nb\r\n", "a\n...\n%YAML 1.1\nb\n"];
 
 #[test]
 fn test_other_spellings_of_content_after_an_end_marker_are_rejected_5089() -> Result<()> {
@@ -67,8 +67,8 @@ const ACCEPTED: &[(&str, &str)] = &[
     ("a\n...\n# only a comment\n", "\"a\"\n"),
     ("a\n...\n...\n", "\"a\"\n"),
     ("a\n---\nb\n...\n---\nc\n", "\"a\"\n\"b\"\n\"c\"\n"),
-    // A directive after `...` is rejected by yq and accepted here, as YAML 1.2 allows it.
-    ("a\n...\n%YAML 1.2\n---\nb\n", "\"a\"\n\"b\"\n"),
+    // A `%YAML 1.1` after `...` is go-yaml's to read, and it reads it (#6419).
+    ("a\n...\n%YAML 1.1\n---\nb\n", "\"a\"\n\"b\"\n"),
 ];
 
 #[test]

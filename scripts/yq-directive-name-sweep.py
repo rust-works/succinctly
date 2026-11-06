@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Differential sweep for #6412: random streams of directive lines (`%FOO`, `%TAG ...`, `%YAML`) around `---` and `...`.
+"""Differential sweep for #6412 and #6419: random streams of directive lines (`%FOO`, `%TAG ...`, `%YAML`) around `---` and `...`.
 
     scripts/yq-directive-name-sweep.py SEED COUNT SUBJECT [BASELINE]
 
-Each stream is two to five lines drawn from a pool (well-formed and malformed `%TAG` lines, unknown and empty directive
-names, `%YA..` lines yq's header slurp takes, markers, comments, content) and is run through yq v4.53.3 and SUBJECT (a
+Each stream is two to five lines drawn from a pool (well-formed and malformed `%TAG` and `%YAML` lines, unknown and empty directive
+names, `%YAML..` lines yq's header slurp takes, markers, comments, and content that leaves a node pending) and is run through yq v4.53.3 and SUBJECT (a
 `succinctly` binary, run as `yq`). A stream agrees when both refuse it, or neither does and the JSON matches. It prints
 how many streams agree and lists the first that do not. With a BASELINE binary it also lists the streams BASELINE
 read as yq does and SUBJECT does not.
@@ -18,7 +18,9 @@ rng = random.Random(seed)
 LINES = ["%YAML 1.2", "%YAML 1.1", "%YAMLL", "%YA", "%TAG ! x:", "%TAG !! y:", "%TAG !e! z", "%TAG !a-b_1! z",
          "%TAG !e! w", "%TAG", "%TAG !", "%TAG ! x: # c", "%TAG ! x: y", "%TAG ! x:# c", "%TAG x y", "%TAG !a b! x",
          "%TAG\t!\tx", "%TAGX ! x:", "%FOO", "%FOO bar", "%foo", "%", "% FOO", "%1", "%-", "%FOO # c", "%FOO#c",
-         "---", "...", "# c", "a: 1", "x", "", "  ", " %TAG ! x:", "--- x"]
+         "---", "...", "# c", "a: 1", "x", "", "  ", " %TAG ! x:", "--- x",
+         "%YAML 1.1 # c", "%YAML 1.1#c", "%YAML 1.2", "%YAML 1", "%YAML 1.1 x", "%YAML\t1.1", "%YAML 01.1", "%YAML 001.1", "%YAML 1.100",
+         "!!str", "&a", "a:", "- ", "- a", "? a", "a: |", "  x", "a: \"x\"", "a: [x]", "[a]", "\"x\""]
 def run(binary, text):
     r = subprocess.run(binary.split() + ["-o=json", "-I0", "."], input=text.encode(), capture_output=True)
     return ("ERR" if (r.returncode != 0 or b"Error" in r.stderr) else "OK"), r.stdout.decode(errors="replace")
