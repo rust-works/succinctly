@@ -9375,6 +9375,11 @@ fn write_yaml_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
         {
             out.write_str("!!merge ")?;
         }
+        // #6443: a key that is an empty plain scalar (`&a : 1`, `? ` / `: 1`) is written single-quoted
+        // by go-yaml's emitter, which cannot leave a simple key empty; an empty plain value stays bare.
+        if matches!(s, YamlString::Unquoted { .. }) && matches!(s.as_str(), Ok(v) if v.is_empty()) {
+            return Ok(out.write_str("''")?);
+        }
         // The index's own flag, so a JSON object key is written the way yq
         // writes a string it decoded from JSON (#3575). A JSON key always
         // parses as `YamlString::DoubleQuoted`, which is the variant that flag
