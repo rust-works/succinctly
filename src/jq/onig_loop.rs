@@ -922,10 +922,16 @@ impl Rewriter<'_> {
         min: u32,
         max: Option<u32>,
     ) -> Result<Piece, GiveUp> {
-        // #6301: the scoped switch is verified for the greedy loop. A lazy repeat decides whether
-        // Oniguruma unrolls it from the body's operation count (`onig_ops`), which does not read a
-        // switch, so it keeps the switch as the unknown it was.
-        if !rep.greedy && has_switch(&rep.ast) {
+        // #6301: the scoped switch is verified for the greedy loop. A lazy unbounded repeat decides
+        // whether Oniguruma unrolls it from the body's operation count (`onig_ops`), which does not
+        // read a switch, so it keeps the switch as the unknown it was. A lazy bounded one is never
+        // unrolled (Oniguruma expands only a greedy bounded repeat), so the count is not asked,
+        // except for a body with a way that is only an anchor, which the forms of
+        // [`Self::anchored_repeat`] were not checked against a switch.
+        if !rep.greedy
+            && (max.is_none() || matches!(body.ways, Ways::Anchored { .. }))
+            && has_switch(&rep.ast)
+        {
             body.ways = Ways::Unknown;
         }
         if let Ways::Anchored {
@@ -2350,6 +2356,25 @@ mod tests {
         let written = rewrite_with_groups(&format!("(?:(a)|b*|c)+{nested}")).unwrap();
         assert!(written.pattern.contains("{1,2}?"), "{}", written.pattern);
         assert_eq!(rewrite_with_groups(&nested).map(|g| g.pattern), None);
+    }
+
+    /// #6358: Oniguruma counts a lazy repeat with an upper bound whatever its body is, so a switch in
+    /// the body does not hide it; the unbounded one decides from an operation count that does not read
+    /// a switch, and a body with a way that is only an anchor was not checked against one.
+    #[test]
+    fn a_lazy_bounded_repeat_over_a_switch_is_written_and_the_others_are_not_6358() {
+        let written = rewrite_with_groups("((?i)|b*){2,5}?c").unwrap().pattern;
+        assert!(written.contains("(?i)"), "{written}");
+        assert!(!written.contains("){2,5}?"), "{written}");
+        assert!(rewrite_with_groups("((?i)|(b*)){2,4}?c").is_some());
+        assert_eq!(
+            rewrite_with_groups("((?i)|b*){2,}?c").map(|g| g.pattern),
+            None
+        );
+        assert_eq!(
+            rewrite_with_groups("(?:(?:(a)|b?){0,2}(\\z)|(?i)(a|b)){2,3}?").map(|g| g.pattern),
+            None
+        );
     }
 
     /// #6358: a flag switch in the body of a loop with groups is written as the flag group it stands
