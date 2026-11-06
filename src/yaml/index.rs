@@ -706,6 +706,14 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         !self.tags.is_empty()
     }
 
+    /// Whether the document has a comment recorded anywhere (a line, head or foot comment),
+    /// which lets a writer skip the scan for an element's comment in a comment-free document.
+    #[inline]
+    #[must_use]
+    pub fn has_comments(&self) -> bool {
+        !self.comments.is_empty()
+    }
+
     /// Get the raw trailing-comment byte range(s) for a BP position, if the
     /// node at that position has any same-line comment (issue #710).
     /// Usually zero or one entry; a mapping key can hold two (#1085) -- a
