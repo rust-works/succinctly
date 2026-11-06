@@ -5290,9 +5290,13 @@ ruled out), even though real yq supports every one of them:
   and no style of its own is also written as a block scalar, and an existing one survives a
   DOM write (`a: |\n  x` + `.b = 1` keeps `a: |`), all ported from libyaml's emitter and
   checked against yq v4.53.3 on ~5,000 random strings (tagged strings on another ~2,000).
-  Two go-yaml folded-writer quirks are reproduced rather than fixed, so a folded value does
+  Two go-yaml folded-writer quirks are reproduced by the write route rather than fixed, so a folded value does
   not always read back identically in yq either: a kept (`>+`) trailing run gains one empty
-  line, and a more-indented line (`x\n y`) gets an empty line before it. Divergences that
+  line, and a more-indented line (`x\n y`) gets an empty line before it.
+  The streaming route (`.`) reproduces the first and not the second: it writes the more-indented line without the empty line, because yq's output reads back as a different value (an extra newline, and it is not idempotent), which ADR-0018 does not follow (#836).
+  So `a: >` / `  x` / `    y` differs between `.` and a write here, and from yq on `.`.
+  A scalar that starts with blank lines is written as yq writes it on both routes (#6446), and a `>+` of nothing but blank lines gains no trailing empty line.
+  The divergences that
   remain for `tagged`: `1_000` is a string here where yq types it `!!int`;
   `2024-01-01` is `!!str` where yq has `!!timestamp` (no timestamp type); an explicit source
   tag is not kept (`a: !!float 1` prints `!!int 1`, [#1416](https://github.com/rust-works/succinctly/issues/1416));

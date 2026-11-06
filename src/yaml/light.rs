@@ -10823,6 +10823,10 @@ fn chomping_indicator(decoded: &str) -> ChompingIndicator {
 /// only arise with 2+ physical lines, which always means an embedded run
 /// exists too and takes the full-scan path below instead.
 fn widen_folded_breaks(decoded: &str, explicit_indent_used: bool) -> Cow<'_, str> {
+    // #6446: a value of nothing but breaks (`>+` over blank lines) gets no trailing "+1" from go-yaml either, so it
+    // is written as with an explicit indent: its last break is the separator's.
+    let explicit_indent_used =
+        explicit_indent_used || (!decoded.is_empty() && decoded.bytes().all(|b| b == b'\n'));
     let trailing_run_start = decoded.trim_end_matches('\n').len();
     // `decoded[..trailing_run_start]` is everything before the scalar's own
     // trailing run - correct even when there IS no trailing run at all
@@ -10861,6 +10865,14 @@ fn widen_folded_breaks(decoded: &str, explicit_indent_used: bool) -> Cow<'_, str
         let run_start = i;
         while i < bytes.len() && bytes[i] == b'\n' {
             i += 1;
+        }
+        // #6446: a run of breaks the string starts with has no line before it to fold into, so it is written
+        // as it is. Widening it wrote one empty line too many, which read back as another value (`"\n\nx\n"`
+        // became `"\n\n\nx\n"`); go-yaml's writer widens nothing for a string that starts with a break.
+        if run_start == 0 {
+            result.push_str(&decoded[run_start..i]);
+            line_start = i;
+            continue;
         }
         let is_trailing_run = run_start >= trailing_run_start;
         // The line just scanned (`line_start..run_start`) is non-empty by
@@ -18818,6 +18830,24 @@ plain: hello
             a.stream_yaml_as_document(&mut out, IndentSpec::spaces(2), false)
                 .unwrap();
             assert_eq!(out, "1");
+        }
+
+        #[test]
+        fn widen_folded_breaks_leaves_the_breaks_a_value_starts_with_alone_6446() {
+            // A run of breaks at the start has no line before it to fold into.
+            assert_eq!(widen_folded_breaks("\n\nx\n", false), "\n\nx\n");
+            assert_eq!(widen_folded_breaks("\n\nx\n\ny\n", false), "\n\nx\n\n\ny\n");
+            // Between two plain lines a break is widened, as before; beside a more-indented line it is not.
+            assert_eq!(widen_folded_breaks("x\ny\n", false), "x\n\ny\n");
+            assert_eq!(widen_folded_breaks("x\n  y\n", false), "x\n  y");
+            // A value of nothing but breaks loses the separator's, with or without an explicit indent.
+            assert_eq!(widen_folded_breaks("\n", false), "");
+            assert_eq!(widen_folded_breaks("\n\n", false), "\n");
+            assert_eq!(widen_folded_breaks("\n\n", true), "\n");
+            // Anything else keeps its trailing run's "+1" unless an indent was written.
+            assert_eq!(widen_folded_breaks("x\n\n", false), "x\n\n");
+            assert_eq!(widen_folded_breaks("x\n\n", true), "x\n");
+            assert_eq!(widen_folded_breaks("", false), "");
         }
 
         #[test]
