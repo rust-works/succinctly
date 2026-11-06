@@ -27817,6 +27817,73 @@ fn dv_captures_at<'h>(
     }
 }
 
+/// The byte spans of the `^` of `pattern` that stand under `(?m)` (#6456), or `None` when the
+/// `regex` crate's parser does not read the pattern. Flags are followed in the order they are
+/// written: a `(?m)` holds to the end of its group, a `(?m:...)` inside its body, and `(?-m)`
+/// turns it off.
+#[cfg(feature = "regex")]
+fn multiline_caret_spans(pattern: &str) -> Option<Vec<(usize, usize)>> {
+    use regex_syntax::ast::{self, AssertionKind, Ast, Flag, FlagsItemKind, GroupKind};
+    fn apply(flags: &ast::Flags, multi_line: &mut bool) {
+        let mut negated = false;
+        for item in &flags.items {
+            match item.kind {
+                FlagsItemKind::Negation => negated = true,
+                FlagsItemKind::Flag(Flag::MultiLine) => *multi_line = !negated,
+                FlagsItemKind::Flag(_) => {}
+            }
+        }
+    }
+    fn walk(ast: &Ast, multi_line: &mut bool, out: &mut Vec<(usize, usize)>) {
+        match ast {
+            Ast::Flags(set) => apply(&set.flags, multi_line),
+            Ast::Assertion(assertion) => {
+                if *multi_line && assertion.kind == AssertionKind::StartLine {
+                    out.push((assertion.span.start.offset, assertion.span.end.offset));
+                }
+            }
+            Ast::Group(group) => {
+                let outer = *multi_line;
+                if let GroupKind::NonCapturing(flags) = &group.kind {
+                    apply(flags, multi_line);
+                }
+                walk(&group.ast, multi_line, out);
+                *multi_line = outer;
+            }
+            Ast::Repetition(rep) => walk(&rep.ast, multi_line, out),
+            Ast::Alternation(alt) => alt.asts.iter().for_each(|a| walk(a, multi_line, out)),
+            Ast::Concat(concat) => concat.asts.iter().for_each(|a| walk(a, multi_line, out)),
+            _ => {}
+        }
+    }
+    let tree = ast::parse::Parser::new().parse(pattern).ok()?;
+    let mut spans = Vec::new();
+    walk(&tree, &mut false, &mut spans);
+    Some(spans)
+}
+
+/// Whether `pattern` has a `^` under `(?m)` (#6456).
+#[cfg(feature = "regex")]
+fn has_multiline_caret(pattern: &str) -> bool {
+    pattern.contains('^')
+        && pattern_may_enable_multiline(pattern)
+        && multiline_caret_spans(pattern).is_some_and(|spans| !spans.is_empty())
+}
+
+/// `pattern` with each `^` under `(?m)` written as Oniguruma reads it (#6456): it holds at the
+/// start of the text, and after a newline unless that is the end of the text (`ON_STR_END`), so
+/// `"a\n" | [match("(?m)^";"g").offset]` is `[0]`. The `regex` crate's holds after any newline,
+/// and has no look-ahead to say "not the end"; `fancy-regex` has. `None` when there is none.
+#[cfg(feature = "regex")]
+fn rewrite_multiline_caret(pattern: &str) -> Option<String> {
+    let spans = multiline_caret_spans(pattern).filter(|spans| !spans.is_empty())?;
+    let mut text = pattern.to_string();
+    for &(start, end) in spans.iter().rev() {
+        text.replace_range(start..end, r"(?:\A|^(?!\z))");
+    }
+    Some(text)
+}
+
 /// The exact reading of a pattern's `$` for [`dv_captures_at`]: the `fancy-regex` compilation of
 /// it, built the first time two views of a text disagree and kept after (a pattern that does not
 /// reach that point never pays for it).
@@ -27867,6 +27934,12 @@ struct JqRegex {
     needs_trailing_nl_check: bool,
     /// The exact reading of `$` for a pattern with `needs_trailing_nl_check` (#5572).
     exact_end: Option<ExactEnd>,
+    /// For a pattern with a `^` under `(?m)`: the exact reading of it (#6456). Oniguruma's `^`
+    /// does not hold at the end of the text after a final newline, where the `regex` crate's does.
+    /// A match of the crate that ends at the end of such a text may have used it there, so it is
+    /// asked of the `fancy-regex` build, which writes the `^` as Oniguruma reads it (see
+    /// [`rewrite_multiline_caret`]). Every other match is the same in both.
+    caret_end: Option<ExactEnd>,
     suppress_empty: bool,
     /// `n` is enforced by the `fancy-regex` engine itself (its not-empty mode, #5530), which
     /// refuses a match that ends where the attempt began, as Oniguruma's
@@ -28051,13 +28124,48 @@ impl JqRegex {
         self.suppress_empty && !self.engine_not_empty
     }
 
+    /// A match of the `regex` crate that ends at the end of a text with a final newline, for a
+    /// pattern with a `^` under `(?m)`, may have used the `^` there, which Oniguruma's does not
+    /// hold at (#6456). The `fancy-regex` build of the pattern, with that `^` written as Oniguruma
+    /// reads it, answers for the search; a match that ends before the end cannot have used it. A
+    /// pattern the build refuses keeps the crate's match, as before.
+    fn caret_at_the_end<'h>(
+        &self,
+        input: &'h str,
+        start: usize,
+        caps: Option<RegexCaptures<'h>>,
+    ) -> Result<Option<RegexCaptures<'h>>, EvalError> {
+        let Some(exact) = self.caret_end.as_ref() else {
+            return Ok(caps);
+        };
+        let at_the_end = caps
+            .as_ref()
+            .and_then(|caps| caps.get(0))
+            .is_some_and(|whole| whole.end() == input.len());
+        if !at_the_end || !ends_with_trailing_newline(input) {
+            return Ok(caps);
+        }
+        match exact.engine() {
+            Some(engine) => engine
+                .captures_from_pos(input, start)
+                .map(|found| found.map(RegexCaptures::Fancy))
+                .map_err(fancy_match_error),
+            None => Ok(caps),
+        }
+    }
+
     fn is_match(&self, input: &str) -> Result<bool, EvalError> {
         if self.suppress_empty {
             return Ok(first_captures(self, input)?.is_some());
         }
         match &self.engine {
             RegexEngine::Std(re) | RegexEngine::Rewritten { re, .. } => {
-                Ok(dv_is_match(re, input, self.needs_trailing_nl_check))
+                let matched = dv_is_match(re, input, self.needs_trailing_nl_check);
+                if matched && self.caret_end.is_some() && ends_with_trailing_newline(input) {
+                    // The match may stand on a `^` at the end of the text, which is not one.
+                    return Ok(self.captures_at(input, 0)?.is_some());
+                }
+                Ok(matched)
             }
             RegexEngine::Fancy(re) => re.is_match(input).map_err(fancy_match_error),
         }
@@ -28091,26 +28199,32 @@ impl JqRegex {
         starts: Option<&LongestStarts>,
     ) -> Result<Option<RegexCaptures<'h>>, EvalError> {
         match &self.engine {
-            RegexEngine::Std(re) => Ok(dv_captures_at(
-                re,
-                input,
-                start,
-                self.needs_trailing_nl_check,
-                self.exact_end.as_ref(),
-            )),
+            RegexEngine::Std(re) => {
+                let caps = dv_captures_at(
+                    re,
+                    input,
+                    start,
+                    self.needs_trailing_nl_check,
+                    self.exact_end.as_ref(),
+                );
+                self.caret_at_the_end(input, start, caps)
+            }
             // A tie between the two views of a final `\n` is settled by the exact engine, which
             // compiled the original pattern, so its captures need no reading back.
-            RegexEngine::Rewritten { re, groups } => Ok(dv_captures_at(
-                re,
-                input,
-                start,
-                self.needs_trailing_nl_check,
-                self.exact_end.as_ref(),
-            )
-            .map(|caps| match caps {
-                RegexCaptures::Std(caps) => RegexCaptures::mapped(caps, groups),
-                other => other,
-            })),
+            RegexEngine::Rewritten { re, groups } => {
+                let caps = dv_captures_at(
+                    re,
+                    input,
+                    start,
+                    self.needs_trailing_nl_check,
+                    self.exact_end.as_ref(),
+                )
+                .map(|caps| match caps {
+                    RegexCaptures::Std(caps) => RegexCaptures::mapped(caps, groups),
+                    other => other,
+                });
+                self.caret_at_the_end(input, start, caps)
+            }
             RegexEngine::Fancy(re) if self.longest.is_some() => {
                 if let Some(starts) = starts {
                     return match starts.winner_from(start) {
@@ -33086,6 +33200,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                     engine: RegexEngine::Fancy(re),
                     needs_trailing_nl_check: false,
                     exact_end: None,
+                    caret_end: None,
                     suppress_empty,
                     engine_not_empty: modes.not_empty,
                     longest: modes.longest.then_some(LongestSearch {
@@ -33118,6 +33233,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 engine: RegexEngine::Fancy(re),
                 needs_trailing_nl_check: false,
                 exact_end: None,
+                caret_end: None,
                 suppress_empty,
                 engine_not_empty: false,
                 longest: None,
@@ -33186,6 +33302,8 @@ fn build_regex_uncached<S: EvalSemantics>(
             engine,
             needs_trailing_nl_check,
             exact_end: needs_trailing_nl_check.then(|| ExactEnd::new(&pattern)),
+            caret_end: (S::TAG != EvalTag::Yq && has_multiline_caret(&pattern))
+                .then(|| ExactEnd::new(as_written.as_deref().unwrap_or(&pattern))),
             suppress_empty,
             engine_not_empty: false,
             longest: None,
@@ -33203,6 +33321,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 // `build_fancy_regex` rewrote `$` itself: see [`prepare_fancy_pattern`].
                 needs_trailing_nl_check: false,
                 exact_end: None,
+                caret_end: None,
                 suppress_empty,
                 engine_not_empty: false,
                 longest: None,
@@ -33815,6 +33934,8 @@ fn build_fancy_regex_at<S: EvalSemantics>(
         .then(|| guard_prefix_lifting(source, true))
         .flatten();
     let pattern = prepare_fancy_pattern(guarded.as_deref().unwrap_or(source))?;
+    // #6456: a `^` under `(?m)` does not hold at the end of the text after a final newline.
+    let pattern = rewrite_multiline_caret(&pattern).unwrap_or(pattern);
     // The tree is read the way the builder below reads the pattern (#6165): in Oniguruma's mode a
     // stacked repeat (`a**`) is valid, which the default reading refuses.
     let (expr, pattern) = parse_fancy_tree(pattern)?;
@@ -139584,6 +139705,30 @@ mod tests {
     /// #6106: a loop rewritten for Oniguruma's empty-iteration exit is what the `regex` crate
     /// compiles, and a rewrite the crate refuses (here, nested past its limit) falls back to the
     /// pattern as written instead of becoming an error.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_caret_under_multiline_is_found_where_the_flag_holds_6456() {
+        let carets = |pattern: &str| multiline_caret_spans(pattern).map(|spans| spans.len());
+        assert_eq!(carets("^a"), Some(0));
+        assert_eq!(carets("(?m)^a"), Some(1));
+        assert_eq!(carets("(?m)^a|^b"), Some(2));
+        // The flag holds to the end of its group, inside `(?m:..)`, and `-m` turns it off.
+        assert_eq!(carets("(?:(?m)^)^"), Some(1));
+        assert_eq!(carets("(?m:^)^"), Some(1));
+        assert_eq!(carets("(?m)(?-m)^"), Some(0));
+        assert_eq!(carets("(?m)(?-m:^)^"), Some(1));
+        // A pattern the parser does not read (a look-behind) has no answer.
+        assert_eq!(carets("(?m)(?<=a)^"), None);
+        assert!(has_multiline_caret("(?m)^a"));
+        assert!(!has_multiline_caret("^a"));
+        assert!(!has_multiline_caret("(?m)a$"));
+        assert_eq!(
+            rewrite_multiline_caret("(?m)^a|^b").as_deref(),
+            Some(r"(?m)(?:\A|^(?!\z))a|(?:\A|^(?!\z))b")
+        );
+        assert_eq!(rewrite_multiline_caret("^a"), None);
+    }
+
     #[cfg(feature = "regex")]
     #[test]
     fn build_regex_falls_back_to_the_pattern_as_written_6106() {
