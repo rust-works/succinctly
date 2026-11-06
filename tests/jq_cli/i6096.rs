@@ -1,7 +1,7 @@
 //! #6096: `fancy-regex` 0.20.0 (the second engine, taken for lookaround, a backreference, `\\K`, ...)
 //! answers wrongly for two greedy `X+` repeats of one expression with a single repeat that can match
 //! nothing between them: `"a" | test("(?=a)a+a*a+")` is `true`, and jq and the `regex` crate say
-//! `false`. The shape is refused on that engine (`invalid regex`), as other unverified constructs are,
+//! `false`. The shape is refused on that engine (`Regex failure`), as other unverified constructs are,
 //! and keeps its normal route when nothing else needs the second engine, `l` and `n` included.
 //! Every other expectation is what `/usr/bin/jq` 1.7.1 printed for `test($p; $f)`.
 

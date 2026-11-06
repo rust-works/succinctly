@@ -7403,7 +7403,7 @@ A word boundary built from jq's class would need a look-around on every pattern 
 A range that starts or ends at a `\w` (`[\w-.]`, `[+-\w]`) was accepted here and an error in jq until #6184.
 One exotic shape still differs: a negated bracket under the `i` flag (`test("[[:^upper:]]";"i")`) is case-folded before the negation here and is not in jq.
 A range from a POSIX bracket (`[[:alpha:]-z]`) and a doubled hyphen (`[a--b]`) were accepted here and an error in jq until #6184.
-An unknown bracket name (`[[:foo:]]`, `[[:ALPHA:]]`) is an error in both, with this crate's wording.
+An unknown bracket name (`[[:foo:]]`, `[[:ALPHA:]]`) is `invalid POSIX bracket type` in both (#6423).
 In jq mode a `[`, `&` or `~` inside a class is the literal character, as in Oniguruma's Perl syntax, where the `regex` crate would read a nested class, an intersection and a symmetric difference.
 Only the first `^` after a class's `[` negates it (#6193): `[^^]` is a negated class holding `^`, and a `]` after the second `^` closes it, so an unterminated class after it (`[^^]z[]`) is an error as in jq.
 A dash is read as Oniguruma reads it (#6184), where the `regex` crate takes `--` for set difference and a `]` that opens a class for a literal that no range can start.
@@ -7425,7 +7425,7 @@ A property name is read as Oniguruma reads it (#6217).
 `\p{XDigit}` is the ASCII hex digits (the crate has no such name), also as `\P{XDigit}`, `\p{^XDigit}` and inside a class.
 A name with `=` or `:` (`\p{Age=1.1}`, `\p{Script=Latin}`, `\p{gc=L}`) and the properties newer than the Unicode tables jq 1.7.1 links (`Bidi_Mirrored`, `IDS_Unary_Operator`, `ID_Compat_Math_Start`, `ID_Compat_Math_Continue`, `Modifier_Combining_Mark` and their abbreviations) are `invalid character property name {NAME}`, the name as written, as in jq.
 Case, blanks, `_` and `-` do not matter in a name.
-Over every name in the `regex` crate's property table (413) in nine spellings, the answers match jq 1.7.1 except for a name neither tool knows (`\p{Foo}`), which is refused in both with each tool's own wording.
+Over every name in the `regex` crate's property table (413) in nine spellings, the answers match jq 1.7.1 and a name neither tool knows (`\p{Foo}`, `\p{^Foo}`) is refused in both as `invalid character property name {Foo}` (#6423).
 A Unicode block name (`\p{In_Basic_Latin}`) is the block's code points (#6228), also as `\P{..}`, `\p{^..}` and inside a class, and `In_No_Block` is the code points no block holds.
 The three surrogate blocks hold no scalar value, so they match nothing.
 The table (`src/jq/regex_blocks.rs`, 328 blocks) is read from the pinned `/usr/bin/jq` by `scripts/jq-regex-block-table.py`, which also checks it (`--check`), so it is the Unicode version that Oniguruma links (15.0, which includes Kawi and Nag Mundari), not that of `Blocks.txt` or of the `regex` crate.
@@ -7445,7 +7445,7 @@ A surrogate or a value past U+10FFFF as an end of a range in a class (`[a-\o{154
 `\x` is not in the set: jq reads hex digits after it, and a lone `\x` at the end of a pattern is the letter while `\xZ` matches nothing, which this does not reproduce (it stays the crate's error).
 Pinned in `tests/jq_cli/i6080.rs`.
 A Python-style group (`(?P<n>a)`, `(?P=n)`, `(?P>n)`) is an error in jq (`undefined group option`), and the `regex` crate would accept the first.
-It is an error here too, with this crate's `invalid regex:` prefix where jq says `Regex failure:`, the same wording difference every refused pattern has.
+It is the same error here (#6423).
 A group option other than `i`, `m`, `x`, `s` and `-` is the same error (`(?U)`, `(?u:a)`, `(?-R)`, `(?a)`, `(?)`, #6126), where the `regex` crate took `U` (swap greed), `u` and `R` as flags and rejected the other letters in its own words.
 `(?R)` is `unmatched close parenthesis` in jq, and here.
 The set was captured from jq 1.7.1 over every ASCII letter in five spellings each, and pinned in `tests/jq_cli/i6126.rs`.
@@ -7478,7 +7478,7 @@ The `regex` crate reads the same text as a quantifier on a quantifier, `(a*)+`, 
 Since #6172 the quantifier is written as the atomic group of its atom and quantifier, `a*+a` as `(?>a*)a`, which the crate refuses and the second engine (`fancy-regex`, below) reads as jq does.
 That includes a repeat after the possessive quantifier (`a?+*`, `a*+*`, `a?+{2}`, `(?:a*+b)*+`), which `fancy-regex` cannot read written out, and an interval (`a{1,2}+*`), which it would read as a repeat of a repeat.
 The scan finds where the atom starts: a group's `(`, a class's `[`, an escape, a character.
-Where it cannot place one, the pattern is refused as before, with `invalid regex: regex parse error: possessive quantifier is not supported` (exit 5): a quantifier on a quoted run (`\Qab\E*+c`), after an escape the scan does not size (`\C-a`), or on a group of flags (`(?i)*+c`), and any pattern with an inline `(?x)`, whose blanks the scan does not model.
+Where it cannot place one, the pattern is refused as before, with `Regex failure: regex parse error: possessive quantifier is not supported` (exit 5): a quantifier on a quoted run (`\Qab\E*+c`), after an escape the scan does not size (`\C-a`), or on a group of flags (`(?i)*+c`), and any pattern with an inline `(?x)`, whose blanks the scan does not model.
 So is a pattern that also holds a lazy quantifier followed by `+` (`c?+a+?+`): jq reads that as a repeat of a repeat, and the second engine reads it otherwise.
 A repeat of a repeat that the second engine refuses (`a**+b`, `a{2}+++a`) is an error from it, not a wrong answer.
 As the last character of the pattern, or followed only by closing parentheses (`(?:a++)`), nothing after it can fail, so it is rewritten to the plain quantifier instead (`sub("a*+";"X")`, `gsub("a++";"X")`), and stays on the first engine.
@@ -7534,10 +7534,10 @@ Three differences remain.
   Pinned by `tests/jq_cli/i6169.rs`.
 - **Oniguruma syntax outside the checked list stays refused.**
   The second engine takes only constructs and escapes whose meaning there was compared with jq's.
-  `\g<name>` and `\g'name'` and `\y` keep the `invalid regex` error.
+  `\g<name>` and `\g'name'` and `\y` keep the crate's parse error.
   The absence operator `(?~X)` is read since [#6252](https://github.com/rust-works/succinctly/issues/6252): it is written as `(?:(?:(?!X)(?s:.))*)` before the engines see the pattern, which is how jq 1.7.1 reads it.
   Over 5,075 generated cases the answers match jq's, except a lazy repeat of the operator under the `l` flag (the `l` flag's own limit, below) and a pattern that names one group twice.
-  A range cutter `(?~|…)`, an operator inside another one or inside a look-behind (`(?<=(?~a))b`, which jq accepts), and one in a pattern with a quoted run `\Q…\E` or an extended-mode `#` comment keep the `invalid regex` error.
+  A range cutter `(?~|…)`, an operator inside another one or inside a look-behind (`(?<=(?~a))b`, which jq accepts), and one in a pattern with a quoted run `\Q…\E` or an extended-mode `#` comment keep the crate's parse error.
   On input with a multibyte character jq 1.7.1 steps into the middle of a character after an empty match (`"éab" | match("(?~[^a])"; "g")` has an extra empty match at offset 1), and the operator does not follow it: the rewrite reads a look-ahead, which [#6326](https://github.com/rust-works/succinctly/issues/6326)'s byte step leaves to the character step (a recorded divergence of the global search, not of this rewrite).
   Pinned by `tests/jq_cli/i6252.rs`.
   (`\h`, `\H` and `\g1` are the letters in jq and here, #6080: see the escaped-letter paragraph above.)
@@ -7549,7 +7549,7 @@ Three differences remain.
   It is wrong for `a+b*a+` and `.+.*.+` too (the repeat between the plusses can be any atom, and any `{0,n}`), for a chain of them (`a+b*a+b*a+` on `aa`), and for `(?:ab)+c*(?:ab)+`.
   Two repeats between them, a mandatory item, a different atom for either plus, bounded repeats such as `a{1,3}b*a{1,3}`, a lazy plus at either end, and an alternation or a capture group as the middle repeat (`a+(?:a|)a+`, `a+(a*)a+`) are answered correctly, and not refused.
   The shape is found wherever it sits: inside a group, an alternation, an atomic group, a look-ahead or a look-behind.
-  A pattern with the shape that needs the second engine (a lookaround, a backreference, `\K`) gets the `invalid regex` error whatever the text, though the engine answers some texts right (`aa` for `a+a*a+`), since a pattern cannot tell which.
+  A pattern with the shape that needs the second engine (a lookaround, a backreference, `\K`) gets the crate's parse error whatever the text, though the engine answers some texts right (`aa` for `a+a*a+`), since a pattern cannot tell which.
   Without a second-engine feature the shape keeps the `regex` crate, and `l` and `n` keep their old route for it, so those answer as jq does.
   Pinned by `tests/jq_cli/i6096.rs` (a mutant that drops the guard, one that ignores that the two plusses must match, and one that ignores that the repeat between them must be optional all fail it).
   Upstream: the report to `fancy-regex` is not filed from here; the Rust case is in #6096.
@@ -7558,7 +7558,7 @@ Three differences remain.
   `fancy-regex` 0.20.0 saves a group's start as the group opens and reads the reference from the new start to the old end, which is empty whenever the passes are contiguous.
   `"ab" | [match("(\\1|\\w)+")|[.offset,.string,.captures[0].offset,.captures[0].string]]` is `[[0,"ab",1,"b"]]` in jq and was `[[0,"a",1,""]]` here (and `(a|\1)+` on `"ab"` had the group at `[1,""]` where jq has `[0,"a"]`).
   The crate has no option for the other reading (`RegexBuilder` offers `oniguruma_mode`, `find_not_empty`, `leftmost_longest`, `backtrack_limit` and `seek`), and rewriting the pattern to carry the previous pass would need two alternating copies of the group, which does not keep the order Oniguruma tries a repeat's ways in.
-  Such a pattern gets the `invalid regex` error whatever the text: `(\1|\w)+`, `(a|\1){2}`, `((?!\1)){2,}`, `(?:(a|\1)b)+`, `(a\1)+`, and the named form `(?<n>a|\k<n>)+`.
+  Such a pattern gets the crate's parse error whatever the text: `(\1|\w)+`, `(a|\1){2}`, `((?!\1)){2,}`, `(?:(a|\1)b)+`, `(a\1)+`, and the named form `(?<n>a|\k<n>)+`.
   Over a grid of 468 such patterns (12 group bodies, 11 repeats, 3 outer shapes) on 8 strings and both `g` settings, 185 patterns differed from jq on some text before; the other 283 agreed on every text tried, some of them only because the reference's pass and the plain one end at the same place (`(a\1?)+` on `aaaa`), and are refused with them because a pattern cannot tell which texts reach the reference.
   A reference to a group that is open under no such repeat (`(a|\1)`, `(a|\1)?`, `(a|\1){1}`) reads a group that never completes in either engine and answers as jq does, and so does a reference to a group that has closed (`(a)\1+`, `(a)(\1)+`).
   `scripts/jq-regex-open-backref-sweep.py` regenerates the grid.
@@ -7622,7 +7622,7 @@ Every row was captured from jq 1.7.1.
 - **jq's refusals:** an interval with nothing to repeat (`{1}`, `a|{2}`, `(?:{2})`: `target of repeat operator is not specified`), a conditional on a group the pattern lacks (`(?(2)a|b)`: `invalid backref number/name`, and `undefined name <n> reference` for a name), and a group name that is empty or starts with a digit.
   `"a" | test("(?(2)a|b)")` panicked inside `fancy-regex` before this.
 
-Still refused with the crate's `invalid regex` error, where jq answers: `\y` and `\Y` (text-segment boundaries), `\g<name>` (a call), an octal escape of 0x80 or more (`\377`) and `\cé`.
+Still refused with the crate's parse error, where jq answers: `\y` and `\Y` (text-segment boundaries), `\g<name>` (a call), an octal escape of 0x80 or more (`\377`) and `\cé`.
 Whether one of them matches needs Unicode text segmentation or Oniguruma's byte-level reading of a multibyte pattern.
 Pinned by `tests/jq_cli/i6070.rs`.
 
@@ -7669,13 +7669,23 @@ Left as they were:
 A class that opens with `]` and has no other `]` after it is `empty char-class` (`[]`, `[^]`, `a[]`, `[]a`), and any other class the pattern ends inside is `premature end of char-class` (`[a`, `[^`, `[\]`, `[a-`).
 A `]` first in a class is a member only when a later `]` closes it, and an escaped `]` counts for that (`[]\]` never closes: `premature end of char-class`, as in jq).
 A pattern that ends in a lone backslash is `end pattern at escape`.
-`translate_posix_brackets_scan` raises all three before the crate parses, worded `invalid regex: <message>` where jq words them `Regex failure: <message>`.
+`translate_posix_brackets_scan` raises all three before the crate parses, worded `Regex failure: <message>` as in jq.
 jq reports the first error in parse order; the scan reports an earlier error only when the scan itself finds it.
 A pattern with two errors, the earlier one an error only the crate or a later pass finds, reports the class error instead (`\p{Foo}[` is `invalid character property name {Foo}` in jq, `(?<=a)*[` is `target of repeat operator is invalid`).
 Inside a class the pattern ends in, jq reports an error in a member first where one is still unmatched: `[\d-` and `[a\d-` are `unmatched range specifier in char-class` in jq, and `premature end of char-class` here.
 Both still exit 5 with no output.
 The other malformed-pattern messages (`(`, `)`, `(?`, `(?<n`) are still the crate's `regex parse error`.
 Pinned by `tests/jq_cli/i6229.rs`.
+
+### A regex compile error is worded as in jq, where Oniguruma has the words (#6423)
+
+Every refused pattern is `Regex failure: <message>` in jq mode, as in jq, so `try test("[") catch .` is `"Regex failure: premature end of char-class"` in both.
+A refusal the `regex` crate's parser makes is given Oniguruma's message from the error's kind: an unclosed group (`(a`, `(?:`, `(?=`, `\p{L`) is `end pattern with unmatched parenthesis`, an unopened one (`a)`) `unmatched close parenthesis`, `a{2,1}` `upper is smaller than lower in repeat range`, `(?`, `(?i` and `(?#abc` `end pattern in group`, `(?<x` and `\k<x` `invalid group name <x>`, `\k<x>` and `\g<x>` to a name no group has `undefined name <x> reference`, `\k<1>` `invalid backref number/name`, and an unknown property `invalid character property name {Foo}`.
+A repeat count past Oniguruma's 100000 (`x{100001}`, `x{1000,100001}`, `x{99999999}`) is `too big number for repeat range`, which the crate either compiled (and matched) or refused for its size; `x{,100001}` is answered, as in jq.
+Inside a look-around or an atomic group (`(?=a{100001})`), which the crate's parser cannot read, such a count is still answered where jq refuses it, as before.
+A refusal of a construct jq accepts (a call `\g<a>` to a group the pattern has, a range cutter `(?~|…)`) has no Oniguruma message, and keeps the crate's rendered parse error after the prefix.
+The rows are pinned against jq 1.7.1 in `tests/jq_cli/i6423.rs`.
+`succinctly yq` is not affected: its patterns are Go's, refused in Go's words (``error parsing regexp: missing closing ]: `[` ``).
 
 ### A group repeated `{0}` keeps its capture entry (#6108)
 

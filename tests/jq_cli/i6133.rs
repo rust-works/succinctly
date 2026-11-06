@@ -84,7 +84,7 @@ fn a_repeat_after_an_empty_option_group_is_refused_6133() -> Result<()> {
         let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
         assert_eq!(code, 5, "{filter}: stdout={stdout:?} stderr={stderr:?}");
         assert!(
-            stderr.contains("invalid regex: target of repeat operator is not specified")
+            stderr.contains("Regex failure: target of repeat operator is not specified")
                 || stderr.contains("Regex failure: target of repeat operator is not specified"),
             "{filter}: {stderr:?}"
         );

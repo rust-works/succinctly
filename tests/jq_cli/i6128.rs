@@ -188,6 +188,6 @@ fn test_a_quantified_comment_in_a_loop_body_is_still_refused_6128() -> Result<()
         None,
     )?;
     assert_eq!((stdout.as_str(), code), ("", 5), "stderr {stderr}");
-    assert!(stderr.contains("invalid regex"), "{stderr}");
+    assert!(stderr.contains("Regex failure"), "{stderr}");
     Ok(())
 }

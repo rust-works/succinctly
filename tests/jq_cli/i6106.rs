@@ -108,8 +108,10 @@ fn test_a_pattern_refused_without_the_loop_is_refused_with_it_6106() -> Result<(
     let (stdout, looped, code) =
         run_jq_full(&["-nc", r#""ba" | test("(?:\\p{Foo}{0}|a)+")"#], None)?;
     assert_eq!((stdout.as_str(), code, plain_code), ("", 5, 5));
-    assert!(plain.contains("Unicode property not found"), "{plain}");
-    assert!(looped.contains("Unicode property not found"), "{looped}");
+    // In jq's words since #6423.
+    let message = "Regex failure: invalid character property name {Foo}";
+    assert!(plain.contains(message), "{plain}");
+    assert!(looped.contains(message), "{looped}");
     Ok(())
 }
 

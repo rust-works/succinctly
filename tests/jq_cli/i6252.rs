@@ -107,7 +107,7 @@ fn test_what_is_not_the_absence_operator_is_left_alone_6252() -> Result<()> {
     ] {
         let (stdout, code, stderr) = matches("abab", pattern, "g")?;
         assert_ne!(code, 0, "{pattern}: {stdout}");
-        assert!(stderr.contains("invalid regex"), "{pattern}: {stderr}");
+        assert!(stderr.contains("Regex failure"), "{pattern}: {stderr}");
     }
     Ok(())
 }

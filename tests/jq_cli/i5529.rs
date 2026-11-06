@@ -48,7 +48,7 @@ fn test_python_named_groups_are_refused_5529() -> Result<()> {
         assert_eq!(code, 5, "{filter}: stdout={stdout:?} stderr={stderr:?}");
         assert_eq!(stdout, "", "{filter}");
         assert!(
-            stderr.contains("invalid regex: undefined group option"),
+            stderr.contains("Regex failure: undefined group option"),
             "{filter}: {stderr:?}"
         );
     }

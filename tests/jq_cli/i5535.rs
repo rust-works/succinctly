@@ -1,7 +1,7 @@
 //! #5535: Oniguruma refuses a repetition operator right after an assertion (`^*`, `$+`, `\b?`,
 //! `\A{2}`) with `target of repeat operator is invalid`, where the `regex` crate repeats the
-//! empty match and `succinctly jq` answered `true`. It is refused now, with the `invalid regex:`
-//! prefix every refused pattern here has. Rows were captured from jq 1.7.1 (`/usr/bin/jq -n`).
+//! empty match and `succinctly jq` answered `true`. It is refused now, with jq's `Regex failure:`
+//! prefix (#6423). Rows were captured from jq 1.7.1 (`/usr/bin/jq -n`).
 
 use anyhow::Result;
 
@@ -25,7 +25,7 @@ fn test_a_repetition_after_an_assertion_is_refused_5535() -> Result<()> {
         assert_eq!(code, 5, "{pattern}: stdout={stdout:?} stderr={stderr:?}");
         assert_eq!(stdout, "", "{pattern}");
         assert!(
-            stderr.contains("invalid regex: target of repeat operator is invalid"),
+            stderr.contains("Regex failure: target of repeat operator is invalid"),
             "{pattern}: {stderr:?}"
         );
     }

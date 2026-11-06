@@ -29,7 +29,7 @@ fn test_a_descending_range_in_a_class_is_refused_as_jq_refuses_it_6273() -> Resu
             run_jq_full(&["-n", "--arg", "p", pattern, r#""a" | test($p)"#], None)?;
         assert_eq!((stdout.as_str(), status), ("", 5), "{pattern}: {stderr}");
         assert!(
-            stderr.contains("invalid regex: empty range in char class"),
+            stderr.contains("Regex failure: empty range in char class"),
             "{pattern}: {stderr}"
         );
     }
@@ -88,7 +88,7 @@ fn test_a_range_with_a_class_at_an_end_keeps_its_own_refusal_6273() -> Result<()
             run_jq_full(&["-n", "--arg", "p", pattern, r#""a" | test($p)"#], None)?;
         assert_eq!((stdout.as_str(), status), ("", 5), "{pattern}: {stderr}");
         assert!(
-            stderr.contains(&format!("invalid regex: {reason}")),
+            stderr.contains(&format!("Regex failure: {reason}")),
             "{pattern}: {stderr}"
         );
     }
@@ -110,7 +110,7 @@ fn test_every_regex_builtin_refuses_a_descending_range_6273() -> Result<()> {
         let (stdout, stderr, status) = run_jq_full(&["-n", "--arg", "p", "[z-a]", filter], None)?;
         assert_eq!((stdout.as_str(), status), ("", 5), "{filter}: {stderr}");
         assert!(
-            stderr.contains("invalid regex: empty range in char class"),
+            stderr.contains("Regex failure: empty range in char class"),
             "{filter}: {stderr}"
         );
     }

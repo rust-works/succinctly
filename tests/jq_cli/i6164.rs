@@ -61,7 +61,7 @@ fn test_a_repeated_plain_group_of_a_zero_width_body_stays_refused_6164() -> Resu
     for pattern in [r"(?:\K)*", r"(?:\G)+", r"\K*", r"(?:(?=a))*", r"(?:\K)?*"] {
         let (stdout, stderr, code) = matches(pattern)?;
         assert_eq!(code, 5, "{pattern}: stdout={stdout:?} stderr={stderr:?}");
-        assert!(stderr.contains("invalid regex"), "{pattern}: {stderr:?}");
+        assert!(stderr.contains("Regex failure"), "{pattern}: {stderr:?}");
     }
     Ok(())
 }

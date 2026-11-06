@@ -49,7 +49,7 @@ fn test_an_interval_after_only_comments_is_refused_6170() -> Result<()> {
             "{pattern:?} {flags}: {stderr}"
         );
         assert!(
-            stderr.contains("invalid regex: target of repeat operator is not specified"),
+            stderr.contains("Regex failure: target of repeat operator is not specified"),
             "{pattern:?} {flags}: {stderr}"
         );
     }
@@ -97,7 +97,7 @@ fn test_a_repeat_after_an_assertion_and_a_comment_is_still_refused_6170() -> Res
         let (stdout, stderr, code) = run(pattern, "")?;
         assert_eq!((stdout.as_str(), code), ("", 5), "{pattern:?}: {stderr}");
         assert!(
-            stderr.contains("invalid regex: target of repeat operator is invalid"),
+            stderr.contains("Regex failure: target of repeat operator is invalid"),
             "{pattern:?}: {stderr}"
         );
     }
@@ -111,7 +111,7 @@ fn test_a_star_after_only_a_comment_is_refused_6170() -> Result<()> {
     for pattern in [r"(?#)*a", r"(?#)+a", r"(?#)?a"] {
         let (stdout, stderr, code) = run(pattern, "")?;
         assert_eq!((stdout.as_str(), code), ("", 5), "{pattern:?}: {stderr}");
-        assert!(stderr.contains("invalid regex"), "{pattern:?}: {stderr}");
+        assert!(stderr.contains("Regex failure"), "{pattern:?}: {stderr}");
     }
     Ok(())
 }

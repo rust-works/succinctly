@@ -122,7 +122,7 @@ fn test_a_lazy_repeat_of_a_g_k_body_keeps_its_other_answers_6166() -> Result<()>
     ] {
         let (stdout, stderr, code) = matches("cab", pattern)?;
         assert_eq!(code, 5, "{pattern}: stdout={stdout:?} stderr={stderr:?}");
-        assert!(stderr.contains("invalid regex"), "{pattern}: {stderr:?}");
+        assert!(stderr.contains("Regex failure"), "{pattern}: {stderr:?}");
     }
     Ok(())
 }

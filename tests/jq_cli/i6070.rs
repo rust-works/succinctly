@@ -216,7 +216,7 @@ fn test_valid_neighbours_do_not_change_6070() -> Result<()> {
 }
 
 /// Patterns jq refuses, with its reason. The exit code is 5 and the message names the reason;
-/// jq's own text is `Regex failure: <reason>`, ours `invalid regex: <reason>`.
+/// both say `Regex failure: <reason>` (#6423).
 #[test]
 fn test_patterns_jq_refuses_are_refused_6070() -> Result<()> {
     for (pattern, reason) in [
@@ -255,7 +255,7 @@ fn test_patterns_jq_refuses_are_refused_6070() -> Result<()> {
         let (stdout, stderr, code) = run(&filter)?;
         assert_eq!((stdout.as_str(), code), ("", 5), "{pattern}: {stderr}");
         assert!(
-            stderr.contains(&format!("invalid regex: {reason}")),
+            stderr.contains(&format!("Regex failure: {reason}")),
             "{pattern}: {stderr}"
         );
     }
