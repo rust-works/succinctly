@@ -10003,7 +10003,8 @@ struct LazyMore {
     chunks: usize,
     /// Where the file starts in jq's input (#5497).
     file_start: (usize, usize),
-    /// The seams of every source, which the end of a stream that turned malformed is read with.
+    /// The seams the end of a stream that turned malformed is read with: the lone source's, or the
+    /// last source's of several (#6450).
     seams: Vec<Seam>,
     /// The tag of the last source, which the end of the stream names.
     last_source: u32,
@@ -10302,7 +10303,8 @@ fn lazy_scan_on(
             match read_json_tail(text, end_of_last, &cx, &mut values, &mut ends, &mut errors) {
                 Ok(_) => {
                     // A stream scanned a chunk at a time has nothing queued behind its lazy
-                    // documents: it is the only source, and it was clean when it was deferred.
+                    // documents: it is the only source, or the last of several whose earlier ones
+                    // have all been read (#6450), and it was clean when it was deferred.
                     let mut locations = InputLocations::new(Vec::new());
                     locations.extend_from_ends(
                         lazy.source as usize,
