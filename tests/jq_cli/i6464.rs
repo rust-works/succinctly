@@ -14,18 +14,37 @@ fn null_input_line_number_does_not_open_the_files_6464() -> Result<()> {
     std::fs::write(&data, "1 2\n")?;
     for (flags, filter, files, expected) in [
         (&["-nc"][..], "input_line_number", &[&gone][..], "0\n"),
-        (&["-nc"], "[input_line_number, input_filename]", &[&gone], "[0,null]\n"),
+        (
+            &["-nc"],
+            "[input_line_number, input_filename]",
+            &[&gone],
+            "[0,null]\n",
+        ),
         (&["-nc"], "input_line_number", &[&gone, &data], "0\n"),
         (&["-nce"], "input_line_number", &[&gone], "0\n"),
-        (&["-nc", "--seq"], "input_line_number", &[&gone], "\u{1e}0\n"),
+        (
+            &["-nc", "--seq"],
+            "input_line_number",
+            &[&gone],
+            "\u{1e}0\n",
+        ),
         // `input` still opens the file, and the line counts what it read.
-        (&["-nc"], "[input_line_number, input, input_line_number]", &[&data], "[0,1,1]\n"),
+        (
+            &["-nc"],
+            "[input_line_number, input, input_line_number]",
+            &[&data],
+            "[0,1,1]\n",
+        ),
     ] {
         let mut args: Vec<&str> = flags.to_vec();
         args.push(filter);
         args.extend(files.iter().map(|f| f.as_str()));
         let (out, err, code) = run_jq_full(&args, None)?;
-        assert_eq!((out.as_str(), err.as_str(), code), (expected, "", 0), "{flags:?} {filter}");
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            (expected, "", 0),
+            "{flags:?} {filter}"
+        );
     }
     // An `input` that reaches the missing file reports it and exits 2.
     let (out, err, code) = run_jq_full(&["-nc", "input", &gone], None)?;
@@ -61,8 +80,15 @@ fn raw_input_stops_after_the_first_line_past_a_missing_file_6464() -> Result<()>
         let mut args = vec!["-R", "."];
         args.extend(files.iter().map(|f| f.as_str()));
         let (out, err, code) = run_jq_full(&args, None)?;
-        assert_eq!((out.as_str(), code), (expected, 2), "{files:?} stderr: {err:?}");
-        assert!(err.starts_with("jq: error: Could not open file "), "{err:?}");
+        assert_eq!(
+            (out.as_str(), code),
+            (expected, 2),
+            "{files:?} stderr: {err:?}"
+        );
+        assert!(
+            err.starts_with("jq: error: Could not open file "),
+            "{err:?}"
+        );
     }
     Ok(())
 }
