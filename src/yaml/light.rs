@@ -10105,12 +10105,11 @@ fn yq_header_len(text: &[u8]) -> (usize, bool) {
         // differently, though: [`write_yq_header`] keeps the empty one as it is and writes the
         // whitespace-only one as the comment `# ` plus the line, as go-yaml does.
         let at_break_or_eof = indent_len == rest.len() || is_line_break(rest[indent_len]);
-        if !at_break_or_eof
-            && !(rest[indent_len] == b'#'
-                || (indent_len == 0
-                    && (rest[indent_len..].starts_with(b"%YAML")
-                        || rest[indent_len..].starts_with(b"---"))))
-        {
+        let header_shaped = at_break_or_eof
+            || rest[indent_len] == b'#'
+            || super::parser::starts_yq_yaml_directive(&rest[indent_len..])
+            || (indent_len == 0 && rest[indent_len..].starts_with(b"---"));
+        if !header_shaped {
             return (pos, false);
         }
         let line_end = rest
@@ -10176,8 +10175,14 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
             if line.is_empty() && brk == 2 && rest.as_bytes()[line_end] == b'\r' {
                 out.write_str("# ")?;
             }
-            // #6401: a line of only blanks is a comment to go-yaml too, `# ` plus the line.
-            if is_blank_line(line.as_bytes()) {
+            // #6401: a line of only blanks is a comment to go-yaml too, `# ` plus the line. So is an
+            // indented `%YAML` line (#6408): the indent follows the `# `.
+            if is_blank_line(line.as_bytes())
+                || (line.starts_with([' ', '\t'])
+                    && super::parser::starts_yq_yaml_directive(
+                        line.trim_start_matches([' ', '\t']).as_bytes(),
+                    ))
+            {
                 out.write_str("# ")?;
             }
             out.write_str(line)?;

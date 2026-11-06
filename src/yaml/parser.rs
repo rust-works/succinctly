@@ -3432,6 +3432,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 let comment_start = self.pos;
                 self.skip_to_eol();
                 self.record_standalone_comment(comment_start, self.pos);
+            } else if let Some(at) = self.yq_indented_head_directive() {
+                // #6408: an indented `%YAML` line after the head's `---` is yq's header too.
+                self.pos = at;
+                self.skip_to_eol();
+                self.record_standalone_comment(at, self.pos);
             } else if b == b'\t'
                 && (self.pos == 0 || Self::is_break(self.input[self.pos - 1]))
                 && self.documents_started <= 1
@@ -3701,6 +3706,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let mut tag_handles: Vec<(usize, usize)> = Vec::new();
         loop {
             self.skip_directive_gap_whitespace()?;
+            // #6408: an indented `%YAML` in the head is yq's header too.
+            if let Some(at) = self.yq_indented_head_directive() {
+                self.pos = at;
+                self.skip_to_eol();
+                self.skip_line_break();
+                continue;
+            }
             if self.in_document || self.peek() != Some(b'%') {
                 break;
             }
@@ -9290,7 +9302,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             && self.in_document
             && self.bp_pos == self.document_start_bp_pos
             && (self.pos == 0 || Self::is_break(self.input[self.pos - 1]))
-            && self.input[self.pos..].starts_with(b"%YAML")
+            && starts_yq_yaml_directive(&self.input[self.pos..])
             && self.only_yq_header_lines_before_cursor()
     }
 
@@ -9352,6 +9364,40 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.end_document();
     }
 
+    /// Whether `input[..at]` ends in nothing but spaces and tabs back to the start of its line.
+    fn only_indent_before(&self, at: usize) -> bool {
+        let mut start = at;
+        while start > 0 && matches!(self.input[start - 1], b' ' | b'\t') {
+            start -= 1;
+        }
+        start == 0 || Self::is_break(self.input[start - 1])
+    }
+
+    /// The offset of the `%` of an indented `%YAML` line (a space or tab before it) that the cursor, at
+    /// the start of its line, is on in the head of a yq stream (#6408): yq's slurp trims the line before
+    /// it looks for `%YA`, so it sets it aside as it does a column-0 one (#6342), and prints it back as
+    /// a comment (`# ` and the line, indent included). The head is the lines before the first
+    /// `---` or content, or between a leading `---` and the first content line.
+    fn yq_indented_head_directive(&self) -> Option<usize> {
+        if !self.yq_mode || !(self.pos == 0 || Self::is_break(self.input[self.pos - 1])) {
+            return None;
+        }
+        let mut at = self.pos;
+        while matches!(self.input.get(at), Some(b' ' | b'\t')) {
+            at += 1;
+        }
+        let in_head = match self.documents_started {
+            0 => !self.in_document,
+            1 => self.in_document && self.bp_pos == self.document_start_bp_pos,
+            _ => false,
+        };
+        (at > self.pos
+            && in_head
+            && starts_yq_yaml_directive(&self.input[at..])
+            && self.only_yq_header_lines_before_cursor())
+        .then_some(at)
+    }
+
     /// Whether `input[from..self.pos]` holds nothing but the lines yq's header slurp sets aside:
     /// blanks, line breaks, `#` comments and `%YAML` directive lines (#6342). It is the text between
     /// a leading `---` and the next one when the second is more of yq's header (#6349). A node
@@ -9367,8 +9413,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         i += 1;
                     }
                 }
-                b'%' if self.input[i..].starts_with(b"%YAML")
-                    && (i == 0 || Self::is_break(self.input[i - 1])) =>
+                b'%' if starts_yq_yaml_directive(&self.input[i..])
+                    && self.only_indent_before(i) =>
                 {
                     while i < end && !matches!(self.input[i], b'\n' | b'\r') {
                         i += 1;
@@ -10404,6 +10450,12 @@ fn line_is_bare_dash_before_comment(line: &[u8]) -> bool {
             .iter()
             .find(|&&b| !matches!(b, b' ' | b'\t'))
             .map_or(true, |&b| b == b'#')
+}
+
+/// Whether `rest` starts a `%YAML` directive line, which yq's header slurp sets aside in the head of a
+/// stream (#6342, and indented #6408). One definition for the parser and the header writer in `light.rs`.
+pub(super) fn starts_yq_yaml_directive(rest: &[u8]) -> bool {
+    rest.starts_with(b"%YAML")
 }
 
 /// Whether `line` (already without its leading spaces) opens a document whose root node is a bare
