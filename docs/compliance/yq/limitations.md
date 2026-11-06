@@ -6887,6 +6887,7 @@ documents x 8 filters. Still different:
   The identity route, a write and a navigation lay the collection out across lines with the comment after the element's comma, and the closing bracket on a line of its own when the last element is commented.
   `-P`, which writes the collection as a block, does not hold it: yq prints `- 1 # note`, where the element here has none.
   A comment on a line of its own inside the collection (`[` / `  # head` / `  x]`) is still dropped.
+  So is a comment after a single pair written in a flow sequence (`[a: 1, # c`), after an empty value (`{a: , # c`), or on a key, and a second comment on the line of a comma (`[a # c1` / `, # c2`), where yq keeps both.
   With `-I4`, the closing bracket of a commented collection nested in a `- [` item is at column 0 where yq puts it at the item's column.
 - **An empty `{}`/`[]` value that follows a held comment**: yq writes `b: # ec` and the `{}` on the next line;
   this build writes `b: {} # ec`.

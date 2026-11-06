@@ -10141,20 +10141,6 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
     Ok(())
 }
 
-/// Write the last item's own trailing comment in a flow-style sequence or
-/// mapping, if present, followed by a newline and reindent to the
-/// container's own indentation (issue #794).
-///
-/// A comment can't be followed by the closing `]`/`}` on the same line -
-/// `#` would consume the bracket into the comment text, corrupting the
-/// YAML - so unlike a comment elsewhere in a flow collection, the last
-/// item's own comment forces a line break before the close, mirroring real
-/// `yq`'s own reformatting for this shape (which also adds a trailing
-/// comma; that's not replicated here, as it's cosmetic and comma-before-
-/// comment isn't required by the grammar). Only the *last* item is handled
-/// this way - a comment on a middle item would need to avoid also
-/// swallowing the following `,` onto the same line, which no filed issue
-/// currently asks for.
 /// Where a flow collection's elements continue after a line break and where its closing `]` goes
 /// (#6334), or `None` for the compact output that has no indent. A collection written at `indent`
 /// continues at the indent of its own elements and closes one step above `indent`, the indent its
@@ -10190,7 +10176,8 @@ fn flow_elements_have_line_comment<W: AsRef<[u64]>>(elements: YamlElements<'_, W
     false
 }
 
-/// A flow collection's element as [`render_flow`] lays it out (#6334): its text, the comment on
+/// A flow collection's element as [`render_flow`] lays it out (#6334; `flow_item` in `yq_runner.rs` is
+/// the same decision for the DOM route): its text, the comment on
 /// `commented`, and whether `shape` is a collection that is not an alias, which a comment follows
 /// differently from a scalar.
 fn flow_item_of<W: AsRef<[u64]>>(
@@ -10209,6 +10196,23 @@ fn flow_item_of<W: AsRef<[u64]>>(
     }
 }
 
+/// Write the last item's own trailing comment in a flow-style sequence or
+/// mapping, if present, followed by a newline and reindent to the
+/// container's own indentation (issue #794).
+///
+/// A comment can't be followed by the closing `]`/`}` on the same line -
+/// `#` would consume the bracket into the comment text, corrupting the
+/// YAML - so unlike a comment elsewhere in a flow collection, the last
+/// item's own comment forces a line break before the close, mirroring real
+/// `yq`'s own reformatting for this shape (which also adds a trailing
+/// comma; that's not replicated here, as it's cosmetic and comma-before-
+/// comment isn't required by the grammar). Only the *last* item is handled
+/// this way - a comment on a middle item would need to avoid also
+/// swallowing the following `,` onto the same line, which no filed issue
+/// currently asks for.
+///
+/// A flow collection with an element comment is laid out by [`render_flow`] instead (#6334); this
+/// remains for the compact (`indent_spaces` 0) output, which has no indent to continue at.
 fn write_flow_last_item_comment<Out: core::fmt::Write>(
     out: &mut Out,
     comment: Option<&str>,

@@ -7252,9 +7252,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.advance(); // Skip `:`
                 self.skip_flow_whitespace();
 
+                // A value that is absent (`{a: , b: 1}`) has no node for a comment to follow.
+                let has_value = !matches!(self.peek(), Some(b',' | b'}'));
                 let value_bp = self.bp_pos;
                 self.parse_flow_value_node()?;
-                prev_value = Some(value_bp);
+                prev_value = has_value.then_some(value_bp);
             } else if matches!(self.peek(), Some(b',' | b'}')) {
                 // Key without colon/value - emit empty value (implicit null)
                 self.set_ib();
