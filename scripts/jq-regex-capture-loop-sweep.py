@@ -17,7 +17,7 @@ that keep their text. `--assert` (#6358) draws the loops whose ways hold a zero-
 beside a capture group or a consuming item, under the counted and lazy quantifiers, on subjects with a word boundary
 in the middle; `--newlines` runs it on subjects that hold a newline instead, and lets the ways consume one, which is what says `^` and
 `$` may be written as `\\A` and `\\z`. `--fancy` (#6358) draws the plain loops with a lookaround or an atomic group beside them, outside the repeat, so
-that they run on `fancy-regex`. `--bounded` (#6428) draws a lazy `{0,n}?` or `{1,n}?` over anchors, flag switches and loops of its own, beside another loop or
+that they run on `fancy-regex`. `--bounded` (#6428, #6427) draws a lazy repeat that may run once or not at all (`{0,n}?`, `{1,n}?`, `*?`, `+?`) over anchors, flag switches and loops of its own, beside another loop or
 inside a repeat. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
 captures are compared. It prints how many patterns SUBJECT fixed (BASELINE differed from jq, SUBJECT does
 not), broke (the reverse) and still differs on, and exits 1 when it broke one.
@@ -145,7 +145,7 @@ BOUNDED = ["{0,2}?", "{1,2}?", "{0,3}?", "{1,3}?", "{0,4}?", "{1,4}?", "{0,12}?"
 
 
 def bounded_patterns(count, rng):
-    """`--bounded`: a lazy `{0,n}?` or `{1,n}?`, over anchors, flag switches and loops, beside a loop or in a repeat."""
+    """`--bounded`: a lazy repeat with a minimum under two, over anchors, flag switches and loops, beside a loop or in a repeat."""
     pool = ATOMS + NESTED + ANCHORS + ["(?i)", r"(\b)", r"(\z)", "(.*?)"]
 
     def way():
@@ -207,7 +207,7 @@ def main():
     shape.add_argument("--nest", action="store_true", help="also nest loops inside repeats")
     shape.add_argument("--ways", action="store_true", help="loops beside other items in the ways of an outer repeat")
     shape.add_argument("--assert", dest="anchors", action="store_true", help="ways that hold a zero-width anchor")
-    shape.add_argument("--bounded", action="store_true", help="a lazy {0,n}? or {1,n}? over anchors, switches and loops")
+    shape.add_argument("--bounded", action="store_true", help="a lazy repeat with a minimum under two over anchors, switches and loops")
     shape.add_argument("--fancy", action="store_true", help="a lookaround or atomic group beside the loop")
     ap.add_argument("--newlines", action="store_true", help="with --assert: subjects that hold a newline")
     ap.add_argument("--blanks", action="store_true",

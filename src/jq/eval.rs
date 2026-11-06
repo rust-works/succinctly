@@ -33708,11 +33708,12 @@ fn group_copies_engine<S: EvalSemantics>(
     // would factor and so change which branch wins. The guard adds no group.
     let (copied, re) = match std_regex(&copied.pattern) {
         Ok(re) => (copied, re),
-        Err(_) => {
-            let copied = super::onig_loop::rewrite_with_groups_past_the_size_limit(source)?;
+        Err(_) => [1, 2].iter().find_map(|&reading| {
+            let copied =
+                super::onig_loop::rewrite_with_groups_past_the_size_limit(source, reading)?;
             let re = std_regex(&copied.pattern).ok()?;
-            (copied, re)
-        }
+            Some((copied, re))
+        })?,
     };
     (re.captures_len() == copied.compiled_groups).then_some(())?;
     let groups = compose_group_copies(base, copied)?;
@@ -139713,7 +139714,8 @@ mod tests {
         for n in [12_000, 20_000, 33_000, 55_000] {
             let pattern = format!("(?:(a)|b*|c)+(?:(d*)|x){{1,{n}}}?");
             let written = super::super::onig_loop::rewrite_with_groups(&pattern).unwrap();
-            let again = super::super::onig_loop::rewrite_with_groups_past_the_size_limit(&pattern);
+            let again =
+                super::super::onig_loop::rewrite_with_groups_past_the_size_limit(&pattern, 2);
             let again = again.unwrap();
             assert!(again.pattern.contains(&format!("{{1,{n}}}?")), "{pattern}");
             let refused = std_regex(&written.pattern).is_err();

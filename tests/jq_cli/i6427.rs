@@ -72,6 +72,11 @@ fn a_lazy_star_or_plus_around_groups_answers_as_jq_does_6427() -> Result<()> {
             "abba",
             r#"[[0,"abba",["",null]],[4,"",["",""]]]"#,
         ),
+        (
+            r"(?:(?:(b*)|a)+?|c)+?(b)",
+            "abab",
+            r#"[[0,"ab",["","b"]],[2,"ab",["","b"]]]"#,
+        ),
     ] {
         let (stdout, _, status) = run_jq_full(
             &[
@@ -83,6 +88,38 @@ fn a_lazy_star_or_plus_around_groups_answers_as_jq_does_6427() -> Result<()> {
                 "p",
                 pattern,
                 r#"[$s | match($p; "g") | [.offset, .string, (.captures | map(.string))]]"#,
+            ],
+            None,
+        )?;
+        assert_eq!(
+            (stdout.trim_end(), status),
+            (expected, 0),
+            "{pattern} on {input:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A letter that stops the operation count under case folding does not make a short body long, and a
+/// repeat in the body still leaves the length unknown.
+#[test]
+fn a_lazy_plus_under_case_folding_answers_as_jq_does_6427() -> Result<()> {
+    for (pattern, input, expected) in [
+        (r"(?:(s*)|a)+?b", "aab", r#"[[0,"aab",[""]]]"#),
+        (r"(?:(s*)|(a))+?b", "aab", r#"[[0,"aab",["","a"]]]"#),
+        (r"(?:([c]*)|a)+?b", "aab", r#"[[0,"aab",[""]]]"#),
+        (r"((b*)|(a)?)+?b", "aab", r#"[[0,"aab",["a",null,"a"]]]"#),
+    ] {
+        let (stdout, _, status) = run_jq_full(
+            &[
+                "-nc",
+                "--arg",
+                "s",
+                input,
+                "--arg",
+                "p",
+                pattern,
+                r#"[$s | match($p; "gi") | [.offset, .string, (.captures | map(.string))]]"#,
             ],
             None,
         )?;
