@@ -7730,23 +7730,52 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let mut chomping = ChompingIndicator::Clip;
         let mut explicit_indent: u8 = 0;
 
-        // Parse optional modifiers (order can vary: |2- or |-2)
+        // Parse optional modifiers (order can vary: |2- or |-2), one of each kind: a second
+        // chomping indicator, a second digit and a `0` are left for the check below, which
+        // refuses them (#6348).
+        let mut chomping_seen = false;
         for _ in 0..2 {
             match self.peek() {
-                Some(b'-') => {
+                Some(b'-') if !chomping_seen => {
                     chomping = ChompingIndicator::Strip;
+                    chomping_seen = true;
                     self.advance();
                 }
-                Some(b'+') => {
+                Some(b'+') if !chomping_seen => {
                     chomping = ChompingIndicator::Keep;
+                    chomping_seen = true;
                     self.advance();
                 }
-                Some(c) if c.is_ascii_digit() && c != b'0' => {
+                Some(c) if c.is_ascii_digit() && c != b'0' && explicit_indent == 0 => {
                     explicit_indent = c - b'0';
                     self.advance();
                 }
                 _ => break,
             }
+        }
+
+        // The header holds nothing else: after the indicators only blanks, a comment and the line
+        // break (#6348). yq stops at anything more with `did not find expected comment or line
+        // break` (`a: |  x`, `a: |x`, `a: |--`, `a: |0`, `a: |"q"`); the text was dropped and the
+        // lines below read as the content.
+        let mut after = self.pos;
+        while self
+            .input
+            .get(after)
+            .copied()
+            .is_some_and(Self::is_inline_whitespace)
+        {
+            after += 1;
+        }
+        // NEL, LS and PS end the line to yq as `\n` does, which the index does not model (#4913):
+        // left accepted, as before, rather than refused for a value that is already wrong.
+        if !matches!(self.input.get(after), None | Some(b'\n' | b'\r' | b'#'))
+            && self.unicode_break_len_at(after) == 0
+        {
+            return Err(self.err_unexpected_char(
+                after,
+                "did not find expected comment or line break after a block scalar header",
+            ));
         }
 
         Ok(BlockScalarHeader {
@@ -9851,6 +9880,65 @@ fn build_semi_index_impl(input: &[u8], json_strict: bool) -> Result<SemiIndex, Y
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6348: a block scalar header holds one chomping character, one digit 1-9, blanks, a comment
+    /// and the line break. Anything else is refused at the parser, whatever the caller, in every
+    /// position a block scalar can open: this pins the loop's own one-of-each guards apart from the
+    /// post-check that backs them.
+    #[test]
+    fn test_a_block_scalar_header_with_anything_else_is_refused_6348() {
+        for yaml in [
+            &b"a: |  x\n  y\n"[..],
+            b"a: |x\n  y\n",
+            b"a: |--\n  x\n",
+            b"a: |-+\n  x\n",
+            b"a: |+-\n  x\n",
+            b"a: |22\n  x\n",
+            b"a: |0\n  x\n",
+            b"a: |-1-\n  x\n",
+            b"a: |1-1\n  x\n",
+            b"a: !!str |  x\n  y\n",
+            b"a: &x |  x\n  y\n",
+            b"- |  x\n  y\n",
+            b"- &a |--\n  y\n",
+            b"? |0\n  x\n: 1\n",
+            b"|  x\n  y\n",
+            b"--- |  x\n  y\n",
+            b"a:\n  b: |  q\n    r\n",
+        ] {
+            assert!(
+                crate::yaml::YamlIndex::build(yaml).is_err(),
+                "{:?} should be refused",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
+    /// #6348: the refusal's controls: indicators in either order, blanks, a tab and a comment (with
+    /// or without a space before `#`, as yq reads it) before the break all still parse.
+    #[test]
+    fn test_a_block_scalar_header_of_indicators_blanks_and_a_comment_still_parses_6348() {
+        for yaml in [
+            &b"a: |1-\n  x\n"[..],
+            b"a: |-1\n  x\n",
+            b"a: |+2\n   x\n",
+            b"a: |#c\n  x\n",
+            b"a: | #c\n  x\n",
+            b"a: |\t# c\n  x\n",
+            b"a: |  \n  x\n",
+            b"a: |\t\n  x\n",
+            b"a: !!str |-\n  x\n",
+            b"a: &x |#c\n  x\n",
+            b"- >+\n  x\n\n",
+            b"a: |",
+        ] {
+            assert!(
+                crate::yaml::YamlIndex::build(yaml).is_ok(),
+                "{:?} should parse",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
 
     /// #5062: a `: ` inside a trailing comment does not make a plain scalar a mapping key. yq v4.53.3
     /// reads each of these; they were rejected as `key without value`. `a#b: c` (no space before `#`)
