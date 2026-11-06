@@ -61,7 +61,6 @@ GT5M      lax:anchors       anchor/alias rules not validated — #223
 H7J7      lax:anchors       anchored key's value on the next line, unindented relative to the key (`key: &x` / `!!map` at the same column) — read as null per indentation, but the tag's own deferred mapping content is then dropped rather than rejected — #223 (surfaced by #224 the same way as 9HCY)
 JEF9/02   scalars           blank final line with no break — follows yq, which gives "" — #344
 K3WX      structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
-L24T/00   scalars           scalar content/folding differs from spec
 L24T/01   scalars           literal block ending the input with a line of spaces and no break: the spec's `b-chomped-last` counts the end of input as a break (`"x\n \n"`), real yq gives `"x\n "` — we follow yq, the same policy as JEF9/02 — #4959
 M2N8/00   structure         a compact entry with an empty key and no `?` before its `:` inside an explicit key (`- ? : x`): valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected key") — we follow yq, as for 2JQS (#6325)
 M7A3      structure         bare document / `...` end-marker mis-parsed (both paths agree)
