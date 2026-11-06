@@ -14,6 +14,10 @@ const A: &str =
     r#"{"a":null,"b":[1,"x",null,{"c":null,"d":true}],"e":{"f":2.5,"g":"s","h":[]},"i":{}}"#;
 const B: &str = r#"[null,[null,[null]],{"a":{"a":null}},"s",1,false,true]"#;
 
+const SHADOW: &str = "{\"a\":\"x\",\"b\":[null,\"y\",{\"a\":1}]}";
+const G: &str =
+    r#"{"n":null,"t":true,"f":false,"i":3,"s":"s","a":[1,[2],{}],"o":{"k":[null,"z"]},"e":""}"#;
+
 /// (stdin, filter, jq 1.7.1's stdout, jq 1.7.1's exit status).
 const ROWS: &[(&str, &str, &str, i32)] = &[
     (A, "[path(..|nulls)]", "[[\"a\"],[\"b\",2],[\"b\",3,\"c\"]]\n", 0),
@@ -96,6 +100,54 @@ const ROWS: &[(&str, &str, &str, i32)] = &[
     (B, "[path(..|(strings//empty))]", "[[3]]\n", 0),
     (B, "[path(..|strings|strings)]", "[[3]]\n", 0),
     (B, "delpaths([path(..|strings)])", "[null,[null,[null]],{\"a\":{\"a\":null}},1,false,true]\n", 0),
+    (SHADOW, "def strings: .a; [path(..|strings)]", "", 5),
+    (SHADOW, "def nulls: empty; del(..|nulls)", "{\"a\":\"x\",\"b\":[null,\"y\",{\"a\":1}]}\n", 0),
+    (SHADOW, "def values: select(type==\"string\"); [path(..|values)]", "[[\"a\"],[\"b\",1]]\n", 0),
+    (SHADOW, "def objects: .; (..|objects) |= 1", "", 5),
+    (SHADOW, "def arrays(f): f; [path(..|arrays(.a?))]", "[[\"a\"],[\"b\",0,\"a\"],[\"b\",2,\"a\"]]\n", 0),
+    (SHADOW, "def nulls: select(.a?); [path(..|nulls)]", "[[],[\"b\",2]]\n", 0),
+    (G, "[path(..|booleans)]", "[[\"t\"],[\"f\"]]\n", 0),
+    (G, "del(..|booleans)", "{\"n\":null,\"i\":3,\"s\":\"s\",\"a\":[1,[2],{}],\"o\":{\"k\":[null,\"z\"]},\"e\":\"\"}\n", 0),
+    (G, "(..|booleans) |= 0", "{\"n\":null,\"t\":0,\"f\":0,\"i\":3,\"s\":\"s\",\"a\":[1,[2],{}],\"o\":{\"k\":[null,\"z\"]},\"e\":\"\"}\n", 0),
+    (G, "[path(first(..|booleans))]", "[[\"t\"]]\n", 0),
+    (G, "[path(..|booleans|length)]", "", 5),
+    (G, "try path(..|booleans|tostring) catch .", "\"Invalid path expression with result \\\"true\\\"\"\n", 0),
+    (G, "[path(..|numbers)]", "[[\"i\"],[\"a\",0],[\"a\",1,0]]\n", 0),
+    (G, "del(..|numbers)", "{\"n\":null,\"t\":true,\"f\":false,\"s\":\"s\",\"a\":[[],{}],\"o\":{\"k\":[null,\"z\"]},\"e\":\"\"}\n", 0),
+    (G, "(..|numbers) |= 0", "{\"n\":null,\"t\":true,\"f\":false,\"i\":0,\"s\":\"s\",\"a\":[0,[0],{}],\"o\":{\"k\":[null,\"z\"]},\"e\":\"\"}\n", 0),
+    (G, "[path(first(..|numbers))]", "[[\"i\"]]\n", 0),
+    (G, "[path(..|numbers|length)]", "", 5),
+    (G, "try path(..|numbers|tostring) catch .", "\"Invalid path expression with result \\\"3\\\"\"\n", 0),
+    (G, "[path(..|arrays)]", "[[\"a\"],[\"a\",1],[\"o\",\"k\"]]\n", 0),
+    (G, "del(..|arrays)", "{\"n\":null,\"t\":true,\"f\":false,\"i\":3,\"s\":\"s\",\"o\":{},\"e\":\"\"}\n", 0),
+    (G, "(..|arrays) |= 0", "", 5),
+    (G, "[path(first(..|arrays))]", "[[\"a\"]]\n", 0),
+    (G, "[path(..|arrays|length)]", "", 5),
+    (G, "try path(..|arrays|tostring) catch .", "\"Invalid path expression with result \\\"[1,[2],{}]\\\"\"\n", 0),
+    (G, "[path(..|objects)]", "[[],[\"a\",2],[\"o\"]]\n", 0),
+    (G, "del(..|objects)", "null\n", 0),
+    (G, "(..|objects) |= 0", "", 5),
+    (G, "[path(first(..|objects))]", "[[]]\n", 0),
+    (G, "[path(..|objects|length)]", "", 5),
+    (G, "try path(..|objects|tostring) catch .", "\"Invalid path expression with result \\\"{\\\\\\\"n\\\\\\\":null,\\\\\\\"t\\\\\\\":true,\\\\\\\"...\"\n", 0),
+    (G, "[path(..|iterables)]", "[[],[\"a\"],[\"a\",1],[\"a\",2],[\"o\"],[\"o\",\"k\"]]\n", 0),
+    (G, "del(..|iterables)", "null\n", 0),
+    (G, "(..|iterables) |= 0", "", 5),
+    (G, "[path(first(..|iterables))]", "[[]]\n", 0),
+    (G, "[path(..|iterables|length)]", "", 5),
+    (G, "try path(..|iterables|tostring) catch .", "\"Invalid path expression with result \\\"{\\\\\\\"n\\\\\\\":null,\\\\\\\"t\\\\\\\":true,\\\\\\\"...\"\n", 0),
+    (G, "[path(..|scalars)]", "[[\"n\"],[\"t\"],[\"f\"],[\"i\"],[\"s\"],[\"a\",0],[\"a\",1,0],[\"o\",\"k\",0],[\"o\",\"k\",1],[\"e\"]]\n", 0),
+    (G, "del(..|scalars)", "{\"a\":[[],{}],\"o\":{\"k\":[]}}\n", 0),
+    (G, "(..|scalars) |= 0", "{\"n\":0,\"t\":0,\"f\":0,\"i\":0,\"s\":0,\"a\":[0,[0],{}],\"o\":{\"k\":[0,0]},\"e\":0}\n", 0),
+    (G, "[path(first(..|scalars))]", "[[\"n\"]]\n", 0),
+    (G, "[path(..|scalars|length)]", "", 5),
+    (G, "try path(..|scalars|tostring) catch .", "\"Invalid path expression with result \\\"null\\\"\"\n", 0),
+    (G, "[path(..|values)]", "[[],[\"t\"],[\"f\"],[\"i\"],[\"s\"],[\"a\"],[\"a\",0],[\"a\",1],[\"a\",1,0],[\"a\",2],[\"o\"],[\"o\",\"k\"],[\"o\",\"k\",1],[\"e\"]]\n", 0),
+    (G, "del(..|values)", "null\n", 0),
+    (G, "(..|values) |= 0", "", 5),
+    (G, "[path(first(..|values))]", "[[]]\n", 0),
+    (G, "[path(..|values|length)]", "", 5),
+    (G, "try path(..|values|tostring) catch .", "\"Invalid path expression with result \\\"{\\\\\\\"n\\\\\\\":null,\\\\\\\"t\\\\\\\":true,\\\\\\\"...\"\n", 0),
 ];
 
 #[test]
