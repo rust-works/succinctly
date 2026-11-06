@@ -1945,6 +1945,11 @@ impl Rewriter<'_> {
         if self.has_groups(&written) || (grouped && self.lazy_around > 0) {
             return Ok(kept);
         }
+        // #6424: a second exit written back last sets the group around the body. With none, it is
+        // the exit every loop ends with, which the text already has.
+        if anchor.last && !grouped {
+            return Ok(kept);
+        }
         // With no `B`, and no group for `E` to set, the next iteration can only fail where `A` did,
         // so the text already leaves where Oniguruma does (as [`Self::exit_on_empty`] says). Short
         // of a minimum of two: there `c` then `A` makes the count, where Oniguruma has left. That
@@ -2928,9 +2933,15 @@ mod tests {
         assert_eq!(written(r"(\b|a)?"), None);
         // Counted, it is written: `E` leaves all of it, where the crate's copies would go on.
         assert!(written(r"(\b|a){2}").is_some());
-        // Two exits, or an empty way after one, are past what the forms write.
-        assert_eq!(written(r"(\A|a|\B)*"), None);
+        // A second exit with no way after it, or the same anchor again, is written (#6424); one with
+        // a way after it is past what the forms write, and so is a list of anchors that holds nowhere.
+        assert!(written(r"(\A|a|\B)*").is_some_and(|t| t.contains(r"\A(")));
+        assert!(written(r"(\b|a|\b)*").is_some());
+        assert_eq!(written(r"(\A|a|\B|b)*"), None);
+        assert_eq!(written(r"(\b|a|\B|b)*"), None);
         assert_eq!(written(r"(\b\B|a)*"), None);
+        // Without a group around the body the dropped exit sets nothing: the text stays as written.
+        assert_eq!(rewrite(r"(?:\A|a|\B)*"), None);
         // The shadow spells `\G` as `\b`: it is not one, so nothing writes its complement.
         let shadowed = rewrite(r"(?=x)(?:a|\Gb?|b)*").unwrap_or_default();
         assert!(!shadowed.contains(r"\B"), "{shadowed}");
