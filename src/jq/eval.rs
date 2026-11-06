@@ -34433,6 +34433,10 @@ fn build_fancy_regex_at<S: EvalSemantics>(
     // The tree is read the way the builder below reads the pattern (#6165): in Oniguruma's mode a
     // stacked repeat (`a**`) is valid, which the default reading refuses.
     let (expr, pattern) = parse_fancy_tree(pattern)?;
+    // #6460: a lazy repeat between two greedy ones of one expression is written so that the
+    // engine's optimizer does not merge them. Where that is not possible, the text a loop rewrite
+    // wrote is refused (#6426) and a pattern as written keeps the answer it had.
+    let (expr, pattern) = fancy_without_lazy_squeezed_run(expr, pattern);
     if !fancy_expr_is_oniguruma(&expr) || expr.has_descendant(|e| !fancy_expr_is_oniguruma(e)) {
         return None;
     }
@@ -34977,8 +34981,8 @@ fn fancy_has_squeezed_plus_run(expr: &fancy_regex::Expr) -> bool {
 /// Whether `expr` holds a greedy `X+` or `X*` and a greedy `X+` or `X*` of the same expression with
 /// one lazy repeat that can match nothing between them (`b+a*?b*`), which `fancy-regex` 0.20.0
 /// rewrites to `b+(?:a+?b*)?` and so makes greedy: `"bab" | test("b+a*?b*")` matches `b` in jq and
-/// `bab` there (#6426). The loop rewrites write lazy repeats between copies of a way, and are run
-/// by the `regex` crate where they can be; a rewrite with this shape keeps the pattern as it was.
+/// `bab` there (#6426). [`fancy_without_lazy_squeezed_run`] writes the lazy repeat so that it is
+/// not merged (#6460).
 #[cfg(feature = "regex")]
 fn fancy_has_lazy_squeezed_run(expr: &fancy_regex::Expr) -> bool {
     use fancy_regex::Expr;
@@ -35047,6 +35051,184 @@ fn fancy_has_repeated_lazy_group(expr: &fancy_regex::Expr) -> bool {
         _ => false,
     };
     merged(expr) || expr.has_descendant(merged)
+}
+
+/// `expr` and its `pattern`, with every lazy repeat that can match nothing written as the
+/// alternation `(?:X*?|(?!))` when the tree has the shape [`fancy_has_lazy_squeezed_run`] finds
+/// (#6460). The optimizer looks for a repeat between two others, and the alternation is not one;
+/// its second way never matches, so the pattern means what it did. Unchanged where the scan cannot
+/// read the pattern or the result still has the shape.
+#[cfg(feature = "regex")]
+fn fancy_without_lazy_squeezed_run(
+    expr: fancy_regex::Expr,
+    pattern: String,
+) -> (fancy_regex::Expr, String) {
+    if !fancy_has_lazy_squeezed_run(&expr) {
+        return (expr, pattern);
+    }
+    match wrap_lazy_zero_repeats(&pattern).and_then(parse_fancy_tree) {
+        Some((wrapped_expr, wrapped)) if !fancy_has_lazy_squeezed_run(&wrapped_expr) => {
+            (wrapped_expr, wrapped)
+        }
+        _ => (expr, pattern),
+    }
+}
+
+/// `pattern` with each lazy repeat that allows no repetition (`X*?`, `X??`, `X{0,n}?`, `X{,n}?`)
+/// written as `(?:X*?|(?!))` (#6460), or `None` when the pattern holds anything this scan does not
+/// read as a sequence of atoms and quantifiers: a comment, the extended mode, `\Q`, a backreference
+/// or a lazy repeat whose atom it cannot find.
+#[cfg(feature = "regex")]
+fn wrap_lazy_zero_repeats(pattern: &str) -> Option<String> {
+    let b = pattern.as_bytes();
+    let extended = pattern.match_indices("(?").any(|(at, _)| {
+        pattern[at + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
+            .any(|c| c == 'x')
+    });
+    if pattern.contains('#') || extended {
+        return None;
+    }
+    let mut open: Vec<usize> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    // Where the last complete atom starts; none after a quantifier or a bare `(`.
+    let mut atom: Option<usize> = None;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                let next = *b.get(i + 1)?;
+                let len = match next {
+                    b'p' | b'P' | b'x' | b'o' if b.get(i + 2) == Some(&b'{') => {
+                        3 + b[i + 3..].iter().position(|&c| c == b'}')? + 1
+                    }
+                    b'x' if b
+                        .get(i + 2..i + 4)
+                        .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit)) =>
+                    {
+                        4
+                    }
+                    b'd' | b'D' | b'w' | b'W' | b's' | b'S' | b'h' | b'H' | b'b' | b'B' | b'A'
+                    | b'z' | b'Z' | b'G' | b'K' | b'R' | b'N' | b'O' | b'X' | b'n' | b'r'
+                    | b't' | b'f' | b'v' | b'e' | b'a' => 2,
+                    c if !c.is_ascii_alphanumeric() && c.is_ascii() => 2,
+                    _ => return None,
+                };
+                atom = Some(i);
+                i += len;
+            }
+            b'[' => {
+                let mut j = i + 1;
+                let mut depth = 1usize;
+                if b.get(j) == Some(&b'^') {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b']') {
+                    j += 1;
+                }
+                while depth > 0 {
+                    match *b.get(j)? {
+                        b'\\' => j += 1,
+                        b'[' => depth += 1,
+                        b']' => depth -= 1,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                atom = Some(i);
+                i = j;
+            }
+            b'(' => {
+                atom = None;
+                if b.get(i + 1) == Some(&b'?') {
+                    // The group's opening: `(?:`, `(?=`, `(?!`, `(?>`, `(?<=`, `(?<!`, `(?<n>`,
+                    // `(?'n'`, `(?i:`; a switch with no body (`(?i)`) is no group to repeat.
+                    let rest = &pattern[i + 2..];
+                    let header = match rest.as_bytes().first()? {
+                        b':' | b'=' | b'!' | b'>' => 3,
+                        b'<' if matches!(rest.as_bytes().get(1), Some(b'=' | b'!')) => 4,
+                        b'<' => 2 + rest.find('>')? + 1,
+                        b'\'' => 2 + 1 + rest[1..].find('\'')? + 1,
+                        _ => {
+                            let flags = rest
+                                .bytes()
+                                .take_while(|c| c.is_ascii_alphabetic() || *c == b'-')
+                                .count();
+                            match rest.as_bytes().get(flags)? {
+                                b':' => 2 + flags + 1,
+                                b')' => {
+                                    i += 2 + flags + 1;
+                                    continue;
+                                }
+                                _ => return None,
+                            }
+                        }
+                    };
+                    open.push(i);
+                    i += header;
+                } else {
+                    open.push(i);
+                    i += 1;
+                }
+            }
+            b')' => {
+                atom = Some(open.pop()?);
+                i += 1;
+            }
+            c @ (b'*' | b'+' | b'?' | b'{') => {
+                let (mut end, lo_zero) = match c {
+                    b'*' | b'?' => (i + 1, true),
+                    b'+' => (i + 1, false),
+                    _ => {
+                        let close = i + b[i..].iter().position(|&c| c == b'}')?;
+                        let inner = &pattern[i + 1..close];
+                        let (lo, hi) = inner.split_once(',').unwrap_or((inner, inner));
+                        let digits = |t: &str| t.bytes().all(|c| c.is_ascii_digit());
+                        if !digits(lo) || !digits(hi) || (lo.is_empty() && hi.is_empty()) {
+                            // Not an interval: a literal `{`.
+                            atom = Some(i);
+                            i += 1;
+                            continue;
+                        }
+                        (close + 1, lo.is_empty() || lo.bytes().all(|c| c == b'0'))
+                    }
+                };
+                let lazy = b.get(end) == Some(&b'?');
+                if lazy || b.get(end) == Some(&b'+') {
+                    end += 1;
+                }
+                if lazy && lo_zero {
+                    spans.push((atom?, end));
+                }
+                atom = None;
+                i = end;
+            }
+            _ => {
+                atom = Some(i);
+                i += pattern[i..].chars().next()?.len_utf8();
+            }
+        }
+    }
+    if !open.is_empty() || spans.is_empty() {
+        return None;
+    }
+    // At one position the closings come first, and of two openings the longer span.
+    let mut edits: Vec<(usize, u8, usize)> = Vec::with_capacity(spans.len() * 2);
+    for &(start, end) in &spans {
+        edits.push((start, 1, usize::MAX - end));
+        edits.push((end, 0, 0));
+    }
+    edits.sort_unstable();
+    let mut out = string_with_capacity(pattern.len() + 9 * spans.len());
+    let mut from = 0;
+    for (at, kind, _) in edits {
+        out.push_str(&pattern[from..at]);
+        out.push_str(if kind == 1 { "(?:" } else { "|(?!))" });
+        from = at;
+    }
+    out.push_str(&pattern[from..]);
+    Some(out)
 }
 
 /// Whether `expr` holds a backreference to a capture group that is still open where the reference
@@ -140426,31 +140608,36 @@ mod tests {
         }
     }
 
-    /// #6426: `fancy-regex` 0.20 rewrites `b+a*?b*` as `b+(?:a+?b*)?`, which makes the lazy repeat
-    /// greedy (`"bab"` matches `bab`; jq and the `regex` crate match `b`). The text a loop rewrite
-    /// wrote is refused there when it holds the shape, also under a repeat that is merged first
-    /// (`(?:b+)+`); the pattern as written is not.
+    /// #6426, #6460: `fancy-regex` 0.20 rewrites `b+a*?b*` as `b+(?:a+?b*)?`, which makes the lazy
+    /// repeat greedy (`"bab"` matches `bab`; jq and the `regex` crate match `b`). The lazy repeat is
+    /// written as `(?:a*?|(?!))`, which the optimizer does not merge, also under a repeat that is
+    /// merged first (`(?:b+)+`) and in text a loop rewrite wrote; where the scan cannot read the
+    /// pattern, the text a rewrite wrote is refused and a pattern as written keeps its answer.
     #[cfg(feature = "regex")]
     #[test]
-    fn a_rewrite_with_a_lazy_repeat_between_two_greedy_ones_is_refused_by_fancy_regex_6426() {
-        let rewritten = FancyModes::rewritten_on(false);
+    fn a_lazy_repeat_between_two_greedy_ones_is_kept_lazy_on_fancy_regex_6460() {
+        let span = |pattern: &str, modes: FancyModes| {
+            let re = build_fancy_regex_with::<JqSemantics>(pattern, modes)?;
+            let caps = re.captures("bab").unwrap()?;
+            let all = caps.get(0).unwrap();
+            Some((all.start(), all.end()))
+        };
         for squeezed in [
             "(?=b)b+a*?b*",
             "(?=b)b*a*?b*",
             "(?=b)(?:b+)+a*?b*",
-            "(?=b)(?:(a)b+c*?b*)",
+            "(?=b)b+[ab]??b*",
+            "(?=b)b+a{0,3}?b*",
+            "(?=b)(?:b+a*?b*)*",
+            "(?=b)(b+)(?:xa)*?(b*)",
+            "(?=b)b+[a-z]??b*",
         ] {
-            assert!(
-                build_fancy_regex_with::<JqSemantics>(squeezed, FancyModes::default()).is_some(),
-                "{squeezed} as written"
-            );
-            assert!(
-                build_fancy_regex_with::<JqSemantics>(squeezed, rewritten).is_none(),
-                "{squeezed} rewritten"
-            );
+            for modes in [FancyModes::default(), FancyModes::rewritten_on(false)] {
+                assert_eq!(span(squeezed, modes), Some((0, 1)), "{squeezed}");
+            }
         }
         // A lazy repeat that is not between two of the same expression, a greedy middle, a bounded
-        // side and a lazy side are not the shape.
+        // side and a lazy side are not the shape, and are not written differently.
         for other in [
             "(?=b)b+a*?c*",
             "(?=b)b+a*b*",
@@ -140458,10 +140645,87 @@ mod tests {
             "(?=b)b+?a*?b*",
             "(?=b)b+a+?b*",
         ] {
+            let re = build_fancy_regex_with::<JqSemantics>(other, FancyModes::rewritten_on(false)).unwrap();
+            assert!(!re.as_str().contains("(?!)"), "{other}");
+        }
+        // A pattern the scan does not read keeps the answer it had as written, and is refused as
+        // the text of a rewrite.
+        for unread in [
+            "(?=b)(?#c)b+a*?b*",
+            "(?x)(?=b)b+ a*? b*",
+            "(?=b)\\Qb\\E+a*?b*",
+        ] {
+            let as_written = span(unread, FancyModes::default());
             assert!(
-                build_fancy_regex_with::<JqSemantics>(other, rewritten).is_some(),
-                "{other}"
+                as_written.is_none() || as_written == Some((0, 3)),
+                "{unread}"
             );
+            assert_eq!(span(unread, FancyModes::rewritten_on(false)), None, "{unread}");
+        }
+    }
+
+    /// #6460: the scan finds the atom of each lazy repeat that allows none, and reads nothing it is
+    /// not sure of.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn the_scan_wraps_each_lazy_zero_repeat_6460() {
+        for (pattern, wrapped) in [
+            ("b+a*?b*", "b+(?:a*?|(?!))b*"),
+            ("b+[ab]??b*", "b+(?:[ab]??|(?!))b*"),
+            ("b+a{0,3}?b*", "b+(?:a{0,3}?|(?!))b*"),
+            ("b+a{,3}?b*", "b+(?:a{,3}?|(?!))b*"),
+            ("b+(?:xa)*?b*", "b+(?:(?:xa)*?|(?!))b*"),
+            ("b+(a|c)*?b*", "b+(?:(a|c)*?|(?!))b*"),
+            ("b+\\w*?b*", "b+(?:\\w*?|(?!))b*"),
+            ("b+\\p{L}*?b*", "b+(?:\\p{L}*?|(?!))b*"),
+            ("b+\\x41*?b*", "b+(?:\\x41*?|(?!))b*"),
+            ("b+\\x{41}*?b*", "b+(?:\\x{41}*?|(?!))b*"),
+            ("b+\\.*?b*", "b+(?:\\.*?|(?!))b*"),
+            ("b+é*?b*", "b+(?:é*?|(?!))b*"),
+            ("b+[]a]*?b*", "b+(?:[]a]*?|(?!))b*"),
+            ("b+[[:alpha:]]*?b*", "b+(?:[[:alpha:]]*?|(?!))b*"),
+            ("b+(?<n>a)*?b*", "b+(?:(?<n>a)*?|(?!))b*"),
+            ("b+(?i:a)*?b*", "b+(?:(?i:a)*?|(?!))b*"),
+            ("(?i)b+a*?b*", "(?i)b+(?:a*?|(?!))b*"),
+            ("(?:b+a*?b*)*?", "(?:(?:b+(?:a*?|(?!))b*)*?|(?!))"),
+            ("b+(?:a*?)*?b*", "b+(?:(?:(?:a*?|(?!)))*?|(?!))b*"),
+            ("b+a*?b*c??", "b+(?:a*?|(?!))b*(?:c??|(?!))"),
+            // `{x}` is no interval: the repeat is of the `}`, as Oniguruma reads it.
+            ("b+a{x}*?b*", "b+a{x(?:}*?|(?!))b*"),
+        ] {
+            assert_eq!(
+                wrap_lazy_zero_repeats(pattern).as_deref(),
+                Some(wrapped),
+                "{pattern}"
+            );
+        }
+        for unread in [
+            // Nothing to wrap: no lazy repeat that can match nothing.
+            "b+a+?b*",
+            "b+a*b*",
+            "b+a{1,3}?b*",
+            "b+a*+b*",
+            "b+a{x",
+            // Read by another rule.
+            "b+(?#c)a*?b*",
+            "(?x)b+ a*? b*",
+            "(?i-x)(?x:b+ a*? b*)",
+            "b+#a*?\n",
+            "b+\\Qa\\E*?b*",
+            "b+\\1*?b*",
+            "(b)+\\k<n>*?b*",
+            "b+\\u0041*?b*",
+            // Unbalanced, or a lazy repeat with no atom.
+            "b+(a*?b*",
+            "b+a*?b*)",
+            "*?",
+            "b+(*?)b*",
+            "b+[a*?b*",
+            "b+(?<n a*?b*",
+            "b+(?",
+            "b+\\",
+        ] {
+            assert_eq!(wrap_lazy_zero_repeats(unread), None, "{unread}");
         }
     }
 
