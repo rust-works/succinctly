@@ -33069,7 +33069,7 @@ fn build_regex_uncached<S: EvalSemantics>(
         }
     }
     if S::TAG != EvalTag::Yq && !longest {
-        if let Some(rewritten) = super::onig_loop::rewrite(&pattern) {
+        if let Some(rewritten) = super::onig_loop::rewrite_for(&pattern, suppress_empty) {
             let before = core::mem::replace(&mut pattern, rewritten);
             as_written.get_or_insert(before);
         }
@@ -33180,7 +33180,9 @@ fn build_regex_uncached<S: EvalSemantics>(
             // cannot): it leaves that loop where Oniguruma does. It writes no group, so the
             // copies stay as counted; a result the crate refuses keeps the capture rewrite alone.
             if !longest {
-                if let Some(ordered) = super::onig_loop::rewrite(&groups.pattern) {
+                if let Some(ordered) =
+                    super::onig_loop::rewrite_for(&groups.pattern, suppress_empty)
+                {
                     // #6426: a pattern with a lookaround or an atomic group is checked on the
                     // engine that runs it.
                     let compiles = if is_fancy_syntax(&ordered) {
@@ -33203,7 +33205,14 @@ fn build_regex_uncached<S: EvalSemantics>(
     // the crate refuses keeps what there was.
     let mut fancy_copies_refused = false;
     let grouped = (S::TAG != EvalTag::Yq && !longest)
-        .then(|| group_copies_engine::<S>(&pattern, capture.as_ref(), &mut fancy_copies_refused))
+        .then(|| {
+            group_copies_engine::<S>(
+                &pattern,
+                capture.as_ref(),
+                &mut fancy_copies_refused,
+                suppress_empty,
+            )
+        })
         .flatten();
     let rewritten = grouped.or_else(|| {
         capture.and_then(|groups| {
@@ -33684,12 +33693,13 @@ fn group_copies_engine<S: EvalSemantics>(
     pattern: &str,
     base: Option<&super::onig_capture_loop::LoopRewrite>,
     fancy_refused: &mut bool,
+    not_empty: bool,
 ) -> Option<RegexEngine> {
     let source = base.map_or(pattern, |groups| groups.pattern.as_str());
     // Switches the copy rewrite refuses leave it unknown whether copies are needed, so the fancy
     // route takes the capture rewrite alone only where they are not refused.
     *fancy_refused = super::onig_loop::leading_switches_refuse(source);
-    let copied = super::onig_loop::rewrite_with_groups(source)?;
+    let copied = super::onig_loop::rewrite_with_groups_for(source, not_empty)?;
     // #6426: a lookaround or an atomic group beside the loop is syntax only `fancy-regex` reads, and
     // the rewrite keeps it as written: it runs there, with the same groups. `fancy_refused` says
     // that the copies were needed and the engine could not take them.
@@ -33709,8 +33719,9 @@ fn group_copies_engine<S: EvalSemantics>(
     let (copied, re) = match std_regex(&copied.pattern) {
         Ok(re) => (copied, re),
         Err(_) => [1, 2].iter().find_map(|&reading| {
-            let copied =
-                super::onig_loop::rewrite_with_groups_past_the_size_limit(source, reading)?;
+            let copied = super::onig_loop::rewrite_with_groups_past_the_size_limit(
+                source, reading, not_empty,
+            )?;
             let re = std_regex(&copied.pattern).ok()?;
             Some((copied, re))
         })?,
@@ -139714,14 +139725,15 @@ mod tests {
         for n in [12_000, 20_000, 33_000, 55_000] {
             let pattern = format!("(?:(a)|b*|c)+(?:(d*)|x){{1,{n}}}?");
             let written = super::super::onig_loop::rewrite_with_groups(&pattern).unwrap();
-            let again =
-                super::super::onig_loop::rewrite_with_groups_past_the_size_limit(&pattern, 2);
+            let again = super::super::onig_loop::rewrite_with_groups_past_the_size_limit(
+                &pattern, 2, false,
+            );
             let again = again.unwrap();
             assert!(again.pattern.contains(&format!("{{1,{n}}}?")), "{pattern}");
             let refused = std_regex(&written.pattern).is_err();
             let kept = std_regex(&again.pattern).is_ok();
             assert_eq!(
-                group_copies_engine::<JqSemantics>(&pattern, None, &mut false).is_some(),
+                group_copies_engine::<JqSemantics>(&pattern, None, &mut false, false).is_some(),
                 !refused || kept
             );
         }
