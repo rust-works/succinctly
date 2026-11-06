@@ -3,7 +3,7 @@
 //! #2505 left plain, and the same copy for a source with no alias in it).
 //! Every expected output is what yq v4.53.3 prints for the same input and filter.
 //!
-//! What stays different (a scalar's own quoting, a constructed or computed right side, a
+//! What stays different (a scalar's own quoting, a constructed right side, a
 //! compound assignment, the alias group a copy joins) is recorded in
 //! `docs/compliance/yq/limitations.md`.
 
@@ -239,5 +239,121 @@ fn test_an_alias_target_over_an_edited_alias_source_5249() -> Result<()> {
         run_yq_stdin(".b = .c | .c[0] = 7", "a: &x 1\nb: [*x]\nc: [*x]\n", &[])?;
     assert_eq!(exit_code, 0);
     assert_eq!(output, "a: &x 1\nb: [*x]\nc: [7]\n");
+    Ok(())
+}
+
+/// A value operand that is computed but still names one node (`.b // 0`, `select(true)`, `. `)
+/// hands `=` that node, so the target takes its alias, explicit tag, quoting, comment and flow
+/// style as it does for `.c = .b` (the computed-operand rows of #2505).
+#[test]
+fn test_a_computed_operand_naming_one_node_copies_it_5249() -> Result<()> {
+    for (input, filter, expected) in [
+        // A negative index is counted from the end of the array as the document had it.
+        (
+            "a: &x 1\nc: &y 2\nb: [*x, *y]\n",
+            ".d = (.b[-1] // 0)",
+            "a: &x 1\nc: &y 2\nb: [*x, *y]\nd: *y\n",
+        ),
+        // Two nodes with the same value: the one the operand reads is the one copied.
+        (
+            "x: &x 1\ny: 1\n",
+            ".c = (.y // .x)",
+            "x: &x 1\ny: 1\nc: 1\n",
+        ),
+        (
+            "a: &x 1\nb: *x\n",
+            ".c = (.b // 0)",
+            "a: &x 1\nb: *x\nc: *x\n",
+        ),
+        (
+            "a: &x 1\nb: *x\n",
+            ".c = (.b | select(true))",
+            "a: &x 1\nb: *x\nc: *x\n",
+        ),
+        (
+            "a: &x 1\nb: *x\n",
+            ".c = (.b | .)",
+            "a: &x 1\nb: *x\nc: *x\n",
+        ),
+        (
+            "a: !Foo x\nb: !!str 3\n",
+            ".c = (.a // 1)",
+            "a: !Foo x\nb: !!str 3\nc: !Foo x\n",
+        ),
+        (
+            "a: !Foo x\nb: !!str 3\n",
+            ".c = (.a | select(true))",
+            "a: !Foo x\nb: !!str 3\nc: !Foo x\n",
+        ),
+        ("a: !Foo x\n", ".b = (.a | .)", "a: !Foo x\nb: !Foo x\n"),
+        (
+            "a: !Foo x\nb: !!str 3\n",
+            ".b = (.a // 2)",
+            "a: !Foo x\nb: !Foo x\n",
+        ),
+        (
+            "a: &x \"q\" # ca\nb: *x # cb\nl: [1, 2] # cl\nm: {k: v}\n",
+            ".c = (.nope // .b)",
+            "a: &x \"q\" # ca\nb: *x # cb\nl: [1, 2] # cl\nm: {k: v}\nc: *x # cb\n",
+        ),
+        (
+            "a: &x \"q\" # ca\nb: *x # cb\nl: [1, 2] # cl\nm: {k: v}\n",
+            ".c = (.l // 0)",
+            "a: &x \"q\" # ca\nb: *x # cb\nl: [1, 2] # cl\nm: {k: v}\nc: [1, 2] # cl\n",
+        ),
+        (
+            "a: &x \"q\" # ca\nb: *x # cb\nl: [1, 2] # cl\nm: {k: v}\n",
+            ".l = (.m // 0)",
+            "a: &x \"q\" # ca\nb: *x # cb\nl: {k: v} # cl\nm: {k: v}\n",
+        ),
+        (
+            "a: &x \"q\" # ca\nb: *x # cb\nl: [1, 2] # cl\nm: {k: v}\n",
+            ".c.d = (.m // 0)",
+            "a: &x \"q\" # ca\nb: *x # cb\nl: [1, 2] # cl\nm: {k: v}\nc:\n  d: {k: v}\n",
+        ),
+        (
+            "a: &x \"q\" # ca\nb: *x # cb\nl: [1, 2] # cl\nm: {k: v}\n",
+            "(.c, .d) = (.m // 0)",
+            "a: &x \"q\" # ca\nb: *x # cb\nl: [1, 2] # cl\nm: {k: v}\nc: {k: v}\nd: {k: v}\n",
+        ),
+        (
+            "a: &x \"q\" # ca\nb: *x # cb\nl: [1, 2] # cl\nm: {k: v}\n",
+            ".c = (.a | select(true))",
+            "a: &x \"q\" # ca\nb: *x # cb\nl: [1, 2] # cl\nm: {k: v}\nc: \"q\" # ca\n",
+        ),
+    ] {
+        let (output, exit_code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(exit_code, 0, "filter: {filter} on {input:?}");
+        assert_eq!(output, expected, "filter: {filter} on {input:?}");
+    }
+    Ok(())
+}
+
+/// A computed operand that is not a node read, or names several, keeps writing a plain value.
+#[test]
+fn test_a_computed_operand_that_is_not_one_node_stays_plain_5249() -> Result<()> {
+    for (input, filter, expected) in [
+        (
+            "a: &x 1\nb: *x\n",
+            ".c = (.b + 1)",
+            "a: &x 1\nb: *x\nc: 2\n",
+        ),
+        ("a: !Foo x\n", ".b = \"lit\"", "a: !Foo x\nb: lit\n"),
+        // Several results, a construction and a compound assignment are not one node read: yq
+        // aliases `.c` in the first and third (the rows #5249 still tracks); the value is right.
+        (
+            "a: &x 1\nb: *x\n",
+            ".c = (.a, .b)",
+            "a: &x 1\nb: *x\nc: 1\n",
+        ),
+        ("a: !Foo x\n", ".c = [.a]", "a: !Foo x\nc:\n  - x\n"),
+        ("a: &x 1\nb: *x\n", ".c += .b", "a: &x 1\nb: *x\nc: 1\n"),
+        // An operand that falls back to a value has no node to copy.
+        ("a: !Foo x\n", ".c = (.nope // 7)", "a: !Foo x\nc: 7\n"),
+    ] {
+        let (output, exit_code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(exit_code, 0, "filter: {filter} on {input:?}");
+        assert_eq!(output, expected, "filter: {filter} on {input:?}");
+    }
     Ok(())
 }

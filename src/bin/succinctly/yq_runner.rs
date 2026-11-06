@@ -4887,6 +4887,90 @@ fn copy_alias_marks(src: &CommentTree, dst: &mut CommentTree) {
     }
 }
 
+/// `expr` with the value operand of its first plain assignment replaced by the static read of
+/// the node it evaluates to, when it is a computed expression that still names one existing node
+/// (#5249): `.c = (.b // 0)` and `.c = (.a | select(true))` hand `=` the node `.b`/`.a` itself, so
+/// yq copies its tag, quoting, comment and alias as it does for `.c = .b`, where the value alone
+/// would be written plain.
+///
+/// Only the first assignment of a pipe, which reads the document as it came in: a later stage
+/// reads what an earlier one wrote. `None` when there is nothing to resolve, which is also the
+/// answer for an operand that is already a static read, for a construction (`[.b]`, a node of its
+/// own), for several results or several paths, and for a path that does not hold the value the
+/// operand evaluates to.
+fn resolve_computed_assign_value(expr: &Expr, root: &OwnedValue) -> Option<Expr> {
+    match expr {
+        Expr::Assign { path, value } => {
+            if static_nav_steps(value).is_some() || !may_name_a_node(value) {
+                return None;
+            }
+            let read = static_read_of(value, root)?;
+            Some(Expr::Assign {
+                path: path.clone(),
+                value: Box::new(read),
+            })
+        }
+        Expr::Paren(inner) => resolve_computed_assign_value(inner, root).map(Expr::paren),
+        Expr::Pipe(stages) => {
+            let resolved = resolve_computed_assign_value(stages.first()?, root)?;
+            let mut stages = stages.to_vec();
+            stages[0] = resolved;
+            Some(Expr::pipe(stages))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `value` can be a read of a node at all: a literal, a construction, arithmetic and a
+/// comma are values of their own or several, so they skip the two evaluations
+/// [`static_read_of`] costs.
+fn may_name_a_node(value: &Expr) -> bool {
+    match value {
+        Expr::Paren(inner) => may_name_a_node(inner),
+        Expr::Literal(_)
+        | Expr::Array(_)
+        | Expr::Object(_)
+        | Expr::Arithmetic { .. }
+        | Expr::Comma(_)
+        | Expr::Identity => false,
+        _ => true,
+    }
+}
+
+/// The static navigation to the one node `value_expr` evaluates to over `root`, or `None`.
+fn static_read_of(value_expr: &Expr, root: &OwnedValue) -> Option<Expr> {
+    let asked = Expr::Builtin(Builtin::Path(Box::new(value_expr.clone())));
+    let paths = evaluate_input_quiet(root, &asked)?;
+    let [path] = paths.as_slice() else {
+        return None;
+    };
+    let steps = meta_path_from_value(path, root)?;
+    if steps.is_empty() {
+        return None;
+    }
+    // The operand must give that node's own value, not a value computed beside it.
+    let node = owned_value_at(root, &steps)?;
+    let values = evaluate_input_quiet(root, value_expr)?;
+    if values.as_slice() != std::slice::from_ref(node) {
+        return None;
+    }
+    let navigation = steps
+        .into_iter()
+        .map(|step| match step {
+            MetaPathStep::Key(key) => Expr::Field(key),
+            MetaPathStep::Index(idx) => Expr::Index {
+                idx: idx as i64,
+                key: None,
+            },
+        })
+        .collect::<Vec<_>>();
+    Some(if navigation.len() == 1 {
+        navigation.into_iter().next()?
+    } else {
+        Expr::pipe(navigation)
+    })
+}
+
 /// Copy the source node's trailing comment and flow style through a plain assignment whose
 /// value is a static read of it (#5249, the comment and flow-style rows of #2505): `.c = .b` on
 /// `b: [*x] # t` writes `c: [*x] # t`, because go-yaml's `Set` copies the whole source node, so
@@ -7904,12 +7988,25 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
         }
     }
 
+    // A value operand that is computed but still names one node (`.b // 0`, `select(true)`) is
+    // read as that node by the three passes below (#5249). Only the first assignment of a chain
+    // is resolved: a later one reads what an earlier one wrote.
+    let resolved_value = presentation_sync_ctx
+        .as_ref()
+        .and_then(|(pristine_value, _)| resolve_computed_assign_value(expr, pristine_value));
+    let pass_expr = resolved_value.as_ref().unwrap_or(expr);
     // Copy the source's trailing comment and flow style through a plain assignment from a static
     // read (#5249). It comes before the alias pass below and carries no anchor mark of its own,
     // so that pass stays the one place an alias mark is decided.
     if let Some((pristine_value, pristine)) = &presentation_sync_ctx {
         for (value, comments) in docs.iter_mut().flatten() {
-            propagate_assign_copied_presentation(expr, value, pristine_value, pristine, comments);
+            propagate_assign_copied_presentation(
+                pass_expr,
+                value,
+                pristine_value,
+                pristine,
+                comments,
+            );
         }
     }
 
@@ -7929,7 +8026,7 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     if has_aliases && presentation_sync_ctx.is_some() {
         if let Ok(docs) = &mut docs {
             for (value, comments) in docs.iter_mut() {
-                propagate_assign_alias_marks(expr, value, comments);
+                propagate_assign_alias_marks(pass_expr, value, comments);
             }
         }
     }
@@ -7939,7 +8036,7 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     if presentation_sync_ctx.is_some() {
         if let Ok(docs) = &mut docs {
             for (value, comments) in docs.iter_mut() {
-                propagate_assign_spellings(expr, value, comments);
+                propagate_assign_spellings(pass_expr, value, comments);
             }
         }
     }
