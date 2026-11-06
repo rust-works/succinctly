@@ -7679,9 +7679,14 @@ Pinned by `tests/jq_cli/i6229.rs`.
 Every refused pattern is `Regex failure: <message>` in jq mode, as in jq, so `try test("[") catch .` is `"Regex failure: premature end of char-class"` in both.
 A refusal the `regex` crate's parser makes is given Oniguruma's message from the error's kind: an unclosed group (`(a`, `(?:`, `(?=`, `\p{L`) is `end pattern with unmatched parenthesis`, an unopened one (`a)`) `unmatched close parenthesis`, `a{2,1}` `upper is smaller than lower in repeat range`, `(?`, `(?i` and `(?#abc` `end pattern in group`, `(?<x` and `\k<x` `invalid group name <x>`, `\k<x>` and `\g<x>` to a name no group has `undefined name <x> reference`, `\k<1>` `invalid backref number/name`, and an unknown property `invalid character property name {Foo}`.
 A repeat count past Oniguruma's 100000 (`x{100001}`, `x{1000,100001}`, `x{99999999}`) is `too big number for repeat range`, which the crate either compiled (and matched) or refused for its size; `x{,100001}` is answered, as in jq.
-Inside a look-around or an atomic group (`(?=a{100001})`), which the crate's parser cannot read, such a count is still answered where jq refuses it, as before.
+Oniguruma reads the number after a `{` as it lexes, before it knows whether the brace is a repeat, so the count is refused wherever the brace stands (#6433): inside a look-around or an atomic group (`(?=a{100001})`), in a brace that never closes or holds more than digits (`x{100001`, `x{100001a}`, `x{1,100001 }`), and with nothing before it (`{100001}`).
+A brace in a class, a quoted run `\Q…\E`, a comment or a braced escape (`\x{100001}`) is no interval, nor is one whose number does not follow it at once (`{,100001}`, `{ 100001}`), and jq answers those.
+An error before the brace comes first, as Oniguruma reads in order (`{2,}{4294967296` is `target of repeat operator is not specified`), except one Oniguruma meets only at the end of the pattern or after reading it (an unclosed group, an undefined call), which the count comes before.
+A call `\g<n>` to a group the pattern does not have is `undefined group <n> reference` (`\g<+1>` too), and `\g<0>` or one that reaches before the first group (`\g<-1>`) is `never ending recursion`.
+Past a construct the crate cannot read but jq accepts (`(?'name'…)`, a reference to a group the pattern has, a second group of the same name), the pattern is read on for a later error (`(?<x>a)\k<x>(` is `end pattern with unmatched parenthesis`).
+Still in the crate's words: an error inside a look-around other than a count (`(?=a{3,2})`), and Oniguruma's cut of a multibyte group name running to the end (`(?<ßx` is `invalid group name <ß>` in jq, `<ßx>` here).
 A refusal of a construct jq accepts (a call `\g<a>` to a group the pattern has, a range cutter `(?~|…)`) has no Oniguruma message, and keeps the crate's rendered parse error after the prefix.
-The rows are pinned against jq 1.7.1 in `tests/jq_cli/i6423.rs`.
+The rows are pinned against jq 1.7.1 in `tests/jq_cli/i6423.rs` and `tests/jq_cli/i6433.rs`.
 `succinctly yq` is not affected: its patterns are Go's, refused in Go's words (``error parsing regexp: missing closing ]: `[` ``).
 
 ### A group repeated `{0}` keeps its capture entry (#6108)

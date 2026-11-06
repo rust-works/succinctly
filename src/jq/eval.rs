@@ -32873,12 +32873,44 @@ fn build_regex_uncached<S: EvalSemantics>(
     } else {
         let extended = flags.is_some_and(|flags| flags.contains('x'));
         let n_flag = flags.is_some_and(|flags| flags.contains('n'));
+        // #6433: Oniguruma refuses a count past its limit as it lexes, unless it met another error
+        // first: one the pattern before the brace has, and keeps with the count written small (a
+        // refusal of the cut pattern alone may be the cut's, an unclosed group).
+        if let Some((brace, digits)) = oversized_interval(pattern, extended) {
+            let refusal = |p: &str| {
+                build_regex_uncached::<S>(p, flags)
+                    .err()
+                    .map(|e| e.to_string())
+            };
+            let small = format!("{}1{}", &pattern[..digits.start], &pattern[digits.end..]);
+            // Oniguruma meets these only at the end of the pattern, or after reading it whole.
+            // The crate's own refusals (its parse errors, its size limit) are none of Oniguruma's.
+            const LATE: [&str; 8] = [
+                "regex parse error",
+                "exceeds size limit",
+                "end pattern with unmatched parenthesis",
+                "premature end of char-class",
+                "end pattern at escape",
+                "end pattern in group",
+                "undefined group",
+                "never ending recursion",
+            ];
+            deferred_refusal = Some(match refusal(&pattern[..brace]) {
+                Some(earlier)
+                    if refusal(&small).as_ref() == Some(&earlier)
+                        && !LATE.iter().any(|late| earlier.contains(late)) =>
+                {
+                    EvalError::new(earlier)
+                }
+                _ => EvalError::new("Regex failure: too big number for repeat range"),
+            });
+        }
         // #6252: the absence operator is written as the loop it is.
         let absence = rewrite_absence_operator(pattern, extended);
         let pattern = absence.as_deref().unwrap_or(pattern);
         let scanned =
             refuse_possessive_quantifier_for(pattern, extended, n_flag).unwrap_or_else(|refusal| {
-                deferred_refusal = Some(refusal);
+                deferred_refusal.get_or_insert(refusal);
                 std::borrow::Cow::Borrowed(pattern)
             });
         let scanned = match escape_class_range_dashes(&scanned, extended) {
@@ -32973,11 +33005,6 @@ fn build_regex_uncached<S: EvalSemantics>(
 
     if let Some(refusal) = deferred_refusal {
         return Err(refusal);
-    }
-    if S::TAG != EvalTag::Yq {
-        if let Some(refusal) = refuse_oversized_repeat(&pattern) {
-            return Err(refusal);
-        }
     }
 
     // #6106: Oniguruma leaves a greedy loop at the first iteration that matches nothing, where the
@@ -33187,52 +33214,113 @@ fn build_regex_uncached<S: EvalSemantics>(
     }
 }
 
-/// Oniguruma's largest repeat count (`ONIG_MAX_REPEAT_NUM`): a `{n}`, `{n,}` or `{n,m}` with a
-/// count past it is `too big number for repeat range` in jq (#6423), even where the `regex` crate
-/// would compile it (`x{100001}`) or refuse it for its size instead (`x{99999999}`).
+/// Oniguruma's largest repeat count (`ONIG_MAX_REPEAT_NUM`).
 #[cfg(feature = "regex")]
 const ONIG_MAX_REPEAT_NUM: u32 = 100_000;
 
-/// jq's refusal of a pattern whose repeat count is past [`ONIG_MAX_REPEAT_NUM`] (#6423), or
-/// `None`. Only a pattern the crate's parser reads is checked: one it refuses is refused anyway,
-/// in the words [`oniguruma_refusal`] gives it. `{,m}` is left alone, as jq 1.7.1 answers it.
+/// The byte offsets of the first brace and the digits of an interval count past
+/// [`ONIG_MAX_REPEAT_NUM`] (#6423, #6433), which jq refuses, or `None`. Oniguruma reads the number after a `{` as it lexes, before it knows whether the brace is
+/// a repeat, so `x{100001}`, `x{100001`, `x{100001a}`, `x{1,100001 }` and `{100001}` are all
+/// `too big number for repeat range`, inside a look-around or an atomic group too. A brace in a
+/// class, a quoted run, a comment or a braced escape (`\x{..}`, `\p{..}`) is no interval, and
+/// neither is one the number does not follow at once (`{,100001}`, `{ 100001}`), which jq answers.
 #[cfg(feature = "regex")]
-fn refuse_oversized_repeat(pattern: &str) -> Option<EvalError> {
-    use regex_syntax::ast::{self, Ast, RepetitionKind, RepetitionRange};
-    // A count past the limit has at least six digits: most patterns are never parsed here.
-    if !pattern
-        .as_bytes()
-        .windows(6)
-        .any(|w| w.iter().all(u8::is_ascii_digit))
-    {
+fn oversized_interval(pattern: &str, extended: bool) -> Option<(usize, core::ops::Range<usize>)> {
+    if !pattern.contains('{') {
         return None;
     }
-    fn oversized(ast: &Ast, pattern: &str) -> bool {
-        match ast {
-            Ast::Repetition(rep) => {
-                let too_big = match &rep.op.kind {
-                    RepetitionKind::Range(
-                        RepetitionRange::Exactly(n) | RepetitionRange::AtLeast(n),
-                    ) => *n > ONIG_MAX_REPEAT_NUM,
-                    RepetitionKind::Range(RepetitionRange::Bounded(m, n)) => {
-                        let low_omitted = pattern
-                            .get(rep.op.span.start.offset..)
-                            .is_some_and(|op| op.starts_with("{,"));
-                        !low_omitted && (*m > ONIG_MAX_REPEAT_NUM || *n > ONIG_MAX_REPEAT_NUM)
-                    }
-                    _ => false,
-                };
-                too_big || oversized(&rep.ast, pattern)
+    let chars: Vec<char> = pattern.chars().collect();
+    // The digits from `from`, and whether their value is past the limit (leading zeros do not count).
+    let count_at = |from: usize| {
+        let len = chars[from..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        let digits: String = chars[from..from + len].iter().collect();
+        let value = digits.trim_start_matches('0');
+        let too_big =
+            value.len() > 6 || value.parse::<u32>().is_ok_and(|v| v > ONIG_MAX_REPEAT_NUM);
+        (len, too_big)
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if chars.get(i + 1) == Some(&'Q') => {
+                i += 2;
+                while i < chars.len() && !(chars[i] == '\\' && chars.get(i + 1) == Some(&'E')) {
+                    i += 1;
+                }
+                i += 2;
             }
-            Ast::Group(group) => oversized(&group.ast, pattern),
-            Ast::Alternation(alt) => alt.asts.iter().any(|a| oversized(a, pattern)),
-            Ast::Concat(concat) => concat.asts.iter().any(|a| oversized(a, pattern)),
-            _ => false,
+            '\\' => {
+                i += 2;
+                let braced = matches!(chars.get(i - 1), Some('x' | 'p' | 'P' | 'o' | 'N'));
+                if braced && chars.get(i) == Some(&'{') {
+                    i += chars[i..]
+                        .iter()
+                        .position(|&c| c == '}')
+                        .map_or(chars.len(), |n| n + 1);
+                }
+            }
+            '[' => {
+                // A class: `]` first is a literal, an escape one character, and a `[` inside it the
+                // literal character, as in Oniguruma's Perl syntax (`[[a]{100001}]` ends at the first
+                // `]`).
+                i += 1;
+                if chars.get(i) == Some(&'^') {
+                    i += 1;
+                }
+                if chars.get(i) == Some(&']') {
+                    i += 1;
+                }
+                while i < chars.len() && chars[i] != ']' {
+                    // A POSIX bracket (`[:alpha:]`) holds its own `]`.
+                    let posix = (chars[i] == '[' && chars.get(i + 1) == Some(&':'))
+                        .then(|| chars[i + 2..].windows(2).position(|w| w == [':', ']']))
+                        .flatten();
+                    i += match (chars[i], posix) {
+                        (_, Some(n)) => n + 4,
+                        ('\\', _) => 2,
+                        _ => 1,
+                    };
+                }
+                i += 1;
+            }
+            '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') => {
+                i = comment_end(&chars, i);
+            }
+            '#' if extended => {
+                i += chars[i..]
+                    .iter()
+                    .position(|&c| c == '\n')
+                    .unwrap_or(chars.len() - i);
+            }
+            '{' => {
+                let brace = i;
+                i += 1;
+                let (len, too_big) = count_at(i);
+                if len == 0 {
+                    continue;
+                }
+                let mut digits = i..i + len;
+                i += len;
+                let upper_too_big = chars.get(i) == Some(&',') && {
+                    let (len, upper) = count_at(i + 1);
+                    if upper && !too_big {
+                        digits = i + 1..i + 1 + len;
+                    }
+                    i += 1 + len;
+                    upper
+                };
+                if too_big || upper_too_big {
+                    let byte = |at: usize| chars[..at].iter().map(|c| c.len_utf8()).sum::<usize>();
+                    return Some((byte(brace), byte(digits.start)..byte(digits.end)));
+                }
+            }
+            _ => i += 1,
         }
     }
-    let ast = ast::parse::Parser::new().parse(pattern).ok()?;
-    oversized(&ast, pattern)
-        .then(|| EvalError::new("Regex failure: too big number for repeat range"))
+    None
 }
 
 /// Oniguruma's message for a pattern the `regex` crate refused with a parse error of its own
@@ -33241,7 +33329,28 @@ fn refuse_oversized_repeat(pattern: &str) -> Option<EvalError> {
 /// crate's rendered message, which can change between releases.
 #[cfg(feature = "regex")]
 fn oniguruma_refusal(pattern: &str) -> Option<String> {
+    oniguruma_refusal_within(pattern, 8)
+}
+
+/// [`oniguruma_refusal`], which may read past a construct the crate cannot parse but jq accepts
+/// (a reference to a group the pattern has, a `(?'name'...)` group) by writing it as one the crate
+/// reads and looking again, up to `retries` times, for an error Oniguruma would meet later.
+#[cfg(feature = "regex")]
+fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
     use regex_syntax::ast::{self, ErrorKind};
+    let retry = |rewritten: String| {
+        retries
+            .checked_sub(1)
+            .and_then(|left| oniguruma_refusal_within(&rewritten, left))
+    };
+    // A call's own refusal, which Oniguruma makes only after reading the whole pattern: a later
+    // one of these does not come before an earlier call's.
+    let is_late = |message: &String| {
+        message.starts_with("undefined group") || message == "never ending recursion"
+    };
+    let chars_before = |offset: usize| -> Vec<char> {
+        pattern.get(..offset).unwrap_or_default().chars().collect()
+    };
     const UNMATCHED_OPEN: &str = "end pattern with unmatched parenthesis";
     let at = |offset: usize| pattern.get(offset..).unwrap_or_default();
     match ast::parse::Parser::new().parse(pattern) {
@@ -33255,24 +33364,9 @@ fn oniguruma_refusal(pattern: &str) -> Option<String> {
                 }
                 ErrorKind::GroupUnclosed => Some(UNMATCHED_OPEN.into()),
                 ErrorKind::GroupUnopened => Some("unmatched close parenthesis".into()),
-                // Oniguruma checks each count against its limit before it compares the two.
-                ErrorKind::RepetitionCountInvalid => Some(
-                    if at(start)
-                        .split('}')
-                        .next()
-                        .unwrap_or_default()
-                        .split(|c: char| !c.is_ascii_digit())
-                        .any(|count| {
-                            count.len() > 6 || count.parse().unwrap_or(0) > ONIG_MAX_REPEAT_NUM
-                        })
-                    {
-                        "too big number for repeat range".into()
-                    } else {
-                        "upper is smaller than lower in repeat range".into()
-                    },
-                ),
-                // A count too large for the crate's `u32` (`x{4294967296}`).
-                ErrorKind::DecimalInvalid => Some("too big number for repeat range".into()),
+                ErrorKind::RepetitionCountInvalid => {
+                    Some("upper is smaller than lower in repeat range".into())
+                }
                 ErrorKind::FlagUnexpectedEof => Some("end pattern in group".into()),
                 // An unclosed comment group, `(?#abc`.
                 ErrorKind::FlagUnrecognized
@@ -33306,14 +33400,35 @@ fn oniguruma_refusal(pattern: &str) -> Option<String> {
                         // `\k<x`: the name runs to the end of the pattern.
                         return Some(format!("invalid group name <{}>", at(start + 3)));
                     };
+                    let end = start + 3 + name.len() + 1;
+                    let rewritten = || format!("{}(?:){}", &pattern[..start], at(end));
                     let numbered = name.strip_prefix(['-', '+']).unwrap_or(name);
                     if !numbered.is_empty() && numbered.bytes().all(|b| b.is_ascii_digit()) {
-                        return at(start)
-                            .starts_with("\\k")
-                            .then(|| "invalid backref number/name".into());
+                        if at(start).starts_with("\\k") {
+                            return Some("invalid backref number/name".into());
+                        }
+                        // `\g<n>` calls group `n`, `\g<-n>` the `n`th before it, `\g<+n>` the
+                        // `n`th after it; `\g<0>` is the whole pattern, which never ends.
+                        let count: usize = numbered.parse().unwrap_or(usize::MAX);
+                        let total = group_facts_of(&pattern.chars().collect::<Vec<_>>()).total;
+                        let before = group_facts_of(&chars_before(start)).total;
+                        // Oniguruma resolves a call after reading the whole pattern, so an error
+                        // later in it comes first.
+                        let late = match name.as_bytes()[0] {
+                            _ if count == 0 => "never ending recursion".into(),
+                            b'-' if count > before => "never ending recursion".into(),
+                            b'+' if count > total - before => {
+                                format!("undefined group <{name}> reference")
+                            }
+                            b'0'..=b'9' if count > total => {
+                                format!("undefined group <{name}> reference")
+                            }
+                            _ => return retry(rewritten()),
+                        };
+                        return retry(rewritten()).filter(|m| !is_late(m)).or(Some(late));
                     }
                     // `\k<x-1>` names group `x` at a recursion level.
-                    let name = match name.rfind(['+', '-']) {
+                    let base = match name.rfind(['+', '-']) {
                         Some(sign)
                             if sign > 0
                                 && name[sign + 1..].bytes().all(|b| b.is_ascii_digit())
@@ -33323,13 +33438,39 @@ fn oniguruma_refusal(pattern: &str) -> Option<String> {
                         }
                         _ => name,
                     };
-                    if name.starts_with(|c: char| c.is_ascii_digit()) {
-                        return Some(format!("invalid group name <{name}>"));
+                    if base.starts_with(|c: char| c.is_ascii_digit()) {
+                        return Some(format!("invalid group name <{base}>"));
                     }
-                    let defined = pattern.contains(&format!("(?<{name}>"))
-                        || pattern.contains(&format!("(?'{name}'"))
-                        || pattern.contains(&format!("(?P<{name}>"));
-                    (!defined).then(|| format!("undefined name <{name}> reference"))
+                    let names = group_facts_of(&pattern.chars().collect::<Vec<_>>()).names;
+                    let undefined = format!("undefined name <{base}> reference");
+                    match (
+                        names.iter().any(|known| known == base),
+                        at(start).starts_with("\\g"),
+                    ) {
+                        (true, _) => retry(rewritten()),
+                        // A call is resolved after the whole pattern is read (see above); a
+                        // back-reference to a name no group has before it is refused at once.
+                        (false, true) => retry(rewritten())
+                            .filter(|m| !is_late(m) && !m.starts_with("undefined name"))
+                            .or(Some(undefined)),
+                        (false, false) => Some(undefined),
+                    }
+                }
+                // Oniguruma lets several groups carry one name; the crate does not, so a later one is
+                // renamed to look on.
+                ErrorKind::GroupNameDuplicate { .. } => {
+                    let end = error.span().end.offset;
+                    retry(format!("{}_{start}{}", &pattern[..end], at(end)))
+                }
+                // `(?'name'...)`, which the crate does not read: the name runs to a `'`, or to the
+                // end of the pattern; a whole one is read as `(?<name>...)` for a later error.
+                ErrorKind::FlagUnrecognized
+                    if at(start).starts_with('\'') && pattern.get(..start)?.ends_with("(?") =>
+                {
+                    match at(start + 1).split_once('\'') {
+                        Some((name, rest)) => retry(format!("{}<{name}>{rest}", &pattern[..start])),
+                        None => Some(format!("invalid group name <{}>", at(start + 1))),
+                    }
                 }
                 // A look-around or an atomic group the crate cannot read, left open.
                 ErrorKind::UnsupportedLookAround | ErrorKind::FlagUnrecognized => {
