@@ -12443,14 +12443,14 @@ fn test_yaml_explicit_key_forms_next_to_a_sequence_still_parse_1104() -> Result<
 #[test]
 fn test_yaml_bare_explicit_key_with_same_indent_sequence_still_parses_1104() -> Result<()> {
     // YAML test suite 6PBE. The sequence is the bare `?`'s own content, so
-    // the rejection above must not reach it. Neither tool is spec-correct on
-    // the value (yq drops the key's content, answering `{"":["c","d"]}`;
-    // succinctly merges both sequences into the value). The exact output is
-    // pinned so that narrowing or widening the exemption is noticed.
+    // the rejection above must not reach it. The key is that sequence and the
+    // value is `[c, d]`: yq answers `{"":["c","d"]}`, which succinctly now does
+    // too (#6370; it used to merge both sequences into the value). The exact
+    // output is pinned so that narrowing or widening the exemption is noticed.
     let (output, exit_code) =
         run_yq_stdin(".", "---\n?\n- a\n- b\n:\n- c\n- d\n", &["-o=json", "-I=0"])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), r#"{"":["a","b","c","d"]}"#);
+    assert_eq!(output.trim(), r#"{"":["c","d"]}"#);
     Ok(())
 }
 
