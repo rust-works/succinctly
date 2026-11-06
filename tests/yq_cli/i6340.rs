@@ -77,13 +77,36 @@ fn test_a_key_sequence_whose_first_item_is_an_explicit_key_6340() -> Result<()> 
 #[test]
 fn test_a_property_before_an_explicit_key_after_a_colon_is_refused_as_yq_refuses_it_6340(
 ) -> Result<()> {
+    // yq: `mapping key is not allowed in this context` / `mapping keys are not allowed ...`.
     for doc in [
         "? a\n: &t ? x\n  : y\n",
         "? a\n: !!map ? x\n",
-        "? a\n: ? x\n: b\n",
+        "? !!str ? a\n  : b\n: c\n",
     ] {
-        let (stdout, _stderr, code) = run_yq_stdin_with_stderr(".", doc, ARGS)?;
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, ARGS)?;
         assert_ne!(code, 0, "{doc:?} should be refused, got {stdout:?}");
+        assert!(
+            stderr.contains("mapping key is not allowed in this context"),
+            "{doc:?}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_a_tab_straight_after_a_nested_explicit_keys_indicator_is_refused_6340() -> Result<()> {
+    // go-yaml skips no tab where a simple key is allowed: `found character that cannot start any token`.
+    for doc in [
+        "? a\n: ?\tx\n  : y\n",
+        "? ?\tx\n  : y\n: v\n",
+        "? - ?\tx\n    : y\n: v\n",
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, ARGS)?;
+        assert_ne!(code, 0, "{doc:?} should be refused, got {stdout:?}");
+        assert!(
+            stderr.contains("cannot start any token"),
+            "{doc:?}: {stderr:?}"
+        );
     }
     Ok(())
 }
