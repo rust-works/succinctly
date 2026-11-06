@@ -10217,6 +10217,11 @@ fn flow_item_of<W: AsRef<[u64]>>(
                 shape.value(),
                 YamlValue::Sequence(_) | YamlValue::Mapping(_)
             ),
+        mapping: !shape.is_alias()
+            && match shape.value() {
+                YamlValue::Mapping(mut fields) => fields.next().is_some(),
+                _ => false,
+            },
     }
 }
 

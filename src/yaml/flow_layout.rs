@@ -15,6 +15,9 @@ pub struct FlowItem {
     /// Whether the element is itself a collection (empty or not), which takes its
     /// comment differently from a scalar. An alias to one is not: it is written `*x`.
     pub container: bool,
+    /// Whether the element is a mapping that is not empty (and not an alias), which takes the
+    /// comma before a foot inside its `}` when it is a sequence's last element.
+    pub mapping: bool,
     /// Comments written on lines of their own above the element, `#` and all (#6334).
     pub head: Vec<String>,
     /// Comments written on lines of their own below the last element, before the closing
@@ -84,6 +87,7 @@ pub fn render_flow(
     let mut pending = Pending::Nothing;
     let mut foot: Vec<String> = Vec::new();
     let mut last_is_container = false;
+    let mut last_is_mapping = false;
     for (i, item) in items.into_iter().enumerate() {
         let headed = !item.head.is_empty();
         match pending {
@@ -126,6 +130,7 @@ pub fn render_flow(
         }
         foot = item.foot;
         last_is_container = item.container;
+        last_is_mapping = item.mapping;
     }
     if !foot.is_empty() {
         // go-yaml writes a trailing comma before the foot: after a mapping's entry and a
@@ -133,7 +138,7 @@ pub fn render_flow(
         // inside the `}` of a sequence's non-empty mapping.
         match pending {
             Pending::Nothing if open == '[' && last_is_container => {
-                if out.ends_with('}') && !out.ends_with("{}") && !out.ends_with("\n}") {
+                if last_is_mapping && !out.ends_with("\n}") {
                     out.pop();
                     out.push_str(",}");
                 }

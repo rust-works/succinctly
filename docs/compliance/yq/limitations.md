@@ -6893,6 +6893,7 @@ documents x 8 filters. Still different:
   yq writes an empty line before the first comment of a collection nested in a sequence after a sibling mapping that ends with a foot comment (`{k: v` / `# c` / `}, [` / `# d`), and before the foot of a collection that ends a block sequence under `-P`; some of these this build does not write.
   Under `-P` the foot of a last element that is itself a collection is written below the sequence when the sequence has an element after it in an outer sequence, where this build writes it right below the element.
   A comment on the line of a comma that starts its own line, after own-line comments (`x` / `# c3` / `, # c4` / `~`), is the next scalar's line comment in yq (`~, # c4`) and is dropped here.
+  A comment on a line of its own between a flow mapping key's colon and its value is held like any other (the next entry's head, or the value's first element's), and one on the colon's line is dropped, as in yq for a collection value; for a scalar value yq keeps it as the value's line comment.
   A comment after a single pair written in a flow sequence (`[a: 1, # c`), after an empty value (`{a: , # c`) or on a key is dropped, and so is a second comment on the line of a comma (`[a # c1` / `, # c2`) when the first stands on a line of its own.
   With `-I4`, the closing bracket of a commented collection nested in a `- [` item is at column 0 where yq puts it at the item's column.
 - **An empty `{}`/`[]` value that follows a held comment**: yq writes `b: # ec` and the `{}` on the next line;

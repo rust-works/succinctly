@@ -6412,8 +6412,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
         let held = core::mem::take(&mut self.flow_own_comments);
         let head = &mut self.comments.entry(bp).or_default().head;
+        // Ranges ascend, so one at or before the last recorded was recorded already.
         for range in held {
-            if !head.contains(&range) {
+            if head.last().map_or(true, |last| last.1 <= range.0) {
                 head.push(range);
             }
         }
@@ -6430,7 +6431,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
         let foot = &mut self.comments.entry(bp).or_default().foot;
         for range in held {
-            if !foot.contains(&range) {
+            if foot.last().map_or(true, |last| last.1 <= range.0) {
                 foot.push(range);
             }
         }
@@ -6960,9 +6961,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.write_ty(true); // 1 = sequence
 
         // Skip `[`; a comment on a line of its own after it heads the first element (#6334), one
-        // on its line is dropped.
+        // on its line is dropped. JSON holds none.
         self.advance();
-        self.skip_flow_whitespace_noting_line_comment(None, CommaLine::Own);
+        if self.json_strict {
+            self.skip_flow_whitespace();
+        } else {
+            self.skip_flow_whitespace_noting_line_comment(None, CommaLine::Own);
+        }
 
         // Parse items
         let mut first = true;
@@ -6999,9 +7004,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
                 let comma_pos = self.pos;
                 let on_comma_line = self.comma_line(prev_element, element_end, comma_pos);
-                // yq reads a comment on a line of its own before a trailing comma as nothing at all,
-                // and with it those after the comma (#6334).
-                let held_before_comma = self.flow_own_comments.len();
                 self.advance(); // Skip `,`
                 self.skip_flow_whitespace_noting_line_comment(prev_element, on_comma_line);
 
@@ -7023,7 +7025,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                             self.err_unexpected_char(comma_pos, "trailing ',' in JSON array")
                         );
                     }
-                    if held_before_comma > 0 {
+                    // yq reads comments on lines of their own before a trailing comma as nothing at
+                    // all, and with them those after the comma (#6334).
+                    if on_comma_line == CommaLine::Drop {
                         self.flow_own_comments.clear();
                     }
                     break;
@@ -7044,10 +7048,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // they're hoisted into locals and reused below rather than
             // re-run by the json_strict check and the dispatch separately.
             let element_bp = self.bp_pos;
-            self.take_flow_head(element_bp);
-            last_element = Some(element_bp);
             let is_explicit_key = self.looks_like_explicit_flow_key();
             let is_mapping_entry = is_explicit_key || self.looks_like_flow_mapping_entry();
+            // A single pair is a mapping of its own, whose key owns the comments (#6334).
+            let marked_bp = element_bp + usize::from(is_mapping_entry);
+            self.take_flow_head(marked_bp);
+            last_element = Some(marked_bp);
             if self.json_strict && is_mapping_entry {
                 // #2778: a JSON array element is a value, never a `key:
                 // value` pair -- real yq's front end has no concept of an
@@ -7357,7 +7363,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     );
                 }
                 let on_comma_line = self.comma_line(prev_value, entry_end, self.pos);
-                let held_before_comma = self.flow_own_comments.len();
                 self.advance(); // Skip `,`
                 self.skip_flow_whitespace_noting_line_comment(prev_value, on_comma_line);
 
@@ -7368,7 +7373,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
                 // Allow trailing comma
                 if self.peek() == Some(b'}') {
-                    if held_before_comma > 0 {
+                    if on_comma_line == CommaLine::Drop {
                         self.flow_own_comments.clear();
                     }
                     break;
@@ -7441,7 +7446,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     );
                 }
                 self.advance(); // Skip `:`
-                self.skip_flow_whitespace();
+                                // Comments on lines of their own between the colon and the value are held like any
+                                // other: yq gives them to the next entry (or the value's first element), and drops
+                                // one on the colon's line (#6334).
+                self.skip_flow_whitespace_noting_line_comment(None, CommaLine::Own);
                 self.reject_explicit_key_after_implicit_key()?;
 
                 // A value that is absent (`{a: , b: 1}`) has no node for a comment to follow.

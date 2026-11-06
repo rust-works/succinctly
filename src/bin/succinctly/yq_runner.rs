@@ -9695,6 +9695,8 @@ fn flow_item(text: String, value: &OwnedValue, comments: &CommentTree) -> FlowIt
         text,
         comment: comments.own().map(str::to_string),
         container,
+        mapping: comments.alias_name().is_none()
+            && matches!(value, OwnedValue::Object(o) if !o.is_empty()),
         // #6334: a mapping entry's are its key's, which the tree keeps on the value's node.
         head: comments.meta().head_comment().to_vec(),
         foot: comments.meta().foot_comment().to_vec(),
