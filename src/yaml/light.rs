@@ -6433,7 +6433,8 @@ impl<'a> YamlString<'a> {
     }
 
     /// Detect content indentation from first non-empty line.
-    /// Returns None if no content lines found, Some(indent) otherwise.
+    /// Returns None if no content lines found, Some((first content line's indent, the widest blank
+    /// line before it)) otherwise: go-yaml's indent is the larger of the two (#6381).
     /// Note: indent can be 0 for content at column 0.
     fn detect_block_indent(text: &[u8], start: usize) -> Option<(usize, usize)> {
         let mut pos = start;
@@ -13783,6 +13784,55 @@ mod tests {
             (b"fold: >+\n  a\r", "a\n"),
             (b"fold: >\r\n  a\r\n\r\n  b", "a\nb"),
         ]);
+    }
+
+    /// #6393: a line of spaces wider than the indent has the extra spaces as its text, so it is a
+    /// content line (a more-indented one under `>`), at the end of the scalar and in front of the
+    /// first content line; a line no wider than the indent is blank. Expected values are
+    /// mikefarah/yq v4.53.3.
+    #[test]
+    fn test_block_folded_wide_whitespace_line_is_content_6393() {
+        assert_folded(&[
+            (b"fold: >\n  a\n    \nb: 1\n", "a\n  \n"),
+            (b"fold: >\n  a\n   \nb: 1\n", "a\n \n"),
+            (b"fold: >\n  a\n  \nb: 1\n", "a\n"),
+            (b"fold: >-\n  a\n    \nb: 1\n", "a\n  "),
+            (b"fold: >+\n  a\n    \n\nb: 1\n", "a\n  \n\n"),
+            (b"fold: >\n  a\n    \n  b\n", "a\n  \nb\n"),
+            (b"fold: >\n  a\n\n    \n  b\n", "a\n\n  \nb\n"),
+            (b"fold: >2\n    \nb: 1\n", "  \n"),
+            (b"fold: >2\n   \n  x\nb: 1\n", " \nx\n"),
+        ]);
+    }
+
+    /// #6393, literal side: the same line is kept as written, and `|+` already did.
+    #[test]
+    fn test_block_literal_wide_whitespace_line_is_content_6393() {
+        for (yaml, expected) in [
+            (&b"lit: |\n  a\n    \nb: 1\n"[..], "a\n  \n"),
+            (b"lit: |\n  a\n   \nb: 1\n", "a\n \n"),
+            (b"lit: |\n  a\n  \nb: 1\n", "a\n"),
+            (b"lit: |-\n  a\n    \nb: 1\n", "a\n  "),
+            (b"lit: |+\n  a\n    \n\nb: 1\n", "a\n  \n\n"),
+            (b"lit: |\n  a\n    \n    \nb: 1\n", "a\n  \n  \n"),
+            (b"lit: |3\n    \nb: 1\n", " \n"),
+            (b"lit: |\n     \n  # c\nb: 1\n", ""),
+        ] {
+            let index = YamlIndex::build(yaml).unwrap();
+            let root = index.root(yaml);
+            let YamlValue::Mapping(fields) = first_doc(root) else {
+                panic!("expected mapping for {:?}", String::from_utf8_lossy(yaml));
+            };
+            let Some(YamlValue::String(s)) = fields.find("lit") else {
+                panic!("expected string for {:?}", String::from_utf8_lossy(yaml));
+            };
+            assert_eq!(
+                &*s.as_str().unwrap(),
+                expected,
+                "{:?}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
     }
 
     /// Issue #344, folded side: with no content lines at all, keep chomping has
