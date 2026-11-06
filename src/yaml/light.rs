@@ -8007,11 +8007,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
             || (self.is_first_document_content() && {
                 let header_end = self.header_end();
                 header_end > 0
-                    && (self.text[..header_end]
-                        .split(|&b| is_line_break(b))
-                        .any(is_blank_line)
-                        || (!self.index.synthesized_empty()
-                            && header_keeps_empty_lines(&self.text[..header_end])))
+                    && header_is_rebuilt_from_text(
+                        &self.text[..header_end],
+                        self.index.synthesized_empty(),
+                    )
             })
     }
 
@@ -9822,28 +9821,43 @@ fn is_blank_line(line: &[u8]) -> bool {
 /// starts with one, or holds a run of two (#5008). yq prints the header verbatim, so the lines stay where they were;
 /// the index records one blank line at most between two comments, and none before the first.
 fn header_keeps_empty_lines(header: &[u8]) -> bool {
-    if header.is_empty()
-        || header
-            .split(|&b| is_line_break(b))
-            .any(|l| l.starts_with(b"---") || l.starts_with(b"%"))
-    {
-        return false;
-    }
-    let mut empty_run = 0;
-    let mut first = true;
-    for line in header.split(|&b| is_line_break(b)) {
-        // The last piece after a final break is not a line.
-        if line.is_empty() {
-            empty_run += 1;
-            if first || empty_run >= 2 {
-                return true;
-            }
-        } else {
-            empty_run = 0;
+    let mut pos = 0;
+    let mut run = 0;
+    let mut empty = false;
+    while pos < header.len() {
+        let rest = &header[pos..];
+        let line_end = rest
+            .iter()
+            .position(|&b| is_line_break(b))
+            .unwrap_or(rest.len());
+        let line = &rest[..line_end];
+        if line.starts_with(b"---") || line.starts_with(b"%") {
+            return false;
         }
-        first = false;
+        if line.is_empty() {
+            run += 1;
+            empty |= pos == 0 || run >= 2;
+        } else {
+            run = 0;
+        }
+        pos += line_end
+            + if line_end < rest.len() {
+                line_break_len(rest, line_end)
+            } else {
+                0
+            };
     }
-    false
+    empty
+}
+
+/// Whether the DOM route builds a first document's head from the header's text instead of the comment index
+/// ([`header_head_lines`]): a line of only blanks (#6401), a CRLF break (#5053), or blank lines the index cannot
+/// place (#5008) unless the document is the one the CLI makes up for an empty input, whose line break is not the
+/// input's. One definition for the head and for the gate that decides a document has a head at all.
+fn header_is_rebuilt_from_text(header: &[u8], synthesized: bool) -> bool {
+    header.split(|&b| is_line_break(b)).any(is_blank_line)
+        || header.windows(2).any(|pair| pair == b"\r\n")
+        || (!synthesized && header_keeps_empty_lines(header))
 }
 
 /// The comment lines of a first-document header (`header`: [`yq_header_len`]'s bytes) as yq prints them when a line
@@ -9854,13 +9868,7 @@ fn header_keeps_empty_lines(header: &[u8]) -> bool {
 /// unless `synthesized`: the empty document the CLI makes up has a line break that is not the input's. The `---` and
 /// `%` lines are the header's own, not comment lines.
 fn header_head_lines(header: &[u8], synthesized: bool) -> Option<Vec<String>> {
-    // #6401: a line of only blanks is a comment (`# ` plus the line) in an LF header as well, and the comment index
-    // does not hold it.
-    let has_blank_line = header.split(|&b| is_line_break(b)).any(is_blank_line);
-    if !has_blank_line
-        && !header.windows(2).any(|pair| pair == b"\r\n")
-        && (synthesized || !header_keeps_empty_lines(header))
-    {
+    if !header_is_rebuilt_from_text(header, synthesized) {
         return None;
     }
     let mut out = Vec::new();
@@ -18813,8 +18821,14 @@ plain: hello
             assert!(header_keeps_empty_lines(b"\na: 1\n"));
             assert!(header_keeps_empty_lines(b"\n\n# c\n"));
             assert!(header_keeps_empty_lines(b"# h\n\n\n# g\n"));
-            // One blank between comments, or none: the index places them.
+            // One blank between comments, or none: the index places them. A final break is not a line, and a
+            // `\r\n` is one break.
             assert!(!header_keeps_empty_lines(b"# c\n\n# d\n"));
+            assert!(!header_keeps_empty_lines(b"# c\n\n"));
+            assert!(!header_keeps_empty_lines(b"# c\r\n"));
+            assert!(!header_keeps_empty_lines(b"# c\r\n# d\r\n"));
+            assert!(header_keeps_empty_lines(b"\r\n# c\r\n"));
+            assert!(header_keeps_empty_lines(b"# c\r\n\r\n\r\n# d\r\n"));
             assert!(!header_keeps_empty_lines(b"# c\n"));
             assert!(!header_keeps_empty_lines(b""));
             // A marker or directive line makes it the preamble's.
