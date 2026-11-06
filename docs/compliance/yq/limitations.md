@@ -815,6 +815,17 @@ One shape still differs.
 A directive after the marker (`a` / `...` / `%YAML 1.2` / `---` / `b`) is rejected by yq and read as two documents here, because YAML 1.2 allows it (spec examples 6.18, 6.21 and 9.6 are written that way).
 A stream whose first document is `--- text` followed by `...` and more content reads as one scalar in yq (`--- v` / `...` / `b` is `"v... b"`, the marker folded into the text), and since #6276 here too: yq's header slurp glues the line after the marker line onto it, so the `...` is no longer at the start of a line.
 
+### A `%`, `@` or backtick that starts a node, and a directive line inside a document ([#6402](https://github.com/rust-works/succinctly/issues/6402))
+
+go-yaml's scanner starts no plain scalar, key or value, block or flow, on `%`, `@` or a backtick (`found character that cannot start any token`), and it reads a `%` at column 0 as a directive before that, wherever the line stands.
+So a line after a document has started that opens with one is an error in yq: `a: 1` / `%TAG ! x:`, `!!str` / `%YAML 1.2`, `a: %x`, `- @x`, `[a,` / `%x` / `]`.
+`succinctly yq` refuses them as well, and reads them as content only where yq does: a `%` that continues a plain scalar, or stands in a quoted or block scalar (`---` / `x` / `%YAML 1.2` is `"x %YAML 1.2"`), and one inside a word (`a: x%y`).
+yq prints the documents before the failing one and then the error, as for any later parse error (see above), so the stdout prefix differs.
+Over four draws of 1,500 to 2,000 (7,500 in all) generated streams of two to five lines (`%YAML`, `%TAG`, `%x`, `@x` and a backtick at column 0 and after a key, an item and a flow comma, properties, markers, quoted and block scalars), 760 that differed from yq in whether they are refused now agree and none changed the other way.
+Two heads stay different.
+An indented `%YAML` before any content (` %YAML 1.2`) is yq's header, which its slurp sets aside (a null document), and is an error here.
+A directive after a `...` marker is the shape of the #5089 section above.
+
 ## Open divergences (bugs, not decisions)
 
 Representative cases, each live-verified. These are gaps to close, listed here so they are
