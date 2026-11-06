@@ -167,8 +167,6 @@ fn test_constructs_read_differently_stay_refused_5502() -> Result<()> {
         r#""abab" | test("(?<n>ab)\\g<n>")"#,
         // `(?~b)` is read since #6252 (`tests/jq_cli/i6252.rs`); a range cutter is not.
         r#""abc" | test("(?~|b)")"#,
-        // jq errors on this one; `fancy-regex` would answer it.
-        r#""aaa" | test("a{3,2}")"#,
     ] {
         let (stdout, stderr, code) = run(filter)?;
         assert_eq!((stdout.as_str(), code), ("", 5), "{filter}");
@@ -177,6 +175,13 @@ fn test_constructs_read_differently_stay_refused_5502() -> Result<()> {
             "{filter}: {stderr}"
         );
     }
+    // jq errors on this one, in Oniguruma's words (#6423); `fancy-regex` would answer it.
+    let (stdout, stderr, code) = run(r#""aaa" | test("a{3,2}")"#)?;
+    assert_eq!((stdout.as_str(), code), ("", 5));
+    assert!(
+        stderr.contains("Regex failure: upper is smaller than lower in repeat range"),
+        "{stderr}"
+    );
     Ok(())
 }
 

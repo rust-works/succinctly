@@ -7403,7 +7403,7 @@ A word boundary built from jq's class would need a look-around on every pattern 
 A range that starts or ends at a `\w` (`[\w-.]`, `[+-\w]`) was accepted here and an error in jq until #6184.
 One exotic shape still differs: a negated bracket under the `i` flag (`test("[[:^upper:]]";"i")`) is case-folded before the negation here and is not in jq.
 A range from a POSIX bracket (`[[:alpha:]-z]`) and a doubled hyphen (`[a--b]`) were accepted here and an error in jq until #6184.
-An unknown bracket name (`[[:foo:]]`, `[[:ALPHA:]]`) is an error in both, with this crate's wording.
+An unknown bracket name (`[[:foo:]]`, `[[:ALPHA:]]`) is `invalid POSIX bracket type` in both (#6423).
 In jq mode a `[`, `&` or `~` inside a class is the literal character, as in Oniguruma's Perl syntax, where the `regex` crate would read a nested class, an intersection and a symmetric difference.
 Only the first `^` after a class's `[` negates it (#6193): `[^^]` is a negated class holding `^`, and a `]` after the second `^` closes it, so an unterminated class after it (`[^^]z[]`) is an error as in jq.
 A dash is read as Oniguruma reads it (#6184), where the `regex` crate takes `--` for set difference and a `]` that opens a class for a literal that no range can start.

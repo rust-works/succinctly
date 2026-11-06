@@ -33211,10 +33211,9 @@ fn refuse_oversized_repeat(pattern: &str) -> Option<EvalError> {
         match ast {
             Ast::Repetition(rep) => {
                 let too_big = match &rep.op.kind {
-                    RepetitionKind::Range(RepetitionRange::Exactly(n))
-                    | RepetitionKind::Range(RepetitionRange::AtLeast(n)) => {
-                        *n > ONIG_MAX_REPEAT_NUM
-                    }
+                    RepetitionKind::Range(
+                        RepetitionRange::Exactly(n) | RepetitionRange::AtLeast(n),
+                    ) => *n > ONIG_MAX_REPEAT_NUM,
                     RepetitionKind::Range(RepetitionRange::Bounded(m, n)) => {
                         let low_omitted = pattern
                             .get(rep.op.span.start.offset..)

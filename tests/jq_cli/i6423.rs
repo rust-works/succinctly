@@ -31,6 +31,8 @@ const REFUSED: &[(&str, &str)] = &[
     ("[b-a]", "empty range in char class"),
     (r"\1", "invalid backref number/name"),
     ("(?<1a>b)", "invalid group name <1a>"),
+    ("[[:foo:]]", "invalid POSIX bracket type"),
+    ("[[:ALPHA:]]", "invalid POSIX bracket type"),
     // The crate's parse error, in Oniguruma's words.
     ("(", "end pattern with unmatched parenthesis"),
     ("(a", "end pattern with unmatched parenthesis"),
