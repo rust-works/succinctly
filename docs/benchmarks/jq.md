@@ -51,7 +51,9 @@ cargo build --release --features bench-runner
 ./target/release/succinctly dev bench jq --patterns users --queries users_mix --runs 5
 ```
 
-Those two runners time all of jq's runs and then all of succinctly's, and use whichever `jq` is on `PATH`. The *Harness comparison* blocks come from `succinctly dev compare jq` instead ([comparison/jq/README.md](../../comparison/jq/README.md)). It builds jq 1.7.1 and 1.8.1 from source, interleaves the tools within each repetition, and times a row only when the outputs are identical. `--write-docs` regenerates a platform's block with its report, and `--render-docs` re-renders every block from the committed runs without measuring anything:
+Both runners interleave the two tools within each repetition, alternating which runs first, and take the median of the runs (#5409). Before #5409 they timed all of jq's runs and then all of succinctly's, which is how every hand-written section below was measured.
+They compare against the `jq` on `PATH`; `dev bench jq --jq target/compare/jq-1.7.1/bin/jq` uses the pinned build instead (`bench run jq_bench` always takes `PATH`'s), and the generated markdown names the jq and the method under its title.
+The *Harness comparison* blocks come from `succinctly dev compare jq` instead ([comparison/jq/README.md](../../comparison/jq/README.md)). It builds jq 1.7.1 and 1.8.1 from source, interleaves the tools within each repetition, and times a row only when the outputs are identical. `--write-docs` regenerates a platform's block with its report, and `--render-docs` re-renders every block from the committed runs without measuring anything:
 
 ```bash
 cargo build --release --features cli,simd,regex,serde,bench-runner
@@ -176,7 +178,7 @@ Geomean speedup over jq-1.7.1: **1.63x** across 85 timed rows; jq-1.7.1 is faste
 | `corpus_openapi_paths`       | corpus-openapi    |           2.1 |                2.0 |   **1.07x** |        3.47x |
 <!-- /compare:jq-linux-x86_64 -->
 
-The sections below are `bench run jq_bench` and `dev bench jq` results, measured by the method this section's header describes: all jq runs, then all succinctly runs, against the `jq` on `PATH`. That is not the interleaved method of [benchmarking.md](../guides/benchmarking.md#ab-benchmarking-method), so where a figure below disagrees with the block above, the block is the measurement.
+The sections below are `bench run jq_bench` and `dev bench jq` results, measured before #5409 made those runners interleave: all jq runs, then all succinctly runs, against the `jq` on `PATH`. That is not the interleaved method of [benchmarking.md](../guides/benchmarking.md#ab-benchmarking-method), so where a figure below disagrees with the block above, the block is the measurement.
 
 ## Query mix (users pattern)
 
@@ -827,7 +829,7 @@ Geomean speedup over jq-1.7.1: **1.85x** across 85 timed rows; jq-1.7.1 is faste
 | `corpus_openapi_paths`       | corpus-openapi    |           2.8 |                2.6 |   **1.06x** |        1.91x |
 <!-- /compare:jq-macos-aarch64 -->
 
-The sections below are `bench run jq_bench` and `dev bench jq` results, measured by the method this section's header describes: all jq runs, then all succinctly runs, against the `jq` on `PATH`. That is not the interleaved method of [benchmarking.md](../guides/benchmarking.md#ab-benchmarking-method), so where a figure below disagrees with the block above, the block is the measurement.
+The sections below are `bench run jq_bench` and `dev bench jq` results, measured before #5409 made those runners interleave: all jq runs, then all succinctly runs, against the `jq` on `PATH`. That is not the interleaved method of [benchmarking.md](../guides/benchmarking.md#ab-benchmarking-method), so where a figure below disagrees with the block above, the block is the measurement.
 
 ## Query mix (users pattern)
 
