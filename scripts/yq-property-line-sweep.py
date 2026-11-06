@@ -8,16 +8,6 @@ Each stream is two to five lines drawn from a pool and is run through yq v4.53.3
 binaries, run as `yq`). A stream agrees when both refuse it, or neither does and the JSON matches. It prints how many
 SUBJECT fixed, broke and left, and lists the streams it broke. Same harness as `yq-directive-in-document-sweep.py`.
 """
-#!/usr/bin/env python3
-"""Differential sweep for #6402: random streams of lines with `%`, `@` and a backtick starting a node.
-
-    scripts/yq-directive-in-document-sweep.py SEED COUNT BASELINE SUBJECT
-
-Each stream is two to five lines drawn from a pool (`%YAML`, `%TAG`, `%x`, `@x` and a backtick at column 0, after a key,
-an item and a flow comma, properties, markers, quoted and block scalars) and is run through yq v4.53.3, BASELINE and
-SUBJECT (`succinctly` binaries, run as `yq`). A stream agrees when both refuse it, or neither does and the JSON matches.
-It prints how many SUBJECT fixed, broke and left, and lists the streams it broke.
-"""
 import subprocess, random, sys, json
 ver=subprocess.run(["yq","--version"],capture_output=True,text=True).stdout
 assert "v4.53.3" in ver, "the oracle is yq v4.53.3, not "+ver.strip()

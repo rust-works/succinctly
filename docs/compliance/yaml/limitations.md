@@ -128,7 +128,7 @@ rather than discarding it — the same principle as the tag handling below.
 
 `- ` followed by content is one such case in block context, below.
 In a flow collection it is the sequence-entry indicator too, and no block sequence can begin there, so `[- x]` is invalid: `yq` rejects it (`block sequence entries are not allowed in this context`) and so does the validator.
-Since [#6413](https://github.com/rust-works/succinctly/issues/6413) `succinctly yq` refuses it as well (`[- x]`, `[a, - x]`, `{a: - x}`); until then it read the plain scalar `"- x"`, which is what [#332](https://github.com/rust-works/succinctly/issues/332) chose over silently discarding the content (`[null]`).
+Since [#6413](https://github.com/rust-works/succinctly/issues/6413) `succinctly yq` refuses it as well (`[- x]`, `[a, - x]`, `{a: - x}`; this check is made in yq mode only); until then `succinctly yq` read the plain scalar `"- x"`, which is what [#332](https://github.com/rust-works/succinctly/issues/332) chose over silently discarding the content (`[null]`).
 A `-` *not* followed by whitespace is an ordinary flow plain scalar and always was: `[-]` is `["-"]`, `[-1]` is `[-1]`.
 
 The **block** spelling `key: - a` is equally invalid, but it does have a valid reading to

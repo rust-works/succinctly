@@ -16513,7 +16513,8 @@ fn test_empty_block_sequence_items_remain_null() -> Result<()> {
 
 #[test]
 fn test_flow_dash_space_scalar_round_trips_through_yaml_output() -> Result<()> {
-    // Default `-o yaml` must quote the scalar regardless of container style:
+    // A quoted scalar `"- x"` (the plain one is refused, #6413): default `-o yaml` must quote it
+    // regardless of container style:
     // emitted bare under a `- ` marker it would read back as a nested
     // sequence. Since #707 fixed flow-style preservation, this flow-style
     // source now correctly stays flow on output (previously forced to
