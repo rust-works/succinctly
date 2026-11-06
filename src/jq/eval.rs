@@ -33399,13 +33399,19 @@ fn group_copies_engine(
     pattern: &str,
     base: Option<&super::onig_capture_loop::LoopRewrite>,
 ) -> Option<RegexEngine> {
-    let copied = super::onig_loop::rewrite_with_groups(
-        base.map_or(pattern, |groups| groups.pattern.as_str()),
-    )?;
+    let source = base.map_or(pattern, |groups| groups.pattern.as_str());
+    let copied = super::onig_loop::rewrite_with_groups(source)?;
     // #6358: guarded like the pattern as written (#6134): a loop nested in a repeat is written as
     // alternations whose branches share a prefix that matches more than one way, which the crate
     // would factor and so change which branch wins. The guard adds no group.
-    let re = std_regex(&copied.pattern).ok()?;
+    let (copied, re) = match std_regex(&copied.pattern) {
+        Ok(re) => (copied, re),
+        Err(_) => {
+            let copied = super::onig_loop::rewrite_with_groups_past_the_size_limit(source)?;
+            let re = std_regex(&copied.pattern).ok()?;
+            (copied, re)
+        }
+    };
     (re.captures_len() == copied.compiled_groups).then_some(())?;
     let groups = compose_group_copies(base, copied)?;
     Some(RegexEngine::Rewritten { re, groups })

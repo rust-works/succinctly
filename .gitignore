@@ -76,3 +76,4 @@ fuzz/target/
 
 # `succinctly dev compare jq` run output (#5409)
 /data/compare/
+__pycache__/

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Differential sweep for #6310 and #6332: a capture group inside a loop's body.
 
-    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert | --fancy] [--newlines] [--blanks] [--flags g] [--jq /usr/bin/jq]
+    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert | --bounded | --fancy] [--newlines] [--blanks] [--flags g] [--jq /usr/bin/jq]
 
 Oniguruma ends a greedy loop at the first iteration that matches nothing (#6106), and that holds when the
 body has a capture group: after its empty way (`(?:b*|(a))+`, #6310), or before it, in it, or with its own
@@ -17,7 +17,8 @@ that keep their text. `--assert` (#6358) draws the loops whose ways hold a zero-
 beside a capture group or a consuming item, under the counted and lazy quantifiers, on subjects with a word boundary
 in the middle; `--newlines` runs it on subjects that hold a newline instead, and lets the ways consume one, which is what says `^` and
 `$` may be written as `\\A` and `\\z`. `--fancy` (#6358) draws the plain loops with a lookaround or an atomic group beside them, outside the repeat, so
-that they run on `fancy-regex`. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
+that they run on `fancy-regex`. `--bounded` (#6428) draws a lazy `{0,n}?` or `{1,n}?` over anchors, flag switches and loops of its own, beside another loop or
+inside a repeat. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
 captures are compared. It prints how many patterns SUBJECT fixed (BASELINE differed from jq, SUBJECT does
 not), broke (the reverse) and still differs on, and exits 1 when it broke one.
 
@@ -140,6 +141,30 @@ def assert_patterns(count, rng):
     return sorted(out)
 
 
+BOUNDED = ["{0,2}?", "{1,2}?", "{0,3}?", "{1,3}?", "{0,4}?", "{1,4}?", "{0,12}?", "{2,3}?", "{2,5}?"]
+
+
+def bounded_patterns(count, rng):
+    """`--bounded`: a lazy `{0,n}?` or `{1,n}?`, over anchors, flag switches and loops, beside a loop or in a repeat."""
+    pool = ATOMS + NESTED + ANCHORS + ["(?i)", r"(\b)", r"(\z)", "(.*?)"]
+
+    def way():
+        return "".join(rng.choice(pool) for _ in range(rng.choice([1, 1, 2, 2])))
+
+    out = set()
+    while len(out) < count:
+        body = "|".join(way() for _ in range(rng.choice([2, 2, 3])))
+        pattern = rng.choice(["(?:%s)", "(?:%s)", "(%s)"]) % body + rng.choice(BOUNDED)
+        pattern += rng.choice(["", "b", "c", "$"])
+        r = rng.random()
+        if r < 0.2:
+            pattern = "(?:(a)|b*|c)+" + pattern
+        elif r < 0.4:
+            pattern = "(?:%s|c)%s" % (pattern, rng.choice(OUTER + ["*?", "+?"]))
+        out.add(pattern)
+    return sorted(out)
+
+
 def fancy_patterns(count, rng):
     """`--fancy`: a plain draw with a construct only `fancy-regex` reads beside each loop."""
     out = set()
@@ -182,6 +207,7 @@ def main():
     shape.add_argument("--nest", action="store_true", help="also nest loops inside repeats")
     shape.add_argument("--ways", action="store_true", help="loops beside other items in the ways of an outer repeat")
     shape.add_argument("--assert", dest="anchors", action="store_true", help="ways that hold a zero-width anchor")
+    shape.add_argument("--bounded", action="store_true", help="a lazy {0,n}? or {1,n}? over anchors, switches and loops")
     shape.add_argument("--fancy", action="store_true", help="a lookaround or atomic group beside the loop")
     ap.add_argument("--newlines", action="store_true", help="with --assert: subjects that hold a newline")
     ap.add_argument("--blanks", action="store_true",
@@ -195,6 +221,8 @@ def main():
         if args.newlines:
             plist = [p.replace("a|b", "a|\\n") if i % 2 else p for i, p in enumerate(plist)]
             prog = program(NEWLINE_SUBJECTS)
+    elif args.bounded:
+        plist, prog = bounded_patterns(args.count, rng), PROGRAM
     elif args.fancy:
         plist, prog = fancy_patterns(args.count, rng), PROGRAM
     else:
