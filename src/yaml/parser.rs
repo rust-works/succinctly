@@ -9901,6 +9901,9 @@ fn split_trailing_properties(line: &[u8]) -> (&[u8], &[u8]) {
         let b = line[i];
         match quote {
             Some(b'"') if b == b'\\' => i += 1,
+            // `''` inside a single-quoted scalar is an escaped quote, not its end (#6392): the
+            // ` # ` after it is still quoted text.
+            Some(b'\'') if b == b'\'' && line.get(i + 1) == Some(&b'\'') => i += 1,
             Some(q) if b == q => {
                 quote = None;
                 outside_from = i + 1;
