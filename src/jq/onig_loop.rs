@@ -2367,7 +2367,9 @@ mod tests {
         }
     }
 
-    /// #6429: a counted repeat over a body that holds a loop with a group is written copy by copy, and the
+    /// #6429, the loop rewrite alone (the evaluator composes it with the capture rewrite of #6069, whose
+    /// groups bring the cliff to an upper bound of 7: `tests/jq_cli/i6429.rs` pins that one end to end): a
+    /// counted repeat over a body that holds a loop with a group is written copy by copy, and the
     /// text doubles with each count of the upper bound (`{3,7}` 11 KB, `{4,8}` 22 KB, `{5,9}` 45 KB before the
     /// capture rewrite of #6069 adds its own groups), because every copy holds the rest of the repeat twice,
     /// once after the loop's exit and once after another iteration. No smaller spelling exists in the `regex`
