@@ -11597,7 +11597,14 @@ fn parse_json_stream_prefix_ending(
                     None => (values, Some(error), None),
                 };
             }
-            Err(error) => return (values, Some(error), None),
+            // #6454: a fault the walk names in jq's own words (the depth limit) leaves jq's
+            // parser where jq's model of it stops, which is not past the bytes jq drops.
+            Err(error) => {
+                let end = jq_fault()
+                    .filter(|(message, _)| *message == error.to_string())
+                    .map(|(_, end)| end);
+                return (values, Some(error), end);
+            }
         }
     }
     // #5497: jq meets its depth limit first when the refused bracket comes before the fault
