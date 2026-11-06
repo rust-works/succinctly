@@ -9789,6 +9789,13 @@ fn blank_line_before(text: &[u8], at: usize) -> bool {
         .all(|b| matches!(b, b' ' | b'\t' | b'\r'))
 }
 
+/// Whether `line` (without its break) is non-empty and holds only blanks: the header line go-yaml reads as the
+/// comment `# ` plus the line (#6401).
+fn is_blank_line(line: impl AsRef<[u8]>) -> bool {
+    let line = line.as_ref();
+    !line.is_empty() && line.iter().all(|&b| b == b' ' || b == b'\t')
+}
+
 /// The comment lines of a first-document header (`header`: [`yq_header_len`]'s bytes) as yq prints them when a line
 /// break in it is `\r\n`, or `None` for a header without one (#5053): every comment line keeps its `\r` where its break
 /// is CRLF, and a blank line with a CRLF break is `# \r` -- the `\r` is comment text to go-yaml -- where one with a
@@ -9817,6 +9824,13 @@ fn crlf_header_head_lines(header: &[u8]) -> Option<Vec<String>> {
                 "# \r".to_string()
             } else {
                 String::new()
+            });
+        } else if is_blank_line(line.as_bytes()) {
+            // #6401: a line of only blanks is a comment, `# ` plus the line.
+            out.push(if crlf {
+                format!("# {line}\r")
+            } else {
+                format!("# {line}")
             });
         } else if !(line.starts_with("---") || line.starts_with('%')) {
             out.push(if crlf {
@@ -10064,20 +10078,15 @@ fn yq_header_len(text: &[u8]) -> (usize, bool) {
         while indent_len < rest.len() && (rest[indent_len] == b' ' || rest[indent_len] == b'\t') {
             indent_len += 1;
         }
+        // An empty line and a whitespace-only one are both header-shaped (#6401). They print
+        // differently, though: [`write_yq_header`] keeps the empty one as it is and writes the
+        // whitespace-only one as the comment `# ` plus the line, as go-yaml does.
         let at_break_or_eof = indent_len == rest.len() || is_line_break(rest[indent_len]);
-        if at_break_or_eof {
-            // A truly empty line (nothing, not even trailing whitespace,
-            // before the break/EOF) is header-shaped; one with only
-            // whitespace on it is not (matches real yq: "a whitespace-only
-            // line ahead of the first comment makes yq print a bare `#   `
-            // line", see this function's own doc comment).
-            if indent_len != 0 {
-                return (pos, false);
-            }
-        } else if !(rest[indent_len] == b'#'
-            || (indent_len == 0
-                && (rest[indent_len..].starts_with(b"%YA")
-                    || rest[indent_len..].starts_with(b"---"))))
+        if !at_break_or_eof
+            && !(rest[indent_len] == b'#'
+                || (indent_len == 0
+                    && (rest[indent_len..].starts_with(b"%YA")
+                        || rest[indent_len..].starts_with(b"---"))))
         {
             return (pos, false);
         }
@@ -10118,6 +10127,9 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
         return Ok(());
     };
     let mut pos = 0;
+    // The last line written had no break after it (#6401): `Some(true)` for a `---` marker, `Some(false)` for
+    // any other line.
+    let mut unterminated: Option<bool> = None;
     while pos < end {
         let rest = &header[pos..];
         let line_end = rest.bytes().position(is_line_break).unwrap_or(rest.len());
@@ -10127,10 +10139,21 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
             0
         };
         let line = &rest[..line_end];
+        // A bare `\r` ends a line that is not a marker the same way end of input does: yq writes a `\n` after it.
+        let marker = line.starts_with("---");
+        unterminated = if marker {
+            (brk == 0).then_some(true)
+        } else {
+            (rest.as_bytes()[..line_end + brk].last() != Some(&b'\n')).then_some(false)
+        };
         if doc_markers || !line.starts_with("---") {
             // #5053: a blank line of a CRLF header is `# \r` in yq's output -- the `\r` is comment text to go-yaml,
             // which reads the line as a comment of its own -- where an LF header keeps the bare blank line.
             if line.is_empty() && brk == 2 && rest.as_bytes()[line_end] == b'\r' {
+                out.write_str("# ")?;
+            }
+            // #6401: a line of only blanks is a comment to go-yaml too, `# ` plus the line.
+            if is_blank_line(line) {
                 out.write_str("# ")?;
             }
             out.write_str(line)?;
@@ -10151,6 +10174,20 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
     }
     if cut_marker && doc_markers {
         out.write_char('\n')?;
+    } else if !cut_marker && end == text.len() {
+        // A header that ends mid-line gets its break from yq (`%YAML 1.2` and `# c` print with one), and a
+        // `---` that ends it also an empty line after (#6401).
+        // The marker's own break is the first of the two, so under `-N` (no marker written) only the empty line is.
+        match unterminated {
+            Some(false) => out.write_char('\n')?,
+            Some(true) => {
+                if doc_markers {
+                    out.write_char('\n')?;
+                }
+                out.write_char('\n')?;
+            }
+            None => {}
+        }
     }
     Ok(())
 }
@@ -18693,6 +18730,25 @@ plain: hello
         }
 
         #[test]
+        fn a_line_of_blanks_is_header_and_prints_as_a_comment_6401() {
+            // The header runs over it: `# ` plus the line is what yq prints, an empty line stays empty.
+            assert_eq!(yq_header_len(b"\t\na: 1\n"), (2, false));
+            assert_eq!(yq_header_len(b"# c\n \n\nb: 2\n"), (7, false));
+            assert_eq!(yq_header_len(b"\n \n  # c\n---\na: 1\n"), (13, false));
+            // An indented content line is still content, a blank-only line before it is not.
+            assert_eq!(yq_header_len(b" \n  a: 1\n"), (2, false));
+            assert_eq!(yq_header_len(b"  a: 1\n"), (0, false));
+            assert!(is_blank_line("  "));
+            assert!(is_blank_line("\t "));
+            assert!(!is_blank_line(""));
+            assert!(!is_blank_line(" #"));
+            assert_eq!(
+                crlf_header_head_lines(b"# c\r\n \r\n\r\n").unwrap(),
+                ["# c\r", "#  \r", "# \r"]
+            );
+        }
+
+        #[test]
         fn yq_header_len_stops_at_the_first_content_line() {
             assert_eq!(yq_header_len(b"a: 1\n"), (0, false));
             assert_eq!(yq_header_len(b"# c\n\na: 1\n"), (5, false));
@@ -18700,7 +18756,7 @@ plain: hello
             assert_eq!(yq_header_len(b"--- 42\n"), (3, true));
             assert_eq!(yq_header_len(b"---x\n"), (0, false));
             assert_eq!(yq_header_len(b"%YAML 1.2\n---\n"), (14, false));
-            assert_eq!(yq_header_len(b"  \na: 1\n"), (0, false));
+            assert_eq!(yq_header_len(b"  \na: 1\n"), (3, false));
             assert_eq!(yq_header_len(b"# only\n"), (7, false));
             assert_eq!(yq_header_len(b"# only"), (6, false));
             assert_eq!(yq_header_len(b"# c\r\na: 1\r\n"), (5, false));
