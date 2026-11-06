@@ -4763,6 +4763,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // always >= `indent + 2`, which is why `parse_explicit_key`'s
             // opening `close_deeper_indents` cannot close the item we just
             // pushed at virtual indent `indent + 1`.
+            // #6379: a property before the `?` (`- &t ? x`) leaves no key to open.
+            if had_property {
+                return Err(self.err_unexpected_char(
+                    self.pos,
+                    "mapping keys are not allowed in this context",
+                ));
+            }
             self.attach_item_head_at(self.bp_pos, indent);
             self.parse_explicit_key(self.current_column())?;
             // Don't close anything - mapping and item are closed by
@@ -5670,6 +5677,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Parse an explicit key (`? key`).
     /// The key can be any value: scalar, sequence, or mapping.
     fn parse_explicit_key(&mut self, indent: usize) -> Result<(), YamlError> {
+        self.reject_tab_after_indicator()?;
+
         // Same ambiguous-gap error as parse_mapping_entry (#901).
         self.check_mapping_under_mapping_gap(indent)?;
 
@@ -5874,6 +5883,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
 
                 if !self.at_line_end() {
+                    // #6379: and a property before that `?` (`? - &t ? x`) is refused.
+                    if self.properties_precede_explicit_key_indicator() {
+                        return Err(self.err_unexpected_char(
+                            self.pos,
+                            "mapping keys are not allowed in this context",
+                        ));
+                    }
                     // Parse item value
                     if self.peek() == Some(b'?') && Self::is_ws_break_or_eoi(self.peek_at(1)) {
                         // `? - ? x`: the first item is a compact mapping whose first entry is an
@@ -6039,6 +6055,61 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
+    /// A tab among the blanks after the `?` or `:` at the cursor (#6379): go-yaml skips no tab where a
+    /// simple key is allowed, which is right after either indicator, so it stops with `found character
+    /// that cannot start any token` (`?⇥x`, `:⇥b`, `? ⇥x`, and a tab with nothing after it). The blanks
+    /// may end at a `#`, which its comment scanner takes (`?⇥# c`). The one decision for the key's and
+    /// the value's indicator, and for the nested positions that reach them in yq (#6340). The library loader
+    /// keeps its older refusal of a tab right after the `?` of a nested key, in `parse_nested_explicit_key`.
+    fn reject_tab_after_indicator(&self) -> Result<(), YamlError> {
+        debug_assert!(matches!(self.peek(), Some(b'?' | b':')));
+        // Only for yq: YAML 1.2 reads the tab as separation, which the library loader keeps.
+        if !self.yq_mode {
+            return Ok(());
+        }
+        let mut at = self.pos + 1;
+        let mut tab = None;
+        while let Some(&byte) = self.input.get(at) {
+            match byte {
+                b' ' => {}
+                b'\t' => {
+                    tab.get_or_insert(at);
+                }
+                _ => break,
+            }
+            at += 1;
+        }
+        match tab {
+            Some(tab) if self.input.get(at) != Some(&b'#') => {
+                Err(self.err_unexpected_char(tab, "found character that cannot start any token"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether the node properties at the cursor (`&a`, `!!t`, either order, on this line) are followed by
+    /// an explicit key indicator (#6379). yq stops with `mapping keys are not allowed in this context`:
+    /// a `?` after a property is no key, wherever the property stands. Restores the cursor.
+    fn properties_precede_explicit_key_indicator(&mut self) -> bool {
+        let saved = self.pos;
+        let mut found = false;
+        while matches!(self.peek(), Some(b'&' | b'!')) {
+            let end = if self.peek() == Some(b'&') {
+                super::simd::parse_anchor_name(self.input, self.pos + 1)
+            } else {
+                scan_tag_extent(self.input, self.pos).0
+            };
+            if end <= self.pos {
+                break; // patchcov: coverage tolerate-line reason="unreachable: both scanners consume at least the `&` or `!` they start on, so `end` is past the cursor; kept so a scanner that returned early could not loop forever (#6379)"
+            }
+            self.pos = end;
+            self.skip_inline_whitespace();
+            found = self.peek() == Some(b'?') && Self::is_ws_break_or_eoi(self.peek_at(1));
+        }
+        self.pos = saved;
+        found
+    }
+
     /// `key: ? x`: an explicit key indicator straight after an implicit key's colon, on its line. It cannot
     /// open a mapping there (that is `key:` / `  ? x`, or `: ? x` after an explicit key's own colon), and
     /// yq stops with `mapping keys are not allowed in this context`; the line was read as the plain scalar
@@ -6076,7 +6147,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.err_unexpected_char(self.pos, "mapping key is not allowed in this context")
             );
         }
-        if self.peek_at(1) == Some(b'\t') {
+        // The library loader refuses it here as it always has (#6340); yq's own rule is
+        // `reject_tab_after_indicator`, which `parse_explicit_key` applies.
+        if !self.yq_mode && self.peek_at(1) == Some(b'\t') {
             return Err(self
                 .err_unexpected_char(self.pos + 1, "found character that cannot start any token"));
         }
@@ -6089,6 +6162,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// Parse an explicit value (`: value` after explicit key).
     fn parse_explicit_value(&mut self, indent: usize) -> Result<(), YamlError> {
+        self.reject_tab_after_indicator()?;
+
         // Same ambiguous-gap error as parse_mapping_entry (#901).
         self.check_mapping_under_mapping_gap(indent)?;
 
@@ -10099,6 +10174,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     }
                     // Check what follows
                     match self.peek() {
+                        // #6379: `&t ? x`: the properties are this node's, and a `?` after them opens
+                        // no key.
+                        Some(b'?') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
+                            return Err(self.err_unexpected_char(
+                                self.pos,
+                                "mapping keys are not allowed in this context",
+                            ));
+                        }
                         Some(b'\n' | b'\r' | b'#') | None => {
                             // A comment after the properties is deferred past them (#4851), as
                             // it is for a property-prefixed item on the dash's own line (#784):
