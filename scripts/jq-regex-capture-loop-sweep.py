@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Differential sweep for #6310 and #6332: a capture group inside a loop's body.
 
-    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert | --fancy] [--newlines] [--flags g] [--jq /usr/bin/jq]
+    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert | --fancy] [--newlines] [--blanks] [--flags g] [--jq /usr/bin/jq]
 
 Oniguruma ends a greedy loop at the first iteration that matches nothing (#6106), and that holds when the
 body has a capture group: after its empty way (`(?:b*|(a))+`, #6310), or before it, in it, or with its own
@@ -49,6 +49,21 @@ NEWLINE_SUBJECTS = ["a\nb", "\nab", "ab\n", "b\n\na", "a\n", "\n", "ba\nb a"]
 # `--fancy`: what stands beside the loop, on one side or both.
 BEFORE = ["(?=b)", "(?=[ab])", "(?!c)", "(?<=b)", "(?<!c)", "(?>b)", "(?>a|b)", "(?#c)"]
 AFTER = ["(?=b)", "(?!a)", "(?!c)", "(?<=a)", "(?<!b)", "(?>b)", "(?#c)"]
+
+
+# `--blanks` (#6442): subjects with a blank in them, for the patterns `blanked` writes.
+BLANK_SUBJECTS = SUBJECTS[:6] + ["a b", "b a", "ab "]
+
+
+def blanked(plist):
+    """Half the patterns with blanks between their tokens, and a literal `\\ ` for `c`: read under the `x` flag
+    they are the pattern they were, and without it a blank is a character, so both engines still agree."""
+    out = []
+    for i, p in enumerate(plist):
+        if i % 2:
+            p = p.replace("|", " | ").replace("(?:", "(?: ").replace(")", " )").replace("c", "\\ ")
+        out.append(p)
+    return sorted(set(out))
 
 
 def program(subjects):
@@ -169,6 +184,8 @@ def main():
     shape.add_argument("--assert", dest="anchors", action="store_true", help="ways that hold a zero-width anchor")
     shape.add_argument("--fancy", action="store_true", help="a lookaround or atomic group beside the loop")
     ap.add_argument("--newlines", action="store_true", help="with --assert: subjects that hold a newline")
+    ap.add_argument("--blanks", action="store_true",
+                    help="blanks between the tokens of half the patterns, for `--flags gx` (#6442)")
     ap.add_argument("--flags", default="g", help="the match flags (`gi`: case folding)")
     ap.add_argument("--jq", default="/usr/bin/jq")
     args = ap.parse_args()
@@ -183,6 +200,10 @@ def main():
     else:
         plist = ways_patterns(args.count, rng) if args.ways else patterns(args.count, rng, args.nest)
         prog = PROGRAM
+    if args.blanks:
+        if args.anchors or args.fancy:
+            ap.error("--blanks applies to the plain, --nest and --ways draws")
+        plist, prog = blanked(plist), program(BLANK_SUBJECTS)
     ref = answers([args.jq], plist, args.flags, prog)
     base = answers([args.baseline, "jq"], plist, args.flags, prog)
     subj = answers([args.subject, "jq"], plist, args.flags, prog)
