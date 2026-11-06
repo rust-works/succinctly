@@ -33310,10 +33310,10 @@ fn test_path_cursor_native_static_chain_up_to_384_answers_3429() -> Result<()> {
 }
 
 /// #2058 code review (Finding 1) sibling: the *non*-cursor-navigable route
-/// (a trailing `Expr::Slice` routes `path()` to `eval.rs`'s
+/// (a trailing `[1:]`, which `path_expr_is_cursor_navigable` refuses as not
+/// known to be narrow, #6265, routes `path()` to `eval.rs`'s
 /// `builtin_path_on_owned`/`walk_path`/`walk_pipe`/`step_into` instead of
-/// `eval_generic.rs`'s cursor-native walk, since `path_expr_is_cursor_
-/// navigable` rejects a `Slice` component, #2061) shares the identical
+/// `eval_generic.rs`'s cursor-native walk) shares the identical
 /// unbounded-recursion shape, guarded there by the file-appropriate
 /// `MAX_VALUE_TREE_DEPTH` (384) instead of `MAX_NESTING_DEPTH`.
 ///
@@ -33339,11 +33339,11 @@ fn test_path_cursor_native_static_chain_up_to_384_answers_3429() -> Result<()> {
 /// `i5554c.rs` pins the refusal past it, and the yq-mode test below still pins 384.
 #[test]
 fn test_path_non_cursor_native_deep_static_chain_answers_as_jq_2058_3275_5554() -> Result<()> {
-    let filter = format!("path({}[0:1])", ".a".repeat(500));
+    let filter = format!("path({}[1:])", ".a".repeat(500));
     let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("{}"))?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     let mut expected: Vec<serde_json::Value> = (0..500).map(|_| "a".into()).collect();
-    expected.push(serde_json::json!({"start": 0, "end": 1}));
+    expected.push(serde_json::json!({"start": 1, "end": null}));
     assert_eq!(
         stdout.trim_end(),
         serde_json::Value::Array(expected).to_string(),
@@ -33359,7 +33359,7 @@ fn test_path_non_cursor_native_deep_static_chain_answers_as_jq_2058_3275_5554() 
 /// `value_depth_defers_to_the_floor_only_when_armed_and_registered_5554`'s.
 #[test]
 fn test_path_non_cursor_native_deep_walk_under_try_answers_as_jq_3275_5554() -> Result<()> {
-    let deep = format!("path({}[0:1])", ".a".repeat(500));
+    let deep = format!("path({}[1:])", ".a".repeat(500));
     for (filter, want) in [
         (format!(r#"try {deep} catch "x" | length"#), "501"),
         (format!("{deep}? | length"), "501"),
@@ -33383,12 +33383,12 @@ fn test_path_non_cursor_native_deep_walk_under_try_answers_as_jq_3275_5554() -> 
 #[test]
 fn test_path_non_cursor_native_depth_boundary_3275() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
-        &["-c", &format!("path({}[0:1])", ".a".repeat(383))],
+        &["-c", &format!("path({}[1:])", ".a".repeat(383))],
         Some("{}"),
     )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     let mut expected: Vec<serde_json::Value> = (0..383).map(|_| "a".into()).collect();
-    expected.push(serde_json::json!({"start": 0, "end": 1}));
+    expected.push(serde_json::json!({"start": 1, "end": null}));
     assert_eq!(
         stdout.trim_end(),
         serde_json::Value::Array(expected).to_string(),
@@ -33396,7 +33396,7 @@ fn test_path_non_cursor_native_depth_boundary_3275() -> Result<()> {
     );
 
     let (stdout, stderr, code) = run_jq_full(
-        &["-c", &format!("path({}[0:1]) | length", ".a".repeat(384))],
+        &["-c", &format!("path({}[1:]) | length", ".a".repeat(384))],
         Some("{}"),
     )?;
     assert_eq!((stdout.trim_end(), code), ("385", 0), "stderr: {stderr:?}");
@@ -33408,7 +33408,7 @@ fn test_path_non_cursor_native_depth_boundary_3275() -> Result<()> {
 /// printed; since #5554 both answer in jq mode, as in jq 1.7.1 (`1`, `501`).
 #[test]
 fn test_path_non_cursor_native_deep_walk_keeps_generator_order_3275_5554() -> Result<()> {
-    let filter = format!("path(.a, ({}) [0:1]) | length", ".a".repeat(500));
+    let filter = format!("path(.a, ({}) [1:]) | length", ".a".repeat(500));
     let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("{}"))?;
     assert_eq!(
         (stdout.as_str(), code),
