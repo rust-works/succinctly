@@ -9,6 +9,8 @@ SUBJECT (`succinctly` binaries, run as `yq`). A stream agrees when both refuse i
 It prints how many SUBJECT fixed, broke and left, and lists the streams it broke.
 """
 import subprocess, random, sys, json
+ver=subprocess.run(["yq","--version"],capture_output=True,text=True).stdout
+assert "v4.53.3" in ver, "the oracle is yq v4.53.3, not "+ver.strip()
 seed=int(sys.argv[1]); count=int(sys.argv[2]); base=sys.argv[3]; new=sys.argv[4]
 rng=random.Random(seed)
 LINES=["a: 1","- a","%YAML 1.2","%TAG ! x:","%x","%","@x","`x","a: %x","- @x","- `x","[a, %x]","{a: `x}","{%k: 1}","? %k","? a","!!str","&a","---","...","# c","a:","  b: 2","  %y: 1","  - %z","x","\"q\"","'q'","|","  txt","key: |","  line","a: >","  - c","b: [1,","  2]","%a b","- - %n","a: x","  cont","  %cont","!!map","- &a","k: !!str","\t# t","","  ","a: 'x","  y'","\"d","  e\""]
