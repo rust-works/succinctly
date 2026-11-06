@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Differential sweep for #6310 and #6332: a capture group inside a loop's body.
 
-    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert] [--flags g] [--jq /usr/bin/jq]
+    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert | --fancy] [--flags g] [--jq /usr/bin/jq]
 
 Oniguruma ends a greedy loop at the first iteration that matches nothing (#6106), and that holds when the
 body has a capture group: after its empty way (`(?:b*|(a))+`, #6310), or before it, in it, or with its own
@@ -15,11 +15,13 @@ six in ten of them a loop with a group (or a plain atom otherwise), so that a lo
 the ways share a prefix; it is the draw that found the alternation `regex-syntax` factors (#6134) and the lazy `*?` and `+?`
 that keep their text. `--assert` (#6358) draws the loops whose ways hold a zero-width anchor (`\\b`, `\\B`, `^`, `$`, `\\A`, `\\z`)
 beside a capture group or a consuming item, under the counted and lazy quantifiers, on subjects with a word boundary
-in the middle. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
+in the middle. `--fancy` (#6358) draws the plain loops with a lookaround or an atomic group beside them, outside the repeat, so
+that they run on `fancy-regex`. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
 captures are compared. It prints how many patterns SUBJECT fixed (BASELINE differed from jq, SUBJECT does
 not), broke (the reverse) and still differs on, and exits 1 when it broke one.
 
-`--jq` is jq 1.7.1. A pattern that makes jq abort (an assertion in its UTF-8 reader on some inputs) is
+`--jq` is jq 1.7.1: pass it where `/usr/bin/jq` is an older jq (Ubuntu's is 1.6, whose `match` differs on empty matches, and
+thousands of patterns then read as differing). A pattern that makes jq abort (an assertion in its UTF-8 reader on some inputs) is
 run alone and left out when it aborts again.
 """
 import argparse
@@ -42,6 +44,9 @@ SUBJECTS = ["ba", "bab", "abab", "aab", "abba", "baab", "aaa", "bbb", "cba", "ab
 # `--assert`: the anchors, and subjects that put a word boundary inside the string.
 ANCHORS = [r"\b", r"\B", "^", "$", r"\A", r"\z"]
 ASSERT_SUBJECTS = SUBJECTS[:6] + ["a b", " ab", "ba b", "b a"]
+# `--fancy`: what stands beside the loop, on one side or both.
+BEFORE = ["(?=b)", "(?=[ab])", "(?!c)", "(?<=b)", "(?<!c)", "(?>b)", "(?>a|b)", "(?#c)"]
+AFTER = ["(?=b)", "(?!a)", "(?!c)", "(?<=a)", "(?<!b)", "(?>b)", "(?#c)"]
 
 
 def program(subjects):
@@ -118,6 +123,17 @@ def assert_patterns(count, rng):
     return sorted(out)
 
 
+def fancy_patterns(count, rng):
+    """`--fancy`: a plain draw with a construct only `fancy-regex` reads beside each loop."""
+    out = set()
+    for pattern in patterns(count * 2, rng):
+        side = rng.random()
+        before = rng.choice(BEFORE) if side < 0.7 else ""
+        after = rng.choice(AFTER) if side > 0.4 else ""
+        out.add(before + pattern + after)
+    return sorted(out)[:count]
+
+
 def run(cmd, plist, flags="g", prog=PROGRAM):
     r = subprocess.run(cmd + ["-c", "--arg", "flags", flags, prog], input=json.dumps(plist),
                        capture_output=True, text=True)
@@ -149,12 +165,15 @@ def main():
     shape.add_argument("--nest", action="store_true", help="also nest loops inside repeats")
     shape.add_argument("--ways", action="store_true", help="loops beside other items in the ways of an outer repeat")
     shape.add_argument("--assert", dest="anchors", action="store_true", help="ways that hold a zero-width anchor")
+    shape.add_argument("--fancy", action="store_true", help="a lookaround or atomic group beside the loop")
     ap.add_argument("--flags", default="g", help="the match flags (`gi`: case folding)")
     ap.add_argument("--jq", default="/usr/bin/jq")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     if args.anchors:
         plist, prog = assert_patterns(args.count, rng), program(ASSERT_SUBJECTS)
+    elif args.fancy:
+        plist, prog = fancy_patterns(args.count, rng), PROGRAM
     else:
         plist = ways_patterns(args.count, rng) if args.ways else patterns(args.count, rng, args.nest)
         prog = PROGRAM
