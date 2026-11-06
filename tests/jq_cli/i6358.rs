@@ -197,6 +197,12 @@ fn a_loop_with_capture_groups_inside_another_repeat_answers_as_jq_does_6358() ->
         ("(?:(b|()|(a*)){2,3})*", "ba", "[[0,\"b\",[\"\",\"\",null]],[1,\"\",[\"\",\"\",\"\"]],[2,\"\",[\"\",\"\",\"\"]]]"),
         ("(?:x*|(?:b*|(a))+(?:(b)*|a)+)+?b", "abab", "[[0,\"abab\",[null,\"b\"]]]"),
         ("(?:(?:b*|(?:b*|(a))+(?:(b)*|a)+)+?)(b)", "abab", "[[0,\"abab\",[null,\"b\",\"b\"]]]"),
+        // The branches of its alternations share a prefix: the crate factors it unless the pattern is guarded (#6134).
+        (
+            r"((?:b*|(a))+(?:(b)*|a)+(?:a|b)|(?:b*|(a))+\w)*",
+            "abc",
+            "[[0,\"abc\",[\"c\",null,null,null]],[3,\"\",[\"\",\"\",\"\",\"\"]]]",
+        ),
     ] {
         let (stdout, _, status) = run_jq_full(
             &[

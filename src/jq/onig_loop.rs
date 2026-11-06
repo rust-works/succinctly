@@ -1209,10 +1209,9 @@ impl Rewriter<'_> {
         parts.push(self.repeat(iteration, 0, None, false)?);
         let piece = self.concat(&parts, true)?;
         // #6310: only a group in `B` survives the rewrite; with the groups tagged, every one does,
-        // and each copy is read back (#6332), in a loop inside another repeat too (#6358) unless a lazy repeat that is not
-        // rewritten stands around it.
+        // and each copy is read back (#6332), in a loop inside another repeat too (#6358).
         let kept = if self.copies {
-            exit.is_none() || self.lazy_around == 0
+            !self.exit_keeps_text(&exit)
         } else {
             self.groups_only_in_later_ways(&written, &before_text, &b_text)
         };
@@ -1327,9 +1326,8 @@ impl Rewriter<'_> {
         exit: Option<Text>,
     ) -> Result<Piece, GiveUp> {
         // #6310: each copy holds the body's groups again; with the groups tagged they are read back
-        // (#6332), in a loop inside another repeat too (#6358) unless a lazy repeat that is not
-        // rewritten stands around it.
-        if self.has_groups(&written) || (exit.is_some() && self.lazy_around > 0) {
+        // (#6332), in a loop inside another repeat too (#6358).
+        if self.has_groups(&written) || self.exit_keeps_text(&exit) {
             return Ok(Self::unlisted(written));
         }
         let consuming = |text: Text| Piece {
@@ -1365,6 +1363,14 @@ impl Rewriter<'_> {
             text: self.text(format!("(?:{})", rest.text.text), Prec::Atom)?,
             ways: rest.ways,
         })
+    }
+
+    /// Whether a loop written with its exit `exit` keeps its own text instead: a lazy `*?` or `+?`
+    /// stands around it (#6358), which is not rewritten, and the loop written with its exit answers
+    /// differently from Oniguruma's under a repeat that is not. The one rule for every arm that
+    /// writes an exit.
+    fn exit_keeps_text(&self, exit: &Option<Text>) -> bool {
+        exit.is_some() && self.lazy_around > 0
     }
 
     /// The empty way of a counted loop's copy: nothing, or `exit` (#6332).
@@ -1457,9 +1463,8 @@ impl Rewriter<'_> {
             ways: Ways::Consuming,
         };
         // #6310: each copy holds the body's groups again; with the groups tagged they are read back
-        // (#6332), in a loop inside another repeat too (#6358) unless a lazy repeat that is not
-        // rewritten stands around it.
-        if self.has_groups(&written) || (exit.is_some() && self.lazy_around > 0) {
+        // (#6332), in a loop inside another repeat too (#6358).
+        if self.has_groups(&written) || self.exit_keeps_text(&exit) {
             return Ok(Self::unlisted(written));
         }
         let mut loop_rest = body.clone();
