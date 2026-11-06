@@ -15963,62 +15963,36 @@ fn test_compact_mapping_dash_spacing_877() -> Result<()> {
 }
 
 // ============================================================================
-// Out-dented block sequence continuation (#485)
+// Out-dented block sequence continuation (#485, refused since #5086)
 // ============================================================================
 // A continuation `-` indented strictly between a sequence's own indent and
-// whatever encloses it is invalid YAML (`yq` rejects it, and so does the
-// strict validator), but the loader parses the obvious extension rather than
-// silently dropping the item, the same policy #325 chose for `a: - x`.
-// Before this fix, closing the sequence for the out-of-range indent reopened
-// a second, untagged sequence as a sibling child of the mapping instead of a
-// value under a key, which not only dropped the misaligned item but corrupted
-// the *next* mapping entry into a phantom `"":<value>` pair.
+// whatever encloses it is invalid YAML, and yq v4.53.3 rejects every one of
+// these inputs (`did not find expected key`). #325/#485 read the obvious
+// extension instead, because closing the sequence for the out-of-range indent
+// reopened a second, untagged sequence as a sibling child of the mapping,
+// which dropped the misaligned item and corrupted the *next* mapping entry
+// into a phantom `"":<value>` pair. The refusal below ends that without the
+// tolerance: an error never loses a line silently.
 
 #[test]
-fn test_out_dented_sequence_continuation_joins_the_sequence() -> Result<()> {
-    // The #485 repro: `y` used to vanish and `c: 2` corrupted into `"":"c"`.
-    let (output, exit_code) =
-        run_yq_stdin(".", "b:\n    - x\n   - y\nc: 2\n", &["-o", "json", "-I0"])?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), r#"{"b":["x","y"],"c":2}"#);
-    Ok(())
-}
-
-#[test]
-fn test_out_dented_sequence_continuation_does_not_lose_later_items() -> Result<()> {
-    // Everything after the misaligned item must survive too, not just resume
-    // being lost one item later.
-    let (output, exit_code) = run_yq_stdin(
-        ".",
+fn test_out_dented_sequence_continuation_is_refused_as_yq_refuses_it_5086() -> Result<()> {
+    for yaml in [
+        // The #485 repro and its variants: the item after the out-dented one,
+        // the minimal form, and the same shape one mapping level deeper.
+        "b:\n    - x\n   - y\nc: 2\n",
         "b:\n    - x\n   - y\n    - z\n",
-        &["-o", "json", "-I0"],
-    )?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), r#"{"b":["x","y","z"]}"#);
-    Ok(())
-}
-
-#[test]
-fn test_out_dented_sequence_continuation_minimal_form() -> Result<()> {
-    // No trailing entry, no outer nesting.
-    let (output, exit_code) = run_yq_stdin(".", "b:\n  - x\n - y\n", &["-o", "json", "-I0"])?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), r#"{"b":["x","y"]}"#);
-    Ok(())
-}
-
-#[test]
-fn test_out_dented_sequence_continuation_nested_in_a_mapping() -> Result<()> {
-    // The same shape one level deeper: `b`'s sequence sits inside `a`, and the
-    // enclosing frame the out-dented `- y` must reach past is `b`, not the
-    // document root.
-    let (output, exit_code) = run_yq_stdin(
-        ".",
+        "b:\n  - x\n - y\n",
         "a:\n  b:\n    - x\n   - y\n  c: 2\n",
-        &["-o", "json", "-I0"],
-    )?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), r#"{"a":{"b":["x","y"],"c":2}}"#);
+    ] {
+        let (output, stderr, exit_code) =
+            run_yq_stdin_with_stderr(".", yaml, &["-o", "json", "-I0"])?;
+        assert_eq!(exit_code, 1, "{yaml:?}: {output:?}");
+        assert_eq!(output, "", "{yaml:?}");
+        assert!(
+            stderr.contains("inconsistent indentation"),
+            "{yaml:?}: {stderr:?}"
+        );
+    }
     Ok(())
 }
 
@@ -16155,33 +16129,46 @@ fn test_inconsistent_compact_mapping_indent_with_alias_key() -> Result<()> {
 }
 
 // ============================================================================
-// A `-` continuation in a compact mapping's gap (#900)
+// A `-` continuation in a compact mapping's gap (#900, refused since #5086)
 // ============================================================================
 // The sibling shape #885's own doc comment flagged as deliberately
 // out-of-scope: a bare `-` line (not a `key: value` line) landing in the
-// same gap. Unlike a mapping entry, a `-` can't "just be added" to the open
-// compact mapping -- the obvious extension instead closes through both the
-// mapping and its enclosing sequence item and treats this as the next item
-// of the *outer* sequence, same "parse the obvious extension" policy as
-// #325/#485/#885. Real `yq` v4.53.3 rejects every one of these inputs
-// outright (`did not find expected '-' indicator`), same as #885's own
-// cases.
+// same gap. A `-` can't "just be added" to the open compact mapping. #900
+// read it as the next item of the *outer* sequence, but yq v4.53.3 rejects
+// every one of these inputs outright (`did not find expected '-' indicator`),
+// as it does #885's own cases, so it is refused here too.
 
 #[test]
-fn test_sequence_item_gap_headline_repro() -> Result<()> {
-    let (output, exit_code) = run_yq_stdin(".", "-   a: hello\n  - b\n", &["-o", "json", "-I0"])?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), r#"[{"a":"hello"},"b"]"#);
+fn test_sequence_item_gap_is_refused_as_yq_refuses_it_5086() -> Result<()> {
+    for yaml in [
+        // The #900 headline repro, and the shape that checked the outer
+        // sequence was reused after it.
+        "-   a: hello\n  - b\n",
+        "-   a: 1\n  - b\n- c\n-   x: 9\n",
+        // #5086: the same `-` one space under a one-space-dash compact mapping.
+        "- k: a\n - z\n",
+        "- k: a\n  j: b\n - z\n",
+        // A `-` on a nested sequence item's own virtual indent, which dropped
+        // the `b`.
+        "- - a\n - b\n",
+    ] {
+        let (output, stderr, exit_code) =
+            run_yq_stdin_with_stderr(".", yaml, &["-o", "json", "-I0"])?;
+        assert_eq!(exit_code, 1, "{yaml:?}: {output:?}");
+        assert_eq!(output, "", "{yaml:?}");
+        assert!(
+            stderr.contains("inconsistent indentation"),
+            "{yaml:?}: {stderr:?}"
+        );
+    }
     Ok(())
 }
 
 #[test]
 fn test_sequence_item_gap_at_the_mappings_own_indent_with_resolved_key() -> Result<()> {
-    // Lower bound aside, the mapping's own exact indent is *not* included in
-    // #900's trigger range (see `sequence_item_gap_reaches`'s own doc comment
-    // for why: that exact indent is ambiguous with the legitimate "block
-    // sequence value at the key's own indent" shape when the key is deferred).
-    // Here the key already has its value (`a: hello`), so the `-` has nothing
+    // The mapping's own exact indent is not a gap: it is ambiguous with the
+    // legitimate "block sequence value at the key's own indent" shape when the
+    // key is deferred. Here the key already has its value (`a: hello`), so the `-` has nothing
     // to be the value of and is an error, as in real yq, not a line to drop
     // (#4530; this pinned the silent drop, `[{"a":"hello"}]`, before).
     let (output, exit_code) = run_yq_stdin(".", "-   a: hello\n    - b\n", &["-o", "json", "-I0"])?;
@@ -16201,26 +16188,6 @@ fn test_sequence_item_gap_does_not_regress_deferred_value_at_own_indent() -> Res
     let (output, exit_code) = run_yq_stdin(".", "- k: &a\n  - 1\n", &["-o", "json", "-I0"])?;
     assert_eq!(exit_code, 0);
     assert_eq!(output.trim(), r#"[{"k":[1]}]"#);
-    Ok(())
-}
-
-#[test]
-fn test_sequence_item_gap_does_not_lose_later_items() -> Result<()> {
-    // The second `-   x: 9\n` sibling (a fresh compact-mapping item, not a
-    // plain scalar) confirms the outer sequence is genuinely reused, not
-    // just tolerated for a single extra item. `- c` is deliberately at
-    // indent 0 rather than the same 2-space indent as `- b`: indent 2 is
-    // *greater* than item `b`'s own virtual indent (1), so it would fold as
-    // a continuation of `b`'s own plain-scalar text under ordinary YAML
-    // rules (verified against real yq: `- b\n  - c\n` reads as `["b - c"]`)
-    // -- an unrelated, pre-existing folding rule, not this fix's concern.
-    let (output, exit_code) = run_yq_stdin(
-        ".",
-        "-   a: 1\n  - b\n- c\n-   x: 9\n",
-        &["-o", "json", "-I0"],
-    )?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), r#"[{"a":1},"b","c",{"x":9}]"#);
     Ok(())
 }
 
@@ -16554,8 +16521,7 @@ fn test_ambiguous_gap_via_key_landing_in_sequence_958() -> Result<()> {
     // landing frame, so a mapping-entry-shaped line landing in an open
     // *sequence's* gap is caught too. Confirmed live: real yq errors here;
     // succinctly silently dropped "c: 1" before this fix. A `-`
-    // continuation at the identical indent stays valid (tested below),
-    // since #325/#485's tolerance is specific to that line shape.
+    // continuation at the identical indent is refused too (#5086).
     let (_output, stderr, exit_code) =
         run_yq_stdin_with_stderr(".", "a:\n  - x\n c: 1\n", &["-o", "json", "-I0"])?;
     assert_eq!(exit_code, 1, "stderr: {stderr:?}");
@@ -16578,17 +16544,8 @@ fn test_ambiguous_gap_generalization_does_not_regress_existing_tolerances_958() 
         // column 0) -- landing on the permanent root sentinel must never
         // be flagged.
         ("  a: 1\n  b: 2\n", r#"{"a":1,"b":2}"#),
-        // #900's compact-mapping-under-sequence-item continuation.
-        (
-            "-   a: 1\n  - b\n- c\n-   x: 9\n",
-            r#"[{"a":1},"b","c",{"x":9}]"#,
-        ),
         // #885's exact-match deferred-value exception.
         ("- k: &a\n  - 1\n", r#"[{"k":[1]}]"#),
-        // #325/#485's out-dented sequence-item continuation -- the
-        // exact shape that #958's generalization first broke before the
-        // `for_sequence_item` tolerance was threaded through.
-        ("b:\n    - x\n   - y\nc: 2\n", r#"{"b":["x","y"],"c":2}"#),
         // An ordinary sibling key landing exactly at a closed sequence's
         // own indent, distinct from the new key-in-sequence-gap error
         // case above (this one matches the landing frame exactly).
