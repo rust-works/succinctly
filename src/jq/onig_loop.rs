@@ -256,6 +256,67 @@ pub(crate) struct GroupRewrite {
     pub(crate) names: Vec<Option<Box<str>>>,
 }
 
+/// `pattern` parsed by `regex-syntax`, which refuses a group name used twice where Oniguruma allows
+/// it (#6430). Each later use of a name is renamed in the returned text (`n` becomes `n__d1`), and
+/// the second element of the result lists the renames as (new, original), so a caller that reads
+/// names out of the tree reads them back through [`original_name`]. The text is `pattern` itself
+/// when no name repeats. `None` for a pattern the parser refuses for any other reason.
+pub(crate) fn parse_distinct_names(pattern: &str) -> Option<DistinctNames> {
+    let mut text = pattern.to_string();
+    let mut renames: Vec<(String, String)> = Vec::new();
+    // Each pass renames one use; a pattern with more repeated uses than this keeps its text.
+    // One parse more than renames, so that the last rename is read.
+    for _ in 0..=MAX_NAME_RENAMES {
+        match ast::parse::Parser::new().parse(&text) {
+            Ok(tree) => {
+                return Some(DistinctNames {
+                    text,
+                    ast: tree,
+                    renames,
+                })
+            }
+            Err(error) if matches!(error.kind(), ast::ErrorKind::GroupNameDuplicate { .. }) => {
+                let span = error.span();
+                let (start, end) = (span.start.offset, span.end.offset);
+                let original = text.get(start..end)?.to_string();
+                let mut count = 1;
+                let renamed = loop {
+                    let candidate = format!("{original}__d{count}");
+                    if !text.contains(&candidate) {
+                        break candidate;
+                    }
+                    count += 1;
+                };
+                text.replace_range(start..end, &renamed);
+                renames.push((renamed, original));
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// What [`parse_distinct_names`] read.
+pub(crate) struct DistinctNames {
+    /// The pattern, with each repeated use of a group name renamed.
+    pub(crate) text: String,
+    pub(crate) ast: Ast,
+    /// The renames, as (new name, name as written).
+    pub(crate) renames: Vec<(String, String)>,
+}
+
+/// How many repeated uses of a group name [`parse_distinct_names`] renames before it gives up.
+const MAX_NAME_RENAMES: usize = 64;
+
+/// The name a group carried in the pattern as written: `name` itself, or the one
+/// [`parse_distinct_names`] renamed it from.
+pub(crate) fn original_name(name: Box<str>, renames: &[(String, String)]) -> Box<str> {
+    match renames.iter().find(|(renamed, _)| **renamed == *name) {
+        Some((_, original)) => original.as_str().into(),
+        None => name,
+    }
+}
+
 /// [`rewrite`] for a pattern whose loops have a capture group where the plain rewrite would copy or
 /// drop it (#6332): the groups are tagged by number, the loops are written as they are without
 /// one, and each group the rewrite copied is read back through [`GroupRewrite::copies`]. `None`
@@ -268,7 +329,12 @@ pub(crate) fn rewrite_with_groups(input: &str) -> Option<GroupRewrite> {
     if !may_need_rewrite(pattern) || !pattern.contains('(') || pattern.contains(TAG) {
         return None;
     }
-    let ast = ast::parse::Parser::new().parse(pattern).ok()?;
+    let DistinctNames {
+        text: distinct,
+        ast,
+        renames,
+    } = parse_distinct_names(pattern)?;
+    let pattern = distinct.as_str();
     let mut openers = Vec::new();
     capture_openers(&ast, &mut openers);
     if openers.is_empty() {
@@ -311,6 +377,10 @@ pub(crate) fn rewrite_with_groups(input: &str) -> Option<GroupRewrite> {
     let mut names = Vec::new();
     capture_names(&ast, &mut names);
     names.insert(0, None);
+    let names = names
+        .into_iter()
+        .map(|name| name.map(|name| original_name(name, &renames)))
+        .collect();
     Some(GroupRewrite {
         pattern,
         copies,
@@ -2553,5 +2623,63 @@ mod tests {
             pattern = format!("(?:{pattern}|c*|d)+");
         }
         assert_eq!(rewrite(&pattern), None);
+    }
+
+    #[test]
+    fn a_repeated_group_name_is_renamed_for_the_parser_and_read_back_6430() {
+        // No repeat: the text is the pattern itself and nothing is renamed.
+        let read = parse_distinct_names("(?<n>a)(?<m>b)").unwrap();
+        assert_eq!(
+            (read.text.as_str(), read.renames.len()),
+            ("(?<n>a)(?<m>b)", 0)
+        );
+        // Each later use is renamed, the first keeps its name, and the rename reads back.
+        let read = parse_distinct_names("(?<n>a)|(?<n>b)|(?<n>c)").unwrap();
+        assert_eq!(read.text, "(?<n>a)|(?<n__d1>b)|(?<n__d2>c)");
+        let mut names = Vec::new();
+        capture_names(&read.ast, &mut names);
+        let names: Vec<_> = names
+            .into_iter()
+            .map(|name| name.map(|name| original_name(name, &read.renames)))
+            .collect();
+        assert_eq!(
+            names,
+            [Some("n".into()), Some("n".into()), Some("n".into())]
+        );
+        // A name that already ends like a rename is not taken twice.
+        let read = parse_distinct_names("(?<n__d1>a)(?<n>b)(?<n>c)").unwrap();
+        assert_eq!(read.text, "(?<n__d1>a)(?<n>b)(?<n__d2>c)");
+        // Any other refusal stays one.
+        assert!(parse_distinct_names("(?<n>a").is_none());
+        // Past the cap the pattern keeps its text: the parse is refused, not answered wrongly.
+        let many = "(?<n>a)".repeat(MAX_NAME_RENAMES + 2);
+        assert!(parse_distinct_names(&many).is_none());
+        let at_cap = "(?<n>a)".repeat(MAX_NAME_RENAMES + 1);
+        assert_eq!(
+            parse_distinct_names(&at_cap).unwrap().renames.len(),
+            MAX_NAME_RENAMES
+        );
+    }
+
+    #[test]
+    fn a_loop_with_groups_in_a_pattern_that_repeats_a_name_is_written_6430() {
+        let mut rewritten = 0;
+        for pattern in [
+            "(?:(?<n>a)|(?<n>a)|())*",
+            "(?:(?<n>a)|c|(?<n>b)|(b*))+",
+            "(?:b*|(?<n>a)(?<n>b))*",
+            "(?:(?<n>a)|b|(?<n>c)|)+",
+        ] {
+            // Not every pattern needs the group copies; the ones that do must name no group but `n`.
+            if let Some(written) = rewrite_with_groups(pattern) {
+                rewritten += 1;
+                assert!(!written.pattern.contains("?<"), "{pattern}");
+                assert!(
+                    written.names.iter().flatten().all(|name| &**name == "n"),
+                    "{pattern}"
+                );
+            }
+        }
+        assert!(rewritten > 0, "no pattern was rewritten with its groups");
     }
 }
