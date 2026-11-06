@@ -8167,8 +8167,13 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
 /// the held comment on its own opening line, since its own comment is no longer written there. An
 /// empty `[]`/`{}` stays flow and keeps its comment, and an alias is one line. The walk follows
 /// the value's order, which is the order the document is written in.
+///
+/// The comment of an element of a collection written in flow (`[[1], # a` / `2]`) is held the same
+/// way (#6334). The held comment is one slot, which the next held comment overwrites; and between
+/// the elements of a flow *sequence* (not a mapping) an element with a comment of its own, an
+/// alias or a scalar, overwrites it where beside block entries it would have waited.
 fn defer_flow_line_comments(value: &OwnedValue, tree: &mut CommentTree) {
-    let mut held = std::collections::VecDeque::new();
+    let mut held = None;
     defer_flow_line_comments_at(value, tree, LineComment::Free, false, &mut held, 0);
 }
 
@@ -8193,19 +8198,28 @@ enum LineComment {
     Placed,
 }
 
-/// `in_flow`: `tree`'s parent stays flow-written, where a nested collection's trailing comment is
-/// lost rather than held.
+/// `in_flow`: `tree`'s parent was a sequence written in flow, where an element with a comment of
+/// its own, an alias included, overwrites the held comment instead of leaving it to wait for a
+/// later line, and an alias takes it on its own line (#6334).
 fn defer_flow_line_comments_at(
     value: &OwnedValue,
     tree: &mut CommentTree,
     line: LineComment,
     in_flow: bool,
-    held: &mut std::collections::VecDeque<String>,
+    held: &mut Option<String>,
     depth: usize,
 ) {
     assert_value_tree_depth(depth);
-    // An alias is written as `*name` and never takes the held comment; the next line does.
+    // An alias is one line. Beside block entries and in a mapping it never takes the held comment,
+    // the next line does; in a flow sequence it is a line like a scalar's (#6334).
     if tree.alias_name().is_some() {
+        if in_flow {
+            if tree.own().is_some() {
+                *held = None;
+            } else if let Some(comment) = held.take() {
+                tree.meta_mut().comment = Some(comment);
+            }
+        }
         return;
     }
     let converted_flow = is_non_empty_collection(value) && tree.style() == "flow";
@@ -8216,13 +8230,18 @@ fn defer_flow_line_comments_at(
     };
     match line {
         LineComment::Overwritten => {
-            held.pop_front();
+            *held = None;
         }
         LineComment::Placed => {}
         LineComment::Free if tree.own().is_none() => {
-            if let Some(comment) = held.pop_front() {
+            if let Some(comment) = held.take() {
                 tree.meta_mut().comment = Some(comment);
             }
+        }
+        // Between the elements of a collection written in flow, an element with a comment of its
+        // own overwrites the held one (#6334); beside the entries of a block it waits (#4377).
+        LineComment::Free if in_flow => {
+            *held = None;
         }
         LineComment::Free => {}
     }
@@ -8241,13 +8260,13 @@ fn defer_flow_line_comments_at(
                 // A collection is written on the lines below its key, so the held comment ends
                 // the key's line; any other value ends the line itself.
                 let on_key = !key_commented
-                    && !held.is_empty()
+                    && held.is_some()
                     && is_non_empty_collection(child)
                     && fields
                         .get(key.as_str())
                         .is_some_and(|slot| slot.alias_name().is_none());
                 if on_key {
-                    if let Some(comment) = held.pop_front() {
+                    if let Some(comment) = held.take() {
                         tree.set_key_comment(key, comment);
                     }
                 }
@@ -8265,7 +8284,9 @@ fn defer_flow_line_comments_at(
                         } else {
                             LineComment::Free
                         },
-                        children_in_flow,
+                        // Beside the entries of a flow mapping a commented one leaves the held
+                        // comment waiting, as beside block entries.
+                        false,
                         held,
                         depth + 1,
                     );
@@ -8282,11 +8303,11 @@ fn defer_flow_line_comments_at(
                 }
                 // A collection item opens on its dash, and the writer puts a comment there as the
                 // head comment of the item's first member (#4231).
-                let on_dash = !held.is_empty()
+                let on_dash = held.is_some()
                     && slots[i].alias_name().is_none()
                     && is_non_empty_collection(child);
                 if on_dash {
-                    if let Some(comment) = held.pop_front() {
+                    if let Some(comment) = held.take() {
                         head_comment_first_member(&mut slots[i], child, comment);
                     }
                 }
@@ -8307,9 +8328,9 @@ fn defer_flow_line_comments_at(
         _ => {}
     }
     if let Some(comment) = own {
-        if !in_flow {
-            held.push_back(comment);
-        }
+        // One slot: a comment held after a nested flow collection is overwritten by the next one
+        // that is held, the parent's (`{x: [1] # xi` / `} # ec` writes `ec`, #4377).
+        *held = Some(comment);
     }
 }
 

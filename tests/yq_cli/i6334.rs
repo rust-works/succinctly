@@ -407,6 +407,164 @@ fn test_a_comment_on_its_own_line_inside_a_flow_collection_is_kept_6334() -> Res
             &[],
             "k:\n  - {a: 2,}\n  # c\n",
         ),
+        (
+            "v: [[1] # c\n  # f\n  ]\n",
+            ".",
+            &[],
+            "v: [[1] # c\n  # f\n]\n",
+        ),
+        (
+            "v: [{a: 1} # c\n  # f\n  ]\n",
+            ".",
+            &[],
+            "v: [{a: 1,} # c\n  # f\n]\n",
+        ),
+        (
+            "v: {a: [1] # c\n  # f\n  }\n",
+            ".",
+            &[],
+            "v: {a: [1] # c\n,\n  # f\n}\n",
+        ),
+    ];
+    for &(doc, filter, flags, expected) in rows {
+        let (stdout, code) = run_yq_stdin(filter, doc, flags)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "{flags:?} {filter} on {doc:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Under `-P` a flow collection becomes a block, and the comment on an element that is a collection (`[[1], # a`
+/// / `2]`) has no line of its own: yq holds it for the next line without a comment, as it holds one after the
+/// whole collection (#4377), but an element with a comment of its own overwrites it instead of letting it wait.
+/// Every row was captured from yq v4.53.3.
+#[test]
+fn test_p_holds_the_comment_of_a_flow_element_that_is_a_collection_6334() -> Result<()> {
+    let rows: &[(&str, &str, &[&str], &str)] = &[
+        (
+            "v: [1, # a\n 2, # b\n 3]\n",
+            ".",
+            &["-P"],
+            "v:\n  - 1 # a\n  - 2 # b\n  - 3\n",
+        ),
+        (
+            "v: {a: 1, # a\n b: 2}\n",
+            ".",
+            &["-P"],
+            "v:\n  a: 1 # a\n  b: 2\n",
+        ),
+        (
+            "v: [[1], # a\n 2]\n",
+            ".",
+            &["-P"],
+            "v:\n  - - 1\n  - 2 # a\n",
+        ),
+        (
+            "v: [[1], # a\n [2]]\n",
+            ".",
+            &["-P"],
+            "v:\n  - - 1\n  - # a\n    - 2\n",
+        ),
+        (
+            "v: [{a: 1}, # a\n {b: 2}, # b\n 3]\n",
+            ".",
+            &["-P"],
+            "v:\n  - a: 1\n  - # a\n    b: 2\n  - 3 # b\n",
+        ),
+        (
+            "v: {a: [1], # a\n b: 2}\n",
+            ".",
+            &["-P"],
+            "v:\n  a:\n    - 1\n  b: 2 # a\n",
+        ),
+        (
+            "v: {a: {c: 1}, # a\n b: 2}\n",
+            ".",
+            &["-P"],
+            "v:\n  a:\n    c: 1\n  b: 2 # a\n",
+        ),
+        (
+            "v: [1, [2], # a\n 3]\n",
+            ".",
+            &["-P"],
+            "v:\n  - 1\n  - - 2\n  - 3 # a\n",
+        ),
+        ("v: [1, [2] # a\n]\n", ".", &["-P"], "v:\n  - 1\n  - - 2\n"),
+        (
+            "v: [[~], # c7\n a , # c9\n []]\n",
+            ".",
+            &["-P"],
+            "v:\n  - - ~\n  - a # c9\n  - []\n",
+        ),
+        (
+            "v: [[1], # a\n b, # b\n c, # c\n d]\n",
+            ".",
+            &["-P"],
+            "v:\n  - - 1\n  - b # b\n  - c # c\n  - d\n",
+        ),
+        (
+            "a: [1] # a\nb: 2 # b\nc: [3]\nd: 4\n",
+            ".",
+            &["-P"],
+            "a:\n  - 1\nb: 2 # b\nc: # a\n  - 3\nd: 4\n",
+        ),
+        (
+            "a: {x: [1] # xi\n  }\nb: 3\n",
+            ".",
+            &["-P"],
+            "a:\n  x:\n    - 1\nb: 3 # xi\n",
+        ),
+        (
+            "a: [[1] # xi\n  ]\nb: 3\n",
+            ".",
+            &["-P"],
+            "a:\n  - - 1\nb: 3 # xi\n",
+        ),
+        (
+            "a: [[1] # xi\n  ] # ec\nb: 3\n",
+            ".",
+            &["-P"],
+            "a:\n  - - 1\nb: 3 # ec\n",
+        ),
+        (
+            "a: [[1], # xi\n  [2]] # ec\nb: 3\n",
+            ".",
+            &["-P"],
+            "a:\n  - - 1\n  - # xi\n    - 2\nb: 3 # ec\n",
+        ),
+        (
+            "v: {a: [1], # a\n b: 2, # b\n c: 3}\n",
+            ".",
+            &["-P"],
+            "v:\n  a:\n    - 1\n  b: 2 # b\n  c: 3 # a\n",
+        ),
+        (
+            "x: &x 5\nv: [[1], # a\n *x, 2]\n",
+            ".",
+            &["-P"],
+            "x: &x 5\nv:\n  - - 1\n  - *x # a\n  - 2\n",
+        ),
+        (
+            "x: &x 5\nv: {a: [1], # a\n b: *x, c: 2}\n",
+            ".",
+            &["-P"],
+            "x: &x 5\nv:\n  a:\n    - 1\n  b: *x\n  c: 2 # a\n",
+        ),
+        (
+            "x: &x 5\nv: [[1], # a\n *x # b\n, 2]\n",
+            ".",
+            &["-P"],
+            "x: &x 5\nv:\n  - - 1\n  - *x # b\n  - 2\n",
+        ),
+        (
+            "v: {a: {x: 1}, # a\n b: 2, # b\n c: 3}\n",
+            ".",
+            &["-P"],
+            "v:\n  a:\n    x: 1\n  b: 2 # b\n  c: 3 # a\n",
+        ),
     ];
     for &(doc, filter, flags, expected) in rows {
         let (stdout, code) = run_yq_stdin(filter, doc, flags)?;
@@ -450,5 +608,24 @@ fn test_flow_comments_that_still_differ_from_yq_6334() -> Result<()> {
         assert_eq!((stdout.as_str(), code), (expected, 0), "{doc:?}");
         assert_ne!(stdout, yq_prints, "{doc:?} now matches yq");
     }
+    // Under -P yq writes the foot of a last element that is a collection after the key line that follows it.
+    let doc = "v: [{a: 1} # c\n  # f\n  ]\nw: [1] # z\ny: 2\n";
+    let (stdout, code) = run_yq_stdin(".", doc, &["-P"])?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("v:\n  - a: 1\n\n# f\nw: # c\n  - 1\ny: 2 # z\n", 0),
+        "-P on {doc:?}"
+    );
+    assert_ne!(stdout, "v:\n  - a: 1\nw: # c\n# f\n  - 1\ny: 2 # z\n");
+    // Under -P a comment held beside a commented entry of a mapping that is a sequence item reaches the next
+    // item here; yq drops it.
+    let doc = "- {k0: {k0: true}, # c5\n  m1: b # c6\n  }\n- 2\n";
+    let (stdout, code) = run_yq_stdin(".", doc, &["-P"])?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("- k0:\n    k0: true\n  m1: b # c6\n- 2 # c5\n", 0),
+        "-P on {doc:?}"
+    );
+    assert_ne!(stdout, "- k0:\n    k0: true\n  m1: b # c6\n- 2\n");
     Ok(())
 }
