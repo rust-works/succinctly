@@ -5923,7 +5923,7 @@ What the streaming route reproduces, all measured against pinned v4.53.3:
   Blanks in front of the first marker and a second marker the pushed-back text starts with (`--- --- x`) are stripped as in yq.
   A run of leading bare `---` lines is one header and one document in yq, and since #6349 here too (`---` / `---` / `x` is `"x"`, with all three lines in the printed header): `succinctly yq` indexes its input with `YamlIndex::build_yq`, and the library's `build` keeps the YAML spec's reading (a null document, then `x`).
   A marker after the first content line is a marker in both, and so is every later empty document (`a: 1` / `---` / `---` / `b: 2` is three documents).
-  Not reproduced: `---` / `---` / `...` is an error in yq and the null document here, and the `line` of an empty document is `0` in yq and a line number here (`---` alone is `1`, as before);
+  Not reproduced: `---` / `---` / `...` and `---` / `...` / `---` / `x` are errors in yq and read as null documents here, and `from_yaml` and the YAML-snippet parser of the yq builtins still read their text with `build` (a run of markers inside such a string is two documents), and the `line` of an empty document is `0` in yq and a line number here (`---` alone is `1`, as before);
 - a scalar root prints its head and *drops* its foot, a flow or block collection root
   prints both (`# lead\n42\n# foot` is `# lead\n42` in yq; the getter still answers
   `foot`). The DOM route reproduces this asymmetry too (#2795 PR B).

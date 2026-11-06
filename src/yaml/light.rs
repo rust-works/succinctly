@@ -9907,7 +9907,6 @@ fn write_foot_comment_lines<Out: core::fmt::Write>(
 fn yq_position_preamble(text: &[u8]) -> (usize, usize) {
     let mut pos = 0;
     let mut lines = 0;
-    let mut seen_marker = false;
     while pos < text.len() {
         let rest = &text[pos..];
         let line_end = rest
@@ -9923,10 +9922,7 @@ fn yq_position_preamble(text: &[u8]) -> (usize, usize) {
             Some(i) => line[i] == b'#' || (i == 0 && line.starts_with(b"%YA")) || bare_marker,
         };
         if !leading {
-            let columns = if !seen_marker
-                && line.starts_with(b"---")
-                && matches!(line.get(3), Some(b' ' | b'\t'))
-            {
+            let columns = if line.starts_with(b"---") && matches!(line.get(3), Some(b' ' | b'\t')) {
                 let content = line[3..]
                     .iter()
                     .position(|&b| b != b' ' && b != b'\t')
@@ -9941,7 +9937,6 @@ fn yq_position_preamble(text: &[u8]) -> (usize, usize) {
             };
             return (lines, columns);
         }
-        seen_marker |= bare_marker;
         pos += line_end
             + if line_end < rest.len() {
                 line_break_len(rest, line_end)

@@ -42,6 +42,14 @@ fn test_a_marker_after_content_or_an_empty_later_document_is_still_a_document_63
         ("a: 1\n---\n---\nb: 2\n", "{\"a\":1}\nnull\n{\"b\":2}\n"),
         ("x\n---\n---\ny\n", "\"x\"\nnull\n\"y\"\n"),
         ("---\nx\n---\n---\ny\n", "\"x\"\nnull\n\"y\"\n"),
+        // Only blanks and comments between the markers make the run: a property is content, though
+        // it writes no node, so the second marker starts the second document.
+        ("---\n&a\n---\nx\n", "null\n\"x\"\n"),
+        ("---\n!!str\n---\nx\n", "\"\"\n\"x\"\n"),
+        ("---\n&a !!str\n---\nx\n", "\"\"\n\"x\"\n"),
+        ("---\n&a x\n---\ny\n", "\"x\"\n\"y\"\n"),
+        // A property on the marker line is glued to the next marker (#6276): one document.
+        ("--- &a\n---\nx\n", "\"x\"\n"),
     ] {
         let (stdout, code) = run_yq_stdin(".", doc, JSON)?;
         assert_eq!((stdout.as_str(), code), (expected, 0), "{doc:?}");
@@ -77,6 +85,9 @@ fn test_the_run_is_document_zero_and_numbers_its_lines_from_the_content_6349() -
         ("---\n---\na: 1\n", "line", "1\n"),
         ("---\n# c\n---\nk: 1\nm: 2\n", ".m | line", "2\n"),
         ("---\n---\nk: 1\n", ".k | line", "1\n"),
+        // The content on a later marker line loses the marker and the blanks after it.
+        ("---\n--- k: 1\n", ".k | column", "4\n"),
+        ("---\n--- k: 1\n", ".k | line", "1\n"),
     ] {
         let (stdout, code) = run_yq_stdin(filter, doc, &[])?;
         let separated = stdout.replace("---\n", "");
