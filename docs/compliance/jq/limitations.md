@@ -7689,25 +7689,27 @@ The rows are pinned against jq 1.7.1 in `tests/jq_cli/i6423.rs`.
 
 ### A large counted repeat of a Unicode class is refused, where jq answers it (#6439)
 
-A pattern whose compiled form passes the `regex` crate's size limit is refused in jq's words: `try test("\\w{100000}") catch .` is `"Regex failure: Compiled regex exceeds size limit of 134217728 bytes."`, and jq 1.7.1 answers `false`.
+A pattern whose compiled form passes the `regex` crate's size limit is refused in jq's words: `try test("\\w{3000}") catch .` is `"Regex failure: Compiled regex exceeds size limit of 134217728 bytes."`, and jq 1.7.1 answers `false`.
 The crate writes a counted repeat out copy by copy, and a Unicode class is large (`\w` is about 700 ranges, each written as UTF-8 byte sequences), so the compiled program grows with the count times the class.
 Oniguruma keeps a counter instead: jq compiles `\w{100000}` in 2.6 MB of memory and no measurable time.
-The limit is 128 MiB, raised from the crate's 10 MiB, which refused `\w{1000}` (the `fancy-regex` route, for a look-around or an atomic group, takes the same limit).
+The limit is 128 MiB, raised from the crate's 10 MiB, which refused `\w{1000}`; the lazy-DFA cache limit is raised with it, and the `fancy-regex` route (a look-around or an atomic group) takes the same size limit.
 At 128 MiB `\w{1000}`, `\w{2500}`, `\d{5000}` and `.{100000}` are answered, and so are `a{100000}`, `[a-z]{100000}` and `(?:a|b){100000}`, which never needed more.
 `\w{3000}`, `\w{20000}`, `\w{100000}`, `(\w{1000}){20}` and `(?:\w{1000}){10}` are refused.
-The limit is not raised further, which ADR-0018 allows where matching the reference would take the host process down: a refused pattern allocates up to about three times the limit before the crate gives up.
-Measured on a release build (peak memory of the whole process and wall time, `try test(P)` on `"a"`):
+The limit is not raised further, which ADR-0018 allows where matching the reference would take the host process down: a refused pattern allocates several times the limit before the crate gives up.
+Measured on a release build, peak memory of the whole process and wall time of `try test(P)` on `"a"`:
 
-| pattern           | limit 10 MiB (before) | limit 128 MiB (now)     | limit 1 GiB                |
-|-------------------|-----------------------|-------------------------|----------------------------|
-| `\w{1000}`        | refused, 28 MB        | answered, 72 MB, 0.9 s  | answered                   |
-| `\w{2500}`        | refused, 25 MB        | answered, 222 MB, 0.4 s | answered                   |
-| `\w{3000}`        | refused, 24 MB        | refused, 461 MB, 1.6 s  | answered                   |
-| `\w{20000}`       | refused, 25 MB        | refused                 | answered, 2.6 GB           |
-| `\w{100000}`      | refused, 30 MB        | refused, 276 MB, 1.7 s  | refused, 1.6 GB            |
-| `.{100000}`        | refused, 27 MB        | answered, 134 MB, 0.2 s | answered                   |
+| pattern                | limit 10 MiB (before) | limit 128 MiB (now)      |
+|------------------------|-----------------------|--------------------------|
+| `\w{1000}`             | refused, 28 MB        | answered, 72 MB, 0.9 s   |
+| `\w{2500}`             | refused, 25 MB        | answered, 222 MB, 0.4 s  |
+| `.{100000}`            | refused, 27 MB        | answered, 134 MB, 0.2 s  |
+| `\w{3000}`             | refused, 24 MB        | refused, 441 MB, 2.1 s   |
+| `\w{100000}`           | refused, 30 MB        | refused, 276 MB, 1.7 s   |
+| `(?:(\w{3000})\|b*)+`  | refused               | refused, 764 MB, 2.0 s   |
 
-So the limit that answers every pattern jq answers is not a safe one for an untrusted pattern (`\w{20000}` takes 2.6 GB at 1 GiB, and `\w{100000}` needs more than 4 GiB).
+A pattern with a loop or a capture group is compiled once more for each rewrite that is tried, so its refusal peaks higher (the last row).
+At a limit of 1 GiB `\w{20000}` compiles in 2.6 GB and `\w{100000}` is still refused after 1.6 GB, so no limit that answers every pattern jq answers is safe for an untrusted pattern.
+Matching is slower than in jq where the compiled program is large: `\w{2500}$` over a 1 MB line takes 1.5 s here and 0.06 s in jq.
 A fix would need a counted repeat that is not written out (a loop counter), which the crate does not have.
 The refusal and the rows that are answered are pinned by `tests/jq_cli/i6439.rs`.
 `succinctly yq` is not affected: its patterns are Go's, which refuses a count past 1000.

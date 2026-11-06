@@ -33465,14 +33465,17 @@ fn std_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
 fn compile_std(pattern: &str) -> Result<regex::Regex, regex::Error> {
     regex::RegexBuilder::new(pattern)
         .size_limit(STD_REGEX_SIZE_LIMIT)
+        .dfa_size_limit(STD_REGEX_SIZE_LIMIT)
         .build()
 }
 
-/// How large a compiled program the `regex` crate may build for a jq pattern: 128 MiB, where its default
-/// is 10 MiB (#6439). The crate writes a counted repeat out copy by copy, and a Unicode class is large,
-/// so `\w{1000}` passes the default; Oniguruma, which keeps a counter, compiles `\w{100000}` in a few MB.
-/// At 128 MiB `\w{2500}` and `.{100000}` compile; a pattern past it is refused after allocating up to
-/// about 3.5 times the limit (measured), so the limit is not raised further (`docs/compliance/jq/limitations.md`).
+/// How large a compiled program, and how large a lazy-DFA cache, the `regex` crate may build for a jq
+/// pattern: 128 MiB each, where its default is 10 MiB (#6439). The crate writes a counted repeat out
+/// copy by copy and a Unicode class is large, so `\\w{1000}` passes the default; Oniguruma, which keeps
+/// a counter, compiles `\\w{100000}` in a few MB. At 128 MiB `\\w{2500}` and `.{100000}` compile. A
+/// pattern past it is refused after allocating several times the limit (up to about 760 MB measured),
+/// so the limit is not raised further (`docs/compliance/jq/limitations.md`). The cache limit goes with
+/// it: `\\w{2500}$` over a 1 MB line took 21 s with the default cache and 1.5 s with this one.
 #[cfg(feature = "regex")]
 const STD_REGEX_SIZE_LIMIT: usize = 128 << 20;
 
@@ -33612,6 +33615,7 @@ fn build_fancy_regex_at<S: EvalSemantics>(
         .find_not_empty(modes.not_empty)
         .backtrack_limit(FANCY_BACKTRACK_LIMIT)
         .delegate_size_limit(STD_REGEX_SIZE_LIMIT)
+        .delegate_dfa_size_limit(STD_REGEX_SIZE_LIMIT)
         .build()
         .ok()
 }

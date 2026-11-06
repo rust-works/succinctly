@@ -13,7 +13,13 @@ fn a_counted_repeat_of_a_unicode_class_past_the_size_limit_is_refused_in_jq_s_wo
 ) -> Result<()> {
     let pattern = r"\w{3000}";
     let (stdout, _, status) = run_jq_full(
-        &["-nc", "--arg", "p", pattern, r#""a" | try test($p) catch ."#],
+        &[
+            "-nc",
+            "--arg",
+            "p",
+            pattern,
+            r#""a" | try test($p) catch ."#,
+        ],
         None,
     )?;
     assert_eq!(
