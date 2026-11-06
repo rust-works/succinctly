@@ -592,15 +592,16 @@ and `TS54`. `DK95/00` (a tab used as separation before a plain scalar, retained 
 content instead of stripped) was fixed by
 [#381](https://github.com/rust-works/succinctly/issues/381).
 `DK95/04` (a line holding only a tab after `foo: 1`) is valid YAML 1.2 and refused by yq v4.53.3, which reports `found a tab character that violates indentation` when the tab is no deeper than the owning block, so it is refused here too ([#6286](https://github.com/rust-works/succinctly/issues/6286)).
-The same line after any other completed node (a flow collection, a quoted scalar, a comment, a key with no value, a property) is refused at every column ([#6295](https://github.com/rust-works/succinctly/issues/6295)), as is one before the first content line of a block scalar and one after a `...` end marker.
-A tab-only line in the head of the first document is yq's header and reads.
-`96NN/00`, `96NN/01`, `R4YG` and `Y79Y/001` (a block scalar line that holds a tab right after its spaces while the scalar's indent is not yet known) are valid YAML 1.2 and refused by yq (`found a tab character where an indentation space is expected`), so they are refused here too and listed as known failures.
 What remains under
 `scalars` is unrelated to folding: zero-indented block scalars (`DK3J`, `FP8R`, and
 `W4TN` — moved here from `directives` once #225 fixed the directive line that used to
 mask this same gap), trailing whitespace (`L24T/00`, `JEF9/02`), explicit indentation
 indicators (`M5C3`), and the empty stream (`AVM7`, filed under `scalars` although it
 is really a document-level case).
+
+`DK95/04`'s line, a line holding only a tab, is refused after any other completed node too (a flow collection, a quoted scalar, a comment, a key or `?` with no value, a property) at every column ([#6295](https://github.com/rust-works/succinctly/issues/6295)), as is one before the first content line of a block scalar and one after a `...` end marker.
+A tab-only line in the head of the first document is yq's header and reads, and so is one after an inline value on its `---` line (yq folds it onto that line).
+`96NN/00`, `96NN/01`, `R4YG` and `Y79Y/001` (a block scalar line that holds a tab right after its spaces while the scalar's indent is not yet known) are valid YAML 1.2 and refused by yq (`found a tab character where an indentation space is expected`), so they are refused here too and listed as known failures.
 
 ### `JEF9/02`: the one case where we follow `yq` over the suite
 

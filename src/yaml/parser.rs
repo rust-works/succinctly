@@ -2792,21 +2792,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             && super::line_is_structural(self.input, self.pos)
     }
 
-    /// #6286: the line at `line_start` is spaces, a tab and nothing else, the tab sits at a column no
-    /// deeper than the block that owns the plain scalar just before it, and only blank lines
-    /// separate the two. go-yaml refuses such a line (`found a tab character that violates
-    /// indentation`); to this parser it is an empty line, so the scalar scanner stops short of it,
-    /// [`Self::skip_newlines`] leaves it, and `parse_document_line` raises the error.
-    fn tab_only_line_ends_plain_scalar(&self, line_start: usize) -> bool {
-        let Some(indent) = self.tab_only_line_indent(line_start) else {
-            return false;
-        };
-        let Some(span) = self.last_plain_scalar else {
-            return false;
-        };
-        indent <= span.owner && self.plain_scalar_directly_before(line_start)
-    }
-
     /// The number of spaces before the tab of the line at `line_start` when that line is spaces, a tab
     /// and nothing else but blanks (#6286, #6295), `None` for any other line.
     fn tab_only_line_indent(&self, line_start: usize) -> Option<usize> {
@@ -2834,31 +2819,42 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         })
     }
 
-    /// [`Self::tab_only_line_after_completed_node`] for the line the cursor stopped at, for the sites
-    /// that look past a key's empty value and would otherwise take the line as that value's blank
-    /// prefix (#6295: `a:` / ` ⇥` is refused by yq, and read as `{"a": null}` here).
+    /// Whether go-yaml refuses the line at `line_start`, which is spaces, a tab and nothing else, where this
+    /// parser would read an empty line (#6286, #6295). The one decision for every site (`skip_newlines`,
+    /// `parse_document_line`, [`Self::reject_tab_only_line_at_cursor`]), with one scan of the line.
+    ///
+    /// go-yaml's `scan_to_next_token` skips a tab only where a simple key is not allowed, which is never
+    /// at the start of a block-context line, so it stops with `found a tab character that violates
+    /// indentation` at every column. The lines it does not reach are the ones a scalar scanner takes:
+    ///
+    /// - after a plain scalar the scanner consumes the blank lines itself, and refuses the tab only at a
+    ///   column no deeper than the block that owns the scalar (#6286);
+    /// - a block scalar's content takes it as text (it never reaches `skip_newlines`);
+    /// - in the head of the first document yq's header slurp takes the line away, so nothing before the
+    ///   first node of the first document refuses it. After anything else (a flow collection, a quoted
+    ///   scalar, a comment, an empty value, a property, a `---` that is not the first) it is refused.
+    fn tab_only_line_is_refused(&self, line_start: usize) -> bool {
+        let Some(indent) = self.tab_only_line_indent(line_start) else {
+            return false;
+        };
+        match self.last_plain_scalar {
+            Some(span) if self.plain_scalar_directly_before(line_start) => indent <= span.owner,
+            _ => self.documents_started > 1 || self.bp_pos > self.document_start_bp_pos,
+        }
+    }
+
+    /// [`Self::tab_only_line_is_refused`] for the line the cursor stopped at, for the sites that look
+    /// past an empty value or key and would otherwise take the line as its blank prefix (#6295: `a:` /
+    /// ` ⇥` is refused by yq, and was read as `{"a": null}`; `?` / ` ⇥` / `  a` as `{"a": null}` too).
     fn reject_tab_only_line_at_cursor(&self) -> Result<(), YamlError> {
         let at_line_start = self.pos == 0 || Self::is_break(self.input[self.pos - 1]);
-        if at_line_start && self.tab_only_line_after_completed_node(self.pos) {
+        if at_line_start && self.tab_only_line_is_refused(self.pos) {
             return Err(YamlError::TabIndentation {
                 line: self.current_line(),
                 offset: self.pos,
             });
         }
         Ok(())
-    }
-
-    /// #6295: the line at `line_start` is spaces, a tab and nothing else, and what lies before it is a
-    /// node that is complete: a flow collection, a quoted scalar, a comment, an empty value or a
-    /// property. go-yaml's `scan_to_next_token` skips a tab only where a simple key is not allowed,
-    /// which is never at the start of a block-context line, so it stops with `found a tab character
-    /// that violates indentation` at every column; to this parser the line is an empty one. A plain
-    /// scalar before it keeps its own rule (it consumes the blank lines itself, #6286), and a tab-only
-    /// line in the head of the first document is yq's header, which its slurp takes away.
-    fn tab_only_line_after_completed_node(&self, line_start: usize) -> bool {
-        self.tab_only_line_indent(line_start).is_some()
-            && !self.plain_scalar_directly_before(line_start)
-            && (self.documents_started > 1 || self.bp_pos > self.document_start_bp_pos)
     }
 
     /// Skip `s-separate-in-line` whitespace still sitting on the cursor after
@@ -3277,8 +3273,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 let start = self.pos;
                 // #6286: a tab-only line go-yaml refuses is left for the line dispatcher to reject.
                 if (start == 0 || Self::is_break(self.input[start - 1]))
-                    && (self.tab_only_line_ends_plain_scalar(start)
-                        || self.tab_only_line_after_completed_node(start))
+                    && self.tab_only_line_is_refused(start)
                 {
                     break;
                 }
@@ -5119,6 +5114,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             // Look ahead to determine if this is a null value or a nested structure
             self.skip_newlines();
+            self.reject_tab_only_line_at_cursor()?;
             if self.peek().is_none() {
                 // EOF - null value: emit empty value node
                 self.set_ib();
@@ -5733,6 +5729,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             // Look ahead to see what's on the next line
             self.skip_newlines();
+            self.reject_tab_only_line_at_cursor()?;
             if self.peek().is_none() {
                 // EOF - empty key (null) with implicit null value
                 // Emit empty key node using the position after `?`
@@ -8955,9 +8952,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             });
         }
 
-        if self.tab_only_line_ends_plain_scalar(line_start)
-            || self.tab_only_line_after_completed_node(line_start)
-        {
+        // The cursor is past the line's spaces: only a line whose next byte is the tab can be the one.
+        if self.peek() == Some(b'\t') && self.tab_only_line_is_refused(line_start) {
             return Err(YamlError::TabIndentation {
                 line: self.current_line(),
                 offset: self.pos,

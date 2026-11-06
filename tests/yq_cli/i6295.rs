@@ -38,6 +38,13 @@ fn test_a_tab_only_line_after_a_completed_node_is_refused_as_yq_refuses_it_6295(
         // After a `...` the gap is no header either.
         "---\na: 1\n...\n \t\n---\nb: 2\n",
         "---\na: 1\n...\n\t\n---\nb: 2\n",
+        // An explicit key with no content, and an empty value in a sequence item.
+        "?\n \t\n  a\n",
+        "?\n \t\n: b\n",
+        "- ?\n \t\n  a\n",
+        "- a:\n \t\n  b\n",
+        "- ? a\n \t\n  : b\n",
+        "- - a\n \t\n  - b\n",
         // Before the first content line of a block scalar the indent is not known yet.
         "a: |\n \t\n  x\n  y\nb: 1\n",
         "a: |\n  \t\n  x\n",
@@ -67,6 +74,15 @@ fn test_a_tab_only_line_that_yq_reads_still_reads_6295() -> Result<()> {
         ("? a\n \t\n: b\n", "{\"a\":\"b\"}"),
         // A block scalar's content takes it as text.
         ("a: >\n  x\n  \t\n", "{\"a\":\"x\\n\\t\\n\"}"),
+        // yq folds the line after a first `---` onto it, so what follows an inline value there is the
+        // value's own trailing blanks: not a line of its own.
+        ("--- [x]\n \t\n", "[\"x\"]"),
+        ("--- {a: 1}\n \t\n", "{\"a\":1}"),
+        ("--- \"x\"\n \t\n", "\"x\""),
+        ("--- a: [x]\n \t\n", "{\"a\":[\"x\"]}"),
+        ("--- |\n \t\n  x\n", "\"x\\n\""),
+        ("--- >\n\t\n  x\n", "\"x\\n\""),
+        ("? a\n \t\n: b\n", "{\"a\":\"b\"}"),
         // A flow collection is not block context.
         ("a: [\n \t\nx]\n", "{\"a\":[\"x\"]}"),
         ("a: {\n \t\nb: 1}\n", "{\"a\":{\"b\":1}}"),
