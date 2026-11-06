@@ -666,13 +666,20 @@ struct Parser<'a, const HAS_CR: bool> {
     /// a pre-existing gap #2777 closed as a side effect of requiring a
     /// specific key/value shape, not a deliberate new check.)
     json_strict: bool,
-    /// Reads a run of leading `---` markers as one document (#6349), as yq's header slurp does: it
-    /// sets aside every leading blank, comment, directive and `---` line before the first content
-    /// line, so `---` / `---` / `x` is the one document `x` where YAML reads a null document and
-    /// then `x`. Set for the input `succinctly yq` reads (see
+    /// Reads the stream as yq does, for the input `succinctly yq` reads (see
     /// [`YamlIndex::build_yq`](crate::yaml::YamlIndex::build_yq)); the library loader keeps the
-    /// spec's reading.
-    yq_leading_marker_run: bool,
+    /// spec's reading. Three things differ, all from yq's header slurp, which sets aside every
+    /// leading blank, comment, `%YAML` directive and `---` line before the first content line:
+    ///
+    /// - a run of leading `---` markers is one document (#6349): `---` / `---` / `x` is the one
+    ///   document `x` where YAML reads a null document and then `x`;
+    /// - a `...` met while that head is all the stream holds is an error (#6342): go-yaml is
+    ///   handed the `...` as the first token of an implicit document, which has no node to hold;
+    /// - a stream of only that head, directives included, is one null document (#6342).
+    yq_mode: bool,
+    /// Whether a directive other than `%YAML` was skipped (#6342): `%TAG` and the rest are not
+    /// set aside by yq's slurp, so go-yaml sees them and wants a `---` after them.
+    saw_non_header_directive: bool,
     /// How many documents `start_document` has started: the leading run only ever merges into the
     /// first (`a: 1` / `---` / `---` / `b: 2` is three documents in yq as in YAML).
     documents_started: usize,
@@ -756,7 +763,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             pending_explicit_key_below: Vec::new(),
             nesting_depth: 0,
             json_strict: false,
-            yq_leading_marker_run: false,
+            yq_mode: false,
+            saw_non_header_directive: false,
             documents_started: 0,
             leading_run_from: 0,
             #[cfg(debug_assertions)]
@@ -2888,6 +2896,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// The number of spaces before the tab of the line at `line_start` when that line is spaces, a tab
     /// and nothing else but blanks (#6286, #6295), `None` for any other line.
     fn tab_only_line_indent(&self, line_start: usize) -> Option<usize> {
+        let (indent, at) = self.tab_led_blank_prefix(line_start)?;
+        (at >= self.input.len() || is_line_break(self.input[at])).then_some(indent)
+    }
+
+    /// [`Self::tab_only_line_indent`] for a line that goes on to a `#` comment after its blanks (#6342):
+    /// in the head of the first document that is a comment line to yq's slurp, as a space-led one is.
+    fn tab_comment_line_indent(&self, line_start: usize) -> Option<usize> {
+        let (indent, at) = self.tab_led_blank_prefix(line_start)?;
+        (self.input.get(at) == Some(&b'#')).then_some(indent)
+    }
+
+    /// The blanks a line opens with when they are spaces and then a tab (and any blanks after it):
+    /// the number of spaces, and where the blanks end. `None` for a line with no tab among them.
+    fn tab_led_blank_prefix(&self, line_start: usize) -> Option<(usize, usize)> {
         let mut at = line_start;
         while self.input.get(at) == Some(&b' ') {
             at += 1;
@@ -2899,7 +2921,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         while matches!(self.input.get(at), Some(b' ' | b'\t')) {
             at += 1;
         }
-        (at >= self.input.len() || is_line_break(self.input[at])).then_some(indent)
+        Some((indent, at))
     }
 
     /// Whether the last plain scalar ends at or before `line_start` with only blank lines between.
@@ -3394,11 +3416,22 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 && (self.pos == 0 || Self::is_break(self.input[self.pos - 1]))
                 && self.documents_started <= 1
                 && self.bp_pos == self.document_start_bp_pos
-                && self.tab_only_line_indent(self.pos).is_some()
+                && (self.tab_only_line_indent(self.pos).is_some()
+                    || (self.yq_mode
+                        && self.tab_comment_line_indent(self.pos).is_some()
+                        && self.only_yq_header_lines_before_cursor()))
             {
                 // #6295: a tab-only line in the head of the first document is yq's header, which its
-                // slurp takes away (`---` / `⇥` / `a: 1`): an empty line, as a space-led one is.
+                // slurp takes away (`---` / `⇥` / `a: 1`): an empty line, as a space-led one is. A tab
+                // before a comment is the same (#6342): the stream `⇥ # c` is one null document.
                 self.skip_inline_whitespace();
+            } else if b == b'%' && self.at_yq_head_yaml_directive() {
+                // #6342: a `%YAML` line after the head's `---` is yq's header too, which its slurp sets
+                // aside up to the first content line (`---` / `%YAML 1.2` / `a: 1`), and prints back
+                // as it was written, as a comment does.
+                let start = self.pos;
+                self.skip_to_eol();
+                self.record_standalone_comment(start, self.pos);
             } else if b == b' ' {
                 // Check if rest of line is whitespace or comment
                 let start = self.pos;
@@ -3648,6 +3681,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.skip_directive_gap_whitespace()?;
             if self.in_document || self.peek() != Some(b'%') {
                 break;
+            }
+            if !self.input[self.pos..].starts_with(b"%YAML") {
+                self.saw_non_header_directive = true;
             }
             self.skip_to_eol();
             self.skip_line_break();
@@ -8844,6 +8880,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Skip any `%YAML`/`%TAG`/reserved directive lines before the first
         // document (#225).
         self.skip_directives()?;
+        if self.yq_mode && self.saw_non_header_directive && !self.is_document_start() {
+            return Err(self.err_directive_without_document_start());
+        }
 
         // Skip leading `---` if present (optional for first doc)
         if self.is_document_start() {
@@ -8865,6 +8904,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Check if file is empty after markers
         if self.peek().is_none() {
             // Empty YAML - nothing to parse
+            if self.yq_mode && !self.in_document && self.documents_started == 0 {
+                self.yq_directive_only_stream();
+            }
             return Ok(());
         }
 
@@ -8887,6 +8929,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             // Check for document end marker
             if self.is_document_end() {
+                if self.yq_mode && self.yq_head_holds_nothing_before_end_marker() {
+                    return Err(
+                        self.err_unexpected_char(self.pos, "did not find expected node content")
+                    );
+                }
                 self.end_document();
                 self.skip_document_marker();
 
@@ -8936,11 +8983,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             if self.is_document_start() {
                 // #6349: a marker while the first document has written nothing (only comments and
                 // blank lines since its own `---`) is more of yq's header, not another document.
-                if self.yq_leading_marker_run
+                if self.yq_mode
                     && self.in_document
                     && self.documents_started == 1
                     && self.bp_pos == self.document_start_bp_pos
-                    && self.only_blank_or_comment_lines_since(self.leading_run_from)
+                    && self.only_yq_header_lines_since(self.leading_run_from)
                 {
                     self.skip_document_marker();
                     self.leading_run_from = self.pos;
@@ -8972,16 +9019,95 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
-    /// Whether `input[from..self.pos]` holds nothing but blanks, line breaks and `#` comments: the
-    /// text between a leading `---` and the next one when the second is more of yq's header
-    /// (#6349). A node property (`&a`, `!!str`) is not, though it writes no node of its own.
-    fn only_blank_or_comment_lines_since(&self, from: usize) -> bool {
+    /// Whether the cursor is on a `%YAML` line in the head of a yq stream, after the first document's
+    /// leading `---` (#6342): yq's slurp sets it aside like a comment (before the `---` it is a
+    /// directive, which `skip_directives` skips).
+    fn at_yq_head_yaml_directive(&self) -> bool {
+        self.yq_mode
+            && self.documents_started == 1
+            && self.in_document
+            && self.bp_pos == self.document_start_bp_pos
+            && (self.pos == 0 || Self::is_break(self.input[self.pos - 1]))
+            && self.input[self.pos..].starts_with(b"%YAML")
+            && self.only_yq_header_lines_before_cursor()
+    }
+
+    /// Whether everything before the cursor, from the start of the stream or of the first document's
+    /// last leading `---`, is a line yq's slurp sets aside (#6342). A node property (`!!str`) writes no
+    /// node here, but it is content to go-yaml, which then refuses a tab-led line after it where the
+    /// slurp would have taken it.
+    fn only_yq_header_lines_before_cursor(&self) -> bool {
+        // A directive other than `%YAML` is not set aside, so the lines after it are go-yaml's.
+        !self.saw_non_header_directive
+            && self.only_yq_header_lines_since(if self.documents_started == 0 {
+                0
+            } else {
+                self.leading_run_from
+            })
+    }
+
+    /// Whether a `...` at the cursor is the first token go-yaml would see (#6342): yq's header slurp
+    /// has set aside everything before it (blank and comment lines, `%YAML` directives and a run of
+    /// leading `---` markers), so the marker opens an implicit document and has no node to close.
+    /// `a: 1` / `---` / `...` is not this: that `---` is not in the head, go-yaml reads it, and the
+    /// document it starts is empty by the spec. Nor is `!!str` / `...`: a property is a node, an
+    /// empty scalar, though it writes none here, so the head is read as text.
+    ///
+    /// A directive other than `%YAML` stays with go-yaml, whose explicit document start then makes
+    /// the `...` an empty document's end, so it is not this either.
+    fn yq_head_holds_nothing_before_end_marker(&self) -> bool {
+        if self.saw_non_header_directive {
+            return false;
+        }
+        match self.documents_started {
+            0 => !self.in_document,
+            1 => {
+                self.in_document
+                    && self.bp_pos == self.document_start_bp_pos
+                    && self.only_yq_header_lines_since(self.leading_run_from)
+            }
+            _ => false,
+        }
+    }
+
+    /// The refusal for a directive other than `%YAML` that no `---` follows (#6342): yq's slurp
+    /// leaves `%TAG` and the rest to go-yaml, which wants a document start after them.
+    fn err_directive_without_document_start(&self) -> YamlError {
+        const CONTEXT: &str = "did not find expected <document start>";
+        if self.peek().is_some() {
+            self.err_unexpected_char(self.pos, CONTEXT)
+        } else {
+            YamlError::UnexpectedEof { context: CONTEXT }
+        }
+    }
+
+    /// The end of a yq stream with no document and no marker (#6342). yq's slurp sets aside a
+    /// `%YAML` line like a comment, so a stream of only those is the one null document its comments
+    /// and directives are the head of, as a stream of only comments is (`parse`).
+    fn yq_directive_only_stream(&mut self) {
+        debug_assert!(!self.saw_non_header_directive);
+        self.start_document();
+        self.end_document();
+    }
+
+    /// Whether `input[from..self.pos]` holds nothing but the lines yq's header slurp sets aside:
+    /// blanks, line breaks, `#` comments and `%YAML` directive lines (#6342). It is the text between
+    /// a leading `---` and the next one when the second is more of yq's header (#6349). A node
+    /// property (`&a`, `!!str`) is not header, though it writes no node of its own.
+    fn only_yq_header_lines_since(&self, from: usize) -> bool {
         let mut i = from;
         let end = self.pos.min(self.input.len());
         while i < end {
             match self.input[i] {
                 b' ' | b'\t' | b'\n' | b'\r' => i += 1,
                 b'#' => {
+                    while i < end && !matches!(self.input[i], b'\n' | b'\r') {
+                        i += 1;
+                    }
+                }
+                b'%' if self.input[i..].starts_with(b"%YAML")
+                    && (i == 0 || Self::is_break(self.input[i - 1])) =>
+                {
                     while i < end && !matches!(self.input[i], b'\n' | b'\r') {
                         i += 1;
                     }
@@ -10191,7 +10317,7 @@ pub fn build_semi_index(input: &[u8]) -> Result<SemiIndex, YamlError> {
 }
 
 /// [`build_semi_index`] for the input `succinctly yq` reads: a run of leading `---` markers is one
-/// document, as in yq (#6349). See `Parser::yq_leading_marker_run`.
+/// document, as in yq (#6349). See `Parser::yq_mode`.
 ///
 /// # Errors
 ///
@@ -10200,7 +10326,7 @@ pub fn build_semi_index_yq(input: &[u8]) -> Result<SemiIndex, YamlError> {
     build_semi_index_impl(
         input,
         BuildMode {
-            yq_leading_marker_run: true,
+            yq_mode: true,
             ..BuildMode::default()
         },
     )
@@ -10235,8 +10361,8 @@ pub fn build_semi_index_json_strict(input: &[u8]) -> Result<SemiIndex, YamlError
 struct BuildMode {
     /// `Parser::json_strict`.
     json_strict: bool,
-    /// `Parser::yq_leading_marker_run`.
-    yq_leading_marker_run: bool,
+    /// `Parser::yq_mode`.
+    yq_mode: bool,
 }
 
 fn build_semi_index_impl(input: &[u8], mode: BuildMode) -> Result<SemiIndex, YamlError> {
@@ -10257,12 +10383,12 @@ fn build_semi_index_impl(input: &[u8], mode: BuildMode) -> Result<SemiIndex, Yam
     if crate::util::simd::escape::contains_cr(input) {
         let mut p = Parser::<true>::new(input);
         p.json_strict = mode.json_strict;
-        p.yq_leading_marker_run = mode.yq_leading_marker_run;
+        p.yq_mode = mode.yq_mode;
         p.parse()
     } else {
         let mut p = Parser::<false>::new(input);
         p.json_strict = mode.json_strict;
-        p.yq_leading_marker_run = mode.yq_leading_marker_run;
+        p.yq_mode = mode.yq_mode;
         p.parse()
     }
 }
