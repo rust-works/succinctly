@@ -263,12 +263,11 @@ const DUMP_KEEP_WIDE: usize = 26;
 /// and split the two conventions apart, so the correct writer is now available
 /// by name.)
 ///
-/// One deviation remains, about where the dump is cut rather than what gets
-/// dumped: jq cuts at a byte offset and can therefore split a multi-byte
-/// character, emitting invalid UTF-8; a Rust `String` cannot hold that, so we
-/// snap back to the nearest character boundary. The two agree except when a
-/// multi-byte character straddles byte `DUMP_KEEP` of the dump — see
-/// `docs/compliance/jq/limitations.md`.
+/// Where the cut falls: jq cuts at a byte offset and can therefore split a
+/// multi-byte character, which building the message as a `jv` string turns
+/// into one U+FFFD. The sink snaps back to the character boundary and
+/// [`dump_truncated_at`] writes that U+FFFD (#6434), so the two
+/// agree byte for byte — see `docs/compliance/jq/limitations.md`.
 ///
 /// jq-pinned shim (#1055): delegates to [`dump_truncated_with`] fixed at
 /// [`EvalTag::Jq`]. Migrate a call site to `dump_truncated_with(S::TAG, ..)`
@@ -317,7 +316,12 @@ fn dump_truncated_at(tag: EvalTag, value: &OwnedValue, budget: usize, keep: usiz
     if !sink.overflowed {
         return sink.buf;
     }
-    sink.truncate_to(keep);
+    // #6434: jq copies `keep` bytes and builds the message as a `jv` string, which replaces a
+    // character the cut split with one U+FFFD. yq never cuts a value in its messages; the
+    // yq-mode messages that do are jq's convention (the shims above), so the rule is one.
+    if sink.truncate_to(keep) {
+        sink.buf.push(char::REPLACEMENT_CHARACTER);
+    }
     sink.buf.push_str("...");
     sink.buf
 }
@@ -348,8 +352,8 @@ fn stream_value_preview<W: core::fmt::Write>(
 ///   JSON string arrives from the streaming writer as one span, so clamping the
 ///   copy — not just refusing later writes — is what actually bounds the work.
 /// * `buf` stays valid UTF-8: an oversized span is cut back to a `char`
-///   boundary. jq's `strncpy` emits the split bytes instead, which is the one
-///   place the preview is allowed to come out shorter than jq's.
+///   boundary. jq's `strncpy` keeps the split bytes, which its message then
+///   holds as one U+FFFD; [`dump_truncated_at`] writes it (#6434).
 struct PreviewSink {
     /// The retained prefix; never longer than `cap`, always valid UTF-8.
     buf: String,
@@ -368,11 +372,13 @@ impl PreviewSink {
         }
     }
 
-    /// Cut `buf` back to at most `len` bytes, on a `char` boundary.
-    fn truncate_to(&mut self, len: usize) {
-        let cut = len.min(self.buf.len());
-        let cut = floor_char_boundary(&self.buf, cut, 0);
+    /// Cut `buf` back to at most `len` bytes, on a `char` boundary, and say whether the cut split
+    /// a character (so that bytes short of `len` were dropped with it).
+    fn truncate_to(&mut self, len: usize) -> bool {
+        let want = len.min(self.buf.len());
+        let cut = floor_char_boundary(&self.buf, want, 0);
         self.buf.truncate(cut);
+        cut < want
     }
 }
 
@@ -2018,10 +2024,20 @@ mod tests {
     }
 
     #[test]
-    fn dump_truncation_snaps_back_off_a_character_boundary() {
-        // jq would cut mid-character here and emit invalid UTF-8; we keep one
-        // byte fewer so the message stays a valid Rust string.
-        assert_eq!(dump_truncated(&s("あああああ")), "\"あああ...");
+    fn dump_truncation_that_splits_a_character_writes_one_replacement_6434() {
+        // jq cuts mid-character here, and its message holds U+FFFD where the partial character
+        // was (`"あああ\u{FFFD}...`, one replacement whatever is left of the character).
+        assert_eq!(dump_truncated(&s("あああああ")), "\"あああ\u{FFFD}...");
+        assert_eq!(dump_truncated(&s("a😀😀😀")), "\"a😀😀\u{FFFD}...");
+        assert_eq!(dump_truncated(&s("abc😀😀😀")), "\"abc😀\u{FFFD}...");
+        assert_eq!(dump_truncated(&s("abcd😀😀😀")), "\"abcd😀\u{FFFD}...");
+        // A cut on a boundary writes none.
+        assert_eq!(dump_truncated(&s("ab😀😀😀")), "\"ab😀😀...");
+        // One rule in both modes: a yq-mode message that cuts a value uses jq's convention.
+        assert_eq!(
+            dump_truncated_with(EvalTag::Yq, &s("あああああ")),
+            "\"あああ\u{FFFD}..."
+        );
     }
 
     /// The preview must cost a bounded amount of work, not a copy of the value.

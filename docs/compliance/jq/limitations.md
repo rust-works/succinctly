@@ -200,25 +200,22 @@ jq: error (at <unknown>): Invalid path expression near attempt to access element
                                                                              # key: still 11 bytes
 ```
 
-## Truncation that splits a multi-byte character
+## Truncation that splits a multi-byte character: matched (#6434)
 
-jq cuts the dump at a byte offset and will happily split a UTF-8 sequence, emitting
-invalid UTF-8:
+jq cuts the dump at a byte offset and will split a UTF-8 sequence. The message is then built as a `jv` string, which replaces the partial sequence with one U+FFFD (`ef bf bd`), whether one, two or three bytes of the character were kept:
 
 ```bash
 $ echo '"あああああ"' | jq '.[]' | cat -v
 jq: error (at <stdin>:1): Cannot iterate over string ("M-cM-^AM-^BM-cM-^AM-^BM-cM-^AM-^BM-oM-?M-=...)
-                                                     # "あああ + a lone 0xE3 byte
+                                                     # "あああ, then U+FFFD (M-oM-?M-=)
 ```
 
-A Rust `String` cannot hold that, so `dump_truncated` snaps back to the nearest character
-boundary and emits `"あああ...` — one byte shorter, no replacement character. The two
-agree whenever the cut lands on a boundary, which includes every 2-byte character
-(`"ααααα...`, exactly 11 bytes).
-
-This case is deliberately **absent from the probe corpus**: the captured table is a UTF-8
-file read with `include_str!`, so jq's byte-exact output here is not representable. It is
-recorded in prose instead rather than dropped silently.
+`dump_truncated` cuts back to the character boundary and writes that U+FFFD before the `...`, so `try (.[]) catch .` on `"abc😀😀😀"` is `"Cannot iterate over string (\"abc😀�...)"` in both.
+It applies at the wide `path()` budget too.
+The `succinctly yq` messages that embed a cut value (`keys` of a string, `tonumber` of an object) are jq's wording, not yq's, and get the same U+FFFD.
+A cut that lands on a boundary writes none (`"ααααα...`, exactly 11 bytes).
+Before #6434 this page said jq emitted the lone invalid byte, and `succinctly jq` dropped the partial character without a replacement.
+Pinned in `src/jq/error.rs` (`dump_truncation_that_splits_a_character_writes_one_replacement_6434`) and `tests/jq_cli/i6434.rs`.
 
 ## jq's own UTF-8 replacement-character substitution: matched, at each caller's own granularity
 
