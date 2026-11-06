@@ -1186,6 +1186,19 @@ fn is_static_target(expr: &Expr) -> bool {
         }
         Expr::Alternative(left, right) => is_static_target(left) && is_static_target(right),
         Expr::Builtin(Builtin::Select(cond)) => is_value_only_condition(cond),
+        // The jq-defined `select(type == ...)` family: `nulls`, `strings`, `iterables`, ... keep `.`
+        // or drop it by its type, with no condition that could reach back into the paths.
+        Expr::Builtin(
+            Builtin::Nulls
+            | Builtin::Booleans
+            | Builtin::Numbers
+            | Builtin::Strings
+            | Builtin::Arrays
+            | Builtin::Objects
+            | Builtin::Iterables
+            | Builtin::Scalars
+            | Builtin::Values,
+        ) => true,
         _ => false,
     }
 }
