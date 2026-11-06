@@ -34,6 +34,10 @@ fn test_from_yaml_applies_the_header_slurp_to_its_string_6363() -> Result<()> {
         ("a: 1\n---\n---\nb: 2", "{\"a\":1}\n"),
         ("---\n&a\n---\nx", "null\n"),
         ("a: 1", "{\"a\":1}\n"),
+        // Only the first document is read, and a string that is no header reads as before.
+        ("a: 1\n---\nb: 2", "{\"a\":1}\n"),
+        ("a: &x 1\nb: *x", "{\"a\":1,\"b\":1}\n"),
+        ("- &a [1]\n- *a", "[[1],[1]]\n"),
         ("x\ny", "\"x y\"\n"),
     ] {
         for builtin in ["from_yaml", "from_json"] {
