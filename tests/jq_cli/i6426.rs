@@ -112,6 +112,15 @@ fn a_loop_with_capture_groups_beside_a_lookaround_or_atomic_group_answers_as_jq_
             "g",
             r#"[[0,"abab",["a"]],[4,"",[""]]]"#,
         ),
+        ("(?=b)(b*|a)*", "ba", "g", r#"[[0,"b",[""]]]"#),
+        ("(?=b)(b*|a)*", "bab", "g", r#"[[0,"b",[""]],[2,"b",[""]]]"#),
+        (
+            "(?=b|a)(b*|a)+",
+            "bab",
+            "g",
+            r#"[[0,"b",[""]],[1,"",[""]],[2,"b",[""]]]"#,
+        ),
+        ("(?=a|b)(b*|a)*", "ba", "g", r#"[[0,"b",[""]],[1,"",[""]]]"#),
     ] {
         assert_matches(pattern, input, flags, expected)?;
     }
