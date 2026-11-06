@@ -545,6 +545,14 @@ struct Parser<'a, const HAS_CR: bool> {
     /// [`Self::set_pending_explicit_key`].
     pending_explicit_key_empty: bool,
 
+    /// The explicit keys still waiting for a value *behind* the one in
+    /// [`Self::pending_explicit_key`], outermost first, as `(owner depth, empty)`
+    /// pairs, the next one to be handed back last. A key whose own content is an explicit key (`? ? a\n  : b\n: c`, #6322) opens
+    /// a mapping that has a `?` of its own: the inner key's `:` has to find the inner owner,
+    /// and the outer key's `:` has to find the outer one once the inner mapping has closed.
+    /// [`Self::clear_pending_explicit_key`] hands the next one back.
+    pending_explicit_key_below: Vec<(usize, bool)>,
+
     /// Current depth of recursively-parsed constructs, capped at
     /// [`MAX_NESTING_DEPTH`] to bound call-stack growth
     nesting_depth: usize,
@@ -731,6 +739,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     || crate::util::simd::escape::contains_byte(input, 0xE2)),
             last_plain_scalar: None,
             pending_explicit_key_empty: false,
+            pending_explicit_key_below: Vec::new(),
             nesting_depth: 0,
             json_strict: false,
             yq_leading_marker_run: false,
@@ -2347,8 +2356,38 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// emptiness (#1104).
     #[inline]
     fn set_pending_explicit_key(&mut self, owner_depth: usize, empty: bool) {
+        // A key still waiting in a mapping *below* this one is an outer key whose own content is
+        // this mapping (`? ? ? a⏎  ? y⏎: c`, #6322): it waits behind the new one.
+        if let Some(waiting) = self.pending_explicit_key {
+            if waiting < owner_depth {
+                self.wait_behind_pending_explicit_key(waiting, self.pending_explicit_key_empty);
+            }
+        }
         self.pending_explicit_key = Some(owner_depth);
         self.pending_explicit_key_empty = empty;
+    }
+
+    /// Records the explicit key of the mapping at `owner_depth` as waiting behind the pending one
+    /// ([`Self::pending_explicit_key_below`]). The one place that list is added to: it is kept in
+    /// order of owner depth, so the last entry is the nearest outer key whichever order the keys
+    /// are found in (a nested key returns after the keys inside it, a key added to a mapping
+    /// above one that waits is found before it).
+    fn wait_behind_pending_explicit_key(&mut self, owner_depth: usize, empty: bool) {
+        let at = self
+            .pending_explicit_key_below
+            .partition_point(|&(depth, _)| depth < owner_depth);
+        self.pending_explicit_key_below
+            .insert(at, (owner_depth, empty));
+    }
+
+    /// The pending explicit key has its value (or its null): the one behind it, if a nested
+    /// key left one ([`Self::pending_explicit_key_below`]), is the one waiting now.
+    #[inline]
+    fn clear_pending_explicit_key(&mut self) {
+        match self.pending_explicit_key_below.pop() {
+            Some((owner_depth, empty)) => self.set_pending_explicit_key(owner_depth, empty),
+            None => self.pending_explicit_key = None,
+        }
     }
 
     /// Whether a `-` line at `indent` would land directly after an explicit
@@ -2407,7 +2446,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // Use input.len() as the text position to indicate "no text" / null value
             self.write_bp_open_at(self.input.len());
             self.write_bp_close();
-            self.pending_explicit_key = None;
+            self.clear_pending_explicit_key();
         }
     }
 
@@ -3350,6 +3389,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// This doesn't open a container - the document IS its content.
     fn start_document(&mut self) {
         self.in_document = true;
+        // Every frame of the closing document has been closed, each key with its value or null.
+        self.pending_explicit_key_below.clear();
         // The document that's closing, if any -- `document_start_bp_pos`
         // still holds its root right up until the overwrite below.
         // `seen_any_document` is the only way to tell "no previous document"
@@ -3946,7 +3987,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// Close containers that are at higher indent levels.
     fn close_deeper_indents(&mut self, new_indent: usize) {
-        while self.indent_stack.len() > 1 {
+        self.close_deeper_indents_above(new_indent, 1);
+    }
+
+    /// [`Self::close_deeper_indents`], leaving the `keep` frames at the bottom of the stack open
+    /// whatever their indent: the root sentinel alone (`keep` is 1) for the ordinary close, and
+    /// up to a nested key's outer owner for #6322.
+    fn close_deeper_indents_above(&mut self, new_indent: usize, keep: usize) {
+        while self.indent_stack.len() > keep {
             let current_indent = *self.indent_stack.last().unwrap();
             // Only close containers that are DEEPER than the new indent.
             // Containers at the same level should stay open so new entries
@@ -4391,7 +4439,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // with `close_pending_explicit_key` rather than
                 // re-deriving it here (#106).
                 if self.pending_explicit_key_owns_current_frame() {
-                    self.pending_explicit_key = None;
+                    self.clear_pending_explicit_key();
                 }
             }
         }
@@ -5643,7 +5691,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let mut bare_colon_key = self.at_bare_colon();
 
         // Check for a property before the key
-        self.parse_node_properties()?;
+        let mut key_has_properties = self.parse_node_properties()?;
 
         // Standalone comments attach to the key node (#798), which every
         // arm below opens at `self.bp_pos` -- inline, on a later line, or
@@ -5729,12 +5777,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.advance_by(next_indent);
             // #6325: and a bare `: ` opening the key's content on the line below (`?⏎  : x`).
             bare_colon_key = self.at_bare_colon();
+            // Properties on the `?` line then belong to the node on this line, which they may
+            // stand before (`? !!str⏎  ? a`).
+            key_has_properties = false;
             // Node properties on the content line belong to the key, as on the `?` line. When
             // they stand alone on it the key content is a further line down, which the main loop
             // reads as it always has.
             if matches!(self.peek(), Some(b'&' | b'!')) {
                 let properties_start = self.pos;
-                self.parse_node_properties()?;
+                key_has_properties = self.parse_node_properties()? || key_has_properties;
                 if self.at_line_end() {
                     self.pos = properties_start;
                     return Ok(());
@@ -5797,6 +5848,25 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     }
                 }
                 self.write_bp_close(); // close item
+            }
+            // `? ? a`: the node after `? ` is a compact mapping whose first entry is an explicit
+            // key of its own, so the outer key *is* that mapping (#6322; yq reads `? ? a\n: c` as
+            // `{"": "c"}`, where this used to read the plain scalar `? a`). The inner `?` is the
+            // key now waiting for a value; the outer one waits behind it until the inner mapping
+            // closes ([`Self::pending_explicit_key_below`]).
+            Some(b'?') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
+                // Properties on the line before it (`? !!str ? a`) are refused by yq (`mapping key
+                // is not allowed in this context`), which a property on a compact mapping's own
+                // first entry is not.
+                if key_has_properties {
+                    return Err(self.err_unexpected_char(
+                        self.pos,
+                        "mapping key is not allowed in this context",
+                    ));
+                }
+                self.parse_explicit_key(self.current_column())?;
+                self.wait_behind_pending_explicit_key(owner_depth, false);
+                return Ok(());
             }
             // `? [1, 2]: value`: the node after `? ` is a compact mapping keyed by
             // the flow collection, so the explicit key *is* that mapping and the
@@ -5926,6 +5996,25 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // compact mapping out from under it.
         let indent = self.resolve_compact_mapping_gap_indent(indent);
 
+        // #6322: a `:` shallower than the nested key still waiting for its value (`? ? a\n: c`)
+        // is the outer key's: the inner mapping closes first, its key taking a null, and the outer
+        // key is the one waiting. Only when a nested key waits: for any other key a shallower `:`
+        // is misaligned with its `?`, which the check below refuses.
+        while let Some(&(outer_owner, _)) = self.pending_explicit_key_below.last() {
+            if !self.pending_explicit_key.is_some_and(|owner_depth| {
+                self.indent_stack
+                    .get(owner_depth - 1)
+                    .is_some_and(|&at| at > indent)
+            }) {
+                break;
+            }
+            let open = self.indent_stack.len();
+            self.close_deeper_indents_above(indent, outer_owner);
+            if self.indent_stack.len() == open {
+                break;
+            }
+        }
+
         // Same ambiguous-column error for a `:` that doesn't match its own
         // `?` (#1010) -- checked against the #885-resolved `indent` above,
         // not the raw column, so that normalization's tolerance stays intact.
@@ -5935,7 +6024,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.close_deeper_indents(indent + 1);
 
         // This value is for the pending explicit key
-        self.pending_explicit_key = None;
+        self.clear_pending_explicit_key();
 
         // Skip `:`
         self.advance();
