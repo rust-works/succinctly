@@ -7726,7 +7726,7 @@ A match that ends before the end of the text cannot have used it, so a text with
 `$` already agrees (`"a\n"` gives `[1,2]` in both).
 A pattern the `regex` crate's parser does not read (a look-around, a backreference) and that has a `^` under `(?m)` keeps the crate's reading on the route it takes; the `fancy-regex` route writes the `^` as above for any pattern the AST reads.
 A pattern `fancy-regex` refuses keeps the match of the crate.
-Pinned by `tests/jq_cli/i6456.rs` (95 rows read from jq 1.7.1); a differential of 333 subject and pattern pairs, 159 of which differed before, agrees.
+Pinned by `tests/jq_cli/i6456.rs` (110 rows read from jq 1.7.1) and, for yq, `tests/yq_cli/i6456.rs`; a differential of 333 subject and pattern pairs, 159 of which differed before, agrees.
 
 ### A group repeated `{0}` keeps its capture entry (#6108)
 

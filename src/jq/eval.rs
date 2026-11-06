@@ -28160,12 +28160,12 @@ impl JqRegex {
         }
         match &self.engine {
             RegexEngine::Std(re) | RegexEngine::Rewritten { re, .. } => {
-                let matched = dv_is_match(re, input, self.needs_trailing_nl_check);
-                if matched && self.caret_end.is_some() && ends_with_trailing_newline(input) {
-                    // The match may stand on a `^` at the end of the text, which is not one.
+                if self.caret_end.is_some() && ends_with_trailing_newline(input) {
+                    // A match may stand on a `^` at the end of the text, which is not one: the
+                    // search that checks it is the only one run.
                     return Ok(self.captures_at(input, 0)?.is_some());
                 }
-                Ok(matched)
+                Ok(dv_is_match(re, input, self.needs_trailing_nl_check))
             }
             RegexEngine::Fancy(re) => re.is_match(input).map_err(fancy_match_error),
         }
@@ -139702,9 +139702,6 @@ mod tests {
         }
     }
 
-    /// #6106: a loop rewritten for Oniguruma's empty-iteration exit is what the `regex` crate
-    /// compiles, and a rewrite the crate refuses (here, nested past its limit) falls back to the
-    /// pattern as written instead of becoming an error.
     #[cfg(feature = "regex")]
     #[test]
     fn a_caret_under_multiline_is_found_where_the_flag_holds_6456() {
@@ -139729,6 +139726,9 @@ mod tests {
         assert_eq!(rewrite_multiline_caret("^a"), None);
     }
 
+    /// #6106: a loop rewritten for Oniguruma's empty-iteration exit is what the `regex` crate
+    /// compiles, and a rewrite the crate refuses (here, nested past its limit) falls back to the
+    /// pattern as written instead of becoming an error.
     #[cfg(feature = "regex")]
     #[test]
     fn build_regex_falls_back_to_the_pattern_as_written_6106() {
