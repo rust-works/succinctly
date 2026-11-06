@@ -6461,6 +6461,46 @@ fn get_inputs(
         return Ok(Ok((Vec::new(), locations, None, Vec::new())));
     }
 
+    // #6451: a lone source the lazy route reads starts on the front of it, so the first document
+    // does not wait for the whole file to be read and checked; the rest is read when the scan gets
+    // there. A source the route turns down on that front is read whole here and goes on below.
+    let mut read_whole: Option<Vec<u8>> = None;
+    if lone_lazy_read(args, track_eof, &files) {
+        match lone_lazy_start(&files) {
+            Ok(LoneStart::Lazy { text, spans, rest }) => {
+                opened.clone_from(&files);
+                // What the lone source's branch below makes of a stream with more after its first
+                // chunk.
+                let mut locations = InputLocations::new(
+                    files.iter().map(|p| Some(input_display_name(p))).collect(),
+                );
+                locations.eof_tail = Some(EofTail {
+                    newlines: 0,
+                    unknown: true,
+                });
+                let more = LazyMore {
+                    scanned_to: spans.last().map_or(0, |&(_, end)| end),
+                    chunks: 1,
+                    file_start: StreamOrigin::ALONE.file,
+                    seams: vec![Seam::NONE],
+                    last_source: locations.last_src(),
+                    lossy: None,
+                    last_span: None,
+                    recorded_tail: None,
+                    rest: Some(rest),
+                };
+                defer_lazy_start(std::rc::Rc::new(text), spans, 0, Seam::NONE, Some(more));
+                #[cfg(test)]
+                LONE_FRONT_STARTS.with(|n| n.set(n.get() + 1));
+                return Ok(Ok((Vec::new(), locations, None, Vec::new())));
+            }
+            Ok(LoneStart::Read(bytes)) => read_whole = Some(bytes),
+            Ok(LoneStart::Declined) => {}
+            // patchcov: coverage tolerate-line reason="untestable: stdin failing part-way"
+            Err(e) => return Ok(Err(e)),
+        }
+    }
+
     // Collect raw input from files or stdin. Read as bytes and decode below
     // rather than through `read_to_string`, which refused the whole input on
     // a stray byte and reported it as a *read* failure when the read had in
@@ -6473,7 +6513,11 @@ fn get_inputs(
     // #6004: a file that would not open after the last one that did is read after it, so the
     // stream does not end where the last opened file does.
     let mut unopened_tail = false;
-    let (files, mut raw_bytes): OpenedInputs = if files.is_empty() {
+    let (files, mut raw_bytes): OpenedInputs = if let Some(bytes) = read_whole {
+        // Stdin is the one source with no file index.
+        let tag = (!files.is_empty()).then_some(0);
+        (files, vec![(tag, bytes)])
+    } else if files.is_empty() {
         match read_stdin_bytes() {
             Ok(b) => (files, vec![(None, b)]),
             Err(e) => return Ok(Err(e)),
@@ -7183,6 +7227,7 @@ fn get_inputs(
                     lossy: None,
                     last_span: None,
                     recorded_tail: None,
+                    rest: None,
                 });
                 for (pos, ((file_idx, raw), (spans, seam))) in
                     raw_inputs.into_iter().zip(spans).enumerate()
@@ -7309,6 +7354,7 @@ fn get_inputs(
                                 lossy: lossy_sources.get_mut(pos).and_then(Option::take),
                                 last_span: None,
                                 recorded_tail,
+                                rest: None,
                             });
                             if recorded_tail.is_none() {
                                 debug_assert_eq!(seam, Seam::NONE, "a lone source is unstitched");
@@ -10016,6 +10062,217 @@ struct LazyMore {
     /// not UTF-8 (the one case whose seam the substitution moves); else it is read off the spans
     /// when the scan reaches the end.
     recorded_tail: Option<EofTail>,
+    /// The source's bytes after the text, not read yet: a lone source starts on the front of it
+    /// (#6451), and the rest is read when the scan gets past that ([`read_lazy_rest`]).
+    rest: Option<LazyRest>,
+}
+
+/// What is left to read of a lone source the lazy route started on the front of (#6451).
+struct LazyRest {
+    reader: Box<dyn std::io::Read>,
+    /// The bytes read after the text that do not make a whole character yet.
+    pending: Vec<u8>,
+}
+
+/// How much of a lone source [`lone_lazy_start`] reads before the program starts: room for the
+/// first chunk's documents ([`LAZY_CHUNK_FIRST_BYTES`]) and the one that ends it.
+const LAZY_PREFIX_BYTES: usize = 4 * LAZY_CHUNK_FIRST_BYTES;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: [`LAZY_PREFIX_BYTES`] in its place, so a short stream starts on a prefix.
+    static LAZY_PREFIX_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Test-only: how many runs [`get_inputs`] started on the front of a lone source.
+    static LONE_FRONT_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn lazy_prefix_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = LAZY_PREFIX_OVERRIDE.with(std::cell::Cell::get) {
+        return bytes;
+    }
+    LAZY_PREFIX_BYTES
+}
+
+/// Whether a run reads its one source the way the lazy route's lone source is read (#5661, #5856),
+/// so [`get_inputs`] can start it on the front of the source (#6451): a program that reads
+/// `input`/`inputs` (`track_eof`), over plain JSON documents, one file or stdin, nothing that
+/// needs the whole text first. Every condition is one the lone source's branch of [`get_inputs`]
+/// takes the stream on; `lone_lazy_read_is_the_lone_source_route_6451` checks the two agree.
+fn lone_lazy_read(args: &JqCommand, track_eof: bool, files: &[PathBuf]) -> bool {
+    track_eof
+        && !args.slurp
+        && !args.stream
+        && !args.stream_errors
+        && !args.seq
+        && !args.raw_input
+        && args.input_dsv.is_none()
+        && !args.validate
+        && !lazy_route_forced_off()
+        && match files {
+            [] => true,
+            [file] => !is_stdin_dash(file),
+            _ => false,
+        }
+}
+
+/// What [`lone_lazy_start`] made of the front of a lone source.
+enum LoneStart {
+    /// A clean first chunk with more after it: the text up to the last whole character read, the
+    /// chunk's documents in it, and the rest of the source.
+    Lazy {
+        text: String,
+        spans: Vec<(usize, usize)>,
+        rest: LazyRest,
+    },
+    /// Every byte of the source, read for the route that reads it whole.
+    Read(Vec<u8>),
+    /// Nothing kept: the file is read as it always was (and a failure reported there).
+    Declined,
+}
+
+/// The front of a lone source, for a run [`lone_lazy_read`] admits (#6451). When the lazy route's
+/// first chunk is all in it and clean, with more text after, that chunk is where the program
+/// starts and the rest is read when the scan reaches it; anything else reads the source whole, as
+/// before. The chunk is the one the route scans over the whole text: it ends at a document with a
+/// byte after it in the front, and the scan reads nothing past that byte. The lines the producer
+/// counts for it read on to the next newline, so a front with none after the chunk is turned down.
+fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
+    let front = lazy_prefix_bytes();
+    let (mut reader, capacity): (Box<dyn std::io::Read>, usize) = match files.first() {
+        None => {
+            let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
+            let stdin =
+                std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(std::io::stdin());
+            (Box::new(stdin), front)
+        }
+        Some(path) => {
+            let Ok(file) = std::fs::File::open(path) else {
+                return Ok(LoneStart::Declined);
+            };
+            // A file the front holds whole gains nothing; a FIFO or a directory keeps its route.
+            match file
+                .metadata()
+                .map(|meta| (meta.is_file(), usize::try_from(meta.len())))
+            {
+                Ok((true, Ok(len))) if len > front => (Box::new(file), len),
+                _ => return Ok(LoneStart::Declined),
+            }
+        }
+    };
+    let from_stdin = files.is_empty();
+    // Sized for the whole file, so the rest is read into the same buffer.
+    let mut bytes = Vec::with_capacity(capacity);
+    if let Err(error) = reader.by_ref().take(front as u64).read_to_end(&mut bytes) {
+        // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+        return if from_stdin {
+            Err(anyhow::Error::new(error).context("Failed to read from stdin"))
+        } else {
+            Ok(LoneStart::Declined)
+        };
+        // patchcov: coverage end
+    }
+    // The whole source (stdin's end, or a file that shrank).
+    if bytes.len() < front {
+        return Ok(LoneStart::Read(bytes));
+    }
+    // The scan reads the text after the BOM jq skips (#5291), as `get_inputs` strips it.
+    let bom = crate::front_matter::leading_bom_len(&bytes);
+    // Up to the last whole character: the front may end inside one.
+    let valid_end = match std::str::from_utf8(&bytes[bom..]) {
+        Ok(_) => bytes.len(),
+        Err(e) if e.error_len().is_none() => bom + e.valid_up_to(),
+        Err(_) => bom,
+    };
+    // The line of a document is jq's count through the read that completes it, which runs to the
+    // next newline ([`LineCounter::read_end_line`]): a newline after the chunk's last document keeps
+    // every count the chunk needs, and the newline the counter keeps for the next, in the front.
+    let more = std::str::from_utf8(&bytes[bom..valid_end])
+        .ok()
+        .and_then(|text| {
+            let chunk = lazy_json_scan_chunk(text, 0, lazy_chunk_budget(0));
+            let newline_after =
+                |&(_, end): &(usize, usize)| text.as_bytes()[end..].contains(&b'\n');
+            (chunk.end == ChunkEnd::More && chunk.spans.last().is_some_and(newline_after))
+                .then_some(chunk)
+        });
+    if let Some(chunk) = more {
+        let pending = bytes.split_off(valid_end);
+        bytes.drain(..bom);
+        match String::from_utf8(bytes) {
+            Ok(text) => {
+                return Ok(LoneStart::Lazy {
+                    text,
+                    spans: chunk.spans,
+                    rest: LazyRest { reader, pending },
+                })
+            }
+            // patchcov: coverage tolerate reason="unreachable: the bytes were validated above"
+            Err(e) => {
+                bytes = e.into_bytes();
+                bytes.extend(pending);
+            } // patchcov: coverage end
+        }
+    }
+    match reader.read_to_end(&mut bytes) {
+        Ok(_) => Ok(LoneStart::Read(bytes)),
+        // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+        Err(error) if from_stdin => {
+            Err(anyhow::Error::new(error).context("Failed to read from stdin"))
+        }
+        Err(_) => Ok(LoneStart::Declined),
+        // patchcov: coverage end
+    }
+}
+
+/// Reads the rest of a lone source the lazy route started on the front of (#6451), when the scan
+/// needs the text after the front. A source that turns out not to be UTF-8 becomes jq's
+/// substitution of its bytes, with the end of the stream recorded from the bytes as read, exactly
+/// as [`get_inputs`] makes such a stream up front: the text before the front's end is UTF-8 and
+/// ends between documents, so the substitution leaves it, and the documents already read, as they
+/// were.
+fn read_lazy_rest(lazy: &mut LazyJsonInputs, more: &mut LazyMore, mut rest: LazyRest) {
+    let mut bytes = std::mem::take(std::rc::Rc::make_mut(&mut lazy.text)).into_bytes();
+    bytes.append(&mut rest.pending);
+    if let Err(error) = rest.reader.read_to_end(&mut bytes) {
+        // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+        // A source that failed part-way ends there: jq reports it and exits 2 (#5498).
+        eprintln!("jq: error: {}", strerror_only(&error));
+        INPUT_READ_FAILED.with(|failed| failed.set(true));
+        // patchcov: coverage end
+    }
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => {
+            let original = e.into_bytes();
+            more.recorded_tail = Some(EofTail::of(
+                &[original.as_slice()],
+                false,
+                &more.seams,
+                false,
+            ));
+            let (text, edits) =
+                succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped(
+                    &original,
+                );
+            debug_assert!(
+                edits
+                    .first()
+                    .map_or(true, |edit| edit.raw.start >= more.scanned_to
+                        && edit.text.start >= more.scanned_to),
+                "the substitution leaves the text already scanned as it was"
+            );
+            let len = original.len();
+            lazy.seam = std::mem::take(&mut lazy.seam).after_substitution(len, &edits);
+            more.seams = std::mem::take(&mut more.seams)
+                .into_iter()
+                .map(|seam| seam.after_substitution(len, &edits))
+                .collect();
+            more.lossy = Some(LossySource::new(original, edits));
+            text
+        }
+    };
+    *std::rc::Rc::make_mut(&mut lazy.text) = text;
 }
 
 /// The first chunk of a lazy stream covers about this much text, and each chunk after it twice the
@@ -10255,6 +10512,10 @@ fn lazy_scan_on(
     };
     more.last_span = lazy.spans.last().copied().or(more.last_span);
     lazy.spans.clear();
+    // #6451: the text after the front of a lone source is read when the scan gets to it.
+    if let Some(rest) = more.rest.take() {
+        read_lazy_rest(lazy, &mut more, rest);
+    }
     let chunk = lazy_json_scan_chunk(&lazy.text, more.scanned_to, lazy_chunk_budget(more.chunks));
     more.chunks += 1;
     #[cfg(test)]
@@ -15777,6 +16038,133 @@ mod tests {
         }
         LAZY_CHUNK_BYTES.with(|c| c.set(None));
         (seen, lazy_documents)
+    }
+
+    /// #6451: a lone source started on the front of it reads as one read whole: every document and
+    /// error `input` pops and the `(at ...)` marker after each, through and past the end, for clean
+    /// streams with a fault, a byte that is not UTF-8 or a character cut by the front's end at every
+    /// position, and every front length up to the stream's. The pin must be able to fail: it does
+    /// with the rest left unread, with a front accepted that holds no newline after its chunk, and
+    /// with a substitution's end of stream read off its text and not the bytes as read (the long
+    /// last line, which jq's 4095-byte reads split where the text is shorter).
+    #[test]
+    fn a_lone_source_started_on_its_front_reads_as_one_read_whole_6451() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let observe = |bytes: &[u8], front: Option<usize>| {
+            LAZY_PREFIX_OVERRIDE.with(|c| c.set(front));
+            let seen = observe_inputs(dir.path(), &[bytes], false, Some(8));
+            LAZY_PREFIX_OVERRIDE.with(|c| c.set(None));
+            seen.0
+        };
+        let clean: &[u8] = b"{\"a\":\"\xc3\xa9\"} [1,2]\n\"\xe2\x82\xac\" 3\n{\"b\":[]} true\n";
+        let inserts: [&[u8]; 6] = [
+            b"}",
+            b"\xff",
+            b"\"\xc3(\" ",
+            b"\xef\xbb\xbf",
+            b"007 ",
+            b"\"x",
+        ];
+        let mut streams: Vec<Vec<u8>> = vec![clean.to_vec(), [b"\xef\xbb\xbf", clean].concat()];
+        for insert in inserts {
+            for at in 0..=clean.len() {
+                streams.push([&clean[..at], insert, &clean[at..]].concat());
+            }
+        }
+        // Ten bytes that are not UTF-8 in a last line of 4095 without a newline: the substitution
+        // makes them one U+FFFD, so the text's last line ends inside a read and the bytes' fills it.
+        let long_last_line = [clean, b"\"", &[0xff; 10], &[b'a'; 4083], b"\""].concat();
+        let whole = observe(&long_last_line, None);
+        for front in 1..20 {
+            assert_eq!(
+                observe(&long_last_line, Some(front)),
+                whole,
+                "front {front}"
+            );
+        }
+        let started = LONE_FRONT_STARTS.with(std::cell::Cell::get);
+        for stream in &streams {
+            let whole = observe(stream, None);
+            for front in 1..stream.len() {
+                assert_eq!(
+                    observe(stream, Some(front)),
+                    whole,
+                    "front {front} of {:?}",
+                    String::from_utf8_lossy(stream)
+                );
+            }
+        }
+        // The route was taken, and not only by the clean streams.
+        let started = LONE_FRONT_STARTS.with(std::cell::Cell::get) - started;
+        assert!(
+            started > 4 * streams.len(),
+            "{started} runs started on a front"
+        );
+    }
+
+    /// #6451: [`lone_lazy_read`] admits only what the lone source's branch of [`get_inputs`] takes
+    /// the lazy route on: a front is started on for no run flag that would read the source another
+    /// way, and every flag that leaves the read alone reads the same with and without one.
+    #[test]
+    fn lone_lazy_read_is_the_lone_source_route_6451() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let observe = |flags: &[&str], front: Option<usize>| {
+            LAZY_PREFIX_OVERRIDE.with(|c| c.set(front));
+            let seen = observe_inputs_with(
+                dir.path(),
+                &[b"1 2 [3] {\"a\":4} 5\n6\n"],
+                flags,
+                false,
+                Some(4),
+            );
+            LAZY_PREFIX_OVERRIDE.with(|c| c.set(None));
+            seen.0
+        };
+        let starts = || LONE_FRONT_STARTS.with(std::cell::Cell::get);
+        let path = dir.path().join("other.json");
+        std::fs::write(&path, b"1 2 [3] {\"a\":4} 5\n6\n").unwrap();
+        let path = path.to_string_lossy().into_owned();
+        for flags in [
+            &["-s"][..],
+            &["--stream"],
+            &["--stream-errors"],
+            &["--seq"],
+            &["-R"],
+            &["--validate"],
+            &["--input-dsv", ","],
+        ] {
+            use clap::Parser;
+            let mut argv = vec!["jq", "-n"];
+            argv.extend(flags);
+            argv.extend(["inputs", path.as_str()]);
+            let cmd = JqCommand::try_parse_from(argv).unwrap();
+            let before = starts();
+            LAZY_PREFIX_OVERRIDE.with(|c| c.set(Some(19)));
+            LAZY_CHUNK_BYTES.with(|c| c.set(Some(4)));
+            let (mut open_failed, mut opened) = (false, Vec::new());
+            let _ = get_inputs(&cmd, true, true, &mut open_failed, &mut opened);
+            LAZY_PREFIX_OVERRIDE.with(|c| c.set(None));
+            LAZY_CHUNK_BYTES.with(|c| c.set(None));
+            LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
+            LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
+            LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
+            assert_eq!(starts(), before, "{flags:?} reads its source another way");
+        }
+        for flags in [
+            &[][..],
+            &["-c"],
+            &["-r"],
+            &["-a"],
+            &["-S"],
+            &["-e"],
+            &["--tab"],
+            &["-j"],
+        ] {
+            let before = starts();
+            let front = observe(flags, Some(19));
+            assert_eq!(starts(), before + 1, "{flags:?} starts on the front");
+            assert_eq!(front, observe(flags, None), "{flags:?}");
+        }
     }
 
     /// #5853: a stream that turns malformed reads the same whether its clean start is converted
