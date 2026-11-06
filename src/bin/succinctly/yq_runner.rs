@@ -8193,8 +8193,8 @@ enum LineComment {
     Placed,
 }
 
-/// `in_flow`: `tree`'s parent stays flow-written, where a nested collection's trailing comment is
-/// lost rather than held.
+/// `in_flow`: `tree`'s parent was written in flow, where an element with a comment of its own
+/// overwrites the held comment instead of waiting for a later line (#6334).
 fn defer_flow_line_comments_at(
     value: &OwnedValue,
     tree: &mut CommentTree,
@@ -8223,6 +8223,11 @@ fn defer_flow_line_comments_at(
             if let Some(comment) = held.pop_front() {
                 tree.meta_mut().comment = Some(comment);
             }
+        }
+        // Between the elements of a collection written in flow, an element with a comment of its
+        // own overwrites the held one (#6334); beside the entries of a block it waits (#4377).
+        LineComment::Free if in_flow => {
+            held.pop_front();
         }
         LineComment::Free => {}
     }
@@ -8307,9 +8312,10 @@ fn defer_flow_line_comments_at(
         _ => {}
     }
     if let Some(comment) = own {
-        if !in_flow {
-            held.push_back(comment);
-        }
+        // One slot: a comment held after a nested flow collection is overwritten by the next one
+        // that is held, the parent's (`{x: [1] # xi` / `} # ec` writes `ec`, #4377).
+        held.clear();
+        held.push_back(comment);
     }
 }
 

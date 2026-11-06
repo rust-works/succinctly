@@ -407,6 +407,134 @@ fn test_a_comment_on_its_own_line_inside_a_flow_collection_is_kept_6334() -> Res
             &[],
             "k:\n  - {a: 2,}\n  # c\n",
         ),
+        (
+            "v: [[1] # c\n  # f\n  ]\n",
+            ".",
+            &[],
+            "v: [[1] # c\n  # f\n]\n",
+        ),
+        (
+            "v: [{a: 1} # c\n  # f\n  ]\n",
+            ".",
+            &[],
+            "v: [{a: 1,} # c\n  # f\n]\n",
+        ),
+        (
+            "v: {a: [1] # c\n  # f\n  }\n",
+            ".",
+            &[],
+            "v: {a: [1] # c\n,\n  # f\n}\n",
+        ),
+    ];
+    for &(doc, filter, flags, expected) in rows {
+        let (stdout, code) = run_yq_stdin(filter, doc, flags)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "{flags:?} {filter} on {doc:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Under `-P` a flow collection becomes a block, and the comment on an element that is a collection (`[[1], # a`
+/// / `2]`) has no line of its own: yq holds it for the next line without a comment, as it holds one after the
+/// whole collection (#4377), but an element with a comment of its own overwrites it instead of letting it wait.
+/// Every row was captured from yq v4.53.3.
+#[test]
+fn test_p_holds_the_comment_of_a_flow_element_that_is_a_collection_6334() -> Result<()> {
+    let rows: &[(&str, &str, &[&str], &str)] = &[
+        (
+            "v: [1, # a\n 2, # b\n 3]\n",
+            ".",
+            &["-P"],
+            "v:\n  - 1 # a\n  - 2 # b\n  - 3\n",
+        ),
+        (
+            "v: {a: 1, # a\n b: 2}\n",
+            ".",
+            &["-P"],
+            "v:\n  a: 1 # a\n  b: 2\n",
+        ),
+        (
+            "v: [[1], # a\n 2]\n",
+            ".",
+            &["-P"],
+            "v:\n  - - 1\n  - 2 # a\n",
+        ),
+        (
+            "v: [[1], # a\n [2]]\n",
+            ".",
+            &["-P"],
+            "v:\n  - - 1\n  - # a\n    - 2\n",
+        ),
+        (
+            "v: [{a: 1}, # a\n {b: 2}, # b\n 3]\n",
+            ".",
+            &["-P"],
+            "v:\n  - a: 1\n  - # a\n    b: 2\n  - 3 # b\n",
+        ),
+        (
+            "v: {a: [1], # a\n b: 2}\n",
+            ".",
+            &["-P"],
+            "v:\n  a:\n    - 1\n  b: 2 # a\n",
+        ),
+        (
+            "v: {a: {c: 1}, # a\n b: 2}\n",
+            ".",
+            &["-P"],
+            "v:\n  a:\n    c: 1\n  b: 2 # a\n",
+        ),
+        (
+            "v: [1, [2], # a\n 3]\n",
+            ".",
+            &["-P"],
+            "v:\n  - 1\n  - - 2\n  - 3 # a\n",
+        ),
+        ("v: [1, [2] # a\n]\n", ".", &["-P"], "v:\n  - 1\n  - - 2\n"),
+        (
+            "v: [[~], # c7\n a , # c9\n []]\n",
+            ".",
+            &["-P"],
+            "v:\n  - - ~\n  - a # c9\n  - []\n",
+        ),
+        (
+            "v: [[1], # a\n b, # b\n c, # c\n d]\n",
+            ".",
+            &["-P"],
+            "v:\n  - - 1\n  - b # b\n  - c # c\n  - d\n",
+        ),
+        (
+            "a: [1] # a\nb: 2 # b\nc: [3]\nd: 4\n",
+            ".",
+            &["-P"],
+            "a:\n  - 1\nb: 2 # b\nc: # a\n  - 3\nd: 4\n",
+        ),
+        (
+            "a: {x: [1] # xi\n  }\nb: 3\n",
+            ".",
+            &["-P"],
+            "a:\n  x:\n    - 1\nb: 3 # xi\n",
+        ),
+        (
+            "a: [[1] # xi\n  ]\nb: 3\n",
+            ".",
+            &["-P"],
+            "a:\n  - - 1\nb: 3 # xi\n",
+        ),
+        (
+            "a: [[1] # xi\n  ] # ec\nb: 3\n",
+            ".",
+            &["-P"],
+            "a:\n  - - 1\nb: 3 # ec\n",
+        ),
+        (
+            "a: [[1], # xi\n  [2]] # ec\nb: 3\n",
+            ".",
+            &["-P"],
+            "a:\n  - - 1\n  - # xi\n    - 2\nb: 3 # ec\n",
+        ),
     ];
     for &(doc, filter, flags, expected) in rows {
         let (stdout, code) = run_yq_stdin(filter, doc, flags)?;

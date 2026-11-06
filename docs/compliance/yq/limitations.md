@@ -6904,7 +6904,7 @@ documents x 8 filters. Still different:
   The identity route, a write and a navigation lay the collection out across lines with the comment after the element's comma, and the closing bracket on a line of its own when the last element is commented.
   A comment on a line of its own is the head of the element after it (`.v[0] | head_comment`), or the foot of the last element when the closing bracket follows it; for a mapping, of the entry's key.
   The head sits on a line of its own before the element, and a foot follows a trailing comma, except after a sequence element that is a sequence (no comma) or a mapping (the comma goes inside its `}`).
-  `-P`, which writes the collection as a block, keeps the head and foot too, but not a comment on an element's line: yq prints `- 1 # note`, where the element here has none.
+  `-P`, which writes the collection as a block, keeps the head, the foot and a comment on a scalar element's line, and holds the comment of an element that is a collection for the next line without a comment, as it does one after the whole collection (an element with a comment of its own overwrites the held one).
   Still different, each seen against yq v4.53.3 over generated documents:
   A comment on a line of its own before a comma that is followed by the closing bracket (`[a, b` / `# f` / `,` / `]`) is dropped here; yq moves it, and the comments after that comma, past the collection to whatever follows (the next node, or the document's foot).
   yq writes an empty line before the first comment of a collection nested in a sequence after a sibling mapping that ends with a foot comment (`{k: v` / `# c` / `}, [` / `# d`), and before the foot of a collection that ends a block sequence under `-P`; some of these this build does not write.

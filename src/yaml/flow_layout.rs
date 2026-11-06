@@ -87,7 +87,6 @@ pub fn render_flow(
     let mut pending = Pending::Nothing;
     let mut foot: Vec<String> = Vec::new();
     let mut last_is_container = false;
-    let mut last_is_mapping = false;
     for (i, item) in items.into_iter().enumerate() {
         let headed = !item.head.is_empty();
         match pending {
@@ -109,7 +108,20 @@ pub fn render_flow(
             out.push('\n');
             out.push_str(continuation);
         }
-        out.push_str(&item.text);
+        // go-yaml writes the comma before a foot inside the `}` of a sequence's last element when
+        // that is a mapping with members, and none after a sequence's collection (below).
+        match item.text.strip_suffix('}') {
+            Some(body)
+                if open == '['
+                    && item.mapping
+                    && !item.foot.is_empty()
+                    && !item.text.ends_with("\n}") =>
+            {
+                out.push_str(body);
+                out.push_str(",}");
+            }
+            _ => out.push_str(&item.text),
+        }
         pending = Pending::Nothing;
         if let Some(comment) = item.comment {
             let mut lines = comment.split('\n');
@@ -130,21 +142,15 @@ pub fn render_flow(
         }
         foot = item.foot;
         last_is_container = item.container;
-        last_is_mapping = item.mapping;
     }
     if !foot.is_empty() {
-        // go-yaml writes a trailing comma before the foot: after a mapping's entry and a
-        // sequence's scalar (after a line comment's own), none after a sequence's sequence and
-        // inside the `}` of a sequence's non-empty mapping.
+        // go-yaml writes a trailing comma before the foot of a mapping's entry and a sequence's
+        // scalar (after a line comment's own), and none after a sequence's collection.
         match pending {
-            Pending::Nothing if open == '[' && last_is_container => {
-                if last_is_mapping && !out.ends_with("\n}") {
-                    out.pop();
-                    out.push_str(",}");
-                }
-            }
+            Pending::Nothing if open == '[' && last_is_container => {}
             Pending::Nothing => out.push(','),
             Pending::AfterScalar => {}
+            Pending::AfterCollection if open == '[' => {}
             Pending::AfterCollection => out.push_str("\n,"),
         }
         for line in &foot {
