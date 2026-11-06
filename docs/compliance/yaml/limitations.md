@@ -492,6 +492,9 @@ visible once a directive line stopped masking them:
   `close_pending_explicit_key` already synthesizes null for a key with no value — guarded so
   a bare `...`/comment with **no** preceding document (`HWV9`, `QT73`) still produces zero
   documents rather than a phantom one.
+  `succinctly yq` reads those streams as yq does instead (#6342).
+  yq's header slurp sets aside the blank, comment, `%YAML` and leading `---` lines, so a stream of only those is one null document.
+  A `...` met while that head is all there is is refused (`did not find expected node content`), and so is a `%TAG` with no `---` after it.
 
 Two of the sixteen `directives`-category corpus cases did not fully clear, for reasons
 unrelated to directive recognition itself: `CC74`/`P76L` apply the `%TAG`-defined shorthand

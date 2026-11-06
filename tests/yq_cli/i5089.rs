@@ -37,13 +37,12 @@ fn test_content_after_a_document_end_marker_without_a_start_is_rejected_5089() -
     Ok(())
 }
 
-/// Other spellings yq rejects: content on the marker's own line, CRLF, a marker that opens the
-/// stream (yq rejects everything after it), and a directive followed by content with no `---`.
+/// Other spellings yq rejects: content on the marker's own line, CRLF, and a directive followed by
+/// content with no `---`. A marker that opens the stream is refused for another reason, and is
+/// pinned in `i6342.rs`.
 const REJECTED_OTHER: &[&str] = &[
     "a\n... b\n",
     "a\r\n...\r\nb\r\n",
-    "...\nb\n",
-    "# c\n...\nb\n",
     "a\n...\n%YAML 1.2\nb\n",
 ];
 
