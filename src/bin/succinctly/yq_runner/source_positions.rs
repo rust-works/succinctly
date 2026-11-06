@@ -105,7 +105,7 @@ impl Source {
     fn loaded(&self) -> Option<&Loaded> {
         self.loaded
             .get_or_init(|| {
-                let index = YamlIndex::build(&self.bytes).ok()?;
+                let index = YamlIndex::build_yq(&self.bytes).ok()?;
                 let mut documents = Vec::new();
                 let YamlValue::Sequence(mut rest) = index.root(&self.bytes).value() else {
                     return None;

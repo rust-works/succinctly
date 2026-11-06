@@ -20137,25 +20137,22 @@ mod standalone_comment_attribution_2811_review {
     /// live-tested, real yq collapses two bare adjacent `---` markers with
     /// no real content before the first one into a *single* document
     /// (`# c1\n---\n---\n# c2\nb: 2\n` is one document with combined head
-    /// `c1`/`c2` in real yq, not two) -- a separate, larger document-count
-    /// divergence outside this fix's scope.
+    /// `c1`/`c2` in real yq, not two). That was a recorded document-count
+    /// divergence until #6349, which made the run one document: the header
+    /// takes every marker and comment (`---\n---\n# c\n`), `--doc 0` is the
+    /// whole input and there is no document 1.
     #[test]
-    fn header_scan_stops_before_a_second_document_marker_2811_review() -> Result<()> {
+    fn a_run_of_leading_markers_is_one_document_with_the_whole_header_2811_review() -> Result<()> {
         let input = "---\n---\n# c\nb: 2\n";
         let (out, code) = run_yq_stdin(".", input, &["--doc", "0"])?;
         assert_eq!(code, 0);
-        // Was `"---\nnull\n"` before the #2795 review fix to
-        // `is_header_only_document`: document 0 here is a bare `---` with
-        // nothing before the next marker, the same synthesized-absent shape
-        // as a lone `---\n` file, which real yq always prints as just
-        // `---\n` -- confirmed live in isolation (`printf -- '---\n' | yq
-        // '.'`) and by real yq's own combined rendering of this exact input
-        // (`yq '.'` with no `--doc` filter prints `---\n---\n# c\nb: 2\n`,
-        // whose first line is this document's whole contribution).
-        assert_eq!(out, "---\n");
+        assert_eq!(out, input);
+        let (out, code) = run_yq_stdin(".", input, &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, input);
         let (out, code) = run_yq_stdin(".", input, &["--doc", "1"])?;
         assert_eq!(code, 0);
-        assert_eq!(out, "# c\nb: 2\n");
+        assert_eq!(out, "");
         Ok(())
     }
 

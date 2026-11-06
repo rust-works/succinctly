@@ -20,7 +20,9 @@ use super::advance_positions::{build_cumulative_rank, OpenPositions};
 use super::end_positions::EndPositions;
 use super::error::YamlError;
 use super::light::YamlCursor;
-use super::parser::{build_semi_index, build_semi_index_json_strict, NodeComments, SemiIndex};
+use super::parser::{
+    build_semi_index, build_semi_index_json_strict, build_semi_index_yq, NodeComments, SemiIndex,
+};
 use super::starts_seq_entry;
 
 /// Index structures for navigating YAML.
@@ -173,6 +175,18 @@ impl YamlIndex<Vec<u64>> {
     /// (#188). Other variants report malformed YAML.
     pub fn build(yaml: &[u8]) -> Result<Self, YamlError> {
         Self::from_semi_index(yaml, build_semi_index(yaml)?)
+    }
+
+    /// [`build`](Self::build) for the YAML input `succinctly yq` reads: a run of leading `---`
+    /// markers (with only comments and blank lines between them) is one document, as in yq, whose
+    /// header slurp sets every leading marker aside (#6349). The YAML spec reads `---` / `---` /
+    /// `x` as a null document and then `x`, which is what [`build`](Self::build) keeps.
+    ///
+    /// # Errors
+    ///
+    /// As [`build`](Self::build).
+    pub fn build_yq(yaml: &[u8]) -> Result<Self, YamlError> {
+        Self::from_semi_index(yaml, build_semi_index_yq(yaml)?)
     }
 
     /// [`build`](Self::build) for input the caller already knows is JSON,

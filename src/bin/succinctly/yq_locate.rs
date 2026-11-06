@@ -99,7 +99,7 @@ pub fn run_yq_locate(args: YqLocateArgs) -> Result<i32> {
     }
 
     // Build the YAML index
-    let index = YamlIndex::build(text)
+    let index = YamlIndex::build_yq(text)
         .with_context(|| format!("Failed to parse YAML file: {}", args.file.display()))?;
 
     // Locate the position

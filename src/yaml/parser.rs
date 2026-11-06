@@ -646,6 +646,21 @@ struct Parser<'a, const HAS_CR: bool> {
     /// a pre-existing gap #2777 closed as a side effect of requiring a
     /// specific key/value shape, not a deliberate new check.)
     json_strict: bool,
+    /// Reads a run of leading `---` markers as one document (#6349), as yq's header slurp does: it
+    /// sets aside every leading blank, comment, directive and `---` line before the first content
+    /// line, so `---` / `---` / `x` is the one document `x` where YAML reads a null document and
+    /// then `x`. Set for the input `succinctly yq` reads (see
+    /// [`YamlIndex::build_yq`](crate::yaml::YamlIndex::build_yq)); the library loader keeps the
+    /// spec's reading.
+    yq_leading_marker_run: bool,
+    /// How many documents `start_document` has started: the leading run only ever merges into the
+    /// first (`a: 1` / `---` / `---` / `b: 2` is three documents in yq as in YAML).
+    documents_started: usize,
+    /// Where the text after the first document's latest leading `---` begins (#6349): the run only
+    /// continues over a further marker when nothing but blank and comment lines lie between the two
+    /// (`---` / `&a` / `---` / `x` is two documents: a property is content, though it writes no
+    /// node).
+    leading_run_from: usize,
 }
 
 impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
@@ -718,6 +733,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             pending_explicit_key_empty: false,
             nesting_depth: 0,
             json_strict: false,
+            yq_leading_marker_run: false,
+            documents_started: 0,
+            leading_run_from: 0,
             #[cfg(debug_assertions)]
             wrapper_slots: Vec::with_capacity(estimated_opens),
             #[cfg(debug_assertions)]
@@ -3360,6 +3378,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
         }
         self.seen_any_document = true;
+        self.documents_started += 1;
         self.document_root_node_taken = false;
         self.document_start_bp_pos = self.bp_pos;
         // A standalone comment block seen before this document's content
@@ -8662,6 +8681,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Skip leading `---` if present (optional for first doc)
         if self.is_document_start() {
             self.skip_document_marker();
+            self.leading_run_from = self.pos;
             // An explicit `---` always starts a document, content or not
             // (#225) - `end_document` synthesizes null if nothing follows.
             self.start_document();
@@ -8747,6 +8767,23 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             // Check for document start marker (new document)
             if self.is_document_start() {
+                // #6349: a marker while the first document has written nothing (only comments and
+                // blank lines since its own `---`) is more of yq's header, not another document.
+                if self.yq_leading_marker_run
+                    && self.in_document
+                    && self.documents_started == 1
+                    && self.bp_pos == self.document_start_bp_pos
+                    && self.only_blank_or_comment_lines_since(self.leading_run_from)
+                {
+                    self.skip_document_marker();
+                    self.leading_run_from = self.pos;
+                    if self.has_content_on_line() {
+                        self.parse_inline_document_value()?;
+                    } else {
+                        self.skip_newlines();
+                    }
+                    continue;
+                }
                 self.end_document();
                 self.skip_document_marker();
                 // Unconditional, as above: `---` always starts a document (#225).
@@ -8766,6 +8803,26 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
 
         Ok(())
+    }
+
+    /// Whether `input[from..self.pos]` holds nothing but blanks, line breaks and `#` comments: the
+    /// text between a leading `---` and the next one when the second is more of yq's header
+    /// (#6349). A node property (`&a`, `!!str`) is not, though it writes no node of its own.
+    fn only_blank_or_comment_lines_since(&self, from: usize) -> bool {
+        let mut i = from;
+        let end = self.pos.min(self.input.len());
+        while i < end {
+            match self.input[i] {
+                b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+                b'#' => {
+                    while i < end && !matches!(self.input[i], b'\n' | b'\r') {
+                        i += 1;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Parse a single line of document content.
@@ -9918,7 +9975,23 @@ fn json_strict_plain_scalar_ok(bytes: &[u8]) -> bool {
 /// BP bit count past `u32::MAX` before the text does; `BalancedParens`
 /// asserts its own ceiling as a loud backstop.)
 pub fn build_semi_index(input: &[u8]) -> Result<SemiIndex, YamlError> {
-    build_semi_index_impl(input, false)
+    build_semi_index_impl(input, BuildMode::default())
+}
+
+/// [`build_semi_index`] for the input `succinctly yq` reads: a run of leading `---` markers is one
+/// document, as in yq (#6349). See `Parser::yq_leading_marker_run`.
+///
+/// # Errors
+///
+/// As [`build_semi_index`].
+pub fn build_semi_index_yq(input: &[u8]) -> Result<SemiIndex, YamlError> {
+    build_semi_index_impl(
+        input,
+        BuildMode {
+            yq_leading_marker_run: true,
+            ..BuildMode::default()
+        },
+    )
 }
 
 /// [`build_semi_index`], enforcing real yq's own `-p json` grammar (#2279,
@@ -9936,10 +10009,25 @@ pub fn build_semi_index(input: &[u8]) -> Result<SemiIndex, YamlError> {
 /// As [`build_semi_index`], plus the JSON delimiter and scalar-grammar
 /// violations above, which that function accepts.
 pub fn build_semi_index_json_strict(input: &[u8]) -> Result<SemiIndex, YamlError> {
-    build_semi_index_impl(input, true)
+    build_semi_index_impl(
+        input,
+        BuildMode {
+            json_strict: true,
+            ..BuildMode::default()
+        },
+    )
 }
 
-fn build_semi_index_impl(input: &[u8], json_strict: bool) -> Result<SemiIndex, YamlError> {
+/// The reading a build asks of the parser; named fields so two flags cannot be swapped.
+#[derive(Clone, Copy, Default)]
+struct BuildMode {
+    /// `Parser::json_strict`.
+    json_strict: bool,
+    /// `Parser::yq_leading_marker_run`.
+    yq_leading_marker_run: bool,
+}
+
+fn build_semi_index_impl(input: &[u8], mode: BuildMode) -> Result<SemiIndex, YamlError> {
     // Text positions (bp_to_text/bp_to_text_end and the select samples and
     // rank arrays derived from them) are stored as u32, so inputs past
     // u32::MAX bytes would silently truncate offsets (#188). Every position
@@ -9956,11 +10044,13 @@ fn build_semi_index_impl(input: &[u8], json_strict: bool) -> Result<SemiIndex, Y
     // parse that follows.
     if crate::util::simd::escape::contains_cr(input) {
         let mut p = Parser::<true>::new(input);
-        p.json_strict = json_strict;
+        p.json_strict = mode.json_strict;
+        p.yq_leading_marker_run = mode.yq_leading_marker_run;
         p.parse()
     } else {
         let mut p = Parser::<false>::new(input);
-        p.json_strict = json_strict;
+        p.json_strict = mode.json_strict;
+        p.yq_leading_marker_run = mode.yq_leading_marker_run;
         p.parse()
     }
 }
@@ -9968,6 +10058,42 @@ fn build_semi_index_impl(input: &[u8], json_strict: bool) -> Result<SemiIndex, Y
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6349: `build_yq` reads a run of leading `---` markers as one document, as yq's header slurp
+    /// does; `build` keeps the YAML spec's reading (a null document per marker), and a marker
+    /// after the first content line or after an empty later document is a document in both.
+    #[test]
+    fn test_a_run_of_leading_markers_is_one_document_for_yq_only_6349() {
+        for (yaml, yq_docs, spec_docs) in [
+            (&b"---\n---\nx\n"[..], 1, 2),
+            (b"---\n---\n", 1, 2),
+            (b"---\n---\n---\nx\n", 1, 3),
+            (b"---\n# c\n---\nx\n", 1, 2),
+            (b"---\n--- x\ny\n", 1, 2),
+            (b"---\n---\nx\n---\ny\n", 2, 3),
+            // Not a leading run: the same in both.
+            (b"x\n---\n---\ny\n", 3, 3),
+            (b"---\nx\n---\n---\ny\n", 3, 3),
+            (b"---\nx\n", 1, 1),
+            // A property between the markers is content, though it writes no node.
+            (b"---\n&a\n---\nx\n", 2, 2),
+            (b"---\n!!str\n---\nx\n", 2, 2),
+        ] {
+            let count = |index: crate::yaml::YamlIndex| index.document_starts().len();
+            assert_eq!(
+                count(crate::yaml::YamlIndex::build_yq(yaml).unwrap()),
+                yq_docs,
+                "build_yq {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+            assert_eq!(
+                count(crate::yaml::YamlIndex::build(yaml).unwrap()),
+                spec_docs,
+                "build {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
 
     /// #6348: a block scalar header holds one chomping character, one digit 1-9, blanks, a comment
     /// and the line break. Anything else is refused at the parser, whatever the caller, in every

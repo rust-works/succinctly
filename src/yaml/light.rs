@@ -9901,13 +9901,12 @@ fn write_foot_comment_lines<Out: core::fmt::Write>(
 /// is how many columns that is, applied to that one line only (`--- [1, 2]` has `[` at column 1).
 ///
 /// Unlike the header yq *prints* ([`yq_header_len`]), a whitespace-only line counts as leading
-/// here (live-checked: `# c` / `  ` / `k: 1` numbers `k` from line 2), and only the first `---` is
-/// one: a second marker is content. As there, only a `%YA..` directive is slurped: `%TAG` is content. A `--- # c` line is left as content: yq's answer
+/// here (live-checked: `# c` / `  ` / `k: 1` numbers `k` from line 2), and so is every bare `---` of a
+/// leading run (#6349). As there, only a `%YA..` directive is slurped: `%TAG` is content. A `--- # c` line is left as content: yq's answer
 /// there is `[0,0]`, which nothing here reproduces.
 fn yq_position_preamble(text: &[u8]) -> (usize, usize) {
     let mut pos = 0;
     let mut lines = 0;
-    let mut seen_marker = false;
     while pos < text.len() {
         let rest = &text[pos..];
         let line_end = rest
@@ -9916,18 +9915,14 @@ fn yq_position_preamble(text: &[u8]) -> (usize, usize) {
             .unwrap_or(rest.len());
         let line = &rest[..line_end];
         let first = line.iter().position(|&b| b != b' ' && b != b'\t');
-        let bare_marker = line.starts_with(b"---")
-            && line[3..].iter().all(|&b| b == b' ' || b == b'\t')
-            && !seen_marker;
+        let bare_marker =
+            line.starts_with(b"---") && line[3..].iter().all(|&b| b == b' ' || b == b'\t');
         let leading = match first {
             None => true,
             Some(i) => line[i] == b'#' || (i == 0 && line.starts_with(b"%YA")) || bare_marker,
         };
         if !leading {
-            let columns = if !seen_marker
-                && line.starts_with(b"---")
-                && matches!(line.get(3), Some(b' ' | b'\t'))
-            {
+            let columns = if line.starts_with(b"---") && matches!(line.get(3), Some(b' ' | b'\t')) {
                 let content = line[3..]
                     .iter()
                     .position(|&b| b != b' ' && b != b'\t')
@@ -9942,7 +9937,6 @@ fn yq_position_preamble(text: &[u8]) -> (usize, usize) {
             };
             return (lines, columns);
         }
-        seen_marker |= bare_marker;
         pos += line_end
             + if line_end < rest.len() {
                 line_break_len(rest, line_end)
@@ -9974,14 +9968,10 @@ fn yq_position_preamble(text: &[u8]) -> (usize, usize) {
 /// trailing comment is dropped instead).
 fn yq_header_len(text: &[u8]) -> (usize, bool) {
     let mut pos = 0;
-    // Whether a `---` marker has already been folded into the header
-    // (#2811 review): the header concept is specifically "content before
-    // document 0's own real content", so a *second* document-start marker
-    // always ends the scan there, whether or not document 0 turned out
-    // empty (`---\n---\n# c\nb: 2\n` must not let document 1's own leading
-    // comment -- or the marker itself -- get swallowed into document 0's
-    // header and printed only once, for document 0).
-    let mut seen_doc_start = false;
+    // A run of leading `---` markers is all header (#6349): yq's slurp sets aside every leading
+    // blank, comment, directive and `---` line before the first content line, and reads the run
+    // as one document (`YamlIndex::build_yq` does the same), so a second marker no more ends the
+    // header than the first does. A marker with text after it ends it, after the marker itself.
     while pos < text.len() {
         let rest = &text[pos..];
         // Whether this line is header-shaped decides in at most the length
@@ -10026,10 +10016,6 @@ fn yq_header_len(text: &[u8]) -> (usize, bool) {
             text.len()
         };
         if line.starts_with(b"---") {
-            if seen_doc_start {
-                return (pos, false);
-            }
-            seen_doc_start = true;
             match line.get(3) {
                 None => {}
                 Some(b' ' | b'\t') => return (pos + 3, true),
@@ -18558,8 +18544,9 @@ plain: hello
             assert_eq!(yq_position_preamble(b"--- 5\n"), (0, 4));
             assert_eq!(yq_position_preamble(b"---  [1]\n"), (0, 5));
             assert_eq!(yq_position_preamble(b"# c\n--- a: 1\n"), (1, 4));
-            // Only the first marker is part of the preamble; a second is content.
-            assert_eq!(yq_position_preamble(b"---\n---\nk: 1\n"), (1, 0));
+            // A run of bare markers is all preamble (#6349): yq answers line 1 for `k`.
+            assert_eq!(yq_position_preamble(b"---\n---\nk: 1\n"), (2, 0));
+            assert_eq!(yq_position_preamble(b"---\n# c\n---\nk: 1\n"), (3, 0));
             // `--- # c` keeps the marker as content (yq answers [0,0] there).
             assert_eq!(yq_position_preamble(b"--- # c\nk: 1\n"), (0, 0));
             // `---x` is a plain scalar, not a marker.
