@@ -5923,7 +5923,12 @@ What the streaming route reproduces, all measured against pinned v4.53.3:
   header text, so a blank line or a `---`/`%YAML` marker in the header block does not
   survive `-P`/a write (`# lead\n\na: 1\n` under `-P '.'` prints `# lead\na: 1\n`, dropping
   the blank; a bare `---\na: 1\n` drops the marker entirely). Plain leading `#` comment
-  lines with no blank line or marker between them are unaffected. Pinned by
+  lines with no blank line or marker between them are unaffected.
+  The blank lines a header without a marker starts with, and a run of two or more between its comments, do survive (#5008): `\n\na: 1` under `-P` or a write keeps both, and so does `# h` / two blanks / `# g`.
+  They travel as the first document's head comment lines, built from the header text, so a result that is a part of the root (`.a`, `.[0]`) carries none, as in yq.
+  A result that is a new value built from the root (`map(. + 1)` over a sequence) carries the header here and not in yq, as a header of comments does (the derived-from-root gap).
+  The empty document made up for an input that holds none has no blank line to keep, while a file of one line break does.
+  Pinned by
   `header_verbatim_reproduction_is_streaming_only_2795`
   (`tests/yq_cli_tests.rs`), so a future header-unification fix has a test to flip rather
   than a silent behavior change to notice;
