@@ -266,7 +266,7 @@ const DUMP_KEEP_WIDE: usize = 26;
 /// Where the cut falls: jq cuts at a byte offset and can therefore split a
 /// multi-byte character, which building the message as a `jv` string turns
 /// into one U+FFFD. The sink snaps back to the character boundary and
-/// [`dump_truncated_at`] writes that U+FFFD in jq mode (#6434), so the two
+/// [`dump_truncated_at`] writes that U+FFFD (#6434), so the two
 /// agree byte for byte — see `docs/compliance/jq/limitations.md`.
 ///
 /// jq-pinned shim (#1055): delegates to [`dump_truncated_with`] fixed at
@@ -317,8 +317,9 @@ fn dump_truncated_at(tag: EvalTag, value: &OwnedValue, budget: usize, keep: usiz
         return sink.buf;
     }
     // #6434: jq copies `keep` bytes and builds the message as a `jv` string, which replaces a
-    // character the cut split with one U+FFFD. yq words its own messages and has no such cut.
-    if sink.truncate_to(keep) && tag == EvalTag::Jq {
+    // character the cut split with one U+FFFD. yq never cuts a value in its messages; the
+    // yq-mode messages that do are jq's convention (the shims above), so the rule is one.
+    if sink.truncate_to(keep) {
         sink.buf.push(char::REPLACEMENT_CHARACTER);
     }
     sink.buf.push_str("...");
@@ -2032,10 +2033,10 @@ mod tests {
         assert_eq!(dump_truncated(&s("abcd😀😀😀")), "\"abcd😀\u{FFFD}...");
         // A cut on a boundary writes none.
         assert_eq!(dump_truncated(&s("ab😀😀😀")), "\"ab😀😀...");
-        // yq mode has no such replacement.
+        // One rule in both modes: a yq-mode message that cuts a value uses jq's convention.
         assert_eq!(
             dump_truncated_with(EvalTag::Yq, &s("あああああ")),
-            "\"あああ..."
+            "\"あああ\u{FFFD}..."
         );
     }
 
