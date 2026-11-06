@@ -5928,16 +5928,13 @@ What the streaming route reproduces, all measured against pinned v4.53.3:
   a `---` marker — is re-emitted verbatim in front of the first document whenever the
   result is that document itself (`# lead\n\na: 1` keeps its blank; `---\na: 1` and
   `%YAML 1.2\n---\na: 1` keep their markers; `-N` drops the markers, as in yq; `.a` prints
-  no header). `--header-preprocess=false` itself is not implemented. **DOM-route-only
-  gap (#2795 PR B):** this verbatim byte-range mechanism is streaming-only — the DOM route
-  only carries structured head/foot *comment lines* through `CommentTree`, not the raw
-  header text, so a blank line or a `---`/`%YAML` marker in the header block does not
-  survive `-P`/a write (`# lead\n\na: 1\n` under `-P '.'` prints `# lead\na: 1\n`, dropping
-  the blank; a bare `---\na: 1\n` drops the marker entirely). Plain leading `#` comment
-  lines with no blank line or marker between them are unaffected. Pinned by
-  `header_verbatim_reproduction_is_streaming_only_2795`
-  (`tests/yq_cli_tests.rs`), so a future header-unification fix has a test to flip rather
-  than a silent behavior change to notice;
+  no header). `--header-preprocess=false` itself is not implemented.
+  The DOM route (`-P`, a write, `-i`) reproduces the header too (#2795 PR B, #4086, #5008), but through the first document's head comment lines and its preamble, not the raw byte range, so it differs in two ways.
+  A `%YAML` line of the header is not printed back there (see #6408 above).
+  And a result that is a new value built from the root (`map(. + 1)` over a sequence, `-P map(.)`) carries the header here and not in yq, as a header of comments does (the derived-from-root gap); `to_entries` drops it where yq keeps it.
+  The blank lines a header without a marker starts with, and a run of two or more between its comments, are kept since #5008 (`\n\na: 1` under `-P` or a write keeps both, and so does `# h` / two blanks / `# g`), built from the header text: a result that is a part of the root (`.a`, `.[0]`) carries none, as in yq.
+  The empty document made up for an input that holds none has no blank line to keep, while a file of one line break does.
+  Pinned by `header_verbatim_reproduction_is_streaming_only_2795` (`tests/yq_cli_tests.rs`, now a test that the DOM route keeps the blank and the marker) and `tests/yq_cli/i5008.rs`;
 - the header slurp also **loses a line break**, and `succinctly yq` reproduces the loss (#6276).
   yq pushes the text after a leading `--- ` back onto its reader without the marker line's own break,
   so the next line continues it: `--- x` / `y` is `"xy"`, `--- x` / `y: 1` is `{"xy": 1}`, and `--- # c` / `x` / `y` is the comment `# cx` and the document `"y"`.

@@ -117,6 +117,10 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// merged view then lists an inline-mapping source's keys too. Carried here for the same
     /// reason as `canonicalize_numbers` above.
     merge_rendering_aliases_only: bool,
+    /// Whether the text is the empty document the CLI makes up for an input that held none (#5008), set by
+    /// [`Self::mark_synthesized_empty`]: its line break is not a blank line of the input, so a write over it
+    /// prints none. Off by default.
+    synthesized_empty: bool,
     /// Whether any node carries a standalone head/foot comment (#2795).
     /// The streaming emitter consults this once per node before looking up
     /// either list, so a comment-free document -- the common case, and the
@@ -251,6 +255,7 @@ impl YamlIndex<Vec<u64>> {
             canonicalize_numbers: false,
             header_doc_markers: true,
             merge_rendering_aliases_only: false,
+            synthesized_empty: false,
             yq_header: OnceCell::new(),
             text_is_ascii: OnceCell::new(),
             may_have_merge_keys: OnceCell::new(),
@@ -326,6 +331,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             canonicalize_numbers: false,
             header_doc_markers: true,
             merge_rendering_aliases_only: false,
+            synthesized_empty: false,
             yq_header: OnceCell::new(),
             text_is_ascii: OnceCell::new(),
             may_have_merge_keys: OnceCell::new(),
@@ -416,6 +422,18 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// runner only, before streaming through any cursor.
     pub fn render_merges_through_aliases_only(&mut self) {
         self.merge_rendering_aliases_only = true;
+    }
+
+    /// Marks the text as the empty document the CLI makes up for an input that held none (#5008): the line break it
+    /// reads from is not a blank line of the input, which a write would otherwise print above its result.
+    pub fn mark_synthesized_empty(&mut self) {
+        self.synthesized_empty = true;
+    }
+
+    /// Whether [`Self::mark_synthesized_empty`] was called.
+    #[inline]
+    pub(crate) fn synthesized_empty(&self) -> bool {
+        self.synthesized_empty
     }
 
     /// Whether [`Self::render_merges_through_aliases_only`] was called.

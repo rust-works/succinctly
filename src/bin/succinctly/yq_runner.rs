@@ -1215,6 +1215,13 @@ fn read_input_noting_empty_document(
     })
 }
 
+/// Tells an index built from the empty document the run made up that it was (#5008).
+fn note_synthesized_empty<W: AsRef<[u64]>>(index: &mut YamlIndex<W>) {
+    if EMPTY_DOCUMENT_RUN.with(Cell::get) {
+        index.mark_synthesized_empty();
+    }
+}
+
 /// The per-file origin scope for input number `file_index` (#2427), except that the synthesized
 /// empty document has no file (#5721): no scope makes `filename` answer `""`, and `file_index`
 /// and `document_index` fall back to the `0` yq gives it.
@@ -2350,6 +2357,7 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
             let mut index =
                 YamlIndex::build_yq(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
             index.render_merges_through_aliases_only(); // #4987, see the stdin site
+            note_synthesized_empty(&mut index); // #5008
             let root = index.root(bytes);
 
             match root.value() {
@@ -2439,6 +2447,7 @@ fn evaluate_yaml_direct_filtered(
         YamlIndex::build_yq(source).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?
     };
     index.render_merges_through_aliases_only(); // #4987, see the stdin site
+    note_synthesized_empty(&mut index); // #5008
     let bytes: &[u8] = streamed.as_deref().unwrap_or(source);
     let root = index.root(bytes);
 
@@ -11725,6 +11734,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             }
             // #4987: yq's rendering of a mapping expands only an alias `<<` source.
             index.render_merges_through_aliases_only();
+            note_synthesized_empty(&mut index); // #5008
 
             // #1350/#2486: `--sort-keys` has no soundness pass on the M2
             // fast path below -- fall back to the DOM evaluator (via
@@ -11953,6 +11963,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     index.suppress_header_doc_markers(); // #2795, see the stdin site
                 }
                 index.render_merges_through_aliases_only(); // #4987, see the stdin site
+                note_synthesized_empty(&mut index); // #5008
 
                 // #1350/#2486: see the stdin branch's identical check above
                 // for the full rationale.
@@ -12525,6 +12536,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 let mut index = YamlIndex::build_yq(&bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
                 index.render_merges_through_aliases_only(); // #4987, see the stdin site
+                note_synthesized_empty(&mut index); // #5008
                 parsed_sources.push((bytes, index));
             }
 
@@ -12815,6 +12827,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     index.suppress_header_doc_markers(); // #2795, see the stdin site
                 }
                 index.render_merges_through_aliases_only(); // #4987, see the stdin site
+                note_synthesized_empty(&mut index); // #5008
                 let root = index.root(&input_bytes);
 
                 {
