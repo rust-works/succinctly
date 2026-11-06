@@ -166,7 +166,7 @@ Error: YAML parse error: inconsistent indentation at line 3   # yq: did not find
 ```
 
 The same holds for a `-` in an open compact mapping's gap (`- k: a\n - z\n`, which #900 read as the next item of the outer sequence) and for a `-` on a nested sequence item's own virtual indent (`- - a\n - b\n`, which dropped the `b`).
-A `key: value` line in a compact mapping's gap is still read as a continuation of that mapping (#885), though yq refuses it too.
+A `key: value` line in a compact mapping's gap (`- k: a\n b: 1\n`, which #885 read as another entry of the mapping) is refused too ([#6385](https://github.com/rust-works/succinctly/issues/6385)).
 Before #485 an out-dented item lost more than itself: closing the sequence for the out-of-range indent reopened a second, untagged sequence as a sibling *child* of the mapping, which corrupted the next entry into a phantom `"":"c"` pair.
 Refusing the line is what keeps that from coming back.
 
