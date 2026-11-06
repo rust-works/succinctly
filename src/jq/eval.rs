@@ -32876,13 +32876,21 @@ fn build_regex_uncached<S: EvalSemantics>(
         // #6433: Oniguruma refuses a count past its limit as it lexes, unless it met another error
         // first: one the pattern before the brace has, and keeps with the count written small (a
         // refusal of the cut pattern alone may be the cut's, an unclosed group).
-        if let Some((brace, digits)) = oversized_interval(pattern, extended) {
+        if let Some((brace, counts)) = oversized_interval(pattern, extended) {
             let refusal = |p: &str| {
                 build_regex_uncached::<S>(p, flags)
                     .err()
                     .map(|e| e.to_string())
             };
-            let small = format!("{}1{}", &pattern[..digits.start], &pattern[digits.end..]);
+            // Every such count written small, so that neither compile below looks for one again.
+            let mut small = String::with_capacity(pattern.len());
+            let mut from = 0;
+            for digits in counts {
+                small.push_str(&pattern[from..digits.start]);
+                small.push('1');
+                from = digits.end;
+            }
+            small.push_str(&pattern[from..]);
             // Oniguruma meets these only at the end of the pattern, or after reading it whole.
             // The crate's own refusals (its parse errors, its size limit) are none of Oniguruma's.
             const LATE: [&str; 8] = [
@@ -33218,14 +33226,17 @@ fn build_regex_uncached<S: EvalSemantics>(
 #[cfg(feature = "regex")]
 const ONIG_MAX_REPEAT_NUM: u32 = 100_000;
 
-/// The byte offsets of the first brace and the digits of an interval count past
-/// [`ONIG_MAX_REPEAT_NUM`] (#6423, #6433), which jq refuses, or `None`. Oniguruma reads the number after a `{` as it lexes, before it knows whether the brace is
+/// The byte offset of the first brace with an interval count past [`ONIG_MAX_REPEAT_NUM`]
+/// (#6423, #6433), which jq refuses, and the byte ranges of every such count's digits, or `None`. Oniguruma reads the number after a `{` as it lexes, before it knows whether the brace is
 /// a repeat, so `x{100001}`, `x{100001`, `x{100001a}`, `x{1,100001 }` and `{100001}` are all
 /// `too big number for repeat range`, inside a look-around or an atomic group too. A brace in a
 /// class, a quoted run, a comment or a braced escape (`\x{..}`, `\p{..}`) is no interval, and
 /// neither is one the number does not follow at once (`{,100001}`, `{ 100001}`), which jq answers.
 #[cfg(feature = "regex")]
-fn oversized_interval(pattern: &str, extended: bool) -> Option<(usize, core::ops::Range<usize>)> {
+fn oversized_interval(
+    pattern: &str,
+    extended: bool,
+) -> Option<(usize, Vec<core::ops::Range<usize>>)> {
     if !pattern.contains('{') {
         return None;
     }
@@ -33242,6 +33253,12 @@ fn oversized_interval(pattern: &str, extended: bool) -> Option<(usize, core::ops
             value.len() > 6 || value.parse::<u32>().is_ok_and(|v| v > ONIG_MAX_REPEAT_NUM);
         (len, too_big)
     };
+    let byte = |at: usize| chars[..at].iter().map(|c| c.len_utf8()).sum::<usize>();
+    let mut first = None;
+    let mut counts = Vec::new();
+    // Whether the extended mode is on, per open group: from the flag, an inline `(?x)` or `(?-x)`
+    // (to the end of the group it stands in) and `(?x:...)` (#5550).
+    let mut x_mode = vec![extended];
     let mut i = 0;
     while i < chars.len() {
         match chars[i] {
@@ -33254,12 +33271,16 @@ fn oversized_interval(pattern: &str, extended: bool) -> Option<(usize, core::ops
             }
             '\\' => {
                 i += 2;
-                let braced = matches!(chars.get(i - 1), Some('x' | 'p' | 'P' | 'o' | 'N'));
-                if braced && chars.get(i) == Some(&'{') {
-                    i += chars[i..]
-                        .iter()
-                        .position(|&c| c == '}')
-                        .map_or(chars.len(), |n| n + 1);
+                match chars.get(i - 1) {
+                    // `\cX` takes the next character as its operand, a `{` included.
+                    Some('c') => i += 1,
+                    Some('x' | 'p' | 'P' | 'o') if chars.get(i) == Some(&'{') => {
+                        i += chars[i..]
+                            .iter()
+                            .position(|&c| c == '}')
+                            .map_or(chars.len(), |n| n + 1);
+                    }
+                    _ => {}
                 }
             }
             '[' => {
@@ -33289,7 +33310,54 @@ fn oversized_interval(pattern: &str, extended: bool) -> Option<(usize, core::ops
             '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') => {
                 i = comment_end(&chars, i);
             }
-            '#' if extended => {
+            // A callout (`(?{...})`, `(*name)`) holds no interval.
+            '(' if chars.get(i + 1) == Some(&'*')
+                || (chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'{')) =>
+            {
+                i += chars[i..]
+                    .iter()
+                    .position(|&c| c == ')')
+                    .map_or(chars.len(), |n| n + 1);
+            }
+            '(' => {
+                let current = *x_mode.last().unwrap_or(&false);
+                let mut inner = current;
+                let mut j = i + 1;
+                if chars.get(j) == Some(&'?') {
+                    j += 1;
+                    let mut on = true;
+                    while let Some(&c) = chars.get(j) {
+                        match c {
+                            '-' => on = false,
+                            'x' => inner = on,
+                            'i' | 'm' | 's' => {}
+                            _ => break,
+                        }
+                        j += 1;
+                    }
+                }
+                if chars.get(j) == Some(&')') && j > i + 1 {
+                    // `(?x)`: the rest of the enclosing group.
+                    if let Some(mode) = x_mode.last_mut() {
+                        *mode = inner;
+                    }
+                    i = j + 1;
+                } else {
+                    x_mode.push(if chars.get(j) == Some(&':') {
+                        inner
+                    } else {
+                        current
+                    });
+                    i += 1;
+                }
+            }
+            ')' => {
+                if x_mode.len() > 1 {
+                    x_mode.pop();
+                }
+                i += 1;
+            }
+            '#' if *x_mode.last().unwrap_or(&false) => {
                 i += chars[i..]
                     .iter()
                     .position(|&c| c == '\n')
@@ -33302,25 +33370,27 @@ fn oversized_interval(pattern: &str, extended: bool) -> Option<(usize, core::ops
                 if len == 0 {
                     continue;
                 }
-                let mut digits = i..i + len;
+                let lower = i..i + len;
                 i += len;
-                let upper_too_big = chars.get(i) == Some(&',') && {
-                    let (len, upper) = count_at(i + 1);
-                    if upper && !too_big {
-                        digits = i + 1..i + 1 + len;
+                let mut upper = None;
+                if chars.get(i) == Some(&',') {
+                    let (len, big) = count_at(i + 1);
+                    if big {
+                        upper = Some(i + 1..i + 1 + len);
                     }
                     i += 1 + len;
-                    upper
-                };
-                if too_big || upper_too_big {
-                    let byte = |at: usize| chars[..at].iter().map(|c| c.len_utf8()).sum::<usize>();
-                    return Some((byte(brace), byte(digits.start)..byte(digits.end)));
+                }
+                if too_big || upper.is_some() {
+                    first.get_or_insert(byte(brace));
+                    for digits in [too_big.then_some(lower), upper].into_iter().flatten() {
+                        counts.push(byte(digits.start)..byte(digits.end));
+                    }
                 }
             }
             _ => i += 1,
         }
     }
-    None
+    first.map(|brace| (brace, counts))
 }
 
 /// Oniguruma's message for a pattern the `regex` crate refused with a parse error of its own
@@ -33394,9 +33464,16 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                 // `\k<name>` and `\g<name>` to a group the pattern does not have; one it has is
                 // a call or a reference jq answers, which the crate cannot.
                 ErrorKind::EscapeUnrecognized
-                    if at(start).starts_with("\\k<") || at(start).starts_with("\\g<") =>
+                    if ["\\k<", "\\g<", "\\k'", "\\g'"]
+                        .iter()
+                        .any(|open| at(start).starts_with(open)) =>
                 {
-                    let Some((name, _)) = at(start + 3).split_once('>') else {
+                    let close = if at(start + 2).starts_with('<') {
+                        '>'
+                    } else {
+                        '\''
+                    };
+                    let Some((name, _)) = at(start + 3).split_once(close) else {
                         // `\k<x`: the name runs to the end of the pattern.
                         return Some(format!("invalid group name <{}>", at(start + 3)));
                     };
@@ -33414,6 +33491,10 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                         let before = group_facts_of(&chars_before(start)).total;
                         // Oniguruma resolves a call after reading the whole pattern, so an error
                         // later in it comes first.
+                        // A signed zero names no group (`\g<+0>`).
+                        if count == 0 && name != numbered {
+                            return Some(format!("invalid group name <{name}>"));
+                        }
                         let late = match name.as_bytes()[0] {
                             _ if count == 0 => "never ending recursion".into(),
                             b'-' if count > before => "never ending recursion".into(),
@@ -33469,7 +33550,11 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                 {
                     match at(start + 1).split_once('\'') {
                         Some((name, rest)) => retry(format!("{}<{name}>{rest}", &pattern[..start])),
-                        None => Some(format!("invalid group name <{}>", at(start + 1))),
+                        // The name stops at the group's `)` when it has one (`(?'na)`).
+                        None => Some(format!(
+                            "invalid group name <{}>",
+                            at(start + 1).split(')').next().unwrap_or_default()
+                        )),
                     }
                 }
                 // A look-around or an atomic group the crate cannot read, left open.

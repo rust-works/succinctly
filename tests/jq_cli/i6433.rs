@@ -59,6 +59,15 @@ fn a_count_past_the_limit_is_refused_wherever_the_brace_stands_6433() -> Result<
         ("x{,100001}", "false"),
         ("(?x)a { 100001}", "false"),
         ("x{00100000}", "false"),
+        // `\cX` takes the `{` as its operand; `\N` has no braced form, so its braces count.
+        (r"\c{100001}", "false"),
+        (r"\N{100001}", TOO_BIG),
+        // A comment of the extended mode, which inline flags turn on and off per group.
+        ("(?x)#{100001}\na", "true"),
+        ("(?ix)#{100001}", "true"),
+        ("a(?x)b#{100001}", "false"),
+        ("(?x:a#{100001})", "end pattern with unmatched parenthesis"),
+        ("a{100001}#", TOO_BIG),
     ])
 }
 
@@ -91,6 +100,9 @@ fn a_call_has_its_own_refusals_6433() -> Result<()> {
         (r"\g<-1>", "never ending recursion"),
         (r"(a)\g<-2>", "never ending recursion"),
         (r"\g<0>", "never ending recursion"),
+        // A signed zero names no group.
+        (r"(a)\g<+0>", "invalid group name <+0>"),
+        (r"\g<-0>", "invalid group name <-0>"),
         // The first of two calls' refusals, and a later unclosed group before a call's.
         (r"\g<n>\g<1>", "undefined name <n> reference"),
         (
@@ -106,6 +118,8 @@ fn an_error_after_a_construct_the_crate_cannot_read_is_found_6433() -> Result<()
         (r"(?'x'a)\k<y>", "undefined name <y> reference"),
         ("(?'x", "invalid group name <x>"),
         ("(?'x'", "end pattern with unmatched parenthesis"),
+        ("(?'na)", "invalid group name <na>"),
+        (r"(?'n'a)\k'n'(", "end pattern with unmatched parenthesis"),
         ("(?'m'b)(?'m'b)(", "end pattern with unmatched parenthesis"),
         ("(?<m>b)(?<m>b)(", "end pattern with unmatched parenthesis"),
         (r"(?<x>a)\k<x>(", "end pattern with unmatched parenthesis"),
@@ -117,4 +131,39 @@ fn an_error_after_a_construct_the_crate_cannot_read_is_found_6433() -> Result<()
         (r"(?'x'a)\k<x>", "false"),
         ("(?<m>b)(?<m>b)", "false"),
     ])
+}
+
+/// The extended mode set by the flag, and turned off inline, for the rest of the group.
+#[test]
+fn an_inline_flag_turns_the_extended_mode_off_6433() -> Result<()> {
+    for pattern in ["(?-x)#{100001}", "(?-x:#{100001})"] {
+        let filter = format!(
+            r#"try test({}; "x") catch ."#,
+            serde_json::to_string(pattern)?
+        );
+        let (stdout, _, code) = run_jq_full(&["-c", &filter], Some(r#""a""#))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (r#""Regex failure: too big number for repeat range""#, 0),
+            "{pattern}"
+        );
+    }
+    let filter = r##"try test("#{100001}"; "x") catch ."##;
+    let (stdout, _, _) = run_jq_full(&["-c", filter], Some(r#""a""#))?;
+    assert_eq!(stdout.trim_end(), "true");
+    Ok(())
+}
+
+/// Each oversized count is written small once, so a long run of them after an earlier error costs
+/// one more compile, not one per count (#6433 review).
+#[test]
+fn many_oversized_counts_after_an_earlier_error_are_one_compile_6433() -> Result<()> {
+    let pattern = format!("[b-a]{}", "a{100001}".repeat(2000));
+    let started = std::time::Instant::now();
+    assert_eq!(
+        caught(&pattern)?,
+        r#""Regex failure: empty range in char class""#
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    Ok(())
 }
