@@ -35912,6 +35912,19 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             }
         }
     }
+    // #5450: yq's `map(key)` over a mapping with a member is `[.[] | key]`, whose key nodes keep
+    // the presentation they were written with. An empty mapping is its own answer (#5918); a
+    // sequence's indexes and a scalar or `null` have no key node to keep.
+    if let Some((family, f)) = map_family_body(builtin) {
+        if yq_map_of_key_nodes::<S>(family, f)
+            && cursor.is_some()
+            && value.as_object().is_some_and(|m| !m.is_empty())
+        {
+            let collected =
+                Expr::array(Expr::pipe(vec![Expr::Iterate, Expr::Builtin(Builtin::Key)]));
+            return eval_single::<S, V>(&collected, value, optional, cursor);
+        }
+    }
     // #2471 (gate reason 1 of spine 2416): a map-family body that reads path
     // context is evaluated once per member, at the member's own position.
     // Gated on `needs_path_context` so an ordinary `map_values(.+1)` never
@@ -41049,6 +41062,17 @@ fn map_family_positioned(stage: &Expr) -> Option<(MapFamily, &Expr)> {
         return None;
     };
     map_family_positioned_builtin(builtin)
+}
+
+/// Whether `map(key)` in yq mode stays on the lazy `map` route (#5450).
+///
+/// The positioned route below answers every member's `key` as a plain string. The lazy route
+/// hands back each member's key *node* (a live cursor), as `[.[] | key]` does, so the key keeps
+/// the quoting, `~` spelling or anchor it was written with, which yq prints.
+fn yq_map_of_key_nodes<S: EvalSemantics>(family: MapFamily, f: &Expr) -> bool {
+    S::TAG == EvalTag::Yq
+        && matches!(family, MapFamily::Map)
+        && matches!(strip_parens(f), Expr::Builtin(Builtin::Key))
 }
 
 /// [`map_family_positioned`] for the builtin itself, which is what
