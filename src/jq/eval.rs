@@ -32882,7 +32882,7 @@ fn build_regex_uncached<S: EvalSemantics>(
         let pattern = absence.as_deref().unwrap_or(pattern);
         let scanned =
             refuse_possessive_quantifier_for(pattern, extended, n_flag).unwrap_or_else(|refusal| {
-                deferred_refusal = Some(refusal);
+                deferred_refusal.get_or_insert(refusal);
                 std::borrow::Cow::Borrowed(pattern)
             });
         let scanned = match escape_class_range_dashes(&scanned, extended) {
@@ -33244,81 +33244,90 @@ fn refuse_oversized_repeat(pattern: &str) -> Option<EvalError> {
 /// `{`, whatever follows it: `a{100001 }`, `a{100001x}`, `a{1,100001`, `{100001}` with nothing to
 /// repeat, and the same inside a look-around or an atomic group, which the `regex` crate's parser
 /// does not read. A count needs a digit straight after the `{` (`a{ 100001}` is text), and `{,m}`
-/// is answered. Escapes (`\{`, `\x{..}`, `\p{..}`), classes, `(?#..)` comments and `\Q..\E` runs
-/// are skipped; a pattern whose `#` may start a comment (`extended`, or an inline `(?x)`) is not
-/// scanned. It reads the pattern as written, before the pre-pass makes a `{` that is no interval
-/// into text for the crate.
+/// is answered. Escapes (`\{`, `\x{..}`, `\p{..}`), classes (a `]` straight after the `[` or `[^` is a
+/// member), `(?#..)` comments and `\Q..\E` runs are skipped.
+///
+/// Where the extended mode may be on (`extended`, or an inline `(?x)`) the scan stops at the first
+/// `#` outside a class, which may start a comment; a count before it is a count, and
+/// [`refuse_oversized_repeat`] reads the rest from the tree. It reads the pattern as written, before
+/// the pre-pass makes a `{` that is no interval into text for the crate.
 #[cfg(feature = "regex")]
 fn oversized_count_in_text(pattern: &str, extended: bool) -> bool {
-    fn too_big(digits: &[char]) -> bool {
-        let significant: Vec<&char> = digits.iter().skip_while(|c| **c == '0').collect();
+    fn too_big(digits: &[u8]) -> bool {
+        let at = digits
+            .iter()
+            .position(|b| *b != b'0')
+            .unwrap_or(digits.len());
+        let significant = &digits[at..];
         significant.len() > 6
             || significant
                 .iter()
-                .fold(0u32, |n, c| n * 10 + (**c as u32 - '0' as u32))
+                .fold(0u32, |n, b| n * 10 + u32::from(b - b'0'))
                 > ONIG_MAX_REPEAT_NUM
     }
-    // A count needs six digits, and a pattern that may hold a comment is not judged by its text.
-    if !pattern
-        .as_bytes()
-        .windows(6)
-        .any(|w| w.iter().all(u8::is_ascii_digit))
-        || (pattern.contains('#') && (extended || inline_extended(pattern)))
-    {
+    let bytes = pattern.as_bytes();
+    // A count needs a `{` and six digits, and most patterns have neither.
+    if !pattern.contains('{') || !bytes.windows(6).any(|w| w.iter().all(u8::is_ascii_digit)) {
         return false;
     }
-    let chars: Vec<char> = pattern.chars().collect();
+    let comments = extended || inline_extended(pattern);
     let digits_from = |at: usize| {
-        chars[at..]
+        bytes[at..]
             .iter()
-            .take_while(|c| c.is_ascii_digit())
+            .take_while(|b| b.is_ascii_digit())
             .count()
     };
     let mut i = 0;
     let mut class_depth = 0usize;
-    while i < chars.len() {
-        match chars[i] {
-            '\\' => {
-                match chars.get(i + 1) {
-                    // `\Q..\E`: everything up to the `\E` is text.
-                    Some('Q') => {
-                        while i < chars.len()
-                            && !(chars[i] == '\\' && chars.get(i + 1) == Some(&'E'))
-                        {
-                            i += 1;
-                        }
-                        i += 2;
-                        continue;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => match bytes.get(i + 1) {
+                // `\Q..\E`: everything up to the `\E` is text (inside a class it is an escaped `Q`).
+                Some(b'Q') if class_depth == 0 => {
+                    while i < bytes.len() && !pattern[i..].starts_with("\\E") {
+                        i += 1;
                     }
-                    // `\x{..}`, `\p{..}` and the like: the braces name a character or property.
-                    Some('x' | 'p' | 'P' | 'u' | 'o' | 'N') if chars.get(i + 2) == Some(&'{') => {
-                        while i < chars.len() && chars[i] != '}' {
-                            i += 1;
-                        }
+                    i += 2;
+                    continue;
+                }
+                // `\x{..}`, `\p{..}` and the like: the braces name a character or property.
+                Some(b'x' | b'p' | b'P' | b'u' | b'o' | b'N')
+                    if bytes.get(i + 2) == Some(&b'{') =>
+                {
+                    while i < bytes.len() && bytes[i] != b'}' {
+                        i += 1;
                     }
-                    _ => i += 1,
+                }
+                _ => i += 1,
+            },
+            b'[' => {
+                class_depth += 1;
+                // A `]` straight after the `[` or the `[^` is a member of the class.
+                let mut member = i + 1;
+                if bytes.get(member) == Some(&b'^') {
+                    member += 1;
+                }
+                if bytes.get(member) == Some(&b']') {
+                    i = member;
                 }
             }
-            '[' => class_depth += 1,
-            ']' if class_depth > 0 => class_depth -= 1,
-            '(' if class_depth == 0
-                && chars.get(i + 1) == Some(&'?')
-                && chars.get(i + 2) == Some(&'#') =>
-            {
-                while i < chars.len() && chars[i] != ')' {
+            b']' if class_depth > 0 => class_depth -= 1,
+            b'#' if comments && class_depth == 0 => return false,
+            b'(' if class_depth == 0 && pattern[i..].starts_with("(?#") => {
+                while i < bytes.len() && bytes[i] != b')' {
                     i += 1;
                 }
             }
-            '{' if class_depth == 0 => {
+            b'{' if class_depth == 0 => {
                 let first = digits_from(i + 1);
                 if first > 0 {
-                    if too_big(&chars[i + 1..i + 1 + first]) {
+                    if too_big(&bytes[i + 1..i + 1 + first]) {
                         return true;
                     }
                     let comma = i + 1 + first;
-                    if chars.get(comma) == Some(&',') {
+                    if bytes.get(comma) == Some(&b',') {
                         let second = digits_from(comma + 1);
-                        if second > 0 && too_big(&chars[comma + 1..comma + 1 + second]) {
+                        if second > 0 && too_big(&bytes[comma + 1..comma + 1 + second]) {
                             return true;
                         }
                     }

@@ -142,6 +142,48 @@ fn a_count_past_oniguruma_s_limit_is_refused_where_jq_reads_it_6433() -> Result<
         ("a{100001}", "z", "\"z is not a valid modifier string\""),
         ("\\x{100001}a", "", "false"),
         ("\\x{100001}{2}", "", "false"),
+        ("[]{100001}]", "", "false"),
+        ("[^]{100001}]", "", "true"),
+        (
+            "[]a]{100001}",
+            "",
+            "\"Regex failure: too big number for repeat range\"",
+        ),
+        (
+            "[\\Qab]{100001}",
+            "",
+            "\"Regex failure: too big number for repeat range\"",
+        ),
+        (
+            "(?x) a{100001} # note",
+            "",
+            "\"Regex failure: too big number for repeat range\"",
+        ),
+        (
+            "(?x) a # note\n b{100001}",
+            "",
+            "\"Regex failure: too big number for repeat range\"",
+        ),
+        (
+            "a*+b{100001}",
+            "",
+            "\"Regex failure: too big number for repeat range\"",
+        ),
+        (
+            "a{100001}b*+",
+            "",
+            "\"Regex failure: too big number for repeat range\"",
+        ),
+        (
+            "a{100001} # note",
+            "x",
+            "\"Regex failure: too big number for repeat range\"",
+        ),
+        (
+            "a # {100001}\n b{100001}",
+            "x",
+            "\"Regex failure: too big number for repeat range\"",
+        ),
     ] {
         let (stdout, _, status) = run_jq_full(
             &[
