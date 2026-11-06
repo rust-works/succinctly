@@ -730,8 +730,14 @@ impl Rewriter<'_> {
                 if !rep.greedy && has_switch(&rep.ast) {
                     body.ways = Ways::Unknown;
                 }
-                if matches!(body.ways, Ways::Anchored { .. }) {
-                    return self.anchored_repeat(&rep.ast, body, min, max, rep.greedy);
+                if let Ways::Anchored {
+                    before,
+                    anchor,
+                    after,
+                } = &body.ways
+                {
+                    let ways = (before, &**anchor, after);
+                    return self.anchored_repeat(&rep.ast, &body.text, ways, min, max, rep.greedy);
                 }
                 let grouped = (self.copies || self.captures) && has_capture(&rep.ast);
                 if !rep.greedy && max.is_none() && self.oniguruma_unrolls(&rep.ast, min) {
@@ -1612,22 +1618,15 @@ impl Rewriter<'_> {
     fn anchored_repeat(
         &mut self,
         ast: &Ast,
-        body: Piece,
+        body: &Text,
+        (before, anchor, after): (&Option<Text>, &Anchor, &Option<Text>),
         min: u32,
         max: Option<u32>,
         greedy: bool,
     ) -> Result<Piece, GiveUp> {
-        let Ways::Anchored {
-            before,
-            anchor,
-            after,
-        } = body.ways
-        else {
-            return Err(GiveUp);
-        };
         let grouped = has_capture(ast);
         let ways = if grouped { Ways::Unknown } else { Ways::Opaque };
-        let written = self.repeat_text(&body.text, min, max, greedy)?;
+        let written = self.repeat_text(body, min, max, greedy)?;
         let kept = Piece {
             text: written.clone(),
             ways: ways.clone(),
@@ -1660,6 +1659,7 @@ impl Rewriter<'_> {
                 if min < 2 || (max.is_none() && self.oniguruma_unrolls(ast, min)) {
                     return Ok(kept);
                 }
+                let (before, after) = (before.clone(), after.clone());
                 let piece =
                     self.lazy_counted(before, after, min, max, written, Some(exit.clone()))?;
                 return Ok(Piece {
@@ -1668,14 +1668,14 @@ impl Rewriter<'_> {
                 });
             }
             (true, None) => {
-                let mut rest = self.anchored_loop(&before, &anchor, &after, &exit)?;
+                let mut rest = self.anchored_loop(before, anchor, after, &exit)?;
                 if min > 0 && copied(ops, min) {
-                    let copies = self.repeat_text(&body.text, min, Some(min), true)?;
+                    let copies = self.repeat_text(body, min, Some(min), true)?;
                     rest = self.concat_text(&[&copies, &rest])?;
                 } else {
                     for _ in 0..min {
-                        let first = consuming(self, &before, &rest)?;
-                        let last = consuming(self, &after, &rest)?;
+                        let first = consuming(self, before, &rest)?;
+                        let last = consuming(self, after, &rest)?;
                         let list: Vec<Text> = first
                             .into_iter()
                             .chain([exit.clone()])
@@ -1692,8 +1692,8 @@ impl Rewriter<'_> {
                 }
                 let mut rest = self.concat_text(&[])?;
                 for k in 0..n {
-                    let first = consuming(self, &before, &rest)?;
-                    let last = consuming(self, &after, &rest)?;
+                    let first = consuming(self, before, &rest)?;
+                    let last = consuming(self, after, &rest)?;
                     let run = n - 1 - k;
                     let leave = (run >= min).then(|| self.concat_text(&[])).transpose()?;
                     let list: Vec<Text> = first
@@ -2465,6 +2465,14 @@ mod tests {
             let text = written(pattern).unwrap_or_else(|| panic!("{pattern} is written"));
             assert!(text.contains(holds), "{pattern}: {text}");
         }
+        // A flag group's flags reach the anchor, so they reach what stands for it: its complement.
+        let flagged = written(r"((?i:\b|a))*").unwrap_or_default();
+        assert!(flagged.contains(r"(?i:\B)"), "{flagged}");
+        assert!(flagged.contains(r"(?i:\b)"), "{flagged}");
+        // An anchor with no complement is wrapped alone, and a switch reaches the later ways.
+        assert!(written(r"((?i:\A|a))*").is_some_and(|t| t.contains(r"((?i:a))")));
+        let scoped = written(r"((?i)a|\b|b)*").unwrap_or_default();
+        assert!(scoped.contains(r"(?i:\B)"), "{scoped}");
         // A lazy repeat that may stop at once keeps its text: `c` is an exit that has already failed.
         assert_eq!(written(r"(\b|a)*?"), None);
         // A repeat that runs once is that one copy, which is what the crate reads the text as.
