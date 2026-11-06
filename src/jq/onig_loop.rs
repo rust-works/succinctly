@@ -2625,6 +2625,14 @@ mod tests {
         assert_eq!(read.text, "(?<n__d1>a)(?<n>b)(?<n__d2>c)");
         // Any other refusal stays one.
         assert!(parse_distinct_names("(?<n>a").is_none());
+        // Past the cap the pattern keeps its text: the parse is refused, not answered wrongly.
+        let many = "(?<n>a)".repeat(MAX_NAME_RENAMES + 2);
+        assert!(parse_distinct_names(&many).is_none());
+        let at_cap = "(?<n>a)".repeat(MAX_NAME_RENAMES + 1);
+        assert_eq!(
+            parse_distinct_names(&at_cap).unwrap().renames.len(),
+            MAX_NAME_RENAMES
+        );
     }
 
     #[test]
