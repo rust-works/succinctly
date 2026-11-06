@@ -2831,34 +2831,69 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             && super::line_is_structural(self.input, self.pos)
     }
 
-    /// #6286: the line at `line_start` is spaces, a tab and nothing else, the tab sits at a column no
-    /// deeper than the block that owns the plain scalar just before it, and only blank lines
-    /// separate the two. go-yaml refuses such a line (`found a tab character that violates
-    /// indentation`); to this parser it is an empty line, so the scalar scanner stops short of it,
-    /// [`Self::skip_newlines`] leaves it, and `parse_document_line` raises the error.
-    fn tab_only_line_ends_plain_scalar(&self, line_start: usize) -> bool {
+    /// The number of spaces before the tab of the line at `line_start` when that line is spaces, a tab
+    /// and nothing else but blanks (#6286, #6295), `None` for any other line.
+    fn tab_only_line_indent(&self, line_start: usize) -> Option<usize> {
         let mut at = line_start;
         while self.input.get(at) == Some(&b' ') {
             at += 1;
         }
         let indent = at - line_start;
         if self.input.get(at) != Some(&b'\t') {
-            return false;
+            return None;
         }
         while matches!(self.input.get(at), Some(b' ' | b'\t')) {
             at += 1;
         }
-        if at < self.input.len() && !is_line_break(self.input[at]) {
-            return false;
-        }
-        let Some(span) = self.last_plain_scalar else {
+        (at >= self.input.len() || is_line_break(self.input[at])).then_some(indent)
+    }
+
+    /// Whether the last plain scalar ends at or before `line_start` with only blank lines between.
+    fn plain_scalar_directly_before(&self, line_start: usize) -> bool {
+        self.last_plain_scalar.is_some_and(|span| {
+            span.end <= line_start
+                && self.input[span.end..line_start]
+                    .iter()
+                    .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        })
+    }
+
+    /// Whether go-yaml refuses the line at `line_start`, which is spaces, a tab and nothing else, where this
+    /// parser would read an empty line (#6286, #6295). The one decision for every site (`skip_newlines`,
+    /// `parse_document_line`, [`Self::reject_tab_only_line_at_cursor`]), with one scan of the line.
+    ///
+    /// go-yaml's `scan_to_next_token` skips a tab only where a simple key is not allowed, which is never
+    /// at the start of a block-context line, so it stops with `found a tab character that violates
+    /// indentation` at every column. The lines it does not reach are the ones a scalar scanner takes:
+    ///
+    /// - after a plain scalar the scanner consumes the blank lines itself, and refuses the tab only at a
+    ///   column no deeper than the block that owns the scalar (#6286);
+    /// - a block scalar's content takes it as text (it never reaches `skip_newlines`);
+    /// - in the head of the first document yq's header slurp takes the line away, so nothing before the
+    ///   first node of the first document refuses it. After anything else (a flow collection, a quoted
+    ///   scalar, a comment, an empty value, a property, a `---` that is not the first) it is refused.
+    fn tab_only_line_is_refused(&self, line_start: usize) -> bool {
+        let Some(indent) = self.tab_only_line_indent(line_start) else {
             return false;
         };
-        indent <= span.owner
-            && span.end <= line_start
-            && self.input[span.end..line_start]
-                .iter()
-                .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        match self.last_plain_scalar {
+            Some(span) if self.plain_scalar_directly_before(line_start) => indent <= span.owner,
+            _ => self.documents_started > 1 || self.bp_pos > self.document_start_bp_pos,
+        }
+    }
+
+    /// [`Self::tab_only_line_is_refused`] for the line the cursor stopped at, for the sites that look
+    /// past an empty value or key and would otherwise take the line as its blank prefix (#6295: `a:` /
+    /// ` ⇥` is refused by yq, and was read as `{"a": null}`; `?` / ` ⇥` / `  a` as `{"a": null}` too).
+    fn reject_tab_only_line_at_cursor(&self) -> Result<(), YamlError> {
+        let at_line_start = self.pos == 0 || Self::is_break(self.input[self.pos - 1]);
+        if at_line_start && self.tab_only_line_is_refused(self.pos) {
+            return Err(YamlError::TabIndentation {
+                line: self.current_line(),
+                offset: self.pos,
+            });
+        }
+        Ok(())
     }
 
     /// Skip `s-separate-in-line` whitespace still sitting on the cursor after
@@ -3301,12 +3336,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 let comment_start = self.pos;
                 self.skip_to_eol();
                 self.record_standalone_comment(comment_start, self.pos);
+            } else if b == b'\t'
+                && (self.pos == 0 || Self::is_break(self.input[self.pos - 1]))
+                && self.documents_started <= 1
+                && self.bp_pos == self.document_start_bp_pos
+                && self.tab_only_line_indent(self.pos).is_some()
+            {
+                // #6295: a tab-only line in the head of the first document is yq's header, which its
+                // slurp takes away (`---` / `⇥` / `a: 1`): an empty line, as a space-led one is.
+                self.skip_inline_whitespace();
             } else if b == b' ' {
                 // Check if rest of line is whitespace or comment
                 let start = self.pos;
                 // #6286: a tab-only line go-yaml refuses is left for the line dispatcher to reject.
                 if (start == 0 || Self::is_break(self.input[start - 1]))
-                    && self.tab_only_line_ends_plain_scalar(start)
+                    && self.tab_only_line_is_refused(start)
                 {
                     break;
                 }
@@ -3543,15 +3587,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// which also means a misspelled directive name (e.g. `%YAM`, `%YAMLL`)
     /// is skipped exactly like a well-formed one, with no name matching at
     /// all.
-    fn skip_directives(&mut self) {
+    fn skip_directives(&mut self) -> Result<(), YamlError> {
         loop {
-            self.skip_directive_gap_whitespace();
+            self.skip_directive_gap_whitespace()?;
             if self.in_document || self.peek() != Some(b'%') {
                 break;
             }
             self.skip_to_eol();
             self.skip_line_break();
         }
+        Ok(())
     }
 
     /// Skip blank lines (including tab-only ones) and comment lines between
@@ -3565,7 +3610,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// `count_indent` can reject it as invalid indentation inside a
     /// document's actual content. Folding the two together silently stopped
     /// rejecting that case (`Y79Y/000`).
-    fn skip_directive_gap_whitespace(&mut self) {
+    fn skip_directive_gap_whitespace(&mut self) -> Result<(), YamlError> {
         while let Some(b) = self.peek() {
             if is_line_break(b) {
                 self.skip_line_break();
@@ -3578,6 +3623,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.record_standalone_comment(comment_start, self.pos);
             } else if b == b' ' || b == b'\t' {
                 let start = self.pos;
+                // #6295: after a `...` the gap is not yq's header (its slurp only takes the head of the
+                // input), so a tab-only line there is go-yaml's refused one, not an empty line.
+                if self.documents_started >= 1
+                    && (start == 0 || Self::is_break(self.input[start - 1]))
+                    && self.tab_only_line_indent(start).is_some()
+                {
+                    return Err(YamlError::TabIndentation {
+                        line: self.current_line(),
+                        offset: start,
+                    });
+                }
                 self.skip_inline_whitespace();
                 if self.at_break() || self.peek() == Some(b'#') || self.peek().is_none() {
                     if self.peek() == Some(b'#') {
@@ -3593,6 +3649,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 break;
             }
         }
+        Ok(())
     }
 
     /// Parse a double-quoted string.
@@ -4938,6 +4995,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             // Look ahead to determine if this is a null value or a nested structure
             self.skip_newlines();
+            self.reject_tab_only_line_at_cursor()?;
             if self.peek().is_none() {
                 // EOF - null value: emit empty value node
                 self.set_ib();
@@ -5179,6 +5237,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             // Look ahead to see what the next content line looks like
             self.skip_newlines();
+            self.reject_tab_only_line_at_cursor()?;
             if self.peek().is_none() {
                 // EOF - null value: emit empty value node
                 self.set_ib();
@@ -5351,6 +5410,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
                 // Look at next content line
                 self.skip_newlines();
+                self.reject_tab_only_line_at_cursor()?;
                 if self.peek().is_none() {
                     // EOF - value is null, create explicit null node for anchor
                     self.pos = saved_pos;
@@ -5550,6 +5610,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             // Look ahead to see what's on the next line
             self.skip_newlines();
+            self.reject_tab_only_line_at_cursor()?;
             if self.peek().is_none() {
                 // EOF - empty key (null) with implicit null value
                 // Emit empty key node using the position after `?`
@@ -7935,7 +7996,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// Detect content indentation from the first non-empty line.
     /// Returns the indentation level, or None if block is empty.
-    fn detect_block_content_indent(&mut self, base_indent: usize) -> Option<usize> {
+    fn detect_block_content_indent(
+        &mut self,
+        base_indent: usize,
+    ) -> Result<Option<usize>, YamlError> {
         let saved_pos = self.pos;
 
         // Scan ahead to find first non-empty line
@@ -7943,7 +8007,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             if self.peek().is_none() {
                 // EOF - empty block scalar
                 self.pos = saved_pos;
-                return None;
+                return Ok(None);
             }
 
             // Count spaces at start of line (SIMD accelerated)
@@ -7955,6 +8019,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // Empty line - skip and continue
                     self.skip_line_break();
                 }
+                // #6295: the scalar's indent is not known yet, and go-yaml refuses a tab right after
+                // the spaces of any line it scans for it, blank or not (`found a tab character where
+                // an indentation space is expected`): ` \t` before the first content line is no
+                // empty line, and a first content line that starts with a tab has no indent.
+                Some(b'\t') => {
+                    return Err(YamlError::TabIndentation {
+                        line: self.current_line(),
+                        offset: self.pos,
+                    });
+                }
                 Some(b'#') if indent <= base_indent => {
                     // Comment line at or below the parent's indent - skip to end. A `#` line indented deeper
                     // is the first content line (#5073) and falls to the arm below: it sets the indent, so a
@@ -7965,7 +8039,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 None => {
                     // EOF
                     self.pos = saved_pos;
-                    return None;
+                    return Ok(None);
                 }
                 _ => {
                     // Found content - restore position and return indent
@@ -7973,9 +8047,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
                     if indent <= base_indent {
                         // Content must be more indented than indicator
-                        return None;
+                        return Ok(None);
                     }
-                    return Some(indent);
+                    return Ok(Some(indent));
                 }
             }
         }
@@ -8125,7 +8199,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             content_indent
         } else {
             // Auto-detect from first content line
-            match self.detect_block_content_indent(base_indent) {
+            match self.detect_block_content_indent(base_indent)? {
                 Some(indent) => indent,
                 None => {
                     // Empty block scalar. `self.pos` sits at the start of the
@@ -8657,7 +8731,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     fn parse_documents(&mut self) -> Result<(), YamlError> {
         // Skip any `%YAML`/`%TAG`/reserved directive lines before the first
         // document (#225).
-        self.skip_directives();
+        self.skip_directives()?;
 
         // Skip leading `---` if present (optional for first doc)
         if self.is_document_start() {
@@ -8716,7 +8790,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
                 // A directive can recur here for the next document, e.g.
                 // after a `...` end marker (#225).
-                self.skip_directives();
+                self.skip_directives()?;
 
                 // Check for another document or EOF (a directive-only tail
                 // can itself exhaust the input).
@@ -8859,7 +8933,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             });
         }
 
-        if self.tab_only_line_ends_plain_scalar(line_start) {
+        // The cursor is past the line's spaces: only a line whose next byte is the tab can be the one.
+        if self.peek() == Some(b'\t') && self.tab_only_line_is_refused(line_start) {
             return Err(YamlError::TabIndentation {
                 line: self.current_line(),
                 offset: self.pos,

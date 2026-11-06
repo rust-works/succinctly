@@ -326,9 +326,11 @@ fn the_loader_never_reports_tab_indentation_for_a_valid_corpus_case() {
     let mut checked = 0usize;
 
     // Valid per the suite, refused by yq v4.53.3 (`found a tab character that violates indentation`):
-    // `foo: 1` then a line of one tab. Reference fidelity wins (#6286, ADR-0018); the row is listed
-    // in docs/compliance/yaml/limitations.md.
-    const REFUSED_BY_YQ: &[&str] = &["DK95/04"];
+    // `foo: 1` then a line of one tab (DK95/04, #6286), and a block scalar with a tab after the spaces
+    // of a line scanned for its indent (96NN/00, 96NN/01, R4YG, Y79Y/001: `found a tab character where
+    // an indentation space is expected`, #6295). Reference fidelity wins (ADR-0018); the rows are
+    // listed in docs/compliance/yaml/limitations.md.
+    const REFUSED_BY_YQ: &[&str] = &["DK95/04", "96NN/00", "96NN/01", "R4YG", "Y79Y/001"];
 
     for case in &cases {
         if case["fail"].as_bool().unwrap_or(false) {
