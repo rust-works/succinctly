@@ -41,9 +41,11 @@
 //! `\K`, `\G`, a comment) is parsed through `oniguruma_shadow`'s copy of it, which writes that syntax
 //! plainly at the same offsets, and every piece's text is still taken from the pattern (#6128).
 //! Those constructs are opaque: a body holding one keeps its loop, and a lookaround or atomic
-//! group has its own body rewritten. The groups of a loop beside such syntax are copied too (#6426),
-//! when the syntax stands outside every repeat and holds no repeat and no group
-//! ([`copyable_beside_loops`]); the evaluator runs the text on `fancy-regex`. A lazy repeat that must run twice or more is written copy by
+//! group has its own body rewritten.
+//! The groups of a loop beside such syntax are copied too (#6426), when the syntax stands outside
+//! every repeat and holds no repeat and no group ([`copyable_beside_loops`]); the evaluator runs the
+//! text on `fancy-regex`.
+//! A lazy repeat that must run twice or more is written copy by
 //! copy up to its minimum by `Rewriter::lazy_counted`, which also writes a lazy `{0,n}?` or `{1,n}?`
 //! with a group; for an unbounded one over a body with a consuming way before
 //! its empty one that form still differs from Oniguruma's on a few patterns (#6128).
@@ -270,24 +272,15 @@ pub(crate) struct GroupRewrite {
 /// names out of the tree reads them back through [`original_name`]. The text is `pattern` itself
 /// when no name repeats. `None` for a pattern the parser refuses for any other reason.
 pub(crate) fn parse_distinct_names(pattern: &str) -> Option<DistinctNames> {
-    distinct_names(pattern, None)
-}
-
-/// [`parse_distinct_names`] over `parsed`, the text the parser reads, with each rename also made in
-/// `real`, the pattern it stands for (#6426): the shadow of a pattern with Oniguruma syntax is as
-/// long as the pattern and holds its group names where the pattern does. The result's text is `real`
-/// when there is one.
-fn distinct_names(parsed: &str, real: Option<&str>) -> Option<DistinctNames> {
-    let mut parsed = parsed.to_string();
-    let mut real = real.map(str::to_string);
+    let mut text = pattern.to_string();
     let mut renames: Vec<(String, String)> = Vec::new();
     // Each pass renames one use; a pattern with more repeated uses than this keeps its text.
     // One parse more than renames, so that the last rename is read.
     for _ in 0..=MAX_NAME_RENAMES {
-        match ast::parse::Parser::new().parse(&parsed) {
+        match ast::parse::Parser::new().parse(&text) {
             Ok(tree) => {
                 return Some(DistinctNames {
-                    text: real.unwrap_or(parsed),
+                    text,
                     ast: tree,
                     renames,
                 })
@@ -295,22 +288,16 @@ fn distinct_names(parsed: &str, real: Option<&str>) -> Option<DistinctNames> {
             Err(error) if matches!(error.kind(), ast::ErrorKind::GroupNameDuplicate { .. }) => {
                 let span = error.span();
                 let (start, end) = (span.start.offset, span.end.offset);
-                let original = parsed.get(start..end)?.to_string();
+                let original = text.get(start..end)?.to_string();
                 let mut count = 1;
                 let renamed = loop {
                     let candidate = format!("{original}__d{count}");
-                    if !parsed.contains(&candidate)
-                        && !real.as_ref().is_some_and(|r| r.contains(&candidate))
-                    {
+                    if !text.contains(&candidate) {
                         break candidate;
                     }
                     count += 1;
                 };
-                parsed.replace_range(start..end, &renamed);
-                if let Some(real) = real.as_mut() {
-                    (real.get(start..end)? == original).then_some(())?;
-                    real.replace_range(start..end, &renamed);
-                }
+                text.replace_range(start..end, &renamed);
                 renames.push((renamed, original));
             }
             Err(_) => return None,
@@ -328,9 +315,14 @@ pub(crate) fn parse_for_group_copies(pattern: &str) -> Option<(DistinctNames, Ve
         return Some((read, Vec::new()));
     }
     let shadow = super::eval::oniguruma_shadow(pattern)?;
-    let read = distinct_names(&shadow.text, Some(pattern))?;
-    (read.renames.is_empty() && copyable_beside_loops(&read.ast, &shadow.opaque, pattern))
-        .then_some((read, shadow.opaque))
+    // A rename would move the offsets of everything after it, so a repeated name keeps the pattern.
+    let mut read = parse_distinct_names(&shadow.text)?;
+    (read.renames.is_empty() && copyable_beside_loops(&read.ast, &shadow.opaque, pattern)).then(
+        || {
+            read.text = pattern.to_string();
+            (read, shadow.opaque)
+        },
+    )
 }
 
 /// What [`parse_distinct_names`] read.
@@ -2978,14 +2970,6 @@ mod tests {
         );
         // A repeated name moves the offsets after it, so the pattern keeps its text.
         assert!(parse_for_group_copies("(?=b)(?<n>a)(?<n>b)").is_none());
-        assert_eq!(
-            distinct_names("(?<n>a)(?<n>b)", Some("(?<n>a)(?<n>b)"))
-                .unwrap()
-                .text,
-            "(?<n>a)(?<n__d1>b)"
-        );
-        // The pattern the offsets belong to is the one the rename is made in.
-        assert!(distinct_names("(?<n>a)(?<n>b)", Some("(?<m>a)(?<m>b)")).is_none());
     }
 
     #[test]

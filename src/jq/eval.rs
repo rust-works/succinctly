@@ -27938,6 +27938,32 @@ enum RegexCaptures<'h> {
 impl<'h> RegexCaptures<'h> {
     /// `caps`, a match of a rewritten pattern, as the original pattern's groups.
     fn mapped(caps: regex::Captures<'h>, groups: &super::onig_capture_loop::LoopRewrite) -> Self {
+        Self::mapped_with(groups, |i| {
+            caps.get(i).map(|m| RegexMatch {
+                text: m.as_str(),
+                start: m.start(),
+            })
+        })
+    }
+
+    /// [`mapped`](Self::mapped) for a match of `fancy-regex`.
+    fn mapped_fancy(
+        caps: fancy_regex::Captures<'h, str>,
+        groups: &super::onig_capture_loop::LoopRewrite,
+    ) -> Self {
+        Self::mapped_with(groups, |i| {
+            caps.get(i).map(|m| RegexMatch {
+                text: m.as_str(),
+                start: m.start(),
+            })
+        })
+    }
+
+    /// The original pattern's groups, each the copy `copy` reads that the match set last.
+    fn mapped_with(
+        groups: &super::onig_capture_loop::LoopRewrite,
+        copy: impl Fn(usize) -> Option<RegexMatch<'h>>,
+    ) -> Self {
         RegexCaptures::Mapped(
             groups
                 .copies
@@ -27949,38 +27975,9 @@ impl<'h> RegexCaptures<'h> {
                     // a repeat around the copies runs a lower-numbered one again after a higher).
                     copies
                         .iter()
-                        .filter_map(|&i| caps.get(i).map(|m| (m.start(), m.end(), i, m)))
+                        .filter_map(|&i| copy(i).map(|m| (m.start(), m.end(), i, m)))
                         .max_by_key(|&(start, end, i, _)| (start, end, i))
-                        .map(|(_, _, _, m)| RegexMatch {
-                            text: m.as_str(),
-                            start: m.start(),
-                        })
-                })
-                .collect(),
-        )
-    }
-}
-
-#[cfg(feature = "regex")]
-impl<'h> RegexCaptures<'h> {
-    /// [`mapped`](Self::mapped) for a match of `fancy-regex`.
-    fn mapped_fancy(
-        caps: fancy_regex::Captures<'h, str>,
-        groups: &super::onig_capture_loop::LoopRewrite,
-    ) -> Self {
-        RegexCaptures::Mapped(
-            groups
-                .copies
-                .iter()
-                .map(|copies| {
-                    copies
-                        .iter()
-                        .filter_map(|&i| caps.get(i).map(|m| (m.start(), m.end(), i, m)))
-                        .max_by_key(|&(start, end, i, _)| (start, end, i))
-                        .map(|(_, _, _, m)| RegexMatch {
-                            text: m.as_str(),
-                            start: m.start(),
-                        })
+                        .map(|(_, _, _, m)| m)
                 })
                 .collect(),
         )
@@ -33689,6 +33686,8 @@ fn group_copies_engine<S: EvalSemantics>(
     fancy_refused: &mut bool,
 ) -> Option<RegexEngine> {
     let source = base.map_or(pattern, |groups| groups.pattern.as_str());
+    // Switches the copy rewrite refuses leave it unknown whether copies are needed, so the fancy
+    // route takes the capture rewrite alone only where they are not refused.
     *fancy_refused = super::onig_loop::leading_switches_refuse(source);
     let copied = super::onig_loop::rewrite_with_groups(source)?;
     // #6426: a lookaround or an atomic group beside the loop is syntax only `fancy-regex` reads, and
