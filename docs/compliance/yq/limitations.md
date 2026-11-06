@@ -6753,6 +6753,9 @@ document as an input of one line break, so it answers like yq wherever a line-br
 does, and differs where one does not: `[.]`, `{"a": .}` and `. as $x | [$x]` print `- null` / `a: null` where yq
 prints a bare `-` / `a:`, `line` is `1` where yq has `0`, and `@yaml` is `null` where yq's is empty.
 `filename` is empty over it, as in yq ([#5721](https://github.com/rust-works/succinctly/issues/5721)).
+A result that is a document with no content (`# c`, an empty input) is written once, with no blank line after it, by `select`, `(.)` and `..` as by `.`.
+Under `-0` the line break the header ends in stays, and `select` and `..` add the NUL after it, where yq writes the NUL in place of that line break (`# c<NUL>`).
+`--eval-all` over an empty input still differs: `select(true)` prints `null` for a blank line, and `.a, filename` writes a `---` between its results.
 Not covered: `--front-matter` on an empty input keeps its
 `no front matter found` error (yq prints `null`); `-` cannot be known to be empty before it is read, so an
 empty stdin mixed with empty files reads nothing at all; and `-i` over several files edits the file each

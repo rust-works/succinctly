@@ -11458,9 +11458,15 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                                         .map_err(StreamFailure::from)?;
                                 }
                                 result
-                                    .stream_yaml::<_, YqSemantics>(out, yaml_indent, sort_keys, |w| {
-                                        w.write_result_terminator(terminator)
-                                    })
+                                    .stream_yaml_terminating::<_, YqSemantics>(
+                                        out,
+                                        yaml_indent,
+                                        sort_keys,
+                                        // #5721: a header-only document's own line break ends
+                                        // it; a NUL terminator is not that line break.
+                                        terminator != Terminator::Nul,
+                                        |w| w.write_result_terminator(terminator),
+                                    )
                                     .map_err(StreamFailure::from)
                             },
                         )?;
@@ -11836,7 +11842,6 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 // (`pkg/yqlib/utils.go:60-89`); this scope is succinctly's
                 // equivalent, and `yq 'file_index' f1 f2` prints `0` then `1`
                 // on both binaries because of it.
-                let _file_index_scope = file_index_scope_for(file_index);
                 let path = Path::new(file_path);
                 if is_drained_stdin_file_argument(path) {
                     continue;
@@ -11862,6 +11867,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     },
                     Err(e) => return flush_then_err(&mut writer, e),
                 };
+                // #5721: entered once the file is read, which is when the run learns whether
+                // its document is the synthesized empty one (that has no file to name).
+                let _file_index_scope = file_index_scope_for(file_index);
                 // #1616: see the stdin block above.
                 let yaml_bytes = substitute_json_utf8(yaml_bytes, fmt, args.output_format);
                 if let Some(code) =
@@ -12661,8 +12669,6 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             // (`pkg/yqlib/utils.go:60-89`); this scope is succinctly's
             // equivalent, and `yq 'file_index' f1 f2` prints `0` then `1`
             // on both binaries because of it.
-            let _file_index_scope = file_index_scope_for(file_index);
-
             let path = Path::new(file_path);
             if is_drained_stdin_file_argument(path) {
                 continue;
@@ -12679,6 +12685,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             ) else {
                 continue;
             };
+            // #5721: entered once the file is read, which is when the run learns whether
+            // its document is the synthesized empty one (that has no file to name).
+            let _file_index_scope = file_index_scope_for(file_index);
             let (input_bytes, format, front_matter_body) =
                 apply_front_matter(raw_bytes, resolved_format, args.front_matter, file_path)?;
             // #1616: `-i` rewrites the file with the substitution only when

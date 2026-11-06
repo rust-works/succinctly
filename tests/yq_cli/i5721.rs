@@ -168,3 +168,30 @@ fn the_empty_document_has_no_filename_5721() -> Result<()> {
     }
     Ok(())
 }
+
+/// `-i` over an empty file evaluates against the empty document, which has no file name either.
+#[test]
+fn an_inplace_write_over_an_empty_file_sees_no_filename_5721() -> Result<()> {
+    let dir = TempDir::new()?;
+    let empty = dir.path().join("empty.yaml");
+    std::fs::write(&empty, "")?;
+    let (_, _, code) = run_yq_files(".a = filename", &[&empty], &["-i"])?;
+    assert_eq!(code, 0);
+    assert_eq!(std::fs::read_to_string(&empty)?, "a: \"\"\n");
+    Ok(())
+}
+
+/// Under `-0` the NUL still ends a header-only result: only a line-break terminator is dropped
+/// after it, as the header already ends in one. (yq writes the NUL in place of that line break,
+/// `# c<NUL>`; here the header's line break stays, recorded in `limitations.md`.)
+#[test]
+fn a_nul_terminator_still_follows_a_header_only_result_5721() -> Result<()> {
+    let dir = TempDir::new()?;
+    let comment = dir.path().join("c.yaml");
+    std::fs::write(&comment, "# c\n")?;
+    for filter in ["select(true)", ".."] {
+        let (out, _, code) = run_yq_files(filter, &[&comment], &["-0"])?;
+        assert_eq!((out.as_str(), code), ("# c\n\0", 0), "{filter}");
+    }
+    Ok(())
+}
