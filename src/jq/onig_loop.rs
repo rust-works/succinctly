@@ -390,7 +390,8 @@ pub(crate) fn rewrite_with_groups(input: &str) -> Option<GroupRewrite> {
 }
 
 /// The length of the flag switches (`(?i)`, `(?s)`, `(?is)`) the pattern starts with, or `None`
-/// when one names `x` or `U`, which change what the rest of the text means.
+/// when one names `U`, which changes what greedy means, or `x` over a pattern with a `#`. A switch
+/// that names `x` is not split off: the length is 0 and it stays in the pattern.
 fn leading_switches(pattern: &str) -> Option<usize> {
     let mut at = 0;
     while pattern[at..].starts_with("(?") {
@@ -401,8 +402,15 @@ fn leading_switches(pattern: &str) -> Option<usize> {
         if flags.is_empty() || !flags.chars().all(|c| c.is_ascii_alphabetic() || c == '-') {
             break;
         }
-        if flags.contains(['x', 'U']) {
+        if flags.contains('U') {
             return None;
+        }
+        // `x` changes how the rest is read (blanks and comments are skipped), so the switch is not
+        // split off: it stays in the pattern, which the parser reads from its start (#6442). A `#`
+        // could start a comment that runs on into text the rewrite writes after it, so the pattern
+        // keeps its text.
+        if flags.contains('x') {
+            return (!pattern.contains('#')).then_some(0);
         }
         at += close + 1;
     }
@@ -2155,18 +2163,28 @@ mod tests {
         );
         assert!(copied("(?:(a)+?|b*|c)+").is_some_and(|g| g.0.contains(r"(?:([^\s\S]))+?")));
         // Nothing to write: no group, no loop that needs it, only a bounded body with no `B`,
-        // a switch that names `x` or `U` (or sits after the loop), or the tag itself.
+        // a switch that names `U` (or sits after the loop), or the tag itself.
         for pattern in [
             "(?:a|b){2,}",
             "(?:b*|a)+",
             "(a)(?:a|b)+",
             "(?:(a)|b*){0,3}",
-            "(?x)(?:b*|(a))+",
             "(?U)(?:b*|(a))+",
             "(?:b*|(a))+__succinctly_g1",
+            // A `#` could start a comment that runs into the text written after it (#6442).
+            "(?x)(?:b*|(a))+ # c\n",
         ] {
             assert_eq!(copied(pattern), None, "{pattern}");
         }
+        // A leading `x` stays in the pattern, which is read with its blanks skipped (#6442).
+        assert_eq!(
+            copied("(?x)(?:b*|(a))+"),
+            Some((
+                String::from(r"(?x)(?:(?:b+)*(?:(a)(?:b+)*)*?(?:(?:|([^\s\S]))))"),
+                vec![vec![0], vec![1, 2]],
+                3
+            ))
+        );
     }
 
     /// #6358: a loop with groups inside another repeat that can run it again is written with the rest,
@@ -2236,9 +2254,9 @@ mod tests {
             let written = copied(pattern).unwrap_or_else(|| panic!("{pattern} is written"));
             assert!(written.contains("(?i:"), "{pattern}: {written}");
         }
-        // A switch that names `x` or `U` still keeps the loop as written.
-        assert_eq!(copied("(?x)(?:b*|(a))+"), None);
+        // A switch that names `U` still keeps the loop as written; a leading `x` is read (#6442).
         assert_eq!(copied("(?U)(?:b*|(a))+"), None);
+        assert!(copied("(?x)(?:b*|(a))+").is_some());
     }
 
     /// A lazy repeat that must run twice or more (#6128): copy `k` leaves first once it is past the
@@ -2681,5 +2699,22 @@ mod tests {
             }
         }
         assert!(rewritten > 0, "no pattern was rewritten with its groups");
+    }
+
+    #[test]
+    fn a_leading_switch_naming_x_stays_in_the_pattern_6442() {
+        // `i` and `s` are split off the front; `x` is not, since it changes how the rest is read.
+        assert_eq!(leading_switches("(?i)(a)"), Some(4));
+        assert_eq!(leading_switches("(?s)(?i)(a)"), Some(8));
+        assert_eq!(leading_switches("(?x)(a|b)"), Some(0));
+        assert_eq!(leading_switches("(?ix)(a|b)"), Some(0));
+        assert_eq!(leading_switches("(a)"), Some(0));
+        // A `#` could start a comment that runs into the text written after it; `U` swaps greed.
+        assert_eq!(leading_switches("(?x)(a) # c\n"), None);
+        assert_eq!(leading_switches("(?U)(a)"), None);
+        // The loop is written with its groups copied, under `x` as without it.
+        let written = rewrite_with_groups("(?x)( () (?: a | ) | (b*) )*").unwrap();
+        assert!(written.copies.iter().skip(1).any(|copies| copies.len() > 1));
+        assert!(rewrite_with_groups("(?x)( () (?: a | ) | (b*) )* # c\n").is_none());
     }
 }
