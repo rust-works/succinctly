@@ -139332,6 +139332,19 @@ mod tests {
         );
     }
 
+    /// #6428: a `{1,n}?` that the rewrite writes within its limits and the crate refuses as too large
+    /// is read again as written, so that the loop beside it keeps its rewrite.
+    #[test]
+    fn a_lazy_bounded_repeat_the_crate_refuses_is_read_again_as_written_6428() {
+        let pattern = "(?:(a)|b*|c)+(?:(d*)|x){1,20000}?";
+        let written = super::super::onig_loop::rewrite_with_groups(pattern).unwrap();
+        assert!(std_regex(&written.pattern).is_err());
+        let again =
+            super::super::onig_loop::rewrite_with_groups_past_the_size_limit(pattern).unwrap();
+        assert!(again.pattern.contains("{1,20000}?"), "{}", again.pattern);
+        assert!(group_copies_engine(pattern, None).is_some());
+    }
+
     /// #6106: a loop rewritten for Oniguruma's empty-iteration exit is what the `regex` crate
     /// compiles, and a rewrite the crate refuses (here, nested past its limit) falls back to the
     /// pattern as written instead of becoming an error.
