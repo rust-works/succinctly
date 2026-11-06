@@ -13122,6 +13122,7 @@ the pinned binaries:
 | `.d` | error | `5` — already diverged | `5` |
 | `path(.d)` | error | error — **matched jq** | `["d"]` — **diverges** |
 | `getpath(["d"])` | error | error — **matched jq** | `5` — **diverges** |
+| `path(.b[:1])` on `{"a":"\ud800","b":[1,2]}` | error | error — **matched jq** | `["b",{"start":null,"end":1}]` — **diverges** |
 
 Step 2 of ADR-0018's decision order therefore *does* separate the two options, and it favours
 the behaviour being given up: keeping the gate matched jq's observable outcome on those rows,
@@ -13133,6 +13134,11 @@ under a carve-out. This class of divergence, and #2103's, are now sanctioned by
 [ADR-0018](../../adrs/adr-0018.md)'s #2103 amendment — the reference rejects the whole
 document at parse time, and a semi-index that deliberately does not validate up front takes
 the uniform divergence over a per-spelling one — rather than resting on prose precedent alone.
+
+The last row is [#6265](https://github.com/rust-works/succinctly/issues/6265), the same trade for a slice.
+`path()` of a literal slice whose bounds alone keep it to 4096 elements or fewer (`[:10]`, `[10:20]`, `[-10:]`) walks with cursors and validates what `.b[:1]` validates: the array's own structure and the elements of the range, so a fault outside them no longer raises.
+A wider range, or one that depends on the array's length (`[1:]`, `[:-1]`), still materializes the document and still raises on all of these, because moving it is slower ([#6265](https://github.com/rust-works/succinctly/issues/6265)'s table).
+So the same filter with a different width can answer or raise on a malformed document; a well-formed one answers the same on both routes.
 
 `key` and `parent` are the exception within the exception: neither is a jq builtin at all
 (`jq: error: key/0 is not defined`, exit 3), so for those two there is no jq oracle and no
@@ -13211,6 +13217,7 @@ applies decNumber's notation rule, as jq does, so both routes print `1E-301`.
 Pinned by `test_lazy_validation_boundary_2168` (the table above, as one test),
 `test_path_answers_past_an_undecodable_sibling_2168`,
 `test_path_try_answers_past_an_undecodable_sibling_4412`,
+`a_narrow_slice_validates_what_the_slice_itself_does_6265` (`tests/jq_cli/i6265.rs`),
 `test_path_answers_past_a_colliding_key_2168`,
 `test_path_answers_past_a_structural_fault_it_never_reads_2168`,
 `test_getpath_touches_only_the_nodes_it_navigates_2168`,

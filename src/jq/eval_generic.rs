@@ -14998,13 +14998,16 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // be the identity one, unlike a bare `.`/`Expr::Identity`, which
             // never decodes at all.
             if let Some(elements) = value.as_array() {
-                for element in elements.collect_values() {
+                // `validate_cursor`, not a copy of each element: only the verdict is wanted, building
+                // and freeing the copies cost more than the bridge's one, and a cursor sees a nested
+                // `[,]` that a bare value's copy does not (#6265).
+                for element in elements.collect_cursors() {
                     // STYLE-0012: a decode failure is uncatchable at value
                     // position (`is_uncatchable_at_value_position`), so this
                     // must raise regardless of `optional` -- only
                     // `eval.rs`'s slow general path (`suppress_or_raise`)
                     // ever needs to consult it for this same error class.
-                    if let Err(e) = to_owned::<S, _>(&element) {
+                    if let Err(e) = validate_cursor::<S, _>(&element) {
                         return GenericResult::Error(e);
                     }
                 }
@@ -28188,8 +28191,8 @@ fn path_expr_observes_no_identity(expr: &Expr) -> bool {
 ///
 /// Deliberately narrow: only the pure-navigation shapes, whose emitted paths
 /// depend on the document's *structure* along the path and never on a value
-/// it has to compute. Anything else -- a computed index (`.[$k]`), a slice, a
-/// builtin, `getpath`, `first`/`last`, a comparison -- defers to
+/// it has to compute. Anything else -- a computed index (`.[$k]`), a wide or
+/// computed slice, a builtin, `getpath`, `first`/`last`, a comparison -- defers to
 /// `builtin_path_on_owned` unchanged, so this adds a fast path rather than a
 /// second implementation of path resolution.
 ///
@@ -28203,11 +28206,37 @@ fn path_expr_observes_no_identity(expr: &Expr) -> bool {
 /// would change a `path(try .[])` over a document with a duplicate key, and a decode failure
 /// elsewhere in a YAML document would stop raising. jq mode collapses duplicate keys on both
 /// routes.
+///
+/// #6265: in jq mode a literal slice of a known narrow range ([`slice_range_is_narrow`]) is
+/// admitted too. Not in yq mode, whose path keeps a slice's position instead of naming it.
 fn path_expr_is_cursor_navigable<S: EvalSemantics>(expr: &Expr) -> bool {
     path_walk_navigable(expr, S::TAG == EvalTag::Jq)
 }
 
-fn path_walk_navigable(expr: &Expr, tries: bool) -> bool {
+/// The widest literal slice `path()`'s cursor walk takes (#6265). The materializing route's cost is
+/// the document and the walk's is the slice, so the walk wins on a small range (a 36 MB file went
+/// from 521 ms to 83 ms on a Ryzen 9 7950X and 202 ms to 56 ms on an Apple M4 Pro) and loses on a
+/// range near the whole of a wide array, where one element at a time costs more than the one copy
+/// (`path(.users[1:])` was 12% and 21% slower with no cap). 4096 keeps nearly all of the gain:
+/// `[:4096]` read 88 ms and 58 ms.
+const PATH_WALK_SLICE_MAX_WIDTH: u64 = 4096;
+
+/// Whether the bounds alone say a literal slice spans at most [`PATH_WALK_SLICE_MAX_WIDTH`] elements,
+/// whatever the array's length: `[:10]`, `[10:20]`, `[-10:]`, `[-20:-10]`. A range that depends on the
+/// length (`[1:]`, `[:-1]`, `[1:-1]`) is not known to be narrow.
+fn slice_range_is_narrow(start: Option<i64>, end: Option<i64>) -> bool {
+    let width = match (start, end) {
+        (None, Some(end)) if end >= 0 => end.unsigned_abs(),
+        (Some(start), None) if start < 0 => start.unsigned_abs(),
+        (Some(start), Some(end)) if (start < 0) == (end < 0) => {
+            end.saturating_sub(start).max(0).unsigned_abs()
+        }
+        _ => return false,
+    };
+    width <= PATH_WALK_SLICE_MAX_WIDTH
+}
+
+fn path_walk_navigable(expr: &Expr, jq_mode: bool) -> bool {
     match expr {
         Expr::Identity | Expr::Iterate => true,
         Expr::Field(_) => true,
@@ -28215,18 +28244,23 @@ fn path_walk_navigable(expr: &Expr, tries: bool) -> bool {
         // verbatim in both jq and succinctly today (verified live), so the
         // sign costs nothing here.
         Expr::Index { .. } => true,
-        Expr::Paren(inner) | Expr::Optional(inner) => path_walk_navigable(inner, tries),
+        Expr::Slice { start, end, .. } => jq_mode && slice_range_is_narrow(*start, *end),
+        Expr::Paren(inner) | Expr::Optional(inner) => path_walk_navigable(inner, jq_mode),
         // `try E` and `try E catch empty` (the only handler that delivers nothing, so the walk
         // never evaluates it) are `E?`.
         Expr::Try { expr, catch } => {
-            tries
+            jq_mode
                 && catch
                     .as_deref()
                     .map_or(true, crate::jq::eval::is_empty_handler)
-                && path_walk_navigable(expr, tries)
+                && path_walk_navigable(expr, jq_mode)
         }
-        Expr::Pipe(exprs) => exprs.iter().all(|stage| path_walk_navigable(stage, tries)),
-        Expr::Comma(exprs) => exprs.iter().all(|stage| path_walk_navigable(stage, tries)),
+        Expr::Pipe(exprs) => exprs
+            .iter()
+            .all(|stage| path_walk_navigable(stage, jq_mode)),
+        Expr::Comma(exprs) => exprs
+            .iter()
+            .all(|stage| path_walk_navigable(stage, jq_mode)),
         _ => false,
     }
 }
@@ -29264,9 +29298,12 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     guard_path_walk_depth(path.recursion_depth())?;
     // spine 2416 (walk residue): a step from an owned value descends the
     // value itself, with the components the owned identity pipe would name.
-    // Only the path-context walk produces such a node (`path()`'s own walk
-    // admits no slice), so the cursor arms below never see one.
-    if let (PathNode::Owned(v), Expr::Field(_) | Expr::Index { .. } | Expr::Iterate) = (node, expr)
+    // A slice's result is such a node (#6265), so the cursor arms below never
+    // see one.
+    if let (
+        PathNode::Owned(v),
+        Expr::Field(_) | Expr::Index { .. } | Expr::Iterate | Expr::Slice { .. },
+    ) = (node, expr)
     {
         return path_step_owned::<S, V, T>(expr, node, v, path, out);
     }
@@ -29277,6 +29314,25 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
         }
         Expr::Paren(inner) => {
             path_step_generic::<S, V, T>(inner, node, path, collapse_duplicate_keys, out)
+        }
+        // #6265: the component is the slice as written. The child and every refusal are `.[s:e]`'s
+        // own, so `path(.a[s:e])` raises where `.a[s:e]` does, an element of the range included;
+        // what it leaves unread is what the value leaves unread.
+        Expr::Slice {
+            start,
+            end,
+            start_key,
+            end_key,
+        } => {
+            let child = match node {
+                PathNode::At(cursor) => path_slice_child::<S, V>(expr, *cursor)?,
+                // An absent node is `null`, whose slice is `null`; an owned one stepped above.
+                PathNode::Absent | PathNode::Owned(_) => PathNode::Absent,
+            };
+            let component =
+                slice_component_value(*start, start_key.as_ref(), *end, end_key.as_ref());
+            out.push((path.extend_from(component, node), child));
+            Ok(())
         }
         // #4404 (yq): a name an array reads as the integer it spells steps as that index.
         Expr::Field(name)
@@ -29343,6 +29399,22 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
         // `path_expr_is_cursor_navigable` gates every caller, so nothing else
         // can arrive here.
         other => unreachable!("non-navigable path expression reached the cursor walk: {other:?}"),
+    }
+}
+
+/// The node a literal slice of `cursor` stands at (#6265): the cursor itself for a full-range slice,
+/// else the slice's value, which is what a later stage navigates.
+fn path_slice_child<S: EvalSemantics, V: DocumentValue>(
+    slice: &Expr,
+    cursor: V::Cursor,
+) -> Result<PathNode<V>, EvalError> {
+    match eval_single::<S, V>(slice, cursor.value(), false, Some(cursor)) {
+        GenericResult::OneCursor(child) => Ok(PathNode::At(child)),
+        // Before `into_owned`, which reads a failed result as no value at all.
+        GenericResult::Error(e) | GenericResult::Partial(_, Control::Error(e)) => Err(e),
+        result => Ok(result
+            .into_owned::<S>()?
+            .map_or(PathNode::Absent, |value| PathNode::Owned(Rc::new(value)))),
     }
 }
 
@@ -58232,6 +58304,49 @@ mod tests {
             assert!(
                 !path_expr_is_cursor_navigable::<JqSemantics>(&expr),
                 "{refused}"
+            );
+        }
+        // #6265: a slice the bounds alone keep narrow, in jq mode only.
+        for narrow in [
+            ".[:10]",
+            ".[0:4096]",
+            ".[10:20]",
+            ".[-10:]",
+            ".[-20:-10]",
+            ".[5:2]",
+            ".a[:1]",
+            ".a[:1][0]",
+            ".[:1]?",
+            "try .[:1]",
+        ] {
+            let expr = stage(narrow);
+            assert!(
+                path_expr_is_cursor_navigable::<JqSemantics>(&expr),
+                "{narrow}"
+            );
+            assert!(
+                !path_expr_is_cursor_navigable::<YqSemantics>(&expr),
+                "{narrow}"
+            );
+            assert!(!array_route_stage_is_pure_navigation(&expr), "{narrow}");
+        }
+        for wide in [
+            ".[:4097]",
+            ".[0:4097]",
+            ".[-4097:]",
+            ".[-5000:-1]",
+            ".[1:]",
+            ".[:-1]",
+            ".[1:-1]",
+            ".[-1:1]",
+            ".[:1e300]",
+            ".[-1e300:]",
+            ".[$k:1]",
+            ".a[:1] | .[1:]",
+        ] {
+            assert!(
+                !path_expr_is_cursor_navigable::<JqSemantics>(&stage(wide)),
+                "{wide}"
             );
         }
         // A computed, effectful or specially routed stage is refused -- the
