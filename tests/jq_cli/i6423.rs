@@ -71,6 +71,7 @@ const REFUSED: &[(&str, &str)] = &[
     ("x{1000,100001}", "too big number for repeat range"),
     ("a{100000,100001}", "too big number for repeat range"),
     ("x{99999999}", "too big number for repeat range"),
+    ("a|x{100001}", "too big number for repeat range"),
     // The crate refuses these first, for the order of the counts or their size.
     ("a{100001,5}", "too big number for repeat range"),
     ("a{100001,100000}", "too big number for repeat range"),
@@ -136,5 +137,18 @@ fn a_call_to_a_defined_group_keeps_the_crate_s_refusal_6423() -> Result<()> {
         "{stdout}"
     );
     assert!(!stdout.contains("undefined name"), "{stdout}");
+    Ok(())
+}
+
+/// A refusal for the crate's size limit has no Oniguruma counterpart and keeps the crate's words.
+/// jq answers this pattern (`false`): #6439.
+#[test]
+fn a_pattern_past_the_crate_s_size_limit_keeps_its_words_6423() -> Result<()> {
+    let (stdout, code) = caught(r"\w{100000}", None)?;
+    assert_eq!(code, 0);
+    assert!(
+        stdout.starts_with(r#""Regex failure: Compiled regex exceeds size limit"#),
+        "{stdout}"
+    );
     Ok(())
 }
