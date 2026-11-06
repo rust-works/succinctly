@@ -87,6 +87,7 @@ pub fn render_flow(
     let mut pending = Pending::Nothing;
     let mut foot: Vec<String> = Vec::new();
     let mut last_is_container = false;
+    let last = items.len().saturating_sub(1);
     for (i, item) in items.into_iter().enumerate() {
         let headed = !item.head.is_empty();
         match pending {
@@ -113,6 +114,7 @@ pub fn render_flow(
         match item.text.strip_suffix('}') {
             Some(body)
                 if open == '['
+                    && i == last
                     && item.mapping
                     && !item.foot.is_empty()
                     && !item.text.ends_with("\n}") =>

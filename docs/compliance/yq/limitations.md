@@ -6896,7 +6896,8 @@ next sibling's key line when that is a collection (`b: # ec`), its value line ot
 line of a collection item (`- # ec` / `  x: 1`); and it is lost when nothing follows in the document, so
 `yq -P '.a'` on `a: [1, 2] # ec` prints no comment. A scalar that has a comment of its own keeps its line and the
 held comment waits for the next one, a comment on a collection's key overwrites it, an alias is skipped, and an
-empty `[]`/`{}` stays flow with its comment. This build follows that for the DOM route that `-P`, a write and
+empty `[]`/`{}` stays flow with its comment.
+Between the elements of a flow sequence (#6334) the held comment is overwritten by an element that has a comment of its own, and an alias takes it on its line. This build follows that for the DOM route that `-P`, a write and
 `--arg` take, on JSON-shaped and YAML input alike (`defer_flow_line_comments`). Swept against yq v4.53.3 over 14
 documents x 8 filters. Still different:
 
@@ -6908,7 +6909,7 @@ documents x 8 filters. Still different:
   Still different, each seen against yq v4.53.3 over generated documents:
   A comment on a line of its own before a comma that is followed by the closing bracket (`[a, b` / `# f` / `,` / `]`) is dropped here; yq moves it, and the comments after that comma, past the collection to whatever follows (the next node, or the document's foot).
   yq writes an empty line before the first comment of a collection nested in a sequence after a sibling mapping that ends with a foot comment (`{k: v` / `# c` / `}, [` / `# d`), and before the foot of a collection that ends a block sequence under `-P`; some of these this build does not write.
-  Under `-P` the foot of a last element that is itself a collection is written below the sequence when the sequence has an element after it in an outer sequence, where this build writes it right below the element.
+  Under `-P` the foot of a last element that is itself a collection is written below the sequence when the sequence has an element after it in an outer sequence, or a key after it in a mapping (yq: `w: # c` / `# f` / `  - 1`), where this build writes it right below the element.
   A comment on the line of a comma that starts its own line, after own-line comments (`x` / `# c3` / `, # c4` / `~`), is the next scalar's line comment in yq (`~, # c4`) and is dropped here.
   A comment on a line of its own between a flow mapping key's colon and its value is held like any other (the next entry's head, or the value's first element's), and one on the colon's line is dropped, as in yq for a collection value; for a scalar value yq keeps it as the value's line comment.
   A comment after a single pair written in a flow sequence (`[a: 1, # c`), after an empty value (`{a: , # c`) or on a key is dropped, and so is a second comment on the line of a comma (`[a # c1` / `, # c2`) when the first stands on a line of its own.

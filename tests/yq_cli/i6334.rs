@@ -535,6 +535,36 @@ fn test_p_holds_the_comment_of_a_flow_element_that_is_a_collection_6334() -> Res
             &["-P"],
             "a:\n  - - 1\n  - # xi\n    - 2\nb: 3 # ec\n",
         ),
+        (
+            "v: {a: [1], # a\n b: 2, # b\n c: 3}\n",
+            ".",
+            &["-P"],
+            "v:\n  a:\n    - 1\n  b: 2 # b\n  c: 3 # a\n",
+        ),
+        (
+            "x: &x 5\nv: [[1], # a\n *x, 2]\n",
+            ".",
+            &["-P"],
+            "x: &x 5\nv:\n  - - 1\n  - *x # a\n  - 2\n",
+        ),
+        (
+            "x: &x 5\nv: {a: [1], # a\n b: *x, c: 2}\n",
+            ".",
+            &["-P"],
+            "x: &x 5\nv:\n  a:\n    - 1\n  b: *x\n  c: 2 # a\n",
+        ),
+        (
+            "x: &x 5\nv: [[1], # a\n *x # b\n, 2]\n",
+            ".",
+            &["-P"],
+            "x: &x 5\nv:\n  - - 1\n  - *x # b\n  - 2\n",
+        ),
+        (
+            "v: {a: {x: 1}, # a\n b: 2, # b\n c: 3}\n",
+            ".",
+            &["-P"],
+            "v:\n  a:\n    x: 1\n  b: 2 # b\n  c: 3 # a\n",
+        ),
     ];
     for &(doc, filter, flags, expected) in rows {
         let (stdout, code) = run_yq_stdin(filter, doc, flags)?;
@@ -578,5 +608,14 @@ fn test_flow_comments_that_still_differ_from_yq_6334() -> Result<()> {
         assert_eq!((stdout.as_str(), code), (expected, 0), "{doc:?}");
         assert_ne!(stdout, yq_prints, "{doc:?} now matches yq");
     }
+    // Under -P yq writes the foot of a last element that is a collection after the key line that follows it.
+    let doc = "v: [{a: 1} # c\n  # f\n  ]\nw: [1] # z\ny: 2\n";
+    let (stdout, code) = run_yq_stdin(".", doc, &["-P"])?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("v:\n  - a: 1\n\n# f\nw: # c\n  - 1\ny: 2 # z\n", 0),
+        "-P on {doc:?}"
+    );
+    assert_ne!(stdout, "v:\n  - a: 1\nw: # c\n# f\n  - 1\ny: 2 # z\n");
     Ok(())
 }
