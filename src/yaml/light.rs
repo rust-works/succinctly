@@ -10715,7 +10715,12 @@ fn stream_yaml_block_scalar<Out: core::fmt::Write>(
     // behaves exactly like literal's (no extra blank line before whatever
     // follows), while a bare `>` scalar's does not (#836 review).
     let content: Cow<str> = if folded {
-        widen_folded_breaks(decoded, explicit_indent.is_some())
+        // #6446: a value of nothing but breaks (`>+` with only blank lines) gets no trailing "+1" from go-yaml, as with
+        // an explicit indent; anything else, including a string that starts with breaks, keeps it.
+        widen_folded_breaks(
+            decoded,
+            explicit_indent.is_some() || decoded.bytes().all(|b| b == b'\n'),
+        )
     } else {
         Cow::Borrowed(decoded.strip_suffix('\n').unwrap_or(decoded))
     };
@@ -10861,6 +10866,14 @@ fn widen_folded_breaks(decoded: &str, explicit_indent_used: bool) -> Cow<'_, str
         let run_start = i;
         while i < bytes.len() && bytes[i] == b'\n' {
             i += 1;
+        }
+        // #6446: a run of breaks the string starts with has no line before it to fold into, so it is written
+        // as it is. Widening it wrote one empty line too many, which read back as another value (`"\n\nx\n"`
+        // became `"\n\n\nx\n"`); go-yaml's writer widens nothing for a string that starts with a break.
+        if run_start == 0 {
+            result.push_str(&decoded[run_start..i]);
+            line_start = i;
+            continue;
         }
         let is_trailing_run = run_start >= trailing_run_start;
         // The line just scanned (`line_start..run_start`) is non-empty by
