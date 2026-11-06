@@ -82,4 +82,3 @@ W5VH      structure         document/block structure differs from spec
 W9L4      lax:block-scalar  block scalar header not validated — #223
 WZ62      tags              a flow indicator right after a tag (`foo : !!str,`): valid YAML 1.2, where a tag ends at a flow indicator, but rejected by real yq v4.53.3 (`found character ',' that is not allowed in a YAML tag`) — we follow yq, the same policy as S4JQ/FRK4 — #6293
 Y79Y/003  lax:tabs          tab handling not validated — #223
-ZVH3      lax:indentation   indentation not validated — #223
