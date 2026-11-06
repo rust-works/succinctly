@@ -58,7 +58,7 @@ files: 8, total bytes: 36085, anchors: 41, aliases: 86, bare-dash items: 5, CRLF
 
 | metric               | unit         | n    | min  | p50  | p90  | p99  | max  |
 | -------------------- | ------------ | ---- | ---- | ---- | ---- | ---- | ---- |
-| scalar length        | bytes/scalar | 1599 | 0    | 7    | 24   | 89   | 374  |
+| scalar length        | bytes/scalar | 1601 | 0    | 7    | 24   | 85   | 374  |
 | mapping keys         | keys/mapping | 398  | 0    | 2    | 4    | 9    | 69   |
 | sequence items       | items/seq    | 94   | 1    | 2    | 4    | 12   | 12   |
 | bare-dash seq items  | count/file   | 8    | 0    | 0    | 5    | 5    | 5    |
