@@ -105,6 +105,8 @@ down as:
 Two `lax:mapping` cases (`9KBC`, `EW3V`) left the manifest with #4463: the loader now rejects content after a
 mapping value's scalar (`--- key1: value1`, a mis-indented `k2: v2`) as yq does (`mapping values are not allowed in
 this context`) instead of dropping it, so the validator is no longer the only thing that catches them.
+`5LLU` (`lax:indentation`) and `W9L4` (`lax:block-scalar`) left the manifest with [#6381](https://github.com/rust-works/succinctly/issues/6381).
+Both hold a block scalar whose leading blank line is wider than its first content line, which ends the scalar as go-yaml's indent detection does, so the stray content line is refused.
 
 This table is the current *remainder* — cases the validator has not yet caught up to — not
 a fixed accounting of the original 78; earlier revisions of this page also carried

@@ -40,7 +40,6 @@
 4MUZ/00   structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 4MUZ/01   structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 4MUZ/02   structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
-5LLU      lax:indentation   indentation not validated — #223
 5MUD      structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 6M2F      structure         a block-mapping `:` with no `?` before it (an entry with no key): valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected key") — we follow yq, as for CFD4 (#6288)
 7Z25      structure         bare document after a `...` end marker (`---` / `scalar1` / `...` / `key: value`): valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected <document start>": a document after `...` needs its own `---`) — we follow yq, the same policy as CFD4/FRK4/NKF9 — #5089
@@ -82,7 +81,6 @@ UT92      structure         implicit flow key with a line break before its `:`: 
 VJP3/01   structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 W4TN      scalars           scalar content/folding differs from spec
 W5VH      structure         document/block structure differs from spec
-W9L4      lax:block-scalar  block scalar header not validated — #223
 WZ62      tags              a flow indicator right after a tag (`foo : !!str,`): valid YAML 1.2, where a tag ends at a flow indicator, but rejected by real yq v4.53.3 (`found character ',' that is not allowed in a YAML tag`) — we follow yq, the same policy as S4JQ/FRK4 — #6293
 Y79Y/001  structure         a block scalar whose only leading line is a tab after a space (`foo: |` / ` ⇥` / `bar: 1`): valid YAML 1.2, rejected by real yq v4.53.3 ("found a tab character where an indentation space is expected") — we follow yq, the same policy as DK95/04 — #6295
 Y79Y/003  lax:tabs          tab handling not validated — #223
