@@ -46,6 +46,18 @@ fn test_an_empty_value_before_a_quoted_or_flow_key_stays_null_6386() -> Result<(
             "x:\n  - a:\n  - b\n\"c\": 1\n",
             "{\"x\":[{\"a\":null},\"b\"],\"c\":1}",
         ),
+        // A block scalar header at the key's own indent cannot be a key: it is the value.
+        ("a:\n|\n  x\n", "{\"a\":\"x\\n\"}"),
+        ("a:\n>\n  x\n", "{\"a\":\"x\\n\"}"),
+        ("a:\n|-\n  x\nb: 1\n", "{\"a\":\"x\",\"b\":1}"),
+        ("a:\n|\n  x\n\"b\": 1\n", "{\"a\":\"x\\n\",\"b\":1}"),
+        ("a:\n|\n  x\n  y\nb: 2\n", "{\"a\":\"x\\ny\\n\",\"b\":2}"),
+        ("a:\n>+\n  x\n\nb: 1\n", "{\"a\":\"x\\n\\n\",\"b\":1}"),
+        ("a:\n|2\n    x\nb: 1\n", "{\"a\":\"  x\\n\",\"b\":1}"),
+        (
+            "x:\n  a:\n  |\n    t\n  b: 1\n",
+            "{\"x\":{\"a\":\"t\\n\",\"b\":1}}",
+        ),
         // The shapes that already read.
         ("a:\nb: 1\n", "{\"a\":null,\"b\":1}"),
         ("a:\n&n b: 1\n", "{\"a\":null,\"b\":1}"),

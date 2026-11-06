@@ -5292,6 +5292,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             let next_char = self.peek();
             let is_sequence_indicator =
                 matches!(next_char, Some(b'-')) && Self::is_ws_break_or_eoi(self.peek_at(1));
+            // A line that starts with `|` or `>` is a block scalar header: it cannot be a key, so at the
+            // key's own indent it is the key's value, as a sequence is (`a:` / `|` / `  x` is
+            // `{"a": "x\n"}` in yq). It used to read only because the null written for it sat on the
+            // `|` (#6386), which the reader then took for the block scalar.
+            let is_block_scalar_header = matches!(next_char, Some(b'|' | b'>'));
             self.pos = saved_pos;
 
             if next_indent < indent {
@@ -5300,8 +5305,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 return Ok(());
             }
 
-            if next_indent == indent && !is_sequence_indicator {
-                // Next line is at same indent but NOT a sequence - null value
+            if next_indent == indent && !is_sequence_indicator && !is_block_scalar_header {
+                // Next line is at same indent but NOT a sequence or a block scalar - null value
                 // (If it were a sequence, the sequence is the value of this key)
                 self.write_null_value_at(colon_end);
                 return Ok(());
