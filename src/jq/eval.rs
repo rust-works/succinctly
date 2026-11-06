@@ -33106,7 +33106,7 @@ fn build_regex_uncached<S: EvalSemantics>(
             // copies stay as counted; a result the crate refuses keeps the capture rewrite alone.
             if !longest {
                 if let Some(ordered) = super::onig_loop::rewrite(&groups.pattern) {
-                    if regex::Regex::new(&ordered)
+                    if compile_std(&ordered)
                         .is_ok_and(|re| re.captures_len() == groups.compiled_groups)
                     {
                         groups.pattern = ordered;
@@ -33124,7 +33124,7 @@ fn build_regex_uncached<S: EvalSemantics>(
         .flatten();
     let rewritten = grouped.or_else(|| {
         capture.and_then(|groups| {
-            let re = regex::Regex::new(&groups.pattern).ok()?;
+            let re = compile_std(&groups.pattern).ok()?;
             (re.captures_len() == groups.compiled_groups)
                 .then_some(RegexEngine::Rewritten { re, groups })
         })
@@ -33455,10 +33455,29 @@ fn compose_group_copies(
 fn std_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
     // A guarded pattern the crate refuses only for its size compiles as written, factored.
     match guard_prefix_lifting(pattern, false) {
-        Some(guarded) => regex::Regex::new(&guarded).or_else(|_| regex::Regex::new(pattern)),
-        None => regex::Regex::new(pattern),
+        Some(guarded) => compile_std(&guarded).or_else(|_| compile_std(pattern)),
+        None => compile_std(pattern),
     }
 }
+
+/// The `regex` crate's compilation of `pattern` as given, within [`STD_REGEX_SIZE_LIMIT`] (#6439).
+#[cfg(feature = "regex")]
+fn compile_std(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(pattern)
+        .size_limit(STD_REGEX_SIZE_LIMIT)
+        .dfa_size_limit(STD_REGEX_SIZE_LIMIT)
+        .build()
+}
+
+/// How large a compiled program, and how large a lazy-DFA cache, the `regex` crate may build for a jq
+/// pattern: 128 MiB each, where its default is 10 MiB (#6439). The crate writes a counted repeat out
+/// copy by copy and a Unicode class is large, so `\\w{1000}` passes the default; Oniguruma, which keeps
+/// a counter, compiles `\\w{100000}` in a few MB. At 128 MiB `\\w{2500}` and `.{100000}` compile. A
+/// pattern past it is refused after allocating several times the limit (up to about 760 MB measured),
+/// so the limit is not raised further (`docs/compliance/jq/limitations.md`). The cache limit goes with
+/// it: `\\w{2500}$` over a 1 MB line took 21 s with the default cache and 1.5 s with this one.
+#[cfg(feature = "regex")]
+const STD_REGEX_SIZE_LIMIT: usize = 128 << 20;
 
 /// Oniguruma's own retry limit (`ONIG_DEFAULT_RETRY_LIMIT_IN_MATCH`), used as `fancy-regex`'s
 /// backtracking budget so a jq pattern gets the same allowance of work before
@@ -33595,6 +33614,8 @@ fn build_fancy_regex_at<S: EvalSemantics>(
         .leftmost_longest(modes.longest)
         .find_not_empty(modes.not_empty)
         .backtrack_limit(FANCY_BACKTRACK_LIMIT)
+        .delegate_size_limit(STD_REGEX_SIZE_LIMIT)
+        .delegate_dfa_size_limit(STD_REGEX_SIZE_LIMIT)
         .build()
         .ok()
 }
