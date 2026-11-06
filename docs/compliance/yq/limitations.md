@@ -6982,6 +6982,7 @@ Since #5876 `run_yq` arms the same floor `succinctly jq` has had since [#5554](h
 The same holds at those two depths for `to_yaml`, `flatten`, `==`, `.[0]`, a field of a deep object (`{"a": .}` folded 2000 times, then `.a | length`) and the rest of the filters that walk the value.
 Where a value built by the program is handed back to the evaluator whole (a field read out of it, `select`, a bind) the document ceiling of 256 levels no longer applies to it either: it was a bound for an input document, and a built value is bounded by the value-tree depth, or by the floor.
 The bridge's converter keeps the 256-level document ceiling for a caller that has not armed the floor (a library embedder), so only the CLI's armed run reads a built value back past it.
+A path is bounded the same way since [#6356](https://github.com/rust-works/succinctly/issues/6356): `.a.a... | path | length` over 385 and 1000 components is what yq prints, where the walk stopped at 384.
 Past the floor the run refuses with `Error: nesting depth exceeds limit of the native stack` at exit 1, where yq's own Go stack is far deeper.
 Where that is depends on the evaluation thread's stack and on what each level costs: the fold that builds the value is the first step to refuse, ahead of every emitter and presentation walk, so the emitters have not been seen to refuse on their own.
 Checked on a 16 MiB evaluation thread (a throwaway build): the build and every consumer above answered at 8,000 levels and refused cleanly at 11,000, with no crash at any size.
