@@ -769,10 +769,6 @@ $ printf '?\n- item\n' | yq -o=json -I=0 .
 
 Still different, each live-verified against yq v4.53.3:
 
-- **An explicit key nested in a key sequence's item** (`?` / `- ? a` / `  : b`, and with the dash on the
-  `?` line, `? - ? a` / `    : b`) is `inconsistent indentation` here where yq answers `{"":null}`.
-  The bare spelling read the sequence as the value before #6370 and answered `{"":[{"a":"b"}]}`, which was
-  wrong too.
 - **A key whose content starts on the next line** (`?` / `  k`) is read like one that starts on the
   `?` line (#4532): `?` / `  k` / `x: 1` is `{"k":null,"x":1}` and `?` / `  k` / `- item` is an
   error, as in yq. The content takes the same checks as on the `?` line, gaps included (`? : v` and
