@@ -640,6 +640,16 @@ struct Parser<'a, const HAS_CR: bool> {
     /// a pre-existing gap #2777 closed as a side effect of requiring a
     /// specific key/value shape, not a deliberate new check.)
     json_strict: bool,
+    /// Reads a run of leading `---` markers as one document (#6349), as yq's header slurp does: it
+    /// sets aside every leading blank, comment, directive and `---` line before the first content
+    /// line, so `---` / `---` / `x` is the one document `x` where YAML reads a null document and
+    /// then `x`. Set for the input `succinctly yq` reads (see
+    /// [`YamlIndex::build_yq`](crate::yaml::YamlIndex::build_yq)); the library loader keeps the
+    /// spec's reading.
+    yq_leading_marker_run: bool,
+    /// How many documents `start_document` has started: the leading run only ever merges into the
+    /// first (`a: 1` / `---` / `---` / `b: 2` is three documents in yq as in YAML).
+    documents_started: usize,
 }
 
 impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
@@ -708,6 +718,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             pending_explicit_key_empty: false,
             nesting_depth: 0,
             json_strict: false,
+            yq_leading_marker_run: false,
+            documents_started: 0,
             #[cfg(debug_assertions)]
             wrapper_slots: Vec::with_capacity(estimated_opens),
             #[cfg(debug_assertions)]
@@ -3345,6 +3357,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
         }
         self.seen_any_document = true;
+        self.documents_started += 1;
         self.document_root_node_taken = false;
         self.document_start_bp_pos = self.bp_pos;
         // A standalone comment block seen before this document's content
@@ -8661,6 +8674,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             // Check for document start marker (new document)
             if self.is_document_start() {
+                // #6349: a marker while the first document has written nothing (only comments and
+                // blank lines since its own `---`) is more of yq's header, not another document.
+                if self.yq_leading_marker_run
+                    && self.in_document
+                    && self.documents_started == 1
+                    && self.bp_pos == self.document_start_bp_pos
+                {
+                    self.skip_document_marker();
+                    if self.has_content_on_line() {
+                        self.parse_inline_document_value()?;
+                    } else {
+                        self.skip_newlines();
+                    }
+                    continue;
+                }
                 self.end_document();
                 self.skip_document_marker();
                 // Unconditional, as above: `---` always starts a document (#225).
@@ -9830,7 +9858,17 @@ fn json_strict_plain_scalar_ok(bytes: &[u8]) -> bool {
 /// BP bit count past `u32::MAX` before the text does; `BalancedParens`
 /// asserts its own ceiling as a loud backstop.)
 pub fn build_semi_index(input: &[u8]) -> Result<SemiIndex, YamlError> {
-    build_semi_index_impl(input, false)
+    build_semi_index_impl(input, false, false)
+}
+
+/// [`build_semi_index`] for the input `succinctly yq` reads: a run of leading `---` markers is one
+/// document, as in yq (#6349). See `Parser::yq_leading_marker_run`.
+///
+/// # Errors
+///
+/// As [`build_semi_index`].
+pub fn build_semi_index_yq(input: &[u8]) -> Result<SemiIndex, YamlError> {
+    build_semi_index_impl(input, false, true)
 }
 
 /// [`build_semi_index`], enforcing real yq's own `-p json` grammar (#2279,
@@ -9848,10 +9886,14 @@ pub fn build_semi_index(input: &[u8]) -> Result<SemiIndex, YamlError> {
 /// As [`build_semi_index`], plus the JSON delimiter and scalar-grammar
 /// violations above, which that function accepts.
 pub fn build_semi_index_json_strict(input: &[u8]) -> Result<SemiIndex, YamlError> {
-    build_semi_index_impl(input, true)
+    build_semi_index_impl(input, true, false)
 }
 
-fn build_semi_index_impl(input: &[u8], json_strict: bool) -> Result<SemiIndex, YamlError> {
+fn build_semi_index_impl(
+    input: &[u8],
+    json_strict: bool,
+    yq_leading_marker_run: bool,
+) -> Result<SemiIndex, YamlError> {
     // Text positions (bp_to_text/bp_to_text_end and the select samples and
     // rank arrays derived from them) are stored as u32, so inputs past
     // u32::MAX bytes would silently truncate offsets (#188). Every position
@@ -9869,10 +9911,12 @@ fn build_semi_index_impl(input: &[u8], json_strict: bool) -> Result<SemiIndex, Y
     if crate::util::simd::escape::contains_cr(input) {
         let mut p = Parser::<true>::new(input);
         p.json_strict = json_strict;
+        p.yq_leading_marker_run = yq_leading_marker_run;
         p.parse()
     } else {
         let mut p = Parser::<false>::new(input);
         p.json_strict = json_strict;
+        p.yq_leading_marker_run = yq_leading_marker_run;
         p.parse()
     }
 }
@@ -9880,6 +9924,39 @@ fn build_semi_index_impl(input: &[u8], json_strict: bool) -> Result<SemiIndex, Y
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6349: `build_yq` reads a run of leading `---` markers as one document, as yq's header slurp
+    /// does; `build` keeps the YAML spec's reading (a null document per marker), and a marker
+    /// after the first content line or after an empty later document is a document in both.
+    #[test]
+    fn test_a_run_of_leading_markers_is_one_document_for_yq_only_6349() {
+        for (yaml, yq_docs, spec_docs) in [
+            (&b"---\n---\nx\n"[..], 1, 2),
+            (b"---\n---\n", 1, 2),
+            (b"---\n---\n---\nx\n", 1, 3),
+            (b"---\n# c\n---\nx\n", 1, 2),
+            (b"---\n--- x\ny\n", 1, 2),
+            (b"---\n---\nx\n---\ny\n", 2, 3),
+            // Not a leading run: the same in both.
+            (b"x\n---\n---\ny\n", 3, 3),
+            (b"---\nx\n---\n---\ny\n", 3, 3),
+            (b"---\nx\n", 1, 1),
+        ] {
+            let count = |index: crate::yaml::YamlIndex| index.document_starts().len();
+            assert_eq!(
+                count(crate::yaml::YamlIndex::build_yq(yaml).unwrap()),
+                yq_docs,
+                "build_yq {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+            assert_eq!(
+                count(crate::yaml::YamlIndex::build(yaml).unwrap()),
+                spec_docs,
+                "build {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
 
     /// #6348: a block scalar header holds one chomping character, one digit 1-9, blanks, a comment
     /// and the line break. Anything else is refused at the parser, whatever the caller, in every

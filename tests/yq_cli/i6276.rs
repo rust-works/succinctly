@@ -109,21 +109,6 @@ fn test_what_yq_does_not_glue_is_read_as_before_6276() -> Result<()> {
     Ok(())
 }
 
-/// Recorded divergence (#6349): yq sets every leading bare `---` aside as one header and reads one
-/// document; here each is a document start, so the run is several documents. Pinned to what
-/// succinctly answers today; delete a row when it starts to fail.
-#[test]
-fn test_recorded_divergence_a_run_of_bare_leading_markers_is_several_documents_6349() -> Result<()>
-{
-    for (doc, expected) in [
-        ("---\n---\nx\n", "null\n\"x\""),
-        ("---\n--- x\ny\n", "null\n\"xy\""),
-    ] {
-        assert_eq!(json_of(doc)?, expected, "{doc:?}");
-    }
-    Ok(())
-}
-
 #[test]
 fn test_a_line_that_the_glue_makes_invalid_is_refused_as_yq_refuses_it_6276() -> Result<()> {
     // `--- a: 1` / `b: 2` is `a: 1b: 2`, a second `:` on the one line; the same for an indented

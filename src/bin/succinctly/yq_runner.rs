@@ -1109,7 +1109,7 @@ fn walk_yaml_display_keys(bytes: &[u8], refuse_complex: bool) -> Result<()> {
         }
     }
 
-    let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
+    let index = YamlIndex::build_yq(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
     let mut saw_complex = false;
     walk(index.root(bytes), 0, &mut saw_complex)?;
     if refuse_complex && saw_complex {
@@ -2276,7 +2276,7 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
         InputFormat::Yaml | InputFormat::Auto => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
             let mut index =
-                YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
+                YamlIndex::build_yq(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
             index.render_merges_through_aliases_only(); // #4987, see the stdin site
             let root = index.root(bytes);
 
@@ -2364,7 +2364,7 @@ fn evaluate_yaml_direct_filtered(
         streamed = stream;
         index
     } else {
-        YamlIndex::build(source).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?
+        YamlIndex::build_yq(source).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?
     };
     index.render_merges_through_aliases_only(); // #4987, see the stdin site
     let bytes: &[u8] = streamed.as_deref().unwrap_or(source);
@@ -11594,7 +11594,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 }
                 index
             } else {
-                YamlIndex::build(&yaml_bytes)
+                YamlIndex::build_yq(&yaml_bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?
             };
             // #2795: `-N` also drops the `---` lines of the first
@@ -11817,7 +11817,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         index
                     })
                 } else {
-                    YamlIndex::build(&yaml_bytes)
+                    YamlIndex::build_yq(&yaml_bytes)
                 };
                 let mut index = match built {
                     Ok(index) => index,
@@ -12398,7 +12398,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 // No `suppress_header_doc_markers` here (#2795): a slurped
                 // array streams its documents as elements, never as
                 // documents, so no header is ever printed on this path.
-                let mut index = YamlIndex::build(&bytes)
+                let mut index = YamlIndex::build_yq(&bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
                 index.render_merges_through_aliases_only(); // #4987, see the stdin site
                 parsed_sources.push((bytes, index));
@@ -12684,7 +12684,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 // `can_inplace_fast_path` now requires `!any_input_is_json`
                 // (see its own doc comment), so `format` is never `Json`
                 // for any file reaching this branch.
-                let mut index = YamlIndex::build(&input_bytes)
+                let mut index = YamlIndex::build_yq(&input_bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error in {file_path}: {e}"))?;
                 if args.no_doc {
                     index.suppress_header_doc_markers(); // #2795, see the stdin site
