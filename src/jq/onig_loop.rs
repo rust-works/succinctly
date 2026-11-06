@@ -390,10 +390,18 @@ pub(crate) fn rewrite_with_groups(input: &str) -> Option<GroupRewrite> {
 }
 
 /// The length of the flag switches (`(?i)`, `(?s)`, `(?is)`) the pattern starts with, or `None`
-/// when one names `U`, which changes what greedy means, or `x` over a pattern with a `#`. A switch
-/// that names `x` is not split off: the length is 0 and it stays in the pattern.
+/// when one names `U`, which changes what greedy means, or turns `x` on over a pattern with a `#`.
+/// A switch that turns `x` on is not split off: the length is 0 and every switch stays in the
+/// pattern (#6442).
+///
+/// `x` changes how the rest is read (blanks and comments are skipped), so the rest cannot be parsed
+/// on its own after the switch is cut from the front; the parser reads the whole pattern from its
+/// start instead. A `#` could start a comment that runs on into text the rewrite writes after it, so
+/// such a pattern keeps its text. A switch that turns `x` off (`(?-x)`, `(?i-x)`) leaves the rest
+/// as it reads by default, and is split off like `i` and `s`.
 fn leading_switches(pattern: &str) -> Option<usize> {
     let mut at = 0;
+    let mut extended = false;
     while pattern[at..].starts_with("(?") {
         let Some(close) = pattern[at..].find(')') else {
             break;
@@ -405,14 +413,12 @@ fn leading_switches(pattern: &str) -> Option<usize> {
         if flags.contains('U') {
             return None;
         }
-        // `x` changes how the rest is read (blanks and comments are skipped), so the switch is not
-        // split off: it stays in the pattern, which the parser reads from its start (#6442). A `#`
-        // could start a comment that runs on into text the rewrite writes after it, so the pattern
-        // keeps its text.
-        if flags.contains('x') {
-            return (!pattern.contains('#')).then_some(0);
-        }
+        // Only the flags before a `-` turn a mode on.
+        extended |= flags.split('-').next().is_some_and(|on| on.contains('x'));
         at += close + 1;
+    }
+    if extended {
+        return (!pattern.contains('#')).then_some(0);
     }
     Some(at)
 }
@@ -2712,6 +2718,12 @@ mod tests {
         // A `#` could start a comment that runs into the text written after it; `U` swaps greed.
         assert_eq!(leading_switches("(?x)(a) # c\n"), None);
         assert_eq!(leading_switches("(?U)(a)"), None);
+        // Every switch is read: a `U` after an `x`, and an `x` after an `i`, are seen.
+        assert_eq!(leading_switches("(?x)(?U)(a)"), None);
+        assert_eq!(leading_switches("(?i)(?x)(a|b)"), Some(0));
+        // A switch that turns `x` off is split off like `i` and `s`, a `#` after it is a literal.
+        assert_eq!(leading_switches("(?-x)(a)"), Some(5));
+        assert_eq!(leading_switches("(?i-x)(a) #"), Some(6));
         // The loop is written with its groups copied, under `x` as without it.
         let written = rewrite_with_groups("(?x)( () (?: a | ) | (b*) )*").unwrap();
         assert!(written.copies.iter().skip(1).any(|copies| copies.len() > 1));

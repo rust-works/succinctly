@@ -201,6 +201,8 @@ def main():
         plist = ways_patterns(args.count, rng) if args.ways else patterns(args.count, rng, args.nest)
         prog = PROGRAM
     if args.blanks:
+        if args.anchors or args.fancy:
+            ap.error("--blanks applies to the plain, --nest and --ways draws")
         plist, prog = blanked(plist), program(BLANK_SUBJECTS)
     ref = answers([args.jq], plist, args.flags, prog)
     base = answers([args.baseline, "jq"], plist, args.flags, prog)
