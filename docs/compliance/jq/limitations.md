@@ -7798,6 +7798,7 @@ These keep their loop as written, and still match longer than jq where the shape
   A lazy repeat past its minimum leaves before it makes an iteration, which sets no group, so it has no `E`.
   Whether Oniguruma writes a lazy `{n,}?` out as copies comes from an operation count, and a capture group is its body and the two operations that start and end it.
   A loop in a pattern the `regex` crate's parser does not read (a lookaround, a backreference) is read only by the plain rewrite, which keeps a loop as written when it would copy or drop a group.
+  So `"ba" | [match("(?=b)((a|b)|){2,}";"g") | .captures | map(.string)]` has `["a","a"]` here where jq has `["","a"]`, and `scripts/jq-regex-capture-loop-sweep.py --fancy` draws that shape.
   A loop with groups inside another repeat that can run its body more than once, and a counted repeat over a body that has a loop of its own, are written with the rest since [#6358](https://github.com/rust-works/succinctly/issues/6358): the loop's ways are listed through its exit, so the repeat around it takes the empty iteration where Oniguruma does (`"ba" | [match("((?:(b|)*|a)+)*";"g") | .string]` is `["b","",""]`, as in jq; it was `["ba",""]`).
   A counted repeat over such a body that is large enough for the rewrite to give up (its copies pass the size limit above) keeps its text and differs: `"ba" | [match("((?:(b|)*|a)+){4,8}";"g") | .string]` is `["b","",""]` in jq and `["ba",""]` here (`{3,5}` agrees).
   A loop under a lookaround or a backreference inside another repeat is read only by the plain rewrite, so `"ba" | [match("(?=b|a)((?:(b|)*|a)+)*";"g") | .string]` is `["b",""]` in jq and `["ba"]` here.
@@ -7809,7 +7810,7 @@ These keep their loop as written, and still match longer than jq where the shape
   Three draws of 6,000 with assertions, `(?i)`, `{3,}` and nested groups among the atoms fixed 213, 250 and 195 and broke none, and four of 6,000 counted repeats near the unrolling limit fixed 221, 231, 202 and 201 and broke none.
   Six draws with the loops also inside an outer repeat or holding a repeated group of their own (`--nest`) fixed 139 to 160 and broke none, and two of them under the flags `gi` fixed 108 and 133 and broke none.
   `scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE` regenerates the first and last.
-  What still differs, in about 10 to 13 of the 5,000 plain ones and about 15 of the 5,000 nested ones: loops with an assertion beside a group (a leading assertion over a counted repeat, `"ba" | [match("(?=b)((a|b)|){2,}";"g") | .captures | map(.string)]`, has `["a","a"]` where jq has `["","a"]`; a lazy counted repeat whose operation count does not read an assertion), or a group name used twice.
+  What still differs, in about 10 to 13 of the 5,000 plain ones and about 15 of the 5,000 nested ones: the lazy bounded repeat below, a group name used twice, or a loop beside a lookaround.
   A lazy bounded repeat that leaves a group unset differs too: `"ab" | [match("(?:(b*)|a){0,2}?b") | .captures | map(.string)]` is `[null]` in jq and `[""]` here.
   A group beside a flag switch written inside the pattern is rewritten since [#6358](https://github.com/rust-works/succinctly/issues/6358): the empty way of what the switch reaches is the items' empty ways in the flag group the switch stands for, so `"bab" | [match("(?:(a)?|(?i)b)*";"g") | .string]` is `["","a","",""]`, as in jq.
   A way that is only a switch (`((a)?|(?i)){2,}`) is one too.
@@ -7825,9 +7826,17 @@ These keep their loop as written, and still match longer than jq where the shape
   A non-capturing group around one capture group (`(?:(a*)){2,}`) already agrees and is read as written.
   Two draws of 5,000 plain loops fixed 15 and 17 patterns more and broke none, and three draws with the loops nested in repeats fixed 7, 7 and 6.
   Over 2,498 generated `{2,}`, `{3,}` and `{4,}` patterns, the 519 that differed from jq agree and none changed the other way.
-- **A body with a way that matches nothing only where a zero-width assertion holds** (`^`, `$`, `\b`, `\A`, `\z`).
-  Such a way is an assertion beside items that can themselves match nothing, as in `(?:b*|a?\b)+`.
-  Its empty way depends on where it stands, which the rewrite does not express, so `"ba" | [match("(?:b*|a?\\b)+") | .string]` is `["b","",""]` in jq and `["ba",""]` here.
+- **A body with two ways that match nothing only where an anchor holds** (`^`, `$`, `\b`, `\B`, `\A`, `\z`), or such a way with a way that always matches nothing after it.
+  One such way is rewritten since [#6358](https://github.com/rust-works/succinctly/issues/6358): `"ba" | [match("(a|\\b)*") | .string]` is `["","a",""]`, and `"bab" | [match("(?:(a)\\b|\\bb?){2,}?";"g") | .string]` is `["",""]`, as in jq.
+  It is a conditional exit, so the loop over `A | c | B` is `L = A L | c | B L | ε`: where the anchor fails the loop goes on to `B`, and it can still leave after every way has failed.
+  That has an exit on either side of the way back, which one star cannot write, so `onig_loop::anchored_loop` writes it from what the anchor is.
+  `\b` and `\B` have a complement that tells the two heads apart, `\A` and `^` are written for the loop's first head, and no way that consumes text can run where `\z` or `$` holds.
+  A list of anchors (`\b\z`) is the one way, a repeat Oniguruma writes as copies keeps its text, and one it counts leaves the whole repeat at the anchor.
+  Oniguruma refuses a non-capturing body with such a way (`(?:\b|a)*` is `target of repeat operator is invalid`), so the shape is a capturing one, or a list of anchors, or `\bb?`.
+  The forms were checked first against Oniguruma on 7,040 cases (`(\b|I)*` with `I` of two or more ways that overlap, four suffixes, ten strings) and none differed; a form that takes every exit by the anchor before every other exit is wrong (`"ab" | match("(\\z|a|ab)*").string` is `"a"`).
+  What still differs is mostly two such ways (`"bab" | [match("(\\A|a|\\B)+";"g") | .captures[0].string]` is `["","",""]` in jq and `["","a",""]` here), and an empty way after one (`(\B|(?:a|b*)){2,}`): that is another exit past the ways after the first, which these forms do not write.
+  Over draws of 3,000 such loops (`--assert`, seeds 3, 4 and 5) the patterns that differ fall from 113, 115 and 137 to 69, 50 and 62, and none changed the other way; about seven in ten of those left have two such ways, a share the draw inflates by holding each anchor three times.
+  The flag `gi` and `--assert --newlines` broke none either; under `(?m)` `^` and `$` hold at every line, so such a way keeps its text and differs: `"a\nb" | [match("(?m)($|a|\\n|b)*";"g") | .string]` is `["a","","b",""]` in jq and `["a\nb",""]` here.
   An assertion in a way that also consumes text is not this case: `\Ba`, `a\z` and `^a` always consume when they match.
   They are copied with the other ways, and `"ba" | [match("(?:b*|\\Ba)+") | .string]` is `["b","",""]`, as in jq ([#6300](https://github.com/rust-works/succinctly/issues/6300)).
 - **A body with a flag switch** (`(?i)` inside it) is rewritten with the switch scoped over what it reaches, as `(?i:..)` around the items after it and around every later way ([#6301](https://github.com/rust-works/succinctly/issues/6301)): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and here.

@@ -1,7 +1,7 @@
 //! #6358: a loop with capture groups beside a counted repeat of a non-capturing group (`(?:(a)|()){2,}`) or
 //! an inline flag switch (`(?:(a)?|(?i)b)*`) answers as Oniguruma does: the empty iteration ends the loop
 //! before the minimum count, and the group it holds is set; a switch reaches the rest of its group, later
-//! ways included. Every row was captured from jq 1.7.1 (`/usr/bin/jq -nc`).
+//! ways included. Every row was captured from jq 1.7.1 (`jq -nc`).
 
 use anyhow::Result;
 
@@ -223,5 +223,87 @@ fn a_loop_with_capture_groups_inside_another_repeat_answers_as_jq_does_6358() ->
             "{pattern} on {input:?}"
         );
     }
+    Ok(())
+}
+
+/// A loop with one way that is only an anchor: the anchor ends the loop where it holds and only there,
+/// and the loop leaves after its ways where it does not. Rows captured from jq 1.7.1.
+#[test]
+fn a_loop_with_a_way_that_is_only_an_anchor_answers_as_jq_does_6358() -> Result<()> {
+    for (pattern, input, expected) in [
+        (
+            r"(a|\b)*",
+            "ba",
+            r#"[[0,"",[""]],[1,"a",[""]],[2,"",[""]]]"#,
+        ),
+        (
+            r"(\bb*|a)+",
+            "a b",
+            r#"[[0,"",[""]],[1,"",[""]],[2,"b",[""]],[3,"",[""]]]"#,
+        ),
+        (
+            r"(\z|a|ab)*",
+            "ab",
+            r#"[[0,"a",["a"]],[1,"",[""]],[2,"",[""]]]"#,
+        ),
+        (
+            r"(\A|b|a)*",
+            "ab",
+            r#"[[0,"",[""]],[1,"b",["b"]],[2,"",[""]]]"#,
+        ),
+        (r"(\A|a|b)+", "ab", r#"[[0,"",[""]],[1,"b",["b"]]]"#),
+        (r"(a|\B|b)*c?", "ba", r#"[[0,"ba",["a"]],[2,"",[""]]]"#),
+        (r"(a|b|\B)*", "ab", r#"[[0,"ab",["b"]],[2,"",[""]]]"#),
+        (
+            r"(\b|a){2,}",
+            "ba",
+            r#"[[0,"",[""]],[1,"a",[""]],[2,"",[""]]]"#,
+        ),
+        (
+            r"((a|b)|\b){2,}",
+            "ba",
+            r#"[[0,"ba",["","a"]],[2,"",["",""]]]"#,
+        ),
+        (r"((a|b)|^){2,3}", "a b", r#"[[0,"",["",""]]]"#),
+        (r"(a|\z|b){2}", "ab", r#"[[0,"ab",["b"]],[2,"",[""]]]"#),
+        (r"(?:(a)|\B\B){2}", "ba", r#"[[1,"",[""]]]"#),
+        (r"(?:a|\Bb?){2,}", "ba", r#"[[1,"",[]]]"#),
+        (
+            r"(?:(a)\b|\bb?){2,}?",
+            "bab",
+            r#"[[0,"",[""]],[3,"",[""]]]"#,
+        ),
+        (r"((?<n>a)|^){2,3}?", "a b", r#"[[0,"",["",""]]]"#),
+        ("(a|$|\\n|b)*", "a\nb", r#"[[0,"a\nb",[""]],[3,"",[""]]]"#),
+        (
+            "(^|a|\\n|b)*",
+            "a\nb",
+            r#"[[0,"",[""]],[1,"\nb",["b"]],[3,"",[""]]]"#,
+        ),
+    ] {
+        assert_matches(pattern, input, expected)?;
+    }
+    Ok(())
+}
+
+fn assert_matches(pattern: &str, input: &str, expected: &str) -> Result<()> {
+    let (stdout, _, status) = run_jq_full(
+        &[
+            "-nc",
+            "--arg",
+            "s",
+            input,
+            "--arg",
+            "p",
+            pattern,
+            r#"[$s | match($p; "g") | [.offset, .string, (.captures | map(.string))]]"#,
+        ],
+        None,
+    )?;
+    assert_eq!(
+        (stdout.trim_end(), status),
+        (expected, 0),
+        "{pattern} on {input:?}"
+    );
     Ok(())
 }

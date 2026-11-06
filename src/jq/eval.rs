@@ -27620,7 +27620,7 @@ fn ends_with_trailing_newline(input: &str) -> bool {
 /// otherwise be misread as enabling multiline, silently disabling this
 /// whole fix for a pattern that never touched the `m` flag at all.
 #[cfg(feature = "regex")]
-fn pattern_may_enable_multiline(pattern: &str) -> bool {
+pub(crate) fn pattern_may_enable_multiline(pattern: &str) -> bool {
     let bytes = pattern.as_bytes();
     let mut search_from = 0;
     while let Some(rel) = pattern[search_from..].find("(?") {
