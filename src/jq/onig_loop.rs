@@ -2367,6 +2367,31 @@ mod tests {
         }
     }
 
+    /// #6429, the loop rewrite alone (the evaluator composes it with the capture rewrite of #6069, whose
+    /// groups bring the cliff to an upper bound of 7: `tests/jq_cli/i6429.rs` pins that one end to end): a
+    /// counted repeat over a body that holds a loop with a group is written copy by copy, and the
+    /// text doubles with each count of the upper bound (`{3,7}` 11 KB, `{4,8}` 22 KB, `{5,9}` 45 KB before the
+    /// capture rewrite of #6069 adds its own groups), because every copy holds the rest of the repeat twice,
+    /// once after the loop's exit and once after another iteration. No smaller spelling exists in the `regex`
+    /// crate's syntax, and a larger cap only moves the cliff by one count per doubling, so the repeat past it
+    /// keeps its text, which `docs/compliance/jq/limitations.md` records. Pinned here so that it stays a
+    /// fallback and never an error.
+    #[test]
+    fn a_counted_repeat_over_a_loop_with_groups_doubles_and_is_given_up_past_the_cap_6429() {
+        let size = |n: u32| {
+            rewrite_with_groups(&format!("((?:(b|)*|a)+){{{n},{}}}", n + 4))
+                .map(|r| r.pattern.len())
+        };
+        let (small, large) = (size(3).expect("{3,7} is written"), size(2).expect("{2,6}"));
+        assert!(small < 32 * 1024 && large < small, "{large} then {small}");
+        assert!(small * 10 >= large * 19, "doubling: {large} then {small}");
+        assert_eq!(size(4), None, "{{4,8}} is past the cap");
+        assert_eq!(size(8), None);
+        // The unbounded and the exact forms are single loops or plain copies, far from the cap.
+        assert!(rewrite_with_groups("((?:(b|)*|a)+){4,}").is_some());
+        assert!(rewrite_with_groups("((?:(b|)*|a)+){4}").is_some());
+    }
+
     #[test]
     fn a_flag_group_wraps_the_ways_taken_out_of_it() {
         assert_eq!(
