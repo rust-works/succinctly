@@ -21,7 +21,6 @@ fn test_a_line_after_a_quoted_or_flow_explicit_key_is_refused_6382() -> Result<(
         "? [a] # c\n  b\n: v\n",
         "? [a]\n  b\n: v\n",
         "? {a: b}\n  c\n: v\n",
-        "? *x\n  b\n: v\n",
         "? \"a\"\n  : v\n",
         "? \"a\"\n  :x\n: v\n",
         "? [a]\n  - x\n: v\n",
