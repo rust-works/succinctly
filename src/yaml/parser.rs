@@ -540,6 +540,11 @@ struct Parser<'a, const HAS_CR: bool> {
     /// A line that stands after it once a comment ended it has nothing to attach to either.
     explicit_key_scalar_start: Option<usize>,
 
+    /// Whether the pending explicit key's whole content is a node that ended on its own line, a
+    /// quoted scalar or a flow collection (#6382). The line after it that is more indented than the
+    /// `?` has nothing to attach to, comment or not.
+    explicit_key_node_closed: bool,
+
     /// Whether the key named by [`Self::pending_explicit_key`] was a bare `?`
     /// with no content (`?\n- a\n:\n- c`), as opposed to a key that held a
     /// node of its own (`? k`). Only the latter rejects a same-indent `-`
@@ -746,6 +751,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     || crate::util::simd::escape::contains_byte(input, 0xE2)),
             last_plain_scalar: None,
             explicit_key_scalar_start: None,
+            explicit_key_node_closed: false,
             pending_explicit_key_empty: false,
             pending_explicit_key_below: Vec::new(),
             nesting_depth: 0,
@@ -3512,6 +3518,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Every frame of the closing document has been closed, each key with its value or null.
         self.pending_explicit_key_below.clear();
         self.explicit_key_scalar_start = None;
+        self.explicit_key_node_closed = false;
         // The document that's closing, if any -- `document_start_bp_pos`
         // still holds its root right up until the overwrite below.
         // `seen_any_document` is the only way to tell "no previous document"
@@ -5829,6 +5836,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.parse_flow_sequence()?;
                 self.reject_trailing_flow_content(true)?;
                 self.write_bp_close();
+                self.explicit_key_node_closed = true;
             }
             Some(b'{') => {
                 // Flow mapping as key -- see the `[` arm above (#902).
@@ -5836,6 +5844,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.parse_flow_mapping()?;
                 self.reject_trailing_flow_content(true)?;
                 self.write_bp_close();
+                self.explicit_key_node_closed = true;
             }
             Some(b'|' | b'>') => {
                 // Block scalar as key
@@ -5892,6 +5901,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.reject_content_after_inline_value()?;
                 self.set_bp_text_end(self.pos);
                 self.write_bp_close();
+                self.explicit_key_node_closed = true;
             }
             Some(b'\'') => {
                 // Single-quoted key
@@ -5901,6 +5911,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.reject_content_after_inline_value()?;
                 self.set_bp_text_end(self.pos);
                 self.write_bp_close();
+                self.explicit_key_node_closed = true;
             }
             _ => {
                 // Unquoted scalar key
@@ -9280,11 +9291,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let Some(scalar) = ended.filter(|scalar| scalar.start == key_scalar) else {
             return false;
         };
+        self.line_is_beyond_the_pending_explicit_key(indent)
+            && self.only_comments_between(scalar.end) == Some(true)
+    }
+
+    /// Whether the line at the cursor, at `indent`, is content more indented than the `?` of the
+    /// pending explicit key and is not the `:` of its value (#6371, #6382). A `:` that is followed
+    /// by a blank is the value indicator, which the dispatch judges; `:x` is a plain scalar.
+    fn line_is_beyond_the_pending_explicit_key(&self, indent: usize) -> bool {
         let Some(owner_depth) = self.pending_explicit_key else {
             return false;
         };
-        // A `:` that is followed by a blank is the key's value indicator, which the dispatch judges;
-        // `:x` is a plain scalar.
         let value_indicator =
             self.peek() == Some(b':') && Self::is_ws_break_or_eoi(self.peek_at(1));
         !matches!(self.peek(), Some(b'#' | b'\n' | b'\r') | None)
@@ -9293,7 +9310,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 .indent_stack
                 .get(owner_depth - 1)
                 .is_some_and(|&at| indent > at)
-            && self.only_comments_between(scalar.end) == Some(true)
     }
 
     /// Whether nothing but a comment, blank lines and comment lines lies between `from` and the
@@ -9528,6 +9544,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             if self.line_is_stray_after_an_explicit_key_scalar(ended, key_scalar, indent) {
                 return Err(self.err_stray_line());
             }
+        }
+        // #6382: and the line after one whose content is a quoted scalar or a flow collection, which
+        // no comment is needed to end (`? "a"⏎  b⏎: v`).
+        if core::mem::take(&mut self.explicit_key_node_closed)
+            && self.line_is_beyond_the_pending_explicit_key(indent)
+        {
+            return Err(self.err_stray_line());
         }
 
         // Check what kind of content this is
