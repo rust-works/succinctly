@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Differential sweep for #6310 and #6332: a capture group inside a loop's body.
 
-    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways] [--flags g] [--jq /usr/bin/jq]
+    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert] [--flags g] [--jq /usr/bin/jq]
 
 Oniguruma ends a greedy loop at the first iteration that matches nothing (#6106), and that holds when the
 body has a capture group: after its empty way (`(?:b*|(a))+`, #6310), or before it, in it, or with its own
@@ -13,7 +13,9 @@ which re-runs the copies of a group the rewrite wrote (#6332). `--ways` (#6358) 
 `--nest` undersamples: an outer repeat, of any of ten quantifiers, over two or three ways that are each one to three items,
 six in ten of them a loop with a group (or a plain atom otherwise), so that a loop stands in a way beside other items and
 the ways share a prefix; it is the draw that found the alternation `regex-syntax` factors (#6134) and the lazy `*?` and `+?`
-that keep their text. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
+that keep their text. `--assert` (#6358) draws the loops whose ways hold a zero-width anchor (`\\b`, `\\B`, `^`, `$`, `\\A`, `\\z`)
+beside a capture group or a consuming item, under the counted and lazy quantifiers, on subjects with a word boundary
+in the middle. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
 captures are compared. It prints how many patterns SUBJECT fixed (BASELINE differed from jq, SUBJECT does
 not), broke (the reverse) and still differs on, and exits 1 when it broke one.
 
@@ -37,8 +39,17 @@ LOOPS = ["(?:b*|(a))+", "(?:(a)|b?)*", "(?:(a)|b)*", "(b|)*", "(?:a|(b))+?", "(?
 SIMPLE = ["a", "b", "b*", "a?", "(a)", "(a|b)", "(b*)", "()", "c?", "(?:a|b)", r"\w"]
 WAYS_QUANTS = ["{2}", "{2,}", "{0,3}", "{1,2}", "+", "*", "{2,3}?", "{2}?", "{0,2}?", "+?"]
 SUBJECTS = ["ba", "bab", "abab", "aab", "abba", "baab", "aaa", "bbb", "cba", "abc"]
-PROGRAM = ('.[] as $p | %s[] as $s | [$p,$s,(try ([$s|match($p;$flags)|[.offset,.string,'
-           '(.captures|map(.string))]]) catch "ERR")]' % json.dumps(SUBJECTS))
+# `--assert`: the anchors, and subjects that put a word boundary inside the string.
+ANCHORS = [r"\b", r"\B", "^", "$", r"\A", r"\z"]
+ASSERT_SUBJECTS = SUBJECTS[:6] + ["a b", " ab", "ba b", "b a"]
+
+
+def program(subjects):
+    return ('.[] as $p | %s[] as $s | [$p,$s,(try ([$s|match($p;$flags)|[.offset,.string,'
+            '(.captures|map(.string))]]) catch "ERR")]' % json.dumps(subjects))
+
+
+PROGRAM = program(SUBJECTS)
 
 
 def patterns(count, rng, nest=False):
@@ -85,21 +96,43 @@ def ways_patterns(count, rng):
     return sorted(out)
 
 
-def run(cmd, plist, flags="g"):
-    r = subprocess.run(cmd + ["-c", "--arg", "flags", flags, PROGRAM], input=json.dumps(plist),
+def assert_patterns(count, rng):
+    """`--assert`: ways that hold a zero-width anchor beside groups and consuming items, under a repeat."""
+    pool = ATOMS + ANCHORS * 3
+
+    def way():
+        return "".join(rng.choice(pool) for _ in range(rng.choice([1, 1, 2, 2])))
+
+    out = set()
+    while len(out) < count:
+        body = "|".join(way() for _ in range(rng.choice([2, 2, 3])))
+        pattern = rng.choice(["(?:%s)", "(?:%s)", "(%s)"]) % body + rng.choice(QUANTS)
+        r = rng.random()
+        if r < 0.15:
+            pattern += "c"
+        elif r < 0.3:
+            pattern = "x?" + pattern
+        elif r < 0.4:
+            pattern = "(?:" + pattern + ")(b)"
+        out.add(pattern)
+    return sorted(out)
+
+
+def run(cmd, plist, flags="g", prog=PROGRAM):
+    r = subprocess.run(cmd + ["-c", "--arg", "flags", flags, prog], input=json.dumps(plist),
                        capture_output=True, text=True)
     return r.stdout.splitlines() if r.returncode == 0 else None
 
 
-def answers(cmd, plist, flags="g"):
+def answers(cmd, plist, flags="g", prog=PROGRAM):
     out = {}
     for i in range(0, len(plist), 200):
         chunk = plist[i:i + 200]
-        lines = run(cmd, chunk, flags)
+        lines = run(cmd, chunk, flags, prog)
         if lines is None:
             lines = []
             for p in chunk:
-                lines += run(cmd, [p], flags) or []
+                lines += run(cmd, [p], flags, prog) or []
         for line in lines:
             row = json.loads(line)
             out[(row[0], row[1])] = row[2]
@@ -115,14 +148,19 @@ def main():
     shape = ap.add_mutually_exclusive_group()
     shape.add_argument("--nest", action="store_true", help="also nest loops inside repeats")
     shape.add_argument("--ways", action="store_true", help="loops beside other items in the ways of an outer repeat")
+    shape.add_argument("--assert", dest="anchors", action="store_true", help="ways that hold a zero-width anchor")
     ap.add_argument("--flags", default="g", help="the match flags (`gi`: case folding)")
     ap.add_argument("--jq", default="/usr/bin/jq")
     args = ap.parse_args()
     rng = random.Random(args.seed)
-    plist = ways_patterns(args.count, rng) if args.ways else patterns(args.count, rng, args.nest)
-    ref = answers([args.jq], plist, args.flags)
-    base = answers([args.baseline, "jq"], plist, args.flags)
-    subj = answers([args.subject, "jq"], plist, args.flags)
+    if args.anchors:
+        plist, prog = assert_patterns(args.count, rng), program(ASSERT_SUBJECTS)
+    else:
+        plist = ways_patterns(args.count, rng) if args.ways else patterns(args.count, rng, args.nest)
+        prog = PROGRAM
+    ref = answers([args.jq], plist, args.flags, prog)
+    base = answers([args.baseline, "jq"], plist, args.flags, prog)
+    subj = answers([args.subject, "jq"], plist, args.flags, prog)
     keys = [k for k in ref if k in base and k in subj]
     fixed = {k[0] for k in keys if base[k] != ref[k] and subj[k] == ref[k]}
     broke = {k[0] for k in keys if base[k] == ref[k] and subj[k] != ref[k]}
