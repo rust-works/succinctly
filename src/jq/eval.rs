@@ -25980,13 +25980,17 @@ fn builtin_from_yaml<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         _ => return QueryResult::Owned(to_owned_lossy::<S, _>(&value)),
     };
-    let bytes = text.as_bytes();
     // Only the empty string is yq's `EOF`: whitespace or a bare comment is a document with no
     // content, which decodes to null.
-    if bytes.is_empty() {
+    if text.is_empty() {
         return suppress_or_raise(EvalError::new("EOF"), optional);
     }
-    let index = match crate::yaml::YamlIndex::build(bytes) {
+    // yq reads the string through its YAML decoder, whose header slurp applies to it as to a
+    // file: the line break after a leading `--- text` is lost (#6276) and a run of leading
+    // markers is one document (#6349). `"---\n---\nx" | from_yaml` is `"x"`.
+    let glued = crate::yaml::glue_after_leading_marker_text(text.as_bytes());
+    let bytes: &[u8] = glued.as_deref().unwrap_or(text.as_bytes());
+    let index = match crate::yaml::YamlIndex::build_yq(bytes) {
         Ok(index) => index,
         Err(e) => return suppress_or_raise(EvalError::new(format!("yaml: {e}")), optional),
     };
