@@ -491,11 +491,11 @@ fn bodies_with_an_assertion_that_is_not_beside_text_agree_with_jq_6300() -> Resu
     Ok(())
 }
 
-/// What the rewrite still leaves (recorded in `docs/compliance/jq/limitations.md`): a way that can match
-/// nothing only where an assertion holds. jq 1.7.1 answers `[[0,"b"],[1,""],[2,""]]` here.
+/// A way that can match nothing only where an assertion holds: it was read as written until #6358,
+/// which writes the anchor as a conditional exit. Captured from jq 1.7.1.
 #[test]
-fn a_way_that_matches_nothing_only_where_an_assertion_holds_is_still_read_as_written_6300(
-) -> Result<()> {
+fn a_way_that_matches_nothing_only_where_an_assertion_holds_answers_as_jq_does_6358() -> Result<()>
+{
     let (stdout, _, status) = run_jq_full(
         &[
             "-nc",
@@ -503,6 +503,9 @@ fn a_way_that_matches_nothing_only_where_an_assertion_holds_is_still_read_as_wri
         ],
         None,
     )?;
-    assert_eq!((stdout.trim_end(), status), (r#"[[0,"ba"],[2,""]]"#, 0));
+    assert_eq!(
+        (stdout.trim_end(), status),
+        (r#"[[0,"b"],[1,""],[2,""]]"#, 0)
+    );
     Ok(())
 }
