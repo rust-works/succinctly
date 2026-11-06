@@ -563,6 +563,33 @@ follow-up issue once #64 lands. Mirrored in the issue body.
 
 ### F1 — Drop BP's `rank_l2` (largest remaining win) — issue #596
 
+**Status: rejected (2026-11-06).** Implemented in full and measured; the predicted trade is real and
+it loses. `rank_l2` stays. The write-up is the ❌ F1 entry in
+[the lessons log](../optimizations/lessons.md); the numbers, interleaved A/B with identical outputs,
+a 7950X (terminus) and an M4 Pro (Mac mini), `bp_rank_micro` and `bp_select_micro` in µs per 10,000
+queries:
+
+| row                                  | 7950X before | 7950X after | M4 Pro before | M4 Pro after |
+|--------------------------------------|--------------|-------------|---------------|--------------|
+| `bp_rank1/*/1k-100k` (all shapes)    | 22.3-24.6    | 38.8-39.7   | 10.4-10.6     | 24.9-25.2    |
+| `bp_rank1/*/1000k`                   | 25.4-25.5    | 43.0-43.2   | 11.7-12.5     | 25.4-25.6    |
+| `select1_cspoppy/1k-1000k`           | 105-128      | 144-178     | 176-194       | 185-205      |
+
+| end to end, 100 MB           | 7950X                        | M4 Pro                      |
+|------------------------------|------------------------------|-----------------------------|
+| `jq '[..\|scalars]\|length'` | +4.4%                        | +3.4%                       |
+| `jq .` (users)               | +6.4%                        | +7.0%                       |
+| `yq '[..\|tag]\|length'`     | +2.1%                        | 0.0%                        |
+| `yq .` (users)               | +0.5%                        | +1.6%                       |
+| peak RSS (`jq`, `yq`)        | −0.1 to −0.8 MiB (0.03-0.3%) | −0.3 to −0.5 MiB (0.1-0.4%) |
+
+(Medians of 11 interleaved runs; a 5-round interleaved criterion run for the micro rows.)
+What the 12.5% of the BP bitmap buys is a few hundred KiB on a 100 MB document, against a `rank1`
+that is 1.6-2.4x slower. The prediction below that `select1` would widen its ARM regression held
+only mildly (M4 Pro `select1_cspoppy` −0.2% to +5.9%) and hit the 7950X harder (+28% to +39%).
+
+The original proposal follows unchanged.
+
 `rank_l2: Vec<u64>` is 64 bits per 512-bit block = **12.5% of the BP bitmap** —
 twice what Step B saves. Poppy's actual trade is to omit the per-word level and
 popcount up to 7 words inside a basic block, which is exactly one 64-byte cache

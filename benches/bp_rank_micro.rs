@@ -1,12 +1,12 @@
 //! Micro-benchmark for `BalancedParens::rank1` performance.
 //!
-//! Baseline for #596 (F1: drop BP's `rank_l2`). `rank1` is the crate's
-//! hottest path (hit on every cursor navigation) and currently answers in
-//! O(1) via a packed 9-bit-per-word `rank_l2` lookup; #596 proposes
-//! replacing that lookup with popcounting up to 7 words within a 512-bit
-//! block. This benchmark exists so that trade can be measured against a
-//! dedicated baseline instead of noisy end-to-end `yaml_bench`/`yq` numbers
-//! (`benches/bp_select_micro.rs` already covers the select-side half).
+//! The `rank1` micro-benchmark for BP's rank directory. It was written as the baseline for #596
+//! (F1: drop BP's `rank_l2`), which replaced the packed 9-bit-per-word lookup with popcounting up
+//! to 7 words of the 512-bit block and was measured and rejected: `rank1` 1.6-2.4x slower for
+//! 0.1-0.4% less peak memory (the numbers are in `docs/plan/cspoppy.md`). It stays as the standing
+//! micro-benchmark for any change to the directory, instead of noisy end-to-end
+//! `yaml_bench`/`yq` numbers (`benches/bp_select_micro.rs` covers the select-side half). `rank1`
+//! is the crate's hottest path (hit on every cursor navigation).
 //!
 //! Covers three tree shapes (block-density patterns) at four sizes each:
 //! - `flat`: a wide array of leaves (`(()()()...)`) — opens and closes
