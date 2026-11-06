@@ -8,6 +8,61 @@ use anyhow::Result;
 
 use crate::run_jq_full;
 
+/// The same body inside another group or repeat, under a flag switch, or beside a group of its own.
+#[test]
+fn a_second_exit_in_a_nested_group_or_beside_a_flag_switch_6424() -> Result<()> {
+    for (pattern, input, expected) in [
+        (
+            r"((\A|a|\B))*",
+            "aab",
+            r#"[[0,"",["",""]],[1,"a",["",""]],[2,"",["",""]],[3,"",["",""]]]"#,
+        ),
+        (
+            r"((?:\A|a|\B))*",
+            "aab",
+            r#"[[0,"",[""]],[1,"a",[""]],[2,"",[""]],[3,"",[""]]]"#,
+        ),
+        (
+            r"x?(\A|a|\B)+",
+            "aab",
+            r#"[[0,"",[""]],[1,"a",[""]],[2,"",[""]]]"#,
+        ),
+        (
+            r"(((\b|a|\B))*b)*",
+            "ab",
+            r#"[[0,"ab",["ab","",""]],[2,"",["","",""]]]"#,
+        ),
+        (
+            r"(\b|(?i)a|\b)*",
+            "ba",
+            r#"[[0,"",[""]],[1,"a",[""]],[2,"",[""]]]"#,
+        ),
+        (
+            r"((?i)\b|a|\B)*",
+            "ba",
+            r#"[[0,"",[""]],[1,"a",[""]],[2,"",[""]]]"#,
+        ),
+        (
+            r"(?i)(\b|a|\B)+",
+            "ba",
+            r#"[[0,"",[""]],[1,"a",[""]],[2,"",[""]]]"#,
+        ),
+        (
+            r"(\b|(a)|\B)*",
+            "ba",
+            r#"[[0,"",["",""]],[1,"a",["","a"]],[2,"",["",""]]]"#,
+        ),
+        (
+            r"(\b|a|\B)*(\b|b|\B)*",
+            "ab",
+            r#"[[0,"",["",""]],[1,"b",["",""]],[2,"",["",""]]]"#,
+        ),
+    ] {
+        assert_matches(pattern, input, expected)?;
+    }
+    Ok(())
+}
+
 /// A second anchor, or a way that matches nothing, after the first with no consuming way after it
 /// sets the group at the end of every head's ways, not at the first exit.
 #[test]

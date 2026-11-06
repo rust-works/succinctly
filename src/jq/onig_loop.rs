@@ -1945,11 +1945,6 @@ impl Rewriter<'_> {
         if self.has_groups(&written) || (grouped && self.lazy_around > 0) {
             return Ok(kept);
         }
-        // #6424: a second exit written back last sets the group around the body. With none, it is
-        // the exit every loop ends with, which the text already has.
-        if anchor.last && !grouped {
-            return Ok(kept);
-        }
         // With no `B`, and no group for `E` to set, the next iteration can only fail where `A` did,
         // so the text already leaves where Oniguruma does (as [`Self::exit_on_empty`] says). Short
         // of a minimum of two: there `c` then `A` makes the count, where Oniguruma has left. That
@@ -2326,8 +2321,7 @@ mod tests {
             "(?:b*|a)*?",     // lazy
             "(?:b*|a){1,2}?", // lazy, runs once at most
             "(?:a|b*){2}",
-            "(b*|a)+",           // a capture group
-            r"(?:\A\A|a|\b\b)+", // two anchors
+            "(b*|a)+", // a capture group
             "(?U)(?:b*|a)+",
             "(?:(?U:b*)|a)+",
             "(?:a+)*",
@@ -2940,8 +2934,9 @@ mod tests {
         assert_eq!(written(r"(\A|a|\B|b)*"), None);
         assert_eq!(written(r"(\b|a|\B|b)*"), None);
         assert_eq!(written(r"(\b\B|a)*"), None);
-        // Without a group around the body the dropped exit sets nothing: the text stays as written.
-        assert_eq!(rewrite(r"(?:\A|a|\B)*"), None);
+        // The evaluator reads a loop again once the group around it is written as a plain one, so the
+        // dropped exit is written back there too.
+        assert!(rewrite(r"(?:\A|a|\B)*").is_some());
         // The shadow spells `\G` as `\b`: it is not one, so nothing writes its complement.
         let shadowed = rewrite(r"(?=x)(?:a|\Gb?|b)*").unwrap_or_default();
         assert!(!shadowed.contains(r"\B"), "{shadowed}");
