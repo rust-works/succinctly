@@ -8005,13 +8005,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(dedented)
     }
 
-    /// Detect content indentation from the first non-empty line.
-    /// Returns the indentation level, or None if block is empty.
+    /// Detect content indentation from the first non-empty line, or from the widest blank line
+    /// before it when that is wider. Returns the indentation level, or None if block is empty.
     fn detect_block_content_indent(
         &mut self,
         base_indent: usize,
     ) -> Result<Option<usize>, YamlError> {
         let saved_pos = self.pos;
+        // The widest blank line before the first content line (#6381).
+        let mut widest_blank = 0;
 
         // Scan ahead to find first non-empty line
         loop {
@@ -8028,6 +8030,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             match self.peek() {
                 Some(b'\n' | b'\r') => {
                     // Empty line - skip and continue
+                    widest_blank = widest_blank.max(indent);
                     self.skip_line_break();
                 }
                 // #6295: the scalar's indent is not known yet, and go-yaml refuses a tab right after
@@ -8060,7 +8063,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         // Content must be more indented than indicator
                         return Ok(None);
                     }
-                    return Ok(Some(indent));
+                    // go-yaml's indent is the widest of the leading blank lines and the first content
+                    // line (`max_indent` in `yaml_parser_scan_block_scalar_breaks`), so a blank line
+                    // wider than the content makes the content line a dedent that ends the scalar
+                    // (#6381).
+                    return Ok(Some(indent.max(widest_blank)));
                 }
             }
         }
