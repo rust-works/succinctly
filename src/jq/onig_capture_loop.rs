@@ -94,12 +94,21 @@ pub(crate) fn rewrite(pattern: &str) -> Option<LoopRewrite> {
     if !pattern.contains('(') || !pattern.contains(['*', '+', '{']) {
         return None;
     }
-    let ast = ast::parse::Parser::new().parse(pattern).ok()?;
+    let super::onig_loop::DistinctNames {
+        text: distinct,
+        ast,
+        renames,
+    } = super::onig_loop::parse_distinct_names(pattern)?;
+    let pattern = distinct.as_str();
     if swaps_greed(&ast) || !has_candidate(&ast, false) {
         return None;
     }
     let mut names = vec![None];
     collect_names(&ast, &mut names);
+    let names: Vec<Option<Box<str>>> = names
+        .into_iter()
+        .map(|name| name.map(|name| super::onig_loop::original_name(name, &renames)))
+        .collect();
     let mut emitter = Emitter {
         src: pattern,
         out: String::with_capacity(pattern.len() * 2),
@@ -558,5 +567,15 @@ mod tests {
     fn gives_up_past_the_length_cap() {
         let deep = "(a*)*".repeat(MAX_REWRITTEN_LEN / 4);
         assert!(rewrite(&deep).is_none());
+    }
+
+    #[test]
+    fn a_repeated_group_name_is_rewritten_and_reported_as_written_6430() {
+        let written = rewrite("(?:(?<n>a)|(?<n>a)|())*").unwrap();
+        assert_eq!(
+            &*written.names,
+            [None, Some("n".into()), Some("n".into()), None]
+        );
+        assert!(!written.pattern.contains("?<"));
     }
 }

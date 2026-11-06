@@ -7810,7 +7810,8 @@ These keep their loop as written, and still match longer than jq where the shape
   Three draws of 6,000 with assertions, `(?i)`, `{3,}` and nested groups among the atoms fixed 213, 250 and 195 and broke none, and four of 6,000 counted repeats near the unrolling limit fixed 221, 231, 202 and 201 and broke none.
   Six draws with the loops also inside an outer repeat or holding a repeated group of their own (`--nest`) fixed 139 to 160 and broke none, and two of them under the flags `gi` fixed 108 and 133 and broke none.
   `scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE` regenerates the first and last.
-  What still differs, in about 10 to 13 of the 5,000 plain ones and about 15 of the 5,000 nested ones: the lazy bounded repeat below, a group name used twice, or a loop beside a lookaround.
+  What still differs, in about 10 to 13 of the 5,000 plain ones and about 15 of the 5,000 nested ones: the lazy bounded repeat below, or a loop beside a lookaround.
+  A group name used twice in a pattern with a loop is rewritten since [#6430](https://github.com/rust-works/succinctly/issues/6430): the parser behind the rewrites refuses a repeated name, so each later use is renamed for the parse and the names are reported as written (`"ba" | [match("(?:(?<n>a)|(?<n>a)|())*";"g")] | .[1].captures | map(.string)` is `["a",null,""]`, as in jq).
   A lazy bounded repeat that leaves a group unset differs too: `"ab" | [match("(?:(b*)|a){0,2}?b") | .captures | map(.string)]` is `[null]` in jq and `[""]` here.
   A group beside a flag switch written inside the pattern is rewritten since [#6358](https://github.com/rust-works/succinctly/issues/6358): the empty way of what the switch reaches is the items' empty ways in the flag group the switch stands for, so `"bab" | [match("(?:(a)?|(?i)b)*";"g") | .string]` is `["","a","",""]`, as in jq.
   A way that is only a switch (`((a)?|(?i)){2,}`) is one too.
