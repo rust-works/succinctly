@@ -471,7 +471,11 @@ The loader does not distinguish `%YAML` from `%TAG` from a reserved directive li
 — all three are recognized purely by the leading `%` at column 0 outside a document body
 and fully discarded, matching the non-validating loader's general philosophy. This also
 means a misspelled directive name (`%YAM`, `%YAMLL`) is skipped exactly like a well-formed
-one, with no name matching at all. Full `%YAML`-version and `%TAG`-handle semantics are out
+one, with no name matching at all.
+`succinctly yq` is stricter (#6412): it refuses a directive line yq's scanner refuses, which is one whose name is
+empty or not `YAML` or `TAG` (`%FOO`, `%`), and a `%TAG` that is not a handle, a prefix and at most a `#` comment, or
+that repeats a handle; a line that starts `%YAML` is yq's header and is left alone.
+Full `%YAML`-version and `%TAG`-handle semantics are out
 of scope for the default loader; the strict validator
 ([`src/yaml/validate.rs`](../../../src/yaml/validate.rs), #223) already has the more
 detailed grammar for the opt-in validation path.
