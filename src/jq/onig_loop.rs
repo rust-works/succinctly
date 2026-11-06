@@ -2629,21 +2629,23 @@ mod tests {
 
     #[test]
     fn a_loop_with_groups_in_a_pattern_that_repeats_a_name_is_written_6430() {
+        let mut rewritten = 0;
         for pattern in [
             "(?:(?<n>a)|(?<n>a)|())*",
             "(?:(?<n>a)|c|(?<n>b)|(b*))+",
             "(?:b*|(?<n>a)(?<n>b))*",
             "(?:(?<n>a)|b|(?<n>c)|)+",
         ] {
+            // Not every pattern needs the group copies; the ones that do must name no group but `n`.
             if let Some(written) = rewrite_with_groups(pattern) {
+                rewritten += 1;
                 assert!(!written.pattern.contains("?<"), "{pattern}");
                 assert!(
                     written.names.iter().flatten().all(|name| &**name == "n"),
                     "{pattern}"
                 );
-                return;
             }
         }
-        panic!("no pattern was rewritten with its groups");
+        assert!(rewritten > 0, "no pattern was rewritten with its groups");
     }
 }
