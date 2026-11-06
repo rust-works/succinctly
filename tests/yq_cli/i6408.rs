@@ -117,3 +117,39 @@ fn an_indented_directive_that_is_not_the_heads_yaml_one_is_refused_6408() -> Res
     }
     Ok(())
 }
+
+/// The header's own line breaks and `-N` (no document markers) do not change how the line is set aside.
+#[test]
+fn an_indented_yaml_directive_keeps_its_break_and_is_set_aside_under_n_6408() -> Result<()> {
+    for (doc, flags, expected) in [
+        (
+            " %YAML 1.2\r\na: 1\r\n",
+            &[] as &[&str],
+            "#  %YAML 1.2\r\na: 1\n",
+        ),
+        (
+            "# c\r\n  %YAML 1.2\r\n\r\na: 1\r\n",
+            &[] as &[&str],
+            "# c\r\n#   %YAML 1.2\r\n# \r\na: 1\n",
+        ),
+        (
+            "---\n %YAML 1.2\na: 1\n",
+            &["-N"] as &[&str],
+            "#  %YAML 1.2\na: 1\n",
+        ),
+        (
+            " %YAML 1.2\n---\na: 1\n---\nb: 2\n",
+            &["-N"] as &[&str],
+            "#  %YAML 1.2\na: 1\nb: 2\n",
+        ),
+        (
+            " %YAML 1.2\n---\na: 1\n---\nb: 2\n",
+            &[] as &[&str],
+            "#  %YAML 1.2\n---\na: 1\n---\nb: 2\n",
+        ),
+    ] {
+        let (stdout, code) = run_yq_stdin(".", doc, flags)?;
+        assert_eq!((stdout.as_str(), code), (expected, 0), "{doc:?} {flags:?}");
+    }
+    Ok(())
+}

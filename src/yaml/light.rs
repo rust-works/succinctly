@@ -10107,7 +10107,7 @@ fn yq_header_len(text: &[u8]) -> (usize, bool) {
         let at_break_or_eof = indent_len == rest.len() || is_line_break(rest[indent_len]);
         if !at_break_or_eof
             && !(rest[indent_len] == b'#'
-                || rest[indent_len..].starts_with(b"%YAML")
+                || super::parser::starts_yq_yaml_directive(&rest[indent_len..])
                 || (indent_len == 0 && rest[indent_len..].starts_with(b"---")))
         {
             return (pos, false);
@@ -10176,10 +10176,13 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
                 out.write_str("# ")?;
             }
             // #6401: a line of only blanks is a comment to go-yaml too, `# ` plus the line. So is an
-            // indented `%YA..` line (#6408): the indent follows the `# `.
+            // indented `%YAML` line (#6408): the indent follows the `# `.
             if is_blank_line(line.as_bytes())
                 || (line.starts_with([' ', '\t'])
-                    && line.trim_start_matches([' ', '\t']).starts_with("%YA"))
+                    && super::parser::starts_yq_yaml_directive(
+                        line.trim_start_matches([' ', '\t']).as_bytes(),
+                    ))
+            {
             {
                 out.write_str("# ")?;
             }
