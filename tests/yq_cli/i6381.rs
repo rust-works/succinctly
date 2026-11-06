@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 
-use crate::run_yq_stdin;
+use crate::{run_yq_stdin, run_yq_stdin_with_stderr};
 
 #[test]
 fn a_blank_line_wider_than_the_first_content_line_ends_a_block_scalar_6381() -> Result<()> {
@@ -53,10 +53,21 @@ fn a_blank_line_wider_than_the_first_content_line_ends_a_block_scalar_6381() -> 
         "a: |\n  \n    \n  x\n",
         "a: |\n\n    \n  x\nb: 1\n",
         "a: >+\n    \n  x\n\nb: 1\n",
+        "|\n    \n  x\n",
+        "a: |\r\n    \r\n  x\r\n",
+        "a: |\n    \n  # c\n  x\n",
+        "a: |\n    \n# c\n  x\nb: 1\n",
+        "- a: |\n      \n    x\n  b: 1\n",
     ] {
-        let (out, code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        let (out, err, code) = run_yq_stdin_with_stderr(".", input, &["-o=json", "-I=0"])?;
         assert_eq!(out.trim_end(), "", "{input:?}");
         assert_ne!(code, 0, "{input:?}");
+        // the stray line is what is refused, not a tab or a crash
+        assert!(err.contains("YAML parse error"), "{input:?}: {err}");
+        assert!(
+            !err.contains("tab") && !err.contains("panicked"),
+            "{input:?}: {err}"
+        );
     }
     Ok(())
 }
@@ -98,6 +109,16 @@ fn a_blank_line_no_wider_than_the_content_is_read_as_before_6381() -> Result<()>
         ("a: |\n  \n  \n  x\n", "{\"a\":\"\\n\\nx\\n\"}"),
         ("a: |\n\n\n  x\nb: 1\n", "{\"a\":\"\\n\\nx\\n\",\"b\":1}"),
         ("a: |\n    \n      x\n      y\n", "{\"a\":\"\\nx\\ny\\n\"}"),
+        ("--- |\n    \n  x\n", "\"x\\n\""),
+        ("--- |\n    \n  x\n--- 2\n", "\"x\\n\"\n2"),
+        (
+            "a: |\r\n  \r\n  x\r\nb: 1\r\n",
+            "{\"a\":\"\\nx\\n\",\"b\":1}",
+        ),
+        (
+            "a: |\n  # c\n     \n    x\n",
+            "{\"a\":\"# c\\n   \\n  x\\n\"}",
+        ),
     ] {
         let (out, code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
         assert_eq!(code, 0, "{input:?}");
