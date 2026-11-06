@@ -62,12 +62,11 @@ fn a_blank_line_wider_than_the_first_content_line_ends_a_block_scalar_6381() -> 
         let (out, err, code) = run_yq_stdin_with_stderr(".", input, &["-o=json", "-I=0"])?;
         assert_eq!(out.trim_end(), "", "{input:?}");
         assert_ne!(code, 0, "{input:?}");
-        // the stray line is what is refused, not a tab or a crash
-        assert!(err.contains("YAML parse error"), "{input:?}: {err}");
-        assert!(
-            !err.contains("tab") && !err.contains("panicked"),
-            "{input:?}: {err}"
-        );
+        // the stray line is what is refused, not a tab or a crash (CI adds a backtrace after the
+        // first line, so only that line is read)
+        let first = err.lines().next().unwrap_or_default();
+        assert!(first.contains("YAML parse error"), "{input:?}: {err}");
+        assert!(!first.contains("tab character"), "{input:?}: {err}");
     }
     Ok(())
 }
