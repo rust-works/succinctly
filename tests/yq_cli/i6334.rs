@@ -617,5 +617,15 @@ fn test_flow_comments_that_still_differ_from_yq_6334() -> Result<()> {
         "-P on {doc:?}"
     );
     assert_ne!(stdout, "v:\n  - a: 1\nw: # c\n# f\n  - 1\ny: 2 # z\n");
+    // Under -P a comment held beside a commented entry of a mapping that is a sequence item reaches the next
+    // item here; yq drops it.
+    let doc = "- {k0: {k0: true}, # c5\n  m1: b # c6\n  }\n- 2\n";
+    let (stdout, code) = run_yq_stdin(".", doc, &["-P"])?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("- k0:\n    k0: true\n  m1: b # c6\n- 2 # c5\n", 0),
+        "-P on {doc:?}"
+    );
+    assert_ne!(stdout, "- k0:\n    k0: true\n  m1: b # c6\n- 2\n");
     Ok(())
 }
