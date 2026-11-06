@@ -80,7 +80,11 @@ fn test_the_run_is_document_zero_and_numbers_its_lines_from_the_content_6349() -
     ] {
         let (stdout, code) = run_yq_stdin(filter, doc, &[])?;
         let separated = stdout.replace("---\n", "");
-        assert_eq!((separated.as_str(), code), (expected, 0), "{doc:?} {filter}");
+        assert_eq!(
+            (separated.as_str(), code),
+            (expected, 0),
+            "{doc:?} {filter}"
+        );
     }
     Ok(())
 }
