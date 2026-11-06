@@ -2410,6 +2410,36 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             && owner_depth > 0
             && self.indent_stack.get(owner_depth - 1) == Some(&indent)
             && self.type_stack.get(owner_depth - 1) == Some(&NodeType::Mapping)
+            // Not the next item of a key sequence that sits at this very column (`?⏎- a⏎- b`,
+            // #6370).
+            && !self.key_sequence_open_at(indent)
+    }
+
+    /// The `:` of an explicit value ends the key's own sequence at the `?`'s column.
+    fn close_key_sequence_at(&mut self, indent: usize) {
+        while self.key_sequence_open_at(indent)
+            && self.current_type == Some(NodeType::Sequence)
+            && self.indent_stack.last() == Some(&indent)
+        {
+            self.indent_stack.pop();
+            self.pop_type();
+            self.write_bp_close();
+        }
+    }
+
+    /// Whether a block sequence opened as the pending explicit key's content is still open at
+    /// `indent`, above the mapping that owns the key (`?⏎- a⏎- b`, #6370).
+    fn key_sequence_open_at(&self, indent: usize) -> bool {
+        match self.pending_explicit_key {
+            Some(owner_depth) => {
+                self.indent_stack.len() > owner_depth
+                    && self.indent_stack[owner_depth..]
+                        .iter()
+                        .zip(&self.type_stack[owner_depth..])
+                        .any(|(&i, &t)| i == indent && t == NodeType::Sequence)
+            }
+            None => false,
+        }
     }
 
     /// Whether the mapping on top of `indent_stack` right now is the owner
@@ -4305,7 +4335,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // with `close_pending_explicit_key` rather than
                 // re-deriving it here (#106).
                 if self.pending_explicit_key_owns_current_frame() {
-                    self.clear_pending_explicit_key();
+                    // A key still waiting here had the sequence as its content (`?⏎- a⏎k: w`,
+                    // #6370): it has no value, which is its null.
+                    self.close_pending_explicit_key();
                 }
             }
         }
@@ -5571,7 +5603,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             let next_char = self.peek();
             self.pos = saved_pos;
 
-            if next_indent <= indent {
+            // A block sequence at the `?`'s own column is the key's content (YAML 1.2 lets a block
+            // sequence sit at its indicator's indent; yq reads `?⏎- a⏎: v` as the key `[a]` with
+            // the value `v`, #6370), not a sibling of the `?`: a `-` cannot be one.
+            let key_sequence_at_indicator_column = next_indent == indent
+                && next_char == Some(b'-')
+                && Self::is_ws_break_or_eoi(self.input.get(saved_pos + next_indent + 1).copied());
+
+            if next_indent <= indent && !key_sequence_at_indicator_column {
                 // Next content is at same or lower indent
                 if next_char == Some(b':')
                     && (next_indent == indent)
@@ -5682,7 +5721,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         // at the wrong indent (#877 follow-up).
                         self.parse_compact_mapping_entry(self.current_column())?;
                     } else {
-                        self.parse_value(indent + 2)?;
+                        self.parse_value(seq_indent)?;
                     }
                 }
                 self.write_bp_close(); // close item
@@ -5864,8 +5903,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Close deeper structures, but keep the mapping at this indent open. Everything the
         // key pushed is deeper than the `?` (its content starts past it), so a key sequence
-        // left open at the `?`'s column + 1 is closed too (#5086).
+        // left open at the `?`'s column + 1 is closed too (#5086), and so is one at the `?`'s
+        // own column (`?⏎- a⏎: v`, #6370), which is no deeper than it.
         self.close_deeper_indents(indent);
+        self.close_key_sequence_at(indent);
 
         // This value is for the pending explicit key
         self.clear_pending_explicit_key();
