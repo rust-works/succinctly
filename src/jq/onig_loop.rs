@@ -177,6 +177,8 @@ struct Rewriter<'p> {
     /// after such a repeat again without.
     lazy_bounded: bool,
     lazy_bounded_written: bool,
+    /// Whether the repeat being read is directly inside one it reduces with (#6427).
+    inside_reduced: bool,
     /// Whether a loop inside a lazy repeat that may keep its text is written anyway (#6427): the
     /// repeat is expected to be written too, and [`rewrite_parsed`] reads again if it is not.
     lazy_trusted: bool,
@@ -608,6 +610,7 @@ fn rewrite_parsed(pattern: &str, copies: bool, lead: &str, reading: usize) -> Op
         lazy_bounded,
         lazy_bounded_written: false,
         lazy_trusted,
+        inside_reduced: false,
     };
     // #6428, #6427: what a lazy repeat with a group adds never costs the rest of the pattern its
     // rewrite. The first reading writes such a repeat and the loops inside it, the second only the
@@ -660,6 +663,23 @@ fn may_be_empty(ast: &Ast) -> bool {
         Ast::Concat(concat) => concat.asts.iter().all(may_be_empty),
         Ast::Repetition(rep) => bounds(&rep.op.kind).0 == 0 || may_be_empty(&rep.ast),
     }
+}
+
+/// Whether Oniguruma reduces `rep` with the repeat directly inside it: both are a lazy `??`, `*?` or
+/// `+?`, with at most a plain group between (`(?:a+?)*?`). A greedy pair and a greedy repeat of a
+/// lazy `+?` are what the sweeps' `--ways` draw checks instead.
+fn reduces_with_inner(rep: &ast::Repetition) -> bool {
+    let simple = |op: &RepetitionKind| matches!(bounds(op), (0 | 1, None) | (0, Some(1)));
+    let mut inner = &*rep.ast;
+    while let Ast::Group(group) = inner {
+        match &group.kind {
+            GroupKind::NonCapturing(flags) if flags.items.is_empty() => inner = &group.ast,
+            _ => return false,
+        }
+    }
+    !rep.greedy
+        && simple(&rep.op.kind)
+        && matches!(inner, Ast::Repetition(inner) if !inner.greedy && simple(&inner.op.kind))
 }
 
 /// Whether a capture group in `ast` holds an assertion or a flag switch.
@@ -939,14 +959,18 @@ impl Rewriter<'_> {
             Ast::Repetition(rep) => {
                 let (min, max) = bounds(&rep.op.kind);
                 let kept = !rep.greedy && min < 2 && !matches!(max, Some(0 | 1));
+                // #6427: Oniguruma reduces a repeat directly of a repeat to one before it compiles
+                // either, so neither has the copies or the exit written below.
+                let reduced = core::mem::take(&mut self.inside_reduced) || reduces_with_inner(rep);
+                self.inside_reduced = reduces_with_inner(rep);
                 if kept && self.lazy_trusted {
-                    self.lazy_bounded_written = true;
+                    self.lazy_bounded_written |= has_capture(&rep.ast);
                     let changed = core::mem::take(&mut self.changed);
                     let body = self.convert(&rep.ast, true)?;
                     let inner = core::mem::replace(&mut self.changed, changed);
                     let consuming = matches!(body.ways, Ways::Consuming);
                     let written = self.repeat_text(&body.text, min, max, rep.greedy)?;
-                    let piece = self.counted_repeat(rep, body, min, max)?;
+                    let piece = self.counted_repeat(rep, body, min, max, reduced)?;
                     self.changed |= inner;
                     // A loop inside a repeat that kept its text may not take its exit, and only now
                     // does it show that the repeat did. A body that cannot match nothing is safe.
@@ -958,7 +982,7 @@ impl Rewriter<'_> {
                 self.lazy_around += u32::from(kept);
                 let body = self.convert(&rep.ast, true);
                 self.lazy_around -= u32::from(kept);
-                self.counted_repeat(rep, body?, min, max)
+                self.counted_repeat(rep, body?, min, max, reduced)
             }
             Ast::Alternation(alt) => {
                 // #6301: a flag switch (`(?i)`) reaches the rest of its group, later ways included,
@@ -1033,6 +1057,7 @@ impl Rewriter<'_> {
         mut body: Piece,
         min: u32,
         max: Option<u32>,
+        reduced: bool,
     ) -> Result<Piece, GiveUp> {
         // #6301: the scoped switch is verified for the greedy loop. A lazy unbounded repeat decides
         // whether Oniguruma unrolls it from the body's operation count (`onig_ops`), which does not
@@ -1061,17 +1086,14 @@ impl Rewriter<'_> {
         }
         // #6428: a consuming way is written without the group around an anchor, which a repeat that
         // keeps its text still sets.
-        let keeps_text = !rep.greedy && min < 2 && group_holds_assertion(&rep.ast);
+        let keeps_text = !rep.greedy && min < 2 && (reduced || group_holds_assertion(&rep.ast));
         if self.copies && grouped && !keeps_text {
             self.exit = Some(self.empty_text(&rep.ast)?);
         }
         // #6427: `X+?` over a short body is `X X*?`, the first copy with no empty check, and counted
         // over a long one, as `X{2,}?` is.
         if !rep.greedy && min == 1 && max.is_none() && self.lazy_bounded {
-            let exit = self
-                .exit
-                .clone()
-                .filter(|exit| !self.exit_keeps_text(&Some(exit.clone())));
+            let exit = self.exit.clone().filter(|_| self.lazy_around == 0);
             if let (
                 Some(exit),
                 Ways::Nullable {
@@ -1627,7 +1649,7 @@ impl Rewriter<'_> {
             && exit.is_some()
             && !self.exit_keeps_text(&exit)
             && min < 2
-            && max != Some(1)
+            && !matches!(max, Some(0 | 1))
         {
             if let Ways::Nullable {
                 before,
@@ -1827,12 +1849,11 @@ impl Rewriter<'_> {
     /// Whether Oniguruma writes the first iteration of the lazy `X+?` out as a copy of `X`, by the
     /// count [`Self::oniguruma_unrolls`] reads for a `min` of two or more. Where case folding stops
     /// `onig_ops` at a letter or a class, the length without folding stands in for it; a body whose
-    /// length cannot be told at all is taken for long, as [`Self::oniguruma_unrolls`] takes it.
+    /// length cannot be told at all is taken for long.
     fn oniguruma_copies_once(&self, body: &Ast) -> bool {
-        !self.shadowed
-            && onig_ops(body, self.folds)
-                .or_else(|| onig_ops(body, false))
-                .is_some_and(|ops| ops > 0 && ops <= ONIG_EXPAND_LIMIT)
+        onig_ops(body, self.folds)
+            .or_else(|| onig_ops(body, false))
+            .is_some_and(|ops| ops > 0 && ops <= ONIG_EXPAND_LIMIT)
     }
 
     /// `X{min,}?` as Oniguruma unrolls it, `X` `min` times and then `X*?`: the `regex` crate reads
@@ -2481,10 +2502,22 @@ mod tests {
     /// #6427: a lazy `+?` over a short body is `X X*?`, as Oniguruma writes it, the first copy with
     /// no empty check; over a long one the empty way leaves, as a counted repeat's does.
     #[test]
-    fn a_lazy_plus_is_a_copy_and_a_lazy_star_over_a_short_body_6427() {
+    fn a_lazy_plus_is_a_copy_over_a_short_body_and_counted_over_a_long_one_6427() {
         let copied = |pattern: &str| rewrite_with_groups(pattern).unwrap().pattern;
         assert_eq!(copied("(?:(b*)|a)+?c"), "(?:(b*)|a)(?:(?:(b+)|a)*?)c");
         assert!(!copied("(?:(b*)|a|c|d|e|f|g|h)+?i").contains("(b*)"));
+    }
+
+    /// #6427: Oniguruma reduces a repeat directly of a repeat before it compiles either, so a pair
+    /// of them is not written out, with a plain group between or not; a capture group or a third
+    /// item between them keeps them apart.
+    #[test]
+    fn a_repeat_directly_of_a_repeat_keeps_its_text_6427() {
+        let written = |pattern: &str| rewrite_with_groups(pattern).map(|g| g.pattern);
+        assert_eq!(written("(?:(?:(a*)|b)+?)*?c"), None);
+        assert_eq!(written("(?:(?:(?:(a*)|b)+?))??c"), None);
+        assert!(written("((?:(a*)|b)+?)*?c").is_some());
+        assert!(written("(?:(?:(a*)|b)+?d)*?c").is_some());
     }
 
     /// #6428: a lazy bounded repeat is counted, and its empty way leaves the count, so it is written

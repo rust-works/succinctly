@@ -77,6 +77,10 @@ fn a_lazy_star_or_plus_around_groups_answers_as_jq_does_6427() -> Result<()> {
             "abab",
             r#"[[0,"ab",["","b"]],[2,"ab",["","b"]]]"#,
         ),
+        (r"(?:(?:(a*)|b)+?)*?c", "bc", r#"[[0,"bc",[null]]]"#),
+        (r"(?:(?:()|a)+?)??c", "aac", r#"[[0,"aac",[null]]]"#),
+        (r"(?:(?:(a*)|b)+?)+?c", "abc", r#"[[0,"abc",["a"]]]"#),
+        (r"(?:(?:(a*)|b){1,}?){0,}?c", "bc", r#"[[0,"bc",[null]]]"#),
     ] {
         let (stdout, _, status) = run_jq_full(
             &[

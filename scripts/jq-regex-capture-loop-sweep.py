@@ -145,7 +145,7 @@ BOUNDED = ["{0,2}?", "{1,2}?", "{0,3}?", "{1,3}?", "{0,4}?", "{1,4}?", "{0,12}?"
 
 
 def bounded_patterns(count, rng):
-    """`--bounded`: a lazy repeat with a minimum under two, over anchors, flag switches and loops, beside a loop or in a repeat."""
+    """`--bounded`: a lazy repeat, most with a minimum under two, over anchors, flag switches and loops, beside a loop or in a repeat."""
     pool = ATOMS + NESTED + ANCHORS + ["(?i)", r"(\b)", r"(\z)", "(.*?)"]
 
     def way():
@@ -207,7 +207,7 @@ def main():
     shape.add_argument("--nest", action="store_true", help="also nest loops inside repeats")
     shape.add_argument("--ways", action="store_true", help="loops beside other items in the ways of an outer repeat")
     shape.add_argument("--assert", dest="anchors", action="store_true", help="ways that hold a zero-width anchor")
-    shape.add_argument("--bounded", action="store_true", help="a lazy repeat with a minimum under two over anchors, switches and loops")
+    shape.add_argument("--bounded", action="store_true", help="a lazy repeat, most with a minimum under two, over anchors, switches and loops")
     shape.add_argument("--fancy", action="store_true", help="a lookaround or atomic group beside the loop")
     ap.add_argument("--newlines", action="store_true", help="with --assert: subjects that hold a newline")
     ap.add_argument("--blanks", action="store_true",
