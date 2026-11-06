@@ -2363,7 +2363,9 @@ mod tests {
     /// a switch, and a body with a way that is only an anchor was not checked against one.
     #[test]
     fn a_lazy_bounded_repeat_over_a_switch_is_written_and_the_others_are_not_6358() {
-        assert!(rewrite_with_groups("((?i)|b*){2,5}?c").is_some());
+        let written = rewrite_with_groups("((?i)|b*){2,5}?c").unwrap().pattern;
+        assert!(written.contains("(?i)"), "{written}");
+        assert!(!written.contains("){2,5}?"), "{written}");
         assert!(rewrite_with_groups("((?i)|(b*)){2,4}?c").is_some());
         assert_eq!(
             rewrite_with_groups("((?i)|b*){2,}?c").map(|g| g.pattern),

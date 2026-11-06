@@ -336,6 +336,14 @@ fn a_lazy_bounded_repeat_over_a_flag_switch_body_answers_as_jq_does_6358() -> Re
         (r"((?i)|b*){2,5}?c", "bbc", r#"[[0,"bbc",[""]]]"#),
         (r"((?i)|(b*)){2,4}?c", "bbc", r#"[[0,"bbc",["","bb"]]]"#),
         (r"((?i)|(b*)){0,3}?b", "ab", r#"[[1,"b",[null,null]]]"#),
+        // An exact count, a switch that turns a flag off, and a bound past the minimum.
+        (r"((?i)|b*){3}?c", "bbc", r#"[[0,"bbc",[""]]]"#),
+        (r"((?-i)|(b*)){2}?c", "bbc", r#"[[0,"bbc",["","bb"]]]"#),
+        (
+            r"((?-i)|(b*)){3,5}?$",
+            "bab",
+            r#"[[2,"b",["","b"]],[3,"",["",""]]]"#,
+        ),
     ] {
         assert_matches(pattern, input, expected)?;
     }
