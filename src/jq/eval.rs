@@ -33826,9 +33826,9 @@ struct FancyModes {
 impl FancyModes {
     /// The modes for the text a loop rewrite wrote (#6426).
     fn rewritten() -> Self {
-        FancyModes {
+        Self {
             rewritten: true,
-            ..FancyModes::default()
+            ..Self::default()
         }
     }
 }

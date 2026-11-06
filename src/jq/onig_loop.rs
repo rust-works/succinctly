@@ -2928,7 +2928,7 @@ mod tests {
         ] {
             let written = rewrite_with_groups(pattern).unwrap_or_else(|| panic!("{pattern}"));
             let construct = pattern
-                .split(|c| c == '+')
+                .split('+')
                 .flat_map(|part| part.split(')'))
                 .find(|part| part.starts_with("(?") && !part.starts_with("(?:"))
                 .unwrap();
@@ -2972,7 +2972,10 @@ mod tests {
         assert_eq!(read.text, "(?=b)(?<n>a)(?#c)");
         assert_eq!(opaque, [0, 12]);
         // A pattern the parser reads as written has no opaque construct.
-        assert!(parse_for_group_copies("(?<n>a)").unwrap().1.is_empty());
+        assert_eq!(
+            parse_for_group_copies("(?<n>a)").unwrap().1,
+            Vec::<usize>::new()
+        );
         // A repeated name moves the offsets after it, so the pattern keeps its text.
         assert!(parse_for_group_copies("(?=b)(?<n>a)(?<n>b)").is_none());
         assert_eq!(

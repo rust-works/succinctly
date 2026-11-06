@@ -96,7 +96,7 @@ fn a_loop_with_capture_groups_beside_a_lookaround_or_atomic_group_answers_as_jq_
             "g",
             r#"[[0,"b",[""]],[1,"",[""]],[2,"b",[""]]]"#,
         ),
-        ("b+(?=b)(?:a)*?b*", "bab", "g", r#"[]"#),
+        ("b+(?=b)(?:a)*?b*", "bab", "g", "[]"),
     ] {
         assert_matches(pattern, input, flags, expected)?;
     }
@@ -116,7 +116,7 @@ fn assert_matches(pattern: &str, input: &str, flags: &str, expected: &str) -> Re
             "--arg",
             "f",
             flags,
-            r#"[$s | match($p; $f) | [.offset, .string, (.captures | map(.string))]]"#,
+            "[$s | match($p; $f) | [.offset, .string, (.captures | map(.string))]]",
         ],
         None,
     )?;
