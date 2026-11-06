@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Differential sweep for #6310 and #6332: a capture group inside a loop's body.
 
-    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert | --fancy] [--flags g] [--jq /usr/bin/jq]
+    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert | --fancy] [--newlines] [--flags g] [--jq /usr/bin/jq]
 
 Oniguruma ends a greedy loop at the first iteration that matches nothing (#6106), and that holds when the
 body has a capture group: after its empty way (`(?:b*|(a))+`, #6310), or before it, in it, or with its own
@@ -15,7 +15,8 @@ six in ten of them a loop with a group (or a plain atom otherwise), so that a lo
 the ways share a prefix; it is the draw that found the alternation `regex-syntax` factors (#6134) and the lazy `*?` and `+?`
 that keep their text. `--assert` (#6358) draws the loops whose ways hold a zero-width anchor (`\\b`, `\\B`, `^`, `$`, `\\A`, `\\z`)
 beside a capture group or a consuming item, under the counted and lazy quantifiers, on subjects with a word boundary
-in the middle. `--fancy` (#6358) draws the plain loops with a lookaround or an atomic group beside them, outside the repeat, so
+in the middle; `--newlines` runs it on subjects that hold a newline instead, and lets the ways consume one, which is what says `^` and
+`$` may be written as `\\A` and `\\z`. `--fancy` (#6358) draws the plain loops with a lookaround or an atomic group beside them, outside the repeat, so
 that they run on `fancy-regex`. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
 captures are compared. It prints how many patterns SUBJECT fixed (BASELINE differed from jq, SUBJECT does
 not), broke (the reverse) and still differs on, and exits 1 when it broke one.
@@ -44,6 +45,7 @@ SUBJECTS = ["ba", "bab", "abab", "aab", "abba", "baab", "aaa", "bbb", "cba", "ab
 # `--assert`: the anchors, and subjects that put a word boundary inside the string.
 ANCHORS = [r"\b", r"\B", "^", "$", r"\A", r"\z"]
 ASSERT_SUBJECTS = SUBJECTS[:6] + ["a b", " ab", "ba b", "b a"]
+NEWLINE_SUBJECTS = ["a\nb", "\nab", "ab\n", "b\n\na", "a\n", "\n", "ba\nb a"]
 # `--fancy`: what stands beside the loop, on one side or both.
 BEFORE = ["(?=b)", "(?=[ab])", "(?!c)", "(?<=b)", "(?<!c)", "(?>b)", "(?>a|b)", "(?#c)"]
 AFTER = ["(?=b)", "(?!a)", "(?!c)", "(?<=a)", "(?<!b)", "(?>b)", "(?#c)"]
@@ -166,12 +168,16 @@ def main():
     shape.add_argument("--ways", action="store_true", help="loops beside other items in the ways of an outer repeat")
     shape.add_argument("--assert", dest="anchors", action="store_true", help="ways that hold a zero-width anchor")
     shape.add_argument("--fancy", action="store_true", help="a lookaround or atomic group beside the loop")
+    ap.add_argument("--newlines", action="store_true", help="with --assert: subjects that hold a newline")
     ap.add_argument("--flags", default="g", help="the match flags (`gi`: case folding)")
     ap.add_argument("--jq", default="/usr/bin/jq")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     if args.anchors:
         plist, prog = assert_patterns(args.count, rng), program(ASSERT_SUBJECTS)
+        if args.newlines:
+            plist = [p.replace("a|b", "a|\\n") if i % 2 else p for i, p in enumerate(plist)]
+            prog = program(NEWLINE_SUBJECTS)
     elif args.fancy:
         plist, prog = fancy_patterns(args.count, rng), PROGRAM
     else:
