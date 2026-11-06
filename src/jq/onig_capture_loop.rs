@@ -261,8 +261,8 @@ impl Emitter<'_> {
 /// `{n,}` with `n` of 2 or more over a capture group (#6309, #6347): the empty iteration ends such
 /// a loop even before its minimum count, so it is the `*` loop, and the loop copy `(?:X)*` is one
 /// the loop rewrite (#6106) reads, with the groups inside it copied and read back. With a group
-/// inside it, only outside another repeat (which would run the loop's copies again) and with no
-/// flag switch inside, which the loop rewrite does not follow. A non-capturing group that holds
+/// inside it, only outside another repeat (which would run the loop's copies again). A flag switch
+/// inside is scoped by the loop rewrite (#6358). A non-capturing group that holds
 /// more than one capture group is the same (#6358): `"aab" | match("(?:(a)|()){2,}")` has `["a",""]` as
 /// its captures in jq (the third iteration is empty and sets the second group), and `["a",null]` without. A
 /// non-capturing group around one capture group (`(?:(a*)){2,}`) already agrees and is left alone.
@@ -471,6 +471,8 @@ mod tests {
             "(a+)*b",
             "(a*)*?b",
             "(?:(a*)){2,}b",
+            "(?:a|b*){2,}",
+            "(?:a*){3,}x",
             "(a*){0,5}b",
             "(a|$)*",
             r"(a|\b)*b",
