@@ -3701,9 +3701,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// which also means a misspelled directive name (e.g. `%YAM`, `%YAMLL`)
     /// is skipped exactly like a well-formed one, with no name matching at
     /// all.
-    fn skip_directives(&mut self) -> Result<(), YamlError> {
-        // The `%TAG` handles met so far in this run of directives: go-yaml refuses a handle given twice (#6412).
-        let mut tag_handles: Vec<(usize, usize)> = Vec::new();
+    fn skip_directives(&mut self) -> Result<bool, YamlError> {
+        self.skip_directive_run(false)
+    }
+
+    /// [`Self::skip_directives`] and whether it skipped any directive. `in_head_document`: the run sits in the head
+    /// of the stream's first document, behind yq's leading `---` (#6419), where the document is still open.
+    fn skip_directive_run(&mut self, in_head_document: bool) -> Result<bool, YamlError> {
+        let mut run = DirectiveRun::default();
+        let mut skipped = false;
         loop {
             self.skip_directive_gap_whitespace()?;
             // #6408: an indented `%YAML` in the head is yq's header too.
@@ -3713,17 +3719,50 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.skip_line_break();
                 continue;
             }
-            if self.in_document || self.peek() != Some(b'%') {
+            if (self.in_document && !in_head_document) || self.peek() != Some(b'%') {
                 break;
             }
+            skipped = true;
             if !self.input[self.pos..].starts_with(b"%YAML") {
                 self.saw_non_header_directive = true;
             }
             if self.yq_mode {
-                self.check_yq_directive(&mut tag_handles)?;
+                self.check_yq_directive(&mut run)?;
             }
             self.skip_to_eol();
             self.skip_line_break();
+        }
+        Ok(skipped)
+    }
+
+    /// In yq mode, a `%` at column 0 that starts a node is a directive, and a directive ends the document as a `...`
+    /// does (#6419): `a: 1` / `%TAG !e! w` / `---` / `b: 2` is two documents, whatever the document held (a mapping
+    /// or sequence, a value still to come, a property without its node, a block scalar) and what follows must be a
+    /// `---`. The cursor is on the `%`. Behind yq's leading `---` the directive belongs to the head, and the
+    /// document goes on as `---` / `---` does (#6349).
+    fn directive_ends_document(&mut self) -> Result<(), YamlError> {
+        let in_head = self.documents_started == 1
+            && self.bp_pos == self.document_start_bp_pos
+            && self.only_yq_header_lines_since(self.leading_run_from);
+        if in_head {
+            self.skip_directive_run(true)?;
+            self.leading_run_from = self.pos;
+            if !self.is_document_start() {
+                return Err(self.err_directive_without_document_start());
+            }
+            return Ok(());
+        }
+        self.end_document();
+        self.skip_directives()?;
+        if !self.is_document_start() {
+            return Err(self.err_directive_without_document_start());
+        }
+        self.skip_document_marker();
+        self.start_document();
+        if self.has_content_on_line() {
+            self.parse_inline_document_value()?;
+        } else {
+            self.skip_newlines();
         }
         Ok(())
     }
@@ -3733,11 +3772,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// yq's header slurp sets aside only a line that starts `%YAML` (`%YAMLL` too, `%YAM` not), so every other directive reaches go-yaml:
     /// a name that is empty (`%`, `% FOO`) or not `YAML` or `TAG` (`%FOO`, any case but the exact word) is an
     /// error, and so is a `%TAG` that is not a handle (`!`, `!!` or `!word!`), a blank, a non-empty URI prefix and
-    /// then nothing but a `#` comment, or that repeats a handle already given. The library loader keeps the
+    /// then nothing but a `#` comment, or that repeats a handle already given. A `%YAML` that go-yaml sees (after a
+    /// `...`, or after another kind of directive) must be `1.1` alone and come once (#6419); `1.2` is `found
+    /// incompatible YAML document`. The library loader keeps the
     /// YAML 1.2 reading, where an unknown directive is ignored.
-    fn check_yq_directive(&self, tag_handles: &mut Vec<(usize, usize)>) -> Result<(), YamlError> {
+    fn check_yq_directive(&self, run: &mut DirectiveRun) -> Result<(), YamlError> {
         let start = self.pos;
-        if self.input[start..].starts_with(b"%YAML") {
+        // A `%YAML` line in the head of the stream, before any other directive, is yq's header (#6342): the
+        // slurp takes every such line, however many, and go-yaml never sees them.
+        if self.input[start..].starts_with(b"%YAML")
+            && self.documents_started == 0
+            && !self.saw_non_header_directive
+        {
             return Ok(());
         }
         let line_end = self.input[start..]
@@ -3752,11 +3798,63 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         if name_len == 0 {
             return refuse(1, "could not find expected directive name");
         }
-        if &line[1..=name_len] != b"TAG" {
-            return refuse(1, "found unknown directive name");
-        }
+        let name = &line[1..=name_len];
         let blanks = |from: usize| line[from..].iter().take_while(|&&b| is_blank(b)).count();
         let mut at = 1 + name_len;
+        if name == b"YAML" {
+            // go-yaml reads `%YAML`, a blank, `major.minor` and then only blanks and a `#` comment, accepts
+            // nothing but `1.1`, and refuses a second one for the document.
+            let gap = blanks(at);
+            if gap == 0 {
+                return refuse(at, "did not find expected whitespace");
+            }
+            at += gap;
+            let digits = |from: usize| {
+                line[from..]
+                    .iter()
+                    .take_while(|&&b| b.is_ascii_digit())
+                    .count()
+            };
+            let value = |from: usize, n: usize| {
+                line[from..from + n].iter().fold(0u64, |acc, &b| {
+                    acc.saturating_mul(10).saturating_add(u64::from(b - b'0'))
+                })
+            };
+            let major_len = digits(at);
+            if major_len == 0 {
+                return refuse(at, "did not find expected version number");
+            }
+            let major = value(at, major_len);
+            at += major_len;
+            if line.get(at) != Some(&b'.') {
+                return refuse(at, "did not find expected digit or '.' character");
+            }
+            at += 1;
+            let minor_len = digits(at);
+            if minor_len == 0 {
+                return refuse(at, "did not find expected version number");
+            }
+            if major_len > 8 || minor_len > 8 {
+                return refuse(at, "found extremely long version number");
+            }
+            let minor = value(at, minor_len);
+            at += minor_len;
+            at += blanks(at);
+            if at < line.len() && line[at] != b'#' {
+                return refuse(at, "did not find expected comment or line break");
+            }
+            if run.yaml {
+                return refuse(1, "found duplicate %YAML directive");
+            }
+            run.yaml = true;
+            if (major, minor) != (1, 1) {
+                return refuse(1, "found incompatible YAML document");
+            }
+            return Ok(());
+        }
+        if name != b"TAG" {
+            return refuse(1, "found unknown directive name");
+        }
         let gap = blanks(at);
         if gap == 0 {
             return refuse(at, "did not find expected whitespace");
@@ -3806,13 +3904,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         if at < line.len() && line[at] != b'#' {
             return refuse(at, "did not find expected comment or line break");
         }
-        if tag_handles
+        if run
+            .tag_handles
             .iter()
             .any(|&(a, b)| self.input[a..b] == self.input[handle.0..handle.1])
         {
             return refuse(handle_start, "found duplicate %TAG directive");
         }
-        tag_handles.push(handle);
+        run.tag_handles.push(handle);
         Ok(())
     }
 
@@ -9223,11 +9322,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
                 // A directive can recur here for the next document, e.g.
                 // after a `...` end marker (#225).
-                self.skip_directives()?;
+                let skipped = self.skip_directives()?;
 
                 // Check for another document or EOF (a directive-only tail
                 // can itself exhaust the input).
                 if self.peek().is_none() {
+                    // yq wants a `---` after a directive (#6419).
+                    if self.yq_mode && skipped {
+                        return Err(self.err_directive_without_document_start());
+                    }
                     break;
                 }
 
@@ -9283,6 +9386,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 } else {
                     self.skip_newlines();
                 }
+                continue;
+            }
+
+            // #6419: a directive met inside a document ends it.
+            if self.yq_mode
+                && self.in_document
+                && self.peek() == Some(b'%')
+                && (self.pos == 0 || Self::is_break(self.input[self.pos - 1]))
+            {
+                self.directive_ends_document()?;
                 continue;
             }
 
@@ -10456,6 +10569,16 @@ fn line_is_bare_dash_before_comment(line: &[u8]) -> bool {
 /// stream (#6342, and indented #6408). One definition for the parser and the header writer in `light.rs`.
 pub(super) fn starts_yq_yaml_directive(rest: &[u8]) -> bool {
     rest.starts_with(b"%YAML")
+}
+
+/// What [`Parser::check_yq_directive`] remembers across one run of directive lines (#6412, #6419): go-yaml refuses a
+/// `%TAG` handle given twice and a second `%YAML` for one document.
+#[derive(Default)]
+struct DirectiveRun {
+    /// The `%TAG` handles met so far, as `input` offsets.
+    tag_handles: Vec<(usize, usize)>,
+    /// Whether a `%YAML` that go-yaml sees (not one of yq's header) has been met.
+    yaml: bool,
 }
 
 /// Whether `line` (already without its leading spaces) opens a document whose root node is a bare
@@ -11692,6 +11815,35 @@ mod tests {
             b"%YAMLL 1.2\n---\na: 1\n",
         ] {
             assert!(build_semi_index_yq(good).is_ok(), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn yq_mode_checks_a_yaml_directive_go_yaml_sees_and_a_directive_ends_a_document_6419() {
+        // After a `...` or another directive a `%YAML` is go-yaml's: `1.1` alone, once.
+        for bad in [
+            &b"a: 1\n...\n%YAML 1.2\n---\nb: 1\n"[..],
+            b"a: 1\n...\n%YAML 1.1\n%YAML 1.1\n---\nb: 1\n",
+            b"a: 1\n...\n%YAML 1.1 x\n---\nb: 1\n",
+            b"%TAG ! x:\n%YAML 1.2\n---\na: 1\n",
+            b"a: 1\n...\n%TAG !e! w\n",
+        ] {
+            assert!(build_semi_index(bad).is_ok(), "{bad:?}");
+            assert!(build_semi_index_yq(bad).is_err(), "{bad:?}");
+        }
+        // In the head, before any other directive, the lines are yq's header.
+        assert!(build_semi_index_yq(b"%YAML 1.2\n%YAML 9.9\n---\na: 1\n").is_ok());
+        // A directive after content ends the document, and a `---` follows.
+        for ok in [
+            &b"a: 1\n%TAG !e! w\n---\nb: 2\n"[..],
+            b"!!str\n%TAG !e! w\n---\nb: 2\n",
+            b"a: |\n  x\n%YAML 1.1\n---\nb: 2\n",
+            b"---\n%TAG !e! w\n---\nb: 2\n",
+        ] {
+            assert!(build_semi_index_yq(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [&b"a: 1\n%TAG !e! w\n"[..], b"a: 1\n%TAG !e! w\nb: 2\n"] {
+            assert!(build_semi_index_yq(bad).is_err(), "{bad:?}");
         }
     }
 

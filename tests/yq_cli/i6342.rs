@@ -122,7 +122,7 @@ fn a_directive_other_than_yaml_with_no_document_start_after_it_is_refused_6342()
     for doc in [
         "%TAG ! tag:x,2000:\n",
         "%YAML 1.2\n%TAG ! x:\n",
-        "%TAG ! x:\n%YAML 1.2\n",
+        "%TAG ! x:\n%YAML 1.1\n",
         // The directive is go-yaml's to read, so what follows it has to be a `---`.
         "%TAG ! x:\n...\n",
         "%TAG ! x:\na: 1\n",
