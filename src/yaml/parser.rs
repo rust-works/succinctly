@@ -712,7 +712,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             pending_explicit_key: None,
             last_plain_content_end: 0,
             may_hold_unicode_break: crate::util::simd::escape::contains_byte(input, b'\t')
-                && (input.contains(&0xC2) || input.contains(&0xE2)),
+                && (crate::util::simd::escape::contains_byte(input, 0xC2)
+                    || crate::util::simd::escape::contains_byte(input, 0xE2)),
             last_plain_scalar: None,
             pending_explicit_key_empty: false,
             nesting_depth: 0,

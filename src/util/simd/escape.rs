@@ -1142,22 +1142,45 @@ mod tests {
         /// dispatcher agrees with the scalar search at every offset.
         #[test]
         fn contains_byte_finds_a_tab_at_every_offset_6214() {
-            for len in [
-                0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 200,
-            ] {
-                let clean = vec![b'a'; len];
-                assert!(!super::super::contains_byte(&clean, b'\t'), "len {len}");
-                for pos in 0..len {
-                    let mut dirty = clean.clone();
-                    dirty[pos] = b'\t';
-                    assert!(
-                        super::super::contains_byte(&dirty, b'\t'),
-                        "tab at {pos} of {len}"
-                    );
-                    assert!(
-                        !super::super::contains_byte(&dirty, b'\r'),
-                        "a tab is no CR: {pos} of {len}"
-                    );
+            // 0xC2 and 0xE2 are the parser's other needles; 0xFF is the high-bit extreme.
+            for needle in [b'\t', 0xC2, 0xE2, 0xFF] {
+                for len in [
+                    0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 200,
+                ] {
+                    let clean = vec![b'a'; len];
+                    assert!(!super::super::contains_byte(&clean, needle), "len {len}");
+                    for pos in 0..len {
+                        let mut dirty = clean.clone();
+                        dirty[pos] = needle;
+                        assert!(
+                            super::super::contains_byte(&dirty, needle),
+                            "{needle:#x} at {pos} of {len}"
+                        );
+                        assert!(
+                            !super::super::contains_byte(&dirty, b'\r'),
+                            "{needle:#x} is no CR: {pos} of {len}"
+                        );
+                        #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
+                        {
+                            // SAFETY: SSE2 is the x86_64 baseline.
+                            assert!(
+                                unsafe { super::super::contains_byte_sse2(&dirty, needle) },
+                                "SSE2 {needle:#x} at {pos} of {len}"
+                            );
+                        }
+                        #[cfg(all(
+                            target_arch = "aarch64",
+                            not(feature = "broadword-yaml"),
+                            not(feature = "scalar-yaml")
+                        ))]
+                        {
+                            // SAFETY: NEON is mandatory on aarch64.
+                            assert!(
+                                unsafe { super::super::contains_byte_neon(&dirty, needle) },
+                                "NEON {needle:#x} at {pos} of {len}"
+                            );
+                        }
+                    }
                 }
             }
         }
