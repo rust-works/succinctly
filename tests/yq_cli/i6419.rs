@@ -26,6 +26,9 @@ fn a_yaml_directive_go_yaml_sees_is_checked_6419() -> Result<()> {
         "a: 1\n...\n%YAML\n---\nb: 1\n",
         "a: 1\n...\n%YAML 1.1 x\n---\nb: 1\n",
         "a: 1\n...\n%YAML 1 .1\n---\nb: 1\n",
+        "a: 1\n...\n%YAML 001.1\n---\nb: 1\n",
+        "a: 1\n...\n%YAML 1.100\n---\nb: 1\n",
+        "a: 1\n...\n%YAML 100.1\n---\nb: 1\n",
         "a: 1\n...\n%YAML 1.1\n%YAML 1.1\n---\nb: 1\n",
         "a: 1\n...\n# c\n%YAML 1.2\n---\nb: 1\n",
         "a: 1\n...\n%YAMLL\n---\nb: 1\n",
@@ -168,6 +171,29 @@ fn a_directive_that_ends_a_document_and_a_header_yaml_line_are_read_6419() -> Re
             "{\"a\":\"1 %TAG !e! w\"}\n{\"b\":2}\n",
         ),
         ("x\n%TAG !e! w\n---\ny\n", "\"x %TAG !e! w\"\n\"y\"\n"),
+        ("x\n%YAML 1.1\n", "\"x %YAML 1.1\"\n"),
+        ("x\n%TAG !e! w\n---\ny\n", "\"x %TAG !e! w\"\n\"y\"\n"),
+        ("x\n  %TAG !e! w\n", "\"x %TAG !e! w\"\n"),
+        ("--- x\n%TAG !e! w\n", "\"x%TAG !e! w\"\n"),
+        ("\"x\n%TAG\"\n", "\"x %TAG\"\n"),
+        ("'x\n%TAG'\n", "\"x %TAG\"\n"),
+        ("---\n%YAML 1.2\n---\na: 1\n", "{\"a\":1}\n"),
+        ("---\n%YAML 1.2\n%TAG ! x:\n---\na: 1\n", "{\"a\":1}\n"),
+        (
+            "a: 1\n...\n%YAML 1.01\n---\nb: 1\n",
+            "{\"a\":1}\n{\"b\":1}\n",
+        ),
+        ("a: 1\n%TAG !e! w\n--- |\n  t\n", "{\"a\":1}\n\"t\\n\"\n"),
+        ("a: 1\n%TAG !e! w\n--- &a\nb: 1\n", "{\"a\":1}\n{\"b\":1}\n"),
+        (
+            "a: 1\n%TAG !e! w\n--- # c\nb: 1\n",
+            "{\"a\":1}\n{\"b\":1}\n",
+        ),
+        ("a: 1\n%TAG !e! w\n--- !!str\nb\n", "{\"a\":1}\n\"b\"\n"),
+        (
+            "a: 1\n...\n%YAML 1.1\n---\nb: |\n  x\n%YAML 1.1\n---\nc: 1\n",
+            "{\"a\":1}\n{\"b\":\"x\\n\"}\n{\"c\":1}\n",
+        ),
     ] {
         let (out, _err, code) = run_yq_stdin_with_stderr(".", doc, JSON)?;
         assert_eq!((out.as_str(), code), (want, 0), "{doc:?}");

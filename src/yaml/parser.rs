@@ -3754,15 +3754,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
         self.end_document();
         self.skip_directives()?;
+        // The loop reads the `---` as it reads any other, and starts the next document.
         if !self.is_document_start() {
             return Err(self.err_directive_without_document_start());
-        }
-        self.skip_document_marker();
-        self.start_document();
-        if self.has_content_on_line() {
-            self.parse_inline_document_value()?;
-        } else {
-            self.skip_newlines();
         }
         Ok(())
     }
@@ -3820,9 +3814,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     acc.saturating_mul(10).saturating_add(u64::from(b - b'0'))
                 })
             };
+            // go-yaml reads at most two digits of each number.
             let major_len = digits(at);
             if major_len == 0 {
                 return refuse(at, "did not find expected version number");
+            }
+            if major_len > 2 {
+                return refuse(at, "found extremely long version number");
             }
             let major = value(at, major_len);
             at += major_len;
@@ -3834,7 +3832,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             if minor_len == 0 {
                 return refuse(at, "did not find expected version number");
             }
-            if major_len > 8 || minor_len > 8 {
+            if minor_len > 2 {
                 return refuse(at, "found extremely long version number");
             }
             let minor = value(at, minor_len);

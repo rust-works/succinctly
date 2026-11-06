@@ -19,7 +19,7 @@ LINES = ["%YAML 1.2", "%YAML 1.1", "%YAMLL", "%YA", "%TAG ! x:", "%TAG !! y:", "
          "%TAG !e! w", "%TAG", "%TAG !", "%TAG ! x: # c", "%TAG ! x: y", "%TAG ! x:# c", "%TAG x y", "%TAG !a b! x",
          "%TAG\t!\tx", "%TAGX ! x:", "%FOO", "%FOO bar", "%foo", "%", "% FOO", "%1", "%-", "%FOO # c", "%FOO#c",
          "---", "...", "# c", "a: 1", "x", "", "  ", " %TAG ! x:", "--- x",
-         "%YAML 1.1 # c", "%YAML 1.1#c", "%YAML 1.2", "%YAML 1", "%YAML 1.1 x", "%YAML\t1.1", "%YAML 01.1",
+         "%YAML 1.1 # c", "%YAML 1.1#c", "%YAML 1.2", "%YAML 1", "%YAML 1.1 x", "%YAML\t1.1", "%YAML 01.1", "%YAML 001.1", "%YAML 1.100",
          "!!str", "&a", "a:", "- ", "- a", "? a", "a: |", "  x", "a: \"x\"", "a: [x]", "[a]", "\"x\""]
 def run(binary, text):
     r = subprocess.run(binary.split() + ["-o=json", "-I0", "."], input=text.encode(), capture_output=True)
