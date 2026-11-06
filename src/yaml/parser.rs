@@ -4141,8 +4141,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
-    /// Whether an explicit value's `indent`
-    /// matches the mapping frame opened by its own pending `?`, if one is
+    /// Whether an explicit value's `indent` matches the mapping frame opened by its own pending `?`, if one is
     /// pending (#1010). YAML ties both the explicit-key and explicit-value
     /// productions to the same indentation parameter `n`
     /// (c-l-block-map-explicit-key/value(n)), so any deviation -- not just a
@@ -4180,10 +4179,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
-    /// The #901 check: whether
-    /// `indent` would land ambiguously if [`Self::close_deeper_indents`]
-    /// popped every frame deeper than it -- the surviving (landing) frame's
-    /// own recorded indent doesn't exactly match `indent`, so the line
+    /// The #901 check: whether `indent` would land ambiguously if
+    /// [`Self::close_deeper_indents`] popped every frame deeper than it -- the
+    /// surviving (landing) frame's own recorded indent doesn't exactly match
+    /// `indent`, or it is a sequence item's virtual indent, which a line can
+    /// never sit on once the item's content has closed (#6385) -- so the line
     /// belongs to neither the frame(s) that would be popped nor the one it
     /// lands in unambiguously.
     ///
@@ -5057,9 +5057,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // A sibling landing strictly between an open mapping's own indent
         // and its parent mapping's indent has no unambiguous owner (#901) —
         // real yq rejects it outright, so this must too rather than
-        // silently misattributing it. Checked before the #885 normalization
-        // below since the two shapes are mutually exclusive on the parent
-        // frame's type (SequenceItem vs. Mapping).
+        // silently misattributing it. A line between a sequence item and its
+        // compact mapping is refused the same way (#6385).
         self.check_mapping_under_mapping_gap(indent)?;
 
         // First close any containers that are deeper than our indent level.
