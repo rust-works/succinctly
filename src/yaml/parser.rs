@@ -522,6 +522,12 @@ struct Parser<'a, const HAS_CR: bool> {
     /// the stack is the *key*, and the owner — the mapping the null belongs to — is
     /// the one below it.
     pending_explicit_key: Option<usize>,
+    /// Where the plain scalar scanned last ended before its trailing blanks were trimmed (#6214).
+    last_plain_content_end: usize,
+    /// Whether the input holds a tab and a byte that starts U+2028, U+2029 or U+0085 (#6214), so a
+    /// plain scalar is searched for one of them only in a document that can be refused for it: the
+    /// refusal needs the tab. The tab test goes first, as a SIMD pass, and most inputs have none.
+    may_hold_unicode_break: bool,
 
     /// Where the plain scalar scanned last began and ended, and the indent of the innermost open
     /// block when it did (#5068). The next block-context line takes it
@@ -704,6 +710,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             in_document: false,
             document_start_bp_pos: 0,
             pending_explicit_key: None,
+            last_plain_content_end: 0,
+            may_hold_unicode_break: crate::util::simd::escape::contains_byte(input, b'\t')
+                && (crate::util::simd::escape::contains_byte(input, 0xC2)
+                    || crate::util::simd::escape::contains_byte(input, 0xE2)),
             last_plain_scalar: None,
             pending_explicit_key_empty: false,
             nesting_depth: 0,
@@ -2438,7 +2448,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Only called on error paths, so we pay the cost only when needed.
     #[inline]
     fn current_line(&self) -> usize {
-        // Count line breaks from start to current position, by counting the
+        self.line_at(self.pos)
+    }
+
+    /// The 1-indexed line `offset` is on.
+    fn line_at(&self, offset: usize) -> usize {
+        // Count line breaks from start to `offset`, by counting the
         // bytes each break *ends* at: a break of width 1 ends where it starts,
         // so a CRLF — width 2 at its `\r` — is counted once, at its `\n` (#324).
         //
@@ -2446,7 +2461,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // the cursor sits on the LF of a CRLF, that CR's partner is one byte
         // past the prefix, and measuring within the prefix would read it as a
         // lone CR and report a line too many.
-        let breaks = (0..self.pos)
+        let breaks = (0..offset)
             .filter(|&i| line_break_len(self.input, i) == 1)
             .count();
         breaks + 1
@@ -3815,6 +3830,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             owner: self.innermost_block_indent(),
         });
 
+        // The extent the Unicode-break tab check (#6214) reads, kept for the caller: it must not
+        // widen this function's return type, which every plain scalar pays for.
+        self.last_plain_content_end = content_end;
+
         // Return absolute end position (not length)
         end
     }
@@ -3886,6 +3905,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
             }
         }
+
+        self.reject_tab_after_unicode_break(start, self.pos)?;
 
         // Trim trailing whitespace. `\r` goes with it for the same reason as in
         // `parse_unquoted_value_with_indent_impl`: it is a line break, so it is
@@ -5387,6 +5408,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         _ => {
                             let start = self.pos;
                             let end = self.parse_unquoted_value_with_indent(indent);
+                            self.check_unicode_break_tab()?;
                             self.check_json_strict_scalar(start, end)?;
                             // The scan stops at a `: ` of a later line: no node of its own (#5083), as
                             // for a value on the key's line (#5064).
@@ -5863,6 +5885,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.claim_floated_comment_for_key();
                 self.write_bp_open();
                 let end_pos = self.parse_unquoted_value_with_indent(indent);
+                self.check_unicode_break_tab()?;
                 self.set_bp_text_end(end_pos);
                 self.write_bp_close();
             }
@@ -6013,6 +6036,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.set_ib();
                 self.write_bp_open();
                 let end_pos = self.parse_unquoted_value_with_indent(indent);
+                self.check_unicode_break_tab()?;
                 self.set_bp_text_end(end_pos);
                 self.write_bp_close();
             }
@@ -6052,6 +6076,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             _ => {
                 let start = self.pos;
                 let end = self.parse_unquoted_value_with_indent(min_indent);
+                self.check_unicode_break_tab()?;
                 self.check_json_strict_scalar(start, end)?;
                 end
             }
@@ -6177,6 +6202,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.set_ib();
                 self.write_bp_open();
                 let end_pos = self.parse_unquoted_value_with_indent(min_indent);
+                self.check_unicode_break_tab()?;
                 self.set_bp_text_end(end_pos);
                 self.write_bp_close();
                 // The scalar stops at a `: ` and what follows is no node (#5064), so `- a` /
@@ -7497,15 +7523,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(end)
     }
 
+    /// The block indent a tab in a plain scalar's continuation must stay clear of (#6059): the
+    /// enclosing block's. `None` for a collection at the document root, which has no block indent
+    /// to violate.
+    fn tab_indent_limit(&self) -> Option<usize> {
+        (self.indent_stack.len() > 1).then(|| self.innermost_block_indent())
+    }
+
     /// #6059: go-yaml refuses a plain scalar that continues on a line whose leading blanks hold a tab at
     /// a column below the enclosing block's indent plus one (`found a tab character that violates
     /// indentation`), in a flow collection as in block context. `break_pos` is the line break after the
     /// scalar's text; a collection at the document root has no block indent to violate.
     fn reject_tab_in_flow_plain_continuation(&self, break_pos: usize) -> Result<(), YamlError> {
-        if self.indent_stack.len() <= 1 {
+        let Some(limit) = self.tab_indent_limit() else {
             return Ok(());
-        }
-        let limit = self.innermost_block_indent();
+        };
         // The line after the break, and the one after it when that one is empty: the scanners skip an
         // empty line's break along with the previous one, so its successor is never a break they stop
         // at. Every other blank line is a break of its own, which checks its successor in turn.
@@ -7527,6 +7559,60 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 });
             }
             line = start;
+        }
+        Ok(())
+    }
+
+    /// #6214: the Unicode-break tab check for the plain scalar the scanner just read. Inlined to one
+    /// flag test, so a document without a tab pays nothing but that; the search is out of line.
+    #[inline(always)]
+    fn check_unicode_break_tab(&self) -> Result<(), YamlError> {
+        if !self.may_hold_unicode_break {
+            return Ok(());
+        }
+        match self.last_plain_scalar {
+            Some(span) => {
+                self.reject_tab_after_unicode_break(span.start, self.last_plain_content_end)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// #6214: the same refusal for a line that a U+2028, U+2029 or U+0085 ends inside a block plain
+    /// scalar or key (`input[start..end]`). The scalar decoders fold those as line breaks (#4913) and
+    /// go-yaml scans them as such, so the blanks after one are a continuation line's, but the block
+    /// scanners take them for text. The flow scanners stop at the break and call
+    /// [`Self::pass_unicode_break_in_flow_plain`] instead.
+    fn reject_tab_after_unicode_break(&self, start: usize, end: usize) -> Result<(), YamlError> {
+        if !self.may_hold_unicode_break {
+            return Ok(());
+        }
+        let Some(limit) = self.tab_indent_limit() else {
+            return Ok(());
+        };
+        let text = &self.input[start..end.min(self.input.len())];
+        let mut at = 0;
+        while at < text.len() {
+            let width = match text[at..] {
+                [0xE2, 0x80, 0xA8 | 0xA9, ..] => 3,
+                [0xC2, 0x85, ..] => 2,
+                _ => {
+                    at += 1;
+                    continue;
+                }
+            };
+            let line = at + width;
+            let mut tab = line;
+            while text.get(tab) == Some(&b' ') {
+                tab += 1;
+            }
+            if text.get(tab) == Some(&b'\t') && tab - line <= limit {
+                return Err(YamlError::TabIndentation {
+                    line: self.line_at(start + tab),
+                    offset: start + tab,
+                });
+            }
+            at = line;
         }
         Ok(())
     }
@@ -9406,6 +9492,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                                 _ => {
                                     let end = self
                                         .parse_own_line_unquoted_value(indent, is_truly_doc_root);
+                                    self.check_unicode_break_tab()?;
                                     self.reject_content_after_inline_value()?;
                                     end
                                 }
@@ -9526,6 +9613,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         _ => {
                             let start = self.pos;
                             let end = self.parse_own_line_unquoted_value(indent, is_truly_doc_root);
+                            self.check_unicode_break_tab()?;
                             self.check_json_strict_scalar(start, end)?;
                             self.reject_content_after_inline_value()?;
                             end
