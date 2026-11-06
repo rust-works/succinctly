@@ -152,7 +152,7 @@ pub enum YamlError {
     /// A line's indentation falls in the ambiguous gap between an open
     /// container's own indent and its immediate parent's indent, with no
     /// unambiguous interpretation for which container it belongs to (#900,
-    /// #901). Real yq rejects the same inputs (`did not find expected key`
+    /// #901, #5086). Real yq rejects the same inputs (`did not find expected key`
     /// / `did not find expected '-' indicator`) rather than guessing.
     InconsistentIndentation {
         /// Byte offset where the misindented line starts

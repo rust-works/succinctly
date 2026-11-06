@@ -70,6 +70,8 @@ const ACCEPTED: &[(&str, &str)] = &[
     ("?\n - k: a\n: v\n", "{\"\":\"v\"}\n"),
     ("  ?\n   - k: a\n  : v\n", "{\"\":\"v\"}\n"),
     ("?   - a\n    - b\n: v\n", "{\"\":\"v\"}\n"),
+    // A `-` on a nested item's virtual indent that is the item's content.
+    ("-\n - a\n - b\n", "[[\"a\",\"b\"]]\n"),
 ];
 
 /// Documents yq rejects with `did not find expected ...`: a `-` whose indent falls between two open blocks.

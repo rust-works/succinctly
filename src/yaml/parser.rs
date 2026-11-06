@@ -3966,41 +3966,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
-    /// Shared shape behind [`Self::compact_mapping_gap_reaches`],
-    /// [`Self::sequence_item_gap_reaches`], and
-    /// [`Self::mapping_under_mapping_gap_reaches`]: `indent` falls between
-    /// the top two stack frames' own recorded indents, with the top frame
-    /// of type `child` directly on top of a frame of type `parent`. One
-    /// definition so the three call sites' bound-inclusivity and
-    /// frame-type choices can't silently drift apart from each other (the
-    /// #106 lesson — duplicated predicates diverge silently).
-    fn frame_gap_reaches(
-        &self,
-        indent: usize,
-        parent: NodeType,
-        child: NodeType,
-        inclusive_lower: bool,
-        inclusive_upper: bool,
-    ) -> bool {
-        let len = self.indent_stack.len();
-        if len < 2 || self.type_stack[len - 1] != child || self.type_stack[len - 2] != parent {
-            return false;
-        }
-        let lower = self.indent_stack[len - 2];
-        let upper = self.indent_stack[len - 1];
-        let lower_ok = if inclusive_lower {
-            indent >= lower
-        } else {
-            indent > lower
-        };
-        let upper_ok = if inclusive_upper {
-            indent <= upper
-        } else {
-            indent < upper
-        };
-        lower_ok && upper_ok
-    }
-
     /// Whether `indent` falls anywhere from an open compact mapping's own
     /// recorded indent down through its enclosing sequence item's virtual
     /// indent (inclusive on both ends) — e.g. `-   a: hello\n  b: 2\n`, where
@@ -4028,32 +3993,25 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Deliberately narrow to a `Mapping` frame directly on top of a
     /// `SequenceItem` frame: in that shape there's exactly one possible
     /// enclosing scope for the line to belong to, which is what makes this
-    /// tolerance unambiguous. Two known, deliberately out-of-scope siblings
-    /// of this same failure shape, not yet fixed:
-    /// - A `-` continuation landing in the same gap (#900) — unlike a
-    ///   `key: value` line, a bare item has no obvious "add it to the open
-    ///   mapping" interpretation.
-    /// - Mapping-under-mapping nesting (#901) — needs its own correctness
-    ///   argument for whether the same reasoning still holds when the frame
-    ///   below isn't a `SequenceItem` (and thus not guaranteed to be the
-    ///   line's only possible enclosing scope) before extending this check
-    ///   to it.
+    /// tolerance unambiguous. Its siblings are refused: a `-` landing in the
+    /// same gap (#900, refused since #5086 as yq refuses it, there being no
+    /// "add it to the open mapping" reading of a bare item) and
+    /// mapping-under-mapping nesting (#901).
     fn compact_mapping_gap_reaches(&self, indent: usize) -> bool {
-        self.frame_gap_reaches(
-            indent,
-            NodeType::SequenceItem,
-            NodeType::Mapping,
-            true,
-            true,
-        )
+        let len = self.indent_stack.len();
+        if len < 2
+            || self.type_stack[len - 1] != NodeType::Mapping
+            || self.type_stack[len - 2] != NodeType::SequenceItem
+        {
+            return false;
+        }
+        (self.indent_stack[len - 2]..=self.indent_stack[len - 1]).contains(&indent)
     }
 
     /// Normalize `indent` to the open compact mapping's own recorded indent
     /// when [`Self::compact_mapping_gap_reaches`] holds, so
     /// `parse_mapping_entry` adds an entry to that mapping instead of
-    /// closing it — the same normalization `parse_sequence_item_inner`
-    /// already does for an out-dented sequence continuation (#485). A no-op
-    /// otherwise.
+    /// closing it. A no-op otherwise.
     fn resolve_compact_mapping_gap_indent(&self, indent: usize) -> usize {
         if self.compact_mapping_gap_reaches(indent) {
             *self.indent_stack.last().unwrap()
@@ -5594,11 +5552,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // Sequence as key - open key node and let sequence parsing continue
                 // The key will be a sequence
                 self.write_bp_open();
+                // The `-`'s own column: `indent + 2` for `? - a`, but a key on a line of its
+                // own (`?⏎ - a⏎ - b`) or behind more blanks starts elsewhere, and its next item
+                // is at that column. A hard-coded `indent + 2` only worked while a `-` between
+                // two open blocks was read as the next item (#5086).
                 self.write_ty(true); // sequence
-                                     // The `-`'s own column: `indent + 2` for `? - a`, but a key on a line of its
-                                     // own (`?⏎ - a⏎ - b`) or behind more blanks starts elsewhere, and its next item
-                                     // is at that column. A hard-coded `indent + 2` only worked while a `-` between
-                                     // two open blocks was read as the next item (#5086).
                 let seq_indent = self.current_column();
                 self.indent_stack.push(seq_indent);
                 self.push_type(NodeType::Sequence);
@@ -5777,7 +5735,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // not the raw column, so that normalization's tolerance stays intact.
         self.require_consistent_indentation(self.explicit_value_matches_key_indent(indent))?;
 
-        // Close deeper structures, but keep the mapping at this indent open
+        // Close deeper structures, but keep the mapping at this indent open. Everything the
+        // key pushed is deeper than the `?` (its content starts past it), so a key sequence
+        // left open at the `?`'s column + 1 is closed too (#5086).
         self.close_deeper_indents(indent);
 
         // This value is for the pending explicit key
