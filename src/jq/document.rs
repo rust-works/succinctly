@@ -1293,6 +1293,16 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         false
     }
     // patchcov: coverage end
+
+    /// Whether [`stream_yaml_as_document`](Self::stream_yaml_as_document) writes this cursor as
+    /// only the verbatim header the first document carries, so that header's own line break
+    /// already ends the output and the caller's per-result terminator must not follow (#5721).
+    ///
+    /// Only a YAML document with no content of its own (comment-only or blank-only input) is
+    /// one. Default `false`: a format with no such header (JSON) always has a value line.
+    fn is_header_only_document(&self) -> bool {
+        false
+    }
 }
 
 /// A value from a document (JSON value or YAML value).
@@ -6345,5 +6355,16 @@ mod element_index_defaults_tests {
         assert_eq!(rest.get(0).and_then(|v| v.as_i64()), Some(2));
         let (cursor, _) = rest.uncons_cursor().expect("a second element");
         assert_eq!(cursor.value().as_i64(), Some(2));
+    }
+
+    /// Only a YAML document with no content prints as its header alone; a format with no header
+    /// (JSON) always has a value line, so the trait default answers `false` (#5721).
+    #[test]
+    fn a_json_cursor_is_never_a_header_only_document_5721() {
+        let json = br"null";
+        let index = JsonIndex::build(json);
+        assert!(!super::DocumentCursor::is_header_only_document(
+            &index.root(json)
+        ));
     }
 }
