@@ -7980,18 +7980,30 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// Whether the first non-blank line below a block scalar's header holds content indented less than
     /// `content_indent`, so the scalar has no content of its own (#5067). End of input is not such a line.
-    fn first_block_content_line_is_dedented(&mut self, content_indent: usize) -> bool {
+    fn first_block_content_line_is_dedented(
+        &mut self,
+        content_indent: usize,
+    ) -> Result<bool, YamlError> {
         let saved_pos = self.pos;
         let dedented = loop {
             let indent = self.skip_spaces_simd();
             match self.peek() {
                 None => break false,
                 Some(b'\n' | b'\r') => self.skip_line_break(),
+                // A tab below the indent the header gave, on a leading line or on the first content one,
+                // is the error go-yaml raises while it eats the indentation (#6372; the auto-detected
+                // indent has the same rule in `detect_block_content_indent`, #6295).
+                Some(b'\t') if indent < content_indent => {
+                    return Err(YamlError::TabIndentation {
+                        line: self.current_line(),
+                        offset: self.pos,
+                    });
+                }
                 Some(_) => break indent < content_indent,
             }
         };
         self.pos = saved_pos;
-        dedented
+        Ok(dedented)
     }
 
     /// Detect content indentation from the first non-empty line.
@@ -8067,6 +8079,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             .unwrap_or(self.input.len());
         let region_start = self.pos;
         let mut saw_tab = false;
+
+        // The line that ends the scalar by being dedented: go-yaml eats its spaces as the scalar's
+        // indentation, and a tab after them is the error (#6372). A space-only dedent is the ordinary end.
+        let mut after_spaces = block_end;
+        while self.input.get(after_spaces) == Some(&b' ') {
+            after_spaces += 1;
+        }
+        if self.input.get(after_spaces) == Some(&b'\t') {
+            self.pos = after_spaces;
+            return Err(YamlError::TabIndentation {
+                line: self.current_line(),
+                offset: after_spaces,
+            });
+        }
 
         // Now we need to walk through the content to find:
         // 1. last_content_end - position after last non-empty line
@@ -8188,7 +8214,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Determine content indentation
         let content_indent = if header.explicit_indent > 0 {
             let content_indent = base_indent + header.explicit_indent as usize;
-            if self.first_block_content_line_is_dedented(content_indent) {
+            if self.first_block_content_line_is_dedented(content_indent)? {
                 // An explicit indent with nothing indented that far below the header is an empty
                 // scalar, as with an auto-detected one: `|2` / `---` is not a scalar that swallows
                 // the marker (#5067). `find_block_scalar_end` never looks at the first line.
