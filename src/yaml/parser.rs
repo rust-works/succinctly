@@ -3697,6 +3697,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// is skipped exactly like a well-formed one, with no name matching at
     /// all.
     fn skip_directives(&mut self) -> Result<(), YamlError> {
+        // The `%TAG` handles met so far in this run of directives: go-yaml refuses a handle given twice (#6412).
+        let mut tag_handles: Vec<(usize, usize)> = Vec::new();
         loop {
             self.skip_directive_gap_whitespace()?;
             if self.in_document || self.peek() != Some(b'%') {
@@ -3705,9 +3707,100 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             if !self.input[self.pos..].starts_with(b"%YAML") {
                 self.saw_non_header_directive = true;
             }
+            if self.yq_mode {
+                self.check_yq_directive(&mut tag_handles)?;
+            }
             self.skip_to_eol();
             self.skip_line_break();
         }
+        Ok(())
+    }
+
+    /// In yq mode, refuse a `%` directive line (the cursor is on its `%`) that go-yaml's scanner refuses (#6412).
+    ///
+    /// yq's header slurp sets aside only a line that starts `%YAML` (`%YAMLL` too, `%YAM` not), so every other directive reaches go-yaml:
+    /// a name that is empty (`%`, `% FOO`) or not `YAML` or `TAG` (`%FOO`, any case but the exact word) is an
+    /// error, and so is a `%TAG` that is not a handle (`!`, `!!` or `!word!`), a blank, a non-empty URI prefix and
+    /// then nothing but a `#` comment, or that repeats a handle already given. The library loader keeps the
+    /// YAML 1.2 reading, where an unknown directive is ignored.
+    fn check_yq_directive(&self, tag_handles: &mut Vec<(usize, usize)>) -> Result<(), YamlError> {
+        let start = self.pos;
+        if self.input[start..].starts_with(b"%YAML") {
+            return Ok(());
+        }
+        let line_end = self.input[start..]
+            .iter()
+            .position(|&b| Self::is_break(b))
+            .map_or(self.input.len(), |n| start + n);
+        let line = &self.input[start..line_end];
+        let refuse = |at: usize, why: &'static str| Err(self.err_unexpected_char(start + at, why));
+        let is_blank = |b: u8| b == b' ' || b == b'\t';
+        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+        let name_len = line[1..].iter().take_while(|&&b| is_word(b)).count();
+        if name_len == 0 {
+            return refuse(1, "could not find expected directive name");
+        }
+        if &line[1..=name_len] != b"TAG" {
+            return refuse(1, "found unknown directive name");
+        }
+        let blanks = |from: usize| line[from..].iter().take_while(|&&b| is_blank(b)).count();
+        let mut at = 1 + name_len;
+        let gap = blanks(at);
+        if gap == 0 {
+            return refuse(at, "did not find expected whitespace");
+        }
+        at += gap;
+        // The handle: `!`, `!!` or `!word!`.
+        if line.get(at) != Some(&b'!') {
+            return refuse(at, "did not find expected '!'");
+        }
+        let handle_start = at;
+        at += 1;
+        let word = line[at..].iter().take_while(|&&b| is_word(b)).count();
+        if line.get(at + word) == Some(&b'!') {
+            at += word + 1;
+        } else if word != 0 {
+            return refuse(at + word, "did not find expected '!'");
+        }
+        let handle = (start + handle_start, start + at);
+        let gap = blanks(at);
+        if gap == 0 {
+            return refuse(at, "did not find expected whitespace");
+        }
+        at += gap;
+        // The prefix is URI characters: alphanumerics, `-_;/?:@&=+$,.!~*'()[]{}` and `%` with two hex digits. Anything
+        // else (`#`, `^`, `"`, `<`, `>`, a backtick, `|`, `\`, a control byte, a non-ASCII one) ends it.
+        let mut prefix = 0;
+        while let Some(&b) = line.get(at + prefix) {
+            if b.is_ascii_alphanumeric() || b"-_;/?:@&=+$,.!~*'()[]{}".contains(&b) {
+                prefix += 1;
+            } else if b == b'%'
+                && line.get(at + prefix + 1).is_some_and(u8::is_ascii_hexdigit)
+                && line.get(at + prefix + 2).is_some_and(u8::is_ascii_hexdigit)
+            {
+                prefix += 3;
+            } else {
+                break;
+            }
+        }
+        if prefix == 0 {
+            return refuse(at, "did not find expected tag URI");
+        }
+        at += prefix;
+        if at < line.len() && !is_blank(line[at]) {
+            return refuse(at, "did not find expected whitespace or line break");
+        }
+        at += blanks(at);
+        if at < line.len() && line[at] != b'#' {
+            return refuse(at, "did not find expected comment or line break");
+        }
+        if tag_handles
+            .iter()
+            .any(|&(a, b)| self.input[a..b] == self.input[handle.0..handle.1])
+        {
+            return refuse(handle_start, "found duplicate %TAG directive");
+        }
+        tag_handles.push(handle);
         Ok(())
     }
 
@@ -11525,6 +11618,29 @@ mod tests {
         //     "Document --- name"      # expected: "Document", then {"name": "Bob"}
         let docs = documents(b"Document\n---\nname: Bob\n");
         assert_eq!(docs, vec!["\"Document\"", "{\"name\":\"Bob\"}"]);
+    }
+
+    #[test]
+    fn yq_mode_refuses_a_directive_go_yaml_refuses_6412() {
+        // The library loader skips them all; the yq build refuses what go-yaml's scanner does.
+        for bad in [
+            &b"%FOO\n---\na: 1\n"[..],
+            b"%\n---\na: 1\n",
+            b"%TAG\n---\na: 1\n",
+            b"%TAG ! x: y\n---\na: 1\n",
+            b"%TAG ! x:\n%TAG ! y:\n---\na: 1\n",
+            b"%YAM\n---\na: 1\n",
+        ] {
+            assert!(build_semi_index(bad).is_ok(), "{bad:?}");
+            assert!(build_semi_index_yq(bad).is_err(), "{bad:?}");
+        }
+        for good in [
+            &b"%TAG ! x:\n---\na: 1\n"[..],
+            b"%TAG !e! x # c\n%TAG !! y\n---\na: 1\n",
+            b"%YAMLL 1.2\n---\na: 1\n",
+        ] {
+            assert!(build_semi_index_yq(good).is_ok(), "{good:?}");
+        }
     }
 
     #[test]

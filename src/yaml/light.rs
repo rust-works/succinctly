@@ -10014,7 +10014,7 @@ fn write_foot_comment_lines<Out: core::fmt::Write>(
 ///
 /// A whitespace-only line counts as leading here (live-checked: `# c` / `  ` / `k: 1` numbers `k` from line 2),
 /// as it does in the header yq prints ([`yq_header_len`], #6401), and so is every bare `---` of a
-/// leading run (#6349). As there, only a `%YA..` directive is slurped: `%TAG` is content. A `--- # c` line is left as content: yq's answer
+/// leading run (#6349). As there, only a `%YAML..` directive is slurped: `%TAG` is content. A `--- # c` line is left as content: yq's answer
 /// there is `[0,0]`, which nothing here reproduces.
 fn yq_position_preamble(text: &[u8]) -> (usize, usize) {
     let mut pos = 0;
@@ -10031,7 +10031,7 @@ fn yq_position_preamble(text: &[u8]) -> (usize, usize) {
             line.starts_with(b"---") && line[3..].iter().all(|&b| b == b' ' || b == b'\t');
         let leading = match first {
             None => true,
-            Some(i) => line[i] == b'#' || (i == 0 && line.starts_with(b"%YA")) || bare_marker,
+            Some(i) => line[i] == b'#' || (i == 0 && line.starts_with(b"%YAML")) || bare_marker,
         };
         if !leading {
             let columns = if line.starts_with(b"---") && matches!(line.get(3), Some(b' ' | b'\t')) {
@@ -10065,7 +10065,7 @@ fn yq_position_preamble(text: &[u8]) -> (usize, usize) {
 /// verbatim before the first document whenever the result is that document
 /// itself (#2795): every leading line that is empty or holds only blanks (which
 /// go-yaml reads as the comment `# ` plus the line, #6401), a `#` comment (at any
-/// indent), a `%YA..` directive, or a `---` marker, up to the first line
+/// indent), a `%YAML..` directive, or a `---` marker, up to the first line
 /// that is none of those. Blank lines are kept exactly where they were
 /// (`# lead\n\na: 1` round-trips with its blank, unlike a blank after any
 /// other head comment) and so is an explicit leading `---` -- both of which
@@ -10108,7 +10108,7 @@ fn yq_header_len(text: &[u8]) -> (usize, bool) {
         if !at_break_or_eof
             && !(rest[indent_len] == b'#'
                 || (indent_len == 0
-                    && (rest[indent_len..].starts_with(b"%YA")
+                    && (rest[indent_len..].starts_with(b"%YAML")
                         || rest[indent_len..].starts_with(b"---"))))
         {
             return (pos, false);
@@ -18793,6 +18793,11 @@ plain: hello
             assert_eq!(yq_header_len(b"---x\n"), (0, false));
             assert_eq!(yq_header_len(b"%YAML 1.2\n---\n"), (14, false));
             assert_eq!(yq_header_len(b"  \na: 1\n"), (3, false));
+            // Only a line that starts `%YAML` is slurped (#6412): `%YAM` and `%YA` reach go-yaml.
+            assert_eq!(yq_header_len(b"%YAML 1.2\n"), (10, false));
+            assert_eq!(yq_header_len(b"%YAMLL\n"), (7, false));
+            assert_eq!(yq_header_len(b"%YAM\n"), (0, false));
+            assert_eq!(yq_header_len(b"%YA\n"), (0, false));
             assert_eq!(yq_header_len(b"# only\n"), (7, false));
             assert_eq!(yq_header_len(b"# only"), (6, false));
             assert_eq!(yq_header_len(b"# c\r\na: 1\r\n"), (5, false));
@@ -18808,7 +18813,7 @@ plain: hello
             assert_eq!(yq_position_preamble(b"---\nk: 1\n"), (1, 0));
             assert_eq!(yq_position_preamble(b"--- \nk: 1\n"), (1, 0));
             assert_eq!(yq_position_preamble(b"%YAML 1.2\n---\nk: 1\n"), (2, 0));
-            // Only `%YA..` is slurped; any other directive is content.
+            // Only `%YAML..` is slurped; any other directive is content.
             assert_eq!(
                 yq_position_preamble(b"%TAG ! tag:e.com,2000:\n---\nk: 1\n"),
                 (0, 0)
