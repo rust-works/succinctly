@@ -3700,7 +3700,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     ///
     /// yq's header slurp sets aside only a line that starts `%YAML` (`%YAMLL` too, `%YAM` not), so every other directive reaches go-yaml:
     /// a name that is empty (`%`, `% FOO`) or not `YAML` or `TAG` (`%FOO`, any case but the exact word) is an
-    /// error, and so is a `%TAG` that is not a handle (`!`, `!!` or `!word!`), a blank, a non-empty prefix and
+    /// error, and so is a `%TAG` that is not a handle (`!`, `!!` or `!word!`), a blank, a non-empty URI prefix and
     /// then nothing but a `#` comment, or that repeats a handle already given. The library loader keeps the
     /// YAML 1.2 reading, where an unknown directive is ignored.
     fn check_yq_directive(&self, tag_handles: &mut Vec<(usize, usize)>) -> Result<(), YamlError> {
@@ -3748,11 +3748,28 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return refuse(at, "did not find expected whitespace");
         }
         at += gap;
-        let prefix = line[at..].iter().take_while(|&&b| !is_blank(b)).count();
+        // The prefix is URI characters: alphanumerics, `-_;/?:@&=+$,.!~*'()[]{}` and `%` with two hex digits. Anything
+        // else (`#`, `^`, `"`, `<`, `>`, a backtick, `|`, `\`, a control byte, a non-ASCII one) ends it.
+        let mut prefix = 0;
+        while let Some(&b) = line.get(at + prefix) {
+            if b.is_ascii_alphanumeric() || b"-_;/?:@&=+$,.!~*'()[]{}".contains(&b) {
+                prefix += 1;
+            } else if b == b'%'
+                && line.get(at + prefix + 1).is_some_and(u8::is_ascii_hexdigit)
+                && line.get(at + prefix + 2).is_some_and(u8::is_ascii_hexdigit)
+            {
+                prefix += 3;
+            } else {
+                break;
+            }
+        }
         if prefix == 0 {
             return refuse(at, "did not find expected tag URI");
         }
         at += prefix;
+        if at < line.len() && !is_blank(line[at]) {
+            return refuse(at, "did not find expected whitespace or line break");
+        }
         at += blanks(at);
         if at < line.len() && line[at] != b'#' {
             return refuse(at, "did not find expected comment or line break");

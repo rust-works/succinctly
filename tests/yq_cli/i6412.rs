@@ -42,6 +42,16 @@ fn a_directive_go_yaml_refuses_is_refused_6412() -> Result<()> {
         "%FOO\n---\n",
         "%FOO\n...\n---\na: 1\n",
         "%TAG\n...\n---\na: 1\n",
+        // The prefix is URI characters only; `%` takes two hex digits.
+        "%TAG ! x#\n---\na: 1\n",
+        "%TAG ! x^\n---\na: 1\n",
+        "%TAG ! x\"\n---\na: 1\n",
+        "%TAG ! x%4\n---\na: 1\n",
+        "%TAG ! x%zz\n---\na: 1\n",
+        "%TAG ! x%\n---\na: 1\n",
+        "%TAG ! é\n---\na: 1\n",
+        "%TAG ! x|y\n---\na: 1\n",
+        "%TAG ! xy\n---\na: 1\n",
     ] {
         let (out, _err, code) = run_yq_stdin_with_stderr(".", doc, JSON)?;
         assert_eq!(out, "", "{doc:?}");
@@ -69,9 +79,35 @@ fn a_directive_go_yaml_reads_is_still_read_6412() -> Result<()> {
             "a: 1\n...\n%TAG ! x:\n---\nb: 1\n",
             "{\"a\":1}\n{\"b\":1}\n",
         ),
+        // The prefix is URI characters only; `%` takes two hex digits.
+        ("%TAG ! x%41\n---\na: 1\n", "{\"a\":1}\n"),
+        (
+            "%TAG ! a%2Fb;/?:@&=+$,.!~*'()[]{}\n---\na: 1\n",
+            "{\"a\":1}\n",
+        ),
     ] {
         let (out, _err, code) = run_yq_stdin_with_stderr(".", doc, JSON)?;
         assert_eq!((out.as_str(), code), (want, 0), "{doc:?}");
     }
+    Ok(())
+}
+
+#[test]
+fn every_route_refuses_a_directive_go_yaml_refuses_6412() -> Result<()> {
+    let doc = "%FOO\n---\na: 1\n";
+    for args in [
+        &["--doc", "0"][..],
+        &["-P"][..],
+        &["-N"][..],
+        &["--eval-all"][..],
+        &["-e"][..],
+    ] {
+        let (out, _err, code) = run_yq_stdin_with_stderr(".", doc, args)?;
+        assert_eq!(out, "", "{args:?}");
+        assert_ne!(code, 0, "{args:?}");
+    }
+    let (out, _err, code) = run_yq_stdin_with_stderr(".a = 2", doc, &[])?;
+    assert_eq!(out, "");
+    assert_ne!(code, 0);
     Ok(())
 }

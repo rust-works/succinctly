@@ -18778,6 +18778,11 @@ plain: hello
             assert_eq!(yq_header_len(b"---x\n"), (0, false));
             assert_eq!(yq_header_len(b"%YAML 1.2\n---\n"), (14, false));
             assert_eq!(yq_header_len(b"  \na: 1\n"), (3, false));
+            // Only a line that starts `%YAML` is slurped (#6412): `%YAM` and `%YA` reach go-yaml.
+            assert_eq!(yq_header_len(b"%YAML 1.2\n"), (10, false));
+            assert_eq!(yq_header_len(b"%YAMLL\n"), (7, false));
+            assert_eq!(yq_header_len(b"%YAM\n"), (0, false));
+            assert_eq!(yq_header_len(b"%YA\n"), (0, false));
             assert_eq!(yq_header_len(b"# only\n"), (7, false));
             assert_eq!(yq_header_len(b"# only"), (6, false));
             assert_eq!(yq_header_len(b"# c\r\na: 1\r\n"), (5, false));

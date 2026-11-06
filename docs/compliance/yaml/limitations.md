@@ -475,6 +475,7 @@ one, with no name matching at all.
 `succinctly yq` is stricter (#6412): it refuses a directive line yq's scanner refuses, which is one whose name is
 empty or not `YAML` or `TAG` (`%FOO`, `%`), and a `%TAG` that is not a handle, a prefix and at most a `#` comment, or
 that repeats a handle; a line that starts `%YAML` is yq's header and is left alone.
+A `%YAML` line after a `...`, or a second one, is not checked: yq refuses it (`found incompatible YAML document`) and this build reads it.
 Full `%YAML`-version and `%TAG`-handle semantics are out
 of scope for the default loader; the strict validator
 ([`src/yaml/validate.rs`](../../../src/yaml/validate.rs), #223) already has the more
