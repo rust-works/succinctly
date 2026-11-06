@@ -32883,7 +32883,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                     .map(|e| e.to_string())
             };
             // Every such count written small, so that neither compile below looks for one again.
-            let mut small = String::with_capacity(pattern.len());
+            let mut small = string_with_capacity(pattern.len());
             let mut from = 0;
             for digits in counts {
                 small.push_str(&pattern[from..digits.start]);
@@ -33381,7 +33381,7 @@ fn oversized_interval(
                     i += 1 + len;
                 }
                 if too_big || upper.is_some() {
-                    first.get_or_insert(byte(brace));
+                    first.get_or_insert_with(|| byte(brace));
                     for digits in [too_big.then_some(lower), upper].into_iter().flatten() {
                         counts.push(byte(digits.start)..byte(digits.end));
                     }
