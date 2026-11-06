@@ -261,8 +261,11 @@ impl Emitter<'_> {
 /// `{n,}` with `n` of 2 or more over a capture group (#6309, #6347): the empty iteration ends such
 /// a loop even before its minimum count, so it is the `*` loop, and the loop copy `(?:X)*` is one
 /// the loop rewrite (#6106) reads, with the groups inside it copied and read back. With a group
-/// inside it, only outside another repeat (which would run the loop's copies again) and with no
-/// flag switch inside, which the loop rewrite does not follow.
+/// inside it, only outside another repeat (which would run the loop's copies again). A flag switch
+/// inside is scoped by the loop rewrite (#6358). A non-capturing group that holds
+/// more than one capture group is the same (#6358): `"aab" | match("(?:(a)|()){2,}")` has `["a",""]` as
+/// its captures in jq (the third iteration is empty and sets the second group), and `["a",null]` without. A
+/// non-capturing group around one capture group (`(?:(a*)){2,}`) already agrees and is left alone.
 fn is_candidate(rep: &ast::Repetition, nested: bool) -> bool {
     let counted = match rep.op.kind {
         RepetitionKind::ZeroOrMore | RepetitionKind::OneOrMore => false,
@@ -275,8 +278,13 @@ fn is_candidate(rep: &ast::Repetition, nested: bool) -> bool {
         && always_matches_empty(&rep.ast)
         && (!counted
             || matches!(&*rep.ast, Ast::Group(group)
-                if group.capture_index().is_some()
-                    && (!has_group(&group.ast) || (!nested && !sets_flags(&group.ast)))))
+                if (group.capture_index().is_some() || !is_capture_group(&group.ast))
+                    && (!has_group(&group.ast) || !nested)))
+}
+
+/// Whether `ast` is a capture group and nothing else.
+fn is_capture_group(ast: &Ast) -> bool {
+    matches!(ast, Ast::Group(group) if group.capture_index().is_some())
 }
 
 fn has_candidate(ast: &Ast, nested: bool) -> bool {
@@ -429,6 +437,10 @@ mod tests {
     #[test]
     fn rewrites_a_counted_repeat_of_a_capture_group_as_the_star_loop() {
         assert_eq!(rewritten("(a*){2,}b").as_deref(), Some(r"(?:(?:a*)*())b"));
+        // So is one over a non-capturing group of several ways, groups among them (#6358): the empty
+        // iteration ends the loop before the minimum count there too, and sets the group it holds.
+        assert!(rewritten("(?:(a)|()){2,}").is_some_and(|plain| !plain.contains("{2,}")));
+        assert!(rewritten("(?:a|()){3,}").is_some_and(|plain| !plain.contains("{3,}")));
         assert_eq!(rewritten("(b|){3,}").as_deref(), Some(r"(?:(?:b|)*())"));
         // A group inside it is copied too (#6347): the loop copy and the exit each hold one.
         assert_eq!(
@@ -438,10 +450,12 @@ mod tests {
     }
 
     /// #6347: a counted repeat of a group that has a group inside it is written only outside another
-    /// repeat (which runs the loop's copies again) and with no flag switch in the group.
+    /// repeat (which runs the loop's copies again). A flag switch in the group does not stop it
+    /// (#6358): the loop rewrite scopes the switch over what it reaches.
     #[test]
-    fn leaves_a_counted_repeat_of_a_group_with_a_group_inside_in_a_repeat_or_beside_a_switch() {
-        assert_eq!(rewritten("((a)|(?i)b*){2,}"), None);
+    fn writes_a_counted_repeat_of_a_group_with_a_group_inside_beside_a_switch_but_not_in_a_repeat()
+    {
+        assert!(rewritten("((a)|(?i)b*){2,}").is_some_and(|plain| !plain.contains("{2,}")));
         let nested = rewritten("(?:((a)|b*){2,})*").expect("the outer loop is rewritten");
         assert!(nested.contains("{2,}"), "{nested}");
         assert!(rewritten("((a)|b*){2,}").is_some_and(|plain| !plain.contains("{2,}")));
@@ -450,13 +464,15 @@ mod tests {
     #[test]
     fn leaves_every_other_repeat_alone() {
         // No group, a body that cannot match empty, a lazy repeat, a counted repeat from 2 up over
-        // a group that is not a capture group, a bounded one, an assertion in the body, and `U`.
+        // a group that is not a capture group and holds nothing but one (it agrees), a bounded one, an assertion in the body, and `U`.
         for pattern in [
             "a*b",
             "(?:a*)*b",
             "(a+)*b",
             "(a*)*?b",
             "(?:(a*)){2,}b",
+            "(?:a|b*){2,}",
+            "(?:a*){3,}x",
             "(a*){0,5}b",
             "(a|$)*",
             r"(a|\b)*b",

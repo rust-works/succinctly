@@ -131,13 +131,14 @@ fn test_loops_the_engines_agree_on_are_unchanged_6106() -> Result<()> {
 /// as jq's loop does (#6301): `["b","",""]`. (A pattern that goes to `fancy-regex` used to keep the
 /// longer match too; it no longer does since #6128, pinned in `i6128.rs`.)
 #[test]
-fn test_a_capture_still_matches_longer_and_a_flag_switch_no_longer_does_6106() -> Result<()> {
+fn test_a_flag_switch_and_a_capture_beside_it_both_end_the_loop_at_its_empty_way_6106() -> Result<()>
+{
     assert_rows(&[
         // #6310, #6332: a group in any position is rewritten, with the groups copied; one beside a
-        // flag switch keeps the longer match (`["","a","",""]` in jq).
+        // flag switch too since #6358 (it kept the longer match, `["","ab",""]`, before).
         (
             r#""bab" | [match("(?:(a)?|(?i)b)*"; "g") | .string]"#,
-            r#"["","ab",""]"#,
+            r#"["","a","",""]"#,
         ),
         (
             r#""ba" | [match("(?:(?i)b*|a)+"; "g") | .string]"#,
