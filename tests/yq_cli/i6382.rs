@@ -28,6 +28,13 @@ fn test_a_line_after_a_quoted_or_flow_explicit_key_is_refused_6382() -> Result<(
         "- ? \"a\"\n    b\n  : v\n",
         "? \"a\"\n\n  b\n: v\n",
         "? [a, b]\n  k: v\n: w\n",
+        "? [a,\n  b]\n  c\n: v\n",
+        "? \"a\n  b\"\n  c\n: v\n",
+        "? \"a\"\n  # c\n  b\n: v\n",
+        "? !!str \"a\"\n  b\n: v\n",
+        "? &x \"a\"\n  b\n: v\n",
+        "? \"a\"\r\n  b\r\n: v\r\n",
+        "? [a]\r\n  b\r\n: v\r\n",
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, ARGS)?;
         assert_ne!(code, 0, "{doc:?} should be refused, got {stdout:?}");
@@ -53,6 +60,9 @@ fn test_a_quoted_or_flow_explicit_key_still_reads_when_nothing_strays_6382() -> 
         ("? {a: b}\n: v\n", "{\"\":\"v\"}"),
         ("k:\n  ? \"a\"\n  : v\n", "{\"k\":{\"a\":\"v\"}}"),
         ("- ? [a]\n  : v\n", "[{\"\":\"v\"}]"),
+        ("? !!str \"a\"\n: v\n", "{\"a\":\"v\"}"),
+        ("? \"a\"\r\n: v\r\n", "{\"a\":\"v\"}"),
+        ("? \"a\"\n  # c\n: v\n", "{\"a\":\"v\"}"),
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, ARGS)?;
         assert_eq!(
