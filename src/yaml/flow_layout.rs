@@ -2,7 +2,8 @@
 //! (#2708, #6334). Shared by the DOM emitter of `succinctly yq` and the cursor route, which stream
 //! the same collections through different walkers.
 
-use alloc::string::String;
+use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 /// One element of a flow collection being rendered: its text, and the line comment
@@ -16,8 +17,9 @@ pub struct FlowItem {
     pub container: bool,
 }
 
-/// The indent a flow collection's elements continue at after a line break (#2708):
-/// go-yaml's `emitter.indent` once it has entered the collection. The collection's
+/// The indent a flow collection's elements continue at after a line break (#2708).
+///
+/// That is go-yaml's `emitter.indent` once it has entered the collection. The collection's
 /// caller computed that as `indent`, except at the document root, where it is empty
 /// and the first flow level is one step in.
 #[must_use]
@@ -25,10 +27,10 @@ pub fn flow_continuation(indent: &str, step: &str) -> String {
     if indent.is_empty() { step } else { indent }.to_string()
 }
 
-/// A flow collection's text, `[a, b]` or `{k: v}`, with any element line comments
-/// placed the way go-yaml places them (#2708). `continuation` is the indent the
-/// elements continue at after a line break and `owner` the indent of the container
-/// the collection sits in, where a closing `]` goes.
+/// A flow collection's text, `[a, b]` or `{k: v}`, with element line comments placed as go-yaml does.
+///
+/// `continuation` is the indent the elements continue at after a line break (#2708) and `owner`
+/// the indent of the container the collection sits in, where a closing `]` goes.
 ///
 /// A `#` comment runs to the end of the line, so a commented element breaks the
 /// line. After a scalar (an alias too) the comma comes first (`[1, # c`) and the

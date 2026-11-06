@@ -10167,7 +10167,7 @@ fn flow_comment_layout(
     nested_flow: Option<(&str, usize)>,
 ) -> Option<(String, String)> {
     if indent_spaces != 0 {
-        let step: String = core::iter::repeat_n(unit, indent_spaces).collect();
+        let step: String = (0..indent_spaces).map(|_| unit).collect();
         let owner = &indent[..indent.len().saturating_sub(indent_spaces)];
         return Some((flow_continuation(indent, &step), String::from(owner)));
     }
