@@ -74,6 +74,8 @@ mod advance_positions;
 pub(crate) mod encode_style;
 mod end_positions;
 mod error;
+#[doc(hidden)]
+pub mod flow_layout;
 mod index;
 mod light;
 mod line_break;

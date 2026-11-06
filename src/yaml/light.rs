@@ -26,6 +26,7 @@ use super::encode_style::{
     has_unwritable_char, has_unwritable_char_in_block, write_go_yaml_double_quoted,
     write_go_yaml_single_quoted, write_go_yaml_string,
 };
+use super::flow_layout::{flow_continuation, render_flow, FlowItem};
 use super::index::YamlIndex;
 use super::line_break::{blank_line_between, is_line_break, line_break_len};
 use super::scalar::{
@@ -1721,8 +1722,6 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     return Ok(out.write_str("{}")?);
                 }
                 if indent_spaces == 0 || (!known_not_flow && self.style() == "flow") {
-                    // Flow style
-                    out.write_char('{')?;
                     let mut items: Vec<_> = fields.into_iter().collect();
                     if sort_keys {
                         let mut keyed: Vec<_> = items
@@ -1732,6 +1731,44 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         keyed.sort_by(|a, b| a.0.cmp(&b.0));
                         items = keyed.into_iter().map(|(_, field)| field).collect();
                     }
+                    // #6334: as for a flow sequence, an entry's own comment is laid out after its
+                    // comma.
+                    if let Some((continuation, owner)) =
+                        flow_comment_layout(indent, indent_spaces, unit, nested_flow).filter(|_| {
+                            self.index.has_comments()
+                                && items
+                                    .iter()
+                                    .any(|field| field.value_cursor().line_comment_raw().is_some())
+                        })
+                    {
+                        let child_flow = if indent_spaces != 0 {
+                            Some((indent, indent_spaces))
+                        } else {
+                            nested_flow
+                        };
+                        let mut entries = Vec::with_capacity(items.len());
+                        for field in &items {
+                            let mut text = String::new();
+                            write_yaml_field_key(&mut text, *field, true)?;
+                            text.push_str(": ");
+                            write_yaml_child_inline(
+                                &mut text,
+                                field.value_cursor(),
+                                unit,
+                                sort_keys,
+                                child_flow,
+                            )?;
+                            entries.push(flow_item_of(
+                                text,
+                                field.value_cursor(),
+                                field.value_cursor(),
+                            ));
+                        }
+                        let rendered = render_flow('{', '}', entries, &continuation, &owner);
+                        return Ok(out.write_str(&rendered)?);
+                    }
+                    // Flow style
+                    out.write_char('{')?;
                     let last_index = items.len() - 1;
                     for (i, field) in items.into_iter().enumerate() {
                         if i != 0 {
@@ -1971,6 +2008,31 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // itself, so `self.style()` here already sees a flow-style
                 // deferred value (e.g. `-\n  [1, 2]\n`) correctly.
                 if indent_spaces == 0 || (!known_not_flow && self.style() == "flow") {
+                    // #6334: an element's own comment breaks the line, which go-yaml lays out
+                    // after the comma and before the next element.
+                    if let Some((continuation, owner)) =
+                        flow_comment_layout(indent, indent_spaces, unit, nested_flow).filter(|_| {
+                            self.index.has_comments() && flow_elements_have_line_comment(elements)
+                        })
+                    {
+                        let child_flow = if indent_spaces != 0 {
+                            Some((indent, indent_spaces))
+                        } else {
+                            nested_flow
+                        };
+                        let mut items = Vec::new();
+                        let mut elems = elements;
+                        while let Some((cursor, rest)) = elems.uncons_cursor() {
+                            let mut text = String::new();
+                            write_yaml_child_inline(
+                                &mut text, cursor, unit, sort_keys, child_flow,
+                            )?;
+                            items.push(flow_item_of(text, cursor, cursor));
+                            elems = rest;
+                        }
+                        let rendered = render_flow('[', ']', items, &continuation, &owner);
+                        return Ok(out.write_str(&rendered)?);
+                    }
                     // Flow style
                     out.write_char('[')?;
                     let mut first = true;
@@ -10093,6 +10155,61 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
     Ok(())
 }
 
+/// Where a flow collection's elements continue after a line break and where its closing `]` goes
+/// (#6334), or `None` for the compact output that has no indent. A collection written at `indent`
+/// continues at the indent of its own elements and closes one step above `indent`, the indent its
+/// value is written at; one inside another flow collection is written with `indent_spaces` 0 and
+/// takes its elements' indent from `nested_flow`, as the collection around it computed it.
+fn flow_comment_layout(
+    indent: &str,
+    indent_spaces: usize,
+    unit: char,
+    nested_flow: Option<(&str, usize)>,
+) -> Option<(String, String)> {
+    if indent_spaces != 0 {
+        let step: String = (0..indent_spaces).map(|_| unit).collect();
+        let owner = &indent[..indent.len().saturating_sub(indent_spaces)];
+        return Some((flow_continuation(indent, &step), String::from(owner)));
+    }
+    nested_flow.map(|(items, step)| {
+        (
+            String::from(items),
+            String::from(&items[..items.len().saturating_sub(step)]),
+        )
+    })
+}
+
+fn flow_elements_have_line_comment<W: AsRef<[u64]>>(elements: YamlElements<'_, W>) -> bool {
+    let mut elems = elements;
+    while let Some((cursor, rest)) = elems.uncons_cursor() {
+        if cursor.line_comment_raw().is_some() {
+            return true;
+        }
+        elems = rest;
+    }
+    false
+}
+
+/// A flow collection's element as [`render_flow`] lays it out (#6334; `flow_item` in `yq_runner.rs` is
+/// the same decision for the DOM route): its text, the comment on
+/// `commented`, and whether `shape` is a collection that is not an alias, which a comment follows
+/// differently from a scalar.
+fn flow_item_of<W: AsRef<[u64]>>(
+    text: String,
+    commented: YamlCursor<'_, W>,
+    shape: YamlCursor<'_, W>,
+) -> FlowItem {
+    FlowItem {
+        text,
+        comment: commented.line_comment_raw().map(String::from),
+        container: !shape.is_alias()
+            && matches!(
+                shape.value(),
+                YamlValue::Sequence(_) | YamlValue::Mapping(_)
+            ),
+    }
+}
+
 /// Write the last item's own trailing comment in a flow-style sequence or
 /// mapping, if present, followed by a newline and reindent to the
 /// container's own indentation (issue #794).
@@ -10107,6 +10224,9 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
 /// this way - a comment on a middle item would need to avoid also
 /// swallowing the following `,` onto the same line, which no filed issue
 /// currently asks for.
+///
+/// A flow collection with an element comment is laid out by [`render_flow`] instead (#6334); this
+/// remains for the compact (`indent_spaces` 0) output, which has no indent to continue at.
 fn write_flow_last_item_comment<Out: core::fmt::Write>(
     out: &mut Out,
     comment: Option<&str>,

@@ -33,6 +33,7 @@ use succinctly::jq::{
 use succinctly::json::light::JsonCursor;
 use succinctly::json::validate;
 use succinctly::json::JsonIndex;
+use succinctly::yaml::flow_layout::{flow_continuation, render_flow, FlowItem};
 use succinctly::yaml::{
     deeper_yaml_indent, format_float_yq_yaml, format_float_yq_yaml_nested, go_yaml_block_scalar,
     go_yaml_dom_scalar, go_yaml_double_quoted_scalar, go_yaml_explicit_key_scalar,
@@ -9207,7 +9208,7 @@ fn emit_yaml_value_at_depth(
                             Some(anchor) => format!("&{anchor} {item}"),
                             None => item,
                         };
-                        FlowItem::new(item, v, elem_comments)
+                        flow_item(item, v, elem_comments)
                     })
                     .collect();
                 let rendered = render_flow('[', ']', items, &ci, owner_indent);
@@ -9387,7 +9388,7 @@ fn emit_yaml_value_at_depth(
                         );
                         // `{x: &y 1, z: *y}` (#763).
                         let anchor = anchor_decl_prefix(field_comments);
-                        FlowItem::new(format!("{key}:{anchor} {val}"), v, field_comments)
+                        flow_item(format!("{key}:{anchor} {val}"), v, field_comments)
                     })
                     .collect();
                 let rendered = render_flow('{', '}', entries, &ci, owner_indent);
@@ -9667,35 +9668,16 @@ fn can_single_quote(s: &str) -> bool {
     !s.chars().any(|c| c.is_ascii_control()) && !succinctly::yaml::has_unwritable_char(s)
 }
 
-/// One element of a flow collection being rendered: its text, and the line comment
-/// it carries (#2708).
-struct FlowItem {
-    text: String,
-    /// The element's own trailing comment, `#` and all, possibly several lines.
-    comment: Option<String>,
-    /// Whether the element is itself a collection (empty or not), which takes its
-    /// comment differently from a scalar. An alias to one is not: it is written `*x`.
-    container: bool,
-}
-
-impl FlowItem {
-    fn new(text: String, value: &OwnedValue, comments: &CommentTree) -> Self {
-        let container = comments.alias_name().is_none()
-            && matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
-        Self {
-            text,
-            comment: comments.own().map(str::to_string),
-            container,
-        }
+/// A flow collection's element, with the line comment it carries (#2708): the text is the
+/// element as the emitter wrote it.
+fn flow_item(text: String, value: &OwnedValue, comments: &CommentTree) -> FlowItem {
+    let container = comments.alias_name().is_none()
+        && matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
+    FlowItem {
+        text,
+        comment: comments.own().map(str::to_string),
+        container,
     }
-}
-
-/// The indent a flow collection's elements continue at after a line break (#2708):
-/// go-yaml's `emitter.indent` once it has entered the collection. The collection's
-/// caller computed that as `indent`, except at the document root, where it is empty
-/// and the first flow level is one step in.
-fn flow_continuation(indent: &str, step: &str) -> String {
-    if indent.is_empty() { step } else { indent }.to_string()
 }
 
 /// A flow collection nested in the one continuing at `continuation` continues at the
@@ -9708,87 +9690,6 @@ fn flow_child_indent(continuation: &str, step: &str) -> String {
         return continuation.to_string();
     }
     " ".repeat(width * ((continuation.len() + width) / width))
-}
-
-/// A flow collection's text, `[a, b]` or `{k: v}`, with any element line comments
-/// placed the way go-yaml places them (#2708). `continuation` is the indent the
-/// elements continue at after a line break and `owner` the indent of the container
-/// the collection sits in, where a closing `]` goes.
-///
-/// A `#` comment runs to the end of the line, so a commented element breaks the
-/// line. After a scalar (an alias too) the comma comes first (`[1, # c`) and the
-/// next element continues on the next line at `continuation`; when it was the last,
-/// go-yaml has written a trailing comma and the closing bracket gets a line of its
-/// own. After a collection (an empty one too) the comment follows the closing
-/// bracket with no comma (`[[1] # c`) and the comma opens the next line at column 0
-/// (`, 2]`). A further line of a multi-line comment sits at `continuation`. A `]`
-/// closes at `owner`, but a `}` always at column 0, which go-yaml does not do
-/// consistently. Without a comment this is the elements joined by `, `.
-///
-/// Out of line to keep the recursive emitter's frame small (see
-/// `emit_yaml_value_panics_past_nesting_depth_limit_1017`).
-#[inline(never)]
-fn render_flow(
-    open: char,
-    close: char,
-    items: Vec<FlowItem>,
-    continuation: &str,
-    owner: &str,
-) -> String {
-    if items.iter().all(|item| item.comment.is_none()) {
-        let joined = items
-            .into_iter()
-            .map(|item| item.text)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return format!("{open}{joined}{close}");
-    }
-    #[derive(PartialEq)]
-    enum Pending {
-        Nothing,
-        AfterScalar,
-        AfterCollection,
-    }
-    let mut out = String::from(open);
-    let mut pending = Pending::Nothing;
-    for (i, item) in items.into_iter().enumerate() {
-        match pending {
-            Pending::Nothing if i > 0 => out.push_str(", "),
-            Pending::Nothing => {}
-            Pending::AfterScalar => {
-                out.push('\n');
-                out.push_str(continuation);
-            }
-            Pending::AfterCollection => out.push_str("\n, "),
-        }
-        out.push_str(&item.text);
-        pending = Pending::Nothing;
-        if let Some(comment) = item.comment {
-            let mut lines = comment.split('\n');
-            out.push_str(if item.container { " " } else { ", " });
-            out.push_str(lines.next().unwrap_or_default());
-            for line in lines {
-                out.push('\n');
-                if !line.is_empty() {
-                    out.push_str(continuation);
-                    out.push_str(line);
-                }
-            }
-            pending = if item.container {
-                Pending::AfterCollection
-            } else {
-                Pending::AfterScalar
-            };
-        }
-    }
-    if pending != Pending::Nothing {
-        out.push('\n');
-        if close == ']' {
-            out.push_str(owner);
-        }
-    }
-    out.push(close);
-    out
 }
 
 /// go-yaml writes a `,` before the `}` of a non-empty flow mapping that owns a foot comment

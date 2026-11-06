@@ -6285,6 +6285,30 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// [`Self::skip_flow_whitespace`] where a comment on the line the cursor starts on, after the
+    /// element at `owner_bp_pos` or its comma, is that element's own line comment (#6334):
+    /// `[a, # c` / `  b]`. A comment on a line of its own is skipped, as before.
+    fn skip_flow_whitespace_noting_line_comment(&mut self, owner_bp_pos: Option<usize>) {
+        let mut same_line = true;
+        while let Some(b) = self.peek() {
+            match b {
+                b' ' | b'\t' => self.advance(),
+                b'\n' | b'\r' => {
+                    same_line = false;
+                    self.advance();
+                }
+                b'#' => {
+                    if let Some(owner) = owner_bp_pos.filter(|_| same_line) {
+                        self.maybe_capture_line_comment(owner);
+                    }
+                    same_line = false;
+                    self.skip_to_eol();
+                }
+                _ => break,
+            }
+        }
+    }
+
     /// Check if current position starts an implicit mapping entry in flow context.
     /// Returns true if there's a `key : value` pattern (colon followed by space).
     /// This is used to detect patterns like `[ YAML : separate ]`.
@@ -6814,6 +6838,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Parse items
         let mut first = true;
+        // The element the cursor is after, which a comment on the same line belongs to (#6334).
+        let mut prev_element: Option<usize> = None;
         while self.peek() != Some(b']') {
             if self.peek().is_none() {
                 return Err(YamlError::UnexpectedEof {
@@ -6841,7 +6867,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
                 let comma_pos = self.pos;
                 self.advance(); // Skip `,`
-                self.skip_flow_whitespace();
+                self.skip_flow_whitespace_noting_line_comment(prev_element);
 
                 // #2279: `[1,,2]` -- a second `,` where an element belongs
                 // (#2886: in YAML input too, as in go-yaml).
@@ -6865,6 +6891,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
             }
             first = false;
+            prev_element = None;
 
             // #4558: an item that opens with a `:` and a blank (`[: x]`, `[a, : x]`) is an empty
             // key yq rejects ("did not find expected node content"); a `:` straight before
@@ -6877,6 +6904,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // lookaheads scan up to the element's own length, not O(1), so
             // they're hoisted into locals and reused below rather than
             // re-run by the json_strict check and the dispatch separately.
+            let element_bp = self.bp_pos;
             let is_explicit_key = self.looks_like_explicit_flow_key();
             let is_mapping_entry = is_explicit_key || self.looks_like_flow_mapping_entry();
             if self.json_strict && is_mapping_entry {
@@ -6901,8 +6929,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // (`[&x a, *x]`, `[!!str a]`), so it's consumed only now that
                 // the pair check has ruled that out.
                 self.parse_flow_value_node()?;
+                prev_element = Some(element_bp);
             }
-            self.skip_flow_whitespace();
+            self.skip_flow_whitespace_noting_line_comment(prev_element);
         }
 
         // Skip `]`
@@ -7154,6 +7183,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     fn parse_yaml_flow_mapping_entries(&mut self) -> Result<(), YamlError> {
         // Parse key-value pairs
         let mut first = true;
+        // The value the cursor is after, which a comment on the same line belongs to (#6334).
+        let mut prev_value: Option<usize> = None;
         while self.peek() != Some(b'}') {
             if self.peek().is_none() {
                 return Err(YamlError::UnexpectedEof {
@@ -7176,7 +7207,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     );
                 }
                 self.advance(); // Skip `,`
-                self.skip_flow_whitespace();
+                self.skip_flow_whitespace_noting_line_comment(prev_value);
 
                 // `{a: 1,,b: 2}` -- a second `,` where an entry belongs.
                 if self.peek() == Some(b',') {
@@ -7190,6 +7221,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
             let first_entry = first;
             first = false;
+            prev_value = None;
 
             // `? ` is a node marker, not key text: consume it *before* the interest bit
             // is planted, or the indicator and the space after it land inside the key's
@@ -7253,7 +7285,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.skip_flow_whitespace();
                 self.reject_explicit_key_after_implicit_key()?;
 
+                // A value that is absent (`{a: , b: 1}`) has no node for a comment to follow.
+                let has_value = !matches!(self.peek(), Some(b',' | b'}'));
+                let value_bp = self.bp_pos;
                 self.parse_flow_value_node()?;
+                prev_value = has_value.then_some(value_bp);
             } else if matches!(self.peek(), Some(b',' | b'}')) {
                 // Key without colon/value - emit empty value (implicit null)
                 self.set_ib();
@@ -7267,7 +7303,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 ));
             }
 
-            self.skip_flow_whitespace();
+            self.skip_flow_whitespace_noting_line_comment(prev_value);
         }
 
         Ok(())
