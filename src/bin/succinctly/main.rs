@@ -376,6 +376,11 @@ struct BenchJqArgs {
     #[arg(long, default_value = "./target/release/succinctly")]
     binary: PathBuf,
 
+    /// The jq to compare against (a bare name is looked up on PATH). The pinned
+    /// jq 1.7.1 is target/compare/jq-1.7.1/bin/jq, built by `dev compare jq --build-jq`
+    #[arg(long, default_value = "jq")]
+    jq: PathBuf,
+
     /// Skip memory measurement (memory is collected by default)
     #[arg(long)]
     no_memory: bool,
@@ -2261,6 +2266,7 @@ fn run_jq_benchmark(args: BenchJqArgs) -> Result<()> {
         sizes,
         queries,
         succinctly_binary: args.binary,
+        jq_binary: args.jq,
         warmup_runs: args.warmup,
         benchmark_runs: args.runs,
         memory_mode: !args.no_memory,
@@ -3327,6 +3333,7 @@ mod tests {
             warmup: 0,
             runs: 1,
             binary: PathBuf::from(binary),
+            jq: PathBuf::from("jq"),
             no_memory: true,
         }
     }
@@ -3387,6 +3394,20 @@ mod tests {
         assert!(
             msg.contains("jq not found") || msg.contains("binary not found"),
             "unexpected error: {msg}"
+        );
+    }
+
+    /// #5409: `--jq` reaches the benchmark, which refuses a jq it cannot run before timing
+    /// anything (the old runner always ran the `jq` on `PATH`).
+    #[test]
+    fn test_run_jq_benchmark_uses_the_given_jq() {
+        let mut args = bench_jq_args("arrays", "1kb", "identity", "./nonexistent");
+        args.jq = PathBuf::from("/nonexistent/jq-for-bench-test");
+        let err = run_jq_benchmark(args).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("jq not found at `/nonexistent/jq-for-bench-test`"),
+            "unexpected error: {err}"
         );
     }
 

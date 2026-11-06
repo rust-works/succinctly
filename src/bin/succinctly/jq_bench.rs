@@ -1,4 +1,8 @@
-//! jq benchmarking module - compares succinctly jq vs system jq.
+//! jq benchmarking module - compares succinctly jq vs a jq binary (`--jq`, default `jq` on `PATH`).
+//!
+//! The two tools are interleaved within every repetition, the order flipping each rep, per rule 1
+//! of docs/guides/benchmarking.md (#5409): running all of jq's reps and then all of succinctly's
+//! lets thermal drift land on whichever tool runs second.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -220,6 +224,9 @@ pub struct BenchConfig {
     pub sizes: Vec<String>,
     pub queries: Vec<QueryType>,
     pub succinctly_binary: PathBuf,
+    /// The jq to compare against: a bare name is looked up on `PATH`. The pinned build is
+    /// `target/compare/jq-1.7.1/bin/jq` (`dev compare jq --build-jq`).
+    pub jq_binary: PathBuf,
     pub warmup_runs: usize,
     pub benchmark_runs: usize,
     /// Include memory comparison in output (default: true)
@@ -253,6 +260,7 @@ impl Default for BenchConfig {
             ],
             queries: vec![QueryType::Identity],
             succinctly_binary: PathBuf::from("./target/release/succinctly"),
+            jq_binary: PathBuf::from("jq"),
             warmup_runs: 1,
             benchmark_runs: 3,
             memory_mode: true,
@@ -268,8 +276,8 @@ pub fn run_benchmark(
 ) -> Result<Vec<BenchmarkResult>> {
     let mut results = Vec::new();
 
-    // Check that jq is available
-    check_jq_available()?;
+    // Check that jq is available, and record which one the tables were measured against
+    let jq_version = check_jq_available(&config.jq_binary)?;
 
     // Check that succinctly binary exists
     if !config.succinctly_binary.exists() {
@@ -294,6 +302,7 @@ pub fn run_benchmark(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    eprintln!("  jq: {} ({jq_version})", config.jq_binary.display());
     eprintln!("  Warmup runs: {}", config.warmup_runs);
     eprintln!("  Benchmark runs: {}", config.benchmark_runs);
     eprintln!();
@@ -369,7 +378,8 @@ pub fn run_benchmark(
 
     // Generate markdown output (even if interrupted)
     if let Some(md_path) = output_md {
-        let markdown = generate_markdown(&results, config.memory_mode);
+        let method = method_line(&config.jq_binary, &jq_version, config.benchmark_runs);
+        let markdown = generate_markdown(&results, config.memory_mode, &method);
         std::fs::write(md_path, markdown)?;
     }
 
@@ -431,23 +441,12 @@ fn benchmark_file(
     let filesize = std::fs::metadata(file_path)?.len();
     let query = query_type.query();
 
-    // Warmup runs
-    for _ in 0..config.warmup_runs {
-        let _ = run_jq(file_path, query);
-        let _ = run_succinctly(file_path, &config.succinctly_binary, query);
-    }
-
-    // Benchmark runs for jq
-    let mut jq_results = Vec::new();
-    for _ in 0..config.benchmark_runs {
-        jq_results.push(run_jq(file_path, query)?);
-    }
-
-    // Benchmark runs for succinctly
-    let mut succ_results = Vec::new();
-    for _ in 0..config.benchmark_runs {
-        succ_results.push(run_succinctly(file_path, &config.succinctly_binary, query)?);
-    }
+    let (jq_results, succ_results) = interleaved_reps(
+        config.warmup_runs,
+        config.benchmark_runs,
+        || run_jq(file_path, &config.jq_binary, query),
+        || run_succinctly(file_path, &config.succinctly_binary, query),
+    )?;
 
     // Take median of wall time
     let jq_result = select_median(jq_results);
@@ -473,6 +472,61 @@ fn benchmark_file(
     })
 }
 
+/// Which tool runs first in repetition `rep`: jq on even reps, succinctly on odd ones, so neither
+/// tool always runs second (#5409; benchmarking.md rule 1).
+fn rep_order(rep: usize) -> [Tool; 2] {
+    if rep % 2 == 0 {
+        [Tool::Jq, Tool::Succinctly]
+    } else {
+        [Tool::Succinctly, Tool::Jq]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Jq,
+    Succinctly,
+}
+
+/// Run `warmup` untimed and then `runs` timed repetitions, each running both tools in
+/// [`rep_order`]'s order. Returns the timed results per tool, in rep order. A warmup's error is
+/// ignored (as before); a timed rep's error aborts the row.
+fn interleaved_reps<T>(
+    warmup: usize,
+    runs: usize,
+    mut run_jq: impl FnMut() -> Result<T>,
+    mut run_succinctly: impl FnMut() -> Result<T>,
+) -> Result<(Vec<T>, Vec<T>)> {
+    for rep in 0..warmup {
+        for tool in rep_order(rep) {
+            let _ = match tool {
+                Tool::Jq => run_jq(),
+                Tool::Succinctly => run_succinctly(),
+            };
+        }
+    }
+    let mut jq = Vec::with_capacity(runs);
+    let mut succinctly = Vec::with_capacity(runs);
+    for rep in 0..runs {
+        for tool in rep_order(rep) {
+            match tool {
+                Tool::Jq => jq.push(run_jq()?),
+                Tool::Succinctly => succinctly.push(run_succinctly()?),
+            }
+        }
+    }
+    Ok((jq, succinctly))
+}
+
+/// The markdown header line naming the jq the tables were measured against and the method.
+fn method_line(jq_binary: &Path, jq_version: &str, runs: usize) -> String {
+    format!(
+        "**jq**: {jq_version} (`{}`). **Method**: the two tools interleaved within each repetition, \
+         order alternating; median wall time of {runs} run(s).",
+        jq_binary.display()
+    )
+}
+
 /// Select the run with median wall time
 fn select_median(mut results: Vec<ToolResult>) -> ToolResult {
     if results.is_empty() {
@@ -482,9 +536,12 @@ fn select_median(mut results: Vec<ToolResult>) -> ToolResult {
     results.remove(results.len() / 2)
 }
 
-/// Run system jq and measure
-fn run_jq(file_path: &Path, query: &str) -> Result<ToolResult> {
-    run_command_with_timing("jq", &[query, file_path.to_str().unwrap()])
+/// Run the configured jq and measure
+fn run_jq(file_path: &Path, jq_binary: &Path, query: &str) -> Result<ToolResult> {
+    run_command_with_timing(
+        jq_binary.to_str().unwrap(),
+        &[query, file_path.to_str().unwrap()],
+    )
 }
 
 /// Run succinctly jq and measure
@@ -645,12 +702,27 @@ fn parse_linux_times(stderr: &str) -> (f64, f64) {
     (user, sys)
 }
 
-/// Check if jq is available
-fn check_jq_available() -> Result<()> {
-    Command::new("jq").arg("--version").output().context(
-        "jq not found. Please install jq: brew install jq (macOS) or apt install jq (Linux)",
-    )?;
-    Ok(())
+/// Check that `jq_binary` runs, and return its `--version` line
+fn check_jq_available(jq_binary: &Path) -> Result<String> {
+    let output = Command::new(jq_binary)
+        .arg("--version")
+        .output()
+        .with_context(|| {
+            format!(
+                "jq not found at `{}`. Pass --jq <path> (the pinned build is \
+                 target/compare/jq-1.7.1/bin/jq), or install jq: brew install jq (macOS) or \
+                 apt install jq (Linux)",
+                jq_binary.display()
+            )
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`{} --version` exited with {}",
+            jq_binary.display(),
+            output.status
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Get CPU information for the current system
@@ -684,11 +756,12 @@ fn get_cpu_info() -> String {
 }
 
 /// Generate markdown tables from results
-pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> String {
+pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool, method: &str) -> String {
     let mut md = String::new();
 
     md.push_str("# jq vs succinctly Benchmark Results\n\n");
     md.push_str("Generated by `succinctly bench run jq_bench`\n\n");
+    md.push_str(&format!("{method}\n\n"));
 
     // Add CPU info
     let cpu_info = get_cpu_info();
@@ -1049,7 +1122,7 @@ mod tests {
             mk_result(QueryType::Identity, 111.0, 22.0),
             mk_result(QueryType::Map, 333.0, 44.0),
         ];
-        let md = generate_markdown(&results, false);
+        let md = generate_markdown(&results, false, "**Method**: test");
 
         let identity_header = format!(
             "## Query: `{}` ({})",
@@ -1094,10 +1167,97 @@ mod tests {
         assert!(!map_section.contains("22.0ms"));
     }
 
+    /// #5409: each repetition runs both tools, the order flipping every rep, warmups included,
+    /// and only the timed reps are returned (benchmarking.md rule 1).
+    #[test]
+    fn reps_interleave_the_tools_and_alternate_the_order() {
+        use std::cell::RefCell;
+        let log = RefCell::new(Vec::new());
+        let (jq, succ) = interleaved_reps(
+            2,
+            3,
+            || {
+                let mut l = log.borrow_mut();
+                l.push("jq");
+                Ok(l.len())
+            },
+            || {
+                let mut l = log.borrow_mut();
+                l.push("succ");
+                Ok(l.len())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            log.into_inner(),
+            [
+                // warmup reps 0 and 1
+                "jq", "succ", "succ", "jq", //
+                // timed reps 0, 1 and 2
+                "jq", "succ", "succ", "jq", "jq", "succ",
+            ]
+        );
+        // The values are the call positions: the warmups' four are discarded.
+        assert_eq!(jq, [5, 8, 9]);
+        assert_eq!(succ, [6, 7, 10]);
+    }
+
+    #[test]
+    fn a_failed_timed_rep_aborts_and_a_failed_warmup_does_not() {
+        let mut calls = 0;
+        let err = interleaved_reps(
+            1,
+            2,
+            || -> Result<()> {
+                calls += 1;
+                if calls == 1 {
+                    anyhow::bail!("warmup failure is ignored")
+                }
+                anyhow::bail!("timed failure")
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "timed failure");
+        assert_eq!(calls, 2, "the row stops at the first timed failure");
+    }
+
+    #[test]
+    fn the_markdown_names_the_jq_and_the_method() {
+        let method = method_line(Path::new("target/compare/jq-1.7.1/bin/jq"), "jq-1.7.1", 5);
+        assert_eq!(
+            method,
+            "**jq**: jq-1.7.1 (`target/compare/jq-1.7.1/bin/jq`). **Method**: the two tools \
+             interleaved within each repetition, order alternating; median wall time of 5 run(s)."
+        );
+        let md = generate_markdown(&[mk_result(QueryType::Identity, 10.0, 5.0)], false, &method);
+        let header: Vec<&str> = md.lines().take(6).collect();
+        assert_eq!(header[4], method, "{md}");
+    }
+
+    #[test]
+    fn a_missing_jq_is_named_in_the_error() {
+        let err = check_jq_available(Path::new("/nonexistent/jq-for-test")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("jq not found at `/nonexistent/jq-for-test`") && msg.contains("--jq"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_jq_whose_version_fails_is_refused() {
+        let err = check_jq_available(Path::new("false")).unwrap_err();
+        assert!(
+            err.to_string().contains("`false --version` exited"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn test_generate_markdown_single_query_omits_query_headers() {
         let results = vec![mk_result(QueryType::Identity, 10.0, 5.0)];
-        let md = generate_markdown(&results, false);
+        let md = generate_markdown(&results, false, "**Method**: test");
 
         assert!(
             !md.contains("## Query:"),
