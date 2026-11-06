@@ -3253,6 +3253,44 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// [`Self::skip_to_eol`] eight bytes at a time, and whether the bytes it passed held a tab (#6287).
+    /// Each word is tested for a break byte (exactly: the high bit of every zero byte of the word xor
+    /// the pattern) and for a tab; the first break in a word ends the line, and only the tabs before it
+    /// count.
+    #[inline]
+    fn skip_to_eol_noting_tab(&mut self, saw_tab: &mut bool) {
+        const NL: u64 = 0x0A0A_0A0A_0A0A_0A0A;
+        const CR: u64 = 0x0D0D_0D0D_0D0D_0D0D;
+        const TAB: u64 = 0x0909_0909_0909_0909;
+        let input = self.input;
+        let mut at = self.pos;
+        while at + 8 <= input.len() {
+            let mut word = [0u8; 8];
+            word.copy_from_slice(&input[at..at + 8]);
+            let w = u64::from_le_bytes(word);
+            let tabs = zero_bytes(w ^ TAB);
+            let breaks = if HAS_CR {
+                zero_bytes(w ^ NL) | zero_bytes(w ^ CR)
+            } else {
+                zero_bytes(w ^ NL)
+            };
+            if breaks != 0 {
+                let first = (breaks.trailing_zeros() / 8) as usize;
+                // the tabs in the bytes below the first break
+                *saw_tab |= tabs & ((1u64 << (8 * first)) - 1) != 0;
+                self.pos = at + first;
+                return;
+            }
+            *saw_tab |= tabs != 0;
+            at += 8;
+        }
+        while at < input.len() && !Self::is_break(input[at]) {
+            *saw_tab |= input[at] == b'\t';
+            at += 1;
+        }
+        self.pos = at;
+    }
+
     /// Skip newline and empty/comment lines.
     fn skip_newlines(&mut self) {
         while let Some(b) = self.peek() {
@@ -8143,10 +8181,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         &mut self,
         content_indent: usize,
         chomping: ChompingIndicator,
-    ) -> usize {
+    ) -> Result<usize, YamlError> {
         // Use SIMD to quickly find where the block scalar ends
         let block_end = simd::find_block_scalar_end(self.input, self.pos, content_indent)
             .unwrap_or(self.input.len());
+        let region_start = self.pos;
+        let mut saw_tab = false;
 
         // Now we need to walk through the content to find:
         // 1. last_content_end - position after last non-empty line
@@ -8172,7 +8212,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
                 _ => {
                     // This is a content line - skip to end
-                    self.skip_to_eol();
+                    self.skip_to_eol_noting_tab(&mut saw_tab);
                     last_content_end = self.pos;
                     trailing_newline_start = self.pos;
                     self.skip_line_break();
@@ -8180,11 +8220,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
         }
 
+        // The walk saw a tab: read each one for a Unicode break before it (#6287).
+        if saw_tab {
+            self.reject_tab_after_unicode_break_in_block(region_start, block_end, content_indent)?;
+        }
+
         // Position should now be at block_end
         self.pos = block_end;
 
         // Return position based on chomping
-        match chomping {
+        Ok(match chomping {
             ChompingIndicator::Strip => last_content_end,
             ChompingIndicator::Clip => {
                 // Include one trailing line break if there was content — two
@@ -8196,7 +8241,48 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
             }
             ChompingIndicator::Keep => self.pos, // Include all trailing newlines
+        })
+    }
+
+    /// #6287: go-yaml ends a block scalar's line at U+2028, U+2029 and U+0085 as it does at `\n`, so a
+    /// tab after fewer than `content_indent` spaces on what follows is `found a tab character where an
+    /// indentation space is expected`, as it is after a `\n`. The index keeps those three as content
+    /// (#4913), so the line the scalar scanners walk never ends there. The walk over the scalar's lines
+    /// ([`Self::skip_to_eol_noting_tab`]) says whether it passed a tab at all, which block text rarely
+    /// holds; only then is `start..block_end` searched for them, and each one is read backwards: the
+    /// spaces before it, then whether a break ends there.
+    fn reject_tab_after_unicode_break_in_block(
+        &mut self,
+        start: usize,
+        block_end: usize,
+        content_indent: usize,
+    ) -> Result<(), YamlError> {
+        debug_assert!(
+            start == 0 || Self::is_break(self.input[start - 1]),
+            "a block scalar's text starts a line"
+        );
+        let mut from = start;
+        while let Some(tab) = find_tab_swar(&self.input[..block_end], from) {
+            from = tab + 1;
+            let mut spaces_start = tab;
+            while spaces_start > start && self.input[spaces_start - 1] == b' ' {
+                spaces_start -= 1;
+            }
+            if tab - spaces_start >= content_indent {
+                continue;
+            }
+            if matches!(
+                &self.input[start..spaces_start],
+                [.., 0xE2, 0x80, 0xA8 | 0xA9] | [.., 0xC2, 0x85]
+            ) {
+                self.pos = tab;
+                return Err(YamlError::TabIndentation {
+                    line: self.current_line(),
+                    offset: tab,
+                });
+            }
         }
+        Ok(())
     }
 
     /// Parse a block scalar (| or >) including all content lines.
@@ -8249,7 +8335,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         };
 
         // Consume content lines
-        let content_end = self.consume_block_scalar_content(content_indent, header.chomping);
+        let content_end = self.consume_block_scalar_content(content_indent, header.chomping)?;
 
         // Close the block scalar node. `self.pos` has been advanced past the
         // block region (potentially past blank lines or a following
@@ -10144,6 +10230,34 @@ fn build_semi_index_impl(input: &[u8], mode: BuildMode) -> Result<SemiIndex, Yam
     }
 }
 
+/// The high bit of every zero byte of `x`, exactly: no byte above a zero one is flagged, so the
+/// lowest flag is the first zero byte (#6287).
+#[inline(always)]
+fn zero_bytes(x: u64) -> u64 {
+    const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    !(((x & LOW7) + LOW7) | x | LOW7)
+}
+
+/// The offset of the first tab in `bytes[from..]`, or `None`, eight bytes a step (#6287).
+#[inline]
+fn find_tab_swar(bytes: &[u8], from: usize) -> Option<usize> {
+    const TAB: u64 = 0x0909_0909_0909_0909;
+    let mut at = from;
+    while at + 8 <= bytes.len() {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&bytes[at..at + 8]);
+        let tabs = zero_bytes(u64::from_le_bytes(word) ^ TAB);
+        if tabs != 0 {
+            return Some(at + (tabs.trailing_zeros() / 8) as usize);
+        }
+        at += 8;
+    }
+    bytes[at.min(bytes.len())..]
+        .iter()
+        .position(|&b| b == b'\t')
+        .map(|i| at + i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10181,6 +10295,90 @@ mod tests {
                 "build {:?}",
                 String::from_utf8_lossy(yaml)
             );
+        }
+    }
+
+    /// #6287: the eight-bytes-a-step line skip stops where the plain one stops, from every start, and
+    /// its tab flag is exactly whether a tab lies between the start and the stop, under both
+    /// `HAS_CR` specializations (a CR is a break only under `true`).
+    #[test]
+    fn skip_to_eol_noting_tab_agrees_with_the_plain_skip_6287() {
+        fn check<const HAS_CR: bool>(bytes: &[u8], from: usize) {
+            let mut plain = Parser::<HAS_CR>::new(bytes);
+            plain.pos = from;
+            plain.skip_to_eol();
+            let mut fast = Parser::<HAS_CR>::new(bytes);
+            fast.pos = from;
+            let mut saw_tab = false;
+            fast.skip_to_eol_noting_tab(&mut saw_tab);
+            assert_eq!(
+                fast.pos, plain.pos,
+                "{bytes:?} from {from} (HAS_CR {HAS_CR})"
+            );
+            assert_eq!(
+                saw_tab,
+                bytes[from..plain.pos].contains(&b'\t'),
+                "{bytes:?} from {from} (HAS_CR {HAS_CR})"
+            );
+        }
+        let alphabet: [u8; 8] = [b'a', b'\t', b'\n', b'\r', 0x01, 0x08, 0x0A ^ 0x80, b' '];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..4000 {
+            let len = {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % 40) as usize
+            };
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    // mostly plain text, so a break or a tab lands at every alignment
+                    if seed % 5 == 0 {
+                        alphabet[(seed >> 8) as usize % alphabet.len()]
+                    } else {
+                        b'x'
+                    }
+                })
+                .collect();
+            for from in 0..=len {
+                check::<true>(&bytes, from);
+                // `Parser::<false>` is built for input without a CR only
+                if !bytes.contains(&b'\r') {
+                    check::<false>(&bytes, from);
+                }
+            }
+        }
+    }
+
+    /// #6287: the eight-bytes-a-step tab search agrees with the plain one at every length, start
+    /// and tab position, including the near-misses of the zero-byte test (`0x01` above a tab,
+    /// `0x08` and `0x0A` beside it).
+    #[test]
+    fn find_tab_swar_agrees_with_a_plain_search_6287() {
+        let fills: [u8; 4] = [b'a', 0x01, 0x08, 0x0A];
+        for fill in fills {
+            for len in 0..40usize {
+                for tab in std::iter::once(None).chain((0..len).map(Some)) {
+                    let mut bytes = vec![fill; len];
+                    if let Some(t) = tab {
+                        bytes[t] = b'\t';
+                    }
+                    for from in 0..=len {
+                        let want = bytes[from..]
+                            .iter()
+                            .position(|&b| b == b'\t')
+                            .map(|i| from + i);
+                        assert_eq!(
+                            find_tab_swar(&bytes, from),
+                            want,
+                            "fill {fill:#04x}, len {len}, tab {tab:?}, from {from}"
+                        );
+                    }
+                }
+            }
         }
     }
 
