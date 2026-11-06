@@ -139726,6 +139726,35 @@ mod tests {
         assert_eq!(rewrite_multiline_caret("^a"), None);
     }
 
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_caret_at_the_end_is_checked_on_the_loop_engine_too_6456() {
+        // A loop over a group that can match empty is read through the rewritten engine; its match
+        // that ends at the end of the text is asked of the exact engine as the plain one's is.
+        for pattern in [
+            "(?m)^(a|b*)+\\n?",
+            "(?m)^(b*|a)+\\n?",
+            "(?m)^(a*)*\\n?",
+            "(?m)^(?:(a)|b*)+\\n?",
+        ] {
+            let re = build_regex_uncached::<JqSemantics>(pattern, Some("g")).unwrap();
+            if !matches!(re.engine, RegexEngine::Rewritten { .. }) {
+                continue;
+            }
+            assert!(re.caret_end.is_some(), "{pattern}");
+            let caps = re.captures_at("a\n", 0).unwrap().unwrap();
+            assert_eq!(
+                caps.get(0).map(|m| (m.start(), m.end())),
+                Some((0, 2)),
+                "{pattern}"
+            );
+            // The second search starts at the end: `^` does not hold there, so there is no match.
+            assert!(re.captures_at("a\n", 2).unwrap().is_none(), "{pattern}");
+            return;
+        }
+        panic!("no candidate took the rewritten engine");
+    }
+
     /// #6106: a loop rewritten for Oniguruma's empty-iteration exit is what the `regex` crate
     /// compiles, and a rewrite the crate refuses (here, nested past its limit) falls back to the
     /// pattern as written instead of becoming an error.
