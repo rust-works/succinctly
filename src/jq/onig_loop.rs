@@ -129,10 +129,10 @@ struct Rewriter<'p> {
     /// The empty way of the loop body being converted, set for the one `repeat` call that follows
     /// when `copies` and the body has a capture group (#6332): see [`Rewriter::empty_text`].
     exit: Option<Text>,
-    /// How many enclosing repeats of the part being converted can run their body more than once. A
-    /// loop with groups inside one is left as written (#6332): the enclosing repeat, which the
-    /// rewrite does not reach, takes the empty iteration the loop's rewrite assumes it can end at.
-    repeating: u32,
+    /// How many enclosing repeats of the part being converted are lazy and keep their text as
+    /// written (#6358): a lazy `X*?` or `X+?` is not rewritten, and a loop with groups inside one,
+    /// written with its exit, is not read the way Oniguruma's is, so that loop keeps its own text.
+    lazy_around: u32,
 }
 
 /// Whether a flag switch (`(?i)`, not a flag group) stands anywhere in `ast`.
@@ -169,30 +169,6 @@ fn collect_captures(ast: &Ast, out: &mut Vec<Option<String>>) {
         Ast::Concat(concat) => concat.asts.iter().for_each(|a| collect_captures(a, out)),
         Ast::Repetition(rep) => collect_captures(&rep.ast, out),
         _ => {}
-    }
-}
-
-/// Whether a loop stands anywhere in `ast`: a repeat that can run its body more than once, over a
-/// body that has a repeat or an alternation of its own. That is what the plain rewrite writes for a
-/// loop with an empty way (`(?:b+)*(?:(a)(?:b+)*)*?`), as does a loop as written.
-fn has_loop(ast: &Ast) -> bool {
-    fn structured(ast: &Ast) -> bool {
-        match ast {
-            Ast::Repetition(_) | Ast::Alternation(_) => true,
-            Ast::Group(group) => structured(&group.ast),
-            Ast::Concat(concat) => concat.asts.iter().any(structured),
-            _ => false,
-        }
-    }
-    match ast {
-        Ast::Repetition(rep) => {
-            (!matches!(bounds(&rep.op.kind).1, Some(0 | 1)) && structured(&rep.ast))
-                || has_loop(&rep.ast)
-        }
-        Ast::Group(group) => has_loop(&group.ast),
-        Ast::Alternation(alt) => alt.asts.iter().any(has_loop),
-        Ast::Concat(concat) => concat.asts.iter().any(has_loop),
-        _ => false,
     }
 }
 
@@ -404,7 +380,7 @@ fn rewrite_parsed(pattern: &str, copies: bool, lead: &str) -> Option<String> {
         captures: !copies && has_capture(&ast),
         copies,
         exit: None,
-        repeating: 0,
+        lazy_around: 0,
     };
     let piece = rewriter.convert(&ast, false).ok()?;
     // The rewrite can drop a piece that matches only the empty string (`\p{Foo}{0}`), and with it
@@ -687,10 +663,11 @@ impl Rewriter<'_> {
             }
             Ast::Group(group) => self.group(group, listed),
             Ast::Repetition(rep) => {
-                let again = !matches!(bounds(&rep.op.kind).1, Some(0 | 1));
-                self.repeating += u32::from(again);
+                let (min, max) = bounds(&rep.op.kind);
+                let kept = !rep.greedy && min < 2 && !matches!(max, Some(0 | 1));
+                self.lazy_around += u32::from(kept);
                 let body = self.convert(&rep.ast, true);
-                self.repeating -= u32::from(again);
+                self.lazy_around -= u32::from(kept);
                 let mut body = body?;
                 // #6301: the scoped switch is verified for the greedy loop. A lazy repeat decides
                 // whether Oniguruma unrolls it from the body's operation count (`onig_ops`), which does
@@ -699,19 +676,8 @@ impl Rewriter<'_> {
                     body.ways = Ways::Unknown;
                 }
                 let grouped = (self.copies || self.captures) && has_capture(&rep.ast);
-                let (min, max) = bounds(&rep.op.kind);
-
                 if !rep.greedy && max.is_none() && self.oniguruma_unrolls(&rep.ast, min) {
                     return self.lazy_unrolled(body, min, grouped);
-                }
-                // #6332: a counted repeat writes its body out as nested copies, and a body that holds
-                // a loop of its own (one the plain rewrite writes first) is not followed through them.
-                let counted = max.is_some_and(|n| n > 1) || (!rep.greedy && min >= 2);
-                if self.copies && grouped && counted && has_loop(&rep.ast) {
-                    return Ok(Piece {
-                        text: self.repeat_text(&body.text, min, max, rep.greedy)?,
-                        ways: Ways::Unknown,
-                    });
                 }
                 if self.copies && grouped {
                     self.exit = Some(self.empty_text(&rep.ast)?);
@@ -1243,9 +1209,10 @@ impl Rewriter<'_> {
         parts.push(self.repeat(iteration, 0, None, false)?);
         let piece = self.concat(&parts, true)?;
         // #6310: only a group in `B` survives the rewrite; with the groups tagged, every one does,
-        // and each copy is read back (#6332), unless a repeat stands around the loop.
+        // and each copy is read back (#6332), in a loop inside another repeat too (#6358) unless a lazy repeat that is not
+        // rewritten stands around it.
         let kept = if self.copies {
-            exit.is_none() || self.repeating == 0
+            exit.is_none() || self.lazy_around == 0
         } else {
             self.groups_only_in_later_ways(&written, &before_text, &b_text)
         };
@@ -1254,13 +1221,16 @@ impl Rewriter<'_> {
         }
         self.changed = true;
         // #6332: the empty way the loop leaves at, with the groups it sets, ends the rewritten loop.
-        let (text, ways) = match &exit {
-            Some(exit) => (self.concat_text(&[&piece.text, exit])?, Ways::Unknown),
-            None => (piece.text, piece.ways),
+        let piece = match &exit {
+            Some(_) => {
+                let leave = self.exit_piece(&exit)?;
+                self.concat(&[piece, leave], true)?
+            }
+            None => piece,
         };
         Ok(Piece {
-            text: self.text(format!("(?:{})", text.text), Prec::Atom)?,
-            ways,
+            text: self.text(format!("(?:{})", piece.text.text), Prec::Atom)?,
+            ways: piece.ways,
         })
     }
 
@@ -1357,8 +1327,9 @@ impl Rewriter<'_> {
         exit: Option<Text>,
     ) -> Result<Piece, GiveUp> {
         // #6310: each copy holds the body's groups again; with the groups tagged they are read back
-        // (#6332), unless a repeat stands around the loop.
-        if self.has_groups(&written) || (exit.is_some() && self.repeating > 0) {
+        // (#6332), in a loop inside another repeat too (#6358) unless a lazy repeat that is not
+        // rewritten stands around it.
+        if self.has_groups(&written) || (exit.is_some() && self.lazy_around > 0) {
             return Ok(Self::unlisted(written));
         }
         let consuming = |text: Text| Piece {
@@ -1392,11 +1363,7 @@ impl Rewriter<'_> {
         self.changed = true;
         Ok(Piece {
             text: self.text(format!("(?:{})", rest.text.text), Prec::Atom)?,
-            ways: if exit.is_some() {
-                Ways::Unknown
-            } else {
-                rest.ways
-            },
+            ways: rest.ways,
         })
     }
 
@@ -1490,8 +1457,9 @@ impl Rewriter<'_> {
             ways: Ways::Consuming,
         };
         // #6310: each copy holds the body's groups again; with the groups tagged they are read back
-        // (#6332), unless a repeat stands around the loop.
-        if self.has_groups(&written) || (exit.is_some() && self.repeating > 0) {
+        // (#6332), in a loop inside another repeat too (#6358) unless a lazy repeat that is not
+        // rewritten stands around it.
+        if self.has_groups(&written) || (exit.is_some() && self.lazy_around > 0) {
             return Ok(Self::unlisted(written));
         }
         let mut loop_rest = body.clone();
@@ -1507,11 +1475,7 @@ impl Rewriter<'_> {
         self.changed = true;
         Ok(Piece {
             text: self.text(format!("(?:{})", loop_rest.text.text), Prec::Atom)?,
-            ways: if exit.is_some() {
-                Ways::Unknown
-            } else {
-                loop_rest.ways
-            },
+            ways: loop_rest.ways,
         })
     }
 }
@@ -1722,17 +1686,55 @@ mod tests {
             "(?x)(?:b*|(a))+",
             "(?U)(?:b*|(a))+",
             "(?:b*|(a))+__succinctly_g1",
-            // A loop inside a repeat that can run it again, which the rewrite does not reach.
-            "(?:(?:(a)|b*|c)+)+",
-            "(?:(?:(a|b)|(?:|a)){0,3}){2}?",
-            "(?:((b|)(|c)){3})+",
-            // A counted repeat over a body with a loop of its own, as written and as the plain
-            // rewrite writes it.
-            "(?:(?:b*|(a))+(a|b)|(?:b*|(a))+){2}",
-            "(?:(?:(?:b+)*(?:(a)(?:b+)*)*?)(a|b)|(?:(?:b+)*(?:(a)(?:b+)*)*?)){2}",
         ] {
             assert_eq!(copied(pattern), None, "{pattern}");
         }
+    }
+
+    /// #6358: a loop with groups inside another repeat that can run it again is written with the rest,
+    /// its ways listed through its exit, so the repeat around it ends at the empty iteration as
+    /// Oniguruma's does; so is a counted repeat over a body that holds a loop of its own.
+    #[test]
+    fn a_loop_with_groups_inside_another_repeat_is_written_6358() {
+        for pattern in [
+            "(?:(?:(a)|b*|c)+)+",
+            "(?:(?:(a|b)|(?:|a)){0,3}){2}?",
+            "(?:((b|)(|c)){3})+",
+            "(?:(?:b*|(a))+(a|b)|(?:b*|(a))+){2}",
+            "(?:(?:(?:b+)*(?:(a)(?:b+)*)*?)(a|b)|(?:(?:b+)*(?:(a)(?:b+)*)*?)){2}",
+            "((?:(b|)*|a)+)*",
+            "((?:(b)*|a)+){2}",
+        ] {
+            let written = rewrite_with_groups(pattern).unwrap_or_else(|| panic!("{pattern}"));
+            // Every group of the pattern has at least one copy, and every compiled group is read back.
+            assert!(written.copies.iter().all(|c| !c.is_empty()), "{pattern}");
+            assert_eq!(
+                written.copies.iter().map(Vec::len).sum::<usize>(),
+                written.compiled_groups,
+                "{pattern}"
+            );
+        }
+    }
+
+    /// #6358: a lazy `*?` or `+?` around a loop with groups is not rewritten, and the loop inside it,
+    /// written with its exit, is not read the way Oniguruma's is (`"abab" | match("(?:x*|(?:b*|(a))+
+    /// (?:(b)*|a)+)+?b")` has no `a` in group 1 in jq), so that loop keeps its text.
+    #[test]
+    fn a_loop_with_groups_inside_a_lazy_repeat_keeps_its_text_6358() {
+        for pattern in [
+            "(?:x*|(?:b*|(a))+(?:(b)*|a)+)+?b",
+            "(?:b*|(?:b*|(a))+(?:(b)*|a)+)*?b",
+            "(?:(?:b*|(a))+)*?",
+            "(?:(?:b*|(a))+){1,3}?",
+        ] {
+            assert_eq!(
+                rewrite_with_groups(pattern).map(|g| g.pattern),
+                None,
+                "{pattern}"
+            );
+        }
+        // A lazy repeat that is written out copy by copy still takes the loops inside it.
+        assert!(rewrite_with_groups("(?:(?:b*|(a))+){2,3}?").is_some());
     }
 
     /// #6358: a flag switch in the body of a loop with groups is written as the flag group it stands
@@ -1759,25 +1761,6 @@ mod tests {
         // A switch that names `x` or `U` still keeps the loop as written.
         assert_eq!(copied("(?x)(?:b*|(a))+"), None);
         assert_eq!(copied("(?U)(?:b*|(a))+"), None);
-    }
-
-    /// #6332: a loop is a repeat of a body that has a repeat or an alternation of its own; a repeat
-    /// of a plain item is not.
-    #[test]
-    fn a_loop_is_a_repeat_over_a_structured_body_6332() {
-        let loop_in = |pattern: &str| has_loop(&ast::parse::Parser::new().parse(pattern).unwrap());
-        for pattern in [
-            "(?:ab+)*",
-            "(?:a|b)+",
-            "x(?:(a)b*)*y",
-            "(?:(?:a|b)*c)?",
-            "(?:a|(?:b+)*)",
-        ] {
-            assert!(loop_in(pattern), "{pattern}");
-        }
-        for pattern in ["(?:ab)*", "(b)*", "b*", "(?:a|b)?", "(?:a{0}|b)", "a(b)c"] {
-            assert!(!loop_in(pattern), "{pattern}");
-        }
     }
 
     /// A lazy repeat that must run twice or more (#6128): copy `k` leaves first once it is past the

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Differential sweep for #6310 and #6332: a capture group inside a loop's body.
 
-    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest] [--flags g] [--jq /usr/bin/jq]
+    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways] [--flags g] [--jq /usr/bin/jq]
 
 Oniguruma ends a greedy loop at the first iteration that matches nothing (#6106), and that holds when the
 body has a capture group: after its empty way (`(?:b*|(a))+`, #6310), or before it, in it, or with its own
@@ -9,7 +9,11 @@ empty way first (`(?:(a)|b*|c)+`, #6332). This draws `--count` loops
 at random from a pool of atoms (capture groups, nullable and consuming, among them), each with a body of
 two or three ways, one of 13 quantifiers, a plain or capturing group around it, and sometimes a prefix or
 a suffix, under `--flags`; with `--nest` half of them also stand inside an outer repeat or hold a repeated group of their own,
-which re-runs the copies of a group the rewrite wrote (#6332). Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
+which re-runs the copies of a group the rewrite wrote (#6332). `--ways` (#6358) draws the other shape that
+`--nest` undersamples: an outer repeat, of any of ten quantifiers, over two or three ways that are each one to three items,
+six in ten of them a loop with a group (or a plain atom otherwise), so that a loop stands in a way beside other items and
+the ways share a prefix; it is the draw that found the alternation `regex-syntax` factors (#6134) and the lazy `*?` and `+?`
+that keep their text. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
 captures are compared. It prints how many patterns SUBJECT fixed (BASELINE differed from jq, SUBJECT does
 not), broke (the reverse) and still differs on, and exits 1 when it broke one.
 
@@ -28,6 +32,10 @@ QUANTS = ["+", "*", "{2}", "{2,}", "{0,3}", "{1,2}", "{2,3}", "+?", "*?", "{2}?"
           "{0,2}?"]
 NESTED = ["(?:b*|(a))+", "(?:(a)|b?){0,2}", "(?:(a)|b)*", "(b|)*", "(?:a|(b))+?"]
 OUTER = ["*", "+", "{2}", "{0,3}", "{2,}?", "{2}?", "{1,2}"]
+LOOPS = ["(?:b*|(a))+", "(?:(a)|b?)*", "(?:(a)|b)*", "(b|)*", "(?:a|(b))+?", "(?:(b)*|a)+", "(?:(a*)|b)+",
+         "(?:b*|a(\\w*))*", "(?:(b?)|(a))*?", "(?:a*|(b))*"]
+SIMPLE = ["a", "b", "b*", "a?", "(a)", "(a|b)", "(b*)", "()", "c?", "(?:a|b)", r"\w"]
+WAYS_QUANTS = ["{2}", "{2,}", "{0,3}", "{1,2}", "+", "*", "{2,3}?", "{2}?", "{0,2}?", "+?"]
 SUBJECTS = ["ba", "bab", "abab", "aab", "abba", "baab", "aaa", "bbb", "cba", "abc"]
 PROGRAM = ('.[] as $p | %s[] as $s | [$p,$s,(try ([$s|match($p;$flags)|[.offset,.string,'
            '(.captures|map(.string))]]) catch "ERR")]' % json.dumps(SUBJECTS))
@@ -52,6 +60,27 @@ def patterns(count, rng, nest=False):
             pattern = "(?:" + pattern + ")(b)"
         if nest and rng.random() < 0.5:
             pattern = rng.choice(["(?:%s)%s", "(%s)%s"]) % (pattern, rng.choice(OUTER))
+        out.add(pattern)
+    return sorted(out)
+
+
+def ways_patterns(count, rng):
+    """`--ways`: an outer repeat over ways that hold loops with groups beside other items."""
+    def way():
+        return "".join(rng.choice(LOOPS if rng.random() < 0.6 else SIMPLE)
+                       for _ in range(rng.choice([1, 2, 2, 3])))
+
+    out = set()
+    while len(out) < count:
+        body = "|".join(way() for _ in range(rng.choice([2, 2, 3])))
+        pattern = rng.choice(["(?:%s)", "(%s)"]) % body + rng.choice(WAYS_QUANTS)
+        r = rng.random()
+        if r < 0.2:
+            pattern += "c"
+        elif r < 0.3:
+            pattern = "(?:" + pattern + ")(b)"
+        if rng.random() < 0.3:
+            pattern = rng.choice(["(?:%s)%s", "(%s)%s"]) % (pattern, rng.choice(["*", "+", "{2}", "{0,2}"]))
         out.add(pattern)
     return sorted(out)
 
@@ -84,10 +113,12 @@ def main():
     ap.add_argument("--count", type=int, default=5000)
     ap.add_argument("--seed", type=int, default=2)
     ap.add_argument("--nest", action="store_true", help="also nest loops inside repeats")
+    ap.add_argument("--ways", action="store_true", help="loops beside other items in the ways of an outer repeat")
     ap.add_argument("--flags", default="g", help="the match flags (`gi`: case folding)")
     ap.add_argument("--jq", default="/usr/bin/jq")
     args = ap.parse_args()
-    plist = patterns(args.count, random.Random(args.seed), args.nest)
+    rng = random.Random(args.seed)
+    plist = ways_patterns(args.count, rng) if args.ways else patterns(args.count, rng, args.nest)
     ref = answers([args.jq], plist, args.flags)
     base = answers([args.baseline, "jq"], plist, args.flags)
     subj = answers([args.subject, "jq"], plist, args.flags)
