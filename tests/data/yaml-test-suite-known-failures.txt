@@ -45,6 +45,8 @@
 6M2F      structure         a block-mapping `:` with no `?` before it (an entry with no key): valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected key") — we follow yq, as for CFD4 (#6288)
 7Z25      structure         bare document after a `...` end marker (`---` / `scalar1` / `...` / `key: value`): valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected <document start>": a document after `...` needs its own `---`) — we follow yq, the same policy as CFD4/FRK4/NKF9 — #5089
 8G76      structure         comment-only stream: spec wants zero documents, succinctly now synthesizes one null document to match real yq's CLI decode loop (`yq '1'` on `# c` answers `1`, not zero) — deliberate #2795 review fidelity choice (ADR-0018), not a regression
+96NN/00   structure         a block scalar whose first line starts with a tab after its spaces (`foo: |-` / ` ⇥bar`): valid YAML 1.2 (the tab is content), rejected by real yq v4.53.3 ("found a tab character where an indentation space is expected", go-yaml refuses a tab while the indent is not yet known) — we follow yq, the same policy as DK95/04 — #6295
+96NN/01   structure         a block scalar whose first line starts with a tab after its spaces (`foo: |-` / ` ⇥bar`): valid YAML 1.2 (the tab is content), rejected by real yq v4.53.3 ("found a tab character where an indentation space is expected", go-yaml refuses a tab while the indent is not yet known) — we follow yq, the same policy as DK95/04 — #6295
 98YD      structure         same shape and reason as 8G76 — #2795 review
 9C9N      lax:indentation   indentation not validated — #223
 9SA2      structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
@@ -69,6 +71,7 @@ NHX8      structure         a block-mapping `:` with no `?` before it (an entry 
 NJ66      structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 NKF9      structure         an empty key in a flow mapping (`{ : empty key }`): valid YAML 1.2, rejected by real yq (a key cannot open with `:`) — we follow yq — #4558
 QLJ7      lax:documents     directive/document rules not validated — #223
+R4YG      structure         a block scalar whose leading lines hold a tab after spaces (`- >` / ` ⇥` / ` detected`): valid YAML 1.2, rejected by real yq v4.53.3 ("found a tab character where an indentation space is expected") — we follow yq, the same policy as DK95/04 — #6295
 S3PD      structure         a block-mapping `:` with no `?` before it (an entry with no key): valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected key") — we follow yq, as for CFD4 (#6288)
 S4JQ      tags              non-specific tag (`!` alone) resolution: spec's "conventional resolution" forces `!!str`, but real yq v4.53.3 leaves the content's natural type untouched (`! 12` stays the number 12) — we follow yq, the same policy as FRK4/JEF9/02 — #224
 S98Z      lax:block-scalar  block scalar header not validated — #223
@@ -81,5 +84,6 @@ W4TN      scalars           scalar content/folding differs from spec
 W5VH      structure         document/block structure differs from spec
 W9L4      lax:block-scalar  block scalar header not validated — #223
 WZ62      tags              a flow indicator right after a tag (`foo : !!str,`): valid YAML 1.2, where a tag ends at a flow indicator, but rejected by real yq v4.53.3 (`found character ',' that is not allowed in a YAML tag`) — we follow yq, the same policy as S4JQ/FRK4 — #6293
+Y79Y/001  structure         a block scalar whose only leading line is a tab after a space (`foo: |` / ` ⇥` / `bar: 1`): valid YAML 1.2, rejected by real yq v4.53.3 ("found a tab character where an indentation space is expected") — we follow yq, the same policy as DK95/04 — #6295
 Y79Y/003  lax:tabs          tab handling not validated — #223
 ZVH3      lax:indentation   indentation not validated — #223
