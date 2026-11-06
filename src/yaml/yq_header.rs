@@ -32,6 +32,9 @@
 //! - a bare `---` line, which keeps its break;
 //! - a lone `\r` break, since yq splits its lines on `\n` only (`--- x␍y` is `x y`).
 
+#[cfg(not(test))]
+use alloc::{string::String, vec::Vec};
+
 /// Go's `\s` in `regexp` (RE2, ASCII only): space, tab, line feed, form feed, carriage return.
 fn is_re2_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | 0x0c | b'\r')
@@ -86,7 +89,7 @@ fn classify(line: &[u8]) -> Line {
 /// The spans of `text` that yq's stream no longer holds, in no particular order and possibly
 /// overlapping: the lost line breaks (a `\n` or a `\r\n`), the blanks before the first marker,
 /// and the later markers of a pushed-back line.
-fn cuts(text: &[u8]) -> Vec<std::ops::Range<usize>> {
+fn cuts(text: &[u8]) -> Vec<core::ops::Range<usize>> {
     let mut cuts = Vec::new();
     // The unread input is `pending` (whose bytes sit at `pending_at` in `text`, not always
     // contiguously: a cut break lies between two pieces) followed by `text[pos..]`.
@@ -105,8 +108,8 @@ fn cuts(text: &[u8]) -> Vec<std::ops::Range<usize>> {
             None => (rest, None),
         };
         let merged = !pending.is_empty();
-        let mut line = std::mem::take(&mut pending);
-        let mut at = std::mem::take(&mut pending_at);
+        let mut line = core::mem::take(&mut pending);
+        let mut at = core::mem::take(&mut pending_at);
         line.extend_from_slice(physical);
         at.extend(pos..pos + physical.len());
         // The `\r` of a `\r\n` is the last byte of the physical part (the pending part never ends
@@ -151,7 +154,7 @@ fn cuts(text: &[u8]) -> Vec<std::ops::Range<usize>> {
 /// `text` with what yq's `--header-preprocess` drops after a leading `--- <text>` line cut out
 /// (#6276), or `None` when it drops nothing, which is every input that does not begin with
 /// such a marker line.
-pub(super) fn glue_after_leading_marker_text(text: &[u8]) -> Option<Vec<u8>> {
+pub fn glue_after_leading_marker_text(text: &[u8]) -> Option<Vec<u8>> {
     // The overwhelmingly common input starts on its content (`a: 1`, `{`, `[`, `"`): one byte
     // settles it.
     if !text.first().copied().is_some_and(may_start_header_line) {

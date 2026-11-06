@@ -82,6 +82,7 @@ mod parser;
 mod scalar;
 pub mod simd;
 pub mod validate;
+mod yq_header;
 
 /// Does `next` terminate a `-` sequence-entry indicator? That is whitespace, a line
 /// break, or end of input.
@@ -306,6 +307,7 @@ pub(crate) use scalar::{
     is_overflowed_int_literal, nonfinite_literal_index, nonfinite_literal_value,
 };
 pub use scalar::{resolve_plain, resolve_plain_sourced, resolve_tagged, ResolvedScalar};
+pub use yq_header::glue_after_leading_marker_text;
 
 #[cfg(test)]
 mod tests {

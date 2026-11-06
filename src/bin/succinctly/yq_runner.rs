@@ -51,7 +51,6 @@ use crate::output::{
 };
 
 mod go_yaml_color;
-mod leading_marker;
 use go_yaml_color::YamlColorizer;
 use succinctly::text::stream_region::{current_region, StreamRegion};
 mod reshape_presentation;
@@ -1179,7 +1178,7 @@ fn empty_input_reads_as(
         // #6276: the break after a leading `--- text` line is lost to yq's header slurp. Not under
         // `--front-matter`, whose own extraction reads the input first and was not captured.
         if !front_matter && glue_leading_marker {
-            if let Some(glued) = leading_marker::glue_after_leading_marker_text(&bytes) {
+            if let Some(glued) = succinctly::yaml::glue_after_leading_marker_text(&bytes) {
                 bytes = glued;
             }
         }
