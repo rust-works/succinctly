@@ -6883,8 +6883,11 @@ empty `[]`/`{}` stays flow with its comment. This build follows that for the DOM
 `--arg` take, on JSON-shaped and YAML input alike (`defer_flow_line_comments`). Swept against yq v4.53.3 over 14
 documents x 8 filters. Still different:
 
-- **A comment written inside a flow collection** (`[1, # note` / `  2]`) is not kept by the parser, where yq
-  prints it after the element (`- 1 # note`), and so is not held either.
+- **A comment written inside a flow collection** is kept when it follows an element on its line (`[1, # note` / `  2]`, #6334), and printed as yq prints it.
+  The identity route, a write and a navigation lay the collection out across lines with the comment after the element's comma, and the closing bracket on a line of its own when the last element is commented.
+  `-P`, which writes the collection as a block, does not hold it: yq prints `- 1 # note`, where the element here has none.
+  A comment on a line of its own inside the collection (`[` / `  # head` / `  x]`) is still dropped.
+  With `-I4`, the closing bracket of a commented collection nested in a `- [` item is at column 0 where yq puts it at the item's column.
 - **An empty `{}`/`[]` value that follows a held comment**: yq writes `b: # ec` and the `{}` on the next line;
   this build writes `b: {} # ec`.
 - **A collection built by an expression** (`[.]`, `{"k": .a}`, `to_entries`) carries no comment tree at all
