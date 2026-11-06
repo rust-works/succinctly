@@ -8,6 +8,39 @@ use anyhow::Result;
 
 use crate::run_jq_full;
 
+/// A body that ends in a second exit, inside another way or beside more items, answers as it did.
+#[test]
+fn a_second_exit_is_not_read_as_a_first_once_it_is_a_part_of_a_longer_way_6424() -> Result<()> {
+    for (pattern, input, expected) in [
+        (r"(\A|\B)\b", "bab", r#"[[0,"",[""]]]"#),
+        (
+            r"((\A|\B)\b)*",
+            "bab",
+            r#"[[0,"",["",""]],[1,"",["",""]],[2,"",["",""]],[3,"",["",""]]]"#,
+        ),
+        (
+            r"(\A|\B)(b*)",
+            "bab",
+            r#"[[0,"b",["","b"]],[1,"",["",""]],[2,"b",["","b"]]]"#,
+        ),
+        (
+            r"((\A|a|\B)b*)*",
+            "bab",
+            r#"[[0,"bab",["ab","a"]],[3,"",["",""]]]"#,
+        ),
+        (r"((\A|a|\B)\b)+", "bab", r#"[[0,"",["",""]]]"#),
+        (r"(\A|a|\B)b", "bab", r#"[[0,"b",[""]],[1,"ab",["a"]]]"#),
+        (
+            r"((\b|a|\B)|(\z|b|\A))+",
+            "a b",
+            r#"[[0,"",["","",""]],[1,"",["","",""]],[2,"",["","",""]],[3,"",["","",""]]]"#,
+        ),
+    ] {
+        assert_matches(pattern, input, expected)?;
+    }
+    Ok(())
+}
+
 /// The same body inside another group or repeat, under a flag switch, or beside a group of its own.
 #[test]
 fn a_second_exit_in_a_nested_group_or_beside_a_flag_switch_6424() -> Result<()> {
@@ -56,6 +89,11 @@ fn a_second_exit_in_a_nested_group_or_beside_a_flag_switch_6424() -> Result<()> 
             r"(\b|a|\B)*(\b|b|\B)*",
             "ab",
             r#"[[0,"",["",""]],[1,"b",["",""]],[2,"",["",""]]]"#,
+        ),
+        (
+            r"(\b\z|a|\B)*",
+            "ab",
+            r#"[[0,"a",[""]],[1,"",[""]],[2,"",[""]]]"#,
         ),
     ] {
         assert_matches(pattern, input, expected)?;

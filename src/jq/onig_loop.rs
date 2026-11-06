@@ -2934,6 +2934,13 @@ mod tests {
         assert_eq!(written(r"(\A|a|\B|b)*"), None);
         assert_eq!(written(r"(\b|a|\B|b)*"), None);
         assert_eq!(written(r"(\b\B|a)*"), None);
+        // The dropped exit is last among the ways of the repeat's body, not of a part of it: inside
+        // another way, or in a list with more items, the part keeps its text.
+        assert_eq!(written(r"((\A|a|\B)|c)+"), None);
+        assert_eq!(written(r"(((\A|a|\B))|c)+"), None);
+        for pattern in [r"((\A|\B)\b)*", r"((\A|\B)b*)+", r"((\A|a|\B)b*)*"] {
+            assert_eq!(written(pattern), None, "{pattern}");
+        }
         // The evaluator reads a loop again once the group around it is written as a plain one, so the
         // dropped exit is written back there too.
         assert!(rewrite(r"(?:\A|a|\B)*").is_some());
