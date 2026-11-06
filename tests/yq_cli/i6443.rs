@@ -42,6 +42,26 @@ fn an_empty_plain_key_is_written_single_quoted_6443() -> Result<()> {
         ("&a '': 1\n", ".zzkey = 1", "&a '': 1\nzzkey: 1\n"),
         ("&a \"\": 1\n", ".", "&a \"\": 1\n"),
         ("&a \"\": 1\n", ".zzkey = 1", "&a \"\": 1\nzzkey: 1\n"),
+        ("!!null : 1\n", ".", "!!null '': 1\n"),
+        ("!!null : 1\n", ".zzkey = 1", "!!null '': 1\nzzkey: 1\n"),
+        ("!!int : 1\n", ".", "!!int '': 1\n"),
+        ("!!int : 1\n", ".zzkey = 1", "!!int '': 1\nzzkey: 1\n"),
+        ("!custom : 1\n", ".", "!custom '': 1\n"),
+        ("!custom : 1\n", ".zzkey = 1", "!custom '': 1\nzzkey: 1\n"),
+        ("? \n:\n", ".", "'':\n"),
+        ("? \n:\n", ".zzkey = 1", "'':\nzzkey: 1\n"),
+        ("? \n: - x\n", ".", "'':\n  - x\n"),
+        ("? \n: - x\n", ".zzkey = 1", "'':\n  - x\nzzkey: 1\n"),
+        ("&a :\n  - x\n", ".", "&a '':\n  - x\n"),
+        ("&a :\n  - x\n", ".zzkey = 1", "&a '':\n  - x\nzzkey: 1\n"),
+        ("&a : 1\n---\n&b : 2\n", ".", "&a '': 1\n---\n&b '': 2\n"),
+        (
+            "&a : 1\n---\n&b : 2\n",
+            ".zzkey = 1",
+            "&a '': 1\nzzkey: 1\n---\n&b '': 2\nzzkey: 1\n",
+        ),
+        ("&a : \n", ".", "&a '':\n"),
+        ("&a : \n", ".zzkey = 1", "&a '':\nzzkey: 1\n"),
     ] {
         let (stdout, code) = run_yq_stdin(filter, doc, &[])?;
         assert_eq!((stdout.as_str(), code), (want, 0), "{doc:?} {filter}");
