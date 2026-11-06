@@ -38,6 +38,21 @@ fn test_an_explicit_key_indicator_after_an_implicit_keys_colon_is_refused_6379()
         "{a: ? w}\n",
         "[? c : ? d]\n",
         "{? c : ? d}\n",
+        // A value on the next line of a flow collection, and the other flow key forms.
+        "{c:\n  ? w}\n",
+        "[a:\n? w]\n",
+        "{\"k\": ? w}\n",
+        "[\"k\": ? w]\n",
+        "{'k': ? w}\n",
+        "[&a x: ? w]\n",
+        "{[a]: ? w}\n",
+        "{{a: 1}: ? w}\n",
+        // A tab before a property, and a refusal after an earlier document or before a later one.
+        "c:\t&a ? w\n",
+        "- c:\t&a ? w\n",
+        "a: 1\n---\nc: ? w\n",
+        "c: ? w\n---\nd: 1\n",
+        "c:\n  d: ? w\n  e: 1\n",
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, ARGS)?;
         assert_ne!(code, 0, "{doc:?} should be refused, got {stdout:?}");
@@ -59,6 +74,9 @@ fn test_what_is_not_an_explicit_key_after_a_colon_still_reads_6379() -> Result<(
         ("{c: ?b}\n", "{\"c\":\"?b\"}"),
         ("[? c : ?d]\n", "[{\"c\":\"?d\"}]"),
         ("{? c : ?d}\n", "{\"c\":\"?d\"}"),
+        ("{c:\n  ?w}\n", "{\"c\":\"?w\"}"),
+        ("c: !!str? w\n", "{\"c\":\"w\"}"),
+        ("- c: !!str? w\n", "[{\"c\":\"w\"}]"),
         // An explicit key is fine where it opens an entry.
         ("c:\n  ? w\n", "{\"c\":{\"w\":null}}"),
         ("c:\n? w\n", "{\"c\":null,\"w\":null}"),

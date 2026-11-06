@@ -5875,7 +5875,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
-    /// Parse an explicit value (`: value` after explicit key).
     /// `key: ? x`: an explicit key indicator straight after an implicit key's colon, on its line. It cannot
     /// open a mapping there (that is `key:` / `  ? x`, or `: ? x` after an explicit key's own colon), and
     /// yq stops with `mapping keys are not allowed in this context`; the line was read as the plain scalar
@@ -5924,6 +5923,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
+    /// Parse an explicit value (`: value` after explicit key).
     fn parse_explicit_value(&mut self, indent: usize) -> Result<(), YamlError> {
         // Same ambiguous-gap error as parse_mapping_entry (#901).
         self.check_mapping_under_mapping_gap(indent)?;
