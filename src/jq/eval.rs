@@ -33399,13 +33399,19 @@ fn group_copies_engine(
     pattern: &str,
     base: Option<&super::onig_capture_loop::LoopRewrite>,
 ) -> Option<RegexEngine> {
-    let copied = super::onig_loop::rewrite_with_groups(
-        base.map_or(pattern, |groups| groups.pattern.as_str()),
-    )?;
+    let source = base.map_or(pattern, |groups| groups.pattern.as_str());
+    let copied = super::onig_loop::rewrite_with_groups(source)?;
     // #6358: guarded like the pattern as written (#6134): a loop nested in a repeat is written as
     // alternations whose branches share a prefix that matches more than one way, which the crate
     // would factor and so change which branch wins. The guard adds no group.
-    let re = std_regex(&copied.pattern).ok()?;
+    let (copied, re) = match std_regex(&copied.pattern) {
+        Ok(re) => (copied, re),
+        Err(_) => {
+            let copied = super::onig_loop::rewrite_with_groups_past_the_size_limit(source)?;
+            let re = std_regex(&copied.pattern).ok()?;
+            (copied, re)
+        }
+    };
     (re.captures_len() == copied.compiled_groups).then_some(())?;
     let groups = compose_group_copies(base, copied)?;
     Some(RegexEngine::Rewritten { re, groups })
@@ -139324,6 +139330,29 @@ mod tests {
         query!(br#""abc""#, r#"match("[0-9]+"; "")?"#,
             QueryResult::None => {}
         );
+    }
+
+    /// #6428: a `{1,n}?` that the rewrite writes within its limits and the crate refuses as too large
+    /// is read again as written, so that the loop beside it keeps its rewrite. Where the crate
+    /// refuses moves between builds, and a coverage build lands elsewhere than a test build, so this
+    /// states what each count must do, not which count gets there.
+    /// than twice each other and one of them lands between the two.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_lazy_bounded_repeat_the_crate_refuses_is_read_again_as_written_6428() {
+        for n in [12_000, 20_000, 33_000, 55_000] {
+            let pattern = format!("(?:(a)|b*|c)+(?:(d*)|x){{1,{n}}}?");
+            let written = super::super::onig_loop::rewrite_with_groups(&pattern).unwrap();
+            let again = super::super::onig_loop::rewrite_with_groups_past_the_size_limit(&pattern);
+            let again = again.unwrap();
+            assert!(again.pattern.contains(&format!("{{1,{n}}}?")), "{pattern}");
+            let refused = std_regex(&written.pattern).is_err();
+            let kept = std_regex(&again.pattern).is_ok();
+            assert_eq!(
+                group_copies_engine(&pattern, None).is_some(),
+                !refused || kept
+            );
+        }
     }
 
     /// #6106: a loop rewritten for Oniguruma's empty-iteration exit is what the `regex` crate
