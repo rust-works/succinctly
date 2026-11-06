@@ -796,7 +796,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// Set an interest bit at a specific position.
     #[inline]
-    #[allow(dead_code)] // STYLE-0005: helper for an experimental SIMD path
     fn set_ib_at(&mut self, pos: usize) {
         let word_idx = pos / 64;
         let bit_idx = pos % 64;
@@ -2337,6 +2336,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         if before.is_some() && self.pending_head_comment == before {
             self.pending_head_comment = None;
         }
+    }
+
+    /// Write the node of a value that is empty (null), anchored at `at`: the end of its key's `:`
+    /// (#6386). yq places an empty value there (`.a | line` of `a:` is the key's line), and it must be
+    /// a byte no node decodes from: the reader reads a node by its first byte, so a null written at
+    /// the start of the *next* line, where the lookahead leaves the cursor, read a quoted or flow key
+    /// there as the value (`a:` / `"b": 1` was `{"a": "b"}`).
+    fn write_null_value_at(&mut self, at: usize) {
+        self.set_ib_at(at);
+        self.write_bp_open_at(at);
+        self.write_bp_close();
     }
 
     /// Write a close parenthesis (0) to BP.
@@ -4948,6 +4958,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             );
         }
         self.advance(); // Skip ':'
+        let colon_end = self.pos;
 
         // Skip space after colon
         self.skip_inline_whitespace();
@@ -5027,6 +5038,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.write_bp_close();
             } else {
                 let next_indent = self.count_indent().unwrap_or(0);
+                // An empty value with no property sits at its key's colon (#6386); one with a property
+                // keeps the position it has.
+                let null_at = if had_property { self.pos } else { colon_end };
 
                 // Check if next content is a sequence indicator
                 let saved_pos = self.pos;
@@ -5038,9 +5052,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 if next_indent < indent || (next_indent == indent && !is_sequence_indicator) {
                     // Next line is at lower indent, or same indent but not a sequence
                     // - null value: emit empty value node
-                    self.set_ib();
-                    self.write_bp_open();
-                    self.write_bp_close();
+                    self.write_null_value_at(null_at);
                 }
                 // Otherwise, value is a nested structure - main loop will handle it
             }
@@ -5227,6 +5239,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return Err(self.err_unexpected_char(self.pos, "expected ':' after key"));
         }
         self.advance(); // Skip ':'
+        let colon_end = self.pos;
 
         // Skip space after colon
         self.skip_inline_whitespace();
@@ -5283,18 +5296,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             if next_indent < indent {
                 // Next line is at lower indent - definitely null value
-                self.set_ib();
-                self.write_bp_open();
-                self.write_bp_close();
+                self.write_null_value_at(colon_end);
                 return Ok(());
             }
 
             if next_indent == indent && !is_sequence_indicator {
                 // Next line is at same indent but NOT a sequence - null value
                 // (If it were a sequence, the sequence is the value of this key)
-                self.set_ib();
-                self.write_bp_open();
-                self.write_bp_close();
+                self.write_null_value_at(colon_end);
                 return Ok(());
             }
 
