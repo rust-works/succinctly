@@ -1,0 +1,188 @@
+//! #6433: regex refusals #6423 left in the `regex` crate's words, or answered. Oniguruma reads the
+//! number after a `{` as it lexes, so a count past 100000 is refused even where the brace is no
+//! repeat or the crate cannot read the group around it; a call `\g<n>` has its own messages; and an
+//! error after a construct the crate cannot read (`(?'name'...)`, a reference to a group the pattern
+//! has) is the later error's. Every row was captured from jq 1.7.1
+//! (`/usr/bin/jq -c 'try test(P) catch .' <<< '"a"'`).
+
+use anyhow::Result;
+
+use crate::run_jq_full;
+
+fn caught(pattern: &str) -> Result<String> {
+    let filter = format!("try test({}) catch .", serde_json::to_string(pattern)?);
+    let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(r#""a""#))?;
+    assert_eq!((stderr.as_str(), code), ("", 0), "{pattern}");
+    Ok(stdout.trim_end().to_owned())
+}
+
+fn assert_rows(rows: &[(&str, &str)]) -> Result<()> {
+    for &(pattern, answer) in rows {
+        let want = match answer {
+            "true" | "false" => answer.to_owned(),
+            message => format!(r#""Regex failure: {message}""#),
+        };
+        assert_eq!(caught(pattern)?, want, "{pattern}");
+    }
+    Ok(())
+}
+
+const TOO_BIG: &str = "too big number for repeat range";
+
+#[test]
+fn a_count_past_the_limit_is_refused_wherever_the_brace_stands_6433() -> Result<()> {
+    assert_rows(&[
+        ("(?=a{100001})", TOO_BIG),
+        ("(?>a{100001})", TOO_BIG),
+        ("(?<=a{100001})", TOO_BIG),
+        ("(?!x{4294967296})", TOO_BIG),
+        ("x{100001a}", TOO_BIG),
+        ("x{100001 }", TOO_BIG),
+        ("x{1,100001 }", TOO_BIG),
+        ("x{100001,", TOO_BIG),
+        ("x{100001", TOO_BIG),
+        ("{100001}", TOO_BIG),
+        ("a|{100001}", TOO_BIG),
+        ("x{0100001}", TOO_BIG),
+        ("x{1,}{100001}", TOO_BIG),
+        ("[[a]{100001}]", TOO_BIG),
+        ("[[:alpha:]]{100001}", TOO_BIG),
+        ("(?x)a {100001}", TOO_BIG),
+        // Never an interval: in a class, quoted, in a comment, escaped, a braced escape, `{,n}`,
+        // a blank before the number, leading zeros.
+        ("[{100001}]", "false"),
+        ("[[:alpha:]{100001}]", "true"),
+        (r"\Qa{100001}\E", "false"),
+        ("a(?#{100001})", "true"),
+        (r"\{100001}", "false"),
+        (r"\x{100001}", "false"),
+        ("x{,100001}", "false"),
+        ("(?x)a { 100001}", "false"),
+        ("x{00100000}", "false"),
+        // `\cX` takes the `{` as its operand; `\N` has no braced form, so its braces count.
+        (r"\c{100001}", "false"),
+        (r"\N{100001}", TOO_BIG),
+        // A comment of the extended mode, which inline flags turn on and off per group.
+        ("(?x)#{100001}\na", "true"),
+        ("(?ix)#{100001}", "true"),
+        ("a(?x)b#{100001}", "false"),
+        ("(?x:a#{100001})", "end pattern with unmatched parenthesis"),
+        ("a{100001}#", TOO_BIG),
+        // A callout's braces are no interval; one after it is.
+        ("(?{100001})a{100001}", TOO_BIG),
+    ])
+}
+
+/// Oniguruma reports the first error in the order it reads the pattern; an error it meets only at
+/// the end (an unclosed group) or after reading it (an undefined call) comes after the count.
+#[test]
+fn an_error_before_the_count_comes_first_6433() -> Result<()> {
+    assert_rows(&[
+        (
+            "{2,}{4294967296",
+            "target of repeat operator is not specified",
+        ),
+        (r"\k<n>{999999,1", "undefined name <n> reference"),
+        (
+            "${1,2}{4294967296, }",
+            "target of repeat operator is invalid",
+        ),
+        (r"(\Qa{\E{0100001,}", TOO_BIG),
+        (r"\g<1>{100001, }", TOO_BIG),
+    ])
+}
+
+#[test]
+fn a_call_has_its_own_refusals_6433() -> Result<()> {
+    assert_rows(&[
+        (r"\g<1>", "undefined group <1> reference"),
+        (r"(a)\g<2>", "undefined group <2> reference"),
+        (r"\g<+1>", "undefined group <+1> reference"),
+        (r"(a)\g<+1>", "undefined group <+1> reference"),
+        (r"\g<-1>", "never ending recursion"),
+        (r"(a)\g<-2>", "never ending recursion"),
+        (r"\g<0>", "never ending recursion"),
+        // A signed zero names no group.
+        (r"(a)\g<+0>", "invalid group name <+0>"),
+        // A call to a group the pattern has is read past for a later error.
+        (r"(a)\g<1>(", "end pattern with unmatched parenthesis"),
+        (r"(a)\g<-1>)", "unmatched close parenthesis"),
+        (r"\g<-0>", "invalid group name <-0>"),
+        // The first of two calls' refusals, and a later unclosed group before a call's.
+        (r"\g<n>\g<1>", "undefined name <n> reference"),
+        (
+            r"|\}(?'m'b)(\g<n>",
+            "end pattern with unmatched parenthesis",
+        ),
+    ])
+}
+
+#[test]
+fn an_error_after_a_construct_the_crate_cannot_read_is_found_6433() -> Result<()> {
+    assert_rows(&[
+        (r"(?'x'a)\k<y>", "undefined name <y> reference"),
+        ("(?'x", "invalid group name <x>"),
+        ("(?'x'", "end pattern with unmatched parenthesis"),
+        ("(?'na)", "invalid group name <na>"),
+        (r"(?'n'a)\k'n'(", "end pattern with unmatched parenthesis"),
+        ("(?'m'b)(?'m'b)(", "end pattern with unmatched parenthesis"),
+        ("(?<m>b)(?<m>b)(", "end pattern with unmatched parenthesis"),
+        (r"(?<x>a)\k<x>(", "end pattern with unmatched parenthesis"),
+        (r"(?<x>a)\k<x>)", "unmatched close parenthesis"),
+        // Text inside a class names no group.
+        (r"[(?<x>)]\k<x>", "undefined name <x> reference"),
+        // What jq answers stays answered.
+        ("(?'x'a)", "true"),
+        (r"(?'x'a)\k<x>", "false"),
+        ("(?<m>b)(?<m>b)", "false"),
+    ])
+}
+
+/// The extended mode set by the flag, and turned off inline, for the rest of the group.
+#[test]
+fn an_inline_flag_turns_the_extended_mode_off_6433() -> Result<()> {
+    for pattern in ["(?-x)#{100001}", "(?-x:#{100001})"] {
+        let filter = format!(
+            r#"try test({}; "x") catch ."#,
+            serde_json::to_string(pattern)?
+        );
+        let (stdout, _, code) = run_jq_full(&["-c", &filter], Some(r#""a""#))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (r#""Regex failure: too big number for repeat range""#, 0),
+            "{pattern}"
+        );
+    }
+    let filter = r##"try test("#{100001}"; "x") catch ."##;
+    let (stdout, _, _) = run_jq_full(&["-c", filter], Some(r#""a""#))?;
+    assert_eq!(stdout.trim_end(), "true");
+    Ok(())
+}
+
+/// Each oversized count is written small once, so a long run of them after an earlier error costs
+/// one more compile, not one per count (#6433 review).
+#[test]
+fn many_oversized_counts_after_an_earlier_error_are_one_compile_6433() -> Result<()> {
+    let pattern = format!("[b-a]{}", "a{100001}".repeat(2000));
+    let started = std::time::Instant::now();
+    assert_eq!(
+        caught(&pattern)?,
+        r#""Regex failure: empty range in char class""#
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    Ok(())
+}
+
+/// A callout (`(?{...})`, `(*name)`) is not read here, but its braces are never counted: the refusal
+/// is the crate's, never `too big` (jq answers `true` and `invalid callout name`).
+#[test]
+fn a_callout_s_braces_are_no_interval_6433() -> Result<()> {
+    for pattern in ["(?{100001})", "(*{100001})"] {
+        let answer = caught(pattern)?;
+        assert!(
+            answer.starts_with(r#""Regex failure: regex parse error"#),
+            "{pattern}: {answer}"
+        );
+    }
+    Ok(())
+}
