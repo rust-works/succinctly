@@ -727,12 +727,7 @@ impl Rewriter<'_> {
                 for way in &alt.asts {
                     // A way that is only a switch matches nothing, as an empty way does.
                     let piece = match way {
-                        Ast::Flags(set) if self.switch_open(set)?.is_some() => {
-                            if self.copies {
-                                return Err(GiveUp);
-                            }
-                            empty_piece()
-                        }
+                        Ast::Flags(set) if self.switch_open(set)?.is_some() => empty_piece(),
                         _ => self.convert(way, listed)?,
                     };
                     items.push(self.scoped(piece, &active)?);
@@ -762,15 +757,16 @@ impl Rewriter<'_> {
                 Ast::Flags(set) => self.switch_open(set)?,
                 _ => None,
             } {
-                // #6332: the empty way of what the switch reaches is not worked out.
-                if self.copies {
-                    return Err(GiveUp);
-                }
                 items.push(empty_piece());
+                empties.push(None);
                 let rest = &asts[at + 1..];
                 if !rest.is_empty() {
                     let piece = self.convert_concat(rest, listed)?;
+                    // #6358: with the groups tagged, what the switch reaches has an empty way of its
+                    // own, the items' empty ways in the flag group the switch stands for.
+                    let empty = self.scoped_empty_text(rest, &open)?;
                     items.push(self.scoped(piece, &[open])?);
+                    empties.push(empty);
                 }
                 break;
             }
@@ -778,6 +774,22 @@ impl Rewriter<'_> {
             empties.push(self.empty_if_grouped(ast)?);
         }
         self.concat_with(&items, &empties, listed)
+    }
+
+    /// The empty way of the items `rest` that a switch reaches, in the flag group `open` that
+    /// stands for it, when the groups are tagged and they hold a group (#6358).
+    fn scoped_empty_text(&self, rest: &[Ast], open: &str) -> Result<Option<Text>, GiveUp> {
+        if !self.copies || !rest.iter().any(has_capture) {
+            return Ok(None);
+        }
+        let empties = rest
+            .iter()
+            .map(|ast| self.empty_text(ast))
+            .collect::<Result<Vec<_>, _>>()?;
+        let refs: Vec<&Text> = empties.iter().collect();
+        let joined = self.concat_text(&refs)?;
+        self.text(format!("{open}{})", joined.text), Prec::Atom)
+            .map(Some)
     }
 
     /// The empty way of `ast` ([`Self::empty_text`]) when the groups are tagged and it holds one.
@@ -1701,7 +1713,7 @@ mod tests {
         );
         assert!(copied("(?:(a)+?|b*|c)+").is_some_and(|g| g.0.contains(r"(?:([^\s\S]))+?")));
         // Nothing to write: no group, no loop that needs it, only a bounded body with no `B`,
-        // a flag switch (the empty way of what it reaches is not worked out), or the tag itself.
+        // a switch that names `x` or `U` (or sits after the loop), or the tag itself.
         for pattern in [
             "(?:a|b){2,}",
             "(?:b*|a)+",
@@ -1709,8 +1721,6 @@ mod tests {
             "(?:(a)|b*){0,3}",
             "(?x)(?:b*|(a))+",
             "(?U)(?:b*|(a))+",
-            "(?:b*|(a))+(?i)",
-            "(?:(?i)|b*|(a))+",
             "(?:b*|(a))+__succinctly_g1",
             // A loop inside a repeat that can run it again, which the rewrite does not reach.
             "(?:(?:(a)|b*|c)+)+",
@@ -1723,6 +1733,32 @@ mod tests {
         ] {
             assert_eq!(copied(pattern), None, "{pattern}");
         }
+    }
+
+    /// #6358: a flag switch in the body of a loop with groups is written as the flag group it stands
+    /// for, over what it reaches, with the empty way of what it reaches scoped the same way.
+    #[test]
+    fn a_flag_switch_beside_groups_is_scoped_over_what_it_reaches_6358() {
+        let copied = |pattern: &str| rewrite_with_groups(pattern).map(|g| g.pattern);
+        // After the loop it reaches nothing, and is left out.
+        assert_eq!(
+            copied("(?:b*|(a))+(?i)").as_deref(),
+            Some(r"(?:(?:b+)*(?:(a)(?:b+)*)*?(?:(?:|([^\s\S]))))")
+        );
+        // Before a group, in the items after it and in every later way.
+        for pattern in [
+            "(?:b*|(?i)(a))+",
+            "(?:(?i)b*|(a))+",
+            "(?:(?i)|b*|(a))+",
+            "(?:b*(?i)|(a)b)+",
+            "(?:b*|(a)(?i)b)+",
+        ] {
+            let written = copied(pattern).unwrap_or_else(|| panic!("{pattern} is written"));
+            assert!(written.contains("(?i:"), "{pattern}: {written}");
+        }
+        // A switch that names `x` or `U` still keeps the loop as written.
+        assert_eq!(copied("(?x)(?:b*|(a))+"), None);
+        assert_eq!(copied("(?U)(?:b*|(a))+"), None);
     }
 
     /// #6332: a loop is a repeat of a body that has a repeat or an alternation of its own; a repeat
