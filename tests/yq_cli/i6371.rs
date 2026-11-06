@@ -23,12 +23,17 @@ fn test_a_line_after_a_comment_that_ended_an_explicit_key_scalar_is_refused_6371
         "? a\n  b # c\n\n  d\n: v\n",
         "? a # c\n  - x\n: v\n",
         "? a # c\n  k: v\n: w\n",
+        "? a # c\n  :x\n: v\n",
         "- ? a # c\n    b\n  : v\n",
         "? a\n  b # c\n  d\n",
         "? a # c\n  b",
     ] {
-        let (stdout, _, code) = run_yq_stdin_with_stderr(".", doc, ARGS)?;
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, ARGS)?;
         assert_ne!(code, 0, "{doc:?} should be refused, got {stdout:?}");
+        assert!(
+            stderr.contains("a line that is neither a key, a sequence item nor a continuation"),
+            "{doc:?}: {stderr:?}"
+        );
     }
     Ok(())
 }

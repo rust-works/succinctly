@@ -3479,6 +3479,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.in_document = true;
         // Every frame of the closing document has been closed, each key with its value or null.
         self.pending_explicit_key_below.clear();
+        self.explicit_key_scalar_start = None;
         // The document that's closing, if any -- `document_start_bp_pos`
         // still holds its root right up until the overwrite below.
         // `seen_any_document` is the only way to tell "no previous document"
@@ -9177,7 +9178,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let Some(owner_depth) = self.pending_explicit_key else {
             return false;
         };
-        !matches!(self.peek(), Some(b'#' | b'\n' | b'\r' | b':') | None)
+        // A `:` that is followed by a blank is the key's value indicator, which the dispatch judges;
+        // `:x` is a plain scalar.
+        let value_indicator =
+            self.peek() == Some(b':') && Self::is_ws_break_or_eoi(self.peek_at(1));
+        !matches!(self.peek(), Some(b'#' | b'\n' | b'\r') | None)
+            && !value_indicator
             && self
                 .indent_stack
                 .get(owner_depth - 1)
