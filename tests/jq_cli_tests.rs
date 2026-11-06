@@ -33280,26 +33280,21 @@ fn test_map_identity_reports_clean_error_on_adversarial_nesting_1793() -> Result
 /// (`path_expr_is_cursor_navigable`), so this reaches the same #1793
 /// `catch_unwind` this file's other adversarial-nesting tests above already
 /// pin -- matching their exact assertion shape.
+///
+/// Since #6356 the walker's guard is the native-stack floor in jq mode, not 384, so this chain
+/// answers jq 1.7.1's path; `tests/jq_cli/i6356.rs` pins the refusal past the floor.
 #[test]
-fn test_path_cursor_native_deep_static_chain_reports_cleanly_not_stack_overflow_2058() -> Result<()>
-{
-    let filter = format!("path({})", ".a".repeat(400));
+fn test_path_cursor_native_deep_static_chain_answers_as_jq_2058_6356() -> Result<()> {
+    let filter = format!("path({}) | length", ".a".repeat(400));
     let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("{}"))?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
-        "stderr: {stderr:?}"
-    );
-    assert!(
-        !stderr.contains("stack overflow") && !stderr.contains("fatal runtime error"),
-        "stderr: {stderr:?}"
-    );
+    assert_eq!((stdout.as_str(), stderr.as_str(), code), ("400\n", "", 0));
     Ok(())
 }
 
 /// #3429: a static chain between the old 256 ceiling and the new 384 one
 /// answers -- the guard runs before each stage's step, so 384 components are
-/// the most the walker takes (the 385th is the first refused).
+/// the most the walker takes without a native-stack floor (#6356: the CLI has
+/// one, so the 385th answers here and `tests/jq_cli/i6356.rs` pins it).
 #[test]
 fn test_path_cursor_native_static_chain_up_to_384_answers_3429() -> Result<()> {
     for components in [300, 384] {

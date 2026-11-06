@@ -358,14 +358,39 @@ pub(crate) fn guard_nesting_depth(depth: usize) -> Result<(), EvalError> {
 /// `.. | path` and `path(..)` take a *document* nested up to 383 levels (a path as long as the
 /// document is deep must stay under the ceiling), and a static chain
 /// (`path(.a.a...)`) takes up to 384 *components*, because the guard runs
-/// before each stage's step.
+/// before each stage's step. That is the whole bound only without a native-stack floor: under
+/// [`with_value_depth_on_stack_floor`](super::with_value_depth_on_stack_floor), which both CLIs arm,
+/// the walkers' guard defers to the floor past this (#6356).
 pub const MAX_PATH_WALK_DEPTH: usize = super::value::MAX_VALUE_TREE_DEPTH;
 
 /// [`guard_nesting_depth`]'s sibling for the path walkers: a
-/// `decode_failure`-tagged `Err` past [`MAX_PATH_WALK_DEPTH`] levels (#3429).
+/// `decode_failure`-tagged `Err` past [`MAX_PATH_WALK_DEPTH`] levels (#3429), or, once the
+/// native-stack floor is armed, only where that floor is spent (#6356).
+///
+/// [`check_value_tree_depth`](super::value::check_value_tree_depth) makes the same decision for
+/// the owned walk, which is why a chain the walker refused answered with a trailing slice. It is
+/// not called here because its error is a `resource_limit`, where this one keeps its tag.
 #[inline]
 pub(crate) fn guard_path_walk_depth(depth: usize) -> Result<(), EvalError> {
-    check_depth_with(depth, MAX_PATH_WALK_DEPTH, EvalError::decode_failure)
+    if depth < MAX_PATH_WALK_DEPTH {
+        Ok(())
+    } else {
+        guard_path_walk_depth_past_constant()
+    }
+}
+
+/// [`guard_path_walk_depth`] past [`MAX_PATH_WALK_DEPTH`], out of line like
+/// [`check_value_tree_depth`](super::value::check_value_tree_depth)'s own cold half.
+#[cold]
+#[inline(never)]
+fn guard_path_walk_depth_past_constant() -> Result<(), EvalError> {
+    if crate::jq::eval::value_depth_on_stack_floor() {
+        Ok(())
+    } else {
+        Err(EvalError::decode_failure(
+            super::value::value_tree_depth_exceeded_message(),
+        ))
+    }
 }
 
 /// A document number's double under `S`'s number model, for the

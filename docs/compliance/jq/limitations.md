@@ -12856,7 +12856,9 @@ narrowing:
   document first (a descent inside a larger path expression such as `path(.. | .a?)`, a bare
   `path(..)` over a computed value rather than the input document (`map(.) | path(..)`, `{a: 1} | path(..)`),
   `path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, among others) stop at 256, the
-  materializers' ceiling, chosen for native-stack safety. Past the ceiling they return
+  materializers' ceiling, chosen for native-stack safety.
+  `succinctly jq` arms the native-stack floor, so there a static chain (`path(.a.a...)`) passes 384 components as jq does and refuses only where the floor is spent ([#6356](https://github.com/rust-works/succinctly/issues/6356)); a library caller arms none and keeps 384.
+  Past the ceiling they return
   `nesting depth exceeds limit of 384` (or `256`) as a `QueryResult::Error`, tagged as a decode
   failure so a `try` in the filter does not swallow it, and never as an unwinding panic: the
   walkers report it as an error, as do the comment-preserving and standard-JSON materializers
