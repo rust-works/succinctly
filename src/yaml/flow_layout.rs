@@ -15,6 +15,14 @@ pub struct FlowItem {
     /// Whether the element is itself a collection (empty or not), which takes its
     /// comment differently from a scalar. An alias to one is not: it is written `*x`.
     pub container: bool,
+    /// Whether the element is a mapping that is not empty (and not an alias), which takes the
+    /// comma before a foot inside its `}` when it is a sequence's last element.
+    pub mapping: bool,
+    /// Comments written on lines of their own above the element, `#` and all (#6334).
+    pub head: Vec<String>,
+    /// Comments written on lines of their own below the last element, before the closing
+    /// bracket (#6334); only the last element carries any.
+    pub foot: Vec<String>,
 }
 
 /// The indent a flow collection's elements continue at after a line break (#2708).
@@ -42,6 +50,11 @@ pub fn flow_continuation(indent: &str, step: &str) -> String {
 /// closes at `owner`, but a `}` always at column 0, which go-yaml does not do
 /// consistently. Without a comment this is the elements joined by `, `.
 ///
+/// A comment on a line of its own above an element (its head, #6334) sits on a line of its own at
+/// `continuation` before the element, which starts a line of its own too; the comma that precedes
+/// it ends the line above. One below the last element (its foot) follows a trailing comma the same
+/// way, and the closing bracket again gets a line of its own.
+///
 /// Out of line to keep the recursive emitter's frame small (see
 /// `emit_yaml_value_panics_past_nesting_depth_limit_1017`).
 #[inline(never)]
@@ -53,7 +66,10 @@ pub fn render_flow(
     continuation: &str,
     owner: &str,
 ) -> String {
-    if items.iter().all(|item| item.comment.is_none()) {
+    if items
+        .iter()
+        .all(|item| item.comment.is_none() && item.head.is_empty() && item.foot.is_empty())
+    {
         let joined = items
             .into_iter()
             .map(|item| item.text)
@@ -69,15 +85,29 @@ pub fn render_flow(
     }
     let mut out = String::from(open);
     let mut pending = Pending::Nothing;
+    let mut foot: Vec<String> = Vec::new();
+    let mut last_is_container = false;
+    let mut last_is_mapping = false;
     for (i, item) in items.into_iter().enumerate() {
+        let headed = !item.head.is_empty();
         match pending {
-            Pending::Nothing if i > 0 => out.push_str(", "),
+            Pending::Nothing if i > 0 => out.push_str(if headed { "," } else { ", " }),
             Pending::Nothing => {}
-            Pending::AfterScalar => {
+            Pending::AfterScalar if !headed => {
                 out.push('\n');
                 out.push_str(continuation);
             }
-            Pending::AfterCollection => out.push_str("\n, "),
+            Pending::AfterScalar => {}
+            Pending::AfterCollection => out.push_str(if headed { "\n," } else { "\n, " }),
+        }
+        for line in &item.head {
+            out.push('\n');
+            out.push_str(continuation);
+            out.push_str(line);
+        }
+        if headed {
+            out.push('\n');
+            out.push_str(continuation);
         }
         out.push_str(&item.text);
         pending = Pending::Nothing;
@@ -98,6 +128,31 @@ pub fn render_flow(
                 Pending::AfterScalar
             };
         }
+        foot = item.foot;
+        last_is_container = item.container;
+        last_is_mapping = item.mapping;
+    }
+    if !foot.is_empty() {
+        // go-yaml writes a trailing comma before the foot: after a mapping's entry and a
+        // sequence's scalar (after a line comment's own), none after a sequence's sequence and
+        // inside the `}` of a sequence's non-empty mapping.
+        match pending {
+            Pending::Nothing if open == '[' && last_is_container => {
+                if last_is_mapping && !out.ends_with("\n}") {
+                    out.pop();
+                    out.push_str(",}");
+                }
+            }
+            Pending::Nothing => out.push(','),
+            Pending::AfterScalar => {}
+            Pending::AfterCollection => out.push_str("\n,"),
+        }
+        for line in &foot {
+            out.push('\n');
+            out.push_str(continuation);
+            out.push_str(line);
+        }
+        pending = Pending::AfterScalar;
     }
     if pending != Pending::Nothing {
         out.push('\n');

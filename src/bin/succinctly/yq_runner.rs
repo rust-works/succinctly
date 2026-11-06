@@ -9519,11 +9519,29 @@ fn emit_yaml_value_at_depth(
                             elem_comments.meta().head_comment(),
                             indent,
                         );
-                        append_foot_comment_lines(
-                            rendered,
-                            elem_comments.meta().foot_comment(),
-                            indent,
-                        )
+                        // #6334: the foot of a last element that is itself a collection is written
+                        // when both close: on a line of its own below an empty one, at the indent of
+                        // the collection around them.
+                        if i + 1 == arr.len()
+                            && elem_comments.style() != "flow"
+                            && !elem_comments.meta().foot_comment().is_empty()
+                            && (matches!(v, OwnedValue::Array(a) if !a.is_empty())
+                                || matches!(v, OwnedValue::Object(o) if !o.is_empty()))
+                        {
+                            let outer =
+                                &indent[..indent.len().saturating_sub(config.indent_str.len())];
+                            append_foot_comment_lines(
+                                rendered + "\n",
+                                elem_comments.meta().foot_comment(),
+                                outer,
+                            )
+                        } else {
+                            append_foot_comment_lines(
+                                rendered,
+                                elem_comments.meta().foot_comment(),
+                                indent,
+                            )
+                        }
                     })
                     .collect();
                 join_block_entries(items)
@@ -9846,6 +9864,11 @@ fn flow_item(text: String, value: &OwnedValue, comments: &CommentTree) -> FlowIt
         text,
         comment: comments.own().map(str::to_string),
         container,
+        mapping: comments.alias_name().is_none()
+            && matches!(value, OwnedValue::Object(o) if !o.is_empty()),
+        // #6334: a mapping entry's are its key's, which the tree keeps on the value's node.
+        head: comments.meta().head_comment().to_vec(),
+        foot: comments.meta().foot_comment().to_vec(),
     }
 }
 
