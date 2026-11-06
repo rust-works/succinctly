@@ -41,7 +41,11 @@
 //! `\K`, `\G`, a comment) is parsed through `oniguruma_shadow`'s copy of it, which writes that syntax
 //! plainly at the same offsets, and every piece's text is still taken from the pattern (#6128).
 //! Those constructs are opaque: a body holding one keeps its loop, and a lookaround or atomic
-//! group has its own body rewritten. A lazy repeat that must run twice or more is written copy by
+//! group has its own body rewritten.
+//! The groups of a loop beside such syntax are copied too (#6426), when the syntax stands outside
+//! every repeat and holds no repeat and no group ([`copyable_beside_loops`]); the evaluator runs the
+//! text on `fancy-regex`.
+//! A lazy repeat that must run twice or more is written copy by
 //! copy up to its minimum by `Rewriter::lazy_counted`, which also writes a lazy `{0,n}?` or `{1,n}?`
 //! with a group; for an unbounded one over a body with a consuming way before
 //! its empty one that form still differs from Oniguruma's on a few patterns (#6128).
@@ -302,6 +306,25 @@ pub(crate) fn parse_distinct_names(pattern: &str) -> Option<DistinctNames> {
     None
 }
 
+/// [`parse_distinct_names`] for a rewrite that copies groups, and where the constructs of the
+/// pattern that the parsed copy reads as something else start (#6426). A pattern with a lookaround
+/// or an atomic group is read through the copy that writes them plainly, when none of them is in
+/// the way of the copies the rewrite writes ([`copyable_beside_loops`]).
+pub(crate) fn parse_for_group_copies(pattern: &str) -> Option<(DistinctNames, Vec<usize>)> {
+    if let Some(read) = parse_distinct_names(pattern) {
+        return Some((read, Vec::new()));
+    }
+    let shadow = super::eval::oniguruma_shadow(pattern)?;
+    // A rename would move the offsets of everything after it, so a repeated name keeps the pattern.
+    let mut read = parse_distinct_names(&shadow.text)?;
+    (read.renames.is_empty() && copyable_beside_loops(&read.ast, &shadow.opaque, pattern)).then(
+        || {
+            read.text = pattern.to_string();
+            (read, shadow.opaque)
+        },
+    )
+}
+
 /// What [`parse_distinct_names`] read.
 pub(crate) struct DistinctNames {
     /// The pattern, with each repeated use of a group name renamed.
@@ -326,7 +349,9 @@ pub(crate) fn original_name(name: Box<str>, renames: &[(String, String)]) -> Box
 /// [`rewrite`] for a pattern whose loops have a capture group where the plain rewrite would copy or
 /// drop it (#6332): the groups are tagged by number, the loops are written as they are without
 /// one, and each group the rewrite copied is read back through [`GroupRewrite::copies`]. `None`
-/// when the pattern has no group, needs no rewrite, or is not one the `regex` crate's parser reads.
+/// when the pattern has no group, needs no rewrite, or is not one the `regex` crate's parser reads,
+/// apart from a lookaround, atomic group or comment that stands in the way of no copy
+/// ([`copyable_beside_loops`], #6426).
 pub(crate) fn rewrite_with_groups(input: &str) -> Option<GroupRewrite> {
     written_with_groups(input, true)
 }
@@ -349,7 +374,7 @@ fn written_with_groups(input: &str, lazy_bounded: bool) -> Option<GroupRewrite> 
         text: distinct,
         ast,
         renames,
-    } = parse_distinct_names(pattern)?;
+    } = parse_for_group_copies(pattern)?.0;
     let pattern = distinct.as_str();
     let mut openers = Vec::new();
     capture_openers(&ast, &mut openers);
@@ -388,7 +413,7 @@ fn written_with_groups(input: &str, lazy_bounded: bool) -> Option<GroupRewrite> 
     // A group the rewrite left out would be read as unset, which is not what Oniguruma leaves, and
     // the count of the groups the result has must be the count of tags found.
     let mut found = Vec::new();
-    capture_openers(&ast::parse::Parser::new().parse(&pattern).ok()?, &mut found);
+    capture_openers(&parse_either(&pattern)?, &mut found);
     (!copies.iter().any(Vec::is_empty) && found.len() + 1 == compiled).then_some(())?;
     let mut names = Vec::new();
     capture_names(&ast, &mut names);
@@ -403,6 +428,58 @@ fn written_with_groups(input: &str, lazy_bounded: bool) -> Option<GroupRewrite> 
         compiled_groups: compiled,
         names,
     })
+}
+
+/// `pattern` parsed as written, or through the copy that writes its Oniguruma-only syntax plainly.
+fn parse_either(pattern: &str) -> Option<Ast> {
+    match ast::parse::Parser::new().parse(pattern) {
+        Ok(tree) => Some(tree),
+        Err(_) => {
+            let shadow = super::eval::oniguruma_shadow(pattern)?;
+            ast::parse::Parser::new().parse(&shadow.text).ok()
+        }
+    }
+}
+
+/// Whether the Oniguruma-only syntax of a pattern leaves the group-copy rewrite its loops (#6426):
+/// the rewrite copies the body of a loop and writes the groups of it again, which is only sound
+/// for a construct it never copies. `ast` is the parse of the pattern's shadow and `opaque` where
+/// the constructs the shadow reads as something else start. Each must stand outside every repeat, a
+/// lookaround, atomic group or comment must hold no repeat and no group, and a backreference is
+/// refused (the copies renumber the groups it names), as are `\K`, `\G`, `\Z` and `\R`, which
+/// the shadow reads as other escapes.
+fn copyable_beside_loops(ast: &Ast, opaque: &[usize], pattern: &str) -> bool {
+    fn holds_repeat_or_group(ast: &Ast) -> bool {
+        match ast {
+            Ast::Repetition(_) | Ast::Group(_) => true,
+            Ast::Alternation(alt) => alt.asts.iter().any(holds_repeat_or_group),
+            Ast::Concat(concat) => concat.asts.iter().any(holds_repeat_or_group),
+            _ => false,
+        }
+    }
+    fn walk(ast: &Ast, opaque: &[usize], in_repeat: bool) -> bool {
+        let here = opaque.binary_search(&ast.span().start.offset).is_ok();
+        match ast {
+            Ast::Literal(_) if here => false,
+            Ast::Group(group) if here => !in_repeat && !holds_repeat_or_group(&group.ast),
+            Ast::Group(group) => walk(&group.ast, opaque, in_repeat),
+            Ast::Repetition(rep) => walk(&rep.ast, opaque, true),
+            Ast::Alternation(alt) => alt.asts.iter().all(|a| walk(a, opaque, in_repeat)),
+            Ast::Concat(concat) => concat.asts.iter().all(|a| walk(a, opaque, in_repeat)),
+            _ => true,
+        }
+    }
+    !["\\K", "\\G", "\\Z", "\\R"]
+        .iter()
+        .any(|escape| pattern.contains(escape))
+        && walk(ast, opaque, false)
+}
+
+/// Whether the group-copy rewrite refuses `pattern` for the flag switches it starts with (#6426): one
+/// names `U`, or turns `x` on over a pattern with a `#`. The loops of such a pattern are not
+/// written at all, so the capture rewrite of #6069 is not enough for one that needs the copies.
+pub(crate) fn leading_switches_refuse(pattern: &str) -> bool {
+    leading_switches(pattern).is_none()
 }
 
 /// The length of the flag switches (`(?i)`, `(?s)`, `(?is)`) the pattern starts with, or `None`
@@ -2850,6 +2927,74 @@ mod tests {
             }
         }
         assert!(rewritten > 0, "no pattern was rewritten with its groups");
+    }
+
+    /// #6426: a loop with groups beside a lookaround, an atomic group or a comment is written with its
+    /// groups copied, the construct as it stands in the pattern; one in the way of the copies keeps
+    /// the pattern as written.
+    #[test]
+    fn a_loop_with_groups_beside_fancy_regex_syntax_is_written_with_its_copies_6426() {
+        for pattern in [
+            "(?=b)(?:(a)|b*|c)+",
+            "(?!c)(?:(a)|b*|c)+",
+            "(?<=b)(?:(a)|b*|c)+",
+            "(?<!c)(?:(a)|b*|c)+",
+            "(?>b)(?:(a)|b*|c)+",
+            "(?:(a)|b*|c)+(?=b|a)",
+            "(?#c)(?:(a)|b*|c)+",
+        ] {
+            let written = rewrite_with_groups(pattern).unwrap_or_else(|| panic!("{pattern}"));
+            let construct = pattern
+                .split('+')
+                .flat_map(|part| part.split(')'))
+                .find(|part| part.starts_with("(?") && !part.starts_with("(?:"))
+                .unwrap();
+            assert!(
+                written.pattern.contains(construct),
+                "{pattern}: {}",
+                written.pattern
+            );
+            // The groups of the copies are plain, and every group of the input has one.
+            assert!(!written.pattern.contains("?<__"), "{pattern}");
+            assert!(
+                written.copies.iter().all(|copies| !copies.is_empty()),
+                "{pattern}"
+            );
+        }
+        for pattern in [
+            // In a repeat, where the copies would run it again.
+            "(?:(?=b)(a)|b*|c)+",
+            "(?:(a)|(?!c)b*|c)+",
+            // Holding a group or a repeat.
+            "(?=(b))(?:(a)|b*|c)+",
+            "(?=b*)(?:(a)|b*|c)+",
+            "(?>(?:b))(?:(a)|b*|c)+",
+            // A backreference names a group the copies renumber.
+            "(a)\\1(?:(a)|b*|c)+",
+            "(?:(a)|b*|c)+(?<n>b)\\k<n>",
+            // Read as another escape by the plain copy of the pattern.
+            "(?=b)(?:(a)|b*|c)+\\K",
+            "(?=b)\\G(?:(a)|b*|c)+",
+            "(?=b)(?:(a)|b*|c)+\\Z",
+            "(?=b)(?:(a)|b*|c)+\\R",
+        ] {
+            assert!(rewrite_with_groups(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    /// #6426: a repeated group name is renamed in the pattern and in its plain copy alike.
+    #[test]
+    fn a_pattern_with_fancy_syntax_and_no_repeated_name_is_read_with_its_opaque_offsets_6426() {
+        let (read, opaque) = parse_for_group_copies("(?=b)(?<n>a)(?#c)").unwrap();
+        assert_eq!(read.text, "(?=b)(?<n>a)(?#c)");
+        assert_eq!(opaque, [0, 12]);
+        // A pattern the parser reads as written has no opaque construct.
+        assert_eq!(
+            parse_for_group_copies("(?<n>a)").unwrap().1,
+            Vec::<usize>::new()
+        );
+        // A repeated name moves the offsets after it, so the pattern keeps its text.
+        assert!(parse_for_group_copies("(?=b)(?<n>a)(?<n>b)").is_none());
     }
 
     #[test]
