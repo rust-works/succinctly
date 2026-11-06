@@ -26,8 +26,10 @@
 //! The plain [`rewrite`] keeps a loop as written when it would copy or drop a group, and counts the
 //! groups it writes ([`Rewriter::has_groups`]). A body with one way that matches nothing only where
 //! an anchor holds (`\b`, `\bb?`) has a conditional exit, on both sides of the ways after it, which is
-//! written from what the anchor is ([`Rewriter::anchored_repeat`], #6358). A body whose ways are not
-//! listed here keeps its loop as written too: one with two such ways, an empty way after one, an
+//! written from what the anchor is ([`Rewriter::anchored_repeat`], #6358). A second such way, or an
+//! empty way, is another exit: with no way after it, or the same anchor again, it is written too
+//! ([`Rewriter::second_exit`], #6424). A body whose ways are not
+//! listed here keeps its loop as written too: one with a way after that second exit, an
 //! assertion that is not an anchor, or a flag switch that names `x` or `U`. An assertion beside an item that consumes text
 //! does not matter: a way that must consume text always does, and the assertion only decides whether
 //! it matches, so `\Ba` and `a\z` are consuming ways and are copied with the rest (#6300). Any other
@@ -112,6 +114,18 @@ enum Ways {
 struct Anchor {
     text: Text,
     kind: AnchorKind,
+    /// A second exit that came last in the body was dropped from its ways (#6424): the loop writes
+    /// it back as `E`, the body's empty way, last among each head's ways, where the first exit's `E`
+    /// is guarded by the anchor ([`Rewriter::second_exit`]).
+    last: bool,
+}
+
+/// What a second exit after an anchor's comes to ([`Rewriter::second_exit`], #6424).
+enum SecondExit {
+    /// An anchor that holds only where the first does: it is nothing.
+    Same,
+    /// A last exit, past every way but the first's: the loop writes it back as its last way.
+    Last,
 }
 
 #[derive(Clone)]
@@ -984,6 +998,7 @@ impl Rewriter<'_> {
                 anchor: Box::new(Anchor {
                     text: text.clone(),
                     kind,
+                    last: false,
                 }),
                 after: None,
             },
@@ -1200,6 +1215,9 @@ impl Rewriter<'_> {
     /// the text starts or ends it holds at most where that end's anchor does, whatever the other
     /// is, and `\b\b` is `\b`. `None` for a pair that holds nowhere or says nothing simple.
     fn both_anchors(first: &Anchor, second: &Anchor) -> Option<AnchorKind> {
+        if first.last || second.last {
+            return None;
+        }
         match (&first.kind, &second.kind) {
             (AnchorKind::Start, _) | (_, AnchorKind::Start) => Some(AnchorKind::Start),
             (AnchorKind::End, _) | (_, AnchorKind::End) => Some(AnchorKind::End),
@@ -1234,6 +1252,7 @@ impl Rewriter<'_> {
                 anchor: match (anchor, mark) {
                     (false, mark) => mark,
                     (true, mark) => Box::new(Anchor {
+                        last: mark.last,
                         text: wrap(mark.text)?,
                         kind: match mark.kind {
                             AnchorKind::Word { fails } => AnchorKind::Word {
@@ -1373,6 +1392,7 @@ impl Rewriter<'_> {
                         anchor: Box::new(Anchor {
                             text: self.concat_text(&[&first.text, &second.text])?,
                             kind,
+                            last: false,
                         }),
                         after: None,
                     },
@@ -1388,7 +1408,7 @@ impl Rewriter<'_> {
                         before: a2,
                         after: b2,
                     },
-                ) if gone.is_none() => {
+                ) if gone.is_none() && !anchor.last => {
                     let then = |way: &Option<Text>| {
                         way.as_ref()
                             .map(|way| self.concat_text(&[&anchor.text, way]))
@@ -1410,7 +1430,7 @@ impl Rewriter<'_> {
                         anchor,
                         after: None,
                     },
-                ) => {
+                ) if !anchor.last => {
                     let then = |way: Option<Text>| {
                         way.map(|way| self.concat_text(&[&way, &anchor.text]))
                             .transpose()
@@ -1472,6 +1492,9 @@ impl Rewriter<'_> {
     fn alt(&self, items: &[Piece], listed: bool) -> Result<Piece, GiveUp> {
         let mut before = Vec::new();
         let mut after = Vec::new();
+        // #6424: the ways after a second exit, which `after` then holds only up to.
+        let mut late = Vec::new();
+        let mut second: Option<Option<Box<Anchor>>> = None;
         let mut nullable = false;
         let mut unknown = !listed;
         let mut opaque = false;
@@ -1483,11 +1506,32 @@ impl Rewriter<'_> {
             match &item.ways {
                 Ways::Unknown => unknown = true,
                 Ways::Opaque => opaque = true,
+                // A dropped last exit is last among the ways of the repeat's body, not of a part.
+                Ways::Anchored { anchor, .. } if anchor.last => opaque = true,
+                Ways::Consuming if second.is_some() => late.push(item.text.clone()),
                 Ways::Consuming if nullable || anchored.is_some() => after.push(item.text.clone()),
                 Ways::Consuming => before.push(item.text.clone()),
                 // #6358: one anchor is an exit on either side of the ways after it. A second, or an
                 // empty way after it, is another exit past those ways, which the forms of
-                // [`Self::anchored_loop`] do not write.
+                // [`Self::anchored_loop`] do not write, so it is read after the loop
+                // ([`Self::second_exit`], #6424).
+                Ways::Anchored {
+                    before: a,
+                    anchor,
+                    after: b,
+                } if anchored.is_some() && second.is_none() => {
+                    after.extend(a.clone());
+                    late.extend(b.clone());
+                    second = Some(Some(anchor.clone()));
+                }
+                Ways::Nullable {
+                    before: a,
+                    after: b,
+                } if anchored.is_some() && second.is_none() => {
+                    after.extend(a.clone());
+                    late.extend(b.clone());
+                    second = Some(None);
+                }
                 Ways::Anchored { .. } | Ways::Nullable { .. } if anchored.is_some() => {
                     opaque = true;
                 }
@@ -1524,6 +1568,13 @@ impl Rewriter<'_> {
                 }
             }
         }
+        if let (Some(exit), Some(first), false) = (second, &mut anchored, unknown || opaque) {
+            match Self::second_exit(first, exit.as_deref(), late.is_empty()) {
+                Some(SecondExit::Same) => after.append(&mut late),
+                Some(SecondExit::Last) => first.last = true,
+                None => opaque = true,
+            }
+        }
         let ways = if unknown {
             Ways::Unknown
         } else if opaque {
@@ -1548,6 +1599,34 @@ impl Rewriter<'_> {
             prec: Prec::Concat,
         });
         Ok(Piece { text, ways })
+    }
+
+    /// What a second exit `second` (an anchor, or `None` for a way that matches nothing anywhere)
+    /// after the first, `first`, comes to in `A | c1 | B | c2 | C` (#6424). Oniguruma tries what the
+    /// continuation `K` does at a head once, at the first exit that holds there: a later exit is
+    /// the same `K` at the same head, which has already failed. So `c2` matters only where `c1`
+    /// does not hold, and only if some way `C` stands after it:
+    /// - with no `C`, it is the exit every loop ends with after its ways, except that it sets what
+    ///   the empty way sets (a group around the body): the loop writes it back last
+    ///   ([`Anchor::last`]);
+    /// - an anchor that holds only where `c1` does (the same one again) is never the first to
+    ///   hold, so it is nothing.
+    ///
+    /// `None` for any other pair, which needs an exit written on both sides of `B` and `C`: the
+    /// order of `K` among the ways then depends on which anchor holds at each head. (`\b` and
+    /// `\B` right after one another hold together everywhere, which is the empty way, but no draw
+    /// of `--assert` holds that pair and none improved when it was written.)
+    fn second_exit(first: &Anchor, second: Option<&Anchor>, no_after: bool) -> Option<SecondExit> {
+        let start = |anchor: &Anchor| matches!(anchor.text.text.as_str(), r"\A" | "^");
+        match second {
+            Some(second)
+                if first.text.text == second.text.text || (start(first) && start(second)) =>
+            {
+                Some(SecondExit::Same)
+            }
+            _ if no_after => Some(SecondExit::Last),
+            _ => None,
+        }
     }
 
     fn repeat(
@@ -1875,6 +1954,17 @@ impl Rewriter<'_> {
             return Ok(kept);
         }
         let exit = self.empty_text(ast)?;
+        // #6424: a dropped last exit is `E` last among the ways of each head, and the first exit's
+        // `E` is the one where the anchor holds. `E` tries the anchor's way before it tries any
+        // other, so the anchor in front of it is the same exit, and only where it holds.
+        let (exit_all, exit) = if anchor.last {
+            (
+                Some(exit.clone()),
+                self.concat_text(&[&anchor.text, &exit])?,
+            )
+        } else {
+            (None, exit)
+        };
         let ops = onig_ops(ast, self.folds).filter(|_| !self.shadowed);
         let copied = |length: Option<usize>, count: u32| {
             length
@@ -1888,7 +1978,7 @@ impl Rewriter<'_> {
         };
         let text = match (greedy, max) {
             (false, _) => {
-                if min < 2 || (max.is_none() && self.oniguruma_unrolls(ast, min)) {
+                if min < 2 || (max.is_none() && self.oniguruma_unrolls(ast, min)) || anchor.last {
                     return Ok(kept);
                 }
                 let (before, after) = (before.clone(), after.clone());
@@ -1900,7 +1990,12 @@ impl Rewriter<'_> {
                 });
             }
             (true, None) => {
-                let mut rest = self.anchored_loop(before, anchor, after, &exit)?;
+                let mut rest = self.anchored_loop(
+                    before,
+                    anchor,
+                    after,
+                    (&exit, exit_all.as_ref().unwrap_or(&exit)),
+                )?;
                 if min > 0 && copied(ops, min) {
                     let copies = self.repeat_text(body, min, Some(min), true)?;
                     rest = self.concat_text(&[&copies, &rest])?;
@@ -1912,6 +2007,7 @@ impl Rewriter<'_> {
                             .into_iter()
                             .chain([exit.clone()])
                             .chain(last)
+                            .chain(exit_all.clone())
                             .collect();
                         rest = self.alt_text(&list)?.ok_or(GiveUp)?;
                     }
@@ -1932,6 +2028,7 @@ impl Rewriter<'_> {
                         .into_iter()
                         .chain([exit.clone()])
                         .chain(last)
+                        .chain(exit_all.clone())
                         .chain(leave)
                         .collect();
                     rest = self.alt_text(&list)?.ok_or(GiveUp)?;
@@ -1966,7 +2063,7 @@ impl Rewriter<'_> {
         before: &Option<Text>,
         anchor: &Anchor,
         after: &Option<Text>,
-        exit: &Text,
+        (first_exit, exit): (&Text, &Text),
     ) -> Result<Text, GiveUp> {
         let star = |text: &Text| self.repeat_text(text, 0, None, true);
         let looped = before.as_ref().map(star).transpose()?;
@@ -1988,7 +2085,17 @@ impl Rewriter<'_> {
             }
             (Some(iteration), AnchorKind::Start) => {
                 let more = self.repeat_text(&iteration, 1, None, true)?;
-                self.text(format!("(?:{}|{}|)", exit.text, more.text), Prec::Atom)?
+                // #6424: a dropped last exit holds past the ways too, at every head, so it ends
+                // the ways of the later heads (`more`) and what is left of the first.
+                let (more, none) = if anchor.last {
+                    (self.concat_text(&[&more, &leave])?, leave.clone())
+                } else {
+                    (more, self.concat_text(&[])?)
+                };
+                self.text(
+                    format!("(?:{}|{}|{})", first_exit.text, more.text, none.text),
+                    Prec::Atom,
+                )?
             }
             (Some(iteration), AnchorKind::End) => {
                 self.concat_text(&[&star(&iteration)?, &leave])?
