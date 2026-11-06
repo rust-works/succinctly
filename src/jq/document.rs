@@ -6356,4 +6356,15 @@ mod element_index_defaults_tests {
         let (cursor, _) = rest.uncons_cursor().expect("a second element");
         assert_eq!(cursor.value().as_i64(), Some(2));
     }
+
+    /// Only a YAML document with no content prints as its header alone; a format with no header
+    /// (JSON) always has a value line, so the trait default answers `false` (#5721).
+    #[test]
+    fn a_json_cursor_is_never_a_header_only_document_5721() {
+        let json = br"null";
+        let index = JsonIndex::build(json);
+        assert!(!super::DocumentCursor::is_header_only_document(
+            &index.root(json)
+        ));
+    }
 }
