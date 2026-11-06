@@ -4099,6 +4099,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Parse an unquoted key (stops at colon+space).
     fn parse_unquoted_key(&mut self) -> Result<usize, YamlError> {
         let start = self.pos;
+        if self.yq_mode {
+            self.reject_unstartable_plain_at(self.pos)?;
+        }
 
         while let Some(b) = self.peek() {
             match b {
@@ -5377,7 +5380,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         _ => {
                             let start = self.pos;
                             let end = self.parse_unquoted_value_with_indent(indent);
-                            self.check_unicode_break_tab()?;
+                            self.check_plain_scalar()?;
                             self.check_json_strict_scalar(start, end)?;
                             // The scan stops at a `: ` of a later line: no node of its own (#5083), as
                             // for a value on the key's line (#5064).
@@ -5888,7 +5891,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.write_bp_open();
                 let end_pos = self.parse_unquoted_value_with_indent(indent);
                 self.explicit_key_scalar_start = self.last_plain_scalar.map(|span| span.start);
-                self.check_unicode_break_tab()?;
+                self.check_plain_scalar()?;
                 // The scan stops at a `: ` of a later line (`? a⏎  b: 1`): that is a mapping
                 // inside the key's node, which yq refuses, not the entry's value (#5086). A `: `
                 // on the `?` line is the compact mapping arm above.
@@ -6124,7 +6127,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.set_ib();
                 self.write_bp_open();
                 let end_pos = self.parse_unquoted_value_with_indent(indent);
-                self.check_unicode_break_tab()?;
+                self.check_plain_scalar()?;
                 self.set_bp_text_end(end_pos);
                 self.write_bp_close();
             }
@@ -6164,7 +6167,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             _ => {
                 let start = self.pos;
                 let end = self.parse_unquoted_value_with_indent(min_indent);
-                self.check_unicode_break_tab()?;
+                self.check_plain_scalar()?;
                 self.check_json_strict_scalar(start, end)?;
                 end
             }
@@ -6290,7 +6293,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.set_ib();
                 self.write_bp_open();
                 let end_pos = self.parse_unquoted_value_with_indent(min_indent);
-                self.check_unicode_break_tab()?;
+                self.check_plain_scalar()?;
                 self.set_bp_text_end(end_pos);
                 self.write_bp_close();
                 // The scalar stops at a `: ` and what follows is no node (#5064), so `- a` /
@@ -7426,6 +7429,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.record_flow_tag()?;
 
         let start = self.pos;
+        if self.yq_mode {
+            self.reject_unstartable_plain_at(self.pos)?;
+        }
 
         while let Some(b) = self.peek() {
             match b {
@@ -7586,6 +7592,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Returns the absolute end position (with trailing whitespace trimmed).
     fn parse_flow_unquoted_value(&mut self) -> Result<usize, YamlError> {
         let start = self.pos;
+        if self.yq_mode {
+            self.reject_unstartable_plain_at(self.pos)?;
+        }
 
         while let Some(b) = self.peek() {
             match b {
@@ -7691,6 +7700,30 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
+    /// The checks of the plain scalar the scanner just read: the byte it started on (#6402), then the
+    /// Unicode-break tab (#6214). Every site that reads a block plain scalar calls this one.
+    #[inline(always)]
+    fn check_plain_scalar(&self) -> Result<(), YamlError> {
+        if self.yq_mode {
+            if let Some(span) = self.last_plain_scalar {
+                self.reject_unstartable_plain_at(span.start)?;
+            }
+        }
+        self.check_unicode_break_tab()
+    }
+
+    /// #6402: go-yaml's scanner starts no plain scalar, key or value, block or flow, on `%`, `@` or a
+    /// backtick (`found character that cannot start any token`), and a `%` at column 0 is read as a
+    /// directive before that, wherever it stands: a line after a document has started
+    /// (`a: 1⏎%TAG ! x:`, `!!str⏎%YAML 1.2`) is an error in yq, where this read it as content.
+    /// A `%` that continues a plain scalar is content and never reaches here.
+    fn reject_unstartable_plain_at(&self, at: usize) -> Result<(), YamlError> {
+        if matches!(self.input.get(at), Some(b'%' | b'@' | b'`')) {
+            return Err(self.err_unexpected_char(at, "found character that cannot start any token"));
+        }
+        Ok(())
+    }
+
     /// #6214: the Unicode-break tab check for the plain scalar the scanner just read. Inlined to one
     /// flag test, so a document without a tab pays nothing but that; the search is out of line.
     #[inline(always)]
@@ -7783,6 +7816,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.record_flow_tag()?;
 
         let start = self.pos;
+        if self.yq_mode {
+            self.reject_unstartable_plain_at(self.pos)?;
+        }
 
         while let Some(b) = self.peek() {
             match b {
@@ -9884,7 +9920,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                                 _ => {
                                     let end = self
                                         .parse_own_line_unquoted_value(indent, is_truly_doc_root);
-                                    self.check_unicode_break_tab()?;
+                                    self.check_plain_scalar()?;
                                     self.reject_content_after_inline_value()?;
                                     end
                                 }
@@ -10005,7 +10041,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         _ => {
                             let start = self.pos;
                             let end = self.parse_own_line_unquoted_value(indent, is_truly_doc_root);
-                            self.check_unicode_break_tab()?;
+                            self.check_plain_scalar()?;
                             self.check_json_strict_scalar(start, end)?;
                             self.reject_content_after_inline_value()?;
                             end
