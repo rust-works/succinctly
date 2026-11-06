@@ -4929,6 +4929,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Where an empty value goes (#6386): at its key's colon, or at the end of its properties. Never
         // on the next line, whose first byte the reader would decode the node from.
         let null_at = if had_property { self.pos } else { colon_end };
+        self.reject_explicit_key_after_implicit_key()?;
 
         // Parse value
         if self.at_line_end() {
@@ -5359,6 +5360,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // Consume any leading `&anchor` and/or `!tag` - they prefix the
             // actual value.
             self.parse_node_properties()?;
+            self.reject_explicit_key_after_implicit_key()?;
 
             // After anchor, check if value continues on next line
             if self.at_line_end() {
@@ -5873,7 +5875,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
-    /// Parse an explicit value (`: value` after explicit key).
+    /// `key: ? x`: an explicit key indicator straight after an implicit key's colon, on its line. It cannot
+    /// open a mapping there (that is `key:` / `  ? x`, or `: ? x` after an explicit key's own colon), and
+    /// yq stops with `mapping keys are not allowed in this context`; the line was read as the plain scalar
+    /// `? x` (#6379). A property between the two (`key: &a ? x`) does not change it, and `?x` and `?? x`
+    /// stay plain scalars.
+    fn reject_explicit_key_after_implicit_key(&self) -> Result<(), YamlError> {
+        if self.peek() == Some(b'?') && Self::is_ws_break_or_eoi(self.peek_at(1)) {
+            return Err(
+                self.err_unexpected_char(self.pos, "mapping keys are not allowed in this context")
+            );
+        }
+        Ok(())
+    }
+
     /// An explicit key that is the first entry of a compact mapping standing where a node is expected:
     /// the node after `? ` (#6322), after the `- ` that opens a key sequence (#6340) and after an
     /// explicit value's `: ` (#6340). The one place these three sites share, so a refusal added to
@@ -5908,6 +5923,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
+    /// Parse an explicit value (`: value` after explicit key).
     fn parse_explicit_value(&mut self, indent: usize) -> Result<(), YamlError> {
         // Same ambiguous-gap error as parse_mapping_entry (#901).
         self.check_mapping_under_mapping_gap(indent)?;
@@ -6530,6 +6546,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         if self.peek() == Some(b':') {
             self.advance();
             self.skip_flow_whitespace();
+            // `[? k : ? v]`: refused by yq as `[k: ? v]` is (#6379).
+            self.reject_explicit_key_after_implicit_key()?;
 
             // Parse value (if present before , or ])
             if !matches!(self.peek(), Some(b',' | b']' | b'}') | None) {
@@ -6602,6 +6620,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
         self.advance();
         self.skip_flow_whitespace();
+        self.reject_explicit_key_after_implicit_key()?;
 
         // Parse value (if present before , or ])
         if !matches!(self.peek(), Some(b',' | b']' | b'}') | None) {
@@ -7232,6 +7251,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
                 self.advance(); // Skip `:`
                 self.skip_flow_whitespace();
+                self.reject_explicit_key_after_implicit_key()?;
 
                 self.parse_flow_value_node()?;
             } else if matches!(self.peek(), Some(b',' | b'}')) {
