@@ -17,6 +17,7 @@ there are any). Without it, it only lists where `--bin` still differs, classifie
     yq-refuses-we-read   accepts YAML yq refuses (the usual residual: a tolerance, or a stray line dropped)
     we-refuse-yq-reads   refuses YAML yq reads (the direction users meet)
     values-differ        both read it and print different values
+    timeout              a run took over 20 s (reported apart from a refusal, which it is not)
 
 `--wide` adds flow collections, quoted scalars, block scalars, comments, anchors, tags and document
 markers to the pool; many of its residual differences are an *indented* `---` or `%YAML` line, which
@@ -50,7 +51,7 @@ def run(cmd, text):
     try:
         done = subprocess.run(cmd + ["-o", "json", "-I0", "."], input=text.encode(), capture_output=True, timeout=20)
     except subprocess.TimeoutExpired:
-        return (True, None)
+        return ("timeout", None)
     return (done.returncode != 0, None if done.returncode != 0 else done.stdout.decode())
 
 
@@ -90,9 +91,12 @@ def main():
     print(f"documents {len(seen)}  fixed {fixed}  regressions {len(regressions)}  still differ {len(still)}")
     for text in regressions[: args.show]:
         print("REGRESSION", repr(text))
-    classes = {"yq-refuses-we-read": [], "we-refuse-yq-reads": [], "values-differ": []}
+    classes = {"yq-refuses-we-read": [], "we-refuse-yq-reads": [], "values-differ": [], "timeout": []}
     for text, oracle, ours in still:
-        key = "yq-refuses-we-read" if oracle[0] else "we-refuse-yq-reads" if ours[0] else "values-differ"
+        if "timeout" in (oracle[0], ours[0]):
+            key = "timeout"
+        else:
+            key = "yq-refuses-we-read" if oracle[0] else "we-refuse-yq-reads" if ours[0] else "values-differ"
         classes[key].append((text, oracle, ours))
     for key, rows in classes.items():
         print(f"{key}: {len(rows)}")
