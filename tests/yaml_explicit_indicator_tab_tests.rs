@@ -142,3 +142,14 @@ fn a_property_before_an_explicit_key_indicator_is_refused_in_both_builds() {
         assert!(YamlIndex::build_yq(doc).is_ok(), "{doc:?}");
     }
 }
+
+/// #6379: a tab right after the `?` of a nested key stays refused in the library loader, as before
+/// (`parse_nested_explicit_key`'s own check), for the three positions that reach it; yq refuses it
+/// through the shared rule.
+#[test]
+fn a_tab_right_after_a_nested_explicit_key_indicator_is_refused_in_both_builds() {
+    for doc in [&b"? ?\tx\n"[..], b"? - ?\tx\n", b"? a\n: ?\tx\n"] {
+        assert!(YamlIndex::build(doc).is_err(), "{doc:?}: the library");
+        assert!(YamlIndex::build_yq(doc).is_err(), "{doc:?}: yq");
+    }
+}

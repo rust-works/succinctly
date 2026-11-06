@@ -6100,7 +6100,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 scan_tag_extent(self.input, self.pos).0
             };
             if end <= self.pos {
-                break;
+                break; // patchcov: coverage tolerate-line reason="unreachable: both scanners consume at least the `&` or `!` they start on, so `end` is past the cursor; kept so a scanner that returned early could not loop forever (#6379)"
             }
             self.pos = end;
             self.skip_inline_whitespace();
