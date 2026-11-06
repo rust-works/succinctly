@@ -7682,6 +7682,7 @@ Pinned by `tests/jq_cli/i6229.rs`.
 Every refused pattern is `Regex failure: <message>` in jq mode, as in jq, so `try test("[") catch .` is `"Regex failure: premature end of char-class"` in both.
 A refusal the `regex` crate's parser makes is given Oniguruma's message from the error's kind: an unclosed group (`(a`, `(?:`, `(?=`, `\p{L`) is `end pattern with unmatched parenthesis`, an unopened one (`a)`) `unmatched close parenthesis`, `a{2,1}` `upper is smaller than lower in repeat range`, `(?`, `(?i` and `(?#abc` `end pattern in group`, `(?<x` and `\k<x` `invalid group name <x>`, `\k<x>` and `\g<x>` to a name no group has `undefined name <x> reference`, `\k<1>` `invalid backref number/name`, and an unknown property `invalid character property name {Foo}`.
 A repeat count past Oniguruma's 100000 (`x{100001}`, `x{1000,100001}`, `x{99999999}`) is `too big number for repeat range`, which the crate either compiled (and matched) or refused for its size; `x{,100001}` is answered, as in jq.
+Inside a look-around or an atomic group (`(?=a{100001})`), which the crate's parser cannot read, such a count is still answered where jq refuses it, as before.
 A refusal of a construct jq accepts (a call `\g<a>` to a group the pattern has, a range cutter `(?~|…)`) has no Oniguruma message, and keeps the crate's rendered parse error after the prefix.
 The rows are pinned against jq 1.7.1 in `tests/jq_cli/i6423.rs`.
 `succinctly yq` is not affected: its patterns are Go's, refused in Go's words (``error parsing regexp: missing closing ]: `[` ``).

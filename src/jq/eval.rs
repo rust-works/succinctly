@@ -33176,7 +33176,7 @@ fn build_regex_uncached<S: EvalSemantics>(
             }),
             // #6423: jq mode says it in Oniguruma's words where there are some; yq's dialect is
             // Go's, which `go_regex::translate` has already worded.
-            None if S::TAG == EvalTag::Yq => Err(EvalError::new(format!("Regex failure: {e}"))),
+            None if S::TAG == EvalTag::Yq => Err(EvalError::new(format!("invalid regex: {e}"))),
             None => Err(EvalError::new(
                 match oniguruma_refusal(as_written.as_deref().unwrap_or(&pattern)) {
                     Some(message) => format!("Regex failure: {message}"),
@@ -33255,9 +33255,24 @@ fn oniguruma_refusal(pattern: &str) -> Option<String> {
                 }
                 ErrorKind::GroupUnclosed => Some(UNMATCHED_OPEN.into()),
                 ErrorKind::GroupUnopened => Some("unmatched close parenthesis".into()),
-                ErrorKind::RepetitionCountInvalid => {
-                    Some("upper is smaller than lower in repeat range".into())
-                }
+                // Oniguruma checks each count against its limit before it compares the two.
+                ErrorKind::RepetitionCountInvalid => Some(
+                    if at(start)
+                        .split('}')
+                        .next()
+                        .unwrap_or_default()
+                        .split(|c: char| !c.is_ascii_digit())
+                        .any(|count| {
+                            count.len() > 6 || count.parse().unwrap_or(0) > ONIG_MAX_REPEAT_NUM
+                        })
+                    {
+                        "too big number for repeat range".into()
+                    } else {
+                        "upper is smaller than lower in repeat range".into()
+                    },
+                ),
+                // A count too large for the crate's `u32` (`x{4294967296}`).
+                ErrorKind::DecimalInvalid => Some("too big number for repeat range".into()),
                 ErrorKind::FlagUnexpectedEof => Some("end pattern in group".into()),
                 // An unclosed comment group, `(?#abc`.
                 ErrorKind::FlagUnrecognized
@@ -33296,6 +33311,20 @@ fn oniguruma_refusal(pattern: &str) -> Option<String> {
                         return at(start)
                             .starts_with("\\k")
                             .then(|| "invalid backref number/name".into());
+                    }
+                    // `\k<x-1>` names group `x` at a recursion level.
+                    let name = match name.rfind(['+', '-']) {
+                        Some(sign)
+                            if sign > 0
+                                && name[sign + 1..].bytes().all(|b| b.is_ascii_digit())
+                                && sign + 1 < name.len() =>
+                        {
+                            &name[..sign]
+                        }
+                        _ => name,
+                    };
+                    if name.starts_with(|c: char| c.is_ascii_digit()) {
+                        return Some(format!("invalid group name <{name}>"));
                     }
                     let defined = pattern.contains(&format!("(?<{name}>"))
                         || pattern.contains(&format!("(?'{name}'"))

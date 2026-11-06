@@ -71,6 +71,14 @@ const REFUSED: &[(&str, &str)] = &[
     ("x{1000,100001}", "too big number for repeat range"),
     ("a{100000,100001}", "too big number for repeat range"),
     ("x{99999999}", "too big number for repeat range"),
+    // The crate refuses these first, for the order of the counts or their size.
+    ("a{100001,5}", "too big number for repeat range"),
+    ("a{100001,100000}", "too big number for repeat range"),
+    ("x{4294967296}", "too big number for repeat range"),
+    ("x{1,4294967296}", "too big number for repeat range"),
+    // A name with a recursion level is the group's name; one that starts with a digit is no name.
+    (r"\k<x-1>", "undefined name <x> reference"),
+    (r"\k<1x>", "invalid group name <1x>"),
 ];
 
 #[test]
