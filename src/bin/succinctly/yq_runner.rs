@@ -4829,7 +4829,7 @@ fn copy_alias_marks(src: &CommentTree, dst: &mut CommentTree) {
 fn resolve_computed_assign_value(expr: &Expr, root: &OwnedValue) -> Option<Expr> {
     match expr {
         Expr::Assign { path, value } => {
-            if static_nav_steps(value).is_some() {
+            if static_nav_steps(value).is_some() || !may_name_a_node(value) {
                 return None;
             }
             let read = static_read_of(value, root)?;
@@ -4846,6 +4846,22 @@ fn resolve_computed_assign_value(expr: &Expr, root: &OwnedValue) -> Option<Expr>
             Some(Expr::pipe(stages))
         }
         _ => None,
+    }
+}
+
+/// Whether `value` can be a read of a node at all: a literal, a construction, arithmetic and a
+/// comma are values of their own or several, so they skip the two evaluations
+/// [`static_read_of`] costs.
+fn may_name_a_node(value: &Expr) -> bool {
+    match value {
+        Expr::Paren(inner) => may_name_a_node(inner),
+        Expr::Literal(_)
+        | Expr::Array(_)
+        | Expr::Object(_)
+        | Expr::Arithmetic { .. }
+        | Expr::Comma(_)
+        | Expr::Identity => false,
+        _ => true,
     }
 }
 
@@ -7900,15 +7916,16 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
         }
     }
 
-    // Copy the source's trailing comment and flow style through a plain assignment from a static
-    // read (#5249). It comes before the alias pass below and carries no anchor mark of its own,
-    // so that pass stays the one place an alias mark is decided.
     // A value operand that is computed but still names one node (`.b // 0`, `select(true)`) is
-    // read as that node by the three passes below (#5249).
+    // read as that node by the three passes below (#5249). Only the first assignment of a chain
+    // is resolved: a later one reads what an earlier one wrote.
     let resolved_value = presentation_sync_ctx
         .as_ref()
         .and_then(|(pristine_value, _)| resolve_computed_assign_value(expr, pristine_value));
     let pass_expr = resolved_value.as_ref().unwrap_or(expr);
+    // Copy the source's trailing comment and flow style through a plain assignment from a static
+    // read (#5249). It comes before the alias pass below and carries no anchor mark of its own,
+    // so that pass stays the one place an alias mark is decided.
     if let Some((pristine_value, pristine)) = &presentation_sync_ctx {
         for (value, comments) in docs.iter_mut().flatten() {
             propagate_assign_copied_presentation(

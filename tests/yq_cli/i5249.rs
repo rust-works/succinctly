@@ -248,6 +248,18 @@ fn test_an_alias_target_over_an_edited_alias_source_5249() -> Result<()> {
 #[test]
 fn test_a_computed_operand_naming_one_node_copies_it_5249() -> Result<()> {
     for (input, filter, expected) in [
+        // A negative index is counted from the end of the array as the document had it.
+        (
+            "a: &x 1\nc: &y 2\nb: [*x, *y]\n",
+            ".d = (.b[-1] // 0)",
+            "a: &x 1\nc: &y 2\nb: [*x, *y]\nd: *y\n",
+        ),
+        // Two nodes with the same value: the one the operand reads is the one copied.
+        (
+            "x: &x 1\ny: 1\n",
+            ".c = (.y // .x)",
+            "x: &x 1\ny: 1\nc: 1\n",
+        ),
         (
             "a: &x 1\nb: *x\n",
             ".c = (.b // 0)",
@@ -327,6 +339,17 @@ fn test_a_computed_operand_that_is_not_one_node_stays_plain_5249() -> Result<()>
             "a: &x 1\nb: *x\nc: 2\n",
         ),
         ("a: !Foo x\n", ".b = \"lit\"", "a: !Foo x\nb: lit\n"),
+        // Several results, a construction and a compound assignment are not one node read: yq
+        // aliases `.c` in the first and third (the rows #5249 still tracks); the value is right.
+        (
+            "a: &x 1\nb: *x\n",
+            ".c = (.a, .b)",
+            "a: &x 1\nb: *x\nc: 1\n",
+        ),
+        ("a: !Foo x\n", ".c = [.a]", "a: !Foo x\nc:\n  - x\n"),
+        ("a: &x 1\nb: *x\n", ".c += .b", "a: &x 1\nb: *x\nc: 1\n"),
+        // An operand that falls back to a value has no node to copy.
+        ("a: !Foo x\n", ".c = (.nope // 7)", "a: !Foo x\nc: 7\n"),
     ] {
         let (output, exit_code) = run_yq_stdin(filter, input, &[])?;
         assert_eq!(exit_code, 0, "filter: {filter} on {input:?}");
