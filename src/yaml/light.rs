@@ -10183,7 +10183,6 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
                         line.trim_start_matches([' ', '\t']).as_bytes(),
                     ))
             {
-            {
                 out.write_str("# ")?;
             }
             out.write_str(line)?;
