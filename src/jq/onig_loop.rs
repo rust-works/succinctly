@@ -265,7 +265,8 @@ pub(crate) fn parse_distinct_names(pattern: &str) -> Option<DistinctNames> {
     let mut text = pattern.to_string();
     let mut renames: Vec<(String, String)> = Vec::new();
     // Each pass renames one use; a pattern with more repeated uses than this keeps its text.
-    for _ in 0..MAX_NAME_RENAMES {
+    // One parse more than renames, so that the last rename is read.
+    for _ in 0..=MAX_NAME_RENAMES {
         match ast::parse::Parser::new().parse(&text) {
             Ok(tree) => {
                 return Some(DistinctNames {
