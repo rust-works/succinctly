@@ -227,17 +227,19 @@ fn test_alias_mark_dropped_when_the_write_destroys_the_anchor_2505() -> Result<(
     Ok(())
 }
 
-/// A negative index is read from the finished tree, so a later stage that changes the length of
-/// that array leaves the copy plain where yq aliases the element it read at the time. The value
-/// is right; only the spelling is not (recorded in `limitations.md`).
+/// A negative index in the first assignment of a chain is counted from the end of the array as
+/// the document had it, so a later stage that grows the array does not move the element the copy
+/// aliases: `d` is `*y`, as in yq (#5249; it printed `d: 2` before the operand was resolved to
+/// the node it names).
 #[test]
-fn test_negative_index_source_stays_plain_when_a_later_stage_grows_the_array_2505() -> Result<()> {
+fn test_negative_index_source_aliases_the_element_read_when_a_later_stage_grows_the_array_2505(
+) -> Result<()> {
     let (output, exit_code) = run_yq_stdin(
         ".d = .b[-1] | .b[2] = 1",
         "a: &x 1\nc: &y 2\nb: [*x, *y]\n",
         &[],
     )?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "a: &x 1\nc: &y 2\nb: [*x, *y, 1]\nd: 2\n");
+    assert_eq!(output, "a: &x 1\nc: &y 2\nb: [*x, *y, 1]\nd: *y\n");
     Ok(())
 }

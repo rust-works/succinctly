@@ -175,11 +175,10 @@ alias against.
 Since [#2505](https://github.com/rust-works/succinctly/issues/2505) the same pass also reaches the plain shapes #2497 left out:
 a target under a parent the write created (`.c.d = .b`, `.c[0] = .b`), a comma of targets (`(.c, .d) = .b`), a negative index on the source (`.c = .b[-1]`, read from the comment tree, which knows the array's length) and a source container that holds an alias (`.c = .b` on a block `b:\n  - *x`, each alias inside it stays one in the copy).
 Pinned by `tests/yq_cli/i2505.rs`.
-A negative index is read from the finished tree, so a later stage that changes the length of that array (`.d = .b[-1] | .b[2] = 1`) leaves the copy plain where yq aliases the element it read at the time; the value is right.
 A negative index in the first assignment of a chain, source or target (`.a[-1] = .a[0]`), is counted from the end of the array as the document had it (#5407), so the copy carries the source's quoting, comment and style.
 The alias marks of such a target are placed the same way for a lone assignment (`.a[-3] = .a[-4]` over an anchored element).
 In a later assignment of a chain it is still not a static path to this pass (`.a += ["z"] | .a[-1] = .a[0]`, where the array length is not the document's), so the copy stays plain.
-Still plain where yq prints `*x`, each listed on #5249 (the residual of #2505): a constructed right side (`.c = [.b]`, `.c = {"z": .b}`), a right side that is not syntactic navigation although the path register knows its source (`.c = (.b // 0)`, `.c = (.b | select(true))`, `.c = (.a, .b)`; rule 4(b) below for the shapes that change the value), a compound assignment (`.c += .b`), and the alias group a copy joins (`.c = .b | .a = 5` leaves `c` an alias of the rewritten anchor in yq).
+Still plain where yq prints `*x`, each listed on #5249 (the residual of #2505): a constructed right side (`.c = [.b]`, `.c = {"z": .b}`), a right side that names several nodes (`.c = (.a, .b)`; rule 4(b) below for the shapes that change the value), a compound assignment (`.c += .b`), and the alias group a copy joins (`.c = .b | .a = 5` leaves `c` an alias of the rewritten anchor in yq).
 Since [#5249](https://github.com/rust-works/succinctly/issues/5249) the source's trailing comment and flow style are copied too (`.c = .b` on `b: *x # bc` is `c: *x # bc`, on `b: [*x]` it is `c: [*x]`), and so is everything under a copied container (each item's and field's comment and style).
 This is `propagate_assign_copied_presentation`, and it is not specific to aliases: `.c = .b` on `b: [1, 2] # t` copies the comment and the flow style of a document with no alias in it.
 The source's comment wins when it has one, and the target's own comment stays when it has none, as in yq.
@@ -5284,8 +5283,9 @@ ruled out), even though real yq supports every one of them:
   core tags that only restate a type and keeps the rest. Checked against yq v4.53.3 on ~1,900
   random tagged documents.
   A node a write copies from a plain path (`.b = .a`) keeps its tag, as in yq ([#5257](https://github.com/rust-works/succinctly/issues/5257)).
-  A node copied from a computed right-hand side (`.c = [.a]`, `.c = (.a // 1)`) loses it, with its comment and quoting
+  A node copied from a constructed right-hand side (`.c = [.a]`) loses it, with its comment and quoting
   ([#5249](https://github.com/rust-works/succinctly/issues/5249)).
+  A right-hand side that is computed but names one node (`.c = (.a // 1)`, `.c = (.a | select(true))`) is read as that node, and keeps all three.
   Not matched: `!!set` members print `null` where yq prints `''`; and a tagged `null` that a path write walks through
   (`a: !Foo null` + `.a.b = 5`) becomes a mapping where yq leaves the document alone. A tagged
   empty value (`a: !Foo` with nothing after it) is written `!Foo null`. A tag on a mapping *key*
@@ -5296,7 +5296,7 @@ ruled out), even though real yq supports every one of them:
   on a container (`a: !!null [1]`) is dropped by `-P` and kept by the default route, where yq
   turns the value into `null` on both ([#4111](https://github.com/rust-works/succinctly/issues/4111)). A key's tag
   is kept when a write copies its mapping from a plain path (`.a = .b` over a tagged key in `.b`),
-  and lost when the right-hand side is computed (`.a = (.b // 1)`, `. as $x | .a = $x.b`,
+  and lost when the right-hand side is constructed or bound (`.a = [.b]`, `. as $x | .a = $x.b`,
   [#5249](https://github.com/rust-works/succinctly/issues/5249)).
   A key deleted and written again in the same filter is a new node and keeps
   none of the old key's anchor, tag, quoting or key comment, and nothing beneath it either: a
