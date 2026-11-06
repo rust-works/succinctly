@@ -60,6 +60,11 @@ exclude = [
   # every retry, failing Check Links on main and on every PR that touches no link
   # (#5130). Drop this once the server recovers.
   '^https://graphics\.stanford\.edu/',
+  # "The YAML Document from Hell" (docs/compliance/yaml/1.2.md, twice) stopped accepting
+  # connections ("Network unreachable" on every retry; `curl` from a laptop fails to connect
+  # too), failing Check Links on PRs that touch no link. The Wayback Machine holds a snapshot
+  # from 2026-04-12. Drop this once the site recovers.
+  '^https://ruudvanasseldonk\.com/',
   # A link pinned to a commit SHA cannot rot, but GitHub's web tier serves those
   # HTML pages with 503/504s for hours at a time (#3594), and a `commit/` page
   # has no raw form to check instead.
