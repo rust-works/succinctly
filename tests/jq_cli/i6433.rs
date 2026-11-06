@@ -68,6 +68,8 @@ fn a_count_past_the_limit_is_refused_wherever_the_brace_stands_6433() -> Result<
         ("a(?x)b#{100001}", "false"),
         ("(?x:a#{100001})", "end pattern with unmatched parenthesis"),
         ("a{100001}#", TOO_BIG),
+        // A callout's braces are no interval; one after it is.
+        ("(?{100001})a{100001}", TOO_BIG),
     ])
 }
 
@@ -102,6 +104,9 @@ fn a_call_has_its_own_refusals_6433() -> Result<()> {
         (r"\g<0>", "never ending recursion"),
         // A signed zero names no group.
         (r"(a)\g<+0>", "invalid group name <+0>"),
+        // A call to a group the pattern has is read past for a later error.
+        (r"(a)\g<1>(", "end pattern with unmatched parenthesis"),
+        (r"(a)\g<-1>)", "unmatched close parenthesis"),
         (r"\g<-0>", "invalid group name <-0>"),
         // The first of two calls' refusals, and a later unclosed group before a call's.
         (r"\g<n>\g<1>", "undefined name <n> reference"),
@@ -165,5 +170,19 @@ fn many_oversized_counts_after_an_earlier_error_are_one_compile_6433() -> Result
         r#""Regex failure: empty range in char class""#
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    Ok(())
+}
+
+/// A callout (`(?{...})`, `(*name)`) is not read here, but its braces are never counted: the refusal
+/// is the crate's, never `too big` (jq answers `true` and `invalid callout name`).
+#[test]
+fn a_callout_s_braces_are_no_interval_6433() -> Result<()> {
+    for pattern in ["(?{100001})", "(*{100001})"] {
+        let answer = caught(pattern)?;
+        assert!(
+            answer.starts_with(r#""Regex failure: regex parse error"#),
+            "{pattern}: {answer}"
+        );
+    }
     Ok(())
 }
