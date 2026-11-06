@@ -4319,26 +4319,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.pop_type();
                 self.write_bp_close();
 
-                // The sequence just closed may itself have been the
-                // pending explicit key's own implicit value (`? k\n-
-                // item\n`, at the same indent as the key). Clear the
-                // stale flag now that the key's real value is fully
-                // closed -- unlike every other pop site's
-                // `close_pending_explicit_key()` call, no null is
-                // synthesized here: the key already received a real
-                // value, so this isn't the "encountered without an
-                // explicit value" case that helper handles. Left stale,
-                // a later mapping entry at this same indent would be
-                // silently misattributed to the closed key instead of
-                // starting fresh (#1040). Shares
-                // `pending_explicit_key_owns_current_frame`'s predicate
-                // with `close_pending_explicit_key` rather than
-                // re-deriving it here (#106).
-                if self.pending_explicit_key_owns_current_frame() {
-                    // A key still waiting here had the sequence as its content (`?⏎- a⏎k: w`,
-                    // #6370): it has no value, which is its null.
-                    self.close_pending_explicit_key();
-                }
+                // The sequence just closed was the pending explicit key's own content
+                // (`?⏎- a⏎k: w`, #6370): a non-empty key refuses a same-column sequence as its
+                // value (#1104), and a bare `?` takes it as the key, so the key has no value
+                // yet. It gets its null here, as at every other pop site. (Before #6370 this
+                // cleared the flag with no null, because a bare `?` made the sequence the
+                // key's value; left stale, a later entry at this indent was misattributed to
+                // the closed key, #1040.)
+                // Shares `pending_explicit_key_owns_current_frame`'s predicate with
+                // `close_pending_explicit_key` rather than re-deriving it here (#106).
+                self.close_pending_explicit_key();
             }
         }
     }

@@ -23,6 +23,13 @@ const ROWS: &[(&str, &str)] = &[
     ("?\n- a\n: v\n? b\n: c\n", "{\"\":\"v\",\"b\":\"c\"}\n"),
     ("? \n- a\n: v\n", "{\"\":\"v\"}\n"),
     ("- ?\n  - a\n  : v\n", "[{\"\":\"v\"}]\n"),
+    // Properties, comments and CRLF around the key.
+    ("? &x\n- a\n: v\n", "{\"\":\"v\"}\n"),
+    ("? !!seq\n- a\n: v\n", "{\"\":\"v\"}\n"),
+    ("? # c\n- a\n: v\n", "{\"\":\"v\"}\n"),
+    ("?\n# c\n- a\n: v\n", "{\"\":\"v\"}\n"),
+    ("?\n- a\n# c\n: v\n", "{\"\":\"v\"}\n"),
+    ("?\r\n- a\r\n: v\r\n", "{\"\":\"v\"}\n"),
     // The sequence one column in was the key's content already, and a non-empty key still refuses a
     // same-column sequence (#1104).
     ("?\n - a\n - b\n: v\n", "{\"\":\"v\"}\n"),

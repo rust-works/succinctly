@@ -749,7 +749,7 @@ On the sequence `- a`, `- "bad\x"`, `- 3`, `- 4`, `.[:1]` is `["a"]` (`-o=json`)
 The structure of the sequence is still checked as before.
 The reasoning, the table and the pin are in [jq limitations § A slice of an array validates only the elements it keeps](../jq/limitations.md#a-slice-of-an-array-validates-only-the-elements-it-keeps-6231); the yq rows are in `tests/yq_cli/i6231.rs`.
 
-### An explicit `?` key next to a block sequence — rejected when the key has content; the bare `?` shape remains (#1104)
+### An explicit `?` key next to a block sequence — rejected when the key has content (#1104), the bare `?` shape is the key (#6370)
 
 Real yq reads a block sequence at a mapping's indent as the implicit value of an ordinary
 `key:` entry, but never as the value of an explicit key: `? k` / `- item` fails with
@@ -757,18 +757,22 @@ Real yq reads a block sequence at a mapping's indent as the implicit value of an
 node on the `?` line (`? k`, `? "k"`, `? [a]`, `? a: b`, `? - a`), with its own message
 (`a sequence cannot be an explicit key's implicit value`).
 
-Still different, each live-verified against yq v4.53.3:
+A bare `?` followed by a sequence at its own column is the key's content, as in yq
+([#6370](https://github.com/rust-works/succinctly/issues/6370); YAML test suite 6PBE):
 
 ```bash
 $ printf -- '---\n?\n- a\n- b\n:\n- c\n- d\n' | yq -o=json -I=0 .
-{"":["c","d"]}                       # succinctly: {"":["a","b","c","d"]}
+{"":["c","d"]}                      # succinctly: the same
 $ printf '?\n- item\n' | yq -o=json -I=0 .
-{"":null}                            # succinctly: {"":["item"]}
+{"":null}                            # succinctly: the same
 ```
 
-- **A bare `?` followed by a same-indent sequence** (YAML test suite 6PBE) keeps parsing, with
-  the sequence read as the value. Neither tool matches the spec (`{["a","b"]: ["c","d"]}`), and
-  rejecting it here would stop the conformance suite's 6PBE parsing at all.
+Still different, each live-verified against yq v4.53.3:
+
+- **An explicit key nested in a key sequence's item** (`?` / `- ? a` / `  : b`, and with the dash on the
+  `?` line, `? - ? a` / `    : b`) is `inconsistent indentation` here where yq answers `{"":null}`.
+  The bare spelling read the sequence as the value before #6370 and answered `{"":[{"a":"b"}]}`, which was
+  wrong too.
 - **A key whose content starts on the next line** (`?` / `  k`) is read like one that starts on the
   `?` line (#4532): `?` / `  k` / `x: 1` is `{"k":null,"x":1}` and `?` / `  k` / `- item` is an
   error, as in yq. The content takes the same checks as on the `?` line, gaps included (`? : v` and
