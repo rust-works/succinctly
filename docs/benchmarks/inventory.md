@@ -635,7 +635,7 @@ Internal micro-benchmarks for succinct data structures. Not documented in separa
   - 10K queries across various BP sizes (1K-1M opens)
   - Compares binary search vs sampled select
 
-- **bp_rank_micro**: BP rank1 performance, the baseline for #596 (drop `rank_l2`)
+- **bp_rank_micro**: BP rank1 performance; the baseline #596 (drop `rank_l2`) was measured against and rejected
   - Flat, deep and mixed trees at four sizes; run with `cargo bench --bench bp_rank_micro`
 
 - **elias_fano**: Elias-Fano compressed sequence operations

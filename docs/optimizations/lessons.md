@@ -243,6 +243,16 @@ The P-series and O-series YAML parser and query optimizations, newest last.
   - **A test of "no work was done" must be able to fail**: the first draft of the cache-state test ended its sequence on the element the cache was parked on, so removing the guard still passed; found by mutating the guard, fixed by ending on a different element
   - Key insight: a doc comment saying a default "costs them nothing" is a claim about the *default*, not about the code that decides whether to call it — the wrapper resolved a position before reaching the free default. Check what runs *before* the cheap branch
   - See [docs/parsing/yaml.md#o8-skip-the-delimiter-checks-yaml-cannot-fail--accepted-](../parsing/yaml.md#o8-skip-the-delimiter-checks-yaml-cannot-fail--accepted-) for full analysis
+- ❌ F1 (Drop BP's `rank_l2`): **REJECTED** - `rank1` 1.6-2.4x slower for 0.1-0.4% less peak memory, issue #596
+  - Hypothesis: `rank_l2` is 64 bits per 512-bit block (12.5% of the BP bitmap); Poppy omits the per-word level and popcounts up to 7 words of the block, which is the cache line the partial word is read from anyway
+  - Implemented fully (`rank1` sums the block's whole words before the partial one; `select1`'s word-locate step popcounts from the block start; the field, its builder and `BpSelectCtx::rank_l2` deleted; 0 test failures) and measured on a 7950X and an M4 Pro, interleaved, identical outputs
+  - **`rank1` (`bp_rank_micro`, per 10,000 queries):** 7950X 22.3-25.5 µs → 38.8-43.2 µs (1.58-1.76x); M4 Pro 10.4-12.5 µs → 24.9-25.6 µs (2.04-2.41x). Tree shape is neutral, as before
+  - **`select1` (`bp_select_micro`):** `select1_cspoppy` 7950X +28% to +39%, M4 Pro −0.2% to +5.9%; the unsampled `select1` rows and the binary-search rows move with `rank1`
+  - **End to end (100 MB, `comprehensive` and `users`):** `jq` +3.4% to +7.0% on both machines (`[..|scalars]|length`, `.`), `yq` 0.0% to +2.1% (medians)
+  - **What it bought:** peak RSS −0.1 to −0.8 MiB on 100 MB inputs (0.03-0.4%). The BP bitmap is 2 bits per node, a few percent of peak memory, so 12.5% of it is a rounding error next to the input-sized structures
+  - Why the popcounts lose on both architectures: the table lookup is one dependent load from a line that is hot, three instructions on the ARM side; up to seven popcounts plus a variable-trip loop are not cheaper than one load, and `count_ones()` on baseline x86_64 is not one instruction ([simd.md](simd.md#per-word-popcounts-on-baseline-x86_64-5035))
+  - Key insight: a space saving is a percentage *of the structure it comes from*, then of the whole. 12.5% of a structure that is a few percent of memory is a fraction of a percent; the issue's "largest remaining memory win" framing was never checked against the total
+  - See [docs/plan/cspoppy.md](../plan/cspoppy.md#f1--drop-bps-rank_l2-largest-remaining-win--issue-596) for the measurement tables
 
 ## UTF-8 validation log
 
