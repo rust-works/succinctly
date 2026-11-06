@@ -45,7 +45,7 @@ fn test_a_repeat_with_only_a_comment_before_it_stays_refused_6165() -> Result<()
     for pattern in [r"(?#)?", "(?#c)+", "(?:(?#)?)", "a|(?#x)*", r"(?#a\)b)?"] {
         let (stdout, stderr, code) = matches(pattern)?;
         assert_eq!(code, 5, "{pattern}: stdout={stdout:?} stderr={stderr:?}");
-        assert!(stderr.contains("invalid regex"), "{pattern}: {stderr:?}");
+        assert!(stderr.contains("Regex failure"), "{pattern}: {stderr:?}");
     }
     for (pattern, expected) in [
         ("a(?#)?", r#"[[0,0,""],[1,1,"a"],[2,0,""],[3,0,""]]"#),

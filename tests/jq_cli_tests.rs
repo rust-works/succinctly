@@ -16358,14 +16358,11 @@ fn test_match_reports_invalid_regex_error() -> Result<()> {
     // ever forward an ordinary `EvalError`, never a halt -- a distinct case
     // from the pattern-argument arm above. Verified against jq 1.7.1:
     // `jq -n '"abc" | match("(")'` errors with "Regex failure: end pattern
-    // with unmatched parenthesis" and exits 5; succinctly reports its own
-    // "invalid regex: ..." wording for the same malformed pattern (message
-    // parity is a separate concern from the exit code, per this file's other
-    // uncaught-error tests).
+    // with unmatched parenthesis" and exits 5; succinctly reports the same message (#6423).
     let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | match("(")"#], None)?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    assert!(stderr.contains("invalid regex"), "{stderr}");
+    assert!(stderr.contains("Regex failure"), "{stderr}");
     Ok(())
 }
 
@@ -16388,7 +16385,7 @@ fn test_scan_reports_invalid_regex_error() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | scan("(")"#], None)?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    assert!(stderr.contains("invalid regex"), "{stderr}");
+    assert!(stderr.contains("Regex failure"), "{stderr}");
     Ok(())
 }
 

@@ -58,7 +58,7 @@ fn test_a_repeated_group_that_is_an_assertion_is_refused_6127() -> Result<()> {
         assert_eq!(code, 5, "{pattern}: stdout={stdout:?} stderr={stderr:?}");
         assert_eq!(stdout, "", "{pattern}");
         assert!(
-            stderr.contains("invalid regex: target of repeat operator is invalid"),
+            stderr.contains("Regex failure: target of repeat operator is invalid"),
             "{pattern}: {stderr:?}"
         );
     }

@@ -8,13 +8,13 @@ use anyhow::Result;
 
 use crate::run_jq_full;
 
-/// The refusal jq prints, with this crate's `invalid regex:` prefix where jq says `Regex failure:`.
+/// The refusal jq prints, `Regex failure: <message>` (#6423).
 fn assert_refused(filter: &str, message: &str) -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
     assert_eq!(code, 5, "{filter}: stdout={stdout:?} stderr={stderr:?}");
     assert_eq!(stdout, "", "{filter}");
     assert!(
-        stderr.contains(&format!("invalid regex: {message}")),
+        stderr.contains(&format!("Regex failure: {message}")),
         "{filter}: {stderr:?}"
     );
     Ok(())
@@ -150,7 +150,7 @@ fn test_a_pattern_that_ends_inside_an_option_run_stays_refused_6126() -> Result<
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!(code, 5, "{filter}: stdout={stdout:?} stderr={stderr:?}");
         assert_eq!(stdout, "", "{filter}");
-        assert!(stderr.contains("invalid regex:"), "{filter}: {stderr:?}");
+        assert!(stderr.contains("Regex failure:"), "{filter}: {stderr:?}");
     }
     Ok(())
 }

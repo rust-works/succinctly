@@ -62,7 +62,7 @@ fn test_only_the_first_caret_of_a_class_negates_it_6193() -> Result<()> {
             Some(want) => assert_eq!((stdout.trim_end(), code), (*want, 0), "{pattern}: {stderr}"),
             None => {
                 assert_eq!((stdout.as_str(), code), ("", 5), "{pattern}: {stderr}");
-                assert!(stderr.contains("invalid regex"), "{pattern}: {stderr}");
+                assert!(stderr.contains("Regex failure"), "{pattern}: {stderr}");
             }
         }
     }
@@ -116,7 +116,7 @@ fn test_a_second_caret_ends_the_class_start_in_every_scan_6193() -> Result<()> {
             ),
             None => {
                 assert_eq!((stdout.as_str(), code), ("", 5), "{pattern}: {stderr}");
-                assert!(stderr.contains("invalid regex"), "{pattern}: {stderr}");
+                assert!(stderr.contains("Regex failure"), "{pattern}: {stderr}");
             }
         }
     }

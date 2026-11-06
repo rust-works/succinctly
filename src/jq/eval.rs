@@ -28454,17 +28454,17 @@ fn refuse_unknown_group_option(rest: &[char]) -> Result<(), EvalError> {
         Some(c) if c.is_ascii_alphabetic() => {}
         Some('-') if !rest.get(1).is_some_and(char::is_ascii_digit) => {}
         // `(?)`: no option at all.
-        Some(')') => return Err(EvalError::new("invalid regex: undefined group option")),
+        Some(')') => return Err(EvalError::new("Regex failure: undefined group option")),
         _ => return Ok(()),
     }
     if rest.starts_with(&['R', ')']) {
-        return Err(EvalError::new("invalid regex: unmatched close parenthesis"));
+        return Err(EvalError::new("Regex failure: unmatched close parenthesis"));
     }
     for &c in rest {
         match c {
             'i' | 'm' | 'x' | 's' | '-' => {}
             ')' | ':' => return Ok(()),
-            _ => return Err(EvalError::new("invalid regex: undefined group option")),
+            _ => return Err(EvalError::new("Regex failure: undefined group option")),
         }
     }
     Ok(())
@@ -28718,7 +28718,7 @@ fn translate_posix_brackets(
         }
         if bare.contains('(') && repeats_assertion_group(&bare.chars().collect::<Vec<_>>()) {
             return Err(EvalError::new(
-                "invalid regex: target of repeat operator is invalid",
+                "Regex failure: target of repeat operator is invalid",
             ));
         }
         return Ok(translated);
@@ -28731,7 +28731,7 @@ fn translate_posix_brackets(
         && repeats_assertion_group(&pattern.chars().collect::<Vec<_>>())
     {
         return Err(EvalError::new(
-            "invalid regex: target of repeat operator is invalid",
+            "Regex failure: target of repeat operator is invalid",
         ));
     }
     // #6201: a look-behind with alternatives of different widths.
@@ -28741,7 +28741,7 @@ fn translate_posix_brackets(
         && look_behind_alternatives_differ(pattern)
     {
         return Err(EvalError::new(
-            "invalid regex: invalid pattern in look-behind",
+            "Regex failure: invalid pattern in look-behind",
         ));
     }
     Ok(translated)
@@ -29726,7 +29726,7 @@ fn translate_posix_brackets_scan(
                     && repeat_follows_comments(&chars, end)
                 {
                     return Err(EvalError::new(
-                        "invalid regex: target of repeat operator is not specified",
+                        "Regex failure: target of repeat operator is not specified",
                     ));
                 }
                 if check_repetition
@@ -29773,7 +29773,7 @@ fn translate_posix_brackets_scan(
         if c == '\\' {
             // #6229: a backslash that ends the pattern escapes nothing.
             if i + 1 == chars.len() {
-                return Err(EvalError::new("invalid regex: end pattern at escape"));
+                return Err(EvalError::new("Regex failure: end pattern at escape"));
             }
             // #6220: `\X` has no fixed width, which a look-behind needs.
             if depth == 0
@@ -29783,7 +29783,7 @@ fn translate_posix_brackets_scan(
                     .any(|kind| matches!(kind, GroupKind::LookBehind { .. }))
             {
                 return Err(EvalError::new(
-                    "invalid regex: invalid pattern in look-behind",
+                    "Regex failure: invalid pattern in look-behind",
                 ));
             }
             // #6070: the escapes Oniguruma reads that the `regex` crate refuses or reads another way.
@@ -29879,7 +29879,7 @@ fn translate_posix_brackets_scan(
                         match property_name_kind(&raw) {
                             PropertyName::Refused => {
                                 return Err(EvalError::new(format!(
-                                    "invalid regex: invalid character property name {{{raw}}}"
+                                    "Regex failure: invalid character property name {{{raw}}}"
                                 )));
                             }
                             PropertyName::XDigit => {
@@ -29989,7 +29989,7 @@ fn translate_posix_brackets_scan(
             // (`^*`, `$+`, `\b?`, `\A{2}`); the `regex` crate repeats the empty match.
             if check_repetition && was_assertion && starts_repetition(&chars[i..]) {
                 return Err(EvalError::new(
-                    "invalid regex: target of repeat operator is invalid",
+                    "Regex failure: target of repeat operator is invalid",
                 ));
             }
             // #6181: a repeat operator right after a bare option group (`(?i)*`, `a(?i)+`,
@@ -29997,7 +29997,7 @@ fn translate_posix_brackets_scan(
             // item. `{,2}` is the literal run it is everywhere (see `starts_repetition`).
             if check_repetition && was_option && starts_repetition(&chars[i..]) {
                 return Err(EvalError::new(
-                    "invalid regex: target of repeat operator is not specified",
+                    "Regex failure: target of repeat operator is not specified",
                 ));
             }
             prev_assertion = c == '^' || c == '$';
@@ -30017,14 +30017,18 @@ fn translate_posix_brackets_scan(
                 && starts_repetition(&chars[i..])
                 && (i == body_start || after_pipe)
             {
+                // #6423: a `(?` that ends the pattern is a group header cut short, not a repeat.
+                if c == '?' && i + 1 == chars.len() && i > 0 && chars[i - 1] == '(' {
+                    return Err(EvalError::new("Regex failure: end pattern in group"));
+                }
                 return Err(EvalError::new(
-                    "invalid regex: target of repeat operator is not specified",
+                    "Regex failure: target of repeat operator is not specified",
                 ));
             }
             // #5529: jq refuses Python-style named groups (`(?P<n>...)`, `(?P=n)`, `(?P>n)`);
             // the `regex` crate accepts the first and would answer where jq errors.
             if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'P') {
-                return Err(EvalError::new("invalid regex: undefined group option"));
+                return Err(EvalError::new("Regex failure: undefined group option"));
             }
             // #6126: a group option other than `i`, `m`, `x`, `s` (`(?U)`, `(?u:...)`) is an error in
             // jq.
@@ -30049,7 +30053,7 @@ fn translate_posix_brackets_scan(
                             && starts_repetition(&chars[rest.min(chars.len())..])
                         {
                             return Err(EvalError::new(
-                                "invalid regex: target of repeat operator is not specified",
+                                "Regex failure: target of repeat operator is not specified",
                             ));
                         }
                         if let Some(group) = extended_in.last_mut() {
@@ -30093,7 +30097,7 @@ fn translate_posix_brackets_scan(
                 let kind = group_kind(&chars, i);
                 if look_behind_refuses(&kinds, kind) {
                     return Err(EvalError::new(
-                        "invalid regex: invalid pattern in look-behind",
+                        "Regex failure: invalid pattern in look-behind",
                     ));
                 }
                 let outer = extended_in.last().copied().unwrap_or(false);
@@ -30204,7 +30208,7 @@ fn translate_posix_brackets_scan(
                     out.push(']');
                     changed = true;
                 } else {
-                    return Err(EvalError::new("invalid regex: invalid POSIX bracket type"));
+                    return Err(EvalError::new("Regex failure: invalid POSIX bracket type"));
                 }
                 i = name_end;
                 at_start = false;
@@ -30241,14 +30245,14 @@ fn translate_posix_brackets_scan(
             }
         } else if c == ']' && !closes_later(&chars[i + 1..]) {
             // #6229: a `]` first in a class is a member only when another `]` follows to close it.
-            return Err(EvalError::new("invalid regex: empty char-class"));
+            return Err(EvalError::new("Regex failure: empty char-class"));
         } else if c == '&' || c == '~' {
             out.push('\\');
             changed = true;
             at_start = false;
         } else if c == '-' && !at_start && class_range_is_descending(&chars, class_from, i) {
             // #6273: the `regex` crate's own text for it differs from jq's.
-            return Err(EvalError::new("invalid regex: empty range in char class"));
+            return Err(EvalError::new("Regex failure: empty range in char class"));
         } else if c == '^' && at_start && !caret_taken {
             // The leading `^` keeps the position "first"; a second one is a member (#6193).
             caret_taken = true;
@@ -30273,7 +30277,7 @@ fn translate_posix_brackets_scan(
     }
     // #6229: a class still open at the end of the pattern.
     if depth > 0 {
-        return Err(EvalError::new("invalid regex: premature end of char-class"));
+        return Err(EvalError::new("Regex failure: premature end of char-class"));
     }
     Ok(if changed {
         std::borrow::Cow::Owned(out)
@@ -30800,7 +30804,7 @@ fn rewrite_onig_escape(
                 // engines' (it may name a group opened later).
                 let total = facts.get_or_insert_with(|| group_facts_of(chars)).total;
                 if number.is_some_and(|n| n > total) {
-                    return Err(EvalError::new("invalid regex: invalid backref number/name"));
+                    return Err(EvalError::new("Regex failure: invalid backref number/name"));
                 }
                 return Ok(None);
             }
@@ -30818,7 +30822,7 @@ fn rewrite_onig_escape(
             Ok((value <= 0x7F).then(|| (regex_char(value), 1 + digits)))
         }
         'c' => match after {
-            None => Err(EvalError::new("invalid regex: end pattern at control")),
+            None => Err(EvalError::new("Regex failure: end pattern at control")),
             Some(x) if (' '..='~').contains(&x) && x != '\\' => {
                 let value = if x == '?' { 0x7F } else { u32::from(x) & 0x9F };
                 Ok(Some((regex_char(value), 3)))
@@ -30872,7 +30876,7 @@ fn parse_brace_escape(
         at += 1;
     }
     if value > u64::from(u32::MAX) {
-        return Err(EvalError::new("invalid regex: too big number"));
+        return Err(EvalError::new("Regex failure: too big number"));
     }
     // Octal stops at a decimal digit (`\o{8}`), hex at a hex digit.
     let more = |c: &char| {
@@ -30883,17 +30887,17 @@ fn parse_brace_escape(
         }
     };
     if chars.get(at).is_some_and(more) {
-        return Err(EvalError::new("invalid regex: too long wide-char value"));
+        return Err(EvalError::new("Regex failure: too long wide-char value"));
     }
     if digits == 0 {
         return Ok(BraceEscape::Letter);
     }
     if chars.get(at) != Some(&'}') {
-        return Err(EvalError::new("invalid regex: invalid code point value"));
+        return Err(EvalError::new("Regex failure: invalid code point value"));
     }
     let limit = if in_class { 0x1F_FFFF } else { 0x13_FFFF };
     if value > limit {
-        return Err(EvalError::new("invalid regex: invalid code point value"));
+        return Err(EvalError::new("Regex failure: invalid code point value"));
     }
     Ok(BraceEscape::Point(
         u32::try_from(value).unwrap_or(u32::MAX),
@@ -31015,7 +31019,7 @@ fn class_hex_atom(chars: &[char], at: usize) -> Result<Option<(ClassAtom, usize)
     for _ in 1..need {
         let Some((byte, n)) = raw_byte_token(chars, end) else {
             return Err(EvalError::new(
-                "invalid regex: too short multibyte code string",
+                "Regex failure: too short multibyte code string",
             ));
         };
         tail.push(byte);
@@ -31024,7 +31028,7 @@ fn class_hex_atom(chars: &[char], at: usize) -> Result<Option<(ClassAtom, usize)
     let mut value = lead & (0x7F >> need);
     for byte in tail {
         if !(0x80..=0xBF).contains(&byte) {
-            return Err(EvalError::new("invalid regex: invalid code point value"));
+            return Err(EvalError::new("Regex failure: invalid code point value"));
         }
         value = value << 6 | (byte & 0x3F);
     }
@@ -31041,7 +31045,7 @@ fn class_hex_atom(chars: &[char], at: usize) -> Result<Option<(ClassAtom, usize)
 #[cfg(feature = "regex")]
 fn class_atoms_range(x: ClassAtom, y: ClassAtom) -> Result<String, EvalError> {
     if x.value > y.value {
-        return Err(EvalError::new("invalid regex: empty range in char class"));
+        return Err(EvalError::new("Regex failure: empty range in char class"));
     }
     let mut parts: Vec<(u32, u32)> = Vec::new();
     if (x.byte || y.byte) && x.value <= 0x7F {
@@ -31314,7 +31318,7 @@ fn rewrite_class_hex_escape(
         .and_then(|_| class_range_start(chars, class_from, i))
     {
         if start.value > atom.value {
-            return Err(EvalError::new("invalid regex: empty range in char class"));
+            return Err(EvalError::new("Regex failure: empty range in char class"));
         }
         let last = if start.byte && atom.byte {
             atom.value.min(0x7F)
@@ -31369,7 +31373,7 @@ fn rewrite_hex_escape(chars: &[char], i: usize) -> Result<Option<(String, usize)
         return Ok(None);
     };
     let need = match lead {
-        0x80..=0xBF => return Err(EvalError::new("invalid regex: invalid code point value")),
+        0x80..=0xBF => return Err(EvalError::new("Regex failure: invalid code point value")),
         0xC0..=0xDF => 2,
         0xE0..=0xEF => 3,
         0xF0..=0xF4 => 4,
@@ -31380,10 +31384,10 @@ fn rewrite_hex_escape(chars: &[char], i: usize) -> Result<Option<(String, usize)
     for k in 1..need {
         match byte_at(i + 4 * k) {
             Some(b @ 0x80..=0xBF) => bytes.push(b as u8),
-            Some(_) => return Err(EvalError::new("invalid regex: invalid code point value")),
+            Some(_) => return Err(EvalError::new("Regex failure: invalid code point value")),
             None => {
                 return Err(EvalError::new(
-                    "invalid regex: too short multibyte code string",
+                    "Regex failure: too short multibyte code string",
                 ))
             }
         }
@@ -31539,11 +31543,11 @@ fn open_group(
     let (captures, name, body_start) = group_header(chars, i);
     if let Some(name) = &name {
         if name.is_empty() {
-            return Err(EvalError::new("invalid regex: group name is empty"));
+            return Err(EvalError::new("Regex failure: group name is empty"));
         }
         if name.starts_with(|c: char| c.is_ascii_digit()) {
             return Err(EvalError::new(format!(
-                "invalid regex: invalid group name <{name}>"
+                "Regex failure: invalid group name <{name}>"
             )));
         }
     }
@@ -31554,7 +31558,7 @@ fn open_group(
             if !condition.is_empty() && condition.chars().all(|c| c.is_ascii_digit()) {
                 let number = condition.parse::<usize>().unwrap_or(usize::MAX);
                 if number == 0 || number > facts.total {
-                    return Err(EvalError::new("invalid regex: invalid backref number/name"));
+                    return Err(EvalError::new("Regex failure: invalid backref number/name"));
                 }
             } else if let Some(name) = condition
                 .strip_prefix('<')
@@ -31567,7 +31571,7 @@ fn open_group(
             {
                 if !facts.names.iter().any(|known| known == name) {
                     return Err(EvalError::new(format!(
-                        "invalid regex: undefined name <{name}> reference"
+                        "Regex failure: undefined name <{name}> reference"
                     )));
                 }
             }
@@ -32163,7 +32167,7 @@ fn escape_class_range_dashes(
                         || (matches!(next, 'p' | 'P') && braced));
                     if after_operator && !single {
                         return Err(EvalError::new(
-                            "invalid regex: char-class value at end of range",
+                            "Regex failure: char-class value at end of range",
                         ));
                     }
                     // A class escape starts no range, but a dash after it is still the operator
@@ -32176,7 +32180,7 @@ fn escape_class_range_dashes(
                     if let Some((end, ..)) = posix_bracket_at(&chars, i) {
                         if after_operator {
                             return Err(EvalError::new(
-                                "invalid regex: char-class value at end of range",
+                                "Regex failure: char-class value at end of range",
                             ));
                         }
                         out.extend(&chars[i..end]);
@@ -32202,7 +32206,7 @@ fn escape_class_range_dashes(
                     } else if starts_range && next.is_some_and(|n| n != ']') {
                         if after_set {
                             return Err(EvalError::new(
-                                "invalid regex: unmatched range specifier in char-class",
+                                "Regex failure: unmatched range specifier in char-class",
                             ));
                         }
                         out.push('-');
@@ -32342,7 +32346,7 @@ fn refuse_possessive_quantifier_for(
     }
     let chars: Vec<char> = pattern.chars().collect();
     let refusal = || {
-        EvalError::new("invalid regex: regex parse error: possessive quantifier is not supported")
+        EvalError::new("Regex failure: regex parse error: possessive quantifier is not supported")
     };
     // What the token just read is: a greedy quantifier, which a `+` would make possessive and a
     // `?` would make lazy; a fixed `{n}`, which a `?` makes lazy and a `+` repeats; or neither.
@@ -32970,6 +32974,11 @@ fn build_regex_uncached<S: EvalSemantics>(
     if let Some(refusal) = deferred_refusal {
         return Err(refusal);
     }
+    if S::TAG != EvalTag::Yq {
+        if let Some(refusal) = refuse_oversized_repeat(&pattern) {
+            return Err(refusal);
+        }
+    }
 
     // #6106: Oniguruma leaves a greedy loop at the first iteration that matches nothing, where the
     // `regex` crate tries the body's later ways first (see `onig_loop`). Not under `l`: the span of
@@ -33165,7 +33174,168 @@ fn build_regex_uncached<S: EvalSemantics>(
                 keep_anchored: None,
                 empty_steps_bytes: false,
             }),
-            None => Err(EvalError::new(format!("invalid regex: {e}"))),
+            // #6423: jq mode says it in Oniguruma's words where there are some; yq's dialect is
+            // Go's, which `go_regex::translate` has already worded.
+            None if S::TAG == EvalTag::Yq => Err(EvalError::new(format!("Regex failure: {e}"))),
+            None => Err(EvalError::new(
+                match oniguruma_refusal(as_written.as_deref().unwrap_or(&pattern)) {
+                    Some(message) => format!("Regex failure: {message}"),
+                    None => format!("Regex failure: {e}"),
+                },
+            )),
+        },
+    }
+}
+
+/// Oniguruma's largest repeat count (`ONIG_MAX_REPEAT_NUM`): a `{n}`, `{n,}` or `{n,m}` with a
+/// count past it is `too big number for repeat range` in jq (#6423), even where the `regex` crate
+/// would compile it (`x{100001}`) or refuse it for its size instead (`x{99999999}`).
+#[cfg(feature = "regex")]
+const ONIG_MAX_REPEAT_NUM: u32 = 100_000;
+
+/// jq's refusal of a pattern whose repeat count is past [`ONIG_MAX_REPEAT_NUM`] (#6423), or
+/// `None`. Only a pattern the crate's parser reads is checked: one it refuses is refused anyway,
+/// in the words [`oniguruma_refusal`] gives it. `{,m}` is left alone, as jq 1.7.1 answers it.
+#[cfg(feature = "regex")]
+fn refuse_oversized_repeat(pattern: &str) -> Option<EvalError> {
+    use regex_syntax::ast::{self, Ast, RepetitionKind, RepetitionRange};
+    // A count past the limit has at least six digits: most patterns are never parsed here.
+    if !pattern
+        .as_bytes()
+        .windows(6)
+        .any(|w| w.iter().all(u8::is_ascii_digit))
+    {
+        return None;
+    }
+    fn oversized(ast: &Ast, pattern: &str) -> bool {
+        match ast {
+            Ast::Repetition(rep) => {
+                let too_big = match &rep.op.kind {
+                    RepetitionKind::Range(RepetitionRange::Exactly(n))
+                    | RepetitionKind::Range(RepetitionRange::AtLeast(n)) => {
+                        *n > ONIG_MAX_REPEAT_NUM
+                    }
+                    RepetitionKind::Range(RepetitionRange::Bounded(m, n)) => {
+                        let low_omitted = pattern
+                            .get(rep.op.span.start.offset..)
+                            .is_some_and(|op| op.starts_with("{,"));
+                        !low_omitted && (*m > ONIG_MAX_REPEAT_NUM || *n > ONIG_MAX_REPEAT_NUM)
+                    }
+                    _ => false,
+                };
+                too_big || oversized(&rep.ast, pattern)
+            }
+            Ast::Group(group) => oversized(&group.ast, pattern),
+            Ast::Alternation(alt) => alt.asts.iter().any(|a| oversized(a, pattern)),
+            Ast::Concat(concat) => concat.asts.iter().any(|a| oversized(a, pattern)),
+            _ => false,
+        }
+    }
+    let ast = ast::parse::Parser::new().parse(pattern).ok()?;
+    oversized(&ast, pattern)
+        .then(|| EvalError::new("Regex failure: too big number for repeat range"))
+}
+
+/// Oniguruma's message for a pattern the `regex` crate refused with a parse error of its own
+/// (#6423), or `None` when the refusal has no counterpart in jq (the crate's size limit, a
+/// construct jq accepts). It reads the error's kind and the pattern text at its span, never the
+/// crate's rendered message, which can change between releases.
+#[cfg(feature = "regex")]
+fn oniguruma_refusal(pattern: &str) -> Option<String> {
+    use regex_syntax::ast::{self, ErrorKind};
+    const UNMATCHED_OPEN: &str = "end pattern with unmatched parenthesis";
+    let at = |offset: usize| pattern.get(offset..).unwrap_or_default();
+    match ast::parse::Parser::new().parse(pattern) {
+        Err(error) => {
+            let start = error.span().start.offset;
+            match error.kind() {
+                // `(?` that ends the pattern is a group header cut short (the `x` flag's prefix
+                // keeps it from the pre-pass that says so for the bare pattern).
+                ErrorKind::GroupUnclosed if at(start) == "(?" => {
+                    Some("end pattern in group".into())
+                }
+                ErrorKind::GroupUnclosed => Some(UNMATCHED_OPEN.into()),
+                ErrorKind::GroupUnopened => Some("unmatched close parenthesis".into()),
+                ErrorKind::RepetitionCountInvalid => {
+                    Some("upper is smaller than lower in repeat range".into())
+                }
+                ErrorKind::FlagUnexpectedEof => Some("end pattern in group".into()),
+                // An unclosed comment group, `(?#abc`.
+                ErrorKind::FlagUnrecognized
+                    if at(start).starts_with('#') && !at(start).contains(')') =>
+                {
+                    Some("end pattern in group".into())
+                }
+                // `(?<x`: the name runs to the end of the pattern.
+                ErrorKind::GroupNameUnexpectedEof => {
+                    let opened = pattern.get(..start)?.rfind(['<', '\''])?;
+                    Some(format!("invalid group name <{}>", at(opened + 1)))
+                }
+                // `\p{L`: an unclosed property name.
+                ErrorKind::EscapeUnexpectedEof
+                    if pattern
+                        .get(..start)
+                        .and_then(|before| before.rfind('\\'))
+                        .is_some_and(|escape| {
+                            (at(escape).starts_with("\\p{") || at(escape).starts_with("\\P{"))
+                                && !at(escape).contains('}')
+                        }) =>
+                {
+                    Some(UNMATCHED_OPEN.into())
+                }
+                // `\k<name>` and `\g<name>` to a group the pattern does not have; one it has is
+                // a call or a reference jq answers, which the crate cannot.
+                ErrorKind::EscapeUnrecognized
+                    if at(start).starts_with("\\k<") || at(start).starts_with("\\g<") =>
+                {
+                    let Some((name, _)) = at(start + 3).split_once('>') else {
+                        // `\k<x`: the name runs to the end of the pattern.
+                        return Some(format!("invalid group name <{}>", at(start + 3)));
+                    };
+                    let numbered = name.strip_prefix(['-', '+']).unwrap_or(name);
+                    if !numbered.is_empty() && numbered.bytes().all(|b| b.is_ascii_digit()) {
+                        return at(start)
+                            .starts_with("\\k")
+                            .then(|| "invalid backref number/name".into());
+                    }
+                    let defined = pattern.contains(&format!("(?<{name}>"))
+                        || pattern.contains(&format!("(?'{name}'"))
+                        || pattern.contains(&format!("(?P<{name}>"));
+                    (!defined).then(|| format!("undefined name <{name}> reference"))
+                }
+                // A look-around or an atomic group the crate cannot read, left open.
+                ErrorKind::UnsupportedLookAround | ErrorKind::FlagUnrecognized => {
+                    match fancy_regex::Expr::parse_tree(pattern) {
+                        Err(fancy_regex::Error::ParseError(
+                            _,
+                            fancy_regex::ParseError::UnclosedOpenParen,
+                        )) => Some(UNMATCHED_OPEN.into()),
+                        // The parse stopped at a `)` that closes nothing, `(?>a)b)`.
+                        Err(fancy_regex::Error::ParseError(stop, _))
+                            if at(stop).starts_with(')') =>
+                        {
+                            Some("unmatched close parenthesis".into())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        Ok(_) => match regex_syntax::Parser::new().parse(pattern) {
+            Err(regex_syntax::Error::Translate(error))
+                if matches!(
+                    error.kind(),
+                    regex_syntax::hir::ErrorKind::UnicodePropertyNotFound
+                ) =>
+            {
+                let span = error.span();
+                let escape = pattern.get(span.start.offset..span.end.offset)?;
+                // jq names the property without the `^` that negates it (`\p{^Foo}`).
+                let name = escape.get(2..)?.replacen("{^", "{", 1);
+                Some(format!("invalid character property name {name}"))
+            }
+            _ => None,
         },
     }
 }
@@ -33272,7 +33442,7 @@ const FANCY_BACKTRACK_LIMIT: usize = 10_000_000;
 /// when the pattern uses anything whose meaning there was not checked against jq-1.7.1 to be
 /// Oniguruma's: syntax [`prepare_fancy_pattern`] refuses (`\h` is a hex digit in `fancy-regex`
 /// and a literal `h` in jq), or a construct outside [`fancy_expr_is_oniguruma`]'s list
-/// (subroutine calls, absence range cutters `(?~|…)`, backtracking verbs; the plain `(?~X)` is rewritten before either engine, #6252). Those keep the `invalid regex`
+/// (subroutine calls, absence range cutters `(?~|…)`, backtracking verbs; the plain `(?~X)` is rewritten before either engine, #6252). Those keep the `Regex failure`
 /// refusal rather than answering differently from jq. Never in yq mode, whose dialect is Go's.
 ///
 /// `oniguruma_mode` makes `\<`/`\>` the literal characters and `*+`/`++`/`?+` possessive, as in
@@ -139431,7 +139601,7 @@ mod tests {
         // panic or silently return a bogus result.
         query!(br#""x""#, r#"test("[")"#,
             QueryResult::Error(e) => {
-                assert!(e.to_string().contains("invalid regex"));
+                assert!(e.to_string().contains("Regex failure"));
             }
         );
     }
@@ -147990,7 +148160,7 @@ mod tests {
             translate_posix_brackets(r"\x{e9", false, false)
                 .unwrap_err()
                 .message,
-            "invalid regex: invalid code point value"
+            "Regex failure: invalid code point value"
         );
     }
 

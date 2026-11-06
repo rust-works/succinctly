@@ -2,7 +2,7 @@
 //! twice (`(\\1|\\w)+`). Oniguruma reads it as the group's last completed value; `fancy-regex` (the
 //! second engine, taken for a backreference) reads from the group's new start to its old end, which
 //! is empty for contiguous passes, so `"ab" | match("(\\1|\\w)+")` split into `a` and `b` where jq has
-//! one match and the group at `[1,"b"]`. The shape is refused on that engine (`invalid regex`), as
+//! one match and the group at `[1,"b"]`. The shape is refused on that engine (`Regex failure`), as
 //! #6096's is. A reference to a group that is open under no such repeat, or to one that has closed,
 //! keeps its route and answers as `/usr/bin/jq` 1.7.1 does for `match($p; $f)`.
 

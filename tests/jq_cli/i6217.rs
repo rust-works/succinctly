@@ -154,7 +154,7 @@ fn test_a_property_name_oniguruma_refuses_is_refused_6217() -> Result<()> {
         assert_eq!(stdout, "", "{pattern}");
         assert!(
             stderr.contains(&format!(
-                "invalid regex: invalid character property name {name}"
+                "Regex failure: invalid character property name {name}"
             )),
             "{pattern}: {stderr:?}"
         );

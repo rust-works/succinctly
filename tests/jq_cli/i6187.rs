@@ -70,7 +70,7 @@ fn test_a_zero_width_body_without_an_option_group_stays_refused_6187() -> Result
             ("", 5),
             "{pattern}: stderr {stderr}"
         );
-        assert!(stderr.contains("invalid regex"), "{pattern}: {stderr}");
+        assert!(stderr.contains("Regex failure"), "{pattern}: {stderr}");
     }
     Ok(())
 }

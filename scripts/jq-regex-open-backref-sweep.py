@@ -10,7 +10,7 @@ reads from the new start to the old end, which is empty whenever iterations are 
 For each generated pattern (a group that holds a reference to itself, under a repeat or not, with
 the group nested in other groups, lookarounds and alternations) on four strings, with and without
 `g`, this runs jq 1.7.1 and the `succinctly` binary under test (SUBJECT) and prints how many cases
-agree, differ, or are refused here (jq answers, SUBJECT says `invalid regex`). It lists, per
+agree, differ, or are refused here (jq answers, SUBJECT says `Regex failure`). It lists, per
 class of pattern, whether the group sits under a repeat that can run twice (the shape
 `fancy_has_open_group_backref` refuses) or not (the shape it must leave alone).
 Exits 1 when a pattern of the refused shape is answered on some text (the guard is gone or has a
@@ -94,7 +94,7 @@ def main():
             kind = "twice" if pats[p] else "once"
             if theirs.startswith("jq: error"):
                 key = "jq-refuses"
-            elif "invalid regex" in ours:
+            elif "Regex failure" in ours:
                 key = "refused-here"
             elif ours.startswith("jq: error") or ours == "TIMEOUT":
                 key = "other-failure"

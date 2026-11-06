@@ -102,7 +102,7 @@ fn test_a_dash_in_a_class_is_read_as_oniguruma_reads_it_6184() -> Result<()> {
             Some(want) => assert_eq!((stdout.trim_end(), code), (*want, 0), "{pattern}: {stderr}"),
             None => {
                 assert_eq!((stdout.as_str(), code), ("", 5), "{pattern}: {stderr}");
-                assert!(stderr.contains("invalid regex"), "{pattern}: {stderr}");
+                assert!(stderr.contains("Regex failure"), "{pattern}: {stderr}");
             }
         }
     }

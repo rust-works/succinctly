@@ -68,7 +68,7 @@ fn test_a_look_behind_with_alternatives_of_different_widths_is_refused_6201() ->
             Some(want) => assert_eq!((stdout.trim_end(), code), (*want, 0), "{pattern}: {stderr}"),
             None => {
                 assert_eq!((stdout.as_str(), code), ("", 5), "{pattern}: {stderr}");
-                assert!(stderr.contains("invalid regex"), "{pattern}: {stderr}");
+                assert!(stderr.contains("Regex failure"), "{pattern}: {stderr}");
             }
         }
     }

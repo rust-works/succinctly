@@ -275,7 +275,7 @@ fn test_the_members_around_a_utf8_byte_run_in_a_class_6240() -> Result<()> {
 }
 
 /// What jq refuses in a class, with its reason. The exit code is 5 and the message names the reason;
-/// jq's own text is `Regex failure: <reason>`, ours `invalid regex: <reason>`.
+/// both say `Regex failure: <reason>` (#6423).
 #[test]
 fn test_a_bad_utf8_byte_run_or_range_in_a_class_is_refused_6240() -> Result<()> {
     for (pattern, reason) in [
@@ -307,7 +307,7 @@ fn test_a_bad_utf8_byte_run_or_range_in_a_class_is_refused_6240() -> Result<()> 
             run_jq_full(&["-n", "--arg", "p", pattern, r#""a" | test($p)"#], None)?;
         assert_eq!((stdout.as_str(), status), ("", 5), "{pattern}: {stderr}");
         assert!(
-            stderr.contains(&format!("invalid regex: {reason}")),
+            stderr.contains(&format!("Regex failure: {reason}")),
             "{pattern}: {stderr}"
         );
     }

@@ -51,7 +51,7 @@ def main():
     want = outcomes([oracle], patterns)
     got = outcomes([subject, "jq"], patterns)
     # A refused pattern reads `target of repeat operator is invalid` in jq and here (the subject
-    # adds its `invalid regex:` prefix, which the sub() above strips with the rest of the prefix).
+    # adds jq's `Regex failure:` prefix, which the sub() above strips with the rest of the prefix).
     bad = [(p, want[p], got.get(p)) for p in want if want[p] != got.get(p)]
     print(f"{len(want)} patterns, {len(bad)} differ")
     for pattern, w, g in bad[:40]:

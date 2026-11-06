@@ -24,7 +24,7 @@ fn assert_not_specified(pattern: &str) -> Result<()> {
     assert_eq!(code, 5, "{pattern}: stdout={stdout:?} stderr={stderr:?}");
     assert_eq!(stdout, "", "{pattern}");
     assert!(
-        stderr.contains("invalid regex: target of repeat operator is not specified"),
+        stderr.contains("Regex failure: target of repeat operator is not specified"),
         "{pattern}: {stderr:?}"
     );
     Ok(())
@@ -119,7 +119,7 @@ fn test_an_empty_option_group_keeps_its_own_refusal_6181() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-nc", &filter("(?)*a")], None)?;
     assert_eq!((stdout.as_str(), code), ("", 5), "stderr={stderr:?}");
     assert!(
-        stderr.contains("invalid regex: undefined group option"),
+        stderr.contains("Regex failure: undefined group option"),
         "{stderr:?}"
     );
     Ok(())

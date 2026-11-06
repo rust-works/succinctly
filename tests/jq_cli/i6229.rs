@@ -2,7 +2,7 @@
 //! for a class that opens with a `]` and has no other `]` to close it, `premature end of
 //! char-class` for any other class the pattern ends inside, and `end pattern at escape` for a
 //! trailing backslash. Every row was captured from jq 1.7.1 (`/usr/bin/jq -nc`), which words them
-//! `Regex failure: <message>`; this tool words them `invalid regex: <message>`.
+//! `Regex failure: <message>`, as this tool does (#6423).
 
 use anyhow::Result;
 
@@ -27,7 +27,7 @@ fn a_class_that_opens_with_a_close_bracket_and_never_closes_is_empty_6229() -> R
         let (stderr, code) = refusal_of(pattern, None)?;
         assert_eq!(code, 5, "{pattern}: {stderr:?}");
         assert!(
-            stderr.contains("invalid regex: empty char-class"),
+            stderr.contains("Regex failure: empty char-class"),
             "{pattern}: {stderr:?}"
         );
     }
@@ -56,7 +56,7 @@ fn a_class_the_pattern_ends_inside_is_premature_6229() -> Result<()> {
         let (stderr, code) = refusal_of(pattern, None)?;
         assert_eq!(code, 5, "{pattern}: {stderr:?}");
         assert!(
-            stderr.contains("invalid regex: premature end of char-class"),
+            stderr.contains("Regex failure: premature end of char-class"),
             "{pattern}: {stderr:?}"
         );
     }
@@ -78,7 +78,7 @@ fn a_trailing_backslash_escapes_nothing_6229() -> Result<()> {
         let (stderr, code) = refusal_of(pattern, None)?;
         assert_eq!(code, 5, "{pattern}: {stderr:?}");
         assert!(
-            stderr.contains("invalid regex: end pattern at escape"),
+            stderr.contains("Regex failure: end pattern at escape"),
             "{pattern}: {stderr:?}"
         );
     }

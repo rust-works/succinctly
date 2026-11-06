@@ -173,7 +173,7 @@ fn test_constructs_read_differently_stay_refused_5502() -> Result<()> {
         let (stdout, stderr, code) = run(filter)?;
         assert_eq!((stdout.as_str(), code), ("", 5), "{filter}");
         assert!(
-            stderr.contains("invalid regex: regex parse error"),
+            stderr.contains("Regex failure: regex parse error"),
             "{filter}: {stderr}"
         );
     }
