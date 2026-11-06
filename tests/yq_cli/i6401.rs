@@ -96,3 +96,31 @@ fn a_head_ending_in_a_bare_marker_gets_an_empty_line_after_it_6401() -> Result<(
     }
     Ok(())
 }
+
+#[test]
+fn a_write_keeps_the_line_of_blanks_in_the_head_6401() -> Result<()> {
+    for (doc, want) in [
+        (" \na: 1\n", "#  \na: 2\n"),
+        (" \n# c\na: 1\n", "#  \n# c\na: 2\n"),
+        ("# c\n \na: 1\n", "# c\n#  \na: 2\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(".a = 2", doc, &[])?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{doc:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn json_output_and_a_terminated_head_are_unchanged_6401() -> Result<()> {
+    for (doc, flags, want) in [
+        (" \na: 1\n", &["-o=json", "-I=0"][..], "{\"a\":1}\n"),
+        ("\t\n", &["-o=json", "-I=0"][..], "null\n"),
+        ("---\n", &[][..], "---\n"),
+        ("# c\n---\n", &[][..], "# c\n---\n"),
+        ("---\n", &["-N"][..], ""),
+    ] {
+        let (stdout, code) = run_yq_stdin(".", doc, flags)?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{doc:?} {flags:?}");
+    }
+    Ok(())
+}

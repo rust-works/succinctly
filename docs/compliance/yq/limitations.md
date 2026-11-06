@@ -5939,7 +5939,8 @@ Divergences, each classified by `scripts/yq-comment-oracle-fuzz.py`:
   which yq cannot read back); succinctly prints `---` and drops the marker's comment.
   A whitespace-only line in the head of the first document is a comment to go-yaml, and prints as `# ` plus the line,
   where it sits between comments, a `---` or a `%YAML` line (#6401); the header covers it, so it prints the same.
-  The DOM route (`-P`) does not reproduce the header, and so not that line either.
+  The DOM route (`-P`, a write) prints it too, but not the `---` and `%YAML` lines of the header.
+  A whitespace-only line ahead of a leading `---` is printed as it is there, without the `# `.
 - **A genuinely blank CRLF line near a standalone comment, mid-document,** gets a spurious
   extra blank line inserted by yq after the comment that the CRLF source never had at all
   (go-yaml's scanner appears to special-case a blank line only for `\n`, not `\r\n`, in more

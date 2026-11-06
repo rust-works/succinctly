@@ -8000,6 +8000,14 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     #[inline]
     fn document_has_standalone_comments(&self) -> bool {
         self.index.has_standalone_comments()
+            // #6401: a header line of only blanks is a comment to yq, and the comment index does not hold it.
+            || (self.is_first_document_content() && {
+                let header_end = self.header_end();
+                header_end > 0
+                    && self.text[..header_end]
+                        .split(|&b| is_line_break(b))
+                        .any(is_blank_line)
+            })
     }
 
     #[inline]
@@ -8197,9 +8205,12 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         // each blank CRLF line into `# \r`, as the verbatim header [`write_yq_header`] prints it on the
         // streaming route.
         let header_end = self.header_end();
-        let in_header = matches!(ranges.first(), Some(&(first_start, _)) if (first_start as usize) < header_end);
+        let in_header = matches!(ranges.first(), Some(&(first_start, _)) if (first_start as usize) < header_end)
+            // #6401: a header line of only blanks has no range, so a header of nothing else is the first
+            // document's all the same.
+            || (header_end > 0 && self.is_first_document_content());
         if in_header {
-            if let Some(lines) = crlf_header_head_lines(&self.text[..header_end]) {
+            if let Some(lines) = header_head_lines(&self.text[..header_end]) {
                 return lines;
             }
         }
@@ -9791,17 +9802,20 @@ fn blank_line_before(text: &[u8], at: usize) -> bool {
 
 /// Whether `line` (without its break) is non-empty and holds only blanks: the header line go-yaml reads as the
 /// comment `# ` plus the line (#6401).
-fn is_blank_line(line: impl AsRef<[u8]>) -> bool {
-    let line = line.as_ref();
+fn is_blank_line(line: &[u8]) -> bool {
     !line.is_empty() && line.iter().all(|&b| b == b' ' || b == b'\t')
 }
 
 /// The comment lines of a first-document header (`header`: [`yq_header_len`]'s bytes) as yq prints them when a line
-/// break in it is `\r\n`, or `None` for a header without one (#5053): every comment line keeps its `\r` where its break
-/// is CRLF, and a blank line with a CRLF break is `# \r` -- the `\r` is comment text to go-yaml -- where one with a
-/// bare `\n` stays a blank line. The `---` and `%` lines are the header's own, not comment lines.
-fn crlf_header_head_lines(header: &[u8]) -> Option<Vec<String>> {
-    if !header.windows(2).any(|pair| pair == b"\r\n") {
+/// break in it is `\r\n` or a line of it holds only blanks, or `None` for a header with neither: every comment line
+/// keeps its `\r` where its break is CRLF, and a blank line with a CRLF break is `# \r` -- the `\r` is comment text to
+/// go-yaml -- where one with a bare `\n` stays a blank line (#5053). A line of only blanks is `# ` plus the line
+/// (#6401), which the comment index does not hold. The `---` and `%` lines are the header's own, not comment lines.
+fn header_head_lines(header: &[u8]) -> Option<Vec<String>> {
+    // #6401: a line of only blanks is a comment (`# ` plus the line) in an LF header as well, and the comment index
+    // does not hold it.
+    let has_blank_line = header.split(|&b| is_line_break(b)).any(is_blank_line);
+    if !has_blank_line && !header.windows(2).any(|pair| pair == b"\r\n") {
         return None;
     }
     let mut out = Vec::new();
@@ -9990,8 +10004,8 @@ fn write_foot_comment_lines<Out: core::fmt::Write>(
 /// content line that is itself `--- 42` loses the marker and the blanks after it too: `columns`
 /// is how many columns that is, applied to that one line only (`--- [1, 2]` has `[` at column 1).
 ///
-/// Unlike the header yq *prints* ([`yq_header_len`]), a whitespace-only line counts as leading
-/// here (live-checked: `# c` / `  ` / `k: 1` numbers `k` from line 2), and so is every bare `---` of a
+/// A whitespace-only line counts as leading here (live-checked: `# c` / `  ` / `k: 1` numbers `k` from line 2),
+/// as it does in the header yq prints ([`yq_header_len`], #6401), and so is every bare `---` of a
 /// leading run (#6349). As there, only a `%YA..` directive is slurped: `%TAG` is content. A `--- # c` line is left as content: yq's answer
 /// there is `[0,0]`, which nothing here reproduces.
 fn yq_position_preamble(text: &[u8]) -> (usize, usize) {
@@ -10041,7 +10055,8 @@ fn yq_position_preamble(text: &[u8]) -> (usize, usize) {
 /// The byte length of the leading *header* real yq's default
 /// `--header-preprocess` slurps off the front of an input and re-emits
 /// verbatim before the first document whenever the result is that document
-/// itself (#2795): every leading line that is empty, a `#` comment (at any
+/// itself (#2795): every leading line that is empty or holds only blanks (which
+/// go-yaml reads as the comment `# ` plus the line, #6401), a `#` comment (at any
 /// indent), a `%YA..` directive, or a `---` marker, up to the first line
 /// that is none of those. Blank lines are kept exactly where they were
 /// (`# lead\n\na: 1` round-trips with its blank, unlike a blank after any
@@ -10140,6 +10155,7 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
         };
         let line = &rest[..line_end];
         // A bare `\r` ends a line that is not a marker the same way end of input does: yq writes a `\n` after it.
+        // (A marker ended by a bare `\r` is left as it is: yq reads that as a marker with an empty line, not as ours.)
         let marker = line.starts_with("---");
         unterminated = if marker {
             (brk == 0).then_some(true)
@@ -10153,7 +10169,7 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
                 out.write_str("# ")?;
             }
             // #6401: a line of only blanks is a comment to go-yaml too, `# ` plus the line.
-            if is_blank_line(line) {
+            if is_blank_line(line.as_bytes()) {
                 out.write_str("# ")?;
             }
             out.write_str(line)?;
@@ -18738,12 +18754,12 @@ plain: hello
             // An indented content line is still content, a blank-only line before it is not.
             assert_eq!(yq_header_len(b" \n  a: 1\n"), (2, false));
             assert_eq!(yq_header_len(b"  a: 1\n"), (0, false));
-            assert!(is_blank_line("  "));
-            assert!(is_blank_line("\t "));
-            assert!(!is_blank_line(""));
-            assert!(!is_blank_line(" #"));
+            assert!(is_blank_line(b"  "));
+            assert!(is_blank_line(b"\t "));
+            assert!(!is_blank_line(b""));
+            assert!(!is_blank_line(b" #"));
             assert_eq!(
-                crlf_header_head_lines(b"# c\r\n \r\n\r\n").unwrap(),
+                header_head_lines(b"# c\r\n \r\n\r\n").unwrap(),
                 ["# c\r", "#  \r", "# \r"]
             );
         }
