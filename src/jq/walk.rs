@@ -1445,6 +1445,15 @@ pub fn uses_input_builtins(expr: &Expr) -> bool {
     })
 }
 
+/// Whether `expr` calls `input` or `inputs` anywhere (#6464).
+///
+/// The part of [`uses_input_builtins`] that makes jq open a file: `input_line_number` reads the
+/// position of whatever was read, so under `-n` it asks for nothing, and jq runs it without
+/// touching the files. Same expanded-program requirement as [`uses_input_builtins`].
+pub fn pulls_inputs(expr: &Expr) -> bool {
+    contains_builtin(expr, |b| matches!(b, Builtin::Input | Builtin::Inputs))
+}
+
 /// Whether `expr` references a builtin whose answer comes from the *cursor*
 /// rather than from the value, anywhere (#1504).
 ///
