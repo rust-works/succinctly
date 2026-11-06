@@ -32867,7 +32867,11 @@ fn build_regex_uncached<S: EvalSemantics>(
     // A refusal from the jq pre-pass waits until the flags string has been read (#5529, #5524):
     // jq checks the modifiers before it compiles the pattern, so `test("(?P<n>a)"; "z")` is the
     // modifier error.
-    let mut deferred_refusal = None;
+    // #6433: a count past Oniguruma's limit is refused where it is read, before anything the pre-pass
+    // would say about the rest of the pattern, so it is looked for in the pattern as written.
+    let mut deferred_refusal = (S::TAG != EvalTag::Yq
+        && oversized_count_in_text(pattern, flags.is_some_and(|flags| flags.contains('x'))))
+    .then(|| EvalError::new("Regex failure: too big number for repeat range"));
     let mut pattern = if S::TAG == EvalTag::Yq {
         super::go_regex::translate(pattern).map_err(EvalError::new)?
     } else {
@@ -33233,6 +33237,98 @@ fn refuse_oversized_repeat(pattern: &str) -> Option<EvalError> {
     let ast = ast::parse::Parser::new().parse(pattern).ok()?;
     oversized(&ast, pattern)
         .then(|| EvalError::new("Regex failure: too big number for repeat range"))
+}
+
+/// Whether `pattern` has an interval whose count is past [`ONIG_MAX_REPEAT_NUM`], found in the
+/// text and not in the tree (#6433). Oniguruma refuses a count the moment it reads one after a
+/// `{`, whatever follows it: `a{100001 }`, `a{100001x}`, `a{1,100001`, `{100001}` with nothing to
+/// repeat, and the same inside a look-around or an atomic group, which the `regex` crate's parser
+/// does not read. A count needs a digit straight after the `{` (`a{ 100001}` is text), and `{,m}`
+/// is answered. Escapes (`\{`, `\x{..}`, `\p{..}`), classes, `(?#..)` comments and `\Q..\E` runs
+/// are skipped; a pattern whose `#` may start a comment (`extended`, or an inline `(?x)`) is not
+/// scanned. It reads the pattern as written, before the pre-pass makes a `{` that is no interval
+/// into text for the crate.
+#[cfg(feature = "regex")]
+fn oversized_count_in_text(pattern: &str, extended: bool) -> bool {
+    fn too_big(digits: &[char]) -> bool {
+        let significant: Vec<&char> = digits.iter().skip_while(|c| **c == '0').collect();
+        significant.len() > 6
+            || significant
+                .iter()
+                .fold(0u32, |n, c| n * 10 + (**c as u32 - '0' as u32))
+                > ONIG_MAX_REPEAT_NUM
+    }
+    // A count needs six digits, and a pattern that may hold a comment is not judged by its text.
+    if !pattern
+        .as_bytes()
+        .windows(6)
+        .any(|w| w.iter().all(u8::is_ascii_digit))
+        || (pattern.contains('#') && (extended || inline_extended(pattern)))
+    {
+        return false;
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let digits_from = |at: usize| {
+        chars[at..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count()
+    };
+    let mut i = 0;
+    let mut class_depth = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                match chars.get(i + 1) {
+                    // `\Q..\E`: everything up to the `\E` is text.
+                    Some('Q') => {
+                        while i < chars.len()
+                            && !(chars[i] == '\\' && chars.get(i + 1) == Some(&'E'))
+                        {
+                            i += 1;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    // `\x{..}`, `\p{..}` and the like: the braces name a character or property.
+                    Some('x' | 'p' | 'P' | 'u' | 'o' | 'N') if chars.get(i + 2) == Some(&'{') => {
+                        while i < chars.len() && chars[i] != '}' {
+                            i += 1;
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+            '[' => class_depth += 1,
+            ']' if class_depth > 0 => class_depth -= 1,
+            '(' if class_depth == 0
+                && chars.get(i + 1) == Some(&'?')
+                && chars.get(i + 2) == Some(&'#') =>
+            {
+                while i < chars.len() && chars[i] != ')' {
+                    i += 1;
+                }
+            }
+            '{' if class_depth == 0 => {
+                let first = digits_from(i + 1);
+                if first > 0 {
+                    if too_big(&chars[i + 1..i + 1 + first]) {
+                        return true;
+                    }
+                    let comma = i + 1 + first;
+                    if chars.get(comma) == Some(&',') {
+                        let second = digits_from(comma + 1);
+                        if second > 0 && too_big(&chars[comma + 1..comma + 1 + second]) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Oniguruma's message for a pattern the `regex` crate refused with a parse error of its own
