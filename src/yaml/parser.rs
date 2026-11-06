@@ -7840,7 +7840,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         let start = self.pos;
         if self.yq_mode {
-            self.reject_unstartable_plain_at(self.pos)?;
+            self.reject_unstartable_flow_plain_at(self.pos)?;
         }
 
         while let Some(b) = self.peek() {
@@ -8003,7 +8003,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     fn parse_flow_unquoted_value(&mut self) -> Result<usize, YamlError> {
         let start = self.pos;
         if self.yq_mode {
-            self.reject_unstartable_plain_at(self.pos)?;
+            self.reject_unstartable_flow_plain_at(self.pos)?;
         }
 
         while let Some(b) = self.peek() {
@@ -8134,6 +8134,23 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
+    /// [`Self::reject_unstartable_plain_at`] for a scalar in flow context, where a `-` followed by
+    /// a blank is the block sequence indicator that go-yaml refuses (`block sequence entries are not
+    /// allowed in this context`) and no plain scalar starts with (`[- x]`, `[a, - x]`, `{a: - x}`),
+    /// where this read `- x` as the text (#6413).
+    fn reject_unstartable_flow_plain_at(&self, at: usize) -> Result<(), YamlError> {
+        self.reject_unstartable_plain_at(at)?;
+        if self.input.get(at) == Some(&b'-')
+            && Self::is_ws_break_or_eoi(self.input.get(at + 1).copied())
+        {
+            return Err(self.err_unexpected_char(
+                at,
+                "block sequence entries are not allowed in this context",
+            ));
+        }
+        Ok(())
+    }
+
     /// #6214: the Unicode-break tab check for the plain scalar the scanner just read. Inlined to one
     /// flag test, so a document without a tab pays nothing but that; the search is out of line.
     #[inline(always)]
@@ -8227,7 +8244,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         let start = self.pos;
         if self.yq_mode {
-            self.reject_unstartable_plain_at(self.pos)?;
+            self.reject_unstartable_flow_plain_at(self.pos)?;
         }
 
         while let Some(b) = self.peek() {
@@ -10269,6 +10286,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 } else {
                     // Same ambiguous-gap error as parse_mapping_entry (#901, #959).
                     self.check_mapping_under_mapping_gap(indent)?;
+                    // #6413: properties on a line of their own name the node that follows, which
+                    // needs an owner like any other (`k: |` / `!!map`, `a: 1` / `&a`, `- a` / `!!str`).
+                    self.reject_node_without_owner(indent)?;
                     self.close_deeper_indents(indent);
                     // Consume any leading `&anchor` and/or `!tag`, in either
                     // order, for non-mapping-key cases

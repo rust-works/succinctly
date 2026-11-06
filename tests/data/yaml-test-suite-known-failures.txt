@@ -56,9 +56,6 @@ DK3J      scalars           scalar content/folding differs from spec
 DK95/04   structure         a line holding only a tab after `foo: 1` (`foo: 1` / one tab / `bar: 2`): valid YAML 1.2, rejected by real yq v4.53.3 ("found a tab character that violates indentation") — we follow yq, the same policy as FRK4/NKF9 — #6286
 FP8R      scalars           scalar content/folding differs from spec
 FRK4      structure         an entry with an empty key in a flow mapping (`{ ? foo :,\n  : bar }`): valid YAML 1.2, rejected by real yq (a key cannot open with `:`) — we follow yq — #4558
-G9HC      lax:indentation   indentation not validated — #223
-GT5M      lax:anchors       anchor/alias rules not validated — #223
-H7J7      lax:anchors       anchored key's value on the next line, unindented relative to the key (`key: &x` / `!!map` at the same column) — read as null per indentation, but the tag's own deferred mapping content is then dropped rather than rejected — #223 (surfaced by #224 the same way as 9HCY)
 JEF9/02   scalars           blank final line with no break — follows yq, which gives "" — #344
 K3WX      structure         implicit flow key with a line break before its `:`: valid YAML 1.2, rejected by real yq v4.53.3 ("did not find expected ',' or '}'": a simple key has no break) — we follow yq, the same policy as FRK4/NKF9 — #6208
 L24T/01   scalars           literal block ending the input with a line of spaces and no break: the spec's `b-chomped-last` counts the end of input as a break (`"x\n \n"`), real yq gives `"x\n "` — we follow yq, the same policy as JEF9/02 — #4959
