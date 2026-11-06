@@ -104,3 +104,41 @@ fn spelling_the_indicator_separator_with_a_space_gives_the_same_document() {
         );
     }
 }
+
+/// #6379: yq refuses a tab after the `?` or explicit `:` (go-yaml skips no tab there), and the library
+/// loader keeps YAML 1.2's reading, a tab as separation. The property rule below is shared by both.
+#[test]
+fn a_tab_after_the_indicators_is_refused_by_the_yq_build_only() {
+    for doc in [
+        &b"?\tx\n: v\n"[..],
+        b"? a\n:\tb\n",
+        b"- ?\tx\n",
+        b"? \tx\n: v\n",
+    ] {
+        assert!(
+            YamlIndex::build(doc).is_ok(),
+            "{doc:?}: the library reads it"
+        );
+        assert!(YamlIndex::build_yq(doc).is_err(), "{doc:?}: yq refuses it");
+    }
+    // A tab whose blanks end at a `#` is yq's comment scanner's, in both.
+    for doc in [&b"?\t# c\n: v\n"[..], b"? a\n:\t# c\n"] {
+        assert!(YamlIndex::build(doc).is_ok(), "{doc:?}");
+        assert!(YamlIndex::build_yq(doc).is_ok(), "{doc:?}");
+    }
+}
+
+/// #6379: a `?` after a node property opens no key, in the library loader as in yq (as #6340's
+/// `: &t ? x` already did).
+#[test]
+fn a_property_before_an_explicit_key_indicator_is_refused_in_both_builds() {
+    for doc in [&b"- &t ? x\n"[..], b"&t ? x\n: v\n", b"? - &t ? x\n: v\n"] {
+        assert!(YamlIndex::build(doc).is_err(), "{doc:?}");
+        assert!(YamlIndex::build_yq(doc).is_err(), "{doc:?}");
+    }
+    // On a line of its own, or with no blank after the `?`, it is not that.
+    for doc in [&b"- &t\n  ? x\n"[..], b"- &t ?x\n"] {
+        assert!(YamlIndex::build(doc).is_ok(), "{doc:?}");
+        assert!(YamlIndex::build_yq(doc).is_ok(), "{doc:?}");
+    }
+}

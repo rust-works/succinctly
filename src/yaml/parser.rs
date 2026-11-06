@@ -6059,8 +6059,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// simple key is allowed, which is right after either indicator, so it stops with `found character
     /// that cannot start any token` (`?⇥x`, `:⇥b`, `? ⇥x`, and a tab with nothing after it). The blanks
     /// may end at a `#`, which its comment scanner takes (`?⇥# c`). The one decision for the key's and
-    /// the value's indicator, and for the nested positions that reach them (#6340).
+    /// the value's indicator, and for the nested positions that reach them in yq (#6340). The library loader
+    /// keeps its older refusal of a tab right after the `?` of a nested key, in `parse_nested_explicit_key`.
     fn reject_tab_after_indicator(&self) -> Result<(), YamlError> {
+        debug_assert!(matches!(self.peek(), Some(b'?' | b':')));
         // Only for yq: YAML 1.2 reads the tab as separation, which the library loader keeps.
         if !self.yq_mode {
             return Ok(());
