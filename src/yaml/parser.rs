@@ -5733,7 +5733,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
                 if !self.at_line_end() {
                     // Parse item value
-                    if self.looks_like_mapping_entry() {
+                    if self.peek() == Some(b'?') && Self::is_ws_break_or_eoi(self.peek_at(1)) {
+                        // `? - ? x`: the first item is a compact mapping whose first entry is an
+                        // explicit key of its own (#6340), as the node after `? ` is (#6322): the
+                        // outer key waits behind the inner one's. A later item is dispatched by
+                        // `parse_sequence_item`, which finds the outer key already waiting.
+                        self.parse_explicit_key(self.current_column())?;
+                        self.wait_behind_pending_explicit_key(owner_depth, false);
+                    } else if self.looks_like_mapping_entry() {
                         // The key's real column, not a hardcoded `indent + 3`
                         // - `- ` is already skipped above, so `self.pos` sits
                         // at the key. `indent + 3` was wrong even for the
@@ -5883,8 +5890,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
         }
 
-        // Mark that we have an explicit key waiting for a value
-        self.set_pending_explicit_key(owner_depth, false);
+        // Mark that we have an explicit key waiting for a value, unless a key nested in this one's
+        // own content is the one waiting (`? - ? x`, #6340): it took the value first, and this one
+        // is behind it ([`Self::pending_explicit_key_below`]).
+        if !self
+            .pending_explicit_key
+            .is_some_and(|nested| nested > owner_depth)
+        {
+            self.set_pending_explicit_key(owner_depth, false);
+        }
 
         Ok(())
     }
@@ -6008,6 +6022,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // parser opens the item wrapper via `write_bp_open_seq_item`, so
                 // the #332 wrapper-end invariant is enforced here too.
                 self.parse_sequence_item(self.current_column())?;
+            }
+            // `: ? x`: the node after `: ` is a compact mapping whose first entry is an explicit key
+            // of its own, as the node after `- ` is (#339) and the node after `? ` is (#6322). The
+            // `?` indicator wins over a `: ` later on the line, as in the main loop's dispatch.
+            // Properties on the line before it (`: &t ? x`) are refused by yq (`mapping key is not
+            // allowed in this context`), which a property on a compact mapping's own first entry
+            // is not.
+            Some(b'?') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
+                if had_property {
+                    return Err(self.err_unexpected_char(
+                        self.pos,
+                        "mapping key is not allowed in this context",
+                    ));
+                }
+                self.parse_explicit_key(self.current_column())?;
             }
             _ if self.looks_like_mapping_entry() => {
                 // `: b: c` — the mirror of the key-side arm above: the node after `: `
