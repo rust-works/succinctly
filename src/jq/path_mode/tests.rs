@@ -2138,7 +2138,7 @@ fn route_sends_dynamic_path_targets_to_the_interpreter_only_5223() {
     for filter in [
         "del(.users[] | .score as $y | select($y < 100))",
         "path(.a as $x | $x)",
-        "(.. | numbers) |= . + 1",
+        "(.. | numbers) |= . + 1 | path(first(.[] | . as $x | $x))",
         "[paths(type == \"number\") ] as $p | .a | path(first(.[] | if . then .a else .b end))",
         "def f: .a; f |= 1",
         "pick(first(.[] | . as $x | $x))",
@@ -2174,6 +2174,13 @@ fn route_sends_dynamic_path_targets_to_the_interpreter_only_5223() {
         "path(.a // .b)",
         "[path(.[$k])]",
         "path(recurse(.[]?))",
+        // The jq-defined type selectors keep `.` or drop it by its type (#6359).
+        "(.. | numbers) |= . + 1",
+        "[path(.. | nulls)]",
+        "del(.. | nulls)",
+        "path(.. | objects | .a)",
+        "del(.[] | scalars, iterables)",
+        "[path(.. | strings, booleans, arrays, values)]",
         // A value-only index key, which jq runs as a subexpression (#5243).
         "reduce .[] as $r ({}; .[$r.name] = $r.score)",
         "reduce .[] as $r ({}; .x[$r.name | tostring] += 1)",
