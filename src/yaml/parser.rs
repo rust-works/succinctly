@@ -535,6 +535,11 @@ struct Parser<'a, const HAS_CR: bool> {
     /// ended the scalar has nothing to attach to. Written once per plain scalar scan.
     last_plain_scalar: Option<PlainScalarSpan>,
 
+    /// Where the plain scalar that is the whole content of the pending explicit key began (#6371):
+    /// the scalar [`Self::last_plain_scalar`] holds, when `parse_explicit_key` has just read it.
+    /// A line that stands after it once a comment ended it has nothing to attach to either.
+    explicit_key_scalar_start: Option<usize>,
+
     /// Whether the key named by [`Self::pending_explicit_key`] was a bare `?`
     /// with no content (`?\n- a\n:\n- c`), as opposed to a key that held a
     /// node of its own (`? k`). Only the latter rejects a same-indent `-`
@@ -740,6 +745,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 && (crate::util::simd::escape::contains_byte(input, 0xC2)
                     || crate::util::simd::escape::contains_byte(input, 0xE2)),
             last_plain_scalar: None,
+            explicit_key_scalar_start: None,
             pending_explicit_key_empty: false,
             pending_explicit_key_below: Vec::new(),
             nesting_depth: 0,
@@ -3505,6 +3511,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.in_document = true;
         // Every frame of the closing document has been closed, each key with its value or null.
         self.pending_explicit_key_below.clear();
+        self.explicit_key_scalar_start = None;
         // The document that's closing, if any -- `document_start_bp_pos`
         // still holds its root right up until the overwrite below.
         // `seen_any_document` is the only way to tell "no previous document"
@@ -5900,6 +5907,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.claim_floated_comment_for_key();
                 self.write_bp_open();
                 let end_pos = self.parse_unquoted_value_with_indent(indent);
+                self.explicit_key_scalar_start = self.last_plain_scalar.map(|span| span.start);
                 self.check_unicode_break_tab()?;
                 // The scan stops at a `: ` of a later line (`? a⏎  b: 1`): that is a mapping
                 // inside the key's node, which yq refuses, not the entry's value (#5086). A `: `
@@ -9257,6 +9265,37 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         stray && !self.document_root_is_a_bare_plain_scalar()
     }
 
+    /// Whether the line at the cursor, at `indent`, stands after the plain scalar `ended` that is the
+    /// whole content of the pending explicit key beginning at `key_scalar`, a comment having ended
+    /// it, and is more indented than the `?` without being the `:` of the key's value (#6371): yq
+    /// stops with `did not find expected key`, where the line read as the entry's value and the
+    /// `: v` line after it was lost. A line at the `?`'s column is the `:` or the next key, which
+    /// the dispatch below judges.
+    fn line_is_stray_after_an_explicit_key_scalar(
+        &self,
+        ended: Option<PlainScalarSpan>,
+        key_scalar: usize,
+        indent: usize,
+    ) -> bool {
+        let Some(scalar) = ended.filter(|scalar| scalar.start == key_scalar) else {
+            return false;
+        };
+        let Some(owner_depth) = self.pending_explicit_key else {
+            return false;
+        };
+        // A `:` that is followed by a blank is the key's value indicator, which the dispatch judges;
+        // `:x` is a plain scalar.
+        let value_indicator =
+            self.peek() == Some(b':') && Self::is_ws_break_or_eoi(self.peek_at(1));
+        !matches!(self.peek(), Some(b'#' | b'\n' | b'\r') | None)
+            && !value_indicator
+            && self
+                .indent_stack
+                .get(owner_depth - 1)
+                .is_some_and(|&at| indent > at)
+            && self.only_comments_between(scalar.end) == Some(true)
+    }
+
     /// Whether nothing but a comment, blank lines and comment lines lies between `from` and the
     /// line the cursor is on, and if so whether a comment does.
     fn only_comments_between(&self, from: usize) -> Option<bool> {
@@ -9482,6 +9521,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             && self.line_is_stray_after_a_plain_scalar(ended, indent, false)
         {
             return Err(self.err_stray_line());
+        }
+        // #6371: and the line after an explicit key's plain scalar that a comment ended, more
+        // indented than the `?` and not the `:` of its value (`? a⏎  b # c⏎  d⏎: v`).
+        if let Some(key_scalar) = self.explicit_key_scalar_start.take() {
+            if self.line_is_stray_after_an_explicit_key_scalar(ended, key_scalar, indent) {
+                return Err(self.err_stray_line());
+            }
         }
 
         // Check what kind of content this is
