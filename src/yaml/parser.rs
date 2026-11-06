@@ -808,7 +808,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// Set an interest bit at a specific position.
     #[inline]
-    #[allow(dead_code)] // STYLE-0005: helper for an experimental SIMD path
     fn set_ib_at(&mut self, pos: usize) {
         let word_idx = pos / 64;
         let bit_idx = pos % 64;
@@ -2349,6 +2348,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         if before.is_some() && self.pending_head_comment == before {
             self.pending_head_comment = None;
         }
+    }
+
+    /// Write the node of a value that is empty (null), anchored at `at`: the end of its key's `:`
+    /// (#6386). yq places an empty value there (`.a | line` of `a:` is the key's line), and it must be
+    /// a byte no node decodes from: the reader reads a node by its first byte, so a null written at
+    /// the start of the *next* line, where the lookahead leaves the cursor, read a quoted or flow key
+    /// there as the value (`a:` / `"b": 1` was `{"a": "b"}`).
+    fn write_null_value_at(&mut self, at: usize) {
+        self.set_ib_at(at);
+        self.write_bp_open_at(at);
+        self.write_bp_close();
     }
 
     /// Write a close parenthesis (0) to BP.
@@ -4891,6 +4901,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             );
         }
         self.advance(); // Skip ':'
+        let colon_end = self.pos;
 
         // Skip space after colon
         self.skip_inline_whitespace();
@@ -4915,6 +4926,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         } else {
             false
         };
+        // Where an empty value goes (#6386): at its key's colon, or at the end of its properties. Never
+        // on the next line, whose first byte the reader would decode the node from.
+        let null_at = if had_property { self.pos } else { colon_end };
 
         // Parse value
         if self.at_line_end() {
@@ -4965,9 +4979,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.reject_tab_only_line_at_cursor()?;
             if self.peek().is_none() {
                 // EOF - null value: emit empty value node
-                self.set_ib();
-                self.write_bp_open();
-                self.write_bp_close();
+                self.write_null_value_at(null_at);
             } else {
                 let next_indent = self.count_indent().unwrap_or(0);
 
@@ -4976,14 +4988,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.advance_by(next_indent);
                 let is_sequence_indicator =
                     matches!(self.peek(), Some(b'-')) && Self::is_ws_break_or_eoi(self.peek_at(1));
+                // A block scalar header at the key's own indent is the key's value (see
+                // `parse_mapping_entry`): `- a:` / `  |` / `    t` is `[{"a": "t\n"}]`.
+                let is_block_scalar_header = matches!(self.peek(), Some(b'|' | b'>'));
                 self.pos = saved_pos;
 
-                if next_indent < indent || (next_indent == indent && !is_sequence_indicator) {
+                if next_indent < indent
+                    || (next_indent == indent && !is_sequence_indicator && !is_block_scalar_header)
+                {
                     // Next line is at lower indent, or same indent but not a sequence
                     // - null value: emit empty value node
-                    self.set_ib();
-                    self.write_bp_open();
-                    self.write_bp_close();
+                    self.write_null_value_at(null_at);
                 }
                 // Otherwise, value is a nested structure - main loop will handle it
             }
@@ -5163,6 +5178,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return Err(self.err_unexpected_char(self.pos, "expected ':' after key"));
         }
         self.advance(); // Skip ':'
+        let colon_end = self.pos;
 
         // Skip space after colon
         self.skip_inline_whitespace();
@@ -5172,9 +5188,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // Check if at EOF - if so, we need an explicit empty value node
             if self.peek().is_none() {
                 // EOF after colon - emit empty value
-                self.set_ib();
-                self.write_bp_open();
-                self.write_bp_close();
+                self.write_null_value_at(colon_end);
                 return Ok(());
             }
             // Value is on next line - check what kind of value. Capture a
@@ -5200,9 +5214,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.reject_tab_only_line_at_cursor()?;
             if self.peek().is_none() {
                 // EOF - null value: emit empty value node
-                self.set_ib();
-                self.write_bp_open();
-                self.write_bp_close();
+                self.write_null_value_at(colon_end);
                 return Ok(());
             }
 
@@ -5215,22 +5227,23 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             let next_char = self.peek();
             let is_sequence_indicator =
                 matches!(next_char, Some(b'-')) && Self::is_ws_break_or_eoi(self.peek_at(1));
+            // A line that starts with `|` or `>` is a block scalar header: it cannot be a key, so at the
+            // key's own indent it is the key's value, as a sequence is (`a:` / `|` / `  x` is
+            // `{"a": "x\n"}` in yq). It used to read only because the null written for it sat on the
+            // `|` (#6386), which the reader then took for the block scalar.
+            let is_block_scalar_header = matches!(next_char, Some(b'|' | b'>'));
             self.pos = saved_pos;
 
             if next_indent < indent {
                 // Next line is at lower indent - definitely null value
-                self.set_ib();
-                self.write_bp_open();
-                self.write_bp_close();
+                self.write_null_value_at(colon_end);
                 return Ok(());
             }
 
-            if next_indent == indent && !is_sequence_indicator {
-                // Next line is at same indent but NOT a sequence - null value
+            if next_indent == indent && !is_sequence_indicator && !is_block_scalar_header {
+                // Next line is at same indent but NOT a sequence or a block scalar - null value
                 // (If it were a sequence, the sequence is the value of this key)
-                self.set_ib();
-                self.write_bp_open();
-                self.write_bp_close();
+                self.write_null_value_at(colon_end);
                 return Ok(());
             }
 
