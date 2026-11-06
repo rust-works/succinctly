@@ -15100,29 +15100,27 @@ fn test_argjson_invalid_value_errors() -> Result<()> {
 }
 
 // ============================================================================
-// Sequence-entry indicator in flow context (#332)
+// Sequence-entry indicator in flow context (#332, #6413)
 //
-// These inputs are invalid YAML — `-` followed by whitespace is always the
+// These inputs are invalid YAML -- `-` followed by whitespace is always the
 // sequence-entry indicator, and no block sequence can start inside a flow
-// collection — and real `yq` rejects every one of them. So they cannot be yq
-// goldens: `scripts/sync-yq-golden.sh` has no `expected.out` to capture. The
-// loader is deliberately lenient here (`succinctly yaml validate` is the layer
-// that rejects them); what it must not do is silently discard the content,
-// which is what it did before #332.
+// collection -- and real `yq` rejects every one of them. The loader read the
+// content as text, so as not to discard it (#332); since #6413 it refuses them
+// as yq does (`tests/yq_cli/i6413.rs` pins the wider matrix).
 // ============================================================================
 
 #[test]
-fn test_flow_dash_space_scalar_content_is_not_dropped() -> Result<()> {
-    for (yaml, expected) in [
-        ("[- x]\n", r#"["- x"]"#),
-        ("{a: - x}\n", r#"{"a":"- x"}"#),
-        ("[- x, 1]\n", r#"["- x",1]"#),
-        ("[a, - b]\n", r#"["a","- b"]"#),
-        ("{a: [- x]}\n", r#"{"a":["- x"]}"#),
+fn test_flow_dash_space_scalar_is_refused_6413() -> Result<()> {
+    for yaml in [
+        "[- x]\n",
+        "{a: - x}\n",
+        "[- x, 1]\n",
+        "[a, - b]\n",
+        "{a: [- x]}\n",
     ] {
         let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
-        assert_eq!(code, 0, "for {yaml:?}");
-        assert_eq!(output.trim(), expected, "for {yaml:?}");
+        assert_ne!(code, 0, "for {yaml:?}");
+        assert_eq!(output, "", "for {yaml:?}");
     }
     Ok(())
 }
@@ -16521,7 +16519,7 @@ fn test_flow_dash_space_scalar_round_trips_through_yaml_output() -> Result<()> {
     // source now correctly stays flow on output (previously forced to
     // block) — the quoting obligation itself is unconditional and still
     // applies.
-    let (yaml_out, code) = run_yq_stdin(".", "[- x]\n", &[])?;
+    let (yaml_out, code) = run_yq_stdin(".", "[\"- x\"]\n", &[])?;
     assert_eq!(code, 0);
     assert_eq!(yaml_out, "[\"- x\"]\n");
 

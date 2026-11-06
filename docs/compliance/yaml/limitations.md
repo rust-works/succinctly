@@ -126,25 +126,15 @@ For an accepted-but-invalid document the loader's job is to produce *some* value
 losing input. Where a construct has no valid reading, the parser absorbs it as scalar text
 rather than discarding it — the same principle as the tag handling below.
 
-`- ` followed by content is one such case. It is always the sequence-entry indicator, and
-no block sequence can begin inside a flow collection, so `[- x]` is invalid (`yq` rejects
-it, and so does the validator). The loader reads it as the plain scalar `"- x"`:
-
-```
-$ printf '[- x]\n' | succinctly yq -o json -I0 '.'
-["- x"]                   # yq: did not find expected node content
-```
-
-Until [#332](https://github.com/rust-works/succinctly/issues/332) this yielded `[null]` —
-the content was silently discarded, which is a worse failure mode than either erroring or
-keeping the text. A `-` *not* followed by whitespace is an ordinary flow plain scalar and
-always was: `[-]` is `["-"]`, `[-1]` is `[-1]`.
+`- ` followed by content is one such case in block context, below.
+In a flow collection it is the sequence-entry indicator too, and no block sequence can begin there, so `[- x]` is invalid: `yq` rejects it (`block sequence entries are not allowed in this context`) and so does the validator.
+Since [#6413](https://github.com/rust-works/succinctly/issues/6413) `succinctly yq` refuses it as well (`[- x]`, `[a, - x]`, `{a: - x}`); until then it read the plain scalar `"- x"`, which is what [#332](https://github.com/rust-works/succinctly/issues/332) chose over silently discarding the content (`[null]`).
+A `-` *not* followed by whitespace is an ordinary flow plain scalar and always was: `[-]` is `["-"]`, `[-1]` is `[-1]`.
 
 The **block** spelling `key: - a` is equally invalid, but it does have a valid reading to
 fall back on, so [#325](https://github.com/rust-works/succinctly/issues/325) takes it
-rather than absorbing the text: the loader emits the block sequence the author plainly
-meant. Absorbing it as scalar text would keep the bytes but still misread the structure,
-and unlike the flow case there is a sequence to build here.
+rather than refusing it: the loader emits the block sequence the author plainly
+meant, which keeps the structure the author wrote.
 
 ```
 $ printf 'key: - a\n' | succinctly yq -o json -I0 '.'
@@ -153,9 +143,7 @@ $ printf 'key: - a\n' | succinctly yq -o json -I0 '.'
 
 A continuation line at the same column joins that sequence (`key: - a\n     - b` is
 `{"key":["a","b"]}`), and a bare `key: -` is an empty item, `{"key":[null]}` — the `-` is
-an indicator, so there is no text to preserve. This is the one place the two rules differ,
-and the split is deliberate: flow keeps text because no sequence can exist there; block
-builds the sequence because one can.
+an indicator, so there is no text to preserve.
 
 A continuation line can also be invalid the other way: out-dented, sitting strictly between
 the sequence's own indent and whatever encloses it, rather than on the mapping key's line.
