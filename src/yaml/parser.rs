@@ -4983,6 +4983,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         } else {
             false
         };
+        // Where an empty value goes (#6386): at its key's colon, or at the end of its properties. Never
+        // on the next line, whose first byte the reader would decode the node from.
+        let null_at = if had_property { self.pos } else { colon_end };
 
         // Parse value
         if self.at_line_end() {
@@ -5033,23 +5036,23 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.reject_tab_only_line_at_cursor()?;
             if self.peek().is_none() {
                 // EOF - null value: emit empty value node
-                self.set_ib();
-                self.write_bp_open();
-                self.write_bp_close();
+                self.write_null_value_at(null_at);
             } else {
                 let next_indent = self.count_indent().unwrap_or(0);
-                // An empty value with no property sits at its key's colon (#6386); one with a property
-                // keeps the position it has.
-                let null_at = if had_property { self.pos } else { colon_end };
 
                 // Check if next content is a sequence indicator
                 let saved_pos = self.pos;
                 self.advance_by(next_indent);
                 let is_sequence_indicator =
                     matches!(self.peek(), Some(b'-')) && Self::is_ws_break_or_eoi(self.peek_at(1));
+                // A block scalar header at the key's own indent is the key's value (see
+                // `parse_mapping_entry`): `- a:` / `  |` / `    t` is `[{"a": "t\n"}]`.
+                let is_block_scalar_header = matches!(self.peek(), Some(b'|' | b'>'));
                 self.pos = saved_pos;
 
-                if next_indent < indent || (next_indent == indent && !is_sequence_indicator) {
+                if next_indent < indent
+                    || (next_indent == indent && !is_sequence_indicator && !is_block_scalar_header)
+                {
                     // Next line is at lower indent, or same indent but not a sequence
                     // - null value: emit empty value node
                     self.write_null_value_at(null_at);
@@ -5249,9 +5252,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // Check if at EOF - if so, we need an explicit empty value node
             if self.peek().is_none() {
                 // EOF after colon - emit empty value
-                self.set_ib();
-                self.write_bp_open();
-                self.write_bp_close();
+                self.write_null_value_at(colon_end);
                 return Ok(());
             }
             // Value is on next line - check what kind of value. Capture a
@@ -5277,9 +5278,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.reject_tab_only_line_at_cursor()?;
             if self.peek().is_none() {
                 // EOF - null value: emit empty value node
-                self.set_ib();
-                self.write_bp_open();
-                self.write_bp_close();
+                self.write_null_value_at(colon_end);
                 return Ok(());
             }
 

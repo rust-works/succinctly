@@ -58,6 +58,34 @@ fn test_an_empty_value_before_a_quoted_or_flow_key_stays_null_6386() -> Result<(
             "x:\n  a:\n  |\n    t\n  b: 1\n",
             "{\"x\":{\"a\":\"t\\n\",\"b\":1}}",
         ),
+        // The same in a sequence item's compact mapping.
+        ("- a:\n  |\n    t\n", "[{\"a\":\"t\\n\"}]"),
+        (
+            "x:\n  - a:\n    |\n      t\n    b: 1\n",
+            "{\"x\":[{\"a\":\"t\\n\",\"b\":1}]}",
+        ),
+        ("- a: &x\n  |\n    t\n", "[{\"a\":\"t\\n\"}]"),
+        // An empty value with a property, before a quoted or flow key.
+        ("a: &x\n\"b\": 1\n", "{\"a\":null,\"b\":1}"),
+        ("x:\n  a: &x\n\"b\": 1\n", "{\"x\":{\"a\":null},\"b\":1}"),
+        ("x:\n  a: !!str\n[b]: 1\n", "{\"x\":{\"a\":\"\"},\"\":1}"),
+        (
+            "x:\n  - a: &x\n\"b\": 1\n",
+            "{\"x\":[{\"a\":null}],\"b\":1}",
+        ),
+        (
+            "x:\n  - a: !!str\n\"b\": 1\n",
+            "{\"x\":[{\"a\":\"\"}],\"b\":1}",
+        ),
+        (
+            "x:\n  - a: !!null\n[b]: 1\n",
+            "{\"x\":[{\"a\":null}],\"\":1}",
+        ),
+        // CRLF line breaks.
+        ("a:\r\n\"b\": 1\r\n", "{\"a\":null,\"b\":1}"),
+        ("x:\r\n  a:\r\n\"b\": 1\r\n", "{\"x\":{\"a\":null},\"b\":1}"),
+        ("a:\r\n|\r\n  x\r\nb: 1\r\n", "{\"a\":\"x\\n\",\"b\":1}"),
+        ("a:\r\n[x]: 1\r\n", "{\"a\":null,\"\":1}"),
         // The shapes that already read.
         ("a:\nb: 1\n", "{\"a\":null,\"b\":1}"),
         ("a:\n&n b: 1\n", "{\"a\":null,\"b\":1}"),
@@ -84,6 +112,15 @@ fn test_an_empty_value_sits_at_its_keys_colon_6386() -> Result<()> {
         ("x:\n  a:\n  b: 1\n", ".x.a | line", "2"),
         ("a:\n\"b\": 1\n", ".a | line", "1"),
         ("x:\n  - a:\n    b: 1\n", ".x[0].a | line", "2"),
+        // An empty value at the end of the input sits there too, not past the last line.
+        ("a:", ".a | line", "1"),
+        ("a:", ".a | column", "3"),
+        ("a:\n", ".a | line", "1"),
+        ("a:\n", ".a | column", "3"),
+        ("a: # c", ".a | column", "3"),
+        ("x:\n  a:", ".x.a | column", "5"),
+        ("a:\r\nb: 1\r\n", ".a | line", "1"),
+        ("a:\r\nb: 1\r\n", ".a | column", "3"),
     ] {
         let (stdout, code) = run_yq_stdin(filter, doc, &[])?;
         assert_eq!((stdout.trim_end(), code), (expected, 0), "{doc:?} {filter}");
