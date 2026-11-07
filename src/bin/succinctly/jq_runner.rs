@@ -11660,11 +11660,38 @@ fn seq_plain_json_inputs(args: &JqCommand) -> Result<Option<PreparedInputs>> {
 
 /// [`seq_plain_json_inputs`]' decision over one source's bytes: the stream with its RS bytes
 /// blanked when it is clean, the bytes as they were when it is not.
-fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Vec<u8>, Vec<u8>> {
+fn seq_stream_as_plain_json(
+    mut raw: Vec<u8>,
+    slurp: bool,
+) -> std::result::Result<Vec<u8>, Vec<u8>> {
     // `0xEF` starts a byte-order mark, which jq's reader consumes (even a partial one).
     if raw.first() == Some(&0xEF) || std::str::from_utf8(&raw).is_err() {
         return Err(raw);
     }
+    // #6501: a stream that is RFC 7464's own framing, every record `RS value LF` with the value one
+    // RFC 8259 document, is clean without the walk: a one-way check, run at the validator's speed
+    // instead of the walk's. Every other stream takes the walk, as before. `-s` keeps the depth
+    // check the walk's answer is given below, since the array it wraps the values in is a level
+    // more than the deepest value has.
+    if crate::jq_seq_reader::plain_record_sequence(&raw, crate::jq_seq_reader::PlainGuards::ALL)
+        && (!slurp || json_depth_at_most(&raw, LAZY_JSON_MAX_DEPTH))
+    {
+        for b in &mut raw {
+            if *b == ASCII_RS {
+                *b = b' ';
+            }
+        }
+        return Ok(raw);
+    }
+    seq_stream_walked_as_plain_json(raw, slurp)
+}
+
+/// [`seq_stream_as_plain_json`]'s decision by the walk of jq's reader, for the streams
+/// [`crate::jq_seq_reader::plain_record_sequence`] does not vouch for.
+fn seq_stream_walked_as_plain_json(
+    raw: Vec<u8>,
+    slurp: bool,
+) -> std::result::Result<Vec<u8>, Vec<u8>> {
     let mut sources = vec![(None, raw)];
     let mut warned = false;
     let walk = crate::jq_seq_reader::walk_stream_values(&sources, slurp, &mut |_| warned = true);
@@ -22410,5 +22437,267 @@ mod tests {
             "{out:?}"
         );
         assert!(!sink.hit());
+    }
+}
+
+/// #6501: [`crate::jq_seq_reader::plain_record_sequence`] is a second definition of part of what
+/// the walk decides, so this holds the two together: `true` must imply that the walk finds the
+/// same clean stream, under both `-s` values, and each guard is dropped in turn to show the test
+/// can fail without it.
+#[cfg(test)]
+mod plain_record_sequence_tests {
+    use super::*;
+    use crate::jq_seq_reader::{plain_record_sequence, PlainGuards};
+
+    /// xorshift64: a fixed stream of streams, so a failure repeats.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn chance(&mut self, percent: usize) -> bool {
+            self.below(100) < percent
+        }
+    }
+
+    /// Records that are valid RFC 8259, near-misses of it, and shapes only jq reads.
+    const RECORDS: &[&str] = &[
+        r#"{"a":1}"#,
+        r#"{"id":12,"name":"x y","score":1.5e3,"tags":["p","q"],"ok":true,"n":null}"#,
+        "[1,2,3]",
+        "[]",
+        "{}",
+        "[[],{}]",
+        r#""s""#,
+        r#""""#,
+        "0",
+        "-0",
+        "1",
+        "12.5",
+        "1e5",
+        "1E+5",
+        "-1.5e-3",
+        "true",
+        "false",
+        "null",
+        r#""😀""#,
+        r#""é""#,
+        r#""\ud83d\ude00""#,
+        r#""\u0000""#,
+        r#""\udc00""#,
+        r#""\ud800""#,
+        r#""a\"b\\c\/\n""#,
+        r#"{"a":{"b":[{"c":null}]}}"#,
+        "nan",
+        "007",
+        ".5",
+        "+1",
+        "1.",
+        "1,2",
+        "1 2",
+        "}",
+        "]",
+        "[1,",
+        "{\"a\"",
+        "\"open",
+        "tru",
+        "nul",
+        "n",
+        "1e",
+        "-",
+    ];
+
+    /// Bytes a mutation inserts: RS, newlines, whitespace, structure, digits and literal letters,
+    /// and control bytes.
+    const ALPHABET: &[u8] = b"\x1e\x1e\n\n \t\r\"\\{}[],:01-.eEnulltrufas\x1f\x7f\x00";
+
+    fn stream(rng: &mut Rng) -> Vec<u8> {
+        let mut out = Vec::new();
+        if rng.chance(3) {
+            out.extend_from_slice(b"junk\n");
+        }
+        for _ in 0..=rng.below(5) {
+            if rng.chance(96) {
+                out.push(ASCII_RS);
+            }
+            if rng.chance(4) {
+                out.extend_from_slice(b"  ");
+            }
+            let mut record = RECORDS[rng.below(RECORDS.len())].as_bytes().to_vec();
+            if rng.chance(25) {
+                for _ in 0..=rng.below(2) {
+                    let byte = ALPHABET[rng.below(ALPHABET.len())];
+                    let at = rng.below(record.len() + 1);
+                    match rng.below(3) {
+                        0 => record.insert(at, byte),
+                        1 if at < record.len() => record[at] = byte,
+                        2 if at < record.len() => {
+                            record.remove(at);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            out.extend_from_slice(&record);
+            match rng.below(20) {
+                0 => {}
+                1 => out.push(b' '),
+                2 => out.extend_from_slice(b"\r\n"),
+                3 => out.extend_from_slice(b"\n\n"),
+                4 => out.extend_from_slice(b" \n"),
+                _ => out.push(b'\n'),
+            }
+        }
+        out
+    }
+
+    /// What one sweep found, over streams the runner's own gate lets through (valid UTF-8, no
+    /// byte-order mark), each under `-s` and without it.
+    struct Sweep {
+        /// The check said clean.
+        accepted: u64,
+        /// The check said clean and the walk did not, or blanked to different text.
+        unsound: u64,
+        /// The first stream that was.
+        example: Option<Vec<u8>>,
+    }
+
+    fn sweep(guards: PlainGuards, cases: u64) -> Sweep {
+        let mut found = Sweep {
+            accepted: 0,
+            unsound: 0,
+            example: None,
+        };
+        let mut rng = Rng(0x6501_6501_6501_6501);
+        for _ in 0..cases {
+            let raw = stream(&mut rng);
+            if raw.first() == Some(&0xEF) || std::str::from_utf8(&raw).is_err() {
+                continue;
+            }
+            if !plain_record_sequence(&raw, guards) {
+                continue;
+            }
+            let blanked: Vec<u8> = raw
+                .iter()
+                .map(|&b| if b == ASCII_RS { b' ' } else { b })
+                .collect();
+            for slurp in [false, true] {
+                found.accepted += 1;
+                match seq_stream_walked_as_plain_json(raw.clone(), slurp) {
+                    Ok(text) if text == blanked => {}
+                    _ => {
+                        found.unsound += 1;
+                        found.example.get_or_insert_with(|| raw.clone());
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    fn cases() -> u64 {
+        std::env::var("SEQ_RECORD_CHECK_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600_000)
+    }
+
+    #[test]
+    fn a_stream_the_record_check_vouches_for_is_clean_to_the_walk_6501() {
+        let cases = cases();
+        let found = sweep(PlainGuards::ALL, cases);
+        assert_eq!(
+            found.unsound,
+            0,
+            "unsound on {:?}",
+            found
+                .example
+                .as_deref()
+                .map(|e| String::from_utf8_lossy(e).into_owned())
+        );
+        // A check that vouched for nothing would be sound for nothing.
+        assert!(
+            found.accepted > cases / 5,
+            "only {} of {} streams accepted",
+            found.accepted,
+            cases * 2
+        );
+    }
+
+    /// Each guard is needed: with it dropped, the same streams find a stream the check vouches for
+    /// and the walk does not.
+    #[test]
+    fn each_guard_of_the_record_check_is_needed_6501() {
+        let cases = cases();
+        let all = PlainGuards::ALL;
+        for (name, guards) in [
+            (
+                "starts_on_rs",
+                PlainGuards {
+                    starts_on_rs: false,
+                    ..all
+                },
+            ),
+            (
+                "ends_on_newline",
+                // The record guard implies it, so both go.
+                PlainGuards {
+                    ends_on_newline: false,
+                    record_ends_on_newline: false,
+                    ..all
+                },
+            ),
+            (
+                "record_ends_on_newline",
+                PlainGuards {
+                    record_ends_on_newline: false,
+                    ..all
+                },
+            ),
+        ] {
+            let found = sweep(guards, cases);
+            assert!(
+                found.unsound > 0,
+                "{name}: no unsound stream in {cases} cases, so the test cannot fail without it"
+            );
+        }
+    }
+
+    /// The streams of the issue, one per guard, and the shapes the check must take.
+    #[test]
+    fn the_record_check_on_the_streams_of_the_issue_6501() {
+        let all = PlainGuards::ALL;
+        for (raw, want) in [
+            (&b"\x1e{\"a\":1}\n\x1e[2]\n"[..], true),
+            (b"\x1e1\n", true),
+            (b"\x1e1 \n\x1e2\n", true),
+            // Bytes before the first RS, no final newline, an RS straight after a number.
+            (b"false\n", false),
+            (b"\x1e12.5", false),
+            (b"\x1e1\x1e", false),
+            (b"\x1e1\n\x1e2", false),
+            // Nothing, an empty record, a record that is not RFC 8259.
+            (b"", false),
+            (b"\x1e\n", false),
+            (b"\x1e1\n\x1e\n", false),
+            (b"\x1e007\n", false),
+            (b"\x1enan\n", false),
+        ] {
+            assert_eq!(
+                plain_record_sequence(raw, all),
+                want,
+                "{:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
     }
 }
