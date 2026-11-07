@@ -494,6 +494,98 @@ fn a_lazy_short_repeat_over_an_anchored_body_answers_as_jq_does_6358() -> Result
     Ok(())
 }
 
+/// The same patterns through `test`, `scan`, `sub` and `gsub`, which read no capture back (#6358).
+#[test]
+fn a_lazy_short_repeat_over_an_anchored_body_answers_without_captures_as_jq_does_6358() -> Result<()>
+{
+    for (pattern, rows) in [
+        (
+            r"(?:(\b)|b){0,2}?\z",
+            &[
+                ("a b", r#"[true,2,"a X","a XX"]"#),
+                ("ba", r#"[true,1,"baX","baX"]"#),
+                ("bab", r#"[true,2,"baX","baXX"]"#),
+                ("b a", r#"[true,1,"b aX","b aX"]"#),
+                ("ab ", r#"[true,1,"ab X","ab X"]"#),
+            ][..],
+        ),
+        (
+            r"(?:(\b)|b){1,2}?\z",
+            &[
+                ("a b", r#"[true,2,"a X","a XX"]"#),
+                ("ba", r#"[true,1,"baX","baX"]"#),
+                ("bab", r#"[true,2,"baX","baXX"]"#),
+                ("b a", r#"[true,1,"b aX","b aX"]"#),
+                ("ab ", r#"[false,0,"ab ","ab "]"#),
+            ][..],
+        ),
+        (
+            r"(?:(\b)|b){0,3}?\z",
+            &[
+                ("a b", r#"[true,2,"a X","a XX"]"#),
+                ("ba", r#"[true,1,"baX","baX"]"#),
+                ("bab", r#"[true,2,"baX","baXX"]"#),
+                ("b a", r#"[true,1,"b aX","b aX"]"#),
+                ("ab ", r#"[true,1,"ab X","ab X"]"#),
+            ][..],
+        ),
+    ] {
+        for &(input, expected) in rows {
+            let (stdout, _, status) = run_jq_full(
+                &[
+                    "-nc",
+                    "--arg",
+                    "s",
+                    input,
+                    "--arg",
+                    "p",
+                    pattern,
+                    r#"[$s | test($p), ([$s | scan($p)] | length), sub($p; "X"), gsub($p; "X")]"#,
+                ],
+                None,
+            )?;
+            assert_eq!(
+                (stdout.trim_end(), status),
+                (expected, 0),
+                "{pattern} on {input:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The smallest bounded counts, `{0,2}?` and `{1,2}?` (#6358).
+#[test]
+fn a_lazy_two_count_repeat_over_an_anchored_body_answers_as_jq_does_6358() -> Result<()> {
+    for (pattern, rows) in [
+        (
+            r"(?:(\b)|b){0,2}?\z",
+            &[
+                ("a b", r#"[[2,"b",[null]],[3,"",[""]]]"#),
+                ("ba", r#"[[2,"",[""]]]"#),
+                ("bab", r#"[[2,"b",[null]],[3,"",[""]]]"#),
+                ("b a", r#"[[3,"",[""]]]"#),
+                ("ab ", r#"[[3,"",[""]]]"#),
+            ][..],
+        ),
+        (
+            r"(?:(\b)|b){1,2}?\z",
+            &[
+                ("a b", r#"[[2,"b",[null]],[3,"",[""]]]"#),
+                ("ba", r#"[[2,"",[""]]]"#),
+                ("bab", r#"[[2,"b",[null]],[3,"",[""]]]"#),
+                ("b a", r#"[[3,"",[""]]]"#),
+                ("ab ", "[]"),
+            ][..],
+        ),
+    ] {
+        for &(input, expected) in rows {
+            assert_matches(pattern, input, expected)?;
+        }
+    }
+    Ok(())
+}
+
 fn assert_matches(pattern: &str, input: &str, expected: &str) -> Result<()> {
     let (stdout, _, status) = run_jq_full(
         &[

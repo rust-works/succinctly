@@ -4595,6 +4595,7 @@ mod tests {
         // A plain anchor is the same way as before.
         assert!(written(r"(?:(a)|\zb*)+").is_some());
     }
+
     /// #6358: a lazy `{0,n}?` or `{1,n}?` over a body with a way that is only an anchor, a group around
     /// it and a consuming way after it is written for its copies, as one with a group-free body is.
     #[test]
@@ -4607,6 +4608,9 @@ mod tests {
             Some(r"(?:b{0,3}?|[^\s\S](?:(?:(\b)|[^\s\S])))\z")
         );
         assert!(copied(r"(?:(\b)|b){1,3}?\z").is_some());
+        // The smallest bounded counts are written too.
+        assert!(copied(r"(?:(\b)|b){0,2}?\z").is_some());
+        assert!(copied(r"(?:(\b)|b){1,2}?\z").is_some());
         // No consuming way after the anchor's, an unbounded repeat and a repeat of one keep their text.
         assert_eq!(copied(r"(?:b|(\b)){0,3}?\z"), None);
         assert_eq!(copied(r"(?:(\b)|b)*?\z"), None);
