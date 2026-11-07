@@ -429,6 +429,11 @@ struct BenchYqArgs {
     /// Path to succinctly binary
     #[arg(long, default_value = "./target/release/succinctly")]
     binary: PathBuf,
+
+    /// The yq to compare against (a bare name is looked up on PATH; without this flag a missing
+    /// yq runs succinctly alone). The reference is Homebrew yq v4.53.3
+    #[arg(long)]
+    yq: Option<PathBuf>,
 }
 
 /// Arguments for DSV benchmark
@@ -2349,12 +2354,18 @@ fn run_yq_benchmark(args: BenchYqArgs) -> Result<()> {
         );
     }
 
+    if args.runs == 0 {
+        anyhow::bail!("--runs must be at least 1: the median of no runs is undefined");
+    }
+
     let config = yq_bench::BenchConfig {
         data_dir: args.data_dir,
         patterns,
         sizes,
         queries,
         succinctly_binary: args.binary,
+        yq_required: args.yq.is_some(),
+        yq_binary: args.yq.unwrap_or_else(|| PathBuf::from("yq")),
         warmup_runs: args.warmup,
         benchmark_runs: args.runs,
         memory_mode: !args.no_memory,
@@ -2986,6 +2997,7 @@ fn format_bytes(bytes: usize) -> String {
 }
 
 mod address_space;
+mod bench_reps;
 #[cfg(feature = "bench-runner")]
 mod bench_runner;
 #[cfg(feature = "bench-runner")]
@@ -3422,6 +3434,43 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("jq not found at `/nonexistent/jq-for-bench-test`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn bench_yq_args(binary: &str) -> BenchYqArgs {
+        BenchYqArgs {
+            data_dir: PathBuf::from("data/bench/generated/yaml"),
+            output: None,
+            markdown: None,
+            patterns: "arrays".to_string(),
+            sizes: "1kb".to_string(),
+            queries: "identity".to_string(),
+            no_memory: true,
+            warmup: 0,
+            runs: 1,
+            binary: PathBuf::from(binary),
+            yq: None,
+        }
+    }
+
+    /// #6417: `--yq` reaches the benchmark, which refuses a yq it cannot run before timing anything
+    /// (the old runner always ran the `yq` on `PATH`), and `--runs 0` is a usage error.
+    #[test]
+    fn test_run_yq_benchmark_uses_the_given_yq() {
+        let mut args = bench_yq_args("./nonexistent");
+        args.yq = Some(PathBuf::from("/nonexistent/yq-for-bench-test"));
+        let err = run_yq_benchmark(args).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("yq not found at `/nonexistent/yq-for-bench-test`"),
+            "unexpected error: {err}"
+        );
+        let mut args = bench_yq_args("./nonexistent");
+        args.runs = 0;
+        let err = run_yq_benchmark(args).unwrap_err();
+        assert!(
+            err.to_string().contains("--runs must be at least 1"),
             "unexpected error: {err}"
         );
     }

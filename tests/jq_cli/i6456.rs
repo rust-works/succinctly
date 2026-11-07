@@ -345,3 +345,103 @@ fn the_builtins_over_a_multiline_caret_agree_6456() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn a_repeated_group_name_is_checked_for_a_caret_at_the_end_too_6456() -> Result<()> {
+    // The parser the caret check reads the pattern with refuses a name used twice (#6430); the
+    // loop it writes still has the end-of-text `^` asked of the exact engine.
+    for (subject, pattern, flags, expected) in [
+        (
+            "a\n",
+            "(?m)((?<n>a)\\w|(?<n>a)|^^)+",
+            "g",
+            "[[0,\"a\",[\"a\",null,\"a\"]]]",
+        ),
+        (
+            "aa\n",
+            "(?m)((?<n>a)\\w|(?<n>a)|^^)+",
+            "g",
+            "[[0,\"aa\",[\"aa\",\"a\",null]]]",
+        ),
+        (
+            "a\nb\n",
+            "(?m)((?<n>a)\\w|(?<n>a)|^^)+",
+            "g",
+            "[[0,\"a\",[\"a\",null,\"a\"]],[2,\"\",[\"\",\"\",\"\"]]]",
+        ),
+        (
+            "ab\n",
+            "(?m)((?<n>a)\\w|(?<n>a)|^^)+",
+            "g",
+            "[[0,\"ab\",[\"ab\",\"a\",null]]]",
+        ),
+        (
+            "\n",
+            "(?m)((?<n>a)\\w|(?<n>a)|^^)+",
+            "g",
+            "[[0,\"\",[\"\",\"\",\"\"]]]",
+        ),
+        (
+            "a\n",
+            "(?m)(?<n>a)|(?<n>^)",
+            "g",
+            "[[0,\"a\",[\"a\",null]]]",
+        ),
+        (
+            "aa\n",
+            "(?m)(?<n>a)|(?<n>^)",
+            "g",
+            "[[0,\"a\",[\"a\",null]],[1,\"a\",[\"a\",null]]]",
+        ),
+        (
+            "a\nb\n",
+            "(?m)(?<n>a)|(?<n>^)",
+            "g",
+            "[[0,\"a\",[\"a\",null]],[2,\"\",[\"\",\"\"]]]",
+        ),
+        (
+            "ab\n",
+            "(?m)(?<n>a)|(?<n>^)",
+            "g",
+            "[[0,\"a\",[\"a\",null]]]",
+        ),
+        ("\n", "(?m)(?<n>a)|(?<n>^)", "g", "[[0,\"\",[\"\",\"\"]]]"),
+        (
+            "a\n",
+            "(?m)^(?<n>a)?(?<n>b)?",
+            "g",
+            "[[0,\"a\",[\"a\",null]]]",
+        ),
+        (
+            "aa\n",
+            "(?m)^(?<n>a)?(?<n>b)?",
+            "g",
+            "[[0,\"a\",[\"a\",null]]]",
+        ),
+        (
+            "a\nb\n",
+            "(?m)^(?<n>a)?(?<n>b)?",
+            "g",
+            "[[0,\"a\",[\"a\",null]],[2,\"b\",[null,\"b\"]]]",
+        ),
+        (
+            "ab\n",
+            "(?m)^(?<n>a)?(?<n>b)?",
+            "g",
+            "[[0,\"ab\",[\"a\",\"b\"]]]",
+        ),
+        ("\n", "(?m)^(?<n>a)?(?<n>b)?", "g", "[[0,\"\",[\"\",\"\"]]]"),
+    ] {
+        assert_eq!(
+            run(
+                "$s | [match($p; $f) | [.offset, .string, [.captures[].string]]]",
+                subject,
+                pattern,
+                flags
+            )?,
+            (expected.to_owned(), 0),
+            "{pattern:?} ({flags:?}) on {subject:?}"
+        );
+    }
+    Ok(())
+}

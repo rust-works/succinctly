@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Differential sweep for #6310 and #6332: a capture group inside a loop's body.
 
-    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert | --bounded | --fancy] [--newlines] [--blanks] [--flags g] [--jq /usr/bin/jq]
+    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert | --bounded | --fancy] [--newlines [--multiline]] [--blanks] [--flags g] [--jq /usr/bin/jq]
 
 Oniguruma ends a greedy loop at the first iteration that matches nothing (#6106), and that holds when the
 body has a capture group: after its empty way (`(?:b*|(a))+`, #6310), or before it, in it, or with its own
@@ -16,8 +16,9 @@ the ways share a prefix; it is the draw that found the alternation `regex-syntax
 that keep their text. `--assert` (#6358) draws the loops whose ways hold a zero-width anchor (`\\b`, `\\B`, `^`, `$`, `\\A`, `\\z`)
 beside a capture group or a consuming item, under the counted and lazy quantifiers, on subjects with a word boundary
 in the middle; `--newlines` runs it on subjects that hold a newline instead, and lets the ways consume one, which is what says `^` and
-`$` may be written as `\\A` and `\\z`. `--fancy` (#6358) draws the plain loops with a lookaround or an atomic group beside them, outside the repeat, so
-that they run on `fancy-regex`. `--bounded` (#6428) draws a lazy `{0,n}?` or `{1,n}?` over anchors, flag switches and loops of its own, beside another loop or
+`$` may be written as `\\A` and `\\z`; `--multiline` (#6425) puts `(?m)` before every pattern, with `^`, `$` and a newline drawn more often, which is what makes
+them line anchors. `--fancy` (#6358) draws the plain loops with a lookaround or an atomic group beside them, outside the repeat, so
+that they run on `fancy-regex`. `--bounded` (#6428, #6427) draws a lazy repeat that may run once or not at all (`{0,n}?`, `{1,n}?`, `*?`, `+?`) over anchors, flag switches and loops of its own, beside another loop or
 inside a repeat. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
 captures are compared. It prints how many patterns SUBJECT fixed (BASELINE differed from jq, SUBJECT does
 not), broke (the reverse) and still differs on, and exits 1 when it broke one.
@@ -119,9 +120,10 @@ def ways_patterns(count, rng):
     return sorted(out)
 
 
-def assert_patterns(count, rng):
-    """`--assert`: ways that hold a zero-width anchor beside groups and consuming items, under a repeat."""
-    pool = ATOMS + ANCHORS * 3
+def assert_patterns(count, rng, multiline=False):
+    """`--assert`: ways that hold a zero-width anchor beside groups and consuming items, under a repeat.
+    `multiline` (#6425) draws `^`, `$` and a newline more often: they are what a `(?m)` loop turns on."""
+    pool = ATOMS + ANCHORS * 3 + (["^", "$"] * 6 + [r"\n"] * 6 if multiline else [])
 
     def way():
         return "".join(rng.choice(pool) for _ in range(rng.choice([1, 1, 2, 2])))
@@ -141,11 +143,11 @@ def assert_patterns(count, rng):
     return sorted(out)
 
 
-BOUNDED = ["{0,2}?", "{1,2}?", "{0,3}?", "{1,3}?", "{0,4}?", "{1,4}?", "{0,12}?", "{2,3}?", "{2,5}?"]
+BOUNDED = ["{0,2}?", "{1,2}?", "{0,3}?", "{1,3}?", "{0,4}?", "{1,4}?", "{0,12}?", "{2,3}?", "{2,5}?", "*?", "+?"]
 
 
 def bounded_patterns(count, rng):
-    """`--bounded`: a lazy `{0,n}?` or `{1,n}?`, over anchors, flag switches and loops, beside a loop or in a repeat."""
+    """`--bounded`: a lazy repeat, most with a minimum under two, over anchors, flag switches and loops, beside a loop or in a repeat."""
     pool = ATOMS + NESTED + ANCHORS + ["(?i)", r"(\b)", r"(\z)", "(.*?)"]
 
     def way():
@@ -207,20 +209,26 @@ def main():
     shape.add_argument("--nest", action="store_true", help="also nest loops inside repeats")
     shape.add_argument("--ways", action="store_true", help="loops beside other items in the ways of an outer repeat")
     shape.add_argument("--assert", dest="anchors", action="store_true", help="ways that hold a zero-width anchor")
-    shape.add_argument("--bounded", action="store_true", help="a lazy {0,n}? or {1,n}? over anchors, switches and loops")
+    shape.add_argument("--bounded", action="store_true", help="a lazy repeat, most with a minimum under two, over anchors, switches and loops")
     shape.add_argument("--fancy", action="store_true", help="a lookaround or atomic group beside the loop")
     ap.add_argument("--newlines", action="store_true", help="with --assert: subjects that hold a newline")
+    ap.add_argument("--multiline", action="store_true",
+                    help="with --assert --newlines: `(?m)` before every pattern, under which `^` and `$` hold at every line (#6425)")
     ap.add_argument("--blanks", action="store_true",
                     help="blanks between the tokens of half the patterns, for `--flags gx` (#6442)")
     ap.add_argument("--flags", default="g", help="the match flags (`gi`: case folding)")
     ap.add_argument("--jq", default="/usr/bin/jq")
     args = ap.parse_args()
     rng = random.Random(args.seed)
+    if args.multiline and not (args.anchors and args.newlines):
+        ap.error("--multiline applies to --assert --newlines")
     if args.anchors:
-        plist, prog = assert_patterns(args.count, rng), program(ASSERT_SUBJECTS)
+        plist, prog = assert_patterns(args.count, rng, args.multiline), program(ASSERT_SUBJECTS)
         if args.newlines:
             plist = [p.replace("a|b", "a|\\n") if i % 2 else p for i, p in enumerate(plist)]
             prog = program(NEWLINE_SUBJECTS)
+            if args.multiline:
+                plist = sorted({"(?m)" + p for p in plist})
     elif args.bounded:
         plist, prog = bounded_patterns(args.count, rng), PROGRAM
     elif args.fancy:

@@ -26,8 +26,11 @@
 //! The plain [`rewrite`] keeps a loop as written when it would copy or drop a group, and counts the
 //! groups it writes ([`Rewriter::has_groups`]). A body with one way that matches nothing only where
 //! an anchor holds (`\b`, `\bb?`) has a conditional exit, on both sides of the ways after it, which is
-//! written from what the anchor is ([`Rewriter::anchored_repeat`], #6358). A body whose ways are not
-//! listed here keeps its loop as written too: one with two such ways, an empty way after one, an
+//! written from what the anchor is ([`Rewriter::anchored_repeat`], #6358); under a `(?m)` that holds
+//! throughout, `^` and `$` are line anchors, written for ways that leave the lines alone (#6425). A
+//! second such way, or an empty way, is another exit: with no way after it, or the same anchor
+//! again, it is written too ([`Rewriter::second_exit`], #6424). A body whose ways are not
+//! listed here keeps its loop as written too: one with a way after that second exit, an
 //! assertion that is not an anchor, or a flag switch that names `x` or `U`. An assertion beside an item that consumes text
 //! does not matter: a way that must consume text always does, and the assertion only decides whether
 //! it matches, so `\Ba` and `a\z` are consuming ways and are copied with the rest (#6300). Any other
@@ -41,7 +44,11 @@
 //! `\K`, `\G`, a comment) is parsed through `oniguruma_shadow`'s copy of it, which writes that syntax
 //! plainly at the same offsets, and every piece's text is still taken from the pattern (#6128).
 //! Those constructs are opaque: a body holding one keeps its loop, and a lookaround or atomic
-//! group has its own body rewritten. A lazy repeat that must run twice or more is written copy by
+//! group has its own body rewritten.
+//! The groups of a loop beside such syntax are copied too (#6426), when the syntax stands outside
+//! every repeat and holds no repeat and no group ([`copyable_beside_loops`]); the evaluator runs the
+//! text on `fancy-regex`.
+//! A lazy repeat that must run twice or more is written copy by
 //! copy up to its minimum by `Rewriter::lazy_counted`, which also writes a lazy `{0,n}?` or `{1,n}?`
 //! with a group; for an unbounded one over a body with a consuming way before
 //! its empty one that form still differs from Oniguruma's on a few patterns (#6128).
@@ -108,6 +115,18 @@ enum Ways {
 struct Anchor {
     text: Text,
     kind: AnchorKind,
+    /// A second exit that came last in the body was dropped from its ways (#6424): the loop writes
+    /// it back as `E`, the body's empty way, last among each head's ways, where the first exit's `E`
+    /// is guarded by the anchor ([`Rewriter::second_exit`]).
+    last: bool,
+}
+
+/// What a second exit after an anchor's comes to ([`Rewriter::second_exit`], #6424).
+enum SecondExit {
+    /// An anchor that holds only where the first does: it is nothing.
+    Same,
+    /// A last exit, past every way but the first's: the loop writes it back as its last way.
+    Last,
 }
 
 #[derive(Clone)]
@@ -118,6 +137,215 @@ enum AnchorKind {
     Start,
     /// `\z` or `$`: it holds where the text ends, so no way that consumes text can run there.
     End,
+    /// `^` where `(?m)` holds throughout (#6425): it holds at the start of every line. A loop whose
+    /// ways cannot end a line has it hold only at its first head, as [`AnchorKind::Start`] does.
+    LineStart,
+    /// `$` where `(?m)` holds throughout (#6425): it holds before every newline and at the end.
+    /// A way that starts with a newline runs only where it holds, and one that starts with
+    /// anything else only where it does not, which splits the ways ([`LinePlan::Split`]).
+    LineEnd,
+}
+
+/// How [`Rewriter::anchored_loop`] writes a loop over a line anchor (#6425).
+enum LinePlan {
+    /// An anchor that needs no plan.
+    Plain,
+    /// The ways after a `$` under `(?m)`, split by whether they start with a newline.
+    Split {
+        /// The ways that start with anything but a newline: they run only where `$` does not hold.
+        plain: Option<Text>,
+        /// The ways that start with a newline: they run only where `$` holds.
+        newline: Option<Text>,
+    },
+}
+
+/// Whether the first (or last) character a piece of pattern consumes is a newline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Edge {
+    /// It consumes nothing.
+    Nothing,
+    /// Never a newline.
+    Plain,
+    /// Always a newline.
+    Newline,
+    /// Either, or not known.
+    Either,
+}
+
+impl Edge {
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Nothing, edge) | (edge, Self::Nothing) => edge,
+            (a, b) if a == b => a,
+            _ => Self::Either,
+        }
+    }
+}
+
+/// What the first character `ast` consumes is (the last when `last`), and whether it can match
+/// nothing. Anything it does not know is [`Edge::Either`], so a pattern it cannot read keeps its loop.
+fn edge(ast: &Ast, last: bool) -> (Edge, bool) {
+    match ast {
+        Ast::Empty(_) | Ast::Flags(_) | Ast::Assertion(_) => (Edge::Nothing, true),
+        Ast::Literal(lit) => (
+            if lit.c == '\n' {
+                Edge::Newline
+            } else {
+                Edge::Plain
+            },
+            false,
+        ),
+        Ast::Dot(_) => (Edge::Either, false),
+        Ast::ClassUnicode(class) => (unicode_edge(class), false),
+        // `\d`, `\w` and `\S` hold no newline; `\s`, `\D` and `\W` do.
+        Ast::ClassPerl(class) => (perl_edge(class), false),
+        Ast::ClassBracketed(class) => (class_edge(class), false),
+        Ast::Group(group) => edge(&group.ast, last),
+        Ast::Repetition(rep) => {
+            let (min, max) = bounds(&rep.op.kind);
+            if max == Some(0) {
+                return (Edge::Nothing, true);
+            }
+            let (inner, empty) = edge(&rep.ast, last);
+            (inner, empty || min == 0)
+        }
+        Ast::Alternation(alt) => alt
+            .asts
+            .iter()
+            .map(|way| edge(way, last))
+            .fold((Edge::Nothing, false), |(all, any), (one, empty)| {
+                (all.join(one), any || empty)
+            }),
+        Ast::Concat(concat) => {
+            let mut items: Vec<&Ast> = concat.asts.iter().collect();
+            if last {
+                items.reverse();
+            }
+            let mut found = Edge::Nothing;
+            for item in items {
+                let (one, empty) = edge(item, last);
+                found = found.join(one);
+                if !empty {
+                    return (found, false);
+                }
+            }
+            (found, true)
+        }
+    }
+}
+
+/// A Unicode property that holds no newline: a letter, mark, number, punctuation, symbol or
+/// separator category, or `Alphabetic`, `Lowercase` or `Uppercase`. The translation of jq's `\w`
+/// is made of these (`\p{Alphabetic}\p{M}\p{Nd}\p{Pc}`). A newline is a control, so `\p{Cc}`,
+/// `\p{White_Space}`, a script and a negated property may hold one.
+fn unicode_edge(class: &ast::ClassUnicode) -> Edge {
+    const NO_NEWLINE: [&str; 40] = [
+        "L",
+        "Lu",
+        "Ll",
+        "Lt",
+        "Lm",
+        "Lo",
+        "M",
+        "Mn",
+        "Mc",
+        "Me",
+        "N",
+        "Nd",
+        "Nl",
+        "No",
+        "P",
+        "Pc",
+        "Pd",
+        "Ps",
+        "Pe",
+        "Pi",
+        "Pf",
+        "Po",
+        "S",
+        "Sm",
+        "Sc",
+        "Sk",
+        "So",
+        "Z",
+        "Zs",
+        "Zl",
+        "Zp",
+        "Alphabetic",
+        "Lowercase",
+        "Uppercase",
+        "Letter",
+        "Mark",
+        "Number",
+        "Punctuation",
+        "Symbol",
+        "Separator",
+    ];
+    if class.negated {
+        return Edge::Either;
+    }
+    let holds_none = match &class.kind {
+        ast::ClassUnicodeKind::OneLetter(letter) => "LMNPSZ".contains(*letter),
+        ast::ClassUnicodeKind::Named(name) => NO_NEWLINE.contains(&name.as_str()),
+        ast::ClassUnicodeKind::NamedValue { .. } => false,
+    };
+    if holds_none {
+        Edge::Plain
+    } else {
+        Edge::Either
+    }
+}
+
+fn perl_edge(class: &ast::ClassPerl) -> Edge {
+    use ast::ClassPerlKind::{Digit, Space, Word};
+    match (&class.kind, class.negated) {
+        (Digit | Word, false) | (Space, true) => Edge::Plain,
+        _ => Edge::Either,
+    }
+}
+
+/// Whether a bracketed class of literals, ranges, `\d`/`\w` and the properties of
+/// [`unicode_edge`] holds a newline, and whether the newline is all it holds. A class with anything
+/// else in it, or a negated one that excludes no newline, is [`Edge::Either`].
+fn class_edge(class: &ast::ClassBracketed) -> Edge {
+    fn members(item: &ast::ClassSetItem, newline: &mut bool, other: &mut bool) -> Option<()> {
+        match item {
+            ast::ClassSetItem::Literal(lit) if lit.c == '\n' => *newline = true,
+            ast::ClassSetItem::Literal(_) => *other = true,
+            ast::ClassSetItem::Range(range) => {
+                if range.start.c <= '\n' && '\n' <= range.end.c {
+                    *newline = true;
+                    *other |= range.start.c < range.end.c;
+                } else {
+                    *other = true;
+                }
+            }
+            ast::ClassSetItem::Perl(perl) if perl_edge(perl) == Edge::Plain => *other = true,
+            ast::ClassSetItem::Unicode(unicode) if unicode_edge(unicode) == Edge::Plain => {
+                *other = true;
+            }
+            ast::ClassSetItem::Union(union) => {
+                for item in &union.items {
+                    members(item, newline, other)?;
+                }
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+    let ast::ClassSet::Item(item) = &class.kind else {
+        return Edge::Either;
+    };
+    let (mut newline, mut other) = (false, false);
+    if members(item, &mut newline, &mut other).is_none() {
+        return Edge::Either;
+    }
+    match (class.negated, newline, other) {
+        (false, true, false) => Edge::Newline,
+        (false, true, true) => Edge::Either,
+        (false, false, _) | (true, true, _) => Edge::Plain,
+        (true, false, _) => Edge::Either,
+    }
 }
 
 #[derive(Clone)]
@@ -145,6 +373,10 @@ struct Rewriter<'p> {
     /// Whether a flag of the pattern may switch multi-line mode on, under which `^` and `$` are not
     /// the anchors [`AnchorKind`] says they are (#6358).
     multi_line: bool,
+    /// Whether multi-line mode is on for the whole pattern (#6425): a leading `(?m)` that nothing
+    /// switches off or on again. `^` and `$` are then [`AnchorKind::LineStart`] and
+    /// [`AnchorKind::LineEnd`], which a loop writes for ways that leave the lines alone.
+    lines: bool,
     /// Whether the parse is of a copy of the pattern that writes Oniguruma syntax plainly
     /// ([`oniguruma_shadow`](super::eval::oniguruma_shadow)): what a node there is no longer says
     /// how many operations Oniguruma makes of it.
@@ -164,14 +396,20 @@ struct Rewriter<'p> {
     /// when `copies` and the body has a capture group (#6332): see [`Rewriter::empty_text`].
     exit: Option<Text>,
     /// How many enclosing repeats of the part being converted are lazy and may keep their text as
-    /// written (#6358): a lazy `X*?` or `X+?` is not rewritten, a `{0,n}?` or `{1,n}?` not always
-    /// (#6428), and a loop with groups inside one,
+    /// written (#6358): a lazy `X*?`, `X+?`, `X{0,n}?` or `X{1,n}?` is not always rewritten (#6427),
+    /// and a loop with groups inside one,
     /// written with its exit, is not read the way Oniguruma's is, so that loop keeps its own text.
     lazy_around: u32,
-    /// Whether a lazy `{0,n}?` or `{1,n}?` with a group may be written out (#6428), and whether one
-    /// was: [`rewrite_parsed`] reads a pattern that gave up after writing one again without.
+    /// Whether a lazy `*?`, `+?`, `{0,n}?` or `{1,n}?` with a group may be written out (#6428, #6427),
+    /// and whether this reading depended on that: [`rewrite_parsed`] reads a pattern that gave up
+    /// after such a repeat again without.
     lazy_bounded: bool,
     lazy_bounded_written: bool,
+    /// Whether the repeat being read is directly inside one it reduces with (#6427).
+    inside_reduced: bool,
+    /// Whether a loop inside a lazy repeat that may keep its text is written anyway (#6427): the
+    /// repeat is expected to be written too, and [`rewrite_parsed`] reads again if it is not.
+    lazy_trusted: bool,
 }
 
 /// Whether a flag switch (`(?i)`, not a flag group) stands anywhere in `ast`.
@@ -237,17 +475,26 @@ fn empty_piece() -> Piece {
     }
 }
 
+/// [`rewrite_for`] for a search that is not told to find no empty match.
+#[cfg(test)]
+pub(crate) fn rewrite(pattern: &str) -> Option<String> {
+    rewrite_for(pattern, false)
+}
+
 /// `pattern` with every greedy, unbounded loop whose body can match nothing before trying a way
 /// that consumes text written so that the `regex` crate leaves the loop where Oniguruma does, or
 /// `None` when no loop needs it (or the pattern does not parse, or the rewrite grows too large).
-pub(crate) fn rewrite(pattern: &str) -> Option<String> {
+/// With `not_empty` (jq's `n` flag, which refuses an empty match and so the empty exit the forms
+/// write) a loop over `^` or `$` under `(?m)` keeps its text (#6425), as the loops over the anchors
+/// of the whole text answer differently from Oniguruma there too.
+pub(crate) fn rewrite_for(pattern: &str, not_empty: bool) -> Option<String> {
     if !may_need_rewrite(pattern) {
         return None;
     }
-    rewrite_parsed(pattern, false, "", true)
+    rewrite_parsed(pattern, false, "", 0, not_empty)
 }
 
-/// A pattern [`rewrite_with_groups`] wrote, with how its groups read back into the input's.
+/// A pattern [`rewrite_with_groups_for`] wrote, with how its groups read back into the input's.
 pub(crate) struct GroupRewrite {
     /// The pattern to compile; every group in it is unnamed.
     pub(crate) pattern: String,
@@ -302,6 +549,25 @@ pub(crate) fn parse_distinct_names(pattern: &str) -> Option<DistinctNames> {
     None
 }
 
+/// [`parse_distinct_names`] for a rewrite that copies groups, and where the constructs of the
+/// pattern that the parsed copy reads as something else start (#6426). A pattern with a lookaround
+/// or an atomic group is read through the copy that writes them plainly, when none of them is in
+/// the way of the copies the rewrite writes ([`copyable_beside_loops`]).
+pub(crate) fn parse_for_group_copies(pattern: &str) -> Option<(DistinctNames, Vec<usize>)> {
+    if let Some(read) = parse_distinct_names(pattern) {
+        return Some((read, Vec::new()));
+    }
+    let shadow = super::eval::oniguruma_shadow(pattern)?;
+    // A rename would move the offsets of everything after it, so a repeated name keeps the pattern.
+    let mut read = parse_distinct_names(&shadow.text)?;
+    (read.renames.is_empty() && copyable_beside_loops(&read.ast, &shadow.opaque, pattern)).then(
+        || {
+            read.text = pattern.to_string();
+            (read, shadow.opaque)
+        },
+    )
+}
+
 /// What [`parse_distinct_names`] read.
 pub(crate) struct DistinctNames {
     /// The pattern, with each repeated use of a group name renamed.
@@ -323,21 +589,34 @@ pub(crate) fn original_name(name: Box<str>, renames: &[(String, String)]) -> Box
     }
 }
 
-/// [`rewrite`] for a pattern whose loops have a capture group where the plain rewrite would copy or
+/// [`rewrite_with_groups_for`] for a search that is not told to find no empty match.
+#[cfg(test)]
+pub(crate) fn rewrite_with_groups(input: &str) -> Option<GroupRewrite> {
+    rewrite_with_groups_for(input, false)
+}
+
+/// [`rewrite_for`] for a pattern whose loops have a capture group where the plain rewrite would copy or
 /// drop it (#6332): the groups are tagged by number, the loops are written as they are without
 /// one, and each group the rewrite copied is read back through [`GroupRewrite::copies`]. `None`
-/// when the pattern has no group, needs no rewrite, or is not one the `regex` crate's parser reads.
-pub(crate) fn rewrite_with_groups(input: &str) -> Option<GroupRewrite> {
-    written_with_groups(input, true)
+/// when the pattern has no group, needs no rewrite, or is not one the `regex` crate's parser reads,
+/// apart from a lookaround, atomic group or comment that stands in the way of no copy
+/// ([`copyable_beside_loops`], #6426).
+pub(crate) fn rewrite_with_groups_for(input: &str, not_empty: bool) -> Option<GroupRewrite> {
+    written_with_groups(input, 0, not_empty)
 }
 
-/// [`rewrite_with_groups`] that leaves every lazy `{0,n}?` and `{1,n}?` as written (#6428), for a
-/// rewrite the crate refused as too large: a `{1,n}?` is written twice, where the pattern is once.
-pub(crate) fn rewrite_with_groups_past_the_size_limit(input: &str) -> Option<GroupRewrite> {
-    written_with_groups(input, false)
+/// [`rewrite_with_groups_for`] at the later reading `reading` (1 or 2), for a rewrite the crate refused
+/// as too large: reading 1 leaves the loops inside a lazy repeat as written, and reading 2 the lazy
+/// repeats too (#6428, #6427). A `{1,n}?` is written twice, where the pattern has it once.
+pub(crate) fn rewrite_with_groups_past_the_size_limit(
+    input: &str,
+    reading: usize,
+    not_empty: bool,
+) -> Option<GroupRewrite> {
+    written_with_groups(input, reading, not_empty)
 }
 
-fn written_with_groups(input: &str, lazy_bounded: bool) -> Option<GroupRewrite> {
+fn written_with_groups(input: &str, reading: usize, not_empty: bool) -> Option<GroupRewrite> {
     // The flags `i` and `s` of jq put a switch in front of the pattern. It reaches all of it, so it
     // stays in front and the rest is rewritten, with case folding read from it.
     let lead_len = leading_switches(input)?;
@@ -349,7 +628,7 @@ fn written_with_groups(input: &str, lazy_bounded: bool) -> Option<GroupRewrite> 
         text: distinct,
         ast,
         renames,
-    } = parse_distinct_names(pattern)?;
+    } = parse_for_group_copies(pattern)?.0;
     let pattern = distinct.as_str();
     let mut openers = Vec::new();
     capture_openers(&ast, &mut openers);
@@ -364,7 +643,7 @@ fn written_with_groups(input: &str, lazy_bounded: bool) -> Option<GroupRewrite> 
         at = *end;
     }
     tagged.push_str(&pattern[at..]);
-    let written = rewrite_parsed(&tagged, true, lead, lazy_bounded)?;
+    let written = rewrite_parsed(&tagged, true, lead, reading, not_empty)?;
     // Read the tags back: each group of the result is a copy of the group its tag names. The copies
     // share a name, which the parser refuses, so the tags are found by their text.
     let opening = format!("(?<{TAG}");
@@ -388,7 +667,7 @@ fn written_with_groups(input: &str, lazy_bounded: bool) -> Option<GroupRewrite> 
     // A group the rewrite left out would be read as unset, which is not what Oniguruma leaves, and
     // the count of the groups the result has must be the count of tags found.
     let mut found = Vec::new();
-    capture_openers(&ast::parse::Parser::new().parse(&pattern).ok()?, &mut found);
+    capture_openers(&parse_either(&pattern)?, &mut found);
     (!copies.iter().any(Vec::is_empty) && found.len() + 1 == compiled).then_some(())?;
     let mut names = Vec::new();
     capture_names(&ast, &mut names);
@@ -403,6 +682,58 @@ fn written_with_groups(input: &str, lazy_bounded: bool) -> Option<GroupRewrite> 
         compiled_groups: compiled,
         names,
     })
+}
+
+/// `pattern` parsed as written, or through the copy that writes its Oniguruma-only syntax plainly.
+fn parse_either(pattern: &str) -> Option<Ast> {
+    match ast::parse::Parser::new().parse(pattern) {
+        Ok(tree) => Some(tree),
+        Err(_) => {
+            let shadow = super::eval::oniguruma_shadow(pattern)?;
+            ast::parse::Parser::new().parse(&shadow.text).ok()
+        }
+    }
+}
+
+/// Whether the Oniguruma-only syntax of a pattern leaves the group-copy rewrite its loops (#6426):
+/// the rewrite copies the body of a loop and writes the groups of it again, which is only sound
+/// for a construct it never copies. `ast` is the parse of the pattern's shadow and `opaque` where
+/// the constructs the shadow reads as something else start. Each must stand outside every repeat, a
+/// lookaround, atomic group or comment must hold no repeat and no group, and a backreference is
+/// refused (the copies renumber the groups it names), as are `\K`, `\G`, `\Z` and `\R`, which
+/// the shadow reads as other escapes.
+fn copyable_beside_loops(ast: &Ast, opaque: &[usize], pattern: &str) -> bool {
+    fn holds_repeat_or_group(ast: &Ast) -> bool {
+        match ast {
+            Ast::Repetition(_) | Ast::Group(_) => true,
+            Ast::Alternation(alt) => alt.asts.iter().any(holds_repeat_or_group),
+            Ast::Concat(concat) => concat.asts.iter().any(holds_repeat_or_group),
+            _ => false,
+        }
+    }
+    fn walk(ast: &Ast, opaque: &[usize], in_repeat: bool) -> bool {
+        let here = opaque.binary_search(&ast.span().start.offset).is_ok();
+        match ast {
+            Ast::Literal(_) if here => false,
+            Ast::Group(group) if here => !in_repeat && !holds_repeat_or_group(&group.ast),
+            Ast::Group(group) => walk(&group.ast, opaque, in_repeat),
+            Ast::Repetition(rep) => walk(&rep.ast, opaque, true),
+            Ast::Alternation(alt) => alt.asts.iter().all(|a| walk(a, opaque, in_repeat)),
+            Ast::Concat(concat) => concat.asts.iter().all(|a| walk(a, opaque, in_repeat)),
+            _ => true,
+        }
+    }
+    !["\\K", "\\G", "\\Z", "\\R"]
+        .iter()
+        .any(|escape| pattern.contains(escape))
+        && walk(ast, opaque, false)
+}
+
+/// Whether the group-copy rewrite refuses `pattern` for the flag switches it starts with (#6426): one
+/// names `U`, or turns `x` on over a pattern with a `#`. The loops of such a pattern are not
+/// written at all, so the capture rewrite of #6069 is not enough for one that needs the copies.
+pub(crate) fn leading_switches_refuse(pattern: &str) -> bool {
+    leading_switches(pattern).is_none()
 }
 
 /// The length of the flag switches (`(?i)`, `(?s)`, `(?is)`) the pattern starts with, or `None`
@@ -480,7 +811,17 @@ fn capture_openers(ast: &Ast, out: &mut Vec<(usize, usize)>) {
     }
 }
 
-fn rewrite_parsed(pattern: &str, copies: bool, lead: &str, lazy_bounded: bool) -> Option<String> {
+/// What each reading of a pattern writes of a lazy repeat with a group, and of a loop inside one:
+/// `(lazy_bounded, lazy_trusted)` (#6428, #6427).
+const READINGS: [(bool, bool); 3] = [(true, true), (true, false), (false, false)];
+
+fn rewrite_parsed(
+    pattern: &str,
+    copies: bool,
+    lead: &str,
+    reading: usize,
+    not_empty: bool,
+) -> Option<String> {
     // #6128: a pattern with Oniguruma syntax only `fancy-regex` reads (lookaround, a backreference,
     // `\K`) is parsed through a copy that writes that syntax plainly at the same offsets. A pattern
     // the parser reads as written is read as written.
@@ -493,7 +834,7 @@ fn rewrite_parsed(pattern: &str, copies: bool, lead: &str, lazy_bounded: bool) -
             (shadow.text.as_str(), ast, shadow.opaque.as_slice())
         }
     };
-    let new_rewriter = |lazy_bounded: bool| Rewriter {
+    let new_rewriter = |lazy_bounded: bool, lazy_trusted: bool| Rewriter {
         source: pattern,
         opaque,
         limit: pattern
@@ -504,6 +845,7 @@ fn rewrite_parsed(pattern: &str, copies: bool, lead: &str, lazy_bounded: bool) -
         folds: may_fold_case(pattern) || may_fold_case(lead),
         multi_line: super::eval::pattern_may_enable_multiline(pattern)
             || super::eval::pattern_may_enable_multiline(lead),
+        lines: !not_empty && multi_line_throughout(lead, pattern),
         shadowed: parsed != pattern,
         work: core::cell::Cell::new(0),
         work_limit: pattern
@@ -518,12 +860,20 @@ fn rewrite_parsed(pattern: &str, copies: bool, lead: &str, lazy_bounded: bool) -
         lazy_around: 0,
         lazy_bounded,
         lazy_bounded_written: false,
+        lazy_trusted,
+        inside_reduced: false,
     };
-    let mut rewriter = new_rewriter(lazy_bounded);
+    // #6428, #6427: what a lazy repeat with a group adds never costs the rest of the pattern its
+    // rewrite. The first reading writes such a repeat and the loops inside it, the second only the
+    // repeat, and the third neither.
+    let (bounded, trusted) = READINGS[reading];
+    let mut rewriter = new_rewriter(bounded, copies && trusted);
     let mut piece = rewriter.convert(&ast, false);
-    // #6428: what a lazy `{0,n}?` or `{1,n}?` adds never costs the rest of the pattern its rewrite.
-    if piece.is_err() && rewriter.lazy_bounded_written {
-        rewriter = new_rewriter(false);
+    for &(bounded, trusted) in &READINGS[reading + 1..] {
+        if piece.is_ok() || !rewriter.lazy_bounded_written {
+            break;
+        }
+        rewriter = new_rewriter(bounded, copies && trusted);
         piece = rewriter.convert(&ast, false);
     }
     let piece = piece.ok()?;
@@ -550,6 +900,87 @@ fn may_fold_case(pattern: &str) -> bool {
     })
 }
 
+/// Whether a flag group of `pattern` names the flag `flag`, on or off: any `(?` followed by flag
+/// letters (up to a `)` or `:`) that include it. Over-reports (an escaped `\(?m` or a class counts),
+/// which only keeps a rewrite. A named group (`(?<m>`), a lookaround and a comment are no flag group.
+fn mentions_flag(pattern: &str, flag: char) -> bool {
+    pattern.match_indices("(?").any(|(at, _)| {
+        pattern[at + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
+            .any(|c| c == flag)
+            && !pattern[at + 2..].starts_with('P')
+    })
+}
+
+/// Whether `(?m)` holds for the whole of `lead` followed by `pattern` (#6425): the switches they
+/// start with turn it on, and no flag group after them names `m` again. Under the `x` flag the
+/// blanks and comments a way is made of are not its text, so a pattern that names `x` anywhere is not one.
+fn multi_line_throughout(lead: &str, pattern: &str) -> bool {
+    let whole = format!("{lead}{pattern}");
+    let mut at = 0;
+    let mut on = false;
+    while whole[at..].starts_with("(?") {
+        let Some(close) = whole[at..].find(')') else {
+            break;
+        };
+        let flags = &whole[at + 2..at + close];
+        if flags.is_empty() || !flags.chars().all(|c| c.is_ascii_alphabetic() || c == '-') {
+            break;
+        }
+        let mut negated = false;
+        for flag in flags.chars() {
+            match flag {
+                '-' => negated = true,
+                'm' => on = !negated,
+                // Any other flag may change what a line is (`R`, CRLF) or what a letter means.
+                'i' | 's' => {}
+                _ => return false,
+            }
+        }
+        at += close + 1;
+    }
+    on && !mentions_flag(&whole[at..], 'm') && !mentions_flag(&whole, 'x')
+}
+
+/// One way of a list of alternatives, with its text and what its first and last character are.
+struct Way {
+    text: String,
+    first: (Edge, bool),
+    last: (Edge, bool),
+}
+
+/// The ways of `text`, each alternative of its top level (the whole of it when it is not an
+/// alternation) with its text, or `None` when `text` is not a pattern `regex-syntax` reads. The
+/// copies of a tagged group share a name, which the parser refuses, so it reads the text with the
+/// repeats renamed ([`parse_distinct_names`]) and the ways are written back with their own.
+fn ways_of(text: &str) -> Option<Vec<Way>> {
+    let DistinctNames {
+        text: read,
+        ast,
+        renames,
+    } = parse_distinct_names(text)?;
+    let branches: Vec<&Ast> = match &ast {
+        Ast::Alternation(alt) => alt.asts.iter().collect(),
+        other => vec![other],
+    };
+    branches
+        .into_iter()
+        .map(|branch| {
+            let span = branch.span();
+            let mut way = read.get(span.start.offset..span.end.offset)?.to_string();
+            for (renamed, original) in &renames {
+                way = way.replace(renamed.as_str(), original);
+            }
+            Some(Way {
+                text: way,
+                first: edge(branch, false),
+                last: edge(branch, true),
+            })
+        })
+        .collect()
+}
+
 /// Whether `ast` can match the empty string, over-reporting (an assertion or flag counts).
 fn may_be_empty(ast: &Ast) -> bool {
     match ast {
@@ -564,6 +995,23 @@ fn may_be_empty(ast: &Ast) -> bool {
         Ast::Concat(concat) => concat.asts.iter().all(may_be_empty),
         Ast::Repetition(rep) => bounds(&rep.op.kind).0 == 0 || may_be_empty(&rep.ast),
     }
+}
+
+/// Whether Oniguruma reduces `rep` with the repeat directly inside it: both are a lazy `??`, `*?` or
+/// `+?`, with at most a plain group between (`(?:a+?)*?`). A greedy pair and a greedy repeat of a
+/// lazy `+?` are what the sweeps' `--ways` draw checks instead.
+fn reduces_with_inner(rep: &ast::Repetition) -> bool {
+    let simple = |op: &RepetitionKind| matches!(bounds(op), (0 | 1, None) | (0, Some(1)));
+    let mut inner = &*rep.ast;
+    while let Ast::Group(group) = inner {
+        match &group.kind {
+            GroupKind::NonCapturing(flags) if flags.items.is_empty() => inner = &group.ast,
+            _ => return false,
+        }
+    }
+    !rep.greedy
+        && simple(&rep.op.kind)
+        && matches!(inner, Ast::Repetition(inner) if !inner.greedy && simple(&inner.op.kind))
 }
 
 /// Whether a capture group in `ast` holds an assertion or a flag switch.
@@ -843,10 +1291,30 @@ impl Rewriter<'_> {
             Ast::Repetition(rep) => {
                 let (min, max) = bounds(&rep.op.kind);
                 let kept = !rep.greedy && min < 2 && !matches!(max, Some(0 | 1));
+                // #6427: Oniguruma reduces a repeat directly of a repeat to one before it compiles
+                // either, so neither has the copies or the exit written below.
+                let reduced = core::mem::take(&mut self.inside_reduced) || reduces_with_inner(rep);
+                self.inside_reduced = reduces_with_inner(rep);
+                if kept && self.lazy_trusted {
+                    self.lazy_bounded_written |= has_capture(&rep.ast);
+                    let changed = core::mem::take(&mut self.changed);
+                    let body = self.convert(&rep.ast, true)?;
+                    let inner = core::mem::replace(&mut self.changed, changed);
+                    let consuming = matches!(body.ways, Ways::Consuming);
+                    let written = self.repeat_text(&body.text, min, max, rep.greedy)?;
+                    let piece = self.counted_repeat(rep, body, min, max, reduced)?;
+                    self.changed |= inner;
+                    // A loop inside a repeat that kept its text may not take its exit, and only now
+                    // does it show that the repeat did. A body that cannot match nothing is safe.
+                    if inner && !consuming && piece.text.text == written.text {
+                        return Err(GiveUp);
+                    }
+                    return Ok(piece);
+                }
                 self.lazy_around += u32::from(kept);
                 let body = self.convert(&rep.ast, true);
                 self.lazy_around -= u32::from(kept);
-                self.counted_repeat(rep, body?, min, max)
+                self.counted_repeat(rep, body?, min, max, reduced)
             }
             Ast::Alternation(alt) => {
                 // #6301: a flag switch (`(?i)`) reaches the rest of its group, later ways included,
@@ -891,9 +1359,12 @@ impl Rewriter<'_> {
             },
             r"\A" => AnchorKind::Start,
             r"\z" => AnchorKind::End,
-            // Under `(?m)` they hold at every line, so neither says what these two kinds say.
+            // Under `(?m)` they hold at every line, so neither says what these two kinds say; with
+            // `(?m)` on throughout, they are the line anchors (#6425).
             "^" if !self.multi_line => AnchorKind::Start,
             "$" if !self.multi_line => AnchorKind::End,
+            "^" if self.lines => AnchorKind::LineStart,
+            "$" if self.lines => AnchorKind::LineEnd,
             _ => {
                 return Ok(Piece {
                     text,
@@ -907,6 +1378,7 @@ impl Rewriter<'_> {
                 anchor: Box::new(Anchor {
                     text: text.clone(),
                     kind,
+                    last: false,
                 }),
                 after: None,
             },
@@ -921,11 +1393,18 @@ impl Rewriter<'_> {
         mut body: Piece,
         min: u32,
         max: Option<u32>,
+        reduced: bool,
     ) -> Result<Piece, GiveUp> {
-        // #6301: the scoped switch is verified for the greedy loop. A lazy repeat decides whether
-        // Oniguruma unrolls it from the body's operation count (`onig_ops`), which does not read a
-        // switch, so it keeps the switch as the unknown it was.
-        if !rep.greedy && has_switch(&rep.ast) {
+        // #6301: the scoped switch is verified for the greedy loop. A lazy unbounded repeat decides
+        // whether Oniguruma unrolls it from the body's operation count (`onig_ops`), which does not
+        // read a switch, so it keeps the switch as the unknown it was. A lazy bounded one is never
+        // unrolled (Oniguruma expands only a greedy bounded repeat), so the count is not asked,
+        // except for a body with a way that is only an anchor, which the forms of
+        // [`Self::anchored_repeat`] were not checked against a switch.
+        if !rep.greedy
+            && (max.is_none() || matches!(body.ways, Ways::Anchored { .. }))
+            && has_switch(&rep.ast)
+        {
             body.ways = Ways::Unknown;
         }
         if let Ways::Anchored {
@@ -943,9 +1422,31 @@ impl Rewriter<'_> {
         }
         // #6428: a consuming way is written without the group around an anchor, which a repeat that
         // keeps its text still sets.
-        let keeps_text = !rep.greedy && min < 2 && group_holds_assertion(&rep.ast);
+        let keeps_text = !rep.greedy && min < 2 && (reduced || group_holds_assertion(&rep.ast));
         if self.copies && grouped && !keeps_text {
             self.exit = Some(self.empty_text(&rep.ast)?);
+        }
+        // #6427: `X+?` over a short body is `X X*?`, the first copy with no empty check, and counted
+        // over a long one, as `X{2,}?` is.
+        if !rep.greedy && min == 1 && max.is_none() && self.lazy_bounded {
+            let exit = self.exit.clone().filter(|_| self.lazy_around == 0);
+            if let (
+                Some(exit),
+                Ways::Nullable {
+                    before,
+                    after: Some(after),
+                },
+            ) = (exit, &body.ways)
+            {
+                if self.oniguruma_copies_once(&rep.ast) {
+                    self.exit = None;
+                    let written = self.repeat_text(&body.text, 0, None, false)?;
+                    let (before, after) = (before.clone(), Some(after.clone()));
+                    let star =
+                        self.lazy_counted(before, after, 0, None, written, Some(exit.clone()))?;
+                    return self.concat_with(&[body, star], &[Some(exit)], true);
+                }
+            }
         }
         self.repeat(body, min, max, rep.greedy)
     }
@@ -1117,9 +1618,21 @@ impl Rewriter<'_> {
     /// the text starts or ends it holds at most where that end's anchor does, whatever the other
     /// is, and `\b\b` is `\b`. `None` for a pair that holds nowhere or says nothing simple.
     fn both_anchors(first: &Anchor, second: &Anchor) -> Option<AnchorKind> {
+        if first.last || second.last {
+            return None;
+        }
         match (&first.kind, &second.kind) {
             (AnchorKind::Start, _) | (_, AnchorKind::Start) => Some(AnchorKind::Start),
             (AnchorKind::End, _) | (_, AnchorKind::End) => Some(AnchorKind::End),
+            (AnchorKind::LineStart, AnchorKind::LineStart)
+            | (AnchorKind::LineEnd, AnchorKind::LineEnd)
+                if first.text.text == second.text.text =>
+            {
+                Some(match first.kind {
+                    AnchorKind::LineStart => AnchorKind::LineStart,
+                    _ => AnchorKind::LineEnd,
+                })
+            }
             (AnchorKind::Word { fails }, AnchorKind::Word { .. })
                 if first.text.text == second.text.text =>
             {
@@ -1147,10 +1660,25 @@ impl Rewriter<'_> {
                 after,
             } => Ways::Anchored {
                 before: way(before)?,
-                after: way(after)?,
+                // #6425: a `$` under `(?m)` splits the ways after it by how each starts, which a
+                // group around all of them would hide: each is wrapped alone.
+                after: match (&mark.kind, after) {
+                    (AnchorKind::LineEnd, Some(after)) => match self.read_ways(&after.text)? {
+                        Some(ways) => {
+                            let each: Vec<Text> = ways
+                                .into_iter()
+                                .map(|one| wrap(self.text(one.text, Prec::Concat)?))
+                                .collect::<Result<_, _>>()?;
+                            self.alt_text(&each)?
+                        }
+                        None => wrap(after).map(Some)?,
+                    },
+                    (_, after) => way(after)?,
+                },
                 anchor: match (anchor, mark) {
                     (false, mark) => mark,
                     (true, mark) => Box::new(Anchor {
+                        last: mark.last,
                         text: wrap(mark.text)?,
                         kind: match mark.kind {
                             AnchorKind::Word { fails } => AnchorKind::Word {
@@ -1290,6 +1818,7 @@ impl Rewriter<'_> {
                         anchor: Box::new(Anchor {
                             text: self.concat_text(&[&first.text, &second.text])?,
                             kind,
+                            last: false,
                         }),
                         after: None,
                     },
@@ -1305,7 +1834,7 @@ impl Rewriter<'_> {
                         before: a2,
                         after: b2,
                     },
-                ) if gone.is_none() => {
+                ) if gone.is_none() && !anchor.last => {
                     let then = |way: &Option<Text>| {
                         way.as_ref()
                             .map(|way| self.concat_text(&[&anchor.text, way]))
@@ -1327,7 +1856,7 @@ impl Rewriter<'_> {
                         anchor,
                         after: None,
                     },
-                ) => {
+                ) if !anchor.last => {
                     let then = |way: Option<Text>| {
                         way.map(|way| self.concat_text(&[&way, &anchor.text]))
                             .transpose()
@@ -1389,6 +1918,9 @@ impl Rewriter<'_> {
     fn alt(&self, items: &[Piece], listed: bool) -> Result<Piece, GiveUp> {
         let mut before = Vec::new();
         let mut after = Vec::new();
+        // #6424: the ways after a second exit, which `after` then holds only up to.
+        let mut late = Vec::new();
+        let mut second: Option<Option<Box<Anchor>>> = None;
         let mut nullable = false;
         let mut unknown = !listed;
         let mut opaque = false;
@@ -1400,11 +1932,32 @@ impl Rewriter<'_> {
             match &item.ways {
                 Ways::Unknown => unknown = true,
                 Ways::Opaque => opaque = true,
+                // A dropped last exit is last among the ways of the repeat's body, not of a part.
+                Ways::Anchored { anchor, .. } if anchor.last => opaque = true,
+                Ways::Consuming if second.is_some() => late.push(item.text.clone()),
                 Ways::Consuming if nullable || anchored.is_some() => after.push(item.text.clone()),
                 Ways::Consuming => before.push(item.text.clone()),
                 // #6358: one anchor is an exit on either side of the ways after it. A second, or an
                 // empty way after it, is another exit past those ways, which the forms of
-                // [`Self::anchored_loop`] do not write.
+                // [`Self::anchored_loop`] do not write, so it is read after the loop
+                // ([`Self::second_exit`], #6424).
+                Ways::Anchored {
+                    before: a,
+                    anchor,
+                    after: b,
+                } if anchored.is_some() && second.is_none() => {
+                    after.extend(a.clone());
+                    late.extend(b.clone());
+                    second = Some(Some(anchor.clone()));
+                }
+                Ways::Nullable {
+                    before: a,
+                    after: b,
+                } if anchored.is_some() && second.is_none() => {
+                    after.extend(a.clone());
+                    late.extend(b.clone());
+                    second = Some(None);
+                }
                 Ways::Anchored { .. } | Ways::Nullable { .. } if anchored.is_some() => {
                     opaque = true;
                 }
@@ -1441,6 +1994,13 @@ impl Rewriter<'_> {
                 }
             }
         }
+        if let (Some(exit), Some(first), false) = (second, &mut anchored, unknown || opaque) {
+            match Self::second_exit(first, exit.as_deref(), late.is_empty()) {
+                Some(SecondExit::Same) => after.append(&mut late),
+                Some(SecondExit::Last) => first.last = true,
+                None => opaque = true,
+            }
+        }
         let ways = if unknown {
             Ways::Unknown
         } else if opaque {
@@ -1467,6 +2027,38 @@ impl Rewriter<'_> {
         Ok(Piece { text, ways })
     }
 
+    /// What a second exit `second` (an anchor, or `None` for a way that matches nothing anywhere)
+    /// after the first, `first`, comes to in `A | c1 | B | c2 | C` (#6424). Oniguruma tries what the
+    /// continuation `K` does at a head once, at the first exit that holds there: a later exit is
+    /// the same `K` at the same head, which has already failed. So `c2` matters only where `c1`
+    /// does not hold, and only if some way `C` stands after it:
+    /// - with no `C`, it is the exit every loop ends with after its ways, except that it sets what
+    ///   the empty way sets (a group around the body): the loop writes it back last
+    ///   ([`Anchor::last`]);
+    /// - an anchor that holds only where `c1` does (the same one again) is never the first to
+    ///   hold, so it is nothing.
+    ///
+    /// `None` for any other pair, which needs an exit written on both sides of `B` and `C`: the
+    /// order of `K` among the ways then depends on which anchor holds at each head. (`\b` and
+    /// `\B` right after one another hold together everywhere, which is the empty way, but no draw
+    /// of `--assert` holds that pair and none improved when it was written.)
+    fn second_exit(first: &Anchor, second: Option<&Anchor>, no_after: bool) -> Option<SecondExit> {
+        // `^` under `(?m)` also holds after a newline, so it is not the start of the text (#6425).
+        let start = |anchor: &Anchor| {
+            matches!(anchor.kind, AnchorKind::Start)
+                && matches!(anchor.text.text.as_str(), r"\A" | "^")
+        };
+        match second {
+            Some(second)
+                if first.text.text == second.text.text || (start(first) && start(second)) =>
+            {
+                Some(SecondExit::Same)
+            }
+            _ if no_after => Some(SecondExit::Last),
+            _ => None,
+        }
+    }
+
     fn repeat(
         &mut self,
         body: Piece,
@@ -1476,6 +2068,25 @@ impl Rewriter<'_> {
     ) -> Result<Piece, GiveUp> {
         let exit = self.exit.take();
         let text = self.repeat_text(&body.text, min, max, greedy)?;
+        // #6428, #6427: a lazy repeat that may run twice or more with a group in its body. Oniguruma's
+        // empty iteration leaves it, and a group it set is unset again when what follows fails there,
+        // where the crate goes on to the next iteration with the group kept.
+        if !greedy
+            && self.lazy_bounded
+            && exit.is_some()
+            && !self.exit_keeps_text(&exit)
+            && min < 2
+            && !matches!(max, Some(0 | 1))
+        {
+            if let Ways::Nullable {
+                before,
+                after: Some(after),
+            } = &body.ways
+            {
+                let (before, after) = (before.clone(), Some(after.clone()));
+                return self.lazy_counted(before, after, min, max, text, exit);
+            }
+        }
         let ways = match (&body.ways, min, max, greedy) {
             (Ways::Unknown, ..) => Ways::Unknown,
             (Ways::Opaque | Ways::Anchored { .. }, ..) => Ways::Opaque,
@@ -1534,16 +2145,7 @@ impl Rewriter<'_> {
                     after: Some(after),
                 },
                 ..,
-            ) if !greedy
-                && (min >= 2
-                    || (self.lazy_bounded && exit.is_some() && max.is_some_and(|n| n >= 2))) =>
-            {
-                // #6428: Oniguruma counts a lazy bounded repeat, the empty way leaves the count, and
-                // a group it set is unset again when what follows fails there. Without such a group
-                // the text leaves where Oniguruma does, so a `{0,n}?` or `{1,n}?` is written only for
-                // the groups of its body. A pattern that outgrows the limit this way is read again
-                // without it ([`rewrite_parsed`]), so that the rest of it is still rewritten.
-                self.lazy_bounded_written |= min < 2;
+            ) if !greedy && min >= 2 => {
                 let (before, after) = (before.clone(), Some(after.clone()));
                 return self.lazy_counted(before, after, min, max, text, exit);
             }
@@ -1671,6 +2273,16 @@ impl Rewriter<'_> {
                 .is_some_and(|total| total <= ONIG_EXPAND_LIMIT)
     }
 
+    /// Whether Oniguruma writes the first iteration of the lazy `X+?` out as a copy of `X`, by the
+    /// count [`Self::oniguruma_unrolls`] reads for a `min` of two or more. Where case folding stops
+    /// `onig_ops` at a letter or a class, the length without folding stands in for it; a body whose
+    /// length cannot be told at all is taken for long.
+    fn oniguruma_copies_once(&self, body: &Ast) -> bool {
+        onig_ops(body, self.folds)
+            .or_else(|| onig_ops(body, false))
+            .is_some_and(|ops| ops > 0 && ops <= ONIG_EXPAND_LIMIT)
+    }
+
     /// `X{min,}?` as Oniguruma unrolls it, `X` `min` times and then `X*?`: the `regex` crate reads
     /// the repeat the same way, so the text stays as written. Only the body's ways are worked out,
     /// as the concatenation of those copies, for a loop around this one.
@@ -1792,6 +2404,17 @@ impl Rewriter<'_> {
             return Ok(kept);
         }
         let exit = self.empty_text(ast)?;
+        // #6424: a dropped last exit is `E` last among the ways of each head, and the first exit's
+        // `E` is the one where the anchor holds. `E` tries the anchor's way before it tries any
+        // other, so the anchor in front of it is the same exit, and only where it holds.
+        let (exit_all, exit) = if anchor.last {
+            (
+                Some(exit.clone()),
+                self.concat_text(&[&anchor.text, &exit])?,
+            )
+        } else {
+            (None, exit)
+        };
         let ops = onig_ops(ast, self.folds).filter(|_| !self.shadowed);
         let copied = |length: Option<usize>, count: u32| {
             length
@@ -1805,7 +2428,7 @@ impl Rewriter<'_> {
         };
         let text = match (greedy, max) {
             (false, _) => {
-                if min < 2 || (max.is_none() && self.oniguruma_unrolls(ast, min)) {
+                if min < 2 || (max.is_none() && self.oniguruma_unrolls(ast, min)) || anchor.last {
                     return Ok(kept);
                 }
                 let (before, after) = (before.clone(), after.clone());
@@ -1817,7 +2440,17 @@ impl Rewriter<'_> {
                 });
             }
             (true, None) => {
-                let mut rest = self.anchored_loop(before, anchor, after, &exit)?;
+                // #6425: a loop over a line anchor is written only for ways that leave the lines alone.
+                let Some(plan) = self.line_plan(anchor, before, after)? else {
+                    return Ok(kept);
+                };
+                let mut rest = self.anchored_loop(
+                    before,
+                    anchor,
+                    after,
+                    (&exit, exit_all.as_ref().unwrap_or(&exit)),
+                    &plan,
+                )?;
                 if min > 0 && copied(ops, min) {
                     let copies = self.repeat_text(body, min, Some(min), true)?;
                     rest = self.concat_text(&[&copies, &rest])?;
@@ -1829,6 +2462,7 @@ impl Rewriter<'_> {
                             .into_iter()
                             .chain([exit.clone()])
                             .chain(last)
+                            .chain(exit_all.clone())
                             .collect();
                         rest = self.alt_text(&list)?.ok_or(GiveUp)?;
                     }
@@ -1849,6 +2483,7 @@ impl Rewriter<'_> {
                         .into_iter()
                         .chain([exit.clone()])
                         .chain(last)
+                        .chain(exit_all.clone())
                         .chain(leave)
                         .collect();
                     rest = self.alt_text(&list)?.ok_or(GiveUp)?;
@@ -1877,13 +2512,20 @@ impl Rewriter<'_> {
     /// `^` and `$` are written as `\A` and `\z`. In jq `$` holds at the end alone, or before a final
     /// newline, and `^` does not end a loop after a newline inside the text: `--assert --newlines`
     /// in `scripts/jq-regex-capture-loop-sweep.py` finds no pattern moved away from jq. Under `(?m)`
-    /// they hold at every line and stay [`Ways::Opaque`].
+    /// they hold at every line: where that holds throughout they are [`AnchorKind::LineStart`] and
+    /// [`AnchorKind::LineEnd`], and [`Rewriter::line_plan`] says whether the loop is written (#6425);
+    /// where a flag may switch it, they stay [`Ways::Opaque`].
+    /// - `^` under `(?m)`: as `\A`, for ways none of which ends with a newline.
+    /// - `$` under `(?m)`: `n` is the ways that start with anything but a newline and `N` those that
+    ///   start with one, so `T` is `n*(?:N n*)*?(?:E|)`: `N` runs only where `$` holds, which the
+    ///   newline it starts with says, and `n` only where it does not.
     fn anchored_loop(
         &self,
         before: &Option<Text>,
         anchor: &Anchor,
         after: &Option<Text>,
-        exit: &Text,
+        (first_exit, exit): (&Text, &Text),
+        plan: &LinePlan,
     ) -> Result<Text, GiveUp> {
         let star = |text: &Text| self.repeat_text(text, 0, None, true);
         let looped = before.as_ref().map(star).transpose()?;
@@ -1903,17 +2545,130 @@ impl Rewriter<'_> {
                 let here = self.repeat_text(&here, 0, None, false)?;
                 self.concat_text(&[&elsewhere, &here, &leave])?
             }
-            (Some(iteration), AnchorKind::Start) => {
+            (Some(iteration), AnchorKind::Start | AnchorKind::LineStart) => {
                 let more = self.repeat_text(&iteration, 1, None, true)?;
-                self.text(format!("(?:{}|{}|)", exit.text, more.text), Prec::Atom)?
+                // #6424: a dropped last exit holds past the ways too, at every head, so it ends
+                // the ways of the later heads (`more`) and what is left of the first.
+                let (more, none) = if anchor.last {
+                    (self.concat_text(&[&more, &leave])?, leave.clone())
+                } else {
+                    (more, self.concat_text(&[])?)
+                };
+                self.text(
+                    format!("(?:{}|{}|{})", first_exit.text, more.text, none.text),
+                    Prec::Atom,
+                )?
             }
             (Some(iteration), AnchorKind::End) => {
                 self.concat_text(&[&star(&iteration)?, &leave])?
+            }
+            // A way that starts with a newline runs only where `$` holds, and any other only where
+            // it does not, so the heads need no complement of the anchor to tell them apart: `n`
+            // is the ways that start with anything else, and the anchor is the newline itself.
+            (Some(_), AnchorKind::LineEnd) => {
+                let LinePlan::Split { plain, newline } = plan else {
+                    return Err(GiveUp);
+                };
+                let then_a = |b: &Text| match &looped {
+                    Some(a) => self.concat_text(&[b, a]),
+                    None => Ok(b.clone()),
+                };
+                let elsewhere = match plain {
+                    Some(plain) => star(&then_a(plain)?)?,
+                    None => self.concat_text(&[])?,
+                };
+                match newline {
+                    None => self.concat_text(&[&elsewhere, &leave])?,
+                    Some(newline) => {
+                        let here = self.concat_text(&[&then_a(newline)?, &elsewhere])?;
+                        let here = self.repeat_text(&here, 0, None, false)?;
+                        self.concat_text(&[&elsewhere, &here, &leave])?
+                    }
+                }
             }
         };
         match &looped {
             Some(a) => self.concat_text(&[a, &tail]),
             None => Ok(tail),
+        }
+    }
+
+    /// `ways_of` `text`, charged to the work budget as a copy of it is.
+    fn read_ways(&self, text: &str) -> Result<Option<Vec<Way>>, GiveUp> {
+        let work = self.work.get().saturating_add(text.len());
+        self.work.set(work);
+        if work > self.work_limit {
+            return Err(GiveUp);
+        }
+        Ok(ways_of(text))
+    }
+
+    /// How a loop over `before | anchor | after` is written when the anchor is a line anchor
+    /// (#6425), or `None` when it cannot be and the loop keeps its text.
+    ///
+    /// - `^`: it holds at the start of every line, so after a way that ends with a newline too.
+    ///   When no way can end with one, it holds only at the loop's first head, like `\A`.
+    /// - `$`: before a newline, so a way that starts with one can run where it holds. When every
+    ///   way after it starts with a newline or with anything else, the two kinds are the
+    ///   exits' two kinds of head: `\n` runs only where `$` holds and `a` only where it does not.
+    ///
+    /// A way that may or may not start (or end) with a newline, one that cannot be read, and a
+    /// `(?m)` that something switches keep the loop as written.
+    fn line_plan(
+        &self,
+        anchor: &Anchor,
+        before: &Option<Text>,
+        after: &Option<Text>,
+    ) -> Result<Option<LinePlan>, GiveUp> {
+        // With no way after a `$` there is nothing to tell the heads apart for: the loop is the ways
+        // before it and the exit, whichever lines the anchor holds at. A `^` is read with the ways
+        // before it too: it holds after a newline they end with, and Oniguruma's does not hold at the
+        // end of the text there (#6456), which the exit written for it does.
+        // A last exit (#6424) is written around the ways of every head, which neither this nor the
+        // split of the ways by where `$` holds writes.
+        if anchor.last && matches!(anchor.kind, AnchorKind::LineEnd) {
+            return Ok(None);
+        }
+        if after.is_none() && matches!(anchor.kind, AnchorKind::LineEnd) {
+            return Ok(Some(LinePlan::Plain));
+        }
+        match anchor.kind {
+            AnchorKind::LineStart => {
+                for text in [before, after].into_iter().flatten() {
+                    let Some(ways) = self.read_ways(&text.text)? else {
+                        return Ok(None);
+                    };
+                    if !ways
+                        .iter()
+                        .all(|way| matches!(way.last.0, Edge::Plain | Edge::Nothing))
+                    {
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(LinePlan::Plain))
+            }
+            AnchorKind::LineEnd => {
+                let Some(text) = after else {
+                    return Ok(Some(LinePlan::Plain));
+                };
+                let Some(ways) = self.read_ways(&text.text)? else {
+                    return Ok(None);
+                };
+                let (mut plain, mut newline) = (Vec::new(), Vec::new());
+                for way in ways {
+                    let kept = self.text(way.text, Prec::Concat)?;
+                    match way.first {
+                        (Edge::Plain, false) => plain.push(kept),
+                        (Edge::Newline, false) => newline.push(kept),
+                        _ => return Ok(None),
+                    }
+                }
+                Ok(Some(LinePlan::Split {
+                    plain: self.alt_text(&plain)?,
+                    newline: self.alt_text(&newline)?,
+                }))
+            }
+            _ => Ok(Some(LinePlan::Plain)),
         }
     }
 
@@ -1930,9 +2685,9 @@ impl Rewriter<'_> {
     }
 
     /// Whether a repeat written with its exit `exit` keeps its own text instead: a loop, or a lazy
-    /// bounded repeat (#6428), under a lazy `*?` or `+?` (#6358), which is not rewritten, and which
-    /// answers differently from Oniguruma's with the exit written. The one rule for every arm that
-    /// writes an exit.
+    /// repeat (#6428, #6427), under a lazy repeat that may keep its text (#6358) on a reading that
+    /// does not trust it to be written, since it answers differently from Oniguruma's with the exit
+    /// written under one that is not. The one rule for every arm that writes an exit.
     fn exit_keeps_text(&self, exit: &Option<Text>) -> bool {
         exit.is_some() && self.lazy_around > 0
     }
@@ -2131,8 +2886,7 @@ mod tests {
             "(?:b*|a)*?",     // lazy
             "(?:b*|a){1,2}?", // lazy, runs once at most
             "(?:a|b*){2}",
-            "(b*|a)+",           // a capture group
-            r"(?:\A\A|a|\b\b)+", // two anchors
+            "(b*|a)+", // a capture group
             "(?U)(?:b*|a)+",
             "(?:(?U:b*)|a)+",
             "(?:a+)*",
@@ -2295,25 +3049,44 @@ mod tests {
         }
     }
 
-    /// #6358: a lazy `*?` or `+?` around a loop with groups is not rewritten, and the loop inside it,
-    /// written with its exit, is not read the way Oniguruma's is (`"abab" | match("(?:x*|(?:b*|(a))+
-    /// (?:(b)*|a)+)+?b")` has no `a` in group 1 in jq), so that loop keeps its text.
+    /// #6358, #6427: a lazy repeat that keeps its text keeps the loops with groups inside it as
+    /// written (no arm reads a way that starts with an anchor beside a way that can match nothing);
+    /// one that is written out takes them.
     #[test]
-    fn a_loop_with_groups_inside_a_lazy_repeat_keeps_its_text_6358() {
+    fn a_loop_with_groups_inside_a_lazy_repeat_keeps_its_text_with_the_repeat_6427() {
+        for quantifier in ["*?", "+?", "{1,2}?"] {
+            let pattern = format!("(?:^b*|(?:(a*)|b)+(?:(a)|b?){{0,2}}){quantifier}$");
+            let written = rewrite_with_groups(&pattern).map(|g| g.pattern);
+            assert_eq!(written, None, "{pattern}");
+        }
         for pattern in [
             "(?:x*|(?:b*|(a))+(?:(b)*|a)+)+?b",
             "(?:b*|(?:b*|(a))+(?:(b)*|a)+)*?b",
-            "(?:(?:b*|(a))+)*?",
-            "(?:(?:b*|(a))+){1,3}?",
+            "(?:(?:b*|(a))+){2,3}?",
         ] {
-            assert_eq!(
-                rewrite_with_groups(pattern).map(|g| g.pattern),
-                None,
-                "{pattern}"
-            );
+            assert!(rewrite_with_groups(pattern).is_some(), "{pattern}");
         }
-        // A lazy repeat that is written out copy by copy still takes the loops inside it.
-        assert!(rewrite_with_groups("(?:(?:b*|(a))+){2,3}?").is_some());
+    }
+
+    /// #6427: a lazy `+?` over a short body is `X X*?`, as Oniguruma writes it, the first copy with
+    /// no empty check; over a long one the empty way leaves, as a counted repeat's does.
+    #[test]
+    fn a_lazy_plus_is_a_copy_over_a_short_body_and_counted_over_a_long_one_6427() {
+        let copied = |pattern: &str| rewrite_with_groups(pattern).unwrap().pattern;
+        assert_eq!(copied("(?:(b*)|a)+?c"), "(?:(b*)|a)(?:(?:(b+)|a)*?)c");
+        assert!(!copied("(?:(b*)|a|c|d|e|f|g|h)+?i").contains("(b*)"));
+    }
+
+    /// #6427: Oniguruma reduces a repeat directly of a repeat before it compiles either, so a pair
+    /// of them is not written out, with a plain group between or not; a capture group or a third
+    /// item between them keeps them apart.
+    #[test]
+    fn a_repeat_directly_of_a_repeat_keeps_its_text_6427() {
+        let written = |pattern: &str| rewrite_with_groups(pattern).map(|g| g.pattern);
+        assert_eq!(written("(?:(?:(a*)|b)+?)*?c"), None);
+        assert_eq!(written("(?:(?:(?:(a*)|b)+?))??c"), None);
+        assert!(written("((?:(a*)|b)+?)*?c").is_some());
+        assert!(written("(?:(?:(a*)|b)+?d)*?c").is_some());
     }
 
     /// #6428: a lazy bounded repeat is counted, and its empty way leaves the count, so it is written
@@ -2329,7 +3102,7 @@ mod tests {
         );
         assert_eq!(
             rewrite_with_groups("(?:(b*)|a)*?b").map(|g| g.pattern),
-            None
+            Some("(?:(?:(b+)|a)*?)b".to_string())
         );
         assert_eq!(rewrite("(?:b*|a){0,2}?b"), None);
         // The count past the minimum is one repeat, and a group of the empty way alone is held by a
@@ -2350,6 +3123,25 @@ mod tests {
         let written = rewrite_with_groups(&format!("(?:(a)|b*|c)+{nested}")).unwrap();
         assert!(written.pattern.contains("{1,2}?"), "{}", written.pattern);
         assert_eq!(rewrite_with_groups(&nested).map(|g| g.pattern), None);
+    }
+
+    /// #6358: Oniguruma counts a lazy repeat with an upper bound whatever its body is, so a switch in
+    /// the body does not hide it; the unbounded one decides from an operation count that does not read
+    /// a switch, and a body with a way that is only an anchor was not checked against one.
+    #[test]
+    fn a_lazy_bounded_repeat_over_a_switch_is_written_and_the_others_are_not_6358() {
+        let written = rewrite_with_groups("((?i)|b*){2,5}?c").unwrap().pattern;
+        assert!(written.contains("(?i)"), "{written}");
+        assert!(!written.contains("){2,5}?"), "{written}");
+        assert!(rewrite_with_groups("((?i)|(b*)){2,4}?c").is_some());
+        assert_eq!(
+            rewrite_with_groups("((?i)|b*){2,}?c").map(|g| g.pattern),
+            None
+        );
+        assert_eq!(
+            rewrite_with_groups("(?:(?:(a)|b?){0,2}(\\z)|(?i)(a|b)){2,3}?").map(|g| g.pattern),
+            None
+        );
     }
 
     /// #6358: a flag switch in the body of a loop with groups is written as the flag group it stands
@@ -2664,7 +3456,7 @@ mod tests {
         for _ in 0..20_000 {
             let extended = if roll(4) == 0 { "(?x)" } else { "" };
             let pattern = format!("{extended}{}", generate(4, &mut roll));
-            if rewrite_parsed(&pattern, false, "", true).is_some() {
+            if rewrite_parsed(&pattern, false, "", 0, false).is_some() {
                 changed += 1;
                 assert!(may_need_rewrite(&pattern), "{pattern}");
             }
@@ -2719,15 +3511,185 @@ mod tests {
         assert_eq!(written(r"(\b|a)?"), None);
         // Counted, it is written: `E` leaves all of it, where the crate's copies would go on.
         assert!(written(r"(\b|a){2}").is_some());
-        // Two exits, or an empty way after one, are past what the forms write.
-        assert_eq!(written(r"(\A|a|\B)*"), None);
+        // A second exit with no way after it, or the same anchor again, is written (#6424); one with
+        // a way after it is past what the forms write, and so is a list of anchors that holds nowhere.
+        assert!(written(r"(\A|a|\B)*").is_some_and(|t| t.contains(r"\A(")));
+        assert!(written(r"(\b|a|\b)*").is_some());
+        assert_eq!(written(r"(\A|a|\B|b)*"), None);
+        assert_eq!(written(r"(\b|a|\B|b)*"), None);
         assert_eq!(written(r"(\b\B|a)*"), None);
+        // The dropped exit is last among the ways of the repeat's body, not of a part of it: inside
+        // another way, or in a list with more items, the part keeps its text.
+        assert_eq!(written(r"((\A|a|\B)|c)+"), None);
+        assert_eq!(written(r"(((\A|a|\B))|c)+"), None);
+        for pattern in [r"((\A|\B)\b)*", r"((\A|\B)b*)+", r"((\A|a|\B)b*)*"] {
+            assert_eq!(written(pattern), None, "{pattern}");
+        }
+        // The evaluator reads a loop again once the group around it is written as a plain one, so the
+        // dropped exit is written back there too.
+        assert!(rewrite(r"(?:\A|a|\B)*").is_some());
         // The shadow spells `\G` as `\b`: it is not one, so nothing writes its complement.
         let shadowed = rewrite(r"(?=x)(?:a|\Gb?|b)*").unwrap_or_default();
         assert!(!shadowed.contains(r"\B"), "{shadowed}");
-        // Under `(?m)` `^` and `$` hold at every line, which is neither kind.
-        assert_eq!(written(r"(?m)($|a|b)*"), None);
+        // Under a `(?m)` that something switches, `^` and `$` are neither kind.
         assert_eq!(written(r"(?m:(^|a|b)*)"), None);
+        assert_eq!(written(r"(?m)(^|a)*(?-m)"), None);
+        assert_eq!(written(r"(?mx)(^|a)*"), None);
+    }
+
+    /// #6425: under a `(?m)` that holds throughout, `$` splits the ways after it by how each starts
+    /// (a newline runs only where it holds), and `^` is the first head's when no way ends a line.
+    #[test]
+    fn a_loop_over_a_line_anchor_is_written_for_ways_that_leave_the_lines_alone_6425() {
+        let written = |pattern: &str| rewrite_with_groups(pattern).map(|r| r.pattern);
+        // The ways that start with anything but a newline loop where `$` fails, greedy; the one that
+        // starts with a newline loops where it holds, lazy, and each leaves through the exit.
+        assert_eq!(
+            written(r"(?m)($|a|b)*").as_deref(),
+            Some(r"(?m)(?:(?:(a)|(b))*(?:($|[^\s\S]|[^\s\S])|))")
+        );
+        assert_eq!(
+            written(r"(?m)($|a|\n|b)*").as_deref(),
+            Some(r"(?m)(?:(?:(a)|(b))*(?:(\n)(?:(a)|(b))*)*?(?:($|[^\s\S]|[^\s\S]|[^\s\S])|))")
+        );
+        // A `\w`, a class without the newline and a `\S` never start with one; a `\n` and `[\n]` always do.
+        for ways in [
+            r"\w",
+            "[^\\n]",
+            r"\S",
+            "[abc]",
+            r"\x61",
+            "a+",
+            r"\p{L}",
+            r"\p{Alphabetic}b",
+            r"[\p{Nd}_]",
+        ] {
+            assert!(written(&format!("(?m)($|{ways}|\\n)*")).is_some(), "{ways}");
+        }
+        assert!(written(r"(?m)($|a|[\n])*").is_some());
+        // A way that may start either way, and one the parser cannot read, keep the loop: nothing
+        // tells the heads where `$` holds from those where it does not.
+        for ways in [
+            r"\s",
+            ".",
+            "[^b]",
+            r"\W",
+            "[\\na]",
+            r"\P{L}",
+            r"\p{Cc}",
+            r"\p{White_Space}",
+            "a|(?=b)b",
+            r"(\1)",
+        ] {
+            assert_eq!(written(&format!("(?m)($|{ways}|b)*")), None, "{ways}");
+        }
+        // `^` is the first head's when no way ends with a newline; written like `\A` is.
+        let start = written(r"(?m)(^|a|b)*").unwrap_or_default();
+        assert!(start.contains("(a|b)+|)"), "{start}");
+        assert_eq!(written(r"(?m)(^|a|\n|b)*"), None);
+        assert_eq!(written(r"(?m)(^|a|\s)+"), None);
+        assert_eq!(written(r"(?m)(^|a|.)+"), None);
+        // Several anchors in a row are the one anchor when they are the same; two kinds are not.
+        assert!(written(r"(?m)(^^|a|b)*").is_some());
+        assert!(written(r"(?m)($$|a|b)*").is_some());
+        assert_eq!(written(r"(?m)($^|a|b)*"), None);
+        // A flag group around the anchor's body: its flags reach each way, and the anchor too.
+        let flagged = written(r"(?m)((?i:$|a|\n|b))*").unwrap_or_default();
+        assert!(
+            flagged.contains("(?i:a)") && flagged.contains(r"(?i:\n)"),
+            "{flagged}"
+        );
+        // Only ways that start with a newline, and ways that start with none.
+        assert!(written(r"(?m)($|\n)*").is_some_and(|t| t.contains("*?")));
+        assert!(written(r"(?m)($|a)*").is_some_and(|t| !t.contains("*?")));
+        // Ways the parser cannot read keep the loop, before a `^` and after a `$`.
+        assert_eq!(written(r"(?m)(^|(?=x)a|b)*"), None);
+        assert_eq!(written(r"(?m)($|(?=x)a|b)*"), None);
+        // With no way after a `$` there is nothing to tell apart, whatever the ways before it start
+        // with. A `^` is read with them: the exit written for it holds at the end of a text after a
+        // final newline, where Oniguruma's does not (#6456).
+        assert!(written(r"(?m)(a|\n|$)+").is_some());
+        assert!(written(r"(?m)(a|\s|$)+").is_some());
+        assert!(written(r"(?m)(a|^)+").is_some());
+        assert_eq!(written(r"(?m)(a|\n|^)+"), None);
+        // Nor under `x`, where blanks are no text, or when the flag is switched again after the anchor.
+        assert_eq!(written(r"(?x)(?m)($|a|\n|b)*"), None);
+        assert_eq!(written(r"(?m)($|a|\n|b)*(?-m:c)"), None);
+        // Nor when the search is told to find no empty match, which the exit written for a line
+        // anchor does not answer as Oniguruma does (as the loops over `\A` and `\z` do not).
+        assert!(rewrite_with_groups_for(r"(?m)($|a|\n|b)*", false).is_some());
+        assert!(rewrite_with_groups_for(r"(?m)($|a|\n|b)*", true).is_none());
+        assert!(rewrite_with_groups_for(r"(?m)(\b|a)*", true).is_some());
+    }
+
+    /// #6425: `(?m)` holds throughout only when the pattern's own leading switches turn it on and no
+    /// flag group names it again, and no flag group names `x`.
+    #[test]
+    fn multi_line_holds_throughout_only_for_a_leading_switch_6425() {
+        assert!(multi_line_throughout("", "(?m)a$"));
+        assert!(multi_line_throughout("(?m)", "a$"));
+        assert!(multi_line_throughout("(?i)", "(?m)a$"));
+        assert!(multi_line_throughout("", "(?im)(?s)a$"));
+        assert!(multi_line_throughout("", "(?i-s)(?m)a$"));
+        assert!(multi_line_throughout("", "(?m)(?<time>a)$"));
+        assert!(!multi_line_throughout("", "a$"));
+        assert!(!multi_line_throughout("", "a(?m)b$"));
+        assert!(!multi_line_throughout("", "(?m:a)$"));
+        assert!(!multi_line_throughout("", "(?m)a(?-m)b$"));
+        assert!(!multi_line_throughout("", "(?m)a(?i:b)(?m:c)$"));
+        assert!(!multi_line_throughout("", "(?-m)a$"));
+        assert!(!multi_line_throughout("", "(?m-m)a$"));
+        assert!(!multi_line_throughout("(?x)", "(?m)a$"));
+        assert!(!multi_line_throughout("", "(?mx)a$"));
+        assert!(!multi_line_throughout("", "(?m"));
+        assert!(!multi_line_throughout("", "(?mR)a$"));
+    }
+
+    /// #6425: what the first and the last character a way consumes is, as to a newline.
+    #[test]
+    fn a_ways_first_and_last_character_are_read_as_to_a_newline_6425() {
+        let edges = |pattern: &str| {
+            let ast = ast::parse::Parser::new().parse(pattern).unwrap();
+            (edge(&ast, false), edge(&ast, true))
+        };
+        use Edge::{Either, Newline, Nothing, Plain};
+        assert_eq!(edges("a"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges(r"\n"), ((Newline, false), (Newline, false)));
+        assert_eq!(edges(r"\x0a"), ((Newline, false), (Newline, false)));
+        assert_eq!(edges("[\\n]"), ((Newline, false), (Newline, false)));
+        assert_eq!(edges("[^\\n]"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges("[^a]"), ((Either, false), (Either, false)));
+        assert_eq!(edges("[a-z0-9_\\d]"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges("[\\x00-\\x20]"), ((Either, false), (Either, false)));
+        assert_eq!(edges("[\\t-\\x09]"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges(r"[[:alpha:]]"), ((Either, false), (Either, false)));
+        assert_eq!(edges(r"\w\S\d"), ((Plain, false), (Plain, false)));
+        // What the translation writes for jq's `\w`, and the properties that may hold a newline.
+        let word = r"[\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\x{B2}\x{B3}\x{B9}\x{BC}-\x{BE}]";
+        assert_eq!(edges(word), ((Plain, false), (Plain, false)));
+        assert_eq!(edges(r"\p{Lu}"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges(r"\pL"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges(r"\p{Cc}"), ((Either, false), (Either, false)));
+        assert_eq!(edges(r"\P{L}"), ((Either, false), (Either, false)));
+        assert_eq!(edges(r"\p{Greek}"), ((Either, false), (Either, false)));
+        assert_eq!(edges(r"\s"), ((Either, false), (Either, false)));
+        assert_eq!(edges(r"\D"), ((Either, false), (Either, false)));
+        assert_eq!(edges("."), ((Either, false), (Either, false)));
+        // The first character is the first one a way can consume, past what matches nothing.
+        assert_eq!(edges("b*\\n"), ((Either, false), (Newline, false)));
+        assert_eq!(edges("\\nb*"), ((Newline, false), (Either, false)));
+        assert_eq!(edges("a?\\nb?"), ((Either, false), (Either, false)));
+        assert_eq!(edges("^a$"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges("$\\n"), ((Newline, false), (Newline, false)));
+        assert_eq!(edges("(?:a|b)c"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges("(a|\\n)"), ((Either, false), (Either, false)));
+        assert_eq!(edges("a{0}b"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges("b*"), ((Plain, true), (Plain, true)));
+        assert_eq!(edges("a?b*"), ((Plain, true), (Plain, true)));
+        assert_eq!(edges(r"\p{scx=Greek}"), ((Either, false), (Either, false)));
+        assert_eq!(edges("[a-z&&[^b]]"), ((Either, false), (Either, false)));
+        assert_eq!(edges("[a[:alpha:]]"), ((Either, false), (Either, false)));
+        assert_eq!(edges("(?:)"), ((Nothing, true), (Nothing, true)));
     }
 
     /// A piece that matches only the empty string is not copied into the rewrite, so a pattern the
@@ -2825,6 +3787,74 @@ mod tests {
             }
         }
         assert!(rewritten > 0, "no pattern was rewritten with its groups");
+    }
+
+    /// #6426: a loop with groups beside a lookaround, an atomic group or a comment is written with its
+    /// groups copied, the construct as it stands in the pattern; one in the way of the copies keeps
+    /// the pattern as written.
+    #[test]
+    fn a_loop_with_groups_beside_fancy_regex_syntax_is_written_with_its_copies_6426() {
+        for pattern in [
+            "(?=b)(?:(a)|b*|c)+",
+            "(?!c)(?:(a)|b*|c)+",
+            "(?<=b)(?:(a)|b*|c)+",
+            "(?<!c)(?:(a)|b*|c)+",
+            "(?>b)(?:(a)|b*|c)+",
+            "(?:(a)|b*|c)+(?=b|a)",
+            "(?#c)(?:(a)|b*|c)+",
+        ] {
+            let written = rewrite_with_groups(pattern).unwrap_or_else(|| panic!("{pattern}"));
+            let construct = pattern
+                .split('+')
+                .flat_map(|part| part.split(')'))
+                .find(|part| part.starts_with("(?") && !part.starts_with("(?:"))
+                .unwrap();
+            assert!(
+                written.pattern.contains(construct),
+                "{pattern}: {}",
+                written.pattern
+            );
+            // The groups of the copies are plain, and every group of the input has one.
+            assert!(!written.pattern.contains("?<__"), "{pattern}");
+            assert!(
+                written.copies.iter().all(|copies| !copies.is_empty()),
+                "{pattern}"
+            );
+        }
+        for pattern in [
+            // In a repeat, where the copies would run it again.
+            "(?:(?=b)(a)|b*|c)+",
+            "(?:(a)|(?!c)b*|c)+",
+            // Holding a group or a repeat.
+            "(?=(b))(?:(a)|b*|c)+",
+            "(?=b*)(?:(a)|b*|c)+",
+            "(?>(?:b))(?:(a)|b*|c)+",
+            // A backreference names a group the copies renumber.
+            "(a)\\1(?:(a)|b*|c)+",
+            "(?:(a)|b*|c)+(?<n>b)\\k<n>",
+            // Read as another escape by the plain copy of the pattern.
+            "(?=b)(?:(a)|b*|c)+\\K",
+            "(?=b)\\G(?:(a)|b*|c)+",
+            "(?=b)(?:(a)|b*|c)+\\Z",
+            "(?=b)(?:(a)|b*|c)+\\R",
+        ] {
+            assert!(rewrite_with_groups(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    /// #6426: a repeated group name is renamed in the pattern and in its plain copy alike.
+    #[test]
+    fn a_pattern_with_fancy_syntax_and_no_repeated_name_is_read_with_its_opaque_offsets_6426() {
+        let (read, opaque) = parse_for_group_copies("(?=b)(?<n>a)(?#c)").unwrap();
+        assert_eq!(read.text, "(?=b)(?<n>a)(?#c)");
+        assert_eq!(opaque, [0, 12]);
+        // A pattern the parser reads as written has no opaque construct.
+        assert_eq!(
+            parse_for_group_copies("(?<n>a)").unwrap().1,
+            Vec::<usize>::new()
+        );
+        // A repeated name moves the offsets after it, so the pattern keeps its text.
+        assert!(parse_for_group_copies("(?=b)(?<n>a)(?<n>b)").is_none());
     }
 
     #[test]

@@ -94,11 +94,14 @@ pub(crate) fn rewrite(pattern: &str) -> Option<LoopRewrite> {
     if !pattern.contains('(') || !pattern.contains(['*', '+', '{']) {
         return None;
     }
-    let super::onig_loop::DistinctNames {
-        text: distinct,
-        ast,
-        renames,
-    } = super::onig_loop::parse_distinct_names(pattern)?;
+    let (
+        super::onig_loop::DistinctNames {
+            text: distinct,
+            ast,
+            renames,
+        },
+        opaque,
+    ) = super::onig_loop::parse_for_group_copies(pattern)?;
     let pattern = distinct.as_str();
     if swaps_greed(&ast) || !has_candidate(&ast, false) {
         return None;
@@ -111,6 +114,7 @@ pub(crate) fn rewrite(pattern: &str) -> Option<LoopRewrite> {
         .collect();
     let mut emitter = Emitter {
         src: pattern,
+        opaque: &opaque,
         out: String::with_capacity(pattern.len() * 2),
         copies: vec![Vec::new(); names.len()],
         next: 1,
@@ -135,6 +139,9 @@ struct TooLong;
 
 struct Emitter<'p> {
     src: &'p str,
+    /// Where the constructs of `src` that the parsed copy reads as something else start (a
+    /// lookaround, an atomic group, a comment; #6426): each is written as it stands in `src`.
+    opaque: &'p [usize],
     out: String,
     copies: Vec<Vec<usize>>,
     next: usize,
@@ -184,6 +191,12 @@ impl Emitter<'_> {
             | Ast::ClassBracketed(_)
             | Ast::Assertion(_) => {
                 let text = String::from(self.text(ast.span()));
+                self.push(&text)
+            }
+            // #6426: it holds no repeat and no group, and stands in none (see
+            // `onig_loop::copyable_beside_loops`), so its text is the whole of it.
+            Ast::Group(group) if self.opaque.binary_search(&group.span.start.offset).is_ok() => {
+                let text = String::from(self.text(&group.span));
                 self.push(&text)
             }
             Ast::Group(group) => {
@@ -577,5 +590,29 @@ mod tests {
             [None, Some("n".into()), Some("n".into()), None]
         );
         assert!(!written.pattern.contains("?<"));
+    }
+
+    /// #6426: a lookaround, an atomic group or a comment beside the repeat is written as it stands;
+    /// one in the way of a copy keeps the pattern as written.
+    #[test]
+    fn a_construct_only_fancy_regex_reads_is_kept_beside_the_repeat_6426() {
+        for (pattern, kept) in [
+            ("(?=b)((a|b)|){2,}", "(?=b)"),
+            ("(?<!c)((a|b)|){2,}(?>a|b)", "(?<!c)"),
+            ("((a|b)|){2,}(?!c)", "(?!c)"),
+            ("(?#c)((a|b)|){2,}", "(?#c)"),
+        ] {
+            let written = rewrite(pattern).unwrap_or_else(|| panic!("{pattern}"));
+            assert!(
+                written.pattern.contains(kept),
+                "{pattern}: {}",
+                written.pattern
+            );
+            // The groups are the pattern's, one copy of the repeated group added.
+            assert_eq!(written.copies.len(), 3, "{pattern}");
+        }
+        assert!(rewrite("(?:(?=b)((a|b)|)){2,}").is_none());
+        assert!(rewrite("(?=(b))((a|b)|){2,}").is_none());
+        assert!(rewrite("(a)\\1((a|b)|){2,}").is_none());
     }
 }

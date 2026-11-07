@@ -328,6 +328,28 @@ fn a_loop_with_a_way_that_is_only_an_anchor_answers_as_jq_does_6358() -> Result<
     Ok(())
 }
 
+/// A lazy bounded repeat over a body that opens with a flag switch is counted by Oniguruma, never
+/// unrolled, so the switch does not hide it from the rewrite. Rows captured from jq 1.7.1.
+#[test]
+fn a_lazy_bounded_repeat_over_a_flag_switch_body_answers_as_jq_does_6358() -> Result<()> {
+    for (pattern, input, expected) in [
+        (r"((?i)|b*){2,5}?c", "bbc", r#"[[0,"bbc",[""]]]"#),
+        (r"((?i)|(b*)){2,4}?c", "bbc", r#"[[0,"bbc",["","bb"]]]"#),
+        (r"((?i)|(b*)){0,3}?b", "ab", r#"[[1,"b",[null,null]]]"#),
+        // An exact count, a switch that turns a flag off, and a bound past the minimum.
+        (r"((?i)|b*){3}?c", "bbc", r#"[[0,"bbc",[""]]]"#),
+        (r"((?-i)|(b*)){2}?c", "bbc", r#"[[0,"bbc",["","bb"]]]"#),
+        (
+            r"((?-i)|(b*)){3,5}?$",
+            "bab",
+            r#"[[2,"b",["","b"]],[3,"",["",""]]]"#,
+        ),
+    ] {
+        assert_matches(pattern, input, expected)?;
+    }
+    Ok(())
+}
+
 fn assert_matches(pattern: &str, input: &str, expected: &str) -> Result<()> {
     let (stdout, _, status) = run_jq_full(
         &[
