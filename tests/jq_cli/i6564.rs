@@ -17,6 +17,8 @@ fn run_with_env(name: &[u8], value: &[u8], filter: &str) -> Result<(String, Stri
         .arg("jq")
         .arg("-nc")
         .arg(filter)
+        // Only the variable under test: the host's own environment would show in `$ENV`.
+        .env_clear()
         .env(OsStr::from_bytes(name), OsStr::from_bytes(value))
         .output()?;
     Ok((
@@ -51,10 +53,14 @@ fn a_non_utf8_environment_value_is_substituted_as_jq_does_6564() -> Result<()> {
             assert!(ok, "{value:?} {filter}: {stderr}");
             assert_eq!(stdout.trim_end(), expected, "{value:?} {filter}");
         }
-        // Building the whole object must not panic either, whichever variable it holds.
-        let (stdout, stderr, ok) = run_with_env(b"BADVAR", value, "$ENV | length > 0")?;
+        // Building the whole object must not panic either, and holds that one variable.
+        let (stdout, stderr, ok) = run_with_env(
+            b"BADVAR",
+            value,
+            "[$ENV | length, ($ENV | has(\"BADVAR\"))]",
+        )?;
         assert!(ok, "{value:?}: {stderr}");
-        assert_eq!(stdout.trim_end(), "true");
+        assert_eq!(stdout.trim_end(), "[1,true]", "{value:?}");
     }
     Ok(())
 }
@@ -62,10 +68,7 @@ fn a_non_utf8_environment_value_is_substituted_as_jq_does_6564() -> Result<()> {
 /// A name that is not valid UTF-8 is substituted the same way (jq: `BAD\u{fffd}NAME`).
 #[test]
 fn a_non_utf8_environment_name_is_substituted_as_jq_does_6564() -> Result<()> {
-    for filter in [
-        "$ENV | keys | map(select(startswith(\"B\"))) | map(explode)",
-        "env | keys | map(select(startswith(\"B\"))) | map(explode)",
-    ] {
+    for filter in ["$ENV | keys | map(explode)", "env | keys | map(explode)"] {
         let (stdout, stderr, ok) = run_with_env(b"BAD\xffNAME", b"1", filter)?;
         assert!(ok, "{filter}: {stderr}");
         assert_eq!(

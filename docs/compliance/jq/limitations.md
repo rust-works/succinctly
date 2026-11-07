@@ -228,6 +228,7 @@ structurally-valid overlong/surrogate/out-of-range 3-/4-byte lead to a single U+
 `$ENV`, `env`, `env.NAME` and `$ENV.NAME` read the process environment as bytes on Unix and substitute a name or value that is not valid UTF-8 by the same rule ([#6564](https://github.com/rust-works/succinctly/issues/6564)).
 They panicked on the first one before: `env $'BADVAR=\xff\xfe' jq -n '$ENV | length'`.
 `env.BADVAR` is `"\ufffd\ufffd"` and a value `ok\xe1A` is `"ok\ufffd"`, both as in jq 1.7.1.
+Where the platform has no bytes for it (Windows), the standard library's lossy conversion stands in, which writes one U+FFFD per invalid unit and so can count differently from jq's rule.
 `strenv(NAME)` and `env(NAME)` in yq mode still refuse such a value as not provided, where yq reads its bytes ([#6566](https://github.com/rust-works/succinctly/issues/6566)).
 
 jq has a second, separate quirk here (#1717): for `InvalidContinuationByte`, jq's actual
