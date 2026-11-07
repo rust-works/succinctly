@@ -7,9 +7,16 @@
 
 use anyhow::Result;
 
-use crate::run_yq_stdin;
+use crate::{run_yq_split, run_yq_stdin};
 
 const REFUSED: &[&str] = &[
+    // Spacing after the dash, a comment after the colon, a plain mapping key, CRLF.
+    "- -   k:\n  |\n    t\n",
+    "-   k:\n |\n   t\n",
+    "- - k: # c\n  |\n    t\n",
+    "a:\n  b:\n|\n  t\n",
+    "x:\n  k:\n |\n   t\n",
+    "- - k:\r\n  |\r\n    t\r\n",
     "- k:\n|\n  t\n",
     "- k:\n |\n   t\n",
     "- k: &y\n|\n  t\n",
@@ -109,6 +116,24 @@ fn yq_keeps_a_header_at_or_right_of_the_key_6540() -> Result<()> {
     ] {
         let (stdout, status) = run_yq_stdin(".", doc, &["-o=json", "-I0"])?;
         assert_eq!((stdout.trim_end(), status), (expected, 0), "{doc:?}");
+    }
+    Ok(())
+}
+
+/// yq's wording follows the container the key is in: a sequence item reads `did not find expected
+/// '-' indicator`, a block mapping `did not find expected key`.
+#[test]
+fn yq_words_the_refusal_by_the_container_of_the_key_6540() -> Result<()> {
+    for (doc, wording) in [
+        (
+            "- - k:\n  |\n    t\n",
+            "did not find expected '-' indicator",
+        ),
+        ("a:\n  b:\n|\n  t\n", "did not find expected key"),
+    ] {
+        let (_stdout, stderr, status) = run_yq_split(".", doc, &["-o=json", "-I0"])?;
+        assert_eq!(status, 1, "{doc:?}");
+        assert!(stderr.contains(wording), "{doc:?}: {stderr}");
     }
     Ok(())
 }
