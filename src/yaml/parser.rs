@@ -290,13 +290,22 @@ pub struct SemiIndex {
 /// cap must stay above that.
 const MAX_NESTING_DEPTH: usize = 128;
 
-/// The key a content line opens with, past its `- ` markers, and the last marker before it
+/// The markers `Parser::previous_line_key` walks past before the key a line opens with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineMarkers {
+    /// `- ` only: the markers a compact mapping inside sequence items stands behind.
+    Dashes,
+    /// `- `, and the `? ` and `: ` of an explicit key (#6543).
+    Explicit,
+}
+
+/// The key a content line opens with, past its markers, and the last marker before it
 /// (`Parser::previous_line_key`, #6540, #6543).
 struct PreviousLineKey<'a> {
     column: usize,
     text: &'a [u8],
-    /// The column and byte (`-`, or with `explicit` also `?` and `:`) of the last marker.
-    last_marker: Option<(usize, u8)>,
+    /// The column of the last marker, and whether it is a dash.
+    last_marker: Option<(usize, bool)>,
 }
 
 /// A plain scalar the scanner just read: `start..end` in the input, and the indent of the
@@ -9829,28 +9838,28 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// key's column is the line's indent plus the `- ` markers it opens with, so the compact
     /// mapping of a sequence item (`- k:`) stands where its continuation lines do.
     fn previous_content_line_defers_a_value_at(&self, indent: usize) -> bool {
-        self.previous_line_key(false).is_some_and(|key| {
-            key.column == indent && line_ends_with_colon_after_properties(key.text)
-        })
+        self.previous_line_key(LineMarkers::Dashes)
+            .is_some_and(|key| {
+                key.column == indent && line_ends_with_colon_after_properties(key.text)
+            })
     }
 
-    /// The key the previous content line opens with, past the `- ` markers that precede it: its
+    /// The key the previous content line opens with, past the `markers` that precede it: its
     /// column (the line's indent plus the markers, as their spacing leaves it), the text from the
-    /// key on, and whether any marker was there (a sequence item, where yq's refusal reads `did
-    /// not find expected '-' indicator` and a mapping's reads `did not find expected key`). One
-    /// walk for [`Self::previous_content_line_defers_a_value_at`] and
-    /// [`Self::header_is_left_of_the_deferring_key`] (#6540), so the two cannot disagree on where
-    /// a key stands.
-    fn previous_line_key(&self, explicit: bool) -> Option<PreviousLineKey<'_>> {
+    /// key on, and the last marker (its column, and whether it is a dash). The walk is the one
+    /// definition of where a key stands for
+    /// [`Self::previous_content_line_defers_a_value_at`] (`LineMarkers::Dashes`: a `?` or `:` is
+    /// not walked past, as before) and [`Self::header_is_left_of_its_owner`]
+    /// (`LineMarkers::Explicit`, #6540, #6543).
+    fn previous_line_key(&self, markers: LineMarkers) -> Option<PreviousLineKey<'_>> {
         let (lead, rest) = self.previous_content_line()?;
         let mut marker_len = 0;
         let mut last_marker = None;
-        while rest
-            .get(marker_len)
-            .is_some_and(|&b| b == b'-' || (explicit && (b == b'?' || b == b':')))
-            && Self::is_ws_break_or_eoi(rest.get(marker_len + 1).copied())
+        while rest.get(marker_len).is_some_and(|&b| {
+            b == b'-' || (markers == LineMarkers::Explicit && (b == b'?' || b == b':'))
+        }) && Self::is_ws_break_or_eoi(rest.get(marker_len + 1).copied())
         {
-            last_marker = Some((lead + marker_len, rest[marker_len]));
+            last_marker = Some((lead + marker_len, rest[marker_len] == b'-'));
             marker_len += 1;
             while matches!(rest.get(marker_len), Some(b' ' | b'\t')) {
                 marker_len += 1;
@@ -9885,8 +9894,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// `  |`) or to its right is its value. The markers are `-`, and `?` and `:` of an explicit
     /// key. yq words the refusal by the last marker: `did not find expected '-' indicator` after
     /// a dash, `did not find expected key` in a mapping.
-    fn header_is_left_of_the_deferring_key(&self, indent: usize) -> Option<&'static str> {
-        let key = self.previous_line_key(true)?;
+    fn header_is_left_of_its_owner(&self, indent: usize) -> Option<&'static str> {
+        let key = self.previous_line_key(LineMarkers::Explicit)?;
         let owner = match key.last_marker {
             Some((column, _)) if only_node_properties(key.text) => column,
             _ if line_ends_with_colon_before_comment(key.text)
@@ -9897,7 +9906,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             _ => return None,
         };
         (indent < owner).then_some(match key.last_marker {
-            Some((_, b'-')) => "did not find expected '-' indicator",
+            Some((_, true)) => "did not find expected '-' indicator",
             _ => "did not find expected key",
         })
     }
@@ -10327,7 +10336,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             && !self.json_strict
             && self.type_stack.len() > 1
         {
-            if let Some(what) = self.header_is_left_of_the_deferring_key(indent) {
+            if let Some(what) = self.header_is_left_of_its_owner(indent) {
                 return Err(self.err_unexpected_char(self.pos, what));
             }
         }

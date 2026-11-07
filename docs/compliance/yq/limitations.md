@@ -7112,3 +7112,8 @@ These differ:
   yq says `bad expression - probably missing close bracket on (` or reports the lexer's message; both fail with exit 1.
 - **`is_key` is still not defined.**
   [#6081](https://github.com/rust-works/succinctly/issues/6081) stays open for it.
+- **The wording of the refusal of a block scalar header left of its owner can differ (#6543).**
+  yq words it by the container it stops in (`did not find expected '-' indicator`, or `did not find expected key`).
+  `succinctly yq` words it by the last marker of the line above: `'-' indicator` after a dash, `key` otherwise.
+  The two differ on 28 of the 96 explicit-key and dash-chain documents of #6543's grid (for example `? x` / `: - k:` / `|`).
+  Both fail with exit 1 and print nothing.

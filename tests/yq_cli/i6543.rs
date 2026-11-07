@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 
-use crate::run_yq_stdin;
+use crate::{run_yq_split, run_yq_stdin};
 
 const REFUSED: &[&str] = &[
     "- -\n|\n  t\n",
@@ -139,6 +139,28 @@ fn yq_keeps_a_header_at_or_right_of_its_owner_6543() -> Result<()> {
     ] {
         let (stdout, status) = run_yq_stdin(".", doc, &["-o=json", "-I0"])?;
         assert_eq!((stdout.trim_end(), status), (expected, 0), "{doc:?}");
+    }
+    Ok(())
+}
+
+/// Rows the generic stray-line refusal never took: the refusal comes from the owner check
+/// (`did not find expected ...`), not from the arms that read a line with no owner.
+#[test]
+fn yq_refuses_a_header_left_of_its_owner_by_the_owner_check_6543() -> Result<()> {
+    for doc in [
+        "- -\n|\n  t\n",
+        "- - -\n  |\n    t\n",
+        "- - &x\n|\n  t\n",
+        "- - # c\n|\n  t\n",
+        "? k:\n|\n  t\n",
+        "? x\n: - k:\n  |\n    t\n",
+    ] {
+        let (_stdout, stderr, status) = run_yq_split(".", doc, &["-o=json", "-I0"])?;
+        assert_eq!(status, 1, "{doc:?}");
+        assert!(
+            stderr.contains("did not find expected"),
+            "{doc:?}: {stderr}"
+        );
     }
     Ok(())
 }
