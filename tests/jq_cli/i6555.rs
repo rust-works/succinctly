@@ -42,7 +42,10 @@ fn a_clean_seq_stream_reports_an_unopened_file_when_a_read_reaches_it_6555() -> 
         (&["--seq", "-c", "[., input]"][..], &["bad", "gone", "gone2"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Could not open file @DIR@/gone2.json: No such file or directory\njq: error (at @DIR@/gone2.json:0): break\n", 2),
     ];
     for (flags, names, stdout, stderr, status) in rows {
-        let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}.json")).collect();
+        let files: Vec<String> = names
+            .iter()
+            .map(|name| format!("{d}/{name}.json"))
+            .collect();
         let mut args: Vec<&str> = flags.to_vec();
         args.extend(files.iter().map(String::as_str));
         let (out, err, code) = run_jq_full(&args, None)?;
