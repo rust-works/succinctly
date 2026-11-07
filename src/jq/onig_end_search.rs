@@ -361,9 +361,10 @@ fn zero_anchor(ways: &[Vec<Node>]) -> Option<u8> {
     Some(shared)
 }
 
-/// Whether a look-behind's body consumes a character. Every way has the same length in jq's
-/// syntax, so any way that consumes says it. A count of zero drops its item (`x?` is cut to
-/// `x{0}`, `tune_look_behind`).
+/// Whether a look-behind's body consumes a character on every way. A body that can match the
+/// empty string is no look-behind to Oniguruma: `tune_look_behind` writes it as an empty node
+/// (`ci.min == 0`), which always holds, or for `(?<!` never does, on either search (`(?<=b|)`,
+/// `(?<=b|c?)`). A count of zero drops its item (`x?` is cut to `x{0}`).
 fn consumes(ways: &[Vec<Node>]) -> bool {
     fn item(node: &Node) -> bool {
         match node {
@@ -378,7 +379,7 @@ fn consumes(ways: &[Vec<Node>]) -> bool {
             Node::Repeat { item: inner, min } => *min > 0 && item(inner),
         }
     }
-    ways.iter().any(|way| way.iter().any(item))
+    ways.iter().all(|way| way.iter().any(item))
 }
 
 /// Writes each look-behind that consumes, inside `ways`, as the end-anchored search reads it.
@@ -495,6 +496,12 @@ mod tests {
             r"(?<=\b)\z",
             r"(?<=b?)\z",
             r"(?<=b{0})\z",
+            // A way that matches nothing makes the look-behind an empty node (#6516 review).
+            r"(?<=b|)\z",
+            r"(?<=|b)\z",
+            r"(?<=b|c?)\z",
+            r"(?<=(?:b|))\z",
+            r"(?<!b?|c)\z",
             // What this reader does not follow.
             r"(?x)(?<=b)\z",
             r"(?:(?<=b)\z)+",

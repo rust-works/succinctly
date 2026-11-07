@@ -81,7 +81,8 @@ fn a_short_text_and_a_final_newline_read_as_written_6510() -> Result<()> {
 }
 
 /// Where Oniguruma's search is the usual one: something consumes, the right edge has no anchor
-/// every way shares, `$` is a line's end under `(?m)`, or the look-behind consumes nothing.
+/// every way shares, `$` is a line's end under `(?m)`, or the look-behind consumes nothing on
+/// some way.
 #[test]
 fn the_usual_search_is_left_alone_6510() -> Result<()> {
     check(&[
@@ -94,5 +95,14 @@ fn the_usual_search_is_left_alone_6510() -> Result<()> {
         (r"(?:(?<=b)\z|(?<=a)\Z)", "ab", r#"[[[2,[]]],true,"abX"]"#),
         (r"(?<=\b)\z", "ab", r#"[[[2,[]]],true,"abX"]"#),
         (r"(?<=b?)\z", "ab", r#"[[[2,[]]],true,"abX"]"#),
+        // A way that matches nothing makes the look-behind an empty node in Oniguruma.
+        (r"(?<=b|)\z", "ab", r#"[[[2,[]]],true,"abX"]"#),
+        (r"(?<=|b)\z", "ab", r#"[[[2,[]]],true,"abX"]"#),
+        (r"(?<=b|c?)\z", "ab", r#"[[[2,[]]],true,"abX"]"#),
+        (r"(?<=b|c*)\z", "ab", r#"[[[2,[]]],true,"abX"]"#),
+        (r"(?<=(?:b|))\z", "ab", r#"[[[2,[]]],true,"abX"]"#),
+        (r"(?<=(b)|)\z", "ab", r#"[[[2,[2]]],true,"abX"]"#),
+        (r"(?<!b|)\z", "ab", r#"[[],false,"ab"]"#),
+        (r"(?<!b?|c)\z", "ab", r#"[[],false,"ab"]"#),
     ])
 }

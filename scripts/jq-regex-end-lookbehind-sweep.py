@@ -22,7 +22,9 @@ import sys
 
 TEXTS = ["ab", "ab\n", "b", "bb", "a\nb", "a\n", "éb", "abb", "\n", ""]
 BODIES = ["b", "a", r"\w", ".", "[ab]", r"\n", "ab", "a?b", "b+", "(b)", r"\b", "b?",
-          "(?<=a)b", "b(?<=b)", "(?:a|b)", "^", r"\W"]
+          "(?<=a)b", "b(?<=b)", "(?:a|b)", "^", r"\W",
+          # A way that matches nothing (#6516 review).
+          "b|", "|b", "b|c?", "(?:b|)", "b?|c", "(b)|"]
 ANCHORS = [r"\z", "$", r"\Z", r"\b", "^", r"\B"]
 
 PROGRAM = (

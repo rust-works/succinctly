@@ -7771,8 +7771,9 @@ A look-behind that consumes a character therefore never holds there once two cha
 `onig_end_search` reads that condition off the pattern and answers such a search with the pattern as that search reads it: a consuming look-behind becomes a group that never matches, a negative one a group that always does, and the groups keep their numbers.
 The anchor at the right edge is Oniguruma's (`optimize_nodes`, `regcomp.c`): it carries across items that consume nothing and out of a group, an alternation keeps it only when every way has it, and a lookahead passes on none, so `(?<=b)(?=\z)`, `(?<=b)\z|x` and `(?<=b)(?:\z|\Z)` match `"ab"` at offset 2 in both.
 Still read as written: a pattern under the `x` flag or `(?x)`, one with a quantifier on an item that consumes nothing, and one holding `\K`, `\Q`, a call, a conditional or an absent group, none of which the reader follows; and a pattern the `fancy-regex` build of the rewrite refuses.
-Four draws of `scripts/jq-regex-end-lookbehind-sweep.py` (seeds 1-4, 1,258-1,326 patterns each over ten texts) against the branch's base fixed 113-139 patterns each and broke none.
-What still differs in those draws is jq's search one byte after an empty match before a multibyte character (#6326), and `$(?m)`, whose `$` this build no longer reads before a final newline (`"ab\n" | [match("$(?m)";"g") | .offset]` is `[2,3]` in jq and `[3]` here, as before this change).
+A look-behind whose body can match the empty string on some way (`(?<=b|)`, `(?<=b|c?)`) is an empty node to Oniguruma (`tune_look_behind`), which holds on either search, and is left as written.
+Five draws of `scripts/jq-regex-end-lookbehind-sweep.py` (seeds 1-5, 1,282-1,328 patterns each over ten texts, empty ways among the bodies) against the branch's base fixed 82-112 patterns each and broke none.
+What still differs in those draws is jq's search one byte after an empty match before a multibyte character (#6326), and `$(?m)`, whose `$` this build no longer reads before a final newline (`"ab\n" | [match("$(?m)";"g") | .offset]` is `[2,3]` in jq and `[3]` here, as before this change, #6517), and the groups of a look-behind that can match empty, which jq never sets (#6519).
 Pinned by `tests/jq_cli/i6510.rs`.
 
 ### A group repeated `{0}` keeps its capture entry (#6108)
