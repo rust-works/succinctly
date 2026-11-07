@@ -1838,9 +1838,17 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 indent,
                                 indent_spaces,
                                 unit,
+                                sort_keys,
                             )?
                         } else {
-                            write_yaml_block_field_key(out, field, indent, indent_spaces, unit)?
+                            write_yaml_block_field_key(
+                                out,
+                                field,
+                                indent,
+                                indent_spaces,
+                                unit,
+                                sort_keys,
+                            )?
                         };
                         out.write_char(':')?;
                         // Check if value needs newline
@@ -9428,7 +9436,80 @@ fn write_yaml_block_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
     indent: &str,
     indent_spaces: usize,
     unit: char,
+    sort_keys: bool,
 ) -> Result<bool, StreamFailure> {
+    // #6496: a key that is a collection (`? - p`, `? {a: 1}`) is written as the key node it is, after
+    // `? ` and with its lines one step in, as yq writes it. The text of such a key is empty, which
+    // `write_yaml_field_key` would write as `""`.
+    let own_key = field.key_cursor();
+    // A block collection is the key node itself; a flow collection stands inside a node of its own.
+    let key_content = if own_key.is_container() {
+        Some(own_key)
+    } else {
+        own_key.first_child().filter(YamlCursor::is_container)
+    };
+    if let Some(key_cursor) = key_content.filter(|key| !key.is_alias()) {
+        // The properties sit on the key's own node, or on the collection inside it (a flow key).
+        let anchor = own_key.anchor().or_else(|| key_cursor.anchor());
+        let tag = own_key
+            .explicit_tag_at(None)
+            .or_else(|| key_cursor.explicit_tag_at(None));
+        // The properties as written (`&a !!seq`), with a blank after them where more follows.
+        let mut properties = String::new();
+        if let Some(anchor) = anchor {
+            properties.push('&');
+            properties.push_str(anchor);
+        }
+        if let Some(tag) = tag {
+            if !properties.is_empty() {
+                properties.push(' ');
+            }
+            properties.push_str(tag);
+        }
+        // An empty `[]` or `{}` is a simple key, which yq writes without the `? `.
+        if key_cursor.first_child().is_none() {
+            if !properties.is_empty() {
+                out.write_str(&properties)?;
+                out.write_char(' ')?;
+            }
+            key_cursor.stream_yaml_value(out, indent, indent_spaces, unit, sort_keys, false)?;
+            return Ok(false);
+        }
+        // The `?` and the blanks that put a block key's first line at the column its other lines
+        // stand at (`?   - p` under `-I=4`, `? - p` inside a compact sequence entry); a flow key has
+        // one line, and one blank, as is a block key whose properties take the line.
+        let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
+        let flow = key_cursor.style() == "flow";
+        let blanks = if flow || !properties.is_empty() {
+            1
+        } else {
+            child_indent
+                .chars()
+                .count()
+                .saturating_sub(indent.chars().count() + 1)
+                .max(1)
+        };
+        out.write_char('?')?;
+        for _ in 0..blanks {
+            out.write_char(' ')?;
+        }
+        if !properties.is_empty() {
+            out.write_str(&properties)?;
+            if flow {
+                out.write_char(' ')?;
+            } else {
+                // Properties before a block collection stand on a line of their own, as in yq's
+                // output (`? &a` / `  - p`): on the `?` line the collection's `-` would read as
+                // part of them.
+                out.write_char('\n')?;
+                out.write_str(&child_indent)?;
+            }
+        }
+        key_cursor.stream_yaml_value(out, &child_indent, indent_spaces, unit, sort_keys, !flow)?;
+        out.write_char('\n')?;
+        out.write_str(indent)?;
+        return Ok(true);
+    }
     if field.key_cursor().index.canonicalize_numbers() {
         if let YamlValue::String(s @ YamlString::DoubleQuoted { .. }) = field.key() {
             if let Ok(decoded) = s.as_str() {
@@ -9473,6 +9554,7 @@ fn write_yaml_block_field_key_checked<W: AsRef<[u64]>, Out: core::fmt::Write>(
     indent: &str,
     indent_spaces: usize,
     unit: char,
+    sort_keys: bool,
 ) -> Result<bool, StreamFailure> {
     // An alias key is written as `*name` however long its target is (#5469).
     if !field.key_cursor().index.canonicalize_numbers() && !field.key_cursor().is_alias() {
@@ -9522,7 +9604,7 @@ fn write_yaml_block_field_key_checked<W: AsRef<[u64]>, Out: core::fmt::Write>(
             }
         }
     }
-    write_yaml_block_field_key(out, field, indent, indent_spaces, unit)
+    write_yaml_block_field_key(out, field, indent, indent_spaces, unit, sort_keys)
 }
 
 /// Write a child value that is always inline (flow-style mapping/sequence
@@ -13114,7 +13196,8 @@ mod tests {
             .root(yaml)
             .stream_yaml_document(&mut out, IndentSpec::spaces(2), true)
             .unwrap();
-        assert_eq!(out, "\"\":\n  y: 3\nk: hello");
+        // #6496: the key is written as the flow mapping it is, as yq writes it.
+        assert_eq!(out, "? {a: 1}\n: y: 3\nk: hello");
     }
 
     #[test]
@@ -13130,7 +13213,8 @@ mod tests {
             .root(yaml)
             .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
             .unwrap();
-        assert_eq!(out, "k: hello\n\"\":\n  y: 3");
+        // #6496: the key is written as the flow mapping it is, as yq writes it.
+        assert_eq!(out, "k: hello\n? {a: 1}\n: y: 3");
     }
 
     #[test]

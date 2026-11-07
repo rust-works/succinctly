@@ -6021,6 +6021,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
                 // Parse first sequence item inline
                 self.write_bp_open_seq_item(); // item node
+                                               // The item is a frame of its own, as `parse_sequence_item_inner` makes one, so that
+                                               // a container its value opens (`? - - p`, `? - a: 1`) is closed inside it by the
+                                               // dedent that ends the key, and not by the close of the item below (#6496).
+                let item_depth = self.indent_stack.len();
+                self.indent_stack.push(seq_indent + 1);
+                self.push_type(NodeType::SequenceItem);
                 self.advance(); // skip `-`
                 self.skip_inline_whitespace();
 
@@ -6057,7 +6063,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         self.parse_value(seq_indent)?;
                     }
                 }
-                self.write_bp_close(); // close item
+                // Nothing opened inside the item: close it now. A container it opened leaves the
+                // item's frame on the stack for the dedent to close, in order.
+                if self.indent_stack.len() == item_depth + 1 {
+                    self.indent_stack.pop();
+                    self.pop_type();
+                    self.write_bp_close(); // close item
+                }
             }
             // `? ? a`: the node after `? ` is a compact mapping whose first entry is an explicit
             // key of its own, so the outer key *is* that mapping (#6322; yq reads `? ? a\n: c` as
