@@ -4516,6 +4516,7 @@ fn stopped(on_error: Option<OnError>, sink: &ErrorSink) -> bool {
 
 /// The exit code of a run `halt`/`halt_error` ended: its own, unless an input file did not
 /// open, which makes it 2 as it does every other end of the run (`open_failed`, #5472).
+/// Also the code of a run a fault in the input ended (#6476): it is `code` unless a file did not open.
 fn halt_exit_code(code: i32, open_failed: bool) -> i32 {
     if open_failed {
         exit_codes::USAGE_ERROR

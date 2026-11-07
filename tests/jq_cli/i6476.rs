@@ -15,6 +15,12 @@ fn an_unopened_file_after_a_text_that_ends_inside_a_value_is_reported_first_6476
         ("t1.json", "[1,"),
         ("t4.json", "\"x\"\n[1,"),
         ("big.json", "1\n2\n"),
+        ("o1.json", "[1,2"),
+        ("o2.json", "nul"),
+        ("o3.json", "1 tru"),
+        ("o4.json", "\"abc"),
+        ("o5.json", "{\"a\":1"),
+        ("o6.json", "1.2.3"),
         ("nums.json", "1\n2\n3\n"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
@@ -38,6 +44,12 @@ fn an_unopened_file_after_a_text_that_ends_inside_a_value_is_reported_first_6476
         (&["-s", "-c", "."][..], &["t1", "adir"][..], "", "jq: parse error: Unfinished JSON term at EOF at line 1, column 3\n", 2),
         (&["-c", "."][..], &["t4", "adir", "gone"][..], "\"x\"\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Unfinished JSON term at EOF at line 2, column 3\n", 2),
         (&["-c", "."][..], &["t1", "gone", "adir"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Unfinished JSON term at EOF at line 1, column 3\n", 2),
+        (&["-c", "."][..], &["o1", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Unfinished JSON term at EOF at line 1, column 4\n", 2),
+        (&["-c", "."][..], &["o2", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Invalid literal at EOF at line 1, column 3\n", 2),
+        (&["-c", "."][..], &["o3", "gone"][..], "1\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Invalid literal at EOF at line 1, column 5\n", 2),
+        (&["-c", "."][..], &["o4", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Unfinished string at EOF at line 1, column 4\n", 2),
+        (&["-c", "."][..], &["o5", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Unfinished JSON term at EOF at line 1, column 6\n", 2),
+        (&["-c", "."][..], &["o6", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Invalid numeric literal at EOF at line 1, column 5\n", 2),
     ] {
         let files: Vec<String> = names.iter().map(|name| path(name)).collect();
         let mut args: Vec<&str> = flags.to_vec();
