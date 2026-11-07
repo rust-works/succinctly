@@ -27656,10 +27656,9 @@ fn ends_with_trailing_newline(input: &str) -> bool {
 /// on top of that (verified against jq-1.7.1: `(?m)b$` on `"a\nb\n\n"` is
 /// `true` via plain per-line anchoring, with no extra exception involved).
 /// A pattern that both enables and disables multiline in separate scopes,
-/// e.g. `(?m)a(?-m)b$`, is conservatively treated as "multiline active" for
-/// the whole pattern — full per-branch flag-scope tracking is out of scope.
-/// This is a documented simplification, not a correctness bug: at worst it
-/// skips the trailing-newline fix for that one (rare) pattern.
+/// e.g. `(?m)a(?-m)b$`, is treated as "multiline active" here; a `$` that
+/// `(?m)` does not reach is found by [`has_single_line_dollar`], and such a
+/// pattern takes the exact `fancy-regex` route instead (#6517).
 ///
 /// `(?<name>...)` / `(?P<name>...)` named-capture groups are *not* flag
 /// groups — `P`/`<` are not flag letters, so `(?` followed by either can
@@ -33637,9 +33636,18 @@ fn build_regex_uncached<S: EvalSemantics>(
     //
     // #6080: so is one whose `$` something follows, since that token can consume the `\n` the `$` stood
     // before (`"ab\n" | match("b$\\n")`).
+    //
+    // #6517: so is one where `(?m)` stands but does not reach every `$` (`$(?m)`, `(?m:a)$`): the
+    // check above is off for such a pattern, whose `$` outside `(?m)` still matches before a
+    // final newline.
+    let mixed_dollar = S::TAG != EvalTag::Yq
+        && pattern.contains('$')
+        && pattern_may_enable_multiline(&pattern)
+        && has_single_line_dollar(&pattern);
     if S::TAG != EvalTag::Yq
-        && needs_trailing_nl_check
-        && (pattern_has_escape_z(&pattern) || pattern_has_interior_dollar(&pattern))
+        && ((needs_trailing_nl_check
+            && (pattern_has_escape_z(&pattern) || pattern_has_interior_dollar(&pattern)))
+            || mixed_dollar)
     {
         // #6488: a loop whose groups the rewrites copy is written for this engine too; the plain
         // rewrite above leaves such a loop as written. The rewrites read `$` as the end of the text,
@@ -33651,8 +33659,11 @@ fn build_regex_uncached<S: EvalSemantics>(
         let flagged = |letters: &str| flags.is_some_and(|f| f.chars().any(|c| letters.contains(c)));
         let built = build_fancy_regex::<S>(&pattern)
             .or_else(|| as_written.as_deref().and_then(build_fancy_regex::<S>));
-        let rewritable =
-            !flagged("mp") && !pattern_may_match_newline(source) && !has_anchor_only_group(source);
+        // The rewrites read every `$` as the end of the text, which a `$` under `(?m)` is not.
+        let rewritable = !mixed_dollar
+            && !flagged("mp")
+            && !pattern_may_match_newline(source)
+            && !has_anchor_only_group(source);
         let engine = rewritable
             .then(|| rewritten_engine::<S>(&pattern, longest, suppress_empty, true))
             .flatten()
@@ -35531,7 +35542,22 @@ fn fancy_escape_is_oniguruma(e: char) -> bool {
 /// `(?flags)` and `(?flags:...)` set them.
 #[cfg(feature = "regex")]
 fn prepare_fancy_pattern(pattern: &str) -> Option<String> {
+    scan_fancy_pattern(pattern).map(|(written, _)| written)
+}
+
+/// Whether a `$` of `pattern` stands where multi-line mode is off, followed per group as
+/// [`prepare_fancy_pattern`] follows it (#6517): `$(?m)` has one, `(?m)$` none. `false` for a
+/// pattern the scan refuses.
+#[cfg(feature = "regex")]
+fn has_single_line_dollar(pattern: &str) -> bool {
+    scan_fancy_pattern(pattern).is_some_and(|(_, dollar)| dollar)
+}
+
+/// [`prepare_fancy_pattern`], and whether it wrote a `$` as the end of the text.
+#[cfg(feature = "regex")]
+fn scan_fancy_pattern(pattern: &str) -> Option<(String, bool)> {
     const END: &str = r"(?=\n?\z)";
+    let mut dollar = false;
     #[derive(Clone, Copy, Default)]
     struct Flags {
         multi_line: bool,
@@ -35628,6 +35654,7 @@ fn prepare_fancy_pattern(pattern: &str) -> Option<String> {
             }
             '$' if !flags.multi_line => {
                 out.push_str(END);
+                dollar = true;
                 i += 1;
                 continue;
             }
@@ -35706,7 +35733,7 @@ fn prepare_fancy_pattern(pattern: &str) -> Option<String> {
         out.push(c);
         i += 1;
     }
-    Some(out)
+    Some((out, dollar))
 }
 
 /// jq's regex builtins bottom out in `_match_impl`, a C function that reads its **input** before
@@ -139689,6 +139716,22 @@ mod tests {
     }
 
     #[cfg(feature = "regex")]
+    #[test]
+    fn has_single_line_dollar_follows_the_flags_per_group_6517() {
+        for (pattern, want) in [
+            ("$(?m)", true),
+            ("(?m:a)$", true),
+            ("(?m)a(?-m)b$", true),
+            ("a$", true),
+            ("(?m)a$", false),
+            ("(?m:a$)", false),
+            (r"\$(?m)", false),
+            ("[$](?m)", false),
+        ] {
+            assert_eq!(has_single_line_dollar(pattern), want, "{pattern}");
+        }
+    }
+
     #[test]
     fn test_pattern_may_enable_multiline() {
         assert!(!pattern_may_enable_multiline("a$"));
