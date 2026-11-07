@@ -745,7 +745,9 @@ struct Reader<'a> {
     /// reports "Invalid numeric literal", but the same `n` after an
     /// earlier `iu` token reports "Invalid literal" instead. Reproduced
     /// deliberately (ADR-0018 rule: bug-for-bug), and it is deterministic
-    /// for any given input even though jq is reading a stale byte.
+    /// for any given input even though jq is reading a stale byte. A string
+    /// leaves the text it decoded to there, not the text it held
+    /// ([`Reader::found_string`], #6513).
     token_buf: Vec<u8>,
     token_len: usize,
     next: Option<Kind>,
@@ -1407,11 +1409,17 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    /// jq's `found_string`: the escape-validation half, which is all that
-    /// can raise a diagnostic.
+    /// jq's `found_string`: the escape validation, which is all that can raise a diagnostic, and
+    /// the decode jq does *in place* over `tokenbuf` (#6513). The text a string decodes to is
+    /// written from index 0 and nothing clears what follows, so what `check_literal` reads at
+    /// index 1 afterwards is the second byte of the decoded text when it has two or more, and
+    /// the byte the string held when it has one: after `"a"` or the escape for `A` the buffer
+    /// reads `a` or `u`, after the escape for `U+00E9`, a lone surrogate or a pair it reads a
+    /// byte of the encoding. An error leaves the part decoded before it. See [`Reader::token_buf`].
     fn found_string(&mut self) -> Result<(), &'static str> {
         let buf = self.token_buf[..self.token_len].to_vec();
         let mut i = 0;
+        let mut out = 0;
         while i < buf.len() {
             let c = buf[i];
             i += 1;
@@ -1423,6 +1431,8 @@ impl<'a> Reader<'a> {
                         "Invalid string: control characters from U+0000 through U+001F must be escaped",
                     );
                 }
+                self.token_buf[out] = c;
+                out += 1;
                 continue;
             }
             // Unreachable: a trailing `\\` puts the scanner in
@@ -1434,12 +1444,22 @@ impl<'a> Reader<'a> {
             let escape = buf[i];
             i += 1;
             match escape {
-                b'\\' | b'"' | b'/' | b'b' | b'f' | b't' | b'n' | b'r' => {}
+                b'\\' | b'"' | b'/' | b'b' | b'f' | b't' | b'n' | b'r' => {
+                    self.token_buf[out] = match escape {
+                        b'b' => 0x08,
+                        b'f' => 0x0c,
+                        b't' => b'\t',
+                        b'n' => b'\n',
+                        b'r' => b'\r',
+                        other => other,
+                    };
+                    out += 1;
+                }
                 b'u' => {
                     if i + 4 > buf.len() {
                         return Err("Invalid \\uXXXX escape");
                     }
-                    let Some(codepoint) = unhex4(&buf[i..i + 4]) else {
+                    let Some(mut codepoint) = unhex4(&buf[i..i + 4]) else {
                         return Err("Invalid characters in \\uXXXX escape");
                     };
                     i += 4;
@@ -1448,11 +1468,15 @@ impl<'a> Reader<'a> {
                             return Err("Invalid \\uXXXX\\uXXXX surrogate pair escape");
                         }
                         match unhex4(&buf[i + 2..i + 6]) {
-                            Some(low) if (0xDC00..=0xDFFF).contains(&low) => {}
+                            Some(low) if (0xDC00..=0xDFFF).contains(&low) => {
+                                codepoint =
+                                    0x10000 + (((codepoint - 0xD800) << 10) | (low - 0xDC00));
+                            }
                             _ => return Err("Invalid \\uXXXX\\uXXXX surrogate pair escape"),
                         }
                         i += 6;
                     }
+                    out += encode_utf8_unchecked(codepoint, &mut self.token_buf[out..]);
                 }
                 _ => return Err("Invalid escape"),
             }
@@ -1510,6 +1534,31 @@ impl<'a> Reader<'a> {
             self.check_done();
             self.flush_completed();
         }
+    }
+}
+
+/// jq's `jvp_utf8_encode`: `codepoint` as UTF-8 at the start of `out`, returning the length. It
+/// takes a surrogate for a three-byte code point as any other (`U+DC00` is `ED B0 80`), which is
+/// what [`Reader::found_string`] leaves in the token buffer.
+fn encode_utf8_unchecked(codepoint: u32, out: &mut [u8]) -> usize {
+    if codepoint <= 0x7f {
+        out[0] = codepoint as u8;
+        1
+    } else if codepoint <= 0x7ff {
+        out[0] = 0xc0 | (codepoint >> 6) as u8;
+        out[1] = 0x80 | (codepoint & 0x3f) as u8;
+        2
+    } else if codepoint <= 0xffff {
+        out[0] = 0xe0 | (codepoint >> 12) as u8;
+        out[1] = 0x80 | ((codepoint >> 6) & 0x3f) as u8;
+        out[2] = 0x80 | (codepoint & 0x3f) as u8;
+        3
+    } else {
+        out[0] = 0xf0 | (codepoint >> 18) as u8;
+        out[1] = 0x80 | ((codepoint >> 12) & 0x3f) as u8;
+        out[2] = 0x80 | ((codepoint >> 6) & 0x3f) as u8;
+        out[3] = 0x80 | (codepoint & 0x3f) as u8;
+        4
     }
 }
 
@@ -2199,6 +2248,46 @@ mod tests {
                 "Invalid literal at EOF at line 1, column 5",
             ],
         );
+    }
+
+    /// #6513: jq decodes a string's escapes in place over its token buffer, so the byte the next
+    /// bare `n` finds at index 1 is the second byte of the decoded text when that has two or more,
+    /// and the one the string held there when it has one: a `u` (the escape for `A`) takes the
+    /// keyword path and says "Invalid literal", anything else the number path. Every row is jq
+    /// 1.7.1's wording for `\x1e"<string>"\n\x1en\n`.
+    #[test]
+    fn a_decoded_string_leaves_its_second_byte_at_index_one_6513() {
+        let bs = '\\';
+        let numeric = "Invalid numeric literal at line 3, column 0 (need RS to resync)";
+        let literal = "Invalid literal at line 3, column 0 (need RS to resync)";
+        for (string, expected) in [
+            ("a".to_string(), numeric),
+            (format!("{bs}n"), numeric),
+            // One byte decoded: the `u` of the escape is still at index 1.
+            (format!("{bs}u0041"), literal),
+            (format!("{bs}u0000"), literal),
+            // Two or more: index 1 is a byte of the decoded text.
+            (format!("x{bs}u0075"), literal),
+            (format!("{bs}u0041a"), numeric),
+            (format!("{bs}u0041{bs}u0042"), numeric),
+            (format!("{bs}u00e9"), numeric),
+            (format!("{bs}u0800"), numeric),
+            (format!("{bs}uffff"), numeric),
+            (format!("{bs}udc00"), numeric),
+            (format!("{bs}udc00x"), numeric),
+            (format!("{bs}ud83d{bs}ude00"), numeric),
+            // An error leaves what was decoded before it.
+            (format!("{bs}u00e9{bs}ud800"), numeric),
+            (format!("{bs}u0041{bs}ud800"), literal),
+        ] {
+            let input = format!("\x1e\"{string}\"\n\x1en\n").into_bytes();
+            let got = warnings(&[&input]);
+            assert_eq!(
+                got.last().map(String::as_str),
+                Some(expected),
+                "{string}: {got:?}"
+            );
+        }
     }
 
     /// A completed top-level value is handed off and cleared, so trailing
