@@ -11109,7 +11109,7 @@ fn single_builtin_stage(expr: &Expr) -> Option<&Builtin> {
 
 /// An `Int`, or a `Float` that is neither a NaN nor an infinity: the numbers
 /// [`eval_owned_number_fold`] folds (#6527).
-fn is_plain_finite_number(value: &OwnedValue) -> bool {
+pub(crate) fn is_plain_finite_number(value: &OwnedValue) -> bool {
     match value {
         OwnedValue::Int(_) => true,
         OwnedValue::Float(f) => f.is_finite(),
@@ -11120,7 +11120,7 @@ fn is_plain_finite_number(value: &OwnedValue) -> bool {
 /// The body of `map(body)` when `expr` is that one stage, however it is wrapped: in parentheses,
 /// or as the only non-identity stage of a pipe (`. | map(.a)`), as the other front doors read it
 /// (`test_single_stage_front_doors_agree_with_the_wrapped_pipe_3673`).
-fn map_projection_body(expr: &Expr) -> Option<&Expr> {
+pub(crate) fn map_projection_body(expr: &Expr) -> Option<&Expr> {
     match unwrap_paren(expr) {
         Expr::Pipe(stages) => match skip_identity_stages(stages) {
             [only] => map_projection_body(only),
@@ -12271,6 +12271,13 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
             Demand::Stop => Flow::Stopped { pending: None },
         });
     }
+    // #6539: `map(body)` of an owned array of computed numbers, answered number by number.
+    if let Some(mapped) = super::eval_generic::eval_owned_number_map::<S>(expr, input) {
+        return Some(match sink(mapped) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        });
+    }
     // #5816: a string-to-string stage (`ltrimstr("x")`, `tostring`, `. + "x"`) of an owned string.
     if let Some(answer) = eval_owned_string_stage::<S>(expr, input) {
         return Some(match sink(answer) {
@@ -13314,7 +13321,9 @@ fn projection_peel<S: EvalSemantics>(
         .or_else(|| eval_owned_string_stage::<S>(first, input))
         .or_else(|| eval_owned_map_projection::<S>(first, input))
         // #6527: or `add`, `min` or `max` of an array of computed numbers.
-        .or_else(|| eval_owned_number_fold::<S>(first, input));
+        .or_else(|| eval_owned_number_fold::<S>(first, input))
+        // #6539: or `map(body)` of one, which steps to the array of the answers.
+        .or_else(|| super::eval_generic::eval_owned_number_map::<S>(first, input));
     if counted.is_none() && !is_peelable_head::<S>(first) {
         return None;
     }
@@ -150193,6 +150202,226 @@ mod tests {
             }
         }
         assert!(taken > 10_000, "the matrix must reach the door: {taken}");
+    }
+
+    /// #6539: [`super::eval_generic::eval_owned_number_map`] answers what the reindex bridge answers
+    /// for `map(body)` of every array of one or two plain numbers (integers, including past 2^53 and
+    /// `i64::MAX`, floats, `-0`, floats at both ends of the range), for each body it answers, spelled
+    /// every way its stage may be wrapped. A body it declines is checked to be one the bridge keeps.
+    #[test]
+    fn owned_number_map_agrees_with_the_reindex_bridge_6539() {
+        let pool = [
+            OwnedValue::Int(0),
+            OwnedValue::Int(1),
+            OwnedValue::Int(-3),
+            OwnedValue::Int(7),
+            OwnedValue::Int(9007199254740993),
+            OwnedValue::Int(i64::MAX),
+            OwnedValue::Float(1.0),
+            OwnedValue::Float(1.5),
+            OwnedValue::Float(-0.0),
+            OwnedValue::Float(0.1),
+            OwnedValue::Float(1e308),
+            OwnedValue::Float(-1e308),
+            OwnedValue::Float(5e-324),
+        ];
+        let mut arrays = Vec::new();
+        for a in &pool {
+            arrays.push(vec![a.clone()]);
+            for b in &pool {
+                arrays.push(vec![a.clone(), b.clone()]);
+            }
+        }
+        // Bodies the door must answer for a plain number whose answer is plain.
+        let bodies = [
+            ". + 1",
+            ". * 2",
+            ". - 0.5",
+            ". / 3",
+            ". % 3",
+            ". > 1",
+            ". == 1",
+            "tostring",
+            "[.]",
+            "[. + 1]",
+            "{a: .}",
+            ". as $x | $x * 2",
+            "(. + 1)",
+            ". + 1.5",
+            "floor",
+            "sqrt",
+            "fabs",
+            "ceil",
+            "round",
+            "trunc",
+            "log",
+            "exp",
+            "pow(.; 2)",
+            "atan2(.; 1)",
+        ];
+        let mut taken = 0;
+        let mut declined_by_answer = 0;
+        for body in bodies {
+            for wrap in ["map({})", "(map({}))", ". | map({})", "(. | (map({})))"] {
+                let src = wrap.replace("{}", body);
+                let expr = parse(&src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+                for items in &arrays {
+                    let value = OwnedValue::array_from(items.clone());
+                    let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                        &expr, &value, false,
+                    ));
+                    match crate::jq::eval_generic::eval_owned_number_map::<JqSemantics>(
+                        &expr, &value,
+                    ) {
+                        Some(mapped) => {
+                            taken += 1;
+                            let door = (vec![mapped], "ok".to_string());
+                            assert_eq!(
+                                select_door_observable(&door),
+                                select_door_observable(&bridge),
+                                "{src:?} on {value:?} disagrees with the reindex bridge"
+                            );
+                        }
+                        // An element whose answer is not plain (an overflow to an infinity, a
+                        // NaN, an error) is the bridge's.
+                        None => declined_by_answer += 1,
+                    }
+                    assert!(
+                        crate::jq::eval_generic::eval_owned_number_map::<YqSemantics>(
+                            &expr, &value
+                        )
+                        .is_none(),
+                        "yq mode keeps its own `{src}`"
+                    );
+                }
+            }
+        }
+        assert!(taken > 5_000, "the matrix must reach the door: {taken}");
+        assert!(declined_by_answer > 0, "some answers must decline");
+        // Chained: the first door's answer is the second one's input, as in `map(a) | map(b)`, and
+        // the pair is the bridge's answer for the whole pipe (an integer-valued float, a number past
+        // 2^53, an overflow that makes the first stage decline).
+        let chain = [
+            ". * 1.5", ". + 1", ". * 2", ". - 3", ". / 7", "floor", ". % 5",
+        ];
+        let mut chained = 0;
+        for first in chain {
+            for second in chain {
+                let one = parse(&format!("map({first})")).unwrap();
+                let two = parse(&format!("map({second})")).unwrap();
+                let pipe = parse(&format!("map({first}) | map({second})")).unwrap();
+                for items in &arrays {
+                    let value = OwnedValue::array_from(items.clone());
+                    let Some(mid) =
+                        crate::jq::eval_generic::eval_owned_number_map::<JqSemantics>(&one, &value)
+                    else {
+                        continue;
+                    };
+                    let Some(end) =
+                        crate::jq::eval_generic::eval_owned_number_map::<JqSemantics>(&two, &mid)
+                    else {
+                        continue;
+                    };
+                    chained += 1;
+                    let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                        &pipe, &value, false,
+                    ));
+                    assert_eq!(
+                        select_door_observable(&(vec![end], "ok".to_string())),
+                        select_door_observable(&bridge),
+                        "{first:?} then {second:?} on {value:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            chained > 1_000,
+            "the chain must reach both doors: {chained}"
+        );
+        // A body that answers for an ordinary number does answer for it.
+        let numbers = OwnedValue::array_from(vec![
+            OwnedValue::Int(1),
+            OwnedValue::Float(2.5),
+            OwnedValue::Int(4),
+        ]);
+        for body in bodies {
+            let expr = parse(&format!("map({body})")).unwrap();
+            assert!(
+                crate::jq::eval_generic::eval_owned_number_map::<JqSemantics>(&expr, &numbers)
+                    .is_some(),
+                "map({body}) declined an ordinary array"
+            );
+        }
+    }
+
+    /// #6539: the door declines what it cannot answer identically, so the bridge keeps its
+    /// diagnostics and its rules: an empty array, an element that is not a plain number (a number
+    /// literal, a NaN, an infinity, a string, `null`, a container), an object or a scalar input, a
+    /// body that raises for an element or that is not one answer per number, and an answer that is
+    /// not plain.
+    #[test]
+    fn owned_number_map_declines_what_it_cannot_answer_identically_6539() {
+        let array = |items: Vec<OwnedValue>| OwnedValue::array_from(items);
+        let run = |src: &str, input: &OwnedValue| {
+            crate::jq::eval_generic::eval_owned_number_map::<JqSemantics>(
+                &parse(src).unwrap(),
+                input,
+            )
+        };
+        assert!(run("map(. + 1)", &array(vec![])).is_none());
+        for odd in [
+            OwnedValue::from_number_literal::<JqSemantics>("1.50"),
+            OwnedValue::Float(f64::NAN),
+            OwnedValue::Float(f64::INFINITY),
+            OwnedValue::Float(f64::NEG_INFINITY),
+            OwnedValue::String("s".into()),
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            array(vec![OwnedValue::Int(1)]),
+        ] {
+            assert!(run("map(. + 1)", &array(vec![OwnedValue::Int(1), odd.clone()])).is_none());
+            assert!(run("map(. + 1)", &array(vec![odd.clone()])).is_none());
+        }
+        let numbers = array(vec![OwnedValue::Int(1), OwnedValue::Float(2.5)]);
+        let object = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        assert!(run("map(. + 1)", &object).is_none());
+        assert!(run("map(. + 1)", &OwnedValue::Int(1)).is_none());
+        for src in [
+            "map(. % 0)",
+            "map(. / 0)",
+            "map(. + \"a\")",
+            "map(. - null)",
+            "map(.a)",
+            "map(.[0])",
+            "map(.[])",
+            "map(empty)",
+            "map(select(. > 1))",
+            "map(., .)",
+            "map([., 1])",
+            "map(range(.))",
+            "map(length)",
+            "map(tojson)",
+            "map(. + 1 | floor)",
+            "map(error(\"x\"))",
+            "map(. * 1e308 * 10)",
+            "map(sqrt - 5 | sqrt)",
+            "map(1.50)",
+            "map(nan)",
+            "map(infinite)",
+            ". + 1",
+            "add",
+            "map",
+            "map(. + 1), 1",
+        ] {
+            if let Ok(expr) = parse(src) {
+                assert!(
+                    crate::jq::eval_generic::eval_owned_number_map::<JqSemantics>(&expr, &numbers)
+                        .is_none(),
+                    "{src:?} was answered"
+                );
+            }
+        }
+        assert!(run("map(. + 1)", &numbers).is_some());
     }
 
     /// #6527: the fold declines what it cannot answer identically, so the bridge keeps its
