@@ -3926,6 +3926,9 @@ Its datetime operators read that text with Go's `time.Parse` under the current l
 - `+` and `-` add a duration to a timestamp (`.t += "3h10m"`, `.t -= "24h"`), keeping its zone, and raise Go's error for a duration that does not parse (`unable to parse duration [bogus]: time: invalid duration "bogus"`, with `-bogus` for `-`).
   Before #5863, `.t += "3h10m"` concatenated the text and exited 0.
   Any other string on the left of `-` is `strings cannot be subtracted`, or `!!seq () cannot be subtracted from !!str` against a container, in yq's words.
+- `*`, `/` and `%` refuse a timestamp on either side ([#5930](https://github.com/rust-works/succinctly/issues/5930)): `.t * 2` is `cannot multiply !!timestamp with !!int`, `.t / 2` is `!!timestamp cannot be divided by !!int`, `2 % .t` is `!!int cannot modulo by !!timestamp`, naming the other operand's tag, as yq does.
+  A timestamp times `null` is the timestamp.
+  Before #5930, `.t * 2` repeated the text and exited 0.
 - `format_datetime(f)` writes the time with Go's layout `f` and reads the result back as a YAML snippet, as yq does: `format_datetime("2006")` is the number `2026`, and `format_datetime("[2006]")` a sequence.
 - `tz(zone)` moves a timestamp to the zone `time.LoadLocation` loads: `UTC` or the empty name, `Local`, or an IANA name.
 - `now` and `from_unix` are RFC 3339 text in the local zone, with no fraction, and `to_unix` reads under the layout.
@@ -3959,7 +3962,12 @@ Every row of the issue is pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, 
 - `with_dtf` in path position (`with_dtf(error("boom"); .a) |= 1`) reports a layout argument's error without yq's `could not get date time format: ` prefix.
 - A `format_datetime` result that YAML reads back as empty (`""`, `" "`, `"#x"`, `".999"` on a time with no nanoseconds) prints `null` here where yq prints an empty scalar, and `format_datetime("[2006]")` prints block style here where yq keeps flow style.
 - `.t + "1h" | tag` is `!!str` here and `!!timestamp` in yq, the same split as the tags above.
-- `"x" | from_unix` says `math function requires number` here where yq says `from_unix only works on numbers, found !!str instead`.
+- `from_unix` on a non-number names its tag in yq's words since #5930: `from_unix only works on numbers, found !!str instead` (`!!bool`, `!!seq`, `!!map`, `!!null`, and `!!timestamp` for a string that reads as one).
+  In jq mode it keeps `math function requires number`.
+- The `/` and `%` refusals of #5930 write a container or `null` operand differently: yq puts each operand's key in parentheses after its tag when the left operand is a container or `null`, or the right one is a container (`!!timestamp (t) cannot be divided by !!map (m)`), and a value here carries no key, so both are `()`.
+  The `*` refusal has no parentheses in yq and none here.
+  Only the message differs; the error and the exit status are the same.
+- A quoted date times a number (`"2026-01-01T00:00:00Z" * 2`) is yq's string repetition and raises here, since the text stands in for the tag, as above.
 - `tz("Europe")` and `tz("zone.tab")` (a directory and a file that is not a zone) raise a different message here (`is a directory`, `malformed time zone information`) from yq's.
 - Go matches a zone abbreviation read by a layout's `MST` against every zone the local zone has ever used; here only the zones in effect at the date and half a year either side are asked, which covers standard and daylight time.
 - `with_dtf("2006")` and `format_datetime` with no argument are parse errors in succinctly's wording, not yq's (`must provide a date time format string and an expression, ...`, `'format_datetime' expects 1 arg but received none`).

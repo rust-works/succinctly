@@ -16426,7 +16426,9 @@ fn yq_timestamp_arith<S: EvalSemantics>(
     let subtract = match op {
         ArithOp::Add => false,
         ArithOp::Sub => true,
-        _ => return None,
+        ArithOp::Mul(_) | ArithOp::Div | ArithOp::Mod => {
+            return yq_timestamp_refusal(op, left, right)
+        }
     };
     let OwnedValue::String(left) = left else {
         return None;
@@ -16458,6 +16460,65 @@ fn yq_timestamp_arith<S: EvalSemantics>(
         None if subtract => Some(Err(EvalError::new("strings cannot be subtracted"))),
         None => None,
     }
+}
+
+/// Whether `value` is a string that reads as yq's `!!timestamp` (see `super::yq_datetime`).
+fn yq_is_timestamp(value: &OwnedValue) -> bool {
+    matches!(value, OwnedValue::String(text) if super::yq_datetime::is_timestamp(text))
+}
+
+/// The tag yq names an operand of an arithmetic error by: `!!timestamp` for a string that reads as
+/// one (#5930), as for `+` and `-`.
+fn yq_operand_tag(value: &OwnedValue) -> &'static str {
+    match value {
+        OwnedValue::Null => "!!null",
+        OwnedValue::Bool(_) => "!!bool",
+        OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => "!!int",
+        OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => "!!float",
+        OwnedValue::String(_) if yq_is_timestamp(value) => "!!timestamp",
+        OwnedValue::String(_) => "!!str",
+        OwnedValue::Array(_) => "!!seq",
+        OwnedValue::Object(_) => "!!map",
+    }
+}
+
+/// yq's refusal of a timestamp on either side of `*`, `/` or `%` (#5930): `cannot multiply
+/// !!timestamp with !!int`, `!!timestamp cannot be divided by !!int`, `!!int cannot modulo by
+/// !!timestamp`. `None` when neither operand is one. A timestamp times `null` is the timestamp,
+/// as in yq.
+///
+/// When the left operand is a container or `null`, or the right one is a container, yq writes
+/// each operand's key in parentheses after its tag (`!!timestamp (t) cannot be divided by !!map
+/// ()`); the evaluator does not know the keys, so both are `()` here, as in the `-` message above.
+fn yq_timestamp_refusal(
+    op: ArithOp,
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> Option<Result<OwnedValue, EvalError>> {
+    let (left_timestamp, right_timestamp) = (yq_is_timestamp(left), yq_is_timestamp(right));
+    if !left_timestamp && !right_timestamp {
+        return None;
+    }
+    if matches!(op, ArithOp::Mul(_)) && left_timestamp && right.is_null() {
+        return Some(Ok(left.clone()));
+    }
+    let (left_tag, right_tag) = (yq_operand_tag(left), yq_operand_tag(right));
+    let message = match op {
+        ArithOp::Mul(_) => format!("cannot multiply {left_tag} with {right_tag}"),
+        _ => {
+            let container =
+                |value: &OwnedValue| matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
+            let keyed = left.is_null() || container(left) || container(right);
+            let (left_key, right_key) = if keyed { (" ()", " ()") } else { ("", "") };
+            let verb = if matches!(op, ArithOp::Div) {
+                "cannot be divided by"
+            } else {
+                "cannot modulo by"
+            };
+            format!("{left_tag}{left_key} {verb} {right_tag}{right_key}")
+        }
+    };
+    Some(Err(EvalError::new(message)))
 }
 
 /// [`arith_combine`] for operands that carry no hex or octal spelling.
@@ -105214,7 +105275,24 @@ fn builtin_from_unix<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     let timestamp = match get_float_value_with::<W, S>(&value, optional, || {
-        EvalError::new("math function requires number")
+        // yq's `from_unix` names the input's tag (#5930); a string that reads as a timestamp is one.
+        if S::TAG == EvalTag::Yq {
+            let tag = match &value {
+                StandardJson::String(text)
+                    if text
+                        .as_str()
+                        .is_ok_and(|text| super::yq_datetime::is_timestamp(&text)) =>
+                {
+                    "!!timestamp"
+                }
+                other => yaml_type_tag(other),
+            };
+            EvalError::new(format!(
+                "from_unix only works on numbers, found {tag} instead"
+            ))
+        } else {
+            EvalError::new("math function requires number")
+        }
     }) {
         Ok(f) => f,
         Err(r) => return r,
