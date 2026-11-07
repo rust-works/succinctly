@@ -3058,8 +3058,22 @@ impl Rewriter<'_> {
                 .and_then(|length| length.checked_mul(count as usize))
                 .is_some_and(|total| total <= ONIG_EXPAND_LIMIT)
         };
+        // #6518: a bounded `{0,n}?` or `{1,n}?` with a way that consumes after the first exit, as
+        // [`Self::anchored_repeat`] writes one: the crate goes from an exit's iteration into that way
+        // with the exit's group kept, where Oniguruma tried the repeat's exit first.
+        let short = min < 2
+            && self.lazy_bounded
+            && self.copies
+            && has_capture(ast)
+            && matches!(max, Some(n) if n > 1)
+            && list
+                .iter()
+                .skip_while(|way| matches!(way, ListedWay::Consume(_)))
+                .any(|way| matches!(way, ListedWay::Consume(_)));
         let keeps = match (greedy, max) {
-            (false, _) => min < 2 || (max.is_none() && self.oniguruma_unrolls(ast, min)),
+            (false, _) => {
+                !(min >= 2 || short) || (max.is_none() && self.oniguruma_unrolls(ast, min))
+            }
             (true, Some(n)) => n <= 1 || copied(ops.map(|ops| ops + 1), n),
             (true, None) => false,
         };
@@ -3252,7 +3266,15 @@ impl Rewriter<'_> {
                     };
                     rest = group(head(kinds, &rest, false)?)?;
                 }
-                rest
+                // #6518: with no minimum no copy takes an exit, so a group only an exit has is
+                // written where it never matches, to keep it in the pattern as unset.
+                if min == 0 && self.copies && self.exit_group_left_out(&exit, &rest) {
+                    let held =
+                        self.text(format!("{}|{NEVER}(?:{})", rest.text, exit.text), Prec::Alt)?;
+                    group(held)?
+                } else {
+                    rest
+                }
             }
         };
         group(text)
@@ -3719,11 +3741,14 @@ mod tests {
     /// one that is written out takes them.
     #[test]
     fn a_loop_with_groups_inside_a_lazy_repeat_keeps_its_text_with_the_repeat_6427() {
-        for quantifier in ["*?", "+?", "{1,2}?"] {
+        for quantifier in ["*?", "+?"] {
             let pattern = format!("(?:^b*|(?:(a*)|b)+(?:(a)|b?){{0,2}}){quantifier}$");
             let written = rewrite_with_groups(&pattern).map(|g| g.pattern);
             assert_eq!(written, None, "{pattern}");
         }
+        // A bounded `{1,2}?` is written out since #6518 (several exits, a way that consumes after them),
+        // and takes its loops with it.
+        assert!(rewrite_with_groups("(?:^b*|(?:(a*)|b)+(?:(a)|b?){0,2}){1,2}?$").is_some());
         for pattern in [
             "(?:x*|(?:b*|(a))+(?:(b)*|a)+)+?b",
             "(?:b*|(?:b*|(a))+(?:(b)*|a)+)*?b",
@@ -4676,5 +4701,25 @@ mod tests {
         assert_eq!(copied(r"(?:b|(\b)){0,3}?\z"), None);
         assert_eq!(copied(r"(?:(\b)|b)*?\z"), None);
         assert_eq!(copied(r"(?:(\b)|b)??\z"), None);
+    }
+    /// #6518: a bounded lazy repeat of a body with several exits and a way that consumes after the first is
+    /// written for its copies; the group only an exit has stays in the pattern, where it never matches.
+    #[test]
+    fn a_lazy_short_repeat_over_several_exits_is_written_for_its_copies_6518() {
+        let copied = |pattern: &str| rewrite_with_groups(pattern).map(|g| g.pattern);
+        let written = copied(r"((\b)|(\w*)){0,4}?$").expect("written");
+        assert!(written.contains(r"(\b)"), "{written}");
+        assert!(copied(r"(?:(\b)|a*|(?:(a)|b)){1,2}?$").is_some());
+        // Unbounded, and a single count, keep their text.
+        assert_eq!(copied(r"((\b)|(\w*))*?$"), None);
+        assert_eq!(copied(r"((\b)|(\w*)){0,1}?$"), None);
+    }
+    /// #6518: with no group in the repeat the several-exit form keeps its text, as it did.
+    #[test]
+    fn a_groupless_lazy_short_repeat_over_several_exits_keeps_its_text_6518() {
+        assert_eq!(
+            rewrite_with_groups(r"(x)?(?:\b|a*|b){1,3}?c").map(|g| g.pattern),
+            None
+        );
     }
 }
