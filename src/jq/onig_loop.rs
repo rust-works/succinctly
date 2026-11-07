@@ -2048,8 +2048,10 @@ impl Rewriter<'_> {
                     Ways::Consuming,
                 ) => Ways::Consuming,
                 // #6358: an anchor beside what may match nothing is the same anchor's way: `\bb*`
-                // is `\bb+ | \b`, and `a*\z` is `a+\z | \z`. With a group already gone past, the
-                // ways would have to set it after the anchor, so they are not listed.
+                // is `\bb+ | \b`, and `a*\z` is `a+\z | \z`. Two anchors in a row are listed only
+                // with no group gone past, which the way after them would have to set (#6473); an
+                // anchor and an item after it are written from the text of the items before the
+                // way, group included (#6506).
                 (
                     Ways::Anchored {
                         before: None,
@@ -2097,10 +2099,17 @@ impl Rewriter<'_> {
                         before: a2,
                         after: b2,
                     },
-                ) if gone.is_none() && !anchor.last => {
+                ) if !anchor.last => {
+                    // #6506: the text of the items before the way, not of the anchor in them: a
+                    // group around the anchor (`(\z)(\w*)`) is set by the way that consumes, too,
+                    // and by `E` at the exit, as for the other order (#6492).
+                    let prefix = {
+                        let texts: Vec<&Text> = items[..=at].iter().map(|p| &p.text).collect();
+                        self.concat_text(&texts)?
+                    };
                     let then = |way: &Option<Text>| {
                         way.as_ref()
-                            .map(|way| self.concat_text(&[&anchor.text, way]))
+                            .map(|way| self.concat_text(&[&prefix, way]))
                             .transpose()
                     };
                     Ways::Anchored {
@@ -4541,5 +4550,24 @@ mod tests {
         // Past the size limit the repeat stays as written.
         let long = alloc::format!(r"(?:\b|{}|\B|b){{2,9}}", "a".repeat(400));
         assert!(rewrite(&long).map_or(true, |text| text.contains(&long)));
+    }
+
+    /// #6506: a capture group around an anchor, before an item that can match nothing, is a way that
+    /// is listed like the other order (#6492): the group is written in the copy that consumes.
+    #[test]
+    fn a_captured_anchor_before_a_nullable_item_is_listed_6506() {
+        let written = |pattern: &str| rewrite_with_groups(pattern).map(|r| r.pattern);
+        for (pattern, consuming) in [
+            (r"(?:(a)|(\z)b*)+", r"(\z)b+"),
+            (r"(?:(a)|(\b)b*){2}", r"(\b)b+"),
+            (r"(?:(a)|(\A)(\w*)){2}", r"(\A)(\w+)"),
+            (r"(?:(a)|(\z)(\w*))*", r"(\z)(\w+)"),
+        ] {
+            let text = written(pattern).unwrap_or_else(|| panic!("{pattern} is written"));
+            // The consuming copy of the way holds the anchor's group, with the item after it.
+            assert!(text.contains(consuming), "{pattern}: {text}");
+        }
+        // A plain anchor is the same way as before.
+        assert!(written(r"(?:(a)|\zb*)+").is_some());
     }
 }
