@@ -6836,7 +6836,10 @@ fn read_inputs(
         // which sends jq's reader on to the next one.
         // #6480: past the last file that opened, the read of a last value that completes only at
         // the end is placed at the missing file, so it reports what it reached itself.
-        let last_value_at_tail = LAST_VALUE_AT_TAIL.with(std::cell::Cell::get);
+        // #6555: `--seq`'s readers place what they yield past the last file that opened at a last
+        // file that did not, themselves.
+        let last_value_at_tail = LAST_VALUE_AT_TAIL.with(std::cell::Cell::get)
+            || (args.seq && !args.raw_input && args.input_dsv.is_none());
         let ends_cleanly = failures.iter().all(|&(at, _)| {
             // The last file with bytes before it: an empty one between sends the reader on too.
             (last_value_at_tail && at >= raws.len())
@@ -6850,11 +6853,7 @@ fn read_inputs(
         // #6525: so does a program that reads `input` without `-n`, whose main loop reads the first
         // file before the program does and stops one value past a failure. Every route that reads
         // `input` seeds the queue the hook reports from.
-        if (args.null_input || track_eof)
-            && !args.slurp
-            && !args.seq
-            && args.input_dsv.is_none()
-            && ends_cleanly
+        if (args.null_input || track_eof) && !args.slurp && args.input_dsv.is_none() && ends_cleanly
         {
             let fault_ends_text = matches!(first_stream_fault(&raws), Some((_, true)));
             defer_open_failures(failures, fault_ends_text);
@@ -6982,6 +6981,13 @@ fn read_inputs(
     // future change to it can't desynchronize them (CLAUDE.md: "Duplicated
     // predicates diverge silently").
     let seq_stream_shape = args.seq && !args.raw_input && args.input_dsv.is_none();
+    // #6555: a last file that did not open is one more source to jq's `--seq` readers, an empty one
+    // they stand at, line 0: the stream's last refill is that file's, not the last opened file's,
+    // so a record the end-of-stream drop (#2998) would take is kept, and what is read at the end of
+    // the text, the fault at its end included (#6531), is placed at that file.
+    if seq_stream_shape && !args.slurp && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some()) {
+        raw_bytes.push((Some(files.len()), Vec::new()));
+    }
     let seq_warnings_apply = seq_stream_shape && !args.null_input && !seq_by_stream_reader;
     if seq_by_stream_reader {
         // The streaming reader finds the records and their faults itself.
@@ -6993,6 +6999,9 @@ fn read_inputs(
         seq_slurp_position_lost = match seq_no_rs_byte_warning(&raw_bytes) {
             Some(warning) => {
                 seq_warned = true;
+                // #6555: a stream with no record separator holds no value, so jq's reader reads
+                // past every file before it warns at the end: each deferred failure comes first.
+                report_reached_open_failures(None, false);
                 eprintln!("{warning}");
                 // #1525's arm prints its own template instead of the
                 // reader's, but the location still needs the walk. A
@@ -7496,17 +7505,6 @@ fn read_inputs(
     // filter's own `input`. jq has lost its position by then -- the call
     // that raises it closed the stream -- so it names `<unknown>`.
     let mut resumed_errors: Vec<(usize, TrailingParseError)> = seq_fault_errors;
-    // #6531: `--seq`'s reader raises its own faults, and the last one, at the end of the text, is
-    // raised at a last file that did not open, line 0, as the JSON reader's is (#6480).
-    if !args.slurp && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some()) {
-        if let Some((_, fault)) = resumed_errors
-            .last_mut()
-            .filter(|(_, fault)| fault.error.message.contains(" at EOF"))
-        {
-            fault.source = u32::try_from(files.len()).unwrap_or(u32::MAX);
-            fault.line = 0;
-        }
-    }
     // #6019: whether `-n -s` read a stream with a fault the resuming way (below).
     let mut resume_slurp_done = false;
     let mut trailing_error: Option<TrailingParseError> =
