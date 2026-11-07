@@ -5800,7 +5800,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // and reports its parse error after it instead (#2961).
             Ok(Err(e)) => {
                 // Nothing is read after this, so what it left pending is said now.
-                report_reached_open_failures(None);
+                report_reached_open_failures(None, false);
                 let malformed = e.downcast::<MalformedJsonError>()?;
                 let err = malformed.to_eval_error();
                 // The files that opened: `source` indexes them (#5472).
@@ -5825,7 +5825,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             }
             // Validation error. The run reads no further, so what it left pending is said now.
             Err(exit_code) => {
-                report_reached_open_failures(None);
+                report_reached_open_failures(None, false);
                 return Ok(exit_code);
             }
         };
@@ -6477,7 +6477,7 @@ fn get_inputs(
     LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
     LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
     LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
-    defer_open_failures(Vec::new());
+    defer_open_failures(Vec::new(), false);
     LAZY_OPEN_FAILED.with(|seen| seen.set(false));
     // Null input mode: use null as the single input -- unless the filter
     // itself uses `input`/`inputs`/`input_line_number` (#723), in which case
@@ -6615,7 +6615,8 @@ fn get_inputs(
                 .map_or(true, |raw| source_ends_cleanly(raw, args))
         });
         if args.null_input && !args.slurp && !args.seq && args.input_dsv.is_none() && ends_cleanly {
-            defer_open_failures(failures);
+            let fault_ends_text = matches!(first_stream_fault(&raws), Some((_, true)));
+            defer_open_failures(failures, fault_ends_text);
         } else {
             report_open_failures(open_failures_reached(&failures, &raws, args), open_failed);
         }
@@ -8585,11 +8586,17 @@ thread_local! {
         const { RefCell::new(std::collections::VecDeque::new()) };
     /// Whether a pending failure was reported by a read, which makes the run exit 2 (#6475).
     static LAZY_OPEN_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the first fault of the text is at its end (#6480): the read of that fault sent
+    /// jq's reader past the last file, so it reaches every pending failure.
+    static FAULT_ENDS_TEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Leaves `failures` for the reads of the `input` queue to report as they reach them (#6475).
-fn defer_open_failures(failures: Vec<(usize, InputFileOpenError)>) {
+/// `fault_ends_text` says the text the files make first faults at its end, which a read reaches
+/// only by asking past the last file (#6480).
+fn defer_open_failures(failures: Vec<(usize, InputFileOpenError)>, fault_ends_text: bool) {
     PENDING_OPEN_FAILURES.with(|pending| *pending.borrow_mut() = failures.into());
+    FAULT_ENDS_TEXT.with(|ends| ends.set(fault_ends_text));
 }
 
 /// The open failures jq's reader reaches before its parser stops (#6485): it opens the files in
@@ -8613,16 +8620,7 @@ fn open_failures_reached<'a>(
     {
         return failures;
     }
-    // jq skips the byte-order mark at the front of its input: of the first file with bytes.
-    let first = raws.iter().position(|raw| !raw.is_empty());
-    let chunks = raws.iter().enumerate().map(|(at, raw)| {
-        if Some(at) == first {
-            &raw[crate::front_matter::leading_bom_len(raw)..]
-        } else {
-            raw.as_slice()
-        }
-    });
-    match jq::jq_stream_fault_chunk(chunks) {
+    match first_stream_fault(raws) {
         Some((file, false)) => {
             let reached = failures.iter().take_while(|&&(at, _)| at <= file).count();
             &failures[..reached]
@@ -8631,9 +8629,28 @@ fn open_failures_reached<'a>(
     }
 }
 
+/// The file jq's parser is reading when it meets the first fault of the text the files `raws`
+/// make, and whether that fault is at the end of the text, or `None` when it reads every value
+/// ([`jq::jq_stream_fault_chunk`]). jq skips the byte-order mark at the front of its input: of the
+/// first file with bytes.
+fn first_stream_fault(raws: &[Vec<u8>]) -> Option<(usize, bool)> {
+    let first = raws.iter().position(|raw| !raw.is_empty());
+    let chunks = raws.iter().enumerate().map(|(at, raw)| {
+        if Some(at) == first {
+            &raw[crate::front_matter::leading_bom_len(raw)..]
+        } else {
+            raw.as_slice()
+        }
+    });
+    jq::jq_stream_fault_chunk(chunks)
+}
+
 /// Reports the pending open failures a read has reached (#6475): the ones before the source it
-/// read, or every one when it found the stream at its end (`None`).
-fn report_reached_open_failures(read: Option<u32>) {
+/// read, or every one when it found the stream at its end (`None`). A read of a `fault` at the end
+/// of the text found the end too (#6480): `[1,` waits for more, so jq's reader asks the next file
+/// before it raises `Unfinished JSON term at EOF`.
+fn report_reached_open_failures(read: Option<u32>, fault: bool) {
+    let read = read.filter(|_| !(fault && FAULT_ENDS_TEXT.with(std::cell::Cell::get)));
     loop {
         let next = PENDING_OPEN_FAILURES.with(|pending| {
             let mut pending = pending.borrow_mut();
