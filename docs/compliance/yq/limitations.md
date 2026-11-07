@@ -3133,6 +3133,8 @@ keys that share one fallback spelling (the guard still refuses those).
 An empty `[]` or `{}` key is written `[]: v`, a simple key.
 A collection key under a compact sequence entry with `-I=3` or a larger step pads the value's `:` line by the indent step (`:   - v`), as it already did for a scalar key.
 A value's comment on the `:` line of a collection key moves to the end of its text in yq (`: x # c`) and is dropped here.
+A comment on the `?` line above a block collection key (`? # c` / `  - p`) is written at the end of the key's first line in yq (`? - p # c`) and is dropped here.
+A flow mapping that holds a collection key (`{[a]: v}`) still writes `{"": v}` where yq writes `{? [a] : v}`: the flow writer has no explicit-key form for it.
 The routes that build an owned value still write the key as `""`, since the key is a string by then ([#6547](https://github.com/rust-works/succinctly/issues/6547)): `-P`, `keys`, `to_entries`, `sort_keys(.)`, `. as $x | $x`, `[.]` and a write.
 
 **A top-level comma of navigation reads such a document the way `.` does (#5283, answering #2645).**

@@ -3,7 +3,7 @@
 //! printed as `"": v`, the text of the key (empty), though the index held it whole. Compact collections inside the
 //! key lost every item after the first of the one they opened (`? - - p` / `    - q` printed `? - - p`), which was
 //! the parser closing the key's first item behind a container it had opened. An empty `[]` or `{}` key is a
-//! simple key, `[]: v`. Every output was captured from yq v4.53.3.
+//! simple key, `[]: v`. An anchor or tag on the key goes after `? ` (on a line of its own before a block collection). Every output was captured from yq v4.53.3.
 
 use anyhow::Result;
 
@@ -131,6 +131,56 @@ fn a_collection_key_is_written_as_the_key_node_6496() -> Result<()> {
             "- k: 1\n  ? - p\n    - q\n  : v\n",
             &["-I=4"],
             "- k: 1\n  ? - p\n    - q\n  : v\n",
+        ),
+        ("? &a [p, q]\n: v\n", &[], "? &a [p, q]\n: v\n"),
+        ("? &a [p, q]\n: v\n", &["-I=4"], "? &a [p, q]\n: v\n"),
+        ("? !!seq [p]\n: v\n", &[], "? !!seq [p]\n: v\n"),
+        ("? !!seq [p]\n: v\n", &["-I=4"], "? !!seq [p]\n: v\n"),
+        ("? &a []\n: v\n", &[], "&a []: v\n"),
+        ("? &a []\n: v\n", &["-I=4"], "&a []: v\n"),
+        ("? &a {}\n: v\n", &[], "&a {}: v\n"),
+        ("? &a {}\n: v\n", &["-I=4"], "&a {}: v\n"),
+        ("? &a\n  - p\n: v\n", &[], "? &a\n  - p\n: v\n"),
+        ("? &a\n  - p\n: v\n", &["-I=4"], "? &a\n    - p\n: v\n"),
+        ("? !!seq\n  - p\n: v\n", &[], "? !!seq\n  - p\n: v\n"),
+        (
+            "? !!seq\n  - p\n: v\n",
+            &["-I=4"],
+            "? !!seq\n    - p\n: v\n",
+        ),
+        (
+            "? &a !!seq\n  - p\n  - q\n: v\n",
+            &[],
+            "? &a !!seq\n  - p\n  - q\n: v\n",
+        ),
+        (
+            "? &a !!seq\n  - p\n  - q\n: v\n",
+            &["-I=4"],
+            "? &a !!seq\n    - p\n    - q\n: v\n",
+        ),
+        ("? &a\n  b: 1\n: v\n", &[], "? &a\n  b: 1\n: v\n"),
+        ("? &a\n  b: 1\n: v\n", &["-I=4"], "? &a\n    b: 1\n: v\n"),
+        (
+            "x:\n  ? &a\n    - p\n  : v\n",
+            &[],
+            "x:\n  ? &a\n    - p\n  : v\n",
+        ),
+        (
+            "x:\n  ? &a\n    - p\n  : v\n",
+            &["-I=4"],
+            "x:\n    ? &a\n        - p\n    : v\n",
+        ),
+        ("- ? &a\n    - p\n  : v\n", &[], "- ? &a\n    - p\n  : v\n"),
+        (
+            "- ? &a\n    - p\n  : v\n",
+            &["-I=4"],
+            "- ? &a\n    - p\n  : v\n",
+        ),
+        ("? &a [p]\n: v\nz: *a\n", &[], "? &a [p]\n: v\nz: *a\n"),
+        (
+            "? &a [p]\n: v\nz: *a\n",
+            &["-I=4"],
+            "? &a [p]\n: v\nz: *a\n",
         ),
     ];
     for &(input, args, expected) in cases {
