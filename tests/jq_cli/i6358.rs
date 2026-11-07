@@ -350,6 +350,242 @@ fn a_lazy_bounded_repeat_over_a_flag_switch_body_answers_as_jq_does_6358() -> Re
     Ok(())
 }
 
+/// #6358: a lazy `{0,n}?` or `{1,n}?` over a body whose empty way is only an anchor, with a way that consumes
+/// after it. Oniguruma tries the repeat's exit before an iteration, so the anchor's iteration (which sets its
+/// group) only ends the loop; the crate went on from it into the consuming way, with the group kept. Every row
+/// was captured from jq 1.7.1 (`jq -nc`).
+#[test]
+fn a_lazy_short_repeat_over_an_anchored_body_answers_as_jq_does_6358() -> Result<()> {
+    for (pattern, rows) in [
+        (
+            r"(?:(\b)|b){0,3}?\z",
+            &[
+                ("a b", r#"[[2,"b",[null]],[3,"",[""]]]"#),
+                ("ba", r#"[[2,"",[""]]]"#),
+                ("bab", r#"[[2,"b",[null]],[3,"",[""]]]"#),
+                ("abab", r#"[[3,"b",[null]],[4,"",[""]]]"#),
+                ("aab", r#"[[2,"b",[null]],[3,"",[""]]]"#),
+                ("abba", r#"[[4,"",[""]]]"#),
+                ("baab", r#"[[3,"b",[null]],[4,"",[""]]]"#),
+                ("b a", r#"[[3,"",[""]]]"#),
+                ("ab ", r#"[[3,"",[""]]]"#),
+                ("ba b", r#"[[3,"b",[null]],[4,"",[""]]]"#),
+            ][..],
+        ),
+        (
+            r"(?:(\b)|b){1,3}?\z",
+            &[
+                ("a b", r#"[[2,"b",[null]],[3,"",[""]]]"#),
+                ("ba", r#"[[2,"",[""]]]"#),
+                ("bab", r#"[[2,"b",[null]],[3,"",[""]]]"#),
+                ("abab", r#"[[3,"b",[null]],[4,"",[""]]]"#),
+                ("aab", r#"[[2,"b",[null]],[3,"",[""]]]"#),
+                ("abba", r#"[[4,"",[""]]]"#),
+                ("baab", r#"[[3,"b",[null]],[4,"",[""]]]"#),
+                ("b a", r#"[[3,"",[""]]]"#),
+                ("ab ", "[]"),
+                ("ba b", r#"[[3,"b",[null]],[4,"",[""]]]"#),
+            ][..],
+        ),
+        (
+            r"(\b|a|(\w*)(a)){1,2}?$",
+            &[
+                ("a b", r#"[[3,"",["","",""]]]"#),
+                ("ba", r#"[[0,"ba",["ba","b","a"]],[2,"",["","",""]]]"#),
+                ("bab", r#"[[3,"",["","",""]]]"#),
+                ("abab", r#"[[4,"",["","",""]]]"#),
+                ("aab", r#"[[3,"",["","",""]]]"#),
+                ("abba", r#"[[0,"abba",["bba","bb","a"]],[4,"",["","",""]]]"#),
+                ("baab", r#"[[4,"",["","",""]]]"#),
+                ("b a", r#"[[2,"a",["a",null,null]],[3,"",["","",""]]]"#),
+                ("ab ", "[]"),
+                ("ba b", r#"[[4,"",["","",""]]]"#),
+            ][..],
+        ),
+        (
+            r"(?:(\b)(a)?|\b(\w*)){1,3}?$",
+            &[
+                ("a b", r#"[[2,"b",[null,null,"b"]],[3,"",["","",""]]]"#),
+                ("ba", r#"[[0,"ba",[null,null,"ba"]],[2,"",["","",""]]]"#),
+                ("bab", r#"[[0,"bab",[null,null,"bab"]],[3,"",["","",""]]]"#),
+                (
+                    "abab",
+                    r#"[[0,"abab",[null,null,"abab"]],[4,"",["","",""]]]"#,
+                ),
+                ("aab", r#"[[0,"aab",[null,null,"aab"]],[3,"",["","",""]]]"#),
+                (
+                    "abba",
+                    r#"[[0,"abba",[null,null,"abba"]],[4,"",["","",""]]]"#,
+                ),
+                (
+                    "baab",
+                    r#"[[0,"baab",[null,null,"baab"]],[4,"",["","",""]]]"#,
+                ),
+                ("b a", r#"[[2,"a",["","a",null]],[3,"",["","",""]]]"#),
+                ("ab ", "[]"),
+                ("ba b", r#"[[3,"b",[null,null,"b"]],[4,"",["","",""]]]"#),
+            ][..],
+        ),
+        (
+            r"(?:()(\b)|(b|)*\w){0,3}?b",
+            &[
+                ("a b", r#"[[2,"b",[null,null,null]]]"#),
+                ("ba", r#"[[0,"b",[null,null,null]]]"#),
+                (
+                    "bab",
+                    r#"[[0,"b",[null,null,null]],[1,"ab",[null,null,""]]]"#,
+                ),
+                (
+                    "abab",
+                    r#"[[0,"ab",[null,null,""]],[2,"ab",[null,null,""]]]"#,
+                ),
+                ("aab", r#"[[0,"aab",[null,null,""]]]"#),
+                (
+                    "abba",
+                    r#"[[0,"ab",[null,null,""]],[2,"b",[null,null,null]]]"#,
+                ),
+                (
+                    "baab",
+                    r#"[[0,"b",[null,null,null]],[1,"aab",[null,null,""]]]"#,
+                ),
+                ("b a", r#"[[0,"b",[null,null,null]]]"#),
+                ("ab ", r#"[[0,"ab",[null,null,""]]]"#),
+                (
+                    "ba b",
+                    r#"[[0,"b",[null,null,null]],[3,"b",[null,null,null]]]"#,
+                ),
+            ][..],
+        ),
+        (
+            r"(?:a|\A(.*?)|\w){0,3}?$",
+            &[
+                ("a b", r#"[[0,"a b",["a "]],[3,"",[""]]]"#),
+                ("ba", r#"[[0,"ba",["b"]],[2,"",[""]]]"#),
+                ("bab", r#"[[0,"bab",["b"]],[3,"",[""]]]"#),
+                ("abab", r#"[[0,"abab",["ab"]],[4,"",[""]]]"#),
+                ("aab", r#"[[0,"aab",[null]],[3,"",[""]]]"#),
+                ("abba", r#"[[0,"abba",["ab"]],[4,"",[""]]]"#),
+                ("baab", r#"[[0,"baab",["ba"]],[4,"",[""]]]"#),
+                ("b a", r#"[[0,"b a",["b "]],[3,"",[""]]]"#),
+                ("ab ", r#"[[0,"ab ",["ab "]],[3,"",[""]]]"#),
+                ("ba b", r#"[[0,"ba b",["ba "]],[4,"",[""]]]"#),
+            ][..],
+        ),
+        (
+            r"(\b|(?:a|(b))+?){1,2}?$",
+            &[
+                ("a b", r#"[[2,"b",["b","b"]],[3,"",["",""]]]"#),
+                ("ba", r#"[[0,"ba",["a","b"]],[2,"",["",""]]]"#),
+                ("bab", r#"[[0,"bab",["ab","b"]],[3,"",["",""]]]"#),
+                ("abab", r#"[[0,"abab",["bab","b"]],[4,"",["",""]]]"#),
+                ("aab", r#"[[0,"aab",["ab","b"]],[3,"",["",""]]]"#),
+                ("abba", r#"[[0,"abba",["bba","b"]],[4,"",["",""]]]"#),
+                ("baab", r#"[[0,"baab",["aab","b"]],[4,"",["",""]]]"#),
+                ("b a", r#"[[2,"a",["a",null]],[3,"",["",""]]]"#),
+                ("ab ", "[]"),
+                ("ba b", r#"[[3,"b",["b","b"]],[4,"",["",""]]]"#),
+            ][..],
+        ),
+    ] {
+        for &(input, expected) in rows {
+            assert_matches(pattern, input, expected)?;
+        }
+    }
+    Ok(())
+}
+
+/// The same patterns through `test`, `scan`, `sub` and `gsub`, which read no capture back (#6358).
+#[test]
+fn a_lazy_short_repeat_over_an_anchored_body_answers_without_captures_as_jq_does_6358() -> Result<()>
+{
+    for (pattern, rows) in [
+        (
+            r"(?:(\b)|b){0,2}?\z",
+            &[
+                ("a b", r#"[true,2,"a X","a XX"]"#),
+                ("ba", r#"[true,1,"baX","baX"]"#),
+                ("bab", r#"[true,2,"baX","baXX"]"#),
+                ("b a", r#"[true,1,"b aX","b aX"]"#),
+                ("ab ", r#"[true,1,"ab X","ab X"]"#),
+            ][..],
+        ),
+        (
+            r"(?:(\b)|b){1,2}?\z",
+            &[
+                ("a b", r#"[true,2,"a X","a XX"]"#),
+                ("ba", r#"[true,1,"baX","baX"]"#),
+                ("bab", r#"[true,2,"baX","baXX"]"#),
+                ("b a", r#"[true,1,"b aX","b aX"]"#),
+                ("ab ", r#"[false,0,"ab ","ab "]"#),
+            ][..],
+        ),
+        (
+            r"(?:(\b)|b){0,3}?\z",
+            &[
+                ("a b", r#"[true,2,"a X","a XX"]"#),
+                ("ba", r#"[true,1,"baX","baX"]"#),
+                ("bab", r#"[true,2,"baX","baXX"]"#),
+                ("b a", r#"[true,1,"b aX","b aX"]"#),
+                ("ab ", r#"[true,1,"ab X","ab X"]"#),
+            ][..],
+        ),
+    ] {
+        for &(input, expected) in rows {
+            let (stdout, _, status) = run_jq_full(
+                &[
+                    "-nc",
+                    "--arg",
+                    "s",
+                    input,
+                    "--arg",
+                    "p",
+                    pattern,
+                    r#"[$s | test($p), ([$s | scan($p)] | length), sub($p; "X"), gsub($p; "X")]"#,
+                ],
+                None,
+            )?;
+            assert_eq!(
+                (stdout.trim_end(), status),
+                (expected, 0),
+                "{pattern} on {input:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The smallest bounded counts, `{0,2}?` and `{1,2}?` (#6358).
+#[test]
+fn a_lazy_two_count_repeat_over_an_anchored_body_answers_as_jq_does_6358() -> Result<()> {
+    for (pattern, rows) in [
+        (
+            r"(?:(\b)|b){0,2}?\z",
+            &[
+                ("a b", r#"[[2,"b",[null]],[3,"",[""]]]"#),
+                ("ba", r#"[[2,"",[""]]]"#),
+                ("bab", r#"[[2,"b",[null]],[3,"",[""]]]"#),
+                ("b a", r#"[[3,"",[""]]]"#),
+                ("ab ", r#"[[3,"",[""]]]"#),
+            ][..],
+        ),
+        (
+            r"(?:(\b)|b){1,2}?\z",
+            &[
+                ("a b", r#"[[2,"b",[null]],[3,"",[""]]]"#),
+                ("ba", r#"[[2,"",[""]]]"#),
+                ("bab", r#"[[2,"b",[null]],[3,"",[""]]]"#),
+                ("b a", r#"[[3,"",[""]]]"#),
+                ("ab ", "[]"),
+            ][..],
+        ),
+    ] {
+        for &(input, expected) in rows {
+            assert_matches(pattern, input, expected)?;
+        }
+    }
+    Ok(())
+}
+
 fn assert_matches(pattern: &str, input: &str, expected: &str) -> Result<()> {
     let (stdout, _, status) = run_jq_full(
         &[
