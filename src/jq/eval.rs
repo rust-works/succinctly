@@ -144939,6 +144939,58 @@ mod tests {
         );
     }
 
+    /// #6574: a closed `if` is one value, the chosen branch's; the branch the condition does not
+    /// choose is never read, and a condition or chosen branch that cannot be answered declines.
+    #[test]
+    #[cfg(feature = "std")]
+    fn closed_if_answers_the_chosen_branch_only_6574() {
+        let closed = |src: &str| closed_expr_to_owned::<JqSemantics>(&parse(src).unwrap());
+        assert_eq!(
+            closed("if 4 % 2 == 0 then 1 else 0 end"),
+            Some(OwnedValue::Int(1))
+        );
+        assert_eq!(
+            closed("if 3 % 2 == 0 then 1 else 0 end"),
+            Some(OwnedValue::Int(0))
+        );
+        assert_eq!(
+            closed("if 1 > 5 then 1 elif 1 > 2 then 2 else [3] end"),
+            Some(OwnedValue::array_from(vec![OwnedValue::Int(3)]))
+        );
+        assert_eq!(
+            closed("if null then 1 else {a: 2} end"),
+            Some(OwnedValue::object_from([(
+                "a".to_string(),
+                OwnedValue::Int(2)
+            )]))
+        );
+        // A branch not chosen is never read, so a raise there is not run; the shape gate, which
+        // wants every part closed, still sends the whole step to the evaluator's own route.
+        let unchosen_raise = parse("if true then 1 else error(\"x\") end").unwrap();
+        assert_eq!(
+            closed_expr_to_owned::<JqSemantics>(&unchosen_raise),
+            Some(OwnedValue::Int(1))
+        );
+        assert!(!closed_expr_shape(&unchosen_raise));
+        assert!(closed_expr_shape(
+            &parse("if 1 > 2 then 1 elif 3 > 2 then 2 else 3 end").unwrap()
+        ));
+        // The chosen branch or the condition raises, is empty, or reads the state.
+        assert_eq!(closed("if false then 1 else 1 / 0 end"), None);
+        assert_eq!(closed("if empty then 1 else 2 end"), None);
+        assert_eq!(closed("if . then 1 else 2 end"), None);
+        assert_eq!(closed("if true then . else 2 end"), None);
+        assert_eq!(closed("if false then 1 end"), None);
+        // `if C then A end` has `.` for its else; chosen, `A` is closed, but the shape gate declines.
+        assert_eq!(closed("if true then 1 end"), Some(OwnedValue::Int(1)));
+        assert!(!closed_expr_shape(&parse("if true then 1 end").unwrap()));
+        // yq's `if` is its own, so the arm answers in jq mode only.
+        assert_eq!(
+            closed_expr_to_owned::<YqSemantics>(&parse("if true then 1 else 2 end").unwrap()),
+            None
+        );
+    }
+
     #[test]
     fn test_2152_closed_expr_to_owned_falls_back_on_non_literal_leaf() {
         // A shape this function doesn't recognize (a field access mixed
