@@ -28,9 +28,10 @@
 //! an anchor holds (`\b`, `\bb?`) has a conditional exit, on both sides of the ways after it, which is
 //! written from what the anchor is ([`Rewriter::anchored_repeat`], #6358). A second such way, or an
 //! empty way, is another exit: with no way after it, or the same anchor again, it is written too
-//! ([`Rewriter::second_exit`], #6424). A body whose ways are not
-//! listed here keeps its loop as written too: one with a way after that second exit, an
-//! assertion that is not an anchor, or a flag switch that names `x` or `U`. An assertion beside an item that consumes text
+//! ([`Rewriter::second_exit`], #6424). Any other list of such exits, with ways after the second, is
+//! written way by way, each kind of head behind the anchors that hold there
+//! ([`Rewriter::exits_repeat`], #6473). A body whose ways are not listed here keeps its loop as
+//! written too: an assertion that is not an anchor, or a flag switch that names `x` or `U`. An assertion beside an item that consumes text
 //! does not matter: a way that must consume text always does, and the assertion only decides whether
 //! it matches, so `\Ba` and `a\z` are consuming ways and are copied with the rest (#6300). Any other
 //! flag switch reaches the rest of its group, so under a greedy loop it is written as a flag group
@@ -99,6 +100,11 @@ enum Ways {
         anchor: Box<Anchor>,
         after: Option<Text>,
     },
+    /// Two or more exits that [`Rewriter::alt`] cannot read as one anchor's, or a run of anchors
+    /// [`Rewriter::both_anchors`] does not reduce, with the ways around them in the order they are
+    /// tried (#6473). Read as [`Ways::Opaque`] anywhere but directly under a repeat
+    /// ([`Rewriter::exits_repeat`]).
+    Exits(Vec<Way>),
     /// Not listed, but its text holds only zero-width assertions and what consumes text around
     /// them: it may be copied, and a consuming item beside it makes the whole consume (`\Ba` and
     /// `a\z` are consuming ways, #6300), but whether it matches nothing depends on where it stands.
@@ -106,6 +112,161 @@ enum Ways {
     /// Not listed: a capture group whose empty way comes first or that holds a way that is not
     /// listed (#6310), a flag switch, or something holding one.
     Unknown,
+}
+
+/// One way of a body with several exits ([`Ways::Exits`], #6473).
+#[derive(Clone)]
+enum Way {
+    /// A way that consumes text.
+    Consume(Text),
+    /// A way that matches nothing, where `Cond` holds.
+    Exit(Cond),
+}
+
+/// Where an exit holds: every anchor of its way does (#6473). The default holds everywhere.
+#[derive(Clone, Copy, Default)]
+struct Cond {
+    /// `\A`, or `^` outside multi-line mode.
+    start: bool,
+    /// `\z`, or `$` outside multi-line mode.
+    end: bool,
+    /// `\b` (`Some(true)`) or `\B` (`Some(false)`).
+    word: Option<bool>,
+    /// Both `\b` and `\B`: it holds nowhere.
+    never: bool,
+    /// `$`, which jq also holds before a newline that ends the text, where a way may consume it.
+    dollar: bool,
+}
+
+impl Cond {
+    /// The condition of a run of anchors, `None` for text that is anything else. `^` and `$` only
+    /// stand in an anchor's text outside multi-line mode ([`Rewriter::assertion`]).
+    fn of(text: &str) -> Option<Self> {
+        let mut cond = Self::default();
+        let mut rest = text;
+        while !rest.is_empty() {
+            let (anchor, tail) = match rest.as_bytes() {
+                [b'\\', b'b', ..] => (Self::word(true), &rest[2..]),
+                [b'\\', b'B', ..] => (Self::word(false), &rest[2..]),
+                [b'\\', b'A', ..] => (Self::at(true, false), &rest[2..]),
+                [b'\\', b'z', ..] => (Self::at(false, true), &rest[2..]),
+                [b'^', ..] => (Self::at(true, false), &rest[1..]),
+                [b'$', ..] => (
+                    Self {
+                        dollar: true,
+                        ..Self::at(false, true)
+                    },
+                    &rest[1..],
+                ),
+                _ => return None,
+            };
+            cond = cond.and(anchor);
+            rest = tail;
+        }
+        Some(cond)
+    }
+
+    fn word(word: bool) -> Self {
+        Self {
+            word: Some(word),
+            ..Self::default()
+        }
+    }
+
+    fn at(start: bool, end: bool) -> Self {
+        Self {
+            start,
+            end,
+            ..Self::default()
+        }
+    }
+
+    /// Both conditions at once.
+    fn and(self, other: Self) -> Self {
+        let never = self.never
+            || other.never
+            || matches!((self.word, other.word), (Some(a), Some(b)) if a != b);
+        Self {
+            start: self.start || other.start,
+            end: self.end || other.end,
+            word: self.word.or(other.word),
+            never,
+            dollar: self.dollar || other.dollar,
+        }
+    }
+
+    /// Whether the exit holds at a head of kind `head`, which is never where the text ends.
+    fn holds(self, head: Head) -> bool {
+        !self.never
+            && !self.end
+            && (head.start || !self.start)
+            && self.word.map_or(true, |w| head.word == Some(w))
+    }
+}
+
+/// Whether `text` may match a newline, read conservatively (#6473): `true` unless every item is a
+/// letter, a digit, an anchor, `\w`, `\d`, a group or repeat around those, or a class that does not
+/// open with `^` and holds only those, a word property (the shadow's `\w`) and code points that are
+/// not a newline.
+fn may_take_newline(text: &str) -> bool {
+    const WORD_PROPERTIES: [&str; 8] = ["Alphabetic", "M", "Nd", "Pc", "L", "Lu", "Ll", "N"];
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        let after = &rest[c.len_utf8()..];
+        rest = match c {
+            '\\' => {
+                let Some(e) = after.chars().next() else {
+                    return true;
+                };
+                let tail = &after[e.len_utf8()..];
+                match e {
+                    'w' | 'd' | 'b' | 'B' | 'A' | 'z' => tail,
+                    'p' => match tail.strip_prefix('{').and_then(|t| t.split_once('}')) {
+                        Some((name, tail)) if WORD_PROPERTIES.contains(&name) => tail,
+                        _ => return true,
+                    },
+                    'x' => match tail.strip_prefix('{').and_then(|t| t.split_once('}')) {
+                        Some((hex, tail)) => match u32::from_str_radix(hex, 16) {
+                            Ok(code) if code != 0x0A => tail,
+                            _ => return true,
+                        },
+                        None => return true,
+                    },
+                    _ => return true,
+                }
+            }
+            '[' if after.starts_with('^') => return true,
+            '.' | '\n' => return true,
+            c if c.is_ascii_alphanumeric() => after,
+            '_' | '(' | ')' | '?' | ':' | '|' | '*' | '+' | '{' | '}' | ',' | '<' | '>' | '^'
+            | '$' | '[' | ']' | '-' | ' ' => after,
+            _ => return true,
+        };
+    }
+    false
+}
+
+/// A kind of head of a loop over [`Ways::Exits`], told apart by the anchors that hold there.
+#[derive(Clone, Copy)]
+struct Head {
+    /// The text starts here, which only the loop's first head can be.
+    start: bool,
+    /// `\b` holds here (`Some(true)`) or `\B` does, when some exit asks.
+    word: Option<bool>,
+}
+
+impl Head {
+    /// The anchors that hold at this kind of head and at no other.
+    fn guard(self) -> &'static str {
+        match (self.start, self.word) {
+            (true, Some(true)) => r"\A\b",
+            (true, Some(false)) => r"\A\B",
+            (true, None) => r"\A",
+            (false, Some(true)) => r"\b",
+            (false, Some(false)) => r"\B",
+            (false, None) => "",
+        }
+    }
 }
 
 /// An anchor that is a way of its own: `\b` where it stands, and what tells a loop how the anchor
@@ -1081,10 +1242,14 @@ impl Rewriter<'_> {
         // except for a body with a way that is only an anchor, which the forms of
         // [`Self::anchored_repeat`] were not checked against a switch.
         if !rep.greedy
-            && (max.is_none() || matches!(body.ways, Ways::Anchored { .. }))
+            && (max.is_none() || matches!(body.ways, Ways::Anchored { .. } | Ways::Exits(_)))
             && has_switch(&rep.ast)
         {
             body.ways = Ways::Unknown;
+        }
+        if let Ways::Exits(list) = &body.ways {
+            let list = list.clone();
+            return self.exits_repeat(&rep.ast, &body.text, &list, min, max, rep.greedy);
         }
         if let Ways::Anchored {
             before,
@@ -1274,10 +1439,12 @@ impl Rewriter<'_> {
                 // Only with the groups tagged (`self.copies`) may the group's own empty way come
                 // first: it is written back at the exit. An anchor's iteration sets the group
                 // there too (#6358), so the anchor itself stays out of the group.
-                Ways::Nullable { before: None, .. } | Ways::Anchored { .. } if !self.copies => {
+                Ways::Nullable { before: None, .. } | Ways::Anchored { .. } | Ways::Exits(_)
+                    if !self.copies =>
+                {
                     Ways::Unknown
                 }
-                ways @ (Ways::Nullable { .. } | Ways::Anchored { .. }) => {
+                ways @ (Ways::Nullable { .. } | Ways::Anchored { .. } | Ways::Exits(_)) => {
                     self.ways_in(ways, open, false)?
                 }
                 Ways::Opaque | Ways::Unknown => Ways::Unknown,
@@ -1345,6 +1512,17 @@ impl Rewriter<'_> {
                     }),
                 },
             },
+            // #6473: the exits are written as `E` and their guards, so only a group (whose flags
+            // do not reach those) has its consuming ways wrapped.
+            Ways::Exits(_) if anchor => Ways::Opaque,
+            Ways::Exits(list) => Ways::Exits(
+                list.into_iter()
+                    .map(|way| match way {
+                        Way::Consume(text) => wrap(text).map(Way::Consume),
+                        exit => Ok(exit),
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
             ways => ways,
         })
     }
@@ -1451,9 +1629,10 @@ impl Rewriter<'_> {
                 // One item that consumes text makes the whole way consume, an assertion beside it
                 // included: it only decides whether that way matches (#6300).
                 (Ways::Consuming, _)
-                | (Ways::Opaque | Ways::Nullable { .. } | Ways::Anchored { .. }, Ways::Consuming) => {
-                    Ways::Consuming
-                }
+                | (
+                    Ways::Opaque | Ways::Nullable { .. } | Ways::Anchored { .. } | Ways::Exits(_),
+                    Ways::Consuming,
+                ) => Ways::Consuming,
                 // #6358: an anchor beside what may match nothing is the same anchor's way: `\bb*`
                 // is `\bb+ | \b`, and `a*\z` is `a+\z | \z`. With a group already gone past, the
                 // ways would have to set it after the anchor, so they are not listed.
@@ -1478,6 +1657,14 @@ impl Rewriter<'_> {
                         }),
                         after: None,
                     },
+                    // #6473: a pair that says nothing simple is still one exit, where both hold.
+                    // The group gone past is set by `E` at the exit, which is all an exit sets.
+                    None if !first.last && !second.last => {
+                        match (Cond::of(&first.text.text), Cond::of(&second.text.text)) {
+                            (Some(a), Some(b)) => Ways::Exits(alloc::vec![Way::Exit(a.and(b))]),
+                            _ => Ways::Opaque,
+                        }
+                    }
                     None => Ways::Opaque,
                 },
                 (
@@ -1523,8 +1710,8 @@ impl Rewriter<'_> {
                         anchor: anchor.clone(),
                     }
                 }
-                (Ways::Opaque | Ways::Anchored { .. }, _)
-                | (_, Ways::Opaque | Ways::Anchored { .. }) => Ways::Opaque,
+                (Ways::Opaque | Ways::Anchored { .. } | Ways::Exits(_), _)
+                | (_, Ways::Opaque | Ways::Anchored { .. } | Ways::Exits(_)) => Ways::Opaque,
                 (
                     Ways::Nullable {
                         before: a1,
@@ -1587,7 +1774,7 @@ impl Rewriter<'_> {
             }
             match &item.ways {
                 Ways::Unknown => unknown = true,
-                Ways::Opaque => opaque = true,
+                Ways::Opaque | Ways::Exits(_) => opaque = true,
                 // A dropped last exit is last among the ways of the repeat's body, not of a part.
                 Ways::Anchored { anchor, .. } if anchor.last => opaque = true,
                 Ways::Consuming if second.is_some() => late.push(item.text.clone()),
@@ -1653,6 +1840,13 @@ impl Rewriter<'_> {
         if let (Some(exit), Some(first), false) = (second, &mut anchored, unknown || opaque) {
             match Self::second_exit(first, exit.as_deref(), late.is_empty()) {
                 Some(SecondExit::Same) => after.append(&mut late),
+                // #6473: a last exit is one more exit of the listing, which writes it at every
+                // kind of head; a way that is not listed keeps the form of #6424.
+                Some(SecondExit::Last)
+                    if items.iter().all(|item| Self::exit_ways(item).is_some()) =>
+                {
+                    opaque = true;
+                }
                 Some(SecondExit::Last) => first.last = true,
                 None => opaque = true,
             }
@@ -1660,7 +1854,13 @@ impl Rewriter<'_> {
         let ways = if unknown {
             Ways::Unknown
         } else if opaque {
-            Ways::Opaque
+            // #6473: exits the forms above do not write, each way still listed, are listed one by
+            // one for a repeat to write.
+            items
+                .iter()
+                .map(Self::exit_ways)
+                .collect::<Option<Vec<_>>>()
+                .map_or(Ways::Opaque, |lists| Ways::Exits(lists.concat()))
         } else if let Some(anchor) = anchored {
             Ways::Anchored {
                 before: self.alt_text(&before)?,
@@ -1741,7 +1941,7 @@ impl Rewriter<'_> {
         }
         let ways = match (&body.ways, min, max, greedy) {
             (Ways::Unknown, ..) => Ways::Unknown,
-            (Ways::Opaque | Ways::Anchored { .. }, ..) => Ways::Opaque,
+            (Ways::Opaque | Ways::Anchored { .. } | Ways::Exits(_), ..) => Ways::Opaque,
             // #6310: an arm below that writes the body again, with the groups it holds.
             (Ways::Nullable { .. }, 0 | 1, Some(1) | None, false)
                 if self.has_groups(&body.text) =>
@@ -2207,6 +2407,287 @@ impl Rewriter<'_> {
             Some(a) => self.concat_text(&[a, &tail]),
             None => Ok(tail),
         }
+    }
+
+    /// A piece's ways one by one, in the order they are tried, for [`Ways::Exits`] (#6473); `None`
+    /// for a piece whose ways are not listed, and for a dropped last exit (#6424), which only the
+    /// forms of [`Self::anchored_loop`] write.
+    fn exit_ways(piece: &Piece) -> Option<Vec<Way>> {
+        let consume = |way: &Option<Text>| way.clone().map(Way::Consume);
+        let around = |before: &Option<Text>, exit: Cond, after: &Option<Text>| {
+            consume(before)
+                .into_iter()
+                .chain([Way::Exit(exit)])
+                .chain(consume(after))
+                .collect()
+        };
+        Some(match &piece.ways {
+            Ways::Consuming => alloc::vec![Way::Consume(piece.text.clone())],
+            Ways::Nullable { before, after } => around(before, Cond::default(), after),
+            Ways::Anchored {
+                before,
+                anchor,
+                after,
+            } if !anchor.last => around(before, Cond::of(&anchor.text.text)?, after),
+            Ways::Exits(list) => list.clone(),
+            Ways::Anchored { .. } | Ways::Opaque | Ways::Unknown => return None,
+        })
+    }
+
+    /// A repeat of a body with several exits, `X = S0 | c1 | S1 | ... | ck | Sk`, each `Si` the
+    /// consuming ways between two exits (#6473). At a head Oniguruma tries the ways in order and
+    /// leaves at the first exit that holds there, so the ways before that exit (`P`) are tried
+    /// before it and the rest (`Q`) after: `L = P L | E | Q L | ε`, with `E` the body's empty way,
+    /// which itself takes the first exit that holds and sets the groups that one sets. Which exit
+    /// that is depends only on the anchors that hold at the head, so the heads are told apart by
+    /// guards ([`Head`]): `\b` or `\B`, and `\A` at the first head alone, every later one being past
+    /// an iteration that consumed text. An end anchor holds where no way consumes text, so there
+    /// the order does not matter: `E` takes it wherever it is tried. With each head's `P` and `Q`
+    /// behind its guard, as `X = (?:g1 P1|g2 P2)` and `Y = (?:g1 Q1|g2 Q2)`:
+    /// - an unbounded greedy loop is `X* (?:Y X*)*? (?:E|)`, which tries `E` at a head after `X` and
+    ///   before `Y`, behind a first head of its own where an exit holds at `\A`;
+    /// - a copy that counts is `H(R) = (?:g1(?:P1 R|E|Q1 R)|g2(?:P2 R|E|Q2 R))`, and a way that
+    ///   leaves once the minimum has run, as [`Self::anchored_repeat`] writes its copies; a lazy
+    ///   repeat past its minimum leaves first, which is the lazy repeat of every consuming way.
+    ///
+    /// What is copied, unrolled or kept follows [`Self::anchored_repeat`]. A form that grows past
+    /// the limit keeps the repeat as written.
+    fn exits_repeat(
+        &mut self,
+        ast: &Ast,
+        body: &Text,
+        list: &[Way],
+        min: u32,
+        max: Option<u32>,
+        greedy: bool,
+    ) -> Result<Piece, GiveUp> {
+        let grouped = has_capture(ast);
+        let ways = if grouped { Ways::Unknown } else { Ways::Opaque };
+        let written = self.repeat_text(body, min, max, greedy)?;
+        let kept = Piece {
+            text: written.clone(),
+            ways: ways.clone(),
+        };
+        let consumes = list.iter().any(|way| matches!(way, Way::Consume(_)));
+        let exits = list
+            .iter()
+            .any(|way| matches!(way, Way::Exit(cond) if !cond.never));
+        // jq's `$` holds before a newline that ends the text too, where the heads below place it
+        // after a way that consumes that newline.
+        let dollar_taken = list
+            .iter()
+            .any(|way| matches!(way, Way::Exit(cond) if cond.dollar && !cond.never))
+            && list
+                .iter()
+                .any(|way| matches!(way, Way::Consume(text) if may_take_newline(&text.text)));
+        if !consumes || !exits || dollar_taken || self.has_groups(&written) || self.lazy_around > 0
+        {
+            return Ok(kept);
+        }
+        let ops = onig_ops(ast, self.folds).filter(|_| !self.shadowed);
+        let copied = |length: Option<usize>, count: u32| {
+            length
+                .and_then(|length| length.checked_mul(count as usize))
+                .is_some_and(|total| total <= ONIG_EXPAND_LIMIT)
+        };
+        let keeps = match (greedy, max) {
+            (false, _) => min < 2 || (max.is_none() && self.oniguruma_unrolls(ast, min)),
+            (true, Some(n)) => n <= 1 || copied(ops.map(|ops| ops + 1), n),
+            (true, None) => false,
+        };
+        if keeps {
+            return Ok(kept);
+        }
+        match self.exits_text(
+            ast,
+            body,
+            list,
+            min,
+            max,
+            greedy,
+            ops.is_some_and(|ops| copied(Some(ops), min)),
+        ) {
+            Ok(text) => {
+                self.changed = true;
+                Ok(Piece { text, ways })
+            }
+            Err(GiveUp) => Ok(kept),
+        }
+    }
+
+    /// The text of [`Self::exits_repeat`]; `copies` when Oniguruma writes the minimum of a greedy
+    /// unbounded repeat out as plain copies.
+    #[allow(clippy::too_many_arguments)]
+    fn exits_text(
+        &self,
+        ast: &Ast,
+        body: &Text,
+        list: &[Way],
+        min: u32,
+        max: Option<u32>,
+        greedy: bool,
+        copies: bool,
+    ) -> Result<Text, GiveUp> {
+        let exit = self.empty_text(ast)?;
+        let asks = |f: fn(&Cond) -> bool| {
+            list.iter()
+                .any(|way| matches!(way, Way::Exit(cond) if !cond.never && f(cond)))
+        };
+        let words: &[Option<bool>] = if asks(|cond| cond.word.is_some()) {
+            &[Some(true), Some(false)]
+        } else {
+            &[None]
+        };
+        let heads =
+            |start: bool| -> Vec<Head> { words.iter().map(|&word| Head { start, word }).collect() };
+        let later = heads(false);
+        let first = if asks(|cond| cond.start) {
+            heads(true)
+        } else {
+            Vec::new()
+        };
+        // A head's guard, and its ways before and after the first exit that holds there.
+        let split = |head: Head| -> Result<(Text, Option<Text>, Option<Text>), GiveUp> {
+            let at = list
+                .iter()
+                .position(|way| matches!(way, Way::Exit(cond) if cond.holds(head)));
+            let side = |range: &[Way]| {
+                let texts: Vec<Text> = range
+                    .iter()
+                    .filter_map(|way| match way {
+                        Way::Consume(text) => Some(text.clone()),
+                        Way::Exit(_) => None,
+                    })
+                    .collect();
+                self.alt_text(&texts)
+            };
+            let (before, after) = match at {
+                Some(at) => (side(&list[..at])?, side(&list[at..])?),
+                None => (side(list)?, None),
+            };
+            Ok((self.text(head.guard().into(), Prec::Concat)?, before, after))
+        };
+        let guarded = |guard: &Text, way: &Option<Text>| {
+            way.as_ref()
+                .map(|way| self.concat_text(&[guard, way]))
+                .transpose()
+        };
+        // `H(R)`, with the heads `kinds`, and a way that leaves last when `leave`.
+        let head = |kinds: &[&[Head]], rest: &Text, leave: bool| -> Result<Text, GiveUp> {
+            let mut ways = Vec::new();
+            for &kind in kinds.iter().flat_map(|kinds| kinds.iter()) {
+                let (guard, before, after) = split(kind)?;
+                let then = |way: &Option<Text>| {
+                    way.as_ref()
+                        .map(|way| self.concat_text(&[way, rest]))
+                        .transpose()
+                };
+                let inner: Vec<Text> = then(&before)?
+                    .into_iter()
+                    .chain([exit.clone()])
+                    .chain(then(&after)?)
+                    .collect();
+                let inner = self.alt_text(&inner)?.ok_or(GiveUp)?;
+                let inner = self.text(format!("(?:{})", inner.text), Prec::Atom)?;
+                ways.push(self.concat_text(&[&guard, &inner])?);
+            }
+            if leave {
+                ways.push(self.concat_text(&[])?);
+            }
+            self.alt_text(&ways)?.ok_or(GiveUp)
+        };
+        let group = |text: Text| self.text(format!("(?:{})", text.text), Prec::Atom);
+        let text = match (greedy, max) {
+            (true, None) => {
+                // `X* (?:Y X*)*? (?:E|)` over the later heads.
+                let (mut xs, mut ys) = (Vec::new(), Vec::new());
+                for &kind in &later {
+                    let (guard, before, after) = split(kind)?;
+                    xs.extend(guarded(&guard, &before)?);
+                    ys.extend(guarded(&guard, &after)?);
+                }
+                let star = |ways: &[Text]| -> Result<Option<Text>, GiveUp> {
+                    self.alt_text(ways)?
+                        .map(|way| self.repeat_text(&way, 0, None, true))
+                        .transpose()
+                };
+                let xs = star(&xs)?;
+                let leave = self.text(format!("(?:{}|)", exit.text), Prec::Atom)?;
+                let mut loop_text = Vec::new();
+                loop_text.extend(xs.clone());
+                if let Some(y) = self.alt_text(&ys)? {
+                    let mut iteration = alloc::vec![group(y)?];
+                    iteration.extend(xs);
+                    let refs: Vec<&Text> = iteration.iter().collect();
+                    let iteration = self.concat_text(&refs)?;
+                    loop_text.push(self.repeat_text(&iteration, 0, None, false)?);
+                }
+                loop_text.push(leave);
+                let refs: Vec<&Text> = loop_text.iter().collect();
+                let later_loop = self.concat_text(&refs)?;
+                let mut rest = if min > 0 && !copies {
+                    let mut rest = later_loop;
+                    for at in 0..min {
+                        let kinds: &[&[Head]] = if at + 1 == min {
+                            &[&first, &later]
+                        } else {
+                            &[&later]
+                        };
+                        rest = group(head(kinds, &rest, false)?)?;
+                    }
+                    rest
+                } else if first.is_empty() {
+                    later_loop
+                } else {
+                    // The first head, where an exit may hold at `\A`; past it, or at a head
+                    // where none does, the loop as at every later head.
+                    let opening = head(&[&first], &later_loop, false)?;
+                    group(self.alt_text(&[opening, later_loop])?.ok_or(GiveUp)?)?
+                };
+                if min > 0 && copies {
+                    let copies = self.repeat_text(body, min, Some(min), true)?;
+                    rest = self.concat_text(&[&copies, &rest])?;
+                }
+                rest
+            }
+            (true, Some(n)) => {
+                let mut rest = self.concat_text(&[])?;
+                for k in 0..n {
+                    let kinds: &[&[Head]] = if k + 1 == n {
+                        &[&first, &later]
+                    } else {
+                        &[&later]
+                    };
+                    rest = group(head(kinds, &rest, n - 1 - k >= min)?)?;
+                }
+                rest
+            }
+            (false, _) => {
+                let consuming: Vec<Text> = list
+                    .iter()
+                    .filter_map(|way| match way {
+                        Way::Consume(text) => Some(text.clone()),
+                        Way::Exit(_) => None,
+                    })
+                    .collect();
+                let all = self.alt_text(&consuming)?.ok_or(GiveUp)?;
+                let mut rest = match max {
+                    None => self.repeat_text(&all, 0, None, false)?,
+                    Some(n) if n > min => self.repeat_text(&all, 0, Some(n - min), false)?,
+                    Some(_) => self.concat_text(&[])?,
+                };
+                for at in 0..min {
+                    let kinds: &[&[Head]] = if at + 1 == min {
+                        &[&first, &later]
+                    } else {
+                        &[&later]
+                    };
+                    rest = group(head(kinds, &rest, false)?)?;
+                }
+                rest
+            }
+        };
+        group(text)
     }
 
     /// Whether `exit` holds a tagged group `written` does not.
@@ -3048,17 +3529,21 @@ mod tests {
         assert_eq!(written(r"(\b|a)?"), None);
         // Counted, it is written: `E` leaves all of it, where the crate's copies would go on.
         assert!(written(r"(\b|a){2}").is_some());
-        // A second exit with no way after it, or the same anchor again, is written (#6424); one with
-        // a way after it is past what the forms write, and so is a list of anchors that holds nowhere.
-        assert!(written(r"(\A|a|\B)*").is_some_and(|t| t.contains(r"\A(")));
+        // A second exit with no way after it, or the same anchor again, is written (#6424), and so is
+        // one with a way after it, way by way, each kind of head behind its anchors (#6473). A list
+        // of anchors that holds nowhere is an exit that never holds, so with no other exit the loop
+        // leaves only where the crate's does and keeps its text.
+        assert!(written(r"(\A|a|\B)*").is_some_and(|t| t.contains(r"\A\b(")));
         assert!(written(r"(\b|a|\b)*").is_some());
-        assert_eq!(written(r"(\A|a|\B|b)*"), None);
-        assert_eq!(written(r"(\b|a|\B|b)*"), None);
+        for pattern in [r"(\A|a|\B|b)*", r"(\b|a|\B|b)*"] {
+            assert!(written(pattern).is_some(), "{pattern}");
+        }
         assert_eq!(written(r"(\b\B|a)*"), None);
         // The dropped exit is last among the ways of the repeat's body, not of a part of it: inside
-        // another way, or in a list with more items, the part keeps its text.
-        assert_eq!(written(r"((\A|a|\B)|c)+"), None);
-        assert_eq!(written(r"(((\A|a|\B))|c)+"), None);
+        // another way its exits are listed with the rest (#6473), and in a list with more items the
+        // part keeps its text.
+        assert!(written(r"((\A|a|\B)|c)+").is_some());
+        assert!(written(r"(((\A|a|\B))|c)+").is_some());
         for pattern in [r"((\A|\B)\b)*", r"((\A|\B)b*)+", r"((\A|a|\B)b*)*"] {
             assert_eq!(written(pattern), None, "{pattern}");
         }
@@ -3259,5 +3744,75 @@ mod tests {
         let written = rewrite_with_groups("(?x)( () (?: a | ) | (b*) )*").unwrap();
         assert!(written.copies.iter().skip(1).any(|copies| copies.len() > 1));
         assert!(rewrite_with_groups("(?x)( () (?: a | ) | (b*) )* # c\n").is_none());
+    }
+
+    /// #6473: a run of anchors is the conjunction of what each says; `\b\B` holds nowhere (jq 1.7.1
+    /// matches `\b\B` nowhere), and anything that is not an anchor is not read.
+    #[test]
+    fn a_run_of_anchors_is_where_all_of_them_hold_6473() {
+        let later = |word| Head { start: false, word };
+        let first = |word| Head { start: true, word };
+        let cond = |text: &str| Cond::of(text).unwrap();
+        assert!(cond(r"\b").holds(later(Some(true))));
+        assert!(!cond(r"\b").holds(later(Some(false))));
+        assert!(cond(r"\B").holds(later(Some(false))));
+        assert!(!cond(r"\A").holds(later(None)));
+        assert!(cond(r"\A").holds(first(None)));
+        assert!(cond(r"^\b").holds(first(Some(true))));
+        assert!(!cond(r"^\b").holds(first(Some(false))));
+        assert!(!cond(r"\z").holds(later(None)));
+        assert!(!cond("$").holds(first(None)));
+        assert!(cond("$").dollar && !cond(r"\z").dollar);
+        assert!(cond(r"\b\B").never && !cond(r"\b\B").holds(later(Some(true))));
+        assert!(cond(r"\B\b").never);
+        assert!(!cond(r"\b\b").never);
+        assert!(Cond::default().holds(later(None)));
+        assert!(Cond::of("").is_some());
+        assert!(
+            Cond::of("a").is_none() && Cond::of(r"\w").is_none() && Cond::of(r"(?i:\b)").is_none()
+        );
+        let guards: Vec<&str> = [first(Some(true)), first(Some(false)), first(None)]
+            .into_iter()
+            .chain([later(Some(true)), later(Some(false)), later(None)])
+            .map(Head::guard)
+            .collect();
+        assert_eq!(guards, [r"\A\b", r"\A\B", r"\A", r"\b", r"\B", ""]);
+    }
+
+    /// #6473: what may match a newline is read conservatively: only letters, digits, `\w`, `\d`,
+    /// anchors, groups and positive classes of those and of word properties are known not to.
+    #[test]
+    fn a_way_that_may_take_a_newline_is_read_conservatively_6473() {
+        for text in [
+            "a",
+            r"\w+",
+            r"(?:a|b*)\b",
+            r"(?<__succinctly_g1>\d)",
+            r"[\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\x{B2}\x{BC}-\x{BE}]*",
+            "[a-z] {2,3}?",
+            r"^\A\z$\B",
+        ] {
+            assert!(!may_take_newline(text), "{text:?}");
+        }
+        for text in [
+            r"\n", ".", "[^a]", r"\s", r"\W", r"\p{Zs}", r"\p", r"\x{A}", r"\x{zz}", r"\x0A", "\n",
+            "\\", "#", "a\u{e9}",
+        ] {
+            assert!(may_take_newline(text), "{text:?}");
+        }
+    }
+
+    /// #6473: a pair of anchors the anchor forms do not reduce is still one exit, and a list of
+    /// exits keeps its loop where the forms would grow past the limit, or a part of it is not read.
+    #[test]
+    fn several_exits_are_written_or_kept_6473() {
+        // `\b\B` holds nowhere: the loop's only exit is `\A`.
+        assert!(rewrite(r"(?:\b\B|a|\A|b)+").is_some());
+        // A flag group around the anchors, and a lazy repeat of fewer than two, keep their text.
+        assert!(rewrite(r"(?i:\b|a|\B|b)+").map_or(true, |text| text.contains(r"(?i:\b|a|\B|b)+")));
+        assert_eq!(rewrite(r"(?:\b|a|\B|b)+?"), None);
+        // Past the size limit the repeat stays as written.
+        let long = alloc::format!(r"(?:\b|{}|\B|b){{2,9}}", "a".repeat(400));
+        assert!(rewrite(&long).map_or(true, |text| text.contains(&long)));
     }
 }
