@@ -89062,7 +89062,8 @@ fn owned_update_step_arith<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> 
 }
 
 /// `if C then A else B end` whose `C` is one value the step can settle (closed, or reading the
-/// state, #5279): the UPDATE is whichever branch `C` chooses, and that is a step of its own.
+/// state, #5279): the UPDATE is whichever branch `C` chooses, and that is a step of its own -- or,
+/// for a branch that is `.` or closed (#6569), the state or the branch's value.
 /// `Err(state)` when `expr` is no such `if`, or `C` cannot be settled; a branch that is no step
 /// hands the state back as `Declined`, and the whole `if` is then the evaluator's.
 #[inline(never)]
@@ -89089,7 +89090,21 @@ fn owned_if_step<S: EvalSemantics>(
     } else {
         else_branch
     };
-    Ok(owned_update_step::<S>(branch, state))
+    // #6569: a branch that is `.` answers the state itself, and a closed one its own value, as the
+    // evaluator's route would. [`owned_update_step`] has no arm for either (a bare `.` or literal
+    // UPDATE never reaches it), so the whole `if` used to decline and run on that route every step:
+    // a running max, `if $x > . then $x else . end`, was 0.40x of jq 1.7.1. The closed check runs
+    // only once the step has declined, so a computing branch (`. + 1`) pays nothing for it.
+    if matches!(unwrap_paren(branch), Expr::Identity) {
+        return Ok(OwnedStep::Handled(Ok(state)));
+    }
+    Ok(match owned_update_step::<S>(branch, state) {
+        OwnedStep::Declined(state) => match closed_expr_to_owned::<S>(branch) {
+            Some(value) => OwnedStep::Handled(Ok(value)),
+            None => OwnedStep::Declined(state),
+        },
+        done => done,
+    })
 }
 
 /// `. + a + b`: [`owned_arith_chain_shape`] applied to the moved state, link by link.
@@ -115391,6 +115406,67 @@ mod tests {
             ),
             "a chain of + is the evaluator's under the table"
         );
+    }
+
+    /// #6569: an `if` UPDATE whose chosen branch is `.` answers the state itself, its own storage,
+    /// and one whose chosen branch is closed answers that value; through the evaluator's route the
+    /// whole `if` ran again every step. A branch with an effect, no output or several declines as
+    /// before, with the state untouched.
+    #[test]
+    #[cfg(feature = "std")]
+    fn if_step_answers_a_dot_or_closed_branch_6569() {
+        let state = || {
+            OwnedValue::object_from([
+                ("a".to_string(), OwnedValue::Int(1)),
+                ("b".to_string(), OwnedValue::Int(2)),
+            ])
+        };
+        let step =
+            |src: &str, at: OwnedValue| owned_update_step::<JqSemantics>(&parse(src).unwrap(), at);
+        let held = state();
+        let OwnedStep::Handled(Ok(same)) =
+            step("if length > 1 then . else .c = 1 end", held.clone())
+        else {
+            panic!("a `.` branch must be taken"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step declined an `if` whose chosen branch is `.` (#6569)"
+        };
+        assert!(same.shares_storage_with(&held), "the state was copied");
+        for (src, want) in [
+            ("if .a == 1 then . else 0 end", state()),
+            ("if true then 7 else . end", OwnedValue::Int(7)),
+            (
+                "if false then 7 else [1, \"x\"] end",
+                OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::string("x")]),
+            ),
+            (
+                "if .a == 1 then {k: 2} else . end",
+                OwnedValue::object_from([("k".to_string(), OwnedValue::Int(2))]),
+            ),
+            (
+                "if .a == 2 then . elif .b == 2 then \"two\" else . end",
+                OwnedValue::string("two"),
+            ),
+            ("if .a == 2 then 1 elif .b == 3 then 2 else . end", state()),
+            ("if (.a > 0) then (.) else (.c = 1) end", state()),
+            ("if .z then 1 else null end", OwnedValue::Null),
+        ] {
+            let OwnedStep::Handled(Ok(got)) = step(src, state()) else {
+                panic!("not handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step declined an `if` the test lists as handled (#6569)"
+            };
+            assert_eq!(got, want, "{src}");
+        }
+        for src in [
+            "if true then error(\"x\") else . end",
+            "if true then empty else . end",
+            "if true then (1, 2) else . end",
+            "if true then debug else . end",
+            "if true then input else . end",
+            "if true then $__loc__ else . end",
+        ] {
+            let OwnedStep::Declined(back) = step(src, state()) else {
+                panic!("handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step answered an `if` the test lists as declined (#6569)"
+            };
+            assert_eq!(back, state(), "{src}: the declined state is untouched");
+        }
     }
 
     /// #5263: an operand that reads `.` is evaluated on the state, which a binding the
