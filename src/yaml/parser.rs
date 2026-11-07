@@ -9895,14 +9895,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Whether the nearest earlier line that is neither blank nor a comment leaves its value for
     /// the next line: a key written up to its colon (`a:`, `- k:`), with node properties after
     /// the colon or not (`a: &x`, #4947), or a dash with nothing after it but node properties and a
-    /// comment (`-`, `- -`, `- &x`, #6550). The only place
-    /// a block scalar header on a line of its own can belong (#4259); a header anywhere else is
-    /// not a value slot and keeps the path it always took.
+    /// comment (`-`, `- -`, `- &x`, #6550: [`Self::deferred_value_owner`] reads all three). The
+    /// only place a block scalar header on a line of its own can belong (#4259); a header anywhere
+    /// else is not a value slot and keeps the path it always took.
     fn previous_content_line_defers_its_value(&self) -> bool {
         self.previous_content_line().is_some_and(|(lead, rest)| {
             line_ends_with_colon_before_comment(rest)
                 || line_ends_with_colon_after_properties(rest)
-                || Self::deferred_value_owner(lead, rest).is_some_and(|(_, is_dash)| is_dash)
+                || Self::deferred_value_owner(lead, rest).is_some()
         })
     }
 

@@ -10,9 +10,16 @@
 
 use anyhow::Result;
 
-use crate::run_yq_stdin;
+use crate::{run_yq_split, run_yq_stdin};
 
 const REFUSED: &[&str] = &[
+    // A bare dash and a chain with no properties (yq v4.53.3 refuses these too).
+    "-\n  |\n    t\n\n  u\n",
+    "-\n   |\n     t\n\n  u\n",
+    "-\n  |\n    t\n  u\n",
+    "- -\n    |\n      t\n\n   u\n",
+    "- -\n     |\n       t\n\n    u\n",
+    "- -\n    |\n      t\n     u\n",
     "- &x\n |\n   t\n\n u\n",
     "- &x\n |\n   t\n\n  u\n",
     "- &x\n |\n   t\n u\n",
@@ -358,6 +365,27 @@ fn yq_keeps_the_lines_that_belong_to_an_own_line_block_scalar_6550() -> Result<(
     for (doc, expected) in ACCEPTED {
         let (stdout, status) = run_yq_stdin(".", doc, &["-o=json", "-I0"])?;
         assert_eq!((stdout.trim_end(), status), (*expected, 0), "{doc:?}");
+    }
+    Ok(())
+}
+
+/// The refusal is the sequence one: a line left of the content and right of the dash is `did not
+/// find expected '-' indicator`, not an indentation or stray-line error of another route.
+#[test]
+fn yq_words_the_refusal_of_a_line_below_an_own_line_block_scalar_6550() -> Result<()> {
+    for doc in [
+        "- &x\n  |\n    t\n\n  u\n",
+        "- &x\n  |\n    t\n u\n",
+        "- !!str\n   |\n     t\n\n  u\n",
+        "-\n  |\n    t\n\n  u\n",
+        "- -\n    |\n      t\n\n   u\n",
+    ] {
+        let (_stdout, stderr, status) = run_yq_split(".", doc, &["-o=json", "-I0"])?;
+        assert_eq!(status, 1, "{doc:?}");
+        assert!(
+            stderr.contains("did not find expected '-' indicator"),
+            "{doc:?}: {stderr}"
+        );
     }
     Ok(())
 }

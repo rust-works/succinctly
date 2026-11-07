@@ -7129,3 +7129,6 @@ These differ:
 - **An explicit indentation indicator on a block scalar under `- ?` is measured from the wrong indent (#6553, #6490).**
   `- ?` / `   |2` / `     t` is the key `" t\n"` in yq and `"   t\n"` here: the indicator counts from the indent of the enclosing sequence (0 here), where yq counts from the indent of the mapping the `?` opens (2 here).
   Only the scalar's text differs; the document is accepted and the key is the same one.
+- **An explicit indentation indicator on a block scalar under a chain of dashes is measured from the wrong indent (#6550, #6490).**
+  `- - &x` / `  |2` / `    t` is `[["t\n"]]` in yq and `[["  t\n"]]` here, and `- - !!str` / `  |1` / `    t` is `[[" t\n"]]` in yq and `[["   t\n"]]` here: the indicator counts from the indent of the enclosing sequence, where yq counts from the indent of the innermost one.
+  Only the scalar's text differs; the document is accepted.
