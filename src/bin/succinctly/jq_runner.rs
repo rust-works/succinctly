@@ -5924,8 +5924,15 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 debug_assert_eq!(locations.per_value(), &[]);
                 // #6480: the reader settles its own end at the last file that opened, which a
                 // missing last file does not move yet.
-                jq::seed_remaining_inputs_from(stream_reader_producer(lazy));
-                jq::count_reads_past_end();
+                jq::seed_remaining_inputs_from(end_producer_at(
+                    locations.unopened_end(),
+                    stream_reader_producer(lazy),
+                ));
+                if locations.unopened_end().is_some() {
+                    jq::hold_reads_past_end();
+                } else {
+                    jq::count_reads_past_end();
+                }
             } else {
                 seed_input_queue(
                     args.slurp,
@@ -6123,7 +6130,18 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     )
                 })),
             };
+            // #6531: whether the loop stopped before its last document (`-R`'s pending open failures
+            // are then not reached).
+            let mut ended_early = false;
+            // Nothing is pending on the common run, which pays nothing per line for it.
+            let pending_failures =
+                PENDING_OPEN_FAILURES.with(|pending| !pending.borrow().is_empty());
             'documents: for (document, location, source) in documents {
+                // #6531: a file that did not open is reported when the line read from past it is
+                // reached, before that line.
+                if let (true, Some(source)) = (pending_failures, source) {
+                    report_reached_open_failures(Some(source), false);
+                }
                 // `UNKNOWN_LINE`, not just any missing entry, must clear the
                 // source too (#3202): `input_filename` can't otherwise tell
                 // "this value's file is genuinely stdin" apart from "no
@@ -6164,6 +6182,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 );
                 if !finished.next_input(args.on_error, &mut sink, &mut had_output, &mut last_output)
                 {
+                    ended_early = true;
                     break 'documents;
                 }
                 evaluate_input_streaming_via(
@@ -6194,8 +6213,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // file past one that did not open, and the value that took it there is still
                 // processed (`-R . missing lines.txt` prints the first line and stops).
                 if source_is_past_open_failure(source) {
+                    ended_early = true;
                     break 'documents;
                 }
+            }
+            // #6531: the files past the last line, which its reader asks for when it finds none.
+            if !ended_early && !stopped(args.on_error, &sink) {
+                report_reached_open_failures(None, false);
             }
             // The parse error the stream ended in, reported after the
             // documents before it (#2961) -- or, for `--seq -s`, the warning
@@ -6702,15 +6726,23 @@ fn read_inputs(
         opened.clone_from(&files);
         let locations =
             InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
-        let tags = if files.is_empty() {
+        // #6531: a last file that did not open is one source more, which `get_inputs` names after
+        // this read returns, and the stream ends at it.
+        let tail_source = tail_is_source && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some());
+        let mut tags: Vec<Option<usize>> = if files.is_empty() {
             vec![None]
         } else {
             (0..files.len()).map(Some).collect()
         };
+        if tail_source {
+            tags.push(Some(files.len()));
+        }
         LAZY_STREAM_INPUTS.with(|slot| {
             *slot.borrow_mut() = Some(LazyStreamInputs {
-                last_source: u32::try_from(locations.files().len().saturating_sub(1))
-                    .unwrap_or(u32::MAX),
+                last_source: u32::try_from(
+                    (locations.files().len() + usize::from(tail_source)).saturating_sub(1),
+                )
+                .unwrap_or(u32::MAX),
                 files: tags,
                 reader: crate::jq_stream_errors::Reader::from_source(Box::new(
                     crate::jq_stream_errors::ChunkedSources::new(readers)
@@ -6831,10 +6863,16 @@ fn read_inputs(
             let main_loop_only = !args.null_input
                 && !args.slurp
                 && (!track_eof || (args.seq && !PROGRAM_READS_INPUTS.with(std::cell::Cell::get)));
-            report_open_failures(
-                open_failures_reached(&failures, &raws, args, main_loop_only),
-                open_failed,
-            );
+            let reached = open_failures_reached(&failures, &raws, args, main_loop_only).len();
+            if main_loop_only && args.raw_input && args.input_dsv.is_none() && !args.validate {
+                // #6531: `-R`'s main loop reports a file when the line it reads comes from past it,
+                // after the lines before.
+                let mut failures = failures;
+                failures.truncate(reached);
+                defer_open_failures(failures, false);
+            } else {
+                report_open_failures(&failures[..reached], open_failed);
+            }
         }
         let raws = raws
             .into_iter()
@@ -7458,6 +7496,17 @@ fn read_inputs(
     // filter's own `input`. jq has lost its position by then -- the call
     // that raises it closed the stream -- so it names `<unknown>`.
     let mut resumed_errors: Vec<(usize, TrailingParseError)> = seq_fault_errors;
+    // #6531: `--seq`'s reader raises its own faults, and the last one, at the end of the text, is
+    // raised at a last file that did not open, line 0, as the JSON reader's is (#6480).
+    if !args.slurp && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some()) {
+        if let Some((_, fault)) = resumed_errors
+            .last_mut()
+            .filter(|(_, fault)| fault.error.message.contains(" at EOF"))
+        {
+            fault.source = u32::try_from(files.len()).unwrap_or(u32::MAX);
+            fault.line = 0;
+        }
+    }
     // #6019: whether `-n -s` read a stream with a fault the resuming way (below).
     let mut resume_slurp_done = false;
     let mut trailing_error: Option<TrailingParseError> =
@@ -9216,6 +9265,12 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     let tail_is_source = unopened
         .last()
         .is_some_and(|failure| !failure.is_directory());
+    // #6531: and `input_filename` names it from there on, once `get_inputs` hands it to the
+    // locations.
+    if let Some(failure) = unopened.last().filter(|_| tail_is_source) {
+        let name = input_display_name(&failure.path);
+        UNOPENED_TAIL_NAME.with(|tail| *tail.borrow_mut() = Some(name));
+    }
     let tail: crate::jq_stream_errors::Tail = if unopened.is_empty() {
         Vec::new()
     } else if tail_is_source {
