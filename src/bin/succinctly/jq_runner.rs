@@ -6850,9 +6850,12 @@ fn read_inputs(
         // #6525: so does a program that reads `input` without `-n`, whose main loop reads the first
         // file before the program does and stops one value past a failure. Every route that reads
         // `input` seeds the queue the hook reports from.
+        // #6555: a `--seq` stream its reader reads without a fault pops its values as a JSON
+        // stream's are, so the reads reach the failures as they do there. With nothing to report
+        // the walk is not worth its copy of the text.
         if (args.null_input || track_eof)
             && !args.slurp
-            && !args.seq
+            && (!args.seq || (any_open_failure && seq_text_reads_clean(&raws, args)))
             && args.input_dsv.is_none()
             && ends_cleanly
         {
@@ -8946,6 +8949,28 @@ thread_local! {
 fn defer_open_failures(failures: Vec<(usize, InputFileOpenError)>, fault_ends_text: bool) {
     PENDING_OPEN_FAILURES.with(|pending| *pending.borrow_mut() = failures.into());
     FAULT_ENDS_TEXT.with(|ends| ends.set(fault_ends_text));
+}
+
+/// Whether `--seq`'s own reader reads the text the files `raws` make without a fault (#6555): no
+/// diagnostic, none deferred and no position lost, so each value is read where a JSON stream's
+/// is and nothing else comes out of the input queue. That holds for `--stream` and
+/// `--stream-errors` too, whose events of a clean record stream are placed as their values'. `-R`
+/// and DSV read a `--seq` stream as lines and records of their own, and are not this reader's to
+/// vouch for.
+fn seq_text_reads_clean(raws: &[Vec<u8>], args: &JqCommand) -> bool {
+    if !args.seq || args.raw_input || args.input_dsv.is_some() {
+        return false;
+    }
+    let sources: Vec<(Option<usize>, Vec<u8>)> = raws
+        .iter()
+        .enumerate()
+        .map(|(at, raw)| (Some(at), raw.clone()))
+        .collect();
+    let mut warned = false;
+    let walk = crate::jq_seq_reader::walk_stream_values(&sources, args.slurp, &mut |_| {
+        warned = true;
+    });
+    !warned && walk.deferred_warning.is_none() && !walk.slurp_position_lost
 }
 
 /// The open failures jq's reader reaches before its parser stops (#6485): it opens the files in
