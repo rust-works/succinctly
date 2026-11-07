@@ -107,6 +107,30 @@ fn a_lazy_short_repeat_over_several_exits_answers_as_jq_does_6518() -> Result<()
     Ok(())
 }
 
+/// The loop pin of #6427 for `{1,2}?`: a body with loops of its own is written out since #6518, and answers as jq does.
+#[test]
+fn a_lazy_short_repeat_over_loops_and_exits_answers_as_jq_does_6518() -> Result<()> {
+    for (pattern, rows) in [(
+        r"(?:^b*|(?:(a*)|b)+(?:(a)|b?){0,2}){1,2}?$",
+        &[
+            ("abba", r#"[[0,"abba",["",null]],[4,"",["",""]]]"#),
+            ("ba", r#"[[0,"ba",["",null]],[2,"",["",""]]]"#),
+            ("bab", r#"[[0,"bab",["",null]],[3,"",["",""]]]"#),
+            ("aab", r#"[[0,"aab",["",null]],[3,"",["",""]]]"#),
+            ("abab", r#"[[0,"abab",["","a"]],[4,"",["",""]]]"#),
+            ("a", r#"[[0,"a",["",null]],[1,"",["",""]]]"#),
+            ("b", r#"[[0,"b",[null,null]],[1,"",["",""]]]"#),
+            ("", r#"[[0,"",["",""]]]"#),
+            ("ab", r#"[[0,"ab",["",null]],[2,"",["",""]]]"#),
+        ][..],
+    )] {
+        for &(input, expected) in rows {
+            assert_matches(pattern, input, expected)?;
+        }
+    }
+    Ok(())
+}
+
 fn assert_matches(pattern: &str, input: &str, expected: &str) -> Result<()> {
     let (stdout, _, status) = run_jq_full(
         &[

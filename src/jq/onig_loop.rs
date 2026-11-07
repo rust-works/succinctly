@@ -3064,6 +3064,7 @@ impl Rewriter<'_> {
         let short = min < 2
             && self.lazy_bounded
             && self.copies
+            && has_capture(ast)
             && matches!(max, Some(n) if n > 1)
             && list
                 .iter()
@@ -4712,5 +4713,13 @@ mod tests {
         // Unbounded, and a single count, keep their text.
         assert_eq!(copied(r"((\b)|(\w*))*?$"), None);
         assert_eq!(copied(r"((\b)|(\w*)){0,1}?$"), None);
+    }
+    /// #6518: with no group in the repeat the several-exit form keeps its text, as it did.
+    #[test]
+    fn a_groupless_lazy_short_repeat_over_several_exits_keeps_its_text_6518() {
+        assert_eq!(
+            rewrite_with_groups(r"(x)?(?:\b|a*|b){1,3}?c").map(|g| g.pattern),
+            None
+        );
     }
 }
