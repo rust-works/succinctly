@@ -6814,7 +6814,15 @@ fn read_inputs(
                     .find(|raw| !raw.is_empty())
                     .map_or(true, |raw| source_ends_cleanly(raw, args))
         });
-        if args.null_input && !args.slurp && !args.seq && args.input_dsv.is_none() && ends_cleanly {
+        // #6525: so does a program that reads `input` without `-n`, whose main loop reads the first
+        // file before the program does and stops one value past a failure. Every route that reads
+        // `input` seeds the queue the hook reports from.
+        if (args.null_input || track_eof)
+            && !args.slurp
+            && !args.seq
+            && args.input_dsv.is_none()
+            && ends_cleanly
+        {
             let fault_ends_text = matches!(first_stream_fault(&raws), Some((_, true)));
             defer_open_failures(failures, fault_ends_text);
         } else {
