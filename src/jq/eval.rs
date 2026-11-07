@@ -88830,7 +88830,6 @@ fn settle_free_slot<'e, S: EvalSemantics>(
         Expr::Array(inner) => {
             let items = match unwrap_paren(inner) {
                 Expr::Comma(items) => items.as_slice(),
-                Expr::Builtin(Builtin::Empty) => return None,
                 single => core::slice::from_ref(single),
             };
             let mut parts = vec_with_capacity(items.len());
@@ -88844,7 +88843,7 @@ fn settle_free_slot<'e, S: EvalSemantics>(
             for entry in entries {
                 let key = match &entry.key {
                     ObjectKey::Literal(name) => name.clone(),
-                    ObjectKey::Bare => return None,
+                    ObjectKey::Bare => return None, // patchcov: coverage tolerate-line reason="unreachable in jq mode: only yq's parser writes a bare entry, and owned_constructor_step declines yq mode first (#6549)"
                     ObjectKey::Expr(key) => {
                         match owned_assign_operand_off_the_tree::<S>(key, state)? {
                             OwnedValue::String(name) => name.into_string(),
@@ -178271,6 +178270,8 @@ mod named_args_shared_tests_5690 {
             // A repeated key in a nested constructor drops the overwritten member's move.
             "{x: {k: .a, k: (.a + [1])}}",
             "{x: {k: (.a + [1]), k: .b, j: .a}}",
+            // A computed key in a nested constructor, read off the tree.
+            "{x: {(.s): (.a + [1])}}",
             "{a: ((.a // []) + [9])}",
             "{z: ((.z // []) + [9])}",
             "{m: ((.missing // {}) + {k: 1})}",
@@ -178302,6 +178303,9 @@ mod named_args_shared_tests_5690 {
             "{a: (.a + [1] + .n)}",
             "{n: {s: .}}",
             "{n: [.a[]], a: (.a + [1])}",
+            // A nested key that is not a string, or that needs the rebuilt state.
+            "{x: {(.n): (.a + [1])}}",
+            "{x: {(.o | tojson): (.a + [1])}}",
             "{a: ((.a // [1]) + [9]), b: .a}",
             "{z: ((.z // .a) + [9])}",
             "{n: ((.n // []) + [9])}",
