@@ -6660,7 +6660,7 @@ fn read_inputs(
     // #5498: a program that asks for the `--stream` events as it goes reads them from the files a
     // chunk at a time, as jq does, and not from their bytes read whole first.
     if stream_read_in_chunks(args, track_eof) {
-        let (files, readers) = match open_chunked_inputs(&files, open_failed) {
+        let (files, readers, unopened_tail, tail_is_source) = match open_chunked_inputs(&files) {
             Ok(opened_inputs) => opened_inputs,
             Err(e) => return Ok(Err(e)),
         };
@@ -6678,7 +6678,8 @@ fn read_inputs(
                     .unwrap_or(u32::MAX),
                 files: tags,
                 reader: crate::jq_stream_errors::Reader::from_source(Box::new(
-                    crate::jq_stream_errors::ChunkedSources::new(readers),
+                    crate::jq_stream_errors::ChunkedSources::new(readers)
+                        .with_tail(unopened_tail, tail_is_source),
                 )),
                 raise_errors: !args.stream_errors,
             });
@@ -8962,8 +8963,40 @@ fn stream_read_in_chunks(args: &JqCommand, track_eof: bool) -> bool {
         && (args.null_input || stream_walk_by_reader(args))
 }
 
-/// The input files that opened and how to open each again for the reader ([`open_chunked_inputs`]).
-type ChunkedInputs = (Vec<PathBuf>, Vec<crate::jq_stream_errors::Opener>);
+/// The input files that opened, how to open each again for the reader, and what the reader says
+/// when it asks past the last of them ([`open_chunked_inputs`]).
+type ChunkedInputs = (
+    Vec<PathBuf>,
+    Vec<crate::jq_stream_errors::Opener>,
+    crate::jq_stream_errors::Tail,
+    bool,
+);
+
+/// Wraps `open` so that the reader, on reaching the source, first says what jq says of the files
+/// that would not open before it (#6485): jq reports a file when its reader gets there, and one
+/// the reader never reaches, past a fault or a program that stopped asking, is not reported.
+fn report_unopened_before(
+    failures: Vec<InputFileOpenError>,
+    open: crate::jq_stream_errors::Opener,
+) -> crate::jq_stream_errors::Opener {
+    if failures.is_empty() {
+        return open;
+    }
+    Box::new(move || {
+        report_lazy_open_failures(&failures);
+        open()
+    })
+}
+
+/// Reports `failures` as reached by the reader, which makes the run exit 2 ([`LAZY_OPEN_FAILED`]).
+fn report_lazy_open_failures(failures: &[InputFileOpenError]) {
+    for failure in failures {
+        // A directory said last is reported here too: the reader asked past it (#6472 only keeps
+        // quiet for a run that ends at it).
+        report_usage_error(&failure.to_string());
+        LAZY_OPEN_FAILED.with(|seen| seen.set(true));
+    }
+}
 
 /// Open the main input files, or stdin, for the stream reader (#5498): a source that does not
 /// open is reported and left out, as [`read_input_files`] does (#5472).
@@ -8973,7 +9006,7 @@ type ChunkedInputs = (Vec<PathBuf>, Vec<crate::jq_stream_errors::Opener>);
 /// the front of its input (#5291) is found on the first source that has bytes. The reader opens
 /// each file when it gets to it and drops it when it is read, so a run over many files holds one.
 /// Stdin is read for its first bytes and kept.
-fn open_chunked_inputs(files: &[PathBuf], open_failed: &mut bool) -> Result<ChunkedInputs> {
+fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     let mut opened = Vec::with_capacity(files.len());
     let mut openers: Vec<crate::jq_stream_errors::Opener> = Vec::with_capacity(files.len().max(1));
     let mut look_for_bom = true;
@@ -8987,8 +9020,11 @@ fn open_chunked_inputs(files: &[PathBuf], open_failed: &mut bool) -> Result<Chun
             let rest = std::io::Cursor::new(head[skip..].to_vec()).chain(stdin);
             Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, rest)))
         }));
-        return Ok((opened, openers));
+        return Ok((opened, openers, Vec::new(), false));
     }
+    // The files that would not open since the last one that did: said when the reader reaches
+    // the next source, or its end (#6485).
+    let mut unopened: Vec<InputFileOpenError> = Vec::new();
     let mut dash_seen = false;
     for (at, path) in files.iter().enumerate() {
         if is_stdin_dash(path) {
@@ -9004,12 +9040,15 @@ fn open_chunked_inputs(files: &[PathBuf], open_failed: &mut bool) -> Result<Chun
                     let skip = bom_to_skip(&bytes[..bytes.len().min(3)], &mut look_for_bom);
                     bytes.drain(..skip);
                     opened.push(path.clone());
-                    openers.push(Box::new(move || Ok(Box::new(std::io::Cursor::new(bytes)))));
+                    openers.push(report_unopened_before(
+                        std::mem::take(&mut unopened),
+                        Box::new(move || Ok(Box::new(std::io::Cursor::new(bytes)))),
+                    ));
                 }
                 Err(e) => {
                     let e = InputFileOpenError::new(path, e.to_string());
                     note_open_failure_at(opened.len());
-                    report_unopenable_input(&e, open_failed);
+                    unopened.push(e); // patchcov: coverage tolerate-line reason="untestable: stdin failing part-way"
                 }
             }
             continue;
@@ -9022,27 +9061,53 @@ fn open_chunked_inputs(files: &[PathBuf], open_failed: &mut bool) -> Result<Chun
                 let skip = bom_to_skip(&head, &mut look_for_bom);
                 let path = path.clone();
                 opened.push(path.clone());
-                openers.push(Box::new(move || {
-                    use std::io::Seek;
-                    let mut file = std::fs::File::open(&path)?;
-                    file.seek(std::io::SeekFrom::Start(skip as u64))?;
-                    Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, file)))
-                }));
+                openers.push(report_unopened_before(
+                    std::mem::take(&mut unopened),
+                    Box::new(move || {
+                        use std::io::Seek;
+                        let mut file = std::fs::File::open(&path)?;
+                        file.seek(std::io::SeekFrom::Start(skip as u64))?;
+                        Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, file)))
+                    }),
+                ));
             }
             // #6472: a directory is a source with no bytes, past which jq's reader has moved.
             Err(e) if e.is_directory() => {
                 opened.push(path.clone());
-                openers.push(Box::new(|| Ok(Box::new(std::io::Cursor::new(Vec::new())))));
+                // jq counts the failure when its read of the directory fails, and says so on the
+                // read after it: the run fails once the reader gets here, whether or not it goes on.
+                openers.push(report_unopened_before(
+                    std::mem::take(&mut unopened),
+                    Box::new(|| {
+                        LAZY_OPEN_FAILED.with(|seen| seen.set(true));
+                        Ok(Box::new(std::io::Cursor::new(Vec::new())))
+                    }),
+                ));
                 note_open_failure_at(opened.len());
-                report_unopenable_input(&e, open_failed);
+                unopened.push(e);
             }
             Err(e) => {
                 note_open_failure_at(opened.len());
-                report_unopenable_input(&e, open_failed);
+                unopened.push(e);
             }
         }
     }
-    Ok((opened, openers))
+    // #6004: the last file named, when it did not open, is a source of its own in jq's reader, so
+    // the last file that did open does not end the stream: a number at its end waits for the next
+    // read, which opens the one that failed. A directory opened, and is a source already.
+    let tail_is_source = unopened
+        .last()
+        .is_some_and(|failure| !failure.is_directory());
+    let tail: crate::jq_stream_errors::Tail = if unopened.is_empty() {
+        Vec::new()
+    } else if tail_is_source {
+        vec![Box::new(move || report_lazy_open_failures(&unopened))]
+    } else {
+        // A directory last has been read, and counted: what jq says of it comes on a read after
+        // this one, which `jq -c --stream .` never makes and `[inputs]` does (a known gap, #6522).
+        Vec::new()
+    };
+    Ok((opened, openers, tail, tail_is_source))
 }
 
 /// The first three bytes of `reader`, or fewer at its end.
