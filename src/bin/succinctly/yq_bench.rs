@@ -400,16 +400,12 @@ fn benchmark_file(
             || run_succinctly(file_path, &config.succinctly_binary, query),
         )?
     } else {
-        let succ = interleaved_reps(
-            config.warmup_runs,
-            config.benchmark_runs,
-            || Ok(None),
-            || run_succinctly(file_path, &config.succinctly_binary, query).map(Some),
-        )?
-        .1
-        .into_iter()
-        .flatten()
-        .collect();
+        for _ in 0..config.warmup_runs {
+            let _ = run_succinctly(file_path, &config.succinctly_binary, query);
+        }
+        let succ = (0..config.benchmark_runs)
+            .map(|_| run_succinctly(file_path, &config.succinctly_binary, query))
+            .collect::<Result<Vec<_>>>()?;
         (Vec::new(), succ)
     };
     let yq_result = if has_yq {
