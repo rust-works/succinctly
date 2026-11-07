@@ -7230,6 +7230,36 @@ against the pinned jq 1.7.1 binary), so refusing with a catchable error is the s
 "would take the host process down" exception as the rest of this entry, not a new kind of
 divergence.
 
+## Standard input is read to EOF before the program runs (#6499)
+
+`succinctly jq` reads standard input to its end before it evaluates anything, on every route but `--stream`.
+jq reads as it goes.
+A pipe that stays open therefore prints nothing until it closes, and one that never closes grows until the process is killed.
+This is a known limitation, not supported at this stage: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
+Reading stdin incrementally is not in scope here, because it needs a design of its own (what releases consumed text, given that a fault is worded by re-reading it).
+
+First output when one record is written, the pipe is held open for two seconds, and a second record follows, with `--unbuffered` on both tools (without it, jq's own stdout buffering hides the difference):
+
+| program                          | jq 1.7.1 | succinctly |
+|----------------------------------|---------:|-----------:|
+| `-c .a`                          |   0.00 s |     2.00 s |
+| `-R .`                           |   0.00 s |     2.00 s |
+| `--seq -c .a`                    |   0.00 s |     2.00 s |
+| `-n input`, `-n first(inputs)`   |   0.00 s |     2.00 s |
+| `--stream -c .`                  |   0.00 s |     0.00 s |
+
+The two spellings of `-n` are the partial case.
+A lone source starts its lazy read on its front since [#6451](https://github.com/rust-works/succinctly/issues/6451), reading the first 256 KiB, so they stop on an endless stream; on a quiet pipe they wait for 256 KiB or for EOF.
+`--stream` reads a chunk at a time (`ChunkedSources`, [#5498](https://github.com/rust-works/succinctly/issues/5498)).
+The cause on the other routes is that `read_stdin_bytes` is `read_to_end`, and the plain route then splits the whole text into values before its loop.
+
+An endless stream into `head -1` shows the cost, under a 400 MB cap (`yes '{"a":1}' | TOOL -c .a | head -1`): jq exits after 1 MB, and succinctly is killed at the cap.
+The same holds for `-R .` and `--seq -c .a`.
+`-n input`, `-n first(inputs)` and `--stream -c .` exit after 1 MB or less in both tools.
+A caller that pipes a producer that does not end has to bound it (`head -c`, `timeout`), or use `--stream`.
+
+The endless-stream rows were measured on `main` @ 89a900ccc against `/usr/bin/jq` 1.7.1, and the held-open table again on c44d34dd4 with the same times; both are behaviour probes that do not depend on the machine.
+
 ## Nesting depth (#5497)
 
 [#5497](https://github.com/rust-works/succinctly/issues/5497) decided each row under ADR-0018.

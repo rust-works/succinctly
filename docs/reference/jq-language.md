@@ -637,6 +637,8 @@ rather than accepting the syntax and returning a wrong answer. Remaining `jq`-mo
 divergences (`inputs | f` does not interleave) are recorded in
 [jq Known Limitations](../compliance/jq/limitations.md).
 
+**Standard input is read to EOF before the program runs** (`--stream` excepted), where jq reads as it goes: a pipe that stays open prints nothing, and one that never ends grows until the process is killed, so bound a producer that does not end (`head -c`, `timeout`) or use `--stream` ([#6499](https://github.com/rust-works/succinctly/issues/6499), [recorded in the limitations](../compliance/jq/limitations.md#standard-input-is-read-to-eof-before-the-program-runs-6499)).
+
 ### Partial Implementation Notes
 
 1. **Variable scoping** - May not perfectly match jq edge cases
