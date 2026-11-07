@@ -35214,7 +35214,7 @@ fn wrap_lazy_zero_repeats(pattern: &str) -> Option<String> {
         return None;
     }
     // At one position the closings come first, and of two openings the longer span.
-    let mut edits: Vec<(usize, u8, usize)> = Vec::with_capacity(spans.len() * 2);
+    let mut edits: Vec<(usize, u8, usize)> = vec_with_capacity(spans.len() * 2);
     for &(start, end) in &spans {
         edits.push((start, 1, usize::MAX - end));
         edits.push((end, 0, 0));

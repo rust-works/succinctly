@@ -31,7 +31,6 @@ fn a_squeezed_plus_run_on_the_second_engine_is_refused() -> Result<()> {
         r"(?=[\s\S])a+a?a+",
         r"(?=[\s\S])a+a{0,3}a+",
         r"(?=[\s\S])a{1,}a*a{1,}",
-        r"(?=[\s\S])a+a*?a+",
         r"(?=[\s\S])a*a+a*a+",
         r"(?=[\s\S])a+a*a+a*a+",
         r"(?=[\s\S])a+b*a+",
@@ -51,6 +50,27 @@ fn a_squeezed_plus_run_on_the_second_engine_is_refused() -> Result<()> {
             assert_eq!(
                 test_on(text, pattern, "")?,
                 r#""ERR""#,
+                "{text:?} ~ {pattern:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A lazy repeat between the two plusses is written so that the engine does not merge it (#6460),
+/// and is answered as jq answers it, where it was refused.
+#[test]
+fn a_lazy_repeat_between_two_plusses_is_answered_6460() -> Result<()> {
+    for pattern in [r"(?=[\s\S])a+a*?a+", r"(?=[\s\S])a+a??a+"] {
+        for (text, expected) in [
+            ("a", "false"),
+            ("aa", "true"),
+            ("aba", "false"),
+            ("aaa", "true"),
+        ] {
+            assert_eq!(
+                test_on(text, pattern, "")?,
+                expected,
                 "{text:?} ~ {pattern:?}"
             );
         }

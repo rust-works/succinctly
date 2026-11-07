@@ -7574,6 +7574,7 @@ Three differences remain.
 - **Two greedy `X+` repeats with one optional repeat between them are refused on the second engine (#6096).**
   `fancy-regex` 0.20.0 answers wrongly for them: `"a" | test("(?=a)a+a*a+")` is `true` there, and `false` in jq and in the `regex` crate.
   It is wrong for `a+b*a+` and `.+.*.+` too (the repeat between the plusses can be any atom, and any `{0,n}`), for a chain of them (`a+b*a+b*a+` on `aa`), and for `(?:ab)+c*(?:ab)+`.
+  A lazy repeat between them (`a+a*?a+`) is answered as jq does since [#6460](https://github.com/rust-works/succinctly/issues/6460), where it was refused here too.
   Two repeats between them, a mandatory item, a different atom for either plus, bounded repeats such as `a{1,3}b*a{1,3}`, a lazy plus at either end, and an alternation or a capture group as the middle repeat (`a+(?:a|)a+`, `a+(a*)a+`) are answered correctly, and not refused.
   The shape is found wherever it sits: inside a group, an alternation, an atomic group, a look-ahead or a look-behind.
   A pattern with the shape that needs the second engine (a lookaround, a backreference, `\K`) gets the crate's parse error whatever the text, though the engine answers some texts right (`aa` for `a+a*a+`), since a pattern cannot tell which.
