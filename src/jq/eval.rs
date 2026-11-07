@@ -28191,10 +28191,11 @@ impl JqRegex {
         }
         match exact.engine() {
             // A search that fails (its backtrack limit) keeps the crate's match, as before.
-            Some(engine) => Ok(match engine.captures_from_pos(input, start) {
-                Ok(found) => found.map(RegexCaptures::Fancy),
-                Err(_) => caps,
-            }),
+            Some(engine) => Ok(engine
+                .captures_from_pos(input, start)
+                .ok()
+                .map(|found| found.map(RegexCaptures::Fancy))
+                .unwrap_or(caps)),
             None => Ok(caps),
         }
     }
@@ -139960,28 +139961,47 @@ mod tests {
     fn a_caret_at_the_end_is_checked_on_the_loop_engine_too_6456() {
         // A loop over a group that can match empty is read through the rewritten engine; its match
         // that ends at the end of the text is asked of the exact engine as the plain one's is.
-        for pattern in [
+        let candidates = [
             "(?m)^(a|b*)+\\n?",
             "(?m)^(b*|a)+\\n?",
             "(?m)^(a*)*\\n?",
             "(?m)^(?:(a)|b*)+\\n?",
-        ] {
+        ];
+        let (pattern, re) = candidates
+            .iter()
+            .map(|pattern| {
+                (
+                    pattern,
+                    build_regex_uncached::<JqSemantics>(pattern, Some("g")).unwrap(),
+                )
+            })
+            .find(|(_, re)| matches!(re.engine, RegexEngine::Rewritten { .. }))
+            .expect("no candidate took the rewritten engine");
+        assert!(re.caret_end.is_some(), "{pattern}");
+        let caps = re.captures_at("a\n", 0).unwrap().unwrap();
+        assert_eq!(
+            caps.get(0).map(|m| (m.start(), m.end())),
+            Some((0, 2)),
+            "{pattern}"
+        );
+        // The second search starts at the end: `^` does not hold there, so there is no match.
+        assert!(re.captures_at("a\n", 2).unwrap().is_none(), "{pattern}");
+    }
+
+    /// A loop the rewrite wrote, whose `$` the two views of a final newline disagree on, takes the
+    /// captures of the exact engine as they are (#6456 coverage of the `Rewritten` arm).
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_rewritten_loop_takes_the_exact_engine_s_captures_at_a_final_newline_6456() {
+        for pattern in ["(a|\\s*)+$", "(\\n|a*)+$"] {
             let re = build_regex_uncached::<JqSemantics>(pattern, Some("g")).unwrap();
-            if !matches!(re.engine, RegexEngine::Rewritten { .. }) {
-                continue;
-            }
-            assert!(re.caret_end.is_some(), "{pattern}");
-            let caps = re.captures_at("a\n", 0).unwrap().unwrap();
-            assert_eq!(
-                caps.get(0).map(|m| (m.start(), m.end())),
-                Some((0, 2)),
+            assert!(
+                matches!(re.engine, RegexEngine::Rewritten { .. }),
                 "{pattern}"
             );
-            // The second search starts at the end: `^` does not hold there, so there is no match.
-            assert!(re.captures_at("a\n", 2).unwrap().is_none(), "{pattern}");
-            return;
+            let caps = re.captures_at("a\n", 0).unwrap().unwrap();
+            assert!(matches!(caps, RegexCaptures::Fancy(_)), "{pattern}");
         }
-        panic!("no candidate took the rewritten engine");
     }
 
     /// #6426: `fancy-regex` 0.20 rewrites `b+a*?b*` as `b+(?:a+?b*)?`, which makes the lazy repeat
