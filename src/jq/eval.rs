@@ -139795,6 +139795,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "regex")]
     #[test]
     fn test_pattern_may_enable_multiline() {
         assert!(!pattern_may_enable_multiline("a$"));
