@@ -108959,6 +108959,22 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     QueryResult::Owned(OwnedValue::Null)
 }
 
+/// The refusal of `strenv` and `env` for a variable `std::env::var` does not hand back (#6566): an
+/// unset one is "not provided", as yq words it. A set one whose value is not valid UTF-8 is not
+/// unset: yq reads its bytes, and an `OwnedValue::String` cannot hold them, so it is refused as
+/// what it is (a recorded divergence) rather than reported as missing.
+#[cfg(feature = "std")]
+fn env_value_refusal(name: &str, builtin: &str, error: &std::env::VarError) -> String {
+    match error {
+        std::env::VarError::NotUnicode(_) => {
+            format!("value for env variable '{name}' is not valid UTF-8 in {builtin}")
+        }
+        std::env::VarError::NotPresent => {
+            format!("value for env variable '{name}' not provided in {builtin}")
+        }
+    }
+}
+
 /// Builtin: env(VAR_NAME) - get environment variable by literal name (yq syntax)
 #[cfg(feature = "std")]
 fn builtin_env_object<'a, W: Clone + AsRef<[u64]>>(
@@ -108968,9 +108984,7 @@ fn builtin_env_object<'a, W: Clone + AsRef<[u64]>>(
     match std::env::var(name) {
         Ok(val) => QueryResult::Owned(OwnedValue::String(val.into())),
         Err(_) if optional => QueryResult::None,
-        Err(_) => QueryResult::Error(EvalError::new(format!(
-            "value for env variable '{name}' not provided in env()"
-        ))),
+        Err(error) => QueryResult::Error(EvalError::new(env_value_refusal(name, "env()", &error))),
     }
 }
 
@@ -108996,9 +109010,9 @@ fn builtin_strenv<'a, W: Clone + AsRef<[u64]>>(name: &str, optional: bool) -> Qu
     match std::env::var(name) {
         Ok(val) => QueryResult::Owned(OwnedValue::String(val.into())),
         Err(_) if optional => QueryResult::None,
-        Err(_) => QueryResult::Error(EvalError::new(format!(
-            "value for env variable '{name}' not provided in strenv()"
-        ))),
+        Err(error) => {
+            QueryResult::Error(EvalError::new(env_value_refusal(name, "strenv()", &error)))
+        }
     }
 }
 
