@@ -15207,9 +15207,11 @@ fn owned_state_scalar_direct<S: EvalSemantics>(
 
 /// `length`, or `READ | length` with `READ` a pure read ([`eval_owned_pure`]), of a container, a
 /// string or `null` (#6549): `.a | length` beside a fold step that grows `.a`. The count is a fresh
-/// integer, never a subvalue, so the container read to take it may be any size and is not copied;
-/// the rebuilt route serialised the whole state to count one field. A number, a boolean, a read
-/// that raises and anything else declines, and the evaluator keeps its rules and text.
+/// integer, never a subvalue, and is [`eval_owned_count_door`]'s, the one the bridge's answer is
+/// checked against. A read of static steps is borrowed off the tree, so a string of any length is
+/// counted where it is; the rebuilt route serialised the whole state to count one field. A number,
+/// a boolean, a read that raises and anything else declines, and the evaluator keeps its rules and
+/// text.
 fn owned_state_length_direct<S: EvalSemantics>(
     expr: &Expr,
     state: &OwnedValue,
@@ -15223,17 +15225,22 @@ fn owned_state_length_direct<S: EvalSemantics>(
         length if is_length(length) => (&[][..], length),
         _ => return None,
     };
+    let count = |value: &OwnedValue| match value {
+        OwnedValue::Null => Some(OwnedValue::Int(0)),
+        other => eval_owned_count_door::<S>(length, other),
+    };
+    let borrowed = reads.iter().try_fold(state, |at, read| {
+        owned_assign_step_child(&static_step(unwrap_paren(read))?, at)
+    });
+    if let Some(value) = borrowed {
+        return count(value);
+    }
     let mut value = None;
     for read in reads {
         let at = value.as_ref().unwrap_or(state);
         value = Some(eval_owned_pure::<S>(read, at, ResultPosition::Operand)?.ok()?);
     }
-    let value = value.as_ref().unwrap_or(state);
-    match value {
-        OwnedValue::Null => Some(OwnedValue::Int(0)),
-        OwnedValue::String(_) => eval_owned_string_door::<S>(length, value),
-        _ => eval_owned_length(length, value),
-    }
+    count(value.as_ref().unwrap_or(state))
 }
 
 /// An integer (or an integer literal spelled as its own digits) no larger than 2^53: the range in
@@ -88713,12 +88720,13 @@ impl<'e> FreeMember<'e> {
 fn free_slots_disjoint<'m, 'e: 'm>(
     members: impl Iterator<Item = &'m FreeMember<'e>> + Clone,
 ) -> bool {
+    // Every slot against the ones before it, counted over the present slots only, so a `None`
+    // anywhere leaves the comparison on the same basis.
     fn disjoint(slots: &[Option<&SlotPath<'_>>]) -> bool {
-        slots
-            .iter()
-            .flatten()
+        let present = || slots.iter().flatten();
+        present()
             .enumerate()
-            .all(|(at, slot)| !slots[..at].iter().flatten().any(|held| held.overlaps(slot)))
+            .all(|(at, slot)| !present().take(at).any(|held| held.overlaps(slot)))
     }
     // The common step moves one or two slots and nests nothing: check those where they are,
     // without collecting them (a step's allocation is a measurable share of a short fold step).
@@ -88774,18 +88782,15 @@ fn settle_free_slot<'e, S: EvalSemantics>(
             right,
             ..
         } => {
-            // Fold the right operands of a left-nested chain into one, innermost first.
-            let mut right = owned_assign_operand_off_the_tree::<S>(right, state)?;
+            // The base of a left-nested chain first, so a member whose base is no slot declines
+            // before any operand is evaluated.
             let mut base = unwrap_paren(left);
             while let Expr::Arithmetic {
                 op: ArithOp::Add,
                 left,
-                right: earlier,
                 ..
             } = base
             {
-                let earlier = owned_assign_operand_off_the_tree::<S>(earlier, state)?;
-                right = free_plus::<S>(earlier, right)?;
                 base = unwrap_paren(left);
             }
             let (path, default) = match base {
@@ -88796,6 +88801,20 @@ fn settle_free_slot<'e, S: EvalSemantics>(
                 read => (SlotPath::of(read)?, None),
             };
             let old = path.peek(state)?;
+            // Then the right operands, folded into one, innermost first.
+            let mut right = owned_assign_operand_off_the_tree::<S>(right, state)?;
+            let mut link = unwrap_paren(left);
+            while let Expr::Arithmetic {
+                op: ArithOp::Add,
+                left,
+                right: earlier,
+                ..
+            } = link
+            {
+                let earlier = owned_assign_operand_off_the_tree::<S>(earlier, state)?;
+                right = free_plus::<S>(earlier, right)?;
+                link = unwrap_paren(left);
+            }
             let left = match &default {
                 Some(default) if !old.is_truthy() => default,
                 _ => old,
@@ -88833,6 +88852,13 @@ fn settle_free_slot<'e, S: EvalSemantics>(
                         }
                     }
                 };
+                // A repeated key takes the last value (at the first position), so an earlier member
+                // under it is overwritten and need not move its slot.
+                for (held, earlier) in &mut parts {
+                    if *held == key && matches!(earlier, FreePart::Member(_)) {
+                        *earlier = FreePart::Value(OwnedValue::Null);
+                    }
+                }
                 parts.push((key, settle_free_part::<S>(&entry.value, state)?));
             }
             Some(FreeMember::Nested(FreeShape::Object(parts)))
@@ -178242,6 +178268,9 @@ mod named_args_shared_tests_5690 {
             "{wrap: {arr: [(.arr[0] + [9]), .arr[1]]}}",
             "[[.a], {b: .b}]",
             "{n: [empty], a: (.a + [1])}",
+            // A repeated key in a nested constructor drops the overwritten member's move.
+            "{x: {k: .a, k: (.a + [1])}}",
+            "{x: {k: (.a + [1]), k: .b, j: .a}}",
             "{a: ((.a // []) + [9])}",
             "{z: ((.z // []) + [9])}",
             "{m: ((.missing // {}) + {k: 1})}",
