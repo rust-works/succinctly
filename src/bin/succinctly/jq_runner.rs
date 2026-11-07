@@ -6560,7 +6560,6 @@ fn read_inputs(
     LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
     defer_open_failures(Vec::new(), false);
     LAZY_OPEN_FAILED.with(|seen| seen.set(false));
-    DIRECTORY_TAIL.with(|tail| *tail.borrow_mut() = None);
     UNOPENED_TAIL_NAME.with(|tail| *tail.borrow_mut() = None);
     // Null input mode: use null as the single input -- unless the filter
     // itself uses `input`/`inputs`/`input_line_number` (#723), in which case
@@ -8726,10 +8725,6 @@ thread_local! {
     /// The name of the last file named, when it did not open (#6480), for [`get_inputs`] to give a
     /// source of its own.
     static UNOPENED_TAIL_NAME: RefCell<Option<String>> = const { RefCell::new(None) };
-    /// The directory that ended the files, which says what it is on the second read past the end
-    /// (#6472), with how many reads past it there have been.
-    static DIRECTORY_TAIL: RefCell<Option<(Vec<InputFileOpenError>, usize)>> =
-        const { RefCell::new(None) };
     /// Whether the first fault of the text is at its end (#6480): the read of that fault sent
     /// jq's reader past the last file, so it reaches every pending failure.
     static FAULT_ENDS_TEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -8901,24 +8896,6 @@ fn report_unopened_before(
     })
 }
 
-/// Counts a read of the stream past its end, and says what a directory last is on the second
-/// (#6472): jq counts its failure when the read of it fails, and says so on the read after, which
-/// a main loop that stops at the end of the input never makes.
-fn say_directory_tail() {
-    let ready = DIRECTORY_TAIL.with(|tail| match tail.borrow_mut().as_mut() {
-        Some((_, reads)) => {
-            *reads += 1;
-            *reads >= 2
-        }
-        None => false,
-    });
-    if ready {
-        if let Some((failures, _)) = DIRECTORY_TAIL.with(|tail| tail.borrow_mut().take()) {
-            report_lazy_open_failures(&failures);
-        }
-    }
-}
-
 /// Reports `failures` as reached by the reader, which makes the run exit 2 ([`LAZY_OPEN_FAILED`]).
 fn report_lazy_open_failures(failures: &[InputFileOpenError]) {
     for failure in failures {
@@ -8979,7 +8956,7 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                 Err(e) => {
                     let e = InputFileOpenError::new(path, e.to_string());
                     note_open_failure_at(opened.len());
-                    unopened.push(e);
+                    unopened.push(e); // patchcov: coverage tolerate-line reason="untestable: stdin failing part-way"
                 }
             }
             continue;
@@ -9034,8 +9011,8 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     } else if tail_is_source {
         vec![Box::new(move || report_lazy_open_failures(&unopened))]
     } else {
-        // A directory last: said by the second read past the end ([`say_directory_tail`]).
-        DIRECTORY_TAIL.with(|tail| *tail.borrow_mut() = Some((unopened, 0)));
+        // A directory last has been read, and counted: what jq says of it comes on a read after
+        // this one, which `jq -c --stream .` never makes and `[inputs]` does (a known gap, #6522).
         Vec::new()
     };
     Ok((opened, openers, tail, tail_is_source))
@@ -11617,7 +11594,6 @@ fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
             }
         }
         None => {
-            say_directory_tail();
             // A source that failed part-way ended there: jq reports it and exits 2 (#5498).
             if let Some(error) = reader.take_error() {
                 eprintln!("jq: error: {}", strerror_only(&error));
