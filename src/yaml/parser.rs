@@ -10686,7 +10686,7 @@ fn trim_spaces_end(bytes: &[u8]) -> &[u8] {
 /// comes back without the whitespace before the properties. A `#` opens a comment only outside a
 /// quoted key (`"x # y":`), a quote opens one only at the start of a token (`it's` does not), and
 /// a property never starts inside one, so `"a: !x":` has none.
-fn split_trailing_properties(line: &[u8]) -> (&[u8], &[u8]) {
+pub(crate) fn split_trailing_properties(line: &[u8]) -> (&[u8], &[u8]) {
     let mut quote = None;
     let mut code_end = line.len();
     // The first byte past the last closing quote: no property token starts before it.
