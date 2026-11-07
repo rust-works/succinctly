@@ -121,6 +121,7 @@ fn parse_errors_among_the_documents_are_delivered_in_order_4311() {
 /// #6475: every read tells the hook where it reached -- the source of the document or parse error it
 /// returns, and `None` once it finds the stream at its end -- before it returns, so a driver can say
 /// what a file it could not open stood in the way of at the read that gets there.
+/// #6480: and whether it is a parse error, whose read may have taken jq's reader past the last file.
 #[test]
 fn a_read_tells_the_hook_which_source_it_reached_6475() {
     let seen = Rc::new(RefCell::new(Vec::new()));
@@ -130,33 +131,56 @@ fn a_read_tells_the_hook_which_source_it_reached_6475() {
         vec![(1, EvalError::new("e"), (0, 9))],
     );
     let sink = Rc::clone(&seen);
-    set_input_read_hook(move |source| sink.borrow_mut().push(source));
+    set_input_read_hook(move |source, fault| sink.borrow_mut().push((source, fault)));
     for _ in 0..5 {
         let _ = pop_input();
     }
     // The document, the parse error after it, the document of the next source, then the end, which
     // every read past it reports again.
-    assert_eq!(*seen.borrow(), [Some(0), Some(0), Some(1), None, None]);
+    assert_eq!(
+        *seen.borrow(),
+        [
+            (Some(0), false),
+            (Some(0), true),
+            (Some(1), false),
+            (None, false),
+            (None, false)
+        ]
+    );
 }
 
 /// The same for a stream the CLI produces as it is read, and a seed clears the hook.
 #[test]
 fn a_producer_read_tells_the_hook_and_a_seed_clears_it_6475() {
     let seen = Rc::new(RefCell::new(Vec::new()));
-    let mut left = vec![(OwnedValue::Int(1), 0u32, 1u32), (OwnedValue::Int(2), 2, 2)];
+    let mut left = vec![
+        Some((OwnedValue::Int(1), 0u32, 1u32)),
+        Some((OwnedValue::Int(2), 2, 2)),
+        None,
+    ];
     left.reverse();
     seed_remaining_inputs_from(Box::new(move || match left.pop() {
-        Some((value, source, line)) => ProducedInput::Document(value, source, line),
+        Some(Some((value, source, line))) => ProducedInput::Document(value, source, line),
+        // A parse error the producer raises (#6480).
+        Some(None) => ProducedInput::Error(EvalError::new("e"), (2, 3)),
         None => ProducedInput::End(Some((2, 3))),
     }));
     let sink = Rc::clone(&seen);
-    set_input_read_hook(move |source| sink.borrow_mut().push(source));
-    for _ in 0..3 {
+    set_input_read_hook(move |source, fault| sink.borrow_mut().push((source, fault)));
+    for _ in 0..4 {
         let _ = pop_input();
     }
-    assert_eq!(*seen.borrow(), [Some(0), Some(2), None]);
+    assert_eq!(
+        *seen.borrow(),
+        [
+            (Some(0), false),
+            (Some(2), false),
+            (Some(2), true),
+            (None, false)
+        ]
+    );
 
     seed_remaining_inputs_with_errors(vec![(OwnedValue::Int(3), 0, 1)], None, Vec::new());
     let _ = pop_input();
-    assert_eq!(seen.borrow().len(), 3, "the seed cleared the hook");
+    assert_eq!(seen.borrow().len(), 4, "the seed cleared the hook");
 }
