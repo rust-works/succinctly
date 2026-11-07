@@ -88495,7 +88495,9 @@ fn fold_step_each<S: EvalSemantics>(
 /// ([`owned_assign_pipe_step`], jq mode, not under the table), so a field one stage extends is not
 /// copied by the next. And (#6575) any pipe whose stages each yield one value
 /// ([`owned_stage_pipe_step`]), each stage a step in turn, a later one that is not running through
-/// [`eval_each_owned`] on the state so far.
+/// [`eval_each_owned`] on the state so far. And (#6582) `SOURCE as $v | BODY` with a scalar source
+/// read off the state ([`owned_as_bind_step`], jq mode, not under the table), spliced into `BODY`,
+/// which is then a step or a closed value.
 ///
 /// [`owned_if_step`] (#6569) answers a branch that is `.` or closed even while the table below is
 /// live: `.` is the state unchanged, and a closed value comes from [`closed_expr_to_owned`], which
@@ -88581,7 +88583,9 @@ fn owned_update_step_as<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> Own
 /// `SOURCE` is settled by [`owned_assign_operand_off_the_tree`]: one value, no effect, no rebuilt
 /// state. A source it does not settle, or that is a container (whose splice would cost a copy of
 /// it every step), declines with the state untouched, as does a `BODY` that is neither a step nor
-/// closed. jq mode only, and not under the #2889 embed table.
+/// closed. jq mode only, and not under the #2889 embed table. Out of line: it recurses through
+/// [`owned_update_step`] for a nested binding, and keeps that frame small.
+#[inline(never)]
 fn owned_as_bind_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
     let (
         EvalTag::Jq,

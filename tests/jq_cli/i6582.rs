@@ -74,3 +74,16 @@ fn a_long_as_binding_fold_answers_6582() -> Result<()> {
     assert_eq!((stdout.as_str(), code), ("0\n", 0));
     Ok(())
 }
+
+/// `while` emits every state it steps from, so its step gets a second reference to the state; the
+/// binding answers all the same. The answer is jq 1.7.1's.
+#[test]
+fn a_while_as_binding_step_answers_6582() -> Result<()> {
+    let filter = "[{n: 0} | while(.n < 3; .n as $n | .n = $n + 1)]";
+    let (stdout, _, code) = run_jq_full(&["-nc", filter], None)?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[{\"n\":0},{\"n\":1},{\"n\":2}]\n", 0)
+    );
+    Ok(())
+}
