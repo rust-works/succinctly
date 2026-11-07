@@ -290,6 +290,13 @@ pub struct SemiIndex {
 /// cap must stay above that.
 const MAX_NESTING_DEPTH: usize = 128;
 
+/// The key a content line opens with, past its `- ` markers (`Parser::previous_line_key`, #6540).
+struct PreviousLineKey<'a> {
+    column: usize,
+    text: &'a [u8],
+    in_sequence: bool,
+}
+
 /// A plain scalar the scanner just read: `start..end` in the input, and the indent of the
 /// innermost open block when it began (#5068).
 #[derive(Clone, Copy)]
@@ -9820,9 +9827,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// key's column is the line's indent plus the `- ` markers it opens with, so the compact
     /// mapping of a sequence item (`- k:`) stands where its continuation lines do.
     fn previous_content_line_defers_a_value_at(&self, indent: usize) -> bool {
-        let Some((lead, rest)) = self.previous_content_line() else {
-            return false;
-        };
+        self.previous_line_key().is_some_and(|key| {
+            key.column == indent && line_ends_with_colon_after_properties(key.text)
+        })
+    }
+
+    /// The key the previous content line opens with, past the `- ` markers that precede it: its
+    /// column (the line's indent plus the markers, as their spacing leaves it), the text from the
+    /// key on, and whether any marker was there (a sequence item, where yq's refusal reads `did
+    /// not find expected '-' indicator` and a mapping's reads `did not find expected key`). One
+    /// walk for [`Self::previous_content_line_defers_a_value_at`] and
+    /// [`Self::header_is_left_of_the_deferring_key`] (#6540), so the two cannot disagree on where
+    /// a key stands.
+    fn previous_line_key(&self) -> Option<PreviousLineKey<'_>> {
+        let (lead, rest) = self.previous_content_line()?;
         let mut marker_len = 0;
         while rest.get(marker_len) == Some(&b'-')
             && Self::is_ws_break_or_eoi(rest.get(marker_len + 1).copied())
@@ -9832,7 +9850,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 marker_len += 1;
             }
         }
-        lead + marker_len == indent && line_ends_with_colon_after_properties(&rest[marker_len..])
+        Some(PreviousLineKey {
+            column: lead + marker_len,
+            text: &rest[marker_len..],
+            in_sequence: marker_len > 0,
+        })
     }
 
     /// Whether the nearest earlier line that is neither blank nor a comment leaves its value for
@@ -9845,6 +9867,25 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             line_ends_with_colon_before_comment(rest)
                 || line_ends_with_colon_after_properties(rest)
                 || (rest[0] == b'-' && line_is_bare_dash_before_comment(rest))
+        })
+    }
+
+    /// Whether the line above leaves its value to a key (`- k:`, `- - k: &y`) that stands to the
+    /// right of `indent` (#6540): a block scalar header on a line of its own there is left of the
+    /// key it would be the value of, so it is no value slot. yq refuses it with `did not find
+    /// expected '-' indicator`; a header at the key's own column (`- k:` / `  |`) or to its right
+    /// is the key's value. The key's column is the line's indent plus the `- ` markers it opens
+    /// with, as [`Self::previous_content_line_defers_a_value_at`] reads it; a bare dash owns its
+    /// header by [`Self::dash_above_owns_header_at`], and an explicit `?` line is not judged.
+    fn header_is_left_of_the_deferring_key(&self, indent: usize) -> Option<&'static str> {
+        let key = self.previous_line_key()?;
+        (indent < key.column
+            && (line_ends_with_colon_before_comment(key.text)
+                || line_ends_with_colon_after_properties(key.text)))
+        .then_some(if key.in_sequence {
+            "did not find expected '-' indicator"
+        } else {
+            "did not find expected key"
         })
     }
 
@@ -10542,6 +10583,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     && (self.previous_content_line_defers_its_value()
                         || self.dash_above_owns_header_at(indent)) =>
             {
+                if let Some(what) = self.header_is_left_of_the_deferring_key(indent) {
+                    return Err(self.err_unexpected_char(self.pos, what));
+                }
                 self.check_mapping_under_mapping_gap(indent)?;
                 // #6390: a header at the column of the bare `-` above is that item's value, so the
                 // item stays open for it (`-` / `|` / `  t` is `["t\n"]`).
