@@ -88495,7 +88495,9 @@ fn fold_step_each<S: EvalSemantics>(
 /// ([`owned_assign_pipe_step`], jq mode, not under the table), so a field one stage extends is not
 /// copied by the next. And (#6575) any pipe whose stages each yield one value
 /// ([`owned_stage_pipe_step`]), each stage a step in turn, a later one that is not running through
-/// [`eval_each_owned`] on the state so far.
+/// [`eval_each_owned`] on the state so far. And (#6582) `SOURCE as $v | BODY` with a scalar source
+/// read off the state ([`owned_as_bind_step`], jq mode, not under the table), spliced into `BODY`,
+/// which is then a step or a closed value.
 ///
 /// [`owned_if_step`] (#6569) answers a branch that is `.` or closed even while the table below is
 /// live: `.` is the state unchanged, and a closed value comes from [`closed_expr_to_owned`], which
@@ -88535,6 +88537,9 @@ pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue
                 Err(state) if matches!(unwrap_paren(expr), Expr::Pipe(_)) => {
                     owned_update_step_pipe::<S>(expr, state)
                 }
+                Err(state) if matches!(unwrap_paren(expr), Expr::As { .. }) => {
+                    owned_update_step_as::<S>(expr, state)
+                }
                 Err(state) => owned_update_step_arith::<S>(expr, state),
             },
         };
@@ -88550,7 +88555,66 @@ pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue
     if matches!(expr, Expr::Pipe(_)) {
         return owned_update_step_pipe::<S>(expr, state);
     }
+    // `SOURCE as $v | BODY` (#6582), the same way.
+    if matches!(expr, Expr::As { .. }) {
+        return owned_update_step_as::<S>(expr, state);
+    }
     owned_update_step_arith::<S>(expr, state)
+}
+
+/// `SOURCE as $v | BODY` as [`owned_update_step`]'s UPDATE: the route an `as` already had (#3978:
+/// a closed source bound into an assignment, through [`try_eval_owned_step`]), then, when it
+/// declines, [`owned_as_bind_step`].
+#[inline(never)]
+fn owned_update_step_as<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
+    match owned_update_step_arith::<S>(expr, state) {
+        OwnedStep::Declined(state) => owned_as_bind_step::<S>(expr, state),
+        done => done,
+    }
+}
+
+/// `SOURCE as $v | BODY` whose `SOURCE` is one scalar read off the state (#6582): `. as $s | $s +
+/// $i`, `(. + $i) as $t | $t`. The scalar is spliced into `BODY` as a literal, as the fold splices
+/// its loop variable ([`substitute_var`]), and `BODY` is answered as a step on the state, or, when
+/// it is no step, as the closed value it then is (#6569 answers an `if` branch the same way).
+/// Through the evaluator's route each step evaluated the whole binding on a re-indexed copy of
+/// the state: 0.33x-0.45x of jq 1.7.1.
+///
+/// `SOURCE` is settled by [`owned_assign_operand_off_the_tree`]: one value, no effect, no rebuilt
+/// state. A source it does not settle, or that is a container (whose splice would cost a copy of
+/// it every step), declines with the state untouched, as does a `BODY` that is neither a step nor
+/// closed. jq mode only, and not under the #2889 embed table. Out of line: it recurses through
+/// [`owned_update_step`] for a nested binding, and keeps that frame small.
+#[inline(never)]
+fn owned_as_bind_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
+    let (
+        EvalTag::Jq,
+        Expr::As {
+            expr: source,
+            var,
+            body,
+        },
+    ) = (S::TAG, unwrap_paren(expr))
+    else {
+        return OwnedStep::Declined(state);
+    };
+    if super::eval_generic::embed_table_active() {
+        return OwnedStep::Declined(state);
+    }
+    let bound = match owned_assign_operand_off_the_tree::<S>(source, &state) {
+        Some(OwnedValue::Array(_) | OwnedValue::Object(_)) | None => {
+            return OwnedStep::Declined(state);
+        }
+        Some(scalar) => scalar,
+    };
+    let body = substitute_var(body, var, &bound);
+    match owned_update_step::<S>(&body, state) {
+        OwnedStep::Declined(state) => match closed_expr_to_owned::<S>(&body) {
+            Some(value) => OwnedStep::Handled(Ok(value)),
+            None => OwnedStep::Declined(state),
+        },
+        done => done,
+    }
 }
 
 /// A pipe as [`owned_update_step`]'s UPDATE: the routes a pipe already had (#5285's pipe of
@@ -115819,6 +115883,77 @@ mod tests {
         let _guard = embed_table_push::<JqSemantics>(Some(&origin), &mut bound);
         assert!(matches!(
             step(". + [7] | .[-3:]", list()),
+            OwnedStep::Declined(_)
+        ));
+    }
+
+    /// #6582: `SOURCE as $v | BODY` with a scalar `SOURCE` read off the state binds it and answers
+    /// `BODY` as a step, or as the closed value it then is, which is what the evaluator answers. A
+    /// container source, a source that is no operand, a destructuring pattern, and a `BODY` that is
+    /// neither decline with the state untouched.
+    #[test]
+    #[cfg(feature = "std")]
+    fn as_binding_step_binds_a_scalar_source_6582() {
+        use crate::jq::eval_generic::embed_table_push;
+
+        let state = || {
+            OwnedValue::object_from([
+                ("n".to_string(), OwnedValue::Int(4)),
+                (
+                    "l".to_string(),
+                    OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+                ),
+            ])
+        };
+        let step = |src: &str| owned_update_step::<JqSemantics>(&parse(src).unwrap(), state());
+        for src in [
+            ".n as $n | .n = $n + 1",
+            ".n as $n | {n: ($n * 2)}",
+            "(.n + 1) as $t | $t",
+            "(.n + 1) as $t | if $t > 3 then 0 else $t end",
+            "(.l | length) as $k | .l += [$k]",
+            "(.n as $n | .m = $n)",
+            ".n as $n | (.n + $n) as $m | $m",
+        ] {
+            let OwnedStep::Handled(Ok(got)) = step(src) else {
+                panic!("not handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step declined an `as` step the test lists as handled (#6582)"
+            };
+            let want = eval_owned_multi_first::<JqSemantics>(
+                &parse(src).unwrap(),
+                &state(),
+                Reentry::REBUILT,
+            )
+            .expect("evaluates")
+            .expect("one output");
+            assert_eq!(got, want, "{src}");
+        }
+        for src in [
+            ". as $s | $s",
+            ".l as $l | $l",
+            ".n as $n | . as $s | $n",
+            ".n as $n | (1, 2)",
+            ".n as $n | empty",
+            ".n as $n | .l[]",
+            ".l as [$a] | $a",
+            "input as $i | .",
+        ] {
+            let OwnedStep::Declined(back) = step(src) else {
+                panic!("handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step answered an `as` step the test lists as declined (#6582)"
+            };
+            assert_eq!(back, state(), "{src}: the declined state is untouched");
+        }
+        assert!(matches!(
+            owned_update_step::<YqSemantics>(&parse(".n as $n | .n = $n + 1").unwrap(), state()),
+            OwnedStep::Declined(_)
+        ));
+        let mut bound = state();
+        let origin = BindOrigin::Node {
+            node: 2,
+            document: 8,
+        };
+        let _guard = embed_table_push::<JqSemantics>(Some(&origin), &mut bound);
+        assert!(matches!(
+            step("(.n + 1) as $t | $t"),
             OwnedStep::Declined(_)
         ));
     }
