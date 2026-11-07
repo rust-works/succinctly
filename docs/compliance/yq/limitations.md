@@ -838,6 +838,11 @@ yq refuses them in the place of a sibling, level with the keys or items of a blo
 The properties of a document (`!!map` / `k: 1`), of a value (`a:` / `  !!map` / `  b: 1`) and of a key on its own line (`a: 1` / `&a b: 2`) are read as before.
 A `-` followed by a blank in a flow collection is the block sequence indicator, which go-yaml refuses and no plain scalar starts with: `[- x]`, `[a, - x]` and `{a: - x}` are errors in yq, and were the text `- x` here.
 `-x` and a quoted `"- x"` are text in both.
+A `-` after a node property on its line is refused in yq since [#6414](https://github.com/rust-works/succinctly/issues/6414): `&t - x`, `- &t - x`, `a: &t - x`, `- !!seq - x` and `? &t - x` are `block sequence entries are not allowed in this context`, and were the sequence `["x"]` here (`&t - a: b` was `{"- a": "b"}`).
+A property on a line of its own above the `-` (`&t` / `- x`) is the sequence's property, and is read.
+A tab among the blanks after the `-` (`-⇥x`, `- ⇥x`, `-⇥# c`) is `found character that cannot start any token`, where go-yaml skips no tab in the place of a simple key; after a `?` or `:` the blanks may end at a `#` (#6379), and after a `-` they may not.
+The library loader reads both as YAML 1.2 does, and `key: - a` with no property still reads as the sequence ([#325](https://github.com/rust-works/succinctly/issues/325), #6355).
+Over 518 generated documents (seven property forms, eleven contexts, six tails, and fourteen tab shapes in four contexts) the 409 that differed from yq in whether they are refused now agree, and a sweep of 2,308 valid documents near the two rules changed none the other way.
 Over five draws of 2,000 generated streams of two to five lines (properties, keys and items with a value left to the next line, block scalars and flow dashes), 474 that differed from yq in whether they are refused now agree and none changed the other way.
 yq prints the documents before the failing one and then the error, as for any later parse error (see above), so the stdout prefix differs.
 
