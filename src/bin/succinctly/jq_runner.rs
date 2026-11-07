@@ -11673,9 +11673,7 @@ fn seq_stream_as_plain_json(
     // instead of the walk's. Every other stream takes the walk, as before. `-s` keeps the depth
     // check the walk's answer is given below, since the array it wraps the values in is a level
     // more than the deepest value has.
-    if crate::jq_seq_reader::plain_record_sequence(&raw, crate::jq_seq_reader::PlainGuards::ALL)
-        && (!slurp || json_depth_at_most(&raw, LAZY_JSON_MAX_DEPTH))
-    {
+    if seq_stream_is_plain_records(&raw, slurp, crate::jq_seq_reader::PlainGuards::ALL) {
         for b in &mut raw {
             if *b == ASCII_RS {
                 *b = b' ';
@@ -11684,6 +11682,21 @@ fn seq_stream_as_plain_json(
         return Ok(raw);
     }
     seq_stream_walked_as_plain_json(raw, slurp)
+}
+
+/// Whether [`seq_stream_as_plain_json`] may skip the walk for `raw` (#6501): the stream is RFC 7464's
+/// own framing ([`crate::jq_seq_reader::plain_record_sequence`]), and under `-s` also shallow
+/// enough that the array the values are wrapped in stays under the nesting ceiling (#2847), which
+/// the walk's answer is given the same bound. A function of its own so that the test holds exactly
+/// this to the walk, with `guards` as the shipped [`crate::jq_seq_reader::PlainGuards::ALL`] or one
+/// dropped.
+fn seq_stream_is_plain_records(
+    raw: &[u8],
+    slurp: bool,
+    guards: crate::jq_seq_reader::PlainGuards,
+) -> bool {
+    crate::jq_seq_reader::plain_record_sequence(raw, guards)
+        && (!slurp || json_depth_at_most(raw, LAZY_JSON_MAX_DEPTH))
 }
 
 /// [`seq_stream_as_plain_json`]'s decision by the walk of jq's reader, for the streams
@@ -22514,7 +22527,27 @@ mod plain_record_sequence_tests {
         "n",
         "1e",
         "-",
+        // Past double range, long digit strings, lone surrogates in a key, an escaped RS, and the
+        // nesting either side of the validator's limit of 128.
+        "1e999",
+        "-1e999",
+        "1e-999",
+        "123456789012345678901234567890",
+        "0.1e1",
+        r#"{"\udc00":1}"#,
+        r#"{"\ud800\udc00":[]}"#,
+        r#""a\u001eb""#,
+        "\"a\x1eb\"",
+        "\"a\x01b\"",
+        "[1]\r",
+        "{\"a\":\t1}",
     ];
+    /// `[[...]]` nested `depth` levels.
+    fn nested(depth: usize) -> Vec<u8> {
+        let mut out = vec![b'['; depth];
+        out.extend(std::iter::repeat(b']').take(depth));
+        out
+    }
 
     /// Bytes a mutation inserts: RS, newlines, whitespace, structure, digits and literal letters,
     /// and control bytes.
@@ -22532,7 +22565,12 @@ mod plain_record_sequence_tests {
             if rng.chance(4) {
                 out.extend_from_slice(b"  ");
             }
-            let mut record = RECORDS[rng.below(RECORDS.len())].as_bytes().to_vec();
+            // The last two picks are the nesting either side of the validator's limit of 128.
+            let mut record = match rng.below(RECORDS.len() + 2) {
+                n if n < RECORDS.len() => RECORDS[n].as_bytes().to_vec(),
+                n if n == RECORDS.len() => nested(127),
+                _ => nested(129),
+            };
             if rng.chance(25) {
                 for _ in 0..=rng.below(2) {
                     let byte = ALPHABET[rng.below(ALPHABET.len())];
@@ -22563,9 +22601,12 @@ mod plain_record_sequence_tests {
     /// What one sweep found, over streams the runner's own gate lets through (valid UTF-8, no
     /// byte-order mark), each under `-s` and without it.
     struct Sweep {
-        /// The check said clean.
+        /// Streams the gate let through.
+        streams: u64,
+        /// Streams the check said were clean.
         accepted: u64,
-        /// The check said clean and the walk did not, or blanked to different text.
+        /// Checks (a stream under one `-s` value) where the check said clean and the walk did not,
+        /// or blanked to different text.
         unsound: u64,
         /// The first stream that was.
         example: Option<Vec<u8>>,
@@ -22573,6 +22614,7 @@ mod plain_record_sequence_tests {
 
     fn sweep(guards: PlainGuards, cases: u64) -> Sweep {
         let mut found = Sweep {
+            streams: 0,
             accepted: 0,
             unsound: 0,
             example: None,
@@ -22583,15 +22625,17 @@ mod plain_record_sequence_tests {
             if raw.first() == Some(&0xEF) || std::str::from_utf8(&raw).is_err() {
                 continue;
             }
-            if !plain_record_sequence(&raw, guards) {
-                continue;
-            }
+            found.streams += 1;
             let blanked: Vec<u8> = raw
                 .iter()
                 .map(|&b| if b == ASCII_RS { b' ' } else { b })
                 .collect();
+            let mut accepted = false;
             for slurp in [false, true] {
-                found.accepted += 1;
+                if !seq_stream_is_plain_records(&raw, slurp, guards) {
+                    continue;
+                }
+                accepted = true;
                 match seq_stream_walked_as_plain_json(raw.clone(), slurp) {
                     Ok(text) if text == blanked => {}
                     _ => {
@@ -22600,6 +22644,7 @@ mod plain_record_sequence_tests {
                     }
                 }
             }
+            found.accepted += u64::from(accepted);
         }
         found
     }
@@ -22624,12 +22669,13 @@ mod plain_record_sequence_tests {
                 .as_deref()
                 .map(|e| String::from_utf8_lossy(e).into_owned())
         );
-        // A check that vouched for nothing would be sound for nothing.
+        // A check that vouched for nothing would be sound for nothing: the generator makes a
+        // clean stream about one time in ten.
         assert!(
-            found.accepted > cases / 5,
+            found.accepted * 20 > found.streams,
             "only {} of {} streams accepted",
             found.accepted,
-            cases * 2
+            found.streams
         );
     }
 
@@ -22670,6 +22716,20 @@ mod plain_record_sequence_tests {
                 "{name}: no unsound stream in {cases} cases, so the test cannot fail without it"
             );
         }
+    }
+
+    /// Under `-s` the values are wrapped in one array, a level more than the deepest has, so a stream
+    /// near the nesting ceiling keeps the walk (#2847): the record check alone vouches for a record
+    /// 100 levels deep, and [`seq_stream_is_plain_records`] declines it under `-s` only.
+    #[test]
+    fn a_deep_record_under_slurp_keeps_the_walk_6501() {
+        let mut raw = vec![ASCII_RS];
+        raw.extend(nested(100));
+        raw.push(b'\n');
+        let all = PlainGuards::ALL;
+        assert!(plain_record_sequence(&raw, all));
+        assert!(seq_stream_is_plain_records(&raw, false, all));
+        assert!(!seq_stream_is_plain_records(&raw, true, all));
     }
 
     /// The streams of the issue, one per guard, and the shapes the check must take.

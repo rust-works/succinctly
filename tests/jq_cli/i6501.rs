@@ -3,7 +3,8 @@
 //! becomes with each RS blanked, without the walk of jq's reader. Every stream the check does not
 //! vouch for keeps the walk. These rows sit on each guard of the check (bytes before the first RS,
 //! no final newline, an RS straight after a number, a blank line, an empty record) and on records
-//! that are not RFC 8259 (a leading zero, `nan`), and give what jq 1.7.1 (`/usr/bin/jq`) answers:
+//! that are not RFC 8259 (a leading zero, `nan`), on RFC 8259 records jq reads unusually (past double
+//! range, lone surrogate keys, nesting under `-s`), and give what jq 1.7.1 (`/usr/bin/jq`) answers:
 //! `(args, stdout, stderr, exit status)`. The stdout, the warnings and the exit status must be what
 //! they were before the check existed, whichever route reads the stream.
 
@@ -85,6 +86,62 @@ const STREAMS: &[(&str, &str, &[Row])] = &[
         &[
             (&["-c", "."], "\x1e{\"a\":[1,{\"b\":null}]}\n\x1e\"éé\"\n", "", 0),
             (&["-s", "-c", "."], "\x1e[{\"a\":[1,{\"b\":null}]},\"éé\"]\n", "", 0),
+        ],
+    ),
+    (
+        "past_double_range",
+        "\x1e1e999\n\x1e-1e999\n\x1e1e-999\n",
+        &[
+            (&["-c", "."], "\x1e1E+999\n\x1e-1E+999\n\x1e1E-999\n", "", 0),
+            (&["-s", "-c", "length"], "\x1e3\n", "", 0),
+        ],
+    ),
+    (
+        "long_digits",
+        "\x1e123456789012345678901234567890\n\x1e0.1e1\n",
+        &[
+            (&["-c", "."], "\x1e123456789012345678901234567890\n\x1e1\n", "", 0),
+            (&["-s", "-c", "length"], "\x1e2\n", "", 0),
+        ],
+    ),
+    (
+        "surrogate_keys",
+        "\x1e{\"\\udc00\":1}\n\x1e{\"\\ud800\\udc00\":[]}\n",
+        &[
+            (&["-c", "."], "\x1e{\"�\":1}\n\x1e{\"𐀀\":[]}\n", "", 0),
+            (&["-s", "-c", "length"], "\x1e2\n", "", 0),
+        ],
+    ),
+    (
+        "escaped_rs",
+        "\x1e\"a\\u001eb\"\n\x1e1\n",
+        &[
+            (&["-c", "."], "\x1e\"a\\u001eb\"\n\x1e1\n", "", 0),
+            (&["-s", "-c", "length"], "\x1e2\n", "", 0),
+        ],
+    ),
+    (
+        "raw_rs_in_a_string",
+        "\x1e\"a\x1eb\"\n",
+        &[
+            (&["-c", "."], "", "jq: ignoring parse error: Truncated value at line 1, column 4\njq: ignoring parse error: Invalid numeric literal at line 1, column 6 (need RS to resync)\n", 0),
+            (&["-s", "-c", "length"], "\x1e0\n", "jq: ignoring parse error: Truncated value at line 1, column 4\njq: ignoring parse error: Invalid numeric literal at line 1, column 6 (need RS to resync)\n", 0),
+        ],
+    ),
+    (
+        "tab_in_an_object",
+        "\x1e{\"a\":\t1}\n",
+        &[
+            (&["-c", "."], "\x1e{\"a\":1}\n", "", 0),
+            (&["-s", "-c", "length"], "\x1e1\n", "", 0),
+        ],
+    ),
+    (
+        "nested_100",
+        "\x1e[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n\x1e[1]\n",
+        &[
+            (&["-c", "."], "\x1e[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n\x1e[1]\n", "", 0),
+            (&["-s", "-c", "length"], "\x1e2\n", "", 0),
         ],
     ),
 ];
