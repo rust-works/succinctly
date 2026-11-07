@@ -179,6 +179,10 @@ fn input_dsv_rows_are_read_from_their_own_file_past_a_missing_one_6585() -> Resu
     // One row, from `o.csv` alone; how the unterminated quote reads is not what this pins.
     assert!(out.starts_with("[\"x\","), "{out}");
     assert_eq!(out.lines().count(), 1, "{out}");
+    assert!(
+        !out.contains("\"z\""),
+        "the row of z.csv is never read: {out}"
+    );
     assert_eq!(
         err,
         format!("jq: error: Could not open file {d}/gone.csv: No such file or directory\n")

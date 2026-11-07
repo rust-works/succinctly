@@ -14184,10 +14184,10 @@ jq's main loop ends the run once an open has failed, after the one value it was 
 Past a missing file jq therefore prints the first value of the next file that has one, and no more: `jq -c . missing five.json` over `2 3 4 5 6` prints `2`, and `jq -c . two.json missing five.json` prints `2`, `3` and then `2`.
 `succinctly jq` does the same on the route plain documents take, and does not report a missing file it never reached, as jq does not.
 It reports a missing file when it reaches it, after the values before it, so the stderr lines of a run keep jq's order.
-Two residuals remain, both with a missing file *and* a feature that routes input differently:
+What follows is the missing-file behaviour of the features that route input differently:
 
-* `-s` reads every file that opens and reports every missing one up front, as jq's slurp does.
-  jq stops after one more line, record or event past a missing file, and reaches a missing file only when the reader gets to it.
+* `-s` reads every file that opens and reports every missing one up front, as jq's slurp does (`jq -c -s . missing a.json missing2` reports both, captured from jq 1.7.1).
+  Elsewhere jq stops after one more line, record or event past a missing file, and reaches a missing file only when the reader gets to it.
   `--seq` and `--stream-errors` do the same when the program reads `input`, under `-n` and `-s`, and when the first value past the missing file is not complete inside its file (a last record or event that ends the file).
   Otherwise their main loop reports only the failures up to the file that first value comes from, since [#6522](https://github.com/rust-works/succinctly/issues/6522): `jq --seq -c . missing a.seq missing2` reports `missing` and never `missing2`.
   A filter that uses `input`/`inputs` under `-n` reports a missing file when a read reaches it, since [#6475](https://github.com/rust-works/succinctly/issues/6475): `jq -n -c input data.json missing` prints the first value and exits 0, as in jq, because the reader never asks for the file after it.
