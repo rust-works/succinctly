@@ -13988,6 +13988,65 @@ fn closed_index_expr<S: EvalSemantics>(
     }
 }
 
+/// [`closed_expr_to_owned_node`]'s `Pipe` arm: a closed head, then each later stage answered
+/// against the value so far. Its own function, not inline in the arm, for the reason
+/// [`closed_index_expr`] gives: the walk recurses to `MAX_VALUE_TREE_DEPTH` levels, and a local
+/// added to the arm's frame is paid at every level.
+///
+/// #5712: a head that is a marker is read in place, not cloned, while the stages run: a string
+/// marker's clone is a copy of the whole string (`SharableString::Owned`), and a stage that
+/// declines (`$t | length + 1`) paid that copy for nothing, once per round (+3.7% over a 32 MB
+/// string). The marker's `escaped` bit is set as the marker arm sets it, and a pipe of the head
+/// alone still clones it, as the arm does.
+#[inline(never)]
+fn closed_pipe_to_owned<S: EvalSemantics>(
+    stages: &[Expr],
+    depth: usize,
+    escaped: &mut bool,
+) -> Option<OwnedValue> {
+    let (head, rest) = stages.split_first()?;
+    let mut value: Option<OwnedValue> = None;
+    let mut borrowed: Option<&OwnedValue> = None;
+    match head {
+        Expr::TrackedVar(marker) if S::TAG == EvalTag::Jq && !rest.is_empty() => {
+            // The marker arm's rule, and `closed_expr_to_owned_at_depth`'s reset for a scalar.
+            if !marker.fold_share
+                && matches!(marker.value, OwnedValue::Array(_) | OwnedValue::Object(_))
+            {
+                *escaped = true;
+            }
+            borrowed = Some(&marker.value);
+        }
+        _ => {
+            value = Some(closed_expr_to_owned_at_depth::<S>(
+                head,
+                depth + 1,
+                escaped,
+            )?);
+        }
+    }
+    for stage in rest {
+        let current = value.as_ref().or(borrowed)?;
+        let next = match eval_owned_fast_path::<S>(stage, current, false) {
+            Some(Ok(Some(next))) => next,
+            Some(_) => return None,
+            None => match closed_unary_builtin::<S>(stage, current) {
+                Some(next) => next,
+                // #5712: a comparison, a boolean or a `try` over a string's length
+                // (`$t | length > 3`), or its prefix test, is read off the string: the
+                // answer is a fresh integer, boolean or `null`, never a node of it.
+                // jq mode only, like `closed_unary_builtin`.
+                None if S::TAG == EvalTag::Jq => {
+                    eval_owned_string_door::<S>(unwrap_paren(stage), current)?
+                }
+                None => return None,
+            },
+        };
+        value = Some(next);
+    }
+    value
+}
+
 fn closed_expr_to_owned_node<S: EvalSemantics>(
     expr: &Expr,
     depth: usize,
@@ -14012,18 +14071,7 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
             Some(marker.value.clone())
         }
         Expr::Paren(inner) => closed_expr_to_owned_at_depth::<S>(inner, depth + 1, escaped),
-        Expr::Pipe(stages) => {
-            let (head, rest) = stages.split_first()?;
-            let mut value = closed_expr_to_owned_at_depth::<S>(head, depth + 1, escaped)?;
-            for stage in rest {
-                value = match eval_owned_fast_path::<S>(stage, &value, false) {
-                    Some(Ok(Some(next))) => next,
-                    Some(_) => return None,
-                    None => closed_unary_builtin::<S>(stage, &value)?,
-                };
-            }
-            Some(value)
-        }
+        Expr::Pipe(stages) => closed_pipe_to_owned::<S>(stages, depth, escaped),
         // #5774: `$d[0].users[$i]`, a key that is itself closed (the loop variable): the target and
         // the key are each one value, and the step is the navigation `.[k]` / `.k` the pipe stages
         // above answer. A key that is not an integer or a string, or a step that raises, declines
@@ -88538,6 +88586,31 @@ fn eval_owned_expr_full<S: EvalSemantics>(
     }
 }
 
+/// [`eval_owned_relocating_fold`], then (#5712, jq mode) [`eval_owned_closed`]: an expression that
+/// never reads `.` is one value whatever the input is, as the lazy twin [`eval_each_owned`] answers
+/// it. Without it a stage that closes over a bound value (`. as $t | [range(25) | ($t | length)]`,
+/// where `$t` is a computed string or array) wrote the input out and indexed it again to evaluate a
+/// stage that never reads it, once per round: 1.8 s against 0.17 s over a 6.6 MB string.
+///
+/// One call in [`eval_owned_input`] and not two, and `#[inline(never)]`: that function is inlined
+/// into the recursive [`eval_owned_pipe`], and a second `Option<OwnedValue>` there cost it 80 bytes
+/// of frame per level in a debug build (`walk_impl_panics_past_nesting_depth_limit_1021` overflowed
+/// a 2 MB test stack on ARM64 Linux at 1021 levels). A change to this pair must keep that frame:
+/// `eval_owned_pipe` is 2944 bytes on aarch64 debug without it.
+#[inline(never)]
+fn eval_owned_relocated_or_closed<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if let Some(relocated) = eval_owned_relocating_fold::<S>(expr, input) {
+        return Some(relocated);
+    }
+    if S::TAG == EvalTag::Jq {
+        return eval_owned_closed::<S>(expr);
+    }
+    None
+}
+
 /// Evaluate an expression with an OwnedValue as input, preserving the full
 /// output stream.
 ///
@@ -88574,7 +88647,7 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // construction here, and without these the whole pipe bridged, so the
     // stage standing on the embed saw a copy. Both only fire past their own
     // payoff gates, so any other input bridges exactly as before.
-    if let Some(relocated) = eval_owned_relocating_fold::<S>(expr, input) {
+    if let Some(relocated) = eval_owned_relocated_or_closed::<S>(expr, input) {
         return QueryResult::Owned(relocated);
     }
     if let Some((values, control)) = embed_peel_collect::<S>(expr, input, optional, reentry) {
