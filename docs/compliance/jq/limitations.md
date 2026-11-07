@@ -7747,6 +7747,14 @@ A fix would need a counted repeat that is not written out (a loop counter), whic
 The refusal and the rows that are answered are pinned by `tests/jq_cli/i6439.rs`.
 `succinctly yq` is not affected: its patterns are Go's, which refuses a count past 1000.
 
+### A `$` that `(?m)` does not reach, beside a loop that can match nothing (#6517)
+
+A pattern where `(?m)` stands but does not reach every `$` (`$(?m)`, `(?m:a)$`) runs on the exact `fancy-regex` route, which follows `(?m)` group by group, so its `$` outside `(?m)` matches before a final newline as in jq.
+That route's loop rewrite (#6488) reads every `$` as the end of the text, so it is not applied to such a pattern, and a loop whose last iteration matches nothing reports the last non-empty one.
+`"aab\n" | match("(a|)*b$(?m)") | .captures[0].offset` is `2` in jq and `1` here, and `(?:a|())*b$(?m)` gives the group offset `-1` where jq has `2`; `(a|)*b$` without the switch agrees.
+Before #6517 neither pattern matched `"aab\n"` at all; `test`, `sub`, `split` and the match spans agree with jq.
+The `$` rows are pinned by `tests/jq_cli/i6517.rs`.
+
 ### A `^` under `(?m)` does not hold at the end of the text (#6456)
 
 Oniguruma's begin-of-line anchor holds at the start of the text, and after a newline unless that is the end of the text (`ON_STR_END`).
