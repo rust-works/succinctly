@@ -32,7 +32,9 @@
 //! bytes, so a number keeps its spelling and a string its decoding exactly as a document's would;
 //! this module decides only where each one begins and ends and which error fires.
 
-use crate::jq_seq_reader::{fgets_chunk_len_at, number_is_valid, unhex4, JQ_FGETS_CHUNK};
+use crate::jq_seq_reader::{
+    decode_string_in_place, fgets_chunk_len_at, number_is_valid, JQ_FGETS_CHUNK,
+};
 use succinctly::jq::OwnedValue;
 
 /// What jq's `p->last_seen` can hold.
@@ -1600,69 +1602,32 @@ impl Parser {
         Ok(())
     }
 
-    /// jq's `found_string`.
+    /// The token between double quotes, as the document parser reads a string.
+    fn quoted_token(&self) -> Vec<u8> {
+        let mut quoted = Vec::with_capacity(self.token_len + 2);
+        quoted.push(b'"');
+        quoted.extend_from_slice(&self.token_buf[..self.token_len]);
+        quoted.push(b'"');
+        quoted
+    }
+
+    /// jq's `found_string`: the validation and in-place decode of [`decode_string_in_place`]
+    /// (#6513), then the value the string spells.
     fn found_string(&mut self) -> Result<(), &'static str> {
-        let buf = &self.token_buf[..self.token_len];
-        let mut i = 0;
-        while i < buf.len() {
-            let c = buf[i];
-            i += 1;
-            if c != b'\\' {
-                // jq compares a *signed* char, so only U+0000..=U+001F qualifies.
-                if c <= 0x1f {
-                    return Err(
-                        "Invalid string: control characters from U+0000 through U+001F must be escaped",
-                    );
-                }
-                continue;
-            }
-            // Unreachable: a trailing backslash leaves the scanner in `StrEscape`, so the next byte
-            // is consumed as the escaped one. jq carries the arm anyway.
-            if i >= buf.len() {
-                return Err("Expected escape character at end of string");
-            }
-            let escape = buf[i];
-            i += 1;
-            match escape {
-                b'\\' | b'"' | b'/' | b'b' | b'f' | b't' | b'n' | b'r' => {}
-                b'u' => {
-                    if i + 4 > buf.len() {
-                        return Err("Invalid \\uXXXX escape");
-                    }
-                    let Some(codepoint) = unhex4(&buf[i..i + 4]) else {
-                        return Err("Invalid characters in \\uXXXX escape");
-                    };
-                    i += 4;
-                    if (0xD800..=0xDBFF).contains(&codepoint) {
-                        if i + 6 > buf.len() || buf[i] != b'\\' || buf[i + 1] != b'u' {
-                            return Err("Invalid \\uXXXX\\uXXXX surrogate pair escape");
-                        }
-                        match unhex4(&buf[i + 2..i + 6]) {
-                            Some(low) if (0xDC00..=0xDFFF).contains(&low) => {}
-                            _ => return Err("Invalid \\uXXXX\\uXXXX surrogate pair escape"),
-                        }
-                        i += 6;
-                    }
-                }
-                _ => return Err("Invalid escape"),
-            }
-        }
-        // The validation above passed. A string with no escape and valid UTF-8 is its own bytes, so
-        // it needs neither the checked document parser nor a quoted copy to hand it (#5498).
-        let plain = if buf.contains(&b'\\') {
-            None
-        } else {
-            core::str::from_utf8(buf).ok()
-        };
-        let value = match plain {
-            Some(text) => OwnedValue::string(text),
-            None => {
-                let mut quoted = Vec::with_capacity(self.token_len + 2);
-                quoted.push(b'"');
-                quoted.extend_from_slice(&self.token_buf[..self.token_len]);
-                quoted.push(b'"');
-                materialize(&quoted)
-            }
+        // The decode overwrites the escapes, and the value of a string that has one is read from
+        // them, so that string keeps its text apart.
+        let quoted = self.token_buf[..self.token_len]
+            .contains(&b'\\')
+            .then(|| self.quoted_token());
+        decode_string_in_place(&mut self.token_buf[..self.token_len])?;
+        // The validation passed. A string with no escape and valid UTF-8 is its own bytes, so it
+        // needs neither the checked document parser nor a quoted copy to hand it (#5498).
+        let value = match quoted {
+            Some(quoted) => materialize(&quoted),
+            None => match core::str::from_utf8(&self.token_buf[..self.token_len]) {
+                Ok(text) => OwnedValue::string(text),
+                Err(_) => materialize(&self.quoted_token()),
+            },
         };
         self.value(value)?;
         self.token_len = 0;
