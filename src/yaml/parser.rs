@@ -4955,9 +4955,35 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let saved_pos = self.pos;
         self.skip_to_eol();
         self.skip_newlines();
-        let is_null = self.peek().is_none() || self.count_indent().unwrap_or(0) <= indent;
+        let is_null = if self.peek().is_none() {
+            true
+        } else {
+            let next_indent = self.count_indent().unwrap_or(0);
+            next_indent < indent || (next_indent == indent && !self.header_at_indent(next_indent))
+        };
         self.pos = saved_pos;
         is_null
+    }
+
+    /// Whether the content line the cursor is on, at its indent `indent`, is a block scalar
+    /// header (`|` or `>`). A header cannot be a key or an item, so at the indent of an empty
+    /// `key:`, `:` or `-` it is that node's value, as a sequence is for a key: `a:` / `|` / `  t` is
+    /// `{"a": "t\n"}` and `-` / `|` / `  t` is `["t\n"]` in yq (#6390). The one definition behind
+    /// every place that tells a null value from one on the next line, so they cannot disagree.
+    /// Restores `self.pos`.
+    fn header_at_indent(&mut self, indent: usize) -> bool {
+        let saved_pos = self.pos;
+        self.advance_by(indent);
+        let is_header = self.peek().is_some_and(Self::opens_block_scalar);
+        self.pos = saved_pos;
+        is_header
+    }
+
+    /// Whether a line that starts with `byte` is a block scalar header: `|` or `>`. The one test
+    /// every lookahead for a header applies, so a change to what counts is made once (#6390).
+    #[inline]
+    const fn opens_block_scalar(byte: u8) -> bool {
+        matches!(byte, b'|' | b'>')
     }
 
     /// [`Self::following_value_is_null`] for a value that a block sequence at the owner's own
@@ -4976,7 +5002,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             let is_sequence =
                 matches!(self.peek(), Some(b'-')) && Self::is_ws_break_or_eoi(self.peek_at(1));
             self.pos = line_start;
-            next_indent < indent || (next_indent == indent && !is_sequence)
+            next_indent < indent
+                || (next_indent == indent && !is_sequence && !self.header_at_indent(next_indent))
         };
         self.pos = saved_pos;
         is_null
@@ -5007,7 +5034,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
         let spaces = super::simd::count_leading_spaces(self.input, p);
         match self.input.get(p + spaces) {
-            Some(&b) if !Self::is_break(b) && b != b'#' && b != b'\t' => Some(spaces <= indent),
+            // A block scalar header at the indent is the value, as `following_value_is_null` has it.
+            Some(&b) if !Self::is_break(b) && b != b'#' && b != b'\t' => {
+                Some(spaces < indent || (spaces == indent && !Self::opens_block_scalar(b)))
+            }
             None if spaces == 0 => Some(true),
             _ => None,
         }
@@ -5259,7 +5289,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     matches!(self.peek(), Some(b'-')) && Self::is_ws_break_or_eoi(self.peek_at(1));
                 // A block scalar header at the key's own indent is the key's value (see
                 // `parse_mapping_entry`): `- a:` / `  |` / `    t` is `[{"a": "t\n"}]`.
-                let is_block_scalar_header = matches!(self.peek(), Some(b'|' | b'>'));
+                let is_block_scalar_header = self.peek().is_some_and(Self::opens_block_scalar);
                 self.pos = saved_pos;
 
                 if next_indent < indent
@@ -5500,7 +5530,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // key's own indent it is the key's value, as a sequence is (`a:` / `|` / `  x` is
             // `{"a": "x\n"}` in yq). It used to read only because the null written for it sat on the
             // `|` (#6386), which the reader then took for the block scalar.
-            let is_block_scalar_header = matches!(next_char, Some(b'|' | b'>'));
+            let is_block_scalar_header = next_char.is_some_and(Self::opens_block_scalar);
             self.pos = saved_pos;
 
             if next_indent < indent {
@@ -5685,7 +5715,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // it wasn't quite: that version already included the tab in
                 // its terminator set and this one didn't, so `-\tx` at the
                 // key's indent still dangled the anchor (#434).
-                if next_indent < indent || (next_indent == indent && !is_sequence_at_same_indent) {
+                // A block scalar header at the key's indent is its value too (#6390).
+                if next_indent < indent
+                    || (next_indent == indent
+                        && !is_sequence_at_same_indent
+                        && !self.header_at_indent(next_indent))
+                {
                     // Next line is at same or lower indent and not a sequence - value is null
                     // Create explicit null node for anchor to point to
                     self.pos = saved_pos;
@@ -9770,6 +9805,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         })
     }
 
+    /// Whether the line above the cursor's that leaves its value for the lines below is a dash (`-`,
+    /// `- &x`, a chain of them) at column `indent`: a block scalar header at that column is its
+    /// value (#6390), where a header deeper than it always was.
+    fn dash_above_owns_header_at(&self, indent: usize) -> bool {
+        self.previous_content_line()
+            .and_then(|(lead, rest)| Self::deferred_value_owner(lead, rest))
+            .is_some_and(|(owner, is_dash)| is_dash && owner == indent)
+    }
+
     /// The nearest line above the cursor's that holds content, as its count of leading spaces and
     /// the rest of it: a blank line, a comment line and node properties on a line of their own
     /// (`&x`, part of the value that follows, #4271) are walked past. `None` at the top of the
@@ -10452,10 +10496,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             Some(b'|' | b'>')
                 if !self.json_strict
                     && self.type_stack.len() > 1
-                    && self.previous_content_line_defers_its_value() =>
+                    && (self.previous_content_line_defers_its_value()
+                        || self.dash_above_owns_header_at(indent)) =>
             {
                 self.check_mapping_under_mapping_gap(indent)?;
-                self.close_deeper_indents(indent);
+                // #6390: a header at the column of the bare `-` above is that item's value, so the
+                // item stays open for it (`-` / `|` / `  t` is `["t\n"]`).
+                let keeps_item = self.dash_above_owns_header_at(indent);
+                self.close_deeper_indents(if keeps_item { indent + 1 } else { indent });
                 self.parse_own_line_block_scalar(indent)?;
             }
             Some(_) => {
@@ -12635,6 +12683,11 @@ mod tests {
             (b"x\n    deep\n", 0),
             (b"x\n    deep\n", 4),
             (b"x\n    deep\n", 5),
+            // A block scalar header at the indent is the value, not a null (#6390).
+            (b"x\n  |\n    t\n", 2),
+            (b"x\n  >\n    t\n", 2),
+            (b"x\n  |\n    t\n", 3),
+            (b"x\n  |\n    t\n", 1),
         ];
         for &(input, indent) in cases {
             // `self.pos` must sit on the current line's own break, per both
@@ -12691,6 +12744,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #6390: every lookahead that tells a null value from one on the next line reads a block scalar
+    /// header at the owner's indent as the value, and one above or below it as it reads any other
+    /// line: the full lookahead, the one that makes an exception for a sequence at the owner's
+    /// indent, and the fast path for a bare dash. They share `Parser::header_at_indent`, and this
+    /// pins that none of them has its own copy of the answer.
+    #[test]
+    fn every_lookahead_reads_a_block_scalar_header_at_the_owners_indent_as_a_value_6390() {
+        for header in ["|", ">", "|-", ">+"] {
+            for (indent, header_indent, null) in [
+                (2usize, 2usize, false), // at the owner's indent: its value
+                (2, 4, false),           // deeper: its value, as it always was
+                (2, 0, true),            // shallower: the owner's value is absent
+            ] {
+                let input = format!(
+                    "x\n{}{header}\n{}t\n",
+                    " ".repeat(header_indent),
+                    " ".repeat(header_indent + 2)
+                );
+                let input = input.as_bytes();
+                let pos = 1; // on `x`'s own break
+                let parser = || {
+                    let mut p = Parser::<false>::new(input);
+                    p.pos = pos;
+                    p
+                };
+                assert_eq!(
+                    parser().following_value_is_null(indent),
+                    null,
+                    "{input:?} {indent}"
+                );
+                assert_eq!(
+                    parser().following_value_is_null_unless_sequence_at(indent),
+                    null,
+                    "{input:?} {indent}"
+                );
+                assert_eq!(
+                    parser().next_line_settles_value_is_null(indent),
+                    Some(null),
+                    "{input:?} {indent}"
+                );
+            }
+        }
+        // A plain line at the owner's indent is still a null, and the pos is restored.
+        let mut p = Parser::<false>::new(b"x\ny\n");
+        p.pos = 1;
+        assert!(p.following_value_is_null(0));
+        assert!(p.following_value_is_null_unless_sequence_at(0));
+        assert_eq!(p.pos, 1);
     }
 
     /// #4081: the flow-sequence lookahead that decides whether an entry is an
