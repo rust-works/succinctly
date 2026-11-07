@@ -25,14 +25,14 @@ fn raw_input_lines_are_read_as_the_main_loop_gets_to_them_6437() -> Result<()> {
         .to_string_lossy()
         .into_owned();
     let named = |text: &str| {
-        text.replace('A', &a)
-            .replace('B', &b)
-            .replace('M', &missing)
+        text.replace("{A}", &a)
+            .replace("{B}", &b)
+            .replace("{M}", &missing)
     };
     for (args, stdout, stderr, status) in [
         (
             vec!["-c", "[.,input_filename]", &a, &b],
-            "[\"one\",\"A\"]\n[\"two\",\"A\"]\n[\"threefour\",\"B\"]\n",
+            "[\"one\",\"{A}\"]\n[\"two\",\"{A}\"]\n[\"threefour\",\"{B}\"]\n",
             "",
             0,
         ),
@@ -44,13 +44,13 @@ fn raw_input_lines_are_read_as_the_main_loop_gets_to_them_6437() -> Result<()> {
                 &b,
             ],
             "\"one\"\n\"threefour\"\n",
-            "jq: error (at A:2): bad two\n",
+            "jq: error (at {A}:2): bad two\n",
             0,
         ),
         (
             vec!["-c", ".", &a, &missing, &b],
             "\"one\"\n\"two\"\n\"threefour\"\n",
-            "jq: error: Could not open file M: No such file or directory\n",
+            "jq: error: Could not open file {M}: No such file or directory\n",
             2,
         ),
         (vec!["-c", "length", &b, &a], "4\n3\n3\n5\n", "", 0),
