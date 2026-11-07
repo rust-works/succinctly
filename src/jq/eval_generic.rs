@@ -57604,6 +57604,80 @@ mod tests {
         assert!(reindexes <= 1, "yq: {query} reindexed {reindexes} times");
     }
 
+    /// #5712: a stage that closes over a bound computed value and never reads `.`
+    /// (`($t | length)` once `$t` is substituted) is one value whatever the round's input is, so
+    /// `[range(n) | ($t | length)]` costs the same number of reindexes for any `n`. It used to
+    /// write `$t` out and index it again each round (`eval_owned_input` had no closed-expression
+    /// door, as its lazy twin has), so a program over a large computed string paid the whole
+    /// bridge once per round: 1.8 s for 25 rounds over a 6.6 MB string, 0.17 s with the door.
+    ///
+    /// `. as $t` after a computed stage binds the owned value (`ascii_downcase as $t` binds a
+    /// cursor node, which never took the bridge). The answers are pinned too, in jq mode, whose
+    /// codepoint count (11) differs from the byte count yq answers (13).
+    #[test]
+    fn test_a_closed_stage_over_a_bound_computed_value_reindexes_once_for_any_rounds_5712() {
+        let doc = r#"{"s":"Héllo Wörld"}"#;
+        for (shape, want) in [
+            ("($t | length)", "11"),
+            ("($t | length > 3)", "true"),
+            ("($t | length | tostring)", r#""11""#),
+        ] {
+            let at = |rounds: usize| {
+                let query =
+                    format!(".s | ascii_downcase | . as $t | [range({rounds}) | {shape}] | .[0]");
+                let (out, reindexes) = outputs_and_reindexes_in::<JqSemantics>(doc, &query);
+                assert_eq!(out, [want], "jq: {query}");
+                reindexes
+            };
+            let (few, many) = (at(2), at(40));
+            assert_eq!(
+                few, many,
+                "jq: {shape} reindexed {few} times for 2 rounds and {many} for 40"
+            );
+            assert!(few <= 3, "jq: {shape} reindexed {few} times");
+        }
+        // An array is the same: its `length` is a count read off the tree, and `$t` is a bound
+        // owned container the rounds share.
+        let at = |rounds: usize| {
+            let query = format!(
+                r".s | ascii_downcase | [., .] | . as $t | [range({rounds}) | ($t | length)] | add"
+            );
+            let (out, reindexes) = outputs_and_reindexes_in::<JqSemantics>(doc, &query);
+            assert_eq!(out, [(2 * rounds).to_string()], "jq: {query}");
+            reindexes
+        };
+        assert_eq!(at(2), at(40), "an array's count reindexed per round");
+        // yq answers its own count (bytes) through the same shape: the door is jq mode's.
+        let query = ".s | ascii_downcase | . as $t | [range(3) | ($t | length)] | add";
+        let (out, _) = outputs_and_reindexes_in::<YqSemantics>(doc, query);
+        assert_eq!(out, ["39"], "yq: {query}");
+        // A stage the closed route does not answer (`length + 1`) keeps its answer in both modes,
+        // and a stage that hands on a child of the bound container keeps it too: the route reads
+        // the marker in place and must not change what a node of it is.
+        for (query, jq_want, yq_want) in [
+            (
+                ".s | ascii_downcase | . as $t | [range(2) | ($t | length + 1)] | .[0]",
+                "12",
+                "14",
+            ),
+            (
+                ".s | ascii_downcase | [., .] | . as $t | [range(2) | ($t | .[1] | length)] | .[0]",
+                "11",
+                "13",
+            ),
+            (
+                ".s | ascii_downcase | [[1], .] | . as $t | [range(2) | ($t | .[0])] | .[1]",
+                "[1]",
+                "[1]",
+            ),
+        ] {
+            let (out, _) = outputs_and_reindexes_in::<JqSemantics>(doc, query);
+            assert_eq!(out, [jq_want], "jq: {query}");
+            let (out, _) = outputs_and_reindexes_in::<YqSemantics>(doc, query);
+            assert_eq!(out, [yq_want], "yq: {query}");
+        }
+    }
+
     /// #3690: `nulls`, `booleans`, `numbers`, `strings`, `arrays` and
     /// `objects` answer from the node's own type. They used to fall through to
     /// the materializing fallback, which decoded each element and re-entered
