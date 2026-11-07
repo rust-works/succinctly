@@ -3964,7 +3964,8 @@ Every row of the issue is pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, 
 - `.t + "1h" | tag` is `!!str` here and `!!timestamp` in yq, the same split as the tags above.
 - `from_unix` on a non-number names its tag in yq's words since #5930: `from_unix only works on numbers, found !!str instead` (`!!bool`, `!!seq`, `!!map`, `!!null`, and `!!timestamp` for a string that reads as one).
   In jq mode it keeps `math function requires number`.
-- The `*`, `/` and `%` refusals of #5930 write a container or `null` operand differently: yq puts each operand's key in parentheses after its tag when the left operand is a container or `null`, or the right one is a container (`!!timestamp (t) cannot be divided by !!map (m)`), and a value here carries no key, so both are `()`.
+- The `/` and `%` refusals of #5930 write a container or `null` operand differently: yq puts each operand's key in parentheses after its tag when the left operand is a container or `null`, or the right one is a container (`!!timestamp (t) cannot be divided by !!map (m)`), and a value here carries no key, so both are `()`.
+  The `*` refusal has no parentheses in yq and none here.
   Only the message differs; the error and the exit status are the same.
 - A quoted date times a number (`"2026-01-01T00:00:00Z" * 2`) is yq's string repetition and raises here, since the text stands in for the tag, as above.
 - `tz("Europe")` and `tz("zone.tab")` (a directory and a file that is not a zone) raise a different message here (`is a directory`, `malformed time zone information`) from yq's.

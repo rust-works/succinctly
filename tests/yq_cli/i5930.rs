@@ -246,6 +246,13 @@ fn a_timestamp_in_multiplication_division_and_modulo_answers_as_yq_does_5930() -
         (".s * 2", true, "\"xx\""),
         (".t * null", true, "\"2026-01-01T00:00:00Z\""),
         (".z * .t", false, "cannot multiply !!null with !!timestamp"),
+        (".t *n null", true, "\"2026-01-01T00:00:00Z\""),
+        (".t *? null", true, "\"2026-01-01T00:00:00Z\""),
+        (".t *+ null", true, "\"2026-01-01T00:00:00Z\""),
+        (".t *d null", true, "\"2026-01-01T00:00:00Z\""),
+        (".t *n 2", false, "cannot multiply !!timestamp with !!int"),
+        (".t *+ 2", false, "cannot multiply !!timestamp with !!int"),
+        (".t *d 2", false, "cannot multiply !!timestamp with !!int"),
     ];
     for &(filter, ok, expected) in rows {
         let (stdout, stderr, status) =
@@ -259,6 +266,31 @@ fn a_timestamp_in_multiplication_division_and_modulo_answers_as_yq_does_5930() -
                 "{filter}: {stderr}"
             );
         }
+    }
+    Ok(())
+}
+
+/// The two shapes #5930 leaves different from yq, pinned as they are (both are recorded in
+/// `docs/compliance/yq/limitations.md`): a quoted date is a `!!str` in yq, which repeats it, and the text stands in
+/// for the tag here; and a container or `null` operand of `/` and `%` carries no key, so yq's `(t)` is `()`.
+#[test]
+fn the_recorded_differences_of_a_timestamp_in_arithmetic_stay_as_recorded_5930() -> Result<()> {
+    let rows: &[(&str, &str)] = &[
+        (".q * 2", "cannot multiply !!timestamp with !!int"),
+        (".q * .n", "cannot multiply !!timestamp with !!int"),
+        (".m / .t", "!!map () cannot be divided by !!timestamp ()"),
+        (".l % .t", "!!seq () cannot modulo by !!timestamp ()"),
+        (".z / .t", "!!null () cannot be divided by !!timestamp ()"),
+        (".t / .m", "!!timestamp () cannot be divided by !!map ()"),
+    ];
+    for &(filter, expected) in rows {
+        let (_stdout, stderr, status) =
+            run_yq_stdin_with_stderr(filter, DOC, &["-o", "json", "-I0"])?;
+        assert_ne!(status, 0, "{filter}");
+        assert!(
+            stderr.contains(&format!("Error: {expected}")),
+            "{filter}: {stderr}"
+        );
     }
     Ok(())
 }
