@@ -106,3 +106,67 @@ fn implode_of_a_non_number_element_keeps_jqs_error_6523() -> Result<()> {
     }
     Ok(())
 }
+
+/// The array `implode` reads is not always a stage's own: it can be bound (`. as $a | $a | implode`), a
+/// fold's state, an update's right side or a path-tracked value, where the embed table or the path
+/// resolver decide what may be answered without the bridge. Every row was captured from jq 1.7.1.
+#[test]
+fn implode_over_a_bound_folded_updated_or_path_tracked_array_is_jqs_answer_6523() -> Result<()> {
+    for (filter, input, expected) in [
+        (
+            ". as $a | [$a, $a] | map(implode)",
+            "[97,98]",
+            "[\"ab\",\"ab\"]",
+        ),
+        (
+            "reduce (1,2) as $i ([]; . + [96 + $i]) | implode",
+            "null",
+            "\"ab\"",
+        ),
+        (
+            "[foreach (1,2,3) as $i ([]; . + [96 + $i]; implode)]",
+            "null",
+            "[\"a\",\"ab\",\"abc\"]",
+        ),
+        (
+            ".a |= (explode | map(. + 1) | implode)",
+            "{\"a\":\"abc\"}",
+            "{\"a\":\"bcd\"}",
+        ),
+        (
+            ".[] |= (explode | implode)",
+            "[\"ab\",\"cd\"]",
+            "[\"ab\",\"cd\"]",
+        ),
+        ("def f: explode | implode; f", "\"héllo\"", "\"héllo\""),
+        ("[explode | implode?]", "\"ab\"", "[\"ab\"]"),
+        (
+            "try path(explode | implode) catch .",
+            "\"ab\"",
+            "\"Invalid path expression with result \\\"ab\\\"\"",
+        ),
+        (
+            "try del(explode | implode) catch .",
+            "\"ab\"",
+            "\"Invalid path expression with result \\\"ab\\\"\"",
+        ),
+        (
+            ".[0] as $a | ($a | explode) as $e | $e | implode",
+            "[\"ab\"]",
+            "\"ab\"",
+        ),
+        (
+            "[.[] | select(explode | implode | length > 1)]",
+            "[\"ab\",\"c\"]",
+            "[\"ab\"]",
+        ),
+        ("[1e1000] | implode", "null", "\"\u{fffd}\""),
+        ("[65.9] | implode", "null", "\"A\""),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(stdout, format!("{expected}\n"), "{filter} on {input}");
+        assert_eq!(stderr, "", "{filter} on {input}");
+        assert_eq!(code, 0, "{filter} on {input}");
+    }
+    Ok(())
+}
