@@ -6029,7 +6029,36 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }
             }
         } else {
-            'documents: for (idx, document) in inputs.iter().enumerate() {
+            // #6437: `-R`'s lines are made strings as the loop gets to them, from the producer
+            // `input` reads them through; every other input was read up front. Each comes with
+            // its location and source, as `locations` places it.
+            let raw_lines = LAZY_RAW_INPUTS.with(|slot| slot.borrow_mut().take());
+            debug_assert!(raw_lines.is_none() || (inputs.is_empty() && trailing_error.is_none()));
+            let documents: Box<
+                dyn Iterator<Item = (std::borrow::Cow<'_, OwnedValue>, InputLocation, Option<u32>)>,
+            > = match raw_lines {
+                Some(files) => {
+                    let mut lines = lazy_raw_producer(files, None);
+                    let locations = &locations;
+                    Box::new(std::iter::from_fn(move || match lines() {
+                        jq::ProducedInput::Document(line_text, tag, line) => Some((
+                            std::borrow::Cow::Owned(line_text),
+                            locations.resolve(tag, line),
+                            (line != UNKNOWN_LINE).then_some(tag),
+                        )),
+                        // The producer of `-R`'s lines raises no error.
+                        jq::ProducedInput::End(_) | jq::ProducedInput::Error(..) => None,
+                    }))
+                }
+                None => Box::new(inputs.iter().enumerate().map(|(idx, document)| {
+                    (
+                        std::borrow::Cow::Borrowed(document),
+                        locations.get(idx),
+                        locations.source_at(idx),
+                    )
+                })),
+            };
+            'documents: for (document, location, source) in documents {
                 // `UNKNOWN_LINE`, not just any missing entry, must clear the
                 // source too (#3202): `input_filename` can't otherwise tell
                 // "this value's file is genuinely stdin" apart from "no
@@ -6041,10 +6070,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // own `UNKNOWN_LINE` check for `input_line_number` (#1549).
                 // `source_at` shares `resolve`'s own gate rather than
                 // re-deriving it here.
-                jq::cli_context::set_current_source(locations.source_at(idx));
+                jq::cli_context::set_current_source(source);
                 // Nothing on this branch can consume an input document, so
                 // the per-value location is fixed before evaluation.
-                let at = ErrorAt::Fixed(locations.get(idx));
+                let at = ErrorAt::Fixed(location);
                 // Streaming, not collect-then-write (#1653): each output has
                 // to reach stdout before the *next* one is evaluated, or a
                 // mid-stream `debug`/`stderr`/`error` side effect lands ahead
@@ -6065,15 +6094,15 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     false,
                     args.raw_input
                         && args.input_dsv.is_none()
-                        && matches!(document, OwnedValue::String(_)),
-                    stream_slurp_by_reader(&args) && matches!(document, OwnedValue::Array(_)),
+                        && matches!(*document, OwnedValue::String(_)),
+                    stream_slurp_by_reader(&args) && matches!(*document, OwnedValue::Array(_)),
                 );
                 if !finished.next_input(args.on_error, &mut sink, &mut had_output, &mut last_output)
                 {
                     break 'documents;
                 }
                 evaluate_input_streaming_via(
-                    &std::borrow::Cow::Borrowed(document),
+                    &document,
                     &expr,
                     &context,
                     &at,
@@ -6099,7 +6128,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // #6464: jq's main loop reads no further input once its reader has read from a
                 // file past one that did not open, and the value that took it there is still
                 // processed (`-R . missing lines.txt` prints the first line and stops).
-                if source_is_past_open_failure(locations.source_at(idx)) {
+                if source_is_past_open_failure(source) {
                     break 'documents;
                 }
             }
@@ -7251,9 +7280,11 @@ fn get_inputs(
     } else if args.raw_input && args.input_dsv.is_none() {
         // Never reached with `args.slurp`: `-R -s` without `--input-dsv`
         // already returned early above this point.
-        if track_eof && !args.stream && !lazy_route_forced_off() {
+        if !args.stream && !lazy_route_forced_off() {
             // #5857: each line becomes a string when the program reads it, as a JSON document
             // does (#5661). The end of the stream was recorded above, from the bytes as read.
+            // #6437: and when the main loop gets to it, for a program that reads no `input`: a
+            // string per line built up front held 3.5x the file.
             LAZY_RAW_INPUTS.with(|slot| {
                 *slot.borrow_mut() = Some(
                     raw_inputs
@@ -16994,6 +17025,57 @@ mod tests {
         );
         // Drain the queue so the next test starts clean.
         while !matches!(jq::pop_input(), jq::InputPop::Exhausted) {}
+    }
+
+    /// #6437: a `-R` program that reads no `input` gets its lines from the producer `input` reads
+    /// them through, each made a string when the main loop gets to it, and no string up front; the
+    /// end of the stream is not read for it. `--stream` keeps its route. The pin must be able to
+    /// fail: it does with the producer kept to programs that read `input`.
+    #[test]
+    fn raw_input_lines_wait_for_the_main_loop_6437() {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lines.txt");
+        std::fs::write(&path, "a\nb\nc").unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let read = |argv: &[&str]| {
+            let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+            let (mut open_failed, mut opened) = (false, Vec::new());
+            let (inputs, locations, trailing, resumed) =
+                get_inputs(&cmd, false, false, &mut open_failed, &mut opened)
+                    .expect("no exit code")
+                    .expect("reads");
+            assert!(trailing.is_none() && resumed.is_empty());
+            let lines = LAZY_RAW_INPUTS.with(|slot| slot.borrow_mut().take());
+            (inputs, locations, lines)
+        };
+        let (inputs, locations, lines) = read(&["jq", "-R", ".", &path]);
+        assert_eq!(inputs, Vec::<OwnedValue>::new());
+        assert_eq!(locations.per_value(), &[]);
+        assert_eq!(locations.eof_tail, None);
+        assert_eq!(lines, Some(vec![(0, "a\nb\nc".to_string())]));
+        // The producer places each line as the eager route does: line 1, 2, and the last, which has
+        // no newline, on the file's last line.
+        let mut producer = lazy_raw_producer(lines.unwrap(), None);
+        let placed: Vec<(String, u32, u32)> = std::iter::from_fn(|| match producer() {
+            jq::ProducedInput::Document(OwnedValue::String(text), tag, line) => {
+                Some((text.to_string(), tag, line))
+            }
+            _ => None,
+        })
+        .collect();
+        assert_eq!(
+            placed,
+            [
+                ("a".to_string(), 0, 1),
+                ("b".to_string(), 0, 2),
+                ("c".to_string(), 0, 2)
+            ]
+        );
+        let (inputs, _, lines) = read(&["jq", "-R", "--stream", ".", &path]);
+        assert_eq!(inputs.len(), 3, "`--stream` reads its lines up front");
+        assert!(lines.is_none());
     }
 
     /// #5857: [`lazy_json_sources`] takes a stream of several files whose last holds no document, with
