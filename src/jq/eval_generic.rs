@@ -6019,7 +6019,12 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     // delete itself on `owned`, with no text written and indexed to hand it a cursor.
     let owned = match crate::jq::eval::owned_del_step::<S>(expr, owned) {
         crate::jq::eval::OwnedStep::Handled(Ok(value)) => return GenericResult::Owned(value),
-        crate::jq::eval::OwnedStep::Handled(Err(_)) if optional => return GenericResult::None,
+        // An uncatchable error escapes `?` here as on the evaluator's route (#2132, #6575).
+        crate::jq::eval::OwnedStep::Handled(Err(error))
+            if optional && !error.is_uncatchable_at_value_position() =>
+        {
+            return GenericResult::None
+        }
         crate::jq::eval::OwnedStep::Handled(Err(error)) => return GenericResult::Error(error),
         crate::jq::eval::OwnedStep::Declined(owned) => owned,
     };

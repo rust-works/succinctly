@@ -13761,13 +13761,14 @@ fn owned_stage_on_evaluator<S: EvalSemantics>(
     }
 }
 
-/// The error [`owned_stage_on_evaluator`] reports if a stage of [`owned_one_value_assign_shape`]
-/// ever yields other than one value or one error.
+/// The error [`owned_stage_on_evaluator`] or [`owned_stage_through_doors`] reports if a stage of
+/// [`owned_one_value_assign_shape`] or [`owned_one_value_stage`] ever yields other than one value or
+/// one error.
 #[cold]
 fn unreachable_owned_pipe_stage() -> EvalError {
     debug_assert!(
         false, // patchcov: coverage tolerate-line reason="unreachable: a stage of owned_one_value_assign_shape yields exactly one value or one error, which is what the caller's other arms answer (#5285)"
-        "an assignment stage of a pipe yielded neither one value nor one error" // patchcov: coverage tolerate-line reason="unreachable: same invariant as the `false` above (#5285)"
+        "a one-value stage of a pipe yielded neither one value nor one error" // patchcov: coverage tolerate-line reason="unreachable: same invariant as the `false` above (#5285)"
     );
     EvalError::new("internal error: pipe stage yielded other than one value") // patchcov: coverage tolerate-line reason="unreachable: same invariant as the `false` above (#5285)"
 } // patchcov: coverage tolerate-line reason="unreachable: the whole function body above is dead by the same invariant (#5285)"
@@ -88459,7 +88460,11 @@ fn fold_step_each<S: EvalSemantics>(
             Demand::Continue => Flow::Exhausted,
             Demand::Stop => Flow::Stopped { pending: None },
         },
-        OwnedStep::Handled(Err(_)) if optional => Flow::Exhausted,
+        // An uncatchable error (a resource limit, a decode failure) escapes `?` here as it does on
+        // the evaluator's route (#2132): a later pipe stage runs there (#6575), and can raise one.
+        OwnedStep::Handled(Err(error)) if optional && !error.is_uncatchable_at_value_position() => {
+            Flow::Exhausted
+        }
         OwnedStep::Handled(Err(error)) => Flow::Escaped(Control::Error(error)),
         OwnedStep::Declined(state) => {
             eval_each_owned::<S>(expr, &state, optional, reentry, on_update)
@@ -88488,7 +88493,9 @@ fn fold_step_each<S: EvalSemantics>(
 ///
 /// Also taken (#5285): a pipe of assignments, stage by stage on the moved state
 /// ([`owned_assign_pipe_step`], jq mode, not under the table), so a field one stage extends is not
-/// copied by the next.
+/// copied by the next. And (#6575) any pipe whose stages each yield one value
+/// ([`owned_stage_pipe_step`]), each stage a step in turn, a later one that is not running through
+/// [`eval_each_owned`] on the state so far.
 ///
 /// [`owned_if_step`] (#6569) answers a branch that is `.` or closed even while the table below is
 /// live: `.` is the state unchanged, and a closed value comes from [`closed_expr_to_owned`], which
@@ -88525,6 +88532,9 @@ pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue
             Ok(done) => done,
             Err(state) => match owned_constructor_step::<S>(expr, state) {
                 Ok(done) => done,
+                Err(state) if matches!(unwrap_paren(expr), Expr::Pipe(_)) => {
+                    owned_update_step_pipe::<S>(expr, state)
+                }
                 Err(state) => owned_update_step_arith::<S>(expr, state),
             },
         };
@@ -88536,7 +88546,139 @@ pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue
             Err(state) => owned_update_step_arith::<S>(expr, state),
         };
     }
+    // A pipe of stages (#6575), out of line like the `if` above.
+    if matches!(expr, Expr::Pipe(_)) {
+        return owned_update_step_pipe::<S>(expr, state);
+    }
     owned_update_step_arith::<S>(expr, state)
+}
+
+/// A pipe as [`owned_update_step`]'s UPDATE: the routes a pipe already had (#5285's pipe of
+/// assignments, through [`try_eval_owned_step`]), then, when they decline, its stages one at a
+/// time ([`owned_stage_pipe_step`], #6575).
+#[inline(never)]
+fn owned_update_step_pipe<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
+    match owned_update_step_arith::<S>(expr, state) {
+        OwnedStep::Declined(state) => owned_stage_pipe_step::<S>(expr, state),
+        done => done,
+    }
+}
+
+/// A pipe of stages as a fold's UPDATE (#6575): `. + [$x] | .[-5:]`, `. + $x | . % 1000`,
+/// `[., $x] | max`, each stage applied to the moved state by [`owned_update_step`] in turn, as
+/// #5285's [`owned_assign_pipe_step`] does for a pipe of assignments. Through the bridge each step
+/// evaluated the whole pipe on a re-indexed copy of the state: 0.33x-0.55x of jq 1.7.1.
+///
+/// Every stage yields exactly one value or raises, with no effect ([`owned_one_value_stage`]), so
+/// running them one after another is what jq does. The first stage that declines hands the
+/// untouched state back, and the whole pipe is the evaluator's. A later one has the earlier
+/// stages' work in the state, which can no longer be handed back, so that stage runs on the
+/// evaluator against the state so far ([`owned_stage_through_doors`]), and the answer and any error
+/// are the ones the evaluator gives for the whole pipe. jq mode only, and not while the #2889 embed
+/// table is live, as [`owned_assign_pipe_stages`] is not.
+#[inline(never)]
+fn owned_stage_pipe_step<S: EvalSemantics>(expr: &Expr, mut state: OwnedValue) -> OwnedStep {
+    let (EvalTag::Jq, Expr::Pipe(stages)) = (S::TAG, unwrap_paren(expr)) else {
+        return OwnedStep::Declined(state);
+    };
+    if stages.len() < 2
+        || !stages
+            .iter()
+            .all(|stage| owned_one_value_stage(unwrap_paren(stage)))
+        || super::eval_generic::embed_table_active()
+    {
+        return OwnedStep::Declined(state);
+    }
+    for (n, stage) in stages.iter().enumerate() {
+        let stage = unwrap_paren(stage);
+        // `.` leaves the state as it is, and a literal replaces it; neither is a step of
+        // [`owned_update_step`]'s, so a pipe that starts with one (`. | [.]`) would decline whole.
+        match stage {
+            Expr::Identity => continue,
+            Expr::Literal(lit) => {
+                state = literal_to_owned(lit);
+                continue;
+            }
+            _ => {}
+        }
+        match owned_update_step::<S>(stage, state) {
+            OwnedStep::Handled(Ok(next)) => state = next,
+            OwnedStep::Handled(Err(error)) => return OwnedStep::Handled(Err(error)),
+            OwnedStep::Declined(back) if n == 0 => return OwnedStep::Declined(back),
+            OwnedStep::Declined(back) => match owned_stage_through_doors::<S>(stage, &back) {
+                Ok(next) => state = next,
+                Err(error) => return OwnedStep::Handled(Err(error)),
+            },
+        }
+    }
+    OwnedStep::Handled(Ok(state))
+}
+
+/// The one value a stage of [`owned_stage_pipe_step`] yields on `state`, or the error it raises,
+/// through [`eval_each_owned`]: the route a declined step takes, whose front doors answer a stage
+/// such as `max` of an owned array without re-indexing it ([`owned_stage_on_evaluator`]'s fork does
+/// not, and made `[., $x] | max` 1.5x slower than the whole pipe on that route). A stage of
+/// [`owned_one_value_stage`] has no other outcome.
+fn owned_stage_through_doors<S: EvalSemantics>(
+    stage: &Expr,
+    state: &OwnedValue,
+) -> Result<OwnedValue, EvalError> {
+    let mut out = None;
+    let flow = eval_each_owned::<S>(stage, state, false, Reentry::REBUILT, &mut |value| {
+        out.get_or_insert(value);
+        Demand::Continue
+    });
+    match (flow, out) {
+        (Flow::Exhausted, Some(value)) => Ok(value),
+        (Flow::Escaped(Control::Error(error)), None) => Err(error),
+        _ => Err(unreachable_owned_pipe_stage()), // patchcov: coverage tolerate-line reason="unreachable: a stage of owned_one_value_stage yields exactly one value or one error (#6575)"
+    }
+}
+
+/// Whether a stage of [`owned_stage_pipe_step`]'s pipe yields exactly one value or raises, with
+/// no effect: a shape an operand may be ([`owned_state_expr_shape`]), an assignment that is one
+/// value ([`owned_one_value_assign_shape`]), a slice with literal bounds, one of the builtins
+/// below, which take no argument and answer any input with one value or an error, or an `if`
+/// whose condition is an operand shape and whose branches are such stages, or a pipe of them.
+fn owned_one_value_stage(stage: &Expr) -> bool {
+    // A pipe nested in a stage (`(. + [$x] | .[1:]) | sort`) is one value when each of its own
+    // stages is, and [`owned_update_step`] applies it as a pipe in turn.
+    if let Expr::Pipe(stages) = stage {
+        return stages
+            .iter()
+            .all(|stage| owned_one_value_stage(unwrap_paren(stage)));
+    }
+    if let Expr::If {
+        cond,
+        then_branch,
+        else_branch,
+    } = stage
+    {
+        return owned_state_expr_shape(cond)
+            && owned_one_value_stage(unwrap_paren(then_branch))
+            && owned_one_value_stage(unwrap_paren(else_branch));
+    }
+    owned_state_expr_shape(stage)
+        || owned_one_value_assign_shape(stage)
+        || matches!(
+            stage,
+            Expr::Slice { .. }
+                | Expr::Builtin(
+                    Builtin::Add
+                        | Builtin::Min
+                        | Builtin::Max
+                        | Builtin::Sort
+                        | Builtin::Reverse
+                        | Builtin::Unique
+                        | Builtin::Keys
+                        | Builtin::KeysUnsorted
+                        | Builtin::Flatten
+                        | Builtin::ToEntries
+                        | Builtin::FromEntries
+                        | Builtin::ToNumber
+                        | Builtin::ToJson
+                )
+        )
 }
 
 /// `[.]`, `[., <closed>…]` and `{<key>: .}` as a fold's UPDATE (#5875): a container built around
@@ -115593,6 +115735,92 @@ mod tests {
             };
             assert_eq!(back, state(), "{src}: the declined state is untouched");
         }
+    }
+
+    /// #6575: a pipe of stages that each yield one value is applied to the state stage by stage,
+    /// and answers what the evaluator answers for the whole pipe: a later stage no step takes
+    /// runs on the evaluator against the state so far. A first stage that declines, or a stage
+    /// that could yield other than one value, hands the state back untouched; yq mode and a live
+    /// embed table decline too.
+    #[test]
+    #[cfg(feature = "std")]
+    fn pipe_of_stages_is_applied_stage_by_stage_6575() {
+        use crate::jq::eval_generic::embed_table_push;
+
+        let list = || OwnedValue::array_from((1..=6).map(OwnedValue::Int).collect());
+        let step =
+            |src: &str, at: OwnedValue| owned_update_step::<JqSemantics>(&parse(src).unwrap(), at);
+        let evaluated = |src: &str, at: &OwnedValue| {
+            eval_owned_multi_first::<JqSemantics>(&parse(src).unwrap(), at, Reentry::REBUILT)
+                .expect("evaluates")
+                .expect("one output")
+        };
+        for src in [
+            ". + [7] | .[-3:]",
+            "(. + [7] | .[1:])",
+            ". + [7] | sort | reverse",
+            "[., 9] | max",
+            ". + [7] | unique | add",
+            ". + [7] | tostring",
+            ". + [7] | .[0] | . + 1",
+            ".[0] = 9 | .[1:]",
+            ". + [7] | if length > 3 then .[:2] else . end",
+            ". + [[1, [2]]] | flatten | length",
+            // A pipe nested in a stage, and a pipe that starts with `.` or a literal.
+            "(. + [7] | .[1:]) | .[1:]",
+            ". + [7] | (.[1:] | sort)",
+            "if length > 3 then . + [8] | .[-2:] else . end | add",
+            ". | [.]",
+            ". | length",
+            "0 | . + 1",
+        ] {
+            let OwnedStep::Handled(Ok(got)) = step(src, list()) else {
+                panic!("not handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step declined a pipe the test lists as handled (#6575)"
+            };
+            assert_eq!(got, evaluated(src, &list()), "{src}");
+        }
+        // A later stage that raises raises the evaluator's error.
+        let OwnedStep::Handled(Err(error)) = step(". + [7] | .a", list()) else {
+            panic!("a raising later stage must raise"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step did not raise for a pipe whose second stage raises (#6575)"
+        };
+        assert!(error.to_string().contains("Cannot index array"), "{error}");
+        // So does a stage that is a step and raises: `+` of an array and a string.
+        let OwnedStep::Handled(Err(error)) = step(". + \"x\" | length", list()) else {
+            panic!("a raising step stage must raise"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step did not raise for a pipe whose first stage raises (#6575)"
+        };
+        assert!(error.to_string().contains("cannot be added"), "{error}");
+        // A first stage no step takes (`length`) leaves the whole pipe to the evaluator, whose
+        // own doors may answer it; so do stages that could yield other than one value.
+        for src in [
+            "length | . + 1 | . * 2",
+            "map(. + 1) | length",
+            ". + [7] | .[]",
+            ". + [7] | (., .)",
+            ". + [7] | empty",
+            ". + [7] | debug",
+            ". + [7] | error(\"e\")",
+            ". + [7] | input",
+            ". + [7] | fromjson",
+        ] {
+            let OwnedStep::Declined(back) = step(src, list()) else {
+                panic!("handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step answered a pipe the test lists as declined (#6575)"
+            };
+            assert_eq!(back, list(), "{src}: the declined state is untouched");
+        }
+        assert!(matches!(
+            owned_update_step::<YqSemantics>(&parse(". + [7] | .[-3:]").unwrap(), list()),
+            OwnedStep::Declined(_)
+        ));
+        let mut bound = list();
+        let origin = BindOrigin::Node {
+            node: 3,
+            document: 9,
+        };
+        let _guard = embed_table_push::<JqSemantics>(Some(&origin), &mut bound);
+        assert!(matches!(
+            step(". + [7] | .[-3:]", list()),
+            OwnedStep::Declined(_)
+        ));
     }
 
     /// #5263: an operand that reads `.` is evaluated on the state, which a binding the
@@ -179075,13 +179303,24 @@ mod named_args_shared_tests_5690 {
             "{a: ., b: (1, 2)}",
             "{a: ., b: error(\"x\")}",
             "{(.): 1}",
-            "{a: 1} | .",
-            "[.] | length",
         ] {
             let OwnedStep::Declined(back) = step(src) else {
                 panic!("handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step answered a constructor UPDATE the test lists as declined (#5875)"
             };
             assert_eq!(back, state(), "{src}: the declined state is untouched");
+        }
+        // A constructor as one stage of a pipe is #6575's: the pipe is applied stage by stage.
+        for (src, want) in [
+            (
+                "{a: 1} | .",
+                OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]),
+            ),
+            ("[.] | length", OwnedValue::Int(1)),
+        ] {
+            let OwnedStep::Handled(Ok(got)) = step(src) else {
+                panic!("not handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step declined a pipe the test lists as handled (#6575)"
+            };
+            assert_eq!(got, want, "{src}");
         }
 
         // yq builds its constructors with presentation, which this step does not carry.
