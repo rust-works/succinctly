@@ -14069,8 +14069,11 @@ Past a missing file jq therefore prints the first value of the next file that ha
 It reports a missing file when it reaches it, after the values before it, so the stderr lines of a run keep jq's order.
 Two residuals remain, both with a missing file *and* a feature that routes input differently:
 
-* `--seq`, `--stream-errors`, `-s`, `--input-dsv` and a filter that uses `input`/`inputs` read every file that opens and report every missing one up front.
-  jq stops after one more line, record or event past a missing file, and reaches a missing file only when the reader gets to it (`jq -n -c input data.json missing` never opens `missing`).
+* `--seq`, `--stream-errors`, `-s` and `--input-dsv` read every file that opens and report every missing one up front.
+  jq stops after one more line, record or event past a missing file, and reaches a missing file only when the reader gets to it.
+  A filter that uses `input`/`inputs` under `-n` reports a missing file when a read reaches it, since [#6475](https://github.com/rust-works/succinctly/issues/6475): `jq -n -c input data.json missing` prints the first value and exits 0, as in jq, because the reader never asks for the file after it.
+  A read that finds the stream at its end reports every one it has not reached, and a failure fails the run when it is reported.
+  Two cases still report a missing file up front: the chunked `--stream` walk, and a file whose last value is a bare number or literal with no newline after it, which completes only at the end of its file and so sends jq's reader on to the next one (`jq -n input one.json missing`, `one.json` holding `1`).
   A plain `--stream` walk stops as jq does, after the one event past a missing file (`jq -c --stream . missing a.json` over `[3]` prints `[[0],3]` and not the closing `[[0]]`, #6006); it still reports the missing file up front.
   The output of `-R` and `-s` over files that all exist is unchanged; only the run that has a missing file differs.
 * `-R` stops as jq does, after the one line past a missing file (`jq -R . missing lines.txt` prints the first line only, #6464), but still reports a second missing file that jq never reaches up front.

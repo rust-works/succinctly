@@ -4517,7 +4517,7 @@ fn stopped(on_error: Option<OnError>, sink: &ErrorSink) -> bool {
 /// The exit code of a run `halt`/`halt_error` ended: its own, unless an input file did not
 /// open, which makes it 2 as it does every other end of the run (`open_failed`, #5472).
 fn halt_exit_code(code: i32, open_failed: bool) -> i32 {
-    if open_failed {
+    if open_failed || LAZY_OPEN_FAILED.with(std::cell::Cell::get) {
         exit_codes::USAGE_ERROR
     } else {
         code
@@ -4541,7 +4541,10 @@ fn jq_exit_code(
     mut last_output: Option<OwnedValue>,
     open_failed: bool,
 ) -> i32 {
-    if open_failed || INPUT_READ_FAILED.with(std::cell::Cell::get) {
+    if open_failed
+        || LAZY_OPEN_FAILED.with(std::cell::Cell::get)
+        || INPUT_READ_FAILED.with(std::cell::Cell::get)
+    {
         return exit_codes::USAGE_ERROR;
     }
     let failed = match args.on_error {
@@ -6426,6 +6429,8 @@ fn get_inputs(
     LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
     LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
     LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
+    defer_open_failures(Vec::new());
+    LAZY_OPEN_FAILED.with(|seen| seen.set(false));
     // Null input mode: use null as the single input -- unless the filter
     // itself uses `input`/`inputs`/`input_line_number` (#723), in which case
     // the caller passes `force_read_under_null_input: true` to fall through
@@ -6546,7 +6551,21 @@ fn get_inputs(
         if let Some(&(at, _)) = failures.first() {
             note_open_failure_at(at);
         }
-        report_open_failures(&failures, open_failed);
+        // #6475: under `-n` the program asks for each file as it goes, and says what it cannot
+        // open when its read gets there. A slurp reads them all first, and so does a text that
+        // does not end where a value does: its last token completes only at the end of the file,
+        // which sends jq's reader on to the next one.
+        let ends_cleanly = failures.iter().all(|&(at, _)| {
+            at == 0
+                || raws
+                    .get(at - 1)
+                    .map_or(true, |raw| source_ends_cleanly(raw, args))
+        });
+        if args.null_input && !args.slurp && !args.seq && args.input_dsv.is_none() && ends_cleanly {
+            defer_open_failures(failures);
+        } else {
+            report_open_failures(&failures, open_failed);
+        }
         let raws = raws
             .into_iter()
             .enumerate()
@@ -8467,6 +8486,59 @@ thread_local! {
     /// moved past it.
     static FIRST_OPEN_FAILURE_AT: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    /// The input files that would not open, which `input`/`inputs` have not reached yet (#6475):
+    /// each with the number of files that opened before it, in order. jq opens a file when its
+    /// reader has read the one before and asks for more, so a failure is said then, and not at
+    /// all by a program that stops reading earlier.
+    static PENDING_OPEN_FAILURES: RefCell<std::collections::VecDeque<(usize, InputFileOpenError)>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
+    /// Whether a pending failure was reported by a read, which makes the run exit 2 (#6475).
+    static LAZY_OPEN_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Leaves `failures` for the reads of the `input` queue to report as they reach them (#6475).
+fn defer_open_failures(failures: Vec<(usize, InputFileOpenError)>) {
+    PENDING_OPEN_FAILURES.with(|pending| *pending.borrow_mut() = failures.into());
+}
+
+/// Reports the pending open failures a read has reached (#6475): the ones before the source it
+/// read, or every one when it found the stream at its end (`None`).
+fn report_reached_open_failures(read: Option<u32>) {
+    loop {
+        let next = PENDING_OPEN_FAILURES.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            match pending.front() {
+                Some(&(at, _)) if read.map_or(true, |source| at <= source as usize) => {
+                    pending.pop_front()
+                }
+                _ => None,
+            }
+        });
+        let Some((_, failure)) = next else { return };
+        let mut failed = false;
+        report_unopenable_input(&failure, &mut failed);
+        LAZY_OPEN_FAILED.with(|seen| seen.set(seen.get() || failed));
+    }
+}
+
+/// Whether a source's last byte ends what jq's parser reads there, so that a read of its last value
+/// does not go on to the next file for more (#6475): a newline or other blank, or the closing
+/// bracket or quote of a value, and for `-R` a newline. A bare number or literal at the end of the
+/// file completes only at its end.
+fn source_ends_cleanly(bytes: &[u8], args: &JqCommand) -> bool {
+    match bytes.last() {
+        None => true,
+        Some(&last) if args.raw_input => last == b'\n',
+        Some(&last) => last.is_ascii_whitespace() || matches!(last, b']' | b'}' | b'"'),
+    }
+}
+
+/// Has the `input` queue report the failures [`defer_open_failures`] left, as its reads reach them
+/// (#6475). After the seed, which clears the hook.
+fn install_open_failure_hook() {
+    if PENDING_OPEN_FAILURES.with(|pending| !pending.borrow().is_empty()) {
+        jq::set_input_read_hook(report_reached_open_failures);
+    }
 }
 
 /// Note that the input at `at` (among the ones that opened) is past a file that did not open,
@@ -11065,6 +11137,7 @@ fn seed_input_queue(
             jq::count_reads_past_end();
         }
     }
+    install_open_failure_hook();
 }
 
 /// What a stream that turned malformed after its lazy start (#5853) hands out once the lazy

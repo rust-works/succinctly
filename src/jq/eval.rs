@@ -100404,6 +100404,38 @@ mod remaining_inputs {
         // `--seq`, which does not yet raise jq's truncated-number error on a
         // last record) would count a read jq spends on an error (#4303).
         static COUNT_PAST_END: Cell<bool> = const { Cell::new(false) };
+        // What the CLI wants told when a read reaches a source, or the end of the stream
+        // (#6475): see `set_read_hook`.
+        static ON_READ: RefCell<Option<ReadHook>> = const { RefCell::new(None) };
+    }
+
+    /// What is called when a read reaches a source, or the end of the stream.
+    pub type ReadHook = Box<dyn FnMut(Option<u32>)>;
+
+    /// Registers `hook`, called by every read of the queue once it knows where it reads from: with
+    /// the source tag of the document, or parse error, it returns, and with `None` when it finds
+    /// the stream at its end (#6475). The read has moved the marker by then and has not returned
+    /// yet, so what the hook prints comes before what the read hands back.
+    ///
+    /// jq's reader opens a file when it has read the one before and asks for more, and says so
+    /// then if it cannot (`jq_util_input_read_more`): a program that stops reading earlier never
+    /// meets the failure. A seed clears it, so it is set after the seed.
+    pub fn set_read_hook(hook: ReadHook) {
+        ON_READ.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+
+    /// Tells the hook a read reached `source`, or the end of the stream. The hook is out of its
+    /// slot while it runs, so one that reads the queue finds no borrow held.
+    fn reached(source: Option<u32>) {
+        if let Some(mut hook) = ON_READ.with(|slot| slot.borrow_mut().take()) {
+            hook(source);
+            ON_READ.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(hook);
+                }
+            });
+        }
     }
 
     /// One read from the input stream.
@@ -100448,6 +100480,7 @@ mod remaining_inputs {
         EXHAUSTED.with(|e| e.set(exhausted));
         PAST_END.with(|p| p.set(false));
         COUNT_PAST_END.with(|c| c.set(false));
+        ON_READ.with(|slot| *slot.borrow_mut() = None);
     }
 
     /// [`seed`] for a stream whose items `producer` hands over one at a time, when they are read
@@ -100465,6 +100498,7 @@ mod remaining_inputs {
         EXHAUSTED.with(|e| e.set(None));
         PAST_END.with(|p| p.set(false));
         COUNT_PAST_END.with(|c| c.set(false));
+        ON_READ.with(|slot| *slot.borrow_mut() = None);
     }
 
     /// Counts the reads past the end from here on: see `COUNT_PAST_END`.
@@ -100525,6 +100559,7 @@ mod remaining_inputs {
             // input catch 0)` on `1\n2 }\n\n\n`.
             LAST_LINE.with(|l| l.set(at.1));
             CURRENT.with(|c| c.set(Some(at)));
+            reached(Some(at.0));
             return Pop::ParseError(error);
         }
         // Out of its slot while the producer runs, so a producer that reads the queue itself
@@ -100545,6 +100580,7 @@ mod remaining_inputs {
             PRODUCER.with(|p| *p.borrow_mut() = Some(producer));
             LAST_LINE.with(|l| l.set(line));
             CURRENT.with(|c| c.set(Some((src, line))));
+            reached(Some(src));
             return pop;
         }
         let popped = QUEUE.with(|q| q.borrow_mut().pop_front());
@@ -100552,6 +100588,7 @@ mod remaining_inputs {
             POPPED.with(|p| p.set(popped_so_far + 1));
             LAST_LINE.with(|l| l.set(line));
             CURRENT.with(|c| c.set(Some((src, line))));
+            reached(Some(src));
             return Pop::Document(doc);
         }
         // Unreachable by the seed's own invariant (every error comes before
@@ -100562,6 +100599,7 @@ mod remaining_inputs {
             // input catch 0)` on `1\n2 }\n\n\n`.
             LAST_LINE.with(|l| l.set(at.1));
             CURRENT.with(|c| c.set(Some(at)));
+            reached(Some(at.0));
             return Pop::ParseError(error);
         }
         pop_past_end()
@@ -100570,6 +100608,7 @@ mod remaining_inputs {
     /// A read that finds nothing left: the marker settles at `EXHAUSTED`, and the reads after
     /// the first are counted as `pop_input` describes.
     fn pop_past_end() -> Pop {
+        reached(None);
         if !COUNT_PAST_END.with(Cell::get) {
             CURRENT.with(|c| c.set(EXHAUSTED.with(Cell::get)));
             return Pop::Exhausted;
@@ -100959,6 +100998,14 @@ pub use remaining_inputs::Pop as InputPop;
 #[cfg(feature = "std")]
 pub fn pop_input() -> InputPop {
     remaining_inputs::pop_input()
+}
+
+/// Registers what the CLI wants told when a read of the `input`/`inputs` queue reaches a source (its
+/// tag) or finds the stream at its end (`None`), before the read returns (#6475). A seed clears it,
+/// so a driver sets it after seeding.
+#[cfg(feature = "std")]
+pub fn set_input_read_hook(hook: impl FnMut(Option<u32>) + 'static) {
+    remaining_inputs::set_read_hook(Box::new(hook));
 }
 
 /// Pops the next queued input document (#723).
