@@ -14962,8 +14962,9 @@ fn owned_state_operand_direct<S: EvalSemantics>(
 /// One scalar of [`owned_state_operand_direct`]: a pure read ([`eval_owned_pure`]) with a
 /// canonical spelling, or `+`, `-` or `*` of two integers that are exact in a double.
 ///
-/// Arithmetic is not part of [`eval_owned_pure`]'s grammar, because `arith_combine` hands an
-/// operand back unchanged for `. + null` and a navigated subvalue must not escape as an answer.
+/// Arithmetic is not part of [`eval_owned_pure`]'s grammar as an *answer*, because `arith_combine`
+/// hands an operand back unchanged for `. + null` and a navigated subvalue must not escape as an
+/// answer (#6536 made it an operand of a comparison or a boolean only, never in `Fresh` position).
 /// Integers within ±2^53 cannot do that and are the range jq computes exactly, so the real
 /// `arith_combine` runs on them; the answer is taken only if it is again such an integer.
 fn owned_state_scalar_direct<S: EvalSemantics>(
@@ -88578,6 +88579,13 @@ fn produces_fresh_value(expr: &Expr) -> bool {
 /// the fold changed `succinctly yq -n '[0.5+0.5] | .[0] | tostring'` from
 /// `1.0` to `1`; that was the bridge re-spelling a computed float, fixed at
 /// its source by #2902, so the two paths now agree there either way.
+///
+/// #6536 added an `Arithmetic` arm that keeps that rule: it is an `Operand`-position arm
+/// only (jq mode), declines in `Fresh` position, and declines wherever `arith_combine` raises.
+/// Its value is consumed by a comparison, a boolean or the next pipe stage, and a pipe's last
+/// stage is where a navigated value would have to leave, which `Identity`/`Field`/`Index`
+/// already refuse in `Fresh` position. So `select(. % 3 == 0)` is settled from the tree
+/// while `. + null` as an expression's own answer is still the bridge's.
 fn eval_owned_pure<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
