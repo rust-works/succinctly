@@ -9264,14 +9264,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.properties_end = self.pos;
             // `&t - a: b`: what the property stands before is a block sequence entry, not a key, which yq
             // refuses (#6414); the key would read as the plain text `- a`.
-            if self.yq_mode
-                && self.peek() == Some(b'-')
-                && Self::is_ws_break_or_eoi(self.peek_at(1))
-            {
-                return Err(self.err_unexpected_char(
-                    self.pos,
-                    "block sequence entries are not allowed in this context",
-                ));
+            if self.peek() == Some(b'-') && Self::is_ws_break_or_eoi(self.peek_at(1)) {
+                self.reject_misplaced_sequence_indicator()?;
             }
         }
         Ok(())
