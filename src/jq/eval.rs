@@ -27723,6 +27723,138 @@ fn pattern_has_interior_dollar(pattern: &str) -> bool {
     false
 }
 
+/// Whether something in `pattern` may match a newline, read from its text and erring towards yes
+/// (#6488): a literal newline, an escape that may stand for one (`\n`, `\s`, `\W`, `\D`, a code
+/// point, a back-reference, a property, ...), a negated class, a range or a POSIX bracket inside a
+/// class, or a `.` where a flag may make it match one.
+#[cfg(feature = "regex")]
+fn pattern_may_match_newline(pattern: &str) -> bool {
+    // Escapes that cannot match a newline: word, digit and non-space classes, the anchors, `\K`,
+    // and the escapes of other control characters and of punctuation.
+    let safe_escape = |c: char| {
+        matches!(
+            c,
+            'w' | 'd'
+                | 'S'
+                | 'h'
+                | 'b'
+                | 'B'
+                | 'A'
+                | 'z'
+                | 'Z'
+                | 'G'
+                | 'K'
+                | 't'
+                | 'r'
+                | 'f'
+                | 'a'
+                | 'e'
+        ) || c.is_ascii_punctuation()
+    };
+    if pattern.contains('\n') {
+        return true;
+    }
+    // A flag group that switches `s` on (jq's `m`, written `(?s)` in front) makes `.` match one.
+    let dot_all = pattern.match_indices("(?").any(|(at, _)| {
+        pattern[at + 2..]
+            .chars()
+            .take_while(|&c| c != ':' && c != ')' && c != '-')
+            .any(|c| c == 's')
+    });
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                match chars.get(i + 1) {
+                    Some(&c) if safe_escape(c) => {}
+                    _ => return true,
+                }
+                i += 2;
+            }
+            '[' => {
+                i += 1;
+                if chars.get(i) == Some(&'^') {
+                    return true;
+                }
+                let start = i;
+                while i < chars.len() && (chars[i] != ']' || i == start) {
+                    match chars[i] {
+                        '\\' => {
+                            match chars.get(i + 1) {
+                                Some(&c) if safe_escape(c) => {}
+                                _ => return true,
+                            }
+                            i += 2;
+                        }
+                        // A range may run across the newline, and `[:space:]` holds it.
+                        '-' if i > start && chars.get(i + 1).is_some_and(|&c| c != ']') => {
+                            return true
+                        }
+                        '[' => return true,
+                        _ => i += 1,
+                    }
+                }
+                i += 1;
+            }
+            '.' if dot_all => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// Whether `pattern` has a capture group that holds only zero-width anchors (`(\z)`, `($)`,
+/// `(?<n>\b^)`), which the group-copies rewrite can leave out of the copy of a way it writes after
+/// a nullable item (#6492: `(\w*)(\z)` is written `(\w+)\z`).
+#[cfg(feature = "regex")]
+fn has_anchor_only_group(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '(' => {
+                // The body of a plain or named capture group.
+                let body = match (chars.get(i + 1), chars.get(i + 2)) {
+                    (Some('?'), Some('<' | '\'' | 'P'))
+                        if chars.get(i + 3) != Some(&'=') && chars.get(i + 3) != Some(&'!') =>
+                    {
+                        let close = if chars.get(i + 2) == Some(&'\'') {
+                            '\''
+                        } else {
+                            '>'
+                        };
+                        chars[i..]
+                            .iter()
+                            .position(|&c| c == close)
+                            .map(|n| i + n + 1)
+                    }
+                    (Some('?'), _) => None,
+                    _ => Some(i + 1),
+                };
+                if let Some(mut at) = body {
+                    let mut anchors = 0;
+                    loop {
+                        match (chars.get(at), chars.get(at + 1)) {
+                            (Some('\\'), Some('z' | 'Z' | 'A' | 'b' | 'B' | 'G')) => at += 2,
+                            (Some('^' | '$'), _) => at += 1,
+                            _ => break,
+                        }
+                        anchors += 1;
+                    }
+                    if anchors > 0 && chars.get(at) == Some(&')') {
+                        return true;
+                    }
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// Whether `pattern` needs the dual-haystack-view trailing-newline check at
 /// all (see `dv_captures_at`). Deliberately naive about escaping/character
 /// classes — a false positive (an escaped `\$` or a `$` inside `[...]`)
@@ -27921,6 +28053,9 @@ enum RegexEngine {
     RewrittenFancy {
         re: fancy_regex::Regex,
         groups: super::onig_capture_loop::LoopRewrite,
+        /// The pattern as written, which answers a search that exhausts the backtracking budget
+        /// on the rewrite (#6488).
+        as_written: Option<Box<fancy_regex::Regex>>,
     },
 }
 
@@ -28088,9 +28223,14 @@ impl JqRegex {
             RegexEngine::Std(re) | RegexEngine::Rewritten { re, .. } => {
                 Ok(dv_is_match(re, input, self.needs_trailing_nl_check))
             }
-            RegexEngine::Fancy(re) | RegexEngine::RewrittenFancy { re, .. } => {
-                re.is_match(input).map_err(fancy_match_error)
-            }
+            RegexEngine::Fancy(re) => re.is_match(input).map_err(fancy_match_error),
+            RegexEngine::RewrittenFancy { re, as_written, .. } => match re.is_match(input) {
+                found if !exhausted_budget(&found) => found.map_err(fancy_match_error),
+                found => match as_written {
+                    Some(re) => re.is_match(input).map_err(fancy_match_error),
+                    None => found.map_err(fancy_match_error),
+                },
+            },
         }
     }
 
@@ -28164,10 +28304,19 @@ impl JqRegex {
                 .captures_from_pos(input, start)
                 .map(|caps| caps.map(RegexCaptures::Fancy))
                 .map_err(fancy_match_error),
-            RegexEngine::RewrittenFancy { re, groups } => re
-                .captures_from_pos(input, start)
-                .map(|caps| caps.map(|caps| RegexCaptures::mapped_fancy(caps, groups)))
-                .map_err(fancy_match_error),
+            RegexEngine::RewrittenFancy {
+                re,
+                groups,
+                as_written,
+            } => match (re.captures_from_pos(input, start), as_written) {
+                (found, Some(re)) if exhausted_budget(&found) => re
+                    .captures_from_pos(input, start)
+                    .map(|caps| caps.map(RegexCaptures::Fancy))
+                    .map_err(fancy_match_error),
+                (found, _) => found
+                    .map(|caps| caps.map(|caps| RegexCaptures::mapped_fancy(caps, groups)))
+                    .map_err(fancy_match_error),
+            },
         }
     }
 
@@ -28353,6 +28502,18 @@ fn fancy_longest_keep_captures<'h>(
         }
     }
     Ok(best.map(|(_, caps)| caps))
+}
+
+/// Whether a `fancy-regex` search gave up on its backtracking budget, which a rewritten pattern can
+/// exhaust where the pattern as written does not (#6488).
+#[cfg(feature = "regex")]
+fn exhausted_budget<T>(found: &Result<T, fancy_regex::Error>) -> bool {
+    matches!(
+        found,
+        Err(fancy_regex::Error::RuntimeError(
+            fancy_regex::RuntimeError::BacktrackLimitExceeded
+        ))
+    )
 }
 
 /// A `fancy-regex` search that gave up. Oniguruma gives up too, on its own retry limit, with
@@ -32907,6 +33068,8 @@ fn build_regex_uncached<S: EvalSemantics>(
     // jq checks the modifiers before it compiles the pattern, so `test("(?P<n>a)"; "z")` is the
     // modifier error.
     let mut deferred_refusal = None;
+    // The pattern as the user wrote it, before the classes are rewritten (#6488).
+    let source = pattern;
     let mut pattern = if S::TAG == EvalTag::Yq {
         super::go_regex::translate(pattern).map_err(EvalError::new)?
     } else {
@@ -33151,11 +33314,35 @@ fn build_regex_uncached<S: EvalSemantics>(
         && needs_trailing_nl_check
         && (pattern_has_escape_z(&pattern) || pattern_has_interior_dollar(&pattern))
     {
+        // #6488: a loop whose groups the rewrites copy is written for this engine too; the plain
+        // rewrite above leaves such a loop as written. The rewrites read `$` as the end of the text,
+        // which this engine's `$` is only where nothing can match the final newline it may stand
+        // before, and a group that holds nothing but an anchor can be dropped from a copy (#6492).
+        // Both are read off the pattern as the user wrote it: the rewrites spell `\w` as a class of
+        // ranges and write a way that never matches as `[^\s\S]`, which the check would take for
+        // a newline. jq's `m` and `p` make `.` match one.
+        let flagged = |letters: &str| flags.is_some_and(|f| f.chars().any(|c| letters.contains(c)));
         let built = build_fancy_regex::<S>(&pattern)
             .or_else(|| as_written.as_deref().and_then(build_fancy_regex::<S>));
-        if let Some(re) = built {
+        let rewritable =
+            !flagged("mp") && !pattern_may_match_newline(source) && !has_anchor_only_group(source);
+        let engine = rewritable
+            .then(|| rewritten_engine::<S>(&pattern, longest, suppress_empty, true))
+            .flatten()
+            .map(|engine| match engine {
+                // The copies can take far more backtracking than the pattern as written, so a
+                // search that exhausts the budget on them is answered by the pattern instead.
+                RegexEngine::RewrittenFancy { re, groups, .. } => RegexEngine::RewrittenFancy {
+                    re,
+                    groups,
+                    as_written: built.clone().map(Box::new),
+                },
+                other => other,
+            })
+            .or_else(|| built.map(RegexEngine::Fancy));
+        if let Some(engine) = engine {
             return Ok(JqRegex {
-                engine: RegexEngine::Fancy(re),
+                engine,
                 needs_trailing_nl_check: false,
                 exact_end: None,
                 suppress_empty,
@@ -33167,71 +33354,7 @@ fn build_regex_uncached<S: EvalSemantics>(
         }
     }
 
-    // #6069: a repeated group that can match empty reports Oniguruma's last iteration only from a
-    // rewritten pattern. The rewrite keeps every character, class and escape of the pattern, so
-    // one the crate compiles stands for the pattern; one it refuses (its size limit) leaves the
-    // pattern to compile as written, with the crate's own error if it has one.
-    let capture = (S::TAG != EvalTag::Yq)
-        .then(|| super::onig_capture_loop::rewrite(&pattern))
-        .flatten()
-        .map(|mut groups| {
-            // #6305: the repeated group's own loop copy is now a plain `(?:X)*`, which the #6106
-            // rewrite can read (the group itself was a body with a capture group, which it
-            // cannot): it leaves that loop where Oniguruma does. It writes no group, so the
-            // copies stay as counted; a result the crate refuses keeps the capture rewrite alone.
-            if !longest {
-                if let Some(ordered) =
-                    super::onig_loop::rewrite_for(&groups.pattern, suppress_empty)
-                {
-                    // #6426: a pattern with a lookaround or an atomic group is checked on the
-                    // engine that runs it.
-                    let compiles = if is_fancy_syntax(&ordered) {
-                        build_fancy_regex_with::<S>(&ordered, FancyModes::rewritten())
-                            .is_some_and(|re| re.captures_len() == groups.compiled_groups)
-                    } else {
-                        compile_std(&ordered)
-                            .is_ok_and(|re| re.captures_len() == groups.compiled_groups)
-                    };
-                    if compiles {
-                        groups.pattern = ordered;
-                    }
-                }
-            }
-            groups
-        });
-    // #6332: a loop with a capture group in a way the plain rewrite would copy or drop is written
-    // with the group copied, and each copy is read back into the group (see `onig_loop`). It runs
-    // over the capture rewrite's pattern when there is one, composing the two readings; a result
-    // the crate refuses keeps what there was.
-    let mut fancy_copies_refused = false;
-    let grouped = (S::TAG != EvalTag::Yq && !longest)
-        .then(|| {
-            group_copies_engine::<S>(
-                &pattern,
-                capture.as_ref(),
-                &mut fancy_copies_refused,
-                suppress_empty,
-            )
-        })
-        .flatten();
-    let rewritten = grouped.or_else(|| {
-        capture.and_then(|groups| {
-            // #6426: the capture rewrite of a pattern with a lookaround or an atomic group keeps
-            // it as written, and runs on `fancy-regex`. Not when the copies of a group it needs
-            // were refused there: the capture rewrite alone answers some of those wrongly.
-            if S::TAG != EvalTag::Yq && is_fancy_syntax(&groups.pattern) {
-                if fancy_copies_refused {
-                    return None;
-                }
-                let re = build_fancy_regex_with::<S>(&groups.pattern, FancyModes::rewritten())?;
-                return (re.captures_len() == groups.compiled_groups)
-                    .then_some(RegexEngine::RewrittenFancy { re, groups });
-            }
-            let re = compile_std(&groups.pattern).ok()?;
-            (re.captures_len() == groups.compiled_groups)
-                .then_some(RegexEngine::Rewritten { re, groups })
-        })
-    });
+    let rewritten = rewritten_engine::<S>(&pattern, longest, suppress_empty, false);
     // The pattern as written replaces the #6106 rewrite only when it compiles where the rewrite does
     // not (an engine limit). A pattern the crate refuses either way keeps its rewrite for
     // `fancy-regex` (#6128), and is refused in the words of the pattern as written.
@@ -33685,6 +33808,90 @@ fn empty_match_is_position_free(pattern: &str) -> bool {
         .is_ok_and(|ast| assertion_free(&ast))
 }
 
+/// The engine of a pattern the capture rewrite (#6069) or the group-copies rewrite (#6332) reads
+/// as Oniguruma does, or `None` when neither applies or the engine refuses what they write. With
+/// `on_fancy`, every rewrite runs on `fancy-regex`, for a pattern only that engine reads exactly
+/// (`$` and `\z` together, or a `$` something follows, #5572, #6488).
+#[cfg(feature = "regex")]
+fn rewritten_engine<S: EvalSemantics>(
+    pattern: &str,
+    longest: bool,
+    suppress_empty: bool,
+    on_fancy: bool,
+) -> Option<RegexEngine> {
+    // #6069: a repeated group that can match empty reports Oniguruma's last iteration only from a
+    // rewritten pattern. The rewrite keeps every character, class and escape of the pattern, so
+    // one the crate compiles stands for the pattern; one it refuses (its size limit) leaves the
+    // pattern to compile as written, with the crate's own error if it has one.
+    let capture = (S::TAG != EvalTag::Yq)
+        .then(|| super::onig_capture_loop::rewrite(pattern))
+        .flatten()
+        .map(|mut groups| {
+            // #6305: the repeated group's own loop copy is now a plain `(?:X)*`, which the #6106
+            // rewrite can read (the group itself was a body with a capture group, which it
+            // cannot): it leaves that loop where Oniguruma does. It writes no group, so the
+            // copies stay as counted; a result the crate refuses keeps the capture rewrite alone.
+            if !longest {
+                if let Some(ordered) =
+                    super::onig_loop::rewrite_for(&groups.pattern, suppress_empty)
+                {
+                    // #6426: a pattern with a lookaround or an atomic group is checked on the
+                    // engine that runs it.
+                    let compiles = if on_fancy || is_fancy_syntax(&ordered) {
+                        build_fancy_regex_with::<S>(&ordered, FancyModes::rewritten())
+                            .is_some_and(|re| re.captures_len() == groups.compiled_groups)
+                    } else {
+                        compile_std(&ordered)
+                            .is_ok_and(|re| re.captures_len() == groups.compiled_groups)
+                    };
+                    if compiles {
+                        groups.pattern = ordered;
+                    }
+                }
+            }
+            groups
+        });
+    // #6332: a loop with a capture group in a way the plain rewrite would copy or drop is written
+    // with the group copied, and each copy is read back into the group (see `onig_loop`). It runs
+    // over the capture rewrite's pattern when there is one, composing the two readings; a result
+    // the crate refuses keeps what there was.
+    let mut fancy_copies_refused = false;
+    let grouped = (S::TAG != EvalTag::Yq && !longest)
+        .then(|| {
+            group_copies_engine::<S>(
+                pattern,
+                capture.as_ref(),
+                &mut fancy_copies_refused,
+                suppress_empty,
+                on_fancy,
+            )
+        })
+        .flatten();
+    grouped.or_else(|| {
+        capture.and_then(|groups| {
+            // #6426: the capture rewrite of a pattern with a lookaround or an atomic group keeps
+            // it as written, and runs on `fancy-regex`. Not when the copies of a group it needs
+            // were refused there: the capture rewrite alone answers some of those wrongly.
+            if S::TAG != EvalTag::Yq && (on_fancy || is_fancy_syntax(&groups.pattern)) {
+                if fancy_copies_refused {
+                    return None;
+                }
+                let re = build_fancy_regex_with::<S>(&groups.pattern, FancyModes::rewritten())?;
+                return (re.captures_len() == groups.compiled_groups).then_some(
+                    RegexEngine::RewrittenFancy {
+                        re,
+                        groups,
+                        as_written: None,
+                    },
+                );
+            }
+            let re = compile_std(&groups.pattern).ok()?;
+            (re.captures_len() == groups.compiled_groups)
+                .then_some(RegexEngine::Rewritten { re, groups })
+        })
+    })
+}
+
 /// The engine for `pattern` written by the loop rewrite with its groups copied (#6332), or `None`
 /// when no loop needs it or the crate refuses the result. It runs over the capture rewrite's
 /// pattern when there is one (`base`, #6069), composing the two readings.
@@ -33694,6 +33901,7 @@ fn group_copies_engine<S: EvalSemantics>(
     base: Option<&super::onig_capture_loop::LoopRewrite>,
     fancy_refused: &mut bool,
     not_empty: bool,
+    on_fancy: bool,
 ) -> Option<RegexEngine> {
     let source = base.map_or(pattern, |groups| groups.pattern.as_str());
     // Switches the copy rewrite refuses leave it unknown whether copies are needed, so the fancy
@@ -33703,12 +33911,16 @@ fn group_copies_engine<S: EvalSemantics>(
     // #6426: a lookaround or an atomic group beside the loop is syntax only `fancy-regex` reads, and
     // the rewrite keeps it as written: it runs there, with the same groups. `fancy_refused` says
     // that the copies were needed and the engine could not take them.
-    if is_fancy_syntax(&copied.pattern) {
+    if on_fancy || is_fancy_syntax(&copied.pattern) {
         let engine = build_fancy_regex_with::<S>(&copied.pattern, FancyModes::rewritten())
             .filter(|re| re.captures_len() == copied.compiled_groups)
             .and_then(|re| {
                 let groups = compose_group_copies(base, copied)?;
-                Some(RegexEngine::RewrittenFancy { re, groups })
+                Some(RegexEngine::RewrittenFancy {
+                    re,
+                    groups,
+                    as_written: None,
+                })
             });
         *fancy_refused = engine.is_none();
         return engine;
@@ -33939,7 +34151,9 @@ fn build_fancy_regex_at<S: EvalSemantics>(
     if fancy_has_squeezed_plus_run(&expr) {
         return None;
     }
-    if modes.rewritten && fancy_has_lazy_squeezed_run(&expr) {
+    if modes.rewritten
+        && (fancy_has_lazy_squeezed_run(&expr) || fancy_has_repeated_lazy_group(&expr))
+    {
         return None;
     }
     // #6262: the engine reads a reference to a still-open group of a repeat as empty.
@@ -34507,6 +34721,37 @@ fn fancy_has_lazy_squeezed_run(expr: &fancy_regex::Expr) -> bool {
         _ => false,
     };
     squeezed(expr) || expr.has_descendant(squeezed)
+}
+
+/// Whether `expr` holds an unbounded repeat of a capture group whose body is an unbounded lazy
+/// repeat (`(.+?)*`, `(.*?)*?`, `(?<n>[ab]+?){1,}?`), which `fancy-regex` 0.20.0 answers wrongly
+/// when it runs the pattern itself (beside a lookaround): `"abc" | match("(?=a)(?:(.+?)*)c")` has
+/// the group at `"b"` in jq and at `"ab"` there, and `"abcc" | match("(?=a)(?:(.+?)*)c").string` is
+/// `"abcc"` in jq and `"abc"` there (#6488). The `regex` crate answers both as jq does, and the
+/// copy rewrite writes the shape for a lazy loop of a way that consumes (`(?:(.*?)|$)+?c` is
+/// `(?:(.*?)|$)(?:(.+?)*?)c`); a rewrite with it keeps the pattern as it was.
+#[cfg(feature = "regex")]
+fn fancy_has_repeated_lazy_group(expr: &fancy_regex::Expr) -> bool {
+    use fancy_regex::Expr;
+    let merged = |e: &Expr| match e {
+        Expr::Repeat {
+            child,
+            hi: usize::MAX,
+            ..
+        } => matches!(
+            &**child,
+            Expr::Group(body) if matches!(
+                &**body,
+                Expr::Repeat {
+                    hi: usize::MAX,
+                    greedy: false,
+                    ..
+                }
+            )
+        ),
+        _ => false,
+    };
+    merged(expr) || expr.has_descendant(merged)
 }
 
 /// Whether `expr` holds a backreference to a capture group that is still open where the reference
@@ -139783,7 +140028,8 @@ mod tests {
             let refused = std_regex(&written.pattern).is_err();
             let kept = std_regex(&again.pattern).is_ok();
             assert_eq!(
-                group_copies_engine::<JqSemantics>(&pattern, None, &mut false, false).is_some(),
+                group_copies_engine::<JqSemantics>(&pattern, None, &mut false, false, false)
+                    .is_some(),
                 !refused || kept
             );
         }
@@ -175743,5 +175989,102 @@ mod negated_byte_class_tests_6246 {
         assert!(pattern_may_set_ignore_case("a(?mi:b)"));
         assert!(!pattern_may_set_ignore_case("(?m)a"));
         assert!(!pattern_may_set_ignore_case("a"));
+    }
+}
+
+/// #6488: the trailing-newline route writes a loop's groups only for a pattern that cannot match a
+/// newline and has no group that holds only an anchor, read off the pattern as the user wrote it.
+#[cfg(all(test, feature = "regex"))]
+mod trailing_newline_route_tests_6488 {
+    use super::{
+        build_fancy_regex_with, has_anchor_only_group, pattern_may_match_newline, FancyModes,
+        JqSemantics,
+    };
+
+    /// `fancy-regex` 0.20 merges a repeat of a group whose body is a lazy repeat, beside a
+    /// lookaround: `"abc" | match("(?=a)(?:(.+?)*)c")` has the group at `"ab"` there and at `"b"`
+    /// in jq. A rewrite that holds the shape is refused there; the pattern as written is not.
+    #[test]
+    fn a_rewrite_with_a_repeated_lazy_group_is_refused_by_fancy_regex_6488() {
+        for merged in [
+            r"(?=a)(?:(.+?)*)c",
+            r"(?=a)(?:(.*?)*?)c",
+            r"(?=a)(?:(?<n>[ab]+?){1,}?)c",
+            r"(?=a)x|(?:(.+?)*)c",
+        ] {
+            assert!(
+                build_fancy_regex_with::<JqSemantics>(merged, FancyModes::default()).is_some(),
+                "{merged} as written"
+            );
+            assert!(
+                build_fancy_regex_with::<JqSemantics>(merged, FancyModes::rewritten()).is_none(),
+                "{merged} rewritten"
+            );
+        }
+        // A greedy body, a bounded repeat of the group, a bounded body and a body with more than
+        // the repeat are not the shape.
+        for other in [
+            r"(?=a)(?:(.+)*)c",
+            r"(?=a)(?:(.+?){0,3})c",
+            r"(?=a)(?:(.{1,2}?)*)c",
+            r"(?=a)(?:(a.+?)*)c",
+        ] {
+            assert!(
+                build_fancy_regex_with::<JqSemantics>(other, FancyModes::rewritten()).is_some(),
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_is_an_anchor_only_group_6488() {
+        for pattern in [r"(\w*)(\z)$", r"($)a", r"(?<n>\b^)$", r"a(\A\z)"] {
+            assert!(has_anchor_only_group(pattern), "{pattern}");
+        }
+        for pattern in [
+            r"(\w*)\z$",
+            r"(?:\z)$",
+            r"(?=\z)$",
+            r"(?<=\b)a$",
+            r"(a\z)$",
+            r"\(\z\)$",
+            r"()$",
+        ] {
+            assert!(!has_anchor_only_group(pattern), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn what_may_match_a_newline_6488() {
+        for pattern in [
+            r"(?:$\z|\B(\w*)){2,}",
+            r"a\d+\S$",
+            r"[ab_0]+\b$",
+            r"(?:a|\t)\z",
+            r"\.\$\(\)$",
+            r"(?<n>a)(?=b)(?#c)$",
+        ] {
+            assert!(!pattern_may_match_newline(pattern), "{pattern}");
+        }
+        for pattern in [
+            "a\n$",
+            r"a\n$",
+            r"\s$",
+            r"\W$",
+            r"\D$",
+            r"[^a]$",
+            r"[a-z]$",
+            r"[[:space:]]$",
+            r"\x0a$",
+            r"(a)\1$",
+            r"\p{L}$",
+            r"\h\R$",
+            r"(?s).$",
+            r"(?s:.)$",
+        ] {
+            assert!(pattern_may_match_newline(pattern), "{pattern}");
+        }
+        // A `.` that no flag turns to match a newline does not.
+        assert!(!pattern_may_match_newline(r"a.$"));
     }
 }
