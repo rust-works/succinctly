@@ -150083,6 +150083,11 @@ mod tests {
             "fabs",
             "ceil",
             "round",
+            "trunc",
+            "log",
+            "exp",
+            "pow(.; 2)",
+            "atan2(.; 1)",
         ];
         let mut taken = 0;
         let mut declined_by_answer = 0;
@@ -150123,6 +150128,46 @@ mod tests {
         }
         assert!(taken > 5_000, "the matrix must reach the door: {taken}");
         assert!(declined_by_answer > 0, "some answers must decline");
+        // Chained: the first door's answer is the second one's input, as in `map(a) | map(b)`, and
+        // the pair is the bridge's answer for the whole pipe (an integer-valued float, a number past
+        // 2^53, an overflow that makes the first stage decline).
+        let chain = [
+            ". * 1.5", ". + 1", ". * 2", ". - 3", ". / 7", "floor", ". % 5",
+        ];
+        let mut chained = 0;
+        for first in chain {
+            for second in chain {
+                let one = parse(&format!("map({first})")).unwrap();
+                let two = parse(&format!("map({second})")).unwrap();
+                let pipe = parse(&format!("map({first}) | map({second})")).unwrap();
+                for items in &arrays {
+                    let value = OwnedValue::array_from(items.clone());
+                    let Some(mid) =
+                        crate::jq::eval_generic::eval_owned_number_map::<JqSemantics>(&one, &value)
+                    else {
+                        continue;
+                    };
+                    let Some(end) =
+                        crate::jq::eval_generic::eval_owned_number_map::<JqSemantics>(&two, &mid)
+                    else {
+                        continue;
+                    };
+                    chained += 1;
+                    let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                        &pipe, &value, false,
+                    ));
+                    assert_eq!(
+                        select_door_observable(&(vec![end], "ok".to_string())),
+                        select_door_observable(&bridge),
+                        "{first:?} then {second:?} on {value:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            chained > 1_000,
+            "the chain must reach both doors: {chained}"
+        );
         // A body that answers for an ordinary number does answer for it.
         let numbers = OwnedValue::array_from(vec![
             OwnedValue::Int(1),

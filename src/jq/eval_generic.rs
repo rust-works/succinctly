@@ -611,13 +611,17 @@ pub(crate) fn eval_owned_number_map<S: EvalSemantics>(
     };
     if items.is_empty()
         || !(math.is_some() || plain_shape_may_be_answered(body))
-        || !items.iter().all(crate::jq::eval::is_plain_finite_number)
         || embed_table_active()
     {
         return None;
     }
     let mut out = crate::jq::eval::vec_with_capacity(items.len());
     for item in items {
+        // Checked per element, in the answer loop: a body no number answers (`length`, `tojson`)
+        // or an element that is not plain declines at the first one, with no scan before it.
+        if !crate::jq::eval::is_plain_finite_number(item) {
+            return None;
+        }
         let answer = math
             .and_then(|builtin| {
                 crate::jq::eval::owned_unary_math::<S>(builtin, item)

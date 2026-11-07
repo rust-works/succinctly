@@ -120,3 +120,62 @@ fn a_map_body_that_raises_over_a_computed_number_array_keeps_jqs_error_6539() ->
     }
     Ok(())
 }
+
+/// A second `map` reads the first one's answers: an integer-valued float (`1.5e+17`), a number past
+/// 2^53, an overflow to an infinity (which the door leaves to the bridge) and a subnormal all read
+/// the same through the chain as in jq 1.7.1.
+#[test]
+fn chained_maps_over_large_and_integer_valued_floats_are_jqs_answer_6539() -> Result<()> {
+    for (filter, expected) in [
+        (
+            "[(1e17,2e17)|.+0] | map(. * 1.5) | map(. + 1)",
+            "[1.5e+17,3e+17]",
+        ),
+        (
+            "[(1e17,2e17)|.+0] | map(. * 1.5) | map(. + 1) | map(tostring)",
+            "[\"1.5e+17\",\"3e+17\"]",
+        ),
+        (
+            "[(1e17,3e16)|.+0] | map(. * 1.5) | map(. * 2) | add",
+            "3.9e+17",
+        ),
+        (
+            "[range(3)|.*1e17] | map(. * 1.5) | map(. + 1) | tojson",
+            "\"[1,1.5e+17,3e+17]\"",
+        ),
+        (
+            "[(9007199254740993, 4)|.+0] | map(. + 1) | map(. * 2) | map(. + 1)",
+            "[18014398509481984,11]",
+        ),
+        (
+            "[(1e300,1)|.+0] | map(. * 10) | map(. * 1e10) | map(. - 1)",
+            "[1.7976931348623157e+308,99999999999]",
+        ),
+        (
+            "[(0.1,0.2)|.+0] | map(. * 3) | map(. + 0.1) | map(. * 10)",
+            "[4,7.000000000000001]",
+        ),
+        (
+            "[(5e-324,1)|.+0] | map(. / 2) | map(. * 2) | map(. + 0)",
+            "[0,1]",
+        ),
+        (
+            "[(1e17,2e17)|.+0] | map(. * 1.5) | map(. + 1) | map(. % 7)",
+            "[4,1]",
+        ),
+        (
+            "[(4e18,1)|.+0] | map(. * 2) | map(. + 1) | map(. - 1) | map(tostring)",
+            "[\"8e+18\",\"2\"]",
+        ),
+        (
+            "[range(4)|.*3e18] | map(. + 1) | map(. * 2) | tojson",
+            "\"[2,6e+18,1.2e+19,1.8e+19]\"",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], None)?;
+        assert_eq!(stdout, format!("{expected}\n"), "{filter}");
+        assert_eq!(stderr, "", "{filter}");
+        assert_eq!(code, 0, "{filter}");
+    }
+    Ok(())
+}
