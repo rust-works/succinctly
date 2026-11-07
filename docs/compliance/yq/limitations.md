@@ -7140,3 +7140,7 @@ These differ:
 - **An explicit indentation indicator on a block scalar under a chain of dashes is measured from the wrong indent (#6550, #6490).**
   `- - &x` / `  |2` / `    t` is `[["t\n"]]` in yq and `[["  t\n"]]` here, and `- - !!str` / `  |1` / `    t` is `[[" t\n"]]` in yq and `[["   t\n"]]` here: the indicator counts from the indent of the enclosing sequence, where yq counts from the indent of the innermost one.
   Only the scalar's text differs; the document is accepted.
+- **An environment variable whose value is not valid UTF-8 is refused by `strenv()` and `env()` (#6566).**
+  yq reads the bytes: `strenv(BADVAR)` with `BADVAR` set to `\xff\xfe` prints those two bytes, and `env(BADVAR)` reads them as a YAML document (`Error: EOF`).
+  A string value here cannot hold non-UTF-8 text, so both stop with `value for env variable 'BADVAR' is not valid UTF-8 in strenv()` (or `env()`) and exit status 1, where they said `not provided` before #6566.
+  An unset variable is `not provided`, as in yq.
