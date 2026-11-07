@@ -1,7 +1,8 @@
 //! #6480 (its plan's step 5): a fault at the end of the text, when the last file named did not
 //! open. `[1,` waits for more, so jq's parser asks its reader past the last file before it gives
 //! up, and `input` raises `Unfinished JSON term at EOF` at the missing file, line 0, which names
-//! it in the `(at ...)` marker. A fault earlier in the text, or a missing file before the last
+//! it in the `(at ...)` marker, under `-n`, `-n -s`, or for an `input` the program reads itself.
+//! A fault earlier in the text, or a missing file before the last
 //! that opened, keeps the fault's own file, and jq's main loop prints the fault with no position.
 //! Every row was captured from jq 1.7.1.
 
@@ -23,6 +24,7 @@ fn a_fault_at_the_end_of_the_text_is_raised_at_a_missing_last_file_6480() -> Res
         ("key", "{\"a\":"),
         ("bad", "[1,}\n2"),
         ("ok", "1\n2\n"),
+        ("b", "1\n[1,"),
     ] {
         std::fs::write(dir.path().join(format!("{name}.json")), text)?;
     }
@@ -51,8 +53,13 @@ fn a_fault_at_the_end_of_the_text_is_raised_at_a_missing_last_file_6480() -> Res
         (&["-n"][..], "[inputs] | length", &["t1", "gone", "ok"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error (at @DIR@/ok.json:2): Expected separator between values at line 3, column 0\n", 2),
         (&["-n"][..], "[inputs] | length", &["bad", "gone"][..], "", "jq: error (at @DIR@/bad.json:1): Unmatched '}' at line 1, column 4\n", 5),
         (&["-n"][..], "[inputs] | length", &["t1"][..], "", "jq: error (at @DIR@/t1.json:0): Unfinished JSON term at EOF at line 1, column 3\n", 5),
+        (&["-n", "-s"][..], "input", &["t1", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error (at @DIR@/gone.json:0): Unfinished JSON term at EOF at line 1, column 3\n", 2),
+        (&["-n", "-s"][..], "try input catch ., input", &["t1", "gone"][..], "\"Unfinished JSON term at EOF at line 1, column 3\"\n[]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&[][..], "[., input]", &["b", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error (at @DIR@/gone.json:0): Unfinished JSON term at EOF at line 2, column 3\n", 2),
+        (&[][..], "try input catch input_filename", &["b", "gone"][..], "\"@DIR@/gone.json\"\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&[][..], ".", &["t1", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Unfinished JSON term at EOF at line 1, column 3\n", 2),
         (&[][..], "input_line_number as $l | .", &["okt", "gone"][..], "1\n2\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Unfinished JSON term at EOF at line 3, column 3\n", 2),
+
     ] {
         let paths: Vec<String> = names.iter().map(|name| format!("{d}/{name}.json")).collect();
         let mut args = vec!["-c"];

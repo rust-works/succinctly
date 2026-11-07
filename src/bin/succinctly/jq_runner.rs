@@ -7940,6 +7940,8 @@ fn read_inputs(
                 .unwrap_or((0, UNKNOWN_LINE));
             let mut slurped_locations = InputLocations::new(locations.files().to_vec());
             slurped_locations.unopened_tail = locations.unopened_tail;
+            // #6480: the faults go ahead of the array, the one at the end of the text included.
+            slurped_locations.fault_at_tail = locations.fault_at_tail;
             slurped_locations.push(src as usize, line as usize);
             let mut ahead: Vec<(usize, TrailingParseError)> = resumed_errors
                 .into_iter()
