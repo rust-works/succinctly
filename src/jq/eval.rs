@@ -140732,7 +140732,8 @@ mod tests {
             "(?=b)b+?a*?b*",
             "(?=b)b+a+?b*",
         ] {
-            let re = build_fancy_regex_with::<JqSemantics>(other, FancyModes::rewritten_on(false)).unwrap();
+            let re = build_fancy_regex_with::<JqSemantics>(other, FancyModes::rewritten_on(false))
+                .unwrap();
             assert!(!re.as_str().contains("(?!)"), "{other}");
         }
         // The extended mode switched on by the leading switches, and a `#` that is a literal.
@@ -140741,7 +140742,7 @@ mod tests {
             "(?x)(?=b)b+ a*? # c\n b*",
             "(?=b)b+a*?b*|#",
         ] {
-            for modes in [FancyModes::default(), FancyModes::rewritten()] {
+            for modes in [FancyModes::default(), FancyModes::rewritten_on(false)] {
                 assert_eq!(span(read, modes), Some((0, 1)), "{read}");
             }
         }
@@ -140758,7 +140759,11 @@ mod tests {
                 Some((0, 3)),
                 "{unread}"
             );
-            assert_eq!(span(unread, FancyModes::rewritten_on(false)), None, "{unread}");
+            assert_eq!(
+                span(unread, FancyModes::rewritten_on(false)),
+                None,
+                "{unread}"
+            );
         }
     }
 
