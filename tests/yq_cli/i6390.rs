@@ -120,10 +120,35 @@ fn a_block_scalar_header_at_the_indent_of_an_empty_node_is_its_value_6390() -> R
         ("- k: !!str\n  >+\n    t\n", "[{\"k\":\"t\\n\"}]"),
         ("- k: &y !!str\n  |\n    t\n", "[{\"k\":\"t\\n\"}]"),
         ("- k: &y !!str\n  >+\n    t\n", "[{\"k\":\"t\\n\"}]"),
+        ("-\r\n|\r\n  t\r\n", "[\"t\\n\"]"),
+        ("? a\r\n:\r\n>\r\n  t\r\n", "{\"a\":\"t\\n\"}"),
+        (
+            "a:\r\n  b: &y\r\n  |\r\n    t\r\n",
+            "{\"a\":{\"b\":\"t\\n\"}}",
+        ),
     ] {
         let (out, code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
         assert_eq!(code, 0, "{input:?}");
         assert_eq!(out.trim_end(), expected, "{input:?}");
+    }
+    Ok(())
+}
+
+/// A line at the owner's indent that starts with `|` or `>` but is not a header stays refused, as it
+/// was and as in yq (the first byte decides that it is the value, the block scalar reader that it is
+/// not a valid one).
+#[test]
+fn a_malformed_header_at_the_indent_of_an_empty_node_stays_refused_6390() -> Result<()> {
+    for input in [
+        "a:\n>foo\n",
+        "a:\n|x\n",
+        "-\n>foo\n",
+        "? a\n:\n>foo\n",
+        "a:\n  -\n  |x\n",
+        "a: &y\n>foo\n",
+    ] {
+        let (_, code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_ne!(code, 0, "{input:?}");
     }
     Ok(())
 }

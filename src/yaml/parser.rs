@@ -4974,9 +4974,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     fn header_at_indent(&mut self, indent: usize) -> bool {
         let saved_pos = self.pos;
         self.advance_by(indent);
-        let is_header = matches!(self.peek(), Some(b'|' | b'>'));
+        let is_header = self.peek().is_some_and(Self::opens_block_scalar);
         self.pos = saved_pos;
         is_header
+    }
+
+    /// Whether a line that starts with `byte` is a block scalar header: `|` or `>`. The one test
+    /// every lookahead for a header applies, so a change to what counts is made once (#6390).
+    #[inline]
+    const fn opens_block_scalar(byte: u8) -> bool {
+        matches!(byte, b'|' | b'>')
     }
 
     /// [`Self::following_value_is_null`] for a value that a block sequence at the owner's own
@@ -5029,7 +5036,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         match self.input.get(p + spaces) {
             // A block scalar header at the indent is the value, as `following_value_is_null` has it.
             Some(&b) if !Self::is_break(b) && b != b'#' && b != b'\t' => {
-                Some(spaces < indent || (spaces == indent && !matches!(b, b'|' | b'>')))
+                Some(spaces < indent || (spaces == indent && !Self::opens_block_scalar(b)))
             }
             None if spaces == 0 => Some(true),
             _ => None,
@@ -5282,7 +5289,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     matches!(self.peek(), Some(b'-')) && Self::is_ws_break_or_eoi(self.peek_at(1));
                 // A block scalar header at the key's own indent is the key's value (see
                 // `parse_mapping_entry`): `- a:` / `  |` / `    t` is `[{"a": "t\n"}]`.
-                let is_block_scalar_header = matches!(self.peek(), Some(b'|' | b'>'));
+                let is_block_scalar_header = self.peek().is_some_and(Self::opens_block_scalar);
                 self.pos = saved_pos;
 
                 if next_indent < indent
@@ -5523,7 +5530,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // key's own indent it is the key's value, as a sequence is (`a:` / `|` / `  x` is
             // `{"a": "x\n"}` in yq). It used to read only because the null written for it sat on the
             // `|` (#6386), which the reader then took for the block scalar.
-            let is_block_scalar_header = matches!(next_char, Some(b'|' | b'>'));
+            let is_block_scalar_header = next_char.is_some_and(Self::opens_block_scalar);
             self.pos = saved_pos;
 
             if next_indent < indent {
