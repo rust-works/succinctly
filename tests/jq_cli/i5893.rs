@@ -1,7 +1,8 @@
 //! #5893: a constructor fold step that reads a scalar off the accumulator (`[., length]`,
 //! `{a: ., n: length}`, `{(.s): .}`) is built on the moved accumulator like `[.]` is (#5875), so a
-//! deep fold of it is linear. A member that reads a container out of the accumulator (`[., .a]`), a
-//! float or `tojson` is answered from a rebuilt copy of it: right, and still quadratic. Every expected string was captured from jq 1.7.1
+//! deep fold of it is linear. A member that reads a container out of the accumulator (`[., .a]`)
+//! or `tojson` is answered from a rebuilt copy of it: right, and still quadratic (a finite float is
+//! read off the tree since #6528). Every expected string was captured from jq 1.7.1
 //! (`/usr/bin/jq`).
 
 use anyhow::Result;
