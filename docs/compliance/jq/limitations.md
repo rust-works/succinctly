@@ -14174,7 +14174,7 @@ Two residuals remain, both with a missing file *and* a feature that routes input
 
 * `-s` and `--input-dsv` read every file that opens and report every missing one up front.
   jq stops after one more line, record or event past a missing file, and reaches a missing file only when the reader gets to it.
-  `--seq` and `--stream-errors` do the same when the program reads `input`, and when the first value past the missing file is not complete inside its file (a last line, record or event that ends the file).
+  `--seq` and `--stream-errors` do the same when the program reads `input`, under `-n` and `-s`, and when the first value past the missing file is not complete inside its file (a last record or event that ends the file).
   Otherwise their main loop reports only the failures up to the file that first value comes from, since [#6522](https://github.com/rust-works/succinctly/issues/6522): `jq --seq -c . missing a.seq missing2` reports `missing` and never `missing2`.
   A filter that uses `input`/`inputs` under `-n` reports a missing file when a read reaches it, since [#6475](https://github.com/rust-works/succinctly/issues/6475): `jq -n -c input data.json missing` prints the first value and exits 0, as in jq, because the reader never asks for the file after it.
   Without `-n`, a filter that reads `input`, `inputs` or `input_line_number` reports a missing file the same way, since [#6525](https://github.com/rust-works/succinctly/issues/6525): the main loop reads the first file before the program does and stops one value past the first failure, so `jq -c 'try input catch .' missing.json three.json m2.json` reports `missing.json` and never `m2.json`.
@@ -14184,7 +14184,9 @@ Two residuals remain, both with a missing file *and* a feature that routes input
   A bare number or literal last in the whole input is read at a missing last file instead, which reports it at that read (#6480): `jq -n input nonl.json missing` over `1\n2` reads `1` and exits 0, because `1` completes at its newline, and `jq -n input one.json missing` reports the file before `1`, as jq does.
   A plain `--stream` walk stops as jq does, after the one event past a missing file (`jq -c --stream . missing a.json` over `[3]` prints `[[0],3]` and not the closing `[[0]]`, #6006); it still reports the missing file up front.
   The output of `-R` and `-s` over files that all exist is unchanged; only the run that has a missing file differs.
-* `-R` stops as jq does, after the one line past a missing file (`jq -R . missing lines.txt` prints the first line only, #6464), and does not report a second missing file that jq never reaches (#6522), when the file that line comes from holds a newline.
+* `-R` stops as jq does, after the one line past a missing file (`jq -R . missing lines.txt` prints the first line only, #6464), and does not report a second missing file that jq never reaches (#6522).
+  A line with no newline goes on into the next file that has bytes, as in jq, so a missing file between the two is reported and one after the file that ends the line is not.
+  A program that reads `input`, `-n` and `-s` report every missing file when a read reaches it, or up front, as above.
   `-n` with `input_line_number` and no `input`/`inputs` opens no file, so it reports no missing one (#6464).
 * jq keeps the name of the last file it tried even when it did not open, so a diagnostic or `input_filename` after a missing last file names that file (`jq -s -c input_filename data.json missing` prints `"missing"`).
   `succinctly jq` does the same once a read reaches the end of the input, since [#6480](https://github.com/rust-works/succinctly/issues/6480): the missing last file is a source past the ones that opened, at line 0, so `[inputs], input_filename` under `-n`, an error after `[inputs]`, and every `-s` route name it.

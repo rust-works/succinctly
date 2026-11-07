@@ -1,7 +1,9 @@
 //! #6522: `-R`, `--seq` and `--stream-errors` read past a fault, but jq's main loop still ends the
 //! run one value past the first file that did not open: a file after the one that value comes from
 //! is never opened, so it is never reported. Every row was captured from jq 1.7.1; the files end
-//! where a line, a record or an event does, so the first value is complete inside its file.
+//! where a line, a record or an event does, so the first value is complete inside its file; a line
+//! with no newline goes on into the next file, and a program that reads `input` keeps the failures it
+//! reaches.
 
 use anyhow::Result;
 
@@ -18,6 +20,7 @@ fn a_main_loop_that_reads_lines_records_or_events_stops_past_the_first_failure_6
         ("ok.json", "[1,2]\n"),
         ("seq.json", "\u{1e}1\n\u{1e}2\n"),
         ("empty.json", ""),
+        ("nonl.json", "x"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
@@ -35,6 +38,12 @@ fn a_main_loop_that_reads_lines_records_or_events_stops_past_the_first_failure_6
         (&["--stream-errors", "-c", "."][..], &["ok", "gone", "nums", "gone2"][..], "[[0],1]\n[[1],2]\n[[1]]\n[[],1]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&["--stream-errors", "-c", "[., input_filename]"][..], &["gone", "empty", "ok", "gone2"][..], "[[[0],1],\"@DIR@/ok.json\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&["--stream-errors", "-c", "."][..], &["gone", "gone2", "ok", "gone3"][..], "[[0],1]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Could not open file @DIR@/gone2.json: No such file or directory\n", 2),
+        (&["-R", "-c", "."][..], &["gone", "nonl", "lines", "gone2"][..], "\"xx\"\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-R", "-c", "."][..], &["gone", "nonl", "gone2"][..], "\"x\"\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Could not open file @DIR@/gone2.json: No such file or directory\n", 2),
+        (&["-R", "-c", "."][..], &["gone", "nonl", "empty", "lines", "gone2"][..], "\"xx\"\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-R", "-c", "."][..], &["nonl", "gone", "lines", "gone2"][..], "\"xx\"\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["--seq", "-c", "[., input]"][..], &["seq", "gone", "gone2"][..], "\u{1e}[1,2]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Could not open file @DIR@/gone2.json: No such file or directory\n", 2),
+        (&["--stream-errors", "-c", "input"][..], &["gone", "ok", "gone2"][..], "[[1],2]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
     ] {
         let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}.json")).collect();
         let mut args: Vec<&str> = flags.to_vec();

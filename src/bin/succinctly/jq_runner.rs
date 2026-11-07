@@ -8922,14 +8922,25 @@ fn open_failures_reached<'a>(
         // the first open failure: a failure after the file that value comes from is never
         // reached, when the file holds the whole value.
         if main_loop_only && args.input_dsv.is_none() {
-            let first = failures[0].0;
-            let value_file = raws
+            // The first file with bytes from the first failure on holds the value, or the end of
+            // one that started before it. A line with no newline goes on into the next file with
+            // bytes; the other readers stop where they cannot tell.
+            let mut files = raws
                 .iter()
                 .enumerate()
-                .skip(first)
-                .find(|(_, raw)| !raw.is_empty())
-                .map(|(at, _)| at);
-            if let Some(file) = value_file.filter(|&at| first_value_completes_in(&raws[at], args)) {
+                .skip(failures[0].0)
+                .filter(|(_, raw)| !raw.is_empty());
+            let file = if args.raw_input {
+                files
+                    .find(|(_, raw)| first_value_completes_in(raw, args))
+                    .map(|(at, _)| at)
+            } else {
+                files
+                    .next()
+                    .filter(|(at, _)| first_value_completes_at(raws, *at, args))
+                    .map(|(at, _)| at)
+            };
+            if let Some(file) = file {
                 let reached = failures.iter().take_while(|&&(at, _)| at <= file).count();
                 return &failures[..reached];
             }
@@ -8951,14 +8962,19 @@ fn open_failures_reached<'a>(
 fn first_value_completes_in(raw: &[u8], args: &JqCommand) -> bool {
     if args.raw_input {
         raw.contains(&b'\n')
-    } else if args.seq {
+    } else {
         // A record ends at the next record separator.
         raw.iter().filter(|&&b| b == 0x1e).count() >= 2
+    }
+}
+
+/// [`first_value_completes_in`] for the file at `at` of `raws`, and for `--stream-errors`, whose
+/// text is whole JSON that ends where a value does: its first event is complete however it is read.
+fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bool {
+    if args.stream_errors && !args.seq {
+        source_ends_cleanly(&raws[at], args) && first_stream_fault(&raws[at..=at]).is_none()
     } else {
-        // `--stream-errors`: the text is whole JSON that ends where a value does, so its first event
-        // is complete however it is read.
-        source_ends_cleanly(raw, args)
-            && first_stream_fault(core::slice::from_ref(&raw.to_vec())).is_none()
+        first_value_completes_in(&raws[at], args)
     }
 }
 
