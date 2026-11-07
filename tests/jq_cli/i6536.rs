@@ -54,3 +54,19 @@ fn a_condition_whose_arithmetic_raises_keeps_jqs_error_6536() -> Result<()> {
     assert_eq!(code, 5);
     Ok(())
 }
+
+/// The values before the one that raises are printed first, as in jq 1.7.1.
+#[test]
+fn outputs_before_a_raising_arithmetic_condition_are_printed_first_6536() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "-c", "range(4) | select(. % 2 == 0 or . % 0 == 0)"],
+        None,
+    )?;
+    assert_eq!(stdout, "0\n");
+    assert_eq!(
+        stderr,
+        "jq: error (at <unknown>): number (1) and number (0) cannot be divided (remainder) because the divisor is zero\n"
+    );
+    assert_eq!(code, 5);
+    Ok(())
+}
