@@ -2997,6 +2997,7 @@ fn format_bytes(bytes: usize) -> String {
 }
 
 mod address_space;
+mod bench_reps;
 #[cfg(feature = "bench-runner")]
 mod bench_runner;
 #[cfg(feature = "bench-runner")]

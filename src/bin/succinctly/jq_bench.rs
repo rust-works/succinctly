@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::bench_runner::utils::{ensure_success, interleaved_reps};
+use crate::bench_reps::{ensure_success, interleaved_reps};
 
 /// Query types for benchmarking different `eval_generic.rs` execution paths.
 ///
