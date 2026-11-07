@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Differential sweep for #6310 and #6332: a capture group inside a loop's body.
 
-    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert | --bounded | --fancy] [--newlines [--multiline]] [--blanks] [--flags g] [--jq /usr/bin/jq]
+    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert | --bounded | --paired | --fancy] [--newlines [--multiline]] [--blanks] [--flags g] [--jq /usr/bin/jq]
 
 Oniguruma ends a greedy loop at the first iteration that matches nothing (#6106), and that holds when the
 body has a capture group: after its empty way (`(?:b*|(a))+`, #6310), or before it, in it, or with its own
@@ -19,7 +19,8 @@ in the middle; `--newlines` runs it on subjects that hold a newline instead, and
 `$` may be written as `\\A` and `\\z`; `--multiline` (#6425) puts `(?m)` before every pattern, with `^`, `$` and a newline drawn more often, which is what makes
 them line anchors. `--fancy` (#6358) draws the plain loops with a lookaround or an atomic group beside them, outside the repeat, so
 that they run on `fancy-regex`. `--bounded` (#6428, #6427) draws a lazy repeat that may run once or not at all (`{0,n}?`, `{1,n}?`, `*?`, `+?`) over anchors, flag switches and loops of its own, beside another loop or
-inside a repeat. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
+inside a repeat. `--paired` (#6469) draws two such lazy repeats, each over ways that hold loops with groups, beside each other,
+in alternation or one nested in the other, which is what tells a pattern-wide reading from one per repeat. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
 captures are compared. It prints how many patterns SUBJECT fixed (BASELINE differed from jq, SUBJECT does
 not), broke (the reverse) and still differs on, and exits 1 when it broke one.
 
@@ -167,6 +168,34 @@ def bounded_patterns(count, rng):
     return sorted(out)
 
 
+LAZY = ["*?", "+?", "{0,2}?", "{1,2}?", "{0,3}?", "{1,3}?"]
+PAIRED_SUBJECTS = SUBJECTS + ["aac", "abac", "xyc"]
+
+
+def paired_patterns(count, rng):
+    """`--paired`: two lazy repeats over loops with groups, beside, in alternation with or nested in each other."""
+    pool = ATOMS + NESTED + LOOPS + ["^x*", "^b*", "(?:(y*)|x)+", "(?:(y)|x?){0,2}"]
+
+    def lazy(inner=""):
+        ways = ["".join(rng.choice(pool) for _ in range(rng.choice([1, 2, 2])))
+                for _ in range(rng.choice([2, 2, 3]))]
+        if inner:
+            ways[rng.randrange(len(ways))] += inner
+        return "(?:%s)%s" % ("|".join(ways), rng.choice(LAZY))
+
+    out = set()
+    while len(out) < count:
+        shape = rng.random()
+        if shape < 0.5:
+            pattern = lazy() + lazy()
+        elif shape < 0.75:
+            pattern = "(?:%s|%s)" % (lazy(), lazy())
+        else:
+            pattern = lazy(lazy())
+        out.add(pattern + rng.choice(["", "c", "c", "$", "b"]))
+    return sorted(out)
+
+
 def fancy_patterns(count, rng):
     """`--fancy`: a plain draw with a construct only `fancy-regex` reads beside each loop."""
     out = set()
@@ -210,6 +239,7 @@ def main():
     shape.add_argument("--ways", action="store_true", help="loops beside other items in the ways of an outer repeat")
     shape.add_argument("--assert", dest="anchors", action="store_true", help="ways that hold a zero-width anchor")
     shape.add_argument("--bounded", action="store_true", help="a lazy repeat, most with a minimum under two, over anchors, switches and loops")
+    shape.add_argument("--paired", action="store_true", help="two lazy repeats beside, in alternation with or nested in each other")
     shape.add_argument("--fancy", action="store_true", help="a lookaround or atomic group beside the loop")
     ap.add_argument("--newlines", action="store_true", help="with --assert: subjects that hold a newline")
     ap.add_argument("--multiline", action="store_true",
@@ -231,13 +261,15 @@ def main():
                 plist = sorted({"(?m)" + p for p in plist})
     elif args.bounded:
         plist, prog = bounded_patterns(args.count, rng), PROGRAM
+    elif args.paired:
+        plist, prog = paired_patterns(args.count, rng), program(PAIRED_SUBJECTS)
     elif args.fancy:
         plist, prog = fancy_patterns(args.count, rng), PROGRAM
     else:
         plist = ways_patterns(args.count, rng) if args.ways else patterns(args.count, rng, args.nest)
         prog = PROGRAM
     if args.blanks:
-        if args.anchors or args.fancy:
+        if args.anchors or args.fancy or args.paired:
             ap.error("--blanks applies to the plain, --nest and --ways draws")
         plist, prog = blanked(plist), program(BLANK_SUBJECTS)
     ref = answers([args.jq], plist, args.flags, prog)
