@@ -7716,6 +7716,22 @@ A fix would need a counted repeat that is not written out (a loop counter), whic
 The refusal and the rows that are answered are pinned by `tests/jq_cli/i6439.rs`.
 `succinctly yq` is not affected: its patterns are Go's, which refuses a count past 1000.
 
+### A `^` under `(?m)` does not hold at the end of the text (#6456)
+
+Oniguruma's begin-of-line anchor holds at the start of the text, and after a newline unless that is the end of the text (`ON_STR_END`).
+The `regex` crate's `(?m)^` holds after any newline, so a text that ends with one gets one more match at its end: `"a\n" | [match("(?m)^";"g") | .offset]` is `[0]` in jq and was `[0,2]`, and `"a\nb\n" | gsub("(?m)^";"> ")` ended with a stray `"> "`.
+A match of the crate that ends at the end of a text with a final newline may have used the `^` there, so it is asked of the `fancy-regex` build of the pattern (`ExactEnd`, built the first time and kept), with every `^` under `(?m)` written as `(?:\A|^(?!\z))`.
+A match that ends before the end of the text cannot have used it, so a text without a final newline, and a pattern without a multi-line `^`, take no extra work.
+`(?m)` is followed in the order it is written: a `(?m)` holds to the end of its group, `(?m:...)` inside its body, `(?-m)` and a repeat of the flag turn it off or on again.
+`$` already agrees (`"a\n"` gives `[1,2]` in both).
+A look-around or a backreference around the `^` does not change that: `"a\n" | [match("(?m)(?<=\\n)^";"g")]` is `[]` in jq and here, and `(?m)(?=a)^`, `(?m)^(?!x)` and `(?m)(?<!x)^` agree on texts with one and with two final newlines.
+A `^` *inside* a look-around still keeps the crate's reading: `"a\n" | [match("(?m)(?<!^)";"g") | .offset]` is `[1,2]` in jq and `[1]` here, and `"a\n" | [match("(?m)a\\n(?!^)";"g") | .offset]` is `[0]` in jq and `[]` here.
+A pattern that repeats a group name more often than `onig_loop::MAX_NAME_RENAMES` keeps the crate's reading too.
+A match of the crate that the exact engine fails on (its backtrack limit) keeps the crate's match, as before.
+Only a pattern whose syntax tree the parser cannot read keeps the crate's reading.
+A pattern `fancy-regex` refuses keeps the match of the crate: `"aa\n" | [match("(?m)^a+a*a+\\n?^";"g")]` is `[]` in jq and one match here, because `a+a*a+` is the shape `fancy-regex` answers wrongly (the entry on two greedy `X+` repeats above).
+Pinned by `tests/jq_cli/i6456.rs` (119 rows read from jq 1.7.1, and 15 for a repeated group name) and, for yq, `tests/yq_cli/i6456.rs`; a differential of 333 subject and pattern pairs, 159 of which differed before, agrees.
+
 ### A group repeated `{0}` keeps its capture entry (#6108)
 
 Oniguruma numbers a group repeated zero times (`{0}`, `{0,0}`), so jq reports an entry for it: offset `-1` and string `null`, or an empty string at the match offset when the whole match is empty.
@@ -7910,9 +7926,9 @@ These keep their loop as written, and still match longer than jq where the shape
   A `^` holds again after a newline that a way ends with, so only a body no way of which can end with one is written, as `\A` is.
   What keeps its text, and differs, is a `$` with a way after it that may start with a newline or not (`\s`, `[^b]`, `\W`; `.` too, since the flag that lets it match one is not tracked) or that the parser cannot read, a `^` beside a way that can end with a newline (`"a\nb" | [match("(?m)(^|a|\\n|b)*";"g") | .string]` is `["","\n","",""]` in jq and `["","\nb",""]` here), a `(?m)` that something switches, and a search told to find no empty match (the `n` flag).
   No closed form is known for those: the `regex` crate has no complement of a line anchor and no lookahead to build one, and a way that starts either way cannot be split by its first character in general.
-  Over draws of 3,000 loops under `(?m)` (`--assert --newlines --multiline`, seeds 2, 3 and 4) the patterns that differ fall from 273, 260 and 255 to 235, 229 and 219, and two in all changed the other way (`(?m)((?<n>a)\w|(?<n>a)|^^)+` and, under `gi`, `(?m)x?(\A|\n|^)*`), each on a subject that ends with a newline, where it was right because of the end-of-text `^` below.
-  Most of those left differ in the bare `^` as well: `(?m)^` holds at the end of a text that ends with a newline, where Oniguruma's does not ([#6456](https://github.com/rust-works/succinctly/issues/6456)).
-  Of the 235 left in seed 2, 189 agree with jq on every subject that does not end with a newline.
+  Over draws of 3,000 loops under `(?m)` (`--assert --newlines --multiline`, seeds 2, 3 and 4) the patterns that differ fall from 273, 260 and 255 to 235, 229 and 219.
+  Since [#6456](https://github.com/rust-works/succinctly/issues/6456) the bare `^` agrees with jq at the end of a text that ends with a newline, and on the same draws 60, 64 and 67 patterns differ, none of them broken by it.
+  Two patterns that the end-of-text `^` had made differ the other way (`(?m)((?<n>a)\w|(?<n>a)|^^)+` and, under `gi`, `(?m)x?(\A|\n|^)*`) agree with jq on `"a\n"`, `"aa\n"`, `"a\n\n"` and `"ab\n"`, since the caret check reads a pattern that repeats a group name through the renamed copy ([#6430](https://github.com/rust-works/succinctly/issues/6430)).
   An assertion in a way that also consumes text is not this case: `\Ba`, `a\z` and `^a` always consume when they match.
   They are copied with the other ways, and `"ba" | [match("(?:b*|\\Ba)+") | .string]` is `["b","",""]`, as in jq ([#6300](https://github.com/rust-works/succinctly/issues/6300)).
 - **A body with a flag switch** (`(?i)` inside it) is rewritten with the switch scoped over what it reaches, as `(?i:..)` around the items after it and around every later way ([#6301](https://github.com/rust-works/succinctly/issues/6301)): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and here.
