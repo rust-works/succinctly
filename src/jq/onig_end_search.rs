@@ -471,6 +471,16 @@ mod tests {
             ),
             (r"(?<=[ab]{2})\z", Some((r"(?:(?!)(?:[ab]{2}))\z", false))),
             (r"(?<=\p{L}+)\z", Some((r"(?:(?!)(?:\p{L}+))\z", false))),
+            // A brace that is no count is a literal; escapes read through their digits.
+            (r"(?<=b{x})\z", Some((r"(?:(?!)(?:b{x}))\z", false))),
+            (r"(?<=b{1,a})\z", Some((r"(?:(?!)(?:b{1,a}))\z", false))),
+            (r"(?<=\x62)\z", Some((r"(?:(?!)(?:\x62))\z", false))),
+            (r"(?<=\u0062)\z", Some((r"(?:(?!)(?:\u0062))\z", false))),
+            (r"(?<=\012)\z", Some((r"(?:(?!)(?:\012))\z", false))),
+            (
+                r"(?<=(?<n>b)\k'n')\z",
+                Some((r"(?:(?!)(?:(?<n>b)\k'n'))\z", false)),
+            ),
         ];
         for (pattern, want) in cases {
             let want = want.map(|(text, semi)| (text.to_string(), semi));
@@ -506,6 +516,7 @@ mod tests {
             r"(?x)(?<=b)\z",
             r"(?:(?<=b)\z)+",
             r"(?<=b)\K\z",
+            r"(?<=\kn)\z",
             r"(?<=b)\z)",
             r"\z",
         ] {
