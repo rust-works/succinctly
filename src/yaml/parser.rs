@@ -6075,7 +6075,31 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     return Err(self.err_unexpected_char(self.pos, "did not find expected key"));
                 }
 
-                if !self.at_line_end() {
+                // #6570: properties alone after the dash (`? - &x`) name a value on a line below,
+                // as for any other item: the item stays open and the main loop reads the value
+                // there, with the checks it makes of a line below a block scalar. `parse_value`
+                // below would read the properties' own line end as a plain scalar over the lines
+                // that follow, which holds a block scalar header and its content as text (`? -
+                // &x` / `   |` / `     t` / `` / `   u` dropped `u`).
+                let mut value_on_a_later_line = false;
+                if matches!(self.peek(), Some(b'&' | b'!'))
+                    && !self.node_properties_prefix_mapping_entry()
+                {
+                    let properties_start = self.pos;
+                    let had_property = self.parse_node_properties()?;
+                    if self.at_line_end() {
+                        value_on_a_later_line = true;
+                        if had_property && self.following_value_is_null(seq_indent) {
+                            self.set_ib();
+                            self.write_bp_open();
+                            self.write_bp_close();
+                        }
+                    } else {
+                        self.pos = properties_start;
+                    }
+                }
+
+                if !value_on_a_later_line && !self.at_line_end() {
                     // #6379: and a property before that `?` (`? - &t ? x`) is refused.
                     if self.properties_precede_explicit_key_indicator() {
                         return Err(self.err_unexpected_char(
@@ -6105,7 +6129,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
                 // Nothing opened inside the item: close it now. A container it opened leaves the
                 // item's frame on the stack for the dedent to close, in order.
-                if self.indent_stack.len() == item_depth + 1 {
+                if !value_on_a_later_line && self.indent_stack.len() == item_depth + 1 {
                     self.indent_stack.pop();
                     self.pop_type();
                     self.write_bp_close(); // close item
