@@ -19,6 +19,7 @@ fn an_unopened_file_after_a_text_that_ends_inside_a_value_is_reported_first_6476
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
+    std::fs::create_dir(dir.path().join("adir.json"))?;
     let path = |name: &str| format!("{d}/{name}.json");
     for (flags, names, stdout, stderr, status) in [
         (&["."][..], &["t1", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Unfinished JSON term at EOF at line 1, column 3\n", 2),
@@ -33,6 +34,10 @@ fn an_unopened_file_after_a_text_that_ends_inside_a_value_is_reported_first_6476
         (&["-c", "--seq", "."][..], &["t1", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Unfinished abandoned text at EOF at line 1, column 3\n", 2),
         (&["-c", "."][..], &["nums", "gone"][..], "1\n2\n3\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&["-s", "-c", "."][..], &["nums", "gone"][..], "[1,2,3]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["."][..], &["t1", "adir"][..], "", "jq: parse error: Unfinished JSON term at EOF at line 1, column 3\n", 2),
+        (&["-s", "-c", "."][..], &["t1", "adir"][..], "", "jq: parse error: Unfinished JSON term at EOF at line 1, column 3\n", 2),
+        (&["-c", "."][..], &["t4", "adir", "gone"][..], "\"x\"\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Unfinished JSON term at EOF at line 2, column 3\n", 2),
+        (&["-c", "."][..], &["t1", "gone", "adir"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Unfinished JSON term at EOF at line 1, column 3\n", 2),
     ] {
         let files: Vec<String> = names.iter().map(|name| path(name)).collect();
         let mut args: Vec<&str> = flags.to_vec();
