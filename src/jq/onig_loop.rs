@@ -54,6 +54,7 @@
 //! its empty one that form still differs from Oniguruma's on a few patterns (#6128).
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -410,6 +411,15 @@ struct Rewriter<'p> {
     /// Whether a loop inside a lazy repeat that may keep its text is written anyway (#6427): the
     /// repeat is expected to be written too, and [`rewrite_parsed`] reads again if it is not.
     lazy_trusted: bool,
+    /// The reading of each lazy repeat that may keep its text, by where it starts, when it is not
+    /// the pattern's ([`rewrite_parsed`], #6469): one repeat that gives up is read again without
+    /// costing the others theirs.
+    readings: BTreeMap<usize, usize>,
+    /// The pattern's own reading, which a repeat missing from [`Self::readings`] has.
+    reading: usize,
+    /// The innermost lazy repeat that may keep its text, and may still be read again, around the
+    /// point where the conversion gave up (#6469).
+    blame: Option<usize>,
 }
 
 /// Whether a flag switch (`(?i)`, not a flag group) stands anywhere in `ast`.
@@ -834,7 +844,7 @@ fn rewrite_parsed(
             (shadow.text.as_str(), ast, shadow.opaque.as_slice())
         }
     };
-    let new_rewriter = |lazy_bounded: bool, lazy_trusted: bool| Rewriter {
+    let new_rewriter = |reading: usize, readings: BTreeMap<usize, usize>| Rewriter {
         source: pattern,
         opaque,
         limit: pattern
@@ -858,23 +868,42 @@ fn rewrite_parsed(
         copies,
         exit: None,
         lazy_around: 0,
-        lazy_bounded,
+        lazy_bounded: READINGS[reading].0,
         lazy_bounded_written: false,
-        lazy_trusted,
+        lazy_trusted: copies && READINGS[reading].1,
         inside_reduced: false,
+        readings,
+        reading,
+        blame: None,
     };
     // #6428, #6427: what a lazy repeat with a group adds never costs the rest of the pattern its
     // rewrite. The first reading writes such a repeat and the loops inside it, the second only the
-    // repeat, and the third neither.
-    let (bounded, trusted) = READINGS[reading];
-    let mut rewriter = new_rewriter(bounded, copies && trusted);
+    // repeat, and the third neither. #6469: a repeat the conversion gave up inside is read again
+    // at its next reading, and the others keep theirs; a give-up no such repeat is around moves the
+    // whole pattern to its next reading. Each read moves one repeat or the pattern on, so a
+    // pattern is read at most once per reading of each such repeat; past `MOST_READS` the pattern
+    // moves on as a whole.
+    const MOST_READS: usize = 16;
+    let mut readings: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut whole = reading;
+    let mut rewriter = new_rewriter(whole, readings.clone());
     let mut piece = rewriter.convert(&ast, false);
-    for &(bounded, trusted) in &READINGS[reading + 1..] {
-        if piece.is_ok() || !rewriter.lazy_bounded_written {
-            break;
+    let mut reads = 1;
+    while piece.is_err() && rewriter.lazy_bounded_written {
+        match rewriter.blame.filter(|_| reads < MOST_READS) {
+            Some(at) => {
+                let next = readings.get(&at).copied().unwrap_or(whole) + 1;
+                readings.insert(at, next);
+            }
+            None if whole + 1 < READINGS.len() => {
+                whole += 1;
+                readings.retain(|_, own| *own > whole);
+            }
+            None => break,
         }
-        rewriter = new_rewriter(bounded, copies && trusted);
+        rewriter = new_rewriter(whole, readings.clone());
         piece = rewriter.convert(&ast, false);
+        reads += 1;
     }
     let piece = piece.ok()?;
     // The rewrite can drop a piece that matches only the empty string (`\p{Foo}{0}`), and with it
@@ -1295,26 +1324,24 @@ impl Rewriter<'_> {
                 // either, so neither has the copies or the exit written below.
                 let reduced = core::mem::take(&mut self.inside_reduced) || reduces_with_inner(rep);
                 self.inside_reduced = reduces_with_inner(rep);
-                if kept && self.lazy_trusted {
-                    self.lazy_bounded_written |= has_capture(&rep.ast);
-                    let changed = core::mem::take(&mut self.changed);
-                    let body = self.convert(&rep.ast, true)?;
-                    let inner = core::mem::replace(&mut self.changed, changed);
-                    let consuming = matches!(body.ways, Ways::Consuming);
-                    let written = self.repeat_text(&body.text, min, max, rep.greedy)?;
-                    let piece = self.counted_repeat(rep, body, min, max, reduced)?;
-                    self.changed |= inner;
-                    // A loop inside a repeat that kept its text may not take its exit, and only now
-                    // does it show that the repeat did. A body that cannot match nothing is safe.
-                    if inner && !consuming && piece.text.text == written.text {
-                        return Err(GiveUp);
+                if kept {
+                    // #6469: each such repeat is read at its own reading, which the repeats inside
+                    // it and `counted_repeat` below read through the two flags.
+                    let at = rep.span.start.offset;
+                    let reading = self.readings.get(&at).copied().unwrap_or(self.reading);
+                    let (bounded, trusted) = READINGS[reading];
+                    let saved = (self.lazy_bounded, self.lazy_trusted);
+                    self.lazy_bounded = bounded;
+                    self.lazy_trusted = self.copies && trusted;
+                    let piece = self.lazy_repeat(rep, min, max, reduced);
+                    (self.lazy_bounded, self.lazy_trusted) = saved;
+                    if piece.is_err() && self.blame.is_none() && reading + 1 < READINGS.len() {
+                        self.blame = Some(at);
                     }
-                    return Ok(piece);
+                    return piece;
                 }
-                self.lazy_around += u32::from(kept);
-                let body = self.convert(&rep.ast, true);
-                self.lazy_around -= u32::from(kept);
-                self.counted_repeat(rep, body?, min, max, reduced)
+                let body = self.convert(&rep.ast, true)?;
+                self.counted_repeat(rep, body, min, max, reduced)
             }
             Ast::Alternation(alt) => {
                 // #6301: a flag switch (`(?i)`) reaches the rest of its group, later ways included,
@@ -1346,6 +1373,38 @@ impl Rewriter<'_> {
     }
 
     /// An assertion, which is a way of its own when it is an anchor a loop can write (#6358).
+    /// A lazy `X*?`, `X+?`, `X{0,n}?` or `X{1,n}?`, which may keep its text, at the reading the two
+    /// flags hold for it: with `lazy_trusted` the loops inside it are written too, on the
+    /// expectation that it is, and it gives up when it keeps its text after all (#6427).
+    fn lazy_repeat(
+        &mut self,
+        rep: &ast::Repetition,
+        min: u32,
+        max: Option<u32>,
+        reduced: bool,
+    ) -> Result<Piece, GiveUp> {
+        if !self.lazy_trusted {
+            self.lazy_around += 1;
+            let body = self.convert(&rep.ast, true);
+            self.lazy_around -= 1;
+            return self.counted_repeat(rep, body?, min, max, reduced);
+        }
+        self.lazy_bounded_written |= has_capture(&rep.ast);
+        let changed = core::mem::take(&mut self.changed);
+        let body = self.convert(&rep.ast, true)?;
+        let inner = core::mem::replace(&mut self.changed, changed);
+        let consuming = matches!(body.ways, Ways::Consuming);
+        let written = self.repeat_text(&body.text, min, max, rep.greedy)?;
+        let piece = self.counted_repeat(rep, body, min, max, reduced)?;
+        self.changed |= inner;
+        // A loop inside a repeat that kept its text may not take its exit, and only now does it
+        // show that the repeat did. A body that cannot match nothing is safe.
+        if inner && !consuming && piece.text.text == written.text {
+            return Err(GiveUp);
+        }
+        Ok(piece)
+    }
+
     fn assertion(&self, ast: &Ast) -> Result<Piece, GiveUp> {
         let text = self.text(self.verbatim(ast.span()).into(), Prec::Atom)?;
         let word = |fails: &str| self.text(fails.into(), Prec::Atom);
