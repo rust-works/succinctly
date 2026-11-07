@@ -56,3 +56,49 @@ fn a_chunked_stream_reports_an_unopened_file_when_its_reader_reaches_it_6485() -
     }
     Ok(())
 }
+
+/// A last file that did not open is a source of its own in jq's reader, so a number at the end of
+/// the file before it waits for the read that opens the one that failed; and a directory last is
+/// read, and fails the run, even when nothing asks past it.
+#[test]
+fn a_last_unopened_file_or_directory_is_a_source_of_its_own_6485() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let d = dir.path().to_string_lossy().into_owned();
+    for (name, text) in [
+        ("a1.json", "1"),
+        ("two.json", "2 3"),
+        ("nonl.json", "[1]"),
+        ("nums.json", "1\n2\n3\n"),
+    ] {
+        std::fs::write(dir.path().join(name), text)?;
+    }
+    std::fs::create_dir(dir.path().join("adir.json"))?;
+    for (flags, names, stdout, stderr, status) in [
+        (&["-c", "-n", "--stream", "input"][..], &["a1", "gone"][..], "[[],1]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "-n", "--stream", "first(inputs)"][..], &["a1", "gone"][..], "[[],1]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "-n", "--stream", "input,input"][..], &["two", "gone"][..], "[[],2]\n[[],3]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "--stream", "input|halt_error"][..], &["two", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n[[],3]\n", 2),
+        (&["-c", "--stream", "."][..], &["a1", "gone"][..], "[[],1]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "--stream", "."][..], &["two", "gone"][..], "[[],2]\n[[],3]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "-n", "--stream", "input,input"][..], &["nonl", "adir"][..], "[[0],1]\n[[0]]\n", "", 2),
+        (&["-c", "-n", "--stream", "input"][..], &["a1", "adir"][..], "[[],1]\n", "", 2),
+        (&["-c", "-n", "--stream", "first(inputs)"][..], &["nonl", "adir"][..], "[[0],1]\n", "", 0),
+        (&["-c", "--stream", "input|halt_error"][..], &["nonl", "adir"][..], "", "[[0]]\n", 2),
+        (&["-c", "--stream", "."][..], &["nonl", "adir"][..], "[[0],1]\n[[0]]\n", "", 2),
+        (&["-c", "--stream", "."][..], &["adir"][..], "", "", 2),
+        (&["-c", "--stream", "."][..], &["nums", "adir", "gone"][..], "[[],1]\n[[],2]\n[[],3]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "--stream", "."][..], &["nums", "adir", "nums"][..], "[[],1]\n[[],2]\n[[],3]\n[[],1]\n", "jq: error: Is a directory\n", 2),
+    ] {
+        let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}.json")).collect();
+        let mut args: Vec<&str> = flags.to_vec();
+        args.extend(files.iter().map(String::as_str));
+        let (out, err, code) = run_jq_full(&args, None)?;
+        let expected_err = stderr.replace("@DIR@", &d);
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            (stdout, expected_err.as_str(), status),
+            "{flags:?} {names:?}"
+        );
+    }
+    Ok(())
+}

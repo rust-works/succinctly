@@ -216,6 +216,9 @@ pub(crate) struct ChunkedSources {
     closed: bool,
     error: Option<std::io::Error>,
     tail: Tail,
+    /// The tail's last failure is a source of its own in jq's reader, so the last source that
+    /// opened does not end the stream.
+    tail_is_source: bool,
 }
 
 impl ChunkedSources {
@@ -231,12 +234,14 @@ impl ChunkedSources {
             closed: false,
             error: None,
             tail: Vec::new(),
+            tail_is_source: false,
         }
     }
 
     /// Has `tail` run when the reader asks past the last source (#6485).
-    pub(crate) fn with_tail(mut self, tail: Tail) -> Self {
+    pub(crate) fn with_tail(mut self, tail: Tail, tail_is_source: bool) -> Self {
         self.tail = tail;
+        self.tail_is_source = tail_is_source;
         self
     }
 
@@ -293,7 +298,7 @@ impl RefillSource for ChunkedSources {
         let count = self.openers.len();
         while self.source < count {
             let source = self.source;
-            let last_source = source + 1 == count;
+            let last_source = source + 1 == count && !self.tail_is_source;
             if self.current.is_none() {
                 let opened = self.openers[source].take().map_or_else(
                     || {
@@ -372,8 +377,13 @@ impl RefillSource for ChunkedSources {
                 is_last,
             });
         }
-        for report in self.tail.drain(..) {
-            report();
+        // What a missing last file says is said on the first read past the last source. A
+        // directory last is a source that has been read already (its failure counts then), and
+        // what jq says of it comes on a read after this one (#6472).
+        if self.tail_is_source {
+            for report in self.tail.drain(..) {
+                report();
+            }
         }
         if !self.closed {
             self.closed = true;
