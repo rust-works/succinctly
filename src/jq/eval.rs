@@ -14120,6 +14120,16 @@ fn closed_expr_shape(expr: &Expr) -> bool {
         | Expr::And(left, right)
         | Expr::Or(left, right)
         | Expr::Alternative(left, right) => closed_expr_shape(left) && closed_expr_shape(right),
+        // #6574: `if C then A else B end`, all three closed (an `elif` is a nested `if`).
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            closed_expr_shape(cond)
+                && closed_expr_shape(then_branch)
+                && closed_expr_shape(else_branch)
+        }
         _ => false,
     }
 }
@@ -14355,6 +14365,25 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
             } else {
                 closed_expr_to_owned_at_depth::<S>(right, depth + 1, escaped)
             }
+        }
+        // #6574: `if $i % 2 == 0 then 1 else 0 end` with every part closed: the condition is one
+        // value, its truthiness picks a branch, and only that branch is answered, so a branch the
+        // condition does not choose is never read (one that would raise stays unobserved, as in
+        // jq). A condition or chosen branch that raises or yields nothing declines, leaving the
+        // evaluator's route and text. `escaped` follows the chosen branch alone. jq mode only,
+        // like the operators above.
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } if S::TAG == EvalTag::Jq => {
+            let chosen = closed_expr_to_owned_at_depth::<S>(cond, depth + 1, escaped)?;
+            let branch = if chosen.is_truthy() {
+                then_branch
+            } else {
+                else_branch
+            };
+            closed_expr_to_owned_at_depth::<S>(branch, depth + 1, escaped)
         }
         // `[$x]` is a *bare* element inside `Expr::Array`: the parser only
         // adds `Expr::Comma` when a `,` is present (#2152).
