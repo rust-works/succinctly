@@ -6990,6 +6990,11 @@ fn get_inputs(
                                 locations.push(source, line);
                                 values.push(value);
                             }
+                            // #6485: jq's main loop reads no further once a file has failed to
+                            // open, and the fault comes from a read after the array.
+                            crate::jq_stream_errors::Afterwards::Fault(..) if any_open_failure => {
+                                break;
+                            }
                             crate::jq_stream_errors::Afterwards::Fault(message, at) => {
                                 let (source, line) = place(at);
                                 trailing_error = Some(TrailingParseError {
