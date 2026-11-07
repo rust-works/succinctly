@@ -14186,7 +14186,7 @@ Past a missing file jq therefore prints the first value of the next file that ha
 It reports a missing file when it reaches it, after the values before it, so the stderr lines of a run keep jq's order.
 Two residuals remain, both with a missing file *and* a feature that routes input differently:
 
-* `-s` and `--input-dsv` read every file that opens and report every missing one up front.
+* `-s` reads every file that opens and reports every missing one up front, as jq's slurp does.
   jq stops after one more line, record or event past a missing file, and reaches a missing file only when the reader gets to it.
   `--seq` and `--stream-errors` do the same when the program reads `input`, under `-n` and `-s`, and when the first value past the missing file is not complete inside its file (a last record or event that ends the file).
   Otherwise their main loop reports only the failures up to the file that first value comes from, since [#6522](https://github.com/rust-works/succinctly/issues/6522): `jq --seq -c . missing a.seq missing2` reports `missing` and never `missing2`.
@@ -14211,6 +14211,11 @@ Two residuals remain, both with a missing file *and* a feature that routes input
   `input_filename` and an error in that row name the file the record ends in, where jq's reader stands when it completes the record, and its row number counts from the start of that file.
   Only a quote that is still open joins: a last row with no newline stays its own row, where `-R` would join that line to the next file's, since many files end that way and joining them would merge two rows.
   A record still open at the end of the last file is read as it stood.
+  Since [#6585](https://github.com/rust-works/succinctly/issues/6585) it also follows `-R` for a missing file (`--input-dsv` answers `Unknown option --input-dsv` in jq 1.7.1).
+  It reports a missing file when a read reaches it, ends the run after the one row read from past the first missing file, and does not report a second missing one that row never reaches: `succinctly jq -c --input-dsv , . missing a.csv missing2` over `a,b\n1,2\n` prints `["a","b"]` and reports `missing` only, as `-R` does for `lines.txt`.
+  The same holds for a program that reads `input`, and `-n` with `inputs` reads to the end and reports every one.
+  `-s` and `--validate` still report every missing file up front.
+  A record joined across files is read from the file it ends in, so a missing file between the two is reported when that row is read, as `-R` does for a line with no newline.
   jq has no DSV input to compare with, so this is a succinctly extension.
 * jq keeps the name of the last file it tried even when it did not open, so a diagnostic or `input_filename` after a missing last file names that file (`jq -s -c input_filename data.json missing` prints `"missing"`).
   `succinctly jq` does the same once a read reaches the end of the input, since [#6480](https://github.com/rust-works/succinctly/issues/6480): the missing last file is a source past the ones that opened, at line 0, so `[inputs], input_filename` under `-n`, an error after `[inputs]`, and every `-s` route name it.

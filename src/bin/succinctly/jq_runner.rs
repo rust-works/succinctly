@@ -5030,13 +5030,32 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 read_input_files(&files)
             };
             join_dsv_records_across_files(&mut raw_inputs, dsv_config(delimiter).quote_char);
-            report_open_failures(&failures, &mut open_failed);
+            // #6585: as `-R`'s main loop does (#6531), a file that did not open is reported when
+            // the row read from past it is reached, and the loop ends after that one row, so a
+            // failure past the file that row comes from is never reached. `--validate` does not
+            // read DSV and keeps reporting every failure up front.
+            let mut failures = failures;
+            if args.validate {
+                report_open_failures(&failures, &mut open_failed);
+                failures.clear();
+            } else {
+                let reached = open_failures_reached(&failures, &raw_inputs, &args, true).len();
+                failures.truncate(reached);
+            }
+            if let Some(&(at, _)) = failures.first() {
+                note_open_failure_at(at);
+            }
+            // Nothing is pending on the common run, which pays nothing per row for it.
+            let pending_failures = !failures.is_empty();
+            defer_open_failures(failures, false);
+            let mut ended_early = false;
             // `input_filename` on this route too (#3046 review), named after the files that
             // opened: `raw_inputs`' indexes are its source tags (#5472).
             jq::cli_context::set_input_names(input_names(&files));
 
             'files: for (file_idx, raw) in raw_inputs.into_iter().enumerate() {
                 if stopped(args.on_error, &sink) {
+                    ended_early = true;
                     break;
                 }
                 jq::cli_context::set_current_source(u32::try_from(file_idx).ok());
@@ -5050,6 +5069,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 let rows = DsvRows::new(&raw, &index);
 
                 for (row_idx, row) in rows.enumerate() {
+                    // #6585: a file that did not open is reported before the first row read from
+                    // past it.
+                    if pending_failures && row_idx == 0 {
+                        report_reached_open_failures(u32::try_from(file_idx).ok(), false);
+                    }
                     // Each row is one top-level input.
                     if !finished.next_input(
                         args.on_error,
@@ -5057,6 +5081,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         &mut had_output,
                         &mut last_output,
                     ) {
+                        ended_early = true;
                         break 'files;
                     }
                     // One row per line, so the row index is the line. Approximate
@@ -5108,9 +5133,19 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         return Ok(halt_exit_code(code, open_failed));
                     }
                     // row_value is dropped here, freeing memory for this row
+                    // #6585: jq's main loop reads no further input once its reader has read from a
+                    // file past one that did not open; the row that took it there is processed.
+                    if source_is_past_open_failure(u32::try_from(file_idx).ok()) {
+                        ended_early = true;
+                        break 'files;
+                    }
                 }
             }
 
+            // #6585: the files past the last row, which the reader asks for when it finds none.
+            if !ended_early && !stopped(args.on_error, &sink) {
+                report_reached_open_failures(None, false);
+            }
             out.flush()?;
             return Ok(jq_exit_code(
                 &args,
@@ -6949,7 +6984,9 @@ fn read_inputs(
         // values are placed then; with nothing to report the walk is not worth its copy of the text.
         if (args.null_input || track_eof)
             && !args.slurp
-            && args.input_dsv.is_none()
+            // #6585: `--input-dsv` reads its records through the queue the hook reports from; with
+            // `--seq` it keeps the up-front route.
+            && (args.input_dsv.is_none() || !args.seq)
             && (!args.seq
                 || args.raw_input
                 || seq_readers_place_reads
@@ -6970,8 +7007,10 @@ fn read_inputs(
             && ends_cleanly
         {
             // The `--seq` readers place their own faults: the JSON text's fault is not theirs.
-            let fault_ends_text =
-                !seq_readers_place_reads && matches!(first_stream_fault(&raws), Some((_, true)));
+            // A JSON text's fault; `-R` and DSV read no JSON, so none ends their text (#6585).
+            let fault_ends_text = args.input_dsv.is_none()
+                && !seq_readers_place_reads
+                && matches!(first_stream_fault(&raws), Some((_, true)));
             defer_open_failures(failures, fault_ends_text);
             SEQ_FAULT_ENDS.with(|ends| *ends.borrow_mut() = seq_fault_ends_of_stream.into());
         } else {
@@ -6980,9 +7019,9 @@ fn read_inputs(
                 && !args.slurp
                 && (!track_eof || (args.seq && !PROGRAM_READS_INPUTS.with(std::cell::Cell::get)));
             let reached = open_failures_reached(&failures, &raws, args, main_loop_only).len();
-            if main_loop_only && args.raw_input && args.input_dsv.is_none() && !args.validate {
+            if main_loop_only && (args.raw_input || args.input_dsv.is_some()) && !args.validate {
                 // #6531: `-R`'s main loop reports a file when the line it reads comes from past it,
-                // after the lines before.
+                // after the lines before. #6585: and `--input-dsv`'s, for a record.
                 let mut failures = failures;
                 failures.truncate(reached);
                 defer_open_failures(failures, false);
@@ -9418,7 +9457,7 @@ fn open_failures_reached<'a>(
         // #6522: these read on past a fault, but jq's main loop still ends the run one value past
         // the first open failure: a failure after the file that value comes from is never
         // reached, when the file holds the whole value.
-        if main_loop_only && args.input_dsv.is_none() {
+        if main_loop_only {
             // #6646: a `--seq --stream` text whose last file before the failure ends in a
             // container with a scalar before its closer holds that closer's event back until
             // the next read, which is the open of the failed file: the main loop ends there, so
@@ -9440,7 +9479,7 @@ fn open_failures_reached<'a>(
                 .enumerate()
                 .skip(failures[0].0)
                 .filter(|(_, raw)| !raw.is_empty());
-            let file = if args.raw_input {
+            let file = if args.raw_input || args.input_dsv.is_some() {
                 files
                     .find(|(_, raw)| first_value_completes_in(raw, args))
                     .map(|(at, _)| at)
@@ -9520,11 +9559,15 @@ fn closing_event_lags(raw: &[u8]) -> bool {
     false
 }
 
-/// Whether the first value a reader takes from `raw` (a line for `-R`, a record for
-/// `--seq`, an event for `--stream-errors`) is complete inside it, so that reading it asks for no
-/// more of the files after it (#6522). `false` where it cannot tell.
+/// Whether the first value a reader takes from `raw` (a line for `-R`, a record for `--seq` or
+/// `--input-dsv`, an event for `--stream-errors`) is complete inside it, so that reading it asks for
+/// no more of the files after it (#6522, #6585). `false` where it cannot tell.
 fn first_value_completes_in(raw: &[u8], args: &JqCommand) -> bool {
-    if args.raw_input {
+    if args.input_dsv.is_some() {
+        // Every file's rows are read from that file alone (`parse_dsv_input`), so its first row
+        // is complete in it, a record still open at its end included (#6585).
+        true
+    } else if args.raw_input {
         raw.contains(&b'\n')
     } else {
         // A record ends at the next record separator.
@@ -9670,6 +9713,10 @@ fn reach_last_directory(at: usize, read: Option<u32>) -> bool {
 /// file completes at its end, so what ends in a letter, a digit or `+`, `-` or `.` does not; with
 /// `-R` a line is complete at its newline alone.
 fn source_ends_cleanly(bytes: &[u8], args: &JqCommand) -> bool {
+    if args.input_dsv.is_some() {
+        // Rows are not joined across files, so no file leaves a row open for the next (#6585).
+        return true;
+    }
     match bytes.last() {
         None => true,
         Some(&last) if args.raw_input => last == b'\n',
