@@ -7305,7 +7305,8 @@ The text stage of #5598/#5743 stays as the fallback there: a pipe whose first st
 One cost remains.
 A fold whose step is a constructor around the accumulator (`[.]`, `[., <closed>…]`, `{k: .}`, with every other member closed or reading scalars off the accumulator: `length`, `type`, a field, `+`, `-`, `*` and `/` of integers and finite floats such as `.n + 1`) builds it on the moved state, so it is linear in the number of steps, as jq's is ([#5875](https://github.com/rust-works/succinctly/issues/5875), [#5893](https://github.com/rust-works/succinctly/issues/5893), [#6528](https://github.com/rust-works/succinctly/issues/6528)).
 Before that it re-indexed the whole accumulator on every step and was quadratic past 384 levels (17 s at N = 40,000, against 0.03 s in jq).
-A member that reads a container out of the accumulator (`[., .a]`), an infinite float or `tojson` costs `O(accumulator)` a step and is quadratic, as is a step of any other shape that constructs from `.`.
+A member that reads a container out of the accumulator (`[., .a]`), a NaN or infinite float, `%` or `tojson` costs `O(accumulator)` a step and is quadratic, as is a step of any other shape that constructs from `.`.
+A constructor with no `.` member (`[.[0] + $x, .[1] + 1]`) is built off the accumulator only when every member reads scalars from it; one that reads a container (`{a: (.a + [$i]), b: .b}`) re-indexes the accumulator once a step and is quadratic ([#6528](https://github.com/rust-works/succinctly/issues/6528)).
 `paths`, `tostream` and `[path(..)]` over a value hundreds of thousands of levels deep build output quadratic in its depth, as jq's would, and need the memory for it.
 `succinctly yq` takes the same floor since [#5876](https://github.com/rust-works/succinctly/issues/5876); see the yq limitations page.
 
