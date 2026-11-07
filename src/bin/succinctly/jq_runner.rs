@@ -6133,10 +6133,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // #6531: whether the loop stopped before its last document (`-R`'s pending open failures
             // are then not reached).
             let mut ended_early = false;
+            // Nothing is pending on the common run, which pays nothing per line for it.
+            let pending_failures =
+                PENDING_OPEN_FAILURES.with(|pending| !pending.borrow().is_empty());
             'documents: for (document, location, source) in documents {
                 // #6531: a file that did not open is reported when the line read from past it is
                 // reached, before that line.
-                if let Some(source) = source {
+                if let (true, Some(source)) = (pending_failures, source) {
                     report_reached_open_failures(Some(source), false);
                 }
                 // `UNKNOWN_LINE`, not just any missing entry, must clear the
