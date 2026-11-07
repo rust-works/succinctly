@@ -8516,7 +8516,7 @@ fn open_chunked_inputs(files: &[PathBuf], open_failed: &mut bool) -> Result<Chun
         return Ok((opened, openers));
     }
     let mut dash_seen = false;
-    for path in files {
+    for (at, path) in files.iter().enumerate() {
         if is_stdin_dash(path) {
             // `-` is standard input: the first one holds it all (kept whole), a later one is empty.
             let first = !std::mem::replace(&mut dash_seen, true);
@@ -8542,7 +8542,7 @@ fn open_chunked_inputs(files: &[PathBuf], open_failed: &mut bool) -> Result<Chun
         }
         let probed = std::fs::File::open(path)
             .and_then(|mut file| read_head(&mut file))
-            .map_err(|e| InputFileOpenError::new(path, strerror_only(&e)));
+            .map_err(|e| InputFileOpenError::from_io(path, &e));
         match probed {
             Ok(head) => {
                 let skip = bom_to_skip(&head, &mut look_for_bom);
@@ -8554,6 +8554,13 @@ fn open_chunked_inputs(files: &[PathBuf], open_failed: &mut bool) -> Result<Chun
                     file.seek(std::io::SeekFrom::Start(skip as u64))?;
                     Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, file)))
                 }));
+            }
+            // #6472: a directory is a source with no bytes, past which jq's reader has moved.
+            Err(e) if e.is_directory() => {
+                opened.push(path.clone());
+                openers.push(Box::new(|| Ok(Box::new(std::io::Cursor::new(Vec::new())))));
+                note_open_failure_at(opened.len());
+                report_unopenable_input(&e.at_end(at + 1 == files.len()), open_failed);
             }
             Err(e) => {
                 note_open_failure_at(opened.len());
@@ -8643,7 +8650,7 @@ fn input_display_name(path: &Path) -> String {
 /// rather than letting it escape as `Error: .../Caused by:` at exit 1
 /// (#3098).
 fn read_file_bytes(path: &Path) -> std::result::Result<Vec<u8>, InputFileOpenError> {
-    std::fs::read(path).map_err(|e| InputFileOpenError::new(path, strerror_only(&e)))
+    std::fs::read(path).map_err(|e| InputFileOpenError::from_io(path, &e))
 }
 
 /// Skip the UTF-8 byte-order mark at the front of the JSON input stream (#5291).
@@ -8683,25 +8690,69 @@ fn strip_leading_json_bom<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
 pub struct InputFileOpenError {
     path: PathBuf,
     detail: String,
+    kind: InputFileErrorKind,
 }
+
+/// Where a main input file failed (#6472).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputFileErrorKind {
+    /// It would not open: `jq: error: Could not open file <path>: <detail>`.
+    Open,
+    /// A directory. `fopen` succeeds on one and the first read fails with `EISDIR`, so jq's reader
+    /// has the file open and finds `ferror` set when it asks for more input, which is when it
+    /// prints `jq: error: Is a directory`. It never asks after the last file, so `last` says
+    /// whether any file follows, and the message is left out when none does. The exit status is 2
+    /// either way (`state->failures`).
+    Directory { last: bool },
+}
+
+/// `EISDIR`, the errno a read of a directory fails with on Linux and on macOS (`std`'s
+/// `ErrorKind::IsADirectory` needs a newer Rust than the crate's).
+const EISDIR: i32 = 21;
 
 impl InputFileOpenError {
     fn new(path: &Path, detail: String) -> Self {
         Self {
             path: path.to_path_buf(),
             detail,
+            kind: InputFileErrorKind::Open,
         }
+    }
+
+    /// The failure of `error` on `path`: a directory when the read said so (#6472).
+    fn from_io(path: &Path, error: &std::io::Error) -> Self {
+        let mut failure = Self::new(path, strerror_only(error));
+        if error.raw_os_error() == Some(EISDIR) {
+            failure.kind = InputFileErrorKind::Directory { last: false };
+        }
+        failure
+    }
+
+    /// Whether the file is a directory: it opened, and is a source of no bytes (#6472).
+    fn is_directory(&self) -> bool {
+        matches!(self.kind, InputFileErrorKind::Directory { .. })
+    }
+
+    /// A directory failure that `last` says is the last file given (#6472).
+    fn at_end(mut self, last: bool) -> Self {
+        if self.is_directory() {
+            self.kind = InputFileErrorKind::Directory { last };
+        }
+        self
     }
 }
 
 impl std::fmt::Display for InputFileOpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "error: Could not open file {}: {}",
-            self.path.display(),
-            self.detail
-        )
+        match self.kind {
+            InputFileErrorKind::Open => write!(
+                f,
+                "error: Could not open file {}: {}",
+                self.path.display(),
+                self.detail
+            ),
+            InputFileErrorKind::Directory { .. } => write!(f, "error: {}", self.detail),
+        }
     }
 }
 
@@ -8714,7 +8765,11 @@ impl std::error::Error for InputFileOpenError {}
 /// jq carries on with the other files and exits 2 at the end, so this only reports and notes
 /// the failure in `open_failed` (#5472).
 fn report_unopenable_input(e: &InputFileOpenError, open_failed: &mut bool) {
-    report_usage_error(&e.to_string());
+    // #6472: jq's reader does not ask for more after the last file, so a directory there is not
+    // reported, but it still fails the run.
+    if !matches!(e.kind, InputFileErrorKind::Directory { last: true }) {
+        report_usage_error(&e.to_string());
+    }
     *open_failed = true;
 }
 
@@ -8740,7 +8795,7 @@ fn read_input_files(files: &[PathBuf]) -> (Vec<PathBuf>, Vec<Vec<u8>>, OpenFailu
     let mut raws = Vec::with_capacity(files.len());
     let mut failures = Vec::new();
     let mut dash_seen = false;
-    for path in files {
+    for (at, path) in files.iter().enumerate() {
         let read = if is_stdin_dash(path) {
             // `-` is standard input: the first one holds it all, a later one is empty.
             let first = !std::mem::replace(&mut dash_seen, true);
@@ -8756,6 +8811,13 @@ fn read_input_files(files: &[PathBuf]) -> (Vec<PathBuf>, Vec<Vec<u8>>, OpenFailu
             Ok(raw) => {
                 opened.push(path.clone());
                 raws.push(raw);
+            }
+            // #6472: a directory is an input file that has no bytes, and what jq says of it
+            // comes once its reader moves on, so it stands between this file and the next.
+            Err(e) if e.is_directory() => {
+                opened.push(path.clone());
+                raws.push(Vec::new());
+                failures.push((opened.len(), e.at_end(at + 1 == files.len())));
             }
             Err(e) => failures.push((opened.len(), e)),
         }

@@ -233,7 +233,7 @@ fn a_line_from_a_slow_producer_is_answered_before_the_next_one_arrives_5498() ->
 }
 
 /// A file that does not open, or opens and cannot be read (a directory), is reported when the files
-/// are checked and left out, as it was when each was read whole (#5472); the others are read.
+/// are checked, as it was when each was read whole (#5472); the others are read.
 #[test]
 fn an_unreadable_file_is_reported_and_left_out_of_the_chunked_read_5498() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -247,17 +247,19 @@ fn an_unreadable_file_is_reported_and_left_out_of_the_chunked_read_5498() -> Res
         missing.to_string_lossy().into_owned(),
         folder.to_string_lossy().into_owned(),
     );
-    for (unreadable, detail) in [
-        (&missing, "No such file or directory"),
-        (&folder, "Is a directory"),
+    // A directory opens and fails on its first read, which jq says as `Is a directory` once its
+    // reader moves on to the next file (#6472).
+    for (unreadable, message) in [
+        (
+            &missing,
+            format!("jq: error: Could not open file {missing}: No such file or directory\n"),
+        ),
+        (&folder, String::from("jq: error: Is a directory\n")),
     ] {
         let (stdout, stderr, code) =
             run_jq_full(&["-nc", "--stream", "[inputs]", unreadable, &good], None)?;
         assert_eq!(stdout, "[[[0],1],[[0]]]\n");
-        assert_eq!(
-            stderr,
-            format!("jq: error: Could not open file {unreadable}: {detail}\n")
-        );
+        assert_eq!(stderr, message);
         assert_eq!(code, 2);
     }
     Ok(())
