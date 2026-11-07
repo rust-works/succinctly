@@ -27798,6 +27798,18 @@ fn pattern_may_match_newline(pattern: &str) -> bool {
                 i += 1;
             }
             '.' if dot_all => return true,
+            // A comment is skipped whole: a `[` in it opens no class. The absence operator
+            // (`(?~X)`) matches whatever does not hold `X`, a newline included.
+            '(' if chars.get(i + 1) == Some(&'?') => match chars.get(i + 2) {
+                Some('#') => {
+                    i = chars[i..]
+                        .iter()
+                        .position(|&c| c == ')')
+                        .map_or(chars.len(), |n| i + n + 1);
+                }
+                Some('~') => return true,
+                _ => i += 1,
+            },
             _ => i += 1,
         }
     }
@@ -27805,8 +27817,10 @@ fn pattern_may_match_newline(pattern: &str) -> bool {
 }
 
 /// Whether `pattern` has a capture group that holds only zero-width anchors (`(\z)`, `($)`,
-/// `(?<n>\b^)`), which the group-copies rewrite can leave out of the copy of a way it writes after
-/// a nullable item (#6492: `(\w*)(\z)` is written `(\w+)\z`).
+/// `(?<n>\b^)`, also inside other groups, beside a flag switch, a comment, a lookaround or a blank:
+/// `((?:\z))`, `((?i)\z)`, `( \z)`), which the group-copies rewrite can leave out of the copy of a
+/// way it writes after a nullable item (#6492: `(\w*)(\z)` is written `(\w+)\z`). A blank counts as
+/// nothing whatever the `x` flag says, which only keeps the plain rewrite for more patterns.
 #[cfg(feature = "regex")]
 fn has_anchor_only_group(pattern: &str) -> bool {
     let chars: Vec<char> = pattern.chars().collect();
@@ -27814,36 +27828,10 @@ fn has_anchor_only_group(pattern: &str) -> bool {
     while i < chars.len() {
         match chars[i] {
             '\\' => i += 2,
+            '[' => i = class_end(&chars, i),
             '(' => {
-                // The body of a plain or named capture group.
-                let body = match (chars.get(i + 1), chars.get(i + 2)) {
-                    (Some('?'), Some('<' | '\'' | 'P'))
-                        if chars.get(i + 3) != Some(&'=') && chars.get(i + 3) != Some(&'!') =>
-                    {
-                        let close = if chars.get(i + 2) == Some(&'\'') {
-                            '\''
-                        } else {
-                            '>'
-                        };
-                        chars[i..]
-                            .iter()
-                            .position(|&c| c == close)
-                            .map(|n| i + n + 1)
-                    }
-                    (Some('?'), _) => None,
-                    _ => Some(i + 1),
-                };
-                if let Some(mut at) = body {
-                    let mut anchors = 0;
-                    loop {
-                        match (chars.get(at), chars.get(at + 1)) {
-                            (Some('\\'), Some('z' | 'Z' | 'A' | 'b' | 'B' | 'G')) => at += 2,
-                            (Some('^' | '$'), _) => at += 1,
-                            _ => break,
-                        }
-                        anchors += 1;
-                    }
-                    if anchors > 0 && chars.get(at) == Some(&')') {
+                if let Some(body) = capture_body_start(&chars, i) {
+                    if holds_only_anchors(&chars, body) {
                         return true;
                     }
                 }
@@ -27853,6 +27841,158 @@ fn has_anchor_only_group(pattern: &str) -> bool {
         }
     }
     false
+}
+
+/// Where the body of the capture group opened at `chars[open]` begins: after `(`, `(?<name>`,
+/// `(?P<name>` or `(?'name'`. `None` for every other group.
+#[cfg(feature = "regex")]
+fn capture_body_start(chars: &[char], open: usize) -> Option<usize> {
+    match (
+        chars.get(open + 1),
+        chars.get(open + 2),
+        chars.get(open + 3),
+    ) {
+        (Some('?'), Some('<'), Some('=' | '!')) => None,
+        (Some('?'), Some('<' | '\'' | 'P'), _) => {
+            let close = if chars.get(open + 2) == Some(&'\'') {
+                '\''
+            } else {
+                '>'
+            };
+            let name = open + 3 + usize::from(chars.get(open + 2) == Some(&'P'));
+            chars[name..]
+                .iter()
+                .position(|&c| c == close)
+                .map(|n| name + n + 1)
+        }
+        (Some('?'), _, _) => None,
+        _ => Some(open + 1),
+    }
+}
+
+/// The index after the bracketed class that opens at `chars[open]` (`[`), past escapes, a `]`
+/// first in the class and nested POSIX or set brackets.
+#[cfg(feature = "regex")]
+fn class_end(chars: &[char], open: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = open;
+    let mut first = true;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            '[' => depth += 1,
+            ']' if first => {}
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        first = chars[i] == '[' || (chars[i] == '^' && chars.get(i - 1) == Some(&'['));
+        i += 1;
+    }
+    chars.len()
+}
+
+/// The index after the group that opens at `chars[open]`, past classes and escapes; `None` when it
+/// does not close.
+#[cfg(feature = "regex")]
+fn group_end(chars: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '[' => i = class_end(chars, i),
+            '(' => {
+                depth += 1;
+                i += 1;
+            }
+            ')' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Whether the group body that begins at `chars[at]` holds an anchor and otherwise only what matches
+/// nothing: other anchors, `|`, blanks, flag switches, comments, lookarounds, and groups of those.
+#[cfg(feature = "regex")]
+fn holds_only_anchors(chars: &[char], mut at: usize) -> bool {
+    let mut depth = 0usize;
+    let mut anchors = 0usize;
+    loop {
+        match (chars.get(at), chars.get(at + 1), chars.get(at + 2)) {
+            (Some('\\'), Some('z' | 'Z' | 'A' | 'b' | 'B' | 'G'), _) => {
+                anchors += 1;
+                at += 2;
+            }
+            (Some('^' | '$'), _, _) => {
+                anchors += 1;
+                at += 1;
+            }
+            (Some(' ' | '\t' | '|'), _, _) => at += 1,
+            // A comment, and a lookaround, which matches nothing whatever it holds.
+            (Some('('), Some('?'), Some('#')) => match chars[at..].iter().position(|&c| c == ')') {
+                Some(n) => at += n + 1,
+                None => return false,
+            },
+            (Some('('), Some('?'), Some('=' | '!')) => match group_end(chars, at) {
+                Some(end) => {
+                    anchors += 1;
+                    at = end;
+                }
+                None => return false,
+            },
+            (Some('('), Some('?'), Some('<')) if matches!(chars.get(at + 3), Some('=' | '!')) => {
+                match group_end(chars, at) {
+                    Some(end) => {
+                        anchors += 1;
+                        at = end;
+                    }
+                    None => return false,
+                }
+            }
+            (Some('('), Some('?'), _) => {
+                if let Some(body) = capture_body_start(chars, at) {
+                    depth += 1;
+                    at = body;
+                    continue;
+                }
+                // A non-capturing group or a flag group (`(?:`, `(?i-x:`), or a switch (`(?i)`).
+                let letters = chars[at + 2..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphabetic() || **c == '-')
+                    .count();
+                match chars.get(at + 2 + letters) {
+                    Some(':') => {
+                        depth += 1;
+                        at += 3 + letters;
+                    }
+                    Some(')') if letters > 0 => at += 3 + letters,
+                    _ => return false,
+                }
+            }
+            (Some('('), _, _) => {
+                depth += 1;
+                at += 1;
+            }
+            (Some(')'), _, _) if depth == 0 => return anchors > 0,
+            (Some(')'), _, _) => {
+                depth -= 1;
+                at += 1;
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// Whether `pattern` needs the dual-haystack-view trailing-newline check at
@@ -33258,7 +33398,7 @@ fn build_regex_uncached<S: EvalSemantics>(
         let modes = FancyModes {
             longest,
             not_empty: suppress_empty && can_be_empty,
-            rewritten: false,
+            ..FancyModes::default()
         };
         // A pattern that asks for `l` and cannot have it is refused by the builder and keeps its
         // old route whole: the flags are not independent (`ln` is the longest *non-empty* match
@@ -33838,7 +33978,7 @@ fn rewritten_engine<S: EvalSemantics>(
                     // #6426: a pattern with a lookaround or an atomic group is checked on the
                     // engine that runs it.
                     let compiles = if on_fancy || is_fancy_syntax(&ordered) {
-                        build_fancy_regex_with::<S>(&ordered, FancyModes::rewritten())
+                        build_fancy_regex_with::<S>(&ordered, FancyModes::rewritten_on(on_fancy))
                             .is_some_and(|re| re.captures_len() == groups.compiled_groups)
                     } else {
                         compile_std(&ordered)
@@ -33876,7 +34016,10 @@ fn rewritten_engine<S: EvalSemantics>(
                 if fancy_copies_refused {
                     return None;
                 }
-                let re = build_fancy_regex_with::<S>(&groups.pattern, FancyModes::rewritten())?;
+                let re = build_fancy_regex_with::<S>(
+                    &groups.pattern,
+                    FancyModes::rewritten_on(on_fancy),
+                )?;
                 return (re.captures_len() == groups.compiled_groups).then_some(
                     RegexEngine::RewrittenFancy {
                         re,
@@ -33912,16 +34055,17 @@ fn group_copies_engine<S: EvalSemantics>(
     // the rewrite keeps it as written: it runs there, with the same groups. `fancy_refused` says
     // that the copies were needed and the engine could not take them.
     if on_fancy || is_fancy_syntax(&copied.pattern) {
-        let engine = build_fancy_regex_with::<S>(&copied.pattern, FancyModes::rewritten())
-            .filter(|re| re.captures_len() == copied.compiled_groups)
-            .and_then(|re| {
-                let groups = compose_group_copies(base, copied)?;
-                Some(RegexEngine::RewrittenFancy {
-                    re,
-                    groups,
-                    as_written: None,
-                })
-            });
+        let engine =
+            build_fancy_regex_with::<S>(&copied.pattern, FancyModes::rewritten_on(on_fancy))
+                .filter(|re| re.captures_len() == copied.compiled_groups)
+                .and_then(|re| {
+                    let groups = compose_group_copies(base, copied)?;
+                    Some(RegexEngine::RewrittenFancy {
+                        re,
+                        groups,
+                        as_written: None,
+                    })
+                });
         *fancy_refused = engine.is_none();
         return engine;
     }
@@ -34043,14 +34187,19 @@ struct FancyModes {
     /// The pattern is the text a loop rewrite wrote (#6426), which the engine must read as the
     /// `regex` crate would: see [`fancy_has_lazy_squeezed_run`].
     rewritten: bool,
+    /// The rewrite is for the route that reads `$` exactly (#6488), where a refusal leaves the
+    /// pattern as written: see [`fancy_has_repeated_lazy_group`].
+    exact_end: bool,
 }
 
 #[cfg(feature = "regex")]
 impl FancyModes {
-    /// The modes for the text a loop rewrite wrote (#6426).
-    fn rewritten() -> Self {
+    /// The modes for the text a loop rewrite wrote (#6426), for the route that reads `$` exactly
+    /// when `exact_end` (#6488).
+    fn rewritten_on(exact_end: bool) -> Self {
         Self {
             rewritten: true,
+            exact_end,
             ..Self::default()
         }
     }
@@ -34151,9 +34300,10 @@ fn build_fancy_regex_at<S: EvalSemantics>(
     if fancy_has_squeezed_plus_run(&expr) {
         return None;
     }
-    if modes.rewritten
-        && (fancy_has_lazy_squeezed_run(&expr) || fancy_has_repeated_lazy_group(&expr))
-    {
+    if modes.rewritten && fancy_has_lazy_squeezed_run(&expr) {
+        return None;
+    }
+    if modes.exact_end && fancy_has_repeated_lazy_group(&expr) {
         return None;
     }
     // #6262: the engine reads a reference to a still-open group of a repeat as empty.
@@ -34724,12 +34874,14 @@ fn fancy_has_lazy_squeezed_run(expr: &fancy_regex::Expr) -> bool {
 }
 
 /// Whether `expr` holds an unbounded repeat of a capture group whose body is an unbounded lazy
-/// repeat (`(.+?)*`, `(.*?)*?`, `(?<n>[ab]+?){1,}?`), which `fancy-regex` 0.20.0 answers wrongly
+/// repeat (`(.+?)*`, `(.*?)*?`, `(?<n>[ab]+?)*?`), which `fancy-regex` 0.20.0 can answer wrongly
 /// when it runs the pattern itself (beside a lookaround): `"abc" | match("(?=a)(?:(.+?)*)c")` has
 /// the group at `"b"` in jq and at `"ab"` there, and `"abcc" | match("(?=a)(?:(.+?)*)c").string` is
-/// `"abcc"` in jq and `"abc"` there (#6488). The `regex` crate answers both as jq does, and the
-/// copy rewrite writes the shape for a lazy loop of a way that consumes (`(?:(.*?)|$)+?c` is
-/// `(?:(.*?)|$)(?:(.+?)*?)c`); a rewrite with it keeps the pattern as it was.
+/// `"abcc"` in jq and `"abc"` there (#6488). The copy rewrite writes the shape for a lazy loop of a
+/// way that consumes (`(?:(.*?)|$)+?c` is `(?:(.*?)|$)(?:(.+?)*?)c`). Which of these the engine
+/// answers wrongly depends on the text as well (`(b+?)*` and `(.*?)*` are answered right), so this
+/// over-reports, and is read only on the route that reads `$` exactly, where a refusal leaves the
+/// pattern as written: elsewhere the pattern as written answers its loop wrongly (#6069).
 #[cfg(feature = "regex")]
 fn fancy_has_repeated_lazy_group(expr: &fancy_regex::Expr) -> bool {
     use fancy_regex::Expr;
@@ -140042,7 +140194,7 @@ mod tests {
     #[cfg(feature = "regex")]
     #[test]
     fn a_rewrite_with_a_lazy_repeat_between_two_greedy_ones_is_refused_by_fancy_regex_6426() {
-        let rewritten = FancyModes::rewritten();
+        let rewritten = FancyModes::rewritten_on(false);
         for squeezed in [
             "(?=b)b+a*?b*",
             "(?=b)b*a*?b*",
@@ -176003,21 +176155,26 @@ mod trailing_newline_route_tests_6488 {
 
     /// `fancy-regex` 0.20 merges a repeat of a group whose body is a lazy repeat, beside a
     /// lookaround: `"abc" | match("(?=a)(?:(.+?)*)c")` has the group at `"ab"` there and at `"b"`
-    /// in jq. A rewrite that holds the shape is refused there; the pattern as written is not.
+    /// in jq. A rewrite for the exact `$` route that holds the shape is refused there; the pattern
+    /// as written is not, nor is a rewrite for the lookaround route, whose loop the pattern as
+    /// written answers wrongly.
     #[test]
-    fn a_rewrite_with_a_repeated_lazy_group_is_refused_by_fancy_regex_6488() {
+    fn a_rewrite_with_a_repeated_lazy_group_is_refused_on_the_exact_end_route_6488() {
         for merged in [
             r"(?=a)(?:(.+?)*)c",
             r"(?=a)(?:(.*?)*?)c",
-            r"(?=a)(?:(?<n>[ab]+?){1,}?)c",
+            r"(?=a)(?:(?<n>[ab]+?)*?)c",
             r"(?=a)x|(?:(.+?)*)c",
         ] {
+            for modes in [FancyModes::default(), FancyModes::rewritten_on(false)] {
+                assert!(
+                    build_fancy_regex_with::<JqSemantics>(merged, modes).is_some(),
+                    "{merged}"
+                );
+            }
             assert!(
-                build_fancy_regex_with::<JqSemantics>(merged, FancyModes::default()).is_some(),
-                "{merged} as written"
-            );
-            assert!(
-                build_fancy_regex_with::<JqSemantics>(merged, FancyModes::rewritten()).is_none(),
+                build_fancy_regex_with::<JqSemantics>(merged, FancyModes::rewritten_on(true))
+                    .is_none(),
                 "{merged} rewritten"
             );
         }
@@ -176030,7 +176187,8 @@ mod trailing_newline_route_tests_6488 {
             r"(?=a)(?:(a.+?)*)c",
         ] {
             assert!(
-                build_fancy_regex_with::<JqSemantics>(other, FancyModes::rewritten()).is_some(),
+                build_fancy_regex_with::<JqSemantics>(other, FancyModes::rewritten_on(true))
+                    .is_some(),
                 "{other}"
             );
         }
@@ -176038,7 +176196,27 @@ mod trailing_newline_route_tests_6488 {
 
     #[test]
     fn what_is_an_anchor_only_group_6488() {
-        for pattern in [r"(\w*)(\z)$", r"($)a", r"(?<n>\b^)$", r"a(\A\z)"] {
+        for pattern in [
+            r"(\w*)(\z)$",
+            r"($)a",
+            r"(?<n>\b^)$",
+            r"(?P<n>\z)$",
+            r"(?'n'\z)$",
+            r"a(\A\z)",
+            r"((?:\z))$",
+            r"((?:$))\z",
+            r"((?i)\z)$",
+            r"((?i:\z))$",
+            r"((?:\b)\z)$",
+            r"( \z)$",
+            r"((?#c)\z)$",
+            r"((?#()\z)$",
+            r"(\z|$)a",
+            r"((\z))$",
+            r"((?=a))$",
+            r"((?<!a)\b)$",
+            r"[(]a(\z)$",
+        ] {
             assert!(has_anchor_only_group(pattern), "{pattern}");
         }
         for pattern in [
@@ -176049,6 +176227,11 @@ mod trailing_newline_route_tests_6488 {
             r"(a\z)$",
             r"\(\z\)$",
             r"()$",
+            r"((?:a)\z)$",
+            r"(\z|a)$",
+            r"(?i)$",
+            r"[(\z)]$",
+            r"((?#c))$",
         ] {
             assert!(!has_anchor_only_group(pattern), "{pattern}");
         }
@@ -176081,6 +176264,8 @@ mod trailing_newline_route_tests_6488 {
             r"\h\R$",
             r"(?s).$",
             r"(?s:.)$",
+            r"(?s)(?#[)(a|.*)+(?#])$",
+            r"(?~a)$",
         ] {
             assert!(pattern_may_match_newline(pattern), "{pattern}");
         }

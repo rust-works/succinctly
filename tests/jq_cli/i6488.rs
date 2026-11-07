@@ -65,6 +65,41 @@ fn a_loop_with_groups_beside_dollar_and_z_answers_as_jq_does_6488() -> Result<()
         // The copies write `(.+?)*?`, which `fancy-regex` answers wrongly beside a lookaround: the
         // rewrite is refused there.
         (r"(?:(.*?)|$\b)+?c", "g", "abc", r#"[[0,"abc",["b"]]]"#),
+        // A group that holds only anchors inside another group, beside a switch or a blank.
+        (
+            r"(?:|(\w*)((?:\z))){2}$",
+            "g",
+            "ab",
+            r#"[[0,"ab",["ab",""]],[2,"",["",""]]]"#,
+        ),
+        (
+            r"(?:|(\w*)((?i)\z)){2}$",
+            "g",
+            "ab",
+            r#"[[0,"ab",["ab",""]],[2,"",["",""]]]"#,
+        ),
+        (
+            r"(?:|(\w*)( \z)){2}$",
+            "gx",
+            "ab",
+            r#"[[0,"ab",["ab",""]],[2,"",["",""]]]"#,
+        ),
+        // A `[` in a comment opens no class that would hide the `.` after it.
+        (
+            r"(?s)(?#[)($()|(?:a|.*))+(?#])",
+            "g",
+            "a\n",
+            r#"[[0,"a",["",""]],[1,"",["",""]],[2,"",["",""]]]"#,
+        ),
+        // A lazy group the user wrote beside a lookaround keeps the lookaround route's rewrite
+        // (#6426): the refusal above is only for the exact `$` route.
+        (r"(?=a)(a|)*(b+?)+", "g", "aab", r#"[[0,"aab",["","b"]]]"#),
+        (
+            r"(?=a)(?:(a)|b*|c)+(d+?)*",
+            "g",
+            "abcc",
+            r#"[[0,"ab",["a",null]]]"#,
+        ),
         // The copies of this loop exhaust the backtracking budget, and the pattern as written
         // answers instead.
         (
