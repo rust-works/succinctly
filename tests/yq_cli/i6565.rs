@@ -438,3 +438,200 @@ fn yq_reads_the_header_below_a_dash_after_an_explicit_key_marker_as_its_value_65
     }
     Ok(())
 }
+
+/// Documents the old walk answered differently from yq and the new one answers as yq does: a bare
+/// `:` or `: &x` before a header or a properties-only line, and a dash after `:`. `None` is a
+/// document yq refuses. Captured from yq v4.53.3.
+const CHANGED: &[(&str, Option<&str>)] = &[
+    ("? a\n: -\n  |\n    t\n", Some("{\"a\":[\"t\\n\"]}")),
+    ("? a\n: -\n  |\n    t\n  \n   u\n", None),
+    ("? a\n: -\n    |\n      t\n  \n   u\n", None),
+    ("? a\n: -\n      |\n        t\n  \n   u\n", None),
+    ("? a\n: -\n    !!str\n", Some("{\"a\":[\"\"]}")),
+    ("? a\n: -\n      !!str\n", Some("{\"a\":[\"\"]}")),
+    ("? a\n: - &x\n  |\n    t\n", Some("{\"a\":[\"t\\n\"]}")),
+    ("? a\n: - &x\n    &y\n", None),
+    ("? a\n: - &x\n      &y\n", None),
+    ("? a\n: - &x\n    &y\n    m: 1\n", None),
+    ("? a\n: - &x\n      &y\n      m: 1\n", None),
+    ("? a\n: - &x\n  |\n    t\n  \n   u\n", None),
+    ("? a\n: - &x\n    |\n      t\n  \n   u\n", None),
+    ("? a\n: - &x\n      |\n        t\n  \n   u\n", None),
+    ("? a\n: - &x\n    !!str\n", Some("{\"a\":[\"\"]}")),
+    ("? a\n: - &x\n      !!str\n", Some("{\"a\":[\"\"]}")),
+    (
+        "? a\n: - - &x\n    |\n      t\n",
+        Some("{\"a\":[[\"t\\n\"]]}"),
+    ),
+    ("? a\n: - - &x\n      &y\n", None),
+    ("? a\n: - - &x\n      &y\n      m: 1\n", None),
+    ("? a\n: - - &x\n      !!str\n", Some("{\"a\":[[\"\"]]}")),
+    (
+        "- ? a\n  : - &x\n    |\n      t\n",
+        Some("[{\"a\":[\"t\\n\"]}]"),
+    ),
+    ("- ? a\n  : - &x\n      &y\n", None),
+    ("- ? a\n  : - &x\n      &y\n      m: 1\n", None),
+    ("- ? a\n  : - &x\n      !!str\n", Some("[{\"a\":[\"\"]}]")),
+    ("? - &x\n  |\n    t\n  \n   u\n", None),
+    ("? a\n: - !!str\n    !!str\n    m: 1\n", None),
+    ("? a\n: - !!str\n      !!str\n      m: 1\n", None),
+    ("? a\n: - !!str\n  |\n    t\n", Some("{\"a\":[\"t\\n\"]}")),
+    ("? a\n: - !!str\n    &y\n", Some("{\"a\":[\"\"]}")),
+    ("? a\n: - !!str\n      &y\n", Some("{\"a\":[\"\"]}")),
+    ("? a\n: - !!str\n  |\n    t\n  \n   u\n", None),
+    ("? a\n: - !!str\n    |\n      t\n  \n   u\n", None),
+    ("? a\n: - !!str\n      |\n        t\n  \n   u\n", None),
+    ("? a\n: - !!str\n    !!str\n", None),
+    ("? a\n: - !!str\n      !!str\n", None),
+    ("? a\n: - !!str\n    !!str\n      m: 1\n", None),
+    ("? a\n: - !!str\n      !!str\n        m: 1\n", None),
+];
+
+/// The other owners the widened marker walk reads (`? k:`, `: k:`, `: - k:`, `- ? k:`, a bare
+/// `:`), which agree with yq before and after. `None` is a document yq refuses.
+const CONTROLS: &[(&str, Option<&str>)] = &[
+    ("? k:\n!!str\nm: 1\n", None),
+    ("? k:\n      !!str\n      m: 1\n", Some("{\"\":null}")),
+    ("? k:\n    |\n      t\n", Some("{\"\":null}")),
+    ("? k:\n    # c\n    m: 1\n", Some("{\"\":null}")),
+    ("? k:\n  &y\n", None),
+    ("? k:\n  &y\n  m: 1\n", None),
+    ("? k:\n!!str\n", None),
+    ("? k:\n      !!str\n", Some("{\"\":null}")),
+    (
+        "? a\n: k:\n    !!str\n    m: 1\n",
+        Some("{\"a\":{\"k\":{\"m\":1}}}"),
+    ),
+    (
+        "? a\n: k:\n    |\n      t\n",
+        Some("{\"a\":{\"k\":\"t\\n\"}}"),
+    ),
+    (
+        "? a\n: k:\n  # c\n  m: 1\n",
+        Some("{\"a\":{\"k\":null,\"m\":1}}"),
+    ),
+    ("? a\n: k:\n  &y\n", None),
+    ("? a\n: k:\n&y\nm: 1\n", None),
+    (
+        "? a\n: k:\n      &y\n      m: 1\n",
+        Some("{\"a\":{\"k\":{\"m\":1}}}"),
+    ),
+    ("? a\n: k:\n    !!str\n", Some("{\"a\":{\"k\":\"\"}}")),
+    ("? a\n: - k:\n    !!str\n    m: 1\n", None),
+    ("? a\n: - k:\n  |\n    t\n", None),
+    ("? a\n: - k:\n  # c\n  m: 1\n", None),
+    ("? a\n: - k:\n&y\n", None),
+    ("? a\n: - k:\n      &y\n", Some("{\"a\":[{\"k\":null}]}")),
+    ("? a\n: - k:\n    &y\n    m: 1\n", None),
+    ("? a\n: - k:\n    !!str\n", None),
+    ("? a\n: - k: &x\n  !!str\n  m: 1\n", None),
+    ("? a\n: - k: &x\n  |\n    t\n", None),
+    (
+        "? a\n: - k: &x\n# c\nm: 1\n",
+        Some("{\"a\":[{\"k\":null}],\"m\":1}"),
+    ),
+    (
+        "? a\n: - k: &x\n      # c\n      m: 1\n",
+        Some("{\"a\":[{\"k\":{\"m\":1}}]}"),
+    ),
+    ("? a\n: - k: &x\n    &y\n", None),
+    ("? a\n: - k: &x\n    &y\n    m: 1\n", None),
+    ("? a\n: - k: &x\n  !!str\n", None),
+    ("- ? k:\n  !!str\n  m: 1\n", None),
+    ("- ? k:\n|\n  t\n", None),
+    ("- ? k:\n      |\n        t\n", Some("[{\"\":null}]")),
+    ("- ? k:\n    # c\n    m: 1\n", Some("[{\"\":null}]")),
+    ("- ? k:\n    &y\n", None),
+    ("- ? k:\n  &y\n  m: 1\n", None),
+    ("- ? k:\n  !!str\n", None),
+    ("? - k:\n!!str\nm: 1\n", None),
+    ("? - k:\n      !!str\n      m: 1\n", Some("{\"\":null}")),
+    ("? - k:\n    |\n      t\n", Some("{\"\":null}")),
+    ("? - k:\n    # c\n    m: 1\n", Some("{\"\":null}")),
+    ("? - k:\n  &y\n", None),
+    ("? - k:\n  &y\n  m: 1\n", None),
+    ("? - k:\n!!str\n", None),
+    ("? - k:\n      !!str\n", Some("{\"\":null}")),
+    (
+        "? a\n: &x\n    !!str\n    m: 1\n",
+        Some("{\"a\":{\"m\":1}}"),
+    ),
+    ("? a\n: &x\n    |\n      t\n", Some("{\"a\":\"t\\n\"}")),
+    ("? a\n: &x\n  # c\n  m: 1\n", Some("{\"a\":{\"m\":1}}")),
+    ("? a\n: &x\n  &y\n", None),
+    ("? a\n: &x\n&y\nm: 1\n", None),
+    ("? a\n: &x\n      &y\n      m: 1\n", None),
+    ("? a\n: &x\n    !!str\n", Some("{\"a\":\"\"}")),
+    ("? a\n:\n    !!str\n    m: 1\n", Some("{\"a\":{\"m\":1}}")),
+    ("? a\n:\n  |\n    t\n", Some("{\"a\":\"t\\n\"}")),
+    ("? a\n:\n  # c\n  m: 1\n", Some("{\"a\":{\"m\":1}}")),
+    ("? a\n:\n&y\n", None),
+    ("? a\n:\n      &y\n", Some("{\"a\":null}")),
+    ("? a\n:\n    &y\n    m: 1\n", Some("{\"a\":{\"m\":1}}")),
+    ("? a\n:\n    !!str\n", Some("{\"a\":\"\"}")),
+    ("? a\n: # c\n  !!str\n  m: 1\n", Some("{\"a\":{\"m\":1}}")),
+    ("? a\n: # c\n  |\n    t\n", Some("{\"a\":\"t\\n\"}")),
+    ("? a\n: # c\n# c\nm: 1\n", Some("{\"a\":null,\"m\":1}")),
+    (
+        "? a\n: # c\n      # c\n      m: 1\n",
+        Some("{\"a\":{\"m\":1}}"),
+    ),
+    ("? a\n: # c\n    &y\n", Some("{\"a\":null}")),
+    ("? a\n: # c\n    &y\n    m: 1\n", Some("{\"a\":{\"m\":1}}")),
+    ("? a\n: # c\n  !!str\n", Some("{\"a\":\"\"}")),
+    ("- ? a\n  :\n  !!str\n  m: 1\n", None),
+    ("- ? a\n  :\n|\n  t\n", None),
+    (
+        "- ? a\n  :\n      |\n        t\n",
+        Some("[{\"a\":\"t\\n\"}]"),
+    ),
+    (
+        "- ? a\n  :\n    # c\n    m: 1\n",
+        Some("[{\"a\":{\"m\":1}}]"),
+    ),
+    ("- ? a\n  :\n    &y\n", Some("[{\"a\":null}]")),
+    ("- ? a\n  :\n  &y\n  m: 1\n", None),
+    ("- ? a\n  :\n  !!str\n", None),
+    ("a:\n  ? b\n  : &x\n!!str\nm: 1\n", None),
+    (
+        "a:\n  ? b\n  : &x\n      !!str\n      m: 1\n",
+        Some("{\"a\":{\"b\":{\"m\":1}}}"),
+    ),
+    (
+        "a:\n  ? b\n  : &x\n    |\n      t\n",
+        Some("{\"a\":{\"b\":\"t\\n\"}}"),
+    ),
+    (
+        "a:\n  ? b\n  : &x\n    # c\n    m: 1\n",
+        Some("{\"a\":{\"b\":{\"m\":1}}}"),
+    ),
+    ("a:\n  ? b\n  : &x\n  &y\n", None),
+    ("a:\n  ? b\n  : &x\n  &y\n  m: 1\n", None),
+    ("a:\n  ? b\n  : &x\n!!str\n", None),
+    (
+        "a:\n  ? b\n  : &x\n      !!str\n",
+        Some("{\"a\":{\"b\":\"\"}}"),
+    ),
+];
+
+fn check(rows: &[(&str, Option<&str>)]) -> Result<()> {
+    for (doc, expected) in rows {
+        let (stdout, status) = run_yq_stdin(".", doc, &["-o=json", "-I0"])?;
+        match expected {
+            Some(json) => assert_eq!((stdout.trim_end(), status), (*json, 0), "{doc:?}"),
+            None => assert_eq!(status, 1, "{doc:?}"),
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn yq_reads_a_bare_value_marker_and_a_dash_after_it_as_the_owner_it_is_6565() -> Result<()> {
+    check(CHANGED)
+}
+
+#[test]
+fn yq_keeps_the_other_owners_of_an_explicit_key_as_they_were_6565() -> Result<()> {
+    check(CONTROLS)
+}

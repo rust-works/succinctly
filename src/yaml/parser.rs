@@ -5084,18 +5084,39 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// The column of the dash or key whose value the line `rest` (standing `lead` columns in)
     /// leaves for the lines below it, and whether it is a dash: a bare `-`, a chain of them
-    /// (`- -`), a dash with only properties (`- &x`), or a key written up to its colon, with
-    /// properties after it or not (`k:`, `- k: !!map`). A key's column is the line's indent plus
-    /// the `- ` markers it opens with.
+    /// (`- -`), a dash with only properties (`- &x`) or such a dash after an explicit key's marker
+    /// (`: - &x`, #6565), or a key written up to its colon, with properties after it or not (`k:`,
+    /// `- k: !!map`, `: k:`). A key's column is the line's indent plus the markers it opens with
+    /// (`-`, and `?` and `:`, see [`Self::walk_line_markers`]); a dash is the owner only when it
+    /// is the last marker, so `- ?` is owned by its `?`, which is not a dash.
     fn deferred_value_owner(lead: usize, rest: &[u8]) -> Option<(usize, bool)> {
+        let (marker_len, last_marker) = Self::walk_line_markers(lead, rest, LineMarkers::Explicit);
+        let tail = &rest[marker_len..];
+        match last_marker {
+            Some((column, true)) if only_node_properties(tail) => Some((column, true)),
+            // An explicit value's `:` with nothing after it but properties (`:`, `: &x`) leaves
+            // its value for the lines below as the key's `:` of `k:` does, at its own column.
+            Some((column, false)) if only_node_properties(tail) && rest[column - lead] == b':' => {
+                Some((column, false))
+            }
+            _ => line_ends_with_colon_after_properties(tail).then_some((lead + marker_len, false)),
+        }
+    }
+
+    /// The markers a content line opens with, past which its key or content stands: how many bytes
+    /// they take (their spacing included), and the last one's column and whether it is a dash. One
+    /// walk for [`Self::previous_line_key`] and [`Self::deferred_value_owner`], so the two cannot
+    /// disagree on where a key stands (#6543, #6565).
+    fn walk_line_markers(
+        lead: usize,
+        rest: &[u8],
+        markers: LineMarkers,
+    ) -> (usize, Option<(usize, bool)>) {
         let mut marker_len = 0;
         let mut last_marker = None;
-        // The markers a line opens with: `- `, and an explicit key's `? ` and `: ` (#6565), so a
-        // dash after one (`: - &x`) is the owner it is after a dash.
-        while rest
-            .get(marker_len)
-            .is_some_and(|&b| matches!(b, b'-' | b'?' | b':'))
-            && Self::is_ws_break_or_eoi(rest.get(marker_len + 1).copied())
+        while rest.get(marker_len).is_some_and(|&b| {
+            b == b'-' || (markers == LineMarkers::Explicit && (b == b'?' || b == b':'))
+        }) && Self::is_ws_break_or_eoi(rest.get(marker_len + 1).copied())
         {
             last_marker = Some((lead + marker_len, rest[marker_len] == b'-'));
             marker_len += 1;
@@ -5103,11 +5124,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 marker_len += 1;
             }
         }
-        let tail = &rest[marker_len..];
-        match last_marker {
-            Some((column, true)) if only_node_properties(tail) => Some((column, true)),
-            _ => line_ends_with_colon_after_properties(tail).then_some((lead + marker_len, false)),
-        }
+        (marker_len, last_marker)
     }
 
     /// Whether the value that the dash or key at column `owner` leaves for the lines below it is
@@ -9877,18 +9894,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// (`LineMarkers::Explicit`, #6540, #6543).
     fn previous_line_key(&self, markers: LineMarkers) -> Option<PreviousLineKey<'_>> {
         let (lead, rest) = self.previous_content_line()?;
-        let mut marker_len = 0;
-        let mut last_marker = None;
-        while rest.get(marker_len).is_some_and(|&b| {
-            b == b'-' || (markers == LineMarkers::Explicit && (b == b'?' || b == b':'))
-        }) && Self::is_ws_break_or_eoi(rest.get(marker_len + 1).copied())
-        {
-            last_marker = Some((lead + marker_len, rest[marker_len] == b'-'));
-            marker_len += 1;
-            while matches!(rest.get(marker_len), Some(b' ' | b'\t')) {
-                marker_len += 1;
-            }
-        }
+        let (marker_len, last_marker) = Self::walk_line_markers(lead, rest, markers);
         Some(PreviousLineKey {
             column: lead + marker_len,
             text: &rest[marker_len..],
