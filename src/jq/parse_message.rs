@@ -575,6 +575,34 @@ pub fn jq_stream_fault_end<B: AsRef<[u8]>>(
     }
 }
 
+/// The index of the chunk jq's parser is reading when it meets the first fault of the stream the
+/// `chunks` make, and whether that fault is at the end of the text (`... at EOF`), or `None` when
+/// it reads every value (#6485). A fault at the end is the last chunk's, since the parser is
+/// waiting for more where they end.
+///
+/// For a caller that must say which input file a fault is in: jq's reader has opened every file up
+/// to that one, and none after it unless the fault is at the end of the text.
+#[doc(hidden)]
+pub fn jq_stream_fault_chunk<B: AsRef<[u8]>>(
+    chunks: impl IntoIterator<Item = B>,
+) -> Option<(usize, bool)> {
+    let mut parser = Parser::new(1, 0, JQ_MAX_PARSING_DEPTH);
+    parser.multi = true;
+    let mut count = 0;
+    for chunk in chunks {
+        count += 1;
+        for &byte in chunk.as_ref() {
+            if let Err(Stop::Fault(_)) = parser.feed(byte) {
+                return Some((count - 1, false));
+            }
+        }
+    }
+    match parser.finish() {
+        Err(Stop::Fault(_)) => count.checked_sub(1).map(|last| (last, true)),
+        _ => None,
+    }
+}
+
 /// Whether `message` is jq's parse-depth refusal, which jq's `main` prints as a parse error.
 #[doc(hidden)]
 pub fn is_jq_depth_fault(message: &str) -> bool {
@@ -994,5 +1022,24 @@ mod tests {
             );
         }
         assert!(!stack_reaches(b"[\"unterminated", JQ_MAX_PARSING_DEPTH));
+    }
+
+    /// #6485: the chunk a fault is read in, and whether it is the end of the text. A value that
+    /// spans two chunks is one value, and a fault in the second is the second's.
+    #[test]
+    fn a_fault_is_placed_in_the_chunk_the_parser_was_reading_6485() {
+        let place = |chunks: &[&str]| jq_stream_fault_chunk(chunks.iter().map(|c| c.as_bytes()));
+        assert_eq!(place(&[]), None);
+        assert_eq!(place(&["1\n", "2\n"]), None);
+        assert_eq!(place(&["[1,}", "2"]), Some((0, false)));
+        assert_eq!(place(&["1", "[1,}", "2"]), Some((1, false)));
+        // Text that ends inside a value is the last chunk's, whichever chunk opened it.
+        assert_eq!(place(&["[1,", "2"]), Some((1, true)));
+        assert_eq!(place(&["1 [", ""]), Some((1, true)));
+        // A value that spans the chunks: the fault is where the bytes are.
+        assert_eq!(place(&["[1,", "}"]), Some((1, false)));
+        // The parse-depth limit is a fault like any other.
+        let deep = "[".repeat(JQ_MAX_PARSING_DEPTH + 1);
+        assert_eq!(place(&["1", &deep]), Some((1, false)));
     }
 }

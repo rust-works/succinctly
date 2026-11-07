@@ -5182,7 +5182,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // reader gets there, which the loop below does too (#5472).
         let stop_at = failures.first().map(|(at, _)| *at).filter(|_| !args.slurp);
         if args.slurp {
-            report_open_failures(&failures, &mut open_failed);
+            report_open_failures(
+                open_failures_reached(&failures, &raw_inputs, &args),
+                &mut open_failed,
+            );
         }
         let mut next_failure = if args.slurp { failures.len() } else { 0 };
         let mut run_stopped = false;
@@ -6614,7 +6617,7 @@ fn get_inputs(
         if args.null_input && !args.slurp && !args.seq && args.input_dsv.is_none() && ends_cleanly {
             defer_open_failures(failures);
         } else {
-            report_open_failures(&failures, open_failed);
+            report_open_failures(open_failures_reached(&failures, &raws, args), open_failed);
         }
         let raws = raws
             .into_iter()
@@ -8587,6 +8590,42 @@ thread_local! {
 /// Leaves `failures` for the reads of the `input` queue to report as they reach them (#6475).
 fn defer_open_failures(failures: Vec<(usize, InputFileOpenError)>) {
     PENDING_OPEN_FAILURES.with(|pending| *pending.borrow_mut() = failures.into());
+}
+
+/// The open failures jq's reader reaches before its parser stops (#6485): it opens the files in
+/// order, so one is reported when the reader has read the file before it, and a fault in the text
+/// stops the main loop, which opens no file after it. A failure sits after the `at` files that
+/// opened before it. A fault at the end of the text is met after the last file (#6476), and a run
+/// with no fault reads them all. Only a JSON text has such a fault: `-R`, `--seq`, DSV and
+/// `--stream-errors` read on past one.
+fn open_failures_reached<'a>(
+    failures: &'a [(usize, InputFileOpenError)],
+    raws: &[Vec<u8>],
+    args: &JqCommand,
+) -> &'a [(usize, InputFileOpenError)] {
+    if failures.is_empty()
+        || args.raw_input
+        || args.seq
+        || args.input_dsv.is_some()
+        || args.stream_errors
+    {
+        return failures;
+    }
+    // jq skips the byte-order mark at the front of its input.
+    let chunks = raws.iter().enumerate().map(|(at, raw)| {
+        if at == 0 {
+            raw.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(raw)
+        } else {
+            raw.as_slice()
+        }
+    });
+    match jq::jq_stream_fault_chunk(chunks) {
+        Some((file, false)) => {
+            let reached = failures.iter().take_while(|&&(at, _)| at <= file).count();
+            &failures[..reached]
+        }
+        _ => failures,
+    }
 }
 
 /// Reports the pending open failures a read has reached (#6475): the ones before the source it
