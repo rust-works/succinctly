@@ -89650,12 +89650,12 @@ fn eval_owned_pure_in<S: EvalSemantics>(
         }
         // #6567: `.[K]` with a single-output pure key, as an operand: jq's `E[K]` is
         // `K as $k | E | .[$k]`, so the key is settled first, against this node's own input. Only a
-        // string key (an object, or `null`) and an integer key, computed or spelled as a literal
-        // (an array, or `null`), are read here, as `index_one_owned_read` reads them; every other key kind (a slice descriptor, an array
-        // of indices, a float, a literal-spelled number, `null`, a boolean) and every read that
-        // raises declines, so the evaluator keeps jq's rules and its text. Operand position only:
-        // the value read is a node of `input`, which must not leave as an expression's own result
-        // (#2397). jq mode only.
+        // string key (an object, or `null`) and an integer key, computed or spelled as an integer
+        // literal (an array, or `null`), are read here, as `index_one_owned_read` reads them; every
+        // other key kind (a slice descriptor, an array of indices, a float or any number literal
+        // that is not an integer, `null`, a boolean) and every read that raises declines, so the
+        // evaluator keeps jq's rules and its text. Operand position only: the value read is a node
+        // of `input`, which must not leave as an expression's own result (#2397). jq mode only.
         Expr::IndexExpr { target, key }
             if S::TAG == EvalTag::Jq && position == ResultPosition::Operand =>
         {
@@ -129501,6 +129501,10 @@ mod tests {
             ".[true] == 1",
             ".[1.5] == 1",
             ".[[1]] == 1",
+            ".[.a][.b] == 1",
+            ".[.b][.a] == 1",
+            ".[.a.b][.b.a] == 1",
+            "(.[.a][.b] // 0) == 1",
             "(. // 0) == 0",
             "(null // .a) == null",
             "(false // 5) == 5",
@@ -174424,6 +174428,7 @@ mod share_audit_2999 {
             (".c[.i]", false),
             (".arr[.k]", false),
             (".arr[.fl]", false),
+            (".arr[(1.5 - 0.5)]", false),
             (".i[.k]", false),
             (".s[.i]", false),
             (".arr[null]", false),
@@ -174469,6 +174474,9 @@ mod share_audit_2999 {
             ".c[.k] // 0",
             "(.z // 0) + 1",
             "[(.i // 0) + 1]",
+            ".big[.i]",
+            "(.big[.i] // 0) + 1",
+            "(.big[(.i + 5)] // 0) + 1",
             "(.c[(5 % 3 | tostring)] // 0) + 1",
             "(.o[(\"p\" | ascii_downcase)] // 0) + 1",
         ] {
