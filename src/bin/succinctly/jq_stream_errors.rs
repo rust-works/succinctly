@@ -392,7 +392,8 @@ impl RefillSource for ChunkedSources {
             if let Some((source, false)) = self.last {
                 buf.clear();
                 return Some(Refill {
-                    source,
+                    // A last file that did not open is the source this refill is read from (#6531).
+                    source: if self.tail_is_source { count } else { source },
                     newline: false,
                     is_last: true,
                 });
