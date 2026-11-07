@@ -10780,6 +10780,10 @@ pub(crate) fn eval_owned_string_door<S: EvalSemantics>(
 /// the input's own handle where jq hands its input back (`ltrimstr`/`rtrimstr` with nothing to
 /// trim, `tostring` of a string, as [`tostring_owned`] does). jq mode only.
 ///
+/// #6523: and `implode` of an owned array of plain integers, the one stage here whose input is an
+/// array (what `explode` builds): the codepoints are written into a new string through
+/// [`implode_codepoint`], where the bridge wrote the array out as text and read each number back.
+///
 /// Apart from [`eval_owned_count_door`], whose callers rely on an answer that is no node of
 /// `input` (the `as` count bind substitutes a fresh integer or boolean): a string stage is asked
 /// for only where its answer is the value the rest of the pipe runs on or the output, in front of
@@ -10791,6 +10795,24 @@ pub(crate) fn eval_owned_string_stage<S: EvalSemantics>(
 ) -> Option<OwnedValue> {
     if S::TAG != EvalTag::Jq {
         return None;
+    }
+    // #6523: `implode` of an owned array of integers (what `explode`, or `map(. + 1)` over one,
+    // builds) is the string of those codepoints. The bridge wrote the whole array out as text,
+    // indexed it and read each number back. Only an array of plain integers is answered: a float,
+    // a literal-spelled number, a string or `null` element declines, so the fractional, `nan`,
+    // infinite and error cases keep the bridge's diagnostics.
+    if let OwnedValue::Array(items) = input {
+        if !matches!(unwrap_paren(expr), Expr::Builtin(Builtin::Implode)) {
+            return None;
+        }
+        let mut text = string_with_capacity(items.len());
+        for item in items {
+            let OwnedValue::Int(codepoint) = item else {
+                return None;
+            };
+            text.push(implode_codepoint(*codepoint));
+        }
+        return Some(OwnedValue::String(text.into()));
     }
     let OwnedValue::String(text) = input else {
         return None;
@@ -26582,6 +26604,19 @@ fn builtin_explode<W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// The character `implode` writes for one integer codepoint, shared by [`builtin_implode`] and the
+/// owned-array door ([`eval_owned_string_stage`], #6523) so the two cannot drift.
+///
+/// jq substitutes U+FFFD for any codepoint `char::from_u32` rejects (surrogates, >0x10FFFF,
+/// negative), rather than erroring. `u32::try_from` (not `as`) so a codepoint outside u32's range
+/// fails instead of wrapping into some other valid codepoint.
+fn implode_codepoint(codepoint: i64) -> char {
+    u32::try_from(codepoint)
+        .ok()
+        .and_then(char::from_u32)
+        .unwrap_or('\u{FFFD}')
+}
+
 /// Builtin: implode - array of codepoints to string
 fn builtin_implode<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
@@ -26634,16 +26669,7 @@ fn builtin_implode<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         })
                     }
                 };
-                // jq substitutes U+FFFD for any codepoint char::from_u32 rejects
-                // (surrogates, >0x10FFFF, negative), rather than erroring.
-                // `u32::try_from` (not `as`) so a codepoint outside u32's range
-                // fails instead of wrapping into some other valid codepoint.
-                result.push(
-                    u32::try_from(codepoint)
-                        .ok()
-                        .and_then(char::from_u32)
-                        .unwrap_or('\u{FFFD}'),
-                );
+                result.push(implode_codepoint(codepoint));
             }
             QueryResult::Owned(OwnedValue::String(result.into()))
         }
@@ -124987,6 +125013,85 @@ mod tests {
                 assert!(
                     eval_owned_string_stage::<JqSemantics>(&expr, &input).is_none(),
                     "{src:?} on {input:?}"
+                );
+            }
+        }
+    }
+
+    /// #6523: `implode` of an owned array of plain integers is answered from the array, and is the
+    /// string the reindex bridge answers, for every codepoint `char::from_u32` takes and for each
+    /// one it turns into U+FFFD (a surrogate, past U+10FFFF, negative, outside `u32`). Jq mode only.
+    /// Every element that is not a plain integer, and every input that is not an array, declines,
+    /// so the fractional, `nan`, infinite and error cases keep the bridge's own answer.
+    #[test]
+    fn eval_owned_string_stage_implodes_an_integer_array_as_the_bridge_does_6523() {
+        let arrays: [&[i64]; 15] = [
+            &[],
+            &[97],
+            &[97, 98, 99],
+            &[0x65e5, 0x672c, 0x8a9e],
+            &[0x1f600, 120],
+            &[0, 10, 34, 92],
+            &[0xd7ff, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000],
+            &[0x10ffff, 0x110000],
+            &[-1],
+            &[i64::MAX],
+            &[i64::MIN],
+            &[4_294_967_296 + 65],
+            &[4_294_967_295],
+            &[65, -65, 66],
+            &[0x7f, 0x80, 0x7ff, 0x800, 0xffff, 0x10000],
+        ];
+        for codepoints in arrays {
+            let value =
+                OwnedValue::array_from(codepoints.iter().map(|&c| OwnedValue::Int(c)).collect());
+            for src in ["implode", "(implode)"] {
+                let expr = parse(src).unwrap();
+                let fast = eval_owned_string_stage::<JqSemantics>(&expr, &value)
+                    .unwrap_or_else(|| panic!("{src:?} on {codepoints:?} declined"));
+                let bridge = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, &value, false,
+                ));
+                assert_eq!(
+                    debug_normalize(QueryResult::<Vec<u64>>::Owned(fast)),
+                    bridge,
+                    "{src:?} on {codepoints:?}"
+                );
+                assert!(
+                    eval_owned_string_stage::<YqSemantics>(&expr, &value).is_none(),
+                    "{src:?} on {codepoints:?} answered in yq mode"
+                );
+            }
+        }
+        // Not an array of plain integers: the bridge keeps the answer and its errors.
+        let nested = OwnedValue::array_from(vec![OwnedValue::Int(97)]);
+        let declined = [
+            OwnedValue::array_from(vec![OwnedValue::Float(97.5)]),
+            OwnedValue::array_from(vec![OwnedValue::Int(97), OwnedValue::Float(98.0)]),
+            OwnedValue::array_from(vec![OwnedValue::Float(f64::NAN)]),
+            OwnedValue::array_from(vec![OwnedValue::Float(f64::INFINITY)]),
+            OwnedValue::array_from(vec![OwnedValue::String("a".into())]),
+            OwnedValue::array_from(vec![OwnedValue::Null]),
+            OwnedValue::array_from(vec![OwnedValue::Bool(true)]),
+            OwnedValue::array_from(vec![nested]),
+            OwnedValue::Null,
+            OwnedValue::Int(97),
+            OwnedValue::String("abc".into()),
+        ];
+        let expr = parse("implode").unwrap();
+        for value in &declined {
+            assert!(
+                eval_owned_string_stage::<JqSemantics>(&expr, value).is_none(),
+                "implode of {value:?} was answered"
+            );
+        }
+        // Another builtin over an array is not this door's.
+        let ints = OwnedValue::array_from(vec![OwnedValue::Int(97)]);
+        for src in ["explode", "length", "tostring", "reverse", "implode(1)"] {
+            if let Ok(expr) = parse(src) {
+                assert!(
+                    eval_owned_string_stage::<JqSemantics>(&expr, &ints).is_none(),
+                    "{src:?} over an array was answered"
                 );
             }
         }
