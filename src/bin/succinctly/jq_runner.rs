@@ -6850,10 +6850,14 @@ fn read_inputs(
         // #6525: so does a program that reads `input` without `-n`, whose main loop reads the first
         // file before the program does and stops one value past a failure. Every route that reads
         // `input` seeds the queue the hook reports from.
+        // #6555: a `--seq` stream its reader reads without a fault pops its values as a JSON
+        // stream's are, so the reads reach the failures as they do there; `-R` reads the lines of
+        // one with its own reader, as it reads any text. With nothing to report the walk is not
+        // worth its copy of the text.
         if (args.null_input || track_eof)
             && !args.slurp
-            && !args.seq
             && args.input_dsv.is_none()
+            && (!args.seq || args.raw_input || (any_open_failure && seq_text_reads_clean(&raws)))
             && ends_cleanly
         {
             let fault_ends_text = matches!(first_stream_fault(&raws), Some((_, true)));
@@ -8946,6 +8950,27 @@ thread_local! {
 fn defer_open_failures(failures: Vec<(usize, InputFileOpenError)>, fault_ends_text: bool) {
     PENDING_OPEN_FAILURES.with(|pending| *pending.borrow_mut() = failures.into());
     FAULT_ENDS_TEXT.with(|ends| ends.set(fault_ends_text));
+}
+
+/// Whether `--seq`'s own reader reads the text the files `raws` make without a fault (#6555): no
+/// diagnostic and none deferred, the message-less end of #2998 included, so each value is read
+/// where a JSON stream's is and nothing else comes out of the input queue. That holds for
+/// `--stream` and `--stream-errors` too, whose events of a clean record stream are placed as their
+/// values'. A slurp reads every file before the program runs, so this is asked only of a run
+/// without `-s`.
+fn seq_text_reads_clean(raws: &[Vec<u8>]) -> bool {
+    let sources: Vec<(Option<usize>, Vec<u8>)> = raws
+        .iter()
+        .enumerate()
+        .map(|(at, raw)| (Some(at), raw.clone()))
+        .collect();
+    let mut warned = false;
+    // Collecting the faults, as the queue's own walk does: without it, a final buffer that starts on
+    // an RS (#2998) ends the stream with no word, which the queue raises as `break` (#5662).
+    let walk = crate::jq_seq_reader::walk_stream_collecting(&sources, false, true, &mut |_| {
+        warned = true;
+    });
+    !warned && walk.faults.is_empty() && walk.deferred_warning.is_none()
 }
 
 /// The open failures jq's reader reaches before its parser stops (#6485): it opens the files in
