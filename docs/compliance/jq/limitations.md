@@ -8035,6 +8035,14 @@ A text that ends in two newlines is searched the same way, because `$` is just b
   A `$` ending a branch inside a group counts as followed (`(?:b$|x)\n`), and under the `x` flag so does one before blanks or a comment.
   A pattern `fancy-regex` cannot compile keeps the two searches (the first bullet above).
   Pinned in `tests/jq_cli/i6080.rs`.
+- **A loop with groups in such a pattern is written with its groups copied only where nothing can match the final newline (#6488).**
+  The exact route used to run the plain loop rewrite alone, which keeps a loop as written when it would copy a group, so `"ba b" | [match("(?:$\\z|\\B(\\w*)){2,}";"g") | .string]` was `["a",""]` where jq's is `["",""]`.
+  The capture and group-copies rewrites now run there too, on `fancy-regex`, but they read `$` as the end of the text, which it is only where no part of the pattern can match the newline it may stand before.
+  So a pattern with an escape, class or `.` that may match a newline keeps the plain rewrite, as does one under the `m` or `p` flag (they make `.` match one), and one with a group that holds nothing but anchors (also through other groups, switches, comments, lookarounds and blanks: `((?i)\z)`), which the group-copies rewrite can drop ([#6492](https://github.com/rust-works/succinctly/issues/6492)).
+  `fancy-regex` 0.20 merges a repeat of a group whose body is an unbounded lazy repeat when it runs a pattern itself (`"abc" | match("(?=a)(?:(.+?)*)c") | .captures[0].string` is `"b"` in jq and `"ab"` there), and the copies of a lazy loop write that shape (`(?:(.*?)|$\b)+?c` is written `(?:(.*?)|$\b)(?:(.+?)*?)c`), so a rewrite for this route holding it keeps the pattern as it was.
+  Which of those the engine answers wrongly depends on the text too (`(b+?)*` and `(.*?)*` are answered right), so the check over-reports, and it is not made on the lookaround route of #6426, where the pattern as written would answer its loop wrongly instead.
+  The copies can need far more backtracking than the pattern as written, so a search that exhausts `fancy-regex`'s budget on them is answered by the pattern as written: `"ba" | [match("(?:(b*|(?:(a)|b?){0,2}(b|)*){0,12}?$|c){0,3}";"g") | .string]` is `["ba",""]`, as in jq.
+  Pinned in `tests/jq_cli/i6488.rs`.
 
 ## A slice is a path component
 
