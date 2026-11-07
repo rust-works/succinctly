@@ -28196,6 +28196,28 @@ impl ExactEnd {
     }
 }
 
+/// The pattern [`super::onig_end_search::rewrite`] wrote, and whether its anchor is only `$`/`\Z`.
+#[cfg(feature = "regex")]
+struct CappedEnd {
+    exact: ExactEnd,
+    semi_only: bool,
+}
+
+#[cfg(feature = "regex")]
+impl CappedEnd {
+    fn of<S: EvalSemantics>(pattern: &str, suppress_empty: bool) -> Option<Self> {
+        // Under `n` a pattern that matches only the empty string never matches.
+        if S::TAG == EvalTag::Yq || suppress_empty {
+            return None;
+        }
+        let search = super::onig_end_search::rewrite(pattern)?;
+        Some(Self {
+            exact: ExactEnd::new(&search.pattern),
+            semi_only: search.semi_only,
+        })
+    }
+}
+
 /// A compiled jq regex plus whatever extra state its builtins need to
 /// replicate jq semantics that Rust's `regex` crate doesn't natively
 /// support (currently: jq's Perl-style trailing-newline exception for `$`
@@ -28227,6 +28249,11 @@ struct JqRegex {
     /// asked of the `fancy-regex` build, which writes the `^` as Oniguruma reads it (see
     /// [`rewrite_multiline_caret`]). Every other match is the same in both.
     caret_end: Option<ExactEnd>,
+    /// For a pattern that matches only the empty string at the end of the text and holds a
+    /// look-behind that consumes: the pattern as Oniguruma's end-anchored search reads it, which
+    /// answers every search with two or more characters after its start (#6510, see
+    /// [`super::onig_end_search`]).
+    capped_end: Option<CappedEnd>,
     suppress_empty: bool,
     /// `n` is enforced by the `fancy-regex` engine itself (its not-empty mode, #5530), which
     /// refuses a match that ends where the attempt began, as Oniguruma's
@@ -28475,7 +28502,33 @@ impl JqRegex {
         }
     }
 
+    /// The answer of Oniguruma's end-anchored search, for a pattern it reads differently there,
+    /// when a search from `start` is that one: two or more characters follow `start`, and for a
+    /// `$`/`\Z` anchor the text does not end in a newline (#6510). `None` otherwise, and where the
+    /// build refused the pattern as written for that search.
+    #[allow(clippy::type_complexity)]
+    fn capped_at_the_end<'h>(
+        &self,
+        input: &'h str,
+        start: usize,
+    ) -> Option<Result<Option<RegexCaptures<'h>>, EvalError>> {
+        let capped = self.capped_end.as_ref()?;
+        if input[start..].chars().nth(1).is_none() || (capped.semi_only && input.ends_with('\n')) {
+            return None;
+        }
+        let engine = capped.exact.engine()?;
+        Some(
+            engine
+                .captures_from_pos(input, start)
+                .map(|caps| caps.map(RegexCaptures::Fancy))
+                .map_err(fancy_match_error),
+        )
+    }
+
     fn is_match(&self, input: &str) -> Result<bool, EvalError> {
+        if let Some(found) = self.capped_at_the_end(input, 0) {
+            return found.map(|caps| caps.is_some());
+        }
         if self.suppress_empty {
             return Ok(first_captures(self, input)?.is_some());
         }
@@ -28527,6 +28580,9 @@ impl JqRegex {
         start: usize,
         starts: Option<&LongestStarts>,
     ) -> Result<Option<RegexCaptures<'h>>, EvalError> {
+        if let Some(found) = self.capped_at_the_end(input, start) {
+            return found;
+        }
         match &self.engine {
             RegexEngine::Std(re) => {
                 let caps = dv_captures_at(
@@ -33489,6 +33545,9 @@ fn build_regex_uncached<S: EvalSemantics>(
         return Err(refusal);
     }
 
+    // #6510: read off the pattern before the rewrites below, whose groups it keeps.
+    let capped_end = CappedEnd::of::<S>(&pattern, suppress_empty);
+
     // #6106: Oniguruma leaves a greedy loop at the first iteration that matches nothing, where the
     // `regex` crate tries the body's later ways first (see `onig_loop`). Not under `l`: the span of
     // the longest match does not depend on that order, and `fancy-regex`'s longest mode refuses the
@@ -33562,6 +33621,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                     needs_trailing_nl_check: false,
                     exact_end: None,
                     caret_end: None,
+                    capped_end,
                     suppress_empty,
                     engine_not_empty: modes.not_empty,
                     longest: modes.longest.then_some(LongestSearch {
@@ -33619,6 +33679,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 needs_trailing_nl_check: false,
                 exact_end: None,
                 caret_end: None,
+                capped_end,
                 suppress_empty,
                 engine_not_empty: false,
                 longest: None,
@@ -33657,6 +33718,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 (S::TAG != EvalTag::Yq && has_multiline_caret(written))
                     .then(|| ExactEnd::new(written))
             },
+            capped_end,
             suppress_empty,
             engine_not_empty: false,
             longest: None,
@@ -33675,6 +33737,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 needs_trailing_nl_check: false,
                 exact_end: None,
                 caret_end: None,
+                capped_end,
                 suppress_empty,
                 engine_not_empty: false,
                 longest: None,
