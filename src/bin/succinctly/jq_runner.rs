@@ -6110,29 +6110,16 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         jq::ProducedInput::End(_) | jq::ProducedInput::Error(..) => None,
                     }))
                 }
-                None => {
-                    // #6480: the last value, read at a last file that did not open, unless a fault
-                    // follows it.
-                    let last = inputs.len().checked_sub(1);
-                    let end = locations
-                        .last_value_end()
-                        .filter(|_| trailing_error.is_none() && resumed_errors.is_empty());
-                    let locations = &locations;
-                    Box::new(inputs.iter().enumerate().map(move |(idx, document)| {
-                        match end.filter(|_| Some(idx) == last) {
-                            Some((source, line)) => (
-                                std::borrow::Cow::Borrowed(document),
-                                locations.resolve(source, line),
-                                Some(source),
-                            ),
-                            None => (
-                                std::borrow::Cow::Borrowed(document),
-                                locations.get(idx),
-                                locations.source_at(idx),
-                            ),
-                        }
-                    }))
-                }
+                // #6480: no value here is read at an unopened last file but `-s -R`'s one, which
+                // `InputLocations::single_at_end` already places there; the modes that take
+                // this branch otherwise (`--seq`, `--stream`, DSV) place their own.
+                None => Box::new(inputs.iter().enumerate().map(|(idx, document)| {
+                    (
+                        std::borrow::Cow::Borrowed(document),
+                        locations.get(idx),
+                        locations.source_at(idx),
+                    )
+                })),
             };
             'documents: for (document, location, source) in documents {
                 // `UNKNOWN_LINE`, not just any missing entry, must clear the

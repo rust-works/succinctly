@@ -28,7 +28,12 @@ fn a_last_value_that_completes_at_the_end_is_read_at_a_missing_last_file_6480() 
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
-    // Text that is not UTF-8, which the lazy routes leave to the eager reader.
+    // Deeper than the lazy route reads, which hands the stream to the eager queue.
+    std::fs::write(
+        dir.path().join("deep.json"),
+        "[".repeat(120) + &"]".repeat(120) + " 12",
+    )?;
+    // Text that is not UTF-8.
     std::fs::write(dir.path().join("iu.json"), b"\"\xff\" 12")?;
     std::fs::write(dir.path().join("iutxt.txt"), b"a\xff\nb")?;
     // More than one chunk of the lazy route's scan, ending in a bare number.
@@ -70,6 +75,8 @@ fn a_last_value_that_completes_at_the_end_is_read_at_a_missing_last_file_6480() 
         (&[][..], "[., input_filename]", &["gone", "three", "gone2"][..], "[1,\"@DIR@/three.json\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&[][..], "[., input_filename]", &["gone", "num", "gone2"][..], "[12,\"@DIR@/gone2.json\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Could not open file @DIR@/gone2.json: No such file or directory\n", 2),
         (&[][..], "error", &["gone", "num", "gone2"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Could not open file @DIR@/gone2.json: No such file or directory\njq: error (at @DIR@/gone2.json:0) (not a string): 12\n", 2),
+        (&["-n"][..], "[inputs | [input_filename, input_line_number]]", &["deep", "gone"][..], "[[\"@DIR@/deep.json\",0],[\"@DIR@/gone.json\",0]]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&[][..], "input_line_number as $l | [input_filename, $l]", &["deep", "gone"][..], "[\"@DIR@/deep.json\",0]\n[\"@DIR@/gone.json\",0]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&["-n"][..], "[inputs | [., input_filename, input_line_number]]", &["iu", "gone"][..], "[[\"�\",\"@DIR@/iu.json\",0],[12,\"@DIR@/gone.json\",0]]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&[][..], "input_line_number as $l | [., input_filename]", &["iu", "gone"][..], "[\"�\",\"@DIR@/iu.json\"]\n[12,\"@DIR@/gone.json\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&["-R"][..], "[., input_filename]", &["iutxt", "gone"][..], "[\"a�\",\"@DIR@/iutxt.txt\"]\n[\"b\",\"@DIR@/gone.json\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
