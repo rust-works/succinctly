@@ -18,6 +18,7 @@ fn seq_reports_an_unopened_file_when_its_reader_reaches_it_6555() -> Result<()> 
         ("norsend.json", "\u{1e}7"),
         ("arr.json", "\u{1e}[1]"),
         ("empty.json", ""),
+        ("seqnum.json", "\u{1e}1\n\u{1e}2"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
@@ -40,6 +41,9 @@ fn seq_reports_an_unopened_file_when_its_reader_reaches_it_6555() -> Result<()> 
         (&["--seq", "--stream", "-c", "[., input_filename, input_line_number]"][..], &["arr", "gone"][..], "\u{1e}[[[0],1],\"@DIR@/arr.json\",0]\n\u{1e}[[[0]],\"@DIR@/gone.json\",0]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&["--seq", "--stream-errors", "-n", "-c", "[input, input_filename, input_line_number]"][..], &["empty", "gone"][..], "\u{1e}[[\"Unfinished abandoned text at EOF at line 1, column 0\",[]],\"@DIR@/gone.json\",0]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&["--seq", "--stream-errors", "-n", "-c", "input"][..], &["seq", "gone"][..], "\u{1e}[[],1]\n", "", 0),
+        (&["--seq", "-n", "-c", "input"][..], &["seqnum", "gone", "one"][..], "\u{1e}1\n", "", 0),
+        (&["--seq", "-c", "[., input_filename]"][..], &["seqnum", "gone", "one"][..], "\u{1e}[1,\"@DIR@/seqnum.json\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Potentially truncated top-level numeric value at line 2, column 3\n", 2),
+        (&["--seq", "--stream", "-n", "-c", "input"][..], &["seqnum", "gone", "one"][..], "\u{1e}[[],1]\n", "", 0),
     ] {
         let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}.json")).collect();
         let mut args: Vec<&str> = flags.to_vec();

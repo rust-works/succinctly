@@ -6715,6 +6715,16 @@ fn read_inputs(
 
     // Get input files
     let files = get_input_files(args);
+    // Shared by the open-failure deferral, `seq_warnings_apply` below, the `-n`-forced-read
+    // fallback just after it, and the `build_seq_values` gate further down -- one definition rather
+    // than hand-copies of the same shape, so a future change to it can't desynchronize them
+    // (CLAUDE.md: "Duplicated predicates diverge silently").
+    let seq_stream_shape = args.seq && !args.raw_input && args.input_dsv.is_none();
+    // #6555: whether the `--seq` readers place a read that the files that did not open lie before:
+    // their positions follow the reader into the next file, and a last file that did not open is a
+    // source of their own (below). The streaming reader stops at the first of several such files at
+    // the end, which it has no source for, so those are still reported up front (#6591).
+    let mut seq_readers_place_reads = false;
 
     // #5498: a program that asks for the `--stream` events as it goes reads them from the files a
     // chunk at a time, as jq does, and not from their bytes read whole first.
@@ -6836,20 +6846,23 @@ fn read_inputs(
         // which sends jq's reader on to the next one.
         // #6480: past the last file that opened, the read of a last value that completes only at
         // the end is placed at the missing file, so it reports what it reached itself.
-        // #6555: `--seq`'s readers place what they yield past the last file that opened at a last
-        // file that did not, themselves.
-        let last_value_at_tail = LAST_VALUE_AT_TAIL.with(std::cell::Cell::get)
-            || (args.seq && !args.raw_input && args.input_dsv.is_none());
-        let ends_cleanly = failures.iter().all(|&(at, _)| {
-            // The last file with bytes before it: an empty one between sends the reader on too.
-            (last_value_at_tail && at >= raws.len())
-                || raws
-                    .iter()
-                    .take(at)
-                    .rev()
-                    .find(|raw| !raw.is_empty())
-                    .map_or(true, |raw| source_ends_cleanly(raw, args))
-        });
+        let last_value_at_tail = LAST_VALUE_AT_TAIL.with(std::cell::Cell::get);
+        let several_unplaced_tails = seq_stream_shape
+            && seq_by_stream_reader(args)
+            && failures.iter().filter(|&&(at, _)| at >= raws.len()).count() > 1;
+        seq_readers_place_reads = seq_stream_shape && !args.slurp && !several_unplaced_tails;
+        let ends_cleanly = seq_readers_place_reads
+            || !several_unplaced_tails
+                && failures.iter().all(|&(at, _)| {
+                    // The last file with bytes before it: an empty one between sends the reader on too.
+                    (last_value_at_tail && at >= raws.len())
+                        || raws
+                            .iter()
+                            .take(at)
+                            .rev()
+                            .find(|raw| !raw.is_empty())
+                            .map_or(true, |raw| source_ends_cleanly(raw, args))
+                });
         // #6525: so does a program that reads `input` without `-n`, whose main loop reads the first
         // file before the program does and stops one value past a failure. Every route that reads
         // `input` seeds the queue the hook reports from.
@@ -6975,17 +6988,11 @@ fn read_inputs(
     // The walk's diagnostics, kept only where `input`/`inputs` raise them ([`seq_faults_queued`]):
     // each comes out in order with the values, where a plain run prints it as a warning.
     let mut seq_fault_errors: Vec<(usize, TrailingParseError)> = Vec::new();
-    // Shared by `seq_warnings_apply` below, the `-n`-forced-read fallback
-    // just after it, and the `build_seq_values` gate further down -- one
-    // definition rather than three hand-copies of the same shape, so a
-    // future change to it can't desynchronize them (CLAUDE.md: "Duplicated
-    // predicates diverge silently").
-    let seq_stream_shape = args.seq && !args.raw_input && args.input_dsv.is_none();
     // #6555: a last file that did not open is one more source to jq's `--seq` readers, an empty one
     // they stand at, line 0: the stream's last refill is that file's, not the last opened file's,
     // so a record the end-of-stream drop (#2998) would take is kept, and what is read at the end of
     // the text, the fault at its end included (#6531), is placed at that file.
-    if seq_stream_shape && !args.slurp && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some()) {
+    if seq_readers_place_reads && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some()) {
         raw_bytes.push((Some(files.len()), Vec::new()));
     }
     let seq_warnings_apply = seq_stream_shape && !args.null_input && !seq_by_stream_reader;
