@@ -6802,10 +6802,11 @@ fn get_inputs(
         }
         let mut resumed: Vec<(usize, TrailingParseError)> = Vec::new();
         let mut trailing_error = None;
-        // #6481: a `--seq` slurp whose stream holds a fault has the fault in its last call, and a
-        // file that did not open ends jq's main loop before the array is read.
-        let array_lost =
-            args.slurp && any_open_failure && !faults_as_inputs && !read.faults.is_empty();
+        let array_lost = slurped_array_lost(
+            args.slurp && !faults_as_inputs,
+            any_open_failure,
+            !read.faults.is_empty(),
+        );
         for fault in read.faults {
             if faults_as_inputs {
                 // `input`/`inputs` raise what a plain run only warns about (#5640).
@@ -6839,16 +6840,13 @@ fn get_inputs(
                 });
             }
         }
-        if array_lost {
+        let (values, locations) = if array_lost {
             let files = locations.files().to_vec();
-            return Ok(Ok((
-                Vec::new(),
-                InputLocations::new(files),
-                trailing_error,
-                resumed,
-            )));
-        }
-        return Ok(Ok((read.values, locations, trailing_error, resumed)));
+            (Vec::new(), InputLocations::new(files))
+        } else {
+            (read.values, locations)
+        };
+        return Ok(Ok((values, locations, trailing_error, resumed)));
     }
 
     // `--seq` keeps its raw bytes: its values are ranges into them, and
@@ -7679,12 +7677,11 @@ fn get_inputs(
             Some((src, line)) => locations.resolve(src, line),
             None => InputLocation::unknown(),
         };
-        // #6481: jq's main loop reads no further once a file has failed to open, and a `--seq`
-        // slurp whose stream holds a fault has the fault, not the array, in its last call: with a
-        // file that did not open, the warning is all there is, and the run exits 2.
-        let array_lost = args.seq
-            && any_open_failure
-            && (seq_warned || trailing_error.as_ref().is_some_and(|t| t.seq_warning));
+        let array_lost = slurped_array_lost(
+            args.seq,
+            any_open_failure,
+            seq_warned || trailing_error.as_ref().is_some_and(|t| t.seq_warning),
+        );
         let slurped = if array_lost {
             Vec::new()
         } else {
@@ -7821,6 +7818,15 @@ fn stream_location(
 /// One definition for the read in `get_inputs` and for the main loop that warns about its faults.
 fn seq_by_stream_reader(args: &JqCommand) -> bool {
     args.seq && !args.raw_input && args.input_dsv.is_none() && (args.stream || args.stream_errors)
+}
+
+/// Whether a `--seq` slurp has no array to print (#6481): jq's main loop reads no further once a
+/// file has failed to open, and a stream that holds a fault has the fault, not the array, in its
+/// last call, so with a file that did not open the warning is all there is and the run exits 2.
+/// `seq_slurp` says the run is one that reads the stream whole, `faulted` that it holds a fault.
+/// One definition for the two routes that read a `--seq` stream.
+fn slurped_array_lost(seq_slurp: bool, any_open_failure: bool, faulted: bool) -> bool {
+    seq_slurp && any_open_failure && faulted
 }
 
 /// Whether `--stream -s` (#5498) is read by the stream reader: the array holds the events, and the
