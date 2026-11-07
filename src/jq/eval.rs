@@ -15082,6 +15082,30 @@ fn owned_state_expr_shape_in(expr: &Expr, calls: bool) -> bool {
 /// `None` declines. Not while the #2889 embed table is live, whose bindings a
 /// read of `.` could reach, nor in yq mode.
 fn owned_assign_operand<S: EvalSemantics>(expr: &Expr, state: &OwnedValue) -> Option<OwnedValue> {
+    if let Some(value) = owned_assign_operand_off_the_tree::<S>(expr, state) {
+        return Some(value);
+    }
+    if S::TAG != EvalTag::Jq
+        || !owned_state_expr_shape(expr)
+        || super::eval_generic::embed_table_active()
+    {
+        return None;
+    }
+    #[cfg(test)]
+    OPERAND_REBUILT.with(|n| n.set(n.get() + 1));
+    match eval_owned_multi_first::<S>(expr, state, Reentry::REBUILT) {
+        Ok(Some(value)) => Some(value),
+        _ => None,
+    }
+}
+
+/// [`owned_assign_operand`] without its last resort, the rebuilt state: a closed operand, or one
+/// [`owned_state_operand_direct`] reads off the tree. `None` for every other operand, which this
+/// never evaluates on a rebuilt copy, so it costs no `O(state)` serialisation (#6528).
+fn owned_assign_operand_off_the_tree<S: EvalSemantics>(
+    expr: &Expr,
+    state: &OwnedValue,
+) -> Option<OwnedValue> {
     if let Some(value) = closed_expr_to_owned::<S>(expr) {
         return Some(value);
     }
@@ -15091,15 +15115,7 @@ fn owned_assign_operand<S: EvalSemantics>(expr: &Expr, state: &OwnedValue) -> Op
     {
         return None;
     }
-    if let Some(value) = owned_state_operand_direct::<S>(expr, state) {
-        return Some(value);
-    }
-    #[cfg(test)]
-    OPERAND_REBUILT.with(|n| n.set(n.get() + 1));
-    match eval_owned_multi_first::<S>(expr, state, Reentry::REBUILT) {
-        Ok(Some(value)) => Some(value),
-        _ => None,
-    }
+    owned_state_operand_direct::<S>(expr, state)
 }
 
 #[cfg(test)]
@@ -15121,9 +15137,14 @@ thread_local! {
 /// Narrower than that evaluator on purpose, to the answers the rebuilt route would spell the
 /// same: a scalar whose text is its own canonical one ([`owned_scalar_spelled_the_same`]), or a
 /// fresh array of them. A container read off the state is left to the route below, since handing
-/// it on would share its storage with the state the write goes into; a float is, since the
-/// rebuilt route re-spells it (#1008, #1054). Anything outside the grammar, or that raises,
-/// declines (`None`) to the evaluator's own route and text.
+/// it on would share its storage with the state the write goes into. A finite float is read here
+/// (#6528): since #2902 the bridge writes a bare `Float` as a token that reparses to itself and
+/// echoes a document's number literal verbatim ([`reindex_bridge_is_identity`]), so the rebuilt
+/// route hands back the very value the tree holds. A NaN or infinite one is still left to it.
+/// Anything outside the grammar, or that raises, declines (`None`) to the evaluator's own route
+/// and text.
+///
+/// [`reindex_bridge_is_identity`]: super::eval_generic::reindex_bridge_is_identity
 fn owned_state_operand_direct<S: EvalSemantics>(
     expr: &Expr,
     state: &OwnedValue,
@@ -15147,12 +15168,15 @@ fn owned_state_operand_direct<S: EvalSemantics>(
 }
 
 /// One scalar of [`owned_state_operand_direct`]: a pure read ([`eval_owned_pure`]) with a
-/// canonical spelling, or `+`, `-` or `*` of two integers that are exact in a double.
+/// canonical spelling, or `+`, `-`, `*` or `/` of two numbers that are integers exact in a double
+/// or finite floats.
 ///
 /// Arithmetic is not part of [`eval_owned_pure`]'s grammar, because `arith_combine` hands an
 /// operand back unchanged for `. + null` and a navigated subvalue must not escape as an answer.
-/// Integers within ±2^53 cannot do that and are the range jq computes exactly, so the real
-/// `arith_combine` runs on them; the answer is taken only if it is again such an integer.
+/// Integers within ±2^53 cannot do that and are the range jq computes exactly, and a finite float
+/// reads back from the rebuilt state as itself (#6528), so the real `arith_combine` runs on them;
+/// the answer is taken only if it is again such a number. A division by zero raises, which
+/// declines to the evaluator's own text.
 fn owned_state_scalar_direct<S: EvalSemantics>(
     expr: &Expr,
     state: &OwnedValue,
@@ -15161,14 +15185,17 @@ fn owned_state_scalar_direct<S: EvalSemantics>(
         op, left, right, ..
     } = unwrap_paren(expr)
     {
-        if !matches!(op, ArithOp::Add | ArithOp::Sub | ArithOp::Mul(_)) {
+        if !matches!(
+            op,
+            ArithOp::Add | ArithOp::Sub | ArithOp::Mul(_) | ArithOp::Div
+        ) {
             return None;
         }
-        let left = owned_state_scalar_direct::<S>(left, state).filter(exact_integer)?;
-        let right = owned_state_scalar_direct::<S>(right, state).filter(exact_integer)?;
+        let left = owned_state_scalar_direct::<S>(left, state).filter(exact_number)?;
+        let right = owned_state_scalar_direct::<S>(right, state).filter(exact_number)?;
         return arith_combine::<S>(*op, left, right)
             .ok()
-            .filter(exact_integer);
+            .filter(exact_number);
     }
     let value = eval_owned_pure::<S>(expr, state, ResultPosition::Operand)?.ok()?;
     owned_scalar_spelled_the_same(&value).then_some(value)
@@ -15186,12 +15213,23 @@ fn exact_integer(value: &OwnedValue) -> bool {
     }
 }
 
+/// An [`exact_integer`], or a finite float, bare or a literal (#6528): the numbers an arithmetic
+/// operand of [`owned_state_scalar_direct`] may be, and its answer.
+fn exact_number(value: &OwnedValue) -> bool {
+    match value {
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => f.is_finite(),
+        other => exact_integer(other),
+    }
+}
+
 /// Whether `value` is a scalar that prints the way the rebuilt route would print it: `null`, a
-/// boolean, a string, an integer, or an integer literal whose text is its own digits.
+/// boolean, a string, an integer, an integer literal whose text is its own digits, or a finite
+/// float, bare or a literal, which the bridge hands back as itself (#2902, #6528).
 fn owned_scalar_spelled_the_same(value: &OwnedValue) -> bool {
     match value {
         OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::Int(_) | OwnedValue::String(_) => true,
         OwnedValue::NumberLiteral(NumberRepr::Int(n), text) => is_canonical_int_text(*n, text),
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => f.is_finite(),
         _ => false,
     }
 }
@@ -88341,15 +88379,26 @@ pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue
 /// the state itself, with every other element or member closed. The new container takes the moved
 /// state as its one `.` member, so a fold of `N` steps costs `O(N)`. Through the bridge each step
 /// wrote the whole accumulator out as JSON and indexed it again to evaluate a constructor that
-/// copies it, which is `O(N^2)` once the accumulator is a nest `N` levels deep.
+/// copies it, which is `O(N^2)` once the accumulator is a nest `N` levels deep. Also a constructor
+/// with no `.` member whose every member is read off the state's tree (#6528, below).
 ///
-/// Exactly one member is `.` itself (a second would need a copy of a value that is already `N`
+/// At most one member is `.` itself (a second would need a copy of a value that is already `N`
 /// levels deep). Every other element, key and value is settled by [`owned_assign_operand`] against
 /// the state before it is moved: a closed one (one output, no read of `.`, no effect), or one that
-/// reads scalars off the state (`length`, `type`, a field, integer `+`, `-`, `*` such as `.n + 1`,
-/// #5893). A member that reads a container (`.a`, `.[0]`) is answered from a rebuilt copy of the
-/// state, which is right and costs `O(state)` a step; a float (`.n / 2`) or `tojson` is the same,
-/// so a fold of those is quadratic past 384 levels as before. A member the helper evaluates and
+/// reads scalars off the state (`length`, `type`, a field, `+`, `-`, `*` or `/` of numbers such
+/// as `.n + 1` or `.[0] + 0.5`, #5893, #6528). A member that reads a container (`.a`, `.[0]`) is
+/// answered from a rebuilt copy of the state, which is right and costs `O(state)` a step;
+/// `tojson` is the same, so a fold of those is quadratic past 384 levels as before.
+///
+/// A constructor with no `.` member at all (#6528) is the state the running-total folds build,
+/// `[.[0] + $x, .[1] + 1]` and `{s: (.s + $x), n: (.n + 1)}`. It is taken only when every member
+/// is closed or read off the tree ([`owned_assign_operand_off_the_tree`]), and the state is then
+/// dropped. Through the bridge each step evaluated the constructor on the evaluator's own route
+/// and re-indexed the state for each `.[0]` it read, 0.35x-0.49x of jq 1.7.1 over 800k floats. A
+/// member that needs the rebuilt state (`.a + [$i]`) declines the whole constructor to that one
+/// route, which re-indexes the state once a step, instead of once for each such member; so does a
+/// member outside [`owned_state_expr_shape`], which is checked for every member before any is
+/// evaluated. A member the helper evaluates and
 /// then declines (it raises, or yields other than one value) costs that evaluation again on the
 /// bridge the step falls back to, with the state untouched. A member that is not
 /// [`owned_state_expr_shape`] is never evaluated here, so no effect runs twice.
@@ -88364,24 +88413,25 @@ fn owned_constructor_step<S: EvalSemantics>(
     if S::TAG != EvalTag::Jq {
         return Err(state);
     }
-    // The live-table check is a thread-local read, so it comes after the shape checks that
-    // decline most constructors for nothing.
     match unwrap_paren(expr) {
         Expr::Array(inner) => {
             let items = match unwrap_paren(inner) {
                 Expr::Comma(items) => items.as_slice(),
                 single => core::slice::from_ref(single),
             };
-            // One pass: the member that reads `.` is a placeholder until every other member has
-            // been settled, so a decline hands the state back before it is moved. A second read
-            // of `.` declines at once.
-            if !items
+            let around_state = items
                 .iter()
-                .any(|item| matches!(unwrap_paren(item), Expr::Identity))
+                .any(|item| matches!(unwrap_paren(item), Expr::Identity));
+            // The live-table check is a thread-local read, so it comes after the shape checks that
+            // decline most constructors for nothing.
+            if !around_state && !items.iter().all(off_the_tree_shape)
                 || super::eval_generic::embed_table_active()
             {
                 return Err(state);
             }
+            // One pass: the member that reads `.` is a placeholder until every other member has
+            // been settled, so a decline hands the state back before it is moved. A second read
+            // of `.` declines at once.
             let mut out: Vec<OwnedValue> = vec_with_capacity(items.len());
             let mut dot = None;
             for (at, item) in items.iter().enumerate() {
@@ -88390,16 +88440,17 @@ fn owned_constructor_step<S: EvalSemantics>(
                         return Err(state);
                     }
                     out.push(OwnedValue::Null);
-                } else if let Some(value) = owned_assign_operand::<S>(item, &state) {
+                } else if let Some(value) = settle_member::<S>(around_state, item, &state) {
                     out.push(value);
                 } else {
                     return Err(state);
                 }
             }
-            let Some(dot) = dot else {
-                return Err(state);
-            };
-            out[dot] = state;
+            // With no `.` member (#6528) every element was read off the state, which is then
+            // dropped, not moved.
+            if let Some(dot) = dot {
+                out[dot] = state;
+            }
             Ok(OwnedStep::Handled(Ok(OwnedValue::array_from(out))))
         }
         Expr::Object(entries) => {
@@ -88407,9 +88458,18 @@ fn owned_constructor_step<S: EvalSemantics>(
             // takes the last value, as `object_from_pairs` does in jq mode and
             // `eval_object_construction` does; the member that reads `.` is the key it was
             // written under until a later member takes that key over.
-            if !entries
+            let around_state = entries
                 .iter()
-                .any(|entry| matches!(unwrap_paren(&entry.value), Expr::Identity))
+                .any(|entry| matches!(unwrap_paren(&entry.value), Expr::Identity));
+            if !around_state
+                && !entries.iter().all(|entry| {
+                    off_the_tree_shape(&entry.value)
+                        && match &entry.key {
+                            ObjectKey::Literal(_) => true,
+                            ObjectKey::Expr(key) => off_the_tree_shape(key),
+                            ObjectKey::Bare => false,
+                        }
+                })
                 || super::eval_generic::embed_table_active()
             {
                 return Err(state);
@@ -88421,7 +88481,7 @@ fn owned_constructor_step<S: EvalSemantics>(
                 let key = match &entry.key {
                     ObjectKey::Literal(name) => name.clone(),
                     ObjectKey::Bare => return Err(state),
-                    ObjectKey::Expr(key) => match owned_assign_operand::<S>(key, &state) {
+                    ObjectKey::Expr(key) => match settle_member::<S>(around_state, key, &state) {
                         Some(OwnedValue::String(name)) => name.into_string(),
                         _ => return Err(state),
                     },
@@ -88433,7 +88493,7 @@ fn owned_constructor_step<S: EvalSemantics>(
                     dot = Some(key.clone());
                     dot_live = true;
                     map.insert(key, OwnedValue::Null);
-                } else if let Some(value) = owned_assign_operand::<S>(&entry.value, &state) {
+                } else if let Some(value) = settle_member::<S>(around_state, &entry.value, &state) {
                     if dot_live && dot.as_deref() == Some(key.as_str()) {
                         dot_live = false;
                     }
@@ -88442,16 +88502,35 @@ fn owned_constructor_step<S: EvalSemantics>(
                     return Err(state);
                 }
             }
-            let Some(dot) = dot else {
-                return Err(state);
-            };
-            if dot_live {
+            if let (Some(dot), true) = (dot, dot_live) {
                 map.insert(dot, state);
             }
             Ok(OwnedStep::Handled(Ok(OwnedValue::Object(map.into()))))
         }
         _ => Err(state),
     }
+}
+
+/// A member of [`owned_constructor_step`]'s constructor, settled against `state`: through the
+/// rebuilt state if need be when the constructor is built around the state, and only off the tree
+/// when it is not (#6528).
+fn settle_member<S: EvalSemantics>(
+    around_state: bool,
+    member: &Expr,
+    state: &OwnedValue,
+) -> Option<OwnedValue> {
+    if around_state {
+        owned_assign_operand::<S>(member, state)
+    } else {
+        owned_assign_operand_off_the_tree::<S>(member, state)
+    }
+}
+
+/// Whether a member of a constructor with no `.` member can be settled off the tree at all: closed,
+/// or a shape [`owned_state_operand_direct`] may answer. Checked for every member before any is
+/// evaluated, so a constructor that cannot be built here costs no evaluation (#6528).
+fn off_the_tree_shape(member: &Expr) -> bool {
+    closed_expr_shape(member) || owned_state_expr_shape(member)
 }
 
 /// The rest of [`owned_update_step`], once `expr` is no settleable `if`.
@@ -173017,7 +173096,7 @@ mod share_audit_2999 {
     /// step of a fold (`.a += [.i]` was quadratic, and 1.6 ms a step beside an untouched 100k-element
     /// field), which no copy count shows -- so this counts the operands that still go through it.
     /// Where it answers, it answers what the rebuilt route does, spelling included; where it
-    /// cannot promise that (a float, a container read off the state, arithmetic) it declines.
+    /// cannot promise that (an infinite float, a container read off the state, `%`) it declines.
     #[test]
     fn state_reading_operand_is_read_off_the_tree_5288() {
         let state = |json: &str| {
@@ -173031,7 +173110,7 @@ mod share_audit_2999 {
                 .expect("evaluates")
                 .expect("one output")
         };
-        let doc = r#"{"i":3,"j":"x","n":10,"b":true,"z":null,"s":"hello","o":{"x":7},"a":[1,2],"f":1.5,"e":1e3,"big":100000000000000000000,"lit":1.0,"neg":-4,"m":9007199254740992}"#;
+        let doc = r#"{"i":3,"j":"x","n":10,"b":true,"z":null,"s":"hello","o":{"x":7},"a":[1,2],"f":1.5,"e":1e3,"big":100000000000000000000,"lit":1.0,"neg":-4,"m":9007199254740992,"inf":1e1000,"g":0.1}"#;
         // (operand, whether it is answered from the tree).
         let rows: &[(&str, bool)] = &[
             (".i", true),
@@ -173049,13 +173128,16 @@ mod share_audit_2999 {
             ("[.i | not]", true),
             ("[.o | .x]", true),
             ("[.i | type]", true),
-            // Not promised to spell the same: a float, a literal with a float spelling.
-            (".f", false),
-            ("[.f]", false),
-            ("[.i, .f]", false),
-            ("[.e]", false),
-            ("[.big]", false),
-            ("[.lit]", false),
+            // A finite float, bare or a literal of any spelling, reads back from the rebuilt state as
+            // itself (#2902), so it is read here too (#6528); an infinite one is not.
+            (".f", true),
+            ("[.f]", true),
+            ("[.i, .f]", true),
+            ("[.e]", true),
+            ("[.big]", true),
+            ("[.lit]", true),
+            (".inf", false),
+            ("[.inf]", false),
             // A container read off the state would share its storage with the state it is written to.
             (".a", false),
             ("[.a]", false),
@@ -173066,16 +173148,33 @@ mod share_audit_2999 {
             ("[.i * .n - 2]", true),
             ("[(.i + .n) * 2]", true),
             (".neg - 1", true),
-            // ...and nothing else: a float, a string, a division, a null operand, a result past 2^53.
-            ("[.f + 1]", false),
+            // ...and so is arithmetic and division of finite floats, mixed with integers or not (#6528).
+            ("[.f + 1]", true),
+            ("[.f * .e - .g]", true),
+            ("[.g + .g]", true),
+            ("[.lit + 0]", true),
+            ("[.lit * .f]", true),
+            ("[.big + 1]", true),
+            ("[.i / 2]", true),
+            ("[.n / .f]", true),
+            (".f - .neg", true),
+            ("[.e * .e * .e]", true),
+            // Past 2^53 jq's arithmetic is a double's, and the answer is a float read as one.
+            ("[.m + 1]", true),
+            ("[.m * 2]", true),
+            // ...and nothing else: a string, `%`, a null operand, an infinite operand or result,
+            // a division by zero.
             ("[.s + \"x\"]", false),
-            ("[.i / 2]", false),
             ("[.i % 2]", false),
+            ("[.f % 2]", false),
+            ("[.f + null]", false),
+            ("[.inf + 1]", false),
+            ("[.inf - .inf]", false),
+            ("[.e * 1e306]", false),
+            ("[.f / 0]", false),
+            ("[.f + .s]", false),
             ("[.z + 1]", false),
             ("[.zz + 1]", false),
-            ("[.m + 1]", false),
-            ("[.m * 2]", false),
-            ("[.big + 1]", false),
             // Outside the pure grammar: `length`, a call.
             ("length", false),
             ("[length]", false),
@@ -173103,7 +173202,7 @@ mod share_audit_2999 {
             assert!(owned_assign_operand::<JqSemantics>(&operand(filter), &wide).is_some());
         }
         assert_eq!(OPERAND_REBUILT.with(core::cell::Cell::get), before);
-        assert!(owned_assign_operand::<JqSemantics>(&operand("[.i / 2]"), &wide).is_some());
+        assert!(owned_assign_operand::<JqSemantics>(&operand("[.i % 2]"), &wide).is_some());
         assert_eq!(OPERAND_REBUILT.with(core::cell::Cell::get), before + 1);
     }
 
@@ -177416,17 +177515,13 @@ mod named_args_shared_tests_5690 {
         assert!(items[0].shares_storage_with(&held), "the state was copied");
 
         for src in [
-            "[1]",
             "[., .]",
             "[., empty]",
             "[., (1, 2)]",
             "[., error(\"x\")]",
             "[.[]]",
-            "[.q]",
-            "{a: .q}",
             "{a: (., .)}",
             "{(.): 1}",
-            "{a: 1}",
             "{a: 1} | .",
             "[.] | length",
         ] {
@@ -177451,6 +177546,120 @@ mod named_args_shared_tests_5690 {
         };
         let _guard = embed_table_push::<JqSemantics>(Some(&origin), &mut bound);
         assert!(matches!(step("[.]"), OwnedStep::Declined(_)));
+    }
+
+    /// #6528: a constructor with no `.` member -- the running total `[.[0] + $x, .[1] + 1]`,
+    /// `{s: (.s + $x), n: (.n + 1)}` -- is built from members settled against the state, floats
+    /// included, where it used to take the evaluator's route and re-index the state for each read.
+    /// What it builds is what that route builds; a member it cannot settle declines the whole
+    /// constructor with the state untouched.
+    #[test]
+    #[cfg(feature = "std")]
+    fn owned_update_step_builds_a_constructor_without_the_state_6528() {
+        use crate::jq::eval_generic::embed_table_push;
+
+        let state = || {
+            let json = br#"{"s":1.5,"n":2,"q":[1,2],"t":"x","lit":1.50}"#;
+            let index = crate::json::JsonIndex::build(json);
+            crate::jq::eval_generic::to_owned_cursor::<JqSemantics, _>(&index.root(json))
+                .expect("decodes")
+        };
+        let step = |src: &str| owned_update_step::<JqSemantics>(&parse(src).unwrap(), state());
+        for src in [
+            "[1]",
+            "[.s + 0.25, .n + 1]",
+            "[(.s + 0.25), (.n + 1)]",
+            "([.s * 2, .n])",
+            "[.n, .s]",
+            "[.s / 3]",
+            "[.lit]",
+            "[.lit + 1]",
+            "[.s > 1, .t]",
+            "[(.s, .n)]",
+            "{a: 1}",
+            "{s: (.s + 0.25), n: (.n + 1)}",
+            "{s: .n, n: .s}",
+            "{s: 1, s: (.s - 1)}",
+            "{(.t): .s}",
+            "{(.t | type): (.s * .n)}",
+        ] {
+            let rebuilt_before = OPERAND_REBUILT.with(core::cell::Cell::get);
+            let OwnedStep::Handled(Ok(got)) = step(src) else {
+                panic!("not handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step declined a constructor UPDATE the test lists as handled (#6528)"
+            };
+            // Read off the tree: no member was evaluated on a rebuilt copy of the state.
+            assert_eq!(
+                OPERAND_REBUILT.with(core::cell::Cell::get),
+                rebuilt_before,
+                "{src}"
+            );
+            let want = eval_owned_multi_first::<JqSemantics>(
+                &parse(src).unwrap(),
+                &state(),
+                Reentry::REBUILT,
+            )
+            .expect("evaluates")
+            .expect("one output");
+            assert_eq!(got.to_json(), want.to_json(), "{src}");
+            assert_eq!(got, want, "{src}");
+        }
+
+        // A member that reads a container needs the rebuilt state, so the whole constructor goes
+        // back to the bridge, which re-indexes the state once a step rather than once a member; a
+        // member outside the shapes is seen before any member is evaluated.
+        for src in [
+            "[.q]",
+            "[.q, .s]",
+            "{a: .q}",
+            "{a: (.q + [1]), b: (.q + [2])}",
+            "{(.t + \"y\"): .s}",
+            "[.s + 1, (.n | input_line_number)]",
+            "[.s % 2]",
+            "[.s + 1, empty]",
+            "[.s, (1, 2)]",
+            "[.n, error(\"x\")]",
+            "[.s / 0]",
+            "[.t - 1]",
+            "[.q[]]",
+            "{a: (.s, .n)}",
+            "{(.n): 1}",
+            "{(.s): 1}",
+        ] {
+            let OwnedStep::Declined(back) = step(src) else {
+                panic!("handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step answered a constructor UPDATE the test lists as declined (#6528)"
+            };
+            assert_eq!(back, state(), "{src}: the declined state is untouched");
+        }
+
+        // yq mode and a live embed table decline as they do for a constructor around the state.
+        assert!(matches!(
+            owned_update_step::<YqSemantics>(&parse("[.n + 1]").unwrap(), state()),
+            OwnedStep::Declined(_)
+        ));
+        // A bare entry (`{.n}`) is yq's alone, whose parser is the only one to write it; the shape
+        // check refuses it before any member is evaluated, whatever the mode.
+        let bare = Expr::Object(vec![
+            ObjectEntry {
+                key: ObjectKey::Literal("a".to_string()),
+                value: parse(".n + 1").unwrap(),
+            },
+            ObjectEntry {
+                key: ObjectKey::Bare,
+                value: parse(".n").unwrap(),
+            },
+        ]);
+        let OwnedStep::Declined(back) = owned_update_step::<JqSemantics>(&bare, state()) else {
+            panic!("a bare entry was handled"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step answered a constructor holding a bare entry (#6528)"
+        };
+        assert_eq!(back, state());
+        let mut bound = state();
+        let origin = BindOrigin::Node {
+            node: 7,
+            document: 42,
+        };
+        let _guard = embed_table_push::<JqSemantics>(Some(&origin), &mut bound);
+        assert!(matches!(step("[.n + 1]"), OwnedStep::Declined(_)));
+        assert!(matches!(step("{a: 1}"), OwnedStep::Declined(_)));
     }
 }
 
