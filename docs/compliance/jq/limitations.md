@@ -7755,8 +7755,8 @@ A match that ends before the end of the text cannot have used it, so a text with
 `(?m)` is followed in the order it is written: a `(?m)` holds to the end of its group, `(?m:...)` inside its body, `(?-m)` and a repeat of the flag turn it off or on again.
 `$` already agrees (`"a\n"` gives `[1,2]` in both).
 A look-around or a backreference around the `^` does not change that: `"a\n" | [match("(?m)(?<=\\n)^";"g")]` is `[]` in jq and here, and `(?m)(?=a)^`, `(?m)^(?!x)` and `(?m)(?<!x)^` agree on texts with one and with two final newlines.
-A `^` *inside* a look-around still keeps the crate's reading: `"a\n" | [match("(?m)(?<!^)";"g") | .offset]` is `[1,2]` in jq and `[1]` here, and `"a\n" | [match("(?m)a\\n(?!^)";"g") | .offset]` is `[0]` in jq and `[]` here.
-A pattern that repeats a group name more often than `onig_loop::MAX_NAME_RENAMES` keeps the crate's reading too.
+A `^` *inside* a look-around is written the same way since [#6502](https://github.com/rust-works/succinctly/issues/6502): the pattern is read through its plain copy (`oniguruma_shadow`), which holds the `^` at the same offset, so `"a\n" | [match("(?m)(?<!^)";"g") | .offset]` is `[1,2]`, as in jq (it was `[1]`), and `"a\n" | [match("(?m)a\\n(?!^)";"g") | .offset]` is `[0]` (it was `[]`).
+A pattern that repeats a group name more often than `onig_loop::MAX_NAME_RENAMES` keeps the crate's reading too, and so does one with a look-around that repeats a group name at all, since the renamed copy is not the pattern's text.
 A match of the crate that the exact engine fails on (its backtrack limit) keeps the crate's match, as before.
 Only a pattern whose syntax tree the parser cannot read keeps the crate's reading.
 A pattern `fancy-regex` refuses keeps the match of the crate: `"aa\n" | [match("(?m)^a+a*a+\\n?^";"g")]` is `[]` in jq and one match here, because `a+a*a+` is the shape `fancy-regex` answers wrongly (the entry on two greedy `X+` repeats above).
