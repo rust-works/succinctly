@@ -9626,7 +9626,10 @@ fn emit_yaml_value_at_depth(
                         // mapping's column. A key with no style, anchor or tag of its own (JSON
                         // or computed, or cleared by `-P`) takes go-yaml's choice of scalar; a
                         // YAML key keeps the spelling it was written in (#4950).
-                        let plain_key = kc.key_style(k).is_empty()
+                        // #6230: a quoted key `-P` stripped is a string with no style left, so a
+                        // break in it takes go-yaml's choice too (`? |-` and a literal block).
+                        let plain_key = (kc.key_style(k).is_empty()
+                            || kc.key_style(k) == KEY_STYLE_STRING)
                             && kc.key_anchor(k).is_none()
                             && kc.key_tag(k).is_none();
                         // An alias key is `*name` however long its target is (#5469).
