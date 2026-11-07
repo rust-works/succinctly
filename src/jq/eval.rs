@@ -176216,6 +176216,9 @@ mod trailing_newline_route_tests_6488 {
             r"((?=a))$",
             r"((?<!a)\b)$",
             r"[(]a(\z)$",
+            r"[]a](\z)$",
+            r"((?<n>\z))$",
+            r"((?=a\)[)])\z)$",
         ] {
             assert!(has_anchor_only_group(pattern), "{pattern}");
         }
@@ -176232,6 +176235,12 @@ mod trailing_newline_route_tests_6488 {
             r"(?i)$",
             r"[(\z)]$",
             r"((?#c))$",
+            r"((?~a)\z)$",
+            // Groups that do not close.
+            r"(\z(?#c",
+            r"(\z(?=a",
+            r"(\z(?<=a",
+            r"(\z(?=[a",
         ] {
             assert!(!has_anchor_only_group(pattern), "{pattern}");
         }
@@ -176269,7 +176278,8 @@ mod trailing_newline_route_tests_6488 {
         ] {
             assert!(pattern_may_match_newline(pattern), "{pattern}");
         }
-        // A `.` that no flag turns to match a newline does not.
+        // A `.` that no flag turns to match a newline does not, nor does a safe escape in a class.
         assert!(!pattern_may_match_newline(r"a.$"));
+        assert!(!pattern_may_match_newline(r"[\w_]$"));
     }
 }
