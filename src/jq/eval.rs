@@ -10951,17 +10951,7 @@ pub(crate) fn eval_owned_number_fold<S: EvalSemantics>(
     let OwnedValue::Array(items) = input else {
         return None;
     };
-    let builtin = match unwrap_paren(expr) {
-        Expr::Pipe(stages) => match skip_identity_stages(stages) {
-            [only] => match unwrap_paren(only) {
-                Expr::Builtin(builtin) => builtin,
-                _ => return None,
-            },
-            _ => return None,
-        },
-        Expr::Builtin(builtin) => builtin,
-        _ => return None,
-    };
+    let builtin = single_builtin_stage(expr)?;
     if !matches!(builtin, Builtin::Add | Builtin::Min | Builtin::Max)
         || items.is_empty()
         || !items.iter().all(is_plain_finite_number)
@@ -10977,6 +10967,19 @@ pub(crate) fn eval_owned_number_fold<S: EvalSemantics>(
         }
         Builtin::Min => jq_min_by(items.iter().cloned(), compare_values::<S>),
         _ => jq_max_by(items.iter().cloned(), compare_values::<S>),
+    }
+}
+
+/// The builtin `expr` is when it is that one stage, however it is wrapped: in parentheses, or as
+/// the only non-identity stage of a pipe, at any depth (`. | (. | add)`).
+fn single_builtin_stage(expr: &Expr) -> Option<&Builtin> {
+    match unwrap_paren(expr) {
+        Expr::Pipe(stages) => match skip_identity_stages(stages) {
+            [only] => single_builtin_stage(only),
+            _ => None,
+        },
+        Expr::Builtin(builtin) => Some(builtin),
+        _ => None,
     }
 }
 
@@ -149348,6 +149351,8 @@ mod tests {
             "(max)",
             ". | min",
             "(. | add)",
+            ". | (. | add)",
+            "(. | (max))",
         ];
         let mut taken = 0;
         for src in sources {
