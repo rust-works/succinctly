@@ -2120,8 +2120,10 @@ impl Rewriter<'_> {
                         after: None,
                     },
                 ) if !anchor.last => {
+                    // The text of the item, not of the anchor in it: a group around the anchor
+                    // (`(\w*)(\z)`) is set by the way that consumes, too (#6492).
                     let then = |way: Option<Text>| {
-                        way.map(|way| self.concat_text(&[&way, &anchor.text]))
+                        way.map(|way| self.concat_text(&[&way, &next.text]))
                             .transpose()
                     };
                     Ways::Anchored {
