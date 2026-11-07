@@ -28139,7 +28139,9 @@ fn multiline_caret_read(pattern: &str) -> Option<CaretRead> {
             _ => {}
         }
     }
-    let read = super::onig_loop::parse_distinct_names(pattern)?;
+    // #6502: a `^` inside a lookaround is read through the plain copy of the pattern, which holds
+    // it at the same offset.
+    let (read, _) = super::onig_loop::parse_distinct_names_or_shadow(pattern)?;
     let mut spans = Vec::new();
     walk(&read.ast, &mut false, &mut spans);
     Some((read.text, spans, read.renames))
@@ -140346,8 +140348,14 @@ mod tests {
         assert_eq!(carets("(?m:^)^"), Some(1));
         assert_eq!(carets("(?m)(?-m)^"), Some(0));
         assert_eq!(carets("(?m)(?-m:^)^"), Some(1));
-        // A pattern the parser does not read (a look-behind) has no answer.
-        assert_eq!(carets("(?m)(?<=a)^"), None);
+        // A look-around is read through the pattern's plain copy, inside it too (#6502); a copy
+        // that would need a group renamed, and a pattern the parser does not read, have no answer.
+        assert_eq!(carets("(?m)(?<=a)^"), Some(1));
+        assert_eq!(carets("(?m)(?<!^)a(?!^|b)"), Some(2));
+        assert_eq!(carets("(?m)(?<!(?-m:^))"), Some(0));
+        assert_eq!(carets("(?m)(?#^)(?<!a)"), Some(0));
+        assert_eq!(carets("(?m)(?:(?<n>a)|(?<n>b))(?<!^)"), None);
+        assert_eq!(carets("(?m)(?<!^"), None);
         assert!(has_multiline_caret("(?m)^a"));
         assert!(!has_multiline_caret("^a"));
         assert!(!has_multiline_caret("(?m)a$"));
@@ -140356,6 +140364,10 @@ mod tests {
             Some(r"(?m)(?:\A|^(?!\z))a|(?:\A|^(?!\z))b")
         );
         assert_eq!(rewrite_multiline_caret("^a"), None);
+        assert_eq!(
+            rewrite_multiline_caret("(?m)(?<!^)").as_deref(),
+            Some(r"(?m)(?<!(?:\A|^(?!\z)))")
+        );
     }
 
     #[cfg(feature = "regex")]

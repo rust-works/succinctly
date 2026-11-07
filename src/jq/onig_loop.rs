@@ -740,23 +740,36 @@ pub(crate) fn parse_distinct_names(pattern: &str) -> Option<DistinctNames> {
     None
 }
 
-/// [`parse_distinct_names`] for a rewrite that copies groups, and where the constructs of the
-/// pattern that the parsed copy reads as something else start (#6426). A pattern with a lookaround
-/// or an atomic group is read through the copy that writes them plainly, when none of them is in
-/// the way of the copies the rewrite writes ([`copyable_beside_loops`]).
-pub(crate) fn parse_for_group_copies(pattern: &str) -> Option<(DistinctNames, Vec<usize>)> {
+/// [`parse_distinct_names`], reading a pattern with syntax only `fancy-regex` reads (a lookaround,
+/// an atomic group, a comment, a backreference) through the copy that writes it plainly at the same
+/// offsets ([`oniguruma_shadow`](super::eval::oniguruma_shadow), #6128): the tree's spans are then
+/// the pattern's, and the text returned is the pattern. The second element is `Some` when the copy
+/// was read, with where each construct it reads as something else starts. A rename would move the
+/// offsets of everything after it, so a copy that repeats a name is `None`.
+pub(crate) fn parse_distinct_names_or_shadow(
+    pattern: &str,
+) -> Option<(DistinctNames, Option<Vec<usize>>)> {
     if let Some(read) = parse_distinct_names(pattern) {
-        return Some((read, Vec::new()));
+        return Some((read, None));
     }
     let shadow = super::eval::oniguruma_shadow(pattern)?;
-    // A rename would move the offsets of everything after it, so a repeated name keeps the pattern.
     let mut read = parse_distinct_names(&shadow.text)?;
-    (read.renames.is_empty() && copyable_beside_loops(&read.ast, &shadow.opaque, pattern)).then(
-        || {
-            read.text = pattern.to_string();
-            (read, shadow.opaque)
-        },
-    )
+    read.renames.is_empty().then(|| {
+        read.text = pattern.to_string();
+        (read, Some(shadow.opaque))
+    })
+}
+
+/// [`parse_distinct_names_or_shadow`] for a rewrite that copies groups (#6426): a pattern with a
+/// lookaround or an atomic group is read through its plain copy only when none of them is in the
+/// way of the copies the rewrite writes ([`copyable_beside_loops`]).
+pub(crate) fn parse_for_group_copies(pattern: &str) -> Option<(DistinctNames, Vec<usize>)> {
+    match parse_distinct_names_or_shadow(pattern)? {
+        (read, None) => Some((read, Vec::new())),
+        (read, Some(opaque)) => {
+            copyable_beside_loops(&read.ast, &opaque, pattern).then_some((read, opaque))
+        }
+    }
 }
 
 /// What [`parse_distinct_names`] read.
