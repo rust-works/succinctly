@@ -14082,7 +14082,7 @@ Two residuals remain, both with a missing file *and* a feature that routes input
 * jq keeps the name of the last file it tried even when it did not open, so a diagnostic or `input_filename` after a missing last file names that file (`jq -s -c input_filename data.json missing` prints `"missing"`).
   `succinctly jq` does the same once a read reaches the end of the input, since [#6480](https://github.com/rust-works/succinctly/issues/6480): the missing last file is a source past the ones that opened, at line 0, so `[inputs], input_filename` under `-n`, an error after `[inputs]`, and every `-s` route name it.
   Two cases still name the last file that opened: a value that its read completes at the end of the input (a bare number or literal in the last bytes, `jq -c input_filename num.json missing` over `12`, and the last `-R` line with no newline), and a fault at the end of the text (`[1,`).
-  The `--stream`, `--stream-errors` and `--seq` readers set their positions themselves and still name the last file that opened throughout.
+  The `--stream` and `--stream-errors` readers set their positions themselves and still name the last file that opened throughout.
 
 ## Bare `..`/`recurse` on a `$var` off the register (#3048; its nested-fold residual closed by #4779)
 
