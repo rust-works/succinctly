@@ -1091,7 +1091,7 @@ fn rewrite_parsed(
                 whole += 1;
                 readings.retain(|_, own| *own > whole);
             }
-            None => break,
+            None => break, // patchcov: coverage tolerate-line reason="defensive: at the last reading no repeat is written, so `lazy_bounded_written` ends the loop first"
         }
         rewriter = new_rewriter(whole, readings.clone());
         piece = rewriter.convert(&ast, false);
