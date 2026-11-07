@@ -2048,8 +2048,10 @@ impl Rewriter<'_> {
                     Ways::Consuming,
                 ) => Ways::Consuming,
                 // #6358: an anchor beside what may match nothing is the same anchor's way: `\bb*`
-                // is `\bb+ | \b`, and `a*\z` is `a+\z | \z`. With a group already gone past, the
-                // ways would have to set it after the anchor, so they are not listed.
+                // is `\bb+ | \b`, and `a*\z` is `a+\z | \z`. Two anchors in a row are listed only
+                // with no group gone past, which the way after them would have to set (#6473); an
+                // anchor and an item after it are written from the text of the items before the
+                // way, group included (#6506).
                 (
                     Ways::Anchored {
                         before: None,
