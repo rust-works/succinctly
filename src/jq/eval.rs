@@ -15034,6 +15034,8 @@ fn owned_state_expr_shape_in(expr: &Expr, calls: bool) -> bool {
     match expr {
         Expr::Identity | Expr::Literal(_) | Expr::Field(_) | Expr::Index { .. } | Expr::Not => true,
         Expr::Paren(inner) | Expr::Negate(inner) => shape(inner),
+        // #6567: `.[K]` of single-output operands is one value (or a raise, which declines).
+        Expr::IndexExpr { target, key } => shape(target) && shape(key),
         // `[]`, `[a, b]` and `[a]`: each element is one value, so the array is one.
         Expr::Array(inner) => match inner.as_ref() {
             Expr::Builtin(Builtin::Empty) => true,
@@ -89646,6 +89648,56 @@ fn eval_owned_pure_in<S: EvalSemantics>(
             };
             arith_combine::<S>(*op, l, r).ok().map(Ok)
         }
+        // #6567: `.[K]` with a single-output pure key, as an operand: jq's `E[K]` is
+        // `K as $k | E | .[$k]`, so the key is settled first, against this node's own input. Only a
+        // string key (an object, or `null`) and an integer key, computed or spelled as a literal
+        // (an array, or `null`), are read here, as `index_one_owned_read` reads them; every other key kind (a slice descriptor, an array
+        // of indices, a float, a literal-spelled number, `null`, a boolean) and every read that
+        // raises declines, so the evaluator keeps jq's rules and its text. Operand position only:
+        // the value read is a node of `input`, which must not leave as an expression's own result
+        // (#2397). jq mode only.
+        Expr::IndexExpr { target, key }
+            if S::TAG == EvalTag::Jq && position == ResultPosition::Operand =>
+        {
+            let k = match eval_owned_pure_in::<S>(key, input, ResultPosition::Operand, door)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            if !matches!(
+                k,
+                OwnedValue::String(_)
+                    | OwnedValue::Int(_)
+                    | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
+            ) {
+                return None;
+            }
+            let t = match eval_owned_pure_in::<S>(target, input, ResultPosition::Operand, door)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            match index_one_owned_read::<S>(&t, &k, false) {
+                Ok(Some(v)) => Some(Ok(v)),
+                _ => None,
+            }
+        }
+        // #6567: `a // b` for a single-output pure `a`: `a`'s value when it is neither `null` nor
+        // `false`, else `b`, which is not read otherwise. jq 1.7.1 does not suppress an error in
+        // `a` (`(error("x")) // 1` and `[1] | (.a) // 2` both raise), so an `a` that raises is
+        // that error, as it is for every other operand of this grammar, and `b`'s is raised only
+        // when `b` is reached. Operand position only, for the representation reason above.
+        Expr::Alternative(left, right)
+            if S::TAG == EvalTag::Jq && position == ResultPosition::Operand =>
+        {
+            let l = match eval_owned_pure_in::<S>(left, input, ResultPosition::Operand, door)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            if l.is_truthy() {
+                Some(Ok(l))
+            } else {
+                eval_owned_pure_in::<S>(right, input, ResultPosition::Operand, door)
+            }
+        }
         _ => None,
     }
 }
@@ -129409,6 +129461,97 @@ mod tests {
                 .is_none(),
                 "{src:?} answered as a result"
             );
+        }
+    }
+
+    /// #6567: `.[K]` with a pure key and `a // b` of pure operands, as operands of a comparison, are
+    /// answered from the owned value and are the answer the reindex bridge gives, over every kind
+    /// of value in the matrix (and, for the key, strings, integers, floats, `null` and containers).
+    /// A read that raises declines or raises the bridge's own text, a key kind the arm does not
+    /// read declines, as a bare result (`Fresh` position) and in yq mode nothing is answered.
+    #[test]
+    fn eval_owned_pure_answers_computed_keys_and_alternatives_as_the_bridge_does_6567() {
+        let shapes = [
+            "(.a // 0) == 1",
+            "(.a.b // 0) == 2",
+            "(.[\"a\"] // 0) == 1",
+            "(.[\"a\"][\"b\"] // 0) == 2",
+            ".[0] == 1",
+            "(.[0] // 7) == 7",
+            "(.[1] // 7) == 7",
+            "(.[-1] // 7) == 7",
+            ".[(\"a\")] == 1",
+            ".[.a] == 1",
+            "(.[.a] // 0) == 0",
+            "(.[.a.b] // 0) == 0",
+            ".[0][0] == 1",
+            "(.a // .b) == 1",
+            "(.x // .y // 3) == 3",
+            "((.[\"a\"] // 0) + 1) == 2",
+            ".[(1 - 1)] != null",
+            ".[(0 + 1)] != null",
+            ".[null] == 1",
+            ".[true] == 1",
+            ".[1.5] == 1",
+            ".[[1]] == 1",
+            "(. // 0) == 0",
+            "(null // .a) == null",
+            "(false // 5) == 5",
+            "(0 // 5) == 0",
+            "(\"\" // 5) == \"\"",
+            "(.a // error(\"x\")) == 1",
+            "(.[\"a\"] // 0 | type) == \"number\"",
+        ];
+        let values = pure_value_matrix();
+        let mut answered = 0;
+        for src in shapes {
+            let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+            for value in &values {
+                let bridge = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                for door in [false, true] {
+                    if let Some(fast) =
+                        eval_owned_pure_in::<JqSemantics>(&expr, value, ResultPosition::Fresh, door)
+                    {
+                        let fast = match fast {
+                            Ok(v) => debug_normalize(QueryResult::<Vec<u64>>::Owned(v)),
+                            Err(e) => debug_normalize(QueryResult::<Vec<u64>>::Error(e)),
+                        };
+                        answered += 1;
+                        assert_eq!(fast, bridge, "{src:?} on {value:?} (door {door})");
+                    }
+                }
+                // Only a shape that holds a `//` or a key read off the input is this arm's; the
+                // static reads (`.[0]`, `.[("a")]`) are older grammar that yq mode shares.
+                if src.contains("//") || src.contains("[.") {
+                    assert!(
+                        eval_owned_pure_in::<YqSemantics>(
+                            &expr,
+                            value,
+                            ResultPosition::Fresh,
+                            true
+                        )
+                        .is_none(),
+                        "{src:?} on {value:?} answered in yq mode"
+                    );
+                }
+            }
+        }
+        assert!(
+            answered > 500,
+            "only {answered} answers: the arms were not reached"
+        );
+        // As an expression's own result neither arm answers: the value read is a node of the input.
+        for src in [".[\"a\"]", ".[0]", ".a // 0", ".[.a] // 0", "(.a // 0)"] {
+            let expr = parse(src).unwrap();
+            for value in &values {
+                assert!(
+                    eval_owned_pure_in::<JqSemantics>(&expr, value, ResultPosition::Fresh, true)
+                        .is_none(),
+                    "{src:?} on {value:?} answered as a result"
+                );
+            }
         }
     }
 
@@ -174195,6 +174338,128 @@ mod share_audit_2999 {
         assert_eq!(OPERAND_REBUILT.with(core::cell::Cell::get), before);
         assert!(owned_assign_operand::<JqSemantics>(&operand("[.i % 2]"), &wide).is_some());
         assert_eq!(OPERAND_REBUILT.with(core::cell::Cell::get), before + 1);
+    }
+
+    /// #6567: a computed key and a `//` default in an operand that reads the state
+    /// (`(.c[.k] // 0) + 1`, `.arr[.i] // 9`) are read off the tree. They were not in the shape a state
+    /// reads, so the fold's right side `.[$k] = (.[$k] // 0) + 1` went to the evaluator for the whole
+    /// assignment and re-indexed the state every step (0.20x of jq 1.7.1 at a hundred keys). Where the
+    /// direct route answers it answers what the rebuilt route does, spelling included; a key that is
+    /// not a string or an integer, a read that raises and a `//` whose left side raises decline.
+    #[test]
+    fn computed_key_and_alternative_operands_are_read_off_the_tree_6567() {
+        let state = |json: &str| {
+            let index = JsonIndex::build(json.as_bytes());
+            crate::jq::eval_generic::to_owned_cursor::<JqSemantics, _>(&index.root(json.as_bytes()))
+                .expect("decodes")
+        };
+        let operand = |filter: &str| parse(filter).expect("parses");
+        let rebuilt = |expr: &Expr, state: &OwnedValue| {
+            eval_owned_multi_first::<JqSemantics>(expr, state, Reentry::REBUILT)
+                .expect("evaluates")
+                .expect("one output")
+        };
+        let doc = r#"{"c":{"a":3,"b":0,"n":null,"f":false,"neg":-2,"s":"t","fl":1.5},"arr":[10,20,null,false],"k":"a","i":1,"j":-1,"s":"x","z":null,"fl":1.5,"o":{"p":{"q":7}},"t":true}"#;
+        // (operand, whether it is answered from the tree).
+        let rows: &[(&str, bool)] = &[
+            // A string key into an object, a missing one, and a key that is itself read off the state.
+            (".c[.k]", true),
+            (".c[\"a\"]", true),
+            (".c[\"zz\"]", true),
+            (".c[.s]", true),
+            ("[.c[.k]]", true),
+            ("[.c[.k], .c[.s]]", true),
+            (".o.p[\"q\"]", true),
+            (".o[\"p\"][\"q\"]", true),
+            (".z[\"a\"]", true),
+            // An integer key into an array, a negative one, one past the end, one computed.
+            (".arr[.i]", true),
+            (".arr[.j]", true),
+            (".arr[5]", true),
+            (".arr[(.i + 1)]", true),
+            (".arr[(.i - 3)]", true),
+            (".z[.i]", true),
+            // `//`: a truthy left side, `null`, `false`, `0` (truthy), a missing key, a left side
+            // that is itself a read, and a right side that is read only when it is needed.
+            (".c[.k] // 0", true),
+            (".c[\"n\"] // 5", true),
+            (".c[\"f\"] // 5", true),
+            (".c[\"b\"] // 5", true),
+            (".c[\"zz\"] // \"d\"", true),
+            (".z // 3", true),
+            (".zz // \"d\"", true),
+            (".i // .zzz", true),
+            ("(.z // .i)", true),
+            (".z // .z // 7", true),
+            (".arr[.i] // 9", true),
+            (".arr[2] // 9", true),
+            // The counting idiom's right side, and nested forms of it.
+            ("(.c[.k] // 0) + 1", true),
+            ("(.c[\"zz\"] // 0) + 1", true),
+            ("(.c[\"n\"] // 0) * 2 - 1", true),
+            ("[(.c[.k] // 0) + 1]", true),
+            ("(.arr[.i] // 0) + (.arr[0] // 0)", true),
+            ("((.o.p[\"q\"] // 0) + 1) * 2", true),
+            ("(.c[.k] // 0.5) + 1", true),
+            ("(.c[\"fl\"] // 0) + 1", true),
+            // Declined: a key that is not a string or an integer, a read that raises, a left side
+            // that raises, and a container read off the state.
+            (".c[.fl]", false),
+            (".c[.z]", false),
+            (".c[.t]", false),
+            (".c[.i]", false),
+            (".arr[.k]", false),
+            (".arr[.fl]", false),
+            (".i[.k]", false),
+            (".s[.i]", false),
+            (".arr[null]", false),
+            ("(.arr[.k]) // 1", false),
+            ("(.i[.k] // 0) + 1", false),
+            // `//` reads its right side only when the left is `null` or `false`.
+            ("(.c[.k] // error(\"x\"))", true),
+            ("(.c[\"n\"] // error(\"x\"))", false),
+            (".c[.k] // .c", true),
+            (".c[\"n\"] // .c", false),
+            (".c", false),
+            (".c[\"zz\"] // .c", false),
+            (".arr[.i:]", false),
+            ("(.c[.k] // 0) / 0", false),
+        ];
+        let doc_state = state(doc);
+        let mut answered = 0;
+        for (filter, direct) in rows {
+            let expr = operand(filter);
+            let got = owned_state_operand_direct::<JqSemantics>(&expr, &doc_state);
+            assert_eq!(got.is_some(), *direct, "{filter}");
+            if let Some(value) = got {
+                answered += 1;
+                let expected = rebuilt(&expr, &doc_state);
+                assert_eq!(value.to_json(), expected.to_json(), "{filter}");
+                assert_eq!(value, expected, "{filter}");
+            }
+        }
+        assert!(answered > 30, "the rows must reach the arms: {answered}");
+        // The counter: the counting idiom's right side never touches the rebuilt route, however
+        // wide the state is.
+        let big = (0..100_000)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let wide = state(&format!(
+            r#"{{"c":{{"a":3}},"k":"a","o":{{"p":1}},"s":"p","i":1,"z":null,"big":[{big}]}}"#
+        ));
+        let before = OPERAND_REBUILT.with(core::cell::Cell::get);
+        for filter in [
+            "(.c[.k] // 0) + 1",
+            "(.o[.s] // 0) + 1",
+            ".c[.k] // 0",
+            "(.z // 0) + 1",
+            "[(.i // 0) + 1]",
+        ] {
+            let got = owned_assign_operand::<JqSemantics>(&operand(filter), &wide);
+            assert!(got.is_some(), "{filter}");
+        }
+        assert_eq!(OPERAND_REBUILT.with(core::cell::Cell::get), before);
     }
 
     /// #5288: an integer literal prints as it was written, so the direct route takes one only when
