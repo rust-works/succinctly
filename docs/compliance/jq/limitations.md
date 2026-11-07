@@ -7542,16 +7542,19 @@ Three differences remain.
   `?` and `try` catch the error like any other.
   Pinned by `test_backtrack_limit_is_a_catchable_error_5502`.
 - **Some lookbehinds Oniguruma refuses are answered.**
-  Oniguruma refuses a lookbehind whose body repeats a varying number of times in some shapes (`(?<!a*b)`, `(?<=a*bc)`, `(?<=aa*)`), with `invalid pattern in look-behind`.
-  `fancy-regex` matches them, correctly.
-  Oniguruma's rule is not a simple one (`(?<=a?)`, `(?<=a*)`, `(?<!a+)` and `(?<=a*a)` are accepted, `(?<=a*bc)` and `(?<=aa*)` are not), and reproducing it would mean reproducing its lookbehind compiler.
-  An alternation whose branches are of fixed, differing widths is the part that is modelled (#6201): `(?<=a|bc)`, `(?<!a(?:b|cd))` and `(?<=(?:a|bc){2})` are refused here as in jq, wherever the alternation sits in a body with no repeat of a varying count.
-  So is one under a repeat that must run at least once, when the repeat is the body or an item of its concatenation (`(?<=(?:a|bc)+)`, `(?<=x(?:a|bc){1,2})`).
-  Alternatives of one width (`(?<=ab|cd)`), a branch written empty (`(?<=a|)`) and a body with a varying repeat that may run zero times (`(?<=(?:a|bc)?)`, `(?<=(?:a|bc)*)`) are accepted by both, and a branch holding a backreference, an atomic group or a comment is not counted.
-  Left accepted here though jq refuses them: `(?<=(?:a|bc)*e)` (the same repeat beside another item), `(?<=(?:a|b)+)`, `(?<=\R|a)` (`\R` is one or two characters), a branch with an anchor beside a character (`(?<=a|b\z)`), and any look-behind under the `x` flag or an inline `(?x)`, whose blanks the check cannot see.
-  Over 8,000 generated look-behinds with no varying repeat the two agree on every pattern, and none that jq accepts is refused over 32,000 more with them.
+  Oniguruma sizes a lookbehind's body before it compiles it (`tune_look_behind`, `regcomp.c`), and refuses one that is not of a single length with `invalid pattern in look-behind`.
+  A body that can match the empty string, and is sure of it, is no lookbehind at all: it becomes an empty node (a failure for `(?<!`), so its groups are never set (`"ab" | match("(?<=(a)|)b")` captures `{offset: -1, string: null}`).
+  A group or an assertion makes the length unsure, so `(?<=(a)?)b`, `(?<=(a)*)b` and `(?<=b|()|c)` are refused, and `(?<=a|)b` and `(?<=(a)|)b` are not.
+  Before it sizes the body, the compiler cuts a quantifier on a plain item to its least count (`x+` is `x`, `x?` and `x*` are removed), but only the first item of a branch that is not itself removed, and not one that a later item makes possessive (`a*b` is `(?>a*)b`).
+  That is why `(?<=a*a)` is accepted and `(?<=a*b)`, `(?<=bb?)` and `(?<=aa*)` are refused.
+  A branch whose every item is removed ends in an error code with no text of its own: `(?<=a*b*)` is `Regex failure: undefined error code`.
+  `onig_look_behind.rs` reads that rule (#6519) for every body it can follow, and the lookbehind is refused, accepted or, for an empty body, written as the node Oniguruma makes of it (`(?:)`, a class that matches nothing for `(?<!`, and the groups kept unset).
+  Over five draws of 2,000 generated look-behinds (10,000 in all) against jq 1.7.1, 1,717 differ from jq without this rule and 86 with it, and none that agreed without it differs now.
+  What it does not follow keeps the older shape rules of #6201: an alternation whose branches are of fixed, differing widths is refused here as in jq (`(?<=a|bc)`, `(?<!a(?:b|cd))`, `(?<=(?:a|bc){2})`), wherever it sits in a body this does not read.
+  The bodies it does not read are those with a case-insensitive flag, a backreference, a nested lookaround, an atomic group or a comment, `\K`, `\G`, `\Z` or `\R`, a character that is not ASCII, a flag group, a quantified group that Oniguruma merges with another quantifier in a way the table of `onig_reduce_nested_quantifier` does not settle, a repeated class whose possessive reading depends on what the class holds (`(?<=\w*\d)`), and two groups of one name.
+  Left accepted here though jq refuses them: `(?<=\R|a)` (`\R` is one or two characters), a branch with an anchor beside a character (`(?<=a|b\z)`), and any look-behind under the `x` flag or an inline `(?x)`, whose blanks the check cannot see.
   The part about a lookahead inside a look-behind (`(?<=(?=a)a)`) is #6197.
-  Pinned by `test_lookbehind_oniguruma_refuses_is_answered_5502`.
+  Pinned by `test_lookbehind_oniguruma_refuses_is_refused_5502` and `tests/jq_cli/i6519.rs`.
 - **A `\K` that ends a look-behind match ends the global search here; jq's never ends.**
   `"cab" | [match("(?<=a\\Kb)";"g")]` never answers in jq 1.7.1: the match is `[2,3)`, jq resumes at its end (3), and the look-behind finds the same match from there, so the search pushes it for ever and grows without bound.
   Matching that would take the host process down, so a match that begins before the offset the search resumed from and ends at it is skipped, and the search moves on one character: the answer is `["b"]` ([#6169](https://github.com/rust-works/succinctly/issues/6169)).
