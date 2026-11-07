@@ -6075,25 +6075,24 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     return Err(self.err_unexpected_char(self.pos, "did not find expected key"));
                 }
 
-                // #6570: properties alone after the dash (`? - &x`) name a value on a line below,
-                // as for any other item: the item stays open and the main loop reads the value
-                // there, with the checks it makes of a line below a block scalar. `parse_value`
-                // below would read the properties' own line end as a plain scalar over the lines
-                // that follow, which holds a block scalar header and its content as text (`? -
-                // &x` / `   |` / `     t` / `` / `   u` dropped `u`).
+                // #6570: properties alone after the dash (`? - &x`) with a value on a line below
+                // are an item whose value the main loop reads there, with the checks it makes of a
+                // line below a block scalar, as for any other item: the item stays open. Reading
+                // them through `parse_value` below takes the properties' own line end for a plain
+                // scalar over the lines that follow, which holds a block scalar header and its
+                // content as text (`? - &x` / `   |` / `     t` / `` / `   u` dropped `u`). With
+                // nothing below (`? - &x` / `: v`) the item is null and takes that path as before.
                 let mut value_on_a_later_line = false;
                 if matches!(self.peek(), Some(b'&' | b'!'))
                     && !self.node_properties_prefix_mapping_entry()
                 {
                     let properties_start = self.pos;
-                    let had_property = self.parse_node_properties()?;
-                    if self.at_line_end() {
+                    self.parse_node_properties()?;
+                    if self.at_line_end() && !self.following_value_is_null(seq_indent) {
                         value_on_a_later_line = true;
-                        if had_property && self.following_value_is_null(seq_indent) {
-                            self.set_ib();
-                            self.write_bp_open();
-                            self.write_bp_close();
-                        }
+                        // A comment after the properties goes with the value that follows, as for
+                        // any property-prefixed item (#784).
+                        self.defer_line_comment();
                     } else {
                         self.pos = properties_start;
                     }

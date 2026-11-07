@@ -414,26 +414,245 @@ const CHANGED: &[(&str, Option<&str>)] = &[
     ("? - &x\n    |\n      t\n\n   u\n: v\n", None),
     ("? - &x\n    |\n      t\n\n   u\nb: 1\n", None),
     ("? - &x\n    |\n      t\n\n   u\n: v\nb: 1\n", None),
+    ("? - &x\n    |\n      t\n\n   u\n# f\n: v\n", None),
     ("? - !!str\n    |\n      t\n\n   u\n", None),
     ("? - !!str\n    |\n      t\n\n   u\n: v\n", None),
     ("? - !!str\n    |\n      t\n\n   u\nb: 1\n", None),
     ("? - !!str\n    |\n      t\n\n   u\n: v\nb: 1\n", None),
+    ("? - !!str\n    |\n      t\n\n   u\n# f\n: v\n", None),
     ("? - &x !!str\n    |\n      t\n\n   u\n", None),
     ("? - &x !!str\n    |\n      t\n\n   u\n: v\n", None),
     ("? - &x !!str\n    |\n      t\n\n   u\nb: 1\n", None),
     ("? - &x !!str\n    |\n      t\n\n   u\n: v\nb: 1\n", None),
+    ("? - &x !!str\n    |\n      t\n\n   u\n# f\n: v\n", None),
     ("? - &x # c\n    |\n      t\n\n   u\n", None),
     ("? - &x # c\n    |\n      t\n\n   u\n: v\n", None),
     ("? - &x # c\n    |\n      t\n\n   u\nb: 1\n", None),
     ("? - &x # c\n    |\n      t\n\n   u\n: v\nb: 1\n", None),
+    ("? - &x # c\n    |\n      t\n\n   u\n# f\n: v\n", None),
     ("? - !!seq\n    |\n      t\n\n   u\n", None),
     ("? - !!seq\n    |\n      t\n\n   u\n: v\n", None),
     ("? - !!seq\n    |\n      t\n\n   u\nb: 1\n", None),
     ("? - !!seq\n    |\n      t\n\n   u\n: v\nb: 1\n", None),
-    ("? - &x &y\n    |\n      t\n\n   u\n", None),
-    ("? - &x &y\n    |\n      t\n\n   u\n: v\n", None),
-    ("? - &x &y\n    |\n      t\n\n   u\nb: 1\n", None),
-    ("? - &x &y\n    |\n      t\n\n   u\n: v\nb: 1\n", None),
+    ("? - !!seq\n    |\n      t\n\n   u\n# f\n: v\n", None),
+];
+
+/// The same documents as YAML (`.`, the default output), where the comments after the properties
+/// and the scalar below them are written where yq writes them.
+const CHANGED_YAML: &[(&str, Option<&str>)] = &[
+    ("? - &x\n  |\n    t\n", Some("? - &x |\n    t\n:")),
+    ("? - &x\n  |\n    t\n: v\n", Some("? - &x |\n    t\n: v")),
+    (
+        "? - &x\n  |\n    t\nb: 1\n",
+        Some("? - &x |\n    t\n:\nb: 1"),
+    ),
+    (
+        "? - &x\n  |\n    t\n: v\nb: 1\n",
+        Some("? - &x |\n    t\n: v\nb: 1"),
+    ),
+    (
+        "? - &x\n  |\n    t\n# f\n: v\n",
+        Some("? - &x |\n    t\n: v\n# f"),
+    ),
+    ("? - &x\n    |\n      t\n", Some("? - &x |\n    t\n:")),
+    (
+        "? - &x\n    |\n      t\n: v\n",
+        Some("? - &x |\n    t\n: v"),
+    ),
+    (
+        "? - &x\n    |\n      t\nb: 1\n",
+        Some("? - &x |\n    t\n:\nb: 1"),
+    ),
+    (
+        "? - &x\n    |\n      t\n: v\nb: 1\n",
+        Some("? - &x |\n    t\n: v\nb: 1"),
+    ),
+    (
+        "? - &x\n    |\n      t\n# f\n: v\n",
+        Some("? - &x |\n    t\n: v\n# f"),
+    ),
+    ("? - &x\n    |\n      t\n\n   u\n", None),
+    ("? - &x\n    |\n      t\n\n   u\n: v\n", None),
+    ("? - &x\n    |\n      t\n\n   u\nb: 1\n", None),
+    ("? - &x\n    |\n      t\n\n   u\n: v\nb: 1\n", None),
+    ("? - &x\n    |\n      t\n\n   u\n# f\n: v\n", None),
+    ("? - !!str\n  |\n    t\n", Some("? - !!str |\n    t\n:")),
+    (
+        "? - !!str\n  |\n    t\n: v\n",
+        Some("? - !!str |\n    t\n: v"),
+    ),
+    (
+        "? - !!str\n  |\n    t\nb: 1\n",
+        Some("? - !!str |\n    t\n:\nb: 1"),
+    ),
+    (
+        "? - !!str\n  |\n    t\n: v\nb: 1\n",
+        Some("? - !!str |\n    t\n: v\nb: 1"),
+    ),
+    (
+        "? - !!str\n  |\n    t\n# f\n: v\n",
+        Some("? - !!str |\n    t\n: v\n# f"),
+    ),
+    ("? - !!str\n    |\n      t\n", Some("? - !!str |\n    t\n:")),
+    (
+        "? - !!str\n    |\n      t\n: v\n",
+        Some("? - !!str |\n    t\n: v"),
+    ),
+    (
+        "? - !!str\n    |\n      t\nb: 1\n",
+        Some("? - !!str |\n    t\n:\nb: 1"),
+    ),
+    (
+        "? - !!str\n    |\n      t\n: v\nb: 1\n",
+        Some("? - !!str |\n    t\n: v\nb: 1"),
+    ),
+    (
+        "? - !!str\n    |\n      t\n# f\n: v\n",
+        Some("? - !!str |\n    t\n: v\n# f"),
+    ),
+    ("? - !!str\n    |\n      t\n\n   u\n", None),
+    ("? - !!str\n    |\n      t\n\n   u\n: v\n", None),
+    ("? - !!str\n    |\n      t\n\n   u\nb: 1\n", None),
+    ("? - !!str\n    |\n      t\n\n   u\n: v\nb: 1\n", None),
+    ("? - !!str\n    |\n      t\n\n   u\n# f\n: v\n", None),
+    (
+        "? - &x !!str\n  |\n    t\n",
+        Some("? - &x !!str |\n    t\n:"),
+    ),
+    (
+        "? - &x !!str\n  |\n    t\n: v\n",
+        Some("? - &x !!str |\n    t\n: v"),
+    ),
+    (
+        "? - &x !!str\n  |\n    t\nb: 1\n",
+        Some("? - &x !!str |\n    t\n:\nb: 1"),
+    ),
+    (
+        "? - &x !!str\n  |\n    t\n: v\nb: 1\n",
+        Some("? - &x !!str |\n    t\n: v\nb: 1"),
+    ),
+    (
+        "? - &x !!str\n  |\n    t\n# f\n: v\n",
+        Some("? - &x !!str |\n    t\n: v\n# f"),
+    ),
+    (
+        "? - &x !!str\n    |\n      t\n",
+        Some("? - &x !!str |\n    t\n:"),
+    ),
+    (
+        "? - &x !!str\n    |\n      t\n: v\n",
+        Some("? - &x !!str |\n    t\n: v"),
+    ),
+    (
+        "? - &x !!str\n    |\n      t\nb: 1\n",
+        Some("? - &x !!str |\n    t\n:\nb: 1"),
+    ),
+    (
+        "? - &x !!str\n    |\n      t\n: v\nb: 1\n",
+        Some("? - &x !!str |\n    t\n: v\nb: 1"),
+    ),
+    (
+        "? - &x !!str\n    |\n      t\n# f\n: v\n",
+        Some("? - &x !!str |\n    t\n: v\n# f"),
+    ),
+    ("? - &x !!str\n    |\n      t\n\n   u\n", None),
+    ("? - &x !!str\n    |\n      t\n\n   u\n: v\n", None),
+    ("? - &x !!str\n    |\n      t\n\n   u\nb: 1\n", None),
+    ("? - &x !!str\n    |\n      t\n\n   u\n: v\nb: 1\n", None),
+    ("? - &x !!str\n    |\n      t\n\n   u\n# f\n: v\n", None),
+    ("? - &x # c\n  |\n    t\n", Some("? - &x | # c\n    t\n:")),
+    (
+        "? - &x # c\n  |\n    t\n: v\n",
+        Some("? - &x | # c\n    t\n: v"),
+    ),
+    (
+        "? - &x # c\n  |\n    t\nb: 1\n",
+        Some("? - &x | # c\n    t\n:\nb: 1"),
+    ),
+    (
+        "? - &x # c\n  |\n    t\n: v\nb: 1\n",
+        Some("? - &x | # c\n    t\n: v\nb: 1"),
+    ),
+    (
+        "? - &x # c\n  |\n    t\n# f\n: v\n",
+        Some("? - &x | # c\n    t\n: v\n# f"),
+    ),
+    (
+        "? - &x # c\n    |\n      t\n",
+        Some("? - &x | # c\n    t\n:"),
+    ),
+    (
+        "? - &x # c\n    |\n      t\n: v\n",
+        Some("? - &x | # c\n    t\n: v"),
+    ),
+    (
+        "? - &x # c\n    |\n      t\nb: 1\n",
+        Some("? - &x | # c\n    t\n:\nb: 1"),
+    ),
+    (
+        "? - &x # c\n    |\n      t\n: v\nb: 1\n",
+        Some("? - &x | # c\n    t\n: v\nb: 1"),
+    ),
+    (
+        "? - &x # c\n    |\n      t\n# f\n: v\n",
+        Some("? - &x | # c\n    t\n: v\n# f"),
+    ),
+    ("? - &x # c\n    |\n      t\n\n   u\n", None),
+    ("? - &x # c\n    |\n      t\n\n   u\n: v\n", None),
+    ("? - &x # c\n    |\n      t\n\n   u\nb: 1\n", None),
+    ("? - &x # c\n    |\n      t\n\n   u\n: v\nb: 1\n", None),
+    ("? - &x # c\n    |\n      t\n\n   u\n# f\n: v\n", None),
+    (
+        "- ? - &x\n    |\n      t\n",
+        Some("- ? - &x |\n      t\n  :"),
+    ),
+    (
+        "a:\n  ? - &x\n    |\n      t\n",
+        Some("a:\n  ? - &x |\n      t\n  :"),
+    ),
+    (
+        "a:\n  ? - &x\n    |\n      t\nb: 1\n",
+        Some("a:\n  ? - &x |\n      t\n  :\nb: 1"),
+    ),
+    ("? - !!seq\n  |\n    t\n", Some("? - !!seq |\n    t\n:")),
+    (
+        "? - !!seq\n  |\n    t\n: v\n",
+        Some("? - !!seq |\n    t\n: v"),
+    ),
+    (
+        "? - !!seq\n  |\n    t\nb: 1\n",
+        Some("? - !!seq |\n    t\n:\nb: 1"),
+    ),
+    (
+        "? - !!seq\n  |\n    t\n: v\nb: 1\n",
+        Some("? - !!seq |\n    t\n: v\nb: 1"),
+    ),
+    (
+        "? - !!seq\n  |\n    t\n# f\n: v\n",
+        Some("? - !!seq |\n    t\n: v\n# f"),
+    ),
+    ("? - !!seq\n    |\n      t\n", Some("? - !!seq |\n    t\n:")),
+    (
+        "? - !!seq\n    |\n      t\n: v\n",
+        Some("? - !!seq |\n    t\n: v"),
+    ),
+    (
+        "? - !!seq\n    |\n      t\nb: 1\n",
+        Some("? - !!seq |\n    t\n:\nb: 1"),
+    ),
+    (
+        "? - !!seq\n    |\n      t\n: v\nb: 1\n",
+        Some("? - !!seq |\n    t\n: v\nb: 1"),
+    ),
+    (
+        "? - !!seq\n    |\n      t\n# f\n: v\n",
+        Some("? - !!seq |\n    t\n: v\n# f"),
+    ),
+    ("? - !!seq\n    |\n      t\n\n   u\n", None),
+    ("? - !!seq\n    |\n      t\n\n   u\n: v\n", None),
+    ("? - !!seq\n    |\n      t\n\n   u\nb: 1\n", None),
+    ("? - !!seq\n    |\n      t\n\n   u\n: v\nb: 1\n", None),
+    ("? - !!seq\n    |\n      t\n\n   u\n# f\n: v\n", None),
 ];
 
 #[test]
@@ -460,6 +679,18 @@ fn yq_answers_the_explicit_key_sequences_that_changed_as_yq_does_6570() -> Resul
         let (stdout, status) = run_yq_stdin(".", doc, &["-o=json", "-I0"])?;
         match expected {
             Some(json) => assert_eq!((stdout.trim_end(), status), (*json, 0), "{doc:?}"),
+            None => assert_eq!(status, 1, "{doc:?}"),
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn yq_writes_the_explicit_key_sequences_that_changed_as_yq_does_6570() -> Result<()> {
+    for (doc, expected) in CHANGED_YAML {
+        let (stdout, status) = run_yq_stdin(".", doc, &[])?;
+        match expected {
+            Some(yaml) => assert_eq!((stdout.trim(), status), (*yaml, 0), "{doc:?}"),
             None => assert_eq!(status, 1, "{doc:?}"),
         }
     }
