@@ -223,3 +223,53 @@ fn a_constructor_extract_around_a_deep_state_is_linear_6581() -> Result<()> {
     );
     Ok(())
 }
+
+/// The declines the arm relies on: a loop inside a binding that holds a document node (the embed table
+/// is live), a `?//` alternative, and a constructor the step declines (a second `.`, a member that reads a
+/// container). Each answers as jq 1.7.1 does, on a document read from stdin.
+#[test]
+fn a_constructor_extract_that_declines_answers_as_jq_6581() -> Result<()> {
+    let doc = "{\"a\":[1,2],\"b\":{\"c\":3}}\n";
+    for (filter, want) in [
+        (
+            r". as $d | [foreach range(3) as $i ($d; .; [$i, .])]",
+            "[[0,{\"a\":[1,2],\"b\":{\"c\":3}}],[1,{\"a\":[1,2],\"b\":{\"c\":3}}],[2,{\"a\":[1,2],\"b\":{\"c\":3}}]]\n",
+        ),
+        (
+            r". as $d | [foreach range(3) as $i ($d.a; . + [$i]; [., $d])]",
+            "[[[1,2,0],{\"a\":[1,2],\"b\":{\"c\":3}}],[[1,2,0,1],{\"a\":[1,2],\"b\":{\"c\":3}}],[[1,2,0,1,2],{\"a\":[1,2],\"b\":{\"c\":3}}]]\n",
+        ),
+        (
+            r". as $d | [foreach range(2) as $i ($d; .; {k: $i, v: .})] | map(.v.b.c)",
+            "[3,3]\n",
+        ),
+        (
+            r"[foreach (1,2) as $i ?// [$i] (0; . + 1; [$i, .])]",
+            "[[1,1],[2,2]]\n",
+        ),
+        (
+            r"[foreach ([1],[2]) as [$a] ?// $a (.; .; [$a, .])] | length",
+            "2\n",
+        ),
+        (
+            r"[foreach range(3) as $i (.; .; [., .])] | length",
+            "3\n",
+        ),
+        (
+            r"[foreach range(3) as $i (.; .; [.a, .b])]",
+            "[[[1,2],{\"c\":3}],[[1,2],{\"c\":3}],[[1,2],{\"c\":3}]]\n",
+        ),
+        (
+            r"[foreach range(2) as $i (.; .; {x: .a, y: (.b | keys)})]",
+            "[{\"x\":[1,2],\"y\":[\"c\"]},{\"x\":[1,2],\"y\":[\"c\"]}]\n",
+        ),
+        (
+            r"[foreach range(2) as $i (.; .; [$i, (.. | numbers)])]",
+            "[[0,1,2,3],[1,1,2,3]]\n",
+        ),
+    ] {
+        let (stdout, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{filter}");
+    }
+    Ok(())
+}

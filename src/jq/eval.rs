@@ -92439,9 +92439,13 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                                     Demand::Continue => Flow::Exhausted,
                                     Demand::Stop => Flow::Stopped { pending: None },
                                 },
-                                Some(Ok(OwnedStep::Handled(Err(_)))) if optional => Flow::Exhausted,
+                                // Only an allocation failure (#6538), as in `fold_step_each`.
                                 Some(Ok(OwnedStep::Handled(Err(error)))) => {
-                                    Flow::Escaped(Control::Error(error))
+                                    if optional {
+                                        Flow::Exhausted // patchcov: coverage tolerate-line reason="unreachable in practice: a constructor step errs only on an allocation failure (#6538, #6581)"
+                                    } else {
+                                        Flow::Escaped(Control::Error(error)) // patchcov: coverage tolerate-line reason="unreachable in practice: a constructor step errs only on an allocation failure (#6538, #6581)"
+                                    }
                                 }
                                 _ => eval_each_owned::<S>(
                                     ext_expr,
