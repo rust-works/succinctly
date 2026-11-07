@@ -190,6 +190,10 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> RefillSource for MemorySources<S> {
 /// Opens one source when the reader reaches it.
 pub(crate) type Opener = Box<dyn FnOnce() -> std::io::Result<Box<dyn std::io::BufRead>>>;
 
+/// What the reader does once, when it asks for more past the last source (#6485): it says what jq
+/// says of the files at the end of the list that would not open. At most one.
+pub(crate) type Tail = Vec<Box<dyn FnOnce()>>;
+
 /// jq's refills over files and stdin, read a chunk at a time (#5498): what is held is the source
 /// being read, with its buffer, and one `fgets` chunk, 4095 bytes at most, not the input.
 ///
@@ -211,6 +215,7 @@ pub(crate) struct ChunkedSources {
     last: Option<(usize, bool)>,
     closed: bool,
     error: Option<std::io::Error>,
+    tail: Tail,
 }
 
 impl ChunkedSources {
@@ -225,7 +230,14 @@ impl ChunkedSources {
             last: None,
             closed: false,
             error: None,
+            tail: Vec::new(),
         }
+    }
+
+    /// Has `tail` run when the reader asks past the last source (#6485).
+    pub(crate) fn with_tail(mut self, tail: Tail) -> Self {
+        self.tail = tail;
+        self
     }
 
     fn fail(&mut self, error: std::io::Error) {
@@ -359,6 +371,9 @@ impl RefillSource for ChunkedSources {
                 newline,
                 is_last,
             });
+        }
+        for report in self.tail.drain(..) {
+            report();
         }
         if !self.closed {
             self.closed = true;
