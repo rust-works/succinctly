@@ -14120,6 +14120,16 @@ fn closed_expr_shape(expr: &Expr) -> bool {
         | Expr::And(left, right)
         | Expr::Or(left, right)
         | Expr::Alternative(left, right) => closed_expr_shape(left) && closed_expr_shape(right),
+        // #6574: `if C then A else B end`, all three closed (an `elif` is a nested `if`).
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            closed_expr_shape(cond)
+                && closed_expr_shape(then_branch)
+                && closed_expr_shape(else_branch)
+        }
         _ => false,
     }
 }
@@ -14204,6 +14214,32 @@ fn closed_index_expr<S: EvalSemantics>(
         Some(Ok(Some(next))) => Some(next),
         _ => None,
     }
+}
+
+/// [`closed_expr_to_owned_node`]'s `If` arm (#6574): the condition is one closed value, its
+/// truthiness picks a branch, and only that branch is answered, so a branch the condition does not
+/// choose is never read (one that would raise stays unobserved, as in jq). A condition or chosen
+/// branch that raises or yields nothing declines, leaving the evaluator's route and text. The
+/// condition is read for its truthiness alone, so an `escaped` mark it sets is dropped: `escaped`
+/// follows the chosen branch. Its own function, not inline in the arm, for the reason
+/// [`closed_index_expr`] gives.
+#[inline(never)]
+fn closed_if_to_owned<S: EvalSemantics>(
+    cond: &Expr,
+    then_branch: &Expr,
+    else_branch: &Expr,
+    depth: usize,
+    escaped: &mut bool,
+) -> Option<OwnedValue> {
+    let before = *escaped;
+    let chosen = closed_expr_to_owned_at_depth::<S>(cond, depth + 1, escaped)?;
+    *escaped = before;
+    let branch = if chosen.is_truthy() {
+        then_branch
+    } else {
+        else_branch
+    };
+    closed_expr_to_owned_at_depth::<S>(branch, depth + 1, escaped)
 }
 
 /// [`closed_expr_to_owned_node`]'s `Pipe` arm: a closed head, then each later stage answered
@@ -14355,6 +14391,15 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
             } else {
                 closed_expr_to_owned_at_depth::<S>(right, depth + 1, escaped)
             }
+        }
+        // #6574: `if $i % 2 == 0 then 1 else 0 end` with every part closed; see [`closed_if_to_owned`].
+        // jq mode only, like the operators above.
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } if S::TAG == EvalTag::Jq => {
+            closed_if_to_owned::<S>(cond, then_branch, else_branch, depth, escaped)
         }
         // `[$x]` is a *bare* element inside `Expr::Array`: the parser only
         // adds `Expr::Comma` when a `,` is present (#2152).
@@ -126660,6 +126705,9 @@ mod tests {
             "{\"a\":1} | .a",
             "[1,2] | length",
             "[1,2] | first",
+            "if 1 then 2 else 3 end",
+            "if null then 1 else [2] end",
+            "if 1 > 2 then 1 elif 2 > 1 then {\"a\":2} else 3 end",
         ];
         // Which sources each mode answers. jq answers all but `first`; yq's
         // owned grammar has no operators and no `length`/`first` stage, so a
@@ -126680,6 +126728,9 @@ mod tests {
             "false or null",
             "[1,2] | length",
             "[1,2] | first",
+            "if 1 then 2 else 3 end",
+            "if null then 1 else [2] end",
+            "if 1 > 2 then 1 elif 2 > 1 then {\"a\":2} else 3 end",
         ];
         for src in closed {
             let expr = parse(src).unwrap();
@@ -144921,6 +144972,58 @@ mod tests {
             Some(OwnedValue::Array(
                 vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()
             ))
+        );
+    }
+
+    /// #6574: a closed `if` is one value, the chosen branch's; the branch the condition does not
+    /// choose is never read, and a condition or chosen branch that cannot be answered declines.
+    #[test]
+    #[cfg(feature = "std")]
+    fn closed_if_answers_the_chosen_branch_only_6574() {
+        let closed = |src: &str| closed_expr_to_owned::<JqSemantics>(&parse(src).unwrap());
+        assert_eq!(
+            closed("if 4 % 2 == 0 then 1 else 0 end"),
+            Some(OwnedValue::Int(1))
+        );
+        assert_eq!(
+            closed("if 3 % 2 == 0 then 1 else 0 end"),
+            Some(OwnedValue::Int(0))
+        );
+        assert_eq!(
+            closed("if 1 > 5 then 1 elif 1 > 2 then 2 else [3] end"),
+            Some(OwnedValue::array_from(vec![OwnedValue::Int(3)]))
+        );
+        assert_eq!(
+            closed("if null then 1 else {a: 2} end"),
+            Some(OwnedValue::object_from([(
+                "a".to_string(),
+                OwnedValue::Int(2)
+            )]))
+        );
+        // A branch not chosen is never read, so a raise there is not run; the shape gate, which
+        // wants every part closed, still sends the whole step to the evaluator's own route.
+        let unchosen_raise = parse("if true then 1 else error(\"x\") end").unwrap();
+        assert_eq!(
+            closed_expr_to_owned::<JqSemantics>(&unchosen_raise),
+            Some(OwnedValue::Int(1))
+        );
+        assert!(!closed_expr_shape(&unchosen_raise));
+        assert!(closed_expr_shape(
+            &parse("if 1 > 2 then 1 elif 3 > 2 then 2 else 3 end").unwrap()
+        ));
+        // The chosen branch or the condition raises, is empty, or reads the state.
+        assert_eq!(closed("if false then 1 else 1 / 0 end"), None);
+        assert_eq!(closed("if empty then 1 else 2 end"), None);
+        assert_eq!(closed("if . then 1 else 2 end"), None);
+        assert_eq!(closed("if true then . else 2 end"), None);
+        assert_eq!(closed("if false then 1 end"), None);
+        // `if C then A end` has `.` for its else; chosen, `A` is closed, but the shape gate declines.
+        assert_eq!(closed("if true then 1 end"), Some(OwnedValue::Int(1)));
+        assert!(!closed_expr_shape(&parse("if true then 1 end").unwrap()));
+        // yq's `if` is its own, so the arm answers in jq mode only.
+        assert_eq!(
+            closed_expr_to_owned::<YqSemantics>(&parse("if true then 1 else 2 end").unwrap()),
+            None
         );
     }
 
