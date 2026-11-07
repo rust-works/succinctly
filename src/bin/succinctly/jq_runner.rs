@@ -6586,17 +6586,14 @@ fn last_item_at(
         };
         match item {
             jq::ProducedInput::Document(value, source, line) => {
-                let (source, line) = match document_end {
-                    Some(end) if is_last(&mut ahead) => end,
-                    _ => (source, line),
-                };
+                let (source, line) = document_end
+                    .filter(|_| is_last(&mut ahead))
+                    .unwrap_or((source, line));
                 jq::ProducedInput::Document(value, source, line)
             }
+            // A text whose first fault is at its end holds no other, so a placed fault is the last.
             jq::ProducedInput::Error(error, at) => {
-                let at = match fault_end {
-                    Some(end) if is_last(&mut ahead) => end,
-                    _ => at,
-                };
+                let at = fault_end.filter(|_| is_last(&mut ahead)).unwrap_or(at);
                 jq::ProducedInput::Error(error, at)
             }
             end => end,
