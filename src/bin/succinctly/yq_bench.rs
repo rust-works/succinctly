@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::bench_reps::{ensure_success, interleaved_reps};
+
 use crate::yaml_generators;
 
 /// Every generated suite pattern, alphabetically.
@@ -129,6 +131,11 @@ pub struct BenchConfig {
     pub sizes: Vec<String>,
     pub queries: Vec<QueryType>,
     pub succinctly_binary: PathBuf,
+    /// The yq to compare against (a bare name is looked up on `PATH`).
+    pub yq_binary: PathBuf,
+    /// Whether `yq_binary` was asked for by name (`--yq`): a yq that will not run is then an
+    /// error, not the succinctly-only run an absent default `yq` gets.
+    pub yq_required: bool,
     pub warmup_runs: usize,
     pub benchmark_runs: usize,
     /// Include memory comparison in output (default: true)
@@ -150,6 +157,8 @@ impl Default for BenchConfig {
             ],
             queries: QueryType::all().to_vec(),
             succinctly_binary: PathBuf::from("./target/release/succinctly"),
+            yq_binary: PathBuf::from("yq"),
+            yq_required: false,
             warmup_runs: 1,
             benchmark_runs: 3,
             memory_mode: true,
@@ -165,8 +174,16 @@ pub fn run_benchmark(
 ) -> Result<Vec<BenchmarkResult>> {
     let mut results = Vec::new();
 
-    // Check if system yq is available
-    let has_yq = check_yq_available();
+    // Check if yq is available, and record which one the tables are measured against
+    let yq_version = check_yq_available(&config.yq_binary);
+    if yq_version.is_none() && config.yq_required {
+        anyhow::bail!(
+            "yq not found at `{}`. Pass --yq <path> to a yq that runs, or drop --yq to benchmark \
+             succinctly alone",
+            config.yq_binary.display()
+        );
+    }
+    let has_yq = yq_version.is_some();
 
     // Check that succinctly binary exists
     if !config.succinctly_binary.exists() {
@@ -183,11 +200,10 @@ pub fn run_benchmark(
     eprintln!("Running yq benchmark suite...");
     eprintln!("  Data directory: {}", config.data_dir.display());
     eprintln!(
-        "  System yq: {}",
-        if has_yq {
-            "available"
-        } else {
-            "not found (succinctly-only benchmarks)"
+        "  yq: {}",
+        match &yq_version {
+            Some(version) => format!("{} ({version})", config.yq_binary.display()),
+            None => "not found (succinctly-only benchmarks)".to_string(),
         }
     );
     eprintln!(
@@ -306,7 +322,12 @@ pub fn run_benchmark(
 
     // Generate markdown output (even if interrupted)
     if let Some(md_path) = output_md {
-        let markdown = generate_markdown(&results, has_yq, config.memory_mode);
+        let header = yq_header(
+            &config.yq_binary,
+            yq_version.as_deref(),
+            config.benchmark_runs,
+        );
+        let markdown = generate_markdown(&results, has_yq, config.memory_mode, &header);
         std::fs::write(md_path, markdown)?;
     }
 
@@ -368,20 +389,26 @@ fn benchmark_file(
     let filesize = std::fs::metadata(file_path)?.len();
     let query = query_type.query();
 
-    // Warmup runs
-    for _ in 0..config.warmup_runs {
-        if has_yq {
-            let _ = run_yq(file_path, query);
+    // Each repetition, warmups included, runs both tools and alternates which goes first, so
+    // neither always runs second (benchmarking.md rule 1, #6417). Without a yq only succinctly
+    // is timed.
+    let (yq_results, succ_results) = if has_yq {
+        interleaved_reps(
+            config.warmup_runs,
+            config.benchmark_runs,
+            || run_yq(file_path, &config.yq_binary, query),
+            || run_succinctly(file_path, &config.succinctly_binary, query),
+        )?
+    } else {
+        for _ in 0..config.warmup_runs {
+            let _ = run_succinctly(file_path, &config.succinctly_binary, query);
         }
-        let _ = run_succinctly(file_path, &config.succinctly_binary, query);
-    }
-
-    // Benchmark runs for yq (if available)
+        let succ = (0..config.benchmark_runs)
+            .map(|_| run_succinctly(file_path, &config.succinctly_binary, query))
+            .collect::<Result<Vec<_>>>()?;
+        (Vec::new(), succ)
+    };
     let yq_result = if has_yq {
-        let mut yq_results = Vec::new();
-        for _ in 0..config.benchmark_runs {
-            yq_results.push(run_yq(file_path, query)?);
-        }
         select_median(yq_results)
     } else {
         // Placeholder for when yq is not available
@@ -394,12 +421,6 @@ fn benchmark_file(
             sys_time_ms: 0.0,
         }
     };
-
-    // Benchmark runs for succinctly
-    let mut succ_results = Vec::new();
-    for _ in 0..config.benchmark_runs {
-        succ_results.push(run_succinctly(file_path, &config.succinctly_binary, query)?);
-    }
 
     // Take median of wall time
     let succ_result = select_median(succ_results);
@@ -435,11 +456,14 @@ fn select_median(mut results: Vec<ToolResult>) -> ToolResult {
     results.remove(results.len() / 2)
 }
 
-/// Run system yq and measure (outputs JSON for comparison)
-fn run_yq(file_path: &Path, query: &str) -> Result<ToolResult> {
+/// Run the configured yq and measure (outputs JSON for comparison)
+fn run_yq(file_path: &Path, yq_binary: &Path, query: &str) -> Result<ToolResult> {
+    let yq = yq_binary
+        .to_str()
+        .with_context(|| format!("--yq path is not UTF-8: {}", yq_binary.display()))?;
     // Use -o json -I 0 for compact JSON output (matches succinctly's default)
     run_command_with_timing(
-        "yq",
+        yq,
         &["-o", "json", "-I", "0", query, file_path.to_str().unwrap()],
     )
 }
@@ -476,6 +500,11 @@ fn run_command_with_timing(program: &str, args: &[&str]) -> Result<ToolResult> {
             .args(args)
             .output()
             .with_context(|| format!("Failed to run {program}"))?;
+        ensure_success(
+            program,
+            output.status,
+            &String::from_utf8_lossy(&output.stderr),
+        )?;
         (output.stdout, 0, 0.0, 0.0)
     };
 
@@ -508,6 +537,8 @@ fn run_with_time_macos(program: &str, args: &[&str]) -> Result<(Vec<u8>, u64, f6
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 
+    ensure_success(program, output.status, &stderr)?;
+
     // Parse macOS time output
     let peak_memory = parse_macos_memory(&stderr);
     let (user_time, sys_time) = parse_macos_times(&stderr);
@@ -528,6 +559,8 @@ fn run_with_time_linux(program: &str, args: &[&str]) -> Result<(Vec<u8>, u64, f6
         .with_context(|| "Failed to run /usr/bin/time")?;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+
+    ensure_success(program, output.status, &stderr)?;
 
     // Parse Linux time output
     let peak_memory = parse_linux_memory(&stderr);
@@ -611,14 +644,29 @@ fn parse_linux_times(stderr: &str) -> (f64, f64) {
     (user, sys)
 }
 
-/// Check if yq is available
-fn check_yq_available() -> bool {
-    Command::new("yq")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+/// The `--version` line of `yq_binary`, or `None` when it does not run
+fn check_yq_available(yq_binary: &Path) -> Option<String> {
+    let output = Command::new(yq_binary).arg("--version").output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The markdown header lines naming the yq the tables were measured against (or its absence)
+/// and the method.
+fn yq_header(yq_binary: &Path, yq_version: Option<&str>, runs: usize) -> String {
+    match yq_version {
+        Some(version) => format!(
+            "**yq version**: {version} (`{}`)\n**Method**: the two tools interleaved within each \
+             repetition, order alternating; median wall time of {runs} run(s).\n",
+            yq_binary.display()
+        ),
+        None => format!(
+            "**yq**: Not installed (succinctly-only benchmarks)\n**Method**: median wall time \
+             of {runs} run(s).\n"
+        ),
+    }
 }
 
 /// Get CPU information for the current system
@@ -651,33 +699,23 @@ fn get_cpu_info() -> String {
     "Unknown CPU".to_string()
 }
 
-/// Get yq version string
-fn get_yq_version() -> String {
-    Command::new("yq")
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map_or_else(|| "Unknown".to_string(), |s| s.trim().to_string())
-}
-
 /// Generate markdown tables from results
-pub fn generate_markdown(results: &[BenchmarkResult], has_yq: bool, memory_mode: bool) -> String {
+pub fn generate_markdown(
+    results: &[BenchmarkResult],
+    has_yq: bool,
+    memory_mode: bool,
+    header: &str,
+) -> String {
     let mut md = String::new();
 
     md.push_str("# yq vs succinctly Benchmark Results\n\n");
-    md.push_str("Generated by `succinctly bench run yq_bench`\n\n");
+    md.push_str("Generated by `succinctly dev bench yq` (which `bench run yq_bench` runs)\n\n");
 
     // Add CPU info
     let cpu_info = get_cpu_info();
     md.push_str(&format!("**CPU**: {cpu_info}\n"));
 
-    if has_yq {
-        let yq_version = get_yq_version();
-        md.push_str(&format!("**yq version**: {yq_version}\n"));
-    } else {
-        md.push_str("**yq**: Not installed (succinctly-only benchmarks)\n");
-    }
+    md.push_str(header);
     md.push('\n');
 
     // Collect unique queries from results
@@ -1004,5 +1042,115 @@ mod tests {
     fn test_format_memory_fixed() {
         assert_eq!(format_memory_fixed(1024 * 1024 * 100), " 100 MB");
         assert_eq!(format_memory_fixed(1024 * 500), " 500 KB");
+    }
+    #[test]
+    fn the_markdown_names_the_yq_and_the_method() {
+        let header = yq_header(Path::new("/opt/homebrew/bin/yq"), Some("yq v4.53.3"), 5);
+        assert_eq!(
+            header,
+            "**yq version**: yq v4.53.3 (`/opt/homebrew/bin/yq`)\n**Method**: the two tools \
+             interleaved within each repetition, order alternating; median wall time of 5 run(s).\n"
+        );
+        let md = generate_markdown(&[], true, false, &header);
+        assert!(md.contains(&header), "{md}");
+        let absent = yq_header(Path::new("yq"), None, 3);
+        assert!(absent.starts_with("**yq**: Not installed (succinctly-only benchmarks)\n"));
+        assert!(absent.contains("median wall time of 3 run(s)"), "{absent}");
+    }
+
+    #[test]
+    fn a_yq_that_does_not_run_is_not_available() {
+        assert_eq!(
+            check_yq_available(Path::new("/nonexistent/yq-for-test")),
+            None
+        );
+        #[cfg(unix)]
+        assert_eq!(check_yq_available(Path::new("false")), None);
+    }
+
+    #[test]
+    fn a_yq_asked_for_by_name_that_will_not_run_is_an_error() {
+        let config = BenchConfig {
+            yq_binary: PathBuf::from("/nonexistent/yq-for-test"),
+            yq_required: true,
+            ..BenchConfig::default()
+        };
+        let err = run_benchmark(&config, None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("yq not found at `/nonexistent/yq-for-test`") && msg.contains("--yq"),
+            "{msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_that_exits_non_zero_fails_the_row() {
+        let err = run_command_with_timing("sh", &["-c", "echo boom >&2; exit 3"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`sh` exited with") && msg.contains("boom"),
+            "{msg}"
+        );
+        assert!(run_command_with_timing("true", &[]).is_ok());
+    }
+
+    /// Two stub tools that log their name when run: `benchmark_file` runs both in every
+    /// repetition, warmups included, and the order alternates (#6417).
+    #[cfg(unix)]
+    fn stub_tool(dir: &Path, name: &str, log: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho {name} >> {}\necho '{{}}'\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_file_interleaves_the_tools_and_alternates_the_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let data = dir.path().join("data.yaml");
+        std::fs::write(&data, "a: 1\n").unwrap();
+        let config = BenchConfig {
+            succinctly_binary: stub_tool(dir.path(), "succ", &log),
+            yq_binary: stub_tool(dir.path(), "yq", &log),
+            warmup_runs: 1,
+            benchmark_runs: 2,
+            ..BenchConfig::default()
+        };
+        let result = benchmark_file(&data, &config, true, QueryType::Identity).unwrap();
+        let ran: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        // The warmup is rep 0 and the order carries on across it: yq, succ, then succ, yq, ...
+        assert_eq!(ran, ["yq", "succ", "succ", "yq", "yq", "succ"]);
+        assert_eq!(result.status, "match");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_a_yq_only_succinctly_is_timed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let data = dir.path().join("data.yaml");
+        std::fs::write(&data, "a: 1\n").unwrap();
+        let config = BenchConfig {
+            succinctly_binary: stub_tool(dir.path(), "succ", &log),
+            warmup_runs: 1,
+            benchmark_runs: 2,
+            ..BenchConfig::default()
+        };
+        let result = benchmark_file(&data, &config, false, QueryType::Identity).unwrap();
+        let ran = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(ran.lines().collect::<Vec<_>>(), ["succ", "succ", "succ"]);
+        assert_eq!(result.status, "succinctly-only");
     }
 }

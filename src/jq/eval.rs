@@ -33069,7 +33069,7 @@ fn build_regex_uncached<S: EvalSemantics>(
         }
     }
     if S::TAG != EvalTag::Yq && !longest {
-        if let Some(rewritten) = super::onig_loop::rewrite(&pattern) {
+        if let Some(rewritten) = super::onig_loop::rewrite_for(&pattern, suppress_empty) {
             let before = core::mem::replace(&mut pattern, rewritten);
             as_written.get_or_insert(before);
         }
@@ -33180,7 +33180,9 @@ fn build_regex_uncached<S: EvalSemantics>(
             // cannot): it leaves that loop where Oniguruma does. It writes no group, so the
             // copies stay as counted; a result the crate refuses keeps the capture rewrite alone.
             if !longest {
-                if let Some(ordered) = super::onig_loop::rewrite(&groups.pattern) {
+                if let Some(ordered) =
+                    super::onig_loop::rewrite_for(&groups.pattern, suppress_empty)
+                {
                     // #6426: a pattern with a lookaround or an atomic group is checked on the
                     // engine that runs it.
                     let compiles = if is_fancy_syntax(&ordered) {
@@ -33203,7 +33205,14 @@ fn build_regex_uncached<S: EvalSemantics>(
     // the crate refuses keeps what there was.
     let mut fancy_copies_refused = false;
     let grouped = (S::TAG != EvalTag::Yq && !longest)
-        .then(|| group_copies_engine::<S>(&pattern, capture.as_ref(), &mut fancy_copies_refused))
+        .then(|| {
+            group_copies_engine::<S>(
+                &pattern,
+                capture.as_ref(),
+                &mut fancy_copies_refused,
+                suppress_empty,
+            )
+        })
         .flatten();
     let rewritten = grouped.or_else(|| {
         capture.and_then(|groups| {
@@ -33684,12 +33693,13 @@ fn group_copies_engine<S: EvalSemantics>(
     pattern: &str,
     base: Option<&super::onig_capture_loop::LoopRewrite>,
     fancy_refused: &mut bool,
+    not_empty: bool,
 ) -> Option<RegexEngine> {
     let source = base.map_or(pattern, |groups| groups.pattern.as_str());
     // Switches the copy rewrite refuses leave it unknown whether copies are needed, so the fancy
     // route takes the capture rewrite alone only where they are not refused.
     *fancy_refused = super::onig_loop::leading_switches_refuse(source);
-    let copied = super::onig_loop::rewrite_with_groups(source)?;
+    let copied = super::onig_loop::rewrite_with_groups_for(source, not_empty)?;
     // #6426: a lookaround or an atomic group beside the loop is syntax only `fancy-regex` reads, and
     // the rewrite keeps it as written: it runs there, with the same groups. `fancy_refused` says
     // that the copies were needed and the engine could not take them.
@@ -33709,8 +33719,9 @@ fn group_copies_engine<S: EvalSemantics>(
     let (copied, re) = match std_regex(&copied.pattern) {
         Ok(re) => (copied, re),
         Err(_) => [1, 2].iter().find_map(|&reading| {
-            let copied =
-                super::onig_loop::rewrite_with_groups_past_the_size_limit(source, reading)?;
+            let copied = super::onig_loop::rewrite_with_groups_past_the_size_limit(
+                source, reading, not_empty,
+            )?;
             let re = std_regex(&copied.pattern).ok()?;
             Some((copied, re))
         })?,
@@ -100393,6 +100404,40 @@ mod remaining_inputs {
         // `--seq`, which does not yet raise jq's truncated-number error on a
         // last record) would count a read jq spends on an error (#4303).
         static COUNT_PAST_END: Cell<bool> = const { Cell::new(false) };
+        // What the CLI wants told when a read reaches a source, or the end of the stream
+        // (#6475): see `set_read_hook`.
+        static ON_READ: RefCell<Option<ReadHook>> = const { RefCell::new(None) };
+    }
+
+    /// What is called when a read reaches a source, or the end of the stream.
+    pub type ReadHook = Box<dyn FnMut(Option<u32>)>;
+
+    /// Registers `hook` for every read of the queue (#6475).
+    ///
+    /// It is called once the read knows where it reads from: with the source tag of the document,
+    /// or parse error, it returns, and with `None` when it finds the stream at its end. The read
+    /// has moved the marker by then and has not returned yet, so what the hook prints comes before
+    /// what the read hands back.
+    ///
+    /// jq's reader opens a file when it has read the one before and asks for more, and says so
+    /// then if it cannot (`jq_util_input_read_more`): a program that stops reading earlier never
+    /// meets the failure. A seed clears it, so it is set after the seed.
+    pub fn set_read_hook(hook: ReadHook) {
+        ON_READ.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+
+    /// Tells the hook a read reached `source`, or the end of the stream. The hook is out of its
+    /// slot while it runs, so one that reads the queue finds no borrow held.
+    fn reached(source: Option<u32>) {
+        if let Some(mut hook) = ON_READ.with(|slot| slot.borrow_mut().take()) {
+            hook(source);
+            ON_READ.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(hook);
+                }
+            });
+        }
     }
 
     /// One read from the input stream.
@@ -100437,6 +100482,7 @@ mod remaining_inputs {
         EXHAUSTED.with(|e| e.set(exhausted));
         PAST_END.with(|p| p.set(false));
         COUNT_PAST_END.with(|c| c.set(false));
+        ON_READ.with(|slot| *slot.borrow_mut() = None);
     }
 
     /// [`seed`] for a stream whose items `producer` hands over one at a time, when they are read
@@ -100454,6 +100500,7 @@ mod remaining_inputs {
         EXHAUSTED.with(|e| e.set(None));
         PAST_END.with(|p| p.set(false));
         COUNT_PAST_END.with(|c| c.set(false));
+        ON_READ.with(|slot| *slot.borrow_mut() = None);
     }
 
     /// Counts the reads past the end from here on: see `COUNT_PAST_END`.
@@ -100514,6 +100561,7 @@ mod remaining_inputs {
             // input catch 0)` on `1\n2 }\n\n\n`.
             LAST_LINE.with(|l| l.set(at.1));
             CURRENT.with(|c| c.set(Some(at)));
+            reached(Some(at.0));
             return Pop::ParseError(error);
         }
         // Out of its slot while the producer runs, so a producer that reads the queue itself
@@ -100534,6 +100582,7 @@ mod remaining_inputs {
             PRODUCER.with(|p| *p.borrow_mut() = Some(producer));
             LAST_LINE.with(|l| l.set(line));
             CURRENT.with(|c| c.set(Some((src, line))));
+            reached(Some(src));
             return pop;
         }
         let popped = QUEUE.with(|q| q.borrow_mut().pop_front());
@@ -100541,6 +100590,7 @@ mod remaining_inputs {
             POPPED.with(|p| p.set(popped_so_far + 1));
             LAST_LINE.with(|l| l.set(line));
             CURRENT.with(|c| c.set(Some((src, line))));
+            reached(Some(src));
             return Pop::Document(doc);
         }
         // Unreachable by the seed's own invariant (every error comes before
@@ -100551,6 +100601,7 @@ mod remaining_inputs {
             // input catch 0)` on `1\n2 }\n\n\n`.
             LAST_LINE.with(|l| l.set(at.1));
             CURRENT.with(|c| c.set(Some(at)));
+            reached(Some(at.0));
             return Pop::ParseError(error);
         }
         pop_past_end()
@@ -100559,6 +100610,7 @@ mod remaining_inputs {
     /// A read that finds nothing left: the marker settles at `EXHAUSTED`, and the reads after
     /// the first are counted as `pop_input` describes.
     fn pop_past_end() -> Pop {
+        reached(None);
         if !COUNT_PAST_END.with(Cell::get) {
             CURRENT.with(|c| c.set(EXHAUSTED.with(Cell::get)));
             return Pop::Exhausted;
@@ -100948,6 +101000,15 @@ pub use remaining_inputs::Pop as InputPop;
 #[cfg(feature = "std")]
 pub fn pop_input() -> InputPop {
     remaining_inputs::pop_input()
+}
+
+/// Registers a hook that every read of the `input`/`inputs` queue calls (#6475).
+///
+/// It is told the source tag the read reached, or `None` when the read finds the stream at its end,
+/// before the read returns. A seed clears it, so a driver sets it after seeding.
+#[cfg(feature = "std")]
+pub fn set_input_read_hook(hook: impl FnMut(Option<u32>) + 'static) {
+    remaining_inputs::set_read_hook(Box::new(hook));
 }
 
 /// Pops the next queued input document (#723).
@@ -139714,14 +139775,15 @@ mod tests {
         for n in [12_000, 20_000, 33_000, 55_000] {
             let pattern = format!("(?:(a)|b*|c)+(?:(d*)|x){{1,{n}}}?");
             let written = super::super::onig_loop::rewrite_with_groups(&pattern).unwrap();
-            let again =
-                super::super::onig_loop::rewrite_with_groups_past_the_size_limit(&pattern, 2);
+            let again = super::super::onig_loop::rewrite_with_groups_past_the_size_limit(
+                &pattern, 2, false,
+            );
             let again = again.unwrap();
             assert!(again.pattern.contains(&format!("{{1,{n}}}?")), "{pattern}");
             let refused = std_regex(&written.pattern).is_err();
             let kept = std_regex(&again.pattern).is_ok();
             assert_eq!(
-                group_copies_engine::<JqSemantics>(&pattern, None, &mut false).is_some(),
+                group_copies_engine::<JqSemantics>(&pattern, None, &mut false, false).is_some(),
                 !refused || kept
             );
         }

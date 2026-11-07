@@ -7903,7 +7903,16 @@ These keep their loop as written, and still match longer than jq where the shape
   Where the way-by-way form is not written, a body with a dropped last exit keeps the form of #6424, and a lazy loop with a group inside another repeat keeps its text, which reads the group as jq does: `" a" | [match("((?:(\\B|.|\\b\\b){2,}?)*)\\z";"g") | .captures[1].string]` is `["",""]`.
   Over three draws of 1,500 loops with anchors (`--assert`, seeds 3, 4 and 5) the patterns that differ fall from 91 to 55, and none changed the other way; seeds 6 and 7 and the flag `gx` broke none either.
   Over 3,744 generated loops (two anchors, four middle ways, two prefixes, thirteen quantifiers, six strings) 433 patterns that differed agree and none changed the other way.
-  The flag `gi` and `--assert --newlines` broke none either; under `(?m)` `^` and `$` hold at every line, so such a way keeps its text and differs: `"a\nb" | [match("(?m)($|a|\\n|b)*";"g") | .string]` is `["a","","b",""]` in jq and `["a\nb",""]` here.
+  The flag `gi` and `--assert --newlines` broke none either.
+  Under `(?m)` `^` and `$` hold at every line, and since [#6425](https://github.com/rust-works/succinctly/issues/6425) they are written as line anchors when `(?m)` is switched on at the start of the pattern and no flag group names `m` or `x` again.
+  A `$` holds before every newline, so the ways after it split by how each starts: one that starts with a newline runs only where `$` holds and any other only where it does not.
+  That tells the two kinds of head apart without a complement of the anchor, and the loop is the ways of the second kind, greedy, then those of the first, lazy, each leaving through the exit: `"a\nb" | [match("(?m)($|a|\\n|b)*";"g") | .string]` is `["a","","b",""]`, as in jq (it was `["a\nb",""]`).
+  A `^` holds again after a newline that a way ends with, so only a body no way of which can end with one is written, as `\A` is.
+  What keeps its text, and differs, is a `$` with a way after it that may start with a newline or not (`\s`, `[^b]`, `\W`; `.` too, since the flag that lets it match one is not tracked) or that the parser cannot read, a `^` beside a way that can end with a newline (`"a\nb" | [match("(?m)(^|a|\\n|b)*";"g") | .string]` is `["","\n","",""]` in jq and `["","\nb",""]` here), a `(?m)` that something switches, and a search told to find no empty match (the `n` flag).
+  No closed form is known for those: the `regex` crate has no complement of a line anchor and no lookahead to build one, and a way that starts either way cannot be split by its first character in general.
+  Over draws of 3,000 loops under `(?m)` (`--assert --newlines --multiline`, seeds 2, 3 and 4) the patterns that differ fall from 273, 260 and 255 to 235, 229 and 219, and two in all changed the other way (`(?m)((?<n>a)\w|(?<n>a)|^^)+` and, under `gi`, `(?m)x?(\A|\n|^)*`), each on a subject that ends with a newline, where it was right because of the end-of-text `^` below.
+  Most of those left differ in the bare `^` as well: `(?m)^` holds at the end of a text that ends with a newline, where Oniguruma's does not ([#6456](https://github.com/rust-works/succinctly/issues/6456)).
+  Of the 235 left in seed 2, 189 agree with jq on every subject that does not end with a newline.
   An assertion in a way that also consumes text is not this case: `\Ba`, `a\z` and `^a` always consume when they match.
   They are copied with the other ways, and `"ba" | [match("(?:b*|\\Ba)+") | .string]` is `["b","",""]`, as in jq ([#6300](https://github.com/rust-works/succinctly/issues/6300)).
 - **A body with a flag switch** (`(?i)` inside it) is rewritten with the switch scoped over what it reaches, as `(?i:..)` around the items after it and around every later way ([#6301](https://github.com/rust-works/succinctly/issues/6301)): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and here.
@@ -14067,8 +14076,11 @@ Past a missing file jq therefore prints the first value of the next file that ha
 It reports a missing file when it reaches it, after the values before it, so the stderr lines of a run keep jq's order.
 Two residuals remain, both with a missing file *and* a feature that routes input differently:
 
-* `--seq`, `--stream-errors`, `-s`, `--input-dsv` and a filter that uses `input`/`inputs` read every file that opens and report every missing one up front.
-  jq stops after one more line, record or event past a missing file, and reaches a missing file only when the reader gets to it (`jq -n -c input data.json missing` never opens `missing`).
+* `--seq`, `--stream-errors`, `-s` and `--input-dsv` read every file that opens and report every missing one up front.
+  jq stops after one more line, record or event past a missing file, and reaches a missing file only when the reader gets to it.
+  A filter that uses `input`/`inputs` under `-n` reports a missing file when a read reaches it, since [#6475](https://github.com/rust-works/succinctly/issues/6475): `jq -n -c input data.json missing` prints the first value and exits 0, as in jq, because the reader never asks for the file after it.
+  A read that finds the stream at its end reports every one it has not reached, and a failure fails the run when it is reported.
+  Two cases still report a missing file up front: the chunked `--stream` walk, and a file whose last value is a bare number or literal with no newline after it, which completes only at the end of its file and so sends jq's reader on to the next one (`jq -n input one.json missing`, `one.json` holding `1`).
   A plain `--stream` walk stops as jq does, after the one event past a missing file (`jq -c --stream . missing a.json` over `[3]` prints `[[0],3]` and not the closing `[[0]]`, #6006); it still reports the missing file up front.
   The output of `-R` and `-s` over files that all exist is unchanged; only the run that has a missing file differs.
 * `-R` stops as jq does, after the one line past a missing file (`jq -R . missing lines.txt` prints the first line only, #6464), but still reports a second missing file that jq never reaches up front.

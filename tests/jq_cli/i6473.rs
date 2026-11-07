@@ -94,6 +94,17 @@ fn a_loop_the_listing_declines_keeps_what_it_had_6473() -> Result<()> {
             " \n",
             "[[0,\"\",[]],[1,\"\",[]],[2,\"\",[]]]\n",
         ),
+        // under `(?m)`, `^` and `$` are line anchors (#6425), which no exit here says.
+        (
+            r"(?m)(?:^\b|\w|\B$)+",
+            "a\nb",
+            "[[0,\"\",[]],[2,\"\",[]]]\n",
+        ),
+        (
+            r"(?m)(?:^\b|\w|\B$)+",
+            "ab\n\nc",
+            "[[0,\"\",[]],[1,\"b\",[]],[3,\"\",[]],[4,\"\",[]]]\n",
+        ),
     ] {
         assert_eq!(
             matches(pattern, subject)?,
