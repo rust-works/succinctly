@@ -99,3 +99,23 @@ fn a_long_running_max_answers_6569() -> Result<()> {
     assert_eq!((stdout.as_str(), code), ("999\n", 0));
     Ok(())
 }
+
+/// `while` hands its step the state it has just emitted, a second reference; the chosen branch
+/// answers all the same. The answers are jq 1.7.1's.
+#[test]
+fn while_if_steps_answer_as_jq_6569() -> Result<()> {
+    for (filter, want) in [
+        (
+            r"[0 | while(. < 6; if . == 1 then 3 elif . == 4 then 5 else . + 1 end)]",
+            "[0,1,3,4,5]\n",
+        ),
+        (
+            r"[1 | while(. < 100; if . > 10 then 100 else . * 3 end)]",
+            "[1,3,9,27]\n",
+        ),
+    ] {
+        let (stdout, _, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{filter}");
+    }
+    Ok(())
+}

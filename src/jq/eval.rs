@@ -88443,6 +88443,11 @@ fn fold_step_each<S: EvalSemantics>(
 /// ([`owned_assign_pipe_step`], jq mode, not under the table), so a field one stage extends is not
 /// copied by the next.
 ///
+/// [`owned_if_step`] (#6569) answers a branch that is `.` or closed even while the table below is
+/// live: `.` is the state unchanged, and a closed value comes from [`closed_expr_to_owned`], which
+/// declines a container carrying an `as` binding's marker (#4005), so no registered container
+/// reaches the accumulator that way.
+///
 /// While the #2889 embed table is live (the loop runs inside an `as` binding
 /// that holds a document node) only the assignment half of the step runs -- not
 /// the slice cut of [`try_eval_owned_step`] either (#5274), whose result shares the
@@ -89093,10 +89098,14 @@ fn owned_if_step<S: EvalSemantics>(
     // #6569: a branch that is `.` answers the state itself, and a closed one its own value, as the
     // evaluator's route would. [`owned_update_step`] has no arm for either (a bare `.` or literal
     // UPDATE never reaches it), so the whole `if` used to decline and run on that route every step:
-    // a running max, `if $x > . then $x else . end`, was 0.40x of jq 1.7.1. The closed check runs
-    // only once the step has declined, so a computing branch (`. + 1`) pays nothing for it.
-    if matches!(unwrap_paren(branch), Expr::Identity) {
-        return Ok(OwnedStep::Handled(Ok(state)));
+    // a running max, `if $x > . then $x else . end`, was 0.43x of jq 1.7.1. A literal (the loop
+    // variable spliced in, the running max's `$x`) is answered at once, being no step; any other
+    // closed branch only once the step has declined, so a computing branch (`. + 1`) pays nothing
+    // for the check.
+    match unwrap_paren(branch) {
+        Expr::Identity => return Ok(OwnedStep::Handled(Ok(state))),
+        Expr::Literal(lit) => return Ok(OwnedStep::Handled(Ok(literal_to_owned(lit)))),
+        _ => {}
     }
     Ok(match owned_update_step::<S>(branch, state) {
         OwnedStep::Declined(state) => match closed_expr_to_owned::<S>(branch) {
@@ -115460,7 +115469,6 @@ mod tests {
             "if true then (1, 2) else . end",
             "if true then debug else . end",
             "if true then input else . end",
-            "if true then $__loc__ else . end",
         ] {
             let OwnedStep::Declined(back) = step(src, state()) else {
                 panic!("handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step answered an `if` the test lists as declined (#6569)"
