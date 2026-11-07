@@ -128291,15 +128291,33 @@ mod tests {
             "1 + 2 == 3",
             "10 % 3 == 1",
         ];
+        fn holds_nan(value: &OwnedValue) -> bool {
+            match value {
+                OwnedValue::Array(items) => items.iter().any(holds_nan),
+                OwnedValue::Object(map) => map.values().any(holds_nan),
+                other => other.as_f64().is_some_and(f64::is_nan),
+            }
+        }
         let values = pure_value_matrix();
         let mut answered = 0;
         for src in shapes {
             let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
             for value in &values {
+                // `. + null == .` hands its operand's own storage back, so jq's instance rule
+                // answers identity for a container holding a NaN, as this route does. Without
+                // `std` the bridge has no thread-local to register its input in and rebuilds
+                // the value, so that one pairing is exempt there (#3069).
+                let instance_rule = !cfg!(feature = "std")
+                    && matches!(src, ". + null == ." | "null + . == .")
+                    && matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+                    && holds_nan(value);
                 let bridge = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
                     &expr, value, false,
                 ));
                 for door in [false, true] {
+                    if instance_rule {
+                        continue;
+                    }
                     if let Some(fast) =
                         eval_owned_pure_in::<JqSemantics>(&expr, value, ResultPosition::Fresh, door)
                     {
