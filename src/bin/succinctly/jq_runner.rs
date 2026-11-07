@@ -8953,10 +8953,11 @@ fn defer_open_failures(failures: Vec<(usize, InputFileOpenError)>, fault_ends_te
 }
 
 /// Whether `--seq`'s own reader reads the text the files `raws` make without a fault (#6555): no
-/// diagnostic, none deferred and no position lost, so each value is read where a JSON stream's
-/// is and nothing else comes out of the input queue. That holds for `--stream` and
-/// `--stream-errors` too, whose events of a clean record stream are placed as their values'. A slurp
-/// reads every file before the program runs, so this is asked only of a run without `-s`.
+/// diagnostic and none deferred, the message-less end of #2998 included, so each value is read
+/// where a JSON stream's is and nothing else comes out of the input queue. That holds for
+/// `--stream` and `--stream-errors` too, whose events of a clean record stream are placed as their
+/// values'. A slurp reads every file before the program runs, so this is asked only of a run
+/// without `-s`.
 fn seq_text_reads_clean(raws: &[Vec<u8>]) -> bool {
     let sources: Vec<(Option<usize>, Vec<u8>)> = raws
         .iter()
@@ -8964,10 +8965,12 @@ fn seq_text_reads_clean(raws: &[Vec<u8>]) -> bool {
         .map(|(at, raw)| (Some(at), raw.clone()))
         .collect();
     let mut warned = false;
-    let walk = crate::jq_seq_reader::walk_stream_values(&sources, false, &mut |_| {
+    // Collecting the faults, as the queue's own walk does: without it, a final buffer that starts on
+    // an RS (#2998) ends the stream with no word, which the queue raises as `break` (#5662).
+    let walk = crate::jq_seq_reader::walk_stream_collecting(&sources, false, true, &mut |_| {
         warned = true;
     });
-    !warned && walk.deferred_warning.is_none() && !walk.slurp_position_lost
+    !warned && walk.faults.is_empty() && walk.deferred_warning.is_none()
 }
 
 /// The open failures jq's reader reaches before its parser stops (#6485): it opens the files in

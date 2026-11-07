@@ -17,6 +17,7 @@ fn a_clean_seq_stream_reports_an_unopened_file_when_a_read_reaches_it_6555() -> 
         ("rec.json", "\u{1e}[3]\n"),
         ("empty.json", ""),
         ("bad.json", "\u{1e}[1,\n\u{1e}2\n"),
+        ("rsend.json", "\u{1e}[1]\n\u{1e}"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
@@ -40,6 +41,9 @@ fn a_clean_seq_stream_reports_an_unopened_file_when_a_read_reaches_it_6555() -> 
         (&["-R", "--seq", "-c", "[., input]"][..], &["gone", "seq", "gone2"][..], "\u{1e}[\"\\u001e1\",\"\\u001e2\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         // A stream its reader faults on keeps its up-front report, which jq agrees with here.
         (&["--seq", "-c", "[., input]"][..], &["bad", "gone", "gone2"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Could not open file @DIR@/gone2.json: No such file or directory\njq: error (at @DIR@/gone2.json:0): break\n", 2),
+        // A final buffer that starts on an RS ends the stream with no word (#2998), a fault all the
+        // same: the queue raises it as `break` (#5662).
+        (&["--seq", "-c", "-n", "[inputs]"][..], &["rsend", "gone2"][..], "\u{1e}[[1]]\n", "jq: error: Could not open file @DIR@/gone2.json: No such file or directory\n", 2),
     ];
     for (flags, names, stdout, stderr, status) in rows {
         let files: Vec<String> = names
