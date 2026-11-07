@@ -68,7 +68,7 @@ For complete documentation update workflow, see [docs/guides/benchmarking.md](..
 ### Quick Workflow
 
 1. Build the benchmark runner: `cargo build --release --features bench-runner`
-2. Run benchmarks: `./target/release/succinctly bench run jq_bench` (against the `jq` on `PATH`), or `./target/release/succinctly dev bench jq --jq target/compare/jq-1.7.1/bin/jq` for the pinned jq 1.7.1. Both interleave the two tools within each repetition (#5409); a table measured before #5409 ran all jq reps, then all succinctly reps, and is labelled so in `docs/benchmarks/jq.md`
+2. Run benchmarks: `./target/release/succinctly bench run jq_bench` (against the `jq` on `PATH`), or `./target/release/succinctly dev bench jq --jq target/compare/jq-1.7.1/bin/jq` for the pinned jq 1.7.1. Both interleave the two tools within each repetition (#5409); a table measured before #5409 ran all jq reps, then all succinctly reps, and is labelled so in `docs/benchmarks/jq.md`. `bench run yq_bench` and `dev bench yq [--yq <path>]` do the same for yq (#6417); `docs/benchmarks/yq.md`'s tables predate it and say so
 3. Review output: `data/bench/results/<timestamp>/jq-bench.md`
 4. Update documentation:
    - `docs/benchmarks/jq.md` - Full results with all patterns/sizes
