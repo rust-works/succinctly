@@ -36,7 +36,7 @@ fn a_lazy_repeat_between_two_greedy_ones_answers_as_jq_does_on_the_fancy_regex_r
                 "--arg",
                 "p",
                 pattern,
-                r#"[$s | match($p; "g") | [.offset, .string, (.captures | map(.string))]]"#,
+                "[$s | match($p; \"g\") | [.offset, .string, (.captures | map(.string))]]",
             ],
             None,
         )?;
@@ -44,6 +44,53 @@ fn a_lazy_repeat_between_two_greedy_ones_answers_as_jq_does_on_the_fancy_regex_r
             (stdout.trim_end(), status),
             (expected, 0),
             "{pattern} on {input:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The same under the flags that read the text differently (`x`), and with a literal `#`, a chain of
+/// the shape and a repeat merged first. Every row was captured from jq 1.7.1.
+#[test]
+fn the_shape_is_kept_lazy_under_the_extended_flag_and_beside_a_literal_hash_6460() -> Result<()> {
+    for (pattern, input, flags, expected) in [
+        ("(?=b)b+a*?b*", "bab", "gx", r#"[[0,"b",[]],[2,"b",[]]]"#),
+        ("(?=b)b+ a*? b*", "bab", "gx", r#"[[0,"b",[]],[2,"b",[]]]"#),
+        (
+            "(?=b)b+a*?b*|#",
+            "bab#",
+            "g",
+            r##"[[0,"b",[]],[2,"b",[]],[3,"#",[]]]"##,
+        ),
+        ("(?=b)b+[#]*?b*", "b#b", "g", r#"[[0,"b",[]],[2,"b",[]]]"#),
+        ("(?=a)a+\\d*?a+", "aa1a", "g", r#"[[0,"aa1a",[]]]"#),
+        (
+            "(?=b)(?:b+)+a*?b*",
+            "bab",
+            "g",
+            r#"[[0,"b",[]],[2,"b",[]]]"#,
+        ),
+    ] {
+        let (stdout, _, status) = run_jq_full(
+            &[
+                "-nc",
+                "--arg",
+                "s",
+                input,
+                "--arg",
+                "p",
+                pattern,
+                "--arg",
+                "f",
+                flags,
+                "[$s | match($p; $f) | [.offset, .string, (.captures | map(.string))]]",
+            ],
+            None,
+        )?;
+        assert_eq!(
+            (stdout.trim_end(), status),
+            (expected, 0),
+            "{pattern} on {input:?} under {flags}"
         );
     }
     Ok(())
