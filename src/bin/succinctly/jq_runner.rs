@@ -5192,7 +5192,20 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // `input_filename`'s names for this route's source tags, which are the
         // indexes into `raw_inputs` below (#3046). Only the files that opened have a tag, so
         // the names are taken after the ones that did not are dropped (#5472).
-        jq::cli_context::set_input_names(input_names(&files));
+        // #6480: a slurp reads to the end, which leaves jq's reader at a last file that did not
+        // open, so the slurped document answers for that file, at line 0, from one more source.
+        let slurp_tail = unopened_tail_name(&failures, files.len()).filter(|_| args.slurp);
+        // With no file open, the tail is the only source: there is no stdin entry before it.
+        let names = match &slurp_tail {
+            Some(tail) => {
+                let mut names: Vec<Option<String>> =
+                    files.iter().map(|p| Some(input_display_name(p))).collect();
+                names.push(Some(tail.clone()));
+                names
+            }
+            None => input_names(&files),
+        };
+        jq::cli_context::set_input_names(names);
         // #5291: jq skips a BOM at the start of its input, `--validate` included.
         strip_leading_json_bom(raw_inputs.iter_mut());
         // #4305: see [`stitch_json_file_seams`]. Not under `--validate`, which is strict per file.
@@ -5315,9 +5328,16 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // The slurped document answers for the last file (`input_filename`,
             // and the file a diagnostic names), as the materializing route's
             // `InputLocations::single` always did.
-            let source = slurped.as_ref().map_or(idx, |s| s.last_source);
+            let source = match (&slurped, &slurp_tail) {
+                (Some(_), Some(_)) => files.len(),
+                (Some(s), None) => s.last_source,
+                (None, _) => idx,
+            };
             jq::cli_context::set_current_source(u32::try_from(source).ok());
-            let filename: Option<String> = files.get(source).map(|p| input_display_name(p));
+            let filename: Option<String> = match &slurp_tail {
+                Some(tail) if slurped.is_some() => Some(tail.clone()),
+                _ => files.get(source).map(|p| input_display_name(p)),
+            };
             // Validate JSON if --validate flag is set. Under `--slurp` this
             // already ran per file, on each file's own bytes, inside
             // `slurp_documents`; the synthesized buffer is not input.
@@ -5388,7 +5408,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             let locator = ValueLocator::new(
                 raw,
                 filename.as_deref(),
-                slurped.as_ref().map(|slurped| slurped.eof_line),
+                slurped.as_ref().map(|slurped| {
+                    if slurp_tail.is_some() {
+                        0
+                    } else {
+                        slurped.eof_line
+                    }
+                }),
                 seam.clone(),
             );
             for (start, end) in values {
@@ -6465,7 +6491,48 @@ type Inputs = (
 
 /// Get input values based on arguments.
 /// Returns Err(i32) for validation failures (exit code), Ok(Err) for other errors.
+///
+/// #6480: when the last file named did not open, jq's reader ends at that file: the locations get
+/// one more source past the files that opened, which names it.
 fn get_inputs(
+    args: &JqCommand,
+    force_read_under_null_input: bool,
+    track_eof: bool,
+    open_failed: &mut bool,
+    opened: &mut Vec<PathBuf>,
+) -> std::result::Result<Result<Inputs>, i32> {
+    let mut inputs = read_inputs(
+        args,
+        force_read_under_null_input,
+        track_eof,
+        open_failed,
+        opened,
+    );
+    if let Ok(Ok((_, locations, ..))) = &mut inputs {
+        take_unopened_tail(locations);
+    }
+    inputs
+}
+
+/// The name of the last file named, when it did not open, among `failures` after `opened` files
+/// that did (#6480). A directory last opened, and has its own source already.
+fn unopened_tail_name(failures: &[(usize, InputFileOpenError)], opened: usize) -> Option<String> {
+    failures
+        .last()
+        .filter(|(at, failure)| *at >= opened && !failure.is_directory())
+        .map(|(_, failure)| input_display_name(&failure.path))
+}
+
+/// Gives `locations` the source of the last file named, when it did not open (#6480), unless an
+/// earlier call took it: a slurp settles its value's location from it before it returns.
+fn take_unopened_tail(locations: &mut InputLocations) {
+    if let Some(name) = UNOPENED_TAIL_NAME.with(|tail| tail.borrow_mut().take()) {
+        locations.end_at_unopened_tail(name);
+    }
+}
+
+/// [`get_inputs`], up to the source for a last file that did not open.
+fn read_inputs(
     args: &JqCommand,
     force_read_under_null_input: bool,
     track_eof: bool,
@@ -6479,6 +6546,7 @@ fn get_inputs(
     LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
     defer_open_failures(Vec::new(), false);
     LAZY_OPEN_FAILED.with(|seen| seen.set(false));
+    UNOPENED_TAIL_NAME.with(|tail| *tail.borrow_mut() = None);
     // Null input mode: use null as the single input -- unless the filter
     // itself uses `input`/`inputs`/`input_line_number` (#723), in which case
     // the caller passes `force_read_under_null_input: true` to fall through
@@ -6598,6 +6666,9 @@ fn get_inputs(
     } else {
         let (files, raws, failures) = read_input_files(&files);
         unopened_tail = failures.iter().any(|&(at, _)| at >= files.len());
+        if let Some(name) = unopened_tail_name(&failures, files.len()) {
+            UNOPENED_TAIL_NAME.with(|tail| *tail.borrow_mut() = Some(name));
+        }
         any_open_failure = !failures.is_empty();
         if let Some(&(at, _)) = failures.first() {
             note_open_failure_at(at);
@@ -7217,6 +7288,7 @@ fn get_inputs(
         // `.unwrap()`) to stay correct if that gate's condition ever
         // changes, matching this codebase's convention for exhaustive-but-
         // currently-dead defensive arms (#1064).
+        take_unopened_tail(&mut locations);
         let at = match locations.slurp_eof(slurp_eof_line) {
             Some((src, line)) => locations.resolve(src, line),
             None => InputLocation::unknown(),
@@ -7708,6 +7780,7 @@ fn get_inputs(
 
     // Slurp mode: wrap all inputs in an array
     if args.slurp {
+        take_unopened_tail(&mut locations);
         let at = match locations.slurp_eof(slurp_eof_line) {
             Some((src, line)) => locations.resolve(src, line),
             None => InputLocation::unknown(),
@@ -7730,6 +7803,7 @@ fn get_inputs(
                 .slurp_eof(slurp_eof_line)
                 .unwrap_or((0, UNKNOWN_LINE));
             let mut slurped_locations = InputLocations::new(locations.files().to_vec());
+            slurped_locations.unopened_tail = locations.unopened_tail;
             slurped_locations.push(src as usize, line as usize);
             let mut ahead: Vec<(usize, TrailingParseError)> = resumed_errors
                 .into_iter()
@@ -7738,7 +7812,9 @@ fn get_inputs(
             ahead.extend(trailing_error.take().map(|fault| (0, fault)));
             return Ok(Ok((slurped, slurped_locations, None, ahead)));
         }
-        let slurped_locations = InputLocations::single(at);
+        let mut slurped_locations = InputLocations::single(at);
+        // #6480: the one source is then the last file, which did not open.
+        slurped_locations.unopened_tail = locations.unopened_tail;
         Ok(Ok((
             slurped,
             slurped_locations,
@@ -7986,6 +8062,8 @@ pub struct InputLocations {
     /// How the input stream ends, for [`exhausted`](Self::exhausted) (#4303);
     /// `None` where it was not recorded, which keeps the per-value fallback.
     eof_tail: Option<EofTail>,
+    /// Whether the last source is a file that did not open (#6480), where jq's reader ends.
+    unopened_tail: bool,
 }
 
 /// How an input stream ends, which decides jq's `(at ...)` marker once every
@@ -8214,7 +8292,16 @@ impl InputLocations {
             files,
             per_value: Vec::new(),
             eof_tail: None,
+            unopened_tail: false,
         }
+    }
+
+    /// Ends the input at the file `name`, which was named last and did not open (#6480): it is a
+    /// source past the others, and a read that reaches the end leaves jq's position there at line
+    /// 0, under `-s` too.
+    fn end_at_unopened_tail(&mut self, name: String) {
+        self.files.push(Some(name));
+        self.unopened_tail = true;
     }
 
     /// Locations for an input with nothing to point at (`-n`).
@@ -8379,10 +8466,13 @@ impl InputLocations {
     /// jq -s 'error("x")'  a.json b.json  => b.json:1    (unchanged)
     /// ```
     fn exhausted(&self, slurping: bool) -> Option<(u32, u32)> {
+        let last_src = self.last_src();
+        if self.unopened_tail {
+            return Some((last_src, 0));
+        }
         if slurping {
             return None;
         }
-        let last_src = self.last_src();
         // #4303: the stream's own end, where it was recorded. The fallback
         // below reads the last document's line instead, which differs after
         // trailing blank lines and misses `<unknown>`.
@@ -8411,6 +8501,9 @@ impl InputLocations {
     /// compute `eof_line` directly from the last source's raw text before
     /// it's consumed, and pass it in.
     fn slurp_eof(&self, eof_line: Option<usize>) -> Option<(u32, u32)> {
+        if self.unopened_tail {
+            return Some((self.last_src(), 0));
+        }
         let line = eof_line?;
         Some((self.last_src(), line as u32))
     }
@@ -8586,6 +8679,9 @@ thread_local! {
         const { RefCell::new(std::collections::VecDeque::new()) };
     /// Whether a pending failure was reported by a read, which makes the run exit 2 (#6475).
     static LAZY_OPEN_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The name of the last file named, when it did not open (#6480), for [`get_inputs`] to give a
+    /// source of its own.
+    static UNOPENED_TAIL_NAME: RefCell<Option<String>> = const { RefCell::new(None) };
     /// Whether the first fault of the text is at its end (#6480): the read of that fault sent
     /// jq's reader past the last file, so it reaches every pending failure.
     static FAULT_ENDS_TEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
