@@ -17364,8 +17364,7 @@ mod tests {
         for stream in &streams {
             for flags in [&["-n"][..], &[][..]] {
                 let (lazy, built, seen) = observe_seq(dir.path(), &[stream], flags, false);
-                let (eager_lazy, _, eager_seen) =
-                    observe_seq(dir.path(), &[stream], flags, true);
+                let (eager_lazy, _, eager_seen) = observe_seq(dir.path(), &[stream], flags, true);
                 assert!(!eager_lazy, "the reference must be eager");
                 assert_eq!(
                     seen,
