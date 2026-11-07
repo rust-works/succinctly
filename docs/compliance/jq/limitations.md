@@ -14060,10 +14060,12 @@ Past a missing file jq therefore prints the first value of the next file that ha
 It reports a missing file when it reaches it, after the values before it, so the stderr lines of a run keep jq's order.
 Two residuals remain, both with a missing file *and* a feature that routes input differently:
 
-* `-R`, `--seq`, `--stream-errors`, `-s`, `--input-dsv` and a filter that uses `input`/`inputs` read every file that opens and report every missing one up front.
+* `--seq`, `--stream-errors`, `-s`, `--input-dsv` and a filter that uses `input`/`inputs` read every file that opens and report every missing one up front.
   jq stops after one more line, record or event past a missing file, and reaches a missing file only when the reader gets to it (`jq -n -c input data.json missing` never opens `missing`).
   A plain `--stream` walk stops as jq does, after the one event past a missing file (`jq -c --stream . missing a.json` over `[3]` prints `[[0],3]` and not the closing `[[0]]`, #6006); it still reports the missing file up front.
   The output of `-R` and `-s` over files that all exist is unchanged; only the run that has a missing file differs.
+* `-R` stops as jq does, after the one line past a missing file (`jq -R . missing lines.txt` prints the first line only, #6464), but still reports a second missing file that jq never reaches up front.
+  `-n` with `input_line_number` and no `input`/`inputs` opens no file, so it reports no missing one (#6464).
 * jq keeps the name of the last file it tried even when it did not open, so a diagnostic or `input_filename` after a missing last file names that file (`jq -s -c input_filename data.json missing` prints `"missing"`).
   `succinctly jq` names the last file that opened, because a file that did not open takes no source index.
 

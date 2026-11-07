@@ -5746,8 +5746,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // exhausted against an empty queue instead of hanging; the only data
         // lost is data the user intended to type in live rather than
         // pipe/redirect, an already-unusual way to invoke `-n`.
+        // #6464: under `-n` it is `input`/`inputs` that ask jq for a file; `input_line_number`
+        // alone leaves the files unopened, so a missing one is not reported.
         let force_read_under_null_input = should_force_read_under_null_input(
-            uses_input_builtins,
+            uses_input_builtins && (!args.null_input || jq::walk::pulls_inputs(&expr)),
             args.null_input,
             get_input_files(&args).is_empty(),
             std::io::stdin().is_terminal(),
@@ -6065,6 +6067,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 if let Some(code) = sink.halted() {
                     out.flush()?;
                     return Ok(halt_exit_code(code, open_failed));
+                }
+                // #6464: jq's main loop reads no further input once its reader has read from a
+                // file past one that did not open, and the value that took it there is still
+                // processed (`-R . missing lines.txt` prints the first line and stops).
+                if source_is_past_open_failure(locations.source_at(idx)) {
+                    break 'documents;
                 }
             }
             // The parse error the stream ended in, reported after the
@@ -8445,6 +8453,16 @@ fn main_loop_reads_on() -> bool {
     match FIRST_OPEN_FAILURE_AT.with(std::cell::Cell::get) {
         None => true,
         Some(at) => jq::current_input_location().map_or(true, |(source, _)| (source as usize) < at),
+    }
+}
+
+/// Whether a value read from `source` (a position among the files that opened, as a location's
+/// source tag counts them) is the one that took jq's reader past a file that did not open, after
+/// which its main loop reads no further input (#6464).
+fn source_is_past_open_failure(source: Option<u32>) -> bool {
+    match (FIRST_OPEN_FAILURE_AT.with(std::cell::Cell::get), source) {
+        (Some(at), Some(source)) => source as usize >= at,
+        _ => false,
     }
 }
 
