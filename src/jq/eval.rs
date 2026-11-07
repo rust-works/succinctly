@@ -13761,13 +13761,14 @@ fn owned_stage_on_evaluator<S: EvalSemantics>(
     }
 }
 
-/// The error [`owned_stage_on_evaluator`] reports if a stage of [`owned_one_value_assign_shape`]
-/// ever yields other than one value or one error.
+/// The error [`owned_stage_on_evaluator`] or [`owned_stage_through_doors`] reports if a stage of
+/// [`owned_one_value_assign_shape`] or [`owned_one_value_stage`] ever yields other than one value or
+/// one error.
 #[cold]
 fn unreachable_owned_pipe_stage() -> EvalError {
     debug_assert!(
         false, // patchcov: coverage tolerate-line reason="unreachable: a stage of owned_one_value_assign_shape yields exactly one value or one error, which is what the caller's other arms answer (#5285)"
-        "an assignment stage of a pipe yielded neither one value nor one error" // patchcov: coverage tolerate-line reason="unreachable: same invariant as the `false` above (#5285)"
+        "a one-value stage of a pipe yielded neither one value nor one error" // patchcov: coverage tolerate-line reason="unreachable: same invariant as the `false` above (#5285)"
     );
     EvalError::new("internal error: pipe stage yielded other than one value") // patchcov: coverage tolerate-line reason="unreachable: same invariant as the `false` above (#5285)"
 } // patchcov: coverage tolerate-line reason="unreachable: the whole function body above is dead by the same invariant (#5285)"
@@ -88412,7 +88413,11 @@ fn fold_step_each<S: EvalSemantics>(
             Demand::Continue => Flow::Exhausted,
             Demand::Stop => Flow::Stopped { pending: None },
         },
-        OwnedStep::Handled(Err(_)) if optional => Flow::Exhausted,
+        // An uncatchable error (a resource limit, a decode failure) escapes `?` here as it does on
+        // the evaluator's route (#2132): a later pipe stage runs there (#6575), and can raise one.
+        OwnedStep::Handled(Err(error)) if optional && !error.is_uncatchable_at_value_position() => {
+            Flow::Exhausted
+        }
         OwnedStep::Handled(Err(error)) => Flow::Escaped(Control::Error(error)),
         OwnedStep::Declined(state) => {
             eval_each_owned::<S>(expr, &state, optional, reentry, on_update)
@@ -88441,7 +88446,9 @@ fn fold_step_each<S: EvalSemantics>(
 ///
 /// Also taken (#5285): a pipe of assignments, stage by stage on the moved state
 /// ([`owned_assign_pipe_step`], jq mode, not under the table), so a field one stage extends is not
-/// copied by the next.
+/// copied by the next. And (#6575) any pipe whose stages each yield one value
+/// ([`owned_stage_pipe_step`]), each stage a step in turn, a later one that is not running through
+/// [`eval_each_owned`] on the state so far.
 ///
 /// [`owned_if_step`] (#6569) answers a branch that is `.` or closed even while the table below is
 /// live: `.` is the state unchanged, and a closed value comes from [`closed_expr_to_owned`], which
@@ -88537,6 +88544,16 @@ fn owned_stage_pipe_step<S: EvalSemantics>(expr: &Expr, mut state: OwnedValue) -
     }
     for (n, stage) in stages.iter().enumerate() {
         let stage = unwrap_paren(stage);
+        // `.` leaves the state as it is, and a literal replaces it; neither is a step of
+        // [`owned_update_step`]'s, so a pipe that starts with one (`. | [.]`) would decline whole.
+        match stage {
+            Expr::Identity => continue,
+            Expr::Literal(lit) => {
+                state = literal_to_owned(lit);
+                continue;
+            }
+            _ => {}
+        }
         match owned_update_step::<S>(stage, state) {
             OwnedStep::Handled(Ok(next)) => state = next,
             OwnedStep::Handled(Err(error)) => return OwnedStep::Handled(Err(error)),
@@ -88575,8 +88592,15 @@ fn owned_stage_through_doors<S: EvalSemantics>(
 /// no effect: a shape an operand may be ([`owned_state_expr_shape`]), an assignment that is one
 /// value ([`owned_one_value_assign_shape`]), a slice with literal bounds, one of the builtins
 /// below, which take no argument and answer any input with one value or an error, or an `if`
-/// whose condition is an operand shape and whose branches are such stages.
+/// whose condition is an operand shape and whose branches are such stages, or a pipe of them.
 fn owned_one_value_stage(stage: &Expr) -> bool {
+    // A pipe nested in a stage (`(. + [$x] | .[1:]) | sort`) is one value when each of its own
+    // stages is, and [`owned_update_step`] applies it as a pipe in turn.
+    if let Expr::Pipe(stages) = stage {
+        return stages
+            .iter()
+            .all(|stage| owned_one_value_stage(unwrap_paren(stage)));
+    }
     if let Expr::If {
         cond,
         then_branch,
@@ -115624,6 +115648,13 @@ mod tests {
             ".[0] = 9 | .[1:]",
             ". + [7] | if length > 3 then .[:2] else . end",
             ". + [[1, [2]]] | flatten | length",
+            // A pipe nested in a stage, and a pipe that starts with `.` or a literal.
+            "(. + [7] | .[1:]) | .[1:]",
+            ". + [7] | (.[1:] | sort)",
+            "if length > 3 then . + [8] | .[-2:] else . end | add",
+            ". | [.]",
+            ". | length",
+            "0 | . + 1",
         ] {
             let OwnedStep::Handled(Ok(got)) = step(src, list()) else {
                 panic!("not handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step declined a pipe the test lists as handled (#6575)"
