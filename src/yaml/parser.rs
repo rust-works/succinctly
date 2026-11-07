@@ -4877,7 +4877,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// leave the item open for the main loop to read the value into. The one copy of this, shared
     /// by an ordinary item and the first item of an explicit key's sequence (#6580).
     ///
-    /// `indent` is the `-`'s column, `wrapper_bp` the item wrapper's own bp.
+    /// `indent` is the `-`'s column, `wrapper_bp` the item wrapper's own bp. `had_property` is
+    /// whether properties follow the dash on its line: an ordinary item passes it, the first item
+    /// of an explicit key's sequence passes `false` (properties there are read by its own #6570
+    /// branch, so only a dash alone on its line reaches this).
     fn defer_item_value_to_later_lines(
         &mut self,
         indent: usize,
@@ -4899,8 +4902,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         //   `self.bp_pos`, is the one `.[i]` resolves to and real yq
         //   answers `head_comment` from (`# h\n-\n  x\n` is `.[1]`'s
         //   head, not `.[0]`'s foot), so any pending standalone block
-        //   attaches to it here, exactly as the plain-scalar arm below
-        //   does for `- x`;
+        //   attaches to it here, exactly as the plain-scalar arm of
+        //   `parse_sequence_item_inner` does for `- x`;
         // - absent (the next content is a sibling item, a dedent, or
         //   end of input): there is no node, and real yq floats the
         //   comment -- see `float_absent_item_comment`. An absent item
