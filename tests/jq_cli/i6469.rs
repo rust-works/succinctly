@@ -53,14 +53,22 @@ fn a_lazy_repeat_that_keeps_its_text_leaves_the_others_written_6469() -> Result<
     Ok(())
 }
 
-/// Nine repeats that keep their text are more readings than `MOST_READS` allows, so the pattern
-/// moves on as a whole past it, and still answers as jq does.
+/// Nine repeats that keep their text take ten readings, under `MOST_READS` (16), and answer as jq
+/// does. Seventeen take more than it allows, so the pattern moves on as a whole past it and the last
+/// group is `""` where jq's is `null`: the limitation `docs/compliance/jq/limitations.md` records.
 #[test]
 fn past_the_most_readings_the_pattern_moves_on_as_a_whole_6469() -> Result<()> {
     let kept = r"(?:^x*|(?:(y*)|x)+(?:(y)|x?){0,2})*?";
-    let pattern = format!("{}(?:(?:(b*)|a){{0,2}}?)*?c", kept.repeat(9));
-    let want = format!("[[{}]]\n", ["null"; 19].join(","));
-    assert_eq!(captures(&pattern, "aac")?, want);
+    let pattern = |copies: usize| format!("{}(?:(?:(b*)|a){{0,2}}?)*?c", kept.repeat(copies));
+    let nulls = |count: usize| ["null"].repeat(count).join(",");
+    assert_eq!(
+        captures(&pattern(9), "aac")?,
+        format!("[[{}]]\n", nulls(19))
+    );
+    assert_eq!(
+        captures(&pattern(17), "aac")?,
+        format!("[[{},\"\"]]\n", nulls(34))
+    );
     Ok(())
 }
 
