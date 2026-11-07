@@ -89107,6 +89107,28 @@ fn eval_owned_pure_in<S: EvalSemantics>(
             }
             eval_owned_pure_in::<S>(last, current.as_ref().unwrap_or(input), position, door)
         }
+        // #6536: `. % 3`, `.a + 1`, `. * 2` of single-output pure operands, as an operand of a
+        // comparison or a boolean (`select(. % 3 == 0)`, `if .a % 2 == 0 then ..`). The operands
+        // are settled right first, as the compare arm does (`binary_fanout_each` nests a binary
+        // operator's operands rightmost-outermost), then combined with `arith_combine`, the
+        // combination the evaluator's own `eval_arithmetic` and the fold routes use. An operator
+        // that raises (`1 % 0`, `{} - 1`) declines and not answers, so the bridge keeps jq's
+        // message and the order it raises in. Operand position only: `null + x` hands `x` back
+        // as it is, and a navigated subvalue must not leave as an expression's own result
+        // (#2397). jq mode only: yq's operators have their own rules.
+        Expr::Arithmetic {
+            op, left, right, ..
+        } if S::TAG == EvalTag::Jq && position == ResultPosition::Operand => {
+            let r = match eval_owned_pure_in::<S>(right, input, ResultPosition::Operand, door)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            let l = match eval_owned_pure_in::<S>(left, input, ResultPosition::Operand, door)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            arith_combine::<S>(*op, l, r).ok().map(Ok)
+        }
         _ => None,
     }
 }
@@ -128686,6 +128708,114 @@ mod tests {
                     "yq mode: {src:?} on {value:?} disagrees with the reindex bridge"
                 );
             }
+        }
+    }
+
+    /// #6536: arithmetic of pure operands, as an operand of a comparison or a boolean
+    /// (`select(. % 3 == 0)`), is answered from the owned value and is the answer the reindex
+    /// bridge gives, over every number representation (`Int`, `Float`, `NaN`, the infinities,
+    /// literal-spelled numbers, past 2^53), strings, containers and `null`. An operator that
+    /// raises declines (so the bridge keeps jq's message and order), arithmetic as the
+    /// expression's own result declines (`null + x` hands `x` back as it is), and yq mode is not
+    /// answered.
+    #[test]
+    fn eval_owned_pure_answers_arithmetic_operands_as_the_bridge_does_6536() {
+        let shapes = [
+            ". % 3 == 0",
+            ". % 2 == 1",
+            ". + 1 > 2",
+            ". - 1 < 0",
+            ". * 2 == 4",
+            ". / 2 == 1",
+            ". + \"x\" == \"x\"",
+            "(. + 1) * 2 > 4",
+            ". * . == 4",
+            ".a % 2 == 1",
+            ".a + .b == 3",
+            ".a.b + 1 == 3",
+            ". + null == .",
+            "null + . == .",
+            ". - . == 0",
+            ". % 2 == 0 and . > 1",
+            ". % 2 == 0 or . == 1",
+            "(. % 3 == 0) | not",
+            "1 + 2 == 3",
+            "10 % 3 == 1",
+        ];
+        let values = pure_value_matrix();
+        let mut answered = 0;
+        for src in shapes {
+            let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+            for value in &values {
+                let bridge = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                for door in [false, true] {
+                    if let Some(fast) =
+                        eval_owned_pure_in::<JqSemantics>(&expr, value, ResultPosition::Fresh, door)
+                    {
+                        answered += 1;
+                        let fast = match fast {
+                            Ok(v) => debug_normalize(QueryResult::<Vec<u64>>::Owned(v)),
+                            Err(e) => debug_normalize(QueryResult::<Vec<u64>>::Error(e)),
+                        };
+                        assert_eq!(fast, bridge, "{src:?} on {value:?} (door {door})");
+                    }
+                }
+                assert!(
+                    eval_owned_pure_in::<YqSemantics>(&expr, value, ResultPosition::Fresh, true)
+                        .is_none(),
+                    "{src:?} on {value:?} answered in yq mode"
+                );
+            }
+        }
+        // The arm is reached: a modulus on a plain integer is answered, not declined.
+        let expr = parse(". % 3 == 0").unwrap();
+        for (n, expected) in [(0, true), (1, false), (3, true), (-6, true), (7, false)] {
+            match eval_owned_pure_in::<JqSemantics>(
+                &expr,
+                &OwnedValue::Int(n),
+                ResultPosition::Fresh,
+                false,
+            ) {
+                Some(Ok(OwnedValue::Bool(got))) => assert_eq!(got, expected, "{n} % 3 == 0"),
+                other => panic!("{n} % 3 == 0 was not answered: {other:?}"), // patchcov: coverage tolerate-line reason="the failure message of the assertion this test exists to make (#6536)"
+            }
+        }
+        assert!(
+            answered > 200,
+            "only {answered} answers: the arm was not reached"
+        );
+        // Raising operators decline and are the bridge's.
+        for (src, value) in [
+            (". % 0 == 0", OwnedValue::Int(1)),
+            (". / 0 == 0", OwnedValue::Int(1)),
+            (". % \"a\" == 0", OwnedValue::Int(1)),
+            (". - \"a\" == 0", OwnedValue::Int(1)),
+            (". * {} == 0", OwnedValue::Int(1)),
+            (".a + 1 == 0", OwnedValue::Int(1)),
+        ] {
+            let expr = parse(src).unwrap();
+            let fast =
+                eval_owned_pure_in::<JqSemantics>(&expr, &value, ResultPosition::Fresh, true);
+            assert!(
+                !matches!(fast, Some(Ok(_))),
+                "{src:?} on {value:?} answered where jq raises: {fast:?}"
+            );
+        }
+        // Arithmetic as the expression's own result is not answered.
+        for src in [". + 1", ".a + 1", "null + .", ". * 2"] {
+            let expr = parse(src).unwrap();
+            assert!(
+                eval_owned_pure_in::<JqSemantics>(
+                    &expr,
+                    &OwnedValue::Int(1),
+                    ResultPosition::Fresh,
+                    true
+                )
+                .is_none(),
+                "{src:?} answered as a result"
+            );
         }
     }
 
