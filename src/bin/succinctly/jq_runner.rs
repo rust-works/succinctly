@@ -6857,9 +6857,7 @@ fn read_inputs(
         if (args.null_input || track_eof)
             && !args.slurp
             && args.input_dsv.is_none()
-            && (!args.seq
-                || args.raw_input
-                || (any_open_failure && seq_text_reads_clean(&raws)))
+            && (!args.seq || args.raw_input || (any_open_failure && seq_text_reads_clean(&raws)))
             && ends_cleanly
         {
             let fault_ends_text = matches!(first_stream_fault(&raws), Some((_, true)));
