@@ -5787,6 +5787,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // position to name. A non-slurped stream keeps its clean prefix
             // and reports its parse error after it instead (#2961).
             Ok(Err(e)) => {
+                // Nothing is read after this, so what it left pending is said now.
+                report_reached_open_failures(None);
                 let malformed = e.downcast::<MalformedJsonError>()?;
                 let err = malformed.to_eval_error();
                 // The files that opened: `source` indexes them (#5472).
@@ -5808,7 +5810,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }
                 return Ok(DiagStyle::Jq.error_exit_code());
             }
-            Err(exit_code) => return Ok(exit_code), // Validation error
+            // Validation error. The run reads no further, so what it left pending is said now.
+            Err(exit_code) => {
+                report_reached_open_failures(None);
+                return Ok(exit_code);
+            }
         };
         // `input_filename`'s names for this route's source tags (#3046). Stdin
         // is one unnamed source, which this table records as no sources at
@@ -6556,10 +6562,12 @@ fn get_inputs(
         // does not end where a value does: its last token completes only at the end of the file,
         // which sends jq's reader on to the next one.
         let ends_cleanly = failures.iter().all(|&(at, _)| {
-            at == 0
-                || raws
-                    .get(at - 1)
-                    .map_or(true, |raw| source_ends_cleanly(raw, args))
+            // The last file with bytes before it: an empty one between sends the reader on too.
+            raws.iter()
+                .take(at)
+                .rev()
+                .find(|raw| !raw.is_empty())
+                .map_or(true, |raw| source_ends_cleanly(raw, args))
         });
         if args.null_input && !args.slurp && !args.seq && args.input_dsv.is_none() && ends_cleanly {
             defer_open_failures(failures);
@@ -8522,14 +8530,14 @@ fn report_reached_open_failures(read: Option<u32>) {
 }
 
 /// Whether a source's last byte ends what jq's parser reads there, so that a read of its last value
-/// does not go on to the next file for more (#6475): a newline or other blank, or the closing
-/// bracket or quote of a value, and for `-R` a newline. A bare number or literal at the end of the
-/// file completes only at its end.
+/// does not go on to the next file for more (#6475). Only a bare number or literal at the end of the
+/// file completes at its end, so what ends in a letter, a digit or `+`, `-` or `.` does not; with
+/// `-R` a line is complete at its newline alone.
 fn source_ends_cleanly(bytes: &[u8], args: &JqCommand) -> bool {
     match bytes.last() {
         None => true,
         Some(&last) if args.raw_input => last == b'\n',
-        Some(&last) => last.is_ascii_whitespace() || matches!(last, b']' | b'}' | b'"'),
+        Some(&last) => !(last.is_ascii_alphanumeric() || matches!(last, b'+' | b'-' | b'.')),
     }
 }
 

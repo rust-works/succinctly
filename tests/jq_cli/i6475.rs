@@ -29,6 +29,8 @@ impl Files {
         std::fs::write(path("one.json"), "1")?;
         std::fs::write(path("arr.json"), "[1,2]")?;
         std::fs::write(path("raw.txt"), "abc")?;
+        std::fs::write(path("empty.json"), "")?;
+        std::fs::write(path("bad.json"), "1 2\n{")?;
         std::fs::create_dir(path("adir"))?;
         let paths = vec![
             ("nums", path("nums.json")),
@@ -36,6 +38,8 @@ impl Files {
             ("one", path("one.json")),
             ("arr", path("arr.json")),
             ("raw", path("raw.txt")),
+            ("empty", path("empty.json")),
+            ("bad", path("bad.json")),
             ("adir", path("adir")),
             ("gone", path("gone.json")),
         ];
@@ -154,6 +158,38 @@ fn a_file_the_program_never_reaches_is_not_reported_6475() -> Result<()> {
         (
             &["-nc", "[input,halt]", "{nums}", "{gone}", "{b}"],
             "",
+            "",
+            0,
+        ),
+        (
+            &["-nc", "input", "{one}", "{empty}", "{gone}"],
+            "1\n",
+            "jq: error: Could not open file {gone}: No such file or directory\n",
+            2,
+        ),
+        (
+            &["-nc", "input", "{nums}", "{empty}", "{gone}"],
+            "1\n",
+            "",
+            0,
+        ),
+        (
+            &[
+                "-nc",
+                "[input,input,input,input]",
+                "{nums}",
+                "{empty}",
+                "{gone}",
+                "{b}",
+            ],
+            "[1,2,3,4]\n",
+            "jq: error: Could not open file {gone}: No such file or directory\n",
+            2,
+        ),
+        (&["-nc", "input", "{bad}", "{gone}"], "1\n", "", 0),
+        (
+            &["-nc", "[input,input]", "{empty}", "{nums}", "{gone}"],
+            "[1,2]\n",
             "",
             0,
         ),
