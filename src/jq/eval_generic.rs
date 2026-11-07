@@ -57613,6 +57613,58 @@ mod tests {
         assert!(reindexes <= 1, "yq: {query} reindexed {reindexes} times");
     }
 
+    /// #5712: an `if`, a one-element array, an object with literal keys, an arithmetic and a `//`
+    /// built from a string's length answer from the owned string, as a lone last stage and as the
+    /// head of a pipe: each wrote the string out and indexed it again. `ascii_downcase` makes the
+    /// string an owned value and is the one crossing each row still pays, so a row is bounded by 1.
+    /// Both modes run, on a string whose codepoint count (11) and byte count (13) differ, with the
+    /// thresholds between them, so a door that counted the wrong way in either mode changes an
+    /// answer; a shape that would raise (`length / 0`) or reads the input back keeps its answer.
+    #[test]
+    fn test_composed_string_length_shapes_need_no_second_reindex_5712() {
+        let doc = r#"{"s":"Héllo Wörld"}"#;
+        let rows: [(&str, &str, &str); 12] = [
+            // (stage, jq: codepoints, yq: bytes)
+            ("if length > 11 then 1 else 2 end", "2", "1"),
+            (
+                "if length > 11 then \"big\" else length end",
+                "11",
+                "\"big\"",
+            ),
+            ("[length]", "[11]", "[13]"),
+            ("length + 1", "12", "14"),
+            ("length * 2", "22", "26"),
+            ("(length > 11) // 7", "7", "true"),
+            ("length // 7", "11", "13"),
+            ("[length + 1] | length", "1", "1"),
+            ("length + 1 | tostring", "\"12\"", "\"14\""),
+            ("if length > 11 then 1 else 2 end | . + 1", "3", "2"),
+            // Not answered, or raising (yq divides by zero to infinity, jq raises): the bridge's answer,
+            // unchanged.
+            (
+                "try (length / 0) catch \"e\"",
+                "\"e\"",
+                "1.7976931348623157e+308",
+            ),
+            ("if length > 11 then . else 0 end | length", "0", "13"),
+        ];
+        for (stage, jq_want, yq_want) in rows {
+            let query = format!(".s | ascii_downcase | {stage}");
+            let (out, reindexes) = outputs_and_reindexes_in::<JqSemantics>(doc, &query);
+            assert_eq!(out, [jq_want], "jq: {query}");
+            let (yq_out, yq_reindexes) = outputs_and_reindexes_in::<YqSemantics>(doc, &query);
+            assert_eq!(yq_out, [yq_want], "yq: {query}");
+            // The last two rows read the bridge by design.
+            if !stage.contains("catch") && !stage.contains("then . else") {
+                assert!(reindexes <= 1, "jq: {query} reindexed {reindexes} times");
+                assert!(
+                    yq_reindexes <= 1,
+                    "yq: {query} reindexed {yq_reindexes} times"
+                );
+            }
+        }
+    }
+
     /// #5712: a stage that closes over a bound computed value and never reads `.`
     /// (`($t | length)` once `$t` is substituted) is one value whatever the round's input is, so
     /// `[range(n) | ($t | length)]` costs the same number of reindexes for any `n`. It used to

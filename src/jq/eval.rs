@@ -10771,7 +10771,109 @@ pub(crate) fn eval_owned_string_door<S: EvalSemantics>(
         stage @ (Expr::Compare { .. } | Expr::And(..) | Expr::Or(..) | Expr::Not) => {
             eval_owned_pure_in::<S>(stage, input, ResultPosition::Fresh, true)?.ok()
         }
+        // #5712: an `if`, a one-element array, an arithmetic or a `//` built from such answers.
+        // Its own function: this one is entered at every level of a nested condition, and a local
+        // added here is paid at each.
+        Expr::If { .. }
+        | Expr::Array(_)
+        | Expr::Object(_)
+        | Expr::Arithmetic { .. }
+        | Expr::Alternative(..) => string_door_composed::<S>(unwrap_paren(expr), input),
         _ => None,
+    }
+}
+
+/// [`eval_owned_string_door`]'s composed shapes (#5712), over the same string: `if C then A else B
+/// end` once the string settles `C`, `[A]`, `{k: A}` (literal keys), `A op B` and `A // B`, where
+/// each of `A` and `B` is a literal or itself an answer of the door. Every answer is a fresh value
+/// (an integer, a boolean, `null`, a literal, or an array, object or arithmetic result built from
+/// those), never a node of `input`. Anything the door does not answer, and everything that would
+/// raise (`length / 0`), is `None` and the bridge keeps its diagnostics: only an answer is taken.
+/// `if` without an `else` reads the input back, which is no answer, so it declines.
+///
+/// A dispatch only, with one `#[inline(never)]` function per shape: the walk recurses once per
+/// level of nesting (to the parser's 256), through [`eval_owned_string_door`] and
+/// [`eval_owned_pure_in`], and a level pays for the frame of the shape it holds, not of all five.
+#[inline(never)]
+fn string_door_composed<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    match expr {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => string_door_if::<S>(cond, then_branch, else_branch, input),
+        Expr::Array(inner) => string_door_operand::<S>(inner, input)
+            .map(|element| OwnedValue::array_from(vec![element])),
+        Expr::Object(entries) => string_door_object::<S>(entries, input),
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => string_door_arithmetic::<S>(*op, left, right, input),
+        Expr::Alternative(left, right) => string_door_alternative::<S>(left, right, input),
+        _ => None,
+    }
+}
+
+/// One operand of a composed shape: a literal, or an answer of the door.
+#[inline(never)]
+fn string_door_operand<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    match unwrap_paren(expr) {
+        Expr::Literal(lit) => Some(literal_to_owned(lit)),
+        other => eval_owned_string_door::<S>(other, input),
+    }
+}
+
+#[inline(never)]
+fn string_door_if<S: EvalSemantics>(
+    cond: &Expr,
+    then_branch: &Expr,
+    else_branch: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    let taken = owned_cond_verdict::<S>(cond, input, false)?.ok()?;
+    string_door_operand::<S>(if taken { then_branch } else { else_branch }, input)
+}
+
+/// Literal keys only (a computed key is a generator), each value one answer: the pairs fold into
+/// the map as the evaluator's own construction folds them.
+#[inline(never)]
+fn string_door_object<S: EvalSemantics>(
+    entries: &[ObjectEntry],
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    let mut pairs = vec_with_capacity(entries.len());
+    for entry in entries {
+        let ObjectKey::Literal(key) = &entry.key else {
+            return None;
+        };
+        pairs.push((key.clone(), string_door_operand::<S>(&entry.value, input)?));
+    }
+    let fields = object_from_pairs::<S>(pairs).ok()?;
+    Some(OwnedValue::Object(fields.into()))
+}
+
+#[inline(never)]
+fn string_door_arithmetic<S: EvalSemantics>(
+    op: ArithOp,
+    left: &Expr,
+    right: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    let left = string_door_operand::<S>(left, input)?;
+    let right = string_door_operand::<S>(right, input)?;
+    arith_combine::<S>(op, left, right).ok()
+}
+
+#[inline(never)]
+fn string_door_alternative<S: EvalSemantics>(
+    left: &Expr,
+    right: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    let first = string_door_operand::<S>(left, input)?;
+    if first.is_truthy() {
+        Some(first)
+    } else {
+        string_door_operand::<S>(right, input)
     }
 }
 
@@ -125219,6 +125321,60 @@ mod tests {
             }
         }
         assert_eq!(composed, strings.len() * 15);
+        // #5712: an `if`, a one-element array, an object with literal keys, an arithmetic and a
+        // `//` built from those counts are answered, and agree with the bridge in both modes.
+        let mut built = 0;
+        for text in strings {
+            let value = OwnedValue::String(text.into());
+            for src in [
+                "[length]",
+                "[length > 3]",
+                "[length, 1][0]",
+                "{a: length}",
+                "{a: length, b: [length > 3]}",
+                "length + 1",
+                "length * 2 - 1",
+                "length % 7",
+                "1 + length",
+                "if length > 3 then 1 else 2 end",
+                "if length > 3 then length else 0 end",
+                "if length > 100 then 1 elif length > 3 then \"b\" else null end",
+                "if length > 3 and length < 99 then [length] else {a: 1} end",
+                "(length > 3) // 7",
+                "(length > 100) // 7",
+                "(if length > 100 then 1 else null end) // [length]",
+                "length // 7",
+            ] {
+                let expr = parse(src).unwrap();
+                for (jq_mode, name) in [(true, "jq"), (false, "yq")] {
+                    let fast = if jq_mode {
+                        eval_owned_string_door::<JqSemantics>(&expr, &value)
+                    } else {
+                        eval_owned_string_door::<YqSemantics>(&expr, &value)
+                    };
+                    // `[length, 1][0]` indexes an array, which is the pipe's and not the door's.
+                    let Some(fast) = fast else {
+                        assert_eq!(
+                            src, "[length, 1][0]",
+                            "{name}: {src:?} on {text:?} declined"
+                        );
+                        continue;
+                    };
+                    built += 1;
+                    let bridged = if jq_mode {
+                        eval_owned_input_bridge::<Vec<u64>, JqSemantics>(&expr, &value, false)
+                    } else {
+                        eval_owned_input_bridge::<Vec<u64>, YqSemantics>(&expr, &value, false)
+                    };
+                    assert_eq!(
+                        debug_normalize(QueryResult::<Vec<u64>>::Owned(fast)),
+                        debug_normalize(bridged),
+                        "{name} mode: {src:?} on {text:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(built, strings.len() * 2 * 16);
         // A composed shape that raises, fans out or computes is the bridge's: only an answer is
         // taken, so the door declines and the error keeps the bridge's words.
         let text = OwnedValue::String("abc".into());
@@ -125229,8 +125385,19 @@ mod tests {
             "try (.a > 1) catch \"c\"",
             "(length > 1, 3)",
             "length > (1, 3)",
-            "[length]",
             "length > 1 | not",
+            // The composed shapes (#5712) that raise, fan out, read the input back or compute a key.
+            "length / 0",
+            "length + \"a\"",
+            "[length, length]",
+            "{(\"k\"): length, (\"j\", \"i\"): 1}",
+            "if length > 1 then . else 0 end",
+            // No `else` reads the input back only when the condition is false.
+            "if length > 100 then 1 end",
+            "if length > 1 then (1, 2) else 0 end",
+            "(length, 1) // 2",
+            ".a // 1",
+            "{a: .}",
         ] {
             assert!(
                 eval_owned_string_door::<JqSemantics>(&parse(src).unwrap(), &text).is_none(),
