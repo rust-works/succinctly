@@ -108452,14 +108452,52 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 // Environment functions
 
+/// Whether [`environment_object`] hands out one snapshot of the environment per thread (#6560).
+#[cfg(feature = "std")]
+static ENVIRONMENT_SNAPSHOT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Read the environment once per thread, for every `$ENV` and `env` that follows (#6560).
+///
+/// jq builds `$ENV` once; this evaluator built the whole object again on every evaluation (every
+/// name and value copied, an insert each, a new allocation), so `select(.x == $ENV.X)` over
+/// 85,000 records with the 87 variables of an ordinary shell took 806 ms against jq's 132 ms. With
+/// the snapshot on, the object is built on a thread's first use and each later `$ENV` is a clone of
+/// it, a reference-count bump.
+///
+/// Opt-in because it changes what a later `std::env::set_var` is read as: the CLI calls this at
+/// startup (nothing in a run sets a variable, as in jq), and a library caller that sets variables
+/// between evaluations keeps reading the current environment each time.
+#[cfg(feature = "std")]
+pub fn snapshot_environment() {
+    ENVIRONMENT_SNAPSHOT.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The object of all environment variables: built now, or the thread's snapshot of it once
+/// [`snapshot_environment`] has been called.
+#[cfg(feature = "std")]
+fn environment_object() -> OwnedValue {
+    fn build() -> OwnedValue {
+        let mut env_obj = IndexMap::new();
+        for (key, value) in std::env::vars() {
+            env_obj.insert(key, OwnedValue::String(value.into()));
+        }
+        OwnedValue::Object(env_obj.into())
+    }
+    thread_local! {
+        static SNAPSHOT: core::cell::RefCell<Option<OwnedValue>> =
+            const { core::cell::RefCell::new(None) };
+    }
+    if !ENVIRONMENT_SNAPSHOT.load(core::sync::atomic::Ordering::Relaxed) {
+        return build();
+    }
+    SNAPSHOT.with(|cell| cell.borrow_mut().get_or_insert_with(build).clone())
+}
+
 /// $ENV expression - returns object of all environment variables
 #[cfg(feature = "std")]
 fn eval_env<'a, W: Clone + AsRef<[u64]>>(_optional: bool) -> QueryResult<'a, W> {
-    let mut env_obj = IndexMap::new();
-    for (key, value) in std::env::vars() {
-        env_obj.insert(key, OwnedValue::String(value.into()));
-    }
-    QueryResult::Owned(OwnedValue::Object(env_obj.into()))
+    QueryResult::Owned(environment_object())
 }
 
 #[cfg(not(feature = "std"))]
@@ -108474,11 +108512,7 @@ fn builtin_env<W: Clone + AsRef<[u64]>>(
     _value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    let mut env_obj = IndexMap::new();
-    for (key, value) in std::env::vars() {
-        env_obj.insert(key, OwnedValue::String(value.into()));
-    }
-    QueryResult::Owned(OwnedValue::Object(env_obj.into()))
+    QueryResult::Owned(environment_object())
 }
 
 #[cfg(not(feature = "std"))]
@@ -150134,6 +150168,34 @@ mod tests {
             }
         }
         assert!(taken > 250, "the matrix must reach the door: {taken}");
+    }
+
+    /// #6560: `environment_object` is the environment, built fresh or read back from the thread's
+    /// snapshot, and a second read under the snapshot is the first one. The test only reads the
+    /// environment (setting a variable here would race the other tests' threads), so what a later
+    /// `set_var` is read as is the CLI's to pin: `$ENV` of a child process's own environment.
+    #[cfg(feature = "std")]
+    #[test]
+    fn environment_object_is_the_environment_fresh_and_snapshotted_6560() {
+        let expected = || {
+            let mut map = IndexMap::new();
+            for (key, value) in std::env::vars() {
+                map.insert(key, OwnedValue::String(value.into()));
+            }
+            format!("{:?}", OwnedValue::Object(map.into()))
+        };
+        let fresh = format!("{:?}", environment_object());
+        assert_eq!(fresh, expected());
+        snapshot_environment();
+        let first = format!("{:?}", environment_object());
+        let second = format!("{:?}", environment_object());
+        assert_eq!(first, expected());
+        assert_eq!(second, first);
+        // A thread of its own builds its own snapshot, from the same environment.
+        let other = std::thread::spawn(|| format!("{:?}", environment_object()))
+            .join()
+            .unwrap();
+        assert_eq!(other, first);
     }
 
     /// #6527: [`eval_owned_number_fold`] answers what the reindex bridge answers for every array of

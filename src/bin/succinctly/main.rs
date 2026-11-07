@@ -1929,6 +1929,8 @@ fn parse_cli_allowing_negative_filter() -> Cli {
 }
 
 fn run_main() -> Result<()> {
+    // #6560: `$ENV` is read once, as jq reads it, not built again for every record.
+    succinctly::jq::snapshot_environment();
     // Multi-call binary: check if invoked via a known alias name (e.g., sjq, syq)
     if let Some(exit_code) = try_multicall()? {
         exit_after_run(exit_code);
