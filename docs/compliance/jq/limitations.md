@@ -7230,6 +7230,36 @@ against the pinned jq 1.7.1 binary), so refusing with a catchable error is the s
 "would take the host process down" exception as the rest of this entry, not a new kind of
 divergence.
 
+## Standard input is read to EOF before the program runs (#6499)
+
+`succinctly jq` reads standard input to its end before it evaluates anything, on every route but `--stream`.
+jq reads as it goes.
+A pipe that stays open therefore prints nothing until it closes, and one that never closes grows until the process is killed.
+This is a known limitation, not supported at this stage: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
+Reading stdin incrementally is not in scope here, because it needs a design of its own (what releases consumed text, given that a fault is worded by re-reading it).
+
+First output when one record is written, the pipe is held open for two seconds, and a second record follows, with `--unbuffered` on both tools (without it, jq's own stdout buffering hides the difference):
+
+| program                          | jq 1.7.1 | succinctly |
+|----------------------------------|---------:|-----------:|
+| `-c .a`                          |   0.00 s |     2.00 s |
+| `-R .`                           |   0.00 s |     2.00 s |
+| `--seq -c .a`                    |   0.00 s |     2.00 s |
+| `-n input`, `-n first(inputs)`   |   0.00 s |     2.00 s |
+| `--stream -c .`                  |   0.00 s |     0.00 s |
+
+The two spellings of `-n` are the partial case.
+A lone source starts its lazy read on its front since [#6451](https://github.com/rust-works/succinctly/issues/6451), reading the first 256 KiB, so they stop on an endless stream; on a quiet pipe they wait for 256 KiB or for EOF.
+`--stream` reads a chunk at a time (`ChunkedSources`, [#5498](https://github.com/rust-works/succinctly/issues/5498)).
+The cause on the other routes is that `read_stdin_bytes` is `read_to_end`, and the plain route then splits the whole text into values before its loop.
+
+An endless stream into `head -1` shows the cost, under a 400 MB cap (`yes '{"a":1}' | TOOL -c .a | head -1`): jq exits after 1 MB, and succinctly is killed at the cap.
+The same holds for `-R .` and `--seq -c .a`.
+`-n input`, `-n first(inputs)` and `--stream -c .` exit after 1 MB or less in both tools.
+A caller that pipes a producer that does not end has to bound it (`head -c`, `timeout`), or use `--stream`.
+
+The endless-stream rows were measured on `main` @ 89a900ccc against `/usr/bin/jq` 1.7.1, and the held-open table again on c44d34dd4 with the same times; both are behaviour probes that do not depend on the machine.
+
 ## Nesting depth (#5497)
 
 [#5497](https://github.com/rust-works/succinctly/issues/5497) decided each row under ADR-0018.
@@ -7716,6 +7746,22 @@ A fix would need a counted repeat that is not written out (a loop counter), whic
 The refusal and the rows that are answered are pinned by `tests/jq_cli/i6439.rs`.
 `succinctly yq` is not affected: its patterns are Go's, which refuses a count past 1000.
 
+### A `^` under `(?m)` does not hold at the end of the text (#6456)
+
+Oniguruma's begin-of-line anchor holds at the start of the text, and after a newline unless that is the end of the text (`ON_STR_END`).
+The `regex` crate's `(?m)^` holds after any newline, so a text that ends with one gets one more match at its end: `"a\n" | [match("(?m)^";"g") | .offset]` is `[0]` in jq and was `[0,2]`, and `"a\nb\n" | gsub("(?m)^";"> ")` ended with a stray `"> "`.
+A match of the crate that ends at the end of a text with a final newline may have used the `^` there, so it is asked of the `fancy-regex` build of the pattern (`ExactEnd`, built the first time and kept), with every `^` under `(?m)` written as `(?:\A|^(?!\z))`.
+A match that ends before the end of the text cannot have used it, so a text without a final newline, and a pattern without a multi-line `^`, take no extra work.
+`(?m)` is followed in the order it is written: a `(?m)` holds to the end of its group, `(?m:...)` inside its body, `(?-m)` and a repeat of the flag turn it off or on again.
+`$` already agrees (`"a\n"` gives `[1,2]` in both).
+A look-around or a backreference around the `^` does not change that: `"a\n" | [match("(?m)(?<=\\n)^";"g")]` is `[]` in jq and here, and `(?m)(?=a)^`, `(?m)^(?!x)` and `(?m)(?<!x)^` agree on texts with one and with two final newlines.
+A `^` *inside* a look-around still keeps the crate's reading: `"a\n" | [match("(?m)(?<!^)";"g") | .offset]` is `[1,2]` in jq and `[1]` here, and `"a\n" | [match("(?m)a\\n(?!^)";"g") | .offset]` is `[0]` in jq and `[]` here.
+A pattern that repeats a group name more often than `onig_loop::MAX_NAME_RENAMES` keeps the crate's reading too.
+A match of the crate that the exact engine fails on (its backtrack limit) keeps the crate's match, as before.
+Only a pattern whose syntax tree the parser cannot read keeps the crate's reading.
+A pattern `fancy-regex` refuses keeps the match of the crate: `"aa\n" | [match("(?m)^a+a*a+\\n?^";"g")]` is `[]` in jq and one match here, because `a+a*a+` is the shape `fancy-regex` answers wrongly (the entry on two greedy `X+` repeats above).
+Pinned by `tests/jq_cli/i6456.rs` (119 rows read from jq 1.7.1, and 15 for a repeated group name) and, for yq, `tests/yq_cli/i6456.rs`; a differential of 333 subject and pattern pairs, 159 of which differed before, agrees.
+
 ### A group repeated `{0}` keeps its capture entry (#6108)
 
 Oniguruma numbers a group repeated zero times (`{0}`, `{0,0}`), so jq reports an entry for it: offset `-1` and string `null`, or an empty string at the match offset when the whole match is empty.
@@ -7895,8 +7941,15 @@ These keep their loop as written, and still match longer than jq where the shape
   Oniguruma tries what follows the loop once at a head, at the first exit that holds there, so a later exit is the same continuation at the same head and has already failed.
   A second exit past the last consuming way is therefore the exit every loop ends with, except that it sets the group around the body, so the loop writes it back last among each head's ways, with the first exit guarded by its anchor.
   An anchor that holds only where the first does (the same one again, or `\A` after `^`) is never the first to hold, so it is dropped.
-  What still differs is a second exit with a consuming way after it (`(\B|a|\z|b)+`): where the continuation stands among the ways then depends on which of the two anchors holds at each head, and each pair of anchors needs a form of its own.
-  `\b` and `\B` right after one another hold together everywhere, so they are an empty way, but writing them so fixed no pattern of those draws and moved one the wrong way, so they keep their text.
+  A second exit with a consuming way after it (`(\B|a|\z|b)+`), any number of exits, and a way that holds an anchor beside an item that may match nothing (`\Aa*`, `\B(\w*)`) are written since [#6473](https://github.com/rust-works/succinctly/issues/6473), way by way (`onig_loop::exits_repeat`): `"a b" | [match("(\\Aa*|\\B){2,}?";"g") | .string]` is `[""]`, and `" ab" | [match("((?:a|b*)\\A|\\ba*|\\bb){2,3}?";"g") | .string]` is `["","",""]`, as in jq.
+  Which exit holds first at a head depends only on the anchors that hold there, `\b` or `\B`, and `\A` or `^` at the loop's first head alone, so each kind of head is written behind those anchors with its own ways before and after the exit, and the exit is the body's empty way, which takes the first exit that holds and sets the groups that one sets.
+  An end anchor holds where no way consumes text, so the empty way takes it wherever it is tried; a `$` exit beside a way that may consume a newline keeps its text, since jq's `$` also holds before a newline that ends the text.
+  `\b` and `\B` right after one another hold nowhere (jq's `match("\\b\\B")` matches no string), so such a way is an exit that never holds.
+  A pattern with `\z` or a `$` before its end runs on `fancy-regex`, which takes the plain rewrite but not the one that copies capture groups, so a loop that needs its groups copied keeps its text there ([#6488](https://github.com/rust-works/succinctly/issues/6488)): `"ba b" | [match("(?:$\\z|\\B(\\w*)){2,}";"g") | .string]` is `["",""]` in jq and `["a",""]` here.
+  Of the 24 patterns of the draws below that still differ, 23 hold `$` or `\z` and a capture group; the other is a lazy `{0,2}?`, which keeps its text (#6428).
+  Over the same three draws (`--assert`, seeds 3, 4 and 5) the patterns that differ fall from 55 to 24, and seeds 3 to 7 fix 54 and break none, with `--newlines` and the flag `gx` too; `--bounded` fixes 21 over seeds 3 to 5, and the plain, `--nest`, `--ways`, `--fancy` and `--blanks` draws break none.
+  A second draw of 13,500 patterns with three to seven ways, two to four exits, runs of anchors, nested groups and subjects with `é`, digits, blanks and newlines, under `g`, `gi` and `gx`, fixes more than a thousand cases and breaks none.
+  Where the way-by-way form is not written, a body with a dropped last exit keeps the form of #6424, and a lazy loop with a group inside another repeat keeps its text, which reads the group as jq does: `" a" | [match("((?:(\\B|.|\\b\\b){2,}?)*)\\z";"g") | .captures[1].string]` is `["",""]`.
   Over three draws of 1,500 loops with anchors (`--assert`, seeds 3, 4 and 5) the patterns that differ fall from 91 to 55, and none changed the other way; seeds 6 and 7 and the flag `gx` broke none either.
   Over 3,744 generated loops (two anchors, four middle ways, two prefixes, thirteen quantifiers, six strings) 433 patterns that differed agree and none changed the other way.
   The flag `gi` and `--assert --newlines` broke none either.
@@ -7906,9 +7959,9 @@ These keep their loop as written, and still match longer than jq where the shape
   A `^` holds again after a newline that a way ends with, so only a body no way of which can end with one is written, as `\A` is.
   What keeps its text, and differs, is a `$` with a way after it that may start with a newline or not (`\s`, `[^b]`, `\W`; `.` too, since the flag that lets it match one is not tracked) or that the parser cannot read, a `^` beside a way that can end with a newline (`"a\nb" | [match("(?m)(^|a|\\n|b)*";"g") | .string]` is `["","\n","",""]` in jq and `["","\nb",""]` here), a `(?m)` that something switches, and a search told to find no empty match (the `n` flag).
   No closed form is known for those: the `regex` crate has no complement of a line anchor and no lookahead to build one, and a way that starts either way cannot be split by its first character in general.
-  Over draws of 3,000 loops under `(?m)` (`--assert --newlines --multiline`, seeds 2, 3 and 4) the patterns that differ fall from 273, 260 and 255 to 235, 229 and 219, and two in all changed the other way (`(?m)((?<n>a)\w|(?<n>a)|^^)+` and, under `gi`, `(?m)x?(\A|\n|^)*`), each on a subject that ends with a newline, where it was right because of the end-of-text `^` below.
-  Most of those left differ in the bare `^` as well: `(?m)^` holds at the end of a text that ends with a newline, where Oniguruma's does not ([#6456](https://github.com/rust-works/succinctly/issues/6456)).
-  Of the 235 left in seed 2, 189 agree with jq on every subject that does not end with a newline.
+  Over draws of 3,000 loops under `(?m)` (`--assert --newlines --multiline`, seeds 2, 3 and 4) the patterns that differ fall from 273, 260 and 255 to 235, 229 and 219.
+  Since [#6456](https://github.com/rust-works/succinctly/issues/6456) the bare `^` agrees with jq at the end of a text that ends with a newline, and on the same draws 60, 64 and 67 patterns differ, none of them broken by it.
+  Two patterns that the end-of-text `^` had made differ the other way (`(?m)((?<n>a)\w|(?<n>a)|^^)+` and, under `gi`, `(?m)x?(\A|\n|^)*`) agree with jq on `"a\n"`, `"aa\n"`, `"a\n\n"` and `"ab\n"`, since the caret check reads a pattern that repeats a group name through the renamed copy ([#6430](https://github.com/rust-works/succinctly/issues/6430)).
   An assertion in a way that also consumes text is not this case: `\Ba`, `a\z` and `^a` always consume when they match.
   They are copied with the other ways, and `"ba" | [match("(?:b*|\\Ba)+") | .string]` is `["b","",""]`, as in jq ([#6300](https://github.com/rust-works/succinctly/issues/6300)).
 - **A body with a flag switch** (`(?i)` inside it) is rewritten with the switch scoped over what it reaches, as `(?i:..)` around the items after it and around every later way ([#6301](https://github.com/rust-works/succinctly/issues/6301)): `"ba" | [match("(?:(?i)b*|a)+"; "g") | .string]` is `["b","",""]` in jq and here.
@@ -7985,6 +8038,14 @@ A text that ends in two newlines is searched the same way, because `$` is just b
   A `$` ending a branch inside a group counts as followed (`(?:b$|x)\n`), and under the `x` flag so does one before blanks or a comment.
   A pattern `fancy-regex` cannot compile keeps the two searches (the first bullet above).
   Pinned in `tests/jq_cli/i6080.rs`.
+- **A loop with groups in such a pattern is written with its groups copied only where nothing can match the final newline (#6488).**
+  The exact route used to run the plain loop rewrite alone, which keeps a loop as written when it would copy a group, so `"ba b" | [match("(?:$\\z|\\B(\\w*)){2,}";"g") | .string]` was `["a",""]` where jq's is `["",""]`.
+  The capture and group-copies rewrites now run there too, on `fancy-regex`, but they read `$` as the end of the text, which it is only where no part of the pattern can match the newline it may stand before.
+  So a pattern with an escape, class or `.` that may match a newline keeps the plain rewrite, as does one under the `m` or `p` flag (they make `.` match one), and one with a group that holds nothing but anchors (also through other groups, switches, comments, lookarounds and blanks: `((?i)\z)`), which the group-copies rewrite can drop ([#6492](https://github.com/rust-works/succinctly/issues/6492)).
+  `fancy-regex` 0.20 merges a repeat of a group whose body is an unbounded lazy repeat when it runs a pattern itself (`"abc" | match("(?=a)(?:(.+?)*)c") | .captures[0].string` is `"b"` in jq and `"ab"` there), and the copies of a lazy loop write that shape (`(?:(.*?)|$\b)+?c` is written `(?:(.*?)|$\b)(?:(.+?)*?)c`), so a rewrite for this route holding it keeps the pattern as it was.
+  Which of those the engine answers wrongly depends on the text too (`(b+?)*` and `(.*?)*` are answered right), so the check over-reports, and it is not made on the lookaround route of #6426, where the pattern as written would answer its loop wrongly instead.
+  The copies can need far more backtracking than the pattern as written, so a search that exhausts `fancy-regex`'s budget on them is answered by the pattern as written: `"ba" | [match("(?:(b*|(?:(a)|b?){0,2}(b|)*){0,12}?$|c){0,3}";"g") | .string]` is `["ba",""]`, as in jq.
+  Pinned in `tests/jq_cli/i6488.rs`.
 
 ## A slice is a path component
 
@@ -14076,13 +14137,16 @@ Two residuals remain, both with a missing file *and* a feature that routes input
   jq stops after one more line, record or event past a missing file, and reaches a missing file only when the reader gets to it.
   A filter that uses `input`/`inputs` under `-n` reports a missing file when a read reaches it, since [#6475](https://github.com/rust-works/succinctly/issues/6475): `jq -n -c input data.json missing` prints the first value and exits 0, as in jq, because the reader never asks for the file after it.
   A read that finds the stream at its end reports every one it has not reached, and a failure fails the run when it is reported.
+  So does the read of a fault at the end of the text, since [#6480](https://github.com/rust-works/succinctly/issues/6480): `[1,` waits for more, so jq's parser asks the reader for the next file before it raises `Unfinished JSON term at EOF` (`jq -n '[inputs]' t1.json missing` reports `missing` and exits 2, and under `try` the run still exits 2).
   Two cases still report a missing file up front: the chunked `--stream` walk, and a file whose last value is a bare number or literal with no newline after it, which completes only at the end of its file and so sends jq's reader on to the next one (`jq -n input one.json missing`, `one.json` holding `1`).
   A plain `--stream` walk stops as jq does, after the one event past a missing file (`jq -c --stream . missing a.json` over `[3]` prints `[[0],3]` and not the closing `[[0]]`, #6006); it still reports the missing file up front.
   The output of `-R` and `-s` over files that all exist is unchanged; only the run that has a missing file differs.
 * `-R` stops as jq does, after the one line past a missing file (`jq -R . missing lines.txt` prints the first line only, #6464), but still reports a second missing file that jq never reaches up front.
   `-n` with `input_line_number` and no `input`/`inputs` opens no file, so it reports no missing one (#6464).
 * jq keeps the name of the last file it tried even when it did not open, so a diagnostic or `input_filename` after a missing last file names that file (`jq -s -c input_filename data.json missing` prints `"missing"`).
-  `succinctly jq` names the last file that opened, because a file that did not open takes no source index.
+  `succinctly jq` does the same once a read reaches the end of the input, since [#6480](https://github.com/rust-works/succinctly/issues/6480): the missing last file is a source past the ones that opened, at line 0, so `[inputs], input_filename` under `-n`, an error after `[inputs]`, and every `-s` route name it.
+  Two cases still name the last file that opened: a value that its read completes at the end of the input (a bare number or literal in the last bytes, `jq -c input_filename num.json missing` over `12`, and the last `-R` line with no newline), and a fault at the end of the text (`[1,`).
+  The `--stream` and `--stream-errors` readers set their positions themselves and still name the last file that opened throughout.
 
 ## Bare `..`/`recurse` on a `$var` off the register (#3048; its nested-fold residual closed by #4779)
 

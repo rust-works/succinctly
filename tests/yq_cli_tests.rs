@@ -11920,21 +11920,19 @@ fn test_yaml_anchored_first_item_of_explicit_key_sequence_binds() -> Result<()> 
 fn test_yaml_explicit_non_scalar_key_dash_tab_separated() -> Result<()> {
     // Same construct as `test_yaml_explicit_non_scalar_key_headline_repro`
     // (`? - a\n  - b\n: value`), but with a tab instead of a space after each
-    // `-`. `parse_explicit_key`'s inline dispatch on the key's first byte
-    // matched `Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\n' |
-    // b'\r') | None)` - missing the tab that every sibling `-` check in this
-    // file, and the canonical `is_seq_indicator_next` (#332), already
-    // include. Before the fix, `-\ta` fell through to being parsed as a
-    // plain scalar key instead of a sequence key, and the second item and
-    // the value were lost entirely: `{"-\ta":["b"]}` instead of
-    // `{"":"value"}` (#434).
+    // `-`. The loader's inline dispatch on the key's first byte missed the tab that every sibling
+    // `-` check in this file includes, so `-\ta` was read as a plain scalar key and the second item
+    // and the value were lost: `{"-\ta":["b"]}` instead of `{"":"value"}` (#434). That is still
+    // what the library loader reads (`tests/yaml_explicit_indicator_tab_tests.rs`). yq refuses a
+    // tab after the `-` (go-yaml skips no tab where a simple key is allowed), and `succinctly yq`
+    // refuses it as well since #6414.
     let input = "? -\ta\n  -\tb\n: value\n";
-    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(
-        output.trim(),
-        r#"{"":"value"}"#,
-        "the tab form must parse the same document as the space form"
+    let (output, err, exit_code) = run_yq_stdin_with_stderr(".", input, &["-o=json", "-I=0"])?;
+    assert_ne!(exit_code, 0);
+    assert_eq!(output, "");
+    assert!(
+        err.contains("found character that cannot start any token"),
+        "{err}"
     );
     Ok(())
 }
