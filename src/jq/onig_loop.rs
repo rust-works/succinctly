@@ -211,8 +211,11 @@ impl Cond {
 fn may_take_newline(text: &str) -> bool {
     const WORD_PROPERTIES: [&str; 8] = ["Alphabetic", "M", "Nd", "Pc", "L", "Lu", "Ll", "N"];
     let mut rest = text;
+    // The class depth, and the code point of the item before, which a `-` may make a range from.
+    let (mut classes, mut prev): (u32, Option<u32>) = (0, None);
     while let Some(c) = rest.chars().next() {
         let after = &rest[c.len_utf8()..];
+        let mut point = None;
         rest = match c {
             '\\' => {
                 let Some(e) = after.chars().next() else {
@@ -227,7 +230,10 @@ fn may_take_newline(text: &str) -> bool {
                     },
                     'x' => match tail.strip_prefix('{').and_then(|t| t.split_once('}')) {
                         Some((hex, tail)) => match u32::from_str_radix(hex, 16) {
-                            Ok(code) if code != 0x0A => tail,
+                            Ok(code) if code != 0x0A => {
+                                point = Some(code);
+                                tail
+                            }
                             _ => return true,
                         },
                         None => return true,
@@ -236,12 +242,29 @@ fn may_take_newline(text: &str) -> bool {
                 }
             }
             '[' if after.starts_with('^') => return true,
+            '[' => {
+                classes += 1;
+                after
+            }
+            ']' => {
+                classes = classes.saturating_sub(1);
+                after
+            }
+            // A range from below a newline holds one (`[\x{1}-a]`).
+            '-' if classes > 0 => match prev {
+                Some(low) if low >= 0x0A => after,
+                _ => return true,
+            },
             '.' | '\n' => return true,
-            c if c.is_ascii_alphanumeric() => after,
-            '_' | '(' | ')' | '?' | ':' | '|' | '*' | '+' | '{' | '}' | ',' | '<' | '>' | '^'
-            | '$' | '[' | ']' | '-' | ' ' => after,
+            c if c.is_ascii_alphanumeric() || c == '_' || c == ' ' => {
+                point = Some(u32::from(c));
+                after
+            }
+            '(' | ')' | '?' | ':' | '|' | '*' | '+' | '{' | '}' | ',' | '<' | '>' | '^' | '$'
+            | '-' => after,
             _ => return true,
         };
+        prev = point;
     }
     false
 }
@@ -279,6 +302,9 @@ struct Anchor {
     /// it back as `E`, the body's empty way, last among each head's ways, where the first exit's `E`
     /// is guarded by the anchor ([`Rewriter::second_exit`]).
     last: bool,
+    /// With [`Anchor::last`], the body's ways one by one (#6473): a repeat writes them way by way,
+    /// and the form of #6424 where it does not ([`Rewriter::exits_repeat`]).
+    listed: Option<Vec<Way>>,
 }
 
 /// What a second exit after an anchor's comes to ([`Rewriter::second_exit`], #6424).
@@ -347,6 +373,9 @@ struct Rewriter<'p> {
     /// and a loop with groups inside one,
     /// written with its exit, is not read the way Oniguruma's is, so that loop keeps its own text.
     lazy_around: u32,
+    /// How many repeats enclose the part being converted (#6473): a lazy loop with groups written
+    /// way by way inside one reads its groups differently from Oniguruma's, so it keeps its text.
+    repeats_around: u32,
     /// Whether a lazy `*?`, `+?`, `{0,n}?` or `{1,n}?` with a group may be written out (#6428, #6427),
     /// and whether this reading depended on that: [`rewrite_parsed`] reads a pattern that gave up
     /// after such a repeat again without.
@@ -782,6 +811,7 @@ fn rewrite_parsed(pattern: &str, copies: bool, lead: &str, reading: usize) -> Op
         copies,
         exit: None,
         lazy_around: 0,
+        repeats_around: 0,
         lazy_bounded,
         lazy_bounded_written: false,
         lazy_trusted,
@@ -1141,7 +1171,10 @@ impl Rewriter<'_> {
                 if kept && self.lazy_trusted {
                     self.lazy_bounded_written |= has_capture(&rep.ast);
                     let changed = core::mem::take(&mut self.changed);
-                    let body = self.convert(&rep.ast, true)?;
+                    self.repeats_around += 1;
+                    let body = self.convert(&rep.ast, true);
+                    self.repeats_around -= 1;
+                    let body = body?;
                     let inner = core::mem::replace(&mut self.changed, changed);
                     let consuming = matches!(body.ways, Ways::Consuming);
                     let written = self.repeat_text(&body.text, min, max, rep.greedy)?;
@@ -1155,7 +1188,9 @@ impl Rewriter<'_> {
                     return Ok(piece);
                 }
                 self.lazy_around += u32::from(kept);
+                self.repeats_around += 1;
                 let body = self.convert(&rep.ast, true);
+                self.repeats_around -= 1;
                 self.lazy_around -= u32::from(kept);
                 self.counted_repeat(rep, body?, min, max, reduced)
             }
@@ -1219,6 +1254,7 @@ impl Rewriter<'_> {
                     text: text.clone(),
                     kind,
                     last: false,
+                    listed: None,
                 }),
                 after: None,
             },
@@ -1249,7 +1285,28 @@ impl Rewriter<'_> {
         }
         if let Ways::Exits(list) = &body.ways {
             let list = list.clone();
-            return self.exits_repeat(&rep.ast, &body.text, &list, min, max, rep.greedy);
+            let written = self.exits_repeat(&rep.ast, &body.text, &list, min, max, rep.greedy)?;
+            return match written {
+                Some(piece) => Ok(piece),
+                None => Ok(Piece {
+                    text: self.repeat_text(&body.text, min, max, rep.greedy)?,
+                    ways: if has_capture(&rep.ast) {
+                        Ways::Unknown
+                    } else {
+                        Ways::Opaque
+                    },
+                }),
+            };
+        }
+        // #6473: a body read with #6424's dropped last exit is written way by way where it can be.
+        if let Ways::Anchored { anchor, .. } = &body.ways {
+            if let Some(list) = anchor.listed.clone() {
+                let written =
+                    self.exits_repeat(&rep.ast, &body.text, &list, min, max, rep.greedy)?;
+                if let Some(piece) = written {
+                    return Ok(piece);
+                }
+            }
         }
         if let Ways::Anchored {
             before,
@@ -1499,9 +1556,16 @@ impl Rewriter<'_> {
                 before: way(before)?,
                 after: way(after)?,
                 anchor: match (anchor, mark) {
-                    (false, mark) => mark,
+                    // #6473: the listing's consuming ways are in the group too.
+                    (false, mut mark) => {
+                        if let Some(list) = mark.listed.take() {
+                            mark.listed = Some(self.list_in(list, open)?);
+                        }
+                        mark
+                    }
                     (true, mark) => Box::new(Anchor {
                         last: mark.last,
+                        listed: None,
                         text: wrap(mark.text)?,
                         kind: match mark.kind {
                             AnchorKind::Word { fails } => AnchorKind::Word {
@@ -1515,16 +1579,21 @@ impl Rewriter<'_> {
             // #6473: the exits are written as `E` and their guards, so only a group (whose flags
             // do not reach those) has its consuming ways wrapped.
             Ways::Exits(_) if anchor => Ways::Opaque,
-            Ways::Exits(list) => Ways::Exits(
-                list.into_iter()
-                    .map(|way| match way {
-                        Way::Consume(text) => wrap(text).map(Way::Consume),
-                        exit => Ok(exit),
-                    })
-                    .collect::<Result<_, _>>()?,
-            ),
+            Ways::Exits(list) => Ways::Exits(self.list_in(list, open)?),
             ways => ways,
         })
+    }
+
+    /// `list` inside the group that opens with `open`: each consuming way wrapped in it (#6473).
+    fn list_in(&self, list: Vec<Way>, open: &str) -> Result<Vec<Way>, GiveUp> {
+        list.into_iter()
+            .map(|way| match way {
+                Way::Consume(t) => self
+                    .text(format!("{open}{})", t.text), Prec::Atom)
+                    .map(Way::Consume),
+                exit => Ok(exit),
+            })
+            .collect()
     }
 
     fn concat_text(&self, items: &[&Text]) -> Result<Text, GiveUp> {
@@ -1654,6 +1723,7 @@ impl Rewriter<'_> {
                             text: self.concat_text(&[&first.text, &second.text])?,
                             kind,
                             last: false,
+                            listed: None,
                         }),
                         after: None,
                     },
@@ -1840,14 +1910,16 @@ impl Rewriter<'_> {
         if let (Some(exit), Some(first), false) = (second, &mut anchored, unknown || opaque) {
             match Self::second_exit(first, exit.as_deref(), late.is_empty()) {
                 Some(SecondExit::Same) => after.append(&mut late),
-                // #6473: a last exit is one more exit of the listing, which writes it at every
-                // kind of head; a way that is not listed keeps the form of #6424.
-                Some(SecondExit::Last)
-                    if items.iter().all(|item| Self::exit_ways(item).is_some()) =>
-                {
-                    opaque = true;
+                // #6473: a last exit is also one more exit of the listing, which a repeat writes at
+                // every kind of head, keeping the form of #6424 where it does not.
+                Some(SecondExit::Last) => {
+                    first.last = true;
+                    first.listed = items
+                        .iter()
+                        .map(Self::exit_ways)
+                        .collect::<Option<Vec<_>>>()
+                        .map(|lists| lists.concat());
                 }
-                Some(SecondExit::Last) => first.last = true,
                 None => opaque = true,
             }
         }
@@ -2429,8 +2501,9 @@ impl Rewriter<'_> {
                 anchor,
                 after,
             } if !anchor.last => around(before, Cond::of(&anchor.text.text)?, after),
+            Ways::Anchored { anchor, .. } => anchor.listed.clone()?,
             Ways::Exits(list) => list.clone(),
-            Ways::Anchored { .. } | Ways::Opaque | Ways::Unknown => return None,
+            Ways::Opaque | Ways::Unknown => return None,
         })
     }
 
@@ -2450,8 +2523,9 @@ impl Rewriter<'_> {
     ///   leaves once the minimum has run, as [`Self::anchored_repeat`] writes its copies; a lazy
     ///   repeat past its minimum leaves first, which is the lazy repeat of every consuming way.
     ///
-    /// What is copied, unrolled or kept follows [`Self::anchored_repeat`]. A form that grows past
-    /// the limit keeps the repeat as written.
+    /// What is copied, unrolled or kept follows [`Self::anchored_repeat`]. `None` where the repeat
+    /// is not written this way: kept as written, or for a body with #6424's dropped last exit,
+    /// written as [`Self::anchored_repeat`] writes it.
     fn exits_repeat(
         &mut self,
         ast: &Ast,
@@ -2460,14 +2534,13 @@ impl Rewriter<'_> {
         min: u32,
         max: Option<u32>,
         greedy: bool,
-    ) -> Result<Piece, GiveUp> {
-        let grouped = has_capture(ast);
-        let ways = if grouped { Ways::Unknown } else { Ways::Opaque };
-        let written = self.repeat_text(body, min, max, greedy)?;
-        let kept = Piece {
-            text: written.clone(),
-            ways: ways.clone(),
+    ) -> Result<Option<Piece>, GiveUp> {
+        let ways = if has_capture(ast) {
+            Ways::Unknown
+        } else {
+            Ways::Opaque
         };
+        let written = self.repeat_text(body, min, max, greedy)?;
         let consumes = list.iter().any(|way| matches!(way, Way::Consume(_)));
         let exits = list
             .iter()
@@ -2480,9 +2553,15 @@ impl Rewriter<'_> {
             && list
                 .iter()
                 .any(|way| matches!(way, Way::Consume(text) if may_take_newline(&text.text)));
-        if !consumes || !exits || dollar_taken || self.has_groups(&written) || self.lazy_around > 0
+        let nested_lazy = !greedy && self.repeats_around > 0 && has_capture(ast);
+        if !consumes
+            || !exits
+            || dollar_taken
+            || nested_lazy
+            || self.has_groups(&written)
+            || self.lazy_around > 0
         {
-            return Ok(kept);
+            return Ok(None);
         }
         let ops = onig_ops(ast, self.folds).filter(|_| !self.shadowed);
         let copied = |length: Option<usize>, count: u32| {
@@ -2496,23 +2575,23 @@ impl Rewriter<'_> {
             (true, None) => false,
         };
         if keeps {
-            return Ok(kept);
+            return Ok(None);
         }
-        match self.exits_text(
-            ast,
-            body,
-            list,
-            min,
-            max,
-            greedy,
-            ops.is_some_and(|ops| copied(Some(ops), min)),
-        ) {
-            Ok(text) => {
-                self.changed = true;
-                Ok(Piece { text, ways })
-            }
-            Err(GiveUp) => Ok(kept),
-        }
+        let copies = ops.is_some_and(|ops| copied(Some(ops), min));
+        // A form that gives up leaves the work it charged, which the rest of the pattern needs.
+        let work = self.work.get();
+        Ok(
+            match self.exits_text(ast, body, list, min, max, greedy, copies) {
+                Ok(text) => {
+                    self.changed = true;
+                    Some(Piece { text, ways })
+                }
+                Err(GiveUp) => {
+                    self.work.set(work);
+                    None
+                }
+            },
+        )
     }
 
     /// The text of [`Self::exits_repeat`]; `copies` when Oniguruma writes the minimum of a greedy
@@ -3795,8 +3874,23 @@ mod tests {
             assert!(!may_take_newline(text), "{text:?}");
         }
         for text in [
-            r"\n", ".", "[^a]", r"\s", r"\W", r"\p{Zs}", r"\p", r"\x{A}", r"\x{zz}", r"\x0A", "\n",
-            "\\", "#", "a\u{e9}",
+            r"[\x{1}-a]",
+            r"[\x{9}-\x{b}]",
+            "[-a]",
+            r"\n",
+            ".",
+            "[^a]",
+            r"\s",
+            r"\W",
+            r"\p{Zs}",
+            r"\p",
+            r"\x{A}",
+            r"\x{zz}",
+            r"\x0A",
+            "\n",
+            "\\",
+            "#",
+            "a\u{e9}",
         ] {
             assert!(may_take_newline(text), "{text:?}");
         }

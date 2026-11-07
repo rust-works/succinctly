@@ -59,3 +59,47 @@ fn a_dollar_exit_beside_a_way_that_takes_a_newline_keeps_its_text_6473() -> Resu
     );
     Ok(())
 }
+
+/// Where the way-by-way form is not written (a `$` exit beside a way that may take a newline, a loop
+/// inside a lazy repeat that keeps its text), a body with #6424's dropped last exit keeps that form,
+/// and anything else keeps its text: both already answer as jq does.
+#[test]
+fn a_loop_the_listing_declines_keeps_what_it_had_6473() -> Result<()> {
+    for (pattern, subject, want) in [
+        // `$` beside `\W`, which may take a newline: the form of #6424.
+        (r"(?:$\b|\W|\A\B){2}", " ", "[[0,\"\",[]]]\n"),
+        // the same inside a counted repeat of three, before `$`.
+        (
+            r"\b(?:\W|(?:\b$)|\w+|\A\B){3}$",
+            "a\n",
+            "[[0,\"a\",[]],[1,\"\",[]]]\n",
+        ),
+        // inside an outer lazy repeat, which keeps the inner loop's own form.
+        (r"(?:(?:\A\B| |a+|\b\b){2})+?b", "ab", "[]\n"),
+        // a lazy loop inside a greedy one, before `\z`.
+        (
+            r"((?:(\B|.|\b\b){2,}?)*)\z",
+            " a",
+            "[[0,\" a\",[\" a\",\"\"]],[2,\"\",[\"\",\"\"]]]\n",
+        ),
+        // a class range from below a newline takes it.
+        (
+            r"(?:\A\B|$\B|[\x{1}-a])*",
+            " \n",
+            "[[0,\"\",[]],[1,\"\",[]],[2,\"\",[]]]\n",
+        ),
+        // the same with a range around the newline.
+        (
+            r"(?:\A\B|$\B|[\x{9}-\x{b}])*",
+            " \n",
+            "[[0,\"\",[]],[1,\"\",[]],[2,\"\",[]]]\n",
+        ),
+    ] {
+        assert_eq!(
+            matches(pattern, subject)?,
+            want,
+            "{pattern:?} on {subject:?}"
+        );
+    }
+    Ok(())
+}
