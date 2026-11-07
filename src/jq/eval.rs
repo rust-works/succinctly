@@ -28190,10 +28190,11 @@ impl JqRegex {
             return Ok(caps);
         }
         match exact.engine() {
-            Some(engine) => engine
-                .captures_from_pos(input, start)
-                .map(|found| found.map(RegexCaptures::Fancy))
-                .map_err(fancy_match_error),
+            // A search that fails (its backtrack limit) keeps the crate's match, as before.
+            Some(engine) => Ok(match engine.captures_from_pos(input, start) {
+                Ok(found) => found.map(RegexCaptures::Fancy),
+                Err(_) => caps,
+            }),
             None => Ok(caps),
         }
     }
@@ -28204,12 +28205,13 @@ impl JqRegex {
         }
         match &self.engine {
             RegexEngine::Std(re) | RegexEngine::Rewritten { re, .. } => {
-                if self.caret_end.is_some() && ends_with_trailing_newline(input) {
-                    // A match may stand on a `^` at the end of the text, which is not one: the
-                    // search that checks it is the only one run.
+                let found = dv_is_match(re, input, self.needs_trailing_nl_check);
+                if found && self.caret_end.is_some() && ends_with_trailing_newline(input) {
+                    // The match may stand on a `^` at the end of the text, which is not one. When
+                    // the crate finds none, Oniguruma's, a subset of its, finds none either.
                     return Ok(self.captures_at(input, 0)?.is_some());
                 }
-                Ok(dv_is_match(re, input, self.needs_trailing_nl_check))
+                Ok(found)
             }
             RegexEngine::Fancy(re) | RegexEngine::RewrittenFancy { re, .. } => {
                 re.is_match(input).map_err(fancy_match_error)
@@ -33385,8 +33387,12 @@ fn build_regex_uncached<S: EvalSemantics>(
             engine,
             needs_trailing_nl_check,
             exact_end: needs_trailing_nl_check.then(|| ExactEnd::new(&pattern)),
-            caret_end: (S::TAG != EvalTag::Yq && has_multiline_caret(&pattern))
-                .then(|| ExactEnd::new(as_written.as_deref().unwrap_or(&pattern))),
+            caret_end: {
+                // The text the exact engine reads is the one that says where the `^` stand.
+                let written = as_written.as_deref().unwrap_or(&pattern);
+                (S::TAG != EvalTag::Yq && has_multiline_caret(written))
+                    .then(|| ExactEnd::new(written))
+            },
             suppress_empty,
             engine_not_empty: false,
             longest: None,

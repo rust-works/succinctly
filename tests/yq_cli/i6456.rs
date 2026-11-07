@@ -16,3 +16,21 @@ fn yq_keeps_go_s_multiline_caret_at_the_end_of_the_text_6456() -> Result<()> {
     assert_eq!((stdout.trim_end(), status), ("[0,2]", 0));
     Ok(())
 }
+
+#[test]
+fn yq_keeps_go_s_multiline_caret_in_test_sub_and_match_6456() -> Result<()> {
+    // Each row was captured from yq v4.53.3.
+    for (filter, input, expected) in [
+        (r#"test("(?m)\n^")"#, "\"a\\n\"\n", "true"),
+        (r#"sub("(?m)^";">")"#, "\"a\\n\"\n", "\">a\\n>\""),
+        (
+            r#"[match("(?m)^";"g") | .offset]"#,
+            "\"a\\nb\\n\"\n",
+            "[0,2,4]",
+        ),
+    ] {
+        let (stdout, status) = run_yq_stdin(filter, input, &["-o=json", "-I0"])?;
+        assert_eq!((stdout.trim_end(), status), (expected, 0), "{filter}");
+    }
+    Ok(())
+}
