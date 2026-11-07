@@ -5783,6 +5783,15 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
                     return GenericResult::Owned(answer);
                 }
             }
+            // #6523: `implode` of an array of plain integers (what `explode` built) is a fresh
+            // string; an element of any other kind declines and the bridge answers.
+            Expr::Builtin(Builtin::Implode) if container => {
+                if let Some(answer) =
+                    crate::jq::eval::eval_owned_string_stage::<S>(strip_parens(expr), &owned)
+                {
+                    return GenericResult::Owned(answer);
+                }
+            }
             // #5606: `[e]`, `{k: e}` and `. as $x | body` over the number, where `e` and the body
             // are shapes the owned routes answer; see `plain_number_answer`. The embed table gates
             // it as it gates the fast path below: the answer may then be a bound node's own value.

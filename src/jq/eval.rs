@@ -10805,8 +10805,8 @@ pub(crate) fn eval_owned_string_stage<S: EvalSemantics>(
         if !matches!(unwrap_paren(expr), Expr::Builtin(Builtin::Implode)) {
             return None;
         }
-        let mut text = String::with_capacity(items.len());
-        for item in items.iter() {
+        let mut text = string_with_capacity(items.len());
+        for item in items {
             let OwnedValue::Int(codepoint) = item else {
                 return None;
             };
