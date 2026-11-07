@@ -5804,6 +5804,14 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
         }
     }
 
+    // #6527: `add`, `min` and `max` of an array of computed numbers fold them, where the bridge
+    // would write every number out as text and parse it back (`map(. * 2) | max`).
+    if container {
+        if let Some(answer) = crate::jq::eval::eval_owned_number_fold::<S>(expr, &owned) {
+            return GenericResult::Owned(answer);
+        }
+    }
+
     // #5712: and over a string, which has no node identity to keep once no bound node can be it.
     // `select` and `if` settle their condition from the string (`select(length > 3)`) and a
     // verdict is a boolean that carries nothing from it. Only these two: `tojson` of a string is

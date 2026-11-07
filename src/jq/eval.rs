@@ -10917,6 +10917,79 @@ pub(crate) fn eval_owned_map_projection<S: EvalSemantics>(
     Some(OwnedValue::array_from(out))
 }
 
+/// `add`, `min` and `max` of an owned array of plain computed numbers, answered by folding them
+/// instead of through the re-index bridge (#6527): `map(. * 2) | add` wrote the 800,000 floats of
+/// the array out as text (a shortest-round-trip float each), indexed that text, and parsed every
+/// number back, which was 150 to 160 ms that jq 1.7.1 does not spend (0.64x to 0.75x of it on an
+/// Apple M5).
+///
+/// "Plain" is [`is_plain_finite_number`]: an `Int`, or a `Float` that is neither a NaN nor an
+/// infinity. Such a number has no storage identity to keep and no source spelling to preserve, so
+/// the fold's answer carries no node of the input, and the folds are the bridged builtins' own
+/// calls: `add` is [`arith_add`] from the first element (a one-element array is that element
+/// verbatim), `min` and `max` are [`jq_min_by`] and [`jq_max_by`] over [`compare_values`], so
+/// which of two equal elements each keeps (`1` and `1.0`) is the bridge's. The infinities decline
+/// because the bridge writes one out as the largest finite float, so `[infinite, -infinite] | add`
+/// is `0` there; that is its own answer to keep, not this door's to change.
+///
+/// Everything else declines, so the bridge keeps its diagnostics and its rules: an empty array
+/// (`null`), an element of any other kind, an object (`add` iterates its values in an order of
+/// its own), a scalar, and yq mode, whose `min` and `max` raise (`S::MIN_MAX_NEED_AN_ELEMENT`).
+/// The stage may be wrapped as every front door's is (parentheses, a one-stage pipe, identity
+/// stages). Not under an embed table, where [`eval_owned_relocating_fold`] owns these builtins.
+///
+/// A number the fold answers is the input's own (`min`/`max`), an `Int` or `Float` where the bridge
+/// re-reads a `NumberLiteral`: two spellings of one value that every printer renders alike (pinned
+/// by `owned_number_fold_agrees_with_the_reindex_bridge_6527`).
+pub(crate) fn eval_owned_number_fold<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let OwnedValue::Array(items) = input else {
+        return None;
+    };
+    let builtin = match unwrap_paren(expr) {
+        Expr::Pipe(stages) => match skip_identity_stages(stages) {
+            [only] => match unwrap_paren(only) {
+                Expr::Builtin(builtin) => builtin,
+                _ => return None,
+            },
+            _ => return None,
+        },
+        Expr::Builtin(builtin) => builtin,
+        _ => return None,
+    };
+    if !matches!(builtin, Builtin::Add | Builtin::Min | Builtin::Max)
+        || items.is_empty()
+        || !items.iter().all(is_plain_finite_number)
+        || super::eval_generic::embed_table_active()
+    {
+        return None;
+    }
+    match builtin {
+        Builtin::Add => {
+            let mut rest = items.iter().cloned();
+            let first = rest.next()?;
+            rest.try_fold(first, arith_add::<S>).ok()
+        }
+        Builtin::Min => jq_min_by(items.iter().cloned(), compare_values::<S>),
+        _ => jq_max_by(items.iter().cloned(), compare_values::<S>),
+    }
+}
+
+/// An `Int`, or a `Float` that is neither a NaN nor an infinity: the numbers
+/// [`eval_owned_number_fold`] folds (#6527).
+fn is_plain_finite_number(value: &OwnedValue) -> bool {
+    match value {
+        OwnedValue::Int(_) => true,
+        OwnedValue::Float(f) => f.is_finite(),
+        _ => false,
+    }
+}
+
 /// The body of `map(body)` when `expr` is that one stage, however it is wrapped: in parentheses,
 /// or as the only non-identity stage of a pipe (`. | map(.a)`), as the other front doors read it
 /// (`test_single_stage_front_doors_agree_with_the_wrapped_pipe_3673`).
@@ -12064,6 +12137,13 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
             Demand::Stop => Flow::Stopped { pending: None },
         });
     }
+    // #6527: `add`, `min` and `max` of an owned array of computed numbers fold them.
+    if let Some(folded) = eval_owned_number_fold::<S>(expr, input) {
+        return Some(match sink(folded) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        });
+    }
     // #5816: a string-to-string stage (`ltrimstr("x")`, `tostring`, `. + "x"`) of an owned string.
     if let Some(answer) = eval_owned_string_stage::<S>(expr, input) {
         return Some(match sink(answer) {
@@ -13105,7 +13185,9 @@ fn projection_peel<S: EvalSemantics>(
     // #6122: or `map(.field)`, which steps to the array of those fields.
     let counted = eval_owned_count_door::<S>(first, input)
         .or_else(|| eval_owned_string_stage::<S>(first, input))
-        .or_else(|| eval_owned_map_projection::<S>(first, input));
+        .or_else(|| eval_owned_map_projection::<S>(first, input))
+        // #6527: or `add`, `min` or `max` of an array of computed numbers.
+        .or_else(|| eval_owned_number_fold::<S>(first, input));
     if counted.is_none() && !is_peelable_head::<S>(first) {
         return None;
     }
@@ -149226,6 +149308,116 @@ mod tests {
             }
         }
         assert!(taken > 250, "the matrix must reach the door: {taken}");
+    }
+
+    /// #6527: [`eval_owned_number_fold`] answers what the reindex bridge answers for every array of
+    /// one to three plain numbers (integers, including past 2^53, floats, `-0`, ties between `1`
+    /// and `1.0`, floats at both ends of the range) under `add`, `min` and `max`, spelled every way
+    /// its stage may be wrapped.
+    #[test]
+    fn owned_number_fold_agrees_with_the_reindex_bridge_6527() {
+        let pool = [
+            OwnedValue::Int(0),
+            OwnedValue::Int(1),
+            OwnedValue::Int(-3),
+            OwnedValue::Int(9007199254740993),
+            OwnedValue::Int(i64::MAX),
+            OwnedValue::Float(1.0),
+            OwnedValue::Float(1.5),
+            OwnedValue::Float(-0.0),
+            OwnedValue::Float(0.1),
+            OwnedValue::Float(1e308),
+            OwnedValue::Float(-1e308),
+            OwnedValue::Float(5e-324),
+        ];
+        let mut arrays = Vec::new();
+        for a in &pool {
+            arrays.push(vec![a.clone()]);
+            for b in &pool {
+                arrays.push(vec![a.clone(), b.clone()]);
+                for c in &pool {
+                    arrays.push(vec![a.clone(), b.clone(), c.clone()]);
+                }
+            }
+        }
+        let sources = [
+            "add",
+            "min",
+            "max",
+            "(add)",
+            "(max)",
+            ". | min",
+            "(. | add)",
+        ];
+        let mut taken = 0;
+        for src in sources {
+            let expr = parse(src).unwrap();
+            for items in &arrays {
+                let value = OwnedValue::array_from(items.clone());
+                let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, &value, false,
+                ));
+                let door = eval_owned_number_fold::<JqSemantics>(&expr, &value)
+                    .map(|v| (vec![v], "ok".to_string()))
+                    .unwrap_or_else(|| panic!("{src:?} on {value:?} was declined"));
+                taken += 1;
+                assert_eq!(
+                    select_door_observable(&door),
+                    select_door_observable(&bridge),
+                    "{src:?} on {value:?} disagrees with the reindex bridge"
+                );
+                assert!(
+                    eval_owned_number_fold::<YqSemantics>(&expr, &value).is_none(),
+                    "yq mode keeps its own `{src}`"
+                );
+            }
+        }
+        assert!(taken > 10_000, "the matrix must reach the door: {taken}");
+    }
+
+    /// #6527: the fold declines what it cannot answer identically, so the bridge keeps its
+    /// diagnostics and its rules: an empty array, an element that is not a plain number (a
+    /// number literal, a NaN, an infinity, a string, `null`, a container), an object, a scalar,
+    /// and a stage that is not `add`, `min` or `max`.
+    #[test]
+    fn owned_number_fold_declines_what_it_cannot_answer_identically_6527() {
+        let array = |items: Vec<OwnedValue>| OwnedValue::array_from(items);
+        let run = |src: &str, input: &OwnedValue| {
+            eval_owned_number_fold::<JqSemantics>(&parse(src).unwrap(), input)
+        };
+        assert!(run("add", &array(vec![])).is_none());
+        assert!(run("max", &array(vec![])).is_none());
+        for odd in [
+            OwnedValue::from_number_literal::<JqSemantics>("1.50"),
+            OwnedValue::Float(f64::NAN),
+            OwnedValue::Float(f64::INFINITY),
+            OwnedValue::Float(f64::NEG_INFINITY),
+            OwnedValue::String("s".into()),
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            array(vec![OwnedValue::Int(1)]),
+        ] {
+            for src in ["add", "min", "max"] {
+                assert!(run(src, &array(vec![OwnedValue::Int(1), odd.clone()])).is_none());
+                assert!(run(src, &array(vec![odd.clone()])).is_none());
+            }
+        }
+        let numbers = array(vec![OwnedValue::Int(1), OwnedValue::Float(2.5)]);
+        let object = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        assert!(run("add", &object).is_none());
+        assert!(run("add", &OwnedValue::Int(1)).is_none());
+        for src in [
+            "length",
+            "sort",
+            "add + 1",
+            "map(.)",
+            "add | . + 1",
+            "first",
+            "add, max",
+        ] {
+            assert!(run(src, &numbers).is_none(), "{src}");
+        }
+        assert!(run("add", &numbers).is_some());
     }
 
     /// #6122: the door declines what it cannot answer identically. An element that raises at a
