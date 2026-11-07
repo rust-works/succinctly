@@ -100412,10 +100412,12 @@ mod remaining_inputs {
     /// What is called when a read reaches a source, or the end of the stream.
     pub type ReadHook = Box<dyn FnMut(Option<u32>)>;
 
-    /// Registers `hook`, called by every read of the queue once it knows where it reads from: with
-    /// the source tag of the document, or parse error, it returns, and with `None` when it finds
-    /// the stream at its end (#6475). The read has moved the marker by then and has not returned
-    /// yet, so what the hook prints comes before what the read hands back.
+    /// Registers `hook` for every read of the queue (#6475).
+    ///
+    /// It is called once the read knows where it reads from: with the source tag of the document,
+    /// or parse error, it returns, and with `None` when it finds the stream at its end. The read
+    /// has moved the marker by then and has not returned yet, so what the hook prints comes before
+    /// what the read hands back.
     ///
     /// jq's reader opens a file when it has read the one before and asks for more, and says so
     /// then if it cannot (`jq_util_input_read_more`): a program that stops reading earlier never
@@ -101000,9 +101002,10 @@ pub fn pop_input() -> InputPop {
     remaining_inputs::pop_input()
 }
 
-/// Registers what the CLI wants told when a read of the `input`/`inputs` queue reaches a source (its
-/// tag) or finds the stream at its end (`None`), before the read returns (#6475). A seed clears it,
-/// so a driver sets it after seeding.
+/// Registers a hook that every read of the `input`/`inputs` queue calls (#6475).
+///
+/// It is told the source tag the read reached, or `None` when the read finds the stream at its end,
+/// before the read returns. A seed clears it, so a driver sets it after seeding.
 #[cfg(feature = "std")]
 pub fn set_input_read_hook(hook: impl FnMut(Option<u32>) + 'static) {
     remaining_inputs::set_read_hook(Box::new(hook));
