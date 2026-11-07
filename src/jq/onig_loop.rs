@@ -2676,8 +2676,9 @@ impl Rewriter<'_> {
     ///   iterations have run, last, since the loop tries that after the body fails;
     /// - a lazy `X{min,}?` or `X{min,max}?` that counts is [`Self::lazy_counted`], with `E` as the
     ///   exit; anything else lazy leaves first, and `c` is an exit that has already failed. A
-    ///   `{0,n}?` or `{1,n}?` here keeps its text: the way [`Self::concat_with`] builds for a group
-    ///   around an anchor leaves the group out of the consuming ways (#6428).
+    ///   bounded `{0,n}?` or `{1,n}?` with a `B` is [`Self::lazy_counted`] too, when copies are
+    ///   read back: the crate goes from `c`'s iteration on into `B`, with `c`'s group kept, where
+    ///   Oniguruma tried the exit first. Without a `B` it keeps its text, as does an unbounded one.
     fn anchored_repeat(
         &mut self,
         ast: &Ast,
@@ -2730,7 +2731,18 @@ impl Rewriter<'_> {
         };
         let text = match (greedy, max) {
             (false, _) => {
-                if min < 2 || (max.is_none() && self.oniguruma_unrolls(ast, min)) || anchor.last {
+                // #6358: under `{0,n}?` and `{1,n}?` the way after the anchor's is reached through
+                // the anchor's own iteration by the crate, which sets the anchor's group, where
+                // Oniguruma tried the repeat's exit first and the anchor's iteration ends the loop.
+                let short = min < 2
+                    && self.lazy_bounded
+                    && self.copies
+                    && after.is_some()
+                    && matches!(max, Some(n) if n > 1);
+                if !(min >= 2 || short)
+                    || (max.is_none() && self.oniguruma_unrolls(ast, min))
+                    || anchor.last
+                {
                     return Ok(kept);
                 }
                 let (before, after) = (before.clone(), after.clone());
@@ -4582,5 +4594,22 @@ mod tests {
         }
         // A plain anchor is the same way as before.
         assert!(written(r"(?:(a)|\zb*)+").is_some());
+    }
+    /// #6358: a lazy `{0,n}?` or `{1,n}?` over a body with a way that is only an anchor, a group around
+    /// it and a consuming way after it is written for its copies, as one with a group-free body is.
+    #[test]
+    fn a_lazy_short_repeat_over_an_anchored_body_is_written_for_its_copies_6358() {
+        let copied = |pattern: &str| rewrite_with_groups(pattern).map(|g| g.pattern);
+        // `{0,n}?` leaves first and the anchor's iteration is dead: the consuming ways alone repeat,
+        // with the group kept in a branch that never matches.
+        assert_eq!(
+            copied(r"(?:(\b)|b){0,3}?\z").as_deref(),
+            Some(r"(?:b{0,3}?|[^\s\S](?:(?:(\b)|[^\s\S])))\z")
+        );
+        assert!(copied(r"(?:(\b)|b){1,3}?\z").is_some());
+        // No consuming way after the anchor's, an unbounded repeat and a repeat of one keep their text.
+        assert_eq!(copied(r"(?:b|(\b)){0,3}?\z"), None);
+        assert_eq!(copied(r"(?:(\b)|b)*?\z"), None);
+        assert_eq!(copied(r"(?:(\b)|b)??\z"), None);
     }
 }
