@@ -6643,7 +6643,7 @@ fn get_inputs(
             && !args.seq
             && args.input_dsv.is_none()
             && ends_cleanly
-            && !(faults_at_end && !failures.is_empty())
+            && (!faults_at_end || failures.is_empty())
         {
             defer_open_failures(failures);
         } else {
