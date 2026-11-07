@@ -5939,7 +5939,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 && next_char == Some(b'-')
                 && Self::is_ws_break_or_eoi(self.input.get(saved_pos + next_indent + 1).copied());
 
-            if next_indent <= indent && !key_sequence_at_indicator_column {
+            // A block scalar header at the `?`'s own column is the key's content too (`?⏎|⏎  t` is
+            // the key `t⏎` in yq, #6553), where any other scalar there is the next entry.
+            let key_block_scalar_at_indicator_column =
+                next_indent == indent && matches!(next_char, Some(b'|' | b'>'));
+
+            if next_indent <= indent
+                && !key_sequence_at_indicator_column
+                && !key_block_scalar_at_indicator_column
+            {
                 // Next content is at same or lower indent
                 if next_char == Some(b':')
                     && (next_indent == indent)
