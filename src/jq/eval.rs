@@ -177029,6 +177029,22 @@ mod named_args_shared_tests_5690 {
             owned_update_step::<YqSemantics>(&parse("[.n + 1]").unwrap(), state()),
             OwnedStep::Declined(_)
         ));
+        // A bare entry (`{.n}`) is yq's alone, whose parser is the only one to write it; the shape
+        // check refuses it before any member is evaluated, whatever the mode.
+        let bare = Expr::Object(vec![
+            ObjectEntry {
+                key: ObjectKey::Literal("a".to_string()),
+                value: parse(".n + 1").unwrap(),
+            },
+            ObjectEntry {
+                key: ObjectKey::Bare,
+                value: parse(".n").unwrap(),
+            },
+        ]);
+        let OwnedStep::Declined(back) = owned_update_step::<JqSemantics>(&bare, state()) else {
+            panic!("a bare entry was handled"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step answered a constructor holding a bare entry (#6528)"
+        };
+        assert_eq!(back, state());
         let mut bound = state();
         let origin = BindOrigin::Node {
             node: 7,
