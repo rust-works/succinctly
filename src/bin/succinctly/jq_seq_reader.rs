@@ -153,6 +153,10 @@ fn refill_boundaries(raw_bytes: &[(Option<usize>, Vec<u8>)], size_limit: bool) -
 /// [`Reader::yielded_at`]'s marker for a value jq's EOF branch yields.
 const YIELDED_AT_EOF: usize = usize::MAX;
 
+/// The offset [`walk_stream_collecting_at`] gives a warning of jq's EOF branch: met after every
+/// byte of every file, so after every file that did not open.
+pub(crate) const AT_EOF: usize = YIELDED_AT_EOF;
+
 /// jq's `(source index, line)` for each yield offset (ascending, as
 /// [`Reader::yielded_at`] records them), per jq 1.7.1's `src/util.c`:
 /// `jq_util_input_read_more` names the file it is reading and bumps
@@ -365,6 +369,21 @@ pub(crate) fn walk_stream_collecting(
     tail: Tail,
     emit: &mut dyn FnMut(&str),
 ) -> SeqStreamWalk {
+    walk_stream_placing(raw_bytes, slurp, collect_faults, true, tail, &mut |warning, _| {
+        emit(warning);
+    })
+}
+
+/// [`walk_stream_collecting`], handing `emit` with each warning the absolute offset of the byte
+/// jq's reader met it on, or [`AT_EOF`] for the EOF branch's report (#6589): `--seq -s` places
+/// each warning among the open failures of the files by where jq's reader stood.
+pub(crate) fn walk_stream_collecting_at(
+    raw_bytes: &[(Option<usize>, Vec<u8>)],
+    slurp: bool,
+    collect_faults: bool,
+    tail: Tail,
+    emit: &mut dyn FnMut(&str, usize),
+) -> SeqStreamWalk {
     walk_stream_placing(raw_bytes, slurp, collect_faults, true, tail, emit)
 }
 
@@ -376,7 +395,14 @@ pub(crate) fn walk_stream_values(
     slurp: bool,
     emit: &mut dyn FnMut(&str),
 ) -> SeqStreamWalk {
-    walk_stream_placing(raw_bytes, slurp, false, false, Tail::Opened, emit)
+    walk_stream_placing(
+        raw_bytes,
+        slurp,
+        false,
+        false,
+        Tail::Opened,
+        &mut |warning, _| emit(warning),
+    )
 }
 
 /// The guards of [`plain_record_sequence`], as data so that a test can drop one and show the
@@ -481,7 +507,7 @@ fn walk_stream_placing(
     collect_faults: bool,
     place_values: bool,
     tail: Tail,
-    emit: &mut dyn FnMut(&str),
+    emit: &mut dyn FnMut(&str, usize),
 ) -> SeqStreamWalk {
     let bom = bom_prefix(raw_bytes);
     let mut reader = Reader::new(bom, emit);
@@ -955,11 +981,12 @@ struct Reader<'a> {
     faults: Vec<RecordedFault>,
     /// The stream's whole length in bytes, for [`Reader::fault_position_lost`].
     total: usize,
-    emit: &'a mut dyn FnMut(&str),
+    /// Each warning, with the offset it was met at ([`walk_stream_collecting_at`]).
+    emit: &'a mut dyn FnMut(&str, usize),
 }
 
 impl<'a> Reader<'a> {
-    fn new(bom: BomPrefix, emit: &'a mut dyn FnMut(&str)) -> Self {
+    fn new(bom: BomPrefix, emit: &'a mut dyn FnMut(&str, usize)) -> Self {
         Self {
             line: 1,
             column: 0,
@@ -1032,7 +1059,8 @@ impl<'a> Reader<'a> {
     }
 
     fn emit_warning(&mut self, body: &str) {
-        (self.emit)(&ignored_parse_error(body));
+        let at = if self.at_eof { AT_EOF } else { self.offset };
+        (self.emit)(&ignored_parse_error(body), at);
         if self.collect_faults {
             self.record_fault(body);
         }
