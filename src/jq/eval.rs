@@ -27826,12 +27826,14 @@ fn multiline_caret_spans(pattern: &str) -> Option<Vec<(usize, usize)>> {
     multiline_caret_read(pattern).map(|(_, spans, _)| spans)
 }
 
+/// What [`multiline_caret_read`] found: the text read, the `^` spans in it, and the renames of repeated group names.
+#[cfg(feature = "regex")]
+type CaretRead = (String, Vec<(usize, usize)>, Vec<(String, String)>);
+
 /// [`multiline_caret_spans`] over the text the parser reads: a group name that a pattern uses twice
 /// is renamed there (#6430), so the spans are the text's, which is returned with the renames.
 #[cfg(feature = "regex")]
-fn multiline_caret_read(
-    pattern: &str,
-) -> Option<(String, Vec<(usize, usize)>, Vec<(String, String)>)> {
+fn multiline_caret_read(pattern: &str) -> Option<CaretRead> {
     use regex_syntax::ast::{self, AssertionKind, Ast, Flag, FlagsItemKind, GroupKind};
     fn apply(flags: &ast::Flags, multi_line: &mut bool) {
         let mut negated = false;
