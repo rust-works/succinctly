@@ -5135,7 +5135,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     // row_value is dropped here, freeing memory for this row
                     // #6585: jq's main loop reads no further input once its reader has read from a
                     // file past one that did not open; the row that took it there is processed.
-                    if source_is_past_open_failure(u32::try_from(file_idx).ok()) {
+                    if pending_failures && source_is_past_open_failure(u32::try_from(file_idx).ok())
+                    {
                         ended_early = true;
                         break 'files;
                     }
