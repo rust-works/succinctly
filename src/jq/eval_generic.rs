@@ -577,6 +577,75 @@ fn plain_number_answer<S: EvalSemantics>(expr: &Expr, number: &OwnedValue) -> Op
     }
 }
 
+/// `map(body)` of an owned array of plain computed numbers, answered number by number instead of
+/// through the reindex bridge (#6539): `.numbers | map(. + 1) | map(. + 1) | add` wrote the second
+/// `map`'s whole input out as text, indexed it and parsed it back.
+///
+/// Each element is answered by what answers a lone computed number: the unary and binary math
+/// builtins ([`crate::jq::eval::owned_unary_math`], [`crate::jq::eval::owned_binary_math`]) or
+/// [`plain_number_answer`], which settles `. + c`, `. * c`, a comparison, `tostring`, `[e]`,
+/// `{k: e}` and `. as $x | body` from the number alone. The body therefore has exactly one output
+/// per element and the answer is `[.[] | body]`, which is `map(body)`.
+///
+/// "Plain" is [`crate::jq::eval::is_plain_finite_number`], as for the #6527 fold: an `Int` or a
+/// finite `Float`, which has no storage identity and no source spelling. Everything else
+/// declines whole, so the bridge keeps its diagnostics and its rules: an empty array, an element
+/// of any other kind (a string, a container, `null`, a `NaN`, an infinity, a literal-spelled
+/// number), a body no element answers (a generator, `select`, a name that raises such as `.a`), and
+/// an element for which the answer raises (`. % 0`, `. + "a"`). Nothing has been sent by then, and
+/// the walk has no effect, so the bridge starts over. jq mode only, not under an embed table.
+pub(crate) fn eval_owned_number_map<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let OwnedValue::Array(items) = input else {
+        return None;
+    };
+    let body = strip_parens(crate::jq::eval::map_projection_body(expr)?);
+    let math = match body {
+        Expr::Builtin(builtin) => Some(builtin),
+        _ => None,
+    };
+    if items.is_empty()
+        || !(math.is_some() || plain_shape_may_be_answered(body))
+        || !items.iter().all(crate::jq::eval::is_plain_finite_number)
+        || embed_table_active()
+    {
+        return None;
+    }
+    let mut out = crate::jq::eval::vec_with_capacity(items.len());
+    for item in items {
+        let answer = math
+            .and_then(|builtin| {
+                crate::jq::eval::owned_unary_math::<S>(builtin, item)
+                    .or_else(|| crate::jq::eval::owned_binary_math::<S>(builtin, item))
+            })
+            .or_else(|| plain_number_answer::<S>(body, item))?;
+        // An answer that is not plain declines: the bridge writes an infinity out as the largest
+        // finite float and a literal keeps its spelling, so a later stage would read them
+        // differently (`[1e308] | map(. * 2) | map(. - 1e308)`), and that is the bridge's to keep.
+        if !is_plain_answer(&answer) {
+            return None;
+        }
+        out.push(answer);
+    }
+    Some(OwnedValue::array_from(out))
+}
+
+/// Whether `value` is made only of what the bridge reads back as itself: `null`, booleans, strings,
+/// finite plain numbers, and arrays and objects of those ([`eval_owned_number_map`]).
+fn is_plain_answer(value: &OwnedValue) -> bool {
+    match value {
+        OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::String(_) => true,
+        OwnedValue::Array(items) => items.iter().all(is_plain_answer),
+        OwnedValue::Object(map) => map.values().all(is_plain_answer),
+        other => crate::jq::eval::is_plain_finite_number(other),
+    }
+}
+
 /// A necessary condition for [`plain_number_answer`] to answer `expr`, read off it before any
 /// `$x` is substituted: the constructors and operators it answers, over variables, literals and
 /// the shapes the owned fast path answers. It never rejects what the answerer would answer (the
@@ -5817,6 +5886,14 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     // would write every number out as text and parse it back (`map(. * 2) | max`).
     if container {
         if let Some(answer) = crate::jq::eval::eval_owned_number_fold::<S>(expr, &owned) {
+            return GenericResult::Owned(answer);
+        }
+    }
+
+    // #6539: `map(body)` of an array of computed numbers is answered number by number, where the
+    // bridge would write the whole array out and parse it back (`map(. + 1) | map(. + 1)`).
+    if container {
+        if let Some(answer) = eval_owned_number_map::<S>(expr, &owned) {
             return GenericResult::Owned(answer);
         }
     }
