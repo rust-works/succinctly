@@ -2314,6 +2314,37 @@ mod tests {
         }
     }
 
+    /// #6513: [`decode_string_in_place`] on its own: the text it decodes to is written from index
+    /// 0 and the rest of the token is left as it was, so a string that ends in a lone backslash
+    /// (which the scanner never hands it) is the one fault that stops at the end of the text.
+    #[test]
+    fn the_decode_leaves_the_rest_of_the_token_where_it_was_6513() {
+        let bs = '\\';
+        let decoded = |token: &str| {
+            let mut bytes = token.as_bytes().to_vec();
+            let result = decode_string_in_place(&mut bytes);
+            (result, bytes)
+        };
+        // The bytes before the first escape decode to themselves; the escape is written over
+        // what follows it, and the tail it leaves is the text the token held.
+        let (result, bytes) = decoded(&format!("ab{bs}u00e9c"));
+        assert_eq!(result, Ok(()));
+        assert_eq!(bytes, b"ab\xc3\xa9c0e9c");
+        let (result, bytes) = decoded(&format!("{bs}n{bs}t"));
+        assert_eq!(result, Ok(()));
+        assert_eq!(bytes, b"\n\t\\t");
+        let (result, bytes) = decoded("plain");
+        assert_eq!((result, bytes), (Ok(()), b"plain".to_vec()));
+        // A fault keeps what was decoded before it.
+        let (result, bytes) = decoded(&format!("{bs}u00e9{bs}x"));
+        assert_eq!(result, Err("Invalid escape"));
+        assert_eq!(&bytes[..2], b"\xc3\xa9");
+        let (result, _) = decoded("a\x01");
+        assert!(result.is_err());
+        let (result, _) = decoded(&format!("a{bs}"));
+        assert_eq!(result, Err("Expected escape character at end of string"));
+    }
+
     /// A completed top-level value is handed off and cleared, so trailing
     /// garbage is reported on its own rather than as a separator error.
     #[test]
