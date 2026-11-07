@@ -21,9 +21,12 @@ fn a_seq_slurp_reports_an_unopened_file_where_its_reader_reaches_it_6589() -> Re
         ("norsend", "\u{1e}7"),
         ("defer", "\u{1e}1{"),
         ("s2", "\u{1e}[1]\n\u{1e}[2]\n"),
+        ("trunc", "\u{1e}{\"a\n"),
+        ("endrs", "\u{1e}1\n\u{1e}{\"a\n\u{1e}"),
     ] {
         std::fs::write(dir.path().join(format!("{name}.json")), text)?;
     }
+    std::fs::create_dir(dir.path().join("adir.json"))?;
     for (program, names, stdout, stderr, status) in [
         (".", &["bad", "gone"][..], "\u{1e}[1,2]\n", "jq: ignoring parse error: Truncated value at line 3, column 1\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (".", &["gone", "bad"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Truncated value at line 3, column 1\n", 2),
@@ -37,6 +40,11 @@ fn a_seq_slurp_reports_an_unopened_file_where_its_reader_reaches_it_6589() -> Re
         (".", &["defer", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 3\n", 2),
         (".", &["gone", "defer"][..], "\u{1e}[1]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         ("input", &["gone", "defer"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 3\n", 2),
+        // A fault met at the first byte of the file after the missing one comes after its failure,
+        // and one met at the last byte of the file before it comes first.
+        (".", &["trunc", "gone", "s2"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Truncated value at line 2, column 1\n", 2),
+        (".", &["endrs", "gone", "s2"][..], "\u{1e}[1,[1],[2]]\n", "jq: ignoring parse error: Truncated value at line 3, column 1\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (".", &["bad", "adir", "s2"][..], "\u{1e}[1,2,[1],[2]]\n", "jq: ignoring parse error: Truncated value at line 3, column 1\njq: error: Is a directory\n", 2),
         (".", &["defer"][..], "\u{1e}[1]\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 3\n", 0),
     ] {
         let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}.json")).collect();
