@@ -94,7 +94,7 @@ fn raw_input_stops_after_the_first_line_past_a_missing_file_6464() -> Result<()>
 }
 
 /// Slurp and `-e` over a missing file, rows from jq 1.7.1, and the residual the limitations page
-/// records: a second missing file that jq never reaches is still reported up front.
+/// records: a second missing file that jq never reaches is not reported either (#6522).
 #[test]
 fn raw_input_with_a_missing_file_under_slurp_and_exit_status_6464() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -134,7 +134,9 @@ fn raw_input_with_a_missing_file_under_slurp_and_exit_status_6464() -> Result<()
         (out.as_str(), code),
         ("\"line1\"\n\"line2\"\n\"\"\n\"line4x\"\n", 2)
     );
-    // jq reports `gone.txt` only. Both are reported here, up front.
-    assert_eq!(err.matches("Could not open file").count(), 2, "{err:?}");
+    // jq reports `gone.txt` only: the line it was reading ends in `other.txt`, so `gone2.txt` is
+    // never opened (#6522).
+    assert_eq!(err.matches("Could not open file").count(), 1, "{err:?}");
+    assert!(err.contains("gone.txt"), "{err:?}");
     Ok(())
 }

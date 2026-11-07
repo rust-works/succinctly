@@ -4867,6 +4867,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // faults come out in order with the values, as jq's main loop meets them. A clean stream has
     // no fault to order and is taken off the queue again by #5674's probe.
     let uses_input_builtins = program_reads_inputs || seq_faults_by_queue(&args);
+    PROGRAM_READS_INPUTS.with(|reads| reads.set(program_reads_inputs));
 
     // Configure output
     let output_config = OutputConfig::from_args(&args);
@@ -5183,7 +5184,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         let stop_at = failures.first().map(|(at, _)| *at).filter(|_| !args.slurp);
         if args.slurp {
             report_open_failures(
-                open_failures_reached(&failures, &raw_inputs, &args),
+                open_failures_reached(&failures, &raw_inputs, &args, false),
                 &mut open_failed,
             );
         }
@@ -6826,7 +6827,14 @@ fn read_inputs(
             let fault_ends_text = matches!(first_stream_fault(&raws), Some((_, true)));
             defer_open_failures(failures, fault_ends_text);
         } else {
-            report_open_failures(open_failures_reached(&failures, &raws, args), open_failed);
+            // #6522: only the main loop reads, one value at a time, when nothing asks for more.
+            let main_loop_only = !args.null_input
+                && !args.slurp
+                && (!track_eof || (args.seq && !PROGRAM_READS_INPUTS.with(std::cell::Cell::get)));
+            report_open_failures(
+                open_failures_reached(&failures, &raws, args, main_loop_only),
+                open_failed,
+            );
         }
         let raws = raws
             .into_iter()
@@ -8866,6 +8874,10 @@ thread_local! {
         const { RefCell::new(std::collections::VecDeque::new()) };
     /// Whether a pending failure was reported by a read, which makes the run exit 2 (#6475).
     static LAZY_OPEN_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the program itself reads `input`, `inputs` or `input_line_number` (#6522), which
+    /// [`read_inputs`]' `track_eof` cannot say for `--seq`: its main loop reads through the queue
+    /// whatever the program is.
+    static PROGRAM_READS_INPUTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The name of the last file named, when it did not open (#6480), for [`get_inputs`] to give a
     /// source of its own.
     static UNOPENED_TAIL_NAME: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -8897,15 +8909,42 @@ fn open_failures_reached<'a>(
     failures: &'a [(usize, InputFileOpenError)],
     raws: &[Vec<u8>],
     args: &JqCommand,
+    main_loop_only: bool,
 ) -> &'a [(usize, InputFileOpenError)] {
     if failures.is_empty()
-        || args.raw_input
-        || args.seq
-        || args.input_dsv.is_some()
-        || args.stream_errors
         // `--validate` is its own, stricter check of the files, which reports in its own order.
         || args.validate
     {
+        return failures;
+    }
+    if args.raw_input || args.seq || args.input_dsv.is_some() || args.stream_errors {
+        // #6522: these read on past a fault, but jq's main loop still ends the run one value past
+        // the first open failure: a failure after the file that value comes from is never
+        // reached, when the file holds the whole value.
+        if main_loop_only && args.input_dsv.is_none() {
+            // The first file with bytes from the first failure on holds the value, or the end of
+            // one that started before it. A line with no newline goes on into the next file with
+            // bytes; the other readers stop where they cannot tell.
+            let mut files = raws
+                .iter()
+                .enumerate()
+                .skip(failures[0].0)
+                .filter(|(_, raw)| !raw.is_empty());
+            let file = if args.raw_input {
+                files
+                    .find(|(_, raw)| first_value_completes_in(raw, args))
+                    .map(|(at, _)| at)
+            } else {
+                files
+                    .next()
+                    .filter(|(at, _)| first_value_completes_at(raws, *at, args))
+                    .map(|(at, _)| at)
+            };
+            if let Some(file) = file {
+                let reached = failures.iter().take_while(|&&(at, _)| at <= file).count();
+                return &failures[..reached];
+            }
+        }
         return failures;
     }
     match first_stream_fault(raws) {
@@ -8914,6 +8953,28 @@ fn open_failures_reached<'a>(
             &failures[..reached]
         }
         _ => failures,
+    }
+}
+
+/// Whether the first value a reader takes from `raw` (a line for `-R`, a record for
+/// `--seq`, an event for `--stream-errors`) is complete inside it, so that reading it asks for no
+/// more of the files after it (#6522). `false` where it cannot tell.
+fn first_value_completes_in(raw: &[u8], args: &JqCommand) -> bool {
+    if args.raw_input {
+        raw.contains(&b'\n')
+    } else {
+        // A record ends at the next record separator.
+        raw.iter().filter(|&&b| b == 0x1e).count() >= 2
+    }
+}
+
+/// [`first_value_completes_in`] for the file at `at` of `raws`, and for `--stream-errors`, whose
+/// text is whole JSON that ends where a value does: its first event is complete however it is read.
+fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bool {
+    if args.stream_errors && !args.seq {
+        source_ends_cleanly(&raws[at], args) && first_stream_fault(&raws[at..=at]).is_none()
+    } else {
+        first_value_completes_in(&raws[at], args)
     }
 }
 
