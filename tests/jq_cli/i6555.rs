@@ -44,6 +44,9 @@ fn seq_reports_an_unopened_file_when_its_reader_reaches_it_6555() -> Result<()> 
         (&["--seq", "-n", "-c", "input"][..], &["seqnum", "gone", "one"][..], "\u{1e}1\n", "", 0),
         (&["--seq", "-c", "[., input_filename]"][..], &["seqnum", "gone", "one"][..], "\u{1e}[1,\"@DIR@/seqnum.json\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Potentially truncated top-level numeric value at line 2, column 3\n", 2),
         (&["--seq", "--stream", "-n", "-c", "input"][..], &["seqnum", "gone", "one"][..], "\u{1e}[[],1]\n", "", 0),
+        // The streaming reader stops at the first of several missing files at the end, which it
+        // has no source for: these are still reported up front (#6591).
+        (&["--seq", "--stream", "-c", "[., input_filename]"][..], &["seq", "empty", "gone", "gone2"][..], "\u{1e}[[[],1],\"@DIR@/seq.json\"]\n\u{1e}[[[],2],\"@DIR@/seq.json\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Could not open file @DIR@/gone2.json: No such file or directory\n", 2),
     ] {
         let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}.json")).collect();
         let mut args: Vec<&str> = flags.to_vec();
