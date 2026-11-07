@@ -15207,8 +15207,49 @@ fn owned_state_scalar_direct<S: EvalSemantics>(
             .ok()
             .filter(exact_number);
     }
+    if let Some(length) = owned_state_length_direct::<S>(expr, state) {
+        return Some(length);
+    }
     let value = eval_owned_pure::<S>(expr, state, ResultPosition::Operand)?.ok()?;
     owned_scalar_spelled_the_same(&value).then_some(value)
+}
+
+/// `length`, or `READ | length` with `READ` a pure read ([`eval_owned_pure`]), of a container, a
+/// string or `null` (#6549): `.a | length` beside a fold step that grows `.a`. The count is a fresh
+/// integer, never a subvalue, and is [`eval_owned_count_door`]'s, the one the bridge's answer is
+/// checked against. A read of static steps is borrowed off the tree, so a string of any length is
+/// counted where it is; the rebuilt route serialised the whole state to count one field. A number,
+/// a boolean, a read that raises and anything else declines, and the evaluator keeps its rules and
+/// text.
+fn owned_state_length_direct<S: EvalSemantics>(
+    expr: &Expr,
+    state: &OwnedValue,
+) -> Option<OwnedValue> {
+    let is_length = |stage: &Expr| matches!(unwrap_paren(stage), Expr::Builtin(Builtin::Length));
+    let (reads, length) = match unwrap_paren(expr) {
+        Expr::Pipe(stages) => match stages.split_last() {
+            Some((last, reads)) if is_length(last) => (reads, last),
+            _ => return None,
+        },
+        length if is_length(length) => (&[][..], length),
+        _ => return None,
+    };
+    let count = |value: &OwnedValue| match value {
+        OwnedValue::Null => Some(OwnedValue::Int(0)),
+        other => eval_owned_count_door::<S>(length, other),
+    };
+    let borrowed = reads.iter().try_fold(state, |at, read| {
+        owned_assign_step_child(&static_step(unwrap_paren(read))?, at)
+    });
+    if let Some(value) = borrowed {
+        return count(value);
+    }
+    let mut value = None;
+    for read in reads {
+        let at = value.as_ref().unwrap_or(state);
+        value = Some(eval_owned_pure::<S>(read, at, ResultPosition::Operand)?.ok()?);
+    }
+    count(value.as_ref().unwrap_or(state))
 }
 
 /// An integer (or an integer literal spelled as its own digits) no larger than 2^53: the range in
@@ -88464,13 +88505,14 @@ pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue
 ///
 /// A constructor with no `.` member at all (#6528) is the state the running-total folds build,
 /// `[.[0] + $x, .[1] + 1]` and `{s: (.s + $x), n: (.n + 1)}`. It is taken only when every member
-/// is closed, read off the tree ([`owned_assign_operand_off_the_tree`]), or a container slot one
-/// static step down, as `.k`, `.k + R` or `(.k // C) + R` (#6538, [`settle_free_slot`]); the
-/// slots are moved out of the state once every member is settled, so `{a: (.a + [$i]), n: (.n +
-/// 1)}` extends `.a` in place, and the rest of the state is dropped. Through the bridge each step evaluated the
+/// is closed, read off the tree ([`owned_assign_operand_off_the_tree`]), or a container slot, as
+/// `.k`, `.k + R` or `(.k // C) + R` (#6538, [`settle_free_slot`]), a static path (`.a.b`), a `+`
+/// chain or a nested `.`-free constructor of these (#6549); the slots are moved out of the state
+/// once every member is settled, so `{a: (.a + [$i]), n: (.a | length)}` extends `.a` in place,
+/// and the rest of the state is dropped. Through the bridge each step evaluated the
 /// constructor on the evaluator's own route and re-indexed the state for each `.[0]` it read,
 /// 0.35x-0.49x of jq 1.7.1 over 800k floats, and quadratic once the state held a growing list. A
-/// member that needs the rebuilt state (`.a | length`, a slot two members move) declines the whole
+/// member that needs the rebuilt state (`.a | map(.)`, overlapping slots) declines the whole
 /// constructor to that one route, which re-indexes the state once a step, instead of once for each
 /// such member; so does a member outside [`owned_state_expr_shape`], which is checked for every
 /// member before any is evaluated. A member the helper evaluates and
@@ -88586,65 +88628,219 @@ fn owned_constructor_step<S: EvalSemantics>(
     }
 }
 
+/// Where a slot a [`FreeMember`] moves lives: one static step down (the common fold shape, which
+/// allocates nothing) or a path of them, `.a.b` (#6549).
+enum SlotPath<'e> {
+    One(StepKey<'e>),
+    Many(Vec<StepKey<'e>>),
+}
+
+impl<'e> SlotPath<'e> {
+    /// The path of a static read (`.k`, `.[n]`, `.a.b`), or `None` for anything else.
+    fn of(read: &'e Expr) -> Option<Self> {
+        if let Some(step) = static_step(read) {
+            return Some(SlotPath::One(step));
+        }
+        let mut steps = Vec::new();
+        static_path_steps(read, &mut steps)?;
+        (!steps.is_empty()).then_some(SlotPath::Many(steps))
+    }
+
+    fn steps(&self) -> &[StepKey<'e>] {
+        match self {
+            SlotPath::One(step) => core::slice::from_ref(step),
+            SlotPath::Many(steps) => steps,
+        }
+    }
+
+    /// What jq reads at the path, or `None` where [`owned_assign_step_child`] declines a step (a
+    /// key of the wrong kind, a negative index, a pad): `null` below a missing field, the index one
+    /// past the end, or a `null`.
+    fn peek<'v>(&self, state: &'v OwnedValue) -> Option<&'v OwnedValue> {
+        self.steps()
+            .iter()
+            .try_fold(state, |at, step| owned_assign_step_child(step, at))
+    }
+
+    /// The value at the path, moved out of `state` and replaced by `null`; `null` where the path
+    /// does not exist yet, which is what [`SlotPath::peek`] read there. A container on the way is
+    /// made unique first (`owned_slot_mut`), so a shared one is copied, not written through.
+    fn take(&self, state: &mut OwnedValue) -> OwnedValue {
+        let mut at = state;
+        for step in self.steps() {
+            match owned_slot_mut(step, at) {
+                Some(slot) => at = slot,
+                None => return OwnedValue::Null,
+            }
+        }
+        core::mem::replace(at, OwnedValue::Null)
+    }
+
+    /// Whether one path is a prefix of the other, or they are equal: moving either out would leave
+    /// the other reading the `null` it left behind.
+    fn overlaps(&self, other: &SlotPath<'_>) -> bool {
+        let (a, b) = (self.steps(), other.steps());
+        let n = a.len().min(b.len());
+        a[..n] == b[..n]
+    }
+}
+
 /// A member of a constructor with no `.` member that moves a container slot out of the state
-/// (#6538), settled against the state before anything is moved out of it. A member read off the
-/// tree ([`owned_assign_operand_off_the_tree`]) is a value at once and never one of these.
+/// (#6538, #6549), settled against the state before anything is moved out of it. A member read off
+/// the tree ([`owned_assign_operand_off_the_tree`]) is a value at once and never one of these.
 enum FreeMember<'e> {
     /// `.k + R` or `(.k // C) + R`: the container (or string) the slot holds -- or `C`, closed,
     /// when the slot is `null` or `false` -- extended by `R`'s settled value. `+` cannot fail on
-    /// the pair ([`plus_cannot_fail`]), or the left is `null` and the sum is `R`.
+    /// the pair ([`plus_cannot_fail`]), or the left is `null` and the sum is `R`. A chain
+    /// `.k + R1 + R2` has `R` = `R1 + R2`, which `+`'s associativity makes the same sum.
     Grow {
-        key: StepKey<'e>,
+        path: SlotPath<'e>,
         default: Option<OwnedValue>,
         right: OwnedValue,
     },
     /// `.k`: the container the slot holds.
-    Take(StepKey<'e>),
+    Take(SlotPath<'e>),
+    /// A constructor nested in the member (`{a: {b: (.a.b + [$i])}}`), itself with no `.` member.
+    Nested(FreeShape<'e>),
 }
 
-impl FreeMember<'_> {
+/// A nested `.`-free constructor of a [`FreeMember::Nested`], each part a value or a member.
+enum FreeShape<'e> {
+    Array(Vec<FreePart<'e>>),
+    Object(Vec<(String, FreePart<'e>)>),
+}
+
+/// One part of a [`FreeShape`].
+enum FreePart<'e> {
+    Value(OwnedValue),
+    Member(FreeMember<'e>),
+}
+
+impl FreePart<'_> {
+    fn resolve<S: EvalSemantics>(self, state: &mut OwnedValue) -> Result<OwnedValue, EvalError> {
+        match self {
+            FreePart::Value(value) => Ok(value),
+            FreePart::Member(member) => member.resolve::<S>(state),
+        }
+    }
+}
+
+impl<'e> FreeMember<'e> {
     /// The member's value. A slot is moved out of `state`, which the step drops afterwards, so a
     /// container nothing else holds is extended where it is, as `.k += R` is (#5273), instead of
     /// being read off a re-indexed copy of the state every step. The `+` fails only on an
-    /// allocation failure, as [`owned_grow`]'s does.
+    /// allocation failure, as [`owned_grow`]'s does. A nested object takes a repeated key's last
+    /// value at its first position, as `object_from_pairs` does in jq mode.
     fn resolve<S: EvalSemantics>(self, state: &mut OwnedValue) -> Result<OwnedValue, EvalError> {
         match self {
             FreeMember::Grow {
-                key,
+                path,
                 default,
                 right,
             } => {
-                let old = take_slot(&key, state);
+                let old = path.take(state);
                 let left = match default {
                     Some(default) if !old.is_truthy() => default,
                     _ => old,
                 };
                 arith_combine::<S>(ArithOp::Add, left, right)
             }
-            FreeMember::Take(key) => Ok(take_slot(&key, state)),
+            FreeMember::Take(path) => Ok(path.take(state)),
+            FreeMember::Nested(FreeShape::Array(parts)) => {
+                let mut out: Vec<OwnedValue> = vec_with_capacity(parts.len());
+                for part in parts {
+                    out.push(part.resolve::<S>(state)?);
+                }
+                Ok(OwnedValue::array_from(out))
+            }
+            FreeMember::Nested(FreeShape::Object(parts)) => {
+                let mut map: IndexMap<String, OwnedValue> = IndexMap::with_capacity(parts.len());
+                for (key, part) in parts {
+                    map.insert(key, part.resolve::<S>(state)?);
+                }
+                Ok(OwnedValue::Object(map.into()))
+            }
         }
     }
 
-    /// The slot this member moves out of the state.
-    fn slot(&self) -> &StepKey<'_> {
+    /// Every slot this member moves out of the state, nested constructors included.
+    fn collect_slots<'m>(&'m self, into: &mut Vec<Option<&'m SlotPath<'e>>>) {
         match self {
-            FreeMember::Grow { key, .. } | FreeMember::Take(key) => key,
+            FreeMember::Grow { path, .. } | FreeMember::Take(path) => into.push(Some(path)),
+            FreeMember::Nested(FreeShape::Array(parts)) => {
+                for part in parts {
+                    if let FreePart::Member(member) = part {
+                        member.collect_slots(into);
+                    }
+                }
+            }
+            FreeMember::Nested(FreeShape::Object(parts)) => {
+                for (_, part) in parts {
+                    if let FreePart::Member(member) = part {
+                        member.collect_slots(into);
+                    }
+                }
+            }
         }
     }
 }
 
-/// `state`'s value at `key`, moved out and replaced by `null`; `null` when the slot does not exist
-/// yet (a missing field, the index one past the end, a `null` state), which is what jq reads there.
-fn take_slot(key: &StepKey<'_>, state: &mut OwnedValue) -> OwnedValue {
-    owned_slot_mut(key, state).map_or(OwnedValue::Null, |slot| {
-        core::mem::replace(slot, OwnedValue::Null)
-    })
+/// Whether no two of the slots `members` move overlap ([`SlotPath::overlaps`]). Such a constructor
+/// is the bridge's: the second move would read the `null` the first left behind.
+fn free_slots_disjoint<'m, 'e: 'm>(
+    members: impl Iterator<Item = &'m FreeMember<'e>> + Clone,
+) -> bool {
+    // Every slot against the ones before it, counted over the present slots only, so a `None`
+    // anywhere leaves the comparison on the same basis.
+    fn disjoint(slots: &[Option<&SlotPath<'_>>]) -> bool {
+        let present = || slots.iter().flatten();
+        present()
+            .enumerate()
+            .all(|(at, slot)| !present().take(at).any(|held| held.overlaps(slot)))
+    }
+    // The common step moves one or two slots and nests nothing: check those where they are,
+    // without collecting them (a step's allocation is a measurable share of a short fold step).
+    let mut flat: [Option<&SlotPath<'e>>; 4] = [None; 4];
+    let mut count = 0;
+    for member in members.clone() {
+        match member {
+            FreeMember::Grow { path, .. } | FreeMember::Take(path) if count < flat.len() => {
+                flat[count] = Some(path);
+                count += 1;
+            }
+            _ => {
+                count = usize::MAX;
+                break;
+            }
+        }
+    }
+    if count != usize::MAX {
+        return disjoint(&flat[..count]);
+    }
+    let mut slots = Vec::new();
+    for member in members {
+        member.collect_slots(&mut slots);
+    }
+    disjoint(&slots)
+}
+
+/// `a + b` for two settled operands a fold step's `+` chain folds together (#6549): only where it
+/// cannot fail ([`plus_cannot_fail`], or either side `null`, which `+` returns the other for).
+fn free_plus<S: EvalSemantics>(left: OwnedValue, right: OwnedValue) -> Option<OwnedValue> {
+    let cannot_fail = matches!(left, OwnedValue::Null)
+        || matches!(right, OwnedValue::Null)
+        || plus_cannot_fail(&left, &right);
+    if !cannot_fail {
+        return None;
+    }
+    arith_combine::<S>(ArithOp::Add, left, right).ok()
 }
 
 /// [`FreeMember`] for a member [`owned_assign_operand_off_the_tree`] did not read, or `None` to
-/// decline the constructor: `.k` holding a container, or `.k + R` or `(.k // C) + R` with `R` read
-/// off the tree and `C` closed, for a static field or a non-negative index `k`
-/// ([`owned_assign_step_child`]: no pad, no wrong kind).
+/// decline the constructor: a static read holding a container (`.k`, `.a.b`); `.k + R` or
+/// `(.k // C) + R` with `R` read off the tree and `C` closed, or a chain `.k + R1 + R2`; or a
+/// constructor with no `.` member whose parts are values or members (#6549). A step is a static
+/// field or a non-negative index ([`SlotPath::peek`]: no pad, no wrong kind).
 fn settle_free_slot<'e, S: EvalSemantics>(
     member: &'e Expr,
     state: &OwnedValue,
@@ -88656,42 +88852,115 @@ fn settle_free_slot<'e, S: EvalSemantics>(
             right,
             ..
         } => {
-            let (key, default) = match unwrap_paren(left) {
+            // The base of a left-nested chain first, so a member whose base is no slot declines
+            // before any operand is evaluated.
+            let mut base = unwrap_paren(left);
+            while let Expr::Arithmetic {
+                op: ArithOp::Add,
+                left,
+                ..
+            } = base
+            {
+                base = unwrap_paren(left);
+            }
+            let (path, default) = match base {
                 Expr::Alternative(read, default) => (
-                    static_step(unwrap_paren(read))?,
+                    SlotPath::of(unwrap_paren(read))?,
                     Some(closed_expr_to_owned::<S>(default)?),
                 ),
-                read => (static_step(read)?, None),
+                read => (SlotPath::of(read)?, None),
             };
-            let old = owned_assign_step_child(&key, state)?;
+            let old = path.peek(state)?;
+            // Then the right operands, folded into one, innermost first.
+            let mut right = owned_assign_operand_off_the_tree::<S>(right, state)?;
+            let mut link = unwrap_paren(left);
+            while let Expr::Arithmetic {
+                op: ArithOp::Add,
+                left,
+                right: earlier,
+                ..
+            } = link
+            {
+                let earlier = owned_assign_operand_off_the_tree::<S>(earlier, state)?;
+                right = free_plus::<S>(earlier, right)?;
+                link = unwrap_paren(left);
+            }
             let left = match &default {
                 Some(default) if !old.is_truthy() => default,
                 _ => old,
             };
-            let right = owned_assign_operand_off_the_tree::<S>(right, state)?;
             (matches!(left, OwnedValue::Null) || plus_cannot_fail(left, &right)).then_some(
                 FreeMember::Grow {
-                    key,
+                    path,
                     default,
                     right,
                 },
             )
         }
+        Expr::Array(inner) => {
+            let items = match unwrap_paren(inner) {
+                Expr::Comma(items) => items.as_slice(),
+                single => core::slice::from_ref(single),
+            };
+            let mut parts = vec_with_capacity(items.len());
+            for item in items {
+                parts.push(settle_free_part::<S>(item, state)?);
+            }
+            Some(FreeMember::Nested(FreeShape::Array(parts)))
+        }
+        Expr::Object(entries) => {
+            let mut parts = vec_with_capacity(entries.len());
+            for entry in entries {
+                let key = match &entry.key {
+                    ObjectKey::Literal(name) => name.clone(),
+                    ObjectKey::Bare => return None, // patchcov: coverage tolerate-line reason="unreachable in jq mode: only yq's parser writes a bare entry, and owned_constructor_step declines yq mode first (#6549)"
+                    ObjectKey::Expr(key) => {
+                        match owned_assign_operand_off_the_tree::<S>(key, state)? {
+                            OwnedValue::String(name) => name.into_string(),
+                            _ => return None,
+                        }
+                    }
+                };
+                // A repeated key takes the last value (at the first position), so an earlier member
+                // under it is overwritten and need not move its slot.
+                for (held, earlier) in &mut parts {
+                    if *held == key && matches!(earlier, FreePart::Member(_)) {
+                        *earlier = FreePart::Value(OwnedValue::Null);
+                    }
+                }
+                parts.push((key, settle_free_part::<S>(&entry.value, state)?));
+            }
+            Some(FreeMember::Nested(FreeShape::Object(parts)))
+        }
         other => {
-            let key = static_step(other)?;
-            let old = owned_assign_step_child(&key, state)?;
+            let path = SlotPath::of(other)?;
+            let old = path.peek(state)?;
             matches!(old, OwnedValue::Array(_) | OwnedValue::Object(_))
-                .then_some(FreeMember::Take(key))
+                .then_some(FreeMember::Take(path))
         }
     }
+}
+
+/// One part of a nested `.`-free constructor: read off the tree, or a [`FreeMember`]. A `.` part
+/// would hold the whole state, which the slots are moved out of, so it declines.
+fn settle_free_part<'e, S: EvalSemantics>(
+    part: &'e Expr,
+    state: &OwnedValue,
+) -> Option<FreePart<'e>> {
+    if matches!(unwrap_paren(part), Expr::Identity) {
+        return None;
+    }
+    if let Some(value) = owned_assign_operand_off_the_tree::<S>(part, state) {
+        return Some(FreePart::Value(value));
+    }
+    settle_free_slot::<S>(part, state).map(FreePart::Member)
 }
 
 /// `[a, b, ...]` with no `.` member as a fold's UPDATE (#6528, #6538), in one pass: every member is
 /// settled against the state first ([`settle_free_slot`]), so a decline hands it back untouched,
 /// and only then are the slots the members name moved out of it. A constructor of scalar reads
 /// builds its output directly, as it did before slots were taken: `moves` stays empty and never
-/// allocates. Two members that would move the same slot decline, since the second would read the
-/// `null` the first left behind.
+/// allocates. Members whose slots overlap decline ([`free_slots_disjoint`]).
 fn owned_free_array_step<S: EvalSemantics>(
     items: &[Expr],
     mut state: OwnedValue,
@@ -88706,11 +88975,11 @@ fn owned_free_array_step<S: EvalSemantics>(
         let Some(member) = settle_free_slot::<S>(item, &state) else {
             return Err(state);
         };
-        if moves.iter().any(|(_, held)| held.slot() == member.slot()) {
-            return Err(state);
-        }
         out.push(OwnedValue::Null);
         moves.push((at, member));
+    }
+    if !moves.is_empty() && !free_slots_disjoint(moves.iter().map(|(_, member)| member)) {
+        return Err(state);
     }
     for (at, member) in moves {
         match member.resolve::<S>(&mut state) {
@@ -88750,11 +89019,11 @@ fn owned_free_object_step<S: EvalSemantics>(
         let Some(member) = settle_free_slot::<S>(&entry.value, &state) else {
             return Err(state);
         };
-        if moves.iter().any(|(_, held)| held.slot() == member.slot()) {
-            return Err(state);
-        }
         map.insert(key.clone(), OwnedValue::Null);
         moves.push((key, member));
+    }
+    if !moves.is_empty() && !free_slots_disjoint(moves.iter().map(|(_, member)| member)) {
+        return Err(state);
     }
     for (key, member) in moves {
         match member.resolve::<S>(&mut state) {
@@ -173886,9 +174155,20 @@ mod share_audit_2999 {
             ("[.f + .s]", false),
             ("[.z + 1]", false),
             ("[.zz + 1]", false),
-            // Outside the pure grammar: `length`, a call.
-            ("length", false),
-            ("[length]", false),
+            // `length` of the state, a container read off it, a string or `null` is a fresh count
+            // (#6549); of a number or a boolean it is the evaluator's.
+            ("length", true),
+            ("[length]", true),
+            (".a | length", true),
+            ("[(.o | length), (.s | length)]", true),
+            (".z | length", true),
+            (".zz | length", true),
+            ("(.a | length) + 1", true),
+            ("[.o | .x | length]", false),
+            (".i | length", false),
+            (".b | length", false),
+            (".f | length", false),
+            (".a | .[0] | length", false),
         ];
         let state = state(doc);
         for (filter, direct) in rows {
@@ -173983,6 +174263,38 @@ mod share_audit_2999 {
             (
                 "reduce .[] as $r ({}; {a: ((.a // []) + [$r.score])})",
                 &[][..],
+            ),
+        ] {
+            assert_forced(&json, filter, expected);
+        }
+    }
+
+    /// #6549: the same holds for a slot further down (`{a: {b: (.a.b + [x])}}`), a `+` chain
+    /// (`.a + [x] + [0]`) and a member that counts the slot (`n: (.a | length)`) beside the one
+    /// that grows it: 1,000 steps copy no more than step one does, where the program's literal
+    /// (and, for a nested slot, the literal object around it) is copied once.
+    #[test]
+    fn fold_constructor_growing_nested_and_chained_slots_copies_nothing_6549() {
+        let body: Vec<String> = (0..1000)
+            .map(|i| format!("{{\"name\":\"u{i}\",\"score\":{i}}}"))
+            .collect();
+        let json = format!("[{}]", body.join(",")).into_bytes();
+        for (filter, expected) in [
+            (
+                "reduce .[] as $r ({a: {b: []}}; {a: {b: (.a.b + [$r.score])}})",
+                &[(Kind::ArrayMakeMut, 1), (Kind::ObjectMakeMut, 1)][..],
+            ),
+            (
+                "reduce .[] as $r ({a: []}; {a: (.a + [$r.score] + [0])})",
+                &[(Kind::ArrayMakeMut, 1)][..],
+            ),
+            (
+                "reduce .[] as $r ({a: [], n: 0}; {a: (.a + [$r.score]), n: (.a | length)})",
+                &[(Kind::ArrayMakeMut, 1)][..],
+            ),
+            (
+                "reduce .[] as $r ({g: {l: [], n: 0}}; {g: {l: (.g.l + [$r.score]), n: (.g.n + 1)}})",
+                &[(Kind::ArrayMakeMut, 1), (Kind::ObjectMakeMut, 1)][..],
             ),
         ] {
             assert_forced(&json, filter, expected);
@@ -178320,12 +178632,31 @@ mod named_args_shared_tests_5690 {
             "{b: .a, a: .b}",
             "{a: .a, o: .o, n: .n}",
             "{s: (.s + \"x\")}",
+            // `length` of the slot is read before the slot moves (#6549).
+            "{n: (.a | length), a: (.a + [0])}",
+            "{a: (.a + [0]), n: (.a | length)}",
             "{o: (.o + {y: 2})}",
             "{z: (.z + [1])}",
             "{m: (.missing + [1])}",
             "{a: 1, a: (.a + [5])}",
             "{a: (.a + [5]), a: 1}",
             "{(.s): (.a + [1])}",
+            // A slot further down (#6549), a `+` chain, and a nested constructor.
+            "[.arr[0] + [2], .arr[1]]",
+            "{x: .o, y: (.arr[0] + [5])}",
+            "{a: (.a + [1] + [2]), b: (.b + [] + [3] + null)}",
+            "{o: (.o + {y: 2} + {x: 3})}",
+            "{s: (.s + \"x\" + \"y\")}",
+            "{z: (.z + [1] + [2])}",
+            "{n: {a: (.a + [1]), c: .n}, b: [.b, (.b | length)]}",
+            "{wrap: {arr: [(.arr[0] + [9]), .arr[1]]}}",
+            "[[.a], {b: .b}]",
+            "{n: [empty], a: (.a + [1])}",
+            // A repeated key in a nested constructor drops the overwritten member's move.
+            "{x: {k: .a, k: (.a + [1])}}",
+            "{x: {k: (.a + [1]), k: .b, j: .a}}",
+            // A computed key in a nested constructor, read off the tree.
+            "{x: {(.s): (.a + [1])}}",
             "{a: ((.a // []) + [9])}",
             "{z: ((.z // []) + [9])}",
             "{m: ((.missing // {}) + {k: 1})}",
@@ -178348,18 +178679,28 @@ mod named_args_shared_tests_5690 {
         }
         for src in [
             "{a: .a, b: .a}",
+            // Overlapping slots: a slot and one inside it.
+            "{x: .arr, y: (.arr[0] + [1])}",
+            "{x: (.arr[1] + {}), y: .arr}",
+            "{n: {a: .a}, a: (.a + [1])}",
+            // A chain link that `+` could fail on, and a nested `.`.
+            "{a: (.a + [1] + \"x\")}",
+            "{a: (.a + [1] + .n)}",
+            "{n: {s: .}}",
+            "{n: [.a[]], a: (.a + [1])}",
+            // A nested key that is not a string, or that needs the rebuilt state.
+            "{x: {(.n): (.a + [1])}}",
+            "{x: {(.o | tojson): (.a + [1])}}",
             "{a: ((.a // [1]) + [9]), b: .a}",
             "{z: ((.z // .a) + [9])}",
             "{n: ((.n // []) + [9])}",
-            // `length` is not read off the tree, so the member needs the rebuilt state.
-            "{n: (.a | length), a: (.a + [0])}",
+            // `length` of a number is the evaluator's, so the member needs the rebuilt state.
+            "{c: (.n | length), a: (.a + [0])}",
             "{a: (.a + .b)}",
             "{a: (.a + null)}",
             "{n: (.n + [1])}",
             "{s: (.s + [1])}",
             "{a: (.a + {})}",
-            // Only a slot one static step down is moved: `.arr[0]` is two.
-            "[.arr[0] + [2], .arr[1]]",
             "[.arr[-1] + [1]]",
             "[.a.x + [1]]",
             "[.a[0:1] + [1]]",

@@ -7307,7 +7307,8 @@ A fold whose step is a constructor around the accumulator (`[.]`, `[., <closed>â
 Before that it re-indexed the whole accumulator on every step and was quadratic past 384 levels (17 s at N = 40,000, against 0.03 s in jq).
 A member that reads a container out of the accumulator (`[., .a]`), a NaN or infinite float, `%` or `tojson` costs `O(accumulator)` a step and is quadratic, as is a step of any other shape that constructs from `.`.
 A constructor with no `.` member (`[.[0] + $x, .[1] + 1]`) is built off the accumulator when every member reads scalars from it ([#6528](https://github.com/rust-works/succinctly/issues/6528)), or is a container field or index one step down, read whole or extended (`{a: (.a + [$i]), b: .b}`, `{a: ((.a // []) + [$i])}`), which is moved out of the accumulator and extended in place, so the fold is linear ([#6538](https://github.com/rust-works/succinctly/issues/6538)).
-Any other read of a container in such a constructor (`.a | length`, `.a.b + [$i]`, `.a + [$i] + [1]`, one field moved by two members) re-indexes the accumulator once a step and is quadratic.
+The same holds for a slot further down, in a nested constructor or not (`{a: {b: (.a.b + [$i])}}`), for a `+` chain (`.a + [$i] + [1]`), and beside a member that counts a container (`n: (.a | length)`) ([#6549](https://github.com/rust-works/succinctly/issues/6549)).
+Any other read of a container in such a constructor (`.a | map(.)`, `.a[1:] + [$i]`, a slot moved by two members or one inside another) re-indexes the accumulator once a step and is quadratic.
 `paths`, `tostream` and `[path(..)]` over a value hundreds of thousands of levels deep build output quadratic in its depth, as jq's would, and need the memory for it.
 `succinctly yq` takes the same floor since [#5876](https://github.com/rust-works/succinctly/issues/5876); see the yq limitations page.
 
