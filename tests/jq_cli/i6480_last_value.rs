@@ -24,6 +24,7 @@ fn a_last_value_that_completes_at_the_end_is_read_at_a_missing_last_file_6480() 
         ("mix.json", "[1] 2"),
         ("empty.json", ""),
         ("ab.txt", "a\nb"),
+        ("three.json", "1\n2\n3"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
@@ -61,6 +62,12 @@ fn a_last_value_that_completes_at_the_end_is_read_at_a_missing_last_file_6480() 
         (&["-R"][..], "[., input_filename]", &["ab", "gone"][..], "[\"a\",\"@DIR@/ab.txt\"]\n[\"b\",\"@DIR@/gone.json\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&["-R", "-n"][..], "[inputs | [., input_filename, input_line_number]]", &["ab", "gone"][..], "[[\"a\",\"@DIR@/ab.txt\",1],[\"b\",\"@DIR@/gone.json\",0]]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&["-R", "-n"][..], "input", &["ab", "gone"][..], "\"a\"\n", "", 0),
+        (&[][..], "error", &["gone", "three", "gone2"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error (at @DIR@/three.json:1) (not a string): 1\n", 2),
+        (&[][..], ".", &["gone", "three", "gone2"][..], "1\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&[][..], "[., input_filename]", &["gone", "three", "gone2"][..], "[1,\"@DIR@/three.json\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&[][..], "[., input_filename]", &["gone", "num", "gone2"][..], "[12,\"@DIR@/gone2.json\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Could not open file @DIR@/gone2.json: No such file or directory\n", 2),
+        (&[][..], "error", &["gone", "num", "gone2"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Could not open file @DIR@/gone2.json: No such file or directory\njq: error (at @DIR@/gone2.json:0) (not a string): 12\n", 2),
+
     ] {
         let paths: Vec<String> = names
             .iter()

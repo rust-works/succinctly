@@ -5198,9 +5198,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         let slurp_tail = tail_name.clone().filter(|_| args.slurp);
         // #6480: the same for a last value that completes only at the end of the input: jq's parser
         // asks for more before it is complete, which reaches the missing file.
-        let value_tail = tail_name.clone().filter(|_| {
-            !args.slurp && !args.validate && last_value_reaches_end(&raw_inputs, &args)
-        });
+        let value_tail = tail_name
+            .clone()
+            .filter(|_| !args.slurp && last_value_reaches_end(&raw_inputs, &args));
         // With no file open, the tail is the only source: there is no stdin entry before it.
         let names = match &tail_name {
             Some(tail) => {
@@ -5382,6 +5382,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // fetching when it met the failure: the first the files past it hold. It reads
             // nothing beyond that value, so a fault further on is never reached (#5472).
             let past_open_failure = stop_at.is_some_and(|at| idx >= at) && !values.is_empty();
+            // #6480: the file's last value before the cut below, which keeps one value past a
+            // file that did not open: that one is the input's last only if it was already.
+            let last_span = values.last().copied();
             let split_error = if past_open_failure {
                 values.truncate(1);
                 None
@@ -5423,7 +5426,6 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }),
                 seam.clone(),
             );
-            let last_span = values.last().copied();
             let tail_locator = ValueLocator::new(b"", value_tail.as_deref(), Some(0), Seam::NONE);
             for (start, end) in values {
                 if !finished.next_input(args.on_error, &mut sink, &mut had_output, &mut last_output)
@@ -6616,9 +6618,10 @@ fn take_unopened_tail(locations: &mut InputLocations) {
 /// with no newline. jq's parser asks the reader for more before it knows the value is complete,
 /// which sends the reader past the last file, so the value carries the position there. A string or
 /// container ends on its own closing byte, and a text that faults first is a fault's to place.
-/// `--seq` and the streaming readers place their values themselves.
+/// `--seq` and the streaming readers place their values themselves, and `--validate` checks each
+/// file on its own.
 fn last_value_reaches_end(raws: &[Vec<u8>], args: &JqCommand) -> bool {
-    if args.seq || args.stream || args.stream_errors || args.input_dsv.is_some() {
+    if args.seq || args.stream || args.stream_errors || args.input_dsv.is_some() || args.validate {
         return false;
     }
     let Some(last) = raws.iter().rev().find(|raw| !raw.is_empty()) else {
