@@ -6635,16 +6635,7 @@ fn get_inputs(
                 .find(|raw| !raw.is_empty())
                 .map_or(true, |raw| source_ends_cleanly(raw, args))
         });
-        // #6480: and so does a text that ends inside a value, whose fault the reader meets after it
-        // has moved on to the files that did not open, so they come first.
-        let faults_at_end = matches!(first_text_fault(&raws, args), Some((_, true)));
-        if args.null_input
-            && !args.slurp
-            && !args.seq
-            && args.input_dsv.is_none()
-            && ends_cleanly
-            && (!faults_at_end || failures.is_empty())
-        {
+        if args.null_input && !args.slurp && !args.seq && args.input_dsv.is_none() && ends_cleanly {
             defer_open_failures(failures);
         } else {
             report_open_failures(open_failures_reached(&failures, &raws, args), open_failed);
