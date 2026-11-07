@@ -6615,10 +6615,13 @@ fn get_inputs(
     } else {
         let (files, raws, failures) = read_input_files(&files);
         unopened_tail = failures.iter().any(|&(at, _)| at >= files.len());
+        // Only a text that ends in a fault has a read that goes on to it (#6480): the others keep
+        // the lazy route and their own positions.
         unopened_tail_name = failures
             .iter()
             .rfind(|&&(at, _)| at >= files.len())
-            .map(|(_, failure)| input_display_name(&failure.path));
+            .map(|(_, failure)| input_display_name(&failure.path))
+            .filter(|_| matches!(first_text_fault(&raws, args), Some((_, true))));
         any_open_failure = !failures.is_empty();
         if let Some(&(at, _)) = failures.first() {
             note_open_failure_at(at);
