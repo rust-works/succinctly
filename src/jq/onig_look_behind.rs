@@ -144,7 +144,7 @@ fn multiply(a: u64, count: u64) -> u64 {
 /// `node_char_len1`.
 fn char_len(node: &Node) -> Len {
     match node {
-        Node::Str(text) => Len::set(text.len() as u64),
+        Node::Str(text) => Len::set(text.chars().count() as u64),
         Node::Class { .. } => Len::set(1),
         Node::Anchor => Len {
             min: 0,
@@ -328,7 +328,7 @@ fn popular(lower: u64, upper: u64, greedy: bool) -> Option<usize> {
 }
 
 /// A quantifier on `body`, as the parser and `tune_quant` leave it.
-fn quantify(lower: u64, upper: u64, greedy: bool, body: Node) -> Node {
+fn quantify(lower: u64, upper: u64, greedy: bool, body: Node) -> Option<Node> {
     let plain = |lower, upper, greedy, body| Node::Quant {
         body: Box::new(body),
         lower,
@@ -336,7 +336,7 @@ fn quantify(lower: u64, upper: u64, greedy: bool, body: Node) -> Node {
         greedy,
         possessive: Possessive::No,
     };
-    match body {
+    Some(match body {
         // `onig_reduce_nested_quantifier`.
         Node::Quant {
             body: inner,
@@ -350,8 +350,9 @@ fn quantify(lower: u64, upper: u64, greedy: bool, body: Node) -> Node {
                 popular(inner_lower, inner_upper, inner_greedy),
             ) {
                 (Some(outer), Some(target)) => {
-                    // `ReduceTypeTable[target][outer]`: a letter is the quantifier that replaces
-                    // both, `d` the inner one alone, `s` both as they are, `q` `(?:x+)??`.
+                    // `ReduceTypeTable[target][outer]`, a letter for what it says: `d` deletes the
+                    // outer quantifier, `s` keeps both, `a` is `*`, `p` is `+`, `A` is `*?`, `Q` is
+                    // `??` and `q` is `(?:x+)??`.
                     const TABLE: [[char; 6]; 6] = [
                         ['d', 'a', 'a', 'Q', 'A', 's'],
                         ['d', 'd', 'd', 'q', 'q', 'd'],
@@ -375,9 +376,13 @@ fn quantify(lower: u64, upper: u64, greedy: bool, body: Node) -> Node {
                         ),
                     }
                 }
-                // Two exact counts multiply.
+                // Two exact counts multiply (`onig_positive_int_multiply`, which refuses a product
+                // past an `int`; that is the compile error for the caller's other rules).
                 _ if lower == upper && inner_lower == inner_upper => {
-                    quantify(lower * inner_lower, lower * inner_lower, greedy, *inner)
+                    let product = lower
+                        .checked_mul(inner_lower)
+                        .filter(|&n| i32::try_from(n).is_ok())?;
+                    return quantify(product, product, greedy, *inner);
                 }
                 _ => plain(
                     lower,
@@ -388,7 +393,7 @@ fn quantify(lower: u64, upper: u64, greedy: bool, body: Node) -> Node {
             }
         }
         // `tune_quant` writes an exact count of a string as the longer string, when it is at most
-        // 100 bytes (the body is ASCII here, see `tune_shadow`).
+        // 100 bytes (UTF-8 here, as in jq).
         Node::Str(text)
             if lower == upper
                 && (2..=100).contains(&lower)
@@ -397,7 +402,7 @@ fn quantify(lower: u64, upper: u64, greedy: bool, body: Node) -> Node {
             Node::Str(text.repeat(lower as usize))
         }
         body => plain(lower, upper, greedy, body),
-    }
+    })
 }
 
 /// What `get_tree_head_literal` finds at the head of an item.
@@ -469,7 +474,7 @@ fn build(ast: &Ast) -> Option<Node> {
             if (lower, upper) == (1, 1) {
                 return Some(body);
             }
-            Some(quantify(lower, upper, repetition.greedy, body))
+            quantify(lower, upper, repetition.greedy, body)
         }
         Ast::Concat(concat) => {
             let mut items: Vec<Node> = Vec::new();
@@ -612,6 +617,10 @@ pub(crate) fn tune(pattern: &str, ignore_case: bool) -> Vec<Tuned> {
 }
 
 fn tune_shadow(pattern: &str, shadow: &OnigurumaShadow) -> Vec<Tuned> {
+    // The offsets are read in both texts; the shadow keeps the pattern's length by construction.
+    if shadow.text.len() != pattern.len() {
+        return Vec::new();
+    }
     let Ok(tree) = ast::parse::Parser::new().parse(&shadow.text) else {
         return Vec::new();
     };
@@ -641,10 +650,8 @@ fn tune_shadow(pattern: &str, shadow: &OnigurumaShadow) -> Vec<Tuned> {
         }
         // A backreference, lookaround, atomic group or comment inside the body is opaque; an escape
         // the shadow writes as another (`\K`, `\G`, `\Z`, `\R`) makes the text differ.
-        // The string expansion above counts bytes, which are characters in ASCII.
         if shadow.opaque.iter().any(|&at| at > open && at < close)
             || pattern.get(body_at..close) != shadow.text.get(body_at..close)
-            || !pattern[body_at..close].is_ascii()
         {
             continue;
         }
@@ -862,5 +869,22 @@ mod tests {
         // Not a string, or a count a bound apart.
         assert_eq!(verdicts("(?<=(?:[ab]{2}){1,2})c"), [Verdict::Invalid]);
         assert_eq!(verdicts("(?<=(?:c{2,3}){1,2})c"), [Verdict::Invalid]);
+    }
+
+    #[test]
+    fn counts_are_characters_and_a_product_past_an_int_is_not_sized() {
+        // An escape for a character that takes two bytes is one character.
+        assert_eq!(verdicts(r"(?<=\x{e9}|a)b"), [Verdict::Fixed]);
+        assert_eq!(verdicts(r"(?<=\x{1F600}|a)b"), [Verdict::Fixed]);
+        // Two exact counts multiply, and a product Oniguruma cannot hold is left to the caller.
+        assert_eq!(
+            tune(
+                "(?<=(?:(?:(?:(?:a{99999}){99999}){99999}){99999}){99999})b",
+                false
+            ),
+            []
+        );
+        assert_eq!(verdicts("(?<=(?:a{300}){300})b"), [Verdict::Invalid]);
+        assert_eq!(verdicts("(?<=(?:a{3}){4})b"), [Verdict::Fixed]);
     }
 }

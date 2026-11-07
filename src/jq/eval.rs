@@ -29927,6 +29927,7 @@ fn property_name_kind(raw: &str) -> PropertyName {
 /// where it was. Alternation branches of one width (`ab|cd`) and a branch that can be empty (`a|`)
 /// are accepted. A branch holding anything this cannot size (a backreference, a nested lookaround or
 /// atomic group, a comment) is not counted.
+/// The shape rules alone, as they judge a body `onig_look_behind` does not read (the tests pin them).
 #[cfg(all(feature = "regex", test))]
 fn look_behind_alternatives_differ(pattern: &str) -> bool {
     look_behind_alternatives_differ_but(pattern, &[])
@@ -33543,6 +33544,20 @@ fn build_regex_uncached<S: EvalSemantics>(
                 scanned
             }
         };
+        // #6519: a look-behind that can match nothing is no look-behind to Oniguruma, and the groups
+        // in its body are never set. Written before the translation, which then reads the pattern
+        // that its refusal of the other look-behinds reads.
+        let scanned = if extended || inline_extended(&scanned) {
+            scanned
+        } else {
+            match super::onig_look_behind::rewrite_empty(
+                &scanned,
+                flags.is_some_and(|f| f.contains('i')),
+            ) {
+                Some(written) => std::borrow::Cow::Owned(written),
+                None => scanned,
+            }
+        };
         match translate_posix_brackets(&scanned, extended, flags.is_some_and(|f| f.contains('i'))) {
             // #6108: a group repeated `{0}` keeps its capture slot.
             Ok(translated) => {
@@ -33557,16 +33572,8 @@ fn build_regex_uncached<S: EvalSemantics>(
                     Some(pinned) => std::borrow::Cow::Owned(pinned),
                     None => translated,
                 };
-                let kept = keep_zero_count_groups(&translated, extended)
-                    .unwrap_or_else(|| translated.into_owned());
-                // #6519: a look-behind that can match nothing is no look-behind to Oniguruma, and
-                // the groups in its body are never set.
-                let ignore_case = flags.is_some_and(|f| f.contains('i'));
-                if extended || inline_extended(&kept) {
-                    kept
-                } else {
-                    super::onig_look_behind::rewrite_empty(&kept, ignore_case).unwrap_or(kept)
-                }
+                keep_zero_count_groups(&translated, extended)
+                    .unwrap_or_else(|| translated.into_owned())
             }
             Err(refusal) => {
                 deferred_refusal.get_or_insert(refusal);

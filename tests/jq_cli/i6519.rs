@@ -180,3 +180,31 @@ fn a_branch_with_every_item_removed_is_an_undefined_error_6519() -> Result<()> {
         ),
     ])
 }
+
+/// A character written as an escape is one character, a count past 100 bytes is no longer string,
+/// and what follows a repeat decides whether a plain item is possessive.
+#[test]
+fn escapes_counts_and_what_follows_a_repeat_6519() -> Result<()> {
+    check(&[
+        (r"(?<=\x{e9}|a)b", "éb", r"[[1,[]]]"),
+        (r"(?<=(?:\x{e9}{2}){1,2})b", "ééb", r"[[2,[]]]"),
+        (r"(?#xy)(?<=(a)|)b", "ab", r"[[1,[[-1,null]]]]"),
+        (r"\x{e9}(?<=(a)|)b", "éb", r"[[0,[[-1,null]]]]"),
+        (r"(?<=a{0})b", "ab", r"[[1,[]]]"),
+        (r"(?<=x|a*)b", "ab", r"[[1,[]]]"),
+        (r"(?<=a*(?:b|c))d", "abd", r"[[2,[]]]"),
+        (r"(?<=a*(?:a|c))d", "aad", r"[[2,[]]]"),
+        (
+            r"(?<=a*(b))d",
+            "abd",
+            r#""Regex failure: invalid pattern in look-behind""#,
+        ),
+        (r"(?<=(?:a+?)*)b", "ab", r"[[1,[]]]"),
+        (r"(?<=(?:a+?)+)b", "ab", r"[[1,[]]]"),
+        (
+            r"(?<=(?:a{300}){300})b",
+            "ab",
+            r#""Regex failure: invalid pattern in look-behind""#,
+        ),
+    ])
+}
