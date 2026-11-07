@@ -3128,6 +3128,13 @@ materializing routes only: yq keeps both keys there too, and a duplicate-capable
 ([#1344](https://github.com/rust-works/succinctly/issues/1344)) holds the entries of an *ordinary* repeated key but not a pair of
 keys that share one fallback spelling (the guard still refuses those).
 
+**A collection key is written as the key node on the cursor route (#6496).**
+`.` and navigation over a mapping with a key that is a sequence, a mapping or a flow collection write `? - p` / `: v` as yq does; they wrote `"": v` before.
+An empty `[]` or `{}` key is written `[]: v`, a simple key.
+A collection key under a compact sequence entry with `-I=3` or a larger step pads the value's `:` line by the indent step (`:   - v`), as it already did for a scalar key.
+A value's comment on the `:` line of a collection key moves to the end of its text in yq (`: x # c`) and is dropped here.
+The routes that build an owned value still write the key as `""`, since the key is a string by then ([#6547](https://github.com/rust-works/succinctly/issues/6547)): `-P`, `keys`, `to_entries`, `sort_keys(.)`, `. as $x | $x`, `[.]` and a write.
+
 **A top-level comma of navigation reads such a document the way `.` does (#5283, answering #2645).**
 Real yq rejects the document for every filter, as it rejects a single undecodable key, so this is the same divergence as `.`, not a new one.
 The materializing routes raise because they must build a map; a comma of navigation builds none, so `.,.` and `.k, .` echo both entries under `""` where they used to raise.

@@ -5941,7 +5941,8 @@ fn test_yq_generic_routes_raise_on_colliding_complex_keys_2519() -> Result<()> {
 fn test_yq_streaming_routes_keep_both_colliding_complex_keys_2519() -> Result<()> {
     const TWO: &str = "? [1]\n: v1\n? [2]\n: v2\n";
     let rows: &[(&str, &str, &[&str], &str)] = &[
-        (TWO, ".", &[], "\"\": v1\n\"\": v2\n"),
+        // #6496: each key is written as the node it is.
+        (TWO, ".", &[], "? [1]\n: v1\n? [2]\n: v2\n"),
         (
             TWO,
             ".",
@@ -5957,7 +5958,7 @@ fn test_yq_streaming_routes_keep_both_colliding_complex_keys_2519() -> Result<()
         ),
         (TWO, "length", &[], "2\n"),
         (TWO, "has(\"\")", &[], "true\n"),
-        (TWO, "select(.)", &[], "\"\": v1\n\"\": v2\n"),
+        (TWO, "select(.)", &[], "? [1]\n: v1\n? [2]\n: v2\n"),
         ("? [1]\n: v1\nb: 3\n", ".x = 1", &[], "'': v1\nb: 3\nx: 1\n"),
         // An ordinary repeated key is kept by a write, as yq does (#1344, ADR-0027).
         ("a: 1\na: 2\n", ".x = 1", &[], "a: 1\na: 2\nx: 1\n"),
@@ -6121,7 +6122,7 @@ fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()
         (
             MERGED_VS_LOCAL_COMPLEX,
             ".",
-            "a: &a\n  \"\": x\nb:\n  !!merge <<: *a\n  \"\": y\n",
+            "a: &a\n  ? [1]\n  : x\nb:\n  !!merge <<: *a\n  ? [2]\n  : y\n",
         ),
     ];
     for &(yaml, filter, expected) in rows {
@@ -15892,7 +15893,8 @@ fn test_flow_keyed_mapping_predicate_leaves_other_shapes_alone_1188() -> Result<
 #[test]
 fn test_flow_keyed_mapping_is_not_reported_as_flow_style_1188() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "[a, b]: value\nz: 1\n", &[])?;
-    assert_eq!((code, out.as_str()), (0, "\"\": value\nz: 1\n"));
+    // #6496: written as the explicit key it is, as yq writes it.
+    assert_eq!((code, out.as_str()), (0, "? [a, b]\n: value\nz: 1\n"));
     let (out, code) = run_yq_stdin(".", "{[a]: v}\n", &[])?;
     assert_eq!((code, out.as_str()), (0, "{\"\": v}\n"));
     let (out, code) = run_yq_stdin(".", "k: [a, b]\nm: {c: 1}\n", &[])?;
