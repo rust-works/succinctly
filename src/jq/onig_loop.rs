@@ -26,9 +26,10 @@
 //! The plain [`rewrite`] keeps a loop as written when it would copy or drop a group, and counts the
 //! groups it writes ([`Rewriter::has_groups`]). A body with one way that matches nothing only where
 //! an anchor holds (`\b`, `\bb?`) has a conditional exit, on both sides of the ways after it, which is
-//! written from what the anchor is ([`Rewriter::anchored_repeat`], #6358). A second such way, or an
-//! empty way, is another exit: with no way after it, or the same anchor again, it is written too
-//! ([`Rewriter::second_exit`], #6424). A body whose ways are not
+//! written from what the anchor is ([`Rewriter::anchored_repeat`], #6358); under a `(?m)` that holds
+//! throughout, `^` and `$` are line anchors, written for ways that leave the lines alone (#6425). A
+//! second such way, or an empty way, is another exit: with no way after it, or the same anchor
+//! again, it is written too ([`Rewriter::second_exit`], #6424). A body whose ways are not
 //! listed here keeps its loop as written too: one with a way after that second exit, an
 //! assertion that is not an anchor, or a flag switch that names `x` or `U`. An assertion beside an item that consumes text
 //! does not matter: a way that must consume text always does, and the assertion only decides whether
@@ -136,6 +137,215 @@ enum AnchorKind {
     Start,
     /// `\z` or `$`: it holds where the text ends, so no way that consumes text can run there.
     End,
+    /// `^` where `(?m)` holds throughout (#6425): it holds at the start of every line. A loop whose
+    /// ways cannot end a line has it hold only at its first head, as [`AnchorKind::Start`] does.
+    LineStart,
+    /// `$` where `(?m)` holds throughout (#6425): it holds before every newline and at the end.
+    /// A way that starts with a newline runs only where it holds, and one that starts with
+    /// anything else only where it does not, which splits the ways ([`LinePlan::Split`]).
+    LineEnd,
+}
+
+/// How [`Rewriter::anchored_loop`] writes a loop over a line anchor (#6425).
+enum LinePlan {
+    /// An anchor that needs no plan.
+    Plain,
+    /// The ways after a `$` under `(?m)`, split by whether they start with a newline.
+    Split {
+        /// The ways that start with anything but a newline: they run only where `$` does not hold.
+        plain: Option<Text>,
+        /// The ways that start with a newline: they run only where `$` holds.
+        newline: Option<Text>,
+    },
+}
+
+/// Whether the first (or last) character a piece of pattern consumes is a newline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Edge {
+    /// It consumes nothing.
+    Nothing,
+    /// Never a newline.
+    Plain,
+    /// Always a newline.
+    Newline,
+    /// Either, or not known.
+    Either,
+}
+
+impl Edge {
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Nothing, edge) | (edge, Self::Nothing) => edge,
+            (a, b) if a == b => a,
+            _ => Self::Either,
+        }
+    }
+}
+
+/// What the first character `ast` consumes is (the last when `last`), and whether it can match
+/// nothing. Anything it does not know is [`Edge::Either`], so a pattern it cannot read keeps its loop.
+fn edge(ast: &Ast, last: bool) -> (Edge, bool) {
+    match ast {
+        Ast::Empty(_) | Ast::Flags(_) | Ast::Assertion(_) => (Edge::Nothing, true),
+        Ast::Literal(lit) => (
+            if lit.c == '\n' {
+                Edge::Newline
+            } else {
+                Edge::Plain
+            },
+            false,
+        ),
+        Ast::Dot(_) => (Edge::Either, false),
+        Ast::ClassUnicode(class) => (unicode_edge(class), false),
+        // `\d`, `\w` and `\S` hold no newline; `\s`, `\D` and `\W` do.
+        Ast::ClassPerl(class) => (perl_edge(class), false),
+        Ast::ClassBracketed(class) => (class_edge(class), false),
+        Ast::Group(group) => edge(&group.ast, last),
+        Ast::Repetition(rep) => {
+            let (min, max) = bounds(&rep.op.kind);
+            if max == Some(0) {
+                return (Edge::Nothing, true);
+            }
+            let (inner, empty) = edge(&rep.ast, last);
+            (inner, empty || min == 0)
+        }
+        Ast::Alternation(alt) => alt
+            .asts
+            .iter()
+            .map(|way| edge(way, last))
+            .fold((Edge::Nothing, false), |(all, any), (one, empty)| {
+                (all.join(one), any || empty)
+            }),
+        Ast::Concat(concat) => {
+            let mut items: Vec<&Ast> = concat.asts.iter().collect();
+            if last {
+                items.reverse();
+            }
+            let mut found = Edge::Nothing;
+            for item in items {
+                let (one, empty) = edge(item, last);
+                found = found.join(one);
+                if !empty {
+                    return (found, false);
+                }
+            }
+            (found, true)
+        }
+    }
+}
+
+/// A Unicode property that holds no newline: a letter, mark, number, punctuation, symbol or
+/// separator category, or `Alphabetic`, `Lowercase` or `Uppercase`. The translation of jq's `\w`
+/// is made of these (`\p{Alphabetic}\p{M}\p{Nd}\p{Pc}`). A newline is a control, so `\p{Cc}`,
+/// `\p{White_Space}`, a script and a negated property may hold one.
+fn unicode_edge(class: &ast::ClassUnicode) -> Edge {
+    const NO_NEWLINE: [&str; 40] = [
+        "L",
+        "Lu",
+        "Ll",
+        "Lt",
+        "Lm",
+        "Lo",
+        "M",
+        "Mn",
+        "Mc",
+        "Me",
+        "N",
+        "Nd",
+        "Nl",
+        "No",
+        "P",
+        "Pc",
+        "Pd",
+        "Ps",
+        "Pe",
+        "Pi",
+        "Pf",
+        "Po",
+        "S",
+        "Sm",
+        "Sc",
+        "Sk",
+        "So",
+        "Z",
+        "Zs",
+        "Zl",
+        "Zp",
+        "Alphabetic",
+        "Lowercase",
+        "Uppercase",
+        "Letter",
+        "Mark",
+        "Number",
+        "Punctuation",
+        "Symbol",
+        "Separator",
+    ];
+    if class.negated {
+        return Edge::Either;
+    }
+    let holds_none = match &class.kind {
+        ast::ClassUnicodeKind::OneLetter(letter) => "LMNPSZ".contains(*letter),
+        ast::ClassUnicodeKind::Named(name) => NO_NEWLINE.contains(&name.as_str()),
+        ast::ClassUnicodeKind::NamedValue { .. } => false,
+    };
+    if holds_none {
+        Edge::Plain
+    } else {
+        Edge::Either
+    }
+}
+
+fn perl_edge(class: &ast::ClassPerl) -> Edge {
+    use ast::ClassPerlKind::{Digit, Space, Word};
+    match (&class.kind, class.negated) {
+        (Digit | Word, false) | (Space, true) => Edge::Plain,
+        _ => Edge::Either,
+    }
+}
+
+/// Whether a bracketed class of literals, ranges, `\d`/`\w` and the properties of
+/// [`unicode_edge`] holds a newline, and whether the newline is all it holds. A class with anything
+/// else in it, or a negated one that excludes no newline, is [`Edge::Either`].
+fn class_edge(class: &ast::ClassBracketed) -> Edge {
+    fn members(item: &ast::ClassSetItem, newline: &mut bool, other: &mut bool) -> Option<()> {
+        match item {
+            ast::ClassSetItem::Literal(lit) if lit.c == '\n' => *newline = true,
+            ast::ClassSetItem::Literal(_) => *other = true,
+            ast::ClassSetItem::Range(range) => {
+                if range.start.c <= '\n' && '\n' <= range.end.c {
+                    *newline = true;
+                    *other |= range.start.c < range.end.c;
+                } else {
+                    *other = true;
+                }
+            }
+            ast::ClassSetItem::Perl(perl) if perl_edge(perl) == Edge::Plain => *other = true,
+            ast::ClassSetItem::Unicode(unicode) if unicode_edge(unicode) == Edge::Plain => {
+                *other = true;
+            }
+            ast::ClassSetItem::Union(union) => {
+                for item in &union.items {
+                    members(item, newline, other)?;
+                }
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+    let ast::ClassSet::Item(item) = &class.kind else {
+        return Edge::Either;
+    };
+    let (mut newline, mut other) = (false, false);
+    if members(item, &mut newline, &mut other).is_none() {
+        return Edge::Either;
+    }
+    match (class.negated, newline, other) {
+        (false, true, false) => Edge::Newline,
+        (false, true, true) => Edge::Either,
+        (false, false, _) | (true, true, _) => Edge::Plain,
+        (true, false, _) => Edge::Either,
+    }
 }
 
 #[derive(Clone)]
@@ -163,6 +373,10 @@ struct Rewriter<'p> {
     /// Whether a flag of the pattern may switch multi-line mode on, under which `^` and `$` are not
     /// the anchors [`AnchorKind`] says they are (#6358).
     multi_line: bool,
+    /// Whether multi-line mode is on for the whole pattern (#6425): a leading `(?m)` that nothing
+    /// switches off or on again. `^` and `$` are then [`AnchorKind::LineStart`] and
+    /// [`AnchorKind::LineEnd`], which a loop writes for ways that leave the lines alone.
+    lines: bool,
     /// Whether the parse is of a copy of the pattern that writes Oniguruma syntax plainly
     /// ([`oniguruma_shadow`](super::eval::oniguruma_shadow)): what a node there is no longer says
     /// how many operations Oniguruma makes of it.
@@ -261,17 +475,26 @@ fn empty_piece() -> Piece {
     }
 }
 
+/// [`rewrite_for`] for a search that is not told to find no empty match.
+#[cfg(test)]
+pub(crate) fn rewrite(pattern: &str) -> Option<String> {
+    rewrite_for(pattern, false)
+}
+
 /// `pattern` with every greedy, unbounded loop whose body can match nothing before trying a way
 /// that consumes text written so that the `regex` crate leaves the loop where Oniguruma does, or
 /// `None` when no loop needs it (or the pattern does not parse, or the rewrite grows too large).
-pub(crate) fn rewrite(pattern: &str) -> Option<String> {
+/// With `not_empty` (jq's `n` flag, which refuses an empty match and so the empty exit the forms
+/// write) a loop over `^` or `$` under `(?m)` keeps its text (#6425), as the loops over the anchors
+/// of the whole text answer differently from Oniguruma there too.
+pub(crate) fn rewrite_for(pattern: &str, not_empty: bool) -> Option<String> {
     if !may_need_rewrite(pattern) {
         return None;
     }
-    rewrite_parsed(pattern, false, "", 0)
+    rewrite_parsed(pattern, false, "", 0, not_empty)
 }
 
-/// A pattern [`rewrite_with_groups`] wrote, with how its groups read back into the input's.
+/// A pattern [`rewrite_with_groups_for`] wrote, with how its groups read back into the input's.
 pub(crate) struct GroupRewrite {
     /// The pattern to compile; every group in it is unnamed.
     pub(crate) pattern: String,
@@ -366,27 +589,34 @@ pub(crate) fn original_name(name: Box<str>, renames: &[(String, String)]) -> Box
     }
 }
 
-/// [`rewrite`] for a pattern whose loops have a capture group where the plain rewrite would copy or
+/// [`rewrite_with_groups_for`] for a search that is not told to find no empty match.
+#[cfg(test)]
+pub(crate) fn rewrite_with_groups(input: &str) -> Option<GroupRewrite> {
+    rewrite_with_groups_for(input, false)
+}
+
+/// [`rewrite_for`] for a pattern whose loops have a capture group where the plain rewrite would copy or
 /// drop it (#6332): the groups are tagged by number, the loops are written as they are without
 /// one, and each group the rewrite copied is read back through [`GroupRewrite::copies`]. `None`
 /// when the pattern has no group, needs no rewrite, or is not one the `regex` crate's parser reads,
 /// apart from a lookaround, atomic group or comment that stands in the way of no copy
 /// ([`copyable_beside_loops`], #6426).
-pub(crate) fn rewrite_with_groups(input: &str) -> Option<GroupRewrite> {
-    written_with_groups(input, 0)
+pub(crate) fn rewrite_with_groups_for(input: &str, not_empty: bool) -> Option<GroupRewrite> {
+    written_with_groups(input, 0, not_empty)
 }
 
-/// [`rewrite_with_groups`] at the later reading `reading` (1 or 2), for a rewrite the crate refused
+/// [`rewrite_with_groups_for`] at the later reading `reading` (1 or 2), for a rewrite the crate refused
 /// as too large: reading 1 leaves the loops inside a lazy repeat as written, and reading 2 the lazy
 /// repeats too (#6428, #6427). A `{1,n}?` is written twice, where the pattern has it once.
 pub(crate) fn rewrite_with_groups_past_the_size_limit(
     input: &str,
     reading: usize,
+    not_empty: bool,
 ) -> Option<GroupRewrite> {
-    written_with_groups(input, reading)
+    written_with_groups(input, reading, not_empty)
 }
 
-fn written_with_groups(input: &str, reading: usize) -> Option<GroupRewrite> {
+fn written_with_groups(input: &str, reading: usize, not_empty: bool) -> Option<GroupRewrite> {
     // The flags `i` and `s` of jq put a switch in front of the pattern. It reaches all of it, so it
     // stays in front and the rest is rewritten, with case folding read from it.
     let lead_len = leading_switches(input)?;
@@ -413,7 +643,7 @@ fn written_with_groups(input: &str, reading: usize) -> Option<GroupRewrite> {
         at = *end;
     }
     tagged.push_str(&pattern[at..]);
-    let written = rewrite_parsed(&tagged, true, lead, reading)?;
+    let written = rewrite_parsed(&tagged, true, lead, reading, not_empty)?;
     // Read the tags back: each group of the result is a copy of the group its tag names. The copies
     // share a name, which the parser refuses, so the tags are found by their text.
     let opening = format!("(?<{TAG}");
@@ -585,7 +815,13 @@ fn capture_openers(ast: &Ast, out: &mut Vec<(usize, usize)>) {
 /// `(lazy_bounded, lazy_trusted)` (#6428, #6427).
 const READINGS: [(bool, bool); 3] = [(true, true), (true, false), (false, false)];
 
-fn rewrite_parsed(pattern: &str, copies: bool, lead: &str, reading: usize) -> Option<String> {
+fn rewrite_parsed(
+    pattern: &str,
+    copies: bool,
+    lead: &str,
+    reading: usize,
+    not_empty: bool,
+) -> Option<String> {
     // #6128: a pattern with Oniguruma syntax only `fancy-regex` reads (lookaround, a backreference,
     // `\K`) is parsed through a copy that writes that syntax plainly at the same offsets. A pattern
     // the parser reads as written is read as written.
@@ -609,6 +845,7 @@ fn rewrite_parsed(pattern: &str, copies: bool, lead: &str, reading: usize) -> Op
         folds: may_fold_case(pattern) || may_fold_case(lead),
         multi_line: super::eval::pattern_may_enable_multiline(pattern)
             || super::eval::pattern_may_enable_multiline(lead),
+        lines: !not_empty && multi_line_throughout(lead, pattern),
         shadowed: parsed != pattern,
         work: core::cell::Cell::new(0),
         work_limit: pattern
@@ -661,6 +898,87 @@ fn may_fold_case(pattern: &str) -> bool {
             .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
             .any(|c| c == 'i')
     })
+}
+
+/// Whether a flag group of `pattern` names the flag `flag`, on or off: any `(?` followed by flag
+/// letters (up to a `)` or `:`) that include it. Over-reports (an escaped `\(?m` or a class counts),
+/// which only keeps a rewrite. A named group (`(?<m>`), a lookaround and a comment are no flag group.
+fn mentions_flag(pattern: &str, flag: char) -> bool {
+    pattern.match_indices("(?").any(|(at, _)| {
+        pattern[at + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
+            .any(|c| c == flag)
+            && !pattern[at + 2..].starts_with('P')
+    })
+}
+
+/// Whether `(?m)` holds for the whole of `lead` followed by `pattern` (#6425): the switches they
+/// start with turn it on, and no flag group after them names `m` again. Under the `x` flag the
+/// blanks and comments a way is made of are not its text, so a pattern that names `x` anywhere is not one.
+fn multi_line_throughout(lead: &str, pattern: &str) -> bool {
+    let whole = format!("{lead}{pattern}");
+    let mut at = 0;
+    let mut on = false;
+    while whole[at..].starts_with("(?") {
+        let Some(close) = whole[at..].find(')') else {
+            break;
+        };
+        let flags = &whole[at + 2..at + close];
+        if flags.is_empty() || !flags.chars().all(|c| c.is_ascii_alphabetic() || c == '-') {
+            break;
+        }
+        let mut negated = false;
+        for flag in flags.chars() {
+            match flag {
+                '-' => negated = true,
+                'm' => on = !negated,
+                // Any other flag may change what a line is (`R`, CRLF) or what a letter means.
+                'i' | 's' => {}
+                _ => return false,
+            }
+        }
+        at += close + 1;
+    }
+    on && !mentions_flag(&whole[at..], 'm') && !mentions_flag(&whole, 'x')
+}
+
+/// One way of a list of alternatives, with its text and what its first and last character are.
+struct Way {
+    text: String,
+    first: (Edge, bool),
+    last: (Edge, bool),
+}
+
+/// The ways of `text`, each alternative of its top level (the whole of it when it is not an
+/// alternation) with its text, or `None` when `text` is not a pattern `regex-syntax` reads. The
+/// copies of a tagged group share a name, which the parser refuses, so it reads the text with the
+/// repeats renamed ([`parse_distinct_names`]) and the ways are written back with their own.
+fn ways_of(text: &str) -> Option<Vec<Way>> {
+    let DistinctNames {
+        text: read,
+        ast,
+        renames,
+    } = parse_distinct_names(text)?;
+    let branches: Vec<&Ast> = match &ast {
+        Ast::Alternation(alt) => alt.asts.iter().collect(),
+        other => vec![other],
+    };
+    branches
+        .into_iter()
+        .map(|branch| {
+            let span = branch.span();
+            let mut way = read.get(span.start.offset..span.end.offset)?.to_string();
+            for (renamed, original) in &renames {
+                way = way.replace(renamed.as_str(), original);
+            }
+            Some(Way {
+                text: way,
+                first: edge(branch, false),
+                last: edge(branch, true),
+            })
+        })
+        .collect()
 }
 
 /// Whether `ast` can match the empty string, over-reporting (an assertion or flag counts).
@@ -1041,9 +1359,12 @@ impl Rewriter<'_> {
             },
             r"\A" => AnchorKind::Start,
             r"\z" => AnchorKind::End,
-            // Under `(?m)` they hold at every line, so neither says what these two kinds say.
+            // Under `(?m)` they hold at every line, so neither says what these two kinds say; with
+            // `(?m)` on throughout, they are the line anchors (#6425).
             "^" if !self.multi_line => AnchorKind::Start,
             "$" if !self.multi_line => AnchorKind::End,
+            "^" if self.lines => AnchorKind::LineStart,
+            "$" if self.lines => AnchorKind::LineEnd,
             _ => {
                 return Ok(Piece {
                     text,
@@ -1303,6 +1624,15 @@ impl Rewriter<'_> {
         match (&first.kind, &second.kind) {
             (AnchorKind::Start, _) | (_, AnchorKind::Start) => Some(AnchorKind::Start),
             (AnchorKind::End, _) | (_, AnchorKind::End) => Some(AnchorKind::End),
+            (AnchorKind::LineStart, AnchorKind::LineStart)
+            | (AnchorKind::LineEnd, AnchorKind::LineEnd)
+                if first.text.text == second.text.text =>
+            {
+                Some(match first.kind {
+                    AnchorKind::LineStart => AnchorKind::LineStart,
+                    _ => AnchorKind::LineEnd,
+                })
+            }
             (AnchorKind::Word { fails }, AnchorKind::Word { .. })
                 if first.text.text == second.text.text =>
             {
@@ -1330,7 +1660,21 @@ impl Rewriter<'_> {
                 after,
             } => Ways::Anchored {
                 before: way(before)?,
-                after: way(after)?,
+                // #6425: a `$` under `(?m)` splits the ways after it by how each starts, which a
+                // group around all of them would hide: each is wrapped alone.
+                after: match (&mark.kind, after) {
+                    (AnchorKind::LineEnd, Some(after)) => match self.read_ways(&after.text)? {
+                        Some(ways) => {
+                            let each: Vec<Text> = ways
+                                .into_iter()
+                                .map(|one| wrap(self.text(one.text, Prec::Concat)?))
+                                .collect::<Result<_, _>>()?;
+                            self.alt_text(&each)?
+                        }
+                        None => wrap(after).map(Some)?,
+                    },
+                    (_, after) => way(after)?,
+                },
                 anchor: match (anchor, mark) {
                     (false, mark) => mark,
                     (true, mark) => Box::new(Anchor {
@@ -1699,7 +2043,11 @@ impl Rewriter<'_> {
     /// `\B` right after one another hold together everywhere, which is the empty way, but no draw
     /// of `--assert` holds that pair and none improved when it was written.)
     fn second_exit(first: &Anchor, second: Option<&Anchor>, no_after: bool) -> Option<SecondExit> {
-        let start = |anchor: &Anchor| matches!(anchor.text.text.as_str(), r"\A" | "^");
+        // `^` under `(?m)` also holds after a newline, so it is not the start of the text (#6425).
+        let start = |anchor: &Anchor| {
+            matches!(anchor.kind, AnchorKind::Start)
+                && matches!(anchor.text.text.as_str(), r"\A" | "^")
+        };
         match second {
             Some(second)
                 if first.text.text == second.text.text || (start(first) && start(second)) =>
@@ -2092,11 +2440,16 @@ impl Rewriter<'_> {
                 });
             }
             (true, None) => {
+                // #6425: a loop over a line anchor is written only for ways that leave the lines alone.
+                let Some(plan) = self.line_plan(anchor, before, after)? else {
+                    return Ok(kept);
+                };
                 let mut rest = self.anchored_loop(
                     before,
                     anchor,
                     after,
                     (&exit, exit_all.as_ref().unwrap_or(&exit)),
+                    &plan,
                 )?;
                 if min > 0 && copied(ops, min) {
                     let copies = self.repeat_text(body, min, Some(min), true)?;
@@ -2159,13 +2512,20 @@ impl Rewriter<'_> {
     /// `^` and `$` are written as `\A` and `\z`. In jq `$` holds at the end alone, or before a final
     /// newline, and `^` does not end a loop after a newline inside the text: `--assert --newlines`
     /// in `scripts/jq-regex-capture-loop-sweep.py` finds no pattern moved away from jq. Under `(?m)`
-    /// they hold at every line and stay [`Ways::Opaque`].
+    /// they hold at every line: where that holds throughout they are [`AnchorKind::LineStart`] and
+    /// [`AnchorKind::LineEnd`], and [`Rewriter::line_plan`] says whether the loop is written (#6425);
+    /// where a flag may switch it, they stay [`Ways::Opaque`].
+    /// - `^` under `(?m)`: as `\A`, for ways none of which ends with a newline.
+    /// - `$` under `(?m)`: `n` is the ways that start with anything but a newline and `N` those that
+    ///   start with one, so `T` is `n*(?:N n*)*?(?:E|)`: `N` runs only where `$` holds, which the
+    ///   newline it starts with says, and `n` only where it does not.
     fn anchored_loop(
         &self,
         before: &Option<Text>,
         anchor: &Anchor,
         after: &Option<Text>,
         (first_exit, exit): (&Text, &Text),
+        plan: &LinePlan,
     ) -> Result<Text, GiveUp> {
         let star = |text: &Text| self.repeat_text(text, 0, None, true);
         let looped = before.as_ref().map(star).transpose()?;
@@ -2185,7 +2545,7 @@ impl Rewriter<'_> {
                 let here = self.repeat_text(&here, 0, None, false)?;
                 self.concat_text(&[&elsewhere, &here, &leave])?
             }
-            (Some(iteration), AnchorKind::Start) => {
+            (Some(iteration), AnchorKind::Start | AnchorKind::LineStart) => {
                 let more = self.repeat_text(&iteration, 1, None, true)?;
                 // #6424: a dropped last exit holds past the ways too, at every head, so it ends
                 // the ways of the later heads (`more`) and what is left of the first.
@@ -2202,10 +2562,113 @@ impl Rewriter<'_> {
             (Some(iteration), AnchorKind::End) => {
                 self.concat_text(&[&star(&iteration)?, &leave])?
             }
+            // A way that starts with a newline runs only where `$` holds, and any other only where
+            // it does not, so the heads need no complement of the anchor to tell them apart: `n`
+            // is the ways that start with anything else, and the anchor is the newline itself.
+            (Some(_), AnchorKind::LineEnd) => {
+                let LinePlan::Split { plain, newline } = plan else {
+                    return Err(GiveUp);
+                };
+                let then_a = |b: &Text| match &looped {
+                    Some(a) => self.concat_text(&[b, a]),
+                    None => Ok(b.clone()),
+                };
+                let elsewhere = match plain {
+                    Some(plain) => star(&then_a(plain)?)?,
+                    None => self.concat_text(&[])?,
+                };
+                match newline {
+                    None => self.concat_text(&[&elsewhere, &leave])?,
+                    Some(newline) => {
+                        let here = self.concat_text(&[&then_a(newline)?, &elsewhere])?;
+                        let here = self.repeat_text(&here, 0, None, false)?;
+                        self.concat_text(&[&elsewhere, &here, &leave])?
+                    }
+                }
+            }
         };
         match &looped {
             Some(a) => self.concat_text(&[a, &tail]),
             None => Ok(tail),
+        }
+    }
+
+    /// `ways_of` `text`, charged to the work budget as a copy of it is.
+    fn read_ways(&self, text: &str) -> Result<Option<Vec<Way>>, GiveUp> {
+        let work = self.work.get().saturating_add(text.len());
+        self.work.set(work);
+        if work > self.work_limit {
+            return Err(GiveUp);
+        }
+        Ok(ways_of(text))
+    }
+
+    /// How a loop over `before | anchor | after` is written when the anchor is a line anchor
+    /// (#6425), or `None` when it cannot be and the loop keeps its text.
+    ///
+    /// - `^`: it holds at the start of every line, so after a way that ends with a newline too.
+    ///   When no way can end with one, it holds only at the loop's first head, like `\A`.
+    /// - `$`: before a newline, so a way that starts with one can run where it holds. When every
+    ///   way after it starts with a newline or with anything else, the two kinds are the
+    ///   exits' two kinds of head: `\n` runs only where `$` holds and `a` only where it does not.
+    ///
+    /// A way that may or may not start (or end) with a newline, one that cannot be read, and a
+    /// `(?m)` that something switches keep the loop as written.
+    fn line_plan(
+        &self,
+        anchor: &Anchor,
+        before: &Option<Text>,
+        after: &Option<Text>,
+    ) -> Result<Option<LinePlan>, GiveUp> {
+        // With no way after a `$` there is nothing to tell the heads apart for: the loop is the ways
+        // before it and the exit, whichever lines the anchor holds at. A `^` is read with the ways
+        // before it too: it holds after a newline they end with, and Oniguruma's does not hold at the
+        // end of the text there (#6456), which the exit written for it does.
+        // A last exit (#6424) is written around the ways of every head, which neither this nor the
+        // split of the ways by where `$` holds writes.
+        if anchor.last && matches!(anchor.kind, AnchorKind::LineEnd) {
+            return Ok(None);
+        }
+        if after.is_none() && matches!(anchor.kind, AnchorKind::LineEnd) {
+            return Ok(Some(LinePlan::Plain));
+        }
+        match anchor.kind {
+            AnchorKind::LineStart => {
+                for text in [before, after].into_iter().flatten() {
+                    let Some(ways) = self.read_ways(&text.text)? else {
+                        return Ok(None);
+                    };
+                    if !ways
+                        .iter()
+                        .all(|way| matches!(way.last.0, Edge::Plain | Edge::Nothing))
+                    {
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(LinePlan::Plain))
+            }
+            AnchorKind::LineEnd => {
+                let Some(text) = after else {
+                    return Ok(Some(LinePlan::Plain));
+                };
+                let Some(ways) = self.read_ways(&text.text)? else {
+                    return Ok(None);
+                };
+                let (mut plain, mut newline) = (Vec::new(), Vec::new());
+                for way in ways {
+                    let kept = self.text(way.text, Prec::Concat)?;
+                    match way.first {
+                        (Edge::Plain, false) => plain.push(kept),
+                        (Edge::Newline, false) => newline.push(kept),
+                        _ => return Ok(None),
+                    }
+                }
+                Ok(Some(LinePlan::Split {
+                    plain: self.alt_text(&plain)?,
+                    newline: self.alt_text(&newline)?,
+                }))
+            }
+            _ => Ok(Some(LinePlan::Plain)),
         }
     }
 
@@ -2993,7 +3456,7 @@ mod tests {
         for _ in 0..20_000 {
             let extended = if roll(4) == 0 { "(?x)" } else { "" };
             let pattern = format!("{extended}{}", generate(4, &mut roll));
-            if rewrite_parsed(&pattern, false, "", 0).is_some() {
+            if rewrite_parsed(&pattern, false, "", 0, false).is_some() {
                 changed += 1;
                 assert!(may_need_rewrite(&pattern), "{pattern}");
             }
@@ -3068,9 +3531,165 @@ mod tests {
         // The shadow spells `\G` as `\b`: it is not one, so nothing writes its complement.
         let shadowed = rewrite(r"(?=x)(?:a|\Gb?|b)*").unwrap_or_default();
         assert!(!shadowed.contains(r"\B"), "{shadowed}");
-        // Under `(?m)` `^` and `$` hold at every line, which is neither kind.
-        assert_eq!(written(r"(?m)($|a|b)*"), None);
+        // Under a `(?m)` that something switches, `^` and `$` are neither kind.
         assert_eq!(written(r"(?m:(^|a|b)*)"), None);
+        assert_eq!(written(r"(?m)(^|a)*(?-m)"), None);
+        assert_eq!(written(r"(?mx)(^|a)*"), None);
+    }
+
+    /// #6425: under a `(?m)` that holds throughout, `$` splits the ways after it by how each starts
+    /// (a newline runs only where it holds), and `^` is the first head's when no way ends a line.
+    #[test]
+    fn a_loop_over_a_line_anchor_is_written_for_ways_that_leave_the_lines_alone_6425() {
+        let written = |pattern: &str| rewrite_with_groups(pattern).map(|r| r.pattern);
+        // The ways that start with anything but a newline loop where `$` fails, greedy; the one that
+        // starts with a newline loops where it holds, lazy, and each leaves through the exit.
+        assert_eq!(
+            written(r"(?m)($|a|b)*").as_deref(),
+            Some(r"(?m)(?:(?:(a)|(b))*(?:($|[^\s\S]|[^\s\S])|))")
+        );
+        assert_eq!(
+            written(r"(?m)($|a|\n|b)*").as_deref(),
+            Some(r"(?m)(?:(?:(a)|(b))*(?:(\n)(?:(a)|(b))*)*?(?:($|[^\s\S]|[^\s\S]|[^\s\S])|))")
+        );
+        // A `\w`, a class without the newline and a `\S` never start with one; a `\n` and `[\n]` always do.
+        for ways in [
+            r"\w",
+            "[^\\n]",
+            r"\S",
+            "[abc]",
+            r"\x61",
+            "a+",
+            r"\p{L}",
+            r"\p{Alphabetic}b",
+            r"[\p{Nd}_]",
+        ] {
+            assert!(written(&format!("(?m)($|{ways}|\\n)*")).is_some(), "{ways}");
+        }
+        assert!(written(r"(?m)($|a|[\n])*").is_some());
+        // A way that may start either way, and one the parser cannot read, keep the loop: nothing
+        // tells the heads where `$` holds from those where it does not.
+        for ways in [
+            r"\s",
+            ".",
+            "[^b]",
+            r"\W",
+            "[\\na]",
+            r"\P{L}",
+            r"\p{Cc}",
+            r"\p{White_Space}",
+            "a|(?=b)b",
+            r"(\1)",
+        ] {
+            assert_eq!(written(&format!("(?m)($|{ways}|b)*")), None, "{ways}");
+        }
+        // `^` is the first head's when no way ends with a newline; written like `\A` is.
+        let start = written(r"(?m)(^|a|b)*").unwrap_or_default();
+        assert!(start.contains("(a|b)+|)"), "{start}");
+        assert_eq!(written(r"(?m)(^|a|\n|b)*"), None);
+        assert_eq!(written(r"(?m)(^|a|\s)+"), None);
+        assert_eq!(written(r"(?m)(^|a|.)+"), None);
+        // Several anchors in a row are the one anchor when they are the same; two kinds are not.
+        assert!(written(r"(?m)(^^|a|b)*").is_some());
+        assert!(written(r"(?m)($$|a|b)*").is_some());
+        assert_eq!(written(r"(?m)($^|a|b)*"), None);
+        // A flag group around the anchor's body: its flags reach each way, and the anchor too.
+        let flagged = written(r"(?m)((?i:$|a|\n|b))*").unwrap_or_default();
+        assert!(
+            flagged.contains("(?i:a)") && flagged.contains(r"(?i:\n)"),
+            "{flagged}"
+        );
+        // Only ways that start with a newline, and ways that start with none.
+        assert!(written(r"(?m)($|\n)*").is_some_and(|t| t.contains("*?")));
+        assert!(written(r"(?m)($|a)*").is_some_and(|t| !t.contains("*?")));
+        // Ways the parser cannot read keep the loop, before a `^` and after a `$`.
+        assert_eq!(written(r"(?m)(^|(?=x)a|b)*"), None);
+        assert_eq!(written(r"(?m)($|(?=x)a|b)*"), None);
+        // With no way after a `$` there is nothing to tell apart, whatever the ways before it start
+        // with. A `^` is read with them: the exit written for it holds at the end of a text after a
+        // final newline, where Oniguruma's does not (#6456).
+        assert!(written(r"(?m)(a|\n|$)+").is_some());
+        assert!(written(r"(?m)(a|\s|$)+").is_some());
+        assert!(written(r"(?m)(a|^)+").is_some());
+        assert_eq!(written(r"(?m)(a|\n|^)+"), None);
+        // Nor under `x`, where blanks are no text, or when the flag is switched again after the anchor.
+        assert_eq!(written(r"(?x)(?m)($|a|\n|b)*"), None);
+        assert_eq!(written(r"(?m)($|a|\n|b)*(?-m:c)"), None);
+        // Nor when the search is told to find no empty match, which the exit written for a line
+        // anchor does not answer as Oniguruma does (as the loops over `\A` and `\z` do not).
+        assert!(rewrite_with_groups_for(r"(?m)($|a|\n|b)*", false).is_some());
+        assert!(rewrite_with_groups_for(r"(?m)($|a|\n|b)*", true).is_none());
+        assert!(rewrite_with_groups_for(r"(?m)(\b|a)*", true).is_some());
+    }
+
+    /// #6425: `(?m)` holds throughout only when the pattern's own leading switches turn it on and no
+    /// flag group names it again, and no flag group names `x`.
+    #[test]
+    fn multi_line_holds_throughout_only_for_a_leading_switch_6425() {
+        assert!(multi_line_throughout("", "(?m)a$"));
+        assert!(multi_line_throughout("(?m)", "a$"));
+        assert!(multi_line_throughout("(?i)", "(?m)a$"));
+        assert!(multi_line_throughout("", "(?im)(?s)a$"));
+        assert!(multi_line_throughout("", "(?i-s)(?m)a$"));
+        assert!(multi_line_throughout("", "(?m)(?<time>a)$"));
+        assert!(!multi_line_throughout("", "a$"));
+        assert!(!multi_line_throughout("", "a(?m)b$"));
+        assert!(!multi_line_throughout("", "(?m:a)$"));
+        assert!(!multi_line_throughout("", "(?m)a(?-m)b$"));
+        assert!(!multi_line_throughout("", "(?m)a(?i:b)(?m:c)$"));
+        assert!(!multi_line_throughout("", "(?-m)a$"));
+        assert!(!multi_line_throughout("", "(?m-m)a$"));
+        assert!(!multi_line_throughout("(?x)", "(?m)a$"));
+        assert!(!multi_line_throughout("", "(?mx)a$"));
+        assert!(!multi_line_throughout("", "(?m"));
+        assert!(!multi_line_throughout("", "(?mR)a$"));
+    }
+
+    /// #6425: what the first and the last character a way consumes is, as to a newline.
+    #[test]
+    fn a_ways_first_and_last_character_are_read_as_to_a_newline_6425() {
+        let edges = |pattern: &str| {
+            let ast = ast::parse::Parser::new().parse(pattern).unwrap();
+            (edge(&ast, false), edge(&ast, true))
+        };
+        use Edge::{Either, Newline, Nothing, Plain};
+        assert_eq!(edges("a"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges(r"\n"), ((Newline, false), (Newline, false)));
+        assert_eq!(edges(r"\x0a"), ((Newline, false), (Newline, false)));
+        assert_eq!(edges("[\\n]"), ((Newline, false), (Newline, false)));
+        assert_eq!(edges("[^\\n]"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges("[^a]"), ((Either, false), (Either, false)));
+        assert_eq!(edges("[a-z0-9_\\d]"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges("[\\x00-\\x20]"), ((Either, false), (Either, false)));
+        assert_eq!(edges("[\\t-\\x09]"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges(r"[[:alpha:]]"), ((Either, false), (Either, false)));
+        assert_eq!(edges(r"\w\S\d"), ((Plain, false), (Plain, false)));
+        // What the translation writes for jq's `\w`, and the properties that may hold a newline.
+        let word = r"[\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\x{B2}\x{B3}\x{B9}\x{BC}-\x{BE}]";
+        assert_eq!(edges(word), ((Plain, false), (Plain, false)));
+        assert_eq!(edges(r"\p{Lu}"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges(r"\pL"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges(r"\p{Cc}"), ((Either, false), (Either, false)));
+        assert_eq!(edges(r"\P{L}"), ((Either, false), (Either, false)));
+        assert_eq!(edges(r"\p{Greek}"), ((Either, false), (Either, false)));
+        assert_eq!(edges(r"\s"), ((Either, false), (Either, false)));
+        assert_eq!(edges(r"\D"), ((Either, false), (Either, false)));
+        assert_eq!(edges("."), ((Either, false), (Either, false)));
+        // The first character is the first one a way can consume, past what matches nothing.
+        assert_eq!(edges("b*\\n"), ((Either, false), (Newline, false)));
+        assert_eq!(edges("\\nb*"), ((Newline, false), (Either, false)));
+        assert_eq!(edges("a?\\nb?"), ((Either, false), (Either, false)));
+        assert_eq!(edges("^a$"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges("$\\n"), ((Newline, false), (Newline, false)));
+        assert_eq!(edges("(?:a|b)c"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges("(a|\\n)"), ((Either, false), (Either, false)));
+        assert_eq!(edges("a{0}b"), ((Plain, false), (Plain, false)));
+        assert_eq!(edges("b*"), ((Plain, true), (Plain, true)));
+        assert_eq!(edges("a?b*"), ((Plain, true), (Plain, true)));
+        assert_eq!(edges(r"\p{scx=Greek}"), ((Either, false), (Either, false)));
+        assert_eq!(edges("[a-z&&[^b]]"), ((Either, false), (Either, false)));
+        assert_eq!(edges("[a[:alpha:]]"), ((Either, false), (Either, false)));
+        assert_eq!(edges("(?:)"), ((Nothing, true), (Nothing, true)));
     }
 
     /// A piece that matches only the empty string is not copied into the rewrite, so a pattern the
