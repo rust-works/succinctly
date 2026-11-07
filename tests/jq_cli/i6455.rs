@@ -70,3 +70,41 @@ fn an_earlier_file_past_its_first_chunks_reads_as_jq_reads_it_6455() -> Result<(
     }
     Ok(())
 }
+
+/// #6455: a fault a later chunk meets in the stream's last file names `<unknown>` where jq does: a
+/// number straight before the last byte, an opener, completes in the read that reaches the end
+/// (#6004). The lazy route's fault handoff read the stream as one that went on past that file. From
+/// one file and as the last of two; jq 1.7.1's rows.
+#[test]
+fn a_late_fault_at_the_end_of_the_stream_is_placed_as_jq_places_it_6455() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut opener = Vec::new();
+    for i in 0..8_000 {
+        opener.extend_from_slice(format!("{{\"id\":{i}}}\n").as_bytes());
+    }
+    opener.extend_from_slice(b"5[");
+    let path = dir.path().join("opener.json");
+    std::fs::write(&path, &opener)?;
+    let opener = path.to_string_lossy().into_owned();
+    let first = dir.path().join("first.json");
+    std::fs::write(&first, "{\"id\":-1}\n")?;
+    let first = first.to_string_lossy().into_owned();
+    for (files, line) in [
+        (vec![opener.as_str()], 8001),
+        (vec![first.as_str(), &opener], 8002),
+    ] {
+        let mut args = vec!["-n", "[inputs]|length"];
+        args.extend(&files);
+        let (output, code) = spawn_jq(&args, None)?;
+        assert_eq!(String::from_utf8(output.stdout)?, "", "{files:?}");
+        assert_eq!(
+            String::from_utf8(output.stderr)?,
+            format!(
+                "jq: error (at <unknown>): Unfinished JSON term at EOF at line {line}, column 2\n"
+            ),
+            "{files:?}"
+        );
+        assert_eq!(code, 5, "{files:?}");
+    }
+    Ok(())
+}
