@@ -88380,7 +88380,8 @@ pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue
 /// state as its one `.` member, so a fold of `N` steps costs `O(N)`. Through the bridge each step
 /// wrote the whole accumulator out as JSON and indexed it again to evaluate a constructor that
 /// copies it, which is `O(N^2)` once the accumulator is a nest `N` levels deep. Also a constructor
-/// with no `.` member whose every member is read off the state's tree (#6528, below).
+/// with no `.` member whose members are read off the state's tree or move a container slot out of
+/// it (#6528, #6538, below).
 ///
 /// At most one member is `.` itself (a second would need a copy of a value that is already `N`
 /// levels deep). Every other element, key and value is settled by [`owned_assign_operand`] against
@@ -88393,9 +88394,9 @@ pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue
 /// A constructor with no `.` member at all (#6528) is the state the running-total folds build,
 /// `[.[0] + $x, .[1] + 1]` and `{s: (.s + $x), n: (.n + 1)}`. It is taken only when every member
 /// is closed, read off the tree ([`owned_assign_operand_off_the_tree`]), or a container slot one
-/// static step down, as `.k` or `.k + R` (#6538, [`settle_free_member`]); the slots are moved out
-/// of the state once every member is settled, so `{a: (.a + [$i]), n: (.n + 1)}` extends `.a` in
-/// place, and the rest of the state is dropped. Through the bridge each step evaluated the
+/// static step down, as `.k`, `.k + R` or `(.k // C) + R` (#6538, [`settle_free_slot`]); the
+/// slots are moved out of the state once every member is settled, so `{a: (.a + [$i]), n: (.n +
+/// 1)}` extends `.a` in place, and the rest of the state is dropped. Through the bridge each step evaluated the
 /// constructor on the evaluator's own route and re-indexed the state for each `.[0]` it read,
 /// 0.35x-0.49x of jq 1.7.1 over 800k floats, and quadratic once the state held a growing list. A
 /// member that needs the rebuilt state (`.a | length`, a slot two members move) declines the whole
@@ -88422,39 +88423,34 @@ fn owned_constructor_step<S: EvalSemantics>(
                 Expr::Comma(items) => items.as_slice(),
                 single => core::slice::from_ref(single),
             };
-            let around_state = items
+            let dot = items
                 .iter()
-                .any(|item| matches!(unwrap_paren(item), Expr::Identity));
+                .position(|item| matches!(unwrap_paren(item), Expr::Identity));
             // The live-table check is a thread-local read, so it comes after the shape checks that
             // decline most constructors for nothing.
-            if !around_state && !items.iter().all(off_the_tree_shape)
+            if dot.is_none() && !items.iter().all(off_the_tree_shape)
                 || super::eval_generic::embed_table_active()
             {
                 return Err(state);
             }
-            if !around_state {
+            let Some(dot) = dot else {
                 return owned_free_array_step::<S>(items, state);
-            }
+            };
             // One pass: the member that reads `.` is a placeholder until every other member has
             // been settled, so a decline hands the state back before it is moved. A second read
             // of `.` declines at once.
             let mut out: Vec<OwnedValue> = vec_with_capacity(items.len());
-            let mut dot = None;
             for (at, item) in items.iter().enumerate() {
-                if matches!(unwrap_paren(item), Expr::Identity) {
-                    if dot.replace(at).is_some() {
-                        return Err(state);
-                    }
+                if at == dot {
                     out.push(OwnedValue::Null);
+                } else if matches!(unwrap_paren(item), Expr::Identity) {
+                    return Err(state);
                 } else if let Some(value) = owned_assign_operand::<S>(item, &state) {
                     out.push(value);
                 } else {
                     return Err(state);
                 }
             }
-            let Some(dot) = dot else {
-                return Err(state); // patchcov: coverage tolerate-line reason="unreachable: `around_state` above found a `.` member, which the loop records or declines on a second one (#6538)"
-            };
             out[dot] = state;
             Ok(OwnedStep::Handled(Ok(OwnedValue::array_from(out))))
         }
@@ -88519,14 +88515,18 @@ fn owned_constructor_step<S: EvalSemantics>(
     }
 }
 
-/// A member of a constructor with no `.` member (#6528, #6538), settled against the state before
-/// anything is moved out of it.
+/// A member of a constructor with no `.` member that moves a container slot out of the state
+/// (#6538), settled against the state before anything is moved out of it. A member read off the
+/// tree ([`owned_assign_operand_off_the_tree`]) is a value at once and never one of these.
 enum FreeMember<'e> {
-    /// Closed, or read off the tree ([`owned_assign_operand_off_the_tree`]).
-    Value(OwnedValue),
-    /// `.k + R`: the container (or string) the slot holds, extended by `R`'s settled value. `+`
-    /// cannot fail on the pair ([`plus_cannot_fail`]), or the slot is `null` and the sum is `R`.
-    Grow(StepKey<'e>, OwnedValue),
+    /// `.k + R` or `(.k // C) + R`: the container (or string) the slot holds -- or `C`, closed,
+    /// when the slot is `null` or `false` -- extended by `R`'s settled value. `+` cannot fail on
+    /// the pair ([`plus_cannot_fail`]), or the left is `null` and the sum is `R`.
+    Grow {
+        key: StepKey<'e>,
+        default: Option<OwnedValue>,
+        right: OwnedValue,
+    },
     /// `.k`: the container the slot holds.
     Take(StepKey<'e>),
 }
@@ -88538,19 +88538,26 @@ impl FreeMember<'_> {
     /// allocation failure, as [`owned_grow`]'s does.
     fn resolve<S: EvalSemantics>(self, state: &mut OwnedValue) -> Result<OwnedValue, EvalError> {
         match self {
-            FreeMember::Value(value) => Ok(value),
-            FreeMember::Grow(key, right) => {
-                arith_combine::<S>(ArithOp::Add, take_slot(&key, state), right)
+            FreeMember::Grow {
+                key,
+                default,
+                right,
+            } => {
+                let old = take_slot(&key, state);
+                let left = match default {
+                    Some(default) if !old.is_truthy() => default,
+                    _ => old,
+                };
+                arith_combine::<S>(ArithOp::Add, left, right)
             }
             FreeMember::Take(key) => Ok(take_slot(&key, state)),
         }
     }
 
-    /// The slot this member moves out of the state, if any.
-    fn slot(&self) -> Option<&StepKey<'_>> {
+    /// The slot this member moves out of the state.
+    fn slot(&self) -> &StepKey<'_> {
         match self {
-            FreeMember::Value(_) => None,
-            FreeMember::Grow(key, _) | FreeMember::Take(key) => Some(key),
+            FreeMember::Grow { key, .. } | FreeMember::Take(key) => key,
         }
     }
 }
@@ -88563,16 +88570,14 @@ fn take_slot(key: &StepKey<'_>, state: &mut OwnedValue) -> OwnedValue {
     })
 }
 
-/// [`FreeMember`] for `member`, or `None` to decline the constructor. A member that is not read
-/// off the tree may be `.k` holding a container, or `.k + R` with `R` read off the tree, for a
-/// static field or a non-negative index `k` ([`owned_assign_step_child`]: no pad, no wrong kind).
-fn settle_free_member<'e, S: EvalSemantics>(
+/// [`FreeMember`] for a member [`owned_assign_operand_off_the_tree`] did not read, or `None` to
+/// decline the constructor: `.k` holding a container, or `.k + R` or `(.k // C) + R` with `R` read
+/// off the tree and `C` closed, for a static field or a non-negative index `k`
+/// ([`owned_assign_step_child`]: no pad, no wrong kind).
+fn settle_free_slot<'e, S: EvalSemantics>(
     member: &'e Expr,
     state: &OwnedValue,
 ) -> Option<FreeMember<'e>> {
-    if let Some(value) = owned_assign_operand_off_the_tree::<S>(member, state) {
-        return Some(FreeMember::Value(value));
-    }
     match unwrap_paren(member) {
         Expr::Arithmetic {
             op: ArithOp::Add,
@@ -88580,11 +88585,26 @@ fn settle_free_member<'e, S: EvalSemantics>(
             right,
             ..
         } => {
-            let key = static_step(unwrap_paren(left))?;
+            let (key, default) = match unwrap_paren(left) {
+                Expr::Alternative(read, default) => (
+                    static_step(unwrap_paren(read))?,
+                    Some(closed_expr_to_owned::<S>(default)?),
+                ),
+                read => (static_step(read)?, None),
+            };
             let old = owned_assign_step_child(&key, state)?;
+            let left = match &default {
+                Some(default) if !old.is_truthy() => default,
+                _ => old,
+            };
             let right = owned_assign_operand_off_the_tree::<S>(right, state)?;
-            (matches!(old, OwnedValue::Null) || plus_cannot_fail(old, &right))
-                .then_some(FreeMember::Grow(key, right))
+            (matches!(left, OwnedValue::Null) || plus_cannot_fail(left, &right)).then_some(
+                FreeMember::Grow {
+                    key,
+                    default,
+                    right,
+                },
+            )
         }
         other => {
             let key = static_step(other)?;
@@ -88595,49 +88615,51 @@ fn settle_free_member<'e, S: EvalSemantics>(
     }
 }
 
-/// Whether no two members move the same slot out of the state: the second would read the `null`
-/// the first left behind. Such a constructor is the bridge's.
-fn free_slots_distinct<'m, 'e: 'm>(members: impl Iterator<Item = &'m FreeMember<'e>>) -> bool {
-    let slots: Vec<&StepKey<'_>> = members.filter_map(FreeMember::slot).collect();
-    slots
-        .iter()
-        .enumerate()
-        .all(|(at, slot)| !slots[..at].contains(slot))
-}
-
-/// `[a, b, ...]` with no `.` member as a fold's UPDATE (#6528, #6538): every member is settled
-/// against the state first ([`settle_free_member`]), so a decline hands it back untouched, and
-/// only then are the slots the members name moved out of it.
+/// `[a, b, ...]` with no `.` member as a fold's UPDATE (#6528, #6538), in one pass: every member is
+/// settled against the state first ([`settle_free_slot`]), so a decline hands it back untouched,
+/// and only then are the slots the members name moved out of it. A constructor of scalar reads
+/// builds its output directly, as it did before slots were taken: `moves` stays empty and never
+/// allocates. Two members that would move the same slot decline, since the second would read the
+/// `null` the first left behind.
 fn owned_free_array_step<S: EvalSemantics>(
     items: &[Expr],
     mut state: OwnedValue,
 ) -> Result<OwnedStep, OwnedValue> {
-    let mut members = vec_with_capacity(items.len());
-    for item in items {
-        match settle_free_member::<S>(item, &state) {
-            Some(member) => members.push(member),
-            None => return Err(state),
+    let mut out: Vec<OwnedValue> = vec_with_capacity(items.len());
+    let mut moves: Vec<(usize, FreeMember<'_>)> = Vec::new();
+    for (at, item) in items.iter().enumerate() {
+        if let Some(value) = owned_assign_operand_off_the_tree::<S>(item, &state) {
+            out.push(value);
+            continue;
+        }
+        let Some(member) = settle_free_slot::<S>(item, &state) else {
+            return Err(state);
+        };
+        if moves.iter().any(|(_, held)| held.slot() == member.slot()) {
+            return Err(state);
+        }
+        out.push(OwnedValue::Null);
+        moves.push((at, member));
+    }
+    for (at, member) in moves {
+        match member.resolve::<S>(&mut state) {
+            Ok(value) => out[at] = value,
+            Err(error) => return Ok(OwnedStep::Handled(Err(error))), // patchcov: coverage tolerate-line reason="unreachable in practice: a `+` that cannot fail fails only on an allocation failure (#6538)"
         }
     }
-    if !free_slots_distinct(members.iter()) {
-        return Err(state);
-    }
-    let out = members
-        .into_iter()
-        .map(|member| member.resolve::<S>(&mut state))
-        .collect::<Result<Vec<_>, _>>();
-    Ok(OwnedStep::Handled(out.map(OwnedValue::array_from)))
+    Ok(OwnedStep::Handled(Ok(OwnedValue::array_from(out))))
 }
 
 /// `{k: v, ...}` with no `.` member as a fold's UPDATE (#6528, #6538), as
 /// [`owned_free_array_step`]. Each key is closed or read off the tree, and must be a string. A
 /// repeated key keeps its first position and takes the last value, as `object_from_pairs` does in
-/// jq mode.
+/// jq mode, so a later member under the same key drops the move an earlier one named.
 fn owned_free_object_step<S: EvalSemantics>(
     entries: &[ObjectEntry],
     mut state: OwnedValue,
 ) -> Result<OwnedStep, OwnedValue> {
-    let mut members = vec_with_capacity(entries.len());
+    let mut map: IndexMap<String, OwnedValue> = IndexMap::with_capacity(entries.len());
+    let mut moves: Vec<(String, FreeMember<'_>)> = Vec::new();
     for entry in entries {
         let key = match &entry.key {
             ObjectKey::Literal(name) => name.clone(),
@@ -88647,16 +88669,23 @@ fn owned_free_object_step<S: EvalSemantics>(
                 _ => return Err(state),
             },
         };
-        match settle_free_member::<S>(&entry.value, &state) {
-            Some(member) => members.push((key, member)),
-            None => return Err(state),
+        if !moves.is_empty() {
+            moves.retain(|(held, _)| *held != key);
         }
+        if let Some(value) = owned_assign_operand_off_the_tree::<S>(&entry.value, &state) {
+            map.insert(key, value);
+            continue;
+        }
+        let Some(member) = settle_free_slot::<S>(&entry.value, &state) else {
+            return Err(state);
+        };
+        if moves.iter().any(|(_, held)| held.slot() == member.slot()) {
+            return Err(state);
+        }
+        map.insert(key.clone(), OwnedValue::Null);
+        moves.push((key, member));
     }
-    if !free_slots_distinct(members.iter().map(|(_, member)| member)) {
-        return Err(state);
-    }
-    let mut map: IndexMap<String, OwnedValue> = IndexMap::with_capacity(members.len());
-    for (key, member) in members {
+    for (key, member) in moves {
         match member.resolve::<S>(&mut state) {
             Ok(value) => {
                 map.insert(key, value);
@@ -173410,6 +173439,10 @@ mod share_audit_2999 {
                 "reduce .[] as $r ({o: {}}; {o: (.o + {($r.name): $r.score})})",
                 &[(Kind::ObjectMakeMut, 1)][..],
             ),
+            (
+                "reduce .[] as $r ({}; {a: ((.a // []) + [$r.score])})",
+                &[][..],
+            ),
         ] {
             assert_forced(&json, filter, expected);
         }
@@ -177750,6 +177783,12 @@ mod named_args_shared_tests_5690 {
             "{a: 1, a: (.a + [5])}",
             "{a: (.a + [5]), a: 1}",
             "{(.s): (.a + [1])}",
+            "{a: ((.a // []) + [9])}",
+            "{z: ((.z // []) + [9])}",
+            "{m: ((.missing // {}) + {k: 1})}",
+            "{s: ((.s // \"d\") + \"x\")}",
+            "{a: (.a + [1]), b: 2, a: .b}",
+            "{a: .b, a: (.a + [1])}",
         ] {
             let OwnedStep::Handled(Ok(got)) = step(src) else {
                 panic!("not handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step declined a constructor UPDATE the test lists as handled (#6538)"
@@ -177766,6 +177805,9 @@ mod named_args_shared_tests_5690 {
         }
         for src in [
             "{a: .a, b: .a}",
+            "{a: ((.a // [1]) + [9]), b: .a}",
+            "{z: ((.z // .a) + [9])}",
+            "{n: ((.n // []) + [9])}",
             // `length` is not read off the tree, so the member needs the rebuilt state.
             "{n: (.a | length), a: (.a + [0])}",
             "{a: (.a + .b)}",

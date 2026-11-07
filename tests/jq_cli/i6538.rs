@@ -35,6 +35,13 @@ fn container_slot_constructor_steps_answer_as_jq_6538() -> Result<()> {
         (r"{a: [9]} as $s | reduce .[] as $i ($s; {a: (.a + [$i])}) | ., $s", "{\"a\":[9,1,2.5,\"x\",null,{\"k\":1}]}\n{\"a\":[9]}\n", 0),
         (r"[0] as $s | reduce .[] as $i ({a: $s}; {a: (.a + [$i])}) | ., $s", "{\"a\":[0,1,2.5,\"x\",null,{\"k\":1}]}\n[0]\n", 0),
         (r#"try reduce .[] as $i ({a: []}; {a: (.a + [$i]), b: error("x")}) catch ."#, "\"x\"\n", 0),
+        (r"reduce .[] as $i ({}; {a: ((.a // []) + [$i])})", "{\"a\":[1,2.5,\"x\",null,{\"k\":1}]}\n", 0),
+        (r"reduce .[] as $i ({a: false}; {a: ((.a // []) + [$i])})", "{\"a\":[1,2.5,\"x\",null,{\"k\":1}]}\n", 0),
+        (r"reduce .[] as $i ({}; {o: ((.o // {}) + {($i | tojson): 1})})", "{\"o\":{\"1\":1,\"2.5\":1,\"\\\"x\\\"\":1,\"null\":1,\"{\\\"k\\\":1}\":1}}\n", 0),
+        (r"try reduce .[] as $i ({}; {a: ((.a // 1) + [$i])}) catch .", "\"number (1) and array ([1]) cannot be added\"\n", 0),
+        (r"reduce .[] as $i ({a: [], b: 1}; {a: (.a + [$i]), b: 2, a: .b})", "", 5),
+        (r"reduce .[] as $i ({a: [], b: 1}; {a: .b, a: (.a + [$i])})", "{\"a\":[1,2.5,\"x\",null,{\"k\":1}]}\n", 0),
+        (r"reduce .[] as $i ({a: []}; {a: (.a + [$i] + [0])})", "{\"a\":[1,0,2.5,0,\"x\",0,null,0,{\"k\":1},0]}\n", 0),
     ] {
         let (stdout, _, code) = run_jq_full(&["-c", filter], Some(INPUT))?;
         assert_eq!((stdout.as_str(), code), (want, want_code), "{filter}");
@@ -42,7 +49,7 @@ fn container_slot_constructor_steps_answer_as_jq_6538() -> Result<()> {
     Ok(())
 }
 
-/// 20,000 steps re-indexed a state holding up to 20,000 elements on every step before (minutes);
+/// 20,000 steps re-indexed a state holding up to 20,000 elements on every step before (about 5 s);
 /// the slot is extended in place now. The answer is jq 1.7.1's.
 #[test]
 fn a_long_container_slot_constructor_fold_answers_6538() -> Result<()> {
