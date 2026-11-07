@@ -5231,16 +5231,17 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 Ok(mut slurped) => (vec![std::mem::take(&mut slurped.combined)], Some(slurped)),
                 // `--validate` already printed its own report.
                 Err(SlurpFailure::Validation(exit_code)) => return Ok(exit_code),
+                // #6476: a file that did not open makes the run exit 2 after any of these faults.
                 Err(SlurpFailure::DepthLimit) => {
                     sink.report_parse_error("Exceeds depth limit for parsing");
-                    return Ok(DiagStyle::Jq.error_exit_code());
+                    return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
                 }
                 // Line 0 of the first file, where `get_inputs` has always
                 // named a `--slurp` stream it could not finish splitting: the
                 // one combined value has no document position of its own.
                 Err(SlurpFailure::Unsplittable(Some(message))) => {
                     sink.report_parse_error(&message);
-                    return Ok(DiagStyle::Jq.error_exit_code());
+                    return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
                 }
                 // patchcov: coverage tolerate reason="defensive: the splitter stops only at a fault jq's parser also meets, so `slurp_fault` names one; kept so a disagreement between them prints the old line-0 message rather than none (#5555)"
                 Err(SlurpFailure::Unsplittable(None)) => {
@@ -5250,7 +5251,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         &EvalError::new("Invalid JSON text"),
                         &InputLocation::at(file.as_deref(), 0),
                     );
-                    return Ok(DiagStyle::Jq.error_exit_code());
+                    return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
                 } // patchcov: coverage end
             }
         } else {
@@ -5695,6 +5696,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 if let Some(message) =
                     jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0)
                 {
+                    // #6476: a text that ends inside a value is a fault jq's parser meets at the end
+                    // of the last file's bytes, after its reader has moved on to the files that
+                    // would not open, so it reports them first and the run exits 2 with them.
+                    if message.contains(" at EOF") {
+                        report_open_failures(&failures[next_failure..], &mut open_failed);
+                        next_failure = failures.len();
+                    }
                     sink.report_parse_error(&message);
                     run_stopped = true;
                     break;
@@ -5719,7 +5727,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         if let (false, Some(message)) = (run_stopped, slurp_deferred_fault) {
             out.flush()?;
             sink.report_parse_error(&message);
-            return Ok(DiagStyle::Jq.error_exit_code());
+            return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
         }
     } else {
         // The materializing path: reads every document up front into a
@@ -5803,7 +5811,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         sink.report(DiagStyle::Jq, &err, &at);
                     } // patchcov: coverage end
                 }
-                return Ok(DiagStyle::Jq.error_exit_code());
+                // #6476: a file that would not open makes the run exit 2, whatever else it reports.
+                return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
             }
             Err(exit_code) => return Ok(exit_code), // Validation error
         };
