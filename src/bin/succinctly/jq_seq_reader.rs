@@ -378,6 +378,80 @@ pub(crate) fn walk_stream_values(
     walk_stream_placing(raw_bytes, slurp, false, false, emit)
 }
 
+/// The guards of [`plain_record_sequence`], as data so that a test can drop one and show the
+/// check unsound without it (#6501). Each closes one way for a stream of valid records to still
+/// not be clean; the shipped check has all three ([`PlainGuards::ALL`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlainGuards {
+    /// The stream starts on an RS: bytes before the first RS are discarded by jq's reader without a
+    /// word (`WaitingForRs`), so `false\n` is no value at all.
+    pub(crate) starts_on_rs: bool,
+    /// The stream ends on a newline (#2998): every RS after the first takes the reader's
+    /// message-less branch, so a final buffer that starts on one ends the stream and drops its
+    /// record (`\x1e12.5`). The record guard below rejects the same streams, but only after the
+    /// check has read every record before the last: this one is a precheck that fails them first.
+    pub(crate) ends_on_newline: bool,
+    /// Every record ends on a newline: an RS straight after a number or a literal is a truncation
+    /// warning (`\x1e1\x1e`).
+    pub(crate) record_ends_on_newline: bool,
+}
+
+impl PlainGuards {
+    /// What the runner asks.
+    pub(crate) const ALL: Self = Self {
+        starts_on_rs: true,
+        ends_on_newline: true,
+        record_ends_on_newline: true,
+    };
+}
+
+/// Whether `raw` is RFC 7464's own framing, every record `RS value LF` with `value` one RFC 8259
+/// document (#6501). One-way: `true` claims [`walk_stream_values`] finds the stream clean, one
+/// value per record and every RS between them; `false` claims nothing, and the walk decides.
+///
+/// Sound because the strict validator accepts a subset of what jq's parser does (every RFC number,
+/// narrower strings, literals and structure, and a depth limit of 128 under jq's), so a record that
+/// passes draws no diagnostic, and the three [`PlainGuards`] close the ways valid records can still
+/// leave the stream unclean. The walk is a byte-at-a-time model of jq's reader (about 200 MB/s);
+/// the validator runs at about 1 GB/s. The caller's UTF-8 and byte-order-mark gate stays in front.
+///
+/// The last record is read first: a stream that fails does so most often at its end (a truncated
+/// tail, a record that is not RFC 8259), and the check then costs one record, not a pass over every
+/// record before it. The verdict does not depend on the order.
+///
+/// Not complete on purpose: a stream with a blank line between records, a record that is not
+/// RFC 8259 (`nan`, a leading zero) or one jq reads with a warning keeps the walk.
+pub(crate) fn plain_record_sequence(raw: &[u8], guards: PlainGuards) -> bool {
+    use succinctly::json::validate::validate;
+    if guards.starts_on_rs && raw.first() != Some(&ASCII_RS) {
+        return false;
+    }
+    if guards.ends_on_newline && raw.last() != Some(&b'\n') {
+        return false;
+    }
+    let record_ok = |record: &[u8]| {
+        (!guards.record_ends_on_newline || record.last() == Some(&b'\n'))
+            && validate(record).is_ok()
+    };
+    // The record after the last RS (the whole stream when it holds none).
+    let last = raw.rsplit(|&b| b == ASCII_RS).next().unwrap_or(raw);
+    if !record_ok(last) {
+        return false;
+    }
+    let mut records = raw.split(|&b| b == ASCII_RS);
+    if raw.first() == Some(&ASCII_RS) {
+        records.next();
+    }
+    let mut any = false;
+    for record in records {
+        if !record_ok(record) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
 fn walk_stream_placing(
     raw_bytes: &[(Option<usize>, Vec<u8>)],
     slurp: bool,
