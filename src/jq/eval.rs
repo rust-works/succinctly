@@ -109167,8 +109167,13 @@ fn environment_object() -> OwnedValue {
 fn environment_object_in(snapshot: bool) -> OwnedValue {
     fn build() -> OwnedValue {
         let mut env_obj = IndexMap::new();
-        for (key, value) in std::env::vars() {
-            env_obj.insert(key, OwnedValue::String(value.into()));
+        // `vars_os`, not `vars`: `vars` panics on the first name or value that is not UTF-8
+        // (#6564); jq substitutes it instead.
+        for (key, value) in std::env::vars_os() {
+            env_obj.insert(
+                environment_text(&key),
+                OwnedValue::String(environment_text(&value).into()),
+            );
         }
         OwnedValue::Object(env_obj.into())
     }
@@ -109186,6 +109191,21 @@ fn environment_object_in(snapshot: bool) -> OwnedValue {
 #[cfg(feature = "std")]
 fn eval_env<'a, W: Clone + AsRef<[u64]>>(_optional: bool) -> QueryResult<'a, W> {
     QueryResult::Owned(environment_object())
+}
+
+/// An environment name or value as text: jq's maximal-subpart substitution of its bytes where the
+/// platform has them (Unix), the standard library's lossy conversion elsewhere.
+#[cfg(feature = "std")]
+fn environment_text(text: &std::ffi::OsStr) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        crate::text::utf8::substitute_invalid_utf8_jq_style(text.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        text.to_string_lossy().into_owned()
+    }
 }
 
 #[cfg(not(feature = "std"))]
@@ -109250,10 +109270,10 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     finish_result::<_, S>(
-        match std::env::var(&*var_name) {
-            Ok(val) => QueryResult::Owned(OwnedValue::String(val.into())),
-            Err(_) if optional => QueryResult::None,
-            Err(_) => QueryResult::Owned(OwnedValue::Null),
+        match std::env::var_os(&*var_name) {
+            Some(val) => QueryResult::Owned(OwnedValue::String(environment_text(&val).into())),
+            None if optional => QueryResult::None,
+            None => QueryResult::Owned(OwnedValue::Null),
         },
         trailing,
     )

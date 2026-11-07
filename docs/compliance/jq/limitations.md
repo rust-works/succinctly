@@ -225,6 +225,11 @@ and — since #1719 — for `@base64d`/`@urid`'s own invalid-UTF-8 output too, c
 structurally-valid overlong/surrogate/out-of-range 3-/4-byte lead to a single U+FFFD where
 `String::from_utf8_lossy`'s WHATWG rule gives one per byte.
 
+`$ENV`, `env`, `env.NAME` and `$ENV.NAME` read the process environment as bytes on Unix and substitute a name or value that is not valid UTF-8 by the same rule ([#6564](https://github.com/rust-works/succinctly/issues/6564)).
+They panicked on the first one before: `env $'BADVAR=\xff\xfe' jq -n '$ENV | length'`.
+`env.BADVAR` is `"\ufffd\ufffd"` and a value `ok\xe1A` is `"ok\ufffd"`, both as in jq 1.7.1.
+`strenv(NAME)` and `env(NAME)` in yq mode still refuse such a value as not provided, where yq reads its bytes ([#6566](https://github.com/rust-works/succinctly/issues/6566)).
+
 jq has a second, separate quirk here (#1717): for `InvalidContinuationByte`, jq's actual
 rule is simply `len - pos < seq_len` — if `seq_len` bytes aren't all physically present
 from the lead byte's own position onward, jq collapses the *entire* remaining tail into
