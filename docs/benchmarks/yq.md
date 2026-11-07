@@ -92,6 +92,10 @@ cargo build --release --features bench-runner
 cargo bench --bench yq_comparison
 ```
 
+`bench run yq_bench` and `dev bench yq` interleave the two tools within each repetition, alternating which runs first, and take the median of the runs (#6417); a tool that exits non-zero fails its row instead of being timed on its error.
+`dev bench yq --yq <path>` picks the yq (default: the `yq` on `PATH`, and succinctly alone when there is none), and the generated markdown names that yq's version, its path and the method.
+Every table below was measured before #6417, by timing all of yq's runs and then all of succinctly's, against whichever `yq` was on `PATH`; the direction of that bias is against succinctly, which always ran second, and its size was not measured.
+
 ---
 
 ## Summary Results

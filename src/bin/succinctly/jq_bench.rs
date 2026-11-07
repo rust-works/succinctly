@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::bench_runner::utils::{ensure_success, interleaved_reps};
+
 /// Query types for benchmarking different `eval_generic.rs` execution paths.
 ///
 /// Added for issue #686: `keys_unsorted | map/select` (and general
@@ -472,55 +474,6 @@ fn benchmark_file(
     })
 }
 
-/// Which tool runs first in repetition `rep`: jq on even reps, succinctly on odd ones, so neither
-/// tool always runs second (#5409; benchmarking.md rule 1).
-fn rep_order(rep: usize) -> [Tool; 2] {
-    if rep % 2 == 0 {
-        [Tool::Jq, Tool::Succinctly]
-    } else {
-        [Tool::Succinctly, Tool::Jq]
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tool {
-    Jq,
-    Succinctly,
-}
-
-/// Run `warmup` untimed and then `runs` timed repetitions, each running both tools in
-/// [`rep_order`]'s order. One counter spans the warmups and the timed reps, so the order keeps
-/// alternating across the boundary rather than running one tool twice in a row there. With an odd
-/// total one tool leads one rep more often; no order of an odd count can balance that. Returns the
-/// timed results per tool, in rep order. A warmup's error is ignored (as before); a timed rep's
-/// error aborts the row.
-fn interleaved_reps<T>(
-    warmup: usize,
-    runs: usize,
-    mut run_jq: impl FnMut() -> Result<T>,
-    mut run_succinctly: impl FnMut() -> Result<T>,
-) -> Result<(Vec<T>, Vec<T>)> {
-    for rep in 0..warmup {
-        for tool in rep_order(rep) {
-            let _ = match tool {
-                Tool::Jq => run_jq(),
-                Tool::Succinctly => run_succinctly(),
-            };
-        }
-    }
-    let mut jq = Vec::with_capacity(runs);
-    let mut succinctly = Vec::with_capacity(runs);
-    for rep in warmup..warmup + runs {
-        for tool in rep_order(rep) {
-            match tool {
-                Tool::Jq => jq.push(run_jq()?),
-                Tool::Succinctly => succinctly.push(run_succinctly()?),
-            }
-        }
-    }
-    Ok((jq, succinctly))
-}
-
 /// The markdown header line naming the jq the tables were measured against and the method.
 fn method_line(jq_binary: &Path, jq_version: &str, runs: usize) -> String {
     format!(
@@ -591,16 +544,6 @@ fn run_command_with_timing(program: &str, args: &[&str]) -> Result<ToolResult> {
         user_time_ms: user_time * 1000.0,
         sys_time_ms: sys_time * 1000.0,
     })
-}
-
-/// Fail the row when a timed tool exits non-zero (`/usr/bin/time` exits with the child's status):
-/// a jq that rejects the query would otherwise be timed on its near-instant error (#5409).
-fn ensure_success(program: &str, status: std::process::ExitStatus, stderr: &str) -> Result<()> {
-    if status.success() {
-        return Ok(());
-    }
-    let first = stderr.lines().next().unwrap_or("").trim();
-    anyhow::bail!("`{program}` exited with {status}: {first}")
 }
 
 /// Run command with /usr/bin/time on macOS
@@ -1187,77 +1130,6 @@ mod tests {
         assert!(map_section.contains("44.0ms"));
         assert!(!map_section.contains("111.0ms"));
         assert!(!map_section.contains("22.0ms"));
-    }
-
-    /// #5409: each repetition runs both tools, the order flipping every rep, warmups included,
-    /// and only the timed reps are returned (benchmarking.md rule 1).
-    #[test]
-    fn reps_interleave_the_tools_and_alternate_the_order() {
-        use std::cell::RefCell;
-        let log = RefCell::new(Vec::new());
-        let (jq, succ) = interleaved_reps(
-            2,
-            3,
-            || {
-                let mut l = log.borrow_mut();
-                l.push("jq");
-                Ok(l.len())
-            },
-            || {
-                let mut l = log.borrow_mut();
-                l.push("succ");
-                Ok(l.len())
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            log.into_inner(),
-            [
-                // warmup reps 0 and 1
-                "jq", "succ", "succ", "jq", //
-                // timed reps 2, 3 and 4: the order carries on across the boundary
-                "jq", "succ", "succ", "jq", "jq", "succ",
-            ]
-        );
-        // The values are the call positions: the warmups' four are discarded.
-        assert_eq!(jq, [5, 8, 9]);
-        assert_eq!(succ, [6, 7, 10]);
-        // After one warmup (jq first) the first timed rep leads with succinctly.
-        let log = RefCell::new(Vec::new());
-        interleaved_reps(
-            1,
-            1,
-            || -> Result<()> {
-                log.borrow_mut().push("jq");
-                Ok(())
-            },
-            || {
-                log.borrow_mut().push("succ");
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(log.into_inner(), ["jq", "succ", "succ", "jq"]);
-    }
-
-    #[test]
-    fn a_failed_timed_rep_aborts_and_a_failed_warmup_does_not() {
-        let mut calls = 0;
-        let err = interleaved_reps(
-            1,
-            2,
-            || -> Result<()> {
-                calls += 1;
-                if calls == 1 {
-                    anyhow::bail!("warmup failure is ignored")
-                }
-                anyhow::bail!("timed failure")
-            },
-            || Ok(()),
-        )
-        .unwrap_err();
-        assert_eq!(err.to_string(), "timed failure");
-        assert_eq!(calls, 2, "the row stops at the first timed failure");
     }
 
     #[test]
