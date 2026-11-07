@@ -115666,6 +115666,11 @@ mod tests {
             panic!("a raising later stage must raise"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step did not raise for a pipe whose second stage raises (#6575)"
         };
         assert!(error.to_string().contains("Cannot index array"), "{error}");
+        // So does a stage that is a step and raises: `+` of an array and a string.
+        let OwnedStep::Handled(Err(error)) = step(". + \"x\" | length", list()) else {
+            panic!("a raising step stage must raise"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if owned_update_step did not raise for a pipe whose first stage raises (#6575)"
+        };
+        assert!(error.to_string().contains("cannot be added"), "{error}");
         // A first stage no step takes (`length`) leaves the whole pipe to the evaluator, whose
         // own doors may answer it; so do stages that could yield other than one value.
         for src in [
