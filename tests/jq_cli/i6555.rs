@@ -1,7 +1,8 @@
 //! #6555: a `--seq` stream that jq's `--seq` reader reads without a fault, under a program that reads
 //! `input`, reports a file that did not open when a read reaches it, as a JSON stream's run does
 //! (#6475, #6525), and not every one up front. That holds for `--stream` and `--stream-errors` over
-//! the record stream too. Every row was captured from jq 1.7.1.
+//! the record stream too, and for `-R`, which reads the lines of one as it reads any text. Every
+//! row was captured from jq 1.7.1.
 
 use anyhow::Result;
 
@@ -35,6 +36,8 @@ fn a_clean_seq_stream_reports_an_unopened_file_when_a_read_reaches_it_6555() -> 
         (&["--seq", "--stream", "-c", "-n", "input"][..], &["seq", "gone", "gone2"][..], "\u{1e}[[],1]\n", "", 0),
         (&["--seq", "--stream-errors", "-c", "[., input]"][..], &["gone", "seq", "gone2"][..], "\u{1e}[[[],1],[[],2]]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&["--seq", "--stream-errors", "-c", "-n", "input"][..], &["gone", "rec", "gone2"][..], "\u{1e}[[0],3]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-R", "--seq", "-c", "input"][..], &["gone", "seq", "gone2"][..], "\u{1e}\"\\u001e2\"\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-R", "--seq", "-c", "[., input]"][..], &["gone", "seq", "gone2"][..], "\u{1e}[\"\\u001e1\",\"\\u001e2\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         // A stream its reader faults on keeps its up-front report, which jq agrees with here.
         (&["--seq", "-c", "[., input]"][..], &["bad", "gone", "gone2"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Could not open file @DIR@/gone2.json: No such file or directory\njq: error (at @DIR@/gone2.json:0): break\n", 2),
     ];
