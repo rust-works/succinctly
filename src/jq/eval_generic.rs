@@ -57651,6 +57651,31 @@ mod tests {
         let query = ".s | ascii_downcase | . as $t | [range(3) | ($t | length)] | add";
         let (out, _) = outputs_and_reindexes_in::<YqSemantics>(doc, query);
         assert_eq!(out, ["39"], "yq: {query}");
+        // A stage the closed route does not answer (`length + 1`) keeps its answer in both modes,
+        // and a stage that hands on a child of the bound container keeps it too: the route reads
+        // the marker in place and must not change what a node of it is.
+        for (query, jq_want, yq_want) in [
+            (
+                ".s | ascii_downcase | . as $t | [range(2) | ($t | length + 1)] | .[0]",
+                "12",
+                "14",
+            ),
+            (
+                ".s | ascii_downcase | [., .] | . as $t | [range(2) | ($t | .[1] | length)] | .[0]",
+                "11",
+                "13",
+            ),
+            (
+                ".s | ascii_downcase | [[1], .] | . as $t | [range(2) | ($t | .[0])] | .[1]",
+                "[1]",
+                "[1]",
+            ),
+        ] {
+            let (out, _) = outputs_and_reindexes_in::<JqSemantics>(doc, query);
+            assert_eq!(out, [jq_want], "jq: {query}");
+            let (out, _) = outputs_and_reindexes_in::<YqSemantics>(doc, query);
+            assert_eq!(out, [yq_want], "yq: {query}");
+        }
     }
 
     /// #3690: `nulls`, `booleans`, `numbers`, `strings`, `arrays` and
