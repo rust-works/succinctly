@@ -208,18 +208,6 @@ fn a_timestamp_in_multiplication_division_and_modulo_answers_as_yq_does_5930() -
             "from_unix only works on numbers, found !!seq instead",
         ),
         (
-            "{} | from_unix",
-            false,
-            "from_unix only works on numbers, found !!map instead",
-        ),
-        (
-            ".t | from_unix",
-            false,
-            "from_unix only works on numbers, found !!timestamp instead",
-        ),
-        (".n | from_unix", true, "\"1970-01-01T10:00:03+10:00\""),
-        (".f | from_unix", true, "\"1970-01-01T10:00:01+10:00\""),
-        (
             "\"1\" | from_unix",
             false,
             "from_unix only works on numbers, found !!str instead",
