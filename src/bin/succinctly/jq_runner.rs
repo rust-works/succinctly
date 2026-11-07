@@ -6448,6 +6448,20 @@ struct TrailingParseError {
     as_parse_error: bool,
 }
 
+/// Moves a fault at the end of the text to where jq's reader stands then, when the last file named
+/// did not open (#6480): that file, at line 0. Its name takes the tag after the files that opened.
+fn place_fault_at_unopened_tail(
+    fault: &mut TrailingParseError,
+    locations: &mut InputLocations,
+    name: &str,
+) {
+    if fault.error.message.contains(" at EOF") {
+        fault.source = u32::try_from(locations.files.len()).unwrap_or(u32::MAX);
+        fault.line = 0;
+        locations.files.push(Some(name.to_string()));
+    }
+}
+
 /// What [`get_inputs`] read: every document, their locations, and -- when a
 /// JSON input stream turned malformed partway -- the parse error that ended
 /// it, to be raised only after the documents before it.
@@ -6584,6 +6598,9 @@ fn get_inputs(
     // #6004: a file that would not open after the last one that did is read after it, so the
     // stream does not end where the last opened file does.
     let mut unopened_tail = false;
+    // #6480: the name of the last file named when it did not open: where jq's reader stands once
+    // a read has reached the end of the input, at line 0.
+    let mut unopened_tail_name: Option<String> = None;
     // #6481: whether any input file failed to open, in the middle of the list or at its end.
     let mut any_open_failure = false;
     let (files, mut raw_bytes): OpenedInputs = if let Some(bytes) = read_whole {
@@ -6598,6 +6615,10 @@ fn get_inputs(
     } else {
         let (files, raws, failures) = read_input_files(&files);
         unopened_tail = failures.iter().any(|&(at, _)| at >= files.len());
+        unopened_tail_name = failures
+            .iter()
+            .rfind(|&&(at, _)| at >= files.len())
+            .map(|(_, failure)| input_display_name(&failure.path));
         any_open_failure = !failures.is_empty();
         if let Some(&(at, _)) = failures.first() {
             note_open_failure_at(at);
@@ -6614,7 +6635,16 @@ fn get_inputs(
                 .find(|raw| !raw.is_empty())
                 .map_or(true, |raw| source_ends_cleanly(raw, args))
         });
-        if args.null_input && !args.slurp && !args.seq && args.input_dsv.is_none() && ends_cleanly {
+        // #6480: and so does a text that ends inside a value, whose fault the reader meets after it
+        // has moved on to the files that did not open, so they come first.
+        let faults_at_end = matches!(first_text_fault(&raws, args), Some((_, true)));
+        if args.null_input
+            && !args.slurp
+            && !args.seq
+            && args.input_dsv.is_none()
+            && ends_cleanly
+            && !(faults_at_end && !failures.is_empty())
+        {
             defer_open_failures(failures);
         } else {
             report_open_failures(open_failures_reached(&failures, &raws, args), open_failed);
@@ -6661,6 +6691,9 @@ fn get_inputs(
         && !args.stream_errors
         && !args.validate
         && raw_bytes.len() > 1
+        // #6480: the fault the eager reader raises at the end of the text is placed at the file
+        // that did not open after it, which the lazy producer does not know.
+        && unopened_tail_name.is_none()
         && !lazy_route_forced_off()
         && raw_bytes
             .iter()
@@ -7555,6 +7588,12 @@ fn get_inputs(
                         Ok(file_end) => file_end,
                         Err(error) => return Ok(Err(error)),
                     };
+                    // #6480: the same for the fault that ended the stream in the last file.
+                    if let (true, Some(name), Some((_, fault))) =
+                        (pos == last, &unopened_tail_name, resumed_errors.last_mut())
+                    {
+                        place_fault_at_unopened_tail(fault, &mut locations, name);
+                    }
                     if let (true, Some(end)) = (counts_files && pos < last, file_end) {
                         next_file = end;
                     }
@@ -7669,7 +7708,7 @@ fn get_inputs(
                 // after it is read, this file or any later one, and the error
                 // is raised once the documents before it have been (#2961).
                 if let Some(error) = parse_error {
-                    trailing_error = Some(TrailingParseError {
+                    let mut fault = TrailingParseError {
                         error,
                         source: u32::try_from(src).unwrap_or(u32::MAX),
                         line: if slurp_keeps_prefix {
@@ -7679,7 +7718,13 @@ fn get_inputs(
                         },
                         seq_warning: false,
                         as_parse_error: false,
-                    });
+                    };
+                    // #6480: a fault at the end of the text is met by a read that has gone on to the
+                    // last file named, when that one did not open.
+                    if let Some(name) = &unopened_tail_name {
+                        place_fault_at_unopened_tail(&mut fault, &mut locations, name);
+                    }
+                    trailing_error = Some(fault);
                     break;
                 }
             }
@@ -8603,15 +8648,26 @@ fn open_failures_reached<'a>(
     raws: &[Vec<u8>],
     args: &JqCommand,
 ) -> &'a [(usize, InputFileOpenError)] {
-    if failures.is_empty()
-        || args.raw_input
-        || args.seq
-        || args.input_dsv.is_some()
-        || args.stream_errors
-        // `--validate` is its own, stricter check of the files, which reports in its own order.
-        || args.validate
-    {
+    if failures.is_empty() {
         return failures;
+    }
+    match first_text_fault(raws, args) {
+        Some((file, false)) => {
+            let reached = failures.iter().take_while(|&&(at, _)| at <= file).count();
+            &failures[..reached]
+        }
+        _ => failures,
+    }
+}
+
+/// The file jq's parser is in when it meets the first fault of the text the `raws` make, and whether
+/// the fault is at the end of the text (#6485, #6480), or `None` for a text with no fault and for a
+/// run that does not read JSON texts: `-R`, `--seq`, DSV and `--stream-errors` read on past a fault,
+/// and `--validate` is its own, stricter check of the files, which reports in its own order.
+fn first_text_fault(raws: &[Vec<u8>], args: &JqCommand) -> Option<(usize, bool)> {
+    if args.raw_input || args.seq || args.input_dsv.is_some() || args.stream_errors || args.validate
+    {
+        return None;
     }
     // jq skips the byte-order mark at the front of its input: of the first file with bytes.
     let first = raws.iter().position(|raw| !raw.is_empty());
@@ -8622,13 +8678,7 @@ fn open_failures_reached<'a>(
             raw.as_slice()
         }
     });
-    match jq::jq_stream_fault_chunk(chunks) {
-        Some((file, false)) => {
-            let reached = failures.iter().take_while(|&&(at, _)| at <= file).count();
-            &failures[..reached]
-        }
-        _ => failures,
-    }
+    jq::jq_stream_fault_chunk(chunks)
 }
 
 /// Reports the pending open failures a read has reached (#6475): the ones before the source it
