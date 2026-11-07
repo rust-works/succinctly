@@ -20,9 +20,12 @@ fn the_end_of_the_input_is_at_a_last_file_that_did_not_open_6480() -> Result<()>
         ("str.json", "\"s\""),
         ("empty.json", ""),
         ("ab.txt", "a\nb"),
+        ("obj.json", "{\"a\":1}\n"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
+    // More than one chunk of the lazy route's scan.
+    std::fs::write(dir.path().join("many.json"), "1\n".repeat(100_000))?;
     std::fs::create_dir(dir.path().join("adir"))?;
     for (flags, program, names, stdout, stderr, status) in [
         (&["-n"][..], "[inputs], input_filename", &["ok", "gone"][..], "[1,2]\n\"@DIR@/gone.json\"\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
@@ -47,6 +50,17 @@ fn the_end_of_the_input_is_at_a_last_file_that_did_not_open_6480() -> Result<()>
         (&["-s", "-R"][..], "[., input_filename]", &["ok", "gone"][..], "[\"1\\n2\\n\",\"@DIR@/gone.json\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&["-R", "-n"][..], "[inputs], input_filename, input_line_number", &["ab", "gone"][..], "[\"a\",\"b\"]\n\"@DIR@/gone.json\"\n0\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&[][..], "[., input_filename]", &["ok", "gone"][..], "[1,\"@DIR@/ok.json\"]\n[2,\"@DIR@/ok.json\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-n"][..], "[inputs] | length, input_filename, input_line_number", &["ok", "obj", "gone"][..], "3\n\"@DIR@/gone.json\"\n0\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-n"][..], "[inputs] | length, input_filename, input_line_number", &["many", "gone"][..], "100000\n\"@DIR@/gone.json\"\n0\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-n"][..], "last(inputs), input_filename", &["ok", "obj", "gone"][..], "{\"a\":1}\n\"@DIR@/gone.json\"\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&[][..], "[inputs], input_filename", &["ok", "obj", "gone"][..], "[2,{\"a\":1}]\n\"@DIR@/gone.json\"\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-n", "-R", "-s"][..], "[inputs], input_filename", &["ab", "gone"][..], "[\"a\\nb\"]\n\"@DIR@/gone.json\"\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-n"][..], "[inputs], (try input catch .), input_filename, input_line_number", &["ok", "gone"][..], "[1,2]\n\"break\"\n\"@DIR@/gone.json\"\n0\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-n"][..], "(try input catch .), (try input catch .), input_filename", &["gone"][..], "\"break\"\n\"break\"\n\"@DIR@/gone.json\"\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-n"][..], "[(try input catch .), (try input catch .), (try input catch .)], input_filename, input_line_number", &["ok", "gone"][..], "[1,2,\"break\"]\n\"@DIR@/gone.json\"\n0\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-s"][..], "[., (try input catch .), (try input catch .), input_filename, input_line_number]", &["ok", "gone"][..], "[[1,2],\"break\",\"break\",\"@DIR@/gone.json\",0]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-n", "-R"][..], "input, input, input, input", &["ab", "gone"][..], "\"a\"\n\"b\"\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error (at @DIR@/gone.json:0): break\n", 2),
+
     ] {
         let paths: Vec<String> = names
             .iter()

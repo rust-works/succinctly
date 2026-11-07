@@ -5896,8 +5896,15 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // #5498: `--stream` and `--stream-errors` read as the program asks. The end of the
                 // stream is settled when the reader reaches it.
                 debug_assert_eq!(locations.per_value(), &[]);
-                jq::seed_remaining_inputs_from(stream_reader_producer(lazy));
-                jq::count_reads_past_end();
+                jq::seed_remaining_inputs_from(end_producer_at(
+                    locations.unopened_end(),
+                    stream_reader_producer(lazy),
+                ));
+                if locations.unopened_tail {
+                    jq::hold_reads_past_end();
+                } else {
+                    jq::count_reads_past_end();
+                }
             } else {
                 seed_input_queue(
                     args.slurp,
@@ -6512,6 +6519,18 @@ fn get_inputs(
         take_unopened_tail(locations);
     }
     inputs
+}
+
+/// `producer`, with the end it finds replaced by the unopened last file's (#6480): a lazy route
+/// settles its end from the last file that opened.
+fn end_producer_at(end: Option<(u32, u32)>, mut producer: jq::InputProducer) -> jq::InputProducer {
+    match end {
+        None => producer,
+        Some(end) => Box::new(move || match producer() {
+            jq::ProducedInput::End(_) => jq::ProducedInput::End(Some(end)),
+            produced => produced,
+        }),
+    }
 }
 
 /// The name of the last file named, when it did not open, among `failures` after `opened` files
@@ -7295,7 +7314,7 @@ fn read_inputs(
         };
         return Ok(Ok((
             vec![OwnedValue::String(combined.into())],
-            InputLocations::single(at),
+            InputLocations::single_at_end(at, locations.unopened_tail),
             None,
             Vec::new(),
         )));
@@ -7812,9 +7831,7 @@ fn read_inputs(
             ahead.extend(trailing_error.take().map(|fault| (0, fault)));
             return Ok(Ok((slurped, slurped_locations, None, ahead)));
         }
-        let mut slurped_locations = InputLocations::single(at);
-        // #6480: the one source is then the last file, which did not open.
-        slurped_locations.unopened_tail = locations.unopened_tail;
+        let slurped_locations = InputLocations::single_at_end(at, locations.unopened_tail);
         Ok(Ok((
             slurped,
             slurped_locations,
@@ -8304,6 +8321,23 @@ impl InputLocations {
         self.unopened_tail = true;
     }
 
+    /// Where every read past the end leaves jq's position when the last file named did not open
+    /// (#6480): at that file, line 0, however many reads go past it, and whatever a producer
+    /// found at the end of the last file that did open.
+    fn unopened_end(&self) -> Option<(u32, u32)> {
+        self.unopened_tail.then(|| (self.last_src(), 0))
+    }
+
+    /// Has the reads past the end move on from it as jq's do (#4303), where the stream's own end
+    /// was recorded or after a slurp, or stay at a last file that did not open (#6480).
+    fn count_reads_past_end(&self, slurp: bool) {
+        if self.unopened_tail {
+            jq::hold_reads_past_end();
+        } else if self.eof_tail.is_some() || slurp {
+            jq::count_reads_past_end();
+        }
+    }
+
     /// Locations for an input with nothing to point at (`-n`).
     fn unknown() -> Self {
         Self::default()
@@ -8323,6 +8357,14 @@ impl InputLocations {
     /// guarding that zip, release-build silent empty output instead of
     /// jq's own `[]`) -- confirmed live against jq 1.7.1: `printf '' | jq
     /// -c -s '., inputs'` prints `[]`.
+    /// [`single`](Self::single) for a slurp's one value, whose source is the last file named when
+    /// it did not open (`unopened_tail`, #6480).
+    fn single_at_end(at: InputLocation, unopened_tail: bool) -> Self {
+        let mut locations = Self::single(at);
+        locations.unopened_tail = unopened_tail;
+        locations
+    }
+
     fn single(at: InputLocation) -> Self {
         let mut locations = Self::new(vec![at.file.clone()]);
         locations.push(0, at.line.unwrap_or(UNKNOWN_LINE as usize));
@@ -11320,10 +11362,11 @@ fn seed_input_queue(
         // #5857: `-R`'s lines, converted as the program reads them. There is no parse error to
         // queue behind them, and `inputs` is empty.
         debug_assert!(inputs.is_empty() && trailing_error.is_none() && resumed_errors.is_empty());
-        jq::seed_remaining_inputs_from(lazy_raw_producer(files, locations.exhausted(slurp)));
-        if locations.eof_tail.is_some() || slurp {
-            jq::count_reads_past_end();
-        }
+        jq::seed_remaining_inputs_from(end_producer_at(
+            locations.unopened_end(),
+            lazy_raw_producer(files, locations.exhausted(slurp)),
+        ));
+        locations.count_reads_past_end(slurp);
     } else if let Some(lazy) = LAZY_JSON_INPUTS.with(|slot| slot.borrow_mut().take()) {
         // #5661: a stream whose documents are converted as the program reads them. A clean
         // one has `inputs` empty, and so is `locations`' line table: each document's line
@@ -11331,14 +11374,11 @@ fn seed_input_queue(
         // turned malformed (#5853) has the documents and parse errors after its lazy start
         // in `inputs` and `resumed_errors`, and they follow it in order.
         let tail = lazy_tail_items(inputs, locations, trailing_error, resumed_errors);
-        jq::seed_remaining_inputs_from(lazy_json_producer_then(
-            lazy,
-            Box::new(tail),
-            locations.exhausted(slurp),
+        jq::seed_remaining_inputs_from(end_producer_at(
+            locations.unopened_end(),
+            lazy_json_producer_then(lazy, Box::new(tail), locations.exhausted(slurp)),
         ));
-        if locations.eof_tail.is_some() || slurp {
-            jq::count_reads_past_end();
-        }
+        locations.count_reads_past_end(slurp);
     } else {
         // Moves rather than clones: `inputs` isn't read again on
         // this branch (the null-input arm below uses `OwnedValue::
@@ -11376,9 +11416,7 @@ fn seed_input_queue(
         // #4303: where the stream's own end was recorded, reads past it
         // move on from it as jq's do. A slurp read the whole stream to build its one value, so
         // every read past that value is already past the end: line 0 and `<unknown>` (#6145).
-        if locations.eof_tail.is_some() || slurp {
-            jq::count_reads_past_end();
-        }
+        locations.count_reads_past_end(slurp);
     }
     install_open_failure_hook();
 }

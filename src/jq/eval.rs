@@ -100404,6 +100404,9 @@ mod remaining_inputs {
         // `--seq`, which does not yet raise jq's truncated-number error on a
         // last record) would count a read jq spends on an error (#4303).
         static COUNT_PAST_END: Cell<bool> = const { Cell::new(false) };
+        // Whether every read past the end stays at the seeded end of input, where the input ends
+        // at a file that did not open (#6480): jq names it at line 0 however often it is read.
+        static HOLD_END: Cell<bool> = const { Cell::new(false) };
         // What the CLI wants told when a read reaches a source, or the end of the stream
         // (#6475): see `set_read_hook`.
         static ON_READ: RefCell<Option<ReadHook>> = const { RefCell::new(None) };
@@ -100485,6 +100488,7 @@ mod remaining_inputs {
         EXHAUSTED.with(|e| e.set(exhausted));
         PAST_END.with(|p| p.set(false));
         COUNT_PAST_END.with(|c| c.set(false));
+        HOLD_END.with(|h| h.set(false));
         ON_READ.with(|slot| *slot.borrow_mut() = None);
     }
 
@@ -100503,12 +100507,19 @@ mod remaining_inputs {
         EXHAUSTED.with(|e| e.set(None));
         PAST_END.with(|p| p.set(false));
         COUNT_PAST_END.with(|c| c.set(false));
+        HOLD_END.with(|h| h.set(false));
         ON_READ.with(|slot| *slot.borrow_mut() = None);
     }
 
     /// Counts the reads past the end from here on: see `COUNT_PAST_END`.
     pub fn count_reads_past_end() {
         COUNT_PAST_END.with(|c| c.set(true));
+    }
+
+    /// Has every read past the end leave the seeded end of input and its line: see `HOLD_END`.
+    pub fn hold_reads_past_end() {
+        COUNT_PAST_END.with(|c| c.set(true));
+        HOLD_END.with(|h| h.set(true));
     }
 
     /// Whether a CLI driver has seeded the queue on this thread.
@@ -100618,7 +100629,7 @@ mod remaining_inputs {
             CURRENT.with(|c| c.set(EXHAUSTED.with(Cell::get)));
             return Pop::Exhausted;
         }
-        let at = if PAST_END.with(|p| p.replace(true)) {
+        let at = if PAST_END.with(|p| p.replace(true)) && !HOLD_END.with(Cell::get) {
             None
         } else {
             EXHAUSTED.with(Cell::get)
@@ -100990,6 +101001,15 @@ pub fn seed_remaining_inputs_from(producer: InputProducer) {
 #[cfg(feature = "std")]
 pub fn count_reads_past_end() {
     remaining_inputs::count_reads_past_end();
+}
+
+/// [`count_reads_past_end`], but every read past the end stays at the seeded end of input (#6480).
+///
+/// [`current_input_location`] stays there and `input_line_number` at its line: jq's reader stays at
+/// a last file that did not open, line 0, however often it is asked. A seed resets it.
+#[cfg(feature = "std")]
+pub fn hold_reads_past_end() {
+    remaining_inputs::hold_reads_past_end();
 }
 
 /// One read from the `input`/`inputs` queue: a document, a parse error in the
