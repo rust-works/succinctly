@@ -100409,13 +100409,15 @@ mod remaining_inputs {
         static ON_READ: RefCell<Option<ReadHook>> = const { RefCell::new(None) };
     }
 
-    /// What is called when a read reaches a source, or the end of the stream.
-    pub type ReadHook = Box<dyn FnMut(Option<u32>)>;
+    /// What is called when a read reaches a source, or the end of the stream, and whether the read
+    /// is of a parse error.
+    pub type ReadHook = Box<dyn FnMut(Option<u32>, bool)>;
 
     /// Registers `hook` for every read of the queue (#6475).
     ///
     /// It is called once the read knows where it reads from: with the source tag of the document,
-    /// or parse error, it returns, and with `None` when it finds the stream at its end. The read
+    /// or parse error, it returns, and with `None` when it finds the stream at its end; and with
+    /// `true` for a parse error (#6480: one at the end of the text sent jq's reader on). The read
     /// has moved the marker by then and has not returned yet, so what the hook prints comes before
     /// what the read hands back.
     ///
@@ -100426,11 +100428,12 @@ mod remaining_inputs {
         ON_READ.with(|slot| *slot.borrow_mut() = Some(hook));
     }
 
-    /// Tells the hook a read reached `source`, or the end of the stream. The hook is out of its
-    /// slot while it runs, so one that reads the queue finds no borrow held.
-    fn reached(source: Option<u32>) {
+    /// Tells the hook a read reached `source`, or the end of the stream, and whether it read a
+    /// parse error. The hook is out of its slot while it runs, so one that reads the queue finds
+    /// no borrow held.
+    fn reached(source: Option<u32>, fault: bool) {
         if let Some(mut hook) = ON_READ.with(|slot| slot.borrow_mut().take()) {
-            hook(source);
+            hook(source, fault);
             ON_READ.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 if slot.is_none() {
@@ -100561,7 +100564,7 @@ mod remaining_inputs {
             // input catch 0)` on `1\n2 }\n\n\n`.
             LAST_LINE.with(|l| l.set(at.1));
             CURRENT.with(|c| c.set(Some(at)));
-            reached(Some(at.0));
+            reached(Some(at.0), true);
             return Pop::ParseError(error);
         }
         // Out of its slot while the producer runs, so a producer that reads the queue itself
@@ -100582,7 +100585,7 @@ mod remaining_inputs {
             PRODUCER.with(|p| *p.borrow_mut() = Some(producer));
             LAST_LINE.with(|l| l.set(line));
             CURRENT.with(|c| c.set(Some((src, line))));
-            reached(Some(src));
+            reached(Some(src), matches!(pop, Pop::ParseError(_)));
             return pop;
         }
         let popped = QUEUE.with(|q| q.borrow_mut().pop_front());
@@ -100590,7 +100593,7 @@ mod remaining_inputs {
             POPPED.with(|p| p.set(popped_so_far + 1));
             LAST_LINE.with(|l| l.set(line));
             CURRENT.with(|c| c.set(Some((src, line))));
-            reached(Some(src));
+            reached(Some(src), false);
             return Pop::Document(doc);
         }
         // Unreachable by the seed's own invariant (every error comes before
@@ -100601,7 +100604,7 @@ mod remaining_inputs {
             // input catch 0)` on `1\n2 }\n\n\n`.
             LAST_LINE.with(|l| l.set(at.1));
             CURRENT.with(|c| c.set(Some(at)));
-            reached(Some(at.0));
+            reached(Some(at.0), true);
             return Pop::ParseError(error);
         }
         pop_past_end()
@@ -100610,7 +100613,7 @@ mod remaining_inputs {
     /// A read that finds nothing left: the marker settles at `EXHAUSTED`, and the reads after
     /// the first are counted as `pop_input` describes.
     fn pop_past_end() -> Pop {
-        reached(None);
+        reached(None, false);
         if !COUNT_PAST_END.with(Cell::get) {
             CURRENT.with(|c| c.set(EXHAUSTED.with(Cell::get)));
             return Pop::Exhausted;
@@ -101005,9 +101008,10 @@ pub fn pop_input() -> InputPop {
 /// Registers a hook that every read of the `input`/`inputs` queue calls (#6475).
 ///
 /// It is told the source tag the read reached, or `None` when the read finds the stream at its end,
-/// before the read returns. A seed clears it, so a driver sets it after seeding.
+/// and whether the read is of a parse error (#6480), before the read returns. A seed clears it, so a
+/// driver sets it after seeding.
 #[cfg(feature = "std")]
-pub fn set_input_read_hook(hook: impl FnMut(Option<u32>) + 'static) {
+pub fn set_input_read_hook(hook: impl FnMut(Option<u32>, bool) + 'static) {
     remaining_inputs::set_read_hook(Box::new(hook));
 }
 
