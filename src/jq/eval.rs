@@ -125199,6 +125199,41 @@ mod tests {
         }
     }
 
+    /// #5712: the composed shapes recurse once per level of nesting, to the parser's 256, through
+    /// the door, the dispatch and the shape's own function. A test thread has 2 MB, so this holds
+    /// the frames of those functions to it: a local added to one of them (the way
+    /// `eval_owned_pipe` grew 80 bytes per level in #6508 and overflowed on ARM64 Linux) fails here
+    /// in a debug build before it fails in CI.
+    #[test]
+    fn string_door_composed_shapes_nest_to_the_parsers_limit_5712() {
+        let value = OwnedValue::String("abc".into());
+        let (cond, zero, leaf) = (
+            parse("length > 1").unwrap(),
+            parse("0").unwrap(),
+            parse("length").unwrap(),
+        );
+        // Built here and not parsed: the parser recurses deeper per level than the door does and
+        // overflows a test thread on its own.
+        for depth in [100usize, 250] {
+            let mut arrays = leaf.clone();
+            let mut ifs = parse("1").unwrap();
+            let mut alternatives = leaf.clone();
+            for _ in 0..depth {
+                arrays = Expr::Array(Box::new(arrays));
+                ifs = Expr::If {
+                    cond: Box::new(cond.clone()),
+                    then_branch: Box::new(ifs),
+                    else_branch: Box::new(zero.clone()),
+                };
+                alternatives = Expr::Alternative(Box::new(alternatives), Box::new(zero.clone()));
+            }
+            for (name, expr) in [("arrays", &arrays), ("ifs", &ifs), ("//", &alternatives)] {
+                let answer = eval_owned_string_door::<JqSemantics>(expr, &value);
+                assert!(answer.is_some(), "{name} at depth {depth}");
+            }
+        }
+    }
+
     /// #5691, #5675: `eval_owned_string_door` answers `length`, `utf8bytelength`,
     /// `startswith("lit")`, `endswith("lit")` and `contains("lit")` of an owned string (and, #5712,
     /// `try`/`?` and comparisons or booleans over those) the way the reindex bridge does, in both
@@ -125344,6 +125379,14 @@ mod tests {
                 "(length > 100) // 7",
                 "(if length > 100 then 1 else null end) // [length]",
                 "length // 7",
+                // Parenthesised at the top, and built from literals alone: the same answer the
+                // evaluator gives, never a different spelling of a number.
+                "([length])",
+                "(if length > 3 then 1 else 2 end)",
+                "{a: 1}",
+                "[1.0]",
+                "1 + 2",
+                "1.50 // 2",
             ] {
                 let expr = parse(src).unwrap();
                 for (jq_mode, name) in [(true, "jq"), (false, "yq")] {
@@ -125374,7 +125417,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(built, strings.len() * 2 * 16);
+        assert_eq!(built, strings.len() * 2 * 22);
         // A composed shape that raises, fans out or computes is the bridge's: only an answer is
         // taken, so the door declines and the error keeps the bridge's words.
         let text = OwnedValue::String("abc".into());
@@ -125398,6 +125441,10 @@ mod tests {
             "(length, 1) // 2",
             ".a // 1",
             "{a: .}",
+            // Shorthand entries read the input: `{a}` is `{a: .a}`, `{length}` is `{length: .length}`.
+            "{a}",
+            "{length}",
+            "{\"a\"}",
         ] {
             assert!(
                 eval_owned_string_door::<JqSemantics>(&parse(src).unwrap(), &text).is_none(),
