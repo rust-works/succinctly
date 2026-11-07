@@ -290,11 +290,22 @@ pub struct SemiIndex {
 /// cap must stay above that.
 const MAX_NESTING_DEPTH: usize = 128;
 
-/// The key a content line opens with, past its `- ` markers (`Parser::previous_line_key`, #6540).
+/// The markers `Parser::previous_line_key` walks past before the key a line opens with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineMarkers {
+    /// `- ` only: the markers a compact mapping inside sequence items stands behind.
+    Dashes,
+    /// `- `, and the `? ` and `: ` of an explicit key (#6543).
+    Explicit,
+}
+
+/// The key a content line opens with, past its markers, and the last marker before it
+/// (`Parser::previous_line_key`, #6540, #6543).
 struct PreviousLineKey<'a> {
     column: usize,
     text: &'a [u8],
-    in_sequence: bool,
+    /// The column of the last marker, and whether it is a dash.
+    last_marker: Option<(usize, bool)>,
 }
 
 /// A plain scalar the scanner just read: `start..end` in the input, and the indent of the
@@ -9839,24 +9850,28 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// key's column is the line's indent plus the `- ` markers it opens with, so the compact
     /// mapping of a sequence item (`- k:`) stands where its continuation lines do.
     fn previous_content_line_defers_a_value_at(&self, indent: usize) -> bool {
-        self.previous_line_key().is_some_and(|key| {
-            key.column == indent && line_ends_with_colon_after_properties(key.text)
-        })
+        self.previous_line_key(LineMarkers::Dashes)
+            .is_some_and(|key| {
+                key.column == indent && line_ends_with_colon_after_properties(key.text)
+            })
     }
 
-    /// The key the previous content line opens with, past the `- ` markers that precede it: its
+    /// The key the previous content line opens with, past the `markers` that precede it: its
     /// column (the line's indent plus the markers, as their spacing leaves it), the text from the
-    /// key on, and whether any marker was there (a sequence item, where yq's refusal reads `did
-    /// not find expected '-' indicator` and a mapping's reads `did not find expected key`). One
-    /// walk for [`Self::previous_content_line_defers_a_value_at`] and
-    /// [`Self::header_is_left_of_the_deferring_key`] (#6540), so the two cannot disagree on where
-    /// a key stands.
-    fn previous_line_key(&self) -> Option<PreviousLineKey<'_>> {
+    /// key on, and the last marker (its column, and whether it is a dash). The walk is the one
+    /// definition of where a key stands for
+    /// [`Self::previous_content_line_defers_a_value_at`] (`LineMarkers::Dashes`: a `?` or `:` is
+    /// not walked past, as before) and [`Self::header_is_left_of_its_owner`]
+    /// (`LineMarkers::Explicit`, #6540, #6543).
+    fn previous_line_key(&self, markers: LineMarkers) -> Option<PreviousLineKey<'_>> {
         let (lead, rest) = self.previous_content_line()?;
         let mut marker_len = 0;
-        while rest.get(marker_len) == Some(&b'-')
-            && Self::is_ws_break_or_eoi(rest.get(marker_len + 1).copied())
+        let mut last_marker = None;
+        while rest.get(marker_len).is_some_and(|&b| {
+            b == b'-' || (markers == LineMarkers::Explicit && (b == b'?' || b == b':'))
+        }) && Self::is_ws_break_or_eoi(rest.get(marker_len + 1).copied())
         {
+            last_marker = Some((lead + marker_len, rest[marker_len] == b'-'));
             marker_len += 1;
             while matches!(rest.get(marker_len), Some(b' ' | b'\t')) {
                 marker_len += 1;
@@ -9865,7 +9880,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Some(PreviousLineKey {
             column: lead + marker_len,
             text: &rest[marker_len..],
-            in_sequence: marker_len > 0,
+            last_marker,
         })
     }
 
@@ -9882,22 +9897,29 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         })
     }
 
-    /// Whether the line above leaves its value to a key (`- k:`, `- - k: &y`) that stands to the
-    /// right of `indent` (#6540): a block scalar header on a line of its own there is left of the
-    /// key it would be the value of, so it is no value slot. yq refuses it with `did not find
-    /// expected '-' indicator`; a header at the key's own column (`- k:` / `  |`) or to its right
-    /// is the key's value. The key's column is the line's indent plus the `- ` markers it opens
-    /// with, as [`Self::previous_content_line_defers_a_value_at`] reads it; a bare dash owns its
-    /// header by [`Self::dash_above_owns_header_at`], and an explicit `?` line is not judged.
-    fn header_is_left_of_the_deferring_key(&self, indent: usize) -> Option<&'static str> {
-        let key = self.previous_line_key()?;
-        (indent < key.column
-            && (line_ends_with_colon_before_comment(key.text)
-                || line_ends_with_colon_after_properties(key.text)))
-        .then_some(if key.in_sequence {
-            "did not find expected '-' indicator"
-        } else {
-            "did not find expected key"
+    /// Whether the line above leaves its value to a dash or a key that stands to the right of
+    /// `indent` (#6540, #6543): a block scalar header on a line of its own there is left of the
+    /// owner it would be the value of, so it is no value slot, and yq refuses it. The owner is a
+    /// key written up to its colon (`- k:`, `- - k: &y`, `? k:`, `: - k:`), at the line's indent
+    /// plus the markers it opens with, or the last marker of a line that ends in one (`- -`,
+    /// `- - &x`, `? -`, a bare `?`). A header at the owner's own column (`- k:` / `  |`, `- -` /
+    /// `  |`) or to its right is its value. The markers are `-`, and `?` and `:` of an explicit
+    /// key. yq words the refusal by the last marker: `did not find expected '-' indicator` after
+    /// a dash, `did not find expected key` in a mapping.
+    fn header_is_left_of_its_owner(&self, indent: usize) -> Option<&'static str> {
+        let key = self.previous_line_key(LineMarkers::Explicit)?;
+        let owner = match key.last_marker {
+            Some((column, _)) if only_node_properties(key.text) => column,
+            _ if line_ends_with_colon_before_comment(key.text)
+                || line_ends_with_colon_after_properties(key.text) =>
+            {
+                key.column
+            }
+            _ => return None,
+        };
+        (indent < owner).then_some(match key.last_marker {
+            Some((_, true)) => "did not find expected '-' indicator",
+            _ => "did not find expected key",
         })
     }
 
@@ -10318,6 +10340,19 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return Err(self.err_stray_line());
         }
 
+        // #6540, #6543: a block scalar header on a line of its own, left of the dash or key above
+        // that it would be the value of, is no value slot: yq refuses it. Judged here, ahead of
+        // the arms, so a header that no arm below takes as an own-line value (the line above is a
+        // chain of dashes, or ends in `?`) is refused too.
+        if matches!(self.peek(), Some(b'|' | b'>'))
+            && !self.json_strict
+            && self.type_stack.len() > 1
+        {
+            if let Some(what) = self.header_is_left_of_its_owner(indent) {
+                return Err(self.err_unexpected_char(self.pos, what));
+            }
+        }
+
         // Check what kind of content this is
         match self.peek() {
             Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
@@ -10595,9 +10630,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     && (self.previous_content_line_defers_its_value()
                         || self.dash_above_owns_header_at(indent)) =>
             {
-                if let Some(what) = self.header_is_left_of_the_deferring_key(indent) {
-                    return Err(self.err_unexpected_char(self.pos, what));
-                }
                 self.check_mapping_under_mapping_gap(indent)?;
                 // #6390: a header at the column of the bare `-` above is that item's value, so the
                 // item stays open for it (`-` / `|` / `  t` is `["t\n"]`).
