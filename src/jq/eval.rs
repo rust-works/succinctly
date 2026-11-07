@@ -89659,9 +89659,16 @@ fn eval_owned_pure_in<S: EvalSemantics>(
         Expr::IndexExpr { target, key }
             if S::TAG == EvalTag::Jq && position == ResultPosition::Operand =>
         {
-            let k = match eval_owned_pure_in::<S>(key, input, ResultPosition::Operand, door)? {
-                Ok(v) => v,
-                Err(e) => return Some(Err(e)),
+            // A key that reads nothing of the input (`($i % 100 | tostring)` once the fold has put
+            // its loop variable in) is computed once, as the write path's keys are; any other key is
+            // read off the input by this grammar.
+            let k = if closed_expr_shape(key) {
+                closed_expr_to_owned::<S>(key)?
+            } else {
+                match eval_owned_pure_in::<S>(key, input, ResultPosition::Operand, door)? {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                }
             };
             if !matches!(
                 k,
@@ -174370,6 +174377,13 @@ mod share_audit_2999 {
             ("[.c[.k]]", true),
             ("[.c[.k], .c[.s]]", true),
             (".o.p[\"q\"]", true),
+            // A key that reads nothing of the state but is not in the pure grammar (`tostring`).
+            (".c[(1 | tostring)]", true),
+            ("(.c[(3 % 2 | tostring)] // 0) + 1", true),
+            ("(.c[(\"A\" | ascii_downcase)] // 0) + 1", true),
+            (".arr[(7 % 3)]", true),
+            ("(.arr[(7 % 3)] // 0) + 1", true),
+            (".c[(1 | tostring)] // 5", true),
             (".o[\"p\"][\"q\"]", true),
             (".z[\"a\"]", true),
             // An integer key into an array, a negative one, one past the end, one computed.
@@ -174455,6 +174469,8 @@ mod share_audit_2999 {
             ".c[.k] // 0",
             "(.z // 0) + 1",
             "[(.i // 0) + 1]",
+            "(.c[(5 % 3 | tostring)] // 0) + 1",
+            "(.o[(\"p\" | ascii_downcase)] // 0) + 1",
         ] {
             let got = owned_assign_operand::<JqSemantics>(&operand(filter), &wide);
             assert!(got.is_some(), "{filter}");
