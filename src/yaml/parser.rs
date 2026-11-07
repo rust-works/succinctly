@@ -696,6 +696,10 @@ struct Parser<'a, const HAS_CR: bool> {
     ///   handed the `...` as the first token of an implicit document, which has no node to hold;
     /// - a stream of only that head, directives included, is one null document (#6342).
     yq_mode: bool,
+    /// Where the cursor stood when `parse_node_properties` last consumed a property, which is the next
+    /// token's start (`usize::MAX` before one): a `-` met there has a property in front of it on its
+    /// line, which yq refuses (#6414).
+    properties_end: usize,
     /// Whether a directive other than `%YAML` was skipped (#6342): `%TAG` and the rest are not
     /// set aside by yq's slurp, so go-yaml sees them and wants a `---` after them.
     saw_non_header_directive: bool,
@@ -784,6 +788,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             nesting_depth: 0,
             json_strict: false,
             yq_mode: false,
+            properties_end: usize::MAX,
             saw_non_header_directive: false,
             documents_started: 0,
             leading_run_from: 0,
@@ -4639,6 +4644,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     fn parse_sequence_item_inner(&mut self, indent: usize) -> Result<(), YamlError> {
         let _item_start = self.pos;
+        self.reject_misplaced_sequence_indicator()?;
 
         // Mark the `-` position
         self.set_ib();
@@ -5982,6 +5988,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // `? -\ta\n  -\tb\n: value` fell through to being parsed as a plain
             // scalar key `-\ta` instead of a sequence key (#434).
             Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
+                // `? &t - x`, `? -⇥x`: refused as everywhere else (#6414).
+                self.reject_misplaced_sequence_indicator()?;
                 // Sequence as key - open key node and let sequence parsing continue
                 // The key will be a sequence
                 self.write_bp_open();
@@ -6187,14 +6195,33 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
-    /// A tab among the blanks after the `?` or `:` at the cursor (#6379): go-yaml skips no tab where a
-    /// simple key is allowed, which is right after either indicator, so it stops with `found character
+    /// What yq refuses about the `-` at the cursor that opens a block sequence entry, whichever site
+    /// reads it (#6414): a property in front of it on its line (`&t - x`, `a: &t - x`, `- !!seq - x`)
+    /// is no node's property, and yq stops with `block sequence entries are not allowed in this
+    /// context` wherever the property stands (a property on a line of its own above the `-` is fine,
+    /// and ends at the line break, not here); and a tab among the blanks after it is no separation
+    /// to go-yaml (`-⇥x`, `- ⇥x`). Yq only: the library loader keeps both readings.
+    fn reject_misplaced_sequence_indicator(&self) -> Result<(), YamlError> {
+        if !self.yq_mode {
+            return Ok(());
+        }
+        if self.properties_end == self.pos {
+            return Err(self.err_unexpected_char(
+                self.pos,
+                "block sequence entries are not allowed in this context",
+            ));
+        }
+        self.reject_tab_after_indicator()
+    }
+
+    /// A tab among the blanks after the `?`, `:` or `-` at the cursor (#6379, #6414): go-yaml skips no tab
+    /// where a simple key is allowed, which is right after any of the indicators, so it stops with `found character
     /// that cannot start any token` (`?⇥x`, `:⇥b`, `? ⇥x`, and a tab with nothing after it). The blanks
     /// may end at a `#`, which its comment scanner takes (`?⇥# c`). The one decision for the key's and
     /// the value's indicator, and for the nested positions that reach them in yq (#6340). The library loader
     /// keeps its older refusal of a tab right after the `?` of a nested key, in `parse_nested_explicit_key`.
     fn reject_tab_after_indicator(&self) -> Result<(), YamlError> {
-        debug_assert!(matches!(self.peek(), Some(b'?' | b':')));
+        debug_assert!(matches!(self.peek(), Some(b'?' | b':' | b'-')));
         // Only for yq: YAML 1.2 reads the tab as separation, which the library loader keeps.
         if !self.yq_mode {
             return Ok(());
@@ -6211,8 +6238,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
             at += 1;
         }
+        // The blanks may end at a `#` after `?` or `:`, which the comment scanner takes (`?⇥# c`); after
+        // a `-` go-yaml stops at the tab all the same (`-⇥# c`, #6414).
+        let comment_follows = self.peek() != Some(b'-') && self.input.get(at) == Some(&b'#');
         match tab {
-            Some(tab) if self.input.get(at) != Some(&b'#') => {
+            Some(tab) if !comment_follows => {
                 Err(self.err_unexpected_char(tab, "found character that cannot start any token"))
             }
             _ => Ok(()),
@@ -9158,6 +9188,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 _ => break,
             }
         }
+        if had_property {
+            self.properties_end = self.pos;
+        }
         Ok(had_property)
     }
 
@@ -9218,11 +9251,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// already-open twin of [`Self::parse_node_properties`], combining
     /// [`Self::record_key_anchor`] and [`Self::record_key_tag`].
     fn record_key_properties(&mut self) -> Result<(), YamlError> {
+        let mut had_property = false;
         loop {
             match self.peek() {
                 Some(b'&') => self.record_key_anchor()?,
                 Some(b'!') => self.record_key_tag()?,
                 _ => break,
+            }
+            had_property = true;
+        }
+        if had_property {
+            self.properties_end = self.pos;
+            // `&t - a: b`: what the property stands before is a block sequence entry, not a key, which yq
+            // refuses (#6414); the key would read as the plain text `- a`.
+            if self.peek() == Some(b'-') && Self::is_ws_break_or_eoi(self.peek_at(1)) {
+                self.reject_misplaced_sequence_indicator()?;
             }
         }
         Ok(())
