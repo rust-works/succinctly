@@ -17,6 +17,9 @@ fn a_fault_before_an_unopened_file_stops_the_run_before_it_under_slurp_6485() ->
         ("mid.json", "{\"a\":1}\n{\"a\":}\n{\"a\":3}\n"),
         ("nums.json", "1\n2\n3\n"),
         ("bom.json", "\u{feff}[1,}"),
+        ("empty.json", ""),
+        ("a.json", "[1,"),
+        ("b.json", "2]"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
@@ -43,6 +46,15 @@ fn a_fault_before_an_unopened_file_stops_the_run_before_it_under_slurp_6485() ->
         (&["-c", "-s", "--stream", "."][..], &["t1", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Unfinished JSON term at EOF at line 1, column 3\n", 2),
         (&["-c", "-s", "--stream", "."][..], &["bom", "gone"][..], "", "jq: parse error: Expected another key:value pair at line 1, column 4\n", 5),
         (&["-c", "-s", "--stream", "."][..], &["nums", "bad", "gone"][..], "", "jq: parse error: Expected another key:value pair at line 4, column 4\n", 5),
+        (&["-c", "-s", "."][..], &["empty", "bom", "gone"][..], "", "jq: parse error: Unmatched '}' at line 1, column 4\n", 5),
+        (&["-c", "-s", "."][..], &["a", "b", "gone"][..], "[[1,2]]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "-s", "--stream", "."][..], &["empty", "bom", "gone"][..], "", "jq: parse error: Expected another key:value pair at line 1, column 4\n", 5),
+        (&["-c", "-n", "[inputs]"][..], &["bad", "gone"][..], "", "jq: error (at @DIR@/bad.json:0): Unmatched '}' at line 1, column 4\n", 5),
+        (&["-c", "-n", "[inputs]"][..], &["mid", "gone", "nums"][..], "", "jq: error (at @DIR@/mid.json:2): Unmatched '}' at line 2, column 6\n", 5),
+        (&["-c", "-n", "input"][..], &["bad", "gone"][..], "", "jq: error (at @DIR@/bad.json:0): Unmatched '}' at line 1, column 4\n", 5),
+        (&["-c", "-s", "-R", "."][..], &["bad", "gone"][..], "\"[1,}\"\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "-s", "--seq", "."][..], &["bad", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Unfinished abandoned text at EOF at line 1, column 4\n", 2),
+        (&["-c", "-n", "-s", "."][..], &["bad", "gone"][..], "null\n", "", 0),
     ] {
         let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}.json")).collect();
         let mut args: Vec<&str> = flags.to_vec();

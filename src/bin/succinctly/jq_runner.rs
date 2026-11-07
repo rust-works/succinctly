@@ -8608,13 +8608,16 @@ fn open_failures_reached<'a>(
         || args.seq
         || args.input_dsv.is_some()
         || args.stream_errors
+        // `--validate` is its own, stricter check of the files, which reports in its own order.
+        || args.validate
     {
         return failures;
     }
-    // jq skips the byte-order mark at the front of its input.
+    // jq skips the byte-order mark at the front of its input: of the first file with bytes.
+    let first = raws.iter().position(|raw| !raw.is_empty());
     let chunks = raws.iter().enumerate().map(|(at, raw)| {
-        if at == 0 {
-            raw.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(raw)
+        if Some(at) == first {
+            &raw[crate::front_matter::leading_bom_len(raw)..]
         } else {
             raw.as_slice()
         }
