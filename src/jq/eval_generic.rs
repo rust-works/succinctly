@@ -57640,7 +57640,7 @@ mod tests {
         // owned container the rounds share.
         let at = |rounds: usize| {
             let query = format!(
-                r#".s | ascii_downcase | [., .] | . as $t | [range({rounds}) | ($t | length)] | add"#
+                r".s | ascii_downcase | [., .] | . as $t | [range({rounds}) | ($t | length)] | add"
             );
             let (out, reindexes) = outputs_and_reindexes_in::<JqSemantics>(doc, &query);
             assert_eq!(out, [(2 * rounds).to_string()], "jq: {query}");

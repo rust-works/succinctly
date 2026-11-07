@@ -13988,6 +13988,65 @@ fn closed_index_expr<S: EvalSemantics>(
     }
 }
 
+/// [`closed_expr_to_owned_node`]'s `Pipe` arm: a closed head, then each later stage answered
+/// against the value so far. Its own function, not inline in the arm, for the reason
+/// [`closed_index_expr`] gives: the walk recurses to `MAX_VALUE_TREE_DEPTH` levels, and a local
+/// added to the arm's frame is paid at every level.
+///
+/// #5712: a head that is a marker is read in place, not cloned, while the stages run: a string
+/// marker's clone is a copy of the whole string (`SharableString::Owned`), and a stage that
+/// declines (`$t | length + 1`) paid that copy for nothing, once per round (+3.7% over a 32 MB
+/// string). The marker's `escaped` bit is set as the marker arm sets it, and a pipe of the head
+/// alone still clones it, as the arm does.
+#[inline(never)]
+fn closed_pipe_to_owned<S: EvalSemantics>(
+    stages: &[Expr],
+    depth: usize,
+    escaped: &mut bool,
+) -> Option<OwnedValue> {
+    let (head, rest) = stages.split_first()?;
+    let mut value: Option<OwnedValue> = None;
+    let mut borrowed: Option<&OwnedValue> = None;
+    match head {
+        Expr::TrackedVar(marker) if S::TAG == EvalTag::Jq && !rest.is_empty() => {
+            // The marker arm's rule, and `closed_expr_to_owned_at_depth`'s reset for a scalar.
+            if !marker.fold_share
+                && matches!(marker.value, OwnedValue::Array(_) | OwnedValue::Object(_))
+            {
+                *escaped = true;
+            }
+            borrowed = Some(&marker.value);
+        }
+        _ => {
+            value = Some(closed_expr_to_owned_at_depth::<S>(
+                head,
+                depth + 1,
+                escaped,
+            )?)
+        }
+    }
+    for stage in rest {
+        let current = value.as_ref().or(borrowed)?;
+        let next = match eval_owned_fast_path::<S>(stage, current, false) {
+            Some(Ok(Some(next))) => next,
+            Some(_) => return None,
+            None => match closed_unary_builtin::<S>(stage, current) {
+                Some(next) => next,
+                // #5712: a comparison, a boolean or a `try` over a string's length
+                // (`$t | length > 3`), or its prefix test, is read off the string: the
+                // answer is a fresh integer, boolean or `null`, never a node of it.
+                // jq mode only, like `closed_unary_builtin`.
+                None if S::TAG == EvalTag::Jq => {
+                    eval_owned_string_door::<S>(unwrap_paren(stage), current)?
+                }
+                None => return None,
+            },
+        };
+        value = Some(next);
+    }
+    value
+}
+
 fn closed_expr_to_owned_node<S: EvalSemantics>(
     expr: &Expr,
     depth: usize,
@@ -14012,28 +14071,7 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
             Some(marker.value.clone())
         }
         Expr::Paren(inner) => closed_expr_to_owned_at_depth::<S>(inner, depth + 1, escaped),
-        Expr::Pipe(stages) => {
-            let (head, rest) = stages.split_first()?;
-            let mut value = closed_expr_to_owned_at_depth::<S>(head, depth + 1, escaped)?;
-            for stage in rest {
-                value = match eval_owned_fast_path::<S>(stage, &value, false) {
-                    Some(Ok(Some(next))) => next,
-                    Some(_) => return None,
-                    None => match closed_unary_builtin::<S>(stage, &value) {
-                        Some(next) => next,
-                        // #5712: a comparison, a boolean or a `try` over a string's length
-                        // (`$t | length > 3`), or its prefix test, is read off the string: the
-                        // answer is a fresh integer, boolean or `null`, never a node of it.
-                        // jq mode only, like `closed_unary_builtin`.
-                        None if S::TAG == EvalTag::Jq => {
-                            eval_owned_string_door::<S>(unwrap_paren(stage), &value)?
-                        }
-                        None => return None,
-                    },
-                };
-            }
-            Some(value)
-        }
+        Expr::Pipe(stages) => closed_pipe_to_owned::<S>(stages, depth, escaped),
         // #5774: `$d[0].users[$i]`, a key that is itself closed (the loop variable): the target and
         // the key are each one value, and the step is the navigation `.[k]` / `.k` the pipe stages
         // above answer. A key that is not an integer or a string, or a step that raises, declines
