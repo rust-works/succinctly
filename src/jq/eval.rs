@@ -14216,6 +14216,32 @@ fn closed_index_expr<S: EvalSemantics>(
     }
 }
 
+/// [`closed_expr_to_owned_node`]'s `If` arm (#6574): the condition is one closed value, its
+/// truthiness picks a branch, and only that branch is answered, so a branch the condition does not
+/// choose is never read (one that would raise stays unobserved, as in jq). A condition or chosen
+/// branch that raises or yields nothing declines, leaving the evaluator's route and text. The
+/// condition is read for its truthiness alone, so an `escaped` mark it sets is dropped: `escaped`
+/// follows the chosen branch. Its own function, not inline in the arm, for the reason
+/// [`closed_index_expr`] gives.
+#[inline(never)]
+fn closed_if_to_owned<S: EvalSemantics>(
+    cond: &Expr,
+    then_branch: &Expr,
+    else_branch: &Expr,
+    depth: usize,
+    escaped: &mut bool,
+) -> Option<OwnedValue> {
+    let before = *escaped;
+    let chosen = closed_expr_to_owned_at_depth::<S>(cond, depth + 1, escaped)?;
+    *escaped = before;
+    let branch = if chosen.is_truthy() {
+        then_branch
+    } else {
+        else_branch
+    };
+    closed_expr_to_owned_at_depth::<S>(branch, depth + 1, escaped)
+}
+
 /// [`closed_expr_to_owned_node`]'s `Pipe` arm: a closed head, then each later stage answered
 /// against the value so far. Its own function, not inline in the arm, for the reason
 /// [`closed_index_expr`] gives: the walk recurses to `MAX_VALUE_TREE_DEPTH` levels, and a local
@@ -14366,24 +14392,14 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
                 closed_expr_to_owned_at_depth::<S>(right, depth + 1, escaped)
             }
         }
-        // #6574: `if $i % 2 == 0 then 1 else 0 end` with every part closed: the condition is one
-        // value, its truthiness picks a branch, and only that branch is answered, so a branch the
-        // condition does not choose is never read (one that would raise stays unobserved, as in
-        // jq). A condition or chosen branch that raises or yields nothing declines, leaving the
-        // evaluator's route and text. `escaped` follows the chosen branch alone. jq mode only,
-        // like the operators above.
+        // #6574: `if $i % 2 == 0 then 1 else 0 end` with every part closed; see [`closed_if_to_owned`].
+        // jq mode only, like the operators above.
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } if S::TAG == EvalTag::Jq => {
-            let chosen = closed_expr_to_owned_at_depth::<S>(cond, depth + 1, escaped)?;
-            let branch = if chosen.is_truthy() {
-                then_branch
-            } else {
-                else_branch
-            };
-            closed_expr_to_owned_at_depth::<S>(branch, depth + 1, escaped)
+            closed_if_to_owned::<S>(cond, then_branch, else_branch, depth, escaped)
         }
         // `[$x]` is a *bare* element inside `Expr::Array`: the parser only
         // adds `Expr::Comma` when a `,` is present (#2152).
@@ -126675,6 +126691,9 @@ mod tests {
             "{\"a\":1} | .a",
             "[1,2] | length",
             "[1,2] | first",
+            "if 1 then 2 else 3 end",
+            "if null then 1 else [2] end",
+            "if 1 > 2 then 1 elif 2 > 1 then {\"a\":2} else 3 end",
         ];
         // Which sources each mode answers. jq answers all but `first`; yq's
         // owned grammar has no operators and no `length`/`first` stage, so a
@@ -126695,6 +126714,9 @@ mod tests {
             "false or null",
             "[1,2] | length",
             "[1,2] | first",
+            "if 1 then 2 else 3 end",
+            "if null then 1 else [2] end",
+            "if 1 > 2 then 1 elif 2 > 1 then {\"a\":2} else 3 end",
         ];
         for src in closed {
             let expr = parse(src).unwrap();
