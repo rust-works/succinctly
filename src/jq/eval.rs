@@ -28161,6 +28161,10 @@ fn has_multiline_caret(pattern: &str) -> bool {
 /// and has no look-ahead to say "not the end"; `fancy-regex` has. `None` when there is none.
 #[cfg(feature = "regex")]
 fn rewrite_multiline_caret(pattern: &str) -> Option<String> {
+    // Most patterns have no `^`, and reading one through its plain copy costs a parse.
+    if !pattern.contains('^') {
+        return None;
+    }
     let (mut text, spans, renames) =
         multiline_caret_read(pattern).filter(|(_, spans, _)| !spans.is_empty())?;
     for &(start, end) in spans.iter().rev() {

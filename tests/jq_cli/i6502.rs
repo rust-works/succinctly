@@ -1,4 +1,4 @@
-//! #6502: a `^` under `(?m)` inside a look-around is written as Oniguruma reads it too (#6456: it
+//! #6502: a `^` under `(?m)` inside a look-around (or an atomic group) is written as Oniguruma reads it too (#6456: it
 //! does not hold at the end of a text after a final newline), since the pattern is read through
 //! its plain copy, which holds the `^` at the same offset. Every row was captured from jq 1.7.1
 //! (`jq -nc`).
@@ -19,8 +19,8 @@ fn a_multiline_caret_inside_a_lookaround_does_not_hold_at_the_end_6502() -> Resu
         ("(?m)(?<!^)(?#c)", "ab\n", "[1,2,3]"),
         // `(?-m)` inside the look-around: the `^` there is the start of the text only.
         ("(?m)(?<!(?-m:^))", "a\n", "[1,2]"),
-        // A `^` beside the look-around was already read (#6456), and still is.
-        ("(?m)(?=(?:^|x))", "a\n", "[0]"),
+        // An atomic group is read through the plain copy too.
+        ("(?m)(?<!(?>^))", "a\n", "[1,2]"),
     ] {
         let (stdout, stderr, status) = run_jq_full(
             &[
