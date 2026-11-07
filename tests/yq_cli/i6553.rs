@@ -97,3 +97,51 @@ fn yq_keeps_the_other_scalars_at_a_bare_question_mark_s_column_6553() -> Result<
     assert_eq!((stdout.trim_end(), status), (r#"{"t\n":null}"#, 0));
     Ok(())
 }
+
+/// What follows the key and what is not a header: a sibling key, a value, a second key, a nested
+/// mapping, a malformed header, a second document. `None` is a document yq refuses. Captured from
+/// yq v4.53.3.
+const NEIGHBOURS: &[(&str, Option<&str>)] = &[
+    ("?\n>foo\n", None),
+    ("?\n|x\n", None),
+    ("?\n| \n", Some("{\"\":null}")),
+    ("?\n|\n", Some("{\"\":null}")),
+    ("?\n|\n  t\nb: 1\n", Some("{\"t\\n\":null,\"b\":1}")),
+    ("?\n|\n  t\n: v\nb: 1\n", Some("{\"t\\n\":\"v\",\"b\":1}")),
+    (
+        "?\n|\n  t\n?\n|\n  u\n",
+        Some("{\"t\\n\":null,\"u\\n\":null}"),
+    ),
+    ("?\n|\n  t\n? c\n", Some("{\"t\\n\":null,\"c\":null}")),
+    ("- ?\n|\n  t\n", None),
+    ("- ?\n|\n  t\n- b\n", None),
+    ("a:\n  ?\n|\n  t\n", None),
+    (
+        "a:\n  ?\n  |\n    t\n  b: 1\n",
+        Some("{\"a\":{\"t\\n\":null,\"b\":1}}"),
+    ),
+    ("a:\n  ?\n  |\n    t\n: 1\n", None),
+    (
+        "? \n|\n  t\n---\n?\n|\n  u\n",
+        Some("{\"t\\n\":null}\n{\"u\\n\":null}"),
+    ),
+    ("?\n|\n\n", Some("{\"\":null}")),
+    ("?\n|\n  t\n- x\n", None),
+    ("?\n>-\n  t\n  u\nz: 1\n", Some("{\"t u\":null,\"z\":1}")),
+    (
+        "a: 1\n?\n|\n  t\nb: 2\n",
+        Some("{\"a\":1,\"t\\n\":null,\"b\":2}"),
+    ),
+];
+
+#[test]
+fn yq_ends_the_key_a_header_at_a_bare_question_mark_s_column_opens_6553() -> Result<()> {
+    for (doc, expected) in NEIGHBOURS {
+        let (stdout, status) = run_yq_stdin(".", doc, &["-o=json", "-I0"])?;
+        match expected {
+            Some(json) => assert_eq!((stdout.trim_end(), status), (*json, 0), "{doc:?}"),
+            None => assert_eq!(status, 1, "{doc:?}"),
+        }
+    }
+    Ok(())
+}

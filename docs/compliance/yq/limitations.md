@@ -7126,3 +7126,6 @@ These differ:
   `succinctly yq` words it by the last marker of the line above: `'-' indicator` after a dash, `key` otherwise.
   The two differ on 28 of the 96 explicit-key and dash-chain documents of #6543's grid (for example `? x` / `: - k:` / `|`).
   Both fail with exit 1 and print nothing.
+- **An explicit indentation indicator on a block scalar under `- ?` is measured from the wrong indent (#6553, #6490).**
+  `- ?` / `   |2` / `     t` is the key `" t\n"` in yq and `"   t\n"` here: the indicator counts from the indent of the enclosing sequence (0 here), where yq counts from the indent of the mapping the `?` opens (2 here).
+  Only the scalar's text differs; the document is accepted and the key is the same one.
