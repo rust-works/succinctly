@@ -4747,99 +4747,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Check what follows
         if self.at_line_end() {
-            // A trailing comment here belongs to this item's own deferred
-            // value, not to the item's dash line (#784, same shape as
-            // `parse_mapping_entry`'s anchor case). A property-prefixed
-            // item defers it past the property (`defer_line_comment`,
-            // #784). A bare item has no property to defer past, and where
-            // the comment goes depends on whether a value follows at all
-            // (#1079):
-            //
-            // - deferred to a node on a later line (a mapping, nested
-            //   sequence, or scalar): captured against the item wrapper's
-            //   own bp, which the emitter renders on the dash line (or, for
-            //   a scalar, above it) -- and that node, opening next at
-            //   `self.bp_pos`, is the one `.[i]` resolves to and real yq
-            //   answers `head_comment` from (`# h\n-\n  x\n` is `.[1]`'s
-            //   head, not `.[0]`'s foot), so any pending standalone block
-            //   attaches to it here, exactly as the plain-scalar arm below
-            //   does for `- x`;
-            // - absent (the next content is a sibling item, a dedent, or
-            //   end of input): there is no node, and real yq floats the
-            //   comment -- see `float_absent_item_comment`. An absent item
-            //   with no comment attaches nothing either, so a block above
-            //   it reaches the next item that does exist -- and it ends an
-            //   earlier floated comment's claim on the enclosing key's foot
-            //   (`a:\n  - # c\n  -\nb: 2\n` heads `b`, measured).
-            if had_property {
-                self.defer_line_comment();
-            } else {
-                let trailing = self.scan_trailing_comment();
-                // The lookahead also records comment-only lines between
-                // this dash and the following content. Those sit *inside*
-                // the deferred value and belong to its first node
-                // (`-\n  # c\n  - x\n` heads `.[0][0]`, measured), so only
-                // the lines already pending here are this value's own head.
-                let above_dash = self.pending_head_lines.len();
-                let value_is_null = self
-                    .next_line_settles_value_is_null(indent)
-                    .unwrap_or_else(|| self.following_value_is_null(indent));
-                // Properties on a line of their own name an empty node, so the item is not
-                // absent, but its comment still goes forward off the dash line (#2835).
-                let empty_property_item =
-                    !value_is_null && self.next_line_is_properties_of_a_null_value(indent);
-                if value_is_null || empty_property_item {
-                    if empty_property_item && self.pending_head_lines.len() > above_dash {
-                        // Comment lines between the dash and the properties go forward with
-                        // the rest, as the dash line's own comment does below: yq heads
-                        // whatever opens next with them, not placing them by the column they
-                        // were written at (#4851). The whole block is reset, a line pending
-                        // above the dash included, since it is one block to the placement
-                        // rule and yq moves it the same way (`- 1` / `# a` / `-` / `# x` /
-                        // `!!str`, measured).
-                        self.pending_block = PendingBlock::default();
-                    }
-                    match (trailing, empty_property_item) {
-                        (Some(range), false) => self.float_absent_item_comment(range),
-                        (Some(range), true) => self.float_comment_past_empty_property_item(range),
-                        (None, _) => self.end_float(),
-                    }
-                    // A null item is still content: a block after it at end
-                    // of document is the root's foot, not a comment-only
-                    // document's head (`-\n# c\n`, measured).
-                    self.saw_head_foot_node = true;
-                } else {
-                    // The lookahead can also have *settled* the block (a
-                    // blank line after it resolves it backwards), so clamp.
-                    let above_dash = above_dash.min(self.pending_head_lines.len());
-                    let below_dash = self.pending_head_lines.split_off(above_dash);
-                    self.attach_deferred_item_value_at(self.bp_pos, indent);
-                    self.pending_head_lines = below_dash;
-                    if let Some(range) = trailing {
-                        self.push_line_comment(wrapper_bp, range);
-                    }
-                }
-            }
-
-            // An anchor records the *next* BP position as its target, and a
-            // tag is looked up *at* that position (`self.tags`), so a
-            // property-prefixed item whose value turns out to be null needs
-            // an explicit empty node for either to resolve against —
-            // otherwise the anchor/tag would land on a sibling's open, on a
-            // close bit, or (for a tag) nowhere at all, silently dropping it
-            // (corpus case LE5A: `- !!str` with nothing after must resolve
-            // to `""`, not `null` — #224). parse_mapping_entry does the same
-            // for `key: &a` / `key: !!str` with no value.
-            if had_property && self.following_value_is_null(indent) {
-                self.set_ib();
-                self.write_bp_open();
-                self.write_bp_close();
-            }
-
-            // Content is on the next line(s) at greater indentation.
-            // Leave the item open - subsequent content at indent > this item's
-            // indent will be parsed as the item's value. The item will be closed
-            // by close_deeper_indents when we see content at indent <= sequence indent.
+            self.defer_item_value_to_later_lines(indent, had_property, wrapper_bp);
             return Ok(());
         }
 
@@ -4962,6 +4870,113 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
 
         Ok(())
+    }
+
+    /// A sequence item whose value stands on the lines below its `-` (or below the properties
+    /// after it): settle where the line comment, the comments between and a null value go, and
+    /// leave the item open for the main loop to read the value into. The one copy of this, shared
+    /// by an ordinary item and the first item of an explicit key's sequence (#6580).
+    ///
+    /// `indent` is the `-`'s column, `wrapper_bp` the item wrapper's own bp.
+    fn defer_item_value_to_later_lines(
+        &mut self,
+        indent: usize,
+        had_property: bool,
+        wrapper_bp: usize,
+    ) {
+        // A trailing comment here belongs to this item's own deferred
+        // value, not to the item's dash line (#784, same shape as
+        // `parse_mapping_entry`'s anchor case). A property-prefixed
+        // item defers it past the property (`defer_line_comment`,
+        // #784). A bare item has no property to defer past, and where
+        // the comment goes depends on whether a value follows at all
+        // (#1079):
+        //
+        // - deferred to a node on a later line (a mapping, nested
+        //   sequence, or scalar): captured against the item wrapper's
+        //   own bp, which the emitter renders on the dash line (or, for
+        //   a scalar, above it) -- and that node, opening next at
+        //   `self.bp_pos`, is the one `.[i]` resolves to and real yq
+        //   answers `head_comment` from (`# h\n-\n  x\n` is `.[1]`'s
+        //   head, not `.[0]`'s foot), so any pending standalone block
+        //   attaches to it here, exactly as the plain-scalar arm below
+        //   does for `- x`;
+        // - absent (the next content is a sibling item, a dedent, or
+        //   end of input): there is no node, and real yq floats the
+        //   comment -- see `float_absent_item_comment`. An absent item
+        //   with no comment attaches nothing either, so a block above
+        //   it reaches the next item that does exist -- and it ends an
+        //   earlier floated comment's claim on the enclosing key's foot
+        //   (`a:\n  - # c\n  -\nb: 2\n` heads `b`, measured).
+        if had_property {
+            self.defer_line_comment();
+        } else {
+            let trailing = self.scan_trailing_comment();
+            // The lookahead also records comment-only lines between
+            // this dash and the following content. Those sit *inside*
+            // the deferred value and belong to its first node
+            // (`-\n  # c\n  - x\n` heads `.[0][0]`, measured), so only
+            // the lines already pending here are this value's own head.
+            let above_dash = self.pending_head_lines.len();
+            let value_is_null = self
+                .next_line_settles_value_is_null(indent)
+                .unwrap_or_else(|| self.following_value_is_null(indent));
+            // Properties on a line of their own name an empty node, so the item is not
+            // absent, but its comment still goes forward off the dash line (#2835).
+            let empty_property_item =
+                !value_is_null && self.next_line_is_properties_of_a_null_value(indent);
+            if value_is_null || empty_property_item {
+                if empty_property_item && self.pending_head_lines.len() > above_dash {
+                    // Comment lines between the dash and the properties go forward with
+                    // the rest, as the dash line's own comment does below: yq heads
+                    // whatever opens next with them, not placing them by the column they
+                    // were written at (#4851). The whole block is reset, a line pending
+                    // above the dash included, since it is one block to the placement
+                    // rule and yq moves it the same way (`- 1` / `# a` / `-` / `# x` /
+                    // `!!str`, measured).
+                    self.pending_block = PendingBlock::default();
+                }
+                match (trailing, empty_property_item) {
+                    (Some(range), false) => self.float_absent_item_comment(range),
+                    (Some(range), true) => self.float_comment_past_empty_property_item(range),
+                    (None, _) => self.end_float(),
+                }
+                // A null item is still content: a block after it at end
+                // of document is the root's foot, not a comment-only
+                // document's head (`-\n# c\n`, measured).
+                self.saw_head_foot_node = true;
+            } else {
+                // The lookahead can also have *settled* the block (a
+                // blank line after it resolves it backwards), so clamp.
+                let above_dash = above_dash.min(self.pending_head_lines.len());
+                let below_dash = self.pending_head_lines.split_off(above_dash);
+                self.attach_deferred_item_value_at(self.bp_pos, indent);
+                self.pending_head_lines = below_dash;
+                if let Some(range) = trailing {
+                    self.push_line_comment(wrapper_bp, range);
+                }
+            }
+        }
+
+        // An anchor records the *next* BP position as its target, and a
+        // tag is looked up *at* that position (`self.tags`), so a
+        // property-prefixed item whose value turns out to be null needs
+        // an explicit empty node for either to resolve against —
+        // otherwise the anchor/tag would land on a sibling's open, on a
+        // close bit, or (for a tag) nowhere at all, silently dropping it
+        // (corpus case LE5A: `- !!str` with nothing after must resolve
+        // to `""`, not `null` — #224). parse_mapping_entry does the same
+        // for `key: &a` / `key: !!str` with no value.
+        if had_property && self.following_value_is_null(indent) {
+            self.set_ib();
+            self.write_bp_open();
+            self.write_bp_close();
+        }
+
+        // Content is on the next line(s) at greater indentation.
+        // Leave the item open - subsequent content at indent > this item's
+        // indent will be parsed as the item's value. The item will be closed
+        // by close_deeper_indents when we see content at indent <= sequence indent.
     }
 
     /// Look ahead from the end of the current line to decide whether the value
@@ -6061,9 +6076,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
                 // Parse first sequence item inline
                 self.write_bp_open_seq_item(); // item node
-                                               // The item is a frame of its own, as `parse_sequence_item_inner` makes one, so that
-                                               // a container its value opens (`? - - p`, `? - a: 1`) is closed inside it by the
-                                               // dedent that ends the key, and not by the close of the item below (#6496).
+                let item_wrapper_bp = self.last_open_bp_pos;
+                // The item is a frame of its own, as `parse_sequence_item_inner` makes one, so that
+                // a container its value opens (`? - - p`, `? - a: 1`) is closed inside it by the
+                // dedent that ends the key, and not by the close of the item below (#6496).
                 let item_depth = self.indent_stack.len();
                 self.indent_stack.push(seq_indent + 1);
                 self.push_type(NodeType::SequenceItem);
@@ -6083,7 +6099,22 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // content as text (`? - &x` / `   |` / `     t` / `` / `   u` dropped `u`). With
                 // nothing below (`? - &x` / `: v`) the item is null and takes that path as before.
                 let mut value_on_a_later_line = false;
-                if matches!(self.peek(), Some(b'&' | b'!'))
+                // #6580: a dash alone on its line with a value below (`? -` / `   x`, `? -` /
+                // `   &x` / `   x`) is the same item as an ordinary one reads: its value is the
+                // node on the lines below, not a null item followed by a second one. The item
+                // stays open for the main loop, and its comments are placed by the one routine
+                // an ordinary item uses.
+                if self.at_line_end() {
+                    let value_is_null = self
+                        .next_line_settles_value_is_null(seq_indent)
+                        .unwrap_or_else(|| self.following_value_is_null(seq_indent));
+                    if !value_is_null {
+                        self.defer_item_value_to_later_lines(seq_indent, false, item_wrapper_bp);
+                        value_on_a_later_line = true;
+                    }
+                }
+                if !value_on_a_later_line
+                    && matches!(self.peek(), Some(b'&' | b'!'))
                     && !self.node_properties_prefix_mapping_entry()
                 {
                     let properties_start = self.pos;
@@ -10078,7 +10109,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let Some(scalar) = ended else {
             return false;
         };
-        if self.type_stack.len() <= 1 || self.pending_explicit_key.is_some() {
+        // The key's own plain scalar is judged by `line_is_stray_after_an_explicit_key_scalar`,
+        // not here. A scalar inside a container the key opened (`? - a` / `    # c` / `    x`,
+        // `? - - a`, `? - k: a`) is an item or a value like any other, and a line left over after
+        // it is stray in the same way (#6580).
+        let inside_key_container = self
+            .pending_explicit_key
+            .is_some_and(|owner_depth| self.indent_stack.len() > owner_depth);
+        if self.type_stack.len() <= 1
+            || (self.pending_explicit_key.is_some() && !inside_key_container)
+        {
             return false;
         }
         if !bare_scalar && indent <= scalar.owner {
