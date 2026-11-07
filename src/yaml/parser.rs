@@ -9894,14 +9894,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// Whether the nearest earlier line that is neither blank nor a comment leaves its value for
     /// the next line: a key written up to its colon (`a:`, `- k:`), with node properties after
-    /// the colon or not (`a: &x`, #4947), or a bare `-`, a trailing comment aside. The only place
+    /// the colon or not (`a: &x`, #4947), or a dash with nothing after it but node properties and a
+    /// comment (`-`, `- -`, `- &x`, #6550). The only place
     /// a block scalar header on a line of its own can belong (#4259); a header anywhere else is
     /// not a value slot and keeps the path it always took.
     fn previous_content_line_defers_its_value(&self) -> bool {
-        self.previous_content_line().is_some_and(|(_, rest)| {
+        self.previous_content_line().is_some_and(|(lead, rest)| {
             line_ends_with_colon_before_comment(rest)
                 || line_ends_with_colon_after_properties(rest)
-                || (rest[0] == b'-' && line_is_bare_dash_before_comment(rest))
+                || Self::deferred_value_owner(lead, rest).is_some_and(|(_, is_dash)| is_dash)
         })
     }
 
@@ -10841,16 +10842,6 @@ pub(crate) fn split_trailing_properties(line: &[u8]) -> (&[u8], &[u8]) {
 /// (#4530).
 fn line_ends_with_colon_after_properties(line: &[u8]) -> bool {
     split_trailing_properties(line).0.last() == Some(&b':')
-}
-
-/// Whether `line` (already without its leading spaces) is a `-` and nothing else, a trailing
-/// comment aside.
-fn line_is_bare_dash_before_comment(line: &[u8]) -> bool {
-    line.first() == Some(&b'-')
-        && line[1..]
-            .iter()
-            .find(|&&b| !matches!(b, b' ' | b'\t'))
-            .map_or(true, |&b| b == b'#')
 }
 
 /// Whether `rest` starts a `%YAML` directive line, which yq's header slurp sets aside in the head of a
