@@ -92,3 +92,49 @@ fn raw_input_stops_after_the_first_line_past_a_missing_file_6464() -> Result<()>
     }
     Ok(())
 }
+
+/// Slurp and `-e` over a missing file, rows from jq 1.7.1, and the residual the limitations page
+/// records: a second missing file that jq never reaches is still reported up front.
+#[test]
+fn raw_input_with_a_missing_file_under_slurp_and_exit_status_6464() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    let (gone, gone2, lines, other) = (
+        path("gone.txt"),
+        path("gone2.txt"),
+        path("lines.txt"),
+        path("other.txt"),
+    );
+    std::fs::write(&lines, "line1\nline2\n\nline4")?;
+    std::fs::write(&other, "x\ny\n")?;
+    for (flags, expected) in [
+        (&["-Rs"][..], "\"line1\\nline2\\n\\nline4\"\n"),
+        (&["-R", "-e"], "\"line1\"\n"),
+    ] {
+        let mut args = flags.to_vec();
+        args.extend([".", gone.as_str(), lines.as_str()]);
+        let (out, err, code) = run_jq_full(&args, None)?;
+        assert_eq!(
+            (out.as_str(), code),
+            (expected, 2),
+            "{flags:?} stderr: {err:?}"
+        );
+    }
+    let args = [
+        "-R",
+        ".",
+        lines.as_str(),
+        gone.as_str(),
+        other.as_str(),
+        gone2.as_str(),
+        lines.as_str(),
+    ];
+    let (out, err, code) = run_jq_full(&args, None)?;
+    assert_eq!(
+        (out.as_str(), code),
+        ("\"line1\"\n\"line2\"\n\"\"\n\"line4x\"\n", 2)
+    );
+    // jq reports `gone.txt` only. Both are reported here, up front.
+    assert_eq!(err.matches("Could not open file").count(), 2, "{err:?}");
+    Ok(())
+}
