@@ -9848,6 +9848,32 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         })
     }
 
+    /// Whether the line above leaves its value to a key (`- k:`, `- - k: &y`) that stands to the
+    /// right of `indent` (#6540): a block scalar header on a line of its own there is left of the
+    /// key it would be the value of, so it is no value slot. yq refuses it with `did not find
+    /// expected '-' indicator`; a header at the key's own column (`- k:` / `  |`) or to its right
+    /// is the key's value. The key's column is the line's indent plus the `- ` markers it opens
+    /// with, as [`Self::previous_content_line_defers_a_value_at`] reads it; a bare dash owns its
+    /// header by [`Self::dash_above_owns_header_at`], and an explicit `?` line is not judged.
+    fn header_is_left_of_the_deferring_key(&self, indent: usize) -> bool {
+        let Some((lead, rest)) = self.previous_content_line() else {
+            return false;
+        };
+        let mut marker_len = 0;
+        while rest.get(marker_len) == Some(&b'-')
+            && Self::is_ws_break_or_eoi(rest.get(marker_len + 1).copied())
+        {
+            marker_len += 1;
+            while matches!(rest.get(marker_len), Some(b' ' | b'\t')) {
+                marker_len += 1;
+            }
+        }
+        let key = &rest[marker_len..];
+        indent < lead + marker_len
+            && (line_ends_with_colon_before_comment(key)
+                || line_ends_with_colon_after_properties(key))
+    }
+
     /// Whether the line above the cursor's that leaves its value for the lines below is a dash (`-`,
     /// `- &x`, a chain of them) at column `indent`: a block scalar header at that column is its
     /// value (#6390), where a header deeper than it always was.
@@ -10542,6 +10568,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     && (self.previous_content_line_defers_its_value()
                         || self.dash_above_owns_header_at(indent)) =>
             {
+                if self.header_is_left_of_the_deferring_key(indent) {
+                    return Err(
+                        self.err_unexpected_char(self.pos, "did not find expected '-' indicator")
+                    );
+                }
                 self.check_mapping_under_mapping_gap(indent)?;
                 // #6390: a header at the column of the bare `-` above is that item's value, so the
                 // item stays open for it (`-` / `|` / `  t` is `["t\n"]`).
