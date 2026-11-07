@@ -5896,15 +5896,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // #5498: `--stream` and `--stream-errors` read as the program asks. The end of the
                 // stream is settled when the reader reaches it.
                 debug_assert_eq!(locations.per_value(), &[]);
-                jq::seed_remaining_inputs_from(end_producer_at(
-                    locations.unopened_end(),
-                    stream_reader_producer(lazy),
-                ));
-                if locations.unopened_tail {
-                    jq::hold_reads_past_end();
-                } else {
-                    jq::count_reads_past_end();
-                }
+                // #6480: the reader settles its own end at the last file that opened, which a
+                // missing last file does not move yet.
+                jq::seed_remaining_inputs_from(stream_reader_producer(lazy));
+                jq::count_reads_past_end();
             } else {
                 seed_input_queue(
                     args.slurp,
