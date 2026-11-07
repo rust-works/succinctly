@@ -6075,6 +6075,9 @@ A block scalar whose `|`/`>` header is on a line of its own below the owning `-`
 front of the header on that line (`&x |`, `!!str >`), or on a line of their own above it (`&x` / `|`;
 [#4271](https://github.com/rust-works/succinctly/issues/4271)). A comment after properties that stand
 alone (`&x # c` / `|`) still reads wrong, as it did before.
+An explicit indentation indicator on such a header is measured from the key's own column below a compact key too, with a property after the colon or without (`- k: &y` / `  >2` / `    t` is `[{"k":"t\n"}]`, as in yq; [#6490](https://github.com/rust-works/succinctly/issues/6490)).
+One shape is still read where yq refuses it: a header at the column of an inner dash of a nested compact key (`- - k:` / `  |` / `    t`, [#6540](https://github.com/rust-works/succinctly/issues/6540)).
+yq answers `did not find expected '-' indicator` there, and `succinctly yq` reads an empty item beside a key with a null value.
 
 Four known gaps this write shares with every other write form, none specific to #798:
 

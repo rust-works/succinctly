@@ -6410,11 +6410,27 @@ impl<'a> YamlString<'a> {
                     .position(|b| !matches!(b, b' ' | b'\t'))
                     .map(|i| (i, &rest[1 + i..]));
                 return Some(match after {
-                    // A key whose value is deferred (`- k:`, comment aside): the key's own column.
+                    // A key whose value is deferred (`- k:`, `- k: &y`, comment aside): the key's own
+                    // column. Node properties after the colon belong to the value below (#6490),
+                    // and so does a key behind more dashes (`- - k:`).
                     Some((gap, content))
-                        if crate::yaml::parser::line_ends_with_colon_before_comment(content) =>
+                        if crate::yaml::parser::line_ends_with_colon_before_comment(
+                            crate::yaml::parser::split_trailing_properties(content).0,
+                        ) =>
                     {
-                        indent + 1 + gap
+                        let mut column = indent + 1 + gap;
+                        let mut content = content;
+                        while content.first() == Some(&b'-')
+                            && matches!(content.get(1), Some(b' ' | b'\t'))
+                        {
+                            let gap = content[1..]
+                                .iter()
+                                .position(|b| !matches!(b, b' ' | b'\t'))
+                                .unwrap_or(content.len() - 1);
+                            column += 1 + gap;
+                            content = &content[1 + gap..];
+                        }
+                        column
                     }
                     _ => indent,
                 });
