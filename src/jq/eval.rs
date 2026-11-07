@@ -14019,7 +14019,17 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
                 value = match eval_owned_fast_path::<S>(stage, &value, false) {
                     Some(Ok(Some(next))) => next,
                     Some(_) => return None,
-                    None => closed_unary_builtin::<S>(stage, &value)?,
+                    None => match closed_unary_builtin::<S>(stage, &value) {
+                        Some(next) => next,
+                        // #5712: a comparison, a boolean or a `try` over a string's length
+                        // (`$t | length > 3`), or its prefix test, is read off the string: the
+                        // answer is a fresh integer, boolean or `null`, never a node of it.
+                        // jq mode only, like `closed_unary_builtin`.
+                        None if S::TAG == EvalTag::Jq => {
+                            eval_owned_string_door::<S>(unwrap_paren(stage), &value)?
+                        }
+                        None => return None,
+                    },
                 };
             }
             Some(value)
@@ -88170,6 +88180,16 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(None) => QueryResult::None,
             Err(e) => e.into(),
         };
+    }
+    // #5712: an expression that never reads `.` is one value whatever the input is, as the lazy
+    // twin [`eval_each_owned`] answers it. Without this a stage that closes over a bound value
+    // (`. as $t | [range(25) | ($t | length)]`, where `$t` is a computed string or array) wrote
+    // the input out and indexed it again to evaluate a stage that never reads it, once per round:
+    // 1.8 s against 0.17 s over a 6.6 MB string. jq mode only, as the lazy twin's is.
+    if S::TAG == EvalTag::Jq {
+        if let Some(value) = eval_owned_closed::<S>(expr) {
+            return QueryResult::Owned(value);
+        }
     }
     // #3180: the relocating fold and the embed peel, as in the lazy twin
     // [`eval_each_owned`]. An eager caller -- an array constructor's
