@@ -7771,6 +7771,19 @@ Only a pattern whose syntax tree the parser cannot read keeps the crate's readin
 A pattern `fancy-regex` refuses keeps the match of the crate: `"aa\n" | [match("(?m)^a+a*a+\\n?^";"g")]` is `[]` in jq and one match here, because `a+a*a+` is the shape `fancy-regex` answers wrongly (the entry on two greedy `X+` repeats above).
 Pinned by `tests/jq_cli/i6456.rs` (119 rows read from jq 1.7.1, and 15 for a repeated group name) and, for yq, `tests/yq_cli/i6456.rs`; a differential of 333 subject and pattern pairs, 159 of which differed before, agrees.
 
+### A look-behind before an end anchor, on a search Oniguruma starts at the end (#6510)
+
+jq 1.7.1's Oniguruma searches a pattern that matches only the empty string, and whose right edge is `\z` (or `$`/`\Z` on a text with no final newline), at the end of the text alone (`search_in_range`, `regexec.c`).
+That search is a backward one, and it lets a look-behind read only one character past where the search began.
+A look-behind that consumes a character therefore never holds there once two characters follow the search's start: `"ab" | test("(?<=b)\\z")` is `false` in jq, `"ab" | test("(?<!b)\\z")` is `true`, and `"b" | test("(?<=b)\\z")` is `true`.
+`onig_end_search` reads that condition off the pattern and answers such a search with the pattern as that search reads it: a consuming look-behind becomes a group that never matches, a negative one a group that always does, and the groups keep their numbers.
+The anchor at the right edge is Oniguruma's (`optimize_nodes`, `regcomp.c`): it carries across items that consume nothing and out of a group, an alternation keeps it only when every way has it, and a lookahead passes on none, so `(?<=b)(?=\z)`, `(?<=b)\z|x` and `(?<=b)(?:\z|\Z)` match `"ab"` at offset 2 in both.
+Still read as written: a pattern under the `x` flag or `(?x)`, one with a quantifier on an item that consumes nothing, and one holding `\K`, `\Q`, a call, a conditional or an absent group, none of which the reader follows; and a pattern the `fancy-regex` build of the rewrite refuses.
+A look-behind whose body can match the empty string on some way (`(?<=b|)`, `(?<=b|c?)`) is an empty node to Oniguruma (`tune_look_behind`), which holds on either search, and is left as written.
+Five draws of `scripts/jq-regex-end-lookbehind-sweep.py` (seeds 1-5, 1,282-1,328 patterns each over ten texts, empty ways among the bodies) against the branch's base fixed 82-112 patterns each and broke none.
+What still differs in those draws is jq's search one byte after an empty match before a multibyte character (#6326), and `$(?m)`, whose `$` this build no longer reads before a final newline (`"ab\n" | [match("$(?m)";"g") | .offset]` is `[2,3]` in jq and `[3]` here, as before this change, #6517), and the groups of a look-behind that can match empty, which jq never sets (#6519).
+Pinned by `tests/jq_cli/i6510.rs`.
+
 ### A group repeated `{0}` keeps its capture entry (#6108)
 
 Oniguruma numbers a group repeated zero times (`{0}`, `{0,0}`), so jq reports an entry for it: offset `-1` and string `null`, or an empty string at the match offset when the whole match is empty.
