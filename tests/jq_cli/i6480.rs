@@ -5,26 +5,12 @@
 //! that read without the report, so the run ended in the fault and exited 5, or 0 under `try`.
 //! Every row was captured from jq 1.7.1.
 //!
-//! The `(at ...)` marker of the fault names the file that did not open in jq and the last one
-//! that did here, which is the rest of #6480 (its plan's step 5); the rows mask it.
+//! The `(at ...)` marker of the fault names the last file named, at line 0: jq's reader is there
+//! when its parser gives up (#6480's step 5).
 
 use anyhow::Result;
 
 use crate::run_jq_full;
-
-/// The marker `jq: error (at <file>:<line>):` with its location replaced by `@AT@`.
-fn mask_location(stderr: &str) -> String {
-    stderr
-        .lines()
-        .map(|line| match (line.find("(at "), line.find("): ")) {
-            (Some(open), Some(close)) if open < close => {
-                format!("{}(at @AT@{}", &line[..open], &line[close..])
-            }
-            _ => line.to_string(),
-        })
-        .map(|line| line + "\n")
-        .collect()
-}
 
 #[test]
 fn a_fault_at_the_end_of_the_text_reports_the_files_after_it_under_null_input_6480() -> Result<()> {
@@ -186,9 +172,11 @@ fn a_fault_at_the_end_of_the_text_reports_the_files_after_it_under_null_input_64
         let mut args = vec!["-c", "-n", program];
         args.extend(paths.iter().map(String::as_str));
         let (out, err, code) = run_jq_full(&args, None)?;
-        let expected_err = stderr.replace("@DIR@", &d);
+        // The fault is raised at the last file named, line 0.
+        let at = format!("{}:0", paths.last().map_or("", String::as_str));
+        let expected_err = stderr.replace("@AT@", &at).replace("@DIR@", &d);
         assert_eq!(
-            (out.as_str(), mask_location(&err).as_str(), code),
+            (out.as_str(), err.as_str(), code),
             (stdout, expected_err.as_str(), status),
             "{program} {names:?}"
         );

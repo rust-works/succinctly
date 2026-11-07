@@ -6095,8 +6095,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             > = match raw_lines {
                 Some(files) => {
                     // #6480: a last line with no newline is read at a last file that did not open.
-                    let mut lines = last_document_at(
+                    let mut lines = last_item_at(
                         locations.last_value_end(),
+                        None,
                         lazy_raw_producer(files, None),
                     );
                     let locations = &locations;
@@ -6560,24 +6561,45 @@ fn end_producer_at(end: Option<(u32, u32)>, mut producer: jq::InputProducer) -> 
     }
 }
 
-/// `producer`, with its last document placed at `end` (#6480): a value that completes only at the
-/// end of the input, whose last file did not open. It reads one item ahead to know a document is
-/// the last, which a parse error after it is not.
-fn last_document_at(end: Option<(u32, u32)>, mut producer: jq::InputProducer) -> jq::InputProducer {
-    let Some(end) = end else { return producer };
+/// `producer`, with its last item placed at a last file that did not open (#6480): the last
+/// document at `document_end`, a value that completes only at the end of the input, and the last
+/// parse error at `fault_end`, a fault at the end of the text. It reads one item ahead to know an
+/// item is the last.
+fn last_item_at(
+    document_end: Option<(u32, u32)>,
+    fault_end: Option<(u32, u32)>,
+    mut producer: jq::InputProducer,
+) -> jq::InputProducer {
+    if document_end.is_none() && fault_end.is_none() {
+        return producer;
+    }
     let mut ahead: Option<jq::ProducedInput> = None;
     Box::new(move || {
         let item = ahead.take().unwrap_or_else(&mut producer);
-        let jq::ProducedInput::Document(value, source, line) = item else {
-            return item;
+        // Whether the item just read is the last: the next is the end. Asked only of an item that
+        // would be placed.
+        let mut is_last = |ahead: &mut Option<jq::ProducedInput>| {
+            let next = producer();
+            let last = matches!(next, jq::ProducedInput::End(_));
+            *ahead = Some(next);
+            last
         };
-        let next = producer();
-        let last = matches!(next, jq::ProducedInput::End(_));
-        ahead = Some(next);
-        if last {
-            jq::ProducedInput::Document(value, end.0, end.1)
-        } else {
-            jq::ProducedInput::Document(value, source, line)
+        match item {
+            jq::ProducedInput::Document(value, source, line) => {
+                let (source, line) = match document_end {
+                    Some(end) if is_last(&mut ahead) => end,
+                    _ => (source, line),
+                };
+                jq::ProducedInput::Document(value, source, line)
+            }
+            jq::ProducedInput::Error(error, at) => {
+                let at = match fault_end {
+                    Some(end) if is_last(&mut ahead) => end,
+                    _ => at,
+                };
+                jq::ProducedInput::Error(error, at)
+            }
+            end => end,
         }
     })
 }
@@ -6597,7 +6619,21 @@ fn take_unopened_tail(locations: &mut InputLocations) {
     if let Some(name) = UNOPENED_TAIL_NAME.with(|tail| tail.borrow_mut().take()) {
         locations.end_at_unopened_tail(name);
         locations.last_value_at_tail = LAST_VALUE_AT_TAIL.with(|at| at.replace(false));
+        locations.fault_at_tail = FAULT_AT_TAIL.with(|at| at.replace(false));
     }
+}
+
+/// Whether the first fault of the JSON text the files `raws` make is at its end (#6480): `[1,`
+/// waits for more, so jq's parser asks the reader past the last file before it gives up, and the
+/// fault is raised there. `--seq` and the streaming readers raise their own faults.
+fn fault_reaches_end(raws: &[Vec<u8>], args: &JqCommand) -> bool {
+    !(args.raw_input
+        || args.seq
+        || args.stream
+        || args.stream_errors
+        || args.input_dsv.is_some()
+        || args.validate)
+        && matches!(first_stream_fault(raws), Some((_, true)))
 }
 
 /// Whether the last value of the text the files `raws` make completes only at its end (#6480): a
@@ -6634,6 +6670,7 @@ fn read_inputs(
     LAZY_OPEN_FAILED.with(|seen| seen.set(false));
     UNOPENED_TAIL_NAME.with(|tail| *tail.borrow_mut() = None);
     LAST_VALUE_AT_TAIL.with(|at| at.set(false));
+    FAULT_AT_TAIL.with(|at| at.set(false));
     // Null input mode: use null as the single input -- unless the filter
     // itself uses `input`/`inputs`/`input_line_number` (#723), in which case
     // the caller passes `force_read_under_null_input: true` to fall through
@@ -6756,6 +6793,7 @@ fn read_inputs(
         if let Some(name) = unopened_tail_name(&failures, files.len()) {
             UNOPENED_TAIL_NAME.with(|tail| *tail.borrow_mut() = Some(name));
             LAST_VALUE_AT_TAIL.with(|at| at.set(last_value_reaches_end(&raws, args)));
+            FAULT_AT_TAIL.with(|at| at.set(fault_reaches_end(&raws, args)));
         }
         any_open_failure = !failures.is_empty();
         if let Some(&(at, _)) = failures.first() {
@@ -8163,6 +8201,9 @@ pub struct InputLocations {
     /// Whether the last value completes only at the end of the input, and so is read at that
     /// file, line 0 (#6480): [`last_value_reaches_end`].
     last_value_at_tail: bool,
+    /// Whether the text's first fault is at its end, after jq's reader asked past the last file,
+    /// and so is raised at that file, line 0 (#6480).
+    fault_at_tail: bool,
 }
 
 /// How an input stream ends, which decides jq's `(at ...)` marker once every
@@ -8393,6 +8434,7 @@ impl InputLocations {
             eof_tail: None,
             unopened_tail: false,
             last_value_at_tail: false,
+            fault_at_tail: false,
         }
     }
 
@@ -8415,6 +8457,12 @@ impl InputLocations {
     /// file did not open (#6480): [`unopened_end`](Self::unopened_end).
     fn last_value_end(&self) -> Option<(u32, u32)> {
         self.unopened_end().filter(|_| self.last_value_at_tail)
+    }
+
+    /// Where a fault at the end of the text is raised when the last file did not open (#6480):
+    /// [`unopened_end`](Self::unopened_end).
+    fn fault_end(&self) -> Option<(u32, u32)> {
+        self.unopened_end().filter(|_| self.fault_at_tail)
     }
 
     /// Has the reads past the end move on from it as jq's do (#4303), where the stream's own end
@@ -8816,6 +8864,8 @@ thread_local! {
     /// Whether the last value of the text completes only at its end (#6480), for
     /// [`take_unopened_tail`] to hand to the locations with the name above.
     static LAST_VALUE_AT_TAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the text's first fault is at its end (#6480), for [`take_unopened_tail`].
+    static FAULT_AT_TAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Whether the first fault of the text is at its end (#6480): the read of that fault sent
     /// jq's reader past the last file, so it reaches every pending failure.
     static FAULT_ENDS_TEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -11456,8 +11506,9 @@ fn seed_input_queue(
         debug_assert!(inputs.is_empty() && trailing_error.is_none() && resumed_errors.is_empty());
         jq::seed_remaining_inputs_from(end_producer_at(
             locations.unopened_end(),
-            last_document_at(
+            last_item_at(
                 locations.last_value_end(),
+                None,
                 lazy_raw_producer(files, locations.exhausted(slurp)),
             ),
         ));
@@ -11471,8 +11522,9 @@ fn seed_input_queue(
         let tail = lazy_tail_items(inputs, locations, trailing_error, resumed_errors);
         jq::seed_remaining_inputs_from(end_producer_at(
             locations.unopened_end(),
-            last_document_at(
+            last_item_at(
                 locations.last_value_end(),
+                locations.fault_end(),
                 lazy_json_producer_then(lazy, Box::new(tail), locations.exhausted(slurp)),
             ),
         ));
@@ -11515,7 +11567,13 @@ fn seed_input_queue(
             // parse error like any other, where the materializer's
             // own error is tagged as an uncatchable decode failure.
             .map(|(before, t)| (before, EvalError::new(t.error.message), (t.source, t.line)))
-            .collect();
+            .collect::<Vec<_>>();
+        // #6480: a fault at the end of the text, raised at a last file that did not open. It is
+        // the text's first fault, and so the only one.
+        let mut errors = errors;
+        if let (Some(end), Some(last)) = (locations.fault_end(), errors.last_mut()) {
+            last.2 = end;
+        }
         jq::seed_remaining_inputs_with_errors(queue, locations.exhausted(slurp), errors);
         // #4303: where the stream's own end was recorded, reads past it
         // move on from it as jq's do. A slurp read the whole stream to build its one value, so
