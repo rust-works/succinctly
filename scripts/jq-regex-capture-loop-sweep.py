@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Differential sweep for #6310 and #6332: a capture group inside a loop's body.
 
-    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert | --bounded | --paired | --fancy] [--newlines [--multiline]] [--blanks] [--flags g] [--jq /usr/bin/jq]
+    scripts/jq-regex-capture-loop-sweep.py SUBJECT BASELINE [--count 5000] [--seed 2] [--nest | --ways | --assert | --bounded | --paired | --fancy | --lazyrun] [--newlines [--multiline]] [--blanks] [--flags g] [--jq /usr/bin/jq]
 
 Oniguruma ends a greedy loop at the first iteration that matches nothing (#6106), and that holds when the
 body has a capture group: after its empty way (`(?:b*|(a))+`, #6310), or before it, in it, or with its own
@@ -20,7 +20,9 @@ in the middle; `--newlines` runs it on subjects that hold a newline instead, and
 them line anchors. `--fancy` (#6358) draws the plain loops with a lookaround or an atomic group beside them, outside the repeat, so
 that they run on `fancy-regex`. `--bounded` (#6428, #6427) draws a lazy repeat that may run once or not at all (`{0,n}?`, `{1,n}?`, `*?`, `+?`) over anchors, flag switches and loops of its own, beside another loop or
 inside a repeat. `--paired` (#6469) draws two such lazy repeats, each over ways that hold loops with groups, beside each other,
-in alternation or one nested in the other, which is what tells a pattern-wide reading from one per repeat. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
+in alternation or one nested in the other, which is what tells a pattern-wide reading from one per repeat.
+`--lazyrun` (#6460) draws a lazy repeat that can match nothing between a greedy `X+` or `X*` and a greedy `X*` or `X+` of the same
+expression, under a lookaround, a repeat or a group, the shape `fancy-regex` merges into a greedy one. Each runs on ten strings under `g`, in one process per binary, and the match offsets, strings and
 captures are compared. It prints how many patterns SUBJECT fixed (BASELINE differed from jq, SUBJECT does
 not), broke (the reverse) and still differs on, and exits 1 when it broke one.
 
@@ -207,6 +209,29 @@ def fancy_patterns(count, rng):
     return sorted(out)[:count]
 
 
+# `--lazyrun` (#6460): X+ M*? X* with X the same expression on both sides.
+LAZY_X = ["b", "a", r"\w", "[ab]", "(?:ab)", "(b)", "(a|b)"]
+LAZY_M = ["a", "b", "(?:xa)", "c", r"\w", "[ac]", "(a)", "(?:a|c)"]
+LAZY_Q = ["*?", "??", "{0,2}?", "{0,3}?"]
+LAZY_PRE = ["(?=b)", "(?!c)", "(?<=b)", "(?>b)"]
+
+
+def lazyrun_patterns(count, rng):
+    out = set()
+    for x in LAZY_X:
+        for m in LAZY_M:
+            for q in LAZY_Q:
+                for left in "+*":
+                    for right in "*+":
+                        core = "%s%s%s%s%s%s" % (x, left, m, q, x, right)
+                        pre = rng.choice(LAZY_PRE)
+                        out.add(pre + core)
+                        out.add(pre + "(?:%s)%s" % (core, rng.choice(["*", "+", "{2}", "{1,2}"])))
+                        out.add(pre + "(%s)" % core)
+                        out.add(pre + core + rng.choice(["c", "$", "(?=b)"]))
+    return sorted(out)[:count]
+
+
 def run(cmd, plist, flags="g", prog=PROGRAM):
     r = subprocess.run(cmd + ["-c", "--arg", "flags", flags, prog], input=json.dumps(plist),
                        capture_output=True, text=True)
@@ -241,6 +266,7 @@ def main():
     shape.add_argument("--bounded", action="store_true", help="a lazy repeat, most with a minimum under two, over anchors, switches and loops")
     shape.add_argument("--paired", action="store_true", help="two lazy repeats beside, in alternation with or nested in each other")
     shape.add_argument("--fancy", action="store_true", help="a lookaround or atomic group beside the loop")
+    shape.add_argument("--lazyrun", action="store_true", help="a lazy repeat between two greedy repeats of one expression")
     ap.add_argument("--newlines", action="store_true", help="with --assert: subjects that hold a newline")
     ap.add_argument("--multiline", action="store_true",
                     help="with --assert --newlines: `(?m)` before every pattern, under which `^` and `$` hold at every line (#6425)")
@@ -265,11 +291,13 @@ def main():
         plist, prog = paired_patterns(args.count, rng), program(PAIRED_SUBJECTS)
     elif args.fancy:
         plist, prog = fancy_patterns(args.count, rng), PROGRAM
+    elif args.lazyrun:
+        plist, prog = lazyrun_patterns(args.count, rng), PROGRAM
     else:
         plist = ways_patterns(args.count, rng) if args.ways else patterns(args.count, rng, args.nest)
         prog = PROGRAM
     if args.blanks:
-        if args.anchors or args.fancy or args.paired:
+        if args.anchors or args.fancy or args.paired or args.lazyrun:
             ap.error("--blanks applies to the plain, --nest and --ways draws")
         plist, prog = blanked(plist), program(BLANK_SUBJECTS)
     ref = answers([args.jq], plist, args.flags, prog)
