@@ -5089,19 +5089,23 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// the `- ` markers it opens with.
     fn deferred_value_owner(lead: usize, rest: &[u8]) -> Option<(usize, bool)> {
         let mut marker_len = 0;
-        let mut last_dash = None;
-        while rest.get(marker_len) == Some(&b'-')
+        let mut last_marker = None;
+        // The markers a line opens with: `- `, and an explicit key's `? ` and `: ` (#6565), so a
+        // dash after one (`: - &x`) is the owner it is after a dash.
+        while rest
+            .get(marker_len)
+            .is_some_and(|&b| matches!(b, b'-' | b'?' | b':'))
             && Self::is_ws_break_or_eoi(rest.get(marker_len + 1).copied())
         {
-            last_dash = Some(lead + marker_len);
+            last_marker = Some((lead + marker_len, rest[marker_len] == b'-'));
             marker_len += 1;
             while matches!(rest.get(marker_len), Some(b' ' | b'\t')) {
                 marker_len += 1;
             }
         }
         let tail = &rest[marker_len..];
-        match last_dash {
-            Some(column) if only_node_properties(tail) => Some((column, true)),
+        match last_marker {
+            Some((column, true)) if only_node_properties(tail) => Some((column, true)),
             _ => line_ends_with_colon_after_properties(tail).then_some((lead + marker_len, false)),
         }
     }
