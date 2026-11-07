@@ -92417,7 +92417,40 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                                     }
                                     None => (hoisted, Reentry::Proven),
                                 };
-                            eval_each_owned::<S>(ext_expr, &update_val, optional, reentry, sink)
+                            // #6581: a constructor EXTRACT around the state (`[$i, .]`,
+                            // `{i: $i, s: .}`) is built on the owned tree, as an UPDATE of the
+                            // same shape is (#5875, #6528), instead of on the generic route,
+                            // where every read of `.` inside it re-indexes the state. The state
+                            // is one `Rc` clone for a container: it is this step's output and
+                            // the next step's accumulator at once, as the implicit-identity arm
+                            // below already has it. A constructor the step declines (a member
+                            // outside its shapes, the embed table live, yq mode) is untouched
+                            // and runs as before.
+                            let by_value = if matches!(
+                                unwrap_paren(ext_expr),
+                                Expr::Array(_) | Expr::Object(_)
+                            ) {
+                                Some(owned_constructor_step::<S>(ext_expr, update_val.clone()))
+                            } else {
+                                None
+                            };
+                            match by_value {
+                                Some(Ok(OwnedStep::Handled(Ok(value)))) => match sink(value) {
+                                    Demand::Continue => Flow::Exhausted,
+                                    Demand::Stop => Flow::Stopped { pending: None },
+                                },
+                                Some(Ok(OwnedStep::Handled(Err(_)))) if optional => Flow::Exhausted,
+                                Some(Ok(OwnedStep::Handled(Err(error)))) => {
+                                    Flow::Escaped(Control::Error(error))
+                                }
+                                _ => eval_each_owned::<S>(
+                                    ext_expr,
+                                    &update_val,
+                                    optional,
+                                    reentry,
+                                    sink,
+                                ),
+                            }
                         }
                         // EXTRACT omitted is EXTRACT `.` (jq desugars `foreach f as
                         // $x (init; update)` to `(init; update; .)`), so the push
