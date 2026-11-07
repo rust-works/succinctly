@@ -232,8 +232,8 @@ fn a_line_from_a_slow_producer_is_answered_before_the_next_one_arrives_5498() ->
     Ok(())
 }
 
-/// A file that does not open, or opens and cannot be read (a directory), is reported when the files
-/// are checked, as it was when each was read whole (#5472); the others are read.
+/// A file that does not open is reported when the files are checked and left out, as it was when each
+/// was read whole (#5472); a directory opens, fails its read and is said so (#6472); the others are read.
 #[test]
 fn an_unreadable_file_is_reported_and_left_out_of_the_chunked_read_5498() -> Result<()> {
     let dir = tempfile::tempdir()?;

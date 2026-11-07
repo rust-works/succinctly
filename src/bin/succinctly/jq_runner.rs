@@ -8542,7 +8542,7 @@ fn open_chunked_inputs(files: &[PathBuf], open_failed: &mut bool) -> Result<Chun
         }
         let probed = std::fs::File::open(path)
             .and_then(|mut file| read_head(&mut file))
-            .map_err(|e| InputFileOpenError::from_io(path, &e));
+            .map_err(|e| InputFileOpenError::from_io(path, &e, at + 1 == files.len()));
         match probed {
             Ok(head) => {
                 let skip = bom_to_skip(&head, &mut look_for_bom);
@@ -8560,7 +8560,7 @@ fn open_chunked_inputs(files: &[PathBuf], open_failed: &mut bool) -> Result<Chun
                 opened.push(path.clone());
                 openers.push(Box::new(|| Ok(Box::new(std::io::Cursor::new(Vec::new())))));
                 note_open_failure_at(opened.len());
-                report_unopenable_input(&e.at_end(at + 1 == files.len()), open_failed);
+                report_unopenable_input(&e, open_failed);
             }
             Err(e) => {
                 note_open_failure_at(opened.len());
@@ -8649,8 +8649,8 @@ fn input_display_name(path: &Path) -> String {
 /// (via [`report_unopenable_input`])
 /// rather than letting it escape as `Error: .../Caused by:` at exit 1
 /// (#3098).
-fn read_file_bytes(path: &Path) -> std::result::Result<Vec<u8>, InputFileOpenError> {
-    std::fs::read(path).map_err(|e| InputFileOpenError::from_io(path, &e))
+fn read_file_bytes(path: &Path, last: bool) -> std::result::Result<Vec<u8>, InputFileOpenError> {
+    std::fs::read(path).map_err(|e| InputFileOpenError::from_io(path, &e, last))
 }
 
 /// Skip the UTF-8 byte-order mark at the front of the JSON input stream (#5291).
@@ -8719,11 +8719,12 @@ impl InputFileOpenError {
         }
     }
 
-    /// The failure of `error` on `path`: a directory when the read said so (#6472).
-    fn from_io(path: &Path, error: &std::io::Error) -> Self {
+    /// The failure of `error` on `path`, which is the last file given when `last`: a directory
+    /// when the read said so (#6472).
+    fn from_io(path: &Path, error: &std::io::Error, last: bool) -> Self {
         let mut failure = Self::new(path, strerror_only(error));
         if error.raw_os_error() == Some(EISDIR) {
-            failure.kind = InputFileErrorKind::Directory { last: false };
+            failure.kind = InputFileErrorKind::Directory { last };
         }
         failure
     }
@@ -8731,14 +8732,6 @@ impl InputFileOpenError {
     /// Whether the file is a directory: it opened, and is a source of no bytes (#6472).
     fn is_directory(&self) -> bool {
         matches!(self.kind, InputFileErrorKind::Directory { .. })
-    }
-
-    /// A directory failure that `last` says is the last file given (#6472).
-    fn at_end(mut self, last: bool) -> Self {
-        if self.is_directory() {
-            self.kind = InputFileErrorKind::Directory { last };
-        }
-        self
     }
 }
 
@@ -8805,7 +8798,7 @@ fn read_input_files(files: &[PathBuf]) -> (Vec<PathBuf>, Vec<Vec<u8>>, OpenFailu
                 Ok(Vec::new())
             }
         } else {
-            read_file_bytes(path)
+            read_file_bytes(path, at + 1 == files.len())
         };
         match read {
             Ok(raw) => {
@@ -8817,7 +8810,7 @@ fn read_input_files(files: &[PathBuf]) -> (Vec<PathBuf>, Vec<Vec<u8>>, OpenFailu
             Err(e) if e.is_directory() => {
                 opened.push(path.clone());
                 raws.push(Vec::new());
-                failures.push((opened.len(), e.at_end(at + 1 == files.len())));
+                failures.push((opened.len(), e));
             }
             Err(e) => failures.push((opened.len(), e)),
         }
