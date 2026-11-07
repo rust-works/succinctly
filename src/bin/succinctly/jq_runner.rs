@@ -5421,6 +5421,15 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         jq_stream_position(&raw_inputs, idx, start)
                     })
                 {
+                    // #6465: that position and column are counted over the substituted text; where
+                    // the substitution changed the stream, jq's parser read the originals.
+                    let message = originals
+                        .iter()
+                        .any(Option::is_some)
+                        .then(|| jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0))
+                        .flatten()
+                        .filter(|read| jq::is_jq_depth_fault(read))
+                        .unwrap_or(message);
                     sink.report_parse_error(&message);
                     run_stopped = true;
                     break 'files;
@@ -11599,11 +11608,17 @@ fn parse_json_stream_prefix_ending(
             }
             // #6454: a fault the walk names in jq's own words (the depth limit) leaves jq's
             // parser where jq's model of it stops, which is not past the bytes jq drops.
+            // #6465: the walk counts a depth refusal's column over the substituted text, jq over
+            // the bytes it read, so where the two disagree on a depth refusal the model's is jq's.
             Err(error) => {
-                let end = jq_fault()
-                    .filter(|(message, _)| *message == error.to_string())
-                    .map(|(_, end)| end);
-                return (values, Some(error), end);
+                let walked = error.to_string();
+                return match jq_fault().filter(|(message, _)| {
+                    *message == walked
+                        || (jq::is_jq_depth_fault(message) && jq::is_jq_depth_fault(&walked))
+                }) {
+                    Some((message, end)) => (values, Some(EvalError::new(message)), Some(end)),
+                    None => (values, Some(error), None),
+                };
             }
         }
     }
