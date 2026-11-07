@@ -149357,9 +149357,10 @@ mod tests {
                 let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
                     &expr, &value, false,
                 ));
-                let door = eval_owned_number_fold::<JqSemantics>(&expr, &value)
-                    .map(|v| (vec![v], "ok".to_string()))
-                    .unwrap_or_else(|| panic!("{src:?} on {value:?} was declined"));
+                let Some(folded) = eval_owned_number_fold::<JqSemantics>(&expr, &value) else {
+                    panic!("{src:?} on {value:?} was declined");
+                };
+                let door = (vec![folded], "ok".to_string());
                 taken += 1;
                 assert_eq!(
                     select_door_observable(&door),
