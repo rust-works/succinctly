@@ -42902,18 +42902,20 @@ fn test_gmtime_localtime_seconds_slot_is_yq_float_shaped_3071() -> Result<()> {
 /// `strftime`, which it's an alias of) -- real yq's own `from_unix` does
 /// not: confirmed live against yq v4.53.3, both a string and an array
 /// error with `from_unix only works on numbers, found !!<type> instead`
-/// (a wording succinctly does not yet match -- a separate, pre-existing
-/// gap, not this issue's), never succeeding on an array the way jq's
+/// (a wording succinctly has matched since #5930), never succeeding on an array the way jq's
 /// `todate` now does. Pins that `from_unix` was decoupled from `todate`'s
 /// new array-acceptance rather than inheriting it, keeping its own
-/// pre-existing (not real yq's) wording and non-zero exit either way.
+/// wording and non-zero exit either way.
 #[test]
 fn test_from_unix_still_rejects_non_numbers_including_arrays_3068() -> Result<()> {
-    for input in [r#""x""#, "[1970,0,1,0,0,0,4,0]"] {
+    // The wording is yq's since #5930: it names the input's tag.
+    for (input, tag) in [(r#""x""#, "!!str"), ("[1970,0,1,0,0,0,4,0]", "!!seq")] {
         let (_out, stderr, code) = run_yq_stdin_with_stderr("from_unix", input, &[])?;
         assert_ne!(code, 0, "input {input:?}: stderr {stderr:?}");
         assert!(
-            stderr.contains("math function requires number"),
+            stderr.contains(&format!(
+                "from_unix only works on numbers, found {tag} instead"
+            )),
             "input {input:?}: stderr {stderr:?}"
         );
     }
