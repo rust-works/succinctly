@@ -29341,15 +29341,35 @@ fn translate_posix_brackets(
             "Regex failure: target of repeat operator is invalid",
         ));
     }
-    // #6201: a look-behind with alternatives of different widths.
+    // #6201: a look-behind with alternatives of different widths. #6519: the body's length as
+    // Oniguruma's `tune_look_behind` sizes it, for the bodies `onig_look_behind` can read; the rest
+    // are left to the shape rules of `look_behind_alternatives_differ`.
     if (pattern.contains("(?<=") || pattern.contains("(?<!"))
         && !extended
         && !inline_extended(pattern)
-        && look_behind_alternatives_differ(pattern)
     {
-        return Err(EvalError::new(
-            "Regex failure: invalid pattern in look-behind",
-        ));
+        let tuned = super::onig_look_behind::tune(pattern, ignore_case);
+        if let Some(bad) = tuned.iter().find(|t| {
+            matches!(
+                t.verdict,
+                super::onig_look_behind::Verdict::Invalid
+                    | super::onig_look_behind::Verdict::Undefined
+            )
+        }) {
+            return Err(EvalError::new(
+                if bad.verdict == super::onig_look_behind::Verdict::Undefined {
+                    "Regex failure: undefined error code"
+                } else {
+                    "Regex failure: invalid pattern in look-behind"
+                },
+            ));
+        }
+        let sized: Vec<usize> = tuned.iter().map(|t| t.open).collect();
+        if look_behind_alternatives_differ_but(pattern, &sized) {
+            return Err(EvalError::new(
+                "Regex failure: invalid pattern in look-behind",
+            ));
+        }
     }
     Ok(translated)
 }
@@ -29932,8 +29952,16 @@ fn property_name_kind(raw: &str) -> PropertyName {
 /// where it was. Alternation branches of one width (`ab|cd`) and a branch that can be empty (`a|`)
 /// are accepted. A branch holding anything this cannot size (a backreference, a nested lookaround or
 /// atomic group, a comment) is not counted.
-#[cfg(feature = "regex")]
+/// The shape rules alone, as they judge a body `onig_look_behind` does not read (the tests pin them).
+#[cfg(all(feature = "regex", test))]
 fn look_behind_alternatives_differ(pattern: &str) -> bool {
+    look_behind_alternatives_differ_but(pattern, &[])
+}
+
+/// [`look_behind_alternatives_differ`], leaving out the look-behinds that start at the offsets in
+/// `sized`: [`super::onig_look_behind`] has sized those (#6519) and its verdict is the one that counts.
+#[cfg(feature = "regex")]
+fn look_behind_alternatives_differ_but(pattern: &str, sized: &[usize]) -> bool {
     use regex_syntax::ast::{self, Ast, RepetitionKind, RepetitionRange};
 
     /// The one width `ast` can match, if it has one and this can tell.
@@ -30100,22 +30128,26 @@ fn look_behind_alternatives_differ(pattern: &str) -> bool {
     }
 
     /// Whether `ast` holds a look-behind with such an alternation in its body.
-    fn refused(ast: &Ast, opaque: &[usize], behind: &[usize]) -> bool {
+    fn refused(ast: &Ast, opaque: &[usize], behind: &[usize], sized: &[usize]) -> bool {
         match ast {
             Ast::Group(group) => {
                 (behind.contains(&group.span.start.offset)
+                    && !sized.contains(&group.span.start.offset)
                     && ((fixed_counts(&group.ast)
                         && no_empty_branch(&group.ast)
                         && differs(&group.ast, opaque, behind))
                         || repeated_differs(&group.ast, opaque, behind)))
-                    || refused(&group.ast, opaque, behind)
+                    || refused(&group.ast, opaque, behind, sized)
             }
-            Ast::Repetition(repetition) => refused(&repetition.ast, opaque, behind),
-            Ast::Concat(concat) => concat.asts.iter().any(|ast| refused(ast, opaque, behind)),
+            Ast::Repetition(repetition) => refused(&repetition.ast, opaque, behind, sized),
+            Ast::Concat(concat) => concat
+                .asts
+                .iter()
+                .any(|ast| refused(ast, opaque, behind, sized)),
             Ast::Alternation(alternation) => alternation
                 .asts
                 .iter()
-                .any(|ast| refused(ast, opaque, behind)),
+                .any(|ast| refused(ast, opaque, behind, sized)),
             _ => false,
         }
     }
@@ -30144,7 +30176,7 @@ fn look_behind_alternatives_differ(pattern: &str) -> bool {
         .copied()
         .filter(|&at| !is_behind(at))
         .collect();
-    refused(&ast, &opaque, &behind)
+    refused(&ast, &opaque, &behind, sized)
 }
 
 /// The index after the comment `(?#...)` that starts at `start`: a backslash escapes the next
@@ -33535,6 +33567,20 @@ fn build_regex_uncached<S: EvalSemantics>(
             Err(refusal) => {
                 deferred_refusal.get_or_insert(refusal);
                 scanned
+            }
+        };
+        // #6519: a look-behind that can match nothing is no look-behind to Oniguruma, and the groups
+        // in its body are never set. Written before the translation, which then reads the pattern
+        // that its refusal of the other look-behinds reads.
+        let scanned = if extended || inline_extended(&scanned) {
+            scanned
+        } else {
+            match super::onig_look_behind::rewrite_empty(
+                &scanned,
+                flags.is_some_and(|f| f.contains('i')),
+            ) {
+                Some(written) => std::borrow::Cow::Owned(written),
+                None => scanned,
             }
         };
         match translate_posix_brackets(&scanned, extended, flags.is_some_and(|f| f.contains('i'))) {

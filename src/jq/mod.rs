@@ -106,6 +106,8 @@ mod onig_fold;
 #[cfg(feature = "regex")]
 mod onig_fold_data;
 #[cfg(feature = "regex")]
+mod onig_look_behind;
+#[cfg(feature = "regex")]
 mod onig_loop;
 mod parse_message;
 mod parser;
