@@ -14022,7 +14022,7 @@ fn closed_pipe_to_owned<S: EvalSemantics>(
                 head,
                 depth + 1,
                 escaped,
-            )?)
+            )?);
         }
     }
     for stage in rest {
@@ -88189,6 +88189,31 @@ fn eval_owned_expr_full<S: EvalSemantics>(
     }
 }
 
+/// [`eval_owned_relocating_fold`], then (#5712, jq mode) [`eval_owned_closed`]: an expression that
+/// never reads `.` is one value whatever the input is, as the lazy twin [`eval_each_owned`] answers
+/// it. Without it a stage that closes over a bound value (`. as $t | [range(25) | ($t | length)]`,
+/// where `$t` is a computed string or array) wrote the input out and indexed it again to evaluate a
+/// stage that never reads it, once per round: 1.8 s against 0.17 s over a 6.6 MB string.
+///
+/// One call in [`eval_owned_input`] and not two, and `#[inline(never)]`: that function is inlined
+/// into the recursive [`eval_owned_pipe`], and a second `Option<OwnedValue>` there cost it 80 bytes
+/// of frame per level in a debug build (`walk_impl_panics_past_nesting_depth_limit_1021` overflowed
+/// a 2 MB test stack on ARM64 Linux at 1021 levels). A change to this pair must keep that frame:
+/// `eval_owned_pipe` is 2944 bytes on aarch64 debug without it.
+#[inline(never)]
+fn eval_owned_relocated_or_closed<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if let Some(relocated) = eval_owned_relocating_fold::<S>(expr, input) {
+        return Some(relocated);
+    }
+    if S::TAG == EvalTag::Jq {
+        return eval_owned_closed::<S>(expr);
+    }
+    None
+}
+
 /// Evaluate an expression with an OwnedValue as input, preserving the full
 /// output stream.
 ///
@@ -88219,23 +88244,13 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(e) => e.into(),
         };
     }
-    // #5712: an expression that never reads `.` is one value whatever the input is, as the lazy
-    // twin [`eval_each_owned`] answers it. Without this a stage that closes over a bound value
-    // (`. as $t | [range(25) | ($t | length)]`, where `$t` is a computed string or array) wrote
-    // the input out and indexed it again to evaluate a stage that never reads it, once per round:
-    // 1.8 s against 0.17 s over a 6.6 MB string. jq mode only, as the lazy twin's is.
-    if S::TAG == EvalTag::Jq {
-        if let Some(value) = eval_owned_closed::<S>(expr) {
-            return QueryResult::Owned(value);
-        }
-    }
     // #3180: the relocating fold and the embed peel, as in the lazy twin
     // [`eval_each_owned`]. An eager caller -- an array constructor's
     // collect, `[input | . as $x | {k:.} | .k | path($x)]` -- reaches a
     // construction here, and without these the whole pipe bridged, so the
     // stage standing on the embed saw a copy. Both only fire past their own
     // payoff gates, so any other input bridges exactly as before.
-    if let Some(relocated) = eval_owned_relocating_fold::<S>(expr, input) {
+    if let Some(relocated) = eval_owned_relocated_or_closed::<S>(expr, input) {
         return QueryResult::Owned(relocated);
     }
     if let Some((values, control)) = embed_peel_collect::<S>(expr, input, optional, reentry) {
