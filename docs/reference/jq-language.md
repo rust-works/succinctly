@@ -460,7 +460,7 @@ echo '{"data": {"nested": {"value": 42}}}' | succinctly jq 'at_offset(9) | .nest
 
 ADR-0018 rule 5 lets `succinctly jq` run a name its reference refuses only where this documentation marks the name as an extension.
 Forty-five names (46 name and arity pairs, `parent` having two) are in that position: `succinctly jq` runs each, and `jq` 1.7.1 answers `is not defined`.
-The list was captured by running every name the parser matches, at arities 0 to 3, through `/usr/bin/jq` 1.7.1 (`-n`), jq 1.8.2 and `yq` v4.53.3; a name the parser reaches another way is not in it, so it is a lower bound.
+The list was captured on 2026-11-09 by running every name the parser matches, at arities 0 to 3, through `/usr/bin/jq` 1.7.1 (`-n`), jq 1.8.2 and `yq` v4.53.3; a name the parser reaches another way is not in it, so it is a lower bound.
 
 | Class            | Names                                                                                                                                                                                                                                                                                              | jq 1.8.2    | yq v4.53.3                              | Pinned by                                 |
 |------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------|-----------------------------------------|-------------------------------------------|
@@ -473,7 +473,7 @@ The list was captured by running every name the parser matches, at arities 0 to 
   `succinctly yq` follows yq for all of them.
 - `isvalid` has its own paragraph under "Succinctly Extensions" (#6662), and `at_offset`, `at_position` and `leaf_paths` their own sections.
   `isnull` to `isobject` are the zero-argument type tests of the "Type Functions" list above; `tojsonstream` and `fromjsonstream` are the non-standard event pair described under "Other", distinct from `tostream`/`fromstream`.
-- `tests/jq_extension_roster_tests.rs` keeps this table, the rows of `comparison/jq/probes/extensions.tsv` and `succinctly jq` in agreement: each name is listed on its class's row, each uncovered name has a probe row, and each row runs.
+- `tests/jq_extension_roster_tests.rs` keeps this table, the rows of `comparison/jq/probes/extensions.tsv` and `succinctly jq` in agreement: each name is listed on its class's row, each name has its own probe row (or, for a jq 1.8 name, a use in jq 1.8.1's vendored tests), each row belongs to a name, and each row runs.
 
 #### `leaf_paths`
 

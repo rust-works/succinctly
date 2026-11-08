@@ -7,7 +7,8 @@
 //!
 //! - every name in [`ROSTER`] is listed under its class in the table of
 //!   `docs/reference/jq-language.md`'s "Names jq 1.7.1 does not define" section;
-//! - every name that has no row elsewhere has a row in `extensions.tsv` whose program uses it;
+//! - every name is pinned by its own row in `extensions.tsv` (whose program uses it), or by jq
+//!   1.8.1's vendored tests, and every row belongs to a name;
 //! - every row of `extensions.tsv` runs under `succinctly jq` and exits 0, the half of the verdict
 //!   that needs no reference (the harness judges the other half against jq 1.7.1).
 //!
@@ -35,55 +36,68 @@ const YQ: &str = "a yq name";
 /// No jq 1.7.1 or 1.8.2 and no yq has it; it behaves as `recurse`.
 const OLD_ALIAS: &str = "an old alias";
 
-/// `(class, name, covered by a row elsewhere)`: a name with `true` is pinned by a row this file
-/// does not look for (`at_offset`, `at_position` and `leaf_paths` have their own; `isvalid` has
-/// one in #6673; the jq 1.8 names are probed against jq 1.8.1 by its vendored tests).
-const ROSTER: &[(&str, &str, bool)] = &[
-    (OWN, "at_offset", true),
-    (OWN, "at_position", true),
-    (OWN, "leaf_paths", true),
-    (OWN, "isvalid", true),
-    (OWN, "isnull", false),
-    (OWN, "isboolean", false),
-    (OWN, "isnumber", false),
-    (OWN, "isstring", false),
-    (OWN, "isarray", false),
-    (OWN, "isobject", false),
-    (OWN, "tojsonstream", false),
-    (OWN, "fromjsonstream", false),
-    (OLD_ALIAS, "recurse_down", false),
-    (JQ_18, "trim", true),
-    (JQ_18, "ltrim", true),
-    (JQ_18, "rtrim", true),
-    (JQ_18, "toboolean", true),
-    (JQ_18, "skip", true),
-    (YQ, "anchor", false),
-    (YQ, "tag", false),
-    (YQ, "kind", false),
-    (YQ, "style", false),
-    (YQ, "key", false),
-    (YQ, "line", false),
-    (YQ, "column", false),
-    (YQ, "parent", false),
-    (YQ, "path", false),
-    (YQ, "di", false),
-    (YQ, "document_index", false),
-    (YQ, "fi", false),
-    (YQ, "file_index", false),
-    (YQ, "fileIndex", false),
-    (YQ, "head_comment", false),
-    (YQ, "line_comment", false),
-    (YQ, "foot_comment", false),
-    (YQ, "from_unix", false),
-    (YQ, "to_unix", false),
-    (YQ, "tz", false),
-    (YQ, "format_datetime", false),
-    (YQ, "with_dtf", false),
-    (YQ, "load", false),
-    (YQ, "omit", false),
-    (YQ, "pivot", false),
-    (YQ, "shuffle", false),
-    (YQ, "split_doc", false),
+/// Where a name is pinned against the reference.
+#[derive(Clone, Copy)]
+enum Pin {
+    /// Its own row in `comparison/jq/probes/extensions.tsv`: the row's id.
+    Row(&'static str),
+    /// The vendored jq 1.8.1 test files (`comparison/jq/vendor/jq-1.8.1/jq.test`), which the
+    /// harness runs against jq 1.8.1 alone: a jq 1.8 name is not succinctly-only, so it has no
+    /// "the reference must reject" row.
+    Vendored18,
+    /// A row another change adds (#6673 adds `isvalid`'s).
+    Elsewhere,
+}
+
+use Pin::{Elsewhere, Row, Vendored18};
+
+/// `(class, name, pin)`.
+const ROSTER: &[(&str, &str, Pin)] = &[
+    (OWN, "at_offset", Row("at-offset")),
+    (OWN, "at_position", Row("at-position")),
+    (OWN, "leaf_paths", Row("leaf-paths")),
+    (OWN, "isvalid", Elsewhere),
+    (OWN, "isnull", Row("isnull")),
+    (OWN, "isboolean", Row("isboolean")),
+    (OWN, "isnumber", Row("isnumber")),
+    (OWN, "isstring", Row("isstring")),
+    (OWN, "isarray", Row("isarray")),
+    (OWN, "isobject", Row("isobject")),
+    (OWN, "tojsonstream", Row("tojsonstream")),
+    (OWN, "fromjsonstream", Row("fromjsonstream")),
+    (OLD_ALIAS, "recurse_down", Row("recurse-down")),
+    (JQ_18, "trim", Vendored18),
+    (JQ_18, "ltrim", Vendored18),
+    (JQ_18, "rtrim", Vendored18),
+    (JQ_18, "toboolean", Vendored18),
+    (JQ_18, "skip", Vendored18),
+    (YQ, "anchor", Row("anchor")),
+    (YQ, "tag", Row("tag")),
+    (YQ, "kind", Row("kind")),
+    (YQ, "style", Row("style")),
+    (YQ, "key", Row("key")),
+    (YQ, "line", Row("line")),
+    (YQ, "column", Row("column")),
+    (YQ, "parent", Row("parent")),
+    (YQ, "path", Row("path-0")),
+    (YQ, "di", Row("di")),
+    (YQ, "document_index", Row("document-index")),
+    (YQ, "fi", Row("fi")),
+    (YQ, "file_index", Row("file-index")),
+    (YQ, "fileIndex", Row("file-index-camel")),
+    (YQ, "head_comment", Row("head-comment")),
+    (YQ, "line_comment", Row("line-comment")),
+    (YQ, "foot_comment", Row("foot-comment")),
+    (YQ, "from_unix", Row("from-unix")),
+    (YQ, "to_unix", Row("to-unix")),
+    (YQ, "tz", Row("tz")),
+    (YQ, "format_datetime", Row("format-datetime")),
+    (YQ, "with_dtf", Row("with-dtf")),
+    (YQ, "load", Row("load")),
+    (YQ, "omit", Row("omit")),
+    (YQ, "pivot", Row("pivot")),
+    (YQ, "shuffle", Row("shuffle")),
+    (YQ, "split_doc", Row("split-doc")),
 ];
 
 fn root() -> PathBuf {
@@ -133,7 +147,7 @@ fn every_name_is_listed_under_its_class_in_the_reference_6672() -> Result<()> {
     for (class, name, _) in ROSTER {
         let row = section
             .lines()
-            .find(|line| line.starts_with('|') && line.contains(class))
+            .find(|line| line.starts_with(&format!("| {class} ")))
             .with_context(|| format!("no table row for the class {class:?}"))?;
         assert!(
             row.contains(&format!("`{name}`")),
@@ -144,17 +158,49 @@ fn every_name_is_listed_under_its_class_in_the_reference_6672() -> Result<()> {
 }
 
 #[test]
-fn every_uncovered_name_has_a_probe_row_6672() -> Result<()> {
+fn every_name_is_pinned_by_its_own_row_or_the_vendored_tests_6672() -> Result<()> {
     let rows = probe_rows()?;
-    for (_, name, covered_elsewhere) in ROSTER {
-        if *covered_elsewhere {
-            continue;
+    let vendored = std::fs::read_to_string(root().join("comparison/jq/vendor/jq-1.8.1/jq.test"))?;
+    for (_, name, pin) in ROSTER {
+        match pin {
+            Row(id) => {
+                let (_, args, _) = rows
+                    .iter()
+                    .find(|(row_id, _, _)| row_id == id)
+                    .with_context(|| format!("`{name}`: no row `{id}` in extensions.tsv"))?;
+                let program = args.last().cloned().unwrap_or_default();
+                assert!(
+                    has_word(&program, name),
+                    "row `{id}` does not use `{name}`: {program}"
+                );
+            }
+            Vendored18 => assert!(
+                has_word(&vendored, name),
+                "`{name}` is not exercised by jq 1.8.1's vendored jq.test"
+            ),
+            Elsewhere => {}
         }
-        let program = |args: &[String]| args.last().cloned().unwrap_or_default();
+    }
+    // A row belongs to a name: one nobody lists (and that is not one of the surface rows from
+    // before #6672) is a probe the table above would never mention.
+    const EARLIER: &[&str] = &["dsv-format", "input-dsv", "validate"];
+    // `parent(n)` is `parent`'s second arity: a row of its own on a name the roster lists once.
+    const SECOND_ARITY: &[(&str, &str)] = &[("parent-n", "parent")];
+    for (id, name) in SECOND_ARITY {
+        let (_, args, _) = rows
+            .iter()
+            .find(|(row_id, _, _)| row_id == id)
+            .with_context(|| format!("no row `{id}` in extensions.tsv"))?;
+        assert!(has_word(args.last().map_or("", String::as_str), name));
+    }
+    for (id, _, _) in &rows {
         assert!(
-            rows.iter()
-                .any(|(_, args, _)| has_word(&program(args), name)),
-            "`{name}` has no row in comparison/jq/probes/extensions.tsv"
+            EARLIER.contains(&id.as_str())
+                || SECOND_ARITY.iter().any(|(row, _)| row == id)
+                || ROSTER
+                    .iter()
+                    .any(|(_, _, pin)| matches!(pin, Row(row) if row == id)),
+            "row `{id}` of extensions.tsv names no name in the roster"
         );
     }
     Ok(())
