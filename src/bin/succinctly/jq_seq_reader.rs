@@ -351,20 +351,26 @@ pub(crate) fn walk_stream(
     slurp: bool,
     emit: &mut dyn FnMut(&str),
 ) -> SeqStreamWalk {
-    walk_stream_collecting(raw_bytes, slurp, false, emit)
+    walk_stream_collecting(raw_bytes, slurp, false, false, emit)
 }
 
 /// [`walk_stream`], also recording each diagnostic as a [`SeqFault`] when `collect_faults` is
 /// set (#5640): `-n`'s `input`/`inputs` raise what a plain run only warns about, and need the
 /// message with where the reader stood. Off by default, because a stream can warn once per
 /// byte and the faults would be held in memory (see the note on [`walk_stream`]).
+///
+/// `unopened_tail` says a file that did not open follows the last of `raw_bytes` (#6588). jq's
+/// reader then asks that file for more before it is at its end, so the refill that sets `is_last`
+/// is the empty one at the missing file, and the last opened file's last chunk is not the final
+/// buffer: [`final_buffer_start`] is the stream's end.
 pub(crate) fn walk_stream_collecting(
     raw_bytes: &[(Option<usize>, Vec<u8>)],
     slurp: bool,
     collect_faults: bool,
+    unopened_tail: bool,
     emit: &mut dyn FnMut(&str),
 ) -> SeqStreamWalk {
-    walk_stream_placing(raw_bytes, slurp, collect_faults, true, emit)
+    walk_stream_placing(raw_bytes, slurp, collect_faults, true, unopened_tail, emit)
 }
 
 /// [`walk_stream`] for a caller that wants the values and the verdicts but not where jq's reader
@@ -375,7 +381,7 @@ pub(crate) fn walk_stream_values(
     slurp: bool,
     emit: &mut dyn FnMut(&str),
 ) -> SeqStreamWalk {
-    walk_stream_placing(raw_bytes, slurp, false, false, emit)
+    walk_stream_placing(raw_bytes, slurp, false, false, false, emit)
 }
 
 /// The guards of [`plain_record_sequence`], as data so that a test can drop one and show the
@@ -457,6 +463,7 @@ fn walk_stream_placing(
     slurp: bool,
     collect_faults: bool,
     place_values: bool,
+    unopened_tail: bool,
     emit: &mut dyn FnMut(&str),
 ) -> SeqStreamWalk {
     let bom = bom_prefix(raw_bytes);
@@ -476,7 +483,12 @@ fn walk_stream_placing(
     // newline happen as the reader scans it, and a refill after a full
     // 4095-byte chunk with no newline is one more (#3200).
     let boundaries = refill_boundaries(raw_bytes, bom.malformed);
-    let final_buffer_start = final_buffer_start(raw_bytes, total);
+    // #6588: past a last file that did not open, the final buffer is the empty one read there.
+    let final_buffer_start = if unopened_tail {
+        total
+    } else {
+        final_buffer_start(raw_bytes, total)
+    };
     reader.final_buffer_start = final_buffer_start;
     reader.total = total;
     if bom.malformed {
