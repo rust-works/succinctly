@@ -224,6 +224,36 @@ const ROWS: &[(&str, &str, &str)] = &[
         "with_entries(select(.key == \"a\"))",
         "a: {c: 1}\n",
     ),
+    (
+        "a:\nb: 1\nc: ~ # k\nd: 'q'\n",
+        "with_entries(select(.key == \"a\" or .key == \"c\"))",
+        "a:\nc: ~ # k\n",
+    ),
+    (
+        "a:\nb: 1\nc: ~ # k\nd: 'q'\n",
+        "with_entries(select(.key != \"a\" and .value != 1))",
+        "c: ~ # k\nd: 'q'\n",
+    ),
+    (
+        "a:\nb: 1\nc: ~ # k\nd: 'q'\n",
+        "with_entries(select((.key == \"a\") | not))",
+        "b: 1\nc: ~ # k\nd: 'q'\n",
+    ),
+    (
+        "a:\nb: 1\nc: ~ # k\nd: 'q'\n",
+        "with_entries((select(.key != \"b\")))",
+        "a:\nc: ~ # k\nd: 'q'\n",
+    ),
+    (
+        "a:\nb: 1\nc: ~ # k\nd: 'q'\n",
+        "with_entries(select(.key | . != \"b\"))",
+        "a:\nc: ~ # k\nd: 'q'\n",
+    ),
+    (
+        "a:\nb: 1\nc: ~ # k\nd: 'q'\n",
+        "with_entries(select((.value != 1)))",
+        "a:\nc: ~ # k\nd: 'q'\n",
+    ),
 ];
 
 #[test]
