@@ -13617,14 +13617,21 @@ mod bridge_docs {
 /// handed on without being converted (#5624): every container level is held to it, and the walk stops at
 /// the first level that is not, so a deeper value costs no more than the ceiling.
 fn check_output_nesting(value: &OwnedValue, depth: usize) -> core::result::Result<(), EvalError> {
-    check_nesting_depth(depth)?;
+    // A container is held to the ceiling, a scalar is not: it recurses no deeper, and jq's own
+    // limit of 256 containers leaves room for the scalar inside the 256th (#6618).
     match value {
-        OwnedValue::Array(items) => items
-            .iter()
-            .try_for_each(|item| check_output_nesting(item, depth + 1)),
-        OwnedValue::Object(fields) => fields
-            .values()
-            .try_for_each(|item| check_output_nesting(item, depth + 1)),
+        OwnedValue::Array(items) => {
+            check_nesting_depth(depth)?;
+            items
+                .iter()
+                .try_for_each(|item| check_output_nesting(item, depth + 1))
+        }
+        OwnedValue::Object(fields) => {
+            check_nesting_depth(depth)?;
+            fields
+                .values()
+                .try_for_each(|item| check_output_nesting(item, depth + 1))
+        }
         _ => Ok(()),
     }
 }
@@ -15669,9 +15676,10 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
     // instead of routing through `print_json`), reusing each child's
     // already-resolved `text_position()` via `value_at` (see `scalar_end_pos`'s
     // own doc comment) the same way `check_preceding_delimiter` does.
-    check_nesting_depth(depth)?;
     match cursor.value() {
         StandardJson::Array(elements) => {
+            // A container is held to the ceiling, a scalar is not (#6618).
+            check_nesting_depth(depth)?;
             let mut saw_any = false;
             let mut last_child = None;
             for (i, child) in elements.cursor_iter().enumerate() {
@@ -15711,6 +15719,7 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
             }
         }
         StandardJson::Object(fields) => {
+            check_nesting_depth(depth)?;
             let mut remaining = fields;
             let mut field_index = 0usize;
             let mut last_value = None;
@@ -22353,9 +22362,9 @@ mod tests {
             assert_eq!(built, 1, "{filter}");
             assert!(!outputs.is_empty(), "{filter}");
         }
-        // The nesting ceiling of a converted output (256 levels) holds for the shortcut too: 255
-        // levels print, 256 do not.
-        for (depth, prints) in [(255usize, 1usize), (256, 0), (300, 0)] {
+        // The nesting ceiling of a converted output holds for the shortcut too: a container is held
+        // to it and a scalar is not (#6618), so 256 containers around a scalar print, and 257 do not.
+        for (depth, prints) in [(255usize, 1usize), (256, 1), (257, 0), (300, 0)] {
             let mut nest = OwnedValue::Int(1);
             for _ in 0..depth {
                 nest = OwnedValue::array_from(vec![nest]);
