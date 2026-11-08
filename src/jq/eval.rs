@@ -11168,6 +11168,14 @@ fn owned_path_each_optional<'v, S: EvalSemantics>(
     let mut stages = Vec::new();
     path_stages(expr, &mut stages);
     let (_, path) = stages.split_last()?;
+    owned_static_read(path, input)
+}
+
+/// What the static `.name` / `.[n]` steps `path` read from `input`, or `None` where a step would
+/// raise (a `.name` on anything but an object or `null`, a `.[n]` on anything but an array or
+/// `null`) or is not static. A missing key, an out-of-range index and `null` read `null`, and a
+/// negative index counts from the end, as [`eval_owned_map_projection`] reads them (#6595).
+fn owned_static_read<'v>(path: &[&Expr], input: &'v OwnedValue) -> Option<&'v OwnedValue> {
     let mut at = input;
     for stage in path {
         at = match (static_step(stage)?, at) {
@@ -11193,6 +11201,81 @@ fn path_stages<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
         Expr::Identity => {}
         other => out.push(other),
     }
+}
+
+/// `[.a]`, `{id, name}`, `{id: .id, kind: "x", pos: {x: .x}}` over an owned value, answered from the
+/// tree instead of through the re-index bridge (#6608): a `recurse(.children[]?) | {id, name}` wrote
+/// every visited node, and so its whole subtree, out as text and indexed it again to read two fields,
+/// so the walk grew with depth at a fixed node count (0.27-0.55x of jq 1.7.1 on a 7950X).
+///
+/// An operand is a literal, a static `.name` / `.[n]` path ([`owned_static_read`]: one output, and it
+/// declines where a step would raise), or an array or object built from operands. Keys are literals
+/// (a computed key is a generator). The pairs fold into the map as the evaluator's own construction
+/// folds them ([`object_from_pairs`]). The elements are the input's own (a refcount bump for a
+/// container); the bridge re-reads its serialization, so a number nested in one is a `NumberLiteral`
+/// there and an `Int` here: two spellings of one value that every printer renders alike, as for
+/// [`eval_owned_map_projection`]. The stage may be wrapped as every front door's is. jq mode only,
+/// and not under an embed table, as [`owned_path_each_optional`]: a node a binding tracks is
+/// answered by the bridge, which can name it.
+pub(crate) fn eval_owned_construct<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let shape = match unwrap_paren(expr) {
+        Expr::Pipe(stages) => match skip_identity_stages(stages) {
+            [only] => unwrap_paren(only),
+            _ => return None,
+        },
+        other => other,
+    };
+    if !matches!(shape, Expr::Array(_) | Expr::Object(_))
+        || super::eval_generic::embed_table_active()
+    {
+        return None;
+    }
+    construct_operand::<S>(shape, input)
+}
+
+/// One operand of [`eval_owned_construct`]: a dispatch only, with one `#[inline(never)]` function
+/// per shape, as [`string_door_composed`] is, since the walk recurses once per level of nesting.
+fn construct_operand<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    match unwrap_paren(expr) {
+        Expr::Literal(lit) => Some(literal_to_owned(lit)),
+        Expr::Array(inner) => construct_array::<S>(inner, input),
+        Expr::Object(entries) => construct_object::<S>(entries, input),
+        other => construct_read(other, input),
+    }
+}
+
+#[inline(never)]
+fn construct_array<S: EvalSemantics>(inner: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    construct_operand::<S>(inner, input).map(|element| OwnedValue::array_from(vec![element]))
+}
+
+#[inline(never)]
+fn construct_object<S: EvalSemantics>(
+    entries: &[ObjectEntry],
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    let mut pairs = vec_with_capacity(entries.len());
+    for entry in entries {
+        let ObjectKey::Literal(key) = &entry.key else {
+            return None;
+        };
+        pairs.push((key.clone(), construct_operand::<S>(&entry.value, input)?));
+    }
+    let fields = object_from_pairs::<S>(pairs).ok()?;
+    Some(OwnedValue::Object(fields.into()))
+}
+
+#[inline(never)]
+fn construct_read(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    let mut stages = Vec::new();
+    path_stages(expr, &mut stages);
+    owned_static_read(&stages, input).cloned()
 }
 
 /// The last of [`path_stages`]'s stages of `expr`, found without collecting them: `None` when
@@ -12364,6 +12447,13 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
             Demand::Stop => Flow::Stopped { pending: None },
         });
     }
+    // #6608: `{id, name}` and `[.a]` read their fields off the tree.
+    if let Some(built) = eval_owned_construct::<S>(expr, input) {
+        return Some(match sink(built) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        });
+    }
     // #6595: `.children[]?` reads the children of an owned node, not the node written out and
     // indexed again (once per ancestor in a `recurse` walk).
     if let Some(children) = owned_path_each_optional::<S>(expr, input) {
@@ -13425,6 +13515,8 @@ fn projection_peel<S: EvalSemantics>(
     let counted = eval_owned_count_door::<S>(first, input)
         .or_else(|| eval_owned_string_stage::<S>(first, input))
         .or_else(|| eval_owned_map_projection::<S>(first, input))
+        // #6608: or a constructor of static reads, `{id, name}`.
+        .or_else(|| eval_owned_construct::<S>(first, input))
         // #6527: or `add`, `min` or `max` of an array of computed numbers.
         .or_else(|| eval_owned_number_fold::<S>(first, input))
         // #6539: or `map(body)` of one, which steps to the array of the answers.
@@ -151514,6 +151606,116 @@ mod tests {
             declined_raising > 50,
             "the matrix must reach a raising step: {declined_raising}"
         );
+    }
+
+    /// #6608: [`eval_owned_construct`] answers what the reindex bridge answers for every value x
+    /// constructor it takes, and declines the rest (a step that would raise, a computed key, a
+    /// generator, a variable, yq mode), so the bridge keeps its diagnostics.
+    #[test]
+    fn owned_construct_agrees_with_the_reindex_bridge_6608() {
+        let object = |pairs: &[(&str, OwnedValue)]| {
+            OwnedValue::object_from(pairs.iter().map(|(k, v)| ((*k).to_string(), v.clone())))
+        };
+        let literal = OwnedValue::from_number_literal::<JqSemantics>("1.50");
+        let big = OwnedValue::from_number_literal::<JqSemantics>("100000000000000000000");
+        let inner = OwnedValue::array_from(vec![OwnedValue::Int(7), OwnedValue::Null]);
+        let mut values = vec![
+            object(&[
+                ("id", OwnedValue::Int(1)),
+                ("name", OwnedValue::String("n".into())),
+                ("a", inner.clone()),
+                ("b", object(&[("c", literal.clone())])),
+            ]),
+            object(&[("id", big.clone()), ("a", OwnedValue::Null)]),
+            object(&[("a", OwnedValue::Int(3))]),
+            object(&[]),
+            inner.clone(),
+            OwnedValue::array_from(vec![]),
+            OwnedValue::Null,
+            OwnedValue::Int(1),
+            OwnedValue::String("s".into()),
+            OwnedValue::Bool(true),
+        ];
+        for v in pure_scalar_matrix() {
+            values.push(object(&[
+                ("id", v.clone()),
+                ("a", OwnedValue::array_from(vec![v])),
+            ]));
+        }
+        values.extend(pure_value_matrix());
+        let answered = [
+            "{id, name}",
+            "{id: .id}",
+            "{id: .id, id: .name}",
+            "{a: .a[1], b: .b.c, z: .zz, k: \"lit\", n: 3, w: {id}}",
+            "{\"a b\": .a}",
+            "[.id]",
+            "[.[0]]",
+            "[.a[-1]]",
+            "[.]",
+            "{x: .}",
+            "[[.id]]",
+            "[{id}]",
+            "({id, name})",
+            ". | {id}",
+            "{id: .a.b.c.d}",
+            "{}",
+            "[1]",
+        ];
+        let left = [
+            "{(.id | tostring): 1}",
+            "[.id, .name]",
+            "[.a[]]",
+            "[.a[]?]",
+            "{id: (.id, .name)}",
+            "{id: .id?}",
+            "{id: .id + 1}",
+            "{$__loc__}",
+            "{id, name} | .id",
+            "{id} | .",
+            "[]",
+        ];
+        let mut taken = 0;
+        for src in answered {
+            let expr = parse(src).unwrap();
+            let mut reached = false;
+            for value in &values {
+                let door = eval_owned_construct::<JqSemantics>(&expr, value);
+                assert!(
+                    eval_owned_construct::<YqSemantics>(&expr, value).is_none(),
+                    "yq mode must keep its own constructors: {src:?}"
+                );
+                let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                let Some(door) = door else {
+                    // A decline is only ever a read that raises.
+                    assert!(
+                        bridge.1.starts_with("error:"),
+                        "{src:?} on {value:?} declined where the bridge answers {bridge:?}"
+                    );
+                    continue;
+                };
+                reached = true;
+                taken += 1;
+                assert_eq!(
+                    select_door_observable(&(vec![door], "ok".to_string())),
+                    select_door_observable(&bridge),
+                    "{src:?} on {value:?} disagrees with the reindex bridge"
+                );
+            }
+            assert!(reached, "{src:?} never reached the door");
+        }
+        for src in left {
+            let Ok(expr) = parse(src) else { continue };
+            for value in &values {
+                assert!(
+                    eval_owned_construct::<JqSemantics>(&expr, value).is_none(),
+                    "{src:?} on {value:?} must be left to the bridge"
+                );
+            }
+        }
+        assert!(taken > 300, "the matrix must reach the door: {taken}");
     }
 
     /// #6560: `environment_object_in` is the environment, built fresh or read back from the
