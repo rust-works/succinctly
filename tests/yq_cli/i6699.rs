@@ -80,6 +80,9 @@ fn test_yq_names_the_text_after_the_spaces_in_the_lexer_error_6699() -> Result<(
         (r#"."a b" = 9"#, r#""b\" = 9""#),
         (r#"."a b"#, r#""b""#),
         (r#"."a b" # c"#, r#""b\" # c""#),
+        // A backslash and a newline in the rest are escaped as well.
+        (".\"a b\\c\"", r#""b\\c\"""#),
+        (".\"a b\n  .x", r#""b\n  .x""#),
         // Go's `%q` writes a carriage return and the other ASCII controls as escapes.
         (".\"a b\r\"", r#""b\r\"""#),
         (".\"a b\x01\"", r#""b\x01\"""#),
