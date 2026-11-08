@@ -14228,6 +14228,10 @@ What follows is the missing-file behaviour of the features that route input diff
   The same holds for a program that reads `input`, and `-n` with `inputs` reads to the end and reports every one.
   `-s` and `--validate` still report every missing file up front.
   A record joined across files is read from the file it ends in, so a missing file between the two is reported when that row is read, as `-R` does for a line with no newline.
+  A record still open at the end of the last file that opened asks for the next file, since [#6669](https://github.com/rust-works/succinctly/issues/6669), so every failure behind it is reported, as `-R` does for a last line with no newline: `succinctly jq -c --input-dsv , . gone o.csv gone2` over `x,"y` reports `gone` and `gone2`, and `-n 'first(inputs)'` over `o.csv gone` reports `gone`, where each said less.
+  A last row with no newline and no open quote is complete where its file ends, so it stops the main loop at the first failure; `-R`'s line with no newline does not.
+  "Open" is the DSV index's own rule, as for the join across files (#6601): a file with an odd number of quote bytes ends inside a quote, so a stray quote in an unquoted field (`ab"c,d`) leaves the rest of the file one open record and asks for the next file too.
+  `input_filename` on the streaming route names the file the open row came from (`o.csv`), where `-R` names the missing file its line is read at.
   jq has no DSV input to compare with, so this is a succinctly extension.
 * jq keeps the name of the last file it tried even when it did not open, so a diagnostic or `input_filename` after a missing last file names that file (`jq -s -c input_filename data.json missing` prints `"missing"`).
   `succinctly jq` does the same once a read reaches the end of the input, since [#6480](https://github.com/rust-works/succinctly/issues/6480): the missing last file is a source past the ones that opened, at line 0, so `[inputs], input_filename` under `-n`, an error after `[inputs]`, and every `-s` route name it.
