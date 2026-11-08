@@ -751,8 +751,10 @@ fn to_owned_checked_at_depth<S: EvalSemantics, V: DocumentValue>(
     value: &V,
     depth: usize,
 ) -> Result<OwnedValue, EvalError> {
-    check_nesting_depth(depth)?;
+    // A container is held to the ceiling, a scalar is not: it recurses no deeper, and jq's own
+    // limit of 256 containers leaves room for the scalar inside the 256th (#6618).
     if let Some(fields) = value.as_object_rendered() {
+        check_nesting_depth(depth)?;
         let mut map = ObjectBuilder::new();
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
@@ -774,6 +776,7 @@ fn to_owned_checked_at_depth<S: EvalSemantics, V: DocumentValue>(
         child_tail_gap_ok(last_field.as_ref(), b'}')?;
         Ok(OwnedValue::Object(map.finish()))
     } else if let Some(elements) = value.as_array() {
+        check_nesting_depth(depth)?;
         let mut items = Vec::new();
         let mut elems = elements;
         let mut is_first = true;
@@ -44855,24 +44858,65 @@ mod tests {
     /// #2299 code review: `to_owned_checked_at_depth`'s recursion shape must
     /// answer the depth question identically to `to_owned_at_depth`'s own
     /// panicking guard, on both branches it mirrors. This pins the array
-    /// branch: `to_owned` panics on 256-deep nesting (the guard this
+    /// branch: `to_owned` panics on 257 containers of nesting (the guard this
     /// function stands in for), `to_owned_checked` reports a clean error
-    /// instead, at the exact same boundary.
+    /// instead, at the exact same boundary. The ceiling is jq's own: 256
+    /// containers read, the scalar inside the 256th included, and the 257th
+    /// refused (#6618, `jq -c . ` over each, jq 1.7.1).
     #[test]
     fn test_to_owned_checked_reports_clean_error_past_nesting_limit_2299() {
         use crate::json::JsonIndex;
-        let json = format!("{}1{}", "[".repeat(256), "]".repeat(256));
+        let at_limit = format!("{}1{}", "[".repeat(256), "]".repeat(256));
+        let index = JsonIndex::build(at_limit.as_bytes());
+        let cursor = index.root(at_limit.as_bytes());
+        to_owned_checked::<JqSemantics, _>(&cursor.value())
+            .expect("256 containers around a scalar is jq's own ceiling, which it reads");
+        let json = format!("{}1{}", "[".repeat(257), "]".repeat(257));
         let json = json.as_bytes();
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
         let err = to_owned_checked::<JqSemantics, _>(&value)
-            .expect_err("256 levels of array nesting exceeds the limit");
+            .expect_err("257 levels of array nesting exceeds the limit");
         assert!(
             err.message.contains("nesting depth exceeds limit of 256"),
             "message: {}",
             err.message
         );
+    }
+
+    /// #6618: `to_owned` (the unchecked walk the checked one stands in for) draws the same boundary
+    /// as `to_owned_checked`: 256 containers around a scalar read, the 257th is refused with the
+    /// catchable decode failure. The two must agree, as #2299's review required.
+    #[test]
+    fn test_to_owned_draws_the_checked_walks_nesting_boundary_6618() {
+        use crate::json::JsonIndex;
+        for (shape, open, close) in [("array", "[", "]"), ("object", "{\"a\":", "}")] {
+            for (containers, reads) in [(255usize, true), (256, true), (257, false)] {
+                let json = format!("{}1{}", open.repeat(containers), close.repeat(containers));
+                let json = json.as_bytes();
+                let index = JsonIndex::build(json);
+                let cursor = index.root(json);
+                let value = cursor.value();
+                let plain = to_owned::<JqSemantics, _>(&value);
+                let checked = to_owned_checked::<JqSemantics, _>(&value);
+                assert_eq!(plain.is_ok(), reads, "{shape} x{containers}: to_owned");
+                assert_eq!(
+                    checked.is_ok(),
+                    reads,
+                    "{shape} x{containers}: to_owned_checked"
+                );
+                if !reads {
+                    for err in [plain.unwrap_err(), checked.unwrap_err()] {
+                        assert!(
+                            err.message.contains("nesting depth exceeds limit of 256"),
+                            "{shape} x{containers}: {}",
+                            err.message
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Companion to the test above: legitimately-nested input well under
@@ -44899,13 +44943,13 @@ mod tests {
     #[test]
     fn test_to_owned_checked_object_branch_reports_clean_error_past_nesting_limit_2299() {
         use crate::json::JsonIndex;
-        let json = format!("{}1{}", "{\"a\":".repeat(256), "}".repeat(256));
+        let json = format!("{}1{}", "{\"a\":".repeat(257), "}".repeat(257));
         let json = json.as_bytes();
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
         let err = to_owned_checked::<JqSemantics, _>(&value)
-            .expect_err("256 levels of object nesting exceeds the limit");
+            .expect_err("257 levels of object nesting exceeds the limit");
         assert!(
             err.message.contains("nesting depth exceeds limit of 256"),
             "message: {}",
