@@ -7287,9 +7287,11 @@ What still differs:
 - Under `--slurp` the message has no `at line L, column C`: the files are joined into one array before it is indexed, so the position is gone by then.
 - jq's `--stream` uses its streaming parser, which has no depth limit, and succinctly's `--stream` does not apply jq's parse limit either.
   Except without `-s` (#5498), it still materializes each document before it streams the events, though, so it stops at the materializer's ceiling below (a document of 257 nested arrays), where jq streams on.
-- The routes that materialize a document (`input`/`inputs`, `--slurpfile`, and the filters that build an owned copy, such as `tojson`, `del` and `sort`) check every node, leaves included, against `MAX_NESTING_DEPTH` (256).
-  A document jq accepts with a scalar at its 257th level, which only 256 nested containers can hold (`[[…[1]…]]` with 256 arrays, or 255 arrays around `{"a":1}`), is refused there with `nesting depth exceeds limit of 256`.
-  The guard is shared with `succinctly yq` across the evaluator, and a one-level band is not worth moving it for.
+- The routes that read a document into an owned value (`input`/`inputs`, `--slurpfile`, a `--seq` record) hold only a container to `MAX_NESTING_DEPTH` (256), since a scalar recurses no deeper (#6618).
+  A document jq accepts with a scalar at its 257th level, which only 256 nested containers can hold (`[[…[1]…]]` with 256 arrays, or 255 arrays around `{"a":1}`), is read there, as jq reads it.
+  Until #6618 those routes checked every node, leaves included, and refused it with `nesting depth exceeds limit of 256`; `--seq` dropped the record without a word (`--seq -nc '[inputs|type]'` printed `[]`, `--seq -s length` printed `0`).
+  The filters that build an owned copy (`tojson`, `tostring`, `del`, `walk` and `flatten`, measured over 256 arrays around `1`) still check every node against the ceiling and refuse the same document with `nesting depth exceeds limit of 256`.
+  Their guards are shared with `succinctly yq` across the evaluator, and a one-level band is not worth moving them for.
 - `--preserve-input`'s raw echo (a succinctly extension that echoes a document without validating it) does not apply the limit.
 - A document deeper than 128 levels whose first fault in jq's order is something else keeps the default route's lazy handling of that fault: the depth check refuses only what jq's depth limit refuses.
 
