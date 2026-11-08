@@ -9241,9 +9241,9 @@ Pinned in `tests/jq_cli/i6662.rs`, and its yq gating in `tests/yq_cli/i6662.rs`.
 
 `_nwise(n)` and `_nwise(a; n)` run in `succinctly jq` as jq 1.7.1 defines them in its builtin.jq.
 They are not in jq's manual, but `[_nwise(3)]` is a widely quoted chunking idiom.
-The definitions are `def _nwise($n): def n: if length <= $n then . else .[0:$n] , (.[$n:] | n) end; n;` and `def _nwise(a; $n): a | _nwise($n);`, checked against the pinned jq over 29 programs rather than taken from memory.
+The definitions are `def _nwise($n): def n: if length <= $n then . else .[0:$n] , (.[$n:] | n) end; n;` and `def _nwise(a; $n): a | _nwise($n);`, checked against the pinned jq over the programs of `tests/jq_cli/i6684.rs` rather than taken from memory.
 The parser expands a call to them where it stands, so `[_nwise(2,3)]` chunks by 2 and then by 3, `_nwise(a; 3)` chunks each output of `a`, and `path(_nwise(3))` answers the slice paths jq answers.
-A `def _nwise` of the program's, or of an included module's, shadows it, as in jq.
+A `def _nwise` of the program's, or of an included module's, shadows it where its arity and scope reach the call, as in jq: a `def _nwise(a; b; c)` leaves `_nwise(2)` the builtin, and so does a def in a scope the call is outside of or a `def _nwise` spelled in a comment.
 `_nwise` and `_nwise(a; b; c)` stay jq's compile error (`_nwise/0 is not defined`, `_nwise/3 is not defined`, exit 3).
 `builtins` omits it, as jq's omits every name that starts with an underscore.
 `succinctly yq` does not define it, since real yq has no such function.

@@ -925,17 +925,12 @@ fn dollar_var_expr(name: String, line: usize) -> Expr {
     }
 }
 
-/// #2036 Direction 3: a cheap, deliberately over-approximate scan for every
-/// identifier spelled after a `def` keyword anywhere in `input`, plus (#2723)
-/// every identifier spelled in that `def`'s own parameter list -- see
-/// `Parser::shadowable_defs`'s own doc comment for why imprecision here is
-/// safe (a false positive costs one wasted double-parse at one call site; a
-/// false negative is impossible to turn into a wrong *answer* either, since
-/// `resolve.rs`'s own scope-aware pass is what actually decides shadowing,
-/// this is only a hint for which call sites are worth asking it about).
-/// Deliberately not lexically aware -- does not skip string literals or
-/// comments, so `"def foo"` or `# def foo` also add `foo` to the set. Plain
-/// substring scanning, not a real lexer pass, by design.
+/// The variable `_nwise(n)`'s expansion binds its argument to first (#6684): a name a program
+/// cannot spell, so [`nwise_fallback_arity`] and its siblings recognize the shape.
+const NWISE_ONE_VAR: &str = "__nwise_1";
+/// The same marker for the expansion of `_nwise(a; n)`: `n`'s generator is bound to it.
+const NWISE_TWO_VAR: &str = "__nwise_m";
+
 /// jq 1.7.1's `_nwise` (#6684), as its builtin.jq defines it:
 ///
 /// ```jq
@@ -947,9 +942,10 @@ fn dollar_var_expr(name: String, line: usize) -> Expr {
 /// it, and the second form was not what the first draft of this guessed.) Expanded at the call
 /// site, with the argument expressions put in where jq's `$n` and `a` are bound, so `[_nwise(2,3)]`
 /// chunks by 2 and then by 3, `_nwise(a; 3)` chunks each output of `a`, and a `$n` generator
-/// is the outer loop. The one extra name, `$__nwise_m`, is not one a program writes (as jq's own
-/// `$__loc__`), and the arguments are parsed outside the template, so they cannot see its
-/// variables.
+/// is the outer loop. The extra names, `$__nwise_1` and `$__nwise_m`, are not ones a program
+/// writes (as jq's own `$__loc__`), and the arguments are parsed outside the template, so they
+/// cannot see its variables. The template is parsed by a parser of its own, which has no program
+/// `def`s, so its `length` and its slices are the builtins whatever the program defines.
 ///
 /// `Err(args)` hands the arguments back when the template does not have the shape this fills in
 /// (it is parsed from the text above, so a test pins the shape): the call stays a plain call.
@@ -959,9 +955,9 @@ fn nwise_expansion(mut args: Vec<Expr>) -> Result<Expr, Vec<Expr>> {
     // alone), so it cannot see them.
     const BODY: &str = "def n: if length <= $n then . else .[0:$n] , (.[$n:] | n) end; n";
     let template = if args.len() == 1 {
-        format!("0 as $n | {BODY}")
+        format!("0 as ${NWISE_ONE_VAR} | ${NWISE_ONE_VAR} as $n | {BODY}")
     } else {
-        format!("0 as $__nwise_m | 1 | ($__nwise_m as $n | {BODY})")
+        format!("0 as ${NWISE_TWO_VAR} | 1 | (${NWISE_TWO_VAR} as $n | {BODY})")
     };
     let Ok(mut parsed) = parse_with_mode(&template, ParserMode::Jq) else {
         return Err(args);
@@ -982,9 +978,76 @@ fn nwise_expansion(mut args: Vec<Expr>) -> Result<Expr, Vec<Expr>> {
         *slot = args.remove(0);
         **expr = args.remove(0);
     }
-    Ok(Expr::Paren(Box::new(parsed)))
+    Ok(parsed)
 }
 
+/// The arity of a stored `_nwise` expansion (#6684), for `resolve.rs`'s shadowing check: the call
+/// is a `builtin_fallback`, so a `def _nwise` of the same arity in scope wins and any other
+/// (another arity, a def in a scope the call is outside of, a `def` spelled in a comment) leaves
+/// jq's builtin. `None` for any other expression.
+pub(crate) fn nwise_fallback_arity(expr: &Expr) -> Option<usize> {
+    match expr {
+        Expr::As { var, .. } if var == NWISE_ONE_VAR => Some(1),
+        Expr::As { var, .. } if var == NWISE_TWO_VAR => Some(2),
+        _ => None,
+    }
+}
+
+/// The call's own arguments out of a stored `_nwise` expansion, in the order written (`a`, then
+/// `n`), moved out; `Err` hands any other expression back.
+pub(crate) fn nwise_fallback_into_args(expr: Expr) -> Result<Vec<Expr>, Expr> {
+    match expr {
+        Expr::As { var, expr, body } if var == NWISE_ONE_VAR => {
+            let _ = body;
+            Ok(alloc::vec![*expr])
+        }
+        Expr::As { var, expr, body } if var == NWISE_TWO_VAR => match *body {
+            // `nwise_expansion` builds a pipe whose first stage is `a`.
+            Expr::Pipe(stages) => {
+                let mut stages = stages.into_iter();
+                let first = stages.next();
+                // patchcov: coverage tolerate reason="unreachable: nwise_expansion's pipe always has `a` as its first stage, and only it names the marker variable"
+                let Some(first) = first else {
+                    return Ok(alloc::vec![*expr]);
+                };
+                // patchcov: coverage end
+                Ok(alloc::vec![first, *expr])
+            }
+            // patchcov: coverage tolerate reason="unreachable: only nwise_expansion names the marker variable, and its body is a pipe"
+            other => Err(Expr::As {
+                var,
+                expr,
+                body: Box::new(other),
+            }),
+            // patchcov: coverage end
+        },
+        other => Err(other),
+    }
+}
+
+/// [`nwise_fallback_into_args`], by reference.
+pub(crate) fn nwise_fallback_children(expr: &Expr) -> Option<Vec<&Expr>> {
+    match expr {
+        Expr::As { var, expr, .. } if var == NWISE_ONE_VAR => Some(alloc::vec![expr.as_ref()]),
+        Expr::As { var, expr, body } if var == NWISE_TWO_VAR => match body.as_ref() {
+            Expr::Pipe(stages) => stages.first().map(|a| alloc::vec![a, expr.as_ref()]),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// #2036 Direction 3: a cheap, deliberately over-approximate scan for every
+/// identifier spelled after a `def` keyword anywhere in `input`, plus (#2723)
+/// every identifier spelled in that `def`'s own parameter list -- see
+/// `Parser::shadowable_defs`'s own doc comment for why imprecision here is
+/// safe (a false positive costs one wasted double-parse at one call site; a
+/// false negative is impossible to turn into a wrong *answer* either, since
+/// `resolve.rs`'s own scope-aware pass is what actually decides shadowing,
+/// this is only a hint for which call sites are worth asking it about).
+/// Deliberately not lexically aware -- does not skip string literals or
+/// comments, so `"def foo"` or `# def foo` also add `foo` to the set. Plain
+/// substring scanning, not a real lexer pass, by design.
 fn collect_def_names(input: &str) -> BTreeSet<String> {
     // Yq mode's own `-`-in-identifier extension (`.my-key`) is folded in
     // unconditionally here too, even though real `def` doesn't exist in yq
@@ -6149,12 +6212,13 @@ impl<'a> Parser<'a> {
         // for the name and find an unrelated same-spelling occurrence.
         // #6684: jq's `_nwise` is defined in its builtin.jq. A `def _nwise` of the program's (or of
         // an included module's, `extra`) keeps the name, as any builtin is shadowed.
-        if self.mode == ParserMode::Jq
-            && name == "_nwise"
-            && matches!(args.len(), 1 | 2)
-            && !self.shadowable_defs.contains("_nwise")
-        {
+        if self.mode == ParserMode::Jq && name == "_nwise" && matches!(args.len(), 1 | 2) {
+            // A program that spells `def _nwise` anywhere keeps the expansion as a
+            // `builtin_fallback`, which `resolve.rs` takes only where no `def _nwise` of this
+            // arity is in scope (#2036).
+            let shadowable = self.shadowable_defs.contains("_nwise");
             return match nwise_expansion(args) {
+                Ok(expanded) if shadowable => Ok(Self::wrap_shadowable_call("_nwise", expanded)),
                 Ok(expanded) => Ok(expanded),
                 Err(args) => {
                     self.record_call_site(name.clone(), args.len(), start_pos);
@@ -6899,7 +6963,8 @@ impl<'a> Parser<'a> {
                 | Expr::Builtin(_)
                 | Expr::Break(_)
         ) || matches!(&original, Expr::Paren(inner) if matches!(**inner, Expr::Range { .. }))
-            || join_expr_arity(&original).is_some();
+            || join_expr_arity(&original).is_some()
+            || nwise_fallback_arity(&original).is_some();
         if !is_recognized_special_form_shape {
             return original;
         }
