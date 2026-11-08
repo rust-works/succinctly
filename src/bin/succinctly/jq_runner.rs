@@ -6717,32 +6717,37 @@ fn take_unopened_tail(locations: &mut InputLocations) {
     }
 }
 
+/// The first fault of the JSON text the files `raws` make, as [`first_stream_fault`] says it, for
+/// the modes that read a JSON text with its own parser: `-R`, `--seq`, `--stream`,
+/// `--stream-errors`, DSV and `--validate` raise their own faults, or none. One definition for
+/// [`fault_reaches_end`] and [`json_text_faults`].
+fn json_text_first_fault(raws: &[Vec<u8>], args: &JqCommand) -> Option<(usize, bool)> {
+    if args.raw_input
+        || args.seq
+        || args.stream
+        || args.stream_errors
+        || args.input_dsv.is_some()
+        || args.validate
+    {
+        return None;
+    }
+    first_stream_fault(raws)
+}
+
 /// Whether the JSON text the files `raws` make faults somewhere (#6663). The reads of a program that
 /// reads `input` meet each fault and go on past it, reaching the failures after it as they do, so
 /// the hook places them, whatever the text's last token is. The up-front route cuts its report at
 /// the first fault, which is right only for the main loop's own read of it, and that route is the
 /// one a last value that completes only at its end (`2` of `1 }` and `2`) sends the run to.
 fn json_text_faults(raws: &[Vec<u8>], args: &JqCommand) -> bool {
-    !(args.raw_input
-        || args.seq
-        || args.stream
-        || args.stream_errors
-        || args.input_dsv.is_some()
-        || args.validate)
-        && first_stream_fault(raws).is_some()
+    json_text_first_fault(raws, args).is_some()
 }
 
 /// Whether the first fault of the JSON text the files `raws` make is at its end (#6480): `[1,`
 /// waits for more, so jq's parser asks the reader past the last file before it gives up, and the
 /// fault is raised there. `--seq` and the streaming readers raise their own faults.
 fn fault_reaches_end(raws: &[Vec<u8>], args: &JqCommand) -> bool {
-    !(args.raw_input
-        || args.seq
-        || args.stream
-        || args.stream_errors
-        || args.input_dsv.is_some()
-        || args.validate)
-        && matches!(first_stream_fault(raws), Some((_, true)))
+    matches!(json_text_first_fault(raws, args), Some((_, true)))
 }
 
 /// Whether the last value of the text the files `raws` make completes only at its end (#6480): a
@@ -6976,6 +6981,9 @@ fn read_inputs(
         // #6643: the reader's own faults stand in for the JSON text's rule of where a value ends: a
         // number at the end of the last file is the fault `Potentially truncated top-level numeric
         // value at EOF`, which the hook places by the fault's own read.
+        // #6663: a JSON text that faults counts as ending cleanly too. Where its last token
+        // completes is then the fault's to place along with the failures around it: the reads that
+        // meet each fault go on past it, and the up-front route would stop at the first.
         let ends_cleanly = raw_lines_read_whole
             || !seq_fault_ends_of_stream.is_empty()
             || seq_readers_place_reads
