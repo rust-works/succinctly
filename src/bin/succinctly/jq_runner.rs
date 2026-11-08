@@ -6727,6 +6727,15 @@ fn read_inputs(
 
     // Get input files
     let files = get_input_files(args);
+    // Shared by the open-failure deferral, `seq_warnings_apply` below, the `-n`-forced-read
+    // fallback just after it, and the `build_seq_values` gate further down -- one definition rather
+    // than hand-copies of the same shape, so a future change to it can't desynchronize them
+    // (CLAUDE.md: "Duplicated predicates diverge silently").
+    let seq_stream_shape = args.seq && !args.raw_input && args.input_dsv.is_none();
+    // #6584: whether the `--seq` readers place each read where jq's reader stands when it completes
+    // it, a fault included: their positions follow the reader into the next file, and a last file
+    // that did not open is a source of their own (below, #6588). A slurp reads every file first.
+    let mut seq_readers_place_reads = false;
 
     // #5498: a program that asks for the `--stream` events as it goes reads them from the files a
     // chunk at a time, as jq does, and not from their bytes read whole first.
@@ -6855,7 +6864,13 @@ fn read_inputs(
         // stops on an earlier line never gets there, as in jq. `--stream` and `--stream-errors`
         // place that tail themselves and keep the test.
         let raw_lines_read_whole = args.raw_input && !args.stream && !args.stream_errors;
+        // A last failure that is not a source of its own (a directory) is reported by a read past
+        // the end, which a fault raised first never makes: that stream keeps #6586's rule below.
+        let unplaced_tail = failures.last().is_some_and(|&(at, _)| at >= files.len())
+            && unopened_tail_name(&failures, files.len()).is_none();
+        seq_readers_place_reads = seq_stream_shape && !args.slurp && !unplaced_tail;
         let ends_cleanly = raw_lines_read_whole
+            || seq_readers_place_reads
             || failures.iter().all(|&(at, _)| {
                 // The last file with bytes before it: an empty one between sends the reader on too.
                 (last_value_at_tail && at >= raws.len())
@@ -6869,15 +6884,17 @@ fn read_inputs(
         // #6525: so does a program that reads `input` without `-n`, whose main loop reads the first
         // file before the program does and stops one value past a failure. Every route that reads
         // `input` seeds the queue the hook reports from.
-        // #6555: a `--seq` stream its reader reads without a fault pops its values as a JSON
-        // stream's are, so the reads reach the failures as they do there; `-R` reads the lines of
-        // one with its own reader, as it reads any text. With nothing to report the walk is not
-        // worth its copy of the text.
+        // #6555, #6584: `-R` reads the lines of a `--seq` stream with its own reader, as it reads
+        // any text, and the `--seq` readers place each read where the reader stands, a fault
+        // included, so their reads reach the failures as a JSON stream's do. A stream they cannot
+        // place the reads of is deferred only when it reads without a fault, as a JSON stream's
+        // values are placed then; with nothing to report the walk is not worth its copy of the text.
         if (args.null_input || track_eof)
             && !args.slurp
             && args.input_dsv.is_none()
             && (!args.seq
                 || args.raw_input
+                || seq_readers_place_reads
                 || (any_open_failure
                     // #6588: the streaming readers (`read_seq`) still end the stream at the
                     // final buffer of the last file that opened (#6591), so for them an unopened
@@ -6885,7 +6902,9 @@ fn read_inputs(
                     && seq_text_reads_clean(&raws, unopened_tail && !seq_by_stream_reader(args))))
             && ends_cleanly
         {
-            let fault_ends_text = matches!(first_stream_fault(&raws), Some((_, true)));
+            // The `--seq` readers place their own faults: the JSON text's fault is not theirs.
+            let fault_ends_text =
+                !seq_readers_place_reads && matches!(first_stream_fault(&raws), Some((_, true)));
             defer_open_failures(failures, fault_ends_text);
         } else {
             // #6522: only the main loop reads, one value at a time, when nothing asks for more.
@@ -7023,12 +7042,13 @@ fn read_inputs(
     // The walk's diagnostics, kept only where `input`/`inputs` raise them ([`seq_faults_queued`]):
     // each comes out in order with the values, where a plain run prints it as a warning.
     let mut seq_fault_errors: Vec<(usize, TrailingParseError)> = Vec::new();
-    // Shared by `seq_warnings_apply` below, the `-n`-forced-read fallback
-    // just after it, and the `build_seq_values` gate further down -- one
-    // definition rather than three hand-copies of the same shape, so a
-    // future change to it can't desynchronize them (CLAUDE.md: "Duplicated
-    // predicates diverge silently").
-    let seq_stream_shape = args.seq && !args.raw_input && args.input_dsv.is_none();
+    // #6584: a last file that did not open is one more source to jq's `--seq` readers, an empty one
+    // they stand at, line 0. The walk's own `Tail` (#6588) keeps the end-of-stream drop (#2998) off
+    // the last file that opened; this source is where what is read past it is placed: the fault at
+    // the end of the text (#6531) and a value that completes only there.
+    if seq_readers_place_reads && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some()) {
+        raw_bytes.push((Some(files.len()), Vec::new()));
+    }
     let seq_warnings_apply = seq_stream_shape && !args.null_input && !seq_by_stream_reader;
     if seq_by_stream_reader {
         // The streaming reader finds the records and their faults itself.
@@ -7040,6 +7060,9 @@ fn read_inputs(
         seq_slurp_position_lost = match seq_no_rs_byte_warning(&raw_bytes) {
             Some(warning) => {
                 seq_warned = true;
+                // #6555: a stream with no record separator holds no value, so jq's reader reads
+                // past every file before it warns at the end: each deferred failure comes first.
+                report_reached_open_failures(None, false);
                 eprintln!("{warning}");
                 // #1525's arm prints its own template instead of the
                 // reader's, but the location still needs the walk. A
@@ -7549,17 +7572,6 @@ fn read_inputs(
     // filter's own `input`. jq has lost its position by then -- the call
     // that raises it closed the stream -- so it names `<unknown>`.
     let mut resumed_errors: Vec<(usize, TrailingParseError)> = seq_fault_errors;
-    // #6531: `--seq`'s reader raises its own faults, and the last one, at the end of the text, is
-    // raised at a last file that did not open, line 0, as the JSON reader's is (#6480).
-    if !args.slurp && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some()) {
-        if let Some((_, fault)) = resumed_errors
-            .last_mut()
-            .filter(|(_, fault)| fault.error.message.contains(" at EOF"))
-        {
-            fault.source = u32::try_from(files.len()).unwrap_or(u32::MAX);
-            fault.line = 0;
-        }
-    }
     // #6019: whether `-n -s` read a stream with a fault the resuming way (below).
     let mut resume_slurp_done = false;
     let mut trailing_error: Option<TrailingParseError> =
@@ -9014,7 +9026,8 @@ fn defer_open_failures(failures: Vec<(usize, InputFileOpenError)>, fault_ends_te
 /// where a JSON stream's is and nothing else comes out of the input queue. That holds for
 /// `--stream` and `--stream-errors` too, whose events of a clean record stream are placed as their
 /// values'. A slurp reads every file before the program runs, so this is asked only of a run
-/// without `-s`.
+/// without `-s`. Since #6584 it decides only a run whose last failure is not a source of its own
+/// (a directory), the rest being placed by `seq_readers_place_reads`.
 fn seq_text_reads_clean(raws: &[Vec<u8>], unopened_tail: bool) -> bool {
     let sources: Vec<(Option<usize>, Vec<u8>)> = raws
         .iter()
