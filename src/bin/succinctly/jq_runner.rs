@@ -5269,8 +5269,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // `--validate` already printed its own report.
                 Err(SlurpFailure::Validation(exit_code)) => return Ok(exit_code),
                 // #6476: a file that did not open makes the run exit 2 after any of these faults.
-                Err(SlurpFailure::DepthLimit) => {
-                    sink.report_parse_error("Exceeds depth limit for parsing");
+                Err(SlurpFailure::DepthLimit(message)) => {
+                    sink.report_parse_error(
+                        message
+                            .as_deref()
+                            .unwrap_or("Exceeds depth limit for parsing"),
+                    );
                     return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
                 }
                 // Line 0 of the first file, where `get_inputs` has always
@@ -5500,6 +5504,15 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         .flatten()
                         .filter(|read| jq::is_jq_depth_fault(read))
                         .unwrap_or(message);
+                    // #6628: a slurp joined the documents, so the position is that of the files
+                    // read again as one stream (stdin cannot be, and keeps the bare message).
+                    let message = if source == jq::InputSource::Slurped {
+                        reread_stream_fault(&files)
+                            .filter(|read| jq::is_jq_depth_fault(read))
+                            .unwrap_or(message)
+                    } else {
+                        message
+                    };
                     sink.report_parse_error(&message);
                     run_stopped = true;
                     break 'files;
@@ -12804,9 +12817,9 @@ enum SlurpFailure {
     /// when its parser stops there too.
     Unsplittable(Option<String>),
     /// jq's parse-depth limit refuses the document the splitter gave up on, before the fault it
-    /// stopped at (#5497). Reported as jq's parse error, without the position, as every depth
-    /// refusal under `--slurp` is.
-    DepthLimit,
+    /// stopped at (#5497). Carries jq's own parse error for it, with the position of the bracket
+    /// it refuses (#6628), when the stream can be read again to place it.
+    DepthLimit(Option<String>),
 }
 
 /// What [`slurp_documents`] hands the lazy per-document loop (#2847).
@@ -12932,14 +12945,17 @@ fn slurp_documents(
         }
         let (spans, split_error) = split_json_values(&raw);
         if let Some(offset) = split_error {
-            // #5497: jq meets its depth limit first when the refused bracket comes first.
-            if jq::jq_depth_fault_offset(&raw[offset..]).is_some() {
-                return Err(SlurpFailure::DepthLimit);
-            }
             let read = originals
                 .get(idx)
                 .and_then(Option::as_deref)
                 .unwrap_or(&raw);
+            // #5497: jq meets its depth limit first when the refused bracket comes first.
+            if jq::jq_depth_fault_offset(&raw[offset..]).is_some() {
+                // #6628: and names where its parser stood, as the stream route does.
+                let message =
+                    slurp_fault(files, idx, read, origin).filter(|m| jq::is_jq_depth_fault(m));
+                return Err(SlurpFailure::DepthLimit(message));
+            }
             let message = slurp_fault(files, idx, read, origin);
             // #6004: a bare token straight before the stream's last byte, an opener, is a value
             // by the time jq meets the fault: the array keeps it and the error follows.
@@ -20996,7 +21012,7 @@ mod tests {
                 )),
                 Err(f) => Err(match f {
                     SlurpFailure::Unsplittable(_) => "unsplittable",
-                    SlurpFailure::DepthLimit => "depth",
+                    SlurpFailure::DepthLimit(_) => "depth",
                     SlurpFailure::Validation(_) => "validation",
                 }),
             }
