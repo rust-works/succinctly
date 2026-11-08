@@ -11156,16 +11156,18 @@ fn owned_path_each_optional<'v, S: EvalSemantics>(
     if S::TAG != EvalTag::Jq {
         return None;
     }
-    let mut stages = Vec::new();
-    path_stages(expr, &mut stages);
-    let (last, path) = stages.split_last()?;
-    match last {
-        Expr::Optional(inner) if matches!(unwrap_paren(inner), Expr::Iterate) => {}
+    // Every program the front doors are offered reaches here, so the last stage is checked before
+    // any are collected.
+    match last_path_stage(expr) {
+        Some(Expr::Optional(inner)) if matches!(unwrap_paren(inner), Expr::Iterate) => {}
         _ => return None,
     }
     if super::eval_generic::embed_table_active() {
         return None;
     }
+    let mut stages = Vec::new();
+    path_stages(expr, &mut stages);
+    let (_, path) = stages.split_last()?;
     let mut at = input;
     for stage in path {
         at = match (static_step(stage)?, at) {
@@ -11190,6 +11192,16 @@ fn path_stages<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
         Expr::Pipe(stages) => stages.iter().for_each(|stage| path_stages(stage, out)),
         Expr::Identity => {}
         other => out.push(other),
+    }
+}
+
+/// The last of [`path_stages`]'s stages of `expr`, found without collecting them: `None` when
+/// every stage is an identity.
+fn last_path_stage(expr: &Expr) -> Option<&Expr> {
+    match unwrap_paren(expr) {
+        Expr::Pipe(stages) => stages.iter().rev().find_map(last_path_stage),
+        Expr::Identity => None,
+        other => Some(other),
     }
 }
 
