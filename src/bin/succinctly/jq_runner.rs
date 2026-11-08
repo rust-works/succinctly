@@ -7076,9 +7076,15 @@ fn read_inputs(
                 .then(|| first_stream_fault(&raws))
                 .flatten();
             let text_faults = slurp_fault.is_some();
-            if main_loop_only && (args.raw_input || args.input_dsv.is_some()) && !args.validate {
+            if main_loop_only
+                && (args.raw_input
+                    || args.input_dsv.is_some()
+                    || stream_errors_main_loop_places_failures(args, &failures[..reached], &raws))
+                && !args.validate
+            {
                 // #6531: `-R`'s main loop reports a file when the line it reads comes from past it,
-                // after the lines before. #6585: and `--input-dsv`'s, for a record.
+                // after the lines before. #6585: and `--input-dsv`'s, for a record. #6683: and
+                // `--stream-errors`', which a program that halts first never reaches past.
                 let mut failures = failures;
                 failures.truncate(reached);
                 defer_open_failures(failures, false);
@@ -9829,6 +9835,32 @@ fn last_directory_left_to_reads(
         && failures.len() > 1
         && reached == failures.len()
         && ends_in_last_directory(failures)
+}
+
+/// Whether a `--stream-errors` run whose main loop alone reads (#6522) leaves the failures it
+/// reached to that loop's reads, as `-R` does (#6683): a file is reported, and a directory counted,
+/// only when a read gets there, so a program that halts first reports nothing.
+///
+/// Only where the first value the loop reads completes inside its own file, before the first
+/// failure: one that needs the next file to end (a bare number with no newline) sends the reader
+/// into the failure on that first read, which then counts it whatever the program does next. And
+/// only where no file with bytes follows the first failure: the loop stops at the value that took
+/// the reader past it, with the failures behind that value's own file reported by what that value
+/// needed to end, which the up-front report places.
+fn stream_errors_main_loop_places_failures(
+    args: &JqCommand,
+    reached: &[(usize, InputFileOpenError)],
+    raws: &[Vec<u8>],
+) -> bool {
+    let Some(&(first_failure, _)) = reached.first() else {
+        return false;
+    };
+    stream_errors_reads_place_failures(args)
+        && raws.iter().skip(first_failure).all(Vec::is_empty)
+        && raws
+            .iter()
+            .position(|raw| !raw.is_empty())
+            .is_some_and(|file| file < first_failure && first_value_completes_at(raws, file, args))
 }
 
 /// Whether `args` read JSON text with `--stream-errors` alone: its in-memory route (without `-n`, or
