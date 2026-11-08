@@ -291,6 +291,13 @@ QUERIES = [
     # reads identically to `length` on this fixture (both -12.20%), so it is
     # not a second row.
     ("wide_length", "wide", "2mb", "jq", "length"),
+    # #6619: a `--seq` stream with a diagnostic. Every other `--seq` shape the project times reads
+    # a clean stream, which takes #5674's plain route; one truncated record sends the run down the
+    # route #6500 made incremental, so a change that went back to materializing every record (the
+    # 0.22x and 1.1 GB at 100 MB #6500 started from) read 0.0% on every row above. `json-seq-bad-last`
+    # is the `json-seq` pattern's records and one cut-off record after them, read as `-r .name`
+    # (`QUERY_FLAGS`), so the time and, through the instruction count, the work are both watched.
+    ("seq_name_bad_last", "json-seq-bad-last", "2mb", "jq", ".name"),
     # The mid-width shape: an array of equal objects of a few hundred keys,
     # where #4167's prefilter gate (128 keys) applies per object. -6.8% Ir
     # there, -0.85% on the same filter over 8-key objects (so no 8-key row:
@@ -313,6 +320,7 @@ QUERY_FLAGS = {
     "users_yq_raw_slice": ["-R"],
     "users_yq_raw_concat": ["-R"],
     "users_yq_raw_test": ["-R"],
+    "seq_name_bad_last": ["--seq", "-r"],
     # yq's lexer has no `keys_unsorted`, so yq mode needs the flag for it (#4808); its cost
     # is one boolean in the parser, nothing on the keys walk this row measures.
     "users_yq_keys_unsorted": ["--jq-extensions"],
