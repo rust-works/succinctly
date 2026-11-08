@@ -102,15 +102,13 @@ fn an_extension_builtin_beside_a_static_path_target_still_answers_5233() -> Resu
 fn a_dynamic_path_program_over_an_undecodable_document_raises_5233() -> Result<()> {
     let lone = r#"{"a":"\ud800","d":5}"#;
     let deep = format!("{}1{}", "[".repeat(256), "]".repeat(256));
-    for (filter, input, message) in [(
-        "[.d | path(if . then . else empty end)]",
-        lone,
-        "invalid unicode escape sequence",
-    )] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!((stdout.as_str(), code), ("", 5), "`{filter}`: {stderr}");
-        assert!(names_fault(&stderr, message), "`{filter}`: {stderr}");
-    }
+    let filter = "[.d | path(if . then . else empty end)]";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(lone))?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "`{filter}`: {stderr}");
+    assert!(
+        names_fault(&stderr, "invalid unicode escape sequence"),
+        "`{filter}`: {stderr}"
+    );
     let (stdout, stderr, code) = run_jq_full(&["-c", "[.d | path(.)]"], Some(lone))?;
     assert_eq!((stdout.as_str(), code), ("[[]]\n", 0), "{stderr}");
     // #6631: a document 256 containers deep is read by the dynamic path walk, as jq reads it.
