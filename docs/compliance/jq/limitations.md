@@ -1605,6 +1605,13 @@ operand like any other, so the same fused read answers it. An owned array (a con
 closed bounds only, instead of being written out and indexed again for each read; an owned array has
 no malformed element to skip, so that route adds no row to the table above.
 
+Since [#6692](https://github.com/rust-works/succinctly/issues/6692) the same answers come from the pipes of `eval.rs`, which build a slice and then read it for a loop body over a built array (`[range(0; N; 2) as $i | .[$i:][0]]`), and a second literal slice (`E[a:b][c:d]`) is composed onto the first's resolved range.
+The composed slice converts only the elements of its own range, so a malformed element of the first slice that the second drops is not read: `[1,{"a":},3] | .[:2][:1]` is `[1]` and `.[1:][1:]` is `[3]`, where jq rejects the document and the build before #6692 raised.
+That is the posture of the reads above, for the same reason: converting the first slice's elements is the O(tail) per read that made the loop quadratic.
+A bare `.[a:b]`, a read that names the malformed element (`.[1:][0]`) and a slice whose range holds it (`.[:2][:2]`) still raise.
+Pinned by `tests/jq_cli/i6692.rs`.
+Still O(tail) per read: a `?` on the second slice (`.[$i:][:2]?`) and a chain of three slices, which the fusion does not look through.
+
 Still unfused, and so still O(tail) per read: a computed index that is fractional, a string, `null` or
 fans out (the ordinary route answers or raises it), a `key` read with a `parent`, a `?`, a field step
 over an element that is not an object, a target other than `.` (`.a[$i:][0] | key`) or any other stage
