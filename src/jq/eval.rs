@@ -96630,9 +96630,9 @@ fn walk_impl_at_depth<S: EvalSemantics>(
 /// `test_isvalid_reaches_every_builtins_own_optional_guard` for the full
 /// before/after case-by-case verification, including two cases
 /// (`@format`'s own `_ if optional => Ok(String::new())` arm, and
-/// `paths_filter`'s node-error swallowing) where the old forcing had
-/// produced a succinctly-only divergence from real jq's own reference
-/// `isvalid` desugaring that this fix incidentally corrects too.
+/// `paths_filter`'s node-error swallowing) where the old forcing answered
+/// unlike `def isvalid(f): try (f|true) catch false;` run on real jq. That is
+/// only a comparison: `isvalid` is a succinctly extension, no jq has it (#6662).
 fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
@@ -146790,15 +146790,15 @@ mod tests {
             );
         }
 
-        // #881 review: real jq has no `isvalid` builtin to diff against
-        // directly, but its own doc comment ("check if expr succeeds
-        // without errors") matches the standard community desugaring
-        // `def isvalid(f): try (f|true) catch false;` — checked live
-        // against jq 1.8.2. Under that reference, `isvalid(@base64d)` on a
-        // non-string input is `false` (`try @base64d catch false`:
-        // `@base64d` genuinely errors on bad input in real jq, with no
-        // optional-dependent "renders as empty string" behavior at all).
-        // Before this fix, the `@format` builtins' own `_ if optional =>
+        // #881 review: `isvalid` is a succinctly extension with no jq builtin
+        // to diff against (#6662). `def isvalid(f): try (f|true) catch false;`
+        // is a comparison, not its definition: that yields one boolean per
+        // output of `f` and none for `empty`, where `isvalid` always yields
+        // exactly one (`tests/jq_cli/i6662.rs`). Run on `1` under jq 1.7.1 and
+        // 1.8.2, it answers `false` for `@base64d`, `@csv` and `@tsv`, each of
+        // which raises there. `@urid` agrees only with 1.7.1, which has no such
+        // format; 1.8.2 decodes `1` to `"1"`, so it answers `true`. `@dsv` is
+        // succinctly's own. Before this fix, the `@format` builtins' own `_ if optional =>
         // Ok(String::new())` arm (`format_urid`/`format_csv`/etc,
         // `src/jq/eval.rs`) was reachable *only* through `isvalid`'s forced
         // broadcast — a succinctly-only quirk, not modeled on any real jq
@@ -146806,8 +146806,8 @@ mod tests {
         // `true`. Now that `isvalid` no longer forces `optional`, this arm
         // is unreachable via `isvalid` (still reachable the same way every
         // other builtin's `_ if optional` arm is: a literal `?` written
-        // directly after the format, e.g. `@urid?`) and these correctly
-        // report `false`, matching the real-jq-verified reference semantics.
+        // directly after the format, e.g. `@urid?`) and each of these reports
+        // `false` because the format raises on `1` here.
         for expr in [
             "isvalid(@urid)",
             "isvalid(@csv)",
@@ -146948,11 +146948,11 @@ mod tests {
     /// above), `.foo` on a scalar node here now genuinely errors instead of
     /// being swallowed — matching real jq exactly:
     /// `{"a":1,"b":2} | [paths(.foo, true)]` itself errors in real jq 1.8.2
-    /// ("Cannot index number with string (\"foo\")"), and under the
-    /// reference `def isvalid(f): try (f|true) catch false;` desugaring
-    /// (checked live against jq 1.8.2), `isvalid(paths(.foo, true))` there
-    /// is `false`, not `true`. The pre-#881 test pinned `true` — a
-    /// succinctly-only divergence from real jq that #773's own (correct)
+    /// ("Cannot index number with string (\"foo\")"), and
+    /// `def isvalid(f): try (f|true) catch false;` run on jq 1.7.1 and 1.8.2
+    /// (a comparison only: `isvalid` is a succinctly extension, #6662) answers
+    /// `false` for `isvalid(paths(.foo, true))` there, not `true`. The pre-#881
+    /// test pinned `true` — an answer that #773's own (correct)
     /// optional-threading fix made *reachable* without being its cause;
     /// #881's broader fix (no longer forcing `optional` at all) corrects it.
     #[test]

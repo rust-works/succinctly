@@ -497,10 +497,14 @@ rejects) is gated behind `--jq-extensions` and off by default since #1512 —
 `isvalid(f)` is **not a jq builtin**: jq 1.6, 1.7.1 and 1.8.2 each refuse it with
 `isvalid/1 is not defined` (exit 3). It is a succinctly extension (ADR-0018 rule 5) that is
 `true` when `f` yields an output and raises no error, and `false` when `f` yields nothing or raises.
+It yields exactly one boolean whatever `f` yields, so it is not `def isvalid(f): try (f|true) catch false;`,
+which answers once per output of `f` and not at all for `empty`.
 
 ```bash
 echo '{"a": 1}' | succinctly jq -c '[isvalid(.a), isvalid(.a.b), isvalid(empty)]'
 # [true,false,false]
+echo 1 | succinctly jq -c '[isvalid(1, 2), isvalid(1, error("x"))]'
+# [true,false]
 ```
 
 It changes no program jq accepts: a `def isvalid(f): ...` of your own wins, other arities
