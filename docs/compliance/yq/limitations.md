@@ -6711,6 +6711,16 @@ straight after a `.` or a name stays in it, and `.a+1`, `.a%1`, `.a<1`, `.a>1`, 
 `succinctly jq` is unchanged. `.> 1` is a lexer error in yq
 and a parse error here (the message differs).
 
+**Resolved ([#6699](https://github.com/rust-works/succinctly/issues/6699)):** the quoted name of a dotted step is that token too.
+It takes the opening quote and ends at the first space, so `."a b"` is `."a` followed by `b"`, which no rule takes: `lexer: invalid input text "b\""` in yq, and the same refusal here (the message follows yq's wording).
+The refusal is for U+0020 alone, and holds wherever the step is read: a read, `?`, `//`, a write target, `del()`, after another step, in a pipe (`."p q".r`).
+Every other character is inside the token, a tab and a newline included (`."a\tb"` is a key with a backslash and a `t`), and a name with no space is read as before.
+`.["a b"]` is the spelling both accept for a key with a space.
+An empty name is not unquoted: `.""` is the key made of two quote characters, so it reads `null` over a document whose key is `""`, and `.x."" = 9` creates that key.
+`succinctly jq` is unchanged: jq reads `."a b"` as a string index and `.""` as the key `""`.
+A quoted name with no closing quote (`."a`) is still a parse error here, where yq's token is the key `"a` and answers `null`; that is the same token rule, left open.
+Pinned in `tests/yq_cli/i6699.rs` and `tests/jq_cli/i6699.rs`.
+
 A wildcard key costs one pass over the mapping's keys plus one keyed lookup per match, and
 a keyed lookup into a document object is linear in its key count ([#3913](https://github.com/rust-works/succinctly/issues/3913)),
 so a pattern matching *m* keys of an *n*-key mapping is O(m·n): `.["k1*"]` over 8,000 keys
