@@ -6841,6 +6841,9 @@ fn read_inputs(
     // them ([`seq_slurp_places_failures`]).
     let mut held_open_failures: std::collections::VecDeque<(usize, InputFileOpenError)> =
         std::collections::VecDeque::new();
+    // Whether a last directory was left to the read that reaches it (#6604): it fails the run
+    // whether or not a read does, but only once the warnings have been placed among the others.
+    let mut seq_directory_deferred = false;
     let (files, mut raw_bytes): OpenedInputs = if let Some(bytes) = read_whole {
         // Stdin is the one source with no file index.
         let tag = (!files.is_empty()).then_some(0);
@@ -6931,6 +6934,7 @@ fn read_inputs(
                 defer_open_failures(failures, false);
             } else if args.slurp
                 && (args.null_input || track_eof)
+                && !seq_slurp_places_failures(args)
                 && matches!(
                     failures[..reached].last(),
                     Some((_, e)) if e.kind == InputFileErrorKind::Directory { last: true }
@@ -6948,6 +6952,20 @@ fn read_inputs(
                 defer_open_failures(directory, false);
                 SLURP_DIRECTORY_READ.with(|slurp| slurp.set(true));
             } else if seq_slurp_places_failures(args) {
+                let mut failures = failures;
+                // #6604, as above: a last directory is read by the extra input a program that
+                // reads `input` asks for after the array, so it is left to that read.
+                if track_eof
+                    && matches!(
+                        failures.last(),
+                        Some((_, e)) if e.kind == InputFileErrorKind::Directory { last: true }
+                    )
+                {
+                    let directory = failures.split_off(failures.len() - 1);
+                    defer_open_failures(directory, false);
+                    SLURP_DIRECTORY_READ.with(|slurp| slurp.set(true));
+                    seq_directory_deferred = true;
+                }
                 held_open_failures = failures.into();
             } else {
                 report_open_failures(&failures[..reached], open_failed);
@@ -7159,6 +7177,9 @@ fn read_inputs(
     // stopped it first.
     if !seq_slurp_stopped {
         report_held_open_failures(&mut held_open_failures, usize::MAX, open_failed);
+    }
+    if seq_directory_deferred {
+        *open_failed = true;
     }
 
     // Answered here, before the UTF-8 substitution below consumes

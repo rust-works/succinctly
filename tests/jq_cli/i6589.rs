@@ -45,6 +45,12 @@ fn a_seq_slurp_reports_an_unopened_file_where_its_reader_reaches_it_6589() -> Re
         (".", &["trunc", "gone", "s2"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Truncated value at line 2, column 1\n", 2),
         (".", &["endrs", "gone", "s2"][..], "\u{1e}[1,[1],[2]]\n", "jq: ignoring parse error: Truncated value at line 3, column 1\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (".", &["bad", "adir", "s2"][..], "\u{1e}[1,2,[1],[2]]\n", "jq: ignoring parse error: Truncated value at line 3, column 1\njq: error: Is a directory\n", 2),
+        // A last directory is read by the extra `input` a slurp makes, after the warnings and
+        // the failures before it (#6604).
+        ("input", &["bad", "gone", "adir"][..], "", "jq: ignoring parse error: Truncated value at line 3, column 1\njq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Is a directory\njq: error (at <unknown>): break\n", 2),
+        ("[inputs]", &["bad", "gone", "adir"][..], "\u{1e}[]\n", "jq: ignoring parse error: Truncated value at line 3, column 1\njq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Is a directory\n", 2),
+        ("input", &["s2", "adir"][..], "", "jq: error: Is a directory\njq: error (at <unknown>): break\n", 2),
+        (".", &["bad", "gone", "adir"][..], "\u{1e}[1,2]\n", "jq: ignoring parse error: Truncated value at line 3, column 1\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (".", &["defer"][..], "\u{1e}[1]\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 3\n", 0),
     ] {
         let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}.json")).collect();

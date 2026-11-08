@@ -369,9 +369,16 @@ pub(crate) fn walk_stream_collecting(
     tail: Tail,
     emit: &mut dyn FnMut(&str),
 ) -> SeqStreamWalk {
-    walk_stream_placing(raw_bytes, slurp, collect_faults, true, tail, &mut |warning, _| {
-        emit(warning);
-    })
+    walk_stream_placing(
+        raw_bytes,
+        slurp,
+        collect_faults,
+        true,
+        tail,
+        &mut |warning, _| {
+            emit(warning);
+        },
+    )
 }
 
 /// [`walk_stream_collecting`], handing `emit` with each warning the absolute offset of the byte
