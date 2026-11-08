@@ -134,3 +134,136 @@ fn a_constructor_after_recurse_answers_as_jq_6608() -> Result<()> {
     }
     Ok(())
 }
+
+/// The shapes the door must leave alone or build exactly (generators and `//` and `as` inside `[...]`,
+/// interpolated and computed keys, a repeated key, number literals as the program spells them), each
+/// run after a `recurse` so the constructor is reached as a stage of the walk.
+#[test]
+fn constructors_after_recurse_keep_jq_cardinality_and_spelling_6608() -> Result<()> {
+    let input =
+        "[{\"a\":1,\"b\":null,\"id\":\"x\",\"children\":[]},{\"a\":false,\"b\":2,\"id\":\"y\"}]";
+    for (filter, want, want_err, want_code) in [
+        (
+            "[.[] | recurse(.children[]?) | [(.a,.b)]]",
+            "[[1,null],[false,2]]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | [.a // 1]]",
+            "[[1],[1]]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | [.a as $x | $x]]",
+            "[[1],[false]]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | [.a?]]",
+            "[[1],[false]]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | [.a,.b]]",
+            "[[1,null],[false,2]]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | [empty]]",
+            "[[],[]]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | {n: 1.0}]",
+            "[{\"n\":1.0},{\"n\":1.0}]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | {n: 1e2}]",
+            "[{\"n\":1E+2},{\"n\":1E+2}]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | [1.10]]",
+            "[[1.10],[1.10]]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | {n: 100000000000000000000}]",
+            "[{\"n\":100000000000000000000},{\"n\":100000000000000000000}]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | [-0]]",
+            "[[-0],[-0]]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | {\"a\\(1)\": .id}]",
+            "[{\"a1\":\"x\"},{\"a1\":\"y\"}]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | {(.id): 1}]",
+            "[{\"x\":1},{\"y\":1}]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | {id: (.a,.b)}]",
+            "[{\"id\":1},{\"id\":null},{\"id\":false},{\"id\":2}]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | {id: .a?}]",
+            "[{\"id\":1},{\"id\":false}]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | {\"x\": .id, \"x\": .a}]",
+            "[{\"x\":1},{\"x\":false}]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | {a: [.id, {b: .a}]}]",
+            "[{\"a\":[\"x\",{\"b\":1}]},{\"a\":[\"y\",{\"b\":false}]}]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | [[.a]]]",
+            "[[[1]],[[false]]]\n",
+            "",
+            0,
+        ),
+        (
+            "[.[] | recurse(.children[]?) | {id, a, zz}]",
+            "[{\"id\":\"x\",\"a\":1,\"zz\":null},{\"id\":\"y\",\"a\":false,\"zz\":null}]\n",
+            "",
+            0,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want, want_err, want_code),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
