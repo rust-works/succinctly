@@ -821,6 +821,12 @@ jobs:
       - name: ci-runner-pin self-tests
         run: python3 scripts/test_ci_runner_pin.py -v
 
+      # #6652: pins that no workflow fetches a release asset with curl/wget from
+      # github.com/<repo>/releases/download/ (504 for hours on 2026-11-08), and that
+      # scripts/gh-release-download.sh retries; a fake `gh`, no network.
+      - name: ci-release-downloads self-tests
+        run: python3 scripts/test_ci_release_downloads.py -v
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -1237,12 +1243,17 @@ jobs:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
 
+      # #6652: through the API asset endpoint (`gh release download`), retried. The
+      # github.com/<repo>/releases/download/ URL a `curl` used answered 504 for hours on
+      # 2026-11-08 while the API endpoint served the same bytes.
+      # scripts/test_ci_release_downloads.py fails a workflow that goes back to it.
       - name: Install pinned yq
         if: needs.gate.outputs.code == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           V="$(cat tests/data/yq-golden/YQ_VERSION)"
-          curl -fsSL "https://github.com/mikefarah/yq/releases/download/${V}/yq_linux_amd64" \
-            -o /usr/local/bin/yq
+          ./scripts/gh-release-download.sh mikefarah/yq "${V}" yq_linux_amd64 /usr/local/bin/yq
           chmod +x /usr/local/bin/yq
           yq --version | grep -F "version ${V}"
 
@@ -1265,12 +1276,14 @@ jobs:
       - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
 
+      # #6652: the same download as the yq drift check above.
       - name: Install pinned jq
         if: needs.gate.outputs.code == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           V="$(cat tests/data/jq-golden/JQ_VERSION)"
-          curl -fsSL "https://github.com/jqlang/jq/releases/download/${V}/jq-linux-amd64" \
-            -o /usr/local/bin/jq
+          ./scripts/gh-release-download.sh jqlang/jq "${V}" jq-linux-amd64 /usr/local/bin/jq
           chmod +x /usr/local/bin/jq
           jq --version | grep -F "${V}"
 
