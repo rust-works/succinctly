@@ -637,11 +637,35 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def generate_fixture(binary, pattern, size, seed, out_path):
+def _run_generate(binary, pattern, size, seed, out_path):
     cmd = [binary, "json", "generate", size, "-p", pattern, "-s", str(seed), "-o", out_path]
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    return cmd, result
+
+
+def generate_fixture(binary, pattern, size, seed, out_path):
+    cmd, result = _run_generate(binary, pattern, size, seed, out_path)
     if result.returncode != 0:
         sys.exit(f"'{' '.join(cmd)}' exited {result.returncode}; stderr:\n{result.stderr}")
+
+
+def pattern_is_unknown(stderr, pattern):
+    """Whether `stderr` is `json generate` refusing `pattern` itself (clap's `invalid value
+    '<pattern>' for '--pattern <PATTERN>'`), as opposed to any other way generating can fail."""
+    return f"invalid value '{pattern}' for '--pattern" in stderr
+
+
+def generate_fixture_if_known(binary, pattern, size, seed, out_path):
+    """[`generate_fixture`] for the baseline binary (#6619): `False` when it does not know
+    `pattern`, which is what a PR that adds a generator pattern and a row over it looks like to the
+    merge-base build it is compared with. Any other failure is as fatal as it is for the binary
+    under test."""
+    cmd, result = _run_generate(binary, pattern, size, seed, out_path)
+    if result.returncode == 0:
+        return True
+    if pattern_is_unknown(result.stderr, pattern):
+        return False
+    sys.exit(f"'{' '.join(cmd)}' exited {result.returncode}; stderr:\n{result.stderr}")
 
 
 def generate_compact_fixture(binary, source_path, out_path):
@@ -807,13 +831,17 @@ def measured_path(tmp, binary):
     return path
 
 
-def measure_all(binary, valgrind_bin, reps, label="binary"):
+def measure_all(binary, valgrind_bin, reps, label="binary", baseline_run=False):
     """Generate each distinct (pattern, size) fixture exactly once -- several
     `QUERIES` rows share one, and regenerating an identical file per row
     would be pure waste -- then measure every query against its fixture.
     Returns {query_id: median instruction count}. `label` only affects the
     printed header, distinguishing this run's output in CI logs when
-    `measure_all` is called twice (current binary, then --baseline-binary)."""
+    `measure_all` is called twice (current binary, then --baseline-binary).
+
+    With `baseline_run`, a row whose fixture the binary cannot generate because it does not know
+    the pattern is left out of the result (#6619): the row is new in this PR, and `report_drift`
+    says so instead of comparing it."""
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as tmp:
         fixture_paths = {}
         for _, pattern, size, _, _ in QUERIES:
@@ -827,8 +855,12 @@ def measure_all(binary, valgrind_bin, reps, label="binary"):
                 # content sniffing, so this is what makes it resolve to JSON
                 # rather than falling through to YAML's own default.
                 path = os.path.join(tmp, f"{pattern}_{size}.json")
-                generate_fixture(binary, pattern, size, FIXTURE_SEED, path)
-                fixture_paths[shape] = path
+                if baseline_run:
+                    known = generate_fixture_if_known(binary, pattern, size, FIXTURE_SEED, path)
+                else:
+                    generate_fixture(binary, pattern, size, FIXTURE_SEED, path)
+                    known = True
+                fixture_paths[shape] = path if known else None
 
         # #2608: `users_compact_identity`/`users_compact_latefail` don't read
         # a generated fixture directly -- they're derived from the base
@@ -878,6 +910,9 @@ def measure_all(binary, valgrind_bin, reps, label="binary"):
             # Not `.get(query_id, fixture_paths[...])`: that evaluates the
             # default eagerly, and a derived row has no generated fixture.
             fixture_path = derived_fixture_paths.get(query_id) or fixture_paths[(pattern, size)]
+            if fixture_path is None:
+                print(f"{query_id:<26} {'(pattern unknown to this binary)':>16}")
+                continue
             flags = QUERY_FLAGS.get(query_id, [])
             ir = measure_query(valgrind_bin, run_binary, mode, flags, filter_expr, fixture_path, reps)
             measured[query_id] = ir
@@ -885,6 +920,29 @@ def measure_all(binary, valgrind_bin, reps, label="binary"):
             sys.stdout.flush()
         print()
     return measured
+
+
+def report_drift(baseline, measured, default_threshold):
+    """Print the per-row table and return the rows over their threshold, as
+    [(query_id, drift, threshold)]. A row the baseline has no number for is new in this PR (its
+    fixture is one the baseline binary cannot generate, #6619): it is printed and not compared, as
+    a new row has nothing accepted against it yet."""
+    failed = []
+    print(f"{'query':<26} {'baseline':>14} {'current':>14} {'drift':>8}")
+    print("-" * 66)
+    for query_id, _, _, _, _ in QUERIES:
+        cur = measured[query_id]
+        if query_id not in baseline:
+            print(f"{query_id:<26} {'(new row)':>14} {cur:>14,.0f} {'':>8}  not compared")
+            continue
+        base = baseline[query_id]
+        drift = (cur / base - 1) * 100 if base else float("inf")
+        threshold = QUERY_THRESHOLDS.get(query_id, default_threshold)
+        flag = "  <-- FAIL" if abs(drift) > threshold else ""
+        print(f"{query_id:<26} {base:>14,.0f} {cur:>14,.0f} {drift:>+7.1f}%{flag}")
+        if abs(drift) > threshold:
+            failed.append((query_id, drift, threshold))
+    return failed
 
 
 def load_baseline_file(path):
@@ -973,24 +1031,13 @@ def main(argv=None):
         # and cancels out, leaving only what this binary's diff changed
         # (issue #1582).
         baseline = measure_all(args.baseline_binary, args.valgrind_bin, args.reps,
-                                label="baseline binary")
+                                label="baseline binary", baseline_run=True)
 
     stale = set(baseline) - known_ids
     if stale:
         print(f"NOTE: baseline has stale entries no longer measured: {sorted(stale)}")
 
-    failed = []
-    print(f"{'query':<26} {'baseline':>14} {'current':>14} {'drift':>8}")
-    print("-" * 66)
-    for query_id, _, _, _, _ in QUERIES:
-        base = baseline[query_id]
-        cur = measured[query_id]
-        drift = (cur / base - 1) * 100 if base else float("inf")
-        threshold = QUERY_THRESHOLDS.get(query_id, args.threshold)
-        flag = "  <-- FAIL" if abs(drift) > threshold else ""
-        print(f"{query_id:<26} {base:>14,.0f} {cur:>14,.0f} {drift:>+7.1f}%{flag}")
-        if abs(drift) > threshold:
-            failed.append((query_id, drift, threshold))
+    failed = report_drift(baseline, measured, args.threshold)
 
     print()
     if failed:
