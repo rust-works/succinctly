@@ -6950,7 +6950,6 @@ fn read_inputs(
             && args.seq
             && !args.raw_input
             && args.input_dsv.is_none()
-            && !seq_by_stream_reader(args)
             && any_open_failure
             && unplaced_tail
         {
