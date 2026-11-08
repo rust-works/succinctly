@@ -80,6 +80,12 @@ fn test_yq_names_the_text_after_the_spaces_in_the_lexer_error_6699() -> Result<(
         (r#"."a b" = 9"#, r#""b\" = 9""#),
         (r#"."a b"#, r#""b""#),
         (r#"."a b" # c"#, r#""b\" # c""#),
+        // Go's `%q` writes a carriage return and the other ASCII controls as escapes.
+        (".\"a b\r\"", r#""b\r\"""#),
+        (".\"a b\x01\"", r#""b\x01\"""#),
+        (".\"a b\x7f\"", r#""b\x7f\"""#),
+        (".\"a b\x1b[0m\"", r#""b\x1b[0m\"""#),
+        (".\"a b\t\u{e9}\"", "\"b\\t\u{e9}\\\"\""),
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
         assert_eq!((stdout.as_str(), code), ("", 1), "{filter}");
