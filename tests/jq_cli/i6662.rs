@@ -16,6 +16,7 @@ fn isvalid_one_is_an_extension_that_answers_true_or_false_6662() -> Result<()> {
         ("isvalid(error)", "false\n"),
         ("isvalid(empty)", "false\n"),
         ("[isvalid(1, 2)]", "[true]\n"),
+        ("isvalid(1, error(\"x\"))", "false\n"),
     ] {
         let (out, err, code) = run_jq_full(&["-c", filter], Some("1"))?;
         assert_eq!(
@@ -36,6 +37,11 @@ fn a_user_definition_of_isvalid_wins_exactly_as_in_jq_6662() -> Result<()> {
         ("def isvalid: 9; isvalid", "9\n"),
         ("def isvalid(f; g): 5; isvalid(1; 2)", "5\n"),
         ("{isvalid: 1} | .isvalid", "1\n"),
+        // A parameter or variable of that name is the parameter or variable.
+        ("def f(isvalid): isvalid; f(3)", "3\n"),
+        ("def f(isvalid): [isvalid, isvalid]; f(1, 2)", "[1,2,1,2]\n"),
+        ("def f($isvalid): $isvalid; f(3)", "3\n"),
+        (". as $isvalid | $isvalid", "1\n"),
     ] {
         let (out, err, code) = run_jq_full(&["-c", filter], Some("1"))?;
         assert_eq!(
