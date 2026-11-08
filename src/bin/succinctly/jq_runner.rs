@@ -7022,7 +7022,7 @@ fn read_inputs(
                     &raw_bytes,
                     args.slurp,
                     queue_faults,
-                    unopened_tail,
+                    crate::jq_seq_reader::Tail::of(unopened_tail),
                     &mut |warning| {
                         if !queue_faults {
                             seq_warned = true;
@@ -7047,7 +7047,7 @@ fn read_inputs(
             &raw_bytes,
             args.slurp,
             true,
-            unopened_tail,
+            crate::jq_seq_reader::Tail::of(unopened_tail),
             &mut |_| {},
         );
         seq_values = walk.values;
@@ -8983,7 +8983,7 @@ fn seq_text_reads_clean(raws: &[Vec<u8>], unopened_tail: bool) -> bool {
         &sources,
         false,
         true,
-        unopened_tail,
+        crate::jq_seq_reader::Tail::of(unopened_tail),
         &mut |_| {
             warned = true;
         },

@@ -351,26 +351,21 @@ pub(crate) fn walk_stream(
     slurp: bool,
     emit: &mut dyn FnMut(&str),
 ) -> SeqStreamWalk {
-    walk_stream_collecting(raw_bytes, slurp, false, false, emit)
+    walk_stream_collecting(raw_bytes, slurp, false, Tail::Opened, emit)
 }
 
 /// [`walk_stream`], also recording each diagnostic as a [`SeqFault`] when `collect_faults` is
 /// set (#5640): `-n`'s `input`/`inputs` raise what a plain run only warns about, and need the
 /// message with where the reader stood. Off by default, because a stream can warn once per
 /// byte and the faults would be held in memory (see the note on [`walk_stream`]).
-///
-/// `unopened_tail` says a file that did not open follows the last of `raw_bytes` (#6588). jq's
-/// reader then asks that file for more before it is at its end, so the refill that sets `is_last`
-/// is the empty one at the missing file, and the last opened file's last chunk is not the final
-/// buffer: [`final_buffer_start`] is the stream's end.
 pub(crate) fn walk_stream_collecting(
     raw_bytes: &[(Option<usize>, Vec<u8>)],
     slurp: bool,
     collect_faults: bool,
-    unopened_tail: bool,
+    tail: Tail,
     emit: &mut dyn FnMut(&str),
 ) -> SeqStreamWalk {
-    walk_stream_placing(raw_bytes, slurp, collect_faults, true, unopened_tail, emit)
+    walk_stream_placing(raw_bytes, slurp, collect_faults, true, tail, emit)
 }
 
 /// [`walk_stream`] for a caller that wants the values and the verdicts but not where jq's reader
@@ -381,7 +376,7 @@ pub(crate) fn walk_stream_values(
     slurp: bool,
     emit: &mut dyn FnMut(&str),
 ) -> SeqStreamWalk {
-    walk_stream_placing(raw_bytes, slurp, false, false, false, emit)
+    walk_stream_placing(raw_bytes, slurp, false, false, Tail::Opened, emit)
 }
 
 /// The guards of [`plain_record_sequence`], as data so that a test can drop one and show the
@@ -458,12 +453,34 @@ pub(crate) fn plain_record_sequence(raw: &[u8], guards: PlainGuards) -> bool {
     any
 }
 
+/// What follows the last of the files a walk reads (#6588): a file that did not open means jq's
+/// reader asks that file for more before it is at its end, so the refill that sets `is_last` is
+/// the empty one at the missing file, and the last opened file's last chunk is not the final
+/// buffer: [`final_buffer_start`] is the stream's end.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Tail {
+    /// The last file is the last source: its last chunk is the final buffer.
+    Opened,
+    /// A file that did not open follows the last file that did.
+    UnopenedFollows,
+}
+
+impl Tail {
+    pub(crate) fn of(unopened_follows: bool) -> Self {
+        if unopened_follows {
+            Self::UnopenedFollows
+        } else {
+            Self::Opened
+        }
+    }
+}
+
 fn walk_stream_placing(
     raw_bytes: &[(Option<usize>, Vec<u8>)],
     slurp: bool,
     collect_faults: bool,
     place_values: bool,
-    unopened_tail: bool,
+    tail: Tail,
     emit: &mut dyn FnMut(&str),
 ) -> SeqStreamWalk {
     let bom = bom_prefix(raw_bytes);
@@ -484,7 +501,7 @@ fn walk_stream_placing(
     // 4095-byte chunk with no newline is one more (#3200).
     let boundaries = refill_boundaries(raw_bytes, bom.malformed);
     // #6588: past a last file that did not open, the final buffer is the empty one read there.
-    let final_buffer_start = if unopened_tail {
+    let final_buffer_start = if tail == Tail::UnopenedFollows {
         total
     } else {
         final_buffer_start(raw_bytes, total)
