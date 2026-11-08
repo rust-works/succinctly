@@ -43,7 +43,9 @@ use succinctly::yaml::{
     YamlIndex, YamlValue,
 };
 
-use super::m2_gate::{can_use_m2_streaming, eval_all_matches_per_document};
+use super::m2_gate::{
+    can_use_m2_streaming, can_use_m2_streaming_yq, eval_all_matches_per_document,
+};
 use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
 use crate::front_matter;
 use crate::output::{
@@ -2582,15 +2584,35 @@ struct FallbackStreamState<'a> {
 /// `--sort-keys` over aliases (#1350, #2486), whose sort can invert an anchor and its alias, and a
 /// sort of a mapping, which the streamers write without its entries' presentation (#4386). The
 /// one definition both the stdin and the per-file site read.
+///
+/// `streams_array_of_nodes` (#3475): the query is an array built from the document's own nodes,
+/// which the M2 streamers print copy-free, but without the comments *between* a sequence's items
+/// and after its last (`# between` is dropped, as it is for `map(.)`), and with an error after
+/// the first document of a stream printing that document's `---` first. A document with a
+/// comment, or a stream of several documents, takes the DOM route, which keeps both.
 fn needs_dom_fallback(
     sort_keys: bool,
     output_format: OutputFormat,
     index: &YamlIndex,
     expr: &Expr,
     bytes: &[u8],
+    streams_array_of_nodes: bool,
 ) -> bool {
     output_format == OutputFormat::Yaml
-        && ((sort_keys && index.has_aliases()) || sorts_a_mapping(expr, index, bytes))
+        && ((sort_keys && index.has_aliases())
+            || sorts_a_mapping(expr, index, bytes)
+            || (streams_array_of_nodes
+                && (index.has_comments() || has_several_documents(index, bytes))))
+}
+
+/// Whether `bytes` holds more than one YAML document.
+fn has_several_documents(index: &YamlIndex, bytes: &[u8]) -> bool {
+    let root = index.root(bytes);
+    let YamlValue::Sequence(docs) = root.value() else {
+        return false;
+    };
+    docs.uncons_cursor()
+        .is_some_and(|(_, rest)| rest.uncons_cursor().is_some())
 }
 
 /// Whether `expr` is itself a `sort`, `sort_by`, `reverse`, `unique` or `unique_by`: on a
@@ -11119,6 +11141,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // input at all: it now gets *both* correct numbers and duplicate-key
     // preservation, matching real yq on both counts.
     let is_m2_streamable = can_use_m2_streaming(&program.expr);
+    // #3475: an array built from the document's own nodes (`[.users[] | select(.age > 30)]`)
+    // streams from their cursors too, to stdout: the DOM route copied the whole sequence into an
+    // owned value and a comment tree first. `--inplace` and `--slurp` keep their own gates.
+    let streams_array_of_nodes = !is_m2_streamable && can_use_m2_streaming_yq(&program.expr);
     // #5283: a query that is itself a `,` of M2-streamable branches streams too. The evaluator
     // already answers one as the nodes its branches name (`eval_comma_generic`, #1361), and the
     // DOM route they used to take rebuilt each as an `IndexMap`, collapsing a duplicate mapping
@@ -11279,7 +11305,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // even without `-r`), so `can_yaml_fast_path` never had this gap.
     let can_stream_json_output_style =
         !output_config.raw_output && (output_config.compact || can_stream_pretty_or_colored);
-    let can_json_fast_path = (is_m2_streamable || is_m2_streamable_comma)
+    let can_json_fast_path = (is_m2_streamable || streams_array_of_nodes || is_m2_streamable_comma)
         && can_stream_json_output_style
         && output_config.output_format == OutputFormat::Json
         && !args.null_input
@@ -11300,7 +11326,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // `-P` never reached its own style-clearing DOM route when combined
     // with `-I0` -- confirmed live, `-I0 -P` on flow-style input left it
     // as flow instead of expanding to block style the way real yq does.
-    let can_yaml_fast_path = (is_m2_streamable || is_m2_streamable_comma)
+    let can_yaml_fast_path = (is_m2_streamable || streams_array_of_nodes || is_m2_streamable_comma)
         && can_stream_pretty_or_colored
         && output_config.output_format == OutputFormat::Yaml
         && !args.null_input
@@ -11838,6 +11864,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 &index,
                 &program.expr,
                 &yaml_bytes,
+                streams_array_of_nodes,
             ) {
                 let doc_filter = args.document.map(|target| (target, global_doc_index));
                 // Single stdin input, no further reads to filter -- unlike
@@ -12062,6 +12089,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     &index,
                     &program.expr,
                     &yaml_bytes,
+                    streams_array_of_nodes,
                 ) {
                     let doc_filter = args.document.map(|target| (target, global_doc_index));
                     let num_docs = stream_yaml_sort_keys_alias_fallback(

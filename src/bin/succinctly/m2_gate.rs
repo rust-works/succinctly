@@ -190,6 +190,49 @@ pub fn can_use_m2_streaming(expr: &Expr) -> bool {
     }
 }
 
+/// [`can_use_m2_streaming`], plus an array built from nodes (yq only, #3475).
+///
+/// `[.users[] | select(.age > 30)]`, `[.[]]` and `.users | [.[]]` answer a `GenericResult::LazySeq`
+/// over the nodes themselves (`LazySeq::from_cursors`), which the streaming writers render one live
+/// cursor at a time. On the DOM route the same sequence was first copied into an owned value and a
+/// comment tree (`sequence_of_nodes`): 256 MB against `map(select(...))`'s 38 MB over a 10 MB file,
+/// for the same output.
+///
+/// Only the array's own body is checked, and only for the shapes that yield nodes -- navigation and
+/// `select`, never a stage that computes (`[.[] | .a + 1]`, `[.[] | length]`), whose owned results
+/// need the DOM route's number and string formatting. A `,` body stays on the DOM route: yq answers
+/// `[., .]` as one node (#3477), which `top_level_comma_branches`' own handling does not cover.
+pub fn can_use_m2_streaming_yq(expr: &Expr) -> bool {
+    if can_use_m2_streaming(expr) {
+        return true;
+    }
+    match expr {
+        Expr::Array(body) => body_yields_nodes(body),
+        Expr::Paren(inner) => can_use_m2_streaming_yq(inner),
+        // `.users | [.[]]`: a streamable prefix, then the array last. An array in the middle
+        // (`[.[]] | .[0]`) feeds a later stage an owned value and stays on the DOM route.
+        Expr::Pipe(stages) => match stages.split_last() {
+            Some((Expr::Array(body), prefix)) => {
+                body_yields_nodes(body) && prefix.iter().all(can_use_m2_streaming)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether an array body answers document nodes: navigation and `select` only (see
+/// [`can_use_m2_streaming_yq`]).
+fn body_yields_nodes(body: &Expr) -> bool {
+    match body {
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => true,
+        Expr::Builtin(Builtin::Select(_)) => true,
+        Expr::Pipe(stages) => stages.iter().all(body_yields_nodes),
+        Expr::Optional(inner) | Expr::Paren(inner) => body_yields_nodes(inner),
+        _ => false,
+    }
+}
+
 /// Whether `yq --eval-all` answers `expr` the way it would answer each document
 /// on its own (#4380).
 ///
@@ -309,6 +352,57 @@ mod tests {
             "Builtin::NthStream shares NthExpr's arm and must answer the same"
         );
     }
+    /// #3475: yq streams an array built from document nodes (navigation and `select`), alone or
+    /// behind a streamable prefix, and keeps every array that computes, joins branches or feeds a
+    /// later stage on the DOM route. jq's own gate is unchanged: it never sees these shapes.
+    #[test]
+    fn test_yq_gate_streams_an_array_of_nodes_only_3475() {
+        let parse = |f: &str| succinctly::jq::parse(f).expect("parses");
+        for streams in [
+            "[.]",
+            "[.[]]",
+            "[.a]",
+            "[.[0]]",
+            "[.a[]?]",
+            "[.users[] | select(.age > 30)]",
+            "[select(.a)]",
+            "([.[]])",
+            ".users | [.[]]",
+            ".a.b | [.[] | select(.x)]",
+        ] {
+            let expr = parse(streams);
+            assert!(can_use_m2_streaming_yq(&expr), "{streams} should stream");
+            assert!(
+                !can_use_m2_streaming(&expr),
+                "{streams}: the shared gate (jq's too) stays as it was"
+            );
+        }
+        for stays in [
+            // A stage that computes needs the DOM route's number and string formatting.
+            "[.[] | .a + 1]",
+            "[.[] | length]",
+            "[.[] | tostring]",
+            "[.[] | keys]",
+            // A slice is built, not navigated; `,` is yq's one-node-per-name union (#3477).
+            "[.[1:]]",
+            "[., .]",
+            "[.a, .b]",
+            // The array feeds a later stage, or a prefix that does not stream.
+            "[.[]] | .[0]",
+            "[.[]] | length",
+            ".a | length | [.]",
+            "{a: [.[]]}",
+        ] {
+            assert!(
+                !can_use_m2_streaming_yq(&parse(stays)),
+                "{stays} should keep the DOM route"
+            );
+        }
+        // What already streams still does.
+        assert!(can_use_m2_streaming_yq(&parse(".a | map(.)")));
+        assert!(can_use_m2_streaming_yq(&parse(".[]")));
+    }
+
     /// #2416 phase 2: a path-context pipe the cursor walk takes whole streams
     /// through M2 (its outputs are live cursors or small `key`/`path`
     /// values), so a float scalar keeps its source spelling (#2419) instead
