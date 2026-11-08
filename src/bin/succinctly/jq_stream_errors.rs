@@ -739,6 +739,54 @@ pub(crate) fn read(sources: &[(Option<usize>, Vec<u8>)]) -> StreamErrorsRead {
     read_keeping(sources, usize::MAX, false)
 }
 
+/// The bytes [`first_event_completes_in`] tries after a file in turn: one that continues a number
+/// (`0`), one that ends an array (`]`), ones that end a string (`"`, and `n"` for one cut after a
+/// backslash), and ones that end the literals `true`/`false` (`e`) and `null` (`l`). A token cut
+/// short at the end of a file is finished or broken differently by each, so the first event
+/// differs between them.
+const NEXT_FILE_PROBES: [&[u8]; 6] = [b"0", b"]", b"\"", b"n\"", b"e", b"l"];
+
+/// The longest prefix [`first_event_completes_in`] reads: 1 MiB.
+const FIRST_EVENT_PREFIX_LIMIT: usize = 1 << 20;
+
+/// Whether the first thing `--stream-errors` yields from `raw` is complete inside it (#6591): the
+/// next file's bytes, whatever they are, do not change it. A bare number or a half-read string at
+/// the end of a file waits for the next file, so the same read followed by each of
+/// [`NEXT_FILE_PROBES`] gives different first events; `[1,` gives `[[0],1]` every time. jq's main
+/// loop stops one event past an open failure, so a first event that is complete in its file never
+/// opens the file after it.
+///
+/// A prefix of `raw` is read, doubling until the answer is settled, the prefix is all of `raw`, or
+/// it reaches [`FIRST_EVENT_PREFIX_LIMIT`] (the answer is then `false`: a first event that long is
+/// not worth reading the file for, and `false` reports every file, as before): the prefix's end
+/// stands in for the file's end, so equal events at some prefix mean the event was complete before
+/// it. The probes are no proof for every cut token (a literal cut after two letters is broken by
+/// all of them alike), so this is the answer for a file that starts a token of its own, which is
+/// what the caller establishes first ([`text_ends_between_tokens`] in `jq_runner`).
+pub(crate) fn first_event_completes_in(raw: &[u8]) -> bool {
+    let first = |prefix: &[u8], next: &[u8]| {
+        let sources = [(None, prefix.to_vec()), (None, next.to_vec())];
+        Reader::new(&sources[..])
+            .next_yielded()
+            .map(|got| (got.value, got.error))
+    };
+    let mut end = raw.len().min(4096);
+    loop {
+        let prefix = &raw[..end];
+        let settled = first(prefix, NEXT_FILE_PROBES[0]);
+        if NEXT_FILE_PROBES[1..]
+            .iter()
+            .all(|probe| first(prefix, probe) == settled)
+        {
+            return true;
+        }
+        if end == raw.len() || end >= FIRST_EVENT_PREFIX_LIMIT {
+            return false;
+        }
+        end = (end * 2).min(raw.len());
+    }
+}
+
 /// How many trailing locations [`read_for_slurp`] keeps: the values jq's `--slurp` loop leaves
 /// after its array are the close it still held and the EOF report.
 const SLURP_TAIL: usize = 8;
@@ -2026,6 +2074,51 @@ mod tests {
             reader.take_error().map(|e| e.to_string()),
             Some("input/output error".to_string())
         );
+    }
+
+    /// #6591: a first event is complete inside its file when what follows cannot change it. A
+    /// bare token or a half-read string waits for the next file; `[1,` has `[[0],1]` however it
+    /// goes on, and a fault after the event does not matter.
+    #[test]
+    fn a_first_event_completes_in_its_file_when_the_next_file_cannot_change_it_6591() {
+        for (text, complete) in [
+            ("[1,", true),
+            ("[1]", true),
+            ("[1,2]\n", true),
+            ("1\n", true),
+            ("\"s\" ", true),
+            ("{\"a\":1,", true),
+            ("[,", true),
+            ("[1", false),
+            ("1", false),
+            ("\"ab", false),
+            ("{\"a\":", false),
+            ("[", false),
+            ("", false),
+            ("  ", false),
+            ("tru", false),
+            ("nul", false),
+            ("\"ab\\", false),
+            ("[1,\"x", true),
+            ("[1,tru", true),
+        ] {
+            assert_eq!(
+                first_event_completes_in(text.as_bytes()),
+                complete,
+                "{text:?}"
+            );
+        }
+        // A first event that ends past the first prefix read (4096 bytes) is found by the doubling.
+        let mut long = b"[\"".to_vec();
+        long.extend(std::iter::repeat(b'x').take(10_000));
+        assert!(!first_event_completes_in(&long));
+        long.extend_from_slice(b"\",");
+        assert!(first_event_completes_in(&long));
+        // And one past the limit is not read for: the answer is `false`.
+        let mut huge = b"[\"".to_vec();
+        huge.extend(std::iter::repeat(b'x').take(FIRST_EVENT_PREFIX_LIMIT + 10));
+        huge.extend_from_slice(b"\",");
+        assert!(!first_event_completes_in(&huge));
     }
 
     /// #5498: `--slurp` keeps the location of the last few values only, and of the first error, and
