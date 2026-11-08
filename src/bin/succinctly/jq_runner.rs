@@ -7018,6 +7018,12 @@ fn read_inputs(
                     // The last file with bytes before it: an empty one between sends the reader on
                     // too.
                     || (last_value_at_tail && at >= raws.len())
+                    // #6657: under `-n` the program asks for each file as it goes, so a failure with
+                    // a file that opened after it is the read of the value that spans them to
+                    // reach (that value is placed in the next file, as a last file's is at the
+                    // tail), and a program that stops before it never does. The up-front report is
+                    // for the stream whose last value before the failure it cannot place.
+                    || (args.null_input && at < raws.len())
                     || raws
                         .iter()
                         .take(at)
