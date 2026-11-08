@@ -199,6 +199,31 @@ const ROWS: &[(&str, &str, &str)] = &[
         "map(select(. != 1))",
         "- 0x10\n- '3'\n- \"4\"\n- 5 # five\n",
     ),
+    (
+        "# head\na: 1\n",
+        "to_entries | map(.) | from_entries",
+        "a: 1\n",
+    ),
+    (
+        "# head\na: 1\n",
+        "to_entries | from_entries",
+        "# head\na: 1\n",
+    ),
+    (
+        "# head\na: 1\nb: 2\n",
+        "to_entries | map(select(.value != 1)) | from_entries",
+        "b: 2\n",
+    ),
+    (
+        "# head\na: 1\nb: 2\n",
+        "with_entries(select(.value != 1))",
+        "# head\nb: 2\n",
+    ),
+    (
+        "a: {c: 1}\nb: 2\n",
+        "with_entries(select(.key == \"a\"))",
+        "a: {c: 1}\n",
+    ),
 ];
 
 #[test]

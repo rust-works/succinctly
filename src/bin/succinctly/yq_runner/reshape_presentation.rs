@@ -63,6 +63,16 @@ pub(super) fn supported(expr: &Expr) -> bool {
     }
 }
 
+/// Put the head comment of `original` (a mapping's tree) on `rebuilt`, the mapping a rewrite of it
+/// produced, keeping the mark of being the header read before the first document (#6674).
+fn restore_head(rebuilt: &mut CommentTree, original: &CommentTree) {
+    *rebuilt.meta_mut() = rebuilt.meta().with_head_foot_of(
+        original.meta().head_comment().to_vec(),
+        Vec::new(),
+        original.meta(),
+    );
+}
+
 /// The condition of a `select(c)` filter whose `c` is a pure test of the item, or `None` for any
 /// other filter (#6674). `map(select(c))` and `with_entries(select(c))` keep each item that passes
 /// as it is, so its comments, spelling and style come with it; the condition only decides which.
@@ -84,7 +94,9 @@ fn pure_condition(expr: &Expr) -> bool {
         Expr::Compare { left, right, .. } => pure_condition(left) && pure_condition(right),
         Expr::Paren(inner) => pure_condition(inner),
         Expr::Pipe(parts) => parts.iter().all(pure_condition),
-        _ => supported(expr),
+        // Reads of the item and closed literals; a write or a rebuilding builtin is not a test.
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } => true,
+        _ => is_closed_literal(expr),
     }
 }
 
@@ -663,6 +675,18 @@ fn trace_at_depth(
             for part in parts {
                 pair = next(part, &pair)?;
             }
+            // #6674: yq keeps a mapping's head comment across `to_entries | from_entries` with
+            // nothing between the two, where a `map` between them builds a new sequence and drops it.
+            if matches!(
+                parts.as_slice(),
+                [
+                    Expr::Builtin(Builtin::ToEntries),
+                    Expr::Builtin(Builtin::FromEntries)
+                ]
+            ) && matches!(value, OwnedValue::Object(_))
+            {
+                restore_head(&mut pair.1, tree);
+            }
             Some(pair)
         }
         Expr::Builtin(Builtin::Keys | Builtin::KeysUnsorted | Builtin::ToEntries) => {
@@ -757,16 +781,7 @@ fn trace_at_depth(
                     key_tree
                 });
             }
-            // #6674: the document's head comment rides on the entry list, for `from_entries` to put
-            // back on the mapping it builds; yq keeps it across `to_entries | from_entries`.
-            let meta = if matches!(expr, Expr::Builtin(Builtin::ToEntries))
-                && matches!(value, OwnedValue::Object(_))
-            {
-                NodeMeta::empty().with_head_foot(tree.meta().head_comment().to_vec(), Vec::new())
-            } else {
-                NodeMeta::empty()
-            };
-            Some((result, CommentTree::Array(meta, children)))
+            Some((result, CommentTree::Array(NodeMeta::empty(), children)))
         }
         Expr::Builtin(Builtin::FromEntries) => {
             let result = evaluated(expr, value)?;
@@ -813,10 +828,7 @@ fn trace_at_depth(
                 }
             }
             KeyMeta::record_shadows(&mut keys, shadow_leaves);
-            Some((
-                result,
-                CommentTree::Object(tree.meta().clone(), fields, keys),
-            ))
+            Some((result, CommentTree::Object(NodeMeta::empty(), fields, keys)))
         }
         // #4386: a sorted mapping is the same entries in another order, each keeping the comments,
         // style, anchor and tag of its own node and its key. A sorted array already keeps its
@@ -863,9 +875,7 @@ fn trace_at_depth(
             // drops the first entry, where the same steps written out (`to_entries | map(...) |
             // from_entries`) drop it with that entry.
             if matches!(value, OwnedValue::Object(_)) {
-                *rebuilt.meta_mut() = rebuilt
-                    .meta()
-                    .with_head_foot(tree.meta().head_comment().to_vec(), Vec::new());
+                restore_head(&mut rebuilt, tree);
             }
             Some((result, rebuilt))
         }
@@ -930,8 +940,9 @@ fn trace_at_depth(
             let mut trees = Vec::new();
             // yq keeps a document's head comment on its first key, so it goes with that entry.
             let mut first_dropped = false;
+            let select = select_condition(f);
             for (i, item) in items.iter().enumerate() {
-                if let Some(cond) = select_condition(f) {
+                if let Some(cond) = select {
                     // #6674: an item that passes is kept as it is, with its own tree; one that
                     // fails is dropped. A test with no single answer is the plain route's.
                     let keep = evaluated(cond, item)?;
@@ -948,7 +959,8 @@ fn trace_at_depth(
                 trees.push(t);
             }
             let meta = if first_dropped {
-                tree.meta().with_head_foot(Vec::new(), Vec::new())
+                tree.meta()
+                    .with_head_foot(Vec::new(), tree.meta().foot_comment().to_vec())
             } else {
                 tree.meta().clone()
             };
