@@ -88541,15 +88541,16 @@ struct FoldOperand<'e> {
     /// [`FoldOperand::constructor_for`], where a step used to walk the expression again to ask.
     /// `false` until then, and for an UPDATE.
     by_value: bool,
-    /// The attempts at that step a fork's EXTRACT has had declined (the state's shape is the
-    /// part of the answer the expression cannot give), shared by the fork's steps through
+    /// The attempts at that step a fork's EXTRACT has had declined one after another (the state's
+    /// shape is the part of the answer the expression cannot give), shared by the fork's steps through
     /// [`FoldOperand::counting_declines`]; `None` outside a fork's own steps.
     declines: Option<&'e core::cell::Cell<u8>>,
 }
 
-/// The declines of the owned constructor step a fork tolerates before its EXTRACT stays on the
-/// evaluator's own route (#6629). A decline costs the step's own work again on that route, so a
-/// shape the state never fits pays this many and no more.
+/// The consecutive declines of the owned constructor step a fork tolerates before its EXTRACT stays
+/// on the evaluator's own route (#6629). A decline costs the step's own work again on that route,
+/// so a shape the state never fits pays this many and no more; an answer starts the count again, so
+/// a shape the state fits only some of the time keeps its fast steps.
 const MAX_EXTRACT_CONSTRUCTOR_DECLINES: u8 = 4;
 
 impl<'e> FoldOperand<'e> {
@@ -88587,7 +88588,8 @@ impl<'e> FoldOperand<'e> {
     }
 
     /// Whether a step of this EXTRACT should try the owned constructor step: the fold's verdict,
-    /// and a fork that has not had it declined [`MAX_EXTRACT_CONSTRUCTOR_DECLINES`] times.
+    /// and a fork that has not had it declined [`MAX_EXTRACT_CONSTRUCTOR_DECLINES`] times running.
+    /// An operand without a counter (outside a fork's own steps) is never cut off.
     fn tries_constructor(&self) -> bool {
         self.by_value
             && self
@@ -88599,6 +88601,13 @@ impl<'e> FoldOperand<'e> {
     fn constructor_declined(&self) {
         if let Some(seen) = self.declines {
             seen.set(seen.get().saturating_add(1));
+        }
+    }
+
+    /// Records that the owned constructor step answered this step: the run of declines ends.
+    fn constructor_answered(&self) {
+        if let Some(seen) = self.declines {
+            seen.set(0);
         }
     }
 
@@ -89024,9 +89033,12 @@ fn constructor_holds_state_at_most_once(expr: &Expr) -> bool {
                 Expr::Comma(items) => items.as_slice(),
                 single => core::slice::from_ref(single),
             };
+            // An array with no `.` member is let in (#6629)...
             items.iter().filter(|item| is_dot(item)).count() <= 1 && items.iter().all(fits)
         }
         Expr::Object(entries) => {
+            // ...an object with none is not (the evaluator already answers it off the tree, #6608):
+            // keep this `== 1` unless that is measured again.
             entries.iter().filter(|entry| is_dot(&entry.value)).count() == 1
                 && entries.iter().all(|entry| {
                     fits(&entry.value)
@@ -92653,8 +92665,10 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                                             )),
                                     ));
                                 });
-                                if !matches!(step, Ok(OwnedStep::Handled(_))) {
-                                    if let Some(ext) = extract {
+                                if let Some(ext) = extract {
+                                    if matches!(step, Ok(OwnedStep::Handled(_))) {
+                                        ext.constructor_answered();
+                                    } else {
                                         ext.constructor_declined();
                                     }
                                 }
@@ -179941,6 +179955,15 @@ mod fold_operand_inert_tests_5745 {
             counted.constructor_declined();
         }
         assert!(!counted.tries_constructor());
+        // An answer in the middle of a run starts it again.
+        declined.set(MAX_EXTRACT_CONSTRUCTOR_DECLINES - 1);
+        counted.constructor_answered();
+        assert!(counted.tries_constructor());
+        assert_eq!(declined.get(), 0);
+        // An operand outside a fork's own steps has no counter, and is never cut off.
+        let uncounted = operand.constructor_for::<JqSemantics>(&names);
+        uncounted.constructor_declined();
+        assert!(uncounted.tries_constructor());
     }
 
     /// Run `program` over `null`, returning its outputs and what the EXTRACT constructor step did
@@ -180009,6 +180032,12 @@ mod fold_operand_inert_tests_5745 {
             ),
             ("[foreach range(50) as $i ({a: 1}; .; .a)]", (0, 0)),
             ("[foreach range(50) as $i ({a: 1}; .a += 1)]", (0, 0)),
+            // A shape the state fits every other step keeps being offered: an answer ends the
+            // run of declines.
+            (
+                "[foreach range(50) as $i ({a: 1}; if $i % 2 == 0 then {a: 1} else {a: [1]} end; [.a, .a])]",
+                (steps, steps / 2),
+            ),
             // Each INIT fork counts its own declines.
             (
                 "[foreach range(50) as $i (({a: [1]}, {a: [2]}); .; [.a, .a])]",

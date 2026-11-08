@@ -373,9 +373,75 @@ fn a_dot_free_constructor_extract_answers_as_jq_6629() -> Result<()> {
             "{\"x\":1000,\"y\":0}\n",
             0,
         ),
+        (
+            r"[foreach ([1],[2]) as $x ({a: 1}; .; [.a, $x[0]])]",
+            "[[1,1],[1,2]]\n",
+            0,
+        ),
+        (
+            r"[foreach ([1],[2]) as $x ({a: 1}; .; [.a, $x])]",
+            "[[1,[1]],[1,[2]]]\n",
+            0,
+        ),
+        (
+            r"[foreach ([1],[2]) as $x ({a: 1}; .; [.a, ($x | length)])]",
+            "[[1,1],[1,1]]\n",
+            0,
+        ),
+        (
+            r"[foreach ({k: 1},{k: 2}) as $x ({a: 1}; .; [.a, $x.k, $x])]",
+            "[[1,1,{\"k\":1}],[1,2,{\"k\":2}]]\n",
+            0,
+        ),
+        (
+            r"[foreach range(3) as $i ({a: [1, 2]}; .; [.a[0], .a])]",
+            "[[1,[1,2]],[1,[1,2]],[1,[1,2]]]\n",
+            0,
+        ),
+        (
+            r"[foreach range(3) as $i ({a: [1, 2]}; .; [.a, (.a | length)])]",
+            "[[[1,2],2],[[1,2],2],[[1,2],2]]\n",
+            0,
+        ),
+        (
+            r"[foreach range(3) as $i ({a: [1, 2]}; .; [.a, .a[0]])]",
+            "[[[1,2],1],[[1,2],1],[[1,2],1]]\n",
+            0,
+        ),
+        (
+            r"[foreach range(3) as $i ({a: [1, 2], b: [3]}; .; [.b, .a, .b])]",
+            "[[[3],[1,2],[3]],[[3],[1,2],[3]],[[3],[1,2],[3]]]\n",
+            0,
+        ),
+        (
+            r"[foreach range(6) as $i ({a: 1}; if $i % 2 == 0 then {a: 1} else {a: [1]} end; [.a, .a])]",
+            "[[1,1],[[1],[1]],[1,1],[[1],[1]],[1,1],[[1],[1]]]\n",
+            0,
+        ),
     ] {
         let (stdout, _, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!((stdout.as_str(), code), (want, want_code), "{filter}");
+    }
+    Ok(())
+}
+
+/// A step that runs the as-written EXTRACT (the loop starts from a binding that holds a document node,
+/// so the embed table is live) never asks the owned step, and answers as jq 1.7.1 does.
+#[test]
+fn a_dot_free_constructor_extract_over_a_document_node_answers_as_jq_6629() -> Result<()> {
+    let doc = "{\"a\":[1,2],\"b\":{\"c\":3}}\n";
+    for (filter, want) in [
+        (
+            r". as $d | [foreach range(3) as $i ($d; .; [.a, .b])]",
+            "[[[1,2],{\"c\":3}],[[1,2],{\"c\":3}],[[1,2],{\"c\":3}]]\n",
+        ),
+        (
+            r". as $d | [foreach range(3) as $i ($d; .; [$i, .a])]",
+            "[[0,[1,2]],[1,[1,2]],[2,[1,2]]]\n",
+        ),
+    ] {
+        let (stdout, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{filter}");
     }
     Ok(())
 }
