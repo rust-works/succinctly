@@ -7343,8 +7343,18 @@ fn read_inputs(
             values.extend(outside);
             value_locations.extend(outside_locations);
         }
-        for &at in &value_locations {
-            let (source, line) = stream_location(&raw_bytes, at);
+        // #6591: the fault event at the end of the text is read at a last file that did not open,
+        // line 0, as the JSON reader's fault is (#6480).
+        let fault_at_tail = !args.slurp
+            && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some())
+            && values.last().is_some_and(is_eof_fault_event);
+        let last = value_locations.len().saturating_sub(1);
+        for (index, &at) in value_locations.iter().enumerate() {
+            let (source, line) = if fault_at_tail && index == last {
+                (files.len(), 0)
+            } else {
+                stream_location(&raw_bytes, at)
+            };
             locations.push(source, line);
         }
         if track_eof && !args.slurp {
@@ -8145,6 +8155,16 @@ fn seq_fault_errors_of(
             )
         })
         .collect()
+}
+
+/// Whether `value` is the `--stream-errors` event of a parse error at the end of the text: the
+/// `[message, path]` a path event (`[[...], leaf]`) is told from by its string first element.
+fn is_eof_fault_event(value: &OwnedValue) -> bool {
+    value
+        .as_array()
+        .and_then(|event| event.first())
+        .and_then(OwnedValue::as_str)
+        .is_some_and(|message| message.contains(" at EOF"))
 }
 
 /// Whether a plain `--stream` walk (#5498) is read by the stream reader through the input queue:
@@ -9106,10 +9126,18 @@ fn first_value_completes_in(raw: &[u8], args: &JqCommand) -> bool {
 }
 
 /// [`first_value_completes_in`] for the file at `at` of `raws`, and for `--stream-errors`, whose
-/// text is whole JSON that ends where a value does: its first event is complete however it is read.
+/// first event is complete inside the file when the next file's bytes cannot change it (#6591),
+/// whatever follows it in the file: `[1,` is complete, `[1` is not.
 fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bool {
     if args.stream_errors && !args.seq {
-        source_ends_cleanly(&raws[at], args) && first_stream_fault(&raws[at..=at]).is_none()
+        // jq skips a byte-order mark at the front of its input: of the first file with bytes.
+        let raw = &raws[at][..];
+        let bom = if raws[..at].iter().all(Vec::is_empty) {
+            crate::front_matter::leading_bom_len(raw)
+        } else {
+            0
+        };
+        crate::jq_stream_errors::first_event_completes_in(&raw[bom..])
     } else {
         first_value_completes_in(&raws[at], args)
     }
