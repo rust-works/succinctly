@@ -5066,13 +5066,21 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 let index = build_dsv_index(&raw, &config);
 
                 // Stream rows using the cursor - no materialization of all rows
-                let rows = DsvRows::new(&raw, &index);
+                let mut rows = DsvRows::new(&raw, &index).enumerate().peekable();
+                // #6669: a record still open at the end of the last file that opened (the join
+                // has moved any other forward) asks for the next file, so reading it reaches
+                // every failure behind it, as `-R`'s line with no newline does.
+                let open_tail = pending_failures
+                    && open_dsv_record_start(&raw, dsv_config(delimiter).quote_char).is_some();
 
-                for (row_idx, row) in rows.enumerate() {
+                while let Some((row_idx, row)) = rows.next() {
                     // #6585: a file that did not open is reported before the first row read from
                     // past it.
                     if pending_failures && row_idx == 0 {
                         report_reached_open_failures(u32::try_from(file_idx).ok(), false);
+                    }
+                    if open_tail && rows.peek().is_none() {
+                        report_reached_open_failures(None, false);
                     }
                     // Each row is one top-level input.
                     if !finished.next_input(
@@ -6758,6 +6766,19 @@ fn fault_reaches_end(raws: &[Vec<u8>], args: &JqCommand) -> bool {
 /// `--seq` and the streaming readers place their values themselves, and `--validate` checks each
 /// file on its own.
 fn last_value_reaches_end(raws: &[Vec<u8>], args: &JqCommand) -> bool {
+    if let Some(delimiter) = args.input_dsv {
+        // #6669: a quote still open at the end of the last file with bytes leaves its one record
+        // asking for more, and no file after it opened to join it (#6601), so the row is read at
+        // the file that did not open, as `-R`'s last line with no newline is.
+        return !(args.seq || args.stream || args.stream_errors || args.validate)
+            && raws
+                .iter()
+                .rev()
+                .find(|raw| !raw.is_empty())
+                .is_some_and(|raw| {
+                    open_dsv_record_start(raw, dsv_config(delimiter).quote_char).is_some()
+                });
+    }
     if args.seq || args.stream || args.stream_errors || args.input_dsv.is_some() || args.validate {
         return false;
     }
@@ -9612,11 +9633,14 @@ fn closing_event_lags(raw: &[u8]) -> bool {
 /// `--input-dsv`, an event for `--stream-errors`) is complete inside it, so that reading it asks for
 /// no more of the files after it (#6522, #6585). `false` where it cannot tell.
 fn first_value_completes_in(raw: &[u8], args: &JqCommand) -> bool {
-    if args.input_dsv.is_some() {
+    if let Some(delimiter) = args.input_dsv {
         // A record still open at the end of a file is joined to the next file's (#6601) and read
         // from the file it ends in, so the first row after a missing file is read from the first
-        // file past it that has bytes, whichever file closes it (#6585).
-        true
+        // file past it that has bytes, whichever file closes it (#6585). A file that is still
+        // open at its end and has no earlier record in it is the last that opened (the join has
+        // emptied any other), and its one row asks for the next file (#6669), as `-R`'s line with
+        // no newline does.
+        open_dsv_record_start(raw, dsv_config(delimiter).quote_char) != Some(0)
     } else if args.raw_input {
         raw.contains(&b'\n')
     } else {
