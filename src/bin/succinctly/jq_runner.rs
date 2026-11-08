@@ -6864,7 +6864,11 @@ fn read_inputs(
         // stops on an earlier line never gets there, as in jq. `--stream` and `--stream-errors`
         // place that tail themselves and keep the test.
         let raw_lines_read_whole = args.raw_input && !args.stream && !args.stream_errors;
-        seq_readers_place_reads = seq_stream_shape && !args.slurp;
+        // A last failure that is not a source of its own (a directory) is reported by a read past
+        // the end, which a fault raised first never makes: that stream keeps #6586's rule below.
+        let unplaced_tail = failures.last().is_some_and(|&(at, _)| at >= files.len())
+            && unopened_tail_name(&failures, files.len()).is_none();
+        seq_readers_place_reads = seq_stream_shape && !args.slurp && !unplaced_tail;
         let ends_cleanly = raw_lines_read_whole
             || seq_readers_place_reads
             || failures.iter().all(|&(at, _)| {
@@ -6882,7 +6886,9 @@ fn read_inputs(
         // `input` seeds the queue the hook reports from.
         // #6555, #6584: `-R` reads the lines of a `--seq` stream with its own reader, as it reads
         // any text, and the `--seq` readers place each read where the reader stands, a fault
-        // included, so their reads reach the failures as a JSON stream's do.
+        // included, so their reads reach the failures as a JSON stream's do. A stream they cannot
+        // place the reads of is deferred only when it reads without a fault, as a JSON stream's
+        // values are placed then; with nothing to report the walk is not worth its copy of the text.
         if (args.null_input || track_eof)
             && !args.slurp
             && args.input_dsv.is_none()
@@ -9020,7 +9026,8 @@ fn defer_open_failures(failures: Vec<(usize, InputFileOpenError)>, fault_ends_te
 /// where a JSON stream's is and nothing else comes out of the input queue. That holds for
 /// `--stream` and `--stream-errors` too, whose events of a clean record stream are placed as their
 /// values'. A slurp reads every file before the program runs, so this is asked only of a run
-/// without `-s`.
+/// without `-s`. Since #6584 it decides only a run whose last failure is not a source of its own
+/// (a directory), the rest being placed by `seq_readers_place_reads`.
 fn seq_text_reads_clean(raws: &[Vec<u8>], unopened_tail: bool) -> bool {
     let sources: Vec<(Option<usize>, Vec<u8>)> = raws
         .iter()
