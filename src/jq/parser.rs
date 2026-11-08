@@ -940,45 +940,42 @@ const NWISE_TWO_VAR: &str = "__nwise_m";
 ///
 /// (Both captured against the pinned jq, not taken from its manual: the manual does not document
 /// it, and the second form was not what the first draft of this guessed.) Expanded at the call
-/// site, with the argument expressions put in where jq's `$n` and `a` are bound, so `[_nwise(2,3)]`
-/// chunks by 2 and then by 3, `_nwise(a; 3)` chunks each output of `a`, and a `$n` generator
-/// is the outer loop. The extra names, `$__nwise_1` and `$__nwise_m`, are not ones a program
-/// writes (as jq's own `$__loc__`), and the arguments are parsed outside the template, so they
-/// cannot see its variables. The template is parsed by a parser of its own, which has no program
-/// `def`s, so its `length` and its slices are the builtins whatever the program defines.
-///
-/// `Err(args)` hands the arguments back when the template does not have the shape this fills in
-/// (it is parsed from the text above, so a test pins the shape): the call stays a plain call.
-fn nwise_expansion(mut args: Vec<Expr>) -> Result<Expr, Vec<Expr>> {
-    // `n` and `$n` are jq's own names. An argument expression is parsed outside this template and
-    // sits outside the scope of both (`a` of the two-argument form is evaluated under `$__nwise_m`
-    // alone), so it cannot see them.
+/// site, with the argument expressions bound where jq binds `$n` and put where `a` is called, so
+/// `[_nwise(2,3)]` chunks by 2 and then by 3, `_nwise(a; 3)` chunks each output of `a`, and a
+/// `$n` generator is the outer loop. The extra names, `$__nwise_1` and `$__nwise_m`, are not ones
+/// a program writes (as jq's own `$__loc__`), and the arguments are parsed outside the template,
+/// so they cannot see its variables. The template is parsed by a parser of its own, which has no
+/// program `def`s, so its `length` and its slices are the builtins whatever the program defines.
+fn nwise_expansion(mut args: Vec<Expr>) -> Expr {
+    // `n` and `$n` are jq's own names. An argument expression sits outside the scope of both
+    // (`a` of the two-argument form is evaluated under `$__nwise_m` alone).
     const BODY: &str = "def n: if length <= $n then . else .[0:$n] , (.[$n:] | n) end; n";
-    let template = if args.len() == 1 {
-        format!("0 as ${NWISE_ONE_VAR} | ${NWISE_ONE_VAR} as $n | {BODY}")
-    } else {
-        format!("0 as ${NWISE_TWO_VAR} | 1 | (${NWISE_TWO_VAR} as $n | {BODY})")
-    };
-    let Ok(mut parsed) = parse_with_mode(&template, ParserMode::Jq) else {
-        return Err(args);
-    };
-    let Expr::As { expr, body, .. } = &mut parsed else {
-        return Err(args);
+    let template = |source: String| {
+        parse_with_mode(&source, ParserMode::Jq).expect("jq's _nwise template parses")
     };
     if args.len() == 1 {
-        **expr = args.remove(0);
+        Expr::As {
+            expr: Box::new(args.remove(0)),
+            var: NWISE_ONE_VAR.to_string(),
+            body: Box::new(template(format!("${NWISE_ONE_VAR} as $n | {BODY}"))),
+        }
     } else {
         // `_nwise(a; $n)`: `$n`'s generator is the outer loop, `a` is evaluated inside it.
-        let Expr::Pipe(stages) = &mut **body else {
-            return Err(args);
-        };
-        let (Some(slot), 2) = (stages.first_mut(), args.len()) else {
-            return Err(args);
-        };
-        *slot = args.remove(0);
-        **expr = args.remove(0);
+        let a = args.remove(0);
+        Expr::As {
+            expr: Box::new(args.remove(0)),
+            var: NWISE_TWO_VAR.to_string(),
+            body: Box::new(Expr::Pipe(
+                vec![
+                    a,
+                    Expr::Paren(Box::new(template(format!(
+                        "${NWISE_TWO_VAR} as $n | {BODY}"
+                    )))),
+                ]
+                .into(),
+            )),
+        }
     }
-    Ok(parsed)
 }
 
 /// The arity of a stored `_nwise` expansion (#6684), for `resolve.rs`'s shadowing check: the call
@@ -997,42 +994,32 @@ pub(crate) fn nwise_fallback_arity(expr: &Expr) -> Option<usize> {
 /// `n`), moved out; `Err` hands any other expression back.
 pub(crate) fn nwise_fallback_into_args(expr: Expr) -> Result<Vec<Expr>, Expr> {
     match expr {
-        Expr::As { var, expr, body } if var == NWISE_ONE_VAR => {
-            let _ = body;
-            Ok(alloc::vec![*expr])
+        Expr::As { var, expr, .. } if var == NWISE_ONE_VAR => Ok(alloc::vec![*expr]),
+        Expr::As { var, expr, body } if var == NWISE_TWO_VAR => {
+            let a = if let Expr::Pipe(stages) = *body {
+                stages.into_iter().next()
+            } else {
+                None
+            };
+            Ok(a.into_iter().chain(Some(*expr)).collect())
         }
-        Expr::As { var, expr, body } if var == NWISE_TWO_VAR => match *body {
-            // `nwise_expansion` builds a pipe whose first stage is `a`.
-            Expr::Pipe(stages) => {
-                let mut stages = stages.into_iter();
-                let first = stages.next();
-                // patchcov: coverage tolerate reason="unreachable: nwise_expansion's pipe always has `a` as its first stage, and only it names the marker variable"
-                let Some(first) = first else {
-                    return Ok(alloc::vec![*expr]);
-                };
-                // patchcov: coverage end
-                Ok(alloc::vec![first, *expr])
-            }
-            // patchcov: coverage tolerate reason="unreachable: only nwise_expansion names the marker variable, and its body is a pipe"
-            other => Err(Expr::As {
-                var,
-                expr,
-                body: Box::new(other),
-            }),
-            // patchcov: coverage end
-        },
         other => Err(other),
     }
 }
 
 /// [`nwise_fallback_into_args`], by reference.
 pub(crate) fn nwise_fallback_children(expr: &Expr) -> Option<Vec<&Expr>> {
-    match expr {
-        Expr::As { var, expr, .. } if var == NWISE_ONE_VAR => Some(alloc::vec![expr.as_ref()]),
-        Expr::As { var, expr, body } if var == NWISE_TWO_VAR => match body.as_ref() {
-            Expr::Pipe(stages) => stages.first().map(|a| alloc::vec![a, expr.as_ref()]),
-            _ => None,
-        },
+    let Expr::As { var, expr, body } = expr else {
+        return None;
+    };
+    let a = if let Expr::Pipe(stages) = body.as_ref() {
+        stages.first()
+    } else {
+        None
+    };
+    match var.as_str() {
+        NWISE_ONE_VAR => Some(alloc::vec![expr.as_ref()]),
+        NWISE_TWO_VAR => Some(a.into_iter().chain(Some(expr.as_ref())).collect()),
         _ => None,
     }
 }
@@ -6217,18 +6204,12 @@ impl<'a> Parser<'a> {
             // `builtin_fallback`, which `resolve.rs` takes only where no `def _nwise` of this
             // arity is in scope (#2036).
             let shadowable = self.shadowable_defs.contains("_nwise");
-            return match nwise_expansion(args) {
-                Ok(expanded) if shadowable => Ok(Self::wrap_shadowable_call("_nwise", expanded)),
-                Ok(expanded) => Ok(expanded),
-                Err(args) => {
-                    self.record_call_site(name.clone(), args.len(), start_pos);
-                    Ok(Expr::FuncCall {
-                        name,
-                        args,
-                        builtin_fallback: None,
-                    })
-                }
-            };
+            let expanded = nwise_expansion(args);
+            return Ok(if shadowable {
+                Self::wrap_shadowable_call("_nwise", expanded)
+            } else {
+                expanded
+            });
         }
 
         self.record_call_site(name.clone(), args.len(), start_pos);
