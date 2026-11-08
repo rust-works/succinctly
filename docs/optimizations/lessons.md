@@ -37,6 +37,7 @@ See [README.md](README.md) for the technique pages these come from.
 The P-series and O-series YAML parser and query optimizations, newest last.
 
 - ✅ P2.5 (Cached Type Checking): 1-17% improvement depending on nesting depth
+- Fewer instructions and a slower wall clock is a prompt to count system calls (#6437): `users_assign_update` ran 20% fewer instructions than jq and took 25% longer, because glibc gave the evaluation thread a secondary arena that grows by one 4 KiB `mprotect` per page. `M_ARENA_MAX=1` (`src/bin/succinctly/malloc_arena.rs`) made the 10 MB row 1.24x faster; `strace -c` found it in one run.
   - See [docs/parsing/yaml.md#p25-cached-type-checking---implemented-](../parsing/yaml.md#p25-cached-type-checking---implemented-) for details
   - Best for deeply nested YAML (Kubernetes configs, CI/CD files)
 - ❌ P2.6 (Software Prefetching): **REJECTED** - 30% regression on large files
