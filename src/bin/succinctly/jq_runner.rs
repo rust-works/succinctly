@@ -5959,6 +5959,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 } else {
                     jq::count_reads_past_end();
                 }
+                // #6624: a directory given last is placed by these reads, as on the other routes.
+                install_open_failure_hook();
             } else {
                 seed_input_queue(
                     args.slurp,
@@ -9814,7 +9816,15 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
         vec![Box::new(move || report_lazy_open_failures(&unopened))]
     } else {
         // A directory last has been read, and counted: what jq says of it comes on a read after
-        // this one, which `jq -c --stream .` never makes and `[inputs]` does (a known gap, #6522).
+        // that one, which `jq -c --stream .` never makes and `[inputs]` does (#6624). The `input`
+        // queue's reads place it ([`reach_last_directory`]), as they do on the other routes
+        // (#6615), so it waits there for the read that reaches it.
+        let at = opened.len();
+        PENDING_OPEN_FAILURES.with(|pending| {
+            pending
+                .borrow_mut()
+                .extend(unopened.into_iter().map(|failure| (at, failure)));
+        });
         Vec::new()
     };
     Ok((opened, openers, tail, tail_is_source))
