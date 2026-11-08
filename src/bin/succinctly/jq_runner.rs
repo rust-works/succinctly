@@ -9419,6 +9419,19 @@ fn open_failures_reached<'a>(
         // the first open failure: a failure after the file that value comes from is never
         // reached, when the file holds the whole value.
         if main_loop_only && args.input_dsv.is_none() {
+            // #6646: a `--seq --stream` text whose last file before the failure ends in a
+            // container with a scalar before its closer holds that closer's event back until
+            // the next read, which is the open of the failed file: the main loop ends there, so
+            // the failures after the first are not reached.
+            if args.seq
+                && (args.stream || args.stream_errors)
+                && raws[..failures[0].0.min(raws.len())]
+                    .iter()
+                    .rfind(|raw| !raw.is_empty())
+                    .is_some_and(|raw| closing_event_lags(raw))
+            {
+                return &failures[..1];
+            }
             // The first file with bytes from the first failure on holds the value, or the end of
             // one that started before it. A line with no newline goes on into the next file with
             // bytes; the other readers stop where they cannot tell.
@@ -9451,6 +9464,60 @@ fn open_failures_reached<'a>(
         }
         _ => failures,
     }
+}
+
+/// Whether the last record of the `--seq` text `raw` leaves jq's stream parser holding its closing
+/// event until the next read (#6646): a top-level container that ends at the last byte of the text,
+/// whose closer follows a scalar. `[1]`, `{"a":"b"}`, `[[],1]` and `[1,2]` do; `[]`, `[[1]]`,
+/// `{"a":{}}` and a text with a byte after the closer (`[1]\n`) do not, as the closer then reads
+/// with the scalar's own token. Captured from jq 1.7.1.
+fn closing_event_lags(raw: &[u8]) -> bool {
+    let record = raw.rsplit(|&b| b == 0x1e).next().unwrap_or(raw);
+    let start = record
+        .iter()
+        .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .unwrap_or(record.len());
+    let record = &record[start..];
+    let [b'[' | b'{', .., b']' | b'}'] = record else {
+        return false;
+    };
+    // A text that is not one well-formed value (`[1}`, `{"a"}`) faults, and jq reports differently.
+    if serde_json::from_slice::<serde::de::IgnoredAny>(record).is_err() {
+        return false;
+    }
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    let mut previous = 0u8;
+    for (at, &byte) in record.iter().enumerate() {
+        if in_string {
+            match (escaped, byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+            previous = byte;
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => {
+                depth = match depth.checked_sub(1) {
+                    Some(depth) => depth,
+                    None => return false,
+                };
+                if depth == 0 {
+                    // The top-level closer is the last byte, and a scalar's last byte is before it.
+                    return at + 1 == record.len()
+                        && !matches!(previous, b'[' | b'{' | b']' | b'}' | b',' | b':');
+                }
+            }
+            b' ' | b'\t' | b'\n' | b'\r' => continue,
+            _ => {}
+        }
+        previous = byte;
+    }
+    false
 }
 
 /// Whether the first value a reader takes from `raw` (a line for `-R`, a record for
@@ -17632,6 +17699,54 @@ fn format_json_text(value: &OwnedValue, config: &OutputConfig) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// #6646: which `--seq` texts leave a closing event held back, each shape captured from jq
+    /// 1.7.1 (one failure reported where it lags, two where it does not).
+    #[test]
+    fn closing_event_lags_matches_jq_6646() {
+        for (text, lags) in [
+            ("[1]", true),
+            ("[\"a\"]", true),
+            ("[true]", true),
+            ("[null]", true),
+            ("[1 ]", true),
+            ("[ 1]", true),
+            ("  [1]", true),
+            ("{\"a\":\"b\"}", true),
+            ("[[],1]", true),
+            ("[{},1]", true),
+            ("[[1],2]", true),
+            ("[-1.5e3]", true),
+            ("[\"]\"]", true),
+            ("[\"\\\"\"]", true),
+            ("[]", false),
+            ("{}", false),
+            ("[[1]]", false),
+            ("{\"a\":{}}", false),
+            ("[1,[]]", false),
+            ("[1,[2]]", false),
+            ("{\"a\":1,\"b\":[]}", false),
+            ("[[1],[2]]", false),
+            ("[1]\n", false),
+            ("[1]\t", false),
+            ("1", false),
+            ("", false),
+            ("[1", false),
+            ("[1,]", false),
+            ("]", false),
+        ] {
+            let seq = format!("\u{1e}{text}");
+            assert_eq!(closing_event_lags(seq.as_bytes()), lags, "{text:?}");
+        }
+        // Only a well-formed value lags: a mismatched closer or a key with no value is a fault.
+        for text in ["[1}", "{\"a\":1]", "{\"a\"}", "[1][2]", "[1] [2]"] {
+            let seq = format!("\u{1e}{text}");
+            assert!(!closing_event_lags(seq.as_bytes()), "{text:?}");
+        }
+        // Only the last record counts.
+        assert!(closing_event_lags(b"\x1e[[1]]\n\x1e[2]"));
+        assert!(!closing_event_lags(b"\x1e[1]\x1e{}"));
+    }
+
     use super::*;
 
     /// #5713: `$ARGS` is built for a program that names it, wherever it stands, and only then.
