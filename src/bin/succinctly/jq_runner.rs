@@ -6844,16 +6844,23 @@ fn read_inputs(
         // #6480: past the last file that opened, the read of a last value that completes only at
         // the end is placed at the missing file, so it reports what it reached itself.
         let last_value_at_tail = LAST_VALUE_AT_TAIL.with(std::cell::Cell::get);
-        let ends_cleanly = failures.iter().all(|&(at, _)| {
-            // The last file with bytes before it: an empty one between sends the reader on too.
-            (last_value_at_tail && at >= raws.len())
-                || raws
-                    .iter()
-                    .take(at)
-                    .rev()
-                    .find(|raw| !raw.is_empty())
-                    .map_or(true, |raw| source_ends_cleanly(raw, args))
-        });
+        // #6602: `-R` needs no such test: a line that runs to the end of its file is read whole
+        // from the next file, so the value carries that file's source index and the hook reports
+        // the failure between them when a read of that line reaches it, not before. A read that
+        // stops on an earlier line never gets there, as in jq. `--stream` and `--stream-errors`
+        // place that tail themselves and keep the test.
+        let raw_lines_read_whole = args.raw_input && !args.stream && !args.stream_errors;
+        let ends_cleanly = raw_lines_read_whole
+            || failures.iter().all(|&(at, _)| {
+                // The last file with bytes before it: an empty one between sends the reader on too.
+                (last_value_at_tail && at >= raws.len())
+                    || raws
+                        .iter()
+                        .take(at)
+                        .rev()
+                        .find(|raw| !raw.is_empty())
+                        .map_or(true, |raw| source_ends_cleanly(raw, args))
+            });
         // #6525: so does a program that reads `input` without `-n`, whose main loop reads the first
         // file before the program does and stops one value past a failure. Every route that reads
         // `input` seeds the queue the hook reports from.
