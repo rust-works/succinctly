@@ -5817,7 +5817,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     // #6476: a text that ends inside a value is a fault jq's parser meets at the end
                     // of the last file's bytes, after its reader has moved on to the files that
                     // would not open, so it reports them first and the run exits 2 with them.
-                    if message.contains(" at EOF") {
+                    if fault_is_at_eof(&message) {
                         report_open_failures(&failures[next_failure..], &mut open_failed);
                         next_failure = failures.len();
                     }
@@ -7053,7 +7053,7 @@ fn read_inputs(
                 *open_failed = true;
                 defer_open_failures(directory, false);
                 SLURP_DIRECTORY_READ.with(|slurp| slurp.set(true));
-            } else if fault_leaves_last_directory_to_reads(args, &failures, reached) {
+            } else if fault_leaves_failures_to_reads(args, &failures, reached) {
                 // #6625: a `-n` run over a text that faults hands the fault to the first read
                 // and then goes on: jq's reader reaches what follows the fault on the reads after
                 // it, and a program that stops at the fault never does. So the failures past it
@@ -8454,7 +8454,7 @@ fn is_eof_fault_event(value: &OwnedValue) -> bool {
         .as_array()
         .and_then(|event| event.first())
         .and_then(OwnedValue::as_str)
-        .is_some_and(|message| message.contains(" at EOF"))
+        .is_some_and(fault_is_at_eof)
 }
 
 /// Whether a plain `--stream` walk (#5498) is read by the stream reader through the input queue:
@@ -9408,7 +9408,7 @@ fn seq_faults_all_before_end(raws: &[Vec<u8>], unopened_tail: bool) -> bool {
         && walk
             .faults
             .iter()
-            .all(|fault| !fault.body.contains(" at EOF"))
+            .all(|fault| !fault_is_at_eof(&fault.body))
 }
 
 /// For each fault `--seq`'s own reader holds over the text the files `raws` make, in order, whether
@@ -9428,7 +9428,7 @@ fn seq_fault_ends(raws: &[Vec<u8>], unopened_tail: bool) -> Vec<bool> {
     )
     .faults
     .iter()
-    .map(|fault| fault.body.contains(" at EOF"))
+    .map(|fault| fault_is_at_eof(&fault.body))
     .collect()
 }
 
@@ -9753,10 +9753,10 @@ fn last_directory_left_to_reads(
         && ends_in_last_directory(failures)
 }
 
-/// Whether a `-n` run's text faults before the directory given last, which the fault left out of
-/// the failures its reads reached (#6625): the reads that follow the fault place it
-/// ([`reach_last_directory`]).
-fn fault_leaves_last_directory_to_reads(
+/// Whether a `-n` run's text faults before some of its open failures, which the fault left out of
+/// the failures its reads reached (#6625, #6656): the reads that follow the fault place them, and
+/// a directory given last by [`reach_last_directory`].
+fn fault_leaves_failures_to_reads(
     args: &JqCommand,
     failures: &[(usize, InputFileOpenError)],
     reached: usize,
@@ -9765,7 +9765,6 @@ fn fault_leaves_last_directory_to_reads(
         && !args.raw_input
         && reads_place_json_or_text_failures(args)
         && reached < failures.len()
-        && ends_in_last_directory(failures)
 }
 
 /// Whether the input is JSON text or `-R` lines, the readers whose reads [`reach_last_directory`]
@@ -12457,6 +12456,12 @@ fn seed_input_queue(
         // is counted when it is read, one forward pass over the text in all. One that
         // turned malformed (#5853) has the documents and parse errors after its lazy start
         // in `inputs` and `resumed_errors`, and they follow it in order.
+        note_fault_ends(
+            resumed_errors
+                .iter()
+                .map(|(_, fault)| &fault.error.message)
+                .chain(trailing_error.iter().map(|fault| &fault.error.message)),
+        );
         let tail = lazy_tail_items(inputs, locations, trailing_error, resumed_errors);
         jq::seed_remaining_inputs_from(end_producer_at(
             locations.unopened_end(),
@@ -12512,20 +12517,8 @@ fn seed_input_queue(
         if let (Some(end), Some(last)) = (locations.fault_end(), errors.last_mut()) {
             last.2 = end;
         }
-        // #6625: a slurp's faults each say whether they are at the end of the text, for the hook
-        // to place a last directory by, when it has more than the one fault the whole read names.
-        if slurp
-            && errors.len() > 1
-            && PENDING_OPEN_FAILURES.with(|pending| !pending.borrow().is_empty())
-        {
-            SEQ_FAULT_ENDS.with(|ends| {
-                *ends.borrow_mut() = errors
-                    .iter()
-                    // The text of the fault, as `seq_faults_all_before_end` tells them apart.
-                    .map(|(_, error, _)| error.to_string().contains(" at EOF"))
-                    .collect();
-            });
-        }
+        // #6625, #6656: a text's faults each say whether they are at the end of the text.
+        note_fault_ends(errors.iter().map(|(_, error, _)| error.to_string()));
         jq::seed_remaining_inputs_with_errors(queue, locations.exhausted(slurp), errors);
         // #4303: where the stream's own end was recorded, reads past it
         // move on from it as jq's do. A slurp read the whole stream to build its one value, so
@@ -12533,6 +12526,31 @@ fn seed_input_queue(
         locations.count_reads_past_end(slurp);
     }
     install_open_failure_hook();
+}
+
+/// Records, for each fault of a text (#6625, #6656), whether it is at the end of the text, for the
+/// hook to place the failures after it by, when the text has more than the one fault the whole
+/// read names ([`FAULT_ENDS_TEXT`]). The text of a fault tells them apart, as
+/// `seq_faults_all_before_end` does.
+fn note_fault_ends<M: AsRef<str>>(messages: impl Iterator<Item = M>) {
+    // Cheapest test first: most runs have no failure pending, and `--seq`'s own per-fault flags
+    // (#6643) are not replaced.
+    if PENDING_OPEN_FAILURES.with(|pending| pending.borrow().is_empty())
+        || SEQ_FAULT_ENDS.with(|slot| !slot.borrow().is_empty())
+    {
+        return;
+    }
+    let ends: std::collections::VecDeque<bool> = messages
+        .map(|message| fault_is_at_eof(message.as_ref()))
+        .collect();
+    if ends.len() > 1 {
+        SEQ_FAULT_ENDS.with(|slot| *slot.borrow_mut() = ends);
+    }
+}
+
+/// Whether a parse error's message says the fault is at the end of the text: jq's `... at EOF`.
+fn fault_is_at_eof(message: &str) -> bool {
+    message.contains(" at EOF")
 }
 
 /// What a stream that turned malformed after its lazy start (#5853) hands out once the lazy
