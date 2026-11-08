@@ -9212,34 +9212,70 @@ enum ObjectEntries<'a> {
 /// how [`field_comments_of`] finds the spelling the tree kept for it (#6335).
 type ObjectEntry<'a> = (&'a String, &'a OwnedValue, bool, usize);
 
+/// Counts the entries seen per key: the one definition of "the n-th earlier entry of this key"
+/// that the writer ([`ObjectEntries`]) and the `to_entries` trace
+/// (`reshape_presentation.rs`) share, and that the by-key tree's shadow leaves are numbered by
+/// (#6335).
+#[derive(Default)]
+struct KeyCounts<'a>(std::collections::HashMap<&'a str, usize>);
+
+impl<'a> KeyCounts<'a> {
+    /// How many entries of `key` were counted before this one; counts this one.
+    fn bump(&mut self, key: &'a str) -> usize {
+        let count = self.0.entry(key).or_insert(0);
+        let before = *count;
+        *count += 1;
+        before
+    }
+
+    /// How many entries of `key` have been counted.
+    fn of(&self, key: &str) -> usize {
+        self.0.get(key).copied().unwrap_or(0)
+    }
+}
+
 impl<'a> ObjectEntries<'a> {
-    fn of(obj: &'a ObjectMap, sort_keys: bool) -> Self {
+    fn of(obj: &'a ObjectMap, comments: &CommentTree, sort_keys: bool) -> Self {
         if !sort_keys && !obj.has_shadows() {
             return Self::Plain(obj.iter());
         }
-        Self::Listed(Self::listed(obj, sort_keys).into_iter())
+        Self::Listed(Self::listed(obj, comments, sort_keys).into_iter())
     }
 
     #[inline(never)]
-    fn listed(obj: &'a ObjectMap, sort_keys: bool) -> Vec<ObjectEntry<'a>> {
-        // Document order, so the count of a key's earlier shadows is the ordinal of this one;
-        // sorting is stable, so a key's entries keep that order after it.
-        let mut seen: std::collections::HashMap<&String, usize> = std::collections::HashMap::new();
+    fn listed(obj: &'a ObjectMap, comments: &CommentTree, sort_keys: bool) -> Vec<ObjectEntry<'a>> {
         let mut entries: Vec<_> = obj
             .occurrences()
             .flagged()
-            .map(|(k, v, live)| {
-                let ordinal = if live {
-                    0
-                } else {
-                    let slot = seen.entry(k).or_insert(0);
-                    let ordinal = *slot;
-                    *slot += 1;
-                    ordinal
-                };
-                (k, v, live, ordinal)
-            })
+            .map(|(k, v, live)| (k, v, live, 0))
             .collect();
+        // Only a tree that kept a shadow's spelling has anything to find by ordinal; the rest
+        // print the writer's default, so no entry is numbered.
+        if comments.has_shadow_leaves() {
+            // Document order, so the count of a key's earlier shadows is the ordinal of this one.
+            let mut totals = KeyCounts::default();
+            for (k, _, live, _) in &entries {
+                if !live {
+                    totals.bump(k);
+                }
+            }
+            let mut seen = KeyCounts::default();
+            for (k, _, live, ordinal) in &mut entries {
+                if !*live {
+                    let position = seen.bump(k);
+                    // A tree that kept a different number of shadows for this key than the
+                    // mapping now holds (a write changed the count) cannot be aligned by
+                    // position: the entry prints plain rather than another one's spelling.
+                    let kept = comments.key_meta(k).map_or(0, |meta| meta.shadows().len());
+                    *ordinal = if kept == totals.of(k) {
+                        position
+                    } else {
+                        usize::MAX
+                    };
+                }
+            }
+        }
+        // Sorting is stable, so a key's entries keep their document order.
         if sort_keys {
             entries.sort_by(|a, b| a.0.cmp(b.0));
         }
@@ -9616,7 +9652,7 @@ fn emit_yaml_value_at_depth(
                 // Flow style for nested in flow context
                 let ci = flow_continuation(indent, &config.indent_str);
                 let child_indent = flow_child_indent(&ci, &config.indent_str);
-                let entries: Vec<_> = ObjectEntries::of(obj, false)
+                let entries: Vec<_> = ObjectEntries::of(obj, comments, false)
                     .map(|(k, v, live, ordinal)| {
                         let kc = key_comments_of(comments, live);
                         let key = with_key_anchor(
@@ -9644,7 +9680,7 @@ fn emit_yaml_value_at_depth(
                 with_container_tag(value, comments, rendered)
             } else {
                 // Block style mapping
-                let entries: Vec<_> = ObjectEntries::of(obj, config.sort_keys).collect();
+                let entries: Vec<_> = ObjectEntries::of(obj, comments, config.sort_keys).collect();
 
                 let items: Vec<(String, bool)> = entries
                     .iter()
@@ -13560,6 +13596,76 @@ fn run_exit_code(sink: &ErrorSink, exit_status: bool, any_truthy: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6335: the writer numbers a repeated key's earlier entries by position among that key's
+    /// shadows (also under a sort, which is stable), numbers nothing when the tree kept no
+    /// spelling, and refuses to number a key whose kept leaves are a different count from the
+    /// shadows the mapping holds, since position would then attach another entry's spelling.
+    #[test]
+    fn test_object_entries_number_a_keys_shadows_by_position_6335() {
+        let mut obj = ObjectMap::default();
+        for (key, value) in [
+            ("a", OwnedValue::Null),
+            ("b", OwnedValue::Int(1)),
+            ("a", OwnedValue::Null),
+            ("a", OwnedValue::Int(2)),
+        ] {
+            obj.push_occurrence(key.to_string(), value);
+        }
+        let leaves = |count: usize| {
+            let spelled = CommentTree::Leaf(NodeMeta::empty().with_spelling(Some(String::new())));
+            IndexMap::from([("a".to_string(), vec![spelled; count])])
+        };
+        let tree_with = |count: usize| {
+            let mut keys = IndexMap::new();
+            succinctly::jq::eval_generic::KeyMeta::record_shadows(&mut keys, leaves(count));
+            CommentTree::Object(NodeMeta::empty(), IndexMap::new(), keys)
+        };
+        let numbered = |tree: &CommentTree, sort_keys: bool| -> Vec<(String, bool, usize)> {
+            ObjectEntries::of(&obj, tree, sort_keys)
+                .map(|(k, _, live, ordinal)| (k.clone(), live, ordinal))
+                .collect()
+        };
+        let entry = |k: &str, live: bool, ordinal: usize| (k.to_string(), live, ordinal);
+
+        // Two shadows of `a`, two leaves kept: the n-th shadow is the n-th leaf.
+        assert_eq!(
+            numbered(&tree_with(2), false),
+            [
+                entry("a", false, 0),
+                entry("b", true, 0),
+                entry("a", false, 1),
+                entry("a", true, 0),
+            ]
+        );
+        assert_eq!(
+            numbered(&tree_with(2), true),
+            [
+                entry("a", false, 0),
+                entry("a", false, 1),
+                entry("a", true, 0),
+                entry("b", true, 0),
+            ]
+        );
+        // One leaf kept for two shadows: not aligned, so neither is numbered.
+        assert_eq!(
+            numbered(&tree_with(1), false)
+                .iter()
+                .map(|(_, _, ordinal)| *ordinal)
+                .collect::<Vec<_>>(),
+            [usize::MAX, 0, usize::MAX, 0]
+        );
+        // A tree that kept no spelling has nothing to find, so nothing is numbered.
+        assert!(numbered(&CommentTree::empty(), false)
+            .iter()
+            .all(|(_, _, ordinal)| *ordinal == 0));
+        // A misaligned or absent leaf is the empty tree, never another entry's.
+        assert!(tree_with(1)
+            .shadow_field("a", usize::MAX)
+            .meta()
+            .spelling()
+            .is_none());
+    }
 
     /// #2004: `stream_maybe_colored` writes the colorized results before the first NUL and
     /// stops, which is only sound if that is the same text as the corresponding leading slice

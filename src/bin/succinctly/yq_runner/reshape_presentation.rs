@@ -6,7 +6,7 @@
 
 use super::{
     collect_write_targets, is_closed_literal, reconcile_presentation, CommentTree, Expr, IndexMap,
-    NodeMeta, NumberRepr, OwnedValue, ResultWithComments,
+    KeyCounts, NodeMeta, NumberRepr, OwnedValue, ResultWithComments,
 };
 use succinctly::jq::document::{
     DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields, DocumentValue,
@@ -648,22 +648,22 @@ fn trace_at_depth(
             // #6335: `to_entries` lists a repeated key once per entry, and the by-key tree holds
             // the live one's presentation. `totals` counts the entries of each key and `earlier`
             // those listed so far, so an entry before the last is a shadow, found by its position
-            // among them. Counted once, and only for a mapping that repeats a key.
+            // among them, as the writer finds it (`KeyCounts`). Counted once, and only for a
+            // mapping whose tree kept a shadow's spelling.
             let has_shadows = matches!(value, OwnedValue::Object(o) if o.has_shadows())
+                && tree.has_shadow_leaves()
                 && matches!(expr, Expr::Builtin(Builtin::ToEntries));
-            let mut totals: std::collections::HashMap<&str, usize> =
-                std::collections::HashMap::new();
+            let mut totals = KeyCounts::default();
             if has_shadows {
                 for output in outputs {
                     if let OwnedValue::Object(entry) = output {
                         if let Some(OwnedValue::String(key)) = entry.get("key") {
-                            *totals.entry(key.as_ref()).or_insert(0) += 1;
+                            totals.bump(key.as_ref());
                         }
                     }
                 }
             }
-            let mut earlier: std::collections::HashMap<&str, usize> =
-                std::collections::HashMap::new();
+            let mut earlier = KeyCounts::default();
             for (i, output) in outputs.iter().enumerate() {
                 let is_entries = matches!(expr, Expr::Builtin(Builtin::ToEntries));
                 let key = if is_entries {
@@ -695,11 +695,18 @@ fn trace_at_depth(
                                     .map(|name| AnchorMark::Aliases(name.to_string()))
                             });
                         let value_tree = if has_shadows {
-                            let seen = earlier.entry(key.as_ref()).or_insert(0);
-                            let ordinal = *seen;
-                            *seen += 1;
-                            if ordinal + 1 < totals.get(key.as_ref()).copied().unwrap_or(0) {
-                                tree.shadow_field(key, ordinal).clone()
+                            let ordinal = earlier.bump(key.as_ref());
+                            let total = totals.of(key.as_ref());
+                            if ordinal + 1 < total {
+                                // As the writer: a tree that kept another number of shadows
+                                // than the mapping holds cannot be aligned by position.
+                                if tree.key_meta(key).map_or(0, |meta| meta.shadows().len())
+                                    == total - 1
+                                {
+                                    tree.shadow_field(key, ordinal).clone()
+                                } else {
+                                    CommentTree::empty()
+                                }
                             } else {
                                 tree.field(key).clone()
                             }

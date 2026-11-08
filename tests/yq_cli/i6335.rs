@@ -52,6 +52,82 @@ const ROWS: &[(&str, &str, &str)] = &[
         ".zzkey = 1",
         "a:\nb:\na: 2\nb: 3\nzzkey: 1\n",
     ),
+    (
+        "a: 1\na: ~\na: 2\n",
+        ".zzkey = 1",
+        "a: 1\na: ~\na: 2\nzzkey: 1\n",
+    ),
+    (
+        "a: 1\na: ~\na: 2\n",
+        "with_entries(.)",
+        "a: 1\na: ~\na: 2\n",
+    ),
+    (
+        "a: 1\na: ~\na: 2\n",
+        ". * {\"q\":1}",
+        "a: 1\na: ~\na: 2\nq: 1\n",
+    ),
+    ("a: 1\na: ~\na: 2\n", "del(.zzkey)", "a: 1\na: ~\na: 2\n"),
+    (
+        "a: ~\na: 1\na: True\na: 2\n",
+        ".zzkey = 1",
+        "a: ~\na: 1\na: True\na: 2\nzzkey: 1\n",
+    ),
+    (
+        "a: ~\na: 1\na: True\na: 2\n",
+        "with_entries(.)",
+        "a: ~\na: 1\na: True\na: 2\n",
+    ),
+    (
+        "a: ~\na: 1\na: True\na: 2\n",
+        ". * {\"q\":1}",
+        "a: ~\na: 1\na: True\na: 2\nq: 1\n",
+    ),
+    (
+        "a: ~\na: 1\na: True\na: 2\n",
+        "del(.zzkey)",
+        "a: ~\na: 1\na: True\na: 2\n",
+    ),
+    (
+        "a:\nb:\na: ~\nb: ~\nz: 1\na: 2\nb: 3\n",
+        ".zzkey = 1",
+        "a:\nb:\na: ~\nb: ~\nz: 1\na: 2\nb: 3\nzzkey: 1\n",
+    ),
+    (
+        "a:\nb:\na: ~\nb: ~\nz: 1\na: 2\nb: 3\n",
+        "with_entries(.)",
+        "a:\nb:\na: ~\nb: ~\nz: 1\na: 2\nb: 3\n",
+    ),
+    (
+        "a:\nb:\na: ~\nb: ~\nz: 1\na: 2\nb: 3\n",
+        ". * {\"q\":1}",
+        "a:\nb:\na: ~\nb: ~\nz: 1\na: 2\nb: 3\nq: 1\n",
+    ),
+    (
+        "a:\nb:\na: ~\nb: ~\nz: 1\na: 2\nb: 3\n",
+        "del(.zzkey)",
+        "a:\nb:\na: ~\nb: ~\nz: 1\na: 2\nb: 3\n",
+    ),
+    (
+        "x:\n  a: ~\n  a: 1\ny:\n  a:\n  a:\n",
+        ".zzkey = 1",
+        "x:\n  a: ~\n  a: 1\ny:\n  a:\n  a:\nzzkey: 1\n",
+    ),
+    (
+        "x:\n  a: ~\n  a: 1\ny:\n  a:\n  a:\n",
+        "with_entries(.)",
+        "x:\n  a: ~\n  a: 1\ny:\n  a:\n  a:\n",
+    ),
+    (
+        "x:\n  a: ~\n  a: 1\ny:\n  a:\n  a:\n",
+        ". * {\"q\":1}",
+        "x:\n  a: ~\n  a: 1\ny:\n  a:\n  a:\nq: 1\n",
+    ),
+    (
+        "x:\n  a: ~\n  a: 1\ny:\n  a:\n  a:\n",
+        "del(.zzkey)",
+        "x:\n  a: ~\n  a: 1\ny:\n  a:\n  a:\n",
+    ),
 ];
 
 #[test]

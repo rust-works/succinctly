@@ -3638,9 +3638,12 @@ impl KeyMeta {
     /// The leaf a key keeps for an earlier entry whose tree was `earlier` (the one a later entry
     /// of the same key replaced in a by-key map): its spelling, nothing else (#6335).
     pub fn shadow_leaf(earlier: &CommentTree) -> CommentTree {
-        CommentTree::Leaf(
-            NodeMeta::empty().with_spelling(earlier.meta().spelling().map(str::to_string)),
-        )
+        match earlier.meta().spelling() {
+            Some(spelling) => {
+                CommentTree::Leaf(NodeMeta::empty().with_spelling(Some(spelling.to_string())))
+            }
+            None => CommentTree::empty(),
+        }
     }
 
     /// Store `leaves` (per repeated key, one per earlier entry in document order) in `keys`,
@@ -3806,6 +3809,16 @@ impl CommentTree {
         self.key_meta(key)
             .and_then(|k| k.shadows.get(ordinal))
             .unwrap_or(&EMPTY_COMMENT_TREE)
+    }
+
+    /// Whether any key of this object kept shadow leaves (see [`KeyMeta::shadows`]): when none
+    /// did, a repeated key's earlier entries print the writer's default and need no lookup
+    /// (#6335).
+    pub fn has_shadow_leaves(&self) -> bool {
+        match self {
+            Self::Object(_, _, keys) => keys.values().any(|k| !k.shadows.is_empty()),
+            _ => false,
+        }
     }
 
     /// A comment trailing object field `key`'s own *key* line, when its
@@ -4268,10 +4281,12 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             // #6335: the entry this one replaces in the by-key tree is a shadow, whose own
             // spelling (`a:`, `~`) would otherwise be lost.
             if let Some(earlier) = comment_map.insert(key.clone(), c) {
-                shadow_leaves
-                    .entry(key.clone())
-                    .or_default()
-                    .push(KeyMeta::shadow_leaf(&earlier));
+                if !S::COLLAPSE_DUPLICATE_KEYS {
+                    shadow_leaves
+                        .entry(key.clone())
+                        .or_default()
+                        .push(KeyMeta::shadow_leaf(&earlier));
+                }
             }
             // A comment trailing the key's own line, when the value is
             // deferred to a following line (issue #765) - distinct from
