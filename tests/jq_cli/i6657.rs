@@ -25,6 +25,11 @@ fn check(rows: &[Row<'_>]) -> Result<()> {
         ("one.json", "1"),
         ("empty.json", ""),
         ("s.json", "\"a\"\n"),
+        ("flt.json", "1 }"),
+        ("trunc.json", "[1,"),
+        ("txt.json", "a\nb"),
+        ("seqb.json", "\u{1e}\"a\"\u{1e}12"),
+        ("arr.json", "[1,2]"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
@@ -80,6 +85,31 @@ fn a_program_that_reads_the_last_value_reaches_the_failure_with_it_6657() -> Res
         (&["-c", "-n", "input"][..], &["bare", "miss", "one"][..], "121\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
         (&["-c", "-n", "[., input]"][..], &["bare", "miss", "one"][..], "[null,121]\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
         (&["-c", "-n", "[inputs]"][..], &["bare", "miss", "one"][..], "[121]\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
+    ];
+    check(&rows)
+}
+
+/// The fix touches the way `-n` places a failure behind any file, so the readers and texts it must
+/// not change are pinned too: a text that faults, `-R`, `--seq`, `--stream`, `--stream-errors` and
+/// `-s`. Each row matched jq before this change as well.
+#[test]
+fn faulting_texts_and_the_other_readers_keep_their_rows_6657() -> Result<()> {
+    #[rustfmt::skip]
+    let rows = [
+        (&["-c", "-n", "input"][..], &["flt", "miss", "one"][..], "1\n", "", 0),
+        (&["-c", "-n", "[inputs]"][..], &["flt", "miss", "one"][..], "", "jq: error (at @DIR@/flt.json:0): Unmatched '}' at line 1, column 3\n", 5),
+        (&["-c", "-n", "first(inputs)"][..], &["trunc", "miss", "one"][..], "", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error (at @DIR@/one.json:0): Unfinished JSON term at EOF at line 1, column 4\n", 2),
+        (&["-c", "-n", "input"][..], &["trunc", "miss", "one"][..], "", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error (at @DIR@/one.json:0): Unfinished JSON term at EOF at line 1, column 4\n", 2),
+        (&["-c", "-n", "[., input]"][..], &["bare", "miss", "trunc"][..], "[null,12]\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
+        (&["-c", "-n", "-R", "input"][..], &["txt", "miss", "one"][..], "\"a\"\n", "", 0),
+        (&["-c", "-n", "-R", "[inputs]"][..], &["txt", "miss", "one"][..], "[\"a\",\"b1\"]\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
+        (&["-c", "-n", "--seq", "input"][..], &["seqb", "miss", "one"][..], "\u{1e}\"a\"\n", "", 0),
+        (&["-c", "-n", "--seq", "[inputs]"][..], &["seqb", "miss", "one"][..], "", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error (at @DIR@/one.json:0): Potentially truncated top-level numeric value at EOF at line 1, column 8\n", 2),
+        (&["-c", "-n", "--stream", "input"][..], &["str", "miss", "one"][..], "[[],\"a\"]\n", "", 0),
+        (&["-c", "-n", "--stream", "[inputs]"][..], &["str", "miss", "one"][..], "[[[],\"a\"],[[],121]]\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
+        (&["-c", "-n", "--stream-errors", "first(inputs)"][..], &["str", "miss", "one"][..], "[[],\"a\"]\n", "", 0),
+        (&["-c", "-n", "-s", "."][..], &["str", "miss", "one"][..], "null\n", "", 0),
+        (&["-c", "-n", "--stream", "input"][..], &["arr", "miss", "one"][..], "[[0],1]\n", "", 0),
     ];
     check(&rows)
 }
