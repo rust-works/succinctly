@@ -15851,9 +15851,12 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
     // instead of routing through `print_json`), reusing each child's
     // already-resolved `text_position()` via `value_at` (see `scalar_end_pos`'s
     // own doc comment) the same way `check_preceding_delimiter` does.
-    check_nesting_depth(depth)?;
+    // #6618: jq's ceiling counts containers, not the scalar a deepest container holds, so a
+    // record 256 containers deep is accepted and one 257 deep is refused: the check is each
+    // container's, at the depth it opens.
     match cursor.value() {
         StandardJson::Array(elements) => {
+            check_nesting_depth(depth)?;
             let mut saw_any = false;
             let mut last_child = None;
             for (i, child) in elements.cursor_iter().enumerate() {
@@ -15893,6 +15896,7 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
             }
         }
         StandardJson::Object(fields) => {
+            check_nesting_depth(depth)?;
             let mut remaining = fields;
             let mut field_index = 0usize;
             let mut last_value = None;
