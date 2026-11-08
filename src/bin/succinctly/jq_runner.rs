@@ -10144,6 +10144,10 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
             }
             // #6472: a directory is a source with no bytes, past which jq's reader has moved.
             Err(e) if e.is_directory() => {
+                // #6680: the main loop ends at the read that fails, which delivers an event the
+                // file before it held back (`[1,2]` with no newline), so that read is the source
+                // it stops at.
+                note_open_failure_at(opened.len());
                 opened.push(path.clone());
                 // jq counts the failure when its read of the directory fails, and says so on the
                 // read after it: the run fails once the reader gets here, whether or not it goes on.
@@ -10154,8 +10158,22 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                         Ok(Box::new(std::io::Cursor::new(Vec::new())))
                     }),
                 ));
-                note_open_failure_at(opened.len());
                 unopened.push(e);
+            }
+            // #6680: a file that did not open, in the middle of the list, is an empty read to jq's
+            // reader, as a directory is: the event the file before it held back is read there, and
+            // the main loop ends at it. The last file named is the tail's, a source of its own
+            // already (#6004).
+            Err(e) if at + 1 < files.len() => {
+                note_open_failure_at(opened.len());
+                opened.push(path.clone());
+                openers.push(report_unopened_before(
+                    std::mem::take(&mut unopened),
+                    Box::new(move || {
+                        report_lazy_open_failures(&[e]);
+                        Ok(Box::new(std::io::Cursor::new(Vec::new())))
+                    }),
+                ));
             }
             Err(e) => {
                 note_open_failure_at(opened.len());
