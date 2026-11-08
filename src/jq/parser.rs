@@ -2510,10 +2510,41 @@ impl<'a> Parser<'a> {
         loop {
             match self.next() {
                 None => return Err(ParseError::new("unterminated string", self.pos)),
+                // An empty name is not stripped of its quotes: yq's key is the two characters
+                // `""` (`.""` reads it and `.x."" = 9` creates it), where `."a"` is the key `a`
+                // (#6699, live against the pinned v4.53.3).
+                Some('"') if name.is_empty() => return Ok("\"\"".to_string()),
                 Some('"') => return Ok(name),
+                // yq's path-element token takes the opening quote and stops at the first space
+                // (`\.[^ ;...]+`, #4237), so `."a b"` is `."a` and the rest `b"` that no rule
+                // takes: the lexer error. Every other character is inside the token, a tab and a
+                // newline included (#6699).
+                Some(' ') => return Err(self.invalid_input_text_after_spaces()),
                 Some(c) => name.push(c),
             }
         }
+    }
+
+    /// yq's `lexer: invalid input text "..."` for what follows the spaces at the cursor (the one
+    /// space just read, and any more): the rest of the program, quoted as Go's `%q` quotes it.
+    fn invalid_input_text_after_spaces(&mut self) -> ParseError {
+        let at = self.pos;
+        while self.peek() == Some(' ') {
+            self.next();
+        }
+        let rest = &self.input[self.pos..];
+        let mut quoted = String::from("\"");
+        for c in rest.chars() {
+            match c {
+                '"' => quoted.push_str("\\\""),
+                '\\' => quoted.push_str("\\\\"),
+                '\n' => quoted.push_str("\\n"),
+                '\t' => quoted.push_str("\\t"),
+                other => quoted.push(other),
+            }
+        }
+        quoted.push('"');
+        ParseError::new(format!("lexer: invalid input text {quoted}"), at)
     }
 
     /// Parse a simple string literal (for object keys, etc.)
