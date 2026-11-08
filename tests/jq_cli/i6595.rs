@@ -444,3 +444,24 @@ fn a_deep_chain_recurses_as_jq_6595() -> Result<()> {
     );
     Ok(())
 }
+
+/// Programs that read the same children from a path, a binding or an assignment, and bodies that
+/// end in an identity stage: all reach the owned door, and none may change what jq answers.
+#[test]
+fn children_reads_beside_the_walk_answer_as_jq_6595() -> Result<()> {
+    for (filter, input, want) in [
+        ("[recurse(.children[]? | .)] | length", "{\"id\":1,\"children\":[{\"id\":2,\"children\":[{\"id\":3}]},{\"id\":4,\"children\":null}]}", "4\n"),
+        ("[recurse((.children[]?) | .)] | length", "{\"id\":1,\"children\":[{\"id\":2,\"children\":[{\"id\":3}]},{\"id\":4,\"children\":null}]}", "4\n"),
+        ("[path(.children[]?)]", "{\"id\":1,\"children\":[{\"id\":2,\"children\":[{\"id\":3}]},{\"id\":4,\"children\":null},5]}", "[[\"children\",0],[\"children\",1],[\"children\",2]]\n"),
+        ("[paths(type==\"number\")]", "{\"id\":1,\"children\":[{\"id\":2,\"children\":[{\"id\":3}]},{\"id\":4,\"children\":null},5]}", "[[\"id\"],[\"children\",0,\"id\"],[\"children\",0,\"children\",0,\"id\"],[\"children\",1,\"id\"],[\"children\",2]]\n"),
+        (". as $x | [$x.children[]?] | length", "{\"id\":1,\"children\":[{\"id\":2,\"children\":[{\"id\":3}]},{\"id\":4,\"children\":null},5]}", "3\n"),
+        ("[recurse(.children[]?; type==\"object\")] | length", "{\"id\":1,\"children\":[{\"id\":2,\"children\":[{\"id\":3}]},{\"id\":4,\"children\":null},5]}", "4\n"),
+        ("[.children[]?, (.children[0].children[]?)] | length", "{\"id\":1,\"children\":[{\"id\":2,\"children\":[{\"id\":3}]},{\"id\":4,\"children\":null},5]}", "4\n"),
+        ("del(.children[]?)", "{\"id\":1,\"children\":[{\"id\":2,\"children\":[{\"id\":3}]},{\"id\":4,\"children\":null},5]}", "{\"id\":1,\"children\":[]}\n"),
+        ("[limit(2; recurse(.children[]?))] | length", "{\"id\":1,\"children\":[{\"id\":2,\"children\":[{\"id\":3}]},{\"id\":4,\"children\":null},5]}", "2\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!((stdout.as_str(), stderr.as_str(), code), (want, "", 0), "{filter}");
+    }
+    Ok(())
+}
