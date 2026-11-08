@@ -6945,6 +6945,11 @@ fn read_inputs(
         // #6643: a directory last beside a stream the `--seq` reader finds faults in: each fault says
         // whether it is at the end, for the hook to place the directory's read by (see
         // `SEQ_FAULT_ENDS`). Only the reader of the queue, which delivers them in this order.
+        // #6661: `--seq --stream` and `--seq --stream-errors` take it too. The flags come from the
+        // plain `--seq` walk, whose faults are not always the stream reader's (`12` at a record's
+        // end is a fault there and the event `[[],12]` here), so a flag the reader never pops is
+        // harmless but a fault only the walk sees, ahead of one at the end, would pop the wrong
+        // one; `tests/jq_cli/i6661.rs` pins that shape.
         let seq_fault_ends_of_stream = if (args.null_input || track_eof)
             && !args.slurp
             && args.seq

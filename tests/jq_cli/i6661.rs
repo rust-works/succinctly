@@ -20,6 +20,9 @@ fn a_directory_last_is_reported_by_the_next_read_under_seq_with_a_stream_flag_66
         ("s.seq", "\u{1e}1\n\u{1e}2"),
         ("s2.seq", "\u{1e}1\n\u{1e}2\n"),
         ("ok.seq", "\u{1e}[1]\n"),
+        // A fault only the plain `--seq` walk sees (`12` at a record's end is the stream reader's
+        // `[[],12]`) ahead of one at the end: the per-fault flags the hook pops stay in step.
+        ("mix.seq", "\u{1e}12\n\u{1e}3\u{1e}["),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
@@ -38,6 +41,8 @@ fn a_directory_last_is_reported_by_the_next_read_under_seq_with_a_stream_flag_66
         (&["-c", "-n", "--seq", "--stream-errors", "[inputs]"][..], &["bare.json", "missing.json", "dir"][..], "\u{1e}[[\"Unfinished abandoned text at EOF at line 1, column 1\",[]]]\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\njq: error: Is a directory\n", 2),
         (&["-c", "-n", "--seq", "--stream-errors", "[range(3)|try input catch .]"][..], &["ok.seq", "dir"][..], "\u{1e}[[[0],1],[[0]],\"break\"]\n", "", 2),
         (&["-c", "--seq", "--stream", "."][..], &["ok.seq", "dir"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 2),
+        (&["-c", "-n", "--seq", "--stream-errors", "[range(4)|try input catch .]"][..], &["mix.seq", "dir"][..], "\u{1e}[[[],12],[[],3],[\"Unfinished JSON term at EOF at line 2, column 4\",[0]],\"break\"]\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "-n", "--seq", "--stream", "[range(4)|try input catch .]"][..], &["mix.seq", "dir"][..], "\u{1e}[[[],12],[[],3],\"Unfinished JSON term at EOF at line 2, column 4\",\"break\"]\n", "jq: error: Is a directory\n", 2),
     ];
     for (flags, names, stdout, stderr, status) in rows {
         let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}")).collect();
