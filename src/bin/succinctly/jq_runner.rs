@@ -3566,7 +3566,7 @@ fn write_json_string_zero_copy<Out: Write>(
 fn trim_ascii_ws(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
-        .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .position(|b| !b.is_ascii_whitespace())
         .unwrap_or(bytes.len());
     let end = bytes
         .iter()
@@ -13658,7 +13658,7 @@ fn parse_json_stream_serde(
         let end = deserializer.byte_offset();
         let start = bytes[prev_end..end]
             .iter()
-            .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+            .position(|b| !b.is_ascii_whitespace())
             .map_or(prev_end, |offset| prev_end + offset);
         values.push(
             // Wrapped, not flattened to an `anyhow!` string: this is a data
