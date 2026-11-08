@@ -117,3 +117,51 @@ fn an_open_record_asks_for_the_next_file_as_r_does_6669() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn what_counts_as_open_is_the_dsv_indexs_quote_rule_6669() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let d = dir.path().to_string_lossy().into_owned();
+    // (delimiter, file text, reported by `. gone f gone2`, reported by `-n first(inputs) f gone`).
+    for (delimiter, text, over, under_n) in [
+        // The delimiter and the quote byte are the config's, not a comma and a `"`.
+        ("|", "x|\"y", 2, 1),
+        // An escaped pair inside an open quote leaves it open; one that closes does not.
+        (",", "x,\"a\"\"b", 2, 1),
+        (",", "x,\"a\"\"b\"\n", 1, 0),
+        // The record breaks at a newline outside a quote, and `\r\n` inside one does not break it.
+        (",", "x,\"y\r\n", 2, 1),
+        // A stray quote in an unquoted field is an odd quote count, as the join across files sees it.
+        (",", "ab\"c,d\ne,f\n", 2, 1),
+        // A quote that closes, and a row with no newline and no open quote.
+        (",", "x,\"y\"\n", 1, 0),
+        (",", "x", 1, 0),
+    ] {
+        std::fs::write(dir.path().join("f.csv"), text)?;
+        let (_, err, code) = run(
+            &d,
+            &["--input-dsv", delimiter],
+            ".",
+            &["gone.csv", "f.csv", "gone2.csv"],
+        )?;
+        assert_eq!(reported(&err).len(), over, "{delimiter:?} {text:?}: {err}");
+        assert_eq!(code, 2, "{delimiter:?} {text:?}");
+        let (_, err, code) = run(
+            &d,
+            &["-n", "--input-dsv", delimiter],
+            "first(inputs)",
+            &["f.csv", "gone.csv"],
+        )?;
+        assert_eq!(
+            reported(&err).len(),
+            under_n,
+            "-n {delimiter:?} {text:?}: {err}"
+        );
+        assert_eq!(
+            code,
+            if under_n == 0 { 0 } else { 2 },
+            "-n {delimiter:?} {text:?}"
+        );
+    }
+    Ok(())
+}

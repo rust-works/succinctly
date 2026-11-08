@@ -6766,21 +6766,20 @@ fn fault_reaches_end(raws: &[Vec<u8>], args: &JqCommand) -> bool {
 /// `--seq` and the streaming readers place their values themselves, and `--validate` checks each
 /// file on its own.
 fn last_value_reaches_end(raws: &[Vec<u8>], args: &JqCommand) -> bool {
+    if args.seq || args.stream || args.stream_errors || args.validate {
+        return false;
+    }
     if let Some(delimiter) = args.input_dsv {
         // #6669: a quote still open at the end of the last file with bytes leaves its one record
         // asking for more, and no file after it opened to join it (#6601), so the row is read at
         // the file that did not open, as `-R`'s last line with no newline is.
-        return !(args.seq || args.stream || args.stream_errors || args.validate)
-            && raws
-                .iter()
-                .rev()
-                .find(|raw| !raw.is_empty())
-                .is_some_and(|raw| {
-                    open_dsv_record_start(raw, dsv_config(delimiter).quote_char).is_some()
-                });
-    }
-    if args.seq || args.stream || args.stream_errors || args.input_dsv.is_some() || args.validate {
-        return false;
+        return raws
+            .iter()
+            .rev()
+            .find(|raw| !raw.is_empty())
+            .is_some_and(|raw| {
+                open_dsv_record_start(raw, dsv_config(delimiter).quote_char).is_some()
+            });
     }
     let Some(last) = raws.iter().rev().find(|raw| !raw.is_empty()) else {
         return false;
