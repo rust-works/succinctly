@@ -51,6 +51,15 @@ fn a_held_back_closer_ends_the_failures_reached_6646() -> Result<()> {
             format!("{RS}[[0],1]\n{RS}[[0]]\n"),
             TWO_MISSING,
         ),
+        // A closer that does not match is a fault, not a held-back event.
+        (
+            "--stream-errors",
+            format!("{RS}[1}}"),
+            format!(
+                "{RS}[\"Unmatched '}}' in the middle of an array at line 1, column 4 (need RS to resync)\",[0]]\n"
+            ),
+            TWO_MISSING,
+        ),
         (
             "--stream",
             format!("{RS}[]"),

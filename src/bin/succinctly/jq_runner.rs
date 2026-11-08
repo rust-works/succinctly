@@ -9424,6 +9424,10 @@ fn closing_event_lags(raw: &[u8]) -> bool {
     let [b'[' | b'{', .., b']' | b'}'] = record else {
         return false;
     };
+    // A text that is not one well-formed value (`[1}`, `{"a"}`) faults, and jq reports differently.
+    if serde_json::from_slice::<serde::de::IgnoredAny>(record).is_err() {
+        return false;
+    }
     let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
     let mut previous = 0u8;
     for (at, &byte) in record.iter().enumerate() {
@@ -17612,6 +17616,11 @@ mod tests {
         ] {
             let seq = format!("\u{1e}{text}");
             assert_eq!(closing_event_lags(seq.as_bytes()), lags, "{text:?}");
+        }
+        // Only a well-formed value lags: a mismatched closer or a key with no value is a fault.
+        for text in ["[1}", "{\"a\":1]", "{\"a\"}", "[1][2]", "[1] [2]"] {
+            let seq = format!("\u{1e}{text}");
+            assert!(!closing_event_lags(seq.as_bytes()), "{text:?}");
         }
         // Only the last record counts.
         assert!(closing_event_lags(b"\x1e[[1]]\n\x1e[2]"));
