@@ -36,9 +36,10 @@ pub(super) fn supported(expr: &Expr) -> bool {
         Expr::Builtin(
             Builtin::Keys | Builtin::KeysUnsorted | Builtin::ToEntries | Builtin::FromEntries,
         ) => true,
-        Expr::Builtin(Builtin::WithEntries(f) | Builtin::Map(f) | Builtin::MapValues(f)) => {
-            supported(f)
+        Expr::Builtin(Builtin::WithEntries(f) | Builtin::Map(f)) => {
+            supported(f) || select_condition(f).is_some()
         }
+        Expr::Builtin(Builtin::MapValues(f)) => supported(f),
         Expr::Builtin(Builtin::SortBy(f)) => supported(f) || sort_key_filter(f),
         Expr::Builtin(Builtin::Sort | Builtin::Flatten | Builtin::Pivot) => true,
         Expr::Builtin(Builtin::FlattenDepth(depth)) => is_closed_literal(depth),
@@ -59,6 +60,43 @@ pub(super) fn supported(expr: &Expr) -> bool {
         }
         Expr::Update { path, filter } => static_path(path) && supported(filter),
         _ => false,
+    }
+}
+
+/// Put the head comment of `original` (a mapping's tree) on `rebuilt`, the mapping a rewrite of it
+/// produced, keeping the mark of being the header read before the first document (#6674).
+fn restore_head(rebuilt: &mut CommentTree, original: &CommentTree) {
+    *rebuilt.meta_mut() = rebuilt.meta().with_head_foot_of(
+        original.meta().head_comment().to_vec(),
+        Vec::new(),
+        original.meta(),
+    );
+}
+
+/// The condition of a `select(c)` filter whose `c` is a pure test of the item, or `None` for any
+/// other filter (#6674). `map(select(c))` and `with_entries(select(c))` keep each item that passes
+/// as it is, so its comments, spelling and style come with it; the condition only decides which.
+fn select_condition(f: &Expr) -> Option<&Expr> {
+    match f {
+        Expr::Builtin(Builtin::Select(cond)) if pure_condition(cond) => Some(cond),
+        Expr::Paren(inner) => select_condition(inner),
+        _ => None,
+    }
+}
+
+/// A test the replay may run on an item: field and index reads, closed literals, comparisons and
+/// `and`/`or`/`not` over them. Nothing here reads a variable, the environment or the clock, so
+/// running it on a copy of the item has no effect beyond its answer.
+fn pure_condition(expr: &Expr) -> bool {
+    match expr {
+        Expr::And(l, r) | Expr::Or(l, r) => pure_condition(l) && pure_condition(r),
+        Expr::Not => true,
+        Expr::Compare { left, right, .. } => pure_condition(left) && pure_condition(right),
+        Expr::Paren(inner) => pure_condition(inner),
+        Expr::Pipe(parts) => parts.iter().all(pure_condition),
+        // Reads of the item and closed literals; a write or a rebuilding builtin is not a test.
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } => true,
+        _ => is_closed_literal(expr),
     }
 }
 
@@ -637,6 +675,18 @@ fn trace_at_depth(
             for part in parts {
                 pair = next(part, &pair)?;
             }
+            // #6674: yq keeps a mapping's head comment across `to_entries | from_entries` with
+            // nothing between the two, where a `map` between them builds a new sequence and drops it.
+            if matches!(
+                parts.as_slice(),
+                [
+                    Expr::Builtin(Builtin::ToEntries),
+                    Expr::Builtin(Builtin::FromEntries)
+                ]
+            ) && matches!(value, OwnedValue::Object(_))
+            {
+                restore_head(&mut pair.1, tree);
+            }
             Some(pair)
         }
         Expr::Builtin(Builtin::Keys | Builtin::KeysUnsorted | Builtin::ToEntries) => {
@@ -820,7 +870,14 @@ fn trace_at_depth(
         Expr::Builtin(Builtin::WithEntries(f)) => {
             let entries = next(&Expr::Builtin(Builtin::ToEntries), input)?;
             let mapped = next(&Expr::Builtin(Builtin::Map(f.clone())), &entries)?;
-            next(&Expr::Builtin(Builtin::FromEntries), &mapped)
+            let (result, mut rebuilt) = next(&Expr::Builtin(Builtin::FromEntries), &mapped)?;
+            // #6674: yq's `with_entries` keeps the document's head comment even when its filter
+            // drops the first entry, where the same steps written out (`to_entries | map(...) |
+            // from_entries`) drop it with that entry.
+            if matches!(value, OwnedValue::Object(_)) {
+                restore_head(&mut rebuilt, tree);
+            }
+            Some((result, rebuilt))
         }
         // `map_values(f)` keeps each key, its comments and its position (#5429); on a sequence it
         // is `map(f)`.
@@ -881,14 +938,35 @@ fn trace_at_depth(
             };
             let mut values = Vec::new();
             let mut trees = Vec::new();
+            // yq keeps a document's head comment on its first key, so it goes with that entry.
+            let mut first_dropped = false;
+            let select = select_condition(f);
             for (i, item) in items.iter().enumerate() {
+                if let Some(cond) = select {
+                    // #6674: an item that passes is kept as it is, with its own tree; one that
+                    // fails is dropped. A test with no single answer is the plain route's.
+                    let keep = evaluated(cond, item)?;
+                    if matches!(keep, OwnedValue::Null | OwnedValue::Bool(false)) {
+                        first_dropped |= i == 0;
+                        continue;
+                    }
+                    values.push(item.clone());
+                    trees.push(tree.at_index(i).clone());
+                    continue;
+                }
                 let (v, t) = next(f, &(item.clone(), tree.at_index(i).clone()))?;
                 values.push(v);
                 trees.push(t);
             }
+            let meta = if first_dropped {
+                tree.meta()
+                    .with_head_foot(Vec::new(), tree.meta().foot_comment().to_vec())
+            } else {
+                tree.meta().clone()
+            };
             Some((
                 OwnedValue::Array(values.into_iter().collect()),
-                CommentTree::Array(tree.meta().clone(), trees),
+                CommentTree::Array(meta, trees),
             ))
         }
         Expr::Arithmetic {
