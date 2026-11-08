@@ -7008,7 +7008,7 @@ fn read_inputs(
             && ends_cleanly
         {
             // The `--seq` readers place their own faults: the JSON text's fault is not theirs.
-            // A JSON text's fault; `-R` and DSV read no JSON, so none ends their text (#6585).
+            // A JSON text's fault; DSV reads no JSON, so none ends its text (#6585).
             let fault_ends_text = args.input_dsv.is_none()
                 && !seq_readers_place_reads
                 && matches!(first_stream_fault(&raws), Some((_, true)));
