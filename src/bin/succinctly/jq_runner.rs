@@ -7042,10 +7042,10 @@ fn read_inputs(
     // The walk's diagnostics, kept only where `input`/`inputs` raise them ([`seq_faults_queued`]):
     // each comes out in order with the values, where a plain run prints it as a warning.
     let mut seq_fault_errors: Vec<(usize, TrailingParseError)> = Vec::new();
-    // #6555: a last file that did not open is one more source to jq's `--seq` readers, an empty one
-    // they stand at, line 0: the stream's last refill is that file's, not the last opened file's,
-    // so a record the end-of-stream drop (#2998) would take is kept, and what is read at the end of
-    // the text, the fault at its end included (#6531), is placed at that file.
+    // #6584: a last file that did not open is one more source to jq's `--seq` readers, an empty one
+    // they stand at, line 0. The walk's own `Tail` (#6588) keeps the end-of-stream drop (#2998) off
+    // the last file that opened; this source is where what is read past it is placed: the fault at
+    // the end of the text (#6531) and a value that completes only there.
     if seq_readers_place_reads && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some()) {
         raw_bytes.push((Some(files.len()), Vec::new()));
     }
