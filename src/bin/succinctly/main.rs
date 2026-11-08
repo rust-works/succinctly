@@ -1270,8 +1270,9 @@ pub struct YqCommand {
     pub front_matter: Option<FrontMatterMode>,
 
     // === Output Options ===
-    /// Output format type [yaml, json, auto] (default: yaml)
-    #[arg(short = 'o', long, value_name = "FORMAT", default_value = "yaml")]
+    /// Output format type [yaml, json, auto] (default: auto, which is the input's own format:
+    /// a `.json` file prints JSON, anything else YAML, #6703)
+    #[arg(short = 'o', long, value_name = "FORMAT", default_value = "auto")]
     pub output_format: OutputFormat,
 
     /// Unwrap scalar values, print without quotes (default for YAML)

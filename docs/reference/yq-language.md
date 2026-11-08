@@ -816,7 +816,7 @@ same kind of thing as the rest of this table — extra, off by default.
 |-----------------------|-----------------------------------------------|
 | `-r, --unwrapScalar`  | Output raw strings without quotes             |
 | `-I, --indent N`      | Indent level (0 = compact for JSON, 4 spaces for YAML, #2606) |
-| `-o, --output-format` | Output format: `yaml`, `json`, `auto`         |
+| `-o, --output-format` | Output format: `auto` (default), `yaml`, `json` |
 | `-i, --inplace`       | Update file in place                          |
 | `-0, --nul-output`    | Use NUL separator instead of newline          |
 | `--no-doc`            | Omit document separators (`---`)              |

@@ -892,9 +892,10 @@ impl OutputConfig {
         // Compact output when indent is 0 (yq-compatible)
         let compact = args.indent == 0;
 
-        // `args.output_format` itself, not yet resolved against any
-        // source's `InputFormat` -- see `Self::for_source` below (#1493) -- except that an
-        // explicit `-p=json` makes `-o auto` YAML (#5721, yq v4.53.3: `-p=json -o auto .`
+        // `args.output_format` itself. `run_yq_inner` has already resolved an `Auto` from the CLI
+        // against the run's first file (#6703), so this branch and `Self::for_source` below (#1493)
+        // serve a caller that builds the config from an unresolved `Auto`, which is why they stay.
+        // An explicit `-p=json` makes `-o auto` YAML (#5721, yq v4.53.3: `-p=json -o auto .`
         // prints YAML, with a backwards-compatibility warning): yq's `auto` reads the output
         // file's extension, and `-p` given keeps the old YAML default instead.
         let output_format =
@@ -10751,6 +10752,23 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     if args.tojson {
         eprintln!("Flag --tojson has been deprecated, please use -o=json instead");
         args.output_format = OutputFormat::Json;
+    }
+
+    // yq's `-o` defaults to `auto` (#6703): the run's own input format, picked once from the first
+    // file's extension (#4394). A `.json` file prints JSON; standard input, `.yaml`, `.yml` and any
+    // other name print YAML. There is nothing to match under `-n`, `-R` or `--front-matter`, and an
+    // explicit `-p` keeps the old YAML default (yq v4.53.3 says so in a deprecation warning, #5721).
+    // Resolved here once, so everything below reads a concrete format; `OutputConfig::for_source`
+    // still resolves it per source for a caller that builds one from an unresolved `Auto`.
+    if args.output_format == OutputFormat::Auto {
+        let nothing_to_match = args.null_input || args.raw_input || args.front_matter.is_some();
+        let json_input = args.input_format == InputFormat::Auto
+            && resolve_run_input_format(InputFormat::Auto, &args.files) == InputFormat::Json;
+        args.output_format = if json_input && !nothing_to_match {
+            OutputFormat::Json
+        } else {
+            OutputFormat::Yaml
+        };
     }
 
     // Handle --version
