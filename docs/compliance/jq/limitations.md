@@ -9237,6 +9237,28 @@ An object key `isvalid` is a key.
 [#6662](https://github.com/rust-works/succinctly/issues/6662) recorded it, after #2658's note below ("`isvalid` is a succinctly extension") called it an extension only in passing.
 Pinned in `tests/jq_cli/i6662.rs`, and its yq gating in `tests/yq_cli/i6662.rs`.
 
+## jq's underscore-prefixed builtins: `_nwise` is defined, the rest are not (#6684)
+
+`_nwise(n)` and `_nwise(a; n)` run in `succinctly jq` as jq 1.7.1 defines them in its builtin.jq.
+They are not in jq's manual, but `[_nwise(3)]` is a widely quoted chunking idiom.
+The definitions are `def _nwise($n): def n: if length <= $n then . else .[0:$n] , (.[$n:] | n) end; n;` and `def _nwise(a; $n): a | _nwise($n);`, checked against the pinned jq over the programs of `tests/jq_cli/i6684.rs` rather than taken from memory.
+The parser expands a call to them where it stands, so `[_nwise(2,3)]` chunks by 2 and then by 3, `_nwise(a; 3)` chunks each output of `a`, and `path(_nwise(3))` answers the slice paths jq answers.
+A `def _nwise` of the program's, or of an included module's, shadows it where its arity and scope reach the call, as in jq: a `def _nwise(a; b; c)` leaves `_nwise(2)` the builtin, and so does a def in a scope the call is outside of or a `def _nwise` spelled in a comment.
+`_nwise` and `_nwise(a; b; c)` stay jq's compile error (`_nwise/0 is not defined`, `_nwise/3 is not defined`, exit 3).
+`builtins` omits it, as jq's omits every name that starts with an underscore.
+`succinctly yq` does not define it, since real yq has no such function.
+`_nwise(0)` and `_nwise(null)` never reach their end in jq, because each step is a slice of nothing.
+Here `[limit(3; _nwise(0))]`, `first(_nwise(0))` and a streamed `_nwise(0)` agree with jq's first outputs, and a collecting `[_nwise(0)]` ends with `n/0: maximum outputs exceeded` where jq runs until it is stopped.
+That is the same guard every unbounded generator has.
+
+The other underscore names that jq 1.7.1 defines are still not defined in `succinctly jq`, and each is a compile error (`NAME/N is not defined`, exit 3):
+`_flatten/1`, `_modify/2`, `_assign/2`, `_negate/0`, `_plus/2`, `_minus/2`, `_multiply/2`, `_divide/2`, `_mod/2`, `_equal/2`, `_notequal/2`, `_less/2`, `_greater/2`, `_lesseq/2`, `_greatereq/2`, `_strindices/1`, `_match_impl/3`, `_sort_by_impl/1`, `_group_by_impl/1`, `_min_by_impl/1` and `_max_by_impl/1`.
+They are jq's internals: the C functions behind the operators and the helper definitions behind `flatten`, `sort_by`, `match` and the update operators.
+jq hides them from `builtins` and its manual never names them, so a program that calls one is written against jq's implementation rather than its language.
+The list was probed from a candidate set of internal names, so it may not be complete; `jq --debug-dump-disasm` does not list a builtin's name.
+[#6684](https://github.com/rust-works/succinctly/issues/6684) recorded it.
+Pinned in `tests/jq_cli/i6684.rs` and, for the expansion's shape, in `nwise_expands_in_jq_mode_unless_the_program_defines_it_6684` in `src/jq/parser.rs`.
+
 ## `skip` with a generator count
 
 `skip(n; f)` is a succinctly extension relative to the pinned jq 1.7.1,

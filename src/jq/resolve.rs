@@ -1092,6 +1092,9 @@ fn reach_in_scope(scope: &ReachScope, name: &str, arity: usize) -> ScanResult<Sc
 /// `builtin_fallback_arity` names, one returning owned children, this one
 /// borrowed ones.
 fn builtin_fallback_children(fallback: &Expr) -> Vec<&Expr> {
+    if let Some(children) = super::parser::nwise_fallback_children(fallback) {
+        return children;
+    }
     match fallback {
         Expr::Not => Vec::new(),
         Expr::Limit { n, expr } => alloc::vec![n.as_ref(), expr.as_ref()],
@@ -2131,6 +2134,10 @@ fn builtin_fallback_arity(fallback: &Expr) -> usize {
     if let Some(arity) = super::parser::join_expr_arity(fallback) {
         return arity;
     }
+    // #6684: `_nwise(n)` and `_nwise(a; n)` are expanded at the call site.
+    if let Some(arity) = super::parser::nwise_fallback_arity(fallback) {
+        return arity;
+    }
     match fallback {
         Expr::Not => 0,
         Expr::Limit { .. } | Expr::Until { .. } | Expr::While { .. } => 2,
@@ -2185,6 +2192,11 @@ fn builtin_fallback_arity(fallback: &Expr) -> usize {
 fn builtin_fallback_into_args(fallback: Expr) -> Vec<Expr> {
     // #3046: `JOIN` desugars to an `as` binding; see `parser::join_expr`.
     let fallback = match super::parser::join_expr_into_args(fallback) {
+        Ok(args) => return args,
+        Err(fallback) => fallback,
+    };
+    // #6684: the arguments of a stored `_nwise` expansion, in the order written.
+    let fallback = match super::parser::nwise_fallback_into_args(fallback) {
         Ok(args) => return args,
         Err(fallback) => fallback,
     };
