@@ -32,6 +32,10 @@ fn a_halting_program_does_not_reach_the_files_behind_its_first_value_under_strea
         (&["-c", "--stream-errors", "halt_error"][..], &["p.json", "dir"][..], "", "[[],1]\n", 2),
         (&["-c", "--stream-errors", "halt_error"][..], &["p.json", "missing.json"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n[[],1]\n", 2),
         (&["-c", "--stream-errors", "-e", "halt"][..], &["pn.json", "dir"][..], "", "", 0),
+        // A good file behind a failure keeps the up-front report: its bare number reads on into the
+        // next failure, which the loop that stops at that value would otherwise leave unsaid.
+        (&["-c", "--stream-errors", "."][..], &["pn.json", "dir", "p.json", "missing.json"][..], "[[],1]\n[[],1]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
+        (&["-c", "--stream-errors", "limit(1;.)"][..], &["pn.json", "missing.json", "p.json", "dir"][..], "[[],1]\n[[],1]\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
     ];
     for (flags, names, stdout, stderr, status) in rows {
         let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}")).collect();
