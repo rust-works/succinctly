@@ -157,11 +157,12 @@ fn input_dsv_validate_keeps_reporting_every_unopened_file_up_front_6585() -> Res
 }
 
 #[test]
-fn input_dsv_rows_are_read_from_their_own_file_past_a_missing_one_6585() -> Result<()> {
+fn input_dsv_rows_are_read_from_the_file_they_end_in_past_a_missing_one_6585() -> Result<()> {
     // A quoted field with a newline in it is one record, so the first file's record is whole in it
     // and the run ends after the row of the file past the missing one. A record left open at the
-    // end of a file is a row of that file (rows are not joined across files), so the run ends
-    // after it and the failure behind it is never reached.
+    // end of a file is joined to the next file's (#6601) and is read from the file it ends in, so a
+    // missing file between the two is reported when that row is read, as `-R` does for a line with
+    // no newline, and the run ends after that row.
     let dir = tempfile::tempdir()?;
     let d = dir.path().to_string_lossy().into_owned();
     std::fs::write(dir.path().join("q.csv"), "\"a\nb\",c\n")?;
@@ -176,16 +177,15 @@ fn input_dsv_rows_are_read_from_their_own_file_past_a_missing_one_6585() -> Resu
     );
     assert_eq!(code, 2);
     let (out, err, code) = run(&d, &flags, &["gone.csv", "o.csv", "gone2.csv", "z.csv"])?;
-    // One row, from `o.csv` alone; how the unterminated quote reads is not what this pins.
+    // One row, the open record of `o.csv` completed by `z.csv`; how the unterminated quote reads is
+    // not what this pins. The row is read from `z.csv`, past `gone2.csv`, so both are reported.
     assert!(out.starts_with("[\"x\","), "{out}");
     assert_eq!(out.lines().count(), 1, "{out}");
-    assert!(
-        !out.contains("\"z\""),
-        "the row of z.csv is never read: {out}"
-    );
     assert_eq!(
         err,
-        format!("jq: error: Could not open file {d}/gone.csv: No such file or directory\n")
+        format!(
+            "jq: error: Could not open file {d}/gone.csv: No such file or directory\njq: error: Could not open file {d}/gone2.csv: No such file or directory\n"
+        )
     );
     assert_eq!(code, 2);
     Ok(())

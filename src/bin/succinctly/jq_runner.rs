@@ -9565,8 +9565,9 @@ fn closing_event_lags(raw: &[u8]) -> bool {
 /// no more of the files after it (#6522, #6585). `false` where it cannot tell.
 fn first_value_completes_in(raw: &[u8], args: &JqCommand) -> bool {
     if args.input_dsv.is_some() {
-        // Every file's rows are read from that file alone (`parse_dsv_input`), so its first row
-        // is complete in it, a record still open at its end included (#6585).
+        // A record still open at the end of a file is joined to the next file's (#6601) and read
+        // from the file it ends in, so the first row after a missing file is read from the first
+        // file past it that has bytes, whichever file closes it (#6585).
         true
     } else if args.raw_input {
         raw.contains(&b'\n')
@@ -9715,7 +9716,9 @@ fn reach_last_directory(at: usize, read: Option<u32>) -> bool {
 /// `-R` a line is complete at its newline alone.
 fn source_ends_cleanly(bytes: &[u8], args: &JqCommand) -> bool {
     if args.input_dsv.is_some() {
-        // Rows are not joined across files, so no file leaves a row open for the next (#6585).
+        // A record left open at the end of a file is joined to the next file's (#6601), so the row
+        // carries the file it ends in and the hook reports a failure between them when it is read,
+        // as `-R`'s line is (#6585): no file sends the reader on past one that did not open.
         return true;
     }
     match bytes.last() {
