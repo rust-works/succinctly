@@ -13210,8 +13210,20 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
         anyhow::bail!("Invalid JSON: empty text");
     }
 
-    validate::validate_jq_lenient(s.as_bytes())
+    // #6637: containers may nest as deep as jq's parse-depth ceiling, not the validator's default
+    // of 128 (as `fromjson` reads them, #5688). jq counts an object as two entries of that
+    // ceiling, so a text past the old default is also put to jq's own count.
+    let mut validator = validate::Validator::new(s.as_bytes())
+        .jq_lenient()
+        .with_max_depth(jq::JQ_MAX_PARSING_DEPTH);
+    validator
+        .validate()
         .map_err(|e| anyhow::anyhow!("Invalid JSON: {s}: {e}"))?;
+    if validator.deepest() > jq::JQ_MAX_PARSING_DEPTH / 2
+        && jq::jq_depth_fault_offset(s.as_bytes()).is_some()
+    {
+        anyhow::bail!("Invalid JSON: {s}: Exceeds depth limit for parsing");
+    }
     // #2295: the checked materializer, not the bare panicking one -- `s` is
     // genuinely external text, and the depth guard has to be this call's
     // own rather than an incidental by-product of whatever validated it.
