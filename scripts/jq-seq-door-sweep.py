@@ -7,7 +7,7 @@ door. This sweep crosses programs with record streams that hold a diagnostic, wh
 a `--seq` run through the queue's per-record conversion and the door, and compares **stdout, stderr
 and exit status together** against the pinned jq.
 
-Each case is a stream of 1-4 random JSON records (objects with `name`/`id`/`age`, nested arrays,
+Each case is a stream of 1-4 random JSON records (one case in ten: 100-400, to cross the stretches the door closes for) (objects with `name`/`id`/`age`, nested arrays,
 spelled-out numbers, `nan`, repeated keys, non-ASCII strings, a record 300 levels deep) with one
 truncated record placed at a random position, run through one program with `-c` (some with
 `-r`). With `--base BASE` it also runs the binary from before the change, so that a row where the
@@ -75,7 +75,7 @@ PROGRAMS = [
     "$__loc__", "@text", "@json", "@base64?", "tojson|fromjson", "walk(.)", "sort?", "unique?",
     "add?", "any?", "all?", "min?", "reverse?", "flatten?", "env|type", "input_filename",
     "ltrimstr(\"a\")", "select(.id)|.id", "select(.id==1)", "if .id then .id else empty end",
-    "(.id,.name)", ".id as $x|$x", "reduce .[]? as $x (0;.+1)", "[.[]?|select(type==\"number\")]",
+    "(.id,.name)", ".id as $x|$x", "if type==\"array\" then .[0]? else keys? end", "if type==\"object\" then .name else length? end", "reduce .[]? as $x (0;.+1)", "[.[]?|select(type==\"number\")]",
     "splits(\"a\")?", "ascii?", "implode?", "tojson|length", "halt", "halt_error", "empty", "not",
     "del(.a)", ".a=1", ".name|=.", ".id+=1", ".[]?|=1", "to_entries[]?", "limit(0;.)", "first",
     "last?", "nth(0)?", "range(2)", "$ENV|type", "now|type", "splits(\"x\")?",
@@ -117,7 +117,10 @@ def make_cases(count, seed):
     rng = random.Random(seed)
     cases = []
     for _ in range(count):
-        records = [RS + rng.choice(RECORDS) + b"\n" for _ in range(rng.randint(1, 4))]
+        # One case in ten is long enough for the door's backoff: 4 declines close it for 64 records,
+        # then 128, so a stream of a few hundred records crosses a closed stretch and its probes.
+        count = rng.randint(100, 400) if rng.random() < 0.1 else rng.randint(1, 4)
+        records = [RS + rng.choice(RECORDS) + b"\n" for _ in range(count)]
         fault = rng.choice(FAULTS)
         records.insert(rng.randint(0, len(records)), fault)
         stream = b"".join(records)
