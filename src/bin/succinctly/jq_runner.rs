@@ -7463,14 +7463,19 @@ fn read_inputs(
         let mut resumed: Vec<(usize, TrailingParseError)> = Vec::new();
         let mut trailing_error = None;
         // #6676: a slurp that places its failures among the warnings lost the array where a
-        // warning was met after one was reported, as the record reader's does (#6589).
+        // warning was met after one was reported, as the record reader's does (#6589). A fault
+        // that is the call after the array's is met after every file, so it loses the array
+        // beside any file that failed (#6481).
         let mut slurp_stopped = false;
-        let array_lost = !seq_stream_places_failures
-            && slurped_array_lost(
-                args.slurp && !faults_as_inputs,
-                any_open_failure,
-                !read.faults.is_empty(),
-            );
+        let array_lost = slurped_array_lost(
+            args.slurp && !faults_as_inputs,
+            any_open_failure,
+            if seq_stream_places_failures {
+                read.faults.iter().any(|fault| fault.after_array)
+            } else {
+                !read.faults.is_empty()
+            },
+        );
         for fault in read.faults {
             if faults_as_inputs {
                 // `input`/`inputs` raise what a plain run only warns about (#5640).
