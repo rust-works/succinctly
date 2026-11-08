@@ -1967,7 +1967,7 @@ fn run_main() -> Result<()> {
             JsonSubcommand::Generate(args) => {
                 let pattern: generators::Pattern = args.pattern.into();
                 if pattern.is_line_delimited() && args.pretty {
-                    anyhow::bail!("--pretty needs a single document; the ndjson and json-seq patterns have one per line");
+                    anyhow::bail!("--pretty needs a single document; the ndjson and json-seq patterns (json-seq-bad-first, json-seq-bad-last) have one record per line");
                 }
                 let json = generate_json(
                     args.size,
@@ -2586,6 +2586,10 @@ fn validate_generated_json(
         let framed = pattern.is_framed();
         let lines = json.lines().count();
         let fault = pattern.fault_line(lines);
+        // A faulty pattern with no line to put the fault on (an empty file) promised one.
+        if pattern.has_fault() && fault.is_none() {
+            anyhow::bail!("the {pattern:?} pattern has no line for its fault record");
+        }
         for (n, line) in json.lines().enumerate() {
             let record = match (framed, line.strip_prefix('\u{1e}')) {
                 (true, Some(rest)) => rest,
@@ -3348,6 +3352,10 @@ mod tests {
         // A second bad line is a generator bug, not the fault.
         let two = format!("{fault}{good}{fault}");
         assert!(validate_generated_json(&two, false, Pattern::JsonSeqBadLast).is_err());
+        // An empty file has no line for the fault either.
+        assert!(validate_generated_json("", false, Pattern::JsonSeqBadLast).is_err());
+        assert!(validate_generated_json("", false, Pattern::JsonSeqBadFirst).is_err());
+        assert!(validate_generated_json("", false, Pattern::JsonSeq).is_ok());
     }
 
     #[test]

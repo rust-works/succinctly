@@ -42,11 +42,16 @@ impl Pattern {
         )
     }
 
+    /// Whether the pattern holds one truncated record (#6619).
+    pub fn has_fault(self) -> bool {
+        matches!(self, Self::JsonSeqBadFirst | Self::JsonSeqBadLast)
+    }
+
     /// Which line of a generated `json-seq` stream is the one truncated record, when the pattern
     /// has one (#6619): the first or the last of `lines` lines.
     pub fn fault_line(self, lines: usize) -> Option<usize> {
         match self {
-            Self::JsonSeqBadFirst => Some(0),
+            Self::JsonSeqBadFirst => (lines > 0).then_some(0),
             Self::JsonSeqBadLast => lines.checked_sub(1),
             _ => None,
         }
@@ -547,8 +552,11 @@ pub fn generate_ndjson_json(target_size: usize, seed: Option<u64>, framed: bool)
 }
 
 /// The truncated record of the faulty `json-seq` patterns: an RS byte, a record cut off inside a
-/// string, and the line feed after it. A `--seq` reader ends it at the next RS (or the end of the
-/// stream) with `ignoring parse error: Truncated value`, and goes on.
+/// string, and the line feed after it. jq 1.7.1's `--seq` reader ends it at the next RS with
+/// `ignoring parse error: Truncated value`, or at the end of the stream with `Unfinished string at
+/// EOF`, one warning each, and every record around it is read (checked against `/usr/bin/jq` for
+/// both patterns: the ids come out as the clean stream's). The record is not counted against the
+/// size the generator stops at, so a file is a few dozen bytes over its tier.
 const JSON_SEQ_FAULT: &str = "\u{1e}{\"id\":-1,\"name\":\"cut\n";
 
 /// [`generate_ndjson_json`] framed as `json-seq`, with one truncated record ([`JSON_SEQ_FAULT`])
@@ -1119,6 +1127,11 @@ mod tests {
                 assert_eq!(parses, n != bad, "line {n}");
             }
         }
+        assert!(Pattern::JsonSeqBadFirst.has_fault() && Pattern::JsonSeqBadLast.has_fault());
+        assert!(!Pattern::JsonSeq.has_fault() && !Pattern::Ndjson.has_fault());
+        // No line to put it on in an empty stream.
+        assert_eq!(Pattern::JsonSeqBadFirst.fault_line(0), None);
+        assert_eq!(Pattern::JsonSeqBadLast.fault_line(0), None);
         assert_eq!(Pattern::JsonSeq.fault_line(10), None);
         assert_eq!(Pattern::Ndjson.fault_line(10), None);
         assert!(Pattern::JsonSeqBadLast.is_framed() && !Pattern::Ndjson.is_framed());
