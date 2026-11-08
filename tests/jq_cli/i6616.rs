@@ -73,6 +73,27 @@ fn raw_input_ignores_the_streaming_flags_for_unopened_files_6616() -> Result<()>
             GONE,
             2,
         ),
+        (
+            &["--stream-errors", "-s", "-c", "."][..],
+            &["nl", "gone"][..],
+            "\"a\\nb\\n\"\n",
+            GONE,
+            2,
+        ),
+        (
+            &["--stream", "-e", "-c", "."][..],
+            &["pnum", "gone", "empty", "gone2"][..],
+            "\"1\"\n\"2\"\n",
+            GONE_BOTH,
+            2,
+        ),
+        (
+            &["--stream-errors", "-e", "-c", "input_filename"][..],
+            &["nl", "gone"][..],
+            "\"@DIR@/nl.json\"\n\"@DIR@/nl.json\"\n",
+            GONE,
+            2,
+        ),
     ] {
         let files: Vec<String> = names
             .iter()
