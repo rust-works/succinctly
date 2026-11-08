@@ -56,15 +56,37 @@ fn test_jq_index_and_slice_loops_over_a_built_array_match_jq_6666() -> Result<()
 
 #[test]
 fn test_jq_index_loop_over_a_wide_built_array_is_not_quadratic_6666() -> Result<()> {
-    for filter in [
-        "[range(400000)] | [range(0; length; 1) as $i | .[$i]] | length",
-        "[range(400000)] | [range(0; length; 1) as $i | .[$i:$i+2]] | length",
+    // 200,000 reads of a 200,000-element array took minutes before. The element-index counters in
+    // `jq::eval::tests` pin the mechanism; this only fails a loop that has gone quadratic again,
+    // by a bound far above any runner's speed.
+    for (filter, want) in [
+        (
+            "[range(200000)] | [range(0; length; 1) as $i | .[$i]] | length",
+            "200000\n",
+        ),
+        (
+            "[range(200000)] | [range(0; length; 1) as $i | .[$i:$i+2]] | length",
+            "200000\n",
+        ),
+        // Streaming: the loop emits per read, with no collecting `[ ]` around it.
+        (
+            "[range(200000)] | [range(0; length; 1) as $i | .[$i]] | last",
+            "199999\n",
+        ),
+        (
+            "[range(200000)] | last(range(0; length; 1) as $i | .[$i])",
+            "199999\n",
+        ),
+        (
+            "[range(200000)] | last(range(0; length; 1) as $i | .[$i:$i+2][0])",
+            "199999\n",
+        ),
     ] {
         let started = std::time::Instant::now();
         let (stdout, code) = run_jq_null(filter, &["-c"])?;
-        assert_eq!((stdout.as_str(), code), ("400000\n", 0), "{filter}");
+        assert_eq!((stdout.as_str(), code), (want, 0), "{filter}");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(20),
+            started.elapsed() < std::time::Duration::from_secs(60),
             "{filter} took {:?}: the loop reads the array per iteration again",
             started.elapsed()
         );

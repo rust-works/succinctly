@@ -11266,6 +11266,36 @@ mod slot_memo {
         }
     }
 
+    impl Guard {
+        /// Put this scope aside and let the one it replaced answer, until the returned
+        /// [`Suspended`] drops (#6666). The caller's program runs inside a sink the bridge
+        /// calls, and its reads belong to its own document's memos; this scope's state (an
+        /// index it has built) is kept, not rebuilt after each sink call. Swapping, not
+        /// dropping and entering again, so it holds in whatever order the scopes in between
+        /// open and close.
+        pub(crate) fn suspended(&mut self) -> Suspended<'_> {
+            self.swap();
+            Suspended(self)
+        }
+
+        fn swap(&mut self) {
+            if let Restore::Previous(held) = &mut self.restore {
+                MEMO.with(|m| std::mem::swap(&mut *m.borrow_mut(), held));
+            }
+            self._keys.swap();
+            self._elements.swap();
+        }
+    }
+
+    /// A scope set aside by [`Guard::suspended`], put back when it drops (also on an unwind).
+    pub(crate) struct Suspended<'a>(&'a mut Guard);
+
+    impl Drop for Suspended<'_> {
+        fn drop(&mut self) {
+            self.0.swap();
+        }
+    }
+
     /// Open the scope for evaluations over `document`: a no-op while one is
     /// already open for it, a nested scope (restored on drop) otherwise.
     pub(crate) fn enter(document: usize) -> Guard {
@@ -11589,6 +11619,16 @@ mod slot_memo {
 #[cfg(not(feature = "std"))]
 mod slot_memo {
     pub(crate) struct Guard;
+
+    pub(crate) struct Suspended;
+
+    impl Guard {
+        // The memo does not exist without `std`: nothing to set aside.
+        #[allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)]
+        pub(crate) fn suspended(&mut self) -> Suspended {
+            Suspended
+        }
+    }
 
     pub(crate) fn enter(_document: usize) -> Guard {
         Guard

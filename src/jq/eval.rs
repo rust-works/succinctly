@@ -3895,7 +3895,17 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // was decoded above (a slice is a materializing operation for this purpose,
                 // `test_style_0012_routed_sites_still_raise_2334`), so handing the original
                 // back skips nothing the identity rule did not already pay.
-                if S::TAG != EvalTag::Yq {
+                //
+                // What narrowed (#6666): an element *outside* the range is no longer decoded, so a
+                // malformed one there goes unread, as it does on the generic evaluator's route
+                // (#4287), which every CLI read of a document takes. This arm is reached by the
+                // bridge, whose document is the serialization of an already-decoded value.
+                //
+                // Only a slice that can name every element asks for the length again: a start
+                // after the first element or an end before the last never does, which is every
+                // narrow slice of a loop.
+                let may_be_full = start.map_or(true, |s| s <= 0) && end.map_or(true, |e| e >= 0);
+                if S::TAG != EvalTag::Yq && may_be_full {
                     if let Ok(len) = array_index::len_checked_memoized(&elements) {
                         if SliceBounds::from_literals(*start, *end).is_full_range(len) {
                             return QueryResult::One(value);
@@ -13226,11 +13236,10 @@ fn eval_each_owned_past_front_doors_in<S: EvalSemantics>(
     // is the bridge's own: a loop over its arrays reads each by index, so an unscoped read walks
     // the whole array every time.
     //
-    // Only while the program runs over this document: the `sink` continues the *caller's*
-    // program, often a fan-out over its own document, whose memos a nested scope replaces. So
-    // the scope is left around each `sink` call and entered again after it.
-    let token = cursor.document_token();
-    let mut scope = Some(super::eval_generic::enter_document_scope(token));
+    // The `sink` continues the *caller's* program, often a fan-out over its own document, so
+    // the scope is set aside around each `sink` call and keeps what it built (an element index)
+    // for the next output: a loop that streams `.[$i]` per output stays linear too.
+    let mut scope = super::eval_generic::enter_document_scope(cursor.document_token());
 
     eval_each::<Vec<u64>, S>(expr, cursor.value(), optional, &mut |item| {
         // The document is `to_json_for_reindex` of an already-decoded value, so there is
@@ -13241,10 +13250,8 @@ fn eval_each_owned_past_front_doors_in<S: EvalSemantics>(
             Item::Borrowed(v) => to_owned_lossy_shared::<S, _>(&v),
             Item::Owned(v) => v,
         };
-        drop(scope.take());
-        let demand = sink(value);
-        scope = Some(super::eval_generic::enter_document_scope(token));
-        demand
+        let _aside = scope.suspended();
+        sink(value)
     })
 }
 
@@ -116076,13 +116083,25 @@ mod tests {
     fn a_loop_over_an_owned_array_reads_its_element_index_6666() {
         use crate::jq::array_index::memo;
         let input = OwnedValue::array_from((0..2000).map(OwnedValue::Int).collect::<Vec<_>>());
+        // The collected forms emit once; the streaming ones emit per iteration, and the scope is
+        // set aside around each of those sink calls without losing the index it built.
         for (filter, expected) in [
-            ("[range(0; length; 2) as $i | .[$i]] | length", "1000"),
-            ("[range(0; length; 2) as $i | .[$i:$i+2]] | length", "1000"),
-            ("[range(0; length; 2) as $i | .[3:5]] | length", "1000"),
+            ("[range(0; length; 2) as $i | .[$i]] | length", vec!["1000"]),
+            (
+                "[range(0; length; 2) as $i | .[$i:$i+2]] | length",
+                vec!["1000"],
+            ),
+            (
+                "[range(0; length; 2) as $i | .[3:5]] | length",
+                vec!["1000"],
+            ),
             (
                 "[range(0; length; 2) as $i | .[$i:$i+2][1]] | add",
-                "1000000",
+                vec!["1000000"],
+            ),
+            (
+                "range(0; length; 500) as $i | .[$i]",
+                vec!["0", "500", "1000", "1500"],
             ),
         ] {
             let expr = parse(filter).unwrap();
@@ -116094,15 +116113,31 @@ mod tests {
                     Demand::Continue
                 });
             assert!(matches!(flow, Flow::Exhausted), "{filter}");
-            assert_eq!(out, [expected], "{filter}");
+            assert_eq!(out, expected, "{filter}");
             let (builds, hits) = memo::work();
-            assert_eq!(builds - before.0, 1, "{filter}: one index for the loop");
-            assert!(
-                hits - before.1 >= 900,
-                "{filter}: the index answered the loop's reads ({} hits)",
-                hits - before.1
-            );
+            if expected.len() == 1 {
+                assert_eq!(builds - before.0, 1, "{filter}: one index for the loop");
+                assert!(
+                    hits - before.1 >= 900,
+                    "{filter}: the index answered the loop's reads ({} hits)",
+                    hits - before.1
+                );
+            }
         }
+        // A streaming loop of many outputs keeps one index across its sink calls.
+        let expr = parse("range(0; length; 2) as $i | .[$i]").unwrap();
+        let before = memo::work();
+        let mut count = 0usize;
+        let flow =
+            eval_each_owned::<JqSemantics>(&expr, &input, false, Reentry::REBUILT, &mut |_| {
+                count += 1;
+                Demand::Continue
+            });
+        assert!(matches!(flow, Flow::Exhausted));
+        assert_eq!(count, 1000);
+        let (builds, hits) = memo::work();
+        assert_eq!(builds - before.0, 1, "one index across 1000 sink calls");
+        assert!(hits - before.1 >= 900, "{} hits", hits - before.1);
     }
 
     /// #5274: a fold's `.[1:]` cuts a uniquely owned array in place and leaves a shared one

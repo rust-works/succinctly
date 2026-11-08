@@ -545,6 +545,21 @@ pub(crate) mod memo {
         }
     }
 
+    impl Guard {
+        /// Exchange the live scope with the one this guard replaced (#6666): the guard's own
+        /// scope is kept aside, intact, while the replaced one answers, and a second call puts
+        /// them back. A no-op for a guard that opened nothing.
+        pub(crate) fn swap(&mut self) {
+            if let Restore::Previous(held) = &mut self.0 {
+                MEMO.with(|m| {
+                    let mut m = m.borrow_mut();
+                    std::mem::swap(&mut *m, held);
+                    BLOOM.with(|b| b.set(m.as_ref().map_or(0, |s| bloom_of(&s.entries))));
+                });
+            }
+        }
+    }
+
     /// Open the scope for evaluations over `document`: a no-op while one is
     /// already open for it, a nested scope (restored on drop) otherwise.
     pub(crate) fn enter(document: usize) -> Guard {
@@ -880,6 +895,12 @@ pub(crate) mod memo {
     use super::DocumentElements;
 
     pub(crate) struct Guard;
+
+    impl Guard {
+        // The memo does not exist without `std`: nothing to set aside.
+        #[allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)]
+        pub(crate) fn swap(&mut self) {}
+    }
 
     pub(crate) fn enter(_document: usize) -> Guard {
         Guard
