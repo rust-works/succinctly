@@ -6861,6 +6861,9 @@ fn read_inputs(
     // Whether a last directory was left to the read that reaches it (#6604): it fails the run
     // whether or not a read does, but only once the warnings have been placed among the others.
     let mut seq_directory_deferred = false;
+    // #6591: whether a `--seq --stream` run that warns as it goes holds its open failures to place
+    // them among the warnings, as `--seq -s` does ([`seq_slurp_places_failures`]).
+    let mut seq_stream_places_failures = false;
     let (files, mut raw_bytes): OpenedInputs = if let Some(bytes) = read_whole {
         // Stdin is the one source with no file index.
         let tag = (!files.is_empty()).then_some(0);
@@ -6998,6 +7001,13 @@ fn read_inputs(
                     SLURP_DIRECTORY_READ.with(|slurp| slurp.set(true));
                 }
                 defer_open_failures(failures, false);
+            } else if seq_by_stream_reader(args) && !args.slurp && !args.null_input && !track_eof {
+                // #6591: the reader's warnings come out as jq's main loop pops each fault, and a
+                // failure is said when the reader opens the file, so it sits among them by source.
+                let mut failures = failures;
+                failures.truncate(reached);
+                held_open_failures = failures.into();
+                seq_stream_places_failures = true;
             } else {
                 report_open_failures(&failures[..reached], open_failed);
             }
@@ -7210,7 +7220,7 @@ fn read_inputs(
 
     // #6589: what the warnings did not reach is reached at the end of the read, unless a warning
     // stopped it first.
-    if !seq_slurp_stopped {
+    if !seq_slurp_stopped && !seq_stream_places_failures {
         report_held_open_failures(&mut held_open_failures, usize::MAX, open_failed);
     }
     if seq_directory_deferred {
@@ -7261,6 +7271,17 @@ fn read_inputs(
                 unknown: read.open_at_end.is_none(),
             });
         }
+        // #6591: the value that took jq's reader past the first file that did not open is the last
+        // one its main loop reads (#6006), so a warning met reading any later value never comes.
+        let main_loop_stops_at = if seq_stream_places_failures {
+            read.locations.iter().position(|&at| {
+                let (source, line) = stream_location(&raw_bytes, at);
+                line != UNKNOWN_LINE as usize
+                    && source_is_past_open_failure(u32::try_from(source).ok())
+            })
+        } else {
+            None
+        };
         let mut resumed: Vec<(usize, TrailingParseError)> = Vec::new();
         let mut trailing_error = None;
         let array_lost = slurped_array_lost(
@@ -7283,6 +7304,13 @@ fn read_inputs(
                     },
                 ));
             } else if !fault.after_array {
+                if seq_stream_places_failures {
+                    if main_loop_stops_at.is_some_and(|stop| fault.before > stop) {
+                        continue;
+                    }
+                    let (source, _) = stream_location(&raw_bytes, fault.location);
+                    report_held_open_failures(&mut held_open_failures, source, open_failed);
+                }
                 eprintln!(
                     "{}",
                     crate::jq_seq_reader::ignored_parse_error(&fault.message)
@@ -7300,6 +7328,9 @@ fn read_inputs(
                     as_parse_error: false,
                 });
             }
+        }
+        if seq_stream_places_failures {
+            report_held_open_failures(&mut held_open_failures, usize::MAX, open_failed);
         }
         let (values, locations) = if array_lost {
             let files = locations.files().to_vec();

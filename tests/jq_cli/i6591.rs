@@ -6,6 +6,10 @@
 //! - The event of a parse error at the end of the text is read at a last file that did not open,
 //!   line 0 (`input_filename` is that file), as the JSON reader's fault is (#6480).
 //!
+//! - `--seq --stream` without a program that reads `input` warns about a fault as jq's main loop
+//!   pops it, so a failure sits among the warnings by the file it is before, and a warning met
+//!   after the value that took the reader past the failure is never read.
+//!
 //! Every row was captured from jq 1.7.1.
 
 use anyhow::Result;
@@ -68,6 +72,51 @@ fn stream_errors_stops_past_the_first_failure_and_places_its_end_fault_6591() ->
             (out.as_str(), err.as_str(), code),
             (want_out.as_str(), want_err.as_str(), status),
             "{flags:?} {names:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn seq_stream_places_a_warning_among_the_open_failures_6591() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let d = dir.path().to_string_lossy().into_owned();
+    for (name, text) in [
+        ("bad", "\u{1e}1\n\u{1e}{\"a\n\u{1e}2\n"),
+        ("d", "\u{1e}[1,"),
+        ("ok", "\u{1e}3\n\u{1e}4\n"),
+        ("mid", "\u{1e}1\n\u{1e}{\"a\n\u{1e}2\n\u{1e}5\n"),
+    ] {
+        std::fs::write(dir.path().join(format!("{name}.seq")), text)?;
+    }
+    const WARN: &str = "jq: ignoring parse error: Truncated value at line 3, column 1\n";
+    const GONE: &str = "jq: error: Could not open file @DIR@/gone.seq: No such file or directory\n";
+    let both = format!("{WARN}{GONE}");
+    #[rustfmt::skip]
+    let rows = [
+        // The warning is met at the end of `bad`, which is read before the failure.
+        (&["bad", "gone"][..], "\u{1e}[[],1]\n\u{1e}[[],2]\n", both.as_str(), 2),
+        (&["bad", "gone", "ok"][..], "\u{1e}[[],1]\n\u{1e}[[],2]\n\u{1e}[[],3]\n", both.as_str(), 2),
+        (&["mid", "gone", "ok"][..], "\u{1e}[[],1]\n\u{1e}[[],2]\n\u{1e}[[],5]\n\u{1e}[[],3]\n", both.as_str(), 2),
+        // The value that takes the reader past the failure is the last one read: a warning after
+        // it, in that file or the next, never comes.
+        (&["gone", "bad"][..], "\u{1e}[[],1]\n", GONE, 2),
+        (&["gone", "d"][..], "\u{1e}[[0],1]\n", GONE, 2),
+        (&["gone", "ok", "bad"][..], "\u{1e}[[],3]\n", GONE, 2),
+        (&["ok", "gone", "bad"][..], "\u{1e}[[],3]\n\u{1e}[[],4]\n\u{1e}[[],1]\n", GONE, 2),
+        // No failure: the warning is all there is.
+        (&["bad"][..], "\u{1e}[[],1]\n\u{1e}[[],2]\n", WARN, 0),
+    ];
+    for (names, stdout, stderr, status) in rows {
+        let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}.seq")).collect();
+        let mut args: Vec<&str> = vec!["-c", "--seq", "--stream", "."];
+        args.extend(files.iter().map(String::as_str));
+        let (out, err, code) = run_jq_full(&args, None)?;
+        let want_err = stderr.replace("@DIR@", &d);
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            (stdout, want_err.as_str(), status),
+            "{names:?}"
         );
     }
     Ok(())
