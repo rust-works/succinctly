@@ -64,8 +64,8 @@ below and [ADR-0019](../adrs/adr-0019.md).
 
 ### Type Functions
 - [x] `type` - Returns type name
-- [x] `isnull`, `isboolean`, `isnumber`, `isstring`, `isarray`, `isobject`
-- [x] `toboolean` - Convert to boolean (accepts true, false, "true", "false")
+- [x] `isnull`, `isboolean`, `isnumber`, `isstring`, `isarray`, `isobject` (succinctly extensions: jq 1.7.1 and 1.8.2 and yq do not define them, see "Names jq 1.7.1 does not define" below)
+- [x] `toboolean` - Convert to boolean (accepts true, false, "true", "false"; a jq 1.8 builtin, `is not defined` in jq 1.7.1)
 
 ### Type Filters
 - [x] `values` - Select non-null values
@@ -112,7 +112,7 @@ below and [ADR-0019](../adrs/adr-0019.md).
 ### String Functions
 - [x] `ascii_downcase` / `ascii_upcase`
 - [x] `ltrimstr(s)` / `rtrimstr(s)`
-- [x] `ltrim` / `rtrim` / `trim`
+- [x] `ltrim` / `rtrim` / `trim` (jq 1.8 builtins, `is not defined` in jq 1.7.1; `succinctly jq` follows 1.8)
 - [x] `startswith(s)` / `endswith(s)`
 - [x] `split(s)` / `join(s)`
 - [x] `contains(x)` / `inside(x)`
@@ -209,7 +209,7 @@ echo '["a","b","c"]' | jq -r '@dsv(";")'        # Output: "a";"b";"c"
 
 ### Advanced Control Flow
 - [x] `limit(n; expr)`
-- [x] `skip(n; expr)` - skip first n outputs from expr
+- [x] `skip(n; expr)` - skip first n outputs from expr (a jq 1.8 builtin, `is not defined` in jq 1.7.1)
 - [x] `first` / `first(expr)` / `last` / `last(expr)`
 - [x] `nth(n; expr)`
 - [x] `until(cond; update)` / `while(cond; update)`
@@ -256,7 +256,7 @@ echo '["a","b","c"]' | jq -r '@dsv(";")'        # Output: "a";"b";"c"
 - [x] `env`, `$ENV.VAR`, `env(VAR)`, `strenv(VAR)`
 - [x] `now` - Current Unix timestamp
 - [x] `builtins` - List all builtin function names: jq 1.7.1's 218 `name/arity` entries, in jq's order, and no other (#5304).
-  A name that is only an extension here (`trim`, `leaf_paths`, `isvalid`, the yq metadata getters) is callable but not listed.
+  A name that jq 1.7.1 does not define (`trim` and the other jq 1.8 names, `leaf_paths`, `isvalid`, the yq metadata getters) is callable but not listed; they are enumerated under "Names jq 1.7.1 does not define" below.
 
 ### Assignment Operators
 - [x] `.a = value` - Simple assignment
@@ -298,7 +298,8 @@ printf 'a: [1, 2]\nb: [3, 4]\n' | succinctly yq '.a *= .b'               # a: [3
 - [x] `recurse` / `recurse(f)` / `recurse(f; cond)`
 - [x] `walk(f)`
 - [x] `modulemeta` (arity 0 like real jq's — #2035; errors the same way real jq's does — #2111; resolves the module on `-L` and answers its metadata, `deps` and `defs` — #5321)
-- [x] `tojsonstream` / `fromjsonstream`
+- [x] `tojsonstream` / `fromjsonstream` (succinctly extensions: no jq or yq defines them)
+- [x] `recurse_down` - an alias of `recurse` (a succinctly extension: jq 1.7.1 and 1.8.2 do not define it)
 - [x] `tostream` / `fromstream(f)` / `truncate_stream(f)` — jq's standard streaming
   builtins (#396). Distinct from `tojsonstream`/`fromjsonstream` above, which predate
   these and use a different (non-standard) event shape; both pairs are kept for
@@ -454,6 +455,25 @@ echo '{"data": {"nested": {"value": 42}}}' | succinctly jq 'at_offset(9) | .nest
 - `at_position(line; col)` uses a 1-indexed line and column (same as `jq-locate --line --column`).
 - Both return an error if the offset or position is out of bounds or does not correspond to a valid node.
 - Use `at_offset(n)?` or `at_position(l; c)?` for the optional form (empty on an invalid position).
+
+#### Names jq 1.7.1 does not define, run by `succinctly jq` (#6672)
+
+ADR-0018 rule 5 lets `succinctly jq` run a name its reference refuses only where this documentation marks the name as an extension.
+Forty-five names (46 name and arity pairs, `parent` having two) are in that position: `succinctly jq` runs each, and `jq` 1.7.1 answers `is not defined`.
+The list was captured by running every name the parser matches, at arities 0 to 3, through `/usr/bin/jq` 1.7.1 (`-n`), jq 1.8.2 and `yq` v4.53.3; a name the parser reaches another way is not in it, so it is a lower bound.
+
+| Class            | Names                                                                                                                                                                                                                                                                                              | jq 1.8.2    | yq v4.53.3                              | Pinned by                                 |
+|------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------|-----------------------------------------|-------------------------------------------|
+| succinctly's own | `at_offset`, `at_position`, `leaf_paths`, `isvalid`, `isnull`, `isboolean`, `isnumber`, `isstring`, `isarray`, `isobject`, `tojsonstream`, `fromjsonstream`                                                                                                                                        | not defined | lexer error                             | `probes/extensions.tsv`                   |
+| an old alias     | `recurse_down` (behaves as `recurse`)                                                                                                                                                                                                                                                              | not defined | lexer error                             | `probes/extensions.tsv`                   |
+| a jq 1.8 name    | `trim`, `ltrim`, `rtrim`, `toboolean`, `skip` (`skip(n; f)`)                                                                                                                                                                                                                                       | defined     | `trim` defined, the others lexer errors | jq 1.8.1's vendored tests (`since-1.8.1`) |
+| a yq name        | `anchor`, `tag`, `kind`, `style`, `key`, `line`, `column`, `parent`, `path`, `di`, `document_index`, `fi`, `file_index`, `fileIndex`, `head_comment`, `line_comment`, `foot_comment`, `from_unix`, `to_unix`, `tz`, `format_datetime`, `with_dtf`, `load`, `omit`, `pivot`, `shuffle`, `split_doc` | not defined | defined                                 | `probes/extensions.tsv`                   |
+
+- A yq name in jq mode is the name, not yq's behaviour: `line`/`column` answer the JSON text's position where yq answers `0` for JSON input, and `tz` takes a Unix timestamp where yq's takes an ISO 8601 string.
+  `succinctly yq` follows yq for all of them.
+- `isvalid` has its own paragraph under "Succinctly Extensions" (#6662), and `at_offset`, `at_position` and `leaf_paths` their own sections.
+  `isnull` to `isobject` are the zero-argument type tests of the "Type Functions" list above; `tojsonstream` and `fromjsonstream` are the non-standard event pair described under "Other", distinct from `tostream`/`fromstream`.
+- `tests/jq_extension_roster_tests.rs` keeps this table, the rows of `comparison/jq/probes/extensions.tsv` and `succinctly jq` in agreement: each name is listed on its class's row, each uncovered name has a probe row, and each row runs.
 
 #### `leaf_paths`
 
