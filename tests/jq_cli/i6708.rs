@@ -58,6 +58,11 @@ fn a_second_failure_behind_the_value_that_passed_the_first_is_not_reached_6708()
         (&["-c", "[input_line_number, input]"][..], &["str", "miss", "s", "miss2"][..], "[0,12]\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
         (&["-c", "input"][..], &["one", "miss", "s", "miss2", "one"][..], "\"a\"\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
         (&["-c", "input"][..], &["one", "empty", "miss", "s", "miss2"][..], "\"a\"\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
+        (&["-c", "[limit(1;inputs)]"][..], &["one", "miss", "s", "miss2"][..], "[\"a\"]\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
+        (&["-c", "try input catch \"e\""][..], &["one", "miss", "s", "miss2"][..], "\"a\"\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
+        (&["-c", "-e", "input"][..], &["one", "miss", "s", "miss2"][..], "\"a\"\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
+        (&["-c", "--arg", "x", "1", "input"][..], &["one", "miss", "s", "miss2"][..], "\"a\"\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
+        (&["-c", "[.,input]"][..], &["one", "miss", "s", "miss2"][..], "[1,\"a\"]\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
     ];
     check(&rows)
 }
@@ -74,6 +79,15 @@ fn reads_that_go_on_and_the_main_loop_alone_keep_their_rows_6708() -> Result<()>
         (&["-c", "[inputs]"][..], &["one", "miss", "s", "miss2"][..], "[\"a\"]\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\n", 2),
         (&["-c", "[input, input]"][..], &["one", "miss", "s", "miss2"][..], "", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\njq: error (at @DIR@/miss2.json:0): break\n", 2),
         (&["-c", "."][..], &["one", "miss", "s", "miss2"][..], "1\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
+        (&["-c", "reduce inputs as $x (.;.)"][..], &["one", "miss", "s", "miss2"][..], "1\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\n", 2),
+        (&["-c", "[limit(2;inputs)]"][..], &["one", "miss", "s", "miss2"][..], "[\"a\"]\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\n", 2),
+        (&["-c", "[inputs]|length"][..], &["one", "miss", "s", "miss2"][..], "1\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\n", 2),
+        (&["-c", "[.,input,input]"][..], &["one", "miss", "s", "miss2"][..], "", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\njq: error (at @DIR@/miss2.json:0): break\n", 2),
+        (&["-c", "-s", "input"][..], &["one", "miss", "s", "miss2"][..], "", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\njq: error (at @DIR@/miss2.json:0): break\n", 2),
+        (&["-c", "-R", "input"][..], &["one", "miss", "s", "miss2"][..], "", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\njq: error (at @DIR@/miss2.json:0): break\n", 2),
+        (&["-c", "--seq", "input"][..], &["one", "miss", "s", "miss2"][..], "", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\njq: ignoring parse error: Unfinished abandoned text at EOF at line 2, column 0\n", 2),
+        (&["-c", "-n", "first(inputs)"][..], &["one", "miss", "s", "miss2"][..], "1\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
+        (&["-c", "-n", "[limit(1;inputs)]"][..], &["one", "miss", "s", "miss2"][..], "[1]\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
     ];
     check(&rows)
 }
