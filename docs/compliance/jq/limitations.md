@@ -14199,6 +14199,12 @@ Two residuals remain, both with a missing file *and* a feature that routes input
   A line with no newline goes on into the next file that has bytes, as in jq, so a missing file between the two is reported and one after the file that ends the line is not.
   A program that reads `input`, `-n` and `-s` report every missing file when a read reaches it, or up front, as above.
   `-n` with `input_line_number` and no `input`/`inputs` opens no file, so it reports no missing one (#6464).
+* `--input-dsv` joins a quoted field that runs past the end of its file to the next file, since [#6601](https://github.com/rust-works/succinctly/issues/6601), as jq reads its files as one stream and as `-R` joins a line to the next file's.
+  `a,"b` in one file and `c",d` in the next is the one row `["a","b\nc","d"]`, as the two files joined are.
+  `input_filename` and an error in that row name the file the record ends in, where jq's reader stands when it completes the record, and its row number counts from the start of that file.
+  Only a quote that is still open joins: a last row with no newline stays its own row, where `-R` would join that line to the next file's, since many files end that way and joining them would merge two rows.
+  A record still open at the end of the last file is read as it stood.
+  jq has no DSV input to compare with, so this is a succinctly extension.
 * jq keeps the name of the last file it tried even when it did not open, so a diagnostic or `input_filename` after a missing last file names that file (`jq -s -c input_filename data.json missing` prints `"missing"`).
   `succinctly jq` does the same once a read reaches the end of the input, since [#6480](https://github.com/rust-works/succinctly/issues/6480): the missing last file is a source past the ones that opened, at line 0, so `[inputs], input_filename` under `-n`, an error after `[inputs]`, and every `-s` route name it.
   So does a last value that completes only at the end of the input, since #6480's next step: a bare number or literal in the last bytes (`jq -c '[., input_filename]' num.json missing` over `12` is `[12,"missing"]`), or the last `-R` line with no newline, is read at the missing file, line 0, and the open error is said at that read, after the values before it.

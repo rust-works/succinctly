@@ -5024,11 +5024,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         if !args.slurp && !args.null_input && !uses_input_builtins {
             // Streaming mode: process each row independently
             let files = get_input_files(&args);
-            let (files, raw_inputs, failures) = if files.is_empty() {
+            let (files, mut raw_inputs, failures) = if files.is_empty() {
                 (files, vec![read_stdin_bytes()?], Vec::new())
             } else {
                 read_input_files(&files)
             };
+            join_dsv_records_across_files(&mut raw_inputs, dsv_config(delimiter).quote_char);
             report_open_failures(&failures, &mut open_failed);
             // `input_filename` on this route too (#3046 review), named after the files that
             // opened: `raw_inputs`' indexes are its source tags (#5472).
@@ -5042,7 +5043,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 let file = files.get(file_idx).map(|p| input_display_name(p));
 
                 // Build DSV index (memory-efficient with SIMD)
-                let config = DsvConfig::default().with_delimiter(delimiter as u8);
+                let config = dsv_config(delimiter);
                 let index = build_dsv_index(&raw, &config);
 
                 // Stream rows using the cursor - no materialization of all rows
@@ -7724,6 +7725,9 @@ fn read_inputs(
         // so this is the one count made ahead of a refusal: a newline count of each file but
         // the last, on a route that already decodes every byte of each, and none at all where
         // no message can read it (`--stream`, DSV).
+        if let Some(delimiter) = args.input_dsv {
+            join_dsv_records_across_files(&mut raw_inputs, dsv_config(delimiter).quote_char);
+        }
         let last = raw_inputs.len().saturating_sub(1);
         LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
         LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
@@ -13669,12 +13673,86 @@ fn validate_dsv_delimiter(delimiter: char) -> Result<()> {
     }
 }
 
+/// A file's text, as the two `--input-dsv` routes hold it: bytes, or a decoded string with the
+/// index of the file it came from (#6601).
+trait DsvSource: Sized {
+    fn bytes(&self) -> &[u8];
+    /// Takes the text from `at` on out of `self`.
+    fn split_off_at(&mut self, at: usize) -> Self;
+    /// Puts `head` in front of `self`.
+    fn prepend(&mut self, head: Self);
+}
+
+impl DsvSource for Vec<u8> {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+    fn split_off_at(&mut self, at: usize) -> Self {
+        self.split_off(at)
+    }
+    fn prepend(&mut self, mut head: Self) {
+        head.append(self);
+        *self = head;
+    }
+}
+
+impl DsvSource for (Option<usize>, String) {
+    fn bytes(&self) -> &[u8] {
+        self.1.as_bytes()
+    }
+    fn split_off_at(&mut self, at: usize) -> Self {
+        (self.0, self.1.split_off(at))
+    }
+    fn prepend(&mut self, head: Self) {
+        self.1.insert_str(0, &head.1);
+    }
+}
+
+/// The configuration every `--input-dsv` reader indexes and parses with, and the join across files
+/// (#6601) reads its quote byte from, so they cannot disagree about which byte toggles a quote.
+fn dsv_config(delimiter: char) -> DsvConfig {
+    DsvConfig::default().with_delimiter(delimiter as u8)
+}
+
+/// Where the record a text ends inside starts, when it ends inside a quoted field (#6601): every
+/// quote byte toggles the state the DSV index tracks, so the text ends inside a quote exactly when
+/// it holds an odd number of them. `None` for a text whose last record is complete.
+fn open_dsv_record_start(text: &[u8], quote: u8) -> Option<usize> {
+    if text.iter().filter(|&&byte| byte == quote).count() % 2 == 0 {
+        return None;
+    }
+    let (mut quoted, mut start) = (false, 0);
+    for (at, &byte) in text.iter().enumerate() {
+        if byte == quote {
+            quoted = !quoted;
+        } else if byte == b'\n' && !quoted {
+            start = at + 1;
+        }
+    }
+    Some(start)
+}
+
+/// Reads the files `--input-dsv` is given as one stream of records, as jq reads its files (and as
+/// `-R` joins a line to the next file's): a record whose quoted field runs past the end of its file
+/// continues in the next file that opened, and is read, and named, there (#6601). A last record
+/// with no newline stays its own row: only a quote that is still open joins, as one would in a
+/// single file. The common run, of one file or of files that end on a record, pays a count of each
+/// earlier file's quote bytes and no copy; a spanning record copies the next file once.
+fn join_dsv_records_across_files<T: DsvSource>(sources: &mut [T], quote: u8) {
+    for at in 1..sources.len() {
+        if let Some(start) = open_dsv_record_start(sources[at - 1].bytes(), quote) {
+            let open = sources[at - 1].split_off_at(start);
+            sources[at].prepend(open);
+        }
+    }
+}
+
 /// Parse DSV (delimiter-separated values) input into JSON arrays.
 /// Each row becomes a JSON array of strings.
 fn parse_dsv_input(s: &str, delimiter: char) -> Vec<OwnedValue> {
-    use succinctly::dsv::{Dsv, DsvConfig};
+    use succinctly::dsv::Dsv;
 
-    let config = DsvConfig::default().with_delimiter(delimiter as u8);
+    let config = dsv_config(delimiter);
 
     let dsv = Dsv::parse_with_config(s.as_bytes(), &config);
     let mut values = Vec::with_capacity(dsv.row_count());
