@@ -110,3 +110,68 @@ fn test_yq_prints_yaml_for_standard_input_and_null_input_6703() -> Result<()> {
     }
     Ok(())
 }
+
+/// `--inplace` rewrites a `.json` file as JSON (it wrote YAML into it before), with `-I` and `-P`
+/// as given, and as YAML only when `-o=yaml` says so.
+#[test]
+fn test_yq_inplace_keeps_a_json_file_json_6703() -> Result<()> {
+    let dir = TempDir::new()?;
+    for (args, name, text, want) in [
+        (
+            &["-i"][..],
+            "b.json",
+            "{\"b\": 2}\n",
+            "{\n  \"b\": 2,\n  \"x\": 1\n}\n",
+        ),
+        (
+            &["-i", "-I=4"][..],
+            "b.json",
+            "{\"b\": 2}\n",
+            "{\n    \"b\": 2,\n    \"x\": 1\n}\n",
+        ),
+        (
+            &["-i", "-P"][..],
+            "b.json",
+            "{\"b\": 2}\n",
+            "{\n  \"b\": 2,\n  \"x\": 1\n}\n",
+        ),
+        (
+            &["-i", "-o=auto"][..],
+            "b.json",
+            "{\"b\": 2}\n",
+            "{\n  \"b\": 2,\n  \"x\": 1\n}\n",
+        ),
+        (
+            &["-i", "-o=json"][..],
+            "b.json",
+            "{\"b\": 2}\n",
+            "{\n  \"b\": 2,\n  \"x\": 1\n}\n",
+        ),
+        (
+            &["-i", "-o=yaml"][..],
+            "b.json",
+            "{\"b\": 2}\n",
+            "b: 2\nx: 1\n",
+        ),
+        (&["-i"][..], "a.yaml", "a: 1\n", "a: 1\nx: 1\n"),
+    ] {
+        std::fs::write(dir.path().join(name), text)?;
+        let status = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("yq")
+            .args(args)
+            .arg(".x = 1")
+            .arg(name)
+            .current_dir(dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        assert!(status.success(), "{args:?} {name}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(name))?,
+            want,
+            "{args:?} {name}"
+        );
+    }
+    Ok(())
+}
