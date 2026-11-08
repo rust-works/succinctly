@@ -6938,6 +6938,8 @@ fn read_inputs(
             } else if args.slurp
                 && (args.null_input || track_eof)
                 && !seq_slurp_places_failures(args)
+                // #6599: `--seq -s -n` defers every failure, a last directory included.
+                && !seq_slurp_defers_failures(args)
                 && matches!(
                     failures[..reached].last(),
                     Some((_, e)) if e.kind == InputFileErrorKind::Directory { last: true }
@@ -6970,6 +6972,18 @@ fn read_inputs(
                     seq_directory_deferred = true;
                 }
                 held_open_failures = failures.into();
+            } else if seq_slurp_defers_failures(args) {
+                // #6599: under `-n` nothing prints while the stream is read: the program's `input`
+                // reads it, and a failure is for the read that reaches the file (a fault met
+                // before it stops the program first). A last directory is read by the extra
+                // `input` the array's read makes way for (#6604), as the plain slurp's is.
+                if matches!(
+                    failures.last(),
+                    Some((_, e)) if e.kind == InputFileErrorKind::Directory { last: true }
+                ) {
+                    SLURP_DIRECTORY_READ.with(|slurp| slurp.set(true));
+                }
+                defer_open_failures(failures, false);
             } else {
                 report_open_failures(&failures[..reached], open_failed);
             }
@@ -7080,7 +7094,11 @@ fn read_inputs(
     // they stand at, line 0. The walk's own `Tail` (#6588) keeps the end-of-stream drop (#2998) off
     // the last file that opened; this source is where what is read past it is placed: the fault at
     // the end of the text (#6531) and a value that completes only there.
-    if seq_readers_place_reads && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some()) {
+    // #6599: `-s -n` reads the same stream through the program's `input`, so the fault at the end of
+    // the text is raised there too.
+    if (seq_readers_place_reads || seq_slurp_defers_failures(args))
+        && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some())
+    {
         raw_bytes.push((Some(files.len()), Vec::new()));
     }
     // #6589: whether jq's main loop stopped on a warning met after a file that did not open, so the
@@ -8128,6 +8146,11 @@ fn read_inputs(
         // #6589: a read that places its failures among its warnings knows whether one stopped it.
         let array_lost = if seq_slurp_places_failures(args) {
             seq_slurp_stopped
+        } else if seq_slurp_defers_failures(args) {
+            // #6599: no main loop reads the stream under `-n`, so no failure stops it: a fault the
+            // slurp's own call met is queued ahead of the array, and one it did not is queued
+            // behind it.
+            false
         } else {
             slurped_array_lost(
                 args.seq,
@@ -8162,6 +8185,18 @@ fn read_inputs(
         // No array, no location: the queue of a program that reads `input` holds nothing (#6589).
         let slurped_locations = if array_lost {
             InputLocations::new(locations.files().to_vec())
+        } else if !resumed_errors.is_empty() || seq_slurp_defers_failures(args) {
+            // #6599: a fault the queue raises names the file it was met in by its index in the
+            // whole table, and a read of the array reaches the failures up to its source, so the
+            // table stays whole and the array is one entry in it, at the last source
+            // (`single_at_end` keeps only the array's own file).
+            let (src, line) = locations
+                .slurp_eof(slurp_eof_line)
+                .unwrap_or((0, UNKNOWN_LINE));
+            let mut slurped = InputLocations::new(locations.files().to_vec());
+            slurped.unopened_tail = locations.unopened_tail;
+            slurped.push(src as usize, line as usize);
+            slurped
         } else {
             InputLocations::single_at_end(at, locations.unopened_tail)
         };
@@ -8300,6 +8335,18 @@ fn seq_slurp_places_failures(args: &JqCommand) -> bool {
     args.seq
         && args.slurp
         && !args.null_input
+        && !args.raw_input
+        && args.input_dsv.is_none()
+        && !seq_by_stream_reader(args)
+}
+
+/// Whether a `--seq -s -n` read leaves its open failures to the reads of the program's `input`
+/// (#6599), as [`defer_open_failures`] does for the non-slurp queue (#6475): the same stream as
+/// [`seq_slurp_places_failures`] reads, under `-n`.
+fn seq_slurp_defers_failures(args: &JqCommand) -> bool {
+    args.seq
+        && args.slurp
+        && args.null_input
         && !args.raw_input
         && args.input_dsv.is_none()
         && !seq_by_stream_reader(args)
