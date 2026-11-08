@@ -106477,7 +106477,7 @@ fn get_timezone_offset(zone: &str, timestamp: f64) -> Result<i64, String> {
                 "IST" => 5 * 3600 + 30 * 60, // India: +5:30
                 // Australian timezones
                 "AEST" => 10 * 3600,
-                "AEDT" => 13600,
+                "AEDT" => 11 * 3600,
                 "ACST" => 9 * 3600 + 30 * 60,
                 "ACDT" => 10 * 3600 + 30 * 60,
                 "AWST" => 8 * 3600,
@@ -106549,14 +106549,14 @@ fn get_timezone_offset(zone: &str, timestamp: f64) -> Result<i64, String> {
                         // Australia
                         "Australia/Sydney" => {
                             if is_dst_australia(timestamp) {
-                                13600
+                                11 * 3600
                             } else {
                                 10 * 3600
                             }
                         }
                         "Australia/Melbourne" => {
                             if is_dst_australia(timestamp) {
-                                13600
+                                11 * 3600
                             } else {
                                 10 * 3600
                             }
@@ -153685,6 +153685,26 @@ mod tests {
             error.message,
             "mktime/strftime: broken-down time value out of representable range"
         );
+    }
+
+    /// #6690: the Australian daylight-time offset was `13600` seconds (+03:46) in three places, a
+    /// typo for eleven hours. Pins `AEDT`, Sydney and Melbourne in daylight and standard time, and
+    /// the rest of the Australian names beside them.
+    #[test]
+    fn test_australian_offsets_6690() {
+        const NOV_15_2023: f64 = 1_700_000_000.0; // 2023-11-14T22:13:20Z: DST in Sydney
+        const JUN_15_2024: f64 = 1_718_445_000.0; // winter in Sydney
+        let off = |zone: &str, ts: f64| get_timezone_offset(zone, ts).unwrap();
+        assert_eq!(off("AEDT", NOV_15_2023), 11 * 3600);
+        assert_eq!(off("AEST", NOV_15_2023), 10 * 3600);
+        for zone in ["Australia/Sydney", "Australia/Melbourne"] {
+            assert_eq!(off(zone, NOV_15_2023), 11 * 3600, "{zone} in daylight time");
+            assert_eq!(off(zone, JUN_15_2024), 10 * 3600, "{zone} in standard time");
+        }
+        assert_eq!(off("Australia/Perth", NOV_15_2023), 8 * 3600);
+        assert_eq!(off("ACST", NOV_15_2023), 9 * 3600 + 30 * 60);
+        assert_eq!(off("ACDT", NOV_15_2023), 10 * 3600 + 30 * 60);
+        assert_eq!(off("AWST", NOV_15_2023), 8 * 3600);
     }
 
     #[test]
