@@ -6927,10 +6927,18 @@ fn read_inputs(
                 || args.raw_input
                 || seq_readers_place_reads
                 || (any_open_failure
+                    // #6610: a directory last is read only by a read past the end, which a fault
+                    // before the end stops the program ahead of: jq's exit status is that fault's.
+                    // A fault at the end is raised by that same read, which reaches the directory.
                     // #6588: the streaming readers (`read_seq`) still end the stream at the
                     // final buffer of the last file that opened (#6591), so for them an unopened
                     // file after it does not change what the walk calls clean.
-                    && seq_text_reads_clean(&raws, unopened_tail && !seq_by_stream_reader(args))))
+                    && (seq_text_reads_clean(&raws, unopened_tail && !seq_by_stream_reader(args))
+                        || (unplaced_tail
+                            && seq_faults_all_before_end(
+                                &raws,
+                                unopened_tail && !seq_by_stream_reader(args),
+                            )))))
             && ends_cleanly
         {
             // The `--seq` readers place their own faults: the JSON text's fault is not theirs.
@@ -9233,6 +9241,31 @@ thread_local! {
 fn defer_open_failures(failures: Vec<(usize, InputFileOpenError)>, fault_ends_text: bool) {
     PENDING_OPEN_FAILURES.with(|pending| *pending.borrow_mut() = failures.into());
     FAULT_ENDS_TEXT.with(|ends| ends.set(fault_ends_text));
+}
+
+/// Whether `--seq`'s own reader over the text the files `raws` make faults, and only before the end
+/// of the text (#6610): a fault in the middle of the stream stops a program that reads it before a
+/// read past the last file is made. The reader's report of what it holds open at the end
+/// (`... at EOF`) is raised by that read instead, which reaches a directory last, and a stream
+/// holding both is not told apart by the hook, which treats every fault read alike.
+fn seq_faults_all_before_end(raws: &[Vec<u8>], unopened_tail: bool) -> bool {
+    let sources: Vec<(Option<usize>, Vec<u8>)> = raws
+        .iter()
+        .enumerate()
+        .map(|(at, raw)| (Some(at), raw.clone()))
+        .collect();
+    let walk = crate::jq_seq_reader::walk_stream_collecting(
+        &sources,
+        false,
+        true,
+        crate::jq_seq_reader::Tail::of(unopened_tail),
+        &mut |_| {},
+    );
+    !walk.faults.is_empty()
+        && walk
+            .faults
+            .iter()
+            .all(|fault| !fault.body.contains(" at EOF"))
 }
 
 /// Whether `--seq`'s own reader reads the text the files `raws` make without a fault (#6555): no
@@ -14101,10 +14134,9 @@ mod bridge_docs {
 
 /// `generic_to_owned_checked`'s nesting ceiling ([`check_nesting_depth`]) applied to a value that is
 /// handed on without being converted (#5624): every container level is held to it, and the walk stops at
-/// the first level that is not, so a deeper value costs no more than the ceiling.
+/// the first level that is not, so a deeper value costs no more than the ceiling. A scalar is held to
+/// nothing (#6631): it recurses no deeper, and the ceiling counts containers.
 fn check_output_nesting(value: &OwnedValue, depth: usize) -> core::result::Result<(), EvalError> {
-    // A container is held to the ceiling, a scalar is not: it recurses no deeper, and jq's own
-    // limit of 256 containers leaves room for the scalar inside the 256th (#6618).
     match value {
         OwnedValue::Array(items) => {
             check_nesting_depth(depth)?;
@@ -23018,8 +23050,8 @@ mod tests {
             assert_eq!(built, 1, "{filter}");
             assert!(!outputs.is_empty(), "{filter}");
         }
-        // The nesting ceiling of a converted output holds for the shortcut too: a container is held
-        // to it and a scalar is not (#6618), so 256 containers around a scalar print, and 257 do not.
+        // The nesting ceiling of a converted output (256 containers) holds for the shortcut too: 256
+        // containers around a scalar print (#6631: the scalar is no level), 257 do not.
         for (depth, prints) in [(255usize, 1usize), (256, 1), (257, 0), (300, 0)] {
             let mut nest = OwnedValue::Int(1);
             for _ in 0..depth {

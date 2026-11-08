@@ -1342,7 +1342,8 @@ mod tests {
             let json = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
             let index = JsonIndex::build(json.as_bytes());
             let cursor = index.root(json.as_bytes());
-            if depth < MAX_NESTING_DEPTH {
+            // #6631: the ceiling counts containers, so a document of exactly 256 is read.
+            if depth <= MAX_NESTING_DEPTH {
                 assert_eq!(try_cursor_to_owned(&cursor).unwrap().to_json(), json);
                 assert_eq!(cursor_to_owned(&cursor).unwrap().to_json(), json);
                 assert_eq!(
