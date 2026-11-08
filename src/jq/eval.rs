@@ -106436,6 +106436,10 @@ fn format_datetime_with_offset(timestamp: f64, offset_seconds: i64) -> Result<St
 
 /// Get timezone offset in seconds for a given IANA timezone name
 /// Returns Ok(offset_seconds) or Err(error_message)
+/// Australian eastern daylight time, UTC+11: the one definition `AEDT` and the daylight half of
+/// Sydney and Melbourne share (it was `13600` in each of the three, #6690).
+const AEDT_OFFSET: i64 = 11 * 3600;
+
 fn get_timezone_offset(zone: &str, timestamp: f64) -> Result<i64, String> {
     match zone.to_lowercase().as_str() {
         "utc" | "z" | "gmt" => Ok(0),
@@ -106477,7 +106481,7 @@ fn get_timezone_offset(zone: &str, timestamp: f64) -> Result<i64, String> {
                 "IST" => 5 * 3600 + 30 * 60, // India: +5:30
                 // Australian timezones
                 "AEST" => 10 * 3600,
-                "AEDT" => 11 * 3600,
+                "AEDT" => AEDT_OFFSET,
                 "ACST" => 9 * 3600 + 30 * 60,
                 "ACDT" => 10 * 3600 + 30 * 60,
                 "AWST" => 8 * 3600,
@@ -106547,16 +106551,9 @@ fn get_timezone_offset(zone: &str, timestamp: f64) -> Result<i64, String> {
                         "Asia/Dubai" => 4 * 3600,
                         "Asia/Singapore" => 8 * 3600,
                         // Australia
-                        "Australia/Sydney" => {
+                        "Australia/Sydney" | "Australia/Melbourne" => {
                             if is_dst_australia(timestamp) {
-                                11 * 3600
-                            } else {
-                                10 * 3600
-                            }
-                        }
-                        "Australia/Melbourne" => {
-                            if is_dst_australia(timestamp) {
-                                11 * 3600
+                                AEDT_OFFSET
                             } else {
                                 10 * 3600
                             }
@@ -153696,6 +153693,7 @@ mod tests {
         const JUN_15_2024: f64 = 1_718_445_000.0; // winter in Sydney
         let off = |zone: &str, ts: f64| get_timezone_offset(zone, ts).unwrap();
         assert_eq!(off("AEDT", NOV_15_2023), 11 * 3600);
+        assert_eq!(AEDT_OFFSET, 11 * 3600);
         assert_eq!(off("AEST", NOV_15_2023), 10 * 3600);
         for zone in ["Australia/Sydney", "Australia/Melbourne"] {
             assert_eq!(off(zone, NOV_15_2023), 11 * 3600, "{zone} in daylight time");
