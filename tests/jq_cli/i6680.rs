@@ -71,6 +71,45 @@ fn a_held_back_closer_ends_the_run_at_the_next_failed_open_6680() -> Result<()> 
             "[[\"a\"],1]\n[[\"a\"]]\n",
             GONE,
         ),
+        // A byte after the closer: the closer is read in its own file, so the run goes on past a
+        // missing file or a directory, to the file after it.
+        (
+            "[1,2]\n",
+            &["--stream", "."],
+            &["dir", "g.json"],
+            "[[0],1]\n[[1],2]\n[[1]]\n[[\"a\"],1]\n",
+            "jq: error: Is a directory\n",
+        ),
+        (
+            "[1,2]\n",
+            &["-n", "--stream", "[inputs]"],
+            &["gone", "g.json"],
+            "[[[0],1],[[1],2],[[1]],[[\"a\"],1],[[\"a\"]]]\n",
+            GONE,
+        ),
+        // `inputs` asks past a failure, so it reads on to the file after the failures.
+        (
+            "[1,2]",
+            &["-n", "--stream", "[inputs]"],
+            &["gone", "gone2", "g.json"],
+            "[[[0],1],[[1],2],[[1]],[[\"a\"],1],[[\"a\"]]]\n",
+            GONE_AND_GONE2,
+        ),
+        // The held-back closer is read at the missing file, which `input_filename` names.
+        (
+            "[1,2]",
+            &["--stream", "[., input_filename, input_line_number]"],
+            &["gone", "g.json"],
+            "[[[0],1],\"@D@/f.json\",0]\n[[[1],2],\"@D@/f.json\",0]\n[[[1]],\"@D@/gone\",0]\n",
+            GONE,
+        ),
+        (
+            "[1,2]\n",
+            &["--stream", "[., input_filename, input_line_number]"],
+            &["gone", "g.json"],
+            "[[[0],1],\"@D@/f.json\",1]\n[[[1],2],\"@D@/f.json\",1]\n[[[1]],\"@D@/f.json\",1]\n[[[\"a\"],1],\"@D@/g.json\",0]\n",
+            GONE,
+        ),
         // Not held back: a byte after the closer, or a closer that follows a container.
         (
             "[1,2]\n",
@@ -102,7 +141,11 @@ fn a_held_back_closer_ends_the_run_at_the_next_failed_open_6680() -> Result<()> 
         let (out, err, code) = run_jq_full(&args, None)?;
         assert_eq!(
             (out.as_str(), err.as_str(), code),
-            (*stdout, stderr.replace("@D@", &d).as_str(), 2),
+            (
+                stdout.replace("@D@", &d).as_str(),
+                stderr.replace("@D@", &d).as_str(),
+                2
+            ),
             "{text:?} {flags:?} then {after:?}"
         );
     }
