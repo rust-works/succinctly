@@ -1132,8 +1132,14 @@ What is still different, each a place that has not been taught the entries (an e
 
 - **`sort_keys`** stable-sorts every entry of a repeated key (`a: 1 / a: 2 / b: 3` stays `{"a":1,"a":2,"b":3}`).
   yq copies the last value over the earlier entries (`{"a":2,"a":2,"b":3}`), which would destroy a document value, so this is a recorded divergence (ADR-0018, ADR-0027 P4, #5426).
-- **A comment, anchor or style on an earlier entry** is not carried on the routes that hold a `CommentTree`, which is keyed by key and describes the last entry: the earlier entry is written plain.
+- **A comment, anchor, tag or quoting on an earlier entry** is not carried on the routes that hold a `CommentTree`, which is keyed by key and describes the last entry: the earlier entry is written plain.
   An alias to an anchor declared on an earlier entry is written as that entry's value, since the anchor is not.
+  One thing of an earlier entry is carried (#6335): how its value was spelled, in the key's `KeyMeta` (`a:` as the empty value, `~`, `Null`, `True`).
+  A write (`=`, `|=`, `+=`), `del`, `*`, `with_entries(.)` and a `to_entries | from_entries` with nothing between the two print `a:` / `a: 2` as yq does, where they printed `a: null`.
+  The spelling is kept by position among the key's earlier entries, and only while the tree holds as many as the mapping does; a key whose count changed prints plain.
+  Still plain, each printing `a: null` for `a:` (and `null`/`true` for `~`/`True`): `pick`, which answers the earliest entry of a key (`a:` in yq), and every route that rebuilds a mapping from its parts without the key's entry.
+  Those are a filter between `to_entries` and `from_entries` (`reverse`, `sort_by`, `del(.[0])`, a slice, `map(select(...))`), `*+`, `*d`, `*n` and `*?`, `with_entries(select(...))` and `. as $x | .y = $x`; all of them lose a spelling with or without a repeated key.
+  An empty value inside a flow mapping (`{a: , b: 2}`) is `''` in yq and `null` here for every entry, repeated key or not.
 - The other `IndexMap` builders that have not been converted.
   Object slicing was one, closed by #5426.
 
