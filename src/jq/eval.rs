@@ -15374,6 +15374,15 @@ fn owned_assign_operand_off_the_tree<S: EvalSemantics>(
 
 #[cfg(test)]
 thread_local! {
+    /// How many times a `foreach` step tried [`owned_constructor_step`] on its EXTRACT (#6629), and
+    /// how many of those it answered: what a test reads to tell a fold that decides once, and gives
+    /// up on a shape the state never fits, from one that asks at every step.
+    static EXTRACT_CONSTRUCTOR_TRIES: core::cell::Cell<(usize, usize)> =
+        const { core::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// How many operands [`owned_assign_operand`] settled through the rebuilt state (#5288): the
     /// cost no copy-on-write count can see, so a test counts it.
     static OPERAND_REBUILT: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
@@ -88527,7 +88536,21 @@ struct FoldOperand<'e> {
     /// copy of itself, so the step runs the operand as it stands. Settled once per fork by
     /// [`FoldOperand::inert_for`]; `false` until then.
     inert: bool,
+    /// An EXTRACT whose constructor [`owned_constructor_step`] may build on the owned tree
+    /// ([`extract_constructor_eligible`], #6629): decided once per fold by
+    /// [`FoldOperand::constructor_for`], where a step used to walk the expression again to ask.
+    /// `false` until then, and for an UPDATE.
+    by_value: bool,
+    /// The attempts at that step a fork's EXTRACT has had declined (the state's shape is the
+    /// part of the answer the expression cannot give), shared by the fork's steps through
+    /// [`FoldOperand::counting_declines`]; `None` outside a fork's own steps.
+    declines: Option<&'e core::cell::Cell<u8>>,
 }
+
+/// The declines of the owned constructor step a fork tolerates before its EXTRACT stays on the
+/// evaluator's own route (#6629). A decline costs the step's own work again on that route, so a
+/// shape the state never fits pays this many and no more.
+const MAX_EXTRACT_CONSTRUCTOR_DECLINES: u8 = 4;
 
 impl<'e> FoldOperand<'e> {
     /// `expr`'s entry for a fold whose hoisted copy is `hoisted`.
@@ -88541,6 +88564,41 @@ impl<'e> FoldOperand<'e> {
             hoisted,
             as_written: rerootable.then_some(expr),
             inert: false,
+            by_value: false,
+            declines: None,
+        }
+    }
+
+    /// This EXTRACT with [`FoldOperand::by_value`] decided against the fold's loop variable `names`
+    /// (#6629). jq mode only: the step declines yq's constructors, which carry presentation.
+    fn constructor_for<S: EvalSemantics>(self, names: &[String]) -> Self {
+        Self {
+            by_value: S::TAG == EvalTag::Jq && extract_constructor_eligible(self.hoisted, names),
+            ..self
+        }
+    }
+
+    /// This operand with a fork's decline counter ([`FoldOperand::declines`]).
+    fn counting_declines(self, declines: &'e core::cell::Cell<u8>) -> Self {
+        Self {
+            declines: Some(declines),
+            ..self
+        }
+    }
+
+    /// Whether a step of this EXTRACT should try the owned constructor step: the fold's verdict,
+    /// and a fork that has not had it declined [`MAX_EXTRACT_CONSTRUCTOR_DECLINES`] times.
+    fn tries_constructor(&self) -> bool {
+        self.by_value
+            && self
+                .declines
+                .map_or(true, |seen| seen.get() < MAX_EXTRACT_CONSTRUCTOR_DECLINES)
+    }
+
+    /// Records that the owned constructor step declined this step.
+    fn constructor_declined(&self) {
+        if let Some(seen) = self.declines {
+            seen.set(seen.get().saturating_add(1));
         }
     }
 
@@ -88947,13 +89005,15 @@ fn owned_one_value_stage(stage: &Expr) -> bool {
         )
 }
 
-/// Whether `expr` is an array or object constructor with exactly one member that is `.` itself
-/// (`[$i, .]`, `{i: $i, s: .}`) and every other member, and key, a shape [`off_the_tree_shape`]
-/// accepts: the constructor a `foreach` EXTRACT builds on the owned tree (#6581). Any other
-/// constructor is the evaluator's own route, so a step that would decline it costs nothing here:
-/// a constructor with no `.` member, two, or a member the step evaluates and then declines (`(1, 2)`,
-/// `empty`) was measured 1.02x-1.15x slower than not trying (7950X).
-fn constructor_holds_state_once(expr: &Expr) -> bool {
+/// Whether `expr` is an array or object constructor with at most one member that is `.` itself
+/// (`[$i, .]`, `{i: $i, s: .}`, `[.a, .b]`) and every other member, and key, a shape
+/// [`off_the_tree_shape`] accepts: the constructor a `foreach` EXTRACT builds on the owned tree
+/// (#6581, and with no `.` member #6629). Any other constructor is the evaluator's own route, so a
+/// step that would decline it costs nothing here: a constructor with two `.` members, or a member
+/// the step evaluates and then declines (`(1, 2)`, `empty`) was measured 1.02x-1.15x slower than
+/// not trying (7950X). A fold asks this once ([`extract_constructor_eligible`]), not for every
+/// step.
+fn constructor_holds_state_at_most_once(expr: &Expr) -> bool {
     let is_dot = |e: &Expr| matches!(unwrap_paren(e), Expr::Identity);
     let fits = |e: &Expr| is_dot(e) || off_the_tree_shape(e);
     match unwrap_paren(expr) {
@@ -88962,10 +89022,10 @@ fn constructor_holds_state_once(expr: &Expr) -> bool {
                 Expr::Comma(items) => items.as_slice(),
                 single => core::slice::from_ref(single),
             };
-            items.iter().filter(|item| is_dot(item)).count() == 1 && items.iter().all(fits)
+            items.iter().filter(|item| is_dot(item)).count() <= 1 && items.iter().all(fits)
         }
         Expr::Object(entries) => {
-            entries.iter().filter(|entry| is_dot(&entry.value)).count() == 1
+            entries.iter().filter(|entry| is_dot(&entry.value)).count() <= 1
                 && entries.iter().all(|entry| {
                     fits(&entry.value)
                         && match &entry.key {
@@ -88977,6 +89037,26 @@ fn constructor_holds_state_once(expr: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether a fold's EXTRACT `expr` is a constructor the owned step may build ([`FoldOperand::by_value`],
+/// #6629), decided once for the fold: the shape [`constructor_holds_state_at_most_once`] accepts,
+/// asked of the expression with each loop variable `names` replaced by a literal, as every step
+/// replaces it ([`substitute_fold_step`]). A step's substituted copy holds a literal or a marker
+/// where this holds a `null`, and both are closed members, so the verdict is the same one the step
+/// would reach. An answer that is too generous costs a decline, which the step makes for itself
+/// ([`owned_constructor_step`] checks the shape again) and the fork stops paying for
+/// ([`MAX_EXTRACT_CONSTRUCTOR_DECLINES`]); one that is too strict leaves the step on the evaluator's route.
+fn extract_constructor_eligible(expr: &Expr, names: &[String]) -> bool {
+    if !matches!(unwrap_paren(expr), Expr::Array(_) | Expr::Object(_)) {
+        return false;
+    }
+    if fold_operand_is_inert(expr, names) {
+        return constructor_holds_state_at_most_once(expr);
+    }
+    let null = OwnedValue::Null;
+    let probe = substitute_vars(expr, names.iter().map(|name| (name.as_str(), &null)));
+    constructor_holds_state_at_most_once(&probe)
 }
 
 /// `[.]`, `[., <closed>…]` and `{<key>: .}` as a fold's UPDATE (#5875): a container built around
@@ -92527,7 +92607,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                             // positionally (#494): here they are simply already
                             // pushed by the time the `Flow` is inspected.
                             let witnessed;
-                            let (ext_expr, reentry) =
+                            let (ext_expr, reentry, hoisted_copy) =
                                 match extract.and_then(|ext| ext.witnessed::<S>(&update_val)) {
                                     Some(as_written) => {
                                         witnessed = substitute_fold_step(
@@ -92537,21 +92617,46 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                                             mark_loop_vars,
                                             false,
                                         );
-                                        (&witnessed, Reentry::REBUILT)
+                                        (&witnessed, Reentry::REBUILT, false)
                                     }
-                                    None => (hoisted, Reentry::Proven),
+                                    None => (hoisted, Reentry::Proven, true),
                                 };
                             // #6581: a constructor EXTRACT around the state (`[$i, .]`,
-                            // `{i: $i, s: .}`; one `.` member, [`constructor_holds_state_once`]) is built on the owned tree, as an UPDATE of the
+                            // `{i: $i, s: .}`) or built from reads of it (`[.a, .b]`, #6629) is
+                            // built on the owned tree, as an UPDATE of the
                             // same shape is (#5875, #6528), instead of on the generic route,
                             // where every read of `.` inside it re-indexes the state. The state
                             // is one `Rc` clone for a container: it is this step's output and
                             // the next step's accumulator at once, as the implicit-identity arm
                             // below already has it. A constructor the step declines (a member
                             // outside its shapes, the embed table live, yq mode) is untouched
-                            // and runs as before.
-                            let by_value = if constructor_holds_state_once(ext_expr) {
-                                Some(owned_constructor_step::<S>(ext_expr, update_val.clone()))
+                            // and runs as before. Whether the expression has the shape was
+                            // decided once for the fold ([`FoldOperand::constructor_for`]); a
+                            // witnessed step runs the as-written copy with the embed table
+                            // live, which the step declines, so it does not try.
+                            let by_value = if hoisted_copy
+                                && extract.is_some_and(|ext| ext.tries_constructor())
+                            {
+                                let step =
+                                    owned_constructor_step::<S>(ext_expr, update_val.clone());
+                                #[cfg(test)]
+                                EXTRACT_CONSTRUCTOR_TRIES.with(|tries| {
+                                    let (asked, answered) = tries.get();
+                                    tries.set((
+                                        asked + 1,
+                                        answered
+                                            + usize::from(matches!(
+                                                step,
+                                                Ok(OwnedStep::Handled(_))
+                                            )),
+                                    ));
+                                });
+                                if !matches!(step, Ok(OwnedStep::Handled(_))) {
+                                    if let Some(ext) = extract {
+                                        ext.constructor_declined();
+                                    }
+                                }
+                                Some(step)
                             } else {
                                 None
                             };
@@ -93796,9 +93901,15 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         let (update, extract) = *inert_operands.get_or_insert_with(|| {
             (
                 update.inert_for(all_var_names),
-                extract.map(|ext| ext.inert_for(all_var_names)),
+                extract.map(|ext| {
+                    ext.inert_for(all_var_names)
+                        .constructor_for::<S>(all_var_names)
+                }),
             )
         });
+        // #6629: the declines of this fork's EXTRACT constructor step, counted across its steps.
+        let extract_declines = core::cell::Cell::new(0u8);
+        let extract = extract.map(|ext| ext.counting_declines(&extract_declines));
         let mut state = init_val;
         // Recorded out-of-band for the usual reason: the per-element callback
         // can only answer `Demand`, so "why did the fold stop" has to be kept
@@ -179756,12 +179867,151 @@ mod fold_operand_inert_tests_5745 {
                 hoisted,
                 as_written,
                 inert: false,
+                by_value: false,
+                declines: None,
             }
         }
         assert!(operand(&plain, None).inert_for(&names).inert);
         assert!(operand(&plain, Some(&plain)).inert_for(&names).inert);
         assert!(!operand(&plain, Some(&reading)).inert_for(&names).inert);
         assert!(!operand(&reading, None).inert_for(&names).inert);
+    }
+
+    /// #6629: whether an EXTRACT is a constructor the owned step may build is decided from the
+    /// expression, once, with the loop variables standing for the literals a step splices in. A
+    /// `.`-free constructor of reads is one; so are the shapes #6581 took; a second `.`, a member
+    /// outside the shapes, a bare entry and a non-constructor are not.
+    #[test]
+    fn test_extract_constructor_eligible_decides_from_the_expression_6629() {
+        let names = vec!["i".to_string()];
+        for (source, eligible) in [
+            ("[.a, .b]", true),
+            ("{x: .a, y: .b}", true),
+            ("[$i, .a]", true),
+            ("{k: $i, v: .b}", true),
+            ("{(.k): .a}", true),
+            ("[$i, .]", true),
+            ("{i: $i, s: .}", true),
+            ("[1, 2]", true),
+            ("[.a, .a + 1, (.a | length)]", true),
+            ("[., .]", false),
+            ("[.a, (1, 2)]", false),
+            ("[.a, empty]", false),
+            ("[$i, (.a | map(.b + 1))]", false),
+            ("[$i, (.a | map(.b))]", true),
+            ("[.a, ($i | tojson | fromjson)]", true),
+            ("[.a, (.b | paths)]", false),
+            ("{a}", true),
+            (".a", false),
+            ("$i", false),
+            ("[.a] | .[0]", false),
+            ("def f: .a; [f, $i]", false),
+        ] {
+            let expr = parse(source).unwrap();
+            assert_eq!(
+                extract_constructor_eligible(&expr, &names),
+                eligible,
+                "{source}"
+            );
+        }
+        // Another loop variable's name is no variable of this fold: it stays unresolved here.
+        let other = parse("[$j, .a]").unwrap();
+        assert!(!extract_constructor_eligible(&other, &names));
+        assert!(extract_constructor_eligible(&other, &["j".to_string()]));
+    }
+
+    /// #6629: yq's constructors carry presentation, so the fold never asks the step for them; jq's
+    /// are asked.
+    #[test]
+    fn test_constructor_for_is_jq_only_6629() {
+        let names = vec!["i".to_string()];
+        let expr = parse("[.a, $i]").unwrap();
+        let hoisted = Cow::Borrowed(&expr);
+        let operand = FoldOperand::new::<JqSemantics>(&expr, &hoisted).inert_for(&names);
+        assert!(operand.constructor_for::<JqSemantics>(&names).by_value);
+        assert!(!operand.constructor_for::<YqSemantics>(&names).by_value);
+        let declined = core::cell::Cell::new(0u8);
+        let counted = operand
+            .constructor_for::<JqSemantics>(&names)
+            .counting_declines(&declined);
+        for _ in 0..MAX_EXTRACT_CONSTRUCTOR_DECLINES {
+            assert!(counted.tries_constructor());
+            counted.constructor_declined();
+        }
+        assert!(!counted.tries_constructor());
+    }
+
+    /// Run `program` over `null`, returning its outputs and what the EXTRACT constructor step did
+    /// on this thread: (tries, answers).
+    #[cfg(feature = "std")]
+    fn run_and_count_constructor_tries(program: &'static str) -> (String, (usize, usize)) {
+        const STACK: usize = 256 * 1024 * 1024;
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(move || {
+                with_stack_budget(STACK, || {
+                    let expr = parse(program).unwrap();
+                    let json = b"null";
+                    let index = crate::json::JsonIndex::build(json);
+                    let mut outputs = Vec::new();
+                    let control = crate::jq::eval_generic::eval_each_with_cursor(
+                        &expr,
+                        index.root(json),
+                        &mut |result| {
+                            outputs.push(format!("{result:?}"));
+                            true
+                        },
+                    );
+                    assert!(control.is_none(), "{control:?}");
+                    (
+                        outputs.join(","),
+                        EXTRACT_CONSTRUCTOR_TRIES.with(core::cell::Cell::get),
+                    )
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// #6629: a `.`-free EXTRACT the state fits is built by the step every time; one the state
+    /// never fits (`[.a, .a]` moves one slot twice) is tried a bounded number of times per fork and
+    /// then left to the evaluator; one the fold never tries (a second `.`, a member outside the
+    /// shapes, an EXTRACT that is no constructor) is not tried at all.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_extract_constructor_is_tried_by_the_fold_verdict_not_per_step_6629() {
+        let steps = 50usize;
+        let cap = MAX_EXTRACT_CONSTRUCTOR_DECLINES as usize;
+        for (program, tries) in [
+            (
+                "[foreach range(50) as $i ({a: 1, b: 2}; .a += 1; [.a, .b])]",
+                (steps, steps),
+            ),
+            (
+                "[foreach range(50) as $i ({a: 1, b: 2}; .a += 1; {x: .a, i: $i})]",
+                (steps, steps),
+            ),
+            (
+                "[foreach range(50) as $i ({a: [1]}; .; [.a, .a])]",
+                (cap, 0),
+            ),
+            ("[foreach range(50) as $i ({a: 1}; .; [., .])]", (0, 0)),
+            (
+                "[foreach range(50) as $i ({a: 1}; .; [.a, (1, 2)])]",
+                (0, 0),
+            ),
+            ("[foreach range(50) as $i ({a: 1}; .; .a)]", (0, 0)),
+            ("[foreach range(50) as $i ({a: 1}; .a += 1)]", (0, 0)),
+            // Each INIT fork counts its own declines.
+            (
+                "[foreach range(50) as $i (({a: [1]}, {a: [2]}); .; [.a, .a])]",
+                (2 * cap, 0),
+            ),
+        ] {
+            let (_, counted) = run_and_count_constructor_tries(program);
+            assert_eq!(counted, tries, "{program}");
+        }
     }
 }
 
