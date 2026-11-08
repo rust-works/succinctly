@@ -7037,7 +7037,9 @@ fn read_inputs(
                     // and a program that stops before that value never makes the read. So the
                     // reads place it, and only a failure at the tail (past every file that opened)
                     // still depends on how the last value ends, in the rule below.
-                    || (args.null_input && at < raws.len())
+                    // #6708: so does a program that reads `input` without `-n`, whose main loop
+                    // reads the first value and stops one value past a failure.
+                    || ((args.null_input || track_eof) && at < raws.len())
                     || raws
                         .iter()
                         .take(at)
