@@ -14,6 +14,10 @@ Three kinds of check, none of which touches the network (a fake `gh` stands in):
   - each pinned-tool install step goes through the helper and passes it a token;
   - the helper retries, then gives up with an error, and hands `gh` the arguments it was given.
 
+It reads the workflow text, so it cannot see a third-party action that downloads from that URL inside
+its own code (`lycheeverse/lychee-action` did; it was replaced for that reason): a new `uses:` that
+installs a tool is a review question, not something this test answers.
+
 Run directly (`python3 scripts/test_ci_release_downloads.py`).
 """
 

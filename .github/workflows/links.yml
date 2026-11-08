@@ -6,12 +6,14 @@ on:
     paths:
       - '**.md'
       - '.github/workflows/links.yml'
+      - 'scripts/gh-release-download.sh'
       - 'lychee.toml'
   pull_request:
     branches: [main]
     paths:
       - '**.md'
       - '.github/workflows/links.yml'
+      - 'scripts/gh-release-download.sh'
       - 'lychee.toml'
   # Allow manual trigger
   workflow_dispatch:
@@ -79,6 +81,8 @@ jobs:
           code=0
           for attempt in 1 2; do
             code=0
+            # A report from the first attempt must not stand in for a second one that wrote none.
+            rm -f "$report"
             lychee --config lychee.toml --mode task --format markdown \
               --output "$report" '**/*.md' || code=$?
             [ "$code" -eq 0 ] && break
@@ -88,7 +92,7 @@ jobs:
             echo "No output. Check the log to see if lychee panicked." > "$report"
           fi
           cat "$report"
-          cp "$report" "$GITHUB_STEP_SUMMARY"
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
           # No links at all means the glob or the config broke, not that the
           # docs are clean (lychee-action's failIfEmpty).
           if grep -Eq 'Total\s+\|\s+0' "$report"; then
