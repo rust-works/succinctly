@@ -6178,6 +6178,9 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     // demoting rebuilds `expr` whenever it holds a marker at all.
     let expr = reentry.reroot::<S>(expr);
     let rebuilt;
+    // #6666: the memos belong to a document, and `rebuilt` is this bridge's own (a `rooted` one
+    // is the caller's, whose scope is already open: opening it again would be a no-op).
+    let mut scope = None;
     let cursor = match rooted.as_deref() {
         Some(doc) => doc.root(),
         None => {
@@ -6185,6 +6188,7 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
                 Ok(doc) => doc,
                 Err(error) => return GenericResult::Error(error),
             };
+            scope = enter_document_scope(&rebuilt);
             rebuilt.root()
         }
     };
@@ -6214,7 +6218,9 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     // arms rather than `.unwrap()`/`.expect()` because the *type* (`Result`)
     // is what lets a real failure, if this invariant is ever violated by a
     // future change, surface as a normal `EvalError` instead of a panic.
-    query_result_to_generic::<V, S>(full_eval::<Vec<u64>, S>(&expr, cursor))
+    let result = query_result_to_generic::<V, S>(full_eval::<Vec<u64>, S>(&expr, cursor));
+    drop(scope);
+    result
 }
 
 /// Materialize `value` (with its `cursor`, if any) and hand `expr` to the
@@ -11349,6 +11355,36 @@ mod slot_memo {
         }
     }
 
+    impl Guard {
+        /// Put this scope aside and let the one it replaced answer, until the returned
+        /// [`Suspended`] drops (#6666). The caller's program runs inside a sink the bridge
+        /// calls, and its reads belong to its own document's memos; this scope's state (an
+        /// index it has built) is kept, not rebuilt after each sink call. Swapping, not
+        /// dropping and entering again, so it holds in whatever order the scopes in between
+        /// open and close.
+        pub(crate) fn suspended(&mut self) -> Suspended<'_> {
+            self.swap();
+            Suspended(self)
+        }
+
+        fn swap(&mut self) {
+            if let Restore::Previous(held) = &mut self.restore {
+                MEMO.with(|m| std::mem::swap(&mut *m.borrow_mut(), held));
+            }
+            self._keys.swap();
+            self._elements.swap();
+        }
+    }
+
+    /// A scope set aside by [`Guard::suspended`], put back when it drops (also on an unwind).
+    pub(crate) struct Suspended<'a>(&'a mut Guard);
+
+    impl Drop for Suspended<'_> {
+        fn drop(&mut self) {
+            self.0.swap();
+        }
+    }
+
     /// Open the scope for evaluations over `document`: a no-op while one is
     /// already open for it, a nested scope (restored on drop) otherwise.
     pub(crate) fn enter(document: usize) -> Guard {
@@ -11672,6 +11708,16 @@ mod slot_memo {
 #[cfg(not(feature = "std"))]
 mod slot_memo {
     pub(crate) struct Guard;
+
+    pub(crate) struct Suspended;
+
+    impl Guard {
+        // The memo does not exist without `std`: nothing to set aside.
+        #[allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)]
+        pub(crate) fn suspended(&mut self) -> Suspended {
+            Suspended
+        }
+    }
 
     pub(crate) fn enter(_document: usize) -> Guard {
         Guard
@@ -12471,6 +12517,30 @@ fn eval_with_cursor_unscoped<S: EvalSemantics, C: DocumentCursor>(
         }
     }
     eval_with_cursor_shipped::<S, C>(expr, cursor)
+}
+
+/// What [`enter_document_scope`] opens: the per-document memos (the slot scans, #3702, and the
+/// key and element indexes beside them, #3913, #4035), closed when it drops.
+pub(crate) type DocumentScope = slot_memo::Guard;
+
+/// Open the memos for evaluations over the document `token` names (#6666).
+///
+/// The generic evaluator opens them at each entry point, over the document it was handed. The
+/// owned evaluator's reindex bridge builds a document of its own and evaluates over it, and a
+/// memo is consulted only for the document it was opened for, so without this a loop over that
+/// document's array (`[range(N)] | [range(0; length) as $i | .[$i]]`) walked the whole array on
+/// every read instead of building the element index on the third.
+///
+/// `None` for a document too small to hold anything a memo remembers: an array or an object is
+/// wide at 64 elements or members ([`crate::jq::array_index::WIDE_ELEMENTS`],
+/// [`crate::jq::key_index::WIDE_MEMBERS`]), and 64 of either take at least 127 bytes of text. A
+/// per-record program bridges thousands of small values, and the scope's setup is a cost of
+/// about 140 ns per bridge that it would pay for nothing (the review of #6666 measured +8% on
+/// `map(.name | ascii_downcase | ltrimstr("user"))`).
+pub(crate) fn enter_document_scope(doc: &super::value::ReindexedDoc) -> Option<DocumentScope> {
+    const SMALLEST_WIDE_DOCUMENT: usize = 2 * crate::jq::array_index::WIDE_ELEMENTS - 1;
+    (doc.text().len() >= SMALLEST_WIDE_DOCUMENT)
+        .then(|| slot_memo::enter(doc.root().document_token()))
 }
 
 /// [`eval_with_cursor_unscoped`]'s route for every program the path-mode
@@ -26546,7 +26616,7 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
 /// O(range), not O(length). A delimiter that walk raises on keeps the
 /// collecting read for the computed spelling `E[S:T]`, which never ran its checks and still
 /// does not; `strict` (the literal spelling, #6231) raises it instead, as the bridge did.
-fn to_owned_array_slice<S: EvalSemantics, V: DocumentValue>(
+pub(crate) fn to_owned_array_slice<S: EvalSemantics, V: DocumentValue>(
     elements: &V::Elements,
     start: Option<i64>,
     end: Option<i64>,
@@ -62112,6 +62182,40 @@ mod tests {
         assert_eq!(slot_memo::resume(1, 3, 10_000), Some((333, 9, false)));
         // An element after the target is not a place to resume from.
         assert_eq!(slot_memo::resume(1, 3, 300), None);
+    }
+
+    /// #6666: a scope set aside (by `suspended`) hands the one it replaced back, keeps its own
+    /// entries, and takes the place again when the set-aside drops; a guard that opened nothing
+    /// sets nothing aside.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_slot_memo_scope_set_aside_keeps_its_entries_6666() {
+        let _outer = slot_memo::enter(1);
+        slot_memo::remember(1, 7, 70, 3, Some(71), false, None);
+        let mut inner = slot_memo::enter(2);
+        slot_memo::remember(2, 9, 90, 5, None, false, None);
+        assert_eq!(slot_memo::resume(2, 9, 1_000), Some((90, 5, false)));
+        assert_eq!(slot_memo::resume(1, 7, 1_000), None, "another document");
+        {
+            let _aside = inner.suspended();
+            assert_eq!(slot_memo::resume(1, 7, 1_000), Some((70, 3, false)));
+            assert_eq!(slot_memo::resume(2, 9, 1_000), None, "set aside");
+        }
+        assert_eq!(slot_memo::resume(2, 9, 1_000), Some((90, 5, false)), "kept");
+        assert_eq!(slot_memo::resume(1, 7, 1_000), None);
+        drop(inner);
+        assert_eq!(
+            slot_memo::resume(1, 7, 1_000),
+            Some((70, 3, false)),
+            "restored on drop"
+        );
+        let mut same = slot_memo::enter(1);
+        let _aside = same.suspended();
+        assert_eq!(
+            slot_memo::resume(1, 7, 1_000),
+            Some((70, 3, false)),
+            "nothing to set aside"
+        );
     }
 
     /// #3702: an evaluation of another document inside an open scope gets a

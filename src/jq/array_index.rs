@@ -545,6 +545,21 @@ pub(crate) mod memo {
         }
     }
 
+    impl Guard {
+        /// Exchange the live scope with the one this guard replaced (#6666): the guard's own
+        /// scope is kept aside, intact, while the replaced one answers, and a second call puts
+        /// them back. A no-op for a guard that opened nothing.
+        pub(crate) fn swap(&mut self) {
+            if let Restore::Previous(held) = &mut self.0 {
+                MEMO.with(|m| {
+                    let mut m = m.borrow_mut();
+                    std::mem::swap(&mut *m, held);
+                    BLOOM.with(|b| b.set(m.as_ref().map_or(0, |s| bloom_of(&s.entries))));
+                });
+            }
+        }
+    }
+
     /// Open the scope for evaluations over `document`: a no-op while one is
     /// already open for it, a nested scope (restored on drop) otherwise.
     pub(crate) fn enter(document: usize) -> Guard {
@@ -881,6 +896,12 @@ pub(crate) mod memo {
 
     pub(crate) struct Guard;
 
+    impl Guard {
+        // The memo does not exist without `std`: nothing to set aside.
+        #[allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)]
+        pub(crate) fn swap(&mut self) {}
+    }
+
     pub(crate) fn enter(_document: usize) -> Guard {
         Guard
     }
@@ -1127,6 +1148,68 @@ mod tests {
             assert_eq!(builds - before.0, 1, "one build, not one per lookup");
             assert_eq!(hits - before.1, 4, "every lookup after the building one");
             assert!(answers.iter().all(|a| *a == Ok(WIDE_ELEMENTS * 2)));
+        }
+
+        /// #6666: a nested scope can be set aside, so the scope it replaced answers, and put back
+        /// intact: the index it built is still there, and the flag every lookup reads follows
+        /// each swap (a stale flag would answer from the wrong scope, or never ask).
+        #[test]
+        fn a_scope_set_aside_keeps_its_index_and_hands_the_replaced_one_back_6666() {
+            let outer_doc = wide_array(WIDE_ELEMENTS * 2);
+            let outer_index = JsonIndex::build(outer_doc.as_bytes());
+            let outer = outer_index.root(outer_doc.as_bytes());
+            let inner_doc = wide_array(WIDE_ELEMENTS * 3);
+            let inner_index = JsonIndex::build(inner_doc.as_bytes());
+            let inner = inner_index.root(inner_doc.as_bytes());
+            let outer_elements = outer.value().as_array().expect("an array document");
+            let inner_elements = inner.value().as_array().expect("an array document");
+
+            let _outer_scope = memo::enter(outer.document_token());
+            for _ in 0..3 {
+                assert!(len_checked_memoized(&outer_elements).is_ok());
+            }
+            let mut inner_scope = memo::enter(inner.document_token());
+            for _ in 0..3 {
+                assert!(len_checked_memoized(&inner_elements).is_ok());
+            }
+            // Both indexes are built; only the live scope's answers.
+            assert_eq!(memo::len(&inner_elements), Some(WIDE_ELEMENTS * 3));
+            assert_eq!(
+                memo::len(&outer_elements),
+                None,
+                "the outer scope is not live"
+            );
+
+            inner_scope.swap();
+            assert_eq!(memo::len(&outer_elements), Some(WIDE_ELEMENTS * 2));
+            assert_eq!(
+                memo::len(&inner_elements),
+                None,
+                "the inner scope is set aside"
+            );
+            inner_scope.swap();
+            let before = memo::work();
+            assert_eq!(
+                memo::len(&inner_elements),
+                Some(WIDE_ELEMENTS * 3),
+                "kept, not rebuilt"
+            );
+            assert_eq!(memo::len(&outer_elements), None);
+            assert_eq!(
+                memo::work().0,
+                before.0,
+                "no index was built by the swap back"
+            );
+            drop(inner_scope);
+            assert_eq!(
+                memo::len(&outer_elements),
+                Some(WIDE_ELEMENTS * 2),
+                "restored on drop"
+            );
+            // A guard that opened nothing (the scope was already open) has nothing to set aside.
+            let mut same = memo::enter(outer.document_token());
+            same.swap();
+            assert_eq!(memo::len(&outer_elements), Some(WIDE_ELEMENTS * 2));
         }
 
         #[test]
