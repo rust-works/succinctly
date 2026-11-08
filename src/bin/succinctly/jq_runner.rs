@@ -6864,7 +6864,13 @@ fn read_inputs(
         if (args.null_input || track_eof)
             && !args.slurp
             && args.input_dsv.is_none()
-            && (!args.seq || args.raw_input || (any_open_failure && seq_text_reads_clean(&raws)))
+            && (!args.seq
+                || args.raw_input
+                || (any_open_failure
+                    // #6588: the streaming readers (`read_seq`) still end the stream at the
+                    // final buffer of the last file that opened (#6591), so for them an unopened
+                    // file after it does not change what the walk calls clean.
+                    && seq_text_reads_clean(&raws, unopened_tail && !seq_by_stream_reader(args))))
             && ends_cleanly
         {
             let fault_ends_text = matches!(first_stream_fault(&raws), Some((_, true)));
@@ -7023,6 +7029,7 @@ fn read_inputs(
                     &raw_bytes,
                     args.slurp,
                     queue_faults,
+                    crate::jq_seq_reader::Tail::of(unopened_tail),
                     &mut |warning| {
                         if !queue_faults {
                             seq_warned = true;
@@ -7043,8 +7050,13 @@ fn read_inputs(
         // `-R` are excluded from both gates identically. That combination
         // skips the warnings but still needs the values and `-s`'s
         // location, so it runs the walk here with a no-op sink.
-        let walk =
-            crate::jq_seq_reader::walk_stream_collecting(&raw_bytes, args.slurp, true, &mut |_| {});
+        let walk = crate::jq_seq_reader::walk_stream_collecting(
+            &raw_bytes,
+            args.slurp,
+            true,
+            crate::jq_seq_reader::Tail::of(unopened_tail),
+            &mut |_| {},
+        );
         seq_values = walk.values;
         seq_value_locations = walk.locations;
         // `input`/`inputs` raise what a plain run only warns about (#5640).
@@ -8965,7 +8977,7 @@ fn defer_open_failures(failures: Vec<(usize, InputFileOpenError)>, fault_ends_te
 /// `--stream` and `--stream-errors` too, whose events of a clean record stream are placed as their
 /// values'. A slurp reads every file before the program runs, so this is asked only of a run
 /// without `-s`.
-fn seq_text_reads_clean(raws: &[Vec<u8>]) -> bool {
+fn seq_text_reads_clean(raws: &[Vec<u8>], unopened_tail: bool) -> bool {
     let sources: Vec<(Option<usize>, Vec<u8>)> = raws
         .iter()
         .enumerate()
@@ -8974,9 +8986,15 @@ fn seq_text_reads_clean(raws: &[Vec<u8>]) -> bool {
     let mut warned = false;
     // Collecting the faults, as the queue's own walk does: without it, a final buffer that starts on
     // an RS (#2998) ends the stream with no word, which the queue raises as `break` (#5662).
-    let walk = crate::jq_seq_reader::walk_stream_collecting(&sources, false, true, &mut |_| {
-        warned = true;
-    });
+    let walk = crate::jq_seq_reader::walk_stream_collecting(
+        &sources,
+        false,
+        true,
+        crate::jq_seq_reader::Tail::of(unopened_tail),
+        &mut |_| {
+            warned = true;
+        },
+    );
     !warned && walk.faults.is_empty() && walk.deferred_warning.is_none()
 }
 
