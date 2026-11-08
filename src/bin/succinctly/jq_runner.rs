@@ -6861,11 +6861,15 @@ fn read_inputs(
         // stream's are, so the reads reach the failures as they do there; `-R` reads the lines of
         // one with its own reader, as it reads any text. With nothing to report the walk is not
         // worth its copy of the text.
+        // #6602: `-R` needs no `ends_cleanly`. A line that runs to the end of its file is read
+        // whole from the next file, so the value carries that file's source index and the hook
+        // reports the failure between them when a read of that line reaches it, not before;
+        // a read that stops on an earlier line never gets there, as in jq.
         if (args.null_input || track_eof)
             && !args.slurp
             && args.input_dsv.is_none()
             && (!args.seq || args.raw_input || (any_open_failure && seq_text_reads_clean(&raws)))
-            && ends_cleanly
+            && (ends_cleanly || args.raw_input)
         {
             let fault_ends_text = matches!(first_stream_fault(&raws), Some((_, true)));
             defer_open_failures(failures, fault_ends_text);
