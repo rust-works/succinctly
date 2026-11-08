@@ -7162,11 +7162,17 @@ fn read_inputs(
                 SEQ_FAULT_ENDS.with(|ends| {
                     *ends.borrow_mut() = seq_fault_ends(&raws, unopened_tail).into();
                 });
-            } else if seq_stream_places_failures_by_warning(args, track_eof) {
+            } else if seq_stream_places_failures_by_warning(args, track_eof)
+                || seq_stream_slurp_places_failures(args, track_eof)
+            {
                 // #6591: the reader's warnings come out as jq's main loop pops each fault, and a
                 // failure is said when the reader opens the file, so it sits among them by source.
+                // #6676: a slurp reads them all in its first call, and every failure is held for
+                // the warnings to place.
                 let mut failures = failures;
-                failures.truncate(reached);
+                if !args.slurp {
+                    failures.truncate(reached);
+                }
                 held_open_failures = failures.into();
                 seq_stream_places_failures = true;
             } else if last_directory_left_to_reads(args, track_eof, &failures, reached) {
@@ -7445,7 +7451,7 @@ fn read_inputs(
         }
         // #6591: the value that took jq's reader past the first file that did not open is the last
         // one its main loop reads (#6006), so a warning met reading any later value never comes.
-        let main_loop_stops_at = if seq_stream_places_failures {
+        let main_loop_stops_at = if seq_stream_places_failures && !args.slurp {
             read.locations.iter().position(|&at| {
                 let (source, line) = stream_location(&raw_bytes, at);
                 line != UNKNOWN_LINE as usize
@@ -7456,10 +7462,19 @@ fn read_inputs(
         };
         let mut resumed: Vec<(usize, TrailingParseError)> = Vec::new();
         let mut trailing_error = None;
+        // #6676: a slurp that places its failures among the warnings lost the array where a
+        // warning was met after one was reported, as the record reader's does (#6589). A fault
+        // that is the call after the array's is met after every file, so it loses the array
+        // beside any file that failed (#6481).
+        let mut slurp_stopped = false;
         let array_lost = slurped_array_lost(
             args.slurp && !faults_as_inputs,
             any_open_failure,
-            !read.faults.is_empty(),
+            if seq_stream_places_failures {
+                read.faults.iter().any(|fault| fault.after_array)
+            } else {
+                !read.faults.is_empty()
+            },
         );
         for fault in read.faults {
             if faults_as_inputs {
@@ -7477,11 +7492,19 @@ fn read_inputs(
                 ));
             } else if !fault.after_array {
                 if seq_stream_places_failures {
-                    if main_loop_stops_at.is_some_and(|stop| fault.before > stop) {
+                    if main_loop_stops_at.is_some_and(|stop| fault.before > stop) || slurp_stopped {
                         continue;
                     }
-                    let (source, _) = stream_location(&raw_bytes, fault.location);
-                    report_held_open_failures(&mut held_open_failures, source, open_failed);
+                    // The warning at the end of the text is raised by the read that has been
+                    // through every file (#6676).
+                    let source = if fault.message.contains(" at EOF") {
+                        usize::MAX
+                    } else {
+                        stream_location(&raw_bytes, fault.location).0
+                    };
+                    let reported =
+                        report_held_open_failures(&mut held_open_failures, source, open_failed);
+                    slurp_stopped = args.slurp && reported;
                 }
                 eprintln!(
                     "{}",
@@ -7501,10 +7524,10 @@ fn read_inputs(
                 });
             }
         }
-        if seq_stream_places_failures {
+        if seq_stream_places_failures && !slurp_stopped {
             report_held_open_failures(&mut held_open_failures, usize::MAX, open_failed);
         }
-        let (values, locations) = if array_lost {
+        let (values, locations) = if array_lost || slurp_stopped {
             let files = locations.files().to_vec();
             (Vec::new(), InputLocations::new(files))
         } else {
@@ -8603,6 +8626,20 @@ fn seq_stream_places_failures_by_warning(args: &JqCommand, track_eof: bool) -> b
     seq_by_stream_reader(args)
         && !args.stream_errors
         && !args.slurp
+        && !args.null_input
+        && !track_eof
+}
+
+/// Whether a `--seq --stream -s` run reports its open failures among the stream reader's warnings
+/// (#6676), as [`seq_slurp_places_failures`] does for the record reader: the program reads no `input`
+/// (`track_eof`), so jq's main loop reads the whole slurp in its first call, and a warning met once a
+/// file has failed to open stops it with the array lost. A file is opened, and a failure said, when
+/// the reader gets to it, so a warning met before it leaves the array, and the end of the stream
+/// counts a directory given last.
+fn seq_stream_slurp_places_failures(args: &JqCommand, track_eof: bool) -> bool {
+    seq_by_stream_reader(args)
+        && !args.stream_errors
+        && args.slurp
         && !args.null_input
         && !track_eof
 }
